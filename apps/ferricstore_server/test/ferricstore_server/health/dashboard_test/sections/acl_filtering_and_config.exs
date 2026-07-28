@@ -441,7 +441,9 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           assert Dashboard.render_pubsub_page(data) =~ "Pub/Sub Activity"
         end
 
-        test "security page is OSS-only diagnostics and redacts password material" do
+        test "security page exposes permission-aware account management and redacts passwords" do
+          Application.put_env(:ferricstore, :protected_mode, true)
+
           :ok =
             FerricstoreServer.Acl.set_user("tenant-a-security", [
               "on",
@@ -451,11 +453,23 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
               "-@all",
               "+GET",
               "+SET",
-              "+PUBSUB"
+              "+PUBSUB",
+              "+ACL.LIST",
+              "+ACL.SETUSER",
+              "+ACL.DELUSER"
+            ])
+
+          :ok =
+            FerricstoreServer.Acl.set_user("managed-security-user", [
+              "on",
+              ">managed-password-123",
+              "-@all",
+              "+INFO"
             ])
 
           data =
             Dashboard.collect_security_page(%{
+              "acl_username" => "tenant-a-security",
               "user" => "tenant-a-security",
               "command" => "GET",
               "key" => "tenant-a:visible",
@@ -471,9 +485,45 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           assert html =~ "Key allowed"
           assert html =~ "Channel allowed"
           assert html =~ "ACL.LIST"
+          assert html =~ "Account management"
+          assert html =~ ~s(action="/dashboard/security/users")
+          assert html =~ ~s(action="/dashboard/security/users/password")
+          assert html =~ ~s(action="/dashboard/security/users/delete")
+          assert html =~ ~s(action="/dashboard/logout")
+          assert html =~ ~s(name="username" maxlength="1024" autocomplete="username")
+
+          assert html =~
+                   ~s(type="text" name="username" value="managed-security-user" autocomplete="username" hidden)
+
+          assert html =~ ~s(<td><div class="mono acl-rule-summary")
+          assert html =~ ".acl-rule-summary {"
+          assert html =~ "overflow-wrap: anywhere"
+          assert html =~ "max-height: 10rem"
+          assert html =~ "overflow: auto"
           refute html =~ "very-secret-password"
-          refute html =~ "ACL SETUSER"
-          refute html =~ ~s(method="post")
+          refute html =~ FerricstoreServer.Acl.get_user("tenant-a-security").password
+        end
+
+        test "security page hides mutation controls from ACL list-only principals" do
+          :ok =
+            FerricstoreServer.Acl.set_user("security-viewer", [
+              "on",
+              ">viewer-password-123",
+              "~*",
+              "-@all",
+              "+ACL.LIST"
+            ])
+
+          data =
+            Dashboard.collect_security_page(%{
+              "acl_username" => "security-viewer"
+            })
+
+          html = Dashboard.render_security_page(data)
+
+          assert html =~ "Read-only access"
+          refute html =~ ~s(action="/dashboard/security/users")
+          refute html =~ ~s(action="/dashboard/security/users/delete")
         end
 
         @tag :dashboard_security_acl_identity

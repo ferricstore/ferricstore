@@ -38,7 +38,13 @@ defmodule Ferricstore.Flow.RecordProjection do
           raise ArgumentError, "invalid Flow storage scope"
       end
 
-    Map.drop(record, [:incarnation, :state_enter_seq, :governance_limit, :system_metadata])
+    Map.drop(record, [
+      :incarnation,
+      :state_enter_seq,
+      :governance_limit,
+      :system_metadata,
+      :schedule_metadata
+    ])
   end
 
   def public(record), do: record

@@ -39,6 +39,100 @@ defmodule FerricstoreServer.Management.ACLCatalogTest do
     refute user.password == secret
   end
 
+  test "dashboard bootstrap atomically passwords only the initial default user" do
+    store = FerricStore.Instance.get(:default)
+    secret = "bootstrap-secret-that-must-not-enter-raft"
+
+    assert :ok = ACL.bootstrap_default(secret, store: store)
+    assert {:ok, "default"} = Acl.authenticate("default", secret)
+
+    assert {:ok, encoded} = Router.server_catalog_entry(store, "acl", "default")
+    assert :binary.match(encoded, secret) == :nomatch
+
+    assert {:error, :dashboard_already_configured} =
+             ACL.bootstrap_default("replacement-secret", store: store)
+
+    assert {:ok, "default"} = Acl.authenticate("default", secret)
+    assert {:error, _reason} = Acl.authenticate("default", "replacement-secret")
+  end
+
+  test "dashboard bootstrap refuses catalogs containing another ACL user" do
+    store = FerricStore.Instance.get(:default)
+    assert :ok = ACL.set_user("existing", ["on", "nopass"], store: store)
+
+    assert {:error, :dashboard_already_configured} =
+             ACL.bootstrap_default("bootstrap-secret", store: store)
+
+    assert Acl.get_user("default").password == nil
+  end
+
+  test "concurrent dashboard bootstrap attempts have exactly one winner" do
+    store = FerricStore.Instance.get(:default)
+
+    tasks =
+      for secret <- ["first-bootstrap-secret", "second-bootstrap-secret"] do
+        Task.async(fn -> {secret, ACL.bootstrap_default(secret, store: store)} end)
+      end
+
+    results = Enum.map(tasks, &Task.await(&1, 5_000))
+
+    assert [{winning_secret, :ok}] = Enum.filter(results, &(elem(&1, 1) == :ok))
+
+    assert [{_losing_secret, {:error, :dashboard_already_configured}}] =
+             Enum.reject(results, &(elem(&1, 1) == :ok))
+
+    assert {:ok, "default"} = Acl.authenticate("default", winning_secret)
+  end
+
+  test "dashboard account creation cannot overwrite an existing user" do
+    store = FerricStore.Instance.get(:default)
+    assert :ok = ACL.create_user("alice", ["on", ">original-secret"], store: store)
+
+    assert {:error, :acl_user_already_exists} =
+             ACL.create_user("alice", ["on", ">replacement-secret"], store: store)
+
+    assert {:ok, "alice"} = Acl.authenticate("alice", "original-secret")
+    assert {:error, _reason} = Acl.authenticate("alice", "replacement-secret")
+  end
+
+  test "concurrent dashboard account creation has one durable winner" do
+    store = FerricStore.Instance.get(:default)
+
+    results =
+      ["first-create-secret", "second-create-secret"]
+      |> Enum.map(fn secret ->
+        Task.async(fn ->
+          {secret, ACL.create_user("contended", ["on", ">" <> secret], store: store)}
+        end)
+      end)
+      |> Enum.map(&Task.await(&1, 5_000))
+
+    assert [{winning_secret, :ok}] = Enum.filter(results, &(elem(&1, 1) == :ok))
+
+    assert [{_losing_secret, {:error, :acl_user_already_exists}}] =
+             Enum.reject(results, &(elem(&1, 1) == :ok))
+
+    assert {:ok, "contended"} = Acl.authenticate("contended", winning_secret)
+  end
+
+  test "dashboard account updates never upsert a missing user" do
+    store = FerricStore.Instance.get(:default)
+
+    assert {:error, :acl_user_not_found} =
+             ACL.update_user("missing-dashboard-user", ["on"], store: store)
+
+    assert Acl.get_user("missing-dashboard-user") == nil
+    assert {:ok, nil} = Router.server_catalog_entry(store, "acl", "missing-dashboard-user")
+  end
+
+  test "dashboard account deletion uses the strict catalog mutation path" do
+    store = FerricStore.Instance.get(:default)
+    assert :ok = ACL.create_user("strict-delete", ["on", "nopass"], store: store)
+
+    assert {:ok, 1} = ACL.delete_user("strict-delete", store: store)
+    assert Acl.get_user("strict-delete") == nil
+  end
+
   test "prepared SETUSER values reject usernames that cannot authenticate" do
     assert {:error, utf8_reason} =
              ACL.prepare_catalog_value(nil, <<0xFF>>, ["on", "nopass"])

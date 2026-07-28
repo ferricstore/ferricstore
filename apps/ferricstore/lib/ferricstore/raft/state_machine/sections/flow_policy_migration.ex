@@ -12,7 +12,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
       alias Ferricstore.Flow.PolicyMigration
       alias Ferricstore.Flow.Query.SourceCatalog, as: FlowQuerySourceCatalog
       alias Ferricstore.Flow.RetryPolicy
-      alias Ferricstore.Flow.Schedule.Catalog, as: FlowScheduleCatalog
       alias Ferricstore.Flow.StateMeta
 
       defp flow_put_type_catalog_member(
@@ -90,9 +89,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
                        nil
                      ),
                    :ok <- flow_advance_active_job_barrier(state, type, revision) do
-                with :ok <- flow_reopen_stale_policy_migration(state, type, generation) do
-                  flow_put_schedule_catalog_member(state, record)
-                end
+                flow_reopen_stale_policy_migration(state, type, generation)
               end
             else
               {:error, "ERR flow type catalog entry is corrupt"}
@@ -123,7 +120,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
                        catalog.migration_generation
                      ),
                    :ok <- flow_advance_active_job_barrier(state, type, revision) do
-                flow_delete_schedule_catalog_member(state, record)
+                :ok
               end
             else
               {:error, "ERR flow type catalog ownership mismatch"}
@@ -137,116 +134,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
       end
 
       defp flow_delete_type_catalog_member(_state, _record), do: :ok
-
-      defp flow_put_schedule_catalog_member(state, record) do
-        case FlowScheduleCatalog.bucket(record) do
-          {:ok, bucket} ->
-            count_key = FlowScheduleCatalog.count_key(bucket)
-
-            with {:ok, count} <- flow_schedule_catalog_count(state, count_key),
-                 {:ok, bitmap} <- flow_schedule_catalog_bitmap(state),
-                 :ok <- flow_validate_schedule_catalog_membership(count, bitmap, bucket),
-                 true <- count < 0xFFFF_FFFF_FFFF_FFFF,
-                 :ok <-
-                   flow_put_hot_value(
-                     state,
-                     count_key,
-                     FlowScheduleCatalog.encode_count(count + 1),
-                     0
-                   ),
-                 :ok <- flow_store_schedule_catalog_bucket(state, bitmap, bucket) do
-              :ok
-            else
-              false -> {:error, "ERR flow schedule catalog count exhausted"}
-              {:error, _reason} = error -> error
-            end
-
-          :error ->
-            :ok
-        end
-      end
-
-      defp flow_delete_schedule_catalog_member(state, record) do
-        case FlowScheduleCatalog.bucket(record) do
-          {:ok, bucket} ->
-            count_key = FlowScheduleCatalog.count_key(bucket)
-
-            with {:ok, count} when count > 0 <- flow_schedule_catalog_count(state, count_key),
-                 {:ok, bitmap} <- flow_schedule_catalog_bitmap(state),
-                 :ok <- flow_validate_schedule_catalog_membership(count, bitmap, bucket),
-                 :ok <- flow_store_decremented_schedule_catalog_count(state, count_key, count),
-                 :ok <- flow_maybe_clear_schedule_catalog_bucket(state, bitmap, bucket, count) do
-              :ok
-            else
-              {:ok, 0} -> {:error, "ERR flow schedule catalog count is corrupt"}
-              {:error, _reason} = error -> error
-            end
-
-          :error ->
-            :ok
-        end
-      end
-
-      defp flow_schedule_catalog_count(state, key) do
-        case FlowScheduleCatalog.decode_count(do_get(state, key)) do
-          {:ok, count} -> {:ok, count}
-          :error -> {:error, "ERR flow schedule catalog count is corrupt"}
-        end
-      end
-
-      defp flow_schedule_catalog_bitmap(state) do
-        case FlowScheduleCatalog.decode_bitmap(do_get(state, FlowScheduleCatalog.bitmap_key())) do
-          {:ok, bitmap} -> {:ok, bitmap}
-          :error -> {:error, "ERR flow schedule catalog is corrupt"}
-        end
-      end
-
-      defp flow_validate_schedule_catalog_membership(count, bitmap, bucket) do
-        present? = Bitwise.band(bitmap, Bitwise.bsl(1, bucket)) != 0
-
-        if (count > 0 and present?) or (count == 0 and not present?),
-          do: :ok,
-          else: {:error, "ERR flow schedule catalog is corrupt"}
-      end
-
-      defp flow_store_decremented_schedule_catalog_count(state, key, 1),
-        do: do_delete(state, key)
-
-      defp flow_store_decremented_schedule_catalog_count(state, key, count) when count > 1 do
-        flow_put_hot_value(state, key, FlowScheduleCatalog.encode_count(count - 1), 0)
-      end
-
-      defp flow_store_schedule_catalog_bucket(state, bitmap, bucket) do
-        next_bitmap = FlowScheduleCatalog.put_bucket(bitmap, bucket)
-
-        if next_bitmap == bitmap do
-          :ok
-        else
-          flow_put_hot_value(
-            state,
-            FlowScheduleCatalog.bitmap_key(),
-            FlowScheduleCatalog.encode_bitmap(next_bitmap),
-            0
-          )
-        end
-      end
-
-      defp flow_maybe_clear_schedule_catalog_bucket(state, bitmap, bucket, 1) do
-        next_bitmap = FlowScheduleCatalog.delete_bucket(bitmap, bucket)
-
-        if next_bitmap == 0 do
-          do_delete(state, FlowScheduleCatalog.bitmap_key())
-        else
-          flow_put_hot_value(
-            state,
-            FlowScheduleCatalog.bitmap_key(),
-            FlowScheduleCatalog.encode_bitmap(next_bitmap),
-            0
-          )
-        end
-      end
-
-      defp flow_maybe_clear_schedule_catalog_bucket(_state, _bitmap, _bucket, _count), do: :ok
 
       defp flow_catalog_projection_newer?(state, %{id: id, type: type} = record)
            when is_binary(id) and is_binary(type) and type != "" do

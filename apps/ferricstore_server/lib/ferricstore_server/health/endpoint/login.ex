@@ -3,6 +3,7 @@ defmodule FerricstoreServer.Health.Endpoint.Login do
 
   alias FerricstoreServer.Acl
   alias FerricstoreServer.Acl.Password
+  alias FerricstoreServer.Health.Endpoint.AccessPage
 
   @authentication_error "WRONGPASS invalid username-password pair or user is disabled."
 
@@ -68,42 +69,35 @@ defmodule FerricstoreServer.Health.Endpoint.Login do
 
   def render_page(next, error) do
     safe_next = sanitize_next(next)
-    error_html = if is_binary(error), do: "<p class=\"error\">#{html_escape(error)}</p>", else: ""
 
-    """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="utf-8">
-      <title>FerricStore Dashboard Login</title>
-      <style>
-        body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-        main{width:min(420px,calc(100vw - 32px));border:1px solid #30363d;background:#161b22;padding:24px}
-        h1{font-size:22px;margin:0 0 8px}
-        p{color:#8b949e;margin:0 0 18px}
-        label{display:block;margin:14px 0 6px;color:#c9d1d9;font-size:13px}
-        input{box-sizing:border-box;width:100%;border:1px solid #30363d;background:#0d1117;color:#e6edf3;padding:10px 12px;font:inherit}
-        button{margin-top:18px;width:100%;border:0;background:#238636;color:white;padding:11px 12px;font:inherit;cursor:pointer}
-        .error{border:1px solid #f85149;color:#ffb4ae;background:#2d1215;padding:10px 12px}
-      </style>
-    </head>
-    <body>
-      <main>
-        <h1>FerricStore Dashboard</h1>
-        <p>Sign in with a FerricStore ACL user. Page access follows that user's command and key permissions.</p>
-        #{error_html}
-        <form method="post" action="/dashboard/login">
-          <input type="hidden" name="next" value="#{html_escape(safe_next)}">
-          <label for="username">Username</label>
-          <input id="username" name="username" autocomplete="username" autofocus>
-          <label for="password">Password</label>
-          <input id="password" name="password" type="password" autocomplete="current-password">
-          <button type="submit">Sign in</button>
-        </form>
-      </main>
-    </body>
-    </html>
-    """
+    form_html =
+      """
+      <form method="post" action="/dashboard/login">
+        <input type="hidden" name="next" value="#{AccessPage.escape(safe_next)}">
+        <label for="username">Username</label>
+        <input id="username" name="username" maxlength="1024" autocomplete="username" required autofocus autocapitalize="none" spellcheck="false">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" maxlength="4096" autocomplete="current-password" required>
+        <button type="submit">Sign in</button>
+      </form>
+      """
+
+    AccessPage.render(%{
+      title: "FerricStore Dashboard Login",
+      kicker: "Protected mode",
+      heading: "Sign in to the control plane",
+      copy:
+        "Use a FerricStore ACL account. Every dashboard page keeps that account's command and key boundaries.",
+      error: error,
+      form_html: form_html,
+      context_heading: "Access follows the live ACL policy.",
+      context_items: [
+        {"Identity", "FerricStore ACL"},
+        {"Transport", "Local or HTTPS"},
+        {"Session", "Signed and revocable"}
+      ],
+      footer_items: ["ACL-scoped access", "Revoked when credentials or rules change"]
+    })
   end
 
   defp has_control_byte?(path) do
@@ -111,16 +105,6 @@ defmodule FerricstoreServer.Health.Endpoint.Login do
       :binary.match(path, for(byte <- 0..31, byte not in [?\r, ?\n], do: <<byte>>)) != :nomatch or
       :binary.match(path, <<127>>) != :nomatch
   end
-
-  defp html_escape(value) when is_binary(value) do
-    value
-    |> String.replace("&", "&amp;")
-    |> String.replace("<", "&lt;")
-    |> String.replace(">", "&gt;")
-    |> String.replace("\"", "&quot;")
-  end
-
-  defp html_escape(value), do: value |> to_string() |> html_escape()
 
   defp authenticate_session_with(username, password, authenticate) do
     case Acl.get_user(username) do

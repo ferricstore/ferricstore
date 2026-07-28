@@ -15,7 +15,7 @@ defmodule FerricstoreServer.Native.Commands do
   require Logger
 
   alias Ferricstore.{AuditLog, Stats}
-  alias Ferricstore.Commands.{PreparedCommand, Strings}
+  alias Ferricstore.Commands.{KeyDiscovery, PreparedCommand, Strings}
   alias Ferricstore.Flow.{ClaimDueAPI, ClaimWaiters}
   alias Ferricstore.Flow.InternalKey
   alias Ferricstore.Flow.RecordProjection, as: FlowRecordProjection
@@ -2405,9 +2405,30 @@ defmodule FerricstoreServer.Native.Commands do
        do: :ok
 
   defp authorize_keys(command, @op_flow_schedule_create, payload, state) do
-    case validate_generated_schedule_target_scope(state.acl_cache, payload) do
-      :ok -> authorize_command_keys(command, @op_flow_schedule_create, payload, state)
-      {:error, reason} -> authorization_denied(command, reason, state)
+    case state.acl_cache do
+      :full_access ->
+        :ok
+
+      %{keys: :all} ->
+        :ok
+
+      cache ->
+        with {:ok, description} <-
+               KeyDiscovery.describe_structured("FLOW.SCHEDULE.CREATE", payload),
+             false <- "*" in description.acl_keys,
+             :ok <- ConnAuth.check_keys_cached(cache, command, description.acl_keys) do
+          :ok
+        else
+          true ->
+            authorization_denied(
+              command,
+              "NOPERM generated schedule targets require an authorized partition_key for scoped users",
+              state
+            )
+
+          {:error, reason} ->
+            authorization_denied(command, reason, state)
+        end
     end
   end
 
@@ -2421,36 +2442,6 @@ defmodule FerricstoreServer.Native.Commands do
       {:error, reason} -> authorization_denied(command, reason, state)
     end
   end
-
-  defp validate_generated_schedule_target_scope(:full_access, _payload), do: :ok
-  defp validate_generated_schedule_target_scope(%{keys: :all}, _payload), do: :ok
-
-  defp validate_generated_schedule_target_scope(_acl_cache, payload) do
-    target = payload_flow_option(payload, "target")
-
-    if generated_schedule_target?(target) and is_nil(schedule_target_partition_key(target)) do
-      {:error,
-       "NOPERM generated schedule targets require an authorized partition_key for scoped users"}
-    else
-      :ok
-    end
-  end
-
-  defp generated_schedule_target?(%{} = target),
-    do: is_nil(Map.get(target, "id") || Map.get(target, :id))
-
-  defp generated_schedule_target?(target) when is_list(target),
-    do: is_nil(Keyword.get(target, :id))
-
-  defp generated_schedule_target?(_target), do: false
-
-  defp schedule_target_partition_key(%{} = target),
-    do: Map.get(target, "partition_key") || Map.get(target, :partition_key)
-
-  defp schedule_target_partition_key(target) when is_list(target),
-    do: Keyword.get(target, :partition_key)
-
-  defp schedule_target_partition_key(_target), do: nil
 
   defp authorization_denied(command, reason, state) do
     FerricstoreServer.Acl.Protection.log_command_denied(
@@ -2659,7 +2650,12 @@ defmodule FerricstoreServer.Native.Commands do
   defp keys(opcode, payload) when opcode in @flow_partition_or_id_opcodes,
     do: flow_partition_or_fallback(payload, [Map.get(payload, "id")])
 
-  defp keys(@op_flow_schedule_create, payload), do: flow_schedule_create_acl_keys(payload)
+  defp keys(@op_flow_schedule_create, payload) do
+    case KeyDiscovery.describe_structured("FLOW.SCHEDULE.CREATE", payload) do
+      {:ok, description} -> description.acl_keys
+      {:error, _reason} -> ["*"]
+    end
+  end
 
   defp keys(opcode, _payload) when opcode in @flow_schedule_id_opcodes, do: ["*"]
 
@@ -2815,25 +2811,6 @@ defmodule FerricstoreServer.Native.Commands do
         end
     end
   end
-
-  defp flow_schedule_create_acl_keys(payload) do
-    schedule_id = Map.get(payload, "id")
-    target_key = payload |> payload_flow_option("target") |> flow_schedule_target_acl_key()
-    binary_list([schedule_id, target_key || "*"])
-  end
-
-  defp flow_schedule_target_acl_key(%{} = target) do
-    Map.get(target, "partition_key") || Map.get(target, :partition_key) ||
-      Map.get(target, "id") || Map.get(target, :id) || Map.get(target, "id_prefix") ||
-      Map.get(target, :id_prefix)
-  end
-
-  defp flow_schedule_target_acl_key(target) when is_list(target) do
-    Keyword.get(target, :partition_key) || Keyword.get(target, :id) ||
-      Keyword.get(target, :id_prefix)
-  end
-
-  defp flow_schedule_target_acl_key(_target), do: nil
 
   defp flow_approval_request_acl_keys(payload) do
     [
@@ -7782,7 +7759,7 @@ defmodule FerricstoreServer.Native.Commands do
         {:ok, opts}
 
       _other ->
-        opts =
+        top_level =
           payload
           |> Map.drop([
             "opts",
@@ -7791,7 +7768,12 @@ defmodule FerricstoreServer.Native.Commands do
             :__wire_flow_items_normalized__,
             :__wire_flow_opts__ | drop_keys
           ])
-          |> Map.merge(option_map(Map.get(payload, "opts", %{})))
+
+        opts =
+          payload
+          |> Map.get("opts", %{})
+          |> option_map()
+          |> Map.merge(top_level)
 
         to_flow_opts(opts)
     end

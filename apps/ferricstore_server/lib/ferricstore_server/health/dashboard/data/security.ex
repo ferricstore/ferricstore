@@ -2,7 +2,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
   @moduledoc false
 
   alias FerricstoreServer.Acl
-  alias FerricstoreServer.Acl.Formatter
+  alias FerricstoreServer.Acl.{Formatter, Tables}
   alias FerricstoreServer.Health.Dashboard.Access
   alias FerricstoreServer.Health.Endpoint.RouteRequirements
 
@@ -49,6 +49,9 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
       current_user: current_user,
       acl_user_count: length(users),
       acl_users: users,
+      can_manage_users: command_allowed?(current_user, "ACL.SETUSER"),
+      can_delete_users: command_allowed?(current_user, "ACL.DELUSER"),
+      flash: collect_flash(params),
       tester: collect_tester(params, current_user),
       route_requirements: route_requirements(),
       generated_at_ms: System.system_time(:millisecond)
@@ -80,21 +83,63 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
   end
 
   defp acl_user_summaries do
-    Acl.list_users()
-    |> Enum.map(&parse_acl_rule/1)
+    Tables.read(&:ets.tab2list/1)
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.map(&acl_user_summary/1)
   rescue
     _ -> []
   catch
     :exit, _ -> []
   end
 
-  defp parse_acl_rule(rule) when is_binary(rule) do
-    case Formatter.split_user_rule(rule) do
-      {:ok, {username, state, summary}} ->
-        %{username: username, state: state, rule: rule, summary: summary}
+  defp acl_user_summary({username, user}) when is_binary(username) and is_map(user) do
+    %{
+      username: username,
+      state: if(Map.get(user, :enabled) == true, do: "on", else: "off"),
+      rule: Formatter.format_user_rule({username, user}),
+      password_configured: is_binary(Map.get(user, :password)),
+      access: access_label(user)
+    }
+  rescue
+    _error -> invalid_acl_user_summary(username)
+  end
 
-      :error ->
-        %{username: "unknown", state: "unknown", rule: rule, summary: rule}
+  defp acl_user_summary(_invalid), do: invalid_acl_user_summary("unknown")
+
+  defp invalid_acl_user_summary(username) do
+    %{
+      username: username,
+      state: "unknown",
+      rule: "Invalid ACL record",
+      password_configured: false,
+      access: "Invalid record"
+    }
+  end
+
+  defp access_label(%{commands: :all, keys: :all}), do: "Full administrator"
+
+  defp access_label(%{commands: commands}) when is_struct(commands, MapSet) do
+    "#{MapSet.size(commands)} explicit commands"
+  end
+
+  defp access_label(_user), do: "Restricted"
+
+  defp command_allowed?(username, command) when is_binary(username) do
+    Acl.check_command(username, command) == :ok
+  rescue
+    _error -> false
+  catch
+    :exit, _reason -> false
+  end
+
+  defp command_allowed?(_username, _command), do: false
+
+  defp collect_flash(params) do
+    status = Map.get(params, "status")
+    message = Map.get(params, "message")
+
+    if status in ["ok", "error"] and is_binary(message) and message != "" do
+      %{status: status, message: String.slice(message, 0, 512)}
     end
   end
 

@@ -322,6 +322,107 @@ defmodule Ferricstore.Commands.KeyDiscovery do
     }
   end
 
+  @spec describe_structured(binary(), map()) :: {:ok, description()} | {:error, binary()}
+  def describe_structured(command, payload) when is_binary(command) and is_map(payload) do
+    command = String.upcase(command)
+
+    with {:ok, discovered_keys} <- structured_keys(command, payload) do
+      {:ok, describe(command, {:structured_native_command, command}, discovered_keys)}
+    end
+  end
+
+  def describe_structured(_command, _payload),
+    do: {:error, "ERR structured command payload must be a map"}
+
+  defp structured_keys("FLOW.SCHEDULE.CREATE", payload) do
+    schedule_key = payload |> structured_option("id") |> bounded_acl_key()
+    target_key = payload |> structured_option("target") |> schedule_target_acl_key()
+    {:ok, Enum.uniq([schedule_key, target_key])}
+  end
+
+  defp structured_keys(command, _payload),
+    do: {:error, "ERR unsupported structured key discovery for #{command}"}
+
+  defp schedule_target_acl_key(target) when is_map(target) do
+    target
+    |> structured_target_key()
+    |> bounded_acl_key()
+  end
+
+  defp schedule_target_acl_key(target) when is_list(target) do
+    target
+    |> structured_target_key()
+    |> bounded_acl_key()
+  end
+
+  defp schedule_target_acl_key(_target), do: "*"
+
+  defp structured_target_key(target) do
+    structured_field(target, "partition_key") ||
+      structured_field(target, "id") ||
+      generated_target_scope(target)
+  end
+
+  defp generated_target_scope(target) do
+    case structured_field(target, "id_prefix") do
+      value when is_binary(value) and value != "" -> "*"
+      _missing -> nil
+    end
+  end
+
+  defp bounded_acl_key(value) when is_binary(value) and value != "", do: value
+  defp bounded_acl_key(_value), do: "*"
+
+  defp structured_option(payload, key) do
+    case fetch_structured_field(payload, key) do
+      {:ok, value} ->
+        value
+
+      :error ->
+        case structured_field(payload, "opts") do
+          opts when is_map(opts) or is_list(opts) -> structured_field(opts, key)
+          _no_opts -> nil
+        end
+    end
+  end
+
+  defp structured_field(value, key) do
+    case fetch_structured_field(value, key) do
+      {:ok, field} -> field
+      :error -> nil
+    end
+  end
+
+  defp fetch_structured_field(map, key) when is_map(map) do
+    case Map.fetch(map, key) do
+      {:ok, _value} = found -> found
+      :error -> Map.fetch(map, structured_atom_key(key))
+    end
+  end
+
+  defp fetch_structured_field(list, key) when is_list(list) do
+    case List.keyfind(list, key, 0) do
+      {^key, value} ->
+        {:ok, value}
+
+      nil ->
+        atom_key = structured_atom_key(key)
+
+        case List.keyfind(list, atom_key, 0) do
+          {^atom_key, value} -> {:ok, value}
+          nil -> :error
+        end
+    end
+  end
+
+  defp fetch_structured_field(_value, _key), do: :error
+
+  defp structured_atom_key("id"), do: :id
+  defp structured_atom_key("id_prefix"), do: :id_prefix
+  defp structured_atom_key("opts"), do: :opts
+  defp structured_atom_key("partition_key"), do: :partition_key
+  defp structured_atom_key("target"), do: :target
+
   defp acl_resources(command, discovered_keys) when command in @channel_acl_commands,
     do: {[], discovered_keys}
 

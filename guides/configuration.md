@@ -851,6 +851,8 @@ These environment variables are read from `config/runtime.exs` in production (`M
 | `FERRICSTORE_DASHBOARD_TRUSTED_PROXIES` | unset | Comma-separated proxy IPs/CIDRs allowed to supply forwarded headers |
 | `FERRICSTORE_DASHBOARD_COOKIE_SECURE` | `auto` | Set dashboard cookies Secure automatically, always, or never |
 | `FERRICSTORE_DASHBOARD_ALLOWED_ORIGINS` | unset | Additional comma-separated Origins accepted for dashboard POSTs |
+| `FERRICSTORE_DASHBOARD_SESSION_SECRET` | unset | Session-signing secret of at least 32 bytes; required when remote dashboard access is enabled |
+| `FERRICSTORE_DASHBOARD_BOOTSTRAP_TOKEN_FILE` | unset | File containing the 32-4096 byte credential required for remote first-time dashboard setup; one trailing LF or CRLF is ignored |
 | `FERRICSTORE_AUTH_RATE_LIMIT_MAX_ATTEMPTS` | `10` | Authentication attempts allowed per username and source IP window |
 | `FERRICSTORE_AUTH_RATE_LIMIT_WINDOW_MS` | `60000` | Authentication rate-limit window in milliseconds |
 | `FERRICSTORE_AUTH_RATE_LIMIT_MAX_ENTRIES` | `10000` | Maximum bounded authentication limiter entries |

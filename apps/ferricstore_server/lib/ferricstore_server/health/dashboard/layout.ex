@@ -3,6 +3,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
 
   import FerricstoreServer.Health.Dashboard.Format
 
+  alias FerricstoreServer.Acl
   alias FerricstoreServer.Health.Dashboard.Layout.Styles
 
   def page_head(title, refresh_seconds) do
@@ -466,12 +467,29 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
 
   def sidebar_html(active, badges) do
     links = Enum.map_join(sidebar_sections(), "\n", &render_sidebar_section(&1, active, badges))
+    session = render_sidebar_session()
 
     """
     <nav class="sidebar" aria-label="Dashboard sections">
       #{links}
+      #{session}
     </nav>
     """
+  end
+
+  defp render_sidebar_session do
+    if Acl.protected_mode?() do
+      """
+      <div class="sidebar-session">
+        <span>Protected session</span>
+        <form action="/dashboard/logout" method="post">
+          <button type="submit">Sign out</button>
+        </form>
+      </div>
+      """
+    else
+      ""
+    end
   end
 
   defp sidebar_sections do

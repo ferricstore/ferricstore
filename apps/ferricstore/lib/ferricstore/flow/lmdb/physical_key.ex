@@ -17,7 +17,8 @@ defmodule Ferricstore.Flow.LMDB.PhysicalKey do
   @spec compact?(term()) :: boolean()
   def compact?(logical_key) when is_binary(logical_key) do
     byte_size(logical_key) > @max_direct_key_bytes and
-      byte_size(logical_key) <= Router.max_key_size() and Keys.state_key?(logical_key)
+      byte_size(logical_key) <= Router.max_key_size() and
+      (Keys.state_key?(logical_key) or Keys.value_key?(logical_key))
   end
 
   def compact?(_logical_key), do: false

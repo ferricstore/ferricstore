@@ -1,10 +1,14 @@
 defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
   @moduledoc false
 
+  alias Ferricstore.AuditLog
+  alias FerricstoreServer.Health.Dashboard.Accounts
   alias FerricstoreServer.Health.Dashboard
   alias FerricstoreServer.Health.Endpoint.Auth
   alias FerricstoreServer.Health.Endpoint.FlowPaths
+  alias FerricstoreServer.Health.Endpoint.Login
   alias FerricstoreServer.Health.Endpoint.Response
+  alias FerricstoreServer.Health.Endpoint.Session
   alias FerricstoreServer.Health.QueryDecoder
 
   def handle_slowlog_page(socket, transport, peer, headers) do
@@ -68,6 +72,35 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
     end
   end
 
+  def handle_security_mutation(socket, transport, peer, headers, action, body) do
+    case Session.session_user(headers) do
+      actor when is_binary(actor) ->
+        params = FlowPaths.decode_form_body(body)
+        result = apply_security_mutation(action, actor, params)
+        audit_security_mutation(result, action, actor, params, peer, headers)
+
+        respond_to_security_mutation(
+          socket,
+          transport,
+          peer,
+          headers,
+          action,
+          actor,
+          params,
+          result
+        )
+
+      _missing_session ->
+        Response.send_response(
+          socket,
+          transport,
+          403,
+          "Forbidden",
+          ~s({"error":"an authenticated protected-mode session is required"})
+        )
+    end
+  end
+
   def handle_raft_page(socket, transport, peer, headers) do
     case Auth.observability_authorized?(peer, headers) do
       false ->
@@ -85,6 +118,91 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
             Response.send_html_response(socket, transport, 200, "OK", body)
         end
     end
+  end
+
+  defp apply_security_mutation(:create, actor, params),
+    do: Accounts.create_user(actor, params)
+
+  defp apply_security_mutation(:state, actor, params) do
+    case Map.get(params, "enabled") do
+      "true" -> Accounts.set_enabled(actor, Map.get(params, "username", ""), true)
+      "false" -> Accounts.set_enabled(actor, Map.get(params, "username", ""), false)
+      _invalid -> {:error, "Account state must be enabled or disabled."}
+    end
+  end
+
+  defp apply_security_mutation(:password, actor, params),
+    do: Accounts.reset_password(actor, params)
+
+  defp apply_security_mutation(:rules, actor, params),
+    do: Accounts.apply_modifiers(actor, params)
+
+  defp apply_security_mutation(:delete, actor, params),
+    do: Accounts.delete_user(actor, Map.get(params, "username", ""))
+
+  defp respond_to_security_mutation(
+         socket,
+         transport,
+         peer,
+         headers,
+         :password,
+         actor,
+         _params,
+         {:ok, actor}
+       ) do
+    Response.send_redirect_response(socket, transport, "/dashboard/login", [
+      {"Set-Cookie", Session.clear_session_cookie(peer, headers)}
+    ])
+  end
+
+  defp respond_to_security_mutation(
+         socket,
+         transport,
+         _peer,
+         _headers,
+         action,
+         _actor,
+         params,
+         result
+       ) do
+    {status, message} = security_flash(result, action, params)
+
+    location =
+      "/dashboard/security?" <>
+        URI.encode_query(%{"status" => status, "message" => message})
+
+    Response.send_redirect_response(socket, transport, location)
+  end
+
+  defp security_flash({:ok, username}, :create, _params),
+    do: {"ok", "Account '#{username}' created."}
+
+  defp security_flash({:ok, username}, :password, _params),
+    do: {"ok", "Password for '#{username}' reset."}
+
+  defp security_flash({:ok, username}, :rules, _params),
+    do: {"ok", "ACL modifiers for '#{username}' updated."}
+
+  defp security_flash({:ok, username}, :state, %{"enabled" => "true"}),
+    do: {"ok", "Account '#{username}' enabled."}
+
+  defp security_flash({:ok, username}, :state, %{"enabled" => "false"}),
+    do: {"ok", "Account '#{username}' disabled."}
+
+  defp security_flash({:ok, username}, :delete, _params),
+    do: {"ok", "Account '#{username}' deleted."}
+
+  defp security_flash({:error, message}, _action, _params), do: {"error", message}
+
+  defp audit_security_mutation(result, action, actor, params, peer, headers) do
+    AuditLog.log(:acl_user_change, %{
+      actor: actor,
+      target: Map.get(params, "username", ""),
+      action: action,
+      outcome: if(match?({:ok, _username}, result), do: :ok, else: :error),
+      client_ip: peer |> Session.client_peer(headers) |> Login.peer_string(),
+      surface: :dashboard
+    })
   end
 
   def handle_consensus_redirect(socket, transport, peer, headers) do

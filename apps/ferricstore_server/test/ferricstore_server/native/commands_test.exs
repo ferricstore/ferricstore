@@ -4007,6 +4007,55 @@ defmodule FerricstoreServer.Native.CommandsTest do
     refute status == :noperm
   end
 
+  test "native Flow options cannot shadow authorized top-level schedule fields" do
+    assert :ok =
+             Acl.set_user("schedule_option_precedence", [
+               "on",
+               "nopass",
+               "-@all",
+               "+@read",
+               "+@write",
+               "~tenant:a:*"
+             ])
+
+    state = state_as("schedule_option_precedence")
+    schedule_id = "tenant:a:precedence:#{System.unique_integer([:positive])}"
+
+    payload = %{
+      "id" => schedule_id,
+      "kind" => "delay",
+      "delay_ms" => 1_000,
+      "target" => %{
+        "id" => "tenant:a:target",
+        "type" => "scheduled",
+        "partition_key" => "tenant:a:partition"
+      },
+      "opts" => %{
+        "target" => %{
+          "id" => "tenant:b:target",
+          "type" => "scheduled",
+          "partition_key" => "tenant:b:partition"
+        }
+      }
+    }
+
+    assert {:ok,
+            %{
+              id: ^schedule_id,
+              target: %{id: "tenant:a:target", partition_key: "tenant:a:partition"}
+            }, _state} = Commands.execute(@op_flow_schedule_create, payload, state)
+  end
+
+  test "native schedule ACLs consume the shared structured command contract" do
+    source =
+      Path.expand("../../../lib/ferricstore_server/native/commands.ex", __DIR__)
+      |> File.read!()
+
+    assert source =~ ~s|KeyDiscovery.describe_structured("FLOW.SCHEDULE.CREATE", payload)|
+    refute source =~ "defp flow_schedule_create_acl_keys"
+    refute source =~ "defp flow_schedule_target_acl_key"
+  end
+
   test "approval ACLs ignore decoy partitions and protect requested flow scope" do
     put_platform_scoped_user("platform_scoped")
     state = state_as("platform_scoped")

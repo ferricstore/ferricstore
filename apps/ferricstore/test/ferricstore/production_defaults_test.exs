@@ -75,6 +75,13 @@ defmodule Ferricstore.ProductionDefaultsTest do
     refute runtime_exs =~ "write_through"
   end
 
+  test "scheduler documentation names the runtime retry option" do
+    source = File.read!(Path.join(@repo_root, "apps/ferricstore/lib/ferricstore.ex"))
+
+    assert source =~ ":error_sleep_ms"
+    refute source =~ ":interval_ms"
+  end
+
   test "native NIFs build from source by default in repo checkouts" do
     config_exs = File.read!(Path.join(@repo_root, "config/config.exs"))
     bench_exs = File.read!(Path.join(@repo_root, "config/bench.exs"))

@@ -93,7 +93,9 @@ defmodule FerricstoreServer.Health.Endpoint.SecurityTest do
 
     assert response_header(health_response, "x-content-type-options") == "nosniff"
     assert response_header(health_response, "x-frame-options") == "DENY"
-    assert response_header(health_response, "referrer-policy") == "no-referrer"
+    # Chromium serializes the Origin of same-origin form POSTs as `null` under
+    # `no-referrer`, which makes the dashboard reject its own CSRF-protected forms.
+    assert response_header(health_response, "referrer-policy") == "same-origin"
     assert response_header(health_response, "cache-control") == "no-store"
     assert response_header(health_response, "permissions-policy") =~ "camera=()"
 

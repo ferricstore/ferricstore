@@ -3,6 +3,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
 
   alias Ferricstore.Flow.{Attributes, Internal, Keys, RetryPolicy, StateMeta}
   alias Ferricstore.Flow.Query.QueryRowCodec
+  alias Ferricstore.Flow.Schedule.Metadata, as: ScheduleMetadata
   alias Ferricstore.Store.Router
 
   import Ferricstore.Flow.Options,
@@ -121,7 +122,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
          {:ok, priority} <- optional_priority(opts, @default_priority),
          {:ok, partition_key} <- optional_partition_key(opts),
          {:ok, attributes} <- Attributes.from_opts(opts),
-         {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
+         {:ok, state_meta} <- StateMeta.update_from_opts(opts),
+         {:ok, schedule_metadata} <- optional_schedule_metadata(opts, type) do
       partition_key_explicit? = not is_nil(partition_key)
       partition_key = partition_key || Ferricstore.Flow.Keys.auto_partition_key(id)
 
@@ -146,6 +148,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
         |> maybe_put_flow_value_ref(opts, :payload_ref)
         |> maybe_put_named_value_opts(opts)
         |> maybe_put_attr(:attributes, attributes)
+        |> maybe_put_attr(:schedule_metadata, schedule_metadata)
         |> maybe_put_state_meta_update_opts(state, state_meta)
         |> maybe_put_attr(:now_ms, now)
         |> maybe_put_attr(:run_at_ms, run_at_ms)
@@ -153,6 +156,22 @@ defmodule Ferricstore.Flow.MutationAttrs do
       with :ok <- validate_create_query_row(attrs) do
         {:ok, attrs}
       end
+    end
+  end
+
+  defp optional_schedule_metadata(opts, type) do
+    case Keyword.fetch(opts, :schedule_metadata) do
+      :error ->
+        {:ok, nil}
+
+      {:ok, metadata} ->
+        with true <- Internal.allowed?(opts),
+             true <- Internal.reserved_type?(type),
+             {:ok, %{} = normalized} <- ScheduleMetadata.normalize(metadata) do
+          {:ok, normalized}
+        else
+          _invalid -> {:error, "ERR flow schedule metadata is reserved for internal use"}
+        end
     end
   end
 

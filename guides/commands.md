@@ -134,6 +134,13 @@ List state filters must use that state set or `all`, and `from_ms` cannot exceed
 `to_ms`. A planning failure persists `end_reason: planning_failed` and
 `last_planning_error` without creating a target.
 
+Schedule create, get, fire, pause, resume, and list responses include the
+complete recurrence shape. `created_at_ms`, `every_ms`, `cron`, and
+`overlap_retry_ms` are always present; non-applicable optional values are
+null. Lists are globally ordered by next due time and ID (reversed by `REV`),
+scan the durable exact-type catalog in bounded pages, and hydrate only the
+requested top results. There is no fixed total-candidate ceiling.
+
 The built-in scheduler owns automatic due execution. `FLOW.SCHEDULE.FIRE_DUE`
 is exposed for tests, administration, or deployments that intentionally use a
 custom scheduler; its result includes `claimed`, `fired`, `skipped`,

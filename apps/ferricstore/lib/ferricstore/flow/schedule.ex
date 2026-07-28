@@ -22,6 +22,7 @@ defmodule Ferricstore.Flow.Schedule do
     Dispatcher,
     Limits,
     Listing,
+    Metadata,
     ResourceGovernance,
     Summary,
     TargetOwnership
@@ -106,6 +107,7 @@ defmodule Ferricstore.Flow.Schedule do
         type: @schedule_type,
         state: @active_state,
         partition_key: partition_key(id),
+        schedule_metadata: Metadata.from_definition(definition),
         payload: definition,
         run_at_ms: Map.fetch!(definition, :next_run_at_ms),
         now_ms: Map.fetch!(definition, :created_at_ms)
@@ -1163,6 +1165,7 @@ defmodule Ferricstore.Flow.Schedule do
       state: state,
       partition_key: Map.get(record, :partition_key),
       expected_version: Map.fetch!(record, :version),
+      schedule_metadata: Metadata.from_definition(definition),
       payload: definition,
       run_at_ms: run_at_ms,
       now_ms: now_ms
@@ -1853,6 +1856,9 @@ defmodule Ferricstore.Flow.Schedule do
       flow_id: Map.get(record, :id),
       state: Map.get(record, :state),
       kind: Map.fetch!(definition, :kind),
+      created_at_ms: Map.get(definition, :created_at_ms),
+      every_ms: Map.get(definition, :every_ms),
+      cron: Map.get(definition, :cron),
       next_run_at_ms: visible_next_run_at_ms(record, definition),
       fire_count: Map.get(definition, :fire_count, 0),
       attempts: Map.get(record, :attempts, 0),
@@ -1869,6 +1875,7 @@ defmodule Ferricstore.Flow.Schedule do
       last_coalesced_count: Map.get(definition, :last_coalesced_count, 0),
       last_planning_error: Map.get(definition, :last_planning_error),
       overlap_policy: Map.get(definition, :overlap_policy, :allow),
+      overlap_retry_ms: Map.get(definition, :overlap_retry_ms),
       overlap_queued_due_at_ms: Map.get(definition, :overlap_queued_due_at_ms),
       max_fires: Map.get(definition, :max_fires),
       end_at_ms: Map.get(definition, :end_at_ms),

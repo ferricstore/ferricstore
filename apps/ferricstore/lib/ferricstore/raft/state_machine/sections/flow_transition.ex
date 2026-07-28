@@ -22,6 +22,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
       alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
       alias Ferricstore.Flow.Keys, as: FlowKeys
       alias Ferricstore.Flow.RetryPolicy
+      alias Ferricstore.Flow.Schedule.Metadata, as: ScheduleMetadata
       alias Ferricstore.HLC
 
       alias Ferricstore.Store.{
@@ -157,6 +158,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
 
         with {:ok, record} <- flow_require_record(state, id, partition_key),
              :ok <- flow_require_schedule_type(record, expected_type),
+             :ok <- flow_validate_schedule_replace_state(logical_state),
              :ok <- flow_require_schedule_version(record, expected_version),
              :ok <- flow_require_schedule_unleased(record, apply_now_ms()),
              {:ok, record, next} <-
@@ -667,10 +669,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
       defp flow_require_schedule_type(nil, _expected_type),
         do: {:error, "ERR flow schedule not found"}
 
-      defp flow_require_schedule_type(%{type: expected_type}, expected_type), do: :ok
+      defp flow_require_schedule_type(
+             %{type: "__ferricstore_schedule"},
+             "__ferricstore_schedule"
+           ),
+           do: :ok
 
       defp flow_require_schedule_type(_record, _expected_type),
         do: {:error, "ERR flow schedule not found"}
+
+      defp flow_validate_schedule_replace_state(state) when state in ["active", "paused"],
+        do: :ok
+
+      defp flow_validate_schedule_replace_state(_state),
+        do: {:error, "ERR invalid internal flow schedule state"}
 
       defp flow_require_schedule_version(%{version: expected_version}, expected_version), do: :ok
 
@@ -705,9 +717,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
         partition_key = Map.get(record, :partition_key)
 
         with {:ok, value_refs} <-
-               flow_named_value_refs(record, attrs, id, version, partition_key) do
+               flow_named_value_refs(record, attrs, id, version, partition_key),
+             {:ok, schedule_metadata} <- flow_schedule_replace_metadata(record, attrs) do
           next =
             record
+            |> flow_schedule_replace_put_metadata(schedule_metadata)
             |> Map.merge(%{
               state: logical_state,
               run_state: nil,
@@ -733,6 +747,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
           end
         end
       end
+
+      defp flow_schedule_replace_metadata(_record, attrs) do
+        case {Map.fetch(attrs, :schedule_metadata), Map.fetch(attrs, :payload)} do
+          {{:ok, metadata}, {:ok, definition}} ->
+            with {:ok, %{} = normalized} <- ScheduleMetadata.normalize(metadata),
+                 {:ok, ^normalized} <- ScheduleMetadata.from_definition_result(definition) do
+              {:ok, normalized}
+            else
+              _invalid -> {:error, "ERR invalid internal flow schedule metadata"}
+            end
+
+          _incomplete ->
+            {:error, "ERR invalid internal flow schedule metadata"}
+        end
+      end
+
+      defp flow_schedule_replace_put_metadata(record, metadata),
+        do: Map.put(record, :schedule_metadata, metadata)
 
       defp flow_apply_reschedule(state, record, next, partition_key, now_ms, attrs) do
         plans = [{record, next}]

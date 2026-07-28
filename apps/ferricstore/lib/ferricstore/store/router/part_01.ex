@@ -160,6 +160,97 @@ defmodule Ferricstore.Store.Router.Part01 do
         do: {:error, "ERR invalid shard batch read request"}
 
       @doc false
+      def read_shard_values_chunked(_ctx, idx, []) when is_integer(idx) and idx >= 0,
+        do: {:ok, []}
+
+      def read_shard_values_chunked(ctx, idx, keys)
+          when is_integer(idx) and idx >= 0 and is_list(keys) and
+                 length(keys) <= @shard_batch_read_max_keys do
+        case classify_shard_batch_read(keys, 0, 0) do
+          :valid -> read_shard_values(ctx, idx, keys)
+          :split -> read_shard_value_chunks(ctx, idx, keys, [], 0, 0, [])
+          :invalid -> {:error, "ERR invalid shard batch read request"}
+        end
+      end
+
+      def read_shard_values_chunked(_ctx, _idx, _keys),
+        do: {:error, "ERR invalid shard batch read request"}
+
+      defp classify_shard_batch_read([], _count, _bytes), do: :valid
+
+      defp classify_shard_batch_read([key | rest], count, bytes)
+           when is_binary(key) and byte_size(key) <= @shard_batch_read_max_key_size do
+        next_count = count + 1
+        next_bytes = bytes + byte_size(key)
+
+        if next_count > @shard_batch_read_max_keys or
+             next_bytes > @shard_batch_read_max_key_bytes do
+          :split
+        else
+          classify_shard_batch_read(rest, next_count, next_bytes)
+        end
+      end
+
+      defp classify_shard_batch_read(_keys, _count, _bytes), do: :invalid
+
+      defp read_shard_value_chunks(ctx, idx, [], current, _count, _bytes, value_chunks) do
+        with {:ok, value_chunks} <-
+               read_final_shard_value_chunk(ctx, idx, current, value_chunks) do
+          {:ok, value_chunks |> Enum.reverse() |> Enum.concat()}
+        end
+      end
+
+      defp read_shard_value_chunks(
+             ctx,
+             idx,
+             [key | rest],
+             current,
+             count,
+             bytes,
+             value_chunks
+           )
+           when is_binary(key) and byte_size(key) <= @shard_batch_read_max_key_size do
+        key_bytes = byte_size(key)
+
+        if count == @shard_batch_read_max_keys or
+             bytes + key_bytes > @shard_batch_read_max_key_bytes do
+          with {:ok, values} <- read_shard_values(ctx, idx, Enum.reverse(current)) do
+            read_shard_value_chunks(ctx, idx, rest, [key], 1, key_bytes, [values | value_chunks])
+          end
+        else
+          read_shard_value_chunks(
+            ctx,
+            idx,
+            rest,
+            [key | current],
+            count + 1,
+            bytes + key_bytes,
+            value_chunks
+          )
+        end
+      end
+
+      defp read_shard_value_chunks(
+             _ctx,
+             _idx,
+             _keys,
+             _current,
+             _count,
+             _bytes,
+             _value_chunks
+           ),
+           do: {:error, "ERR invalid shard batch read request"}
+
+      defp read_final_shard_value_chunk(_ctx, _idx, [], value_chunks),
+        do: {:ok, value_chunks}
+
+      defp read_final_shard_value_chunk(ctx, idx, current, value_chunks) do
+        with {:ok, values} <- read_shard_values(ctx, idx, Enum.reverse(current)) do
+          {:ok, [values | value_chunks]}
+        end
+      end
+
+      @doc false
       def read_shard_entries(ctx, idx, keys)
           when is_integer(idx) and idx >= 0 and is_list(keys) and
                  length(keys) <= @shard_batch_read_max_keys do

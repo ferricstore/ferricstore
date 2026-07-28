@@ -1,16 +1,14 @@
 defmodule Ferricstore.Flow.Schedule.Listing do
   @moduledoc false
 
-  alias Ferricstore.Flow.RecordRead
   alias Ferricstore.Flow.Schedule
   alias Ferricstore.Flow.Schedule.Catalog
 
-  @schedule_type "__ferricstore_schedule"
-  @schedule_id_prefix "__ferricstore_schedule__:"
   @active_state "active"
   @terminal_states ["completed", "failed", "cancelled"]
   @all_states ["active", "paused", "running" | @terminal_states]
-  @default_scan_limit 1_000
+  @default_page_size 256
+  @max_page_size 512
   @max_exact_integer 9_007_199_254_740_991
   @option_keys [:count, :from_ms, :kind, :rev, :state, :target_type, :timezone, :to_ms]
 
@@ -21,17 +19,14 @@ defmodule Ferricstore.Flow.Schedule.Listing do
          {:ok, count} <- list_count(opts),
          {:ok, rev?} <- optional_boolean(opts, :rev, false),
          {:ok, filters} <- list_filters(opts),
-         {:ok, partition_keys} <- Catalog.partition_keys(ctx),
-         {:ok, records} <- collect_candidates(ctx, states, partition_keys, scan_limit()),
-         {:ok, schedules} <- hydrate_records(ctx, records) do
-      direction = if rev?, do: :desc, else: :asc
-
+         direction = if(rev?, do: :desc, else: :asc),
+         {:ok, summaries} <- collect_summaries(ctx, states, filters, count, direction),
+         {:ok, schedules} <- hydrate_summaries(ctx, summaries) do
       schedules =
         schedules
         |> Enum.reject(&is_nil/1)
-        |> Enum.uniq_by(& &1.id)
-        |> Enum.filter(&matches_filters?(&1, filters))
-        |> Enum.sort_by(&{sort_due(&1), &1.id}, direction)
+        |> Enum.filter(&matches_schedule?(&1, states, filters))
+        |> sort_schedules(direction)
         |> Enum.take(count)
 
       {:ok, schedules}
@@ -39,6 +34,73 @@ defmodule Ferricstore.Flow.Schedule.Listing do
   end
 
   def list(_ctx, _opts), do: {:error, "ERR flow schedule opts must be a keyword list"}
+
+  defp collect_summaries(ctx, states, filters, count, direction) do
+    reducer = fn page, selected ->
+      page
+      |> Enum.filter(&matches_summary?(&1, states, filters))
+      |> Enum.reduce(selected, &put_newest_summary/2)
+      |> trim_summaries(count, direction)
+    end
+
+    with {:ok, selected} <- Catalog.reduce_summaries(ctx, page_size(), %{}, reducer) do
+      {:ok, selected |> Map.values() |> sort_summaries(direction)}
+    end
+  end
+
+  defp put_newest_summary(summary, selected) do
+    Map.update(selected, summary.id, summary, fn current ->
+      if summary.version >= current.version, do: summary, else: current
+    end)
+  end
+
+  defp trim_summaries(selected, count, direction) when map_size(selected) > count do
+    selected
+    |> Map.values()
+    |> sort_summaries(direction)
+    |> Enum.take(count)
+    |> Map.new(&{&1.id, &1})
+  end
+
+  defp trim_summaries(selected, _count, _direction), do: selected
+
+  defp sort_summaries(summaries, direction), do: sort_schedules(summaries, direction)
+
+  defp sort_schedules(schedules, direction),
+    do: Enum.sort_by(schedules, &ordering_key(&1, direction), direction)
+
+  defp hydrate_summaries(ctx, summaries) when length(summaries) <= 4 do
+    Enum.reduce_while(summaries, {:ok, []}, fn summary, {:ok, acc} ->
+      case Schedule.get(ctx, summary.id) do
+        {:ok, schedule} -> {:cont, {:ok, [schedule | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp hydrate_summaries(ctx, summaries) do
+    summaries
+    |> Task.async_stream(
+      fn summary -> Schedule.get(ctx, summary.id) end,
+      max_concurrency: min(8, System.schedulers_online()),
+      ordered: true,
+      on_timeout: :kill_task,
+      timeout: 30_000
+    )
+    |> Enum.reduce_while({:ok, []}, fn
+      {:ok, {:ok, schedule}}, {:ok, acc} -> {:cont, {:ok, [schedule | acc]}}
+      {:ok, {:error, _reason} = error}, _acc -> {:halt, error}
+      {:exit, _reason}, _acc -> {:halt, {:error, "ERR flow schedule hydration failed"}}
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _reason} = error -> error
+    end
+  end
 
   defp validate_options(opts) do
     if Keyword.keyword?(opts) do
@@ -67,81 +129,6 @@ defmodule Ferricstore.Flow.Schedule.Listing do
       else: first_duplicate(keys, MapSet.put(seen, key))
   end
 
-  defp collect_candidates(ctx, states, partition_keys, limit) do
-    routes = for state <- states, partition_key <- partition_keys, do: {state, partition_key}
-
-    routes
-    |> Enum.reduce_while({:ok, [], limit}, fn {state, partition_key}, {:ok, chunks, remaining} ->
-      case partition_records(ctx, state, partition_key, remaining + 1) do
-        {:ok, records} when length(records) <= remaining ->
-          {:cont, {:ok, [records | chunks], remaining - length(records)}}
-
-        {:ok, _overflow} ->
-          {:halt, {:error, "ERR flow schedule query candidate limit exceeded (#{limit})"}}
-
-        {:error, _reason} = error ->
-          {:halt, error}
-      end
-    end)
-    |> case do
-      {:ok, chunks, _remaining} -> {:ok, chunks |> Enum.reverse() |> List.flatten()}
-      {:error, _reason} = error -> error
-    end
-  end
-
-  defp partition_records(ctx, state, partition_key, count) do
-    query = %{
-      count: count,
-      from_ms: nil,
-      to_ms: nil,
-      rev?: false,
-      before_id: nil,
-      state: state,
-      terminal_only?: state in @terminal_states
-    }
-
-    RecordRead.list_records(
-      ctx,
-      @schedule_type,
-      state,
-      partition_key,
-      count,
-      query,
-      true,
-      true,
-      @terminal_states,
-      count
-    )
-  end
-
-  defp hydrate_records(ctx, records) do
-    records
-    |> Enum.reduce_while({:ok, [], %{}}, fn record, {:ok, schedules, cache} ->
-      id = Map.get(record, :id)
-
-      case Map.fetch(cache, id) do
-        {:ok, schedule} ->
-          {:cont, {:ok, [schedule | schedules], cache}}
-
-        :error ->
-          case hydrate_record(ctx, record) do
-            {:ok, schedule} ->
-              {:cont, {:ok, [schedule | schedules], Map.put(cache, id, schedule)}}
-
-            {:error, _reason} = error ->
-              {:halt, error}
-          end
-      end
-    end)
-    |> case do
-      {:ok, schedules, _cache} -> {:ok, Enum.reverse(schedules)}
-      {:error, _reason} = error -> error
-    end
-  end
-
-  defp hydrate_record(ctx, %{id: @schedule_id_prefix <> id}), do: Schedule.get(ctx, id)
-  defp hydrate_record(_ctx, _record), do: {:ok, nil}
-
   defp list_states(opts) do
     case Keyword.get(opts, :state, @active_state) do
       :all ->
@@ -167,10 +154,10 @@ defmodule Ferricstore.Flow.Schedule.Listing do
     end
   end
 
-  defp scan_limit do
-    case Application.get_env(:ferricstore, :flow_schedule_list_scan_limit, @default_scan_limit) do
-      value when is_integer(value) and value > 0 -> min(value, @default_scan_limit)
-      _invalid -> @default_scan_limit
+  defp page_size do
+    case Application.get_env(:ferricstore, :flow_schedule_list_page_size, @default_page_size) do
+      value when is_integer(value) and value > 0 -> min(value, @max_page_size)
+      _invalid -> @default_page_size
     end
   end
 
@@ -237,8 +224,17 @@ defmodule Ferricstore.Flow.Schedule.Listing do
     end
   end
 
-  defp matches_filters?(schedule, filters) do
-    filter_match?(filters.kind, schedule.kind) and
+  defp matches_summary?(summary, states, filters) do
+    summary.state in states and
+      filter_match?(filters.kind, summary.kind) and
+      filter_match?(filters.target_type, summary.target_type) and
+      filter_match?(filters.timezone, summary.timezone) and
+      due_in_range?(summary.next_run_at_ms, filters.from_ms, filters.to_ms)
+  end
+
+  defp matches_schedule?(schedule, states, filters) do
+    schedule.state in states and
+      filter_match?(filters.kind, schedule.kind) and
       filter_match?(filters.target_type, get_in(schedule, [:target, :type])) and
       filter_match?(filters.timezone, Map.get(schedule, :timezone)) and
       due_in_range?(schedule.next_run_at_ms, filters.from_ms, filters.to_ms)
@@ -257,8 +253,15 @@ defmodule Ferricstore.Flow.Schedule.Listing do
   defp due_in_range?(due_ms, from_ms, to_ms),
     do: is_integer(due_ms) and due_ms >= from_ms and due_ms <= to_ms
 
-  defp sort_due(%{next_run_at_ms: due_ms}) when is_integer(due_ms), do: due_ms
-  defp sort_due(_schedule), do: 9_223_372_036_854_775_807
+  defp ordering_key(%{next_run_at_ms: due_ms, id: id}, :asc) when is_integer(due_ms),
+    do: {0, due_ms, id}
+
+  defp ordering_key(%{id: id}, :asc), do: {1, 0, id}
+
+  defp ordering_key(%{next_run_at_ms: due_ms, id: id}, :desc) when is_integer(due_ms),
+    do: {1, due_ms, id}
+
+  defp ordering_key(%{id: id}, :desc), do: {0, 0, id}
 
   defp normalize_timezone("UTC"), do: "Etc/UTC"
   defp normalize_timezone(timezone), do: timezone

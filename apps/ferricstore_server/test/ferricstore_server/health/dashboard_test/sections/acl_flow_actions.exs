@@ -25,6 +25,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
 
         test "protected mode redirects dashboard pages to ACL login" do
           Application.put_env(:ferricstore, :protected_mode, true)
+          :ok = FerricstoreServer.Acl.set_user("configured", ["on", ">configured-password"])
 
           response = http_get(HealthEndpoint.port(), "/dashboard/flow")
 

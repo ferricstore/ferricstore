@@ -1,95 +1,269 @@
 defmodule Ferricstore.Flow.Schedule.Catalog do
   @moduledoc false
 
+  alias Ferricstore.Flow
+  alias Ferricstore.Flow.{Keys, LMDB, LMDBMirror, LMDBWriter, PolicyMigration}
+  alias Ferricstore.Flow.Schedule.Metadata
   alias Ferricstore.Store.Router
 
   @schedule_type "__ferricstore_schedule"
   @schedule_id_prefix "__ferricstore_schedule__:"
-  @partition_prefix "__ferricstore_schedule__:"
-  @partition_buckets 256
-  @bitmap_key <<0, "flow-schedule-partitions:1">>
-  @count_prefix <<0, "flow-schedule-partition-count:1:">>
-  @max_u64 0xFFFF_FFFF_FFFF_FFFF
+  @max_page_bytes 4 * 1_024 * 1_024
 
-  @spec bitmap_key() :: binary()
-  def bitmap_key, do: @bitmap_key
+  @type summary :: %{
+          id: binary(),
+          flow_id: binary(),
+          state: binary(),
+          kind: :one_shot | :delay | :interval | :cron,
+          next_run_at_ms: non_neg_integer() | nil,
+          target_type: binary(),
+          timezone: binary() | nil,
+          partition_key: binary(),
+          version: pos_integer()
+        }
 
-  @spec count_key(non_neg_integer()) :: binary()
-  def count_key(bucket) when is_integer(bucket) and bucket >= 0 and bucket < @partition_buckets,
-    do: <<@count_prefix::binary, bucket::unsigned-big-16>>
+  @spec reduce_summaries(FerricStore.Instance.t(), pos_integer(), term(), function()) ::
+          {:ok, term()} | {:error, binary()}
+  def reduce_summaries(ctx, page_size, initial, reducer)
+      when is_integer(page_size) and page_size > 0 and page_size <= 512 and
+             is_function(reducer, 2) do
+    with :ok <- validate_context(ctx),
+         :ok <- flush_catalog(ctx),
+         :ok <- require_healthy_catalog(ctx) do
+      ctx.data_dir
+      |> LMDBMirror.shard_paths(ctx.shard_count)
+      |> Enum.with_index()
+      |> Enum.reduce_while({:ok, initial}, fn {path, shard_index}, {:ok, acc} ->
+        case reduce_shard(ctx, path, shard_index, page_size, "", acc, reducer) do
+          {:ok, next_acc} -> {:cont, {:ok, next_acc}}
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+    end
+  end
 
-  @spec bucket(map()) :: {:ok, non_neg_integer()} | :error
-  def bucket(%{id: @schedule_id_prefix <> id, type: @schedule_type}) when id != "",
-    do: {:ok, :erlang.phash2(id, @partition_buckets)}
+  def reduce_summaries(_ctx, _page_size, _initial, _reducer),
+    do: {:error, "ERR flow schedule catalog is unavailable"}
 
-  def bucket(_record), do: :error
+  defp reduce_shard(ctx, path, shard_index, page_size, cursor, acc, reducer) do
+    prefix = Keys.policy_catalog_projection_prefix(@schedule_type)
 
-  @spec encode_bitmap(non_neg_integer()) :: binary()
-  def encode_bitmap(bitmap) when is_integer(bitmap) and bitmap >= 0,
-    do: <<bitmap::unsigned-big-size(@partition_buckets)>>
+    case LMDB.range_entries_bounded(
+           path,
+           prefix,
+           cursor,
+           "",
+           page_size,
+           @max_page_bytes
+         ) do
+      {:ok, rows, exhausted?, _bytes} ->
+        with {:ok, summaries} <- decode_page(ctx, shard_index, rows) do
+          next_acc = reducer.(summaries, acc)
 
-  @spec decode_bitmap(term()) :: {:ok, non_neg_integer()} | :error
-  def decode_bitmap(nil), do: {:ok, 0}
+          cond do
+            exhausted? ->
+              {:ok, next_acc}
 
-  def decode_bitmap(<<bitmap::unsigned-big-size(@partition_buckets)>>),
-    do: {:ok, bitmap}
+            rows == [] ->
+              corrupt_catalog()
 
-  def decode_bitmap(_value), do: :error
-
-  @spec encode_count(pos_integer()) :: binary()
-  def encode_count(count) when is_integer(count) and count > 0 and count <= @max_u64,
-    do: <<count::unsigned-big-64>>
-
-  @spec decode_count(term()) :: {:ok, non_neg_integer()} | :error
-  def decode_count(nil), do: {:ok, 0}
-  def decode_count(<<count::unsigned-big-64>>), do: {:ok, count}
-  def decode_count(_value), do: :error
-
-  @spec put_bucket(non_neg_integer(), non_neg_integer()) :: non_neg_integer()
-  def put_bucket(bitmap, bucket)
-      when is_integer(bucket) and bucket >= 0 and bucket < @partition_buckets,
-      do: Bitwise.bor(bitmap, Bitwise.bsl(1, bucket))
-
-  @spec delete_bucket(non_neg_integer(), non_neg_integer()) :: non_neg_integer()
-  def delete_bucket(bitmap, bucket)
-      when is_integer(bucket) and bucket >= 0 and bucket < @partition_buckets,
-      do: Bitwise.band(bitmap, Bitwise.bnot(Bitwise.bsl(1, bucket)))
-
-  @spec partition_keys(FerricStore.Instance.t()) :: {:ok, [binary()]} | {:error, binary()}
-  def partition_keys(%{shard_count: shard_count, keydir_refs: keydir_refs} = ctx)
-      when is_integer(shard_count) and shard_count > 0 and is_tuple(keydir_refs) and
-             tuple_size(keydir_refs) >= shard_count do
-    0..(shard_count - 1)
-    |> Enum.reduce_while({:ok, 0}, fn shard_index, {:ok, bitmap} ->
-      case Router.read_shard_value(ctx, shard_index, @bitmap_key) do
-        {:ok, value} ->
-          case decode_bitmap(value) do
-            {:ok, shard_bitmap} -> {:cont, {:ok, Bitwise.bor(bitmap, shard_bitmap)}}
-            :error -> {:halt, {:error, "ERR flow schedule catalog is corrupt"}}
+            true ->
+              {next_cursor, _value} = List.last(rows)
+              reduce_shard(ctx, path, shard_index, page_size, next_cursor, next_acc, reducer)
           end
+        end
 
-        :unavailable ->
-          {:halt, {:error, "ERR flow schedule catalog is unavailable"}}
+      {:error, _reason} ->
+        unavailable_catalog()
+    end
+  end
 
-        _invalid ->
-          {:halt, {:error, "ERR flow schedule catalog is corrupt"}}
-      end
+  defp decode_page(_ctx, _shard_index, []), do: {:ok, []}
+
+  defp decode_page(ctx, shard_index, rows) do
+    with {:ok, candidates} <- decode_projection_rows(rows),
+         {:ok, state_keys} <- read_catalog_state_keys(ctx, shard_index, candidates),
+         {:ok, state_values} <- read_state_values(ctx, state_keys) do
+      decode_state_records(state_keys, state_values)
+    end
+  end
+
+  defp decode_projection_rows(rows) do
+    Enum.reduce_while(rows, {:ok, []}, fn
+      {key, <<1>>}, {:ok, acc} ->
+        case Keys.decode_policy_catalog_projection_key(@schedule_type, key) do
+          {:ok, candidate} -> {:cont, {:ok, [candidate | acc]}}
+          :error -> {:halt, corrupt_catalog()}
+        end
+
+      _invalid, _acc ->
+        {:halt, corrupt_catalog()}
     end)
     |> case do
-      {:ok, bitmap} -> {:ok, decode_partition_keys(bitmap)}
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
       {:error, _reason} = error -> error
     end
   end
 
-  def partition_keys(_ctx), do: {:error, "ERR flow schedule catalog is unavailable"}
+  defp read_catalog_state_keys(ctx, shard_index, candidates) do
+    catalog_keys = Enum.map(candidates, & &1.catalog_key)
 
-  defp decode_partition_keys(bitmap) do
-    0..(@partition_buckets - 1)
-    |> Enum.reduce([], fn bucket, acc ->
-      if Bitwise.band(bitmap, Bitwise.bsl(1, bucket)) == 0,
-        do: acc,
-        else: [@partition_prefix <> Integer.to_string(bucket) | acc]
-    end)
-    |> Enum.reverse()
+    with {:ok, values} <- read_shard_values(ctx, shard_index, catalog_keys) do
+      candidates
+      |> Enum.zip(values)
+      |> Enum.reduce_while({:ok, []}, fn
+        {_candidate, nil}, {:ok, acc} ->
+          {:cont, {:ok, acc}}
+
+        {candidate, encoded}, {:ok, acc} when is_binary(encoded) ->
+          case PolicyMigration.decode_catalog(encoded) do
+            {:ok, catalog} ->
+              if valid_catalog_owner?(candidate, catalog) do
+                {:cont, {:ok, [catalog.state_key | acc]}}
+              else
+                {:halt, corrupt_catalog()}
+              end
+
+            :error ->
+              {:halt, corrupt_catalog()}
+          end
+
+        _invalid, _acc ->
+          {:halt, corrupt_catalog()}
+      end)
+      |> case do
+        {:ok, reversed} -> {:ok, reversed |> Enum.reverse() |> Enum.uniq()}
+        {:error, _reason} = error -> error
+      end
+    end
   end
+
+  defp valid_catalog_owner?(candidate, catalog) do
+    catalog.migration_generation >= candidate.migration_generation and
+      Keys.type_catalog_member_key(@schedule_type, catalog.state_key) == candidate.catalog_key
+  end
+
+  defp decode_state_records(state_keys, values) when length(state_keys) == length(values) do
+    state_keys
+    |> Enum.zip(values)
+    |> Enum.reduce_while({:ok, []}, fn
+      {_state_key, nil}, {:ok, acc} ->
+        {:cont, {:ok, acc}}
+
+      {state_key, encoded}, {:ok, acc} when is_binary(encoded) ->
+        case decode_summary(state_key, encoded) do
+          {:ok, summary} -> {:cont, {:ok, [summary | acc]}}
+          :error -> {:halt, corrupt_catalog()}
+        end
+
+      _invalid, _acc ->
+        {:halt, corrupt_catalog()}
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp decode_state_records(_state_keys, _values), do: corrupt_catalog()
+
+  defp read_state_values(_ctx, []), do: {:ok, []}
+
+  defp read_state_values(ctx, state_keys) do
+    case Router.flow_batch_get_state_keys_with_status(ctx, state_keys) do
+      values when is_list(values) and length(values) == length(state_keys) ->
+        cond do
+          Enum.any?(values, &(&1 == :unavailable)) -> unavailable_catalog()
+          Enum.all?(values, &(is_binary(&1) or is_nil(&1))) -> {:ok, values}
+          true -> corrupt_catalog()
+        end
+
+      _invalid ->
+        corrupt_catalog()
+    end
+  end
+
+  defp decode_summary(state_key, encoded) do
+    with %{id: @schedule_id_prefix <> id, type: @schedule_type} = record <-
+           Flow.decode_record(encoded),
+         true <- Keys.state_key(record.id, Map.get(record, :partition_key)) == state_key,
+         {:ok, metadata} <- Metadata.fetch_record(record),
+         state when is_binary(state) and state != "" <- Map.get(record, :state),
+         version when is_integer(version) and version > 0 <- Map.get(record, :version),
+         partition_key when is_binary(partition_key) and partition_key != "" <-
+           Map.get(record, :partition_key) do
+      {:ok,
+       %{
+         id: id,
+         flow_id: record.id,
+         state: state,
+         kind: metadata.kind,
+         next_run_at_ms: visible_next_run_at_ms(record),
+         target_type: metadata.target_type,
+         timezone: Map.get(metadata, :timezone),
+         partition_key: partition_key,
+         version: version
+       }}
+    else
+      _invalid -> :error
+    end
+  rescue
+    _error -> :error
+  end
+
+  defp visible_next_run_at_ms(%{state: state})
+       when state in ["completed", "failed", "cancelled"],
+       do: nil
+
+  defp visible_next_run_at_ms(record) do
+    case Map.get(record, :next_run_at_ms) do
+      value when is_integer(value) and value >= 0 -> value
+      _none -> nil
+    end
+  end
+
+  defp read_shard_values(_ctx, _shard_index, []), do: {:ok, []}
+
+  defp read_shard_values(ctx, shard_index, keys) do
+    case Router.read_shard_values_chunked(ctx, shard_index, keys) do
+      {:ok, values} when is_list(values) and length(values) == length(keys) -> {:ok, values}
+      :unavailable -> unavailable_catalog()
+      {:error, _reason} -> unavailable_catalog()
+      _invalid -> corrupt_catalog()
+    end
+  end
+
+  defp validate_context(%{
+         name: name,
+         data_dir: data_dir,
+         shard_count: shard_count,
+         keydir_refs: keydir_refs
+       })
+       when is_atom(name) and is_binary(data_dir) and is_integer(shard_count) and shard_count > 0 and
+              is_tuple(keydir_refs) and tuple_size(keydir_refs) >= shard_count,
+       do: :ok
+
+  defp validate_context(_ctx), do: unavailable_catalog()
+
+  defp flush_catalog(ctx) do
+    case LMDBWriter.flush_all(ctx.name, ctx.shard_count, 30_000) do
+      :ok -> :ok
+      {:error, _reason} -> unavailable_catalog()
+      _invalid -> unavailable_catalog()
+    end
+  end
+
+  defp require_healthy_catalog(ctx) do
+    case LMDBMirror.require_healthy(
+           ctx,
+           Keys.policy_catalog_projection_prefix(@schedule_type),
+           nil
+         ) do
+      :ok -> :ok
+      {:error, _reason} -> unavailable_catalog()
+    end
+  end
+
+  defp unavailable_catalog, do: {:error, "ERR flow schedule catalog is unavailable"}
+  defp corrupt_catalog, do: {:error, "ERR flow schedule catalog is corrupt"}
 end

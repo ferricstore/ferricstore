@@ -362,7 +362,14 @@ defmodule FerricStore.API.Flow do
   def flow_schedule_create(_id, _opts),
     do: {:error, "ERR flow schedule opts must be a keyword list"}
 
-  @doc "Returns a durable Flow schedule by id."
+  @doc """
+  Returns a durable Flow schedule by id.
+
+  The returned map includes the complete recurrence configuration. In
+  particular, `:created_at_ms`, `:every_ms`, `:cron`, and
+  `:overlap_retry_ms` are always present; fields that do not apply to the
+  schedule kind are `nil`.
+  """
   @spec flow_schedule_get(binary(), keyword()) :: {:ok, map() | nil} | {:error, binary()}
   def flow_schedule_get(id, opts \\ [])
 
@@ -424,7 +431,19 @@ defmodule FerricStore.API.Flow do
   def flow_schedule_resume(_id, _opts),
     do: {:error, "ERR flow schedule opts must be a keyword list"}
 
-  @doc "Lists durable Flow schedules."
+  @doc """
+  Lists durable Flow schedules.
+
+  Results default to active schedules ordered by `{next_run_at_ms, id}`.
+  Terminal schedules with no next run sort last. Pass `rev: true` to reverse
+  the order and `state: :all` to include every schedule state. Supported
+  filters are `:kind`, `:target_type`, `:timezone`, `:from_ms`, and `:to_ms`.
+  `:count` defaults to 100 and is capped at 1,000.
+
+  Listing scans the durable exact-type catalog in bounded pages, applies
+  filters before retaining the requested top results, and hydrates only those
+  retained records. It does not impose a total candidate ceiling.
+  """
   @spec flow_schedule_list(keyword()) :: {:ok, [map()]} | {:error, binary()}
   def flow_schedule_list(opts \\ [])
 

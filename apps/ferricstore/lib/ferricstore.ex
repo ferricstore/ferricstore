@@ -44,7 +44,7 @@ defmodule FerricStore do
     * `:read_sample_rate` — LFU sampling rate (default: 100)
     * `:flow_retention_sweeper` — per-instance Flow timeout/retention sweeper
     * `:flow_scheduler` — per-instance durable schedule runner
-      options such as `:initial_delay_ms`, `:interval_ms`, and `:limit`
+      options such as `:initial_delay_ms`, `:error_sleep_ms`, and `:limit`
   """
 
   defmacro __using__(opts) do

@@ -106,6 +106,43 @@ defmodule Ferricstore.FlowCodecTest do
     refute Map.has_key?(public, :system_metadata)
   end
 
+  test "record codec round trips private schedule metadata without exposing it" do
+    schedule_metadata = %{
+      kind: :cron,
+      target_type: "report",
+      timezone: "America/New_York"
+    }
+
+    record =
+      base_record()
+      |> Map.merge(%{
+        id: "__ferricstore_schedule__:daily-report",
+        root_flow_id: "__ferricstore_schedule__:daily-report",
+        type: "__ferricstore_schedule",
+        schedule_metadata: schedule_metadata
+      })
+
+    assert Flow.encode_record(record) == Flow.encode_record_elixir(record)
+    assert record == record |> Flow.encode_record() |> Flow.decode_record()
+    refute Map.has_key?(RecordProjection.public(record), :schedule_metadata)
+  end
+
+  test "private schedule metadata preserves opaque target type bytes" do
+    target_type = <<0, 255, 128, 1>>
+
+    record =
+      base_record()
+      |> Map.merge(%{
+        id: "__ferricstore_schedule__:opaque-type",
+        root_flow_id: "__ferricstore_schedule__:opaque-type",
+        type: "__ferricstore_schedule",
+        schedule_metadata: %{kind: :one_shot, target_type: target_type}
+      })
+
+    assert %{schedule_metadata: %{target_type: ^target_type}} =
+             record |> Flow.encode_record() |> Flow.decode_record()
+  end
+
   test "empty system metadata keeps dedicated record bytes unchanged" do
     record = base_record()
 
@@ -180,7 +217,17 @@ defmodule Ferricstore.FlowCodecTest do
       %{"__incarnation__" => -1},
       %{"__state_enter_seq__" => "1"},
       %{"__governance_limit__" => %{"scope" => "missing-required-fields"}},
-      %{"__system_metadata__" => "not-sealed-metadata"}
+      %{"__system_metadata__" => "not-sealed-metadata"},
+      %{"__schedule_metadata__" => %{"kind" => "unknown", "target_type" => "report"}},
+      %{"__schedule_metadata__" => %{"kind" => "cron", "target_type" => ""}},
+      %{"__schedule_metadata__" => %{"kind" => "one_shot", "target_type_b64" => "***"}},
+      %{
+        "__schedule_metadata__" => %{
+          "kind" => "cron",
+          "target_type" => "report",
+          "timezone" => 123
+        }
+      }
     ]
 
     Enum.each(invalid_sidecars, fn child_groups ->

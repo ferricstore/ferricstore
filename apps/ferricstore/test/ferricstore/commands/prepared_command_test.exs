@@ -43,6 +43,60 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
     assert partitioned.acl_keys == ["tenant-a"]
   end
 
+  test "structured schedule creation shares ACL, routing, and mutation key discovery" do
+    payload = %{
+      "id" => "billing-sweep",
+      "target" => %{
+        "id_prefix" => "billing-run",
+        "partition_key" => "tenant:billing",
+        "type" => "billing"
+      }
+    }
+
+    assert {:ok, description} =
+             KeyDiscovery.describe_structured("FLOW.SCHEDULE.CREATE", payload)
+
+    assert description.command_keys == ["billing-sweep", "tenant:billing"]
+    assert description.acl_keys == ["billing-sweep", "tenant:billing"]
+    assert description.routing_scope == :coordinated
+    assert description.routing_keys == []
+    assert description.read_keys == []
+    assert description.write_keys == ["billing-sweep", "tenant:billing"]
+    assert description.transaction_mode == :request
+  end
+
+  test "structured schedule creation fails closed for an unbounded generated target" do
+    payload = %{
+      id: "billing-sweep",
+      opts: [target: [id_prefix: "billing-run", type: "billing"]]
+    }
+
+    assert {:ok, description} =
+             KeyDiscovery.describe_structured("flow.schedule.create", payload)
+
+    assert description.command_keys == ["billing-sweep", "*"]
+    assert description.acl_keys == ["billing-sweep", "*"]
+    assert description.write_keys == ["billing-sweep", "*"]
+  end
+
+  test "structured schedule discovery does not let nested options shadow native fields" do
+    payload = %{
+      "id" => "actual-schedule",
+      "target" => %{"id" => "actual-target", "type" => "billing"},
+      "opts" => %{
+        "id" => "decoy-schedule",
+        "target" => %{"partition_key" => "decoy-partition", "type" => "billing"}
+      }
+    }
+
+    assert {:ok, description} =
+             KeyDiscovery.describe_structured("FLOW.SCHEDULE.CREATE", payload)
+
+    assert description.command_keys == ["actual-schedule", "actual-target"]
+    assert description.acl_keys == ["actual-schedule", "actual-target"]
+    assert description.write_keys == ["actual-schedule", "actual-target"]
+  end
+
   test "FLOW.QUERY preparation binds once and shares tenant ACL, routing, and read scope" do
     query =
       "FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD"

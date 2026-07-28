@@ -56,6 +56,7 @@ defmodule FerricstoreServer.Health.Endpoint do
   alias Ferricstore.AuditLog
   alias FerricstoreServer.AuthRateLimiter
   alias FerricstoreServer.Health.Endpoint.Auth
+  alias FerricstoreServer.Health.Endpoint.Bootstrap
   alias FerricstoreServer.Health.Endpoint.DashboardHandlers
   alias FerricstoreServer.Health.Endpoint.Forbidden
   alias FerricstoreServer.Health.Endpoint.Login
@@ -65,6 +66,7 @@ defmodule FerricstoreServer.Health.Endpoint do
   alias FerricstoreServer.Health.Endpoint.Response
   alias FerricstoreServer.Health.Endpoint.RouteRequirements
   alias FerricstoreServer.Health.Endpoint.Session
+  alias FerricstoreServer.Health.Dashboard.Accounts
 
   require Logger
 
@@ -204,7 +206,36 @@ defmodule FerricstoreServer.Health.Endpoint do
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/login", _peer, _headers, _body) do
-    send_html_response(socket, transport, 200, "OK", Login.render_page("", nil))
+    render_dashboard_login(socket, transport, "")
+  end
+
+  defp dispatch_request(socket, transport, "GET", "/dashboard/setup", peer, headers, _body) do
+    render_dashboard_setup(socket, transport, peer, headers, "")
+  end
+
+  defp dispatch_request(
+         socket,
+         transport,
+         "GET",
+         "/dashboard/setup?" <> query,
+         peer,
+         headers,
+         _body
+       ) do
+    params = FerricstoreServer.Health.QueryDecoder.decode(query)
+    render_dashboard_setup(socket, transport, peer, headers, Map.get(params, "next", ""))
+  end
+
+  defp dispatch_request(
+         socket,
+         transport,
+         "POST",
+         "/dashboard/setup",
+         peer,
+         headers,
+         body
+       ) do
+    handle_dashboard_setup(socket, transport, peer, headers, body)
   end
 
   defp dispatch_request(
@@ -218,12 +249,45 @@ defmodule FerricstoreServer.Health.Endpoint do
        ) do
     params = FerricstoreServer.Health.QueryDecoder.decode(query)
 
-    send_html_response(
+    render_dashboard_login(socket, transport, Map.get(params, "next", ""))
+  end
+
+  defp dispatch_request(
+         socket,
+         transport,
+         "POST",
+         "/dashboard/security/users",
+         peer,
+         headers,
+         body
+       ) do
+    DashboardHandlers.handle_security_mutation(
       socket,
       transport,
-      200,
-      "OK",
-      Login.render_page(Map.get(params, "next", ""), nil)
+      peer,
+      headers,
+      :create,
+      body
+    )
+  end
+
+  defp dispatch_request(
+         socket,
+         transport,
+         "POST",
+         "/dashboard/security/users/" <> action,
+         peer,
+         headers,
+         body
+       )
+       when action in ["state", "password", "rules", "delete"] do
+    DashboardHandlers.handle_security_mutation(
+      socket,
+      transport,
+      peer,
+      headers,
+      security_mutation_action(action),
+      body
     )
   end
 
@@ -1230,11 +1294,138 @@ defmodule FerricstoreServer.Health.Endpoint do
     )
   end
 
+  defp security_mutation_action("state"), do: :state
+  defp security_mutation_action("password"), do: :password
+  defp security_mutation_action("rules"), do: :rules
+  defp security_mutation_action("delete"), do: :delete
+
   defp audit_dashboard_login(event, peer, username, rate_limited) do
     AuditLog.log(event, %{
       username: username,
       client_ip: Login.peer_string(peer),
       surface: :dashboard,
+      rate_limited: rate_limited
+    })
+  end
+
+  defp render_dashboard_login(socket, transport, next) do
+    if FerricstoreServer.Acl.protected_mode?() and Accounts.bootstrap_available?() do
+      send_redirect_response(socket, transport, Bootstrap.location(next))
+    else
+      send_html_response(socket, transport, 200, "OK", Login.render_page(next, nil))
+    end
+  end
+
+  defp render_dashboard_setup(socket, transport, peer, headers, next) do
+    cond do
+      not FerricstoreServer.Acl.protected_mode?() ->
+        send_redirect_response(socket, transport, "/dashboard")
+
+      not Accounts.bootstrap_available?() ->
+        send_redirect_response(socket, transport, "/dashboard/login")
+
+      true ->
+        send_html_response(
+          socket,
+          transport,
+          200,
+          "OK",
+          Bootstrap.render_page(next, nil, Bootstrap.token_required?(peer, headers))
+        )
+    end
+  end
+
+  defp handle_dashboard_setup(socket, transport, peer, headers, body) do
+    if FerricstoreServer.Acl.protected_mode?() and Accounts.bootstrap_available?() do
+      params = FlowPaths.decode_form_body(body)
+      token = Map.get(params, "bootstrap_token", "")
+      next = Map.get(params, "next", "")
+      client_peer = Session.client_peer(peer, headers)
+
+      case AuthRateLimiter.permit(client_peer, "dashboard-bootstrap", token) do
+        {:ok, reservation} ->
+          complete_dashboard_setup(
+            socket,
+            transport,
+            peer,
+            headers,
+            params,
+            reservation,
+            next
+          )
+
+        {:error, {:rate_limited, retry_after_ms}} ->
+          audit_dashboard_setup(:auth_failure, peer, headers, true)
+
+          send_html_response(
+            socket,
+            transport,
+            429,
+            "Too Many Requests",
+            Bootstrap.render_page(
+              next,
+              "Too many setup attempts. Try again later.",
+              Bootstrap.token_required?(peer, headers)
+            ),
+            [{"Retry-After", Integer.to_string(div(retry_after_ms + 999, 1_000))}]
+          )
+
+        {:error, reason} ->
+          audit_dashboard_setup(:auth_failure, peer, headers, false)
+
+          send_html_response(
+            socket,
+            transport,
+            422,
+            "Unprocessable Content",
+            Bootstrap.render_page(
+              next,
+              to_string(reason),
+              Bootstrap.token_required?(peer, headers)
+            )
+          )
+      end
+    else
+      send_redirect_response(socket, transport, "/dashboard/login")
+    end
+  end
+
+  defp complete_dashboard_setup(
+         socket,
+         transport,
+         peer,
+         headers,
+         params,
+         reservation,
+         next
+       ) do
+    with :ok <- Bootstrap.authorize(peer, headers, Map.get(params, "bootstrap_token", "")),
+         {:ok, username} <- Accounts.bootstrap(params) do
+      :ok = AuthRateLimiter.release_success(reservation)
+      audit_dashboard_setup(:auth_success, peer, headers, false)
+
+      send_redirect_response(socket, transport, Bootstrap.success_location(next), [
+        {"Set-Cookie", Session.session_cookie(username, peer, headers)}
+      ])
+    else
+      {:error, reason} ->
+        audit_dashboard_setup(:auth_failure, peer, headers, false)
+
+        send_html_response(
+          socket,
+          transport,
+          422,
+          "Unprocessable Content",
+          Bootstrap.render_page(next, reason, Bootstrap.token_required?(peer, headers))
+        )
+    end
+  end
+
+  defp audit_dashboard_setup(event, peer, headers, rate_limited) do
+    AuditLog.log(event, %{
+      username: "default",
+      client_ip: peer |> Session.client_peer(headers) |> Login.peer_string(),
+      surface: :dashboard_setup,
       rate_limited: rate_limited
     })
   end

@@ -111,6 +111,21 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirementsTest do
   end
 
   test "dashboard_route_requirement maps POST actions" do
+    for path <- [
+          "/dashboard/security/users",
+          "/dashboard/security/users/state",
+          "/dashboard/security/users/password",
+          "/dashboard/security/users/rules"
+        ] do
+      assert RouteRequirements.dashboard_route_requirement("POST", path) ==
+               {"ACL.SETUSER", []}
+    end
+
+    assert RouteRequirements.dashboard_route_requirement(
+             "POST",
+             "/dashboard/security/users/delete"
+           ) == {"ACL.DELUSER", []}
+
     assert RouteRequirements.dashboard_route_requirement("POST", "/dashboard/flow/failures") ==
              {"FLOW.RECLAIM", []}
 

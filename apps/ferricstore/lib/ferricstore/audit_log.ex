@@ -14,6 +14,7 @@ defmodule Ferricstore.AuditLog do
     * `:connection_close`  -- client disconnection (client IP, duration)
     * `:dangerous_command` -- execution of FLUSHDB, FLUSHALL, or DEBUG
     * `:command_denied`    -- ACL command denial (username, command, client IP)
+    * `:acl_user_change`   -- dashboard ACL account mutation
 
   ## Configuration (application env)
 
@@ -58,6 +59,7 @@ defmodule Ferricstore.AuditLog do
           | :connection_close
           | :dangerous_command
           | :command_denied
+          | :acl_user_change
 
   @typedoc "Details map attached to an audit event."
   @type details :: %{optional(atom()) => term()}

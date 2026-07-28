@@ -4,6 +4,23 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.4 - 2026-07-28
+
+- Added the complete durable schedule recurrence contract, including canonical
+  creation time, interval period, cron expression, timezone, overlap policy,
+  and optional queue-after-previous retry configuration in create, get, list,
+  fire, and scheduler responses.
+- Made schedule catalog maintenance and due execution bounded, restart-safe,
+  and deterministic while preserving interval catch-up, overlap, and terminal
+  lifecycle correctness.
+- Added protected-mode HTTP bootstrap, login, signed revocable sessions, and
+  ACL-scoped account management to the OSS dashboard. Browser forms retain
+  strict origin and CSRF validation, login throttling, audit records, and
+  immediate session revocation after credential, state, rule, or user changes.
+- Hardened prepared Flow command discovery and mutation metadata so parsing,
+  ACL scope, routing, and apply-time footprints remain consistent without
+  adding work to query or ordinary KV hot paths.
+
 ## 0.11.3 - 2026-07-27
 
 - Centralized the compact FQL1 result quality vocabulary and made response

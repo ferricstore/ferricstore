@@ -143,10 +143,16 @@ creation cannot make a valid schedule unreadable or unfireable.
 
 | Field | Meaning |
 | --- | --- |
+| `created_at_ms` | Logical schedule creation timestamp. |
+| `every_ms` | Interval period, or null for other schedule kinds. |
+| `cron` | Cron expression, or null for other schedule kinds. |
+| `timezone` | IANA timezone for cron schedules, or null otherwise. |
 | `catchup_policy` | Interval catch-up policy, or null for other kinds. |
 | `coalesced_count` | Cumulative number of elapsed occurrences not replayed. |
 | `last_coalesced_count` | Number coalesced by the latest recovery fire. |
 | `last_catchup_at_ms` | Actual scheduler time of the latest catch-up. |
+| `overlap_policy` | Behavior when the previous target is still active. |
+| `overlap_retry_ms` | Queue retry override, or null when not configured. |
 | `fire_count` | Targets actually created. |
 | `next_run_at_ms` | Next durable due time, or null after completion. |
 | `last_planning_error` | Actionable recurrence error when `end_reason` is `planning_failed`; otherwise null. |
@@ -157,9 +163,11 @@ owns a fenced lease; normal clients should observe it but must not treat it as
 a new user-controlled lifecycle state. List operations default to `active`;
 pass `state: :all` (or the native string `"all"`) to inspect every state.
 State filters outside this set and inverted `from_ms`/`to_ms` ranges are
-rejected before storage access. Listing uses a replicated partition catalog and
-a single 1,000-record candidate budget across every requested state and
-partition; it never scans all 256 schedule buckets when none are occupied.
+rejected before storage access. Listing scans the replicated exact-type catalog
+in bounded pages across shards, filters compact record summaries, retains only
+the requested global top results, and hydrates only those schedules. It has no
+fixed total-candidate ceiling and uses memory proportional to the requested
+count plus one catalog page rather than to the total schedule population.
 
 `FLOW.SCHEDULE.FIRE_DUE` returns batch counts for `claimed`, `fired`, `skipped`,
 and `coalesced`, plus bounded per-schedule `errors`. Every claimed schedule has

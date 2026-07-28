@@ -8,7 +8,7 @@ defmodule FerricstoreServer.Health.Endpoint.Response do
     {"Cache-Control", "no-store"},
     {"X-Content-Type-Options", "nosniff"},
     {"X-Frame-Options", "DENY"},
-    {"Referrer-Policy", "no-referrer"},
+    {"Referrer-Policy", "same-origin"},
     {"Permissions-Policy", "camera=(), geolocation=(), microphone=()"},
     {"Cross-Origin-Opener-Policy", "same-origin"}
   ]

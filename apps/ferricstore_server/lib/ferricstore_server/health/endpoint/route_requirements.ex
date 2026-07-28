@@ -83,6 +83,21 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     {clean_path, _query} = split_path_query(path)
 
     case clean_path do
+      "/dashboard/security/users" ->
+        {"ACL.SETUSER", []}
+
+      "/dashboard/security/users/state" ->
+        {"ACL.SETUSER", []}
+
+      "/dashboard/security/users/password" ->
+        {"ACL.SETUSER", []}
+
+      "/dashboard/security/users/rules" ->
+        {"ACL.SETUSER", []}
+
+      "/dashboard/security/users/delete" ->
+        {"ACL.DELUSER", []}
+
       "/dashboard/flow/failures" ->
         {"FLOW.RECLAIM", []}
 

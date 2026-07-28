@@ -2,6 +2,8 @@ defmodule FerricstoreServer.Health.Endpoint.Auth do
   @moduledoc false
 
   alias FerricstoreServer.Acl
+  alias FerricstoreServer.Health.Dashboard.Accounts
+  alias FerricstoreServer.Health.Endpoint.Bootstrap
   alias FerricstoreServer.Health.Endpoint.Login
   alias FerricstoreServer.Health.Endpoint.RouteRequirements
   alias FerricstoreServer.Health.Endpoint.Session
@@ -28,6 +30,11 @@ defmodule FerricstoreServer.Health.Endpoint.Auth do
   defp do_authorize_request(_method, "/dashboard/login", _peer, _headers), do: :ok
 
   defp do_authorize_request(_method, "/dashboard/login?" <> _query, _peer, _headers),
+    do: :ok
+
+  defp do_authorize_request(_method, "/dashboard/setup", _peer, _headers), do: :ok
+
+  defp do_authorize_request(_method, "/dashboard/setup?" <> _query, _peer, _headers),
     do: :ok
 
   defp do_authorize_request("POST", "/dashboard/logout", _peer, _headers), do: :ok
@@ -106,7 +113,7 @@ defmodule FerricstoreServer.Health.Endpoint.Auth do
         if RouteRequirements.dashboard_api_path?(path) do
           {:unauthorized, "login required"}
         else
-          {:redirect_login, Login.location(path)}
+          {:redirect_login, unauthenticated_location(path)}
         end
     end
   end
@@ -167,6 +174,10 @@ defmodule FerricstoreServer.Health.Endpoint.Auth do
 
   defp loopback_peer_allowed_for_observability?(peer) do
     not Acl.protected_mode?() and loopback_peer?(peer)
+  end
+
+  defp unauthenticated_location(path) do
+    if Accounts.bootstrap_available?(), do: Bootstrap.location(path), else: Login.location(path)
   end
 
   defp loopback_peer?({127, _, _, _}), do: true

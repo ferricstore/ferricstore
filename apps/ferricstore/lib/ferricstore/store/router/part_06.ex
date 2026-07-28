@@ -550,6 +550,18 @@ defmodule Ferricstore.Store.Router.Part06 do
 
       defp do_flow_batch_get(ctx, ids, partition_key, availability_mode) do
         keys = Enum.map(ids, &Ferricstore.Flow.Keys.state_key(&1, partition_key))
+
+        flow_batch_get_state_keys(ctx, keys, availability_mode)
+      end
+
+      @doc false
+      def flow_batch_get_state_keys_with_status(ctx, state_keys) when is_list(state_keys) do
+        flow_batch_get_state_keys(ctx, state_keys, :preserve_unavailable)
+      end
+
+      defp flow_batch_get_state_keys(_ctx, [], _availability_mode), do: []
+
+      defp flow_batch_get_state_keys(ctx, keys, availability_mode) do
         now_ms = CommandTime.now_ms()
 
         blocked_keys = flow_blocked_state_keys(ctx, keys, now_ms)
@@ -620,7 +632,7 @@ defmodule Ferricstore.Store.Router.Part06 do
               shard_keys = Enum.map(indexed_chunk, fn {key, _index} -> key end)
 
               shard_values =
-                case read_shard_values(ctx, shard_index, shard_keys) do
+                case read_shard_values_chunked(ctx, shard_index, shard_keys) do
                   {:ok, values} -> values
                   :unavailable -> List.duplicate(:unavailable, length(shard_keys))
                   {:error, _reason} -> List.duplicate(:unavailable, length(shard_keys))

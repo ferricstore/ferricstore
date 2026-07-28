@@ -405,6 +405,40 @@ if config_env() == :prod do
       _too_short -> raise "FERRICSTORE_DASHBOARD_SESSION_SECRET must be at least 32 bytes"
     end
 
+  dashboard_bootstrap_token =
+    case System.get_env("FERRICSTORE_DASHBOARD_BOOTSTRAP_TOKEN_FILE") do
+      nil ->
+        nil
+
+      path ->
+        contents =
+          case File.read(path) do
+            {:ok, contents} ->
+              contents
+
+            {:error, reason} ->
+              raise "FERRICSTORE_DASHBOARD_BOOTSTRAP_TOKEN_FILE could not be read: #{:file.format_error(reason)}"
+          end
+
+        token =
+          cond do
+            String.ends_with?(contents, "\r\n") ->
+              binary_part(contents, 0, byte_size(contents) - 2)
+
+            String.ends_with?(contents, "\n") ->
+              binary_part(contents, 0, byte_size(contents) - 1)
+
+            true ->
+              contents
+          end
+
+        if byte_size(token) in 32..4_096 do
+          token
+        else
+          raise "FERRICSTORE_DASHBOARD_BOOTSTRAP_TOKEN_FILE must contain between 32 and 4096 bytes"
+        end
+    end
+
   Enum.each(dashboard_trusted_proxies, fn entry ->
     {address, prefix} =
       case String.split(entry, "/", parts: 2) do
@@ -442,6 +476,7 @@ if config_env() == :prod do
     dashboard_cookie_secure: dashboard_cookie_secure,
     dashboard_allowed_origins: dashboard_allowed_origins,
     dashboard_session_secret: dashboard_session_secret,
+    dashboard_bootstrap_token: dashboard_bootstrap_token,
     auth_rate_limit_max_attempts:
       positive_integer_env.("FERRICSTORE_AUTH_RATE_LIMIT_MAX_ATTEMPTS", 10),
     auth_rate_limit_window_ms:

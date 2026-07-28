@@ -118,11 +118,18 @@ defmodule FerricstoreServer.Health.Endpoint.AuthTest do
            ) == :ok
   end
 
-  test "authorize_request requires login in protected mode" do
+  test "protected mode directs a fresh catalog to setup and a configured catalog to login" do
     Application.put_env(:ferricstore, :protected_mode, true)
 
     assert Auth.authorize_request("GET", "/dashboard/api/overview", {127, 0, 0, 1}, %{}) ==
              {:unauthorized, "login required"}
+
+    assert {:redirect_login, location} =
+             Auth.authorize_request("GET", "/dashboard/config", {127, 0, 0, 1}, %{})
+
+    assert location =~ "/dashboard/setup?next="
+
+    assert :ok = Acl.set_user("configured", ["on", ">configured-secret", "~*", "+info"])
 
     assert {:redirect_login, location} =
              Auth.authorize_request("GET", "/dashboard/config", {127, 0, 0, 1}, %{})

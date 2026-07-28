@@ -1,5 +1,6 @@
 Code.require_file("dashboard_test/sections/collection_and_overview.exs", __DIR__)
 Code.require_file("dashboard_test/sections/acl_flow_actions.exs", __DIR__)
+Code.require_file("dashboard_test/sections/acl_account_management.exs", __DIR__)
 Code.require_file("dashboard_test/sections/acl_filtering_and_config.exs", __DIR__)
 Code.require_file("dashboard_test/sections/operational_pages.exs", __DIR__)
 Code.require_file("dashboard_test/sections/flow_browse_and_queries.exs", __DIR__)
@@ -54,6 +55,20 @@ defmodule FerricstoreServer.Health.DashboardTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
+
+  @tag :dashboard_accessible_colors
+  test "dashboard secondary labels use the accessible muted foreground" do
+    css = FerricstoreServer.Health.Dashboard.Layout.Styles.stylesheet()
+
+    for selector <- [
+          ".acl-role-selector small",
+          ".acl-modifier-field span",
+          ".acl-action-note",
+          ".sidebar-session span"
+        ] do
+      assert css =~ "#{selector} { color: #94a3b8;"
+    end
+  end
 
   test "Flow governance budget table renders remaining overage and reservation columns" do
     html =
@@ -475,6 +490,7 @@ defmodule FerricstoreServer.Health.DashboardTest do
 
   use FerricstoreServer.Health.DashboardTest.Sections.CollectionAndOverview
   use FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions
+  use FerricstoreServer.Health.DashboardTest.Sections.AclAccountManagement
   use FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig
   use FerricstoreServer.Health.DashboardTest.Sections.OperationalPages
   use FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries

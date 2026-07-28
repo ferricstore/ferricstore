@@ -231,6 +231,74 @@ defmodule FerricstoreServer.Management.ACL do
     end
   end
 
+  @doc false
+  @spec create_user(binary(), [binary()], keyword()) :: :ok | {:error, term()}
+  def create_user(username, rules, opts) do
+    with :ok <- Rules.validate_username(username),
+         {:ok, store} <- mutation_store(opts) do
+      create_user_catalog(store, username, rules, @catalog_cas_attempts)
+    end
+  end
+
+  @doc false
+  @spec update_user(binary(), [binary()], keyword()) :: :ok | {:error, term()}
+  def update_user(username, rules, opts) do
+    with :ok <- Rules.validate_username(username),
+         {:ok, store} <- mutation_store(opts) do
+      update_user_catalog(store, username, rules, @catalog_cas_attempts)
+    end
+  end
+
+  @doc false
+  @spec bootstrap_default(binary(), keyword()) :: :ok | {:error, term()}
+  def bootstrap_default(password, opts) when is_binary(password) and is_list(opts) do
+    with {:ok, store} <- mutation_store(opts),
+         {:ok, expected, expected_revision, initial_user} <-
+           initial_dashboard_catalog_snapshot(store),
+         {:ok, max_users} <- configured_max_users(),
+         {:ok, value} <- prepare_catalog_value(initial_user, "default", [">" <> password]) do
+      case Router.server_catalog_mutate(
+             store,
+             "acl",
+             "default",
+             expected,
+             expected_revision,
+             value,
+             max_users
+           ) do
+        {:ok, encoded} ->
+          with :ok <-
+                 notify_catalog_entry_change(:upsert, "default", expected_revision, encoded) do
+            project_set_user(store, "default", encoded, expected_revision)
+          end
+
+        {:error, stale}
+        when stale in [:stale_server_catalog_entry, :stale_server_catalog_revision] ->
+          {:error, :dashboard_already_configured}
+
+        {:error, reason} ->
+          {:error, reason}
+
+        :unavailable ->
+          {:error, "ERR ACL catalog unavailable"}
+
+        other ->
+          {:error, other}
+      end
+    end
+  end
+
+  def bootstrap_default(_password, _opts), do: {:error, "ERR invalid dashboard password"}
+
+  @doc false
+  @spec delete_user(binary(), keyword()) :: {:ok, 1} | {:error, term()}
+  def delete_user(username, opts) do
+    with :ok <- Rules.validate_username(username),
+         {:ok, store} <- mutation_store(opts) do
+      del_user_catalog(store, username, 1)
+    end
+  end
+
   @impl true
   def del_user(username, opts) do
     with :ok <- Rules.validate_username(username),
@@ -534,9 +602,19 @@ defmodule FerricstoreServer.Management.ACL do
     Enum.sort_by(updates ++ deletes, &elem(&1, 0))
   end
 
-  defp set_user_catalog(store, username, rules, attempts) do
+  defp set_user_catalog(store, username, rules, attempts),
+    do: mutate_user_catalog(store, username, rules, :upsert, attempts)
+
+  defp create_user_catalog(store, username, rules, attempts),
+    do: mutate_user_catalog(store, username, rules, :create, attempts)
+
+  defp update_user_catalog(store, username, rules, attempts),
+    do: mutate_user_catalog(store, username, rules, :update, attempts)
+
+  defp mutate_user_catalog(store, username, rules, mode, attempts) do
     with {:ok, expected, expected_revision, existing} <-
            current_catalog_user(store, username),
+         :ok <- validate_user_mutation_mode(mode, existing),
          {:ok, max_users} <- configured_max_users(),
          {:ok, value} <- prepare_catalog_value(existing, username, rules) do
       case Router.server_catalog_mutate(
@@ -556,12 +634,17 @@ defmodule FerricstoreServer.Management.ACL do
 
         {:error, stale}
         when stale in [:stale_server_catalog_entry, :stale_server_catalog_revision] and
+               mode == :update ->
+          {:error, "ERR ACL user changed concurrently"}
+
+        {:error, stale}
+        when stale in [:stale_server_catalog_entry, :stale_server_catalog_revision] and
                attempts > 1 ->
-          set_user_catalog(store, username, rules, attempts - 1)
+          mutate_user_catalog(store, username, rules, mode, attempts - 1)
 
         {:error, stale}
         when stale in [:stale_server_catalog_entry, :stale_server_catalog_revision] ->
-          {:error, "ERR ACL user changed concurrently"}
+          {:error, concurrent_user_mutation_error(mode)}
 
         {:error, {:server_catalog_limit_reached, max}} ->
           {:error, "ERR max ACL users reached (#{max})"}
@@ -575,6 +658,29 @@ defmodule FerricstoreServer.Management.ACL do
         other ->
           {:error, other}
       end
+    end
+  end
+
+  defp validate_user_mutation_mode(:create, nil), do: :ok
+  defp validate_user_mutation_mode(:create, _existing), do: {:error, :acl_user_already_exists}
+  defp validate_user_mutation_mode(:update, nil), do: {:error, :acl_user_not_found}
+  defp validate_user_mutation_mode(:update, _existing), do: :ok
+  defp validate_user_mutation_mode(:upsert, _existing), do: :ok
+
+  defp concurrent_user_mutation_error(:upsert), do: "ERR ACL user changed concurrently"
+  defp concurrent_user_mutation_error(_mode), do: "ERR ACL catalog changed concurrently"
+
+  defp initial_dashboard_catalog_snapshot(store) do
+    with {:ok, expected_revision, _version} <- catalog_revision(store),
+         {:ok, entries} <- catalog_entries(store),
+         {:ok, after_revision, _after_version} <- catalog_revision(store),
+         true <- expected_revision == after_revision,
+         [{"default", %{value: value}, expected}] when is_binary(value) <- entries,
+         {:ok, user} <- decode_catalog_value(value),
+         true <- user == Acl.default_user() do
+      {:ok, expected, expected_revision, user}
+    else
+      _configured_or_changed -> {:error, :dashboard_already_configured}
     end
   end
 

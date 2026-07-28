@@ -119,6 +119,71 @@ To disable protected mode, either:
 1. Set a password on the default user: `ACL SETUSER default on >password`
 2. Create at least one non-default user with a password
 
+### Dashboard Bootstrap and Login
+
+When `FERRICSTORE_PROTECTED_MODE=true`, the OSS dashboard uses the same durable
+ACL identities and permissions as the native protocol. It does not maintain a
+separate user database.
+
+A new installation whose replicated ACL catalog contains only the initial,
+passwordless `default` user redirects dashboard HTML requests to
+`/dashboard/setup`. The setup form sets a confirmed password on `default`,
+creates a signed dashboard session, and then becomes unavailable. The catalog
+compare-and-swap makes concurrent setup attempts deterministic: only the first
+valid commit succeeds. Setup is exposed only for the canonical factory ACL
+state, so it cannot overwrite an existing administrator. Deliberately restoring
+the durable ACL catalog to that factory state re-enables bootstrap.
+
+For a dashboard reached directly from loopback, setup does not require a
+second credential. Remote setup requires all of the following:
+
+- `FERRICSTORE_DASHBOARD_REMOTE_ACCESS=true`
+- HTTPS termination at an explicitly trusted proxy
+- `FERRICSTORE_DASHBOARD_TRUST_PROXY_HEADERS=true`
+- the proxy address or CIDR in `FERRICSTORE_DASHBOARD_TRUSTED_PROXIES`
+- `FERRICSTORE_DASHBOARD_SESSION_SECRET` set to at least 32 random bytes
+- `FERRICSTORE_DASHBOARD_BOOTSTRAP_TOKEN_FILE` pointing to a mounted file that
+  contains a random 32-4096 byte bootstrap credential
+
+For example:
+
+```bash
+umask 077
+openssl rand -hex 32 > /run/secrets/ferricstore-dashboard-bootstrap
+export FERRICSTORE_DASHBOARD_REMOTE_ACCESS=true
+export FERRICSTORE_DASHBOARD_TRUST_PROXY_HEADERS=true
+export FERRICSTORE_DASHBOARD_TRUSTED_PROXIES=10.0.0.0/8
+export FERRICSTORE_DASHBOARD_SESSION_SECRET="$(openssl rand -hex 32)"
+export FERRICSTORE_DASHBOARD_BOOTSTRAP_TOKEN_FILE=/run/secrets/ferricstore-dashboard-bootstrap
+```
+
+All dashboard-serving nodes behind the same endpoint must use the same session
+secret. Mount the same bootstrap token on every node that may receive the
+initial setup request.
+
+Do not enable `FERRICSTORE_DASHBOARD_ALLOW_INSECURE_HTTP` on an untrusted
+network. Forwarded scheme and client-address headers are ignored unless the
+immediate peer is in the trusted proxy list.
+
+After bootstrap, use **Security > Account management** to add named accounts:
+
+| Profile | Dashboard behavior |
+|---------|--------------------|
+| Administrator | Full commands, keys, and channels |
+| Observer | Read commands constrained by key and channel patterns |
+| Custom | Explicit ACL modifiers, with password and enabled state managed separately |
+
+The account-management surface itself follows ACL policy. Listing requires
+`ACL.LIST`, account creation, state, password, and rule changes require
+`ACL.SETUSER`, and deletion requires `ACL.DELUSER`. The `default` recovery
+administrator cannot be disabled or deleted in the dashboard, and a user
+cannot disable or delete its own active account there. Password or rule changes
+invalidate existing signed sessions immediately.
+
+Dashboard POSTs use origin validation and double-submit CSRF tokens. Login and
+bootstrap attempts share the bounded authentication rate limiter, and
+authentication plus dashboard ACL mutations are available to the audit log.
+
 ## TLS Configuration
 
 FerricStore has **two separate network layers**, each with its own TLS:

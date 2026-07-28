@@ -509,6 +509,9 @@ defmodule Ferricstore.FlowGovernanceReleaseOutboxTest do
              Router.read_shard_values(ctx, 0, List.duplicate("key", 513))
 
     assert {:error, "ERR invalid shard batch read request"} =
+             Router.read_shard_values_chunked(ctx, 0, List.duplicate("key", 513))
+
+    assert {:error, "ERR invalid shard batch read request"} =
              Router.read_shard_values(ctx, 0, [:not_a_binary])
 
     assert {:error, "ERR invalid shard batch read request"} =

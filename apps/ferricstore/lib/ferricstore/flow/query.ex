@@ -92,7 +92,7 @@ defmodule Ferricstore.Flow.Query do
   end
 
   defp parse_diagnostic(parser, query) do
-    if function_exported?(parser, :parse_diagnostic, 1) do
+    if Code.ensure_loaded?(parser) and function_exported?(parser, :parse_diagnostic, 1) do
       parser.parse_diagnostic(query)
     else
       case parser.parse(query) do

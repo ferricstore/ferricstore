@@ -30,6 +30,36 @@ defmodule Ferricstore.Flow.MutationAttrsTest do
     assert attrs.max_active_ms == :infinity
   end
 
+  test "schedule discovery metadata is accepted only through the internal schedule path" do
+    metadata = %{kind: :interval, target_type: "email"}
+
+    assert {:error, "ERR flow schedule metadata is reserved for internal use"} =
+             MutationAttrs.create_attrs("flow-1",
+               type: "email",
+               schedule_metadata: metadata
+             )
+
+    assert {:ok, attrs} =
+             MutationAttrs.create_attrs(
+               "__ferricstore_schedule__:daily",
+               Ferricstore.Flow.Internal.put(
+                 type: "__ferricstore_schedule",
+                 schedule_metadata: metadata
+               )
+             )
+
+    assert attrs.schedule_metadata == metadata
+
+    assert {:error, "ERR flow schedule metadata is reserved for internal use"} =
+             MutationAttrs.create_attrs(
+               "__ferricstore_schedule__:invalid",
+               Ferricstore.Flow.Internal.put(
+                 type: "__ferricstore_schedule",
+                 schedule_metadata: %{kind: :cron, target_type: "email"}
+               )
+             )
+  end
+
   test "transition_attrs rejects direct transition into running" do
     assert {:error, "ERR flow running state is only entered by FLOW.CLAIM_DUE"} =
              MutationAttrs.transition_attrs("flow-1", "queued", "running",

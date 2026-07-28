@@ -36,7 +36,13 @@ defmodule FerricstoreServer.Health.Endpoint.LoginTest do
 
     assert html =~ "&lt;bad&gt;"
     assert html =~ "/dashboard/flow?x=&quot;bad&quot;"
-    assert html =~ "FerricStore Dashboard"
+    assert html =~ "Sign in to the control plane"
+    assert html =~ ~s(<meta name="viewport")
+    assert html =~ ~s(class="auth-context")
+    assert html =~ ~s(role="alert")
+    assert html =~ ~s(name="username")
+    assert html =~ ~s(autocomplete="username")
+    assert html =~ ~s(maxlength="1024")
   end
 
   test "authenticate delegates to shared ACL authentication" do

@@ -24,6 +24,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       alias Ferricstore.Flow.PolicyAttributeCatalog
       alias Ferricstore.Flow.PolicyPatch
       alias Ferricstore.Flow.RetryPolicy
+      alias Ferricstore.Flow.Schedule.Metadata, as: ScheduleMetadata
       alias Ferricstore.Flow.StateMeta
       alias Ferricstore.Flow.SystemMetadata
       alias Ferricstore.HLC
@@ -290,11 +291,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           run_state: nil,
           child_groups: %{}
         }
+        |> flow_create_put_schedule_metadata(Map.get(attrs, :schedule_metadata))
         |> SystemMetadata.put_record(Map.get(attrs, :system_metadata, %{}))
         |> flow_put_record_attributes(Map.get(attrs, :attributes))
         |> StateMeta.apply_update(attrs)
         |> flow_stamp_terminal_retention(now_ms)
       end
+
+      defp flow_create_put_schedule_metadata(record, %{} = metadata),
+        do: Map.put(record, :schedule_metadata, metadata)
+
+      defp flow_create_put_schedule_metadata(record, _metadata), do: record
 
       defp flow_next_state_enter_seq(state) do
         base =
@@ -1452,7 +1459,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
             {:error, "ERR flow state must be a non-empty string"}
 
           true ->
-            :ok
+            flow_validate_create_schedule_metadata(attrs)
+        end
+      end
+
+      defp flow_validate_create_schedule_metadata(%{type: "__ferricstore_schedule"} = attrs) do
+        with :ok <- flow_validate_schedule_create_state(Map.get(attrs, :state)),
+             {:ok, %{} = metadata} <-
+               ScheduleMetadata.normalize(Map.get(attrs, :schedule_metadata)),
+             {:ok, ^metadata} <-
+               ScheduleMetadata.from_definition_result(Map.get(attrs, :payload)) do
+          :ok
+        else
+          {:error, _reason} = error -> error
+          _invalid -> {:error, "ERR invalid internal flow schedule metadata"}
+        end
+      end
+
+      defp flow_validate_schedule_create_state("active"), do: :ok
+
+      defp flow_validate_schedule_create_state(_state),
+        do: {:error, "ERR invalid internal flow schedule state"}
+
+      defp flow_validate_create_schedule_metadata(attrs) do
+        if Map.has_key?(attrs, :schedule_metadata) do
+          {:error, "ERR flow schedule metadata is reserved for internal use"}
+        else
+          :ok
         end
       end
 
