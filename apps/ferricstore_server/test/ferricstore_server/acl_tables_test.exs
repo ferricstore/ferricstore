@@ -36,6 +36,7 @@ defmodule FerricstoreServer.Acl.TablesTest do
     store = FerricStore.Instance.get(:default)
     default_user = Acl.get_user("default")
     revision = max(Acl.catalog_projection_revision(), 0)
+    expected_user = Map.put(default_user, :auth_epoch, revision)
     parent = self()
 
     readers = [
@@ -79,8 +80,8 @@ defmodule FerricstoreServer.Acl.TablesTest do
         result = Task.await(task)
 
         case name do
-          :lookup -> assert [{"default", ^default_user}] = result
-          :list -> assert {"default", default_user} in result
+          :lookup -> assert [{"default", ^expected_user}] = result
+          :list -> assert {"default", expected_user} in result
           :count -> assert result >= 1
         end
       end
