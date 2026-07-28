@@ -1749,9 +1749,11 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
     delayed_attrs = %{
       id: id,
       type: type,
-      state: "accept",
+      from_state: "accept",
+      to_state: "updated",
       partition_key: @partition,
       expected_version: migrated.version,
+      fencing_token: migrated.fencing_token,
       run_at_ms: 2_000,
       now_ms: 1_100,
       policy_ref: policy_reference(policy_v1, 1),
@@ -1761,7 +1763,7 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
     assert {:error, "ERR stale flow policy generation"} =
              Ferricstore.Raft.WARaftBackend.write(
                shard_index,
-               {:flow_schedule_replace, state_key, delayed_attrs}
+               {:flow_transition, state_key, delayed_attrs}
              )
 
     assert {:ok, delayed} = FerricStore.flow_get(id, partition_key: @partition)
@@ -1778,7 +1780,7 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
     assert :ok =
              Ferricstore.Raft.WARaftBackend.write(
                shard_index,
-               {:flow_schedule_replace, state_key, current_attrs}
+               {:flow_transition, state_key, current_attrs}
              )
 
     assert {:ok, converged} = FerricStore.flow_get(id, partition_key: @partition)

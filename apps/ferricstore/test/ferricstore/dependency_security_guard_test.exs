@@ -10,10 +10,14 @@ defmodule Ferricstore.DependencySecurityGuardTest do
     schedule =
       File.read!(Path.join(@repo_root, "apps/ferricstore/lib/ferricstore/flow/schedule.ex"))
 
+    cron =
+      File.read!(Path.join(@repo_root, "apps/ferricstore/lib/ferricstore/flow/schedule/cron.ex"))
+
     assert app_mix =~ ~s({:tz, "~> 0.28"})
     refute app_mix =~ "{:tzdata,"
     refute app_mix =~ "{:hackney,"
     refute config =~ "config :tzdata"
-    assert schedule =~ "Tz.TimeZoneDatabase"
+    assert schedule =~ "Cron.next_run_at_ms"
+    assert cron =~ "Tz.TimeZoneDatabase"
   end
 end
