@@ -9,7 +9,10 @@ commands outside the compact opcode set, native clients use `COMMAND_EXEC` with
 `{"command": "...", "args": [...]}`. The command examples below show the
 logical command name and arguments, not a text wire protocol.
 
-FerricFlow commands use the `FLOW.*` prefix and model durable workflow state: create, claim due work, transition, retry, complete, fail, cancel, signal, value refs, and fanout.
+FerricFlow commands use the `FLOW.*` prefix and model durable workflow state:
+create, claim due work, fused start/step execution, transition, retry, complete,
+fail, cancel, signal, value refs, fanout, query, schedules, policies, and
+governance.
 
 ## Command Surface Summary
 
@@ -44,17 +47,28 @@ CLIENT ID/SETNAME/GETNAME/INFO/LIST/TRACKING/CACHING/TRACKINGINFO/GETREDIR, HELL
 Flow commands are FerricStore-native workflow commands, not FerricStore
 data-structure commands. They are exposed through native TCP mode and the embedded API:
 
-`FLOW.CREATE`, `FLOW.CREATE_MANY`, `FLOW.VALUE.PUT`, `FLOW.SIGNAL`,
+`FLOW.CREATE`, `FLOW.CREATE_MANY`, `FLOW.VALUE.PUT`, `FLOW.VALUE.MGET`, `FLOW.SIGNAL`,
 `FLOW.SPAWN_CHILDREN`, `FLOW.GET`, `FLOW.CLAIM_DUE`, `FLOW.RECLAIM`,
 `FLOW.EXTEND_LEASE`, `FLOW.COMPLETE`, `FLOW.COMPLETE_MANY`, `FLOW.RETRY`,
 `FLOW.RETRY_MANY`, `FLOW.FAIL`, `FLOW.FAIL_MANY`, `FLOW.CANCEL`,
 `FLOW.CANCEL_MANY`, `FLOW.TRANSITION`, `FLOW.TRANSITION_MANY`,
+`FLOW.START_AND_CLAIM`, `FLOW.STEP_CONTINUE`, `FLOW.RUN_STEPS_MANY`,
 `FLOW.REWIND`, `FLOW.STATS`, `FLOW.INFO`, `FLOW.HISTORY`,
 `FLOW.POLICY.SET`, `FLOW.POLICY.GET`, `FLOW.ATTRIBUTES`,
-`FLOW.ATTRIBUTE_VALUES`, `FLOW.QUERY`, `FLOW.RETENTION_CLEANUP`,
+`FLOW.ATTRIBUTE_VALUES`, `FLOW.QUERY`, `FLOW.QUERY.INDEXES`,
+`FLOW.RETENTION_CLEANUP`,
 `FLOW.SCHEDULE.CREATE`, `FLOW.SCHEDULE.GET`, `FLOW.SCHEDULE.LIST`,
 `FLOW.SCHEDULE.FIRE`, `FLOW.SCHEDULE.FIRE_DUE`, `FLOW.SCHEDULE.PAUSE`,
-`FLOW.SCHEDULE.RESUME`, and `FLOW.SCHEDULE.DELETE`.
+`FLOW.SCHEDULE.RESUME`, `FLOW.SCHEDULE.DELETE`, `FLOW.EFFECT.RESERVE`,
+`FLOW.EFFECT.CONFIRM`, `FLOW.EFFECT.FAIL`, `FLOW.EFFECT.COMPENSATE`,
+`FLOW.EFFECT.GET`, `FLOW.APPROVAL.REQUEST`, `FLOW.APPROVAL.APPROVE`,
+`FLOW.APPROVAL.REJECT`, `FLOW.APPROVAL.GET`, `FLOW.APPROVAL.LIST`,
+`FLOW.CIRCUIT.OPEN`, `FLOW.CIRCUIT.CLOSE`, `FLOW.CIRCUIT.GET`,
+`FLOW.BUDGET.RESERVE`, `FLOW.BUDGET.COMMIT`, `FLOW.BUDGET.RELEASE`,
+`FLOW.BUDGET.GET`, `FLOW.BUDGET.LIST`, `FLOW.LIMIT.LEASE`,
+`FLOW.LIMIT.SPEND`, `FLOW.LIMIT.RELEASE`, `FLOW.LIMIT.GET`,
+`FLOW.LIMIT.LIST`, `FLOW.GOVERNANCE.LEDGER`, and
+`FLOW.GOVERNANCE.OVERVIEW`.
 
 Flow attributes are small indexed metadata fields for query and dashboard
 filters. They are separate from payload and named value refs:
@@ -82,8 +96,9 @@ Collection reads require one `partition_key` equality. A point read that omits
 it addresses only the run ID's deterministic auto-partition; explicitly
 partitioned runs require the predicate. The OSS default includes bounded
 composite collections, exact `RETURN COUNT`, cursors, statistics, index status,
-and full explain analysis. Enterprise uses the same provider and adds metadata
-scope and governance integration without changing the query contracts.
+and full explain analysis. The planner, indexes, and FlowGuard primitives are
+OSS features. Enterprise consumes the same provider and may add enterprise
+metadata scope and policy integration without changing the query contracts.
 
 ```text
 FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND state = 'failed' ORDER BY updated_at_ms DESC LIMIT 50 RETURN RECORDS" partition tenant-a

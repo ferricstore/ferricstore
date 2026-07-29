@@ -5,13 +5,103 @@
 [![CI](https://github.com/ferricstore/ferricstore/actions/workflows/test.yml/badge.svg)](https://github.com/ferricstore/ferricstore/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-**FerricStore is a durable server with a Ferric native TCP protocol and FerricFlow workflow state built in.**
+**FerricStore is an open-source durable workflow and queue server.**
 
-FerricStore gives applications a durable key-value/data-structure store and a workflow layer for worker queues, explicit state machines, retries, leases, history, observability, indexed attributes, value refs, signals, and fanout.
+Applications run ordinary handler code in their own services. FerricStore
+persists one Flow for each job or process, makes named states claimable under
+leases and fencing, and records every transition, retry, signal, and terminal
+outcome.
 
-FerricFlow keeps each workflow or job's state and history in one durable place. Applications keep running normal business code; FerricFlow records ownership, lease tokens, attempts, retry timing, history, terminal state, retention metadata, and repair data instead of asking application code to rebuild those pieces around a generic queue.
+```text
+create -> claim a state -> run handler -> transition / retry / complete / fail
+```
 
-FerricFlow can replace queue glue for many workflow-shaped workloads: independent services in different languages claim the states they handle, while FerricFlow stores the durable queue/workflow state, leases, retries, history, and repair data in one place.
+Start with a durable queue. Evolve the same Flow into a multi-service state
+machine, then add bounded queries, schedules, policies, and governance as the
+workflow grows. FerricStore does not replay handler code or require application
+code to run inside the server.
+
+FerricFlow runs on the same sharded, Raft-backed engine that FerricStore exposes
+as a durable key-value and data-structure store.
+
+## Start Locally
+
+Run one development node:
+
+```bash
+docker run -p 6388:6388 -p 6380:6380 -p 6381:6381 \
+  -e FERRICSTORE_PROTECTED_MODE=false \
+  -v ferricstore_data:/data \
+  ghcr.io/ferricstore/ferricstore:0.11.4
+```
+
+Published SDKs connect to `ferric://127.0.0.1:6388`. The operations dashboard
+is at <http://127.0.0.1:6380/dashboard>, metrics are at `/metrics`, and isolated
+liveness/readiness probes use port `6381`.
+
+`FERRICSTORE_PROTECTED_MODE=false` is for local development only. With
+protected mode enabled, bootstrap the first durable ACL user at
+`/dashboard/setup`, then sign in at `/dashboard/login`. See
+[Getting Started](guides/getting-started.md) for SDK setup and
+[Security](guides/security.md) before exposing a server.
+
+## OSS Capability Map
+
+The FQL1 query planner, schedules, governance primitives, and operations
+dashboard are included in this OSS repository and release image; they are not
+enterprise-only add-ons.
+
+| Area | Included in FerricStore OSS `0.11.4` |
+| --- | --- |
+| Durable KV and data structures | Strings, hashes with field TTL, lists, sets, sorted sets, streams and consumer groups, Pub/Sub, transactions, blocking reads, bitmaps, HyperLogLog, GEO, Bloom and Cuckoo filters, Count-Min Sketch, TopK, and TDigest. |
+| FerricStore-native helpers | Compare-and-swap, fenced distributed locks, fixed-window rate limiting, cache-aside/stampede protection, key diagnostics, quotas, and cluster inspection. |
+| Durable queues and workflows | `FLOW.CREATE`, batched create/mutation commands, fused `FLOW.START_AND_CLAIM`, `FLOW.STEP_CONTINUE`, and `FLOW.RUN_STEPS_MANY`, state-specific `FLOW.CLAIM_DUE`, leases and fencing, transitions, retry, complete, fail, cancel, reclaim, rewind, history, and retention cleanup. |
+| Query engine | `FLOW.QUERY` with FQL1 point, collection, exact-count, history, lineage, metadata, and lease-deadline queries; bounded indexes, field projection, cursors, statistics, `EXPLAIN`, `EXPLAIN ANALYZE`, and `FLOW.QUERY.INDEXES`. |
+| Scheduling | Durable one-shot, delayed, interval, and cron schedules; pause/resume/delete, bounded interval catch-up, overlap policies, maximum fires, automatic due execution, and explicit administrative firing. |
+| Policies and lifecycle | Type policy generations with compare-and-swap, per-state FIFO or parallel execution, fixed/exponential retry policies, exhaustion routing, maximum active lifetime, indexed attributes/state metadata, and resumable policy migrations. |
+| Workflow coordination | Durable signals, parent/child fanout, lineage, named value refs, state metadata, idempotent creation, and independently claimable workflow states. |
+| FlowGuard governance | Durable effect reservations, approvals, circuits, budgets, strict leased concurrency limits, per-Flow governance ledgers, global overview/list surfaces, and structured denials. |
+| Operations | Browser dashboard, local operational Mix CLI, Flow query and index inspection, schedules, policies, governance, failures, retention, storage, keyspace, clients, streams, Pub/Sub, slow log, Raft/consensus, doctor diagnostics, health probes, and Prometheus metrics. |
+| Security | Protected mode, named ACL users, command/key/channel rules, dashboard bootstrap/login and ACL-scoped accounts, TLS/mTLS, trusted-proxy controls, CSRF/origin validation, login throttling, session revocation, and audit logging. |
+| Durability and deployment | Sharded WARaft consensus, disk-backed authoritative records, restart recovery, compaction, memory pressure/admission controls, multi-node routing, Docker multi-arch images, Kubernetes, bare-metal releases, and embedded mode. |
+
+## Scope And Boundaries
+
+- The native wire protocol is FerricStore's multiplexed typed binary protocol,
+  not Redis RESP. Command snippets in this README show logical command names;
+  SDKs send typed native frames and values.
+- FerricFlow is a durable state, queue, and coordination engine. It does not
+  replay handler code or require handlers to run inside FerricStore.
+- FQL1 is a deliberately bounded Flow query language, not general SQL. It
+  rejects shapes for which the server cannot produce an advertised bounded
+  plan.
+- `partition_key` is an application routing, co-location, and bounded-query
+  key. It is not an OSS tenant-control-plane requirement.
+- FQL does not return payload, result, error, named-value, lease-token, fencing,
+  or retention fields. QueryRows and covering indexes hold query-visible
+  metadata; payload/value bytes are hydrated through point, claim, or value-ref
+  APIs when explicitly requested.
+- FerricStore uses familiar Redis-style logical command names for many data
+  structures, but compatibility is command-specific. It is not a drop-in Redis
+  wire server; use the Ferric native SDKs or embedded Elixir API.
+
+## Interfaces And Published SDKs
+
+The published SDKs use the same Ferric native protocol and currently correlate
+with the OSS server at version `0.11.4`:
+
+| Interface | Package or module | Source |
+| --- | --- | --- |
+| Python | [`ferricstore`](https://pypi.org/project/ferricstore/) | [`ferricstore/ferricstore-python`](https://github.com/ferricstore/ferricstore-python) |
+| Go | [`github.com/ferricstore/ferricstore-go`](https://pkg.go.dev/github.com/ferricstore/ferricstore-go) | [`ferricstore/ferricstore-go`](https://github.com/ferricstore/ferricstore-go) |
+| Elixir native client | [`ferricstore_sdk`](https://hex.pm/packages/ferricstore_sdk) | [`ferricstore/ferricstore-elixir`](https://github.com/ferricstore/ferricstore-elixir) |
+| TypeScript / Node.js | [`@ferricstore/ferricstore`](https://www.npmjs.com/package/@ferricstore/ferricstore) | [`ferricstore/ferricstore-typescript`](https://github.com/ferricstore/ferricstore-typescript) |
+| Embedded Elixir server API | [`ferricstore`](https://hex.pm/packages/ferricstore) | This repository |
+| Local operational CLI | `mix ferricstore.*` tasks | This repository |
+
+All four native SDK release lines declare FerricStore `0.11.4` as their minimum
+server version while retaining native wire protocol v1.
+No Java SDK is currently published.
 
 ## Beta Status
 
@@ -21,8 +111,9 @@ public APIs, command details, operational defaults, and storage/projection
 internals may still change before `1.0`.
 
 Beta does not mean lightly tested. The project is thoroughly tested across the
-durability path, FerricFlow workflow commands, Rust NIFs, storage behavior,
-security, dashboard/API surfaces, the embedded API, Python SDK, restart/recovery,
+durability path, FerricFlow workflow commands, FQL1 and index lifecycle, durable
+schedules, governance, Rust NIFs, storage behavior, security, dashboard/API
+surfaces, the embedded API, published SDK integration suites, restart/recovery,
 cluster/quorum behavior, benchmarks, and longer soak runs.
 
 Use it today for development, benchmarks, pilots, and controlled production
@@ -38,11 +129,14 @@ A Flow is one durable workflow record:
 | --- | --- |
 | `type` | Workflow or queue type, such as `email` or `order`. |
 | `id` | Application-defined Flow id. |
+| `partition_key` | Routing/co-location boundary required by bounded collection queries and FIFO lanes. |
 | `state` | Current durable state, such as `queued`, `created`, or `charged`. |
 | `attributes` | Small indexed metadata for Flow query, stats, and dashboard filters. |
+| `state_meta` | Metadata retained independently for each logical state; one policy-selected key can be indexed. |
 | `payload` / value refs | Small routing payload plus optional named values stored separately. |
 | lease | Worker claim ownership with fencing. |
 | history | State changes, signals, retries, and terminal events. |
+| lineage | Parent, root, and correlation identities for fanout and cross-service inspection. |
 | terminal status | Completed, failed, cancelled, or still active. |
 
 The core loop is explicit:
@@ -55,25 +149,24 @@ Queue workers usually process one state and complete/fail/retry. Workflow worker
 
 A long workflow does not need to live in one codebase or one workflow runtime. One service can claim `fraud_check`, another can claim `charge_card`, and another can claim `send_email`; the work moves by durable state transition instead of ad hoc queue messages, retry tables, and status tables.
 
-## Run Locally
+## Command-Line Tools
 
-```bash
-docker run -p 6388:6388 \
-  -e FERRICSTORE_PROTECTED_MODE=false \
-  -v ferricstore_data:/data \
-  ghcr.io/ferricstore/ferricstore:0.11.4
-```
+FerricStore ships operational Mix tasks for source checkouts and embedded
+Elixir deployments. These tasks start and operate on the default local
+FerricStore application; they are not a standalone shell for a remote native
+TCP server. Use a published SDK or the operations dashboard for remote access.
 
-`FERRICSTORE_PROTECTED_MODE=false` is for local development only. Use ACL/TLS/protected-mode settings for real deployments.
+| Task | Purpose |
+| --- | --- |
+| `mix ferricstore.info` | Show uptime, shard/key counts, memory, connection/command counters, and Raft leader status. |
+| `mix ferricstore.keys [glob]` | Stream keys with optional `*`/`?` filtering through bounded cursor pages. |
+| `mix ferricstore.config get/set ...` | Inspect or update local namespace commit-window configuration. |
+| `mix ferricstore.merge [shard]` | Trigger the normal merge/compaction eligibility check for one or all local shards. |
+| `mix ferricstore.redis_compat matrix/assess ...` | Generate a Redis compatibility matrix or assess a captured workload in Markdown or JSON. |
+| `mix ferricstore.recovery_kill9 ...` | Run the manual child-process kill/restart recovery benchmark; this is a diagnostic benchmark, not routine administration. |
 
-The published container image is hosted on GitHub Container Registry:
-
-```bash
-docker pull ghcr.io/ferricstore/ferricstore:0.11.4
-```
-
-Current release images are published as multi-arch images for `linux/amd64`
-and `linux/arm64`.
+Run `mix help ferricstore.info` or the corresponding task name for its complete
+arguments and behavior.
 
 ## First Flow Over The Ferric Native Protocol
 
@@ -98,8 +191,128 @@ FLOW.COMPLETE order-1 <lease-token> FENCING <fencing-token> RESULT "ok"
 ```
 
 Flow commands and normal FerricStore commands can be pipelined on the same native connection.
+Latency-sensitive workers can use `FLOW.START_AND_CLAIM` and
+`FLOW.STEP_CONTINUE` to combine state mutation with the next lease, while
+`FLOW.RUN_STEPS_MANY` executes a bounded same-partition batch. These are durable
+server commands, not client-side emulation.
 
-## Python SDK
+## Querying Flows With FQL1
+
+`FLOW.QUERY` is the canonical read and query envelope for Flow state. FQL1 is
+SQL-shaped, but it is purpose-built for bounded workflow queries and exposes
+only plans advertised by the server capability manifest.
+
+```text
+FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND type = @type AND state IN ('queued', 'retrying') ORDER BY updated_at_ms DESC LIMIT 100 RETURN RECORDS (run_id, state, updated_at_ms, attribute['region'])" partition tenant-a type order
+
+FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND type = @type RETURN COUNT" partition tenant-a type order
+
+FLOW.QUERY FQL1 "EXPLAIN ANALYZE FROM runs WHERE partition_key = @partition AND type = @type AND state = 'failed' ORDER BY updated_at_ms DESC LIMIT 50 RETURN RECORDS" partition tenant-a type order
+
+FLOW.QUERY.INDEXES
+```
+
+The OSS query engine includes:
+
+- authoritative point reads plus bounded collections, exact counts, event
+  history, lineage, metadata, and lease-deadline sources;
+- equality, `IN`, `BETWEEN`, time windows, `NULL`, `MISSING`, typed parameters,
+  stable ordering, bounded limits, and opaque cursor pagination;
+- source-specific field projection, including `attribute.*` and
+  `state_meta.*`, to avoid decoding and transferring fields the caller did not
+  request;
+- cost-aware plan selection, statistics, rejected alternatives, actionable
+  errors, `EXPLAIN`, and ACL-controlled `EXPLAIN ANALYZE`;
+- durable index build, validation, activation, retirement, statistics
+  freshness, resumable backfill, and pressure-aware operation, visible through
+  `FLOW.QUERY.INDEXES` and the dashboard; and
+- the negotiated `flow_query_result_v1` compact typed-binary result codec, with
+  the ordinary typed-value codec retained as a lossless fallback.
+
+Current query state is checked against authoritative Flow storage where the
+selected plan requires hydration. Metadata-only and covered projections can be
+served directly from the compact QueryRow/index snapshot. Every scan, result
+page, decoded byte count, native response, memory reservation, and deadline is
+bounded.
+
+The beta commands `FLOW.LIST`, `FLOW.SEARCH`, `FLOW.TERMINALS`,
+`FLOW.FAILURES`, `FLOW.STUCK`, `FLOW.BY_PARENT`, `FLOW.BY_ROOT`, and
+`FLOW.BY_CORRELATION` are not supported. SDK convenience methods compile those
+use cases to `FLOW.QUERY`; new integrations should use FQL1 directly when they
+need control over predicates, fields, order, pagination, counts, or explain
+output.
+
+See the [Flow Query Guide](docs/flow-query.md) for the grammar, result contract,
+index lifecycle, ACL model, diagnostics, and tuning.
+
+## Schedules, Policies, And Governance
+
+### Durable schedules
+
+Schedules are durable Flow records. FerricStore supports one-shot timestamps,
+relative delays, fixed intervals, and cron expressions with timezones.
+
+```text
+FLOW.SCHEDULE.CREATE billing-sweep KIND interval EVERY_MS 60000 CATCHUP_POLICY fire_once OVERLAP_POLICY queue_after_previous TARGET <typed-map>
+FLOW.SCHEDULE.GET billing-sweep
+FLOW.SCHEDULE.LIST KIND interval STATE active COUNT 100
+FLOW.SCHEDULE.PAUSE billing-sweep
+FLOW.SCHEDULE.RESUME billing-sweep
+FLOW.SCHEDULE.DELETE billing-sweep
+```
+
+The built-in scheduler performs automatic due execution. Interval recovery uses
+bounded O(1) `fire_once` catch-up: it creates one target, records how many
+occurrences were coalesced, and advances to the next interval without replaying
+an unbounded burst. Overlap policies, optional queue-after-previous retry,
+maximum fires, end times, and planning failures are persisted and inspectable.
+`FLOW.SCHEDULE.FIRE` and `FLOW.SCHEDULE.FIRE_DUE` are available for explicit
+administration and custom-scheduler deployments.
+
+### Type and state policies
+
+`FLOW.POLICY.SET` installs a replicated type policy. Policy updates merge by
+default, return a monotonic generation, and support compare-and-swap with
+`EXPECTED_GENERATION`; `REPLACE TRUE` performs an intentional full replacement.
+
+```text
+FLOW.POLICY.SET order MAX_ACTIVE_MS 300000 INDEXED_ATTRIBUTES region \
+  MAX_RETRIES 5 BACKOFF exponential BASE_MS 100 MAX_MS 30000 \
+  STATE queued MODE FIFO STATE review MODE PARALLEL
+```
+
+Policies cover fixed or exponential retry and exhaustion routing, maximum
+non-terminal lifetime, indexed attributes, one indexed state-metadata key, and
+per-state FIFO or parallel execution. FIFO ordering is scoped to a
+type/state/partition lane, survives restart and hibernation, and cannot be
+overridden by an individual create or claim. Policy/index migrations are
+durable, bounded, resumable, and ordered by policy generation.
+
+### FlowGuard governance
+
+FlowGuard keeps workflow-side control state in FerricStore rather than an
+external coordination database:
+
+- `FLOW.EFFECT.*` reserves, confirms, fails, compensates, and reads fenced
+  side-effect attempts with idempotency information.
+- `FLOW.APPROVAL.*` requests, approves, rejects, gets, and lists durable human or
+  service approvals.
+- `FLOW.CIRCUIT.*` opens, closes, and reads durable circuit state.
+- `FLOW.BUDGET.*` reserves, commits, releases, gets, and lists fixed-window
+  budgets.
+- `FLOW.LIMIT.*` leases, spends, releases, gets, and lists durable strict global
+  concurrency credits without a cross-shard transaction on every claim.
+- `FLOW.GOVERNANCE.LEDGER` and `FLOW.GOVERNANCE.OVERVIEW` expose per-Flow audit
+  and global operational summaries.
+
+Governance enforcement is fail-closed and structured, but its claim/terminal
+hot-path integration is opt-in: callers provide the governance limit scope and
+shard identity when strict running capacity should be spent and released.
+Workloads that do not enable governance do not pay governance work on ordinary
+Flow claims. See [FerricFlow Governance](docs/flow-governance-design.md) for the
+implemented surface and enforcement boundaries.
+
+## Python Quick Start
 
 Install:
 
@@ -160,7 +373,10 @@ Python SDK links:
 
 ## Core FerricFlow Primitives
 
-- **Queue-to-workflow upgrade** — Python, Elixir, Java, Go, Node, or any FerricStore SDK-capable service can claim specific Flow states, transition work forward, and share one durable record for retries, leases, history, and terminal status.
+- **Multi-language queue-to-workflow upgrade** - services using the published
+  Python, Go, Elixir, or TypeScript SDKs can claim specific Flow states,
+  transition work forward, and share one durable record for retries, leases,
+  history, and terminal status.
 
 ### Signals
 
@@ -237,7 +453,38 @@ def dispatch(job):
 - Handlers are normal application code. FerricFlow does not replay handler code to recover state.
 - History and cold query projections may lag briefly, but current Flow state is the source of truth.
 
-## Durable Store Underneath
+## Operations Dashboard And Security
+
+The OSS server includes a browser operations dashboard on the combined HTTP
+port. It is an operational surface, not a separate control-plane service. Pages
+cover server overview, command/read activity, keyspace and prefixes, storage and
+merge state, clients, streams, Pub/Sub, slow log, configuration, capabilities,
+Raft/consensus, doctor diagnostics, and the full Flow surface: lookup, states,
+workers, due work, FQL queries, index projections, lineage, signals, schedules,
+policies, governance, failures, and retention.
+
+In protected mode:
+
+- a factory ACL catalog bootstraps through `/dashboard/setup` and then disables
+  setup;
+- users sign in through `/dashboard/login` with the same durable ACL identities
+  used by native TCP;
+- `/dashboard/security` supports ACL-scoped named-account management;
+- every page and form action checks its underlying command plus key/channel
+  permission, so an observer cannot invoke an administrator action;
+- signed sessions are revoked immediately after password, enabled-state, rule,
+  or user changes; and
+- POST requests use origin and CSRF validation, while login/bootstrap attempts
+  are rate-limited and audited.
+
+Remote dashboard access requires an explicitly trusted HTTPS proxy, trusted
+proxy CIDRs, a shared session secret, and a file-backed bootstrap token. The
+server also exposes Prometheus-compatible `/metrics`, combined-port dashboard
+JSON endpoints, and isolated liveness/readiness probes. See
+[Security](guides/security.md) for ACL, dashboard, TLS/mTLS, audit, and proxy
+configuration.
+
+## Durability And Storage Model
 
 FerricStore also exposes a durable key-value/data-structure store through the native protocol and embedded API:
 
@@ -249,6 +496,37 @@ ZADD due 1700000000000 flow-1
 ```
 
 Writes go through Raft consensus and disk-backed storage before success is reported. There is no separate mode to turn persistence on.
+
+The high-level data path is:
+
+```text
+native SDK / embedded API
+          |
+          v
+deterministic shard routing -> WARaft quorum commit -> append/apply storage
+                                                    -> hot keydir/native indexes
+                                                    -> async history + LMDB query projection
+```
+
+Authoritative Flow records remain in the Raft segment/apply-projection storage
+path. Hot keydir/native indexes serve current state. LMDB stores one compact
+QueryRow per current Flow plus composite index entries; it does not duplicate
+the full record or payload. A QueryRow contains bounded query-visible metadata
+and one checked physical log locator. Composite entries contain identity,
+version, expiry, and declared covering fields, but do not copy the payload or
+locator.
+
+This layout lets covered FQL projections and counts avoid authoritative-log
+reads while keeping point, history, lineage, and payload-dependent reads
+bounded and validated. Compaction relocates the central QueryRow locator with a
+compare-and-swap instead of rewriting every composite index. Query backfill,
+hydration, native merge, and admission are limited by rows, bytes, memory,
+deadlines, and MemoryGuard pressure.
+
+Rust NIFs implement bounded storage and codec paths. Portable grouped
+`pread`/`pwrite` behavior remains available across supported platforms, while
+Linux builds carry io_uring parity coverage for the applicable asynchronous I/O
+paths.
 
 | Property | How |
 | --- | --- |
@@ -286,6 +564,7 @@ Start here:
 - [Getting Started](guides/getting-started.md) — installation, configuration, first commands.
 - [Key-Value Store](guides/kv-store.md) — how the durable KV/data-structure store works.
 - [Workflow usage examples](docs/flow-vs-temporal-usage.md) — queues, workflows, retries, fanout, signals, and value refs.
+- [Native protocol](docs/native-protocol.md) — typed framing, values, opcodes, compact query results, multiplexing, routing, and backpressure.
 - [Benchmarks](docs/benchmarks.md) — latest Azure FerricFlow results and native KV benchmark requirements.
 
 FerricFlow:
@@ -294,6 +573,7 @@ FerricFlow:
 - [Flow query guide](docs/flow-query.md) — FQL1 syntax, result-field projection, binary results, EXPLAIN, indexes, operations, security, and tuning.
 - [Flow schedules](docs/flow-schedules.md) — durable one-shot, interval, and cron schedules, catch-up, overlap, and recovery semantics.
 - [Flow retry policy](docs/flow-retry-policy.md) — type/state retry policies and retry exhaustion behavior.
+- [FlowGuard governance](docs/flow-governance-design.md) — effects, approvals, circuits, budgets, strict limits, ledgers, and opt-in enforcement.
 - [Flow production readiness](docs/flow-production-readiness.md) — operational model, lagged projections, retention, reclaim, and production tuning.
 - [Elixir Flow SDK](guides/flow-elixir-sdk.md) — high-level embedded workflow/state-machine API over core Flow commands.
 
@@ -301,11 +581,13 @@ Operations and reference:
 
 - [Architecture](guides/architecture.md) — write path, read path, storage, Raft consensus.
 - [Commands Reference](guides/commands.md) — FerricStore command syntax, native protocol mapping, and FerricFlow commands.
+- [Embedded Mode](guides/embedded-mode.md) — in-process Elixir setup, command coverage, storage, and multiple instances.
 - [Redis Migration Guide](guides/redis-migration.md) — compatibility matrix generation, workload assessment, and import strategy.
 - [Configuration](guides/configuration.md) — server config and production defaults.
 - [Deployment](guides/deployment.md) — Docker, Kubernetes, bare metal, clustering.
-- [Security](guides/security.md) — ACL, TLS, protected mode.
+- [Security](guides/security.md) — ACL, protected mode, dashboard accounts, TLS/mTLS, trusted proxies, and audit logging.
 - [Best Practices](guides/best-practices.md) — pipelining, key design, partitioning.
+- [Changelog](CHANGELOG.md) — release-by-release capability and compatibility changes.
 
 ## Contributing
 
