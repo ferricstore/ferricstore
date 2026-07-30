@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.5 - 2026-07-30
+
 - Added deterministic atomic Stream append plans, same-stream and grouped
   multi-topic `XADD_MANY`, compact native producer mode 34, post-WAL bulk
   catalog/cache publication, and reproducible single-topic, partitioned,
