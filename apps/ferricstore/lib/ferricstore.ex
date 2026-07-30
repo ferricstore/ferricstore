@@ -401,6 +401,14 @@ defmodule FerricStore do
   defguardeddelegate(bitpos(key, bit_value, opts \\ []), to: BitmapAPI, keys: [key])
 
   defguardeddelegate(xadd(key, fields), to: StreamsAPI, keys: [key])
+
+  @spec xadd_many([{key(), [binary()]}]) ::
+          [{:ok, binary()} | {:error, term()}] | {:error, binary()}
+  # StreamsAPI validates every item and authorizes the finalized same- or
+  # mixed-stream plan. Avoid building and authorizing a duplicate key list at
+  # this public boundary for large producer batches.
+  def xadd_many(items), do: StreamsAPI.xadd_many(items)
+
   defguardeddelegate(xlen(key), to: StreamsAPI, keys: [key])
   defguardeddelegate(xrange(key, start, stop, opts \\ []), to: StreamsAPI, keys: [key])
   defguardeddelegate(xrevrange(key, stop, start, opts \\ []), to: StreamsAPI, keys: [key])

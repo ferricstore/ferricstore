@@ -9,14 +9,17 @@ defmodule FerricstoreServer.Native.Lane do
   """
 
   alias Ferricstore.{LatencyTrace, Stats}
+  alias Ferricstore.Commands.Stream.Args, as: StreamArgs
   alias Ferricstore.Flow.InternalKey
   alias Ferricstore.Store.{ReadResult, Router}
+  alias Ferricstore.Stream.ActivityLog, as: StreamActivityLog
   alias FerricstoreServer.Native.{Codec, Commands, OutboundBudget, ResourceBudget}
 
   @flag_trace 0x01
   @flag_custom_payload 0x02
   @flag_no_reply 0x10
   @op_pipeline 0x000E
+  @op_command_exec 0x0100
   @op_get 0x0101
   @op_set 0x0102
   @op_mget 0x0104
@@ -361,35 +364,51 @@ defmodule FerricstoreServer.Native.Lane do
         {responses, length(frames)}
 
       :fallback ->
-        case try_compact_data_write_pipeline_batch(frames, command_state) do
+        case try_compact_stream_append_pipeline_batch(frames, command_state) do
           {:ok, responses} ->
             {responses, length(frames)}
 
           :fallback ->
-            case try_compact_mget_batch(frames, command_state) do
+            case try_compact_data_write_pipeline_batch(frames, command_state) do
               {:ok, responses} ->
                 {responses, length(frames)}
 
               :fallback ->
-                case try_plain_get_batch(frames, command_state) do
+                case try_compact_mget_batch(frames, command_state) do
                   {:ok, responses} ->
                     {responses, length(frames)}
 
                   :fallback ->
-                    case try_plain_set_batch(frames, command_state) do
+                    case try_plain_get_batch(frames, command_state) do
                       {:ok, responses} ->
                         {responses, length(frames)}
 
                       :fallback ->
-                        {responses, done_count} =
-                          Enum.reduce(frames, {[], 0}, fn frame, {responses, done_count} ->
-                            case execute_frame(frame, command_state) do
-                              :noreply -> {responses, done_count + 1}
-                              iodata -> {[iodata | responses], done_count + 1}
-                            end
-                          end)
+                        case try_plain_stream_append_batch(frames, command_state) do
+                          {:ok, responses} ->
+                            {responses, length(frames)}
 
-                        {Enum.reverse(responses), done_count}
+                          :fallback ->
+                            case try_plain_set_batch(frames, command_state) do
+                              {:ok, responses} ->
+                                {responses, length(frames)}
+
+                              :fallback ->
+                                {responses, done_count} =
+                                  Enum.reduce(
+                                    frames,
+                                    {[], 0},
+                                    fn frame, {responses, done_count} ->
+                                      case execute_frame(frame, command_state) do
+                                        :noreply -> {responses, done_count + 1}
+                                        iodata -> {[iodata | responses], done_count + 1}
+                                      end
+                                    end
+                                  )
+
+                                {Enum.reverse(responses), done_count}
+                            end
+                        end
                     end
                 end
             end
@@ -485,13 +504,127 @@ defmodule FerricstoreServer.Native.Lane do
     responses
   end
 
+  defp try_compact_stream_append_pipeline_batch(frames, command_state) do
+    case prepare_compact_stream_append_pipeline_batch(frames, command_state) do
+      {:ok, requests, counts, items} ->
+        Stats.incr_commands_by(command_state.stats_counter, length(items))
+
+        execute_prepared_batch(
+          fn ->
+            results = Router.stream_append_auto_items(command_state.instance_ctx, items)
+            StreamActivityLog.record_xadd_results(results, items)
+            results
+          end,
+          &encode_compact_stream_append_pipeline_batch_responses(
+            &1,
+            requests,
+            counts,
+            command_state
+          )
+        )
+
+      :fallback ->
+        :fallback
+    end
+  end
+
+  defp prepare_compact_stream_append_pipeline_batch(frames, command_state) do
+    with true <- plain_set_batch_allowed?(command_state),
+         true <- pressure_ok?(command_state),
+         {:ok, requests, counts, items} <-
+           extract_compact_stream_append_pipeline_frames(frames, [], [], []),
+         :ok <- authorize_batch_pairs(items) do
+      {:ok, requests, counts, items}
+    else
+      _ -> :fallback
+    end
+  rescue
+    _ -> :fallback
+  end
+
+  defp extract_compact_stream_append_pipeline_frames([], requests, counts, item_chunks) do
+    {:ok, Enum.reverse(requests), Enum.reverse(counts),
+     item_chunks |> Enum.reverse() |> List.flatten()}
+  end
+
+  defp extract_compact_stream_append_pipeline_frames(
+         [{lane_id, @op_pipeline, request_id, @flag_custom_payload, body} | rest],
+         requests,
+         counts,
+         item_chunks
+       ) do
+    case Codec.decode_body(@op_pipeline, @flag_custom_payload, body) do
+      {:ok, %{"compact_pipeline" => {34, items}} = payload} when is_list(items) ->
+        request = {lane_id, request_id, Map.get(payload, "compact_values") == true}
+
+        extract_compact_stream_append_pipeline_frames(
+          rest,
+          [request | requests],
+          [length(items) | counts],
+          [items | item_chunks]
+        )
+
+      _ ->
+        :fallback
+    end
+  end
+
+  defp extract_compact_stream_append_pipeline_frames(
+         _frames,
+         _requests,
+         _counts,
+         _item_chunks
+       ),
+       do: :fallback
+
+  defp encode_compact_stream_append_pipeline_batch_responses(
+         results,
+         requests,
+         counts,
+         command_state
+       ) do
+    {responses, []} =
+      requests
+      |> Enum.zip(counts)
+      |> Enum.map_reduce(results, fn {{lane_id, request_id, values_only?}, count}, remaining ->
+        {frame_results, rest} = Enum.split(remaining, count)
+
+        payload =
+          if values_only? do
+            Codec.encode_compact_kv_mget(frame_results) ||
+              compact_pipeline_result_body(frame_results)
+          else
+            compact_pipeline_result_body(frame_results)
+          end
+
+        response =
+          Codec.encode_command_response_frames(
+            @op_pipeline,
+            lane_id,
+            request_id,
+            :ok,
+            payload,
+            compression: Map.get(command_state, :compression, :none),
+            compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
+            compact_response_codecs:
+              Map.get(command_state, :compact_response_codecs, MapSet.new()),
+            chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
+            max_response_bytes: Map.get(command_state, :max_response_bytes)
+          )
+
+        {response, rest}
+      end)
+
+    responses
+  end
+
   defp try_compact_data_write_pipeline_batch(frames, command_state) do
     case prepare_compact_data_write_pipeline_batch(frames, command_state) do
       {:ok, requests, counts, ops} ->
         Stats.incr_commands_by(command_state.stats_counter, length(ops))
 
         execute_prepared_batch(
-          fn -> Router.pipeline_write_batch(command_state.instance_ctx, ops) end,
+          fn -> submit_plain_stream_ops(command_state.instance_ctx, ops) end,
           &encode_compact_data_write_pipeline_batch_responses(&1, requests, counts, command_state)
         )
 
@@ -784,6 +917,127 @@ defmodule FerricstoreServer.Native.Lane do
     end)
   end
 
+  defp try_plain_stream_append_batch(frames, command_state) do
+    case prepare_plain_stream_append_batch(frames, command_state) do
+      {:ok, requests, ops, activity} ->
+        Stats.incr_commands_by(command_state.stats_counter, length(ops))
+
+        execute_prepared_batch(
+          fn -> Router.pipeline_write_batch(command_state.instance_ctx, ops) end,
+          &encode_plain_stream_append_batch_responses(
+            &1,
+            requests,
+            activity,
+            command_state
+          )
+        )
+
+      :fallback ->
+        :fallback
+    end
+  end
+
+  defp prepare_plain_stream_append_batch(frames, command_state) do
+    with true <- plain_set_batch_allowed?(command_state),
+         true <- pressure_ok?(command_state),
+         {:ok, requests, ops, activity} <-
+           extract_plain_stream_append_frames(frames, [], [], []),
+         :ok <- authorize_keyed_commands(ops) do
+      {:ok, requests, ops, activity}
+    else
+      _ -> :fallback
+    end
+  rescue
+    _ -> :fallback
+  end
+
+  defp extract_plain_stream_append_frames([], requests, ops, activity) do
+    {:ok, Enum.reverse(requests), Enum.reverse(ops), Enum.reverse(activity)}
+  end
+
+  defp extract_plain_stream_append_frames(
+         [{lane_id, @op_command_exec, request_id, 0, body} | rest],
+         requests,
+         ops,
+         activity
+       ) do
+    with {:ok, %{"command" => command, "args" => args} = payload} <-
+           Codec.decode_body(@op_command_exec, 0, body),
+         true <- map_size(payload) == 2,
+         true <- is_binary(command) and String.upcase(command) == "XADD",
+         true <- is_list(args) and length(args) >= 4,
+         {:ok, key, id_spec, fields, nil, nomkstream} <- StreamArgs.parse_xadd_args(args) do
+      raft_command = {:stream_append, key, id_spec, fields, nil, nomkstream}
+
+      extract_plain_stream_append_frames(
+        rest,
+        [{lane_id, request_id} | requests],
+        [{key, raft_command} | ops],
+        [{key, div(length(fields), 2), nil, nomkstream} | activity]
+      )
+    else
+      _ -> :fallback
+    end
+  end
+
+  defp extract_plain_stream_append_frames(_frames, _requests, _ops, _activity), do: :fallback
+
+  defp submit_plain_stream_ops(
+         ctx,
+         [{key, {:stream_append, key, :auto, fields, nil, false}} | rest] = ops
+       ) do
+    case collect_same_plain_stream_fields(rest, key, [fields]) do
+      {:ok, fields_lists} -> Router.stream_append_many_auto(ctx, key, fields_lists)
+      :mixed -> Router.pipeline_write_batch(ctx, ops)
+    end
+  end
+
+  defp submit_plain_stream_ops(ctx, ops), do: Router.pipeline_write_batch(ctx, ops)
+
+  defp collect_same_plain_stream_fields([], _key, fields),
+    do: {:ok, Enum.reverse(fields)}
+
+  defp collect_same_plain_stream_fields(
+         [{key, {:stream_append, key, :auto, fields, nil, false}} | rest],
+         key,
+         acc
+       ),
+       do: collect_same_plain_stream_fields(rest, key, [fields | acc])
+
+  defp collect_same_plain_stream_fields(_mixed, _key, _acc), do: :mixed
+
+  defp encode_plain_stream_append_batch_responses(
+         results,
+         requests,
+         activity,
+         command_state
+       ) do
+    record_plain_stream_append_batch_activity(results, activity)
+
+    requests
+    |> Enum.zip(results)
+    |> Enum.map(fn {{lane_id, request_id}, result} ->
+      {status, value} = plain_set_response(result)
+
+      Codec.encode_command_response_frames(
+        @op_command_exec,
+        lane_id,
+        request_id,
+        status,
+        value,
+        compression: Map.get(command_state, :compression, :none),
+        compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
+        compact_response_codecs: Map.get(command_state, :compact_response_codecs, MapSet.new()),
+        chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
+        max_response_bytes: Map.get(command_state, :max_response_bytes)
+      )
+    end)
+  end
+
+  defp record_plain_stream_append_batch_activity(results, activity) do
+    StreamActivityLog.record_xadd_results(results, activity)
+  end
+
   defp try_plain_set_batch(frames, command_state) do
     case prepare_plain_set_batch(frames, command_state) do
       {:ok, requests, kv_pairs} ->
@@ -1013,7 +1267,9 @@ defmodule FerricstoreServer.Native.Lane do
     case Codec.decode_body(opcode, flags, body) do
       {:ok, payload} ->
         Commands.mark_command_seen(command_state)
-        {status, value, _state} = Commands.execute(opcode, payload, command_state)
+
+        execution_state = maybe_enable_direct_stream_range_response(opcode, command_state)
+        {status, value, _state} = Commands.execute(opcode, payload, execution_state)
 
         Codec.encode_command_response_frames(opcode, lane_id, request_id, status, value,
           compression: Map.get(command_state, :compression, :none),
@@ -1061,6 +1317,26 @@ defmodule FerricstoreServer.Native.Lane do
       flags: @flag_trace
     )
   end
+
+  defp maybe_enable_direct_stream_range_response(@op_command_exec, command_state) do
+    chunk_bytes = Map.get(command_state, :response_chunk_bytes, 0)
+    codecs = Map.get(command_state, :compact_response_codecs, MapSet.new())
+
+    direct? =
+      Map.get(command_state, :compression, :none) == :none and
+        (not is_integer(chunk_bytes) or chunk_bytes <= 0) and
+        not compact_codec_member?(codecs, "flow_query_result_v1")
+
+    if direct?,
+      do: Map.put(command_state, :native_direct_stream_range_response, true),
+      else: command_state
+  end
+
+  defp maybe_enable_direct_stream_range_response(_opcode, command_state), do: command_state
+
+  defp compact_codec_member?(%MapSet{} = codecs, codec), do: MapSet.member?(codecs, codec)
+  defp compact_codec_member?(codecs, codec) when is_list(codecs), do: codec in codecs
+  defp compact_codec_member?(_codecs, _codec), do: false
 
   defp no_reply?({_lane_id, _opcode, _request_id, flags, _body}),
     do: Bitwise.band(flags, @flag_no_reply) != 0

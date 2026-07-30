@@ -345,6 +345,79 @@ The rule for adding the next specialized term is strict:
 
 The `put_batch` profiling lesson was that the compact wire term was good, but the first apply implementation did too much extra pending-state work. The matching `delete_batch` fast path follows the same rule for tombstones: stage the durable projection first, then remove ETS rows only after projection success. Future terms need both halves: compact log shape and compact state-machine apply.
 
+### Compact Stream Apply Plan
+
+The Stream engine owns Stream IDs, metadata, trimming, entries, groups, and
+indexes. `Ferricstore.Raft.StateMachine` in this section means only the
+deterministic Raft apply callback that makes a Stream mutation durable; it is
+not a FerricFlow workflow state machine and does not own Stream semantics.
+
+`{:stream_append_many_auto, key, fields_lists}` and pure auto-ID multi-topic
+batches follow an explicit four-stage apply contract:
+
+1. `AtomicAppend.plan_many_auto/3` reads the current Stream metadata and builds
+   an immutable plan containing ordered replies, entry rows, one final metadata
+   row, parsed IDs, and ready-to-publish catalog rows. Planning does not mutate
+   storage, ETS, caches, or indexes.
+2. `commit_terminal_many_auto/2` stages one plan in the ordinary pending-write
+   batch. A multi-topic command first groups items by Stream key, preserves each
+   key's original item order, and creates one plan per key. Because grouped keys
+   are unique and cannot observe one another, `commit_terminal_many_auto_group/2`
+   stages all shared-log projections in one pending-write update; a promoted
+   Stream falls back to its dedicated per-topic log path. Input result positions
+   remain explicit so grouping cannot reorder the caller's replies.
+3. The state machine appends the complete projection to the local apply log. A
+   failed append rolls the staged work back and publishes nothing.
+4. Each plan's small member-catalog `Publication` descriptor is passed
+   explicitly through the flush call graph. A multi-topic batch carries an
+   ordered list of those descriptors, including each topic's complete derived
+   metadata cache row. Only after the shared append succeeds does FerricStore
+   publish ETS rows, namespace accounting, every topic's catalog and cache rows,
+   and waiter notifications. Catalog bulk inserts are idempotent: their exact
+   counts come from committed per-topic Stream metadata rather than incremental
+   process-local bookkeeping. Terminal plans also bypass the generic compound
+   catalog pass for type and compact-metadata auxiliary rows, which are not
+   logical compound members. Empty legacy Stream-index and waiter ETS tables are
+   checked once per publication, avoiding per-topic lookups when neither optional
+   feature is active; a non-empty table retains the exact indexed/blocked path.
+
+Generic Raft batches containing other command shapes use `commit_many_auto/2`.
+They keep staged values readable because a later command may need metadata
+produced by an earlier operation. Only a batch consisting entirely of untrimmed
+auto-ID Stream appends can use grouped terminal plans; explicit IDs, trimming,
+blob-ref preparation, and mixed command types stay on the generic ordered path.
+The modes are explicit return values and descriptors, never process-local Stream
+flags.
+
+The public and compact-native producer paths retain `{key, fields}` items until
+the routing boundary. Mixed-topic batches route by shard and group by Stream in
+one pass, emitting either the smaller single-topic command or one validated
+grouped command per shard. This avoids constructing generic command tuples only
+to scan and compact them again. Generated IDs follow the same ownership rule:
+the durable compound key is built once and the public ID is a binary slice of
+that owning key, so replies, metadata, and catalog publication do not require a
+second ID copy.
+
+Apply admission charges this compact term once per user-controlled Stream
+member. The type marker and final metadata row are constant command overhead;
+it no longer retains the legacy three-record charge from applying each XADD as
+an independent command. This keeps the replicated work bound while allowing
+larger producer batches.
+
+This shape follows the same broad apply discipline used by permissively
+licensed systems: OpenRaft's RocksDB example builds one explicit write batch and
+publishes replies after it commits (MIT/Apache-2.0), TiKV carries staged writes
+and results in an `ApplyContext` (Apache-2.0), Apache Ratis passes an explicit
+`TransactionContext` into state-machine application (Apache-2.0), and NATS
+JetStream represents batch application with a first-class batch state
+(Apache-2.0). FerricStore uses its own implementation and data model; these are
+architecture references, not copied code.
+
+- [OpenRaft](https://github.com/databendlabs/openraft)
+- [TiKV](https://github.com/tikv/tikv)
+- [Apache Ratis](https://github.com/apache/ratis)
+- [NATS Server](https://github.com/nats-io/nats-server)
+
 ### Future KV Native-Batch Work
 
 The highest-value KV native optimization is durable batched SET, not hot GET. Hot GET already routes through `Router.get/2` to a direct ETS lookup for resident values, and a per-command NIF call would likely give back much of the gain. Durable SET still pays per-entry BEAM costs in routing, compact term handling, state-machine staging, segment/apply-projection validation, and ETS/keydir publishing.

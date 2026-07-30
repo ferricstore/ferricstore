@@ -8,6 +8,14 @@ const RESPONSE_DIRECTION: u8 = 0x80;
 const HEADER_SIZE: usize = 24;
 const FLAG_CUSTOM_PAYLOAD: u8 = 0x02;
 const STATUS_OK: u16 = 0;
+const NATIVE_BINARY: u8 = 4;
+const NATIVE_LIST: u8 = 5;
+const ETF_VERSION: u8 = 131;
+const ETF_LIST_EXT: u8 = 108;
+const ETF_BINARY_EXT: u8 = 109;
+const ETF_NIL_EXT: u8 = 106;
+const MAX_INLINE_STREAM_ROWS: u32 = 2_048;
+const MAX_INLINE_STREAM_SOURCE_BYTES: u64 = 256 * 1_024;
 const COMPACT_FLOW_CLAIM_JOBS: u8 = 0x80;
 const COMPACT_OK_LIST: u8 = 0x81;
 const COMPACT_KV_GET: u8 = 0x82;
@@ -375,6 +383,140 @@ fn encode_compact_kv_mget<'a>(env: Env<'a>, values: Term<'a>) -> NifResult<Term<
     Ok(Binary::from_owned(payload, env).encode(env))
 }
 
+#[rustler::nif(schedule = "DirtyCpu")]
+fn encode_stream_rows_response_frame<'a>(
+    env: Env<'a>,
+    opcode: u16,
+    lane_id: u32,
+    request_id: u64,
+    rows: Term<'a>,
+    max_response_bytes: u64,
+) -> NifResult<Term<'a>> {
+    let layout = match stream_rows_layout(rows) {
+        Some(layout) => layout,
+        None => return Ok(atoms::nil().encode(env)),
+    };
+    let body_len = match 2usize.checked_add(layout.payload_len) {
+        Some(body_len) => body_len,
+        None => return Ok(atoms::nil().encode(env)),
+    };
+
+    if max_response_bytes > 0
+        && u64::try_from(body_len)
+            .map(|body_len| body_len > max_response_bytes)
+            .unwrap_or(true)
+    {
+        return Ok(atoms::response_too_large().encode(env));
+    }
+
+    let mut frame =
+        match allocate_ok_response_frame(opcode, lane_id, request_id, layout.payload_len, 0) {
+            Some(frame) => frame,
+            None => return Ok(atoms::nil().encode(env)),
+        };
+
+    if write_stream_rows_payload(&mut frame.as_mut_slice()[HEADER_SIZE + 2..], rows, &layout)
+        .is_none()
+    {
+        return Ok(atoms::nil().encode(env));
+    }
+
+    Ok(Binary::from_owned(frame, env).encode(env))
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn encode_raw_stream_rows_response_frame<'a>(
+    env: Env<'a>,
+    opcode: u16,
+    lane_id: u32,
+    request_id: u64,
+    pairs: Term<'a>,
+    max_response_bytes: u64,
+) -> NifResult<Term<'a>> {
+    encode_raw_stream_rows_response_frame_impl(
+        env,
+        opcode,
+        lane_id,
+        request_id,
+        pairs,
+        None,
+        max_response_bytes,
+    )
+}
+
+#[rustler::nif]
+// The wire header and precomputed row statistics are separate scalar inputs so
+// this response hot path does not allocate an intermediary BEAM tuple.
+#[allow(clippy::too_many_arguments)]
+fn encode_raw_stream_rows_response_frame_inline<'a>(
+    env: Env<'a>,
+    opcode: u16,
+    lane_id: u32,
+    request_id: u64,
+    pairs: Term<'a>,
+    pair_count: u32,
+    source_bytes: u64,
+    max_response_bytes: u64,
+) -> NifResult<Term<'a>> {
+    if pair_count > MAX_INLINE_STREAM_ROWS || source_bytes > MAX_INLINE_STREAM_SOURCE_BYTES {
+        return Ok(atoms::use_dirty().encode(env));
+    }
+
+    encode_raw_stream_rows_response_frame_impl(
+        env,
+        opcode,
+        lane_id,
+        request_id,
+        pairs,
+        Some(pair_count),
+        max_response_bytes,
+    )
+}
+
+fn encode_raw_stream_rows_response_frame_impl<'a>(
+    env: Env<'a>,
+    opcode: u16,
+    lane_id: u32,
+    request_id: u64,
+    pairs: Term<'a>,
+    expected_pair_count: Option<u32>,
+    max_response_bytes: u64,
+) -> NifResult<Term<'a>> {
+    let layout = match raw_stream_rows_layout(pairs) {
+        Some(layout) => layout,
+        None => return Ok(atoms::nil().encode(env)),
+    };
+    if expected_pair_count.is_some_and(|expected| expected != layout.row_count) {
+        return Ok(atoms::nil().encode(env));
+    }
+    let body_len = match 2usize.checked_add(layout.payload_len) {
+        Some(body_len) => body_len,
+        None => return Ok(atoms::nil().encode(env)),
+    };
+
+    if max_response_bytes > 0
+        && u64::try_from(body_len)
+            .map(|body_len| body_len > max_response_bytes)
+            .unwrap_or(true)
+    {
+        return Ok(atoms::response_too_large().encode(env));
+    }
+
+    let mut frame =
+        match allocate_ok_response_frame(opcode, lane_id, request_id, layout.payload_len, 0) {
+            Some(frame) => frame,
+            None => return Ok(atoms::nil().encode(env)),
+        };
+
+    if write_raw_stream_rows_payload(&mut frame.as_mut_slice()[HEADER_SIZE + 2..], pairs, &layout)
+        .is_none()
+    {
+        return Ok(atoms::nil().encode(env));
+    }
+
+    Ok(Binary::from_owned(frame, env).encode(env))
+}
+
 fn scan_frames(
     bytes: &[u8],
     max_frame_bytes: u32,
@@ -501,9 +643,208 @@ impl<'a> CompactSliceWriter<'a> {
         }
     }
 
+    fn native_binary(&mut self, value: &[u8]) -> Option<()> {
+        self.byte(NATIVE_BINARY)?;
+        self.binary(value)
+    }
+
     fn finish(self) -> Option<()> {
         (self.offset == self.bytes.len()).then_some(())
     }
+}
+
+struct StreamRowsLayout {
+    row_count: u32,
+    row_field_counts: Vec<u32>,
+    payload_len: usize,
+}
+
+fn stream_rows_layout<'a>(rows: Term<'a>) -> Option<StreamRowsLayout> {
+    let mut rows_iter: ListIterator<'a> = rows.decode().ok()?;
+    let mut row_count = 0u32;
+    let mut row_field_counts = Vec::new();
+    let mut payload_len = 5usize;
+
+    for row in &mut rows_iter {
+        let mut fields: ListIterator<'a> = row.decode().ok()?;
+        let mut field_count = 0u32;
+        let mut row_len = 5usize;
+
+        for field in &mut fields {
+            let field = field.decode::<Binary<'a>>().ok()?;
+            u32::try_from(field.len()).ok()?;
+            field_count = field_count.checked_add(1)?;
+            row_len = row_len.checked_add(5)?.checked_add(field.len())?;
+        }
+
+        // Stream entries contain one ID followed by one or more field/value pairs.
+        if field_count < 3 || field_count & 1 == 0 {
+            return None;
+        }
+
+        row_count = row_count.checked_add(1)?;
+        row_field_counts.push(field_count);
+        payload_len = payload_len.checked_add(row_len)?;
+    }
+
+    Some(StreamRowsLayout {
+        row_count,
+        row_field_counts,
+        payload_len,
+    })
+}
+
+fn write_stream_rows_payload<'a>(
+    output: &mut [u8],
+    rows: Term<'a>,
+    layout: &StreamRowsLayout,
+) -> Option<()> {
+    let mut writer = CompactSliceWriter::new(output);
+    let mut rows_iter: ListIterator<'a> = rows.decode().ok()?;
+    writer.byte(NATIVE_LIST)?;
+    writer.write(&layout.row_count.to_be_bytes())?;
+
+    for field_count in &layout.row_field_counts {
+        let row = rows_iter.next()?;
+        let mut fields: ListIterator<'a> = row.decode().ok()?;
+        writer.byte(NATIVE_LIST)?;
+        writer.write(&field_count.to_be_bytes())?;
+
+        for _ in 0..*field_count {
+            let field = fields.next()?.decode::<Binary<'a>>().ok()?;
+            writer.native_binary(field.as_slice())?;
+        }
+
+        if fields.next().is_some() {
+            return None;
+        }
+    }
+
+    if rows_iter.next().is_some() {
+        return None;
+    }
+
+    writer.finish()
+}
+
+struct EtfBinaryListLayout {
+    count: u32,
+    native_len: usize,
+}
+
+fn etf_binary_list_layout(raw: &[u8]) -> Option<EtfBinaryListLayout> {
+    if raw.len() < 7 || raw[0] != ETF_VERSION || raw[1] != ETF_LIST_EXT {
+        return None;
+    }
+
+    let count = read_u32(raw, 2);
+    if count < 2 || count & 1 != 0 {
+        return None;
+    }
+
+    let mut offset = 6usize;
+    let mut native_len = 0usize;
+
+    for _ in 0..count {
+        if raw.get(offset).copied()? != ETF_BINARY_EXT {
+            return None;
+        }
+        let length_offset = offset.checked_add(1)?;
+        let data_offset = length_offset.checked_add(4)?;
+        let len = read_u32_checked(raw, length_offset)? as usize;
+        let end = data_offset.checked_add(len)?;
+        raw.get(data_offset..end)?;
+        native_len = native_len.checked_add(5)?.checked_add(len)?;
+        offset = end;
+    }
+
+    if raw.get(offset).copied()? != ETF_NIL_EXT || offset.checked_add(1)? != raw.len() {
+        return None;
+    }
+
+    Some(EtfBinaryListLayout { count, native_len })
+}
+
+fn read_u32_checked(bytes: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    let bytes = bytes.get(offset..end)?;
+    Some(u32::from_be_bytes(bytes.try_into().ok()?))
+}
+
+fn write_etf_binary_list(
+    writer: &mut CompactSliceWriter<'_>,
+    raw: &[u8],
+    expected_count: u32,
+) -> Option<()> {
+    let layout = etf_binary_list_layout(raw)?;
+    if layout.count != expected_count {
+        return None;
+    }
+
+    let mut offset = 6usize;
+    for _ in 0..layout.count {
+        let len = read_u32_checked(raw, offset.checked_add(1)?)? as usize;
+        let data_offset = offset.checked_add(5)?;
+        let end = data_offset.checked_add(len)?;
+        writer.native_binary(raw.get(data_offset..end)?)?;
+        offset = end;
+    }
+
+    Some(())
+}
+
+fn raw_stream_rows_layout<'a>(pairs: Term<'a>) -> Option<StreamRowsLayout> {
+    let mut pairs_iter: ListIterator<'a> = pairs.decode().ok()?;
+    let mut row_count = 0u32;
+    let mut row_field_counts = Vec::new();
+    let mut payload_len = 5usize;
+
+    for pair in &mut pairs_iter {
+        let (id, raw) = pair.decode::<(Binary<'a>, Binary<'a>)>().ok()?;
+        u32::try_from(id.len()).ok()?;
+        let fields = etf_binary_list_layout(raw.as_slice())?;
+        let row_field_count = fields.count.checked_add(1)?;
+        let row_len = 10usize
+            .checked_add(id.len())?
+            .checked_add(fields.native_len)?;
+
+        row_count = row_count.checked_add(1)?;
+        row_field_counts.push(row_field_count);
+        payload_len = payload_len.checked_add(row_len)?;
+    }
+
+    Some(StreamRowsLayout {
+        row_count,
+        row_field_counts,
+        payload_len,
+    })
+}
+
+fn write_raw_stream_rows_payload<'a>(
+    output: &mut [u8],
+    pairs: Term<'a>,
+    layout: &StreamRowsLayout,
+) -> Option<()> {
+    let mut writer = CompactSliceWriter::new(output);
+    let mut pairs_iter: ListIterator<'a> = pairs.decode().ok()?;
+    writer.byte(NATIVE_LIST)?;
+    writer.write(&layout.row_count.to_be_bytes())?;
+
+    for row_field_count in &layout.row_field_counts {
+        let pair = pairs_iter.next()?;
+        let (id, raw) = pair.decode::<(Binary<'a>, Binary<'a>)>().ok()?;
+        let persisted_field_count = row_field_count.checked_sub(1)?;
+        writer.byte(NATIVE_LIST)?;
+        writer.write(&row_field_count.to_be_bytes())?;
+        writer.native_binary(id.as_slice())?;
+        write_etf_binary_list(&mut writer, raw.as_slice(), persisted_field_count)?;
+    }
+
+    if pairs_iter.next().is_some() {
+        return None;
+    }
+
+    writer.finish()
 }
 
 struct CompactClaimJob<'a> {
@@ -827,13 +1168,36 @@ fn allocate_custom_ok_response_frame(
     request_id: u64,
     payload_len: usize,
 ) -> Option<OwnedBinary> {
+    allocate_ok_response_frame(
+        opcode,
+        lane_id,
+        request_id,
+        payload_len,
+        FLAG_CUSTOM_PAYLOAD,
+    )
+}
+
+fn allocate_ok_response_frame(
+    opcode: u16,
+    lane_id: u32,
+    request_id: u64,
+    payload_len: usize,
+    flags: u8,
+) -> Option<OwnedBinary> {
     let body_len = 2usize.checked_add(payload_len)?;
     if body_len > MAX_FRAME_BODY_BYTES {
         return None;
     }
     let frame_len = HEADER_SIZE.checked_add(body_len)?;
     let mut out = OwnedBinary::new(frame_len)?;
-    write_custom_ok_response_header(out.as_mut_slice(), opcode, lane_id, request_id, body_len);
+    write_ok_response_header(
+        out.as_mut_slice(),
+        opcode,
+        lane_id,
+        request_id,
+        body_len,
+        flags,
+    );
     Some(out)
 }
 
@@ -861,6 +1225,7 @@ fn write_custom_ok_response_frame(
     bytes[HEADER_SIZE + 2..].copy_from_slice(payload);
 }
 
+#[cfg(test)]
 fn write_custom_ok_response_header(
     bytes: &mut [u8],
     opcode: u16,
@@ -868,9 +1233,27 @@ fn write_custom_ok_response_header(
     request_id: u64,
     body_len: usize,
 ) {
+    write_ok_response_header(
+        bytes,
+        opcode,
+        lane_id,
+        request_id,
+        body_len,
+        FLAG_CUSTOM_PAYLOAD,
+    );
+}
+
+fn write_ok_response_header(
+    bytes: &mut [u8],
+    opcode: u16,
+    lane_id: u32,
+    request_id: u64,
+    body_len: usize,
+    flags: u8,
+) {
     bytes[0..4].copy_from_slice(MAGIC);
     bytes[4] = VERSION | RESPONSE_DIRECTION;
-    bytes[5] = FLAG_CUSTOM_PAYLOAD;
+    bytes[5] = flags;
     bytes[6..10].copy_from_slice(&lane_id.to_be_bytes());
     bytes[10..12].copy_from_slice(&opcode.to_be_bytes());
     bytes[12..20].copy_from_slice(&request_id.to_be_bytes());
@@ -929,7 +1312,9 @@ mod atoms {
         query_too_large,
         unsupported_field,
         unsupported_query_shape,
-        unsupported_source
+        unsupported_source,
+        response_too_large,
+        use_dirty
     }
 }
 

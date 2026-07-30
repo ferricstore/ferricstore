@@ -52,4 +52,73 @@ defmodule Ferricstore.ActivityLogBoundedReadTest do
     refute stream.key == oversized
     refute publish.target == oversized
   end
+
+  test "batch XADD activity retains only the configured newest rows in order" do
+    entries =
+      Enum.map(1..600, fn index ->
+        {"stream:#{index}", "#{index}-0", 1}
+      end)
+
+    assert :ok = StreamActivityLog.record_xadd_many(entries)
+    assert StreamActivityLog.len() == 512
+
+    assert Enum.map(StreamActivityLog.get(3), & &1.key) == [
+             "stream:600",
+             "stream:599",
+             "stream:598"
+           ]
+
+    assert hd(StreamActivityLog.get(1)).id == 599
+
+    replacement =
+      Enum.map(601..1_200, fn index ->
+        {"stream:#{index}", "#{index}-0", 1}
+      end)
+
+    assert :ok = StreamActivityLog.record_xadd_many(replacement)
+    assert StreamActivityLog.len() == 512
+
+    assert Enum.map(StreamActivityLog.get(3), & &1.key) == [
+             "stream:1200",
+             "stream:1199",
+             "stream:1198"
+           ]
+
+    assert hd(StreamActivityLog.get(1)).id == 1_199
+  end
+
+  test "XADD results are paired and bounded without materializing discarded activity rows" do
+    items =
+      Enum.map(1..700, fn index ->
+        {"stream:#{index}", ["field", Integer.to_string(index)]}
+      end)
+
+    results =
+      Enum.map(1..700, fn index ->
+        if rem(index, 100) == 0, do: {:error, "rejected"}, else: {:ok, "#{index}-0"}
+      end)
+
+    assert :ok = StreamActivityLog.record_xadd_results(results, items)
+    assert StreamActivityLog.len() == 512
+
+    assert Enum.map(StreamActivityLog.get(3), &{&1.key, &1.entry_id, &1.field_pairs}) == [
+             {"stream:699", "699-0", 1},
+             {"stream:698", "698-0", 1},
+             {"stream:697", "697-0", 1}
+           ]
+  end
+
+  test "batch XADD activity preserves trim and NOMKSTREAM metadata" do
+    assert :ok =
+             StreamActivityLog.record_xadd_many([
+               {"stream:trimmed", "10-1", 2, {:maxlen, true, 100}, true}
+             ])
+
+    assert [entry] = StreamActivityLog.get(1)
+    assert entry.key == "stream:trimmed"
+    assert entry.entry_id == "10-1"
+    assert entry.field_pairs == 2
+    assert entry.trim == "MAXLEN ~ 100"
+    assert entry.nomkstream == true
+  end
 end

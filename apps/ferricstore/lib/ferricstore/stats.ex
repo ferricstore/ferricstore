@@ -862,6 +862,8 @@ defmodule Ferricstore.Stats do
   defp flow_internal_key?(_key), do: false
 
   defp compound_internal_key?(<<"XG:", _rest::binary>>), do: true
+  defp compound_internal_key?(<<"XP:", _rest::binary>>), do: true
+  defp compound_internal_key?(<<"XC:", _rest::binary>>), do: true
 
   defp compound_internal_key?(key) do
     Ferricstore.Store.CompoundKey.internal_key?(key)

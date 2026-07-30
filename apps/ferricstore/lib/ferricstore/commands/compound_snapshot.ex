@@ -66,7 +66,12 @@ defmodule Ferricstore.Commands.CompoundSnapshot do
   def prefixes(key, "zset"), do: [CompoundKey.zset_prefix(key)]
 
   def prefixes(key, "stream"),
-    do: [CompoundKey.stream_prefix(key), CompoundKey.stream_group_prefix(key)]
+    do: [
+      CompoundKey.stream_prefix(key),
+      CompoundKey.stream_group_prefix(key),
+      CompoundKey.stream_pending_prefix(key),
+      CompoundKey.stream_consumer_prefix(key)
+    ]
 
   def prefixes(_key, _type), do: []
 

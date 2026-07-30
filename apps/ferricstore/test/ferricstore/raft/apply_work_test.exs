@@ -1,6 +1,7 @@
 defmodule Ferricstore.Raft.ApplyWorkTest do
   use ExUnit.Case, async: true
 
+  alias Ferricstore.Commands.Stream.AppendBatch
   alias Ferricstore.Raft.{ApplyContext, ApplyWork, CommandStamp}
   alias Ferricstore.Store.CompoundKey
 
@@ -108,6 +109,235 @@ defmodule Ferricstore.Raft.ApplyWorkTest do
                  {:zadd_single, "zset", 2.0, "second"}
                ]
              )
+  end
+
+  test "compact stream append batches retain per-entry work and reply budgets" do
+    command =
+      {:stream_append_many_auto, "stream",
+       [
+         ["field", "first"],
+         ["field", "second"]
+       ]}
+
+    exact =
+      ApplyContext.new(
+        batch_command_apply_budget: 4,
+        compound_member_apply_budget: 2
+      )
+
+    assert {:ok,
+            %{
+              command_items: 4,
+              compound_members: 2,
+              visits: 1,
+              replies: 2
+            }} = ApplyWork.batch_usage(exact, [command])
+
+    assert {:error, :batch_command_apply_budget_exceeded} =
+             ApplyWork.admit_command(
+               ApplyContext.new(
+                 batch_command_apply_budget: 3,
+                 compound_member_apply_budget: 2
+               ),
+               command
+             )
+
+    assert {:error, :compound_member_apply_budget_exceeded} =
+             ApplyWork.admit_command(
+               ApplyContext.new(
+                 batch_command_apply_budget: 4,
+                 compound_member_apply_budget: 1
+               ),
+               command
+             )
+
+    assert {:ok, 2} = ApplyWork.admit_stream_many(exact, elem(command, 2))
+
+    assert {:error, :batch_command_apply_budget_exceeded} =
+             ApplyWork.admit_stream_many(
+               ApplyContext.new(
+                 batch_command_apply_budget: 3,
+                 compound_member_apply_budget: 2
+               ),
+               elem(command, 2)
+             )
+
+    assert {:error, :compound_member_apply_budget_exceeded} =
+             ApplyWork.admit_stream_many(
+               ApplyContext.new(
+                 batch_command_apply_budget: 4,
+                 compound_member_apply_budget: 1
+               ),
+               elem(command, 2)
+             )
+  end
+
+  test "fused compact stream admission retains malformed-command precedence" do
+    context =
+      ApplyContext.new(
+        batch_command_apply_budget: 2,
+        compound_member_apply_budget: 1
+      )
+
+    assert {:ok, 0} = ApplyWork.admit_stream_many(context, [])
+
+    assert {:error, :invalid_stream_append_many_auto} =
+             ApplyWork.admit_stream_many(context, [[]])
+
+    assert {:error, :batch_command_apply_budget_exceeded} =
+             ApplyWork.admit_stream_many(context, [[], ["one", "two"]])
+
+    assert {:error, :invalid_batch_command_list} =
+             ApplyWork.admit_stream_many(context, [["field" | :improper]])
+  end
+
+  test "compact stream admission rejects invalid field-pair schemas" do
+    context =
+      ApplyContext.new(
+        batch_command_apply_budget: 16,
+        compound_member_apply_budget: 4
+      )
+
+    for fields_lists <- [
+          [["orphan"]],
+          [["field", "value", "orphan"]],
+          [[123, "value"]],
+          [["field", :value]]
+        ] do
+      assert {:error, :invalid_stream_append_many_auto} =
+               ApplyWork.admit_stream_many(context, fields_lists)
+
+      assert {:error, :invalid_stream_append_many_auto} =
+               ApplyWork.admit_command(
+                 context,
+                 {:stream_append_many_auto, "stream", fields_lists}
+               )
+    end
+  end
+
+  test "fused compact stream admission honors exact common field-shape budgets" do
+    one_pair = [["field", "value"]]
+    two_pairs = [["field-1", "value-1", "field-2", "value-2"]]
+
+    assert {:ok, 1} =
+             ApplyWork.admit_stream_many(
+               ApplyContext.new(batch_command_apply_budget: 2),
+               one_pair
+             )
+
+    assert {:error, :batch_command_apply_budget_exceeded} =
+             ApplyWork.admit_stream_many(
+               ApplyContext.new(batch_command_apply_budget: 1),
+               one_pair
+             )
+
+    assert {:ok, 1} =
+             ApplyWork.admit_stream_many(
+               ApplyContext.new(batch_command_apply_budget: 4),
+               two_pairs
+             )
+
+    assert {:error, :batch_command_apply_budget_exceeded} =
+             ApplyWork.admit_stream_many(
+               ApplyContext.new(batch_command_apply_budget: 3),
+               two_pairs
+             )
+  end
+
+  test "compact stream append admits exactly the configured member boundary" do
+    entry = ["field", "value"]
+
+    exact_context =
+      ApplyContext.new(
+        batch_command_apply_budget: 8_192,
+        compound_member_apply_budget: 4_096
+      )
+
+    assert :ok =
+             ApplyWork.admit_command(
+               exact_context,
+               {:stream_append_many_auto, "stream", List.duplicate(entry, 4_096)}
+             )
+
+    over_context =
+      ApplyContext.new(
+        batch_command_apply_budget: 8_194,
+        compound_member_apply_budget: 4_096
+      )
+
+    assert {:error, :compound_member_apply_budget_exceeded} =
+             ApplyWork.admit_command(
+               over_context,
+               {:stream_append_many_auto, "stream", List.duplicate(entry, 4_097)}
+             )
+  end
+
+  test "grouped stream append charges fields, positions, members, and replies" do
+    command =
+      {:stream_append_grouped_auto,
+       [
+         {"stream:a", [["field", "first"]], [0]},
+         {"stream:b", [["field", "second"]], [1]}
+       ], 2}
+
+    exact =
+      ApplyContext.new(
+        batch_command_apply_budget: 6,
+        compound_member_apply_budget: 2
+      )
+
+    assert {:ok,
+            %{
+              command_items: 6,
+              compound_members: 2,
+              visits: 1,
+              replies: 2
+            }} = ApplyWork.batch_usage(exact, [command])
+
+    assert {:error, :batch_command_apply_budget_exceeded} =
+             ApplyWork.admit_command(
+               ApplyContext.new(
+                 batch_command_apply_budget: 5,
+                 compound_member_apply_budget: 2
+               ),
+               command
+             )
+
+    work = %{command_items: 6, compound_members: 2, replies: 2}
+    assert :ok = ApplyWork.admit_grouped_stream_work(exact, work)
+
+    assert {:error, :batch_command_apply_budget_exceeded} =
+             ApplyWork.admit_grouped_stream_work(
+               ApplyContext.new(
+                 batch_command_apply_budget: 5,
+                 compound_member_apply_budget: 2
+               ),
+               work
+             )
+
+    assert {:error, :compound_member_apply_budget_exceeded} =
+             ApplyWork.admit_grouped_stream_work(
+               ApplyContext.new(
+                 batch_command_apply_budget: 6,
+                 compound_member_apply_budget: 1
+               ),
+               work
+             )
+  end
+
+  test "fused grouped stream validation rejects invalid field-pair schemas" do
+    groups = [
+      {"stream:a", [[], ["one"], ["one", "two", "three"]], [2, 0, 1]}
+    ]
+
+    command = {:stream_append_grouped_auto, groups, 3}
+    context = ApplyContext.new(batch_command_apply_budget: 8, compound_member_apply_budget: 3)
+
+    assert {:error, :invalid_stream_append_grouped_auto} =
+             AppendBatch.validate_groups_with_work(groups, 3)
+
+    assert {:error, :invalid_stream_append_grouped_auto} =
+             ApplyWork.batch_usage(context, [command])
   end
 
   test "wrapped expanded batches share the outer command budget" do

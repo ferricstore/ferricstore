@@ -2,6 +2,7 @@ defmodule Ferricstore.Raft.ApplyWork do
   @moduledoc false
 
   alias Ferricstore.Raft.ApplyContext
+  alias Ferricstore.Commands.Stream.AppendBatch
   alias Ferricstore.Store.CompoundKey
 
   @compound_batch_tags [
@@ -57,6 +58,123 @@ defmodule Ferricstore.Raft.ApplyWork do
   end
 
   def admit_command(_context, _command), do: {:error, :invalid_batch_apply_budget}
+
+  @doc false
+  @spec admit_stream_many(ApplyContext.t(), term()) ::
+          {:ok, non_neg_integer()} | {:error, atom()}
+  def admit_stream_many(
+        %ApplyContext{
+          batch_command_apply_budget: command_budget,
+          compound_member_apply_budget: compound_budget
+        },
+        fields_lists
+      )
+      when is_integer(command_budget) and command_budget > 0 and
+             is_integer(compound_budget) and compound_budget > 0 do
+    with {:ok, count, _command_remaining, invalid_fields?} <-
+           count_stream_many_fields(fields_lists, command_budget, 0, false),
+         :ok <- admit_stream_many_members(count, compound_budget),
+         :ok <- validate_stream_many_fields(invalid_fields?) do
+      {:ok, count}
+    end
+  end
+
+  def admit_stream_many(_context, _fields_lists),
+    do: {:error, :invalid_batch_apply_budget}
+
+  @doc false
+  @spec admit_grouped_stream_work(ApplyContext.t(), map()) :: :ok | {:error, atom()}
+  def admit_grouped_stream_work(
+        %ApplyContext{
+          batch_command_apply_budget: command_budget,
+          compound_member_apply_budget: compound_budget
+        },
+        %{command_items: command_items, compound_members: compound_members}
+      )
+      when is_integer(command_budget) and command_budget > 0 and
+             is_integer(compound_budget) and compound_budget > 0 and
+             is_integer(command_items) and command_items >= 0 and
+             is_integer(compound_members) and compound_members >= 0 do
+    cond do
+      command_items > command_budget ->
+        {:error, :batch_command_apply_budget_exceeded}
+
+      compound_members > compound_budget ->
+        {:error, :compound_member_apply_budget_exceeded}
+
+      true ->
+        :ok
+    end
+  end
+
+  def admit_grouped_stream_work(_context, _work),
+    do: {:error, :invalid_batch_apply_budget}
+
+  defp count_stream_many_fields([], remaining, count, invalid_fields?),
+    do: {:ok, count, remaining, invalid_fields?}
+
+  defp count_stream_many_fields([fields | rest], remaining, count, invalid_fields?) do
+    with {:ok, remaining, valid_fields?} <-
+           count_stream_field_items(fields, remaining, 0, true) do
+      count_stream_many_fields(
+        rest,
+        remaining,
+        count + 1,
+        invalid_fields? or not valid_fields?
+      )
+    end
+  end
+
+  defp count_stream_many_fields(_improper, _remaining, _count, _invalid_fields?),
+    do: {:error, :invalid_batch_command_list}
+
+  defp count_stream_field_items([], remaining, 0, _binary_items?) when remaining > 0,
+    do: {:ok, remaining - 1, false}
+
+  defp count_stream_field_items([], remaining, count, binary_items?) when count > 0,
+    do: {:ok, remaining, binary_items? and rem(count, 2) == 0}
+
+  defp count_stream_field_items([], 0, 0, _binary_items?),
+    do: {:error, :batch_command_apply_budget_exceeded}
+
+  defp count_stream_field_items([field, value], remaining, 0, true) when remaining >= 2,
+    do: {:ok, remaining - 2, is_binary(field) and is_binary(value)}
+
+  defp count_stream_field_items(
+         [field1, value1, field2, value2],
+         remaining,
+         0,
+         true
+       )
+       when remaining >= 4,
+       do:
+         {:ok, remaining - 4,
+          is_binary(field1) and is_binary(value1) and is_binary(field2) and is_binary(value2)}
+
+  defp count_stream_field_items([item | rest], remaining, count, binary_items?)
+       when remaining > 0,
+       do:
+         count_stream_field_items(
+           rest,
+           remaining - 1,
+           count + 1,
+           binary_items? and is_binary(item)
+         )
+
+  defp count_stream_field_items([_item | _rest], 0, _count, _binary_items?),
+    do: {:error, :batch_command_apply_budget_exceeded}
+
+  defp count_stream_field_items(_improper, _remaining, _count, _binary_items?),
+    do: {:error, :invalid_batch_command_list}
+
+  defp admit_stream_many_members(count, compound_budget) when count <= compound_budget,
+    do: :ok
+
+  defp admit_stream_many_members(_count, _compound_budget),
+    do: {:error, :compound_member_apply_budget_exceeded}
+
+  defp validate_stream_many_fields(false), do: :ok
+  defp validate_stream_many_fields(true), do: {:error, :invalid_stream_append_many_auto}
 
   @spec visit_budget(ApplyContext.t()) :: non_neg_integer()
   def visit_budget(%ApplyContext{batch_command_apply_budget: budget})
@@ -323,7 +441,7 @@ defmodule Ferricstore.Raft.ApplyWork do
       normalize_frames(
         frames,
         prepend_normalized(acc, leaf),
-        count + 1,
+        count + command_reply_count(leaf),
         next_command_remaining,
         next_visit_remaining,
         next_compound_remaining
@@ -336,6 +454,16 @@ defmodule Ferricstore.Raft.ApplyWork do
 
   defp reverse_normalized(nil), do: nil
   defp reverse_normalized(acc), do: Enum.reverse(acc)
+
+  defp command_reply_count({:stream_append_many_auto, _key, fields_lists})
+       when is_list(fields_lists),
+       do: length(fields_lists)
+
+  defp command_reply_count({:stream_append_grouped_auto, _groups, count})
+       when is_integer(count) and count > 0,
+       do: count
+
+  defp command_reply_count(_command), do: 1
 
   defp normalize_entry(:put_entries, {key, value, expire_at_ms}),
     do: {:put, key, value, expire_at_ms}
@@ -528,6 +656,52 @@ defmodule Ferricstore.Raft.ApplyWork do
   defp consume_command_work({:pfadd, _key, elements}, remaining),
     do: consume_items(elements, remaining)
 
+  defp consume_command_work(
+         {:stream_append, _key, _id_spec, fields, _trim_opts, _nomkstream},
+         remaining
+       ),
+       do: consume_stream_fields(fields, remaining, :invalid_stream_append)
+
+  defp consume_command_work(
+         {:stream_append_blob_ref, _key, _id_spec, _encoded_ref, _trim_opts, _nomkstream},
+         remaining
+       ),
+       do: {:ok, remaining}
+
+  defp consume_command_work({:stream_append_many_auto, _key, fields_lists}, remaining),
+    do: consume_stream_fields_lists(fields_lists, remaining, :invalid_stream_append_many_auto)
+
+  defp consume_command_work({:stream_append_grouped_auto, groups, count}, remaining) do
+    case AppendBatch.validate_groups_with_work(groups, count) do
+      {:ok, %{command_items: command_items}} when command_items <= remaining ->
+        {:ok, remaining - command_items}
+
+      {:ok, _work} ->
+        {:error, :batch_command_apply_budget_exceeded}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp consume_command_work({:stream_mutate, _key, {:delete, ids}}, remaining),
+    do: consume_items(ids, remaining)
+
+  defp consume_command_work({:stream_mutate, _key, {:trim, _trim_opts}}, remaining),
+    do: {:ok, remaining}
+
+  defp consume_command_work({:stream_mutate, _key, {:ack, _group, ids}}, remaining),
+    do: consume_items(ids, remaining)
+
+  defp consume_command_work(
+         {:stream_mutate, _key, {:read, _group, _consumer, _count}},
+         remaining
+       ),
+       do: consume_unit(remaining)
+
+  defp consume_command_work({:stream_mutate, _key, {:create, _group, _id, _mkstream}}, remaining),
+    do: consume_unit(remaining)
+
   defp consume_command_work({:pfmerge, _key, sketches}, remaining),
     do: consume_items(sketches, remaining)
 
@@ -588,6 +762,28 @@ defmodule Ferricstore.Raft.ApplyWork do
   defp consume_paired_items(first, second, remaining),
     do: count_paired_items(first, second, remaining, 0)
 
+  defp consume_stream_fields(fields, remaining, invalid_error) do
+    with {:ok, remaining, valid_fields?} <-
+           count_stream_field_items(fields, remaining, 0, true),
+         true <- valid_fields? do
+      {:ok, remaining}
+    else
+      false -> {:error, invalid_error}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp consume_stream_fields_lists(fields_lists, remaining, invalid_error) do
+    with {:ok, _count, remaining, invalid_fields?} <-
+           count_stream_many_fields(fields_lists, remaining, 0, false),
+         false <- invalid_fields? do
+      {:ok, remaining}
+    else
+      true -> {:error, invalid_error}
+      {:error, _reason} = error -> error
+    end
+  end
+
   defp count_paired_items([], [], remaining, 0), do: consume_unit(remaining)
   defp count_paired_items([], [], remaining, count), do: {:ok, remaining - count}
 
@@ -614,6 +810,56 @@ defmodule Ferricstore.Raft.ApplyWork do
 
   defp consume_compound_work({:zadd_many_single, entries}, remaining),
     do: consume_compound_items(entries, remaining)
+
+  defp consume_compound_work(
+         {:stream_append, _key, _id_spec, _fields, _trim_opts, _nomkstream},
+         remaining
+       ) do
+    with {:ok, remaining} <- consume_compound_unit(remaining),
+         {:ok, remaining} <- consume_compound_unit(remaining) do
+      consume_compound_unit(remaining)
+    end
+  end
+
+  defp consume_compound_work(
+         {:stream_append_blob_ref, _key, _id_spec, _encoded_ref, _trim_opts, _nomkstream},
+         remaining
+       ) do
+    with {:ok, remaining} <- consume_compound_unit(remaining),
+         {:ok, remaining} <- consume_compound_unit(remaining) do
+      consume_compound_unit(remaining)
+    end
+  end
+
+  # Compact Stream append materializes one member row per item and a constant
+  # type/meta tail for the command. Budget attacker-controlled work per member;
+  # do not retain the legacy 3x charge from independently applied XADDs.
+  defp consume_compound_work({:stream_append_many_auto, _key, fields_lists}, remaining),
+    do: consume_compound_items(fields_lists, remaining)
+
+  defp consume_compound_work({:stream_append_grouped_auto, groups, _count}, remaining),
+    do: consume_grouped_stream_compound_work(groups, remaining)
+
+  defp consume_compound_work({:stream_mutate, _key, {:delete, ids}}, remaining),
+    do: consume_compound_items(ids, remaining)
+
+  defp consume_compound_work({:stream_mutate, _key, {:trim, _trim_opts}}, remaining),
+    do: consume_compound_unit(remaining)
+
+  defp consume_compound_work({:stream_mutate, _key, {:ack, _group, ids}}, remaining),
+    do: consume_compound_items(ids, remaining)
+
+  defp consume_compound_work(
+         {:stream_mutate, _key, {:read, _group, _consumer, _count}},
+         remaining
+       ),
+       do: consume_compound_unit(remaining)
+
+  defp consume_compound_work(
+         {:stream_mutate, _key, {:create, _group, _id, _mkstream}},
+         remaining
+       ),
+       do: consume_compound_units(remaining, 3)
 
   defp consume_compound_work({:list_op, _key, {tag, elements}}, remaining)
        when tag in @list_push_tags,
@@ -642,6 +888,21 @@ defmodule Ferricstore.Raft.ApplyWork do
     end
   end
 
+  defp consume_grouped_stream_compound_work([], remaining), do: {:ok, remaining}
+
+  defp consume_grouped_stream_compound_work(
+         [{_key, fields_lists, _positions} | groups],
+         remaining
+       )
+       when is_list(fields_lists) do
+    with {:ok, remaining} <- consume_compound_items(fields_lists, remaining) do
+      consume_grouped_stream_compound_work(groups, remaining)
+    end
+  end
+
+  defp consume_grouped_stream_compound_work(_invalid, _remaining),
+    do: {:error, :invalid_compound_batch_entry}
+
   defp consume_expire_if_compound_items([], remaining), do: {:ok, remaining}
 
   defp consume_expire_if_compound_items(
@@ -666,6 +927,14 @@ defmodule Ferricstore.Raft.ApplyWork do
 
   defp consume_compound_unit(0),
     do: {:error, :compound_member_apply_budget_exceeded}
+
+  defp consume_compound_units(remaining, 0), do: {:ok, remaining}
+
+  defp consume_compound_units(remaining, count) when count > 0 do
+    with {:ok, next_remaining} <- consume_compound_unit(remaining) do
+      consume_compound_units(next_remaining, count - 1)
+    end
+  end
 
   defp count_items_up_to(
          [],

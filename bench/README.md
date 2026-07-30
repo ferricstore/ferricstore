@@ -7,6 +7,15 @@ Useful local runners:
 | File | Purpose |
 | --- | --- |
 | `commands_bench.exs` | Embedded command microbenchmarks. |
+| `stream_bench.exs` | Replicated Stream append, trim, range, consumer-group, and same-key concurrency benchmark. |
+| `native_stream_bench.exs` | End-to-end Ferric TCP Stream producer benchmark: sequential `COMMAND_EXEC XADD`, auto-coalesced command bursts, and typed/compact pipelines. |
+| `stream_partition_bench.exs` | Single Stream versus whole-batch and mixed-topic producers across distinct shards and one shared shard. |
+| `stream_mixed_prepare_bench.exs` | Legacy generic-command preparation versus the direct one-pass mixed-topic router. |
+| `stream_plan_bench.exs` | Deterministic 64-entry Stream append-plan CPU and allocation cost. |
+| `stream_grouping_bench.exs` | One-, eight-, and 64-topic grouping plus defensive grouped-command validation. |
+| `stream_activity_log_bench.exs` | Bounded producer activity publication and newest-row reads. |
+| `native_stream_request_codec_bench.exs` | Common XRANGE request decode versus mixed native values. |
+| `native_stream_response_codec_bench.exs` | Exact Stream response value encode, size, and frame costs. |
 | `flow_api_bench.exs` | Embedded FerricFlow API benchmark. |
 | `flow_workflow_bench.exs` | Embedded workflow benchmark. |
 | `flow_governance_bench.exs` | Governance command benchmark. |
@@ -41,7 +50,74 @@ Useful local runners:
 | `flow_state_lmdb_soak/` | Sectioned state-machine soak using `ferric://`. |
 
 Native-protocol SET/GET and DBOS-style workflow benchmarks live in the Python
-SDK repository.
+SDK repository. The in-tree native Stream runner is intentionally self-contained
+so protocol and WAL batching regressions can be gated even when that SDK checkout
+is unavailable:
+
+```bash
+BENCH_STREAM_BATCH=64 BENCH_WARMUP=2 BENCH_TIME=5 \
+  MIX_ENV=bench mix run --no-start bench/native_stream_bench.exs
+```
+
+It sends real frames over a loopback TCP socket, checks every outer response,
+verifies final physical Stream lengths, and reports Raft/WAL shard-position
+progress. Exact one-entry batching is asserted in the deterministic native lane
+and command tests; the live runner may observe unrelated background shard writes.
+Benchee reports outer benchmark iterations per second here. Every scenario
+performs `BENCH_STREAM_BATCH` XADDs per iteration, so multiply `ips` by the batch
+size to obtain appended entries/second. `BENCH_FILTER` selects native scenarios
+by name, and `BENCH_STREAM_ACTIVITY_LOG_MAX_LEN` controls the bounded Stream
+activity metadata retained while measuring writes (default: `512`).
+`BENCH_NATIVE_CONCURRENCY` (default `16`) and
+`BENCH_NATIVE_BATCHES_PER_CONNECTION` (default `4`) also run a matched
+sustained-throughput gate with one passive TCP connection per producer. Each
+connection submits compact mode-34 batches sequentially, while the connections
+remain concurrent. The runner verifies the exact final Stream length and prints
+both durable batches/second and appended entries/second. This separates
+single-in-flight latency from saturated producer throughput.
+
+The Stream runner measures the production Router and replicated command path
+without socket/client codec overhead. It validates that common forward and
+reverse ranges stay on the storage member catalog and that concurrent same-key
+XADD replies are unique. Its `XADD_MANY` `ips` value is batches/second, so
+multiply it by `BENCH_STREAM_BATCH` for entries/second. `XRANGE` and
+`XREVRANGE` report requests/second; multiply by the returned `COUNT` only when
+the desired unit is returned entries/second. Override `BENCH_STREAM_SEED`,
+`BENCH_CONCURRENCY`, and `BENCH_STREAM_CONCURRENT_OPS` for scale runs. Set
+`BENCH_FILTER=XADD_MANY` (or another substring of a benchmark name) to isolate
+one case when running a before/after performance gate. Set
+`BENCH_STREAM_ACTIVITY_LOG_MAX_LEN` to exercise a different activity retention
+bound. `BENCH_STREAM_TRACE=1` performs a traced warm append and prints the total
+request time plus the sorted server latency phases before the benchmark.
+
+Do not compare those units directly with a workflow benchmark iteration. A
+workflow iteration may contain several reads, writes, index updates, and Stream
+events, while a batched Stream iteration contains many entries under one
+durable Raft/WAL commit. Comparisons with Redis, RabbitMQ, or Kafka still require
+separate clients on identical hardware and durability settings; their command,
+acknowledgement, ordering, and delivery semantics are not interchangeable.
+
+The partition runner measures the opt-in superstream architecture without
+changing Redis Stream semantics:
+
+```bash
+BENCH_STREAM_PARTITIONS=12 BENCH_STREAM_BATCH=64 BENCH_STREAM_BATCHES=64 \
+  BENCH_STREAM_TOPICS=64 \
+  BENCH_CONCURRENCY=32 BENCH_SAMPLES=7 MIX_ENV=bench \
+  mix run --no-start bench/stream_partition_bench.exs
+```
+
+The runner measures one hot Stream, one whole producer batch per partition, one
+producer batch mixed across distinct-shard topics, and the same mixed batch with
+all topics pinned to one shard. `BENCH_STREAM_TOPICS` controls logical topic
+cardinality independently from `BENCH_STREAM_PARTITIONS`, so many-topic costs
+can be measured without requiring one shard per topic. It checks every per-item
+result and every final physical Stream length. Treat partitioning as a capacity
+tool, not an automatic speedup: on one host and one storage device, extra Raft
+groups can be neutral or slower than a well-batched Stream. Keep enough entries
+per topic/shard commit; dividing a small batch across many topics mostly measures
+durability overhead. Use the partitioned layout only when this runner
+demonstrates a hot-shard, CPU, or cross-node benefit for the intended deployment.
 
 Composite-index read latency, write amplification, storage growth, and backfill
 throughput are measured in OSS by `flow_query_index_bench.exs` for every launch

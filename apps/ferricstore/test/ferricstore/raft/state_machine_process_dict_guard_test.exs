@@ -48,6 +48,29 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
     end
   end
 
+  test "compact Stream publication is explicit rather than process-local mode state" do
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
+
+    refute source =~ ":sm_terminal_stream_append_prefix"
+    refute source =~ ":sm_terminal_stream_append_ids"
+    refute source =~ ":sm_skip_pending_values"
+
+    with_pending_body =
+      Ferricstore.Test.SourceFiles.private_function_source!(source, "with_pending_writes")
+
+    assert with_pending_body =~ "split_pending_write_result(fun.())"
+    assert with_pending_body =~ "flush_pending_writes(state, publication)"
+
+    publish_body =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "publish_pending_batch"
+      )
+
+    assert publish_body =~ "publication"
+    assert publish_body =~ "apply_pending_batch_locations"
+  end
+
   test "delete_batch fast path stages tombstones and publishes ETS after append" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
 

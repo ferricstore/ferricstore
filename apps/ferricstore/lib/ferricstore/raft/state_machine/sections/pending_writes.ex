@@ -43,6 +43,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
 
       alias Ferricstore.Store.Shard.ZSetIndex
       alias Ferricstore.Store.Shard.CompoundMemberIndex
+      alias Ferricstore.Store.Shard.NamespaceUsageIndex
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
@@ -198,10 +199,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
       # Flushes all accumulated disk writes in a single NIF call, then updates
       # ETS entries with real file_id/offset. Called at the end of every apply/3
       # — no :pending entries remain after this returns.
-      defp flush_pending_writes(state) do
+      defp flush_pending_writes(state, publication) do
         case prepare_pending_flow_native_batches(state) do
           :ok ->
-            do_flush_pending_writes(state)
+            do_flush_pending_writes(state, publication)
 
           {:error, _reason} = error ->
             rollback_pending_writes(state)
@@ -209,7 +210,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
         end
       end
 
-      defp do_flush_pending_writes(state) do
+      defp do_flush_pending_writes(state, publication) do
         :ok = flush_pending_lmdb(state)
 
         case Process.put(:sm_pending_writes, []) do
@@ -219,15 +220,26 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
             end
 
           pending when is_list(pending) ->
-            batch = Enum.reverse(pending)
+            batch =
+              pending
+              |> Enum.reverse()
+              |> maybe_compact_pending_stream_meta_writes(publication)
+
             {batch_bytes, record_bytes, delete_count} = bitcask_batch_stats(batch)
 
             case Process.get(@sm_waraft_projection_writer_key) do
               projection_writer when is_function(projection_writer, 1) ->
-                flush_pending_waraft_projection(state, batch, projection_writer)
+                flush_pending_waraft_projection(state, batch, projection_writer, publication)
 
               _none ->
-                flush_pending_bitcask_batch(state, batch, batch_bytes, record_bytes, delete_count)
+                flush_pending_bitcask_batch(
+                  state,
+                  batch,
+                  batch_bytes,
+                  record_bytes,
+                  delete_count,
+                  publication
+                )
             end
 
           _ ->
@@ -235,7 +247,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
         end
       end
 
-      defp flush_pending_bitcask_batch(state, batch, batch_bytes, record_bytes, delete_count) do
+      defp flush_pending_bitcask_batch(
+             state,
+             batch,
+             batch_bytes,
+             record_bytes,
+             delete_count,
+             publication
+           ) do
         case resolve_active_file(state) do
           :stale ->
             emit_bitcask_append_telemetry(
@@ -274,7 +293,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
               {:ok, locations} ->
                 clear_disk_pressure(state)
                 Process.put(:sm_pending_storage_published?, true)
-                publish_pending_batch(state, file_id, batch, locations)
+                publish_pending_batch(state, file_id, batch, locations, publication)
 
                 observe_pending_lmdb_mirror_enqueue(state, enqueue_pending_lmdb_mirror(state))
                 state = track_bitcask_append_bytes(state, file_path, file_id, record_bytes)
@@ -289,7 +308,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
         end
       end
 
-      defp flush_pending_waraft_projection(state, batch, projection_writer) do
+      defp flush_pending_waraft_projection(state, batch, projection_writer, publication) do
         projection_result =
           Ferricstore.LatencyTrace.maybe_span "server_bitcask_append_us" do
             projection_writer.(batch)
@@ -301,7 +320,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
               {:ok, ^locations} ->
                 clear_disk_pressure(state)
                 Process.put(:sm_pending_storage_published?, true)
-                publish_pending_batch(state, file_id, batch, locations)
+                publish_pending_batch(state, file_id, batch, locations, publication)
 
                 observe_pending_lmdb_mirror_enqueue(state, enqueue_pending_lmdb_mirror(state))
                 :ok
@@ -324,12 +343,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
         end
       end
 
-      defp publish_pending_batch(state, file_id, batch, locations) do
+      defp publish_pending_batch(state, file_id, batch, locations, publication) do
         ctx = Map.get(state, :instance_ctx, %{})
 
         Ferricstore.Store.PublicationEpoch.with_write(ctx, state.shard_index, fn ->
           Ferricstore.LatencyTrace.maybe_span "server_pending_locations_us" do
-            apply_pending_locations(state, file_id, batch, locations)
+            apply_pending_batch_locations(state, file_id, batch, locations, publication)
           end
 
           Ferricstore.LatencyTrace.maybe_span "server_flow_index_update_us" do
@@ -340,7 +359,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
             flush_pending_zset_indexes(state)
           end
 
-          flush_pending_stream_cache_cleanups()
+          Ferricstore.LatencyTrace.maybe_span "server_stream_cache_publish_us" do
+            flush_pending_stream_cache_cleanups()
+            publish_terminal_stream_cache(publication)
+          end
         end)
       end
 
@@ -599,6 +621,65 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
         end)
       end
 
+      # A generic Raft batch can contain many XADDs for the same Stream. Each
+      # append must observe the metadata produced by the previous append while
+      # IDs and replies are computed, but only the final metadata value is part
+      # of the committed projection. Avoid writing every intermediate XM row to
+      # Bitcask; the Raft WAL still retains the complete ordered command batch.
+      @doc false
+      def compact_pending_stream_meta_writes_for_test(batch),
+        do: compact_pending_stream_meta_writes(batch)
+
+      # The compact Stream command emits one final metadata row by construction,
+      # so there are no intermediate XM rows to remove. Generic command batches
+      # still require compaction because each XADD is applied sequentially.
+      defp maybe_compact_pending_stream_meta_writes(
+             batch,
+             %Ferricstore.Commands.Stream.AtomicAppend.Publication{}
+           ),
+           do: batch
+
+      defp maybe_compact_pending_stream_meta_writes(
+             batch,
+             [%Ferricstore.Commands.Stream.AtomicAppend.Publication{} | _rest]
+           ),
+           do: batch
+
+      defp maybe_compact_pending_stream_meta_writes(batch, _publication),
+        do: compact_pending_stream_meta_writes(batch)
+
+      defp compact_pending_stream_meta_writes(batch) do
+        {compacted, _seen} =
+          batch
+          |> Enum.reverse()
+          |> Enum.reduce({[], MapSet.new()}, fn entry, {acc, seen} ->
+            case pending_stream_meta_key(entry) do
+              nil ->
+                {[entry | acc], seen}
+
+              key ->
+                if MapSet.member?(seen, key) do
+                  {acc, seen}
+                else
+                  {[entry | acc], MapSet.put(seen, key)}
+                end
+            end
+          end)
+
+        compacted
+      end
+
+      defp pending_stream_meta_key({:put, <<"XM:", _rest::binary>> = key, _value, _expiry}),
+        do: key
+
+      defp pending_stream_meta_key(
+             {:put_cold, <<"XM:", _rest::binary>> = key, _value, _expiry, _lfu}
+           ),
+           do: key
+
+      defp pending_stream_meta_key({:delete, <<"XM:", _rest::binary>> = key, _path}), do: key
+      defp pending_stream_meta_key(_entry), do: nil
+
       defp bitcask_record_bytes(batch) do
         {_batch_bytes, record_bytes, _delete_count} = bitcask_batch_stats(batch)
         record_bytes
@@ -855,21 +936,30 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
 
           NIF.v2_append_ops_batch_nosync(file_path, ops)
         else
-          puts =
-            Enum.map(batch, fn
-              {:put, key, value, expire_at_ms} -> {key, value, expire_at_ms}
-              {:put_cold, key, value, expire_at_ms, _lfu} -> {key, value, expire_at_ms}
-            end)
+          if Process.get(:sm_pending_fast_put_batch) == true and
+               put_only_pending_batch?(batch) do
+            # The native mixed-operation writer accepts these ready {:put, ...}
+            # rows and already returns tagged locations. Avoid allocating one
+            # transformed request list and one transformed result list for the
+            # common Stream/put-only Raft projection.
+            NIF.v2_append_ops_batch_nosync(file_path, batch)
+          else
+            puts =
+              Enum.map(batch, fn
+                {:put, key, value, expire_at_ms} -> {key, value, expire_at_ms}
+                {:put_cold, key, value, expire_at_ms, _lfu} -> {key, value, expire_at_ms}
+              end)
 
-          case NIF.v2_append_batch_nosync(file_path, puts) do
-            {:ok, locations} ->
-              tag_put_append_locations(locations, length(puts))
+            case NIF.v2_append_batch_nosync(file_path, puts) do
+              {:ok, locations} ->
+                tag_put_append_locations(locations, length(puts))
 
-            {:error, _reason} = error ->
-              error
+              {:error, _reason} = error ->
+                error
 
-            other ->
-              {:error, {:bitcask_append_result_mismatch, {:unexpected_result, other}}}
+              other ->
+                {:error, {:bitcask_append_result_mismatch, {:unexpected_result, other}}}
+            end
           end
         end
       end
@@ -973,18 +1063,34 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
       defp non_negative_integer?(value), do: is_integer(value) and value >= 0
 
       defp apply_pending_locations(state, file_id, batch, locations) do
+        apply_pending_batch_locations(state, file_id, batch, locations, nil)
+      end
+
+      defp apply_pending_batch_locations(state, file_id, batch, locations, publication) do
         cond do
-          Process.get(:sm_pending_fast_put_batch) == true and put_only_pending_batch?(batch) ->
+          Process.get(:sm_pending_fast_put_batch) == true and
+              (stream_append_publication?(publication) or
+                 put_only_pending_batch?(batch)) ->
             apply_fast_put_pending_locations(
+              state,
+              file_id,
+              batch,
+              locations,
+              hot_cache_threshold(state),
+              publication
+            )
+
+          Process.get(:sm_pending_fast_delete_batch) == true and delete_only_pending_batch?(batch) ->
+            apply_fast_delete_pending_locations(state, batch, locations)
+
+          Process.get(:sm_pending_fast_put_batch) == true ->
+            apply_mixed_fast_pending_locations(
               state,
               file_id,
               batch,
               locations,
               hot_cache_threshold(state)
             )
-
-          Process.get(:sm_pending_fast_delete_batch) == true and delete_only_pending_batch?(batch) ->
-            apply_fast_delete_pending_locations(state, batch, locations)
 
           Process.get(:sm_pending_fast_staged_put_batch) == true and
               put_or_put_cold_pending_batch?(batch) ->
@@ -1008,6 +1114,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
         end)
       end
 
+      defp stream_append_publication?(%Ferricstore.Commands.Stream.AtomicAppend.Publication{}),
+        do: true
+
+      defp stream_append_publication?([
+             %Ferricstore.Commands.Stream.AtomicAppend.Publication{} | _rest
+           ]),
+           do: true
+
+      defp stream_append_publication?(_publication), do: false
+
       defp delete_only_pending_batch?(batch) do
         Enum.all?(batch, fn
           {:delete, _key, _prob_path} -> true
@@ -1023,34 +1139,388 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
         end)
       end
 
-      defp apply_fast_put_pending_locations(_state, _file_id, [], [], _hot_threshold), do: :ok
+      # A generic batch may start on the invisible put-only fast path and then
+      # add a delete or another staged operation. Once durable, publish only the
+      # final mutation for each key. The ordinary mixed publisher expects every
+      # put to have an ETS :pending row, which intentionally is not true for the
+      # invisible prefix of such a batch.
+      defp apply_mixed_fast_pending_locations(state, file_id, batch, locations, hot_threshold) do
+        final_indexes = final_pending_key_indexes(batch)
+
+        {puts, put_locations, cold_puts, deletes} =
+          batch
+          |> Enum.zip(locations)
+          |> Enum.with_index()
+          |> Enum.reduce({[], [], [], []}, fn
+            {{{:put, key, value, expire_at_ms} = entry, location}, index},
+            {puts, put_locations, cold_puts, deletes} ->
+              if Map.get(final_indexes, key) == index do
+                {[entry | puts], [location | put_locations], cold_puts, deletes}
+              else
+                {puts, put_locations, cold_puts, deletes}
+              end
+
+            {{{:put_cold, key, value, expire_at_ms, lfu}, {:put, offset, value_size}}, index},
+            {puts, put_locations, cold_puts, deletes} ->
+              if Map.get(final_indexes, key) == index do
+                cold_put = {key, value, expire_at_ms, lfu, offset, value_size}
+                {puts, put_locations, [cold_put | cold_puts], deletes}
+              else
+                {puts, put_locations, cold_puts, deletes}
+              end
+
+            {{{:delete, key, prob_path}, {:delete, _offset, _record_size}}, index},
+            {puts, put_locations, cold_puts, deletes} ->
+              maybe_delete_prob_file_path(state, prob_path)
+
+              if Map.get(final_indexes, key) == index do
+                {puts, put_locations, cold_puts, [key | deletes]}
+              else
+                {puts, put_locations, cold_puts, deletes}
+              end
+          end)
+
+        apply_fast_put_pending_locations(
+          state,
+          file_id,
+          Enum.reverse(puts),
+          Enum.reverse(put_locations),
+          hot_threshold,
+          nil
+        )
+
+        Enum.each(Enum.reverse(cold_puts), fn
+          {key, value, expire_at_ms, lfu, offset, value_size} ->
+            apply_put_cold_pending_location(
+              state,
+              key,
+              value,
+              expire_at_ms,
+              lfu,
+              file_id,
+              offset,
+              value_size
+            )
+        end)
+
+        Enum.each(deletes, fn key ->
+          delete_apply_projection_cache_for_pending_original(state, key)
+          track_keydir_binary_remove(state, key)
+          :ets.delete(state.ets, key)
+          CompoundMemberIndex.delete(Map.get(state, :compound_member_index_name), key)
+          logical_key_index_delete(state, key)
+          maybe_queue_lmdb_state_delete_after_publish(state, key)
+        end)
+
+        :ok
+      end
+
+      defp final_pending_key_indexes(batch) do
+        batch
+        |> Enum.with_index()
+        |> Enum.reduce(%{}, fn
+          {{:put, key, _value, _expire_at_ms}, index}, acc ->
+            Map.put(acc, key, index)
+
+          {{:put_cold, key, _value, _expire_at_ms, _lfu}, index}, acc ->
+            Map.put(acc, key, index)
+
+          {{:delete, key, _prob_path}, index}, acc ->
+            Map.put(acc, key, index)
+        end)
+      end
 
       defp apply_fast_put_pending_locations(
              state,
              file_id,
+             batch,
+             locations,
+             hot_threshold,
+             publication
+           ) do
+        {terminal_stream_publications, terminal_stream_members} =
+          case publication do
+            %Ferricstore.Commands.Stream.AtomicAppend.Publication{} = stream_publication ->
+              {[stream_publication], stream_publication.member_entries}
+
+            [%Ferricstore.Commands.Stream.AtomicAppend.Publication{} | _rest] =
+                stream_publications ->
+              members = Enum.flat_map(stream_publications, & &1.member_entries)
+              {stream_publications, members}
+
+            _generic ->
+              {[], nil}
+          end
+
+        collect_stream_usage? =
+          is_list(terminal_stream_members) and namespace_usage_index_active?(state)
+
+        terminal_stream_batch? = terminal_stream_publications != []
+        initial_lfu = LFU.initial()
+
+        {refs, compound_entries, stream_usage_entries, stream_ets_entries, stream_binary_bytes} =
+          Ferricstore.LatencyTrace.maybe_span "server_stream_publish_prepare_us" do
+            do_apply_fast_put_pending_locations(
+              state,
+              file_id,
+              batch,
+              locations,
+              hot_threshold,
+              terminal_stream_members || [],
+              collect_stream_usage?,
+              terminal_stream_batch?,
+              initial_lfu,
+              {[], [], [], [], 0}
+            )
+          end
+
+        # These rows are unique, newly assigned Stream IDs. ETS publication and
+        # namespace accounting are order-independent, so retain the accumulator
+        # order instead of copying both batches merely to restore append order.
+        # The compact Stream member catalog below receives ready keyed rows from
+        # the explicit publication descriptor; generic compound rows retain the
+        # accumulator reversal used by the ordinary publication path.
+        Ferricstore.LatencyTrace.maybe_span "server_stream_publish_keydir_us" do
+          add_keydir_binary_bytes(state, stream_binary_bytes)
+          safe_ets_insert_many(state.ets, stream_ets_entries)
+        end
+
+        Ferricstore.LatencyTrace.maybe_span "server_stream_publish_usage_us" do
+          entries =
+            maybe_collect_late_stream_usage_entries(
+              state,
+              batch,
+              terminal_stream_members,
+              collect_stream_usage?,
+              stream_usage_entries
+            )
+
+          namespace_usage_index_put_many(state, entries)
+        end
+
+        Ferricstore.LatencyTrace.maybe_span "server_stream_publish_members_us" do
+          member_index = Map.get(state, :compound_member_index_name)
+
+          case terminal_stream_publications do
+            [stream_publication] ->
+              CompoundMemberIndex.publish_stream_append(
+                member_index,
+                stream_publication.member_prefix,
+                stream_publication.member_entries,
+                stream_publication.member_count
+              )
+
+            [_first, _second | _rest] = stream_publications ->
+              stream_counts =
+                Enum.map(stream_publications, fn stream_publication ->
+                  {stream_publication.member_prefix, stream_publication.member_count}
+                end)
+
+              CompoundMemberIndex.publish_stream_appends(
+                member_index,
+                terminal_stream_members,
+                stream_counts
+              )
+
+            [] ->
+              CompoundMemberIndex.put_many(member_index, Enum.reverse(compound_entries))
+          end
+        end
+
+        Ferricstore.LatencyTrace.maybe_span "server_stream_publish_cache_refs_us" do
+          delete_apply_projection_cache_refs(state, refs)
+        end
+      end
+
+      defp do_apply_fast_put_pending_locations(
+             _state,
+             _file_id,
+             [],
+             [],
+             _hot_threshold,
+             _terminal_stream_members,
+             _collect_stream_usage?,
+             _terminal_stream_batch?,
+             _initial_lfu,
+             acc
+           ),
+           do: acc
+
+      defp do_apply_fast_put_pending_locations(
+             state,
+             file_id,
              [{:put, key, value, expire_at_ms} | batch],
              [{:put, offset, value_size} | locations],
-             hot_threshold
+             hot_threshold,
+             terminal_stream_members,
+             collect_stream_usage?,
+             terminal_stream_batch?,
+             initial_lfu,
+             {refs, compound_entries, stream_usage_entries, stream_ets_entries,
+              stream_binary_bytes}
            ) do
         ets_val = value_for_ets(value, hot_threshold)
-        previous = :ets.lookup(state.ets, key)
 
-        track_keydir_binary_delta_from_previous(state, key, previous, ets_val, expire_at_ms)
+        {new_stream_member?, remaining_stream_members} =
+          take_terminal_stream_member(key, terminal_stream_members)
 
-        :ets.insert(
-          state.ets,
-          {key, ets_val, expire_at_ms, LFU.initial(), file_id, offset, value_size}
+        {previous, refs} =
+          if new_stream_member? do
+            {[], refs}
+          else
+            {safe_ets_lookup(state.ets, key),
+             maybe_prepend_apply_projection_cache_ref(state, key, refs, file_id)}
+          end
+
+        unless new_stream_member? do
+          track_keydir_binary_delta_from_previous(state, key, previous, ets_val, expire_at_ms)
+        end
+
+        ets_entry =
+          {key, ets_val, expire_at_ms, initial_lfu, file_id, offset, value_size}
+
+        {stream_usage_entries, stream_ets_entries, stream_binary_bytes} =
+          if new_stream_member? do
+            stream_usage_entries =
+              if collect_stream_usage? do
+                [{key, value, expire_at_ms} | stream_usage_entries]
+              else
+                stream_usage_entries
+              end
+
+            {
+              stream_usage_entries,
+              [ets_entry | stream_ets_entries],
+              stream_binary_bytes + missing_keydir_binary_bytes(key, ets_val)
+            }
+          else
+            if terminal_stream_batch? do
+              # The terminal Stream plan is already durable and no command reads
+              # during publication. Publish its type/meta rows with the member
+              # rows in one ETS operation instead of exposing a partial batch.
+              terminal_stream_auxiliary_logical_index_put(state, key, value, expire_at_ms)
+
+              stream_usage_entries =
+                if collect_stream_usage? do
+                  [{key, value, expire_at_ms} | stream_usage_entries]
+                else
+                  stream_usage_entries
+                end
+
+              {stream_usage_entries, [ets_entry | stream_ets_entries], stream_binary_bytes}
+            else
+              safe_ets_insert(state.ets, ets_entry)
+              logical_key_index_put(state, key, value, expire_at_ms)
+              {stream_usage_entries, stream_ets_entries, stream_binary_bytes}
+            end
+          end
+
+        next_compound_entries =
+          if new_stream_member? or terminal_stream_batch? do
+            # Terminal plans contain only explicitly published X: members plus
+            # T:/XM: auxiliary rows. The latter have no compound separator and
+            # are intentionally absent from CompoundMemberIndex, so do not
+            # accumulate and re-scan them through its generic fallback.
+            compound_entries
+          else
+            [{key, expire_at_ms} | compound_entries]
+          end
+
+        do_apply_fast_put_pending_locations(
+          state,
+          file_id,
+          batch,
+          locations,
+          hot_threshold,
+          remaining_stream_members,
+          collect_stream_usage?,
+          terminal_stream_batch?,
+          initial_lfu,
+          {
+            refs,
+            next_compound_entries,
+            stream_usage_entries,
+            stream_ets_entries,
+            stream_binary_bytes
+          }
         )
-
-        CompoundMemberIndex.put(
-          Map.get(state, :compound_member_index_name),
-          key,
-          expire_at_ms
-        )
-
-        logical_key_index_put(state, key, value, expire_at_ms)
-        apply_fast_put_pending_locations(state, file_id, batch, locations, hot_threshold)
       end
+
+      defp take_terminal_stream_member(
+             key,
+             [{{_member_prefix, {_ms, _seq}}, key} | remaining]
+           ),
+           do: {true, remaining}
+
+      defp take_terminal_stream_member(_key, members), do: {false, members}
+
+      # Compact append metadata is an internal row and is intentionally absent
+      # from the logical-key projection. Namespace usage for all terminal rows
+      # is published by one bulk call after the keydir becomes visible.
+      defp terminal_stream_auxiliary_logical_index_put(
+             _state,
+             <<"XM:", _rest::binary>> = key,
+             _value,
+             _expire_at_ms
+           )
+           when is_binary(key),
+           do: :ok
+
+      defp terminal_stream_auxiliary_logical_index_put(state, key, value, expire_at_ms) do
+        :ok =
+          Ferricstore.Store.Shard.LogicalKeyIndex.put(
+            Map.get(state, :logical_key_index_name),
+            Map.get(state, :logical_key_slots_name),
+            key,
+            value,
+            expire_at_ms
+          )
+      end
+
+      defp namespace_usage_index_active?(state) do
+        state
+        |> Map.get(:namespace_usage_index_name)
+        |> NamespaceUsageIndex.active?()
+      end
+
+      defp maybe_collect_late_stream_usage_entries(
+             state,
+             batch,
+             members,
+             false,
+             []
+           )
+           when is_list(members) do
+        # Scope activation rebuilds from the visible keydir. Recheck only after
+        # the bulk member rows are visible: if activation raced the early check,
+        # either this append accounts them here or the rebuild observes them.
+        if namespace_usage_index_active?(state) do
+          collect_terminal_stream_usage_entries(batch, [])
+        else
+          []
+        end
+      end
+
+      defp maybe_collect_late_stream_usage_entries(
+             _state,
+             _batch,
+             _members,
+             _collected?,
+             entries
+           ),
+           do: entries
+
+      defp collect_terminal_stream_usage_entries([], entries), do: entries
+
+      defp collect_terminal_stream_usage_entries(
+             [{:put, key, value, expire_at_ms} | batch],
+             entries
+           ),
+           do:
+             collect_terminal_stream_usage_entries(
+               batch,
+               [{key, value, expire_at_ms} | entries]
+             )
 
       defp apply_fast_delete_pending_locations(_state, [], []), do: :ok
 

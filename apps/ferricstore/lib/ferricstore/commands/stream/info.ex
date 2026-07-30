@@ -6,36 +6,34 @@ defmodule Ferricstore.Commands.Stream.Info do
 
   @spec stream(binary(), map()) :: map() | {:error, binary()}
   def stream(key, store) do
-    with :ok <- Meta.ensure_read_type(key, store) do
-      case Meta.entries(key, store) do
-        [] ->
-          {:error, "ERR no such key"}
+    case Meta.checked_entries(key, store) do
+      [] ->
+        {:error, "ERR no such key"}
 
-        [{^key, len, first, last, _ms, _seq}] ->
-          with {:ok, {first_entry, last_entry}} <-
-                 first_last_entries(key, len, first, last, store),
-               groups when is_integer(groups) <- Groups.count(key, store) do
-            %{
-              "length" => len,
-              "first-entry" => first_entry,
-              "last-entry" => last_entry,
-              "last-generated-id" => last,
-              "groups" => groups
-            }
-          else
-            {:error, {:storage_read_failed, _reason}} = failure ->
-              ReadResult.command_error(failure)
+      [{^key, len, first, last, generated_ms, generated_seq}] ->
+        with {:ok, {first_entry, last_entry}} <-
+               first_last_entries(key, len, first, last, store),
+             groups when is_integer(groups) <- Groups.count(key, store) do
+          %{
+            "length" => len,
+            "first-entry" => first_entry,
+            "last-entry" => last_entry,
+            "last-generated-id" => "#{generated_ms}-#{generated_seq}",
+            "groups" => groups
+          }
+        else
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
 
-            {:error, _reason} = error ->
-              error
-          end
+          {:error, _reason} = error ->
+            error
+        end
 
-        {:error, {:storage_read_failed, _reason}} = failure ->
-          ReadResult.command_error(failure)
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
 
-        {:error, _reason} = error ->
-          error
-      end
+      {:error, _reason} = error ->
+        error
     end
   end
 

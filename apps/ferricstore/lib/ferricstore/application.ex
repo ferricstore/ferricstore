@@ -452,6 +452,7 @@ defmodule Ferricstore.Application do
     _ = state
     _ = Ferricstore.Raft.WARaftBackend.stop()
 
+    Ferricstore.Commands.Stream.Tables.clear_startup_ready()
     FerricStore.Instance.cleanup(:default)
     Ferricstore.Raft.Backend.clear_running()
     Ferricstore.HLC.clear()
@@ -462,6 +463,7 @@ defmodule Ferricstore.Application do
   defp cleanup_failed_start do
     Ferricstore.Health.set_ready(false)
     _ = Ferricstore.Raft.WARaftBackend.stop()
+    Ferricstore.Commands.Stream.Tables.clear_startup_ready()
     FerricStore.Instance.cleanup(:default)
     Ferricstore.Raft.Backend.clear_running()
     Ferricstore.HLC.clear()

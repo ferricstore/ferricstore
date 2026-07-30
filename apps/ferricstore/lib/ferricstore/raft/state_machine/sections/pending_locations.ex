@@ -518,6 +518,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
             expire_at_ms
           )
 
+        namespace_usage_index_put(state, key, value, expire_at_ms)
+      end
+
+      defp namespace_usage_index_put(state, key, value, expire_at_ms) do
         :ok =
           NamespaceUsageIndex.put(
             Map.get(state, :namespace_usage_index_name),
@@ -525,6 +529,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
             key,
             value,
             expire_at_ms,
+            blob_threshold_bytes: Map.get(state, :blob_side_channel_threshold_bytes, 0)
+          )
+      end
+
+      defp namespace_usage_index_put_many(_state, []), do: :ok
+
+      defp namespace_usage_index_put_many(state, entries) do
+        :ok =
+          NamespaceUsageIndex.put_many(
+            Map.get(state, :namespace_usage_index_name),
+            Map.get(state, :namespace_usage_expiry_name),
+            entries,
             blob_threshold_bytes: Map.get(state, :blob_side_channel_threshold_bytes, 0)
           )
       end

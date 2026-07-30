@@ -37,6 +37,8 @@ defmodule Ferricstore.Commands.Stream do
 
   alias Ferricstore.CommandTime
   alias Ferricstore.Commands.Stream.Args
+  alias Ferricstore.Commands.Stream.AtomicAppend
+  alias Ferricstore.Commands.Stream.AtomicMutation
   alias Ferricstore.Commands.Stream.Entries
   alias Ferricstore.Commands.Stream.Groups
   alias Ferricstore.Commands.Stream.ID
@@ -47,7 +49,7 @@ defmodule Ferricstore.Commands.Stream do
   alias Ferricstore.Commands.Stream.Tables
   alias Ferricstore.Commands.Stream.Waiters
   alias Ferricstore.Stream.ActivityLog
-  alias Ferricstore.Store.{Ops, ReadResult, TypeRegistry}
+  alias Ferricstore.Store.{CompoundKey, Ops, ReadResult, TypeRegistry}
 
   @typedoc "A parsed stream ID as `{milliseconds, sequence}`."
   @type stream_id :: {non_neg_integer(), non_neg_integer()}
@@ -86,7 +88,7 @@ defmodule Ferricstore.Commands.Stream do
   def handle("XADD", args, store) when length(args) >= 4 do
     case Args.parse_xadd_args(args) do
       {:ok, key, id_spec, fields, trim_opts, nomkstream} ->
-        do_xadd(key, id_spec, fields, trim_opts, nomkstream, store)
+        execute_xadd(key, id_spec, fields, trim_opts, nomkstream, store)
 
       {:error, _} = err ->
         err
@@ -171,7 +173,7 @@ defmodule Ferricstore.Commands.Stream do
   def handle("XTRIM", [key | rest], store) do
     case Args.parse_trim_opts(rest) do
       {:ok, trim_opts} ->
-        record_xtrim_result(key, trim_opts, Mutations.trim(key, trim_opts, store))
+        execute_xtrim(key, trim_opts, store)
 
       {:error, _} = err ->
         err
@@ -187,7 +189,7 @@ defmodule Ferricstore.Commands.Stream do
   # -------------------------------------------------------------------------
 
   def handle("XDEL", [key | ids], store) when ids != [] do
-    record_xdel_result(key, Mutations.xdel(key, ids, store))
+    execute_xdel(key, ids, store)
   end
 
   def handle("XDEL", _args, _store) do
@@ -280,7 +282,7 @@ defmodule Ferricstore.Commands.Stream do
   def handle_ast({:xadd, key, {id_spec, fields, trim_opts, nomkstream}}, store)
       when is_list(fields) and is_boolean(nomkstream) do
     with :ok <- validate_ast_xadd(key, id_spec, fields, trim_opts) do
-      do_xadd(key, id_spec, fields, trim_opts, nomkstream, store)
+      execute_xadd(key, id_spec, fields, trim_opts, nomkstream, store)
     end
   end
 
@@ -328,10 +330,10 @@ defmodule Ferricstore.Commands.Stream do
   def handle_ast({:xtrim, _key, {:error, reason}}, _store), do: {:error, reason}
 
   def handle_ast({:xtrim, key, trim_opts}, store),
-    do: record_xtrim_result(key, trim_opts, Mutations.trim(key, trim_opts, store))
+    do: execute_xtrim(key, trim_opts, store)
 
   def handle_ast({:xdel, key, ids}, store) when is_list(ids) and ids != [],
-    do: record_xdel_result(key, Mutations.xdel(key, ids, store))
+    do: execute_xdel(key, ids, store)
 
   def handle_ast({:xinfo_stream, key}, store), do: Info.stream(key, store)
   def handle_ast({:xinfo, {:error, reason}}, _store), do: {:error, reason}
@@ -369,6 +371,55 @@ defmodule Ferricstore.Commands.Stream do
 
   def handle_ast(_ast, _store), do: {:error, "ERR unsupported stream command AST"}
 
+  @doc false
+  @spec handle_raw_range_ast(term(), FerricStore.Instance.t()) ::
+          {:ok, [{binary(), binary()}]} | :fallback | {:error, term()}
+  def handle_raw_range_ast(
+        {:xrange, [key, start_str, end_str | rest]},
+        %FerricStore.Instance{} = store
+      ) do
+    with {:ok, count} <- Args.parse_count_opt(rest),
+         {:ok, range_start} <- ID.parse_range_id(start_str, :min),
+         {:ok, range_end} <- ID.parse_range_id(end_str, :max) do
+      raw_xrange(key, range_start, range_end, count, store)
+    end
+  end
+
+  def handle_raw_range_ast(
+        {:xrevrange, [key, end_str, start_str | rest]},
+        %FerricStore.Instance{} = store
+      ) do
+    with {:ok, count} <- Args.parse_count_opt(rest),
+         {:ok, range_start} <- ID.parse_range_id(start_str, :min),
+         {:ok, range_end} <- ID.parse_range_id(end_str, :max) do
+      raw_xrevrange(key, range_start, range_end, count, store)
+    end
+  end
+
+  def handle_raw_range_ast(
+        {:xrange, key, range_start, range_end, count},
+        %FerricStore.Instance{} = store
+      ) do
+    with {:ok, range_start} <- ID.normalize_ast_range_id(range_start, :min),
+         {:ok, range_end} <- ID.normalize_ast_range_id(range_end, :max),
+         {:ok, count} <- normalize_ast_count(count) do
+      raw_xrange(key, range_start, range_end, count, store)
+    end
+  end
+
+  def handle_raw_range_ast(
+        {:xrevrange, key, range_start, range_end, count},
+        %FerricStore.Instance{} = store
+      ) do
+    with {:ok, range_start} <- ID.normalize_ast_range_id(range_start, :min),
+         {:ok, range_end} <- ID.normalize_ast_range_id(range_end, :max),
+         {:ok, count} <- normalize_ast_count(count) do
+      raw_xrevrange(key, range_start, range_end, count, store)
+    end
+  end
+
+  def handle_raw_range_ast(_ast, _store), do: :fallback
+
   defp xlen_key(key, store) do
     # The metadata cache is local-only (not Raft-replicated), so on a follower we
     # don't have it. Fall back to counting the stream's compound entries —
@@ -377,13 +428,11 @@ defmodule Ferricstore.Commands.Stream do
     # when populated; followers and post-migration always count via prefix.
     ensure_meta_table()
 
-    with :ok <- Meta.ensure_read_type(key, store) do
-      case Meta.entries(key, store) do
-        [{^key, len, _first, _last, _ms, _seq}] -> len
-        [] -> store |> Entries.count(key) |> ReadResult.command_result()
-        {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
-        {:error, _reason} = error -> error
-      end
+    case Meta.checked_entries(key, store) do
+      [{^key, len, _first, _last, _ms, _seq}] -> len
+      [] -> store |> Entries.count(key) |> ReadResult.command_result()
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      {:error, _reason} = error -> error
     end
   end
 
@@ -401,7 +450,7 @@ defmodule Ferricstore.Commands.Stream do
   """
   @spec init_tables() :: :ok
   def init_tables do
-    ensure_meta_table()
+    Tables.init_all()
   end
 
   @doc """
@@ -468,6 +517,47 @@ defmodule Ferricstore.Commands.Stream do
   # Private: XADD
   # ---------------------------------------------------------------------------
 
+  defp execute_xadd(key, id_spec, fields, trim_opts, nomkstream, store) do
+    result =
+      case Ops.stream_append(store, key, id_spec, fields, trim_opts, nomkstream) do
+        :unsupported ->
+          if serialized_stream_store?(store) do
+            AtomicAppend.run(key, id_spec, fields, trim_opts, nomkstream, store)
+          else
+            do_xadd(key, id_spec, fields, trim_opts, nomkstream, store)
+          end
+
+        result ->
+          result
+      end
+
+    record_xadd_result(result, key, fields, trim_opts, nomkstream, store)
+  end
+
+  defp serialized_stream_store?(%{defer_stream_cleanup: defer}) when is_function(defer, 1),
+    do: true
+
+  defp serialized_stream_store?(_store), do: false
+
+  defp record_xadd_result(id_str, key, fields, trim_opts, nomkstream, store)
+       when is_binary(id_str) do
+    unless serialized_stream_store?(store) do
+      unless stream_append_notifies?(store) do
+        notify_stream_waiters(key, store)
+      end
+
+      ActivityLog.record_xadd(key, id_str, div(length(fields), 2), trim_opts, nomkstream)
+    end
+
+    id_str
+  end
+
+  defp record_xadd_result(result, _key, _fields, _trim_opts, _nomkstream, _store), do: result
+
+  defp stream_append_notifies?(%FerricStore.Instance{}), do: true
+  defp stream_append_notifies?(%{stream_append_notifies: true}), do: true
+  defp stream_append_notifies?(_store), do: false
+
   defp do_xadd(key, id_spec, fields, trim_opts, nomkstream, store) do
     ensure_meta_table()
     meta_entries = Meta.xadd_entries(key, store)
@@ -488,7 +578,7 @@ defmodule Ferricstore.Commands.Stream do
     end
   end
 
-  defp do_xadd_insert(key, id_spec, fields, trim_opts, meta_entries, nomkstream, store) do
+  defp do_xadd_insert(key, id_spec, fields, trim_opts, meta_entries, _nomkstream, store) do
     with type_status when type_status in [:ok, {:ok, :created}, :no_marker] <-
            stream_type_status(key, store) do
       {last_ms, last_seq} =
@@ -504,7 +594,7 @@ defmodule Ferricstore.Commands.Stream do
 
           case Mutations.prepare_trim(key, id_str, trim_opts, store) do
             {:ok, trim_plan} ->
-              encoded = Ferricstore.TermCodec.encode(fields)
+              encoded = Entries.encode_fields(fields)
 
               case Entries.put(store, key, compound_key, encoded) do
                 :ok ->
@@ -524,17 +614,6 @@ defmodule Ferricstore.Commands.Stream do
                     :ok ->
                       case Mutations.maybe_trim(key, trim_plan, store) do
                         :ok ->
-                          # Notify any XREAD BLOCK waiters watching this stream.
-                          notify_stream_waiters(key, store)
-
-                          ActivityLog.record_xadd(
-                            key,
-                            id_str,
-                            div(length(fields), 2),
-                            trim_opts,
-                            nomkstream
-                          )
-
                           id_str
 
                         {:error, _reason} = error ->
@@ -609,19 +688,59 @@ defmodule Ferricstore.Commands.Stream do
     end
   end
 
-  defp record_xtrim_result(key, trim_opts, result) when is_integer(result) do
-    ActivityLog.record_xtrim(key, result, trim_opts)
+  defp execute_xtrim(key, trim_opts, store) do
+    result =
+      case Ops.stream_mutate(store, key, {:trim, trim_opts}) do
+        :unsupported when is_map(store) ->
+          if serialized_stream_store?(store) do
+            AtomicMutation.run(key, {:trim, trim_opts}, store)
+          else
+            Mutations.trim(key, trim_opts, store)
+          end
+
+        result ->
+          result
+      end
+
+    record_xtrim_result(key, trim_opts, result, store)
+  end
+
+  defp execute_xdel(key, ids, store) do
+    result =
+      case Ops.stream_mutate(store, key, {:delete, ids}) do
+        :unsupported when is_map(store) ->
+          if serialized_stream_store?(store) do
+            AtomicMutation.run(key, {:delete, ids}, store)
+          else
+            Mutations.xdel(key, ids, store)
+          end
+
+        result ->
+          result
+      end
+
+    record_xdel_result(key, result, store)
+  end
+
+  defp record_xtrim_result(key, trim_opts, result, store) when is_integer(result) do
+    unless serialized_stream_store?(store) do
+      ActivityLog.record_xtrim(key, result, trim_opts)
+    end
+
     result
   end
 
-  defp record_xtrim_result(_key, _trim_opts, result), do: result
+  defp record_xtrim_result(_key, _trim_opts, result, _store), do: result
 
-  defp record_xdel_result(key, result) when is_integer(result) do
-    ActivityLog.record_xdel(key, result)
+  defp record_xdel_result(key, result, store) when is_integer(result) do
+    unless serialized_stream_store?(store) do
+      ActivityLog.record_xdel(key, result)
+    end
+
     result
   end
 
-  defp record_xdel_result(_key, result), do: result
+  defp record_xdel_result(_key, result, _store), do: result
 
   defp stream_type_status(key, store) do
     if Ops.has_compound?(store) do
@@ -636,29 +755,163 @@ defmodule Ferricstore.Commands.Stream do
   # ---------------------------------------------------------------------------
 
   defp do_xrange(key, range_start, range_end, count, store) do
-    ensure_meta_table()
+    if Ops.has_compound?(store) do
+      {type_key, entry_prefix} = CompoundKey.stream_read_keys(key)
 
-    with :ok <- Meta.ensure_read_type(key, store) do
-      if Ops.has_compound?(store) do
-        indexed_stream_range(key, range_start, range_end, count, false, store)
-      else
+      case store do
+        %FerricStore.Instance{} when is_integer(count) and count > 0 ->
+          with {:ok, marker, entries} <-
+                 Entries.typed_range_page(
+                   store,
+                   key,
+                   type_key,
+                   entry_prefix,
+                   range_start,
+                   range_end,
+                   count
+                 ),
+               :ok <- Meta.ensure_read_marker(key, marker, store) do
+            entries
+          end
+
+        _other_store_or_unbounded_range ->
+          with :ok <- Meta.ensure_read_type(key, type_key, store) do
+            indexed_stream_range(key, entry_prefix, range_start, range_end, count, false, store)
+          end
+      end
+    else
+      with :ok <- Meta.ensure_read_type(key, store) do
         scanned_stream_range(key, range_start, range_end, count, store)
       end
     end
   end
 
-  defp do_xrevrange(key, range_start, range_end, count, store) do
-    ensure_meta_table()
+  defp raw_xrange(key, range_start, range_end, count, %FerricStore.Instance{} = store)
+       when is_integer(count) and count > 0 do
+    if Ops.has_compound?(store) do
+      {type_key, entry_prefix} = CompoundKey.stream_read_keys(key)
 
-    with :ok <- Meta.ensure_read_type(key, store) do
-      if Ops.has_compound?(store) do
-        indexed_stream_range(key, range_start, range_end, count, true, store)
+      with {:ok, marker, pairs} <-
+             Entries.typed_raw_range_page(
+               store,
+               key,
+               type_key,
+               entry_prefix,
+               range_start,
+               range_end,
+               count
+             ),
+           :ok <- Meta.ensure_read_marker(key, marker, store) do
+        {:ok, pairs}
+      end
+    else
+      :fallback
+    end
+  end
+
+  defp raw_xrange(_key, _range_start, _range_end, _count, _store), do: :fallback
+
+  defp do_xrevrange(key, range_start, range_end, count, store) do
+    if Ops.has_compound?(store) do
+      {type_key, entry_prefix} = CompoundKey.stream_read_keys(key)
+
+      if range_start == :min and range_end == :max and paged_stream_range?(store) do
+        reverse_full_stream_range(key, type_key, entry_prefix, count, store)
       else
+        with :ok <- Meta.ensure_read_type(key, type_key, store) do
+          indexed_stream_range(key, entry_prefix, range_start, range_end, count, true, store)
+        end
+      end
+    else
+      with :ok <- Meta.ensure_read_type(key, store) do
         case scanned_stream_range(key, range_start, range_end, :infinity, store) do
           {:error, _} = error -> error
           entries -> entries |> Enum.reverse() |> maybe_take(count)
         end
       end
+    end
+  end
+
+  defp raw_xrevrange(
+         key,
+         :min,
+         :max,
+         count,
+         %FerricStore.Instance{} = store
+       )
+       when is_integer(count) and count > 0 do
+    if Ops.has_compound?(store) and paged_stream_range?(store) do
+      {type_key, entry_prefix} = CompoundKey.stream_read_keys(key)
+
+      case Meta.entries(key, store) do
+        [{^key, len, _first, _last, _ms, _seq}] when len > 0 ->
+          with {:ok, marker, pairs} <-
+                 Entries.typed_raw_reverse_full_range(
+                   store,
+                   key,
+                   type_key,
+                   entry_prefix,
+                   len,
+                   count
+                 ),
+               :ok <- Meta.ensure_read_marker(key, marker, store) do
+            {:ok, pairs}
+          end
+
+        _empty_failure_or_uncached ->
+          :fallback
+      end
+    else
+      :fallback
+    end
+  end
+
+  defp raw_xrevrange(_key, _range_start, _range_end, _count, _store), do: :fallback
+
+  defp reverse_full_stream_range(
+         key,
+         type_key,
+         entry_prefix,
+         count,
+         %FerricStore.Instance{} = store
+       )
+       when count != 0 do
+    case Meta.entries(key, store) do
+      [{^key, len, _first, _last, _ms, _seq}] when len > 0 ->
+        with {:ok, marker, entries} <-
+               Entries.typed_reverse_full_range(
+                 store,
+                 key,
+                 type_key,
+                 entry_prefix,
+                 len,
+                 count
+               ),
+             :ok <- Meta.ensure_read_marker(key, marker, store) do
+          entries
+        end
+
+      _empty_or_failure ->
+        checked_reverse_full_stream_range(key, type_key, entry_prefix, count, store)
+    end
+  end
+
+  defp reverse_full_stream_range(key, type_key, entry_prefix, count, store),
+    do: checked_reverse_full_stream_range(key, type_key, entry_prefix, count, store)
+
+  defp checked_reverse_full_stream_range(key, type_key, entry_prefix, count, store) do
+    case Meta.checked_entries(key, type_key, store) do
+      [] ->
+        []
+
+      [{^key, len, _first, _last, _ms, _seq}] ->
+        Entries.reverse_full_range(store, key, entry_prefix, len, count)
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -698,13 +951,42 @@ defmodule Ferricstore.Commands.Stream do
     end
   end
 
-  defp indexed_stream_range(key, range_start, range_end, count, reverse?, store) do
-    with :ok <- Index.ensure(key, store) do
-      key
-      |> Index.slice(range_start, range_end, count, reverse?, store)
-      |> Entries.decode_indexed(key, store)
+  defp indexed_stream_range(
+         key,
+         entry_prefix,
+         range_start,
+         range_end,
+         count,
+         reverse?,
+         store
+       ) do
+    cond do
+      count == 0 ->
+        []
+
+      not reverse? and is_integer(count) and paged_stream_range?(store) ->
+        Entries.range_page(store, key, entry_prefix, range_start, range_end, count)
+
+      not reverse? and count == :infinity and paged_stream_range?(store) ->
+        Entries.range_pages(store, key, entry_prefix, range_start, range_end)
+
+      true ->
+        with :ok <- Index.ensure(key, store) do
+          key
+          |> Index.slice(range_start, range_end, count, reverse?, store)
+          |> Entries.decode_indexed(key, store)
+        end
     end
   end
+
+  defp paged_stream_range?(%FerricStore.Instance{}), do: true
+  defp paged_stream_range?(%Ferricstore.Store.LocalTxStore{}), do: true
+
+  defp paged_stream_range?(%{stream_range_pages: true, compound_scan_page: fun})
+       when is_function(fun, 6),
+       do: true
+
+  defp paged_stream_range?(_store), do: false
 
   # ---------------------------------------------------------------------------
   # Private: XREAD
@@ -769,9 +1051,19 @@ defmodule Ferricstore.Commands.Stream do
     with {:ok, id_str} <- normalize_group_start_id(id_str) do
       ensure_meta_table()
 
-      Groups.with_lock(store, key, group, fn ->
-        do_xgroup_create_locked(key, group, id_str, mkstream, store)
-      end)
+      case Ops.stream_mutate(store, key, {:create, group, id_str, mkstream}) do
+        :unsupported when is_map(store) ->
+          if serialized_stream_store?(store) do
+            AtomicMutation.run(key, {:create, group, id_str, mkstream}, store)
+          else
+            Groups.with_lock(store, key, group, fn ->
+              do_xgroup_create_locked(key, group, id_str, mkstream, store)
+            end)
+          end
+
+        result ->
+          result
+      end
     end
   end
 
@@ -891,8 +1183,11 @@ defmodule Ferricstore.Commands.Stream do
     ensure_meta_table()
 
     case xreadgroup_results(group, consumer, stream_ids, count, store, []) do
-      {:error, _} = err -> err
-      results -> record_xreadgroup_result(group, consumer, stream_ids, Enum.reverse(results))
+      {:error, _} = err ->
+        err
+
+      results ->
+        record_xreadgroup_result(group, consumer, stream_ids, Enum.reverse(results), store)
     end
   end
 
@@ -906,7 +1201,25 @@ defmodule Ferricstore.Commands.Stream do
     end
   end
 
+  defp xreadgroup_stream_result(group, consumer, key, ">", count, store) do
+    case Ops.stream_mutate(store, key, {:read, group, consumer, count}) do
+      :unsupported when is_map(store) ->
+        if serialized_stream_store?(store) do
+          AtomicMutation.run(key, {:read, group, consumer, count}, store)
+        else
+          xreadgroup_stream_result_legacy(group, consumer, key, ">", count, store)
+        end
+
+      result ->
+        result
+    end
+  end
+
   defp xreadgroup_stream_result(group, consumer, key, id_str, count, store) do
+    xreadgroup_stream_result_legacy(group, consumer, key, id_str, count, store)
+  end
+
+  defp xreadgroup_stream_result_legacy(group, consumer, key, id_str, count, store) do
     Groups.with_lock(store, key, group, fn ->
       case Groups.lookup(store, key, group) do
         :missing ->
@@ -1054,9 +1367,22 @@ defmodule Ferricstore.Commands.Stream do
   defp do_xack(key, group, ids, store) do
     ensure_meta_table()
 
-    Groups.with_lock(store, key, group, fn ->
-      do_xack_locked(key, group, ids, store)
-    end)
+    result =
+      case Ops.stream_mutate(store, key, {:ack, group, ids}) do
+        :unsupported when is_map(store) ->
+          if serialized_stream_store?(store) do
+            AtomicMutation.run(key, {:ack, group, ids}, store)
+          else
+            Groups.with_lock(store, key, group, fn ->
+              do_xack_locked(key, group, ids, store)
+            end)
+          end
+
+        result ->
+          result
+      end
+
+    record_xack_result(key, group, result, store)
   end
 
   defp do_xack_locked(key, group, ids, store) do
@@ -1078,7 +1404,7 @@ defmodule Ferricstore.Commands.Stream do
           end)
 
         case Groups.persist(store, key, group, last_delivered, consumers, new_pending) do
-          :ok -> record_xack_result(key, group, acked)
+          :ok -> acked
           {:error, _reason} = error -> error
         end
     end
@@ -1211,15 +1537,23 @@ defmodule Ferricstore.Commands.Stream do
     results
   end
 
-  defp record_xreadgroup_result(_group, _consumer, _stream_ids, []), do: []
+  defp record_xreadgroup_result(_group, _consumer, _stream_ids, [], _store), do: []
 
-  defp record_xreadgroup_result(group, consumer, stream_ids, results) do
-    ActivityLog.record_xreadgroup(group, consumer, stream_ids, results)
+  defp record_xreadgroup_result(group, consumer, stream_ids, results, store) do
+    unless serialized_stream_store?(store) do
+      ActivityLog.record_xreadgroup(group, consumer, stream_ids, results)
+    end
+
     results
   end
 
-  defp record_xack_result(key, group, acked) when is_integer(acked) do
-    ActivityLog.record_xack(key, group, acked)
+  defp record_xack_result(key, group, acked, store) when is_integer(acked) do
+    unless serialized_stream_store?(store) do
+      ActivityLog.record_xack(key, group, acked)
+    end
+
     acked
   end
+
+  defp record_xack_result(_key, _group, result, _store), do: result
 end

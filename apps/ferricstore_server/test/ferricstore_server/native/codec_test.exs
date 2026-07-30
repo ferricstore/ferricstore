@@ -3,6 +3,7 @@ defmodule FerricstoreServer.Native.CodecTest do
 
   alias FerricstoreServer.Native.Codec
   alias FerricstoreServer.Native.NIF
+  alias FerricstoreServer.Native.StreamRangeResponse
 
   setup do
     old_max_value_items = Application.get_env(:ferricstore, :native_max_value_items)
@@ -394,6 +395,47 @@ defmodule FerricstoreServer.Native.CodecTest do
     assert reason =~ "exceeds max items"
   end
 
+  test "decodes compact append-only Stream pipeline request bodies" do
+    body =
+      <<0x94, 0xA2, 2::unsigned-32, compact_bin("events:{1}")::binary, 1::unsigned-16,
+        compact_bin("field")::binary, compact_bin("one")::binary,
+        compact_bin("events:{1}")::binary, 2::unsigned-16, compact_bin("field")::binary,
+        compact_bin("two")::binary, compact_bin("kind")::binary, compact_bin("created")::binary>>
+
+    assert {:ok,
+            %{
+              "atomicity" => "none",
+              "compact_count" => 2,
+              "compact_values" => true,
+              "return" => "compact",
+              "compact_pipeline" =>
+                {34,
+                 [
+                   {"events:{1}", ["field", "one"]},
+                   {"events:{1}", ["field", "two", "kind", "created"]}
+                 ]}
+            }} = Codec.decode_body(0x000E, Codec.flags().custom_payload, body)
+  end
+
+  test "compact Stream pipeline decoder bounds nested field/value items" do
+    Application.put_env(:ferricstore, :native_max_value_items, 4)
+
+    body =
+      <<0x94, 0xA2, 1::unsigned-32, compact_bin("events")::binary, 2::unsigned-16,
+        compact_bin("field")::binary, compact_bin("one")::binary, compact_bin("kind")::binary,
+        compact_bin("created")::binary>>
+
+    assert {:error, reason} = Codec.decode_body(0x000E, Codec.flags().custom_payload, body)
+    assert reason =~ "exceeds max items"
+  end
+
+  test "compact Stream pipeline decoder rejects empty field lists" do
+    body = <<0x94, 0xA2, 1::unsigned-32, compact_bin("events")::binary, 0::unsigned-16>>
+
+    assert {:error, "ERR native compact PIPELINE payload is invalid"} =
+             Codec.decode_body(0x000E, Codec.flags().custom_payload, body)
+  end
+
   test "decodes compact SMEMBERS pipeline request body" do
     body = <<0x94, 0x9B, 2::unsigned-32, compact_bin("s1")::binary, compact_bin("s2")::binary>>
 
@@ -727,6 +769,158 @@ defmodule FerricstoreServer.Native.CodecTest do
 
     assert NIF.encode_compact_kv_get_response_frame(0x0101, 3, 42, 123) == nil
     assert NIF.encode_compact_kv_mget_response_frame(0x0104, 4, 43, ["v1", 123]) == nil
+  end
+
+  test "native NIF encodes Stream range rows as the generic wire format" do
+    rows = [
+      ["1-0", "field", "value"],
+      ["2-0", "first", "one", "second", "two"]
+    ]
+
+    frame = NIF.encode_stream_rows_response_frame(0x0100, 3, 42, rows, 0)
+
+    assert frame == Codec.encode_response(0x0100, 3, 42, :ok, rows)
+    assert <<"FSNP", 0x81, 0, _rest::binary>> = frame
+  end
+
+  test "native Stream row encoder preserves byte limits and rejects other shapes" do
+    rows = [["1-0", "field", "value"]]
+    frame = NIF.encode_stream_rows_response_frame(0x0100, 3, 42, rows, 0)
+    body_bytes = byte_size(frame) - 24
+
+    assert NIF.encode_stream_rows_response_frame(0x0100, 3, 42, rows, body_bytes) == frame
+
+    assert NIF.encode_stream_rows_response_frame(0x0100, 3, 42, rows, body_bytes - 1) ==
+             :response_too_large
+
+    assert NIF.encode_stream_rows_response_frame(0x0100, 3, 42, [["1-0", "field"]], 0) ==
+             nil
+
+    assert NIF.encode_stream_rows_response_frame(0x0100, 3, 42, [["1-0", "field", 1]], 0) ==
+             nil
+  end
+
+  test "native NIF encodes persisted Stream field blobs without materializing rows" do
+    pairs = [
+      {"1-0", :erlang.term_to_binary(["field", "value"])},
+      {"2-0", :erlang.term_to_binary(["first", "one", "second", "two"])}
+    ]
+
+    rows = [
+      ["1-0", "field", "value"],
+      ["2-0", "first", "one", "second", "two"]
+    ]
+
+    frame = NIF.encode_raw_stream_rows_response_frame(0x0100, 3, 42, pairs, 0)
+    source_bytes = Enum.sum(for {id, raw} <- pairs, do: byte_size(id) + byte_size(raw))
+
+    assert frame == Codec.encode_response(0x0100, 3, 42, :ok, rows)
+
+    assert NIF.encode_raw_stream_rows_response_frame_inline(
+             0x0100,
+             3,
+             42,
+             pairs,
+             length(pairs),
+             source_bytes,
+             0
+           ) == frame
+
+    assert NIF.encode_raw_stream_rows_response_frame_inline(
+             0x0100,
+             3,
+             42,
+             pairs,
+             length(pairs) + 1,
+             source_bytes,
+             0
+           ) == nil
+
+    assert NIF.encode_raw_stream_rows_response_frame_inline(
+             0x0100,
+             3,
+             42,
+             pairs,
+             length(pairs),
+             256 * 1_024 + 1,
+             0
+           ) == :use_dirty
+
+    assert NIF.encode_raw_stream_rows_response_frame(0x0100, 3, 42, [{"1-0", <<0>>}], 0) == nil
+  end
+
+  test "raw Stream range responses use direct frames and safely materialize fallbacks" do
+    pairs =
+      Enum.map(1..128, fn id ->
+        {"#{id}-0", :erlang.term_to_binary(["field", "value"])}
+      end)
+
+    rows = Enum.map(pairs, fn {id, _raw} -> [id, "field", "value"] end)
+    response = StreamRangeResponse.new(pairs)
+
+    assert response.count == 128
+
+    assert response.source_bytes ==
+             Enum.sum(for {id, raw} <- pairs, do: byte_size(id) + byte_size(raw))
+
+    assert Codec.encode_command_response_frames(0x0100, 3, 42, :ok, response) ==
+             Codec.encode_response_frames(0x0100, 3, 42, :ok, rows)
+
+    invalid_response = StreamRangeResponse.new([{"1-0", <<0>>}])
+
+    assert Codec.encode_command_response_frames(0x0100, 3, 42, :ok, invalid_response) ==
+             Codec.encode_response_frames(0x0100, 3, 42, :ok, [])
+
+    large_pairs =
+      Enum.map(1..128, fn id ->
+        {"#{id}-0", :erlang.term_to_binary(["field", String.duplicate("v", 2_048)])}
+      end)
+
+    large_rows =
+      Enum.map(large_pairs, fn {id, _raw} -> [id, "field", String.duplicate("v", 2_048)] end)
+
+    assert StreamRangeResponse.new(large_pairs).source_bytes > 256 * 1_024
+
+    assert Codec.encode_command_response_frames(
+             0x0100,
+             3,
+             42,
+             :ok,
+             StreamRangeResponse.new(large_pairs)
+           ) == Codec.encode_response_frames(0x0100, 3, 42, :ok, large_rows)
+  end
+
+  test "large command Stream ranges use a wire-equivalent direct frame" do
+    rows =
+      Enum.map(1..128, fn id ->
+        ["#{id}-0", "field", "value"]
+      end)
+
+    assert Codec.encode_command_response_frames(0x0100, 3, 42, :ok, rows) ==
+             Codec.encode_response_frames(0x0100, 3, 42, :ok, rows)
+  end
+
+  test "large non-Stream nested lists fall back to generic response encoding" do
+    values = List.duplicate(["first", "second"], 128)
+
+    assert Codec.encode_command_response_frames(0x0100, 3, 42, :ok, values) ==
+             Codec.encode_response_frames(0x0100, 3, 42, :ok, values)
+  end
+
+  test "large Stream direct frames preserve compression and response limit behavior" do
+    rows = List.duplicate(["1-0", "field", String.duplicate("v", 32)], 128)
+
+    assert Codec.encode_command_response_frames(0x0100, 3, 42, :ok, rows, compression: :zlib) ==
+             Codec.encode_response_frames(0x0100, 3, 42, :ok, rows, compression: :zlib)
+
+    [frame] =
+      Codec.encode_command_response_frames(0x0100, 3, 42, :ok, rows, max_response_bytes: 64)
+
+    <<"FSNP", 0x81, _flags, 3::unsigned-32, 0x0100::unsigned-16, 42::unsigned-64,
+      _body_len::unsigned-32, 6::unsigned-16, value_body::binary>> = frame
+
+    assert {:ok, %{"message" => "ERR native response byte limit exceeded"}} =
+             Codec.decode_body(value_body)
   end
 
   test "command response frames use native compact KV fast path" do

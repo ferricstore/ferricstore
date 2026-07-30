@@ -1,6 +1,16 @@
 defmodule Ferricstore.Store.PromotionAsyncGuardTest do
   use ExUnit.Case, async: true
 
+  alias Ferricstore.Store.CompoundKey
+  alias Ferricstore.Store.Shard.Compound.Promoted
+
+  test "streams remain shared-log structures outside dedicated promotion" do
+    key = "stream-promotion-guard"
+
+    assert Promoted.detect_compound_type(key, CompoundKey.stream_prefix(key)) == nil
+    assert Promoted.detect_compound_type(key, CompoundKey.stream_meta_key(key)) == nil
+  end
+
   @promotion_path Path.expand("../../../lib/ferricstore/store/promotion.ex", __DIR__)
   @state_machine_path Path.expand("../../../lib/ferricstore/raft/state_machine.ex", __DIR__)
   @state_machine_sections Path.expand(

@@ -30,6 +30,8 @@ defmodule Ferricstore.Raft.CommandBatching do
     :put_blob_batch,
     :server_catalog_mutate,
     :server_catalog_replace,
+    :stream_append_grouped_auto,
+    :stream_append_many_auto,
     :ttb,
     :zadd_many_single
   ]
@@ -86,6 +88,20 @@ defmodule Ferricstore.Raft.CommandBatching do
 
   defp coalescible_shape?({:async, _origin, inner}) when is_tuple(inner),
     do: coalescible_shape?(inner)
+
+  # Exact trimming expands into a data-dependent number of deletes. Keep it
+  # standalone until trimming has an explicit bounded apply plan.
+  defp coalescible_shape?({:stream_append, _key, _id, _fields, trim_opts, _nomkstream})
+       when not is_nil(trim_opts),
+       do: false
+
+  defp coalescible_shape?(
+         {:stream_append_blob_ref, _key, _id, _encoded_ref, trim_opts, _nomkstream}
+       )
+       when not is_nil(trim_opts),
+       do: false
+
+  defp coalescible_shape?({:stream_mutate, _key, _operation}), do: false
 
   defp coalescible_shape?(
          {:origin_checked, _key, inner, _before_value, _before_expire_at_ms, _expected_value,

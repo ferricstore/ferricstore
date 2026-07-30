@@ -463,6 +463,29 @@ defmodule Ferricstore.Store.Router.Part09 do
       defp extract_prob_key({:topk_incrby, key, _}), do: key
 
       @doc false
+      @spec stream_append(
+              FerricStore.Instance.t(),
+              binary(),
+              term(),
+              [binary()],
+              term() | nil,
+              boolean()
+            ) :: term()
+      def stream_append(ctx, key, id_spec, fields, trim_opts, nomkstream)
+          when is_binary(key) and is_list(fields) and is_boolean(nomkstream) do
+        idx = shard_for(ctx, key)
+        command = {:stream_append, key, id_spec, fields, trim_opts, nomkstream}
+        raft_write(ctx, idx, key, command)
+      end
+
+      @doc false
+      @spec stream_mutate(FerricStore.Instance.t(), binary(), term()) :: term()
+      def stream_mutate(ctx, key, operation) when is_binary(key) do
+        idx = shard_for(ctx, key)
+        raft_write(ctx, idx, key, {:stream_mutate, key, operation})
+      end
+
+      @doc false
       @spec key_lifecycle(FerricStore.Instance.t(), tuple()) :: term()
       def key_lifecycle(ctx, command) do
         with {:ok, key, idx} <- key_lifecycle_route(ctx, command) do
@@ -1375,6 +1398,20 @@ defmodule Ferricstore.Store.Router.Part09 do
         else
           compound_get_from_keydir(ctx, idx, keydir, redis_key, compound_key, expiry_context)
         end
+      end
+
+      @doc false
+      @spec stream_type_marker_get(FerricStore.Instance.t(), binary(), binary()) ::
+              binary() | nil | ReadResult.failure()
+      def stream_type_marker_get(ctx, redis_key, type_key) do
+        idx = shard_for(ctx, redis_key)
+        keydir = resolve_keydir(ctx, idx)
+        expiry_context = ExpiryContext.capture()
+
+        # Streams are shared-log structures and never use the hash/set/zset
+        # dedicated promotion layout. Retain the complete hot/cold/missing read
+        # behavior while skipping promotion classification for this exact row.
+        compound_get_from_keydir(ctx, idx, keydir, redis_key, type_key, expiry_context)
       end
 
       defp compound_get_from_keydir(ctx, idx, keydir, redis_key, compound_key, now) do

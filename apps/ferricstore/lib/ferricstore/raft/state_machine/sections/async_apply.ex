@@ -343,6 +343,102 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         do_checked_lmove(state, src_key, dst_key, from_dir, to_dir)
       end
 
+      defp apply_single(
+             state,
+             {:stream_append, key, id_spec, fields, trim_opts, nomkstream}
+           )
+           when is_binary(key) and is_list(fields) and is_boolean(nomkstream) do
+        apply_stream_append_with_store(
+          state,
+          key,
+          id_spec,
+          fields,
+          trim_opts,
+          nomkstream,
+          build_compound_store(state)
+        )
+      end
+
+      defp apply_stream_append_with_store(
+             state,
+             key,
+             id_spec,
+             fields,
+             trim_opts,
+             nomkstream,
+             store
+           ) do
+        case check_fetch_or_compute_lock(state, key, nil) do
+          :ok ->
+            Ferricstore.Commands.Stream.AtomicAppend.run(
+              key,
+              id_spec,
+              fields,
+              trim_opts,
+              nomkstream,
+              store
+            )
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp apply_single(
+             state,
+             {:stream_append_blob_ref, key, id_spec, encoded_ref, trim_opts, nomkstream}
+           )
+           when is_binary(key) and is_binary(encoded_ref) and is_boolean(nomkstream) do
+        apply_stream_append_blob_ref_with_store(
+          state,
+          key,
+          id_spec,
+          encoded_ref,
+          trim_opts,
+          nomkstream,
+          build_compound_store(state)
+        )
+      end
+
+      defp apply_stream_append_blob_ref_with_store(
+             state,
+             key,
+             id_spec,
+             encoded_ref,
+             trim_opts,
+             nomkstream,
+             store
+           ) do
+        case check_fetch_or_compute_lock(state, key, nil) do
+          :ok ->
+            Ferricstore.Commands.Stream.AtomicAppend.run_blob_ref(
+              key,
+              id_spec,
+              encoded_ref,
+              trim_opts,
+              nomkstream,
+              store
+            )
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp apply_single(state, {:stream_mutate, key, operation}) when is_binary(key) do
+        case check_fetch_or_compute_lock(state, key, nil) do
+          :ok ->
+            Ferricstore.Commands.Stream.AtomicMutation.run(
+              key,
+              operation,
+              build_compound_store(state)
+            )
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
       defp apply_single(state, {:compound_type_claim, redis_key, type})
            when is_binary(redis_key) and type in [:hash, :list, :set, :zset, :stream] do
         case check_fetch_or_compute_lock(state, redis_key, nil) do

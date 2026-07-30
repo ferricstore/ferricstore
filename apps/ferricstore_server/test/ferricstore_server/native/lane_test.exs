@@ -5,6 +5,7 @@ defmodule FerricstoreServer.Native.LaneTest do
   alias FerricstoreServer.Native.{Codec, Lane, OutboundBudget, ResourceBudget}
 
   @op_pipeline 0x000E
+  @op_command_exec 0x0100
   @op_get 0x0101
   @op_set 0x0102
   @op_fetch_or_compute 0x010B
@@ -219,6 +220,170 @@ defmodule FerricstoreServer.Native.LaneTest do
     assert_ok_response(Enum.at(responses, 1), @op_set, 22)
   end
 
+  test "coalesces ordinary COMMAND_EXEC XADD frames into one Raft entry" do
+    tag = System.unique_integer([:positive, :monotonic])
+    key = "native:lane:stream:coalesced:{#{tag}}"
+    ctx = FerricStore.Instance.get(:default)
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, key)
+    before_position = raft_position(shard_index)
+    {:ok, pid} = Lane.start_link(self(), @lane_id, command_state())
+
+    on_exit(fn ->
+      Lane.stop(pid)
+      FerricStore.del(key)
+    end)
+
+    frames =
+      Enum.map(1..64, fn request_id ->
+        command_exec_xadd_frame(request_id, [
+          key,
+          "*",
+          "field",
+          Integer.to_string(request_id)
+        ])
+      end)
+
+    Lane.enqueue_many(pid, frames)
+
+    assert_receive {:native_lane_responses, @lane_id, responses, 64}, @receive_timeout
+    assert length(responses) == 64
+
+    ids =
+      responses
+      |> Enum.with_index(1)
+      |> Enum.map(fn {response, request_id} ->
+        id = response_value_for(response, @op_command_exec, request_id)
+        assert is_binary(id)
+        id
+      end)
+
+    assert MapSet.size(MapSet.new(ids)) == 64
+    assert raft_position(shard_index) == before_position + 1
+    assert {:ok, 64} = FerricStore.xlen(key)
+  end
+
+  test "coalesced COMMAND_EXEC XADD preserves ordering and per-command errors" do
+    tag = System.unique_integer([:positive, :monotonic])
+    key = "native:lane:stream:ordered:{#{tag}}"
+    ctx = FerricStore.Instance.get(:default)
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, key)
+    before_position = raft_position(shard_index)
+    {:ok, pid} = Lane.start_link(self(), @lane_id, command_state())
+
+    on_exit(fn ->
+      Lane.stop(pid)
+      FerricStore.del(key)
+    end)
+
+    Lane.enqueue_many(pid, [
+      command_exec_xadd_frame(101, [key, "1-0", "field", "one"]),
+      command_exec_xadd_frame(102, [key, "1-0", "field", "duplicate"]),
+      command_exec_xadd_frame(103, [key, "2-0", "field", "two"])
+    ])
+
+    assert_receive {:native_lane_responses, @lane_id, responses, 3}, @receive_timeout
+    assert_response(Enum.at(responses, 0), @op_command_exec, 101, "1-0")
+    assert_error_response(Enum.at(responses, 1), @op_command_exec, 102)
+    assert_response(Enum.at(responses, 2), @op_command_exec, 103, "2-0")
+    assert raft_position(shard_index) == before_position + 1
+
+    assert {:ok, [["1-0", "field", "one"], ["2-0", "field", "two"]]} =
+             FerricStore.xrange(key, "-", "+")
+  end
+
+  test "large COMMAND_EXEC Stream ranges encode correctly through the lane" do
+    key = "native:lane:stream:raw-range:#{System.unique_integer([:positive, :monotonic])}"
+    ctx = FerricStore.Instance.get(:default)
+    {:ok, pid} = Lane.start_link(self(), @lane_id, command_state())
+
+    on_exit(fn ->
+      Lane.stop(pid)
+      FerricStore.del(key)
+    end)
+
+    for id <- 1..128 do
+      id = "#{id}-0"
+      assert id == Ferricstore.Commands.Stream.handle("XADD", [key, id, "field", "value"], ctx)
+    end
+
+    for {request_id, command} <- [{501, "XRANGE"}, {502, "XREVRANGE"}] do
+      args =
+        if command == "XRANGE",
+          do: [key, "-", "+", "COUNT", "128"],
+          else: [key, "+", "-", "COUNT", "128"]
+
+      Lane.enqueue(
+        pid,
+        {@lane_id, @op_command_exec, request_id, 0,
+         Codec.encode_value(%{"command" => command, "args" => args})}
+      )
+
+      assert_receive {:native_lane_response, @lane_id, response}, @receive_timeout
+      rows = response_value_for(response, @op_command_exec, request_id)
+      assert length(rows) == 128
+
+      expected_first = if command == "XRANGE", do: "1-0", else: "128-0"
+      assert [[^expected_first, "field", "value"] | _rest] = rows
+    end
+  end
+
+  test "trimmed COMMAND_EXEC XADD frames stay on the sequential correctness path" do
+    tag = System.unique_integer([:positive, :monotonic])
+    key = "native:lane:stream:trim:{#{tag}}"
+    ctx = FerricStore.Instance.get(:default)
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, key)
+    before_position = raft_position(shard_index)
+    {:ok, pid} = Lane.start_link(self(), @lane_id, command_state())
+
+    on_exit(fn ->
+      Lane.stop(pid)
+      FerricStore.del(key)
+    end)
+
+    Lane.enqueue_many(pid, [
+      command_exec_xadd_frame(111, [key, "MAXLEN", "2", "1-0", "field", "one"]),
+      command_exec_xadd_frame(112, [key, "MAXLEN", "2", "1-0", "field", "duplicate"]),
+      command_exec_xadd_frame(113, [key, "MAXLEN", "2", "2-0", "field", "two"]),
+      command_exec_xadd_frame(114, [key, "MAXLEN", "2", "3-0", "field", "three"])
+    ])
+
+    assert_receive {:native_lane_responses, @lane_id, responses, 4}, @receive_timeout
+    assert_response(Enum.at(responses, 0), @op_command_exec, 111, "1-0")
+    assert_error_response(Enum.at(responses, 1), @op_command_exec, 112)
+    assert_response(Enum.at(responses, 2), @op_command_exec, 113, "2-0")
+    assert_response(Enum.at(responses, 3), @op_command_exec, 114, "3-0")
+    assert raft_position(shard_index) == before_position + 4
+
+    assert {:ok, [["2-0", "field", "two"], ["3-0", "field", "three"]]} =
+             FerricStore.xrange(key, "-", "+")
+  end
+
+  test "COMMAND_EXEC XADD burst coalescing cannot bypass resource governance" do
+    install_audited_resource_limits()
+    tag = System.unique_integer([:positive, :monotonic])
+    allowed = "native:lane:stream:governance:allowed:{#{tag}}"
+    blocked = "native:lane:stream:governance:blocked:{#{tag}}"
+    {:ok, pid} = Lane.start_link(self(), @lane_id, command_state())
+
+    on_exit(fn ->
+      Lane.stop(pid)
+      FerricStore.del([allowed, blocked])
+    end)
+
+    Lane.enqueue_many(pid, [
+      command_exec_xadd_frame(121, [allowed, "*", "field", "stored"]),
+      command_exec_xadd_frame(122, [blocked, "*", "field", "rejected"])
+    ])
+
+    assert_receive {:native_lane_responses, @lane_id, responses, 2}, @receive_timeout
+    assert is_binary(response_value_for(Enum.at(responses, 0), @op_command_exec, 121))
+    assert_error_response(Enum.at(responses, 1), @op_command_exec, 122)
+    assert {:ok, 1} = FerricStore.xlen(allowed)
+    assert {:ok, 0} = FerricStore.xlen(blocked)
+    assert_receive {:resource_check, _command, _args, [^allowed]}
+    assert_receive {:resource_check, _command, _args, [^blocked]}
+  end
+
   test "NO_REPLY lane commands execute without encoding a response" do
     key = "native:lane:no-reply:#{System.unique_integer([:positive, :monotonic])}"
     {:ok, pid} = Lane.start_link(self(), @lane_id, command_state())
@@ -423,6 +588,112 @@ defmodule FerricstoreServer.Native.LaneTest do
     assert length(responses) == 2
     assert_compact_ok_count_response(Enum.at(responses, 0), @op_pipeline, 31, 1)
     assert_compact_ok_count_response(Enum.at(responses, 1), @op_pipeline, 32, 1)
+  end
+
+  test "coalesces compact Stream producer frames and preserves response boundaries" do
+    tag = System.unique_integer([:positive, :monotonic])
+    key_a = "native:lane:stream:compact-coalesced:a:{#{tag}}"
+    key_b = "native:lane:stream:compact-coalesced:b:{#{tag}}"
+    key_c = "native:lane:stream:compact-coalesced:c:{#{tag}}"
+    ctx = FerricStore.Instance.get(:default)
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, key_a)
+
+    assert Enum.all?(
+             [key_b, key_c],
+             &(Ferricstore.Store.Router.shard_for(ctx, &1) == shard_index)
+           )
+
+    before_position = raft_position(shard_index)
+    {:ok, pid} = Lane.start_link(self(), @lane_id, command_state())
+
+    on_exit(fn ->
+      Lane.stop(pid)
+      FerricStore.del([key_a, key_b, key_c])
+    end)
+
+    Lane.enqueue_many(pid, [
+      compact_stream_pipeline_frame(35, [
+        {key_a, ["field", "one"]},
+        {key_b, ["field", "two"]}
+      ]),
+      compact_stream_pipeline_frame(36, [
+        {key_c, ["field", "three"]},
+        {key_a, ["field", "four"]},
+        {key_b, ["field", "five"]}
+      ])
+    ])
+
+    assert_receive {:native_lane_responses, @lane_id, responses, 2}, @receive_timeout
+    assert length(responses) == 2
+
+    first_ids =
+      responses |> Enum.at(0) |> response_value_for(@op_pipeline, 35) |> compact_stream_ids()
+
+    second_ids =
+      responses |> Enum.at(1) |> response_value_for(@op_pipeline, 36) |> compact_stream_ids()
+
+    assert length(first_ids) == 2
+    assert length(second_ids) == 3
+    assert Enum.all?(first_ids ++ second_ids, &is_binary/1)
+    assert MapSet.size(MapSet.new([Enum.at(first_ids, 0), Enum.at(second_ids, 1)])) == 2
+    assert MapSet.size(MapSet.new([Enum.at(first_ids, 1), Enum.at(second_ids, 2)])) == 2
+    assert raft_position(shard_index) == before_position + 1
+    assert {:ok, 2} = FerricStore.xlen(key_a)
+    assert {:ok, 2} = FerricStore.xlen(key_b)
+    assert {:ok, 1} = FerricStore.xlen(key_c)
+  end
+
+  test "coalesces compact Stream producer frames once per destination shard" do
+    tag = System.unique_integer([:positive, :monotonic])
+    ctx = FerricStore.Instance.get(:default)
+    key_a = "native:lane:stream:compact-cross-shard:a:#{tag}"
+    shard_a = Ferricstore.Store.Router.shard_for(ctx, key_a)
+
+    key_b =
+      Enum.find_value(1..10_000, fn suffix ->
+        candidate = "native:lane:stream:compact-cross-shard:b:#{tag}:#{suffix}"
+
+        if Ferricstore.Store.Router.shard_for(ctx, candidate) != shard_a,
+          do: candidate
+      end)
+
+    shard_b = Ferricstore.Store.Router.shard_for(ctx, key_b)
+    refute shard_a == shard_b
+    before_a = raft_position(shard_a)
+    before_b = raft_position(shard_b)
+    {:ok, pid} = Lane.start_link(self(), @lane_id, command_state())
+
+    on_exit(fn ->
+      Lane.stop(pid)
+      FerricStore.del([key_a, key_b])
+    end)
+
+    Lane.enqueue_many(pid, [
+      compact_stream_pipeline_frame(37, [
+        {key_a, ["field", "a1"]},
+        {key_b, ["field", "b1"]}
+      ]),
+      compact_stream_pipeline_frame(38, [
+        {key_b, ["field", "b2"]},
+        {key_a, ["field", "a2"]}
+      ])
+    ])
+
+    assert_receive {:native_lane_responses, @lane_id, responses, 2}, @receive_timeout
+
+    first_ids =
+      responses |> Enum.at(0) |> response_value_for(@op_pipeline, 37) |> compact_stream_ids()
+
+    second_ids =
+      responses |> Enum.at(1) |> response_value_for(@op_pipeline, 38) |> compact_stream_ids()
+
+    assert length(first_ids) == 2
+    assert length(second_ids) == 2
+    assert Enum.all?(first_ids ++ second_ids, &is_binary/1)
+    assert raft_position(shard_a) == before_a + 1
+    assert raft_position(shard_b) == before_b + 1
+    assert {:ok, 2} = FerricStore.xlen(key_a)
+    assert {:ok, 2} = FerricStore.xlen(key_b)
   end
 
   test "compact pipeline fast paths cannot bypass resource governance" do
@@ -648,6 +919,11 @@ defmodule FerricstoreServer.Native.LaneTest do
     {@lane_id, @op_set, request_id, 0, Codec.encode_value(%{"key" => key, "value" => value})}
   end
 
+  defp command_exec_xadd_frame(request_id, args) do
+    {@lane_id, @op_command_exec, request_id, 0,
+     Codec.encode_value(%{"command" => "XADD", "args" => args})}
+  end
+
   defp get_frame(request_id, key) do
     {@lane_id, @op_get, request_id, 0, Codec.encode_value(%{"key" => key})}
   end
@@ -687,6 +963,21 @@ defmodule FerricstoreServer.Native.LaneTest do
     body = [
       <<0x94, mode, length(items)::unsigned-32>>,
       Enum.map(items, &compact_data_write_pipeline_item(mode, &1))
+    ]
+
+    {@lane_id, @op_pipeline, request_id, 0x02, IO.iodata_to_binary(body)}
+  end
+
+  defp compact_stream_pipeline_frame(request_id, items) do
+    body = [
+      <<0x94, 0xA2, length(items)::unsigned-32>>,
+      Enum.map(items, fn {key, fields} ->
+        [
+          compact_bin(key),
+          <<div(length(fields), 2)::unsigned-16>>,
+          Enum.map(fields, &compact_bin/1)
+        ]
+      end)
     ]
 
     {@lane_id, @op_pipeline, request_id, 0x02, IO.iodata_to_binary(body)}
@@ -765,6 +1056,17 @@ defmodule FerricstoreServer.Native.LaneTest do
     assert response_value(value_body) == expected_value
   end
 
+  defp response_value_for(iodata, opcode, request_id) do
+    response = IO.iodata_to_binary(iodata)
+
+    assert <<"FSNP", 0x81, _flags, @lane_id::unsigned-32, ^opcode::unsigned-16,
+             ^request_id::unsigned-64, body_len::unsigned-32, body::binary>> = response
+
+    assert body_len == byte_size(body)
+    assert <<0::unsigned-16, value_body::binary>> = body
+    response_value(value_body)
+  end
+
   defp response_request_id(iodata) do
     <<"FSNP", 0x81, _flags, @lane_id::unsigned-32, _opcode::unsigned-16, request_id::unsigned-64,
       _rest::binary>> = IO.iodata_to_binary(iodata)
@@ -795,6 +1097,33 @@ defmodule FerricstoreServer.Native.LaneTest do
     do: value
 
   defp compact_get_value(_value_body), do: nil
+
+  defp compact_stream_ids(<<0x89, count::unsigned-32, size::unsigned-32, values::binary>>)
+       when byte_size(values) == count * size do
+    for <<id::binary-size(size) <- values>>, do: id
+  end
+
+  defp compact_stream_ids(<<0x83, count::unsigned-32, rest::binary>>) do
+    {ids, ""} = take_variable_compact_stream_ids(count, rest, [])
+    Enum.reverse(ids)
+  end
+
+  defp take_variable_compact_stream_ids(0, rest, ids), do: {ids, rest}
+
+  defp take_variable_compact_stream_ids(
+         count,
+         <<1, size::unsigned-32, id::binary-size(size), rest::binary>>,
+         ids
+       )
+       when count > 0,
+       do: take_variable_compact_stream_ids(count - 1, rest, [id | ids])
+
+  defp raft_position(shard_index) do
+    {:ok, {:raft_log_pos, index, _term}} =
+      Ferricstore.Raft.WARaftBackend.storage_position(shard_index)
+
+    index
+  end
 
   defp eventually(fun, attempts \\ 50)
   defp eventually(fun, 0), do: fun.()

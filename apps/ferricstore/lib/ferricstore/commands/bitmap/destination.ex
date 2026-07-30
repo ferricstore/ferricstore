@@ -69,7 +69,9 @@ defmodule Ferricstore.Commands.Bitmap.Destination do
           CompoundKey.set_prefix(key),
           CompoundKey.zset_prefix(key),
           CompoundKey.stream_prefix(key),
-          CompoundKey.stream_group_prefix(key)
+          CompoundKey.stream_group_prefix(key),
+          CompoundKey.stream_pending_prefix(key),
+          CompoundKey.stream_consumer_prefix(key)
         ]
         |> Enum.reduce_while(:ok, fn prefix, :ok ->
           case Ops.compound_delete_prefix(store, key, prefix) do

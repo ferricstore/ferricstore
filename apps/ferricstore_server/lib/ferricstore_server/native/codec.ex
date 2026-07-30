@@ -15,6 +15,7 @@ defmodule FerricstoreServer.Native.Codec do
   alias Ferricstore.NativeValueCodec
   alias FerricstoreServer.Native.NIF
   alias FerricstoreServer.Native.Connection.FrameBuffer
+  alias FerricstoreServer.Native.StreamRangeResponse
 
   @version 1
   @response_direction 0x80
@@ -38,6 +39,11 @@ defmodule FerricstoreServer.Native.Codec do
 
   @default_max_value_items 100_000
   @default_max_value_depth 64
+  @op_command_exec 0x0100
+  @native_stream_rows_min 128
+  @native_stream_inline_max_rows 2_048
+  @native_stream_inline_max_source_bytes 256 * 1_024
+  @maximum_u64 0xFFFF_FFFF_FFFF_FFFF
 
   @compact_flow_claim_jobs 0x80
   @compact_ok_list 0x81
@@ -320,7 +326,20 @@ defmodule FerricstoreServer.Native.Codec do
           term(),
           keyword()
         ) :: [binary()]
-  def encode_command_response_frames(opcode, lane_id, request_id, status, value, opts \\ []) do
+  def encode_command_response_frames(opcode, lane_id, request_id, status, value, opts \\ [])
+
+  def encode_command_response_frames(
+        opcode,
+        lane_id,
+        request_id,
+        :ok,
+        %StreamRangeResponse{} = response,
+        opts
+      ) do
+    encode_stream_range_response_frames(opcode, lane_id, request_id, response, opts)
+  end
+
+  def encode_command_response_frames(opcode, lane_id, request_id, status, value, opts) do
     case compact_flow_query_result_payload(opcode, status, value, opts) do
       payload when is_binary(payload) ->
         encode_bounded_compact_response_frames(
@@ -334,6 +353,72 @@ defmodule FerricstoreServer.Native.Codec do
 
       nil ->
         do_encode_command_response_frames(opcode, lane_id, request_id, status, value, opts)
+    end
+  end
+
+  defp encode_stream_range_response_frames(opcode, lane_id, request_id, response, opts) do
+    direct_frame =
+      if direct_compact_frame?(opts) and response.count >= @native_stream_rows_min do
+        encode_raw_stream_rows_response_frame(opcode, lane_id, request_id, response, opts)
+      end
+
+    case direct_frame do
+      frame when is_binary(frame) ->
+        [frame]
+
+      :response_too_large ->
+        encode_response_frames(
+          opcode,
+          lane_id,
+          request_id,
+          :bad_request,
+          "ERR native response byte limit exceeded",
+          opts
+        )
+
+      nil ->
+        encode_command_response_frames(
+          opcode,
+          lane_id,
+          request_id,
+          :ok,
+          StreamRangeResponse.materialize(response),
+          opts
+        )
+    end
+  end
+
+  defp encode_raw_stream_rows_response_frame(opcode, lane_id, request_id, response, opts) do
+    max_response_bytes = response_byte_limit(opts)
+
+    frame =
+      if response.count <= @native_stream_inline_max_rows and
+           response.source_bytes <= @native_stream_inline_max_source_bytes do
+        NIF.encode_raw_stream_rows_response_frame_inline(
+          opcode,
+          lane_id,
+          request_id,
+          response.pairs,
+          response.count,
+          response.source_bytes,
+          max_response_bytes
+        )
+      else
+        :use_dirty
+      end
+
+    case frame do
+      :use_dirty ->
+        NIF.encode_raw_stream_rows_response_frame(
+          opcode,
+          lane_id,
+          request_id,
+          response.pairs,
+          max_response_bytes
+        )
+
+      frame ->
+        frame
     end
   end
 
@@ -360,6 +445,40 @@ defmodule FerricstoreServer.Native.Codec do
   end
 
   defp do_encode_command_response_frames(opcode, lane_id, request_id, status, value, opts) do
+    case direct_stream_rows_response_frame(opcode, lane_id, request_id, status, value, opts) do
+      frame when is_binary(frame) ->
+        [frame]
+
+      :response_too_large ->
+        encode_response_frames(
+          opcode,
+          lane_id,
+          request_id,
+          :bad_request,
+          "ERR native response byte limit exceeded",
+          opts
+        )
+
+      nil ->
+        do_encode_command_response_frames_fallback(
+          opcode,
+          lane_id,
+          request_id,
+          status,
+          value,
+          opts
+        )
+    end
+  end
+
+  defp do_encode_command_response_frames_fallback(
+         opcode,
+         lane_id,
+         request_id,
+         status,
+         value,
+         opts
+       ) do
     {status, value} = enforce_response_byte_limit(status, value, opts)
 
     case streamed_compact_mget_frames(opcode, lane_id, request_id, status, value, opts) do
@@ -962,6 +1081,43 @@ defmodule FerricstoreServer.Native.Codec do
   end
 
   defp compact_response_frame(_opcode, _lane_id, _request_id, _status, _value, _opts), do: nil
+
+  defp direct_stream_rows_response_frame(
+         @op_command_exec,
+         lane_id,
+         request_id,
+         :ok,
+         rows,
+         opts
+       )
+       when is_list(rows) do
+    if direct_compact_frame?(opts) and length(rows) >= @native_stream_rows_min do
+      NIF.encode_stream_rows_response_frame(
+        @op_command_exec,
+        lane_id,
+        request_id,
+        rows,
+        response_byte_limit(opts)
+      )
+    end
+  end
+
+  defp direct_stream_rows_response_frame(
+         _opcode,
+         _lane_id,
+         _request_id,
+         _status,
+         _value,
+         _opts
+       ),
+       do: nil
+
+  defp response_byte_limit(opts) do
+    case Keyword.get(opts, :max_response_bytes) do
+      limit when is_integer(limit) and limit > 0 and limit <= @maximum_u64 -> limit
+      _unbounded_or_above_protocol_capacity -> 0
+    end
+  end
 
   defp compact_kv_opcode?(opcode), do: opcode in @compact_always_response_opcodes
 
@@ -1598,6 +1754,20 @@ defmodule FerricstoreServer.Native.Codec do
     end
   end
 
+  # Mode 34 is the append-only Stream producer fast path. Each item contains
+  # one key followed by a non-empty flat field/value list. IDs are server-assigned
+  # (`*`), with no trimming or NOMKSTREAM flag, so the entire shard-local group can
+  # be committed as one replicated batch.
+  defp take_compact_pipeline_items(34, count, rest, _acc) when count >= 0 do
+    max_items = native_value_limits().max_items
+
+    if count <= max_items do
+      take_compact_stream_append_items(count, rest, [], max_items - count)
+    else
+      {:error, "ERR native compact collection exceeds max items"}
+    end
+  end
+
   defp take_compact_pipeline_items(7, count, rest, _acc) when count >= 0 do
     take_compact_shared_value_put_items(count, rest, [])
   end
@@ -1710,6 +1880,87 @@ defmodule FerricstoreServer.Native.Codec do
       take_compact_binary_list(count - 1, rest, [value | acc])
     end
   end
+
+  defp take_compact_stream_append_items(0, rest, acc, _remaining),
+    do: {:ok, Enum.reverse(acc), rest}
+
+  defp take_compact_stream_append_items(count, rest, acc, remaining) when count > 0 do
+    with {:ok, key, rest} <- take_compact_binary(rest) do
+      take_compact_stream_append_item(count, rest, key, acc, remaining)
+    end
+  end
+
+  defp take_compact_stream_append_item(
+         count,
+         <<1::unsigned-16, rest::binary>>,
+         key,
+         acc,
+         remaining
+       ) do
+    with {:ok, remaining} <- reserve_compact_collection_items(remaining, 2),
+         {:ok, field, rest} <- take_compact_binary(rest),
+         {:ok, value, rest} <- take_compact_binary(rest) do
+      take_compact_stream_append_items(
+        count - 1,
+        rest,
+        [{key, [field, value]} | acc],
+        remaining
+      )
+    else
+      {:error, _reason} = error -> error
+      _invalid -> :error
+    end
+  end
+
+  defp take_compact_stream_append_item(
+         count,
+         <<2::unsigned-16, rest::binary>>,
+         key,
+         acc,
+         remaining
+       ) do
+    with {:ok, remaining} <- reserve_compact_collection_items(remaining, 4),
+         {:ok, field1, rest} <- take_compact_binary(rest),
+         {:ok, value1, rest} <- take_compact_binary(rest),
+         {:ok, field2, rest} <- take_compact_binary(rest),
+         {:ok, value2, rest} <- take_compact_binary(rest) do
+      take_compact_stream_append_items(
+        count - 1,
+        rest,
+        [{key, [field1, value1, field2, value2]} | acc],
+        remaining
+      )
+    else
+      {:error, _reason} = error -> error
+      _invalid -> :error
+    end
+  end
+
+  defp take_compact_stream_append_item(
+         count,
+         <<pair_count::unsigned-16, rest::binary>>,
+         key,
+         acc,
+         remaining
+       )
+       when pair_count > 0 do
+    field_value_count = pair_count * 2
+
+    with {:ok, remaining} <- reserve_compact_collection_items(remaining, field_value_count),
+         {:ok, fields, rest} <- take_compact_binary_list(field_value_count, rest, []) do
+      take_compact_stream_append_items(
+        count - 1,
+        rest,
+        [{key, fields} | acc],
+        remaining
+      )
+    else
+      {:error, _reason} = error -> error
+      _invalid -> :error
+    end
+  end
+
+  defp take_compact_stream_append_item(_count, _rest, _key, _acc, _remaining), do: :error
 
   defp take_compact_step_continue_items(
          0,
@@ -2227,6 +2478,25 @@ defmodule FerricstoreServer.Native.Codec do
     case decode_binary(len, rest) do
       {:ok, value, next} -> {:ok, value, next, remaining}
       {:error, _reason} = error -> error
+    end
+  end
+
+  # XRANGE and XREVRANGE use five binary arguments in their common COUNT form.
+  # Match that complete wire shape without recursively dispatching five scalar
+  # values. Other arrays enter the generic budgeted decoder unchanged.
+  defp decode_value(
+         <<5, 5::unsigned-32, 4, first_len::unsigned-32, first::binary-size(first_len), 4,
+           second_len::unsigned-32, second::binary-size(second_len), 4, third_len::unsigned-32,
+           third::binary-size(third_len), 4, fourth_len::unsigned-32,
+           fourth::binary-size(fourth_len), 4, fifth_len::unsigned-32,
+           fifth::binary-size(fifth_len), rest::binary>>,
+         limits,
+         depth,
+         remaining
+       ) do
+    with :ok <- validate_value_container(5, limits, depth),
+         {:ok, remaining} <- reserve_value_items(remaining, 5) do
+      {:ok, [first, second, third, fourth, fifth], rest, remaining}
     end
   end
 

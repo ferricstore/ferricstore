@@ -97,7 +97,7 @@ it addresses only the run ID's deterministic auto-partition; explicitly
 partitioned runs require the predicate. The OSS default includes bounded
 composite collections, exact `RETURN COUNT`, cursors, statistics, index status,
 and full explain analysis. The planner, indexes, and FlowGuard primitives are
-OSS features. Enterprise consumes the same provider and may add enterprise
+OSS features. Enterprise uses the same provider and may add enterprise
 metadata scope and policy integration without changing the query contracts.
 
 ```text
@@ -958,6 +958,11 @@ Adds an entry to a stream with optional trimming and NOMKSTREAM.
 **ID generation:** `*` auto-generates using HLC. Explicit IDs must be strictly greater than the last entry. Partial IDs (just milliseconds) auto-assign the sequence.
 
 **Status:** Supported, including NOMKSTREAM and trim options.
+
+For auto-ID producer group commit, `FerricStore.xadd_many([{key, fields}, ...])`
+returns one `{:ok, id}` or error per item in input order. It emits one Raft/WAL
+entry per touched shard. This is a FerricStore batch API rather than a Redis
+wire command, and it is not an all-or-nothing cross-shard transaction.
 
 ### XLEN / XRANGE / XREVRANGE
 

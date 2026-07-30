@@ -418,7 +418,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
         started_at = System.monotonic_time()
 
         try do
-          command_result = fun.()
+          {command_result, publication} = split_pending_write_result(fun.())
 
           result = state_storage_failure_result(command_result)
 
@@ -427,7 +427,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
             emit_raft_apply_telemetry(state, started_at, result, :rolled_back)
             result
           else
-            flush_result = flush_pending_writes(state)
+            flush_result = flush_pending_writes(state, publication)
             emit_raft_apply_telemetry(state, started_at, result, flush_result)
 
             case flush_result do
@@ -466,6 +466,38 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
           clear_pending_write_process_state()
         end
       end
+
+      # Most commands publish through the generic pending-write path. A
+      # planned Stream append returns its post-commit publication explicitly;
+      # this value is then threaded through the flush call graph instead of
+      # being inferred from ambient process state.
+      defp pending_write_result(
+             result,
+             %Ferricstore.Commands.Stream.AtomicAppend.Publication{} = publication
+           ) do
+        {:sm_pending_write_result, result, publication}
+      end
+
+      defp pending_write_result(
+             result,
+             [%Ferricstore.Commands.Stream.AtomicAppend.Publication{} | _rest] = publications
+           ) do
+        {:sm_pending_write_result, result, publications}
+      end
+
+      defp split_pending_write_result(
+             {:sm_pending_write_result, result,
+              %Ferricstore.Commands.Stream.AtomicAppend.Publication{} = publication}
+           ),
+           do: {result, publication}
+
+      defp split_pending_write_result(
+             {:sm_pending_write_result, result,
+              [%Ferricstore.Commands.Stream.AtomicAppend.Publication{} | _rest] = publications}
+           ),
+           do: {result, publications}
+
+      defp split_pending_write_result(result), do: {result, nil}
 
       defp publish_pending_prob_files(state) do
         with :ok <- publish_pending_prob_creates() do

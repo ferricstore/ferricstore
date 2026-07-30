@@ -217,6 +217,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
   @moduletag :global_state
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Commands.Stream.Index, as: StreamIndex
   alias Ferricstore.Raft.BlobCommand
   alias Ferricstore.Raft.StateMachineTest.CurrentStateMachine, as: StateMachine
   alias Ferricstore.Store.BitcaskWriter
@@ -332,6 +333,488 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
     assert [row] = :ets.lookup(ets, key)
     assert elem(row, 0) == key
+  end
+
+  test "generic batches expose earlier stream appends to later appends", %{
+    state: state,
+    ets: ets
+  } do
+    key = "batched-stream"
+
+    command =
+      {:batch,
+       [
+         {:stream_append, key, {:partial, 1}, ["field", "one"], nil, false},
+         {:stream_append, key, {:partial, 1}, ["field", "two"], nil, false}
+       ]}
+
+    {_new_state, result} = StateMachine.apply(%{}, command, state)
+    assert result == {:ok, ["1-0", "1-1"]}
+
+    entry_prefix = CompoundKey.stream_prefix(key)
+
+    assert ets
+           |> :ets.tab2list()
+           |> Enum.count(fn {compound_key, _, _, _, _, _, _} ->
+             String.starts_with?(compound_key, entry_prefix)
+           end) == 2
+  end
+
+  test "compact stream commands reject malformed fields without mutation", %{
+    state: state,
+    ets: ets
+  } do
+    key = "invalid-compact-stream"
+    command = {:stream_append_many_auto, key, [["orphan"]]}
+
+    assert {_new_state, {:error, :invalid_stream_append_many_auto}} =
+             StateMachine.apply(%{}, command, state)
+
+    assert [] == :ets.lookup(ets, CompoundKey.type_key(key))
+    assert [] == :ets.lookup(ets, CompoundKey.stream_meta_key(key))
+
+    refute ets
+           |> :ets.tab2list()
+           |> Enum.any?(fn {compound_key, _, _, _, _, _, _} ->
+             String.starts_with?(compound_key, CompoundKey.stream_prefix(key))
+           end)
+
+    direct_key = key <> ":direct"
+
+    assert {_new_state, {:error, "ERR wrong number of arguments for 'xadd' command"}} =
+             StateMachine.apply(
+               %{},
+               {:stream_append, direct_key, {:partial, 1}, ["orphan"], nil, false},
+               state
+             )
+
+    assert [] == :ets.lookup(ets, CompoundKey.type_key(direct_key))
+    assert [] == :ets.lookup(ets, CompoundKey.stream_meta_key(direct_key))
+  end
+
+  test "replicated Stream group creation rejects invalid start IDs atomically", %{
+    state: state,
+    ets: ets
+  } do
+    key = "invalid-replicated-stream-group"
+
+    assert {_new_state, {:error, "ERR Invalid stream ID specified as stream command argument"}} =
+             StateMachine.apply(
+               %{},
+               {:stream_mutate, key, {:create, "workers", "not-an-id", true}},
+               state
+             )
+
+    assert [] == :ets.lookup(ets, CompoundKey.type_key(key))
+    assert [] == :ets.lookup(ets, CompoundKey.stream_meta_key(key))
+
+    refute ets
+           |> :ets.tab2list()
+           |> Enum.any?(fn {compound_key, _, _, _, _, _, _} ->
+             String.starts_with?(compound_key, CompoundKey.stream_group_prefix(key))
+           end)
+  end
+
+  test "replicated Stream appends reject malformed ID and trim terms atomically", %{
+    state: state,
+    ets: ets
+  } do
+    commands = [
+      {{:stream_append, "invalid-id-spec", :invalid, ["field", "value"], nil, false},
+       "ERR Invalid stream ID specified as stream command argument"},
+      {{:stream_append, "invalid-maxlen", :auto, ["field", "value"], {:maxlen, :not_boolean, 1},
+        false}, "ERR syntax error"},
+      {{:stream_append, "invalid-minid", :auto, ["field", "value"], {:minid, :not_boolean, "1-0"},
+        false}, "ERR syntax error"}
+    ]
+
+    Enum.each(commands, fn {command, expected_error} ->
+      key = elem(command, 1)
+
+      assert {_new_state, {:error, ^expected_error}} =
+               StateMachine.apply(%{}, command, state)
+
+      assert [] == :ets.lookup(ets, CompoundKey.type_key(key))
+      assert [] == :ets.lookup(ets, CompoundKey.stream_meta_key(key))
+    end)
+  end
+
+  test "replicated Stream delete and ack commands reject non-binary IDs atomically", %{
+    state: state,
+    ets: ets
+  } do
+    key = "invalid-replicated-stream-member-id"
+
+    {state, "1-0"} =
+      StateMachine.apply(
+        %{},
+        {:stream_append, key, {:partial, 1}, ["field", "one"], nil, false},
+        state
+      )
+
+    {state, :ok} =
+      StateMachine.apply(
+        %{},
+        {:stream_mutate, key, {:create, "workers", "0-0", false}},
+        state
+      )
+
+    assert [{_, committed_meta, 0, _, _, _, _}] =
+             :ets.lookup(ets, CompoundKey.stream_meta_key(key))
+
+    commands = [
+      {:stream_mutate, key, {:delete, ["1-0", 123]}},
+      {:stream_mutate, key, {:ack, "workers", [123]}}
+    ]
+
+    Enum.each(commands, fn command ->
+      assert {_new_state, {:error, "ERR Invalid stream ID specified as stream command argument"}} =
+               StateMachine.apply(%{}, command, state)
+
+      assert [{_, ^committed_meta, 0, _, _, _, _}] =
+               :ets.lookup(ets, CompoundKey.stream_meta_key(key))
+
+      assert [_entry] =
+               :ets.lookup(
+                 ets,
+                 Ferricstore.Commands.Stream.Entries.entry_key(key, "1-0")
+               )
+    end)
+  end
+
+  test "generic stream mutations see earlier appends with a warm index", %{
+    state: state,
+    ets: ets
+  } do
+    key = "warm-index-batched-stream"
+    cache_store = %{cache_scope: state.instance_name}
+
+    {state, "1-0"} =
+      StateMachine.apply(
+        %{},
+        {:stream_append, key, {:partial, 1}, ["field", "one"], nil, false},
+        state
+      )
+
+    {state, "2-0"} =
+      StateMachine.apply(
+        %{},
+        {:stream_append, key, {:partial, 2}, ["field", "two"], nil, false},
+        state
+      )
+
+    StreamIndex.insert_id(key, "1-0", cache_store)
+    StreamIndex.insert_id(key, "2-0", cache_store)
+    StreamIndex.mark_ready(key, cache_store)
+    on_exit(fn -> StreamIndex.clear(key, cache_store) end)
+
+    command =
+      {:batch,
+       [
+         {:stream_append, key, {:partial, 3}, ["field", "three"], nil, false},
+         {:stream_mutate, key, {:delete, ["1-0"]}}
+       ]}
+
+    assert {_new_state, {:ok, ["3-0", 1]}} = StateMachine.apply(%{}, command, state)
+
+    assert [
+             {_, encoded_meta, 0, _, _, _, _}
+           ] = :ets.lookup(ets, CompoundKey.stream_meta_key(key))
+
+    assert {:stream_meta, 2, 2, "2-0", "3-0", 3, 0} =
+             :erlang.binary_to_term(encoded_meta, [:safe])
+  end
+
+  test "append trimming sees earlier appends with a warm index", %{state: state, ets: ets} do
+    key = "warm-index-batched-append-trim"
+    cache_store = %{cache_scope: state.instance_name}
+
+    {state, "1-0"} =
+      StateMachine.apply(
+        %{},
+        {:stream_append, key, {:partial, 1}, ["field", "one"], nil, false},
+        state
+      )
+
+    {state, "2-0"} =
+      StateMachine.apply(
+        %{},
+        {:stream_append, key, {:partial, 2}, ["field", "two"], nil, false},
+        state
+      )
+
+    StreamIndex.insert_id(key, "1-0", cache_store)
+    StreamIndex.insert_id(key, "2-0", cache_store)
+    StreamIndex.mark_ready(key, cache_store)
+    on_exit(fn -> StreamIndex.clear(key, cache_store) end)
+
+    command =
+      {:batch,
+       [
+         {:stream_append, key, {:partial, 3}, ["field", "three"], nil, false},
+         {:stream_append, key, {:partial, 4}, ["field", "four"], {:maxlen, false, 2}, false}
+       ]}
+
+    assert {_new_state, {:ok, ["3-0", "4-0"]}} = StateMachine.apply(%{}, command, state)
+
+    assert [{_, encoded_meta, 0, _, _, _, _}] =
+             :ets.lookup(ets, CompoundKey.stream_meta_key(key))
+
+    assert {:stream_meta, 2, 2, "3-0", "4-0", 4, 0} =
+             :erlang.binary_to_term(encoded_meta, [:safe])
+
+    entry_prefix = CompoundKey.stream_prefix(key)
+
+    assert ["3-0", "4-0"] ==
+             ets
+             |> :ets.tab2list()
+             |> Enum.flat_map(fn
+               {compound_key, _, _, _, _, _, _} ->
+                 if String.starts_with?(compound_key, entry_prefix) do
+                   [
+                     binary_part(
+                       compound_key,
+                       byte_size(entry_prefix),
+                       byte_size(compound_key) - byte_size(entry_prefix)
+                     )
+                   ]
+                 else
+                   []
+                 end
+             end)
+             |> Enum.sort()
+
+    assert ["3-0", "4-0"] == StreamIndex.ids(key, :infinity, cache_store)
+  end
+
+  test "pending Stream index views are isolated per topic", %{state: state, ets: ets} do
+    keys = ["pending-topic:a", "pending-topic:b"]
+    cache_store = %{cache_scope: state.instance_name}
+
+    state =
+      Enum.reduce(keys, state, fn key, state ->
+        {state, "1-0"} =
+          StateMachine.apply(
+            %{},
+            {:stream_append, key, {:partial, 1}, ["field", "one"], nil, false},
+            state
+          )
+
+        {state, "2-0"} =
+          StateMachine.apply(
+            %{},
+            {:stream_append, key, {:partial, 2}, ["field", "two"], nil, false},
+            state
+          )
+
+        StreamIndex.insert_id(key, "1-0", cache_store)
+        StreamIndex.insert_id(key, "2-0", cache_store)
+        StreamIndex.mark_ready(key, cache_store)
+        state
+      end)
+
+    on_exit(fn -> Enum.each(keys, &StreamIndex.clear(&1, cache_store)) end)
+
+    [key_a, key_b] = keys
+
+    command =
+      {:batch,
+       [
+         {:stream_append, key_a, {:partial, 3}, ["field", "a-three"], nil, false},
+         {:stream_append, key_b, {:partial, 3}, ["field", "b-three"], nil, false},
+         {:stream_mutate, key_a, {:trim, {:maxlen, false, 2}}},
+         {:stream_mutate, key_b, {:trim, {:minid, false, "2-0"}}}
+       ]}
+
+    assert {_new_state, {:ok, ["3-0", "3-0", 1, 1]}} =
+             StateMachine.apply(%{}, command, state)
+
+    Enum.each(keys, fn key ->
+      assert [{_, encoded_meta, 0, _, _, _, _}] =
+               :ets.lookup(ets, CompoundKey.stream_meta_key(key))
+
+      assert {:stream_meta, 2, 2, "2-0", "3-0", 3, 0} =
+               :erlang.binary_to_term(encoded_meta, [:safe])
+
+      assert ["2-0", "3-0"] == StreamIndex.ids(key, :infinity, cache_store)
+    end)
+  end
+
+  test "standalone transaction stores trim against earlier Stream appends", %{
+    state: state,
+    ets: ets
+  } do
+    key = "transaction-pending-stream-index"
+    cache_store = %{cache_scope: state.instance_name}
+
+    {state, "1-0"} =
+      StateMachine.apply(
+        %{},
+        {:stream_append, key, {:partial, 1}, ["field", "one"], nil, false},
+        state
+      )
+
+    {state, "2-0"} =
+      StateMachine.apply(
+        %{},
+        {:stream_append, key, {:partial, 2}, ["field", "two"], nil, false},
+        state
+      )
+
+    StreamIndex.insert_id(key, "1-0", cache_store)
+    StreamIndex.insert_id(key, "2-0", cache_store)
+    StreamIndex.mark_ready(key, cache_store)
+    on_exit(fn -> StreamIndex.clear(key, cache_store) end)
+
+    execute = fn store ->
+      appended =
+        Ferricstore.Commands.Stream.AtomicAppend.run(
+          key,
+          {:explicit, 3, 0},
+          ["field", "three"],
+          nil,
+          false,
+          store
+        )
+
+      trimmed =
+        Ferricstore.Commands.Stream.AtomicMutation.run(
+          key,
+          {:trim, {:maxlen, false, 2}},
+          store
+        )
+
+      [appended, trimmed]
+    end
+
+    assert {["3-0", 1], _new_state} =
+             StateMachine.apply_standalone_cross_shard(execute, state)
+
+    assert [{_, encoded_meta, 0, _, _, _, _}] =
+             :ets.lookup(ets, CompoundKey.stream_meta_key(key))
+
+    assert {:stream_meta, 2, 2, "2-0", "3-0", 3, 0} =
+             :erlang.binary_to_term(encoded_meta, [:safe])
+
+    refute StreamIndex.ready?(key, cache_store)
+
+    entry_prefix = CompoundKey.stream_prefix(key)
+
+    assert ["2-0", "3-0"] ==
+             ets
+             |> :ets.tab2list()
+             |> Enum.flat_map(fn
+               {compound_key, _, _, _, _, _, _} ->
+                 if String.starts_with?(compound_key, entry_prefix) do
+                   [
+                     binary_part(
+                       compound_key,
+                       byte_size(entry_prefix),
+                       byte_size(compound_key) - byte_size(entry_prefix)
+                     )
+                   ]
+                 else
+                   []
+                 end
+             end)
+             |> Enum.sort()
+  end
+
+  test "failed mixed Stream batches do not publish pending index state", %{
+    state: state,
+    ets: ets
+  } do
+    key = "failed-pending-stream-index"
+    cache_store = %{cache_scope: state.instance_name}
+
+    {state, "1-0"} =
+      StateMachine.apply(
+        %{},
+        {:stream_append, key, {:partial, 1}, ["field", "one"], nil, false},
+        state
+      )
+
+    {state, "2-0"} =
+      StateMachine.apply(
+        %{},
+        {:stream_append, key, {:partial, 2}, ["field", "two"], nil, false},
+        state
+      )
+
+    StreamIndex.insert_id(key, "1-0", cache_store)
+    StreamIndex.insert_id(key, "2-0", cache_store)
+    StreamIndex.mark_ready(key, cache_store)
+    on_exit(fn -> StreamIndex.clear(key, cache_store) end)
+
+    assert [{_, committed_meta, 0, _, _, _, _}] =
+             :ets.lookup(ets, CompoundKey.stream_meta_key(key))
+
+    previous_hook = Application.get_env(:ferricstore, :pending_append_hook)
+
+    Application.put_env(:ferricstore, :pending_append_hook, fn _path, _batch ->
+      {:error, :forced_mixed_stream_failure}
+    end)
+
+    try do
+      command =
+        {:batch,
+         [
+           {:stream_append, key, {:partial, 3}, ["field", "three"], nil, false},
+           {:stream_mutate, key, {:delete, ["1-0"]}}
+         ]}
+
+      assert {_new_state, {:error, {:bitcask_append_failed, :forced_mixed_stream_failure}}} =
+               StateMachine.apply(%{}, command, state)
+    after
+      if previous_hook do
+        Application.put_env(:ferricstore, :pending_append_hook, previous_hook)
+      else
+        Application.delete_env(:ferricstore, :pending_append_hook)
+      end
+    end
+
+    assert [{_, ^committed_meta, 0, _, _, _, _}] =
+             :ets.lookup(ets, CompoundKey.stream_meta_key(key))
+
+    assert [] == :ets.lookup(ets, Ferricstore.Commands.Stream.Entries.entry_key(key, "3-0"))
+    assert ["1-0", "2-0"] == StreamIndex.ids(key, :infinity, cache_store)
+  end
+
+  test "failed WAL append publishes none of a grouped multi-topic Stream batch", %{
+    state: state,
+    ets: ets
+  } do
+    keys = ["multi-publication:a", "multi-publication:b"]
+
+    commands =
+      Enum.map(0..15, fn index ->
+        key = Enum.at(keys, rem(index, length(keys)))
+        {:stream_append, key, :auto, ["value", Integer.to_string(index)], nil, false}
+      end)
+
+    previous_hook = Application.get_env(:ferricstore, :pending_append_hook)
+
+    Application.put_env(:ferricstore, :pending_append_hook, fn _path, _batch ->
+      {:error, :forced_multi_stream_append_failure}
+    end)
+
+    try do
+      assert {_new_state, {:error, {:bitcask_append_failed, :forced_multi_stream_append_failure}}} =
+               StateMachine.apply(%{}, {:batch, commands}, state)
+
+      Enum.each(keys, fn key ->
+        assert [] == :ets.lookup(ets, CompoundKey.type_key(key))
+        assert [] == :ets.lookup(ets, CompoundKey.stream_meta_key(key))
+
+        assert {:ok, []} ==
+                 Ferricstore.Store.Shard.CompoundMemberIndex.keys_for_prefix(
+                   state.compound_member_index_name,
+                   CompoundKey.stream_prefix(key)
+                 )
+      end)
+    after
+      restore_env(:pending_append_hook, previous_hook)
+    end
   end
 
   @tag :invalid_batch_shape

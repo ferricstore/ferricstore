@@ -4,6 +4,26 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Added deterministic atomic Stream append plans, same-stream and grouped
+  multi-topic `XADD_MANY`, compact native producer mode 34, post-WAL bulk
+  catalog/cache publication, and reproducible single-topic, partitioned,
+  same-shard multi-topic, and concurrent TCP benchmarks. The optimized path
+  retains Redis Stream ordering/type semantics and publishes no derived state
+  before the durable Raft projection succeeds.
+- Reduced Stream fixed costs across both write and range paths: grouped topics
+  stage their validated projections in one pending-write update; new topics
+  validate an already-observed type marker once; physical Stream keys are
+  escaped once per plan; idle legacy-index and blocking-waiter tables are
+  skipped; and range catalogs combine ordered traversal with lookup using
+  prepared physical prefixes. The mixed-topic producer now routes and groups in
+  one pass, native compact Stream producers use that same path, generated IDs
+  share the owning durable-key binary, and exact common range rows are assembled
+  directly. Paired local gates improved 64-topic staging by about 27%, reduced a
+  64-entry append plan's median by about 25%, and improved `XRANGE COUNT 10`
+  request throughput by about 80% from the initial baseline while retaining the
+  same WAL, persisted ETF, reply order, promotion fallback, and cache publication
+  contracts.
+
 ## 0.11.4 - 2026-07-28
 
 - Added the complete durable schedule recurrence contract, including canonical

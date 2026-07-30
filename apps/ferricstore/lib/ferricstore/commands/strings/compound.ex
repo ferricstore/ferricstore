@@ -143,7 +143,12 @@ defmodule Ferricstore.Commands.Strings.Compound do
   defp clear_compound_prefix(key, "stream", store) do
     with :ok <-
            Enum.reduce_while(
-             [CompoundKey.stream_prefix(key), CompoundKey.stream_group_prefix(key)],
+             [
+               CompoundKey.stream_prefix(key),
+               CompoundKey.stream_group_prefix(key),
+               CompoundKey.stream_pending_prefix(key),
+               CompoundKey.stream_consumer_prefix(key)
+             ],
              :ok,
              fn prefix, :ok ->
                case Ops.compound_delete_prefix(store, key, prefix) do

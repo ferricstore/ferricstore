@@ -221,6 +221,8 @@ defmodule Ferricstore.Store.CompoundKeyTest do
         CompoundKey.zset_member(key, <<0, "%member">>),
         CompoundKey.stream_prefix(key) <> "1-0",
         CompoundKey.stream_group(key, <<0, "%group">>),
+        CompoundKey.stream_pending(key, <<0, "%group">>, "1-0"),
+        CompoundKey.stream_consumer(key, <<0, "%group">>, <<0, "%consumer">>),
         CompoundKey.type_key(key),
         CompoundKey.list_meta_key(key),
         CompoundKey.stream_meta_key(key),
@@ -228,6 +230,16 @@ defmodule Ferricstore.Store.CompoundKeyTest do
       ]
 
       assert Enum.all?(physical_keys, &(CompoundKey.extract_redis_key(&1) == key))
+    end
+
+    test "stream read keys share the binary-safe logical-key encoding" do
+      key = <<"events%", 0, "raw">>
+
+      assert {CompoundKey.type_key(key), CompoundKey.stream_prefix(key)} ==
+               CompoundKey.stream_read_keys(key)
+
+      assert {CompoundKey.type_key(key), CompoundKey.stream_prefix(key),
+              CompoundKey.stream_meta_key(key)} == CompoundKey.stream_write_keys(key)
     end
 
     test "physical prefixes contain exactly one delimiter before the subkey" do
@@ -239,7 +251,9 @@ defmodule Ferricstore.Store.CompoundKeyTest do
             CompoundKey.set_prefix(key),
             CompoundKey.zset_prefix(key),
             CompoundKey.stream_prefix(key),
-            CompoundKey.stream_group_prefix(key)
+            CompoundKey.stream_group_prefix(key),
+            CompoundKey.stream_pending_prefix(key),
+            CompoundKey.stream_consumer_prefix(key)
           ] do
         assert [_encoded_key, ""] = :binary.split(prefix, <<0>>, [:global])
       end
@@ -269,9 +283,13 @@ defmodule Ferricstore.Store.CompoundKeyTest do
 
     test "identifies stream consumer group metadata keys" do
       group_key = CompoundKey.stream_group("events", "workers")
+      pending_key = CompoundKey.stream_pending("events", "workers", "1-0")
+      consumer_key = CompoundKey.stream_consumer("events", "workers", "consumer")
 
       assert CompoundKey.internal_key?(group_key)
-      assert ["events"] == CompoundKey.user_visible_keys(["events", group_key])
+
+      assert ["events"] ==
+               CompoundKey.user_visible_keys(["events", group_key, pending_key, consumer_key])
     end
 
     test "identifies type metadata keys" do

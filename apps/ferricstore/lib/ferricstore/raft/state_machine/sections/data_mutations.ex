@@ -1522,13 +1522,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # mutations must prove that their exact owner still holds a live lock.
       defp check_fetch_or_compute_lock(state, key, nil) do
         locks = Map.get(state, :fetch_or_compute_locks, %{})
-        expiry_context = ExpiryContext.capture()
 
         case Map.get(locks, key) do
           nil ->
             :ok
 
           {_owner_ref, expire_at_ms} ->
+            expiry_context = ExpiryContext.capture()
+
             case ExpiryContext.classify(expiry_context, expire_at_ms) do
               :live -> {:error, :key_locked}
               :expired -> :ok
@@ -1539,13 +1540,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
 
       defp check_fetch_or_compute_lock(state, key, owner_ref) do
         locks = Map.get(state, :fetch_or_compute_locks, %{})
-        expiry_context = ExpiryContext.capture()
 
         case Map.get(locks, key) do
           nil ->
             {:error, :key_not_locked}
 
           {lock_owner, expire_at_ms} ->
+            expiry_context = ExpiryContext.capture()
+
             case ExpiryContext.classify(expiry_context, expire_at_ms) do
               :live when lock_owner == owner_ref -> :ok
               :live -> {:error, :key_locked}
