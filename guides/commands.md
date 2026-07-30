@@ -97,7 +97,7 @@ it addresses only the run ID's deterministic auto-partition; explicitly
 partitioned runs require the predicate. The OSS default includes bounded
 composite collections, exact `RETURN COUNT`, cursors, statistics, index status,
 and full explain analysis. The planner, indexes, and FlowGuard primitives are
-OSS features. Enterprise consumes the same provider and may add enterprise
+OSS features. Enterprise uses the same provider and may add enterprise
 metadata scope and policy integration without changing the query contracts.
 
 ```text
