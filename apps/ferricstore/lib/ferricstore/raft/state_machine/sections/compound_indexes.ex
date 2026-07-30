@@ -285,6 +285,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       defp queue_stream_cache_cleanup({_scope, key} = cache_key) when is_binary(key) do
         pending = Process.get(:sm_pending_stream_cache_cleanups, MapSet.new())
         Process.put(:sm_pending_stream_cache_cleanups, MapSet.put(pending, cache_key))
+        mark_pending_stream_index_dirty(cache_key)
         :ok
       end
 
@@ -292,6 +293,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
            when is_binary(key) and is_tuple(update) do
         pending = Process.get(:sm_pending_stream_cache_updates, [])
         Process.put(:sm_pending_stream_cache_updates, [{cache_key, update} | pending])
+        mark_pending_stream_index_dirty(cache_key)
         :ok
       end
 
@@ -308,7 +310,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
           {cache_key, {:append_many, latest_update, member_entries}} | pending
         ])
 
+        mark_pending_stream_index_dirty(cache_key)
         :ok
+      end
+
+      defp mark_pending_stream_index_dirty(cache_key) do
+        dirty_keys = Process.get(:sm_pending_stream_index_dirty_keys, MapSet.new())
+        Process.put(:sm_pending_stream_index_dirty_keys, MapSet.put(dirty_keys, cache_key))
+      end
+
+      defp pending_stream_index_dirty?(cache_key) do
+        dirty_keys = Process.get(:sm_pending_stream_index_dirty_keys, MapSet.new())
+        MapSet.member?(dirty_keys, cache_key)
       end
 
       defp queue_stream_group_update({_scope, key} = cache_key, update)
@@ -321,6 +334,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       defp flush_pending_stream_cache_cleanups do
         cleanups = Process.put(:sm_pending_stream_cache_cleanups, MapSet.new())
         updates = Process.put(:sm_pending_stream_cache_updates, [])
+        Process.put(:sm_pending_stream_index_dirty_keys, MapSet.new())
         group_updates = Process.put(:sm_pending_stream_group_updates, [])
 
         if updates != [] or group_updates != [] do

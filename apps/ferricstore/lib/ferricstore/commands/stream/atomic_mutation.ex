@@ -4,6 +4,8 @@ defmodule Ferricstore.Commands.Stream.AtomicMutation do
   alias Ferricstore.Commands.Stream.{CacheKey, Entries, ID, Index, Meta}
   alias Ferricstore.Store.{CompoundKey, Ops, ReadResult, TypeRegistry}
 
+  @invalid_stream_id "ERR Invalid stream ID specified as stream command argument"
+
   @spec run(binary(), {:trim, term()} | {:delete, [binary()]}, map()) :: term()
   def run(key, {operation, _arg1, _arg2, _arg3} = group_operation, store)
       when operation in [:create, :read] do
@@ -63,17 +65,21 @@ defmodule Ferricstore.Commands.Stream.AtomicMutation do
     do: {:error, "ERR syntax error"}
 
   defp mutate(key, {:delete, ids}, current, store) when is_list(ids) do
-    unique_ids = Enum.uniq(ids)
-    compound_keys = Entries.delete_keys(key, unique_ids)
-    raw_values = Entries.batch_get(store, key, compound_keys)
+    if binary_ids?(ids) do
+      unique_ids = Enum.uniq(ids)
+      compound_keys = Entries.delete_keys(key, unique_ids)
+      raw_values = Entries.batch_get(store, key, compound_keys)
 
-    case ReadResult.first_failure(raw_values) do
-      nil ->
-        existing_ids = Entries.existing_ids(unique_ids, raw_values, [])
-        delete_existing(key, current, existing_ids, store)
+      case ReadResult.first_failure(raw_values) do
+        nil ->
+          existing_ids = Entries.existing_ids(unique_ids, raw_values, [])
+          delete_existing(key, current, existing_ids, store)
 
-      failure ->
-        ReadResult.command_error(failure)
+        failure ->
+          ReadResult.command_error(failure)
+      end
+    else
+      {:error, @invalid_stream_id}
     end
   end
 
@@ -98,8 +104,8 @@ defmodule Ferricstore.Commands.Stream.AtomicMutation do
     deleted = MapSet.new(delete_ids)
 
     if MapSet.member?(deleted, first) or MapSet.member?(deleted, last) do
-      with :ok <- Index.ensure(key, store) do
-        {new_first, new_last} = Index.first_last_excluding(key, deleted, store) || {"0-0", "0-0"}
+      with {:ok, bounds} <- current_first_last_excluding(key, deleted, store) do
+        {new_first, new_last} = bounds || {"0-0", "0-0"}
 
         persist_known_bounds(
           key,
@@ -132,27 +138,16 @@ defmodule Ferricstore.Commands.Stream.AtomicMutation do
        ) do
     delete_count = len - max_len
 
-    with :ok <- Index.ensure(key, store) do
-      indexed = Index.slice(key, :min, :max, delete_count + 1, false, store)
-      delete_ids = indexed |> Enum.take(delete_count) |> Enum.map(&elem(&1, 0))
-
-      first =
-        case Enum.at(indexed, delete_count) do
-          {id, _compound_key} -> id
-          nil -> "0-0"
-        end
-
+    with {:ok, delete_ids, first} <- current_maxlen_plan(key, delete_count, store) do
       retained_last = if max_len == 0, do: "0-0", else: last
       persist_known_bounds(key, current, delete_ids, max_len, first, retained_last, store)
     end
   end
 
   defp indexed_minid_trim(key, {len, _first, last, _ms, _seq} = current, min_id, store) do
-    with :ok <- Index.ensure(key, store) do
-      delete_ids = Index.ids_before(key, min_id, store)
-
-      case Index.slice(key, min_id, :max, 1, false, store) do
-        [{first, _compound_key}] ->
+    with {:ok, delete_ids, first} <- current_minid_plan(key, min_id, store) do
+      case first do
+        first when is_binary(first) ->
           persist_known_bounds(
             key,
             current,
@@ -163,11 +158,90 @@ defmodule Ferricstore.Commands.Stream.AtomicMutation do
             store
           )
 
-        [] ->
+        nil ->
           persist_known_bounds(key, current, delete_ids, 0, "0-0", "0-0", store)
       end
     end
   end
+
+  # An earlier Stream command in the same pending WAL batch is visible through
+  # the pending keydir but must not be published into the shared derived index
+  # before durability. In that uncommon dependent-command case, derive bounds
+  # from the pending-aware store snapshot. Ordinary mutations retain the hot
+  # ordered-index path.
+  defp current_first_last_excluding(key, excluded, store) do
+    case Index.pending_ids(key, store) do
+      {:ok, ids} ->
+        included = Enum.reject(ids, &MapSet.member?(excluded, &1))
+
+        case included do
+          [] -> {:ok, nil}
+          _ -> {:ok, {hd(included), List.last(included)}}
+        end
+
+      :clean ->
+        with :ok <- Index.ensure(key, store) do
+          {:ok, Index.first_last_excluding(key, excluded, store)}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp current_maxlen_plan(key, delete_count, store) do
+    case Index.pending_ids(key, store) do
+      {:ok, ids} ->
+        indexed = Enum.take(ids, delete_count + 1)
+        delete_ids = Enum.take(indexed, delete_count)
+        first = Enum.at(indexed, delete_count) || "0-0"
+        {:ok, delete_ids, first}
+
+      :clean ->
+        with :ok <- Index.ensure(key, store) do
+          indexed = Index.slice(key, :min, :max, delete_count + 1, false, store)
+          delete_ids = indexed |> Enum.take(delete_count) |> Enum.map(&elem(&1, 0))
+          first = indexed |> Enum.at(delete_count) |> indexed_id_or_zero()
+          {:ok, delete_ids, first}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp current_minid_plan(key, min_id, store) do
+    case Index.pending_ids(key, store) do
+      {:ok, ids} ->
+        {deleted, retained} =
+          Enum.split_while(ids, fn id_str -> ID.compare(ID.parse_id!(id_str), min_id) == :lt end)
+
+        {:ok, deleted, List.first(retained)}
+
+      :clean ->
+        with :ok <- Index.ensure(key, store) do
+          delete_ids = Index.ids_before(key, min_id, store)
+
+          first =
+            case Index.slice(key, min_id, :max, 1, false, store) do
+              [{id, _compound_key}] -> id
+              [] -> nil
+            end
+
+          {:ok, delete_ids, first}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp indexed_id_or_zero(nil), do: "0-0"
+  defp indexed_id_or_zero({id, _compound_key}), do: id
+
+  defp binary_ids?([]), do: true
+  defp binary_ids?([id | ids]) when is_binary(id), do: binary_ids?(ids)
+  defp binary_ids?(_invalid), do: false
 
   defp persist_known_bounds(
          key,

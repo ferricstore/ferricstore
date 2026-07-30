@@ -9,7 +9,7 @@ defmodule Ferricstore.Commands.Stream.ID do
   @type stream_id :: {integer(), integer()}
 
   @spec resolve(
-          :auto | {:explicit, integer(), integer()} | {:partial, integer()},
+          term(),
           integer(),
           integer()
         ) ::
@@ -47,6 +47,8 @@ defmodule Ferricstore.Commands.Stream.ID do
       {:error, @invalid_id}
     end
   end
+
+  def resolve(_invalid, _last_ms, _last_seq), do: {:error, @invalid_id}
 
   @doc false
   @spec resolve_auto_at(integer(), integer(), integer()) ::

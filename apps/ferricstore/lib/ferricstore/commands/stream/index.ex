@@ -32,6 +32,24 @@ defmodule Ferricstore.Commands.Stream.Index do
     end
   end
 
+  @doc false
+  @spec pending_ids(binary(), map()) :: :clean | {:ok, [binary()]} | {:error, binary()}
+  def pending_ids(
+        stream_key,
+        %{stream_index_dirty?: dirty?, stream_current_ids: current_ids} = store
+      )
+      when is_function(dirty?, 1) and is_function(current_ids, 1) do
+    if dirty?.(CacheKey.build(store, stream_key)) do
+      stream_key
+      |> current_ids.()
+      |> normalize_pending_ids()
+    else
+      :clean
+    end
+  end
+
+  def pending_ids(_stream_key, _store), do: :clean
+
   @spec mark_ready(binary()) :: true
   def mark_ready(stream_key), do: mark_ready(stream_key, nil)
 
@@ -274,6 +292,32 @@ defmodule Ferricstore.Commands.Stream.Index do
         ReadResult.command_error(failure)
     end
   end
+
+  defp normalize_pending_ids({:error, {:storage_read_failed, _reason}} = failure),
+    do: ReadResult.command_error(failure)
+
+  defp normalize_pending_ids(ids) when is_list(ids) do
+    ids
+    |> Enum.reduce_while({:ok, []}, fn id_str, {:ok, indexed_ids} ->
+      case ID.parse_full_id(id_str) do
+        {:ok, id} ->
+          {:cont, {:ok, [{id, id_str} | indexed_ids]}}
+
+        {:error, _message} ->
+          {:halt, ReadResult.command_error(ReadResult.failure(:corrupt_stream_id))}
+      end
+    end)
+    |> case do
+      {:ok, indexed_ids} ->
+        {:ok, indexed_ids |> then(&:lists.keysort(1, &1)) |> Enum.map(&elem(&1, 1))}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp normalize_pending_ids(_invalid),
+    do: ReadResult.command_error(ReadResult.failure(:invalid_pending_stream_index))
 
   defp forward_first(stream_key, :min) do
     :ets.next(@index_table, {stream_key, -1, -1})

@@ -1083,6 +1083,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
           Process.get(:sm_pending_fast_delete_batch) == true and delete_only_pending_batch?(batch) ->
             apply_fast_delete_pending_locations(state, batch, locations)
 
+          Process.get(:sm_pending_fast_put_batch) == true ->
+            apply_mixed_fast_pending_locations(
+              state,
+              file_id,
+              batch,
+              locations,
+              hot_cache_threshold(state)
+            )
+
           Process.get(:sm_pending_fast_staged_put_batch) == true and
               put_or_put_cold_pending_batch?(batch) ->
             apply_fast_staged_put_pending_locations(
@@ -1127,6 +1136,97 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
           {:put, _key, _value, _expire_at_ms} -> true
           {:put_cold, _key, _value, _expire_at_ms, _lfu} -> true
           _entry -> false
+        end)
+      end
+
+      # A generic batch may start on the invisible put-only fast path and then
+      # add a delete or another staged operation. Once durable, publish only the
+      # final mutation for each key. The ordinary mixed publisher expects every
+      # put to have an ETS :pending row, which intentionally is not true for the
+      # invisible prefix of such a batch.
+      defp apply_mixed_fast_pending_locations(state, file_id, batch, locations, hot_threshold) do
+        final_indexes = final_pending_key_indexes(batch)
+
+        {puts, put_locations, cold_puts, deletes} =
+          batch
+          |> Enum.zip(locations)
+          |> Enum.with_index()
+          |> Enum.reduce({[], [], [], []}, fn
+            {{{:put, key, value, expire_at_ms} = entry, location}, index},
+            {puts, put_locations, cold_puts, deletes} ->
+              if Map.get(final_indexes, key) == index do
+                {[entry | puts], [location | put_locations], cold_puts, deletes}
+              else
+                {puts, put_locations, cold_puts, deletes}
+              end
+
+            {{{:put_cold, key, value, expire_at_ms, lfu}, {:put, offset, value_size}}, index},
+            {puts, put_locations, cold_puts, deletes} ->
+              if Map.get(final_indexes, key) == index do
+                cold_put = {key, value, expire_at_ms, lfu, offset, value_size}
+                {puts, put_locations, [cold_put | cold_puts], deletes}
+              else
+                {puts, put_locations, cold_puts, deletes}
+              end
+
+            {{{:delete, key, prob_path}, {:delete, _offset, _record_size}}, index},
+            {puts, put_locations, cold_puts, deletes} ->
+              maybe_delete_prob_file_path(state, prob_path)
+
+              if Map.get(final_indexes, key) == index do
+                {puts, put_locations, cold_puts, [key | deletes]}
+              else
+                {puts, put_locations, cold_puts, deletes}
+              end
+          end)
+
+        apply_fast_put_pending_locations(
+          state,
+          file_id,
+          Enum.reverse(puts),
+          Enum.reverse(put_locations),
+          hot_threshold,
+          nil
+        )
+
+        Enum.each(Enum.reverse(cold_puts), fn
+          {key, value, expire_at_ms, lfu, offset, value_size} ->
+            apply_put_cold_pending_location(
+              state,
+              key,
+              value,
+              expire_at_ms,
+              lfu,
+              file_id,
+              offset,
+              value_size
+            )
+        end)
+
+        Enum.each(deletes, fn key ->
+          delete_apply_projection_cache_for_pending_original(state, key)
+          track_keydir_binary_remove(state, key)
+          :ets.delete(state.ets, key)
+          CompoundMemberIndex.delete(Map.get(state, :compound_member_index_name), key)
+          logical_key_index_delete(state, key)
+          maybe_queue_lmdb_state_delete_after_publish(state, key)
+        end)
+
+        :ok
+      end
+
+      defp final_pending_key_indexes(batch) do
+        batch
+        |> Enum.with_index()
+        |> Enum.reduce(%{}, fn
+          {{:put, key, _value, _expire_at_ms}, index}, acc ->
+            Map.put(acc, key, index)
+
+          {{:put_cold, key, _value, _expire_at_ms, _lfu}, index}, acc ->
+            Map.put(acc, key, index)
+
+          {{:delete, key, _prob_path}, index}, acc ->
+            Map.put(acc, key, index)
         end)
       end
 

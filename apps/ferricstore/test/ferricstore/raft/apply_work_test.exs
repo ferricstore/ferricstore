@@ -191,6 +191,30 @@ defmodule Ferricstore.Raft.ApplyWorkTest do
              ApplyWork.admit_stream_many(context, [["field" | :improper]])
   end
 
+  test "compact stream admission rejects invalid field-pair schemas" do
+    context =
+      ApplyContext.new(
+        batch_command_apply_budget: 16,
+        compound_member_apply_budget: 4
+      )
+
+    for fields_lists <- [
+          [["orphan"]],
+          [["field", "value", "orphan"]],
+          [[123, "value"]],
+          [["field", :value]]
+        ] do
+      assert {:error, :invalid_stream_append_many_auto} =
+               ApplyWork.admit_stream_many(context, fields_lists)
+
+      assert {:error, :invalid_stream_append_many_auto} =
+               ApplyWork.admit_command(
+                 context,
+                 {:stream_append_many_auto, "stream", fields_lists}
+               )
+    end
+  end
+
   test "fused compact stream admission honors exact common field-shape budgets" do
     one_pair = [["field", "value"]]
     two_pairs = [["field-1", "value-1", "field-2", "value-2"]]
@@ -301,7 +325,7 @@ defmodule Ferricstore.Raft.ApplyWorkTest do
              )
   end
 
-  test "fused grouped stream validation preserves generic admission accounting" do
+  test "fused grouped stream validation rejects invalid field-pair schemas" do
     groups = [
       {"stream:a", [[], ["one"], ["one", "two", "three"]], [2, 0, 1]}
     ]
@@ -309,13 +333,11 @@ defmodule Ferricstore.Raft.ApplyWorkTest do
     command = {:stream_append_grouped_auto, groups, 3}
     context = ApplyContext.new(batch_command_apply_budget: 8, compound_member_apply_budget: 3)
 
-    assert {:ok, %{command_items: 8, compound_members: 3, replies: 3} = work} =
+    assert {:error, :invalid_stream_append_grouped_auto} =
              AppendBatch.validate_groups_with_work(groups, 3)
 
-    assert {:ok, %{command_items: 8, compound_members: 3, replies: 3}} =
+    assert {:error, :invalid_stream_append_grouped_auto} =
              ApplyWork.batch_usage(context, [command])
-
-    assert :ok = ApplyWork.admit_grouped_stream_work(context, work)
   end
 
   test "wrapped expanded batches share the outer command budget" do

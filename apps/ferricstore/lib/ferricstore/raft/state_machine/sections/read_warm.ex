@@ -677,6 +677,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           compound_write_budget: state.apply_context.compound_member_apply_budget,
           max_value_size: state.apply_context.max_value_size,
           stream_range_pages: true,
+          stream_index_dirty?: &pending_stream_index_dirty?/1,
+          stream_current_ids: &sm_pending_stream_ids(state, &1),
           defer_stream_cleanup: &queue_stream_cache_cleanup/1,
           defer_stream_append: &queue_stream_cache_append/2,
           defer_stream_append_many: &queue_stream_cache_append_many/3,
@@ -812,6 +814,48 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           end
         }
       end
+
+      defp sm_pending_stream_ids(state, redis_key) do
+        prefix = CompoundKey.stream_prefix(redis_key)
+
+        data_path =
+          Ferricstore.Store.Shard.Compound.Promoted.promoted_store(state, redis_key) ||
+            state.shard_data_path
+
+        state
+        |> shard_ets_state()
+        |> Ferricstore.Store.Shard.ETS.prefix_scan_entries(prefix, data_path)
+        |> Ferricstore.Store.ReadResult.map_success(fn committed_entries ->
+          ids = MapSet.new(committed_entries, &elem(&1, 0))
+
+          Process.get(:sm_pending_values, %{})
+          |> Enum.reduce(ids, fn {compound_key, pending_value}, ids ->
+            case pending_stream_id(compound_key, prefix) do
+              nil ->
+                ids
+
+              id when pending_value == :deleted ->
+                MapSet.delete(ids, id)
+
+              id ->
+                MapSet.put(ids, id)
+            end
+          end)
+          |> MapSet.to_list()
+        end)
+      end
+
+      defp pending_stream_id(compound_key, prefix)
+           when is_binary(compound_key) and is_binary(prefix) and
+                  byte_size(compound_key) > byte_size(prefix) do
+        prefix_size = byte_size(prefix)
+
+        if binary_part(compound_key, 0, prefix_size) == prefix do
+          binary_part(compound_key, prefix_size, byte_size(compound_key) - prefix_size)
+        end
+      end
+
+      defp pending_stream_id(_compound_key, _prefix), do: nil
 
       # Compact terminal Stream commands plan before staging any write. In that
       # scope an exact hot immortal marker can be observed directly; anything

@@ -445,6 +445,9 @@ fn encode_raw_stream_rows_response_frame<'a>(
 }
 
 #[rustler::nif]
+// The wire header and precomputed row statistics are separate scalar inputs so
+// this response hot path does not allocate an intermediary BEAM tuple.
+#[allow(clippy::too_many_arguments)]
 fn encode_raw_stream_rows_response_frame_inline<'a>(
     env: Env<'a>,
     opcode: u16,
@@ -675,7 +678,7 @@ fn stream_rows_layout<'a>(rows: Term<'a>) -> Option<StreamRowsLayout> {
         }
 
         // Stream entries contain one ID followed by one or more field/value pairs.
-        if field_count < 3 || field_count % 2 == 0 {
+        if field_count < 3 || field_count & 1 == 0 {
             return None;
         }
 
@@ -735,7 +738,7 @@ fn etf_binary_list_layout(raw: &[u8]) -> Option<EtfBinaryListLayout> {
     }
 
     let count = read_u32(raw, 2);
-    if count < 2 || count % 2 != 0 {
+    if count < 2 || count & 1 != 0 {
         return None;
     }
 

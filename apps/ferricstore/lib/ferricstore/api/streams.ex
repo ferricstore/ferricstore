@@ -215,18 +215,18 @@ defmodule FerricStore.API.Streams do
 
   ## Returns
 
-    * `{:ok, entries}` where entries is a list of `{id, [field, value, ...]}` tuples.
+    * `{:ok, entries}` where each entry is `[id, field, value, ...]`.
 
   ## Examples
 
       iex> FerricStore.xrange("events:user:42", "-", "+", count: 10)
-      {:ok, [{"1711234567890-0", ["action", "login", "ip", "10.0.0.1"]}]}
+      {:ok, [["1711234567890-0", "action", "login", "ip", "10.0.0.1"]]}
 
       iex> FerricStore.xrange("activity:feed", "-", "+")
-      {:ok, [{"1711234567891-0", ["type", "comment", "body", "looks great!"]}]}
+      {:ok, [["1711234567891-0", "type", "comment", "body", "looks great!"]]}
 
   """
-  @spec xrange(key(), binary(), binary(), keyword()) :: {:ok, [tuple()]}
+  @spec xrange(key(), binary(), binary(), keyword()) :: {:ok, [[binary()]]} | {:error, binary()}
   def xrange(key, start, stop, opts \\ []) do
     store = build_stream_store(key)
     count = Keyword.get(opts, :count)
@@ -251,15 +251,16 @@ defmodule FerricStore.API.Streams do
 
   ## Returns
 
-    * `{:ok, entries}` where entries is a list of `{id, [field, value, ...]}` tuples.
+    * `{:ok, entries}` where each entry is `[id, field, value, ...]`.
 
   ## Examples
 
       iex> FerricStore.xrevrange("events:user:42", "+", "-", count: 5)
-      {:ok, [{"1711234567890-0", ["action", "login", "ip", "10.0.0.1"]}]}
+      {:ok, [["1711234567890-0", "action", "login", "ip", "10.0.0.1"]]}
 
   """
-  @spec xrevrange(key(), binary(), binary(), keyword()) :: {:ok, [tuple()]}
+  @spec xrevrange(key(), binary(), binary(), keyword()) ::
+          {:ok, [[binary()]]} | {:error, binary()}
   def xrevrange(key, stop, start, opts \\ []) do
     store = build_stream_store(key)
     count = Keyword.get(opts, :count)

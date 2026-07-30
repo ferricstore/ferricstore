@@ -2309,6 +2309,43 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         %{
           get: local_get,
           cache_scope: cache_scope,
+          stream_index_dirty?: &pending_stream_index_dirty?/1,
+          stream_current_ids: fn redis_key ->
+            ctx = ctx_for_key.(redis_key)
+            prefix = CompoundKey.stream_prefix(redis_key)
+            member_budget = transaction_compound_member_budget_remaining(anchor_state)
+            byte_budget = transaction_result_byte_budget_remaining(anchor_state)
+
+            case transaction_compound_scan(
+                   ctx,
+                   redis_key,
+                   prefix,
+                   member_budget,
+                   byte_budget,
+                   :fields
+                 ) do
+              {:ok, entries, member_work, result_bytes} ->
+                charge_transaction_compound_member_work!(member_work)
+                charge_transaction_result_bytes!(result_bytes)
+                Enum.map(entries, &elem(&1, 0))
+
+              {:error, :limit_exceeded} ->
+                throw({
+                  :transaction_store_failure,
+                  :transaction_compound_read_budget_exceeded
+                })
+
+              {:error, :byte_limit_exceeded} ->
+                throw({
+                  :transaction_store_failure,
+                  :transaction_result_byte_budget_exceeded
+                })
+
+              {:error, reason} ->
+                record_state_read_failure(reason)
+                throw({:transaction_store_failure, reason})
+            end
+          end,
           get_meta: local_get_meta,
           batch_get: fn keys -> cross_shard_routed_batch_read(keys, ctx_for_key) end,
           put: local_put,

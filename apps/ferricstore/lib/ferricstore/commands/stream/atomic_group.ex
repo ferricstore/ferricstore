@@ -5,6 +5,8 @@ defmodule Ferricstore.Commands.Stream.AtomicGroup do
   alias Ferricstore.Commands.Stream.{CacheKey, Entries, Groups, ID, Index, Meta}
   alias Ferricstore.Store.{CompoundKey, Ops, ReadResult, TypeRegistry}
 
+  @invalid_stream_id "ERR Invalid stream ID specified as stream command argument"
+
   @spec run(binary(), term(), map()) :: term()
   def run(key, {:create, group, id_str, mkstream}, store)
       when is_binary(group) and is_binary(id_str) and is_boolean(mkstream) do
@@ -18,7 +20,7 @@ defmodule Ferricstore.Commands.Stream.AtomicGroup do
   end
 
   def run(key, {:ack, group, ids}, store) when is_binary(group) and is_list(ids) do
-    ack(key, group, ids, store)
+    if binary_ids?(ids), do: ack(key, group, ids, store), else: {:error, @invalid_stream_id}
   end
 
   def run(_key, _operation, _store), do: {:error, "ERR invalid stream group operation"}
@@ -77,7 +79,13 @@ defmodule Ferricstore.Commands.Stream.AtomicGroup do
   defp group_create_meta(_key, false, false, _store), do: {:error, :stream_missing}
 
   defp group_start_id("$", {_len, _first, last, _ms, _seq}), do: {:ok, last}
-  defp group_start_id(id_str, _meta), do: {:ok, id_str}
+
+  defp group_start_id(id_str, _meta) do
+    case ID.parse_full_id(id_str) do
+      {:ok, {ms, seq}} -> {:ok, "#{ms}-#{seq}"}
+      {:error, _message} = error -> error
+    end
+  end
 
   defp maybe_add_type_marker(_key, true, entries), do: entries
 
@@ -335,4 +343,8 @@ defmodule Ferricstore.Commands.Stream.AtomicGroup do
        do: defer.(CacheKey.build(store, key))
 
   defp defer_stream_cleanup(_key, _store), do: :ok
+
+  defp binary_ids?([]), do: true
+  defp binary_ids?([id | ids]) when is_binary(id), do: binary_ids?(ids)
+  defp binary_ids?(_invalid), do: false
 end

@@ -66,6 +66,20 @@ defmodule Ferricstore.Commands.StreamAppendBatchTest do
                [{"stream:a", [["field" | :improper]], [0]}],
                1
              )
+
+    for fields <- [
+          [],
+          ["orphan"],
+          ["field", "value", "orphan"],
+          [123, "value"],
+          ["field", :value]
+        ] do
+      assert {:error, :invalid_stream_append_grouped_auto} =
+               AppendBatch.validate_groups_with_work(
+                 [{"stream:a", [fields], [0]}],
+                 1
+               )
+    end
   end
 
   test "expands groups back into original command order" do

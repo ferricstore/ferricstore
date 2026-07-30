@@ -189,7 +189,7 @@ defmodule Ferricstore.Commands.Stream.AppendBatch do
          position_limit
        )
        when is_integer(position) and position >= 0 do
-    with {:ok, field_items} <- proper_list_length(fields, 0),
+    with {:ok, field_items} <- valid_field_pair_items(fields, 0),
          {:ok, position_tracker} <-
            put_position(position_tracker, position, position_limit) do
       validate_group_items(
@@ -256,12 +256,19 @@ defmodule Ferricstore.Commands.Stream.AppendBatch do
   defp complete_position_tracker?({:map, positions}, count),
     do: map_size(positions) == count
 
-  defp proper_list_length([], count), do: {:ok, count}
-  defp proper_list_length([_field, _value], 0), do: {:ok, 2}
+  defp valid_field_pair_items([], count) when count > 0 and rem(count, 2) == 0,
+    do: {:ok, count}
 
-  defp proper_list_length([_field1, _value1, _field2, _value2], 0),
-    do: {:ok, 4}
+  defp valid_field_pair_items([field, value], 0)
+       when is_binary(field) and is_binary(value),
+       do: {:ok, 2}
 
-  defp proper_list_length([_item | rest], count), do: proper_list_length(rest, count + 1)
-  defp proper_list_length(_improper, _count), do: :error
+  defp valid_field_pair_items([field1, value1, field2, value2], 0)
+       when is_binary(field1) and is_binary(value1) and is_binary(field2) and is_binary(value2),
+       do: {:ok, 4}
+
+  defp valid_field_pair_items([item | rest], count) when is_binary(item),
+    do: valid_field_pair_items(rest, count + 1)
+
+  defp valid_field_pair_items(_invalid, _count), do: :error
 end

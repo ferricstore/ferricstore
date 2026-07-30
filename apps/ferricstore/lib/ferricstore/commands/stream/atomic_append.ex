@@ -66,8 +66,10 @@ defmodule Ferricstore.Commands.Stream.AtomicAppend do
 
   @spec run(binary(), term(), [binary()], term() | nil, boolean(), map()) :: term()
   def run(key, id_spec, fields, trim_opts, nomkstream, store) do
-    encoded_fields = Entries.encode_fields(fields)
-    run_payload(key, id_spec, {:value, encoded_fields}, trim_opts, nomkstream, store)
+    with :ok <- validate_fields(fields) do
+      encoded_fields = Entries.encode_fields(fields)
+      run_payload(key, id_spec, {:value, encoded_fields}, trim_opts, nomkstream, store)
+    end
   end
 
   @doc false
@@ -546,7 +548,7 @@ defmodule Ferricstore.Commands.Stream.AtomicAppend do
     do: {:ok, [], true, appended_first_id(current, new_id)}
 
   defp trim_plan(key, new_id, {:maxlen, approximate?, max_len}, current, store)
-       when is_integer(max_len) and max_len >= 0 do
+       when is_boolean(approximate?) and is_integer(max_len) and max_len >= 0 do
     {current_len, _first, _last, _ms, _seq} = current
     target_len = current_len + 1
     trim_at = if approximate?, do: max_len + @approximate_trim_slack, else: max_len
@@ -558,7 +560,8 @@ defmodule Ferricstore.Commands.Stream.AtomicAppend do
     end
   end
 
-  defp trim_plan(key, new_id, {:minid, _approximate?, min_id_str}, current, store) do
+  defp trim_plan(key, new_id, {:minid, approximate?, min_id_str}, current, store)
+       when is_boolean(approximate?) and is_binary(min_id_str) do
     with {:ok, min_id} <- ID.parse_full_id(min_id_str) do
       if trim_minid_noop?(current, new_id, min_id) do
         {:ok, [], true, appended_first_id(current, new_id)}
@@ -568,19 +571,22 @@ defmodule Ferricstore.Commands.Stream.AtomicAppend do
     end
   end
 
+  defp trim_plan(_key, _new_id, _invalid, _current, _store),
+    do: {:error, "ERR syntax error"}
+
   defp indexed_maxlen_trim(key, new_id, max_len, {current_len, _, _, _, _}, store) do
     delete_count = max(current_len + 1 - max_len, 0)
     delete_current_count = min(delete_count, current_len)
     retained? = delete_count <= current_len
     lookahead = if delete_current_count < current_len, do: 1, else: 0
 
-    with :ok <- Index.ensure(key, store) do
-      indexed = Index.slice(key, :min, :max, delete_current_count + lookahead, false, store)
-      current_delete_ids = indexed |> Enum.take(delete_current_count) |> indexed_ids()
+    with {:ok, indexed_ids} <-
+           current_trim_prefix(key, delete_current_count + lookahead, store) do
+      current_delete_ids = Enum.take(indexed_ids, delete_current_count)
 
       first_id =
-        case Enum.at(indexed, delete_current_count) do
-          {id, _compound_key} -> id
+        case Enum.at(indexed_ids, delete_current_count) do
+          id when is_binary(id) -> id
           nil when retained? -> new_id
           nil -> "0-0"
         end
@@ -591,19 +597,59 @@ defmodule Ferricstore.Commands.Stream.AtomicAppend do
   end
 
   defp indexed_minid_trim(key, new_id, min_id, store) do
-    with :ok <- Index.ensure(key, store) do
-      delete_ids = Index.ids_before(key, min_id, store)
+    with {:ok, delete_ids, retained_first} <- current_minid_ids(key, min_id, store) do
       retained? = ID.compare(ID.parse_id!(new_id), min_id) != :lt
 
       first_id =
-        case Index.slice(key, min_id, :max, 1, false, store) do
-          [{id, _compound_key}] -> id
-          [] when retained? -> new_id
-          [] -> "0-0"
+        case retained_first do
+          id when is_binary(id) -> id
+          nil when retained? -> new_id
+          nil -> "0-0"
         end
 
       delete_ids = if retained?, do: delete_ids, else: delete_ids ++ [new_id]
       {:ok, delete_ids, retained?, first_id}
+    end
+  end
+
+  defp current_trim_prefix(key, count, store) do
+    case Index.pending_ids(key, store) do
+      {:ok, ids} ->
+        {:ok, Enum.take(ids, count)}
+
+      :clean ->
+        with :ok <- Index.ensure(key, store) do
+          {:ok, key |> Index.slice(:min, :max, count, false, store) |> indexed_ids()}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp current_minid_ids(key, min_id, store) do
+    case Index.pending_ids(key, store) do
+      {:ok, ids} ->
+        {delete_ids, retained} =
+          Enum.split_while(ids, fn id_str -> ID.compare(ID.parse_id!(id_str), min_id) == :lt end)
+
+        {:ok, delete_ids, List.first(retained)}
+
+      :clean ->
+        with :ok <- Index.ensure(key, store) do
+          delete_ids = Index.ids_before(key, min_id, store)
+
+          first =
+            case Index.slice(key, min_id, :max, 1, false, store) do
+              [{id, _compound_key}] -> id
+              [] -> nil
+            end
+
+          {:ok, delete_ids, first}
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -756,6 +802,14 @@ defmodule Ferricstore.Commands.Stream.AtomicAppend do
     do: validate.(value)
 
   defp validate_value(_value, _store), do: :ok
+
+  defp validate_fields([field, value]) when is_binary(field) and is_binary(value), do: :ok
+
+  defp validate_fields([field, value | fields]) when is_binary(field) and is_binary(value),
+    do: validate_fields(fields)
+
+  defp validate_fields(_invalid),
+    do: {:error, "ERR wrong number of arguments for 'xadd' command"}
 
   defp validate_many_auto_internal_values(marker_present?, {_key, meta, _expiry}, store) do
     with :ok <- maybe_validate_stream_type_value(marker_present?, store) do
