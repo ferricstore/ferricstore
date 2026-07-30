@@ -738,6 +738,82 @@ For peak performance, clients should still split multi-shard independent work
 into shard-local lanes. Server-side `PIPELINE` exists for protocol completeness
 and ease-of-use, not as the highest-throughput coordinator path.
 
+### Compact Stream producer pipeline
+
+`OPTIONS.capabilities.pipeline.modes.stream_xadd_auto` advertises compact mode
+`34`. This is the high-throughput append-only Stream producer path. It preserves
+the normal `XADD key * field value [field value ...]` result and durability
+semantics while grouping the commands into one replicated batch per shard.
+
+The request uses the existing custom `PIPELINE` payload marker:
+
+```text
+0x94 | mode:u8 | count:u32 | item[count]
+mode = 34, or 0x80 | 34 for a values-only response
+
+item = key:binary32 | field_pair_count:u16 |
+       (field:binary32 | value:binary32)[field_pair_count]
+```
+
+Unlike the typed `PIPELINE` map, this compact body has no `deadline_ms` field.
+A client may still enforce its own socket/request timeout, but timing out does
+not cancel an append that the server has already admitted. SDKs whose public
+pipeline contract promises a server-side deadline must retain the typed path
+until a negotiated compact mode carries that field.
+
+`field_pair_count` must be positive. The connection-wide native item budget
+includes the outer items and every field/value component. Mode 34 always uses a
+server-assigned ID (`*`), does not trim, and does not set `NOMKSTREAM`; producers
+requiring those options use typed `COMMAND_EXEC XADD`. In particular, trimmed
+appends remain on the sequential path because each trim must observe the prior
+append's ordered Stream catalog update.
+
+Clients should route one compact request to a single shard and set the outer
+lane to `shard_id + 1`. The server also accepts multi-shard mode-34 requests and
+returns results in request order, but each shard is committed independently.
+Benchmark mode 34 in appended entries/second: a benchmark iteration is one
+outer pipeline request containing `count` entries, so batch requests/second must
+be multiplied by `count`. The values-only response bit avoids typed per-command
+response envelopes and is the preferred SDK producer shape.
+
+Ordinary SDKs also benefit when they send multiple zero-flag `COMMAND_EXEC
+XADD` frames for one lane in the same TCP burst. The server opportunistically
+coalesces a homogeneous, non-trimming burst into the same per-shard replicated
+batch while preserving one response frame per request. This is a compatibility
+optimization, not a client-visible transaction boundary: TCP segmentation may
+split a burst, so clients that require deterministic batching should use typed
+`PIPELINE` or compact mode 34.
+
+### Partitioned superstream pattern
+
+A Redis-compatible Stream key has one owning shard and one total ID order. The
+server does not silently spread one key across shards because doing so would
+change `XRANGE`, `XREAD`, and consumer-group semantics.
+
+Workloads that need Kafka- or RabbitMQ-superstream-style horizontal producer
+scale should use multiple physical Stream keys, for example
+`orders:partition:0` through `orders:partition:15`. Choose the partition from an
+application routing key, query routes with `ROUTE_BATCH`, and group mode-34
+items by shard when practical. FerricStore compacts a shard-local group that
+contains one auto-ID topic into the same `stream_append_many_auto` Raft shape as
+a dedicated producer batch. A pure mixed-topic group bypasses the generic
+coalescing queue because it is already an explicit bounded batch. A mixed-shard
+mode-34 request is committed as independent shard-local batches; it is not one
+cross-shard transaction. Do not give every partition the same Redis hash tag,
+because that deliberately pins them to one shard.
+
+Ordering and consumer groups remain per physical partition. A consumer that
+needs one global view must merge partition results explicitly; FerricStore does
+not claim a false cross-shard total order. This layout lets independent shard
+Raft/WAL groups commit concurrently while keeping the behavior of every
+physical Stream fully Redis-compatible. Benchmark the layout on the target
+topology before adopting it: a single device can make the extra Raft groups
+neutral or slower than one efficiently batched Stream, while distributed or
+CPU-bound deployments may benefit from the added shard parallelism.
+Batch size is the total request size, not the per-topic size: spreading 64 items
+over 12 shards leaves only about five items per durable shard commit, whereas a
+1,024-item request leaves about 85. Report both values when comparing systems.
+
 ## Security model
 
 Native protocol uses the same protected-mode and ACL model as the embedded

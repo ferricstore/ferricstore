@@ -2,7 +2,7 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
   @moduledoc false
 
   alias Ferricstore.ExpiryContext
-  alias Ferricstore.Store.{BlobValue, ColdRead, ReadResult}
+  alias Ferricstore.Store.{BlobValue, ColdRead, CompoundKey, ReadResult}
   alias Ferricstore.Store.Shard.CompoundMemberIndex
 
   @cold_batch_read_timeout_ms 10_000
@@ -68,7 +68,7 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
       {:ok, selected_rows} ->
         selected_rows
         |> then(&do_prefix_scan_rows(state, keydir, prefix, shard_data_path, &1))
-        |> ReadResult.map_success(&Enum.sort_by(&1, fn {field, _value} -> field end))
+        |> ReadResult.map_success(&sort_prefix_entries(&1, prefix))
 
       {:error, reason} ->
         ReadResult.failure({:compound_catalog_slice_failed, reason})
@@ -78,7 +78,7 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
         |> do_prefix_scan_entries(keydir, prefix, shard_data_path)
         |> ReadResult.map_success(fn entries ->
           entries
-          |> Enum.sort_by(fn {field, _value} -> field end)
+          |> sort_prefix_entries(prefix)
           |> Enum.slice(start, count)
         end)
     end
@@ -551,6 +551,13 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
       value -> ReadResult.failure({:invalid_cold_prefix_value, value})
     end)
   end
+
+  defp sort_prefix_entries(entries, <<"X:", _rest::binary>>) do
+    Enum.sort_by(entries, fn {field, _value} -> CompoundKey.stream_index_member(field) end)
+  end
+
+  defp sort_prefix_entries(entries, _prefix),
+    do: Enum.sort_by(entries, fn {field, _value} -> field end)
 
   defp normalize_materialized_prefix_value({:ok, _value} = result), do: result
 

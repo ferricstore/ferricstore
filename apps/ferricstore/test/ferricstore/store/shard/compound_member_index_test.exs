@@ -89,6 +89,276 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
              {:ok, []}
   end
 
+  test "indexes split stream pending and consumer namespaces", %{
+    keydir: keydir,
+    index: index
+  } do
+    stream = "events"
+    pending_key = CompoundKey.stream_pending(stream, "workers", "1-0")
+    consumer_key = CompoundKey.stream_consumer(stream, "workers", "consumer")
+    :ets.insert(keydir, {pending_key, "pending", 0, 0, 0, 0, 7})
+    :ets.insert(keydir, {consumer_key, "consumer", 0, 0, 0, 0, 8})
+    CompoundMemberIndex.put(index, pending_key)
+    CompoundMemberIndex.put(index, consumer_key)
+
+    state = %{keydir: keydir, shard_data_path: nil, compound_member_index: index}
+
+    assert {:ok, [{_member, "pending"}]} =
+             CompoundMemberIndex.scan_entries(
+               index,
+               state,
+               CompoundKey.stream_pending_prefix(stream)
+             )
+
+    assert {:ok, [{_member, "consumer"}]} =
+             CompoundMemberIndex.scan_entries(
+               index,
+               state,
+               CompoundKey.stream_consumer_prefix(stream)
+             )
+  end
+
+  test "orders stream IDs numerically without duplicating a second stream index", %{
+    keydir: keydir,
+    index: index
+  } do
+    stream = "numeric-events"
+
+    for id <- ["10-0", "2-0", "2-10", "2-2"] do
+      compound_key = CompoundKey.stream_prefix(stream) <> id
+      :ets.insert(keydir, {compound_key, id, 0, 0, 0, 0, byte_size(id)})
+      CompoundMemberIndex.put(index, compound_key)
+    end
+
+    state = %{keydir: keydir, shard_data_path: nil, compound_member_index: index}
+
+    assert {:ok, [{"2-0", _}, {"2-2", _}, {"2-10", _}, {"10-0", _}]} =
+             CompoundMemberIndex.scan_entries(index, state, CompoundKey.stream_prefix(stream))
+
+    assert {:ok, {0, ["2-10", "10-0"]}} =
+             CompoundMemberIndex.scan_page(
+               index,
+               state,
+               CompoundKey.stream_prefix(stream),
+               {:after, "2-2"},
+               2,
+               nil
+             )
+  end
+
+  test "put_many publishes ordered compound members and preserves unique counts", %{
+    keydir: keydir,
+    index: index
+  } do
+    stream = "batch-events"
+    prefix = CompoundKey.stream_prefix(stream)
+    keys = Enum.map(["10-0", "2-0", "2-1"], &(prefix <> &1))
+    [key_10_0, key_2_0, key_2_1] = keys
+
+    Enum.each(keys, fn compound_key ->
+      :ets.insert(keydir, {compound_key, compound_key, 0, 0, 0, 0, byte_size(compound_key)})
+    end)
+
+    assert :ok =
+             CompoundMemberIndex.put_many(
+               index,
+               [
+                 {key_10_0, 0},
+                 {key_2_0, 0},
+                 {key_2_1, 0},
+                 {"plain-key", 0}
+               ],
+               prefix,
+               [{10, 0, "10-0"}, {2, 0, "2-0"}, {2, 1, "2-1"}]
+             )
+
+    assert :ok = CompoundMemberIndex.put_many(index, [{key_2_0, 0}])
+
+    assert {:ok, [^key_2_0, ^key_2_1, ^key_10_0]} =
+             CompoundMemberIndex.keys_for_prefix(index, prefix)
+
+    assert CompoundMemberIndex.count_live(index, %{keydir: keydir}, prefix) == {:ok, 3}
+  end
+
+  test "committed stream append publication is idempotent and sets the exact count", %{
+    keydir: keydir,
+    index: index
+  } do
+    prefix = CompoundKey.stream_prefix("planned-events")
+    key_1 = prefix <> "1-0"
+    key_2 = prefix <> "1-1"
+    objects = [{{prefix, {1, 0}}, key_1}, {{prefix, {1, 1}}, key_2}]
+
+    for key <- [key_1, key_2] do
+      :ets.insert(keydir, {key, key, 0, 0, 0, 0, byte_size(key)})
+    end
+
+    assert :ok = CompoundMemberIndex.publish_stream_append(index, prefix, objects, 2)
+    assert :ok = CompoundMemberIndex.publish_stream_append(index, prefix, objects, 2)
+    assert {:ok, [^key_1, ^key_2]} = CompoundMemberIndex.keys_for_prefix(index, prefix)
+    assert CompoundMemberIndex.count_live(index, %{keydir: keydir}, prefix) == {:ok, 2}
+  end
+
+  test "several committed streams publish in one idempotent batch", %{
+    keydir: keydir,
+    index: index
+  } do
+    prefix_a = CompoundKey.stream_prefix("planned-events-a")
+    prefix_b = CompoundKey.stream_prefix("planned-events-b")
+    key_a = prefix_a <> "1-0"
+    key_b = prefix_b <> "2-0"
+
+    for key <- [key_a, key_b] do
+      :ets.insert(keydir, {key, key, 0, 0, 0, 0, byte_size(key)})
+    end
+
+    objects = [{{prefix_a, {1, 0}}, key_a}, {{prefix_b, {2, 0}}, key_b}]
+    counts = [{prefix_a, 1}, {prefix_b, 1}]
+
+    assert :ok = CompoundMemberIndex.publish_stream_appends(index, objects, counts)
+    assert :ok = CompoundMemberIndex.publish_stream_appends(index, objects, counts)
+    assert {:ok, [^key_a]} = CompoundMemberIndex.keys_for_prefix(index, prefix_a)
+    assert {:ok, [^key_b]} = CompoundMemberIndex.keys_for_prefix(index, prefix_b)
+    assert CompoundMemberIndex.count_live(index, %{keydir: keydir}, prefix_a) == {:ok, 1}
+    assert CompoundMemberIndex.count_live(index, %{keydir: keydir}, prefix_b) == {:ok, 1}
+  end
+
+  test "hot stream pages and slices return values in numeric order", %{
+    keydir: keydir,
+    index: index
+  } do
+    stream = "hot-events"
+    prefix = CompoundKey.stream_prefix(stream)
+
+    for {id, lfu} <- [{"10-0", 10}, {"2-0", 20}, {"2-10", 30}, {"2-2", 40}] do
+      compound_key = prefix <> id
+      value = "value-#{id}"
+      :ets.insert(keydir, {compound_key, value, 0, lfu, 0, 0, byte_size(value)})
+      CompoundMemberIndex.put(index, compound_key)
+    end
+
+    assert {:ok, {{:after, "2-2"}, [{"2-0", "value-2-0"}, {"2-2", "value-2-2"}]}} =
+             CompoundMemberIndex.hot_stream_page(index, keydir, prefix, 0, 2)
+
+    assert {:ok, {{:after, "2-10"}, [{"2-10", "value-2-10"}]}} =
+             CompoundMemberIndex.hot_stream_page(index, keydir, prefix, {:after, {2, 2}}, 1)
+
+    assert {:ok, [{"2-10", "value-2-10"}, {"10-0", "value-10-0"}]} =
+             CompoundMemberIndex.hot_stream_page_once(index, keydir, prefix, {:after, {2, 2}}, 2)
+
+    assert {:ok, [{"2-10", "value-2-10"}, {"10-0", "value-10-0"}]} =
+             CompoundMemberIndex.hot_stream_slice(index, keydir, prefix, 2, 2, 4)
+  end
+
+  test "hot stream pages do not charge stale catalog rows against count", %{
+    keydir: keydir,
+    index: index
+  } do
+    stream = "stale-events"
+    prefix = CompoundKey.stream_prefix(stream)
+    stale_key = prefix <> "1-0"
+    CompoundMemberIndex.put(index, stale_key)
+
+    for id <- ["2-0", "3-0"] do
+      compound_key = prefix <> id
+      :ets.insert(keydir, {compound_key, id, 0, 0, 0, 0, byte_size(id)})
+      CompoundMemberIndex.put(index, compound_key)
+    end
+
+    assert {:ok, {0, [{"2-0", "2-0"}, {"3-0", "3-0"}]}} =
+             CompoundMemberIndex.hot_stream_page(index, keydir, prefix, 0, 2)
+
+    assert {:ok, [{"2-0", "2-0"}, {"3-0", "3-0"}]} =
+             CompoundMemberIndex.hot_stream_page_once(index, keydir, prefix, 0, 2)
+  end
+
+  test "hot stream helpers fall back when a requested value is cold", %{
+    keydir: keydir,
+    index: index
+  } do
+    stream = "cold-events"
+    prefix = CompoundKey.stream_prefix(stream)
+    compound_key = prefix <> "1-0"
+    :ets.insert(keydir, {compound_key, nil, 0, 0, 7, 99, 5})
+    CompoundMemberIndex.put(index, compound_key)
+    assert :fallback = CompoundMemberIndex.hot_stream_page(index, keydir, prefix, 0, 1)
+    assert :fallback = CompoundMemberIndex.hot_stream_page_once(index, keydir, prefix, 0, 1)
+    assert :fallback = CompoundMemberIndex.hot_stream_slice(index, keydir, prefix, 0, 1, 1)
+  end
+
+  test "large hot stream selections preserve numeric cursors and skip stale catalog rows", %{
+    keydir: keydir,
+    index: index
+  } do
+    prefix = CompoundKey.stream_prefix("large-hot-events")
+    other_prefix = CompoundKey.stream_prefix("large-hot-events-other")
+
+    for id <- 1..140 do
+      compound_key = prefix <> "#{id}-0"
+      CompoundMemberIndex.put(index, compound_key)
+
+      if id != 50 do
+        value = "value-#{id}"
+        :ets.insert(keydir, {compound_key, value, 0, 0, 0, 0, byte_size(value)})
+      end
+
+      other_key = other_prefix <> "#{id}-0"
+      other_value = "other-#{id}"
+      :ets.insert(keydir, {other_key, other_value, 0, 0, 0, 0, byte_size(other_value)})
+      CompoundMemberIndex.put(index, other_key)
+    end
+
+    assert {:ok, first_page} =
+             CompoundMemberIndex.hot_stream_page_once(index, keydir, prefix, 0, 128)
+
+    assert length(first_page) == 128
+    assert {"1-0", "value-1"} = hd(first_page)
+    assert {"129-0", "value-129"} = List.last(first_page)
+    refute Enum.any?(first_page, &match?({"50-0", _value}, &1))
+    refute Enum.any?(first_page, fn {_id, value} -> String.starts_with?(value, "other-") end)
+
+    assert {:ok, cursor_page} =
+             CompoundMemberIndex.hot_stream_page_once(
+               index,
+               keydir,
+               prefix,
+               {:after, {10, 0}},
+               128
+             )
+
+    assert length(cursor_page) == 128
+    assert {"11-0", "value-11"} = hd(cursor_page)
+    assert {"139-0", "value-139"} = List.last(cursor_page)
+  end
+
+  test "large hot stream reverse selections return ascending slices and preserve cold fallback",
+       %{
+         keydir: keydir,
+         index: index
+       } do
+    prefix = CompoundKey.stream_prefix("large-reverse-events")
+
+    for id <- 1..140 do
+      compound_key = prefix <> "#{id}-0"
+      value = "value-#{id}"
+      :ets.insert(keydir, {compound_key, value, 0, 0, 0, 0, byte_size(value)})
+      CompoundMemberIndex.put(index, compound_key)
+    end
+
+    assert {:ok, reverse_tail} =
+             CompoundMemberIndex.hot_stream_slice(index, keydir, prefix, 12, 128, 140)
+
+    assert length(reverse_tail) == 128
+    assert {"13-0", "value-13"} = hd(reverse_tail)
+    assert {"140-0", "value-140"} = List.last(reverse_tail)
+
+    cold_key = prefix <> "140-0"
+    :ets.insert(keydir, {cold_key, nil, 0, 0, 7, 99, 5})
+
+    assert :fallback =
+             CompoundMemberIndex.hot_stream_slice(index, keydir, prefix, 12, 128, 140)
+  end
+
   test "delete_prefix streams the ordered namespace without materializing all index keys" do
     source = File.read!(@index_source)
     [_before, delete_prefix] = String.split(source, "def delete_prefix(table, prefix)", parts: 2)

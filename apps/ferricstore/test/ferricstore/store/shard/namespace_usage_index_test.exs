@@ -157,6 +157,57 @@ defmodule Ferricstore.Store.Shard.NamespaceUsageIndexTest do
              NamespaceUsageIndex.usage(ctx.usage, ctx.expiry, child, 1_000)
   end
 
+  test "put_many preserves exact compound usage and replacement accounting", ctx do
+    scope = "tenant:stream-batch"
+    stream_key = scope <> ":events"
+    type_key = CompoundKey.type_key(stream_key)
+    first_key = CompoundKey.stream_prefix(stream_key) <> "1-0"
+    second_key = CompoundKey.stream_prefix(stream_key) <> "2-0"
+
+    assert :ok =
+             NamespaceUsageIndex.rebuild_scope(
+               ctx.usage,
+               ctx.expiry,
+               ctx.keydir,
+               scope,
+               now_ms: 1_000
+             )
+
+    assert :ok =
+             NamespaceUsageIndex.put_many(
+               ctx.usage,
+               ctx.expiry,
+               [
+                 {type_key, "stream", 0},
+                 {first_key, "one", 0},
+                 {second_key, "two", 0}
+               ],
+               blob_threshold_bytes: 0
+             )
+
+    expected_bytes =
+      entry_bytes(type_key, "stream") +
+        entry_bytes(first_key, "one") +
+        entry_bytes(second_key, "two")
+
+    assert {:ok, %{keys: 1, bytes: ^expected_bytes}} =
+             NamespaceUsageIndex.usage(ctx.usage, ctx.expiry, scope, 1_000)
+
+    assert :ok =
+             NamespaceUsageIndex.put_many(
+               ctx.usage,
+               ctx.expiry,
+               [{first_key, "replacement", 0}],
+               blob_threshold_bytes: 0
+             )
+
+    replacement_bytes =
+      expected_bytes - entry_bytes(first_key, "one") + entry_bytes(first_key, "replacement")
+
+    assert {:ok, %{keys: 1, bytes: ^replacement_bytes}} =
+             NamespaceUsageIndex.usage(ctx.usage, ctx.expiry, scope, 1_000)
+  end
+
   test "expires indexed rows once and permits a later replacement", ctx do
     scope = "tenant:expiring"
     key = scope <> ":value"

@@ -13,14 +13,52 @@ defmodule Ferricstore.Commands.StreamPersistedCodecTest do
   end
 
   test "stream entries reject compressed and trailing external terms" do
-    fields = Enum.flat_map(1..200, &["field-#{&1}", :binary.copy("value", 20)])
+    common_fields = ["field", "value"]
+    assert :error = Entries.decode_fields(:erlang.term_to_binary(common_fields) <> <<0>>)
+
+    large_fields = Enum.flat_map(1..200, &["field-#{&1}", :binary.copy("value", 20)])
 
     for raw <- [
-          :erlang.term_to_binary(fields, compressed: 9),
-          :erlang.term_to_binary(fields) <> <<0>>
+          :erlang.term_to_binary(large_fields, compressed: 9),
+          :erlang.term_to_binary(large_fields) <> <<0>>
         ] do
       assert :error = Entries.decode_fields(raw)
     end
+  end
+
+  test "stream field encoder preserves the existing deterministic ETF bytes" do
+    for fields <- [
+          ["field", "value"],
+          ["field", "", <<0, 1, 2>>, :binary.copy("value", 32)]
+        ] do
+      encoded = Entries.encode_fields(fields)
+
+      assert encoded == Ferricstore.TermCodec.encode(fields)
+      assert {:ok, ^fields} = Entries.decode_fields(encoded)
+    end
+  end
+
+  test "stream field decoder remains compatible with existing ETF rows" do
+    fields = ["field", "value", "binary", <<0, 1, 2>>]
+    assert {:ok, ^fields} = Entries.decode_fields(Ferricstore.TermCodec.encode(fields))
+  end
+
+  test "stream metadata encoder preserves the existing deterministic ETF bytes" do
+    key = <<"stream%", 0, "metadata">>
+    metadata = {:stream_meta, 2, 12, "100-0", "100-11", 100, 11}
+    meta_key = CompoundKey.stream_meta_key(key)
+
+    assert {^meta_key, encoded, 0} =
+             Meta.serialized_put_entry_with_key(
+               meta_key,
+               12,
+               "100-0",
+               "100-11",
+               100,
+               11
+             )
+
+    assert encoded == Ferricstore.TermCodec.encode(metadata)
   end
 
   test "stream entries reject invalid field-value shapes" do
@@ -103,7 +141,9 @@ defmodule Ferricstore.Commands.StreamPersistedCodecTest do
       {:stream_group, 1, "not-an-id", %{}, %{}},
       {:stream_group, 1, "1-0", %{"consumer" => "not-a-timestamp"}, %{}},
       {:stream_group, 1, "1-0", %{}, %{"not-an-id" => {"consumer", 1}}},
-      {:stream_group, 1, "1-0", %{}, %{"1-0" => {:not_a_consumer, 1}}}
+      {:stream_group, 1, "1-0", %{}, %{"1-0" => {:not_a_consumer, 1}}},
+      {:stream_group, 2, "not-an-id"},
+      {:stream_group, 2, "1-0", %{}}
     ]
 
     for state <- invalid_states do
@@ -115,6 +155,33 @@ defmodule Ferricstore.Commands.StreamPersistedCodecTest do
       assert {:error, "ERR storage read failed"} ==
                Stream.handle_ast({:xack, key, "group", ["1-0"]}, store)
     end
+  end
+
+  test "split consumer-group state rejects corrupt pending records" do
+    key = "stream-split-corrupt-#{System.unique_integer([:positive])}"
+    group = "workers"
+    group_key = CompoundKey.stream_group(key, group)
+    pending_root = CompoundKey.stream_pending_prefix(key)
+    pending_key = CompoundKey.stream_pending(key, group, "1-0")
+    pending_member = CompoundKey.extract_subkey(pending_key, pending_root)
+    consumer_root = CompoundKey.stream_consumer_prefix(key)
+    group_state = Ferricstore.TermCodec.encode({:stream_group, 2, "1-0"})
+    corrupt_pending = Ferricstore.TermCodec.encode({:stream_pending, 1, :not_binary, 1})
+
+    store = %{
+      compound_get: fn
+        ^key, ^group_key -> group_state
+        ^key, ^pending_key -> corrupt_pending
+        ^key, _other -> nil
+      end,
+      compound_scan: fn
+        ^key, ^pending_root -> [{pending_member, corrupt_pending}]
+        ^key, ^consumer_root -> []
+      end
+    }
+
+    Groups.delete_group_local(store, key, group)
+    assert {:error, "ERR storage read failed"} == Groups.lookup(store, key, group)
   end
 
   test "pending growth bound covers deterministic consumer-group encoding" do

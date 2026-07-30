@@ -959,6 +959,11 @@ Adds an entry to a stream with optional trimming and NOMKSTREAM.
 
 **Status:** Supported, including NOMKSTREAM and trim options.
 
+For auto-ID producer group commit, `FerricStore.xadd_many([{key, fields}, ...])`
+returns one `{:ok, id}` or error per item in input order. It emits one Raft/WAL
+entry per touched shard. This is a FerricStore batch API rather than a Redis
+wire command, and it is not an all-or-nothing cross-shard transaction.
+
 ### XLEN / XRANGE / XREVRANGE
 
 | Command | Syntax | Return | Notes |

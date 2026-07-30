@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   @moduledoc false
 
   alias Ferricstore.ExpiryContext
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
   @separator <<0>>
@@ -9,10 +10,25 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   @count_tag :"$ferricstore_compound_member_count"
   @expiry_tag :"$ferricstore_compound_member_expiry"
   @member_expiry_tag :"$ferricstore_compound_member_expiry_lookup"
+  @stream_select_min_count 128
+  @stream_select_batch_max 4096
 
   @waraft_location_tags [:waraft_segment, :waraft_projection, :waraft_apply_projection]
 
   @type table_ref :: atom() | :ets.tid() | nil
+  @type scan_cursor ::
+          0 | {:after, binary() | {non_neg_integer(), non_neg_integer()}}
+
+  defguardp valid_scan_cursor(cursor)
+            when cursor == 0 or
+                   (is_tuple(cursor) and tuple_size(cursor) == 2 and
+                      elem(cursor, 0) == :after and
+                      (is_binary(elem(cursor, 1)) or
+                         (is_tuple(elem(cursor, 1)) and tuple_size(elem(cursor, 1)) == 2 and
+                            is_integer(elem(elem(cursor, 1), 0)) and
+                            elem(elem(cursor, 1), 0) >= 0 and
+                            is_integer(elem(elem(cursor, 1), 1)) and
+                            elem(elem(cursor, 1), 1) >= 0)))
 
   @spec table_name(atom() | binary(), non_neg_integer()) :: atom()
   def table_name(instance_name, shard_index),
@@ -108,6 +124,8 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   def supports_prefix?(<<"Z:", _rest::binary>> = prefix), do: member_prefix?(prefix)
   def supports_prefix?(<<"X:", _rest::binary>> = prefix), do: member_prefix?(prefix)
   def supports_prefix?(<<"XG:", _rest::binary>> = prefix), do: member_prefix?(prefix)
+  def supports_prefix?(<<"XP:", _rest::binary>> = prefix), do: member_prefix?(prefix)
+  def supports_prefix?(<<"XC:", _rest::binary>> = prefix), do: member_prefix?(prefix)
   def supports_prefix?(<<"XM:", _rest::binary>> = prefix), do: member_prefix?(prefix)
   def supports_prefix?(_prefix), do: false
 
@@ -132,6 +150,12 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   def put(table, <<"XG:", _rest::binary>> = compound_key, expire_at_ms),
     do: put_compound_member(table, compound_key, expire_at_ms)
 
+  def put(table, <<"XP:", _rest::binary>> = compound_key, expire_at_ms),
+    do: put_compound_member(table, compound_key, expire_at_ms)
+
+  def put(table, <<"XC:", _rest::binary>> = compound_key, expire_at_ms),
+    do: put_compound_member(table, compound_key, expire_at_ms)
+
   def put(table, <<"XM:", _rest::binary>> = compound_key, expire_at_ms),
     do: put_compound_member(table, compound_key, expire_at_ms)
 
@@ -140,11 +164,309 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
   def put(_table, _compound_key, _expire_at_ms), do: :ok
 
+  @spec put_many(table_ref(), [{binary(), non_neg_integer()}]) :: :ok
+  def put_many(nil, _entries), do: :ok
+  def put_many(_table, []), do: :ok
+
+  def put_many(table, entries) when is_list(entries) do
+    case writable_table_ref(table) do
+      :undefined ->
+        :ok
+
+      tid ->
+        {stream_groups, remaining} = partition_new_stream_members(entries)
+
+        Enum.each(stream_groups, fn {prefix, reversed_objects} ->
+          insert_new_stream_objects(tid, prefix, Enum.reverse(reversed_objects))
+        end)
+
+        remaining
+        |> Enum.reverse()
+        |> Enum.each(fn {compound_key, expire_at_ms} ->
+          put_compound_member_resolved(tid, compound_key, expire_at_ms)
+        end)
+    end
+
+    :ok
+  end
+
+  @doc false
+  @spec put_many(table_ref(), [{binary(), non_neg_integer()}], binary()) :: :ok
+  def put_many(nil, _entries, _stream_prefix), do: :ok
+  def put_many(_table, [], _stream_prefix), do: :ok
+
+  def put_many(table, entries, <<"X:", _rest::binary>> = stream_prefix)
+      when is_list(entries) do
+    case writable_table_ref(table) do
+      :undefined ->
+        :ok
+
+      tid ->
+        {stream_objects, remaining} =
+          partition_known_stream_members(entries, stream_prefix, [], [])
+
+        insert_new_stream_objects(tid, stream_prefix, Enum.reverse(stream_objects))
+
+        remaining
+        |> Enum.reverse()
+        |> Enum.each(fn {compound_key, expire_at_ms} ->
+          put_compound_member_resolved(tid, compound_key, expire_at_ms)
+        end)
+    end
+
+    :ok
+  end
+
+  def put_many(table, entries, _stream_prefix), do: put_many(table, entries)
+
+  @doc false
+  @spec put_many(
+          table_ref(),
+          [{binary(), non_neg_integer()}],
+          binary(),
+          [{non_neg_integer(), non_neg_integer(), binary()}] | nil
+        ) :: :ok
+  def put_many(nil, _entries, _stream_prefix, _parsed_ids), do: :ok
+  def put_many(_table, [], _stream_prefix, _parsed_ids), do: :ok
+
+  def put_many(
+        table,
+        entries,
+        <<"X:", _rest::binary>> = stream_prefix,
+        parsed_ids
+      )
+      when is_list(entries) and is_list(parsed_ids) do
+    case writable_table_ref(table) do
+      :undefined ->
+        :ok
+
+      tid ->
+        case partition_known_stream_members(
+               entries,
+               stream_prefix,
+               parsed_ids,
+               [],
+               []
+             ) do
+          {:ok, stream_objects, remaining} ->
+            insert_new_stream_objects(tid, stream_prefix, Enum.reverse(stream_objects))
+
+            remaining
+            |> Enum.reverse()
+            |> Enum.each(fn {compound_key, expire_at_ms} ->
+              put_compound_member_resolved(tid, compound_key, expire_at_ms)
+            end)
+
+          :fallback ->
+            put_many(tid, entries, stream_prefix)
+        end
+    end
+
+    :ok
+  end
+
+  def put_many(table, entries, stream_prefix, _parsed_ids),
+    do: put_many(table, entries, stream_prefix)
+
+  @doc """
+  Publishes the already-planned member rows for a committed Stream append.
+
+  Auto-generated Stream IDs are unique and `member_count` comes from the
+  committed metadata row, so both writes are idempotent during recovery. This
+  avoids an `insert_new` membership probe for every append while retaining an
+  exact prefix count.
+  """
+  @spec publish_stream_append(
+          table_ref(),
+          binary(),
+          [
+            {{binary(), {non_neg_integer(), non_neg_integer()}}, binary()}
+          ],
+          non_neg_integer()
+        ) :: :ok
+  def publish_stream_append(nil, _stream_prefix, _objects, _member_count), do: :ok
+
+  def publish_stream_append(
+        table,
+        <<"X:", _rest::binary>> = stream_prefix,
+        objects,
+        member_count
+      )
+      when is_list(objects) and is_integer(member_count) and member_count >= 0 do
+    case writable_table_ref(table) do
+      :undefined ->
+        :ok
+
+      tid ->
+        :ets.insert(tid, [{{@count_tag, stream_prefix}, member_count} | objects])
+    end
+
+    :ok
+  end
+
+  def publish_stream_append(_table, _stream_prefix, _objects, _member_count), do: :ok
+
+  @doc """
+  Publishes planned member rows and exact counts for several committed Streams
+  in one ETS operation.
+  """
+  @spec publish_stream_appends(
+          table_ref(),
+          [{{binary(), {non_neg_integer(), non_neg_integer()}}, binary()}],
+          [{binary(), non_neg_integer()}]
+        ) :: :ok
+  def publish_stream_appends(nil, _objects, _stream_counts), do: :ok
+
+  def publish_stream_appends(table, objects, stream_counts)
+      when is_list(objects) and is_list(stream_counts) do
+    with tid when tid != :undefined <- writable_table_ref(table),
+         {:ok, rows} <- prepend_stream_count_rows(stream_counts, objects) do
+      if rows != [], do: :ets.insert(tid, rows)
+    end
+
+    :ok
+  end
+
+  def publish_stream_appends(_table, _objects, _stream_counts), do: :ok
+
+  defp prepend_stream_count_rows([], objects), do: {:ok, objects}
+
+  defp prepend_stream_count_rows(
+         [{<<"X:", _rest::binary>> = prefix, count} | stream_counts],
+         objects
+       )
+       when is_integer(count) and count >= 0 do
+    prepend_stream_count_rows(stream_counts, [{{@count_tag, prefix}, count} | objects])
+  end
+
+  defp prepend_stream_count_rows(_invalid, _objects), do: :error
+
+  defp partition_known_stream_members([], _prefix, [], objects, remaining),
+    do: {:ok, objects, remaining}
+
+  defp partition_known_stream_members([], _prefix, _unconsumed_ids, _objects, _remaining),
+    do: :fallback
+
+  defp partition_known_stream_members(
+         [{compound_key, 0} = entry | rest],
+         prefix,
+         parsed_ids,
+         objects,
+         remaining
+       )
+       when is_binary(compound_key) do
+    prefix_size = byte_size(prefix)
+
+    if byte_size(compound_key) > prefix_size and
+         binary_part(compound_key, 0, prefix_size) == prefix do
+      member = binary_part(compound_key, prefix_size, byte_size(compound_key) - prefix_size)
+
+      case parsed_ids do
+        [{ms, seq, ^member} | remaining_ids]
+        when is_integer(ms) and ms >= 0 and is_integer(seq) and seq >= 0 ->
+          object = {{prefix, {ms, seq}}, compound_key}
+
+          partition_known_stream_members(
+            rest,
+            prefix,
+            remaining_ids,
+            [object | objects],
+            remaining
+          )
+
+        _mismatch ->
+          :fallback
+      end
+    else
+      partition_known_stream_members(rest, prefix, parsed_ids, objects, [entry | remaining])
+    end
+  end
+
+  defp partition_known_stream_members(
+         [entry | rest],
+         prefix,
+         parsed_ids,
+         objects,
+         remaining
+       ) do
+    partition_known_stream_members(rest, prefix, parsed_ids, objects, [entry | remaining])
+  end
+
+  defp partition_known_stream_members([], _prefix, objects, remaining),
+    do: {objects, remaining}
+
+  defp partition_known_stream_members(
+         [{compound_key, 0} = entry | rest],
+         prefix,
+         objects,
+         remaining
+       )
+       when is_binary(compound_key) do
+    prefix_size = byte_size(prefix)
+
+    if byte_size(compound_key) > prefix_size and
+         binary_part(compound_key, 0, prefix_size) == prefix do
+      member = binary_part(compound_key, prefix_size, byte_size(compound_key) - prefix_size)
+      object = {{prefix, index_member(prefix, member)}, compound_key}
+      partition_known_stream_members(rest, prefix, [object | objects], remaining)
+    else
+      partition_known_stream_members(rest, prefix, objects, [entry | remaining])
+    end
+  end
+
+  defp partition_known_stream_members([entry | rest], prefix, objects, remaining) do
+    partition_known_stream_members(rest, prefix, objects, [entry | remaining])
+  end
+
+  defp insert_new_stream_objects(_tid, _prefix, []), do: :ok
+
+  defp insert_new_stream_objects(tid, prefix, objects) do
+    if :ets.insert_new(tid, objects) do
+      increment_prefix_count(tid, prefix, length(objects))
+    else
+      Enum.each(objects, fn {{_prefix, _member}, compound_key} ->
+        put_compound_member_resolved(tid, compound_key, 0)
+      end)
+    end
+
+    :ok
+  end
+
+  defp partition_new_stream_members(entries) do
+    Enum.reduce(entries, {%{}, []}, fn
+      {<<"X:", _rest::binary>> = compound_key, 0} = entry, {groups, remaining} ->
+        case split_at_separator(compound_key) do
+          {:ok, prefix, member} ->
+            object = {{prefix, index_member(prefix, member)}, compound_key}
+            {Map.update(groups, prefix, [object], &[object | &1]), remaining}
+
+          :ignore ->
+            {groups, [entry | remaining]}
+        end
+
+      {compound_key, expire_at_ms} = entry, {groups, remaining}
+      when is_binary(compound_key) and is_integer(expire_at_ms) and expire_at_ms >= 0 ->
+        {groups, [entry | remaining]}
+
+      _invalid, acc ->
+        acc
+    end)
+  end
+
   defp put_compound_member(table, compound_key, expire_at_ms)
        when is_integer(expire_at_ms) and expire_at_ms >= 0 do
-    with tid when tid != :undefined <- writable_table_ref(table),
-         {:ok, prefix, member} <- split_at_separator(compound_key) do
-      index_key = {prefix, member}
+    with tid when tid != :undefined <- writable_table_ref(table) do
+      put_compound_member_resolved(tid, compound_key, expire_at_ms)
+    end
+
+    :ok
+  end
+
+  defp put_compound_member(_table, _compound_key, _expire_at_ms), do: :ok
+
+  defp put_compound_member_resolved(tid, compound_key, expire_at_ms) do
+    with {:ok, prefix, member} <- split_at_separator(compound_key) do
+      index_key = {prefix, index_member(prefix, member)}
       new_member? = :ets.insert_new(tid, {index_key, compound_key})
 
       unless new_member? do
@@ -160,8 +482,6 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
     :ok
   end
-
-  defp put_compound_member(_table, _compound_key, _expire_at_ms), do: :ok
 
   @spec delete(table_ref(), binary()) :: :ok
   def delete(nil, _compound_key), do: :ok
@@ -181,6 +501,12 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   def delete(table, <<"XG:", _rest::binary>> = compound_key),
     do: delete_compound_member(table, compound_key)
 
+  def delete(table, <<"XP:", _rest::binary>> = compound_key),
+    do: delete_compound_member(table, compound_key)
+
+  def delete(table, <<"XC:", _rest::binary>> = compound_key),
+    do: delete_compound_member(table, compound_key)
+
   def delete(table, <<"XM:", _rest::binary>> = compound_key),
     do: delete_compound_member(table, compound_key)
 
@@ -192,8 +518,10 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   defp delete_compound_member(table, compound_key) do
     with tid when tid != :undefined <- table_ref(table),
          {:ok, prefix, member} <- split_at_separator(compound_key) do
-      case :ets.take(tid, {prefix, member}) do
-        [{{^prefix, ^member}, _compound_key}] ->
+      index_member = index_member(prefix, member)
+
+      case :ets.take(tid, {prefix, index_member}) do
+        [{{^prefix, ^index_member}, _compound_key}] ->
           delete_member_expiry(tid, prefix, compound_key)
           increment_prefix_count(tid, prefix, -1)
 
@@ -473,7 +801,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
         :unavailable
 
       tid ->
-        start_key = {prefix, start_member}
+        start_key = {prefix, index_member(prefix, start_member)}
         first = first_key_at_or_after(tid, prefix, start_member)
 
         with {:ok, acc, remaining} <-
@@ -577,40 +905,133 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
     do: {:error, :invalid_row_slice}
 
   @doc false
+  @spec hot_stream_slice(
+          table_ref(),
+          atom() | reference(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) ::
+          {:ok, [{binary(), binary()}]}
+          | :fallback
+          | :unavailable
+  def hot_stream_slice(
+        table,
+        keydir,
+        <<"X:", _rest::binary>> = prefix,
+        start,
+        count,
+        total
+      )
+      when is_integer(start) and start >= 0 and is_integer(count) and count >= 0 and
+             is_integer(total) and total >= 0 do
+    case ready_table_ref(table) do
+      :undefined ->
+        :unavailable
+
+      _tid when count == 0 ->
+        {:ok, []}
+
+      tid ->
+        requested = min(count, max(total - start, 0))
+
+        if requested == 0 do
+          {:ok, []}
+        else
+          tail = max(total - start - requested, 0)
+
+          cond do
+            requested >= @stream_select_min_count and start == 0 ->
+              select_hot_stream_page_once(tid, keydir, prefix, 0, requested)
+
+            requested >= @stream_select_min_count and tail == 0 ->
+              select_hot_stream_reverse_tail(tid, keydir, prefix, requested)
+
+            start <= tail ->
+              case collect_hot_stream_slice(
+                     tid,
+                     keydir,
+                     prefix,
+                     :ets.next_lookup(tid, {prefix, {-1, -1}}),
+                     :forward,
+                     start,
+                     requested,
+                     []
+                   ) do
+                {:ok, entries} ->
+                  {:ok, Enum.reverse(entries)}
+
+                :fallback ->
+                  :fallback
+              end
+
+            true ->
+              case collect_hot_stream_slice(
+                     tid,
+                     keydir,
+                     prefix,
+                     :ets.prev_lookup(tid, {prefix <> <<0>>, <<>>}),
+                     :backward,
+                     tail,
+                     requested,
+                     []
+                   ) do
+                {:ok, entries} -> {:ok, entries}
+                :fallback -> :fallback
+              end
+          end
+        end
+    end
+  rescue
+    ArgumentError -> :unavailable
+    KeyError -> :unavailable
+  end
+
+  def hot_stream_slice(_table, _state, _prefix, _start, _count, _total), do: :fallback
+
+  @doc false
   @spec scan_page(
           table_ref(),
           map(),
           binary(),
-          0 | {:after, binary()},
+          scan_cursor(),
           pos_integer(),
           binary() | nil
         ) :: {:ok, {0 | {:after, binary()}, [binary()]}} | {:error, term()} | :unavailable
   def scan_page(table, state, prefix, cursor, count, match_pattern)
-      when is_binary(prefix) and
-             (cursor == 0 or
-                (is_tuple(cursor) and tuple_size(cursor) == 2 and elem(cursor, 0) == :after and
-                   is_binary(elem(cursor, 1)))) and is_integer(count) and count > 0 and
+      when is_binary(prefix) and valid_scan_cursor(cursor) and is_integer(count) and count > 0 and
              (is_binary(match_pattern) or is_nil(match_pattern)) do
     case ready_table_ref(table) do
       :undefined ->
         :unavailable
 
       tid ->
-        lookup_state = lookup_state(state)
-        expiry_context = ExpiryContext.capture()
         first = scan_page_start_key(tid, prefix, cursor)
 
-        case collect_scan_page(
-               tid,
-               lookup_state,
-               prefix,
-               first,
-               count,
-               match_pattern,
-               expiry_context,
-               [],
-               nil
-             ) do
+        result =
+          if stream_entry_prefix?(prefix) do
+            # Stream entries never carry per-member expiry. Their values are
+            # fetched immediately after this catalog walk, which also filters
+            # a stale row if recovery or a concurrent lifecycle operation left
+            # one behind. Avoiding a redundant keydir lookup keeps bounded
+            # XRANGE on par with the old stream-specific ETS index.
+            collect_stream_scan_page(tid, prefix, first, count, match_pattern, [], nil)
+          else
+            collect_scan_page(
+              tid,
+              lookup_state(state),
+              prefix,
+              first,
+              count,
+              match_pattern,
+              ExpiryContext.capture(),
+              [],
+              nil
+            )
+          end
+
+        case result do
           {:ok, members, last_inspected, next_key} ->
             next_cursor = scan_page_next_cursor(prefix, last_inspected, next_key)
             {:ok, {next_cursor, Enum.reverse(members)}}
@@ -626,14 +1047,213 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   def scan_page(_table, _state, _prefix, _cursor, _count, _match_pattern),
     do: {:error, :invalid_scan_page}
 
+  @doc false
+  @spec hot_stream_page(
+          table_ref(),
+          atom() | reference(),
+          binary(),
+          scan_cursor(),
+          pos_integer()
+        ) ::
+          {:ok, {0 | {:after, binary()}, [{binary(), binary()}]}}
+          | :fallback
+          | :unavailable
+  def hot_stream_page(table, keydir, <<"X:", _rest::binary>> = prefix, cursor, count)
+      when valid_scan_cursor(cursor) and is_integer(count) and count > 0 do
+    case ready_table_ref(table) do
+      :undefined ->
+        :unavailable
+
+      tid ->
+        first = stream_page_start_lookup(tid, prefix, cursor)
+
+        case collect_hot_stream_page(tid, keydir, prefix, first, count, [], nil) do
+          {:ok, entries, last_inspected, next_key} ->
+            next_cursor = scan_page_next_cursor(prefix, last_inspected, next_key)
+            {:ok, {next_cursor, Enum.reverse(entries)}}
+
+          :fallback ->
+            :fallback
+        end
+    end
+  rescue
+    ArgumentError -> :unavailable
+    KeyError -> :unavailable
+  end
+
+  def hot_stream_page(_table, _state, _prefix, _cursor, _count), do: :fallback
+
+  @doc false
+  @spec hot_stream_page_once(
+          table_ref(),
+          atom() | reference(),
+          binary(),
+          scan_cursor(),
+          pos_integer()
+        ) ::
+          {:ok, [{binary(), binary()}]}
+          | :fallback
+          | :unavailable
+  def hot_stream_page_once(table, keydir, <<"X:", _rest::binary>> = prefix, cursor, count)
+      when valid_scan_cursor(cursor) and is_integer(count) and count > 0 do
+    case ready_table_ref(table) do
+      :undefined ->
+        :unavailable
+
+      tid ->
+        if count >= @stream_select_min_count do
+          select_hot_stream_page_once(tid, keydir, prefix, cursor, count)
+        else
+          first = stream_page_start_lookup(tid, prefix, cursor)
+
+          case collect_hot_stream_page_once(tid, keydir, prefix, first, count, []) do
+            {:ok, entries} -> {:ok, Enum.reverse(entries)}
+            :fallback -> :fallback
+          end
+        end
+    end
+  rescue
+    ArgumentError -> :unavailable
+    KeyError -> :unavailable
+  end
+
+  def hot_stream_page_once(_table, _state, _prefix, _cursor, _count), do: :fallback
+
+  defp stream_page_start_lookup(tid, prefix, 0),
+    do: :ets.next_lookup(tid, {prefix, {-1, -1}})
+
+  defp stream_page_start_lookup(tid, prefix, {:after, {ms, seq}}),
+    do: :ets.next_lookup(tid, {prefix, {ms, seq}})
+
+  defp select_hot_stream_page_once(table, keydir, prefix, cursor, count) do
+    case stream_select_match_spec(prefix, cursor) do
+      :fallback ->
+        :fallback
+
+      match_spec ->
+        table
+        |> :ets.select(match_spec, min(count, @stream_select_batch_max))
+        |> collect_selected_hot_stream_rows(keydir, prefix, count, [], :input)
+    end
+  end
+
+  defp select_hot_stream_reverse_tail(table, keydir, prefix, count) do
+    result =
+      :ets.select_reverse(
+        table,
+        stream_select_match_spec(prefix, 0),
+        min(count, @stream_select_batch_max)
+      )
+
+    collect_selected_hot_stream_rows(result, keydir, prefix, count, [], :reverse_input)
+  end
+
+  defp stream_select_match_spec(prefix, 0) do
+    [{{{prefix, :"$1"}, :"$2"}, [], [:"$2"]}]
+  end
+
+  defp stream_select_match_spec(prefix, {:after, {ms, seq}}) do
+    [
+      {{{prefix, :"$1"}, :"$2"}, [{:>, :"$1", {:const, {ms, seq}}}], [:"$2"]}
+    ]
+  end
+
+  defp stream_select_match_spec(_prefix, _cursor), do: :fallback
+
+  defp collect_selected_hot_stream_rows(
+         :"$end_of_table",
+         _keydir,
+         _prefix,
+         _remaining,
+         acc,
+         output_order
+       ),
+       do: {:ok, order_selected_hot_stream_rows(acc, output_order)}
+
+  defp collect_selected_hot_stream_rows(
+         {rows, continuation},
+         keydir,
+         prefix,
+         remaining,
+         acc,
+         output_order
+       ) do
+    case collect_selected_hot_stream_batch(rows, keydir, prefix, remaining, acc) do
+      {:done, acc} ->
+        {:ok, order_selected_hot_stream_rows(acc, output_order)}
+
+      {:more, remaining, acc} ->
+        continuation
+        |> :ets.select()
+        |> collect_selected_hot_stream_rows(
+          keydir,
+          prefix,
+          remaining,
+          acc,
+          output_order
+        )
+
+      :fallback ->
+        :fallback
+    end
+  end
+
+  defp collect_selected_hot_stream_batch(_rows, _keydir, _prefix, 0, acc),
+    do: {:done, acc}
+
+  defp collect_selected_hot_stream_batch([], _keydir, _prefix, remaining, acc),
+    do: {:more, remaining, acc}
+
+  defp collect_selected_hot_stream_batch(
+         [compound_key | rows],
+         keydir,
+         prefix,
+         remaining,
+         acc
+       ) do
+    case hot_stream_value(keydir, compound_key) do
+      {:ok, value} ->
+        entry = {member_from_key(compound_key, prefix), value}
+
+        collect_selected_hot_stream_batch(
+          rows,
+          keydir,
+          prefix,
+          remaining - 1,
+          [entry | acc]
+        )
+
+      :miss ->
+        collect_selected_hot_stream_batch(rows, keydir, prefix, remaining, acc)
+
+      :fallback ->
+        :fallback
+    end
+  end
+
+  defp order_selected_hot_stream_rows(acc, :input), do: Enum.reverse(acc)
+  defp order_selected_hot_stream_rows(acc, :reverse_input), do: acc
+
   defp scan_page_start_key(tid, prefix, 0), do: first_key(tid, prefix)
-  defp scan_page_start_key(tid, prefix, {:after, member}), do: :ets.next(tid, {prefix, member})
+
+  defp scan_page_start_key(
+         tid,
+         <<"X:", _rest::binary>> = prefix,
+         {:after, {ms, seq}}
+       ),
+       do: :ets.next(tid, {prefix, {ms, seq}})
+
+  defp scan_page_start_key(tid, prefix, {:after, member}),
+    do: :ets.next(tid, {prefix, index_member(prefix, member)})
 
   defp scan_page_next_cursor(prefix, last_inspected, {prefix, _next_member})
        when is_binary(last_inspected),
        do: {:after, last_inspected}
 
   defp scan_page_next_cursor(_prefix, _last_inspected, _next_key), do: 0
+
+  defp stream_entry_prefix?(<<"X:", _rest::binary>>), do: true
+  defp stream_entry_prefix?(_prefix), do: false
 
   defp table_ref(nil), do: :undefined
   defp table_ref(table) when is_reference(table), do: table
@@ -837,6 +1457,9 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
     do_scan_keys(table, prefix, first, [])
   end
 
+  defp first_key(table, <<"X:", _rest::binary>> = prefix),
+    do: :ets.next(table, {prefix, {-1, -1}})
+
   defp first_key(table, prefix) do
     case :ets.lookup(table, {prefix, <<>>}) do
       [{{^prefix, <<>>}, _compound_key}] -> {prefix, <<>>}
@@ -845,6 +1468,8 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   end
 
   defp first_key_at_or_after(table, prefix, member) do
+    member = index_member(prefix, member)
+
     case :ets.lookup(table, {prefix, member}) do
       [{{^prefix, ^member}, _compound_key}] -> {prefix, member}
       _ -> :ets.next(table, {prefix, member})
@@ -852,6 +1477,110 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   end
 
   defp last_key(table, prefix), do: :ets.prev(table, {prefix <> <<0>>, <<>>})
+
+  defp collect_hot_stream_slice(
+         _table,
+         _keydir,
+         _prefix,
+         _next_lookup,
+         _direction,
+         _skip,
+         0,
+         entries
+       ),
+       do: {:ok, entries}
+
+  defp collect_hot_stream_slice(
+         _table,
+         _keydir,
+         _prefix,
+         :"$end_of_table",
+         _direction,
+         _skip,
+         _remaining,
+         entries
+       ),
+       do: {:ok, entries}
+
+  defp collect_hot_stream_slice(
+         table,
+         keydir,
+         prefix,
+         {{prefix, _member} = index_key, [{index_key, compound_key}]},
+         direction,
+         skip,
+         remaining,
+         entries
+       ) do
+    case hot_stream_value(keydir, compound_key) do
+      {:ok, value} ->
+        if skip > 0 do
+          next_lookup = row_slice_next_lookup(table, index_key, direction)
+
+          collect_hot_stream_slice(
+            table,
+            keydir,
+            prefix,
+            next_lookup,
+            direction,
+            skip - 1,
+            remaining,
+            entries
+          )
+        else
+          member = member_from_key(compound_key, prefix)
+
+          if remaining == 1 do
+            {:ok, [{member, value} | entries]}
+          else
+            next_lookup = row_slice_next_lookup(table, index_key, direction)
+
+            collect_hot_stream_slice(
+              table,
+              keydir,
+              prefix,
+              next_lookup,
+              direction,
+              0,
+              remaining - 1,
+              [{member, value} | entries]
+            )
+          end
+        end
+
+      :miss ->
+        next_lookup = row_slice_next_lookup(table, index_key, direction)
+
+        collect_hot_stream_slice(
+          table,
+          keydir,
+          prefix,
+          next_lookup,
+          direction,
+          skip,
+          remaining,
+          entries
+        )
+
+      :fallback ->
+        :fallback
+    end
+  end
+
+  defp collect_hot_stream_slice(
+         _table,
+         _keydir,
+         _prefix,
+         {_other_key, _objects},
+         _direction,
+         _skip,
+         _remaining,
+         entries
+       ),
+       do: {:ok, entries}
+
+  defp row_slice_next_lookup(table, key, :forward), do: :ets.next_lookup(table, key)
+  defp row_slice_next_lookup(table, key, :backward), do: :ets.prev_lookup(table, key)
 
   defp collect_row_slice(
          _table,
@@ -1001,7 +1730,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
          table,
          state,
          prefix,
-         {prefix, member} = index_key,
+         {prefix, _member} = index_key,
          remaining,
          expiry_context,
          pending_values,
@@ -1024,7 +1753,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
                 expiry_context,
                 pending_values,
                 boundary,
-                [member | acc]
+                [member_from_key(compound_key, prefix) | acc]
               )
 
             :pending_skip ->
@@ -1093,6 +1822,240 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   defp member_slice_boundary?(_index_key, :to_end), do: true
   defp member_slice_boundary?(index_key, {:before, start_key}), do: index_key < start_key
 
+  defp collect_hot_stream_page(
+         _table,
+         _keydir,
+         _prefix,
+         next_lookup,
+         0,
+         entries,
+         last_inspected
+       ),
+       do: {:ok, entries, last_inspected, lookup_key(next_lookup)}
+
+  defp collect_hot_stream_page(
+         _table,
+         _keydir,
+         _prefix,
+         :"$end_of_table",
+         _remaining,
+         entries,
+         last_inspected
+       ),
+       do: {:ok, entries, last_inspected, :"$end_of_table"}
+
+  defp collect_hot_stream_page(
+         table,
+         keydir,
+         prefix,
+         {{prefix, _member} = index_key, [{index_key, compound_key}]},
+         remaining,
+         entries,
+         _last_inspected
+       ) do
+    next_lookup = :ets.next_lookup(table, index_key)
+    external_member = member_from_key(compound_key, prefix)
+
+    case hot_stream_value(keydir, compound_key) do
+      {:ok, value} ->
+        collect_hot_stream_page(
+          table,
+          keydir,
+          prefix,
+          next_lookup,
+          remaining - 1,
+          [{external_member, value} | entries],
+          external_member
+        )
+
+      :miss ->
+        collect_hot_stream_page(
+          table,
+          keydir,
+          prefix,
+          next_lookup,
+          remaining,
+          entries,
+          external_member
+        )
+
+      :fallback ->
+        :fallback
+    end
+  end
+
+  defp collect_hot_stream_page(
+         _table,
+         _keydir,
+         _prefix,
+         {other_key, _objects},
+         _remaining,
+         entries,
+         last_inspected
+       ),
+       do: {:ok, entries, last_inspected, other_key}
+
+  defp collect_hot_stream_page_once(
+         _table,
+         _keydir,
+         _prefix,
+         _next_lookup,
+         0,
+         entries
+       ),
+       do: {:ok, entries}
+
+  defp collect_hot_stream_page_once(
+         _table,
+         _keydir,
+         _prefix,
+         :"$end_of_table",
+         _remaining,
+         entries
+       ),
+       do: {:ok, entries}
+
+  defp collect_hot_stream_page_once(
+         table,
+         keydir,
+         prefix,
+         {{prefix, _member} = index_key, [{index_key, compound_key}]},
+         remaining,
+         entries
+       ) do
+    case hot_stream_value(keydir, compound_key) do
+      {:ok, value} ->
+        external_member = member_from_key(compound_key, prefix)
+        entries = [{external_member, value} | entries]
+
+        if remaining == 1 do
+          {:ok, entries}
+        else
+          collect_hot_stream_page_once(
+            table,
+            keydir,
+            prefix,
+            :ets.next_lookup(table, index_key),
+            remaining - 1,
+            entries
+          )
+        end
+
+      :miss ->
+        collect_hot_stream_page_once(
+          table,
+          keydir,
+          prefix,
+          :ets.next_lookup(table, index_key),
+          remaining,
+          entries
+        )
+
+      :fallback ->
+        :fallback
+    end
+  end
+
+  defp collect_hot_stream_page_once(
+         _table,
+         _keydir,
+         _prefix,
+         {_other_key, _objects},
+         _remaining,
+         entries
+       ),
+       do: {:ok, entries}
+
+  # Stream entries are persisted as binary field blobs without member TTLs.
+  # Reading only the value avoids copying the seven-element keydir row for
+  # every range item; nil still identifies a cold value and preserves fallback.
+  defp hot_stream_value(keydir, compound_key) do
+    case :ets.lookup_element(keydir, compound_key, 2, :missing) do
+      :missing -> :miss
+      nil -> :fallback
+      value -> {:ok, value}
+    end
+  end
+
+  defp lookup_key(:"$end_of_table"), do: :"$end_of_table"
+  defp lookup_key({key, _objects}), do: key
+
+  defp collect_stream_scan_page(
+         _table,
+         _prefix,
+         index_key,
+         0,
+         _match_pattern,
+         acc,
+         last_inspected
+       ),
+       do: {:ok, acc, last_inspected, index_key}
+
+  defp collect_stream_scan_page(
+         _table,
+         _prefix,
+         :"$end_of_table",
+         _remaining,
+         _match_pattern,
+         acc,
+         last_inspected
+       ),
+       do: {:ok, acc, last_inspected, :"$end_of_table"}
+
+  defp collect_stream_scan_page(
+         table,
+         prefix,
+         {prefix, _member} = index_key,
+         remaining,
+         match_pattern,
+         acc,
+         last_inspected
+       ) do
+    next_key = :ets.next(table, index_key)
+
+    case :ets.lookup(table, index_key) do
+      [{^index_key, compound_key}] ->
+        external_member = member_from_key(compound_key, prefix)
+
+        acc =
+          if scan_member_matches?(external_member, match_pattern),
+            do: [external_member | acc],
+            else: acc
+
+        collect_stream_scan_page(
+          table,
+          prefix,
+          next_key,
+          remaining - 1,
+          match_pattern,
+          acc,
+          external_member
+        )
+
+      _missing ->
+        collect_stream_scan_page(
+          table,
+          prefix,
+          next_key,
+          remaining,
+          match_pattern,
+          acc,
+          last_inspected
+        )
+    end
+  end
+
+  defp collect_stream_scan_page(
+         _table,
+         _prefix,
+         other_key,
+         _remaining,
+         _match_pattern,
+         acc,
+         last_inspected
+       ),
+       do: {:ok, acc, last_inspected, other_key}
+
   defp collect_scan_page(
          _table,
          _state,
@@ -1123,22 +2086,24 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
          table,
          state,
          prefix,
-         {prefix, member} = index_key,
+         {prefix, _member} = index_key,
          remaining,
          match_pattern,
          expiry_context,
          acc,
-         _last_inspected
+         last_inspected
        ) do
     next_key = :ets.next(table, index_key)
     remaining = remaining - 1
 
     case :ets.lookup(table, index_key) do
       [{^index_key, compound_key}] ->
+        external_member = member_from_key(compound_key, prefix)
+
         case keydir_member_status(state, compound_key, expiry_context) do
           :live ->
             cond do
-              not scan_member_matches?(member, match_pattern) ->
+              not scan_member_matches?(external_member, match_pattern) ->
                 collect_scan_page(
                   table,
                   state,
@@ -1148,7 +2113,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
                   match_pattern,
                   expiry_context,
                   acc,
-                  member
+                  external_member
                 )
 
               true ->
@@ -1160,8 +2125,8 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
                   remaining,
                   match_pattern,
                   expiry_context,
-                  [member | acc],
-                  member
+                  [external_member | acc],
+                  external_member
                 )
             end
 
@@ -1177,7 +2142,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
               match_pattern,
               expiry_context,
               acc,
-              member
+              external_member
             )
 
           {:error, _reason} = error ->
@@ -1194,7 +2159,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
           match_pattern,
           expiry_context,
           acc,
-          member
+          last_inspected
         )
     end
   end
@@ -1672,6 +2637,11 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
     prefix_len = byte_size(prefix)
     binary_part(compound_key, prefix_len, byte_size(compound_key) - prefix_len)
   end
+
+  defp index_member(<<"X:", _rest::binary>>, member),
+    do: CompoundKey.stream_index_member(member)
+
+  defp index_member(_prefix, member), do: member
 
   defp lookup_state(%{keydir: _keydir} = state), do: state
   defp lookup_state(%{ets: ets} = state), do: Map.put(state, :keydir, ets)

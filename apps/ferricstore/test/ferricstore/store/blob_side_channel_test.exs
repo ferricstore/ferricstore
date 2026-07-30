@@ -97,6 +97,49 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     assert Stats.total_cold_reads(ctx) - cold_reads_before == 1
   end
 
+  test "pre-externalized stream entries apply as materializable compound blob refs", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "blob:stream:entry"
+    fields = ["payload", :binary.copy("S", 1536)]
+    encoded_fields = Ferricstore.Commands.Stream.Entries.encode_fields(fields)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+
+    state =
+      StateMachine.init(%{
+        shard_index: 0,
+        shard_data_path: shard_path,
+        active_file_id: 0,
+        active_file_path: ShardETS.file_path(shard_path, 0),
+        ets: keydir,
+        data_dir: ctx.data_dir,
+        instance_ctx: ctx,
+        instance_name: ctx.name
+      })
+
+    assert {:ok, {:stream_append_blob_ref, ^key, {:explicit, 1, 0}, encoded_ref, nil, false}} =
+             Ferricstore.Raft.BlobCommand.prepare(
+               ctx,
+               0,
+               {:stream_append, key, {:explicit, 1, 0}, fields, nil, false},
+               single_member?: true
+             )
+
+    command =
+      {:stream_append_blob_ref, key, {:explicit, 1, 0}, encoded_ref, nil, false}
+
+    assert_state_machine_result(
+      "1-0",
+      StateMachine.apply(%{index: 1}, command, state)
+    )
+
+    entry_key = Ferricstore.Commands.Stream.Entries.entry_key(key, "1-0")
+    assert {:ok, _stored_ref, ref} = raw_disk_blob_ref(ctx, keydir, entry_key)
+    assert {:ok, ^encoded_fields} = BlobStore.get(ctx.data_dir, 0, ref)
+    assert ^encoded_fields = Router.compound_get(ctx, key, entry_key)
+  end
+
   test "bounded batch GET defers ordinary cold reads until size admission", %{
     ctx: ctx,
     keydir: keydir

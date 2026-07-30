@@ -561,7 +561,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
                   wrapped_command =
                     Ferricstore.Raft.ApplyContext.wrap_command(prepared_command, apply_context)
 
-                  case ApplyWork.admit_command(apply_context, wrapped_command) do
+                  case admit_prepared_command(apply_context, command, wrapped_command) do
                     :ok ->
                       {:ok, wrapped_command, blob_protection}
 
@@ -578,6 +578,17 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
           :error ->
             {:error, :unreachable}
         end
+      end
+
+      # The original command was admitted before blob preparation. Most
+      # commands, including compact Stream batches below the blob threshold,
+      # leave preparation and context wrapping unchanged; do not traverse a
+      # potentially large command tree a second time in that case. Any
+      # transformed command retains the post-transformation admission boundary.
+      defp admit_prepared_command(_apply_context, command, command), do: :ok
+
+      defp admit_prepared_command(apply_context, _command, prepared_command) do
+        ApplyWork.admit_command(apply_context, prepared_command)
       end
 
       defp fetch_context do

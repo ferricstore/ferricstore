@@ -27,6 +27,7 @@ defmodule FerricStore.Instance do
           slot_map: tuple(),
           shard_names: tuple(),
           keydir_refs: tuple(),
+          compound_member_index_refs: tuple(),
           publication_epoch: reference(),
           replication_system: atom(),
           pressure_flags: reference(),
@@ -93,6 +94,7 @@ defmodule FerricStore.Instance do
     :slot_map,
     :shard_names,
     :keydir_refs,
+    :compound_member_index_refs,
     :publication_epoch,
     :replication_system,
     :pressure_flags,
@@ -186,6 +188,7 @@ defmodule FerricStore.Instance do
 
     # Per-shard ETS tables (anonymous — no global name pollution)
     keydir_refs = build_keydir_tables(name, shard_count)
+    compound_member_index_refs = build_compound_member_index_refs(name, shard_count)
     publication_epoch = :atomics.new(shard_count, signed: false)
 
     # Per-shard latch tables — one ETS per shard, used by local direct RMW
@@ -520,6 +523,7 @@ defmodule FerricStore.Instance do
       slot_map: slot_map,
       shard_names: shard_names,
       keydir_refs: keydir_refs,
+      compound_member_index_refs: compound_member_index_refs,
       publication_epoch: publication_epoch,
       latch_refs: latch_refs,
       replication_system: :"#{name}_replication",
@@ -713,6 +717,12 @@ defmodule FerricStore.Instance do
       # Just record the name so Router can find it.
       table_name
     end)
+    |> List.to_tuple()
+  end
+
+  defp build_compound_member_index_refs(name, shard_count) do
+    0..(shard_count - 1)
+    |> Enum.map(&Ferricstore.Store.Shard.CompoundMemberIndex.table_name(name, &1))
     |> List.to_tuple()
   end
 

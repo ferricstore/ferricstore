@@ -549,7 +549,7 @@ defmodule Ferricstore.Store.Ops.Compound do
           store(),
           binary(),
           binary(),
-          0 | {:after, binary()},
+          Ferricstore.Store.Shard.CompoundMemberIndex.scan_cursor(),
           pos_integer(),
           binary() | nil,
           boolean()

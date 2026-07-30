@@ -16,6 +16,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
   alias FerricstoreServer.Native.Codec
   alias FerricstoreServer.Native.Commands
   alias FerricstoreServer.Native.Session
+  alias FerricstoreServer.Native.StreamRangeResponse
   alias Ferricstore.AuditLog
   alias Ferricstore.Stats
   alias Ferricstore.Test.IsolatedInstance
@@ -652,6 +653,12 @@ defmodule FerricstoreServer.Native.CommandsTest do
              "pipeline_v1" => [0x000E]
            }
 
+    assert payload.pipeline == %{
+             compact_request: "pipeline_v1",
+             values_only_mode_bit: 0x80,
+             modes: %{stream_xadd_auto: 34}
+           }
+
     assert "FLOW.CREATE" in schema_names(payload)
     assert "FLOW.CLAIM_DUE" in schema_names(payload)
     assert "FLOW.COMPLETE" in schema_names(payload)
@@ -1138,6 +1145,304 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert status == :ok
     assert payload == "PONG"
+  end
+
+  test "COMMAND_EXEC XADD uses the atomic Stream append path" do
+    key = "native:stream:atomic:#{System.unique_integer([:positive, :monotonic])}"
+    native_state = state()
+    on_exit(fn -> FerricStore.del(key) end)
+
+    results =
+      1..64
+      |> Task.async_stream(
+        fn value ->
+          Commands.execute(
+            @op_command_exec,
+            %{
+              "command" => "XADD",
+              "args" => [key, "*", "field", Integer.to_string(value)]
+            },
+            native_state
+          )
+        end,
+        max_concurrency: 32,
+        ordered: false,
+        timeout: 30_000
+      )
+      |> Enum.map(fn {:ok, {:ok, id, _state}} -> id end)
+
+    assert length(results) == 64
+    assert MapSet.size(MapSet.new(results)) == 64
+
+    assert {:ok, 64, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "XLEN", "args" => [key]},
+               native_state
+             )
+  end
+
+  test "COMMAND_EXEC can defer large Stream range materialization to the native encoder" do
+    key = "native:stream:raw-range:#{System.unique_integer([:positive, :monotonic])}"
+    native_state = state()
+    on_exit(fn -> FerricStore.del(key) end)
+
+    for id <- 1..128 do
+      id = "#{id}-0"
+
+      assert id ==
+               Ferricstore.Commands.Stream.handle(
+                 "XADD",
+                 [key, id, "field", "value"],
+                 native_state.instance_ctx
+               )
+    end
+
+    payload = %{
+      "command" => "XRANGE",
+      "args" => [key, "-", "+", "COUNT", "128"]
+    }
+
+    assert {:ok, rows, _state} = Commands.execute(@op_command_exec, payload, native_state)
+    assert length(rows) == 128
+
+    direct_state = Map.put(native_state, :native_direct_stream_range_response, true)
+
+    assert {:ok, %StreamRangeResponse{} = response, _state} =
+             Commands.execute(@op_command_exec, payload, direct_state)
+
+    assert StreamRangeResponse.materialize(response) == rows
+  end
+
+  test "PIPELINE batches same-shard COMMAND_EXEC XADDs into one Raft entry" do
+    tag = System.unique_integer([:positive, :monotonic])
+    key = "native:stream:pipeline:{#{tag}}"
+    native_state = state()
+    ctx = native_state.instance_ctx
+    shard_index = Router.shard_for(ctx, key)
+    before_position = raft_position(shard_index)
+    on_exit(fn -> FerricStore.del(key) end)
+
+    commands =
+      Enum.map(1..64, fn value ->
+        %{
+          "opcode" => @op_command_exec,
+          "request_id" => value,
+          "lane_id" => shard_index + 1,
+          "body" => %{
+            "command" => "XADD",
+            "args" => [key, "*", "field", Integer.to_string(value)]
+          }
+        }
+      end)
+
+    assert {:ok, results, _state} =
+             Commands.execute(
+               @op_pipeline,
+               %{"atomicity" => "same_shard", "commands" => commands},
+               native_state
+             )
+
+    assert Enum.map(results, & &1["request_id"]) == Enum.to_list(1..64)
+    assert Enum.all?(results, &(&1["status"] == "ok"))
+
+    ids = Enum.map(results, & &1["value"])
+    assert Enum.all?(ids, &is_binary/1)
+    assert MapSet.size(MapSet.new(ids)) == 64
+    assert raft_position(shard_index) == before_position + 1
+
+    assert {:ok, 64, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "XLEN", "args" => [key]},
+               native_state
+             )
+  end
+
+  test "compact Stream producer pipeline commits one Raft entry and returns compact IDs" do
+    tag = System.unique_integer([:positive, :monotonic])
+    key = "native:stream:compact-pipeline:{#{tag}}"
+    native_state = state()
+    shard_index = Router.shard_for(native_state.instance_ctx, key)
+    before_position = raft_position(shard_index)
+    on_exit(fn -> FerricStore.del(key) end)
+
+    items = Enum.map(1..64, &{key, ["field", Integer.to_string(&1)]})
+
+    assert {:ok, <<response_tag, 64::unsigned-32, encoded_ids::binary>>, _state} =
+             Commands.execute(
+               @op_pipeline,
+               %{
+                 "atomicity" => "same_shard",
+                 "compact_count" => 64,
+                 "compact_values" => true,
+                 "return" => "compact",
+                 "compact_pipeline" => {34, items}
+               },
+               native_state
+             )
+
+    assert response_tag in [0x83, 0x89]
+    assert byte_size(encoded_ids) > 64
+    assert raft_position(shard_index) == before_position + 1
+
+    assert {:ok, 64, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "XLEN", "args" => [key]},
+               native_state
+             )
+  end
+
+  test "compact Stream producer keeps reserved-key and same-shard validation" do
+    native_state = state()
+    first = "native:stream:compact-validation:first"
+    first_shard = Router.shard_for(native_state.instance_ctx, first)
+
+    second =
+      Enum.find_value(1..1_000, fn suffix ->
+        candidate = "native:stream:compact-validation:#{suffix}"
+
+        if Router.shard_for(native_state.instance_ctx, candidate) != first_shard,
+          do: candidate
+      end)
+
+    assert is_binary(second)
+
+    assert {:bad_request, message, _state} =
+             Commands.execute(
+               @op_pipeline,
+               %{
+                 "atomicity" => "same_shard",
+                 "compact_count" => 2,
+                 "compact_values" => true,
+                 "compact_pipeline" =>
+                   {34, [{first, ["field", "one"]}, {second, ["field", "two"]}]}
+               },
+               native_state
+             )
+
+    assert message =~ "multiple shards"
+
+    assert {:ok, 0, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "XLEN", "args" => [first]},
+               native_state
+             )
+
+    assert {:bad_request, reserved_message, _state} =
+             Commands.execute(
+               @op_pipeline,
+               %{
+                 "atomicity" => "same_shard",
+                 "compact_count" => 1,
+                 "compact_values" => true,
+                 "compact_pipeline" => {34, [{"XM:reserved", ["field", "value"]}]}
+               },
+               native_state
+             )
+
+    assert reserved_message =~ "internal keys"
+  end
+
+  test "batched COMMAND_EXEC XADD preserves same-stream ordering and per-command errors" do
+    tag = System.unique_integer([:positive, :monotonic])
+    key = "native:stream:pipeline:ordered:{#{tag}}"
+    native_state = state()
+    shard_index = Router.shard_for(native_state.instance_ctx, key)
+    before_position = raft_position(shard_index)
+    on_exit(fn -> FerricStore.del(key) end)
+
+    commands =
+      ["1-0", "1-0", "2-0"]
+      |> Enum.with_index(1)
+      |> Enum.map(fn {id, request_id} ->
+        %{
+          "opcode" => @op_command_exec,
+          "request_id" => request_id,
+          "lane_id" => shard_index + 1,
+          "body" => %{
+            "command" => "XADD",
+            "args" => [key, id, "field", Integer.to_string(request_id)]
+          }
+        }
+      end)
+
+    assert {:ok, results, _state} =
+             Commands.execute(
+               @op_pipeline,
+               %{"atomicity" => "same_shard", "commands" => commands},
+               native_state
+             )
+
+    assert [
+             %{"status" => "ok", "value" => "1-0"},
+             %{"status" => "error", "value" => duplicate_error},
+             %{"status" => "ok", "value" => "2-0"}
+           ] = Enum.map(results, &Map.take(&1, ["status", "value"]))
+
+    assert duplicate_error =~ "equal or smaller"
+    assert raft_position(shard_index) == before_position + 1
+
+    assert {:ok, [["1-0", "field", "1"], ["2-0", "field", "3"]], _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "XRANGE", "args" => [key, "-", "+"]},
+               native_state
+             )
+  end
+
+  test "PIPELINE keeps exact-trim COMMAND_EXEC XADDs on the sequential correctness path" do
+    tag = System.unique_integer([:positive, :monotonic])
+    key = "native:stream:pipeline:trim:{#{tag}}"
+    native_state = state()
+    shard_index = Router.shard_for(native_state.instance_ctx, key)
+    before_position = raft_position(shard_index)
+    on_exit(fn -> FerricStore.del(key) end)
+
+    args = [
+      [key, "MAXLEN", "2", "1-0", "field", "one"],
+      [key, "MAXLEN", "2", "1-0", "field", "duplicate"],
+      [key, "MAXLEN", "2", "2-0", "field", "two"],
+      [key, "MAXLEN", "2", "3-0", "field", "three"]
+    ]
+
+    commands =
+      args
+      |> Enum.with_index(1)
+      |> Enum.map(fn {command_args, request_id} ->
+        %{
+          "opcode" => @op_command_exec,
+          "request_id" => request_id,
+          "lane_id" => 1,
+          "body" => %{"command" => "XADD", "args" => command_args}
+        }
+      end)
+
+    assert {:ok, results, _state} =
+             Commands.execute(
+               @op_pipeline,
+               %{"atomicity" => "same_shard", "commands" => commands},
+               native_state
+             )
+
+    assert [
+             %{"status" => "ok", "value" => "1-0"},
+             %{"status" => "error", "value" => duplicate_error},
+             %{"status" => "ok", "value" => "2-0"},
+             %{"status" => "ok", "value" => "3-0"}
+           ] = Enum.map(results, &Map.take(&1, ["status", "value"]))
+
+    assert duplicate_error =~ "equal or smaller"
+    assert raft_position(shard_index) == before_position + 4
+
+    assert {:ok, [["2-0", "field", "two"], ["3-0", "field", "three"]], _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "XRANGE", "args" => [key, "-", "+"]},
+               native_state
+             )
   end
 
   test "native command exceptions are logged without exposing details to clients" do

@@ -69,7 +69,9 @@ defmodule Ferricstore.Commands.Set.Destination do
       CompoundKey.set_prefix(destination),
       CompoundKey.zset_prefix(destination),
       CompoundKey.stream_prefix(destination),
-      CompoundKey.stream_group_prefix(destination)
+      CompoundKey.stream_group_prefix(destination),
+      CompoundKey.stream_pending_prefix(destination),
+      CompoundKey.stream_consumer_prefix(destination)
     ]
     |> Enum.reduce_while(:ok, fn prefix, :ok ->
       case Ops.compound_delete_prefix(store, destination, prefix) do

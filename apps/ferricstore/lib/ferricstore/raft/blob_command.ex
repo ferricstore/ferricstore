@@ -9,6 +9,7 @@ defmodule Ferricstore.Raft.BlobCommand do
   """
 
   alias Ferricstore.Raft.BlobCommand.{FlowAttrs, PayloadWriter}
+  alias Ferricstore.Commands.Stream.{AppendBatch, Entries}
   alias Ferricstore.Store.{BlobRef, BlobStore, BlobValue}
 
   @flow_blob_value_ref_tag :ferricstore_flow_blob_value_ref
@@ -24,6 +25,7 @@ defmodule Ferricstore.Raft.BlobCommand do
           | {:compound_put, binary(), binary(), non_neg_integer()}
           | {:compound_batch_put, binary(), [{binary(), binary(), non_neg_integer()}]}
           | {:put_batch, [{binary(), binary(), non_neg_integer()}]}
+          | {:stream_append, binary(), term(), [binary()], term() | nil, boolean()}
           | term()
 
   @doc """
@@ -258,6 +260,67 @@ defmodule Ferricstore.Raft.BlobCommand do
     end
   end
 
+  defp prepare_enabled(
+         %{data_dir: data_dir},
+         shard_index,
+         threshold,
+         {:stream_append, key, id_spec, fields, trim_opts, nomkstream} = command
+       )
+       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+              is_binary(key) and is_list(fields) and is_boolean(nomkstream) do
+    if stream_fields_candidate?(fields, trim_opts, threshold) do
+      encoded_fields = Entries.encode_fields(fields)
+
+      case prepare_value(data_dir, shard_index, threshold, encoded_fields) do
+        {:ok, {^encoded_fields, :value}} ->
+          {:ok, command}
+
+        {:ok, {encoded_ref, :blob_ref}} ->
+          {:ok, {:stream_append_blob_ref, key, id_spec, encoded_ref, trim_opts, nomkstream}}
+
+        {:error, _reason} = error ->
+          error
+      end
+    else
+      {:ok, command}
+    end
+  end
+
+  defp prepare_enabled(
+         ctx,
+         shard_index,
+         threshold,
+         {:stream_append_many_auto, key, fields_lists} = command
+       )
+       when is_binary(key) and is_list(fields_lists) do
+    if command_candidate?(command, threshold) do
+      commands =
+        Enum.map(fields_lists, fn fields ->
+          {:stream_append, key, :auto, fields, nil, false}
+        end)
+
+      prepare_enabled(ctx, shard_index, threshold, {:batch, commands})
+    else
+      {:ok, command}
+    end
+  end
+
+  defp prepare_enabled(
+         ctx,
+         shard_index,
+         threshold,
+         {:stream_append_grouped_auto, groups, count} = command
+       )
+       when is_list(groups) and is_integer(count) do
+    if command_candidate?(command, threshold) do
+      with {:ok, commands} <- AppendBatch.expand_groups(groups, count) do
+        prepare_enabled(ctx, shard_index, threshold, {:batch, commands})
+      end
+    else
+      {:ok, command}
+    end
+  end
+
   defp prepare_enabled(ctx, shard_index, threshold, {operation, entries})
        when operation in [:mset, :msetnx] and is_list(entries) do
     case prepare_enabled(ctx, shard_index, threshold, {:put_batch, entries}) do
@@ -417,6 +480,33 @@ defmodule Ferricstore.Raft.BlobCommand do
     Enum.any?(entries, fn
       {_key, value, _expire_at_ms} when is_binary(value) -> externalize?(value, threshold)
       _other -> false
+    end)
+  end
+
+  defp command_candidate?(
+         {:stream_append, _key, _id_spec, fields, trim_opts, _nomkstream},
+         threshold
+       )
+       when is_list(fields),
+       do: stream_fields_candidate?(fields, trim_opts, threshold)
+
+  defp command_candidate?({:stream_append_many_auto, _key, fields_lists}, threshold)
+       when is_list(fields_lists) do
+    Enum.any?(fields_lists, fn fields ->
+      is_list(fields) and stream_fields_candidate?(fields, nil, threshold)
+    end)
+  end
+
+  defp command_candidate?({:stream_append_grouped_auto, groups, _count}, threshold)
+       when is_list(groups) do
+    Enum.any?(groups, fn
+      {_key, fields_lists, _positions} when is_list(fields_lists) ->
+        Enum.any?(fields_lists, fn fields ->
+          is_list(fields) and stream_fields_candidate?(fields, nil, threshold)
+        end)
+
+      _invalid ->
+        false
     end)
   end
 
@@ -582,6 +672,24 @@ defmodule Ferricstore.Raft.BlobCommand do
           {:error, _reason} = error -> {:halt, error}
         end
 
+      {:stream_append, key, id_spec, fields, trim_opts, nomkstream} = command,
+      {:ok, acc, external_payloads}
+      when is_binary(key) and is_list(fields) and is_boolean(nomkstream) ->
+        if stream_fields_candidate?(fields, trim_opts, threshold) do
+          encoded_fields = Entries.encode_fields(fields)
+
+          if externalize?(encoded_fields, threshold) do
+            marker =
+              {:stream_append_external, key, id_spec, trim_opts, nomkstream}
+
+            {:cont, {:ok, [marker | acc], [encoded_fields | external_payloads]}}
+          else
+            {:cont, {:ok, [command | acc], external_payloads}}
+          end
+        else
+          {:cont, {:ok, [command | acc], external_payloads}}
+        end
+
       {:flow_terminal_pipeline_batch, op, key, attrs}, {:ok, acc, external_payloads}
       when is_atom(op) and is_map(attrs) ->
         case FlowAttrs.prepare_generic_flow_attrs(attrs, threshold, external_payloads) do
@@ -725,6 +833,12 @@ defmodule Ferricstore.Raft.BlobCommand do
   defp inflate_generic_batch_blob_refs(prepared, refs) do
     {result, []} =
       Enum.map_reduce(prepared, refs, fn
+        {:stream_append_external, key, id_spec, trim_opts, nomkstream}, [ref | rest] ->
+          command =
+            {:stream_append_blob_ref, key, id_spec, BlobRef.encode!(ref), trim_opts, nomkstream}
+
+          {command, rest}
+
         {:put_external, key, expire_at_ms}, [ref | rest] ->
           {{:put_blob_ref, key, BlobRef.encode!(ref), expire_at_ms}, rest}
 
@@ -834,4 +948,11 @@ defmodule Ferricstore.Raft.BlobCommand do
   defp compound_blob_side_channel_key?(<<"L:", _rest::binary>>), do: true
   defp compound_blob_side_channel_key?(<<"X:", _rest::binary>>), do: true
   defp compound_blob_side_channel_key?(_key), do: false
+
+  defp stream_fields_candidate?(_fields, {:maxlen, false, 0}, _threshold), do: false
+
+  defp stream_fields_candidate?(fields, _trim_opts, threshold)
+       when is_list(fields) and is_integer(threshold) and threshold > 0 do
+    :erlang.external_size(fields) >= threshold
+  end
 end

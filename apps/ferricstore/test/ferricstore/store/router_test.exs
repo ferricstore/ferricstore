@@ -214,11 +214,12 @@ defmodule Ferricstore.Store.RouterTest do
              "forced WARaft writes must not use the legacy forwarded Batcher when origin_node is remote"
     end
 
-    test "WARaft hot batch routing uses fixed buckets and ordered result tuples" do
+    test "WARaft hot batch routing uses fixed buckets and one ordered result merge" do
       source = Ferricstore.Test.SourceFiles.router_source()
 
       assert source =~ "new_waraft_batch_buckets(ctx.shard_count)"
-      assert source =~ "put_elem(results, index, value)"
+      assert source =~ "ordered_waraft_batch_results("
+      assert source =~ ":lists.keysort(1, &1)"
       assert source =~ "collect_waraft_hot_shard_batches("
       assert source =~ "merge_waraft_hot_batch_results("
     end

@@ -5,6 +5,7 @@ defmodule Ferricstore.Store.Router.Part05 do
   defmacro __using__(_opts) do
     quote do
       alias Ferricstore.CommandTime
+      alias Ferricstore.Commands.Stream.AppendBatch
       alias Ferricstore.ErrorReasons
       alias Ferricstore.HLC
       alias Ferricstore.HyperLogLog, as: HLL
@@ -490,10 +491,20 @@ defmodule Ferricstore.Store.Router.Part05 do
           # writes, stage disk records first and publish ETS only after append
           # succeeds.
           case direct_batch_command_shape(keyed_commands) do
-            {:put, entries} -> batch_quorum_put(ctx, entries, nil)
-            {:delete, keys} -> do_batch_quorum_delete_keys(ctx, keys, nil)
-            {:zadd_many_single, entries} -> batch_quorum_zadd_many_single(ctx, entries)
-            :generic -> batch_quorum_commands(ctx, keyed_commands)
+            {:put, entries} ->
+              batch_quorum_put(ctx, entries, nil)
+
+            {:delete, keys} ->
+              do_batch_quorum_delete_keys(ctx, keys, nil)
+
+            {:zadd_many_single, entries} ->
+              batch_quorum_zadd_many_single(ctx, entries)
+
+            {:stream_append_many_auto, key, fields_lists} ->
+              batch_quorum_stream_append_many_auto(ctx, key, fields_lists)
+
+            :generic ->
+              batch_quorum_commands(ctx, keyed_commands)
           end
         else
           Enum.map(keyed_commands, fn {key, command} ->
@@ -517,6 +528,9 @@ defmodule Ferricstore.Store.Router.Part05 do
 
       defp direct_batch_command_shape([], :zadd_many_single, acc),
         do: {:zadd_many_single, Enum.reverse(acc)}
+
+      defp direct_batch_command_shape([], {:stream_append_many_auto, key}, acc),
+        do: {:stream_append_many_auto, key, Enum.reverse(acc)}
 
       defp direct_batch_command_shape([], _mode, _acc), do: :generic
 
@@ -543,6 +557,24 @@ defmodule Ferricstore.Store.Router.Part05 do
            when mode in [:unknown, :zadd_many_single] and is_binary(key) and is_number(score) and
                   is_binary(member) do
         direct_batch_command_shape(rest, :zadd_many_single, [{key, score * 1.0, member} | acc])
+      end
+
+      defp direct_batch_command_shape(
+             [{key, {:stream_append, key, :auto, fields, nil, false}} | rest],
+             :unknown,
+             acc
+           )
+           when is_binary(key) and is_list(fields) do
+        direct_batch_command_shape(rest, {:stream_append_many_auto, key}, [fields | acc])
+      end
+
+      defp direct_batch_command_shape(
+             [{key, {:stream_append, key, :auto, fields, nil, false}} | rest],
+             {:stream_append_many_auto, key},
+             acc
+           )
+           when is_binary(key) and is_list(fields) do
+        direct_batch_command_shape(rest, {:stream_append_many_auto, key}, [fields | acc])
       end
 
       defp direct_batch_command_shape(_commands, _mode, _acc), do: :generic
@@ -584,6 +616,68 @@ defmodule Ferricstore.Store.Router.Part05 do
 
       defp batch_quorum_zadd_many_single(_ctx, []), do: []
 
+      defp batch_quorum_stream_append_many_auto(_ctx, _key, []), do: []
+
+      @doc false
+      def stream_append_many_auto(ctx, key, fields_lists)
+          when is_binary(key) and is_list(fields_lists),
+          do: batch_quorum_stream_append_many_auto(ctx, key, fields_lists)
+
+      @doc false
+      def stream_append_auto_items(ctx, [{key, fields} | rest] = items)
+          when is_binary(key) and is_list(fields) do
+        case collect_same_stream_append_fields(rest, key, [fields]) do
+          {:ok, fields_lists} -> stream_append_many_auto(ctx, key, fields_lists)
+          :mixed -> stream_append_many_auto_mixed(ctx, items)
+        end
+      end
+
+      defp collect_same_stream_append_fields([], _key, reversed_fields),
+        do: {:ok, Enum.reverse(reversed_fields)}
+
+      defp collect_same_stream_append_fields([{key, fields} | rest], key, reversed_fields)
+           when is_list(fields),
+           do: collect_same_stream_append_fields(rest, key, [fields | reversed_fields])
+
+      defp collect_same_stream_append_fields(_items, _key, _reversed_fields), do: :mixed
+
+      @doc false
+      def stream_append_many_auto_mixed(ctx, items) when is_list(items) do
+        if selected_waraft_ctx?(ctx) do
+          {prepared, count} = prepare_stream_append_many_auto_mixed(ctx, items)
+
+          ctx
+          |> submit_prepared_stream_shard_batches(prepared)
+          |> ordered_waraft_batch_results(count)
+        else
+          keyed_commands =
+            Enum.map(items, fn {key, fields} ->
+              {key, {:stream_append, key, :auto, fields, nil, false}}
+            end)
+
+          batch_quorum_commands(ctx, keyed_commands)
+        end
+      end
+
+      @doc false
+      def __prepare_stream_append_many_auto_mixed_for_test__(ctx, items),
+        do: prepare_stream_append_many_auto_mixed(ctx, items)
+
+      defp batch_quorum_stream_append_many_auto(ctx, key, fields_lists) do
+        shard_idx = shard_for(ctx, key)
+
+        {results, possible_write_count} =
+          shard_idx
+          |> Ferricstore.Raft.Backend.write({:stream_append_many_auto, key, fields_lists})
+          |> normalize_batch_write_result(length(fields_lists))
+
+        if possible_write_count > 0 do
+          bump_write_version(ctx, shard_idx, possible_write_count)
+        end
+
+        results
+      end
+
       defp batch_quorum_zadd_many_single(ctx, entries) do
         if selected_waraft_ctx?(ctx) do
           {by_shard, count} =
@@ -593,8 +687,6 @@ defmodule Ferricstore.Store.Router.Part05 do
 
               {Map.put(shards, idx, {[entry | shard_entries], [i | indices]}), i + 1}
             end)
-
-          initial_results = new_waraft_result_tuple(count)
 
           shard_batches =
             Enum.map(by_shard, fn {shard_idx, {shard_entries, indices}} ->
@@ -625,10 +717,10 @@ defmodule Ferricstore.Store.Router.Part05 do
             end
 
           shard_results
-          |> Enum.reduce(initial_results, fn {shard_idx, indices, result}, acc ->
+          |> Enum.reduce([], fn {shard_idx, indices, result}, acc ->
             merge_waraft_batch_results(ctx, shard_idx, indices, result, acc)
           end)
-          |> Tuple.to_list()
+          |> ordered_waraft_batch_results(count)
         else
           keyed_commands =
             Enum.map(entries, fn {key, score, member} ->
@@ -886,10 +978,68 @@ defmodule Ferricstore.Store.Router.Part05 do
           ctx,
           waraft_batch_groups(buckets, ctx.shard_count),
           count,
-          &Ferricstore.Raft.Backend.write_batch/2,
-          &{:batch, &1}
+          &submit_waraft_shard_batch/2
         )
       end
+
+      defp submit_waraft_shard_batch(shard_idx, commands) do
+        case stream_append_auto_batch_shape(commands) do
+          {:compact, command} ->
+            Ferricstore.Raft.Backend.write(shard_idx, command)
+
+          {:direct_batch, command} ->
+            Ferricstore.Raft.Backend.write(shard_idx, command)
+
+          :generic ->
+            Ferricstore.Raft.Backend.write_batch(shard_idx, commands)
+        end
+      end
+
+      @doc false
+      def __compact_stream_append_many_auto_command_for_test__(commands),
+        do: compact_stream_append_many_auto_command(commands)
+
+      @doc false
+      def __stream_append_auto_batch_shape_for_test__(commands),
+        do: stream_append_auto_batch_shape(commands)
+
+      defp stream_append_auto_batch_shape(commands) do
+        case compact_stream_append_many_auto_command(commands) do
+          {:ok, command} ->
+            {:compact, command}
+
+          :generic ->
+            case AppendBatch.group_commands(commands) do
+              {:ok, groups, count} ->
+                {:direct_batch, {:stream_append_grouped_auto, groups, count}}
+
+              :generic ->
+                :generic
+            end
+        end
+      end
+
+      defp compact_stream_append_many_auto_command([
+             {:stream_append, key, :auto, fields, nil, false} | rest
+           ])
+           when is_binary(key) and is_list(fields) do
+        compact_stream_append_many_auto_command(rest, key, [fields])
+      end
+
+      defp compact_stream_append_many_auto_command(_commands), do: :generic
+
+      defp compact_stream_append_many_auto_command([], key, fields_lists),
+        do: {:ok, {:stream_append_many_auto, key, Enum.reverse(fields_lists)}}
+
+      defp compact_stream_append_many_auto_command(
+             [{:stream_append, key, :auto, fields, nil, false} | rest],
+             key,
+             fields_lists
+           )
+           when is_list(fields),
+           do: compact_stream_append_many_auto_command(rest, key, [fields | fields_lists])
+
+      defp compact_stream_append_many_auto_command(_commands, _key, _fields_lists), do: :generic
 
       defp waraft_batch_put_entries(_ctx, []), do: []
 
@@ -987,7 +1137,7 @@ defmodule Ferricstore.Store.Router.Part05 do
         |> Enum.reverse()
       end
 
-      defp collect_waraft_shard_batches(ctx, groups, count, submit_fun, _command_fun) do
+      defp collect_waraft_shard_batches(ctx, groups, count, submit_fun) do
         results =
           case groups do
             [{shard_idx, items, indices}] ->
@@ -998,21 +1148,162 @@ defmodule Ferricstore.Store.Router.Part05 do
                 shard_idx,
                 indices,
                 result,
-                new_waraft_result_tuple(count)
+                []
               )
 
             _ ->
-              groups
-              |> Enum.map(fn {shard_idx, items, indices} ->
-                {shard_idx, indices, async_waraft_shard_submit(shard_idx, items, submit_fun)}
-              end)
-              |> Enum.reduce(new_waraft_result_tuple(count), fn {shard_idx, indices, task}, acc ->
-                result = await_waraft_shard_submit(task)
-                merge_waraft_batch_results(ctx, shard_idx, indices, result, acc)
-              end)
+              case prepare_stream_write_many(groups, []) do
+                {:ok, prepared} ->
+                  submit_prepared_stream_shard_batches(ctx, prepared)
+
+                :generic ->
+                  groups
+                  |> Enum.map(fn {shard_idx, items, indices} ->
+                    {shard_idx, indices, async_waraft_shard_submit(shard_idx, items, submit_fun)}
+                  end)
+                  |> Enum.reduce([], fn {shard_idx, indices, task}, acc ->
+                    result = await_waraft_shard_submit(task)
+                    merge_waraft_batch_results(ctx, shard_idx, indices, result, acc)
+                  end)
+              end
           end
 
-        Tuple.to_list(results)
+        ordered_waraft_batch_results(results, count)
+      end
+
+      defp prepare_stream_write_many([], prepared), do: {:ok, Enum.reverse(prepared)}
+
+      defp prepare_stream_write_many(
+             [{shard_idx, commands, indices} | groups],
+             prepared
+           ) do
+        case stream_append_auto_batch_shape(commands) do
+          {:compact, command} ->
+            prepare_stream_write_many(groups, [{shard_idx, indices, command} | prepared])
+
+          {:direct_batch, command} ->
+            prepare_stream_write_many(groups, [{shard_idx, indices, command} | prepared])
+
+          :generic ->
+            :generic
+        end
+      end
+
+      defp prepare_stream_append_many_auto_mixed(ctx, items) do
+        {buckets, count} =
+          Enum.reduce(items, {new_stream_append_batch_buckets(ctx.shard_count), 0}, fn
+            {key, fields}, {buckets, index} ->
+              shard_idx = shard_for(ctx, key)
+
+              {put_stream_append_batch_bucket(buckets, shard_idx, key, fields, index), index + 1}
+          end)
+
+        {stream_append_batch_groups(buckets, ctx.shard_count), count}
+      end
+
+      defp new_stream_append_batch_buckets(shard_count)
+           when is_integer(shard_count) and shard_count > 0,
+           do: :erlang.make_tuple(shard_count, {:empty, [], 0})
+
+      defp put_stream_append_batch_bucket(buckets, shard_idx, key, fields, index) do
+        case elem(buckets, shard_idx) do
+          {:empty, [], 0} ->
+            put_elem(buckets, shard_idx, {{:one, key, [fields]}, [index], 1})
+
+          {{:one, ^key, reversed_fields}, reversed_indices, local_count} ->
+            put_elem(
+              buckets,
+              shard_idx,
+              {{:one, key, [fields | reversed_fields]}, [index | reversed_indices],
+               local_count + 1}
+            )
+
+          {{:one, first_key, reversed_fields}, reversed_indices, local_count} ->
+            first_positions = :lists.seq(local_count - 1, 0, -1)
+
+            groups = %{
+              first_key => {reversed_fields, first_positions},
+              key => {[fields], [local_count]}
+            }
+
+            put_elem(
+              buckets,
+              shard_idx,
+              {{:many, groups, [key, first_key]}, [index | reversed_indices], local_count + 1}
+            )
+
+          {{:many, groups, key_order}, reversed_indices, local_count} ->
+            {groups, key_order} =
+              case Map.fetch(groups, key) do
+                {:ok, {reversed_fields, reversed_positions}} ->
+                  {Map.put(
+                     groups,
+                     key,
+                     {[fields | reversed_fields], [local_count | reversed_positions]}
+                   ), key_order}
+
+                :error ->
+                  {Map.put(groups, key, {[fields], [local_count]}), [key | key_order]}
+              end
+
+            put_elem(
+              buckets,
+              shard_idx,
+              {{:many, groups, key_order}, [index | reversed_indices], local_count + 1}
+            )
+        end
+      end
+
+      defp stream_append_batch_groups(buckets, shard_count) do
+        0..(shard_count - 1)
+        |> Enum.reduce([], fn shard_idx, prepared ->
+          case elem(buckets, shard_idx) do
+            {:empty, [], 0} ->
+              prepared
+
+            {{:one, key, reversed_fields}, reversed_indices, _local_count} ->
+              command = {:stream_append_many_auto, key, Enum.reverse(reversed_fields)}
+              [{shard_idx, Enum.reverse(reversed_indices), command} | prepared]
+
+            {{:many, groups, key_order}, reversed_indices, local_count} ->
+              grouped =
+                key_order
+                |> Enum.reverse()
+                |> Enum.map(fn key ->
+                  {reversed_fields, reversed_positions} = Map.fetch!(groups, key)
+                  {key, Enum.reverse(reversed_fields), Enum.reverse(reversed_positions)}
+                end)
+
+              command = {:stream_append_grouped_auto, grouped, local_count}
+              [{shard_idx, Enum.reverse(reversed_indices), command} | prepared]
+          end
+        end)
+        |> Enum.reverse()
+      end
+
+      defp submit_prepared_stream_shard_batches(ctx, [
+             {shard_idx, indices, command}
+           ]) do
+        merge_waraft_batch_results(
+          ctx,
+          shard_idx,
+          indices,
+          Ferricstore.Raft.Backend.write(shard_idx, command),
+          []
+        )
+      end
+
+      defp submit_prepared_stream_shard_batches(ctx, prepared) do
+        commands =
+          Enum.map(prepared, fn {shard_idx, _indices, command} ->
+            {shard_idx, command}
+          end)
+
+        prepared
+        |> zip_batch_groups_with_results(Ferricstore.Raft.Backend.write_many(commands))
+        |> Enum.reduce([], fn {{shard_idx, indices, _command}, result}, acc ->
+          merge_waraft_batch_results(ctx, shard_idx, indices, result, acc)
+        end)
       end
 
       defp async_waraft_shard_submit(shard_idx, items, submit_fun) do
@@ -1059,14 +1350,12 @@ defmodule Ferricstore.Store.Router.Part05 do
                 shard_idx,
                 indices,
                 result,
-                new_waraft_result_tuple(count)
+                []
               )
 
             _ ->
               {token_meta_pairs, results} =
-                Enum.reduce(groups, {[], new_waraft_result_tuple(count)}, fn {shard_idx, items,
-                                                                              indices},
-                                                                             {tokens, acc} ->
+                Enum.reduce(groups, {[], []}, fn {shard_idx, items, indices}, {tokens, acc} ->
                   {from, token} = ReplyAwaiter.new()
 
                   case submit_async_fun.(shard_idx, items, from) do
@@ -1093,7 +1382,7 @@ defmodule Ferricstore.Store.Router.Part05 do
               end)
           end
 
-        Tuple.to_list(results)
+        ordered_waraft_batch_results(results, count)
       end
 
       defp collect_waraft_hot_shard_batch_status(_ctx, []), do: :ok
@@ -1154,13 +1443,13 @@ defmodule Ferricstore.Store.Router.Part05 do
 
       defp merge_waraft_hot_batch_results(ctx, shard_idx, indices, {:ok, values}, acc)
            when is_list(values) do
-        case put_waraft_hot_batch_results(indices, values, acc) do
-          {:ok, results, ok_count} ->
+        case put_waraft_hot_batch_results(indices, values, []) do
+          {:ok, positioned_results, ok_count} ->
             if ok_count > 0 do
               bump_write_version(ctx, shard_idx, ok_count)
             end
 
-            results
+            [positioned_results | acc]
 
           {:error, _expected, _actual} ->
             merge_waraft_batch_results(
@@ -1237,7 +1526,7 @@ defmodule Ferricstore.Store.Router.Part05 do
       end
 
       defp put_waraft_hot_batch_results([], [], acc, ok_count, _seen),
-        do: {:ok, acc, ok_count}
+        do: {:ok, Enum.reverse(acc), ok_count}
 
       defp put_waraft_hot_batch_results([index | indices], [value | values], acc, ok_count, seen) do
         ok_count =
@@ -1250,7 +1539,7 @@ defmodule Ferricstore.Store.Router.Part05 do
         put_waraft_hot_batch_results(
           indices,
           values,
-          put_elem(acc, index, value),
+          [{index, value} | acc],
           ok_count,
           seen + 1
         )
@@ -1268,9 +1557,7 @@ defmodule Ferricstore.Store.Router.Part05 do
           bump_write_version(ctx, shard_idx, possible_write_count)
         end
 
-        indices
-        |> Enum.zip(results)
-        |> Enum.reduce(acc, fn {index, value}, results -> put_elem(results, index, value) end)
+        [Enum.zip(indices, results) | acc]
       end
 
       defp normalize_batch_write_result({:ok, values}, expected_count)
@@ -1305,6 +1592,15 @@ defmodule Ferricstore.Store.Router.Part05 do
 
       defp count_exact_batch_possible_writes([_value | _rest], 0, _possible_write_count),
         do: :mismatch
+
+      defp count_exact_batch_possible_writes(
+             [value | rest],
+             remaining,
+             possible_write_count
+           )
+           when is_binary(value) do
+        count_exact_batch_possible_writes(rest, remaining - 1, possible_write_count + 1)
+      end
 
       defp count_exact_batch_possible_writes(
              [value | rest],
@@ -1350,6 +1646,52 @@ defmodule Ferricstore.Store.Router.Part05 do
       defp same_list_length?([], []), do: true
       defp same_list_length?([_ | left], [_ | right]), do: same_list_length?(left, right)
       defp same_list_length?(_left, _right), do: false
+
+      defp ordered_waraft_batch_results(positioned_chunks, count)
+           when is_list(positioned_chunks) and is_integer(count) and count >= 0 do
+        positioned_chunks
+        |> :lists.append()
+        |> then(&:lists.keysort(1, &1))
+        |> ordered_waraft_batch_results(
+          0,
+          count,
+          ErrorReasons.write_timeout_unknown(),
+          []
+        )
+      end
+
+      defp ordered_waraft_batch_results(_positioned, count, count, _unknown, results),
+        do: Enum.reverse(results)
+
+      defp ordered_waraft_batch_results([], index, count, unknown, results) do
+        Enum.reverse(results, List.duplicate(unknown, count - index))
+      end
+
+      defp ordered_waraft_batch_results(
+             [{position, value} | positioned],
+             index,
+             count,
+             unknown,
+             results
+           )
+           when position == index do
+        ordered_waraft_batch_results(positioned, index + 1, count, unknown, [value | results])
+      end
+
+      defp ordered_waraft_batch_results(
+             [{position, _value} | positioned],
+             index,
+             count,
+             unknown,
+             results
+           )
+           when position < index do
+        ordered_waraft_batch_results(positioned, index, count, unknown, results)
+      end
+
+      defp ordered_waraft_batch_results(positioned, index, count, unknown, results) do
+        ordered_waraft_batch_results(positioned, index + 1, count, unknown, [unknown | results])
+      end
 
       defp new_waraft_result_tuple(count) when is_integer(count) and count >= 0 do
         :erlang.make_tuple(count, ErrorReasons.write_timeout_unknown())

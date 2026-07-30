@@ -192,6 +192,52 @@ defmodule Ferricstore.Store.Shard.NamespaceUsageIndex do
   def put(_usage, _expiry, storage_key, _value, expire_at_ms, _opts),
     do: {:error, {:invalid_namespace_usage_entry, storage_key, expire_at_ms}}
 
+  @spec put_many(
+          table_ref(),
+          table_ref(),
+          [{binary(), term(), non_neg_integer()}],
+          keyword()
+        ) :: :ok | {:error, term()}
+  def put_many(_usage, _expiry, [], opts) when is_list(opts), do: :ok
+
+  def put_many(usage, expiry, entries, opts) when is_list(entries) and is_list(opts) do
+    with {:ok, usage} <- fetch_table(usage),
+         {:ok, expiry} <- fetch_table(expiry) do
+      if active_tid?(usage) do
+        with {:ok, prepared} <- prepare_put_many(entries, opts) do
+          with_write_lock(usage, fn ->
+            Enum.each(prepared, fn {storage_key, value, expire_at_ms, logical_key, bytes} ->
+              flow_scope = NamespaceUsageFlowAccounting.scope_for_put(usage, storage_key, value)
+              remove_entry_unlocked(usage, expiry, storage_key)
+
+              add_entry_unlocked(
+                usage,
+                expiry,
+                storage_key,
+                logical_key,
+                bytes,
+                expire_at_ms,
+                flow_scope
+              )
+            end)
+
+            :ok
+          end)
+        end
+      else
+        :ok
+      end
+    else
+      :missing -> :ok
+      {:error, _reason} = error -> error
+    end
+  rescue
+    ArgumentError -> {:error, :namespace_usage_index_unavailable}
+  end
+
+  def put_many(_usage, _expiry, entries, opts),
+    do: {:error, {:invalid_namespace_usage_batch, entries, opts}}
+
   @spec put_exact_bytes(
           table_ref(),
           table_ref(),
@@ -729,6 +775,30 @@ defmodule Ferricstore.Store.Shard.NamespaceUsageIndex do
     if CompoundKey.internal_key?(storage_key),
       do: CompoundKey.encoded_redis_key_size(logical_key),
       else: byte_size(logical_key)
+  end
+
+  defp prepare_put_many(entries, opts) do
+    entries
+    |> Enum.reduce_while({:ok, []}, fn
+      {storage_key, value, expire_at_ms}, {:ok, prepared}
+      when is_binary(storage_key) and is_integer(expire_at_ms) and expire_at_ms >= 0 ->
+        case entry_bytes(storage_key, value, opts) do
+          {:ok, bytes} ->
+            logical_key = CompoundKey.extract_redis_key(storage_key)
+
+            {:cont, {:ok, [{storage_key, value, expire_at_ms, logical_key, bytes} | prepared]}}
+
+          {:error, _reason} = error ->
+            {:halt, error}
+        end
+
+      invalid, {:ok, _prepared} ->
+        {:halt, {:error, {:invalid_namespace_usage_batch_entry, invalid}}}
+    end)
+    |> case do
+      {:ok, prepared} -> {:ok, Enum.reverse(prepared)}
+      {:error, _reason} = error -> error
+    end
   end
 
   defp live?(0, _now_ms), do: true

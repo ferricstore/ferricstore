@@ -83,6 +83,58 @@ defmodule FerricstoreServer.Native.NIF do
   def encode_compact_kv_mget_response_frame(_opcode, _lane_id, _request_id, _values),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec encode_stream_rows_response_frame(
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          term(),
+          non_neg_integer()
+        ) :: binary() | :response_too_large | nil
+  def encode_stream_rows_response_frame(
+        _opcode,
+        _lane_id,
+        _request_id,
+        _rows,
+        _max_response_bytes
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec encode_raw_stream_rows_response_frame(
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          term(),
+          non_neg_integer()
+        ) :: binary() | :response_too_large | nil
+  def encode_raw_stream_rows_response_frame(
+        _opcode,
+        _lane_id,
+        _request_id,
+        _pairs,
+        _max_response_bytes
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec encode_raw_stream_rows_response_frame_inline(
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          list(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) :: binary() | nil | :response_too_large | :use_dirty
+  def encode_raw_stream_rows_response_frame_inline(
+        _opcode,
+        _lane_id,
+        _request_id,
+        _pairs,
+        _pair_count,
+        _source_bytes,
+        _max_response_bytes
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   @spec encode_compact_kv_mget(term()) :: binary() | nil
   def encode_compact_kv_mget(_values),
     do: :erlang.nif_error(:nif_not_loaded)

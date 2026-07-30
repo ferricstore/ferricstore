@@ -603,6 +603,32 @@ defmodule Ferricstore.Commands.StreamTest.Sections.Xadd do
           assert [] == Stream.handle("XREVRANGE", ["nonexistent", "+", "-"], store)
         end
 
+        test "paged XREVRANGE treats an expired cached stream as missing" do
+          store = MockStore.make() |> Map.put(:stream_range_pages, true)
+          key = ustream()
+
+          assert "1-0" = Stream.handle("XADD", [key, "1-0", "f", "v"], store)
+          assert [["1-0", "f", "v"]] = Stream.handle("XREVRANGE", [key, "+", "-"], store)
+
+          assert 1 = Expiry.handle("PEXPIRE", [key, "1"], store)
+          Process.sleep(5)
+
+          assert [] = Stream.handle("XREVRANGE", [key, "+", "-"], store)
+        end
+
+        test "paged XREVRANGE rejects a wrong type despite stale local metadata" do
+          store = MockStore.make() |> Map.put(:stream_range_pages, true)
+          key = ustream()
+
+          assert "1-0" = Stream.handle("XADD", [key, "1-0", "f", "v"], store)
+          assert :ok = Strings.handle("SET", [key, "string"], store)
+
+          Ferricstore.Commands.Stream.Meta.put_local(key, 1, "1-0", "1-0", 1, 0, store)
+
+          assert {:error, "WRONGTYPE" <> _} =
+                   Stream.handle("XREVRANGE", [key, "+", "-"], store)
+        end
+
         test "XREVRANGE with specific range" do
           store = MockStore.make()
           key = ustream()

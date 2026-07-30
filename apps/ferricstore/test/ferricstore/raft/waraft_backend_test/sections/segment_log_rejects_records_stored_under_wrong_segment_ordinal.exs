@@ -260,7 +260,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentLogRejectsRecordsSt
                    WARaftBackend.start(ctx,
                      log_module: :ferricstore_waraft_spike_segment_log,
                      commit_batch_interval_ms: 50,
-                     commit_batch_max: 10
+                     commit_batch_max: 10,
+                     commit_batch_adaptive: false
                    )
 
           Application.put_env(:ferricstore, :waraft_segment_log_file_sync_hook, {:notify, self()})

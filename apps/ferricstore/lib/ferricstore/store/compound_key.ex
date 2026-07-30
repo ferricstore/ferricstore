@@ -422,6 +422,35 @@ defmodule Ferricstore.Store.CompoundKey do
     compound_prefix("X:", redis_key)
   end
 
+  @doc false
+  @spec stream_read_keys(binary()) :: {binary(), binary()}
+  def stream_read_keys(redis_key) when is_binary(redis_key) do
+    encoded_key = encode_redis_key(redis_key)
+    {"T:" <> encoded_key, "X:" <> encoded_key <> @separator}
+  end
+
+  @doc false
+  @spec stream_write_keys(binary()) :: {binary(), binary(), binary()}
+  def stream_write_keys(redis_key) when is_binary(redis_key) do
+    encoded_key = encode_redis_key(redis_key)
+
+    {
+      "T:" <> encoded_key,
+      "X:" <> encoded_key <> @separator,
+      "XM:" <> encoded_key
+    }
+  end
+
+  @doc false
+  @spec stream_index_member(binary()) :: binary() | {non_neg_integer(), non_neg_integer()}
+  def stream_index_member(id) when is_binary(id) do
+    case :binary.split(id, "-") do
+      [ms, seq] -> encode_stream_index_member(id, ms, seq)
+      [ms] -> encode_stream_index_member(id, ms, "0")
+      _invalid -> id
+    end
+  end
+
   @doc """
   Builds the durable metadata key for a stream's length and last-generated-id.
   """
@@ -442,6 +471,49 @@ defmodule Ferricstore.Store.CompoundKey do
   @spec stream_group_prefix(binary()) :: binary()
   def stream_group_prefix(redis_key) do
     compound_prefix("XG:", redis_key)
+  end
+
+  @doc """
+  Builds the durable pending-entry key for a stream consumer group.
+
+  The length-prefixed group segment keeps the mapping injective even when
+  group names contain NUL bytes.
+  """
+  @spec stream_pending(binary(), binary(), binary()) :: binary()
+  def stream_pending(redis_key, group, id) do
+    stream_pending_group_prefix(redis_key, group) <> id
+  end
+
+  @doc """
+  Returns the scan prefix for all durable pending entries of a stream.
+  """
+  @spec stream_pending_prefix(binary()) :: binary()
+  def stream_pending_prefix(redis_key), do: compound_prefix("XP:", redis_key)
+
+  @doc false
+  @spec stream_pending_group_prefix(binary(), binary()) :: binary()
+  def stream_pending_group_prefix(redis_key, group) do
+    stream_pending_prefix(redis_key) <> length_prefixed(group)
+  end
+
+  @doc """
+  Builds the durable consumer key for a stream consumer group.
+  """
+  @spec stream_consumer(binary(), binary(), binary()) :: binary()
+  def stream_consumer(redis_key, group, consumer) do
+    stream_consumer_group_prefix(redis_key, group) <> consumer
+  end
+
+  @doc """
+  Returns the scan prefix for all durable consumers of a stream.
+  """
+  @spec stream_consumer_prefix(binary()) :: binary()
+  def stream_consumer_prefix(redis_key), do: compound_prefix("XC:", redis_key)
+
+  @doc false
+  @spec stream_consumer_group_prefix(binary(), binary()) :: binary()
+  def stream_consumer_group_prefix(redis_key, group) do
+    stream_consumer_prefix(redis_key) <> length_prefixed(group)
   end
 
   # -------------------------------------------------------------------
@@ -488,6 +560,8 @@ defmodule Ferricstore.Store.CompoundKey do
   def internal_key?(<<"X:", _rest::binary>>), do: true
   def internal_key?(<<"XM:", _rest::binary>>), do: true
   def internal_key?(<<"XG:", _rest::binary>>), do: true
+  def internal_key?(<<"XP:", _rest::binary>>), do: true
+  def internal_key?(<<"XC:", _rest::binary>>), do: true
   def internal_key?(<<"T:", _rest::binary>>), do: true
   def internal_key?(<<"V:", _rest::binary>>), do: true
   def internal_key?(<<"VM:", _rest::binary>>), do: true
@@ -529,6 +603,8 @@ defmodule Ferricstore.Store.CompoundKey do
   def extract_redis_key(<<"X:", rest::binary>>), do: extract_before_separator(rest)
   def extract_redis_key(<<"XM:", rest::binary>>), do: decode_redis_key(rest)
   def extract_redis_key(<<"XG:", rest::binary>>), do: extract_before_separator(rest)
+  def extract_redis_key(<<"XP:", rest::binary>>), do: extract_before_separator(rest)
+  def extract_redis_key(<<"XC:", rest::binary>>), do: extract_before_separator(rest)
   def extract_redis_key(<<"T:", rest::binary>>), do: decode_redis_key(rest)
   def extract_redis_key(<<"LM:", rest::binary>>), do: decode_redis_key(rest)
   def extract_redis_key(<<"VM:", rest::binary>>), do: extract_before_separator(rest)
@@ -553,6 +629,19 @@ defmodule Ferricstore.Store.CompoundKey do
 
   defp compound_prefix(prefix, redis_key) do
     prefix <> encode_redis_key(redis_key) <> @separator
+  end
+
+  defp length_prefixed(value) when is_binary(value), do: <<byte_size(value)::32, value::binary>>
+
+  defp encode_stream_index_member(fallback, ms_binary, seq_binary) do
+    with {ms, ""} <- Integer.parse(ms_binary),
+         {seq, ""} <- Integer.parse(seq_binary),
+         true <- ms >= 0 and ms <= 0xFFFF_FFFF_FFFF_FFFF,
+         true <- seq >= 0 and seq <= 0xFFFF_FFFF_FFFF_FFFF do
+      {ms, seq}
+    else
+      _invalid -> fallback
+    end
   end
 
   defp encode_redis_key(redis_key) do

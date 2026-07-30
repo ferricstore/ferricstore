@@ -16,6 +16,7 @@ defmodule FerricstoreServer.Native.Commands do
 
   alias Ferricstore.{AuditLog, Stats}
   alias Ferricstore.Commands.{KeyDiscovery, PreparedCommand, Strings}
+  alias Ferricstore.Commands.Stream.Args, as: StreamArgs
   alias Ferricstore.Flow.{ClaimDueAPI, ClaimWaiters}
   alias Ferricstore.Flow.InternalKey
   alias Ferricstore.Flow.RecordProjection, as: FlowRecordProjection
@@ -27,6 +28,7 @@ defmodule FerricstoreServer.Native.Commands do
   alias Ferricstore.Store.{CompoundKey, ListOps, Ops, PublicationEpoch, ReadResult, Router}
   alias Ferricstore.Store.Shard.ZSetIndex
   alias Ferricstore.Store.SlotMap
+  alias Ferricstore.Stream.ActivityLog, as: StreamActivityLog
   alias FerricstoreServer.AuthRateLimiter
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
@@ -35,6 +37,7 @@ defmodule FerricstoreServer.Native.Commands do
   alias FerricstoreServer.Native.FlowQuery
   alias FerricstoreServer.Native.RequestContext
   alias FerricstoreServer.Native.RouteMetadata
+  alias FerricstoreServer.Native.StreamRangeResponse
 
   @list_position_step 1_000_000_000
   @default_max_collection_response_items 10_000
@@ -1999,11 +2002,51 @@ defmodule FerricstoreServer.Native.Commands do
     )
   end
 
+  defp dispatch_command_exec(
+         %PreparedCommand{
+           command: range_command,
+           args: args,
+           ast: ast
+         } = prepared,
+         %{native_direct_stream_range_response: true} = state,
+         request_context
+       )
+       when range_command in ["XRANGE", "XREVRANGE"] do
+    if large_stream_range_args?(args) do
+      store = attach_request_context(state.instance_ctx, request_context)
+
+      result =
+        Ferricstore.Commands.Dispatcher.execute_prepared(prepared, store, fn ->
+          case Ferricstore.Commands.Stream.handle_raw_range_ast(ast, store) do
+            {:ok, pairs} -> StreamRangeResponse.new(pairs)
+            :fallback -> Ferricstore.Commands.Dispatcher.dispatch_ast(ast, store)
+            {:error, _reason} = error -> error
+          end
+        end)
+
+      result |> raw_result_to_native() |> result_to_reply(state)
+    else
+      dispatch_prepared_command_exec(prepared, state, request_context)
+    end
+  end
+
   defp dispatch_command_exec(%PreparedCommand{} = prepared, state, request_context) do
+    dispatch_prepared_command_exec(prepared, state, request_context)
+  end
+
+  defp dispatch_prepared_command_exec(prepared, state, request_context) do
     store = attach_request_context(state.instance_ctx, request_context)
     result = Ferricstore.Commands.Dispatcher.dispatch_prepared(prepared, store)
     result |> raw_result_to_native() |> result_to_reply(state)
   end
+
+  defp large_stream_range_args?([_key, _start, _end, option, count])
+       when is_binary(option) and is_binary(count) do
+    String.upcase(option) == "COUNT" and
+      match?({value, ""} when value >= 128, Integer.parse(count))
+  end
+
+  defp large_stream_range_args?(_args), do: false
 
   defp dispatch_command_exec(
          %PreparedCommand{ast: {:flow_query, %Ferricstore.Flow.Query.Request{} = request}} =
@@ -3175,6 +3218,13 @@ defmodule FerricstoreServer.Native.Commands do
           |> Enum.sort(),
         compact_response_opcodes: compact_response_opcodes,
         supported: ["typed_value" | compact_response_opcodes |> Map.keys() |> Enum.sort()]
+      },
+      pipeline: %{
+        compact_request: "pipeline_v1",
+        values_only_mode_bit: 0x80,
+        modes: %{
+          stream_xadd_auto: 34
+        }
       },
       compression: supported_compressions(),
       auth: @supported_auth,
@@ -4663,7 +4713,8 @@ defmodule FerricstoreServer.Native.Commands do
               30,
               31,
               32,
-              33
+              33,
+              34
             ] and is_list(items) do
     max = Application.get_env(:ferricstore, :native_max_pipeline_commands, 1024)
     count = Map.get(payload, "compact_count")
@@ -4706,6 +4757,17 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp valid_compact_pipeline_items?(30, items),
     do: Enum.all?(items, &is_binary/1)
+
+  defp valid_compact_pipeline_items?(34, items) do
+    Enum.all?(items, fn
+      {key, [field, value | rest]}
+      when is_binary(key) and is_binary(field) and is_binary(value) ->
+        valid_compact_stream_field_pairs?(rest)
+
+      _item ->
+        false
+    end)
+  end
 
   defp valid_compact_pipeline_items?(mode, items) when mode in [18, 19] do
     Enum.all?(items, fn
@@ -4851,6 +4913,14 @@ defmodule FerricstoreServer.Native.Commands do
     end)
   end
 
+  defp valid_compact_stream_field_pairs?([]), do: true
+
+  defp valid_compact_stream_field_pairs?([field, value | rest])
+       when is_binary(field) and is_binary(value),
+       do: valid_compact_stream_field_pairs?(rest)
+
+  defp valid_compact_stream_field_pairs?(_invalid), do: false
+
   defp valid_flow_get_partition_opts?(opts) when is_list(opts) do
     Keyword.keyword?(opts) and
       Enum.all?(opts, fn
@@ -4871,13 +4941,46 @@ defmodule FerricstoreServer.Native.Commands do
   defp valid_flow_get_meta_opts?(_opts), do: false
 
   defp authorize_compact_pipeline_public_keys(mode, items)
-       when mode in [1, 2, 5, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32] do
+       when mode in [
+              1,
+              2,
+              5,
+              18,
+              19,
+              20,
+              21,
+              22,
+              23,
+              24,
+              25,
+              26,
+              27,
+              28,
+              29,
+              30,
+              31,
+              32
+            ] do
     mode
     |> compact_pipeline_keys(items)
     |> InternalKey.authorize_public()
   end
 
+  defp authorize_compact_pipeline_public_keys(34, items) when is_list(items),
+    do: authorize_compact_stream_keys(items, nil)
+
   defp authorize_compact_pipeline_public_keys(_mode, _items), do: :ok
+
+  defp authorize_compact_stream_keys([], _previous_key), do: :ok
+
+  defp authorize_compact_stream_keys([{key, _fields} | rest], key),
+    do: authorize_compact_stream_keys(rest, key)
+
+  defp authorize_compact_stream_keys([{key, _fields} | rest], _previous_key) do
+    with :ok <- InternalKey.authorize_public([key]) do
+      authorize_compact_stream_keys(rest, key)
+    end
+  end
 
   defp safe_compact_mixed_pipeline?(items),
     do: safe_compact_mixed_pipeline?(items, MapSet.new(), MapSet.new())
@@ -4900,6 +5003,10 @@ defmodule FerricstoreServer.Native.Commands do
        when atomicity in ["none", "per_shard"],
        do: :ok
 
+  defp validate_compact_pipeline_atomicity(34, items, "same_shard", state) do
+    validate_compact_stream_same_shard(items, state.instance_ctx, nil, nil)
+  end
+
   defp validate_compact_pipeline_atomicity(mode, items, "same_shard", state) do
     shards =
       mode
@@ -4914,10 +5021,40 @@ defmodule FerricstoreServer.Native.Commands do
     end
   end
 
+  defp validate_compact_stream_same_shard([], _ctx, _expected_shard, _previous_key), do: :ok
+
+  defp validate_compact_stream_same_shard([{key, _fields} | rest], ctx, nil, _previous_key) do
+    validate_compact_stream_same_shard(rest, ctx, Router.shard_for(ctx, key), key)
+  end
+
+  defp validate_compact_stream_same_shard(
+         [{key, _fields} | rest],
+         ctx,
+         expected_shard,
+         key
+       ),
+       do: validate_compact_stream_same_shard(rest, ctx, expected_shard, key)
+
+  defp validate_compact_stream_same_shard(
+         [{key, _fields} | rest],
+         ctx,
+         expected_shard,
+         _previous_key
+       ) do
+    if Router.shard_for(ctx, key) == expected_shard do
+      validate_compact_stream_same_shard(rest, ctx, expected_shard, key)
+    else
+      {:error, "ERR native same_shard pipeline contains multiple shards"}
+    end
+  end
+
   defp compact_pipeline_keys(1, kv_pairs), do: Enum.map(kv_pairs, fn {key, _value} -> key end)
   defp compact_pipeline_keys(2, keys), do: keys
   defp compact_pipeline_keys(27, keys), do: keys
   defp compact_pipeline_keys(30, keys), do: keys
+
+  defp compact_pipeline_keys(34, items), do: Enum.map(items, &elem(&1, 0))
+
   defp compact_pipeline_keys(mode, items) when mode in [18, 19], do: Enum.map(items, &elem(&1, 0))
   defp compact_pipeline_keys(mode, items) when mode in [28, 29], do: Enum.map(items, &elem(&1, 0))
   defp compact_pipeline_keys(20, items), do: Enum.map(items, &elem(&1, 0))
@@ -4992,6 +5129,22 @@ defmodule FerricstoreServer.Native.Commands do
       |> Enum.with_index(1)
       |> Enum.map(fn {key, request_id} ->
         %{opcode: @op_get, lane_id: 1, request_id: request_id, body: %{"key" => key}}
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(34, items) do
+    commands =
+      items
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{key, fields}, request_id} ->
+        %{
+          opcode: @op_command_exec,
+          lane_id: 1,
+          request_id: request_id,
+          body: %{"command" => "XADD", "args" => [key, "*" | fields]}
+        }
       end)
 
     {:ok, commands}
@@ -5491,95 +5644,109 @@ defmodule FerricstoreServer.Native.Commands do
          } = state
        )
        when not is_nil(ctx) do
-    case pipeline_plain_sets(commands, [], []) do
-      {:ok, requests, kv_pairs} ->
+    case pipeline_stream_appends(commands, [], [], []) do
+      {:ok, requests, ops, activity} ->
         Stats.incr_commands_by(state.stats_counter, length(commands))
 
         results =
           ctx
-          |> Router.batch_quorum_put(kv_pairs)
-          |> pipeline_set_results(requests)
+          |> submit_pipeline_stream_ops(ops)
+          |> record_pipeline_stream_activity(activity)
+          |> pipeline_flow_results(requests)
 
         {:ok, results}
 
       :fallback ->
-        case pipeline_plain_gets(commands, [], []) do
-          {:ok, requests, keys} ->
+        case pipeline_plain_sets(commands, [], []) do
+          {:ok, requests, kv_pairs} ->
             Stats.incr_commands_by(state.stats_counter, length(commands))
 
-            case pipeline_batch_get(ctx, keys, state) do
-              {:ok, values} -> {:ok, pipeline_get_results(values, requests)}
-              {:error, _reason} = error -> error
-            end
+            results =
+              ctx
+              |> Router.batch_quorum_put(kv_pairs)
+              |> pipeline_set_results(requests)
+
+            {:ok, results}
 
           :fallback ->
-            case pipeline_data_writes(commands) do
-              {:ok, requests, ops} ->
+            case pipeline_plain_gets(commands, [], []) do
+              {:ok, requests, keys} ->
                 Stats.incr_commands_by(state.stats_counter, length(commands))
 
-                results =
-                  ctx
-                  |> Router.pipeline_write_batch(ops)
-                  |> pipeline_flow_results(requests)
-
-                {:ok, results}
+                case pipeline_batch_get(ctx, keys, state) do
+                  {:ok, values} -> {:ok, pipeline_get_results(values, requests)}
+                  {:error, _reason} = error -> error
+                end
 
               :fallback ->
-                case pipeline_flow_create_many(commands, [], [], nil) do
-                  {:ok, requests, items, opts} ->
+                case pipeline_data_writes(commands) do
+                  {:ok, requests, ops} ->
                     Stats.incr_commands_by(state.stats_counter, length(commands))
 
                     results =
-                      state.instance_ctx
-                      |> Ferricstore.Flow.create_many(
-                        nil,
-                        items,
-                        opts
-                        |> Keyword.put(:independent, true)
-                        |> Keyword.put(:return, :ok_on_success)
-                      )
-                      |> pipeline_create_many_results(requests)
+                      ctx
+                      |> Router.pipeline_write_batch(ops)
+                      |> pipeline_flow_results(requests)
 
                     {:ok, results}
 
                   :fallback ->
-                    case pipeline_flow_shared_value_puts(commands, [], []) do
-                      {:ok, requests, items} ->
+                    case pipeline_flow_create_many(commands, [], [], nil) do
+                      {:ok, requests, items, opts} ->
                         Stats.incr_commands_by(state.stats_counter, length(commands))
 
                         results =
                           state.instance_ctx
-                          |> Ferricstore.Flow.ValueStore.shared_value_put_batch(items)
-                          |> pipeline_flow_results(requests)
+                          |> Ferricstore.Flow.create_many(
+                            nil,
+                            items,
+                            opts
+                            |> Keyword.put(:independent, true)
+                            |> Keyword.put(:return, :ok_on_success)
+                          )
+                          |> pipeline_create_many_results(requests)
 
                         {:ok, results}
 
                       :fallback ->
-                        case pipeline_flow_writes(commands, [], []) do
-                          {:ok, requests, ops} ->
+                        case pipeline_flow_shared_value_puts(commands, [], []) do
+                          {:ok, requests, items} ->
                             Stats.incr_commands_by(state.stats_counter, length(commands))
 
                             results =
                               state.instance_ctx
-                              |> Ferricstore.Flow.pipeline_write_batch_cross_shard_safe(ops)
+                              |> Ferricstore.Flow.ValueStore.shared_value_put_batch(items)
                               |> pipeline_flow_results(requests)
 
                             {:ok, results}
 
                           :fallback ->
-                            case pipeline_flow_reads(commands, [], []) do
+                            case pipeline_flow_writes(commands, [], []) do
                               {:ok, requests, ops} ->
                                 Stats.incr_commands_by(state.stats_counter, length(commands))
 
                                 results =
                                   state.instance_ctx
-                                  |> Ferricstore.Flow.pipeline_read_batch(ops)
+                                  |> Ferricstore.Flow.pipeline_write_batch_cross_shard_safe(ops)
                                   |> pipeline_flow_results(requests)
 
                                 {:ok, results}
 
                               :fallback ->
-                                :fallback
+                                case pipeline_flow_reads(commands, [], []) do
+                                  {:ok, requests, ops} ->
+                                    Stats.incr_commands_by(state.stats_counter, length(commands))
+
+                                    results =
+                                      state.instance_ctx
+                                      |> Ferricstore.Flow.pipeline_read_batch(ops)
+                                      |> pipeline_flow_results(requests)
+
+                                    {:ok, results}
+
+                                  :fallback ->
+                                    :fallback
+                                end
                             end
                         end
                     end
@@ -5590,6 +5757,94 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp execute_pipeline_fast_path(_commands, _state), do: :fallback
+
+  defp pipeline_stream_appends([], requests, ops, activity),
+    do: {:ok, Enum.reverse(requests), Enum.reverse(ops), Enum.reverse(activity)}
+
+  defp pipeline_stream_appends(
+         [
+           %{
+             opcode: @op_command_exec,
+             body: %{__prepared_command__: %PreparedCommand{command: "XADD"} = prepared}
+           } = command
+           | rest
+         ],
+         requests,
+         ops,
+         activity
+       ) do
+    case prepared_stream_append(prepared) do
+      {:ok, key, id_spec, fields, trim_opts, nomkstream} ->
+        if is_nil(trim_opts) do
+          raft_command = {:stream_append, key, id_spec, fields, nil, nomkstream}
+
+          pipeline_stream_appends(
+            rest,
+            [pipeline_request(command) | requests],
+            [{key, raft_command} | ops],
+            [{key, div(length(fields), 2), nil, nomkstream} | activity]
+          )
+        else
+          # Trimming consults the ordered Stream catalog. Generic Raft batches defer
+          # catalog publication until commit, so a later trim in the same batch would
+          # not see entries appended earlier in that batch.
+          :fallback
+        end
+
+      :fallback ->
+        :fallback
+    end
+  end
+
+  defp pipeline_stream_appends(_commands, _requests, _ops, _activity), do: :fallback
+
+  defp prepared_stream_append(%PreparedCommand{
+         ast: {:xadd, key, {id_spec, fields, trim_opts, nomkstream}}
+       })
+       when is_binary(key) and is_list(fields) and is_boolean(nomkstream),
+       do: {:ok, key, id_spec, fields, trim_opts, nomkstream}
+
+  defp prepared_stream_append(%PreparedCommand{args: args})
+       when is_list(args) and length(args) >= 4 do
+    case StreamArgs.parse_xadd_args(args) do
+      {:ok, key, id_spec, fields, trim_opts, nomkstream} ->
+        {:ok, key, id_spec, fields, trim_opts, nomkstream}
+
+      {:error, _reason} ->
+        :fallback
+    end
+  end
+
+  defp prepared_stream_append(%PreparedCommand{}), do: :fallback
+
+  defp submit_pipeline_stream_ops(
+         ctx,
+         [{key, {:stream_append, key, :auto, fields, nil, false}} | rest] = ops
+       ) do
+    case collect_same_auto_stream_fields(rest, key, [fields]) do
+      {:ok, fields_lists} -> Router.stream_append_many_auto(ctx, key, fields_lists)
+      :mixed -> Router.pipeline_write_batch(ctx, ops)
+    end
+  end
+
+  defp submit_pipeline_stream_ops(ctx, ops), do: Router.pipeline_write_batch(ctx, ops)
+
+  defp collect_same_auto_stream_fields([], _key, fields),
+    do: {:ok, Enum.reverse(fields)}
+
+  defp collect_same_auto_stream_fields(
+         [{key, {:stream_append, key, :auto, fields, nil, false}} | rest],
+         key,
+         acc
+       ),
+       do: collect_same_auto_stream_fields(rest, key, [fields | acc])
+
+  defp collect_same_auto_stream_fields(_mixed, _key, _acc), do: :mixed
+
+  defp record_pipeline_stream_activity(results, activity) do
+    StreamActivityLog.record_xadd_results(results, activity)
+    results
+  end
 
   defp execute_compact_pipeline_fast_path(
          1,
@@ -5855,6 +6110,23 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp execute_compact_pipeline_fast_path(
+         34,
+         items,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when is_list(items) and not is_nil(ctx) do
+    Stats.incr_commands_by(state.stats_counter, length(items))
+
+    results =
+      ctx
+      |> submit_compact_stream_items(items)
+      |> record_compact_stream_activity(items)
+
+    {:ok, format_compact_stream_append_results(results, return_format)}
+  end
+
+  defp execute_compact_pipeline_fast_path(
          mode,
          ops,
          return_format,
@@ -5995,6 +6267,14 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp execute_compact_pipeline_fast_path(_mode, _items, _return_format, _state), do: :fallback
+
+  defp submit_compact_stream_items(ctx, [_first | _rest] = items),
+    do: Router.stream_append_auto_items(ctx, items)
+
+  defp record_compact_stream_activity(results, items) do
+    StreamActivityLog.record_xadd_results(results, items)
+    results
+  end
 
   defp compact_hget_results(ctx, items) do
     lookups =
@@ -7596,6 +7876,20 @@ defmodule FerricstoreServer.Native.Commands do
       [Atom.to_string(status), value]
     end)
   end
+
+  # The successful compact XADD path already returns the final binary IDs in
+  # order. Encode that list directly instead of rebuilding and reversing an
+  # equivalent values list. Any per-item error falls back to the general
+  # pipeline formatter so wire-level error semantics remain unchanged.
+  defp format_compact_stream_append_results(results, :values) do
+    case FerricstoreServer.Native.Codec.encode_compact_kv_mget(results) do
+      payload when is_binary(payload) -> payload
+      nil -> format_compact_pipeline_results(results, @op_command_exec, :values)
+    end
+  end
+
+  defp format_compact_stream_append_results(results, return_format),
+    do: format_compact_pipeline_results(results, @op_command_exec, return_format)
 
   defp format_compact_pipeline_results(results, _opcode, :values),
     do: compact_pipeline_flow_values(results)

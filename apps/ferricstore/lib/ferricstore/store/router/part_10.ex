@@ -439,12 +439,20 @@ defmodule Ferricstore.Store.Router.Part10 do
 
       defp promoted_data_compound_key?(keydir, redis_key, compound_key, now) do
         not shared_log_compound_key?(compound_key) and
-          promoted_compound_collection?(keydir, redis_key, now)
+          promoted_compound_collection?(keydir, redis_key, compound_key, now)
+      end
+
+      defp promoted_compound_collection?(keydir, redis_key, compound_key, now) do
+        marker_key = promotion_marker_key(redis_key, compound_key)
+        promoted_compound_collection_key?(keydir, marker_key, now)
       end
 
       defp promoted_compound_collection?(keydir, redis_key, now) do
         marker_key = Ferricstore.Store.CompoundKey.promotion_marker_key(redis_key)
+        promoted_compound_collection_key?(keydir, marker_key, now)
+      end
 
+      defp promoted_compound_collection_key?(keydir, marker_key, now) do
         case :ets.lookup(keydir, marker_key) do
           [{_, _value, 0, _lfu, _fid, _off, _vsize}] -> true
           [{_, _value, exp, _lfu, _fid, _off, _vsize}] when exp > now -> true
@@ -453,6 +461,14 @@ defmodule Ferricstore.Store.Router.Part10 do
       rescue
         ArgumentError -> false
       end
+
+      # Type metadata already contains the escaped logical key. Reuse it
+      # instead of escaping the same Redis key again for the promotion probe.
+      defp promotion_marker_key(_redis_key, <<"T:", encoded_key::binary>>),
+        do: "PM:" <> encoded_key
+
+      defp promotion_marker_key(redis_key, _compound_key),
+        do: Ferricstore.Store.CompoundKey.promotion_marker_key(redis_key)
 
       defp normalize_compound_batch_reply(values, expected_count)
            when is_list(values) and is_integer(expected_count) and expected_count >= 0 do
@@ -732,6 +748,42 @@ defmodule Ferricstore.Store.Router.Part10 do
       def compound_scan_slice(ctx, redis_key, prefix, start, count, total) do
         idx = shard_for(ctx, redis_key)
 
+        case prefix do
+          <<"X:", _rest::binary>> ->
+            stream_scan_slice(
+              ctx,
+              idx,
+              resolve_keydir(ctx, idx),
+              redis_key,
+              prefix,
+              start,
+              count,
+              total
+            )
+
+          _other ->
+            fallback_compound_scan_slice(ctx, idx, redis_key, prefix, start, count, total)
+        end
+      end
+
+      defp stream_scan_slice(ctx, idx, keydir, redis_key, prefix, start, count, total) do
+        case Ferricstore.Store.Shard.CompoundMemberIndex.hot_stream_slice(
+               elem(ctx.compound_member_index_refs, idx),
+               keydir,
+               prefix,
+               start,
+               count,
+               total
+             ) do
+          {:ok, pairs} ->
+            pairs
+
+          _fallback ->
+            fallback_compound_scan_slice(ctx, idx, redis_key, prefix, start, count, total)
+        end
+      end
+
+      defp fallback_compound_scan_slice(ctx, idx, redis_key, prefix, start, count, total) do
         if selected_waraft_ctx?(ctx) do
           state = direct_compound_read_state(ctx, idx)
 
@@ -812,7 +864,7 @@ defmodule Ferricstore.Store.Router.Part10 do
               FerricStore.Instance.t(),
               binary(),
               binary(),
-              0 | {:after, binary()},
+              Ferricstore.Store.Shard.CompoundMemberIndex.scan_cursor(),
               pos_integer(),
               binary() | nil,
               boolean()
@@ -833,7 +885,7 @@ defmodule Ferricstore.Store.Router.Part10 do
         request =
           {:compound_scan_page, redis_key, prefix, cursor, count, match_pattern, fields_only}
 
-        if selected_waraft_ctx?(ctx) do
+        if selected_waraft_ctx?(ctx) or direct_stream_catalog_page?(ctx, idx, prefix) do
           direct_compound_scan_page(
             ctx,
             idx,
@@ -851,6 +903,146 @@ defmodule Ferricstore.Store.Router.Part10 do
           end
         end
       end
+
+      @doc false
+      @spec stream_range_page(
+              FerricStore.Instance.t(),
+              binary(),
+              binary(),
+              Ferricstore.Store.Shard.CompoundMemberIndex.scan_cursor(),
+              pos_integer()
+            ) :: {:ok, [{binary(), binary()}]} | ReadResult.failure()
+      def stream_range_page(ctx, redis_key, <<"X:", _rest::binary>> = prefix, cursor, count)
+          when is_integer(count) and count > 0 do
+        idx = shard_for(ctx, redis_key)
+        keydir = resolve_keydir(ctx, idx)
+
+        case Ferricstore.Store.Shard.CompoundMemberIndex.hot_stream_page_once(
+               elem(ctx.compound_member_index_refs, idx),
+               keydir,
+               prefix,
+               cursor,
+               count
+             ) do
+          {:ok, pairs} ->
+            {:ok, pairs}
+
+          _fallback ->
+            case compound_scan_page(ctx, redis_key, prefix, cursor, count, nil, false) do
+              {:ok, {_next_cursor, pairs}} -> {:ok, pairs}
+              {:error, _reason} = error -> error
+            end
+        end
+      end
+
+      @doc false
+      @spec stream_typed_range_page(
+              FerricStore.Instance.t(),
+              binary(),
+              binary(),
+              binary(),
+              Ferricstore.Store.Shard.CompoundMemberIndex.scan_cursor(),
+              pos_integer()
+            ) :: {:ok, {term(), [{binary(), binary()}]}} | ReadResult.failure()
+      def stream_typed_range_page(
+            ctx,
+            redis_key,
+            type_key,
+            <<"X:", _rest::binary>> = prefix,
+            cursor,
+            count
+          )
+          when is_integer(count) and count > 0 do
+        idx = shard_for(ctx, redis_key)
+        keydir = resolve_keydir(ctx, idx)
+        expiry_context = Ferricstore.ExpiryContext.capture()
+
+        case compound_get_from_keydir(ctx, idx, keydir, redis_key, type_key, expiry_context) do
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            failure
+
+          "stream" = marker ->
+            page =
+              Ferricstore.Store.Shard.CompoundMemberIndex.hot_stream_page_once(
+                elem(ctx.compound_member_index_refs, idx),
+                keydir,
+                prefix,
+                cursor,
+                count
+              )
+
+            case page do
+              {:ok, pairs} ->
+                {:ok, {marker, pairs}}
+
+              _fallback ->
+                case stream_range_page(ctx, redis_key, prefix, cursor, count) do
+                  {:ok, pairs} -> {:ok, {marker, pairs}}
+                  {:error, _reason} = error -> error
+                end
+            end
+
+          missing_or_other_type ->
+            {:ok, {missing_or_other_type, []}}
+        end
+      end
+
+      @doc false
+      @spec stream_typed_reverse_slice(
+              FerricStore.Instance.t(),
+              binary(),
+              binary(),
+              binary(),
+              non_neg_integer(),
+              pos_integer(),
+              pos_integer()
+            ) :: {:ok, {term(), [{binary(), binary()}]}} | ReadResult.failure()
+      def stream_typed_reverse_slice(
+            ctx,
+            redis_key,
+            type_key,
+            <<"X:", _rest::binary>> = prefix,
+            start,
+            count,
+            total
+          )
+          when is_integer(start) and start >= 0 and is_integer(count) and count > 0 and
+                 is_integer(total) and total > 0 do
+        idx = shard_for(ctx, redis_key)
+        keydir = resolve_keydir(ctx, idx)
+        expiry_context = Ferricstore.ExpiryContext.capture()
+
+        case compound_get_from_keydir(ctx, idx, keydir, redis_key, type_key, expiry_context) do
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            failure
+
+          "stream" = marker ->
+            case stream_scan_slice(
+                   ctx,
+                   idx,
+                   keydir,
+                   redis_key,
+                   prefix,
+                   start,
+                   count,
+                   total
+                 ) do
+              {:error, _reason} = error -> error
+              pairs -> {:ok, {marker, pairs}}
+            end
+
+          missing_or_other_type ->
+            {:ok, {missing_or_other_type, []}}
+        end
+      end
+
+      defp direct_stream_catalog_page?(ctx, idx, <<"X:", _rest::binary>>) do
+        ctx.name
+        |> Ferricstore.Store.Shard.CompoundMemberIndex.table_name(idx)
+        |> Ferricstore.Store.Shard.CompoundMemberIndex.ready?()
+      end
+
+      defp direct_stream_catalog_page?(_ctx, _idx, _prefix), do: false
 
       @spec compound_fields(FerricStore.Instance.t(), binary(), binary()) ::
               [binary()] | ReadResult.failure()
@@ -912,9 +1104,54 @@ defmodule Ferricstore.Store.Router.Part10 do
              match_pattern,
              fields_only
            ) do
-        state = direct_compound_read_state(ctx, idx)
-        index = state.compound_member_index
+        hot_stream_page =
+          if match_pattern == nil and not fields_only and match?(<<"X:", _rest::binary>>, prefix) do
+            keydir = resolve_keydir(ctx, idx)
 
+            Ferricstore.Store.Shard.CompoundMemberIndex.hot_stream_page(
+              elem(ctx.compound_member_index_refs, idx),
+              keydir,
+              prefix,
+              cursor,
+              count
+            )
+          else
+            :fallback
+          end
+
+        case hot_stream_page do
+          {:ok, {next_cursor, pairs}} ->
+            {:ok, {next_cursor, pairs}}
+
+          _fallback ->
+            state = direct_compound_read_state(ctx, idx)
+            index = state.compound_member_index
+
+            direct_compound_scan_page_fallback(
+              ctx,
+              redis_key,
+              prefix,
+              cursor,
+              count,
+              match_pattern,
+              fields_only,
+              state,
+              index
+            )
+        end
+      end
+
+      defp direct_compound_scan_page_fallback(
+             ctx,
+             redis_key,
+             prefix,
+             cursor,
+             count,
+             match_pattern,
+             fields_only,
+             state,
+             index
+           ) do
         case Ferricstore.Store.Shard.CompoundMemberIndex.scan_page(
                index,
                state,
@@ -960,8 +1197,7 @@ defmodule Ferricstore.Store.Router.Part10 do
         %{
           keydir: keydir,
           ets: keydir,
-          compound_member_index:
-            Ferricstore.Store.Shard.CompoundMemberIndex.table_name(ctx.name, idx),
+          compound_member_index: elem(ctx.compound_member_index_refs, idx),
           data_dir: ctx.data_dir,
           shard_data_path: Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx),
           index: idx,

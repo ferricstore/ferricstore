@@ -124,6 +124,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
       defp admit_apply_command_work(_state, _command),
         do: {:error, :invalid_batch_apply_budget}
 
+      defp admit_stream_many(%{apply_context: context}, fields_lists),
+        do: ApplyWork.admit_stream_many(context, fields_lists)
+
+      defp admit_stream_many(_state, _fields_lists),
+        do: {:error, :invalid_batch_apply_budget}
+
+      defp admit_grouped_stream_work(%{apply_context: context}, work),
+        do: ApplyWork.admit_grouped_stream_work(context, work)
+
+      defp admit_grouped_stream_work(_state, _work),
+        do: {:error, :invalid_batch_apply_budget}
+
       defp finish_hot_batch_apply(
              meta,
              old_count,

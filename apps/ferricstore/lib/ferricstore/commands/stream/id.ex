@@ -17,16 +17,7 @@ defmodule Ferricstore.Commands.Stream.ID do
   def resolve(:auto, last_ms, last_seq) do
     # CommandTime uses HLC outside Raft and stamped log-entry time inside Raft,
     # keeping stream ID generation deterministic during state-machine replay.
-    now = CommandTime.now_ms()
-
-    cond do
-      not valid_component?(last_ms) or not valid_component?(last_seq) -> {:error, @invalid_id}
-      not valid_component?(now) -> {:error, @invalid_id}
-      now > last_ms -> {:ok, {now, 0}}
-      now == last_ms -> increment_sequence(now, last_seq)
-      # HLC physical behind last_ms: keep last_ms with incremented seq.
-      true -> increment_sequence(last_ms, last_seq)
-    end
+    resolve_auto_at(CommandTime.now_ms(), last_ms, last_seq)
   end
 
   def resolve({:explicit, ms, seq}, last_ms, last_seq) do
@@ -57,6 +48,20 @@ defmodule Ferricstore.Commands.Stream.ID do
     end
   end
 
+  @doc false
+  @spec resolve_auto_at(integer(), integer(), integer()) ::
+          {:ok, stream_id()} | {:error, binary()}
+  def resolve_auto_at(now, last_ms, last_seq) do
+    cond do
+      not valid_component?(last_ms) or not valid_component?(last_seq) -> {:error, @invalid_id}
+      not valid_component?(now) -> {:error, @invalid_id}
+      now > last_ms -> {:ok, {now, 0}}
+      now == last_ms -> increment_sequence(now, last_seq)
+      # HLC physical behind last_ms: keep last_ms with incremented seq.
+      true -> increment_sequence(last_ms, last_seq)
+    end
+  end
+
   @spec parse_id!(binary()) :: stream_id()
   def parse_id!(id_str) do
     case parse_full_id(id_str) do
@@ -67,10 +72,10 @@ defmodule Ferricstore.Commands.Stream.ID do
 
   @spec parse_full_id(binary()) :: {:ok, stream_id()} | {:error, binary()}
   def parse_full_id(id_str) do
-    case String.split(id_str, "-", parts: 2) do
+    case :binary.split(id_str, "-") do
       [ms_str, seq_str] ->
-        case {Integer.parse(ms_str), Integer.parse(seq_str)} do
-          {{ms, ""}, {seq, ""}} when ms in 0..@max_u64 and seq in 0..@max_u64 ->
+        case {parse_component(ms_str), parse_component(seq_str)} do
+          {{:ok, ms}, {:ok, seq}} ->
             {:ok, {ms, seq}}
 
           _ ->
@@ -78,12 +83,29 @@ defmodule Ferricstore.Commands.Stream.ID do
         end
 
       [ms_str] ->
-        case Integer.parse(ms_str) do
-          {ms, ""} when ms in 0..@max_u64 -> {:ok, {ms, 0}}
+        case parse_component(ms_str) do
+          {:ok, ms} -> {:ok, {ms, 0}}
           _ -> {:error, @invalid_id}
         end
     end
   end
+
+  defp parse_component(<<"+", digits::binary>>), do: parse_component_digits(digits, 0)
+  defp parse_component(digits), do: parse_component_digits(digits, 0)
+
+  defp parse_component_digits(<<>>, _value), do: :error
+
+  defp parse_component_digits(<<digit, rest::binary>>, value) when digit in ?0..?9 do
+    next = value * 10 + digit - ?0
+
+    if next <= @max_u64 do
+      if rest == <<>>, do: {:ok, next}, else: parse_component_digits(rest, next)
+    else
+      :error
+    end
+  end
+
+  defp parse_component_digits(_invalid, _value), do: :error
 
   @spec parse_range_id(binary(), :min | :max) ::
           {:ok, :min | :max | stream_id()} | {:error, binary()}

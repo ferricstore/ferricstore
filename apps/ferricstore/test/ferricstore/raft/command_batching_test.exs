@@ -41,6 +41,8 @@ defmodule Ferricstore.Raft.CommandBatchingTest do
           :key_lifecycle,
           :server_catalog_mutate,
           :server_catalog_replace,
+          :stream_append_grouped_auto,
+          :stream_append_many_auto,
           :ttb,
           :zadd_many_single
         ] do

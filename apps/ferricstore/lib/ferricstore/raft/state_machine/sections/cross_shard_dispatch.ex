@@ -916,7 +916,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
 
           "stream" ->
             {[type_key, CompoundKey.stream_meta_key(key)],
-             [CompoundKey.stream_prefix(key), CompoundKey.stream_group_prefix(key)]}
+             [
+               CompoundKey.stream_prefix(key),
+               CompoundKey.stream_group_prefix(key),
+               CompoundKey.stream_pending_prefix(key),
+               CompoundKey.stream_consumer_prefix(key)
+             ]}
 
           nil ->
             if do_get(state, list_meta_key) == nil do

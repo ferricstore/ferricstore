@@ -821,6 +821,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
         ArgumentError -> :ok
       end
 
+      defp safe_ets_insert_many(_table, []), do: :ok
+
+      defp safe_ets_insert_many(table, entries) when is_list(entries) do
+        :ets.insert(table, entries)
+        :ok
+      rescue
+        ArgumentError -> :ok
+      end
+
       defp safe_ets_delete(table, key) do
         :ets.delete(table, key)
         :ok

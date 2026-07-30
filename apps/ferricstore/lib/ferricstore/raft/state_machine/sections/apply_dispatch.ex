@@ -9,11 +9,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       import Bitwise
 
       require Logger
+      require Ferricstore.LatencyTrace
 
       alias Ferricstore.Bitcask.NIF
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
+      alias Ferricstore.Commands.Stream.AppendBatch
+      alias Ferricstore.Commands.Stream.AtomicAppend
       alias Ferricstore.ExpiryContext
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Raft.CommandStamp
@@ -979,6 +982,120 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
+      def apply(
+            meta,
+            {:stream_append_many_auto, key, fields_lists},
+            state
+          )
+          when is_binary(key) and is_list(fields_lists) do
+        with_apply_time(meta, fn ->
+          old_count = state.applied_count
+
+          admission = admit_stream_many(state, fields_lists)
+
+          case admission do
+            {:error, _reason} = error ->
+              new_state = %{state | applied_count: old_count + 1}
+              maybe_release_cursor(meta, old_count, new_state, error)
+
+            {:ok, count} ->
+              applied_increment = max(count, 1)
+
+              write_result =
+                with_pending_writes(state, fn ->
+                  stream_store =
+                    state
+                    |> build_compound_store()
+                    |> terminal_stream_plan_store(state)
+
+                  materialize_pending_fast_deletes(state)
+
+                  case check_fetch_or_compute_lock(state, key, nil) do
+                    :ok ->
+                      run_terminal_stream_append_many_auto(key, fields_lists, stream_store)
+
+                    {:error, _reason} = error ->
+                      List.duplicate(error, count)
+                  end
+                end)
+
+              finish_hot_batch_apply(
+                meta,
+                old_count,
+                state,
+                applied_increment,
+                write_result
+              )
+          end
+        end)
+      end
+
+      def apply(
+            meta,
+            {:stream_append_grouped_auto, groups, count},
+            state
+          )
+          when is_list(groups) and is_integer(count) do
+        with_apply_time(meta, fn ->
+          old_count = state.applied_count
+
+          admission =
+            with {:ok, work} <- AppendBatch.validate_groups_with_work(groups, count),
+                 :ok <- admit_grouped_stream_work(state, work),
+                 do: :ok
+
+          case admission do
+            {:error, _reason} = error ->
+              new_state = %{state | applied_count: old_count + 1}
+              maybe_release_cursor(meta, old_count, new_state, error)
+
+            :ok ->
+              write_result =
+                with_pending_writes(state, fn ->
+                  apply_grouped_stream_append_auto_commands(state, groups, count, old_count)
+                end)
+
+              results =
+                case write_result do
+                  {results, _new_count} when is_list(results) -> results
+                  other -> other
+                end
+
+              finish_hot_batch_apply(meta, old_count, state, max(count, 1), results)
+          end
+        end)
+      end
+
+      # Planning is read-only. Committing only stages the plan in the generic
+      # pending-write batch. Return its publication descriptor explicitly so
+      # with_pending_writes/2 can thread it through durable flush and index
+      # publication without process-local Stream mode flags.
+      defp run_terminal_stream_append_many_auto(key, fields_lists, stream_store) do
+        stream_store = Map.put(stream_store, :stream_meta_cache_safe, true)
+
+        plan_result =
+          Ferricstore.LatencyTrace.maybe_span "server_stream_plan_us" do
+            AtomicAppend.plan_many_auto(key, fields_lists, stream_store)
+          end
+
+        case plan_result do
+          {:ok, plan} ->
+            result =
+              Ferricstore.LatencyTrace.maybe_span "server_stream_stage_us" do
+                AtomicAppend.commit_terminal_many_auto(plan, stream_store)
+              end
+
+            if plan.member_entries == [] do
+              result
+            else
+              pending_write_result(result, AtomicAppend.publication(plan, stream_store))
+            end
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
       defp apply_normalized_generic_batch(
              meta,
              state,
@@ -1025,28 +1142,362 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       end
 
       defp apply_generic_batch_commands(state, commands, old_count) do
-        commands
-        |> Enum.reduce_while({[], old_count}, fn command, {results, count} ->
-          materialize_pending_fast_deletes(state)
-          result = apply_single(state, command)
+        case AppendBatch.group_commands(commands) do
+          {:ok, groups, count} ->
+            apply_grouped_stream_append_auto_commands(state, groups, count, old_count)
 
-          case result do
-            {:error, reason} = error ->
-              if Ferricstore.Raft.ApplyFailure.storage_reason?(reason) do
-                {:halt, error}
-              else
-                {:cont, {[error | results], count + 1}}
-              end
-
-            success ->
-              {:cont, {[success | results], count + 1}}
-          end
-        end)
-        |> case do
-          {:error, _reason} = error -> error
-          {results, new_count} -> {Enum.reverse(results), new_count}
+          :generic ->
+            state
+            |> do_apply_generic_batch_commands(commands, [], old_count, nil)
+            |> case do
+              {:error, _reason} = error -> error
+              {results, new_count, _stream_store} -> {Enum.reverse(results), new_count}
+            end
         end
       end
+
+      defp apply_grouped_stream_append_auto_commands(state, groups, count, old_count) do
+        stream_store =
+          state
+          |> build_compound_store()
+          |> terminal_stream_plan_store(state)
+          # Every command in this grouped Raft entry already observes the same
+          # stamped apply time. Carry it once instead of reading process-local
+          # command time separately for every topic plan.
+          |> Map.put(:stream_apply_now_ms, CommandTime.now_ms())
+          |> Map.put(:stream_meta_cache_safe, true)
+          |> Map.put(:terminal_stream_validated_batch_put, fn
+            redis_key, member_prefix, entries ->
+              do_grouped_terminal_stream_validated_batch_put(
+                state,
+                redis_key,
+                member_prefix,
+                entries
+              )
+          end)
+
+        materialize_pending_fast_deletes(state)
+
+        planned =
+          Ferricstore.LatencyTrace.maybe_span "server_stream_plan_us" do
+            Enum.reduce_while(
+              groups,
+              {:ok, [], [], []},
+              fn {key, fields_lists, positions}, {:ok, positioned_chunks, publications, plans} ->
+                {group_results, publication, plan} =
+                  plan_grouped_stream_append_auto(
+                    state,
+                    key,
+                    fields_lists,
+                    stream_store
+                  )
+
+                case collect_grouped_stream_append_results(
+                       positioned_chunks,
+                       positions,
+                       group_results
+                     ) do
+                  {:ok, positioned_chunks} ->
+                    publications =
+                      case publication do
+                        %AtomicAppend.Publication{} -> [publication | publications]
+                        nil -> publications
+                      end
+
+                    plans =
+                      if match?(%AtomicAppend.Plan{}, plan), do: [plan | plans], else: plans
+
+                    {:cont, {:ok, positioned_chunks, publications, plans}}
+
+                  {:error, _reason} = error ->
+                    {:halt, error}
+                end
+              end
+            )
+          end
+
+        planned
+        |> case do
+          {:ok, positioned_chunks, publications, plans} ->
+            stage_result =
+              Ferricstore.LatencyTrace.maybe_span "server_stream_stage_us" do
+                AtomicAppend.commit_terminal_many_auto_group_reversed(plans, stream_store)
+              end
+
+            case stage_result do
+              :ok ->
+                grouped_stream_append_result(
+                  positioned_chunks,
+                  publications,
+                  count,
+                  old_count
+                )
+
+              {:error, _reason} = error ->
+                error
+            end
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp grouped_stream_append_result(positioned_chunks, [], count, old_count) do
+        {ordered_grouped_stream_append_results(positioned_chunks, count), old_count + count}
+      end
+
+      defp grouped_stream_append_result(positioned_chunks, publications, count, old_count) do
+        pending_write_result(
+          {ordered_grouped_stream_append_results(positioned_chunks, count), old_count + count},
+          Enum.reverse(publications)
+        )
+      end
+
+      defp plan_grouped_stream_append_auto(state, key, fields_lists, stream_store) do
+        case check_fetch_or_compute_lock(state, key, nil) do
+          :ok ->
+            plan_result = AtomicAppend.plan_many_auto(key, fields_lists, stream_store)
+
+            case plan_result do
+              {:ok, plan} ->
+                publication =
+                  if plan.member_entries == [],
+                    do: nil,
+                    else: AtomicAppend.publication(plan, stream_store)
+
+                {plan.results, publication, plan}
+
+              {:error, _reason} = error ->
+                {error, nil, nil}
+            end
+
+          {:error, _reason} = error ->
+            {List.duplicate(error, length(fields_lists)), nil, nil}
+        end
+      end
+
+      defp collect_grouped_stream_append_results(positioned_chunks, positions, group_results)
+           when is_list(group_results) do
+        case zip_exact_grouped_stream_results(positions, group_results) do
+          {:ok, positioned_results} ->
+            {:ok, [positioned_results | positioned_chunks]}
+
+          :mismatch ->
+            {:error, :invalid_stream_append_many_auto_results}
+        end
+      end
+
+      defp zip_exact_grouped_stream_results([], []), do: {:ok, []}
+
+      defp zip_exact_grouped_stream_results([position | positions], [result | results]) do
+        case zip_exact_grouped_stream_results(positions, results) do
+          {:ok, positioned} -> {:ok, [{position, result} | positioned]}
+          :mismatch -> :mismatch
+        end
+      end
+
+      defp zip_exact_grouped_stream_results(_positions, _results), do: :mismatch
+
+      defp collect_grouped_stream_append_results(
+             positioned_chunks,
+             positions,
+             {:error, reason} = error
+           ) do
+        if Ferricstore.Raft.ApplyFailure.storage_reason?(reason) do
+          error
+        else
+          positioned_errors = Enum.map(positions, &{&1, error})
+          {:ok, [positioned_errors | positioned_chunks]}
+        end
+      end
+
+      defp ordered_grouped_stream_append_results(positioned_chunks, count) when count >= 16 do
+        case reverse_contiguous_grouped_results(positioned_chunks, count - 1, []) do
+          {:ok, results} -> results
+          :unordered -> sort_grouped_stream_append_results(positioned_chunks)
+        end
+      end
+
+      defp ordered_grouped_stream_append_results(positioned_chunks, _count),
+        do: sort_grouped_stream_append_results(positioned_chunks)
+
+      defp reverse_contiguous_grouped_results([], -1, results), do: {:ok, results}
+
+      defp reverse_contiguous_grouped_results([chunk | chunks], expected, results) do
+        case :lists.foldr(
+               fn
+                 {position, result}, {position, acc} -> {position - 1, [result | acc]}
+                 _pair, :unordered -> :unordered
+                 _pair, _state -> :unordered
+               end,
+               {expected, results},
+               chunk
+             ) do
+          :unordered ->
+            :unordered
+
+          {next_expected, results} ->
+            reverse_contiguous_grouped_results(chunks, next_expected, results)
+        end
+      end
+
+      defp reverse_contiguous_grouped_results(_chunks, _expected, _results), do: :unordered
+
+      defp sort_grouped_stream_append_results(positioned_chunks) do
+        positioned_chunks
+        |> :lists.append()
+        |> then(&:lists.keysort(1, &1))
+        |> Enum.map(&elem(&1, 1))
+      end
+
+      defp collect_grouped_stream_append_results(_positioned_chunks, _positions, _invalid),
+        do: {:error, :invalid_stream_append_many_auto_results}
+
+      defp do_apply_generic_batch_commands(
+             _state,
+             [],
+             results,
+             count,
+             stream_store
+           ),
+           do: {results, count, stream_store}
+
+      defp do_apply_generic_batch_commands(
+             state,
+             [{:stream_append, key, :auto, fields, nil, false} | rest],
+             results,
+             count,
+             stream_store
+           )
+           when is_binary(key) and is_list(fields) do
+        {same_key_appends, remaining} = take_same_key_auto_appends(rest, key, [])
+        fields_lists = [fields | Enum.reverse(same_key_appends)]
+        stream_store = stream_store || build_compound_store(state)
+        materialize_pending_fast_deletes(state)
+
+        group_results =
+          case check_fetch_or_compute_lock(state, key, nil) do
+            :ok ->
+              Ferricstore.Commands.Stream.AtomicAppend.run_many_auto(
+                key,
+                fields_lists,
+                stream_store
+              )
+
+            {:error, _reason} = error ->
+              List.duplicate(error, length(fields_lists))
+          end
+
+        case group_results do
+          {:error, reason} = error ->
+            if Ferricstore.Raft.ApplyFailure.storage_reason?(reason) do
+              error
+            else
+              do_apply_generic_batch_commands(
+                state,
+                remaining,
+                Enum.reverse(List.duplicate(error, length(fields_lists)), results),
+                count + length(fields_lists),
+                stream_store
+              )
+            end
+
+          group_results when is_list(group_results) ->
+            do_apply_generic_batch_commands(
+              state,
+              remaining,
+              Enum.reverse(group_results, results),
+              count + length(fields_lists),
+              stream_store
+            )
+        end
+      end
+
+      defp do_apply_generic_batch_commands(
+             state,
+             [command | rest],
+             results,
+             count,
+             stream_store
+           ) do
+        materialize_pending_fast_deletes(state)
+        {result, stream_store} = apply_generic_batch_command(state, command, stream_store)
+
+        case result do
+          {:error, reason} = error ->
+            if Ferricstore.Raft.ApplyFailure.storage_reason?(reason) do
+              error
+            else
+              do_apply_generic_batch_commands(
+                state,
+                rest,
+                [error | results],
+                count + 1,
+                stream_store
+              )
+            end
+
+          success ->
+            do_apply_generic_batch_commands(
+              state,
+              rest,
+              [success | results],
+              count + 1,
+              stream_store
+            )
+        end
+      end
+
+      defp take_same_key_auto_appends(
+             [{:stream_append, key, :auto, fields, nil, false} | rest],
+             key,
+             acc
+           )
+           when is_list(fields),
+           do: take_same_key_auto_appends(rest, key, [fields | acc])
+
+      defp take_same_key_auto_appends(rest, _key, acc), do: {acc, rest}
+
+      defp apply_generic_batch_command(
+             state,
+             {:stream_append, key, id_spec, fields, trim_opts, nomkstream},
+             stream_store
+           )
+           when is_binary(key) and is_list(fields) and is_boolean(nomkstream) do
+        stream_store = stream_store || build_compound_store(state)
+
+        {apply_stream_append_with_store(
+           state,
+           key,
+           id_spec,
+           fields,
+           trim_opts,
+           nomkstream,
+           stream_store
+         ), stream_store}
+      end
+
+      defp apply_generic_batch_command(
+             state,
+             {:stream_append_blob_ref, key, id_spec, encoded_ref, trim_opts, nomkstream},
+             stream_store
+           )
+           when is_binary(key) and is_binary(encoded_ref) and is_boolean(nomkstream) do
+        stream_store = stream_store || build_compound_store(state)
+
+        {apply_stream_append_blob_ref_with_store(
+           state,
+           key,
+           id_spec,
+           encoded_ref,
+           trim_opts,
+           nomkstream,
+           stream_store
+         ), stream_store}
+      end
+
+      defp apply_generic_batch_command(state, command, stream_store),
+        do: {apply_single(state, command), stream_store}
 
       defp generic_batch_barrier_kind(commands) do
         Enum.find_value(commands, &Ferricstore.Raft.CommandBatching.barrier_kind/1)
@@ -1975,6 +2426,91 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
                 maybe_release_cursor(meta, old_count, new_state, result)
             end
           end)
+        end)
+      end
+
+      def apply(
+            meta,
+            {:stream_append, key, id_spec, fields, trim_opts, nomkstream},
+            state
+          )
+          when is_binary(key) and is_list(fields) and is_boolean(nomkstream) do
+        with_apply_time(meta, fn ->
+          result =
+            case check_fetch_or_compute_lock(state, key, nil) do
+              :ok ->
+                with_pending_writes(state, fn ->
+                  Ferricstore.Commands.Stream.AtomicAppend.run(
+                    key,
+                    id_spec,
+                    fields,
+                    trim_opts,
+                    nomkstream,
+                    build_compound_store(state)
+                  )
+                end)
+
+              {:error, _reason} = error ->
+                error
+            end
+
+          old_count = state.applied_count
+          new_state = %{state | applied_count: old_count + 1}
+          maybe_release_cursor(meta, old_count, new_state, result)
+        end)
+      end
+
+      def apply(
+            meta,
+            {:stream_append_blob_ref, key, id_spec, encoded_ref, trim_opts, nomkstream},
+            state
+          )
+          when is_binary(key) and is_binary(encoded_ref) and is_boolean(nomkstream) do
+        with_apply_time(meta, fn ->
+          result =
+            case check_fetch_or_compute_lock(state, key, nil) do
+              :ok ->
+                with_pending_writes(state, fn ->
+                  Ferricstore.Commands.Stream.AtomicAppend.run_blob_ref(
+                    key,
+                    id_spec,
+                    encoded_ref,
+                    trim_opts,
+                    nomkstream,
+                    build_compound_store(state)
+                  )
+                end)
+
+              {:error, _reason} = error ->
+                error
+            end
+
+          old_count = state.applied_count
+          new_state = %{state | applied_count: old_count + 1}
+          maybe_release_cursor(meta, old_count, new_state, result)
+        end)
+      end
+
+      def apply(meta, {:stream_mutate, key, operation}, state) when is_binary(key) do
+        with_apply_time(meta, fn ->
+          result =
+            case check_fetch_or_compute_lock(state, key, nil) do
+              :ok ->
+                with_pending_writes(state, fn ->
+                  Ferricstore.Commands.Stream.AtomicMutation.run(
+                    key,
+                    operation,
+                    build_compound_store(state)
+                  )
+                end)
+
+              {:error, _reason} = error ->
+                error
+            end
+
+          old_count = state.applied_count
+          new_state = %{state | applied_count: old_count + 1}
+          maybe_release_cursor(meta, old_count, new_state, result)
         end)
       end
 

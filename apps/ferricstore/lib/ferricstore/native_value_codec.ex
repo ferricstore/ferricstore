@@ -28,6 +28,16 @@ defmodule Ferricstore.NativeValueCodec do
 
   def encode(value) when is_atom(value), do: value |> Atom.to_string() |> encode()
 
+  # XRANGE/XREVRANGE rows and several native command tuples use this exact
+  # three-binary shape. Emit the identical wire representation directly,
+  # avoiding four intermediate binaries and two list traversals per row.
+  def encode([first, second, third])
+      when is_binary(first) and is_binary(second) and is_binary(third) do
+    <<5, 3::unsigned-32, 4, byte_size(first)::unsigned-32, first::binary, 4,
+      byte_size(second)::unsigned-32, second::binary, 4, byte_size(third)::unsigned-32,
+      third::binary>>
+  end
+
   def encode(values) when is_list(values) do
     body = values |> Enum.map(&encode/1) |> IO.iodata_to_binary()
     <<5, length(values)::unsigned-32, body::binary>>
@@ -83,6 +93,10 @@ defmodule Ferricstore.NativeValueCodec do
   defp encoded_size(value, size) when is_float(value), do: size + 9
   defp encoded_size(%_{} = struct, size), do: encoded_size(Map.from_struct(struct), size)
 
+  defp encoded_size([first, second, third], size)
+       when is_binary(first) and is_binary(second) and is_binary(third),
+       do: size + 20 + byte_size(first) + byte_size(second) + byte_size(third)
+
   defp encoded_size(values, size) when is_list(values),
     do: Enum.reduce(values, size + 5, &encoded_size/2)
 
@@ -126,6 +140,14 @@ defmodule Ferricstore.NativeValueCodec do
 
   defp consume(value, remaining) when is_float(value), do: consume_bytes(remaining, 9)
   defp consume(%_{} = struct, remaining), do: consume(Map.from_struct(struct), remaining)
+
+  defp consume([first, second, third], remaining)
+       when is_binary(first) and is_binary(second) and is_binary(third) do
+    consume_bytes(
+      remaining,
+      20 + byte_size(first) + byte_size(second) + byte_size(third)
+    )
+  end
 
   defp consume(values, remaining) when is_list(values) do
     with {:ok, remaining} <- consume_bytes(remaining, 5) do

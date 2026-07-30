@@ -3,6 +3,10 @@ defmodule FerricStore.API.Streams do
 
   import FerricStore.API.Store
 
+  alias Ferricstore.Flow.InternalKey
+  alias Ferricstore.Store.Router
+  alias Ferricstore.Stream.ActivityLog, as: StreamActivityLog
+
   @type key :: FerricStore.key()
   @type value :: FerricStore.value()
   @type write_error :: FerricStore.write_error()
@@ -41,6 +45,144 @@ defmodule FerricStore.API.Streams do
 
     wrap_result(result)
   end
+
+  @doc """
+  Appends many entries using one ordered replicated batch per shard.
+
+  Each item is a `{stream_key, fields}` tuple. IDs are generated atomically on
+  the owning shard, and results retain input order. Commands on one shard share
+  one Raft/WAL entry; commands spanning shards are committed independently and
+  concurrently.
+
+  This is a group-commit API, not an all-or-nothing cross-shard transaction.
+  A per-item error does not roll back successful appends in the same batch.
+
+  ## Examples
+
+      FerricStore.xadd_many([
+        {"events:{tenant-1}", ["type", "created"]},
+        {"events:{tenant-1}", ["type", "updated"]}
+      ])
+      #=> [{:ok, "1711234567890-0"}, {:ok, "1711234567890-1"}]
+
+  """
+  @spec xadd_many([{key(), [binary()]}]) ::
+          [{:ok, binary()} | {:error, term()}] | {:error, binary()}
+  def xadd_many([]), do: []
+
+  def xadd_many(items) when is_list(items) do
+    with {:ok, plan} <- validate_and_plan_xadd_many(items) do
+      ctx = default_ctx()
+
+      ctx
+      |> submit_xadd_many(plan)
+      |> record_xadd_many_activity(items)
+      |> Enum.map(&wrap_xadd_many_result/1)
+    end
+  end
+
+  def xadd_many(_items), do: {:error, "ERR XADD_MANY items must be a list"}
+
+  defp validate_and_plan_xadd_many([{key, _fields} | _rest] = items),
+    do: validate_and_build_xadd_many_plan(items, key, [], nil, false)
+
+  defp validate_and_plan_xadd_many(_items), do: invalid_xadd_many_items()
+
+  defp submit_xadd_many(ctx, {:same_stream, key, fields_lists}),
+    do: Router.stream_append_many_auto(ctx, key, fields_lists)
+
+  defp submit_xadd_many(ctx, {:mixed_streams, items}),
+    do: Router.stream_append_many_auto_mixed(ctx, items)
+
+  defp validate_and_build_xadd_many_plan(
+         [],
+         first_key,
+         reversed_fields,
+         reversed_items,
+         reserved?
+       ) do
+    if reserved? do
+      {:error, InternalKey.error_message()}
+    else
+      plan =
+        case reversed_items do
+          nil -> {:same_stream, first_key, Enum.reverse(reversed_fields)}
+          items -> {:mixed_streams, Enum.reverse(items)}
+        end
+
+      {:ok, plan}
+    end
+  end
+
+  defp validate_and_build_xadd_many_plan(
+         [{key, fields} = item | rest],
+         first_key,
+         reversed_fields,
+         reversed_items,
+         reserved?
+       ) do
+    if valid_xadd_many_item?(item) do
+      {next_reversed_fields, next_reversed_items} =
+        case reversed_items do
+          nil when key == first_key ->
+            {[fields | reversed_fields], nil}
+
+          nil ->
+            prefix_items = Enum.map(reversed_fields, &{first_key, &1})
+
+            {[], [{key, fields} | prefix_items]}
+
+          items ->
+            {reversed_fields, [{key, fields} | items]}
+        end
+
+      validate_and_build_xadd_many_plan(
+        rest,
+        first_key,
+        next_reversed_fields,
+        next_reversed_items,
+        reserved? or InternalKey.reserved?(key)
+      )
+    else
+      invalid_xadd_many_items()
+    end
+  end
+
+  defp validate_and_build_xadd_many_plan(
+         _invalid,
+         _first_key,
+         _reversed_fields,
+         _reversed_commands,
+         _reserved?
+       ),
+       do: invalid_xadd_many_items()
+
+  defp valid_xadd_many_item?({key, [field, value | rest]})
+       when is_binary(key) and is_binary(field) and is_binary(value),
+       do: valid_xadd_many_field_pairs?(rest)
+
+  defp valid_xadd_many_item?(_item), do: false
+
+  defp valid_xadd_many_field_pairs?([]), do: true
+
+  defp valid_xadd_many_field_pairs?([field, value | rest])
+       when is_binary(field) and is_binary(value),
+       do: valid_xadd_many_field_pairs?(rest)
+
+  defp valid_xadd_many_field_pairs?(_invalid), do: false
+
+  defp invalid_xadd_many_items,
+    do: {:error, "ERR XADD_MANY requires {binary_key, non-empty_binary_field_pairs} items"}
+
+  defp record_xadd_many_activity(results, items) do
+    StreamActivityLog.record_xadd_results(results, items)
+    results
+  end
+
+  defp wrap_xadd_many_result({:error, _reason} = error), do: error
+  defp wrap_xadd_many_result({:ok, id}) when is_binary(id), do: {:ok, id}
+  defp wrap_xadd_many_result(id) when is_binary(id), do: {:ok, id}
+  defp wrap_xadd_many_result(other), do: {:error, other}
 
   @doc """
   Returns the number of entries in the stream at `key`.

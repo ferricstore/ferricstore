@@ -112,6 +112,120 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     assert {:ok, ^suffix} = BlobStore.get(root, 0, ref)
   end
 
+  test "prepares a large stream entry without carrying its fields in the Raft command", %{
+    ctx: ctx,
+    root: root
+  } do
+    fields = ["payload", :binary.copy("S", 1024)]
+    encoded_fields = Ferricstore.Commands.Stream.Entries.encode_fields(fields)
+
+    assert {:ok, {:stream_append_blob_ref, "stream", :auto, encoded_ref, nil, false}} =
+             BlobCommand.prepare(
+               ctx,
+               0,
+               {:stream_append, "stream", :auto, fields, nil, false},
+               single_member?: true
+             )
+
+    assert {:ok, ref} = BlobRef.decode(encoded_ref)
+    assert {:ok, ^encoded_fields} = BlobStore.get(root, 0, ref)
+  end
+
+  test "prepares large stream entries inside a generic Raft batch", %{ctx: ctx, root: root} do
+    fields = ["payload", :binary.copy("B", 1024)]
+    encoded_fields = Ferricstore.Commands.Stream.Entries.encode_fields(fields)
+
+    assert {:ok, {:batch, [{:stream_append_blob_ref, "stream", :auto, encoded_ref, nil, false}]}} =
+             BlobCommand.prepare(
+               ctx,
+               0,
+               {:batch, [{:stream_append, "stream", :auto, fields, nil, false}]},
+               single_member?: true
+             )
+
+    assert {:ok, ref} = BlobRef.decode(encoded_ref)
+    assert {:ok, ^encoded_fields} = BlobStore.get(root, 0, ref)
+  end
+
+  test "keeps compact stream batches small and expands only when a member needs a blob", %{
+    ctx: ctx,
+    root: root
+  } do
+    ctx = %{ctx | blob_side_channel_threshold_bytes: 512}
+
+    compact =
+      {:stream_append_many_auto, "stream",
+       [
+         ["payload", "small"],
+         ["payload", "also-small"]
+       ]}
+
+    assert {:ok, ^compact} = BlobCommand.prepare(ctx, 0, compact, single_member?: true)
+
+    large_fields = ["payload", :binary.copy("C", 1024)]
+    encoded_fields = Ferricstore.Commands.Stream.Entries.encode_fields(large_fields)
+
+    assert {:ok,
+            {:batch,
+             [
+               {:stream_append_blob_ref, "stream", :auto, encoded_ref, nil, false},
+               {:stream_append, "stream", :auto, ["payload", "small"], nil, false}
+             ]}} =
+             BlobCommand.prepare(
+               ctx,
+               0,
+               {:stream_append_many_auto, "stream",
+                [
+                  large_fields,
+                  ["payload", "small"]
+                ]},
+               single_member?: true
+             )
+
+    assert {:ok, ref} = BlobRef.decode(encoded_ref)
+    assert {:ok, ^encoded_fields} = BlobStore.get(root, 0, ref)
+  end
+
+  test "keeps grouped stream batches compact and expands large members in input order", %{
+    ctx: ctx,
+    root: root
+  } do
+    ctx = %{ctx | blob_side_channel_threshold_bytes: 512}
+
+    compact =
+      {:stream_append_grouped_auto,
+       [
+         {"stream:a", [["payload", "a"]], [0]},
+         {"stream:b", [["payload", "b"]], [1]}
+       ], 2}
+
+    assert {:ok, ^compact} = BlobCommand.prepare(ctx, 0, compact, single_member?: true)
+
+    large_fields = ["payload", :binary.copy("G", 1024)]
+    encoded_fields = Ferricstore.Commands.Stream.Entries.encode_fields(large_fields)
+
+    assert {:ok,
+            {:batch,
+             [
+               {:stream_append_blob_ref, "stream:a", :auto, encoded_ref, nil, false},
+               {:stream_append, "stream:b", :auto, ["payload", "b"], nil, false},
+               {:stream_append, "stream:a", :auto, ["payload", "a"], nil, false}
+             ]}} =
+             BlobCommand.prepare(
+               ctx,
+               0,
+               {:stream_append_grouped_auto,
+                [
+                  {"stream:a", [large_fields, ["payload", "a"]], [0, 2]},
+                  {"stream:b", [["payload", "b"]], [1]}
+                ], 3},
+               single_member?: true
+             )
+
+    assert {:ok, ref} = BlobRef.decode(encoded_ref)
+    assert {:ok, ^encoded_fields} = BlobStore.get(root, 0, ref)
+  end
+
   test "prepares large setrange as a pre-externalized blob ref", %{ctx: ctx, root: root} do
     patch = :binary.copy("R", 1024)
 

@@ -155,11 +155,39 @@ defmodule Ferricstore.Commands.Stream.Waiters do
         :ok
 
       _ref ->
-        cache_key = CacheKey.build(store, stream_key)
-        notify_cache_key(cache_key, stream_key)
+        if :ets.info(@stream_waiters_table, :size) != 0 do
+          cache_key = CacheKey.build(store, stream_key)
+          notify_cache_key(cache_key, stream_key)
+        end
+
         :ok
     end
   end
+
+  @doc false
+  @spec any?() :: boolean()
+  def any? do
+    case :ets.whereis(@stream_waiters_table) do
+      :undefined -> false
+      _ref -> :ets.info(@stream_waiters_table, :size) != 0
+    end
+  rescue
+    ArgumentError -> false
+  end
+
+  @doc false
+  @spec notify_many([{term(), binary()}]) :: :ok
+  def notify_many(scoped_stream_keys) when is_list(scoped_stream_keys) do
+    if any?() do
+      Enum.each(scoped_stream_keys, fn {_scope, stream_key} = cache_key ->
+        notify_cache_key(cache_key, stream_key)
+      end)
+    end
+
+    :ok
+  end
+
+  def notify_many(_invalid), do: :ok
 
   @spec notify_scope(term()) :: :ok
   def notify_scope(store) do

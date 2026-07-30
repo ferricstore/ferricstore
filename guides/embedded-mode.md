@@ -400,6 +400,13 @@ FerricStore.sadd("set2", ["b", "c", "d"])
 {:ok, id} = FerricStore.xadd("events", ["type", "click", "page", "/home"])
 # id => "1679000000000-0"
 
+# XADD_MANY -- one ordered Raft/WAL group commit per shard
+results = FerricStore.xadd_many([
+  {"events:{tenant-1}", ["type", "click", "page", "/home"]},
+  {"events:{tenant-1}", ["type", "purchase", "sku", "A-42"]}
+])
+# results => [{:ok, id1}, {:ok, id2}]
+
 # XLEN -- stream length
 {:ok, 1} = FerricStore.xlen("events")
 
@@ -412,6 +419,13 @@ FerricStore.sadd("set2", ["b", "c", "d"])
 # XTRIM -- trim by MAXLEN or MINID
 {:ok, trimmed} = FerricStore.xtrim("events", maxlen: 1000)
 ```
+
+`xadd_many/1` generates IDs on the owning shard and preserves input/result
+order. Items on one shard share one replicated log entry. A multi-shard call is
+group-committed independently per shard; it is not an all-or-nothing
+cross-shard transaction. Use multiple physical Stream keys when producer scale
+needs to span shards, and keep one Stream key when a single total order is the
+primary requirement.
 
 **Note:** `XREAD BLOCK`, `XGROUP`, `XREADGROUP`, and `XACK` are only available in native TCP mode. The embedded API does not support blocking reads or consumer groups.
 

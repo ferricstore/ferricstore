@@ -89,6 +89,11 @@ defmodule FerricStore.API.Store do
       getdel: fn k -> Router.getdel(ctx, k) end,
       getex: fn k, e -> Router.getex(ctx, k, e) end,
       setrange: fn k, o, v -> Router.setrange(ctx, k, o, v) end,
+      stream_append: fn key, id_spec, fields, trim_opts, nomkstream ->
+        Router.stream_append(ctx, key, id_spec, fields, trim_opts, nomkstream)
+      end,
+      stream_append_notifies: true,
+      stream_mutate: fn key, operation -> Router.stream_mutate(ctx, key, operation) end,
       compound_get: fn redis_key, compound_key ->
         Router.compound_get(ctx, redis_key, compound_key)
       end,
@@ -122,9 +127,10 @@ defmodule FerricStore.API.Store do
   # Private — stream store builder
   # ---------------------------------------------------------------------------
 
-  def build_stream_store(key) do
-    build_string_store(key)
-  end
+  # FerricStore.Instance implements the Stream/compound Ops boundary directly.
+  # Returning it preserves paged range capabilities and avoids allocating the
+  # general-purpose string adapter (and all of its closures) per Stream call.
+  def build_stream_store(_key), do: default_ctx()
 
   # ---------------------------------------------------------------------------
   # Private — probabilistic structure store builder

@@ -1055,6 +1055,11 @@ defmodule FerricStore.Impl do
       list_op: fn key, op -> Router.list_op(ctx, key, op) end,
       prob_write: fn cmd -> Router.prob_write(ctx, cmd) end,
       key_lifecycle: fn command -> Router.key_lifecycle(ctx, command) end,
+      stream_append: fn key, id_spec, fields, trim_opts, nomkstream ->
+        Router.stream_append(ctx, key, id_spec, fields, trim_opts, nomkstream)
+      end,
+      stream_append_notifies: true,
+      stream_mutate: fn key, operation -> Router.stream_mutate(ctx, key, operation) end,
       prob_dir: fn ->
         # For compound store, use shard 0's prob dir as default
         shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)

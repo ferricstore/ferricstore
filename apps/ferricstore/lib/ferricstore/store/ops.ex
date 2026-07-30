@@ -744,6 +744,39 @@ defmodule Ferricstore.Store.Ops do
   def list_op(%LocalTxStore{} = tx, key, op), do: Router.list_op(tx.instance_ctx, key, op)
   def list_op(store, key, op) when is_map(store), do: store.list_op.(key, op)
 
+  # --- Stream mutation operations ---
+
+  @spec stream_append(store(), binary(), term(), [binary()], term() | nil, boolean()) :: term()
+  def stream_append(%FerricStore.Instance{} = ctx, key, id_spec, fields, trim_opts, nomkstream) do
+    Router.stream_append(ctx, key, id_spec, fields, trim_opts, nomkstream)
+  end
+
+  def stream_append(%LocalTxStore{}, _key, _id_spec, _fields, _trim_opts, _nomkstream),
+    do: :unsupported
+
+  def stream_append(store, key, id_spec, fields, trim_opts, nomkstream) when is_map(store) do
+    case store do
+      %{stream_append: append} when is_function(append, 5) ->
+        append.(key, id_spec, fields, trim_opts, nomkstream)
+
+      _ ->
+        :unsupported
+    end
+  end
+
+  @spec stream_mutate(store(), binary(), term()) :: term()
+  def stream_mutate(%FerricStore.Instance{} = ctx, key, operation),
+    do: Router.stream_mutate(ctx, key, operation)
+
+  def stream_mutate(%LocalTxStore{}, _key, _operation), do: :unsupported
+
+  def stream_mutate(store, key, operation) when is_map(store) do
+    case store do
+      %{stream_mutate: mutate} when is_function(mutate, 2) -> mutate.(key, operation)
+      _ -> :unsupported
+    end
+  end
+
   # --- Compound key capability check ---
 
   @spec has_compound?(store()) :: boolean()

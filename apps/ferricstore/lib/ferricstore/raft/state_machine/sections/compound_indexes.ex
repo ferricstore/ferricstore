@@ -79,7 +79,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       defp zset_index_put(
              %{zset_score_index_name: index, zset_score_lookup_name: lookup},
              redis_key,
-             key,
+             <<"Z:", _rest::binary>> = key,
              value
            )
            when index != nil and lookup != nil do
@@ -101,7 +101,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
              redis_key,
              key
            )
-           when index != nil and lookup != nil do
+           when index != nil and lookup != nil and
+                  (key == <<"T:", redis_key::binary>> or
+                     (is_binary(key) and byte_size(key) >= 2 and
+                        binary_part(key, 0, 2) == "Z:")) do
         operation = zset_index_delete_op(index, lookup, redis_key, key)
 
         if standalone_staged_apply?() do
@@ -118,7 +121,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       defp queue_zset_index_put_after_flush(
              %{zset_score_index_name: index, zset_score_lookup_name: lookup},
              redis_key,
-             key,
+             <<"Z:", _rest::binary>> = key,
              value
            )
            when index != nil and lookup != nil do
@@ -132,7 +135,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
              redis_key,
              key
            )
-           when index != nil and lookup != nil do
+           when index != nil and lookup != nil and
+                  (key == <<"T:", redis_key::binary>> or
+                     (is_binary(key) and byte_size(key) >= 2 and
+                        binary_part(key, 0, 2) == "Z:")) do
         queue_pending_zset_index_op(zset_index_delete_op(index, lookup, redis_key, key))
       end
 
@@ -282,14 +288,250 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         :ok
       end
 
-      defp flush_pending_stream_cache_cleanups do
-        pending = Process.put(:sm_pending_stream_cache_cleanups, MapSet.new())
+      defp queue_stream_cache_append({_scope, key} = cache_key, update)
+           when is_binary(key) and is_tuple(update) do
+        pending = Process.get(:sm_pending_stream_cache_updates, [])
+        Process.put(:sm_pending_stream_cache_updates, [{cache_key, update} | pending])
+        :ok
+      end
 
-        Enum.each(pending, fn {scope, key} ->
+      defp queue_stream_cache_append_many(
+             {_scope, key} = cache_key,
+             latest_update,
+             member_entries
+           )
+           when is_binary(key) and is_tuple(latest_update) and is_list(member_entries) and
+                  member_entries != [] do
+        pending = Process.get(:sm_pending_stream_cache_updates, [])
+
+        Process.put(:sm_pending_stream_cache_updates, [
+          {cache_key, {:append_many, latest_update, member_entries}} | pending
+        ])
+
+        :ok
+      end
+
+      defp queue_stream_group_update({_scope, key} = cache_key, update)
+           when is_binary(key) and is_tuple(update) do
+        pending = Process.get(:sm_pending_stream_group_updates, [])
+        Process.put(:sm_pending_stream_group_updates, [{cache_key, update} | pending])
+        :ok
+      end
+
+      defp flush_pending_stream_cache_cleanups do
+        cleanups = Process.put(:sm_pending_stream_cache_cleanups, MapSet.new())
+        updates = Process.put(:sm_pending_stream_cache_updates, [])
+        group_updates = Process.put(:sm_pending_stream_group_updates, [])
+
+        if updates != [] or group_updates != [] do
+          Ferricstore.Commands.Stream.Tables.ensure_all()
+        end
+
+        Enum.each(cleanups, fn {scope, key} ->
           Ferricstore.Commands.Strings.Delete.cleanup_stream_metadata(key, %{cache_scope: scope})
         end)
 
+        compacted_updates =
+          updates
+          |> Enum.reverse()
+          |> compact_pending_stream_cache_updates(cleanups)
+
+        put_pending_stream_meta_many(compacted_updates)
+
+        compacted_updates
+        |> Enum.reduce([], fn
+          {{scope, key} = cache_key, {latest, reversed_updates, notify?}}, notify_keys ->
+            if Ferricstore.Commands.Stream.Index.ready_cache_key?(cache_key) do
+              store = %{cache_scope: scope}
+
+              reversed_updates
+              |> Enum.reverse()
+              |> Enum.each(&apply_pending_stream_index_update(key, &1, store))
+            end
+
+            if notify?, do: [cache_key | notify_keys], else: notify_keys
+        end)
+        |> Ferricstore.Commands.Stream.Waiters.notify_many()
+
+        group_updates
+        |> Enum.reverse()
+        |> Enum.each(fn
+          {{scope, key} = cache_key, {:invalidate, group}} ->
+            unless MapSet.member?(cleanups, cache_key) do
+              Ferricstore.Commands.Stream.Groups.delete_group_local(
+                %{cache_scope: scope},
+                key,
+                group
+              )
+            end
+
+          {{scope, key} = cache_key, {group, last_delivered, consumers, pending}} ->
+            unless MapSet.member?(cleanups, cache_key) do
+              Ferricstore.Commands.Stream.Groups.put_local(
+                %{cache_scope: scope},
+                key,
+                group,
+                last_delivered,
+                consumers,
+                pending
+              )
+            end
+        end)
+
         :ok
+      end
+
+      defp publish_terminal_stream_cache(
+             %Ferricstore.Commands.Stream.AtomicAppend.Publication{} = publication
+           ) do
+        Ferricstore.Commands.Stream.Tables.ensure_all()
+        Ferricstore.Commands.Stream.Meta.put_local_many([publication.cache_entry])
+        cache_key = elem(publication.cache_entry, 0)
+
+        if Ferricstore.Commands.Stream.Index.any_ready?() and
+             Ferricstore.Commands.Stream.Index.ready_cache_key?(cache_key) do
+          Ferricstore.Commands.Stream.Index.insert_member_entries_cache_key(
+            cache_key,
+            publication.member_entries
+          )
+        end
+
+        if Ferricstore.Commands.Stream.Waiters.any?() do
+          Ferricstore.Commands.Stream.Waiters.notify_many([cache_key])
+        end
+      end
+
+      defp publish_terminal_stream_cache(
+             [%Ferricstore.Commands.Stream.AtomicAppend.Publication{} | _rest] = publications
+           ) do
+        Ferricstore.Commands.Stream.Tables.ensure_all()
+
+        cache_entries = Enum.map(publications, & &1.cache_entry)
+        Ferricstore.Commands.Stream.Meta.put_local_many(cache_entries)
+
+        notify? = Ferricstore.Commands.Stream.Waiters.any?()
+
+        notify_keys =
+          if Ferricstore.Commands.Stream.Index.any_ready?() do
+            Enum.reduce(publications, [], fn publication, notify_keys ->
+              cache_key = elem(publication.cache_entry, 0)
+
+              if Ferricstore.Commands.Stream.Index.ready_cache_key?(cache_key) do
+                Ferricstore.Commands.Stream.Index.insert_member_entries_cache_key(
+                  cache_key,
+                  publication.member_entries
+                )
+              end
+
+              if notify?, do: [cache_key | notify_keys], else: notify_keys
+            end)
+          else
+            if notify? do
+              Enum.map(publications, &elem(&1.cache_entry, 0))
+            else
+              []
+            end
+          end
+
+        if notify?, do: Ferricstore.Commands.Stream.Waiters.notify_many(notify_keys)
+      end
+
+      defp publish_terminal_stream_cache(_publication), do: :ok
+
+      defp compact_pending_stream_cache_updates(updates, cleanups) do
+        Enum.reduce(updates, %{}, fn
+          {cache_key, {:append_many, latest_update, member_entries}}, compacted ->
+            compact_pending_stream_append_many(
+              compacted,
+              cleanups,
+              cache_key,
+              latest_update,
+              member_entries
+            )
+
+          {cache_key, update}, compacted ->
+            if MapSet.member?(cleanups, cache_key) do
+              compacted
+            else
+              notify? = elem(update, 0) == :append
+
+              Map.update(
+                compacted,
+                cache_key,
+                {update, [update], notify?},
+                fn {_latest, reversed_updates, prior_notify?} ->
+                  {update, [update | reversed_updates], prior_notify? or notify?}
+                end
+              )
+            end
+        end)
+      end
+
+      defp compact_pending_stream_append_many(
+             compacted,
+             cleanups,
+             cache_key,
+             latest_update,
+             member_entries
+           ) do
+        if MapSet.member?(cleanups, cache_key) do
+          compacted
+        else
+          index_update = {:append_members, member_entries}
+
+          Map.update(
+            compacted,
+            cache_key,
+            {latest_update, [index_update], true},
+            fn {_prior_latest, prior_reversed, _prior_notify?} ->
+              {latest_update, [index_update | prior_reversed], true}
+            end
+          )
+        end
+      end
+
+      defp put_pending_stream_meta_many(compacted_updates) do
+        entries =
+          Enum.map(compacted_updates, fn {cache_key, {latest, _updates, _notify?}} ->
+            pending_stream_meta_entry(cache_key, latest)
+          end)
+
+        Ferricstore.Commands.Stream.Meta.put_local_many(entries)
+      end
+
+      defp pending_stream_meta_entry(
+             cache_key,
+             {:mutate, len, first, last, ms, seq, _delete_ids}
+           ),
+           do: {cache_key, len, first, last, ms, seq}
+
+      defp pending_stream_meta_entry(
+             cache_key,
+             {:append, len, first, last, ms, seq, _id_str, _retained?, _delete_ids}
+           ),
+           do: {cache_key, len, first, last, ms, seq}
+
+      defp apply_pending_stream_index_update(
+             key,
+             {:mutate, _len, _first, _last, _ms, _seq, delete_ids},
+             store
+           ),
+           do: Ferricstore.Commands.Stream.Index.delete_ids(key, delete_ids, store)
+
+      defp apply_pending_stream_index_update(
+             key,
+             {:append, _len, _first, _last, _ms, _seq, id_str, retained?, delete_ids},
+             store
+           ) do
+        Ferricstore.Commands.Stream.Index.delete_ids(key, delete_ids, store)
+
+        if retained? do
+          Ferricstore.Commands.Stream.Index.insert_id(key, id_str, store)
+        end
+      end
+
+      defp apply_pending_stream_index_update(key, {:append_members, member_entries}, store) do
+        Ferricstore.Commands.Stream.Index.insert_member_entries(key, member_entries, store)
       end
 
       defp apply_pending_zset_index_op({:put, index, lookup, redis_key, key, value}) do
@@ -443,6 +685,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
                  Ferricstore.Store.CompoundKey.stream_group_prefix(key)
                ),
              :ok <-
+               do_compound_delete_prefix(
+                 state,
+                 key,
+                 Ferricstore.Store.CompoundKey.stream_pending_prefix(key)
+               ),
+             :ok <-
+               do_compound_delete_prefix(
+                 state,
+                 key,
+                 Ferricstore.Store.CompoundKey.stream_consumer_prefix(key)
+               ),
+             :ok <-
                do_compound_delete(
                  state,
                  key,
@@ -561,6 +815,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
           delta = binary_byte_size(key) + binary_byte_size(new_ets_val)
           if delta != 0, do: :atomics.add(ref, state.shard_index + 1, delta)
         end
+      end
+
+      defp missing_keydir_binary_bytes(key, value) do
+        binary_byte_size(key) + binary_byte_size(value)
+      end
+
+      defp add_keydir_binary_bytes(_state, 0), do: :ok
+
+      defp add_keydir_binary_bytes(state, bytes) when is_integer(bytes) and bytes > 0 do
+        if ref = keydir_binary_ref(state) do
+          :atomics.add(ref, state.shard_index + 1, bytes)
+        end
+
+        :ok
       end
 
       # Tracks off-heap binary bytes when deleting a key from ETS.

@@ -189,6 +189,15 @@ How FerricStore stores streams:
 - `XREAD BLOCK`, `XGROUP`, `XREADGROUP`, and `XACK` require native TCP mode
   because they depend on connection/session wait state.
 
+For producer batching, the embedded `FerricStore.xadd_many/1` API and native
+compact PIPELINE mode 34 assign IDs inside the shard state machine and use one
+Raft/WAL entry per touched shard. Repeating one physical key gives one ordered
+Stream with group commit. Distributing items across physical partition keys
+uses multiple shard groups concurrently, with ordering and consumer groups kept
+per partition. Partitioning is a capacity option rather than a guaranteed
+speedup; benchmark it on the target storage and cluster topology because one
+well-batched Stream can be faster on a single device.
+
 Use streams for durable event logs, inboxes, handoff queues, audit trails, and
 consumer-group fanout where replay matters. For durable workflow jobs with
 leases, retries, state transitions, and history, use FerricFlow instead of

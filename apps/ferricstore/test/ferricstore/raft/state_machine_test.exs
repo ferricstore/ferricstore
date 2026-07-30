@@ -334,6 +334,68 @@ defmodule Ferricstore.Raft.StateMachineTest do
     assert elem(row, 0) == key
   end
 
+  test "generic batches expose earlier stream appends to later appends", %{
+    state: state,
+    ets: ets
+  } do
+    key = "batched-stream"
+
+    command =
+      {:batch,
+       [
+         {:stream_append, key, {:partial, 1}, ["field", "one"], nil, false},
+         {:stream_append, key, {:partial, 1}, ["field", "two"], nil, false}
+       ]}
+
+    {_new_state, result} = StateMachine.apply(%{}, command, state)
+    assert result == {:ok, ["1-0", "1-1"]}
+
+    entry_prefix = CompoundKey.stream_prefix(key)
+
+    assert ets
+           |> :ets.tab2list()
+           |> Enum.count(fn {compound_key, _, _, _, _, _, _} ->
+             String.starts_with?(compound_key, entry_prefix)
+           end) == 2
+  end
+
+  test "failed WAL append publishes none of a grouped multi-topic Stream batch", %{
+    state: state,
+    ets: ets
+  } do
+    keys = ["multi-publication:a", "multi-publication:b"]
+
+    commands =
+      Enum.map(0..15, fn index ->
+        key = Enum.at(keys, rem(index, length(keys)))
+        {:stream_append, key, :auto, ["value", Integer.to_string(index)], nil, false}
+      end)
+
+    previous_hook = Application.get_env(:ferricstore, :pending_append_hook)
+
+    Application.put_env(:ferricstore, :pending_append_hook, fn _path, _batch ->
+      {:error, :forced_multi_stream_append_failure}
+    end)
+
+    try do
+      assert {_new_state, {:error, {:bitcask_append_failed, :forced_multi_stream_append_failure}}} =
+               StateMachine.apply(%{}, {:batch, commands}, state)
+
+      Enum.each(keys, fn key ->
+        assert [] == :ets.lookup(ets, CompoundKey.type_key(key))
+        assert [] == :ets.lookup(ets, CompoundKey.stream_meta_key(key))
+
+        assert {:ok, []} ==
+                 Ferricstore.Store.Shard.CompoundMemberIndex.keys_for_prefix(
+                   state.compound_member_index_name,
+                   CompoundKey.stream_prefix(key)
+                 )
+      end)
+    after
+      restore_env(:pending_append_hook, previous_hook)
+    end
+  end
+
   @tag :invalid_batch_shape
   test "non-list batch envelopes are rejected without crashing apply", %{state: state} do
     commands = [{:batch, :not_a_list}, {:cross_shard_tx, :not_a_list}]

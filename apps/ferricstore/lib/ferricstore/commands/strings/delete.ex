@@ -120,7 +120,17 @@ defmodule Ferricstore.Commands.Strings.Delete do
   defp delete_list_meta_if_needed(_key, _type_str, _store), do: :ok
 
   defp delete_stream_groups_if_needed(key, "stream", store) do
-    Ops.compound_delete_prefix(store, key, CompoundKey.stream_group_prefix(key))
+    [
+      CompoundKey.stream_group_prefix(key),
+      CompoundKey.stream_pending_prefix(key),
+      CompoundKey.stream_consumer_prefix(key)
+    ]
+    |> Enum.reduce_while(:ok, fn prefix, :ok ->
+      case Ops.compound_delete_prefix(store, key, prefix) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
   end
 
   defp delete_stream_groups_if_needed(_key, _type_str, _store), do: :ok
@@ -178,14 +188,21 @@ defmodule Ferricstore.Commands.Strings.Delete do
   defp maybe_delete_stream_key(key, store) do
     prefix = CompoundKey.stream_prefix(key)
     group_prefix = CompoundKey.stream_group_prefix(key)
+    pending_prefix = CompoundKey.stream_pending_prefix(key)
+    consumer_prefix = CompoundKey.stream_consumer_prefix(key)
     meta_key = CompoundKey.stream_meta_key(key)
 
     with {:ok, stream_entries?} <- compound_prefix_present?(store, key, prefix),
          {:ok, group_entries?} <- compound_prefix_present?(store, key, group_prefix),
+         {:ok, pending_entries?} <- compound_prefix_present?(store, key, pending_prefix),
+         {:ok, consumer_entries?} <- compound_prefix_present?(store, key, consumer_prefix),
          {:ok, stream_meta?} <- compound_key_present?(store, key, meta_key) do
-      if stream_entries? or group_entries? or stream_meta? or stream_metadata_exists?(key, store) do
+      if stream_entries? or group_entries? or pending_entries? or consumer_entries? or
+           stream_meta? or stream_metadata_exists?(key, store) do
         with :ok <- Ops.compound_delete_prefix(store, key, prefix),
              :ok <- Ops.compound_delete_prefix(store, key, group_prefix),
+             :ok <- Ops.compound_delete_prefix(store, key, pending_prefix),
+             :ok <- Ops.compound_delete_prefix(store, key, consumer_prefix),
              :ok <- Ops.compound_delete(store, key, meta_key) do
           case cleanup_stream_metadata(key, store) do
             :ok -> true

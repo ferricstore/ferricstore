@@ -47,6 +47,104 @@ defmodule Ferricstore.Commands.Stream.Groups do
   end
 
   @doc false
+  @spec serialized_entry(map(), binary(), binary()) ::
+          :missing | {:ok, binary(), map(), map()} | {:error, term()}
+  def serialized_entry(store, key, group) do
+    case serialized_state(store, key, group) do
+      {:v1, last_delivered, consumers, pending} ->
+        {:ok, last_delivered, consumers, pending}
+
+      {:v2, last_delivered} ->
+        load_split_state(store, key, group, last_delivered)
+
+      other ->
+        other
+    end
+  end
+
+  @doc false
+  @spec serialized_state(map(), binary(), binary()) ::
+          :missing
+          | {:v1, binary(), map(), map()}
+          | {:v2, binary()}
+          | {:error, term()}
+  def serialized_state(store, key, group) do
+    case Ops.compound_get(store, key, group_key(key, group)) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
+      nil ->
+        :missing
+
+      raw ->
+        case decode_state(raw) do
+          {:ok, last_delivered, consumers, pending} ->
+            {:v1, last_delivered, consumers, pending}
+
+          {:ok, last_delivered} ->
+            {:v2, last_delivered}
+
+          :error ->
+            ReadResult.failure(:invalid_stream_group_state)
+        end
+    end
+  end
+
+  @doc false
+  @spec serialized_put_entry(binary(), binary(), binary(), map(), map()) ::
+          {binary(), binary(), 0}
+  def serialized_put_entry(key, group, last_delivered, consumers, pending) do
+    {group_key(key, group), encode_state(last_delivered, consumers, pending), 0}
+  end
+
+  @doc false
+  @spec serialized_v2_put_entry(binary(), binary(), binary()) :: {binary(), binary(), 0}
+  def serialized_v2_put_entry(key, group, last_delivered) do
+    {group_key(key, group), encode_v2_state(last_delivered), 0}
+  end
+
+  @doc false
+  @spec serialized_delivery_entries(binary(), binary(), binary(), [[binary()]], non_neg_integer()) ::
+          [{binary(), binary(), 0}]
+  def serialized_delivery_entries(key, group, consumer, entries, delivered_at_ms) do
+    pending_entries =
+      Enum.map(entries, fn [id | _fields] ->
+        {CompoundKey.stream_pending(key, group, id), encode_pending(consumer, delivered_at_ms), 0}
+      end)
+
+    [
+      {CompoundKey.stream_consumer(key, group, consumer), encode_consumer(delivered_at_ms), 0}
+      | pending_entries
+    ]
+  end
+
+  @doc false
+  @spec pending_keys(binary(), binary(), [binary()]) :: [binary()]
+  def pending_keys(key, group, ids) do
+    Enum.map(ids, &CompoundKey.stream_pending(key, group, &1))
+  end
+
+  @doc false
+  @spec existing_pending_ids(map(), binary(), binary(), [binary()]) ::
+          {:ok, [binary()]} | {:error, term()}
+  def existing_pending_ids(store, key, group, ids) do
+    unique_ids = Enum.uniq(ids)
+    values = Ops.compound_batch_get(store, key, pending_keys(key, group, unique_ids))
+
+    case ReadResult.first_failure(values) do
+      nil -> validate_pending_values(unique_ids, values, [])
+      failure -> failure
+    end
+  end
+
+  @doc false
+  @spec put_local(term(), binary(), binary(), binary(), map(), map()) :: true
+  def put_local(store, key, group, last_delivered, consumers, pending) do
+    ensure_table()
+    cache(store, key, group, last_delivered, consumers, pending)
+  end
+
+  @doc false
   @spec pending_growth_bound(binary(), non_neg_integer()) :: non_neg_integer()
   def pending_growth_bound(consumer, count)
       when is_binary(consumer) and is_integer(count) and count >= 0 do
@@ -103,13 +201,23 @@ defmodule Ferricstore.Commands.Stream.Groups do
     )
   end
 
+  @doc false
+  @spec delete_group_local(term(), binary(), binary()) :: true
+  def delete_group_local(store, stream_key, group) do
+    ensure_table()
+    :ets.delete(@groups_table, {CacheKey.build(store, stream_key), group})
+  end
+
   @spec delete(map(), binary(), binary()) :: :ok | {:error, term()}
   def delete(store, key, group) do
     ensure_table()
 
     result =
       if Ops.has_compound?(store) do
-        Ops.compound_delete(store, key, group_key(key, group))
+        with :ok <- delete_split_group_entries(store, key, group),
+             :ok <- Ops.compound_delete(store, key, group_key(key, group)) do
+          :ok
+        end
       else
         :ok
       end
@@ -196,21 +304,28 @@ defmodule Ferricstore.Commands.Stream.Groups do
 
   defp load_persisted(store, key, group) do
     if Ops.has_compound?(store) do
-      case Ops.compound_get(store, key, group_key(key, group)) do
+      case serialized_state(store, key, group) do
         {:error, {:storage_read_failed, _reason}} = failure ->
           ReadResult.command_error(failure)
 
-        nil ->
+        :missing ->
           :missing
 
-        raw ->
-          case decode_state(raw) do
-            {:ok, last_delivered, consumers, pending} ->
-              cache(store, key, group, last_delivered, consumers, pending)
-              {:ok, last_delivered, consumers, pending}
+        {:v1, last_delivered, consumers, pending} ->
+          cache(store, key, group, last_delivered, consumers, pending)
+          {:ok, last_delivered, consumers, pending}
 
-            :error ->
-              ReadResult.command_error(ReadResult.failure(:invalid_stream_group_state))
+        {:v2, last_delivered} ->
+          case load_split_state(store, key, group, last_delivered) do
+            {:ok, ^last_delivered, consumers, pending} = loaded ->
+              cache(store, key, group, last_delivered, consumers, pending)
+              loaded
+
+            {:error, {:storage_read_failed, _reason}} = failure ->
+              ReadResult.command_error(failure)
+
+            {:error, _reason} = failure ->
+              ReadResult.command_error(failure)
           end
       end
     else
@@ -233,6 +348,18 @@ defmodule Ferricstore.Commands.Stream.Groups do
     TermCodec.encode({:stream_group, 1, last_delivered, consumers, pending})
   end
 
+  defp encode_v2_state(last_delivered) do
+    TermCodec.encode({:stream_group, 2, last_delivered})
+  end
+
+  defp encode_pending(consumer, delivered_at_ms) do
+    TermCodec.encode({:stream_pending, 1, consumer, delivered_at_ms})
+  end
+
+  defp encode_consumer(seen_at_ms) do
+    TermCodec.encode({:stream_consumer, 1, seen_at_ms})
+  end
+
   defp decode_state(raw) when is_binary(raw) do
     case TermCodec.decode(raw) do
       {:ok, {:stream_group, 1, last_delivered, consumers, pending}}
@@ -243,12 +370,187 @@ defmodule Ferricstore.Commands.Stream.Groups do
           :error
         end
 
+      {:ok, {:stream_group, 2, last_delivered}} when is_binary(last_delivered) ->
+        if valid_stream_id?(last_delivered), do: {:ok, last_delivered}, else: :error
+
       _other ->
         :error
     end
   end
 
   defp decode_state(_raw), do: :error
+
+  defp load_split_state(store, key, group, last_delivered) do
+    with {:ok, pending} <- load_split_pending(store, key, group),
+         {:ok, consumers} <- load_split_consumers(store, key, group) do
+      {:ok, last_delivered, consumers, pending}
+    end
+  end
+
+  defp load_split_pending(store, key, group) do
+    root = CompoundKey.stream_pending_prefix(key)
+
+    group_prefix =
+      split_group_member_prefix(root, CompoundKey.stream_pending_group_prefix(key, group))
+
+    with {:ok, pairs} <- scan_split_entries(store, key, root, group_prefix) do
+      Enum.reduce_while(pairs, {:ok, %{}}, fn {member, raw}, {:ok, pending} ->
+        id = suffix_after_prefix(member, group_prefix)
+
+        case {ID.parse_full_id(id), decode_pending(raw)} do
+          {{:ok, _parsed}, {:ok, consumer, delivered_at_ms}} ->
+            {:cont, {:ok, Map.put(pending, id, {consumer, delivered_at_ms})}}
+
+          _invalid ->
+            {:halt, ReadResult.failure(:invalid_stream_group_state)}
+        end
+      end)
+    end
+  end
+
+  defp load_split_consumers(store, key, group) do
+    root = CompoundKey.stream_consumer_prefix(key)
+
+    group_prefix =
+      split_group_member_prefix(root, CompoundKey.stream_consumer_group_prefix(key, group))
+
+    with {:ok, pairs} <- scan_split_entries(store, key, root, group_prefix) do
+      Enum.reduce_while(pairs, {:ok, %{}}, fn {member, raw}, {:ok, consumers} ->
+        consumer = suffix_after_prefix(member, group_prefix)
+
+        case decode_consumer(raw) do
+          {:ok, seen_at_ms} ->
+            {:cont, {:ok, Map.put(consumers, consumer, seen_at_ms)}}
+
+          _invalid ->
+            {:halt, ReadResult.failure(:invalid_stream_group_state)}
+        end
+      end)
+    end
+  end
+
+  defp scan_split_entries(store, key, root, group_prefix) do
+    case Ops.compound_fields(store, key, root) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
+      fields when is_list(fields) ->
+        matching = Enum.filter(fields, &starts_with?(&1, group_prefix))
+        values = Ops.compound_batch_get(store, key, Enum.map(matching, &(root <> &1)))
+
+        case ReadResult.first_failure(values) do
+          nil when length(values) == length(matching) -> {:ok, Enum.zip(matching, values)}
+          nil -> ReadResult.failure(:invalid_stream_group_state)
+          failure -> failure
+        end
+
+      _invalid ->
+        ReadResult.failure(:invalid_stream_group_state)
+    end
+  end
+
+  defp delete_split_group_entries(store, key, group) do
+    with {:ok, pending_keys} <- split_group_keys(store, key, group, :pending),
+         {:ok, consumer_keys} <- split_group_keys(store, key, group, :consumer) do
+      Ops.compound_batch_delete(store, key, pending_keys ++ consumer_keys)
+    end
+  end
+
+  defp split_group_keys(store, key, group, :pending) do
+    split_group_keys(
+      store,
+      key,
+      CompoundKey.stream_pending_prefix(key),
+      CompoundKey.stream_pending_group_prefix(key, group)
+    )
+  end
+
+  defp split_group_keys(store, key, group, :consumer) do
+    split_group_keys(
+      store,
+      key,
+      CompoundKey.stream_consumer_prefix(key),
+      CompoundKey.stream_consumer_group_prefix(key, group)
+    )
+  end
+
+  defp split_group_keys(store, key, root, full_group_prefix) do
+    group_prefix = split_group_member_prefix(root, full_group_prefix)
+
+    case Ops.compound_fields(store, key, root) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
+      fields when is_list(fields) ->
+        keys =
+          fields
+          |> Enum.filter(&starts_with?(&1, group_prefix))
+          |> Enum.map(&(root <> &1))
+
+        {:ok, keys}
+
+      _invalid ->
+        ReadResult.failure(:invalid_stream_group_state)
+    end
+  end
+
+  defp validate_pending_values([], [], acc), do: {:ok, Enum.reverse(acc)}
+
+  defp validate_pending_values([_id | ids], [nil | values], acc),
+    do: validate_pending_values(ids, values, acc)
+
+  defp validate_pending_values([id | ids], [raw | values], acc) do
+    case decode_pending(raw) do
+      {:ok, _consumer, _delivered_at_ms} ->
+        validate_pending_values(ids, values, [id | acc])
+
+      :error ->
+        ReadResult.failure(:invalid_stream_group_state)
+    end
+  end
+
+  defp validate_pending_values(_ids, _values, _acc),
+    do: ReadResult.failure(:invalid_stream_group_state)
+
+  defp decode_pending(raw) when is_binary(raw) do
+    case TermCodec.decode(raw) do
+      {:ok, {:stream_pending, 1, consumer, delivered_at_ms}}
+      when is_binary(consumer) and is_integer(delivered_at_ms) and delivered_at_ms >= 0 ->
+        {:ok, consumer, delivered_at_ms}
+
+      _invalid ->
+        :error
+    end
+  end
+
+  defp decode_pending(_raw), do: :error
+
+  defp decode_consumer(raw) when is_binary(raw) do
+    case TermCodec.decode(raw) do
+      {:ok, {:stream_consumer, 1, seen_at_ms}}
+      when is_integer(seen_at_ms) and seen_at_ms >= 0 ->
+        {:ok, seen_at_ms}
+
+      _invalid ->
+        :error
+    end
+  end
+
+  defp decode_consumer(_raw), do: :error
+
+  defp split_group_member_prefix(root, full_group_prefix) do
+    CompoundKey.extract_subkey(full_group_prefix, root)
+  end
+
+  defp starts_with?(value, prefix) do
+    value_size = byte_size(value)
+    prefix_size = byte_size(prefix)
+    value_size >= prefix_size and binary_part(value, 0, prefix_size) == prefix
+  end
+
+  defp suffix_after_prefix(value, prefix) do
+    binary_part(value, byte_size(prefix), byte_size(value) - byte_size(prefix))
+  end
 
   defp valid_state?(last_delivered, consumers, pending) do
     valid_stream_id?(last_delivered) and valid_consumers?(consumers) and

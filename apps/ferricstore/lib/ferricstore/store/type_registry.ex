@@ -309,6 +309,29 @@ defmodule Ferricstore.Store.TypeRegistry do
   end
 
   @doc false
+  @spec check_type_status(binary(), CompoundKey.data_type(), binary(), map()) ::
+          {:ok, boolean()} | {:error, binary()} | ReadResult.failure()
+  def check_type_status(redis_key, type, type_key, store)
+      when is_binary(redis_key) and is_binary(type_key) do
+    expected = CompoundKey.encode_type(type)
+
+    case Ops.compound_get(store, redis_key, type_key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
+      nil ->
+        if has_exists?(store) and Ops.exists?(store, redis_key) do
+          {:error, @wrongtype_msg}
+        else
+          {:ok, false}
+        end
+
+      actual ->
+        checked_observed_type_status(redis_key, actual, expected, store)
+    end
+  end
+
+  @doc false
   @spec command_check_type(binary(), CompoundKey.data_type(), map()) ::
           :ok | {:error, binary()}
   def command_check_type(redis_key, type, store) do
@@ -319,6 +342,22 @@ defmodule Ferricstore.Store.TypeRegistry do
 
   defp matching_type_marker?(actual, expected) do
     CompoundKey.type_name(actual) == expected
+  end
+
+  defp checked_observed_type_status(_redis_key, actual, expected, _store)
+       when actual == expected,
+       do: {:ok, true}
+
+  defp checked_observed_type_status(redis_key, actual, expected, store) do
+    if matching_type_marker?(actual, expected) do
+      {:ok, true}
+    else
+      case resolve_type_marker(redis_key, actual, store) do
+        {:error, {:storage_read_failed, _reason}} = failure -> failure
+        "none" -> {:ok, false}
+        _live_type -> {:error, @wrongtype_msg}
+      end
+    end
   end
 
   # Check if the store supports `exists?` — closure maps may omit it.

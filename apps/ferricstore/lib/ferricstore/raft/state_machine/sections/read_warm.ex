@@ -673,6 +673,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       # collections are resolved to their dedicated log before any access.
       defp build_compound_store(state) do
         %{
+          cache_scope: state.instance_name,
+          compound_write_budget: state.apply_context.compound_member_apply_budget,
+          max_value_size: state.apply_context.max_value_size,
+          stream_range_pages: true,
+          defer_stream_cleanup: &queue_stream_cache_cleanup/1,
+          defer_stream_append: &queue_stream_cache_append/2,
+          defer_stream_append_many: &queue_stream_cache_append_many/3,
+          defer_stream_group: &queue_stream_group_update/2,
+          validate_value: fn value ->
+            Ferricstore.Raft.ApplyLimits.validate_value(state, value)
+          end,
           compound_get: fn redis_key, compound_key ->
             sm_store_compound_get(state, redis_key, compound_key)
           end,
@@ -681,6 +692,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           end,
           compound_batch_put: fn redis_key, entries ->
             do_compound_batch_put(state, redis_key, entries)
+          end,
+          terminal_stream_validated_batch_put: fn redis_key, member_prefix, entries ->
+            do_terminal_stream_validated_batch_put(state, redis_key, member_prefix, entries)
+          end,
+          terminal_stream_validated_grouped_batch_put: fn batches ->
+            do_grouped_terminal_stream_validated_batches_put(state, batches)
+          end,
+          compound_blob_batch_put: fn redis_key, entries ->
+            case apply_compound_blob_batch_put_entries(state, redis_key, entries) do
+              results when is_list(results) -> Enum.find(results, :ok, &(&1 != :ok))
+              result -> result
+            end
           end,
           compound_delete: fn redis_key, compound_key ->
             do_compound_delete(state, redis_key, compound_key)
@@ -711,6 +734,62 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
               &Enum.sort_by(&1, fn {field, _} -> field end)
             )
           end,
+          compound_scan_page: fn redis_key, prefix, cursor, count, match_pattern, fields_only ->
+            index = Map.get(state, :compound_member_index_name)
+            shard_state = shard_ets_state(state)
+
+            hot_stream_page =
+              if match_pattern == nil and not fields_only do
+                CompoundMemberIndex.hot_stream_page(
+                  index,
+                  shard_state.keydir,
+                  prefix,
+                  cursor,
+                  count
+                )
+              else
+                :fallback
+              end
+
+            case hot_stream_page do
+              {:ok, {next_cursor, pairs}} ->
+                {:ok, {next_cursor, pairs}}
+
+              _fallback ->
+                case CompoundMemberIndex.scan_page(
+                       index,
+                       shard_state,
+                       prefix,
+                       cursor,
+                       count,
+                       match_pattern
+                     ) do
+                  {:ok, {next_cursor, members}} when fields_only ->
+                    {:ok, {next_cursor, Enum.map(members, &{&1, nil})}}
+
+                  {:ok, {next_cursor, members}} ->
+                    values =
+                      Enum.map(members, &sm_store_compound_get(state, redis_key, prefix <> &1))
+
+                    case Ferricstore.Store.ReadResult.first_failure(values) do
+                      nil when length(values) == length(members) ->
+                        {:ok, {next_cursor, Enum.zip(members, values)}}
+
+                      nil ->
+                        Ferricstore.Store.ReadResult.failure(:invalid_compound_scan_page_reply)
+
+                      failure ->
+                        failure
+                    end
+
+                  {:error, reason} ->
+                    Ferricstore.Store.ReadResult.failure({:compound_scan_page_failed, reason})
+
+                  :unavailable ->
+                    Ferricstore.Store.ReadResult.failure(:compound_member_index_unavailable)
+                end
+            end
+          end,
           compound_scan_slice: fn redis_key, prefix, start, count, total ->
             data_path =
               Ferricstore.Store.Shard.Compound.Promoted.promoted_store(state, redis_key) ||
@@ -732,6 +811,30 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
             live_key?(state, key)
           end
         }
+      end
+
+      # Compact terminal Stream commands plan before staging any write. In that
+      # scope an exact hot immortal marker can be observed directly; anything
+      # requiring pending-write visibility, expiry handling, a cold read, or a
+      # promoted log retains the generic compound read path.
+      defp terminal_stream_plan_store(store, state) do
+        Map.put(store, :terminal_stream_type_status, fn redis_key, type_key ->
+          terminal_stream_type_status(state, redis_key, type_key)
+        end)
+      end
+
+      defp terminal_stream_type_status(state, redis_key, type_key) do
+        pending_values = Process.get(:sm_pending_values, %{})
+
+        if map_size(pending_values) == 0 and
+             promoted_compound_path(state, redis_key, type_key) == nil do
+          case committed_keydir_lookup(state, type_key) do
+            [{^type_key, "stream", 0, _lfu, _fid, _off, _vsize}] -> {:ok, true}
+            _cold_missing_pending_or_other -> :fallback
+          end
+        else
+          :fallback
+        end
       end
 
       defp build_zset_compound_store(state) do
@@ -893,12 +996,111 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         end
       end
 
+      # AtomicAppend constructs every key in this batch from one Stream key,
+      # and the enclosing compact Raft command has already admitted enough
+      # compound-member work. Streams are intentionally shared-log structures;
+      # the dedicated promotion subsystem supports hashes, sets, and sorted
+      # sets only.
+      defp do_terminal_stream_validated_batch_put(
+             _state,
+             _redis_key,
+             _member_prefix,
+             []
+           ),
+           do: :ok
+
+      defp do_terminal_stream_validated_batch_put(
+             state,
+             redis_key,
+             member_prefix,
+             entries
+           ),
+           do:
+             do_shared_compound_batch_put_fast(
+               state,
+               redis_key,
+               entries,
+               {:terminal_stream, member_prefix}
+             )
+
+      # A grouped Stream command is the only producer inside its pending-write
+      # scope. Every preceding row was staged by this same callback, so later
+      # topics can retain the fast publish path without rescanning the growing
+      # pending list to prove that it still contains puts only.
+      defp do_grouped_terminal_stream_validated_batch_put(
+             _state,
+             _redis_key,
+             _member_prefix,
+             []
+           ),
+           do: :ok
+
+      defp do_grouped_terminal_stream_validated_batch_put(
+             state,
+             redis_key,
+             member_prefix,
+             entries
+           ),
+           do:
+             do_shared_compound_batch_put_fast(
+               state,
+               redis_key,
+               entries,
+               {:grouped_terminal_stream, member_prefix}
+             )
+
+      defp do_grouped_terminal_stream_validated_batches_put(_state, []), do: :ok
+
+      defp do_grouped_terminal_stream_validated_batches_put(state, batches) do
+        if compound_shared_fast_path?(state) do
+          do_shared_grouped_stream_batches_put(state, batches)
+        else
+          Enum.reduce_while(batches, :ok, fn {redis_key, member_prefix, entries}, :ok ->
+            case do_grouped_terminal_stream_validated_batch_put(
+                   state,
+                   redis_key,
+                   member_prefix,
+                   entries
+                 ) do
+              :ok -> {:cont, :ok}
+              {:error, _reason} = error -> {:halt, error}
+            end
+          end)
+        end
+      end
+
+      # Group validation guarantees one plan per logical Stream key. Once every
+      # plan resolves to the shared log, stage their already value-validated rows
+      # in one pending-write update while retaining one promotion hint per Stream.
+      defp do_shared_grouped_stream_batches_put(state, batches) do
+        pending = Process.get(:sm_pending_writes, [])
+
+        pending =
+          Enum.reduce(batches, pending, fn {redis_key, member_prefix, entries}, acc ->
+            if standalone_staged_apply?() do
+              Enum.each(entries, fn {compound_key, _value, _expire_at_ms} ->
+                unless binary_has_prefix_and_member?(compound_key, member_prefix) do
+                  record_pending_original(state, compound_key)
+                end
+              end)
+            end
+
+            {acc, last_compound_key} = prepend_terminal_stream_entries(entries, acc, nil)
+
+            acc
+          end)
+
+        Process.put(:sm_pending_writes, pending)
+        Process.put(:sm_pending_fast_put_batch, true)
+        :ok
+      end
+
       defp do_compound_batch_put_value_validated(_state, _redis_key, []), do: :ok
 
       defp do_compound_batch_put_value_validated(state, redis_key, entries) do
         case compound_batch_put_target(state, redis_key, entries) do
           :shared ->
-            do_shared_compound_batch_put_fast(state, redis_key, entries)
+            do_shared_compound_batch_put_fast(state, redis_key, entries, :generic)
 
           {:promoted, dedicated_path} ->
             do_promoted_compound_batch_put(state, redis_key, entries, dedicated_path)
@@ -944,28 +1146,51 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       # put_batch: do not install visible ETS rows until Bitcask returns ordered
       # locations for the whole batch. ZSET side indexes are queued and flushed
       # only after the append succeeds.
-      defp do_shared_compound_batch_put_fast(state, redis_key, entries) do
+      defp do_shared_compound_batch_put_fast(state, redis_key, entries, mode) do
         pending = Process.get(:sm_pending_writes, [])
         pending_values = Process.get(:sm_pending_values, %{})
 
         if compound_shared_fast_path?(state) and
-             fast_put_publish_possible?(pending, pending_values) do
-          case List.last(entries) do
-            {compound_key, _value, _expire_at_ms} ->
-              queue_compound_promotion_after_flush(state, redis_key, compound_key)
+             (grouped_terminal_stream_mode?(mode) or
+                fast_put_publish_possible?(pending, pending_values)) do
+          if standalone_staged_apply?() do
+            terminal_stream_prefix = terminal_stream_prefix(mode)
 
-            nil ->
-              :ok
+            Enum.each(entries, fn {compound_key, _value, _expire_at_ms} ->
+              unless binary_has_prefix_and_member?(compound_key, terminal_stream_prefix) do
+                record_pending_original(state, compound_key)
+              end
+            end)
           end
 
-          pending =
-            Enum.reduce(entries, pending, fn {compound_key, value, expire_at_ms}, acc ->
-              disk_val = to_disk_binary(value)
-              queue_zset_index_put_after_flush(state, redis_key, compound_key, disk_val)
-              [{:put, compound_key, disk_val, expire_at_ms} | acc]
-            end)
+          {pending, last_compound_key} =
+            if terminal_stream_mode?(mode) do
+              prepend_terminal_stream_entries(entries, pending, nil)
+            else
+              prepend_shared_compound_entries(state, redis_key, entries, pending, nil)
+            end
+
+          if last_compound_key != nil and not terminal_stream_mode?(mode) do
+            queue_compound_promotion_after_flush(state, redis_key, last_compound_key)
+          end
+
+          # Generic Raft batches apply commands sequentially but flush their
+          # Bitcask records once. Preserve that sequential visibility without
+          # publishing uncommitted rows to ETS: a later command (notably a
+          # second XADD) must observe the type marker and stream metadata from
+          # this batch.
+          pending_values =
+            if terminal_stream_mode?(mode) do
+              pending_values
+            else
+              Enum.reduce(entries, pending_values, fn
+                {compound_key, value, expire_at_ms}, acc ->
+                  Map.put(acc, compound_key, {value, expire_at_ms})
+              end)
+            end
 
           Process.put(:sm_pending_writes, pending)
+          Process.put(:sm_pending_values, pending_values)
           Process.put(:sm_pending_fast_put_batch, true)
           :ok
         else
@@ -973,9 +1198,117 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         end
       end
 
-      defp compound_shared_fast_path?(_state) do
-        not cross_shard_pending_active?() and not standalone_staged_apply?()
+      defp prepend_terminal_stream_entries([], pending, last_compound_key),
+        do: {pending, last_compound_key}
+
+      defp prepend_terminal_stream_entries(
+             [
+               {first_key, first_value, first_expiry},
+               {last_key, last_value, last_expiry}
+             ],
+             pending,
+             _last_compound_key
+           ) do
+        {
+          [
+            {:put, last_key, last_value, last_expiry},
+            {:put, first_key, first_value, first_expiry}
+            | pending
+          ],
+          last_key
+        }
       end
+
+      defp prepend_terminal_stream_entries(
+             [
+               {first_key, first_value, first_expiry},
+               {middle_key, middle_value, middle_expiry},
+               {last_key, last_value, last_expiry}
+             ],
+             pending,
+             _last_compound_key
+           ) do
+        {
+          [
+            {:put, last_key, last_value, last_expiry},
+            {:put, middle_key, middle_value, middle_expiry},
+            {:put, first_key, first_value, first_expiry}
+            | pending
+          ],
+          last_key
+        }
+      end
+
+      defp prepend_terminal_stream_entries(
+             [{compound_key, value, expire_at_ms} | entries],
+             pending,
+             _last_compound_key
+           ) do
+        prepend_terminal_stream_entries(
+          entries,
+          [{:put, compound_key, value, expire_at_ms} | pending],
+          compound_key
+        )
+      end
+
+      defp prepend_shared_compound_entries(
+             _state,
+             _redis_key,
+             [],
+             pending,
+             last_compound_key
+           ),
+           do: {pending, last_compound_key}
+
+      defp prepend_shared_compound_entries(
+             state,
+             redis_key,
+             [{compound_key, value, expire_at_ms} | entries],
+             pending,
+             _last_compound_key
+           ) do
+        disk_val = to_disk_binary(value)
+        queue_zset_index_put_after_flush(state, redis_key, compound_key, disk_val)
+
+        prepend_shared_compound_entries(
+          state,
+          redis_key,
+          entries,
+          [{:put, compound_key, disk_val, expire_at_ms} | pending],
+          compound_key
+        )
+      end
+
+      defp terminal_stream_prefix({:terminal_stream, prefix}) when is_binary(prefix), do: prefix
+
+      defp terminal_stream_prefix({:grouped_terminal_stream, prefix}) when is_binary(prefix),
+        do: prefix
+
+      defp terminal_stream_prefix(_mode), do: nil
+
+      defp terminal_stream_mode?({:terminal_stream, prefix}) when is_binary(prefix), do: true
+
+      defp terminal_stream_mode?({:grouped_terminal_stream, prefix}) when is_binary(prefix),
+        do: true
+
+      defp terminal_stream_mode?(_mode), do: false
+
+      defp grouped_terminal_stream_mode?({:grouped_terminal_stream, prefix})
+           when is_binary(prefix),
+           do: true
+
+      defp grouped_terminal_stream_mode?(_mode), do: false
+
+      defp compound_shared_fast_path?(_state) do
+        not cross_shard_pending_active?()
+      end
+
+      defp binary_has_prefix_and_member?(key, prefix)
+           when is_binary(key) and is_binary(prefix) and byte_size(key) > byte_size(prefix) do
+        binary_part(key, 0, byte_size(prefix)) == prefix
+      end
+
+      defp binary_has_prefix_and_member?(_key, _prefix), do: false
 
       # Promotion is structural maintenance, not replicated state-machine work.
       # Keep only one lightweight hint per collection and dispatch it after the

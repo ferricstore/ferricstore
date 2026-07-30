@@ -39,20 +39,62 @@ defmodule Ferricstore.Stream.ActivityLog do
 
   @spec record_xadd(binary(), binary(), non_neg_integer(), term(), boolean()) :: :ok
   def record_xadd(key, entry_id, field_pair_count, trim_opts, nomkstream) do
-    record(%{
-      command: "XADD",
-      role: :producer,
-      key: normalize_binary(key),
-      result: "ok",
-      entry_id: normalize_binary(entry_id),
-      count: nil,
-      field_pairs: max(field_pair_count, 0),
-      trim: trim_label(trim_opts),
-      group: nil,
-      consumer: nil,
-      nomkstream: nomkstream
-    })
+    record(xadd_entry(key, entry_id, field_pair_count, trim_opts, nomkstream))
   end
+
+  @doc false
+  @spec record_xadd_many([
+          {binary(), binary(), non_neg_integer()}
+          | {binary(), binary(), non_neg_integer(), term(), boolean()}
+        ]) :: :ok
+  def record_xadd_many(entries) when is_list(entries) do
+    record_bounded_xadd_entries(entries)
+  end
+
+  def record_xadd_many(_invalid), do: :ok
+
+  @doc false
+  @spec record_xadd_results([term()], [term()]) :: :ok
+  def record_xadd_results(results, activity)
+      when is_list(results) and is_list(activity) do
+    max_len = max_len()
+
+    if max_len > 0 and table_ready?() do
+      {entries, count} = collect_xadd_results(results, activity, max_len)
+      record_retained_xadd_entries(entries, count, max_len)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  def record_xadd_results(_results, _activity), do: :ok
+
+  defp xadd_entry(key, entry_id, field_pair_count, trim_opts, nomkstream) do
+    {:xadd, normalize_binary(key), normalize_binary(entry_id), max(field_pair_count, 0),
+     trim_label(trim_opts), nomkstream}
+  end
+
+  defp valid_xadd_batch_entry?({key, entry_id, field_pair_count})
+       when is_binary(key) and is_binary(entry_id) and is_integer(field_pair_count) and
+              field_pair_count >= 0,
+       do: true
+
+  defp valid_xadd_batch_entry?({key, entry_id, field_pair_count, _trim_opts, nomkstream})
+       when is_binary(key) and is_binary(entry_id) and is_integer(field_pair_count) and
+              field_pair_count >= 0 and is_boolean(nomkstream),
+       do: true
+
+  defp valid_xadd_batch_entry?(_invalid), do: false
+
+  defp xadd_batch_entry({key, entry_id, field_pair_count}),
+    do: xadd_entry(key, entry_id, field_pair_count, nil, false)
+
+  defp xadd_batch_entry({key, entry_id, field_pair_count, trim_opts, nomkstream}),
+    do: xadd_entry(key, entry_id, field_pair_count, trim_opts, nomkstream)
 
   @spec record_xread([{binary(), binary()}], term()) :: :ok
   def record_xread(stream_ids, result) when is_list(stream_ids) do
@@ -215,7 +257,7 @@ defmodule Ferricstore.Stream.ActivityLog do
 
       :ets.insert(
         @table,
-        {id, Map.put(entry, :timestamp_us, System.os_time(:microsecond))}
+        {id, put_entry_timestamp(entry, System.os_time(:microsecond))}
       )
 
       maybe_evict_overflow(id, max_len)
@@ -228,6 +270,173 @@ defmodule Ferricstore.Stream.ActivityLog do
     :exit, _ -> :ok
   end
 
+  defp record_bounded_xadd_entries(entries) do
+    max_len = max_len()
+
+    if max_len > 0 and table_ready?() do
+      {retained, count} = collect_valid_xadd_entries(entries, max_len)
+      record_retained_xadd_entries(retained, count, max_len)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  defp record_retained_xadd_entries([], _count, _max_len), do: :ok
+
+  defp record_retained_xadd_entries(entries, count, max_len) do
+    record_retained_xadd_entries(entries, count, max_len, reserve_id_range(count))
+  end
+
+  defp record_retained_xadd_entries(entries, count, max_len, {:ok, first_id}) do
+    first_kept_id = first_id + count - min(count, max_len)
+    timestamp_us = System.os_time(:microsecond)
+    rows = build_xadd_activity_rows(entries, first_kept_id, timestamp_us, [])
+
+    :ets.insert(@table, rows)
+    evict_reserved_overflow(max_len)
+  end
+
+  defp record_retained_xadd_entries(entries, _count, _max_len, :error) do
+    Enum.each(entries, fn entry -> record(xadd_batch_entry(entry)) end)
+  end
+
+  defp build_xadd_activity_rows([], _id, _timestamp_us, rows), do: rows
+
+  defp build_xadd_activity_rows([raw_entry | rest], id, timestamp_us, rows) do
+    entry = raw_entry |> xadd_batch_entry() |> put_entry_timestamp(timestamp_us)
+    build_xadd_activity_rows(rest, id + 1, timestamp_us, [{id, entry} | rows])
+  end
+
+  defp collect_valid_xadd_entries(entries, max_len) do
+    count = count_valid_xadd_entries(entries, 0)
+    {retain_valid_xadd_entries(entries, max(count - max_len, 0), []), count}
+  end
+
+  defp collect_xadd_results(results, activity, max_len) do
+    case collect_xadd_results_within_limit(results, activity, max_len, [], 0) do
+      {:ok, entries, count} ->
+        {entries, count}
+
+      :over_limit ->
+        count = count_valid_xadd_results(results, activity, 0)
+        {retain_xadd_results(results, activity, count - max_len, []), count}
+    end
+  end
+
+  defp collect_xadd_results_within_limit([], _activity, _max_len, acc, count),
+    do: {:ok, Enum.reverse(acc), count}
+
+  defp collect_xadd_results_within_limit(_results, [], _max_len, acc, count),
+    do: {:ok, Enum.reverse(acc), count}
+
+  defp collect_xadd_results_within_limit(
+         [result | results],
+         [metadata | activity],
+         max_len,
+         acc,
+         count
+       ) do
+    if valid_xadd_result?(result, metadata) do
+      if count < max_len do
+        collect_xadd_results_within_limit(
+          results,
+          activity,
+          max_len,
+          [xadd_result_entry(result, metadata) | acc],
+          count + 1
+        )
+      else
+        :over_limit
+      end
+    else
+      collect_xadd_results_within_limit(results, activity, max_len, acc, count)
+    end
+  end
+
+  defp count_valid_xadd_entries([], count), do: count
+
+  defp count_valid_xadd_entries([entry | entries], count) do
+    count_valid_xadd_entries(entries, count + if(valid_xadd_batch_entry?(entry), do: 1, else: 0))
+  end
+
+  defp retain_valid_xadd_entries([], _drop, acc), do: Enum.reverse(acc)
+
+  defp retain_valid_xadd_entries([entry | entries], drop, acc) do
+    if valid_xadd_batch_entry?(entry) do
+      if drop > 0 do
+        retain_valid_xadd_entries(entries, drop - 1, acc)
+      else
+        retain_valid_xadd_entries(entries, 0, [entry | acc])
+      end
+    else
+      retain_valid_xadd_entries(entries, drop, acc)
+    end
+  end
+
+  defp count_valid_xadd_results([result | results], [metadata | activity], count) do
+    count = count + if(valid_xadd_result?(result, metadata), do: 1, else: 0)
+    count_valid_xadd_results(results, activity, count)
+  end
+
+  defp count_valid_xadd_results(_results, _activity, count), do: count
+
+  defp retain_xadd_results([], _activity, _drop, acc), do: Enum.reverse(acc)
+  defp retain_xadd_results(_results, [], _drop, acc), do: Enum.reverse(acc)
+
+  defp retain_xadd_results([result | results], [metadata | activity], drop, acc) do
+    if valid_xadd_result?(result, metadata) do
+      if drop > 0 do
+        retain_xadd_results(results, activity, drop - 1, acc)
+      else
+        retain_xadd_results(
+          results,
+          activity,
+          0,
+          [xadd_result_entry(result, metadata) | acc]
+        )
+      end
+    else
+      retain_xadd_results(results, activity, drop, acc)
+    end
+  end
+
+  defp valid_xadd_result?(result, metadata) do
+    (is_binary(result) or match?({:ok, id} when is_binary(id), result)) and
+      valid_xadd_activity_metadata?(metadata)
+  end
+
+  defp valid_xadd_activity_metadata?({key, fields}) when is_binary(key) and is_list(fields),
+    do: true
+
+  defp valid_xadd_activity_metadata?({key, field_pairs, _trim_opts, nomkstream})
+       when is_binary(key) and is_integer(field_pairs) and field_pairs >= 0 and
+              is_boolean(nomkstream),
+       do: true
+
+  defp valid_xadd_activity_metadata?(_metadata), do: false
+
+  defp xadd_result_entry(result, metadata) do
+    case result do
+      id when is_binary(id) -> xadd_activity_entry(id, metadata)
+      {:ok, id} when is_binary(id) -> xadd_activity_entry(id, metadata)
+      _not_appended -> nil
+    end
+  end
+
+  defp xadd_activity_entry(id, {key, fields}) when is_binary(key) and is_list(fields),
+    do: {key, id, div(length(fields), 2)}
+
+  defp xadd_activity_entry(id, {key, field_pairs, trim_opts, nomkstream})
+       when is_binary(key) and is_integer(field_pairs) and field_pairs >= 0 and
+              is_boolean(nomkstream),
+       do: {key, id, field_pairs, trim_opts, nomkstream}
+
+  defp xadd_activity_entry(_id, _metadata), do: nil
+
   defp max_len do
     case :persistent_term.get(@max_len_key, @default_max_len) do
       n when is_integer(n) and n >= 0 -> n
@@ -239,6 +448,13 @@ defmodule Ferricstore.Stream.ActivityLog do
     case :persistent_term.get(@counter_key, nil) do
       counter when is_reference(counter) -> :atomics.add_get(counter, 1, 1) - 1
       _ -> System.unique_integer([:positive, :monotonic])
+    end
+  end
+
+  defp reserve_id_range(count) when is_integer(count) and count > 0 do
+    case :persistent_term.get(@counter_key, nil) do
+      counter when is_reference(counter) -> {:ok, :atomics.add_get(counter, 1, count) - count}
+      _ -> :error
     end
   end
 
@@ -264,6 +480,30 @@ defmodule Ferricstore.Stream.ActivityLog do
     end
   end
 
+  # Batch reservations produce monotonically increasing integer IDs. Delete
+  # every stale range in one ETS operation instead of issuing one delete NIF
+  # call per displaced activity row (often hundreds for XADD_MANY).
+  defp evict_reserved_overflow(max_len) do
+    case :persistent_term.get(@counter_key, nil) do
+      counter when is_reference(counter) ->
+        first_retained_id = :atomics.get(counter, 1) - max_len
+
+        if first_retained_id > 0 do
+          :ets.select_delete(
+            @table,
+            [{{:"$1", :_}, [{:<, :"$1", first_retained_id}], [true]}]
+          )
+        else
+          0
+        end
+
+      _unavailable ->
+        evict_overflow(max_len)
+    end
+
+    :ok
+  end
+
   defp delete_oldest(remaining) when remaining <= 0, do: :ok
 
   defp delete_oldest(remaining) do
@@ -285,7 +525,7 @@ defmodule Ferricstore.Stream.ActivityLog do
 
     case :ets.lookup(@table, id) do
       [{^id, entry}] ->
-        newest_entries(previous_id, remaining - 1, [Map.put(entry, :id, id) | acc])
+        newest_entries(previous_id, remaining - 1, [materialize_entry(entry, id) | acc])
 
       [] ->
         newest_entries(previous_id, remaining, acc)
@@ -313,6 +553,35 @@ defmodule Ferricstore.Stream.ActivityLog do
 
   defp normalize_optional_binary(nil), do: nil
   defp normalize_optional_binary(value), do: normalize_binary(value)
+
+  defp put_entry_timestamp({:xadd, key, entry_id, field_pairs, trim, nomkstream}, timestamp_us) do
+    {:xadd, timestamp_us, key, entry_id, field_pairs, trim, nomkstream}
+  end
+
+  defp put_entry_timestamp(entry, timestamp_us), do: Map.put(entry, :timestamp_us, timestamp_us)
+
+  defp materialize_entry(
+         {:xadd, timestamp_us, key, entry_id, field_pairs, trim, nomkstream},
+         id
+       ) do
+    %{
+      id: id,
+      timestamp_us: timestamp_us,
+      command: "XADD",
+      role: :producer,
+      key: key,
+      result: "ok",
+      entry_id: entry_id,
+      count: nil,
+      field_pairs: field_pairs,
+      trim: trim,
+      group: nil,
+      consumer: nil,
+      nomkstream: nomkstream
+    }
+  end
+
+  defp materialize_entry(entry, id), do: Map.put(entry, :id, id)
 
   defp stream_read_counts(result) when is_list(result) do
     Enum.flat_map(result, fn

@@ -888,7 +888,7 @@ defmodule Ferricstore.Store.Router.Part01 do
           instance_ctx: ctx,
           index: idx,
           keydir: keydir,
-          compound_member_index: CompoundMemberIndex.table_name(instance_name, idx),
+          compound_member_index: elem(ctx.compound_member_index_refs, idx),
           logical_key_index: logical_keys,
           logical_key_slots: logical_slots,
           namespace_usage_index: namespace_usage,
