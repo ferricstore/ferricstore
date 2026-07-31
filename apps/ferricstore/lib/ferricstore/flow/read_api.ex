@@ -179,6 +179,43 @@ defmodule Ferricstore.Flow.ReadAPI do
   def attribute_values(_ctx, _type, _attr_name, _opts),
     do: {:error, "ERR flow opts must be a keyword list"}
 
+  def state_meta_values(ctx, type, meta_state, name, opts \\ [])
+
+  def state_meta_values(ctx, type, meta_state, name, opts)
+      when is_binary(type) and is_list(opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_type(type),
+         {:ok, meta_state} <- StateMeta.normalize_state_name(meta_state),
+         {:ok, name} <- StateMeta.normalize_name(name),
+         {:ok, partition_key} <- optional_auto_partition_key(opts),
+         {:ok, count} <- flow_count(opts),
+         {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
+         {:ok, ctx, partition_key, _metadata} <-
+           ScopeBinding.bind_read_partition_selector(ctx, :runs, partition_key),
+         {:ok, indexed_name} <- policy_indexed_state_meta(ctx, type),
+         true <- name == indexed_name,
+         {:ok, entries} <-
+           state_meta_value_entries(
+             ctx,
+             type,
+             meta_state,
+             name,
+             partition_key,
+             consistent_projection?
+           ) do
+      {:ok, Enum.take(entries, count)}
+    else
+      false -> {:ok, []}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def state_meta_values(_ctx, type, _meta_state, _name, _opts) when not is_binary(type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
+  def state_meta_values(_ctx, _type, _meta_state, _name, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
   def terminals(ctx, type, opts \\ [])
 
   def terminals(ctx, type, opts) when is_binary(type) and is_list(opts) do
@@ -1542,6 +1579,49 @@ defmodule Ferricstore.Flow.ReadAPI do
              attr_name,
              partition_key,
              consistent?
+           ) do
+      {:ok, top_attribute_values(counts, approximate?)}
+    end
+  end
+
+  defp state_meta_value_entries(ctx, type, meta_state, name, :auto, consistent?) do
+    auto_partition_keys = ScopeBinding.auto_partition_keys(ctx)
+    scan_limit = discovery_auto_bucket_scan_limit(auto_partition_keys)
+
+    auto_partition_keys
+    |> Enum.reduce_while({:ok, {%{}, false}}, fn partition_key, {:ok, {acc, approx_acc}} ->
+      prefix = Keys.state_meta_index_prefix(type, meta_state, name, partition_key)
+
+      case attribute_value_counts_for_prefix(
+             ctx,
+             prefix,
+             partition_key,
+             consistent?,
+             scan_limit
+           ) do
+        {:ok, {counts, approximate?}} ->
+          {:cont, {:ok, {merge_counts(acc, counts), approx_acc or approximate?}}}
+
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, {counts, approximate?}} -> {:ok, top_attribute_values(counts, approximate?)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp state_meta_value_entries(ctx, type, meta_state, name, partition_key, consistent?) do
+    prefix = Keys.state_meta_index_prefix(type, meta_state, name, partition_key)
+
+    with {:ok, {counts, approximate?}} <-
+           attribute_value_counts_for_prefix(
+             ctx,
+             prefix,
+             partition_key,
+             consistent?,
+             nil
            ) do
       {:ok, top_attribute_values(counts, approximate?)}
     end

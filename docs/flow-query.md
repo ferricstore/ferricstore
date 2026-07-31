@@ -772,6 +772,65 @@ responses, and unknown future result shapes fall back to typed values, so a
 client must retain both decoders. See [Native Protocol](native-protocol.md#compact-flow-query-results)
 for the exact `0xA0` layout, enum codes, record bitmap, and validation rules.
 
+## Dashboard Query Workbench
+
+The OSS operations dashboard exposes the query workbench at
+`/dashboard/flow/query`. Its Guided tab builds the common bounded query shapes.
+The FQL tab accepts any supported FQL1 statement plus a JSON object of typed
+named parameters. Values remain separate from the query text and the server
+parses and binds the request once through the same prepared-command path used
+by native clients.
+
+In Guided mode, `Lifecycle state` is the storage lifecycle (`queued`,
+`running`, or a terminal state), while `Workflow step` and the state-metadata
+owner are logical policy states such as `review`. They are separate FQL
+predicates: `state` and `run_state`.
+
+Enter a workflow type and choose **Show options** to inspect its policy-defined
+workflow steps, indexed attribute names, and indexed state-metadata key without
+running the selected query. If the type is empty and an authorized partition is
+present, Show options instead runs a projection-only `LIMIT 65` query and
+labels the deduplicated type suggestions as observed, not complete. Neither
+path hydrates payloads.
+
+In protected mode, observed type suggestions use the query partition's
+`FLOW.QUERY` read scope. Policy-defined options additionally require
+`+FLOW.POLICY.GET` and read access to the workflow type itself. This distinction
+is intentional: query data is partition-scoped, while policy configuration is
+type-scoped. Top-value discovery also requires `+FLOW.ATTRIBUTE_VALUES` and the
+query partition's read scope.
+
+When an indexed attribute key or the indexed state-metadata state/key is also
+present, Show options reads at most 20 top values from the corresponding LMDB
+index. Those reads are time- and scan-bounded and may report approximate counts
+when the scan ceiling is reached. The value picker preserves scalar type:
+text, signed integer, finite decimal, boolean, or null. Empty text remains a
+valid text value. A completed query can also add lifecycle states and workflow
+steps observed in its already-authorized current result page.
+
+Run is the form's default action. Guided cursor continuation preserves the
+exact filters and returns to the Guided tab; FQL cursor continuation preserves
+the FQL text and typed JSON parameters.
+
+The Run, Explain, and Analyze actions map to the normal query modes. In
+protected mode they enforce the same command and partition ACLs:
+
+- Run requires `FLOW.QUERY`;
+- Explain requires `FLOW.QUERY.EXPLAIN`; and
+- Analyze requires both permissions because it executes the selected plan.
+
+The result view preserves the response `quality` and `usage` envelopes, renders
+explicit return projections in requested order, and renders EXPLAIN as plan,
+index-generation, estimate, bound, statistics, decision, diagnostic, and
+alternative sections. Opaque cursors remain in a CSRF-protected POST form; they
+are not copied into URLs or decoded by the dashboard.
+
+Record pages can be visualized by returned state, type, selected scalar
+metadata, and one returned time field. These charts are exact for the current
+page after ACL filtering and require no additional query. They are not global
+facets. FQL1 has no grouping contract; use `RETURN COUNT` for an exact bounded
+global scalar instead of inferring a global distribution from a result page.
+
 ## Reading EXPLAIN
 
 FerricStore follows the useful PostgreSQL and SQLite documentation pattern of

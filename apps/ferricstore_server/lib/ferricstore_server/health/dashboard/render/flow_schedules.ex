@@ -9,7 +9,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
 
     """
     <div class="flow-card-grid">
-      #{render_flow_stat_card("Schedules", Map.get(summary, :total, 0), "sampled durable schedules")}
+      #{render_flow_stat_card("Schedules", Map.get(summary, :total, 0), "bounded durable catalog result")}
       #{render_flow_stat_card("Active", Map.get(summary, "active", 0), "eligible for scheduler firing")}
       #{render_flow_stat_card("Paused", Map.get(summary, "paused", 0), "disabled until resumed")}
       #{render_flow_stat_card("Failed", Map.get(summary, "failed", 0), "failed schedule definitions")}
@@ -29,13 +29,16 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
     filters = Map.get(data, :filters, %{})
 
     """
-    <form class="flow-search" action="/dashboard/flow/schedules" method="get" aria-label="Schedule filters">
-      <input class="flow-search-input mono" type="search" name="q" value="#{escape_attr(Map.get(filters, :q) || "")}" placeholder="schedule id contains..." title="Filter schedules by id substring">
-      #{schedule_select("state", Map.get(filters, :state, :all), ["all", "active", "paused", "running", "failed", "completed", "cancelled"])}
-      #{schedule_select("kind", Map.get(filters, :kind), ["", "one_shot", "delay", "interval", "cron"])}
-      <input class="flow-search-input mono" type="number" min="1" max="500" name="limit" value="#{Map.get(filters, :limit, 100)}" title="Maximum schedules to show">
-      <button class="flow-search-button" type="submit">Filter</button>
-    </form>
+    <div class="flow-filter-panel">
+      <form class="flow-search" action="/dashboard/flow/schedules" method="get" aria-label="Schedule filters">
+        <input class="flow-search-input mono" type="search" name="q" aria-label="Schedule ID contains" value="#{escape_attr(Map.get(filters, :q) || "")}" placeholder="schedule id contains..." title="Filter the bounded catalog result by schedule id substring">
+        #{schedule_select("state", Map.get(filters, :state, :all), ["all", "active", "paused", "running", "failed", "completed", "cancelled"])}
+        #{schedule_select("kind", Map.get(filters, :kind), ["", "one_shot", "delay", "interval", "cron"])}
+        <input class="flow-search-input mono" type="number" min="1" max="500" name="limit" aria-label="Schedule limit" value="#{Map.get(filters, :limit, 100)}" title="Maximum schedules to show">
+        <button class="flow-search-button" type="submit">Filter</button>
+      </form>
+      <div class="flow-filter-note">State and kind are applied during the durable catalog scan. ID contains filters the bounded rows retained by Limit.</div>
+    </div>
     """
   end
 
@@ -151,15 +154,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
   end
 
   defp schedule_select(name, selected, values) do
+    aria_label = if name == "state", do: "Schedule state", else: "Schedule kind"
+
     options =
       Enum.map_join(values, "\n", fn value ->
-        label = if value == "", do: "any kind", else: value
+        option_label = if value == "", do: "any kind", else: value
         selected_attr = if to_string(selected || "") == value, do: " selected", else: ""
 
-        ~s(<option value="#{escape_attr(value)}"#{selected_attr}>#{escape(label)}</option>)
+        ~s(<option value="#{escape_attr(value)}"#{selected_attr}>#{escape(option_label)}</option>)
       end)
 
-    ~s(<select class="flow-search-input mono" name="#{escape_attr(name)}">#{options}</select>)
+    ~s(<select class="flow-search-input mono" name="#{escape_attr(name)}" aria-label="#{aria_label}">#{options}</select>)
   end
 
   defp schedule_kind(schedule), do: schedule |> Map.get(:kind, "-") |> to_string()

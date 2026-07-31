@@ -648,13 +648,17 @@ defmodule Ferricstore.Flow.Keys do
   end
 
   def state_meta_index_key(type, state, name, value, partition_key \\ nil) do
+    state_meta_index_prefix(type, state, name, partition_key) <> index_component(value)
+  end
+
+  def state_meta_index_prefix(type, state, name, partition_key \\ nil) do
     "f:" <>
       tag(partition_key) <>
       ":i:sm:" <>
       index_component(type) <>
       ":" <>
       index_component(state) <>
-      ":" <> index_component(name) <> "=" <> index_component(value)
+      ":" <> index_component(name) <> "="
   end
 
   @doc false

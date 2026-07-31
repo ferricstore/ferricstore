@@ -123,29 +123,44 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Schedules do
     |> Map.put(:total, length(schedules))
   end
 
-  defp normalize_state(nil), do: :all
-  defp normalize_state(""), do: :all
-  defp normalize_state("all"), do: :all
-
-  defp normalize_state(value) when value in ~w(active paused running completed failed cancelled),
-    do: value
+  defp normalize_state(value) when is_binary(value),
+    do: value |> String.trim() |> normalize_state_value()
 
   defp normalize_state(_value), do: :all
 
-  defp normalize_kind(nil), do: nil
-  defp normalize_kind(""), do: nil
+  defp normalize_state_value(value) when value in ["", "all"], do: :all
 
-  defp normalize_kind(value) when value in ~w(one_shot delay interval cron),
-    do: String.to_existing_atom(value)
+  defp normalize_state_value(value)
+       when value in ~w(active paused running completed failed cancelled),
+       do: value
+
+  defp normalize_state_value(_value), do: :all
+
+  defp normalize_kind(nil), do: nil
+
+  defp normalize_kind(value) when is_binary(value),
+    do: value |> String.trim() |> normalize_kind_value()
 
   defp normalize_kind(_value), do: nil
 
+  defp normalize_kind_value(""), do: nil
+
+  defp normalize_kind_value(value) when value in ~w(one_shot delay interval cron),
+    do: String.to_existing_atom(value)
+
+  defp normalize_kind_value(_value), do: nil
+
   defp normalize_text(nil), do: nil
-  defp normalize_text(""), do: nil
-  defp normalize_text(value) when is_binary(value), do: String.trim(value)
+
+  defp normalize_text(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
 
   defp normalize_limit(value) when is_binary(value) do
-    case Integer.parse(value) do
+    case value |> String.trim() |> Integer.parse() do
       {limit, ""} when limit > 0 -> min(limit, @max_limit)
       _other -> @default_limit
     end

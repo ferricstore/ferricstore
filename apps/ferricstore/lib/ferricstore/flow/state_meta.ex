@@ -156,6 +156,12 @@ defmodule Ferricstore.Flow.StateMeta do
   def normalize_indexed_key(_value),
     do: {:error, "ERR flow indexed_state_meta must be a string or one-item list"}
 
+  @doc false
+  def normalize_state_name(state), do: normalize_state(state)
+
+  @doc false
+  def normalize_name(name), do: normalize_key(name)
+
   def indexed_key(%{indexed_state_meta: key}) do
     case normalize_indexed_key(key) do
       {:ok, key} -> key

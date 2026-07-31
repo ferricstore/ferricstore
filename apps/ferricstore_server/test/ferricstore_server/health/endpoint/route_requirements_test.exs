@@ -69,6 +69,19 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirementsTest do
   test "dashboard_route_requirement scopes flow index and query pages" do
     assert RouteRequirements.dashboard_route_requirement(
              "GET",
+             "/dashboard/flow/states?type=email&partition_key=tenant-a"
+           ) == {"FLOW.QUERY", key: {"tenant-a", :read}}
+
+    assert RouteRequirements.dashboard_route_requirement(
+             "GET",
+             "/dashboard/api/flow/states?type=email&partition_key=tenant-a"
+           ) == {"FLOW.QUERY", key: {"tenant-a", :read}}
+
+    assert RouteRequirements.dashboard_route_requirement("GET", "/dashboard/flow/states") ==
+             {"FLOW.QUERY", []}
+
+    assert RouteRequirements.dashboard_route_requirement(
+             "GET",
              "/dashboard/flow/failures?partition_key=tenant-a"
            ) == {"FLOW.QUERY", key: {"tenant-a", :read}}
 

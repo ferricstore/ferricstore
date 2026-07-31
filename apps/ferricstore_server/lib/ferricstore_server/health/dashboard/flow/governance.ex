@@ -152,7 +152,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
 
   defp normalize_text(_value), do: nil
 
-  defp normalize_status(value) when value in ["pending", "approved", "rejected"], do: value
+  defp normalize_status(value) when value in ["pending", "approved", "rejected", "expired"],
+    do: value
+
   defp normalize_status(_value), do: nil
 
   defp normalize_circuit_status(value) when value in ["open", "half_open", "closed"], do: value

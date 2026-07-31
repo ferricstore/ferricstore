@@ -31,7 +31,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
 
     """
     <form class="flow-search" action="/dashboard/flow/governance" method="get" aria-label="Governance filters">
-      <input class="flow-search-input mono" type="search" name="scope" value="#{escape(Map.get(filters, :scope, "") || "")}" placeholder="scope / tenant" title="Governance scope filter">
+      <input class="flow-search-input mono" type="search" name="scope" value="#{escape(Map.get(filters, :scope, "") || "")}" placeholder="governance scope" title="Governance scope filter">
       <input class="flow-search-input mono" type="search" name="flow_id" value="#{escape(Map.get(filters, :flow_id, "") || "")}" placeholder="flow id" title="Approval flow id filter">
       <select class="flow-search-input mono" name="status" title="Approval status filter">
         #{status_options(Map.get(filters, :status))}
@@ -39,7 +39,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
       <select class="flow-search-input mono" name="circuit_status" title="Circuit status filter">
         #{circuit_status_options(Map.get(filters, :circuit_status))}
       </select>
-      <input class="flow-search-input mono flow-filter-limit" type="number" min="1" max="500" name="limit" value="#{Map.get(filters, :limit, 100)}" title="Maximum records per governance section">
+      <input class="flow-search-input mono flow-filter-limit" type="number" min="1" max="100" name="limit" value="#{Map.get(filters, :limit, 100)}" title="Maximum records per governance section">
       <button class="flow-search-button" type="submit">Refresh</button>
     </form>
     """
@@ -51,10 +51,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
     """
     <div class="section-title">State Metadata</div>
     <form class="flow-search" action="/dashboard/flow/governance" method="get" aria-label="State metadata filters">
-      <input class="flow-search-input mono" type="search" name="meta_type" value="#{escape_attr(Map.get(filters, :meta_type, "") || "")}" placeholder="workflow type" title="Workflow type with an indexed state metadata policy">
-      <input class="flow-search-input mono" type="search" name="meta_state" value="#{escape_attr(Map.get(filters, :meta_state, "") || "")}" placeholder="metadata state" title="State whose metadata should be matched">
-      <input class="flow-search-input mono" type="search" name="meta_key" value="#{escape_attr(Map.get(filters, :meta_key, "") || "")}" placeholder="ai.model / risk_tier" title="Indexed state metadata key">
-      <input class="flow-search-input mono" type="search" name="meta_value" value="#{escape_attr(Map.get(filters, :meta_value, "") || "")}" placeholder="gpt-5 / high" title="State metadata value">
+      <input class="flow-search-input mono" type="search" name="meta_type" value="#{escape_attr(Map.get(filters, :meta_type, "") || "")}" placeholder="workflow type required" title="Required workflow type with an indexed state metadata policy" required>
+      <input class="flow-search-input mono" type="search" name="meta_state" value="#{escape_attr(Map.get(filters, :meta_state, "") || "")}" placeholder="metadata state required" title="Required state whose metadata should be matched" required>
+      <input class="flow-search-input mono" type="search" name="meta_key" value="#{escape_attr(Map.get(filters, :meta_key, "") || "")}" placeholder="indexed key required" title="Required indexed state metadata key" required>
+      <input class="flow-search-input mono" type="search" name="meta_value" value="#{escape_attr(Map.get(filters, :meta_value, "") || "")}" placeholder="value required" title="Required state metadata value" required>
       <select class="flow-search-input mono" name="meta_value_type" title="State metadata value type">
         #{state_meta_value_type_options(Map.get(filters, :meta_value_type))}
       </select>
@@ -209,7 +209,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
       {"", "all statuses"},
       {"pending", "pending"},
       {"approved", "approved"},
-      {"rejected", "rejected"}
+      {"rejected", "rejected"},
+      {"expired", "expired"}
     ]
     |> Enum.map_join(fn {value, label} ->
       selected_attr = if value == to_string(selected || ""), do: " selected", else: ""

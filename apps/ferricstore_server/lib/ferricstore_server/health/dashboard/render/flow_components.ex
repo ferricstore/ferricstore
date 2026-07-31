@@ -4,6 +4,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowComponents do
   alias FerricstoreServer.Health.Dashboard.Flow.Recovery
 
   import FerricstoreServer.Health.Dashboard.Format
+
+  import FerricstoreServer.Health.Dashboard.Render.FlowFilters,
+    only: [render_flow_type_datalist: 2]
+
   import FerricstoreServer.Health.Dashboard.Render.FlowQueryPolicy
   import FerricstoreServer.Health.Dashboard.Render.FlowTables
 

@@ -1,8 +1,11 @@
 defmodule FerricstoreServer.Health.Dashboard.Flow.Calls do
   @moduledoc false
 
+  alias Ferricstore.Flow.Query.Request
+
   @flow_dashboard_detail_fetch_timeout_ms 5_000
   @flow_dashboard_list_fetch_timeout_ms 5_000
+  @flow_dashboard_query_discovery_fetch_timeout_ms 1_000
 
   def flow_dashboard_detail_fetch_timeout_ms do
     Application.get_env(
@@ -17,6 +20,14 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Calls do
       :ferricstore,
       :flow_dashboard_list_fetch_timeout_ms,
       @flow_dashboard_list_fetch_timeout_ms
+    )
+  end
+
+  def flow_dashboard_query_discovery_fetch_timeout_ms do
+    Application.get_env(
+      :ferricstore,
+      :flow_dashboard_query_discovery_fetch_timeout_ms,
+      @flow_dashboard_query_discovery_fetch_timeout_ms
     )
   end
 
@@ -39,6 +50,50 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Calls do
     case Application.get_env(:ferricstore, :flow_dashboard_flow_query_fun) do
       fun when is_function(fun, 2) -> fun.(query, params)
       _ -> FerricStore.flow_query(query, params)
+    end
+  end
+
+  def flow_dashboard_flow_policy_get(type, opts) do
+    case Application.get_env(:ferricstore, :flow_dashboard_flow_policy_get_fun) do
+      fun when is_function(fun, 2) -> fun.(type, opts)
+      fun when is_function(fun, 1) -> fun.(type)
+      _ -> FerricStore.flow_policy_get(type, opts)
+    end
+  end
+
+  def flow_dashboard_flow_attribute_values(type, name, opts) do
+    case Application.get_env(:ferricstore, :flow_dashboard_flow_attribute_values_fun) do
+      fun when is_function(fun, 3) -> fun.(type, name, opts)
+      _ -> FerricStore.flow_attribute_values(type, name, opts)
+    end
+  end
+
+  def flow_dashboard_flow_state_meta_values(type, state, name, opts) do
+    case Application.get_env(:ferricstore, :flow_dashboard_flow_state_meta_values_fun) do
+      fun when is_function(fun, 4) ->
+        fun.(type, state, name, opts)
+
+      _ ->
+        Ferricstore.Flow.ReadAPI.state_meta_values(
+          FerricStore.Instance.get(:default),
+          type,
+          state,
+          name,
+          opts
+        )
+    end
+  end
+
+  def flow_dashboard_flow_query_prepared(%Request{} = request) do
+    case Application.get_env(:ferricstore, :flow_dashboard_flow_query_prepared_fun) do
+      fun when is_function(fun, 1) ->
+        fun.(request)
+
+      _missing ->
+        FerricstoreServer.Native.FlowQuery.execute_prepared(
+          FerricStore.Instance.get(:default),
+          request
+        )
     end
   end
 

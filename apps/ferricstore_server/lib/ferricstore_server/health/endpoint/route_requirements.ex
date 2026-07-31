@@ -43,13 +43,13 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
       "/dashboard/prefixes" -> {"SCAN", key: {"*", :read}}
       "/dashboard/flow" -> {"FLOW.QUERY", []}
       "/dashboard/flow/lookup" -> flow_lookup_requirement(query)
-      "/dashboard/flow/states" -> {"FLOW.QUERY", []}
+      "/dashboard/flow/states" -> flow_partition_view_requirement("FLOW.QUERY", query)
       "/dashboard/flow/workers" -> {"FLOW.QUERY", []}
       "/dashboard/flow/due" -> {"FLOW.QUERY", []}
       "/dashboard/flow/schedules" -> {"FLOW.SCHEDULE.LIST", key: {"*", :read}}
       "/dashboard/flow/failures" -> flow_index_view_requirement("FLOW.QUERY", query)
-      "/dashboard/flow/lineage" -> flow_lineage_requirement(query)
-      "/dashboard/flow/query" -> flow_query_requirement(query)
+      "/dashboard/flow/lineage" -> flow_partition_view_requirement("FLOW.QUERY", query)
+      "/dashboard/flow/query" -> flow_query_page_requirement(query)
       "/dashboard/flow/signals" -> {"FLOW.HISTORY", []}
       "/dashboard/flow/policies" -> {"FLOW.POLICY.GET", []}
       "/dashboard/flow/governance" -> flow_governance_requirement(query)
@@ -58,7 +58,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
       "/dashboard/flow/projections" -> {"FLOW.QUERY", []}
       "/dashboard/api/overview" -> {"INFO", []}
       "/dashboard/api/flow" -> {"FLOW.QUERY", []}
-      "/dashboard/api/flow/states" -> {"FLOW.QUERY", []}
+      "/dashboard/api/flow/states" -> flow_partition_view_requirement("FLOW.QUERY", query)
       "/dashboard/api/flow/workers" -> {"FLOW.QUERY", []}
       "/dashboard/api/flow/due" -> {"FLOW.QUERY", []}
       "/dashboard/api/flow/signals" -> {"FLOW.HISTORY", []}
@@ -100,6 +100,9 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
 
       "/dashboard/flow/failures" ->
         {"FLOW.RECLAIM", []}
+
+      "/dashboard/flow/query" ->
+        {"*", []}
 
       "/dashboard/flow/policies" ->
         {"FLOW.POLICY.SET", []}
@@ -326,13 +329,13 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     _ -> {"SCAN", []}
   end
 
-  defp flow_lineage_requirement(query) do
+  defp flow_partition_view_requirement(command, query) do
     case flow_partition_key_from_query(query) do
-      "" -> {"FLOW.QUERY", []}
-      partition_key -> {"FLOW.QUERY", key: {partition_key, :read}}
+      "" -> {command, []}
+      partition_key -> {command, key: {partition_key, :read}}
     end
   rescue
-    _ -> {"FLOW.QUERY", []}
+    _ -> {command, []}
   end
 
   defp flow_query_requirement(query) do
@@ -352,6 +355,9 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
   rescue
     _ -> {"FLOW.QUERY", []}
   end
+
+  defp flow_query_page_requirement(""), do: {"*", []}
+  defp flow_query_page_requirement(query), do: flow_query_requirement(query)
 
   defp flow_index_view_requirement(command, query) do
     params = QueryDecoder.decode(query)

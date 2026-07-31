@@ -19,4 +19,28 @@ defmodule FerricstoreServer.Health.Endpoint.ForbiddenTest do
              required_key_rule: "%R~tenant-a"
            }
   end
+
+  test "dashboard denial reuses the responsive protected-access surface" do
+    details =
+      Forbidden.requirement_details({"FLOW.QUERY", key: {"type:sms", :read}})
+
+    html =
+      Forbidden.render_page(
+        details,
+        "NOPERM <blocked>",
+        "/dashboard/flow/query?kind=list"
+      )
+
+    assert html =~ ~s(<meta name="viewport" content="width=device-width, initial-scale=1">)
+    assert html =~ ~s(<body class="auth-body">)
+    assert html =~ "Access denied"
+    assert html =~ "NOPERM &lt;blocked&gt;"
+    assert html =~ "+FLOW.QUERY"
+    assert html =~ "read on type:sms"
+    assert html =~ "%R~type:sms"
+    assert html =~ "Sign in as another user"
+    assert html =~ ~s(<form method="post" action="/dashboard/logout">)
+    assert html =~ ~s(name="next" value="/dashboard/flow/query?kind=list")
+    refute html =~ "<body><h1>Forbidden</h1>"
+  end
 end

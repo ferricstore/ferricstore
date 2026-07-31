@@ -5,6 +5,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables do
   alias FerricstoreServer.Health.Dashboard.Render.FlowTables.Projection
   alias FerricstoreServer.Health.Dashboard.Render.FlowTables.Records
   alias FerricstoreServer.Health.Dashboard.Render.FlowTables.Signals
+  alias FerricstoreServer.Health.Dashboard.Render.FlowQueryResults
 
   defdelegate default_flow_projection_health(), to: Projection
   defdelegate flow_projection_rollup(metrics), to: Projection
@@ -69,7 +70,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables do
   defdelegate flow_lineage_result_label(result), to: Lineage
   defdelegate render_flow_lineage_nodes(records, filters), to: Lineage
   defdelegate render_flow_lineage_rows(records), to: Lineage
-  defdelegate flow_query_result_command(result), to: Lineage
-  defdelegate render_flow_query_status(result), to: Lineage
-  defdelegate render_flow_query_rows(result), to: Lineage
+  defdelegate flow_query_result_command(result), to: FlowQueryResults
+  defdelegate render_flow_query_status(result), to: FlowQueryResults
+  defdelegate render_flow_query_metadata(result), to: FlowQueryResults
+  defdelegate render_flow_query_visualization(result), to: FlowQueryResults
+  defdelegate render_flow_query_table(result), to: FlowQueryResults
+  defdelegate render_flow_query_continuation(result), to: FlowQueryResults
+  defdelegate render_flow_query_rows(result), to: FlowQueryResults
 end

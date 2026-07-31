@@ -6,7 +6,7 @@ defmodule FerricstoreServer.Health.Endpoint.Request do
   @header_name_pattern ~r/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
 
   @spec read_request(:inet.socket(), module()) ::
-          {:ok, String.t(), String.t(), map(), binary()} | :error
+          {:ok, String.t(), String.t(), map(), binary()} | :closed | :error
   def read_request(socket, transport) do
     deadline_ms = System.monotonic_time(:millisecond) + @request_recv_timeout_ms
 
@@ -23,29 +23,34 @@ defmodule FerricstoreServer.Health.Endpoint.Request do
   end
 
   defp read_request(socket, transport, data, deadline_ms) do
-    with {:ok, remaining_ms} <- remaining_timeout(deadline_ms) do
-      if :binary.match(data, "\r\n\r\n") != :nomatch do
-        case parse_request_line(data) do
-          {:ok, method, path, headers, body} ->
-            read_request_body(
-              socket,
-              transport,
-              method,
-              path,
-              headers,
-              body,
-              deadline_ms,
-              request_head_bytes(data)
-            )
+    case remaining_timeout(deadline_ms) do
+      {:ok, remaining_ms} ->
+        if :binary.match(data, "\r\n\r\n") != :nomatch do
+          case parse_request_line(data) do
+            {:ok, method, path, headers, body} ->
+              read_request_body(
+                socket,
+                transport,
+                method,
+                path,
+                headers,
+                body,
+                deadline_ms,
+                request_head_bytes(data)
+              )
 
-          :error ->
-            :error
+            :error ->
+              :error
+          end
+        else
+          recv_request_headers(socket, transport, data, deadline_ms, remaining_ms)
         end
-      else
-        recv_request_headers(socket, transport, data, deadline_ms, remaining_ms)
-      end
-    else
-      :error -> :error
+
+      :error when data == <<>> ->
+        :closed
+
+      :error ->
+        :error
     end
   end
 
@@ -59,6 +64,9 @@ defmodule FerricstoreServer.Health.Endpoint.Request do
 
         {:ok, _chunk} ->
           :error
+
+        {:error, _reason} when data == <<>> ->
+          :closed
 
         {:error, _reason} ->
           :error

@@ -464,6 +464,16 @@ Raft/consensus, doctor diagnostics, and the full Flow surface: lookup, states,
 workers, due work, FQL queries, index projections, lineage, signals, schedules,
 policies, governance, failures, and retention.
 
+The Flow query page includes Guided and FQL workbench modes. It accepts typed
+JSON parameters, field projections, exact counts, `EXPLAIN`, and `EXPLAIN
+ANALYZE`; preserves query quality and resource usage; continues opaque cursors
+through POST; keeps lifecycle state separate from the current workflow step;
+discovers policy-indexed metadata and bounded top values for a selected
+workflow type; samples observed type suggestions with a projection-only query;
+and can visualize the ACL-filtered current page without issuing a second query.
+Page charts are labeled as page-scoped and are not presented as global grouped
+results.
+
 In protected mode:
 
 - a factory ACL catalog bootstraps through `/dashboard/setup` and then disables

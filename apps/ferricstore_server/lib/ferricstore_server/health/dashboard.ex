@@ -43,6 +43,7 @@ defmodule FerricstoreServer.Health.Dashboard do
     PolicyRetention,
     Projection,
     Query,
+    QueryWorkbench,
     Recovery,
     Schedules
   }
@@ -710,6 +711,24 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc false
   @spec flow_query_opts_from_query(binary()) :: keyword()
   def flow_query_opts_from_query(query), do: Query.query_opts_from_query(query)
+
+  @doc false
+  def prepare_flow_query_workbench(params), do: QueryWorkbench.prepare(params)
+
+  @doc false
+  def flow_query_workbench_action_requirements(params),
+    do: QueryWorkbench.action_requirements(params)
+
+  @doc false
+  def flow_query_workbench_requirements(prepared), do: QueryWorkbench.requirements(prepared)
+
+  @doc false
+  def collect_flow_query_workbench_page(prepared, form, opts \\ []),
+    do: Query.collect_workbench_page(prepared, form, opts)
+
+  @doc false
+  def collect_flow_query_workbench_error_page(form, message, opts \\ []),
+    do: Query.collect_workbench_error_page(form, message, opts)
 
   @doc "Renders the Flow query explorer page."
   @spec render_flow_query_page(map()) :: binary()

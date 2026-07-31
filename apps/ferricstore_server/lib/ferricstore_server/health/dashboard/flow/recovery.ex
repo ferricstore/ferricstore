@@ -195,10 +195,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
       else: flow_recovery_partition_required()
   end
 
-  defp flow_recovery_query_records(%{partition_key: partition_key} = filters, available_types)
-       when is_binary(partition_key) do
-    available_types |> Enum.take(16) |> flow_recovery_query_records_for_types(filters)
-  end
+  defp flow_recovery_query_records(%{partition_key: partition_key}, _available_types)
+       when is_binary(partition_key),
+       do: flow_recovery_type_required()
 
   defp flow_recovery_query_records(_filters, _available_types),
     do: flow_recovery_partition_required()
@@ -271,6 +270,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
 
   defp flow_recovery_partition_required do
     error = {:error, :query_partition_required}
+    {[], %{failures: error, stuck: error}}
+  end
+
+  defp flow_recovery_type_required do
+    error = {:error, :query_type_required}
     {[], %{failures: error, stuck: error}}
   end
 

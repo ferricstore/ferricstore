@@ -3,6 +3,7 @@ defmodule Ferricstore.FlowStateMetaTest do
 
   alias Ferricstore.Flow
   alias Ferricstore.Flow.PolicyMigrationWorker
+  alias Ferricstore.Flow.ReadAPI
 
   @partition "tenant-state-meta"
 
@@ -173,6 +174,36 @@ defmodule Ferricstore.FlowStateMetaTest do
                )
 
       assert Enum.map(records, & &1.id) == [indexed_id]
+    end)
+  end
+
+  test "state metadata value discovery returns bounded typed counts from its index" do
+    type = unique_flow_id("state-meta-value-discovery")
+    ctx = FerricStore.Instance.get(:default)
+
+    assert {:ok, _policy} = FerricStore.flow_policy_set(type, indexed_state_meta: "risk")
+
+    for {suffix, value} <- [{"a", 42}, {"b", 42}, {"c", "42"}] do
+      assert :ok =
+               FerricStore.flow_create(unique_flow_id("state-meta-value-#{suffix}"),
+                 type: type,
+                 state: "__review",
+                 partition_key: @partition,
+                 state_meta: %{"risk" => value},
+                 run_at_ms: 1_000,
+                 now_ms: 1_000
+               )
+    end
+
+    assert_eventually(fn ->
+      assert {:ok, values} =
+               ReadAPI.state_meta_values(ctx, type, "__review", "risk",
+                 partition_key: @partition,
+                 consistent_projection: true,
+                 count: 2
+               )
+
+      assert values == [%{value: 42, count: 2}, %{value: "42", count: 1}]
     end)
   end
 

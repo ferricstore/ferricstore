@@ -72,6 +72,45 @@ defmodule Ferricstore.Flow.Query.BuilderTest do
              Builder.build(:search, %{filters | state_meta: {"queued", "__internal", "high"}})
   end
 
+  test "builds null predicates without inventing a scalar parameter" do
+    base = %{partition_key: "tenant-a", type: "invoice"}
+
+    assert {:ok, %{query: attribute_query, params: attribute_params}} =
+             Builder.build(:search, Map.put(base, :attribute, {:is, "reviewed_at", :null}))
+
+    assert attribute_query =~ "attribute.reviewed_at IS NULL"
+    refute Map.has_key?(attribute_params, "attribute_value")
+    assert {:ok, _request} = Query.prepare_reference("FQL1", attribute_query, attribute_params)
+
+    assert {:ok, %{query: state_meta_query, params: state_meta_params}} =
+             Builder.build(
+               :search,
+               Map.put(base, :state_meta, {:is, "review", "risk_tier", :null})
+             )
+
+    assert state_meta_query =~ "state_meta.review.risk_tier IS NULL"
+    refute Map.has_key?(state_meta_params, "state_meta_value")
+
+    assert {:ok, _request} =
+             Query.prepare_reference("FQL1", state_meta_query, state_meta_params)
+  end
+
+  test "binds lifecycle state and workflow step as independent predicates" do
+    assert {:ok, %{query: query, params: params}} =
+             Builder.build(:list, %{
+               partition_key: "tenant-a",
+               type: "invoice",
+               state: "running",
+               run_state: "review"
+             })
+
+    assert query =~ "state = @state"
+    assert query =~ "run_state = @run_state"
+    assert params["state"] == "running"
+    assert params["run_state"] == "review"
+    assert {:ok, _request} = Query.prepare_reference("FQL1", query, params)
+  end
+
   test "builds bounded return projections with safely quoted dynamic fields" do
     filters = %{
       partition_key: "tenant-a",

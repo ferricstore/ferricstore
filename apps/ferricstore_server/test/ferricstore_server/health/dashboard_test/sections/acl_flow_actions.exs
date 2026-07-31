@@ -624,6 +624,43 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
           assert extract_body(response) =~ "read"
         end
 
+        @tag :flow_query_acl_preflight
+        test "query workbench denies command access before parsing malformed FQL" do
+          Application.put_env(:ferricstore, :protected_mode, true)
+
+          :ok =
+            FerricstoreServer.Acl.set_user("query-without-explain", [
+              "on",
+              ">secret",
+              "%R~type:email",
+              "-@all",
+              "+FLOW.QUERY"
+            ])
+
+          login =
+            http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+              "username" => "query-without-explain",
+              "password" => "secret"
+            })
+
+          response =
+            http_post_form(
+              HealthEndpoint.port(),
+              "/dashboard/flow/query",
+              %{
+                "action" => "explain",
+                "surface" => "advanced",
+                "fql" => "not valid FQL1",
+                "params_json" => "{}"
+              },
+              [{"Cookie", dashboard_session_cookie(login)}]
+            )
+
+          assert extract_status_code(response) == 403
+          assert extract_body(response) =~ "+FLOW.QUERY.EXPLAIN"
+          refute extract_body(response) =~ "FQL1 syntax"
+        end
+
         test "flow failures page enforces ACL key patterns from partition filters" do
           Application.put_env(:ferricstore, :protected_mode, true)
 
@@ -650,6 +687,42 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
 
           response =
             http_get(HealthEndpoint.port(), "/dashboard/flow/failures?#{query}", [
+              {"Cookie", dashboard_session_cookie(login)}
+            ])
+
+          assert extract_status_code(response) == 403
+          assert extract_body(response) =~ "FLOW.QUERY"
+          assert extract_body(response) =~ "%R~tenant-b:queue"
+          assert extract_body(response) =~ "read"
+        end
+
+        @tag :flow_states_acl_preflight
+        test "flow states page rejects an unauthorized explicit partition before collection" do
+          Application.put_env(:ferricstore, :protected_mode, true)
+
+          :ok =
+            FerricstoreServer.Acl.set_user("flow-states-tenant-a", [
+              "on",
+              ">secret",
+              "~tenant-a:*",
+              "-@all",
+              "+FLOW.QUERY"
+            ])
+
+          login =
+            http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+              "username" => "flow-states-tenant-a",
+              "password" => "secret"
+            })
+
+          query =
+            URI.encode_query(%{
+              "type" => "email",
+              "partition_key" => "tenant-b:queue"
+            })
+
+          response =
+            http_get(HealthEndpoint.port(), "/dashboard/flow/states?#{query}", [
               {"Cookie", dashboard_session_cookie(login)}
             ])
 

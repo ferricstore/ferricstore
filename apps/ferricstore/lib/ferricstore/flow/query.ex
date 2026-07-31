@@ -44,7 +44,7 @@ defmodule Ferricstore.Flow.Query do
       when is_atom(parser) do
     with :ok <- validate_version(version),
          {:ok, request} <- parse_diagnostic(parser, query),
-         {:ok, bound} <- Binder.bind_text(request, params) do
+         {:ok, bound} <- bind_text_diagnostic(request, params) do
       {:ok, bound}
     else
       {:error, %Error{} = error} -> {:error, error}
@@ -101,6 +101,38 @@ defmodule Ferricstore.Flow.Query do
       end
     end
   end
+
+  defp bind_text_diagnostic(%Request{} = request, params) do
+    case Binder.bind_text(request, params) do
+      {:error, :missing_parameter} ->
+        missing_names = Binder.missing_parameter_names(request, params)
+        {:error, missing_parameter_diagnostic(missing_names)}
+
+      result ->
+        result
+    end
+  end
+
+  defp missing_parameter_diagnostic([name]) do
+    Error.new(:missing_parameter,
+      detail: "Missing named parameter: @#{name}.",
+      hint: "Add #{name} to the parameters object.",
+      context: %{"missing_parameters" => [name]}
+    )
+  end
+
+  defp missing_parameter_diagnostic([first | _rest] = names) do
+    Error.new(:missing_parameter,
+      detail: "Missing #{length(names)} named parameters; first: @#{first}.",
+      hint: "Add the missing names to the parameters object.",
+      context: %{
+        "missing_parameter_count" => length(names),
+        "missing_parameters" => Enum.take(names, 16)
+      }
+    )
+  end
+
+  defp missing_parameter_diagnostic([]), do: Error.new(:missing_parameter)
 
   @spec error_message(atom()) :: binary()
   defdelegate error_message(reason), to: Error, as: :message

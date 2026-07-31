@@ -4,6 +4,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
 
   @flow_dashboard_recent_limit 40
   @flow_dashboard_max_recent_limit 200
+  @flow_terminal_states ~w(cancelled completed failed)
   @flow_dashboard_time_range_options [
     {nil, "All time"},
     {"5m", "Last 5 minutes"},
@@ -32,19 +33,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
     partition_key = Map.get(filters, :partition_key)
     range_filter = Map.get(filters, :range)
     available_types = Map.get(data, :available_types, [])
-    available_states = Map.get(data, :available_states, [])
 
-    type_options =
-      [nil | available_types]
-      |> Enum.map_join("\n", fn
-        nil ->
-          selected = if is_nil(type_filter), do: " selected", else: ""
-          ~s(<option value=""#{selected}>All types</option>)
+    available_states =
+      data
+      |> Map.get(:available_states, [])
+      |> Kernel.++(@flow_terminal_states)
+      |> Enum.filter(&(is_binary(&1) and &1 != ""))
+      |> Enum.uniq()
+      |> Enum.sort()
 
-        type ->
-          selected = if type == type_filter, do: " selected", else: ""
-          ~s(<option value="#{escape_attr(type)}"#{selected}>#{escape(type)}</option>)
-      end)
+    type_datalist =
+      render_flow_type_datalist("flow-state-type-options", [type_filter | available_types])
 
     state_options =
       [nil | available_states]
@@ -81,15 +80,14 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
     <div class="flow-filter-panel">
       <form class="flow-filter-form" action="/dashboard/flow/states" method="get">
         <label for="flow-state-type-filter">Type</label>
-        <select id="flow-state-type-filter" class="flow-search-input" name="type" title="Filter by workflow type">
-          #{type_options}
-        </select>
+        <input id="flow-state-type-filter" class="flow-search-input mono" type="search" name="type" value="#{escape_attr(type_filter || "")}" list="flow-state-type-options" placeholder="all types" autocomplete="off" title="Filter by workflow type; enter any known type for bounded cold lookup">
+        #{type_datalist}
         <label for="flow-state-state-filter">State</label>
         <select id="flow-state-state-filter" class="flow-search-input" name="state" title="Filter by current workflow state">
           #{state_options}
         </select>
         <label for="flow-state-partition-filter">Partition</label>
-        <input id="flow-state-partition-filter" class="flow-search-input mono" type="search" name="partition_key" value="#{escape_attr(partition_key || "")}" placeholder="required for cold rows" title="Filter by partition and enable cold terminal queries">
+        <input id="flow-state-partition-filter" class="flow-search-input mono" type="search" name="partition_key" value="#{escape_attr(partition_key || "")}" placeholder="type + partition for cold" title="Filter by partition; one explicit type and partition enable cold terminal queries">
         <label for="flow-state-name-filter">ID</label>
         <input id="flow-state-name-filter" class="flow-search-input mono" type="search" name="q" value="#{escape_attr(name_filter || "")}" placeholder="contains" title="Filter by Flow ID substring">
         <label for="flow-state-range-filter">Updated</label>
@@ -107,7 +105,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
       </form>
       <div class="flow-filter-note">
         Showing #{escape(flow_filter_summary(filters))} · #{format_number(filtered_sampled)} / #{format_number(total_sampled)} sampled records
-        #{info_icon("Updated quick ranges are sliding windows and override custom From/To. Custom times are interpreted as UTC. Limit applies to Recent Flow Records only.")}
+        #{info_icon("Updated quick ranges are sliding windows and override custom From/To. Custom times are interpreted as UTC. One explicit type and partition enable bounded cold terminal lookup. All-type views remain sampled. Limit applies to Recent Flow Records only.")}
       </div>
     </div>
     """
@@ -120,17 +118,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
     name_filter = Map.get(filters, :q)
     available_types = Map.get(data, :available_types, [])
 
-    type_options =
-      [nil | available_types]
-      |> Enum.map_join("\n", fn
-        nil ->
-          selected = if is_nil(type_filter), do: " selected", else: ""
-          ~s(<option value=""#{selected}>All types</option>)
-
-        type ->
-          selected = if type == type_filter, do: " selected", else: ""
-          ~s(<option value="#{escape_attr(type)}"#{selected}>#{escape(type)}</option>)
-      end)
+    type_options = render_sampled_type_options(available_types, type_filter)
 
     clear =
       if flow_signal_filter_active?(filters) do
@@ -169,6 +157,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
       </div>
     </div>
     """
+  end
+
+  def render_flow_type_datalist(id, types) when is_binary(id) and is_list(types) do
+    options =
+      types
+      |> Enum.filter(&(is_binary(&1) and &1 != ""))
+      |> Enum.uniq()
+      |> Enum.sort()
+      |> Enum.map_join("", &~s(<option value="#{escape_attr(&1)}"></option>))
+
+    ~s(<datalist id="#{escape_attr(id)}">#{options}</datalist>)
   end
 
   def render_flow_range_options(selected_range) do
@@ -285,4 +284,23 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
   def flow_filter_limit_label(@flow_dashboard_recent_limit), do: ""
   def flow_filter_limit_label(limit) when is_integer(limit), do: "recent limit #{limit}"
   def flow_filter_limit_label(_limit), do: ""
+
+  defp render_sampled_type_options(available_types, selected_type) do
+    types =
+      [selected_type | available_types]
+      |> Enum.reject(&(&1 in [nil, ""]))
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    all_selected = if is_nil(selected_type), do: " selected", else: ""
+    all = ~s(<option value=""#{all_selected}>All types</option>)
+
+    options =
+      Enum.map_join(types, "\n", fn type ->
+        selected = if type == selected_type, do: " selected", else: ""
+        ~s(<option value="#{escape_attr(type)}"#{selected}>#{escape(type)}</option>)
+      end)
+
+    all <> "\n" <> options
+  end
 end

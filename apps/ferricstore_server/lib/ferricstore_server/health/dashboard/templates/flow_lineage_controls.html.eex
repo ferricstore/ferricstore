@@ -11,15 +11,15 @@
     </label>
     <label>
       ID
-      <input class="flow-search-input mono" type="search" name="id" value="<%= escape_attr(filters.target || "") %>" placeholder="parent/root/correlation id" title="Lineage id to query">
+      <input class="flow-search-input mono" type="search" name="id" value="<%= escape_attr(filters.target || "") %>" placeholder="parent/root/correlation id required" title="Required lineage id" required>
     </label>
     <label>
       Partition
-      <input class="flow-search-input mono" type="search" name="partition_key" value="<%= escape_attr(filters.partition_key || "") %>" placeholder="optional" title="Optional partition key">
+      <input class="flow-search-input mono" type="search" name="partition_key" value="<%= escape_attr(filters.partition_key || "") %>" placeholder="required" title="Required partition key" required>
     </label>
     <label>
       Limit
-      <input class="flow-search-input mono flow-filter-limit" type="number" min="1" max="200" name="limit" value="<%= filters.limit %>">
+      <input class="flow-search-input mono flow-filter-limit" type="number" min="1" max="<%= Ferricstore.Flow.Query.Limits.max_results() %>" name="limit" value="<%= filters.limit %>">
     </label>
     <button class="flow-search-button" type="submit">Search</button>
   </form>

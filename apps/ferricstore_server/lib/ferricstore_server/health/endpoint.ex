@@ -153,6 +153,9 @@ defmodule FerricstoreServer.Health.Endpoint do
       {:ok, method, path, headers, body} ->
         handle_request(socket, transport, method, path, peer, headers, body)
 
+      :closed ->
+        :ok
+
       :error ->
         send_response(socket, transport, 400, "Bad Request", ~s({"error":"bad request"}))
     end
@@ -350,11 +353,31 @@ defmodule FerricstoreServer.Health.Endpoint do
          "/dashboard/logout",
          peer,
          headers,
-         _body
+         body
        ) do
-    send_redirect_response(socket, transport, "/dashboard/login", [
+    params = FlowPaths.decode_form_body(body)
+
+    location =
+      case Map.get(params, "next", "") do
+        next when is_binary(next) and next != "" -> Login.location(next)
+        _other -> "/dashboard/login"
+      end
+
+    send_redirect_response(socket, transport, location, [
       {"Set-Cookie", Session.clear_session_cookie(peer, headers)}
     ])
+  end
+
+  defp dispatch_request(
+         socket,
+         transport,
+         "POST",
+         "/dashboard/flow/query",
+         peer,
+         headers,
+         body
+       ) do
+    DashboardHandlers.handle_flow_query_workbench(socket, transport, peer, headers, body)
   end
 
   defp dispatch_request(

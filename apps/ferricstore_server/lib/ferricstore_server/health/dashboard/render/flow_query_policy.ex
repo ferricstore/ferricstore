@@ -12,10 +12,19 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryPolicy do
   defdelegate render_flow_query_kind_help(kind),
     to: FerricstoreServer.Health.Dashboard.Render.FlowQueryControls
 
+  defdelegate render_flow_query_discovery(discovery),
+    to: FerricstoreServer.Health.Dashboard.Render.FlowQueryControls
+
+  defdelegate render_flow_query_discovery_datalists(discovery),
+    to: FerricstoreServer.Health.Dashboard.Render.FlowQueryControls
+
   defdelegate render_flow_query_type_field(filters),
     to: FerricstoreServer.Health.Dashboard.Render.FlowQueryControls
 
   defdelegate render_flow_query_state_field(filters),
+    to: FerricstoreServer.Health.Dashboard.Render.FlowQueryControls
+
+  defdelegate render_flow_query_run_state_field(filters),
     to: FerricstoreServer.Health.Dashboard.Render.FlowQueryControls
 
   defdelegate render_flow_query_attribute_fields(filters),
@@ -30,6 +39,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryPolicy do
   defdelegate render_flow_query_partition_field(filters),
     to: FerricstoreServer.Health.Dashboard.Render.FlowQueryControls
 
+  defdelegate render_flow_query_limit_field(filters),
+    to: FerricstoreServer.Health.Dashboard.Render.FlowQueryControls
+
   defdelegate render_flow_query_time_fields(filters),
     to: FerricstoreServer.Health.Dashboard.Render.FlowQueryControls
 
@@ -37,6 +49,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryPolicy do
     to: FerricstoreServer.Health.Dashboard.Render.FlowQueryControls
 
   defdelegate render_flow_query_dynamic_script,
+    to: FerricstoreServer.Health.Dashboard.Render.FlowQueryControls
+
+  defdelegate render_flow_query_mode_script(active_mode),
     to: FerricstoreServer.Health.Dashboard.Render.FlowQueryControls
 
   defdelegate flow_query_hidden_attr(filters, kinds),

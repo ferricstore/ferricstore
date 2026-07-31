@@ -1,7 +1,8 @@
 defmodule Ferricstore.Flow.Query.BinderTest do
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Flow.Query.{Binder, Request}
+  alias Ferricstore.Flow.Query
+  alias Ferricstore.Flow.Query.{Binder, Error, Request}
 
   test "binds every value in a bounded collection request with exact types" do
     request =
@@ -79,6 +80,21 @@ defmodule Ferricstore.Flow.Query.BinderTest do
 
     assert {:error, :invalid_parameter_type} =
              Binder.bind(request, %{"tenant" => "tenant-a", "edge" => "100"})
+  end
+
+  test "diagnostic binding names missing parameters without exposing values" do
+    query =
+      "FROM runs WHERE partition_key = @partition AND type = @type " <>
+        "ORDER BY updated_at_ms DESC LIMIT 10 RETURN RECORDS"
+
+    assert {:error, %Error{} = error} =
+             Query.prepare_text_diagnostic("FQL1", query, %{"partition" => "tenant-a"})
+
+    assert error.reason == :missing_parameter
+    assert error.context == %{"missing_parameters" => ["type"]}
+    assert Error.format(error) =~ "DETAIL: Missing named parameter: @type."
+    assert Error.format(error) =~ "HINT: Add type to the parameters object."
+    refute Error.format(error) =~ "tenant-a"
   end
 
   test "ordinary dynamic comparisons cannot bind null or unsupported compound values" do

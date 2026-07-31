@@ -4,10 +4,9 @@
   <form class="flow-filter-form" action="/dashboard/flow/failures" method="get">
     <label>
       Type
-      <select class="flow-search-input mono" name="type" title="Filter by workflow type">
-        <%= render_flow_type_options(Map.get(data, :available_types, []), filters.type) %>
-      </select>
+      <input class="flow-search-input mono" type="search" name="type" value="<%= escape_attr(filters.type || "") %>" list="flow-failure-type-options" placeholder="workflow type" autocomplete="off" title="Filter by workflow type; required for exact scan">
     </label>
+    <%= render_flow_type_datalist("flow-failure-type-options", [filters.type | Map.get(data, :available_types, [])]) %>
     <label>
       Partition
       <input class="flow-search-input mono" type="search" name="partition_key" value="<%= escape_attr(filters.partition_key || "") %>" placeholder="required for exact" title="Partition key required by exact queries">
@@ -20,11 +19,11 @@
       Limit
       <input class="flow-search-input mono flow-filter-limit" type="number" min="1" max="200" name="limit" value="<%= filters.limit %>" title="Maximum rows to render">
     </label>
-    <label class="flow-check-label" title="Run bounded exact FLOW.QUERY plans for failures and expired leases in the selected partition.">
+    <label class="flow-check-label" title="Run bounded exact FLOW.QUERY plans for one workflow type in the selected partition.">
       <input type="checkbox" name="exact" value="true" <%= if Map.get(filters, :scan_exact, false), do: "checked", else: "" %>>
       Exact scan
     </label>
     <button class="flow-search-button" type="submit">Apply</button>
   </form>
-  <span class="flow-filter-note">Default view uses the bounded dashboard sample. Exact scan requires a partition and uses FLOW.QUERY. Actions are explicit.</span>
+  <span class="flow-filter-note">Default view uses the bounded dashboard sample. Exact scan requires a workflow type and partition, then uses FLOW.QUERY. ID contains filters the returned bounded rows. Actions are explicit.</span>
 </div>

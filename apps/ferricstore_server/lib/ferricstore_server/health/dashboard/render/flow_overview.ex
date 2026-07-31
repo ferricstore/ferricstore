@@ -116,19 +116,22 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowOverview do
       |> Enum.flat_map(fn {source, source_status} ->
         case source_status do
           {:error, reason} ->
-            [
-              """
-              <div class="flow-alert flow-alert-error">
-                Exact scan issue: #{flow_recovery_source_command(source)} failed with #{escape(inspect(reason, limit: 8))}. Sampled rows are still shown; zero candidates is not authoritative.
-              </div>
-              """
-            ]
+            [{source, reason}]
 
           _ ->
             []
         end
       end)
-      |> Enum.join("")
+      |> Enum.uniq_by(fn {source, reason} ->
+        {flow_recovery_source_command(source), flow_recovery_error_detail(reason, filters)}
+      end)
+      |> Enum.map_join("", fn {source, reason} ->
+        """
+        <div class="flow-alert flow-alert-error">
+          Exact scan issue: #{flow_recovery_source_command(source)} #{escape(flow_recovery_error_detail(reason, filters))}. Sampled rows are still shown; zero candidates is not authoritative.
+        </div>
+        """
+      end)
     else
       ""
     end
@@ -136,4 +139,20 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowOverview do
 
   def flow_recovery_source_command(source) when source in [:failures, :stuck], do: "FLOW.QUERY"
   def flow_recovery_source_command(source), do: source |> to_string() |> String.upcase()
+
+  defp flow_recovery_error_detail(
+         :query_partition_required,
+         %{type: type, partition_key: partition_key}
+       )
+       when type in [nil, ""] and partition_key in [nil, ""],
+       do: "requires a workflow type and partition key"
+
+  defp flow_recovery_error_detail(:query_type_required, _filters),
+    do: "requires one workflow type"
+
+  defp flow_recovery_error_detail(:query_partition_required, _filters),
+    do: "requires a partition key"
+
+  defp flow_recovery_error_detail(reason, _filters),
+    do: "failed with #{inspect(reason, limit: 8)}"
 end

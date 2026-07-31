@@ -1,7 +1,7 @@
 defmodule FerricstoreServer.Health.Endpoint.Forbidden do
   @moduledoc false
 
-  alias FerricstoreServer.Health.Endpoint.Response
+  alias FerricstoreServer.Health.Endpoint.{AccessPage, Login, Response}
 
   def send_response(socket, transport, path, requirement, reason) do
     details = requirement_details(requirement)
@@ -21,13 +21,32 @@ defmodule FerricstoreServer.Health.Endpoint.Forbidden do
         transport,
         403,
         "Forbidden",
-        """
-        <!DOCTYPE html>
-        <html lang="en"><head><meta charset="utf-8"><title>Forbidden</title></head>
-        <body><h1>Forbidden</h1>#{details_html(details, reason)}<p><a href="/dashboard/login">Sign in as another user</a></p></body></html>
-        """
+        render_page(details, reason, path)
       )
     end
+  end
+
+  @doc false
+  @spec render_page(map(), binary(), binary()) :: binary()
+  def render_page(details, reason, path)
+      when is_map(details) and is_binary(reason) and is_binary(path) do
+    next = path |> Login.sanitize_next() |> AccessPage.escape()
+
+    AccessPage.render(%{
+      title: "Forbidden",
+      kicker: "Access denied",
+      heading: "This account cannot access that resource.",
+      copy: reason,
+      form_html: """
+      <form method="post" action="/dashboard/logout">
+        <input type="hidden" name="next" value="#{next}">
+        <button type="submit">Sign in as another user</button>
+      </form>
+      """,
+      context_heading: "The live ACL policy blocked this operation.",
+      context_items: context_items(details),
+      footer_items: ["No protected data was returned", "ACL rules remain in effect"]
+    })
   end
 
   def requirement_details({command, opts}) do
@@ -64,39 +83,23 @@ defmodule FerricstoreServer.Health.Endpoint.Forbidden do
   defp acl_key_rule(:write, key), do: "%W~" <> key
   defp acl_key_rule(_access, key), do: "~" <> key
 
-  defp details_html(details, reason) do
-    key_html =
-      case Map.get(details, :required_key) do
-        nil ->
-          ""
+  defp context_items(details) do
+    items = [{"Required command", Map.fetch!(details, :required_acl_rule)}]
 
-        key ->
-          """
-          <dt>Required key access</dt><dd><code>#{html_escape(Map.fetch!(details, :required_key_access))}</code> on <code>#{html_escape(key)}</code></dd>
-          <dt>Key ACL rule</dt><dd><code>#{html_escape(Map.fetch!(details, :required_key_rule))}</code></dd>
-          """
-      end
+    case Map.get(details, :required_key) do
+      nil ->
+        items
 
-    """
-    <p>#{html_escape(reason)}</p>
-    <dl>
-      <dt>Required ACL command</dt><dd><code>#{html_escape(Map.fetch!(details, :required_acl_rule))}</code></dd>
-      #{key_html}
-    </dl>
-    """
+      key ->
+        items ++
+          [
+            {"Required key", "#{Map.fetch!(details, :required_key_access)} on #{key}"},
+            {"Key ACL rule", Map.fetch!(details, :required_key_rule)}
+          ]
+    end
   end
 
   defp dashboard_api_path?("/dashboard/api"), do: true
   defp dashboard_api_path?("/dashboard/api/" <> _rest), do: true
   defp dashboard_api_path?(_path), do: false
-
-  defp html_escape(value) when is_binary(value) do
-    value
-    |> String.replace("&", "&amp;")
-    |> String.replace("<", "&lt;")
-    |> String.replace(">", "&gt;")
-    |> String.replace("\"", "&quot;")
-  end
-
-  defp html_escape(value), do: value |> to_string() |> html_escape()
 end

@@ -1,8 +1,18 @@
 defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   @moduledoc false
 
-  alias Ferricstore.Flow.Query.Builder
+  alias Ferricstore.Commands.PreparedCommand
+  alias Ferricstore.Flow.Attributes
+  alias Ferricstore.Flow.Query.{Builder, Field, Limits, Request}
   alias FerricstoreServer.Health.Dashboard.Access, as: DashboardAccess
+
+  alias FerricstoreServer.Health.Dashboard.Flow.{
+    QueryDiscovery,
+    QueryResult,
+    QueryVisualization,
+    QueryWorkbench
+  }
+
   alias FerricstoreServer.Health.QueryDecoder
 
   import FerricstoreServer.Health.Dashboard.Flow.Calls
@@ -15,6 +25,38 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   @flow_dashboard_signal_flow_fetch_limit 80
   @flow_dashboard_signal_history_count 25
   @flow_terminal_states ~w(completed failed cancelled)
+  @flow_query_predicates [
+    :type,
+    :state,
+    :run_state,
+    :attribute,
+    :state_meta,
+    :id,
+    :time,
+    :direction
+  ]
+  @flow_query_predicate_labels %{
+    type: "Workflow type",
+    state: "Lifecycle state",
+    run_state: "Workflow step",
+    attribute: "Attribute filters",
+    state_meta: "State metadata",
+    id: "ID",
+    time: "Time range",
+    direction: "Newest-first ordering"
+  }
+  @flow_query_allowed_predicates %{
+    "list" => [:type, :state, :run_state, :attribute, :time, :direction],
+    "search" => [:type, :state, :run_state, :attribute, :state_meta, :time, :direction],
+    "stats" => [:type, :state, :attribute],
+    "terminals" => [:type, :state, :time, :direction],
+    "failures" => [:type, :time, :direction],
+    "stuck" => [:type, :time, :direction],
+    "history" => [:id],
+    "by_parent" => [:id, :time, :direction],
+    "by_root" => [:id, :time, :direction],
+    "by_correlation" => [:id, :time, :direction]
+  }
 
   @spec collect_lineage_page(keyword()) :: map()
   def collect_lineage_page(opts \\ []) when is_list(opts) do
@@ -54,7 +96,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
       :partition_key,
       normalize_flow_partition_query(Map.get(params, "partition_key"))
     )
-    |> maybe_put_query_opt(:limit, normalize_flow_limit_filter(Map.get(params, "limit")))
+    |> maybe_put_query_opt(:limit, normalize_flow_query_limit(Map.get(params, "limit")))
     |> Enum.reverse()
   end
 
@@ -64,25 +106,32 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   def collect_query_page(opts \\ []) when is_list(opts) do
     filters = flow_query_filters_from_opts(opts)
     acl_username = DashboardAccess.keyspace_acl_username(opts)
+    pending_discovery = QueryDiscovery.start(filters, opts)
 
-    sampled_records =
-      @flow_dashboard_sample_limit
-      |> collect_flow_records_sample()
-      |> DashboardAccess.filter_flow_records_for_acl(acl_username)
+    {query_result, query_acl_scope} =
+      if filters.inspect do
+        {flow_query_inspection_result(filters), flow_query_acl_scope(filters)}
+      else
+        execute_flow_query_for_acl(filters, acl_username)
+      end
 
-    {query_result, query_acl_scope} = execute_flow_query_for_acl(filters, acl_username)
+    result =
+      query_result
+      |> maybe_filter_inspection_result_for_acl(
+        filters.inspect,
+        acl_username,
+        query_acl_scope
+      )
+      |> QueryVisualization.attach()
+
+    discovery = QueryDiscovery.finish(pending_discovery, filters, result)
+    result = maybe_put_inspection_discovery_message(result, filters.inspect, discovery)
 
     %{
       filters: filters,
-      result:
-        query_result
-        |> DashboardAccess.flow_query_filter_result_for_acl(
-          acl_username,
-          query_acl_scope
-        ),
-      available_types: flow_available_types(sampled_records),
-      total_sampled: length(sampled_records),
-      sample_limit: @flow_dashboard_sample_limit,
+      result: result,
+      discovery: discovery,
+      workbench: QueryWorkbench.default_form(filters),
       generated_at_ms: System.system_time(:millisecond)
     }
   end
@@ -96,13 +145,18 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
     |> maybe_put_query_opt(:type, normalize_flow_type_filter(Map.get(params, "type")))
     |> maybe_put_query_opt(:state, normalize_flow_state_filter(Map.get(params, "state")))
     |> maybe_put_query_opt(
+      :run_state,
+      normalize_flow_state_filter(Map.get(params, "run_state"))
+    )
+    |> maybe_put_query_opt(
       :attribute_key,
       normalize_flow_name_filter(Map.get(params, "attribute_key"))
     )
     |> maybe_put_query_opt(
-      :attribute_value,
-      normalize_flow_name_filter(Map.get(params, "attribute_value"))
+      :attribute_value_type,
+      normalize_flow_name_filter(Map.get(params, "attribute_value_type"))
     )
+    |> maybe_put_raw_query_opt(:attribute_value, params, "attribute_value")
     |> maybe_put_query_opt(
       :state_meta_state,
       normalize_flow_state_filter(Map.get(params, "state_meta_state"))
@@ -112,22 +166,129 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
       normalize_flow_name_filter(Map.get(params, "state_meta_key"))
     )
     |> maybe_put_query_opt(
-      :state_meta_value,
-      normalize_flow_name_filter(Map.get(params, "state_meta_value"))
+      :state_meta_value_type,
+      normalize_flow_name_filter(Map.get(params, "state_meta_value_type"))
     )
+    |> maybe_put_raw_query_opt(:state_meta_value, params, "state_meta_value")
     |> maybe_put_query_opt(:id, normalize_flow_name_filter(Map.get(params, "id")))
     |> maybe_put_query_opt(
       :partition_key,
       normalize_flow_partition_query(Map.get(params, "partition_key"))
     )
-    |> maybe_put_query_opt(:limit, normalize_flow_limit_filter(Map.get(params, "limit")))
+    |> maybe_put_query_opt(:limit, normalize_flow_query_limit(Map.get(params, "limit")))
     |> maybe_put_query_opt(:from_ms, parse_flow_time_filter(Map.get(params, "from")))
     |> maybe_put_query_opt(:to_ms, parse_flow_time_filter(Map.get(params, "to")))
     |> maybe_put_query_opt(:rev, normalize_flow_boolean_filter(Map.get(params, "rev")))
+    |> maybe_put_query_opt(
+      :inspect,
+      normalize_flow_boolean_filter(Map.get(params, "inspect"))
+    )
     |> Enum.reverse()
   end
 
   def query_opts_from_query(_query), do: []
+
+  defp maybe_put_raw_query_opt(opts, key, params, param_key) do
+    case Map.fetch(params, param_key) do
+      {:ok, value} when is_binary(value) -> [{key, value} | opts]
+      _missing_or_invalid -> opts
+    end
+  end
+
+  @spec collect_workbench_page(PreparedCommand.t(), QueryWorkbench.form(), keyword()) :: map()
+  def collect_workbench_page(%PreparedCommand{} = prepared, form, opts \\ [])
+      when is_map(form) and is_list(opts) do
+    opts = workbench_page_opts(form, opts) |> workbench_discovery_opts(prepared)
+    filters = flow_query_filters_from_opts(opts)
+    pending_discovery = QueryDiscovery.start(filters, opts)
+    acl_username = DashboardAccess.keyspace_acl_username(opts)
+    acl_scope = prepared_acl_scope(prepared)
+
+    result =
+      prepared
+      |> QueryWorkbench.execute()
+      |> DashboardAccess.flow_query_filter_result_for_acl(acl_username, acl_scope)
+      |> QueryVisualization.attach()
+      |> QueryWorkbench.attach_continuation(form)
+
+    workbench_page_data(form, result, filters, pending_discovery)
+  end
+
+  @spec collect_workbench_error_page(QueryWorkbench.form(), binary(), keyword()) :: map()
+  def collect_workbench_error_page(form, message, opts \\ [])
+      when is_map(form) and is_binary(message) and is_list(opts) do
+    result = %{
+      status: :error,
+      command: workbench_command(form),
+      rows: [],
+      message: message
+    }
+
+    workbench_page_data(form, result, opts)
+  end
+
+  defp workbench_page_data(form, result, opts) do
+    filters = form |> workbench_page_opts(opts) |> flow_query_filters_from_opts()
+    pending_discovery = QueryDiscovery.start(filters, opts)
+    workbench_page_data(form, result, filters, pending_discovery)
+  end
+
+  defp workbench_page_data(form, result, filters, pending_discovery) do
+    %{
+      filters: filters,
+      result: result,
+      discovery: QueryDiscovery.finish(pending_discovery, filters, result),
+      workbench: form,
+      generated_at_ms: System.system_time(:millisecond)
+    }
+  end
+
+  defp prepared_acl_scope(%PreparedCommand{acl_keys: [scope | _rest]}) when is_binary(scope),
+    do: scope
+
+  defp prepared_acl_scope(%PreparedCommand{}), do: "*"
+
+  defp workbench_command(%{action: :explain}), do: "FLOW.QUERY EXPLAIN"
+  defp workbench_command(%{action: :analyze}), do: "FLOW.QUERY EXPLAIN ANALYZE"
+  defp workbench_command(_form), do: "FLOW.QUERY"
+
+  defp workbench_discovery_opts(
+         opts,
+         %PreparedCommand{ast: {:flow_query, %Request{predicate: {:and, predicates}}}}
+       )
+       when is_list(predicates) do
+    opts
+    |> maybe_put_workbench_discovery_opt(:type, exact_query_literal(predicates, :type))
+    |> maybe_put_workbench_discovery_opt(
+      :partition_key,
+      exact_query_literal(predicates, :partition_key)
+    )
+  end
+
+  defp workbench_discovery_opts(opts, %PreparedCommand{}), do: opts
+
+  defp workbench_page_opts(%{mode: :guided, guided_query: query}, opts)
+       when is_binary(query) and query != "" and is_list(opts) do
+    query_opts_from_query(query) ++ opts
+  end
+
+  defp workbench_page_opts(_form, opts), do: opts
+
+  defp exact_query_literal(predicates, field) do
+    case Enum.flat_map(predicates, fn
+           {:eq, ^field, {:literal, _type, value}} when is_binary(value) and value != "" ->
+             [value]
+
+           _other ->
+             []
+         end) do
+      [value] -> value
+      _missing_or_ambiguous -> nil
+    end
+  end
+
+  defp maybe_put_workbench_discovery_opt(opts, _key, nil), do: opts
+  defp maybe_put_workbench_discovery_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp flow_query_acl_scope(filters) when is_map(filters) do
     partition_key = Map.get(filters, :partition_key)
@@ -260,7 +421,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
       mode: normalize_flow_lineage_mode(Keyword.get(opts, :mode)),
       target: normalize_flow_name_filter(Keyword.get(opts, :target)),
       partition_key: normalize_flow_partition_query(Keyword.get(opts, :partition_key)),
-      limit: normalize_flow_limit_filter(Keyword.get(opts, :limit))
+      limit: normalize_flow_query_limit(Keyword.get(opts, :limit))
     }
   end
 
@@ -353,23 +514,196 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   end
 
   defp flow_query_filters_from_opts(opts) when is_list(opts) do
+    attribute_key = normalize_flow_name_filter(Keyword.get(opts, :attribute_key))
+    attribute_value_type = metadata_value_type(opts, :attribute_value_type)
+
+    {attribute_value_set?, attribute_value, attribute_value_input, attribute_value_error} =
+      metadata_value_from_opts(
+        opts,
+        :attribute_value,
+        attribute_value_type,
+        "Attribute value",
+        attribute_key
+      )
+
+    state_meta_key = normalize_flow_name_filter(Keyword.get(opts, :state_meta_key))
+    state_meta_value_type = metadata_value_type(opts, :state_meta_value_type)
+
+    {state_meta_value_set?, state_meta_value, state_meta_value_input, state_meta_value_error} =
+      metadata_value_from_opts(
+        opts,
+        :state_meta_value,
+        state_meta_value_type,
+        "State metadata value",
+        state_meta_key
+      )
+
     %{
       kind: normalize_flow_query_kind(Keyword.get(opts, :kind)),
       type: normalize_flow_type_filter(Keyword.get(opts, :type)),
       state: normalize_flow_state_filter(Keyword.get(opts, :state)),
-      attribute_key: normalize_flow_name_filter(Keyword.get(opts, :attribute_key)),
-      attribute_value: normalize_flow_name_filter(Keyword.get(opts, :attribute_value)),
+      run_state: normalize_flow_state_filter(Keyword.get(opts, :run_state)),
+      attribute_key: attribute_key,
+      attribute_value_type: attribute_value_type,
+      attribute_value: attribute_value,
+      attribute_value_input: attribute_value_input,
+      attribute_value_set?: attribute_value_set?,
+      attribute_value_error: attribute_value_error,
       state_meta_state: normalize_flow_state_filter(Keyword.get(opts, :state_meta_state)),
-      state_meta_key: normalize_flow_name_filter(Keyword.get(opts, :state_meta_key)),
-      state_meta_value: normalize_flow_name_filter(Keyword.get(opts, :state_meta_value)),
+      state_meta_key: state_meta_key,
+      state_meta_value_type: state_meta_value_type,
+      state_meta_value: state_meta_value,
+      state_meta_value_input: state_meta_value_input,
+      state_meta_value_set?: state_meta_value_set?,
+      state_meta_value_error: state_meta_value_error,
       id: normalize_flow_name_filter(Keyword.get(opts, :id)),
       partition_key: normalize_flow_partition_query(Keyword.get(opts, :partition_key)),
-      limit: normalize_flow_limit_filter(Keyword.get(opts, :limit)),
+      limit: normalize_flow_query_limit(Keyword.get(opts, :limit)),
       from_ms: Keyword.get(opts, :from_ms),
       to_ms: Keyword.get(opts, :to_ms),
-      rev: Keyword.get(opts, :rev) == true
+      rev: Keyword.get(opts, :rev) == true,
+      inspect: Keyword.get(opts, :inspect) == true
     }
   end
+
+  defp metadata_value_type(opts, key) do
+    case Keyword.get(opts, key, "string") do
+      type when type in ["string", "integer", "float", "boolean", "null"] -> type
+      _invalid -> "invalid"
+    end
+  end
+
+  defp metadata_value_from_opts(_opts, _key, "null", _label, metadata_key) do
+    {is_binary(metadata_key), nil, nil, nil}
+  end
+
+  defp metadata_value_from_opts(opts, key, type, label, metadata_key) do
+    case Keyword.fetch(opts, key) do
+      {:ok, ""} when is_nil(metadata_key) ->
+        {false, nil, nil, nil}
+
+      {:ok, input} when is_binary(input) ->
+        case parse_metadata_value(input, type) do
+          {:ok, value} -> {true, value, input, nil}
+          {:error, detail} -> {true, nil, input, "#{label} #{detail}"}
+        end
+
+      {:ok, _invalid} ->
+        {true, nil, nil, "#{label} must be supplied as text"}
+
+      :error ->
+        {false, nil, nil, nil}
+    end
+  end
+
+  defp parse_metadata_value(value, "string") do
+    if Attributes.valid_scalar?(value),
+      do: {:ok, value},
+      else: {:error, "is too large"}
+  end
+
+  defp parse_metadata_value(value, "integer") do
+    case Integer.parse(String.trim(value)) do
+      {parsed, ""} ->
+        if Attributes.valid_scalar?(parsed),
+          do: {:ok, parsed},
+          else: {:error, "must be a signed 64-bit integer"}
+
+      _invalid ->
+        {:error, "must be an integer"}
+    end
+  end
+
+  defp parse_metadata_value(value, "float") do
+    case Float.parse(String.trim(value)) do
+      {parsed, ""} ->
+        if Attributes.valid_scalar?(parsed),
+          do: {:ok, parsed},
+          else: {:error, "must be a finite number"}
+
+      _invalid ->
+        {:error, "must be a finite number"}
+    end
+  end
+
+  defp parse_metadata_value(value, "boolean") do
+    case String.downcase(String.trim(value)) do
+      "true" -> {:ok, true}
+      "false" -> {:ok, false}
+      _invalid -> {:error, "must be true or false"}
+    end
+  end
+
+  defp parse_metadata_value(_value, _invalid),
+    do: {:error, "type must be string, integer, float, boolean, or null"}
+
+  defp flow_query_inspection_result(%{type: type}) when is_binary(type) and type != "" do
+    %{
+      status: :idle,
+      command: "FLOW.QUERY OPTIONS",
+      rows: [],
+      message: "Options loaded for #{type}"
+    }
+  end
+
+  defp flow_query_inspection_result(_filters) do
+    %{
+      status: :idle,
+      command: "FLOW.QUERY OPTIONS",
+      rows: [],
+      message: "Enter a workflow type"
+    }
+  end
+
+  defp maybe_filter_inspection_result_for_acl(result, true, _username, _scope), do: result
+
+  defp maybe_filter_inspection_result_for_acl(result, false, username, scope) do
+    DashboardAccess.flow_query_filter_result_for_acl(result, username, scope)
+  end
+
+  defp maybe_put_inspection_discovery_message(
+         result,
+         true,
+         %{status: :forbidden, required_command: command}
+       )
+       when is_binary(command) do
+    Map.put(result, :message, "Type options require +#{command}")
+  end
+
+  defp maybe_put_inspection_discovery_message(
+         result,
+         true,
+         %{status: :forbidden, denied_scope: :type}
+       ) do
+    Map.put(result, :message, "Type options are not available for this workflow type")
+  end
+
+  defp maybe_put_inspection_discovery_message(result, true, %{status: :forbidden}) do
+    Map.put(result, :message, "Type options are not available for this partition")
+  end
+
+  defp maybe_put_inspection_discovery_message(result, true, %{status: :unavailable}) do
+    Map.put(result, :message, "Type options are temporarily unavailable")
+  end
+
+  defp maybe_put_inspection_discovery_message(
+         result,
+         true,
+         %{status: :ready, type: nil, available_types: types} = discovery
+       )
+       when is_list(types) do
+    partition_key = Map.get(discovery, :scope)
+
+    message =
+      case partition_key do
+        value when is_binary(value) -> "Type options loaded for #{value}"
+        _missing -> "Type options loaded"
+      end
+
+    Map.put(result, :message, message)
+  end
+
+  defp maybe_put_inspection_discovery_message(result, _inspect?, _discovery), do: result
 
   defp normalize_flow_query_kind("terminals"), do: "terminals"
   defp normalize_flow_query_kind("search"), do: "search"
@@ -383,35 +717,175 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   defp normalize_flow_query_kind(_kind), do: "list"
 
   defp flow_query_execute(filters) do
-    case flow_query_plan(filters) do
+    case validate_flow_query_predicates(filters) do
+      :ok ->
+        execute_flow_query_plan(flow_query_plan(filters))
+
+      {:error, message} ->
+        %{
+          status: :idle,
+          command: flow_query_kind_command(filters.kind),
+          rows: [],
+          message: message
+        }
+    end
+  end
+
+  defp execute_flow_query_plan(plan) do
+    case plan do
       {:ok, command, fun} ->
-        case bounded_dashboard_call(fun, flow_dashboard_list_fetch_timeout_ms(), :query) do
-          {:ok, {:ok, %{records: rows}}} when is_list(rows) ->
-            %{status: :ok, command: command, rows: rows, message: "#{length(rows)} row(s)"}
+        execute_flow_query_call(command, fun, nil)
 
-          {:ok, {:ok, rows}} when is_list(rows) ->
-            %{status: :ok, command: command, rows: rows, message: "#{length(rows)} row(s)"}
-
-          {:ok, {:ok, row}} ->
-            %{status: :ok, command: command, rows: List.wrap(row), message: "1 row"}
-
-          {:ok, {:error, reason}} ->
-            %{status: :error, command: command, rows: [], message: inspect(reason)}
-
-          {:error, :timeout} ->
-            %{status: :timeout, command: command, rows: [], message: "query timed out"}
-
-          {:error, reason} ->
-            %{status: :error, command: command, rows: [], message: inspect(reason)}
-
-          _other ->
-            %{status: :error, command: command, rows: [], message: "unexpected query result"}
-        end
+      {:ok, command, fun, continuation_form} ->
+        execute_flow_query_call(command, fun, continuation_form)
 
       {:idle, command, message} ->
         %{status: :idle, command: command, rows: [], message: message}
     end
   end
+
+  defp execute_flow_query_call(command, fun, continuation_form) do
+    case bounded_dashboard_call(fun, flow_dashboard_list_fetch_timeout_ms(), :query) do
+      {:ok, {:ok, response}} ->
+        command
+        |> QueryResult.success(response)
+        |> maybe_attach_guided_continuation(continuation_form)
+
+      {:ok, {:error, reason}} ->
+        %{status: :error, command: command, rows: [], message: inspect(reason)}
+
+      {:error, :timeout} ->
+        %{status: :timeout, command: command, rows: [], message: "query timed out"}
+
+      {:error, reason} ->
+        %{status: :error, command: command, rows: [], message: inspect(reason)}
+
+      _other ->
+        %{status: :error, command: command, rows: [], message: "unexpected query result"}
+    end
+  end
+
+  defp maybe_attach_guided_continuation(result, nil), do: result
+
+  defp maybe_attach_guided_continuation(result, form),
+    do: QueryWorkbench.attach_continuation(result, form)
+
+  defp validate_flow_query_predicates(filters) do
+    with :ok <-
+           validate_optional_pair(
+             filters.attribute_key,
+             filters.attribute_value_set?,
+             filters.attribute_value_error
+           ),
+         :ok <-
+           validate_optional_triple(
+             filters.state_meta_state,
+             filters.state_meta_key,
+             filters.state_meta_value_set?,
+             filters.state_meta_value_error
+           ),
+         :ok <- validate_query_field_names(filters),
+         :ok <- validate_flow_time_range(filters),
+         :ok <- validate_supported_flow_query_predicates(filters) do
+      :ok
+    end
+  end
+
+  defp validate_optional_pair(_key, _value_set?, error) when is_binary(error),
+    do: {:error, error}
+
+  defp validate_optional_pair(nil, false, nil), do: :ok
+  defp validate_optional_pair(key, true, nil) when is_binary(key), do: :ok
+
+  defp validate_optional_pair(_key, _value_set?, _error),
+    do: {:error, "Enter both attribute key and value"}
+
+  defp validate_optional_triple(_state, _key, _value_set?, error) when is_binary(error),
+    do: {:error, error}
+
+  defp validate_optional_triple(nil, nil, false, nil), do: :ok
+
+  defp validate_optional_triple(state, key, true, nil)
+       when is_binary(state) and is_binary(key),
+       do: :ok
+
+  defp validate_optional_triple(_state, _key, _value_set?, _error),
+    do: {:error, "Enter state metadata state, key, and value"}
+
+  defp validate_query_field_names(filters) do
+    with :ok <- validate_attribute_field_name(Map.get(filters, :attribute_key)),
+         :ok <-
+           validate_state_meta_field_name(
+             Map.get(filters, :state_meta_state),
+             Map.get(filters, :state_meta_key)
+           ) do
+      :ok
+    end
+  end
+
+  defp validate_attribute_field_name(nil), do: :ok
+
+  defp validate_attribute_field_name(key) when is_binary(key) do
+    if Field.valid?({:attribute, key}),
+      do: :ok,
+      else:
+        {:error, "Attribute key is not queryable. Choose an indexed attribute from Show options"}
+  end
+
+  defp validate_attribute_field_name(_invalid),
+    do: {:error, "Attribute key is not queryable. Choose an indexed attribute from Show options"}
+
+  defp validate_state_meta_field_name(nil, nil), do: :ok
+
+  defp validate_state_meta_field_name(state, key) when is_binary(state) and is_binary(key) do
+    if Field.valid?({:state_meta, state, key}),
+      do: :ok,
+      else:
+        {:error,
+         "State metadata state or key is not queryable. Choose the policy-indexed field from Show options"}
+  end
+
+  defp validate_state_meta_field_name(_state, _key), do: :ok
+
+  defp validate_flow_time_range(%{from_ms: from_ms, to_ms: to_ms})
+       when is_integer(from_ms) and is_integer(to_ms) and from_ms > to_ms,
+       do: {:error, "From UTC must not be later than To UTC"}
+
+  defp validate_flow_time_range(_filters), do: :ok
+
+  defp validate_supported_flow_query_predicates(%{kind: kind} = filters) do
+    allowed = Map.fetch!(@flow_query_allowed_predicates, kind)
+
+    case Enum.find(@flow_query_predicates, fn predicate ->
+           query_predicate_present?(filters, predicate) and predicate not in allowed
+         end) do
+      nil ->
+        :ok
+
+      predicate ->
+        {:error,
+         "#{Map.fetch!(@flow_query_predicate_labels, predicate)} is not supported by #{kind}"}
+    end
+  end
+
+  defp query_predicate_present?(filters, :type), do: is_binary(filters.type)
+  defp query_predicate_present?(filters, :state), do: is_binary(filters.state)
+  defp query_predicate_present?(filters, :run_state), do: is_binary(filters.run_state)
+
+  defp query_predicate_present?(filters, :attribute),
+    do: is_binary(filters.attribute_key) or filters.attribute_value_set?
+
+  defp query_predicate_present?(filters, :state_meta),
+    do:
+      is_binary(filters.state_meta_state) or is_binary(filters.state_meta_key) or
+        filters.state_meta_value_set?
+
+  defp query_predicate_present?(filters, :id), do: is_binary(filters.id)
+
+  defp query_predicate_present?(filters, :time),
+    do: not is_nil(filters.from_ms) or not is_nil(filters.to_ms)
+
+  defp query_predicate_present?(filters, :direction), do: filters.rev == true
 
   defp flow_query_plan(%{kind: kind, type: type})
        when kind in ["list", "search", "stats", "terminals", "failures", "stuck"] and
@@ -439,6 +913,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
     {:idle, "FLOW.QUERY", "Enter a partition key"}
   end
 
+  defp flow_query_plan(%{kind: "stats", state: nil}),
+    do: {:idle, "FLOW.STATS", "Enter a workflow state"}
+
   defp flow_query_plan(%{kind: "history", id: id} = filters) do
     opts =
       [count: filters.limit, values: false, consistent_projection: true]
@@ -449,72 +926,144 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   end
 
   defp flow_query_plan(%{kind: "by_parent", id: id} = filters) do
-    query_builder_plan(:by_parent, Map.put(query_builder_filters(filters), :id, id))
+    query_builder_plan(:by_parent, Map.put(query_builder_filters(filters), :id, id), filters)
   end
 
   defp flow_query_plan(%{kind: "by_root", id: id} = filters) do
-    query_builder_plan(:by_root, Map.put(query_builder_filters(filters), :id, id))
+    query_builder_plan(:by_root, Map.put(query_builder_filters(filters), :id, id), filters)
   end
 
   defp flow_query_plan(%{kind: "by_correlation", id: id} = filters) do
-    query_builder_plan(:by_correlation, Map.put(query_builder_filters(filters), :id, id))
+    query_builder_plan(:by_correlation, Map.put(query_builder_filters(filters), :id, id), filters)
   end
 
   defp flow_query_plan(%{kind: "search"} = filters) do
-    attributes = flow_query_attribute_filter(filters)
-    state_meta = flow_query_state_meta_filter(filters)
+    attribute = flow_query_attribute_builder_filter(filters)
+    state_meta = flow_query_state_meta_builder_filter(filters)
 
-    if is_nil(attributes) and is_nil(state_meta) do
+    if is_nil(attribute) and is_nil(state_meta) do
       {:idle, "FLOW.QUERY", "Enter an indexed attribute or state metadata filter"}
     else
-      filters =
+      builder_filters =
         filters
         |> query_builder_filters()
-        |> maybe_put_builder_filter(:attribute, single_attribute(attributes))
-        |> maybe_put_builder_filter(:state_meta, single_state_meta(state_meta))
+        |> maybe_put_builder_filter(:attribute, attribute)
+        |> maybe_put_builder_filter(:state_meta, state_meta)
 
-      query_builder_plan(:search, filters)
+      query_builder_plan(:search, builder_filters, filters)
     end
   end
 
   defp flow_query_plan(%{kind: "terminals"} = filters),
-    do: query_builder_plan(:terminals, query_builder_filters(filters))
+    do: query_builder_plan(:terminals, query_builder_filters(filters), filters)
 
   defp flow_query_plan(%{kind: "failures"} = filters),
-    do: query_builder_plan(:failures, query_builder_filters(filters))
+    do: query_builder_plan(:failures, query_builder_filters(filters), filters)
 
   defp flow_query_plan(%{kind: "stuck"} = filters),
     do:
       query_builder_plan(
         :stuck,
-        Map.put(query_builder_filters(filters), :now_ms, System.system_time(:millisecond))
+        Map.put(query_builder_filters(filters), :now_ms, System.system_time(:millisecond)),
+        filters
       )
 
   defp flow_query_plan(%{kind: "stats", type: type} = filters) do
     opts =
-      flow_query_index_opts(filters)
+      [consistent_projection: true]
+      |> maybe_put_query_opt(:partition_key, filters.partition_key)
+      |> maybe_put_query_opt(:attributes, flow_query_attribute_filter(filters))
       |> maybe_put_query_opt(:state, filters.state)
+      |> Enum.reverse()
 
     {:ok, "FLOW.STATS", fn -> flow_dashboard_flow_stats(type, opts) end}
   end
 
-  defp flow_query_plan(filters), do: query_builder_plan(:list, query_builder_filters(filters))
+  defp flow_query_plan(%{kind: "list"} = filters) do
+    builder_filters =
+      filters
+      |> query_builder_filters()
+      |> maybe_put_builder_filter(:attribute, flow_query_attribute_builder_filter(filters))
 
-  defp query_builder_plan(kind, filters) do
+    query_builder_plan(:list, builder_filters, filters)
+  end
+
+  defp flow_query_plan(filters),
+    do: query_builder_plan(:list, query_builder_filters(filters), filters)
+
+  defp query_builder_plan(kind, filters, guided_filters) do
     case Builder.build(kind, filters) do
       {:ok, built} ->
-        {:ok, "FLOW.QUERY", fn -> flow_dashboard_flow_query(built.query, built.params) end}
+        continuation_form =
+          QueryWorkbench.guided_form(
+            built.query,
+            built.params,
+            guided_query_from_filters(guided_filters)
+          )
+
+        {:ok, "FLOW.QUERY", fn -> flow_dashboard_flow_query(built.query, built.params) end,
+         continuation_form}
 
       {:error, reason} ->
         {:idle, "FLOW.QUERY", query_builder_message(reason)}
     end
   end
 
+  defp guided_query_from_filters(filters) when is_map(filters) do
+    %{
+      "kind" => Map.get(filters, :kind),
+      "type" => Map.get(filters, :type),
+      "state" => Map.get(filters, :state),
+      "run_state" => Map.get(filters, :run_state),
+      "attribute_key" => Map.get(filters, :attribute_key),
+      "attribute_value_type" =>
+        if(
+          Map.get(filters, :attribute_value_set?) and
+            Map.get(filters, :attribute_value_type) != "string",
+          do: Map.get(filters, :attribute_value_type),
+          else: nil
+        ),
+      "attribute_value" =>
+        if(
+          Map.get(filters, :attribute_value_set?) and
+            Map.get(filters, :attribute_value_type) != "null",
+          do: Map.get(filters, :attribute_value_input),
+          else: nil
+        ),
+      "state_meta_state" => Map.get(filters, :state_meta_state),
+      "state_meta_key" => Map.get(filters, :state_meta_key),
+      "state_meta_value_type" =>
+        if(
+          Map.get(filters, :state_meta_value_set?) and
+            Map.get(filters, :state_meta_value_type) != "string",
+          do: Map.get(filters, :state_meta_value_type),
+          else: nil
+        ),
+      "state_meta_value" =>
+        if(
+          Map.get(filters, :state_meta_value_set?) and
+            Map.get(filters, :state_meta_value_type) != "null",
+          do: Map.get(filters, :state_meta_value_input),
+          else: nil
+        ),
+      "id" => Map.get(filters, :id),
+      "partition_key" => Map.get(filters, :partition_key),
+      "limit" => Map.get(filters, :limit),
+      "from" => Map.get(filters, :from_ms),
+      "to" => Map.get(filters, :to_ms),
+      "rev" => if(Map.get(filters, :rev), do: "true", else: nil)
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new(fn {key, value} -> {key, to_string(value)} end)
+    |> URI.encode_query()
+  end
+
   defp query_builder_filters(filters) do
     %{
       partition_key: filters.partition_key,
       type: filters.type,
-      state: filters.state,
+      state: query_builder_state(filters.state),
+      run_state: query_builder_state(filters.run_state),
       limit: filters.limit,
       direction: if(filters.rev, do: :desc, else: :asc),
       from_ms: filters.from_ms,
@@ -522,22 +1071,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
     }
   end
 
-  defp single_attribute(attributes) when is_map(attributes) and map_size(attributes) == 1 do
-    Enum.at(attributes, 0)
-  end
-
-  defp single_attribute(_attributes), do: nil
-
-  defp single_state_meta(state_meta) when is_map(state_meta) and map_size(state_meta) == 1 do
-    [{state, values}] = Map.to_list(state_meta)
-
-    if is_map(values) and map_size(values) == 1 do
-      [{name, value}] = Map.to_list(values)
-      {state, name, value}
-    end
-  end
-
-  defp single_state_meta(_state_meta), do: nil
+  defp query_builder_state(nil), do: "any"
+  defp query_builder_state(state), do: state
 
   defp maybe_put_builder_filter(filters, _key, nil), do: filters
   defp maybe_put_builder_filter(filters, key, value), do: Map.put(filters, key, value)
@@ -546,36 +1081,58 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   defp query_builder_message(:query_filter_required), do: "Enter a query filter"
   defp query_builder_message(reason), do: inspect(reason)
 
-  defp flow_query_index_opts(filters) do
-    [
-      count: filters.limit,
-      include_cold: true,
-      consistent_projection: true
-    ]
-    |> maybe_put_query_opt(:partition_key, filters.partition_key)
-    |> maybe_put_query_opt(:from_ms, filters.from_ms)
-    |> maybe_put_query_opt(:to_ms, filters.to_ms)
-    |> maybe_put_query_opt(:rev, if(filters.rev, do: true, else: nil))
-    |> maybe_put_query_opt(:attributes, flow_query_attribute_filter(filters))
-    |> Enum.reverse()
-  end
-
-  defp flow_query_attribute_filter(%{attribute_key: key, attribute_value: value})
-       when is_binary(key) and key != "" and is_binary(value) and value != "",
+  defp flow_query_attribute_filter(%{
+         attribute_key: key,
+         attribute_value: value,
+         attribute_value_set?: true,
+         attribute_value_error: nil
+       })
+       when is_binary(key) and key != "",
        do: %{key => value}
 
   defp flow_query_attribute_filter(_filters), do: nil
 
-  defp flow_query_state_meta_filter(%{
+  defp flow_query_attribute_builder_filter(%{
+         attribute_key: key,
+         attribute_value_type: "null",
+         attribute_value_set?: true,
+         attribute_value_error: nil
+       })
+       when is_binary(key) and key != "",
+       do: {:is, key, :null}
+
+  defp flow_query_attribute_builder_filter(%{
+         attribute_key: key,
+         attribute_value: value,
+         attribute_value_set?: true,
+         attribute_value_error: nil
+       })
+       when is_binary(key) and key != "",
+       do: {key, value}
+
+  defp flow_query_attribute_builder_filter(_filters), do: nil
+
+  defp flow_query_state_meta_builder_filter(%{
          state_meta_state: state,
          state_meta_key: key,
-         state_meta_value: value
+         state_meta_value_type: "null",
+         state_meta_value_set?: true,
+         state_meta_value_error: nil
        })
-       when is_binary(state) and state != "" and is_binary(key) and key != "" and
-              is_binary(value) and value != "",
-       do: %{state => %{key => value}}
+       when is_binary(state) and state != "" and is_binary(key) and key != "",
+       do: {:is, state, key, :null}
 
-  defp flow_query_state_meta_filter(_filters), do: nil
+  defp flow_query_state_meta_builder_filter(%{
+         state_meta_state: state,
+         state_meta_key: key,
+         state_meta_value: value,
+         state_meta_value_set?: true,
+         state_meta_value_error: nil
+       })
+       when is_binary(state) and state != "" and is_binary(key) and key != "",
+       do: {state, key, value}
+
+  defp flow_query_state_meta_builder_filter(_filters), do: nil
 
   defp flow_query_kind_command("terminals"), do: "FLOW.QUERY"
   defp flow_query_kind_command("search"), do: "FLOW.QUERY"
@@ -587,6 +1144,12 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   defp flow_query_kind_command("by_root"), do: "FLOW.QUERY"
   defp flow_query_kind_command("by_correlation"), do: "FLOW.QUERY"
   defp flow_query_kind_command(_kind), do: "FLOW.QUERY"
+
+  defp normalize_flow_query_limit(value) do
+    value
+    |> normalize_flow_limit_filter()
+    |> min(Limits.max_results())
+  end
 
   defp flow_signals_filters_from_opts(opts) when is_list(opts) do
     %{

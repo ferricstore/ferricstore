@@ -6,6 +6,7 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
   alias FerricstoreServer.Health.Dashboard
   alias FerricstoreServer.Health.Endpoint.Auth
   alias FerricstoreServer.Health.Endpoint.FlowPaths
+  alias FerricstoreServer.Health.Endpoint.Forbidden
   alias FerricstoreServer.Health.Endpoint.Login
   alias FerricstoreServer.Health.Endpoint.Response
   alias FerricstoreServer.Health.Endpoint.Session
@@ -543,6 +544,109 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
         Response.send_html_response(socket, transport, 200, "OK", body)
     end
   end
+
+  def handle_flow_query_workbench(socket, transport, peer, headers, body) do
+    case Auth.observability_authorized?(peer, headers) do
+      false ->
+        Response.send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+
+      true ->
+        params = FlowPaths.decode_form_body(body)
+
+        action_requirements = Dashboard.flow_query_workbench_action_requirements(params)
+
+        case Auth.authorize_command_request(peer, headers, action_requirements, :html) do
+          :ok ->
+            opts = Auth.dashboard_flow_collect_opts(peer, headers)
+
+            case Dashboard.prepare_flow_query_workbench(params) do
+              {:ok, prepared, form} ->
+                authorize_and_run_flow_query(
+                  socket,
+                  transport,
+                  peer,
+                  headers,
+                  prepared,
+                  form,
+                  opts
+                )
+
+              {:error, form, message} ->
+                data = Dashboard.collect_flow_query_workbench_error_page(form, message, opts)
+                html = Dashboard.render_flow_query_page(data)
+                Response.send_html_response(socket, transport, 400, "Bad Request", html)
+            end
+
+          authorization_failure ->
+            send_flow_query_authorization_failure(
+              socket,
+              transport,
+              authorization_failure
+            )
+        end
+    end
+  end
+
+  defp authorize_and_run_flow_query(
+         socket,
+         transport,
+         peer,
+         headers,
+         prepared,
+         form,
+         opts
+       ) do
+    requirements = Dashboard.flow_query_workbench_requirements(prepared)
+
+    case Auth.authorize_command_request(peer, headers, requirements, :html) do
+      :ok ->
+        data = Dashboard.collect_flow_query_workbench_page(prepared, form, opts)
+        html = Dashboard.render_flow_query_page(data)
+        Response.send_html_response(socket, transport, 200, "OK", html)
+
+      authorization_failure ->
+        send_flow_query_authorization_failure(
+          socket,
+          transport,
+          authorization_failure
+        )
+    end
+  end
+
+  defp send_flow_query_authorization_failure(
+         socket,
+         transport,
+         {:redirect_login, location}
+       ),
+       do: Response.send_redirect_response(socket, transport, location)
+
+  defp send_flow_query_authorization_failure(
+         socket,
+         transport,
+         {:unauthorized, reason}
+       ) do
+    Response.send_response(
+      socket,
+      transport,
+      401,
+      "Unauthorized",
+      Jason.encode!(%{error: reason})
+    )
+  end
+
+  defp send_flow_query_authorization_failure(
+         socket,
+         transport,
+         {:forbidden, requirement, reason}
+       ),
+       do:
+         Forbidden.send_response(
+           socket,
+           transport,
+           "/dashboard/flow/query",
+           requirement,
+           reason
+         )
 
   def handle_flow_lookup(socket, transport, peer, headers, query) do
     case Auth.observability_authorized?(peer, headers) do

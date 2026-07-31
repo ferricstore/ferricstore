@@ -15,6 +15,19 @@ defmodule Ferricstore.Flow.Query.Binder do
   @spec bind_text(Request.t(), map()) :: {:ok, Request.t()} | {:error, atom()}
   def bind_text(%Request{} = request, params), do: do_bind(request, params, :text)
 
+  @doc false
+  @spec missing_parameter_names(Request.t(), map()) :: [binary()]
+  def missing_parameter_names(%Request{} = request, params) when is_map(params) do
+    with {:ok, predicates} <- predicates(request),
+         {:ok, expected_names} <- parameter_names(predicates, request.cursor) do
+      Enum.reject(expected_names, &Map.has_key?(params, &1))
+    else
+      _invalid -> []
+    end
+  end
+
+  def missing_parameter_names(%Request{}, _params), do: []
+
   defp do_bind(%Request{} = request, params, transport) when is_map(params) do
     with :ok <- Request.validate_unbound(request),
          {:ok, predicates} <- predicates(request),

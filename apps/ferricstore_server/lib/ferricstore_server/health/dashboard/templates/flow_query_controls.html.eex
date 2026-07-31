@@ -1,29 +1,63 @@
 <% data = assigns.data %>
 <% filters = data.filters %>
+<% discovery = Map.get(data, :discovery, %{}) %>
+<% workbench = Map.get(data, :workbench, FerricstoreServer.Health.Dashboard.Flow.QueryWorkbench.default_form()) %>
+<% guided_active = workbench.mode != :advanced %>
 <div class="flow-policy-panel">
-  <div class="section-title">Safe Query Explorer <%= info_icon("Runs bounded Flow read APIs only. Payload/value hydration stays off.") %></div>
-  <%= render_flow_query_kind_help(filters.kind) %>
-  <form class="flow-filter-form" action="/dashboard/flow/query" method="get" data-flow-query-form>
-    <label>
-      Query
-      <select class="flow-search-input mono" name="kind" title="Flow query to run" data-flow-query-kind>
-        <%= render_flow_query_kind_options(filters.kind) %>
-      </select>
-    </label>
-    <%= render_flow_query_type_field(filters) %>
-    <%= render_flow_query_state_field(filters) %>
-    <%= render_flow_query_attribute_fields(filters) %>
-    <%= render_flow_query_state_meta_fields(filters) %>
-    <%= render_flow_query_id_field(filters) %>
-    <%= render_flow_query_partition_field(filters) %>
-    <label>
-      Limit
-      <input class="flow-search-input mono flow-filter-limit" type="number" min="1" max="200" name="limit" value="<%= filters.limit %>">
-    </label>
-    <%= render_flow_query_time_fields(filters) %>
-    <%= render_flow_query_direction_field(filters) %>
-    <button class="flow-search-button" type="submit">Run</button>
-  </form>
-  <div class="flow-filter-note">Changing Query shows only the fields that command can use. All queries are bounded and return refs, not full payload values.</div>
-  <%= render_flow_query_dynamic_script() %>
+  <div class="section-title">Safe Query Explorer <%= info_icon("Runs bounded Flow queries only. Payload/value hydration stays off unless explicitly projected.") %></div>
+  <div class="flow-query-mode-tabs" role="tablist" aria-label="Query mode">
+    <button type="button" role="tab" id="flow-query-tab-guided" aria-controls="flow-query-panel-guided" aria-selected="<%= if guided_active, do: "true", else: "false" %>" tabindex="<%= if guided_active, do: "0", else: "-1" %>" data-flow-query-mode-tab="guided">Guided</button>
+    <button type="button" role="tab" id="flow-query-tab-advanced" aria-controls="flow-query-panel-advanced" aria-selected="<%= if guided_active, do: "false", else: "true" %>" tabindex="<%= if guided_active, do: "-1", else: "0" %>" data-flow-query-mode-tab="advanced">FQL</button>
+  </div>
+  <div id="flow-query-panel-guided" role="tabpanel" aria-labelledby="flow-query-tab-guided"<%= if guided_active, do: "", else: " hidden" %> data-flow-query-mode="guided">
+    <%= render_flow_query_discovery(discovery) %>
+    <%= render_flow_query_kind_help(filters.kind) %>
+    <form class="flow-filter-form" action="/dashboard/flow/query" method="get" data-flow-query-form>
+      <label>
+        Query
+        <select class="flow-search-input mono" name="kind" title="Flow query to run" data-flow-query-kind>
+          <%= render_flow_query_kind_options(filters.kind) %>
+        </select>
+      </label>
+      <%= render_flow_query_type_field(filters) %>
+      <%= render_flow_query_state_field(filters) %>
+      <%= render_flow_query_run_state_field(filters) %>
+      <fieldset class="flow-query-predicate-group" data-flow-query-kinds="list search stats"<%= flow_query_hidden_attr(filters, ~w(list search stats)) %>>
+        <legend>Indexed attribute predicate</legend>
+        <%= render_flow_query_attribute_fields(filters) %>
+      </fieldset>
+      <fieldset class="flow-query-predicate-group" data-flow-query-kinds="search"<%= flow_query_hidden_attr(filters, ~w(search)) %>>
+        <legend>State metadata predicate</legend>
+        <%= render_flow_query_state_meta_fields(filters) %>
+      </fieldset>
+      <%= render_flow_query_id_field(filters) %>
+      <%= render_flow_query_partition_field(filters) %>
+      <%= render_flow_query_limit_field(filters) %>
+      <%= render_flow_query_time_fields(filters) %>
+      <%= render_flow_query_direction_field(filters) %>
+      <%= render_flow_query_discovery_datalists(discovery) %>
+      <button class="flow-search-button" type="submit" data-flow-query-run-action>Run</button>
+      <button class="flow-search-button secondary" type="submit" name="inspect" value="true" formnovalidate data-flow-query-options-action data-flow-query-kinds="list search stats terminals failures stuck"<%= flow_query_hidden_attr(filters, ~w(list search stats terminals failures stuck)) %>>Show options</button>
+    </form>
+    <div class="flow-filter-note">Changing Query shows only the fields that command can use. All queries are bounded and return refs, not full payload values.</div>
+    <%= render_flow_query_dynamic_script() %>
+  </div>
+  <div id="flow-query-panel-advanced" role="tabpanel" aria-labelledby="flow-query-tab-advanced"<%= if guided_active, do: " hidden", else: "" %> data-flow-query-mode="advanced">
+    <form class="flow-query-workbench-form" action="/dashboard/flow/query" method="post" data-flow-query-workbench-form>
+      <label>
+        FQL1
+        <textarea class="flow-query-editor mono" name="fql" rows="7" spellcheck="false"><%= escape(workbench.fql) %></textarea>
+      </label>
+      <label>
+        Parameters (JSON)
+        <textarea class="flow-query-params mono" name="params_json" rows="5" spellcheck="false"><%= escape(workbench.params_json) %></textarea>
+      </label>
+      <div class="flow-query-actions">
+        <button class="flow-search-button" type="submit" name="action" value="run">Run</button>
+        <button class="flow-search-button secondary" type="submit" name="action" value="explain">Explain</button>
+        <button class="flow-search-button secondary" type="submit" name="action" value="analyze">Analyze</button>
+      </div>
+    </form>
+  </div>
+  <%= render_flow_query_mode_script(workbench.mode) %>
 </div>

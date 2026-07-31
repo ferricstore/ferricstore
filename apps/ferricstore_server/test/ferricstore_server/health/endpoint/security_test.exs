@@ -3,6 +3,7 @@ defmodule FerricstoreServer.Health.Endpoint.SecurityTest do
   @moduletag :global_state
 
   alias FerricstoreServer.Health.Endpoint
+  alias FerricstoreServer.Health.Endpoint.Login
   alias FerricstoreServer.AuthRateLimiter
   alias Ferricstore.AuditLog
   alias FerricstoreServer.Acl
@@ -45,6 +46,26 @@ defmodule FerricstoreServer.Health.Endpoint.SecurityTest do
       ])
 
     assert status_code(post_response) == 302
+  end
+
+  test "role switch logout preserves a safe return location" do
+    get_response = http_request("GET", "/dashboard/login", "", [])
+    token = csrf_token(get_response)
+    cookie = response_cookie(get_response, "ferricstore_dashboard_csrf")
+    next = "/dashboard/flow/states?type=email&partition_key=type%3Aemail"
+
+    body = URI.encode_query(%{"_csrf_token" => token, "next" => next})
+
+    response =
+      http_request("POST", "/dashboard/logout", body, [
+        {"Cookie", cookie},
+        {"Origin", "http://localhost"}
+      ])
+
+    assert status_code(response) == 302
+    assert response_header(response, "location") == Login.location(next)
+    assert response_header(response, "set-cookie") =~ "ferricstore_dashboard="
+    assert response_header(response, "set-cookie") =~ "Max-Age=0"
   end
 
   test "live dashboard component forms retain the request CSRF token" do

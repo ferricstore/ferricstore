@@ -51,6 +51,27 @@ defmodule FerricstoreServer.Health.Dashboard.Access do
 
   def flow_record_allowed_for_acl?(_record, _username), do: false
 
+  def flow_scope_allowed_for_acl?(_scope, nil), do: true
+
+  def flow_scope_allowed_for_acl?(scope, username)
+      when is_binary(scope) and scope != "" and is_binary(username),
+      do: flow_acl_key_allowed?(username, scope)
+
+  def flow_scope_allowed_for_acl?(_scope, _username), do: false
+
+  def flow_command_allowed_for_acl?(_command, nil), do: true
+
+  def flow_command_allowed_for_acl?(command, username)
+      when is_binary(command) and command != "" and is_binary(username) do
+    FerricstoreServer.Acl.check_command(username, command) == :ok
+  rescue
+    _error -> false
+  catch
+    :exit, _reason -> false
+  end
+
+  def flow_command_allowed_for_acl?(_command, _username), do: false
+
   def flow_query_filter_result_for_acl(result, username),
     do: flow_query_filter_result_for_acl(result, username, "*")
 
@@ -59,14 +80,18 @@ defmodule FerricstoreServer.Health.Dashboard.Access do
   def flow_query_filter_result_for_acl(result, username, request_scope) when is_map(result) do
     scope_allowed? = flow_acl_key_allowed?(username, request_scope)
 
-    rows =
-      result
-      |> Map.get(:rows, [])
-      |> filter_flow_query_rows_for_acl(username, scope_allowed?)
+    if Map.has_key?(result, :scalar) or Map.has_key?(result, :explain) do
+      filter_flow_query_non_row_result(result, scope_allowed?)
+    else
+      rows =
+        result
+        |> Map.get(:rows, [])
+        |> filter_flow_query_rows_for_acl(username, scope_allowed?)
 
-    result
-    |> Map.put(:rows, rows)
-    |> Map.put(:message, "#{length(rows)} visible row(s)")
+      result
+      |> Map.put(:rows, rows)
+      |> Map.put(:message, "#{length(rows)} visible row(s)")
+    end
   end
 
   def flow_lineage_filter_result_for_acl(result, nil), do: result
@@ -139,14 +164,26 @@ defmodule FerricstoreServer.Health.Dashboard.Access do
   defp filter_flow_query_rows_for_acl(rows, username, scope_allowed?) when is_list(rows) do
     Enum.filter(rows, fn
       row when is_map(row) ->
-        case flow_record_acl_keys(row) do
-          [] -> scope_allowed?
-          _keys -> flow_record_acl_allowed?(row, username)
+        case flow_record_partition_key(row) do
+          partition_key when is_binary(partition_key) and partition_key != "" ->
+            flow_acl_key_allowed?(username, partition_key)
+
+          _missing_partition ->
+            scope_allowed?
         end
 
       _row ->
         scope_allowed?
     end)
+  end
+
+  defp filter_flow_query_non_row_result(result, true), do: result
+
+  defp filter_flow_query_non_row_result(result, false) do
+    result
+    |> Map.drop([:scalar, :explain, :quality, :usage, :page, :continuation, :visualization])
+    |> Map.put(:rows, [])
+    |> Map.put(:message, "0 visible row(s)")
   end
 
   defp flow_acl_key_allowed?(username, key) when is_binary(key) and key != "" do

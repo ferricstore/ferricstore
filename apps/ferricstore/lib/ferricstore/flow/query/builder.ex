@@ -154,6 +154,8 @@ defmodule Ferricstore.Flow.Query.Builder do
   defp optional_common_predicates(filters) do
     with {:ok, predicates, params} <- optional_type([], %{}, Map.get(filters, :type)),
          {:ok, predicates, params} <- optional_state(predicates, params, Map.get(filters, :state)),
+         {:ok, predicates, params} <-
+           optional_run_state(predicates, params, Map.get(filters, :run_state)),
          {:ok, predicates, params} <- optional_attribute(predicates, params, filters),
          {:ok, predicates, params} <- optional_state_meta(predicates, params, filters) do
       {:ok, Enum.reverse(predicates), params}
@@ -178,6 +180,17 @@ defmodule Ferricstore.Flow.Query.Builder do
 
   defp optional_state(_predicates, _params, _state), do: {:error, :invalid_query_filter}
 
+  defp optional_run_state(predicates, params, run_state) when run_state in [nil, "any"],
+    do: {:ok, predicates, params}
+
+  defp optional_run_state(predicates, params, run_state)
+       when is_binary(run_state) and run_state != "" do
+    {:ok, ["run_state = @run_state" | predicates], Map.put(params, "run_state", run_state)}
+  end
+
+  defp optional_run_state(_predicates, _params, _run_state),
+    do: {:error, :invalid_query_filter}
+
   defp optional_attribute(predicates, params, %{attribute: {name, value}})
        when is_binary(name) do
     field = {:attribute, name}
@@ -191,6 +204,17 @@ defmodule Ferricstore.Flow.Query.Builder do
     else
       false -> {:error, :unsupported_field}
       {:error, _reason} = error -> error
+    end
+  end
+
+  defp optional_attribute(predicates, params, %{attribute: {:is, name, :null}})
+       when is_binary(name) do
+    field = {:attribute, name}
+
+    if Field.valid?(field) do
+      {:ok, [Field.external_name(field) <> " IS NULL" | predicates], params}
+    else
+      {:error, :unsupported_field}
     end
   end
 
@@ -213,6 +237,19 @@ defmodule Ferricstore.Flow.Query.Builder do
     else
       false -> {:error, :unsupported_field}
       {:error, _reason} = error -> error
+    end
+  end
+
+  defp optional_state_meta(predicates, params, %{
+         state_meta: {:is, state, name, :null}
+       })
+       when is_binary(state) and is_binary(name) do
+    field = {:state_meta, state, name}
+
+    if Field.valid?(field) do
+      {:ok, [Field.external_name(field) <> " IS NULL" | predicates], params}
+    else
+      {:error, :unsupported_field}
     end
   end
 

@@ -78,8 +78,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
       |> DashboardAccess.filter_flow_records_for_acl(acl_username)
       |> filter_flow_records_by_partition(filters.partition_key)
 
-    available_types = flow_available_types(records)
-    terminal_records = collect_flow_states_terminal_records(filters, available_types)
+    terminal_records = collect_flow_states_terminal_records(filters)
 
     type_records =
       records
@@ -217,83 +216,95 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
     end)
   end
 
-  defp collect_flow_states_terminal_records(filters, available_types) do
-    terminal_states = flow_states_terminal_fetch_states(filters)
+  defp collect_flow_states_terminal_records(filters) do
+    terminal_state = flow_states_terminal_fetch_state(filters)
+    type = Map.get(filters, :type)
 
-    if terminal_states == [] or not is_binary(filters.partition_key) do
+    if is_nil(terminal_state) or not is_binary(filters.partition_key) or not is_binary(type) do
       []
     else
-      filters
-      |> flow_states_terminal_fetch_types(available_types)
-      |> flow_fetch_terminal_records(
-        terminal_states,
+      flow_fetch_terminal_records(
+        [type],
+        terminal_state,
         filters.limit,
-        filters.partition_key
+        filters.partition_key,
+        filters.from_ms,
+        filters.to_ms
       )
     end
   end
 
-  defp flow_states_terminal_fetch_states(%{state: state}) when state in @flow_terminal_states,
-    do: [state]
+  defp flow_states_terminal_fetch_state(%{state: state}) when state in @flow_terminal_states,
+    do: state
 
-  defp flow_states_terminal_fetch_states(%{state: nil, type: type})
+  defp flow_states_terminal_fetch_state(%{state: nil, type: type})
        when is_binary(type) and type != "",
-       do: @flow_terminal_states
+       do: "any"
 
-  defp flow_states_terminal_fetch_states(_filters), do: []
+  defp flow_states_terminal_fetch_state(_filters), do: nil
 
-  defp flow_states_terminal_fetch_types(%{type: type}, _available_types)
-       when is_binary(type) and type != "",
-       do: [type]
-
-  defp flow_states_terminal_fetch_types(_filters, available_types), do: available_types
-
-  defp flow_fetch_terminal_records(types, terminal_states, limit, partition_key) when limit > 0 do
+  defp flow_fetch_terminal_records(
+         types,
+         terminal_state,
+         limit,
+         partition_key,
+         from_ms,
+         to_ms
+       )
+       when limit > 0 do
     types
     |> Enum.reduce_while({[], limit}, fn type, {acc, remaining} ->
       if remaining <= 0 do
         {:halt, {acc, 0}}
       else
         records =
-          flow_fetch_terminal_records_for_type(type, terminal_states, remaining, partition_key)
+          case flow_dashboard_terminal_records(
+                 type,
+                 terminal_state,
+                 remaining,
+                 partition_key,
+                 from_ms,
+                 to_ms
+               ) do
+            {:ok, records} -> records
+            {:error, _reason} -> []
+          end
 
         {:cont, {prepend_flow_dashboard_chunk(records, acc), max(remaining - length(records), 0)}}
       end
     end)
     |> elem(0)
     |> flatten_flow_dashboard_chunks()
-    |> Enum.take(limit)
+    |> flow_recent_records(limit)
   end
 
-  defp flow_fetch_terminal_records(_types, _terminal_states, _limit, _partition_key), do: []
+  defp flow_fetch_terminal_records(
+         _types,
+         _terminal_state,
+         _limit,
+         _partition_key,
+         _from_ms,
+         _to_ms
+       ),
+       do: []
 
-  defp flow_fetch_terminal_records_for_type(type, terminal_states, limit, partition_key) do
-    terminal_states
-    |> Enum.reduce_while({[], limit}, fn state, {acc, remaining} ->
-      if remaining <= 0 do
-        {:halt, {acc, 0}}
-      else
-        case flow_dashboard_terminal_records(type, state, remaining, partition_key) do
-          {:ok, records} ->
-            {:cont,
-             {prepend_flow_dashboard_chunk(records, acc), max(remaining - length(records), 0)}}
-
-          {:error, _reason} ->
-            {:cont, {acc, remaining}}
-        end
-      end
-    end)
-    |> elem(0)
-    |> flatten_flow_dashboard_chunks()
-  end
-
-  defp flow_dashboard_terminal_records(type, state, limit, partition_key) do
+  defp flow_dashboard_terminal_records(
+         type,
+         state,
+         limit,
+         partition_key,
+         from_ms,
+         to_ms
+       ) do
     with {:ok, %{query: query, params: params}} <-
            Builder.build(:terminals, %{
              type: type,
              state: state,
              partition_key: partition_key,
-             limit: min(limit, 100)
+             limit: min(limit, 100),
+             direction: :desc,
+             from_ms: from_ms,
+             to_ms: to_ms
            }) do
       case bounded_dashboard_call(
              fn -> flow_dashboard_flow_query(query, params) end,

@@ -64,6 +64,13 @@ defmodule FerricstoreServer.Health.Endpoint.RequestTest do
            |> Enum.all?(fn [earlier, later] -> later < earlier end)
   end
 
+  test "idle preconnects close without manufacturing a bad HTTP response" do
+    TricklingTransport.prepare([])
+
+    assert :closed = Request.read_request(:socket, TricklingTransport)
+    assert length(TricklingTransport.recv_calls()) == 1
+  end
+
   test "parse_request_line parses method path headers and body" do
     request = "POST /dashboard/action HTTP/1.1\r\nContent-Length: 4\r\nX-Test: yes\r\n\r\nbody"
 
