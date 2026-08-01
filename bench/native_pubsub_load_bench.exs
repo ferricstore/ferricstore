@@ -43,6 +43,17 @@ activity_log_sample_every = env_integer.("BENCH_PUBSUB_ACTIVITY_LOG_SAMPLE_EVERY
 load_outbound_bytes = env_integer.("BENCH_PUBSUB_LOAD_OUTBOUND_BYTES", "134217728", 1)
 coalesce_max = env_integer.("BENCH_PUBSUB_COALESCE_MAX", "64", 1)
 publish_pipeline = env_integer.("BENCH_PUBSUB_PUBLISH_PIPELINE", "1", 1)
+skip_slow_phase = System.get_env("BENCH_PUBSUB_SKIP_SLOW_PHASE", "0") == "1"
+
+pipeline_encoding =
+  case System.get_env("BENCH_PUBSUB_PIPELINE_ENCODING", "generic") do
+    encoding when encoding in ["generic", "compact"] ->
+      encoding
+
+    invalid ->
+      raise ArgumentError,
+            "BENCH_PUBSUB_PIPELINE_ENCODING must be generic or compact, got: #{inspect(invalid)}"
+  end
 
 slow_outbound_bytes =
   env_integer.(
@@ -130,12 +141,20 @@ run_concurrent = fn concurrency ->
               if(remainder == 0, do: [], else: [remainder])
 
           Enum.map(batch_sizes, fn batch_size ->
+            publishes = List.duplicate({channel, message}, batch_size)
+
             pipeline_frame =
-              NativePubSubClient.publish_pipeline_frame(
-                request_id,
-                List.duplicate({channel, message}, batch_size),
-                lane_id
-              )
+              case pipeline_encoding do
+                "generic" ->
+                  NativePubSubClient.publish_pipeline_frame(request_id, publishes, lane_id)
+
+                "compact" ->
+                  NativePubSubClient.compact_publish_pipeline_frame(
+                    request_id,
+                    publishes,
+                    lane_id
+                  )
+              end
 
             {pipeline_frame, batch_size}
           end)
@@ -208,6 +227,7 @@ IO.puts(
     "outbound_limit_bytes=#{load_outbound_bytes} " <>
     "coalesce_max=#{coalesce_max} " <>
     "publish_pipeline=#{publish_pipeline} " <>
+    "pipeline_encoding=#{pipeline_encoding} " <>
     "activity_log_max_len=#{activity_log_max_len} " <>
     "activity_log_sample_every=#{activity_log_sample_every}"
 )
@@ -222,6 +242,10 @@ Enum.each(concurrent_results, fn result ->
       "deliveries_per_second=#{Float.round(result.deliveries_per_second, 2)} correctness=ok"
   )
 end)
+
+if skip_slow_phase do
+  System.halt(0)
+end
 
 _ = Application.stop(:ferricstore_server)
 _ = Application.stop(:ferricstore)

@@ -403,6 +403,12 @@ defmodule FerricstoreServer.Native.Connection do
       {:pubsub_message, _channel, _message} = event ->
         send_pubsub_events(state, event)
 
+      {:pubsub_messages, channel, messages, %OutboundBudget{} = lease} ->
+        send_pubsub_batch(state, channel, messages, lease)
+
+      {:pubsub_messages, channel, messages} ->
+        send_pubsub_batch(state, channel, messages, nil)
+
       {:pubsub_pmessage, _pattern, _channel, _message, %OutboundBudget{}} = event ->
         send_pubsub_events(state, event)
 
@@ -1660,6 +1666,41 @@ defmodule FerricstoreServer.Native.Connection do
         close_for_outbound_failure(state)
     end
   end
+
+  defp send_pubsub_batch(state, channel, messages, lease) do
+    descriptors = Enum.map(messages, &{:message, channel, &1})
+
+    case safe_encode_guarded_pubsub_events(state, descriptors) do
+      {:ok, frames} ->
+        case ensure_pubsub_batch_iodata(lease, frames) do
+          {:ok, lease} ->
+            result =
+              try do
+                native_send(state, frames, :event)
+              after
+                OutboundBudget.release(lease)
+              end
+
+            case result do
+              :ok -> loop(state)
+              {:error, _reason} -> close_for_outbound_failure(state)
+            end
+
+          {:error, _reason} ->
+            OutboundBudget.release(lease)
+            close_for_outbound_failure(state)
+        end
+
+      {:error, _reason} ->
+        OutboundBudget.release(lease)
+        close_for_outbound_failure(state)
+    end
+  end
+
+  defp ensure_pubsub_batch_iodata(nil, _iodata), do: {:ok, nil}
+
+  defp ensure_pubsub_batch_iodata(%OutboundBudget{} = lease, iodata),
+    do: OutboundBudget.ensure_iodata(lease, iodata)
 
   defp prepare_pubsub_events(state, events) do
     descriptors = Enum.map(events, &pubsub_event_descriptor/1)

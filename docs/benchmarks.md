@@ -4,6 +4,71 @@ This page keeps only the latest public benchmark summaries. Raw benchmark logs a
 
 Use these numbers as reproducible reference points, not universal hardware claims. Throughput and latency depend on VM type, local NVMe availability, shard count, client concurrency, pipeline depth, payload size, and resource guards.
 
+## FerricStore PubSub: compact native pipeline
+
+These loopback TCP measurements use pipeline depth 8 and 256-byte messages.
+Every subscriber acknowledgement, publish count, pushed delivery, and
+slow-consumer isolation check is validated by the runner.
+
+### Protocol-only comparison before batch-aware fanout
+
+| Fanout | Publishers | Generic pipeline publishes/s | Compact mode 35 publishes/s | Change |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 27,634 | 29,204 | +5.7% |
+| 1 | 4 | 10,106 | 11,590 | +14.7% |
+| 8 | 1 | 3,070 | 3,302 | +7.6% |
+| 8 | 4 | 2,872 | 3,096 | +7.8% |
+
+### Batch-aware exact-channel fanout
+
+The retained optimization resolves the exact subscriber list once per compact
+pipeline, reserves outbound capacity once per subscriber batch, enqueues one
+BEAM mailbox message per subscriber, and writes the batch's existing individual
+event frames in one socket send. It does not change the wire format. A depth-8,
+fanout-8 request therefore reduces 64 guarded reservations and mailbox messages
+to 8. Pattern subscriptions conservatively retain the original per-publish path
+so exact and pattern event ordering stays unchanged.
+
+The following are three-sample medians from a matched compact-mode-35 comparison;
+the only benchmark toggle was ordinary per-item publish versus batch-aware
+publish:
+
+| Fanout | Publishers | Per-item publishes/s | Batch-aware publishes/s | Change | Batch-aware deliveries/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 37,270 | 48,556 | +30.3% | 48,556 |
+| 1 | 4 | 13,392 | 50,020 | +273.5% | 50,020 |
+| 8 | 1 | 3,348 | 16,483 | +392.3% | 131,865 |
+| 8 | 4 | 3,273 | 13,605 | +315.7% | 108,840 |
+
+Typed native pipelines containing only `PUBLISH` now reuse the same bounded
+batch fanout path. This preserves the typed wire format for older SDKs while
+removing the former per-item delivery overhead:
+
+| Fanout | Publishers | Typed per-item publishes/s | Typed batch-aware publishes/s | Change |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 1 | 3,262 | 14,976 | +359.0% |
+| 8 | 4 | 3,259 | 12,544 | +284.9% |
+
+### Sustained batch-size gate
+
+Larger explicit `publish_many` requests reduce the remaining per-subscriber
+socket-write cost. With 65,536 publishes per publisher, 256-byte payloads, and
+fanout 8, the production-default activity log, and compact mode 35, the matched
+five-sample medians were:
+
+| Pipeline depth | Publishers | Publishes/s | Delivered messages/s | Change vs depth 512 |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 1 | 132,794 | 1.06M | baseline |
+| 1,024 | 1 | 175,712 | 1.41M | +32.3% |
+| 512 | 4 | 135,774 | 1.09M | baseline |
+| 1,024 | 4 | 184,921 | 1.48M | +36.2% |
+
+The isolated rerun resolved earlier depth-1,024 variance, so SDK
+`publish_many` helpers cap requests at the protocol limit of 1,024 and split
+larger inputs sequentially. Callers can choose a smaller explicit batch for a
+tighter latency or partial-failure boundary; payload size and subscriber fanout
+still need workload-specific measurement.
+
 ## FerricStore Streams: local optimization baseline
 
 These development numbers were recorded on an Apple M4 Max with a one-node

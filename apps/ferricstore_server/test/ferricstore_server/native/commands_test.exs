@@ -18,6 +18,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
   alias FerricstoreServer.Native.Session
   alias FerricstoreServer.Native.StreamRangeResponse
   alias Ferricstore.AuditLog
+  alias Ferricstore.PubSub
   alias Ferricstore.Stats
   alias Ferricstore.Test.IsolatedInstance
 
@@ -656,7 +657,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert payload.pipeline == %{
              compact_request: "pipeline_v1",
              values_only_mode_bit: 0x80,
-             modes: %{stream_xadd_auto: 34}
+             modes: %{pubsub_publish: 35, stream_xadd_auto: 34}
            }
 
     assert "FLOW.CREATE" in schema_names(payload)
@@ -1292,6 +1293,95 @@ defmodule FerricstoreServer.Native.CommandsTest do
                %{"command" => "XLEN", "args" => [key]},
                native_state
              )
+  end
+
+  test "compact PubSub pipeline publishes in order and returns compact subscriber counts" do
+    channel = "native:pubsub:compact:#{System.unique_integer([:positive, :monotonic])}"
+    test_pid = self()
+
+    :ok =
+      PubSub.set_delivery_guard(self(), fn bytes ->
+        send(test_pid, {:compact_pubsub_batch_reserved, bytes})
+        {:ok, :compact_pubsub_batch_lease}
+      end)
+
+    :ok = PubSub.subscribe(channel, self())
+    on_exit(fn -> PubSub.cleanup(self()) end)
+    response_tag = Codec.compact_tags().integer_list
+
+    assert {:ok, <<^response_tag, 2::unsigned-32, 1::signed-64, 1::signed-64>>, _state} =
+             Commands.execute(
+               @op_pipeline,
+               %{
+                 "compact_count" => 2,
+                 "compact_values" => true,
+                 "compact_pipeline" => {35, [{channel, "one"}, {channel, "two"}]}
+               },
+               state()
+             )
+
+    assert_receive {:compact_pubsub_batch_reserved, reserved_bytes}
+    assert reserved_bytes > byte_size(channel) * 2 + byte_size("one") + byte_size("two")
+    refute_receive {:compact_pubsub_batch_reserved, _bytes}
+
+    assert_receive {:pubsub_messages, ^channel, ["one", "two"], :compact_pubsub_batch_lease}
+  end
+
+  test "typed PubSub pipeline reuses one guarded batch delivery" do
+    channel = "native:pubsub:typed:#{System.unique_integer([:positive, :monotonic])}"
+    test_pid = self()
+
+    :ok =
+      PubSub.set_delivery_guard(self(), fn bytes ->
+        send(test_pid, {:typed_pubsub_batch_reserved, bytes})
+        {:ok, :typed_pubsub_batch_lease}
+      end)
+
+    :ok = PubSub.subscribe(channel, self())
+    on_exit(fn -> PubSub.cleanup(self()) end)
+
+    commands =
+      Enum.map(["one", "two"], fn message ->
+        %{
+          "opcode" => @op_command_exec,
+          "request_id" => if(message == "one", do: 1, else: 2),
+          "lane_id" => 3,
+          "body" => %{"command" => "PUBLISH", "args" => [channel, message]}
+        }
+      end)
+
+    assert {:ok, [first, second], _state} =
+             Commands.execute(@op_pipeline, %{"commands" => commands}, state())
+
+    assert %{"request_id" => 1, "lane_id" => 3, "status" => "ok", "value" => 1} = first
+    assert %{"request_id" => 2, "lane_id" => 3, "status" => "ok", "value" => 1} = second
+
+    assert_receive {:typed_pubsub_batch_reserved, reserved_bytes}
+    assert reserved_bytes > byte_size(channel) * 2 + byte_size("one") + byte_size("two")
+    refute_receive {:typed_pubsub_batch_reserved, _bytes}
+
+    assert_receive {:pubsub_messages, ^channel, ["one", "two"], :typed_pubsub_batch_lease}
+  end
+
+  test "compact PubSub pipeline fallback preserves command ACL checks" do
+    username = "compact-publish-denied"
+    put_query_user(username, ["+PIPELINE"])
+    channel = "native:pubsub:compact:denied"
+    :ok = PubSub.subscribe(channel, self())
+    on_exit(fn -> PubSub.cleanup(self()) end)
+
+    assert {:ok, [["noperm", message]], _state} =
+             Commands.execute(
+               @op_pipeline,
+               %{
+                 "return" => "pairs",
+                 "compact_pipeline" => {35, [{channel, "blocked"}]}
+               },
+               state_as(username)
+             )
+
+    assert message =~ "publish"
+    refute_receive {:pubsub_message, ^channel, "blocked"}
   end
 
   test "compact Stream producer keeps reserved-key and same-shard validation" do

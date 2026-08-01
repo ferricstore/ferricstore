@@ -73,11 +73,34 @@ with `BENCH_PUBSUB_CONCURRENCIES`, `BENCH_PUBSUB_PUBLISHES_PER_PUBLISHER`,
 `BENCH_PUBSUB_LOAD_FANOUT`, `BENCH_PUBSUB_COALESCE_MAX`, and
 `BENCH_PUBSUB_PUBLISH_PIPELINE`. A publish-pipeline value greater than one sends
 that many `PUBLISH` commands through one native `PIPELINE` round trip while
-still validating every result and pushed event. The runner restarts the server
-before its slow-consumer phase so the throughput matrix uses the production
-outbound budget while eviction uses an intentionally tight bound. The run fails
-if any response/event count is wrong, the slow subscriber is not evicted, or the
-fast subscriber stops receiving.
+still validating every result and pushed event. Set
+`BENCH_PUBSUB_PIPELINE_ENCODING=compact` to benchmark compact mode 35; the
+default `generic` value retains the typed command-list baseline. The runner
+restarts the server before its slow-consumer phase so the throughput matrix uses
+the production outbound budget while eviction uses an intentionally tight
+bound. The run fails if any response/event count is wrong, the slow subscriber
+is not evicted, or the fast subscriber stops receiving.
+Set `BENCH_PUBSUB_SKIP_SLOW_PHASE=1` only when repeatedly sampling the
+throughput matrix; the default still runs the full isolation gate.
+
+Compact mode 35 also exercises batch-aware exact-channel fanout. One pipeline
+resolves subscribers once, reserves and enqueues once per subscriber, and sends
+the unchanged individual event frames together. When pattern subscriptions are
+present, it retains per-item delivery to preserve exact/pattern event ordering.
+Typed pipelines containing only `PUBLISH` commands reuse this fanout path on
+eligible full-access connections, so the optimization does not depend on
+compact request support.
+The matched retained gate uses 4,096 publishes per publisher, pipeline depth 8,
+256-byte payloads, fanout 1 and 8, publisher counts 1 and 4, and three samples
+per matrix cell; its latest medians are recorded in `docs/benchmarks.md`.
+
+For sustained throughput, the latest isolated five-sample gate found depth
+1,024 to be the measured optimum on the benchmark host. With 65,536 publishes
+per publisher and fanout 8, it sustained roughly 1.41M delivered messages/s for
+one publisher and 1.48M for four, improving 32-36% over depth 512. SDKs therefore
+cap `publish_many` requests at 1,024 and sequentially split larger inputs.
+Smaller explicit batches remain useful when latency or partial-failure scope is
+more important than peak throughput.
 
 Native-protocol SET/GET and DBOS-style workflow benchmarks live in the Python
 SDK repository. The in-tree native Stream runner is intentionally self-contained

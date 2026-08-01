@@ -173,6 +173,104 @@ defmodule Ferricstore.Commands.PubSubTest do
       assert_receive {:pubsub_message, "guarded", "payload", :delivery_lease}
     end
 
+    test "same-channel publish batches reserve and enqueue once per guarded subscriber" do
+      test_pid = self()
+
+      assert :ok =
+               PubSub.set_delivery_guard(self(), fn bytes ->
+                 send(test_pid, {:batch_delivery_reserved, bytes})
+                 {:ok, :batch_delivery_lease}
+               end)
+
+      PubSub.subscribe("guarded-batch", self())
+
+      assert PubSub.publish_many([
+               {"guarded-batch", "one"},
+               {"guarded-batch", "two"}
+             ]) == [1, 1]
+
+      assert_receive {:batch_delivery_reserved, bytes}
+
+      assert bytes >=
+               byte_size("guarded-batch") * 2 + byte_size("one") + byte_size("two")
+
+      refute_receive {:batch_delivery_reserved, _bytes}
+
+      assert_receive {:pubsub_messages, "guarded-batch", ["one", "two"], :batch_delivery_lease}
+    end
+
+    test "an aggregate reservation rejection falls back to per-message admission" do
+      test_pid = self()
+      individual_limit = byte_size("fallback-batch") + byte_size("one") + 128
+
+      assert :ok =
+               PubSub.set_delivery_guard(self(), fn bytes ->
+                 send(test_pid, {:fallback_delivery_reserved, bytes})
+
+                 if bytes <= individual_limit,
+                   do: {:ok, {:individual_delivery_lease, bytes}},
+                   else: {:error, :limit}
+               end)
+
+      PubSub.subscribe("fallback-batch", self())
+
+      assert PubSub.publish_many([
+               {"fallback-batch", "one"},
+               {"fallback-batch", "two"}
+             ]) == [1, 1]
+
+      assert_receive {:fallback_delivery_reserved, aggregate_bytes}
+      assert aggregate_bytes > individual_limit
+      assert_receive {:fallback_delivery_reserved, ^individual_limit}
+      assert_receive {:fallback_delivery_reserved, ^individual_limit}
+
+      assert_receive {:pubsub_message, "fallback-batch", "one",
+                      {:individual_delivery_lease, ^individual_limit}}
+
+      assert_receive {:pubsub_message, "fallback-batch", "two",
+                      {:individual_delivery_lease, ^individual_limit}}
+    end
+
+    test "batch publish preserves exact and pattern event order" do
+      PubSub.subscribe("ordered-batch", self())
+      PubSub.psubscribe("ordered-*", self())
+
+      assert PubSub.publish_many([
+               {"ordered-batch", "one"},
+               {"ordered-batch", "two"}
+             ]) == [2, 2]
+
+      events =
+        for _index <- 1..4 do
+          receive do
+            event -> event
+          after
+            100 -> flunk("expected exact and pattern PubSub events")
+          end
+        end
+
+      assert events == [
+               {:pubsub_message, "ordered-batch", "one"},
+               {:pubsub_pmessage, "ordered-*", "ordered-batch", "one"},
+               {:pubsub_message, "ordered-batch", "two"},
+               {:pubsub_pmessage, "ordered-*", "ordered-batch", "two"}
+             ]
+    end
+
+    test "mixed-channel batches preserve publish and delivery order" do
+      PubSub.subscribe_many(["mixed-a", "mixed-b"], self())
+
+      assert PubSub.publish_many([
+               {"mixed-a", "one"},
+               {"mixed-b", "two"},
+               {"mixed-a", "three"}
+             ]) == [1, 1, 1]
+
+      assert_receive {:pubsub_message, "mixed-a", "one"}
+      assert_receive {:pubsub_message, "mixed-b", "two"}
+      assert_receive {:pubsub_message, "mixed-a", "three"}
+    end
+
     test "exact delivery cache follows guard replacement and clearing" do
       PubSub.subscribe("guard-cache", self())
 

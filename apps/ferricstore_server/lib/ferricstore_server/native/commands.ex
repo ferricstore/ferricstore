@@ -3223,6 +3223,7 @@ defmodule FerricstoreServer.Native.Commands do
         compact_request: "pipeline_v1",
         values_only_mode_bit: 0x80,
         modes: %{
+          pubsub_publish: 35,
           stream_xadd_auto: 34
         }
       },
@@ -4714,7 +4715,8 @@ defmodule FerricstoreServer.Native.Commands do
               31,
               32,
               33,
-              34
+              34,
+              35
             ] and is_list(items) do
     max = Application.get_env(:ferricstore, :native_max_pipeline_commands, 1024)
     count = Map.get(payload, "compact_count")
@@ -4742,7 +4744,7 @@ defmodule FerricstoreServer.Native.Commands do
   defp validate_compact_pipeline(_mode, _items, _payload, _state),
     do: {:error, "ERR native compact PIPELINE payload is invalid"}
 
-  defp valid_compact_pipeline_items?(1, items),
+  defp valid_compact_pipeline_items?(mode, items) when mode in [1, 35],
     do:
       Enum.all?(items, fn
         {key, value} -> is_binary(key) and is_binary(value)
@@ -5003,6 +5005,9 @@ defmodule FerricstoreServer.Native.Commands do
        when atomicity in ["none", "per_shard"],
        do: :ok
 
+  defp validate_compact_pipeline_atomicity(35, _items, "same_shard", _state),
+    do: {:error, "ERR native compact PubSub pipeline does not support same_shard atomicity"}
+
   defp validate_compact_pipeline_atomicity(34, items, "same_shard", state) do
     validate_compact_stream_same_shard(items, state.instance_ctx, nil, nil)
   end
@@ -5129,6 +5134,22 @@ defmodule FerricstoreServer.Native.Commands do
       |> Enum.with_index(1)
       |> Enum.map(fn {key, request_id} ->
         %{opcode: @op_get, lane_id: 1, request_id: request_id, body: %{"key" => key}}
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(35, items) do
+    commands =
+      items
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{channel, message}, request_id} ->
+        %{
+          opcode: @op_command_exec,
+          lane_id: 1,
+          request_id: request_id,
+          body: %{"command" => "PUBLISH", "args" => [channel, message]}
+        }
       end)
 
     {:ok, commands}
@@ -5637,6 +5658,28 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp execute_pipeline_fast_path(
          commands,
+         %{acl_cache: :full_access, require_auth: false} = state
+       ) do
+    case pipeline_pubsub_publishes(commands, [], []) do
+      {:ok, requests, publishes} ->
+        Stats.incr_commands_by(state.stats_counter, length(commands))
+
+        results =
+          publishes
+          |> Ferricstore.PubSub.publish_many()
+          |> pipeline_pubsub_results(requests)
+
+        {:ok, results}
+
+      :fallback ->
+        execute_non_pubsub_pipeline_fast_path(commands, state)
+    end
+  end
+
+  defp execute_pipeline_fast_path(_commands, _state), do: :fallback
+
+  defp execute_non_pubsub_pipeline_fast_path(
+         commands,
          %{
            acl_cache: :full_access,
            require_auth: false,
@@ -5756,7 +5799,46 @@ defmodule FerricstoreServer.Native.Commands do
     end
   end
 
-  defp execute_pipeline_fast_path(_commands, _state), do: :fallback
+  defp execute_non_pubsub_pipeline_fast_path(_commands, _state), do: :fallback
+
+  defp pipeline_pubsub_publishes([], [], []), do: :fallback
+
+  defp pipeline_pubsub_publishes([], requests, publishes),
+    do: {:ok, Enum.reverse(requests), Enum.reverse(publishes)}
+
+  defp pipeline_pubsub_publishes(
+         [
+           %{
+             opcode: @op_command_exec,
+             body: %{
+               __prepared_command__: %PreparedCommand{
+                 command: "PUBLISH",
+                 args: [channel, message]
+               }
+             }
+           } = command
+           | rest
+         ],
+         requests,
+         publishes
+       )
+       when is_binary(channel) and is_binary(message) do
+    pipeline_pubsub_publishes(
+      rest,
+      [pipeline_request(command) | requests],
+      [{channel, message} | publishes]
+    )
+  end
+
+  defp pipeline_pubsub_publishes(_commands, _requests, _publishes), do: :fallback
+
+  defp pipeline_pubsub_results(counts, requests) do
+    requests
+    |> Enum.zip(counts)
+    |> Enum.map(fn {{opcode, request_id, lane_id}, count} ->
+      pipeline_result(opcode, request_id, lane_id, :ok, count)
+    end)
+  end
 
   defp pipeline_stream_appends([], requests, ops, activity),
     do: {:ok, Enum.reverse(requests), Enum.reverse(ops), Enum.reverse(activity)}
@@ -5876,6 +5958,20 @@ defmodule FerricstoreServer.Native.Commands do
     results = Router.batch_quorum_put(ctx, kv_pairs)
 
     {:ok, format_compact_set_results(results, return_format)}
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         35,
+         items,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false} = state
+       )
+       when is_list(items) do
+    Stats.incr_commands_by(state.stats_counter, length(items))
+
+    results = Ferricstore.PubSub.publish_many(items)
+
+    {:ok, format_compact_pipeline_results(results, @op_command_exec, return_format)}
   end
 
   defp execute_compact_pipeline_fast_path(

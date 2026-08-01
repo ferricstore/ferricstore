@@ -519,6 +519,32 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
   end
 
   @tag :native_outbound_byte_budget
+  test "pubsub batches use one guarded reservation and still emit one frame per message" do
+    previous_limit =
+      Application.get_env(:ferricstore, :native_max_outbound_bytes_per_connection)
+
+    Application.put_env(:ferricstore, :native_max_outbound_bytes_per_connection, 1_024 * 1_024)
+
+    on_exit(fn ->
+      restore_env(:native_max_outbound_bytes_per_connection, previous_limit)
+    end)
+
+    assert eventually(fn -> ResourceBudget.usage(ResourceBudget).outbound_bytes == 0 end)
+
+    channel = "native:outbound:pubsub-batch:#{System.unique_integer([:positive, :monotonic])}"
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    assert :ok = :gen_tcp.send(socket, command_exec_frame(242, "SUBSCRIBE", [channel]))
+    assert [{242, 0}] = receive_response_statuses(socket, 1)
+
+    assert Ferricstore.PubSub.publish_many([{channel, "one"}, {channel, "two"}]) == [1, 1]
+    assert [_first, _second] = receive_native_frames(socket, 2)
+
+    assert eventually(fn -> ResourceBudget.usage(ResourceBudget).outbound_bytes == 0 end)
+  end
+
+  @tag :native_outbound_byte_budget
   test "pubsub closes a slow subscriber before queueing an over-limit event" do
     previous_limit =
       Application.get_env(:ferricstore, :native_max_outbound_bytes_per_connection)
@@ -539,6 +565,31 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
     assert [{240, 0}] = receive_response_statuses(socket, 1)
 
     assert Ferricstore.PubSub.publish(channel, :binary.copy("p", 256)) == 0
+    assert_socket_closed(socket)
+  end
+
+  @tag :native_outbound_byte_budget
+  test "pubsub batches cannot bypass the slow-subscriber outbound limit" do
+    previous_limit =
+      Application.get_env(:ferricstore, :native_max_outbound_bytes_per_connection)
+
+    Application.put_env(:ferricstore, :native_max_outbound_bytes_per_connection, 200)
+
+    on_exit(fn ->
+      restore_env(:native_max_outbound_bytes_per_connection, previous_limit)
+    end)
+
+    channel =
+      "native:outbound:pubsub-batch-overflow:#{System.unique_integer([:positive, :monotonic])}"
+
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    assert :ok = :gen_tcp.send(socket, command_exec_frame(243, "SUBSCRIBE", [channel]))
+    assert [{243, 0}] = receive_response_statuses(socket, 1)
+
+    payload = :binary.copy("p", 256)
+    assert Ferricstore.PubSub.publish_many([{channel, payload}, {channel, payload}]) == [0, 0]
     assert_socket_closed(socket)
   end
 
@@ -1058,4 +1109,38 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
   end
 
   defp decode_response_statuses(buffer, responses), do: {responses, buffer}
+
+  defp receive_native_frames(socket, expected_count),
+    do: receive_native_frames(socket, expected_count, "", [])
+
+  defp receive_native_frames(_socket, expected_count, _buffer, frames)
+       when length(frames) >= expected_count,
+       do: Enum.reverse(frames)
+
+  defp receive_native_frames(socket, expected_count, buffer, frames) do
+    {decoded, rest} = decode_native_frames(buffer, [])
+    frames = decoded ++ frames
+
+    if length(frames) >= expected_count do
+      Enum.reverse(frames)
+    else
+      assert {:ok, data} = :gen_tcp.recv(socket, 0, @receive_timeout)
+      receive_native_frames(socket, expected_count, rest <> data, frames)
+    end
+  end
+
+  defp decode_native_frames(
+         <<"FSNP", 0x81, _flags, _lane_id::unsigned-32, _opcode::unsigned-16,
+           _request_id::unsigned-64, body_len::unsigned-32, body_and_rest::binary>> = buffer,
+         frames
+       ) do
+    if byte_size(body_and_rest) >= body_len do
+      <<body::binary-size(body_len), rest::binary>> = body_and_rest
+      decode_native_frames(rest, [body | frames])
+    else
+      {frames, buffer}
+    end
+  end
+
+  defp decode_native_frames(buffer, frames), do: {frames, buffer}
 end

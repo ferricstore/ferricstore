@@ -64,6 +64,8 @@ defmodule Ferricstore.PubSub do
 
     * `{:pubsub_message, channel, message}` — for exact channel subscriptions
     * `{:pubsub_pmessage, pattern, channel, message}` — for pattern subscriptions
+    * `{:pubsub_messages, channel, messages, lease}` — an internal guarded exact
+      batch consumed by protocol connection processes
 
   The protocol connection process is responsible for encoding these into event frames.
   """
@@ -325,6 +327,29 @@ defmodule Ferricstore.PubSub do
     total = channel_count + pattern_count
     ActivityLog.record_publish(channel, byte_size(message), total)
     total
+  end
+
+  @doc """
+  Publishes an ordered batch and returns one subscriber count per item.
+
+  Homogeneous exact-channel batches reserve guarded outbound capacity and
+  enqueue once per subscriber. Mixed-channel batches retain the ordinary
+  per-publish path.
+  """
+  @spec publish_many([{channel(), binary()}]) :: [non_neg_integer()]
+  def publish_many([]), do: []
+
+  def publish_many([{channel, message} | rest] = publishes)
+      when is_binary(channel) and is_binary(message) and is_list(rest) do
+    case same_channel_messages(rest, channel, [message]) do
+      {:ok, messages} ->
+        publish_same_channel_many(channel, messages)
+
+      :mixed ->
+        Enum.map(publishes, fn {item_channel, item_message} ->
+          publish(item_channel, item_message)
+        end)
+    end
   end
 
   @doc """
@@ -1314,6 +1339,157 @@ defmodule Ferricstore.PubSub do
   end
 
   defp publish_exact_deliveries([], _channel, _message, _bytes, count), do: count
+
+  defp same_channel_messages([], _channel, acc), do: {:ok, Enum.reverse(acc)}
+
+  defp same_channel_messages([{channel, message} | rest], channel, acc)
+       when is_binary(message),
+       do: same_channel_messages(rest, channel, [message | acc])
+
+  defp same_channel_messages(_mixed_or_invalid, _channel, _acc), do: :mixed
+
+  defp publish_same_channel_many(channel, messages) do
+    case :ets.info(@pattern_cache_table, :size) do
+      0 ->
+        counts = publish_exact_same_channel_many(channel, messages)
+        record_publish_batch(channel, messages, counts)
+        counts
+
+      _pattern_count ->
+        # Preserve the established exact/pattern interleaving when any pattern
+        # subscription could also observe this batch.
+        Enum.map(messages, &publish(channel, &1))
+    end
+  end
+
+  defp publish_exact_same_channel_many(channel, messages) do
+    case :ets.lookup(@channel_cache_table, channel) do
+      [{^channel, deliveries, _subscriber_count}] ->
+        batch_bytes = exact_batch_delivery_bytes(channel, messages)
+        publish_exact_batch_deliveries(deliveries, channel, messages, batch_bytes)
+
+      [] ->
+        List.duplicate(0, length(messages))
+    end
+  end
+
+  defp exact_batch_delivery_bytes(channel, messages) do
+    channel_bytes = byte_size(channel) + @delivery_overhead_bytes
+    Enum.reduce(messages, 0, fn message, bytes -> bytes + channel_bytes + byte_size(message) end)
+  end
+
+  defp publish_exact_batch_deliveries(deliveries, channel, messages, batch_bytes) do
+    {complete_deliveries, partial_counts} =
+      publish_exact_batch_deliveries(
+        deliveries,
+        channel,
+        messages,
+        batch_bytes,
+        0,
+        List.duplicate(0, length(messages))
+      )
+
+    Enum.map(partial_counts, &(&1 + complete_deliveries))
+  end
+
+  defp publish_exact_batch_deliveries(
+         [pid | rest],
+         channel,
+         messages,
+         batch_bytes,
+         complete_deliveries,
+         partial_counts
+       )
+       when is_pid(pid) do
+    Enum.each(messages, &send(pid, {:pubsub_message, channel, &1}))
+
+    publish_exact_batch_deliveries(
+      rest,
+      channel,
+      messages,
+      batch_bytes,
+      complete_deliveries + 1,
+      partial_counts
+    )
+  end
+
+  defp publish_exact_batch_deliveries(
+         [{pid, guard} = delivery | rest],
+         channel,
+         messages,
+         batch_bytes,
+         complete_deliveries,
+         partial_counts
+       ) do
+    case reserve_guarded_delivery(guard, batch_bytes) do
+      {:ok, nil} ->
+        send(pid, {:pubsub_messages, channel, messages})
+
+        publish_exact_batch_deliveries(
+          rest,
+          channel,
+          messages,
+          batch_bytes,
+          complete_deliveries + 1,
+          partial_counts
+        )
+
+      {:ok, lease} ->
+        send(pid, {:pubsub_messages, channel, messages, lease})
+
+        publish_exact_batch_deliveries(
+          rest,
+          channel,
+          messages,
+          batch_bytes,
+          complete_deliveries + 1,
+          partial_counts
+        )
+
+      :rejected ->
+        delivery_counts =
+          Enum.map(messages, fn message ->
+            case deliver_exact(delivery, channel, message, exact_delivery_bytes(channel, message)) do
+              :sent -> 1
+              :rejected -> 0
+            end
+          end)
+
+        publish_exact_batch_deliveries(
+          rest,
+          channel,
+          messages,
+          batch_bytes,
+          complete_deliveries,
+          add_publish_counts(partial_counts, delivery_counts, [])
+        )
+    end
+  end
+
+  defp publish_exact_batch_deliveries(
+         [],
+         _channel,
+         _messages,
+         _batch_bytes,
+         complete_deliveries,
+         partial_counts
+       ),
+       do: {complete_deliveries, partial_counts}
+
+  defp exact_delivery_bytes(channel, message),
+    do: byte_size(channel) + byte_size(message) + @delivery_overhead_bytes
+
+  defp add_publish_counts([left | left_rest], [right | right_rest], acc),
+    do: add_publish_counts(left_rest, right_rest, [left + right | acc])
+
+  defp add_publish_counts([], [], acc), do: Enum.reverse(acc)
+
+  defp record_publish_batch(channel, [message | messages], [count | counts]) do
+    ActivityLog.record_publish(channel, byte_size(message), count)
+    record_publish_batch(channel, messages, counts)
+  end
+
+  defp record_publish_batch(_channel, [], []), do: :ok
 
   defp deliver_exact(pid, channel, message, _bytes) when is_pid(pid) do
     send(pid, {:pubsub_message, channel, message})

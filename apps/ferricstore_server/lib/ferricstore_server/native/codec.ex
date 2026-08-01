@@ -1636,10 +1636,11 @@ defmodule FerricstoreServer.Native.Codec do
 
   defp take_compact_pipeline_items(_mode, 0, rest, acc), do: {:ok, Enum.reverse(acc), rest}
 
-  defp take_compact_pipeline_items(1, count, rest, acc) when count > 0 do
+  defp take_compact_pipeline_items(mode, count, rest, acc)
+       when mode in [1, 35] and count > 0 do
     with {:ok, key, rest} <- take_compact_binary(rest),
          {:ok, value, rest} <- take_compact_binary(rest) do
-      take_compact_pipeline_items(1, count - 1, rest, [{key, value} | acc])
+      take_compact_pipeline_items(mode, count - 1, rest, [{key, value} | acc])
     end
   end
 

@@ -738,6 +738,31 @@ For peak performance, clients should still split multi-shard independent work
 into shard-local lanes. Server-side `PIPELINE` exists for protocol completeness
 and ease-of-use, not as the highest-throughput coordinator path.
 
+### Compact PubSub publish pipeline
+
+`OPTIONS.capabilities.pipeline.modes.pubsub_publish` advertises compact mode
+`35`. It batches independent `PUBLISH channel message` commands while preserving
+input order and returning the subscriber count for every publish.
+
+```text
+0x94 | mode:u8 | count:u32 | item[count]
+mode = 35, or 0x80 | 35 for a values-only response
+
+item = channel:binary32 | message:binary32
+```
+
+The values-only response is a compact integer list and is the preferred SDK
+shape. PubSub channels are not datastore keys, and `same_shard` atomicity is not
+supported; clients must use `none` (the compact wire default) or `per_shard`.
+The server applies the same command ACL and resource-limit behavior as ordinary
+`PUBLISH`. A full-access connection using the default resource-limit
+implementation can take the direct bounded publish path; other connections
+fall back to normal per-command dispatch without changing results or policy.
+An ordinary typed `PIPELINE` containing only valid `PUBLISH` commands can reuse
+the same batch-aware fanout path, while keeping its typed request and response
+format. This gives older clients the server-side fanout improvement before they
+adopt compact mode 35.
+
 ### Compact Stream producer pipeline
 
 `OPTIONS.capabilities.pipeline.modes.stream_xadd_auto` advertises compact mode

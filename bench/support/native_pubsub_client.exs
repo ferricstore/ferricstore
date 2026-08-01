@@ -6,6 +6,8 @@ defmodule FerricstoreBench.NativePubSubClient do
   @op_pipeline 0x000E
   @op_command_exec 0x0100
   @op_event 0x0010
+  @custom_payload Codec.flags().custom_payload
+  @compact_integer_list Codec.compact_tags().integer_list
   @compressed_flag 0x08
   @header_bytes 24
 
@@ -47,6 +49,20 @@ defmodule FerricstoreBench.NativePubSubClient do
       })
 
     Codec.encode_frame(@op_pipeline, lane_id, request_id, body)
+  end
+
+  def compact_publish_pipeline_frame(request_id, publishes, lane_id \\ 0)
+      when is_list(publishes) do
+    items =
+      Enum.map(publishes, fn {channel, message} ->
+        [compact_binary(channel), compact_binary(message)]
+      end)
+
+    body =
+      [<<0x94, 0xA3, length(publishes)::unsigned-32>>, items]
+      |> IO.iodata_to_binary()
+
+    Codec.encode_frame(@op_pipeline, lane_id, request_id, body, @custom_payload)
   end
 
   def subscribe(socket, channel, request_id) do
@@ -121,6 +137,7 @@ defmodule FerricstoreBench.NativePubSubClient do
       length(results) == publish_count and
         Enum.all?(results, fn
           ["ok", ^expected_subscribers] -> true
+          ^expected_subscribers -> true
           _unexpected -> false
         end)
 
@@ -254,6 +271,11 @@ defmodule FerricstoreBench.NativePubSubClient do
             "#{expected_subscribers} subscribers: #{inspect(frames)}"
   end
 
+  defp compact_binary(value) do
+    value = IO.iodata_to_binary(value)
+    [<<byte_size(value)::unsigned-32>>, value]
+  end
+
   defp decode_server_frames(buffer, frames) when byte_size(buffer) < @header_bytes,
     do: {Enum.reverse(frames), buffer}
 
@@ -270,7 +292,7 @@ defmodule FerricstoreBench.NativePubSubClient do
 
       case body do
         <<status::unsigned-16, encoded_value::binary>> ->
-          value = decode_value!(encoded_value)
+          value = decode_value!(encoded_value, flags)
 
           frame = %{
             flags: flags,
@@ -297,7 +319,24 @@ defmodule FerricstoreBench.NativePubSubClient do
     if Bitwise.band(flags, @compressed_flag) == 0, do: body, else: :zlib.uncompress(body)
   end
 
-  defp decode_value!(encoded) do
+  defp decode_value!(encoded, flags) do
+    if Bitwise.band(flags, @custom_payload) != 0 do
+      decode_compact_value!(encoded)
+    else
+      decode_generic_value!(encoded)
+    end
+  end
+
+  defp decode_compact_value!(<<@compact_integer_list, count::unsigned-32, integers::binary>>)
+       when byte_size(integers) == count * 8 do
+    for <<integer::signed-64 <- integers>>, do: integer
+  end
+
+  defp decode_compact_value!(_encoded) do
+    raise "native PubSub response compact value is invalid"
+  end
+
+  defp decode_generic_value!(encoded) do
     case Codec.decode_value(encoded) do
       {:ok, value, ""} -> value
       {:ok, _value, _rest} -> raise "native PubSub response value has trailing bytes"

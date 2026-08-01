@@ -42,6 +42,30 @@ defmodule FerricstoreServer.Native.PubSubBenchmarkClientTest do
     assert second["body"] == %{"command" => "PUBLISH", "args" => ["orders", "two"]}
   end
 
+  test "encodes compact PubSub pipelines and validates their integer counts" do
+    frame =
+      NativePubSubClient.compact_publish_pipeline_frame(
+        20,
+        [{"orders", "one"}, {"priority", "two"}],
+        3
+      )
+
+    custom_payload = Codec.flags().custom_payload
+
+    assert {:ok, [{3, 0x000E, 20, ^custom_payload, body}], "", :done} =
+             Codec.decode_frames(frame, 4_096)
+
+    assert {:ok,
+            %{
+              "compact_count" => 2,
+              "compact_values" => true,
+              "compact_pipeline" => {35, [{"orders", "one"}, {"priority", "two"}]}
+            }} = Codec.decode_body(0x000E, custom_payload, body)
+
+    response = %{request_id: 20, status: 0, value: [8, 8]}
+    assert :ok = NativePubSubClient.validate_publish_pipeline_frames([response], 20, 2, 8)
+  end
+
   test "decodes coalesced command responses and pushed PubSub events" do
     response = Codec.encode_response(0x0100, 0, 9, :ok, 1)
 
@@ -63,6 +87,16 @@ defmodule FerricstoreServer.Native.PubSubBenchmarkClientTest do
     assert decoded_event.status == 0
     assert decoded_event.value["event"] == "PUBSUB_MESSAGE"
     assert decoded_event.value["payload"]["channel"] == "orders"
+  end
+
+  test "decodes compact integer-list pipeline responses" do
+    payload = Codec.encode_compact_integer_list([8, 8, 8])
+    [response] = Codec.encode_compact_response_frames(0x000E, 3, 20, :ok, payload)
+
+    assert {[%{flags: flags, lane_id: 3, request_id: 20, status: 0, value: [8, 8, 8]}], ""} =
+             NativePubSubClient.decode_server_frames(response)
+
+    assert Bitwise.band(flags, Codec.flags().custom_payload) != 0
   end
 
   test "retains an incomplete pushed frame for the next socket read" do
