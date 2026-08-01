@@ -1737,12 +1737,8 @@ defmodule Ferricstore.PubSub do
 
   defp add_publish_counts([], [], acc), do: Enum.reverse(acc)
 
-  defp record_publish_batch(channel, [message | messages], [count | counts]) do
-    ActivityLog.record_publish(channel, byte_size(message), count)
-    record_publish_batch(channel, messages, counts)
-  end
-
-  defp record_publish_batch(_channel, [], []), do: :ok
+  defp record_publish_batch(channel, messages, counts),
+    do: ActivityLog.record_publish_batch(channel, messages, counts)
 
   defp deliver_exact(pid, channel, message, _bytes) when is_pid(pid) do
     send(pid, {:pubsub_message, channel, message})

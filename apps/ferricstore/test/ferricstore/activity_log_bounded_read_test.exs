@@ -103,6 +103,56 @@ defmodule Ferricstore.ActivityLogBoundedReadTest do
            ]
   end
 
+  test "batch PubSub activity preserves newest-first order, sizes, counts, and ids" do
+    assert :ok =
+             PubSubActivityLog.record_publish_batch(
+               "orders",
+               ["one", "four", "seventeen"],
+               [1, 4, 17]
+             )
+
+    assert Enum.map(PubSubActivityLog.get(3), fn entry ->
+             {entry.id, entry.target, entry.message_bytes, entry.subscribers}
+           end) == [
+             {2, "orders", 9, 17},
+             {1, "orders", 4, 4},
+             {0, "orders", 3, 1}
+           ]
+  end
+
+  test "batch PubSub activity advances sampling exactly once per logical publish" do
+    on_exit(fn -> PubSubActivityLog.configure_publish_sampling(1) end)
+
+    PubSubActivityLog.configure_publish_sampling(3)
+    PubSubActivityLog.reset()
+
+    messages = Enum.map(1..7, &:binary.copy("x", &1))
+    assert :ok = PubSubActivityLog.record_publish_batch("sampled", messages, List.duplicate(0, 7))
+
+    assert Enum.map(PubSubActivityLog.get(3), &{&1.id, &1.message_bytes}) == [
+             {2, 7},
+             {1, 4},
+             {0, 1}
+           ]
+  end
+
+  test "oversized PubSub activity batches retain only the newest bounded rows" do
+    messages = Enum.map(1..600, &:binary.copy("x", &1))
+
+    assert :ok =
+             PubSubActivityLog.record_publish_batch(
+               "bounded",
+               messages,
+               Enum.to_list(1..600)
+             )
+
+    assert :ets.info(:ferricstore_pubsub_activity_log, :size) == 512
+    assert %{id: 599, message_bytes: 600, subscribers: 600} = hd(PubSubActivityLog.get(1))
+
+    assert %{id: 100, message_bytes: 101, subscribers: 101} =
+             PubSubActivityLog.get(500) |> List.last()
+  end
+
   test "batch XADD activity retains only the configured newest rows in order" do
     entries =
       Enum.map(1..600, fn index ->

@@ -57,6 +57,42 @@ defmodule Ferricstore.PubSub.ActivityLog do
     end
   end
 
+  @doc false
+  @spec record_publish_batch(binary(), [binary()], [non_neg_integer()]) :: :ok
+  def record_publish_batch(_channel, [], []), do: :ok
+
+  def record_publish_batch(channel, messages, subscribers)
+      when is_binary(channel) and is_list(messages) and is_list(subscribers) do
+    with {:ok, publish_count} <- paired_length(messages, subscribers) do
+      case :persistent_term.get(@publish_config_key, nil) do
+        {max_len, 1, _counter} ->
+          record_publish_entries(channel, select_publish_entries(messages, subscribers), max_len)
+
+        {max_len, sample_every, counter}
+        when max_len > 0 and sample_every > 1 and is_reference(counter) ->
+          first_sample_index = :atomics.add_get(counter, 1, publish_count) - publish_count
+
+          record_publish_entries(
+            channel,
+            select_publish_entries(messages, subscribers, first_sample_index, sample_every),
+            max_len
+          )
+
+        {0, _sample_every, _counter} ->
+          :ok
+
+        _not_initialized ->
+          record_publish_batch_individually(channel, messages, subscribers)
+      end
+    else
+      :error -> :ok
+    end
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
   @spec record_subscription(binary(), :channel | :pattern, [binary()]) :: :ok
   def record_subscription(_command, _target_type, []), do: :ok
 
@@ -160,6 +196,97 @@ defmodule Ferricstore.PubSub.ActivityLog do
   catch
     :exit, _ -> :ok
   end
+
+  defp record_publish_entries(_channel, [], _max_len), do: :ok
+
+  defp record_publish_entries(channel, entries, max_len) do
+    if max_len > 0 and table_ready?() do
+      entry_count = length(entries)
+      retained = keep_newest(entries, max_len)
+      retained_count = length(retained)
+      first_id = reserve_ids(entry_count) + entry_count - retained_count
+      timestamp_us = System.os_time(:microsecond)
+      target = normalize_binary(channel)
+
+      rows =
+        retained
+        |> Enum.with_index(first_id)
+        |> Enum.map(fn {{message_bytes, subscribers}, id} ->
+          {id, {:publish, timestamp_us, target, message_bytes, subscribers}}
+        end)
+
+      :ets.insert(@table, rows)
+      evict_overflow(max_len)
+    end
+
+    :ok
+  end
+
+  defp select_publish_entries(messages, subscribers),
+    do: select_publish_entries(messages, subscribers, 0, 1)
+
+  defp select_publish_entries(messages, subscribers, first_sample_index, sample_every) do
+    select_publish_entries(
+      messages,
+      subscribers,
+      first_sample_index,
+      sample_every,
+      []
+    )
+  end
+
+  defp select_publish_entries(
+         [message | messages],
+         [subscriber_count | subscribers],
+         sample_index,
+         sample_every,
+         entries
+       ) do
+    entries =
+      if rem(sample_index, sample_every) == 0 do
+        [{byte_size(message), max(subscriber_count, 0)} | entries]
+      else
+        entries
+      end
+
+    select_publish_entries(
+      messages,
+      subscribers,
+      sample_index + 1,
+      sample_every,
+      entries
+    )
+  end
+
+  defp select_publish_entries([], [], _sample_index, _sample_every, entries),
+    do: Enum.reverse(entries)
+
+  defp paired_length(messages, subscribers), do: paired_length(messages, subscribers, 0)
+
+  defp paired_length([_message | messages], [_count | subscribers], count),
+    do: paired_length(messages, subscribers, count + 1)
+
+  defp paired_length([], [], count), do: {:ok, count}
+  defp paired_length(_messages, _subscribers, _count), do: :error
+
+  defp keep_newest(entries, max_len) do
+    discard = length(entries) - max_len
+    if discard > 0, do: Enum.drop(entries, discard), else: entries
+  end
+
+  defp reserve_ids(count) do
+    case :persistent_term.get(@counter_key, nil) do
+      counter when is_reference(counter) -> :atomics.add_get(counter, 1, count) - count
+      _ -> System.unique_integer([:positive, :monotonic])
+    end
+  end
+
+  defp record_publish_batch_individually(channel, [message | messages], [count | counts]) do
+    record_publish(channel, byte_size(message), count)
+    record_publish_batch_individually(channel, messages, counts)
+  end
+
+  defp record_publish_batch_individually(_channel, [], []), do: :ok
 
   defp max_len do
     case :persistent_term.get(@max_len_key, @default_max_len) do

@@ -41,6 +41,8 @@ System.at_exit(fn _status -> cleanup.() end)
 short_channel = "bench:pubsub:activity"
 oversized_channel = :binary.copy("x", 4_096)
 subscription_targets = Enum.map(1..8, &"bench:pubsub:subscription:#{&1}")
+batch_messages = List.duplicate(:binary.copy("x", 256), 1_024)
+batch_counts = List.duplicate(8, 1_024)
 
 :ok = ActivityLog.record_publish("preflight", 17, 3)
 
@@ -78,6 +80,14 @@ Benchee.run(
     end,
     "record publish oversized channel" => fn ->
       :ok = ActivityLog.record_publish(oversized_channel, 256, 0)
+    end,
+    "record publish loop x1024" => fn ->
+      Enum.zip_with(batch_messages, batch_counts, fn message, subscribers ->
+        ActivityLog.record_publish(short_channel, byte_size(message), subscribers)
+      end)
+    end,
+    "record publish batch x1024" => fn ->
+      :ok = ActivityLog.record_publish_batch(short_channel, batch_messages, batch_counts)
     end,
     "record subscription x8" => fn ->
       :ok = ActivityLog.record_subscription("SUBSCRIBE", :channel, subscription_targets)
