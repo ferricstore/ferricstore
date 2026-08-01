@@ -1361,20 +1361,31 @@ defmodule Ferricstore.PubSub do
         counts
 
       _high_pattern_count ->
-        # Preserve the established exact/pattern interleaving when any pattern
-        # subscription could also observe this batch.
-        Enum.map(messages, &publish(channel, &1))
+        counts = publish_indexed_same_channel_many(channel, messages)
+        record_publish_batch(channel, messages, counts)
+        counts
     end
   end
 
   defp publish_planned_same_channel_many(channel, messages) do
+    publish_planned_same_channel_many(channel, messages, matching_pattern_deliveries(channel))
+  end
+
+  defp publish_indexed_same_channel_many(channel, messages) do
+    publish_planned_same_channel_many(
+      channel,
+      messages,
+      matching_indexed_pattern_deliveries(channel)
+    )
+  end
+
+  defp publish_planned_same_channel_many(channel, messages, pattern_deliveries) do
     exact_deliveries =
       case :ets.lookup(@channel_cache_table, channel) do
         [{^channel, deliveries, _subscriber_count}] -> deliveries
         [] -> []
       end
 
-    pattern_deliveries = matching_pattern_deliveries(channel)
     channel_size = byte_size(channel)
 
     Enum.map(messages, fn message ->
@@ -1409,6 +1420,100 @@ defmodule Ferricstore.PubSub do
       @pattern_cache_table
     )
     |> Enum.reverse()
+  end
+
+  defp matching_indexed_pattern_deliveries(channel) do
+    channel_size = byte_size(channel)
+    index_limit = min(channel_size, @max_pattern_bytes - 1)
+
+    []
+    |> collect_cached_pattern(channel, {:exact, channel})
+    |> collect_cached_pattern("*", :all)
+    |> collect_prefix_index_matches(channel, 1, index_limit)
+    |> collect_suffix_index_matches(channel, 1, index_limit)
+    |> collect_glob_index_matches(channel)
+    |> Enum.reverse()
+  end
+
+  defp collect_cached_pattern(acc, pattern, expected_matcher) do
+    case :ets.lookup(@pattern_cache_table, pattern) do
+      [{^pattern, ^expected_matcher, deliveries, _subscriber_count}] ->
+        [{pattern, deliveries} | acc]
+
+      _missing_or_different_matcher ->
+        acc
+    end
+  end
+
+  defp collect_prefix_index_matches(acc, _channel, position, limit) when position > limit,
+    do: acc
+
+  defp collect_prefix_index_matches(acc, channel, position, limit) do
+    prefix = binary_part(channel, 0, position)
+
+    next_acc =
+      @pattern_prefix_index_table
+      |> :ets.lookup(prefix)
+      |> collect_pattern_index_candidates(channel, acc)
+
+    collect_prefix_index_matches(next_acc, channel, position + 1, limit)
+  end
+
+  defp collect_suffix_index_matches(acc, _channel, length, limit) when length > limit,
+    do: acc
+
+  defp collect_suffix_index_matches(acc, channel, length, limit) do
+    channel_size = byte_size(channel)
+    suffix = binary_part(channel, channel_size - length, length)
+
+    next_acc =
+      @pattern_suffix_index_table
+      |> :ets.lookup(suffix)
+      |> collect_pattern_index_candidates(channel, acc)
+
+    collect_suffix_index_matches(next_acc, channel, length + 1, limit)
+  end
+
+  defp collect_glob_index_matches(acc, channel) do
+    :ets.foldl(
+      fn {pattern}, current_acc ->
+        if Ferricstore.GlobMatcher.match?(channel, pattern),
+          do: collect_indexed_pattern(current_acc, pattern),
+          else: current_acc
+      end,
+      acc,
+      @pattern_glob_index_table
+    )
+  end
+
+  defp collect_pattern_index_candidates(
+         [{_anchor, pattern, :direct} | rest],
+         channel,
+         acc
+       ) do
+    collect_pattern_index_candidates(rest, channel, collect_indexed_pattern(acc, pattern))
+  end
+
+  defp collect_pattern_index_candidates(
+         [{_anchor, pattern, :glob} | rest],
+         channel,
+         acc
+       ) do
+    next_acc =
+      if Ferricstore.GlobMatcher.match?(channel, pattern),
+        do: collect_indexed_pattern(acc, pattern),
+        else: acc
+
+    collect_pattern_index_candidates(rest, channel, next_acc)
+  end
+
+  defp collect_pattern_index_candidates([], _channel, acc), do: acc
+
+  defp collect_indexed_pattern(acc, pattern) do
+    case :ets.lookup(@pattern_cache_table, pattern) do
+      [{^pattern, _matcher, deliveries, _subscriber_count}] -> [{pattern, deliveries} | acc]
+      [] -> acc
+    end
   end
 
   defp publish_planned_pattern_deliveries(

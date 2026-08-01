@@ -279,6 +279,76 @@ defmodule Ferricstore.Commands.PubSubTest do
       end
     end
 
+    test "high-cardinality homogeneous batches evaluate indexed globs once" do
+      pattern = "?*indexed-batch-target*?"
+      channel = "xindexed-batch-targety"
+      decoys = for index <- 1..17, do: "indexed-batch-decoy-#{index}"
+
+      PubSub.subscribe(channel, self())
+      PubSub.psubscribe_many(decoys ++ [pattern], self())
+
+      Code.ensure_loaded!(Ferricstore.GlobMatcher)
+      matcher = {Ferricstore.GlobMatcher, :do_match, 6}
+      tracer = spawn(fn -> indexed_glob_trace_loop(0) end)
+
+      :erlang.trace_pattern(matcher, true, [:local])
+      :erlang.trace(self(), true, [:call, {:tracer, tracer}])
+
+      try do
+        assert PubSub.publish_many([{channel, "one"}, {channel, "two"}]) == [2, 2]
+
+        events =
+          for _index <- 1..4 do
+            receive do
+              event -> event
+            after
+              100 -> flunk("expected exact and indexed pattern PubSub events")
+            end
+          end
+
+        assert events == [
+                 {:pubsub_message, channel, "one"},
+                 {:pubsub_pmessage, pattern, channel, "one"},
+                 {:pubsub_message, channel, "two"},
+                 {:pubsub_pmessage, pattern, channel, "two"}
+               ]
+
+        send(tracer, {:report, self()})
+        assert_receive {:indexed_glob_match_calls, 1}
+      after
+        :erlang.trace(self(), false, [:call])
+        :erlang.trace_pattern(matcher, false, [:local])
+        Process.exit(tracer, :kill)
+      end
+    end
+
+    test "high-cardinality batches preserve indexed pattern category order" do
+      channel = "indexed-order:target"
+      patterns = [channel, "*", "indexed-order:*", "*:target", "?*ndexed-order*?"]
+      decoys = for index <- 1..17, do: "indexed-order-decoy-#{index}"
+
+      PubSub.subscribe(channel, self())
+      PubSub.psubscribe_many(decoys ++ patterns, self())
+
+      assert PubSub.publish_many([{channel, "one"}, {channel, "two"}]) == [6, 6]
+
+      events =
+        for _index <- 1..12 do
+          receive do
+            event -> event
+          after
+            100 -> flunk("expected ordered high-cardinality PubSub events")
+          end
+        end
+
+      expected_for = fn message ->
+        [{:pubsub_message, channel, message}] ++
+          Enum.map(patterns, &{:pubsub_pmessage, &1, channel, message})
+      end
+
+      assert events == expected_for.("one") ++ expected_for.("two")
+    end
+
     test "mixed-channel batches preserve publish and delivery order" do
       PubSub.subscribe_many(["mixed-a", "mixed-b"], self())
 
@@ -598,6 +668,18 @@ defmodule Ferricstore.Commands.PubSubTest do
 
       {:report, caller} ->
         send(caller, {:glob_match_calls, count})
+    end
+  end
+
+  defp indexed_glob_trace_loop(count) do
+    receive do
+      {:trace, _pid, :call,
+       {Ferricstore.GlobMatcher, :do_match,
+        [_subject, _subject_position, _subject_size, _pattern, _pattern_position, _pattern_size]}} ->
+        indexed_glob_trace_loop(count + 1)
+
+      {:report, caller} ->
+        send(caller, {:indexed_glob_match_calls, count})
     end
   end
 
