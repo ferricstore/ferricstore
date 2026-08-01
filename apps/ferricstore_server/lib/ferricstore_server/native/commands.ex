@@ -33,6 +33,7 @@ defmodule FerricstoreServer.Native.Commands do
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
   alias FerricstoreServer.Native.Codec
+  alias FerricstoreServer.Native.Connection.Responses
   alias FerricstoreServer.Native.FQLParser
   alias FerricstoreServer.Native.FlowQuery
   alias FerricstoreServer.Native.RequestContext
@@ -5666,7 +5667,7 @@ defmodule FerricstoreServer.Native.Commands do
 
         results =
           publishes
-          |> Ferricstore.PubSub.publish_many()
+          |> publish_many_with_shared_native_batch()
           |> pipeline_pubsub_results(requests)
 
         {:ok, results}
@@ -5969,7 +5970,7 @@ defmodule FerricstoreServer.Native.Commands do
        when is_list(items) do
     Stats.incr_commands_by(state.stats_counter, length(items))
 
-    results = Ferricstore.PubSub.publish_many(items)
+    results = publish_many_with_shared_native_batch(items)
 
     {:ok, format_compact_pipeline_results(results, @op_command_exec, return_format)}
   end
@@ -6363,6 +6364,16 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp execute_compact_pipeline_fast_path(_mode, _items, _return_format, _state), do: :fallback
+
+  defp publish_many_with_shared_native_batch(publishes) do
+    Ferricstore.PubSub.publish_many(publishes, fn channel, messages ->
+      Responses.prepare_pubsub_message_batch(
+        channel,
+        messages,
+        System.system_time(:millisecond)
+      )
+    end)
+  end
 
   defp submit_compact_stream_items(ctx, [_first | _rest] = items),
     do: Router.stream_append_auto_items(ctx, items)

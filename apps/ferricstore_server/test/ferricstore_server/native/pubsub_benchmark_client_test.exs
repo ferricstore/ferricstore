@@ -205,6 +205,85 @@ defmodule FerricstoreServer.Native.PubSubBenchmarkClientTest do
            }
   end
 
+  test "prepared negotiated batches reuse one encoded value across connection frames" do
+    state = %{
+      compression: :none,
+      max_frame_bytes: 1_024,
+      max_response_bytes: 1_024,
+      response_chunk_bytes: 0
+    }
+
+    prepared =
+      Responses.prepare_pubsub_message_batch("orders", ["one", "two", "three"], 1_234)
+
+    [first] = Responses.encode_prepared_pubsub_message_batch(state, 0x0010, prepared)
+    [second] = Responses.encode_prepared_pubsub_message_batch(state, 0x0010, prepared)
+
+    assert [_header, <<0::unsigned-16>>, first_value] = first
+    assert [_header, <<0::unsigned-16>>, second_value] = second
+    assert :erts_debug.same(first_value, prepared.encoded_value)
+    assert :erts_debug.same(second_value, prepared.encoded_value)
+
+    assert IO.iodata_to_binary(first) ==
+             Responses.encode_event(state, 0x0010, %{
+               event: "PUBSUB_MESSAGE",
+               payload: %{
+                 kind: "message_batch",
+                 channel: "orders",
+                 messages: ["one", "two", "three"]
+               },
+               at_ms: 1_234
+             })
+             |> IO.iodata_to_binary()
+  end
+
+  test "prepared negotiated batches preserve compression, chunking, and response limits" do
+    payload = %{
+      event: "PUBSUB_MESSAGE",
+      payload: %{
+        kind: "message_batch",
+        channel: "orders",
+        messages: [String.duplicate("x", 128), String.duplicate("y", 128)]
+      },
+      at_ms: 1_234
+    }
+
+    prepared =
+      Responses.prepare_pubsub_message_batch(
+        "orders",
+        [String.duplicate("x", 128), String.duplicate("y", 128)],
+        1_234
+      )
+
+    for state <- [
+          %{
+            compression: :zlib,
+            max_frame_bytes: 1_024,
+            max_response_bytes: 1_024,
+            response_chunk_bytes: 0
+          },
+          %{
+            compression: :none,
+            max_frame_bytes: 64,
+            max_response_bytes: 1_024,
+            response_chunk_bytes: 0
+          },
+          %{
+            compression: :none,
+            max_frame_bytes: 1_024,
+            max_response_bytes: 64,
+            response_chunk_bytes: 0
+          }
+        ] do
+      assert state
+             |> Responses.encode_prepared_pubsub_message_batch(0x0010, prepared)
+             |> IO.iodata_to_binary() ==
+               state
+               |> Responses.encode_event(0x0010, payload)
+               |> IO.iodata_to_binary()
+    end
+  end
+
   test "batch event encoding preserves the generic compressed framing fallback" do
     state = %{
       compression: :zlib,

@@ -319,6 +319,69 @@ defmodule FerricstoreServer.Native.Codec do
     )
   end
 
+  @doc false
+  @spec encode_preencoded_ok_response_frames(
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          binary(),
+          keyword()
+        ) :: [iodata()]
+  def encode_preencoded_ok_response_frames(opcode, lane_id, request_id, payload, opts \\ [])
+      when is_binary(payload) do
+    case Keyword.get(opts, :max_response_bytes) do
+      limit
+      when is_integer(limit) and limit > 0 and (limit < 2 or byte_size(payload) > limit - 2) ->
+        encode_response_frames(
+          opcode,
+          lane_id,
+          request_id,
+          :bad_request,
+          "ERR native response byte limit exceeded",
+          opts
+        )
+
+      _within_limit ->
+        encode_preencoded_ok_response_frames_unbounded(
+          opcode,
+          lane_id,
+          request_id,
+          payload,
+          opts
+        )
+    end
+  end
+
+  defp encode_preencoded_ok_response_frames_unbounded(
+         opcode,
+         lane_id,
+         request_id,
+         payload,
+         opts
+       ) do
+    extra_flags = Keyword.get(opts, :flags, 0)
+    chunk_bytes = Keyword.get(opts, :chunk_bytes, 0)
+    body_bytes = byte_size(payload) + 2
+
+    if Keyword.get(opts, :compression, :none) == :none and
+         (not is_integer(chunk_bytes) or chunk_bytes <= 0 or body_bytes <= chunk_bytes) do
+      FrameBuffer.validate_frame_body_bytes!(body_bytes)
+
+      header =
+        <<"FSNP", Bitwise.bor(@version, @response_direction), extra_flags, lane_id::unsigned-32,
+          opcode::unsigned-16, request_id::unsigned-64, body_bytes::unsigned-32>>
+
+      [[header, <<0::unsigned-16>>, payload]]
+    else
+      body = <<0::unsigned-16, payload::binary>>
+
+      {body, flags} =
+        maybe_compress_body(body, extra_flags, Keyword.get(opts, :compression, :none))
+
+      encode_frame_chunks(opcode, lane_id, request_id, body, flags, chunk_bytes)
+    end
+  end
+
   @spec encode_command_response_frames(
           non_neg_integer(),
           non_neg_integer(),

@@ -66,6 +66,8 @@ defmodule Ferricstore.PubSub do
     * `{:pubsub_pmessage, pattern, channel, message}` — for pattern subscriptions
     * `{:pubsub_messages, channel, messages, lease}` — an internal guarded exact
       batch consumed by protocol connection processes
+    * `{:pubsub_messages, channel, messages, prepared, lease}` — the same guarded
+      batch with an opaque value prepared once for compatible protocol consumers
 
   The protocol connection process is responsible for encoding these into event frames.
   """
@@ -337,13 +339,23 @@ defmodule Ferricstore.PubSub do
   per-publish path.
   """
   @spec publish_many([{channel(), binary()}]) :: [non_neg_integer()]
-  def publish_many([]), do: []
+  def publish_many(publishes), do: publish_many(publishes, nil)
 
-  def publish_many([{channel, message} | rest] = publishes)
-      when is_binary(channel) and is_binary(message) and is_list(rest) do
+  @doc false
+  @spec publish_many(
+          [{channel(), binary()}],
+          nil | (channel(), [binary()] -> term())
+        ) :: [non_neg_integer()]
+  def publish_many([], batch_preparer)
+      when is_nil(batch_preparer) or is_function(batch_preparer, 2),
+      do: []
+
+  def publish_many([{channel, message} | rest] = publishes, batch_preparer)
+      when is_binary(channel) and is_binary(message) and is_list(rest) and
+             (is_nil(batch_preparer) or is_function(batch_preparer, 2)) do
     case same_channel_messages(rest, channel, [message]) do
       {:ok, messages} ->
-        publish_same_channel_many(channel, messages)
+        publish_same_channel_many(channel, messages, batch_preparer)
 
       :mixed ->
         Enum.map(publishes, fn {item_channel, item_message} ->
@@ -1348,10 +1360,10 @@ defmodule Ferricstore.PubSub do
 
   defp same_channel_messages(_mixed_or_invalid, _channel, _acc), do: :mixed
 
-  defp publish_same_channel_many(channel, messages) do
+  defp publish_same_channel_many(channel, messages, batch_preparer) do
     case :ets.info(@pattern_cache_table, :size) do
       0 ->
-        counts = publish_exact_same_channel_many(channel, messages)
+        counts = publish_exact_same_channel_many(channel, messages, batch_preparer)
         record_publish_batch(channel, messages, counts)
         counts
 
@@ -1554,28 +1566,61 @@ defmodule Ferricstore.PubSub do
        ),
        do: count
 
-  defp publish_exact_same_channel_many(channel, messages) do
+  defp publish_exact_same_channel_many(channel, messages, batch_preparer) do
     case :ets.lookup(@channel_cache_table, channel) do
       [{^channel, deliveries, _subscriber_count}] ->
+        prepared_batch = prepare_pubsub_batch(batch_preparer, deliveries, channel, messages)
         batch_bytes = exact_batch_delivery_bytes(channel, messages)
-        publish_exact_batch_deliveries(deliveries, channel, messages, batch_bytes)
+
+        publish_exact_batch_deliveries(
+          deliveries,
+          channel,
+          messages,
+          prepared_batch,
+          batch_bytes
+        )
 
       [] ->
         List.duplicate(0, length(messages))
     end
   end
 
+  defp prepare_pubsub_batch(nil, _deliveries, _channel, _messages), do: nil
+
+  defp prepare_pubsub_batch(batch_preparer, deliveries, channel, messages) do
+    if multiple_guarded_deliveries?(deliveries, 0),
+      do: batch_preparer.(channel, messages),
+      else: nil
+  end
+
+  defp multiple_guarded_deliveries?(_deliveries, 2), do: true
+
+  defp multiple_guarded_deliveries?([{_pid, _guard} | rest], count),
+    do: multiple_guarded_deliveries?(rest, count + 1)
+
+  defp multiple_guarded_deliveries?([_pid | rest], count),
+    do: multiple_guarded_deliveries?(rest, count)
+
+  defp multiple_guarded_deliveries?([], _count), do: false
+
   defp exact_batch_delivery_bytes(channel, messages) do
     channel_bytes = byte_size(channel) + @delivery_overhead_bytes
     Enum.reduce(messages, 0, fn message, bytes -> bytes + channel_bytes + byte_size(message) end)
   end
 
-  defp publish_exact_batch_deliveries(deliveries, channel, messages, batch_bytes) do
+  defp publish_exact_batch_deliveries(
+         deliveries,
+         channel,
+         messages,
+         prepared_batch,
+         batch_bytes
+       ) do
     {complete_deliveries, partial_counts} =
       publish_exact_batch_deliveries(
         deliveries,
         channel,
         messages,
+        prepared_batch,
         batch_bytes,
         0,
         List.duplicate(0, length(messages))
@@ -1588,6 +1633,7 @@ defmodule Ferricstore.PubSub do
          [pid | rest],
          channel,
          messages,
+         prepared_batch,
          batch_bytes,
          complete_deliveries,
          partial_counts
@@ -1599,6 +1645,7 @@ defmodule Ferricstore.PubSub do
       rest,
       channel,
       messages,
+      prepared_batch,
       batch_bytes,
       complete_deliveries + 1,
       partial_counts
@@ -1609,30 +1656,33 @@ defmodule Ferricstore.PubSub do
          [{pid, guard} = delivery | rest],
          channel,
          messages,
+         prepared_batch,
          batch_bytes,
          complete_deliveries,
          partial_counts
        ) do
     case reserve_guarded_delivery(guard, batch_bytes) do
       {:ok, nil} ->
-        send(pid, {:pubsub_messages, channel, messages})
+        send_pubsub_batch(pid, channel, messages, prepared_batch, nil)
 
         publish_exact_batch_deliveries(
           rest,
           channel,
           messages,
+          prepared_batch,
           batch_bytes,
           complete_deliveries + 1,
           partial_counts
         )
 
       {:ok, lease} ->
-        send(pid, {:pubsub_messages, channel, messages, lease})
+        send_pubsub_batch(pid, channel, messages, prepared_batch, lease)
 
         publish_exact_batch_deliveries(
           rest,
           channel,
           messages,
+          prepared_batch,
           batch_bytes,
           complete_deliveries + 1,
           partial_counts
@@ -1651,6 +1701,7 @@ defmodule Ferricstore.PubSub do
           rest,
           channel,
           messages,
+          prepared_batch,
           batch_bytes,
           complete_deliveries,
           add_publish_counts(partial_counts, delivery_counts, [])
@@ -1662,11 +1713,21 @@ defmodule Ferricstore.PubSub do
          [],
          _channel,
          _messages,
+         _prepared_batch,
          _batch_bytes,
          complete_deliveries,
          partial_counts
        ),
        do: {complete_deliveries, partial_counts}
+
+  defp send_pubsub_batch(pid, channel, messages, nil, nil),
+    do: send(pid, {:pubsub_messages, channel, messages})
+
+  defp send_pubsub_batch(pid, channel, messages, nil, lease),
+    do: send(pid, {:pubsub_messages, channel, messages, lease})
+
+  defp send_pubsub_batch(pid, channel, messages, prepared_batch, lease),
+    do: send(pid, {:pubsub_messages, channel, messages, prepared_batch, lease})
 
   defp exact_delivery_bytes(channel, message),
     do: byte_size(channel) + byte_size(message) + @delivery_overhead_bytes

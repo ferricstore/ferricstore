@@ -31,6 +31,7 @@ defmodule FerricstoreServer.Native.Connection do
     Chunks,
     FrameBuffer,
     InboundBudget,
+    PreparedPubSubBatch,
     PubSubCoalescer,
     Responses
   }
@@ -404,10 +405,14 @@ defmodule FerricstoreServer.Native.Connection do
         send_pubsub_events(state, event)
 
       {:pubsub_messages, channel, messages, %OutboundBudget{} = lease} ->
-        send_pubsub_batch(state, channel, messages, lease)
+        send_pubsub_batch(state, channel, messages, lease, nil)
 
       {:pubsub_messages, channel, messages} ->
-        send_pubsub_batch(state, channel, messages, nil)
+        send_pubsub_batch(state, channel, messages, nil, nil)
+
+      {:pubsub_messages, channel, messages, %PreparedPubSubBatch{} = prepared, lease}
+      when is_nil(lease) or is_struct(lease, OutboundBudget) ->
+        send_pubsub_batch(state, channel, messages, lease, prepared)
 
       {:pubsub_pmessage, _pattern, _channel, _message, %OutboundBudget{}} = event ->
         send_pubsub_events(state, event)
@@ -1667,10 +1672,10 @@ defmodule FerricstoreServer.Native.Connection do
     end
   end
 
-  defp send_pubsub_batch(state, channel, messages, lease) do
+  defp send_pubsub_batch(state, channel, messages, lease, prepared) do
     encoded =
       if pubsub_batch_codec_selected?(state) do
-        safe_encode_guarded_pubsub_batch(state, channel, messages)
+        safe_encode_guarded_pubsub_batch(state, channel, messages, prepared)
       else
         descriptors = Enum.map(messages, &{:message, channel, &1})
         safe_encode_guarded_pubsub_events(state, descriptors)
@@ -1782,7 +1787,7 @@ defmodule FerricstoreServer.Native.Connection do
     kind, reason -> {:error, {kind, reason}}
   end
 
-  defp safe_encode_guarded_pubsub_batch(state, channel, messages) do
+  defp safe_encode_guarded_pubsub_batch(state, channel, messages, nil) do
     {:ok,
      Responses.encode_pubsub_message_batch(
        state,
@@ -1790,6 +1795,24 @@ defmodule FerricstoreServer.Native.Connection do
        channel,
        messages,
        System.system_time(:millisecond)
+     )}
+  rescue
+    error -> {:error, error}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp safe_encode_guarded_pubsub_batch(
+         state,
+         _channel,
+         _messages,
+         %PreparedPubSubBatch{} = prepared
+       ) do
+    {:ok,
+     Responses.encode_prepared_pubsub_message_batch(
+       state,
+       Commands.event_opcode(),
+       prepared
      )}
   rescue
     error -> {:error, error}

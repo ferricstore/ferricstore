@@ -1,8 +1,9 @@
 defmodule FerricstoreServer.Native.Connection.Responses do
   @moduledoc false
 
-  alias Ferricstore.Stats
+  alias Ferricstore.{NativeValueCodec, Stats}
   alias FerricstoreServer.Native.Codec
+  alias FerricstoreServer.Native.Connection.PreparedPubSubBatch
 
   @minimum_integer -0x8000_0000_0000_0000
   @maximum_integer 0x7FFF_FFFF_FFFF_FFFF
@@ -55,11 +56,40 @@ defmodule FerricstoreServer.Native.Connection.Responses do
   def encode_pubsub_message_batch(state, opcode, channel, messages, at_ms)
       when is_binary(channel) and is_list(messages) and is_integer(opcode) and
              is_integer(at_ms) do
-    encode_event(state, opcode, %{
-      event: @pubsub_event,
-      payload: %{kind: "message_batch", channel: channel, messages: messages},
-      at_ms: at_ms
-    })
+    channel
+    |> prepare_pubsub_message_batch(messages, at_ms)
+    |> then(&encode_prepared_pubsub_message_batch(state, opcode, &1))
+  end
+
+  @doc false
+  @spec prepare_pubsub_message_batch(binary(), [binary()], integer()) :: PreparedPubSubBatch.t()
+  def prepare_pubsub_message_batch(channel, messages, at_ms)
+      when is_binary(channel) and is_list(messages) and is_integer(at_ms) do
+    encoded_value =
+      NativeValueCodec.encode(%{
+        event: @pubsub_event,
+        payload: %{kind: "message_batch", channel: channel, messages: messages},
+        at_ms: at_ms
+      })
+
+    %PreparedPubSubBatch{encoded_value: encoded_value}
+  end
+
+  @doc false
+  @spec encode_prepared_pubsub_message_batch(map(), integer(), PreparedPubSubBatch.t()) :: [
+          iodata()
+        ]
+  def encode_prepared_pubsub_message_batch(
+        state,
+        opcode,
+        %PreparedPubSubBatch{encoded_value: encoded_value}
+      )
+      when is_integer(opcode) do
+    Codec.encode_preencoded_ok_response_frames(opcode, 0, 0, encoded_value,
+      compression: state.compression,
+      chunk_bytes: response_chunk_bytes(state),
+      max_response_bytes: Map.get(state, :max_response_bytes)
+    )
   end
 
   defp response_chunk_bytes(state) do

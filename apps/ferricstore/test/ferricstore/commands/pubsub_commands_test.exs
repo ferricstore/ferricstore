@@ -199,6 +199,78 @@ defmodule Ferricstore.Commands.PubSubTest do
       assert_receive {:pubsub_messages, "guarded-batch", ["one", "two"], :batch_delivery_lease}
     end
 
+    test "same-channel batches prepare one shared native value for guarded subscribers" do
+      parent = self()
+
+      subscribers =
+        Enum.map(1..2, fn _index ->
+          spawn(fn ->
+            :ok = PubSub.set_delivery_guard(self(), fn _bytes -> {:ok, :shared_batch_lease} end)
+            :ok = PubSub.subscribe("shared-batch", self())
+            send(parent, {:shared_batch_ready, self()})
+
+            receive do
+              event -> send(parent, {:shared_batch_event, self(), event})
+            end
+          end)
+        end)
+
+      on_exit(fn ->
+        Enum.each(subscribers, fn pid ->
+          if Process.alive?(pid), do: Process.exit(pid, :kill)
+        end)
+      end)
+
+      Enum.each(subscribers, fn pid ->
+        assert_receive {:shared_batch_ready, ^pid}
+      end)
+
+      prepared = make_ref()
+
+      prepare = fn channel, messages ->
+        send(parent, {:shared_batch_prepared, channel, messages})
+        prepared
+      end
+
+      assert PubSub.publish_many(
+               [{"shared-batch", "one"}, {"shared-batch", "two"}],
+               prepare
+             ) == [2, 2]
+
+      assert_receive {:shared_batch_prepared, "shared-batch", ["one", "two"]}
+      refute_receive {:shared_batch_prepared, _, _}
+
+      Enum.each(subscribers, fn pid ->
+        assert_receive {:shared_batch_event, ^pid,
+                        {:pubsub_messages, "shared-batch", ["one", "two"], ^prepared,
+                         :shared_batch_lease}}
+      end)
+    end
+
+    test "same-channel batches do not prepare a value for one guarded subscriber" do
+      parent = self()
+
+      assert :ok =
+               PubSub.set_delivery_guard(self(), fn _bytes -> {:ok, :single_batch_lease} end)
+
+      assert :ok = PubSub.subscribe("single-shared-batch", self())
+
+      prepare = fn channel, messages ->
+        send(parent, {:single_batch_prepared, channel, messages})
+        make_ref()
+      end
+
+      assert PubSub.publish_many(
+               [{"single-shared-batch", "one"}, {"single-shared-batch", "two"}],
+               prepare
+             ) == [1, 1]
+
+      refute_receive {:single_batch_prepared, _, _}
+
+      assert_receive {:pubsub_messages, "single-shared-batch", ["one", "two"],
+                      :single_batch_lease}
+    end
+
     test "an aggregate reservation rejection falls back to per-message admission" do
       test_pid = self()
       individual_limit = byte_size("fallback-batch") + byte_size("one") + 128
