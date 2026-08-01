@@ -98,6 +98,14 @@ defmodule FerricstoreServer.Native.ResourceBudget do
     end
   end
 
+  @spec release_many(GenServer.server(), [reference()]) :: :ok
+  def release_many(server \\ __MODULE__, tokens) when is_list(tokens) do
+    case lookup_budget(server) do
+      {:ok, budget} -> release_fast_leases(budget, tokens)
+      {:error, :resource_budget_unavailable} -> :ok
+    end
+  end
+
   @spec release_async(GenServer.server(), reference()) :: :ok
   def release_async(server \\ __MODULE__, token) when is_reference(token),
     do: release(server, token)
@@ -397,6 +405,27 @@ defmodule FerricstoreServer.Native.ResourceBudget do
       :unavailable ->
         :ok
     end
+  end
+
+  defp release_fast_leases(budget, tokens) do
+    released =
+      Enum.reduce(tokens, %{}, fn token, amounts ->
+        case safe_take_lease(budget.leases, token) do
+          [{^token, owner, resource, amount}] ->
+            safe_delete_owner_lease(budget.owner_leases, owner, token)
+            Map.update(amounts, resource, amount, &(&1 + amount))
+
+          _missing_or_unavailable ->
+            amounts
+        end
+      end)
+
+    Enum.each(released, fn {resource, amount} ->
+      release_amount(budget, resource, amount)
+      notify_capacity(budget, resource)
+    end)
+
+    :ok
   end
 
   defp release_and_grant_waiters(state, token) do

@@ -53,6 +53,56 @@ defmodule Ferricstore.ActivityLogBoundedReadTest do
     refute publish.target == oversized
   end
 
+  test "pubsub activity materializes the public entry contract from compact rows" do
+    PubSubActivityLog.record_subscription("SUBSCRIBE", :channel, ["alpha", "beta"])
+    PubSubActivityLog.record_publish("alpha", 42, 3)
+
+    [publish, subscription] = PubSubActivityLog.get(2)
+
+    assert Map.drop(publish, [:id, :timestamp_us]) == %{
+             command: "PUBLISH",
+             target_type: :channel,
+             target: "alpha",
+             targets: 1,
+             subscribers: 3,
+             message_bytes: 42
+           }
+
+    assert Map.drop(subscription, [:id, :timestamp_us]) == %{
+             command: "SUBSCRIBE",
+             target_type: :channel,
+             target: "alpha +1",
+             targets: 2,
+             subscribers: nil,
+             message_bytes: nil
+           }
+  end
+
+  test "pubsub publish sampling keeps periodic events and all subscription changes" do
+    source = File.read!(Path.expand("../../lib/ferricstore/pubsub/activity_log.ex", __DIR__))
+
+    assert source =~ ":pubsub_activity_log_sample_every"
+    assert source =~ "configure_publish_sampling"
+
+    on_exit(fn -> PubSubActivityLog.configure_publish_sampling(1) end)
+
+    PubSubActivityLog.configure_publish_sampling(3)
+    PubSubActivityLog.reset()
+
+    for index <- 1..7 do
+      PubSubActivityLog.record_publish("sampled:#{index}", index, 0)
+    end
+
+    PubSubActivityLog.record_subscription("SUBSCRIBE", :channel, ["always-recorded"])
+
+    assert Enum.map(PubSubActivityLog.get(4), &{&1.command, &1.target}) == [
+             {"SUBSCRIBE", "always-recorded"},
+             {"PUBLISH", "sampled:7"},
+             {"PUBLISH", "sampled:4"},
+             {"PUBLISH", "sampled:1"}
+           ]
+  end
+
   test "batch XADD activity retains only the configured newest rows in order" do
     entries =
       Enum.map(1..600, fn index ->

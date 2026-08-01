@@ -29,6 +29,13 @@ defmodule Ferricstore.Commands.PubSubTest do
             :ferricstore_pubsub_patterns,
             :ferricstore_pubsub_channel_cache,
             :ferricstore_pubsub_pattern_cache,
+            :ferricstore_pubsub_pid_channels,
+            :ferricstore_pubsub_pid_patterns,
+            :ferricstore_pubsub_channel_memberships,
+            :ferricstore_pubsub_pattern_memberships,
+            :ferricstore_pubsub_pattern_prefix_index,
+            :ferricstore_pubsub_pattern_suffix_index,
+            :ferricstore_pubsub_pattern_glob_index,
             :ferricstore_pubsub_monitors,
             :ferricstore_pubsub_delivery_guards
           ] do
@@ -45,7 +52,14 @@ defmodule Ferricstore.Commands.PubSubTest do
             :ferricstore_pubsub,
             :ferricstore_pubsub_patterns,
             :ferricstore_pubsub_channel_cache,
-            :ferricstore_pubsub_pattern_cache
+            :ferricstore_pubsub_pattern_cache,
+            :ferricstore_pubsub_pid_channels,
+            :ferricstore_pubsub_pid_patterns,
+            :ferricstore_pubsub_channel_memberships,
+            :ferricstore_pubsub_pattern_memberships,
+            :ferricstore_pubsub_pattern_prefix_index,
+            :ferricstore_pubsub_pattern_suffix_index,
+            :ferricstore_pubsub_pattern_glob_index
           ] do
         assert :ets.info(table, :protection) == :protected
       end
@@ -69,6 +83,61 @@ defmodule Ferricstore.Commands.PubSubTest do
                active_subscribers: 1,
                pattern_subscriptions: 1
              } = PubSub.subscription_snapshot(10)
+    end
+
+    test "reverse indexes remain idempotent through unsubscribe and cleanup" do
+      PubSub.subscribe("reverse-channel", self())
+      PubSub.subscribe("reverse-channel", self())
+      PubSub.psubscribe("reverse:*", self())
+      PubSub.psubscribe("reverse:*", self())
+
+      assert :ets.lookup(:ferricstore_pubsub_pid_channels, self()) == [
+               {self(), "reverse-channel"}
+             ]
+
+      assert :ets.lookup(:ferricstore_pubsub_pid_patterns, self()) == [
+               {self(), "reverse:*"}
+             ]
+
+      PubSub.unsubscribe("reverse-channel", self())
+      assert :ets.lookup(:ferricstore_pubsub_pid_channels, self()) == []
+
+      PubSub.cleanup(self())
+      assert :ets.lookup(:ferricstore_pubsub_pid_patterns, self()) == []
+      assert :ets.lookup(:ferricstore_pubsub_patterns, "reverse:*") == []
+    end
+
+    test "bounds snapshots and orders by subscriber count then name" do
+      PubSub.subscribe_many(["delta", "alpha", "charlie", "bravo"], self())
+      PubSub.psubscribe_many(["zeta.*", "alpha.*", "charlie.*", "bravo.*"], self())
+
+      parent = self()
+
+      extra_subscriber =
+        spawn(fn ->
+          PubSub.subscribe_many(["charlie", "bravo"], self())
+          PubSub.psubscribe("charlie.*", self())
+          send(parent, {:snapshot_subscriber_ready, self()})
+          Process.sleep(:infinity)
+        end)
+
+      on_exit(fn ->
+        if Process.alive?(extra_subscriber), do: Process.exit(extra_subscriber, :kill)
+      end)
+
+      assert_receive {:snapshot_subscriber_ready, ^extra_subscriber}
+
+      snapshot = PubSub.subscription_snapshot(2)
+
+      assert snapshot.channels == [
+               %{channel: "bravo", subscribers: 2},
+               %{channel: "charlie", subscribers: 2}
+             ]
+
+      assert snapshot.patterns == [
+               %{pattern: "charlie.*", subscribers: 2},
+               %{pattern: "alpha.*", subscribers: 1}
+             ]
     end
   end
 
@@ -102,6 +171,46 @@ defmodule Ferricstore.Commands.PubSubTest do
       assert_receive {:delivery_reserved, bytes}
       assert bytes >= byte_size("guarded") + byte_size("payload")
       assert_receive {:pubsub_message, "guarded", "payload", :delivery_lease}
+    end
+
+    test "exact delivery cache follows guard replacement and clearing" do
+      PubSub.subscribe("guard-cache", self())
+
+      assert PubSubCmd.handle("PUBLISH", ["guard-cache", "unguarded"]) == 1
+      assert_receive {:pubsub_message, "guard-cache", "unguarded"}
+
+      assert :ok =
+               PubSub.set_delivery_guard(self(), fn _bytes ->
+                 {:ok, :replacement_lease}
+               end)
+
+      assert PubSubCmd.handle("PUBLISH", ["guard-cache", "guarded"]) == 1
+      assert_receive {:pubsub_message, "guard-cache", "guarded", :replacement_lease}
+
+      assert :ok = PubSub.clear_delivery_guard(self())
+      assert PubSubCmd.handle("PUBLISH", ["guard-cache", "cleared"]) == 1
+      assert_receive {:pubsub_message, "guard-cache", "cleared"}
+    end
+
+    test "pattern delivery cache follows guard replacement and clearing" do
+      PubSub.psubscribe("guard-pattern:*", self())
+
+      assert PubSubCmd.handle("PUBLISH", ["guard-pattern:1", "unguarded"]) == 1
+      assert_receive {:pubsub_pmessage, "guard-pattern:*", "guard-pattern:1", "unguarded"}
+
+      assert :ok =
+               PubSub.set_delivery_guard(self(), fn _bytes ->
+                 {:ok, :replacement_lease}
+               end)
+
+      assert PubSubCmd.handle("PUBLISH", ["guard-pattern:2", "guarded"]) == 1
+
+      assert_receive {:pubsub_pmessage, "guard-pattern:*", "guard-pattern:2", "guarded",
+                      :replacement_lease}
+
+      assert :ok = PubSub.clear_delivery_guard(self())
+      assert PubSubCmd.handle("PUBLISH", ["guard-pattern:3", "cleared"]) == 1
+      assert_receive {:pubsub_pmessage, "guard-pattern:*", "guard-pattern:3", "cleared"}
     end
 
     test "a delivery guard failure disconnects the slow subscriber without queueing payload" do
@@ -153,15 +262,17 @@ defmodule Ferricstore.Commands.PubSubTest do
       source = File.read!(Path.expand("../../../lib/ferricstore/pubsub.ex", __DIR__))
       [publish_source] = Regex.run(~r/def publish\(channel, message\).*?^  end/ms, source)
 
-      assert publish_source =~ ":ets.foldl"
-      refute publish_source =~ ":ets.tab2list"
+      assert publish_source =~ "@pattern_cache_table"
+      assert source =~ "defp publish_pattern_scan"
+      assert source =~ ":ets.foldl"
+      refute source =~ ":ets.tab2list(@pattern_cache_table)"
     end
 
     test "exact publish skips pattern scan when there are no pattern subscribers" do
       source = File.read!(Path.expand("../../../lib/ferricstore/pubsub.ex", __DIR__))
       [publish_source] = Regex.run(~r/def publish\(channel, message\).*?^  end/ms, source)
 
-      assert publish_source =~ ":ets.info(@patterns_table, :size)"
+      assert publish_source =~ ":ets.info(@pattern_cache_table, :size)"
 
       PubSub.subscribe("exact-only", self())
 
@@ -196,7 +307,7 @@ defmodule Ferricstore.Commands.PubSubTest do
       [publish_source] = Regex.run(~r/def publish\(channel, message\).*?^  end/ms, source)
 
       assert source =~ "pattern_matcher(pattern)"
-      assert publish_source =~ "pattern_matches?(channel, matcher)"
+      assert source =~ "pattern_matches?(channel, matcher)"
       refute publish_source =~ "Ferricstore.GlobMatcher.match?(channel, pattern)"
 
       PubSub.psubscribe("prefix:*", self())
@@ -217,6 +328,90 @@ defmodule Ferricstore.Commands.PubSubTest do
       assert_receive {:pubsub_pmessage, "*", "literal", "data"}
     end
 
+    test "adaptive matcher indexes preserve high-cardinality pattern delivery" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/pubsub.ex", __DIR__))
+      [publish_source] = Regex.run(~r/def publish\(channel, message\).*?^  end/ms, source)
+
+      assert source =~ "@pattern_linear_scan_limit"
+      assert publish_source =~ "publish_pattern_indexes"
+
+      for table <- [
+            :ferricstore_pubsub_pattern_prefix_index,
+            :ferricstore_pubsub_pattern_suffix_index,
+            :ferricstore_pubsub_pattern_glob_index
+          ] do
+        assert :ets.info(table, :protection) == :protected
+      end
+
+      decoys = for index <- 1..17, do: "indexed-decoy-#{index}"
+
+      PubSub.psubscribe_many(
+        decoys ++ ["indexed-exact", "indexed-prefix:*", "*:indexed-suffix", "indexed-glob:?"],
+        self()
+      )
+
+      assert PubSub.publish("indexed-exact", "exact") == 1
+      assert_receive {:pubsub_pmessage, "indexed-exact", "indexed-exact", "exact"}
+
+      assert PubSub.publish("indexed-prefix:value", "prefix") == 1
+      assert_receive {:pubsub_pmessage, "indexed-prefix:*", "indexed-prefix:value", "prefix"}
+
+      assert PubSub.publish("value:indexed-suffix", "suffix") == 1
+      assert_receive {:pubsub_pmessage, "*:indexed-suffix", "value:indexed-suffix", "suffix"}
+
+      assert PubSub.publish("indexed-glob:x", "glob") == 1
+      assert_receive {:pubsub_pmessage, "indexed-glob:?", "indexed-glob:x", "glob"}
+    end
+
+    test "complex glob indexes use safe literal boundary anchors" do
+      decoys = for index <- 1..17, do: "glob-anchor-decoy-#{index}"
+      prefix_pattern = "anchored-prefix:?*[ab]"
+      suffix_pattern = "[ab]*?:anchored-suffix"
+      escaped_prefix_pattern = "escaped:\\?prefix:*[ab]"
+      unanchored_pattern = "?*middle*?"
+
+      PubSub.psubscribe_many(
+        decoys ++
+          [prefix_pattern, suffix_pattern, escaped_prefix_pattern, unanchored_pattern],
+        self()
+      )
+
+      assert :ets.lookup(:ferricstore_pubsub_pattern_prefix_index, "anchored-prefix:") ==
+               [{"anchored-prefix:", prefix_pattern, :glob}]
+
+      assert :ets.lookup(:ferricstore_pubsub_pattern_suffix_index, ":anchored-suffix") ==
+               [{":anchored-suffix", suffix_pattern, :glob}]
+
+      assert :ets.lookup(:ferricstore_pubsub_pattern_prefix_index, "escaped:?prefix:") ==
+               [{"escaped:?prefix:", escaped_prefix_pattern, :glob}]
+
+      assert :ets.lookup(:ferricstore_pubsub_pattern_glob_index, unanchored_pattern) ==
+               [{unanchored_pattern}]
+
+      assert PubSub.publish("anchored-prefix:xxa", "prefix") == 1
+      assert_receive {:pubsub_pmessage, ^prefix_pattern, "anchored-prefix:xxa", "prefix"}
+
+      assert PubSub.publish("bxx:anchored-suffix", "suffix") == 1
+      assert_receive {:pubsub_pmessage, ^suffix_pattern, "bxx:anchored-suffix", "suffix"}
+
+      assert PubSub.publish("escaped:?prefix:xa", "escaped") == 1
+
+      assert_receive {:pubsub_pmessage, ^escaped_prefix_pattern, "escaped:?prefix:xa", "escaped"}
+
+      assert PubSub.publish("xmiddley", "fallback") == 1
+      assert_receive {:pubsub_pmessage, ^unanchored_pattern, "xmiddley", "fallback"}
+
+      PubSub.punsubscribe_many(
+        [prefix_pattern, suffix_pattern, escaped_prefix_pattern, unanchored_pattern],
+        self()
+      )
+
+      assert :ets.lookup(:ferricstore_pubsub_pattern_prefix_index, "anchored-prefix:") == []
+      assert :ets.lookup(:ferricstore_pubsub_pattern_suffix_index, ":anchored-suffix") == []
+      assert :ets.lookup(:ferricstore_pubsub_pattern_prefix_index, "escaped:?prefix:") == []
+      assert :ets.lookup(:ferricstore_pubsub_pattern_glob_index, unanchored_pattern) == []
+    end
+
     test "pubsub exposes bulk subscribe APIs so connection setup monitors once per command" do
       source = File.read!(Path.expand("../../../lib/ferricstore/pubsub.ex", __DIR__))
 
@@ -224,6 +419,55 @@ defmodule Ferricstore.Commands.PubSubTest do
       assert source =~ "def psubscribe_many(patterns, pid)"
       assert source =~ "def unsubscribe_many(channels, pid)"
       assert source =~ "def punsubscribe_many(patterns, pid)"
+    end
+
+    test "high-fanout subscription changes use thresholded cache mutation" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/pubsub.ex", __DIR__))
+
+      assert source =~ "@incremental_cache_fanout_threshold"
+      assert source =~ "@channel_memberships_table"
+      assert source =~ "refresh_exact_cache_after_add"
+      assert source =~ "refresh_pattern_cache_after_remove"
+
+      for table <- [
+            :ferricstore_pubsub_channel_memberships,
+            :ferricstore_pubsub_pattern_memberships
+          ] do
+        assert :ets.info(table, :protection) == :protected
+      end
+
+      subscribers = for _index <- 1..33, do: spawn(fn -> Process.sleep(:infinity) end)
+
+      on_exit(fn ->
+        Enum.each(subscribers, fn pid ->
+          if Process.alive?(pid), do: Process.exit(pid, :kill)
+        end)
+      end)
+
+      Enum.each(subscribers, fn pid ->
+        PubSub.subscribe("incremental", pid)
+        PubSub.psubscribe("incremental:*", pid)
+      end)
+
+      PubSub.subscribe("incremental", self())
+      PubSub.psubscribe("incremental:*", self())
+      PubSub.subscribe("incremental", self())
+      PubSub.psubscribe("incremental:*", self())
+
+      assert PubSub.publish("incremental", "exact") == 34
+      assert_receive {:pubsub_message, "incremental", "exact"}
+
+      assert PubSub.publish("incremental:value", "pattern") == 34
+      assert_receive {:pubsub_pmessage, "incremental:*", "incremental:value", "pattern"}
+
+      PubSub.unsubscribe("incremental", self())
+      PubSub.punsubscribe("incremental:*", self())
+
+      assert PubSub.publish("incremental", "exact") == 33
+      refute_receive {:pubsub_message, "incremental", "exact"}
+
+      assert PubSub.publish("incremental:value", "pattern") == 33
+      refute_receive {:pubsub_pmessage, "incremental:*", "incremental:value", "pattern"}
     end
   end
 
@@ -286,6 +530,24 @@ defmodule Ferricstore.Commands.PubSubTest do
       assert source =~ ":ets.next(@channels_table, channel)"
       refute channels_source =~ ":ets.tab2list"
     end
+
+    test "channels preclassifies simple filters once before walking the registry" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/pubsub.ex", __DIR__))
+      [channels_source] = Regex.run(~r/def channels\(pattern \\\\ nil\).*?^  end/ms, source)
+
+      assert channels_source =~ "pattern_matcher(pattern)"
+      assert source =~ "pattern_matches?(channel, matcher)"
+
+      PubSub.subscribe_many(
+        ["literal", "prefix:value", "value:suffix", "glob:a", "glob:b"],
+        self()
+      )
+
+      assert PubSub.channels("literal") == ["literal"]
+      assert PubSub.channels("prefix:*") == ["prefix:value"]
+      assert PubSub.channels("*:suffix") == ["value:suffix"]
+      assert Enum.sort(PubSub.channels("glob:[ab]")) == ["glob:a", "glob:b"]
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -315,6 +577,23 @@ defmodule Ferricstore.Commands.PubSubTest do
       assert result == ["nonexistent", 0]
     end
 
+    test "cached counts follow duplicate subscriptions, unsubscription, and cleanup" do
+      PubSub.subscribe("cached-count", self())
+      PubSub.subscribe("cached-count", self())
+      assert PubSub.numsub(["cached-count"]) == ["cached-count", 1]
+
+      PubSub.unsubscribe("cached-count", self())
+      assert PubSub.numsub(["cached-count"]) == ["cached-count", 0]
+
+      subscriber = spawn(fn -> Process.sleep(:infinity) end)
+      PubSub.subscribe("cached-count", subscriber)
+      assert PubSub.numsub(["cached-count"]) == ["cached-count", 1]
+
+      PubSub.cleanup(subscriber)
+      assert PubSub.numsub(["cached-count"]) == ["cached-count", 0]
+      Process.exit(subscriber, :kill)
+    end
+
     test "numsub builds the alternating reply without flat_map allocation" do
       source = File.read!(Path.expand("../../../lib/ferricstore/pubsub.ex", __DIR__))
 
@@ -322,6 +601,7 @@ defmodule Ferricstore.Commands.PubSubTest do
         Regex.run(~r/def numsub\(channel_list\).*?^  end/ms, source)
 
       assert numsub_source =~ "numsub_reply(channel_list, [])"
+      assert source =~ ":ets.lookup_element(@channel_cache_table, channel, 3, 0)"
 
       refute numsub_source =~ "Enum.flat_map",
              "NUMSUB replies are already ordered pairs; use a reverse accumulator instead of flat_map"

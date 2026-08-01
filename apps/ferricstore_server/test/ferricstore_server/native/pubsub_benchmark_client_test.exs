@@ -1,0 +1,248 @@
+Code.require_file(Path.expand("../../../../../bench/support/native_pubsub_client.exs", __DIR__))
+
+defmodule FerricstoreServer.Native.PubSubBenchmarkClientTest do
+  use ExUnit.Case, async: true
+
+  alias FerricstoreBench.NativePubSubClient
+  alias FerricstoreServer.Native.Codec
+  alias FerricstoreServer.Native.Connection.Responses
+
+  test "encodes Redis-compatible PubSub commands as native COMMAND_EXEC frames" do
+    frame = NativePubSubClient.command_exec_frame(7, "PUBLISH", ["orders", "ready"])
+    assert {:ok, [{0, 0x0100, 7, 0, body}], "", :done} = Codec.decode_frames(frame, 1_024)
+
+    assert {:ok, %{"command" => "PUBLISH", "args" => ["orders", "ready"]}} =
+             Codec.decode_body(body)
+
+    routed_frame =
+      NativePubSubClient.command_exec_frame(8, "PUBLISH", ["orders", "ready"], 3)
+
+    assert {:ok, [{3, 0x0100, 8, 0, _body}], "", :done} =
+             Codec.decode_frames(routed_frame, 1_024)
+  end
+
+  test "encodes a batch of publishes as one native PIPELINE frame" do
+    frame =
+      NativePubSubClient.publish_pipeline_frame(
+        19,
+        [{"orders", "one"}, {"orders", "two"}],
+        3
+      )
+
+    assert {:ok, [{3, 0x000E, 19, 0, body}], "", :done} = Codec.decode_frames(frame, 4_096)
+    assert {:ok, payload} = Codec.decode_body(body)
+    assert payload["atomicity"] == "none"
+    assert payload["return"] == "pairs"
+
+    assert [first, second] = payload["commands"]
+    assert first["request_id"] == 1
+    assert first["lane_id"] == 3
+    assert first["body"] == %{"command" => "PUBLISH", "args" => ["orders", "one"]}
+    assert second["request_id"] == 2
+    assert second["body"] == %{"command" => "PUBLISH", "args" => ["orders", "two"]}
+  end
+
+  test "decodes coalesced command responses and pushed PubSub events" do
+    response = Codec.encode_response(0x0100, 0, 9, :ok, 1)
+
+    event =
+      Codec.encode_event(0x0010, %{
+        "event" => "PUBSUB_MESSAGE",
+        "payload" => %{
+          "kind" => "message",
+          "channel" => "orders",
+          "message" => "ready"
+        }
+      })
+
+    assert {[%{request_id: 9, status: 0, value: 1}, decoded_event], ""} =
+             NativePubSubClient.decode_server_frames(response <> event)
+
+    assert decoded_event.request_id == 0
+    assert decoded_event.opcode == 0x0010
+    assert decoded_event.status == 0
+    assert decoded_event.value["event"] == "PUBSUB_MESSAGE"
+    assert decoded_event.value["payload"]["channel"] == "orders"
+  end
+
+  test "retains an incomplete pushed frame for the next socket read" do
+    frame = Codec.encode_event(0x0010, %{"event" => "PUBSUB_MESSAGE"})
+    split_at = byte_size(frame) - 3
+    <<partial::binary-size(split_at), final::binary>> = frame
+
+    assert {[], ^partial} = NativePubSubClient.decode_server_frames(partial)
+
+    assert {[%{request_id: 0, status: 0}], ""} =
+             NativePubSubClient.decode_server_frames(partial <> final)
+  end
+
+  test "batch-encodes message and pattern events as ordinary native frames" do
+    state = %{
+      compression: :none,
+      max_frame_bytes: 1_024,
+      max_response_bytes: 1_024,
+      response_chunk_bytes: 0
+    }
+
+    frames =
+      Responses.encode_pubsub_events(
+        state,
+        0x0010,
+        [
+          {:message, "orders", "ready"},
+          {:pmessage, "orders:*", "orders:priority", "urgent"}
+        ],
+        1_234
+      )
+
+    assert length(frames) == 2
+
+    assert {decoded, ""} =
+             frames
+             |> IO.iodata_to_binary()
+             |> NativePubSubClient.decode_server_frames()
+
+    assert [message, pattern] = Enum.map(decoded, & &1.value)
+
+    assert message == %{
+             "event" => "PUBSUB_MESSAGE",
+             "payload" => %{
+               "kind" => "message",
+               "channel" => "orders",
+               "message" => "ready"
+             },
+             "at_ms" => 1_234
+           }
+
+    assert pattern == %{
+             "event" => "PUBSUB_MESSAGE",
+             "payload" => %{
+               "kind" => "pmessage",
+               "pattern" => "orders:*",
+               "channel" => "orders:priority",
+               "message" => "urgent"
+             },
+             "at_ms" => 1_234
+           }
+  end
+
+  test "batch event encoding preserves the generic compressed framing fallback" do
+    state = %{
+      compression: :zlib,
+      max_frame_bytes: 1_024,
+      max_response_bytes: 1_024,
+      response_chunk_bytes: 0
+    }
+
+    [frame] =
+      Responses.encode_pubsub_events(
+        state,
+        0x0010,
+        [{:message, "orders", "ready"}],
+        1_234
+      )
+
+    payload = %{
+      "event" => "PUBSUB_MESSAGE",
+      "payload" => %{"kind" => "message", "channel" => "orders", "message" => "ready"},
+      "at_ms" => 1_234
+    }
+
+    assert frame == Responses.encode_event(state, 0x0010, payload)
+  end
+
+  test "batch event encoding preserves generic frame and response limits" do
+    payload = %{
+      "event" => "PUBSUB_MESSAGE",
+      "payload" => %{
+        "kind" => "message",
+        "channel" => "orders",
+        "message" => String.duplicate("x", 128)
+      },
+      "at_ms" => 1_234
+    }
+
+    for state <- [
+          %{
+            compression: :none,
+            max_frame_bytes: 64,
+            max_response_bytes: 1_024,
+            response_chunk_bytes: 0
+          },
+          %{
+            compression: :none,
+            max_frame_bytes: 1_024,
+            max_response_bytes: 64,
+            response_chunk_bytes: 0
+          }
+        ] do
+      [frames] =
+        Responses.encode_pubsub_events(
+          state,
+          0x0010,
+          [{:message, "orders", String.duplicate("x", 128)}],
+          1_234
+        )
+
+      assert frames == Responses.encode_event(state, 0x0010, payload)
+    end
+  end
+
+  test "validates publish counts and batches of pushed events for load benchmarks" do
+    assert 2 ==
+             NativePubSubClient.publish_count_from_frames(
+               [%{request_id: 17, status: 0, value: 2}],
+               17
+             )
+
+    frames =
+      Enum.map(1..3, fn _index ->
+        %{
+          opcode: 0x0010,
+          request_id: 0,
+          status: 0,
+          value: %{
+            "event" => "PUBSUB_MESSAGE",
+            "payload" => %{
+              "kind" => "message",
+              "channel" => "orders",
+              "message" => "ready"
+            }
+          }
+        }
+      end)
+
+    assert :ok = NativePubSubClient.validate_pubsub_frames(frames, "orders", "ready")
+
+    assert_raise RuntimeError, ~r/unexpected publish response/, fn ->
+      NativePubSubClient.publish_count_from_frames(
+        [%{request_id: 18, status: 0, value: 2}],
+        17
+      )
+    end
+
+    assert_raise RuntimeError, ~r/unexpected pushed event/, fn ->
+      NativePubSubClient.validate_pubsub_frames(frames, "other", "ready")
+    end
+  end
+
+  test "validates every result in a pipelined publish response" do
+    response = %{request_id: 44, status: 0, value: [["ok", 8], ["ok", 8], ["ok", 8]]}
+
+    assert :ok =
+             NativePubSubClient.validate_publish_pipeline_frames([response], 44, 3, 8)
+
+    assert_raise RuntimeError, ~r/unexpected pipelined publish response/, fn ->
+      NativePubSubClient.validate_publish_pipeline_frames([response], 44, 2, 8)
+    end
+
+    assert_raise RuntimeError, ~r/unexpected pipelined publish response/, fn ->
+      NativePubSubClient.validate_publish_pipeline_frames(
+        [%{response | value: [["ok", 8], ["ok", 7], ["ok", 8]]}],
+        44,
+        3,
+        8
+      )
+    end
+  end
+end

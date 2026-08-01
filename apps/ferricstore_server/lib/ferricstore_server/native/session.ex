@@ -494,7 +494,7 @@ defmodule FerricstoreServer.Native.Session do
       channels,
       state,
       :pubsub_channels,
-      &PS.subscribe_many/2,
+      &PS.subscribe_unique_many/2,
       "subscribe"
     )
   end
@@ -514,7 +514,7 @@ defmodule FerricstoreServer.Native.Session do
       channels,
       state,
       :pubsub_channels,
-      &PS.unsubscribe_many/2,
+      &PS.unsubscribe_unique_many/2,
       "unsubscribe"
     )
   end
@@ -524,7 +524,7 @@ defmodule FerricstoreServer.Native.Session do
       patterns,
       state,
       :pubsub_patterns,
-      &PS.psubscribe_many/2,
+      &PS.psubscribe_unique_many/2,
       "psubscribe"
     )
   end
@@ -544,7 +544,7 @@ defmodule FerricstoreServer.Native.Session do
       patterns,
       state,
       :pubsub_patterns,
-      &PS.punsubscribe_many/2,
+      &PS.punsubscribe_unique_many/2,
       "punsubscribe"
     )
   end
@@ -567,7 +567,7 @@ defmodule FerricstoreServer.Native.Session do
             detached_values = Map.values(detached)
 
             guarded_subscribe_fun = fn values, pid ->
-              case install_pubsub_delivery_guard(reserved_state, pid) do
+              case maybe_install_pubsub_delivery_guard(reserved_state, pid) do
                 :ok -> subscribe_fun.(values, pid)
                 {:error, _reason} = error -> error
               end
@@ -576,20 +576,14 @@ defmodule FerricstoreServer.Native.Session do
             case safe_pubsub_update(guarded_subscribe_fun, detached_values) do
               :ok ->
                 {acks, updated_state} =
-                  Enum.map_reduce(values, reserved_state, fn value, acc ->
-                    retained = Map.fetch!(acc, set_key)
-
-                    acc =
-                      case {MapSet.member?(retained, value), Map.fetch(detached, value)} do
-                        {false, {:ok, detached_value}} ->
-                          Map.put(acc, set_key, MapSet.put(retained, detached_value))
-
-                        _existing_or_duplicate ->
-                          acc
-                      end
-
-                    {[ack_kind, value, subscription_count(acc)], acc}
-                  end)
+                  subscribe_acks_and_state(
+                    values,
+                    reserved_state,
+                    set_key,
+                    detached,
+                    detached_values,
+                    ack_kind
+                  )
 
                 {:ok, acks, updated_state}
 
@@ -606,7 +600,9 @@ defmodule FerricstoreServer.Native.Session do
 
   defp unsubscribe_values(values, state, set_key, unsubscribe_fun, ack_kind) do
     state = ensure_pubsub_sets(state)
-    unsubscribe_fun.(values, self())
+    current = Map.fetch!(state, set_key)
+    removed_values = current |> MapSet.intersection(MapSet.new(values)) |> MapSet.to_list()
+    unsubscribe_fun.(removed_values, self())
 
     {acks, state} =
       Enum.map_reduce(values, state, fn value, acc ->
@@ -627,6 +623,45 @@ defmodule FerricstoreServer.Native.Session do
       end)
 
     {:ok, acks, sync_subscription_lease(state)}
+  end
+
+  defp subscribe_acks_and_state(
+         values,
+         state,
+         set_key,
+         detached,
+         detached_values,
+         ack_kind
+       )
+       when map_size(detached) == length(values) do
+    retained = MapSet.union(Map.fetch!(state, set_key), MapSet.new(detached_values))
+    updated_state = Map.put(state, set_key, retained)
+    {acks, _count} = subscription_acks(values, ack_kind, subscription_count(state), 1)
+    {acks, updated_state}
+  end
+
+  defp subscribe_acks_and_state(values, state, set_key, detached, _detached_values, ack_kind) do
+    Enum.map_reduce(values, state, fn value, acc ->
+      retained = Map.fetch!(acc, set_key)
+
+      acc =
+        case {MapSet.member?(retained, value), Map.fetch(detached, value)} do
+          {false, {:ok, detached_value}} ->
+            Map.put(acc, set_key, MapSet.put(retained, detached_value))
+
+          _existing_or_duplicate ->
+            acc
+        end
+
+      {[ack_kind, value, subscription_count(acc)], acc}
+    end)
+  end
+
+  defp subscription_acks(values, ack_kind, initial_count, delta) do
+    Enum.map_reduce(values, initial_count, fn value, count ->
+      count = count + delta
+      {[ack_kind, value, count], count}
+    end)
   end
 
   defp reserve_subscription_bytes(state, 0), do: {:ok, state}
@@ -732,6 +767,14 @@ defmodule FerricstoreServer.Native.Session do
   end
 
   defp install_pubsub_delivery_guard(_state, _pid), do: :ok
+
+  defp maybe_install_pubsub_delivery_guard(state, pid) do
+    if subscription_count(state) == 0 do
+      install_pubsub_delivery_guard(state, pid)
+    else
+      :ok
+    end
+  end
 
   defp subscription_set_bytes(values),
     do: Enum.reduce(values, 0, &(subscription_entry_bytes(&1) + &2))

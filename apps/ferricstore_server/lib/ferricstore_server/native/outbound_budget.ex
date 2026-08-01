@@ -121,6 +121,34 @@ defmodule FerricstoreServer.Native.OutboundBudget do
     ResourceBudget.release(lease.resource_budget, lease.resource_token)
   end
 
+  @spec release_many([t() | nil]) :: :ok
+  def release_many(leases) when is_list(leases) do
+    {local_bytes, resource_tokens} =
+      Enum.reduce(leases, {%{}, %{}}, fn
+        nil, acc ->
+          acc
+
+        %__MODULE__{} = lease, {local_bytes, resource_tokens} ->
+          {
+            Map.update(local_bytes, lease.counter, lease.bytes, &(&1 + lease.bytes)),
+            Map.update(
+              resource_tokens,
+              lease.resource_budget,
+              [lease.resource_token],
+              &[lease.resource_token | &1]
+            )
+          }
+      end)
+
+    Enum.each(local_bytes, fn {counter, bytes} -> release_local(counter, bytes) end)
+
+    Enum.each(resource_tokens, fn {resource_budget, tokens} ->
+      ResourceBudget.release_many(resource_budget, tokens)
+    end)
+
+    :ok
+  end
+
   defp reserve_local(counter, limit, bytes) do
     used = :atomics.get(counter, 1)
 

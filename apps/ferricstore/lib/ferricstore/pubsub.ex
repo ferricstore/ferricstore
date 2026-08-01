@@ -8,21 +8,41 @@ defmodule Ferricstore.PubSub do
 
   ## Architecture
 
-  Five ETS tables back the registry:
+  Thirteen ETS tables back the registry:
 
     * `:ferricstore_pubsub` — `{channel, pid}` entries for exact channel
       subscriptions. Uses a `:bag` so multiple pids can subscribe to the same
       channel while duplicate subscriptions from the same pid remain collapsed.
 
-    * `:ferricstore_pubsub_channel_cache` — `{channel, [pid]}` entries derived
-      from `:ferricstore_pubsub`. `PUBLISH` reads this table so the hot path
-      avoids copying and reducing `{channel, pid}` tuples on every exact publish.
+    * `:ferricstore_pubsub_channel_cache` —
+      `{channel, [delivery], subscriber_count}` entries
+      derived from `:ferricstore_pubsub`, where each delivery is an unguarded
+      pid or a guarded `{pid, guard}` pair. `PUBLISH` reads this table so the
+      hot path avoids copying subscription tuples and looking up each
+      subscriber's stable delivery guard on every exact publish.
+
+    * `:ferricstore_pubsub_pid_channels` — `{pid, channel}` reverse-index
+      entries used to clean up one subscriber without scanning the complete
+      channel registry.
 
     * `:ferricstore_pubsub_patterns` — `{pattern, pid, matcher}` entries for
       glob-pattern subscriptions (PSUBSCRIBE). Also a `:bag`.
 
-    * `:ferricstore_pubsub_pattern_cache` — `{pattern, subscriber_count}` rows
-      used by bounded observability snapshots.
+    * `:ferricstore_pubsub_pattern_cache` —
+      `{pattern, matcher, [delivery], subscriber_count}` rows used by pattern
+      publishes and bounded observability snapshots. Matching runs once per
+      unique pattern, rather than once per pattern subscription.
+
+    * `:ferricstore_pubsub_pid_patterns` — `{pid, pattern}` reverse-index
+      entries used for bounded per-subscriber pattern cleanup.
+
+    * Two membership sets keyed by `{pid, channel_or_pattern}` provide constant
+      time idempotence checks even when one client owns many subscriptions.
+
+    * Three matcher indexes map simple prefixes, simple suffixes, anchored
+      complex globs, and unanchored complex-glob fallbacks to cached pattern
+      rows. Large pattern registries use these indexes; small registries keep
+      the cheaper linear scan.
 
     * `:ferricstore_pubsub_monitors` — one monitor row per active subscriber.
 
@@ -54,11 +74,21 @@ defmodule Ferricstore.PubSub do
 
   @channels_table :ferricstore_pubsub
   @channel_cache_table :ferricstore_pubsub_channel_cache
+  @pid_channels_table :ferricstore_pubsub_pid_channels
+  @channel_memberships_table :ferricstore_pubsub_channel_memberships
   @patterns_table :ferricstore_pubsub_patterns
   @pattern_cache_table :ferricstore_pubsub_pattern_cache
+  @pid_patterns_table :ferricstore_pubsub_pid_patterns
+  @pattern_memberships_table :ferricstore_pubsub_pattern_memberships
+  @pattern_prefix_index_table :ferricstore_pubsub_pattern_prefix_index
+  @pattern_suffix_index_table :ferricstore_pubsub_pattern_suffix_index
+  @pattern_glob_index_table :ferricstore_pubsub_pattern_glob_index
   @monitors_table :ferricstore_pubsub_monitors
   @delivery_guards_table :ferricstore_pubsub_delivery_guards
   @delivery_overhead_bytes 128
+  @max_pattern_bytes 1024
+  @pattern_linear_scan_limit 16
+  @incremental_cache_fanout_threshold 32
 
   @type channel :: binary()
   @type pattern :: binary()
@@ -112,6 +142,14 @@ defmodule Ferricstore.PubSub do
 
   def subscribe_many(channels, pid) when is_list(channels) and is_pid(pid) do
     channels = unique_channels(channels)
+    subscribe_unique_many(channels, pid)
+  end
+
+  @doc false
+  @spec subscribe_unique_many([channel()], pid()) :: :ok
+  def subscribe_unique_many([], pid) when is_pid(pid), do: :ok
+
+  def subscribe_unique_many(channels, pid) when is_list(channels) and is_pid(pid) do
     exact_subscription_changed(channels, pid)
     ActivityLog.record_subscription("SUBSCRIBE", :channel, channels)
     :ok
@@ -147,6 +185,14 @@ defmodule Ferricstore.PubSub do
 
   def unsubscribe_many(channels, pid) when is_list(channels) and is_pid(pid) do
     channels = unique_channels(channels)
+    unsubscribe_unique_many(channels, pid)
+  end
+
+  @doc false
+  @spec unsubscribe_unique_many([channel()], pid()) :: :ok
+  def unsubscribe_unique_many([], pid) when is_pid(pid), do: :ok
+
+  def unsubscribe_unique_many(channels, pid) when is_list(channels) and is_pid(pid) do
     exact_unsubscription_changed(channels, pid)
     ActivityLog.record_subscription("UNSUBSCRIBE", :channel, channels)
     :ok
@@ -182,6 +228,14 @@ defmodule Ferricstore.PubSub do
 
   def psubscribe_many(patterns, pid) when is_list(patterns) and is_pid(pid) do
     patterns = unique_channels(patterns)
+    psubscribe_unique_many(patterns, pid)
+  end
+
+  @doc false
+  @spec psubscribe_unique_many([pattern()], pid()) :: :ok
+  def psubscribe_unique_many([], pid) when is_pid(pid), do: :ok
+
+  def psubscribe_unique_many(patterns, pid) when is_list(patterns) and is_pid(pid) do
     pattern_subscription_changed(patterns, pid)
     ActivityLog.record_subscription("PSUBSCRIBE", :pattern, patterns)
     :ok
@@ -216,6 +270,14 @@ defmodule Ferricstore.PubSub do
 
   def punsubscribe_many(patterns, pid) when is_list(patterns) and is_pid(pid) do
     patterns = unique_channels(patterns)
+    punsubscribe_unique_many(patterns, pid)
+  end
+
+  @doc false
+  @spec punsubscribe_unique_many([pattern()], pid()) :: :ok
+  def punsubscribe_unique_many([], pid) when is_pid(pid), do: :ok
+
+  def punsubscribe_unique_many(patterns, pid) when is_list(patterns) and is_pid(pid) do
     pattern_unsubscription_changed(patterns, pid)
     ActivityLog.record_subscription("PUNSUBSCRIBE", :pattern, patterns)
     :ok
@@ -240,29 +302,24 @@ defmodule Ferricstore.PubSub do
   def publish(channel, message) when is_binary(channel) and is_binary(message) do
     channel_count =
       case :ets.lookup(@channel_cache_table, channel) do
-        [{^channel, pids}] -> publish_exact_pids(pids, channel, message, 0)
-        [] -> 0
+        [{^channel, deliveries, _subscriber_count}] ->
+          bytes = byte_size(channel) + byte_size(message) + @delivery_overhead_bytes
+          publish_exact_deliveries(deliveries, channel, message, bytes, 0)
+
+        [] ->
+          0
       end
 
-    # Pattern subscribers
     pattern_count =
-      if :ets.info(@patterns_table, :size) == 0 do
-        0
-      else
-        :ets.foldl(
-          fn {pattern, pid, matcher}, count ->
-            if pattern_matches?(channel, matcher) do
-              case deliver_pattern(pid, pattern, channel, message) do
-                :sent -> count + 1
-                :rejected -> count
-              end
-            else
-              count
-            end
-          end,
-          0,
-          @patterns_table
-        )
+      case :ets.info(@pattern_cache_table, :size) do
+        0 ->
+          0
+
+        pattern_count when pattern_count <= @pattern_linear_scan_limit ->
+          publish_pattern_scan(channel, message)
+
+        _pattern_count ->
+          publish_pattern_indexes(channel, message)
       end
 
     total = channel_count + pattern_count
@@ -306,7 +363,8 @@ defmodule Ferricstore.PubSub do
   """
   @spec channels(pattern() | nil) :: [channel()]
   def channels(pattern \\ nil) do
-    collect_channels(:ets.first(@channels_table), pattern, [])
+    matcher = if is_binary(pattern), do: pattern_matcher(pattern), else: nil
+    collect_channels(:ets.first(@channels_table), matcher, [])
   end
 
   defp collect_channels(:"$end_of_table", _pattern, acc), do: Enum.reverse(acc)
@@ -315,13 +373,13 @@ defmodule Ferricstore.PubSub do
     collect_channels(:ets.next(@channels_table, channel), nil, [channel | acc])
   end
 
-  defp collect_channels(channel, pattern, acc) when is_binary(pattern) do
+  defp collect_channels(channel, matcher, acc) do
     next = :ets.next(@channels_table, channel)
 
-    if Ferricstore.GlobMatcher.match?(channel, pattern) do
-      collect_channels(next, pattern, [channel | acc])
+    if pattern_matches?(channel, matcher) do
+      collect_channels(next, matcher, [channel | acc])
     else
-      collect_channels(next, pattern, acc)
+      collect_channels(next, matcher, acc)
     end
   end
 
@@ -347,7 +405,7 @@ defmodule Ferricstore.PubSub do
   defp numsub_reply([], acc), do: Enum.reverse(acc)
 
   defp numsub_reply([channel | rest], acc) do
-    count = length(:ets.lookup(@channels_table, channel))
+    count = :ets.lookup_element(@channel_cache_table, channel, 3, 0)
     numsub_reply(rest, [count, channel | acc])
   end
 
@@ -411,9 +469,58 @@ defmodule Ferricstore.PubSub do
       write_concurrency: true
     ])
 
+    :ets.new(@pid_channels_table, [
+      :named_table,
+      :duplicate_bag,
+      :protected,
+      read_concurrency: true
+    ])
+
+    :ets.new(@channel_memberships_table, [
+      :named_table,
+      :set,
+      :protected,
+      read_concurrency: true
+    ])
+
     :ets.new(@patterns_table, [:named_table, :bag, :protected, read_concurrency: true])
 
     :ets.new(@pattern_cache_table, [
+      :named_table,
+      :set,
+      :protected,
+      read_concurrency: true
+    ])
+
+    :ets.new(@pid_patterns_table, [
+      :named_table,
+      :duplicate_bag,
+      :protected,
+      read_concurrency: true
+    ])
+
+    :ets.new(@pattern_memberships_table, [
+      :named_table,
+      :set,
+      :protected,
+      read_concurrency: true
+    ])
+
+    :ets.new(@pattern_prefix_index_table, [
+      :named_table,
+      :bag,
+      :protected,
+      read_concurrency: true
+    ])
+
+    :ets.new(@pattern_suffix_index_table, [
+      :named_table,
+      :bag,
+      :protected,
+      read_concurrency: true
+    ])
+
+    :ets.new(@pattern_glob_index_table, [
       :named_table,
       :set,
       :protected,
@@ -434,32 +541,49 @@ defmodule Ferricstore.PubSub do
 
   @impl true
   def handle_call({:exact_subscription_changed, channels, pid}, _from, state) do
-    :ets.insert(@channels_table, subscription_entries(channels, pid, []))
+    new_channels = missing_subscription_values(channels, pid, @channel_memberships_table)
+
+    if new_channels != [] do
+      :ets.insert(@channels_table, subscription_entries(new_channels, pid, []))
+      :ets.insert(@pid_channels_table, reverse_subscription_entries(new_channels, pid, []))
+      :ets.insert(@channel_memberships_table, membership_entries(new_channels, pid, []))
+      refresh_exact_cache_after_add(new_channels, delivery_for_pid(pid))
+    end
+
     ensure_monitor_local(pid)
-    rebuild_exact_channels(channels)
     {:reply, :ok, state}
   end
 
   @impl true
   def handle_call({:exact_unsubscription_changed, channels, pid}, _from, state) do
-    delete_exact_subscriptions(channels, pid)
-    rebuild_exact_channels(channels)
+    removed_channels = existing_subscription_values(channels, pid, @channel_memberships_table)
+    delete_exact_subscriptions(removed_channels, pid)
+    refresh_exact_cache_after_remove(removed_channels, pid)
     demonitor_if_unused(pid)
     {:reply, :ok, state}
   end
 
   @impl true
   def handle_call({:pattern_subscription_changed, patterns, pid}, _from, state) do
-    :ets.insert(@patterns_table, pattern_subscription_entries(patterns, pid, []))
+    new_patterns = missing_subscription_values(patterns, pid, @pattern_memberships_table)
+
+    if new_patterns != [] do
+      entries = pattern_subscription_entries(new_patterns, pid, [])
+      :ets.insert(@patterns_table, entries)
+      :ets.insert(@pid_patterns_table, reverse_subscription_entries(new_patterns, pid, []))
+      :ets.insert(@pattern_memberships_table, membership_entries(new_patterns, pid, []))
+      refresh_pattern_cache_after_add(entries, delivery_for_pid(pid))
+    end
+
     ensure_monitor_local(pid)
-    rebuild_patterns(patterns)
     {:reply, :ok, state}
   end
 
   @impl true
   def handle_call({:pattern_unsubscription_changed, patterns, pid}, _from, state) do
-    delete_pattern_subscriptions(patterns, pid)
-    rebuild_patterns(patterns)
+    removed_patterns = existing_subscription_values(patterns, pid, @pattern_memberships_table)
+    delete_pattern_subscriptions(removed_patterns, pid)
+    refresh_pattern_cache_after_remove(removed_patterns, pid)
     demonitor_if_unused(pid)
     {:reply, :ok, state}
   end
@@ -467,6 +591,8 @@ defmodule Ferricstore.PubSub do
   @impl true
   def handle_call({:set_delivery_guard, pid, guard}, _from, state) do
     :ets.insert(@delivery_guards_table, {pid, guard})
+    rebuild_exact_channels(exact_channels_for_pid(pid))
+    rebuild_patterns(patterns_for_pid(pid))
     ensure_monitor_local(pid)
     {:reply, :ok, state}
   end
@@ -474,6 +600,8 @@ defmodule Ferricstore.PubSub do
   @impl true
   def handle_call({:clear_delivery_guard, pid}, _from, state) do
     :ets.delete(@delivery_guards_table, pid)
+    rebuild_exact_channels(exact_channels_for_pid(pid))
+    rebuild_patterns(patterns_for_pid(pid))
     demonitor_if_unused(pid)
     {:reply, :ok, state}
   end
@@ -482,7 +610,7 @@ defmodule Ferricstore.PubSub do
   def handle_call({:cleanup, pid}, _from, state) do
     channels = exact_channels_for_pid(pid)
     patterns = patterns_for_pid(pid)
-    cleanup_pid(pid)
+    cleanup_pid(pid, channels, patterns)
     rebuild_exact_channels(channels)
     rebuild_patterns(patterns)
     demonitor_if_unused(pid)
@@ -496,7 +624,7 @@ defmodule Ferricstore.PubSub do
         channels = exact_channels_for_pid(pid)
         patterns = patterns_for_pid(pid)
         :ets.delete(@monitors_table, pid)
-        cleanup_pid(pid)
+        cleanup_pid(pid, channels, patterns)
         rebuild_exact_channels(channels)
         rebuild_patterns(patterns)
 
@@ -535,8 +663,30 @@ defmodule Ferricstore.PubSub do
     pattern_subscription_entries(rest, pid, [{pattern, pid, pattern_matcher(pattern)} | acc])
   end
 
+  defp reverse_subscription_entries([], _pid, acc), do: acc
+
+  defp reverse_subscription_entries([value | rest], pid, acc) do
+    reverse_subscription_entries(rest, pid, [{pid, value} | acc])
+  end
+
+  defp membership_entries([], _pid, acc), do: acc
+
+  defp membership_entries([value | rest], pid, acc) do
+    membership_entries(rest, pid, [{{pid, value}} | acc])
+  end
+
+  defp missing_subscription_values(values, pid, membership_table) do
+    Enum.reject(values, &:ets.member(membership_table, {pid, &1}))
+  end
+
+  defp existing_subscription_values(values, pid, membership_table) do
+    Enum.filter(values, &:ets.member(membership_table, {pid, &1}))
+  end
+
   defp delete_exact_subscriptions([channel | rest], pid) do
-    :ets.match_delete(@channels_table, {channel, pid})
+    :ets.delete_object(@channels_table, {channel, pid})
+    :ets.delete_object(@pid_channels_table, {pid, channel})
+    :ets.delete(@channel_memberships_table, {pid, channel})
     delete_exact_subscriptions(rest, pid)
   end
 
@@ -544,29 +694,35 @@ defmodule Ferricstore.PubSub do
 
   defp delete_pattern_subscriptions([pattern | rest], pid) do
     :ets.match_delete(@patterns_table, {pattern, pid, :_})
+    :ets.delete_object(@pid_patterns_table, {pid, pattern})
+    :ets.delete(@pattern_memberships_table, {pid, pattern})
     delete_pattern_subscriptions(rest, pid)
   end
 
   defp delete_pattern_subscriptions([], _pid), do: :ok
 
   defp channel_snapshot(limit) do
-    bounded_snapshot(@channel_cache_table, limit, :channel, fn {channel, pids} ->
-      %{channel: channel, subscribers: length(pids)}
-    end)
+    bounded_snapshot(@channel_cache_table, limit, :channel, &channel_snapshot_entry/1)
   rescue
     _ -> []
   catch
     :exit, _ -> []
   end
 
+  defp channel_snapshot_entry({channel, _deliveries, subscriber_count}) do
+    {channel, subscriber_count}
+  end
+
   defp pattern_snapshot(limit) do
-    bounded_snapshot(@pattern_cache_table, limit, :pattern, fn {pattern, subscribers} ->
-      %{pattern: pattern, subscribers: subscribers}
-    end)
+    bounded_snapshot(@pattern_cache_table, limit, :pattern, &pattern_snapshot_entry/1)
   rescue
     _ -> []
   catch
     :exit, _ -> []
+  end
+
+  defp pattern_snapshot_entry({pattern, _matcher, _deliveries, subscriber_count}) do
+    {pattern, subscriber_count}
   end
 
   defp active_subscriber_count, do: safe_ets_size(@monitors_table)
@@ -578,17 +734,28 @@ defmodule Ferricstore.PubSub do
       []
     else
       :ets.foldl(
-        fn row, acc -> insert_snapshot_entry(mapper.(row), acc, limit, name_key) end,
-        [],
+        fn row, entries ->
+          {name, subscribers} = mapper.(row)
+          insert_snapshot_entry(name, subscribers, entries, limit)
+        end,
+        :gb_sets.empty(),
         table
       )
+      |> :gb_sets.to_list()
+      |> Enum.map(fn {_rank, name, subscribers} ->
+        %{name_key => name, subscribers: subscribers}
+      end)
     end
   end
 
-  defp insert_snapshot_entry(entry, acc, limit, name_key) do
-    [entry | acc]
-    |> Enum.sort_by(fn item -> {-item.subscribers, Map.fetch!(item, name_key)} end)
-    |> Enum.take(limit)
+  defp insert_snapshot_entry(name, subscribers, entries, limit) do
+    entries = :gb_sets.add_element({-subscribers, name, subscribers}, entries)
+
+    if :gb_sets.size(entries) > limit do
+      :gb_sets.delete(:gb_sets.largest(entries), entries)
+    else
+      entries
+    end
   end
 
   defp safe_ets_size(table) do
@@ -629,15 +796,99 @@ defmodule Ferricstore.PubSub do
   end
 
   defp subscribed?(pid) do
-    :ets.match(@channels_table, {:_, pid}) != [] or
-      :ets.match(@patterns_table, {:_, pid, :_}) != []
+    :ets.member(@pid_channels_table, pid) or :ets.member(@pid_patterns_table, pid)
   end
 
-  defp cleanup_pid(pid) do
-    :ets.match_delete(@channels_table, {:_, pid})
-    :ets.match_delete(@patterns_table, {:_, pid, :_})
+  defp cleanup_pid(pid, channels, patterns) do
+    delete_exact_subscriptions(channels, pid)
+    delete_pattern_subscriptions(patterns, pid)
+    :ets.delete(@pid_channels_table, pid)
+    :ets.delete(@pid_patterns_table, pid)
     :ets.delete(@delivery_guards_table, pid)
   end
+
+  defp refresh_exact_cache_after_add([], _delivery), do: :ok
+
+  defp refresh_exact_cache_after_add([channel | rest], delivery) do
+    case :ets.lookup(@channel_cache_table, channel) do
+      [{^channel, deliveries, subscriber_count}]
+      when subscriber_count >= @incremental_cache_fanout_threshold ->
+        :ets.insert(
+          @channel_cache_table,
+          {channel, [delivery | deliveries], subscriber_count + 1}
+        )
+
+      _small_or_new_channel ->
+        rebuild_exact_channel(channel)
+    end
+
+    refresh_exact_cache_after_add(rest, delivery)
+  end
+
+  defp refresh_exact_cache_after_remove([], _pid), do: :ok
+
+  defp refresh_exact_cache_after_remove([channel | rest], pid) do
+    case :ets.lookup(@channel_cache_table, channel) do
+      [{^channel, deliveries, subscriber_count}]
+      when subscriber_count > @incremental_cache_fanout_threshold ->
+        remaining = remove_delivery_for_pid(deliveries, pid, [])
+        :ets.insert(@channel_cache_table, {channel, remaining, subscriber_count - 1})
+
+      _small_or_missing_channel ->
+        rebuild_exact_channel(channel)
+    end
+
+    refresh_exact_cache_after_remove(rest, pid)
+  end
+
+  defp refresh_pattern_cache_after_add([], _delivery), do: :ok
+
+  defp refresh_pattern_cache_after_add([{pattern, _pid, _matcher} | rest], delivery) do
+    case :ets.lookup(@pattern_cache_table, pattern) do
+      [{^pattern, existing_matcher, deliveries, subscriber_count}]
+      when subscriber_count >= @incremental_cache_fanout_threshold ->
+        :ets.insert(
+          @pattern_cache_table,
+          {pattern, existing_matcher, [delivery | deliveries], subscriber_count + 1}
+        )
+
+      _small_or_new_pattern ->
+        rebuild_pattern(pattern)
+    end
+
+    refresh_pattern_cache_after_add(rest, delivery)
+  end
+
+  defp refresh_pattern_cache_after_remove([], _pid), do: :ok
+
+  defp refresh_pattern_cache_after_remove([pattern | rest], pid) do
+    case :ets.lookup(@pattern_cache_table, pattern) do
+      [{^pattern, matcher, deliveries, subscriber_count}]
+      when subscriber_count > @incremental_cache_fanout_threshold ->
+        remaining = remove_delivery_for_pid(deliveries, pid, [])
+
+        :ets.insert(
+          @pattern_cache_table,
+          {pattern, matcher, remaining, subscriber_count - 1}
+        )
+
+      _small_or_missing_pattern ->
+        rebuild_pattern(pattern)
+    end
+
+    refresh_pattern_cache_after_remove(rest, pid)
+  end
+
+  defp remove_delivery_for_pid([pid | rest], pid, acc) when is_pid(pid),
+    do: Enum.reverse(acc, rest)
+
+  defp remove_delivery_for_pid([{pid, _guard} | rest], pid, acc),
+    do: Enum.reverse(acc, rest)
+
+  defp remove_delivery_for_pid([delivery | rest], pid, acc),
+    do: remove_delivery_for_pid(rest, pid, [delivery | acc])
+
+  defp remove_delivery_for_pid([], _pid, acc), do: Enum.reverse(acc)
 
   defp rebuild_exact_channels([]), do: :ok
 
@@ -647,45 +898,111 @@ defmodule Ferricstore.PubSub do
   end
 
   defp rebuild_exact_channel(channel) do
-    case exact_pids_for_channel(:ets.lookup(@channels_table, channel), []) do
-      [] -> :ets.delete(@channel_cache_table, channel)
-      pids -> :ets.insert(@channel_cache_table, {channel, pids})
+    case exact_deliveries_for_channel(:ets.lookup(@channels_table, channel), []) do
+      [] ->
+        :ets.delete(@channel_cache_table, channel)
+
+      deliveries ->
+        subscriber_count = length(deliveries)
+        :ets.insert(@channel_cache_table, {channel, deliveries, subscriber_count})
     end
   end
 
   defp rebuild_patterns([]), do: :ok
 
   defp rebuild_patterns([pattern | rest]) do
-    case :ets.lookup(@patterns_table, pattern) do
-      [] -> :ets.delete(@pattern_cache_table, pattern)
-      entries -> :ets.insert(@pattern_cache_table, {pattern, length(entries)})
-    end
-
+    rebuild_pattern(pattern)
     rebuild_patterns(rest)
   end
 
-  defp exact_pids_for_channel([{_channel, pid} | rest], acc) do
-    exact_pids_for_channel(rest, [pid | acc])
+  defp rebuild_pattern(pattern) do
+    case :ets.lookup(@patterns_table, pattern) do
+      [] ->
+        delete_pattern_index(pattern)
+        :ets.delete(@pattern_cache_table, pattern)
+
+      [{^pattern, _pid, matcher} | _rest] = entries ->
+        deliveries = pattern_deliveries(entries, [])
+        subscriber_count = length(deliveries)
+        :ets.insert(@pattern_cache_table, {pattern, matcher, deliveries, subscriber_count})
+        put_pattern_index(pattern, matcher)
+    end
   end
 
-  defp exact_pids_for_channel([], acc), do: acc
+  defp put_pattern_index(pattern, {:prefix, prefix}) do
+    :ets.insert(@pattern_prefix_index_table, {prefix, pattern, :direct})
+  end
+
+  defp put_pattern_index(pattern, {:suffix, suffix}) do
+    :ets.insert(@pattern_suffix_index_table, {suffix, pattern, :direct})
+  end
+
+  defp put_pattern_index(pattern, {:glob, pattern}) do
+    case complex_glob_anchor(pattern) do
+      {:prefix, prefix} ->
+        :ets.insert(@pattern_prefix_index_table, {prefix, pattern, :glob})
+
+      {:suffix, suffix} ->
+        :ets.insert(@pattern_suffix_index_table, {suffix, pattern, :glob})
+
+      :fallback ->
+        :ets.insert(@pattern_glob_index_table, {pattern})
+    end
+  end
+
+  defp put_pattern_index(_pattern, _direct_or_never_matcher), do: :ok
+
+  defp delete_pattern_index(pattern) do
+    case :ets.lookup(@pattern_cache_table, pattern) do
+      [{^pattern, {:prefix, prefix}, _deliveries, _subscriber_count}] ->
+        :ets.delete_object(@pattern_prefix_index_table, {prefix, pattern, :direct})
+
+      [{^pattern, {:suffix, suffix}, _deliveries, _subscriber_count}] ->
+        :ets.delete_object(@pattern_suffix_index_table, {suffix, pattern, :direct})
+
+      [{^pattern, {:glob, ^pattern}, _deliveries, _subscriber_count}] ->
+        delete_complex_glob_index(pattern)
+
+      _direct_never_or_missing ->
+        :ok
+    end
+  end
+
+  defp exact_deliveries_for_channel([{_channel, pid} | rest], acc) do
+    exact_deliveries_for_channel(rest, [delivery_for_pid(pid) | acc])
+  end
+
+  defp exact_deliveries_for_channel([], acc), do: acc
+
+  defp pattern_deliveries([{_pattern, pid, _matcher} | rest], acc) do
+    pattern_deliveries(rest, [delivery_for_pid(pid) | acc])
+  end
+
+  defp pattern_deliveries([], acc), do: acc
+
+  defp delivery_for_pid(pid) do
+    case :ets.lookup(@delivery_guards_table, pid) do
+      [] -> pid
+      [{^pid, guard}] -> {pid, guard}
+    end
+  end
 
   defp exact_channels_for_pid(pid) do
-    @channels_table
-    |> :ets.match({:"$1", pid})
-    |> exact_channels_from_match([])
+    @pid_channels_table
+    |> :ets.lookup(pid)
+    |> reverse_subscription_values([])
   end
 
   defp patterns_for_pid(pid) do
-    @patterns_table
-    |> :ets.match({:"$1", pid, :_})
-    |> exact_channels_from_match([])
+    @pid_patterns_table
+    |> :ets.lookup(pid)
+    |> reverse_subscription_values([])
   end
 
-  defp exact_channels_from_match([[channel] | rest], acc),
-    do: exact_channels_from_match(rest, [channel | acc])
+  defp reverse_subscription_values([{_pid, value} | rest], acc),
+    do: reverse_subscription_values(rest, [value | acc])
 
-  defp exact_channels_from_match([], acc), do: unique_channels(acc)
+  defp reverse_subscription_values([], acc), do: acc
 
   defp unique_channels(channels), do: unique_channels(channels, MapSet.new(), [])
 
@@ -699,22 +1016,312 @@ defmodule Ferricstore.PubSub do
 
   defp unique_channels([], _seen, acc), do: acc
 
-  defp publish_exact_pids([pid | rest], channel, message, count) do
+  defp publish_pattern_scan(channel, message) do
+    channel_size = byte_size(channel)
+    message_size = byte_size(message)
+
+    :ets.foldl(
+      fn {pattern, matcher, deliveries, _subscriber_count}, count ->
+        if pattern_matches?(channel, matcher) do
+          bytes = pattern_delivery_bytes(pattern, channel_size, message_size)
+
+          publish_pattern_deliveries(
+            deliveries,
+            pattern,
+            channel,
+            message,
+            bytes,
+            count
+          )
+        else
+          count
+        end
+      end,
+      0,
+      @pattern_cache_table
+    )
+  end
+
+  defp publish_pattern_indexes(channel, message) do
+    channel_size = byte_size(channel)
+    message_size = byte_size(message)
+
+    count =
+      publish_cached_pattern(
+        channel,
+        {:exact, channel},
+        channel,
+        message,
+        channel_size,
+        message_size,
+        0
+      )
+
+    count =
+      publish_cached_pattern(
+        "*",
+        :all,
+        channel,
+        message,
+        channel_size,
+        message_size,
+        count
+      )
+
+    index_limit = min(channel_size, @max_pattern_bytes - 1)
+
+    count =
+      publish_prefix_index_matches(
+        channel,
+        1,
+        index_limit,
+        message,
+        channel_size,
+        message_size,
+        count
+      )
+
+    count =
+      publish_suffix_index_matches(
+        channel,
+        1,
+        index_limit,
+        message,
+        channel_size,
+        message_size,
+        count
+      )
+
+    publish_glob_index_matches(channel, message, channel_size, message_size, count)
+  end
+
+  defp publish_cached_pattern(
+         pattern,
+         expected_matcher,
+         channel,
+         message,
+         channel_size,
+         message_size,
+         count
+       ) do
+    case :ets.lookup(@pattern_cache_table, pattern) do
+      [{^pattern, ^expected_matcher, deliveries, _subscriber_count}] ->
+        bytes = pattern_delivery_bytes(pattern, channel_size, message_size)
+        publish_pattern_deliveries(deliveries, pattern, channel, message, bytes, count)
+
+      _missing_or_different_matcher ->
+        count
+    end
+  end
+
+  defp publish_indexed_pattern(
+         pattern,
+         channel,
+         message,
+         channel_size,
+         message_size,
+         count
+       ) do
+    case :ets.lookup(@pattern_cache_table, pattern) do
+      [{^pattern, _matcher, deliveries, _subscriber_count}] ->
+        bytes = pattern_delivery_bytes(pattern, channel_size, message_size)
+        publish_pattern_deliveries(deliveries, pattern, channel, message, bytes, count)
+
+      [] ->
+        count
+    end
+  end
+
+  defp publish_prefix_index_matches(
+         _channel,
+         position,
+         limit,
+         _message,
+         _channel_size,
+         _message_size,
+         count
+       )
+       when position > limit,
+       do: count
+
+  defp publish_prefix_index_matches(
+         channel,
+         position,
+         limit,
+         message,
+         channel_size,
+         message_size,
+         count
+       ) do
+    prefix = binary_part(channel, 0, position)
+
+    count =
+      @pattern_prefix_index_table
+      |> :ets.lookup(prefix)
+      |> publish_pattern_index_candidates(
+        channel,
+        message,
+        channel_size,
+        message_size,
+        count
+      )
+
+    publish_prefix_index_matches(
+      channel,
+      position + 1,
+      limit,
+      message,
+      channel_size,
+      message_size,
+      count
+    )
+  end
+
+  defp publish_suffix_index_matches(
+         _channel,
+         length,
+         limit,
+         _message,
+         _channel_size,
+         _message_size,
+         count
+       )
+       when length > limit,
+       do: count
+
+  defp publish_suffix_index_matches(
+         channel,
+         length,
+         limit,
+         message,
+         channel_size,
+         message_size,
+         count
+       ) do
+    suffix = binary_part(channel, channel_size - length, length)
+
+    count =
+      @pattern_suffix_index_table
+      |> :ets.lookup(suffix)
+      |> publish_pattern_index_candidates(
+        channel,
+        message,
+        channel_size,
+        message_size,
+        count
+      )
+
+    publish_suffix_index_matches(
+      channel,
+      length + 1,
+      limit,
+      message,
+      channel_size,
+      message_size,
+      count
+    )
+  end
+
+  defp publish_glob_index_matches(channel, message, channel_size, message_size, count) do
+    :ets.foldl(
+      fn {pattern}, acc ->
+        if Ferricstore.GlobMatcher.match?(channel, pattern) do
+          publish_indexed_pattern(
+            pattern,
+            channel,
+            message,
+            channel_size,
+            message_size,
+            acc
+          )
+        else
+          acc
+        end
+      end,
+      count,
+      @pattern_glob_index_table
+    )
+  end
+
+  defp publish_pattern_index_candidates(
+         [{_anchor, pattern, :direct} | rest],
+         channel,
+         message,
+         channel_size,
+         message_size,
+         count
+       ) do
     next_count =
-      case deliver_exact(pid, channel, message) do
+      publish_indexed_pattern(pattern, channel, message, channel_size, message_size, count)
+
+    publish_pattern_index_candidates(
+      rest,
+      channel,
+      message,
+      channel_size,
+      message_size,
+      next_count
+    )
+  end
+
+  defp publish_pattern_index_candidates(
+         [{_anchor, pattern, :glob} | rest],
+         channel,
+         message,
+         channel_size,
+         message_size,
+         count
+       ) do
+    next_count =
+      if Ferricstore.GlobMatcher.match?(channel, pattern) do
+        publish_indexed_pattern(pattern, channel, message, channel_size, message_size, count)
+      else
+        count
+      end
+
+    publish_pattern_index_candidates(
+      rest,
+      channel,
+      message,
+      channel_size,
+      message_size,
+      next_count
+    )
+  end
+
+  defp publish_pattern_index_candidates(
+         [],
+         _channel,
+         _message,
+         _channel_size,
+         _message_size,
+         count
+       ),
+       do: count
+
+  defp pattern_delivery_bytes(pattern, channel_size, message_size) do
+    byte_size(pattern) + channel_size + message_size + @delivery_overhead_bytes
+  end
+
+  defp publish_exact_deliveries([delivery | rest], channel, message, bytes, count) do
+    next_count =
+      case deliver_exact(delivery, channel, message, bytes) do
         :sent -> count + 1
         :rejected -> count
       end
 
-    publish_exact_pids(rest, channel, message, next_count)
+    publish_exact_deliveries(rest, channel, message, bytes, next_count)
   end
 
-  defp publish_exact_pids([], _channel, _message, count), do: count
+  defp publish_exact_deliveries([], _channel, _message, _bytes, count), do: count
 
-  defp deliver_exact(pid, channel, message) do
-    bytes = byte_size(channel) + byte_size(message) + @delivery_overhead_bytes
+  defp deliver_exact(pid, channel, message, _bytes) when is_pid(pid) do
+    send(pid, {:pubsub_message, channel, message})
+    :sent
+  end
 
-    case reserve_delivery(pid, bytes) do
+  defp deliver_exact({pid, guard}, channel, message, bytes) do
+    case reserve_guarded_delivery(guard, bytes) do
       {:ok, nil} ->
         send(pid, {:pubsub_message, channel, message})
         :sent
@@ -728,11 +1335,40 @@ defmodule Ferricstore.PubSub do
     end
   end
 
-  defp deliver_pattern(pid, pattern, channel, message) do
-    bytes =
-      byte_size(pattern) + byte_size(channel) + byte_size(message) + @delivery_overhead_bytes
+  defp publish_pattern_deliveries(
+         [delivery | rest],
+         pattern,
+         channel,
+         message,
+         bytes,
+         count
+       ) do
+    next_count =
+      case deliver_pattern(delivery, pattern, channel, message, bytes) do
+        :sent -> count + 1
+        :rejected -> count
+      end
 
-    case reserve_delivery(pid, bytes) do
+    publish_pattern_deliveries(rest, pattern, channel, message, bytes, next_count)
+  end
+
+  defp publish_pattern_deliveries(
+         [],
+         _pattern,
+         _channel,
+         _message,
+         _bytes,
+         count
+       ),
+       do: count
+
+  defp deliver_pattern(pid, pattern, channel, message, _bytes) when is_pid(pid) do
+    send(pid, {:pubsub_pmessage, pattern, channel, message})
+    :sent
+  end
+
+  defp deliver_pattern({pid, guard}, pattern, channel, message, bytes) do
+    case reserve_guarded_delivery(guard, bytes) do
       {:ok, nil} ->
         send(pid, {:pubsub_pmessage, pattern, channel, message})
         :sent
@@ -746,17 +1382,11 @@ defmodule Ferricstore.PubSub do
     end
   end
 
-  defp reserve_delivery(pid, bytes) do
-    case :ets.lookup(@delivery_guards_table, pid) do
-      [] ->
-        {:ok, nil}
-
-      [{^pid, guard}] ->
-        case guard.(bytes) do
-          {:ok, lease} -> {:ok, lease}
-          {:error, _reason} -> :rejected
-          _invalid -> :rejected
-        end
+  defp reserve_guarded_delivery(guard, bytes) do
+    case guard.(bytes) do
+      {:ok, lease} -> {:ok, lease}
+      {:error, _reason} -> :rejected
+      _invalid -> :rejected
     end
   rescue
     _error -> :rejected
@@ -770,7 +1400,7 @@ defmodule Ferricstore.PubSub do
   end
 
   defp pattern_matcher(pattern) do
-    if byte_size(pattern) > 1024 do
+    if byte_size(pattern) > @max_pattern_bytes do
       :never
     else
       simple_pattern_matcher(pattern, 0, byte_size(pattern), 0, -1)
@@ -802,6 +1432,102 @@ defmodule Ferricstore.PubSub do
   end
 
   defp simple_pattern_matcher(pattern, _pos, _size, _star_count, _star_pos), do: {:glob, pattern}
+
+  defp delete_complex_glob_index(pattern) do
+    case complex_glob_anchor(pattern) do
+      {:prefix, prefix} ->
+        :ets.delete_object(@pattern_prefix_index_table, {prefix, pattern, :glob})
+
+      {:suffix, suffix} ->
+        :ets.delete_object(@pattern_suffix_index_table, {suffix, pattern, :glob})
+
+      :fallback ->
+        :ets.delete(@pattern_glob_index_table, pattern)
+    end
+  end
+
+  defp complex_glob_anchor(pattern) do
+    prefix = glob_literal_prefix(pattern, 0, byte_size(pattern), [])
+    suffix = glob_literal_suffix(pattern, 0, byte_size(pattern), [])
+
+    cond do
+      byte_size(prefix) >= byte_size(suffix) and prefix != "" -> {:prefix, prefix}
+      suffix != "" -> {:suffix, suffix}
+      true -> :fallback
+    end
+  end
+
+  defp glob_literal_prefix(pattern, position, size, acc) when position < size do
+    case :binary.at(pattern, position) do
+      ?\\ when position + 1 < size ->
+        glob_literal_prefix(
+          pattern,
+          position + 2,
+          size,
+          [:binary.at(pattern, position + 1) | acc]
+        )
+
+      ?\\ ->
+        glob_literal_prefix(pattern, position + 1, size, [?\\ | acc])
+
+      special when special in [?*, ??, ?[] ->
+        acc |> Enum.reverse() |> :erlang.list_to_binary()
+
+      literal ->
+        glob_literal_prefix(pattern, position + 1, size, [literal | acc])
+    end
+  end
+
+  defp glob_literal_prefix(_pattern, _position, _size, acc),
+    do: acc |> Enum.reverse() |> :erlang.list_to_binary()
+
+  defp glob_literal_suffix(pattern, position, size, acc) when position < size do
+    case :binary.at(pattern, position) do
+      ?\\ when position + 1 < size ->
+        glob_literal_suffix(
+          pattern,
+          position + 2,
+          size,
+          [:binary.at(pattern, position + 1) | acc]
+        )
+
+      ?\\ ->
+        glob_literal_suffix(pattern, position + 1, size, [?\\ | acc])
+
+      special when special in [?*, ??] ->
+        glob_literal_suffix(pattern, position + 1, size, [])
+
+      ?[ ->
+        case glob_character_class_end(pattern, position + 1, size) do
+          {:ok, next_position} ->
+            glob_literal_suffix(pattern, next_position, size, [])
+
+          :error ->
+            ""
+        end
+
+      literal ->
+        glob_literal_suffix(pattern, position + 1, size, [literal | acc])
+    end
+  end
+
+  defp glob_literal_suffix(_pattern, _position, _size, acc),
+    do: acc |> Enum.reverse() |> :erlang.list_to_binary()
+
+  defp glob_character_class_end(pattern, position, size) when position < size do
+    case :binary.at(pattern, position) do
+      ?\\ when position + 1 < size ->
+        glob_character_class_end(pattern, position + 2, size)
+
+      ?] ->
+        {:ok, position + 1}
+
+      _class_byte ->
+        glob_character_class_end(pattern, position + 1, size)
+    end
+  end
+
+  defp glob_character_class_end(_pattern, _position, _size), do: :error
 
   defp pattern_matches?(_channel, :all), do: true
   defp pattern_matches?(_channel, :never), do: false

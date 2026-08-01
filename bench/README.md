@@ -7,6 +7,16 @@ Useful local runners:
 | File | Purpose |
 | --- | --- |
 | `commands_bench.exs` | Embedded command microbenchmarks. |
+| `pubsub_bench.exs` | Embedded exact, guarded, and pattern Pub/Sub publish benchmark. |
+| `pubsub_activity_log_bench.exs` | Pub/Sub activity-log write, truncation, and bounded-read benchmark. |
+| `pubsub_channels_bench.exs` | PUBSUB CHANNELS literal, simple, and generic-glob filter cost. |
+| `pubsub_cleanup_bench.exs` | Disconnect cleanup and subscription-write cost in a high-cardinality registry. |
+| `pubsub_pattern_index_bench.exs` | Literal, prefix, suffix, and generic-glob pattern publish cost at high cardinality. |
+| `pubsub_session_bench.exs` | Native session subscription and acknowledgement batch cost. |
+| `pubsub_snapshot_bench.exs` | High-cardinality bounded Pub/Sub subscription snapshot benchmark. |
+| `pubsub_subscription_bench.exs` | Exact and pattern subscription cache-maintenance cost across fanouts. |
+| `native_pubsub_bench.exs` | End-to-end native TCP Pub/Sub publish acknowledgement and pushed-event delivery benchmark. |
+| `native_pubsub_load_bench.exs` | Saturated concurrent native publishers plus bounded slow-consumer eviction and fast-consumer isolation. |
 | `stream_bench.exs` | Replicated Stream append, trim, range, consumer-group, and same-key concurrency benchmark. |
 | `native_stream_bench.exs` | End-to-end Ferric TCP Stream producer benchmark: sequential `COMMAND_EXEC XADD`, auto-coalesced command bursts, and typed/compact pipelines. |
 | `stream_partition_bench.exs` | Single Stream versus whole-batch and mixed-topic producers across distinct shards and one shared shard. |
@@ -48,6 +58,26 @@ Useful local runners:
 | `query_storage_layout_bench.exs` | Previous duplicated-record LMDB layout versus compact QueryRow storage and authoritative-log hydration. |
 | `flow_lmdb_soak.exs` | Long-running Flow/LMDB projection soak using `ferric://`. |
 | `flow_state_lmdb_soak/` | Sectioned state-machine soak using `ferric://`. |
+
+The native Pub/Sub runners use real loopback TCP connections and validate every
+publisher acknowledgement and pushed event. The latency runner reports
+publishes/second; multiply by fanout for delivered messages/second:
+
+```bash
+MIX_ENV=bench mix bench.native_pubsub
+MIX_ENV=bench mix bench.native_pubsub_load
+```
+
+The load runner measures the `1,4,16` publisher matrix by default. Override it
+with `BENCH_PUBSUB_CONCURRENCIES`, `BENCH_PUBSUB_PUBLISHES_PER_PUBLISHER`,
+`BENCH_PUBSUB_LOAD_FANOUT`, `BENCH_PUBSUB_COALESCE_MAX`, and
+`BENCH_PUBSUB_PUBLISH_PIPELINE`. A publish-pipeline value greater than one sends
+that many `PUBLISH` commands through one native `PIPELINE` round trip while
+still validating every result and pushed event. The runner restarts the server
+before its slow-consumer phase so the throughput matrix uses the production
+outbound budget while eviction uses an intentionally tight bound. The run fails
+if any response/event count is wrong, the slow subscriber is not evicted, or the
+fast subscriber stops receiving.
 
 Native-protocol SET/GET and DBOS-style workflow benchmarks live in the Python
 SDK repository. The in-tree native Stream runner is intentionally self-contained
