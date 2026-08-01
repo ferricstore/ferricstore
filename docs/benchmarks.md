@@ -69,6 +69,30 @@ larger inputs sequentially. Callers can choose a smaller explicit batch for a
 tighter latency or partial-failure boundary; payload size and subscriber fanout
 still need workload-specific measurement.
 
+### Negotiated PubSub batch events
+
+With the same 65,536 publishes per publisher, depth 1,024, 256-byte payload,
+and compact-mode-35 workload, three-sample medians compare the legacy event
+frames with `pubsub_batch_v1` negotiated on every subscriber:
+
+| Fanout | Publishers | Legacy publishes/s | Batch-event publishes/s | Change | Batch-event deliveries/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 359,286 | 685,588 | +90.8% | 685,588 |
+| 1 | 4 | 396,652 | 635,082 | +60.1% | 635,082 |
+| 8 | 1 | 152,361 | 295,206 | +93.8% | 2.36M |
+| 8 | 4 | 165,958 | 293,794 | +77.0% | 2.35M |
+
+For a 1,024-message batch with 256-byte values, one subscriber's encoded
+output fell from 1,024 frames and 422,912 bytes to one frame and 267,428 bytes
+(-36.8%). The encoder result also fell from 67,622 retained heap words to 10
+because the batch is held by one encoded binary. Ordinary single-publish memory
+was unchanged in the matched Benchee gate.
+
+For homogeneous batches with eight matching pattern subscribers, resolving a
+complex pattern once per channel batch reduced the 1,024-message median from
+5.64 ms to 3.05 ms (-45.9%) while retaining exact-before-pattern ordering for
+every message.
+
 ## FerricStore Streams: local optimization baseline
 
 These development numbers were recorded on an Apple M4 Max with a one-node

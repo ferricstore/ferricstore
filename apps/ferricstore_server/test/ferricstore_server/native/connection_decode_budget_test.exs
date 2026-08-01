@@ -7,6 +7,7 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
 
   @hello_opcode 0x0001
+  @startup_opcode 0x000C
   @ping_opcode 0x0003
   @options_opcode 0x000B
   @command_exec_opcode 0x0100
@@ -541,6 +542,51 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
     assert Ferricstore.PubSub.publish_many([{channel, "one"}, {channel, "two"}]) == [1, 1]
     assert [_first, _second] = receive_native_frames(socket, 2)
 
+    assert eventually(fn -> ResourceBudget.usage(ResourceBudget).outbound_bytes == 0 end)
+  end
+
+  @tag :native_outbound_byte_budget
+  test "negotiated pubsub batches emit one ordered batch event frame" do
+    previous_limit =
+      Application.get_env(:ferricstore, :native_max_outbound_bytes_per_connection)
+
+    Application.put_env(:ferricstore, :native_max_outbound_bytes_per_connection, 1_024 * 1_024)
+
+    on_exit(fn ->
+      restore_env(:native_max_outbound_bytes_per_connection, previous_limit)
+    end)
+
+    assert eventually(fn -> ResourceBudget.usage(ResourceBudget).outbound_bytes == 0 end)
+
+    channel =
+      "native:outbound:pubsub-negotiated-batch:#{System.unique_integer([:positive, :monotonic])}"
+
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    startup_body = Codec.encode_value(%{"compact_response_codecs" => ["pubsub_batch_v1"]})
+    assert :ok = :gen_tcp.send(socket, Codec.encode_frame(@startup_opcode, 0, 244, startup_body))
+    assert [{244, 0}] = receive_response_statuses(socket, 1)
+
+    assert :ok = :gen_tcp.send(socket, command_exec_frame(245, "SUBSCRIBE", [channel]))
+    assert [{245, 0}] = receive_response_statuses(socket, 1)
+
+    assert Ferricstore.PubSub.publish_many([{channel, "one"}, {channel, "two"}]) == [1, 1]
+    assert [body] = receive_native_frames(socket, 1)
+    assert <<0::unsigned-16, value_body::binary>> = body
+    assert {:ok, value} = Codec.decode_body(value_body)
+
+    assert value == %{
+             "event" => "PUBSUB_MESSAGE",
+             "payload" => %{
+               "kind" => "message_batch",
+               "channel" => channel,
+               "messages" => ["one", "two"]
+             },
+             "at_ms" => value["at_ms"]
+           }
+
+    assert {:error, :timeout} = :gen_tcp.recv(socket, 0, 25)
     assert eventually(fn -> ResourceBudget.usage(ResourceBudget).outbound_bytes == 0 end)
   end
 

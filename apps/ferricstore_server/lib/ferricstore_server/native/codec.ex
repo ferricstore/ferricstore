@@ -91,7 +91,8 @@ defmodule FerricstoreServer.Native.Codec do
       "kv_get_v1" => @compact_kv_get_opcodes,
       "kv_mget_v1" => @compact_kv_mget_opcodes,
       "ok_list_v1" => @compact_ok_list_opcodes,
-      "pipeline_v1" => @compact_pipeline_opcodes
+      "pipeline_v1" => @compact_pipeline_opcodes,
+      "pubsub_batch_v1" => [0x0010]
     }
   end
 

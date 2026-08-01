@@ -616,6 +616,22 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert payload.capabilities.response_codecs.selected_compact == ["flow_query_result_v1"]
   end
 
+  test "STARTUP negotiates batched PubSub events explicitly" do
+    assert {:ok, payload, negotiated} =
+             Commands.execute(
+               @op_startup,
+               %{"compact_response_codecs" => ["pubsub_batch_v1"]},
+               state()
+             )
+
+    assert negotiated.compact_response_codecs == MapSet.new(["pubsub_batch_v1"])
+    assert payload.capabilities.response_codecs.selected_compact == ["pubsub_batch_v1"]
+
+    assert payload.capabilities.response_codecs.compact_response_opcodes["pubsub_batch_v1"] == [
+             0x0010
+           ]
+  end
+
   test "STARTUP rejects malformed, duplicate, and unsupported response codec requests" do
     for {response_codecs, expected} <- [
           {"flow_query_result_v1", "must be a list"},
@@ -651,7 +667,8 @@ defmodule FerricstoreServer.Native.CommandsTest do
              "kv_get_v1" => [0x0101],
              "kv_mget_v1" => [0x0104, 0x020C],
              "ok_list_v1" => [0x0102, 0x0105, 0x020F, 0x0210, 0x0212, 0x0213, 0x0214],
-             "pipeline_v1" => [0x000E]
+             "pipeline_v1" => [0x000E],
+             "pubsub_batch_v1" => [0x0010]
            }
 
     assert payload.pipeline == %{

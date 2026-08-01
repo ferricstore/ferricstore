@@ -3,6 +3,7 @@ defmodule FerricstoreBench.NativePubSubClient do
 
   alias FerricstoreServer.Native.Codec
 
+  @op_hello 0x0001
   @op_pipeline 0x000E
   @op_command_exec 0x0100
   @op_event 0x0010
@@ -26,6 +27,22 @@ defmodule FerricstoreBench.NativePubSubClient do
   def command_exec_frame(request_id, command, args, lane_id \\ 0) do
     body = Codec.encode_value(%{"command" => command, "args" => args})
     Codec.encode_frame(@op_command_exec, lane_id, request_id, body)
+  end
+
+  def pubsub_batch_hello_frame(request_id) do
+    body =
+      Codec.encode_value(%{
+        "compact_flow_responses" => false,
+        "compact_response_codecs" => ["pubsub_batch_v1"]
+      })
+
+    Codec.encode_frame(@op_hello, 0, request_id, body)
+  end
+
+  def negotiate_pubsub_batches(socket, request_id) do
+    frame = pubsub_batch_hello_frame(request_id)
+    {_hello, ""} = command_round_trip(socket, frame, request_id)
+    :ok
   end
 
   def publish_pipeline_frame(request_id, publishes, lane_id \\ 0) when is_list(publishes) do
@@ -169,8 +186,14 @@ defmodule FerricstoreBench.NativePubSubClient do
   end
 
   def validate_pubsub_frames(frames, channel, message) when is_list(frames) do
-    Enum.each(frames, &validate_pubsub_frame(&1, channel, message))
+    _delivery_count = pubsub_delivery_count(frames, channel, message)
     :ok
+  end
+
+  def pubsub_delivery_count(frames, channel, message) when is_list(frames) do
+    Enum.reduce(frames, 0, fn frame, count ->
+      count + validate_pubsub_frame(frame, channel, message)
+    end)
   end
 
   def command_round_trip(socket, frame, request_id) do
@@ -224,21 +247,22 @@ defmodule FerricstoreBench.NativePubSubClient do
                     inspect(reason)
         end
 
-      {frames, rest} when length(frames) <= remaining ->
-        :ok = validate_pubsub_frames(frames, channel, message)
+      {frames, rest} ->
+        deliveries = pubsub_delivery_count(frames, channel, message)
 
-        receive_pubsub_many(
-          socket,
-          channel,
-          message,
-          remaining - length(frames),
-          rest,
-          deadline
-        )
-
-      {frames, _rest} ->
-        raise "native PubSub load benchmark received #{length(frames)} frames with only " <>
-                "#{remaining} expected"
+        if deliveries <= remaining do
+          receive_pubsub_many(
+            socket,
+            channel,
+            message,
+            remaining - deliveries,
+            rest,
+            deadline
+          )
+        else
+          raise "native PubSub load benchmark received #{deliveries} deliveries with only " <>
+                  "#{remaining} expected"
+        end
     end
   end
 
@@ -259,7 +283,30 @@ defmodule FerricstoreBench.NativePubSubClient do
          channel,
          message
        ),
-       do: :ok
+       do: 1
+
+  defp validate_pubsub_frame(
+         %{
+           opcode: @op_event,
+           request_id: 0,
+           status: 0,
+           value: %{
+             "event" => "PUBSUB_MESSAGE",
+             "payload" => %{
+               "kind" => "message_batch",
+               "channel" => channel,
+               "messages" => messages
+             }
+           }
+         },
+         channel,
+         message
+       )
+       when is_list(messages) and messages != [] do
+    if Enum.all?(messages, &(&1 == message)),
+      do: length(messages),
+      else: raise("native PubSub benchmark received a batch with an unexpected message")
+  end
 
   defp validate_pubsub_frame(unexpected, _channel, _message) do
     raise "native PubSub benchmark received an unexpected pushed event: #{inspect(unexpected)}"

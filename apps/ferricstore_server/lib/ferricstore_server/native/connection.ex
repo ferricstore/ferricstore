@@ -1668,9 +1668,15 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp send_pubsub_batch(state, channel, messages, lease) do
-    descriptors = Enum.map(messages, &{:message, channel, &1})
+    encoded =
+      if pubsub_batch_codec_selected?(state) do
+        safe_encode_guarded_pubsub_batch(state, channel, messages)
+      else
+        descriptors = Enum.map(messages, &{:message, channel, &1})
+        safe_encode_guarded_pubsub_events(state, descriptors)
+      end
 
-    case safe_encode_guarded_pubsub_events(state, descriptors) do
+    case encoded do
       {:ok, frames} ->
         case ensure_pubsub_batch_iodata(lease, frames) do
           {:ok, lease} ->
@@ -1774,6 +1780,27 @@ defmodule FerricstoreServer.Native.Connection do
     error -> {:error, error}
   catch
     kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp safe_encode_guarded_pubsub_batch(state, channel, messages) do
+    {:ok,
+     Responses.encode_pubsub_message_batch(
+       state,
+       Commands.event_opcode(),
+       channel,
+       messages,
+       System.system_time(:millisecond)
+     )}
+  rescue
+    error -> {:error, error}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp pubsub_batch_codec_selected?(state) do
+    state
+    |> Map.get(:compact_response_codecs, MapSet.new())
+    |> MapSet.member?("pubsub_batch_v1")
   end
 
   defp close_for_outbound_failure(state) do

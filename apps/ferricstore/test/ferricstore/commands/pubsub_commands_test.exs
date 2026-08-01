@@ -257,6 +257,28 @@ defmodule Ferricstore.Commands.PubSubTest do
              ]
     end
 
+    test "homogeneous pattern batches match a complex channel only once" do
+      pattern = "trace-?-*"
+      channel = "trace-a-orders"
+      PubSub.psubscribe(pattern, self())
+      matcher = {Ferricstore.PubSub, :pattern_matches?, 2}
+      tracer = spawn(fn -> glob_match_trace_loop(0) end)
+
+      :erlang.trace_pattern(matcher, true, [:local])
+      :erlang.trace(self(), true, [:call, {:tracer, tracer}])
+
+      try do
+        assert PubSub.publish_many([{channel, "one"}, {channel, "two"}]) == [1, 1]
+
+        send(tracer, {:report, self()})
+        assert_receive {:glob_match_calls, 1}
+      after
+        :erlang.trace(self(), false, [:call])
+        :erlang.trace_pattern(matcher, false, [:local])
+        Process.exit(tracer, :kill)
+      end
+    end
+
     test "mixed-channel batches preserve publish and delivery order" do
       PubSub.subscribe_many(["mixed-a", "mixed-b"], self())
 
@@ -566,6 +588,16 @@ defmodule Ferricstore.Commands.PubSubTest do
 
       assert PubSub.publish("incremental:value", "pattern") == 33
       refute_receive {:pubsub_pmessage, "incremental:*", "incremental:value", "pattern"}
+    end
+  end
+
+  defp glob_match_trace_loop(count) do
+    receive do
+      {:trace, _pid, :call, {Ferricstore.PubSub, :pattern_matches?, [_channel, _matcher]}} ->
+        glob_match_trace_loop(count + 1)
+
+      {:report, caller} ->
+        send(caller, {:glob_match_calls, count})
     end
   end
 

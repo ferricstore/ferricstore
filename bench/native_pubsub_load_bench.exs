@@ -44,6 +44,7 @@ load_outbound_bytes = env_integer.("BENCH_PUBSUB_LOAD_OUTBOUND_BYTES", "13421772
 coalesce_max = env_integer.("BENCH_PUBSUB_COALESCE_MAX", "64", 1)
 publish_pipeline = env_integer.("BENCH_PUBSUB_PUBLISH_PIPELINE", "1", 1)
 skip_slow_phase = System.get_env("BENCH_PUBSUB_SKIP_SLOW_PHASE", "0") == "1"
+batch_events = System.get_env("BENCH_PUBSUB_BATCH_EVENTS", "0") == "1"
 
 pipeline_encoding =
   case System.get_env("BENCH_PUBSUB_PIPELINE_ENCODING", "generic") do
@@ -109,6 +110,10 @@ run_concurrent = fn concurrency ->
   subscribers =
     Enum.map(1..fanout, fn index ->
       {:ok, socket} = NativePubSubClient.connect(port)
+
+      if batch_events,
+        do: :ok = NativePubSubClient.negotiate_pubsub_batches(socket, 100_000 + index)
+
       :ok = NativePubSubClient.subscribe(socket, channel, index)
       socket
     end)
@@ -228,6 +233,7 @@ IO.puts(
     "coalesce_max=#{coalesce_max} " <>
     "publish_pipeline=#{publish_pipeline} " <>
     "pipeline_encoding=#{pipeline_encoding} " <>
+    "batch_events=#{batch_events} " <>
     "activity_log_max_len=#{activity_log_max_len} " <>
     "activity_log_sample_every=#{activity_log_sample_every}"
 )
@@ -297,6 +303,10 @@ slow_results =
       )
 
     {:ok, fast_socket} = NativePubSubClient.connect(slow_port)
+
+    if batch_events,
+      do: :ok = NativePubSubClient.negotiate_pubsub_batches(fast_socket, 200_000 + sample)
+
     :ok = NativePubSubClient.subscribe(fast_socket, channel, 40_000 + sample)
 
     fast_reader =
@@ -310,6 +320,10 @@ slow_results =
     send(fast_reader.pid, :start)
 
     {:ok, slow_socket} = NativePubSubClient.connect(slow_port, recbuf: 1_024)
+
+    if batch_events,
+      do: :ok = NativePubSubClient.negotiate_pubsub_batches(slow_socket, 300_000 + sample)
+
     :ok = NativePubSubClient.subscribe(slow_socket, channel, 50_000 + sample)
 
     started = System.monotonic_time(:microsecond)

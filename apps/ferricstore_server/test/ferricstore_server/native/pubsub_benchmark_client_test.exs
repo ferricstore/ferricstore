@@ -21,6 +21,18 @@ defmodule FerricstoreServer.Native.PubSubBenchmarkClientTest do
              Codec.decode_frames(routed_frame, 1_024)
   end
 
+  test "encodes explicit PubSub batch capability negotiation as a native HELLO frame" do
+    frame = NativePubSubClient.pubsub_batch_hello_frame(11)
+
+    assert {:ok, [{0, 0x0001, 11, 0, body}], "", :done} = Codec.decode_frames(frame, 1_024)
+
+    assert {:ok,
+            %{
+              "compact_flow_responses" => false,
+              "compact_response_codecs" => ["pubsub_batch_v1"]
+            }} = Codec.decode_body(body)
+  end
+
   test "encodes a batch of publishes as one native PIPELINE frame" do
     frame =
       NativePubSubClient.publish_pipeline_frame(
@@ -160,6 +172,39 @@ defmodule FerricstoreServer.Native.PubSubBenchmarkClientTest do
            }
   end
 
+  test "encodes one negotiated batch envelope with ordered message payloads" do
+    state = %{
+      compression: :none,
+      max_frame_bytes: 1_024,
+      max_response_bytes: 1_024,
+      response_chunk_bytes: 0
+    }
+
+    [encoded] =
+      Responses.encode_pubsub_message_batch(
+        state,
+        0x0010,
+        "orders",
+        ["one", "two", "three"],
+        1_234
+      )
+
+    assert {[frame], ""} =
+             encoded
+             |> IO.iodata_to_binary()
+             |> NativePubSubClient.decode_server_frames()
+
+    assert frame.value == %{
+             "event" => "PUBSUB_MESSAGE",
+             "payload" => %{
+               "kind" => "message_batch",
+               "channel" => "orders",
+               "messages" => ["one", "two", "three"]
+             },
+             "at_ms" => 1_234
+           }
+  end
+
   test "batch event encoding preserves the generic compressed framing fallback" do
     state = %{
       compression: :zlib,
@@ -247,6 +292,22 @@ defmodule FerricstoreServer.Native.PubSubBenchmarkClientTest do
       end)
 
     assert :ok = NativePubSubClient.validate_pubsub_frames(frames, "orders", "ready")
+
+    batch_frame = %{
+      opcode: 0x0010,
+      request_id: 0,
+      status: 0,
+      value: %{
+        "event" => "PUBSUB_MESSAGE",
+        "payload" => %{
+          "kind" => "message_batch",
+          "channel" => "orders",
+          "messages" => ["ready", "ready", "ready"]
+        }
+      }
+    }
+
+    assert 3 == NativePubSubClient.pubsub_delivery_count([batch_frame], "orders", "ready")
 
     assert_raise RuntimeError, ~r/unexpected publish response/, fn ->
       NativePubSubClient.publish_count_from_frames(

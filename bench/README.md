@@ -84,9 +84,11 @@ Set `BENCH_PUBSUB_SKIP_SLOW_PHASE=1` only when repeatedly sampling the
 throughput matrix; the default still runs the full isolation gate.
 
 Compact mode 35 also exercises batch-aware exact-channel fanout. One pipeline
-resolves subscribers once, reserves and enqueues once per subscriber, and sends
-the unchanged individual event frames together. When pattern subscriptions are
-present, it retains per-item delivery to preserve exact/pattern event ordering.
+resolves subscribers once and reserves and enqueues once per subscriber.
+Legacy clients receive the unchanged individual event frames together; clients
+that negotiate `pubsub_batch_v1` receive one ordered batch event. Homogeneous
+batches with a bounded pattern set resolve matching patterns once while
+preserving exact/pattern event ordering.
 Typed pipelines containing only `PUBLISH` commands reuse this fanout path on
 eligible full-access connections, so the optimization does not depend on
 compact request support.
@@ -101,6 +103,11 @@ one publisher and 1.48M for four, improving 32-36% over depth 512. SDKs therefor
 cap `publish_many` requests at 1,024 and sequentially split larger inputs.
 Smaller explicit batches remain useful when latency or partial-failure scope is
 more important than peak throughput.
+
+Set `BENCH_PUBSUB_BATCH_EVENTS=1` to negotiate the batch event codec for each
+subscriber. The load runner counts and validates logical messages inside a
+batch, so the correctness totals remain directly comparable with legacy
+per-message framing.
 
 Native-protocol SET/GET and DBOS-style workflow benchmarks live in the Python
 SDK repository. The in-tree native Stream runner is intentionally self-contained

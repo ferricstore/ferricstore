@@ -51,6 +51,17 @@ defmodule FerricstoreServer.Native.Connection.Responses do
     end)
   end
 
+  @doc false
+  def encode_pubsub_message_batch(state, opcode, channel, messages, at_ms)
+      when is_binary(channel) and is_list(messages) and is_integer(opcode) and
+             is_integer(at_ms) do
+    encode_event(state, opcode, %{
+      event: @pubsub_event,
+      payload: %{kind: "message_batch", channel: channel, messages: messages},
+      at_ms: at_ms
+    })
+  end
+
   defp response_chunk_bytes(state) do
     max_frame_bytes =
       Map.get(state, :max_frame_bytes) ||

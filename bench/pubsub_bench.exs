@@ -42,6 +42,7 @@ if subscriber_counts == [] do
 end
 
 pattern_subscribers = env_integer.("BENCH_PUBSUB_PATTERN_SUBSCRIBERS", "64", 1)
+pattern_batch_size = env_integer.("BENCH_PUBSUB_PATTERN_BATCH_SIZE", "1024", 1)
 message_bytes = env_integer.("BENCH_PUBSUB_MESSAGE_BYTES", "256", 0)
 activity_log_max_len = env_integer.("BENCH_PUBSUB_ACTIVITY_LOG_MAX_LEN", "512", 0)
 warmup = env_number.("BENCH_WARMUP", "2")
@@ -204,6 +205,10 @@ pattern_pids =
 
 ^pattern_subscribers = PubSub.publish(pattern_channel, message)
 0 = PubSub.publish(miss_channel, message)
+pattern_publishes = List.duplicate({pattern_channel, message}, pattern_batch_size)
+pattern_batch_counts = List.duplicate(pattern_subscribers, pattern_batch_size)
+
+^pattern_batch_counts = PubSub.publish_many(pattern_publishes)
 
 Benchee.run(
   %{
@@ -212,6 +217,9 @@ Benchee.run(
     end,
     "pattern publish misses=#{pattern_subscribers}" => fn ->
       0 = PubSub.publish(miss_channel, message)
+    end,
+    "pattern publish_many batch=#{pattern_batch_size} matches=#{pattern_subscribers}" => fn ->
+      ^pattern_batch_counts = PubSub.publish_many(pattern_publishes)
     end
   },
   warmup: warmup,

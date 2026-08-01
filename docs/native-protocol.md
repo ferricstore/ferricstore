@@ -251,6 +251,27 @@ already correlated responses if possible, then reconnect with jitter.
 
 `EVENT` is server-initiated on lane `0` with `request_id=0`.
 
+PubSub pushes use `event: "PUBSUB_MESSAGE"`. The legacy payload is one
+`kind: "message"` or `kind: "pmessage"` event per delivery. A client may
+request `pubsub_batch_v1` in `compact_response_codecs` after verifying that
+`OPTIONS.response_codecs.compact_response_opcodes.pubsub_batch_v1` contains
+`0x0010`. For an ordered same-channel publish batch, the server may then send
+one ordinary typed-value event envelope:
+
+```text
+event: "PUBSUB_MESSAGE"
+at_ms: integer
+payload:
+  kind: "message_batch"
+  channel: binary
+  messages: ordered list of binaries
+```
+
+The frame does not set the custom-payload flag. SDKs must expand `messages` in
+order into their existing per-message API shape and apply event-buffer limits
+to the expanded logical messages. Connections that do not negotiate the codec
+continue receiving one legacy event frame per message.
+
 Supported events:
 
 ```text

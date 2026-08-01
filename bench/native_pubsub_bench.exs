@@ -43,6 +43,7 @@ activity_log_max_len = env_integer.("BENCH_PUBSUB_ACTIVITY_LOG_MAX_LEN", "512", 
 warmup = env_number.("BENCH_WARMUP", "1")
 time = env_number.("BENCH_TIME", "3")
 memory_time = env_number.("BENCH_MEMORY_TIME", "0")
+batch_events = System.get_env("BENCH_PUBSUB_BATCH_EVENTS", "0") == "1"
 
 run_id = "#{System.os_time(:microsecond)}_#{System.unique_integer([:positive, :monotonic])}"
 data_dir = Path.join(System.tmp_dir!(), "ferricstore_native_pubsub_bench_#{run_id}")
@@ -67,6 +68,10 @@ setups =
     subscribers =
       Enum.map(1..fanout, fn index ->
         {:ok, socket} = NativePubSubClient.connect(port)
+
+        if batch_events,
+          do: :ok = NativePubSubClient.negotiate_pubsub_batches(socket, 100_000 + index)
+
         :ok = NativePubSubClient.subscribe(socket, channel, index)
         socket
       end)
@@ -137,7 +142,8 @@ IO.puts("=== Ferric Native PubSub TCP Benchmark ===")
 
 IO.puts(
   "native_port=#{port} message_bytes=#{message_bytes} " <>
-    "activity_log_max_len=#{activity_log_max_len} fanouts=#{Enum.join(fanouts, ",")}"
+    "activity_log_max_len=#{activity_log_max_len} fanouts=#{Enum.join(fanouts, ",")} " <>
+    "batch_events=#{batch_events}"
 )
 
 IO.puts("preflight=ok transport=tcp acknowledgement=decoded pushed_events=decoded_and_validated")

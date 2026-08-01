@@ -1355,12 +1355,99 @@ defmodule Ferricstore.PubSub do
         record_publish_batch(channel, messages, counts)
         counts
 
-      _pattern_count ->
+      pattern_count when pattern_count <= @pattern_linear_scan_limit ->
+        counts = publish_planned_same_channel_many(channel, messages)
+        record_publish_batch(channel, messages, counts)
+        counts
+
+      _high_pattern_count ->
         # Preserve the established exact/pattern interleaving when any pattern
         # subscription could also observe this batch.
         Enum.map(messages, &publish(channel, &1))
     end
   end
+
+  defp publish_planned_same_channel_many(channel, messages) do
+    exact_deliveries =
+      case :ets.lookup(@channel_cache_table, channel) do
+        [{^channel, deliveries, _subscriber_count}] -> deliveries
+        [] -> []
+      end
+
+    pattern_deliveries = matching_pattern_deliveries(channel)
+    channel_size = byte_size(channel)
+
+    Enum.map(messages, fn message ->
+      exact_count =
+        publish_exact_deliveries(
+          exact_deliveries,
+          channel,
+          message,
+          exact_delivery_bytes(channel, message),
+          0
+        )
+
+      publish_planned_pattern_deliveries(
+        pattern_deliveries,
+        channel,
+        message,
+        channel_size,
+        byte_size(message),
+        exact_count
+      )
+    end)
+  end
+
+  defp matching_pattern_deliveries(channel) do
+    :ets.foldl(
+      fn {pattern, matcher, deliveries, _subscriber_count}, acc ->
+        if pattern_matches?(channel, matcher),
+          do: [{pattern, deliveries} | acc],
+          else: acc
+      end,
+      [],
+      @pattern_cache_table
+    )
+    |> Enum.reverse()
+  end
+
+  defp publish_planned_pattern_deliveries(
+         [{pattern, deliveries} | rest],
+         channel,
+         message,
+         channel_size,
+         message_size,
+         count
+       ) do
+    next_count =
+      publish_pattern_deliveries(
+        deliveries,
+        pattern,
+        channel,
+        message,
+        pattern_delivery_bytes(pattern, channel_size, message_size),
+        count
+      )
+
+    publish_planned_pattern_deliveries(
+      rest,
+      channel,
+      message,
+      channel_size,
+      message_size,
+      next_count
+    )
+  end
+
+  defp publish_planned_pattern_deliveries(
+         [],
+         _channel,
+         _message,
+         _channel_size,
+         _message_size,
+         count
+       ),
+       do: count
 
   defp publish_exact_same_channel_many(channel, messages) do
     case :ets.lookup(@channel_cache_table, channel) do
