@@ -12,7 +12,11 @@ defmodule Ferricstore.MemoryGuardTest do
   alias Ferricstore.MemoryGuard
 
   setup do
+    original_eviction_policy = MemoryGuard.eviction_policy()
+    :ok = MemoryGuard.reconfigure(%{eviction_policy: :volatile_lru})
+
     on_exit(fn ->
+      :ok = MemoryGuard.reconfigure(%{eviction_policy: original_eviction_policy})
       MemoryGuard.set_reject_writes(false)
       MemoryGuard.set_keydir_full(false)
     end)
