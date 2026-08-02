@@ -2151,6 +2151,37 @@ defmodule Ferricstore.Flow.ScheduleTest do
              )
   end
 
+  test "strict overlap state reads include hibernated targets" do
+    ctx = FerricStore.Instance.get(:default)
+    target_id = unique_flow_id("schedule-consistent-hibernated-target")
+    partition_key = unique_flow_id("schedule-consistent-hibernated-partition")
+    now_ms = Ferricstore.CommandTime.now_ms()
+    state_key = Ferricstore.Flow.Keys.state_key(target_id, partition_key)
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, state_key)
+    keydir = elem(ctx.keydir_refs, shard_index)
+
+    assert :ok =
+             FerricStore.flow_create(target_id,
+               type: unique_flow_id("schedule-consistent-hibernated-type"),
+               state: "queued",
+               partition_key: partition_key,
+               now_ms: now_ms,
+               run_at_ms: now_ms + 3_600_000
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, shard_index)
+
+    assert_eventually(fn ->
+      refute :ets.member(keydir, state_key)
+    end)
+
+    assert {:ok, %{state: "queued"}} =
+             FerricStore.flow_get(target_id, partition_key: partition_key)
+
+    assert {:ok, "queued"} =
+             Ferricstore.Store.Router.flow_consistent_state(ctx, target_id, partition_key)
+  end
+
   test "overlap policy allow does not depend on reading the previous target" do
     now_ms = 4_050
     schedule_id = unique_flow_id("schedule-overlap-allow")

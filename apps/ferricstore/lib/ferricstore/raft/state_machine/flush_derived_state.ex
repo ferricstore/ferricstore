@@ -73,9 +73,7 @@ defmodule Ferricstore.Raft.StateMachine.FlushDerivedState do
     history_ctx = instance_ctx || %{name: instance_name}
 
     result =
-      with :ok <- discard_lmdb_writer(instance_name, shard_index),
-           :ok <- clear_lmdb_projection_outbox(instance_name, shard_index),
-           :ok <- discard_history_projector(history_ctx, shard_index),
+      with :ok <- do_quiesce(instance_name, history_ctx, shard_index),
            :ok <- clear_lmdb(flow_lmdb_path),
            :ok <- clear_history(shard_data_path),
            :ok <- reset_projection_watermarks(state, history_ctx, ra_index),
@@ -95,6 +93,32 @@ defmodule Ferricstore.Raft.StateMachine.FlushDerivedState do
     error -> {:error, {:flush_derived_state_cleanup_failed, error}}
   catch
     kind, reason -> {:error, {:flush_derived_state_cleanup_failed, kind, reason}}
+  end
+
+  @spec quiesce(map()) :: :ok | {:error, term()}
+  def quiesce(state) when is_map(state) do
+    instance_name = Map.get(state, :instance_name, :default)
+    instance_ctx = Map.get(state, :instance_ctx)
+    shard_index = Map.fetch!(state, :shard_index)
+    history_ctx = instance_ctx || %{name: instance_name}
+
+    case do_quiesce(instance_name, history_ctx, shard_index) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:flush_derived_state_cleanup_failed, reason}}
+      other -> {:error, {:flush_derived_state_cleanup_failed, {:unexpected_result, other}}}
+    end
+  rescue
+    error -> {:error, {:flush_derived_state_cleanup_failed, error}}
+  catch
+    kind, reason -> {:error, {:flush_derived_state_cleanup_failed, kind, reason}}
+  end
+
+  defp do_quiesce(instance_name, history_ctx, shard_index) do
+    with :ok <- discard_lmdb_writer(instance_name, shard_index),
+         :ok <- clear_lmdb_projection_outbox(instance_name, shard_index),
+         :ok <- discard_history_projector(history_ctx, shard_index) do
+      :ok
+    end
   end
 
   defp discard_lmdb_writer(instance_name, shard_index) do

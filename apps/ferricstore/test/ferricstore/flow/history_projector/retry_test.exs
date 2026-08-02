@@ -12,10 +12,19 @@ defmodule Ferricstore.Flow.HistoryProjector.RetryTest do
     keydir = :ets.new(:"history_projector_retry_keydir_#{unique}", [:set, :public])
     attempts = :atomics.new(1, signed: false)
     previous_hook = Application.get_env(:ferricstore, :flow_history_projector_lmdb_publish_hook)
+    test_pid = self()
 
     Application.put_env(:ferricstore, :flow_history_projector_lmdb_publish_hook, fn
       ^dir, 0, [_entry] ->
-        :atomics.add(attempts, 1, 1)
+        attempt = :atomics.add_get(attempts, 1, 1)
+        send(test_pid, {:history_publish_attempt, attempt, System.monotonic_time(:millisecond)})
+
+        if attempt == 3 do
+          receive do
+            :release_history_publish -> :ok
+          end
+        end
+
         {:error, :injected_publish_failure}
     end)
 
@@ -68,11 +77,20 @@ defmodule Ferricstore.Flow.HistoryProjector.RetryTest do
     assert {:error, :flush_failed} = HistoryProjector.flush(ctx, 0)
     assert :atomics.get(attempts, 1) == 1
 
-    Process.sleep(260)
-    retry_attempts = :atomics.get(attempts, 1)
-    assert retry_attempts <= 3
+    try do
+      assert_receive {:history_publish_attempt, 1, first_attempt_at}, 1_000
+      assert_receive {:history_publish_attempt, 2, second_attempt_at}, 1_000
+      assert_receive {:history_publish_attempt, 3, third_attempt_at}, 1_000
+
+      assert second_attempt_at - first_attempt_at >= 40
+      assert third_attempt_at - second_attempt_at >= 90
+    after
+      send(pid, :release_history_publish)
+    end
 
     GenServer.stop(pid)
+    retry_attempts = :atomics.get(attempts, 1)
+    assert retry_attempts == 3
 
     history_path = HistoryProjector.history_file_path(dir, 0)
     assert {:ok, records} = NIF.v2_scan_file(history_path)

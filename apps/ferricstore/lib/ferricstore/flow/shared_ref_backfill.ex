@@ -169,23 +169,27 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
           progress_key(shard_index)
         ]
 
-        only_metadata_or_server_catalog? =
+        unexpected_keys =
           :ets.foldl(
             fn
-              {key, _value, _exp, _lfu, _file_id, _offset, _value_size}, true ->
-                key in allowed or ServerCatalog.internal_key?(key)
+              {key, _value, _exp, _lfu, _file_id, _offset, _value_size}, acc ->
+                if key in allowed or ServerCatalog.internal_key?(key),
+                  do: acc,
+                  else: bounded_unexpected_key(acc, key)
 
-              _entry, _allowed? ->
-                false
+              _entry, acc ->
+                bounded_unexpected_key(acc, :invalid_keydir_entry)
             end,
-            true,
+            [],
             keydir
           )
 
-        if only_metadata_or_server_catalog? do
+        if unexpected_keys == [] do
           :ok
         else
-          raise "shared-ref backfill empty-shard finalization requires an empty keydir"
+          keys = unexpected_keys |> Enum.reverse() |> inspect(printable_limit: 256, limit: 8)
+
+          raise "shared-ref backfill empty-shard finalization requires an empty keydir; unexpected keys: #{keys}"
         end
 
       :undefined ->
@@ -195,6 +199,9 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
     error in ArgumentError ->
       raise "shared-ref backfill empty-shard finalization requires an available keydir: #{Exception.message(error)}"
   end
+
+  defp bounded_unexpected_key(keys, key) when length(keys) < 8, do: [key | keys]
+  defp bounded_unexpected_key(keys, _key), do: keys
 
   defp positive_opt(opts, key, default) do
     case Keyword.get(opts, key, default) do
