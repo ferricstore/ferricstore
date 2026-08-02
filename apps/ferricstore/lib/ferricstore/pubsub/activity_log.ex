@@ -13,6 +13,7 @@ defmodule Ferricstore.PubSub.ActivityLog do
 
   @table :ferricstore_pubsub_activity_log
   @counter_key :ferricstore_pubsub_activity_log_counter
+  @reservation_counter_key :ferricstore_pubsub_activity_log_reservations
   @max_len_key :ferricstore_pubsub_activity_log_max_len
   @publish_config_key :ferricstore_pubsub_activity_log_publish_config
   @publish_sample_counter_key :ferricstore_pubsub_activity_log_sample_counter
@@ -127,13 +128,10 @@ defmodule Ferricstore.PubSub.ActivityLog do
 
   @spec reset() :: :ok
   def reset do
-    if table_ready?() do
-      :ets.delete_all_objects(@table)
+    case Process.whereis(__MODULE__) do
+      pid when is_pid(pid) -> GenServer.call(pid, :reset, :infinity)
+      nil -> :ok
     end
-
-    reset_counter()
-    reset_publish_sample_counter()
-    :ok
   rescue
     _ -> :ok
   catch
@@ -152,6 +150,7 @@ defmodule Ferricstore.PubSub.ActivityLog do
       ])
 
     :persistent_term.put(@counter_key, :atomics.new(1, signed: false))
+    :persistent_term.put(@reservation_counter_key, :atomics.new(2, signed: false))
     sample_counter = :atomics.new(1, signed: false)
     :persistent_term.put(@publish_sample_counter_key, sample_counter)
 
@@ -174,18 +173,43 @@ defmodule Ferricstore.PubSub.ActivityLog do
     {:ok, %{table: table}}
   end
 
+  @impl true
+  def handle_call(:reset, _from, state) do
+    reservation_counter = reservation_counter()
+    :atomics.put(reservation_counter, 2, 1)
+
+    try do
+      await_id_reservations(reservation_counter)
+      :ets.delete_all_objects(@table)
+      reset_counter()
+      reset_publish_sample_counter()
+      {:reply, :ok, state}
+    after
+      :atomics.put(reservation_counter, 2, 0)
+    end
+  end
+
   defp record(entry) do
     record(entry, max_len())
   end
 
   defp record(entry, max_len) do
     if max_len > 0 and table_ready?() do
-      id = next_id()
+      reservation_counter = begin_id_reservation()
 
-      :ets.insert(
-        @table,
-        {id, normalize_and_timestamp_entry(entry, System.os_time(:microsecond))}
-      )
+      id =
+        try do
+          id = next_id()
+
+          :ets.insert(
+            @table,
+            {id, normalize_and_timestamp_entry(entry, System.os_time(:microsecond))}
+          )
+
+          id
+        after
+          finish_id_reservation(reservation_counter)
+        end
 
       maybe_evict_overflow(id, max_len)
     end
@@ -204,18 +228,25 @@ defmodule Ferricstore.PubSub.ActivityLog do
       entry_count = length(entries)
       retained = keep_newest(entries, max_len)
       retained_count = length(retained)
-      first_id = reserve_ids(entry_count) + entry_count - retained_count
-      timestamp_us = System.os_time(:microsecond)
-      target = normalize_binary(channel)
+      reservation_counter = begin_id_reservation()
 
-      rows =
-        retained
-        |> Enum.with_index(first_id)
-        |> Enum.map(fn {{message_bytes, subscribers}, id} ->
-          {id, {:publish, timestamp_us, target, message_bytes, subscribers}}
-        end)
+      try do
+        first_id = reserve_ids(entry_count) + entry_count - retained_count
+        timestamp_us = System.os_time(:microsecond)
+        target = normalize_binary(channel)
 
-      :ets.insert(@table, rows)
+        rows =
+          retained
+          |> Enum.with_index(first_id)
+          |> Enum.map(fn {{message_bytes, subscribers}, id} ->
+            {id, {:publish, timestamp_us, target, message_bytes, subscribers}}
+          end)
+
+        :ets.insert(@table, rows)
+      after
+        finish_id_reservation(reservation_counter)
+      end
+
       evict_overflow(max_len)
     end
 
@@ -323,6 +354,47 @@ defmodule Ferricstore.PubSub.ActivityLog do
     end
   end
 
+  defp begin_id_reservation do
+    counter = reservation_counter()
+    :atomics.add(counter, 1, 1)
+
+    if :atomics.get(counter, 2) == 0 do
+      counter
+    else
+      finish_id_reservation(counter)
+      Process.sleep(1)
+      begin_id_reservation()
+    end
+  end
+
+  defp finish_id_reservation(counter) do
+    :atomics.sub(counter, 1, 1)
+    :ok
+  end
+
+  defp reservation_counter do
+    case :persistent_term.get(@reservation_counter_key, nil) do
+      counter when is_reference(counter) -> counter
+      _missing -> :atomics.new(2, signed: false)
+    end
+  end
+
+  defp await_id_reservations(counter) do
+    if :atomics.get(counter, 1) == 0 do
+      :ok
+    else
+      Process.sleep(1)
+      await_id_reservations(counter)
+    end
+  end
+
+  defp id_reservations_complete? do
+    case :persistent_term.get(@reservation_counter_key, nil) do
+      counter when is_reference(counter) -> :atomics.get(counter, 1) == 0
+      _missing -> false
+    end
+  end
+
   defp reset_publish_sample_counter do
     case :persistent_term.get(@publish_sample_counter_key, nil) do
       counter when is_reference(counter) -> :atomics.put(counter, 1, 0)
@@ -340,21 +412,64 @@ defmodule Ferricstore.PubSub.ActivityLog do
 
   defp evict_overflow(max_len) do
     case :ets.info(@table, :size) do
-      size when is_integer(size) and size > max_len -> delete_oldest(size - max_len)
-      _ -> :ok
+      size when is_integer(size) and size > max_len ->
+        case :ets.last(@table) do
+          id when is_integer(id) -> evict_before_newest_rows(id, max_len)
+          :"$end_of_table" -> :ok
+        end
+
+      _ ->
+        :ok
     end
   end
 
-  defp delete_oldest(remaining) when remaining <= 0, do: :ok
+  defp evict_before_newest_rows(last_id, max_len) do
+    cutoff = last_id - max_len
 
-  defp delete_oldest(remaining) do
+    if id_reservations_complete?() do
+      delete_through(cutoff)
+    else
+      case newest_retained_key(max_len) do
+        id when is_integer(id) -> delete_before(id)
+        nil -> :ok
+      end
+    end
+  end
+
+  defp newest_retained_key(max_len) do
+    match_spec = [{{:"$1", :_}, [], [:"$1"]}]
+
+    case :ets.select_reverse(@table, match_spec, max_len) do
+      {ids, _continuation} when length(ids) == max_len -> List.last(ids)
+      _fewer_than_max_len -> nil
+    end
+  end
+
+  defp delete_through(cutoff) do
     case :ets.first(@table) do
       :"$end_of_table" ->
         :ok
 
-      id ->
+      id when id <= cutoff ->
         :ets.delete(@table, id)
-        delete_oldest(remaining - 1)
+        delete_through(cutoff)
+
+      _retained ->
+        :ok
+    end
+  end
+
+  defp delete_before(retained_key) do
+    case :ets.first(@table) do
+      :"$end_of_table" ->
+        :ok
+
+      id when id < retained_key ->
+        :ets.delete(@table, id)
+        delete_before(retained_key)
+
+      _retained ->
+        :ok
     end
   end
 

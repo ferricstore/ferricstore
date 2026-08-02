@@ -205,6 +205,89 @@ defmodule FerricstoreServer.Native.PubSubBenchmarkClientTest do
            }
   end
 
+  test "splits negotiated batches before the response limit without losing messages" do
+    state = %{
+      compression: :none,
+      max_frame_bytes: 1_024,
+      max_response_bytes: 202,
+      response_chunk_bytes: 0
+    }
+
+    messages = [String.duplicate("x", 80), String.duplicate("y", 80)]
+
+    assert {decoded, ""} =
+             state
+             |> Responses.encode_pubsub_message_batch(0x0010, "c", messages, 1_234)
+             |> IO.iodata_to_binary()
+             |> NativePubSubClient.decode_server_frames()
+
+    assert Enum.all?(decoded, &(&1.status == 0))
+
+    assert Enum.flat_map(decoded, fn frame ->
+             case frame.value do
+               %{"payload" => %{"kind" => "message_batch", "messages" => batch}} -> batch
+               %{"payload" => %{"kind" => "message", "message" => message}} -> [message]
+             end
+           end) == messages
+  end
+
+  test "packs an oversized negotiated batch into the fewest bounded envelopes" do
+    messages = ["one", "two", "six"]
+    prepared = Responses.prepare_pubsub_message_batch("orders", messages, 1_234)
+    encoded_message_bytes = Enum.sum(Enum.map(messages, &(5 + byte_size(&1))))
+    empty_batch_bytes = byte_size(prepared.encoded_value) - encoded_message_bytes
+
+    state = %{
+      compression: :none,
+      max_frame_bytes: 1_024,
+      max_response_bytes: 2 + empty_batch_bytes + 2 * (5 + byte_size("one")),
+      response_chunk_bytes: 0
+    }
+
+    assert {decoded, ""} =
+             state
+             |> Responses.encode_prepared_pubsub_message_batch(0x0010, prepared)
+             |> IO.iodata_to_binary()
+             |> NativePubSubClient.decode_server_frames()
+
+    assert Enum.map(decoded, & &1.value["payload"]["messages"]) == [
+             ["one", "two"],
+             ["six"]
+           ]
+  end
+
+  test "prepared oversized batches reuse their bounded encodings across subscribers" do
+    messages = [String.duplicate("x", 80), String.duplicate("y", 80)]
+
+    state = %{
+      compression: :none,
+      max_frame_bytes: 1_024,
+      max_response_bytes: 202,
+      response_chunk_bytes: 0
+    }
+
+    prepared =
+      Responses.prepare_pubsub_message_batch(
+        "c",
+        messages,
+        1_234,
+        state.max_response_bytes
+      )
+
+    assert length(prepared.bounded_encoded_values) == 2
+
+    first = Responses.encode_prepared_pubsub_message_batch(state, 0x0010, prepared)
+    second = Responses.encode_prepared_pubsub_message_batch(state, 0x0010, prepared)
+
+    Enum.zip([first, second, prepared.bounded_encoded_values])
+    |> Enum.each(fn {first_frame, second_frame, encoded_value} ->
+      assert [_header, <<0::unsigned-16>>, first_value] = first_frame
+      assert [_header, <<0::unsigned-16>>, second_value] = second_frame
+      assert :erts_debug.same(first_value, encoded_value)
+      assert :erts_debug.same(second_value, encoded_value)
+    end)
+  end
+
   test "prepared negotiated batches reuse one encoded value across connection frames" do
     state = %{
       compression: :none,
@@ -237,7 +320,7 @@ defmodule FerricstoreServer.Native.PubSubBenchmarkClientTest do
              |> IO.iodata_to_binary()
   end
 
-  test "prepared negotiated batches preserve compression, chunking, and response limits" do
+  test "prepared negotiated batches preserve compression and chunking" do
     payload = %{
       event: "PUBSUB_MESSAGE",
       payload: %{
@@ -266,12 +349,6 @@ defmodule FerricstoreServer.Native.PubSubBenchmarkClientTest do
             compression: :none,
             max_frame_bytes: 64,
             max_response_bytes: 1_024,
-            response_chunk_bytes: 0
-          },
-          %{
-            compression: :none,
-            max_frame_bytes: 1_024,
-            max_response_bytes: 64,
             response_chunk_bytes: 0
           }
         ] do
@@ -398,6 +475,15 @@ defmodule FerricstoreServer.Native.PubSubBenchmarkClientTest do
     assert_raise RuntimeError, ~r/unexpected pushed event/, fn ->
       NativePubSubClient.validate_pubsub_frames(frames, "other", "ready")
     end
+  end
+
+  test "load benchmark skip mode still runs normal application and data cleanup" do
+    source =
+      File.read!(Path.expand("../../../../../bench/native_pubsub_load_bench.exs", __DIR__))
+
+    refute source =~ "System.halt"
+    assert source =~ "unless skip_slow_phase do"
+    assert source =~ "File.rm_rf!(data_dir)"
   end
 
   test "validates every result in a pipelined publish response" do

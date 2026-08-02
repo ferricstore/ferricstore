@@ -590,6 +590,120 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
     assert eventually(fn -> ResourceBudget.usage(ResourceBudget).outbound_bytes == 0 end)
   end
 
+  test "HELLO refreshes prepared batch delivery metadata for existing subscriptions" do
+    existing_pids = connection_pids()
+    channel = "native:pubsub:renegotiated-batch:#{System.unique_integer([:positive, :monotonic])}"
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+    connection_pid = wait_for_new_connection(existing_pids)
+
+    assert :ok = :gen_tcp.send(socket, command_exec_frame(248, "SUBSCRIBE", [channel]))
+    assert [{248, 0}] = receive_response_statuses(socket, 1)
+
+    assert [{^channel, [{^connection_pid, _guard}], 1}] =
+             :ets.lookup(:ferricstore_pubsub_channel_cache, channel)
+
+    enabled_body = Codec.encode_value(%{"compact_response_codecs" => ["pubsub_batch_v1"]})
+    assert :ok = :gen_tcp.send(socket, Codec.encode_frame(@hello_opcode, 0, 249, enabled_body))
+    assert [{249, 0}] = receive_response_statuses(socket, 1)
+
+    assert eventually(fn ->
+             match?(
+               [{^channel, [{^connection_pid, _guard, :prepared_batches}], 1}],
+               :ets.lookup(:ferricstore_pubsub_channel_cache, channel)
+             )
+           end)
+
+    disabled_body = Codec.encode_value(%{})
+    assert :ok = :gen_tcp.send(socket, Codec.encode_frame(@hello_opcode, 0, 250, disabled_body))
+    assert [{250, 0}] = receive_response_statuses(socket, 1)
+
+    assert eventually(fn ->
+             match?(
+               [{^channel, [{^connection_pid, _guard}], 1}],
+               :ets.lookup(:ferricstore_pubsub_channel_cache, channel)
+             )
+           end)
+  end
+
+  @tag :native_outbound_byte_budget
+  test "negotiated pubsub batches split before the response limit" do
+    previous_response_limit = Application.get_env(:ferricstore, :native_max_response_bytes)
+
+    previous_outbound_limit =
+      Application.get_env(:ferricstore, :native_max_outbound_bytes_per_connection)
+
+    Application.put_env(:ferricstore, :native_max_response_bytes, 1_024 * 1_024)
+
+    Application.put_env(
+      :ferricstore,
+      :native_max_outbound_bytes_per_connection,
+      4 * 1_024 * 1_024
+    )
+
+    on_exit(fn ->
+      restore_env(:native_max_response_bytes, previous_response_limit)
+      restore_env(:native_max_outbound_bytes_per_connection, previous_outbound_limit)
+    end)
+
+    channel = "c"
+    messages = [String.duplicate("x", 700_000), String.duplicate("y", 700_000)]
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    hello_body =
+      Codec.encode_value(%{
+        "compact_flow_responses" => false,
+        "compact_response_codecs" => ["pubsub_batch_v1"]
+      })
+
+    assert :ok = :gen_tcp.send(socket, Codec.encode_frame(@hello_opcode, 0, 246, hello_body))
+    assert [{246, 0}] = receive_response_statuses(socket, 1)
+
+    assert :ok = :gen_tcp.send(socket, command_exec_frame(247, "SUBSCRIBE", [channel]))
+    assert [{247, 0}] = receive_response_statuses(socket, 1)
+
+    assert Ferricstore.PubSub.publish_many(Enum.map(messages, &{channel, &1})) == [1, 1]
+
+    assert decoded =
+             socket
+             |> receive_native_frames(2)
+             |> Enum.map(fn <<0::unsigned-16, value_body::binary>> ->
+               {:ok, value} = Codec.decode_body(value_body)
+               value
+             end)
+
+    assert Enum.flat_map(decoded, fn %{"payload" => payload} ->
+             case payload do
+               %{"kind" => "message_batch", "messages" => batch} -> batch
+               %{"kind" => "message", "message" => message} -> [message]
+             end
+           end) == messages
+  end
+
+  test "pubsub coalescing processes an ACL barrier before later events" do
+    existing_pids = connection_pids()
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+    connection_pid = wait_for_new_connection(existing_pids)
+
+    send(connection_pid, {:pubsub_message, "ordered", "first"})
+    send(connection_pid, {:acl_invalidate, :all, 1})
+    send(connection_pid, {:pubsub_message, "ordered", "second"})
+
+    assert [first_body] = receive_native_frames(socket, 1)
+    assert <<0::unsigned-16, first_value_body::binary>> = first_body
+    assert {:ok, first_value} = Codec.decode_body(first_value_body)
+
+    assert first_value["payload"] == %{
+             "kind" => "message",
+             "channel" => "ordered",
+             "message" => "first"
+           }
+
+    assert_socket_closed_without_more_data(socket)
+  end
+
   @tag :native_outbound_byte_budget
   test "pubsub closes a slow subscriber before queueing an over-limit event" do
     previous_limit =
@@ -1071,6 +1185,19 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
       {:error, :closed} -> :ok
       {:error, :timeout} -> assert_socket_closed(socket, attempts - 1)
       {:ok, _data} -> assert_socket_closed(socket, attempts - 1)
+    end
+  end
+
+  defp assert_socket_closed_without_more_data(socket, attempts \\ 20)
+
+  defp assert_socket_closed_without_more_data(_socket, 0),
+    do: flunk("native connection remained open after the ACL barrier")
+
+  defp assert_socket_closed_without_more_data(socket, attempts) do
+    case :gen_tcp.recv(socket, 0, 25) do
+      {:error, :closed} -> :ok
+      {:error, :timeout} -> assert_socket_closed_without_more_data(socket, attempts - 1)
+      {:ok, data} -> flunk("received #{byte_size(data)} bytes after the ACL barrier")
     end
   end
 

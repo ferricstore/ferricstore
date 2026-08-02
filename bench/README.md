@@ -86,9 +86,10 @@ throughput matrix; the default still runs the full isolation gate.
 Compact mode 35 also exercises batch-aware exact-channel fanout. One pipeline
 resolves subscribers once and reserves and enqueues once per subscriber.
 Legacy clients receive the unchanged individual event frames together; clients
-that negotiate `pubsub_batch_v1` receive one ordered batch event. Homogeneous
-batches with a bounded pattern set resolve matching patterns once while
-preserving exact/pattern event ordering.
+that negotiate `pubsub_batch_v1` receive ordered, response-bounded batch events
+with an ordinary-message fallback for an item too large to share a batch
+envelope. Homogeneous batches with a bounded pattern set resolve matching
+patterns once while preserving exact/pattern event ordering.
 Typed pipelines containing only `PUBLISH` commands reuse this fanout path on
 eligible full-access connections, so the optimization does not depend on
 compact request support.

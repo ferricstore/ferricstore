@@ -249,142 +249,142 @@ Enum.each(concurrent_results, fn result ->
   )
 end)
 
-if skip_slow_phase do
-  System.halt(0)
-end
-
 _ = Application.stop(:ferricstore_server)
 _ = Application.stop(:ferricstore)
 
-Application.put_env(
-  :ferricstore,
-  :native_max_outbound_bytes_per_connection,
-  slow_outbound_bytes
-)
+unless skip_slow_phase do
+  Application.put_env(
+    :ferricstore,
+    :native_max_outbound_bytes_per_connection,
+    slow_outbound_bytes
+  )
 
-Application.put_env(
-  :ferricstore,
-  :native_max_global_outbound_bytes,
-  max(slow_outbound_bytes * 32, 64 * 1024 * 1024)
-)
+  Application.put_env(
+    :ferricstore,
+    :native_max_global_outbound_bytes,
+    max(slow_outbound_bytes * 32, 64 * 1024 * 1024)
+  )
 
-{:ok, _restarted} = Application.ensure_all_started(:ferricstore_server)
+  {:ok, _restarted} = Application.ensure_all_started(:ferricstore_server)
 
-slow_port = FerricstoreServer.Native.Listener.port()
-slow_ctx = FerricStore.Instance.get(:default)
+  slow_port = FerricstoreServer.Native.Listener.port()
+  slow_ctx = FerricStore.Instance.get(:default)
 
-reader_loop = fn reader_loop, socket, channel, payload ->
-  receive do
-    {:read_one, caller} ->
-      :ok = NativePubSubClient.receive_pubsub(socket, channel, payload)
-      send(caller, {:fast_pubsub_received, self()})
-      reader_loop.(reader_loop, socket, channel, payload)
-
-    :stop ->
-      :ok
-  end
-end
-
-{:ok, slow_publisher} = NativePubSubClient.connect(slow_port)
-slow_message = :binary.copy("s", slow_message_bytes)
-
-slow_results =
-  Enum.map(1..slow_samples, fn sample ->
-    channel = "bench:native:pubsub:slow:#{suffix}:#{sample}"
-    lane_id = Ferricstore.Store.Router.shard_for(slow_ctx, channel) + 1
-    request_id = 30_000 + sample
-
-    frame =
-      NativePubSubClient.command_exec_frame(
-        request_id,
-        "PUBLISH",
-        [channel, slow_message],
-        lane_id
-      )
-
-    {:ok, fast_socket} = NativePubSubClient.connect(slow_port)
-
-    if batch_events,
-      do: :ok = NativePubSubClient.negotiate_pubsub_batches(fast_socket, 200_000 + sample)
-
-    :ok = NativePubSubClient.subscribe(fast_socket, channel, 40_000 + sample)
-
-    fast_reader =
-      Task.async(fn ->
-        receive do
-          :start -> reader_loop.(reader_loop, fast_socket, channel, slow_message)
-        end
-      end)
-
-    :ok = :gen_tcp.controlling_process(fast_socket, fast_reader.pid)
-    send(fast_reader.pid, :start)
-
-    {:ok, slow_socket} = NativePubSubClient.connect(slow_port, recbuf: 1_024)
-
-    if batch_events,
-      do: :ok = NativePubSubClient.negotiate_pubsub_batches(slow_socket, 300_000 + sample)
-
-    :ok = NativePubSubClient.subscribe(slow_socket, channel, 50_000 + sample)
-
-    started = System.monotonic_time(:microsecond)
-
-    eviction =
-      Enum.reduce_while(1..slow_max_publishes, nil, fn attempt, _result ->
-        send(fast_reader.pid, {:read_one, self()})
-        subscriber_count = NativePubSubClient.publish_count(slow_publisher, frame, request_id)
-
-        unless subscriber_count in [1, 2] do
-          raise "slow-consumer benchmark expected one or two subscribers, got #{subscriber_count}"
-        end
-
-        receive do
-          {:fast_pubsub_received, pid} when pid == fast_reader.pid -> :ok
-        after
-          30_000 -> raise "fast PubSub subscriber did not receive slow-consumer sample"
-        end
-
-        if subscriber_count == 1 do
-          {:halt, %{attempt: attempt, elapsed_us: System.monotonic_time(:microsecond) - started}}
-        else
-          {:cont, nil}
-        end
-      end)
-
-    if eviction == nil do
-      raise "slow subscriber was not evicted within #{slow_max_publishes} publishes"
-    end
-
-    send(fast_reader.pid, {:read_one, self()})
-    :ok = NativePubSubClient.publish(slow_publisher, frame, request_id, 1)
-
+  reader_loop = fn reader_loop, socket, channel, payload ->
     receive do
-      {:fast_pubsub_received, pid} when pid == fast_reader.pid -> :ok
-    after
-      30_000 -> raise "fast PubSub subscriber stopped after slow-consumer eviction"
+      {:read_one, caller} ->
+        :ok = NativePubSubClient.receive_pubsub(socket, channel, payload)
+        send(caller, {:fast_pubsub_received, self()})
+        reader_loop.(reader_loop, socket, channel, payload)
+
+      :stop ->
+        :ok
     end
+  end
 
-    send(fast_reader.pid, :stop)
-    :ok = Task.await(fast_reader, 5_000)
-    :gen_tcp.close(slow_socket)
-    eviction
-  end)
+  {:ok, slow_publisher} = NativePubSubClient.connect(slow_port)
+  slow_message = :binary.copy("s", slow_message_bytes)
 
-median = fn values ->
-  sorted = Enum.sort(values)
-  Enum.at(sorted, div(length(sorted), 2))
+  slow_results =
+    Enum.map(1..slow_samples, fn sample ->
+      channel = "bench:native:pubsub:slow:#{suffix}:#{sample}"
+      lane_id = Ferricstore.Store.Router.shard_for(slow_ctx, channel) + 1
+      request_id = 30_000 + sample
+
+      frame =
+        NativePubSubClient.command_exec_frame(
+          request_id,
+          "PUBLISH",
+          [channel, slow_message],
+          lane_id
+        )
+
+      {:ok, fast_socket} = NativePubSubClient.connect(slow_port)
+
+      if batch_events,
+        do: :ok = NativePubSubClient.negotiate_pubsub_batches(fast_socket, 200_000 + sample)
+
+      :ok = NativePubSubClient.subscribe(fast_socket, channel, 40_000 + sample)
+
+      fast_reader =
+        Task.async(fn ->
+          receive do
+            :start -> reader_loop.(reader_loop, fast_socket, channel, slow_message)
+          end
+        end)
+
+      :ok = :gen_tcp.controlling_process(fast_socket, fast_reader.pid)
+      send(fast_reader.pid, :start)
+
+      {:ok, slow_socket} = NativePubSubClient.connect(slow_port, recbuf: 1_024)
+
+      if batch_events,
+        do: :ok = NativePubSubClient.negotiate_pubsub_batches(slow_socket, 300_000 + sample)
+
+      :ok = NativePubSubClient.subscribe(slow_socket, channel, 50_000 + sample)
+
+      started = System.monotonic_time(:microsecond)
+
+      eviction =
+        Enum.reduce_while(1..slow_max_publishes, nil, fn attempt, _result ->
+          send(fast_reader.pid, {:read_one, self()})
+          subscriber_count = NativePubSubClient.publish_count(slow_publisher, frame, request_id)
+
+          unless subscriber_count in [1, 2] do
+            raise "slow-consumer benchmark expected one or two subscribers, got #{subscriber_count}"
+          end
+
+          receive do
+            {:fast_pubsub_received, pid} when pid == fast_reader.pid -> :ok
+          after
+            30_000 -> raise "fast PubSub subscriber did not receive slow-consumer sample"
+          end
+
+          if subscriber_count == 1 do
+            {:halt,
+             %{attempt: attempt, elapsed_us: System.monotonic_time(:microsecond) - started}}
+          else
+            {:cont, nil}
+          end
+        end)
+
+      if eviction == nil do
+        raise "slow subscriber was not evicted within #{slow_max_publishes} publishes"
+      end
+
+      send(fast_reader.pid, {:read_one, self()})
+      :ok = NativePubSubClient.publish(slow_publisher, frame, request_id, 1)
+
+      receive do
+        {:fast_pubsub_received, pid} when pid == fast_reader.pid -> :ok
+      after
+        30_000 -> raise "fast PubSub subscriber stopped after slow-consumer eviction"
+      end
+
+      send(fast_reader.pid, :stop)
+      :ok = Task.await(fast_reader, 5_000)
+      :gen_tcp.close(slow_socket)
+      eviction
+    end)
+
+  median = fn values ->
+    sorted = Enum.sort(values)
+    Enum.at(sorted, div(length(sorted), 2))
+  end
+
+  median_attempts = slow_results |> Enum.map(& &1.attempt) |> median.()
+  median_eviction_us = slow_results |> Enum.map(& &1.elapsed_us) |> median.()
+
+  IO.puts(
+    "slow_consumer samples=#{slow_samples} message_bytes=#{slow_message_bytes} " <>
+      "outbound_limit_bytes=#{slow_outbound_bytes} median_publishes_to_evict=#{median_attempts} " <>
+      "median_eviction_ms=#{Float.round(median_eviction_us / 1_000, 2)} " <>
+      "fast_subscriber_followup=ok isolation=ok"
+  )
+
+  :gen_tcp.close(slow_publisher)
+  _ = Application.stop(:ferricstore_server)
+  _ = Application.stop(:ferricstore)
 end
 
-median_attempts = slow_results |> Enum.map(& &1.attempt) |> median.()
-median_eviction_us = slow_results |> Enum.map(& &1.elapsed_us) |> median.()
-
-IO.puts(
-  "slow_consumer samples=#{slow_samples} message_bytes=#{slow_message_bytes} " <>
-    "outbound_limit_bytes=#{slow_outbound_bytes} median_publishes_to_evict=#{median_attempts} " <>
-    "median_eviction_ms=#{Float.round(median_eviction_us / 1_000, 2)} " <>
-    "fast_subscriber_followup=ok isolation=ok"
-)
-
-:gen_tcp.close(slow_publisher)
-_ = Application.stop(:ferricstore_server)
-_ = Application.stop(:ferricstore)
 File.rm_rf!(data_dir)

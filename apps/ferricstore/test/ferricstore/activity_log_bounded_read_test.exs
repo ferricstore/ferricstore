@@ -153,6 +153,105 @@ defmodule Ferricstore.ActivityLogBoundedReadTest do
              PubSubActivityLog.get(500) |> List.last()
   end
 
+  test "concurrent PubSub activity batches retain the bounded newest ring" do
+    messages = Enum.map(1..600, &:binary.copy("x", &1))
+    subscribers = Enum.to_list(1..600)
+
+    1..16
+    |> Enum.map(fn batch ->
+      Task.async(fn ->
+        PubSubActivityLog.record_publish_batch(
+          "concurrent:#{batch}",
+          messages,
+          subscribers
+        )
+      end)
+    end)
+    |> Task.await_many(10_000)
+
+    assert :ets.info(:ferricstore_pubsub_activity_log, :size) == 512
+
+    ids = Enum.map(PubSubActivityLog.get(500), & &1.id)
+    assert length(ids) == 500
+    assert ids == Enum.sort(ids, :desc)
+  end
+
+  test "PubSub activity retention counts actual rows across interrupted id reservations" do
+    messages = List.duplicate("x", 512)
+    subscribers = List.duplicate(1, 512)
+
+    assert :ok = PubSubActivityLog.record_publish_batch("seed", messages, subscribers)
+    assert :ets.info(:ferricstore_pubsub_activity_log, :size) == 512
+
+    counter = :persistent_term.get(:ferricstore_pubsub_activity_log_counter)
+    reservations = :persistent_term.get(:ferricstore_pubsub_activity_log_reservations)
+
+    on_exit(fn ->
+      if :atomics.get(reservations, 1) > 0 do
+        :atomics.sub(reservations, 1, 1)
+      end
+    end)
+
+    :atomics.add(reservations, 1, 1)
+    :atomics.add(counter, 1, 10_000)
+
+    assert :ok = PubSubActivityLog.record_publish_batch("after-gap", ["x"], [1])
+    assert :ets.info(:ferricstore_pubsub_activity_log, :size) == 512
+    assert %{id: 10_512, target: "after-gap"} = hd(PubSubActivityLog.get(1))
+    assert :ets.first(:ferricstore_pubsub_activity_log) == 1
+  end
+
+  test "reset drains the previous activity id reservation generation before clearing rows" do
+    old_reservations =
+      :persistent_term.get(:ferricstore_pubsub_activity_log_reservations)
+
+    id_counter = :persistent_term.get(:ferricstore_pubsub_activity_log_counter)
+
+    assert :ok = :atomics.add(old_reservations, 1, 1)
+    late_id = :atomics.add_get(id_counter, 1, 10_000) - 1
+    reset = Task.async(&PubSubActivityLog.reset/0)
+
+    wait_for_reset_generation = fn wait_for_reset_generation, attempts ->
+      if :atomics.get(old_reservations, 2) == 0 do
+        if attempts == 0 do
+          flunk("activity reset did not close the previous reservation generation")
+        else
+          Process.sleep(1)
+          wait_for_reset_generation.(wait_for_reset_generation, attempts - 1)
+        end
+      end
+    end
+
+    wait_for_reset_generation.(wait_for_reset_generation, 1_000)
+
+    :ets.insert(
+      :ferricstore_pubsub_activity_log,
+      {late_id, {:publish, 0, "pre-reset", 1, 1}}
+    )
+
+    assert :ok = :atomics.sub(old_reservations, 1, 1)
+    assert :ok = Task.await(reset, 5_000)
+
+    new_reservations =
+      :persistent_term.get(:ferricstore_pubsub_activity_log_reservations)
+
+    assert new_reservations == old_reservations
+    assert :atomics.get(new_reservations, 1) == 0
+    assert :atomics.get(new_reservations, 2) == 0
+    assert :ets.lookup(:ferricstore_pubsub_activity_log, late_id) == []
+
+    assert :ok =
+             PubSubActivityLog.record_publish_batch(
+               "post-reset",
+               List.duplicate("x", 512),
+               List.duplicate(1, 512)
+             )
+
+    assert :ets.info(:ferricstore_pubsub_activity_log, :size) == 512
+    assert :ets.first(:ferricstore_pubsub_activity_log) == 0
+    assert :ets.last(:ferricstore_pubsub_activity_log) == 511
+  end
+
   test "batch XADD activity retains only the configured newest rows in order" do
     entries =
       Enum.map(1..600, fn index ->

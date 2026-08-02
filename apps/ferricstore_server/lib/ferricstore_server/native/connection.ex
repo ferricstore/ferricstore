@@ -308,12 +308,16 @@ defmodule FerricstoreServer.Native.Connection do
               max_outbound_bytes: max_outbound_bytes,
               outbound_counter: OutboundBudget.new_counter(),
               response_coalesce_max:
-                max(1, Application.get_env(:ferricstore, :native_response_coalesce_max, 64)),
+                normalized_response_coalesce_max(
+                  Application.get_env(:ferricstore, :native_response_coalesce_max, 64)
+                ),
               response_coalesce_bytes:
-                Application.get_env(
-                  :ferricstore,
-                  :native_response_coalesce_bytes,
-                  8 * 1024 * 1024
+                normalized_response_coalesce_bytes(
+                  Application.get_env(
+                    :ferricstore,
+                    :native_response_coalesce_bytes,
+                    8 * 1024 * 1024
+                  )
                 ),
               idle_timeout_ms: Application.get_env(:ferricstore, :native_idle_timeout_ms, 90_000)
             }
@@ -347,6 +351,20 @@ defmodule FerricstoreServer.Native.Connection do
     receive_timeout = connection_receive_timeout(state)
 
     receive do
+      message ->
+        dispatch_connection_message(state, message)
+    after
+      receive_timeout ->
+        cleanup_connection(state)
+        transport.close(socket)
+    end
+  end
+
+  defp dispatch_connection_message(
+         %__MODULE__{socket: socket, transport: transport} = state,
+         message
+       ) do
+    case message do
       {:tcp, ^socket, data} ->
         handle_data(state, data)
 
@@ -540,10 +558,6 @@ defmodule FerricstoreServer.Native.Connection do
 
       _other ->
         loop(state)
-    after
-      receive_timeout ->
-        cleanup_connection(state)
-        transport.close(socket)
     end
   end
 
@@ -923,7 +937,9 @@ defmodule FerricstoreServer.Native.Connection do
           case Codec.decode_body(opcode(frame), flags(frame), body(frame)) do
             {:ok, payload} ->
               Commands.mark_command_seen(state)
+              previous_state = state
               {status, value, state} = Commands.execute(opcode(frame), payload, state)
+              :ok = Session.refresh_pubsub_delivery_capability(previous_state, state)
               state = refresh_command_state_and_lanes(state)
               {:reply, maybe_encode_response(frame, state, status, value), state}
 
@@ -1438,6 +1454,12 @@ defmodule FerricstoreServer.Native.Connection do
     raise ArgumentError, "#{name} must be a positive integer, got: #{inspect(timeout)}"
   end
 
+  defp normalized_response_coalesce_max(value) when is_integer(value), do: max(value, 1)
+  defp normalized_response_coalesce_max(_invalid), do: 1
+
+  defp normalized_response_coalesce_bytes(value) when is_integer(value), do: value
+  defp normalized_response_coalesce_bytes(_invalid), do: 0
+
   defp ensure_lane(state, lane_id) do
     case Map.fetch(state.lanes, lane_id) do
       {:ok, pid} ->
@@ -1645,7 +1667,7 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp send_pubsub_events(state, first_event) do
-    events =
+    {events, barrier} =
       PubSubCoalescer.collect(
         first_event,
         state.response_coalesce_max,
@@ -1662,7 +1684,7 @@ defmodule FerricstoreServer.Native.Connection do
           end
 
         case result do
-          :ok -> loop(state)
+          :ok -> continue_after_pubsub_events(state, barrier)
           {:error, _reason} -> close_for_outbound_failure(state)
         end
 
@@ -1671,6 +1693,11 @@ defmodule FerricstoreServer.Native.Connection do
         close_for_outbound_failure(state)
     end
   end
+
+  defp continue_after_pubsub_events(state, nil), do: loop(state)
+
+  defp continue_after_pubsub_events(state, barrier),
+    do: dispatch_connection_message(state, barrier)
 
   defp send_pubsub_batch(state, channel, messages, lease, prepared) do
     encoded =

@@ -65,14 +65,34 @@ defmodule FerricstoreServer.Native.Connection.Responses do
   @spec prepare_pubsub_message_batch(binary(), [binary()], integer()) :: PreparedPubSubBatch.t()
   def prepare_pubsub_message_batch(channel, messages, at_ms)
       when is_binary(channel) and is_list(messages) and is_integer(at_ms) do
-    encoded_value =
-      NativeValueCodec.encode(%{
-        event: @pubsub_event,
-        payload: %{kind: "message_batch", channel: channel, messages: messages},
-        at_ms: at_ms
-      })
+    prepare_pubsub_message_batch(channel, messages, at_ms, nil)
+  end
 
-    %PreparedPubSubBatch{encoded_value: encoded_value}
+  @doc false
+  @spec prepare_pubsub_message_batch(binary(), [binary()], integer(), term()) ::
+          PreparedPubSubBatch.t()
+  def prepare_pubsub_message_batch(channel, messages, at_ms, max_response_bytes)
+      when is_binary(channel) and is_list(messages) and is_integer(at_ms) do
+    value = pubsub_message_batch_value(channel, messages, at_ms)
+    encoded_value = NativeValueCodec.encode(value)
+
+    {bounded_response_bytes, bounded_encoded_values} =
+      prepare_bounded_pubsub_values(
+        channel,
+        messages,
+        at_ms,
+        encoded_value,
+        max_response_bytes
+      )
+
+    %PreparedPubSubBatch{
+      channel: channel,
+      messages: messages,
+      at_ms: at_ms,
+      encoded_value: encoded_value,
+      bounded_response_bytes: bounded_response_bytes,
+      bounded_encoded_values: bounded_encoded_values
+    }
   end
 
   @doc false
@@ -82,15 +102,185 @@ defmodule FerricstoreServer.Native.Connection.Responses do
   def encode_prepared_pubsub_message_batch(
         state,
         opcode,
-        %PreparedPubSubBatch{encoded_value: encoded_value}
+        %PreparedPubSubBatch{encoded_value: encoded_value} = prepared
       )
       when is_integer(opcode) do
+    max_response_bytes = Map.get(state, :max_response_bytes)
+
+    case prepared do
+      %PreparedPubSubBatch{
+        bounded_response_bytes: ^max_response_bytes,
+        bounded_encoded_values: encoded_values
+      }
+      when is_list(encoded_values) ->
+        Enum.flat_map(
+          encoded_values,
+          &encode_preencoded_pubsub_value(state, opcode, &1)
+        )
+
+      _not_prepared_for_limit ->
+        if response_bytes_allow?(max_response_bytes, byte_size(encoded_value)) do
+          encode_preencoded_pubsub_value(state, opcode, encoded_value)
+        else
+          encode_split_pubsub_batch(state, opcode, prepared, max_response_bytes)
+        end
+    end
+  end
+
+  defp pubsub_message_batch_value(channel, messages, at_ms) do
+    %{
+      event: @pubsub_event,
+      payload: %{kind: "message_batch", channel: channel, messages: messages},
+      at_ms: at_ms
+    }
+  end
+
+  defp pubsub_message_value(channel, message, at_ms) do
+    %{
+      event: @pubsub_event,
+      payload: %{kind: "message", channel: channel, message: message},
+      at_ms: at_ms
+    }
+  end
+
+  defp prepare_bounded_pubsub_values(
+         channel,
+         messages,
+         at_ms,
+         encoded_value,
+         max_response_bytes
+       )
+       when is_integer(max_response_bytes) and max_response_bytes >= 2 do
+    if response_bytes_allow?(max_response_bytes, byte_size(encoded_value)) do
+      {nil, nil}
+    else
+      empty_batch_bytes =
+        NativeValueCodec.encoded_size(pubsub_message_batch_value(channel, [], at_ms))
+
+      encoded_values =
+        messages
+        |> split_pubsub_batch_messages(max_response_bytes - 2 - empty_batch_bytes)
+        |> Enum.map(fn
+          {:batch, batch} ->
+            NativeValueCodec.encode(pubsub_message_batch_value(channel, batch, at_ms))
+
+          {:message, message} ->
+            NativeValueCodec.encode(pubsub_message_value(channel, message, at_ms))
+        end)
+
+      {max_response_bytes, encoded_values}
+    end
+  end
+
+  defp prepare_bounded_pubsub_values(
+         _channel,
+         _messages,
+         _at_ms,
+         _encoded_value,
+         _unbounded_or_invalid
+       ),
+       do: {nil, nil}
+
+  defp encode_split_pubsub_batch(
+         state,
+         opcode,
+         %PreparedPubSubBatch{
+           channel: channel,
+           messages: messages,
+           at_ms: at_ms
+         },
+         max_response_bytes
+       )
+       when is_integer(max_response_bytes) and max_response_bytes >= 2 do
+    empty_batch_bytes =
+      NativeValueCodec.encoded_size(pubsub_message_batch_value(channel, [], at_ms))
+
+    message_capacity = max_response_bytes - 2 - empty_batch_bytes
+
+    messages
+    |> split_pubsub_batch_messages(message_capacity)
+    |> Enum.flat_map(fn
+      {:batch, batch} ->
+        encoded_value =
+          channel
+          |> pubsub_message_batch_value(batch, at_ms)
+          |> NativeValueCodec.encode()
+
+        encode_preencoded_pubsub_value(state, opcode, encoded_value)
+
+      {:message, message} ->
+        encode_pubsub_events(state, opcode, [{:message, channel, message}], at_ms)
+    end)
+  end
+
+  defp encode_split_pubsub_batch(
+         state,
+         opcode,
+         %PreparedPubSubBatch{encoded_value: encoded_value},
+         _invalid_or_too_small_limit
+       ),
+       do: encode_preencoded_pubsub_value(state, opcode, encoded_value)
+
+  defp encode_preencoded_pubsub_value(state, opcode, encoded_value) do
     Codec.encode_preencoded_ok_response_frames(opcode, 0, 0, encoded_value,
       compression: state.compression,
       chunk_bytes: response_chunk_bytes(state),
       max_response_bytes: Map.get(state, :max_response_bytes)
     )
   end
+
+  defp split_pubsub_batch_messages(messages, capacity),
+    do: split_pubsub_batch_messages(messages, capacity, [], 0, [])
+
+  defp split_pubsub_batch_messages(
+         [message | rest],
+         capacity,
+         current,
+         current_bytes,
+         batches
+       ) do
+    message_bytes = 5 + byte_size(message)
+
+    cond do
+      message_bytes > capacity ->
+        batches = flush_pubsub_batch(current, batches)
+
+        split_pubsub_batch_messages(
+          rest,
+          capacity,
+          [],
+          0,
+          [{:message, message} | batches]
+        )
+
+      current_bytes + message_bytes <= capacity ->
+        split_pubsub_batch_messages(
+          rest,
+          capacity,
+          [message | current],
+          current_bytes + message_bytes,
+          batches
+        )
+
+      true ->
+        split_pubsub_batch_messages(
+          rest,
+          capacity,
+          [message],
+          message_bytes,
+          flush_pubsub_batch(current, batches)
+        )
+    end
+  end
+
+  defp split_pubsub_batch_messages([], _capacity, current, _current_bytes, batches) do
+    current
+    |> flush_pubsub_batch(batches)
+    |> Enum.reverse()
+  end
+
+  defp flush_pubsub_batch([], batches), do: batches
+  defp flush_pubsub_batch(current, batches), do: [{:batch, Enum.reverse(current)} | batches]
 
   defp response_chunk_bytes(state) do
     max_frame_bytes =

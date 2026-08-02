@@ -162,6 +162,17 @@ defmodule FerricstoreServer.Native.Session do
     :ok
   end
 
+  @doc false
+  @spec refresh_pubsub_delivery_capability(map(), map()) :: :ok
+  def refresh_pubsub_delivery_capability(previous_state, state) do
+    if pubsub_batch_codec_selected?(previous_state) != pubsub_batch_codec_selected?(state) and
+         has_pubsub_subscriptions?(state) do
+      install_pubsub_delivery_guard(state, self())
+    else
+      :ok
+    end
+  end
+
   @spec pubsub_payload(:message | :pmessage, binary(), binary() | nil, binary()) :: map()
   def pubsub_payload(:message, channel, _pattern, message) do
     %{"kind" => "message", "channel" => channel, "message" => message}
@@ -752,7 +763,7 @@ defmodule FerricstoreServer.Native.Session do
            outbound_counter: counter,
            max_outbound_bytes: max_bytes,
            resource_budget: resource_budget
-         },
+         } = state,
          pid
        ) do
     budget_state = %{
@@ -761,12 +772,29 @@ defmodule FerricstoreServer.Native.Session do
       resource_budget: resource_budget
     }
 
-    PS.set_delivery_guard(pid, fn bytes ->
-      OutboundBudget.reserve_bytes(budget_state, pid, bytes)
-    end)
+    PS.set_delivery_guard(
+      pid,
+      fn bytes -> OutboundBudget.reserve_bytes(budget_state, pid, bytes) end,
+      prepared_batches: pubsub_batch_codec_selected?(state)
+    )
   end
 
   defp install_pubsub_delivery_guard(_state, _pid), do: :ok
+
+  defp pubsub_batch_codec_selected?(state) do
+    state
+    |> Map.get(:compact_response_codecs, MapSet.new())
+    |> MapSet.member?("pubsub_batch_v1")
+  end
+
+  defp has_pubsub_subscriptions?(state) do
+    Enum.any?([:pubsub_channels, :pubsub_patterns], fn key ->
+      case Map.get(state, key) do
+        %MapSet{} = subscriptions -> MapSet.size(subscriptions) > 0
+        _missing -> false
+      end
+    end)
+  end
 
   defp maybe_install_pubsub_delivery_guard(state, pid) do
     if subscription_count(state) == 0 do

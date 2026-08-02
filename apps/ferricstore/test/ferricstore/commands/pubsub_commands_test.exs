@@ -199,13 +199,42 @@ defmodule Ferricstore.Commands.PubSubTest do
       assert_receive {:pubsub_messages, "guarded-batch", ["one", "two"], :batch_delivery_lease}
     end
 
+    test "unrelated pattern subscriptions do not disable exact batch delivery" do
+      test_pid = self()
+
+      assert :ok =
+               PubSub.set_delivery_guard(self(), fn bytes ->
+                 send(test_pid, {:unrelated_pattern_reserved, bytes})
+                 {:ok, :unrelated_pattern_lease}
+               end)
+
+      PubSub.subscribe("exact-batch", self())
+      PubSub.psubscribe("unrelated:*", self())
+
+      assert PubSub.publish_many([
+               {"exact-batch", "one"},
+               {"exact-batch", "two"}
+             ]) == [1, 1]
+
+      assert_receive {:unrelated_pattern_reserved, _bytes}
+      refute_receive {:unrelated_pattern_reserved, _bytes}
+
+      assert_receive {:pubsub_messages, "exact-batch", ["one", "two"], :unrelated_pattern_lease}
+    end
+
     test "same-channel batches prepare one shared native value for guarded subscribers" do
       parent = self()
 
       subscribers =
         Enum.map(1..2, fn _index ->
           spawn(fn ->
-            :ok = PubSub.set_delivery_guard(self(), fn _bytes -> {:ok, :shared_batch_lease} end)
+            :ok =
+              PubSub.set_delivery_guard(
+                self(),
+                fn _bytes -> {:ok, :shared_batch_lease} end,
+                prepared_batches: true
+              )
+
             :ok = PubSub.subscribe("shared-batch", self())
             send(parent, {:shared_batch_ready, self()})
 
@@ -244,6 +273,116 @@ defmodule Ferricstore.Commands.PubSubTest do
         assert_receive {:shared_batch_event, ^pid,
                         {:pubsub_messages, "shared-batch", ["one", "two"], ^prepared,
                          :shared_batch_lease}}
+      end)
+    end
+
+    test "same-channel batches prepare only after two compatible subscribers are admitted" do
+      parent = self()
+
+      accepted =
+        spawn(fn ->
+          :ok =
+            PubSub.set_delivery_guard(
+              self(),
+              fn _bytes -> {:ok, :accepted_batch_lease} end,
+              prepared_batches: true
+            )
+
+          :ok = PubSub.subscribe("admitted-shared-batch", self())
+          send(parent, {:admitted_shared_batch_ready, self()})
+
+          receive do
+            event -> send(parent, {:admitted_shared_batch_event, self(), event})
+          end
+        end)
+
+      rejected =
+        spawn(fn ->
+          :ok =
+            PubSub.set_delivery_guard(
+              self(),
+              fn _bytes -> {:error, :limit} end,
+              prepared_batches: true
+            )
+
+          :ok = PubSub.subscribe("admitted-shared-batch", self())
+          send(parent, {:admitted_shared_batch_ready, self()})
+          Process.sleep(:infinity)
+        end)
+
+      subscribers = [accepted, rejected]
+
+      on_exit(fn ->
+        Enum.each(subscribers, fn pid ->
+          if Process.alive?(pid), do: Process.exit(pid, :kill)
+        end)
+      end)
+
+      Enum.each(subscribers, fn pid ->
+        assert_receive {:admitted_shared_batch_ready, ^pid}
+      end)
+
+      prepare = fn channel, messages ->
+        send(parent, {:admitted_shared_batch_prepared, channel, messages})
+        make_ref()
+      end
+
+      assert PubSub.publish_many(
+               [
+                 {"admitted-shared-batch", "one"},
+                 {"admitted-shared-batch", "two"}
+               ],
+               prepare
+             ) == [1, 1]
+
+      refute_receive {:admitted_shared_batch_prepared, _, _}
+
+      assert_receive {:admitted_shared_batch_event, ^accepted,
+                      {:pubsub_messages, "admitted-shared-batch", ["one", "two"],
+                       :accepted_batch_lease}}
+    end
+
+    test "same-channel batches do not prepare values unused by legacy guarded subscribers" do
+      parent = self()
+
+      subscribers =
+        Enum.map(1..2, fn _index ->
+          spawn(fn ->
+            :ok = PubSub.set_delivery_guard(self(), fn _bytes -> {:ok, :legacy_batch_lease} end)
+            :ok = PubSub.subscribe("legacy-batch", self())
+            send(parent, {:legacy_batch_ready, self()})
+
+            receive do
+              event -> send(parent, {:legacy_batch_event, self(), event})
+            end
+          end)
+        end)
+
+      on_exit(fn ->
+        Enum.each(subscribers, fn pid ->
+          if Process.alive?(pid), do: Process.exit(pid, :kill)
+        end)
+      end)
+
+      Enum.each(subscribers, fn pid ->
+        assert_receive {:legacy_batch_ready, ^pid}
+      end)
+
+      prepare = fn channel, messages ->
+        send(parent, {:legacy_batch_prepared, channel, messages})
+        make_ref()
+      end
+
+      assert PubSub.publish_many(
+               [{"legacy-batch", "one"}, {"legacy-batch", "two"}],
+               prepare
+             ) == [2, 2]
+
+      refute_receive {:legacy_batch_prepared, _, _}
+
+      Enum.each(subscribers, fn pid ->
+        assert_receive {:legacy_batch_event, ^pid,
+                        {:pubsub_messages, "legacy-batch", ["one", "two"], :legacy_batch_lease}}
       end)
     end
 
@@ -473,6 +612,39 @@ defmodule Ferricstore.Commands.PubSubTest do
       assert :ok = PubSub.clear_delivery_guard(self())
       assert PubSubCmd.handle("PUBLISH", ["guard-pattern:3", "cleared"]) == 1
       assert_receive {:pubsub_pmessage, "guard-pattern:*", "guard-pattern:3", "cleared"}
+    end
+
+    test "high-fanout cache removal drops prepared-capable guarded deliveries" do
+      channel = "prepared-removal:channel"
+      pattern = "prepared-removal:*"
+      subscribers = Enum.map(1..32, fn _index -> spawn(fn -> Process.sleep(:infinity) end) end)
+
+      on_exit(fn ->
+        Enum.each(subscribers, fn pid ->
+          if Process.alive?(pid), do: Process.exit(pid, :kill)
+        end)
+      end)
+
+      Enum.each(subscribers, fn pid ->
+        PubSub.subscribe(channel, pid)
+        PubSub.psubscribe(pattern, pid)
+      end)
+
+      assert :ok =
+               PubSub.set_delivery_guard(
+                 self(),
+                 fn _bytes -> {:ok, :prepared_removal_lease} end,
+                 prepared_batches: true
+               )
+
+      PubSub.subscribe(channel, self())
+      PubSub.psubscribe(pattern, self())
+      PubSub.unsubscribe(channel, self())
+      PubSub.punsubscribe(pattern, self())
+
+      assert PubSub.publish(channel, "after-removal") == 64
+      refute_receive {:pubsub_message, ^channel, "after-removal", _lease}
+      refute_receive {:pubsub_pmessage, ^pattern, ^channel, "after-removal", _lease}
     end
 
     test "a delivery guard failure disconnects the slow subscriber without queueing payload" do

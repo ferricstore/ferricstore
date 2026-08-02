@@ -17,7 +17,8 @@ defmodule Ferricstore.PubSub do
     * `:ferricstore_pubsub_channel_cache` —
       `{channel, [delivery], subscriber_count}` entries
       derived from `:ferricstore_pubsub`, where each delivery is an unguarded
-      pid or a guarded `{pid, guard}` pair. `PUBLISH` reads this table so the
+      pid, a guarded `{pid, guard}` pair, or a guarded
+      `{pid, guard, :prepared_batches}` tuple. `PUBLISH` reads this table so the
       hot path avoids copying subscription tuples and looking up each
       subscriber's stable delivery guard on every exact publish.
 
@@ -481,7 +482,19 @@ defmodule Ferricstore.PubSub do
   @spec set_delivery_guard(pid(), (non_neg_integer() -> {:ok, term()} | {:error, term()})) :: :ok
   def set_delivery_guard(pid, guard)
       when is_pid(pid) and pid == self() and is_function(guard, 1) do
-    GenServer.call(__MODULE__, {:set_delivery_guard, pid, guard})
+    set_delivery_guard(pid, guard, [])
+  end
+
+  @doc false
+  @spec set_delivery_guard(
+          pid(),
+          (non_neg_integer() -> {:ok, term()} | {:error, term()}),
+          keyword()
+        ) :: :ok
+  def set_delivery_guard(pid, guard, opts)
+      when is_pid(pid) and pid == self() and is_function(guard, 1) and is_list(opts) do
+    prepared_batches? = Keyword.get(opts, :prepared_batches, false) == true
+    GenServer.call(__MODULE__, {:set_delivery_guard, pid, guard, prepared_batches?})
   end
 
   @doc false
@@ -626,8 +639,8 @@ defmodule Ferricstore.PubSub do
   end
 
   @impl true
-  def handle_call({:set_delivery_guard, pid, guard}, _from, state) do
-    :ets.insert(@delivery_guards_table, {pid, guard})
+  def handle_call({:set_delivery_guard, pid, guard, prepared_batches?}, _from, state) do
+    :ets.insert(@delivery_guards_table, {pid, guard, prepared_batches?})
     rebuild_exact_channels(exact_channels_for_pid(pid))
     rebuild_patterns(patterns_for_pid(pid))
     ensure_monitor_local(pid)
@@ -919,6 +932,9 @@ defmodule Ferricstore.PubSub do
   defp remove_delivery_for_pid([pid | rest], pid, acc) when is_pid(pid),
     do: Enum.reverse(acc, rest)
 
+  defp remove_delivery_for_pid([{pid, _guard, :prepared_batches} | rest], pid, acc),
+    do: Enum.reverse(acc, rest)
+
   defp remove_delivery_for_pid([{pid, _guard} | rest], pid, acc),
     do: Enum.reverse(acc, rest)
 
@@ -1021,6 +1037,8 @@ defmodule Ferricstore.PubSub do
     case :ets.lookup(@delivery_guards_table, pid) do
       [] -> pid
       [{^pid, guard}] -> {pid, guard}
+      [{^pid, guard, true}] -> {pid, guard, :prepared_batches}
+      [{^pid, guard, false}] -> {pid, guard}
     end
   end
 
@@ -1368,30 +1386,44 @@ defmodule Ferricstore.PubSub do
         counts
 
       pattern_count when pattern_count <= @pattern_linear_scan_limit ->
-        counts = publish_planned_same_channel_many(channel, messages)
+        counts = publish_planned_same_channel_many(channel, messages, batch_preparer)
         record_publish_batch(channel, messages, counts)
         counts
 
       _high_pattern_count ->
-        counts = publish_indexed_same_channel_many(channel, messages)
+        counts = publish_indexed_same_channel_many(channel, messages, batch_preparer)
         record_publish_batch(channel, messages, counts)
         counts
     end
   end
 
-  defp publish_planned_same_channel_many(channel, messages) do
-    publish_planned_same_channel_many(channel, messages, matching_pattern_deliveries(channel))
-  end
-
-  defp publish_indexed_same_channel_many(channel, messages) do
+  defp publish_planned_same_channel_many(channel, messages, batch_preparer) do
     publish_planned_same_channel_many(
       channel,
       messages,
+      batch_preparer,
+      matching_pattern_deliveries(channel)
+    )
+  end
+
+  defp publish_indexed_same_channel_many(channel, messages, batch_preparer) do
+    publish_planned_same_channel_many(
+      channel,
+      messages,
+      batch_preparer,
       matching_indexed_pattern_deliveries(channel)
     )
   end
 
-  defp publish_planned_same_channel_many(channel, messages, pattern_deliveries) do
+  defp publish_planned_same_channel_many(channel, messages, batch_preparer, []),
+    do: publish_exact_same_channel_many(channel, messages, batch_preparer)
+
+  defp publish_planned_same_channel_many(
+         channel,
+         messages,
+         _batch_preparer,
+         pattern_deliveries
+       ) do
     exact_deliveries =
       case :ets.lookup(@channel_cache_table, channel) do
         [{^channel, deliveries, _subscriber_count}] -> deliveries
@@ -1569,39 +1601,28 @@ defmodule Ferricstore.PubSub do
   defp publish_exact_same_channel_many(channel, messages, batch_preparer) do
     case :ets.lookup(@channel_cache_table, channel) do
       [{^channel, deliveries, _subscriber_count}] ->
-        prepared_batch = prepare_pubsub_batch(batch_preparer, deliveries, channel, messages)
         batch_bytes = exact_batch_delivery_bytes(channel, messages)
+
+        preparation_state =
+          if is_nil(batch_preparer),
+            do: :batch_preparation_disabled,
+            else: :awaiting_first_prepared_delivery
 
         publish_exact_batch_deliveries(
           deliveries,
           channel,
           messages,
-          prepared_batch,
-          batch_bytes
+          batch_preparer,
+          batch_bytes,
+          preparation_state,
+          0,
+          List.duplicate(0, length(messages))
         )
 
       [] ->
         List.duplicate(0, length(messages))
     end
   end
-
-  defp prepare_pubsub_batch(nil, _deliveries, _channel, _messages), do: nil
-
-  defp prepare_pubsub_batch(batch_preparer, deliveries, channel, messages) do
-    if multiple_guarded_deliveries?(deliveries, 0),
-      do: batch_preparer.(channel, messages),
-      else: nil
-  end
-
-  defp multiple_guarded_deliveries?(_deliveries, 2), do: true
-
-  defp multiple_guarded_deliveries?([{_pid, _guard} | rest], count),
-    do: multiple_guarded_deliveries?(rest, count + 1)
-
-  defp multiple_guarded_deliveries?([_pid | rest], count),
-    do: multiple_guarded_deliveries?(rest, count)
-
-  defp multiple_guarded_deliveries?([], _count), do: false
 
   defp exact_batch_delivery_bytes(channel, messages) do
     channel_bytes = byte_size(channel) + @delivery_overhead_bytes
@@ -1612,113 +1633,288 @@ defmodule Ferricstore.PubSub do
          deliveries,
          channel,
          messages,
-         prepared_batch,
-         batch_bytes
+         batch_preparer,
+         batch_bytes,
+         preparation_state,
+         complete_deliveries,
+         partial_counts
        ) do
-    {complete_deliveries, partial_counts} =
-      publish_exact_batch_deliveries(
+    {complete_deliveries, partial_counts, preparation_state} =
+      publish_admitted_exact_batch_deliveries(
         deliveries,
         channel,
         messages,
-        prepared_batch,
+        batch_preparer,
         batch_bytes,
-        0,
-        List.duplicate(0, length(messages))
+        preparation_state,
+        complete_deliveries,
+        partial_counts
       )
 
+    maybe_send_single_prepared_delivery(preparation_state, channel, messages)
     Enum.map(partial_counts, &(&1 + complete_deliveries))
   end
 
-  defp publish_exact_batch_deliveries(
+  defp publish_admitted_exact_batch_deliveries(
          [pid | rest],
          channel,
          messages,
-         prepared_batch,
+         batch_preparer,
          batch_bytes,
+         preparation_state,
          complete_deliveries,
          partial_counts
        )
        when is_pid(pid) do
     Enum.each(messages, &send(pid, {:pubsub_message, channel, &1}))
 
-    publish_exact_batch_deliveries(
+    publish_admitted_exact_batch_deliveries(
       rest,
       channel,
       messages,
-      prepared_batch,
+      batch_preparer,
       batch_bytes,
+      preparation_state,
       complete_deliveries + 1,
       partial_counts
     )
   end
 
-  defp publish_exact_batch_deliveries(
-         [{pid, guard} = delivery | rest],
+  defp publish_admitted_exact_batch_deliveries(
+         [{pid, guard, :prepared_batches} = delivery | rest],
          channel,
          messages,
-         prepared_batch,
+         batch_preparer,
          batch_bytes,
+         preparation_state,
          complete_deliveries,
          partial_counts
        ) do
     case reserve_guarded_delivery(guard, batch_bytes) do
-      {:ok, nil} ->
-        send_pubsub_batch(pid, channel, messages, prepared_batch, nil)
-
-        publish_exact_batch_deliveries(
+      {:ok, lease} ->
+        admit_prepared_exact_batch_delivery(
+          pid,
+          lease,
           rest,
           channel,
           messages,
-          prepared_batch,
+          batch_preparer,
           batch_bytes,
-          complete_deliveries + 1,
+          preparation_state,
+          complete_deliveries,
           partial_counts
         )
 
-      {:ok, lease} ->
-        send_pubsub_batch(pid, channel, messages, prepared_batch, lease)
-
-        publish_exact_batch_deliveries(
+      :rejected ->
+        publish_after_rejected_exact_batch_delivery(
+          delivery,
           rest,
           channel,
           messages,
-          prepared_batch,
+          batch_preparer,
           batch_bytes,
+          preparation_state,
+          complete_deliveries,
+          partial_counts
+        )
+    end
+  end
+
+  defp publish_admitted_exact_batch_deliveries(
+         [{pid, guard} = delivery | rest],
+         channel,
+         messages,
+         batch_preparer,
+         batch_bytes,
+         preparation_state,
+         complete_deliveries,
+         partial_counts
+       ) do
+    case reserve_guarded_delivery(guard, batch_bytes) do
+      {:ok, lease} ->
+        send_pubsub_batch(pid, channel, messages, nil, lease)
+
+        publish_admitted_exact_batch_deliveries(
+          rest,
+          channel,
+          messages,
+          batch_preparer,
+          batch_bytes,
+          preparation_state,
           complete_deliveries + 1,
           partial_counts
         )
 
       :rejected ->
-        delivery_counts =
-          Enum.map(messages, fn message ->
-            case deliver_exact(delivery, channel, message, exact_delivery_bytes(channel, message)) do
-              :sent -> 1
-              :rejected -> 0
-            end
-          end)
-
-        publish_exact_batch_deliveries(
+        publish_after_rejected_exact_batch_delivery(
+          delivery,
           rest,
           channel,
           messages,
-          prepared_batch,
+          batch_preparer,
           batch_bytes,
+          preparation_state,
           complete_deliveries,
-          add_publish_counts(partial_counts, delivery_counts, [])
+          partial_counts
         )
     end
   end
 
-  defp publish_exact_batch_deliveries(
+  defp publish_admitted_exact_batch_deliveries(
          [],
          _channel,
          _messages,
-         _prepared_batch,
+         _batch_preparer,
          _batch_bytes,
+         preparation_state,
          complete_deliveries,
          partial_counts
        ),
-       do: {complete_deliveries, partial_counts}
+       do: {complete_deliveries, partial_counts, preparation_state}
+
+  defp admit_prepared_exact_batch_delivery(
+         pid,
+         lease,
+         rest,
+         channel,
+         messages,
+         batch_preparer,
+         batch_bytes,
+         :batch_preparation_disabled,
+         complete_deliveries,
+         partial_counts
+       ) do
+    send_pubsub_batch(pid, channel, messages, nil, lease)
+
+    publish_admitted_exact_batch_deliveries(
+      rest,
+      channel,
+      messages,
+      batch_preparer,
+      batch_bytes,
+      :batch_preparation_disabled,
+      complete_deliveries + 1,
+      partial_counts
+    )
+  end
+
+  defp admit_prepared_exact_batch_delivery(
+         pid,
+         lease,
+         rest,
+         channel,
+         messages,
+         batch_preparer,
+         batch_bytes,
+         :awaiting_first_prepared_delivery,
+         complete_deliveries,
+         partial_counts
+       ) do
+    publish_admitted_exact_batch_deliveries(
+      rest,
+      channel,
+      messages,
+      batch_preparer,
+      batch_bytes,
+      {:awaiting_second_prepared_delivery, pid, lease},
+      complete_deliveries + 1,
+      partial_counts
+    )
+  end
+
+  defp admit_prepared_exact_batch_delivery(
+         pid,
+         lease,
+         rest,
+         channel,
+         messages,
+         batch_preparer,
+         batch_bytes,
+         {:awaiting_second_prepared_delivery, first_pid, first_lease},
+         complete_deliveries,
+         partial_counts
+       ) do
+    prepared_batch = batch_preparer.(channel, messages)
+    send_pubsub_batch(first_pid, channel, messages, prepared_batch, first_lease)
+    send_pubsub_batch(pid, channel, messages, prepared_batch, lease)
+
+    publish_admitted_exact_batch_deliveries(
+      rest,
+      channel,
+      messages,
+      batch_preparer,
+      batch_bytes,
+      {:prepared_batch, prepared_batch},
+      complete_deliveries + 1,
+      partial_counts
+    )
+  end
+
+  defp admit_prepared_exact_batch_delivery(
+         pid,
+         lease,
+         rest,
+         channel,
+         messages,
+         batch_preparer,
+         batch_bytes,
+         {:prepared_batch, prepared_batch} = preparation_state,
+         complete_deliveries,
+         partial_counts
+       ) do
+    send_pubsub_batch(pid, channel, messages, prepared_batch, lease)
+
+    publish_admitted_exact_batch_deliveries(
+      rest,
+      channel,
+      messages,
+      batch_preparer,
+      batch_bytes,
+      preparation_state,
+      complete_deliveries + 1,
+      partial_counts
+    )
+  end
+
+  defp publish_after_rejected_exact_batch_delivery(
+         delivery,
+         rest,
+         channel,
+         messages,
+         batch_preparer,
+         batch_bytes,
+         preparation_state,
+         complete_deliveries,
+         partial_counts
+       ) do
+    delivery_counts =
+      Enum.map(messages, fn message ->
+        case deliver_exact(delivery, channel, message, exact_delivery_bytes(channel, message)) do
+          :sent -> 1
+          :rejected -> 0
+        end
+      end)
+
+    publish_admitted_exact_batch_deliveries(
+      rest,
+      channel,
+      messages,
+      batch_preparer,
+      batch_bytes,
+      preparation_state,
+      complete_deliveries,
+      add_publish_counts(partial_counts, delivery_counts, [])
+    )
+  end
+
+  defp maybe_send_single_prepared_delivery(
+         {:awaiting_second_prepared_delivery, pid, lease},
+         channel,
+         messages
+       ),
+       do: send_pubsub_batch(pid, channel, messages, nil, lease)
+
+  defp maybe_send_single_prepared_delivery(_preparation_state, _channel, _messages), do: :ok
 
   defp send_pubsub_batch(pid, channel, messages, nil, nil),
     do: send(pid, {:pubsub_messages, channel, messages})
@@ -1759,6 +1955,9 @@ defmodule Ferricstore.PubSub do
         reject_slow_subscriber(pid)
     end
   end
+
+  defp deliver_exact({pid, guard, :prepared_batches}, channel, message, bytes),
+    do: deliver_exact({pid, guard}, channel, message, bytes)
 
   defp publish_pattern_deliveries(
          [delivery | rest],
@@ -1806,6 +2005,9 @@ defmodule Ferricstore.PubSub do
         reject_slow_subscriber(pid)
     end
   end
+
+  defp deliver_pattern({pid, guard, :prepared_batches}, pattern, channel, message, bytes),
+    do: deliver_pattern({pid, guard}, pattern, channel, message, bytes)
 
   defp reserve_guarded_delivery(guard, bytes) do
     case guard.(bytes) do

@@ -1,14 +1,39 @@
 # Benchmarks
 
-This page keeps only the latest public benchmark summaries. Raw benchmark logs and one-off profiling runs are intentionally not committed.
+This page keeps public benchmark summaries. Raw benchmark logs and one-off
+profiling runs are intentionally not committed, so these are historical
+reference points rather than a self-contained reproducible artifact.
 
-Use these numbers as reproducible reference points, not universal hardware claims. Throughput and latency depend on VM type, local NVMe availability, shard count, client concurrency, pipeline depth, payload size, and resource guards.
+Use the commands and commit endpoints below for matched reruns; do not treat the
+recorded numbers as universal hardware claims. Throughput and latency depend on
+VM type, local NVMe availability, shard count, client concurrency, pipeline
+depth, payload size, and resource guards.
 
 ## FerricStore PubSub: compact native pipeline
 
 These loopback TCP measurements use pipeline depth 8 and 256-byte messages.
 Every subscriber acknowledgement, publish count, pushed delivery, and
 slow-consumer isolation check is validated by the runner.
+
+The batch-aware comparison used `9dfa241f` as its per-item endpoint and
+`5e189fa8` as its batch-aware endpoint. The negotiated batch-event comparison
+used `f46aa319` and the runner's `BENCH_PUBSUB_BATCH_EVENTS=0/1` switch. The
+recorded host was an Apple M4 Max. A representative matched command is:
+
+```bash
+BENCH_PUBSUB_CONCURRENCIES=1,4 \
+BENCH_PUBSUB_PUBLISHES_PER_PUBLISHER=4096 \
+BENCH_PUBSUB_LOAD_FANOUT=8 \
+BENCH_PUBSUB_PUBLISH_PIPELINE=8 \
+BENCH_PUBSUB_PIPELINE_ENCODING=compact \
+BENCH_PUBSUB_SKIP_SLOW_PHASE=1 \
+MIX_ENV=bench mix run --no-start bench/native_pubsub_load_bench.exs
+```
+
+Run fanout `1` and `8` separately and retain at least three samples per cell.
+For the depth-1,024 negotiated gate, set 65,536 publishes per publisher,
+pipeline depth 1,024, and toggle `BENCH_PUBSUB_BATCH_EVENTS` between `0` and
+`1`.
 
 ### Protocol-only comparison before batch-aware fanout
 

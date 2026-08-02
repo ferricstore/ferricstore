@@ -15,6 +15,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
   alias FerricstoreServer.Native.Codec
   alias FerricstoreServer.Native.Commands
+  alias FerricstoreServer.Native.Connection.PreparedPubSubBatch
   alias FerricstoreServer.Native.Session
   alias FerricstoreServer.Native.StreamRangeResponse
   alias Ferricstore.AuditLog
@@ -1342,6 +1343,67 @@ defmodule FerricstoreServer.Native.CommandsTest do
     refute_receive {:compact_pubsub_batch_reserved, _bytes}
 
     assert_receive {:pubsub_messages, ^channel, ["one", "two"], :compact_pubsub_batch_lease}
+  end
+
+  test "compact PubSub pipeline prepares bounded batch envelopes once for fanout" do
+    parent = self()
+    channel = "native:pubsub:bounded:#{System.unique_integer([:positive, :monotonic])}"
+    messages = [String.duplicate("x", 80), String.duplicate("y", 80)]
+
+    subscribers =
+      Enum.map(1..2, fn _index ->
+        spawn(fn ->
+          :ok =
+            PubSub.set_delivery_guard(
+              self(),
+              fn _bytes -> {:ok, :bounded_batch_lease} end,
+              prepared_batches: true
+            )
+
+          :ok = PubSub.subscribe(channel, self())
+          send(parent, {:bounded_batch_ready, self()})
+
+          receive do
+            event -> send(parent, {:bounded_batch_event, self(), event})
+          end
+        end)
+      end)
+
+    on_exit(fn ->
+      Enum.each(subscribers, fn pid ->
+        if Process.alive?(pid), do: Process.exit(pid, :kill)
+      end)
+    end)
+
+    Enum.each(subscribers, fn pid ->
+      assert_receive {:bounded_batch_ready, ^pid}
+    end)
+
+    assert {:ok, _result, _state} =
+             Commands.execute(
+               @op_pipeline,
+               %{
+                 "compact_count" => 2,
+                 "compact_values" => true,
+                 "compact_pipeline" => {35, Enum.map(messages, &{channel, &1})}
+               },
+               state(%{max_response_bytes: 202})
+             )
+
+    [first_pid, second_pid] = subscribers
+
+    assert_receive {:bounded_batch_event, ^first_pid,
+                    {:pubsub_messages, ^channel, ^messages, %PreparedPubSubBatch{} = prepared,
+                     :bounded_batch_lease}}
+
+    assert prepared.bounded_response_bytes == 202
+    assert length(prepared.bounded_encoded_values) == 2
+
+    assert_receive {:bounded_batch_event, ^second_pid,
+                    {:pubsub_messages, ^channel, ^messages,
+                     %PreparedPubSubBatch{} = second_prepared, :bounded_batch_lease}}
+
+    assert second_prepared == prepared
   end
 
   test "typed PubSub pipeline reuses one guarded batch delivery" do

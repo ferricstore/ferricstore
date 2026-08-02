@@ -256,7 +256,7 @@ PubSub pushes use `event: "PUBSUB_MESSAGE"`. The legacy payload is one
 request `pubsub_batch_v1` in `compact_response_codecs` after verifying that
 `OPTIONS.response_codecs.compact_response_opcodes.pubsub_batch_v1` contains
 `0x0010`. For an ordered same-channel publish batch, the server may then send
-one ordinary typed-value event envelope:
+one or more ordinary typed-value event envelopes. A bounded batch envelope is:
 
 ```text
 event: "PUBSUB_MESSAGE"
@@ -267,10 +267,16 @@ payload:
   messages: ordered list of binaries
 ```
 
-The frame does not set the custom-payload flag. SDKs must expand `messages` in
-order into their existing per-message API shape and apply event-buffer limits
-to the expanded logical messages. Connections that do not negotiate the codec
-continue receiving one legacy event frame per message.
+The frame does not set the custom-payload flag. When the configured response
+limit cannot hold the complete list, the server splits it across multiple
+`message_batch` envelopes. An individual message that cannot share even an
+otherwise-empty batch envelope may use the legacy `kind: "message"` envelope.
+The concatenated logical messages always retain publish order.
+
+SDKs must expand `messages` in order into their existing per-message API shape,
+accept the bounded legacy fallback, and apply event-buffer limits to the
+expanded logical messages. Connections that do not negotiate the codec continue
+receiving one legacy event frame per message.
 
 Supported events:
 

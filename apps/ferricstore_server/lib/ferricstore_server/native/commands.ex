@@ -5667,7 +5667,7 @@ defmodule FerricstoreServer.Native.Commands do
 
         results =
           publishes
-          |> publish_many_with_shared_native_batch()
+          |> publish_many_with_shared_native_batch(state)
           |> pipeline_pubsub_results(requests)
 
         {:ok, results}
@@ -5970,7 +5970,7 @@ defmodule FerricstoreServer.Native.Commands do
        when is_list(items) do
     Stats.incr_commands_by(state.stats_counter, length(items))
 
-    results = publish_many_with_shared_native_batch(items)
+    results = publish_many_with_shared_native_batch(items, state)
 
     {:ok, format_compact_pipeline_results(results, @op_command_exec, return_format)}
   end
@@ -6365,12 +6365,15 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp execute_compact_pipeline_fast_path(_mode, _items, _return_format, _state), do: :fallback
 
-  defp publish_many_with_shared_native_batch(publishes) do
+  defp publish_many_with_shared_native_batch(publishes, state) do
+    max_response_bytes = native_max_response_bytes(state)
+
     Ferricstore.PubSub.publish_many(publishes, fn channel, messages ->
       Responses.prepare_pubsub_message_batch(
         channel,
         messages,
-        System.system_time(:millisecond)
+        System.system_time(:millisecond),
+        max_response_bytes
       )
     end)
   end

@@ -9,7 +9,12 @@ defmodule FerricstoreServer.Native.Connection.PubSubCoalescer do
           | {:pubsub_pmessage, binary(), binary(), binary()}
           | {:pubsub_pmessage, binary(), binary(), binary(), term()}
 
-  @spec collect(event(), pos_integer(), pos_integer()) :: [event()]
+  @spec collect(event(), term(), term()) :: {[event()], term() | nil}
+  def collect(first, max_events, max_bytes)
+      when not is_integer(max_events) or max_events <= 0 or not is_integer(max_bytes) or
+             max_bytes <= 0,
+      do: {[first], nil}
+
   def collect(first, max_events, max_bytes)
       when is_integer(max_events) and max_events > 0 and is_integer(max_bytes) and max_bytes > 0 do
     collect_ready([first], 1, event_bytes(first), max_events, max_bytes)
@@ -34,23 +39,47 @@ defmodule FerricstoreServer.Native.Connection.PubSubCoalescer do
 
   defp collect_ready(acc, count, bytes, max_events, max_bytes)
        when count >= max_events or bytes >= max_bytes,
-       do: Enum.reverse(acc)
+       do: {Enum.reverse(acc), nil}
 
   defp collect_ready(acc, count, bytes, max_events, max_bytes) do
     receive do
-      {:pubsub_message, channel, message} = event ->
-        collect_event(event, channel, message, acc, count, bytes, max_events, max_bytes)
+      message ->
+        case message do
+          {:pubsub_message, channel, event_message} = event ->
+            collect_event(
+              event,
+              channel,
+              event_message,
+              acc,
+              count,
+              bytes,
+              max_events,
+              max_bytes
+            )
 
-      {:pubsub_message, channel, message, _lease} = event ->
-        collect_event(event, channel, message, acc, count, bytes, max_events, max_bytes)
+          {:pubsub_message, channel, event_message, _lease} = event ->
+            collect_event(
+              event,
+              channel,
+              event_message,
+              acc,
+              count,
+              bytes,
+              max_events,
+              max_bytes
+            )
 
-      {:pubsub_pmessage, _pattern, _channel, _message} = event ->
-        collect_event(event, acc, count, bytes, max_events, max_bytes)
+          {:pubsub_pmessage, _pattern, _channel, _message} = event ->
+            collect_event(event, acc, count, bytes, max_events, max_bytes)
 
-      {:pubsub_pmessage, _pattern, _channel, _message, _lease} = event ->
-        collect_event(event, acc, count, bytes, max_events, max_bytes)
+          {:pubsub_pmessage, _pattern, _channel, _message, _lease} = event ->
+            collect_event(event, acc, count, bytes, max_events, max_bytes)
+
+          barrier ->
+            {Enum.reverse(acc), barrier}
+        end
     after
-      0 -> Enum.reverse(acc)
+      0 -> {Enum.reverse(acc), nil}
     end
   end
 

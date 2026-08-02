@@ -12,7 +12,7 @@ defmodule FerricstoreServer.Native.PubSubCoalescerTest do
     send(self(), third)
     send(self(), :after_pubsub_burst)
 
-    assert PubSubCoalescer.collect(first, 2, 1_024) == [first, second]
+    assert PubSubCoalescer.collect(first, 2, 1_024) == {[first, second], nil}
     assert_receive ^third
     assert_receive :after_pubsub_burst
   end
@@ -23,7 +23,46 @@ defmodule FerricstoreServer.Native.PubSubCoalescerTest do
 
     send(self(), second)
 
-    assert PubSubCoalescer.collect(first, 64, PubSubCoalescer.event_bytes(first)) == [first]
+    assert PubSubCoalescer.collect(first, 64, PubSubCoalescer.event_bytes(first)) ==
+             {[first], nil}
+
+    assert_receive ^second
+  end
+
+  test "stops at an earlier control message instead of scanning past it" do
+    first = {:pubsub_message, "channel", "one"}
+    control = {:acl_invalidate, "alice", 7}
+    second = {:pubsub_message, "channel", "two"}
+
+    send(self(), control)
+    send(self(), second)
+
+    assert PubSubCoalescer.collect(first, 64, 1_024) == {[first], control}
+    assert_receive ^second
+  end
+
+  test "a non-positive byte cap disables coalescing without crashing" do
+    first = {:pubsub_message, "channel", "one"}
+    second = {:pubsub_message, "channel", "two"}
+
+    send(self(), second)
+
+    assert PubSubCoalescer.collect(first, 64, 0) == {[first], nil}
+    assert_receive ^second
+  end
+
+  test "invalid coalescing limits disable coalescing without crashing" do
+    first = {:pubsub_message, "orders", "one"}
+    second = {:pubsub_message, "orders", "two"}
+
+    send(self(), second)
+
+    assert PubSubCoalescer.collect(first, :invalid, 1_024) == {[first], nil}
+    assert_receive ^second
+
+    send(self(), second)
+
+    assert PubSubCoalescer.collect(first, 64, :invalid) == {[first], nil}
     assert_receive ^second
   end
 end
