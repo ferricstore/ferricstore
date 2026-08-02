@@ -384,6 +384,18 @@ defmodule Ferricstore.Flow.ScheduleCatchupTest do
     assert schedule.fire_count == 1
     assert schedule.skipped_count == 1
     assert schedule.next_run_at_ms == nil
+
+    internal_id = Ferricstore.Flow.Schedule.flow_id(schedule_id)
+    partition_key = "__ferricstore_schedule__:#{:erlang.phash2(schedule_id, 256)}"
+
+    assert {:ok, internal_schedule} =
+             Ferricstore.Flow.get(
+               FerricStore.Instance.get(:default),
+               internal_id,
+               Ferricstore.Flow.Internal.put(partition_key: partition_key)
+             )
+
+    assert internal_schedule.terminal_retention_until_ms == max_exact_integer
   end
 
   test "an elapsed end bound takes precedence over recovery timestamp overflow" do

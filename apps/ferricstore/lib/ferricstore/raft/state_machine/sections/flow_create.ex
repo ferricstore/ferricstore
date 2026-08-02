@@ -50,6 +50,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       alias Ferricstore.Transaction.Ast, as: TxAst
 
       @flow_state_enter_seq_offset_span 4_294_967_296
+      @flow_max_exact_timestamp_ms 9_007_199_254_740_991
 
       defp flow_create_existing_state(state, %{idempotent: true}, state_key) do
         flow_read_record_by_key(state, state_key)
@@ -620,8 +621,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           retention_ttl_ms = Map.get(record, :retention_ttl_ms)
 
           if is_integer(retention_ttl_ms) and retention_ttl_ms > 0 do
-            retention_start_ms = max(now_ms, apply_now_ms())
-            Map.put(record, :terminal_retention_until_ms, retention_start_ms + retention_ttl_ms)
+            retention_start_ms =
+              now_ms
+              |> max(apply_now_ms())
+              |> min(@flow_max_exact_timestamp_ms)
+
+            retention_until_ms =
+              min(retention_start_ms + retention_ttl_ms, @flow_max_exact_timestamp_ms)
+
+            Map.put(record, :terminal_retention_until_ms, retention_until_ms)
           else
             Map.put(record, :terminal_retention_until_ms, nil)
           end
