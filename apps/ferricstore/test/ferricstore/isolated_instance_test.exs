@@ -10,6 +10,19 @@ defmodule Ferricstore.IsolatedInstanceTest do
   test "checkin releases each cached LMDB environment" do
     assert {:ok, _released} = Ferricstore.Flow.LMDB.release_all()
 
+    unrelated_path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_unrelated_lmdb_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn ->
+      Ferricstore.Flow.LMDB.release(unrelated_path, 30_000)
+      File.rm_rf!(unrelated_path)
+    end)
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(unrelated_path, [{:put, "other", "value"}])
+
     ctx = IsolatedInstance.checkout(shard_count: 1)
 
     lmdb_path =
@@ -20,7 +33,12 @@ defmodule Ferricstore.IsolatedInstanceTest do
     assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:put, "key", "value"}])
     assert {:ok, "value"} = Ferricstore.Flow.LMDB.get(lmdb_path, "key")
     assert :ok = IsolatedInstance.checkin(ctx)
-    assert {:ok, 0} = Ferricstore.Flow.LMDB.release_all()
+
+    File.mkdir_p!(lmdb_path)
+    on_exit(fn -> File.rm_rf!(ctx.data_dir) end)
+
+    assert {:ok, 0} = Ferricstore.Bitcask.NIF.lmdb_release(lmdb_path)
+    assert {:ok, 1} = Ferricstore.Bitcask.NIF.lmdb_release(unrelated_path)
   end
 
   test "checkin tolerates an instance data directory removed by a failure test" do
