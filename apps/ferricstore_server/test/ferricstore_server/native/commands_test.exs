@@ -15,9 +15,11 @@ defmodule FerricstoreServer.Native.CommandsTest do
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
   alias FerricstoreServer.Native.Codec
   alias FerricstoreServer.Native.Commands
+  alias FerricstoreServer.Native.Connection.PreparedPubSubBatch
   alias FerricstoreServer.Native.Session
   alias FerricstoreServer.Native.StreamRangeResponse
   alias Ferricstore.AuditLog
+  alias Ferricstore.PubSub
   alias Ferricstore.Stats
   alias Ferricstore.Test.IsolatedInstance
 
@@ -615,6 +617,22 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert payload.capabilities.response_codecs.selected_compact == ["flow_query_result_v1"]
   end
 
+  test "STARTUP negotiates batched PubSub events explicitly" do
+    assert {:ok, payload, negotiated} =
+             Commands.execute(
+               @op_startup,
+               %{"compact_response_codecs" => ["pubsub_batch_v1"]},
+               state()
+             )
+
+    assert negotiated.compact_response_codecs == MapSet.new(["pubsub_batch_v1"])
+    assert payload.capabilities.response_codecs.selected_compact == ["pubsub_batch_v1"]
+
+    assert payload.capabilities.response_codecs.compact_response_opcodes["pubsub_batch_v1"] == [
+             0x0010
+           ]
+  end
+
   test "STARTUP rejects malformed, duplicate, and unsupported response codec requests" do
     for {response_codecs, expected} <- [
           {"flow_query_result_v1", "must be a list"},
@@ -650,13 +668,14 @@ defmodule FerricstoreServer.Native.CommandsTest do
              "kv_get_v1" => [0x0101],
              "kv_mget_v1" => [0x0104, 0x020C],
              "ok_list_v1" => [0x0102, 0x0105, 0x020F, 0x0210, 0x0212, 0x0213, 0x0214],
-             "pipeline_v1" => [0x000E]
+             "pipeline_v1" => [0x000E],
+             "pubsub_batch_v1" => [0x0010]
            }
 
     assert payload.pipeline == %{
              compact_request: "pipeline_v1",
              values_only_mode_bit: 0x80,
-             modes: %{stream_xadd_auto: 34}
+             modes: %{pubsub_publish: 35, stream_xadd_auto: 34}
            }
 
     assert "FLOW.CREATE" in schema_names(payload)
@@ -1292,6 +1311,156 @@ defmodule FerricstoreServer.Native.CommandsTest do
                %{"command" => "XLEN", "args" => [key]},
                native_state
              )
+  end
+
+  test "compact PubSub pipeline publishes in order and returns compact subscriber counts" do
+    channel = "native:pubsub:compact:#{System.unique_integer([:positive, :monotonic])}"
+    test_pid = self()
+
+    :ok =
+      PubSub.set_delivery_guard(self(), fn bytes ->
+        send(test_pid, {:compact_pubsub_batch_reserved, bytes})
+        {:ok, :compact_pubsub_batch_lease}
+      end)
+
+    :ok = PubSub.subscribe(channel, self())
+    on_exit(fn -> PubSub.cleanup(self()) end)
+    response_tag = Codec.compact_tags().integer_list
+
+    assert {:ok, <<^response_tag, 2::unsigned-32, 1::signed-64, 1::signed-64>>, _state} =
+             Commands.execute(
+               @op_pipeline,
+               %{
+                 "compact_count" => 2,
+                 "compact_values" => true,
+                 "compact_pipeline" => {35, [{channel, "one"}, {channel, "two"}]}
+               },
+               state()
+             )
+
+    assert_receive {:compact_pubsub_batch_reserved, reserved_bytes}
+    assert reserved_bytes > byte_size(channel) * 2 + byte_size("one") + byte_size("two")
+    refute_receive {:compact_pubsub_batch_reserved, _bytes}
+
+    assert_receive {:pubsub_messages, ^channel, ["one", "two"], :compact_pubsub_batch_lease}
+  end
+
+  test "compact PubSub pipeline prepares bounded batch envelopes once for fanout" do
+    parent = self()
+    channel = "native:pubsub:bounded:#{System.unique_integer([:positive, :monotonic])}"
+    messages = [String.duplicate("x", 80), String.duplicate("y", 80)]
+
+    subscribers =
+      Enum.map(1..2, fn _index ->
+        spawn(fn ->
+          :ok =
+            PubSub.set_delivery_guard(
+              self(),
+              fn _bytes -> {:ok, :bounded_batch_lease} end,
+              prepared_batches: true
+            )
+
+          :ok = PubSub.subscribe(channel, self())
+          send(parent, {:bounded_batch_ready, self()})
+
+          receive do
+            event -> send(parent, {:bounded_batch_event, self(), event})
+          end
+        end)
+      end)
+
+    on_exit(fn ->
+      Enum.each(subscribers, fn pid ->
+        if Process.alive?(pid), do: Process.exit(pid, :kill)
+      end)
+    end)
+
+    Enum.each(subscribers, fn pid ->
+      assert_receive {:bounded_batch_ready, ^pid}
+    end)
+
+    assert {:ok, _result, _state} =
+             Commands.execute(
+               @op_pipeline,
+               %{
+                 "compact_count" => 2,
+                 "compact_values" => true,
+                 "compact_pipeline" => {35, Enum.map(messages, &{channel, &1})}
+               },
+               state(%{max_response_bytes: 202})
+             )
+
+    [first_pid, second_pid] = subscribers
+
+    assert_receive {:bounded_batch_event, ^first_pid,
+                    {:pubsub_messages, ^channel, ^messages, %PreparedPubSubBatch{} = prepared,
+                     :bounded_batch_lease}}
+
+    assert prepared.bounded_response_bytes == 202
+    assert length(prepared.bounded_encoded_values) == 2
+
+    assert_receive {:bounded_batch_event, ^second_pid,
+                    {:pubsub_messages, ^channel, ^messages,
+                     %PreparedPubSubBatch{} = second_prepared, :bounded_batch_lease}}
+
+    assert second_prepared == prepared
+  end
+
+  test "typed PubSub pipeline reuses one guarded batch delivery" do
+    channel = "native:pubsub:typed:#{System.unique_integer([:positive, :monotonic])}"
+    test_pid = self()
+
+    :ok =
+      PubSub.set_delivery_guard(self(), fn bytes ->
+        send(test_pid, {:typed_pubsub_batch_reserved, bytes})
+        {:ok, :typed_pubsub_batch_lease}
+      end)
+
+    :ok = PubSub.subscribe(channel, self())
+    on_exit(fn -> PubSub.cleanup(self()) end)
+
+    commands =
+      Enum.map(["one", "two"], fn message ->
+        %{
+          "opcode" => @op_command_exec,
+          "request_id" => if(message == "one", do: 1, else: 2),
+          "lane_id" => 3,
+          "body" => %{"command" => "PUBLISH", "args" => [channel, message]}
+        }
+      end)
+
+    assert {:ok, [first, second], _state} =
+             Commands.execute(@op_pipeline, %{"commands" => commands}, state())
+
+    assert %{"request_id" => 1, "lane_id" => 3, "status" => "ok", "value" => 1} = first
+    assert %{"request_id" => 2, "lane_id" => 3, "status" => "ok", "value" => 1} = second
+
+    assert_receive {:typed_pubsub_batch_reserved, reserved_bytes}
+    assert reserved_bytes > byte_size(channel) * 2 + byte_size("one") + byte_size("two")
+    refute_receive {:typed_pubsub_batch_reserved, _bytes}
+
+    assert_receive {:pubsub_messages, ^channel, ["one", "two"], :typed_pubsub_batch_lease}
+  end
+
+  test "compact PubSub pipeline fallback preserves command ACL checks" do
+    username = "compact-publish-denied"
+    put_query_user(username, ["+PIPELINE"])
+    channel = "native:pubsub:compact:denied"
+    :ok = PubSub.subscribe(channel, self())
+    on_exit(fn -> PubSub.cleanup(self()) end)
+
+    assert {:ok, [["noperm", message]], _state} =
+             Commands.execute(
+               @op_pipeline,
+               %{
+                 "return" => "pairs",
+                 "compact_pipeline" => {35, [{channel, "blocked"}]}
+               },
+               state_as(username)
+             )
+
+    assert message =~ "publish"
+    refute_receive {:pubsub_message, ^channel, "blocked"}
   end
 
   test "compact Stream producer keeps reserved-key and same-shard validation" do

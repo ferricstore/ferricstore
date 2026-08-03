@@ -86,6 +86,63 @@ defmodule FerricstoreServer.Native.SessionSubscriptionBudgetTest do
     assert ResourceBudget.usage(budget).outbound_bytes == 0
   end
 
+  @tag :native_subscription_budget
+  test "batched subscription acknowledgements preserve order and count duplicates once" do
+    source =
+      File.read!(Path.expand("../../../lib/ferricstore_server/native/session.ex", __DIR__))
+
+    assert source =~ "&PS.subscribe_unique_many/2"
+    assert source =~ "subscription_acks"
+
+    budget = :"native_subscription_acks_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {ResourceBudget,
+       name: budget,
+       limits: %{
+         executions: 1,
+         lanes: 1,
+         blocking_requests: 1,
+         chunk_streams: 1,
+         chunk_bytes: 1,
+         inbound_bytes: 1,
+         subscription_bytes: 10_000
+       }}
+    )
+
+    state = session_state(budget, 10_000)
+
+    assert {:ok,
+            [
+              ["subscribe", "alpha", 1],
+              ["subscribe", "alpha", 1],
+              ["subscribe", "beta", 2]
+            ], subscribed} =
+             Session.execute(
+               %{"command" => "SUBSCRIBE", "args" => ["alpha", "alpha", "beta"]},
+               state
+             )
+
+    assert {:ok,
+            [
+              ["unsubscribe", "alpha", 1],
+              ["unsubscribe", "alpha", 1],
+              ["unsubscribe", "missing", 1],
+              ["unsubscribe", "beta", 0]
+            ], unsubscribed} =
+             Session.execute(
+               %{
+                 "command" => "UNSUBSCRIBE",
+                 "args" => ["alpha", "alpha", "missing", "beta"]
+               },
+               subscribed
+             )
+
+    assert MapSet.size(unsubscribed.pubsub_channels) == 0
+    assert unsubscribed.pubsub_subscription_bytes == 0
+    Session.clear(unsubscribed)
+  end
+
   defp session_state(budget, max_subscription_bytes) do
     %{
       require_auth: false,

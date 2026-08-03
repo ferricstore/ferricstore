@@ -385,18 +385,47 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.HelpersPart02 do
         do: flunk("WARaft backend leader was not elected for shard #{shard_index}")
 
       defp wait_for_waraft_backend_leader(names, shard_index, attempts) do
-        case Enum.find(names, fn node ->
-               case :rpc.call(node, WARaftBackend, :status, [shard_index]) do
-                 status when is_list(status) -> Keyword.get(status, :state) == :leader
-                 _other -> false
-               end
-             end) do
+        case waraft_backend_leader(names, shard_index) do
           nil ->
             Process.sleep(50)
             wait_for_waraft_backend_leader(names, shard_index, attempts - 1)
 
           leader ->
             leader
+        end
+      end
+
+      defp waraft_backend_leader(names, shard_index) do
+        Enum.find(names, fn node ->
+          case :rpc.call(node, WARaftBackend, :status, [shard_index]) do
+            status when is_list(status) -> Keyword.get(status, :state) == :leader
+            _other -> false
+          end
+        end)
+      end
+
+      defp waraft_put_committed?(names, shard_index, key, value) do
+        if Enum.any?(names, fn node ->
+             :rpc.call(node, WARaftBackend, :local_get, [shard_index, key]) == value
+           end) do
+          true
+        else
+          case waraft_backend_leader(names, shard_index) do
+            nil ->
+              false
+
+            leader ->
+              case :rpc.call(leader, WARaftBackend, :write, [
+                     shard_index,
+                     {:put, key, value, 0}
+                   ]) do
+                :ok -> true
+                {:error, {:timeout, :unknown_outcome}} -> false
+                {:error, :unknown_outcome} -> false
+                {:error, :timeout} -> false
+                _other -> false
+              end
+          end
         end
       end
 

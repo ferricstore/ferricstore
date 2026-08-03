@@ -15,9 +15,16 @@ defmodule Ferricstore.HLCTest do
   setup do
     # Reset the packed atomics slot to 0 so each test starts from a clean
     # slate. Physical and logical are packed into a single 64-bit value.
-    ref = :persistent_term.get(:ferricstore_hlc_ref)
-    :atomics.put(ref, 1, 0)
+    reset_hlc_clock()
+    on_exit(&reset_hlc_clock/0)
     :ok
+  end
+
+  defp reset_hlc_clock do
+    case :persistent_term.get(:ferricstore_hlc_ref, nil) do
+      ref when is_reference(ref) -> :atomics.put(ref, 1, 0)
+      _missing -> :ok
+    end
   end
 
   # ---------------------------------------------------------------------------

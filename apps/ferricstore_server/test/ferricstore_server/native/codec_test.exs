@@ -417,6 +417,21 @@ defmodule FerricstoreServer.Native.CodecTest do
             }} = Codec.decode_body(0x000E, Codec.flags().custom_payload, body)
   end
 
+  test "decodes compact PubSub publish pipeline request bodies" do
+    body =
+      <<0x94, 0xA3, 2::unsigned-32, compact_bin("orders")::binary, compact_bin("one")::binary,
+        compact_bin("priority")::binary, compact_bin("two")::binary>>
+
+    assert {:ok,
+            %{
+              "atomicity" => "none",
+              "compact_count" => 2,
+              "compact_values" => true,
+              "return" => "compact",
+              "compact_pipeline" => {35, [{"orders", "one"}, {"priority", "two"}]}
+            }} = Codec.decode_body(0x000E, Codec.flags().custom_payload, body)
+  end
+
   test "compact Stream pipeline decoder bounds nested field/value items" do
     Application.put_env(:ferricstore, :native_max_value_items, 4)
 

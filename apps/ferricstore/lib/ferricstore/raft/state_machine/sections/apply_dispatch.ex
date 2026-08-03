@@ -691,47 +691,51 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       defp do_apply_flush_shard(state, ra_index) do
         match_spec = [{{:"$1", :_, :_, :_, :_, :_, :_}, [{:is_binary, :"$1"}], [:"$1"]}]
 
-        case apply_flush_shard_pages(
-               state,
-               :ets.select(state.ets, match_spec, @flush_shard_page_size),
-               0
-             ) do
-          {:ok, deleted} ->
-            flushed_state = consume_pending_state(state)
+        with :ok <- FlushDerivedState.quiesce(state),
+             page_result <-
+               apply_flush_shard_pages(
+                 state,
+                 :ets.select(state.ets, match_spec, @flush_shard_page_size),
+                 0
+               ) do
+          case page_result do
+            {:ok, deleted} ->
+              flushed_state = consume_pending_state(state)
 
-            _reset =
-              CompoundMemberIndex.reset(Map.get(flushed_state, :compound_member_index_name))
+              _reset =
+                CompoundMemberIndex.reset(Map.get(flushed_state, :compound_member_index_name))
 
-            _reset =
-              LogicalKeyIndex.reset(
-                Map.get(flushed_state, :logical_key_index_name),
-                Map.get(flushed_state, :logical_key_slots_name)
-              )
+              _reset =
+                LogicalKeyIndex.reset(
+                  Map.get(flushed_state, :logical_key_index_name),
+                  Map.get(flushed_state, :logical_key_slots_name)
+                )
 
-            _reset =
-              NamespaceUsageIndex.reset(
-                Map.get(flushed_state, :namespace_usage_index_name),
-                Map.get(flushed_state, :namespace_usage_expiry_name)
-              )
+              _reset =
+                NamespaceUsageIndex.reset(
+                  Map.get(flushed_state, :namespace_usage_index_name),
+                  Map.get(flushed_state, :namespace_usage_expiry_name)
+                )
 
-            _state = ZSetIndex.reset(flushed_state)
-            apply_state_put(:flow_due_catalog, Ferricstore.Flow.DueCatalog.new())
+              _state = ZSetIndex.reset(flushed_state)
+              apply_state_put(:flow_due_catalog, Ferricstore.Flow.DueCatalog.new())
 
-            with {:ok, finalized_state} <-
-                   FlushDerivedState.clear(flushed_state, ra_index),
-                 finalized_state = maybe_rotate_state_machine_active_file(finalized_state),
-                 :ok <- Promotion.remove_shard_dedicated_storage(finalized_state) do
-              {:ok, finalized_state, deleted}
-            else
-              {:error, _reason} = error ->
-                error
+              with {:ok, finalized_state} <-
+                     FlushDerivedState.clear(flushed_state, ra_index),
+                   finalized_state = maybe_rotate_state_machine_active_file(finalized_state),
+                   :ok <- Promotion.remove_shard_dedicated_storage(finalized_state) do
+                {:ok, finalized_state, deleted}
+              else
+                {:error, _reason} = error ->
+                  error
 
-              other ->
-                {:error, {:unexpected_flush_shard_cleanup_result, other}}
-            end
+                other ->
+                  {:error, {:unexpected_flush_shard_cleanup_result, other}}
+              end
 
-          {:error, _reason} = error ->
-            error
+            {:error, _reason} = error ->
+              error
+          end
         end
       end
 
@@ -3252,7 +3256,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       defp flow_consistent_state(state, key) do
         case do_get(state, key) do
           nil ->
-            {:ok, nil}
+            flow_consistent_lmdb_state(state, key)
 
           encoded when is_binary(encoded) ->
             case Ferricstore.Flow.Codec.decode_record_meta(encoded) do
@@ -3265,6 +3269,37 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end
       rescue
         _error -> {:error, :invalid_flow_record}
+      end
+
+      defp flow_consistent_lmdb_state(state, key) do
+        case instance_ctx_for_state(state) do
+          ctx when is_map(ctx) ->
+            max_input_bytes = Ferricstore.Flow.Query.QueryRecordStore.max_input_bytes(ctx)
+
+            case Ferricstore.Flow.Query.QueryRecordStore.read_many(
+                   ctx,
+                   state.shard_index,
+                   flow_lmdb_record_path(state),
+                   [key],
+                   apply_now_ms(),
+                   max_input_bytes
+                 ) do
+              {:ok, [%{state: flow_state}], true} when is_binary(flow_state) ->
+                {:ok, flow_state}
+
+              {:ok, [nil], true} ->
+                {:ok, nil}
+
+              {:error, reason} ->
+                {:error, {:flow_consistent_state_read_failed, reason}}
+
+              _invalid ->
+                {:error, :invalid_flow_record}
+            end
+
+          _missing_instance_context ->
+            {:ok, nil}
+        end
       end
 
       def apply(

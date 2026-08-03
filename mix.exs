@@ -36,6 +36,16 @@ defmodule Ferricstore.Umbrella.MixProject do
   defp aliases do
     [
       "bench.commands": "run bench/commands_bench.exs",
+      "bench.pubsub": "run --no-start bench/pubsub_bench.exs",
+      "bench.pubsub_activity_log": "run --no-start bench/pubsub_activity_log_bench.exs",
+      "bench.pubsub_channels": "run --no-start bench/pubsub_channels_bench.exs",
+      "bench.pubsub_cleanup": "run --no-start bench/pubsub_cleanup_bench.exs",
+      "bench.pubsub_pattern_index": "run --no-start bench/pubsub_pattern_index_bench.exs",
+      "bench.pubsub_session": "run --no-start bench/pubsub_session_bench.exs",
+      "bench.pubsub_snapshot": "run --no-start bench/pubsub_snapshot_bench.exs",
+      "bench.pubsub_subscription": "run --no-start bench/pubsub_subscription_bench.exs",
+      "bench.native_pubsub": "run --no-start bench/native_pubsub_bench.exs",
+      "bench.native_pubsub_load": "run --no-start bench/native_pubsub_load_bench.exs",
       "bench.tcp": "run bench/tcp_bench.exs",
       "bench.flow": "run bench/flow_workflow_bench.exs"
     ]

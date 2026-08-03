@@ -1,8 +1,122 @@
 # Benchmarks
 
-This page keeps only the latest public benchmark summaries. Raw benchmark logs and one-off profiling runs are intentionally not committed.
+This page keeps public benchmark summaries. Raw benchmark logs and one-off
+profiling runs are intentionally not committed, so these are historical
+reference points rather than a self-contained reproducible artifact.
 
-Use these numbers as reproducible reference points, not universal hardware claims. Throughput and latency depend on VM type, local NVMe availability, shard count, client concurrency, pipeline depth, payload size, and resource guards.
+Use the commands and commit endpoints below for matched reruns; do not treat the
+recorded numbers as universal hardware claims. Throughput and latency depend on
+VM type, local NVMe availability, shard count, client concurrency, pipeline
+depth, payload size, and resource guards.
+
+## FerricStore PubSub: compact native pipeline
+
+These loopback TCP measurements use pipeline depth 8 and 256-byte messages.
+Every subscriber acknowledgement, publish count, pushed delivery, and
+slow-consumer isolation check is validated by the runner.
+
+The batch-aware comparison used `9dfa241f` as its per-item endpoint and
+`5e189fa8` as its batch-aware endpoint. The negotiated batch-event comparison
+used `f46aa319` and the runner's `BENCH_PUBSUB_BATCH_EVENTS=0/1` switch. The
+recorded host was an Apple M4 Max. A representative matched command is:
+
+```bash
+BENCH_PUBSUB_CONCURRENCIES=1,4 \
+BENCH_PUBSUB_PUBLISHES_PER_PUBLISHER=4096 \
+BENCH_PUBSUB_LOAD_FANOUT=8 \
+BENCH_PUBSUB_PUBLISH_PIPELINE=8 \
+BENCH_PUBSUB_PIPELINE_ENCODING=compact \
+BENCH_PUBSUB_SKIP_SLOW_PHASE=1 \
+MIX_ENV=bench mix run --no-start bench/native_pubsub_load_bench.exs
+```
+
+Run fanout `1` and `8` separately and retain at least three samples per cell.
+For the depth-1,024 negotiated gate, set 65,536 publishes per publisher,
+pipeline depth 1,024, and toggle `BENCH_PUBSUB_BATCH_EVENTS` between `0` and
+`1`.
+
+### Protocol-only comparison before batch-aware fanout
+
+| Fanout | Publishers | Generic pipeline publishes/s | Compact mode 35 publishes/s | Change |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 27,634 | 29,204 | +5.7% |
+| 1 | 4 | 10,106 | 11,590 | +14.7% |
+| 8 | 1 | 3,070 | 3,302 | +7.6% |
+| 8 | 4 | 2,872 | 3,096 | +7.8% |
+
+### Batch-aware exact-channel fanout
+
+The retained optimization resolves the exact subscriber list once per compact
+pipeline, reserves outbound capacity once per subscriber batch, enqueues one
+BEAM mailbox message per subscriber, and writes the batch's existing individual
+event frames in one socket send. It does not change the wire format. A depth-8,
+fanout-8 request therefore reduces 64 guarded reservations and mailbox messages
+to 8. Pattern subscriptions conservatively retain the original per-publish path
+so exact and pattern event ordering stays unchanged.
+
+The following are three-sample medians from a matched compact-mode-35 comparison;
+the only benchmark toggle was ordinary per-item publish versus batch-aware
+publish:
+
+| Fanout | Publishers | Per-item publishes/s | Batch-aware publishes/s | Change | Batch-aware deliveries/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 37,270 | 48,556 | +30.3% | 48,556 |
+| 1 | 4 | 13,392 | 50,020 | +273.5% | 50,020 |
+| 8 | 1 | 3,348 | 16,483 | +392.3% | 131,865 |
+| 8 | 4 | 3,273 | 13,605 | +315.7% | 108,840 |
+
+Typed native pipelines containing only `PUBLISH` now reuse the same bounded
+batch fanout path. This preserves the typed wire format for older SDKs while
+removing the former per-item delivery overhead:
+
+| Fanout | Publishers | Typed per-item publishes/s | Typed batch-aware publishes/s | Change |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 1 | 3,262 | 14,976 | +359.0% |
+| 8 | 4 | 3,259 | 12,544 | +284.9% |
+
+### Sustained batch-size gate
+
+Larger explicit `publish_many` requests reduce the remaining per-subscriber
+socket-write cost. With 65,536 publishes per publisher, 256-byte payloads, and
+fanout 8, the production-default activity log, and compact mode 35, the matched
+five-sample medians were:
+
+| Pipeline depth | Publishers | Publishes/s | Delivered messages/s | Change vs depth 512 |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 1 | 132,794 | 1.06M | baseline |
+| 1,024 | 1 | 175,712 | 1.41M | +32.3% |
+| 512 | 4 | 135,774 | 1.09M | baseline |
+| 1,024 | 4 | 184,921 | 1.48M | +36.2% |
+
+The isolated rerun resolved earlier depth-1,024 variance, so SDK
+`publish_many` helpers cap requests at the protocol limit of 1,024 and split
+larger inputs sequentially. Callers can choose a smaller explicit batch for a
+tighter latency or partial-failure boundary; payload size and subscriber fanout
+still need workload-specific measurement.
+
+### Negotiated PubSub batch events
+
+With the same 65,536 publishes per publisher, depth 1,024, 256-byte payload,
+and compact-mode-35 workload, three-sample medians compare the legacy event
+frames with `pubsub_batch_v1` negotiated on every subscriber:
+
+| Fanout | Publishers | Legacy publishes/s | Batch-event publishes/s | Change | Batch-event deliveries/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 359,286 | 685,588 | +90.8% | 685,588 |
+| 1 | 4 | 396,652 | 635,082 | +60.1% | 635,082 |
+| 8 | 1 | 152,361 | 295,206 | +93.8% | 2.36M |
+| 8 | 4 | 165,958 | 293,794 | +77.0% | 2.35M |
+
+For a 1,024-message batch with 256-byte values, one subscriber's encoded
+output fell from 1,024 frames and 422,912 bytes to one frame and 267,428 bytes
+(-36.8%). The encoder result also fell from 67,622 retained heap words to 10
+because the batch is held by one encoded binary. Ordinary single-publish memory
+was unchanged in the matched Benchee gate.
+
+For homogeneous batches with eight matching pattern subscribers, resolving a
+complex pattern once per channel batch reduced the 1,024-message median from
+5.64 ms to 3.05 ms (-45.9%) while retaining exact-before-pattern ordering for
+every message.
 
 ## FerricStore Streams: local optimization baseline
 

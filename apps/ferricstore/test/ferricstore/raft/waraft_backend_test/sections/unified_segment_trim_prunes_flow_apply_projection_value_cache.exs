@@ -1441,6 +1441,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
         assert "value:32" == Router.get(ctx, "trim:key:32")
       end
 
+      @tag :invalid_election_timeout_isolation
       test "invalid WARaft election timeout bounds fail closed before partition start", %{
         ctx: ctx
       } do

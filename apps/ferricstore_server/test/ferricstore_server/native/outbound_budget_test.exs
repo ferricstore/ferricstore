@@ -71,6 +71,26 @@ defmodule FerricstoreServer.Native.OutboundBudgetTest do
     assert ResourceBudget.usage(budget).outbound_bytes == 0
   end
 
+  test "bulk release clears every local and global lease" do
+    budget = start_budget(100)
+    counter = OutboundBudget.new_counter()
+
+    state = %{
+      resource_budget: budget,
+      outbound_counter: counter,
+      max_outbound_bytes: 100
+    }
+
+    assert {:ok, first} = OutboundBudget.reserve_bytes(state, self(), 20)
+    assert {:ok, second} = OutboundBudget.reserve_bytes(state, self(), 30)
+    assert OutboundBudget.usage(counter) == 50
+    assert ResourceBudget.usage(budget).outbound_bytes == 50
+
+    assert :ok = OutboundBudget.release_many([first, nil, second])
+    assert OutboundBudget.usage(counter) == 0
+    assert ResourceBudget.usage(budget).outbound_bytes == 0
+  end
+
   defp start_budget(outbound_bytes) do
     name = :"native_outbound_budget_#{System.unique_integer([:positive])}"
 

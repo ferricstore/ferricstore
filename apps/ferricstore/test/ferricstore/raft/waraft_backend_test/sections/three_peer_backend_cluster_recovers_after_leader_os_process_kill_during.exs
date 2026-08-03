@@ -654,18 +654,15 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.ThreePeerBackendClusterRec
                        {:put, "backend-cluster-flap:minority:#{cycle}", "minority", 0}
                      ])
 
-            majority_leader = wait_for_waraft_backend_leader(majority_names, 0, 200)
-
             cycle_expected =
               for i <- 1..5 do
                 key = "backend-cluster-flap:#{cycle}:#{i}"
                 value = "v#{cycle}:#{i}"
 
-                assert :ok =
-                         :rpc.call(majority_leader, WARaftBackend, :write, [
-                           0,
-                           {:put, key, value, 0}
-                         ])
+                assert eventually(
+                         fn -> waraft_put_committed?(majority_names, 0, key, value) end,
+                         10
+                       )
 
                 {key, value}
               end

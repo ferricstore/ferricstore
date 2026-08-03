@@ -4,7 +4,22 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
-## 0.11.5 - 2026-07-30
+## 0.11.5 - 2026-08-03
+
+- Added compact native Pub/Sub publish pipeline mode 35 and negotiated
+  `pubsub_batch_v1` delivery. Eligible homogeneous publish batches reuse
+  exact-channel routing, bounded pattern matches, subscriber admission, and
+  shared response encoding while preserving publish order, per-item subscriber
+  counts, ACL/resource policy, response-size limits, and the legacy one-event
+  framing for clients that do not negotiate batching.
+- Hardened Pub/Sub activity-log generation resets, capability renegotiation for
+  existing subscriptions, bounded outbound admission, slow-consumer eviction,
+  and fast-consumer isolation. The retained fanout-8 TCP gate measured 413,811
+  publishes/s with one publisher and 430,637 publishes/s with four publishers,
+  corresponding to 3.31M and 3.45M validated deliveries/s.
+- Made cold Flow reads and derived-state flushes isolation-safe, and saturated
+  terminal schedule-retention deadlines at the maximum exact timestamp so
+  valid high timestamps cannot corrupt the durable history log.
 
 - Added deterministic atomic Stream append plans, same-stream and grouped
   multi-topic `XADD_MANY`, compact native producer mode 34, post-WAL bulk

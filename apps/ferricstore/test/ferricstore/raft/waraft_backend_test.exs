@@ -180,6 +180,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
   end
 
   setup_all do
+    :ok = WARaftBackend.stop()
     on_exit(fn -> ShardHelpers.restore_default_waraft!() end)
     :ok
   end

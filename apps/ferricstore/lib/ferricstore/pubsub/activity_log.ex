@@ -3,14 +3,20 @@ defmodule Ferricstore.PubSub.ActivityLog do
   Metadata-only ring buffer for Pub/Sub activity.
 
   Message payloads are intentionally not stored. Publish entries keep only
-  channel, message byte size, and receiver count.
+  channel, message byte size, and receiver count. Set
+  `:pubsub_activity_log_sample_every` in the `:ferricstore` application to a
+  positive integer to retain one out of every N publish events; subscription
+  changes are always retained.
   """
 
   use GenServer
 
   @table :ferricstore_pubsub_activity_log
   @counter_key :ferricstore_pubsub_activity_log_counter
+  @reservation_counter_key :ferricstore_pubsub_activity_log_reservations
   @max_len_key :ferricstore_pubsub_activity_log_max_len
+  @publish_config_key :ferricstore_pubsub_activity_log_publish_config
+  @publish_sample_counter_key :ferricstore_pubsub_activity_log_sample_counter
   @default_max_len 512
   @default_read_count 128
   @max_read_count 500
@@ -34,28 +40,75 @@ defmodule Ferricstore.PubSub.ActivityLog do
 
   @spec record_publish(binary(), non_neg_integer(), non_neg_integer()) :: :ok
   def record_publish(channel, message_bytes, subscribers) do
-    record(%{
-      command: "PUBLISH",
-      target_type: :channel,
-      target: normalize_binary(channel),
-      targets: 1,
-      subscribers: max(subscribers, 0),
-      message_bytes: max(message_bytes, 0)
-    })
+    entry = {:publish, channel, max(message_bytes, 0), max(subscribers, 0)}
+
+    case :persistent_term.get(@publish_config_key, nil) do
+      {max_len, 1, _counter} ->
+        record(entry, max_len)
+
+      {max_len, sample_every, counter}
+      when max_len > 0 and sample_every > 1 and is_reference(counter) ->
+        if sample_publish?(counter, sample_every), do: record(entry, max_len), else: :ok
+
+      {0, _sample_every, _counter} ->
+        :ok
+
+      _not_initialized ->
+        record(entry)
+    end
+  end
+
+  @doc false
+  @spec record_publish_batch(binary(), [binary()], [non_neg_integer()]) :: :ok
+  def record_publish_batch(_channel, [], []), do: :ok
+
+  def record_publish_batch(channel, messages, subscribers)
+      when is_binary(channel) and is_list(messages) and is_list(subscribers) do
+    with {:ok, publish_count} <- paired_length(messages, subscribers) do
+      case :persistent_term.get(@publish_config_key, nil) do
+        {max_len, 1, _counter} ->
+          record_publish_entries(channel, select_publish_entries(messages, subscribers), max_len)
+
+        {max_len, sample_every, counter}
+        when max_len > 0 and sample_every > 1 and is_reference(counter) ->
+          first_sample_index = :atomics.add_get(counter, 1, publish_count) - publish_count
+
+          record_publish_entries(
+            channel,
+            select_publish_entries(messages, subscribers, first_sample_index, sample_every),
+            max_len
+          )
+
+        {0, _sample_every, _counter} ->
+          :ok
+
+        _not_initialized ->
+          record_publish_batch_individually(channel, messages, subscribers)
+      end
+    else
+      :error -> :ok
+    end
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
   end
 
   @spec record_subscription(binary(), :channel | :pattern, [binary()]) :: :ok
   def record_subscription(_command, _target_type, []), do: :ok
 
   def record_subscription(command, target_type, targets) when is_list(targets) do
-    record(%{
-      command: normalize_binary(command),
-      target_type: target_type,
-      target: sample_target(targets),
-      targets: length(targets),
-      subscribers: nil,
-      message_bytes: nil
-    })
+    record({:subscription, command, target_type, targets, length(targets)})
+  end
+
+  @doc false
+  @spec configure_publish_sampling(pos_integer()) :: :ok
+  def configure_publish_sampling(sample_every)
+      when is_integer(sample_every) and sample_every >= 1 do
+    counter = publish_sample_counter()
+    :atomics.put(counter, 1, 0)
+    :persistent_term.put(@publish_config_key, {max_len(), sample_every, counter})
+    :ok
   end
 
   @spec get(non_neg_integer() | nil) :: [entry()]
@@ -75,12 +128,10 @@ defmodule Ferricstore.PubSub.ActivityLog do
 
   @spec reset() :: :ok
   def reset do
-    if table_ready?() do
-      :ets.delete_all_objects(@table)
+    case Process.whereis(__MODULE__) do
+      pid when is_pid(pid) -> GenServer.call(pid, :reset, :infinity)
+      nil -> :ok
     end
-
-    reset_counter()
-    :ok
   rescue
     _ -> :ok
   catch
@@ -99,25 +150,66 @@ defmodule Ferricstore.PubSub.ActivityLog do
       ])
 
     :persistent_term.put(@counter_key, :atomics.new(1, signed: false))
+    :persistent_term.put(@reservation_counter_key, :atomics.new(2, signed: false))
+    sample_counter = :atomics.new(1, signed: false)
+    :persistent_term.put(@publish_sample_counter_key, sample_counter)
+
+    max_len =
+      Application.get_env(:ferricstore, :pubsub_activity_log_max_len, @default_max_len)
+
+    sample_every =
+      case Application.get_env(:ferricstore, :pubsub_activity_log_sample_every, 1) do
+        value when is_integer(value) and value >= 1 -> value
+        _invalid -> 1
+      end
+
+    :persistent_term.put(@max_len_key, max_len)
 
     :persistent_term.put(
-      @max_len_key,
-      Application.get_env(:ferricstore, :pubsub_activity_log_max_len, @default_max_len)
+      @publish_config_key,
+      {normalized_max_len(max_len), sample_every, sample_counter}
     )
 
     {:ok, %{table: table}}
   end
 
+  @impl true
+  def handle_call(:reset, _from, state) do
+    reservation_counter = reservation_counter()
+    :atomics.put(reservation_counter, 2, 1)
+
+    try do
+      await_id_reservations(reservation_counter)
+      :ets.delete_all_objects(@table)
+      reset_counter()
+      reset_publish_sample_counter()
+      {:reply, :ok, state}
+    after
+      :atomics.put(reservation_counter, 2, 0)
+    end
+  end
+
   defp record(entry) do
-    max_len = max_len()
+    record(entry, max_len())
+  end
 
+  defp record(entry, max_len) do
     if max_len > 0 and table_ready?() do
-      id = next_id()
+      reservation_counter = begin_id_reservation()
 
-      :ets.insert(
-        @table,
-        {id, Map.put(entry, :timestamp_us, System.os_time(:microsecond))}
-      )
+      id =
+        try do
+          id = next_id()
+
+          :ets.insert(
+            @table,
+            {id, normalize_and_timestamp_entry(entry, System.os_time(:microsecond))}
+          )
+
+          id
+        after
+          finish_id_reservation(reservation_counter)
+        end
 
       maybe_evict_overflow(id, max_len)
     end
@@ -129,10 +221,122 @@ defmodule Ferricstore.PubSub.ActivityLog do
     :exit, _ -> :ok
   end
 
+  defp record_publish_entries(_channel, [], _max_len), do: :ok
+
+  defp record_publish_entries(channel, entries, max_len) do
+    if max_len > 0 and table_ready?() do
+      entry_count = length(entries)
+      retained = keep_newest(entries, max_len)
+      retained_count = length(retained)
+      reservation_counter = begin_id_reservation()
+
+      try do
+        first_id = reserve_ids(entry_count) + entry_count - retained_count
+        timestamp_us = System.os_time(:microsecond)
+        target = normalize_binary(channel)
+
+        rows =
+          retained
+          |> Enum.with_index(first_id)
+          |> Enum.map(fn {{message_bytes, subscribers}, id} ->
+            {id, {:publish, timestamp_us, target, message_bytes, subscribers}}
+          end)
+
+        :ets.insert(@table, rows)
+      after
+        finish_id_reservation(reservation_counter)
+      end
+
+      evict_overflow(max_len)
+    end
+
+    :ok
+  end
+
+  defp select_publish_entries(messages, subscribers),
+    do: select_publish_entries(messages, subscribers, 0, 1)
+
+  defp select_publish_entries(messages, subscribers, first_sample_index, sample_every) do
+    select_publish_entries(
+      messages,
+      subscribers,
+      first_sample_index,
+      sample_every,
+      []
+    )
+  end
+
+  defp select_publish_entries(
+         [message | messages],
+         [subscriber_count | subscribers],
+         sample_index,
+         sample_every,
+         entries
+       ) do
+    entries =
+      if rem(sample_index, sample_every) == 0 do
+        [{byte_size(message), max(subscriber_count, 0)} | entries]
+      else
+        entries
+      end
+
+    select_publish_entries(
+      messages,
+      subscribers,
+      sample_index + 1,
+      sample_every,
+      entries
+    )
+  end
+
+  defp select_publish_entries([], [], _sample_index, _sample_every, entries),
+    do: Enum.reverse(entries)
+
+  defp paired_length(messages, subscribers), do: paired_length(messages, subscribers, 0)
+
+  defp paired_length([_message | messages], [_count | subscribers], count),
+    do: paired_length(messages, subscribers, count + 1)
+
+  defp paired_length([], [], count), do: {:ok, count}
+  defp paired_length(_messages, _subscribers, _count), do: :error
+
+  defp keep_newest(entries, max_len) do
+    discard = length(entries) - max_len
+    if discard > 0, do: Enum.drop(entries, discard), else: entries
+  end
+
+  defp reserve_ids(count) do
+    case :persistent_term.get(@counter_key, nil) do
+      counter when is_reference(counter) -> :atomics.add_get(counter, 1, count) - count
+      _ -> System.unique_integer([:positive, :monotonic])
+    end
+  end
+
+  defp record_publish_batch_individually(channel, [message | messages], [count | counts]) do
+    record_publish(channel, byte_size(message), count)
+    record_publish_batch_individually(channel, messages, counts)
+  end
+
+  defp record_publish_batch_individually(_channel, [], []), do: :ok
+
   defp max_len do
     case :persistent_term.get(@max_len_key, @default_max_len) do
       n when is_integer(n) and n >= 0 -> n
       _ -> @default_max_len
+    end
+  end
+
+  defp normalized_max_len(max_len) when is_integer(max_len) and max_len >= 0, do: max_len
+  defp normalized_max_len(_invalid), do: @default_max_len
+
+  defp sample_publish?(counter, sample_every) do
+    rem(:atomics.add_get(counter, 1, 1) - 1, sample_every) == 0
+  end
+
+  defp publish_sample_counter do
+    case :persistent_term.get(@publish_sample_counter_key, nil) do
+      counter when is_reference(counter) -> counter
+      _missing -> :atomics.new(1, signed: false)
     end
   end
 
@@ -150,6 +354,54 @@ defmodule Ferricstore.PubSub.ActivityLog do
     end
   end
 
+  defp begin_id_reservation do
+    counter = reservation_counter()
+    :atomics.add(counter, 1, 1)
+
+    if :atomics.get(counter, 2) == 0 do
+      counter
+    else
+      finish_id_reservation(counter)
+      Process.sleep(1)
+      begin_id_reservation()
+    end
+  end
+
+  defp finish_id_reservation(counter) do
+    :atomics.sub(counter, 1, 1)
+    :ok
+  end
+
+  defp reservation_counter do
+    case :persistent_term.get(@reservation_counter_key, nil) do
+      counter when is_reference(counter) -> counter
+      _missing -> :atomics.new(2, signed: false)
+    end
+  end
+
+  defp await_id_reservations(counter) do
+    if :atomics.get(counter, 1) == 0 do
+      :ok
+    else
+      Process.sleep(1)
+      await_id_reservations(counter)
+    end
+  end
+
+  defp id_reservations_complete? do
+    case :persistent_term.get(@reservation_counter_key, nil) do
+      counter when is_reference(counter) -> :atomics.get(counter, 1) == 0
+      _missing -> false
+    end
+  end
+
+  defp reset_publish_sample_counter do
+    case :persistent_term.get(@publish_sample_counter_key, nil) do
+      counter when is_reference(counter) -> :atomics.put(counter, 1, 0)
+      _ -> :ok
+    end
+  end
+
   defp maybe_evict_overflow(id, max_len) do
     interval = min(max(max_len, 1), 16)
 
@@ -160,21 +412,64 @@ defmodule Ferricstore.PubSub.ActivityLog do
 
   defp evict_overflow(max_len) do
     case :ets.info(@table, :size) do
-      size when is_integer(size) and size > max_len -> delete_oldest(size - max_len)
-      _ -> :ok
+      size when is_integer(size) and size > max_len ->
+        case :ets.last(@table) do
+          id when is_integer(id) -> evict_before_newest_rows(id, max_len)
+          :"$end_of_table" -> :ok
+        end
+
+      _ ->
+        :ok
     end
   end
 
-  defp delete_oldest(remaining) when remaining <= 0, do: :ok
+  defp evict_before_newest_rows(last_id, max_len) do
+    cutoff = last_id - max_len
 
-  defp delete_oldest(remaining) do
+    if id_reservations_complete?() do
+      delete_through(cutoff)
+    else
+      case newest_retained_key(max_len) do
+        id when is_integer(id) -> delete_before(id)
+        nil -> :ok
+      end
+    end
+  end
+
+  defp newest_retained_key(max_len) do
+    match_spec = [{{:"$1", :_}, [], [:"$1"]}]
+
+    case :ets.select_reverse(@table, match_spec, max_len) do
+      {ids, _continuation} when length(ids) == max_len -> List.last(ids)
+      _fewer_than_max_len -> nil
+    end
+  end
+
+  defp delete_through(cutoff) do
     case :ets.first(@table) do
       :"$end_of_table" ->
         :ok
 
-      id ->
+      id when id <= cutoff ->
         :ets.delete(@table, id)
-        delete_oldest(remaining - 1)
+        delete_through(cutoff)
+
+      _retained ->
+        :ok
+    end
+  end
+
+  defp delete_before(retained_key) do
+    case :ets.first(@table) do
+      :"$end_of_table" ->
+        :ok
+
+      id when id < retained_key ->
+        :ets.delete(@table, id)
+        delete_before(retained_key)
+
+      _retained ->
+        :ok
     end
   end
 
@@ -186,7 +481,7 @@ defmodule Ferricstore.PubSub.ActivityLog do
 
     case :ets.lookup(@table, id) do
       [{^id, entry}] ->
-        newest_entries(previous_id, remaining - 1, [Map.put(entry, :id, id) | acc])
+        newest_entries(previous_id, remaining - 1, [materialize_entry(entry, id) | acc])
 
       [] ->
         newest_entries(previous_id, remaining, acc)
@@ -198,6 +493,55 @@ defmodule Ferricstore.PubSub.ActivityLog do
   defp bounded_count(_count), do: @default_read_count
 
   defp table_ready?, do: :ets.whereis(@table) != :undefined
+
+  defp normalize_and_timestamp_entry(
+         {:publish, channel, message_bytes, subscribers},
+         timestamp_us
+       ) do
+    {:publish, timestamp_us, normalize_binary(channel), message_bytes, subscribers}
+  end
+
+  defp normalize_and_timestamp_entry(
+         {:subscription, command, target_type, targets, target_count},
+         timestamp_us
+       ) do
+    {:subscription, timestamp_us, normalize_binary(command), target_type, sample_target(targets),
+     target_count}
+  end
+
+  defp materialize_entry(
+         {:publish, timestamp_us, target, message_bytes, subscribers},
+         id
+       ) do
+    %{
+      id: id,
+      timestamp_us: timestamp_us,
+      command: "PUBLISH",
+      target_type: :channel,
+      target: target,
+      targets: 1,
+      subscribers: subscribers,
+      message_bytes: message_bytes
+    }
+  end
+
+  defp materialize_entry(
+         {:subscription, timestamp_us, command, target_type, target, target_count},
+         id
+       ) do
+    %{
+      id: id,
+      timestamp_us: timestamp_us,
+      command: command,
+      target_type: target_type,
+      target: target,
+      targets: target_count,
+      subscribers: nil,
+      message_bytes: nil
+    }
+  end
+
+  defp materialize_entry(entry, id) when is_map(entry), do: Map.put(entry, :id, id)
 
   defp sample_target([target | rest]) do
     suffix = if rest == [], do: "", else: " +#{length(rest)}"

@@ -5,6 +5,7 @@ defmodule Ferricstore.Raft.FlushShardApplyTest do
   alias Ferricstore.Commands.Stream.{Index, Meta, Tables, Waiters}
 
   alias Ferricstore.Flow.{
+    HistoryProjector,
     HistoryProjectedIndex,
     LMDB,
     LMDBReplaySafeIndex,
@@ -219,6 +220,103 @@ defmodule Ferricstore.Raft.FlushShardApplyTest do
     assert 37 == HistoryProjectedIndex.read(state.shard_data_path)
     assert SharedRefBackfill.verified_complete?(instance_name, state.shard_index)
     assert 0 == :atomics.get(degraded, state.shard_index + 1)
+  end
+
+  test "replicated shard flush quiesces history projection before deleting source rows" do
+    instance_name = :"flush_projector_isolation_#{System.unique_integer([:positive])}"
+    %{state: state, keydir: keydir, path: path} = start_state(instance_name: instance_name)
+    source_key = Keys.value_key("flush-projector-source", :payload, 1)
+    source_value = "projected-source"
+
+    assert {:ok, {source_offset, _record_size}} =
+             NIF.v2_append_record(path, source_key, source_value, 0)
+
+    true =
+      :ets.insert(
+        keydir,
+        {source_key, source_value, 0, LFU.initial(), 0, source_offset, byte_size(source_value)}
+      )
+
+    atomics_size = state.shard_index + 1
+
+    instance_ctx = %{
+      name: instance_name,
+      keydir_refs: List.to_tuple(List.duplicate(nil, state.shard_index) ++ [keydir]),
+      data_dir: state.data_dir,
+      checkpoint_flags: :atomics.new(atomics_size, signed: false),
+      disk_pressure: :atomics.new(atomics_size, signed: false),
+      write_version: :counters.new(atomics_size, [:write_concurrency]),
+      keydir_binary_bytes: :atomics.new(atomics_size, signed: true),
+      flow_history_projected_index: :atomics.new(atomics_size, signed: false),
+      flow_history_projector_flush_failures: :atomics.new(atomics_size, signed: false)
+    }
+
+    state = %{state | instance_ctx: instance_ctx}
+
+    {:ok, projector_pid} =
+      HistoryProjector.start_link(
+        shard_index: state.shard_index,
+        shard_data_path: state.shard_data_path,
+        instance_ctx: instance_ctx,
+        recover_on_init: false
+      )
+
+    history_key = Keys.history_key("flush-projector-history")
+    event_id = "1000-1"
+
+    entry = %{
+      key: Keys.stream_entry_key_from_history_key(history_key, event_id),
+      expire_at_ms: 0,
+      history_key: history_key,
+      event_id: event_id,
+      event_ms: 1_000,
+      version: 1,
+      value: "history-value",
+      value_refs: [source_key],
+      ra_index: 10
+    }
+
+    test_pid = self()
+    previous_hook = Application.get_env(:ferricstore, :flow_history_projector_lmdb_publish_hook)
+
+    Application.put_env(:ferricstore, :flow_history_projector_lmdb_publish_hook, fn
+      _dir, _file_id, [_entry] ->
+        send(test_pid, {:history_projection_blocked, self()})
+
+        receive do
+          :release_history_projection -> :ok
+        end
+    end)
+
+    try do
+      assert :ok = HistoryProjector.enqueue(instance_ctx, state.shard_index, [entry], 10)
+
+      projector_flush =
+        Task.async(fn -> HistoryProjector.flush(instance_ctx, state.shard_index) end)
+
+      assert_receive {:history_projection_blocked, ^projector_pid}, 5_000
+
+      shard_flush = Task.async(fn -> StateMachine.apply(%{}, {:flush_shard, {1, 0}}, state) end)
+
+      assert wait_until(fn -> projector_discard_queued?(projector_pid) end)
+      assert :ets.member(keydir, source_key)
+
+      send(projector_pid, :release_history_projection)
+      assert :ok = Task.await(projector_flush, 5_000)
+      assert {_new_state, {:ok, deleted}} = Task.await(shard_flush, 5_000)
+      assert deleted >= 1
+    after
+      send(projector_pid, :release_history_projection)
+
+      case previous_hook do
+        nil -> Application.delete_env(:ferricstore, :flow_history_projector_lmdb_publish_hook)
+        hook -> Application.put_env(:ferricstore, :flow_history_projector_lmdb_publish_hook, hook)
+      end
+
+      if Process.alive?(projector_pid) do
+        GenServer.stop(projector_pid)
+      end
+    end
   end
 
   test "derived cleanup failure keeps dedicated storage and succeeds on replay" do
@@ -445,5 +543,27 @@ defmodule Ferricstore.Raft.FlushShardApplyTest do
     end)
 
     %{state: state, keydir: keydir, path: path}
+  end
+
+  defp projector_discard_queued?(projector_pid) do
+    case Process.info(projector_pid, :messages) do
+      {:messages, messages} ->
+        Enum.any?(messages, &match?({:"$gen_call", _from, :discard}, &1))
+
+      nil ->
+        false
+    end
+  end
+
+  defp wait_until(fun, attempts \\ 100)
+  defp wait_until(_fun, 0), do: false
+
+  defp wait_until(fun, attempts) do
+    if fun.() do
+      true
+    else
+      Process.sleep(10)
+      wait_until(fun, attempts - 1)
+    end
   end
 end

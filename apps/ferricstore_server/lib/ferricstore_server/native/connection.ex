@@ -27,7 +27,14 @@ defmodule FerricstoreServer.Native.Connection do
     Session
   }
 
-  alias FerricstoreServer.Native.Connection.{Chunks, FrameBuffer, InboundBudget, Responses}
+  alias FerricstoreServer.Native.Connection.{
+    Chunks,
+    FrameBuffer,
+    InboundBudget,
+    PreparedPubSubBatch,
+    PubSubCoalescer,
+    Responses
+  }
 
   @op_goaway 0x000A
   @op_command_exec 0x0100
@@ -301,12 +308,16 @@ defmodule FerricstoreServer.Native.Connection do
               max_outbound_bytes: max_outbound_bytes,
               outbound_counter: OutboundBudget.new_counter(),
               response_coalesce_max:
-                max(1, Application.get_env(:ferricstore, :native_response_coalesce_max, 64)),
+                normalized_response_coalesce_max(
+                  Application.get_env(:ferricstore, :native_response_coalesce_max, 64)
+                ),
               response_coalesce_bytes:
-                Application.get_env(
-                  :ferricstore,
-                  :native_response_coalesce_bytes,
-                  8 * 1024 * 1024
+                normalized_response_coalesce_bytes(
+                  Application.get_env(
+                    :ferricstore,
+                    :native_response_coalesce_bytes,
+                    8 * 1024 * 1024
+                  )
                 ),
               idle_timeout_ms: Application.get_env(:ferricstore, :native_idle_timeout_ms, 90_000)
             }
@@ -340,6 +351,20 @@ defmodule FerricstoreServer.Native.Connection do
     receive_timeout = connection_receive_timeout(state)
 
     receive do
+      message ->
+        dispatch_connection_message(state, message)
+    after
+      receive_timeout ->
+        cleanup_connection(state)
+        transport.close(socket)
+    end
+  end
+
+  defp dispatch_connection_message(
+         %__MODULE__{socket: socket, transport: transport} = state,
+         message
+       ) do
+    case message do
       {:tcp, ^socket, data} ->
         handle_data(state, data)
 
@@ -391,53 +416,27 @@ defmodule FerricstoreServer.Native.Connection do
         maybe_send_event(state, "FLOW_WAKE", Commands.flow_wake_event_payload(state))
         loop(state)
 
-      {:pubsub_message, channel, message, %OutboundBudget{} = lease} ->
-        send_guarded_pubsub_event(
-          state,
-          lease,
-          Session.pubsub_payload(:message, channel, nil, message)
-        )
+      {:pubsub_message, _channel, _message, %OutboundBudget{}} = event ->
+        send_pubsub_events(state, event)
 
-      {:pubsub_message, channel, message} ->
-        native_send(
-          state,
-          Responses.encode_event(
-            state,
-            Commands.event_opcode(),
-            %{
-              "event" => "PUBSUB_MESSAGE",
-              "payload" => Session.pubsub_payload(:message, channel, nil, message),
-              "at_ms" => System.system_time(:millisecond)
-            }
-          ),
-          :event
-        )
+      {:pubsub_message, _channel, _message} = event ->
+        send_pubsub_events(state, event)
 
-        loop(state)
+      {:pubsub_messages, channel, messages, %OutboundBudget{} = lease} ->
+        send_pubsub_batch(state, channel, messages, lease, nil)
 
-      {:pubsub_pmessage, pattern, channel, message, %OutboundBudget{} = lease} ->
-        send_guarded_pubsub_event(
-          state,
-          lease,
-          Session.pubsub_payload(:pmessage, channel, pattern, message)
-        )
+      {:pubsub_messages, channel, messages} ->
+        send_pubsub_batch(state, channel, messages, nil, nil)
 
-      {:pubsub_pmessage, pattern, channel, message} ->
-        native_send(
-          state,
-          Responses.encode_event(
-            state,
-            Commands.event_opcode(),
-            %{
-              "event" => "PUBSUB_MESSAGE",
-              "payload" => Session.pubsub_payload(:pmessage, channel, pattern, message),
-              "at_ms" => System.system_time(:millisecond)
-            }
-          ),
-          :event
-        )
+      {:pubsub_messages, channel, messages, %PreparedPubSubBatch{} = prepared, lease}
+      when is_nil(lease) or is_struct(lease, OutboundBudget) ->
+        send_pubsub_batch(state, channel, messages, lease, prepared)
 
-        loop(state)
+      {:pubsub_pmessage, _pattern, _channel, _message, %OutboundBudget{}} = event ->
+        send_pubsub_events(state, event)
+
+      {:pubsub_pmessage, _pattern, _channel, _message} = event ->
+        send_pubsub_events(state, event)
 
       {:native_blocking_done, _meta, pid} ->
         case take_blocked_request(state, pid) do
@@ -559,10 +558,6 @@ defmodule FerricstoreServer.Native.Connection do
 
       _other ->
         loop(state)
-    after
-      receive_timeout ->
-        cleanup_connection(state)
-        transport.close(socket)
     end
   end
 
@@ -942,7 +937,9 @@ defmodule FerricstoreServer.Native.Connection do
           case Codec.decode_body(opcode(frame), flags(frame), body(frame)) do
             {:ok, payload} ->
               Commands.mark_command_seen(state)
+              previous_state = state
               {status, value, state} = Commands.execute(opcode(frame), payload, state)
+              :ok = Session.refresh_pubsub_delivery_capability(previous_state, state)
               state = refresh_command_state_and_lanes(state)
               {:reply, maybe_encode_response(frame, state, status, value), state}
 
@@ -1457,6 +1454,12 @@ defmodule FerricstoreServer.Native.Connection do
     raise ArgumentError, "#{name} must be a positive integer, got: #{inspect(timeout)}"
   end
 
+  defp normalized_response_coalesce_max(value) when is_integer(value), do: max(value, 1)
+  defp normalized_response_coalesce_max(_invalid), do: 1
+
+  defp normalized_response_coalesce_bytes(value) when is_integer(value), do: value
+  defp normalized_response_coalesce_bytes(_invalid), do: 0
+
   defp ensure_lane(state, lane_id) do
     case Map.fetch(state.lanes, lane_id) do
       {:ok, pid} ->
@@ -1663,20 +1666,55 @@ defmodule FerricstoreServer.Native.Connection do
     :ok
   end
 
-  defp send_guarded_pubsub_event(state, lease, pubsub_payload) do
-    event_payload = %{
-      "event" => "PUBSUB_MESSAGE",
-      "payload" => pubsub_payload,
-      "at_ms" => System.system_time(:millisecond)
-    }
+  defp send_pubsub_events(state, first_event) do
+    {events, barrier} =
+      PubSubCoalescer.collect(
+        first_event,
+        state.response_coalesce_max,
+        state.response_coalesce_bytes
+      )
 
-    case safe_encode_guarded_event(state, event_payload) do
-      {:ok, iodata} ->
-        case OutboundBudget.ensure_iodata(lease, iodata) do
+    case prepare_pubsub_events(state, events) do
+      {:ok, frames, leases} ->
+        result =
+          try do
+            native_send(state, Enum.reverse(frames), :event)
+          after
+            release_pubsub_leases(leases)
+          end
+
+        case result do
+          :ok -> continue_after_pubsub_events(state, barrier)
+          {:error, _reason} -> close_for_outbound_failure(state)
+        end
+
+      {:error, leases} ->
+        release_pubsub_leases(leases)
+        close_for_outbound_failure(state)
+    end
+  end
+
+  defp continue_after_pubsub_events(state, nil), do: loop(state)
+
+  defp continue_after_pubsub_events(state, barrier),
+    do: dispatch_connection_message(state, barrier)
+
+  defp send_pubsub_batch(state, channel, messages, lease, prepared) do
+    encoded =
+      if pubsub_batch_codec_selected?(state) do
+        safe_encode_guarded_pubsub_batch(state, channel, messages, prepared)
+      else
+        descriptors = Enum.map(messages, &{:message, channel, &1})
+        safe_encode_guarded_pubsub_events(state, descriptors)
+      end
+
+    case encoded do
+      {:ok, frames} ->
+        case ensure_pubsub_batch_iodata(lease, frames) do
           {:ok, lease} ->
             result =
               try do
-                native_send(state, iodata, :event)
+                native_send(state, frames, :event)
               after
                 OutboundBudget.release(lease)
               end
@@ -1697,12 +1735,122 @@ defmodule FerricstoreServer.Native.Connection do
     end
   end
 
-  defp safe_encode_guarded_event(state, payload) do
-    {:ok, Responses.encode_event(state, Commands.event_opcode(), payload)}
+  defp ensure_pubsub_batch_iodata(nil, _iodata), do: {:ok, nil}
+
+  defp ensure_pubsub_batch_iodata(%OutboundBudget{} = lease, iodata),
+    do: OutboundBudget.ensure_iodata(lease, iodata)
+
+  defp prepare_pubsub_events(state, events) do
+    descriptors = Enum.map(events, &pubsub_event_descriptor/1)
+
+    case safe_encode_guarded_pubsub_events(state, descriptors) do
+      {:ok, frames} -> ensure_pubsub_event_frames(events, frames, [], [])
+      {:error, _reason} -> {:error, pubsub_event_leases(events)}
+    end
+  end
+
+  defp ensure_pubsub_event_frames([], [], frames, leases), do: {:ok, frames, leases}
+
+  defp ensure_pubsub_event_frames([event | events], [iodata | frames], prepared, leases) do
+    lease = pubsub_event_lease(event)
+
+    case ensure_pubsub_event_iodata(lease, iodata) do
+      {:ok, lease} ->
+        leases = if lease == nil, do: leases, else: [lease | leases]
+        ensure_pubsub_event_frames(events, frames, [iodata | prepared], leases)
+
+      {:error, _reason} ->
+        {:error, leases ++ pubsub_event_leases([event | events])}
+    end
+  end
+
+  defp pubsub_event_descriptor({:pubsub_message, channel, message}),
+    do: {:message, channel, message}
+
+  defp pubsub_event_descriptor({:pubsub_message, channel, message, _lease}),
+    do: {:message, channel, message}
+
+  defp pubsub_event_descriptor({:pubsub_pmessage, pattern, channel, message}),
+    do: {:pmessage, pattern, channel, message}
+
+  defp pubsub_event_descriptor({:pubsub_pmessage, pattern, channel, message, _lease}),
+    do: {:pmessage, pattern, channel, message}
+
+  defp pubsub_event_lease({:pubsub_message, _channel, _message, lease}), do: lease
+
+  defp pubsub_event_lease({:pubsub_pmessage, _pattern, _channel, _message, lease}), do: lease
+
+  defp pubsub_event_lease(_unbudgeted), do: nil
+
+  defp ensure_pubsub_event_iodata(nil, _iodata), do: {:ok, nil}
+
+  defp ensure_pubsub_event_iodata(%OutboundBudget{} = lease, iodata) do
+    OutboundBudget.ensure_iodata(lease, iodata)
+  end
+
+  defp pubsub_event_leases(events) do
+    Enum.flat_map(events, fn
+      {:pubsub_message, _channel, _message, %OutboundBudget{} = lease} -> [lease]
+      {:pubsub_pmessage, _pattern, _channel, _message, %OutboundBudget{} = lease} -> [lease]
+      _unbudgeted -> []
+    end)
+  end
+
+  defp release_pubsub_leases([]), do: :ok
+  defp release_pubsub_leases([lease]), do: OutboundBudget.release(lease)
+  defp release_pubsub_leases(leases), do: OutboundBudget.release_many(leases)
+
+  defp safe_encode_guarded_pubsub_events(state, descriptors) do
+    {:ok,
+     Responses.encode_pubsub_events(
+       state,
+       Commands.event_opcode(),
+       descriptors,
+       System.system_time(:millisecond)
+     )}
   rescue
     error -> {:error, error}
   catch
     kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp safe_encode_guarded_pubsub_batch(state, channel, messages, nil) do
+    {:ok,
+     Responses.encode_pubsub_message_batch(
+       state,
+       Commands.event_opcode(),
+       channel,
+       messages,
+       System.system_time(:millisecond)
+     )}
+  rescue
+    error -> {:error, error}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp safe_encode_guarded_pubsub_batch(
+         state,
+         _channel,
+         _messages,
+         %PreparedPubSubBatch{} = prepared
+       ) do
+    {:ok,
+     Responses.encode_prepared_pubsub_message_batch(
+       state,
+       Commands.event_opcode(),
+       prepared
+     )}
+  rescue
+    error -> {:error, error}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp pubsub_batch_codec_selected?(state) do
+    state
+    |> Map.get(:compact_response_codecs, MapSet.new())
+    |> MapSet.member?("pubsub_batch_v1")
   end
 
   defp close_for_outbound_failure(state) do

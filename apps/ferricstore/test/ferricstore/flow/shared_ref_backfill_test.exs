@@ -825,16 +825,18 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
   test "empty-shard finalization refuses a nonempty keydir", test_ctx do
     :ets.insert(test_ctx.keydir, {"user-key", "value", 0, 0, 0, 0, 5})
 
-    assert_raise RuntimeError, ~r/requires an empty keydir/, fn ->
-      SharedRefBackfill.finalize_empty_shard!(
-        test_ctx.shard_path,
-        test_ctx.keydir,
-        test_ctx.shard_index,
-        test_ctx.ctx,
-        active_file_id: 0,
-        active_file_path: test_ctx.active_file_path
-      )
-    end
+    assert_raise RuntimeError,
+                 ~r/requires an empty keydir.*unexpected keys: \["user-key"\]/,
+                 fn ->
+                   SharedRefBackfill.finalize_empty_shard!(
+                     test_ctx.shard_path,
+                     test_ctx.keydir,
+                     test_ctx.shard_index,
+                     test_ctx.ctx,
+                     active_file_id: 0,
+                     active_file_path: test_ctx.active_file_path
+                   )
+                 end
 
     refute :ets.member(test_ctx.keydir, Keys.shared_value_ref_backfill_key(0))
     refute SharedRefBackfill.verified_complete?(test_ctx.ctx.name, 0)

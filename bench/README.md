@@ -7,6 +7,16 @@ Useful local runners:
 | File | Purpose |
 | --- | --- |
 | `commands_bench.exs` | Embedded command microbenchmarks. |
+| `pubsub_bench.exs` | Embedded exact, guarded, and pattern Pub/Sub publish benchmark. |
+| `pubsub_activity_log_bench.exs` | Pub/Sub activity-log write, truncation, and bounded-read benchmark. |
+| `pubsub_channels_bench.exs` | PUBSUB CHANNELS literal, simple, and generic-glob filter cost. |
+| `pubsub_cleanup_bench.exs` | Disconnect cleanup and subscription-write cost in a high-cardinality registry. |
+| `pubsub_pattern_index_bench.exs` | Literal, prefix, suffix, and generic-glob pattern publish cost at high cardinality. |
+| `pubsub_session_bench.exs` | Native session subscription and acknowledgement batch cost. |
+| `pubsub_snapshot_bench.exs` | High-cardinality bounded Pub/Sub subscription snapshot benchmark. |
+| `pubsub_subscription_bench.exs` | Exact and pattern subscription cache-maintenance cost across fanouts. |
+| `native_pubsub_bench.exs` | End-to-end native TCP Pub/Sub publish acknowledgement and pushed-event delivery benchmark. |
+| `native_pubsub_load_bench.exs` | Saturated concurrent native publishers plus bounded slow-consumer eviction and fast-consumer isolation. |
 | `stream_bench.exs` | Replicated Stream append, trim, range, consumer-group, and same-key concurrency benchmark. |
 | `native_stream_bench.exs` | End-to-end Ferric TCP Stream producer benchmark: sequential `COMMAND_EXEC XADD`, auto-coalesced command bursts, and typed/compact pipelines. |
 | `stream_partition_bench.exs` | Single Stream versus whole-batch and mixed-topic producers across distinct shards and one shared shard. |
@@ -48,6 +58,57 @@ Useful local runners:
 | `query_storage_layout_bench.exs` | Previous duplicated-record LMDB layout versus compact QueryRow storage and authoritative-log hydration. |
 | `flow_lmdb_soak.exs` | Long-running Flow/LMDB projection soak using `ferric://`. |
 | `flow_state_lmdb_soak/` | Sectioned state-machine soak using `ferric://`. |
+
+The native Pub/Sub runners use real loopback TCP connections and validate every
+publisher acknowledgement and pushed event. The latency runner reports
+publishes/second; multiply by fanout for delivered messages/second:
+
+```bash
+MIX_ENV=bench mix bench.native_pubsub
+MIX_ENV=bench mix bench.native_pubsub_load
+```
+
+The load runner measures the `1,4,16` publisher matrix by default. Override it
+with `BENCH_PUBSUB_CONCURRENCIES`, `BENCH_PUBSUB_PUBLISHES_PER_PUBLISHER`,
+`BENCH_PUBSUB_LOAD_FANOUT`, `BENCH_PUBSUB_COALESCE_MAX`, and
+`BENCH_PUBSUB_PUBLISH_PIPELINE`. A publish-pipeline value greater than one sends
+that many `PUBLISH` commands through one native `PIPELINE` round trip while
+still validating every result and pushed event. Set
+`BENCH_PUBSUB_PIPELINE_ENCODING=compact` to benchmark compact mode 35; the
+default `generic` value retains the typed command-list baseline. The runner
+restarts the server before its slow-consumer phase so the throughput matrix uses
+the production outbound budget while eviction uses an intentionally tight
+bound. The run fails if any response/event count is wrong, the slow subscriber
+is not evicted, or the fast subscriber stops receiving.
+Set `BENCH_PUBSUB_SKIP_SLOW_PHASE=1` only when repeatedly sampling the
+throughput matrix; the default still runs the full isolation gate.
+
+Compact mode 35 also exercises batch-aware exact-channel fanout. One pipeline
+resolves subscribers once and reserves and enqueues once per subscriber.
+Legacy clients receive the unchanged individual event frames together; clients
+that negotiate `pubsub_batch_v1` receive ordered, response-bounded batch events
+with an ordinary-message fallback for an item too large to share a batch
+envelope. Homogeneous batches with a bounded pattern set resolve matching
+patterns once while preserving exact/pattern event ordering.
+Typed pipelines containing only `PUBLISH` commands reuse this fanout path on
+eligible full-access connections, so the optimization does not depend on
+compact request support.
+The matched retained gate uses 4,096 publishes per publisher, pipeline depth 8,
+256-byte payloads, fanout 1 and 8, publisher counts 1 and 4, and three samples
+per matrix cell; its latest medians are recorded in `docs/benchmarks.md`.
+
+For sustained throughput, the latest isolated five-sample gate found depth
+1,024 to be the measured optimum on the benchmark host. With 65,536 publishes
+per publisher and fanout 8, it sustained roughly 1.41M delivered messages/s for
+one publisher and 1.48M for four, improving 32-36% over depth 512. SDKs therefore
+cap `publish_many` requests at 1,024 and sequentially split larger inputs.
+Smaller explicit batches remain useful when latency or partial-failure scope is
+more important than peak throughput.
+
+Set `BENCH_PUBSUB_BATCH_EVENTS=1` to negotiate the batch event codec for each
+subscriber. The load runner counts and validates logical messages inside a
+batch, so the correctness totals remain directly comparable with legacy
+per-message framing.
 
 Native-protocol SET/GET and DBOS-style workflow benchmarks live in the Python
 SDK repository. The in-tree native Stream runner is intentionally self-contained
