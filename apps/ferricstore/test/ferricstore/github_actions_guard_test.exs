@@ -205,6 +205,39 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     assert integration_test =~ "System.fetch_env!(\"FERRICSTORE_REQUIRE_IO_URING\")"
   end
 
+  test "published SDK compatibility runs official integration suites against this commit" do
+    path = Path.join(@repo_root, ".github/workflows/sdk-integration.yml")
+
+    assert File.regular?(path)
+    workflow = File.read!(path)
+
+    assert workflow =~ "docker/build-push-action@v6"
+    assert workflow =~ "context: ."
+    assert workflow =~ "outputs: type=docker,dest=/tmp/ferricstore-sdk-image.tar"
+    assert workflow =~ "docker load --input"
+    assert count_occurrences(workflow, "ref: v0.11.5") == 4
+
+    for repository <- [
+          "ferricstore/ferricstore-go",
+          "ferricstore/ferricstore-python",
+          "ferricstore/ferricstore-typescript",
+          "ferricstore/ferricstore-elixir"
+        ] do
+      assert workflow =~ "repository: #{repository}"
+    end
+
+    assert workflow =~ "./scripts/integration-docker.sh"
+    assert workflow =~ "./scripts/integration-security-docker.sh"
+    assert workflow =~ "./scripts/integration-cluster-docker.sh"
+    assert workflow =~ "python -m pytest -q tests/integration"
+    assert workflow =~ "npm run test:integration:isolated"
+    assert workflow =~ "npm run test:integration:deployment"
+    assert workflow =~ "npm run bench:kv"
+    assert workflow =~ "mix test --only integration"
+    assert workflow =~ "mix run bench/kv_benchmark.exs"
+    refute workflow =~ "continue-on-error: true"
+  end
+
   defp workflow_paths, do: Path.wildcard(@workflow_glob)
 
   defp count_occurrences(source, pattern) do
