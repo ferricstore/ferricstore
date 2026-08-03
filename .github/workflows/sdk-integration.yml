@@ -168,7 +168,8 @@ jobs:
           npm run integration:up
           node scripts/bootstrap-integration-auth.mjs
           npm run test:integration:deployment
-          npm run bench:kv -- --command set --request-mode direct \
+          npm run bench:kv -- --url "$FERRICSTORE_AUTH_URL" \
+            --command set --request-mode direct \
             --requests 1000 --pipeline 1 --clients 4 --inflight-batches 8 \
             --value-bytes 32 --min-throughput 100
 

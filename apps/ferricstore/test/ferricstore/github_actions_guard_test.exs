@@ -233,6 +233,7 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     assert workflow =~ "npm run test:integration:isolated"
     assert workflow =~ "npm run test:integration:deployment"
     assert workflow =~ "npm run bench:kv"
+    assert workflow =~ ~s|--url "$FERRICSTORE_AUTH_URL"|
     assert workflow =~ "mix test --only integration"
     assert workflow =~ "mix run bench/kv_benchmark.exs"
     refute workflow =~ "continue-on-error: true"
