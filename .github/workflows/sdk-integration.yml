@@ -1,0 +1,219 @@
+name: Official SDK integration
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+env:
+  FERRICSTORE_SDK_IMAGE: ferricstore-sdk-integration:${{ github.sha }}
+
+jobs:
+  build-server-image:
+    name: Build current server image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - name: Build current commit for SDK integration
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: false
+          tags: ${{ env.FERRICSTORE_SDK_IMAGE }}
+          outputs: type=docker,dest=/tmp/ferricstore-sdk-image.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Upload server image
+        uses: actions/upload-artifact@v7
+        with:
+          name: ferricstore-sdk-image-${{ github.sha }}
+          path: /tmp/ferricstore-sdk-image.tar
+          compression-level: 0
+          retention-days: 1
+
+  sdk-integration:
+    name: ${{ matrix.sdk }} SDK against current server
+    needs: build-server-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sdk: Go
+            id: go
+            repository: ferricstore/ferricstore-go
+            ref: v0.11.5
+          - sdk: Python
+            id: python
+            repository: ferricstore/ferricstore-python
+            ref: v0.11.5
+          - sdk: TypeScript
+            id: typescript
+            repository: ferricstore/ferricstore-typescript
+            ref: v0.11.5
+          - sdk: Elixir
+            id: elixir
+            repository: ferricstore/ferricstore-elixir
+            ref: v0.11.5
+    steps:
+      - name: Checkout official SDK
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.ref }}
+          path: sdk
+
+      - name: Set up Go
+        if: matrix.id == 'go'
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.5"
+
+      - name: Set up Python
+        if: matrix.id == 'python'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: sdk/pyproject.toml
+
+      - name: Set up Node.js
+        if: matrix.id == 'typescript'
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24.x"
+          cache: npm
+          cache-dependency-path: sdk/package-lock.json
+
+      - name: Set up Erlang and Elixir
+        if: matrix.id == 'elixir'
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29"
+          elixir-version: "1.20"
+
+      - name: Download current server image
+        uses: actions/download-artifact@v8
+        with:
+          name: ferricstore-sdk-image-${{ github.sha }}
+          path: /tmp/ferricstore-sdk-image
+
+      - name: Load current server image
+        run: docker load --input /tmp/ferricstore-sdk-image/ferricstore-sdk-image.tar
+
+      - name: Run official Go integration suite
+        if: matrix.id == 'go'
+        working-directory: sdk
+        env:
+          FERRICSTORE_IMAGE: ${{ env.FERRICSTORE_SDK_IMAGE }}
+        run: |
+          ./scripts/integration-docker.sh
+          ./scripts/integration-security-docker.sh
+          ./scripts/integration-cluster-docker.sh
+
+      - name: Install Python SDK
+        if: matrix.id == 'python'
+        working-directory: sdk
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Run official Python integration suite
+        if: matrix.id == 'python'
+        working-directory: sdk
+        env:
+          FERRICSTORE_IMAGE: ${{ env.FERRICSTORE_SDK_IMAGE }}
+          FERRICSTORE_INTEGRATION: "1"
+          FERRICSTORE_URL: ferric://127.0.0.1:6388
+        run: |
+          set -euo pipefail
+          trap 'docker compose down -v' EXIT
+          docker compose up -d ferricstore
+          FERRICSTORE_PORT=6388 FERRICSTORE_WAIT_STABLE_SECONDS=15 \
+            python scripts/wait_for_ferricstore.py
+          python -m pytest -q tests/integration
+
+      - name: Install TypeScript SDK
+        if: matrix.id == 'typescript'
+        working-directory: sdk
+        run: npm ci
+
+      - name: Run official TypeScript integration suite
+        if: matrix.id == 'typescript'
+        working-directory: sdk
+        env:
+          FERRICSTORE_IMAGE: ${{ env.FERRICSTORE_SDK_IMAGE }}
+        run: npm run test:integration:isolated
+
+      - name: Run authenticated TypeScript integration and throughput smoke
+        if: matrix.id == 'typescript'
+        working-directory: sdk
+        env:
+          FERRICSTORE_IMAGE: ${{ env.FERRICSTORE_SDK_IMAGE }}
+          FERRICSTORE_AUTH_BOOTSTRAP_URL: ferric://127.0.0.1:6388
+          FERRICSTORE_AUTH_PASSWORD: sdk-integration-secret
+          FERRICSTORE_AUTH_URL: ferric://default:sdk-integration-secret@127.0.0.1:6388
+        run: |
+          set -euo pipefail
+          trap 'npm run integration:down' EXIT
+          npm run build
+          npm run integration:up
+          node scripts/bootstrap-integration-auth.mjs
+          npm run test:integration:deployment
+          npm run bench:kv -- --url "$FERRICSTORE_AUTH_URL" \
+            --command set --request-mode direct \
+            --requests 1000 --pipeline 1 --clients 4 --inflight-batches 8 \
+            --value-bytes 32 --min-throughput 100
+
+      - name: Install Elixir SDK
+        if: matrix.id == 'elixir'
+        working-directory: sdk
+        run: mix deps.get
+
+      - name: Start current server for Elixir SDK
+        if: matrix.id == 'elixir'
+        run: >-
+          docker run --detach --rm --name ferricstore-elixir-sdk-integration
+          --env FERRICSTORE_PROTECTED_MODE=false
+          --env FERRICSTORE_FLOW_SCHEDULER_ENABLED=false
+          --env FERRICSTORE_NATIVE_ENABLED=true
+          --env FERRICSTORE_NATIVE_BIND=0.0.0.0
+          --env FERRICSTORE_NATIVE_PORT=6388
+          --env FERRICSTORE_NATIVE_ADVERTISE_HOST=127.0.0.1
+          --env FERRICSTORE_NATIVE_ADVERTISE_PORT=6388
+          --publish 6388:6388 $FERRICSTORE_SDK_IMAGE
+
+      - name: Run official Elixir integration suite
+        if: matrix.id == 'elixir'
+        working-directory: sdk
+        run: |
+          for _ in {1..60}; do
+            if mix run -e 'client = FerricStore.connect!(url: "ferric://127.0.0.1:6388"); FerricStore.ping(client); FerricStore.close(client)'; then
+              mix test --only integration
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs ferricstore-elixir-sdk-integration
+          exit 1
+
+      - name: Run acknowledged Elixir throughput smoke
+        if: matrix.id == 'elixir'
+        working-directory: sdk
+        run: >-
+          mix run bench/kv_benchmark.exs
+          --url ferric://127.0.0.1:6388 --command set
+          --requests 1000 --batch 1 --clients 4
+          --value-bytes 32 --min-throughput 100.0
+
+      - name: Stop Elixir SDK server
+        if: always() && matrix.id == 'elixir'
+        run: docker stop ferricstore-elixir-sdk-integration || true
