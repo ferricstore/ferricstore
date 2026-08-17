@@ -115,6 +115,7 @@ defmodule FerricstoreServer.Acl do
   @type user :: %{
           enabled: boolean(),
           auth_epoch: non_neg_integer(),
+          expires_at_ms: non_neg_integer() | nil,
           password: binary() | nil,
           commands: :all | MapSet.t(binary()),
           denied_commands: MapSet.t(binary()),
@@ -194,6 +195,7 @@ defmodule FerricstoreServer.Acl do
   def new_user do
     %{
       enabled: false,
+      expires_at_ms: nil,
       password: nil,
       commands: MapSet.new(),
       denied_commands: MapSet.new(),
@@ -207,6 +209,7 @@ defmodule FerricstoreServer.Acl do
   def default_user do
     %{
       enabled: true,
+      expires_at_ms: nil,
       password: nil,
       commands: :all,
       denied_commands: MapSet.new(),
@@ -376,12 +379,19 @@ defmodule FerricstoreServer.Acl do
   end
 
   defp do_authenticate(username, password) do
+    now_ms = System.system_time(:millisecond)
+
     case get_user(username) do
       nil ->
         verify_dummy_password(password, &Password.verify/2)
         authentication_error()
 
       %{enabled: false} ->
+        verify_dummy_password(password, &Password.verify/2)
+        authentication_error()
+
+      %{expires_at_ms: expires_at_ms}
+      when is_integer(expires_at_ms) and expires_at_ms <= now_ms ->
         verify_dummy_password(password, &Password.verify/2)
         authentication_error()
 
@@ -412,12 +422,19 @@ defmodule FerricstoreServer.Acl do
   end
 
   defp do_authenticate(username, password, verifier) do
+    now_ms = System.system_time(:millisecond)
+
     case get_user(username) do
       nil ->
         verify_dummy_password(password, verifier)
         authentication_error()
 
       %{enabled: false} ->
+        verify_dummy_password(password, verifier)
+        authentication_error()
+
+      %{expires_at_ms: expires_at_ms}
+      when is_integer(expires_at_ms) and expires_at_ms <= now_ms ->
         verify_dummy_password(password, verifier)
         authentication_error()
 
@@ -438,6 +455,20 @@ defmodule FerricstoreServer.Acl do
     _verified = verifier.(password, Password.dummy_hash())
     :ok
   end
+
+  @doc false
+  @spec credential_active?(map(), integer()) :: boolean()
+  def credential_active?(user, now_ms \\ System.system_time(:millisecond))
+
+  def credential_active?(%{enabled: true} = user, now_ms) when is_integer(now_ms) do
+    case Map.get(user, :expires_at_ms) do
+      nil -> true
+      expires_at_ms when is_integer(expires_at_ms) -> expires_at_ms > now_ms
+      _invalid -> false
+    end
+  end
+
+  def credential_active?(_user, _now_ms), do: false
 
   defp maybe_upgrade_password_hash(username, password, stored_hash) do
     if Password.needs_rehash?(stored_hash) do
@@ -494,11 +525,10 @@ defmodule FerricstoreServer.Acl do
         nil ->
           {:error, "NOPERM user '#{username}' does not exist"}
 
-        %{enabled: false} ->
-          {:error, "NOPERM user '#{username}' is disabled"}
-
-        _ ->
-          :ok
+        user ->
+          if credential_active?(user),
+            do: :ok,
+            else: {:error, "NOPERM user '#{username}' is disabled or expired"}
       end
     end
   end
@@ -542,34 +572,12 @@ defmodule FerricstoreServer.Acl do
     with :ok <- ensure_projection_access_ready() do
       case get_user(username) do
         nil ->
-          {:error,
-           "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
+          command_permission_error(cmd)
 
-        %{enabled: false} ->
-          {:error,
-           "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
-
-        %{commands: :all, denied_commands: denied} ->
-          if Rules.command_denied?(denied, cmd) do
-            {:error,
-             "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
-          else
-            :ok
-          end
-
-        %{commands: cmds, denied_commands: denied} ->
-          cond do
-            Rules.command_denied?(denied, cmd) ->
-              {:error,
-               "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
-
-            Rules.command_allowed?(cmds, cmd) ->
-              :ok
-
-            true ->
-              {:error,
-               "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
-          end
+        user ->
+          if credential_active?(user),
+            do: check_active_user_command(user, cmd),
+            else: command_permission_error(cmd)
       end
     end
   end
@@ -600,25 +608,39 @@ defmodule FerricstoreServer.Acl do
     with :ok <- ensure_projection_access_ready() do
       case get_user(username) do
         nil ->
-          {:error,
-           "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
+          key_permission_error()
 
-        %{enabled: false} ->
-          {:error,
-           "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
-
-        %{keys: :all} ->
-          :ok
-
-        %{keys: patterns} ->
-          if key_matches_any?(key, access_type, patterns) do
-            :ok
-          else
-            {:error,
-             "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
-          end
+        user ->
+          if credential_active?(user),
+            do: check_active_user_key(user, key, access_type),
+            else: key_permission_error()
       end
     end
+  end
+
+  defp check_active_user_command(%{commands: :all, denied_commands: denied}, cmd) do
+    if Rules.command_denied?(denied, cmd), do: command_permission_error(cmd), else: :ok
+  end
+
+  defp check_active_user_command(%{commands: commands, denied_commands: denied}, cmd) do
+    if Rules.command_denied?(denied, cmd) or not Rules.command_allowed?(commands, cmd),
+      do: command_permission_error(cmd),
+      else: :ok
+  end
+
+  defp command_permission_error(cmd) do
+    {:error, "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
+  end
+
+  defp check_active_user_key(%{keys: :all}, _key, _access_type), do: :ok
+
+  defp check_active_user_key(%{keys: patterns}, key, access_type) do
+    if key_matches_any?(key, access_type, patterns), do: :ok, else: key_permission_error()
+  end
+
+  defp key_permission_error do
+    {:error,
+     "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
   end
 
   @doc """

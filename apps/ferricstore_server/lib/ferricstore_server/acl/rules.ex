@@ -9,6 +9,7 @@ defmodule FerricstoreServer.Acl.Rules do
   @max_patterns 4_096
   @max_pattern_bytes 4_096
   @max_rule_tokens 16_384
+  @max_expiry_ms 253_402_300_799_999
 
   @type user :: map()
 
@@ -199,6 +200,18 @@ defmodule FerricstoreServer.Acl.Rules do
   @spec parse_rule(user(), binary()) :: {:ok, user()} | {:error, binary()}
   def parse_rule(user, "on"), do: {:ok, %{user | enabled: true}}
   def parse_rule(user, "off"), do: {:ok, %{user | enabled: false}}
+
+  def parse_rule(user, "persist"), do: {:ok, Map.put(user, :expires_at_ms, nil)}
+
+  def parse_rule(user, "expireat:" <> value) do
+    case Integer.parse(value) do
+      {expires_at_ms, ""} when expires_at_ms in 0..@max_expiry_ms ->
+        {:ok, Map.put(user, :expires_at_ms, expires_at_ms)}
+
+      _invalid ->
+        {:error, "ERR Error in ACL SETUSER modifier 'expireat:#{value}': Invalid expiry"}
+    end
+  end
 
   def parse_rule(user, ">" <> password) do
     {:ok, %{user | password: Password.hash(password)}}

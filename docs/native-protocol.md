@@ -882,6 +882,13 @@ frame caps     -> native_max_frame_bytes (max 134,217,704 body bytes), 128 MiB i
 lane caps      -> native_max_lanes_per_connection and native_lane_max_queue
 ```
 
+`ACL SETUSER` also accepts FerricStore's `expireat:<unix_ms>` modifier for an
+absolute credential deadline and `persist` to clear it. Expiry is checked for
+new `AUTH` attempts and on every command, key, and channel authorization check,
+so an already-authenticated connection cannot continue after its deadline.
+Managed Platform deployments consume this primitive through the packaged
+Enterprise server; standalone OSS is not used as the cloud data plane.
+
 Recommended production setup:
 
 ```text

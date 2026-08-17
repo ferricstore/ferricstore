@@ -263,6 +263,7 @@ defmodule FerricstoreServer.Acl.FileParser do
   defp parse_file_rules(username, tokens, line_num) do
     base = %{
       enabled: false,
+      expires_at_ms: nil,
       password: nil,
       commands: MapSet.new(),
       denied_commands: MapSet.new(),
@@ -295,6 +296,15 @@ defmodule FerricstoreServer.Acl.FileParser do
 
   defp parse_file_token(user, "on"), do: {:ok, %{user | enabled: true}}
   defp parse_file_token(user, "off"), do: {:ok, %{user | enabled: false}}
+  defp parse_file_token(user, "persist"), do: {:ok, Map.put(user, :expires_at_ms, nil)}
+
+  defp parse_file_token(user, "expireat:" <> value) do
+    case Rules.parse_rule(user, "expireat:" <> value) do
+      {:ok, updated} -> {:ok, updated}
+      {:error, _reason} -> {:error, "invalid credential expiry"}
+    end
+  end
+
   defp parse_file_token(user, "nopass"), do: {:ok, %{user | password: nil}}
   defp parse_file_token(user, "resetpass"), do: {:ok, %{user | password: nil}}
 

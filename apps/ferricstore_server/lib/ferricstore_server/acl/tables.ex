@@ -38,6 +38,7 @@ defmodule FerricstoreServer.Acl.Tables do
        %{
          enabled: true,
          auth_epoch: auth_epoch,
+         expires_at_ms: nil,
          password: nil,
          commands: :all,
          denied_commands: MapSet.new(),

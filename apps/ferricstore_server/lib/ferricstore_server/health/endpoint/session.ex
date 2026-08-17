@@ -205,6 +205,7 @@ defmodule FerricstoreServer.Health.Endpoint.Session do
                 is_binary(acl_fingerprint) <- TermCodec.decode(payload),
          true <- expires_at > System.system_time(:millisecond),
          %{enabled: true} = user <- Acl.get_user(username),
+         true <- Acl.credential_active?(user),
          true <- Map.get(user, :auth_epoch) == auth_epoch,
          true <- constant_time_equal?(acl_fingerprint, acl_fingerprint(user)) do
       username

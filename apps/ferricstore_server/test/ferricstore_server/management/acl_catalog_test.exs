@@ -179,7 +179,8 @@ defmodule FerricstoreServer.Management.ACLCatalogTest do
                "&events:*"
              ])
 
-    assert {:ferricstore_acl_user, true, password, :all, [], [{"tenant:*", :read}], ["events:*"]} =
+    assert {:ferricstore_acl_user, true, nil, password, :all, [], [{"tenant:*", :read}],
+            ["events:*"]} =
              :erlang.binary_to_term(value, [:safe])
 
     assert is_binary(password)

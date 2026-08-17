@@ -59,10 +59,10 @@ defmodule FerricstoreServer.Connection.Auth do
     :ok = Registry.add_acl_user(state.client_id, self(), username)
 
     case {CatalogProjector.ready?(), FerricstoreServer.Acl.get_user(username)} do
-      {true, %{enabled: true, auth_epoch: ^expected_auth_epoch}} ->
+      {true, %{enabled: true, auth_epoch: ^expected_auth_epoch} = user} ->
         cache = build_acl_cache(username)
 
-        if cache == :denied do
+        if cache == :denied or expired_user?(user) do
           :ok = cancel_acl_authentication(state, username)
           {:error, :acl_changed_during_authentication}
         else
@@ -143,8 +143,10 @@ defmodule FerricstoreServer.Connection.Auth do
         user ->
           denied = Map.get(user, :denied_commands, MapSet.new())
           channels = Map.get(user, :channels, :all)
+          expires_at_ms = Map.get(user, :expires_at_ms)
 
-          if user.enabled and user.commands == :all and MapSet.size(denied) == 0 and
+          if user.enabled and is_nil(expires_at_ms) and user.commands == :all and
+               MapSet.size(denied) == 0 and
                user.keys == :all and channels == :all do
             :full_access
           else
@@ -153,7 +155,8 @@ defmodule FerricstoreServer.Connection.Auth do
               denied_commands: denied,
               keys: user.keys,
               channels: channels,
-              enabled: user.enabled
+              enabled: user.enabled,
+              expires_at_ms: expires_at_ms
             }
           end
       end
@@ -174,7 +177,8 @@ defmodule FerricstoreServer.Connection.Auth do
   @spec check_command_cached(map() | :full_access | :denied | nil, binary()) ::
           :ok | {:error, binary()}
   def check_command_cached(cache, command) do
-    with :ok <- ensure_acl_projection_ready() do
+    with :ok <- ensure_acl_projection_ready(),
+         :ok <- ensure_cache_active(cache) do
       do_check_command_cached(cache, command)
     end
   end
@@ -184,7 +188,7 @@ defmodule FerricstoreServer.Connection.Auth do
           [binary()]
         ) :: :ok | {:error, binary(), binary()}
   def check_commands_cached(cache, [command | _rest] = commands) when is_binary(command) do
-    case ensure_acl_projection_ready() do
+    case ensure_cache_authorization(cache) do
       :ok -> do_check_commands_cached(cache, commands)
       {:error, reason} -> {:error, command, reason}
     end
@@ -198,7 +202,7 @@ defmodule FerricstoreServer.Connection.Auth do
           [binary()]
         ) :: :ok | {:error, binary(), binary()}
   def check_any_command_cached(cache, [command | _rest] = commands) when is_binary(command) do
-    case ensure_acl_projection_ready() do
+    case ensure_cache_authorization(cache) do
       :ok -> do_check_any_command_cached(cache, commands, command, nil)
       {:error, reason} -> {:error, command, reason}
     end
@@ -284,7 +288,8 @@ defmodule FerricstoreServer.Connection.Auth do
   @spec check_keys_cached(map() | :full_access | :denied | nil, binary(), [binary()]) ::
           :ok | {:error, binary()}
   def check_keys_cached(cache, command, keys) do
-    with :ok <- ensure_acl_projection_ready() do
+    with :ok <- ensure_acl_projection_ready(),
+         :ok <- ensure_cache_active(cache) do
       do_check_keys_cached(cache, command, keys)
     end
   end
@@ -317,7 +322,8 @@ defmodule FerricstoreServer.Connection.Auth do
   @spec check_keys_cached(map() | :full_access | :denied | nil, PreparedCommand.t()) ::
           :ok | {:error, binary()}
   def check_keys_cached(cache, %PreparedCommand{} = prepared) do
-    with :ok <- ensure_acl_projection_ready() do
+    with :ok <- ensure_acl_projection_ready(),
+         :ok <- ensure_cache_active(cache) do
       do_check_keys_cached(cache, prepared)
     end
   end
@@ -348,6 +354,7 @@ defmodule FerricstoreServer.Connection.Auth do
         ) :: :ok | {:error, binary()}
   def check_prepared_resources_cached(cache, %PreparedCommand{} = prepared) do
     with :ok <- ensure_acl_projection_ready(),
+         :ok <- ensure_cache_active(cache),
          :ok <- do_check_channels_cached(cache, prepared.channel_keys) do
       do_check_keys_cached(cache, prepared)
     end
@@ -356,9 +363,31 @@ defmodule FerricstoreServer.Connection.Auth do
   @spec check_channels_cached(map() | :full_access | :denied | nil, [binary()]) ::
           :ok | {:error, binary()}
   def check_channels_cached(cache, channels) do
-    with :ok <- ensure_acl_projection_ready() do
+    with :ok <- ensure_acl_projection_ready(),
+         :ok <- ensure_cache_active(cache) do
       do_check_channels_cached(cache, channels)
     end
+  end
+
+  defp ensure_cache_authorization(cache) do
+    with :ok <- ensure_acl_projection_ready() do
+      ensure_cache_active(cache)
+    end
+  end
+
+  defp ensure_cache_active(%{expires_at_ms: expires_at_ms})
+       when is_integer(expires_at_ms) do
+    if expires_at_ms > System.system_time(:millisecond) do
+      :ok
+    else
+      {:error, "NOPERM user session expired or user was deleted"}
+    end
+  end
+
+  defp ensure_cache_active(_cache), do: :ok
+
+  defp expired_user?(user) do
+    not FerricstoreServer.Acl.credential_active?(user)
   end
 
   defp do_check_channels_cached(:denied, _channels),

@@ -81,6 +81,7 @@ defmodule FerricstoreServer.Acl.Formatter do
   def format_user_for_file({name, user}) do
     parts = file_username_tokens(name)
     parts = parts ++ [if(user.enabled, do: "on", else: "off")]
+    parts = parts ++ format_expiry(Map.get(user, :expires_at_ms))
 
     parts =
       case user.password do
@@ -134,6 +135,11 @@ defmodule FerricstoreServer.Acl.Formatter do
 
     Enum.join(parts, " ")
   end
+
+  defp format_expiry(expires_at_ms) when is_integer(expires_at_ms),
+    do: ["expireat:#{expires_at_ms}"]
+
+  defp format_expiry(_expires_at_ms), do: []
 
   defp format_channel_rule_tokens(:all), do: ["&*"]
   defp format_channel_rule_tokens([]), do: ["resetchannels"]

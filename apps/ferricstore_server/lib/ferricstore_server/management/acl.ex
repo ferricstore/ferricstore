@@ -52,8 +52,21 @@ defmodule FerricstoreServer.Management.ACL do
   def decode_catalog_value(encoded)
       when is_binary(encoded) and byte_size(encoded) <= @max_catalog_value_bytes do
     case TermCodec.decode(encoded) do
+      {:ok,
+       {@catalog_value_tag, enabled, expires_at_ms, password, commands, denied_commands, keys,
+        channels}} ->
+        decode_catalog_user(
+          enabled,
+          expires_at_ms,
+          password,
+          commands,
+          denied_commands,
+          keys,
+          channels
+        )
+
       {:ok, {@catalog_value_tag, enabled, password, commands, denied_commands, keys, channels}} ->
-        decode_catalog_user(enabled, password, commands, denied_commands, keys, channels)
+        decode_catalog_user(enabled, nil, password, commands, denied_commands, keys, channels)
 
       _invalid ->
         {:error, :invalid_acl_catalog_value}
@@ -66,6 +79,7 @@ defmodule FerricstoreServer.Management.ACL do
 
   defp encode_catalog_user(%{
          enabled: enabled,
+         expires_at_ms: expires_at_ms,
          password: password,
          commands: commands,
          denied_commands: denied_commands,
@@ -73,12 +87,15 @@ defmodule FerricstoreServer.Management.ACL do
          channels: channels
        }) do
     with true <- is_boolean(enabled),
+         :ok <- validate_catalog_expiry(expires_at_ms),
          :ok <- validate_catalog_password(password),
          {:ok, commands} <- encode_catalog_commands(commands, true),
          {:ok, denied_commands} <- encode_catalog_commands(denied_commands, false),
          {:ok, keys} <- encode_catalog_keys(keys),
          {:ok, channels} <- encode_catalog_channels(channels) do
-      {:ok, {@catalog_value_tag, enabled, password, commands, denied_commands, keys, channels}}
+      {:ok,
+       {@catalog_value_tag, enabled, expires_at_ms, password, commands, denied_commands, keys,
+        channels}}
     else
       _invalid -> {:error, "ERR invalid ACL user record"}
     end
@@ -88,8 +105,17 @@ defmodule FerricstoreServer.Management.ACL do
 
   defp encode_catalog_user(_invalid), do: {:error, "ERR invalid ACL user record"}
 
-  defp decode_catalog_user(enabled, password, commands, denied_commands, keys, channels) do
+  defp decode_catalog_user(
+         enabled,
+         expires_at_ms,
+         password,
+         commands,
+         denied_commands,
+         keys,
+         channels
+       ) do
     with true <- is_boolean(enabled),
+         :ok <- validate_catalog_expiry(expires_at_ms),
          :ok <- validate_catalog_password(password),
          {:ok, commands} <- decode_catalog_commands(commands, true),
          {:ok, denied_commands} <- decode_catalog_commands(denied_commands, false),
@@ -98,6 +124,7 @@ defmodule FerricstoreServer.Management.ACL do
       {:ok,
        %{
          enabled: enabled,
+         expires_at_ms: expires_at_ms,
          password: password,
          commands: commands,
          denied_commands: denied_commands,
@@ -108,6 +135,14 @@ defmodule FerricstoreServer.Management.ACL do
       _invalid -> {:error, :invalid_acl_catalog_value}
     end
   end
+
+  defp validate_catalog_expiry(nil), do: :ok
+
+  defp validate_catalog_expiry(expires_at_ms)
+       when is_integer(expires_at_ms) and expires_at_ms >= 0,
+       do: :ok
+
+  defp validate_catalog_expiry(_invalid), do: {:error, :invalid_acl_catalog_value}
 
   defp validate_catalog_password(nil), do: :ok
 

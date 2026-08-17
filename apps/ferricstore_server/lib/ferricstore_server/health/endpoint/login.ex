@@ -113,8 +113,12 @@ defmodule FerricstoreServer.Health.Endpoint.Login do
         case authenticate.() do
           {:ok, ^username} ->
             case Acl.get_user(username) do
-              %{enabled: true, auth_epoch: ^initial_epoch} ->
-                {:ok, username, initial_epoch}
+              %{auth_epoch: ^initial_epoch} = user ->
+                if Acl.credential_active?(user) do
+                  {:ok, username, initial_epoch}
+                else
+                  authentication_error()
+                end
 
               _changed_during_authentication ->
                 authentication_error()
