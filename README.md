@@ -464,6 +464,8 @@ Raft/consensus, doctor diagnostics, and the full Flow surface: lookup, states,
 workers, due work, FQL queries, index projections, lineage, signals, schedules,
 policies, governance, failures, and retention.
 
+![FerricStore operations dashboard showing Flow health, workflow state pressure, one workflow's transition history, and durable schedules](docs/assets/dashboard-demo.gif)
+
 The Flow query page includes Guided and FQL workbench modes. It accepts typed
 JSON parameters, field projections, exact counts, `EXPLAIN`, and `EXPLAIN
 ANALYZE`; preserves query quality and resource usage; continues opaque cursors
