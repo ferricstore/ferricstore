@@ -44,7 +44,8 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           assert data.type_filter == email_type
           assert Enum.all?(data.states, &(&1.type == email_type))
           assert String.contains?(html, ~s(name="type"))
-          assert String.contains?(html, ~s(value="#{email_type}" selected))
+          assert String.contains?(html, ~s(name="type" value="#{email_type}"))
+          assert String.contains?(html, ~s(<option value="#{email_type}"></option>))
           assert String.contains?(html, email_type)
 
           assert String.contains?(
@@ -330,7 +331,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
 
           assert String.contains?(html, ~s(name="range"))
           assert String.contains?(html, ~s(type="datetime-local"))
-          assert String.contains?(html, ~s(title="Filter by workflow type"))
+          assert String.contains?(html, ~s(title="Filter by workflow type;))
 
           assert String.contains?(
                    html,

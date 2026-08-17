@@ -139,7 +139,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
           assert extract_status_code(response) == 403
           assert extract_body(response) =~ "FLOW.POLICY.SET"
           assert extract_body(response) =~ "+FLOW.POLICY.SET"
-          assert extract_body(response) =~ "Required ACL command"
+          assert extract_body(response) =~ "Required command"
 
           retention_response =
             http_post_form(
@@ -152,7 +152,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
           assert extract_status_code(retention_response) == 403
           assert extract_body(retention_response) =~ "FLOW.RETENTION_CLEANUP"
           assert extract_body(retention_response) =~ "+FLOW.RETENTION_CLEANUP"
-          assert extract_body(retention_response) =~ "Required ACL command"
+          assert extract_body(retention_response) =~ "Required command"
         end
 
         test "metrics endpoint requires the metrics ACL command instead of INFO" do

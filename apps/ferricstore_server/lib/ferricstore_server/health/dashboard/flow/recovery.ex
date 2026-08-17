@@ -19,9 +19,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
     acl_username = DashboardAccess.keyspace_acl_username(opts)
 
     sampled_records =
-      @flow_dashboard_sample_limit
-      |> collect_flow_records_sample()
-      |> DashboardAccess.filter_flow_records_for_acl(acl_username)
+      collect_flow_records_sample_for_acl(@flow_dashboard_sample_limit, acl_username)
 
     available_types =
       sampled_records

@@ -22,7 +22,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
 
   @flow_dashboard_sample_limit 400
   @flow_dashboard_recent_limit 40
-  @flow_dashboard_signal_flow_fetch_limit 80
+  @flow_dashboard_signal_scan_max_flows 16
+  @flow_dashboard_signal_scan_max_concurrency 4
+  @flow_dashboard_signal_scan_fetch_timeout_ms 1_000
+  @flow_dashboard_signal_scan_max_fetch_timeout_ms 5_000
   @flow_dashboard_signal_history_count 25
   @flow_terminal_states ~w(completed failed cancelled)
   @flow_query_predicates [
@@ -64,9 +67,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
     acl_username = DashboardAccess.keyspace_acl_username(opts)
 
     sampled_records =
-      @flow_dashboard_sample_limit
-      |> collect_flow_records_sample()
-      |> DashboardAccess.filter_flow_records_for_acl(acl_username)
+      collect_flow_records_sample_for_acl(@flow_dashboard_sample_limit, acl_username)
 
     result =
       filters
@@ -359,25 +360,14 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   def collect_signals_page(opts \\ []) when is_list(opts) do
     filters = flow_signals_filters_from_opts(opts)
 
-    records =
-      @flow_dashboard_sample_limit
-      |> collect_flow_records_sample()
-      |> DashboardAccess.filter_flow_records_for_acl(DashboardAccess.keyspace_acl_username(opts))
+    acl_username = DashboardAccess.keyspace_acl_username(opts)
+
+    records = collect_flow_records_sample_for_acl(@flow_dashboard_sample_limit, acl_username)
 
     type_records = filter_flow_records_by_type(records, filters.type)
     filtered_records = filter_flow_records_by_name(type_records, filters.q)
 
-    signals =
-      if filters.scan_history do
-        filtered_records
-        |> flow_recent_records(@flow_dashboard_signal_flow_fetch_limit)
-        |> Enum.flat_map(&flow_signal_rows_for_record/1)
-        |> filter_flow_signal_rows(filters)
-        |> Enum.sort_by(&flow_signal_sort_key/1, :desc)
-        |> Enum.take(filters.limit)
-      else
-        []
-      end
+    {signals, signal_scan} = collect_flow_signal_rows(filtered_records, filters)
 
     %{
       signals: signals,
@@ -386,6 +376,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
       total_sampled: length(records),
       filtered_sampled: length(filtered_records),
       sample_limit: @flow_dashboard_sample_limit,
+      signal_scan: signal_scan,
       generated_at_ms: System.system_time(:millisecond)
     }
   end
@@ -1161,7 +1152,61 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
     }
   end
 
-  defp flow_signal_rows_for_record(record) when is_map(record) do
+  defp collect_flow_signal_rows(filtered_records, %{scan_history: false}) do
+    {[],
+     %{
+       requested: false,
+       sampled_flows: length(filtered_records),
+       inspected_flows: 0,
+       completed_flows: 0,
+       failed_flows: 0,
+       truncated: false,
+       auto_refresh: true
+     }}
+  end
+
+  defp collect_flow_signal_rows(filtered_records, filters) do
+    max_flows = flow_signal_scan_max_flows()
+    records = filtered_records |> flow_recent_records(max_flows)
+    timeout_ms = flow_signal_scan_fetch_timeout_ms()
+
+    {rows, completed, failed} =
+      records
+      |> Task.async_stream(
+        &flow_signal_rows_for_record(&1, timeout_ms),
+        max_concurrency: min(flow_signal_scan_max_concurrency(), max(length(records), 1)),
+        ordered: false,
+        on_timeout: :kill_task,
+        timeout: timeout_ms + 250
+      )
+      |> Enum.reduce({[], 0, 0}, fn
+        {:ok, {:ok, record_rows}}, {rows, completed, failed} ->
+          {[record_rows | rows], completed + 1, failed}
+
+        _failure, {rows, completed, failed} ->
+          {rows, completed, failed + 1}
+      end)
+
+    signals =
+      rows
+      |> List.flatten()
+      |> filter_flow_signal_rows(filters)
+      |> Enum.sort_by(&flow_signal_sort_key/1, :desc)
+      |> Enum.take(filters.limit)
+
+    {signals,
+     %{
+       requested: true,
+       sampled_flows: length(filtered_records),
+       inspected_flows: length(records),
+       completed_flows: completed,
+       failed_flows: failed,
+       truncated: length(filtered_records) > length(records),
+       auto_refresh: false
+     }}
+  end
+
+  defp flow_signal_rows_for_record(record, timeout_ms) when is_map(record) do
     id = flow_record_id(record)
     partition_key = flow_record_partition_key(record)
 
@@ -1173,20 +1218,49 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
       ]
       |> maybe_put_query_opt(:partition_key, flow_detail_url_partition_key(partition_key))
 
-    timeout_ms = flow_dashboard_detail_fetch_timeout_ms()
-
     case bounded_dashboard_call(
            fn -> flow_dashboard_flow_history(id, opts) end,
            timeout_ms,
            :signals_history
          ) do
-      {:ok, {:ok, history}} when is_list(history) -> flow_signal_rows(record, history)
-      _ -> []
+      {:ok, {:ok, history}} when is_list(history) -> {:ok, flow_signal_rows(record, history)}
+      _ -> {:error, :history_unavailable}
     end
   rescue
-    _ -> []
+    _ -> {:error, :history_unavailable}
   catch
-    :exit, _ -> []
+    :exit, _ -> {:error, :history_unavailable}
+  end
+
+  defp flow_signal_scan_max_flows do
+    dashboard_positive_limit(
+      :flow_dashboard_signal_scan_max_flows,
+      @flow_dashboard_signal_scan_max_flows,
+      @flow_dashboard_sample_limit
+    )
+  end
+
+  defp flow_signal_scan_max_concurrency do
+    dashboard_positive_limit(
+      :flow_dashboard_signal_scan_max_concurrency,
+      @flow_dashboard_signal_scan_max_concurrency,
+      16
+    )
+  end
+
+  defp flow_signal_scan_fetch_timeout_ms do
+    dashboard_positive_limit(
+      :flow_dashboard_signal_scan_fetch_timeout_ms,
+      @flow_dashboard_signal_scan_fetch_timeout_ms,
+      @flow_dashboard_signal_scan_max_fetch_timeout_ms
+    )
+  end
+
+  defp dashboard_positive_limit(key, default, maximum) do
+    case Application.get_env(:ferricstore, key, default) do
+      value when is_integer(value) and value > 0 -> min(value, maximum)
+      _other -> default
+    end
   end
 
   defp filter_flow_signal_rows(rows, filters) when is_map(filters) do

@@ -4,6 +4,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
   alias Ferricstore.Flow.Query.Limits
   alias FerricstoreServer.Health.Dashboard
   alias FerricstoreServer.Acl
+  alias FerricstoreServer.Health.Dashboard.Render.FlowQueryControls
 
   setup do
     {:ok, _} = Application.ensure_all_started(:ferricstore_server)
@@ -1158,6 +1159,58 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
 
     refute state_html =~ ~s(<select id="flow-state-type-filter")
     assert signal_html =~ ~s(<option value="email" selected>email</option>)
+  end
+
+  test "Flow States live refresh preserves the partition scope" do
+    filters = %{
+      type: "email",
+      state: "queued",
+      partition_key: "tenant:a",
+      q: nil,
+      range: nil,
+      from_ms: nil,
+      to_ms: nil,
+      limit: 40
+    }
+
+    url = FlowQueryControls.flow_states_live_url(filters)
+    %URI{query: query} = URI.parse(url)
+
+    assert URI.decode_query(query) == %{
+             "partition_key" => "tenant:a",
+             "state" => "queued",
+             "type" => "email"
+           }
+  end
+
+  test "Flow Signals history scans disable automatic live refresh" do
+    filters = %{type: "email", signal: nil, q: nil, limit: 40, scan_history: true}
+
+    assert FlowQueryControls.flow_signals_live_url(filters) == ""
+
+    assert FlowQueryControls.flow_signals_live_url(%{filters | scan_history: false}) ==
+             "/dashboard/api/flow/signals?type=email"
+  end
+
+  test "Flow Signals filter reports bounded scan coverage" do
+    html =
+      FerricstoreServer.Health.Dashboard.Render.FlowFilters.render_flow_signals_filter(%{
+        available_types: ["email"],
+        filters: %{type: "email", signal: nil, q: nil, limit: 40, scan_history: true},
+        signal_scan: %{
+          requested: true,
+          sampled_flows: 20,
+          inspected_flows: 4,
+          completed_flows: 3,
+          failed_flows: 1,
+          truncated: true,
+          auto_refresh: false
+        }
+      })
+
+    assert html =~ "Auto-refresh paused"
+    assert html =~ "inspected 4 of 20 matching workflows"
+    assert html =~ "1 history read failed"
   end
 
   test "state filters always expose exact terminal states for bounded cold lookup" do

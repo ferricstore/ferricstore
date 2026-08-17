@@ -42,12 +42,16 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
     """
   end
 
-  def render_flow_schedules_table(schedules) when is_list(schedules) do
+  def render_flow_schedules_table(schedules) when is_list(schedules),
+    do: render_flow_schedules_table(schedules, %{})
+
+  def render_flow_schedules_table(schedules, filters)
+      when is_list(schedules) and is_map(filters) do
     rows =
       if schedules == [] do
         ~s(<tr><td colspan="12" class="c-muted">No schedules matched the current filters.</td></tr>)
       else
-        Enum.map_join(schedules, "\n", &render_flow_schedule_row/1)
+        Enum.map_join(schedules, "\n", &render_flow_schedule_row(&1, filters))
       end
 
     """
@@ -100,11 +104,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
     """
   end
 
-  defp render_flow_schedule_row(%{error: reason}) do
+  defp render_flow_schedule_row(%{error: reason}, _filters) do
     ~s(<tr><td colspan="12" class="flow-alert-error">#{escape(reason)}</td></tr>)
   end
 
-  defp render_flow_schedule_row(schedule) do
+  defp render_flow_schedule_row(schedule, filters) do
     id = Map.get(schedule, :id, "")
     target = Map.get(schedule, :target, %{})
 
@@ -121,36 +125,76 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
       <td>#{schedule_catchup_summary(schedule)}</td>
       <td>#{schedule_end_summary(schedule)}</td>
       <td class="mono">#{escape(Map.get(schedule, :last_target_id, "-") || "-")}</td>
-      <td>#{render_flow_schedule_actions(schedule)}</td>
+      <td>#{render_flow_schedule_actions(schedule, filters)}</td>
     </tr>
     """
   end
 
-  defp render_flow_schedule_actions(schedule) do
+  defp render_flow_schedule_actions(schedule, filters) do
     id = Map.get(schedule, :id, "")
     state = Map.get(schedule, :state)
 
     [
-      if(state == "active", do: schedule_action_button(id, "fire", "Fire")),
-      if(state == "active", do: schedule_action_button(id, "pause", "Pause")),
-      if(state == "paused", do: schedule_action_button(id, "resume", "Resume")),
+      if(state == "active", do: schedule_confirmation(schedule, "fire", "Fire", filters)),
+      if(state == "active", do: schedule_action_button(id, "pause", "Pause", filters)),
+      if(state == "paused", do: schedule_action_button(id, "resume", "Resume", filters)),
       if(state in ["active", "paused", "failed"],
-        do: schedule_action_button(id, "delete", "Delete", true)
+        do: schedule_confirmation(schedule, "delete", "Delete", filters, true)
       )
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join(" ")
   end
 
-  defp schedule_action_button(id, action, label, danger? \\ false) do
+  defp schedule_action_button(id, action, label, filters, danger? \\ false) do
     class = if danger?, do: "flow-search-button flow-danger-button", else: "flow-search-button"
 
     """
     <form style="display:inline" action="/dashboard/flow/schedules" method="post">
       <input type="hidden" name="id" value="#{escape_attr(id)}">
+      #{schedule_filter_inputs(filters)}
       <button class="#{class}" type="submit" name="action" value="#{escape_attr(action)}">#{escape(label)}</button>
     </form>
     """
+  end
+
+  defp schedule_confirmation(schedule, action, label, filters, danger? \\ false) do
+    id = Map.get(schedule, :id, "")
+    state = Map.get(schedule, :state, "")
+    version = Map.get(schedule, :version, "")
+    class = if danger?, do: "flow-search-button flow-danger-button", else: "flow-search-button"
+
+    """
+    <details class="flow-action-confirm">
+      <summary class="#{class}">#{escape(label)}</summary>
+      <div class="flow-action-confirm-panel">
+        <strong>Confirm #{escape(label)}</strong>
+        <span class="mono">#{escape(id)}</span>
+        <form action="/dashboard/flow/schedules" method="post" data-dashboard-single-submit>
+          <input type="hidden" name="id" value="#{escape_attr(id)}">
+          <input type="hidden" name="action" value="#{escape_attr(action)}">
+          <input type="hidden" name="confirm_action" value="true">
+          <input type="hidden" name="expected_state" value="#{escape_attr(state)}">
+          <input type="hidden" name="expected_version" value="#{version |> to_string() |> escape_attr()}">
+          #{schedule_filter_inputs(filters)}
+          <button class="#{class}" type="submit">Confirm #{escape(label)}</button>
+        </form>
+      </div>
+    </details>
+    """
+  end
+
+  defp schedule_filter_inputs(filters) do
+    [
+      {"state", Map.get(filters, :state)},
+      {"kind", Map.get(filters, :kind)},
+      {"q", Map.get(filters, :q)},
+      {"limit", Map.get(filters, :limit)}
+    ]
+    |> Enum.reject(fn {_name, value} -> value in [nil, ""] end)
+    |> Enum.map_join("", fn {name, value} ->
+      ~s(<input type="hidden" name="#{name}" value="#{value |> to_string() |> escape_attr()}">)
+    end)
   end
 
   defp schedule_select(name, selected, values) do

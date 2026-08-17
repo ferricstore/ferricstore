@@ -1855,6 +1855,8 @@ defmodule Ferricstore.Flow.Schedule do
       id: Map.fetch!(definition, :id),
       flow_id: Map.get(record, :id),
       state: Map.get(record, :state),
+      version: Map.get(record, :version),
+      updated_at_ms: Map.get(record, :updated_at_ms),
       kind: Map.fetch!(definition, :kind),
       created_at_ms: Map.get(definition, :created_at_ms),
       every_ms: Map.get(definition, :every_ms),

@@ -28,7 +28,8 @@ defmodule FerricstoreServer.Health.Dashboard.Types do
           total_commands: non_neg_integer(),
           total_connections: non_neg_integer(),
           memory_bytes: non_neg_integer(),
-          run_id: binary()
+          run_id: binary(),
+          version: binary()
         }
 
   @typedoc "Per-shard status data."

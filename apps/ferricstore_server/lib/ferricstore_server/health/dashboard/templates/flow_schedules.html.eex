@@ -12,7 +12,7 @@
         <%= render_flow_schedules_summary(data) %>
         <%= render_flow_schedules_filters(data) %>
         <%= render_flow_failed_schedules(Map.get(data, :failed_schedules, [])) %>
-        <%= render_flow_schedules_table(Map.get(data, :schedules, [])) %>
+        <%= render_flow_schedules_table(Map.get(data, :schedules, []), Map.get(data, :filters, %{})) %>
       </div>
     </main>
   </div>

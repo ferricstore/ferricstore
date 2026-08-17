@@ -19,13 +19,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
   @flow_terminal_states ~w(completed failed cancelled)
 
   def collect_policies_page(opts \\ []) when is_list(opts) do
-    records = collect_flow_records_sample(@flow_dashboard_sample_limit)
     acl_username = DashboardAccess.keyspace_acl_username(opts)
 
-    visible_sampled =
-      records
-      |> DashboardAccess.filter_flow_records_for_acl(acl_username)
-      |> length()
+    records = collect_flow_records_sample_for_acl(@flow_dashboard_sample_limit, acl_username)
+
+    visible_sampled = length(records)
 
     active_types =
       records
@@ -123,14 +121,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
     limit =
       flow_retention_limit!(Keyword.get(opts, :limit, @flow_dashboard_retention_default_limit))
 
-    sampled_records = collect_flow_records_sample(@flow_dashboard_sample_limit)
     acl_username = DashboardAccess.keyspace_acl_username(opts)
 
-    records =
-      DashboardAccess.filter_flow_records_for_acl(
-        sampled_records,
-        acl_username
-      )
+    records = collect_flow_records_sample_for_acl(@flow_dashboard_sample_limit, acl_username)
 
     restricted_metrics? = is_binary(acl_username)
 
@@ -147,7 +140,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
       now_ms: now_ms,
       limit: limit,
       sample_limit: @flow_dashboard_sample_limit,
-      total_sampled: if(restricted_metrics?, do: length(records), else: length(sampled_records)),
+      total_sampled: length(records),
       filtered_sampled: length(records),
       terminal_sampled: terminal_sampled,
       active_sampled: max(length(records) - terminal_sampled, 0),

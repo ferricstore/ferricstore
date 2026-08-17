@@ -131,6 +131,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
     total_sampled = Map.get(data, :total_sampled, filtered_sampled)
     limit = Map.get(filters, :limit, @flow_dashboard_recent_limit)
     scan_checked = if Map.get(filters, :scan_history, false), do: " checked", else: ""
+    scan_status = render_flow_signal_scan_status(Map.get(data, :signal_scan))
 
     """
     <div class="flow-filter-panel">
@@ -153,11 +154,36 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
       </form>
       <div class="flow-filter-note">
         Showing #{escape(flow_signals_filter_summary(filters))} · #{format_number(filtered_sampled)} / #{format_number(total_sampled)} sampled records
+        #{scan_status}
         #{info_icon("Default view avoids history scans so the dashboard stays cheap during soak. Enable Scan histories to inspect recent sampled history, or use Flow detail for full paginated history.")}
       </div>
     </div>
     """
   end
+
+  defp render_flow_signal_scan_status(%{requested: true} = scan) do
+    inspected = Map.get(scan, :inspected_flows, 0)
+    sampled = Map.get(scan, :sampled_flows, inspected)
+    failed = Map.get(scan, :failed_flows, 0)
+
+    coverage =
+      if Map.get(scan, :truncated, false) do
+        "inspected #{format_number(inspected)} of #{format_number(sampled)} matching workflows"
+      else
+        "inspected all #{format_number(inspected)} matching workflows"
+      end
+
+    failures =
+      case failed do
+        0 -> ""
+        1 -> " · 1 history read failed"
+        count -> " · #{format_number(count)} history reads failed"
+      end
+
+    " · Auto-refresh paused · #{coverage}#{failures}"
+  end
+
+  defp render_flow_signal_scan_status(_scan), do: ""
 
   def render_flow_type_datalist(id, types) when is_binary(id) and is_list(types) do
     options =

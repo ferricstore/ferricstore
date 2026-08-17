@@ -376,10 +376,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
 
   def render_footer(data) do
     sample_rate = data.hotcold.sample_rate
+    version = Map.get(data.overview, :version, "unknown")
 
     """
     <div class="footer">
-      <span>Uptime: #{format_uptime(data.overview.uptime_seconds)} &middot; v0.1.0 &middot; Run #{escape(String.slice(data.overview.run_id, 0, 8))}</span>
+      <span>Uptime: #{format_uptime(data.overview.uptime_seconds)} &middot; v#{escape(version)} &middot; Run #{escape(String.slice(data.overview.run_id, 0, 8))}</span>
       <span>Hit/miss stats estimated from 1:#{sample_rate} sampling &middot; Live updates patch changed components</span>
     </div>
     """

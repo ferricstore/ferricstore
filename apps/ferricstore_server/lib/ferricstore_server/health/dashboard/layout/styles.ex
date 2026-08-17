@@ -408,6 +408,19 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       /* Sub-page header */
       .subpage-header { display: flex; align-items: center; gap: 16px; padding: 14px 24px; background: #090a0f; border-bottom: 1px solid #222530; }
       .subpage-title { font-size: 1.15rem; font-weight: 700; color: #f8fafc; letter-spacing: 0; }
+      .dashboard-live-status { margin-left: auto; display: inline-flex; align-items: center; gap: 7px; min-height: 28px; color: #94a3b8; font-size: 0.72rem; white-space: nowrap; }
+      .dashboard-live-dot { width: 7px; height: 7px; border-radius: 50%; background: #f59e0b; }
+      .dashboard-live-status[data-dashboard-live-status="live"] .dashboard-live-dot { background: #10b981; }
+      .dashboard-live-status[data-dashboard-live-status="stale"] .dashboard-live-dot,
+      .dashboard-live-status[data-dashboard-live-status="expired"] .dashboard-live-dot { background: #ef4444; }
+      .dashboard-live-status button { border: 1px solid #343846; border-radius: 5px; background: #171922; color: #e2e8f0; padding: 4px 8px; cursor: pointer; font: inherit; }
+      .dashboard-live-status button:hover { border-color: #818cf8; color: #f8fafc; }
+      .dashboard-live-status button:disabled { opacity: 0.55; cursor: wait; }
+      .flow-action-confirm { position: relative; display: inline-block; vertical-align: middle; }
+      .flow-action-confirm > summary { list-style: none; cursor: pointer; }
+      .flow-action-confirm > summary::-webkit-details-marker { display: none; }
+      .flow-action-confirm-panel { position: absolute; right: 0; top: calc(100% + 6px); z-index: 30; display: grid; gap: 8px; min-width: 240px; padding: 12px; border: 1px solid #343846; border-radius: 6px; background: #12131a; box-shadow: 0 12px 30px rgba(0,0,0,0.45); }
+      .flow-action-confirm-panel span { color: #94a3b8; overflow-wrap: anywhere; }
 
       /* Footer */
       .footer { position: fixed; bottom: 0; left: 0; right: 0; background: #090a0f; border-top: 1px solid #222530; padding: 8px 24px; font-size: 0.7rem; color: #8290a5; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; z-index: 50; }

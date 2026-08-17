@@ -33,7 +33,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
     <form class="flow-search" action="/dashboard/flow/governance" method="get" aria-label="Governance filters">
       <input class="flow-search-input mono" type="search" name="scope" value="#{escape(Map.get(filters, :scope, "") || "")}" placeholder="governance scope" title="Governance scope filter">
       <input class="flow-search-input mono" type="search" name="flow_id" value="#{escape(Map.get(filters, :flow_id, "") || "")}" placeholder="flow id" title="Approval flow id filter">
-      <select class="flow-search-input mono" name="status" title="Approval status filter">
+      <select class="flow-search-input mono" name="approval_status" title="Approval status filter">
         #{status_options(Map.get(filters, :status))}
       </select>
       <select class="flow-search-input mono" name="circuit_status" title="Circuit status filter">
@@ -140,18 +140,22 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
     """
   end
 
-  def render_flow_governance_approvals(approvals) when is_list(approvals) do
+  def render_flow_governance_approvals(approvals) when is_list(approvals),
+    do: render_flow_governance_approvals(approvals, %{})
+
+  def render_flow_governance_approvals(approvals, filters)
+      when is_list(approvals) and is_map(filters) do
     rows =
       if approvals == [] do
-        ~s(<tr><td colspan="8" class="c-muted">No approval requests found.</td></tr>)
+        ~s(<tr><td colspan="9" class="c-muted">No approval requests found.</td></tr>)
       else
-        Enum.map_join(approvals, "\n", &approval_row/1)
+        Enum.map_join(approvals, "\n", &approval_row(&1, filters))
       end
 
     """
     <div class="section-title">Approvals</div>
     <table>
-      <thead><tr><th>ID</th><th>Status</th><th>Flow</th><th>Scope</th><th>Requested</th><th>Expires</th><th>Policy</th><th>Reason</th></tr></thead>
+      <thead><tr><th>ID</th><th>Status</th><th>Flow</th><th>Scope</th><th>Requested</th><th>Expires</th><th>Policy</th><th>Reason</th><th>Decision</th></tr></thead>
       <tbody>#{rows}</tbody>
     </table>
     """
@@ -426,19 +430,72 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
   defp event_text(value) when is_binary(value), do: value
   defp event_text(value), do: to_string(value)
 
-  defp approval_row(approval) do
+  defp approval_row(approval, filters) do
     """
     <tr>
       <td class="mono">#{escape(Map.get(approval, :id, "-"))}</td>
-      <td>#{escape(Map.get(approval, :status, "-"))}</td>
+      <td>#{approval |> Map.get(:status, "-") |> event_text() |> escape()}</td>
       <td class="mono">#{escape(Map.get(approval, :flow_id, "-"))}</td>
       <td class="mono">#{escape(Map.get(approval, :scope, "-"))}</td>
       <td>#{format_timestamp_ms_or_dash(Map.get(approval, :requested_at_ms))}</td>
       <td>#{format_timestamp_ms_or_dash(Map.get(approval, :expires_at_ms))}</td>
       <td class="mono">#{escape(Map.get(approval, :policy_version, Map.get(approval, :policy_hash, "-")) || "-")}</td>
       <td>#{escape(Map.get(approval, :reason, "-") || "-")}</td>
+      <td>#{approval_actions(approval, filters)}</td>
     </tr>
     """
+  end
+
+  defp approval_actions(%{status: :pending} = approval, filters) do
+    [
+      approval_confirmation(approval, "approve_approval", "Approve", filters),
+      approval_confirmation(approval, "reject_approval", "Reject", filters, true)
+    ]
+    |> Enum.join(" ")
+  end
+
+  defp approval_actions(_approval, _filters), do: ~s(<span class="c-muted">decided</span>)
+
+  defp approval_confirmation(approval, action, label, filters, danger? \\ false) do
+    id = Map.get(approval, :id, "")
+    scope = Map.get(approval, :scope, "")
+    requested_at_ms = Map.get(approval, :requested_at_ms, "")
+    class = if danger?, do: "flow-search-button flow-danger-button", else: "flow-search-button"
+
+    """
+    <details class="flow-action-confirm">
+      <summary class="#{class}">#{escape(label)}</summary>
+      <div class="flow-action-confirm-panel">
+        <strong>Confirm #{escape(label)}</strong>
+        <span class="mono">#{escape(id)}</span>
+        <form action="/dashboard/flow/governance" method="post" data-dashboard-single-submit>
+          <input type="hidden" name="action" value="#{escape_attr(action)}">
+          <input type="hidden" name="approval_id" value="#{escape_attr(id)}">
+          <input type="hidden" name="approval_scope" value="#{escape_attr(scope)}">
+          <input type="hidden" name="confirm_action" value="true">
+          <input type="hidden" name="expected_status" value="pending">
+          <input type="hidden" name="expected_requested_at_ms" value="#{requested_at_ms |> to_string() |> escape_attr()}">
+          #{governance_filter_inputs(filters)}
+          <label>Decision reason <input class="flow-search-input" type="text" name="decision_reason" maxlength="262144" placeholder="optional"></label>
+          <button class="#{class}" type="submit">Confirm #{escape(label)}</button>
+        </form>
+      </div>
+    </details>
+    """
+  end
+
+  defp governance_filter_inputs(filters) do
+    [
+      {"scope", Map.get(filters, :scope)},
+      {"approval_status", Map.get(filters, :status)},
+      {"flow_id", Map.get(filters, :flow_id)},
+      {"circuit_status", Map.get(filters, :circuit_status)},
+      {"limit", Map.get(filters, :limit)}
+    ]
+    |> Enum.reject(fn {_name, value} -> value in [nil, ""] end)
+    |> Enum.map_join("", fn {name, value} ->
+      ~s(<input type="hidden" name="#{name}" value="#{value |> to_string() |> escape_attr()}">)
+    end)
   end
 
   defp budget_row(budget) do

@@ -643,6 +643,9 @@ defmodule FerricstoreServer.Health.Dashboard do
   @spec apply_flow_governance_form(map()) :: {:ok, binary()} | {:error, binary()}
   def apply_flow_governance_form(params), do: Governance.apply_form(params)
 
+  @spec apply_flow_governance_form(map(), keyword()) :: {:ok, binary()} | {:error, binary()}
+  def apply_flow_governance_form(params, opts), do: Governance.apply_form(params, opts)
+
   @doc false
   @spec flow_governance_form_command(map()) :: binary()
   def flow_governance_form_command(params), do: Governance.form_command(params)

@@ -19,12 +19,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
   @spec collect_overview_page(keyword()) :: map()
   def collect_overview_page(opts \\ []) when is_list(opts) do
     filters = flow_overview_filters_from_opts(opts)
-    sampled_records = collect_flow_records_sample(@flow_dashboard_sample_limit)
     acl_username = DashboardAccess.keyspace_acl_username(opts)
 
     visible_records =
-      sampled_records
-      |> DashboardAccess.filter_flow_records_for_acl(acl_username)
+      collect_flow_records_sample_for_acl(@flow_dashboard_sample_limit, acl_username)
 
     records =
       visible_records
@@ -40,8 +38,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
       records: flow_recent_records(records, @flow_dashboard_overview_recent_limit),
       workers: flow_worker_summaries(records),
       filters: filters,
-      total_sampled:
-        if(is_binary(acl_username), do: length(visible_records), else: length(sampled_records)),
+      total_sampled: length(visible_records),
       filtered_sampled: length(records),
       sample_limit: @flow_dashboard_sample_limit,
       generated_at_ms: System.system_time(:millisecond)
@@ -73,9 +70,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
     acl_username = DashboardAccess.keyspace_acl_username(opts)
 
     records =
-      @flow_dashboard_sample_limit
-      |> collect_flow_records_sample()
-      |> DashboardAccess.filter_flow_records_for_acl(acl_username)
+      collect_flow_records_sample_for_acl(@flow_dashboard_sample_limit, acl_username)
       |> filter_flow_records_by_partition(filters.partition_key)
 
     terminal_records = collect_flow_states_terminal_records(filters)
@@ -162,10 +157,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
 
   @spec collect_workers_page(keyword()) :: map()
   def collect_workers_page(opts \\ []) do
-    records =
-      @flow_dashboard_sample_limit
-      |> collect_flow_records_sample()
-      |> DashboardAccess.filter_flow_records_for_acl(DashboardAccess.keyspace_acl_username(opts))
+    acl_username = DashboardAccess.keyspace_acl_username(opts)
+
+    records = collect_flow_records_sample_for_acl(@flow_dashboard_sample_limit, acl_username)
 
     %{
       workers: flow_worker_summaries(records),
@@ -178,10 +172,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
 
   @spec collect_due_page(keyword()) :: map()
   def collect_due_page(opts \\ []) do
-    records =
-      @flow_dashboard_sample_limit
-      |> collect_flow_records_sample()
-      |> DashboardAccess.filter_flow_records_for_acl(DashboardAccess.keyspace_acl_username(opts))
+    acl_username = DashboardAccess.keyspace_acl_username(opts)
+
+    records = collect_flow_records_sample_for_acl(@flow_dashboard_sample_limit, acl_username)
 
     %{
       due_now: Enum.filter(records, &flow_due_now?/1),

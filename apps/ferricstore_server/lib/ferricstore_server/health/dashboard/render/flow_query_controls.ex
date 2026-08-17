@@ -821,6 +821,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
     []
     |> maybe_put_query_param("type", Map.get(filters, :type))
     |> maybe_put_query_param("state", Map.get(filters, :state))
+    |> maybe_put_query_param("partition_key", Map.get(filters, :partition_key))
     |> maybe_put_query_param("q", Map.get(filters, :q))
     |> maybe_put_query_param("range", range)
     |> maybe_put_query_param("from_ms", if(range, do: nil, else: Map.get(filters, :from_ms)))
@@ -829,6 +830,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
     |> Enum.reverse()
     |> URI.encode_query()
   end
+
+  def flow_signals_live_url(%{scan_history: true}), do: ""
 
   def flow_signals_live_url(filters) when is_map(filters) do
     case flow_signals_filter_query(filters) do

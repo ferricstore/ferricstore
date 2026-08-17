@@ -81,8 +81,16 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
       total_commands: Stats.total_commands(),
       total_connections: Stats.total_connections(),
       memory_bytes: :erlang.memory(:total),
-      run_id: Stats.run_id()
+      run_id: Stats.run_id(),
+      version: application_version()
     }
+  end
+
+  defp application_version do
+    case Application.spec(:ferricstore_server, :vsn) do
+      nil -> "unknown"
+      version -> to_string(version)
+    end
   end
 
   def collect_shards do

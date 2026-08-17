@@ -21,7 +21,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
     [
       limit: normalize_limit(Map.get(params, "limit")),
       scope: normalize_text(Map.get(params, "scope")),
-      status: normalize_status(Map.get(params, "status")),
+      status: normalize_status(Map.get(params, "approval_status") || Map.get(params, "status")),
       flow_id: normalize_text(Map.get(params, "flow_id")),
       circuit_status: normalize_circuit_status(Map.get(params, "circuit_status")),
       meta_type: normalize_text(Map.get(params, "meta_type")),
@@ -88,10 +88,19 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
   end
 
   @spec apply_form(map()) :: {:ok, binary()} | {:error, binary()}
-  def apply_form(params) when is_map(params) do
+  def apply_form(params), do: apply_form(params, approver: "dashboard")
+
+  @spec apply_form(map(), keyword()) :: {:ok, binary()} | {:error, binary()}
+  def apply_form(params, opts) when is_map(params) and is_list(opts) do
     scope = normalize_text(Map.get(params, "scope"))
 
     case {Map.get(params, "action"), scope} do
+      {"approve_approval", _scope} ->
+        apply_approval_decision(params, :approve, opts)
+
+      {"reject_approval", _scope} ->
+        apply_approval_decision(params, :reject, opts)
+
       {"open_circuit", nil} ->
         {:error, "ERR circuit scope is required"}
 
@@ -127,12 +136,99 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
     end
   end
 
-  def apply_form(_params), do: {:error, "ERR governance form must be a map"}
+  def apply_form(_params, _opts), do: {:error, "ERR governance form must be a map"}
 
   @spec form_command(map()) :: binary()
   def form_command(%{"action" => "close_circuit"}), do: "FLOW.CIRCUIT.CLOSE"
   def form_command(%{"action" => "open_circuit"}), do: "FLOW.CIRCUIT.OPEN"
+  def form_command(%{"action" => "approve_approval"}), do: "FLOW.APPROVAL.APPROVE"
+  def form_command(%{"action" => "reject_approval"}), do: "FLOW.APPROVAL.REJECT"
   def form_command(_params), do: "FLOW.GOVERNANCE.OVERVIEW"
+
+  @spec redirect_location(map(), {:ok, binary()} | {:error, binary()}) :: binary()
+  def redirect_location(params, result) when is_map(params) do
+    filters =
+      params
+      |> Map.take(["scope", "approval_status", "flow_id", "circuit_status", "limit"])
+      |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
+      |> Map.new()
+
+    result_params =
+      case result do
+        {:ok, message} -> %{"status" => "ok", "message" => message}
+        {:error, reason} -> %{"status" => "error", "message" => reason}
+      end
+
+    "/dashboard/flow/governance?" <> URI.encode_query(Map.merge(filters, result_params))
+  end
+
+  defp apply_approval_decision(params, action, opts) do
+    id = normalize_text(Map.get(params, "approval_id"))
+    approver = normalize_text(Keyword.get(opts, :approver))
+
+    with true <- is_binary(id) or {:error, "ERR approval id is required"},
+         true <- is_binary(approver) or {:error, "ERR approval actor is required"},
+         :ok <- validate_approval_confirmation(params),
+         {:ok, approval} <- validate_expected_approval(id, params),
+         decision_opts =
+           [approver: approver, now_ms: System.system_time(:millisecond)]
+           |> maybe_put_opt(:reason, normalize_text(Map.get(params, "decision_reason"))),
+         result <- apply_approval_api(action, id, decision_opts) do
+      case result do
+        {:ok, _decided} -> {:ok, "#{approval_decision_label(action)} approval #{approval.id}"}
+        {:error, reason} -> {:error, governance_error_message(reason)}
+      end
+    else
+      {:error, reason} -> {:error, governance_error_message(reason)}
+      false -> {:error, "ERR invalid approval action"}
+    end
+  end
+
+  defp validate_approval_confirmation(%{"confirm_action" => "true"}), do: :ok
+
+  defp validate_approval_confirmation(_params),
+    do: {:error, "approval decision confirmation is required"}
+
+  defp validate_expected_approval(id, params) do
+    with {:ok, expected_requested_at_ms} <-
+           parse_non_negative_integer(Map.get(params, "expected_requested_at_ms")),
+         "pending" <- normalize_text(Map.get(params, "expected_status")),
+         expected_scope when is_binary(expected_scope) <-
+           normalize_text(Map.get(params, "approval_scope")),
+         {:ok, %{} = approval} <- FerricStore.flow_approval_get(id),
+         :pending <- Map.get(approval, :status),
+         ^expected_requested_at_ms <- Map.get(approval, :requested_at_ms),
+         ^expected_scope <- Map.get(approval, :scope) do
+      {:ok, approval}
+    else
+      {:ok, nil} -> {:error, "approval changed or was deleted; refresh before retrying"}
+      {:error, reason} -> {:error, reason}
+      _other -> {:error, "approval changed; refresh before retrying"}
+    end
+  end
+
+  defp parse_non_negative_integer(value) when is_binary(value) do
+    case value |> String.trim() |> Integer.parse() do
+      {parsed, ""} when parsed >= 0 -> {:ok, parsed}
+      _other -> {:error, "approval request timestamp is required; refresh before retrying"}
+    end
+  end
+
+  defp parse_non_negative_integer(_value),
+    do: {:error, "approval request timestamp is required; refresh before retrying"}
+
+  defp apply_approval_api(:approve, id, opts), do: FerricStore.flow_approval_approve(id, opts)
+  defp apply_approval_api(:reject, id, opts), do: FerricStore.flow_approval_reject(id, opts)
+  defp approval_decision_label(:approve), do: "approved"
+  defp approval_decision_label(:reject), do: "rejected"
+
+  defp governance_error_message(reason) when is_binary(reason), do: reason
+
+  defp governance_error_message(%{message: message}) when is_binary(message), do: message
+  defp governance_error_message(reason), do: inspect(reason)
+
+  defp maybe_put_opt(opts, _key, nil), do: opts
+  defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp normalize_limit(value) when is_integer(value), do: value |> max(1) |> min(@max_limit)
 

@@ -217,12 +217,24 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     flow_governance_scope_requirement("FLOW.CIRCUIT.OPEN", params)
   end
 
+  def flow_governance_form_requirement(%{"action" => "approve_approval"} = params) do
+    flow_governance_scope_requirement("FLOW.APPROVAL.APPROVE", params, "approval_scope")
+  end
+
+  def flow_governance_form_requirement(%{"action" => "reject_approval"} = params) do
+    flow_governance_scope_requirement("FLOW.APPROVAL.REJECT", params, "approval_scope")
+  end
+
   def flow_governance_form_requirement(_params), do: {"FLOW.GOVERNANCE.OVERVIEW", []}
 
   defp flow_governance_scope_requirement(command, params) do
+    flow_governance_scope_requirement(command, params, "scope")
+  end
+
+  defp flow_governance_scope_requirement(command, params, field) do
     scope =
       params
-      |> Map.get("scope", "")
+      |> Map.get(field, "")
       |> String.trim()
 
     if scope == "" do

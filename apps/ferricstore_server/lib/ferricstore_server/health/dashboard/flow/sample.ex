@@ -13,6 +13,19 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
 
   def collect_flow_summary, do: collect_summary()
   def collect_flow_records_sample(limit), do: collect_records_sample(limit)
+
+  def collect_flow_records_sample(limit, visible?) when is_function(visible?, 1),
+    do: collect_records_sample(limit, visible?)
+
+  def collect_flow_records_sample_for_acl(limit, nil), do: collect_records_sample(limit)
+
+  def collect_flow_records_sample_for_acl(limit, username) when is_binary(username) do
+    collect_records_sample(
+      limit,
+      &FerricstoreServer.Health.Dashboard.Access.flow_record_allowed_for_acl?(&1, username)
+    )
+  end
+
   def flow_type_summaries(records), do: type_summaries(records)
   def flow_available_types(records), do: available_types(records)
 
@@ -74,6 +87,41 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
   end
 
   def collect_records_sample(_limit), do: []
+
+  def collect_records_sample(limit, visible?)
+      when is_integer(limit) and limit > 0 and is_function(visible?, 1) do
+    case FerricStore.Instance.fetch(:default) do
+      {:ok, %{shard_count: sc, keydir_refs: keydir_refs} = ctx}
+      when is_integer(sc) and sc > 0 and is_tuple(keydir_refs) and tuple_size(keydir_refs) >= sc ->
+        per_shard_scan_limit =
+          max(
+            @flow_dashboard_keydir_scan_floor,
+            div(limit + sc - 1, sc) * @flow_dashboard_keydir_scan_multiplier
+          )
+
+        0..(sc - 1)
+        |> Enum.reduce_while([], fn index, records ->
+          remaining = limit - length(records)
+
+          if remaining <= 0 do
+            {:halt, records}
+          else
+            visible_records =
+              collect_records_from_keydir(ctx, index, remaining, per_shard_scan_limit, visible?)
+
+            {:cont, records ++ visible_records}
+          end
+        end)
+
+      :error ->
+        []
+
+      _invalid_instance ->
+        []
+    end
+  end
+
+  def collect_records_sample(_limit, _visible?), do: []
 
   def type_summaries(records) do
     records
@@ -391,7 +439,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
         ctx,
         keydir,
         per_shard,
-        max(@flow_dashboard_keydir_scan_floor, per_shard * @flow_dashboard_keydir_scan_multiplier)
+        max(
+          @flow_dashboard_keydir_scan_floor,
+          per_shard * @flow_dashboard_keydir_scan_multiplier
+        ),
+        fn _record -> true end
       )
     rescue
       ArgumentError -> []
@@ -400,7 +452,19 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
     end
   end
 
-  defp collect_records_from_keydir_select(ctx, keydir, wanted, scan_limit) do
+  defp collect_records_from_keydir(ctx, index, wanted, scan_limit, visible?) do
+    keydir = elem(ctx.keydir_refs, index)
+
+    try do
+      collect_records_from_keydir_select(ctx, keydir, wanted, scan_limit, visible?)
+    rescue
+      ArgumentError -> []
+    catch
+      :exit, _ -> []
+    end
+  end
+
+  defp collect_records_from_keydir_select(ctx, keydir, wanted, scan_limit, visible?) do
     match_spec = [{{:"$1", :_, :_, :_, :_, :_, :_}, [], [:"$1"]}]
 
     case :ets.select(keydir, match_spec, @flow_dashboard_keydir_select_batch) do
@@ -416,7 +480,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
           scan_limit,
           [],
           0,
-          0
+          0,
+          visible?
         )
     end
   end
@@ -429,14 +494,22 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
          scan_limit,
          records,
          record_count,
-         scanned
+         scanned,
+         visible?
        ) do
     {records, record_count} =
       Enum.reduce_while(keys, {records, record_count}, fn key, {acc, count} ->
         cond do
-          count >= wanted -> {:halt, {acc, count}}
-          record = record_from_state_key(ctx, key) -> {:cont, {[record | acc], count + 1}}
-          true -> {:cont, {acc, count}}
+          count >= wanted ->
+            {:halt, {acc, count}}
+
+          record = record_from_state_key(ctx, key) ->
+            if visible?.(record),
+              do: {:cont, {[record | acc], count + 1}},
+              else: {:cont, {acc, count}}
+
+          true ->
+            {:cont, {acc, count}}
         end
       end)
 
@@ -463,7 +536,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
               scan_limit,
               records,
               record_count,
-              scanned
+              scanned,
+              visible?
             )
         end
     end

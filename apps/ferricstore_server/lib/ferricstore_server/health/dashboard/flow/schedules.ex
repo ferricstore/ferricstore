@@ -59,7 +59,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Schedules do
         {:error, "schedule id is required"}
 
       {"fire", id} ->
-        apply_result(FerricStore.flow_schedule_fire(id, now_ms: now_ms), "fired #{id}")
+        with :ok <- validate_destructive_confirmation(params),
+             :ok <- validate_expected_schedule(id, params) do
+          apply_result(FerricStore.flow_schedule_fire(id, now_ms: now_ms), "fired #{id}")
+        end
 
       {"pause", id} ->
         apply_result(FerricStore.flow_schedule_pause(id, now_ms: now_ms), "paused #{id}")
@@ -68,7 +71,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Schedules do
         apply_result(FerricStore.flow_schedule_resume(id, now_ms: now_ms), "resumed #{id}")
 
       {"delete", id} ->
-        apply_result(FerricStore.flow_schedule_delete(id, now_ms: now_ms), "deleted #{id}")
+        with :ok <- validate_destructive_confirmation(params),
+             :ok <- validate_expected_schedule(id, params) do
+          apply_result(FerricStore.flow_schedule_delete(id, now_ms: now_ms), "deleted #{id}")
+        end
 
       _other ->
         {:error, "unsupported schedule action"}
@@ -90,9 +96,57 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Schedules do
 
   def form_command(_params), do: "FLOW.SCHEDULE.GET"
 
+  @spec redirect_location(map(), {:ok, binary()} | {:error, binary()}) :: binary()
+  def redirect_location(params, result) when is_map(params) do
+    filters =
+      params
+      |> Map.take(["state", "kind", "q", "limit"])
+      |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
+      |> Map.new()
+
+    result_params =
+      case result do
+        {:ok, message} -> %{"status" => "ok", "message" => message}
+        {:error, reason} -> %{"status" => "error", "message" => reason}
+      end
+
+    "/dashboard/flow/schedules?" <> URI.encode_query(Map.merge(filters, result_params))
+  end
+
   defp apply_result(:ok, message), do: {:ok, message}
   defp apply_result({:ok, _value}, message), do: {:ok, message}
   defp apply_result({:error, reason}, _message), do: {:error, reason}
+
+  defp validate_destructive_confirmation(%{"confirm_action" => "true"}), do: :ok
+
+  defp validate_destructive_confirmation(_params),
+    do: {:error, "schedule action confirmation is required"}
+
+  defp validate_expected_schedule(id, params) do
+    with {:ok, expected_version} <- parse_expected_version(Map.get(params, "expected_version")),
+         expected_state when is_binary(expected_state) and expected_state != "" <-
+           params |> Map.get("expected_state", "") |> String.trim(),
+         {:ok, %{} = schedule} <- FerricStore.flow_schedule_get(id),
+         true <-
+           Map.get(schedule, :version) == expected_version and
+             Map.get(schedule, :state) == expected_state do
+      :ok
+    else
+      {:ok, nil} -> {:error, "schedule changed or was deleted; refresh before retrying"}
+      {:error, reason} -> {:error, reason}
+      _other -> {:error, "schedule changed; refresh before retrying"}
+    end
+  end
+
+  defp parse_expected_version(value) when is_binary(value) do
+    case value |> String.trim() |> Integer.parse() do
+      {version, ""} when version >= 0 -> {:ok, version}
+      _other -> {:error, "schedule version is required; refresh before retrying"}
+    end
+  end
+
+  defp parse_expected_version(_value),
+    do: {:error, "schedule version is required; refresh before retrying"}
 
   defp filters_from_opts(opts) do
     %{

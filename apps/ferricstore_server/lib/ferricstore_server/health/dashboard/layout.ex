@@ -317,6 +317,18 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
           onReady(function () {
             setupFlowValueInspector();
 
+            document.addEventListener("submit", function (event) {
+              var form = event.target.closest && event.target.closest("[data-dashboard-single-submit]");
+              if (!form) { return; }
+              if (form.dataset.dashboardSubmitting === "1") {
+                event.preventDefault();
+                return;
+              }
+              form.dataset.dashboardSubmitting = "1";
+              var buttons = form.querySelectorAll("button[type=submit], input[type=submit]");
+              for (var i = 0; i < buttons.length; i += 1) { buttons[i].disabled = true; }
+            });
+
             var root = document.body;
             if (!root || !root.dataset || !root.dataset.dashboardLiveUrl) { return; }
 
@@ -325,32 +337,113 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
             if (!Number.isFinite(intervalMs) || intervalMs < 500) { intervalMs = 2000; }
 
             var inFlight = false;
+            var failureCount = 0;
+            var lastSuccessAt = null;
+            var timer = null;
+            var status = document.createElement("div");
+            status.className = "dashboard-live-status";
+            status.setAttribute("data-dashboard-live-status", "connecting");
+            status.setAttribute("role", "status");
+            status.setAttribute("aria-live", "polite");
+            status.innerHTML = '<span class="dashboard-live-dot" aria-hidden="true"></span>' +
+              '<span data-dashboard-live-message>Connecting</span>' +
+              '<button type="button" data-dashboard-live-retry hidden>Retry</button>';
+
+            function ensureLiveStatusMounted() {
+              if (status.isConnected) { return; }
+              var statusHost = document.querySelector(".subpage-header") || document.querySelector(".top-bar") || root;
+              statusHost.appendChild(status);
+            }
+
+            ensureLiveStatusMounted();
+
+            var statusMessage = status.querySelector("[data-dashboard-live-message]");
+            var retryButton = status.querySelector("[data-dashboard-live-retry]");
+
+            function formatFreshness() {
+              if (!lastSuccessAt) { return "No successful refresh"; }
+              var ageSeconds = Math.max(0, Math.floor((Date.now() - lastSuccessAt) / 1000));
+              if (ageSeconds < 5) { return "Updated just now"; }
+              if (ageSeconds < 60) { return "Updated " + ageSeconds + "s ago"; }
+              return "Updated " + Math.floor(ageSeconds / 60) + "m ago";
+            }
+
+            function setLiveStatus(state, message, canRetry) {
+              status.setAttribute("data-dashboard-live-status", state);
+              statusMessage.textContent = message;
+              retryButton.hidden = !canRetry;
+              retryButton.disabled = inFlight;
+            }
+
+            function schedule(delayMs) {
+              if (timer) { window.clearTimeout(timer); }
+              timer = window.setTimeout(tick, delayMs);
+            }
+
+            function retryDelayMs() {
+              var exponential = intervalMs * Math.pow(2, failureCount - 1);
+              var bounded = Math.min(exponential, 60000);
+              return bounded + Math.floor(Math.random() * Math.max(1, bounded * 0.15));
+            }
+
+            function redirectToLogin() {
+              var next = window.location.pathname + window.location.search;
+              window.location.assign("/dashboard/login?next=" + encodeURIComponent(next));
+            }
 
             function tick() {
-              if (document.hidden || inFlight) { return; }
+              if (document.hidden) { schedule(intervalMs); return; }
+              if (inFlight) { return; }
               inFlight = true;
+              retryButton.disabled = true;
 
               fetch(url, {
                 cache: "no-store",
                 headers: { "accept": "application/json" }
               })
                 .then(function (response) {
+                  if (response.status === 401) {
+                    setLiveStatus("expired", "Session expired", false);
+                    redirectToLogin();
+                    throw { dashboardSessionExpired: true };
+                  }
                   if (!response.ok) { throw new Error("dashboard live request failed"); }
                   return response.json();
                 })
                 .then(function (payload) {
                   patchComponents(payload.components);
-                  root.dataset.dashboardLiveLastUpdateMs = String(payload.generated_at_ms || Date.now());
+                  ensureLiveStatusMounted();
+                  lastSuccessAt = payload.generated_at_ms || Date.now();
+                  root.dataset.dashboardLiveLastUpdateMs = String(lastSuccessAt);
+                  root.dataset.dashboardLiveError = "";
+                  failureCount = 0;
+                  setLiveStatus("live", formatFreshness(), false);
+                  schedule(intervalMs);
                 })
-                .catch(function () {
+                .catch(function (error) {
+                  if (error && error.dashboardSessionExpired) { return; }
+                  failureCount += 1;
                   root.dataset.dashboardLiveError = "1";
+                  setLiveStatus("stale", "Stale · " + formatFreshness(), true);
+                  schedule(retryDelayMs());
                 })
                 .finally(function () {
                   inFlight = false;
+                  retryButton.disabled = false;
                 });
             }
 
-            window.setInterval(tick, intervalMs);
+            retryButton.addEventListener("click", function () {
+              failureCount = 0;
+              setLiveStatus("connecting", "Retrying", false);
+              schedule(0);
+            });
+
+            document.addEventListener("visibilitychange", function () {
+              if (!document.hidden) { schedule(0); }
+            });
+
+            tick();
           });
         }());
       </script>

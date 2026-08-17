@@ -512,16 +512,19 @@ defmodule FerricstoreServer.Health.Endpoint do
 
         case Auth.authorize_command_request(peer, headers, requirement, :html) do
           :ok ->
-            location =
-              case FerricstoreServer.Health.Dashboard.apply_flow_governance_form(params) do
-                {:ok, message} ->
-                  "/dashboard/flow/governance?" <>
-                    URI.encode_query(%{"status" => "ok", "message" => message})
-
-                {:error, reason} ->
-                  "/dashboard/flow/governance?" <>
-                    URI.encode_query(%{"status" => "error", "message" => reason})
+            approver =
+              case Auth.dashboard_collect_opts(peer, headers) do
+                %{"acl_username" => username} -> username
+                _open_mode -> "dashboard"
               end
+
+            result =
+              FerricstoreServer.Health.Dashboard.apply_flow_governance_form(params,
+                approver: approver
+              )
+
+            location =
+              FerricstoreServer.Health.Dashboard.Flow.Governance.redirect_location(params, result)
 
             send_redirect_response(socket, transport, location)
 
@@ -569,16 +572,10 @@ defmodule FerricstoreServer.Health.Endpoint do
 
         case Auth.authorize_command_request(peer, headers, requirement, :html) do
           :ok ->
-            location =
-              case FerricstoreServer.Health.Dashboard.apply_flow_schedule_form(params) do
-                {:ok, message} ->
-                  "/dashboard/flow/schedules?" <>
-                    URI.encode_query(%{"status" => "ok", "message" => message})
+            result = FerricstoreServer.Health.Dashboard.apply_flow_schedule_form(params)
 
-                {:error, reason} ->
-                  "/dashboard/flow/schedules?" <>
-                    URI.encode_query(%{"status" => "error", "message" => reason})
-              end
+            location =
+              FerricstoreServer.Health.Dashboard.Flow.Schedules.redirect_location(params, result)
 
             send_redirect_response(socket, transport, location)
 
