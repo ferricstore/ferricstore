@@ -152,8 +152,12 @@ defmodule Ferricstore.InstanceTest do
                match?({:ok, %{id: ^target_id}}, EmbeddedFlow.flow_get(target_id))
              end)
 
-      assert {:ok, %{state: "completed", fire_count: 1}} =
-               EmbeddedFlow.flow_schedule_get(schedule_id)
+      assert eventually(fn ->
+               match?(
+                 {:ok, %{state: "completed", fire_count: 1}},
+                 EmbeddedFlow.flow_schedule_get(schedule_id)
+               )
+             end)
     end
 
     test "custom instances automatically sweep overdue Flow records" do
