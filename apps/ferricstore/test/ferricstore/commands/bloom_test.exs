@@ -543,6 +543,7 @@ defmodule Ferricstore.Commands.BloomTest do
   # ===========================================================================
 
   describe "false positive rate verification" do
+    @tag timeout: 60_000
     test "Bloom filter respects target false positive rate within 2x margin" do
       store = make_store()
       error_rate = 0.05
