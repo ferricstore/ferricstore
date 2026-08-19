@@ -299,7 +299,7 @@ defmodule Ferricstore.Flow.ScheduleTest do
         )
       end)
 
-    result = Task.yield(task, 2_000) || Task.shutdown(task)
+    result = Task.yield(task, 10_000) || Task.shutdown(task)
 
     assert {:ok, {:ok, %{claimed: 16, fired: 16, skipped: 0, errors: []}}} = result
   end

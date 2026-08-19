@@ -4,6 +4,26 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.6 - 2026-08-19
+
+- Added a single-task AWS ECS/Fargate OSS deployment profile with private
+  networking, a native TCP load balancer, encrypted task-local ephemeral
+  storage, isolated readiness checks, serialized task replacement, CloudWatch
+  Logs, ECS Exec, and
+  explicit data-loss and security guidance. The profile has no S3, DynamoDB,
+  EFS, EBS, clustering, or autoscaling dependencies.
+- Added a three-node AWS ECS/Fargate cluster profile that emulates stable
+  StatefulSet slots with three desired-count-one services, Cloud Map identities,
+  fixed and private Erlang distribution ports, periodic DNS reconnects,
+  three-AZ placement, task-local Raft replicas, liveness-safe ECS health, and a
+  one-node-at-a-time rollout guarded by local recovery position. A blank-disk
+  replacement integration test covers task IP/disk replacement. The support
+  contract permits one replica loss and explicitly rejects simultaneous
+  multi-replica replacement without an external durable recovery source.
+- Release node identity now selects long-name Erlang distribution for Fargate
+  DNS names and short-name distribution for single-label Docker/Compose hosts,
+  preserving cluster discovery compatibility in both environments.
+
 ## 0.11.5 - 2026-08-03
 
 - Added compact native Pub/Sub publish pipeline mode 35 and negotiated

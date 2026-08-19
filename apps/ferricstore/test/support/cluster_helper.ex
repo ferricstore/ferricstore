@@ -397,10 +397,12 @@ defmodule Ferricstore.Test.ClusterHelper do
   end
 
   @doc """
-  Restarts a killed cluster node with the same node name and data directory.
+  Restarts a killed cluster node with the same node name.
 
   This models beta same-version crash/restart recovery. It intentionally does
-  not try to exercise rolling upgrade behavior.
+  not try to exercise rolling upgrade behavior. Pass `fresh_data: true` to
+  model an infrastructure replacement, such as a new Fargate task, where the
+  logical node identity is retained but its task-local disk is empty.
 
   ## Parameters
 
@@ -409,6 +411,8 @@ defmodule Ferricstore.Test.ClusterHelper do
     - `opts` -- keyword options:
       - `:shards` -- number of shards per node (default: 4)
       - `:timeout` -- leader election timeout in ms (default: 30_000)
+      - `:fresh_data` -- replace the old data directory with a new empty one
+        (default: false)
 
   ## Returns
 
@@ -427,6 +431,13 @@ defmodule Ferricstore.Test.ClusterHelper do
     node_names = Enum.map(nodes, & &1.name)
     name = node_short_name(target.name)
 
+    data_dir =
+      if Keyword.get(opts, :fresh_data, false) do
+        fresh_generated_data_dir("ferricstore_replacement_#{target.index}")
+      else
+        target.data_dir
+      end
+
     code_paths = Enum.flat_map(:code.get_path(), fn p -> [~c"-pa", p] end)
     cookie = Atom.to_charlist(Node.get_cookie())
 
@@ -437,7 +448,7 @@ defmodule Ferricstore.Test.ClusterHelper do
         wait_boot: 120_000
       })
 
-    restarted = %{target | name: node_name, peer: peer_pid}
+    restarted = %{target | name: node_name, peer: peer_pid, data_dir: data_dir}
 
     live_nodes =
       nodes
@@ -452,7 +463,7 @@ defmodule Ferricstore.Test.ClusterHelper do
 
     :ok = ensure_nodes_reachable(node_names, timeout: timeout)
 
-    configure_remote_node(node_name, target.data_dir, shards)
+    configure_remote_node(node_name, restarted.data_dir, shards)
 
     :ok =
       :rpc.call(node_name, Application, :put_env, [

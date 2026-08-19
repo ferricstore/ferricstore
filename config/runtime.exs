@@ -738,7 +738,11 @@ if config_env() == :prod do
           topologies: [
             ferricstore: [
               strategy: Cluster.Strategy.Epmd,
-              config: [hosts: nodes]
+              config: [
+                hosts: nodes,
+                timeout:
+                  String.to_integer(System.get_env("FERRICSTORE_EPMD_POLL_INTERVAL_MS", "5000"))
+              ]
             ]
           ]
 

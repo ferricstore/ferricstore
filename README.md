@@ -32,7 +32,7 @@ Run one development node:
 docker run -p 6388:6388 -p 6380:6380 -p 6381:6381 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
-  quay.io/ferricstore/ferricstore:0.11.5
+  quay.io/ferricstore/ferricstore:0.11.6
 ```
 
 Published SDKs connect to `ferric://127.0.0.1:6388`. The operations dashboard
@@ -51,7 +51,7 @@ The FQL1 query planner, schedules, governance primitives, and operations
 dashboard are included in this OSS repository and release image; they are not
 enterprise-only add-ons.
 
-| Area | Included in FerricStore OSS `0.11.5` |
+| Area | Included in FerricStore OSS `0.11.6` |
 | --- | --- |
 | Durable KV and data structures | Strings, hashes with field TTL, lists, sets, sorted sets, streams and consumer groups, Pub/Sub, transactions, blocking reads, bitmaps, HyperLogLog, GEO, Bloom and Cuckoo filters, Count-Min Sketch, TopK, and TDigest. |
 | FerricStore-native helpers | Compare-and-swap, fenced distributed locks, fixed-window rate limiting, cache-aside/stampede protection, key diagnostics, quotas, and cluster inspection. |
@@ -63,7 +63,7 @@ enterprise-only add-ons.
 | FlowGuard governance | Durable effect reservations, approvals, circuits, budgets, strict leased concurrency limits, per-Flow governance ledgers, global overview/list surfaces, and structured denials. |
 | Operations | Browser dashboard, local operational Mix CLI, Flow query and index inspection, schedules, policies, governance, failures, retention, storage, keyspace, clients, streams, Pub/Sub, slow log, Raft/consensus, doctor diagnostics, health probes, and Prometheus metrics. |
 | Security | Protected mode, named ACL users, command/key/channel rules, dashboard bootstrap/login and ACL-scoped accounts, TLS/mTLS, trusted-proxy controls, CSRF/origin validation, login throttling, session revocation, and audit logging. |
-| Durability and deployment | Sharded WARaft consensus, disk-backed authoritative records, restart recovery, compaction, memory pressure/admission controls, multi-node routing, Docker multi-arch images, Kubernetes, bare-metal releases, and embedded mode. |
+| Durability and deployment | Sharded WARaft consensus, disk-backed authoritative records, restart recovery, compaction, memory pressure/admission controls, multi-node routing, Docker multi-arch images, ephemeral single-task and three-node AWS Fargate OSS profiles, Kubernetes, bare-metal releases, and embedded mode. |
 
 ## Scope And Boundaries
 
@@ -87,8 +87,9 @@ enterprise-only add-ons.
 
 ## Interfaces And Published SDKs
 
-The published SDKs use the same Ferric native protocol and currently correlate
-with the OSS server at version `0.11.5`:
+The published SDKs use the same Ferric native protocol. The `0.11.5` SDK
+release lines are compatibility-tested against the OSS server at version
+`0.11.6`:
 
 | Interface | Package or module | Source |
 | --- | --- | --- |
@@ -560,7 +561,7 @@ FerricStore can also run inside an Elixir application.
 
 ```elixir
 # mix.exs
-{:ferricstore, "~> 0.11.5"}
+{:ferricstore, "~> 0.11.6"}
 ```
 
 ```elixir
@@ -597,7 +598,9 @@ Operations and reference:
 - [Embedded Mode](guides/embedded-mode.md) — in-process Elixir setup, command coverage, storage, and multiple instances.
 - [Redis Migration Guide](guides/redis-migration.md) — compatibility matrix generation, workload assessment, and import strategy.
 - [Configuration](guides/configuration.md) — server config and production defaults.
-- [Deployment](guides/deployment.md) — Docker, Kubernetes, bare metal, clustering.
+- [Deployment](guides/deployment.md) — Docker, AWS Fargate, Kubernetes, bare metal, clustering.
+- [AWS Fargate single-task support](docs/aws-fargate-single-task.md) — exact OSS contract, architecture, lifecycle, and data-loss behavior.
+- [AWS Fargate cluster support](docs/aws-fargate-cluster.md) — three stable node slots, discovery, replacement recovery, guarded upgrades, and failure limits.
 - [Security](guides/security.md) — ACL, protected mode, dashboard accounts, TLS/mTLS, trusted proxies, and audit logging.
 - [Best Practices](guides/best-practices.md) — pipelining, key design, partitioning.
 - [Changelog](CHANGELOG.md) — release-by-release capability and compatibility changes.

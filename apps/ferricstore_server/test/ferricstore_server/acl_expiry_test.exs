@@ -13,7 +13,7 @@ defmodule FerricstoreServer.AclExpiryTest do
   end
 
   test "expiring ACL credentials fail authentication and cached commands after their deadline" do
-    expires_at_ms = System.system_time(:millisecond) + 80
+    expires_at_ms = System.system_time(:millisecond) + 60_000
 
     assert :ok =
              Acl.set_user("platform_cli_expiry", [
@@ -30,7 +30,12 @@ defmodule FerricstoreServer.AclExpiryTest do
     cache = Auth.build_acl_cache("platform_cli_expiry")
     assert :ok = Auth.check_command_cached(cache, "PING")
 
-    Process.sleep(100)
+    expired_at_ms = System.system_time(:millisecond) - 1
+
+    assert :ok =
+             Acl.set_user("platform_cli_expiry", ["expireat:#{expired_at_ms}"])
+
+    expired_cache = Map.put(cache, :expires_at_ms, expired_at_ms)
 
     assert {:error, _reason} = Acl.authenticate("platform_cli_expiry", "temporary-secret")
     assert {:error, _reason} = Acl.check_permission("platform_cli_expiry", "PING")
@@ -38,7 +43,7 @@ defmodule FerricstoreServer.AclExpiryTest do
     assert {:error, _reason} = Acl.check_key_access("platform_cli_expiry", "key", :read)
 
     assert {:error, "NOPERM user session expired or user was deleted"} =
-             Auth.check_command_cached(cache, "PING")
+             Auth.check_command_cached(expired_cache, "PING")
   end
 
   test "expiry survives the durable catalog and ACL file codecs" do

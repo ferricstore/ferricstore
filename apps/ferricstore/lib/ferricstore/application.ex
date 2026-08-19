@@ -916,9 +916,22 @@ defmodule Ferricstore.Application do
         :ok
 
       name ->
-        unless Node.alive?() do
+        cookie = Application.get_env(:ferricstore, :cookie, :ferricstore)
+
+        if Node.alive?() do
+          if node() != name do
+            raise "configured FerricStore node name #{inspect(name)} does not match " <>
+                    "the running release node #{inspect(node())}; set RELEASE_NODE to the " <>
+                    "same value as FERRICSTORE_NODE_NAME"
+          end
+
+          # The release starts distribution before the application and owns its
+          # cookie. rel/env.sh maps FERRICSTORE_COOKIE to RELEASE_COOKIE when
+          # the latter is absent; do not overwrite an explicitly configured
+          # release cookie here.
+          Logger.info("Using existing Erlang distribution: #{name}")
+        else
           {:ok, _} = Node.start(name)
-          cookie = Application.get_env(:ferricstore, :cookie, :ferricstore)
           Node.set_cookie(cookie)
           Logger.info("Started Erlang distribution: #{name}, cookie set")
         end

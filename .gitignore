@@ -77,5 +77,10 @@ apps/ferricstore/*.log
 # Local MCP/tooling config
 .mcp.json
 
+# Local generated workspace artifacts and demos.
+/artifacts/
+/demo/
+/output/
+
 # Native protocol Rust NIF build artifacts.
 apps/ferricstore_server/native/native_protocol_nif/target/

@@ -1,0 +1,20 @@
+# Copy this file to terraform.tfvars and pin the image you intend to operate.
+aws_region      = "us-east-1"
+name_prefix     = "ferricstore"
+container_image = "quay.io/ferricstore/ferricstore:0.11.6"
+
+# The endpoint is always internal and defaults to the stack VPC CIDR.
+# Narrow this list when only particular application subnets need access.
+# allowed_client_cidr_blocks = ["10.42.128.0/20"]
+
+cpu                   = 2048
+memory                = 4096
+cpu_architecture      = "X86_64"
+shard_count           = 0
+ephemeral_storage_gib = 40
+log_retention_days    = 30
+
+tags = {
+  Environment       = "development"
+  DeploymentProfile = "oss-single-task-ephemeral"
+}

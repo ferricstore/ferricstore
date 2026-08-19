@@ -1,0 +1,26 @@
+# First create a strong shared cookie outside Terraform so it is not stored in
+# Terraform state:
+# aws secretsmanager create-secret --name ferricstore-cluster-cookie \
+#   --secret-string "$(openssl rand -hex 32)"
+
+aws_region                 = "us-east-1"
+name_prefix                = "ferricstore"
+container_image            = "123456789012.dkr.ecr.us-east-1.amazonaws.com/ferricstore@sha256:REPLACE_WITH_COMPATIBLE_IMAGE_DIGEST"
+cluster_cookie_secret_arn  = "arn:aws:secretsmanager:us-east-1:123456789012:secret:ferricstore-cluster-cookie-EXAMPLE"
+service_discovery_namespace = "ferricstore.local"
+
+# The endpoint is internal. Narrow this to application subnets when possible.
+# allowed_client_cidr_blocks = ["10.43.128.0/20"]
+
+cpu                   = 2048
+memory                = 4096
+cpu_architecture      = "X86_64"
+shard_count           = 16
+ephemeral_storage_gib = 80
+cluster_remove_delay_ms = 600000
+log_retention_days    = 30
+
+tags = {
+  Environment       = "development"
+  DeploymentProfile = "oss-three-node-fargate-cluster"
+}

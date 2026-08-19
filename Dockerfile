@@ -67,9 +67,12 @@ RUN groupadd --system --gid 10001 ferricstore \
 WORKDIR /app
 
 COPY --from=builder --chown=ferricstore:ferricstore /app/_build/prod/rel/ferricstore ./
+COPY --chown=ferricstore:ferricstore deploy/aws/fargate-cluster/scripts/recovery-check.sh /app/bin/ferricstore-recovery-check
 
 # Create data directory
-RUN mkdir -p /data && chown ferricstore:ferricstore /app /data
+RUN chmod 0755 /app/bin/ferricstore-recovery-check \
+    && mkdir -p /data \
+    && chown ferricstore:ferricstore /app /data
 
 ENV FERRICSTORE_DATA_DIR=/data
 ENV FERRICSTORE_NATIVE_PORT=6388

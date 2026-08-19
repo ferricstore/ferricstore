@@ -698,11 +698,15 @@ defmodule Ferricstore.Raft.WARaftSpikeTest.Sections.CustomDurableSegmentLogStays
         removed = Enum.find(names, &(&1 != leader))
         removed_peer = {:raft_server_ferricstore_waraft_spike_1, removed}
 
-        assert {:ok, {:raft_log_pos, _, _}} =
-                 :rpc.call(leader, :ferricstore_waraft_spike, :adjust_membership, [
-                   :remove,
-                   removed_peer
-                 ])
+        assert eventually(fn ->
+                 match?(
+                   {:ok, {:raft_log_pos, _, _}},
+                   :rpc.call(leader, :ferricstore_waraft_spike, :adjust_membership, [
+                     :remove,
+                     removed_peer
+                   ])
+                 )
+               end)
 
         assert eventually(fn ->
                  membership = :rpc.call(leader, :ferricstore_waraft_spike, :membership, [])

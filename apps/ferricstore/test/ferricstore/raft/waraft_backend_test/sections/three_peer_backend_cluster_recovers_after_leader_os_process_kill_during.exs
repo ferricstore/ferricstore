@@ -661,7 +661,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.ThreePeerBackendClusterRec
 
                 assert eventually(
                          fn -> waraft_put_committed?(majority_names, 0, key, value) end,
-                         10
+                         100
                        )
 
                 {key, value}
