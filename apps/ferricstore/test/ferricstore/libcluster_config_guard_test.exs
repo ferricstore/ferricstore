@@ -31,7 +31,7 @@ defmodule Ferricstore.LibclusterConfigGuardTest do
     assert source =~ "strategy: Cluster.Strategy.Epmd"
   end
 
-  test "release distribution inherits FerricStore cluster identity and cookie" do
+  test "release uses long-name distribution for a Fargate DNS identity" do
     command =
       ~S|. "$1"; printf '%s\n%s\n%s' "$RELEASE_NODE" "$RELEASE_DISTRIBUTION" "$RELEASE_COOKIE"|
 
@@ -44,6 +44,32 @@ defmodule Ferricstore.LibclusterConfigGuardTest do
 
     assert output ==
              "ferricstore@node-0.ferricstore.local\nname\nshared-cookie"
+  end
+
+  test "release uses short-name distribution for a single-label container identity" do
+    command = ~S|. "$1"; printf '%s\n%s' "$RELEASE_NODE" "$RELEASE_DISTRIBUTION"|
+    env = [{"FERRICSTORE_NODE_NAME", "ferricstore@fs-node1-1234"}]
+
+    assert {output, 0} = System.cmd("sh", ["-c", command, "sh", @release_env_path], env: env)
+
+    assert output == "ferricstore@fs-node1-1234\nsname"
+  end
+
+  test "release rejects a distribution mode that cannot preserve the configured identity" do
+    command = ~S|. "$1"|
+
+    env = [
+      {"FERRICSTORE_NODE_NAME", "ferricstore@fs-node1-1234"},
+      {"RELEASE_DISTRIBUTION", "name"}
+    ]
+
+    assert {output, 1} =
+             System.cmd("sh", ["-c", command, "sh", @release_env_path],
+               env: env,
+               stderr_to_stdout: true
+             )
+
+    assert output =~ "RELEASE_DISTRIBUTION must be sname"
   end
 
   test "release preserves an explicit cookie when FerricStore cookie is absent" do

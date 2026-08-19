@@ -20,6 +20,9 @@ All notable changes to FerricStore will be documented here.
   replacement integration test covers task IP/disk replacement. The support
   contract permits one replica loss and explicitly rejects simultaneous
   multi-replica replacement without an external durable recovery source.
+- Release node identity now selects long-name Erlang distribution for Fargate
+  DNS names and short-name distribution for single-label Docker/Compose hosts,
+  preserving cluster discovery compatibility in both environments.
 
 ## 0.11.5 - 2026-08-03
 
