@@ -357,8 +357,8 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
         retry_delay_ms: 10
       )
 
-    assert wait_until(fn -> ReplaySafeIndex.read(dir) == 890 end)
-    assert :atomics.get(durable, 1) == 890
+    assert wait_until(fn -> :atomics.get(durable, 1) == 890 end)
+    assert ReplaySafeIndex.read(dir) == 890
 
     GenServer.stop(writer2)
     File.rm_rf(dir)
