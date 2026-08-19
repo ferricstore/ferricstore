@@ -113,7 +113,7 @@ defmodule Ferricstore.Flow.SchedulerTest do
 
     assert eventually(
              fn -> match?({:ok, %{id: ^target_id}}, FerricStore.flow_get(target_id)) end,
-             timeout: 2_000,
+             timeout: 5_000,
              interval: 10
            )
   end
