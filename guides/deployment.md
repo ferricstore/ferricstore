@@ -78,13 +78,13 @@ The TCP acceptor uses the following socket options (hardcoded in `ferricstore_se
 docker run -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
-  ghcr.io/ferricstore/ferricstore:0.11.6
+  quay.io/ferricstore/ferricstore:0.11.6
 ```
 
-The official image is published to GitHub Container Registry:
+The official image is published publicly to Quay.io:
 
 ```bash
-docker pull ghcr.io/ferricstore/ferricstore:0.11.6
+docker pull quay.io/ferricstore/ferricstore:0.11.6
 ```
 
 Current release images are published as multi-arch images for `linux/amd64`
@@ -100,7 +100,7 @@ docker run -p 6388:6388 \
   --security-opt seccomp=unconfined \
   -e FERRICSTORE_PROTECTED_MODE=true \
   -v /mnt/nvme/ferricstore:/data \
-  ghcr.io/ferricstore/ferricstore:0.11.6
+  quay.io/ferricstore/ferricstore:0.11.6
 ```
 
 #### Why io_uring Matters
@@ -220,7 +220,7 @@ spec:
     spec:
       containers:
         - name: ferricstore
-          image: ghcr.io/ferricstore/ferricstore:0.11.6
+          image: quay.io/ferricstore/ferricstore:0.11.6
           ports:
             - name: native
               containerPort: 6388

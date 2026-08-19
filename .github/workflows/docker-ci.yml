@@ -9,7 +9,9 @@ on:
 
 permissions:
   contents: read
-  packages: write
+
+env:
+  IMAGE: quay.io/ferricstore/ferricstore
 
 jobs:
   build:
@@ -23,12 +25,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GitHub Container Registry
+      - name: Log in to Quay.io
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_TOKEN }}
 
       - name: Build and push branch/SHA image
         uses: docker/build-push-action@v6
@@ -37,16 +39,16 @@ jobs:
           platforms: linux/amd64
           push: true
           provenance: false
-          tags: ghcr.io/${{ github.repository }}:ci-${{ github.sha }}
+          tags: ${{ env.IMAGE }}:ci-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Smoke-test published CI image startup
         run: >-
           scripts/smoke-docker-image.sh
-          "ghcr.io/${{ github.repository }}:ci-${{ github.sha }}"
+          "${IMAGE}:ci-${{ github.sha }}"
 
       - name: Summary
         run: |
           echo "Published image:" >> "$GITHUB_STEP_SUMMARY"
-          echo "ghcr.io/${{ github.repository }}:ci-${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "${IMAGE}:ci-${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"

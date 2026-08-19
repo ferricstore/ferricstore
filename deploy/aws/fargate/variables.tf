@@ -40,7 +40,7 @@ variable "availability_zone_count" {
 variable "container_image" {
   description = "Exact FerricStore OSS image to run. Pin a release or digest for repeatable deployments."
   type        = string
-  default     = "ghcr.io/ferricstore/ferricstore:0.11.6"
+  default     = "quay.io/ferricstore/ferricstore:0.11.6"
 
   validation {
     condition     = trimspace(var.container_image) != ""

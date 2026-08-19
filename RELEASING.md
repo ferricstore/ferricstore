@@ -4,6 +4,10 @@
 
 - Push access to the GitHub repository
 - `mix hex.user auth` configured for Hex.pm publishing
+- A Quay.io robot account with write access to the public
+  `ferricstore/ferricstore` repository
+- GitHub Actions repository secrets `QUAY_USERNAME` and `QUAY_TOKEN` containing
+  that robot account's username and token
 
 ## Steps
 
@@ -23,8 +27,9 @@
    git commit -m "release: update NIF checksums for vX.Y.Z"
    ```
 8. Hex.pm publish happens automatically via the **Publish to Hex.pm** workflow
-   (requires `HEX_API_KEY` secret). Docker Hub push also triggers automatically
-   (requires `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN` secrets).
+   (requires the `HEX_API_KEY` secret). The multi-architecture container image
+   also publishes automatically to `quay.io/ferricstore/ferricstore` using the
+   `QUAY_USERNAME` and `QUAY_TOKEN` secrets.
 
 ## Development builds
 

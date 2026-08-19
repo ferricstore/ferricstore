@@ -32,7 +32,7 @@ Run one development node:
 docker run -p 6388:6388 -p 6380:6380 -p 6381:6381 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
-  ghcr.io/ferricstore/ferricstore:0.11.6
+  quay.io/ferricstore/ferricstore:0.11.6
 ```
 
 Published SDKs connect to `ferric://127.0.0.1:6388`. The operations dashboard
