@@ -239,6 +239,27 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     refute workflow =~ "continue-on-error: true"
   end
 
+  test "container workflows publish only to the official Quay.io repository" do
+    publish_workflow =
+      File.read!(Path.join(@repo_root, ".github/workflows/docker-publish.yml"))
+
+    ci_workflow = File.read!(Path.join(@repo_root, ".github/workflows/docker-ci.yml"))
+
+    for workflow <- [publish_workflow, ci_workflow] do
+      assert workflow =~ "quay.io/ferricstore/ferricstore"
+      assert workflow =~ "registry: quay.io"
+      assert workflow =~ "secrets.QUAY_USERNAME"
+      assert workflow =~ "secrets.QUAY_TOKEN"
+      refute workflow =~ "ghcr.io"
+      refute workflow =~ "secrets.GITHUB_TOKEN"
+    end
+
+    assert publish_workflow =~ ~s(-t "${IMAGE}:latest")
+    assert publish_workflow =~ ~s(-t "${IMAGE}:${VERSION}")
+    assert publish_workflow =~ ~s(-t "${IMAGE}:${{ needs.version.outputs.major_minor }}")
+    assert publish_workflow =~ ~s(-t "${IMAGE}:${{ needs.version.outputs.major }}")
+  end
+
   defp workflow_paths, do: Path.wildcard(@workflow_glob)
 
   defp count_occurrences(source, pattern) do
