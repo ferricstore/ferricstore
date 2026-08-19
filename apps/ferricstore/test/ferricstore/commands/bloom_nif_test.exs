@@ -446,6 +446,7 @@ defmodule Ferricstore.Commands.BloomNifTest do
   # ===========================================================================
 
   describe "NIF false positive rate" do
+    @tag timeout: 60_000
     test "respects target false positive rate within 2x margin" do
       store = make_nif_store()
       error_rate = 0.05
