@@ -905,10 +905,11 @@ These environment variables are read from `config/runtime.exs` in production (`M
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FERRICSTORE_NODE_NAME` | unset | Erlang node name. Setting this enables clustering |
-| `FERRICSTORE_COOKIE` | `ferricstore` | Erlang distribution cookie. Override with a strong shared secret for clustered production. |
+| `FERRICSTORE_NODE_NAME` | unset | Full Erlang node name. Setting this enables clustering and automatically configures the matching release node identity. |
+| `FERRICSTORE_COOKIE` | `ferricstore` | Erlang distribution cookie. Override with a strong shared secret for clustered production; releases inherit it unless `RELEASE_COOKIE` is explicitly set to the same value. |
 | `FERRICSTORE_CLUSTER_NODES` | unset | Comma-separated peer node names |
 | `FERRICSTORE_DISCOVERY` | `gossip` | Discovery strategy when `FERRICSTORE_NODE_NAME` is set (`gossip`, `dns`, `epmd`, `consul`, `etcd`, `none`) |
+| `FERRICSTORE_EPMD_POLL_INTERVAL_MS` | `5000` | Retry interval for static `epmd` peers; DNS is resolved again on each attempt so stable names can follow replacement IPs |
 | `FERRICSTORE_GOSSIP_IF_ADDR` | `127.0.0.1` | Local interface used by gossip discovery. Set explicitly for LAN/container gossip. |
 | `FERRICSTORE_GOSSIP_MULTICAST_IF` | `FERRICSTORE_GOSSIP_IF_ADDR` | Multicast interface used by gossip discovery |
 | `FERRICSTORE_GOSSIP_PORT` | `45892` | UDP port used by gossip discovery |

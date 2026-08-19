@@ -1,7 +1,7 @@
 defmodule Ferricstore.MixProject do
   use Mix.Project
 
-  @version "0.11.5"
+  @version "0.11.6"
 
   def project do
     [
@@ -50,6 +50,8 @@ defmodule Ferricstore.MixProject do
         "../../docs/native-protocol.md",
         "../../docs/flow-query.md",
         "../../docs/flow-production-readiness.md",
+        "../../docs/aws-fargate-single-task.md",
+        "../../docs/aws-fargate-cluster.md",
         "../../docs/flow-retry-policy.md",
         "../../docs/testing.md"
       ],

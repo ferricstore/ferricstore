@@ -1,6 +1,9 @@
 # Deployment Guide
 
-This guide covers running FerricStore as a server: native release, Docker, Kubernetes, and cluster layouts. For local development, start with [Getting Started](getting-started.md). For production security, pair this guide with [Security](security.md).
+This guide covers running FerricStore as a server: native release, Docker,
+AWS Fargate, Kubernetes, and cluster layouts. For local development, start with
+[Getting Started](getting-started.md). For production security, pair this guide
+with [Security](security.md).
 
 > **Beta:** FerricStore is currently a `0.x` beta. Use exact image/package
 > versions and validate upgrades before critical production use. Compatibility
@@ -32,10 +35,11 @@ Environment variables:
 | `FERRICSTORE_DATA_DIR` | `/data` | Bitcask + WAL data directory |
 | `FERRICSTORE_SHARD_COUNT` | `0` (auto) | Number of shards (0 = CPU count) |
 | `FERRICSTORE_PROTECTED_MODE` | `true` | Reject non-localhost without auth |
-| `FERRICSTORE_NODE_NAME` | none | Erlang node name for clustering |
-| `FERRICSTORE_COOKIE` | `ferricstore` | Erlang distribution cookie. Override with a strong shared secret for any cluster. |
+| `FERRICSTORE_NODE_NAME` | none | Full Erlang node name for clustering; releases automatically use it as `RELEASE_NODE`. |
+| `FERRICSTORE_COOKIE` | `ferricstore` | Erlang distribution cookie. Override with a strong shared secret for any cluster; releases automatically use it as `RELEASE_COOKIE`. |
 | `FERRICSTORE_CLUSTER_NODES` | none | Comma-separated peer node names |
 | `FERRICSTORE_DISCOVERY` | `gossip` | Discovery strategy when `FERRICSTORE_NODE_NAME` is set. Use `dns` for Kubernetes. |
+| `FERRICSTORE_EPMD_POLL_INTERVAL_MS` | `5000` | Retry interval for `epmd` discovery. Required for stable DNS names whose task IP can change. |
 | `FERRICSTORE_GOSSIP_IF_ADDR` | `127.0.0.1` | Gossip bind interface. Set explicitly only for private LAN/container gossip. |
 | `FERRICSTORE_GOSSIP_MULTICAST_IF` | same as `FERRICSTORE_GOSSIP_IF_ADDR` | Gossip multicast interface |
 | `FERRICSTORE_GOSSIP_PORT` | `45892` | Gossip UDP port; firewall to FerricStore nodes only |
@@ -74,13 +78,13 @@ The TCP acceptor uses the following socket options (hardcoded in `ferricstore_se
 docker run -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
-  ghcr.io/ferricstore/ferricstore:0.11.5
+  ghcr.io/ferricstore/ferricstore:0.11.6
 ```
 
 The official image is published to GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/ferricstore/ferricstore:0.11.5
+docker pull ghcr.io/ferricstore/ferricstore:0.11.6
 ```
 
 Current release images are published as multi-arch images for `linux/amd64`
@@ -96,7 +100,7 @@ docker run -p 6388:6388 \
   --security-opt seccomp=unconfined \
   -e FERRICSTORE_PROTECTED_MODE=true \
   -v /mnt/nvme/ferricstore:/data \
-  ghcr.io/ferricstore/ferricstore:0.11.5
+  ghcr.io/ferricstore/ferricstore:0.11.6
 ```
 
 #### Why io_uring Matters
@@ -146,6 +150,61 @@ docker run --tmpfs /data:size=8g ...
 Cluster container examples will be documented after that layout is tested as
 part of the release process.
 
+## AWS Fargate
+
+The repository includes two deployable ECS/Fargate profiles for FerricStore
+OSS.
+
+The disposable single-task profile is in
+[`deploy/aws/fargate`](https://github.com/ferricstore/ferricstore/tree/main/deploy/aws/fargate). It uses an internal
+Network Load Balancer, encrypted task-local ephemeral storage mounted at
+`/data`, the isolated readiness endpoint, CloudWatch Logs, and ECS Exec.
+
+```bash
+cd deploy/aws/fargate
+cp terraform.tfvars.example terraform.tfvars
+terraform init
+terraform plan
+terraform apply
+```
+
+All data is lost when the task stops or is replaced, so this layout is for
+disposable development, demos, SDK integration, CI, caches, and similar OSS
+workloads. EFS is not used because FerricStore's LMDB projection cannot safely
+run on NFS. Fargate cannot reattach an existing ECS-managed EBS data volume to
+a replacement task.
+
+The stack keeps the ECS desired count at one and serializes replacements. A
+service replica count greater than one is not a FerricStore cluster. The stack
+does not create S3, DynamoDB, EFS, or EBS resources. Use the native-release or
+Kubernetes local/block-storage layouts for durable workloads. See the stack
+README for networking, security, cost, and cleanup notes, and the
+[single-task support contract](../docs/aws-fargate-single-task.md) for the exact
+failure behavior.
+
+The clustered profile is in
+[`deploy/aws/fargate-cluster`](https://github.com/ferricstore/ferricstore/tree/main/deploy/aws/fargate-cluster). It runs
+three stable logical node slots across three availability zones. Each slot has
+one desired-count-one ECS service and one task-local replica. Cloud Map moves
+the stable node name when ECS assigns a replacement IP, periodic EPMD discovery
+reconnects it, and Raft rebuilds one blank replacement from the two survivors.
+
+```bash
+cd deploy/aws/fargate-cluster
+cp terraform.tfvars.example terraform.tfvars
+terraform init
+terraform plan
+terraform apply
+```
+
+Image changes are registered by Terraform but deployed only through
+`scripts/deploy-sequential.sh`. It replaces one node and verifies full local
+catch-up before touching the next. The cluster has no S3, DynamoDB, EFS, or EBS
+data dependency. It tolerates one task-disk loss; simultaneous loss or upgrade
+of two replicas is unsupported, and loss of all three loses all data. See the
+[cluster support contract](../docs/aws-fargate-cluster.md) for discovery,
+health, rollout, and failure details.
+
 ## Kubernetes
 
 ### Basic Deployment
@@ -161,7 +220,7 @@ spec:
     spec:
       containers:
         - name: ferricstore
-          image: ghcr.io/ferricstore/ferricstore:0.11.5
+          image: ghcr.io/ferricstore/ferricstore:0.11.6
           ports:
             - name: native
               containerPort: 6388
