@@ -85,6 +85,83 @@ defmodule FerricstoreServer.CommandGatewayTest do
              ])
   end
 
+  test "executes SDK value commands through generic and native stateless paths" do
+    username = "flow-values"
+    password = "secret"
+
+    assert :ok =
+             FerricstoreServer.Acl.set_user(username, [
+               "on",
+               ">#{password}",
+               "-@all",
+               "+FLOW.VALUE.PUT",
+               "+FLOW.VALUE.MGET",
+               "~*"
+             ])
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate(username, password, peer: peer())
+
+    assert {:ok, [%{status: :ok, value: %{"ref" => ref}}]} =
+             CommandGateway.execute_batch(session, [["FLOW.VALUE.PUT", "value"]])
+
+    assert {:ok, native_command} =
+             CommandGateway.native_command("FLOW.VALUE.MGET", 0x020C, %{"refs" => [ref]})
+
+    assert {:ok, [%{status: :ok, value: ["value"]}]} =
+             CommandGateway.execute_batch(session, [native_command])
+  end
+
+  test "executes a structured Flow opcode through the stateless gateway" do
+    username = "flow-structured"
+    password = "secret"
+
+    assert :ok =
+             FerricstoreServer.Acl.set_user(username, [
+               "on",
+               ">#{password}",
+               "-@all",
+               "+FLOW.START_AND_CLAIM",
+               "~tenant:a:*"
+             ])
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate(username, password, peer: peer())
+
+    id = allowed_key("start-and-claim")
+
+    payload = %{
+      "id" => id,
+      "type" => "gateway-workflow",
+      "initial_state" => "queued",
+      "worker" => "gateway-worker",
+      "lease_ms" => 30_000,
+      "partition_key" => id,
+      "now_ms" => System.system_time(:millisecond)
+    }
+
+    assert {:ok, native_command} =
+             CommandGateway.native_command("FLOW.START_AND_CLAIM", 0x0223, payload)
+
+    assert {:ok, [%{status: :ok, value: %{id: ^id, state: "running"}}]} =
+             CommandGateway.execute_batch(session, [native_command])
+
+    assert {:error, :invalid_native_command} =
+             CommandGateway.native_command("FLOW.START_AND_CLAIM", 0x0224, payload)
+
+    assert {:error, :invalid_native_command} =
+             CommandGateway.native_command("PING", 0x0223, payload)
+
+    assert {:error, {:malformed_command, 0}} =
+             CommandGateway.execute_batch(session, [
+               %{
+                 "command" => "FLOW.START_AND_CLAIM",
+                 "opcode" => 0x0223,
+                 "payload" => payload
+               }
+             ])
+  end
+
   test "returns command and key ACL failures in their original batch positions" do
     put_http_user("reader", "secret", ["+GET"])
     assert {:ok, session} = AuthenticationGateway.authenticate("reader", "secret", peer: peer())
@@ -108,6 +185,19 @@ defmodule FerricstoreServer.CommandGatewayTest do
     assert command_denied =~ "NOPERM"
   end
 
+  test "keeps preparation failures as ordered command results" do
+    put_http_user("worker", "secret", ["+PING"])
+    assert {:ok, session} = AuthenticationGateway.authenticate("worker", "secret", peer: peer())
+
+    assert {:ok,
+            [
+              %{status: :bad_request, value: unknown},
+              %{status: :ok, value: "PONG"}
+            ]} = CommandGateway.execute_batch(session, [["NOT.A.COMMAND"], ["PING"]])
+
+    assert unknown =~ "unknown command"
+  end
+
   test "invalidates a cached session when its credential epoch changes" do
     put_http_user("rotating", "old-secret")
 
@@ -118,6 +208,14 @@ defmodule FerricstoreServer.CommandGatewayTest do
 
     assert {:error, :reauthentication_required} =
              CommandGateway.execute_batch(session, [["PING"]])
+  end
+
+  test "reuses the immutable ACL snapshot while the credential epoch is unchanged" do
+    put_http_user("stable", "secret")
+    assert {:ok, session} = AuthenticationGateway.authenticate("stable", "secret", peer: peer())
+
+    assert {:ok, validated} = AuthenticationGateway.validate(session)
+    assert :erts_debug.same(session, validated)
   end
 
   test "prevalidates the complete batch and rejects connection-scoped commands" do
@@ -138,6 +236,41 @@ defmodule FerricstoreServer.CommandGatewayTest do
                ["SET", key, "value"],
                []
              ])
+
+    assert Router.get(FerricStore.Instance.get(:default), key) == nil
+  end
+
+  test "prepares independent request batches before executing them under one session validation" do
+    put_http_user("writer", "secret")
+    assert {:ok, session} = AuthenticationGateway.authenticate("writer", "secret", peer: peer())
+    key = allowed_key("prepared")
+
+    assert {:ok, write} =
+             CommandGateway.prepare_batch([["SET", key, "value"]],
+               max_commands: 1,
+               deadline_ms: System.system_time(:millisecond) + 1_000
+             )
+
+    assert {:error, {:unsupported_command, 0, "MULTI"}} =
+             CommandGateway.prepare_batch([["MULTI"]], max_commands: 1)
+
+    assert {:ok, read} = CommandGateway.prepare_batch([["GET", key]], max_commands: 1)
+
+    assert {:ok,
+            [
+              [%{status: :ok, value: "OK"}],
+              [%{status: :ok, value: "value"}]
+            ]} = CommandGateway.execute_prepared_batches(session, [write, read])
+  end
+
+  test "rejects invalid prepared values before executing any request" do
+    put_http_user("writer", "secret")
+    assert {:ok, session} = AuthenticationGateway.authenticate("writer", "secret", peer: peer())
+    key = allowed_key("invalid-prepared")
+    assert {:ok, write} = CommandGateway.prepare_batch([["SET", key, "value"]])
+
+    assert {:error, {:invalid_batch, "prepared batches are invalid"}} =
+             CommandGateway.execute_prepared_batches(session, [write, :not_prepared])
 
     assert Router.get(FerricStore.Instance.get(:default), key) == nil
   end

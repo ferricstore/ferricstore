@@ -20,12 +20,47 @@ defmodule FerricstoreServer.CommandGateway do
   alias FerricstoreServer.AuthenticationGateway.Session
   alias FerricstoreServer.Native.{Blocking, Commands, ResourceBudget}
   alias FerricstoreServer.Native.Session, as: NativeSession
+  alias Ferricstore.Commands.KeyDiscovery
+
+  defmodule NativeCommand do
+    @moduledoc """
+    Validated structured command accepted by the transport-neutral gateway.
+
+    Transport adapters must construct this value through
+    `FerricstoreServer.CommandGateway.native_command/3`; wire envelopes do not
+    belong in the shared execution boundary.
+    """
+
+    @enforce_keys [:name, :opcode, :payload]
+    defstruct @enforce_keys
+
+    @opaque t :: %__MODULE__{
+              name: binary(),
+              opcode: non_neg_integer(),
+              payload: map()
+            }
+  end
+
+  defmodule PreparedBatch do
+    @moduledoc false
+
+    @enforce_keys [:planned, :deadline_ms]
+    defstruct @enforce_keys
+
+    @type planned_command ::
+            {:command_exec, map()} | {:native, non_neg_integer(), map()}
+
+    @opaque t :: %__MODULE__{
+              planned: [planned_command()],
+              deadline_ms: non_neg_integer()
+            }
+  end
 
   @command_exec_opcode 0x0100
   @default_max_commands 1_000
   @connection_scoped_commands MapSet.new(~w(AUTH CLIENT HELLO QUIT SELECT))
 
-  @type command :: [term()]
+  @type command :: [term()] | NativeCommand.t()
   @type result :: %{status: atom(), value: term()}
   @type error ::
           :reauthentication_required
@@ -36,6 +71,49 @@ defmodule FerricstoreServer.CommandGateway do
           | {:malformed_command, non_neg_integer()}
           | {:too_many_commands, pos_integer()}
           | {:unsupported_command, non_neg_integer(), binary()}
+
+  @doc """
+  Creates a validated structured native command for stateless execution.
+
+  The command name and opcode must identify the same allowlisted command.
+  Connection-scoped and blocking commands are never accepted.
+  """
+  @spec native_command(binary(), non_neg_integer(), map()) ::
+          {:ok, NativeCommand.t()} | {:error, :invalid_native_command}
+  def native_command(command, opcode, payload)
+      when is_binary(command) and is_integer(opcode) and opcode >= 0 and is_map(payload) do
+    normalized = String.upcase(command)
+
+    if structured_native_command?(normalized, opcode) do
+      {:ok, %NativeCommand{name: normalized, opcode: opcode, payload: payload}}
+    else
+      {:error, :invalid_native_command}
+    end
+  end
+
+  def native_command(_command, _opcode, _payload), do: {:error, :invalid_native_command}
+
+  @doc """
+  Validates and plans one request batch without executing it.
+
+  The returned value is opaque and can be combined with other independently
+  prepared request batches by `execute_prepared_batches/3`.
+  """
+  @spec prepare_batch([command()], keyword()) ::
+          {:ok, PreparedBatch.t()} | {:error, error()}
+  def prepare_batch(commands, opts \\ [])
+
+  def prepare_batch(commands, opts) when is_list(commands) and is_list(opts) do
+    with {:ok, max_commands} <- max_commands(opts),
+         :ok <- check_batch_size(commands, max_commands),
+         {:ok, deadline_ms} <- deadline_ms(opts),
+         {:ok, planned} <- plan(commands) do
+      {:ok, %PreparedBatch{planned: planned, deadline_ms: deadline_ms}}
+    end
+  end
+
+  def prepare_batch(_commands, _opts),
+    do: {:error, {:invalid_batch, "commands and options must be lists"}}
 
   @doc """
   Executes an ordered, stateless command batch.
@@ -50,16 +128,9 @@ defmodule FerricstoreServer.CommandGateway do
   def execute_batch(%Session{} = session, commands, opts)
       when is_list(commands) and is_list(opts) do
     with {:ok, session} <- AuthenticationGateway.validate(session),
-         {:ok, max_commands} <- max_commands(opts),
-         :ok <- check_batch_size(commands, max_commands),
-         {:ok, deadline_ms} <- deadline_ms(opts),
-         {:ok, planned} <- plan(commands),
-         {:ok, token} <- acquire_execution_slot() do
-      try do
-        {:ok, execute_planned(planned, session, deadline_ms, opts)}
-      after
-        ResourceBudget.release(token)
-      end
+         {:ok, prepared} <- prepare_batch(commands, opts),
+         {:ok, [results]} <- execute_prepared_batches_validated(session, [prepared], opts) do
+      {:ok, results}
     end
   end
 
@@ -68,10 +139,68 @@ defmodule FerricstoreServer.CommandGateway do
 
   def execute_batch(_session, _commands, _opts), do: {:error, :reauthentication_required}
 
+  @doc """
+  Executes independently prepared request batches under one session validation
+  and one global execution-budget lease.
+
+  Request boundaries, command ordering, and each request's absolute deadline
+  remain intact. Every value must originate from `prepare_batch/2`; otherwise
+  no request is submitted.
+  """
+  @spec execute_prepared_batches(Session.t(), [PreparedBatch.t()], keyword()) ::
+          {:ok, [[result()]]} | {:error, error()}
+  def execute_prepared_batches(session, batches, opts \\ [])
+
+  def execute_prepared_batches(%Session{} = session, batches, opts)
+      when is_list(batches) and is_list(opts) do
+    with {:ok, session} <- AuthenticationGateway.validate(session),
+         :ok <- validate_prepared_batches(batches) do
+      execute_prepared_batches_validated(session, batches, opts)
+    end
+  end
+
+  def execute_prepared_batches(%Session{}, _batches, _opts),
+    do: {:error, {:invalid_batch, "prepared batches are invalid"}}
+
+  def execute_prepared_batches(_session, _batches, _opts),
+    do: {:error, :reauthentication_required}
+
+  defp execute_prepared_batches_validated(_session, [], _opts), do: {:ok, []}
+
+  defp execute_prepared_batches_validated(session, batches, opts) do
+    with {:ok, token} <- acquire_execution_slot() do
+      try do
+        state = command_state(session, opts)
+
+        {:ok,
+         Enum.map(batches, fn %PreparedBatch{planned: planned, deadline_ms: deadline_ms} ->
+           execute_planned(planned, state, deadline_ms)
+         end)}
+      after
+        ResourceBudget.release_scoped(token)
+      end
+    end
+  end
+
+  defp validate_prepared_batches(batches) do
+    if Enum.all?(batches, &match?(%PreparedBatch{}, &1)) do
+      :ok
+    else
+      {:error, {:invalid_batch, "prepared batches are invalid"}}
+    end
+  end
+
   defp plan(commands) do
     commands
     |> Enum.with_index()
     |> Enum.reduce_while({:ok, []}, fn
+      {%NativeCommand{name: command, opcode: opcode, payload: payload}, index}, {:ok, planned} ->
+        if structured_native_command?(command, opcode) do
+          {:cont, {:ok, [{:native, opcode, payload} | planned]}}
+        else
+          {:halt, {:error, {:malformed_command, index}}}
+        end
+
       {[command | args], index}, {:ok, planned} when is_binary(command) and is_list(args) ->
         normalized = String.upcase(command)
 
@@ -79,7 +208,7 @@ defmodule FerricstoreServer.CommandGateway do
           {:halt, {:error, {:unsupported_command, index, normalized}}}
         else
           payload = %{"command" => command, "args" => args}
-          {:cont, {:ok, [payload | planned]}}
+          {:cont, {:ok, [{:command_exec, payload} | planned]}}
         end
 
       {_malformed, index}, {:ok, _planned} ->
@@ -91,16 +220,25 @@ defmodule FerricstoreServer.CommandGateway do
     end
   end
 
-  defp execute_planned(planned, session, deadline_ms, opts) do
-    state = command_state(session, opts)
+  defp execute_planned(planned, state, deadline_ms) do
+    Enum.map(planned, fn
+      {:command_exec, payload} ->
+        payload = add_deadline(payload, deadline_ms)
+        {status, value, _state} = Commands.execute(@command_exec_opcode, payload, state)
+        %{status: status, value: value}
 
-    Enum.map(planned, fn payload ->
-      payload =
-        if deadline_ms == 0, do: payload, else: Map.put(payload, "deadline_ms", deadline_ms)
-
-      {status, value, _state} = Commands.execute(@command_exec_opcode, payload, state)
-      %{status: status, value: value}
+      {:native, opcode, payload} ->
+        payload = add_deadline(payload, deadline_ms)
+        {status, value, _state} = Commands.execute(opcode, payload, state)
+        %{status: status, value: value}
     end)
+  end
+
+  defp add_deadline(payload, deadline_ms) do
+    payload =
+      if deadline_ms == 0, do: payload, else: Map.put(payload, "deadline_ms", deadline_ms)
+
+    payload
   end
 
   defp command_state(%Session{} = session, opts) do
@@ -128,6 +266,11 @@ defmodule FerricstoreServer.CommandGateway do
   defp unsupported_command?(command) do
     MapSet.member?(@connection_scoped_commands, command) or
       NativeSession.session_command?(command) or Blocking.blocking_command?(command)
+  end
+
+  defp structured_native_command?(command, opcode) do
+    KeyDiscovery.structured_native_command?(command) and
+      Commands.command_name(opcode) == command and not unsupported_command?(command)
   end
 
   defp max_commands(opts) do
@@ -165,7 +308,7 @@ defmodule FerricstoreServer.CommandGateway do
   end
 
   defp acquire_execution_slot do
-    case ResourceBudget.acquire(:executions, self(), 1) do
+    case ResourceBudget.acquire_scoped(:executions, 1) do
       {:ok, token} -> {:ok, token}
       {:error, {:limit, :executions}} -> {:error, {:busy, "global execution limit exceeded"}}
       {:error, _reason} -> {:error, :resource_budget_unavailable}

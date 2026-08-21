@@ -96,8 +96,9 @@ defmodule FerricstoreServer.AuthenticationGateway do
   @doc """
   Revalidates a session against the current ACL credential generation.
 
-  Authorization caches are rebuilt after validation so an accepted batch uses
-  the current command, key, and channel rules.
+  The session's immutable authorization snapshot is reused while its user epoch
+  is unchanged. Every ACL or credential mutation advances that epoch, so stale
+  snapshots are rejected before a command batch is submitted.
   """
   @spec validate(Session.t()) :: {:ok, Session.t()} | {:error, :reauthentication_required}
   def validate(%Session{} = session) do
@@ -105,9 +106,8 @@ defmodule FerricstoreServer.AuthenticationGateway do
          %{enabled: true, auth_epoch: auth_epoch} = user <- Acl.get_user(session.username),
          true <- auth_epoch == session.auth_epoch,
          true <- Acl.credential_active?(user),
-         true <- credential_source_current?(session.credential_source),
-         acl_cache when acl_cache != :denied <- ConnectionAuth.build_acl_cache(session.username) do
-      {:ok, %{session | acl_cache: acl_cache}}
+         true <- credential_source_current?(session.credential_source) do
+      {:ok, session}
     else
       _stale_disabled_or_unavailable -> {:error, :reauthentication_required}
     end
