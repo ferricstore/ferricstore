@@ -96,7 +96,7 @@ defmodule FerricstoreServer.CommandGatewayTest do
                ">#{password}",
                "-@all",
                "+FLOW.VALUE.PUT",
-               "+FLOW.VALUE.MGET",
+               "+@read",
                "~*"
              ])
 
@@ -111,6 +111,23 @@ defmodule FerricstoreServer.CommandGatewayTest do
 
     assert {:ok, [%{status: :ok, value: ["value"]}]} =
              CommandGateway.execute_batch(session, [native_command])
+
+    assert :ok =
+             FerricstoreServer.Acl.set_user("scoped-flow-values", [
+               "on",
+               ">#{password}",
+               "-@all",
+               "+@read",
+               "~tenant:a:*"
+             ])
+
+    assert {:ok, scoped_session} =
+             AuthenticationGateway.authenticate("scoped-flow-values", password, peer: peer())
+
+    assert {:ok, [%{status: :noperm, value: denied}]} =
+             CommandGateway.execute_batch(scoped_session, [native_command])
+
+    assert denied =~ "NOPERM"
   end
 
   test "executes a structured Flow opcode through the stateless gateway" do

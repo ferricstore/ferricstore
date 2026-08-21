@@ -1,7 +1,7 @@
 defmodule Ferricstore.Commands.NativeAstParserTest do
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.{Extension, NativeAstParser}
+  alias Ferricstore.Commands.{Extension, KeyDiscovery, NativeAstParser}
   alias FerricstoreServer.Acl.CommandCategories
 
   @protocol_control_commands ~w(
@@ -38,7 +38,7 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
     end
   end
 
-  test "native AST parser covers every ACL-visible command family" do
+  test "generic or structured native parsing covers every ACL-visible command family" do
     supported = NativeAstParser.supported_command_names()
 
     unsupported =
@@ -47,7 +47,7 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
       |> Enum.reject(&(&1 in @protocol_control_commands))
       |> Enum.reject(&(&1 in @authorization_only_commands))
       |> Enum.reject(&(&1 in @not_implemented_redis_commands))
-      |> Enum.reject(&native_parser_covers?(&1, supported))
+      |> Enum.reject(&command_input_covers?(&1, supported))
       |> Enum.sort()
 
     assert unsupported == []
@@ -55,6 +55,7 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
 
   test "parses every built-in ACL-visible command family without unknown AST fallback" do
     extension_names = Extension.command_names_upper()
+    supported = NativeAstParser.supported_command_names()
 
     commands =
       CommandCategories.categories()
@@ -63,6 +64,7 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
       |> Enum.reject(&(&1 in @authorization_only_commands))
       |> Enum.reject(&(&1 in @not_implemented_redis_commands))
       |> Enum.reject(&MapSet.member?(extension_names, &1))
+      |> Enum.reject(&structured_native_only?(&1, supported))
 
     for command <- commands do
       {name, args} = parser_call(command)
@@ -88,6 +90,7 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
 
   test "every built-in Flow data command has a non-empty ACL scope" do
     extension_names = Extension.command_names_upper()
+    supported = NativeAstParser.supported_command_names()
 
     commands =
       CommandCategories.categories()
@@ -96,10 +99,20 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
       |> Enum.reject(&(&1 in @authorization_only_commands))
       |> Enum.reject(&MapSet.member?(extension_names, &1))
 
-    for command <- commands do
+    {structured_native_only, generic} =
+      Enum.split_with(commands, &structured_native_only?(&1, supported))
+
+    for command <- generic do
       {name, args} = parser_call(command)
       assert {:ok, _upper, _parsed_args, _ast, keys} = NativeAstParser.parse(name, args)
       refute keys == [], "expected #{command} to require an ACL scope"
+    end
+
+    for command <- structured_native_only do
+      description =
+        KeyDiscovery.describe(command, {:structured_native_command, command}, ["*"])
+
+      refute description.acl_keys == [], "expected #{command} to require an ACL scope"
     end
   end
 
@@ -617,6 +630,16 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
 
   defp native_parser_covers?(command, supported) do
     MapSet.member?(supported, command) or command_parent_supported?(command, supported)
+  end
+
+  defp command_input_covers?(command, supported) do
+    native_parser_covers?(command, supported) or
+      KeyDiscovery.structured_native_command?(command)
+  end
+
+  defp structured_native_only?(command, supported) do
+    KeyDiscovery.structured_native_command?(command) and
+      not native_parser_covers?(command, supported)
   end
 
   defp ast_contains_error?({:error, message}) when is_binary(message), do: true
