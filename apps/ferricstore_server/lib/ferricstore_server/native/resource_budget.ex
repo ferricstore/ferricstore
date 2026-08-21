@@ -880,24 +880,37 @@ defmodule FerricstoreServer.Native.ResourceBudget do
       end
 
     released_resources =
-      Enum.reduce(rows, MapSet.new(), fn {{owner, resource} = key, _amount}, resources ->
-        if scoped_resource_requested?(resource, requested_resource) and not Process.alive?(owner) do
-          case safe_take_lease(state.budget.scoped_owner_leases, key) do
-            [{^key, amount}] ->
-              release_amount(state.budget, resource, amount)
-              MapSet.put(resources, resource)
-
-            _already_released ->
-              resources
-          end
-        else
-          resources
-        end
+      Enum.reduce(rows, MapSet.new(), fn row, resources ->
+        reclaim_dead_scoped_owner(row, resources, state.budget, requested_resource)
       end)
 
     Enum.reduce(released_resources, state, fn resource, acc ->
       grant_waiters(acc, resource)
     end)
+  end
+
+  defp reclaim_dead_scoped_owner(
+         {{owner, resource} = key, _amount},
+         resources,
+         budget,
+         requested_resource
+       ) do
+    if scoped_resource_requested?(resource, requested_resource) and not Process.alive?(owner) do
+      reclaim_scoped_owner_lease(key, resource, resources, budget)
+    else
+      resources
+    end
+  end
+
+  defp reclaim_scoped_owner_lease(key, resource, resources, budget) do
+    case safe_take_lease(budget.scoped_owner_leases, key) do
+      [{^key, amount}] ->
+        release_amount(budget, resource, amount)
+        MapSet.put(resources, resource)
+
+      _already_released ->
+        resources
+    end
   end
 
   defp scoped_resource_requested?(_resource, :all), do: true

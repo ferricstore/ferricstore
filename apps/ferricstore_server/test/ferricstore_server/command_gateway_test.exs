@@ -9,6 +9,7 @@ defmodule FerricstoreServer.CommandGatewayTest do
   alias FerricstoreServer.AuthenticationGateway
   alias FerricstoreServer.AuthenticationGateway.Session
   alias FerricstoreServer.CommandGateway
+  alias FerricstoreServer.CommandGateway.PreparedBatch
 
   setup do
     {:ok, _apps} = Application.ensure_all_started(:ferricstore_server)
@@ -271,6 +272,25 @@ defmodule FerricstoreServer.CommandGatewayTest do
 
     assert {:error, {:invalid_batch, "prepared batches are invalid"}} =
              CommandGateway.execute_prepared_batches(session, [write, :not_prepared])
+
+    assert Router.get(FerricStore.Instance.get(:default), key) == nil
+  end
+
+  test "revalidates forged prepared batches before execution" do
+    put_http_user("writer", "secret")
+    assert {:ok, session} = AuthenticationGateway.authenticate("writer", "secret", peer: peer())
+    key = allowed_key("forged-prepared")
+
+    forged = %PreparedBatch{
+      planned: [
+        {:command_exec, %{"command" => "SET", "args" => [key, "value"]}},
+        {:native, 0xFFFF, %{}}
+      ],
+      deadline_ms: 0
+    }
+
+    assert {:error, {:invalid_batch, "prepared batches are invalid"}} =
+             CommandGateway.execute_prepared_batches(session, [forged])
 
     assert Router.get(FerricStore.Instance.get(:default), key) == nil
   end

@@ -16,11 +16,11 @@ defmodule FerricstoreServer.CommandGateway do
   state are deliberately rejected. Those require a persistent native session.
   """
 
+  alias Ferricstore.Commands.KeyDiscovery
   alias FerricstoreServer.AuthenticationGateway
   alias FerricstoreServer.AuthenticationGateway.Session
   alias FerricstoreServer.Native.{Blocking, Commands, ResourceBudget}
   alias FerricstoreServer.Native.Session, as: NativeSession
-  alias Ferricstore.Commands.KeyDiscovery
 
   defmodule NativeCommand do
     @moduledoc """
@@ -183,12 +183,34 @@ defmodule FerricstoreServer.CommandGateway do
   end
 
   defp validate_prepared_batches(batches) do
-    if Enum.all?(batches, &match?(%PreparedBatch{}, &1)) do
+    if Enum.all?(batches, &valid_prepared_batch?/1) do
       :ok
     else
       {:error, {:invalid_batch, "prepared batches are invalid"}}
     end
   end
+
+  defp valid_prepared_batch?(%PreparedBatch{planned: planned, deadline_ms: deadline_ms})
+       when is_list(planned) and is_integer(deadline_ms) and deadline_ms >= 0 do
+    Enum.all?(planned, &valid_planned_command?/1)
+  end
+
+  defp valid_prepared_batch?(_invalid), do: false
+
+  defp valid_planned_command?({:command_exec, %{"command" => command, "args" => args} = payload})
+       when is_binary(command) and is_list(args) and map_size(payload) == 2 do
+    command |> String.upcase() |> unsupported_command?() |> Kernel.not()
+  end
+
+  defp valid_planned_command?({:native, opcode, payload})
+       when is_integer(opcode) and opcode >= 0 and is_map(payload) do
+    case Commands.command_name(opcode) do
+      command when is_binary(command) -> structured_native_command?(command, opcode)
+      _unknown -> false
+    end
+  end
+
+  defp valid_planned_command?(_invalid), do: false
 
   defp plan(commands) do
     commands
