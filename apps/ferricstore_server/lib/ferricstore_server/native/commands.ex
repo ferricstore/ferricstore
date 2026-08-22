@@ -3711,6 +3711,7 @@ defmodule FerricstoreServer.Native.Commands do
           "ttl_ms",
           "override",
           "local_cache",
+          "now_ms",
           "deadline_ms"
         ]
       },

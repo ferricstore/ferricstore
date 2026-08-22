@@ -84,6 +84,18 @@ defmodule FerricstoreServer.CommandGatewayTest do
                ["SET", key, "value"],
                ["GET", key]
              ])
+
+    assert {:ok, native_set} =
+             CommandGateway.native_command("SET", 0x0102, %{
+               "key" => key,
+               "value" => "native-value"
+             })
+
+    assert {:ok, [%{status: :ok, value: "OK"}]} =
+             CommandGateway.execute_batch(session, [native_set])
+
+    assert {:ok, [%{status: :ok, value: "native-value"}]} =
+             CommandGateway.execute_batch(session, [["GET", key]])
   end
 
   test "executes SDK value commands through generic and native stateless paths" do
@@ -105,6 +117,17 @@ defmodule FerricstoreServer.CommandGatewayTest do
 
     assert {:ok, [%{status: :ok, value: %{"ref" => ref}}]} =
              CommandGateway.execute_batch(session, [["FLOW.VALUE.PUT", "value"]])
+
+    assert {:ok, native_value_put} =
+             CommandGateway.native_command("FLOW.VALUE.PUT", 0x020B, %{
+               "value" => "native-value",
+               "now_ms" => System.system_time(:millisecond)
+             })
+
+    assert {:ok, [%{status: :ok, value: %{ref: native_ref}}]} =
+             CommandGateway.execute_batch(session, [native_value_put])
+
+    assert is_binary(native_ref)
 
     assert {:ok, native_command} =
              CommandGateway.native_command("FLOW.VALUE.MGET", 0x020C, %{"refs" => [ref]})
