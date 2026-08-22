@@ -180,18 +180,58 @@ defmodule FerricstoreServer.CommandGatewayTest do
              ])
   end
 
-  test "accepts the structured native FLOW.QUERY contract used by HTTP transports" do
+  test "executes the structured native FLOW.QUERY contract used by HTTP transports" do
+    type = "gateway-query-#{System.unique_integer([:positive, :monotonic])}"
+    partition = allowed_key("query-partition")
+    id = allowed_key("query-record")
+
+    assert {:ok, _policy} = FerricStore.flow_policy_set(type, indexed_state_meta: "version")
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: type,
+               state: "attr",
+               partition_key: partition,
+               attributes: %{"tenant" => "acme", "tier" => "gold"},
+               state_meta: %{"version" => "1"},
+               now_ms: System.system_time(:millisecond)
+             )
+
+    put_http_user("query-reader", "secret", ["+FLOW.QUERY"])
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("query-reader", "secret", peer: peer())
+
     payload = %{
       "version" => "FQL1",
       "query" =>
-        "FROM runs WHERE partition_key = @partition_key AND type = @type ORDER BY updated_at_ms ASC LIMIT 10 RETURN RECORDS",
-      "params" => %{"partition_key" => allowed_key("query-partition"), "type" => "workflow"}
+        "FROM runs WHERE partition_key = @partition_key AND type = @type AND state = @state AND attribute['tenant'] = @attribute_0 ORDER BY updated_at_ms ASC LIMIT 100 RETURN RECORDS",
+      "params" => %{
+        "partition_key" => partition,
+        "type" => type,
+        "state" => "attr",
+        "attribute_0" => "acme"
+      }
     }
 
     assert {:ok, native_command} =
              CommandGateway.native_command("FLOW.QUERY", 0x0231, payload)
 
     assert %CommandGateway.NativeCommand{} = native_command
+
+    assert :ok =
+             ShardHelpers.eventually(
+               fn ->
+                 case CommandGateway.execute_batch(session, [native_command]) do
+                   {:ok, [%{status: :ok, value: %{records: records}}]} ->
+                     Enum.any?(records, &(&1.id == id))
+
+                   _projection_not_ready ->
+                     false
+                 end
+               end,
+               "structured FLOW.QUERY did not expose the created record"
+             )
 
     assert {:error, :invalid_native_command} =
              CommandGateway.native_command("FLOW.QUERY", 0x0230, payload)
