@@ -180,6 +180,23 @@ defmodule FerricstoreServer.CommandGatewayTest do
              ])
   end
 
+  test "accepts the structured native FLOW.QUERY contract used by HTTP transports" do
+    payload = %{
+      "version" => "FQL1",
+      "query" =>
+        "FROM runs WHERE partition_key = @partition_key AND type = @type ORDER BY updated_at_ms ASC LIMIT 10 RETURN RECORDS",
+      "params" => %{"partition_key" => allowed_key("query-partition"), "type" => "workflow"}
+    }
+
+    assert {:ok, native_command} =
+             CommandGateway.native_command("FLOW.QUERY", 0x0231, payload)
+
+    assert %CommandGateway.NativeCommand{} = native_command
+
+    assert {:error, :invalid_native_command} =
+             CommandGateway.native_command("FLOW.QUERY", 0x0230, payload)
+  end
+
   test "returns command and key ACL failures in their original batch positions" do
     put_http_user("reader", "secret", ["+GET"])
     assert {:ok, session} = AuthenticationGateway.authenticate("reader", "secret", peer: peer())
