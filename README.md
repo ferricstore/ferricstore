@@ -32,7 +32,7 @@ Run one development node:
 docker run -p 6388:6388 -p 6380:6380 -p 6381:6381 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
-  quay.io/ferricstore/ferricstore:0.11.8
+  quay.io/ferricstore/ferricstore:0.11.9
 ```
 
 Published SDKs connect to `ferric://127.0.0.1:6388`. The operations dashboard
@@ -51,7 +51,7 @@ The FQL1 query planner, schedules, governance primitives, and operations
 dashboard are included in this OSS repository and release image; they are not
 enterprise-only add-ons.
 
-| Area | Included in FerricStore OSS `0.11.8` |
+| Area | Included in FerricStore OSS `0.11.9` |
 | --- | --- |
 | Durable KV and data structures | Strings, hashes with field TTL, lists, sets, sorted sets, streams and consumer groups, Pub/Sub, transactions, blocking reads, bitmaps, HyperLogLog, GEO, Bloom and Cuckoo filters, Count-Min Sketch, TopK, and TDigest. |
 | FerricStore-native helpers | Compare-and-swap, fenced distributed locks, fixed-window rate limiting, cache-aside/stampede protection, key diagnostics, quotas, and cluster inspection. |
@@ -87,9 +87,8 @@ enterprise-only add-ons.
 
 ## Interfaces And Published SDKs
 
-The published SDKs use the same Ferric native protocol. The `0.11.7` SDK
-release lines are compatibility-tested against the OSS server at version
-`0.11.8`:
+The published SDKs use the same Ferric native protocol. Their current release
+lines are compatibility-tested against the OSS server at version `0.11.9`:
 
 | Interface | Package or module | Source |
 | --- | --- | --- |
@@ -100,7 +99,7 @@ release lines are compatibility-tested against the OSS server at version
 | Embedded Elixir server API | [`ferricstore`](https://hex.pm/packages/ferricstore) | This repository |
 | Local operational CLI | `mix ferricstore.*` tasks | This repository |
 
-All four native SDK `0.11.7` release lines retain FerricStore `0.11.4` as their
+All four native SDK release lines retain FerricStore `0.11.4` as their
 minimum server version and negotiate the Stream mode-34 producer fast path when
 the server advertises it. Native wire protocol v1 is unchanged.
 No Java SDK is currently published.
@@ -561,7 +560,7 @@ FerricStore can also run inside an Elixir application.
 
 ```elixir
 # mix.exs
-{:ferricstore, "~> 0.11.8"}
+{:ferricstore, "~> 0.11.9"}
 ```
 
 ```elixir

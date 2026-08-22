@@ -16,7 +16,6 @@ defmodule FerricstoreServer.CommandGateway do
   state are deliberately rejected. Those require a persistent native session.
   """
 
-  alias Ferricstore.Commands.KeyDiscovery
   alias FerricstoreServer.AuthenticationGateway
   alias FerricstoreServer.AuthenticationGateway.Session
   alias FerricstoreServer.Native.{Blocking, Commands, ResourceBudget}
@@ -73,10 +72,12 @@ defmodule FerricstoreServer.CommandGateway do
           | {:unsupported_command, non_neg_integer(), binary()}
 
   @doc """
-  Creates a validated structured native command for stateless execution.
+  Creates a validated native command for stateless execution.
 
-  The command name and opcode must identify the same allowlisted command.
-  Connection-scoped and blocking commands are never accepted.
+  The command name and opcode must identify the same known native command.
+  Connection-scoped and blocking commands are never accepted. Payload schema,
+  key discovery, and ACL validation still run through the canonical native
+  command planner before execution.
   """
   @spec native_command(binary(), non_neg_integer(), map()) ::
           {:ok, NativeCommand.t()} | {:error, :invalid_native_command}
@@ -291,8 +292,7 @@ defmodule FerricstoreServer.CommandGateway do
   end
 
   defp structured_native_command?(command, opcode) do
-    KeyDiscovery.structured_native_command?(command) and
-      Commands.command_name(opcode) == command and not unsupported_command?(command)
+    Commands.command_name(opcode) == command and not unsupported_command?(command)
   end
 
   defp max_commands(opts) do
