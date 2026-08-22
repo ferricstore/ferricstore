@@ -87,7 +87,7 @@ enterprise-only add-ons.
 
 ## Interfaces And Published SDKs
 
-The published SDKs use the same Ferric native protocol. The `0.11.5` SDK
+The published SDKs use the same Ferric native protocol. The `0.11.6` SDK
 release lines are compatibility-tested against the OSS server at version
 `0.11.6`:
 
@@ -100,7 +100,7 @@ release lines are compatibility-tested against the OSS server at version
 | Embedded Elixir server API | [`ferricstore`](https://hex.pm/packages/ferricstore) | This repository |
 | Local operational CLI | `mix ferricstore.*` tasks | This repository |
 
-All four native SDK `0.11.5` release lines retain FerricStore `0.11.4` as their
+All four native SDK `0.11.6` release lines retain FerricStore `0.11.4` as their
 minimum server version and negotiate the Stream mode-34 producer fast path when
 the server advertises it. Native wire protocol v1 is unchanged.
 No Java SDK is currently published.

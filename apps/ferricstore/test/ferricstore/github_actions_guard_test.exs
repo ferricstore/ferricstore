@@ -215,7 +215,7 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     assert workflow =~ "context: ."
     assert workflow =~ "outputs: type=docker,dest=/tmp/ferricstore-sdk-image.tar"
     assert workflow =~ "docker load --input"
-    assert count_occurrences(workflow, "ref: v0.11.5") == 4
+    assert count_occurrences(workflow, "ref: v0.11.6") == 4
 
     for repository <- [
           "ferricstore/ferricstore-go",
