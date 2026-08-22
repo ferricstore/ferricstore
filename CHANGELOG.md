@@ -4,6 +4,19 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.7 - 2026-08-22
+
+- Added transport-neutral authentication and command gateways so trusted
+  in-process protocol adapters can reuse the same ACL, command preparation,
+  resource-budget, deadline, and ordered batch-execution contracts as the
+  native TCP server without a loopback network hop.
+- Revalidated prepared command batches immediately before execution, retained
+  bounded resource accounting across shared gateway calls, and added direct
+  gateway coverage for structured native commands and ACL-sensitive keys.
+- Allowed structured `FLOW.QUERY` requests through the shared gateway while
+  preserving command discovery, authorization, bounded planning, diagnostics,
+  and native execution semantics for HTTP and future transports.
+
 ## 0.11.6 - 2026-08-19
 
 - Added a single-task AWS ECS/Fargate OSS deployment profile with private

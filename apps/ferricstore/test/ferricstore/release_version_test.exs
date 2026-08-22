@@ -2,7 +2,7 @@ defmodule Ferricstore.ReleaseVersionTest do
   use ExUnit.Case, async: true
 
   @repo_root Path.expand("../../../..", __DIR__)
-  @release_version "0.11.6"
+  @release_version "0.11.7"
 
   @project_files [
     "mix.exs",
@@ -46,7 +46,7 @@ defmodule Ferricstore.ReleaseVersionTest do
 
         image_versions =
           Regex.scan(
-            ~r{ghcr\.io/ferricstore/ferricstore:(\d+\.\d+\.\d+)},
+            ~r{quay\.io/ferricstore/ferricstore:(\d+\.\d+\.\d+)},
             source,
             capture: :all_but_first
           )
