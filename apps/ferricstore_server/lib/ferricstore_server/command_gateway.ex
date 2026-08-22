@@ -12,8 +12,11 @@ defmodule FerricstoreServer.CommandGateway do
   promises leader reads must add that routing policy before calling this local
   execution boundary.
 
-  Connection-scoped transactions, subscriptions, blocking commands, and client
-  state are deliberately rejected. Those require a persistent native session.
+  Connection-scoped transactions, subscriptions, and client state are
+  deliberately rejected. Blocking commands may participate in one sequential
+  request batch, but that request cannot be coalesced with another request. The
+  request process owns each blocking worker, so cancellation and absolute
+  deadlines tear down its waiter and budget leases.
   """
 
   alias FerricstoreServer.AuthenticationGateway
@@ -47,7 +50,7 @@ defmodule FerricstoreServer.CommandGateway do
     defstruct @enforce_keys
 
     @type planned_command ::
-            {:command_exec, map()} | {:native, non_neg_integer(), map()}
+            {:command_exec, map()} | {:blocking, map()} | {:native, non_neg_integer(), map()}
 
     @opaque t :: %__MODULE__{
               planned: [planned_command()],
@@ -57,6 +60,7 @@ defmodule FerricstoreServer.CommandGateway do
 
   @command_exec_opcode 0x0100
   @default_max_commands 1_000
+  @deadline_wait_chunk_ms 60_000
   @connection_scoped_commands MapSet.new(~w(AUTH CLIENT HELLO QUIT SELECT))
 
   @type command :: [term()] | NativeCommand.t()
@@ -75,20 +79,24 @@ defmodule FerricstoreServer.CommandGateway do
   Creates a validated native command for stateless execution.
 
   The command name and opcode must identify the same known native command.
-  Connection-scoped and blocking commands are never accepted. Payload schema,
-  key discovery, and ACL validation still run through the canonical native
-  command planner before execution.
+  Connection-scoped commands are never accepted. Payload schema, key
+  discovery, and ACL validation still run through the canonical native command
+  planner before execution.
   """
   @spec native_command(binary(), non_neg_integer(), map()) ::
           {:ok, NativeCommand.t()} | {:error, :invalid_native_command}
   def native_command(command, opcode, payload)
       when is_binary(command) and is_integer(opcode) and opcode >= 0 and is_map(payload) do
-    normalized = String.upcase(command)
+    case normalize_command(command) do
+      {:ok, normalized} ->
+        if structured_native_command?(normalized, opcode) do
+          {:ok, %NativeCommand{name: normalized, opcode: opcode, payload: payload}}
+        else
+          {:error, :invalid_native_command}
+        end
 
-    if structured_native_command?(normalized, opcode) do
-      {:ok, %NativeCommand{name: normalized, opcode: opcode, payload: payload}}
-    else
-      {:error, :invalid_native_command}
+      :error ->
+        {:error, :invalid_native_command}
     end
   end
 
@@ -155,7 +163,8 @@ defmodule FerricstoreServer.CommandGateway do
   def execute_prepared_batches(%Session{} = session, batches, opts)
       when is_list(batches) and is_list(opts) do
     with {:ok, session} <- AuthenticationGateway.validate(session),
-         :ok <- validate_prepared_batches(batches) do
+         :ok <- validate_prepared_batches(batches),
+         :ok <- validate_combined_request_shape(batches) do
       execute_prepared_batches_validated(session, batches, opts)
     end
   end
@@ -200,7 +209,21 @@ defmodule FerricstoreServer.CommandGateway do
 
   defp valid_planned_command?({:command_exec, %{"command" => command, "args" => args} = payload})
        when is_binary(command) and is_list(args) and map_size(payload) == 2 do
-    command |> String.upcase() |> unsupported_command?() |> Kernel.not()
+    case normalize_command(command) do
+      {:ok, normalized} ->
+        not unsupported_command?(normalized) and not Blocking.blocking_command?(normalized)
+
+      :error ->
+        false
+    end
+  end
+
+  defp valid_planned_command?({:blocking, %{"command" => command, "args" => args} = payload})
+       when is_binary(command) and is_list(args) and map_size(payload) == 2 do
+    case normalize_command(command) do
+      {:ok, normalized} -> Blocking.blocking_command?(normalized)
+      :error -> false
+    end
   end
 
   defp valid_planned_command?({:native, opcode, payload})
@@ -225,21 +248,34 @@ defmodule FerricstoreServer.CommandGateway do
         end
 
       {[command | args], index}, {:ok, planned} when is_binary(command) and is_list(args) ->
-        normalized = String.upcase(command)
+        case normalize_command(command) do
+          {:ok, normalized} ->
+            cond do
+              unsupported_command?(normalized) ->
+                {:halt, {:error, {:unsupported_command, index, normalized}}}
 
-        if unsupported_command?(normalized) do
-          {:halt, {:error, {:unsupported_command, index, normalized}}}
-        else
-          payload = %{"command" => command, "args" => args}
-          {:cont, {:ok, [{:command_exec, payload} | planned]}}
+              Blocking.blocking_command?(normalized) ->
+                payload = %{"command" => command, "args" => args}
+                {:cont, {:ok, [{:blocking, payload} | planned]}}
+
+              true ->
+                payload = %{"command" => command, "args" => args}
+                {:cont, {:ok, [{:command_exec, payload} | planned]}}
+            end
+
+          :error ->
+            {:halt, {:error, {:malformed_command, index}}}
         end
 
       {_malformed, index}, {:ok, _planned} ->
         {:halt, {:error, {:malformed_command, index}}}
     end)
     |> case do
-      {:ok, planned} -> {:ok, Enum.reverse(planned)}
-      {:error, _reason} = error -> error
+      {:ok, planned} ->
+        {:ok, Enum.reverse(planned)}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -249,6 +285,9 @@ defmodule FerricstoreServer.CommandGateway do
         payload = add_deadline(payload, deadline_ms)
         {status, value, _state} = Commands.execute(@command_exec_opcode, payload, state)
         %{status: status, value: value}
+
+      {:blocking, payload} ->
+        execute_blocking(payload, state, deadline_ms)
 
       {:native, opcode, payload} ->
         payload = add_deadline(payload, deadline_ms)
@@ -288,8 +327,111 @@ defmodule FerricstoreServer.CommandGateway do
 
   defp unsupported_command?(command) do
     MapSet.member?(@connection_scoped_commands, command) or
-      NativeSession.session_command?(command) or Blocking.blocking_command?(command)
+      NativeSession.session_command?(command)
   end
+
+  defp normalize_command(command) do
+    if String.valid?(command), do: {:ok, String.upcase(command)}, else: :error
+  end
+
+  defp validate_combined_request_shape([_, _ | _] = batches) do
+    if Enum.any?(batches, &blocking_batch?/1) do
+      {:error, {:invalid_batch, "a blocking request cannot be combined with other requests"}}
+    else
+      :ok
+    end
+  end
+
+  defp validate_combined_request_shape(_zero_or_one_batch), do: :ok
+
+  defp blocking_batch?(%PreparedBatch{planned: planned}) do
+    Enum.any?(planned, fn
+      {:blocking, _payload} -> true
+      _non_blocking -> false
+    end)
+  end
+
+  defp blocking_batch?(_batch), do: false
+
+  defp execute_blocking(payload, state, deadline_ms) do
+    if deadline_expired?(deadline_ms) do
+      deadline_exceeded_result()
+    else
+      meta = %{gateway_request: make_ref()}
+
+      case Blocking.start_request(payload, state, meta) do
+        {:ok, pid, monitor_ref} ->
+          await_blocking_result(pid, monitor_ref, meta, deadline_ms)
+
+        {:error, status, value} ->
+          %{status: status, value: value}
+      end
+    end
+  end
+
+  defp await_blocking_result(pid, monitor_ref, meta, 0) do
+    receive do
+      {:native_blocking_response, ^meta, ^pid, status, value} ->
+        Process.demonitor(monitor_ref, [:flush])
+        %{status: status, value: value}
+
+      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+        blocking_worker_exit_result(reason)
+    end
+  end
+
+  defp await_blocking_result(pid, monitor_ref, meta, deadline_ms) do
+    timeout_ms =
+      deadline_ms
+      |> Kernel.-(System.system_time(:millisecond))
+      |> max(0)
+      |> min(@deadline_wait_chunk_ms)
+
+    receive do
+      {:native_blocking_response, ^meta, ^pid, status, value} ->
+        Process.demonitor(monitor_ref, [:flush])
+        %{status: status, value: value}
+
+      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+        blocking_worker_exit_result(reason)
+    after
+      timeout_ms ->
+        if deadline_expired?(deadline_ms) do
+          stop_blocking_worker(pid, monitor_ref, meta)
+          deadline_exceeded_result()
+        else
+          await_blocking_result(pid, monitor_ref, meta, deadline_ms)
+        end
+    end
+  end
+
+  defp stop_blocking_worker(pid, monitor_ref, meta) do
+    Process.exit(pid, :kill)
+
+    receive do
+      {:DOWN, ^monitor_ref, :process, ^pid, _reason} -> :ok
+    after
+      1_000 -> Process.demonitor(monitor_ref, [:flush])
+    end
+
+    receive do
+      {:native_blocking_response, ^meta, ^pid, _status, _value} -> :ok
+    after
+      0 -> :ok
+    end
+  end
+
+  defp deadline_expired?(0), do: false
+  defp deadline_expired?(deadline_ms), do: deadline_ms <= System.system_time(:millisecond)
+
+  defp deadline_exceeded_result,
+    do: %{status: :error, value: %{"code" => "deadline_exceeded"}}
+
+  defp blocking_worker_exit_result(:normal),
+    do: %{status: :error, value: "ERR blocking worker exited without a response"}
+
+  defp blocking_worker_exit_result(_reason),
+    do: %{status: :error, value: "ERR internal server error"}
 
   defp structured_native_command?(command, opcode) do
     Commands.command_name(opcode) == command and not unsupported_command?(command)

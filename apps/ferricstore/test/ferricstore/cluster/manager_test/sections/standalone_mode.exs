@@ -339,6 +339,104 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
           refute MapSet.member?(new_state.known_nodes, target)
         end
 
+        test "WARaft participant and member configuration deadlines are reconciled before rollback" do
+          target = :waraft_member_config_timeout_target@localhost
+          parent = self()
+          attempts = :counters.new(1, [:atomics])
+          cleanups = :counters.new(1, [:atomics])
+
+          Process.put(:ferricstore_cluster_manager_target_has_data_hook, fn ^target, 1 ->
+            {:ok, false}
+          end)
+
+          Process.put(:ferricstore_cluster_manager_target_membership_hook, fn ^target, _state ->
+            {:ok, %{0 => false}}
+          end)
+
+          Process.put(:ferricstore_cluster_manager_stop_raft_on_target_hook, fn ^target, 1 ->
+            :ok
+          end)
+
+          Process.put(:ferricstore_cluster_manager_start_raft_on_target_hook, fn ^target,
+                                                                                 1,
+                                                                                 :snapshot_join ->
+            :ok
+          end)
+
+          Process.put(:ferricstore_cluster_manager_add_member_hook, fn 0,
+                                                                       ^target,
+                                                                       :voter,
+                                                                       _timeout_ms ->
+            :ok = :counters.add(attempts, 1, 1)
+            attempt = :counters.get(attempts, 1)
+            send(parent, {:add_member_attempt, attempt})
+
+            case attempt do
+              1 -> {:error, :participant_config_timeout}
+              2 -> {:error, :member_config_timeout}
+              _completed -> :ok
+            end
+          end)
+
+          Process.put(:ferricstore_cluster_manager_waraft_barrier_indices_hook, fn 1 ->
+            {:ok, %{0 => 42}}
+          end)
+
+          Process.put(:ferricstore_cluster_manager_write_target_marker_hook, fn ^target,
+                                                                                _ctx,
+                                                                                %{0 => 42} ->
+            :ok
+          end)
+
+          Process.put(:ferricstore_cluster_manager_remove_added_member_hook, fn ^target, 0 ->
+            send(parent, :rolled_back_member)
+            :ok
+          end)
+
+          Process.put(:ferricstore_cluster_manager_cleanup_target_data_hook, fn ^target, 1 ->
+            :ok = :counters.add(cleanups, 1, 1)
+            :ok
+          end)
+
+          on_exit(fn ->
+            Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
+            Process.delete(:ferricstore_cluster_manager_target_membership_hook)
+            Process.delete(:ferricstore_cluster_manager_stop_raft_on_target_hook)
+            Process.delete(:ferricstore_cluster_manager_start_raft_on_target_hook)
+            Process.delete(:ferricstore_cluster_manager_add_member_hook)
+            Process.delete(:ferricstore_cluster_manager_waraft_barrier_indices_hook)
+            Process.delete(:ferricstore_cluster_manager_write_target_marker_hook)
+            Process.delete(:ferricstore_cluster_manager_remove_added_member_hook)
+            Process.delete(:ferricstore_cluster_manager_cleanup_target_data_hook)
+          end)
+
+          state = %{
+            mode: :cluster,
+            role: :voter,
+            cluster_nodes: [],
+            remove_delay_ms: 60_000,
+            known_nodes: MapSet.new(),
+            remove_timers: %{},
+            sync_status: :synced,
+            shard_sync_status: %{},
+            shard_count: 1
+          }
+
+          assert {:reply, :ok, new_state} =
+                   Manager.handle_call(
+                     {:add_node, target, :voter, []},
+                     {self(), make_ref()},
+                     state
+                   )
+
+          assert_receive {:add_member_attempt, 1}
+          assert_receive {:add_member_attempt, 2}
+          assert_receive {:add_member_attempt, 3}
+          refute_received :rolled_back_member
+          assert :counters.get(cleanups, 1) == 1
+          assert MapSet.member?(new_state.known_nodes, target)
+        end
+
         test "target data probe treats blob side-channel files as existing shard data" do
           root =
             Path.join(

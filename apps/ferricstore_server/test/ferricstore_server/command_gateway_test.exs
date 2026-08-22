@@ -5,11 +5,13 @@ defmodule FerricstoreServer.CommandGatewayTest do
 
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
+  alias Ferricstore.Waiters
   alias FerricstoreServer.Acl.CatalogProjector
   alias FerricstoreServer.AuthenticationGateway
   alias FerricstoreServer.AuthenticationGateway.Session
   alias FerricstoreServer.CommandGateway
   alias FerricstoreServer.CommandGateway.PreparedBatch
+  alias FerricstoreServer.Native.ResourceBudget
 
   setup do
     {:ok, _apps} = Application.ensure_all_started(:ferricstore_server)
@@ -392,14 +394,340 @@ defmodule FerricstoreServer.CommandGatewayTest do
     assert Router.get(FerricStore.Instance.get(:default), key) == nil
   end
 
-  test "rejects every stateful command family at the transport-neutral boundary" do
+  test "contains invalid UTF-8 command names as typed validation errors" do
+    invalid_command = <<0xFF, 0xFE>>
+
+    assert {:error, :invalid_native_command} =
+             CommandGateway.native_command(invalid_command, 0x0101, %{})
+
+    assert {:error, {:malformed_command, 0}} =
+             CommandGateway.prepare_batch([[invalid_command]])
+
+    put_http_user("invalid-command", "secret")
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("invalid-command", "secret", peer: peer())
+
+    forged = %PreparedBatch{
+      planned: [{:command_exec, %{"command" => invalid_command, "args" => []}}],
+      deadline_ms: 0
+    }
+
+    assert {:error, {:invalid_batch, "prepared batches are invalid"}} =
+             CommandGateway.execute_prepared_batches(session, [forged])
+  end
+
+  test "rejects every connection-scoped command family at the transport-neutral boundary" do
     put_http_user("worker", "secret")
     assert {:ok, session} = AuthenticationGateway.authenticate("worker", "secret", peer: peer())
 
-    for command <- ["AUTH", "MULTI", "BLPOP"] do
+    for command <- ["AUTH", "MULTI", "SUBSCRIBE"] do
       assert {:error, {:unsupported_command, 0, ^command}} =
                CommandGateway.execute_batch(session, [[command]])
     end
+  end
+
+  test "executes one blocking list command and wakes it through the canonical waiter path" do
+    put_http_user("blocking-list", "secret", ["+BLPOP", "+RPUSH"])
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("blocking-list", "secret", peer: peer())
+
+    key = allowed_key("blocking-list")
+    deadline_ms = System.system_time(:millisecond) + 2_000
+    usage_before = ResourceBudget.usage()
+
+    blocked =
+      Task.async(fn ->
+        CommandGateway.execute_batch(session, [["BLPOP", key, "0"]], deadline_ms: deadline_ms)
+      end)
+
+    assert :ok =
+             ShardHelpers.eventually(
+               fn ->
+                 usage = ResourceBudget.usage()
+
+                 Waiters.count(key) == 1 and
+                   usage.executions == usage_before.executions + 1 and
+                   usage.blocking_requests == usage_before.blocking_requests + 1
+               end,
+               "gateway BLPOP did not register a waiter"
+             )
+
+    assert {:ok, [%{status: :ok, value: 1}]} =
+             CommandGateway.execute_batch(session, [["RPUSH", key, "value"]])
+
+    assert {:ok, [%{status: :ok, value: [^key, "value"]}]} = Task.await(blocked, 3_000)
+    assert Waiters.count(key) == 0
+
+    assert :ok =
+             ShardHelpers.eventually(
+               fn ->
+                 usage = ResourceBudget.usage()
+
+                 usage.executions == usage_before.executions and
+                   usage.blocking_requests == usage_before.blocking_requests
+               end,
+               "completed gateway BLPOP leaked resource leases"
+             )
+  end
+
+  test "executes the remaining blocking list commands through their waiter paths" do
+    put_http_user("blocking-list-variants", "secret", [
+      "+BRPOP",
+      "+BLMOVE",
+      "+BLMPOP",
+      "+LPUSH",
+      "+RPUSH"
+    ])
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("blocking-list-variants", "secret", peer: peer())
+
+    brpop_key = allowed_key("brpop")
+
+    assert_blocking_list_wake(
+      session,
+      ["BRPOP", brpop_key, "0"],
+      brpop_key,
+      ["LPUSH", brpop_key, "brpop-value"],
+      [brpop_key, "brpop-value"]
+    )
+
+    blmove_tag = "gateway-blmove-#{System.unique_integer([:positive, :monotonic])}"
+    blmove_source = "tenant:a:gateway:{#{blmove_tag}}:source"
+    blmove_destination = "tenant:a:gateway:{#{blmove_tag}}:destination"
+
+    assert_blocking_list_wake(
+      session,
+      ["BLMOVE", blmove_source, blmove_destination, "RIGHT", "LEFT", "0"],
+      blmove_source,
+      ["RPUSH", blmove_source, "blmove-value"],
+      "blmove-value"
+    )
+
+    blmpop_key = allowed_key("blmpop")
+
+    assert_blocking_list_wake(
+      session,
+      ["BLMPOP", "0", "1", blmpop_key, "LEFT", "COUNT", "2"],
+      blmpop_key,
+      ["RPUSH", blmpop_key, "one", "two"],
+      [blmpop_key, ["one", "two"]]
+    )
+  end
+
+  test "request deadline cancels an infinite blocking command and releases its waiter" do
+    put_http_user("blocking-deadline", "secret", ["+BLPOP"])
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("blocking-deadline", "secret", peer: peer())
+
+    key = allowed_key("blocking-deadline")
+    started_ms = System.monotonic_time(:millisecond)
+    usage_before = ResourceBudget.usage()
+
+    assert {:ok, [%{status: :error, value: %{"code" => "deadline_exceeded"}}]} =
+             CommandGateway.execute_batch(session, [["BLPOP", key, "0"]],
+               deadline_ms: System.system_time(:millisecond) + 100
+             )
+
+    assert System.monotonic_time(:millisecond) - started_ms < 1_000
+
+    assert :ok =
+             ShardHelpers.eventually(
+               fn ->
+                 usage = ResourceBudget.usage()
+
+                 Waiters.count(key) == 0 and usage.executions == usage_before.executions and
+                   usage.blocking_requests == usage_before.blocking_requests
+               end,
+               "deadline-cancelled gateway BLPOP leaked its waiter"
+             )
+  end
+
+  test "redacts blocking worker exit reasons from transport results" do
+    put_http_user("blocking-worker-exit", "secret", ["+BLPOP"])
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("blocking-worker-exit", "secret", peer: peer())
+
+    key = allowed_key("blocking-worker-exit")
+    invalid_store = %{stats_counter: :transport_secret_must_not_escape}
+
+    assert {:ok, [%{status: :error, value: "ERR internal server error"}]} =
+             CommandGateway.execute_batch(session, [["BLPOP", key, "0"]],
+               store: invalid_store,
+               deadline_ms: System.system_time(:millisecond) + 1_000
+             )
+  end
+
+  test "caller cancellation terminates the blocking worker and releases its waiter" do
+    put_http_user("blocking-cancel", "secret", ["+BLPOP"])
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("blocking-cancel", "secret", peer: peer())
+
+    key = allowed_key("blocking-cancel")
+    usage_before = ResourceBudget.usage()
+
+    caller =
+      spawn(fn ->
+        CommandGateway.execute_batch(session, [["BLPOP", key, "0"]])
+      end)
+
+    assert :ok =
+             ShardHelpers.eventually(
+               fn -> Waiters.count(key) == 1 end,
+               "gateway BLPOP did not register before caller cancellation"
+             )
+
+    caller_ref = Process.monitor(caller)
+    Process.exit(caller, :kill)
+    assert_receive {:DOWN, ^caller_ref, :process, ^caller, :killed}, 1_000
+
+    assert :ok =
+             ShardHelpers.eventually(
+               fn ->
+                 usage = ResourceBudget.usage()
+
+                 Waiters.count(key) == 0 and usage.executions == usage_before.executions and
+                   usage.blocking_requests == usage_before.blocking_requests
+               end,
+               "cancelled gateway caller leaked its blocking waiter"
+             )
+  end
+
+  test "executes a blocking stream read and wakes it after XADD" do
+    put_http_user("blocking-stream", "secret", ["+XREAD", "+XADD"])
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("blocking-stream", "secret", peer: peer())
+
+    key = allowed_key("blocking-stream")
+    store = FerricStore.Instance.get(:default)
+    assert {:ok, old_id} = FerricStore.xadd(key, ["field", "old"])
+
+    blocked =
+      Task.async(fn ->
+        CommandGateway.execute_batch(
+          session,
+          [["XREAD", "BLOCK", "0", "STREAMS", key, old_id]],
+          deadline_ms: System.system_time(:millisecond) + 2_000
+        )
+      end)
+
+    assert :ok =
+             ShardHelpers.eventually(
+               fn -> Ferricstore.Commands.Stream.stream_waiter_count(key, store) == 1 end,
+               "gateway XREAD did not register a stream waiter"
+             )
+
+    assert {:ok, [%{status: :ok, value: entry_id}]} =
+             CommandGateway.execute_batch(session, [["XADD", key, "*", "field", "value"]])
+
+    assert is_binary(entry_id)
+
+    assert {:ok, [%{status: :ok, value: [[^key, [[^entry_id, "field", "value"]]]]}]} =
+             Task.await(blocked, 3_000)
+
+    assert Ferricstore.Commands.Stream.stream_waiter_count(key, store) == 0
+  end
+
+  test "executes XREADGROUP BLOCK and wakes it after XADD" do
+    put_http_user("blocking-stream-group", "secret", ["+XREADGROUP", "+XGROUP", "+XADD"])
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("blocking-stream-group", "secret", peer: peer())
+
+    key = allowed_key("blocking-stream-group")
+    group = "gateway-group"
+    consumer = "gateway-consumer"
+    store = FerricStore.Instance.get(:default)
+
+    assert {:ok, [%{status: :ok, value: "OK"}]} =
+             CommandGateway.execute_batch(session, [
+               ["XGROUP", "CREATE", key, group, "$", "MKSTREAM"]
+             ])
+
+    blocked =
+      Task.async(fn ->
+        CommandGateway.execute_batch(
+          session,
+          [
+            [
+              "XREADGROUP",
+              "GROUP",
+              group,
+              consumer,
+              "BLOCK",
+              "0",
+              "STREAMS",
+              key,
+              ">"
+            ]
+          ],
+          deadline_ms: System.system_time(:millisecond) + 2_000
+        )
+      end)
+
+    assert :ok =
+             ShardHelpers.eventually(
+               fn -> Ferricstore.Commands.Stream.stream_waiter_count(key, store) == 1 end,
+               "gateway XREADGROUP did not register a stream waiter"
+             )
+
+    assert {:ok, [%{status: :ok, value: entry_id}]} =
+             CommandGateway.execute_batch(session, [["XADD", key, "*", "field", "value"]])
+
+    assert {:ok, [%{status: :ok, value: [[^key, [[^entry_id, "field", "value"]]]]}]} =
+             Task.await(blocked, 3_000)
+
+    assert Ferricstore.Commands.Stream.stream_waiter_count(key, store) == 0
+  end
+
+  test "blocking commands preserve one request pipeline but cannot cross-request coalesce" do
+    for command <- ["BLPOP", "BRPOP", "BLMOVE", "BLMPOP", "XREAD", "XREADGROUP"] do
+      assert {:ok, %PreparedBatch{}} = CommandGateway.prepare_batch([[command]])
+    end
+
+    first_key = allowed_key("mixed-first")
+    second_key = allowed_key("mixed-second")
+    assert {:ok, 1} = FerricStore.rpush(first_key, ["first"])
+    assert {:ok, 1} = FerricStore.rpush(second_key, ["second"])
+
+    put_http_user("blocking-batch", "secret", ["+BLPOP", "+BRPOP", "+PING"])
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("blocking-batch", "secret", peer: peer())
+
+    pipeline = [
+      ["PING"],
+      ["BLPOP", first_key, "0"],
+      ["BRPOP", second_key, "0"],
+      ["PING"]
+    ]
+
+    assert {:ok,
+            [
+              %{status: :ok, value: "PONG"},
+              %{status: :ok, value: [^first_key, "first"]},
+              %{status: :ok, value: [^second_key, "second"]},
+              %{status: :ok, value: "PONG"}
+            ]} = CommandGateway.execute_batch(session, pipeline)
+
+    assert {:ok, blocking_pipeline} =
+             CommandGateway.prepare_batch([
+               ["PING"],
+               ["BLPOP", allowed_key("cross-request"), "1"]
+             ])
+
+    assert {:ok, ping} = CommandGateway.prepare_batch([["PING"]])
+
+    assert {:error, {:invalid_batch, combined_reason}} =
+             CommandGateway.execute_prepared_batches(session, [blocking_pipeline, ping])
+
+    assert combined_reason =~ "blocking request"
   end
 
   test "bounds batches and propagates absolute deadlines" do
@@ -421,6 +749,26 @@ defmodule FerricstoreServer.CommandGatewayTest do
                username,
                ["on", ">#{password}", "-@all" | commands] ++ ["~tenant:a:*"]
              )
+  end
+
+  defp assert_blocking_list_wake(session, blocking_command, wait_key, producer, expected) do
+    blocked =
+      Task.async(fn ->
+        CommandGateway.execute_batch(session, [blocking_command],
+          deadline_ms: System.system_time(:millisecond) + 2_000
+        )
+      end)
+
+    assert :ok =
+             ShardHelpers.eventually(
+               fn -> Waiters.count(wait_key) == 1 end,
+               "gateway #{hd(blocking_command)} did not register a waiter"
+             )
+
+    assert {:ok, [%{status: :ok}]} = CommandGateway.execute_batch(session, [producer])
+
+    assert {:ok, [%{status: :ok, value: ^expected}]} = Task.await(blocked, 3_000)
+    assert Waiters.count(wait_key) == 0
   end
 
   defp peer, do: {{127, 0, 0, 1}, 12_345}
