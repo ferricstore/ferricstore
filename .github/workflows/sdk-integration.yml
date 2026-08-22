@@ -62,7 +62,7 @@ jobs:
           - sdk: Elixir
             id: elixir
             repository: ferricstore/ferricstore-elixir
-            ref: v0.11.11
+            ref: v0.11.12
     steps:
       - name: Checkout official SDK
         uses: actions/checkout@v6
