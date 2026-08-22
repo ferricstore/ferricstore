@@ -218,7 +218,7 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     assert workflow =~ "repository: ferricstore/ferricstore-go\n            ref: v0.11.9"
     assert workflow =~ "repository: ferricstore/ferricstore-python\n            ref: v0.11.7"
     assert workflow =~ "repository: ferricstore/ferricstore-typescript\n            ref: v0.11.9"
-    assert workflow =~ "repository: ferricstore/ferricstore-elixir\n            ref: v0.11.9"
+    assert workflow =~ "repository: ferricstore/ferricstore-elixir\n            ref: v0.11.10"
     refute workflow =~ "ref: v0.11.6"
 
     for repository <- [
