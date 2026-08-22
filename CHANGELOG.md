@@ -4,6 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.8 - 2026-08-22
+
+- Preserved durable terminal QueryRows when late query-only projection work
+  observes a hot source that was intentionally pruned after projection. The
+  atomic terminal reverse marker now distinguishes retained terminal state
+  from a real deletion, while normal source-deletion cleanup remains intact.
+- Made fixed-index FQL terminal reads synchronize pending cold projection work
+  before answering, eliminating read-after-write omissions across completed,
+  failed, and cancelled records, including equal-timestamp transitions.
+
 ## 0.11.7 - 2026-08-22
 
 - Added transport-neutral authentication and command gateways so trusted

@@ -502,6 +502,41 @@ defmodule Ferricstore.Flow.Query.EngineTest do
     end
   end
 
+  test "terminal query returns every state when records share an update timestamp" do
+    ctx = IsolatedInstance.checkout(shard_count: 1)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "query-terminals-tie-#{suffix}"
+    type = "invoice-terminals-tie-#{suffix}"
+    now_ms = System.system_time(:millisecond)
+
+    try do
+      for state <- ~w(completed failed cancelled) do
+        assert :ok =
+                 Ferricstore.Flow.create(ctx, "#{state}-#{suffix}",
+                   type: type,
+                   state: state,
+                   partition_key: partition,
+                   now_ms: now_ms
+                 )
+      end
+
+      assert {:ok, built} =
+               Builder.build(:terminals, %{
+                 partition_key: partition,
+                 type: type,
+                 limit: 20
+               })
+
+      assert {:ok, request} = Query.prepare_reference("FQL1", built.query, built.params)
+      assert {:ok, %{records: records}} = Query.execute(ctx, request)
+
+      assert records |> Enum.map(& &1.state) |> Enum.sort() ==
+               ~w(cancelled completed failed)
+    after
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
   test "default metadata queries do not invent a queued-state filter" do
     ctx = IsolatedInstance.checkout(shard_count: 1)
     suffix = System.unique_integer([:positive, :monotonic])
