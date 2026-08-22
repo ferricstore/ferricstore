@@ -33,6 +33,13 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
 
   use Ferricstore.Flow.HistoryProjectorTest.Sections.AsyncEnqueueRejectsAboveConfiguredPendingCapSoApplyFallBackSy
 
+  defp stop_if_alive(pid) do
+    GenServer.stop(pid)
+  catch
+    :exit, :noproc -> :ok
+    :exit, {:noproc, _call} -> :ok
+  end
+
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 end

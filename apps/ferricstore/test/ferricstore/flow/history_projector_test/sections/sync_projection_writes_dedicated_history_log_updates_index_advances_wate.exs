@@ -119,7 +119,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.SyncProjectionWritesDed
           )
 
         on_exit(fn ->
-          if Process.alive?(pid), do: GenServer.stop(pid)
+          stop_if_alive(pid)
           File.rm_rf(dir)
         end)
 
