@@ -247,8 +247,8 @@ documented in `guides/flow-elixir-sdk.md`.
 | `SELECT` | Returns error -- FerricStore is single-database |
 | `INFO` | Returns FerricStore-specific sections (`raft`, `bitcask`, `ferricstore`, `keydir_analysis`, `namespace_config`) |
 | `WAIT` | Always returns `0` immediately (no replica acknowledgement) |
-| `BLPOP`/`BRPOP`/`BLMOVE`/`BLMPOP` | Supported in TCP mode only, not in embedded mode |
-| `XREAD BLOCK` | Supported in TCP mode via stream waiters; not available in embedded mode |
+| `BLPOP`/`BRPOP`/`BLMOVE`/`BLMPOP` | Supported by native TCP and as one isolated transport-gateway request; not available in embedded mode |
+| `XREAD BLOCK`/`XREADGROUP BLOCK` | Supported by native TCP and as one isolated transport-gateway request via stream waiters; not available in embedded mode |
 
 ### FerricStore-Only Commands
 
@@ -1477,7 +1477,7 @@ Transactions work at the connection level. WATCH implements optimistic locking -
 1. **Single database** -- `SELECT` returns an error. FerricStore is single-database.
 2. **Native TCP mode** -- clients start with `HELLO`/`STARTUP` on the native control lane.
 3. **No Lua scripting** -- `EVAL`/`EVALSHA` are not implemented. Use CAS, LOCK, and FETCH_OR_COMPUTE for atomic operations.
-4. **No blocking commands in embedded mode** -- `BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`, `XREAD BLOCK` require a TCP connection.
+4. **No blocking commands in embedded mode** -- `BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`, `XREAD BLOCK`, and `XREADGROUP BLOCK` require native TCP or one isolated transport-gateway request. A gateway request owns its waiter until completion, caller cancellation, or its absolute deadline.
 5. **Probabilistic structures are built-in** -- available without an external module. BF, CF, CMS, TopK, TDigest are all native.
 6. **CAS is a native command** -- available as a direct compare-and-swap command. WATCH/MULTI/EXEC is also supported.
 8. **FETCH_OR_COMPUTE** -- built-in cache stampede protection.

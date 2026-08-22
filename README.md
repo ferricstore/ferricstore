@@ -32,7 +32,7 @@ Run one development node:
 docker run -p 6388:6388 -p 6380:6380 -p 6381:6381 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
-  quay.io/ferricstore/ferricstore:0.11.9
+  quay.io/ferricstore/ferricstore:0.11.10
 ```
 
 Published SDKs connect to `ferric://127.0.0.1:6388`. The operations dashboard
@@ -51,7 +51,7 @@ The FQL1 query planner, schedules, governance primitives, and operations
 dashboard are included in this OSS repository and release image; they are not
 enterprise-only add-ons.
 
-| Area | Included in FerricStore OSS `0.11.9` |
+| Area | Included in FerricStore OSS `0.11.10` |
 | --- | --- |
 | Durable KV and data structures | Strings, hashes with field TTL, lists, sets, sorted sets, streams and consumer groups, Pub/Sub, transactions, blocking reads, bitmaps, HyperLogLog, GEO, Bloom and Cuckoo filters, Count-Min Sketch, TopK, and TDigest. |
 | FerricStore-native helpers | Compare-and-swap, fenced distributed locks, fixed-window rate limiting, cache-aside/stampede protection, key diagnostics, quotas, and cluster inspection. |
@@ -88,7 +88,7 @@ enterprise-only add-ons.
 ## Interfaces And Published SDKs
 
 The published SDKs use the same Ferric native protocol. Their current release
-lines are compatibility-tested against the OSS server at version `0.11.9`:
+lines are compatibility-tested against the OSS server at version `0.11.10`:
 
 | Interface | Package or module | Source |
 | --- | --- | --- |
@@ -560,7 +560,7 @@ FerricStore can also run inside an Elixir application.
 
 ```elixir
 # mix.exs
-{:ferricstore, "~> 0.11.9"}
+{:ferricstore, "~> 0.11.10"}
 ```
 
 ```elixir

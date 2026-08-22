@@ -4,6 +4,26 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.10 - 2026-08-23
+
+- Added caller-owned, deadline-bounded blocking list and Stream execution to
+  the transport-neutral command gateway. Ordered pipelines may contain
+  blocking commands, while independent requests are never coalesced across a
+  blocking wait; cancellation releases waiters and resource-budget leases.
+- Reconciled transient WARaft participant/member configuration timeouts during
+  node joins instead of rolling back already-converged shards, preventing
+  partial three-node membership after a slow cluster start.
+- Contained malformed and invalid UTF-8 gateway command names as typed request
+  errors before command planning or execution.
+
+## 0.11.9 - 2026-08-22
+
+- Added structured native descriptors to the transport-neutral command gateway
+  so in-process HTTP transports can execute the complete stateless Flow command
+  surface through canonical parsing, ACL, routing, deadline, and resource paths.
+- Validated the HTTP-enabled Go, Python, Elixir, and TypeScript SDK release
+  lines while retaining FerricStore 0.11.4 as the native compatibility floor.
+
 ## 0.11.8 - 2026-08-22
 
 - Preserved durable terminal QueryRows when late query-only projection work
