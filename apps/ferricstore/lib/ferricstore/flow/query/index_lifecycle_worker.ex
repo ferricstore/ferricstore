@@ -438,52 +438,26 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
        when phase in [:source, :index, :counter] do
     definitions = Enum.map(indexes, & &1.definition)
 
-    case state.validation_fun.(
-           state.instance_ctx,
-           shard_index,
-           build_id,
-           definitions,
-           checkpoint,
-           state.backfill_items,
-           state.max_bytes
-         ) do
-      {:ok, %{phase: next_phase} = next}
-      when next_phase in [:source, :index, :counter, :cleanup] ->
-        with :ok <-
-               IndexRegistry.checkpoint_validation(
-                 state.registry,
-                 build_id,
-                 shard_index,
-                 Map.to_list(next)
-               ) do
-          {:ok, :validation_progress}
-        end
+    result =
+      state.validation_fun.(
+        state.instance_ctx,
+        shard_index,
+        build_id,
+        definitions,
+        checkpoint,
+        state.backfill_items,
+        state.max_bytes
+      )
 
-      {:retry, :query_index_validation_concurrent_change} ->
-        {:ok, :validation_retry}
-
-      {:restart, :query_index_validation_concurrent_change} ->
-        with :ok <-
-               IndexRegistry.restart_validation_shard(
-                 state.registry,
-                 build_id,
-                 shard_index
-               ) do
-          {:ok, :validation_restarted}
-        end
-
-      {:mismatch, evidence} when is_map(evidence) ->
-        with :ok <-
-               IndexRegistry.validation_failed(state.registry, build_id, Map.to_list(evidence)) do
-          {:ok, :validation_failed}
-        end
-
-      {:error, _reason} = error ->
-        error
-
-      _invalid ->
-        {:error, :invalid_query_index_validation_result}
-    end
+    handle_validation_result(
+      state,
+      build_id,
+      shard_index,
+      definitions,
+      checkpoint,
+      result,
+      true
+    )
   end
 
   defp run_validation_phase(
@@ -512,6 +486,79 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
 
   defp run_validation_phase(_state, _build_id, _indexes, _shard_index, _checkpoint),
     do: {:error, :invalid_query_index_validation_checkpoint}
+
+  defp handle_validation_result(
+         state,
+         build_id,
+         shard_index,
+         definitions,
+         checkpoint,
+         result,
+         confirm_mismatch?
+       ) do
+    case result do
+      {:ok, %{phase: next_phase} = next}
+      when next_phase in [:source, :index, :counter, :cleanup] ->
+        with :ok <-
+               IndexRegistry.checkpoint_validation(
+                 state.registry,
+                 build_id,
+                 shard_index,
+                 Map.to_list(next)
+               ) do
+          {:ok, :validation_progress}
+        end
+
+      {:retry, :query_index_validation_concurrent_change} ->
+        {:ok, :validation_retry}
+
+      {:restart, :query_index_validation_concurrent_change} ->
+        with :ok <-
+               IndexRegistry.restart_validation_shard(
+                 state.registry,
+                 build_id,
+                 shard_index
+               ) do
+          {:ok, :validation_restarted}
+        end
+
+      {:mismatch, evidence} when is_map(evidence) and confirm_mismatch? ->
+        with :ok <- state.barrier_fun.(state.instance_ctx, shard_index) do
+          confirmation =
+            state.validation_fun.(
+              state.instance_ctx,
+              shard_index,
+              build_id,
+              definitions,
+              checkpoint,
+              state.backfill_items,
+              state.max_bytes
+            )
+
+          handle_validation_result(
+            state,
+            build_id,
+            shard_index,
+            definitions,
+            checkpoint,
+            confirmation,
+            false
+          )
+        end
+
+      {:mismatch, evidence} when is_map(evidence) ->
+        with :ok <-
+               IndexRegistry.validation_failed(state.registry, build_id, Map.to_list(evidence)) do
+          {:ok, :validation_failed}
+        end
+
+      {:error, _reason} = error ->
+        error
+
+      _invalid ->
+        {:error, :invalid_query_index_validation_result}
+    end
+  end
 
   defp empty_validation_checkpoint do
     %{
@@ -547,6 +594,7 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
           end)
       end
     else
+      {:ok, :complete} -> {:ok, :idle}
       {:error, :query_index_not_found} -> {:ok, :idle}
       {:error, _reason} = error -> error
     end

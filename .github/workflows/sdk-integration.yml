@@ -50,19 +50,19 @@ jobs:
           - sdk: Go
             id: go
             repository: ferricstore/ferricstore-go
-            ref: v0.11.9
+            ref: v0.11.10
           - sdk: Python
             id: python
             repository: ferricstore/ferricstore-python
-            ref: v0.11.7
+            ref: v0.11.8
           - sdk: TypeScript
             id: typescript
             repository: ferricstore/ferricstore-typescript
-            ref: v0.11.9
+            ref: v0.11.10
           - sdk: Elixir
             id: elixir
             repository: ferricstore/ferricstore-elixir
-            ref: v0.11.12
+            ref: v0.11.13
     steps:
       - name: Checkout official SDK
         uses: actions/checkout@v6

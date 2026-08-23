@@ -256,11 +256,18 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorkerTest do
     {:ok, _registry_pid} = start_registry(ctx, registry)
     {:ok, %{indexes: [index | _]}} = IndexRegistry.snapshot(ctx, 0)
     complete_build!(registry, index.build_id)
+    parent = self()
+    validation_attempts = :counters.new(1, [:atomics])
 
     {:ok, _worker_pid} =
       start_worker(ctx, registry, worker,
-        barrier_fun: fn _ctx, _shard -> :ok end,
+        barrier_fun: fn _ctx, _shard ->
+          send(parent, :validation_barrier)
+          :ok
+        end,
         validation_fun: fn _ctx, _shard, _build, _definitions, _checkpoint, _items, _bytes ->
+          :counters.add(validation_attempts, 1, 1)
+
           {:mismatch,
            %{
              checked_records: 12,
@@ -272,12 +279,68 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorkerTest do
       )
 
     assert {:ok, :validation_fenced} = IndexLifecycleWorker.run_once(worker)
+    assert_receive :validation_barrier
     assert {:ok, :validation_failed} = IndexLifecycleWorker.run_once(worker)
+    assert_receive :validation_barrier
+    assert :counters.get(validation_attempts, 1) == 2
 
     assert {:ok, %{entries: statuses}} = IndexRegistry.build_status(registry, index.build_id)
     assert Enum.all?(statuses, &(&1.state == :failed))
     assert Enum.all?(statuses, &(&1.validation.mismatches == 1))
     assert {:ok, []} = FerricStore.Flow.QueryIndexProvider.projection_definitions(ctx, 0)
+  end
+
+  test "confirms a validation mismatch after a writer barrier before failing the build" do
+    {ctx, registry, worker, data_dir} = test_context("validation_mismatch_confirmation")
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+    {:ok, _registry_pid} = start_registry(ctx, registry)
+    {:ok, %{indexes: [index | _]}} = IndexRegistry.snapshot(ctx, 0)
+    complete_build!(registry, index.build_id)
+    parent = self()
+    validation_attempts = :counters.new(1, [:atomics])
+
+    validation_fun =
+      fn _ctx, _shard, _build, definitions, checkpoint, _items, _bytes ->
+        :counters.add(validation_attempts, 1, 1)
+        send(parent, {:validation_attempt, checkpoint.phase})
+
+        case :counters.get(validation_attempts, 1) do
+          1 ->
+            {:mismatch,
+             %{
+               checked_records: 1,
+               checked_entries: 0,
+               mismatches: 1,
+               reason: :reverse_index_mismatch
+             }}
+
+          2 ->
+            {:ok, advance_validation(checkpoint, length(definitions))}
+        end
+      end
+
+    {:ok, _worker_pid} =
+      start_worker(ctx, registry, worker,
+        barrier_fun: fn _ctx, _shard ->
+          send(parent, :validation_barrier)
+          :ok
+        end,
+        validation_fun: validation_fun
+      )
+
+    assert {:ok, :validation_fenced} = IndexLifecycleWorker.run_once(worker)
+    assert_receive :validation_barrier
+
+    assert {:ok, :validation_progress} = IndexLifecycleWorker.run_once(worker)
+    assert_receive {:validation_attempt, :source}
+    assert_receive :validation_barrier
+    assert_receive {:validation_attempt, :source}
+
+    assert {:ok, %{entries: statuses, validation_checkpoints: %{0 => checkpoint}}} =
+             IndexRegistry.build_status(registry, index.build_id)
+
+    assert Enum.all?(statuses, &(&1.state == :validating))
+    assert checkpoint.phase == :index
   end
 
   test "restarts validation from a durable fence after concurrent fanout growth" do
@@ -441,6 +504,54 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorkerTest do
     assert_receive :pressure_retirement_barrier
   end
 
+  test "idles after every failed catalog index has completed retirement" do
+    {ctx, registry, worker, data_dir} = test_context("completed_failed_retirement")
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+    catalog_path = Path.join(data_dir, "single-index-catalog.json")
+    write_catalog!(catalog_path, 1, [catalog_index("failed-index", 1)])
+
+    {:ok, registry_pid} =
+      IndexRegistry.start_link(
+        instance_ctx: ctx,
+        name: registry,
+        catalog_path: catalog_path
+      )
+
+    Process.unlink(registry_pid)
+    {:ok, %{indexes: [index]}} = IndexRegistry.snapshot(ctx, 0)
+    complete_build!(registry, index.build_id)
+
+    assert :ok =
+             IndexRegistry.validation_failed(registry, index.build_id,
+               checked_records: 1,
+               checked_entries: 1,
+               mismatches: 1,
+               reason: :missing_index_entry
+             )
+
+    {:ok, _worker_pid} =
+      start_worker(ctx, registry, worker,
+        barrier_fun: fn _ctx, _shard -> :ok end,
+        retirement_fun: fn _ctx, _shard, _definition, checkpoint, _items, _bytes ->
+          case checkpoint.phase do
+            :index -> {:ok, %{checkpoint | phase: :reverse}}
+            :reverse -> {:complete, checkpoint}
+          end
+        end,
+        cleanup_fun: fn _ctx, _shard, _build_id -> :ok end
+      )
+
+    assert {:ok, :retirement_fenced} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :retirement_progress} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :retirement_cleanup_pending} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :retirement_shard_complete} = IndexLifecycleWorker.run_once(worker)
+
+    assert {:ok, %{retirement: %{status: :complete}}} =
+             IndexRegistry.status(registry, index.definition.id, index.definition.version)
+
+    assert {:ok, :idle} = IndexLifecycleWorker.run_once(worker)
+  end
+
   test "waits for admitted queries before fencing retirement" do
     {ctx, registry, worker, data_dir} = test_context("retirement_drain")
     on_exit(fn -> File.rm_rf!(data_dir) end)
@@ -587,6 +698,7 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorkerTest do
     assert {:ok, :retirement_progress} = IndexLifecycleWorker.run_once(worker)
     assert {:ok, :retirement_cleanup_pending} = IndexLifecycleWorker.run_once(worker)
     assert {:ok, :retirement_shard_complete} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :idle} = IndexLifecycleWorker.run_once(worker)
 
     assert {:ok, replacement_lease} = AdmissionController.acquire(admission, ctx, "replacement")
 
