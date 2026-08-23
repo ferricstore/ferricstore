@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.11 - 2026-08-23
+
+- Added the HTTP/HTTPS command and invocation application to the OSS umbrella
+  and release, disabled by default and backed directly by the shared
+  authentication and command gateways.
+- Added TLS 1.2/1.3 listener configuration, bounded protocol controls,
+  invocation target protections, architecture enforcement, real ACL gateway
+  tests, and Python SDK TLS integration coverage.
+
 ## 0.11.10 - 2026-08-23
 
 - Added caller-owned, deadline-bounded blocking list and Stream execution to

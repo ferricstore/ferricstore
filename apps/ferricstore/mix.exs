@@ -1,7 +1,7 @@
 defmodule Ferricstore.MixProject do
   use Mix.Project
 
-  @version "0.11.10"
+  @version "0.11.11"
 
   def project do
     [
@@ -37,6 +37,7 @@ defmodule Ferricstore.MixProject do
         "../../guides/getting-started.md",
         "../../guides/kv-store.md",
         "../../guides/embedded-mode.md",
+        "../../guides/http-api.md",
         "../../guides/flow-elixir-sdk.md",
         "../../guides/commands.md",
         "../../guides/redis-migration.md",
@@ -48,6 +49,9 @@ defmodule Ferricstore.MixProject do
         "../../docs/flow-vs-temporal-usage.md",
         "../../docs/benchmarks.md",
         "../../docs/native-protocol.md",
+        "../../docs/http/api.md",
+        "../../docs/http/architecture.md",
+        "../../docs/http/testing-and-benchmarks.md",
         "../../docs/flow-query.md",
         "../../docs/flow-production-readiness.md",
         "../../docs/aws-fargate-single-task.md",
@@ -57,7 +61,7 @@ defmodule Ferricstore.MixProject do
       ],
       groups_for_extras: [
         Guides: Path.wildcard("../../guides/*.md"),
-        References: Path.wildcard("../../docs/*.md")
+        References: Path.wildcard("../../docs/**/*.md")
       ],
       source_url: "https://github.com/ferricstore/ferricstore",
       homepage_url: "https://github.com/ferricstore/ferricstore"

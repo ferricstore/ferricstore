@@ -6,6 +6,10 @@ defmodule Ferricstore.ArchTest do
     assert module_reference_violations(core_production_files(), :FerricstoreServer) == []
   end
 
+  test "core library source does not reference the HTTP application" do
+    assert module_reference_violations(core_production_files(), :FerricstoreHttp) == []
+  end
+
   test "public API layer does not depend on durability internals" do
     api_modules = modules_matching("FerricStore.API.**")
 

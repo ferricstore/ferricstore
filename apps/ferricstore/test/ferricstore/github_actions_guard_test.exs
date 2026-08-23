@@ -216,8 +216,13 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     assert workflow =~ "outputs: type=docker,dest=/tmp/ferricstore-sdk-image.tar"
     assert workflow =~ "docker load --input"
     assert workflow =~ "repository: ferricstore/ferricstore-go\n            ref: v0.11.10"
-    assert workflow =~ "repository: ferricstore/ferricstore-python\n            ref: v0.11.8"
-    assert workflow =~ "repository: ferricstore/ferricstore-typescript\n            ref: v0.11.10"
+
+    assert workflow =~
+             "repository: ferricstore/ferricstore-python\n            ref: d4012267b18049ef8581cdaab79a7b50b9c8f5cd"
+
+    assert workflow =~
+             "repository: ferricstore/ferricstore-typescript\n            ref: 87d84c4e0631952ca4438f0cfb0e93b267830d6d"
+
     assert workflow =~ "repository: ferricstore/ferricstore-elixir\n            ref: v0.11.13"
     refute workflow =~ "ref: v0.11.6"
 

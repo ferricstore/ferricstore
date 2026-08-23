@@ -32,6 +32,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     Geo,
     Hash,
     HyperLogLog,
+    Invocation,
     List,
     Management,
     Memory,
@@ -69,6 +70,10 @@ defmodule Ferricstore.Commands.Dispatcher do
   @native_raw_commands ~w(CAS LOCK UNLOCK EXTEND RATELIMIT.ADD KEY_INFO FERRICSTORE.KEY_INFO FETCH_OR_COMPUTE FETCH_OR_COMPUTE_RESULT FETCH_OR_COMPUTE_ERROR)
   @management_raw_commands ~w(ACL FERRICSTORE.CAPABILITIES FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FERRICSTORE.TELEMETRY)
   @cluster_raw_commands ~w(CLUSTER.HEALTH CLUSTER.STATS CLUSTER.KEYSLOT CLUSTER.SLOTS CLUSTER.STATUS CLUSTER.JOIN CLUSTER.LEAVE CLUSTER.FAILOVER CLUSTER.PROMOTE CLUSTER.DEMOTE CLUSTER.ROLE FERRICSTORE.HOTNESS)
+  @invocation_raw_commands ~w(
+    INVOCATION.DEFINITION.PUT INVOCATION.DEFINITION.GET INVOCATION.DEFINITION.LIST
+    INVOCATION.CREATE INVOCATION.GET INVOCATION.PARTITION.LIST
+  )
   @raw_fallback_ast_tags ~w(xadd xlen xrange xrevrange xread xtrim xdel xinfo xgroup xreadgroup xack geoadd geopos geodist geohash geosearch geosearchstore cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error)a
   @wrong_arity_list_ast_tags ~w(get incr decr strlen getdel getex ttl pttl persist lpop rpop llen hgetall hkeys hvals hlen hrandfield smembers scard srandmember spop zcard zpopmin zpopmax zrandmember type expiretime pexpiretime)a
 
@@ -569,6 +574,13 @@ defmodule Ferricstore.Commands.Dispatcher do
   def dispatch_ast({:ferricstore_quota, args}, store),
     do: Management.handle("FERRICSTORE.QUOTA", args, store)
 
+  def dispatch_ast({tag, args}, store)
+      when tag in ~w(
+             invocation_definition_put invocation_definition_get invocation_definition_list
+             invocation_create invocation_get invocation_partition_list
+           )a and is_list(args),
+      do: Invocation.handle(ast_command_name(tag), args, store)
+
   def dispatch_ast({:ferricstore_telemetry, args}, store),
     do: Management.handle("FERRICSTORE.TELEMETRY", args, store)
 
@@ -705,6 +717,12 @@ defmodule Ferricstore.Commands.Dispatcher do
   defp ast_command_name(:cluster_demote), do: "CLUSTER.DEMOTE"
   defp ast_command_name(:cluster_role), do: "CLUSTER.ROLE"
   defp ast_command_name(:ferricstore_hotness), do: "FERRICSTORE.HOTNESS"
+  defp ast_command_name(:invocation_definition_put), do: "INVOCATION.DEFINITION.PUT"
+  defp ast_command_name(:invocation_definition_get), do: "INVOCATION.DEFINITION.GET"
+  defp ast_command_name(:invocation_definition_list), do: "INVOCATION.DEFINITION.LIST"
+  defp ast_command_name(:invocation_create), do: "INVOCATION.CREATE"
+  defp ast_command_name(:invocation_get), do: "INVOCATION.GET"
+  defp ast_command_name(:invocation_partition_list), do: "INVOCATION.PARTITION.LIST"
 
   defp ast_command_name(tag) when is_atom(tag) do
     case @ast_command_names do
@@ -731,6 +749,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       cmd in @native_raw_commands -> Native.handle(native_raw_command_name(cmd), args, store)
       cmd in @management_raw_commands -> Management.handle(cmd, args, store)
       cmd in @cluster_raw_commands -> Cluster.handle(cmd, args, store)
+      cmd in @invocation_raw_commands -> Invocation.handle(cmd, args, store)
       cmd in @prob_raw_commands -> dispatch_prob_raw(cmd, args, store)
       cmd == "FERRICSTORE.CONFIG" -> Namespace.handle(cmd, args, store)
       cmd == "MEMORY" -> dispatch_memory_raw(args, store)

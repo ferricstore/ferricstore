@@ -42,6 +42,21 @@ config :ferricstore,
   native_trace_enabled: false,
   native_idle_timeout_ms: 90_000
 
+# The HTTP application ships in the release but does not open a listener until
+# explicitly enabled. Runtime FERRICSTORE_HTTP_* values are parsed and validated
+# by FerricstoreHttp.Config before any network child starts.
+config :ferricstore_http,
+  enabled: false,
+  ip: {127, 0, 0, 1},
+  port: 8080,
+  http2_enabled: false,
+  metrics_enabled: true,
+  trust_context_headers: false,
+  invocations_enabled: false,
+  runner_enabled: false,
+  target_deny_private_networks: true,
+  tls: [enabled: false]
+
 # Data directory for Bitcask shards
 config :ferricstore, :data_dir, "data"
 
