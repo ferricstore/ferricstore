@@ -298,6 +298,235 @@ defmodule FerricstoreServer.CommandGatewayTest do
     assert unknown =~ "unknown command"
   end
 
+  test "stores definitions and creates durable invocations through the shared command engine" do
+    username = "invocation-admin"
+    password = "secret"
+    name = "send-email-#{System.unique_integer([:positive, :monotonic])}"
+
+    assert :ok =
+             FerricstoreServer.Acl.set_user(username, [
+               "on",
+               ">#{password}",
+               "-@all",
+               "+INVOCATION.DEFINITION.PUT",
+               "+INVOCATION.DEFINITION.GET",
+               "+INVOCATION.DEFINITION.LIST",
+               "+INVOCATION.CREATE",
+               "+INVOCATION.GET",
+               "+INVOCATION.PARTITION.LIST",
+               "~invocation:*"
+             ])
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate(username, password, peer: peer())
+
+    definition = %{
+      "name" => name,
+      "enabled" => true,
+      "flow_type" => "email-delivery-#{name}",
+      "initial_state" => "queued",
+      "limits" => %{
+        "max_payload_bytes" => 1_024,
+        "idempotency_required" => true
+      },
+      "partition" => %{"key" => "invocation:{name}:{subject}"},
+      "acl" => %{"invoke_key" => "invocation:create:{name}"}
+    }
+
+    assert {:ok, [%{status: :ok, value: "OK"}]} =
+             CommandGateway.execute_batch(session, [
+               ["INVOCATION.DEFINITION.PUT", Jason.encode!(definition)]
+             ])
+
+    assert {:ok, [%{status: :ok, value: ^definition}]} =
+             CommandGateway.execute_batch(session, [
+               ["INVOCATION.DEFINITION.GET", name]
+             ])
+
+    assert {:ok, [%{status: :ok, value: definitions}]} =
+             CommandGateway.execute_batch(session, [["INVOCATION.DEFINITION.LIST"]])
+
+    assert definition in definitions
+
+    envelope = %{
+      "attrs" => %{"payload" => %{"to" => "test@example.com"}},
+      "idempotency_key" => "request-1"
+    }
+
+    execution_opts = %{
+      request_context: %{"subject" => username, "scopes" => []}
+    }
+
+    expected_partition = "invocation:#{name}:#{username}"
+
+    assert {:ok, [%{status: :ok, value: created}]} =
+             CommandGateway.execute_batch(
+               session,
+               [["INVOCATION.CREATE", name, Jason.encode!(envelope)]],
+               store:
+                 FerricStore.Instance.get(:default)
+                 |> Map.put(:request_context, execution_opts.request_context)
+             )
+
+    assert %{
+             "invocation_id" => invocation_id,
+             "name" => ^name,
+             "flow_type" => "email-delivery-" <> _,
+             "state" => "queued",
+             "partition_key" => ^expected_partition
+           } = created
+
+    assert {:ok, [%{status: :ok, value: ^created}]} =
+             CommandGateway.execute_batch(
+               session,
+               [["INVOCATION.CREATE", name, Jason.encode!(envelope)]],
+               store:
+                 FerricStore.Instance.get(:default)
+                 |> Map.put(:request_context, execution_opts.request_context)
+             )
+
+    assert {:ok, [%{status: :ok, value: metadata}]} =
+             CommandGateway.execute_batch(
+               session,
+               [["INVOCATION.GET", invocation_id]],
+               store:
+                 FerricStore.Instance.get(:default)
+                 |> Map.put(:request_context, execution_opts.request_context)
+             )
+
+    assert metadata["id"] == invocation_id
+    assert metadata["name"] == name
+    refute Map.has_key?(metadata, "tenant")
+
+    assert {:ok, [%{status: :ok, value: partitions}]} =
+             CommandGateway.execute_batch(session, [["INVOCATION.PARTITION.LIST", name]])
+
+    assert expected_partition in partitions
+
+    conflicting = put_in(envelope, ["attrs", "payload", "to"], "other@example.com")
+
+    assert {:ok, [%{status: :error, value: conflict}]} =
+             CommandGateway.execute_batch(
+               session,
+               [["INVOCATION.CREATE", name, Jason.encode!(conflicting)]],
+               store:
+                 FerricStore.Instance.get(:default)
+                 |> Map.put(:request_context, execution_opts.request_context)
+             )
+
+    assert conflict =~ "idempotency_conflict"
+  end
+
+  test "rejects a missing invocation attrs map without raising in native execution" do
+    username = "invocation-validation-admin"
+    password = "secret"
+    name = "validation-#{System.unique_integer([:positive, :monotonic])}"
+
+    assert :ok =
+             FerricstoreServer.Acl.set_user(username, [
+               "on",
+               ">#{password}",
+               "-@all",
+               "+INVOCATION.DEFINITION.PUT",
+               "+INVOCATION.CREATE",
+               "~invocation:*"
+             ])
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate(username, password, peer: peer())
+
+    assert {:ok, [%{status: :ok}]} =
+             CommandGateway.execute_batch(session, [
+               [
+                 "INVOCATION.DEFINITION.PUT",
+                 Jason.encode!(%{"name" => name, "enabled" => true})
+               ]
+             ])
+
+    assert {:ok, [%{status: :error, value: reason}]} =
+             CommandGateway.execute_batch(session, [
+               ["INVOCATION.CREATE", name, Jason.encode!(%{})]
+             ])
+
+    assert reason == "ERR invalid invocation attributes"
+  end
+
+  test "checks invocation command and logical key ACLs before execution" do
+    admin = "invocation-acl-admin"
+    password = "secret"
+    name = "acl-target-#{System.unique_integer([:positive, :monotonic])}"
+
+    assert :ok =
+             FerricstoreServer.Acl.set_user(admin, [
+               "on",
+               ">#{password}",
+               "-@all",
+               "+INVOCATION.DEFINITION.PUT",
+               "~invocation:definition:*"
+             ])
+
+    assert {:ok, admin_session} =
+             AuthenticationGateway.authenticate(admin, password, peer: peer())
+
+    definition = %{
+      "name" => name,
+      "enabled" => true
+    }
+
+    assert {:ok, [%{status: :ok}]} =
+             CommandGateway.execute_batch(admin_session, [
+               ["INVOCATION.DEFINITION.PUT", Jason.encode!(definition)]
+             ])
+
+    caller = "invocation-acl-caller"
+
+    assert :ok =
+             FerricstoreServer.Acl.set_user(caller, [
+               "on",
+               ">#{password}",
+               "-@all",
+               "+INVOCATION.CREATE",
+               "~invocation:other"
+             ])
+
+    assert {:ok, caller_session} =
+             AuthenticationGateway.authenticate(caller, password, peer: peer())
+
+    envelope = Jason.encode!(%{"attrs" => %{}})
+
+    store =
+      FerricStore.Instance.get(:default)
+      |> Map.put(:request_context, %{"subject" => caller, "scopes" => []})
+
+    assert {:ok, [%{status: :noperm, value: key_denied}]} =
+             CommandGateway.execute_batch(
+               caller_session,
+               [["INVOCATION.CREATE", name, envelope]],
+               store: store
+             )
+
+    assert key_denied =~ "NOPERM"
+
+    assert :ok =
+             FerricstoreServer.Acl.set_user(caller, [
+               "resetkeys",
+               "~invocation:#{name}",
+               "-INVOCATION.CREATE"
+             ])
+
+    assert {:ok, caller_session} =
+             AuthenticationGateway.authenticate(caller, password, peer: peer())
+
+    assert {:ok, [%{status: :noperm, value: command_denied}]} =
+             CommandGateway.execute_batch(
+               caller_session,
+               [["INVOCATION.CREATE", name, envelope]],
+               store: store
+             )
+
+    assert command_denied =~ "NOPERM"
+  end
+
   test "invalidates a cached session when its credential epoch changes" do
     put_http_user("rotating", "old-secret")
 

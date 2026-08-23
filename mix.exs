@@ -4,7 +4,7 @@ defmodule Ferricstore.Umbrella.MixProject do
   def project do
     [
       apps_path: "apps",
-      version: "0.11.10",
+      version: "0.11.11",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       aliases: aliases(),
@@ -13,7 +13,8 @@ defmodule Ferricstore.Umbrella.MixProject do
           applications: [
             ranch: :permanent,
             ferricstore: :permanent,
-            ferricstore_server: :permanent
+            ferricstore_server: :permanent,
+            ferricstore_http: :permanent
           ],
           include_executables_for: [:unix],
           rel_templates_path: "rel",
@@ -21,6 +22,10 @@ defmodule Ferricstore.Umbrella.MixProject do
         ]
       ]
     ]
+  end
+
+  def cli do
+    [preferred_envs: ["quality.http": :test, "test.http": :test]]
   end
 
   defp deps do
@@ -47,7 +52,15 @@ defmodule Ferricstore.Umbrella.MixProject do
       "bench.native_pubsub": "run --no-start bench/native_pubsub_bench.exs",
       "bench.native_pubsub_load": "run --no-start bench/native_pubsub_load_bench.exs",
       "bench.tcp": "run bench/tcp_bench.exs",
-      "bench.flow": "run bench/flow_workflow_bench.exs"
+      "bench.flow": "run bench/flow_workflow_bench.exs",
+      "bench.http": "run --no-start bench/http/keepalive_benchmark.exs",
+      "test.http": "test apps/ferricstore_http/test",
+      "quality.http": [
+        "format --check-formatted",
+        "compile --warnings-as-errors",
+        "credo --strict --config-file .credo_http.exs",
+        "test apps/ferricstore_http/test"
+      ]
     ]
   end
 end

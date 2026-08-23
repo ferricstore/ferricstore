@@ -33,6 +33,7 @@ ENV HEX_HTTP_CONCURRENCY=2
 COPY mix.exs mix.lock ./
 COPY apps/ferricstore/mix.exs apps/ferricstore/mix.exs
 COPY apps/ferricstore_server/mix.exs apps/ferricstore_server/mix.exs
+COPY apps/ferricstore_http/mix.exs apps/ferricstore_http/mix.exs
 COPY config/config.exs config/prod.exs config/runtime.exs config/
 
 # Copy source for the standalone Docker image
@@ -42,6 +43,7 @@ COPY apps/ferricstore/src apps/ferricstore/src
 COPY apps/ferricstore/priv/flow_query apps/ferricstore/priv/flow_query
 COPY apps/ferricstore_server/native apps/ferricstore_server/native
 COPY apps/ferricstore_server/lib apps/ferricstore_server/lib
+COPY apps/ferricstore_http/lib apps/ferricstore_http/lib
 COPY rel rel
 
 RUN mix deps.unlock --unused && mix deps.get --only prod
@@ -58,7 +60,7 @@ RUN mix release ferricstore
 FROM ubuntu:noble-20260217@sha256:186072bba1b2f436cbb91ef2567abca677337cfc786c86e107d25b7072feef0c
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3t64 libncurses6 libstdc++6 \
+    ca-certificates libssl3t64 libncurses6 libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system --gid 10001 ferricstore \
@@ -78,11 +80,14 @@ ENV FERRICSTORE_DATA_DIR=/data
 ENV FERRICSTORE_NATIVE_PORT=6388
 ENV FERRICSTORE_HEALTH_PORT=6380
 ENV FERRICSTORE_HEALTH_PROBE_PORT=6381
+ENV FERRICSTORE_HTTP_ENABLED=false
+ENV FERRICSTORE_HTTP_BIND=0.0.0.0
+ENV FERRICSTORE_HTTP_PORT=8080
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 ENV ELIXIR_ERL_OPTIONS="+fnu"
 
-EXPOSE 6388 6380 6381
+EXPOSE 6388 6380 6381 8080
 
 USER ferricstore
 

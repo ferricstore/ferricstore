@@ -81,6 +81,8 @@ defmodule FerricstoreServer.Acl.CommandCategories do
   @scheduler_write ~w(
     FLOW.SCHEDULE.CREATE FLOW.SCHEDULE.DELETE FLOW.SCHEDULE.FIRE FLOW.SCHEDULE.PAUSE FLOW.SCHEDULE.RESUME FLOW.SCHEDULE.FIRE_DUE
   )
+  @invocation_read ~w(INVOCATION.GET INVOCATION.PARTITION.LIST)
+  @invocation_write ~w(INVOCATION.CREATE)
 
   @generic_read ~w(
     EXISTS TYPE RANDOMKEY SCAN OBJECT DBSIZE KEYS TTL PTTL EXPIRETIME PEXPIRETIME
@@ -123,6 +125,7 @@ defmodule FerricstoreServer.Acl.CommandCategories do
     CLUSTER.JOIN CLUSTER.LEAVE CLUSTER.FAILOVER
     CLUSTER.PROMOTE CLUSTER.DEMOTE CLUSTER.ROLE
     FERRICSTORE.CONFIG FERRICSTORE.HOTNESS FERRICSTORE.METRICS FERRICSTORE.BLOBGC FERRICSTORE.DOCTOR FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FLOW.RETENTION_CLEANUP FLOW.QUERY.EXPLAIN
+    INVOCATION.DEFINITION.PUT INVOCATION.DEFINITION.GET INVOCATION.DEFINITION.LIST
   ) ++ @client_admin_commands ++ @acl_subcommands
 
   @dangerous_commands ~w(
@@ -148,7 +151,7 @@ defmodule FerricstoreServer.Acl.CommandCategories do
                      @geo_read ++
                      @stream_read ++
                      @probabilistic_read ++
-                     @flow_read ++ @generic_read ++ @native_read
+                     @flow_read ++ @invocation_read ++ @generic_read ++ @native_read
                  )
 
   @write_commands MapSet.new(
@@ -162,7 +165,7 @@ defmodule FerricstoreServer.Acl.CommandCategories do
                       @geo_write ++
                       @stream_write ++
                       @probabilistic_write ++
-                      @flow_write ++ @generic_write ++ @native_write
+                      @flow_write ++ @invocation_write ++ @generic_write ++ @native_write
                   )
 
   @category_map %{
@@ -182,6 +185,7 @@ defmodule FerricstoreServer.Acl.CommandCategories do
     "STREAM" => MapSet.new(@stream_read ++ @stream_write),
     "PROBABILISTIC" => MapSet.new(@probabilistic_read ++ @probabilistic_write),
     "FLOW" => MapSet.new(@flow_read ++ @flow_write),
+    "INVOCATION" => MapSet.new(@invocation_read ++ @invocation_write),
     "SCHEDULER" => MapSet.new(@scheduler_read ++ @scheduler_write),
     "NATIVE" => MapSet.new(@native_read ++ @native_write),
     "PUBSUB" => MapSet.new(@pubsub_commands),

@@ -939,6 +939,9 @@ defmodule Ferricstore.Commands.NativeAstParser do
     end
   end
 
+  defp command_keys("INVOCATION." <> _rest = command, args, _ast),
+    do: Ferricstore.Commands.Invocation.acl_keys(command, args)
+
   defp command_keys(cmd, args, _ast), do: command_keys(cmd, args)
 
   defp command_keys(cmd, args) when cmd in @management_scoped_commands do
