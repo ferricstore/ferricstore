@@ -148,6 +148,29 @@ terminate TLS only when the hop to FerricStore stays on a protected private or s
 The ingress must remove caller-supplied identity-context headers before adding verified values.
 Keep `FERRICSTORE_HTTP_TRUST_CONTEXT_HEADERS=false` unless that condition is enforced.
 
+## AWS Fargate
+
+The repository's single-task and three-node cluster Terraform profiles can
+enable this listener in the existing FerricStore container with
+`http_enabled = true`. They add task port `8080`, a separate NLB target group,
+and stable `http_endpoint`/`http_readiness_endpoint` outputs. The cluster
+profile creates one HTTP target group per stable node slot so ECS can move task
+IPs without changing the client endpoint.
+
+With no certificate ARN, the listener is plaintext and must stay on a trusted
+private network. Supplying `http_tls_certificate_arn`, `http_hostname`, and
+normally `http_listener_port = 443` makes the internal NLB terminate TLS 1.2/1.3.
+The hop to the task remains plaintext inside the private VPC; this is not
+end-to-end application TLS. The Fargate stacks keep trusted context headers
+disabled and do not turn NLB TLS identity into FerricStore identity—HTTP Basic
+ACL authentication is still required for command requests.
+
+See [single-task Fargate](../deploy/aws/fargate/README.md#http-command-api) or
+[clustered Fargate](../deploy/aws/fargate-cluster/README.md#http-command-api).
+On an existing three-node cluster, follow its staged sequential procedure when
+changing HTTP mode because ECS target-group changes can trigger task
+replacement.
+
 ## Invocation routes and outbound targets
 
 Invocation routes and the background runner are separate opt-ins. Definitions and invocation

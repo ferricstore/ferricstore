@@ -195,6 +195,14 @@ terraform plan
 terraform apply
 ```
 
+FerricStore `0.11.11+` can expose the authenticated HTTP command API from the
+same task. Set `http_enabled = true` to add a private HTTP listener and
+`http_endpoint` output. For production client encryption, also set a matching
+`http_hostname`, an ACM/IAM `http_tls_certificate_arn`, and normally
+`http_listener_port = 443`; the existing NLB terminates TLS and forwards to the
+task over the private VPC. See the stack README for ACL bootstrap, unauthenticated
+health/metrics routes, and the exact TLS boundary.
+
 All data is lost when the task stops or is replaced, so this layout is for
 disposable development, demos, SDK integration, CI, caches, and similar OSS
 workloads. EFS is not used because FerricStore's LMDB projection cannot safely
@@ -223,6 +231,13 @@ terraform init
 terraform plan
 terraform apply
 ```
+
+The cluster profile has the same opt-in HTTP/HTTPS endpoint. One HTTP target
+group follows each stable node slot, so the NLB endpoint stays fixed when Cloud
+Map and ECS move a replacement task to a new IP. On a running cluster, adding
+or removing those target groups must use the documented staged apply plus
+`scripts/deploy-sequential.sh`; an unrestricted target-group change can deploy
+all three stateful services concurrently.
 
 Image changes are registered by Terraform but deployed only through
 `scripts/deploy-sequential.sh`. It replaces one node and verifies full local

@@ -3,6 +3,41 @@ output "endpoint" {
   value       = "ferric://${aws_lb.this.dns_name}:${local.native_port}"
 }
 
+output "http_endpoint" {
+  description = "Private HTTP command API endpoint, or null when http_enabled is false."
+  value = var.http_enabled ? format(
+    "%s://%s:%d",
+    var.http_tls_certificate_arn == null ? "http" : "https",
+    var.http_hostname == null ? aws_lb.this.dns_name : var.http_hostname,
+    var.http_listener_port
+  ) : null
+}
+
+output "http_readiness_endpoint" {
+  description = "Unauthenticated HTTP API readiness endpoint, or null when HTTP is disabled."
+  value = var.http_enabled ? format(
+    "%s://%s:%d/ready",
+    var.http_tls_certificate_arn == null ? "http" : "https",
+    var.http_hostname == null ? aws_lb.this.dns_name : var.http_hostname,
+    var.http_listener_port
+  ) : null
+}
+
+output "http_enabled" {
+  description = "Whether the desired task and ECS service configuration includes the HTTP API."
+  value       = var.http_enabled
+}
+
+output "native_target_group_arns" {
+  description = "Native target group ARN by stable node slot, used by the guarded rollout."
+  value       = { for slot, target_group in aws_lb_target_group.native : slot => target_group.arn }
+}
+
+output "http_target_group_arns" {
+  description = "HTTP target group ARN by stable node slot, used by the guarded rollout when HTTP is enabled."
+  value       = { for slot, target_group in aws_lb_target_group.http : slot => target_group.arn }
+}
+
 output "aws_region" {
   value = var.aws_region
 }

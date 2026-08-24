@@ -15,6 +15,32 @@ env:
 
 jobs:
   # ===========================================================================
+  # Terraform deployment profiles
+  # ===========================================================================
+  terraform-fargate:
+    name: "Terraform (${{ matrix.profile }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [fargate, fargate-cluster]
+    defaults:
+      run:
+        working-directory: deploy/aws/${{ matrix.profile }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive
+      - name: Initialize providers without a backend
+        run: terraform init -backend=false -input=false
+      - name: Validate Terraform
+        run: terraform validate
+
+  # ===========================================================================
   # Build (Ubuntu)
   # ===========================================================================
   build-ubuntu:

@@ -9,8 +9,9 @@ task. It is intended for disposable development, demos, SDK integration, CI,
 caches, and similar workloads. It creates:
 
 - a VPC with public and private subnets in two or three availability zones;
-- one NAT gateway so private tasks can pull the published GHCR image;
-- an internal Network Load Balancer by default;
+- one NAT gateway so private tasks can pull the published Quay.io image;
+- an internal Network Load Balancer with the native endpoint and an optional
+  HTTP/HTTPS endpoint;
 - one ECS service with a fixed desired count of one and no autoscaling;
 - encrypted Fargate ephemeral storage mounted at `/data`;
 - isolated readiness checks on port `6381`, CloudWatch logs, and ECS Exec.
@@ -57,18 +58,67 @@ terraform output -raw endpoint
 The default NLB is internal, so run a FerricStore SDK client from the VPC, a
 peered VPC, or a network connected through VPN/Direct Connect.
 
+## HTTP Command API
+
+FerricStore `0.11.11` and later include the HTTP command API. It remains
+disabled unless you opt in:
+
+```hcl
+container_image    = "quay.io/ferricstore/ferricstore:0.11.11"
+http_enabled       = true
+http_listener_port = 8080
+```
+
+After `terraform apply`, get the stable private endpoints:
+
+```bash
+terraform output -raw http_endpoint
+terraform output -raw http_readiness_endpoint
+```
+
+Enabling or disabling HTTP changes the task definition and replaces the one
+running task. The replacement starts with empty `/data`, so any existing data
+and ACL identities are lost; bootstrap the HTTP ACL identity after the new task
+is ready.
+
+The stack opens task port `8080`, starts the in-process HTTP listener on every
+replacement task, registers it in a separate NLB target group, and checks the
+isolated node readiness endpoint before sending traffic. `POST /v1/commands`
+always requires HTTP Basic credentials backed by a FerricStore ACL identity.
+Create that least-privilege identity through a trusted native administration
+connection before sending HTTP commands; see the
+[HTTP API guide](../../../guides/http-api.md#create-an-acl-identity-first).
+
+Plain HTTP is appropriate only inside a trusted private network. To terminate
+TLS 1.2/1.3 at the NLB, use an ACM or IAM certificate and a DNS name covered by
+that certificate:
+
+```hcl
+http_enabled             = true
+http_listener_port       = 443
+http_hostname            = "ferricstore.internal.example.com"
+http_tls_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/REPLACE_ME"
+```
+
+Create the private DNS alias from `http_hostname` to the NLB outside this
+stack. TLS is terminated at the NLB; the hop to FerricStore remains plaintext
+inside the private VPC. Use application-native TLS instead if policy requires
+encryption all the way to the task. The stack does not store certificate keys
+in the task definition or Terraform state.
+
 ## Security
 
-The stack always creates an internal NLB, disables protected mode, and permits
-native-protocol traffic from the stack VPC by default so a new disposable task
-is immediately usable. Restrict
-`allowed_client_cidr_blocks` to the application subnets that need access. Do not
-route the endpoint from an untrusted network or send sensitive data to this
-service.
+The stack always creates an internal NLB, disables protected mode for the native
+listener, and permits client traffic from the stack VPC by default so a new
+disposable task is immediately usable. HTTP command requests still require ACL
+credentials. Restrict `allowed_client_cidr_blocks` to the application subnets
+that need native or HTTP access. Do not route a plaintext endpoint from an
+untrusted network or send sensitive data through it.
 
 ACL changes would disappear with the rest of `/data` after task replacement.
-Use a durable deployment layout when authentication, persisted credentials, or
-native TLS are required.
+Use a durable deployment layout when persisted credentials or durable data are
+required. NLB TLS protects HTTP clients in transit but does not make the
+task-local ACL catalog durable.
 
 ## Storage And Performance
 
@@ -87,9 +137,11 @@ FerricStore cluster.
 
 ## Operations
 
-The NLB checks `GET /health/ready` on the isolated probe port. Application logs
-are written to `/ecs/<name_prefix>` in CloudWatch Logs. ECS Container Insights
-and ECS Exec are enabled.
+The native and HTTP target groups check `GET /health/ready` on the isolated
+probe port. The HTTP listener also exposes unauthenticated `GET /health`,
+`GET /ready`, and `GET /metrics`; keep those endpoints inside the same approved
+network boundary. Application logs are written to `/ecs/<name_prefix>` in
+CloudWatch Logs. ECS Container Insights and ECS Exec are enabled.
 
 To open a shell, first get the running task id:
 
