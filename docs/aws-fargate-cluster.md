@@ -109,6 +109,14 @@ before enabling application traffic. `GET /health`, `GET /ready`, and the HTTP
 listener's `GET /metrics` do not require credentials, so the NLB must remain
 internal and `allowed_client_cidr_blocks` must be kept narrow.
 
+The stack does not provision application users through Terraform. Send `ACL
+SETUSER` once through a VPC-connected native FerricStore client after cluster
+readiness; the committed user is then available on every node through the
+replicated ACL catalog. See the stack
+[Create An HTTP User](../deploy/aws/fargate-cluster/README.md#create-an-http-user)
+procedure. A surviving quorum restores the user to a replacement node, while
+loss of every task-local replica loses it with the rest of the cluster data.
+
 Plain HTTP is supported only for a trusted private network. For client TLS,
 provide an ACM/IAM `http_tls_certificate_arn`, set `http_hostname` to a DNS name
 covered by that certificate, and normally use `http_listener_port = 443`. The

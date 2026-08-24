@@ -92,11 +92,46 @@ terraform output -raw http_readiness_endpoint
 ```
 
 `POST /v1/commands` always requires HTTP Basic credentials backed by the
-replicated FerricStore ACL catalog. Create a least-privilege ACL identity over a
-trusted native administration connection before sending HTTP commands. The
-listener's `GET /health`, `GET /ready`, and `GET /metrics` routes do not require
-credentials, so the NLB and task security rules must remain private and scoped
-with `allowed_client_cidr_blocks`.
+replicated FerricStore ACL catalog. The listener's `GET /health`, `GET /ready`,
+and `GET /metrics` routes do not require credentials, so the NLB and task
+security rules must remain private and scoped with
+`allowed_client_cidr_blocks`.
+
+### Create An HTTP User
+
+The HTTP API cannot create its own first user because `/v1/commands` already
+requires authentication. After the three nodes report ready, run an official
+FerricStore SDK or another trusted native administration client from the
+VPC-connected network and connect it to:
+
+```bash
+terraform output -raw endpoint
+```
+
+Submit this as one native command. The array below shows the command arguments;
+it is not a shell command, and the leading `>` on the password is an ACL rule:
+
+```text
+["ACL", "SETUSER", "web-api", "on", "resetpass",
+ ">replace-with-a-long-random-password", "resetkeys",
+ "+GET", "+SET", "+DEL", "~web-api:*"]
+```
+
+The successful command is committed through the replicated ACL catalog, so all
+three nodes authenticate the same HTTP user regardless of which node the NLB
+selects. Run it once, wait for success, and then start application traffic. Add
+only the commands and key patterns the application needs. The
+[HTTP API guide](../../../guides/http-api.md#send-a-command-batch) contains a
+complete authenticated request, the [security guide](../../../guides/security.md#access-control-lists-acl)
+documents all ACL rules, and published clients are listed under
+[Interfaces And Published SDKs](../../../README.md#interfaces-and-published-sdks).
+
+Do not put the plaintext password in Terraform variables, task-definition
+environment variables, or source control. A deployment pipeline can read it
+from a secret manager and submit the command after cluster readiness succeeds.
+One task replacement restores the user from the surviving replicas. Loss of
+all task-local replicas loses the ACL catalog along with the application data.
+Creating the user does not make the native endpoint require authentication.
 
 Plain HTTP is only for a trusted private network. For TLS 1.2/1.3 termination at
 the NLB, use an ACM or IAM certificate whose SAN covers a private DNS alias:

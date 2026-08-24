@@ -127,6 +127,13 @@ task can accept native connections without a persistent bootstrap credential.
 HTTP command requests still require an ACL username and password. This profile
 is acceptable only inside an explicitly trusted network boundary.
 
+The stack does not provision application users through Terraform. Bootstrap a
+least-privilege HTTP user after each task becomes ready by sending `ACL
+SETUSER` through a VPC-connected native FerricStore client. See the stack
+[Create An HTTP User](../deploy/aws/fargate/README.md#create-an-http-user)
+procedure. The user is stored with the task-local ACL catalog and is lost on
+replacement.
+
 For the initial OSS profile:
 
 - restrict `allowed_client_cidr_blocks` to application networks;

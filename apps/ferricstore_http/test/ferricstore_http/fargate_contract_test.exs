@@ -42,6 +42,10 @@ defmodule FerricstoreHttp.FargateContractTest do
 
     for document <- [single, cluster] do
       assert document =~ "HTTP Basic"
+      assert document =~ "Create An HTTP User"
+      assert document =~ "ACL\", \"SETUSER"
+      assert document =~ "security guide"
+      assert document =~ "Do not put the plaintext password in Terraform variables"
       assert document =~ "http_tls_certificate_arn"
       assert document =~ "plaintext"
       assert document =~ "private"

@@ -85,9 +85,41 @@ The stack opens task port `8080`, starts the in-process HTTP listener on every
 replacement task, registers it in a separate NLB target group, and checks the
 isolated node readiness endpoint before sending traffic. `POST /v1/commands`
 always requires HTTP Basic credentials backed by a FerricStore ACL identity.
-Create that least-privilege identity through a trusted native administration
-connection before sending HTTP commands; see the
-[HTTP API guide](../../../guides/http-api.md#create-an-acl-identity-first).
+
+### Create An HTTP User
+
+The HTTP API cannot create its own first user because `/v1/commands` already
+requires authentication. After `terraform apply`, run an official FerricStore
+SDK or another trusted native administration client from the VPC-connected
+network and connect it to:
+
+```bash
+terraform output -raw endpoint
+```
+
+Submit this as one native command. The array below shows the command arguments;
+it is not a shell command, and the leading `>` on the password is an ACL rule:
+
+```text
+["ACL", "SETUSER", "web-api", "on", "resetpass",
+ ">replace-with-a-long-random-password", "resetkeys",
+ "+GET", "+SET", "+DEL", "~web-api:*"]
+```
+
+This creates an enabled user that can only run `GET`, `SET`, and `DEL` against
+keys beginning with `web-api:`. Add only the commands and key patterns that the
+application actually needs. Then use `web-api` and the same password as HTTP
+Basic credentials; the [HTTP API guide](../../../guides/http-api.md#send-a-command-batch)
+contains a complete request example, and the [security guide](../../../guides/security.md#access-control-lists-acl)
+documents all user, command, key, and password rules. Published native SDKs are
+listed under [Interfaces And Published SDKs](../../../README.md#interfaces-and-published-sdks).
+
+Do not put the plaintext password in Terraform variables, task-definition
+environment variables, or source control. A deployment pipeline can read it
+from a secret manager and submit the command after readiness succeeds. In this
+single-task profile the ACL catalog is task-local, so repeat that bootstrap
+after every replacement; creating the user does not make the native endpoint
+require authentication.
 
 Plain HTTP is appropriate only inside a trusted private network. To terminate
 TLS 1.2/1.3 at the NLB, use an ACM or IAM certificate and a DNS name covered by
