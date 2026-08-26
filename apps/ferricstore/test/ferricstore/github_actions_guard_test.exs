@@ -226,7 +226,7 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     assert workflow =~ "repository: ferricstore/ferricstore-elixir\n            ref: v0.11.13"
 
     assert workflow =~
-             "repository: ferricstore/ferricstore-java\n            ref: eeb9150a730133a32d886ce8c485ae31753b4f8a"
+             "repository: ferricstore/ferricstore-java\n            ref: 75b20cdd3fb0dffdddf372bd659f71e40f8e2f3f"
 
     refute workflow =~ "ref: v0.11.6"
 
@@ -257,7 +257,7 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     test_workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
 
     assert test_workflow =~
-             "repository: ferricstore/ferricstore-java\n          ref: eeb9150a730133a32d886ce8c485ae31753b4f8a"
+             "repository: ferricstore/ferricstore-java\n          ref: 75b20cdd3fb0dffdddf372bd659f71e40f8e2f3f"
   end
 
   test "container workflows publish only to the official Quay.io repository" do

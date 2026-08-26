@@ -66,7 +66,7 @@ jobs:
           - sdk: Java
             id: java
             repository: ferricstore/ferricstore-java
-            ref: eeb9150a730133a32d886ce8c485ae31753b4f8a
+            ref: 75b20cdd3fb0dffdddf372bd659f71e40f8e2f3f
     steps:
       - name: Checkout official SDK
         uses: actions/checkout@v6
