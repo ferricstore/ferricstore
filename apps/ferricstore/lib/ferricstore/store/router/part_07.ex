@@ -548,22 +548,16 @@ defmodule Ferricstore.Store.Router.Part07 do
              true <- Enum.all?(priorities, &is_integer/1),
              path when is_binary(path) <- flow_claim_due_cold_precheck_path(ctx, idx),
              [_ | _] = buckets <- flow_claim_due_cold_precheck_buckets(now_ms) do
-          Enum.any?(states, fn claim_state ->
-            Enum.any?(priorities, fn claim_priority ->
-              Enum.any?(buckets, fn bucket_ms ->
-                flow_claim_due_cold_precheck_partition_present?(
-                  ctx,
-                  idx,
-                  path,
-                  bucket_ms,
-                  type,
-                  claim_state,
-                  claim_priority,
-                  partition_key
-                )
-              end)
-            end)
-          end)
+          flow_claim_due_cold_precheck_present_by_partition?(
+            ctx,
+            idx,
+            path,
+            buckets,
+            type,
+            states,
+            priorities,
+            partition_key
+          )
         else
           _ -> false
         end
@@ -571,6 +565,64 @@ defmodule Ferricstore.Store.Router.Part07 do
         _ -> false
       catch
         _kind, _reason -> false
+      end
+
+      defp flow_claim_due_cold_precheck_present_by_partition?(
+             ctx,
+             idx,
+             path,
+             buckets,
+             type,
+             states,
+             _priorities,
+             :auto
+           ) do
+        flow_claim_due_auto_cold_precheck_present?(ctx, idx, path, buckets, type, states)
+      end
+
+      defp flow_claim_due_cold_precheck_present_by_partition?(
+             ctx,
+             idx,
+             path,
+             buckets,
+             type,
+             states,
+             priorities,
+             partition_key
+           ) do
+        Enum.any?(states, fn claim_state ->
+          Enum.any?(priorities, fn claim_priority ->
+            Enum.any?(buckets, fn bucket_ms ->
+              flow_claim_due_cold_precheck_partition_present?(
+                ctx,
+                idx,
+                path,
+                bucket_ms,
+                type,
+                claim_state,
+                claim_priority,
+                partition_key
+              )
+            end)
+          end)
+        end)
+      end
+
+      defp flow_claim_due_auto_cold_precheck_present?(ctx, idx, path, buckets, type, states) do
+        Enum.any?(states, fn claim_state ->
+          Enum.any?(buckets, fn bucket_ms ->
+            flow_claim_due_cold_precheck_partition_present?(
+              ctx,
+              idx,
+              path,
+              bucket_ms,
+              type,
+              claim_state,
+              nil,
+              :auto
+            )
+          end)
+        end)
       end
 
       defp flow_claim_due_cold_precheck_path(%{data_dir: data_dir}, idx)
@@ -614,7 +666,7 @@ defmodule Ferricstore.Store.Router.Part07 do
            ) do
         prefix = Ferricstore.Flow.LMDB.cold_due_state_bucket_prefix(bucket_ms, type, claim_state)
 
-        case Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 1) do
+        case Ferricstore.Flow.LMDB.prefix_entries_initialized(path, prefix, 1) do
           {:ok, [_ | _]} -> true
           _ -> false
         end
@@ -639,7 +691,7 @@ defmodule Ferricstore.Store.Router.Part07 do
             priority: claim_priority
           )
 
-        case Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 1) do
+        case Ferricstore.Flow.LMDB.prefix_entries_initialized(path, prefix, 1) do
           {:ok, [_ | _]} -> true
           _ -> false
         end
@@ -697,11 +749,26 @@ defmodule Ferricstore.Store.Router.Part07 do
              priorities <- flow_claim_any_priorities(priority),
              true <- Enum.all?(priorities, &is_integer/1),
              [_ | _] = partition_keys <- flow_auto_partition_keys_for_shard(ctx, idx) do
+          encoded_type = Ferricstore.Flow.Keys.index_component(type)
+
+          encoded_states =
+            Enum.map(states, fn state -> Ferricstore.Flow.Keys.index_component(state) end)
+
+          partition_tags =
+            Enum.map(partition_keys, fn partition_key ->
+              Ferricstore.Flow.Keys.tag(partition_key)
+            end)
+
           keys =
-            for state <- states,
+            for encoded_state <- encoded_states,
                 priority <- priorities,
-                partition_key <- partition_keys do
-              Ferricstore.Flow.Keys.due_key(type, state, priority, partition_key)
+                partition_tag <- partition_tags do
+              Ferricstore.Flow.Keys.due_key_from_tag_and_index_components(
+                partition_tag,
+                encoded_type,
+                encoded_state,
+                priority
+              )
             end
 
           {:ok, keys}

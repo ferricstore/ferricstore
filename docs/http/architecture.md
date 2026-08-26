@@ -15,6 +15,22 @@ SDK HTTP connection
 There is no loopback TCP connection. HTTP keep-alive is handled by Cowboy; FerricStore execution is
 an in-process function boundary.
 
+The shared command gateway recognizes exact homogeneous batches containing at least two plain
+`GET key` or `SET key value` commands. It validates the absolute deadline, key shape, complete ACL
+command/key scope, internal-key policy, and active resource-limit implementation before using the
+core storage batch primitives. Bounded GET reads preserve every logical key access and the original
+result order; missing keys, compound WRONGTYPE errors, storage failures, write errors, and duplicate
+SET ordering retain their ordinary command semantics. Deadline-bearing batches and cross-shard SET
+batches use the canonical ordered path. Any scoped denial, malformed shape, custom resource-limit
+implementation, option-bearing SET, mixed command, or structured command also falls back before
+storage is touched.
+
+Eligibility metadata is collected while the gateway performs its original command-planning pass,
+avoiding another full request scan before direct execution. `PreparedBatch` remains an untrusted
+opaque value at the public combined-execution boundary: the gateway validates every planned command
+and derives fresh eligibility metadata there, so forged acceleration metadata cannot substitute or
+reorder commands.
+
 When invocation routes are enabled, synchronous requests follow the same authenticated backend
 boundary. Definitions and invocation records remain canonical FerricStore commands; Flow operations
 use native descriptors through that boundary.
@@ -99,7 +115,7 @@ architecture suite, and all in-repository HTTP integration tests.
 ## Deliberate non-goals
 
 - TCP proxying or per-user TCP pools;
-- command reimplementation;
+- command reimplementation in the HTTP application;
 - a distributed coordination layer between HTTP server instances;
 - connection-scoped transactions or subscriptions;
 - redirect policy in this server.

@@ -114,3 +114,36 @@ virtual machine consumed multiple cores. Always inspect host contention, repeat 
 and retain controls; do not select the best sample from a noisy machine. The release-candidate rows
 validate the complete TLS and Python SDK path on the newer toolchain; they are not a causal comparison
 with the older scoped-lease measurements.
+
+### Homogeneous command-gateway batch evidence
+
+The Java SDK's real HTTP KV benchmark also covers the shared gateway and durable storage rather than
+an in-memory backend. The following controlled A/B used the unchanged `0.11.11` worktree and the
+candidate worktree on the same host, plain HTTP/1.1, 64 in-flight batches, 100 hot keys, and 16-byte
+values. GET batches contained 1,000 commands and SET batches contained 500 commands. Each value is
+the median of three zero-error five-second samples after the binary correctness probe. SET candidate
+samples used a fresh server process so sustained writes from an earlier sample could not trigger
+storage-batcher admission in a later sample. The benchmark-only authentication attempt allowance was
+1,000 on both A/B servers, isolating the gateway and storage path from connection-startup auth bursts.
+
+| Gateway | Runtime | Workload | Commands/second | p95 batch latency | Errors |
+| --- | --- | --- | ---: | ---: | ---: |
+| Unchanged `0.11.11` | Java 21 | GET | 76,495 | 1,965.9 ms | 0 |
+| Homogeneous KV batch | Java 21 | GET | 762,626 | 130.6 ms | 0 |
+| Unchanged `0.11.11` | Java 21 | SET | 7,657 | 4,194.8 ms | 0 |
+| Homogeneous KV batch | Java 21 | SET | 647,858 | 55.1 ms | 0 |
+| Homogeneous KV batch | Java 17 | GET | 768,617 | 138.0 ms | 0 |
+| Homogeneous KV batch | Java 17 | SET | 677,255 | 51.4 ms | 0 |
+
+The same candidate server then completed the 10,000-flow, three-step Java workflow benchmark with
+zero execution or verification errors: 2,576 workflow completions/s on Java 21 and 2,608/s on Java
+17. The workflow commands deliberately remain on their existing structured paths, so these runs are
+a regression guard rather than evidence that the KV fast path accelerates Flow. These are local
+regression measurements, not universal capacity claims; compare candidates on the same host and
+retain the zero-error requirement.
+
+With the production default of 10 authentication attempts per window, a fresh Java HTTP/1.1 client
+opening 64 connections concurrently also intermittently received `429 rate_limited` for valid Basic
+credentials. The retained throughput samples exclude that separate startup-admission effect; it
+needs its own auth single-flight or queued-verification correction rather than a higher production
+rate limit.

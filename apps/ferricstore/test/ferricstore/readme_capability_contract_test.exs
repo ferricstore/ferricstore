@@ -33,7 +33,7 @@ defmodule Ferricstore.ReadmeCapabilityContractTest do
     "/metrics",
     "not Redis RESP",
     "does not replay handler code",
-    "No Java SDK is currently published"
+    "io.github.ferricstore:ferricstore-java"
   ]
 
   @cli_tasks [
@@ -49,7 +49,8 @@ defmodule Ferricstore.ReadmeCapabilityContractTest do
     "ferricstore/ferricstore-python",
     "ferricstore/ferricstore-go",
     "ferricstore/ferricstore-elixir",
-    "ferricstore/ferricstore-typescript"
+    "ferricstore/ferricstore-typescript",
+    "ferricstore/ferricstore-java"
   ]
 
   @command_summary_additions [
@@ -103,14 +104,12 @@ defmodule Ferricstore.ReadmeCapabilityContractTest do
     assert readme =~ "FQL does not return payload"
   end
 
-  test "README names every published SDK without presenting Java as released" do
+  test "README names every published SDK" do
     readme = File.read!(@readme_path)
 
     for repository <- @published_sdks do
       assert readme =~ repository, "README is missing published SDK #{repository}"
     end
-
-    refute readme =~ "Python, Elixir, Java, Go"
   end
 
   test "linked command summary agrees with the advertised Flow surface" do

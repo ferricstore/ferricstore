@@ -13,6 +13,40 @@ defmodule FerricstoreServer.CommandGatewayTest do
   alias FerricstoreServer.CommandGateway.PreparedBatch
   alias FerricstoreServer.Native.ResourceBudget
 
+  defmodule PassthroughResourceLimits do
+    @behaviour FerricStore.ResourceLimits
+
+    @impl true
+    def set_limit(_scope, _limit_spec, _opts), do: {:error, :unsupported}
+
+    @impl true
+    def get_limit(_scope, _opts), do: {:error, :unsupported}
+
+    @impl true
+    def usage(_scope, _opts), do: {:ok, %{}}
+
+    @impl true
+    def check(_scope, _resource, _amount, _opts), do: :ok
+
+    @impl true
+    def reserve(_scope, _resource, _amount, _opts), do: {:ok, nil}
+
+    @impl true
+    def release(_reservation, _opts), do: :ok
+
+    @impl true
+    def record_activity(_keys, _opts), do: :ok
+
+    @impl true
+    def check_command(_command, _args, _keys, _opts), do: :ok
+
+    @impl true
+    def acquire_command(_command, _args, _keys, _opts), do: {:ok, nil}
+
+    @impl true
+    def release_command(_lease, _opts), do: :ok
+  end
+
   setup do
     {:ok, _apps} = Application.ensure_all_started(:ferricstore_server)
     :ok = CatalogProjector.mark_ready()
@@ -98,6 +132,406 @@ defmodule FerricstoreServer.CommandGatewayTest do
 
     assert {:ok, [%{status: :ok, value: "native-value"}]} =
              CommandGateway.execute_batch(session, [["GET", key]])
+  end
+
+  test "executes an authorized homogeneous GET request with one storage batch" do
+    put_full_access_user("batch-reader", "secret")
+
+    assert {:ok, %Session{acl_cache: :full_access} = session} =
+             AuthenticationGateway.authenticate("batch-reader", "secret", peer: peer())
+
+    keys = [allowed_key("batch-read-one"), allowed_key("batch-read-two")]
+    assert :ok = FerricStore.set(Enum.at(keys, 0), "one")
+    assert :ok = FerricStore.set(Enum.at(keys, 1), "two")
+
+    trace_target = {Router, :batch_get_each_bounded, 3}
+    tracer = start_call_trace(trace_target)
+
+    try do
+      assert {:ok,
+              [
+                %{status: :ok, value: "one"},
+                %{status: :ok, value: "two"}
+              ]} = CommandGateway.execute_batch(session, Enum.map(keys, &["GET", &1]))
+
+      assert_receive {:router_trace,
+                      {:trace, pid, :call,
+                       {Router, :batch_get_each_bounded, [_store, ^keys, _budget]}}}
+
+      assert pid == self()
+    after
+      stop_call_trace(trace_target, tracer)
+    end
+  end
+
+  test "lowercase homogeneous commands use the normalized batch path" do
+    put_full_access_user("lowercase-reader", "secret")
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("lowercase-reader", "secret", peer: peer())
+
+    keys = [allowed_key("lowercase-one"), allowed_key("lowercase-two")]
+    assert :ok = FerricStore.set(Enum.at(keys, 0), "one")
+    assert :ok = FerricStore.set(Enum.at(keys, 1), "two")
+
+    trace_target = {Router, :batch_get_each_bounded, 3}
+    tracer = start_call_trace(trace_target)
+
+    try do
+      assert {:ok,
+              [
+                %{status: :ok, value: "one"},
+                %{status: :ok, value: "two"}
+              ]} = CommandGateway.execute_batch(session, Enum.map(keys, &["get", &1]))
+
+      assert_receive {:router_trace,
+                      {:trace, _pid, :call,
+                       {Router, :batch_get_each_bounded, [_store, ^keys, _budget]}}}
+    after
+      stop_call_trace(trace_target, tracer)
+    end
+  end
+
+  test "homogeneous GET batching preserves missing and WRONGTYPE results" do
+    put_full_access_user("batch-types", "secret")
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("batch-types", "secret", peer: peer())
+
+    string_key = allowed_key("batch-string")
+    list_key = allowed_key("batch-list")
+    missing_key = allowed_key("batch-missing")
+    assert :ok = FerricStore.set(string_key, "value")
+    assert {:ok, 1} = FerricStore.rpush(list_key, ["item"])
+
+    assert {:ok,
+            [
+              %{status: :ok, value: "value"},
+              %{status: :error, value: wrong_type},
+              %{status: :ok, value: nil}
+            ]} =
+             CommandGateway.execute_batch(session, [
+               ["GET", string_key],
+               ["GET", list_key],
+               ["GET", missing_key]
+             ])
+
+    assert wrong_type =~ "WRONGTYPE"
+  end
+
+  test "homogeneous GET batching preserves duplicate logical reads and request order" do
+    put_full_access_user("batch-duplicate-reader", "secret")
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("batch-duplicate-reader", "secret", peer: peer())
+
+    first = allowed_key("batch-duplicate-first")
+    second = allowed_key("batch-duplicate-second")
+    assert :ok = FerricStore.set(first, "one")
+    assert :ok = FerricStore.set(second, "two")
+
+    trace_target = {Router, :batch_get_each_bounded, 3}
+    tracer = start_call_trace(trace_target)
+
+    try do
+      assert {:ok,
+              [
+                %{status: :ok, value: "one"},
+                %{status: :ok, value: "two"},
+                %{status: :ok, value: "one"}
+              ]} =
+               CommandGateway.execute_batch(session, [
+                 ["GET", first],
+                 ["GET", second],
+                 ["GET", first]
+               ])
+
+      assert_receive {:router_trace,
+                      {:trace, _pid, :call,
+                       {Router, :batch_get_each_bounded,
+                        [_store, [^first, ^second, ^first], _budget]}}}
+    after
+      stop_call_trace(trace_target, tracer)
+    end
+  end
+
+  test "homogeneous SET batching preserves duplicate-key order" do
+    put_full_access_user("batch-writer", "secret")
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("batch-writer", "secret", peer: peer())
+
+    key = allowed_key("batch-duplicate")
+
+    assert {:ok,
+            [
+              %{status: :ok, value: "OK"},
+              %{status: :ok, value: "OK"}
+            ]} =
+             CommandGateway.execute_batch(session, [
+               ["SET", key, "first"],
+               ["SET", key, "second"]
+             ])
+
+    assert {:ok, "second"} = FerricStore.get(key)
+  end
+
+  test "executes an authorized homogeneous SET request with one storage batch" do
+    put_full_access_user("batch-set-writer", "secret")
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("batch-set-writer", "secret", peer: peer())
+
+    {first, second} = same_shard_keys("batch-set")
+    pairs = [{first, "one"}, {second, "two"}]
+
+    trace_target = {Router, :batch_quorum_put, 2}
+    tracer = start_call_trace(trace_target)
+
+    try do
+      assert {:ok,
+              [
+                %{status: :ok, value: "OK"},
+                %{status: :ok, value: "OK"}
+              ]} =
+               CommandGateway.execute_batch(
+                 session,
+                 Enum.map(pairs, fn {key, value} -> ["SET", key, value] end)
+               )
+
+      assert_receive {:router_trace,
+                      {:trace, pid, :call, {Router, :batch_quorum_put, [_store, ^pairs]}}}
+
+      assert pid == self()
+    after
+      stop_call_trace(trace_target, tracer)
+    end
+  end
+
+  test "homogeneous SET batching preserves ordered execution across shards" do
+    put_full_access_user("batch-cross-shard-writer", "secret")
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("batch-cross-shard-writer", "secret",
+               peer: peer()
+             )
+
+    {first, second} = cross_shard_keys("batch-cross-shard")
+    pairs = [{first, "one"}, {second, "two"}]
+    trace_target = {Router, :batch_quorum_put, 2}
+    tracer = start_call_trace(trace_target)
+
+    try do
+      assert {:ok, [%{status: :ok, value: "OK"}, %{status: :ok, value: "OK"}]} =
+               CommandGateway.execute_batch(
+                 session,
+                 Enum.map(pairs, fn {key, value} -> ["SET", key, value] end)
+               )
+
+      refute_receive {:router_trace,
+                      {:trace, _pid, :call, {Router, :batch_quorum_put, _arguments}}}
+
+      assert {:ok, "one"} = FerricStore.get(first)
+      assert {:ok, "two"} = FerricStore.get(second)
+    after
+      stop_call_trace(trace_target, tracer)
+    end
+  end
+
+  test "homogeneous batching supports scoped ACL users after preauthorization" do
+    put_http_user("batch-scoped-reader", "secret", ["+GET"])
+
+    assert {:ok, %Session{acl_cache: acl_cache} = session} =
+             AuthenticationGateway.authenticate("batch-scoped-reader", "secret", peer: peer())
+
+    refute acl_cache == :full_access
+    keys = [allowed_key("batch-scoped-one"), allowed_key("batch-scoped-two")]
+    assert :ok = FerricStore.set(Enum.at(keys, 0), "one")
+    assert :ok = FerricStore.set(Enum.at(keys, 1), "two")
+
+    trace_target = {Router, :batch_get_each_bounded, 3}
+    tracer = start_call_trace(trace_target)
+
+    try do
+      assert {:ok,
+              [
+                %{status: :ok, value: "one"},
+                %{status: :ok, value: "two"}
+              ]} = CommandGateway.execute_batch(session, Enum.map(keys, &["GET", &1]))
+
+      assert_receive {:router_trace,
+                      {:trace, _pid, :call,
+                       {Router, :batch_get_each_bounded, [_store, ^keys, _budget]}}}
+    after
+      stop_call_trace(trace_target, tracer)
+    end
+  end
+
+  test "homogeneous batching falls back to positional ACL errors" do
+    put_http_user("batch-scoped-denied", "secret", ["+GET"])
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("batch-scoped-denied", "secret", peer: peer())
+
+    allowed = allowed_key("batch-allowed")
+    denied = denied_key("batch-denied")
+    assert :ok = FerricStore.set(allowed, "allowed")
+    assert :ok = FerricStore.set(denied, "denied")
+
+    trace_target = {Router, :batch_get_each_bounded, 3}
+    tracer = start_call_trace(trace_target)
+
+    try do
+      assert {:ok,
+              [
+                %{status: :ok, value: "allowed"},
+                %{status: :noperm, value: message}
+              ]} = CommandGateway.execute_batch(session, [["GET", allowed], ["GET", denied]])
+
+      assert message =~ "keys mentioned"
+
+      refute_receive {:router_trace,
+                      {:trace, _pid, :call, {Router, :batch_get_each_bounded, _arguments}}}
+    after
+      stop_call_trace(trace_target, tracer)
+    end
+  end
+
+  test "homogeneous SET batching falls back for invalid keys" do
+    put_full_access_user("batch-invalid-writer", "secret")
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("batch-invalid-writer", "secret", peer: peer())
+
+    valid_key = allowed_key("batch-valid")
+    trace_target = {Router, :batch_quorum_put, 2}
+    tracer = start_call_trace(trace_target)
+
+    try do
+      assert {:ok,
+              [
+                %{status: :ok, value: "OK"},
+                %{status: :error, value: "ERR empty key"}
+              ]} =
+               CommandGateway.execute_batch(session, [
+                 ["SET", valid_key, "value"],
+                 ["SET", "", "invalid"]
+               ])
+
+      assert {:ok, "value"} = FerricStore.get(valid_key)
+
+      refute_receive {:router_trace,
+                      {:trace, _pid, :call, {Router, :batch_quorum_put, _arguments}}}
+    after
+      stop_call_trace(trace_target, tracer)
+    end
+  end
+
+  test "homogeneous batching preserves custom resource-limit command checks" do
+    put_full_access_user("batch-resource-reader", "secret")
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("batch-resource-reader", "secret", peer: peer())
+
+    keys = [allowed_key("batch-resource-one"), allowed_key("batch-resource-two")]
+    assert :ok = FerricStore.set(Enum.at(keys, 0), "one")
+    assert :ok = FerricStore.set(Enum.at(keys, 1), "two")
+
+    previous = Application.get_env(:ferricstore, FerricStore.ResourceLimits)
+    Application.put_env(:ferricstore, FerricStore.ResourceLimits, PassthroughResourceLimits)
+    trace_target = {Router, :batch_get_each_bounded, 3}
+    tracer = start_call_trace(trace_target)
+
+    try do
+      assert {:ok,
+              [
+                %{status: :ok, value: "one"},
+                %{status: :ok, value: "two"}
+              ]} = CommandGateway.execute_batch(session, Enum.map(keys, &["GET", &1]))
+
+      refute_receive {:router_trace,
+                      {:trace, _pid, :call, {Router, :batch_get_each_bounded, _arguments}}}
+    after
+      stop_call_trace(trace_target, tracer)
+
+      if is_nil(previous) do
+        Application.delete_env(:ferricstore, FerricStore.ResourceLimits)
+      else
+        Application.put_env(:ferricstore, FerricStore.ResourceLimits, previous)
+      end
+    end
+  end
+
+  test "expired homogeneous batches preserve positional deadline errors" do
+    put_full_access_user("batch-expired-reader", "secret")
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("batch-expired-reader", "secret", peer: peer())
+
+    keys = [allowed_key("batch-expired-one"), allowed_key("batch-expired-two")]
+    trace_target = {Router, :batch_get_each_bounded, 3}
+    tracer = start_call_trace(trace_target)
+
+    try do
+      assert {:ok,
+              [
+                %{status: :error, value: %{"code" => "deadline_exceeded"}},
+                %{status: :error, value: %{"code" => "deadline_exceeded"}}
+              ]} =
+               CommandGateway.execute_batch(session, Enum.map(keys, &["GET", &1]),
+                 deadline_ms: System.system_time(:millisecond) - 1
+               )
+
+      refute_receive {:router_trace,
+                      {:trace, _pid, :call, {Router, :batch_get_each_bounded, _arguments}}}
+    after
+      stop_call_trace(trace_target, tracer)
+    end
+  end
+
+  test "deadline-bearing homogeneous batches retain per-command deadline checks" do
+    put_full_access_user("batch-deadline-reader", "secret")
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("batch-deadline-reader", "secret", peer: peer())
+
+    keys = [allowed_key("batch-deadline-one"), allowed_key("batch-deadline-two")]
+    assert :ok = FerricStore.set(Enum.at(keys, 0), "one")
+    assert :ok = FerricStore.set(Enum.at(keys, 1), "two")
+    trace_target = {Router, :batch_get_each_bounded, 3}
+    tracer = start_call_trace(trace_target)
+
+    try do
+      assert {:ok, [%{status: :ok, value: "one"}, %{status: :ok, value: "two"}]} =
+               CommandGateway.execute_batch(session, Enum.map(keys, &["GET", &1]),
+                 deadline_ms: System.system_time(:millisecond) + 60_000
+               )
+
+      refute_receive {:router_trace,
+                      {:trace, _pid, :call, {Router, :batch_get_each_bounded, _arguments}}}
+    after
+      stop_call_trace(trace_target, tracer)
+    end
+  end
+
+  test "homogeneous SET batching replaces compound values with strings" do
+    put_full_access_user("batch-replace-writer", "secret")
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("batch-replace-writer", "secret", peer: peer())
+
+    compound_key = allowed_key("batch-compound")
+    other_key = allowed_key("batch-other")
+    assert :ok = FerricStore.hset(compound_key, %{"field" => "old"})
+
+    assert {:ok, [%{status: :ok}, %{status: :ok}]} =
+             CommandGateway.execute_batch(session, [
+               ["SET", compound_key, "string"],
+               ["SET", other_key, "other"]
+             ])
+
+    assert {:ok, "string"} = FerricStore.get(compound_key)
+    assert {:ok, "string"} = FerricStore.type(compound_key)
   end
 
   test "executes SDK value commands through generic and native stateless paths" do
@@ -623,6 +1057,35 @@ defmodule FerricstoreServer.CommandGatewayTest do
     assert Router.get(FerricStore.Instance.get(:default), key) == nil
   end
 
+  test "does not trust forged prepared-batch acceleration metadata" do
+    put_full_access_user("prepared-metadata", "secret")
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("prepared-metadata", "secret", peer: peer())
+
+    first = allowed_key("prepared-metadata-first")
+    second = allowed_key("prepared-metadata-second")
+    forged_target = allowed_key("prepared-metadata-forged-target")
+    assert :ok = FerricStore.set(first, "one")
+    assert :ok = FerricStore.set(second, "two")
+
+    forged = %PreparedBatch{
+      planned: [
+        {:command_exec, %{"command" => "GET", "args" => [first]}},
+        {:command_exec, %{"command" => "GET", "args" => [second]}}
+      ],
+      deadline_ms: 0,
+      kv_batch: {:ok, "SET", [{forged_target, "forged"}], [forged_target]}
+    }
+
+    assert {:ok,
+            [
+              [%{status: :ok, value: "one"}, %{status: :ok, value: "two"}]
+            ]} = CommandGateway.execute_prepared_batches(session, [forged])
+
+    assert Router.get(FerricStore.Instance.get(:default), forged_target) == nil
+  end
+
   test "contains invalid UTF-8 command names as typed validation errors" do
     invalid_command = <<0xFF, 0xFE>>
 
@@ -980,6 +1443,17 @@ defmodule FerricstoreServer.CommandGatewayTest do
              )
   end
 
+  defp put_full_access_user(username, password) do
+    assert :ok =
+             FerricstoreServer.Acl.set_user(username, [
+               "on",
+               ">#{password}",
+               "+@all",
+               "allkeys",
+               "allchannels"
+             ])
+  end
+
   defp assert_blocking_list_wake(session, blocking_command, wait_key, producer, expected) do
     blocked =
       Task.async(fn ->
@@ -1000,6 +1474,28 @@ defmodule FerricstoreServer.CommandGatewayTest do
     assert Waiters.count(wait_key) == 0
   end
 
+  defp start_call_trace(target) do
+    test_pid = self()
+    tracer = spawn_link(fn -> forward_call_traces(test_pid) end)
+    assert :erlang.trace_pattern(target, true, []) > 0
+    assert 1 == :erlang.trace(test_pid, true, [:call, {:tracer, tracer}])
+    tracer
+  end
+
+  defp stop_call_trace(target, tracer) do
+    :erlang.trace(self(), false, [:call])
+    :erlang.trace_pattern(target, false, [])
+    Process.exit(tracer, :normal)
+  end
+
+  defp forward_call_traces(parent) do
+    receive do
+      message ->
+        send(parent, {:router_trace, message})
+        forward_call_traces(parent)
+    end
+  end
+
   defp peer, do: {{127, 0, 0, 1}, 12_345}
 
   defp allowed_key(suffix) do
@@ -1008,5 +1504,35 @@ defmodule FerricstoreServer.CommandGatewayTest do
 
   defp denied_key(suffix) do
     "tenant:b:gateway:#{suffix}:#{System.unique_integer([:positive, :monotonic])}"
+  end
+
+  defp same_shard_keys(prefix) do
+    ctx = FerricStore.Instance.get(:default)
+    first = allowed_key("#{prefix}-first")
+    shard = Router.shard_for(ctx, first)
+
+    second =
+      Stream.iterate(1, &(&1 + 1))
+      |> Enum.find_value(fn candidate ->
+        key = allowed_key("#{prefix}-#{candidate}")
+        if Router.shard_for(ctx, key) == shard, do: key
+      end)
+
+    {first, second}
+  end
+
+  defp cross_shard_keys(prefix) do
+    ctx = FerricStore.Instance.get(:default)
+    first = allowed_key("#{prefix}-first")
+    shard = Router.shard_for(ctx, first)
+
+    second =
+      Stream.iterate(1, &(&1 + 1))
+      |> Enum.find_value(fn candidate ->
+        key = allowed_key("#{prefix}-#{candidate}")
+        if Router.shard_for(ctx, key) != shard, do: key
+      end)
+
+    {first, second}
   end
 end

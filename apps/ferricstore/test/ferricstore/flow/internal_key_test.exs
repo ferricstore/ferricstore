@@ -139,6 +139,34 @@ defmodule Ferricstore.Flow.InternalKeyTest do
     assert Keys.shared_value_ref?(named_ref)
   end
 
+  test "pre-encoded due keys are byte-identical to canonical due keys" do
+    cases = [
+      {"checkout", "queued", 0, nil},
+      {"type:with:delimiters", "state/with bytes", 2, "tenant-a"},
+      {<<0, 255, ?:>>, <<1, 254, ?/>>, 1, "__flow_auto__:17"}
+    ]
+
+    Enum.each(cases, fn {type, state, priority, partition_key} ->
+      canonical = Keys.due_key(type, state, priority, partition_key)
+      encoded_type = Keys.index_component(type)
+      encoded_state = Keys.index_component(state)
+
+      assert Keys.due_key_from_index_components(
+               encoded_type,
+               encoded_state,
+               priority,
+               partition_key
+             ) == canonical
+
+      assert Keys.due_key_from_tag_and_index_components(
+               Keys.tag(partition_key),
+               encoded_type,
+               encoded_state,
+               priority
+             ) == canonical
+    end)
+  end
+
   test "auto partition bucket names must be canonical" do
     assert Keys.auto_partition_key?("__flow_auto__:0")
     assert Keys.auto_partition_key?("__flow_auto__:255")

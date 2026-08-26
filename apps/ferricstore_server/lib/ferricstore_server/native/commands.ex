@@ -6893,7 +6893,7 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp native_get_result(get_fun, state) when is_function(get_fun, 1) do
     limit = native_max_response_bytes(state)
-    value_budget = native_get_value_budget(limit)
+    value_budget = single_value_budget(state)
 
     case get_fun.(value_budget) do
       {:ok, value} ->
@@ -6913,6 +6913,14 @@ defmodule FerricstoreServer.Native.Commands do
     do: max(limit - 7, 0)
 
   defp native_get_value_budget(_unbounded), do: :unlimited
+
+  @doc false
+  @spec single_value_budget(map()) :: non_neg_integer() | :unlimited
+  def single_value_budget(state) when is_map(state) do
+    state
+    |> native_max_response_bytes()
+    |> native_get_value_budget()
+  end
 
   defp native_get_value_fits?(_value, limit) when not is_integer(limit) or limit <= 0, do: true
   defp native_get_value_fits?(nil, limit), do: limit >= 3

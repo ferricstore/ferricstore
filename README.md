@@ -32,7 +32,7 @@ Run one development node:
 docker run -p 6388:6388 -p 6380:6380 -p 6381:6381 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
-  quay.io/ferricstore/ferricstore:0.11.11
+  quay.io/ferricstore/ferricstore:0.11.12
 ```
 
 Published SDKs connect to `ferric://127.0.0.1:6388`. The operations dashboard
@@ -54,7 +54,7 @@ protected mode enabled, bootstrap the first durable ACL user at
 The FQL1 query planner, schedules, governance primitives, and operations
 dashboard are included in this OSS repository and release image.
 
-| Area | Included in FerricStore OSS `0.11.11` |
+| Area | Included in FerricStore OSS `0.11.12` |
 | --- | --- |
 | Durable KV and data structures | Strings, hashes with field TTL, lists, sets, sorted sets, streams and consumer groups, Pub/Sub, transactions, blocking reads, bitmaps, HyperLogLog, GEO, Bloom and Cuckoo filters, Count-Min Sketch, TopK, and TDigest. |
 | FerricStore-native helpers | Compare-and-swap, fenced distributed locks, fixed-window rate limiting, cache-aside/stampede protection, key diagnostics, quotas, and cluster inspection. |
@@ -91,7 +91,7 @@ dashboard are included in this OSS repository and release image.
 ## Interfaces And Published SDKs
 
 The published SDKs use the same Ferric native protocol. Their current release
-lines are compatibility-tested against the OSS server at version `0.11.11`:
+lines are compatibility-tested against the OSS server at version `0.11.12`:
 
 | Interface | Package or module | Source |
 | --- | --- | --- |
@@ -99,14 +99,14 @@ lines are compatibility-tested against the OSS server at version `0.11.11`:
 | Go | [`github.com/ferricstore/ferricstore-go`](https://pkg.go.dev/github.com/ferricstore/ferricstore-go) | [`ferricstore/ferricstore-go`](https://github.com/ferricstore/ferricstore-go) |
 | Elixir native client | [`ferricstore_sdk`](https://hex.pm/packages/ferricstore_sdk) | [`ferricstore/ferricstore-elixir`](https://github.com/ferricstore/ferricstore-elixir) |
 | TypeScript / Node.js | [`@ferricstore/ferricstore`](https://www.npmjs.com/package/@ferricstore/ferricstore) | [`ferricstore/ferricstore-typescript`](https://github.com/ferricstore/ferricstore-typescript) |
+| Java 17+ | [`io.github.ferricstore:ferricstore-java`](https://central.sonatype.com/artifact/io.github.ferricstore/ferricstore-java) | [`ferricstore/ferricstore-java`](https://github.com/ferricstore/ferricstore-java) |
 | HTTP/HTTPS API | `/v1/commands`, `/v1/invocations`, and scoped values | This repository |
 | Embedded Elixir server API | [`ferricstore`](https://hex.pm/packages/ferricstore) | This repository |
 | Local operational CLI | `mix ferricstore.*` tasks | This repository |
 
-All four native SDK release lines retain FerricStore `0.11.4` as their
+All five native SDK release lines retain FerricStore `0.11.4` as their
 minimum server version and negotiate the Stream mode-34 producer fast path when
 the server advertises it. Native wire protocol v1 is unchanged.
-No Java SDK is currently published.
 
 ## Beta Status
 
@@ -564,7 +564,7 @@ FerricStore can also run inside an Elixir application.
 
 ```elixir
 # mix.exs
-{:ferricstore, "~> 0.11.11"}
+{:ferricstore, "~> 0.11.12"}
 ```
 
 ```elixir

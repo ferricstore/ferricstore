@@ -63,6 +63,10 @@ jobs:
             id: elixir
             repository: ferricstore/ferricstore-elixir
             ref: v0.11.13
+          - sdk: Java
+            id: java
+            repository: ferricstore/ferricstore-java
+            ref: 75b20cdd3fb0dffdddf372bd659f71e40f8e2f3f
     steps:
       - name: Checkout official SDK
         uses: actions/checkout@v6
@@ -100,6 +104,13 @@ jobs:
           otp-version: "29"
           elixir-version: "1.20"
 
+      - name: Set up Java SDK toolchains
+        if: matrix.id == 'java'
+        uses: jdx/mise-action@v4
+        with:
+          working_directory: sdk
+          install_args: java@temurin-17 java@temurin-21 maven
+
       - name: Download current server image
         uses: actions/download-artifact@v8
         with:
@@ -108,6 +119,13 @@ jobs:
 
       - name: Load current server image
         run: docker load --input /tmp/ferricstore-sdk-image/ferricstore-sdk-image.tar
+
+      - name: Run official Java TCP and HTTP integration suites
+        if: matrix.id == 'java'
+        working-directory: sdk
+        env:
+          FERRICSTORE_CANDIDATE_IMAGE: ${{ env.FERRICSTORE_SDK_IMAGE }}
+        run: mise run integration:candidate
 
       - name: Run official Go integration suite
         if: matrix.id == 'go'

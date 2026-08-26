@@ -520,6 +520,28 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert source =~ "{__MODULE__, :flow_auto_partition_keys_for_shard, ctx.name, ctx.slot_map}"
   end
 
+  test "flow claim_due AUTO encodes invariant due-key components once per precheck" do
+    source = Ferricstore.Test.SourceFiles.router_source()
+
+    function_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_claim_due_auto_precheck_keys",
+        "{:ok, keys}"
+      )
+
+    assert function_source =~ "Keys.index_component(type)"
+    assert function_source =~ "Keys.index_component(state)"
+    assert function_source =~ "Keys.tag(partition_key)"
+    assert function_source =~ "Keys.due_key_from_tag_and_index_components"
+
+    refute function_source =~ "Keys.due_key(type, state",
+           "type and state are invariant across priority and partition loops and must not be encoded for every generated key"
+
+    refute function_source =~ "Keys.due_key_from_index_components",
+           "automatic partition tags are invariant across states and priorities and must not be parsed for every generated key"
+  end
+
   test "flow claim_due reclaim precheck does not scan cold due rows for running leases" do
     source = Ferricstore.Test.SourceFiles.router_source()
 
@@ -546,6 +568,47 @@ defmodule Ferricstore.FlowWriteContractTest do
 
     assert function_source =~ "cold_due_state_bucket_prefix"
     refute function_source =~ "flow_auto_partition_keys_for_shard"
+  end
+
+  test "flow claim_due AUTO cold precheck does not repeat the same LMDB probe per priority" do
+    source = Ferricstore.Test.SourceFiles.router_source()
+
+    dispatch_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_claim_due_cold_precheck_present_by_partition?",
+        ":auto"
+      )
+
+    assert dispatch_source =~ "flow_claim_due_auto_cold_precheck_present?"
+
+    auto_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_claim_due_auto_cold_precheck_present?",
+        "Enum.any?(buckets"
+      )
+
+    assert auto_source =~ "Enum.any?(states"
+    assert auto_source =~ "Enum.any?(buckets"
+
+    refute auto_source =~ "priorities",
+           "the AUTO cold prefix is priority-independent; probing it once per priority repeats identical LMDB reads"
+  end
+
+  test "flow claim_due cold precheck avoids repeated directory syscalls for initialized shards" do
+    source = Ferricstore.Test.SourceFiles.router_source()
+
+    [function_source] =
+      Regex.run(
+        ~r/defp flow_claim_due_cold_precheck_partition_present\?\(.*?defp flow_claim_due_empty_precheck_allowed\?/ms,
+        source
+      )
+
+    assert function_source =~ "LMDB.prefix_entries_initialized"
+
+    refute function_source =~ "LMDB.prefix_entries(path",
+           "Flow shard startup initializes every LMDB directory; checking it again for every empty claim adds one filesystem syscall per cold-prefix probe"
   end
 
   test "flow claim_due fast index path avoids generic per-plan tuple dispatch" do

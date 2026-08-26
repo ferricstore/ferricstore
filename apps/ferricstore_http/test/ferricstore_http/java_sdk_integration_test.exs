@@ -7,6 +7,13 @@ defmodule FerricstoreHttp.JavaSdkIntegrationTest do
   alias FerricstoreServer.Acl.CatalogProjector
 
   test "real Java 17 SDK exercises the complete HTTP command suite through HTTPS" do
+    previous_max_attempts = Application.get_env(:ferricstore, :auth_rate_limit_max_attempts)
+    Application.put_env(:ferricstore, :auth_rate_limit_max_attempts, 100_000)
+
+    on_exit(fn ->
+      restore_env(:auth_rate_limit_max_attempts, previous_max_attempts)
+    end)
+
     java_sdk_path = System.fetch_env!("FERRICSTORE_JAVA_SDK_PATH")
 
     maven =
@@ -49,7 +56,7 @@ defmodule FerricstoreHttp.JavaSdkIntegrationTest do
           "-B",
           "-pl",
           "ferricstore-java",
-          "-Dtest=FerricStoreIntegrationTest",
+          "-Dtest=FerricStoreIntegrationTest,FerricStoreConcurrencyIntegrationTest",
           "test"
         ],
         cd: java_sdk_path,
@@ -66,5 +73,9 @@ defmodule FerricstoreHttp.JavaSdkIntegrationTest do
     assert status == 0, output
     assert output =~ "BUILD SUCCESS"
     assert output =~ "FerricStoreIntegrationTest"
+    assert output =~ "FerricStoreConcurrencyIntegrationTest"
   end
+
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 end
