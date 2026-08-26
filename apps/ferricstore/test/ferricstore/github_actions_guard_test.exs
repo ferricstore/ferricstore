@@ -224,13 +224,18 @@ defmodule Ferricstore.GitHubActionsGuardTest do
              "repository: ferricstore/ferricstore-typescript\n            ref: 87d84c4e0631952ca4438f0cfb0e93b267830d6d"
 
     assert workflow =~ "repository: ferricstore/ferricstore-elixir\n            ref: v0.11.13"
+
+    assert workflow =~
+             "repository: ferricstore/ferricstore-java\n            ref: 6aa176e790d54fe2702869be2eaf3d5a0fc966cc"
+
     refute workflow =~ "ref: v0.11.6"
 
     for repository <- [
           "ferricstore/ferricstore-go",
           "ferricstore/ferricstore-python",
           "ferricstore/ferricstore-typescript",
-          "ferricstore/ferricstore-elixir"
+          "ferricstore/ferricstore-elixir",
+          "ferricstore/ferricstore-java"
         ] do
       assert workflow =~ "repository: #{repository}"
     end
@@ -245,7 +250,14 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     assert workflow =~ ~s|--url "$FERRICSTORE_AUTH_URL"|
     assert workflow =~ "mix test --only integration"
     assert workflow =~ "mix run bench/kv_benchmark.exs"
+    assert workflow =~ "jdx/mise-action@v4"
+    assert workflow =~ "mise run integration:candidate"
     refute workflow =~ "continue-on-error: true"
+
+    test_workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
+
+    assert test_workflow =~
+             "repository: ferricstore/ferricstore-java\n          ref: 6aa176e790d54fe2702869be2eaf3d5a0fc966cc"
   end
 
   test "container workflows publish only to the official Quay.io repository" do

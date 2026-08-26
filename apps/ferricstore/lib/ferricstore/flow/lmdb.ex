@@ -334,6 +334,12 @@ defmodule Ferricstore.Flow.LMDB do
       else: {:ok, []}
   end
 
+  @doc false
+  def prefix_entries_initialized(path, prefix, limit)
+      when is_binary(path) and is_binary(prefix) and is_integer(limit) and limit >= 0 do
+    prefix_entries(path, prefix, limit)
+  end
+
   def prefix_entries_after(path, prefix, after_key, limit)
       when is_binary(path) and is_binary(prefix) and is_binary(after_key) and
              is_integer(limit) and limit >= 0 do

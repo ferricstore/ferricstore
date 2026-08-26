@@ -21,8 +21,11 @@ defmodule FerricstoreServer.CommandGateway do
 
   alias FerricstoreServer.AuthenticationGateway
   alias FerricstoreServer.AuthenticationGateway.Session
+  alias FerricstoreServer.Connection.Auth, as: ConnectionAuth
   alias FerricstoreServer.Native.{Blocking, Commands, ResourceBudget}
   alias FerricstoreServer.Native.Session, as: NativeSession
+  alias Ferricstore.Flow.InternalKey
+  alias Ferricstore.Store.{Router, StringRead}
 
   defmodule NativeCommand do
     @moduledoc """
@@ -47,14 +50,15 @@ defmodule FerricstoreServer.CommandGateway do
     @moduledoc false
 
     @enforce_keys [:planned, :deadline_ms]
-    defstruct @enforce_keys
+    defstruct @enforce_keys ++ [kv_batch: :fallback]
 
     @type planned_command ::
             {:command_exec, map()} | {:blocking, map()} | {:native, non_neg_integer(), map()}
 
     @opaque t :: %__MODULE__{
               planned: [planned_command()],
-              deadline_ms: non_neg_integer()
+              deadline_ms: non_neg_integer(),
+              kv_batch: :fallback | {:ok, binary(), list(), [binary()]}
             }
   end
 
@@ -116,8 +120,8 @@ defmodule FerricstoreServer.CommandGateway do
     with {:ok, max_commands} <- max_commands(opts),
          :ok <- check_batch_size(commands, max_commands),
          {:ok, deadline_ms} <- deadline_ms(opts),
-         {:ok, planned} <- plan(commands) do
-      {:ok, %PreparedBatch{planned: planned, deadline_ms: deadline_ms}}
+         {:ok, planned, kv_batch} <- plan(commands) do
+      {:ok, %PreparedBatch{planned: planned, deadline_ms: deadline_ms, kv_batch: kv_batch}}
     end
   end
 
@@ -163,9 +167,9 @@ defmodule FerricstoreServer.CommandGateway do
   def execute_prepared_batches(%Session{} = session, batches, opts)
       when is_list(batches) and is_list(opts) do
     with {:ok, session} <- AuthenticationGateway.validate(session),
-         :ok <- validate_prepared_batches(batches),
-         :ok <- validate_combined_request_shape(batches) do
-      execute_prepared_batches_validated(session, batches, opts)
+         {:ok, validated_batches} <- validate_prepared_batches(batches),
+         :ok <- validate_combined_request_shape(validated_batches) do
+      execute_prepared_batches_validated(session, validated_batches, opts)
     end
   end
 
@@ -183,8 +187,12 @@ defmodule FerricstoreServer.CommandGateway do
         state = command_state(session, opts)
 
         {:ok,
-         Enum.map(batches, fn %PreparedBatch{planned: planned, deadline_ms: deadline_ms} ->
-           execute_planned(planned, state, deadline_ms)
+         Enum.map(batches, fn %PreparedBatch{
+                                planned: planned,
+                                deadline_ms: deadline_ms,
+                                kv_batch: kv_batch
+                              } ->
+           execute_planned(planned, kv_batch, state, deadline_ms)
          end)}
       after
         ResourceBudget.release_scoped(token)
@@ -193,19 +201,29 @@ defmodule FerricstoreServer.CommandGateway do
   end
 
   defp validate_prepared_batches(batches) do
-    if Enum.all?(batches, &valid_prepared_batch?/1) do
-      :ok
-    else
-      {:error, {:invalid_batch, "prepared batches are invalid"}}
+    batches
+    |> Enum.reduce_while({:ok, []}, fn batch, {:ok, validated} ->
+      case validate_prepared_batch(batch) do
+        {:ok, batch} -> {:cont, {:ok, [batch | validated]}}
+        :error -> {:halt, :error}
+      end
+    end)
+    |> case do
+      {:ok, validated} -> {:ok, Enum.reverse(validated)}
+      :error -> {:error, {:invalid_batch, "prepared batches are invalid"}}
     end
   end
 
-  defp valid_prepared_batch?(%PreparedBatch{planned: planned, deadline_ms: deadline_ms})
+  defp validate_prepared_batch(%PreparedBatch{planned: planned, deadline_ms: deadline_ms} = batch)
        when is_list(planned) and is_integer(deadline_ms) and deadline_ms >= 0 do
-    Enum.all?(planned, &valid_planned_command?/1)
+    if Enum.all?(planned, &valid_planned_command?/1) do
+      {:ok, %{batch | kv_batch: homogeneous_kv_batch(planned)}}
+    else
+      :error
+    end
   end
 
-  defp valid_prepared_batch?(_invalid), do: false
+  defp validate_prepared_batch(_invalid), do: :error
 
   defp valid_planned_command?({:command_exec, %{"command" => command, "args" => args} = payload})
        when is_binary(command) and is_list(args) and map_size(payload) == 2 do
@@ -239,15 +257,17 @@ defmodule FerricstoreServer.CommandGateway do
   defp plan(commands) do
     commands
     |> Enum.with_index()
-    |> Enum.reduce_while({:ok, []}, fn
-      {%NativeCommand{name: command, opcode: opcode, payload: payload}, index}, {:ok, planned} ->
+    |> Enum.reduce_while({:ok, [], :empty}, fn
+      {%NativeCommand{name: command, opcode: opcode, payload: payload}, index},
+      {:ok, planned, _kv_batch} ->
         if structured_native_command?(command, opcode) do
-          {:cont, {:ok, [{:native, opcode, payload} | planned]}}
+          {:cont, {:ok, [{:native, opcode, payload} | planned], :fallback}}
         else
           {:halt, {:error, {:malformed_command, index}}}
         end
 
-      {[command | args], index}, {:ok, planned} when is_binary(command) and is_list(args) ->
+      {[command | args], index}, {:ok, planned, kv_batch}
+      when is_binary(command) and is_list(args) ->
         case normalize_command(command) do
           {:ok, normalized} ->
             cond do
@@ -255,31 +275,70 @@ defmodule FerricstoreServer.CommandGateway do
                 {:halt, {:error, {:unsupported_command, index, normalized}}}
 
               Blocking.blocking_command?(normalized) ->
-                payload = %{"command" => command, "args" => args}
-                {:cont, {:ok, [{:blocking, payload} | planned]}}
+                payload = %{"command" => normalized, "args" => args}
+                {:cont, {:ok, [{:blocking, payload} | planned], :fallback}}
 
               true ->
-                payload = %{"command" => command, "args" => args}
-                {:cont, {:ok, [{:command_exec, payload} | planned]}}
+                payload = %{"command" => normalized, "args" => args}
+                kv_batch = collect_kv_batch_candidate(kv_batch, normalized, args)
+                {:cont, {:ok, [{:command_exec, payload} | planned], kv_batch}}
             end
 
           :error ->
             {:halt, {:error, {:malformed_command, index}}}
         end
 
-      {_malformed, index}, {:ok, _planned} ->
+      {_malformed, index}, {:ok, _planned, _kv_batch} ->
         {:halt, {:error, {:malformed_command, index}}}
     end)
     |> case do
-      {:ok, planned} ->
-        {:ok, Enum.reverse(planned)}
+      {:ok, planned, kv_batch} ->
+        {:ok, Enum.reverse(planned), finalize_kv_batch_candidate(kv_batch)}
 
       {:error, _reason} = error ->
         error
     end
   end
 
-  defp execute_planned(planned, state, deadline_ms) do
+  defp collect_kv_batch_candidate(:fallback, _command, _args), do: :fallback
+
+  defp collect_kv_batch_candidate(candidate, "GET", [key]) when is_binary(key) do
+    case candidate do
+      :empty -> {:get, [key]}
+      {:get, keys} -> {:get, [key | keys]}
+      _other -> :fallback
+    end
+  end
+
+  defp collect_kv_batch_candidate(candidate, "SET", [key, value])
+       when is_binary(key) and is_binary(value) do
+    case candidate do
+      :empty -> {:set, [{key, value}], [key]}
+      {:set, pairs, keys} -> {:set, [{key, value} | pairs], [key | keys]}
+      _other -> :fallback
+    end
+  end
+
+  defp collect_kv_batch_candidate(_candidate, _command, _args), do: :fallback
+
+  defp finalize_kv_batch_candidate({:get, [_second, _first | _rest] = keys}) do
+    keys = Enum.reverse(keys)
+    {:ok, "GET", keys, keys}
+  end
+
+  defp finalize_kv_batch_candidate({:set, [_second, _first | _rest] = pairs, keys}),
+    do: {:ok, "SET", Enum.reverse(pairs), Enum.reverse(keys)}
+
+  defp finalize_kv_batch_candidate(_ineligible), do: :fallback
+
+  defp execute_planned(planned, kv_batch, state, deadline_ms) do
+    case execute_homogeneous_kv_batch(kv_batch, state, deadline_ms) do
+      {:ok, results} -> results
+      :fallback -> execute_planned_individually(planned, state, deadline_ms)
+    end
+  end
+
+  defp execute_planned_individually(planned, state, deadline_ms) do
     Enum.map(planned, fn
       {:command_exec, payload} ->
         payload = add_deadline(payload, deadline_ms)
@@ -295,6 +354,137 @@ defmodule FerricstoreServer.CommandGateway do
         %{status: status, value: value}
     end)
   end
+
+  defp execute_homogeneous_kv_batch(
+         {:ok, command, items, keys},
+         state,
+         deadline_ms
+       ) do
+    with 0 <- deadline_ms,
+         true <- FerricStore.ResourceLimits.default_implementation?(),
+         true <- valid_batch_keys?(keys),
+         true <- homogeneous_batch_order_safe?(command, state.instance_ctx, keys),
+         :ok <- authorize_homogeneous_batch(state.acl_cache, command, keys),
+         false <- deadline_expired?(deadline_ms) do
+      execute_homogeneous_kv_batch(command, items, keys, state)
+    else
+      _not_safe_or_eligible -> :fallback
+    end
+  end
+
+  defp execute_homogeneous_kv_batch(_ineligible, _state, _deadline_ms), do: :fallback
+
+  defp execute_homogeneous_kv_batch("GET", _items, keys, state) do
+    case batch_get_with_individual_budgets(state.instance_ctx, keys, state) do
+      {:ok, values} ->
+        results =
+          state.instance_ctx
+          |> StringRead.batch_results(keys, values)
+          |> Enum.map(&gateway_result/1)
+
+        {:ok, results}
+
+      _limit_or_storage_failure ->
+        :fallback
+    end
+  end
+
+  defp execute_homogeneous_kv_batch("SET", pairs, _keys, state) do
+    results =
+      state.instance_ctx
+      |> Router.batch_quorum_put(pairs)
+      |> Enum.map(&gateway_result/1)
+
+    {:ok, results}
+  end
+
+  defp homogeneous_kv_batch(planned) do
+    case planned do
+      [{:command_exec, %{"command" => "GET", "args" => [_key]}} | _rest] ->
+        collect_homogeneous_get_batch(planned, [])
+
+      [{:command_exec, %{"command" => "SET", "args" => [_key, _value]}} | _rest] ->
+        collect_homogeneous_set_batch(planned, [], [])
+
+      _other ->
+        :fallback
+    end
+  end
+
+  defp collect_homogeneous_get_batch([], [_second, _first | _rest] = keys) do
+    keys = Enum.reverse(keys)
+    {:ok, "GET", keys, keys}
+  end
+
+  defp collect_homogeneous_get_batch([], _too_short), do: :fallback
+
+  defp collect_homogeneous_get_batch(
+         [{:command_exec, %{"command" => "GET", "args" => [key]}} | rest],
+         keys
+       )
+       when is_binary(key) do
+    collect_homogeneous_get_batch(rest, [key | keys])
+  end
+
+  defp collect_homogeneous_get_batch(_planned, _keys), do: :fallback
+
+  defp collect_homogeneous_set_batch([], [_second, _first | _rest] = pairs, keys),
+    do: {:ok, "SET", Enum.reverse(pairs), Enum.reverse(keys)}
+
+  defp collect_homogeneous_set_batch([], _too_short, _keys), do: :fallback
+
+  defp collect_homogeneous_set_batch(
+         [{:command_exec, %{"command" => "SET", "args" => [key, value]}} | rest],
+         pairs,
+         keys
+       )
+       when is_binary(key) and is_binary(value) do
+    collect_homogeneous_set_batch(rest, [{key, value} | pairs], [key | keys])
+  end
+
+  defp collect_homogeneous_set_batch(_planned, _pairs, _keys), do: :fallback
+
+  defp valid_batch_keys?(keys) do
+    max_key_size = Router.max_key_size()
+    Enum.all?(keys, &(byte_size(&1) in 1..max_key_size))
+  end
+
+  defp homogeneous_batch_order_safe?("GET", _ctx, _keys), do: true
+
+  defp homogeneous_batch_order_safe?("SET", ctx, [first | rest]) do
+    shard = Router.shard_for(ctx, first)
+    Enum.all?(rest, &(Router.shard_for(ctx, &1) == shard))
+  end
+
+  defp homogeneous_batch_order_safe?(_command, _ctx, _keys), do: false
+
+  defp authorize_homogeneous_batch(acl_cache, command, keys) do
+    with :ok <- ConnectionAuth.check_command_cached(acl_cache, command),
+         :ok <- ConnectionAuth.check_keys_cached(acl_cache, command, keys) do
+      InternalKey.authorize_public(keys)
+    end
+  end
+
+  defp batch_get_with_individual_budgets(ctx, keys, state) do
+    case Commands.single_value_budget(state) do
+      :unlimited -> {:ok, Router.batch_get(ctx, keys)}
+      budget -> Router.batch_get_each_bounded(ctx, keys, budget)
+    end
+  end
+
+  defp gateway_result(:ok), do: %{status: :ok, value: "OK"}
+  defp gateway_result({:ok, :ok}), do: %{status: :ok, value: "OK"}
+  defp gateway_result({:ok, value}), do: %{status: :ok, value: value}
+
+  defp gateway_result({:error, reason}) when is_binary(reason) do
+    status = if String.starts_with?(reason, ["BUSY", "OOM"]), do: :busy, else: :error
+    %{status: status, value: reason}
+  end
+
+  defp gateway_result({:error, reason}),
+    do: %{status: :error, value: inspect(reason)}
+
+  defp gateway_result(value), do: %{status: :ok, value: value}
 
   defp add_deadline(payload, deadline_ms) do
     payload =

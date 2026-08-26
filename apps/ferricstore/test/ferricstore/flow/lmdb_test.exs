@@ -22,6 +22,35 @@ defmodule Ferricstore.Flow.LMDBUnitTest do
     assert LMDB.__normalize_flush_marker_read_for_test__(:invalid)
   end
 
+  test "initialized prefix scans preserve the safe prefix result" do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lmdb_initialized_prefix_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    assert :ok = LMDB.write_batch(path, [{:put, "flow:1", "one"}, {:put, "other:1", "two"}])
+
+    assert LMDB.prefix_entries_initialized(path, "flow:", 1) ==
+             LMDB.prefix_entries(path, "flow:", 1)
+  end
+
+  test "initialized prefix scans do not create a missing LMDB environment" do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lmdb_missing_initialized_prefix_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    refute File.exists?(path)
+    assert {:ok, []} = LMDB.prefix_entries_initialized(path, "flow:", 1)
+    refute File.exists?(path)
+  end
+
   test "active reverse delete planning preserves corruption and read failures" do
     state_key = "state-key"
     reverse_key = LMDB.active_by_state_key_key(state_key)

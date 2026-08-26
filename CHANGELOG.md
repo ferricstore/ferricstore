@@ -4,6 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.12 - 2026-08-26
+
+- Accelerated eligible homogeneous command-gateway GET batches and ordered
+  same-shard SET batches while retaining ACL, internal-key, resource-limit,
+  response-limit, deadline, and positional error semantics.
+- Reduced FerricFlow query and write-path allocation and LMDB lookup overhead
+  without allowing read-side storage creation.
+- Added Java SDK compatibility coverage for native TCP/TLS and authenticated
+  HTTP/HTTPS on Java 17 and Java 21.
+
 ## 0.11.11 - 2026-08-23
 
 - Added the HTTP/HTTPS command and invocation application to the OSS umbrella

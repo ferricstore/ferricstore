@@ -15,7 +15,7 @@ defmodule FerricstoreHttp.FargateContractTest do
     assert stack.main =~ ~s(dynamic "load_balancer")
     assert stack.outputs =~ ~s(output "http_endpoint")
     assert stack.outputs =~ ~s(output "http_readiness_endpoint")
-    assert stack.variables =~ "quay.io/ferricstore/ferricstore:0.11.11"
+    assert stack.variables =~ "quay.io/ferricstore/ferricstore:0.11.12"
   end
 
   test "cluster Fargate follows stable slots and guards HTTP target-group changes" do

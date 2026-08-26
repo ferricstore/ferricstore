@@ -674,7 +674,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: ferricstore/ferricstore-java
-          ref: de27fefb91f463c5c17f4b0909bd1280a82eb187
+          ref: 6aa176e790d54fe2702869be2eaf3d5a0fc966cc
           path: ferricstore-java
       - uses: erlef/setup-beam@v1
         with:
