@@ -221,7 +221,7 @@ defmodule Ferricstore.GitHubActionsGuardTest do
              "repository: ferricstore/ferricstore-python\n            ref: d4012267b18049ef8581cdaab79a7b50b9c8f5cd"
 
     assert workflow =~
-             "repository: ferricstore/ferricstore-typescript\n            ref: 87d84c4e0631952ca4438f0cfb0e93b267830d6d"
+             "repository: ferricstore/ferricstore-typescript\n            ref: e016d2440145dbb265fddb384fdbcf7b479e66a5"
 
     assert workflow =~ "repository: ferricstore/ferricstore-elixir\n            ref: v0.11.13"
 
