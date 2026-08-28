@@ -64,7 +64,7 @@ FerricStore `0.11.11` and later include the HTTP command API. It remains
 disabled unless you opt in:
 
 ```hcl
-container_image    = "quay.io/ferricstore/ferricstore:0.11.12"
+container_image    = "quay.io/ferricstore/ferricstore:0.11.13"
 http_enabled       = true
 http_listener_port = 8080
 ```
