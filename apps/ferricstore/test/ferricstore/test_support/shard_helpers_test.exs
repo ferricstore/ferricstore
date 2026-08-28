@@ -151,7 +151,13 @@ defmodule Ferricstore.Test.ShardHelpersTest do
     :persistent_term.put(instance_key, updated_ctx)
 
     on_exit(fn ->
-      :persistent_term.put(instance_key, original_ctx)
+      current_ctx = FerricStore.Instance.get(:default)
+
+      :persistent_term.put(
+        instance_key,
+        %{current_ctx | flow_lmdb_mirror_degraded: original_ctx.flow_lmdb_mirror_degraded}
+      )
+
       ShardHelpers.flush_all_keys()
     end)
 
@@ -256,6 +262,23 @@ defmodule Ferricstore.Test.ShardHelpersTest do
 
     assert WARaftBackend.context!(:ferricstore_waraft_backend).apply_context.promotion_threshold ==
              1
+  end
+
+  test "restore_default_apply_context preserves callbacks changed after the snapshot" do
+    original_callback = FerricStore.Instance.get(:default).connected_clients_fn
+
+    snapshot =
+      ShardHelpers.replace_default_apply_context(promotion_threshold: 1)
+
+    test_callback = fn -> 73 end
+    FerricStore.Instance.inject_callbacks(:default, connected_clients_fn: test_callback)
+
+    try do
+      assert :ok = ShardHelpers.restore_default_apply_context(snapshot)
+      assert FerricStore.Instance.get(:default).connected_clients_fn.() == 73
+    after
+      FerricStore.Instance.inject_callbacks(:default, connected_clients_fn: original_callback)
+    end
   end
 
   test "restore_default_waraft! replaces a stopped foreign backend" do

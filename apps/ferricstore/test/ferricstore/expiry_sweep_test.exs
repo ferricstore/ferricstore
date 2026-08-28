@@ -18,7 +18,6 @@ defmodule Ferricstore.ExpirySweepTest do
 
   setup do
     flush_all_keys()
-    reset_expiry_key_counts()
     :ok
   end
 
@@ -39,13 +38,9 @@ defmodule Ferricstore.ExpirySweepTest do
     Enum.each(0..3, &trigger_sweep/1)
   end
 
-  defp reset_expiry_key_counts do
+  defp expiry_key_count(shard_index) do
     ctx = FerricStore.Instance.get(:default)
-
-    Enum.each(1..ctx.shard_count, fn idx ->
-      :atomics.put(ctx.expiry_key_counts, idx, 0)
-      :atomics.put(ctx.expiry_next_due_at, idx, 0)
-    end)
+    :atomics.get(ctx.expiry_key_counts, shard_index + 1)
   end
 
   # ---------------------------------------------------------------------------
@@ -83,26 +78,25 @@ defmodule Ferricstore.ExpirySweepTest do
       ctx = FerricStore.Instance.get(:default)
       key = ukey("ttl_counter")
       shard_idx = Router.shard_for(ctx, key)
-      counter_idx = shard_idx + 1
-      before = :atomics.get(ctx.expiry_key_counts, counter_idx)
+      before = expiry_key_count(shard_idx)
 
-      assert :ok = Router.put(ctx, key, "persistent_value", 0)
-      assert :atomics.get(ctx.expiry_key_counts, counter_idx) == before
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, "persistent_value", 0)
+      assert expiry_key_count(shard_idx) == before
 
       future = System.os_time(:millisecond) + 60_000
-      assert :ok = Router.put(ctx, key, "ttl_value", future)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, "ttl_value", future)
 
       eventually(
-        fn -> :atomics.get(ctx.expiry_key_counts, counter_idx) == before + 1 end,
+        fn -> expiry_key_count(shard_idx) == before + 1 end,
         "TTL key count did not increment",
         50,
         10
       )
 
-      assert :ok = Router.put(ctx, key, "persistent_again", 0)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, "persistent_again", 0)
 
       eventually(
-        fn -> :atomics.get(ctx.expiry_key_counts, counter_idx) == before end,
+        fn -> expiry_key_count(shard_idx) == before end,
         "TTL key count did not decrement",
         50,
         10

@@ -51,8 +51,8 @@ defmodule FerricstoreServer.MixProject do
       {:ranch, "~> 2.2"},
       {:jason, "~> 1.4"},
       {:telemetry, "~> 1.4"},
-      {:rustler_precompiled, "~> 0.8"},
-      {:rustler, "~> 0.37", optional: true},
+      {:rustler_precompiled, "~> 0.9"},
+      {:rustler, "~> 0.38", optional: true},
       {:arch_test, "~> 0.3.1", only: [:dev, :test], runtime: false}
     ]
   end

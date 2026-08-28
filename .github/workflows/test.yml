@@ -87,6 +87,13 @@ jobs:
       - name: Install dependencies
         run: mix deps.get
 
+      - name: Verify dependency lock hygiene
+        run: |
+          for mix_env in dev test bench prod; do
+            MIX_ENV="$mix_env" mix deps.get --check-locked
+            MIX_ENV="$mix_env" mix deps.unlock --check-unused
+          done
+
       - name: Audit Hex dependencies
         run: |
           mix hex.audit

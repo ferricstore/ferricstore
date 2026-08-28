@@ -134,10 +134,25 @@ defmodule Ferricstore.Test.ShardHelpers do
         original_backend: original_backend
       }) do
     wait_shards_alive()
-    :persistent_term.put(instance_key, original_instance)
-    :persistent_term.put(@default_waraft_context_key, original_backend)
+    current_instance = FerricStore.Instance.get(:default)
+    current_backend = :persistent_term.get(@default_waraft_context_key)
 
-    case rollout_default_apply_context(original_instance, original_instance.apply_context) do
+    restored_instance = %{
+      current_instance
+      | apply_context: original_instance.apply_context,
+        max_value_size: original_instance.max_value_size
+    }
+
+    restored_backend = %{
+      current_backend
+      | apply_context: original_backend.apply_context,
+        max_value_size: original_backend.max_value_size
+    }
+
+    :persistent_term.put(instance_key, restored_instance)
+    :persistent_term.put(@default_waraft_context_key, restored_backend)
+
+    case rollout_default_apply_context(restored_instance, restored_instance.apply_context) do
       :ok -> :ok
       {:error, reason} -> raise "failed to restore test apply context: #{inspect(reason)}"
     end
@@ -384,6 +399,8 @@ defmodule Ferricstore.Test.ShardHelpers do
         :ok
 
       _pid ->
+        ctx = FerricStore.Instance.get(:default)
+
         try do
           :sys.resume(Ferricstore.MemoryGuard)
         catch
@@ -408,7 +425,12 @@ defmodule Ferricstore.Test.ShardHelpers do
           })
 
           :sys.replace_state(Ferricstore.MemoryGuard, fn state ->
-            %{state | last_pressure_level: :ok, keydir_pressure_level: :ok}
+            %{
+              state
+              | last_pressure_level: :ok,
+                keydir_pressure_level: :ok,
+                pressure_flags: ctx.pressure_flags
+            }
           end)
 
           Ferricstore.MemoryGuard.reset_pressure_flags()

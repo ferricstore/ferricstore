@@ -15,7 +15,12 @@ defmodule Ferricstore.InstanceCallbacksTest do
 
     on_exit(fn ->
       # Restore original Instance callbacks to prevent test pollution.
-      :persistent_term.put({FerricStore.Instance, :default}, original_ctx)
+      FerricStore.Instance.inject_callbacks(:default,
+        connected_clients_fn: original_ctx.connected_clients_fn,
+        process_rss_fn: original_ctx.process_rss_fn,
+        server_info_fn: original_ctx.server_info_fn
+      )
+
       ShardHelpers.flush_all_keys()
     end)
 

@@ -10,7 +10,7 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
   alias Ferricstore.Test.ShardHelpers
 
   setup do
-    original_ctx = FerricStore.Instance.get(:default)
+    original_process_rss_fn = FerricStore.Instance.get(:default).process_rss_fn
     ShardHelpers.flush_all_keys()
 
     FerricStore.Instance.inject_callbacks(:default, process_rss_fn: nil)
@@ -24,7 +24,11 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
     Ferricstore.MemoryGuard.reset_pressure_flags()
 
     on_exit(fn ->
-      :persistent_term.put({FerricStore.Instance, :default}, original_ctx)
+      FerricStore.Instance.inject_callbacks(
+        :default,
+        process_rss_fn: original_process_rss_fn
+      )
+
       ShardHelpers.flush_all_keys()
     end)
 
