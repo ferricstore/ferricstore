@@ -517,8 +517,6 @@ defmodule Ferricstore.Store.Router.Part05 do
       @doc false
       def flow_command_batch(ctx, keyed_commands), do: pipeline_write_batch(ctx, keyed_commands)
 
-      defp direct_batch_command_shape([]), do: :generic
-
       defp direct_batch_command_shape(keyed_commands) do
         direct_batch_command_shape(keyed_commands, :unknown, [])
       end
@@ -1061,8 +1059,6 @@ defmodule Ferricstore.Store.Router.Part05 do
         )
       end
 
-      defp waraft_batch_put_entries_status(_ctx, []), do: :ok
-
       defp waraft_batch_put_entries_status(ctx, entries) do
         buckets =
           Enum.reduce(entries, new_waraft_item_buckets(ctx.shard_count), fn entry, buckets ->
@@ -1406,13 +1402,6 @@ defmodule Ferricstore.Store.Router.Part05 do
                 {[{token, {shard_idx, count}} | tokens], status}
 
               {:direct, result} ->
-                {tokens,
-                 combine_batch_status(
-                   status,
-                   merge_waraft_hot_batch_status(ctx, shard_idx, count, result)
-                 )}
-
-              result ->
                 {tokens,
                  combine_batch_status(
                    status,

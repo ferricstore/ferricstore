@@ -671,7 +671,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
                    flow_validate_key_size(
                      FlowKeys.due_key(type, flow_state, priority, partition_key)
                    ) do
-              if flow_due_any_index_enabled?() do
+              with_flow_due_any do
                 flow_validate_key_size(FlowKeys.due_any_key(type, priority, partition_key))
               else
                 :ok

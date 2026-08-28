@@ -434,7 +434,6 @@ defmodule Ferricstore.Commands.Stream.Meta do
     case decode_versioned(raw) do
       {:ok, _version, meta} -> meta
       {:error, _reason} = error -> error
-      nil -> nil
     end
   end
 

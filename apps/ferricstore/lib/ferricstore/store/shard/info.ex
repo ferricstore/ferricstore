@@ -540,13 +540,6 @@ defmodule Ferricstore.Store.Shard.Info do
                             redis_key,
                             reason
                           )
-
-                        unexpected ->
-                          Promotion.record_compound_promotion_failure(
-                            state,
-                            redis_key,
-                            {:unexpected_promotion_result, unexpected}
-                          )
                       end
 
                       release_promoted_compaction_latch_if_owned(latch_token, self())
@@ -1140,8 +1133,6 @@ defmodule Ferricstore.Store.Shard.Info do
       defp emit_pending_read_error(state, {_from, _key, :meta, _exp, fid, _off, _vsize}, reason) do
         emit_pending_read_error_for_fid(state, fid, reason)
       end
-
-      defp emit_pending_read_error(_state, _pending_entry, _reason), do: :ok
 
       defp emit_pending_read_error_for_fid(%{shard_data_path: shard_data_path}, fid, reason)
            when is_binary(shard_data_path) and is_integer(fid) and fid >= 0 do

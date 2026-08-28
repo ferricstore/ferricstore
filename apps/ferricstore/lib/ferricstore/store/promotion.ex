@@ -1138,9 +1138,6 @@ defmodule Ferricstore.Store.Promotion do
 
       {:error, reason} ->
         fail_recovery!(:open_dedicated, redis_key, shard_index, reason)
-
-      other ->
-        fail_recovery!(:open_dedicated, redis_key, shard_index, {:unexpected, other})
     end
   end
 

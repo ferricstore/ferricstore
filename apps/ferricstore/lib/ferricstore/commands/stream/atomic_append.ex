@@ -231,7 +231,6 @@ defmodule Ferricstore.Commands.Stream.AtomicAppend do
       end
     else
       {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
-      {:error, _reason} = error -> error
     end
   end
 

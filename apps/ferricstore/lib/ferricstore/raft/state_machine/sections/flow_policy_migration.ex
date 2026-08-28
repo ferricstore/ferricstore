@@ -628,9 +628,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
             else
               {:error, "ERR flow type catalog entry is corrupt"}
             end
-
-          {:ok, _mismatch} ->
-            {:error, "ERR flow type catalog ownership mismatch"}
         end
       end
 

@@ -536,7 +536,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       defp flow_merge_record_value_mode(:none, :none), do: :none
       defp flow_merge_record_value_mode(:none, :payload_only), do: :mixed
       defp flow_merge_record_value_mode(:payload_only, :none), do: :mixed
-      defp flow_merge_record_value_mode(:none, mode), do: mode
       defp flow_merge_record_value_mode(mode, :none), do: mode
       defp flow_merge_record_value_mode(:payload_only, :payload_only), do: :payload_only
 

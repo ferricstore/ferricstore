@@ -330,8 +330,6 @@ defmodule FerricstoreServer.Health.Endpoint.Session do
     end
   end
 
-  defp valid_csrf_token?(_token), do: false
-
   defp csrf_signature(nonce) do
     :crypto.mac(:hmac, :sha256, session_secret(), "csrf:" <> nonce)
     |> Base.url_encode64(padding: false)

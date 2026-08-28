@@ -1532,7 +1532,6 @@ defmodule FerricstoreServer.Native.Commands do
       flow_query_prepared_reply(store, request, state)
     else
       {:error, reason} when is_binary(reason) -> {:bad_request, reason, state}
-      {:error, status, reason} -> {status, reason, state}
     end
   end
 
@@ -4068,9 +4067,6 @@ defmodule FerricstoreServer.Native.Commands do
     else
       {:error, %FlowQueryError{} = error} ->
         {:error, FlowQueryError.status(error), FlowQueryError.payload(error)}
-
-      {:error, reason} when is_atom(reason) ->
-        {:error, FlowQueryError.status(reason), FlowQueryError.payload(reason)}
 
       {:error, reason} when is_binary(reason) ->
         {:error, :bad_request, reason}

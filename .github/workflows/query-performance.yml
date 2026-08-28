@@ -112,7 +112,7 @@ jobs:
               cp apps/ferricstore/native/ferricstore_wal_nif/target/release/libferricstore_wal_nif.so apps/ferricstore/priv/native/ferricstore_wal_nif.so
               cp apps/ferricstore_server/native/native_protocol_nif/target/release/libnative_protocol_nif.so apps/ferricstore_server/priv/native/libnative_protocol_nif.so
               cp apps/ferricstore_server/native/native_protocol_nif/target/release/libnative_protocol_nif.so apps/ferricstore_server/priv/native/native_protocol_nif.so
-              mix compile
+              mix compile --warnings-as-errors
             )
           }
 

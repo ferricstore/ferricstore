@@ -80,7 +80,7 @@ defmodule Ferricstore.Flow do
     FlowTelemetry.observe(:run_steps_many, started, result, %{
       flow_id: nil,
       flow_type: Keyword.get(opts, :type),
-      _count: if(is_list(items), do: length(items), else: 0)
+      _count: length(items)
     })
   end
 

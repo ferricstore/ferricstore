@@ -180,7 +180,6 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
       end
     else
       {:error, reason} -> {:error, governance_error_message(reason)}
-      false -> {:error, "ERR invalid approval action"}
     end
   end
 

@@ -102,21 +102,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
         end
       end
 
-      defp validate_storage_metadata(%{position: position} = metadata) when is_map(metadata) do
-        with :ok <- validate_raft_position(position),
-             :ok <- validate_storage_snapshot_boundary(metadata),
-             :ok <- validate_apply_context_metadata(metadata) do
-          {:ok, metadata}
-        else
-          {:error, reason} -> {:error, {:bad_storage_metadata, reason}}
-        end
-      end
-
-      defp validate_storage_metadata(metadata) when is_map(metadata),
-        do: {:error, {:bad_storage_metadata, :missing_position}}
-
-      defp validate_storage_metadata(other), do: {:error, {:bad_storage_metadata, other}}
-
       defp validate_storage_config(nil), do: :ok
 
       defp validate_storage_config({position, config}) when is_map(config) do
@@ -392,9 +377,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
       rescue
         error -> {:error, {:collect_segment_projection_relocations_failed, error}}
       end
-
-      defp collect_segment_projection_relocations(_sm_state),
-        do: {:error, :bad_segment_projection_state}
 
       defp segment_projection_relocations_from_keydir(keydir, ctx, shard_index, now) do
         keydir
@@ -804,21 +786,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
           end
         else
           {:error, reason} -> {:error, {:compact_apply_projection_log_failed, reason}}
-          other -> {:error, {:compact_apply_projection_log_failed, other}}
         end
       rescue
         error -> {:error, {:compact_apply_projection_log_failed, error}}
       end
-
-      defp compact_apply_projection_log(
-             _root_dir,
-             _ctx,
-             _shard_index,
-             _trim_index,
-             _retention_lmdb_path,
-             _relocation_lmdb_paths
-           ),
-           do: {:error, {:compact_apply_projection_log_failed, :invalid_relocation_lmdb_paths}}
 
       defp relocate_query_rows_after_rewrite(
              ctx,
@@ -1269,9 +1240,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
 
             {:waraft_segment, index} when is_integer(index) and index > 0 ->
               target =
-                {key, expire_at_ms, {:waraft_apply_projection, index},
-                 apply_projection_pin_target_offset(source_file_id, source_offset),
-                 source_value_size}
+                {key, expire_at_ms, {:waraft_apply_projection, index}, 0, source_value_size}
 
               {:ok,
                FlowLMDB.segment_value_pin_batch_put_ops([target]) ++ [{:delete, source_pin_key}]}
@@ -1287,13 +1256,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
             error
         end
       end
-
-      defp apply_projection_pin_target_offset({:waraft_segment, _index}, _source_offset), do: 0
-
-      defp apply_projection_pin_target_offset({:waraft_apply_projection, _index}, source_offset),
-        do: source_offset
-
-      defp apply_projection_pin_target_offset(_file_id, source_offset), do: source_offset
 
       defp current_segment_value_pin_locator(
              lmdb_path,

@@ -314,7 +314,7 @@ defmodule Ferricstore.Flow.Query.QueryRowCodecTest do
     assert :error = QueryRowCodec.decode_reference(encoded <> <<0>>, @state_key, 0)
 
     for offset <- 0..(byte_size(encoded) - 1) do
-      <<prefix::binary-size(offset), byte, suffix::binary>> = encoded
+      <<prefix::binary-size(^offset), byte, suffix::binary>> = encoded
       corrupted = <<prefix::binary, Bitwise.bxor(byte, 1), suffix::binary>>
       assert :error = QueryRowCodec.decode_reference(corrupted, @state_key, 0)
     end
@@ -533,7 +533,7 @@ defmodule Ferricstore.Flow.Query.QueryRowCodecTest do
     assert {:ok, encoded} = QueryRowCodec.encode(@state_key, record(), locator(), 0)
 
     for offset <- 0..(byte_size(encoded) - 1) do
-      <<prefix::binary-size(offset), byte, suffix::binary>> = encoded
+      <<prefix::binary-size(^offset), byte, suffix::binary>> = encoded
       corrupted = <<prefix::binary, Bitwise.bxor(byte, 1), suffix::binary>>
       assert :error = QueryRowCodec.decode(corrupted, @state_key)
     end
@@ -594,8 +594,9 @@ defmodule Ferricstore.Flow.Query.QueryRowCodecTest do
     marker = <<byte_size(name), name::binary>>
     {offset, _bytes} = :binary.match(encoded, marker)
     name_offset = offset + 1
+    name_size = byte_size(name)
 
-    <<prefix::binary-size(name_offset), _name::binary-size(byte_size(name)), suffix::binary>> =
+    <<prefix::binary-size(^name_offset), _name::binary-size(^name_size), suffix::binary>> =
       encoded
 
     corrupted =

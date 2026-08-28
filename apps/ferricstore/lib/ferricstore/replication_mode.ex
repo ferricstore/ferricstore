@@ -158,7 +158,6 @@ defmodule Ferricstore.ReplicationMode do
       {:ok, _} -> nil
       {:error, :enoent} -> nil
       {:error, reason} -> raise "failed to preserve existing cluster_id: #{inspect(reason)}"
-      _ -> nil
     end
   end
 

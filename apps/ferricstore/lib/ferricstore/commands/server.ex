@@ -444,10 +444,8 @@ defmodule Ferricstore.Commands.Server do
     parent = self()
     start_ref = make_ref()
 
-    case Task.start(fn -> background_save(parent, start_ref, store) end) do
-      {:ok, pid} -> await_background_save_start(pid, start_ref)
-      {:error, reason} -> {:error, "ERR background save failed to start: #{inspect(reason)}"}
-    end
+    {:ok, pid} = Task.start(fn -> background_save(parent, start_ref, store) end)
+    await_background_save_start(pid, start_ref)
   end
 
   def handle("BGSAVE", _args, _store) do

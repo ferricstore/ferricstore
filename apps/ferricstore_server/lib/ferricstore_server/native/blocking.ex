@@ -64,7 +64,6 @@ defmodule FerricstoreServer.Native.Blocking do
     else
       {:error, status, reason} -> {:error, status, reason}
       {:error, reason} -> {:error, :bad_request, reason}
-      false -> {:error, :bad_request, "ERR native command is not blocking"}
     end
   end
 

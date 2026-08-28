@@ -250,6 +250,10 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
     assert {:ok, "HGETEX", _args, {:hgetex, "h", :none, ["f"]}, ["h"]} =
              NativeAstParser.parse("hgetex", ["h", "FIELDS", "1", "f"])
 
+    assert {:ok, "HGETEX", _args,
+            {:hgetex, "h", {:error, "ERR value is not an integer or out of range"}}, ["h"]} =
+             NativeAstParser.parse("hgetex", ["h", "PX", "invalid", "FIELDS", "1", "f"])
+
     assert {:ok, "HSETEX", _args, {:hsetex, "h", 5, ["f", "v"]}, ["h"]} =
              NativeAstParser.parse("hsetex", ["h", "5", "f", "v"])
 

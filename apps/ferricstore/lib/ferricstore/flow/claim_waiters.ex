@@ -660,8 +660,6 @@ defmodule Ferricstore.Flow.ClaimWaiters do
     end
   end
 
-  defp compact_partition_keys(_partitions), do: [@any_partition]
-
   defp scheduled_due_at_ms(due_at_ms) when is_integer(due_at_ms) do
     bucket = @scheduled_due_bucket_ms
     div(due_at_ms + bucket - 1, bucket) * bucket

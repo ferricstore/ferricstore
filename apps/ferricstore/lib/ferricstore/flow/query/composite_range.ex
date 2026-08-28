@@ -33,7 +33,7 @@ defmodule Ferricstore.Flow.Query.CompositeRange do
            is_binary(range.prefix) and byte_size(range.prefix) <= @max_key_bytes and
              byte_size(range.prefix) > storage_prefix_bytes + 40 and
              String.starts_with?(range.prefix, storage_prefix),
-         <<_::binary-size(storage_prefix_bytes), embedded_version::unsigned-big-64,
+         <<_::binary-size(^storage_prefix_bytes), embedded_version::unsigned-big-64,
            _fingerprint::binary-size(32), components::binary>> <- range.prefix,
          true <- embedded_version == range.index_version and components != "",
          true <- valid_boundary?(range.after_key, range.prefix, :after),

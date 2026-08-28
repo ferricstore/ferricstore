@@ -125,7 +125,7 @@ defmodule Ferricstore.HyperLogLog do
     current = :binary.at(sketch, index)
 
     if rank > current do
-      <<prefix::binary-size(index), _old, suffix::binary>> = sketch
+      <<prefix::binary-size(^index), _old, suffix::binary>> = sketch
       {<<prefix::binary, rank::8, suffix::binary>>, true}
     else
       {sketch, false}

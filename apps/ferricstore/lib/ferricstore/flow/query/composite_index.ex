@@ -353,7 +353,7 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
            expire_at_ms::unsigned-big-64, payload::binary>> <- body,
          true <- id_bytes > 0 and id_bytes <= @max_run_id_bytes,
          true <- id_bytes < byte_size(payload),
-         <<id::binary-size(id_bytes), state_key::binary>> <- payload,
+         <<id::binary-size(^id_bytes), state_key::binary>> <- payload,
          true <- byte_size(state_key) <= @max_state_key_bytes,
          true <- record_version <= @max_exact_integer,
          {:ok, ^id} <- Keys.run_id_from_state_key(state_key) do
@@ -378,8 +378,8 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
          true <- state_key_bytes > 0 and state_key_bytes <= @max_state_key_bytes,
          true <- covering_bytes > 0 and covering_bytes <= @max_covering_value_bytes,
          true <- byte_size(payload) == id_bytes + state_key_bytes + covering_bytes,
-         <<id::binary-size(id_bytes), state_key::binary-size(state_key_bytes),
-           encoded_covering::binary-size(covering_bytes)>> <- payload,
+         <<id::binary-size(^id_bytes), state_key::binary-size(^state_key_bytes),
+           encoded_covering::binary-size(^covering_bytes)>> <- payload,
          true <- record_version <= @max_exact_integer,
          {:ok, ^id} <- Keys.run_id_from_state_key(state_key),
          {:ok, covering_record} <-

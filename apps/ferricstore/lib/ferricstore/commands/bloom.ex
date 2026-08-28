@@ -377,8 +377,6 @@ defmodule Ferricstore.Commands.Bloom do
   defp production_prob_store?(store) when is_map(store),
     do: is_function(Map.get(store, :prob_write), 1)
 
-  defp production_prob_store?(_store), do: false
-
   defp missing_or_wrongtype(key, store, missing_result) do
     case ProbType.check_create(key, :bloom, store) do
       :ok -> missing_result

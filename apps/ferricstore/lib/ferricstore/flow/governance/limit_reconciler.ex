@@ -591,8 +591,6 @@ defmodule Ferricstore.Flow.Governance.LimitReconciler do
     %{state | timer: Process.send_after(self(), :reconcile, reconcile_interval_ms())}
   end
 
-  defp schedule(state), do: state
-
   defp reconcile_interval_ms do
     case Application.get_env(
            :ferricstore,

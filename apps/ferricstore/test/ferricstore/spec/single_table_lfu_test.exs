@@ -114,7 +114,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       assert val == "hot_value"
       assert exp == 0
       {_ldt, counter} = LFU.unpack(packed_lfu)
-      assert is_integer(counter) and counter >= 0 and counter <= 255
+      assert counter >= 0 and counter <= 255
     end
 
     # Test 3: GET cold key (value=nil) -- falls through to Bitcask

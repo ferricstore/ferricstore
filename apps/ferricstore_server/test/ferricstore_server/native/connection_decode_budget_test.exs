@@ -63,7 +63,7 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
 
     request = Codec.encode_frame(@ping_opcode, 0, 42, "")
     split_at = byte_size(request) - 2
-    <<partial::binary-size(split_at), final_bytes::binary>> = request
+    <<partial::binary-size(^split_at), final_bytes::binary>> = request
 
     assert :ok = :gen_tcp.send(socket, partial)
     assert {:error, :timeout} = :gen_tcp.recv(socket, 0, 25)
@@ -881,7 +881,7 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
 
     assert byte_size(body) > 64
     split_at = div(byte_size(body), 2)
-    <<first::binary-size(split_at), second::binary>> = body
+    <<first::binary-size(^split_at), second::binary>> = body
     assert byte_size(first) <= 64
     assert byte_size(second) <= 64
 
@@ -1202,7 +1202,7 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
   end
 
   defp binary_chunks(binary, chunk_bytes) do
-    full_chunks = for <<chunk::binary-size(chunk_bytes) <- binary>>, do: chunk
+    full_chunks = for <<chunk::binary-size(^chunk_bytes) <- binary>>, do: chunk
     consumed = length(full_chunks) * chunk_bytes
 
     case binary_part(binary, consumed, byte_size(binary) - consumed) do
@@ -1237,7 +1237,7 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
          ids
        ) do
     if byte_size(body_and_rest) >= body_len do
-      <<_body::binary-size(body_len), rest::binary>> = body_and_rest
+      <<_body::binary-size(^body_len), rest::binary>> = body_and_rest
       decode_response_ids(rest, [request_id | ids])
     else
       {ids, buffer}
@@ -1272,7 +1272,7 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
          responses
        ) do
     if byte_size(body_and_rest) >= body_len do
-      <<body::binary-size(body_len), rest::binary>> = body_and_rest
+      <<body::binary-size(^body_len), rest::binary>> = body_and_rest
       body = if Bitwise.band(flags, @compressed_flag) != 0, do: :zlib.uncompress(body), else: body
       <<status::unsigned-16, _value::binary>> = body
       decode_response_statuses(rest, [{request_id, status} | responses])
@@ -1308,7 +1308,7 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
          frames
        ) do
     if byte_size(body_and_rest) >= body_len do
-      <<body::binary-size(body_len), rest::binary>> = body_and_rest
+      <<body::binary-size(^body_len), rest::binary>> = body_and_rest
       decode_native_frames(rest, [body | frames])
     else
       {frames, buffer}

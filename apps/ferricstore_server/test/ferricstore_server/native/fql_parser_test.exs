@@ -85,7 +85,7 @@ defmodule FerricstoreServer.Native.FQLParserTest do
       "FROM runs WHERE partition_key = 'tenant-a' AND run_id = @flow_id RETURN RECORD;"
 
     for offset <- 0..(byte_size(query) - 1), byte <- [0, 9, 10, 13, 32, ?', ?;, ?@, ?_, 255] do
-      <<prefix::binary-size(offset), _replaced, suffix::binary>> = query
+      <<prefix::binary-size(^offset), _replaced, suffix::binary>> = query
       mutated = <<prefix::binary, byte, suffix::binary>>
 
       assert FQLParser.parse(mutated) == ReferenceParser.parse(mutated)

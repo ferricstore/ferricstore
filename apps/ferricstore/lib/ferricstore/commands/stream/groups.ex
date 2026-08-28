@@ -325,7 +325,7 @@ defmodule Ferricstore.Commands.Stream.Groups do
               ReadResult.command_error(failure)
 
             {:error, _reason} = failure ->
-              ReadResult.command_error(failure)
+              failure
           end
       end
     else

@@ -244,50 +244,40 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
               spill_bytes: spill_bytes
             }
 
-            case Task.start(fn ->
-                   result =
-                     run_apply_projection_cache_compaction(
-                       handle.ctx.data_dir,
-                       handle.shard_index,
-                       spill_count,
-                       spill_bytes,
-                       metadata
-                     )
+            {:ok, pid} =
+              Task.start(fn ->
+                result =
+                  run_apply_projection_cache_compaction(
+                    handle.ctx.data_dir,
+                    handle.shard_index,
+                    spill_count,
+                    spill_bytes,
+                    metadata
+                  )
 
-                   send_storage_info(
-                     storage_name,
-                     {:ferricstore_waraft_apply_projection_cache_compact_done, ref,
-                      {started_at, metadata, result}}
-                   )
-                 end) do
-              {:ok, pid} ->
-                monitor = Process.monitor(pid)
-
-                {:ok,
-                 Map.put(handle, :apply_projection_cache_compaction, %{
-                   ref: ref,
-                   pid: pid,
-                   monitor: monitor,
-                   started_at: started_at,
-                   metadata: metadata,
-                   count: count,
-                   bytes: bytes,
-                   limit: entry_limit,
-                   byte_limit: byte_limit,
-                   spill_count: spill_count,
-                   spill_bytes: spill_bytes
-                 })}
-
-              {:error, reason} ->
-                emit_apply_projection_cache_compaction(
-                  metadata,
-                  started_at,
-                  {:error, {:task_start_failed, reason}}
+                send_storage_info(
+                  storage_name,
+                  {:ferricstore_waraft_apply_projection_cache_compact_done, ref,
+                   {started_at, metadata, result}}
                 )
+              end)
 
-                {:ok,
-                 Map.put(handle, :apply_projection_cache_last_error, {:task_start_failed, reason})}
-            end
+            monitor = Process.monitor(pid)
+
+            {:ok,
+             Map.put(handle, :apply_projection_cache_compaction, %{
+               ref: ref,
+               pid: pid,
+               monitor: monitor,
+               started_at: started_at,
+               metadata: metadata,
+               count: count,
+               bytes: bytes,
+               limit: entry_limit,
+               byte_limit: byte_limit,
+               spill_count: spill_count,
+               spill_bytes: spill_bytes
+             })}
         end
       end
 
@@ -688,9 +678,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
                 write_segment_projection(checkpoint_root, position, entries)
               end
 
-            {:ok, _projection} ->
-              write_segment_projection(checkpoint_root, position, entries)
-
             {:error, :enoent} ->
               write_segment_projection(checkpoint_root, position, entries)
 
@@ -702,7 +689,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
           :ok -> :ok
           {:ok, :stale} -> {:ok, :stale}
           {:error, _reason} = error -> error
-          other -> {:error, {:write_segment_projection_checkpoint, other}}
         end
       end
 

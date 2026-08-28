@@ -148,8 +148,8 @@ jobs:
           cp apps/ferricstore_server/native/native_protocol_nif/target/release/libnative_protocol_nif.so apps/ferricstore_server/priv/native/libnative_protocol_nif.so
           cp apps/ferricstore_server/native/native_protocol_nif/target/release/libnative_protocol_nif.so apps/ferricstore_server/priv/native/native_protocol_nif.so
 
-      - name: Compile
-        run: mix compile
+      - name: Compile (warnings as errors)
+        run: mix compile --warnings-as-errors
 
       - name: Validate native query benchmark contracts
         run: |
@@ -255,8 +255,8 @@ jobs:
           cp apps/ferricstore_server/native/native_protocol_nif/target/release/libnative_protocol_nif.dylib apps/ferricstore_server/priv/native/libnative_protocol_nif.so
           cp apps/ferricstore_server/native/native_protocol_nif/target/release/libnative_protocol_nif.dylib apps/ferricstore_server/priv/native/native_protocol_nif.so
 
-      - name: Compile
-        run: mix compile
+      - name: Compile (warnings as errors)
+        run: mix compile --warnings-as-errors
 
       - name: Credo
         run: |

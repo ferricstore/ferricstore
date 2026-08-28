@@ -145,7 +145,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
                 0 -> old_byte &&& bnot(1 <<< bit_position)
               end
 
-            <<prefix::binary-size(byte_index), _old::8, suffix::binary>> = extended
+            <<prefix::binary-size(^byte_index), _old::8, suffix::binary>> = extended
             new_value = <<prefix::binary, new_byte::8, suffix::binary>>
 
             case do_put(state, key, new_value, expire_at_ms) do

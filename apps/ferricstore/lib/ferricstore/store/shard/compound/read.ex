@@ -412,10 +412,6 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
                 ShardETS.cold_read_warm_ets(state, compound_key, value, exp, fid, off, vsize)
                 {value, state}
 
-              {:ok, value} ->
-                ShardETS.ets_insert(state, compound_key, value, 0)
-                {value, state}
-
               {:error, reason} ->
                 {promoted_read_failure(reason), state}
 
@@ -615,10 +611,6 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
               {:ok, value, exp, fid, off, vsize} ->
                 ShardETS.cold_read_warm_ets(state, compound_key, value, exp, fid, off, vsize)
                 {{value, exp}, state}
-
-              {:ok, value} ->
-                ShardETS.ets_insert(state, compound_key, value, 0)
-                {{value, 0}, state}
 
               {:error, reason} ->
                 {promoted_read_failure(reason), state}

@@ -763,7 +763,6 @@ defmodule Ferricstore.Flow.Query.Executor do
          ) do
       {:ok, rows} -> process_query_row_prefix(candidates, rows, true, state)
       {:error, :invalid_query_row} -> {:error, :query_storage_inconsistent}
-      _invalid -> {:error, :query_storage_inconsistent}
     end
   end
 
@@ -944,9 +943,6 @@ defmodule Ferricstore.Flow.Query.Executor do
 
       {:error, _reason} ->
         {:error, :query_storage_unavailable}
-
-      _invalid ->
-        {:error, :query_storage_inconsistent}
     end
   end
 

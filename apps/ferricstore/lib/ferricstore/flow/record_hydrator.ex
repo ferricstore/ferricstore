@@ -275,9 +275,6 @@ defmodule Ferricstore.Flow.RecordHydrator do
 
         {:error, _reason} = error ->
           error
-
-        _invalid ->
-          {:error, :invalid_hydration_read}
       end
     end
   end

@@ -486,19 +486,14 @@ defmodule Ferricstore.Flow.RetentionSweeper do
 
   defp maybe_trigger_compaction(:ok, counts, pressure?, limit_hit?, state) do
     if should_trigger_compaction?(counts, pressure?, limit_hit?, state) do
-      case Task.start(fn -> state.compaction_fun.() end) do
-        {:ok, pid} ->
-          ref = Process.monitor(pid)
+      {:ok, pid} = Task.start(fn -> state.compaction_fun.() end)
+      ref = Process.monitor(pid)
 
-          {%{
-             state
-             | compaction_ref: ref,
-               last_compaction_mono_ms: System.monotonic_time(:millisecond)
-           }, true}
-
-        _other ->
-          {state, false}
-      end
+      {%{
+         state
+         | compaction_ref: ref,
+           last_compaction_mono_ms: System.monotonic_time(:millisecond)
+       }, true}
     else
       {state, false}
     end

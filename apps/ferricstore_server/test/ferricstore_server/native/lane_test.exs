@@ -1100,7 +1100,7 @@ defmodule FerricstoreServer.Native.LaneTest do
 
   defp compact_stream_ids(<<0x89, count::unsigned-32, size::unsigned-32, values::binary>>)
        when byte_size(values) == count * size do
-    for <<id::binary-size(size) <- values>>, do: id
+    for <<id::binary-size(^size) <- values>>, do: id
   end
 
   defp compact_stream_ids(<<0x83, count::unsigned-32, rest::binary>>) do

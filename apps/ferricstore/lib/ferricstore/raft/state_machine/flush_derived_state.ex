@@ -105,7 +105,6 @@ defmodule Ferricstore.Raft.StateMachine.FlushDerivedState do
     case do_quiesce(instance_name, history_ctx, shard_index) do
       :ok -> :ok
       {:error, reason} -> {:error, {:flush_derived_state_cleanup_failed, reason}}
-      other -> {:error, {:flush_derived_state_cleanup_failed, {:unexpected_result, other}}}
     end
   rescue
     error -> {:error, {:flush_derived_state_cleanup_failed, error}}

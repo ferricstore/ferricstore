@@ -132,6 +132,4 @@ defmodule Ferricstore.Flow.Query.Response do
   catch
     _kind, _reason -> {:error, :query_engine_failure}
   end
-
-  defp encoded_size(_term, _response_codec), do: {:error, :query_engine_failure}
 end
