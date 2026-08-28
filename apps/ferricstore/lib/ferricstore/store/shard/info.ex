@@ -443,12 +443,10 @@ defmodule Ferricstore.Store.Shard.Info do
              redis_key,
              type
            ) do
-        state =
-          Map.update!(state, :compound_promotion_pending, &Map.delete(&1, redis_key))
-
         case ShardCompound.promoted_store(state, redis_key) do
           path when is_binary(path) ->
             state
+            |> delete_pending_compound_promotion(redis_key)
             |> install_promoted_instance(redis_key, path)
             |> reply_compound_promotion_waiters(redis_key)
             |> maybe_start_pending_compound_promotion()
@@ -456,42 +454,74 @@ defmodule Ferricstore.Store.Shard.Info do
           nil ->
             state = ShardFlush.await_in_flight(state)
             state = ShardFlush.flush_pending_sync(state)
-            parent = self()
-            job_ref = make_ref()
-            :ok = Promotion.clear_compound_promotion_fence(state, redis_key)
-            latch_token = Promotion.acquire_compaction_latch(state, redis_key)
-            :ok = Promotion.record_compound_promotion_running(state, redis_key)
-            shared_log_latch_token = Promotion.acquire_shared_log_latch(state)
-            state = sync_active_file_from_registry(state)
 
-            {pid, monitor_ref} =
-              spawn_compound_promotion_worker(
-                state,
-                redis_key,
-                type,
-                parent,
-                job_ref,
-                latch_token,
-                shared_log_latch_token
-              )
+            case try_acquire_compound_promotion_latches(state, redis_key) do
+              {:ok, latch_token, shared_log_latch_token} ->
+                state = delete_pending_compound_promotion(state, redis_key)
+                parent = self()
+                job_ref = make_ref()
+                :ok = Promotion.clear_compound_promotion_fence(state, redis_key)
+                :ok = Promotion.record_compound_promotion_running(state, redis_key)
+                state = sync_active_file_from_registry(state)
 
-            worker = %{
-              job_ref: job_ref,
-              monitor_ref: monitor_ref,
-              pid: pid,
-              redis_key: redis_key,
-              type: type,
-              latch_token: latch_token,
-              shared_log_latch_token: shared_log_latch_token,
-              active_file_id: state.active_file_id,
-              active_file_path: state.active_file_path
-            }
+                {pid, monitor_ref} =
+                  spawn_compound_promotion_worker(
+                    state,
+                    redis_key,
+                    type,
+                    parent,
+                    job_ref,
+                    latch_token,
+                    shared_log_latch_token
+                  )
 
-            %{state | compound_promotion_worker: worker}
+                worker = %{
+                  job_ref: job_ref,
+                  monitor_ref: monitor_ref,
+                  pid: pid,
+                  redis_key: redis_key,
+                  type: type,
+                  latch_token: latch_token,
+                  shared_log_latch_token: shared_log_latch_token,
+                  active_file_id: state.active_file_id,
+                  active_file_path: state.active_file_path
+                }
+
+                %{state | compound_promotion_worker: worker}
+
+              :busy ->
+                Process.send_after(self(), {:start_compound_promotion, redis_key, type}, 10)
+                state
+            end
         end
       end
 
       defp maybe_start_compound_promotion(state, _redis_key, _type), do: state
+
+      defp delete_pending_compound_promotion(state, redis_key) do
+        Map.update!(state, :compound_promotion_pending, &Map.delete(&1, redis_key))
+      end
+
+      defp try_acquire_compound_promotion_latches(state, redis_key) do
+        case normalize_try_latch(Promotion.try_acquire_compaction_latch(state, redis_key)) do
+          :busy ->
+            :busy
+
+          {:ok, latch_token} ->
+            case normalize_try_latch(Promotion.try_acquire_shared_log_latch(state)) do
+              :busy ->
+                Promotion.release_compaction_latch(latch_token)
+                :busy
+
+              {:ok, shared_log_latch_token} ->
+                {:ok, latch_token, shared_log_latch_token}
+            end
+        end
+      end
+
+      defp normalize_try_latch(:none), do: {:ok, :none}
+      defp normalize_try_latch(:busy), do: :busy
+      defp normalize_try_latch({:ok, latch_token}), do: {:ok, latch_token}
 
       defp spawn_compound_promotion_worker(
              state,

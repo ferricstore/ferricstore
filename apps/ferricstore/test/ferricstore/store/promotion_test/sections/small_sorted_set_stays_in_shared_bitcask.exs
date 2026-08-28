@@ -37,6 +37,28 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
       # ---------------------------------------------------------------------------
 
       describe "sorted set promotion on threshold crossing" do
+        test "promotion defers without blocking the shard while the shared log is latched" do
+          store = real_store()
+          key = ukey("promote_zset_latch_contention")
+          ctx = FerricStore.Instance.get(:default)
+          shard_idx = Router.shard_for(ctx, key)
+          shard = Router.shard_name(ctx, shard_idx)
+          owner = %{instance_ctx: ctx, shard_index: shard_idx}
+          shared_log_latch = Promotion.acquire_shared_log_latch(owner)
+
+          try do
+            populate_zset(store, key, @test_threshold + 1)
+
+            state = :sys.get_state(shard, 500)
+            assert state.compound_promotion_worker == nil
+            assert state.compound_promotion_pending[key] == :zset
+          after
+            Promotion.release_compaction_latch(shared_log_latch)
+          end
+
+          assert_promoted(key)
+        end
+
         test "zset crossing threshold gets promoted to dedicated Bitcask" do
           store = real_store()
           key = ukey("promote_zset")
