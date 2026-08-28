@@ -220,6 +220,9 @@ pub struct FlowOrderedIndexResource {
     inner: RwLock<FlowOrderedIndex>,
 }
 
+#[rustler::resource_impl]
+impl rustler::Resource for FlowOrderedIndexResource {}
+
 enum IndexLockError {
     Busy,
     Poisoned,
@@ -434,11 +437,6 @@ struct FlowRecordParts<'a> {
     run_state: Option<&'a [u8]>,
     rewound_to_event_id: Option<&'a [u8]>,
     child_groups_encoded: &'a [u8],
-}
-
-#[allow(non_local_definitions)]
-pub fn register_resource(env: Env) {
-    let _ = rustler::resource!(FlowOrderedIndexResource, env);
 }
 
 #[rustler::nif(schedule = "Normal")]

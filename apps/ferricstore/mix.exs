@@ -11,7 +11,7 @@ defmodule Ferricstore.MixProject do
       config_path: "../../config/config.exs",
       deps_path: "../../deps",
       lockfile: "../../mix.lock",
-      elixir: "~> 1.19",
+      elixir: "~> 1.20",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -93,10 +93,10 @@ defmodule Ferricstore.MixProject do
 
   defp deps do
     [
-      {:rustler_precompiled, "~> 0.8"},
-      {:rustler, "~> 0.37", optional: true},
+      {:rustler_precompiled, "~> 0.9"},
+      {:rustler, "~> 0.38", optional: true},
       {:wa_raft, "~> 0.1", hex: :ferricstore_waraft},
-      {:libcluster, "3.3.3"},
+      {:libcluster, "3.5.0", override: true},
       {:libcluster_consul, "1.3.0", optional: true},
       {:libcluster_etcd, "1.1.2", optional: true},
       {:telemetry, "~> 1.4"},

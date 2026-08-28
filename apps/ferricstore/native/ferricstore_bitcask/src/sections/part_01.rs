@@ -21,6 +21,9 @@ struct ValueBuffer {
     data: Vec<u8>,
 }
 
+#[rustler::resource_impl]
+impl rustler::Resource for ValueBuffer {}
+
 mod atoms {
     rustler::atoms! {
         ok,
@@ -80,17 +83,12 @@ static LMDB_VALIDATED_PATHS: OnceLock<
     RwLock<std::collections::HashMap<String, LmdbValidatedPath>>,
 > = OnceLock::new();
 
-#[allow(non_local_definitions)]
-fn load(env: Env, _info: Term) -> bool {
+fn load(_env: Env, _info: Term) -> bool {
     if let Err(error) = async_io::initialize() {
         eprintln!("ferricstore NIF failed to initialise async runtime: {error}");
         return false;
     }
 
-    let _ = rustler::resource!(ValueBuffer, env);
-    flow_index::register_resource(env);
-    tdigest::register_resource(env);
-    tdigest::register_mmap_resource(env);
     true
 }
 

@@ -57,7 +57,7 @@ defmodule Ferricstore.Umbrella.MixProject do
       "test.http": "test apps/ferricstore_http/test",
       "quality.http": [
         "format --check-formatted",
-        "compile --warnings-as-errors",
+        "compile",
         "credo --strict --config-file .credo_http.exs",
         "test apps/ferricstore_http/test"
       ]

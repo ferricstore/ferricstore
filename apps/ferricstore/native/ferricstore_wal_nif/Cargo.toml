@@ -9,7 +9,7 @@ name = "ferricstore_wal_nif"
 crate-type = ["cdylib"]
 
 [dependencies]
-rustler = { version = "0.37", default-features = false, features = ["derive"] }
+rustler = { version = "0.38", default-features = false, features = ["derive"] }
 crossbeam-channel = "0.5"
 libc = "0.2"
 
