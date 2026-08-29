@@ -723,8 +723,8 @@ defmodule Ferricstore.Bench.QueryPerformanceBenchmarkGuardTest do
             "os" => "unix/linux",
             "architecture" => "x86_64",
             "cpu_model" => "test",
-            "otp" => "28",
-            "elixir" => "1.19",
+            "otp" => "29.0.5",
+            "elixir" => "1.20.4",
             "schedulers_online" => 4
           },
           "scenarios" => %{

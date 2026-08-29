@@ -1,13 +1,13 @@
 # ============================================================
 # Stage 1: Rust toolchain
 # ============================================================
-ARG RUST_VERSION=1.94.0
-FROM rust:${RUST_VERSION}-slim-bookworm@sha256:a86cada82e36ebd7a9bffed7548792c55a952fdb20718eea9278a936bcb76e62 AS rust-toolchain
+ARG RUST_VERSION=1.98.0
+FROM rust:${RUST_VERSION}-slim-bookworm@sha256:1469a27c125cb5a3aebfa4f4e4665d935b02fb72cc093b2c974b3d740e43f157 AS rust-toolchain
 
 # ============================================================
 # Stage 2: Build
 # ============================================================
-FROM hexpm/elixir:1.19.5-erlang-28.4.1-ubuntu-noble-20260217@sha256:a0ee05779f7231b1f679ce540b63741e0ec56b181947ff00556b13370ad080f8 AS builder
+FROM hexpm/elixir:1.20.4-erlang-29.0.5-ubuntu-noble-20260810@sha256:e77a33445c3beb9f361e649f705b5852944a3153f13a7c7bfd7a95a5a7c5f0d2 AS builder
 
 # Install system deps + Rust
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -57,7 +57,7 @@ RUN mix release ferricstore
 # ============================================================
 # Stage 3: Runtime
 # ============================================================
-FROM ubuntu:noble-20260217@sha256:186072bba1b2f436cbb91ef2567abca677337cfc786c86e107d25b7072feef0c
+FROM ubuntu:noble-20260810@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3t64 libncurses6 libstdc++6 \

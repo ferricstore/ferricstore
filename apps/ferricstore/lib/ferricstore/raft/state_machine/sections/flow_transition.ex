@@ -666,16 +666,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
         end
       end
 
-      defp flow_require_schedule_type(nil, _expected_type),
-        do: {:error, "ERR flow schedule not found"}
-
       defp flow_require_schedule_type(
              %{type: "__ferricstore_schedule"},
              "__ferricstore_schedule"
            ),
            do: :ok
 
-      defp flow_require_schedule_type(_record, _expected_type),
+      defp flow_require_schedule_type(%{type: _record_type}, _expected_type),
         do: {:error, "ERR flow schedule not found"}
 
       defp flow_validate_schedule_replace_state(state) when state in ["active", "paused"],

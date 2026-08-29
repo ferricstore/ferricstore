@@ -38,7 +38,7 @@ defmodule Ferricstore.Flow.Codec.Primitives do
     len = encoded - 1
 
     case rest do
-      <<value::binary-size(len), tail::binary>> -> {:ok, value, tail}
+      <<value::binary-size(^len), tail::binary>> -> {:ok, value, tail}
       _ -> :error
     end
   end
@@ -53,7 +53,7 @@ defmodule Ferricstore.Flow.Codec.Primitives do
           len = size - 1
 
           case rest do
-            <<value::binary-size(len), tail::binary>> -> {:ok, value, tail}
+            <<value::binary-size(^len), tail::binary>> -> {:ok, value, tail}
             _ -> :error
           end
       end

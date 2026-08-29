@@ -1330,7 +1330,6 @@ defmodule Ferricstore.Flow.LMDB do
       {:ok, [{:compare, terminal_key, terminal_value} | ops]}
     else
       false -> {:error, :invalid_terminal_index_value}
-      :missing -> {:error, :invalid_terminal_index_value}
       :error -> {:error, :invalid_terminal_index_value}
       {:error, _reason} = error -> error
     end
@@ -1391,7 +1390,6 @@ defmodule Ferricstore.Flow.LMDB do
        ]}
     else
       false -> {:error, :invalid_terminal_index_value}
-      :missing -> {:error, :invalid_terminal_index_value}
       :error -> {:error, :invalid_terminal_index_value}
       {:error, _reason} = error -> error
     end

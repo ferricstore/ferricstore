@@ -4,6 +4,18 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.13 - 2026-08-28
+
+- Upgraded the supported runtime baseline to Elixir 1.20.4, Erlang/OTP 29.0.5,
+  and Rust 1.98.0 across local tooling, CI, release images, and deployment
+  examples.
+- Updated Hex and Cargo dependencies, including Rustler 0.38 and
+  RustlerPrecompiled 0.9, while retaining strict compiler, security, and
+  allocation gates.
+- Fixed strict-compiler findings and cross-test runtime-state restoration
+  without weakening correctness assertions, performance thresholds, retry
+  budgets, or timeouts.
+
 ## 0.11.12 - 2026-08-26
 
 - Accelerated eligible homogeneous command-gateway GET batches and ordered

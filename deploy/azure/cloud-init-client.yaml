@@ -38,8 +38,8 @@ write_files:
 
       # Install Elixir
       asdf plugin add elixir || true
-      asdf install elixir ${elixir_version}-otp-28
-      asdf global elixir ${elixir_version}-otp-28
+      asdf install elixir ${elixir_version}-otp-29
+      asdf global elixir ${elixir_version}-otp-29
 
       # Install Rust (for NIF compilation)
       if ! command -v cargo &> /dev/null; then

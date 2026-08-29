@@ -57,7 +57,7 @@ defmodule Ferricstore.ProbFile do
 
     if destination_size > 0 do
       case filename do
-        <<destination::binary-size(destination_size), ^suffix::binary>> ->
+        <<destination::binary-size(^destination_size), ^suffix::binary>> ->
           valid_filename?(destination)
 
         _other ->
@@ -87,7 +87,7 @@ defmodule Ferricstore.ProbFile do
 
     if target_size > 0 do
       case filename do
-        <<target::binary-size(target_size), ^suffix::binary>> ->
+        <<target::binary-size(^target_size), ^suffix::binary>> ->
           if valid_filename?(target), do: {:ok, target}, else: :error
 
         _other ->
@@ -117,7 +117,7 @@ defmodule Ferricstore.ProbFile do
 
     if target_size > 0 do
       case filename do
-        <<target::binary-size(target_size), ^suffix::binary>> ->
+        <<target::binary-size(^target_size), ^suffix::binary>> ->
           if valid_filename?(target), do: {:ok, target}, else: :error
 
         _other ->

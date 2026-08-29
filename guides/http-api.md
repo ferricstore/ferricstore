@@ -83,7 +83,7 @@ docker run --rm \
   -e FERRICSTORE_HTTP_TLS_KEY_FILE=/run/secrets/ferricstore/http-key.pem \
   -v "$PWD/certs:/run/secrets/ferricstore:ro" \
   -v ferricstore_data:/data \
-  quay.io/ferricstore/ferricstore:0.11.12
+  quay.io/ferricstore/ferricstore:0.11.13
 ```
 
 The container runs as UID `10001`; ensure that user can read the mounted certificate and key.

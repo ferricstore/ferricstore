@@ -50,8 +50,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -63,8 +63,8 @@ jobs:
         uses: actions/cache@v5
         with:
           path: deps
-          key: mix-deps-Linux-1.19-28-${{ hashFiles('mix.lock') }}
-          restore-keys: mix-deps-Linux-1.19-28-
+          key: mix-deps-Linux-1.20.4-29.0.5-${{ hashFiles('mix.lock') }}
+          restore-keys: mix-deps-Linux-1.20.4-29.0.5-
 
       - name: Cache Cargo
         uses: actions/cache@v5
@@ -86,6 +86,13 @@ jobs:
 
       - name: Install dependencies
         run: mix deps.get
+
+      - name: Verify dependency lock hygiene
+        run: |
+          for mix_env in dev test bench prod; do
+            MIX_ENV="$mix_env" mix deps.get --check-locked
+            MIX_ENV="$mix_env" mix deps.unlock --check-unused
+          done
 
       - name: Audit Hex dependencies
         run: |
@@ -189,8 +196,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -202,8 +209,8 @@ jobs:
         uses: actions/cache@v5
         with:
           path: deps
-          key: mix-deps-macOS-1.19-28-${{ hashFiles('mix.lock') }}
-          restore-keys: mix-deps-macOS-1.19-28-
+          key: mix-deps-macOS-1.20.4-29.0.5-${{ hashFiles('mix.lock') }}
+          restore-keys: mix-deps-macOS-1.20.4-29.0.5-
 
       - name: Cache Cargo
         uses: actions/cache@v5
@@ -284,8 +291,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -330,8 +337,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -387,8 +394,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -442,8 +449,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -474,8 +481,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -513,8 +520,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -549,8 +556,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -584,8 +591,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -620,8 +627,8 @@ jobs:
           path: ferricstore-python
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -678,8 +685,8 @@ jobs:
           path: ferricstore-java
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.20"
-          otp-version: "29"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -736,8 +743,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -800,8 +807,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -836,8 +843,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex

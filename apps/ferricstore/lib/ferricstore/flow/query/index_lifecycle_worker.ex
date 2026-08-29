@@ -257,7 +257,6 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
           end
         else
           {:error, _reason} = error -> error
-          _invalid -> {:error, :invalid_query_backfill_snapshot_result}
         end
 
       {:error, _reason} = error ->

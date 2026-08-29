@@ -110,7 +110,6 @@ defmodule Ferricstore.Store.Shard.NamespaceUsageIndex do
       end)
     else
       :missing -> :ok
-      {:error, _reason} = error -> error
     end
   rescue
     ArgumentError -> {:error, :namespace_usage_index_unavailable}
@@ -229,7 +228,6 @@ defmodule Ferricstore.Store.Shard.NamespaceUsageIndex do
       end
     else
       :missing -> :ok
-      {:error, _reason} = error -> error
     end
   rescue
     ArgumentError -> {:error, :namespace_usage_index_unavailable}

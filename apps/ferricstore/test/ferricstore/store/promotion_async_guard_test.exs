@@ -100,8 +100,14 @@ defmodule Ferricstore.Store.PromotionAsyncGuardTest do
     assert flush_source =~ "Promotion.try_acquire_shared_log_latch(state)",
            "Raft-owned rotation must share the promotion log latch"
 
-    assert info_source =~ "Promotion.acquire_shared_log_latch(state)",
-           "the promotion worker must hold the shard log latch before capturing its active path"
+    assert info_source =~ "Promotion.try_acquire_shared_log_latch(state)",
+           "promotion startup must acquire the shard log latch without blocking its mailbox"
+
+    assert Regex.match?(
+             ~r/try_acquire_compound_promotion_latches\(state, redis_key\).*state = sync_active_file_from_registry\(state\)/s,
+             info_source
+           ),
+           "the promotion worker must hold both latches before capturing its active path"
 
     assert info_source =~ "refresh_active_file_size_after_compound_promotion",
            "worker appends must be reconciled into shard file-size accounting"

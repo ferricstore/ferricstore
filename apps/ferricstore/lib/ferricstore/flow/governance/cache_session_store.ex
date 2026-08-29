@@ -1434,8 +1434,6 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
     end
   end
 
-  defp decode_head(_value), do: {:error, :cache_session_head_corrupt}
-
   defp encode_meta(meta) do
     TermCodec.encode(
       {@meta_tag, meta.session_id, meta.generation, meta.previous_session_id,
@@ -1476,8 +1474,6 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
         {:error, :cache_session_manifest_corrupt}
     end
   end
-
-  defp decode_meta(_value), do: {:error, :cache_session_manifest_corrupt}
 
   defp encode_page(page) do
     TermCodec.encode(
@@ -1649,8 +1645,6 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
       {:error, "ERR invalid flow governance cache session"}
     end
   end
-
-  defp validate_session(_session), do: {:error, "ERR invalid flow governance cache session"}
 
   defp valid_page_identity?(page) do
     valid_identity?(Map.get(page, :node_id)) and

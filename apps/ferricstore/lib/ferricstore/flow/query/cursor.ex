@@ -307,7 +307,7 @@ defmodule Ferricstore.Flow.Query.Cursor do
          true <- byte_size(envelope) > @nonce_bytes + @tag_bytes do
       ciphertext_bytes = byte_size(envelope) - @nonce_bytes - @tag_bytes
 
-      <<nonce::binary-size(@nonce_bytes), ciphertext::binary-size(ciphertext_bytes),
+      <<nonce::binary-size(@nonce_bytes), ciphertext::binary-size(^ciphertext_bytes),
         tag::binary-size(@tag_bytes)>> = envelope
 
       {:ok, nonce, ciphertext, tag}

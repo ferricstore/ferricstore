@@ -48,8 +48,6 @@ defmodule FerricstoreServer.Health.Dashboard do
     Schedules
   }
 
-  require Logger
-
   import FerricstoreServer.Health.Dashboard.DoctorSupport
   import FerricstoreServer.Health.Dashboard.Flow.Sample
 

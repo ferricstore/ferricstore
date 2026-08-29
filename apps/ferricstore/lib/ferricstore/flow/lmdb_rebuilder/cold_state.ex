@@ -352,7 +352,6 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
   defp decode_source_record(_key, materialized_value, _expire_at_ms, nil) do
     case Codec.decode_record(materialized_value) do
       record when is_map(record) -> {:ok, record, nil}
-      _invalid -> {:error, :invalid_flow_state_record}
     end
   end
 

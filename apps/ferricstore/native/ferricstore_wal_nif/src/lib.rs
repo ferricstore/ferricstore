@@ -25,10 +25,6 @@ use rustler::{Atom, Binary, Encoder, Env, LocalPid, NifResult, OwnedBinary, Reso
 use std::time::Duration;
 use wal_handle::WalHandle;
 
-// WalHandle is registered as a NIF resource via `rustler::resource!` in
-// the on_load callback below. The macro auto-implements `Resource`; no
-// manual impl is needed (and would conflict with the macro).
-
 mod atoms {
     rustler::atoms! {
         ok,
@@ -176,14 +172,4 @@ fn preallocate_keep_size<'a>(env: Env<'a>, path: String, bytes: u64) -> NifResul
 // Helpers
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// NIF Registration
-// ---------------------------------------------------------------------------
-
-#[allow(non_local_definitions)]
-fn on_load(env: Env, _info: Term) -> bool {
-    let _ = rustler::resource!(WalHandle, env);
-    true
-}
-
-rustler::init!("ferricstore_wal_nif", load = on_load);
+rustler::init!("ferricstore_wal_nif");

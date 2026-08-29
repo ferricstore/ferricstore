@@ -603,7 +603,7 @@ defmodule Ferricstore.Commands.Bitmap do
       end
 
     # Replace the byte in the binary
-    <<prefix::binary-size(byte_index), _old::8, suffix::binary>> = extended
+    <<prefix::binary-size(^byte_index), _old::8, suffix::binary>> = extended
     new_value = <<prefix::binary, new_byte::8, suffix::binary>>
 
     write_setbit_result(store, key, new_value, expire_at_ms, old_bit)
@@ -1074,8 +1074,6 @@ defmodule Ferricstore.Commands.Bitmap do
       combine_bitop_sources(op, values)
     end
   end
-
-  defp execute_bitop_ast(_op, _keys, _store), do: {:error, "ERR syntax error"}
 
   defp read_sources(source_keys, store) do
     with :ok <- ensure_string_keys(source_keys, store) do

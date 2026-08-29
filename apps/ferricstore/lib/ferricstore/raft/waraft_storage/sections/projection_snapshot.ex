@@ -496,23 +496,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
         end
       end
 
-      defp validate_snapshot_metadata(%{position: position} = metadata) when is_map(metadata) do
-        validation =
-          with :ok <- validate_raft_position(position),
-               :ok <- validate_apply_context_metadata(metadata),
-               :ok <- validate_snapshot_payload_metadata(metadata) do
-            :ok
-          end
-
-        case validation do
-          :ok ->
-            {:ok, metadata}
-
-          {:error, reason} ->
-            {:error, {:bad_snapshot_metadata, reason}}
-        end
-      end
-
       defp validate_snapshot_payload_metadata(metadata) do
         with :ok <-
                validate_snapshot_payload_dir_list(

@@ -269,9 +269,6 @@ defmodule Ferricstore.Commands.FuzzPropertyTest do
     ])
   end
 
-  defp random_list(count, _fun) when count <= 0, do: []
-  defp random_list(count, fun), do: Enum.map(1..count, fn _ -> fun.() end)
-
   defp random_printable(count) do
     if count <= 0, do: "", else: for(_ <- 1..count, into: "", do: <<Enum.random(32..126)>>)
   end

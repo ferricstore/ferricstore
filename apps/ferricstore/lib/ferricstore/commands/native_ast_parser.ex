@@ -1468,8 +1468,8 @@ defmodule Ferricstore.Commands.NativeAstParser do
       {mode, [value, fields_option, count | fields]} when mode in ~w(EX PX EXAT PXAT) ->
         if String.upcase(fields_option) == "FIELDS" do
           case parse_hgetex_expiry(mode, value) do
-            expiry when is_tuple(expiry) -> parse_hgetex_fields(key, expiry, count, fields)
             {:error, _} = error -> {:hgetex, key, error}
+            expiry when is_tuple(expiry) -> parse_hgetex_fields(key, expiry, count, fields)
           end
         else
           {:hgetex, key, {:error, "ERR syntax error"}}
@@ -2276,7 +2276,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp parse_flow_spawn_children([parent | rest]) do
     with {:ok, before_items, raw_items} <- split_items(rest),
          opts when is_list(opts) <- parse_flow_options(before_items, spec(:spawn_children)) do
-      mixed? = raw_items != [] and String.upcase(hd(raw_items)) == "MIXED"
+      mixed? = String.upcase(hd(raw_items)) == "MIXED"
       item_values = if mixed?, do: tl(raw_items), else: raw_items
       width = if mixed?, do: 4, else: 3
       items = parse_fixed_items(item_values, width, &spawn_child_item(&1, mixed?))

@@ -144,7 +144,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
 
       defp apply_projection_cache_measurement(_infinity_or_invalid), do: 0
 
-      defp build_sm_state(ctx, shard_index, persisted_apply_context \\ nil) do
+      defp build_sm_state(ctx, shard_index, persisted_apply_context) do
         data_dir = ctx.data_dir
         shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
         Ferricstore.FS.mkdir_p!(shard_data_path)

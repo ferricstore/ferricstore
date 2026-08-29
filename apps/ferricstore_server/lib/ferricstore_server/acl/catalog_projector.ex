@@ -196,7 +196,6 @@ defmodule FerricstoreServer.Acl.CatalogProjector do
       end
     else
       {:error, reason} -> projection_failed(state, reason)
-      :unavailable -> projection_failed(state, :unavailable)
     end
   end
 

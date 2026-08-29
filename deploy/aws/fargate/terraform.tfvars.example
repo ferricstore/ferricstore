@@ -1,7 +1,7 @@
 # Copy this file to terraform.tfvars and pin the image you intend to operate.
 aws_region      = "us-east-1"
 name_prefix     = "ferricstore"
-container_image = "quay.io/ferricstore/ferricstore:0.11.12"
+container_image = "quay.io/ferricstore/ferricstore:0.11.13"
 
 # The endpoint is always internal and defaults to the stack VPC CIDR.
 # Narrow this list when only particular application subnets need access.

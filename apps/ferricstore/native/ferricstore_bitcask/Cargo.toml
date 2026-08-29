@@ -12,8 +12,8 @@ crate-type = ["cdylib"]
 crc32fast = "1"
 heed = { version = "0.22.1", default-features = false }
 libc = "0.2"
-rustler = { version = "0.37", default-features = false, features = ["derive"] }
-sha2 = "0.10"
+rustler = { version = "0.38", default-features = false, features = ["derive"] }
+sha2 = "0.11"
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "fs"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 

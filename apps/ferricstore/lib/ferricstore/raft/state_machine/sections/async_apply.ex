@@ -78,7 +78,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       # whether it was the origin (Router already wrote) or a replica (empty
       # ETS, needs to apply). Deterministic per-node because it reads the
       # node's own local ETS state.
-      defp async_key_present?(state, {:put, key, _value, _exp}), do: ets_has?(state.ets, key)
       # Delete/getdel: Router deletes from ETS before Raft submit, so ets_has?
       # always returns false on origin. Always apply — tombstone writes are idempotent.
       defp async_key_present?(_state, {:delete, _key}), do: false
@@ -114,8 +113,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       end
 
       # Unknown inner command shape — conservative fallback: apply it (treat as replica).
-      defp async_key_present?(_state, _other), do: false
-
       defp ets_has?(ets, key) do
         case :ets.lookup(ets, key) do
           [] -> false

@@ -331,6 +331,21 @@ defmodule Ferricstore.Store.Promotion do
   end
 
   @doc false
+  @spec try_acquire_compaction_latch(map(), binary()) ::
+          :none | :busy | {:ok, {term(), term()}}
+  def try_acquire_compaction_latch(owner, redis_key) do
+    case compaction_latch(owner, redis_key) do
+      nil ->
+        :none
+
+      {tab, latch_key, _shard_index} ->
+        try_acquire_latch(tab, latch_key)
+    end
+  rescue
+    ArgumentError -> :none
+  end
+
+  @doc false
   @spec acquire_shared_log_latch(map()) :: :none | {term(), term()}
   def acquire_shared_log_latch(owner) do
     case shared_log_latch(owner) do
@@ -1138,9 +1153,6 @@ defmodule Ferricstore.Store.Promotion do
 
       {:error, reason} ->
         fail_recovery!(:open_dedicated, redis_key, shard_index, reason)
-
-      other ->
-        fail_recovery!(:open_dedicated, redis_key, shard_index, {:unexpected, other})
     end
   end
 

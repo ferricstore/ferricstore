@@ -72,7 +72,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
 
   defp normalize_value(value) when is_binary(value), do: value
   defp normalize_value(value) when is_atom(value), do: Atom.to_string(value)
-  defp normalize_value(value), do: to_string(value || "")
+  defp normalize_value(value), do: to_string(value)
 
   defp safe_boolean(fun) do
     fun.()

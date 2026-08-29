@@ -973,8 +973,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
         _ -> :ok
       end
 
-      defp rebuild_runtime_after_snapshot_rollback(_handle), do: :ok
-
       defp rollback_rebuild_metadata(nil, handle),
         do: %{
           position: Map.get(handle, :position, @zero_pos),

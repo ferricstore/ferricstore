@@ -189,7 +189,7 @@ defmodule Ferricstore.Flow.Query.CompositeIndexTest do
                CompositeIndex.entries(entry_definition, record, state_key, 5_000)
 
       for offset <- 0..(byte_size(entry.value) - 1) do
-        <<prefix::binary-size(offset), byte, suffix::binary>> = entry.value
+        <<prefix::binary-size(^offset), byte, suffix::binary>> = entry.value
         corrupted = <<prefix::binary, Bitwise.bxor(byte, 1), suffix::binary>>
         assert :error = CompositeIndex.decode_entry_value(corrupted)
       end

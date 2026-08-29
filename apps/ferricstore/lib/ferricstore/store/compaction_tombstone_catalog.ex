@@ -8,7 +8,7 @@ defmodule Ferricstore.Store.CompactionTombstoneCatalog do
   @release_timeout_ms 1_000
 
   @type t :: %{path: binary()}
-  @type record ::
+  @type catalog_record ::
           {binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), boolean()}
 
   @spec open(binary(), non_neg_integer()) :: {:ok, t()} | {:error, term()}
@@ -49,7 +49,7 @@ defmodule Ferricstore.Store.CompactionTombstoneCatalog do
     end
   end
 
-  @spec record_source_page(t(), [record()]) :: :ok | {:error, term()}
+  @spec record_source_page(t(), [catalog_record()]) :: :ok | {:error, term()}
   def record_source_page(%{path: path}, records) when is_list(records) do
     case record_source_page_count(%{path: path}, records) do
       {:ok, _new_candidates} -> :ok
@@ -57,7 +57,7 @@ defmodule Ferricstore.Store.CompactionTombstoneCatalog do
     end
   end
 
-  @spec record_source_page_count(t(), [record()]) ::
+  @spec record_source_page_count(t(), [catalog_record()]) ::
           {:ok, non_neg_integer()} | {:error, term()}
   def record_source_page_count(%{path: path}, records) when is_list(records) do
     with {:ok, candidates} <- source_candidates(records),
@@ -73,7 +73,7 @@ defmodule Ferricstore.Store.CompactionTombstoneCatalog do
     end
   end
 
-  @spec observe_lower_page(t(), [record()]) :: :ok | {:error, term()}
+  @spec observe_lower_page(t(), [catalog_record()]) :: :ok | {:error, term()}
   def observe_lower_page(%{path: path}, records) when is_list(records) do
     expiry_cutoff_ms =
       ExpiryContext.capture()
@@ -85,7 +85,7 @@ defmodule Ferricstore.Store.CompactionTombstoneCatalog do
     end
   end
 
-  @spec observe_lower_page_count(t(), [record()], non_neg_integer()) ::
+  @spec observe_lower_page_count(t(), [catalog_record()], non_neg_integer()) ::
           {:ok, non_neg_integer()} | {:error, term()}
   def observe_lower_page_count(%{path: path}, records, file_id)
       when is_list(records) and is_integer(file_id) and file_id >= 0 do
@@ -97,7 +97,7 @@ defmodule Ferricstore.Store.CompactionTombstoneCatalog do
   end
 
   @doc false
-  @spec observe_lower_page_count(t(), [record()], non_neg_integer(), non_neg_integer()) ::
+  @spec observe_lower_page_count(t(), [catalog_record()], non_neg_integer(), non_neg_integer()) ::
           {:ok, non_neg_integer()} | {:error, term()}
   def observe_lower_page_count(%{path: path}, records, file_id, expiry_cutoff_ms)
       when is_list(records) and is_integer(file_id) and file_id >= 0 and
@@ -117,7 +117,7 @@ defmodule Ferricstore.Store.CompactionTombstoneCatalog do
     end
   end
 
-  @spec needed_offsets(t(), [record()]) :: {:ok, [non_neg_integer()]} | {:error, term()}
+  @spec needed_offsets(t(), [catalog_record()]) :: {:ok, [non_neg_integer()]} | {:error, term()}
   def needed_offsets(%{path: path}, records) when is_list(records) do
     tombstones = Enum.filter(records, &tombstone_record?/1)
     keys = unique_catalog_keys(tombstones)

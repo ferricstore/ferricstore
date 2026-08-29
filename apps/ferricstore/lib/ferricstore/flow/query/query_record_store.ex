@@ -327,7 +327,6 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
     else
       {:ok, _rows, false} -> {:error, :query_hydration_batch_too_large}
       {:error, _reason} = error -> error
-      _invalid -> {:error, :query_storage_inconsistent}
     end
   end
 
@@ -443,7 +442,6 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
     else
       {:ok, _rows, false} -> {:error, :query_hydration_batch_too_large}
       {:error, _reason} = error -> error
-      _invalid -> {:error, :query_storage_inconsistent}
     end
   end
 

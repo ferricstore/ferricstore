@@ -6,8 +6,8 @@ Thanks for helping improve FerricStore. This repo is focused on FerricStore core
 
 Required tools:
 
-- Elixir >= 1.19
-- Erlang/OTP >= 28
+- Elixir >= 1.20
+- Erlang/OTP >= 29
 - Rust stable toolchain
 - `mix local.hex` and `mix local.rebar`
 

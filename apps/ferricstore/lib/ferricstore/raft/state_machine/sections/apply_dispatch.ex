@@ -164,15 +164,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           end)
 
         case result do
-          {command_result, flushed_state} ->
-            apply_state_put(:pending_state, flushed_state)
-            command_result
+          {:error, _reason} = error ->
+            error
 
           {:error, reason, partial_state} ->
             apply_state_put(:pending_state, partial_state)
             {:error, reason}
 
-          command_result ->
+          {command_result, flushed_state} ->
+            apply_state_put(:pending_state, flushed_state)
             command_result
         end
       end
@@ -728,9 +728,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
               else
                 {:error, _reason} = error ->
                   error
-
-                other ->
-                  {:error, {:unexpected_flush_shard_cleanup_result, other}}
               end
 
             {:error, _reason} = error ->
@@ -747,9 +744,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
       defp normalize_flush_shard_apply_result({:error, reason}),
         do: {:error, {:flush_shard_apply_failed, reason}}
-
-      defp normalize_flush_shard_apply_result(other),
-        do: {:error, {:flush_shard_apply_failed, {:unexpected_result, other}}}
 
       defp prepare_flush_shard(state, flush_epoch) do
         latch_token = Promotion.acquire_shared_log_latch(state)

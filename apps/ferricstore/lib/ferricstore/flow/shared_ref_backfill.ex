@@ -650,7 +650,6 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
       :not_found -> :missing_or_invalid
       :missing_or_invalid -> :missing_or_invalid
       false -> :missing_or_invalid
-      {:ok, _mismatched} -> :missing_or_invalid
     end
   end
 
@@ -901,8 +900,6 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
         :ok
     end
   end
-
-  defp merge_registry!(_ctx, _run_id, _info, refs) when map_size(refs) == 0, do: :ok
 
   defp merge_registry!(ctx, run_id, info, refs) do
     {existing, existing_value} =
@@ -1440,9 +1437,6 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
 
       {:error, reason} ->
         raise "shared-ref backfill failed to decode or hydrate LMDB QueryRows: #{inspect(reason)}"
-
-      other ->
-        raise "shared-ref backfill LMDB QueryRow read returned #{inspect(other)}"
     end
   end
 

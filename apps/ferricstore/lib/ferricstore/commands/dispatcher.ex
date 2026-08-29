@@ -291,9 +291,6 @@ defmodule Ferricstore.Commands.Dispatcher do
 
   def dispatch_ast({:ping, arg}, store), do: Server.handle("PING", [arg], store)
 
-  def dispatch_ast({:get, args}, store) when is_list(args),
-    do: Strings.handle_ast({:get, args}, store)
-
   def dispatch_ast({:get, key}, store), do: Strings.handle_ast({:get, key}, store)
   def dispatch_ast({:set, _key, _value} = ast, store), do: Strings.handle_ast(ast, store)
   def dispatch_ast({:set, _key, _value, _opts} = ast, store), do: Strings.handle_ast(ast, store)
@@ -687,7 +684,6 @@ defmodule Ferricstore.Commands.Dispatcher do
 
   defp ast_args({_tag, args}) when is_list(args), do: args
 
-  defp ast_command_name(:ping), do: "PING"
   defp ast_command_name(:echo), do: "ECHO"
   defp ast_command_name(:dbsize), do: "DBSIZE"
   defp ast_command_name(:keys), do: "KEYS"

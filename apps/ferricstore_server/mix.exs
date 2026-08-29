@@ -4,12 +4,12 @@ defmodule FerricstoreServer.MixProject do
   def project do
     [
       app: :ferricstore_server,
-      version: "0.11.12",
+      version: "0.11.13",
       build_path: "../../_build",
       config_path: "../../config/config.exs",
       deps_path: "../../deps",
       lockfile: "../../mix.lock",
-      elixir: "~> 1.19",
+      elixir: "~> 1.20",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       package: package(),
@@ -51,8 +51,8 @@ defmodule FerricstoreServer.MixProject do
       {:ranch, "~> 2.2"},
       {:jason, "~> 1.4"},
       {:telemetry, "~> 1.4"},
-      {:rustler_precompiled, "~> 0.8"},
-      {:rustler, "~> 0.37", optional: true},
+      {:rustler_precompiled, "~> 0.9"},
+      {:rustler, "~> 0.38", optional: true},
       {:arch_test, "~> 0.3.1", only: [:dev, :test], runtime: false}
     ]
   end

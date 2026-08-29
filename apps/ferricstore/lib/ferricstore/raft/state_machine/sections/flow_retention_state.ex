@@ -197,7 +197,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
              _source_truncated?
            )
            when remaining_limit <= 0 or remaining_keys <= 0 or remaining_bytes <= 0,
-           do: {Enum.reverse(candidates), remaining_state_keys != []}
+           do: {Enum.reverse(candidates), true}
 
       defp flow_retention_plan_terminal_state_keys(
              [state_key | rest],
@@ -688,14 +688,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
            ),
            do: {:error, :active_index_reverse_read_failed}
 
-      defp flow_hibernated_timeout_active_index_delete_ops_result(
-             _invalid,
-             _state_key,
-             _deadline_ms
-           ),
-           do: {:error, :active_index_reverse_read_failed}
-
       if Mix.env() == :test do
+        defp flow_hibernated_timeout_active_index_delete_ops_result(
+               _invalid,
+               _state_key,
+               _deadline_ms
+             ),
+             do: {:error, :active_index_reverse_read_failed}
+
         @doc false
         def __flow_hibernated_timeout_active_index_delete_ops_result_for_test__(
               state_key,

@@ -196,21 +196,21 @@ defmodule Ferricstore.Store.CompactionPlan do
     get_many_fun = Keyword.get(opts, :get_many_fun, &LMDB.get_many/2)
     write_fun = Keyword.get(opts, :write_fun, &LMDB.write_batch/2)
 
-    case reduce_pages(plan_path, page_size, :ok, fn page, :ok ->
-           case relocate_flow_locator_page(
-                  lmdb_path,
-                  page,
-                  direction,
-                  @compare_retries,
-                  get_many_fun,
-                  write_fun
-                ) do
-             :ok -> :ok
-             {:error, _reason} = error -> error
-           end
-         end) do
-      {:ok, :ok} -> :ok
-      {:error, _reason} = error -> error
+    with {:ok, :ok} <-
+           reduce_pages(plan_path, page_size, :ok, fn page, :ok ->
+             case relocate_flow_locator_page(
+                    lmdb_path,
+                    page,
+                    direction,
+                    @compare_retries,
+                    get_many_fun,
+                    write_fun
+                  ) do
+               :ok -> :ok
+               {:error, _reason} = error -> error
+             end
+           end) do
+      :ok
     end
   end
 
@@ -533,7 +533,6 @@ defmodule Ferricstore.Store.CompactionPlan do
       end
     else
       :error -> {:error, :invalid_query_row}
-      {:error, _reason} = error -> error
     end
   end
 
