@@ -2,6 +2,7 @@ defmodule Ferricstore.LibclusterConfigGuardTest do
   use ExUnit.Case, async: true
 
   @config_path Path.expand("../../../../config/config.exs", __DIR__)
+  @dockerfile_path Path.expand("../../../../Dockerfile", __DIR__)
   @runtime_path Path.expand("../../../../config/runtime.exs", __DIR__)
   @release_env_path Path.expand("../../../../rel/env.sh.eex", __DIR__)
 
@@ -32,10 +33,12 @@ defmodule Ferricstore.LibclusterConfigGuardTest do
   end
 
   test "runtime Consul discovery uses the bundled adapter contract" do
+    dockerfile = File.read!(@dockerfile_path)
     source = File.read!(@runtime_path)
 
     assert Code.ensure_loaded?(Cluster.Strategy.Consul)
     assert :libcluster_consul in Application.spec(:ferricstore_cluster_consul, :applications)
+    assert dockerfile =~ "COPY apps/ferricstore_cluster_consul/mix.exs"
     assert source =~ "strategy: Cluster.Strategy.Consul"
     assert source =~ "list_using: [{Cluster.Strategy.Consul.Health, passing: true}]"
     assert source =~ ~S|base_url: System.get_env("FERRICSTORE_CONSUL_URL"|
