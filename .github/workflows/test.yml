@@ -158,6 +158,11 @@ jobs:
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
 
+      - name: Build publishable Hex package
+        run: |
+          package_dir="$(mktemp -d)"
+          (cd apps/ferricstore && mix hex.build --unpack --output "$package_dir/ferricstore")
+
       - name: Validate native query benchmark contracts
         run: |
           MIX_ENV=bench mix deps.get

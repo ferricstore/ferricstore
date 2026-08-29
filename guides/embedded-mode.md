@@ -22,7 +22,7 @@ Only add `ferricstore` -- you do not need `ferricstore_server`:
 # mix.exs
 def deps do
   [
-    {:ferricstore, "~> 0.11.13"}
+    {:ferricstore, "~> 0.11.14"}
   ]
 end
 ```

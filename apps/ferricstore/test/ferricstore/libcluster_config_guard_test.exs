@@ -31,6 +31,39 @@ defmodule Ferricstore.LibclusterConfigGuardTest do
     assert source =~ "strategy: Cluster.Strategy.Epmd"
   end
 
+  test "runtime Consul discovery uses the bundled adapter contract" do
+    source = File.read!(@runtime_path)
+
+    assert Code.ensure_loaded?(Cluster.Strategy.Consul)
+    assert :libcluster_consul in Application.spec(:ferricstore_cluster_consul, :applications)
+    assert source =~ "strategy: Cluster.Strategy.Consul"
+    assert source =~ "list_using: [{Cluster.Strategy.Consul.Health, passing: true}]"
+    assert source =~ ~S|base_url: System.get_env("FERRICSTORE_CONSUL_URL"|
+    assert source =~ ~S|access_token: System.get_env("FERRICSTORE_CONSUL_TOKEN")|
+    assert source =~ ~S|service: [|
+    assert source =~ ~S|name: System.get_env("FERRICSTORE_CONSUL_SERVICE"|
+    assert source =~ "node_basename: node_basename"
+    refute source =~ "ClusterConsul.Strategy"
+    refute source =~ "agent_url:"
+    refute source =~ "service_name:"
+  end
+
+  test "runtime etcd discovery uses the bundled adapter contract" do
+    source = File.read!(@runtime_path)
+
+    assert Code.ensure_loaded?(LibclusterEtcd.Strategy)
+    assert source =~ "strategy: LibclusterEtcd.Strategy"
+    assert source =~ ~S|System.get_env("FERRICSTORE_ETCD_ENDPOINTS"|
+    assert source =~ ~S|System.get_env("FERRICSTORE_ETCD_PREFIX"|
+    assert source =~ ~S|String.split(",", trim: true)|
+    assert source =~ ~S|String.trim("/")|
+    assert source =~ "etcd_nodes: etcd_nodes"
+    assert source =~ "directory: directory"
+    refute source =~ "Cluster.Strategy.Etcd"
+    refute source =~ "endpoints:"
+    refute source =~ "prefix:"
+  end
+
   test "release uses long-name distribution for a Fargate DNS identity" do
     command =
       ~S|. "$1"; printf '%s\n%s\n%s' "$RELEASE_NODE" "$RELEASE_DISTRIBUTION" "$RELEASE_COOKIE"|
