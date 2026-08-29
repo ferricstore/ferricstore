@@ -4,7 +4,7 @@ defmodule Ferricstore.Umbrella.MixProject do
   def project do
     [
       apps_path: "apps",
-      version: "0.11.13",
+      version: "0.11.14",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       aliases: aliases(),
@@ -13,6 +13,7 @@ defmodule Ferricstore.Umbrella.MixProject do
           applications: [
             ranch: :permanent,
             ferricstore: :permanent,
+            ferricstore_cluster_consul: :permanent,
             ferricstore_server: :permanent,
             ferricstore_http: :permanent
           ],

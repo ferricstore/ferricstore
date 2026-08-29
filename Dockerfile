@@ -32,6 +32,7 @@ ENV HEX_HTTP_CONCURRENCY=2
 # Copy mix files (all apps needed for umbrella resolution)
 COPY mix.exs mix.lock ./
 COPY apps/ferricstore/mix.exs apps/ferricstore/mix.exs
+COPY apps/ferricstore_cluster_consul/mix.exs apps/ferricstore_cluster_consul/mix.exs
 COPY apps/ferricstore_server/mix.exs apps/ferricstore_server/mix.exs
 COPY apps/ferricstore_http/mix.exs apps/ferricstore_http/mix.exs
 COPY config/config.exs config/prod.exs config/runtime.exs config/

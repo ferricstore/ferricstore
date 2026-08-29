@@ -4,6 +4,17 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.14 - 2026-08-29
+
+- Made the core Hex package dependency graph publishable while retaining
+  `libcluster` 3.5.0 by moving the upstream Consul adapter into a release-only
+  umbrella support application.
+- Corrected Consul and etcd discovery to use each adapter's actual strategy
+  module and option contract, including healthy Consul service lookup and
+  normalized etcd endpoints and key directories.
+- Added a required CI gate that builds and unpacks the core Hex package before
+  a release tag can be merged.
+
 ## 0.11.13 - 2026-08-28
 
 - Upgraded the supported runtime baseline to Elixir 1.20.4, Erlang/OTP 29.0.5,

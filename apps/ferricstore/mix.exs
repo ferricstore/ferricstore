@@ -1,7 +1,7 @@
 defmodule Ferricstore.MixProject do
   use Mix.Project
 
-  @version "0.11.13"
+  @version "0.11.14"
 
   def project do
     [
@@ -96,8 +96,7 @@ defmodule Ferricstore.MixProject do
       {:rustler_precompiled, "~> 0.9"},
       {:rustler, "~> 0.38", optional: true},
       {:wa_raft, "~> 0.1", hex: :ferricstore_waraft},
-      {:libcluster, "3.5.0", override: true},
-      {:libcluster_consul, "1.3.0", optional: true},
+      {:libcluster, "3.5.0"},
       {:libcluster_etcd, "1.1.2", optional: true},
       {:telemetry, "~> 1.4"},
       {:jason, "~> 1.4"},
