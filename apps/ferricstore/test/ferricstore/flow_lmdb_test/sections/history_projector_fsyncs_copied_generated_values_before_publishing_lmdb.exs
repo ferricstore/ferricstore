@@ -650,7 +650,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
         keydir = :ets.new(:flow_lmdb_empty_rebuild_keydir, [:set])
 
         on_exit(fn ->
-          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
           File.rm_rf!(data_dir)
         end)
 
@@ -780,7 +779,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
           restore_env(:flow_async_history, old_async_history)
           restore_env(:flow_lmdb_rebuild_history_write_hook, old_hook)
           :telemetry.detach(handler_id)
-          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
           File.rm_rf!(data_dir)
         end)
 
@@ -864,7 +862,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
         on_exit(fn ->
           restore_env(:flow_async_history, old_async_history)
           restore_env(:flow_lmdb_rebuild_history_write_hook, old_hook)
-          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
           File.rm_rf!(data_dir)
         end)
 
@@ -953,7 +950,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
 
         on_exit(fn ->
           Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(data_dir, shard_index)
-          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
           File.rm_rf!(data_dir)
         end)
 
