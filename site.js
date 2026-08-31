@@ -1,30 +1,16 @@
 (function () {
   "use strict";
 
+  // Lead with workflow stories and visual explanations. Code-forward comparisons
+  // follow them, then lower-level messaging and data-structure demonstrations.
   var demos = [
-    {
-      id: "split-lab",
-      title: "Split Lab",
-      icon: "⚡",
-      description: "Crash an AI research worker during summarization and watch a replacement resume from durable state without repeating completed work.",
-      topics: ["Featured", "AI & workflows", "Reliability"],
-      accent: "#8b5cf6"
-    },
     {
       id: "workflow-explainer",
       title: "Workflows for Humans",
       icon: "🎮",
       description: "Learn durable workflows through a familiar save-point story before exploring leases, retries, and recovery.",
-      topics: ["Getting started", "AI & workflows"],
+      topics: ["Featured", "Getting started", "AI & workflows"],
       accent: "#6366f1"
-    },
-    {
-      id: "architecture-comparison",
-      title: "Architecture Comparison",
-      icon: "◫",
-      description: "Compare volatile scripts, queues, database polling, and durable workflow state under the same failure conditions.",
-      topics: ["Featured", "Architecture", "Reliability"],
-      accent: "#38bdf8"
     },
     {
       id: "ai-agent-workflow",
@@ -51,36 +37,12 @@
       accent: "#f472b6"
     },
     {
-      id: "rate-limiting-stream",
-      title: "Rate Limiting & Micro-Batching",
-      icon: "≋",
-      description: "Absorb a webhook burst into a durable stream, enforce throughput limits, and process bounded batches.",
-      topics: ["Queues & messaging", "Architecture"],
-      accent: "#22d3ee"
-    },
-    {
-      id: "zombie-fencing",
-      title: "Zombie Worker Fencing",
-      icon: "⛨",
-      description: "See a stale worker return after lease expiry and lose its write to a newer monotonic fencing token.",
-      topics: ["Architecture", "Reliability"],
-      accent: "#fb7185"
-    },
-    {
-      id: "idempotency-determinism",
-      title: "Idempotency & Determinism",
-      icon: "◇",
-      description: "Explore the duplicate-side-effect boundary and protect retries with stable operation identities and guarded effects.",
-      topics: ["Getting started", "AI & workflows", "Reliability"],
-      accent: "#a78bfa"
-    },
-    {
-      id: "parallel-fanout",
-      title: "Parallel Fan-Out",
-      icon: "⑂",
-      description: "Split a batch into independently recoverable children, then join their results without replaying successful work.",
-      topics: ["AI & workflows", "Queues & messaging"],
-      accent: "#60a5fa"
+      id: "ticket-reservation",
+      title: "Flash-Sale Reservation",
+      icon: "🎟",
+      description: "Hold scarce inventory with durable expiration, guarded ownership, and a clean transition from reservation to purchase.",
+      topics: ["Getting started", "AI & workflows"],
+      accent: "#f97316"
     },
     {
       id: "canary-rollback",
@@ -91,12 +53,12 @@
       accent: "#fbbf24"
     },
     {
-      id: "ticket-reservation",
-      title: "Flash-Sale Reservation",
-      icon: "🎟",
-      description: "Hold scarce inventory with durable expiration, guarded ownership, and a clean transition from reservation to purchase.",
-      topics: ["Getting started", "AI & workflows"],
-      accent: "#f97316"
+      id: "parallel-fanout",
+      title: "Parallel Fan-Out",
+      icon: "⑂",
+      description: "Split a batch into independently recoverable children, then join their results without replaying successful work.",
+      topics: ["AI & workflows", "Queues & messaging"],
+      accent: "#60a5fa"
     },
     {
       id: "agent-loop",
@@ -107,6 +69,38 @@
       accent: "#ec4899"
     },
     {
+      id: "split-lab",
+      title: "Split Lab",
+      icon: "⚡",
+      description: "Crash an AI research worker during summarization and watch a replacement resume from durable state without repeating completed work.",
+      topics: ["Featured", "AI & workflows", "Reliability"],
+      accent: "#8b5cf6"
+    },
+    {
+      id: "idempotency-determinism",
+      title: "Idempotency & Determinism",
+      icon: "◇",
+      description: "Explore the duplicate-side-effect boundary and protect retries with stable operation identities and guarded effects.",
+      topics: ["Getting started", "AI & workflows", "Reliability"],
+      accent: "#a78bfa"
+    },
+    {
+      id: "zombie-fencing",
+      title: "Zombie Worker Fencing",
+      icon: "⛨",
+      description: "See a stale worker return after lease expiry and lose its write to a newer monotonic fencing token.",
+      topics: ["Architecture", "Reliability"],
+      accent: "#fb7185"
+    },
+    {
+      id: "architecture-comparison",
+      title: "Architecture Comparison",
+      icon: "◫",
+      description: "Compare volatile scripts, queues, database polling, and durable workflow state under the same failure conditions.",
+      topics: ["Featured", "Architecture", "Reliability"],
+      accent: "#38bdf8"
+    },
+    {
       id: "hot-cold-storage",
       title: "Hot & Cold Storage",
       icon: "▦",
@@ -115,12 +109,12 @@
       accent: "#2dd4bf"
     },
     {
-      id: "cache-stampede",
-      title: "Cache Stampede Shield",
-      icon: "☂",
-      description: "Coordinate one recomputation while concurrent callers reuse the result instead of overwhelming the origin.",
-      topics: ["Getting started", "Data structures", "Reliability"],
-      accent: "#34d399"
+      id: "rate-limiting-stream",
+      title: "Rate Limiting & Micro-Batching",
+      icon: "≋",
+      description: "Absorb a webhook burst into a durable stream, enforce throughput limits, and process bounded batches.",
+      topics: ["Queues & messaging", "Architecture"],
+      accent: "#22d3ee"
     },
     {
       id: "beginner-queue",
@@ -129,6 +123,14 @@
       description: "Enqueue, claim, lease, retry, and complete a background job with the core ownership rules made visible.",
       topics: ["Getting started", "Queues & messaging"],
       accent: "#818cf8"
+    },
+    {
+      id: "cache-stampede",
+      title: "Cache Stampede Shield",
+      icon: "☂",
+      description: "Coordinate one recomputation while concurrent callers reuse the result instead of overwhelming the origin.",
+      topics: ["Getting started", "Data structures", "Reliability"],
+      accent: "#34d399"
     },
     {
       id: "stream-vs-pubsub",
@@ -162,7 +164,7 @@
     ids.add(demo.id);
   });
 
-  var topicOrder = ["All", "Featured", "Getting started", "AI & workflows", "Queues & messaging", "Data structures", "Architecture", "Reliability"];
+  var topicOrder = ["All", "AI & workflows", "Getting started", "Featured", "Queues & messaging", "Data structures", "Architecture", "Reliability"];
   var grid = document.querySelector("[data-demo-grid]");
   var filters = document.querySelector("[data-filters]");
   var search = document.querySelector("[data-search]");
