@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Travel Booking & Reversible Sagas | FerricStore Demos</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="./style.css?v=2">
   <link rel="stylesheet" href="../shared/polish.css">
   <link rel="stylesheet" href="../shared/accuracy.css?v=4">
 </head>
@@ -37,30 +37,36 @@
           <strong>Flights + Marriott Hotel + Rental Car ($850.00)</strong>
         </div>
         <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-          <button class="ctrl-btn" style="border-color: #ef4444; color: #fca5a5;" data-fail-hotel>🏨 Simulate Hotel Sold Out</button>
-          <button class="ctrl-btn" style="border-color: #f59e0b; color: #fde68a;" data-fail-flight>✈️ Simulate Delta 500 Error</button>
-          <button class="ctrl-btn" style="border-color: #10b981; color: #6ee7b7;" data-success-run>✓ Happy Path (Success)</button>
+          <button class="ctrl-btn scenario-choice is-selected" style="border-color: #ef4444; color: #fca5a5;" data-fail-hotel aria-pressed="true">🏨 Hotel Sold Out</button>
+          <button class="ctrl-btn scenario-choice" style="border-color: #f59e0b; color: #fde68a;" data-fail-flight aria-pressed="false">✈️ Delta HTTP 500</button>
+          <button class="ctrl-btn scenario-choice" style="border-color: #10b981; color: #6ee7b7;" data-success-run aria-pressed="false">✓ Happy Path</button>
         </div>
       </header>
 
+      <div class="current-run" aria-live="polite">
+        <span>Current run</span>
+        <strong data-current-run-label>Hotel sold out</strong>
+        <small data-current-run-step>Step 1 of 5 · Customer Card Authorized ($850.00)</small>
+      </div>
+
       <!-- 4 Saga Stations Grid -->
       <div class="saga-stations-grid">
-        <div class="saga-node" data-saga-node="0">
-          <div class="sn-head"><span>STEP 1</span><span class="node-pill">DONE</span></div>
+        <div class="saga-node is-active" data-saga-node="0">
+          <div class="sn-head"><span>STEP 1</span><span class="node-pill">ACTIVE</span></div>
           <div class="sn-icon">💳</div>
           <strong>1. Card Authorized</strong>
           <small>Stripe API ($850)</small>
         </div>
 
         <div class="saga-node" data-saga-node="1">
-          <div class="sn-head"><span>STEP 2</span><span class="node-pill">DONE</span></div>
+          <div class="sn-head"><span>STEP 2</span><span class="node-pill">PENDING</span></div>
           <div class="sn-icon">✈️</div>
           <strong>2. Flight Booked</strong>
           <small>Delta Seat #14B</small>
         </div>
 
         <div class="saga-node" data-saga-node="2">
-          <div class="sn-head"><span>STEP 3</span><span class="node-pill">ACTIVE</span></div>
+          <div class="sn-head"><span>STEP 3</span><span class="node-pill">PENDING</span></div>
           <div class="sn-icon">🏨</div>
           <strong>3. Hotel Reserved</strong>
           <small>Marriott King Suite</small>
@@ -87,11 +93,11 @@
           </div>
           <div class="ledger-row">
             <span>Delta Airlines Authorization</span>
-            <strong data-ledger-flight>+$350.00</strong>
+            <strong data-ledger-flight>$0.00</strong>
           </div>
           <div class="ledger-row">
             <span>Marriott Hotel Hold</span>
-            <strong data-ledger-hotel>$0.00 (Pending)</strong>
+            <strong data-ledger-hotel>$0.00</strong>
           </div>
           <div class="ledger-row">
             <span>Compensating Refunds Issued</span>
@@ -99,21 +105,19 @@
           </div>
           <div class="ledger-row total">
             <span>Net Unbalanced Liability</span>
-            <strong data-ledger-balance>$0.00 (Balanced)</strong>
+            <strong data-ledger-balance>$850.00</strong>
           </div>
         </div>
 
         <!-- Narrative Box -->
         <div class="saga-narrative-box">
-          <div class="saga-badge good" data-narrative-badge>✓ STEP EXECUTED</div>
-          <h3 style="margin: 0 0 6px; font-size: 18px;" data-narrative-title>Reserving Hotel Room</h3>
+          <div class="saga-badge good" data-narrative-badge>💳 STEP 1: PAYMENT OK</div>
+          <h3 style="margin: 0 0 6px; font-size: 18px;" data-narrative-title>1. Customer Card Authorized ($850.00)</h3>
           <p style="margin: 0 0 12px; font-size: 13.5px; color: var(--text-muted);" data-narrative-desc>
-            Communicating with the Marriott partner API. If this state fails, application logic transitions into explicit compensation states in reverse order.
+            Stripe payment succeeded with a stable provider idempotency key; refund is an explicit state.
           </p>
           <div style="font-family: var(--font-mono); font-size: 11.5px; color: #34d399; background: rgba(0,0,0,0.4); padding: 8px; border-radius: 4px;" data-narrative-code>
-            @ctx.effect("hotel", "marriott.book", operation_digest=f"hotel:{ctx.id}:v1")<br>
-            def book_hotel(): ...<br>
-            hotel_id = book_hotel()
+            stripe.charge(85000, idempotency_key=f'{job.id}:charge:v1')
           </div>
         </div>
       </div>
@@ -132,12 +136,12 @@
         </div>
         <div class="telemetry-card">
           <small>Rollback Cadence</small>
-          <div class="telemetry-val" data-val-cadence>Exact Reverse</div>
+          <div class="telemetry-val" data-val-cadence>Pending</div>
           <span class="telemetry-sub">LIFO unwind sequence</span>
         </div>
         <div class="telemetry-card">
           <small>Execution Latency</small>
-          <div class="telemetry-val" style="color: #38bdf8;" data-val-latency>Durable commit</div>
+          <div class="telemetry-val" style="color: #38bdf8;" data-val-latency>Deployment-dependent</div>
           <span class="telemetry-sub">Topology-dependent latency</span>
         </div>
       </div>
@@ -178,8 +182,19 @@ def flight(ctx):
     @ctx.effect("flight", "delta.book", operation_digest=f"flight:{ctx.id}:v1")
     def book():
         return delta.book_seat("DL402", request_id=f"{ctx.id}:flight:v1")
-    seat = book()
-    return transition("book_hotel", values={"seat_id": seat.id})
+    try:
+        seat = book()
+        return transition("book_hotel", values={"seat_id": seat.id})
+    except DeltaUpstream5xx:
+        # A 500 is ambiguous: verify by stable request ID before retrying.
+        return transition("verify_flight")
+
+@saga.state("verify_flight")
+def verify_flight(ctx):
+    seat = delta.get_booking(request_id=f"{ctx.id}:flight:v1")
+    if seat:
+        return transition("book_hotel", values={"seat_id": seat.id})
+    return transition("refund_card")
 
 @saga.state("book_hotel")
 def hotel(ctx):
@@ -217,7 +232,7 @@ def refund_card(ctx):
     return complete(result={"status": "ROLLED_BACK"})</code></pre>
     </section>
   </main>
-  <script src="./saga.js?v=4"></script>
+  <script src="./saga.js?v=5"></script>
   <script src="../shared/accuracy.js?v=8"></script>
 </body>
 </html>

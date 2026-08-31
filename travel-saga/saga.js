@@ -1,8 +1,8 @@
 (function () {
   "use strict";
 
-  var currentMode = "hotelFail"; // Default to hotelFail to show the saga superpower immediately
-  var currentStep = 2;
+  var currentMode = "hotelFail";
+  var currentStep = 0;
   var isPaused = false;
   var timer = null;
 
@@ -187,8 +187,95 @@
   }
 ];
 
+  var flightFailSteps = [
+  {
+    "badge": "💳 STEP 1: PAYMENT OK",
+    "badgeClass": "good",
+    "title": "1. Customer Card Authorized ($850.00)",
+    "desc": "Stripe payment succeeded with a stable provider idempotency key; refund is an explicit state.",
+    "code": "stripe.charge(85000, idempotency_key=f'{job.id}:charge:v1')",
+    "charge": "+$850.00",
+    "flight": "$0.00",
+    "hotel": "$0.00",
+    "refund": "$0.00",
+    "balance": "$850.00",
+    "comp": "Normal",
+    "stranded": "$0.00",
+    "cadence": "Pending",
+    "latency": "Deployment-dependent",
+    "activeNode": 0,
+    "failedNode": -1,
+    "compensatedNodes": []
+  },
+  {
+    "badge": "❌ STEP 2: DELTA HTTP 500",
+    "badgeClass": "bad",
+    "title": "2. Delta Booking Returned an Ambiguous 500",
+    "desc": "A transport error does not prove whether the seat was created. The workflow records the ambiguous outcome and verifies the stable request ID before calling the hotel.",
+    "code": "return transition('verify_flight')  # do not call hotel yet",
+    "charge": "+$850.00",
+    "flight": "⚠️ OUTCOME UNKNOWN",
+    "hotel": "$0.00 (Not Called)",
+    "refund": "$0.00",
+    "balance": "$850.00 (Verifying Flight)",
+    "comp": "VERIFYING OUTCOME",
+    "stranded": "$0.00",
+    "cadence": "Check Before Retry",
+    "latency": "Deployment-dependent",
+    "activeNode": 1,
+    "failedNode": 1,
+    "compensatedNodes": []
+  },
+  {
+    "badge": "🔎 FLIGHT OUTCOME VERIFIED",
+    "badgeClass": "warn",
+    "title": "Delta Confirms No Seat Was Created",
+    "desc": "The stable request ID is absent at Delta. There is no flight to cancel, so the saga skips the hotel and moves directly to refund_card.",
+    "code": "if not delta.get_booking(request_id=flight_key): return transition('refund_card')",
+    "charge": "+$850.00",
+    "flight": "$0.00 (Not Created)",
+    "hotel": "$0.00 (Not Called)",
+    "refund": "$0.00",
+    "balance": "$850.00 (Pending Refund)",
+    "comp": "SKIP FLIGHT CANCEL",
+    "stranded": "$0.00",
+    "cadence": "Verified Absent",
+    "latency": "Deployment-dependent",
+    "activeNode": 1,
+    "failedNode": 1,
+    "compensatedNodes": []
+  },
+  {
+    "badge": "✓ SAGA COMPLETE: $850.00 REFUNDED",
+    "badgeClass": "good",
+    "title": "Compensating Step 1: Customer Fully Refunded",
+    "desc": "Only the card needs compensation. The refund uses a stable Stripe key, while the hotel and car were never called.",
+    "code": "stripe.refund(tx.id, idempotency_key=f'{job.id}:refund:v1')",
+    "charge": "$0.00 (Refunded)",
+    "flight": "$0.00 (Not Created)",
+    "hotel": "$0.00 (Not Called)",
+    "refund": "-$850.00",
+    "balance": "$0.00 (Balanced)",
+    "comp": "CARD ONLY",
+    "stranded": "$0.00",
+    "cadence": "Clean Exit",
+    "latency": "Deployment-dependent",
+    "activeNode": 0,
+    "failedNode": 1,
+    "compensatedNodes": [0]
+  }
+];
+
   function getSteps() {
-    return currentMode === "hotelFail" ? hotelFailSteps : normalSteps;
+    if (currentMode === "hotelFail") return hotelFailSteps;
+    if (currentMode === "flightFail") return flightFailSteps;
+    return normalSteps;
+  }
+
+  function getModeLabel() {
+    if (currentMode === "hotelFail") return "Hotel sold out";
+    if (currentMode === "flightFail") return "Delta HTTP 500";
+    return "Happy path";
   }
 
   var nodes = document.querySelectorAll("[data-saga-node]");
@@ -213,6 +300,8 @@
   var nextBtn = document.querySelector("[data-next]");
   var replayBtn = document.querySelector("[data-replay]");
   var liveStatus = document.querySelector("[data-live-status]");
+  var currentRunLabel = document.querySelector("[data-current-run-label]");
+  var currentRunStep = document.querySelector("[data-current-run-step]");
 
   var failHotelBtn = document.querySelector("[data-fail-hotel]");
   var failFlightBtn = document.querySelector("[data-fail-flight]");
@@ -263,8 +352,25 @@
     if (valCadence) valCadence.textContent = data.cadence;
     if (valLatency) valLatency.textContent = data.latency;
 
+    var modeLabel = getModeLabel();
+    var stepTitle = data.title.replace(/^\d+\.\s*/, "");
+    var stepLabel = "Step " + (currentStep + 1) + " of " + steps.length + " · " + stepTitle;
+    if (currentRunLabel) currentRunLabel.textContent = modeLabel;
+    if (currentRunStep) currentRunStep.textContent = stepLabel;
+
+    [
+      { button: failHotelBtn, mode: "hotelFail" },
+      { button: failFlightBtn, mode: "flightFail" },
+      { button: successRunBtn, mode: "normal" }
+    ].forEach(function (choice) {
+      if (!choice.button) return;
+      var selected = currentMode === choice.mode;
+      choice.button.classList.toggle("is-selected", selected);
+      choice.button.setAttribute("aria-pressed", String(selected));
+    });
+
     if (pauseBtn) pauseBtn.textContent = isPaused ? "▶ Play" : "⏸ Pause";
-    if (liveStatus) liveStatus.textContent = isPaused ? "Simulation Paused" : "Auto-advancing simulation";
+    if (liveStatus) liveStatus.textContent = (isPaused ? "Paused" : "Running") + " · " + modeLabel + " · Step " + (currentStep + 1) + " of " + steps.length;
   }
 
   function clearTimer() {
@@ -289,7 +395,8 @@
   if (failHotelBtn) {
     failHotelBtn.addEventListener("click", function () {
       currentMode = "hotelFail";
-      currentStep = 2; // Jump directly to hotel sold out failure point
+      currentStep = 0;
+      isPaused = false;
       render();
       schedule();
     });
@@ -299,6 +406,7 @@
     successRunBtn.addEventListener("click", function () {
       currentMode = "normal";
       currentStep = 0;
+      isPaused = false;
       render();
       schedule();
     });
@@ -306,20 +414,13 @@
 
   if (failFlightBtn) {
     failFlightBtn.addEventListener("click", function () {
-      currentMode = "hotelFail";
-      currentStep = 2;
+      currentMode = "flightFail";
+      currentStep = 0;
+      isPaused = false;
       render();
       schedule();
     });
   }
-
-  nodes.forEach(function (node, idx) {
-    node.addEventListener("click", function () {
-      currentStep = idx;
-      render();
-      schedule();
-    });
-  });
 
   if (pauseBtn) {
     pauseBtn.addEventListener("click", function () {

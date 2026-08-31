@@ -58,6 +58,30 @@ h1, h2, h3, h4, .hero-pill, .badge-label, .ctrl-btn {
 .stage-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border-subtle); flex-wrap: wrap; }
 .scenario-badge { display: inline-flex; align-items: center; gap: 10px; font-size: 14px; color: #fff; }
 .badge-label { padding: 4px 10px; border-radius: var(--radius-sm); background: rgba(16, 185, 129, 0.18); color: #6ee7b7; font-size: 11px; font-weight: 750; }
+.scenario-choice { opacity: 0.64; }
+.scenario-choice.is-selected {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.12);
+  box-shadow: 0 0 0 2px currentColor;
+}
+.current-run {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  align-items: center;
+  gap: 10px;
+  margin: -8px 0 20px;
+  padding: 10px 14px;
+  border: 1px solid rgba(139, 92, 246, 0.35);
+  border-radius: var(--radius-sm);
+  background: rgba(139, 92, 246, 0.1);
+}
+.current-run span { color: #c4b5fd; font-size: 10px; font-weight: 850; letter-spacing: 0.08em; text-transform: uppercase; }
+.current-run strong { color: #fff; font-size: 13px; }
+.current-run small { color: var(--text-muted); font-size: 12px; text-align: right; }
+@media (max-width: 720px) {
+  .current-run { grid-template-columns: auto 1fr; }
+  .current-run small { grid-column: 1 / -1; text-align: left; }
+}
 
 /* 4 Saga Stations */
 .saga-stations-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 24px; }
@@ -66,7 +90,7 @@ h1, h2, h3, h4, .hero-pill, .badge-label, .ctrl-btn {
 .saga-node {
   background: #110e2b; border: 1.5px solid rgba(255, 255, 255, 0.08);
   border-radius: var(--radius-md); padding: 14px; text-align: center;
-  cursor: pointer; transition: all 0.25s; min-height: 120px;
+  cursor: default; transition: all 0.25s; min-height: 120px;
   display: flex; flex-direction: column; justify-content: space-between;
 }
 .saga-node:hover { background: #171338; }
