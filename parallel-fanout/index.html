@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Parallel Fan-Out &amp; Map-Reduce · FerricStore</title>
+  <link rel="stylesheet" href="../shared/base.css">
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@500;600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=4">
+</head>
+<body data-mode="after">
+
+  <!-- Top Navigation -->
+  <nav class="demo-nav" aria-label="Demo Header">
+    <a href="../" class="nav-brand">
+      <span class="nav-logo">🔀</span>
+      <div>
+        <strong>FerricStore Workflows</strong>
+        <small>Parallel Fan-Out &amp; Map-Reduce</small>
+      </div>
+    </a>
+    <div class="nav-center">
+      <span class="nav-tag">DIRECTION 11 · MAP-REDUCE BARRIERS</span>
+    </div>
+    <div class="nav-right">
+      <a href="../" class="nav-back-link">← All Demos</a>
+    </div>
+  </nav>
+
+  <main class="demo-main">
+    <!-- Hero Section -->
+    <header class="demo-hero">
+      <div class="hero-tag">BATCH PROCESSING &amp; DISTRIBUTED BARRIERS</div>
+      <h1>
+        When 1 of 16 Workers Dies,<br>
+        <span class="hero-accent">Only That Chunk Retries.</span>
+      </h1>
+      <p class="hero-desc">
+        Compare 16 parallel video chunks. An ad-hoc in-memory barrier can lose completion knowledge, while FerricStore can keep each child flow's result durable so a replacement worker reclaims only unfinished work before the parent joins.
+      </p>
+
+      <!-- Mode Switch Tabs -->
+      <div class="mode-switch" role="tablist" aria-label="Execution Mode">
+        <button type="button" role="tab" data-mode-btn="before" aria-selected="false">
+          <span class="mode-tab-title">Without FerricStore</span>
+          <span class="mode-tab-badge bad">❌ Celery Chords (Full Restart)</span>
+        </button>
+        <button type="button" role="tab" data-mode-btn="after" aria-selected="true" class="is-selected">
+          <span class="mode-tab-title">With FerricStore</span>
+          <span class="mode-tab-badge good">✓ Durable Barrier (1-Chunk Resume)</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Metrics Bar -->
+    <section class="metrics-bar" aria-label="Live Metrics Comparison">
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">💥</span>
+          <small>WORKER FAILURE POINT</small>
+        </div>
+        <strong class="metric-val text-red" data-metric-fail>Chunk #9 (88% Progress)</strong>
+        <span class="metric-sub">OOM / Node Eviction Crash</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">🔄</span>
+          <small>RE-COMPUTED CHUNKS</small>
+        </div>
+        <strong class="metric-val" data-metric-chunks>1 Chunk Only</strong>
+        <span class="metric-sub" data-metric-chunks-sub>15 Chunks loaded from disk</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">⚡</span>
+          <small>BARRIER GATHER LATENCY</small>
+        </div>
+        <strong class="metric-val text-cyan" data-metric-latency>After child completion</strong>
+        <span class="metric-sub">Lease-aware child reclaim</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">🛡️</span>
+          <small>COMPUTE EFFICIENCY</small>
+        </div>
+        <strong class="metric-val text-green" data-metric-eff>Committed chunks reused</strong>
+        <span class="metric-sub" data-metric-eff-sub>0 redundant GPU cycles</span>
+      </div>
+    </section>
+
+    <!-- Main Workspace (Code on Left, Visualizer on Right) -->
+    <section class="demo-workspace">
+      
+      <!-- Code Panel -->
+      <article class="code-panel">
+        <header class="panel-header">
+          <div class="file-info">
+            <span class="file-icon">py</span>
+            <div>
+              <h2 id="code-title" data-code-title>transcode_continue.py</h2>
+              <small data-code-kicker>FERRICSTORE CHILD FLOW API</small>
+            </div>
+          </div>
+          <div class="code-controls">
+            <div class="sdk-style-toggle" data-sdk-toggle>
+              <button type="button" class="sdk-btn" data-sdk-style="steps">Fused Continue</button>
+              <button type="button" class="sdk-btn is-active" data-sdk-style="states">Current SDK</button>
+            </div>
+            <span class="badge-durable" data-code-badge>DURABLE PARALLEL</span>
+          </div>
+        </header>
+
+        <!-- Code Block: Before Mode -->
+        <pre class="code-block" data-code="before" hidden><code><span data-line="1"><b class="ln">1</b><span><i class="k">from</i> celery <i class="k">import</i> chord</span></span>
+<span data-line="2"><b class="ln">2</b><span></span></span>
+<span data-line="3"><b class="ln">3</b><span><i class="k">def</i> <i class="fn">transcode_video</i>(chunks: <i class="t">list</i>):</span></span>
+<span data-line="4"><b class="ln">4</b><span>    <i class="c"># ❌ In-memory chord barrier: if 1 worker dies, chord hangs or restarts all!</i></span></span>
+<span data-line="5"><b class="ln">5</b><span>    header = [render_chunk.<i class="fn">s</i>(c) <i class="k">for</i> c <i class="k">in</i> chunks]</span></span>
+<span data-line="6"><b class="ln">6</b><span>    callback = stitch_video.<i class="fn">s</i>()</span></span>
+<span data-line="7"><b class="ln">7</b><span>    </span></span>
+<span data-line="8"><b class="ln">8</b><span>    <i class="c"># 💥 Worker #9 SIGKILL crashes at 88% transcode</i></span></span>
+<span data-line="9"><b class="ln">9</b><span>    <i class="c"># ❌ 15 completed chunks discarded from memory. Entire job restarts!</i></span></span>
+<span data-line="10"><b class="ln">10</b><span>    <i class="k">return</i> <i class="fn">chord</i>(header)(callback)</span></span></code></pre>
+
+        <!-- Code Block: After Mode (Fused continuation) -->
+        <pre class="code-block" data-code="after-steps" hidden><code>from ferricstore import FlowClient
+
+client = FlowClient.from_url("ferric://127.0.0.1:6388")
+job = client.start_and_claim(
+    "video-42:chunk:9", type="render-chunk",
+    initial_state="render", worker="gpu-9", payload={"chunk": 9},
+)
+
+# The worker runs the step. Then FerricStore durably saves its output,
+# advances the logical state, and returns a fresh running lease + fence.
+rendered = render_chunk_once(
+    job.payload["chunk"], operation_id=f"{job.id}:render:v1",
+)
+job = client.step_continue(
+    job.id,
+    lease_token=job.lease_token,
+    fencing_token=job.fencing_token,
+    from_state=job.run_state,
+    to_state="ready_to_stitch",
+    values={"rendered": rendered},
+    worker="gpu-9",
+    return_job=True,
+)</code></pre>
+
+        <!-- Code Block: After Mode (States) -->
+        <pre class="code-block" data-code="after-states"><code>from ferricstore import ChildSpec, WorkflowClient, complete, transition
+
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
+flow = client.workflow(type="video-transcode", initial_state="fanout")
+
+@flow.state("fanout")
+def fanout(job):
+    children = [
+        ChildSpec(id=f"{job.id}:chunk:{i}", type="render-chunk", payload=str(i).encode())
+        for i in range(16)
+    ]
+    job.flow.spawn_children(
+        children, wait="all", wait_state="waiting",
+        success="stitch", failure="failed", from_state=job.state,
+    )
+    return transition("waiting")
+
+@flow.state("stitch")
+def stitch(job):
+    return complete(result=b"all chunks complete")</code></pre>
+      </article>
+
+      <!-- Stage & Visualizer Panel -->
+      <article class="stage-panel">
+        <header class="stage-header">
+          <div class="stage-meta-left">
+            <span class="run-id-pill">JOB: <strong data-job-id>4K-TRANSCODE-#8492</strong></span>
+            <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>READY</b></span>
+          </div>
+          <div class="playback-controls">
+            <button class="stage-btn btn-primary" data-btn-play title="Play Full Simulation">⚡ Play Simulation</button>
+            <button class="stage-btn" data-btn-step title="Fan Out Chunks">▶ Fan-Out</button>
+            <button class="stage-btn btn-danger" data-btn-crash title="Kill Worker #9">💥 Kill #9</button>
+            <button class="stage-btn btn-warning" data-btn-resume title="Recover & Gather">🔄 Recover</button>
+            <button class="stage-btn btn-ghost" data-btn-reset title="Reset Simulation">↺</button>
+          </div>
+        </header>
+
+        <!-- 16 Worker Chunks Grid -->
+        <div class="visualizer-content">
+          <div class="chunks-card">
+            <div class="chunks-header">
+              <span>PARALLEL WORKER POOL (16 CHUNKS)</span>
+              <span class="chunks-counter" data-chunks-counter>0 / 16 Finished</span>
+            </div>
+            <div class="tiles-16-grid" data-tiles-grid>
+              <!-- 16 chunk tiles generated by JS -->
+            </div>
+            <div class="barrier-row good" data-barrier-bar>
+              <span class="b-icon">🛡️</span>
+              <strong data-barrier-text>BARRIER: READY TO GATHER &amp; STITCH</strong>
+            </div>
+          </div>
+
+          <!-- Live Event Terminal -->
+          <div class="live-terminal-compact">
+            <div class="term-head">
+              <span>📟 LIVE WORKER LOGS</span>
+              <small data-term-speed>Live simulator</small>
+            </div>
+            <div class="term-stream" data-term-stream>
+              <div class="term-row info">[00:00.000] Click "⚡ Play Simulation" to start the 16-worker fan-out transcode.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Outcome Callout -->
+        <footer class="stage-footer">
+          <div class="outcome-callout good" data-outcome-callout>
+            <small data-outcome-label>RECOVERY IMPACT</small>
+            <strong data-outcome-title>EXACT-1 CHUNK RESUME (0 WASTED COMPUTE)</strong>
+            <span data-outcome-sub>Completed child results stayed durable. Only unfinished Chunk #9 was reclaimed.</span>
+          </div>
+        </footer>
+      </article>
+
+    </section>
+
+    <!-- Catastrophe Breakdown Cards -->
+    <section class="catastrophe-section">
+      <div class="catastrophe-head">
+        <span class="catastrophe-pill">⚠️ THE HAZARD vs. HOW FERRICSTORE PREVENTS IT</span>
+        <h2>Why Massive Parallel Fan-Out Fails &amp; How FerricStore Fixes It</h2>
+        <p>Compare standard Celery/Airflow/SQS failure modes with FerricStore's durable chunk checkpointing.</p>
+      </div>
+
+      <div class="catastrophe-grid">
+        <!-- Card 1 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">💸</span>
+            <h4>The $12,000 Restart Penalty</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (Celery / Airflow):</strong>
+              <p>Worker #14 crashes at chunk 99% of a 4-hour batch job. The entire 16-chunk parallel DAG fails, forcing a full from-scratch restart of all 16 workers.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <p><strong>Per-Chunk Durable State:</strong> Every completed child stores its output durably. After reclaim, the application can continue the unfinished child while retaining committed results; external transcode effects still need stable operation keys.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">🚨 4 Hours Wasted GPU Compute</span>
+            <span class="cat-fix-badge">✓ Granular Child Reclaim</span>
+          </div>
+        </div>
+
+        <!-- Card 2 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">🧟</span>
+            <h4>Zombie Duplication Storm</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (SQS / RabbitMQ):</strong>
+              <p>SQS visibility timeout elapses during a heavy chunk calculation. Worker B picks up the chunk while Worker A is still running, processing data twice.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <p><strong>Monotonic Fencing Epoch Tokens:</strong> Every worker is assigned a strictly incrementing epoch token. If a worker exceeds its timeout, its token is revoked and its stale writes are rejected by the engine.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">🚨 Duplicate Customer Charges</span>
+            <span class="cat-fix-badge">✓ Monotonic Fencing Lock</span>
+          </div>
+        </div>
+
+        <!-- Card 3 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">🛑</span>
+            <h4>Barrier Deadlock &amp; Memory Leak</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (Celery / Custom Python):</strong>
+              <p>Worker #9 dies silently from an OOM killer without returning an error code. The join orchestrator waits forever at the barrier, leaking threads and RAM.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <p><strong>Durable Raft Barrier Heartbeats:</strong> The join barrier is a durable state machine node. If any chunk worker heartbeat lapses, FerricStore automatically triggers a localized retry or compensation step.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">📉 Orchestrator Out of Memory</span>
+            <span class="cat-fix-badge">✓ Heartbeat Timeout Cascades</span>
+          </div>
+        </div>
+
+        <!-- Card 4 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">☁️</span>
+            <h4>Cloud Resource Sprawl</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (AWS Step Functions / SQS):</strong>
+              <p>Coordinating 10,000 parallel tasks requires 16 SQS queues, 4 DLQs, DynamoDB state tables, and Lambda coordinators, costing $4,800/mo in cloud overhead.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <p><strong>Zero-Infrastructure Single Engine:</strong> FerricStore manages 100,000+ parallel fan-out tasks inside a single unified engine consuming &lt; 20MB of RAM with zero cloud service sprawl.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">💸 $4,800/mo Cloud Infra Bill</span>
+            <span class="cat-fix-badge">✓ 1 Unified Engine (&lt; 20MB)</span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="./fanout.js?v=4"></script>
+  <script src="../shared/accuracy.js?v=8"></script>
+</body>
+</html>

@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hot RAM + Cold NVMe Tiering · FerricStore Architecture</title>
+  <link rel="stylesheet" href="../shared/base.css">
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=4">
+</head>
+<body data-mode="after">
+
+  <!-- Top Navigation -->
+  <nav class="demo-nav" aria-label="Demo Header">
+    <a href="../" class="nav-brand">
+      <span class="nav-logo">💾</span>
+      <div>
+        <strong>FerricStore Architecture</strong>
+        <small>Hot RAM + Cold NVMe Tiering · Reduce RAM pressure with disk-backed values</small>
+      </div>
+    </a>
+    <div class="nav-center">
+      <span class="nav-tag">UNIQUE ARCHITECTURE &amp; KV STORAGE</span>
+    </div>
+    <div class="nav-right">
+      <a href="../" class="nav-back-link">← All Demos</a>
+    </div>
+  </nav>
+
+  <main class="demo-main">
+    <!-- Hero Section -->
+    <header class="demo-hero">
+      <div class="hero-tag">THE UNIQUE FERRICSTORE ARCHITECTURE</div>
+      <h1>
+        Hot RAM + Cold NVMe Tiering:<br>
+        <span class="hero-accent">Keep Hot Values in RAM and Cold Values on NVMe</span>
+      </h1>
+      <p class="hero-desc">
+        Pure in-memory deployments can become expensive as datasets grow and require an explicit eviction or failure policy under memory pressure. <strong>FerricStore can keep hot values in ETS RAM while serving disk-backed values from NVMe</strong>. MemoryGuard can release cached RAM values while retaining durable disk records; actual latency, memory use, and cost depend on the workload and deployment.
+      </p>
+
+      <!-- Mode Switch Tabs -->
+      <div class="mode-switch" role="tablist" aria-label="Execution Mode">
+        <button type="button" role="tab" data-mode-btn="before" aria-selected="false">
+          <span class="mode-tab-title">Without FerricStore (Redis)</span>
+          <span class="mode-tab-badge bad">Pure in-memory footprint</span>
+        </button>
+        <button type="button" role="tab" data-mode-btn="after" aria-selected="true" class="is-selected">
+          <span class="mode-tab-title">With FerricStore</span>
+          <span class="mode-tab-badge good">✓ Hot RAM + Disk-Backed Values</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Metrics Bar -->
+    <section class="metrics-bar" aria-label="Live Metrics Comparison">
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">💸</span>
+          <small>MONTHLY CLOUD COST</small>
+        </div>
+        <strong class="metric-val text-green" data-metric-cost>Workload-dependent</strong>
+        <span class="metric-sub" data-metric-cost-sub>Validate with deployment benchmarks</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">🧠</span>
+          <small>SERVER RAM REQUIRED</small>
+        </div>
+        <strong class="metric-val text-cyan" data-metric-ram>Bounded hot set</strong>
+        <span class="metric-sub" data-metric-ram-sub>Depends on keys and cache policy</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">🛡️</span>
+          <small>OOM &amp; DATA EVICTION RISK</small>
+        </div>
+        <strong class="metric-val text-green" data-metric-eviction>Disk record retained</strong>
+        <span class="metric-sub" data-metric-eviction-sub>Under configured durability policy</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">⚡</span>
+          <small>COLD READ LATENCY</small>
+        </div>
+        <strong class="metric-val text-green" data-metric-latency>Direct offset read</strong>
+        <span class="metric-sub" data-metric-latency-sub>Hardware and workload dependent</span>
+      </div>
+    </section>
+
+    <!-- Main Workspace (Storage Inspector on Left, Live Simulator on Right) -->
+    <section class="demo-workspace">
+      
+      <!-- Storage Inspector Panel -->
+      <article class="code-panel">
+        <header class="panel-header">
+          <div class="file-info">
+            <span class="file-icon">kv</span>
+            <div>
+              <h2>Keydir &amp; Tiering Inspector</h2>
+              <small>HOT RAM / COLD NVMe STORAGE ENGINE</small>
+            </div>
+          </div>
+          <div class="code-controls">
+            <span class="badge-durable" data-tier-badge>HYBRID TIERING</span>
+          </div>
+        </header>
+
+        <div class="storage-inspector-content">
+          
+          <!-- Dataset Size Slider -->
+          <div class="slider-box">
+            <div class="slider-head">
+              <label for="dataset-slider"><strong>SELECT TOTAL DATASET SIZE:</strong></label>
+              <span class="slider-val" data-dataset-val>1,000 GB (1 TB)</span>
+            </div>
+            <input type="range" id="dataset-slider" min="10" max="1000" step="50" value="1000" class="dataset-slider" data-dataset-slider>
+            <div class="slider-ticks">
+              <span>10 GB</span>
+              <span>250 GB</span>
+              <span>500 GB</span>
+              <span>1,000 GB (1 TB)</span>
+            </div>
+          </div>
+
+          <!-- Dual Storage Tier Visualizer -->
+          <div class="storage-tiers-wrap">
+            
+            <!-- Hot RAM Tier -->
+            <div class="tier-card hot-tier" data-hot-tier-card>
+              <div class="tier-head">
+                <span class="tier-icon">🔥</span>
+                <div>
+                  <strong>HOT TIER (ETS RAM MEMORY)</strong>
+                  <small>Keys &lt; 64KB &amp; Active Top 10% Items</small>
+                </div>
+              </div>
+              <div class="tier-metric-row">
+                <span class="tier-metric-val" data-hot-ram-val>3.8 GB RAM Used</span>
+                <span class="tier-badge ok" data-hot-badge>✓ In-memory hot reads</span>
+              </div>
+              <p class="tier-desc">Stored in ETS-backed tables for the in-memory hot path.</p>
+            </div>
+
+            <!-- Cold NVMe Tier -->
+            <div class="tier-card cold-tier" data-cold-tier-card>
+              <div class="tier-head">
+                <span class="tier-icon">❄️</span>
+                <div>
+                  <strong>COLD TIER (NVMe SSD DISK)</strong>
+                  <small>Values &gt; 64KB &amp; MemoryGuard Evicted Items</small>
+                </div>
+              </div>
+              <div class="tier-metric-row">
+                <span class="tier-metric-val text-cyan" data-cold-disk-val>996.2 GB On Disk</span>
+                <span class="tier-badge ok" data-cold-badge>✓ Direct Pread</span>
+              </div>
+              <p class="tier-desc">Keydir metadata holds physical file offsets so a cold value can be read directly without keeping the value hot in RAM.</p>
+            </div>
+
+          </div>
+
+          <!-- Physical Keydir Pointer Card -->
+          <div class="keydir-inspect-card">
+            <div class="keydir-head">
+              <span>🔬 SHARD KEYDIR RECORD INSPECTION (ETS)</span>
+              <span class="keydir-status-tag" data-keydir-status>STATUS: COLD NVMe</span>
+            </div>
+            <div class="keydir-body">
+              <div class="kd-row">
+                <span class="kd-label">Key:</span>
+                <strong class="kd-val">user:84920:profile</strong>
+              </div>
+              <div class="kd-row">
+                <span class="kd-label">Hot RAM Value:</span>
+                <strong class="kd-val text-muted" data-kd-hot-val>NIL (Demoted by MemoryGuard)</strong>
+              </div>
+              <div class="kd-row">
+                <span class="kd-label">Disk Locator:</span>
+                <strong class="kd-val text-cyan" data-kd-locator>File #14, Offset: 8,388,608, Size: 128 KB</strong>
+              </div>
+              <div class="kd-row">
+                <span class="kd-label">Read Path:</span>
+                <strong class="kd-val text-green" data-kd-path>Single POSIX pread() by offset</strong>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </article>
+
+      <!-- Stage & Visualizer Panel -->
+      <article class="stage-panel">
+        <header class="stage-header">
+          <div class="stage-meta-left">
+            <span class="run-id-pill">SIMULATOR: <strong>MEMORYGUARD &amp; TIERING</strong></span>
+            <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>NORMAL (HEALTHY)</b></span>
+          </div>
+          <div class="playback-controls">
+            <button class="stage-btn btn-primary" data-btn-normal title="Run Normal Hot Key Read/Write">⚡ Hot Read</button>
+            <button class="stage-btn btn-warning" data-btn-pressure title="Simulate 100% RAM Spike (MemoryGuard Trigger)">🚨 RAM Pressure Spike</button>
+            <button class="stage-btn" data-btn-cold title="Read Cold Key From NVMe Disk">❄️ Read Cold Key</button>
+            <button class="stage-btn btn-ghost" data-btn-reset title="Reset Simulation">↺</button>
+          </div>
+        </header>
+
+        <!-- Visualizer Content -->
+        <div class="visualizer-content">
+          
+          <!-- Memory vs Disk Utilization Bars -->
+          <div class="util-bars-grid">
+            
+            <div class="util-box">
+              <div class="util-head">
+                <small>SERVER RAM CAPACITY (4.0 GB MAX)</small>
+                <strong class="util-pct" data-ram-pct>75% Used (3.0 GB)</strong>
+              </div>
+              <div class="util-track">
+                <div class="util-fill ram-fill" data-ram-fill style="width: 75%;"></div>
+              </div>
+            </div>
+
+            <div class="util-box">
+              <div class="util-head">
+                <small>NVMe SSD DISK (2,000 GB CAPACITY)</small>
+                <strong class="util-pct" data-disk-pct>50% Used (1,000 GB)</strong>
+              </div>
+              <div class="util-track">
+                <div class="util-fill disk-fill" data-disk-fill style="width: 50%;"></div>
+              </div>
+            </div>
+
+          </div>
+
+          <!-- Live Event Terminal -->
+          <div class="live-terminal-compact">
+            <div class="term-head">
+              <span>📟 STORAGE ENGINE &amp; MEMORYGUARD LOG</span>
+              <small>Real-time Telemetry</small>
+            </div>
+            <div class="term-stream" data-term-stream>
+              <div class="term-row info">[00:00.000] FerricStore storage engine initialized. Hot RAM + Cold NVMe active.</div>
+            </div>
+          </div>
+
+          <!-- Live Explanation Card -->
+          <div class="explanation-box">
+            <div class="exp-icon" data-exp-icon>💡</div>
+            <div class="exp-text">
+              <strong data-exp-title>Hot Memory + Cold NVMe Storage Tiering Active</strong>
+              <p data-exp-desc>Hot values are served from ETS RAM while disk-backed values retain direct locators. Click "🚨 RAM Pressure Spike" to test MemoryGuard.</p>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- Outcome Callout Footer -->
+        <footer class="stage-footer">
+          <div class="outcome-callout good" data-outcome-callout>
+            <small data-outcome-label>STORAGE ARCHITECTURE OUTCOME</small>
+            <strong data-outcome-title>BOUNDED HOT SET + DISK-BACKED VALUES</strong>
+            <span data-outcome-sub>MemoryGuard can release cached values while retaining disk locators. Size, cost, and latency depend on the selected deployment and workload.</span>
+          </div>
+        </footer>
+      </article>
+
+    </section>
+
+    <!-- Architecture Comparison Table -->
+    <section class="arch-comparison-section">
+      <div class="catastrophe-head">
+        <span class="catastrophe-pill">⚖️ ARCHITECTURE COMPARISON</span>
+        <h2>Hot/Cold Tiering Compared with a Pure In-Memory Deployment</h2>
+        <p>Compare memory footprint, pressure behavior, recovery, and durability choices without assuming a particular cloud price or benchmark.</p>
+      </div>
+
+      <div class="arch-table-card">
+        <table class="arch-table">
+          <thead>
+            <tr>
+              <th>STORAGE REQUIREMENT</th>
+              <th class="bad-col">❌ REDIS (100% In-Memory)</th>
+              <th class="good-col">✓ FERRICSTORE (Hot RAM + Cold NVMe)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>1 Terabyte Dataset Cost</strong></td>
+              <td class="bad-text">Requires enough RAM for the dataset plus allocator and index overhead; price depends on provider and region.</td>
+              <td class="good-text">RAM and NVMe requirements depend on dataset shape, hot-set size, durability, and workload.</td>
+            </tr>
+            <tr>
+              <td><strong>100% Memory Saturation</strong></td>
+              <td class="bad-text"><strong>Policy-dependent:</strong> At the configured memory limit, writes may fail or eligible keys may be evicted according to <code>maxmemory-policy</code>.</td>
+              <td class="good-text"><strong>Disk record retained:</strong> MemoryGuard can release cached values while retaining physical locators under the configured durability policy.</td>
+            </tr>
+            <tr>
+              <td><strong>Reboot Startup Delay</strong></td>
+              <td class="bad-text">Startup may require loading or rebuilding in-memory state, depending on persistence mode and dataset size.</td>
+              <td class="good-text">Disk locators support on-demand cold reads; measured startup and read latency depend on files, hardware, and recovery state.</td>
+            </tr>
+            <tr>
+              <td><strong>Write Durability</strong></td>
+              <td class="bad-text">Durability depends on the selected Redis persistence and replication configuration.</td>
+              <td class="good-text"><strong>Configurable durable boundary:</strong> Acknowledgment and failure tolerance follow the selected FerricStore topology and write settings.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Catastrophe Section -->
+    <section class="catastrophe-section">
+      <div class="catastrophe-head">
+        <span class="catastrophe-pill">⚠️ THE HAZARDS OF PURE RAM STACKS</span>
+        <h2>Why In-Memory Databases Fail in Production &amp; How FerricStore Fixes It</h2>
+        <p>Compare standard Redis/Memcached failure modes with FerricStore's hybrid storage tiering.</p>
+      </div>
+
+      <div class="catastrophe-grid">
+        <!-- Card 1 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">💸</span>
+            <h4>The Full-Dataset RAM Cost</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (Redis / Memcached):</strong>
+              <p>As data grows, a pure in-memory deployment needs RAM for the full dataset plus indexes and allocator overhead.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <p><strong>Hot/Cold NVMe Tiering:</strong> Keep a bounded working set in RAM while retaining colder values on disk. Benchmark the required hot set before sizing production.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">RAM footprint scales with the full dataset</span>
+            <span class="cat-fix-badge">✓ Size the hot set separately</span>
+          </div>
+        </div>
+
+        <!-- Card 2 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">🗑️</span>
+            <h4>Silent LRU Key Eviction</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (Memory Saturation):</strong>
+              <p>When memory reaches the configured limit, Redis behavior depends on <code>maxmemory-policy</code>: writes may fail or eligible keys may be evicted.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <p><strong>MemoryGuard Disk Protection:</strong> FerricStore can demote hot values to disk locators instead of using cache-style eviction. Availability still depends on the configured durability topology and healthy storage.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">🚨 Lost Shopping Carts &amp; Sessions</span>
+            <span class="cat-fix-badge">✓ Disk-Backed Demotion</span>
+          </div>
+        </div>
+
+        <!-- Card 3 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">⏱️</span>
+            <h4>Dataset Reload During Recovery</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (RDB Reload Warmup):</strong>
+              <p>A large in-memory dataset may require reload or reconstruction before the normal hot path is available.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <p><strong>Disk-backed locators:</strong> FerricStore can address cold values by file and offset. Recovery time still depends on data files, indexes, hardware, and topology.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">Recovery depends on dataset and persistence mode</span>
+            <span class="cat-fix-badge">✓ Direct cold-value addressing</span>
+          </div>
+        </div>
+
+        <!-- Card 4 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">💥</span>
+            <h4>60-Second Async Data Loss</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (Async Snapshots):</strong>
+              <p>Redis snapshots to disk asynchronously. A sudden power loss or host kernel panic destroys all writes executed in the last 60 seconds.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <p><strong>Configured write boundary:</strong> Disk acknowledgment and replication behavior follow the chosen FerricStore topology and durability settings.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">🚨 Unsaved Transactions Lost</span>
+            <span class="cat-fix-badge">✓ Configured Durability Policy</span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="./storage.js?v=3"></script>
+  <script src="../shared/accuracy.js?v=8"></script>
+</body>
+</html>

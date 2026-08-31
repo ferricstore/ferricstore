@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rate-Limiting &amp; Micro-Batching Stream | FerricStore Demos</title>
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=4">
+</head>
+<body>
+  <nav class="top-nav">
+    <div class="container nav-inner">
+      <a href="../" class="nav-brand">
+        <span class="brand-icon">⚡</span>
+        <span>FerricStore</span>
+        <span class="nav-tag">Stream Throttling</span>
+      </a>
+      <a href="../" class="back-link">← Back to All Demos</a>
+    </div>
+  </nav>
+
+  <main class="container">
+    <header class="hero">
+      <div class="hero-pill">🌊 HIGH-THROUGHPUT EVENT STREAMING</div>
+      <h1>Rate Limiting &amp; <span class="hero-gradient">Micro-Batching</span></h1>
+      <p class="hero-desc">
+        Model webhook bursts with a durable buffer, micro-batched commits, and token-bucket backpressure. The animation shows one configured workload; throughput, commit latency, and overload behavior depend on topology and limits.
+      </p>
+    </header>
+
+    <section class="stage-card">
+      <header class="stage-header">
+        <div class="scenario-badge">
+          <span class="badge-label" style="background: rgba(6, 182, 212, 0.18); color: #67e8f9;">STREAM PIPELINE</span>
+          <strong>Shopify Webhook Surge ➔ OpenAI Categorization API</strong>
+        </div>
+        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+          <button class="ctrl-btn burst-btn" data-burst-btn>⚡ Trigger 5,000 Burst Surge</button>
+          <button class="ctrl-btn" data-reset-btn>↺ Reset Defaults</button>
+        </div>
+      </header>
+
+      <!-- Sliders for interactive control -->
+      <div class="sliders-box">
+        <div class="slider-group">
+          <label>
+            <span>📥 Inbound Webhook Ingest Rate:</span>
+            <strong style="color: #67e8f9;" data-inbound-label>2,500 events / sec</strong>
+          </label>
+          <input type="range" min="100" max="5000" step="100" value="2500" class="stream-slider cyan" data-inbound-slider aria-label="Inbound Flood Slider">
+          <div class="slider-ticks">
+            <span>100 ev/s (Calm)</span>
+            <span>2,500 ev/s (Normal)</span>
+            <span>5,000 ev/s (Surge Spike)</span>
+          </div>
+        </div>
+
+        <div class="slider-group">
+          <label>
+            <span>🎯 Downstream API Rate Limit:</span>
+            <strong style="color: #34d399;" data-outbound-label>100 req / sec (Max)</strong>
+          </label>
+          <input type="range" min="20" max="500" step="10" value="100" class="stream-slider green" data-outbound-slider aria-label="Outbound Rate Slider">
+          <div class="slider-ticks">
+            <span>20 req/s</span>
+            <span>100 req/s (Standard API Tier)</span>
+            <span>500 req/s</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Real-Time Visual Pipeline Flow Arena -->
+      <div class="stream-arena">
+        <div class="arena-header">
+          <span class="arena-title">LIVE TRAFFIC SMOOTHING PIPELINE</span>
+          <span class="stream-live-tag"><span class="pulse-dot"></span> STREAM ACTIVE</span>
+        </div>
+
+        <div class="pipeline-grid">
+          <!-- Step 1: Ingest -->
+          <div class="pipe-chamber ingest-chamber">
+            <div class="chamber-head">
+              <small>1. INGESTION BURST</small>
+              <strong data-pipe-ingest>2,500 Webhooks/s</strong>
+            </div>
+            <div class="chamber-visual">
+              <div class="particle-track inbound" data-particle-inbound>
+                <div class="particle-wave"></div>
+              </div>
+              <div class="pipe-stat">Shopify Webhooks Ingested</div>
+            </div>
+          </div>
+
+          <div class="pipe-connector">➔</div>
+
+          <!-- Step 2: Buffer & Raft Micro-Batching -->
+          <div class="pipe-chamber batch-chamber">
+            <div class="chamber-head">
+              <small>2. RAFT MICRO-BATCHING</small>
+              <strong data-pipe-batch>50 Items / Batch</strong>
+            </div>
+            <div class="chamber-visual">
+              <div class="buffer-bar-wrap">
+                <div class="buffer-bar" data-buffer-bar style="width: 45%;"></div>
+              </div>
+              <div class="pipe-stat" data-buffer-stat>Queue Buffer: 45 / 5,000 · Durable batch</div>
+            </div>
+          </div>
+
+          <div class="pipe-connector">➔</div>
+
+          <!-- Step 3: Token Bucket -->
+          <div class="pipe-chamber bucket-chamber">
+            <div class="chamber-head">
+              <small>3. TOKEN BUCKET</small>
+              <strong data-pipe-bucket>100 Tokens / Sec</strong>
+            </div>
+            <div class="chamber-visual">
+              <div class="bucket-visual">
+                <div class="token-pills" data-token-pills>
+                  <span class="t-token">●</span><span class="t-token">●</span><span class="t-token">●</span><span class="t-token">●</span><span class="t-token">●</span>
+                </div>
+              </div>
+              <div class="pipe-stat">Leak Rate: 100/sec (modeled within limit)</div>
+            </div>
+          </div>
+
+          <div class="pipe-connector">➔</div>
+
+          <!-- Step 4: Dispatch -->
+          <div class="pipe-chamber dispatch-chamber">
+            <div class="chamber-head">
+              <small>4. DOWNSTREAM DISPATCH</small>
+              <strong data-pipe-dispatch>100 Req/s Clean</strong>
+            </div>
+            <div class="chamber-visual">
+              <div class="particle-track outbound" data-particle-outbound>
+                <div class="particle-wave-smooth"></div>
+              </div>
+              <div class="pipe-stat">OpenAI API (modeled healthy)</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live Telemetry -->
+      <div class="telemetry-grid">
+        <div class="telemetry-card">
+          <small>Inbound Ingestion</small>
+          <div class="telemetry-val" style="color: #67e8f9;" data-val-inbound>2,500 / s</div>
+          <span class="telemetry-sub">Raw webhook traffic</span>
+        </div>
+        <div class="telemetry-card">
+          <small>Downstream Dispatched</small>
+          <div class="telemetry-val" style="color: #34d399;" data-val-outbound>100 / s</div>
+          <span class="telemetry-sub">Throttled &amp; protected</span>
+        </div>
+        <div class="telemetry-card">
+          <small>HTTP 429 Errors</small>
+          <div class="telemetry-val" style="color: #34d399;" data-val-dropped>0 in this run</div>
+          <span class="telemetry-sub">Modeled below the configured limit</span>
+        </div>
+        <div class="telemetry-card">
+          <small>Batch Commit Latency</small>
+          <div class="telemetry-val" style="color: #38bdf8;" data-val-latency>Workload-dependent</div>
+          <span class="telemetry-sub">Durability and topology dependent</span>
+        </div>
+      </div>
+
+      <!-- Controls & Status -->
+      <footer class="stage-footer">
+        <div class="ctrl-btn-group">
+          <button class="ctrl-btn" data-pause>⏸ Pause Stream</button>
+        </div>
+        <div class="status-summary" style="font-size: 13px; color: #cbd5e1;">
+          🛡️ <strong>FerricStore Ingestion:</strong> Traffic surge is safely buffered on disk and smoothed to downstream API limits.
+        </div>
+      </footer>
+    </section>
+
+    <!-- Python Code Example -->
+    <section style="margin-bottom: 60px;">
+      <h3 style="font-size: 20px; margin-bottom: 12px;">FerricStore Python SDK: Stream Rate-Limiting</h3>
+      <pre style="background: #080614; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 20px; font-family: var(--font-mono); font-size: 13px; color: #e2e8f0; overflow-x: auto;"><code># Real rate-limit command + fused pipeline continuation
+import time
+from ferricstore import FlowClient
+
+client = FlowClient.from_url("ferric://127.0.0.1:6388")
+job = client.start_and_claim(
+    "webhook-912", type="shopify-webhook-stream",
+    initial_state="categorize", worker="stream-1",
+    payload={"prompt": "Classify this product update"},
+)
+
+limit = client.ratelimit_add(
+    "rl:openai:categorize", window_ms=1_000, max=100,
+)
+if not limit.allowed:
+    client.transition(
+        job.id,
+        lease_token=job.lease_token,
+        fencing_token=job.fencing_token,
+        from_state=job.run_state,
+        to_state="categorize",
+        run_at_ms=int(time.time() * 1000) + limit.reset_ms,
+    )
+else:
+    summary = ai.categorize_once(
+        operation_id=f"{job.id}:categorize:v1",
+        prompt=job.payload["prompt"],
+    )
+    client.step_continue(
+        job.id,
+        lease_token=job.lease_token,
+        fencing_token=job.fencing_token,
+        from_state=job.run_state,
+        to_state="flush",
+        values={"summary": summary},
+        worker="stream-1",
+        return_job=True,
+    )</code></pre>
+    </section>
+  </main>
+  <script src="./stream.js?v=3"></script>
+  <script src="../shared/accuracy.js?v=8"></script>
+</body>
+</html>

@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>What is a Workflow? Explained for Humans | FerricStore</title>
+  <meta name="description" content="A simple, visual explanation of what durable workflows are, the pain of unexpected crashes (double-billing, lost orders), and how FerricStore provides video game save points for real-world software.">
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=4">
+</head>
+<body>
+
+  <!-- Top Navigation -->
+  <nav class="top-nav">
+    <div class="container nav-inner">
+      <a class="nav-brand" href="../">
+        <span class="brand-icon">⚡</span>
+        <span>FerricStore</span>
+      </a>
+      <span class="nav-tag">PLAIN ENGLISH EXPLAINER</span>
+      <a class="back-link" href="../">← Back to Demo Gallery</a>
+    </div>
+  </nav>
+
+  <main class="container">
+    <!-- Hero Header -->
+    <header class="hero">
+      <div class="hero-pill">🎮 The Video Game Checkpoint Analogy</div>
+      <h1>
+        What is a Workflow?<br>
+        <span class="hero-gradient">Explained for Normal Humans.</span>
+      </h1>
+      <p class="hero-desc">
+        Ever play a video game without save points and lose 3 hours of progress after dying on a boss? That is exactly what happens to software during crashes—until you give it <strong>durable workflows</strong>.
+      </p>
+
+      <!-- Analogy Card -->
+      <div class="analogy-banner">
+        <div class="analogy-icon">💡</div>
+        <div class="analogy-text">
+          <strong>The 10-Second Concept:</strong>
+          <p>
+            A <strong>Workflow</strong> is a multi-step recipe (1. Charge Card → 2. Reserve Stock → 3. Ship Package). 
+            <strong>FerricStore</strong> durably records explicit workflow state. After a worker crash, a replacement worker can reclaim the flow; fencing protects state writes, while external charges still need a stable idempotency key.
+          </p>
+        </div>
+      </div>
+
+      <!-- Mode Switcher Tabs -->
+      <div class="mode-toggle-wrap">
+        <div class="mode-toggle" role="tablist" aria-label="Workflow Mode">
+          <button class="mode-btn" type="button" role="tab" data-mode="before" aria-selected="false">
+            <span class="mode-icon">💀</span>
+            <span class="mode-text-wrap">
+              <strong>Without Workflows</strong>
+              <small>RAM Wiped · Double Charges</small>
+            </span>
+          </button>
+          <button class="mode-btn is-active" type="button" role="tab" data-mode="after" aria-selected="true">
+            <span class="mode-icon">🛡️</span>
+            <span class="mode-text-wrap">
+              <strong>With FerricStore</strong>
+              <small>Durable States · Protected Effects</small>
+            </span>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <!-- Interactive Simulator Stage Card -->
+    <section class="stage-card" aria-label="Interactive 5-Stage Conveyor Animation">
+      <header class="stage-header">
+        <div class="scenario-badge">
+          <span class="badge-label">SCENARIO</span>
+          <strong>Customer Buys $150 Sneakers Online</strong>
+        </div>
+        <div class="stage-actions">
+          <button class="crash-btn" type="button" data-smash-crash title="Trigger an immediate server outage">
+            <span>💥 Smash Crash Button!</span>
+          </button>
+        </div>
+      </header>
+
+      <!-- 5-Station Stepper Track -->
+      <div class="stepper-track-wrap">
+        <div class="stepper-rail">
+          <div class="stepper-fill-line" data-progress-fill></div>
+        </div>
+
+        <div class="stations-list" role="list">
+          <!-- Station 0 -->
+          <div class="station-node-item is-active" data-station="0" role="listitem" tabindex="0">
+            <div class="node-circle">
+              <span class="node-emoji">💳</span>
+              <span class="node-badge">1</span>
+            </div>
+            <strong class="node-title">1. Charge Card</strong>
+            <span class="node-sub" data-st-1-sub>Authorized $150</span>
+          </div>
+
+          <!-- Station 1 -->
+          <div class="station-node-item" data-station="1" role="listitem" tabindex="0">
+            <div class="node-circle">
+              <span class="node-emoji">📦</span>
+              <span class="node-badge">2</span>
+            </div>
+            <strong class="node-title">2. Pick Stock</strong>
+            <span class="node-sub" data-st-2-sub>Warehouse Shelf</span>
+          </div>
+
+          <!-- Station 2 (Crash Zone) -->
+          <div class="station-node-item station-crash-item" data-station="2" role="listitem" tabindex="0">
+            <div class="node-circle">
+              <span class="node-emoji">💥</span>
+              <span class="node-badge">3</span>
+            </div>
+            <strong class="node-title">3. Server Crash!</strong>
+            <span class="node-sub" data-st-3-sub>Outage Zone</span>
+          </div>
+
+          <!-- Station 3 -->
+          <div class="station-node-item" data-station="3" role="listitem" tabindex="0">
+            <div class="node-circle">
+              <span class="node-emoji" data-st-4-icon>🛡️</span>
+              <span class="node-badge">4</span>
+            </div>
+            <strong class="node-title" data-st-4-title>4. Durable Resume</strong>
+            <span class="node-sub" data-st-4-sub>0 Duplicate Work</span>
+          </div>
+
+          <!-- Station 4 -->
+          <div class="station-node-item" data-station="4" role="listitem" tabindex="0">
+            <div class="node-circle">
+              <span class="node-emoji" data-st-5-icon>🎉</span>
+              <span class="node-badge" data-st-5-badge>✓</span>
+            </div>
+            <strong class="node-title" data-st-5-title>5. Exact $150</strong>
+            <span class="node-sub" data-st-5-sub>Happy Customer</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Animated Rolling Conveyor Belt Arena -->
+      <div class="conveyor-arena">
+        <!-- Gate Markers -->
+        <div class="gates-track">
+          <div class="gate-col"><span>Gate 1</span></div>
+          <div class="gate-col"><span>Gate 2</span></div>
+          <div class="gate-col crash-col"><span>Crash Zone 💥</span></div>
+          <div class="gate-col"><span>Gate 4</span></div>
+          <div class="gate-col"><span>Delivery 🚚</span></div>
+        </div>
+
+        <!-- Belt Viewport -->
+        <div class="belt-viewport">
+          <div class="belt-rolling-lines"></div>
+
+          <!-- The Safe Movement Rail (Bounded inside by 100px margins on both sides) -->
+          <div class="belt-movement-rail">
+            <!-- Animated Gliding Package Box -->
+            <div class="gliding-package is-shielded" data-package>
+              <div class="pkg-icon-box" data-pkg-icon>📦</div>
+              <div class="pkg-info-box">
+                <small data-pkg-kicker>ORDER #9842 · $150.00</small>
+                <strong data-pkg-status>Saved in FerricStore</strong>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Lower Dashboard: Customer Phone & Event Narrative -->
+      <div class="stage-lower-grid">
+        <!-- Customer Live Device Notification Widget -->
+        <div class="device-card">
+          <div class="device-header">
+            <span>📱 Customer Phone Notification</span>
+            <span class="live-dot">LIVE SYNC</span>
+          </div>
+          
+          <div class="bank-card" data-bank-card>
+            <div class="card-brand">
+              <small>Personal Visa Debit</small>
+              <span>•••• 4192</span>
+            </div>
+            <div class="card-balance-row">
+              <span class="balance-label">Total Billed:</span>
+              <strong class="balance-val" data-bank-amount>$150.00</strong>
+            </div>
+          </div>
+
+          <div class="sms-push-box" data-sms-box>
+            <div class="sms-icon">💬</div>
+            <div class="sms-content" data-sms-content>
+              <strong>SneakerStore Notification:</strong> Payment authorized for $150.00. Checkpoint saved to disk.
+            </div>
+          </div>
+        </div>
+
+        <!-- Event Narrative & Explainer Card -->
+        <div class="narrative-card">
+          <div class="narrative-top">
+            <span class="narrative-badge is-good" data-narrative-badge>STEP 1 · CHECKPOINT COMMITTED</span>
+            <span class="narrative-step-pill" data-step-indicator>Step 1 of 5</span>
+          </div>
+          <h3 class="narrative-title" data-narrative-title>1. 💳 Credit Card Charged ($150.00)</h3>
+          <p class="narrative-desc" data-narrative-desc>
+            Customer clicks "Buy Sneakers". The application authorizes $150 with a provider idempotency key, then durably advances the workflow state.
+          </p>
+          <div class="checkpoint-status-bar" data-checkpoint-bar>
+            <span class="cp-label">FerricStore Disk Status:</span>
+            <strong class="cp-val" data-checkpoint-val>Step 1 [Payment] Committed &amp; Deduplicated</strong>
+          </div>
+        </div>
+      </div>
+
+      <!-- Playback Controls Toolbar -->
+      <footer class="stage-footer">
+        <div class="ctrl-btn-group">
+          <button class="ctrl-btn" type="button" data-prev aria-label="Previous Step">⏮ Previous</button>
+          <button class="ctrl-btn" type="button" data-pause aria-label="Pause or Play">⏸ Pause</button>
+          <button class="ctrl-btn" type="button" data-next aria-label="Next Step">Next ⏭</button>
+          <button class="ctrl-btn" type="button" data-replay aria-label="Replay Scenario">↺ Replay</button>
+        </div>
+        <div class="stage-live-indicator">
+          <span class="pulse-indicator"></span>
+          <span data-live-status-text>Auto-advancing animation</span>
+        </div>
+      </footer>
+    </section>
+
+    <!-- The Pain vs The Solution Comparison Section -->
+    <section class="comparison-section">
+      <div class="section-kicker">WHY WORKFLOWS MATTER</div>
+      <h2 class="section-title">The Pain of Plain Code vs. The Peace of Mind</h2>
+
+      <div class="cards-comparison-grid">
+        <!-- Pain Card -->
+        <article class="compare-card card-pain">
+          <div class="card-header-badge">💀 The Nightmare (Without Workflows)</div>
+          <h3>Volatile Memory &amp; Blind Retries</h3>
+          <p>
+            When standard software crashes midway through a 5-step process, all progress in temporary RAM is erased. The server has amnesia.
+          </p>
+          <ul class="pain-list">
+            <li>
+              <span>💸</span>
+              <div><strong>Double Billing:</strong> Customer is charged twice ($300 instead of $150) when the dumb retry script restarts from step 1.</div>
+            </li>
+            <li>
+              <span>📦</span>
+              <div><strong>Ghost Inventory:</strong> Stock is deducted twice in the warehouse, causing phantom out-of-stock errors.</div>
+            </li>
+            <li>
+              <span>🚨</span>
+              <div><strong>3:00 AM Engineer Pagers:</strong> Developers wake up to manually fix corrupt database rows and issue refunds.</div>
+            </li>
+            <li>
+              <span>😡</span>
+              <div><strong>Angry Customers:</strong> Support inbox flooded with chargeback complaints and angry reviews.</div>
+            </li>
+          </ul>
+        </article>
+
+        <!-- Solution Card -->
+        <article class="compare-card card-solution">
+          <div class="card-header-badge">🛡️ The Solution (With FerricStore)</div>
+          <h3>Durable State &amp; Guarded Effects</h3>
+          <p>
+            FerricStore commits explicit state transitions through the configured durable topology before moving forward.
+          </p>
+          <ul class="solution-list">
+            <li>
+              <span>✓</span>
+              <div><strong>Explicit recovery:</strong> If the server dies, a replacement worker claims the committed state. Protect charges with a provider idempotency key.</div>
+            </li>
+            <li>
+              <span>⚡</span>
+              <div><strong>Lease-based reclaim:</strong> A replacement worker can claim eligible state after lease expiry.</div>
+            </li>
+            <li>
+              <span>😴</span>
+              <div><strong>Sleep Peacefully:</strong> Even if half your data center loses power, in-flight customer orders resume safely.</div>
+            </li>
+            <li>
+              <span>😊</span>
+              <div><strong>Clear Recovery:</strong> Committed order progress remains inspectable, while provider idempotency keys protect payment and inventory calls.</div>
+            </li>
+          </ul>
+        </article>
+      </div>
+
+      <!-- FAQ Accordion -->
+      <section class="faq-section">
+        <div class="section-kicker" style="text-align: left;">COMMON QUESTIONS</div>
+        <h3 style="font-size: 22px; margin-bottom: 20px; color: #ffffff;">Frequently Asked Questions</h3>
+
+        <details class="faq-item">
+          <summary>Why can’t I just use a regular SQL database like Postgres?</summary>
+          <div class="faq-body">
+            You can, but the application must implement and operate locking, lease renewal, fencing, recovery polling, and retry state machines. FerricStore provides these workflow primitives directly; transition latency still depends on deployment and durability settings.
+          </div>
+        </details>
+
+        <details class="faq-item">
+          <summary>What if a server hangs or pauses during garbage collection?</summary>
+          <div class="faq-body">
+            FerricStore uses <strong>fencing tokens</strong>. If a slow "zombie" server wakes up late and tries to write old data, FerricStore rejects its write immediately because a newer server has already taken ownership of the checkpoint.
+          </div>
+        </details>
+
+        <details class="faq-item">
+          <summary>Is this only for e-commerce?</summary>
+          <div class="faq-body">
+            Not at all! Durable workflows power <strong>AI Agent chains</strong> (planning → web search → summarizing), payment billing, KYC verification, data pipelines, background video rendering, and employee onboarding.
+          </div>
+        </details>
+      </section>
+
+      <!-- Footer CTA -->
+      <div class="footer-cta">
+        <h2>Ready to see the Python code?</h2>
+        <p style="color: var(--text-muted); margin-bottom: 24px;">Explore our interactive developer visualizers with synchronized Python SDK code.</p>
+        <a class="cta-btn" href="../split-lab/">
+          <span>Explore Split Lab Technical Demo →</span>
+        </a>
+      </div>
+    </section>
+  </main>
+
+  <script src="./explainer.js?v=3"></script>
+  <script src="../shared/accuracy.js?v=8"></script>
+</body>
+</html>

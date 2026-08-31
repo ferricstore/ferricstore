@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Autonomous AI Agent Loop · Budget Caps &amp; Circuit Breakers</title>
+  <link rel="stylesheet" href="../shared/base.css">
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=4">
+</head>
+<body data-mode="after">
+
+  <!-- Top Navigation -->
+  <nav class="demo-nav" aria-label="Demo Header">
+    <a href="../" class="nav-brand">
+      <span class="nav-logo">🤖</span>
+      <div>
+        <strong>FerricStore Workflows</strong>
+        <small>Multi-Turn AI Agent · Budget Limits &amp; 3rd-Party Circuit Breakers</small>
+      </div>
+    </a>
+    <div class="nav-center">
+      <span class="nav-tag">DIRECTION 15 · AI AGENT RELIABILITY</span>
+    </div>
+    <div class="nav-right">
+      <a href="../" class="nav-back-link">← All Demos</a>
+    </div>
+  </nav>
+
+  <main class="demo-main">
+    <!-- Hero Section -->
+    <header class="demo-hero">
+      <div class="hero-tag">AGENT FINANCIAL &amp; INFRASTRUCTURE RESILIENCE</div>
+      <h1>
+        Multi-Turn AI Agents:<br>
+        <span class="hero-accent">Enforce Budget Limits &amp; 3rd-Party Circuit Breakers</span>
+      </h1>
+      <p class="hero-desc">
+        Running autonomous agents requires two distinct safeguards: <strong>Financial Budget Caps</strong> (to halt runaway infinite loops from burning $4,000 in API credits) and <strong>Durable Circuit Breakers</strong> (to stop slamming 3rd-party LLM &amp; tool APIs when they return 503/429 errors). Compare how unmanaged agents crash vs. how FerricStore protects both your budget and downstream services.
+      </p>
+
+      <!-- Mode Switch Tabs -->
+      <div class="mode-switch" role="tablist" aria-label="Execution Mode">
+        <button type="button" role="tab" data-mode-btn="before" aria-selected="false">
+          <span class="mode-tab-title">Without FerricStore</span>
+          <span class="mode-tab-badge bad">❌ Blind While-True Loop (No Budget / No Breaker)</span>
+        </button>
+        <button type="button" role="tab" data-mode-btn="after" aria-selected="true" class="is-selected">
+          <span class="mode-tab-title">With FerricStore</span>
+          <span class="mode-tab-badge good">✓ Durable Budget Cap + 3rd-Party Circuit Breaker</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Metrics Bar -->
+    <section class="metrics-bar" aria-label="Live Metrics Comparison">
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">💰</span>
+          <small>FINANCIAL BUDGET CAP</small>
+        </div>
+        <strong class="metric-val text-green" data-metric-budget>$5.00 Hard Ceiling</strong>
+        <span class="metric-sub" data-metric-budget-sub>Monotonic spend tracker</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">⚡</span>
+          <small>3RD-PARTY CIRCUIT BREAKER</small>
+        </div>
+        <strong class="metric-val text-green" data-metric-breaker>Active (3-Fail Trip)</strong>
+        <span class="metric-sub" data-metric-breaker-sub>Protects downstream LLM APIs</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">🧠</span>
+          <small>CRASH REPLAY LATENCY</small>
+        </div>
+        <strong class="metric-val text-cyan" data-metric-rehydrate>Durable resume</strong>
+        <span class="metric-sub" data-metric-rehydrate-sub>Effect guard prevents repeated spend</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">🔨</span>
+          <small>TOOL DEDUPLICATION</small>
+        </div>
+        <strong class="metric-val text-green" data-metric-dedup>Fenced state writes</strong>
+        <span class="metric-sub" data-metric-dedup-sub>Tool effects require idempotency</span>
+      </div>
+    </section>
+
+    <!-- Main Workspace (Code on Left, Visualizer on Right) -->
+    <section class="demo-workspace">
+      
+      <!-- Code Panel -->
+      <article class="code-panel">
+        <header class="panel-header">
+          <div class="file-info">
+            <span class="file-icon">py</span>
+            <div>
+              <h2 id="code-title" data-code-title>agent_continue.py</h2>
+              <small data-code-kicker>FERRICSTORE BUDGET + EFFECT API</small>
+            </div>
+          </div>
+          <div class="code-controls">
+            <div class="sdk-style-toggle" data-sdk-toggle>
+              <button type="button" class="sdk-btn" data-sdk-style="steps">Fused Continue</button>
+              <button type="button" class="sdk-btn is-active" data-sdk-style="states">Current SDK</button>
+            </div>
+            <span class="badge-durable" data-code-badge>BUDGET + BREAKER</span>
+          </div>
+        </header>
+
+        <!-- Code Block: Before Mode -->
+        <pre class="code-block" data-code="before" hidden><code><span data-line="1"><b class="ln">1</b><span><i class="k">while</i> <i class="k">True</i>:</span></span>
+<span data-line="2"><b class="ln">2</b><span>    <i class="c"># ❌ 1. No Budget Cap: Loops 500x burning $4,000 in API credits!</i></span></span>
+<span data-line="3"><b class="ln">3</b><span>    <i class="c"># ❌ 2. No Circuit Breaker: When OpenAI is 503, slams API with 100 req/s</i></span></span>
+<span data-line="4"><b class="ln">4</b><span>    thought = openai.<i class="fn">think</i>(prompt, memory)</span></span>
+<span data-line="5"><b class="ln">5</b><span>    result = tools.<i class="fn">execute</i>(thought.action)</span></span>
+<span data-line="6"><b class="ln">6</b><span>    </span></span>
+<span data-line="7"><b class="ln">7</b><span>    <i class="c"># 💥 Worker crashes on turn 8 ➔ All memory wiped from RAM!</i></span></span>
+<span data-line="8"><b class="ln">8</b><span>    memory.<i class="fn">append</i>(result)</span></span></code></pre>
+
+        <!-- Code Block: After Mode (Fused continuation) -->
+        <pre class="code-block" data-code="after-steps" hidden><code>from ferricstore import FlowClient
+
+client = FlowClient.from_url("ferric://127.0.0.1:6388")
+job = client.start_and_claim(
+    "agent-204", type="react-agent",
+    initial_state="plan", worker="agent-1",
+    payload={"query": "Compare launch options"},
+    values={"turn": 1, "spent_cents": 0},
+)
+
+# The worker performs one guarded agent turn.
+turn = agent.execute(
+    job.payload["query"], idempotency_key=f"{job.id}:turn:1:v1",
+)
+
+# STEP_CONTINUE is the durable boundary between plan and observe.
+job = client.step_continue(
+    job.id,
+    lease_token=job.lease_token,
+    fencing_token=job.fencing_token,
+    from_state=job.run_state,
+    to_state="observe",
+    values={"memory": turn.memory, "spent_cents": turn.cost_cents},
+    worker="agent-1",
+    return_job=True,
+)
+
+# The same worker may continue immediately using the fresh lease + fence.
+observation = evaluate(turn)
+client.complete(
+    job.id,
+    lease_token=job.lease_token,
+    fencing_token=job.fencing_token,
+    result=observation,
+)</code></pre>
+
+        <!-- Code Block: After Mode (States) -->
+        <pre class="code-block" data-code="after-states"><code>from ferricstore import BudgetPolicy, WorkflowClient, complete, transition
+
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
+flow = client.workflow(type="react-agent", initial_state="turn")
+
+@flow.state(
+    "turn",
+    claim_values=["turn", "memory"],
+    budget=BudgetPolicy(scope=lambda ctx: f"agent:{ctx.id}", amount=1, limit=10),
+)
+def turn(ctx):
+    turn_no = int((ctx.value("turn", b"0") or b"0").decode())
+    @ctx.effect(
+        "agent-tool", "ai.tool",
+        operation_digest=f"tool:{ctx.id}:{turn_no}:v1",
+    )
+    def call_tool():
+        return agent.execute(ctx.payload)
+
+    result = call_tool()
+    if result.done:
+        return complete(result=result.answer)
+    return transition("turn", values={
+        "turn": str(turn_no + 1).encode(),
+        "memory": result.memory,
+    })</code></pre>
+      </article>
+
+      <!-- Stage & Visualizer Panel -->
+      <article class="stage-panel">
+        <header class="stage-header">
+          <div class="stage-meta-left">
+            <span class="run-id-pill">AGENT: <strong data-agent-id>MARKET-RESEARCH-AGENT</strong></span>
+            <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>READY</b></span>
+          </div>
+          <div class="playback-controls">
+            <button class="stage-btn btn-primary" data-btn-play title="Run Normal Agent Execution">⚡ Normal Run</button>
+            <button class="stage-btn btn-warning" data-btn-budget title="Simulate Runaway Loop Exceeding $5.00 Budget">💰 Test Budget Cap</button>
+            <button class="stage-btn btn-danger" data-btn-breaker title="Simulate 3rd-Party OpenAI 503 Outage (Trips Circuit Breaker)">⚡ Test Breaker (503)</button>
+            <button class="stage-btn btn-ghost" data-btn-reset title="Reset Simulation">↺</button>
+          </div>
+        </header>
+
+        <!-- Visualizer Content: Dual Safeguards (Budget Meter + Circuit Breaker) -->
+        <div class="visualizer-content">
+          
+          <!-- Dual Safeguards Status Bar -->
+          <div class="dual-guards-grid">
+            
+            <!-- Guard 1: Financial Budget Limit -->
+            <div class="guard-card" data-guard-budget-card>
+              <div class="guard-head">
+                <span class="guard-icon">💰</span>
+                <div>
+                  <strong>FINANCIAL BUDGET LIMIT</strong>
+                  <small>Hard stop on infinite spend</small>
+                </div>
+              </div>
+              <div class="guard-metric-row">
+                <span class="guard-val" data-guard-budget-val>$0.45 / $5.00</span>
+                <span class="guard-badge ok" data-guard-budget-badge>✓ Within Safe Limit</span>
+              </div>
+              <div class="guard-track">
+                <div class="guard-fill" data-guard-budget-fill style="width: 9%;"></div>
+              </div>
+            </div>
+
+            <!-- Guard 2: 3rd-Party Circuit Breaker -->
+            <div class="guard-card" data-guard-breaker-card>
+              <div class="guard-head">
+                <span class="guard-icon">⚡</span>
+                <div>
+                  <strong>3RD-PARTY CIRCUIT BREAKER</strong>
+                  <small>OpenAI API (api.openai.com)</small>
+                </div>
+              </div>
+              <div class="guard-metric-row">
+                <span class="guard-val" data-guard-breaker-val>State: CLOSED (Healthy)</span>
+                <span class="guard-badge ok" data-guard-breaker-badge>0 / 3 Errors</span>
+              </div>
+              <div class="guard-track">
+                <div class="guard-fill breaker-fill" data-guard-breaker-fill style="width: 0%;"></div>
+              </div>
+            </div>
+
+          </div>
+
+          <!-- ReAct Agent Turns Visualizer Widget -->
+          <div class="agent-turns-card">
+            <div class="agent-turns-header">
+              <span>REACT REASONING TURNS (CHECKPOINTED TO RAFT)</span>
+              <span class="turns-counter" data-turns-counter>Turn 1 of 4</span>
+            </div>
+            <div class="turns-stack" data-turns-stack>
+              <!-- Turn items generated by JS -->
+            </div>
+          </div>
+
+          <!-- Live Event Terminal -->
+          <div class="live-terminal-compact">
+            <div class="term-head">
+              <span>📟 AGENT REASONING &amp; GUARDIAN LOG</span>
+              <small data-term-speed>Live simulator</small>
+            </div>
+            <div class="term-stream" data-term-stream>
+              <div class="term-row info">[00:00.000] Click "⚡ Normal Run", "💰 Test Budget Cap", or "⚡ Test Breaker (503)" to test safeguards.</div>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- Outcome Callout Footer -->
+        <footer class="stage-footer">
+          <div class="outcome-callout good" data-outcome-callout>
+            <small data-outcome-label>AGENT GUARDIAN OUTCOME</small>
+            <strong data-outcome-title>DUAL RELIABILITY SAFEGUARDS ACTIVE</strong>
+            <span data-outcome-sub>Budget cap protects your financial balance. Circuit breaker protects downstream 3rd-party APIs from overload during outages.</span>
+          </div>
+        </footer>
+      </article>
+
+    </section>
+
+    <!-- Catastrophe & Prevention Section -->
+    <section class="catastrophe-section">
+      <div class="catastrophe-head">
+        <span class="catastrophe-pill">⚠️ THE HAZARD vs. HOW FERRICSTORE PREVENTS IT</span>
+        <h2>Why Autonomous AI Agents Fail &amp; How FerricStore Fixes It</h2>
+        <p>Compare unmanaged Python agent script failures with FerricStore's durable execution engine.</p>
+      </div>
+
+      <div class="catastrophe-grid">
+        <!-- Card 1 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">💸</span>
+            <h4>$4,000 Runaway Infinite Loop</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (Unbounded While-True):</strong>
+              <p>An autonomous coding agent encounters a syntax error and loops 500 times trying hallucinated tool calls overnight, completely draining the OpenAI API credit budget.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It (Budget Cap):</strong>
+              <p><strong>Durable Financial Spend Limit:</strong> Every turn records token cost in the durable context. If cumulative cost reaches $5.00 (or 15 turns), execution is immediately halted before burning money.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">🚨 $4,000 Wasted API Bill</span>
+            <span class="cat-fix-badge">✓ Hardware-Enforced Budget Cap</span>
+          </div>
+        </div>
+
+        <!-- Card 2 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">⚡</span>
+            <h4>Cascading 3rd-Party API Overload</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (Blind Retry Storm):</strong>
+              <p>When OpenAI or a 3rd-party web scraping API returns 503 / 429 Rate Limits, the unmanaged agent hammers the failing service with 100 req/s, causing permanent IP bans.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It (Circuit Breaker):</strong>
+              <p><strong>Durable 3rd-Party Circuit Breaker:</strong> If 3 consecutive errors occur, the flow enters a persisted cooldown state before a later scheduled retry probes for recovery.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">🚨 429 Rate Limit Ban &amp; Outage</span>
+            <span class="cat-fix-badge">✓ Auto-Trip Circuit Breaker</span>
+          </div>
+        </div>
+
+        <!-- Card 3 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">🔄</span>
+            <h4>Mid-Loop Worker Crash</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (Stateless In-Memory Agents):</strong>
+              <p>Worker machine reboots at Turn #8 (after spending $2.40). The script restarts from Turn 1, charging another $2.40 for duplicate reasoning steps.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <p><strong>Explicit Agent State:</strong> Completed turns and their outputs are carried in durable state. A replacement worker claims the next state after lease expiry.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">💸 Double LLM Inference Spend</span>
+            <span class="cat-fix-badge">✓ Durable Turn State</span>
+          </div>
+        </div>
+
+        <!-- Card 4 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">🔨</span>
+            <h4>Duplicate External Tool Side-Effects</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (Unchecked Retries):</strong>
+              <p>The agent creates a GitHub PR or charges a Stripe card, then crashes before saving completion status, creating 10 duplicate PRs on retry.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <p><strong>Guarded Tool Execution:</strong> Give every external tool call a stable operation digest, provider idempotency key, or <code>ctx.effect(...)</code> guard. Workflow state alone cannot deduplicate an external provider call.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">🚨 10 Duplicate GitHub PRs / Charges</span>
+            <span class="cat-fix-badge">✓ Explicit Effect Protection</span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="./loop.js?v=4"></script>
+  <script src="../shared/accuracy.js?v=8"></script>
+</body>
+</html>

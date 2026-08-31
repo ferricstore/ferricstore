@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Determinism &amp; Idempotency: Steps vs. States API | FerricStore Demos</title>
+  <link rel="stylesheet" href="./style.css?v=2">
+  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=4">
+</head>
+<body>
+  <nav class="top-nav">
+    <div class="container nav-inner">
+      <a href="../" class="nav-brand">
+        <span class="brand-icon">🔁</span>
+        <span>FerricStore</span>
+        <span class="nav-tag">Determinism &amp; Idempotency</span>
+      </a>
+      <a href="../" class="back-link">← Back to All Demos</a>
+    </div>
+  </nav>
+
+  <main class="container">
+    <header class="hero">
+      <div class="hero-pill">🔁 STEP &amp; STATE DISK PERSISTENCE</div>
+      <h1>Determinism &amp; Idempotency: <br><span class="hero-gradient">With vs. Without FerricStore</span></h1>
+      <p class="hero-desc">
+        FerricStore durably records explicit state transitions and fences stale workers. Handlers remain at-least-once, so payment, LLM, inventory, and email calls must use a stable provider idempotency key or <code>ctx.effect(...)</code>.
+      </p>
+    </header>
+
+    <!-- Interactive Scenario Tabs -->
+    <section class="scenario-selector-bar">
+      <span class="scenario-label">SELECT REAL-WORLD PERSISTENCE SCENARIO:</span>
+      <div class="scenario-tabs">
+        <button type="button" class="scen-tab is-active" data-scenario="double-charge">
+          <span>💳 Scenario A: Stripe Double-Billing</span>
+          <small>Unmemoized Call vs. Raft Checkpoint + Key</small>
+        </button>
+        <button type="button" class="scen-tab" data-scenario="llm-tokens">
+          <span>🤖 Scenario B: AI Token &amp; Compute Waste</span>
+          <small>Re-Running 4,000 Tokens vs. Step Disk Cache</small>
+        </button>
+        <button type="button" class="scen-tab" data-scenario="inventory-lock">
+          <span>📦 Scenario C: Inventory Double-Decrement</span>
+          <small>Unchecked Script vs. Sealed FSM State</small>
+        </button>
+      </div>
+    </section>
+
+    <!-- Side-by-Side Dual Arena -->
+    <section class="comparison-stage">
+      
+      <!-- Stage Header with Controls -->
+      <header class="stage-header">
+        <div class="scenario-badge">
+          <span class="badge-label" data-badge-scenario style="background: rgba(239, 68, 68, 0.18); color: #fca5a5;">HAZARD ACTIVE</span>
+          <strong data-scenario-title>Scenario A: E-Commerce Checkout ($150.00 Order #8492)</strong>
+        </div>
+        <div class="ctrl-btn-group">
+          <button class="ctrl-btn auto-play-btn" data-btn-autoplay>⚡ Play Live Interactive Simulation</button>
+          <button class="ctrl-btn" data-btn-step1>▶ 1. Initial Run</button>
+          <button class="ctrl-btn crash-btn" data-btn-crash>💥 2. Inject Crash</button>
+          <button class="ctrl-btn retry-btn" data-btn-retry>🔄 3. Worker Retry</button>
+          <button class="ctrl-btn" data-btn-reset>↺ Reset</button>
+        </div>
+      </header>
+
+      <!-- Dual Arena Grid -->
+      <div class="dual-arena-grid">
+        
+        <!-- LEFT: WITHOUT FERRICSTORE -->
+        <article class="arena-card bad" data-card-left>
+          <div class="arena-head">
+            <div class="arena-title-wrap">
+              <span class="side-badge bad">❌ WITHOUT FERRICSTORE</span>
+              <h3>Naive Python / Celery Worker</h3>
+            </div>
+            <span class="status-pill bad" data-left-status-pill>0% Step Persistence</span>
+          </div>
+
+          <!-- Code Snippet with danger highlights -->
+          <div class="code-box">
+            <pre><code data-left-code-content><span class="c-comment"># ❌ NAIVE SCRIPT: No step checkpointing to disk</span>
+<span class="c-kw">import</span> stripe, inventory, email
+
+<span class="c-kw">def</span> <span class="c-fn">process_order</span>(order_id, amount):
+    <span class="c-danger"># ❌ Uncheckpointed: Re-executes on retry & bills card again!
+    charge = stripe.Charge.create(amount=amount)</span>
+    
+    <span class="c-danger"># ❌ In-memory state lost when server dies!
+    inventory.lock_sku(order_id)</span>
+    
+    <span class="c-crash-line"># 💥 Worker crashes here (SIGKILL / Out-of-Memory)</span>
+    email.send_receipt(charge.id)</code></pre>
+          </div>
+
+          <!-- Live Step Visualizer -->
+          <div class="step-stream" data-left-stream>
+            <div class="stream-item done" data-left-step-1>
+              <span class="s-dot">1</span>
+              <div class="s-info">
+                <strong data-left-s1-title>Charge Customer $150.00</strong>
+                <small data-left-tx1>Stripe Charge API Called: tx_a48f2910</small>
+              </div>
+              <span class="s-badge green" data-left-s1-badge>Billed $150</span>
+            </div>
+
+            <div class="stream-item done" data-left-step-2>
+              <span class="s-dot">2</span>
+              <div class="s-info">
+                <strong data-left-s2-title>Lock Inventory (SKU #849)</strong>
+                <small data-left-s2-sub>Stock decremented in Postgres</small>
+              </div>
+              <span class="s-badge green">Locked</span>
+            </div>
+
+            <div class="stream-item crash" data-left-step-3>
+              <span class="s-dot">3</span>
+              <div class="s-info">
+                <strong data-left-s3-title>Send Customer Receipt</strong>
+                <small data-left-crash-desc>💥 WORKER CRASH (OOM / SIGKILL)</small>
+              </div>
+              <span class="s-badge red">Crash</span>
+            </div>
+
+            <!-- Retry Row -->
+            <div class="retry-danger-box" data-left-retry-box style="display: none;">
+              <div class="retry-head">🚨 SQS / CELERY RETRY RE-RUNS FROM LINE 1:</div>
+              <div class="retry-step">
+                <span>💳 Step 1 re-executed with NEW charge: <code data-left-tx2>tx_3b91c048</code></span>
+                <strong style="color: #ef4444;">➔ BILLED ANOTHER $150!</strong>
+              </div>
+              <div class="retry-step">
+                <span>📦 Step 2 stock decremented a 2nd time (Double count bug!)</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Outcome Footer -->
+          <div class="arena-outcome bad">
+            <small>CUSTOMER &amp; SYSTEM IMPACT</small>
+            <strong data-left-outcome style="color: #ef4444;">$300.00 CHARGED (DOUBLE BILLED!)</strong>
+            <span data-left-outcome-sub>Because Step 1 was not persisted to durable disk log, retry repeats all previous side-effects.</span>
+          </div>
+        </article>
+
+        <!-- RIGHT: WITH FERRICSTORE (FUSED CONTINUE & STATES API TOGGLE) -->
+        <article class="arena-card good" data-card-right>
+          <div class="arena-head">
+            <div class="arena-title-wrap">
+              <span class="side-badge good">✓ WITH FERRICSTORE</span>
+              <h3 data-right-title>Durable SDK (States API - FSM)</h3>
+            </div>
+            <span class="status-pill good" data-right-status-pill>Committed</span>
+          </div>
+
+          <!-- SDK Paradigm Switcher (fused continuation vs. state handlers) -->
+          <div class="api-switcher-bar">
+            <button type="button" class="api-toggle" data-api-mode="steps">
+              <span>Fused Continue</span>
+              <small>Real FLOW.STEP_CONTINUE command</small>
+            </button>
+            <button type="button" class="api-toggle is-active" data-api-mode="states">
+              <span>🔀 States API</span>
+              <small>Atomic Transitions (@flow.state)</small>
+            </button>
+          </div>
+
+          <!-- Code Snippet with safety highlights -->
+          <div class="code-box">
+            <pre><code data-right-code-content># Real fused step boundary
+from ferricstore import FlowClient
+
+client = FlowClient.from_url("ferric://127.0.0.1:6388")
+job = client.start_and_claim(
+    "order-8492", type="checkout-saga",
+    initial_state="charge", worker="checkout-1",
+)
+
+# Use a stable provider key: STEP_CONTINUE does not dedupe Stripe.
+charge = stripe.Charge.create(
+    amount=15000, idempotency_key=f"{job.id}:charge:v1",
+)
+job = client.step_continue(
+    job.id,
+    lease_token=job.lease_token,
+    fencing_token=job.fencing_token,
+    from_state=job.run_state,
+    to_state="reserve",
+    values={"tx_id": charge.id},
+    return_job=True,
+)</code></pre>
+          </div>
+
+          <!-- Live Step Visualizer -->
+          <div class="step-stream" data-right-stream>
+            <div class="stream-item done" data-right-step-1>
+              <span class="s-dot">1</span>
+              <div class="s-info">
+                <strong data-right-s1-title>Charge Customer $150.00</strong>
+                <small data-right-tx1>Committed to Raft Disk with Key: wf_9842_chg</small>
+              </div>
+              <span class="s-badge green" data-right-s1-badge>Billed $150</span>
+            </div>
+
+            <div class="stream-item done" data-right-step-2>
+              <span class="s-dot">2</span>
+              <div class="s-info">
+                <strong data-right-s2-title>Lock Inventory (SKU #849)</strong>
+                <small data-right-s2-sub>Durable state committed before continuing</small>
+              </div>
+              <span class="s-badge green">Locked</span>
+            </div>
+
+            <div class="stream-item crash" data-right-step-3>
+              <span class="s-dot">3</span>
+              <div class="s-info">
+                <strong data-right-s3-title>Send Customer Receipt</strong>
+                <small data-right-crash-desc>💥 WORKER CRASH (OOM / SIGKILL)</small>
+              </div>
+              <span class="s-badge purple" data-right-s3-badge>Resuming...</span>
+            </div>
+
+            <!-- Replay Safe Box -->
+            <div class="replay-safe-box" data-right-replay-box style="display: none;">
+              <div class="replay-head" data-replay-box-head>⚡ REPLACEMENT WORKER RESUMES AFTER RECLAIM:</div>
+              <div class="replay-step" data-replay-step-1>
+                <span>✓ State 1: <strong style="color: #34d399;">Already committed</strong> (charge protected by provider key)</span>
+              </div>
+              <div class="replay-step" data-replay-step-2>
+                <span>✓ State 2: <strong style="color: #34d399;">Already committed</strong> (inventory mutation idempotent)</span>
+              </div>
+              <div class="replay-step" data-replay-step-3>
+                <span>✉️ Step 3: Resumes directly from Step 3 and completes!</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Outcome Footer -->
+          <div class="arena-outcome good">
+            <small>CUSTOMER &amp; SYSTEM IMPACT</small>
+            <strong data-right-outcome style="color: #34d399;">DURABLE STATE + GUARDED CHARGE</strong>
+            <span data-right-outcome-sub>The state transition is durable; Stripe still needs a stable idempotency key or guarded effect.</span>
+          </div>
+        </article>
+
+      </div>
+
+      <!-- Live Interactive Event Stream & Console Terminal -->
+      <div class="live-event-terminal">
+        <div class="term-header">
+          <div class="term-title-wrap">
+            <span class="term-icon">📟</span>
+            <strong>LIVE WORKER EVENT STREAM &amp; REPLAY AUDIT LOG</strong>
+          </div>
+          <span class="term-status" data-term-status><span class="pulse-dot"></span> SIMULATION READY</span>
+        </div>
+        <div class="term-body" data-term-body>
+          <div class="term-line info">[00:00.000] System ready. Click "⚡ Play Live Interactive Simulation" or use the step buttons above to trigger live failure recovery.</div>
+        </div>
+      </div>
+
+      <!-- Comparative Telemetry Metrics -->
+      <div class="telemetry-grid">
+        <div class="telemetry-card">
+          <small>Naive Total Billed</small>
+          <div class="telemetry-val" style="color: #ef4444;" data-val-naive-billed>$300.00</div>
+          <span class="telemetry-sub">2x Double charge ($150 penalty)</span>
+        </div>
+        <div class="telemetry-card">
+          <small>FerricStore Billed</small>
+          <div class="telemetry-val" style="color: #34d399;" data-val-ferric-billed>$150.00</div>
+          <span class="telemetry-sub">Charge protected by provider key</span>
+        </div>
+        <div class="telemetry-card">
+          <small>Replay Disk Lookup</small>
+          <div class="telemetry-val" style="color: #38bdf8;" data-val-replay-time>After reclaim</div>
+          <span class="telemetry-sub">Lease and topology dependent</span>
+        </div>
+        <div class="telemetry-card">
+          <small>Duplicate Execution</small>
+          <div class="telemetry-val" style="color: #34d399;" data-val-divergence>Stale writes fenced</div>
+          <span class="telemetry-sub">Handlers can run at-least-once</span>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- Real-World Catastrophes Breakdown Section -->
+    <section class="catastrophes-section">
+      <div class="section-badge">⚠️ PRODUCTION FAILURE ANATOMY</div>
+      <h2>What Happens in Production When Idempotency &amp; Determinism Aren't Handled?</h2>
+      <p class="section-subtitle">
+        In distributed backends, <strong>worker retries are inevitable</strong> (Kubernetes pod evictions, network timeouts, JVM/Node GC pauses, OOM crashes). If your service relies on raw Celery tasks, SQS queues, or naive scripts, retries re-execute completed side-effects, causing severe real-world damage:
+      </p>
+
+      <div class="catastrophe-grid">
+        <div class="cat-card">
+          <div class="cat-icon">💳</div>
+          <h3>1. Double-Billing &amp; Chargeback Penalties</h3>
+          <p>
+            <strong>The Failure:</strong> Stripe authorizes a $150 payment, but the worker crashes before acknowledging the message. The queue retries from line 1 without an idempotency key, charging the customer a second time ($300 total).
+          </p>
+          <div class="cat-impact">
+            <strong>Real-World Impact:</strong> Customer files a fraud dispute. The merchant pays a $15.00 chargeback fee per dispute and faces credit card processor suspension.
+          </div>
+        </div>
+
+        <div class="cat-card">
+          <div class="cat-icon">📦</div>
+          <h3>2. Ghost Inventory Decrements (Over-Selling)</h3>
+          <p>
+            <strong>The Failure:</strong> Worker runs <code>UPDATE items SET stock = stock - 1</code> in Postgres. It crashes during the confirmation webhook. The retry re-runs the SQL query, decrementing stock to 8 instead of 9.
+          </p>
+          <div class="cat-impact">
+            <strong>Real-World Impact:</strong> Physical warehouse inventory desynchronizes from the database ledger. During flash sales, this causes overselling and expensive order cancellations.
+          </div>
+        </div>
+
+        <div class="cat-card">
+          <div class="cat-icon">🤖</div>
+          <h3>3. Exponential AI Token Waste &amp; 429 Cascades</h3>
+          <p>
+            <strong>The Failure:</strong> An autonomous AI agent completes a 4,000-token research synthesis ($0.12). A network timeout occurs while uploading the PDF. The retry re-runs the entire LLM prompt from scratch.
+          </p>
+          <div class="cat-impact">
+            <strong>Real-World Impact:</strong> Redundant token burns double your OpenAI/Anthropic cloud bill and exhaust API rate limits (<code>429 Too Many Requests</code>), crashing downstream services.
+          </div>
+        </div>
+
+        <div class="cat-card">
+          <div class="cat-icon">📨</div>
+          <h3>4. Notification Storms &amp; Carrier Spam Blocking</h3>
+          <p>
+            <strong>The Failure:</strong> Worker sends an SMS OTP or order confirmation email, then fails while updating the user record. Every retry re-dispatches the SMS/Email to the end user.
+          </p>
+          <div class="cat-impact">
+            <strong>Real-World Impact:</strong> Customer receives 5 duplicate text messages in 2 minutes. Carriers flag your Twilio phone number as spam, and support tickets spike.
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Side-by-Side Architectural Matrix -->
+    <section class="matrix-section">
+      <h2>Where FerricStore Durability Ends and Effect Idempotency Begins</h2>
+      <div class="matrix-table-wrap">
+        <table class="matrix-table">
+          <thead>
+            <tr>
+              <th>Operation / Workload</th>
+              <th>Without FerricStore (Naive Script)</th>
+              <th>Fused <code>STEP_CONTINUE</code></th>
+              <th>States API (@flow.state)</th>
+              <th>Required effect protection</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Payment API Calls</strong></td>
+              <td class="bad">Re-executes on retry → double charged</td>
+              <td class="good">Persists output and advances state atomically</td>
+              <td class="good">State "charge" committed before transition</td>
+              <td>Stable Stripe idempotency key or <code>ctx.effect</code></td>
+            </tr>
+            <tr>
+              <td><strong>Inventory Decrement</strong></td>
+              <td class="bad">Stock decremented twice in database</td>
+              <td class="good">Advances after the guarded database mutation</td>
+              <td class="good">FSM skips completed "reserve" state</td>
+              <td>Idempotent SQL mutation or guarded effect</td>
+            </tr>
+            <tr>
+              <td><strong>AI Model Inference</strong></td>
+              <td class="bad">Repeats 4,000 LLM token generation</td>
+              <td class="good">Stores the LLM output before the next state</td>
+              <td class="good">State payload carries completed generation</td>
+              <td>Application/FlowGuard effect protection for repeated spend</td>
+            </tr>
+            <tr>
+              <td><strong>Network Gateway Timeout</strong></td>
+              <td class="bad">Unbounded retries with new random IDs</td>
+              <td class="good">Idempotency key derived from workflow ID</td>
+              <td class="good">Idempotency key derived from job ID</td>
+              <td>Gateway deduplicates mid-flight retries</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="./determinism.js?v=5"></script>
+  <script src="../shared/accuracy.js?v=8"></script>
+</body>
+</html>

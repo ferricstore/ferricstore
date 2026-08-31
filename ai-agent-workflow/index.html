@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Multi-Agent AI & Human-in-the-Loop | FerricStore Demos</title>
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=4">
+</head>
+<body>
+  <nav class="top-nav">
+    <div class="container nav-inner">
+      <a href="../" class="nav-brand">
+        <span class="brand-icon">⚡</span>
+        <span>FerricStore</span>
+        <span class="nav-tag">AI Agent Demo</span>
+      </a>
+      <a href="../" class="back-link">← Back to All Demos</a>
+    </div>
+  </nav>
+
+  <main class="container">
+    <header class="hero">
+      <div class="hero-pill">🤖 MULTI-AGENT ORCHESTRATION</div>
+      <h1>Long-Running AI &amp; <span class="hero-gradient">Human-in-the-Loop</span></h1>
+      <p class="hero-desc">
+        AI agent chains can pause for days awaiting human approval. The workflow persists an <code>await_approval</code> state without holding an application handler until a webhook sends a durable, state-guarded signal.
+      </p>
+    </header>
+
+    <section class="stage-card">
+      <header class="stage-header">
+        <div class="scenario-badge">
+          <span class="badge-label">SCENARIO</span>
+          <strong>Autonomous $50k Marketing Campaign Generator</strong>
+        </div>
+        <div style="display: flex; gap: 8px;">
+          <button class="ctrl-btn" style="border-color: #ef4444; color: #fca5a5;" data-kill-btn>💥 Kill Server Mid-Wait</button>
+        </div>
+      </header>
+
+      <!-- 5 Agent Stations Grid -->
+      <div class="agent-stations-grid">
+        <div class="agent-node" data-agent-node="0">
+          <div class="an-head"><span>STAGE 1</span><span class="node-pill">DONE</span></div>
+          <div class="an-icon">🔍</div>
+          <strong>1. Market Research</strong>
+          <small>Web Scraping Agent</small>
+        </div>
+
+        <div class="agent-node" data-agent-node="1">
+          <div class="an-head"><span>STAGE 2</span><span class="node-pill">DONE</span></div>
+          <div class="an-icon">📝</div>
+          <strong>2. Ad Generation</strong>
+          <small>Drafts $50k Plan</small>
+        </div>
+
+        <div class="agent-node is-waiting" data-agent-node="2">
+          <div class="an-head"><span>STAGE 3</span><span class="node-pill">ACTIVE</span></div>
+          <div class="an-icon">⏸️</div>
+          <strong>3. State: await_approval</strong>
+          <small>Durable waiting state</small>
+        </div>
+
+        <div class="agent-node" data-agent-node="3">
+          <div class="an-head"><span>STAGE 4</span><span class="node-pill">PENDING</span></div>
+          <div class="an-icon">🛡️</div>
+          <strong>4. Crash / Host Reboot</strong>
+          <small>Zero State Loss</small>
+        </div>
+
+        <div class="agent-node" data-agent-node="4">
+          <div class="an-head"><span>STAGE 5</span><span class="node-pill">PENDING</span></div>
+          <div class="an-icon">🚀</div>
+          <strong>5. Ad Launch</strong>
+          <small>Triggered by Signal</small>
+        </div>
+      </div>
+
+      <!-- Interactive Showcase Area (Slack UI + Explainer) -->
+      <div class="agent-showcase-split">
+        <!-- Interactive Slack Notification Card -->
+        <div class="slack-modal-box">
+          <div>
+            <div class="slack-header">
+              <span class="slack-icon">#</span>
+              <span>Slack Notification: #finance-approvals</span>
+            </div>
+            <div class="slack-body">
+              <div style="font-weight: 800; color: #fff; margin-bottom: 4px;">🤖 AI Marketing Agent requests budget signoff:</div>
+              <div style="color: #cbd5e1; margin-bottom: 6px;">Campaign: <em>"Summer SaaS Growth Blast"</em> (Job ID: <code>#camp-9842</code>)</div>
+              <div style="font-family: var(--font-mono); color: #34d399; font-size: 13px; font-weight: 750;">Total Budget: $50,000.00 USD</div>
+            </div>
+          </div>
+          <div class="slack-actions">
+            <button class="slack-btn-approve" data-slack-approve>✓ Approve in Slack ($50k)</button>
+            <button class="slack-btn-reject" data-slack-reject>✕ Request Revisions</button>
+          </div>
+        </div>
+
+        <!-- Narrative Box -->
+        <div class="agent-narrative-box">
+          <div class="agent-badge warn" data-narrative-badge>⏸️ STATE: AWAIT_APPROVAL</div>
+          <h3 style="margin: 0 0 6px; font-size: 18px;" data-narrative-title>Workflow Parked on Disk</h3>
+          <p style="margin: 0 0 12px; font-size: 13.5px; color: var(--text-muted);" data-narrative-desc>
+            The workflow transitioned to <code>await_approval</code> state and yielded execution. FerricStore unloads the worker process completely. No memory leaks, no hung threads.
+          </p>
+          <div style="font-family: var(--font-mono); font-size: 11.5px; color: #a78bfa; background: rgba(0,0,0,0.4); padding: 8px; border-radius: 4px;" data-narrative-code>
+            return transition("await_approval", payload={"plan": plan})
+          </div>
+        </div>
+      </div>
+
+      <!-- Live Telemetry -->
+      <div class="telemetry-grid">
+        <div class="telemetry-card">
+          <small>Server CPU While Parked</small>
+          <div class="telemetry-val" style="color: #34d399;" data-val-cpu>0.0%</div>
+          <span class="telemetry-sub">Zero compute wasted</span>
+        </div>
+        <div class="telemetry-card">
+          <small>Worker Compute RAM</small>
+          <div class="telemetry-val" style="color: #34d399;" data-val-ram>Unloaded</div>
+          <span class="telemetry-sub">State safe on disk log</span>
+        </div>
+        <div class="telemetry-card">
+          <small>Signal Waiting State</small>
+          <div class="telemetry-val" data-val-wait>Awaiting Signal</div>
+          <span class="telemetry-sub">client.signal(job_id, ...)</span>
+        </div>
+        <div class="telemetry-card">
+          <small>Signal Resumption Latency</small>
+          <div class="telemetry-val" style="color: #38bdf8;" data-val-resume>Lease-dependent</div>
+          <span class="telemetry-sub">Advances after a valid signal and worker claim</span>
+        </div>
+      </div>
+
+      <!-- Controls -->
+      <footer class="stage-footer">
+        <div class="ctrl-btn-group">
+          <button class="ctrl-btn" data-prev>⏮ Prev</button>
+          <button class="ctrl-btn" data-pause>⏸ Pause</button>
+          <button class="ctrl-btn" data-next>Next ⏭</button>
+          <button class="ctrl-btn" data-replay>↺ Replay</button>
+        </div>
+        <div style="font-size: 13px; color: var(--text-dim);" data-live-status>
+          Auto-advancing simulation
+        </div>
+      </footer>
+    </section>
+
+    <!-- Python Code Example -->
+    <section style="margin-bottom: 60px;">
+      <h3 style="font-size: 20px; margin-bottom: 12px;">FerricStore Python SDK: State Transition &amp; External Signal</h3>
+      <pre style="background: #080614; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 20px; font-family: var(--font-mono); font-size: 13px; color: #e2e8f0; overflow-x: auto;"><code># 1. The Multi-Agent AI Workflow State Machine
+from ferricstore import WorkflowClient, transition, complete
+
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
+flow = client.workflow(type="ad-campaign-agent", initial_state="research")
+
+@flow.state("research")
+def research(ctx):
+    @ctx.effect("research", "web.scrape", operation_digest=f"research:{ctx.id}:v1")
+    def scrape():
+        return web_scraper.run(operation_id=f"{ctx.id}:research:v1")
+    competitors = scrape()
+    return transition("draft_plan", payload={"competitors": competitors})
+
+@flow.state("draft_plan")
+def draft(ctx):
+    @ctx.effect("draft", "llm.create", operation_digest=f"draft:{ctx.id}:v1")
+    def create_plan():
+        return llm.create_campaign(ctx.payload["competitors"])
+    plan = create_plan()
+
+    @ctx.effect("approval-request", "slack.post", operation_digest=f"approval:{ctx.id}:v1")
+    def request_approval():
+        slack.post_approval_request(
+            channel="#finance-approvals", job_id=ctx.id, plan=plan,
+            idempotency_key=f"{ctx.id}:approval:v1",
+        )
+    request_approval()
+    # ⏸️ Transition to a durable waiting state and yield this handler:
+    return transition("await_approval", payload={"plan": plan})
+
+@flow.state("launch_campaign")
+def launch(ctx):
+    @ctx.effect("launch", "google-ads.create", operation_digest=f"launch:{ctx.id}:v1")
+    def create_campaign():
+        return google_ads.create_campaign(
+            budget=50000, request_id=f"{ctx.id}:launch:v1",
+        )
+    res = create_campaign()
+    return complete(result=res)
+
+# -------------------------------------------------------------
+# 2. The Slack Webhook API Endpoint (FastAPI / Flask)
+# -------------------------------------------------------------
+@app.post("/webhooks/slack/approve")
+def slack_webhook(payload: dict):
+    job_id = payload["job_id"]
+    # ⚡ External signal commands the workflow to transition to the next state:
+    client.signal(
+        job_id, signal="approved", if_state="await_approval",
+        transition_to="launch_campaign", values={"approved_by": payload["user"]},
+        idempotency_key=f"{job_id}:approve:{payload['action_id']}:v1",
+    )
+    return {"status": "workflow_resumed"}</code></pre>
+    </section>
+  </main>
+  <script src="./agent.js?v=3"></script>
+  <script src="../shared/accuracy.js?v=8"></script>
+</body>
+</html>

@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pub/Sub &amp; Streams · FerricStore</title>
+  <link rel="stylesheet" href="../shared/base.css">
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=4">
+</head>
+<body data-mode="pubsub">
+
+  <!-- Top Navigation -->
+  <nav class="demo-nav" aria-label="Demo Header">
+    <a href="../" class="nav-brand">
+      <span class="nav-logo">📡</span>
+      <div>
+        <strong>FerricStore Messaging Primitives</strong>
+        <small>Pub/Sub &amp; Streams · Ephemeral Fanout &amp; Durable Logs</small>
+      </div>
+    </a>
+    <div class="nav-center">
+      <span class="nav-tag">STREAMS &amp; PUBSUB MESSAGING</span>
+    </div>
+    <div class="nav-right">
+      <a href="../" class="nav-back-link">← All Demos</a>
+    </div>
+  </nav>
+
+  <main class="demo-main">
+    <!-- Hero Section -->
+    <header class="demo-hero">
+      <div class="hero-tag">NATIVE MESSAGING PRIMITIVES · TWO PURPOSE-BUILT ENGINES</div>
+      <h1>
+        Pub/Sub &amp; Streams in FerricStore:<br>
+        <span class="hero-accent">Choose Ephemeral In-Memory Fanout or Durable Raft Event Logs</span>
+      </h1>
+      <p class="hero-desc">
+        FerricStore provides first-class native support for both <strong>Pub/Sub</strong> and <strong>Streams</strong>. Neither is "better"—each is engineered for different backend needs. Use <strong>Pub/Sub</strong> for ephemeral in-memory broadcast to active subscribers. Use <strong>Streams</strong> for a persisted event log, consumer-group load balancing, and replay after a worker reconnects.
+      </p>
+
+      <!-- Mode Switch Tabs -->
+      <div class="mode-switch" role="tablist" aria-label="Messaging Mode">
+        <button type="button" role="tab" data-mode-btn="pubsub" aria-selected="true" class="is-selected">
+          <span class="mode-tab-title">📡 Live Pub/Sub (PUBLISH / SUBSCRIBE)</span>
+          <span class="mode-tab-badge mode-cyan">⚡ Ephemeral In-Memory Fanout</span>
+        </button>
+        <button type="button" role="tab" data-mode-btn="stream" aria-selected="false">
+          <span class="mode-tab-title">📜 Durable Streams (XADD / XREADGROUP)</span>
+          <span class="mode-tab-badge mode-purple">🛡️ NVMe Append Log (HLC IDs · Replay)</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Metrics Bar -->
+    <section class="metrics-bar" aria-label="Live Metrics Comparison">
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">⚙️</span>
+          <small data-metric-lbl-1>MESSAGING ARCHITECTURE</small>
+        </div>
+        <strong class="metric-val text-cyan" data-metric-val-1>In-Memory Socket Push</strong>
+        <span class="metric-sub" data-metric-sub-1>Zero disk/WAL write overhead</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">⚡</span>
+          <small data-metric-lbl-2>FANOUT LATENCY</small>
+        </div>
+        <strong class="metric-val text-green" data-metric-val-2>Workload Dependent</strong>
+        <span class="metric-sub" data-metric-sub-2>Direct TCP socket delivery</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">💾</span>
+          <small data-metric-lbl-3>STORAGE FOOTPRINT</small>
+        </div>
+        <strong class="metric-val text-green" data-metric-val-3>No Message Log</strong>
+        <span class="metric-sub" data-metric-sub-3>Messages are not retained for replay</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">🎯</span>
+          <small data-metric-lbl-4>BEST USED FOR</small>
+        </div>
+        <strong class="metric-val text-cyan" data-metric-val-4>Cache Invalidation &amp; UI Toasts</strong>
+        <span class="metric-sub" data-metric-sub-4>Real-time client alerts</span>
+      </div>
+    </section>
+
+    <!-- Main Workspace (Code on Left, Visualizer on Right) -->
+    <section class="demo-workspace">
+      
+      <!-- Code Panel -->
+      <article class="code-panel">
+        <header class="panel-header">
+          <div class="file-info">
+            <span class="file-icon" data-code-icon>msg</span>
+            <div>
+              <h2 id="code-title" data-code-title>pubsub_broadcast.py</h2>
+              <small data-code-kicker>FERRICSTORE PUBSUB API</small>
+            </div>
+          </div>
+          <div class="code-controls">
+            <span class="badge-durable" data-code-badge>LIVE PUBSUB</span>
+          </div>
+        </header>
+
+        <!-- Code Block: Pub/Sub Mode -->
+        <pre class="code-block" data-code="pubsub"><code><span data-line="1"><b class="ln">1</b><span><i class="c"># 📡 Live Pub/Sub (Ultra-Fast In-Memory Broadcast):</i></span></span>
+<span data-line="2"><b class="ln">2</b><span><i class="c"># Push ephemeral cache invalidations and live UI alerts:</i></span></span>
+<span data-line="3"><b class="ln">3</b><span>client.<i class="fn">publish</i>(<q>"cache:invalidation"</q>, <q>"product:42:price_updated"</q>)</span></span>
+<span data-line="4"><b class="ln">4</b><span></span></span>
+<span data-line="5"><b class="ln">5</b><span><i class="c"># Active web instances receive the event immediately:</i></span></span>
+<span data-line="6"><b class="ln">6</b><span>pubsub = client.<i class="fn">subscribe</i>(<q>"cache:invalidation"</q>)</span></span>
+<span data-line="7"><b class="ln">7</b><span><i class="k">for</i> message <i class="k">in</i> pubsub.<i class="fn">listen</i>():</span></span>
+<span data-line="8"><b class="ln">8</b><span>    local_memory_cache.<i class="fn">delete</i>(message[<q>"data"</q>])</span></span></code></pre>
+
+        <!-- Code Block: Stream Mode -->
+        <pre class="code-block" data-code="stream" hidden><code><span data-line="1"><b class="ln">1</b><span><i class="c"># 📜 Durable Stream (Persistent Disk-Backed Event Log):</i></span></span>
+<span data-line="2"><b class="ln">2</b><span><i class="c"># Save financial orders with monotonic HLC IDs and Raft durability:</i></span></span>
+<span data-line="3"><b class="ln">3</b><span>event_id = client.<i class="fn">xadd</i>(<q>"events:orders"</q>, {<q>"order_id"</q>: <q>"1001"</q>, <q>"amount"</q>: <q>"250.00"</q>})</span></span>
+<span data-line="4"><b class="ln">4</b><span></span></span>
+<span data-line="5"><b class="ln">5</b><span><i class="c"># Consumer group workers process &amp; ACK. If a worker reboots, it replays from offset:</i></span></span>
+<span data-line="6"><b class="ln">6</b><span>messages = client.<i class="fn">xreadgroup</i>(group=<q>"workers"</q>, consumer=<q>"w1"</q>, streams={<q>"events:orders"</q>: <q>">"</q>})</span></span>
+<span data-line="7"><b class="ln">7</b><span>client.<i class="fn">xack</i>(<q>"events:orders"</q>, <q>"workers"</q>, event_id)</span></span></code></pre>
+      </article>
+
+      <!-- Stage & Visualizer Panel -->
+      <article class="stage-panel">
+        <header class="stage-header">
+          <div class="stage-meta-left">
+            <span class="run-id-pill">CHANNEL: <strong data-target-name>cache:invalidation</strong></span>
+            <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>ACTIVE LISTENER READY</b></span>
+          </div>
+          <div class="playback-controls">
+            <button class="stage-btn btn-primary" data-btn-action-1 title="Run Primary Flow">⚡ 1. Broadcast Event</button>
+            <button class="stage-btn btn-cyan" data-btn-action-2 title="Run Secondary Flow">👥 2. Multi-Subscriber Fanout</button>
+            <button class="stage-btn btn-ghost" data-btn-reset title="Reset Simulation">↺</button>
+          </div>
+        </header>
+
+        <!-- Visualizer Content: Dual Channel Visualizer -->
+        <div class="visualizer-content">
+          
+          <div class="messaging-arena-grid">
+            
+            <!-- Left: Publisher / Producer Card -->
+            <div class="msg-card" data-card-left>
+              <div class="m-head">
+                <span class="m-icon" data-icon-left>📤</span>
+                <div>
+                  <strong data-title-left>EVENT PUBLISHER</strong>
+                  <small data-sub-left>In-Memory Dispatch</small>
+                </div>
+              </div>
+              <div class="m-metric-row">
+                <span class="m-val text-cyan" data-val-left>PUBLISH event</span>
+                <span class="m-badge ok" data-badge-left>Live push</span>
+              </div>
+              <div class="m-sub-box">
+                <code data-code-left>PUBLISH "cache:invalidation" "product:42"</code>
+              </div>
+            </div>
+
+            <!-- Middle: Engine Storage / Broker Card -->
+            <div class="msg-card" data-card-mid>
+              <div class="m-head">
+                <span class="m-icon" data-icon-mid>⚡</span>
+                <div>
+                  <strong data-title-mid>IN-MEMORY FANOUT</strong>
+                  <small data-sub-mid>Zero Disk Overhead</small>
+                </div>
+              </div>
+              <div class="m-metric-row">
+                <span class="m-val text-green" data-val-mid>Ephemeral Message</span>
+                <span class="m-badge ok" data-badge-mid>✓ Zero Disk I/O</span>
+              </div>
+              <div class="m-track">
+                <div class="m-fill" data-fill-mid style="width: 100%;"></div>
+              </div>
+            </div>
+
+            <!-- Right: Subscriber / Consumer Card -->
+            <div class="msg-card" data-card-right>
+              <div class="m-head">
+                <span class="m-icon" data-icon-right>📥</span>
+                <div>
+                  <strong data-title-right>CONNECTED SUBSCRIBERS</strong>
+                  <small data-sub-right>3 Active Microservice Pods</small>
+                </div>
+              </div>
+              <div class="m-metric-row">
+                <span class="m-val text-green" data-val-right>3 / 3 Delivered</span>
+                <span class="m-badge ok" data-badge-right>✓ Live Push</span>
+              </div>
+              <div class="m-track">
+                <div class="m-fill consumer-fill" data-fill-right style="width: 100%;"></div>
+              </div>
+            </div>
+
+          </div>
+
+          <!-- Live Event Terminal -->
+          <div class="live-terminal-compact">
+            <div class="term-head">
+              <span>📟 REAL-TIME MESSAGING LOG</span>
+              <small>Live Stream</small>
+            </div>
+            <div class="term-stream" data-term-stream>
+              <div class="term-row info">[00:00.000] FerricStore messaging ready. Subscribed to live channels.</div>
+            </div>
+          </div>
+
+          <!-- Live Explanation Card -->
+          <div class="explanation-box">
+            <div class="exp-icon" data-exp-icon>💡</div>
+            <div class="exp-text">
+              <strong data-exp-title>Live Pub/Sub: In-Memory Broadcast</strong>
+              <p data-exp-desc>Messages are pushed directly to currently connected subscribers and are not retained for replay. Click "⚡ 1. Broadcast Event" to watch the fanout.</p>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- Outcome Callout Footer -->
+        <footer class="stage-footer">
+          <div class="outcome-callout good" data-outcome-callout>
+            <small data-outcome-label>PUBSUB ARCHITECTURE BENEFIT</small>
+            <strong data-outcome-title>EPHEMERAL FANOUT TO ACTIVE SUBSCRIBERS</strong>
+            <span data-outcome-sub>Pub/Sub pushes notifications to listeners that are connected now; it does not create a replayable message log.</span>
+          </div>
+        </footer>
+      </article>
+
+    </section>
+
+    <!-- Use Case Decision Guide Section (Clear Explanation of What Each is For) -->
+    <section class="use-cases-section">
+      <div class="catastrophe-head">
+        <span class="catastrophe-pill">🎯 USE CASE GUIDE</span>
+        <h2>When to Use Pub/Sub vs. When to Use Streams</h2>
+        <p>Both are native, first-class primitives in FerricStore. Choose the best tool for your application.</p>
+      </div>
+
+      <div class="use-cases-grid">
+        <!-- Card 1: Pub/Sub Cache Invalidation -->
+        <div class="use-case-card">
+          <div class="uc-head">
+            <span class="uc-badge cyan">📡 USE PUBSUB</span>
+            <h4>Cache Invalidation Across 100 Web Pods</h4>
+          </div>
+          <p class="uc-desc">When a user updates their profile or product price, all 100 web nodes must immediately invalidate their local in-memory cache.</p>
+          <div class="uc-highlight">
+            <strong>Why Pub/Sub fits:</strong> Every currently subscribed web pod receives the same ephemeral invalidation without creating a replay log.
+          </div>
+          <div class="uc-code-pill">
+            <code>client.publish("cache:bust", "product:42")</code>
+          </div>
+        </div>
+
+        <!-- Card 2: Streams Orders & Payments -->
+        <div class="use-case-card">
+          <div class="uc-head">
+            <span class="uc-badge purple">📜 USE STREAMS</span>
+            <h4>Financial Ledgers &amp; Order Processing</h4>
+          </div>
+          <p class="uc-desc">When a customer places an order, the event must be safely stored on disk and processed by inventory and payment workers.</p>
+          <div class="uc-highlight">
+            <strong>Why Streams fit:</strong> Events are persisted through the configured durability topology. After reconnecting, workers continue from their consumer-group position and may redeliver unacknowledged entries.
+          </div>
+          <div class="uc-code-pill">
+            <code>client.xadd("events:orders", {"id": "1001"})</code>
+          </div>
+        </div>
+
+        <!-- Card 3: Pub/Sub Real-Time UI Toasts -->
+        <div class="use-case-card">
+          <div class="uc-head">
+            <span class="uc-badge cyan">📡 USE PUBSUB</span>
+            <h4>Live Chat &amp; Dashboard Notification Toasts</h4>
+          </div>
+          <p class="uc-desc">Pushing a live notification to a user currently looking at their dashboard or chat window.</p>
+          <div class="uc-highlight">
+            <strong>Why Pub/Sub fits:</strong> Connected users receive the live event, and no historical message queue accumulates.
+          </div>
+          <div class="uc-code-pill">
+            <code>client.publish("user:42:notifications", "New comment")</code>
+          </div>
+        </div>
+
+        <!-- Card 4: Streams Consumer Group Job Queues -->
+        <div class="use-case-card">
+          <div class="uc-head">
+            <span class="uc-badge purple">📜 USE STREAMS</span>
+            <h4>Multi-Worker Background Task Hand-Offs</h4>
+          </div>
+          <p class="uc-desc">Distributing 50,000 video encoding or email generation jobs across 10 background worker instances.</p>
+          <div class="uc-highlight">
+            <strong>Why Streams are Perfect:</strong> Consumer groups (<code>XREADGROUP</code>) balance work evenly; unacked tasks are auto-reclaimed.
+          </div>
+          <div class="uc-code-pill">
+            <code>client.xreadgroup("workers", "w1", {"jobs": ">"})</code>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Architecture Comparison Table -->
+    <section class="arch-comparison-section">
+      <div class="catastrophe-head">
+        <span class="catastrophe-pill">⚖️ TECHNICAL SPECIFICATIONS</span>
+        <h2>Pub/Sub vs. Streams Capability Comparison</h2>
+        <p>Architectural properties of FerricStore's two native messaging engines.</p>
+      </div>
+
+      <div class="arch-table-card">
+        <table class="arch-table">
+          <thead>
+            <tr>
+              <th>CAPABILITY</th>
+              <th class="cyan-col">📡 LIVE PUBSUB (PUBLISH / SUBSCRIBE)</th>
+              <th class="purple-col">📜 DURABLE STREAMS (XADD / XREADGROUP)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Primary Purpose</strong></td>
+              <td class="good-text"><strong>Real-time broadcast:</strong> Pushing instant events to active subscribers.</td>
+              <td class="good-text"><strong>Durable event log:</strong> Storing sequential events for explicit acknowledgement and replay.</td>
+            </tr>
+            <tr>
+              <td><strong>Delivery Semantics</strong></td>
+              <td class="good-text"><strong>At-Most-Once:</strong> Delivered directly to active client TCP sockets.</td>
+              <td class="good-text"><strong>At-Least-Once:</strong> Persisted to NVMe Raft disk; requires explicit <code>XACK</code>.</td>
+            </tr>
+            <tr>
+              <td><strong>Storage &amp; Memory Overhead</strong></td>
+              <td class="good-text"><strong>No replay log:</strong> Pub/Sub messages are not retained as stream entries.</td>
+              <td class="good-text"><strong>Compact NVMe Append Log:</strong> Bounded disk entries with Hot Keydir pointers.</td>
+            </tr>
+            <tr>
+              <td><strong>Worker Load Balancing</strong></td>
+              <td class="good-text"><strong>Fanout Broadcast:</strong> Every active subscriber gets the message.</td>
+              <td class="good-text"><strong>Consumer Groups (<code>XGROUP</code>):</strong> Work is shared across multiple workers.</td>
+            </tr>
+            <tr>
+              <td><strong>Latency</strong></td>
+              <td class="good-text"><strong>Low-latency path:</strong> Direct in-memory TCP socket push; measure on the target deployment.</td>
+              <td class="good-text"><strong>Durable append:</strong> Commit latency depends on batch shape, durability settings, topology, and hardware.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="./stream_pubsub.js?v=3"></script>
+  <script src="../shared/accuracy.js?v=8"></script>
+</body>
+</html>

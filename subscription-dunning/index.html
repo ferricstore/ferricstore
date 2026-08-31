@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SaaS Subscription & Time-Travel Dunning | FerricStore Demos</title>
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=4">
+</head>
+<body>
+  <nav class="top-nav">
+    <div class="container nav-inner">
+      <a href="../" class="nav-brand">
+        <span class="brand-icon">⏱️</span>
+        <span>FerricStore</span>
+        <span class="nav-tag">Time-Travel Engine</span>
+      </a>
+      <a href="../" class="back-link">← Back to All Demos</a>
+    </div>
+  </nav>
+
+  <main class="container">
+    <header class="hero">
+      <div class="hero-pill">⏱️ TIME-TRAVEL &amp; NATIVE TIMERS</div>
+      <h1>30-Day SaaS Billing &amp; <span class="hero-gradient">Dunning Engine</span></h1>
+      <p class="hero-desc">
+        Model a multi-day billing lifecycle as explicit durable states with scheduled eligibility, retry transitions, and guarded payment effects—without keeping an application handler blocked between dates.
+      </p>
+    </header>
+
+    <section class="stage-card">
+      <header class="stage-header">
+        <div class="scenario-badge">
+          <span class="badge-label" style="background: rgba(245, 158, 11, 0.18); color: #fbbf24;">LIFECYCLE</span>
+          <strong>Acme Corp ($99.00 / month SaaS Subscription)</strong>
+        </div>
+        <div style="display: flex; gap: 8px;">
+          <button class="ctrl-btn" style="border-color: #ef4444; color: #fca5a5;" data-declined-toggle>💳 Card Declines on Day 15</button>
+          <button class="ctrl-btn" style="border-color: #10b981; color: #6ee7b7;" data-success-toggle>✓ Card Valid on Day 15</button>
+        </div>
+      </header>
+
+      <!-- Time Travel Scrubber Slider -->
+      <div class="time-travel-panel">
+        <div class="tt-header">
+          <span style="font-size: 13px; font-weight: 800; color: #fff;">⏳ Interactive Time-Travel Scrubber:</span>
+          <strong style="color: #fbbf24; font-size: 14px;" data-tt-label>Day 15 (Charge Attempt)</strong>
+        </div>
+        <input type="range" min="0" max="4" value="2" class="tt-slider" data-tt-slider aria-label="Time Travel Slider">
+      </div>
+
+      <!-- 5 Day Milestones Grid -->
+      <div class="timeline-milestones-grid">
+        <div class="tm-node" data-tm-node="0">
+          <div class="tmn-head"><span>DAY 1</span><span class="node-pill">DONE</span></div>
+          <div class="tmn-icon">🚀</div>
+          <strong>Trial Started</strong>
+          <small>14-Day Free Access</small>
+        </div>
+
+        <div class="tm-node" data-tm-node="1">
+          <div class="tmn-head"><span>DAY 14</span><span class="node-pill">DONE</span></div>
+          <div class="tmn-icon">📧</div>
+          <strong>Warning Email</strong>
+          <small>Trial Ending Alert</small>
+        </div>
+
+        <div class="tm-node is-active" data-tm-node="2">
+          <div class="tmn-head"><span>DAY 15</span><span class="node-pill">ACTIVE</span></div>
+          <div class="tmn-icon">💳</div>
+          <strong>Card Charge</strong>
+          <small>Declined / Insufficient $</small>
+        </div>
+
+        <div class="tm-node" data-tm-node="3">
+          <div class="tmn-head"><span>DAY 18</span><span class="node-pill">PENDING</span></div>
+          <div class="tmn-icon">📱</div>
+          <strong>Dunning Retry #1</strong>
+          <small>SMS Alert Sent</small>
+        </div>
+
+        <div class="tm-node" data-tm-node="4">
+          <div class="tmn-head"><span>DAY 21</span><span class="node-pill">PENDING</span></div>
+          <div class="tmn-icon">🎉</div>
+          <strong>Dunning Recovered</strong>
+          <small>Card Updated ($99 ✓)</small>
+        </div>
+      </div>
+
+      <!-- Dunning Split View -->
+      <div class="dunning-narrative-split">
+        <!-- Account Status Box -->
+        <div class="account-status-box">
+          <div style="font-size: 11.5px; font-weight: 800; color: #94a3b8; text-transform: uppercase; margin-bottom: 12px;">
+            👤 Customer Subscription State
+          </div>
+          <div style="margin-bottom: 14px;">
+            <div class="as-badge pastdue" data-account-badge>PAST DUE (DUNNING ACTIVE)</div>
+            <div style="font-size: 16px; font-weight: 800; color: #fff;" data-account-title>Acme Pro Plan · $99/mo</div>
+          </div>
+          <div style="font-size: 13px; color: var(--text-muted); line-height: 1.5;" data-account-desc>
+            Credit card payment failed on Day 15. The flow entered a durable grace-period state and is eligible for Retry #1 at its scheduled time.
+          </div>
+        </div>
+
+        <!-- Narrative Box -->
+        <div class="dunning-narrative-box">
+          <div class="as-badge trial" data-narrative-badge>TIMER SCHEDULED</div>
+          <h3 style="margin: 0 0 6px; font-size: 18px;" data-narrative-title>Day 15: Charge Attempted</h3>
+          <p style="margin: 0 0 12px; font-size: 13.5px; color: var(--text-muted);" data-narrative-desc>
+            The workflow handles the card decline gracefully, sending an immediate alert and scheduling the next retry in 3 days with zero database polling.
+          </p>
+          <div style="font-family: var(--font-mono); font-size: 11.5px; color: #fbbf24; background: rgba(0,0,0,0.4); padding: 8px; border-radius: 4px;" data-narrative-code>
+            email.send_dunning(idempotency_key=f"{job.id}:dunning-1:v1"); transition("retry_1", run_at_ms=day_18_ms)
+          </div>
+        </div>
+      </div>
+
+      <!-- Live Telemetry -->
+      <div class="telemetry-grid">
+        <div class="telemetry-card">
+          <small>Revenue Recovered</small>
+          <div class="telemetry-val" style="color: #34d399;" data-val-rev>$99.00</div>
+          <span class="telemetry-sub">Prevented churn loss</span>
+        </div>
+        <div class="telemetry-card">
+          <small>DB Polling Queries</small>
+          <div class="telemetry-val" style="color: #34d399;" data-val-queries>0 Queries</div>
+          <span class="telemetry-sub">Native Raft timer wheel</span>
+        </div>
+        <div class="telemetry-card">
+          <small>Cron Drift</small>
+          <div class="telemetry-val" data-val-drift>0.00s</div>
+          <span class="telemetry-sub">Deterministic schedule</span>
+        </div>
+        <div class="telemetry-card">
+          <small>Grace Period</small>
+          <div class="telemetry-val" style="color: #fbbf24;" data-val-grace>3 Days Left</div>
+          <span class="telemetry-sub">Access preserved</span>
+        </div>
+      </div>
+
+      <!-- Controls -->
+      <footer class="stage-footer">
+        <div class="ctrl-btn-group">
+          <button class="ctrl-btn" data-prev>⏮ Prev</button>
+          <button class="ctrl-btn" data-pause>⏸ Pause</button>
+          <button class="ctrl-btn" data-next>Next ⏭</button>
+          <button class="ctrl-btn" data-replay>↺ Replay</button>
+        </div>
+        <div style="font-size: 13px; color: var(--text-dim);" data-live-status>
+          Auto-advancing simulation
+        </div>
+      </footer>
+    </section>
+
+    <!-- Python Code Example -->
+    <section style="margin-bottom: 60px;">
+      <h3 style="font-size: 20px; margin-bottom: 12px;">FerricStore Python SDK: Clean Multi-Day Subscriptions</h3>
+      <pre style="background: #080614; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 20px; font-family: var(--font-mono); font-size: 13px; color: #e2e8f0; overflow-x: auto;"><code># Fused immediate step + durable multi-day timer
+import time
+from ferricstore import FlowClient
+
+client = FlowClient.from_url("ferric://127.0.0.1:6388")
+job = client.start_and_claim(
+    "sub-user-42", type="saas-subscription",
+    initial_state="welcome", worker="billing-1",
+    payload={"user_id": "user-42"},
+)
+
+email.send_welcome(
+    job.payload["user_id"], idempotency_key=f"{job.id}:welcome:v1",
+)
+
+# Save the completed step and continue immediately with a fresh lease + fence.
+job = client.step_continue(
+    job.id,
+    lease_token=job.lease_token,
+    fencing_token=job.fencing_token,
+    from_state=job.run_state,
+    to_state="schedule_warning",
+    worker="billing-1",
+    return_job=True,
+)
+
+# Park until day 14; no Python process or worker lease stays alive.
+client.transition(
+    job.id,
+    lease_token=job.lease_token,
+    fencing_token=job.fencing_token,
+    from_state=job.run_state,
+    to_state="pre_billing_warning",
+    run_at_ms=int(time.time() * 1000) + 14 * 86_400_000,
+)</code></pre>
+    </section>
+  </main>
+  <script src="./dunning.js?v=4"></script>
+  <script src="../shared/accuracy.js?v=8"></script>
+</body>
+</html>

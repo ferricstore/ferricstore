@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Canary Deployment &amp; Durable 24h Soak · FerricStore</title>
+  <link rel="stylesheet" href="../shared/base.css">
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=4">
+</head>
+<body data-mode="after">
+
+  <!-- Top Navigation -->
+  <nav class="demo-nav" aria-label="Demo Header">
+    <a href="../" class="nav-brand">
+      <span class="nav-logo">🚀</span>
+      <div>
+        <strong>FerricStore Workflows</strong>
+        <small>Canary Deployment · Durable Soak State &amp; State-Guarded Rollback</small>
+      </div>
+    </a>
+    <div class="nav-center">
+      <span class="nav-tag">DEPLOYMENT PIPELINE RELIABILITY</span>
+    </div>
+    <div class="nav-right">
+      <a href="../" class="nav-back-link">← All Demos</a>
+    </div>
+  </nav>
+
+  <main class="demo-main">
+    <!-- Hero Section -->
+    <header class="demo-hero">
+      <div class="hero-tag">HOW FERRICSTORE POWERS CANARY RELEASES</div>
+      <h1>
+        Deploy 10% to Canary, Soak for 24 Hours:<br>
+        <span class="hero-accent">Durable Observation. Crash Recovery. Explicit Rollback.</span>
+      </h1>
+      <p class="hero-desc">
+        When deploying a new version, route 10% of traffic and persist an observation state instead of holding an application thread open. If the worker reboots, the flow can be reclaimed after its lease expires; a Datadog signal can advance it into an explicit, idempotent rollback state.
+      </p>
+
+      <!-- Mode Switch Tabs -->
+      <div class="mode-switch" role="tablist" aria-label="Execution Mode">
+        <button type="button" role="tab" data-mode-btn="before" aria-selected="false">
+          <span class="mode-tab-title">Without FerricStore</span>
+          <span class="mode-tab-badge bad">❌ Fragile Script (Blocks Threads / Lost on Crash)</span>
+        </button>
+        <button type="button" role="tab" data-mode-btn="after" aria-selected="true" class="is-selected">
+          <span class="mode-tab-title">With FerricStore</span>
+          <span class="mode-tab-badge good">✓ Durable State + Signal + Rollback</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Metrics Bar -->
+    <section class="metrics-bar" aria-label="Live Metrics Comparison">
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">💤</span>
+          <small>24-HOUR SOAK CPU USAGE</small>
+        </div>
+        <strong class="metric-val text-green" data-metric-cpu>No waiting handler held</strong>
+        <span class="metric-sub" data-metric-cpu-sub>Observation state is persisted</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">💥</span>
+          <small>SERVER CRASH RESILIENCE</small>
+        </div>
+        <strong class="metric-val text-cyan" data-metric-crash>Lease-based recovery</strong>
+        <span class="metric-sub" data-metric-crash-sub>Reclaim timing is configurable</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">🚨</span>
+          <small>DATADOG 5XX ERROR SPIKE</small>
+        </div>
+        <strong class="metric-val text-red" data-metric-errors>2.40% (Threshold: 0.50%)</strong>
+        <span class="metric-sub" data-metric-errors-sub>Signal advances the parked soak state</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">↩</span>
+          <small>ROLLBACK REMEDIATION TIME</small>
+        </div>
+        <strong class="metric-val text-green" data-metric-rollback>Explicit rollback state</strong>
+        <span class="metric-sub" data-metric-rollback-sub>Provider latency dependent</span>
+      </div>
+    </section>
+
+    <!-- Main Workspace (Code on Left, Visualizer on Right) -->
+    <section class="demo-workspace">
+      
+      <!-- Code Panel -->
+      <article class="code-panel">
+        <header class="panel-header">
+          <div class="file-info">
+            <span class="file-icon">py</span>
+            <div>
+              <h2 id="code-title" data-code-title>canary_continue.py</h2>
+              <small data-code-kicker>FERRICSTORE STATE + SIGNAL API</small>
+            </div>
+          </div>
+          <div class="code-controls">
+            <div class="sdk-style-toggle" data-sdk-toggle>
+              <button type="button" class="sdk-btn" data-sdk-style="steps">Fused Continue</button>
+              <button type="button" class="sdk-btn is-active" data-sdk-style="states">Current SDK</button>
+            </div>
+            <span class="badge-durable" data-code-badge>DURABLE CANARY</span>
+          </div>
+        </header>
+
+        <!-- Code Block: Before Mode -->
+        <pre class="code-block" data-code="before" hidden><code><span data-line="1"><b class="ln">1</b><span><i class="k">import</i> time, envoy, datadog</span></span>
+<span data-line="2"><b class="ln">2</b><span></span></span>
+<span data-line="3"><b class="ln">3</b><span><i class="k">def</i> <i class="fn">deploy_canary</i>():</span></span>
+<span data-line="4"><b class="ln">4</b><span>    <i class="c"># 1. Route 10% traffic to new version</i></span></span>
+<span data-line="5"><b class="ln">5</b><span>    envoy.<i class="fn">set_weight</i>(<q>"v2.4.0"</q>, 10)</span></span>
+<span data-line="6"><b class="ln">6</b><span>    </span></span>
+<span data-line="7"><b class="ln">7</b><span>    <i class="c"># ❌ 2. FRAGILE 24-HOUR SLEEP:</i></span></span>
+<span data-line="8"><b class="ln">8</b><span>    <i class="c"># Blocks an OS thread for 24h. If the runner reboots at hour 18:</i></span></span>
+<span data-line="9"><b class="ln">9</b><span>    <i class="c"># Deployment state is lost! 10% broken canary runs in prod forever!</i></span></span>
+<span data-line="10"><b class="ln">10</b><span>    time.<i class="fn">sleep</i>(86400)</span></span>
+<span data-line="11"><b class="ln">11</b><span>    envoy.<i class="fn">set_weight</i>(<q>"v2.4.0"</q>, 100)</span></span></code></pre>
+
+        <!-- Code Block: After Mode (Fused continuation) -->
+        <pre class="code-block" data-code="after-steps" hidden><code>import time
+from ferricstore import FlowClient
+
+client = FlowClient.from_url("ferric://127.0.0.1:6388")
+job = client.start_and_claim(
+    "deploy-240", type="canary-release",
+    initial_state="route_canary", worker="deployer-1",
+)
+
+# Run one step, then atomically persist its result and keep working.
+route = envoy.set_weight("v2.4.0", 10, request_id=f"{job.id}:route-10:v1")
+job = client.step_continue(
+    job.id,
+    lease_token=job.lease_token,
+    fencing_token=job.fencing_token,
+    from_state=job.run_state,
+    to_state="capture_baseline",
+    values={"route": route},
+    worker="deployer-1",
+    return_job=True,
+)
+
+# A 24-hour wait should park the flow and release the worker lease.
+client.transition(
+    job.id,
+    lease_token=job.lease_token,
+    fencing_token=job.fencing_token,
+    from_state=job.run_state,
+    to_state="soak",
+    run_at_ms=int(time.time() * 1000) + 86_400_000,
+)</code></pre>
+
+        <!-- Code Block: After Mode (States) -->
+        <pre class="code-block" data-code="after-states"><code>import time
+from ferricstore import WorkflowClient, complete, transition
+
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
+flow = client.workflow(type="canary-release", initial_state="canary")
+
+@flow.state("canary")
+def canary(ctx):
+    @ctx.effect("route-canary", "envoy.route", operation_digest=f"canary:{ctx.id}:v1")
+    def route():
+        envoy.set_weight("v2.4.0", 10, request_id=f"{ctx.id}:canary:v1")
+    route()
+    return transition("soak", run_at_ms=int(time.time() * 1000) + 86_400_000)
+
+@flow.state("soak")
+def soak(ctx):
+    @ctx.effect("promote", "envoy.route", operation_digest=f"promote:{ctx.id}:v1")
+    def promote():
+        envoy.set_weight("v2.4.0", 100, request_id=f"{ctx.id}:promote:v1")
+    promote()
+    return complete(result=b"promoted")
+
+@flow.state("rollback")
+def rollback(ctx):
+    @ctx.effect("rollback", "envoy.route", operation_digest=f"rollback:{ctx.id}:v1")
+    def restore():
+        envoy.set_weight("v2.3.9", 100, request_id=f"{ctx.id}:rollback:v1")
+    restore()
+    return complete(result=b"rolled back")
+
+# Datadog can move a waiting soak directly to rollback:
+client.signal(
+    run_id, signal="5xx", if_state="soak", transition_to="rollback",
+    idempotency_key=f"{run_id}:5xx:v1",
+)</code></pre>
+      </article>
+
+      <!-- Stage & Visualizer Panel -->
+      <article class="stage-panel">
+        <header class="stage-header">
+          <div class="stage-meta-left">
+            <span class="run-id-pill">SERVICE: <strong>PAYMENT-GATEWAY-v2.4.0</strong></span>
+            <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>STEP 1 OF 3</b></span>
+          </div>
+          <div class="playback-controls">
+            <button class="stage-btn btn-primary" data-btn-play title="Play 3-Step Story">⚡ Play Story (3s)</button>
+            <button class="stage-btn" data-btn-step-1 title="Step 1: Route 10% Canary & Park on Disk">1. Route 10%</button>
+            <button class="stage-btn btn-danger" data-btn-step-2 title="Step 2: Server Reboots at Hour 18 (Crash Recovery)">2. Crash at Hr 18</button>
+            <button class="stage-btn btn-warning" data-btn-step-3 title="Step 3: Datadog 5xx alert advances to rollback">3. 5xx Rollback</button>
+            <button class="stage-btn btn-ghost" data-btn-reset title="Reset Simulation">↺</button>
+          </div>
+        </header>
+
+        <!-- Visual Storyboard Canvas -->
+        <div class="story-canvas">
+          
+          <!-- Step Indicator Header -->
+          <div class="story-stepper">
+            <div class="step-pill is-active" data-step-indicator="1">
+              <span class="s-num">1</span>
+              <span>Route 10% (durable observation)</span>
+            </div>
+            <div class="step-divider">➔</div>
+            <div class="step-pill" data-step-indicator="2">
+              <span class="s-num">2</span>
+              <span>Host Crash at Hour 18</span>
+            </div>
+            <div class="step-divider">➔</div>
+            <div class="step-pill" data-step-indicator="3">
+              <span class="s-num">3</span>
+              <span data-step-3-text>Datadog 5xx ➔ rollback state</span>
+            </div>
+          </div>
+
+          <!-- Live Canary Visualizer Grid -->
+          <div class="canary-story-grid">
+            
+            <!-- Widget 1: Envoy Traffic Weight -->
+            <div class="canary-card" data-envoy-card>
+              <div class="c-head">
+                <span class="c-icon">🌐</span>
+                <div>
+                  <strong>ENVOY TRAFFIC ROUTING</strong>
+                  <small data-envoy-sub>Routing live user traffic</small>
+                </div>
+              </div>
+              <div class="c-metric-row">
+                <span class="c-val" data-envoy-val>10% Canary (v2.4.0)</span>
+                <span class="c-badge canary" data-envoy-badge>10% v2.4 / 90% v2.3</span>
+              </div>
+              <div class="c-track">
+                <div class="c-fill" data-envoy-fill style="width: 10%;"></div>
+              </div>
+            </div>
+
+            <!-- Widget 2: 24-Hour Durable Soak Timer -->
+            <div class="canary-card" data-soak-card>
+              <div class="c-head">
+                <span class="c-icon">⏱️</span>
+                <div>
+                  <strong>24-HOUR SOAK OBSERVATION</strong>
+                  <small data-soak-sub>Observation state persisted</small>
+                </div>
+              </div>
+              <div class="c-metric-row">
+                <span class="c-val text-cyan" data-soak-val>18h 32m / 24h 00m</span>
+                <span class="c-badge ok" data-soak-badge>💤 No handler blocked</span>
+              </div>
+              <div class="c-track">
+                <div class="c-fill soak-fill" data-soak-fill style="width: 77%;"></div>
+              </div>
+            </div>
+
+            <!-- Widget 3: Datadog Health & Error Monitor -->
+            <div class="canary-card" data-datadog-card>
+              <div class="c-head">
+                <span class="c-icon">📊</span>
+                <div>
+                  <strong>DATADOG 5XX ERROR RATE</strong>
+                  <small>Alert threshold: > 0.50%</small>
+                </div>
+              </div>
+              <div class="c-metric-row">
+                <span class="c-val" data-datadog-val>0.02% (Healthy)</span>
+                <span class="c-badge ok" data-datadog-badge>✓ Normal Health</span>
+              </div>
+              <div class="c-track">
+                <div class="c-fill error-fill" data-datadog-fill style="width: 4%;"></div>
+              </div>
+            </div>
+
+          </div>
+
+          <!-- Live Explanation Card -->
+          <div class="explanation-box" data-explanation-box>
+            <div class="exp-icon" data-exp-icon>💡</div>
+            <div class="exp-text">
+              <strong data-exp-title>Step 1: Envoy shifts 10% traffic to v2.4.0 (24h Soak Started)</strong>
+              <p data-exp-desc>The flow persists an observation state and returns the handler. Click "2. Crash at Hr 18" to simulate a Kubernetes host reboot.</p>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- Outcome Callout Footer -->
+        <footer class="stage-footer">
+          <div class="outcome-callout good" data-outcome-callout>
+            <small data-outcome-label>CANARY RELIABILITY OUTCOME</small>
+            <strong data-outcome-title>DURABLE OBSERVATION + EXPLICIT ROLLBACK</strong>
+            <span data-outcome-sub>The flow persists observation state, survives worker replacement, and advances on a durable 5xx signal.</span>
+          </div>
+        </footer>
+      </article>
+
+    </section>
+
+    <!-- Catastrophe & Prevention Section -->
+    <!-- Architecture Comparison Table -->
+    <section class="arch-comparison-section">
+      <div class="catastrophe-head">
+        <span class="catastrophe-pill">⚖️ ARCHITECTURE COMPARISON</span>
+        <h2>How Canaries Are Usually Built vs. The FerricStore Way</h2>
+        <p>Why modern engineering teams replace fragile CI/CD scripts with durable workflow state machines.</p>
+      </div>
+
+      <div class="arch-table-card">
+        <table class="arch-table">
+          <thead>
+            <tr>
+              <th>CANARY REQUIREMENT</th>
+              <th class="bad-col">❌ THE USUAL WAY (Jenkins / Cron / Bash)</th>
+              <th class="good-col">✓ THE FERRICSTORE WAY</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>24-Hour Soak Window</strong></td>
+              <td class="bad-text"><code>time.sleep(86400)</code> holds an OS worker thread for 24 hours and is vulnerable to runner restarts and execution limits.</td>
+              <td class="good-text"><strong>Durable wait:</strong> model observation as a scheduled state; no application handler needs to stay blocked.</td>
+            </tr>
+            <tr>
+              <td><strong>Server Reboot at Hour 18</strong></td>
+              <td class="bad-text">Script dies in RAM. 10% canary is permanently orphaned as an unmonitored "zombie container" in production.</td>
+              <td class="good-text"><strong>Lease-based recovery:</strong> a replacement worker reclaims the persisted state after the configured lease expires.</td>
+            </tr>
+            <tr>
+              <td><strong>5xx Error Spike Detected</strong></td>
+              <td class="bad-text">Cron polls every 5 mins or fires PagerDuty alert to wake up an engineer for manual <code>kubectl rollout undo</code>.</td>
+              <td class="good-text"><strong>Signal-driven rollback:</strong> a durable Datadog signal advances the flow to an idempotent Envoy update.</td>
+            </tr>
+            <tr>
+              <td><strong>Infrastructure Footprint</strong></td>
+              <td class="bad-text">Requires gluing 5 cloud tools: Jenkins + Cron + Redis lock + Postgres state table + Lambda.</td>
+              <td class="good-text"><strong>One workflow:</strong> Persists the soak as state without holding the application handler; engine footprint depends on deployment.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="catastrophe-section">
+      <div class="catastrophe-head">
+        <span class="catastrophe-pill">⚠️ THE HAZARD vs. HOW FERRICSTORE PREVENTS IT</span>
+        <h2>Why Long-Running Canary Deployments Fail &amp; How FerricStore Fixes It</h2>
+        <p>Compare standard Python sleep / cron polling failures with FerricStore's durable quorum timers.</p>
+      </div>
+
+      <div class="catastrophe-grid">
+        <!-- Card 1 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">💤</span>
+            <h4>Sleep Thread Exhaustion</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (Standard Python / Celery):</strong>
+              <p>Calling <code>time.sleep(86400)</code> holds an OS worker thread for 24 hours. Enough concurrent deployments can exhaust the worker pool.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <p><strong>Persisted observation state:</strong> schedule the next eligible run without holding an application handler or OS thread open.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">📉 Worker Starvation Outage</span>
+            <span class="cat-fix-badge">✓ No Blocked Handler</span>
+          </div>
+        </div>
+
+        <!-- Card 2 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">💥</span>
+            <h4>Server Crash During 24h Soak</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (In-Memory Sleep):</strong>
+              <p>A Kubernetes node restarts or crashes 18 hours into the canary soak. The in-memory sleep timer vanishes, leaving canary traffic permanently frozen at 10%.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <p><strong>Replicated Timer State:</strong> The deadline is stored with the workflow state. After a worker or host failure, due work becomes eligible again according to the configured lease and recovery behavior.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">🚨 Stuck Production Deployments</span>
+            <span class="cat-fix-badge">✓ Lease-Based Recovery</span>
+          </div>
+        </div>
+
+        <!-- Card 3 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">⚡</span>
+            <h4>Late Rollback Double-Drop</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (Custom Scripts / Cron):</strong>
+              <p>When 5xx errors spike at hour 20, the script tries to rollback while a second deployment pipeline starts, causing conflicting Envoy route updates.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <p><strong>Explicit state transitions:</strong> protect Envoy routing updates with stable operation digests or provider idempotency and reject stale state writes with fencing.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">🚨 Broken Envoy Routing Loop</span>
+            <span class="cat-fix-badge">✓ Guarded Rollback Effect</span>
+          </div>
+        </div>
+
+        <!-- Card 4 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">📈</span>
+            <h4>Silent Metric Degradation</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (Polling Scripts):</strong>
+              <p>Background polling scripts miss a brief Datadog latency spike due to cron drift, allowing broken code to roll out to 100% of production users.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <p><strong>Application-owned webhook:</strong> A Datadog webhook handler can call <code>client.signal(...)</code> with an idempotency key and <code>if_state="soak"</code>, advancing the parked workflow to its explicit rollback state.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">💸 $50,000 SLA Breach Penalties</span>
+            <span class="cat-fix-badge">✓ Durable, State-Guarded Signals</span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="./canary.js?v=4"></script>
+  <script src="../shared/accuracy.js?v=8"></script>
+</body>
+</html>

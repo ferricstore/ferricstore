@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Workflows vs. Queues, In-Memory &amp; DBs | FerricStore</title>
+  <meta name="description" content="An interactive architectural comparison showing how In-Memory tasks, Message Queues (SQS/RabbitMQ), DIY Database polling, and FerricStore Durable Workflows behave under real-world server crashes.">
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=4">
+</head>
+<body>
+
+  <!-- Top Navigation -->
+  <nav class="top-nav">
+    <div class="container nav-inner">
+      <a class="nav-brand" href="../">
+        <span class="brand-icon">⚡</span>
+        <span>FerricStore</span>
+      </a>
+      <span class="nav-tag">ARCHITECTURE DEEP DIVE</span>
+      <a class="back-link" href="../">← Back to Demo Gallery</a>
+    </div>
+  </nav>
+
+  <main class="container">
+    <!-- Hero Header -->
+    <header class="hero">
+      <div class="hero-pill">⚡ ARCHITECTURAL MATRIX</div>
+      <h1>
+        Workflows vs. Other Solutions.<br>
+        <span class="hero-gradient">What Happens When Servers Die?</span>
+      </h1>
+      <p class="hero-desc">
+        Why do engineering teams adopt <strong>durable workflows</strong> when they already have Redis queues, Celery, RabbitMQ, SQS, or Postgres cron jobs? Switch paradigms below to see the failure modes in action.
+      </p>
+
+      <!-- 4 Paradigm Selector Cards -->
+      <div class="paradigm-selector-grid" role="tablist" aria-label="Architecture Paradigm">
+        <!-- 1. In-Memory -->
+        <button class="paradigm-btn" type="button" role="tab" data-arch="memory" aria-selected="false">
+          <div class="p-header">
+            <span class="p-icon">🧠</span>
+            <span class="p-tag">VOLATILE RAM</span>
+          </div>
+          <strong>In-Memory Async</strong>
+          <small>FastAPI BackgroundTasks · Threading · Promises</small>
+        </button>
+
+        <!-- 2. Message Queues -->
+        <button class="paradigm-btn" type="button" role="tab" data-arch="queue" aria-selected="false">
+          <div class="p-header">
+            <span class="p-icon">📬</span>
+            <span class="p-tag">JOB LEVEL</span>
+          </div>
+          <strong>Message Queues</strong>
+          <small>AWS SQS · RabbitMQ · Redis PubSub · BullMQ</small>
+        </button>
+
+        <!-- 3. DIY Database Polling -->
+        <button class="paradigm-btn" type="button" role="tab" data-arch="db" aria-selected="false">
+          <div class="p-header">
+            <span class="p-icon">🗄️</span>
+            <span class="p-tag">HIGH CONTENTION</span>
+          </div>
+          <strong>DIY Database + Cron</strong>
+          <small>Postgres Status Columns · Advisory Locks · Cron</small>
+        </button>
+
+        <!-- 4. FerricStore Durable Workflows -->
+        <button class="paradigm-btn is-active" type="button" role="tab" data-arch="workflow" aria-selected="true">
+          <div class="p-header">
+            <span class="p-icon">🛡️</span>
+            <span class="p-tag">DURABLE + FENCED</span>
+          </div>
+          <strong>FerricStore Workflows</strong>
+          <small>Explicit States · Fencing · Lease-Aware Resume</small>
+        </button>
+      </div>
+    </header>
+
+    <!-- Interactive Simulator Stage Card -->
+    <section class="stage-card" aria-label="Interactive Architecture Failure Simulator">
+      <header class="stage-header">
+        <div class="scenario-badge">
+          <span class="badge-label">SCENARIO</span>
+          <strong>AI Order: $200 Payment + 1,500 Token LLM Pipeline</strong>
+        </div>
+        <div class="stage-actions">
+          <button class="crash-btn" type="button" data-smash-crash title="Trigger an immediate server outage">
+            <span>💥 Simulate Server Crash Now!</span>
+          </button>
+        </div>
+      </header>
+
+      <!-- 4-Step Stations Track -->
+      <div class="flow-stations-grid" role="list">
+        <!-- Step 1 -->
+        <div class="flow-node is-active" data-step-node="0" role="listitem" tabindex="0">
+          <div class="flow-node-num">
+            <span>STEP 01</span>
+            <span class="node-state-pill" data-n0-state>ACTIVE</span>
+          </div>
+          <div class="flow-node-icon">💳</div>
+          <strong>1. Charge $200.00</strong>
+          <small data-n0-desc>Payment Gateway API</small>
+        </div>
+
+        <!-- Step 2 -->
+        <div class="flow-node" data-step-node="1" role="listitem" tabindex="0">
+          <div class="flow-node-num">
+            <span>STEP 02</span>
+            <span class="node-state-pill" data-n1-state>PENDING</span>
+          </div>
+          <div class="flow-node-icon">🤖</div>
+          <strong>2. LLM Inference</strong>
+          <small data-n1-desc>1,500 Tokens ($0.45)</small>
+        </div>
+
+        <!-- Step 3 -->
+        <div class="flow-node flow-crash" data-step-node="2" role="listitem" tabindex="0">
+          <div class="flow-node-num">
+            <span>STEP 03</span>
+            <span class="node-state-pill" data-n2-state>CRASH POINT</span>
+          </div>
+          <div class="flow-node-icon">💥</div>
+          <strong>3. Server Dies!</strong>
+          <small data-n2-desc>OOM / Spot Termination</small>
+        </div>
+
+        <!-- Step 4 -->
+        <div class="flow-node" data-step-node="3" role="listitem" tabindex="0">
+          <div class="flow-node-num">
+            <span>STEP 04</span>
+            <span class="node-state-pill" data-n3-state>RECOVERY</span>
+          </div>
+          <div class="flow-node-icon" data-n3-icon>🛡️</div>
+          <strong data-n3-title>4. Durable Delivery</strong>
+          <small data-n3-desc>Send Customer Receipt</small>
+        </div>
+      </div>
+
+      <!-- Architecture Showcase Box -->
+      <div class="arch-showcase-box" data-showcase-box>
+        <div class="showcase-icon-avatar" data-showcase-avatar>🛡️</div>
+        <div class="showcase-details">
+          <div class="showcase-header">
+            <span class="showcase-badge badge-good" data-showcase-badge>FERRICSTORE · DURABLE STATE RESUME</span>
+            <span class="step-pill" data-step-counter>Step 1 of 4</span>
+          </div>
+          <h3 data-showcase-title>1. 💳 Payment Authorized ($200.00)</h3>
+          <p data-showcase-desc>
+            FerricStore commits explicit workflow state durably. Protect the payment call separately with a stable operation digest or provider idempotency key.
+          </p>
+        </div>
+      </div>
+
+      <!-- Real-Time Metrics & Cost Telemetry Grid -->
+      <div class="telemetry-grid">
+        <div class="telemetry-card" data-card-billed>
+          <small>Total Money Billed</small>
+          <div class="telemetry-val" data-val-billed>$200.00</div>
+          <span class="telemetry-sub" data-sub-billed>Stable provider key required</span>
+        </div>
+
+        <div class="telemetry-card" data-card-tokens>
+          <small>LLM Tokens Consumed</small>
+          <div class="telemetry-val" data-val-tokens>1,500</div>
+          <span class="telemetry-sub" data-sub-tokens>0 repeated tokens</span>
+        </div>
+
+        <div class="telemetry-card" data-card-latency>
+          <small>Crash Recovery Latency</small>
+          <div class="telemetry-val" data-val-latency>Lease-aware</div>
+          <span class="telemetry-sub" data-sub-latency>Deployment-dependent recovery</span>
+        </div>
+
+        <div class="telemetry-card is-success" data-card-reliability>
+          <small>Reliability Rating</small>
+          <div class="telemetry-val" data-val-reliability>Configured durability</div>
+          <span class="telemetry-sub" data-sub-reliability>State durability boundary</span>
+        </div>
+      </div>
+
+      <!-- Playback Controls Toolbar -->
+      <footer class="stage-footer">
+        <div class="ctrl-btn-group">
+          <button class="ctrl-btn" type="button" data-prev aria-label="Previous Step">⏮ Previous</button>
+          <button class="ctrl-btn" type="button" data-pause aria-label="Pause or Play">⏸ Pause</button>
+          <button class="ctrl-btn" type="button" data-next aria-label="Next Step">Next ⏭</button>
+          <button class="ctrl-btn" type="button" data-replay aria-label="Replay Scenario">↺ Replay</button>
+        </div>
+        <div class="stage-live-indicator">
+          <span class="pulse-indicator"></span>
+          <span data-live-status-text>Auto-advancing simulation</span>
+        </div>
+      </footer>
+    </section>
+
+    <!-- Comprehensive Architecture Comparison Matrix -->
+    <section class="matrix-section">
+      <div class="section-kicker">FEATURE BY FEATURE COMPARISON</div>
+      <h2 class="section-title">How the 4 Paradigms Compare</h2>
+
+      <div class="matrix-table-wrap">
+        <table class="matrix-table">
+          <thead>
+            <tr>
+              <th>Architectural Feature</th>
+              <th>🧠 In-Memory / Threads</th>
+              <th>📬 Message Queues (SQS)</th>
+              <th>🗄️ DIY Database Polling</th>
+              <th class="th-highlight">🛡️ FerricStore Workflows</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>State Persistence</strong></td>
+              <td><span class="bad-tag">❌ Process RAM</span></td>
+              <td><span class="warn-tag">⚠️ Message Body Only</span></td>
+              <td><span class="warn-tag">⚠️ Custom SQL Rows</span></td>
+              <td class="td-highlight"><span class="good-tag">✓ Configured Durable Topology</span></td>
+            </tr>
+            <tr>
+              <td><strong>Crash Granularity</strong></td>
+              <td><span class="bad-tag">❌ None (Wiped)</span></td>
+              <td><span class="bad-tag">❌ Entire Job Level</span></td>
+              <td><span class="warn-tag">⚠️ Manual Column State</span></td>
+              <td class="td-highlight"><span class="good-tag">✓ Explicit State Transition</span></td>
+            </tr>
+            <tr>
+              <td><strong>Duplicate Payment Prevention</strong></td>
+              <td><span class="bad-tag">❌ Impossible</span></td>
+              <td><span class="bad-tag">❌ Redelivers Whole Message</span></td>
+              <td><span class="warn-tag">⚠️ Complex Custom Sagas</span></td>
+              <td class="td-highlight"><span class="good-tag">✓ Automatic Idempotency Key</span></td>
+            </tr>
+            <tr>
+              <td><strong>Zombie Worker Protection</strong></td>
+              <td><span class="bad-tag">❌ None</span></td>
+              <td><span class="bad-tag">❌ None (Visibility Race)</span></td>
+              <td><span class="warn-tag">⚠️ Advisory Locks (High Contention)</span></td>
+              <td class="td-highlight"><span class="good-tag">✓ Monotonic Fencing Tokens</span></td>
+            </tr>
+            <tr>
+              <td><strong>Crash Recovery Time</strong></td>
+              <td><span class="bad-tag">❌ Never (Data Lost)</span></td>
+              <td><span class="warn-tag">⚠️ 30,000ms Visibility Timeout</span></td>
+              <td><span class="warn-tag">⚠️ 5,000ms - 15,000ms Polling Loop</span></td>
+              <td class="td-highlight"><span class="good-tag">✓ Durable, Fenced Resume</span></td>
+            </tr>
+
+            <tr>
+              <td><strong>End-to-End Observability</strong></td>
+              <td><span class="bad-tag">❌ Zero</span></td>
+              <td><span class="bad-tag">❌ Black Box (Scattered in 4 Queues &amp; DLQs)</span></td>
+              <td><span class="warn-tag">⚠️ Manual SQL Queries</span></td>
+              <td class="td-highlight"><span class="good-tag">✓ Unified Step Graph &amp; Time-Travel Replay</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Deep Dive Card: Queue Choreography vs Workflows (Interactive Animations) -->
+      <article class="choreography-deepdive-card" id="choreography-deepdive">
+        <div class="deepdive-header-row">
+          <div>
+            <div class="deepdive-badge">🤔 COMMON DISTRIBUTED SYSTEMS QUESTION</div>
+            <h3 style="margin: 0 0 6px; font-size: 24px; font-weight: 800; color: #ffffff;">
+              "Why not just use a separate Queue for each step (Choreography)?"
+            </h3>
+            <p class="deepdive-subtitle" style="margin: 0;">
+              Chaining queues (<code>payment_queue</code> → <code>llm_queue</code> → <code>email_queue</code>) seems simple on paper. Click the 4 interactive animated deep dives below to see where it breaks down:
+            </p>
+          </div>
+        </div>
+
+        <!-- 4 Animated Part Selector Tabs -->
+        <div class="choreo-tabs-bar" role="tablist" aria-label="Choreography Failure Modes">
+          <button class="choreo-tab-btn is-active" type="button" data-choreo-tab="dualwrite">
+            <span class="ctab-icon">⚠️</span>
+            <span class="ctab-text">1. The Dual-Write Trap</span>
+          </button>
+          <button class="choreo-tab-btn" type="button" data-choreo-tab="observability">
+            <span class="ctab-icon">🔍</span>
+            <span class="ctab-text">2. Observability Black Hole</span>
+          </button>
+          <button class="choreo-tab-btn" type="button" data-choreo-tab="saga">
+            <span class="ctab-icon">🔄</span>
+            <span class="ctab-text">3. Saga Rollback Hell</span>
+          </button>
+          <button class="choreo-tab-btn" type="button" data-choreo-tab="sprawl">
+            <span class="ctab-icon">💰</span>
+            <span class="ctab-text">4. Infrastructure Sprawl</span>
+          </button>
+        </div>
+
+        <!-- Interactive Dynamic Animation Arena -->
+        <div class="choreo-stage-arena" data-choreo-arena>
+          <!-- Dynamic Content rendered by comparison.js -->
+        </div>
+
+        <!-- Explainer Footer Note -->
+        <footer class="choreo-stage-footer">
+          <div class="choreo-note-text" data-choreo-note>
+            <!-- Rendered by JS -->
+          </div>
+          <button class="choreo-replay-btn" type="button" data-choreo-replay>
+            <span>↺ Replay Animation</span>
+          </button>
+        </footer>
+      </article>
+
+      <!-- Code Comparison Inspector Section -->
+      <section class="code-compare-section">
+        <div class="section-kicker" style="text-align: left;">CODE COMPLEXITY</div>
+        <h3 style="font-size: 22px; margin-bottom: 16px; color: #ffffff;">Compare Developer Code</h3>
+
+        <div class="code-tabs" role="tablist">
+          <button class="code-tab-btn is-active" type="button" data-code-tab="workflow">🛡️ FerricStore SDK</button>
+          <button class="code-tab-btn" type="button" data-code-tab="queue">📬 SQS / Queues</button>
+          <button class="code-tab-btn" type="button" data-code-tab="db">🗄️ SQL State Machine</button>
+          <button class="code-tab-btn" type="button" data-code-tab="memory">🧠 In-Memory Async</button>
+        </div>
+
+        <pre class="code-preview-box"><code data-code-content># FerricStore Python SDK: explicit durable states
+from ferricstore import WorkflowClient, complete, transition
+
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
+checkout = client.workflow(type="ai-checkout", initial_state="charge")
+
+@checkout.state("charge")
+def charge(ctx):
+    @ctx.effect(
+        "stripe-charge",
+        "payment.charge",
+        operation_digest=f"stripe:{ctx.id}:v1",
+    )
+    def call_stripe():
+        return stripe.charge(
+            ctx.payload["amount"],
+            idempotency_key=f"{ctx.id}:charge:v1",
+        )
+
+    tx = call_stripe()
+    return transition("summarize", values={"tx": tx})
+
+@checkout.state("summarize")
+def summarize(ctx):
+    @ctx.effect("llm-summary", "llm.generate", operation_digest=f"summary:{ctx.id}:v1")
+    def call_llm():
+        return llm.generate(ctx.payload["prompt"])
+    summary = call_llm()
+    return transition("deliver", values={"summary": summary})
+
+@checkout.state("deliver")
+def deliver(ctx):
+    @ctx.effect("receipt", "email.send", operation_digest=f"receipt:{ctx.id}:v1")
+    def send():
+        email.send_receipt(
+            ctx.payload["email"], tx=ctx.value("tx"),
+            idempotency_key=f"{ctx.id}:receipt:v1",
+        )
+    send()
+    return complete(result=b"sent")
+
+checkout.worker().run()</code></pre>
+      </section>
+
+      <!-- Footer CTA -->
+      <div class="footer-cta">
+        <h2>Ready to explore all homepage directions?</h2>
+        <p style="color: var(--text-muted); margin-bottom: 24px;">Compare all 21 visual developer demos and cast your team vote.</p>
+        <a class="cta-btn" href="../">
+          <span>← Back to Demo Gallery &amp; Vote</span>
+        </a>
+      </div>
+    </section>
+  </main>
+
+  <script src="./comparison.js?v=4"></script>
+  <script src="../shared/accuracy.js?v=8"></script>
+</body>
+</html>

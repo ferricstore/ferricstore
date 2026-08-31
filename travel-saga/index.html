@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Travel Booking & Reversible Sagas | FerricStore Demos</title>
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=4">
+</head>
+<body>
+  <nav class="top-nav">
+    <div class="container nav-inner">
+      <a href="../" class="nav-brand">
+        <span class="brand-icon">✈️</span>
+        <span>FerricStore</span>
+        <span class="nav-tag">Distributed Sagas</span>
+      </a>
+      <a href="../" class="back-link">← Back to All Demos</a>
+    </div>
+  </nav>
+
+  <main class="container">
+    <header class="hero">
+      <div class="hero-pill">💸 DISTRIBUTED SAGA ENGINE</div>
+      <h1>Multi-Leg Booking &amp; <span class="hero-gradient">Reversible Sagas</span></h1>
+      <p class="hero-desc">
+        When a 4-step vacation checkout fails at the hotel step, you can't just throw an error. Model the rollback explicitly: FerricStore durably advances through compensation states that release seats, refund cards, and rebalance the ledger.
+      </p>
+    </header>
+
+    <section class="stage-card">
+      <header class="stage-header">
+        <div class="scenario-badge">
+          <span class="badge-label">VACATION BUNDLE</span>
+          <strong>Flights + Marriott Hotel + Rental Car ($850.00)</strong>
+        </div>
+        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+          <button class="ctrl-btn" style="border-color: #ef4444; color: #fca5a5;" data-fail-hotel>🏨 Simulate Hotel Sold Out</button>
+          <button class="ctrl-btn" style="border-color: #f59e0b; color: #fde68a;" data-fail-flight>✈️ Simulate Delta 500 Error</button>
+          <button class="ctrl-btn" style="border-color: #10b981; color: #6ee7b7;" data-success-run>✓ Happy Path (Success)</button>
+        </div>
+      </header>
+
+      <!-- 4 Saga Stations Grid -->
+      <div class="saga-stations-grid">
+        <div class="saga-node" data-saga-node="0">
+          <div class="sn-head"><span>STEP 1</span><span class="node-pill">DONE</span></div>
+          <div class="sn-icon">💳</div>
+          <strong>1. Card Authorized</strong>
+          <small>Stripe API ($850)</small>
+        </div>
+
+        <div class="saga-node" data-saga-node="1">
+          <div class="sn-head"><span>STEP 2</span><span class="node-pill">DONE</span></div>
+          <div class="sn-icon">✈️</div>
+          <strong>2. Flight Booked</strong>
+          <small>Delta Seat #14B</small>
+        </div>
+
+        <div class="saga-node" data-saga-node="2">
+          <div class="sn-head"><span>STEP 3</span><span class="node-pill">ACTIVE</span></div>
+          <div class="sn-icon">🏨</div>
+          <strong>3. Hotel Reserved</strong>
+          <small>Marriott King Suite</small>
+        </div>
+
+        <div class="saga-node" data-saga-node="3">
+          <div class="sn-head"><span>STEP 4</span><span class="node-pill">PENDING</span></div>
+          <div class="sn-icon">🚗</div>
+          <strong>4. Car Rental</strong>
+          <small>Hertz SUV</small>
+        </div>
+      </div>
+
+      <!-- Ledger & Narrative Split -->
+      <div class="saga-ledger-split">
+        <!-- Financial Ledger Card -->
+        <div class="ledger-box">
+          <div style="font-size: 11.5px; font-weight: 800; color: #94a3b8; text-transform: uppercase; margin-bottom: 12px;">
+            📊 Live Double-Entry Financial Ledger
+          </div>
+          <div class="ledger-row">
+            <span>Customer Card Charge</span>
+            <strong data-ledger-charge>+$850.00</strong>
+          </div>
+          <div class="ledger-row">
+            <span>Delta Airlines Authorization</span>
+            <strong data-ledger-flight>+$350.00</strong>
+          </div>
+          <div class="ledger-row">
+            <span>Marriott Hotel Hold</span>
+            <strong data-ledger-hotel>$0.00 (Pending)</strong>
+          </div>
+          <div class="ledger-row">
+            <span>Compensating Refunds Issued</span>
+            <strong style="color: #fca5a5;" data-ledger-refund>$0.00</strong>
+          </div>
+          <div class="ledger-row total">
+            <span>Net Unbalanced Liability</span>
+            <strong data-ledger-balance>$0.00 (Balanced)</strong>
+          </div>
+        </div>
+
+        <!-- Narrative Box -->
+        <div class="saga-narrative-box">
+          <div class="saga-badge good" data-narrative-badge>✓ STEP EXECUTED</div>
+          <h3 style="margin: 0 0 6px; font-size: 18px;" data-narrative-title>Reserving Hotel Room</h3>
+          <p style="margin: 0 0 12px; font-size: 13.5px; color: var(--text-muted);" data-narrative-desc>
+            Communicating with the Marriott partner API. If this state fails, application logic transitions into explicit compensation states in reverse order.
+          </p>
+          <div style="font-family: var(--font-mono); font-size: 11.5px; color: #34d399; background: rgba(0,0,0,0.4); padding: 8px; border-radius: 4px;" data-narrative-code>
+            @ctx.effect("hotel", "marriott.book", operation_digest=f"hotel:{ctx.id}:v1")<br>
+            def book_hotel(): ...<br>
+            hotel_id = book_hotel()
+          </div>
+        </div>
+      </div>
+
+      <!-- Live Telemetry -->
+      <div class="telemetry-grid">
+        <div class="telemetry-card">
+          <small>Compensation State</small>
+          <div class="telemetry-val" style="color: #34d399;" data-val-comp>Normal Flow</div>
+          <span class="telemetry-sub">Zero rollbacks needed</span>
+        </div>
+        <div class="telemetry-card">
+          <small>Orphaned Holds / Stranded $</small>
+          <div class="telemetry-val" style="color: #34d399;" data-val-stranded>$0.00</div>
+          <span class="telemetry-sub">Explicit durable transitions</span>
+        </div>
+        <div class="telemetry-card">
+          <small>Rollback Cadence</small>
+          <div class="telemetry-val" data-val-cadence>Exact Reverse</div>
+          <span class="telemetry-sub">LIFO unwind sequence</span>
+        </div>
+        <div class="telemetry-card">
+          <small>Execution Latency</small>
+          <div class="telemetry-val" style="color: #38bdf8;" data-val-latency>Durable commit</div>
+          <span class="telemetry-sub">Topology-dependent latency</span>
+        </div>
+      </div>
+
+      <!-- Controls -->
+      <footer class="stage-footer">
+        <div class="ctrl-btn-group">
+          <button class="ctrl-btn" data-prev>⏮ Prev</button>
+          <button class="ctrl-btn" data-pause>⏸ Pause</button>
+          <button class="ctrl-btn" data-next>Next ⏭</button>
+          <button class="ctrl-btn" data-replay>↺ Replay</button>
+        </div>
+        <div style="font-size: 13px; color: var(--text-dim);" data-live-status>
+          Auto-advancing simulation
+        </div>
+      </footer>
+    </section>
+
+    <!-- Python Code Example -->
+    <section style="margin-bottom: 60px;">
+      <h3 style="font-size: 20px; margin-bottom: 12px;">FerricStore Python SDK: Reversible Sagas</h3>
+      <pre style="background: #080614; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 20px; font-family: var(--font-mono); font-size: 13px; color: #e2e8f0; overflow-x: auto;"><code># Compensations are explicit states; every provider mutation has a stable key
+from ferricstore import WorkflowClient, transition, complete
+
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
+saga = client.workflow(type="vacation-checkout", initial_state="charge_card")
+
+@saga.state("charge_card")
+def charge(ctx):
+    @ctx.effect("charge", "stripe.charge", operation_digest=f"charge:{ctx.id}:v1")
+    def call_stripe():
+        return stripe.charge(850.00, idempotency_key=f"{ctx.id}:charge:v1")
+    tx = call_stripe()
+    return transition("book_flight", values={"tx_id": tx.id})
+
+@saga.state("book_flight")
+def flight(ctx):
+    @ctx.effect("flight", "delta.book", operation_digest=f"flight:{ctx.id}:v1")
+    def book():
+        return delta.book_seat("DL402", request_id=f"{ctx.id}:flight:v1")
+    seat = book()
+    return transition("book_hotel", values={"seat_id": seat.id})
+
+@saga.state("book_hotel")
+def hotel(ctx):
+    @ctx.effect("hotel", "marriott.book", operation_digest=f"hotel:{ctx.id}:v1")
+    def book():
+        return marriott.book_suite(request_id=f"{ctx.id}:hotel:v1")
+    try:
+        room = book()
+        return transition("rent_car", values={"room_id": room.id})
+    except HotelSoldOutException:
+        return transition("cancel_seat")
+
+@saga.state("rent_car")
+def car(ctx):
+    @ctx.effect("car", "hertz.book", operation_digest=f"car:{ctx.id}:v1")
+    def book():
+        return hertz.book_suv(request_id=f"{ctx.id}:car:v1")
+    rental = book()
+    return complete(result={"status": "BOOKING_COMPLETE", "rental_id": rental.id})
+
+@saga.state("cancel_seat", claim_values=["seat_id"])
+def cancel_seat(ctx):
+    @ctx.effect("cancel-flight", "delta.cancel", operation_digest=f"cancel:{ctx.id}:v1")
+    def cancel():
+        delta.cancel_seat(ctx.value("seat_id"), request_id=f"{ctx.id}:cancel:v1")
+    cancel()
+    return transition("refund_card")
+
+@saga.state("refund_card", claim_values=["tx_id"])
+def refund_card(ctx):
+    @ctx.effect("refund", "stripe.refund", operation_digest=f"refund:{ctx.id}:v1")
+    def refund():
+        stripe.refund(ctx.value("tx_id"), idempotency_key=f"{ctx.id}:refund:v1")
+    refund()
+    return complete(result={"status": "ROLLED_BACK"})</code></pre>
+    </section>
+  </main>
+  <script src="./saga.js?v=4"></script>
+  <script src="../shared/accuracy.js?v=8"></script>
+</body>
+</html>

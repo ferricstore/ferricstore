@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Zombie Worker &amp; Fencing Tokens | FerricStore Demos</title>
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=4">
+</head>
+<body>
+  <nav class="top-nav">
+    <div class="container nav-inner">
+      <a href="../" class="nav-brand">
+        <span class="brand-icon">🛡️</span>
+        <span>FerricStore</span>
+        <span class="nav-tag">Fencing Tokens</span>
+      </a>
+      <a href="../" class="back-link">← Back to All Demos</a>
+    </div>
+  </nav>
+
+  <main class="container">
+    <header class="hero">
+      <div class="hero-pill">🧟 SPLIT-BRAIN &amp; ZOMBIE PREVENTION</div>
+      <h1>Zombie Workers &amp; <span class="hero-gradient">Monotonic Fencing</span></h1>
+      <p class="hero-desc">
+        When a worker freezes through lease expiry, a replacement can claim the flow with a newer fencing token. FerricStore rejects stale Flow mutations; external databases are protected only when the application also passes the token and the database enforces monotonic updates.
+      </p>
+    </header>
+
+    <section class="stage-card">
+      <header class="stage-header">
+        <div class="scenario-badge">
+          <span class="badge-label" style="background: rgba(239, 68, 68, 0.18); color: #fca5a5;">DISTRIBUTED HAZARD</span>
+          <strong data-stage-name>Stage 4: Zombie Worker A Attempts Stale Write ➔ Blocked!</strong>
+        </div>
+        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+          <button class="ctrl-btn freeze-btn" data-freeze-btn>❄️ 1. Freeze Worker A (GC Pause)</button>
+          <button class="ctrl-btn promote-btn" data-promote-btn>👑 2. Promote Worker B (Gen 2)</button>
+          <button class="ctrl-btn zombie-btn" data-zombie-btn>🧟 3. Fire Zombie Stale Write</button>
+        </div>
+      </header>
+
+      <!-- Stepper Track -->
+      <nav class="stepper-wrap" aria-label="Zombie Fencing Steps">
+        <ol class="flow-stepper" data-stepper>
+          <li class="is-done" data-step="0">
+            <span class="step-num">1</span>
+            <span class="step-title">Normal Lease (Gen 1)</span>
+          </li>
+          <li class="is-done" data-step="1">
+            <span class="step-num">2</span>
+            <span class="step-title">20s GC Freeze</span>
+          </li>
+          <li class="is-done" data-step="2">
+            <span class="step-num">3</span>
+            <span class="step-title">Lease Transferred (Gen 2)</span>
+          </li>
+          <li class="is-active is-crash" data-step="3">
+            <span class="step-num">4</span>
+            <span class="step-title">Zombie Write Blocked 💥</span>
+          </li>
+        </ol>
+      </nav>
+
+      <!-- Visual Split-Brain Collision Arena -->
+      <div class="fencing-arena">
+        <!-- Worker A Panel (Original / Zombie) -->
+        <div class="worker-card worker-a" data-worker-a-panel>
+          <div class="wc-head">
+            <div class="wc-identity">
+              <span class="wc-avatar">🅰️</span>
+              <div>
+                <strong>Worker A (Pod #1)</strong>
+                <small data-worker-a-role>Original Lease Owner</small>
+              </div>
+            </div>
+            <span class="wp-token-badge gen1" data-worker-a-token>TOKEN: GEN=1</span>
+          </div>
+
+          <div class="wc-body">
+            <p data-worker-a-desc>
+              Unfreezes after 20s GC pause! Unaware it was replaced, Worker A attempts to write stale data with Generation 1.
+            </p>
+            <div class="wc-status-box" data-worker-a-status>
+              🚨 ATTEMPTING STALE WRITE (GEN=1)...
+            </div>
+          </div>
+        </div>
+
+        <!-- Center Storage Gatekeeper Shield -->
+        <div class="gatekeeper-vault" data-gatekeeper-vault>
+          <div class="vault-shield-icon" data-vault-icon>🛡️</div>
+          <h3 data-gk-title>Raft Storage Gatekeeper</h3>
+          <div class="vault-lease-chip" data-vault-lease>
+            ACTIVE LEASE: GENERATION 2
+          </div>
+          <div class="vault-decision-box" data-gk-decision>
+            💥 REJECTED: incoming gen (1) &lt; storage gen (2)<br>
+            <strong style="color: #34d399;">FENCING_TOKEN_STALE ➔ 0% DB Corruption!</strong>
+          </div>
+        </div>
+
+        <!-- Worker B Panel (Successor / Valid Owner) -->
+        <div class="worker-card worker-b is-active-gen" data-worker-b-panel>
+          <div class="wc-head">
+            <div class="wc-identity">
+              <span class="wc-avatar">🅱️</span>
+              <div>
+                <strong>Worker B (Pod #2)</strong>
+                <small data-worker-b-role>Elected Successor</small>
+              </div>
+            </div>
+            <span class="wp-token-badge gen2" data-worker-b-token>TOKEN: GEN=2 (ACTIVE)</span>
+          </div>
+
+          <div class="wc-body">
+            <p data-worker-b-desc>
+              Heartbeat expired during Worker A's pause. Worker B claimed Lease Gen 2 and safely committed the valid step.
+            </p>
+            <div class="wc-status-box good" data-worker-b-status>
+              ✓ COMMITTED TO DISK (GEN=2)
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live Telemetry -->
+      <div class="telemetry-grid">
+        <div class="telemetry-card">
+          <small>Current Storage Lease</small>
+          <div class="telemetry-val" style="color: #34d399;" data-val-gen>Generation 2</div>
+          <span class="telemetry-sub">Strictly monotonic counter</span>
+        </div>
+        <div class="telemetry-card">
+          <small>Zombie Writes Blocked</small>
+          <div class="telemetry-val" style="color: #38bdf8;" data-val-blocked>1 Stale Write Blocked</div>
+          <span class="telemetry-sub">Rejected at storage layer</span>
+        </div>
+        <div class="telemetry-card">
+          <small>Database Corruption</small>
+          <div class="telemetry-val" style="color: #34d399;" data-val-corrupt>Stale mutation rejected</div>
+          <span class="telemetry-sub">External DB must enforce fence</span>
+        </div>
+        <div class="telemetry-card">
+          <small>Validation Latency</small>
+          <div class="telemetry-val" style="color: #38bdf8;" data-val-latency>Topology dependent</div>
+          <span class="telemetry-sub">Fenced state mutation</span>
+        </div>
+      </div>
+
+      <!-- Controls -->
+      <footer class="stage-footer">
+        <div class="ctrl-btn-group">
+          <button class="ctrl-btn" data-pause>⏸ Pause</button>
+          <button class="ctrl-btn" data-replay>↺ Reset &amp; Replay</button>
+        </div>
+        <div style="font-size: 13px; color: #cbd5e1;" data-live-status>
+          🛡️ <strong>Safety boundary:</strong> FerricStore fences its own state writes; pass the token to external stores that support monotonic write guards.
+        </div>
+      </footer>
+    </section>
+
+    <!-- Python Code Example -->
+    <section style="margin-bottom: 60px;">
+      <h3 style="font-size: 20px; margin-bottom: 12px;">FerricStore Python SDK: Monotonic Fencing Tokens</h3>
+      <pre style="background: #080614; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 20px; font-family: var(--font-mono); font-size: 13px; color: #e2e8f0; overflow-x: auto;"><code># Pass the claim's fence into an external store that enforces it
+from ferricstore import WorkflowClient, complete
+
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
+flow = client.workflow(type="critical-database-sync", initial_state="sync")
+
+@flow.state("sync")
+def sync_inventory(job):
+    # The DB update must compare/store this token transactionally.
+    postgres.update_stock(
+        job.payload["item_id"],
+        job.payload["quantity"],
+        fence=job.fencing_token,
+    )
+    return complete(result=b"synced")
+
+flow.worker().run()</code></pre>
+    </section>
+  </main>
+  <script src="./fencing.js?v=3"></script>
+  <script src="../shared/accuracy.js?v=8"></script>
+</body>
+</html>

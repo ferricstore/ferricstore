@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Interactive FerricStore demos for durable workflows, queues, streaming, caching, and resilient execution.">
+  <meta name="theme-color" content="#090b12">
+  <title>FerricStore Interactive Demos</title>
+  <link rel="stylesheet" href="./site.css?v=1">
+</head>
+<body>
+  <a class="skip-link" href="#demo-grid">Skip to demos</a>
+
+  <header class="site-header">
+    <a class="brand" href="./" aria-label="FerricStore demos home">
+      <span class="brand-mark" aria-hidden="true">F</span>
+      <span><strong>FerricStore</strong><small>Interactive demos</small></span>
+    </a>
+    <nav aria-label="Primary navigation">
+      <a href="https://github.com/ferricstore/ferricstore">GitHub</a>
+      <a href="https://github.com/ferricstore/ferricstore#readme">Documentation</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <span class="eyebrow">DURABLE SYSTEMS, MADE VISIBLE</span>
+        <h1 id="hero-title">See recovery happen.<br><span>State by state.</span></h1>
+        <p>Explore self-contained simulations of FerricStore workflows, queues, streaming, caching, and coordination patterns. Every demo is interactive and runs directly in your browser.</p>
+        <div class="hero-actions">
+          <a class="primary-action" href="./split-lab/">Start with Split Lab <span aria-hidden="true">→</span></a>
+          <a class="secondary-action" href="#demo-grid">Browse all 19 demos</a>
+        </div>
+      </div>
+      <div class="hero-visual" aria-label="Workflow recovery preview">
+        <div class="visual-head"><span>RUN</span><strong>report-204</strong><i>RECOVERED</i></div>
+        <ol>
+          <li class="is-done"><span>01</span><strong>Plan</strong><small>saved</small></li>
+          <li class="is-done"><span>02</span><strong>Search</strong><small>saved</small></li>
+          <li class="is-crash"><span>03</span><strong>Crash</strong><small>worker A</small></li>
+          <li class="is-active"><span>04</span><strong>Resume</strong><small>worker B</small></li>
+        </ol>
+        <div class="state-card">
+          <span>FERRICSTORE STATE</span>
+          <strong>summarize</strong>
+          <code>fence: 42 · plan ✓ · facts ✓</code>
+        </div>
+      </div>
+    </section>
+
+    <aside class="accuracy-note">
+      <span aria-hidden="true">i</span>
+      <p><strong>How to read these demos:</strong> They are interactive simulations. Timings, costs, and capacity values are illustrative rather than benchmarks. Workflow handlers remain at-least-once, so external effects need guarded execution and stable idempotency keys.</p>
+    </aside>
+
+    <section class="catalog" aria-labelledby="catalog-title">
+      <header class="catalog-header">
+        <div>
+          <span class="eyebrow">DEMO COLLECTION</span>
+          <h2 id="catalog-title">Choose a system behavior to explore</h2>
+        </div>
+        <p><span data-visible-count>19</span> unique demos</p>
+      </header>
+
+      <div class="catalog-controls">
+        <div class="filters" role="tablist" aria-label="Filter demos by topic" data-filters></div>
+        <label class="search">
+          <span class="visually-hidden">Search demos</span>
+          <span aria-hidden="true">⌕</span>
+          <input type="search" placeholder="Search demos" autocomplete="off" data-search>
+        </label>
+      </div>
+
+      <div class="demo-grid" id="demo-grid" data-demo-grid></div>
+
+      <div class="empty-state" hidden data-empty-state>
+        <strong>No demos match that search.</strong>
+        <button type="button" data-clear-search>Clear search</button>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <a class="brand footer-brand" href="./">
+      <span class="brand-mark" aria-hidden="true">F</span>
+      <span><strong>FerricStore</strong><small>Durable KV and workflow state engine</small></span>
+    </a>
+    <p>Open source · Browser-based demonstrations · No account required</p>
+  </footer>
+
+  <script src="./site.js?v=1"></script>
+</body>
+</html>

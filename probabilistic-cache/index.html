@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Native Probabilistic Filters · FerricStore</title>
+  <link rel="stylesheet" href="../shared/base.css">
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=4">
+</head>
+<body data-mode="bloom">
+
+  <!-- Top Navigation -->
+  <nav class="demo-nav" aria-label="Demo Header">
+    <a href="../" class="nav-brand">
+      <span class="nav-logo">🔮</span>
+      <div>
+        <strong>FerricStore Advanced KV</strong>
+        <small>Native In-Memory Probabilistic Structures · Bloom &amp; Cuckoo</small>
+      </div>
+    </a>
+    <div class="nav-center">
+      <span class="nav-tag">ADVANCED PROBABILISTIC DATA STRUCTURES</span>
+    </div>
+    <div class="nav-right">
+      <a href="../" class="nav-back-link">← All Demos</a>
+    </div>
+  </nav>
+
+  <main class="demo-main">
+    <!-- Hero Section -->
+    <header class="demo-hero">
+      <div class="hero-tag">ADVANCED IN-MEMORY KV · PROBABILISTIC STRUCTURES</div>
+      <h1>
+        Native Bloom &amp; Cuckoo Filters:<br>
+        <span class="hero-accent">Model 10,000,000 Items with a Compact Bloom Filter</span>
+      </h1>
+      <p class="hero-desc">
+        Cache-penetration traffic repeatedly asks for missing keys and can push avoidable work into a database. <strong>FerricStore includes native Bloom Filters, Cuckoo Filters, and Count-Min Sketches</strong> so applications can cheaply reject definitely absent keys. Memory, latency, and false-positive behavior depend on configured capacity, error rate, data shape, and hardware.
+      </p>
+
+      <!-- Mode Switch Tabs -->
+      <div class="mode-switch" role="tablist" aria-label="Execution Mode">
+        <button type="button" role="tab" data-mode-btn="set" aria-selected="false">
+          <span class="mode-tab-title">Standard String Set (SADD / SISMEMBER)</span>
+          <span class="mode-tab-badge bad">❌ 950 MB RAM for 10M Keys (High Cost)</span>
+        </button>
+        <button type="button" role="tab" data-mode-btn="bloom" aria-selected="true" class="is-selected">
+          <span class="mode-tab-title">FerricStore Native Bloom Filter</span>
+          <span class="mode-tab-badge good">✓ Compact Filter + Configurable Error Rate</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Metrics Bar -->
+    <section class="metrics-bar" aria-label="Live Metrics Comparison">
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">💾</span>
+          <small>RAM FOOTPRINT (10M ITEMS)</small>
+        </div>
+        <strong class="metric-val text-green" data-metric-ram>11.98 MB (99% Saved)</strong>
+        <span class="metric-sub" data-metric-ram-sub>vs 950 MB for raw string sets</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">⚡</span>
+          <small>LOOKUP SPEED</small>
+        </div>
+        <strong class="metric-val text-cyan" data-metric-speed>Bitwise membership test</strong>
+        <span class="metric-sub" data-metric-speed>3 bitwise hash calculations</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">🛡️</span>
+          <small>CACHE PENETRATION SHIELD</small>
+        </div>
+        <strong class="metric-val text-green" data-metric-shield>Blocked in this run</strong>
+        <span class="metric-sub" data-metric-shield-sub>Bogus queries blocked in RAM</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">🎯</span>
+          <small>STANDARD BLOOM-FILTER PROPERTY</small>
+        </div>
+        <strong class="metric-val text-green" data-metric-guar>0.00% False Negatives</strong>
+        <span class="metric-sub" data-metric-guar-sub>Mathematically impossible to miss valid items</span>
+      </div>
+    </section>
+
+    <!-- Main Workspace (Code on Left, Visualizer on Right) -->
+    <section class="demo-workspace">
+      
+      <!-- Code Panel -->
+      <article class="code-panel">
+        <header class="panel-header">
+          <div class="file-info">
+            <span class="file-icon">py</span>
+            <div>
+              <h2 id="code-title" data-code-title>bloom_shield.py</h2>
+              <small data-code-kicker>FERRICSTORE BLOOM FILTER API</small>
+            </div>
+          </div>
+          <div class="code-controls">
+            <span class="badge-durable">PROBABILISTIC KV</span>
+          </div>
+        </header>
+
+        <!-- Code Block: Set Mode -->
+        <pre class="code-block" data-code="set" hidden><code><span data-line="1"><b class="ln">1</b><span><i class="c"># ❌ Raw String Set in Redis:</i></span></span>
+<span data-line="2"><b class="ln">2</b><span><i class="c"># Adding 10,000,000 user IDs to check existence:</i></span></span>
+<span data-line="3"><b class="ln">3</b><span>redis.<i class="fn">sadd</i>(<q>"valid_users"</q>, user_id)</span></span>
+<span data-line="4"><b class="ln">4</b><span></span></span>
+<span data-line="5"><b class="ln">5</b><span><i class="c"># 💥 Memory Consumption: ~950 MB to 1.8 GB RAM!</i></span></span>
+<span data-line="6"><b class="ln">6</b><span><i class="c"># If cache miss occurs, query falls through to Postgres database.</i></span></span>
+<span data-line="7"><b class="ln">7</b><span>is_member = redis.<i class="fn">sismember</i>(<q>"valid_users"</q>, input_id)</span></span></code></pre>
+
+        <!-- Code Block: Bloom Mode -->
+        <pre class="code-block" data-code="bloom"><code><span data-line="1"><b class="ln">1</b><span><i class="c"># ✓ FerricStore Native Bloom Filter (Built into core engine):</i></span></span>
+<span data-line="2"><b class="ln">2</b><span><i class="c"># Illustrative target: 10M items, 1% false-positive rate, ~11.98 MB bit array</i></span></span>
+<span data-line="3"><b class="ln">3</b><span>client.<i class="fn">bf_reserve</i>(<q>"bloom:valid_users"</q>, error_rate=0.001, capacity=10_000_000)</span></span>
+<span data-line="4"><b class="ln">4</b><span>client.<i class="fn">bf_add</i>(<q>"bloom:valid_users"</q>, <q>"user_alice"</q>)</span></span>
+<span data-line="5"><b class="ln">5</b><span></span></span>
+<span data-line="6"><b class="ln">6</b><span><i class="c"># If BF.EXISTS returns False, the key DEFINITELY does NOT exist (0% false negatives):</i></span></span>
+<span data-line="7"><b class="ln">7</b><span><i class="k">if not</i> client.<i class="fn">bf_exists</i>(<q>"bloom:valid_users"</q>, incoming_id):</span></span>
+<span data-line="8"><b class="ln">8</b><span>    <i class="k">return</i> <q>"404 Not Found"</q>  <i class="c"># Definitely absent; skip the DB lookup</i></span></span></code></pre>
+      </article>
+
+      <!-- Stage & Visualizer Panel -->
+      <article class="stage-panel">
+        <header class="stage-header">
+          <div class="stage-meta-left">
+            <span class="run-id-pill">FILTER: <strong>bloom:valid_users</strong></span>
+            <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>SHIELD ACTIVE (11.98 MB RAM)</b></span>
+          </div>
+          <div class="playback-controls">
+            <button class="stage-btn btn-primary" data-btn-valid title="Query Valid User (Alice)">⚡ 1. Valid Key (Alice)</button>
+            <button class="stage-btn btn-danger" data-btn-spam title="Simulate 10,000 Bogus Attacker Queries">🚨 2. Attacker Spam (10k Bogus)</button>
+            <button class="stage-btn btn-ghost" data-btn-reset title="Reset Simulation">↺</button>
+          </div>
+        </header>
+
+        <!-- Visualizer Content: Bitwise Filter Matrix -->
+        <div class="visualizer-content">
+          
+          <div class="bloom-arena-grid">
+            
+            <!-- Card 1: Incoming Query -->
+            <div class="b-card" data-query-card>
+              <div class="b-head">
+                <span class="b-icon">🔍</span>
+                <div>
+                  <strong>INCOMING QUERY</strong>
+                  <small data-query-sub>User ID lookup</small>
+                </div>
+              </div>
+              <div class="b-val-box">
+                <code data-query-val>"user_alice"</code>
+              </div>
+              <span class="b-badge ok" data-query-badge>✓ Legitimate User</span>
+            </div>
+
+            <!-- Card 2: 3-Hash Bitwise Array -->
+            <div class="b-card" data-matrix-card>
+              <div class="b-head">
+                <span class="b-icon">⚡</span>
+                <div>
+                  <strong>3-HASH BITWISE ARRAY</strong>
+                  <small>11.98 MB Memory Bitset</small>
+                </div>
+              </div>
+              <div class="bit-hashes-row">
+                <div class="bit-slot" data-bit-1><small>H1</small><b>1</b></div>
+                <div class="bit-slot" data-bit-2><small>H2</small><b>1</b></div>
+                <div class="bit-slot" data-bit-3><small>H3</small><b>1</b></div>
+              </div>
+              <span class="b-badge ok" data-matrix-badge>All Bits Match (1-1-1)</span>
+            </div>
+
+            <!-- Card 3: Database Protection Result -->
+            <div class="b-card" data-db-card>
+              <div class="b-head">
+                <span class="b-icon">🗄️</span>
+                <div>
+                  <strong>POSTGRES IMPACT</strong>
+                  <small data-db-sub>SQL Database Load</small>
+                </div>
+              </div>
+              <div class="b-metric-row">
+                <strong class="text-green" data-db-val>0 DB Queries Sent</strong>
+                <span class="b-badge ok" data-db-badge>✓ Definitive negatives skip SQL</span>
+              </div>
+              <div class="b-track">
+                <div class="b-fill" data-db-fill style="width: 0%;"></div>
+              </div>
+            </div>
+
+          </div>
+
+          <!-- Live Event Terminal -->
+          <div class="live-terminal-compact">
+            <div class="term-head">
+              <span>📟 BITWISE FILTER TELEMETRY</span>
+              <small>Real-time Stream</small>
+            </div>
+            <div class="term-stream" data-term-stream>
+              <div class="term-row info">[00:00.000] Bloom filter bloom:valid_users initialized with 10,000,000 capacity (11.98 MB RAM).</div>
+            </div>
+          </div>
+
+          <!-- Live Explanation Card -->
+          <div class="explanation-box">
+            <div class="exp-icon" data-exp-icon>💡</div>
+            <div class="exp-text">
+              <strong data-exp-title>Sub-Microsecond Bitwise Membership Check</strong>
+              <p data-exp-desc>If any required Bloom-filter bit is unset, the key is definitely absent and the application can skip the database lookup. A positive result remains probabilistic and may require verification.</p>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- Outcome Callout Footer -->
+        <footer class="stage-footer">
+          <div class="outcome-callout good" data-outcome-callout>
+            <small data-outcome-label>PROBABILISTIC CACHE BENEFIT</small>
+            <strong data-outcome-title>99% RAM REDUCTION &amp; ZERO DATABASE PENETRATION</strong>
+            <span data-outcome-sub>This illustrative 10M-item, 1% false-positive configuration uses an approximately 11.98 MB bit array. Positive checks still require application verification.</span>
+          </div>
+        </footer>
+      </article>
+
+    </section>
+
+    <!-- Technical Specifications Table -->
+    <section class="arch-comparison-section">
+      <div class="catastrophe-head">
+        <span class="catastrophe-pill">⚖️ ARCHITECTURE COMPARISON</span>
+        <h2>String Sets vs. Native Bloom Filters in Memory</h2>
+        <p>Why modern high-traffic architectures use native probabilistic structures to protect databases.</p>
+      </div>
+
+      <div class="arch-table-card">
+        <table class="arch-table">
+          <thead>
+            <tr>
+              <th>CAPABILITY (10,000,000 ITEMS)</th>
+              <th class="bad-col">❌ RAW STRING SET (SADD)</th>
+              <th class="good-col">✓ FERRICSTORE NATIVE BLOOM FILTER (BF.ADD)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>RAM Footprint</strong></td>
+              <td class="bad-text"><strong>950 MB - 1.8 GB:</strong> Stores full string payloads, dict entry pointers, and hash table metadata.</td>
+              <td class="good-text"><strong>~11.98 MB bit array in this model:</strong> Based on 10M items and a 1% target false-positive rate; implementation overhead is additional.</td>
+            </tr>
+            <tr>
+              <td><strong>Cache Penetration Attack</strong></td>
+              <td class="bad-text"><strong>Postgres Crash:</strong> If malicious bots query 50,000 bogus IDs, queries miss cache and hammer Postgres connection pools.</td>
+              <td class="good-text"><strong>Negative check:</strong> An unset required bit proves absence, so that request can skip SQL. Positive checks can include false positives.</td>
+            </tr>
+            <tr>
+              <td><strong>Lookup Latency</strong></td>
+              <td class="bad-text"><strong>Hash-table path:</strong> Stores full keys and object metadata.</td>
+              <td class="good-text"><strong>Bitwise path:</strong> Compact membership test; measure latency on the target workload.</td>
+            </tr>
+            <tr>
+              <td><strong>Built-in Structures</strong></td>
+              <td class="bad-text">Requires custom modules or external Redis Stack binaries.</td>
+              <td class="good-text"><strong>Native Engine Family:</strong> Bloom, Cuckoo, Count-Min Sketch (CMS), Top-K, and T-Digest out of the box.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="./bloom.js?v=3"></script>
+  <script src="../shared/accuracy.js?v=8"></script>
+</body>
+</html>

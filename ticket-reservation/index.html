@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>10-Minute Ticket Cart Hold · FerricStore vs Redis</title>
+  <link rel="stylesheet" href="../shared/base.css">
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=4">
+</head>
+<body data-mode="after">
+
+  <!-- Top Navigation -->
+  <nav class="demo-nav" aria-label="Demo Header">
+    <a href="../" class="nav-brand">
+      <span class="nav-logo">🎟️</span>
+      <div>
+        <strong>FerricStore Workflows</strong>
+        <small>Flash Sale &amp; 10-Minute Cart Reservation Hold</small>
+      </div>
+    </a>
+    <div class="nav-center">
+      <span class="nav-tag">HIGH-CONCURRENCY TICKETING</span>
+    </div>
+    <div class="nav-right">
+      <a href="../" class="nav-back-link">← All Demos</a>
+    </div>
+  </nav>
+
+  <main class="demo-main">
+    <!-- Hero Section -->
+    <header class="demo-hero">
+      <div class="hero-tag">THE 10-MINUTE CART RACE</div>
+      <h1>
+        Buyer #1 vs. Buyer #2:<br>
+        <span class="hero-accent">What Happens When the Cart Timer Expires?</span>
+      </h1>
+      <p class="hero-desc">
+        Buyer #1 places the last VIP seat in a <strong>10-minute hold</strong> while Buyer #2 waits. The comparison shows how an ad-hoc lock can race, while a durable hold state, lease expiry, and fencing provide an explicit ownership handoff. Payment still needs its own idempotency key.
+      </p>
+
+      <!-- Mode Switch Tabs -->
+      <div class="mode-switch" role="tablist" aria-label="Execution Mode">
+        <button type="button" role="tab" data-mode-btn="before" aria-selected="false">
+          <span class="mode-tab-title">Without FerricStore</span>
+          <span class="mode-tab-badge bad">❌ Redis EXPIRE (Double-Booking Hazard)</span>
+        </button>
+        <button type="button" role="tab" data-mode-btn="after" aria-selected="true" class="is-selected">
+          <span class="mode-tab-title">With FerricStore</span>
+          <span class="mode-tab-badge good">✓ Durable Hold + Fenced Transfer</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Metrics Bar -->
+    <section class="metrics-bar" aria-label="Live Metrics Comparison">
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">💤</span>
+          <small>TIMER MEMORY &amp; CPU FOOTPRINT</small>
+        </div>
+        <strong class="metric-val text-green" data-metric-cpu>No waiting handler held</strong>
+        <span class="metric-sub" data-metric-cpu-sub>Capacity depends on topology</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">⏱️</span>
+          <small>SEAT REASSIGN LATENCY</small>
+        </div>
+        <strong class="metric-val text-cyan" data-metric-reclaim>After hold expiry</strong>
+        <span class="metric-sub" data-metric-reclaim-sub>Immediate queue promotion</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">👥</span>
+          <small>DOUBLE-BOOKING RISK</small>
+        </div>
+        <strong class="metric-val text-green" data-metric-risk>State-Guarded Handoff</strong>
+        <span class="metric-sub" data-metric-risk-sub>Strict monotonic Raft lock</span>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-icon">💰</span>
+          <small>INVENTORY REVENUE CAPTURE</small>
+        </div>
+        <strong class="metric-val text-green" data-metric-rev>Captured in this run</strong>
+        <span class="metric-sub" data-metric-rev-sub>Zero abandoned ghost locks</span>
+      </div>
+    </section>
+
+    <!-- Main Workspace -->
+    <section class="demo-workspace">
+      
+      <!-- Left Column: Code Panel -->
+      <article class="code-panel">
+        <header class="panel-header">
+          <div class="file-info">
+            <span class="file-icon">py</span>
+            <div>
+              <h2 id="code-title" data-code-title>ticket_continue.py</h2>
+              <small data-code-kicker>FERRICSTORE SCHEDULED STATE API</small>
+            </div>
+          </div>
+          <div class="code-controls">
+            <div class="sdk-style-toggle" data-sdk-toggle>
+              <button type="button" class="sdk-btn" data-sdk-style="steps">Fused Continue</button>
+              <button type="button" class="sdk-btn is-active" data-sdk-style="states">Current SDK</button>
+            </div>
+            <span class="badge-durable" data-code-badge>DURABLE CART TIMER</span>
+          </div>
+        </header>
+
+        <!-- Code Block: Before Mode -->
+        <pre class="code-block" data-code="before" hidden><code><span data-line="1"><b class="ln">1</b><span><i class="k">import</i> redis, postgres, stripe</span></span>
+<span data-line="2"><b class="ln">2</b><span></span></span>
+<span data-line="3"><b class="ln">3</b><span><i class="k">def</i> <i class="fn">reserve_seat_in_cart</i>(seat_id, buyer_id):</span></span>
+<span data-line="4"><b class="ln">4</b><span>    <i class="c"># ❌ 1. Set 10-minute temporary Redis key</i></span></span>
+<span data-line="5"><b class="ln">5</b><span>    redis.<i class="fn">set</i>(f<q>"seat:{seat_id}"</q>, buyer_id, ex=600)</span></span>
+<span data-line="6"><b class="ln">6</b><span>    </span></span>
+<span data-line="7"><b class="ln">7</b><span>    <i class="c"># 💥 2. RACE CONDITION AT SECOND 600:</i></span></span>
+<span data-line="8"><b class="ln">8</b><span>    <i class="c"># If Buyer #1 pays at second 599 while Buyer #2 claims at 600:</i></span></span>
+<span data-line="9"><b class="ln">9</b><span>    <i class="c"># Both Stripe charges succeed for $280 ➔ DOUBLE BOOKING!</i></span></span>
+<span data-line="10"><b class="ln">10</b><span>    postgres.<i class="fn">execute</i>(<q>"UPDATE seats SET status = 'sold'"</q>)</span></span></code></pre>
+
+        <!-- Code Block: After Mode (Fused continuation) -->
+        <pre class="code-block" data-code="after-steps" hidden><code>import time
+from ferricstore import FlowClient
+
+client = FlowClient.from_url("ferric://127.0.0.1:6388")
+job = client.start_and_claim(
+    "hold-A12", type="ticket-hold",
+    initial_state="hold", worker="checkout-1",
+    payload={"seat": "A12", "buyer": "buyer-1"},
+)
+
+hold = seats.hold(
+    job.payload, idempotency_key=f"{job.id}:hold:v1",
+)
+job = client.step_continue(
+    job.id,
+    lease_token=job.lease_token,
+    fencing_token=job.fencing_token,
+    from_state=job.run_state,
+    to_state="persist_hold",
+    values={"hold": hold},
+    worker="checkout-1",
+    return_job=True,
+)
+
+# Timers use a scheduled transition so no worker stays alive for 10 minutes.
+client.transition(
+    job.id,
+    lease_token=job.lease_token,
+    fencing_token=job.fencing_token,
+    from_state=job.run_state,
+    to_state="check_payment",
+    run_at_ms=int(time.time() * 1000) + 600_000,
+)</code></pre>
+
+        <!-- Code Block: After Mode (States) -->
+        <pre class="code-block" data-code="after-states"><code>import time
+from ferricstore import WorkflowClient, complete, transition
+
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
+flow = client.workflow(type="ticket-hold", initial_state="hold")
+
+@flow.state("hold")
+def hold(ctx):
+    @ctx.effect("seat-hold", "tickets.hold", operation_digest=f"hold:{ctx.id}:v1")
+    def reserve():
+        return seats.hold(ctx.payload, request_id=f"{ctx.id}:hold:v1")
+    reserve()
+    return transition("check_payment", run_at_ms=int(time.time() * 1000) + 600_000)
+
+@flow.state("check_payment")
+def check_payment(job):
+    if billing.paid(job.id):
+        return complete(result=b"confirmed")
+    return transition("transfer")
+
+@flow.state("transfer")
+def transfer(ctx):
+    @ctx.effect("seat-transfer", "tickets.assign", operation_digest=f"transfer:{ctx.id}:v1")
+    def assign():
+        seats.assign_next(ctx.id, fencing_token=ctx.fencing_token)
+    assign()
+    return complete(result=b"transferred")</code></pre>
+      </article>
+
+      <!-- Right Column: Interactive Visual Story Stage -->
+      <article class="stage-panel">
+        <header class="stage-header">
+          <div class="stage-meta-left">
+            <span class="run-id-pill">EVENT: <strong>COLDPLAY VIP CONCERT</strong></span>
+            <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>STEP 1 OF 3</b></span>
+          </div>
+          <div class="playback-controls">
+            <button class="stage-btn btn-primary" data-btn-play title="Play Story">⚡ Play Story (3s)</button>
+            <button class="stage-btn" data-btn-step-1 title="Step 1: Buyer #1 Holds Seat">1. Hold Seat</button>
+            <button class="stage-btn btn-warning" data-btn-step-2 title="Step 2: 10-Min Timer Expires">2. 10m Expires</button>
+            <button class="stage-btn btn-danger" data-btn-step-3 title="Step 3: Concurrency Resolution">3. Resolution</button>
+            <button class="stage-btn btn-ghost" data-btn-reset title="Reset">↺</button>
+          </div>
+        </header>
+
+        <!-- Visual Storyboard Canvas -->
+        <div class="story-canvas">
+          
+          <!-- Step Indicator Header -->
+          <div class="story-stepper">
+            <div class="step-pill is-active" data-step-indicator="1">
+              <span class="s-num">1</span>
+              <span>Buyer #1 Holds Seat (10:00)</span>
+            </div>
+            <div class="step-divider">➔</div>
+            <div class="step-pill" data-step-indicator="2">
+              <span class="s-num">2</span>
+              <span>10m Timer Expires</span>
+            </div>
+            <div class="step-divider">➔</div>
+            <div class="step-pill" data-step-indicator="3">
+              <span class="s-num">3</span>
+              <span data-step-3-text>Fenced Seat Handoff</span>
+            </div>
+          </div>
+
+          <!-- Central Interactive Arena: Buyer 1 <-> Seat A12 <-> Buyer 2 -->
+          <div class="buyer-seat-arena">
+            
+            <!-- Buyer #1 Card -->
+            <div class="buyer-card buyer-1" data-buyer-1-card>
+              <div class="buyer-avatar">👩</div>
+              <div class="buyer-meta">
+                <strong>Buyer #1 (Alex G.)</strong>
+                <span class="buyer-tag" data-buyer-1-tag>🛒 In Cart (Holding Seat)</span>
+              </div>
+              <div class="timer-display-box" data-buyer-1-timer-box>
+                <small>CART TIMER</small>
+                <div class="timer-digits" data-timer-digits>10:00</div>
+                <div class="timer-bar"><div class="timer-bar-fill" data-timer-fill style="width: 100%;"></div></div>
+              </div>
+              <div class="buyer-action-note" data-buyer-1-note>Holding Seat A12 for checkout...</div>
+            </div>
+
+            <!-- Central Seat Target -->
+            <div class="central-seat-box" data-seat-box>
+              <div class="seat-badge">VIP SECTION</div>
+              <div class="seat-icon">🎟️</div>
+              <strong class="seat-name">Seat #A12</strong>
+              <span class="seat-price">$280.00</span>
+              <div class="seat-owner-pill" data-seat-owner>Held by: Buyer #1</div>
+            </div>
+
+            <!-- Buyer #2 Card -->
+            <div class="buyer-card buyer-2" data-buyer-2-card>
+              <div class="buyer-avatar">👨</div>
+              <div class="buyer-meta">
+                <strong>Buyer #2 (Sarah M.)</strong>
+                <span class="buyer-tag waiting" data-buyer-2-tag>⏳ Waiting Room (Pos #1)</span>
+              </div>
+              <div class="timer-display-box" data-buyer-2-timer-box>
+                <small>WAITING ROOM STATUS</small>
+                <div class="queue-status-text" data-buyer-2-status>Waiting for Seat A12...</div>
+              </div>
+              <div class="buyer-action-note" data-buyer-2-note>Ready to claim if Buyer #1 abandons</div>
+            </div>
+
+          </div>
+
+          <!-- Live Explanation Card -->
+          <div class="explanation-box" data-explanation-box>
+            <div class="exp-icon" data-exp-icon>💡</div>
+            <div class="exp-text">
+              <strong data-exp-title>Step 1: Buyer #1 locks Seat #A12 for 10 minutes</strong>
+              <p data-exp-desc>The hold is durable; no application handler remains blocked. Buyer #2 is waiting in position #1. Click "2. 10m Expires" to simulate expiry.</p>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- Outcome Callout Footer -->
+        <footer class="stage-footer">
+          <div class="outcome-callout good" data-outcome-callout>
+            <small data-outcome-label>CONCURRENCY OUTCOME</small>
+            <strong data-outcome-title>FENCED OWNERSHIP TRANSFER</strong>
+            <span data-outcome-sub>The hold expired and the next buyer acquired a newer ownership fence. Guard payment separately with a provider idempotency key.</span>
+          </div>
+        </footer>
+      </article>
+
+    </section>
+
+    <!-- Catastrophe & Prevention Section -->
+    <section class="catastrophe-section">
+      <div class="catastrophe-head">
+        <span class="catastrophe-pill">⚠️ THE HAZARD vs. HOW FERRICSTORE PREVENTS IT</span>
+        <h2>Why Cart Reservation Timers Fail &amp; How FerricStore Fixes It</h2>
+        <p>Compare standard Redis/Cron failure modes with FerricStore's durable quorum architecture.</p>
+      </div>
+
+      <div class="catastrophe-grid">
+        <!-- Card 1 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">👥</span>
+            <h4>Concert Double-Booking</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (Redis / Cron):</strong>
+              <p>Two users click 'Pay' at the exact second Redis key expires. Both credit cards are charged $280 for Seat A12, resulting in a venue conflict at the gates.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <p><strong>Fenced ownership:</strong> after expiry, Buyer #2 advances the durable state with a newer fence. A late Buyer #1 worker cannot overwrite the state; Stripe still requires an idempotency key and current-ownership check.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">🚨 $50 Chargeback + PR Disaster</span>
+            <span class="cat-fix-badge">✓ State-Guarded Ownership</span>
+          </div>
+        </div>
+
+        <!-- Card 2 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">🔒</span>
+            <h4>Ghost Inventory Lock Leak</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (Redis / Cron):</strong>
+              <p>A checkout worker crashes mid-payment without releasing the lock. 50 VIP seats remain marked 'held' forever, going unsold while 5,000 fans wait in line.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <p><strong>Decoupled Raft Timer Heartbeats:</strong> The timer runs directly in the replicated consensus cluster, independent of application workers. Even if all checkout workers crash, the timer still fires on schedule and auto-releases the hold.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">💸 $14,000 Lost Ticket Sales</span>
+            <span class="cat-fix-badge">✓ Zero Ghost Holds</span>
+          </div>
+        </div>
+
+        <!-- Card 3 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">🔌</span>
+            <h4>Database Connection Storm</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (Redis / Cron):</strong>
+              <p>Running 50,000 cron polling queries per second to check expired cart timestamps exhausts Postgres connection pools, taking down the entire storefront.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <p><strong>Scheduled eligibility:</strong> hold deadlines are durable and can be indexed for due claims. Validate capacity and polling behavior for the intended topology.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">📉 Complete Checkout Outage</span>
+            <span class="cat-fix-badge">✓ No Blocked Handler</span>
+          </div>
+        </div>
+
+        <!-- Card 4 -->
+        <div class="cat-card">
+          <div class="cat-head-row">
+            <span class="cat-icon">⚡</span>
+            <h4>Slow Waiting Room Dispatch</h4>
+          </div>
+          <div class="cat-body-block">
+            <div class="hazard-box">
+              <strong class="hazard-lbl">💥 The Hazard (Redis / Cron):</strong>
+              <p>Unmanaged carts take 45 seconds of polling latency to reassign abandoned seats, causing waiting room buyers to leave the site in frustration.</p>
+            </div>
+            <div class="prevention-box">
+              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <p><strong>Lease-based handoff:</strong> after the cart hold expires, the next eligible buyer can claim the durable state with a newer fencing token.</p>
+            </div>
+          </div>
+          <div class="cat-footer-row">
+            <span class="cat-cost">📉 28% Cart Abandonment</span>
+            <span class="cat-fix-badge">✓ Fenced Promotion</span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="./ticket.js?v=4"></script>
+  <script src="../shared/accuracy.js?v=8"></script>
+</body>
+</html>
