@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Multi-Agent AI & Human-in-the-Loop | FerricStore Demos</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="./style.css?v=2">
   <link rel="stylesheet" href="../shared/polish.css">
   <link rel="stylesheet" href="../shared/accuracy.css?v=4">
 </head>
@@ -37,28 +37,28 @@
           <strong>Autonomous $50k Marketing Campaign Generator</strong>
         </div>
         <div style="display: flex; gap: 8px;">
-          <button class="ctrl-btn" style="border-color: #ef4444; color: #fca5a5;" data-kill-btn>💥 Kill Server Mid-Wait</button>
+          <button class="ctrl-btn" style="border-color: #ef4444; color: #fca5a5;" data-kill-btn disabled>💥 Kill Server Mid-Wait</button>
         </div>
       </header>
 
       <!-- 5 Agent Stations Grid -->
       <div class="agent-stations-grid">
-        <div class="agent-node" data-agent-node="0">
-          <div class="an-head"><span>STAGE 1</span><span class="node-pill">DONE</span></div>
+        <div class="agent-node is-active" data-agent-node="0">
+          <div class="an-head"><span>STAGE 1</span><span class="node-pill">ACTIVE</span></div>
           <div class="an-icon">🔍</div>
           <strong>1. Market Research</strong>
           <small>Web Scraping Agent</small>
         </div>
 
         <div class="agent-node" data-agent-node="1">
-          <div class="an-head"><span>STAGE 2</span><span class="node-pill">DONE</span></div>
+          <div class="an-head"><span>STAGE 2</span><span class="node-pill">PENDING</span></div>
           <div class="an-icon">📝</div>
           <strong>2. Ad Generation</strong>
           <small>Drafts $50k Plan</small>
         </div>
 
-        <div class="agent-node is-waiting" data-agent-node="2">
-          <div class="an-head"><span>STAGE 3</span><span class="node-pill">ACTIVE</span></div>
+        <div class="agent-node" data-agent-node="2">
+          <div class="an-head"><span>STAGE 3</span><span class="node-pill">PENDING</span></div>
           <div class="an-icon">⏸️</div>
           <strong>3. State: await_approval</strong>
           <small>Durable waiting state</small>
@@ -95,20 +95,20 @@
             </div>
           </div>
           <div class="slack-actions">
-            <button class="slack-btn-approve" data-slack-approve>✓ Approve in Slack ($50k)</button>
-            <button class="slack-btn-reject" data-slack-reject>✕ Request Revisions</button>
+            <button class="slack-btn-approve" data-slack-approve disabled>✓ Approve in Slack ($50k)</button>
+            <button class="slack-btn-reject" data-slack-reject disabled>✕ Request Revisions</button>
           </div>
         </div>
 
         <!-- Narrative Box -->
         <div class="agent-narrative-box">
-          <div class="agent-badge warn" data-narrative-badge>⏸️ STATE: AWAIT_APPROVAL</div>
-          <h3 style="margin: 0 0 6px; font-size: 18px;" data-narrative-title>Workflow Parked on Disk</h3>
+          <div class="agent-badge good" data-narrative-badge>🔍 RESEARCH AGENT ACTIVE</div>
+          <h3 style="margin: 0 0 6px; font-size: 18px;" data-narrative-title>1. Multi-Source Competitor Research</h3>
           <p style="margin: 0 0 12px; font-size: 13.5px; color: var(--text-muted);" data-narrative-desc>
-            The workflow transitioned to <code>await_approval</code> state and yielded execution. FerricStore unloads the worker process completely. No memory leaks, no hung threads.
+            Scraping 24 competitor ad accounts and keyword bids. The step result is durably cached in FerricStore's disk log.
           </p>
           <div style="font-family: var(--font-mono); font-size: 11.5px; color: #a78bfa; background: rgba(0,0,0,0.4); padding: 8px; border-radius: 4px;" data-narrative-code>
-            return transition("await_approval", payload={"plan": plan})
+            return transition("draft_plan", payload={"competitors": competitors})
           </div>
         </div>
       </div>
@@ -116,24 +116,24 @@
       <!-- Live Telemetry -->
       <div class="telemetry-grid">
         <div class="telemetry-card">
-          <small>Server CPU While Parked</small>
-          <div class="telemetry-val" style="color: #34d399;" data-val-cpu>0.0%</div>
-          <span class="telemetry-sub">Zero compute wasted</span>
+          <small>Server CPU</small>
+          <div class="telemetry-val" style="color: #34d399;" data-val-cpu>14.2%</div>
+          <span class="telemetry-sub">Illustrative per-stage activity</span>
         </div>
         <div class="telemetry-card">
-          <small>Worker Compute RAM</small>
-          <div class="telemetry-val" style="color: #34d399;" data-val-ram>Unloaded</div>
-          <span class="telemetry-sub">State safe on disk log</span>
+          <small>Worker / State Memory</small>
+          <div class="telemetry-val" style="color: #34d399;" data-val-ram>42 MB</div>
+          <span class="telemetry-sub">Process or durable state footprint</span>
         </div>
         <div class="telemetry-card">
-          <small>Signal Waiting State</small>
-          <div class="telemetry-val" data-val-wait>Awaiting Signal</div>
-          <span class="telemetry-sub">client.signal(job_id, ...)</span>
+          <small>Wait State</small>
+          <div class="telemetry-val" data-val-wait>0s</div>
+          <span class="telemetry-sub">Current transition timing</span>
         </div>
         <div class="telemetry-card">
-          <small>Signal Resumption Latency</small>
-          <div class="telemetry-val" style="color: #38bdf8;" data-val-resume>Lease-dependent</div>
-          <span class="telemetry-sub">Advances after a valid signal and worker claim</span>
+          <small>Resume Boundary</small>
+          <div class="telemetry-val" style="color: #38bdf8;" data-val-resume>After claim</div>
+          <span class="telemetry-sub">Where execution continues</span>
         </div>
       </div>
 
@@ -210,7 +210,7 @@ def slack_webhook(payload: dict):
     return {"status": "workflow_resumed"}</code></pre>
     </section>
   </main>
-  <script src="./agent.js?v=3"></script>
+  <script src="./agent.js?v=4"></script>
   <script src="../shared/accuracy.js?v=8"></script>
 </body>
 </html>

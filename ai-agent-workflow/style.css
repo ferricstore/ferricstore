@@ -148,3 +148,14 @@ h1, h2, h3, h4, .hero-pill, .badge-label, .ctrl-btn {
 .ctrl-btn-group { display: inline-flex; align-items: center; gap: 8px; }
 .ctrl-btn { height: 38px; padding: 0 16px; border-radius: var(--radius-sm); background: rgba(255, 255, 255, 0.06); border: 1px solid var(--border-subtle); color: #fff; font-size: 13px; font-weight: 650; cursor: pointer; }
 .ctrl-btn:hover { background: rgba(255, 255, 255, 0.12); }
+.ctrl-btn:disabled,
+.slack-btn-approve:disabled,
+.slack-btn-reject:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  box-shadow: none;
+  filter: none;
+  transform: none;
+}
+.ctrl-btn:disabled:hover { background: rgba(255, 255, 255, 0.06); }
+.slack-btn-approve:disabled:hover { filter: none; transform: none; }

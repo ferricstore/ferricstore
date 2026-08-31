@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  var currentStep = 2;
+  var currentStep = 0;
   var isPaused = false;
   var timer = null;
 
@@ -113,6 +113,16 @@
     if (valRam) valRam.textContent = data.ram;
     if (valWait) valWait.textContent = data.wait;
     if (valResume) valResume.textContent = data.resume;
+
+    var canSignal = currentStep === 2 || currentStep === 3;
+    if (slackApprove) slackApprove.disabled = !canSignal;
+    if (slackReject) slackReject.disabled = !canSignal;
+    if (killBtn) {
+      killBtn.disabled = currentStep !== 2;
+      killBtn.title = currentStep === 2
+        ? "Kill the host while the workflow is waiting for approval"
+        : "Available when the workflow reaches the approval wait";
+    }
 
     if (pauseBtn) pauseBtn.textContent = isPaused ? "▶ Play" : "⏸ Pause";
     if (liveStatus) liveStatus.textContent = isPaused ? "Simulation Paused" : "Auto-advancing simulation";
