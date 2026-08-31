@@ -22,6 +22,7 @@
   var valOutbound = document.querySelector("[data-val-outbound]");
   var valDropped = document.querySelector("[data-val-dropped]");
   var valLatency = document.querySelector("[data-val-latency]");
+  var currentRunValue = document.querySelector("[data-current-run-value]");
 
   var pauseBtn = document.querySelector("[data-pause]");
   var resetBtn = document.querySelector("[data-reset-btn]");
@@ -50,6 +51,12 @@
     if (valOutbound) valOutbound.textContent = isPaused ? "0 / s" : outboundLimit.toLocaleString() + " / s";
     if (valDropped) valDropped.textContent = "0 in this run";
     if (valLatency) valLatency.textContent = "Workload-dependent";
+    if (currentRunValue) {
+      currentRunValue.textContent = "Shopify webhook surge → OpenAI categorization · "
+        + inboundRate.toLocaleString() + " inbound → "
+        + outboundLimit.toLocaleString() + " downstream"
+        + (isPaused ? " · Paused" : "");
+    }
 
     if (pauseBtn) pauseBtn.textContent = isPaused ? "▶ Resume Stream" : "⏸ Pause Stream";
   }

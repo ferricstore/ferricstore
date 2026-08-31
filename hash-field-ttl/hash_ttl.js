@@ -7,7 +7,7 @@
 
   var state = {
     auth_2fa: { value: '"849201"', ttlRemaining: 5.0, active: true },
-    cart_hold: { value: '"sku_iphone16"', ttlRemaining: 10.0, active: true }
+    cart_hold: { value: null, ttlRemaining: 0, active: false }
   };
 
   // DOM Elements
@@ -136,8 +136,12 @@
           if (status2fa) { status2fa.className = 'status-chip dead'; status2fa.textContent = 'PURGED'; }
           if (val2fa) val2fa.textContent = '(nil / purged)';
 
-          log('danger', '⏳ [HEXPIRE SWEEP] user:42 -> auth_2fa expired (5.0s elapsed). Field purged from ETS.');
-          log('success', '✓ [PARENT SAFE] user:42 fields "name" and "role" remain unchanged while the selected field expires.');
+          log('danger', currentMode === 'before'
+            ? '⏳ [KEY EXPIRY] user:42:auth_2fa expired after 5.0s. The separate top-level key was removed.'
+            : '⏳ [HEXPIRE SWEEP] user:42 -> auth_2fa expired after 5.0s. The selected field was purged.');
+          log('success', currentMode === 'before'
+            ? '✓ [PROFILE UNCHANGED] The separate user:42:profile key remains, at the cost of another top-level key.'
+            : '✓ [PARENT SAFE] user:42 fields "name" and "role" remain unchanged while the selected field expires.');
         }
       }
 
@@ -153,7 +157,9 @@
           if (statusCart) { statusCart.className = 'status-chip dead'; statusCart.textContent = 'PURGED'; }
           if (valCart) valCart.textContent = '(nil / purged)';
 
-          log('danger', '⏳ [HEXPIRE SWEEP] user:42 -> cart_hold expired (10.0s elapsed). Item released to inventory.');
+          log('danger', currentMode === 'before'
+            ? '⏳ [KEY EXPIRY] user:42:cart_hold expired after 10.0s. The separate key was removed.'
+            : '⏳ [HEXPIRE SWEEP] user:42 -> cart_hold expired after 10.0s. Item released to inventory.');
         }
       }
     }, 100);
@@ -163,14 +169,29 @@
   function set2fa() {
     clearAll();
     state.auth_2fa = { value: '"849201"', ttlRemaining: 5.0, active: true };
+    state.cart_hold = { value: null, ttlRemaining: 0, active: false };
+
+    if (livePill) livePill.className = 'live-pill';
+    if (liveStatus) {
+      liveStatus.textContent = currentMode === 'before'
+        ? 'STEP 1 · LEGACY 2FA KEY TTL'
+        : 'STEP 1 · 2FA FIELD TTL';
+    }
 
     if (row2fa) row2fa.className = 'f-row expiring';
     if (val2fa) val2fa.textContent = '"849201"';
     if (ttl2fa) { ttl2fa.className = 'ttl-badge exp'; ttl2fa.textContent = '⏳ 5.0s'; }
     if (status2fa) { status2fa.className = 'status-chip warn'; status2fa.textContent = 'COUNTDOWN'; }
 
-    log('info', 'HSET user:42 auth_2fa "849201"...');
-    log('cyan', 'HEXPIRE user:42 5 FIELDS 1 auth_2fa ➔ Set sub-key millisecond TTL.');
+    if (rowCart) rowCart.className = 'f-row waiting-row';
+    if (valCart) valCart.textContent = '—';
+    if (ttlCart) { ttlCart.className = 'ttl-badge wait'; ttlCart.textContent = 'Not set'; }
+    if (statusCart) { statusCart.className = 'status-chip wait'; statusCart.textContent = 'STEP 2'; }
+
+    log('info', currentMode === 'before'
+      ? 'SETEX user:42:auth_2fa 5 "849201" ➔ Created a separate top-level key.'
+      : 'HSET user:42 auth_2fa "849201"...');
+    if (currentMode === 'after') log('cyan', 'HEXPIRE user:42 5 FIELDS 1 auth_2fa ➔ Set sub-key millisecond TTL.');
 
     highlightCodeLine(7);
     startCountdown();
@@ -181,13 +202,22 @@
     clearAll();
     state.cart_hold = { value: '"sku_iphone16"', ttlRemaining: 10.0, active: true };
 
+    if (livePill) livePill.className = 'live-pill';
+    if (liveStatus) {
+      liveStatus.textContent = currentMode === 'before'
+        ? 'STEP 2 · LEGACY CART KEY TTL'
+        : 'STEP 2 · CART FIELD TTL';
+    }
+
     if (rowCart) rowCart.className = 'f-row expiring';
     if (valCart) valCart.textContent = '"sku_iphone16"';
     if (ttlCart) { ttlCart.className = 'ttl-badge exp'; ttlCart.textContent = '⏳ 10.0s'; }
     if (statusCart) { statusCart.className = 'status-chip warn'; statusCart.textContent = 'COUNTDOWN'; }
 
-    log('info', 'HSET user:42 cart_hold "sku_iphone16"...');
-    log('cyan', 'HEXPIRE user:42 10 FIELDS 1 cart_hold ➔ Set 10-second flash sale cart hold.');
+    log('info', currentMode === 'before'
+      ? 'SETEX user:42:cart_hold 10 "sku_iphone16" ➔ Created another separate top-level key.'
+      : 'HSET user:42 cart_hold "sku_iphone16"...');
+    if (currentMode === 'after') log('cyan', 'HEXPIRE user:42 10 FIELDS 1 cart_hold ➔ Set 10-second flash sale cart hold.');
 
     highlightCodeLine(11);
     startCountdown();
@@ -213,11 +243,9 @@
     clearAll();
     clearLogs();
     set2fa();
-    setCart();
   });
 
   // Init
   updateModeUI();
   set2fa();
-  setCart();
 })();

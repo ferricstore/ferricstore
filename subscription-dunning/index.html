@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>SaaS Subscription & Time-Travel Dunning | FerricStore Demos</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="./style.css?v=2">
   <link rel="stylesheet" href="../shared/polish.css">
-  <link rel="stylesheet" href="../shared/accuracy.css?v=4">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
 </head>
 <body>
   <nav class="top-nav">
@@ -37,38 +37,44 @@
           <strong>Acme Corp ($99.00 / month SaaS Subscription)</strong>
         </div>
         <div style="display: flex; gap: 8px;">
-          <button class="ctrl-btn" style="border-color: #ef4444; color: #fca5a5;" data-declined-toggle>💳 Card Declines on Day 15</button>
-          <button class="ctrl-btn" style="border-color: #10b981; color: #6ee7b7;" data-success-toggle>✓ Card Valid on Day 15</button>
+          <button class="ctrl-btn" style="border-color: #ef4444; color: #fca5a5;" data-declined-toggle>Jump to Day 15 Decline</button>
+          <button class="ctrl-btn" style="border-color: #10b981; color: #6ee7b7;" data-success-toggle>Jump to Day 21 Recovery</button>
         </div>
       </header>
+
+      <div class="current-run" aria-live="polite">
+        <span>Current run</span>
+        <strong>Dunning recovery</strong>
+        <small data-current-run-step>Step 1 of 5 · Day 1: Trial Started (14-Day Free Access)</small>
+      </div>
 
       <!-- Time Travel Scrubber Slider -->
       <div class="time-travel-panel">
         <div class="tt-header">
           <span style="font-size: 13px; font-weight: 800; color: #fff;">⏳ Interactive Time-Travel Scrubber:</span>
-          <strong style="color: #fbbf24; font-size: 14px;" data-tt-label>Day 15 (Charge Attempt)</strong>
+          <strong style="color: #fbbf24; font-size: 14px;" data-tt-label>Day 1: Trial Started (14-Day Free Access)</strong>
         </div>
-        <input type="range" min="0" max="4" value="2" class="tt-slider" data-tt-slider aria-label="Time Travel Slider">
+        <input type="range" min="0" max="4" value="0" class="tt-slider" data-tt-slider aria-label="Time Travel Slider">
       </div>
 
       <!-- 5 Day Milestones Grid -->
       <div class="timeline-milestones-grid">
-        <div class="tm-node" data-tm-node="0">
-          <div class="tmn-head"><span>DAY 1</span><span class="node-pill">DONE</span></div>
+        <div class="tm-node is-active" data-tm-node="0">
+          <div class="tmn-head"><span>DAY 1</span><span class="node-pill">ACTIVE</span></div>
           <div class="tmn-icon">🚀</div>
           <strong>Trial Started</strong>
           <small>14-Day Free Access</small>
         </div>
 
         <div class="tm-node" data-tm-node="1">
-          <div class="tmn-head"><span>DAY 14</span><span class="node-pill">DONE</span></div>
+          <div class="tmn-head"><span>DAY 14</span><span class="node-pill">PENDING</span></div>
           <div class="tmn-icon">📧</div>
           <strong>Warning Email</strong>
           <small>Trial Ending Alert</small>
         </div>
 
-        <div class="tm-node is-active" data-tm-node="2">
-          <div class="tmn-head"><span>DAY 15</span><span class="node-pill">ACTIVE</span></div>
+        <div class="tm-node" data-tm-node="2">
+          <div class="tmn-head"><span>DAY 15</span><span class="node-pill">PENDING</span></div>
           <div class="tmn-icon">💳</div>
           <strong>Card Charge</strong>
           <small>Declined / Insufficient $</small>
@@ -97,23 +103,23 @@
             👤 Customer Subscription State
           </div>
           <div style="margin-bottom: 14px;">
-            <div class="as-badge pastdue" data-account-badge>PAST DUE (DUNNING ACTIVE)</div>
+            <div class="as-badge trial" data-account-badge>TRIAL ACTIVE (14 DAYS REMAINING)</div>
             <div style="font-size: 16px; font-weight: 800; color: #fff;" data-account-title>Acme Pro Plan · $99/mo</div>
           </div>
           <div style="font-size: 13px; color: var(--text-muted); line-height: 1.5;" data-account-desc>
-            Credit card payment failed on Day 15. The flow entered a durable grace-period state and is eligible for Retry #1 at its scheduled time.
+            User is exploring features with full access. A payment method is on file for the end of the trial.
           </div>
         </div>
 
         <!-- Narrative Box -->
         <div class="dunning-narrative-box">
           <div class="as-badge trial" data-narrative-badge>TIMER SCHEDULED</div>
-          <h3 style="margin: 0 0 6px; font-size: 18px;" data-narrative-title>Day 15: Charge Attempted</h3>
+          <h3 style="margin: 0 0 6px; font-size: 18px;" data-narrative-title>Day 1: Welcome Email Sent</h3>
           <p style="margin: 0 0 12px; font-size: 13.5px; color: var(--text-muted);" data-narrative-desc>
-            The workflow handles the card decline gracefully, sending an immediate alert and scheduling the next retry in 3 days with zero database polling.
+            Customer activates Acme Pro Plan. The flow persists a trial state with a scheduled next eligibility time; no application handler stays blocked.
           </p>
           <div style="font-family: var(--font-mono); font-size: 11.5px; color: #fbbf24; background: rgba(0,0,0,0.4); padding: 8px; border-radius: 4px;" data-narrative-code>
-            email.send_dunning(idempotency_key=f"{job.id}:dunning-1:v1"); transition("retry_1", run_at_ms=day_18_ms)
+            return transition('send_warning', run_at_ms=day_14_ms)
           </div>
         </div>
       </div>
@@ -122,7 +128,7 @@
       <div class="telemetry-grid">
         <div class="telemetry-card">
           <small>Revenue Recovered</small>
-          <div class="telemetry-val" style="color: #34d399;" data-val-rev>$99.00</div>
+          <div class="telemetry-val" style="color: #34d399;" data-val-rev>$0.00 (Trial)</div>
           <span class="telemetry-sub">Prevented churn loss</span>
         </div>
         <div class="telemetry-card">
@@ -137,7 +143,7 @@
         </div>
         <div class="telemetry-card">
           <small>Grace Period</small>
-          <div class="telemetry-val" style="color: #fbbf24;" data-val-grace>3 Days Left</div>
+          <div class="telemetry-val" style="color: #fbbf24;" data-val-grace>14 Days</div>
           <span class="telemetry-sub">Access preserved</span>
         </div>
       </div>
@@ -196,7 +202,7 @@ client.transition(
 )</code></pre>
     </section>
   </main>
-  <script src="./dunning.js?v=4"></script>
-  <script src="../shared/accuracy.js?v=8"></script>
+  <script src="./dunning.js?v=5"></script>
+  <script src="../shared/accuracy.js?v=9"></script>
 </body>
 </html>

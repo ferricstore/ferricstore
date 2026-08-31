@@ -83,6 +83,7 @@
 
   var slackApprove = document.querySelector("[data-slack-approve]");
   var slackReject = document.querySelector("[data-slack-reject]");
+  var currentRunStep = document.querySelector("[data-current-run-step]");
 
   function render() {
     var data = stepsData[currentStep];
@@ -113,6 +114,9 @@
     if (valRam) valRam.textContent = data.ram;
     if (valWait) valWait.textContent = data.wait;
     if (valResume) valResume.textContent = data.resume;
+    if (currentRunStep) {
+      currentRunStep.textContent = "Step " + (currentStep + 1) + " of " + stepsData.length + " · " + data.title.replace(/^\d+\.\s*/, "");
+    }
 
     var canSignal = currentStep === 2 || currentStep === 3;
     if (slackApprove) slackApprove.disabled = !canSignal;

@@ -6,12 +6,12 @@
   <title>Sub-Key Hash Field TTLs · FerricStore</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="../shared/base.css">
-  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="./style.css?v=2">
   <link rel="stylesheet" href="../shared/polish.css">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@600;700;800;900&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="../shared/accuracy.css?v=4">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
 </head>
 <body data-mode="before">
 
@@ -142,7 +142,7 @@
         <header class="stage-header">
           <div class="stage-meta-left">
             <span class="run-id-pill">KEY: <strong>user:42</strong></span>
-            <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>COMPOUND HASH ACTIVE</b></span>
+            <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>STEP 1 · LEGACY 2FA KEY TTL</b></span>
           </div>
           <div class="playback-controls">
             <button class="stage-btn btn-primary" data-btn-set-2fa title="Set 2FA Code with 5s TTL">⚡ 1. Set 2FA (5s TTL)</button>
@@ -198,11 +198,11 @@
                     <td><span class="status-chip warn" data-status-2fa>COUNTDOWN</span></td>
                   </tr>
                   <!-- Field 4: Cart Reservation (Expiring) -->
-                  <tr class="f-row expiring" data-row-cart>
+                  <tr class="f-row waiting-row" data-row-cart>
                     <td><code>cart_hold</code></td>
-                    <td><strong class="val-text" data-val-cart>"sku_iphone16"</strong></td>
-                    <td><span class="ttl-badge exp" data-ttl-cart>⏳ 10.000s</span></td>
-                    <td><span class="status-chip warn" data-status-cart>COUNTDOWN</span></td>
+                    <td><strong class="val-text" data-val-cart>—</strong></td>
+                    <td><span class="ttl-badge wait" data-ttl-cart>Not set</span></td>
+                    <td><span class="status-chip wait" data-status-cart>STEP 2</span></td>
                   </tr>
                 </tbody>
               </table>
@@ -288,7 +288,7 @@
 
   </main>
 
-  <script src="./hash_ttl.js?v=4"></script>
-  <script src="../shared/accuracy.js?v=8"></script>
+  <script src="./hash_ttl.js?v=5"></script>
+  <script src="../shared/accuracy.js?v=9"></script>
 </body>
 </html>

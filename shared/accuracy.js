@@ -70,6 +70,49 @@
   }
 
   enhance(document.body);
+
+  function installCurrentContext() {
+    if (document.querySelector("[data-current-run-label], .demo-current-context")) return;
+    var host = document.querySelector(
+      ".mode-switch, .mode-toggle-wrap, .paradigm-selector-grid, .scenario-selector-bar"
+    );
+    if (!host) return;
+
+    var context = document.createElement("div");
+    context.className = "demo-current-context";
+    context.setAttribute("role", "status");
+    context.setAttribute("aria-live", "polite");
+    var kicker = document.createElement("span");
+    kicker.textContent = host.classList.contains("scenario-selector-bar") ? "Current scenario" : "Current view";
+    var value = document.createElement("strong");
+    context.append(kicker, value);
+    host.insertAdjacentElement("afterend", context);
+
+    function updateCurrentContext() {
+      var selected = host.querySelector(
+        '[aria-selected="true"], [aria-pressed="true"], .is-selected, .is-active'
+      );
+      if (!selected) {
+        value.textContent = "Ready";
+        return;
+      }
+      var label = selected.querySelector(".mode-tab-title")
+        || selected.querySelector(".mode-text-wrap strong")
+        || selected.querySelector("strong")
+        || selected.querySelector("span")
+        || selected;
+      value.textContent = label.textContent.replace(/\s+/g, " ").trim();
+    }
+
+    updateCurrentContext();
+    new MutationObserver(updateCurrentContext).observe(host, {
+      attributes: true,
+      subtree: true,
+      attributeFilter: ["class", "aria-selected", "aria-pressed"]
+    });
+  }
+
+  installCurrentContext();
   var observer = new MutationObserver(function (mutations) {
     observer.disconnect();
     mutations.forEach(function (mutation) {

@@ -72,6 +72,24 @@ code, pre, .telemetry-val, .wp-token-badge, .wc-status-box, .vault-decision-box 
 /* Stage Card */
 .stage-card { background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); padding: 28px; box-shadow: 0 24px 70px rgba(0, 0, 0, 0.55); margin-bottom: 48px; }
 .stage-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid var(--border-subtle); flex-wrap: wrap; }
+.current-run {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  align-items: center;
+  gap: 10px;
+  margin: -4px 0 20px;
+  padding: 10px 14px;
+  border: 1px solid rgba(56, 189, 248, 0.32);
+  border-radius: var(--radius-sm);
+  background: rgba(56, 189, 248, 0.08);
+}
+.current-run span { color: #7dd3fc; font-size: 10px; font-weight: 850; letter-spacing: 0.08em; text-transform: uppercase; }
+.current-run strong { color: #fff; font-size: 13px; }
+.current-run small { color: var(--text-muted); font-size: 12px; text-align: right; }
+@media (max-width: 720px) {
+  .current-run { grid-template-columns: auto 1fr; }
+  .current-run small { grid-column: 1 / -1; text-align: left; }
+}
 
 .scenario-badge { display: flex; align-items: center; gap: 10px; }
 .badge-label { padding: 4px 10px; border-radius: var(--radius-full); font-size: 11px; font-weight: 800; letter-spacing: 0.05em; }

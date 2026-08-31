@@ -17,6 +17,7 @@
       '    <button type="button" data-action="reset" disabled><span aria-hidden="true">↺</span>Reset</button>',
       '  </div>',
       '</div>',
+      '<p class="workflow-current-view"><span>Current view</span><strong data-current-mode-label>Without FerricStore</strong></p>',
       '<p class="workflow-hint" data-workflow-hint>Run the workflow, then crash Worker A during summarization.</p>',
       '<p class="sr-only" data-announcer aria-live="polite" aria-atomic="true"></p>'
     ].join("");
@@ -29,6 +30,7 @@
     var resetButton = target.querySelector('[data-action="reset"]');
     var hint = target.querySelector("[data-workflow-hint]");
     var announcer = target.querySelector("[data-announcer]");
+    var currentModeLabel = target.querySelector("[data-current-mode-label]");
 
     modeButtons.forEach(function (button) {
       button.addEventListener("click", function () {
@@ -52,6 +54,9 @@
         button.setAttribute("aria-pressed", active ? "true" : "false");
         button.classList.toggle("is-active", active);
       });
+      if (currentModeLabel) {
+        currentModeLabel.textContent = state.mode === "unmanaged" ? "Without FerricStore" : "With FerricStore";
+      }
 
       var waiting = state.status === "AWAITING_CRASH";
       crashButton.disabled = !state.crashReady;

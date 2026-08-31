@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  var currentStep = 3;
+  var currentStep = 0;
   var isPaused = false;
   var timer = null;
 
@@ -92,6 +92,8 @@
   var workerBRole = document.querySelector("[data-worker-b-role]");
   var workerBDesc = document.querySelector("[data-worker-b-desc]");
   var workerBStatus = document.querySelector("[data-worker-b-status]");
+  var workerAToken = document.querySelector("[data-worker-a-token]");
+  var workerBToken = document.querySelector("[data-worker-b-token]");
 
   var vaultLease = document.querySelector("[data-vault-lease]");
   var vaultDecision = document.querySelector("[data-gk-decision]");
@@ -107,6 +109,7 @@
   var freezeBtn = document.querySelector("[data-freeze-btn]");
   var promoteBtn = document.querySelector("[data-promote-btn]");
   var zombieBtn = document.querySelector("[data-zombie-btn]");
+  var currentRunStep = document.querySelector("[data-current-run-step]");
 
   function render() {
     var data = states[currentStep];
@@ -144,6 +147,8 @@
       workerBStatus.textContent = data.workerBStatus;
       workerBStatus.className = "wc-status-box" + (data.workerBActive ? " good" : "");
     }
+    if (workerAToken) workerAToken.textContent = "TOKEN: GEN=1" + (currentStep >= 2 ? " (STALE)" : "");
+    if (workerBToken) workerBToken.textContent = currentStep >= 2 ? "TOKEN: GEN=2 (ACTIVE)" : "TOKEN: STANDBY";
 
     if (vaultLease) vaultLease.textContent = data.vaultLease;
     if (vaultDecision) vaultDecision.innerHTML = data.vaultDecision;
@@ -152,6 +157,10 @@
     if (valBlocked) valBlocked.textContent = data.valBlocked;
     if (valCorrupt) valCorrupt.textContent = data.valCorrupt;
     if (valLatency) valLatency.textContent = "Lease-dependent";
+
+    if (currentRunStep) {
+      currentRunStep.textContent = "Step " + (currentStep + 1) + " of " + states.length + " · " + data.stageName.replace(/^Stage \d+:\s*/, "");
+    }
 
     if (pauseBtn) pauseBtn.textContent = isPaused ? "Play" : "Pause";
   }

@@ -22,6 +22,8 @@
   var querySub = document.querySelector('[data-query-sub]');
 
   var matrixCard = document.querySelector('[data-matrix-card]');
+  var matrixTitle = matrixCard ? matrixCard.querySelector('.b-head strong') : null;
+  var matrixSub = matrixCard ? matrixCard.querySelector('.b-head small') : null;
   var matrixBadge = document.querySelector('[data-matrix-badge]');
   var bit1 = document.querySelector('[data-bit-1]');
   var bit2 = document.querySelector('[data-bit-2]');
@@ -119,28 +121,51 @@
     clearAllTimeouts();
     updateModeUI();
 
+    if (livePill) livePill.className = 'live-pill';
+    if (liveStatus) {
+      liveStatus.textContent = currentMode === 'set'
+        ? 'STEP 1 · STANDARD SET LOOKUP'
+        : 'STEP 1 · BLOOM FILTER CHECK';
+    }
+
     if (queryVal) queryVal.textContent = '"user_alice"';
     if (queryBadge) { queryBadge.className = 'b-badge ok'; queryBadge.textContent = '✓ Legitimate User'; }
     if (querySub) querySub.textContent = 'Valid registered user';
 
+    if (matrixTitle) matrixTitle.textContent = currentMode === 'set' ? 'STANDARD SET HASH TABLE' : '3-HASH BITWISE ARRAY';
+    if (matrixSub) matrixSub.textContent = currentMode === 'set' ? 'Raw membership lookup' : '11.98 MB Memory Bitset';
+
     if (bit1) { bit1.className = 'bit-slot'; bit1.querySelector('b').textContent = '1'; }
     if (bit2) { bit2.className = 'bit-slot'; bit2.querySelector('b').textContent = '1'; }
     if (bit3) { bit3.className = 'bit-slot'; bit3.querySelector('b').textContent = '1'; }
-    if (matrixBadge) { matrixBadge.className = 'b-badge ok'; matrixBadge.textContent = 'All Bits Match (1-1-1)'; }
+    if (matrixBadge) {
+      matrixBadge.className = 'b-badge ok';
+      matrixBadge.textContent = currentMode === 'set' ? 'Hash-table member found' : 'All Bits Match (1-1-1)';
+    }
 
     if (dbVal) dbVal.textContent = '0 DB Queries (Served Cache)';
     if (dbBadge) { dbBadge.className = 'b-badge ok'; dbBadge.textContent = '✓ Healthy in this model'; }
     if (dbFill) dbFill.style.width = '0%';
 
-    log('info', 'GET user:user_alice ➔ Testing Bloom Filter bloom:valid_users...');
+    log('info', currentMode === 'set'
+      ? 'SISMEMBER valid_users user_alice ➔ Testing the standard Set...'
+      : 'BF.EXISTS bloom:valid_users user_alice ➔ Testing the Bloom Filter...');
 
     animTimeouts.push(setTimeout(function () {
-      log('success', '✓ [BF.EXISTS MATCH] 3 hash slots [48291, 108420, 892011] all evaluate to 1.');
-      log('success', '⚡ [SERVED] Served user_alice after a positive membership check and application lookup.');
+      log('success', currentMode === 'set'
+        ? '✓ [SISMEMBER MATCH] user_alice was found in the standard Set hash table.'
+        : '✓ [BF.EXISTS MATCH] 3 hash slots [48291, 108420, 892011] all evaluate to 1.');
+      log('success', currentMode === 'set'
+        ? '⚡ [SERVED] Served user_alice after the exact Set membership lookup.'
+        : '⚡ [SERVED] Served user_alice after a positive membership check and application lookup.');
 
       if (expIcon) expIcon.textContent = '⚡';
-      if (expTitle) expTitle.textContent = 'Positive Membership Check: Verify the Record';
-      if (expDesc) expDesc.textContent = 'All 3 hash bits matched (1-1-1). FerricStore served the user from cache. Click "🚨 2. Attacker Spam" to simulate malicious penetration attacks!';
+      if (expTitle) expTitle.textContent = currentMode === 'set'
+        ? 'Standard Set Membership Lookup'
+        : 'Positive Membership Check: Verify the Record';
+      if (expDesc) expDesc.textContent = currentMode === 'set'
+        ? 'The exact Set lookup found this valid user. Click "🚨 2. Attacker Spam" to see how random misses fall through without a probabilistic guard.'
+        : 'All 3 hash bits matched (1-1-1). FerricStore served the user from cache. Click "🚨 2. Attacker Spam" to simulate malicious penetration attacks!';
 
       highlightCodeLine(currentMode === 'set' ? 7 : 7);
     }, 300));
@@ -175,6 +200,9 @@
       highlightCodeLine(7);
 
     } else {
+      if (livePill) livePill.className = 'live-pill';
+      if (liveStatus) liveStatus.textContent = 'STEP 2 · DEFINITELY ABSENT KEYS BLOCKED';
+
       if (bit1) { bit1.className = 'bit-slot'; bit1.querySelector('b').textContent = '1'; }
       if (bit2) { bit2.className = 'bit-slot is-zero'; bit2.querySelector('b').textContent = '0'; }
       if (bit3) { bit3.className = 'bit-slot'; bit3.querySelector('b').textContent = '1'; }

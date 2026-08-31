@@ -66,6 +66,28 @@
 .code-accuracy-label + pre { border-top-left-radius: 0 !important; border-top-right-radius: 0 !important; }
 .accuracy-table-scroll { max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
 
+.demo-current-context {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  max-width: min(100%, 720px);
+  margin: 10px auto 0;
+  padding: 8px 12px;
+  border: 1px solid rgba(129, 140, 248, 0.34);
+  border-radius: 999px;
+  background: rgba(99, 102, 241, 0.1);
+  color: #e2e8f0;
+  font-size: 12px;
+}
+.demo-current-context span {
+  color: #a5b4fc;
+  font-size: 9px;
+  font-weight: 850;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.demo-current-context strong { color: #fff; font-weight: 800; }
+
 @media (max-width: 640px) {
   html, body { max-width: 100%; overflow-x: clip; }
   body > *, main, section, article, aside, header, footer, nav, div { min-width: 0; }

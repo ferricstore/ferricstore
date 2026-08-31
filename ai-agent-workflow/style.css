@@ -159,3 +159,22 @@ h1, h2, h3, h4, .hero-pill, .badge-label, .ctrl-btn {
 }
 .ctrl-btn:disabled:hover { background: rgba(255, 255, 255, 0.06); }
 .slack-btn-approve:disabled:hover { filter: none; transform: none; }
+
+.current-run {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  align-items: center;
+  gap: 10px;
+  margin: -8px 0 20px;
+  padding: 10px 14px;
+  border: 1px solid rgba(139, 92, 246, 0.34);
+  border-radius: var(--radius-sm);
+  background: rgba(139, 92, 246, 0.09);
+}
+.current-run span { color: #c4b5fd; font-size: 10px; font-weight: 850; letter-spacing: 0.08em; text-transform: uppercase; }
+.current-run strong { color: #fff; font-size: 13px; }
+.current-run small { color: var(--text-muted); font-size: 12px; text-align: right; }
+@media (max-width: 720px) {
+  .current-run { grid-template-columns: auto 1fr; }
+  .current-run small { grid-column: 1 / -1; text-align: left; }
+}

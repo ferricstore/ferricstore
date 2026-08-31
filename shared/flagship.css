@@ -276,6 +276,25 @@ code, pre { font-family: var(--ff-mono); }
   animation: crash-ready 1.4s ease-in-out infinite;
 }
 
+.workflow-current-view {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+}
+.workflow-current-view span {
+  color: var(--accent);
+  font-family: var(--ff-mono);
+  font-size: 8px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.workflow-current-view strong { color: var(--text); font-size: 10px; }
+
 .workflow-hint {
   min-height: 18px;
   margin: 5px 4px 0;

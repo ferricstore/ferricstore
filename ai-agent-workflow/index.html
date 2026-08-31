@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Multi-Agent AI & Human-in-the-Loop | FerricStore Demos</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css?v=2">
+  <link rel="stylesheet" href="./style.css?v=3">
   <link rel="stylesheet" href="../shared/polish.css">
-  <link rel="stylesheet" href="../shared/accuracy.css?v=4">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
 </head>
 <body>
   <nav class="top-nav">
@@ -40,6 +40,12 @@
           <button class="ctrl-btn" style="border-color: #ef4444; color: #fca5a5;" data-kill-btn disabled>💥 Kill Server Mid-Wait</button>
         </div>
       </header>
+
+      <div class="current-run" aria-live="polite">
+        <span>Current run</span>
+        <strong>Human approval with host recovery</strong>
+        <small data-current-run-step>Step 1 of 5 · Multi-Source Competitor Research</small>
+      </div>
 
       <!-- 5 Agent Stations Grid -->
       <div class="agent-stations-grid">
@@ -210,7 +216,7 @@ def slack_webhook(payload: dict):
     return {"status": "workflow_resumed"}</code></pre>
     </section>
   </main>
-  <script src="./agent.js?v=4"></script>
-  <script src="../shared/accuracy.js?v=8"></script>
+  <script src="./agent.js?v=5"></script>
+  <script src="../shared/accuracy.js?v=9"></script>
 </body>
 </html>

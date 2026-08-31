@@ -341,13 +341,16 @@ body {
 .ttl-badge.perm { background: rgba(16, 185, 129, 0.25); color: #6ee7b7; border: 1px solid #10b981; }
 .ttl-badge.exp { background: rgba(245, 158, 11, 0.25); color: #fde047; border: 1px solid #f59e0b; }
 .ttl-badge.dead { background: rgba(239, 68, 68, 0.25); color: #fca5a5; border: 1px solid #ef4444; }
+.ttl-badge.wait { background: rgba(148, 163, 184, 0.14); color: #cbd5e1; border: 1px solid rgba(148, 163, 184, 0.45); }
 
 .status-chip { font-size: 10.5px; font-weight: 950; padding: 2px 8px; border-radius: 4px; }
 .status-chip.ok { background: rgba(16, 185, 129, 0.2); color: #34d399; }
 .status-chip.warn { background: rgba(245, 158, 11, 0.2); color: #fde047; }
 .status-chip.dead { background: rgba(239, 68, 68, 0.2); color: #f87171; }
+.status-chip.wait { background: rgba(148, 163, 184, 0.14); color: #cbd5e1; }
 
 .f-row.expired-row td { opacity: 0.45; text-decoration: line-through; }
+.f-row.waiting-row td { opacity: 0.6; }
 
 /* Live Terminal Compact */
 .live-terminal-compact {

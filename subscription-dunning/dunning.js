@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  var currentStep = 2;
+  var currentStep = 0;
   var isPaused = false;
   var timer = null;
 
@@ -126,6 +126,7 @@
   var nextBtn = document.querySelector("[data-next]");
   var replayBtn = document.querySelector("[data-replay]");
   var liveStatus = document.querySelector("[data-live-status]");
+  var currentRunStep = document.querySelector("[data-current-run-step]");
 
   var declinedToggle = document.querySelector("[data-declined-toggle]");
   var successToggle = document.querySelector("[data-success-toggle]");
@@ -167,8 +168,10 @@
     if (valDrift) valDrift.textContent = data.drift;
     if (valGrace) valGrace.textContent = data.grace;
 
+    if (currentRunStep) currentRunStep.textContent = "Step " + (currentStep + 1) + " of " + stepsData.length + " · " + data.ttLabel;
+
     if (pauseBtn) pauseBtn.textContent = isPaused ? "▶ Play" : "⏸ Pause";
-    if (liveStatus) liveStatus.textContent = isPaused ? "Simulation Paused" : "Auto-advancing simulation";
+    if (liveStatus) liveStatus.textContent = (isPaused ? "Paused" : "Running") + " · Dunning recovery · Step " + (currentStep + 1) + " of " + stepsData.length;
   }
 
   function clearTimer() {
@@ -207,7 +210,8 @@
 
   if (declinedToggle) {
     declinedToggle.addEventListener("click", function () {
-      currentStep = 2; // Jump to day 15 declined
+      currentStep = 2;
+      isPaused = true;
       render();
       schedule();
     });
@@ -215,7 +219,8 @@
 
   if (successToggle) {
     successToggle.addEventListener("click", function () {
-      currentStep = 4; // Jump to recovered
+      currentStep = 4;
+      isPaused = true;
       render();
       schedule();
     });
