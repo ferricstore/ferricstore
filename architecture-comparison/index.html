@@ -38,7 +38,7 @@
       <!-- 4 Paradigm Selector Cards -->
       <div class="paradigm-selector-grid" role="tablist" aria-label="Architecture Paradigm">
         <!-- 1. In-Memory -->
-        <button class="paradigm-btn" type="button" role="tab" data-arch="memory" aria-selected="false">
+        <button class="paradigm-btn is-active" type="button" role="tab" data-arch="memory" aria-selected="true">
           <div class="p-header">
             <span class="p-icon">🧠</span>
             <span class="p-tag">VOLATILE RAM</span>
@@ -68,7 +68,7 @@
         </button>
 
         <!-- 4. FerricStore Durable Workflows -->
-        <button class="paradigm-btn is-active" type="button" role="tab" data-arch="workflow" aria-selected="true">
+        <button class="paradigm-btn" type="button" role="tab" data-arch="workflow" aria-selected="false">
           <div class="p-header">
             <span class="p-icon">🛡️</span>
             <span class="p-tag">DURABLE + FENCED</span>
@@ -317,10 +317,10 @@
         <h3 style="font-size: 22px; margin-bottom: 16px; color: #ffffff;">Compare Developer Code</h3>
 
         <div class="code-tabs" role="tablist">
-          <button class="code-tab-btn is-active" type="button" data-code-tab="workflow">🛡️ FerricStore SDK</button>
+          <button class="code-tab-btn" type="button" data-code-tab="workflow">🛡️ FerricStore SDK</button>
           <button class="code-tab-btn" type="button" data-code-tab="queue">📬 SQS / Queues</button>
           <button class="code-tab-btn" type="button" data-code-tab="db">🗄️ SQL State Machine</button>
-          <button class="code-tab-btn" type="button" data-code-tab="memory">🧠 In-Memory Async</button>
+          <button class="code-tab-btn is-active" type="button" data-code-tab="memory">🧠 In-Memory Async</button>
         </div>
 
         <pre class="code-preview-box"><code data-code-content># FerricStore Python SDK: explicit durable states
@@ -378,7 +378,7 @@ checkout.worker().run()</code></pre>
     </section>
   </main>
 
-  <script src="./comparison.js?v=4"></script>
+  <script src="./comparison.js?v=5"></script>
   <script src="../shared/accuracy.js?v=8"></script>
 </body>
 </html>

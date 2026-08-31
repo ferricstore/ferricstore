@@ -1,7 +1,7 @@
 (function () {
   'use strict';
 
-  var currentMode = 'after';
+  var currentMode = 'before';
   var currentSdk = 'states';
   var animTimeouts = [];
 

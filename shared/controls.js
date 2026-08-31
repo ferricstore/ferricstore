@@ -7,8 +7,8 @@
     target.innerHTML = [
       '<div class="workflow-toolbar" role="toolbar" aria-label="Workflow controls">',
       '  <div class="workflow-modes" role="group" aria-label="Comparison mode">',
-      '    <button type="button" data-mode="durable" aria-pressed="true"><strong>With FerricStore</strong><span>Durable, fenced resume</span></button>',
-      '    <button type="button" data-mode="unmanaged" aria-pressed="false"><strong>Without FerricStore</strong><span>In-memory restart</span></button>',
+      '    <button type="button" data-mode="unmanaged" aria-pressed="true"><strong>Without FerricStore</strong><span>In-memory restart</span></button>',
+      '    <button type="button" data-mode="durable" aria-pressed="false"><strong>With FerricStore</strong><span>Durable, fenced resume</span></button>',
       '  </div>',
       '  <div class="workflow-actions">',
       '    <button type="button" class="action-run" data-action="run"><span aria-hidden="true">▶</span><span data-run-label>Run workflow</span></button>',

@@ -13,7 +13,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@600;700;800;900&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="../shared/accuracy.css?v=4">
 </head>
-<body data-mode="bloom">
+<body data-mode="set">
 
   <!-- Top Navigation -->
   <nav class="demo-nav" aria-label="Demo Header">
@@ -46,11 +46,11 @@
 
       <!-- Mode Switch Tabs -->
       <div class="mode-switch" role="tablist" aria-label="Execution Mode">
-        <button type="button" role="tab" data-mode-btn="set" aria-selected="false">
+        <button type="button" role="tab" data-mode-btn="set" aria-selected="true" class="is-selected">
           <span class="mode-tab-title">Standard String Set (SADD / SISMEMBER)</span>
           <span class="mode-tab-badge bad">❌ 950 MB RAM for 10M Keys (High Cost)</span>
         </button>
-        <button type="button" role="tab" data-mode-btn="bloom" aria-selected="true" class="is-selected">
+        <button type="button" role="tab" data-mode-btn="bloom" aria-selected="false">
           <span class="mode-tab-title">FerricStore Native Bloom Filter</span>
           <span class="mode-tab-badge good">✓ Compact Filter + Configurable Error Rate</span>
         </button>
@@ -284,7 +284,7 @@
 
   </main>
 
-  <script src="./bloom.js?v=3"></script>
+  <script src="./bloom.js?v=4"></script>
   <script src="../shared/accuracy.js?v=8"></script>
 </body>
 </html>

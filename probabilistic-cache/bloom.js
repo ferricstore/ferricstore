@@ -1,7 +1,7 @@
 (function () {
   'use strict';
 
-  var currentMode = 'bloom';
+  var currentMode = 'set';
   var animTimeouts = [];
 
   // DOM Elements

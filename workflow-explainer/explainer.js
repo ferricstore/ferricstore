@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  var mode = "after"; // "before" (Without Workflows) or "after" (With FerricStore)
+  var mode = "before"; // "before" (Without Workflows) or "after" (With FerricStore)
   var currentStep = 0;
   var isPaused = false;
   var timer = null;

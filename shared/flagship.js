@@ -86,7 +86,7 @@
   ].join("");
 
   var reduceMotion = global.matchMedia && global.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  var engine = global.FerricWorkflow.createEngine({ delay: reduceMotion ? 250 : 850 });
+  var engine = global.FerricWorkflow.createEngine({ delay: reduceMotion ? 250 : 850, mode: "unmanaged" });
   global.FerricControls.mount(document.getElementById("workflow-controls"), engine);
 
   var rendererFactory = global.FerricRenderers && global.FerricRenderers[design];

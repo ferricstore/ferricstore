@@ -13,7 +13,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@600;700;800;900&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="../shared/accuracy.css?v=4">
 </head>
-<body data-mode="after">
+<body data-mode="before">
 
   <!-- Top Navigation -->
   <nav class="demo-nav" aria-label="Demo Header">
@@ -46,11 +46,11 @@
 
       <!-- Mode Switch Tabs -->
       <div class="mode-switch" role="tablist" aria-label="Execution Mode">
-        <button type="button" role="tab" data-mode-btn="before" aria-selected="false">
+        <button type="button" role="tab" data-mode-btn="before" aria-selected="true" class="is-selected">
           <span class="mode-tab-title">Without FerricStore (Celery + SQS)</span>
           <span class="mode-tab-badge bad">❌ 4 Cloud Services + Zombie Duplicate Charges</span>
         </button>
-        <button type="button" role="tab" data-mode-btn="after" aria-selected="true" class="is-selected">
+        <button type="button" role="tab" data-mode-btn="after" aria-selected="false">
           <span class="mode-tab-title">With FerricStore</span>
           <span class="mode-tab-badge good">✓ 1 Native Engine + Fenced Monotonic Leases</span>
         </button>
@@ -393,7 +393,7 @@
     </section>
   </main>
 
-  <script src="./queue.js?v=3"></script>
+  <script src="./queue.js?v=4"></script>
   <script src="../shared/accuracy.js?v=8"></script>
 </body>
 </html>

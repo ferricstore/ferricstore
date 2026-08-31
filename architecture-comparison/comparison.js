@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  var activeArch = "workflow";
+  var activeArch = "memory";
   var currentStep = 0;
   var isPaused = false;
   var timer = null;
@@ -368,6 +368,7 @@
 
   var codeTabs = document.querySelectorAll("[data-code-tab]");
   var codeContent = document.querySelector("[data-code-content]");
+  if (codeContent) codeContent.textContent = codeSnippets[activeArch];
 
   // Choreography Deep Dive DOM Elements
   var choreoTabs = document.querySelectorAll("[data-choreo-tab]");
