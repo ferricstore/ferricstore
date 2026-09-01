@@ -337,7 +337,7 @@ Metrics are arranged as one bordered four-cell band with 18px interior padding a
 
 ### Disclosures
 
-Supporting code, comparisons, sources, accuracy notes, and technical boundaries use native `details` rows. The 58px summary is condensed and left-aligned, with a small signal-ink Open/Close state at the edge; opened content sits on bright paper behind a soft rule.
+Supporting code, comparisons, sources, accuracy notes, and technical boundaries use native `details` rows. The 58px summary is condensed and left-aligned, with a 14px signal-ink Open/Close state at the edge. Opened content is always a light reading surface: 16px section copy, 15px body and table copy, 14px metadata and code, and 16px nested disclosure labels. Route-specific dark themes and gradients never leak into these reading panels; semantic warning and success tints remain available as restrained paper colors.
 
 ### Catalog Rows
 

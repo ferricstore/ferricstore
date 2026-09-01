@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-09-01T14:03:36Z",
+  "generatedAt": "2026-09-01T14:43:42Z",
   "title": "Design System: FerricStore Dispatch Strip Board",
   "extensions": {
     "colorMeta": {
@@ -201,9 +201,9 @@
       "name": "Technical Disclosure",
       "kind": "custom",
       "refersTo": "disclosure-row",
-      "description": "Defers supporting code, comparisons, and caveats while keeping their purpose visible.",
+      "description": "Defers supporting code, comparisons, and caveats while keeping their purpose visible on a consistently light, readable surface.",
       "html": "<details class=\"ds-disclosure\"><summary><span>Accuracy and SDK boundary</span><small>Open</small></summary><div><p>Workflow handlers remain at-least-once. Guard external effects with a stable idempotency key.</p></div></details>",
-      "css": ".ds-disclosure { border-top: 1px solid #0d222b; border-bottom: 1px solid #0d222b; background: #fcfefb; color: #0d222b; font-family: \"Atkinson Hyperlegible\", ui-sans-serif, system-ui, sans-serif; } .ds-disclosure summary { display: flex; min-height: 58px; align-items: center; justify-content: space-between; gap: 20px; padding: 0 18px; cursor: pointer; font-family: \"Barlow Condensed\", \"Arial Narrow\", sans-serif; font-size: 21px; font-weight: 600; list-style: none; } .ds-disclosure summary::-webkit-details-marker { display: none; } .ds-disclosure summary:hover { background: #e7ece8; } .ds-disclosure summary:focus-visible { outline: 3px solid #526b00; outline-offset: 3px; } .ds-disclosure summary small { color: #526b00; font-family: \"Atkinson Hyperlegible\", ui-sans-serif, system-ui, sans-serif; font-size: 13px; } .ds-disclosure[open] summary small { font-size: 0; } .ds-disclosure[open] summary small::after { content: \"Close\"; font-size: 13px; } .ds-disclosure > div { padding: clamp(18px,3vw,38px); border-top: 1px solid #d8dfda; background: #fcfefb; } .ds-disclosure p { max-width: 75ch; margin: 0; color: #2e454e; line-height: 1.62; }"
+      "css": ".ds-disclosure { border-top: 1px solid #0d222b; border-bottom: 1px solid #0d222b; background: #fcfefb; color: #0d222b; font-family: \"Atkinson Hyperlegible\", ui-sans-serif, system-ui, sans-serif; } .ds-disclosure summary { display: flex; min-height: 58px; align-items: center; justify-content: space-between; gap: 20px; padding: 0 18px; cursor: pointer; font-family: \"Barlow Condensed\", \"Arial Narrow\", sans-serif; font-size: 21px; font-weight: 600; list-style: none; } .ds-disclosure summary::-webkit-details-marker { display: none; } .ds-disclosure summary:hover { background: #e7ece8; } .ds-disclosure summary:focus-visible { outline: 3px solid #526b00; outline-offset: 3px; } .ds-disclosure summary small { color: #526b00; font-family: \"Atkinson Hyperlegible\", ui-sans-serif, system-ui, sans-serif; font-size: 14px; } .ds-disclosure[open] summary small { font-size: 0; } .ds-disclosure[open] summary small::after { content: \"Close\"; font-size: 14px; } .ds-disclosure > div { padding: clamp(18px,3vw,38px); border-top: 1px solid #d8dfda; background: #fcfefb; color: #0d222b; font-size: 16px; line-height: 1.62; } .ds-disclosure p { max-width: 75ch; margin: 0; color: #2e454e; font-size: 15px; line-height: 1.62; } .ds-disclosure details summary { min-height: 52px; background: #fcfefb; color: #0d222b; font: 700 16px/1.4 \"Atkinson Hyperlegible\", ui-sans-serif, system-ui, sans-serif; }"
     },
     {
       "name": "Catalog Search Field",

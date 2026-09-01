@@ -320,8 +320,8 @@
     var cls = node.className || "";
     var text = (node.querySelector("h2, h3") || {}).textContent || "";
     if (/evidence-note|mode-boundary/i.test(cls)) return "How to read this evidence";
-    if (/code|sdk/i.test(cls + " " + text)) return "Inspect implementation and SDK patterns";
     if (/matrix|comparison|architecture|use-case/i.test(cls + " " + text)) return "Compare architecture and trade-offs";
+    if (/code|sdk/i.test(cls) || /sdk|implementation/i.test(text)) return "Inspect implementation and SDK patterns";
     if (/catastrophe|pain|failure/i.test(cls + " " + text)) return "Inspect the failure without this mechanism";
     if (/source|reference/i.test(cls + " " + text)) return "Sources and evidence boundaries";
     if (/faq|question/i.test(cls + " " + text)) return "Questions and technical boundaries";
@@ -392,6 +392,18 @@
         event.preventDefault();
         tabs[current].focus();
         tabs[current].click();
+      });
+    });
+  }
+
+  function installDisclosureKeyboard() {
+    Array.prototype.slice.call(document.querySelectorAll("details > summary")).forEach(function (summary) {
+      if (summary.dataset.fsKeyboardReady) return;
+      summary.dataset.fsKeyboardReady = "true";
+      summary.addEventListener("keydown", function (event) {
+        if ((event.key !== "Enter" && event.key !== " ") || event.repeat) return;
+        event.preventDefault();
+        summary.click();
       });
     });
   }
@@ -592,6 +604,7 @@
     }
 
     enhanceSecondary(main, firstView, hero);
+    installDisclosureKeyboard();
     installTabKeyboard();
   }
 
