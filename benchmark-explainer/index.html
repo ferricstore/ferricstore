@@ -7,11 +7,11 @@
   <meta name="theme-color" content="#071018">
   <title>Workflow Benchmark, Explained | FerricStore Demos</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css?v=2">
+  <link rel="stylesheet" href="./style.css?v=3">
   <link rel="stylesheet" href="../shared/accuracy.css?v=5">
 </head>
 <body>
-  <a class="skip-link" href="#workflow-math">Skip to workflow math</a>
+  <a class="skip-link" href="#workflow-modes">Skip to workflow modes</a>
 
   <nav class="top-nav" aria-label="Demo navigation">
     <a class="brand" href="../">
@@ -25,79 +25,95 @@
     <header class="hero">
       <div class="hero-copy">
         <span class="eyebrow">WORKFLOW BENCHMARK, DECODED</span>
-        <h1><span>54K workflows/s.</span><br>What actually completed?</h1>
-        <p>The headline is a measured end-to-end workflow rate. To compare it with DBOS or Temporal, we first have to expose the steps, durable operations, hardware, and missing latency data behind it.</p>
+        <h1><span>Two workflow paths.</span><br>Two different meanings.</h1>
+        <p>FerricStore has a measured worker-driven result for normal application work and a faster fused result for deterministic state chains. The numbers are both real, but they do not describe the same job.</p>
       </div>
 
       <div class="headline-stack" aria-label="FerricStore workflow benchmark summary">
         <article class="headline-result">
-          <span>MEASURED END TO END</span>
-          <strong>54,060</strong>
-          <small>completed workflows / second</small>
+          <span>FUSED 3-STEP RESULT</span>
+          <strong>104,696</strong>
+          <small>completed deterministic workflows / second</small>
         </article>
         <div class="headline-facts">
-          <div><strong>1</strong><span>worker-applied state action per workflow</span></div>
-          <div><strong>0 B</strong><span>benchmark payload and result</span></div>
-          <div class="is-unknown"><strong>—</strong><span>no workflow latency percentiles published</span></div>
+          <div><strong>3</strong><span>declared workflow steps, persisted as one chain</span></div>
+          <div><strong>314K</strong><span>logical workflow steps/s, derived</span></div>
+          <div><strong>27 ms</strong><span>measured p99 for this local run</span></div>
         </div>
       </div>
     </header>
 
     <aside class="evidence-note" aria-label="Benchmark evidence boundary">
       <span aria-hidden="true">i</span>
-      <p><strong>Measured boundary:</strong> the 54,060/s result was a one-million-workflow, one-step synthetic run—not a three-step run. The three-step calculator below is explicit arithmetic. It does not prove that the same server sustains 54,060 three-step workflows/s.</p>
+      <p><strong>Do not read this as 104,696 three-step business processes.</strong> The fused benchmark records an already-known state chain in one durable command. No HTTP call, model inference, payment, or other application handler runs between its steps.</p>
     </aside>
 
-    <section class="math-section" id="workflow-math" aria-labelledby="math-title">
+    <section class="math-section" id="workflow-modes" aria-labelledby="modes-title">
       <div class="section-heading">
         <div>
-          <span class="eyebrow">WORKFLOW → STATE ACTIONS</span>
-          <h2 id="math-title">Yes, three steps means 3× the state actions</h2>
+          <span class="eyebrow">WHAT THE NUMBERS MEAN</span>
+          <h2 id="modes-title">Choose the execution model first</h2>
         </div>
-        <p>That multiplication is valid only after we say exactly what “step” counts.</p>
+        <p>The useful question is not “which number is larger?” It is “does application code need to run between durable states?”</p>
       </div>
 
-      <div class="math-layout">
-        <div class="calculator-card">
-          <label for="step-count">
-            State actions per workflow
-            <strong><span data-step-count>3</span> <span data-step-word>steps</span></strong>
-          </label>
-          <input id="step-count" type="range" min="1" max="10" step="1" value="3" data-step-slider>
+      <div class="mode-switch" role="tablist" aria-label="Workflow execution model">
+        <button type="button" role="tab" aria-selected="true" aria-controls="mode-panel" data-mode-button="worker">Worker-driven workflow</button>
+        <button type="button" role="tab" aria-selected="false" aria-controls="mode-panel" data-mode-button="fused">Fused deterministic chain</button>
+      </div>
 
-          <div class="equation" aria-live="polite">
-            <div><small>WORKFLOW RATE</small><strong>54,060/s</strong></div>
-            <span>×</span>
-            <div><small>STATE ACTIONS</small><strong data-equation-steps>3</strong></div>
-            <span>=</span>
-            <div class="equation-result"><small>STATE ACTION RATE</small><strong data-state-actions>162,180/s</strong></div>
-          </div>
-
-          <div class="command-total">
-            <div>
-              <span>Include the separate workflow create</span>
-              <small><span data-step-count-copy>3</span> state actions + 1 create command per workflow</small>
-            </div>
-            <strong data-command-rate>216,240 durable commands/s</strong>
-          </div>
-
-          <div class="action-track" data-action-track aria-label="Three worker-applied state actions plus workflow creation">
-            <span class="create-action">CREATE</span>
-            <span>STEP 1</span>
-            <span>STEP 2</span>
-            <span>STEP 3 · COMPLETE</span>
+      <div class="mode-panel" id="mode-panel" role="tabpanel" aria-live="polite">
+        <div class="mode-copy">
+          <span class="eyebrow" data-mode-kicker>REAL APPLICATION WORK</span>
+          <h3 data-mode-title>54,060 worker-driven workflows/s</h3>
+          <p data-mode-summary>Workers claim a named state, run normal application code, and report a durable transition or completion. The measured Azure run used one tiny handler, so it measures orchestration capacity—not the speed of your business logic.</p>
+          <div class="mode-answer">
+            <strong data-mode-answer-title>What does 54K mean?</strong>
+            <p data-mode-answer>One server started, coordinated, claimed, and durably completed roughly 54,000 one-state synthetic workflows each second while producers and workers ran together.</p>
           </div>
         </div>
 
-        <aside class="math-explanation">
-          <span class="eyebrow">WHAT THE MATH MEANS</span>
-          <h3>Three actions, not three database writes</h3>
-          <p>FerricStore’s Python benchmark counts every claimed and applied workflow handler as one <strong>state action</strong>. With three states, the worker applies two transitions and one final completion.</p>
-          <p>Workflow creation is measured separately. Internally, each command can update state, indexes, history, leases, and storage records, so <strong>216,240 commands/s must not be relabeled as database writes/s.</strong></p>
-          <div class="warning-box">
-            <strong>Measured vs. hypothetical</strong>
-            <p>54,060 workflows/s × 3 = 162,180 state actions/s is correct arithmetic. The published run measured 54,060 workflows/s × 1 action, so a real three-step throughput run is still required.</p>
-          </div>
+        <div class="mode-visual" data-mode-visual="worker" aria-label="Worker-driven workflow sequence">
+          <div class="mode-step"><small>01</small><strong>START</strong><span>producer creates Flow</span></div>
+          <i aria-hidden="true">→</i>
+          <div class="mode-step"><small>02</small><strong>CLAIM</strong><span>worker receives lease</span></div>
+          <i aria-hidden="true">→</i>
+          <div class="mode-step app-step"><small>03</small><strong>RUN CODE</strong><span>API, model, payment…</span></div>
+          <i aria-hidden="true">→</i>
+          <div class="mode-step"><small>04</small><strong>COMMIT</strong><span>transition or complete</span></div>
+        </div>
+
+        <div class="mode-metrics" aria-label="Selected workflow benchmark facts">
+          <article><small>THROUGHPUT</small><strong data-mode-throughput>54,060/s</strong><span data-mode-throughput-note>1M live Azure run</span></article>
+          <article><small>LOGICAL STEPS</small><strong data-mode-steps>1</strong><span data-mode-steps-note>one worker handler</span></article>
+          <article><small>LATENCY</small><strong data-mode-latency>Not published</strong><span data-mode-latency-note>throughput only</span></article>
+          <article><small>DURABLE SHAPE</small><strong data-mode-command>create + claim + finish</strong><span data-mode-command-note>application code between boundaries</span></article>
+        </div>
+
+        <aside class="mode-boundary">
+          <strong data-mode-boundary-title>Use this model when steps perform real work.</strong>
+          <p data-mode-boundary>The handler may call other services and may run again after a crash, so external effects still need idempotency.</p>
+        </aside>
+      </div>
+
+      <div class="fused-proof">
+        <div>
+          <span class="eyebrow">MEASURED FUSED PROFILES</span>
+          <h3>Three steps really were measured</h3>
+          <p>The step counts used different batch and in-flight settings. Three steps beating one step reflects different batching and overhead amortization—not a claim that adding steps makes a workflow faster.</p>
+        </div>
+        <div class="proof-grid">
+          <article><small>1 STEP</small><strong>31,839/s</strong><span>p50 3.2 ms · p99 18.8 ms</span></article>
+          <article class="is-featured"><small>3 STEPS</small><strong>104,696/s</strong><span>p50 18.1 ms · p99 27.0 ms</span></article>
+          <article><small>9 STEPS</small><strong>32,470/s</strong><span>p50 11.3 ms · p99 71.5 ms</span></article>
+        </div>
+        <aside class="proof-math">
+          <div><small>MEASURED WORKFLOW RATE</small><strong>104,696/s</strong></div>
+          <span>×</span>
+          <div><small>DECLARED STEPS</small><strong>3</strong></div>
+          <span>=</span>
+          <div><small>LOGICAL STEP RATE</small><strong>314,088/s</strong></div>
+          <p>This is a derived count of persisted logical steps. It is not 314,088 function calls, Activities, database writes, or network requests.</p>
         </aside>
       </div>
     </section>
@@ -105,10 +121,10 @@
     <section class="measured-section" aria-labelledby="measured-title">
       <div class="section-heading">
         <div>
-          <span class="eyebrow">THE MEASURED FERRICSTORE RUN</span>
-          <h2 id="measured-title">Keep the workload attached</h2>
+          <span class="eyebrow">WORKER-DRIVEN BASELINE</span>
+          <h2 id="measured-title">The 54K result still matters</h2>
         </div>
-        <p>The result is useful because it includes live creation and worker completion together.</p>
+        <p>This is the more representative orchestration number when application handlers must run between states.</p>
       </div>
 
       <div class="run-grid">
@@ -143,9 +159,27 @@
         <p>These references answer different questions. The table shows what can—and cannot—be concluded.</p>
       </div>
 
+      <div class="model-map" aria-label="Temporal and FerricFlow execution model comparison">
+        <article>
+          <small>TEMPORAL</small>
+          <strong>Workflow code + Activities</strong>
+          <p>A Worker replays durable Event History to reconstruct workflow state, then schedules or resumes application Activities.</p>
+        </article>
+        <div class="shared-split">
+          <span>SHARED DEPLOYMENT IDEA</span>
+          <strong>producer → durable service → worker</strong>
+          <p>Both separate the process that starts work from long-running workers.</p>
+        </div>
+        <article>
+          <small>FERRICFLOW</small>
+          <strong>Explicit state pipeline</strong>
+          <p>A Worker claims a named durable state and reports the next state. FerricFlow does not replay application handlers.</p>
+        </article>
+      </div>
+
       <div class="comparison-table" role="table" aria-label="Published workflow benchmark comparison">
         <div class="comparison-head" role="row">
-          <span role="columnheader">SYSTEM</span>
+          <span role="columnheader">PATH / SYSTEM</span>
           <span role="columnheader">PUBLIC NUMBER</span>
           <span role="columnheader">WORK PER WORKFLOW</span>
           <span role="columnheader">INFRASTRUCTURE</span>
@@ -153,11 +187,19 @@
         </div>
 
         <article class="comparison-row ferric-row" role="row">
-          <div role="cell"><strong>FerricStore</strong><span>measured Azure run</span></div>
+          <div role="cell"><strong>FerricStore worker</strong><span>measured Azure run</span></div>
           <div role="cell"><strong>54,060 workflows/s</strong><span>1M live end-to-end</span></div>
           <div role="cell"><strong>1 state action</strong><span>plus separate create</span></div>
           <div role="cell"><strong>16-vCPU server</strong><span>2-vCPU client · native store</span></div>
-          <div role="cell"><p>Highest top-line workflow rate here, but measured with one tiny synthetic state action.</p></div>
+          <div role="cell"><p>Measures the real claim/worker/finish path, but with one tiny synthetic handler and no latency percentiles.</p></div>
+        </article>
+
+        <article class="comparison-row fused-row" role="row">
+          <div role="cell"><strong>FerricStore fused</strong><span>measured local run</span></div>
+          <div role="cell"><strong>104,696 workflows/s</strong><span>314,088 logical steps/s</span></div>
+          <div role="cell"><strong>3 declared steps</strong><span>one durable chain command</span></div>
+          <div role="cell"><strong>local source server</strong><span>16 shards · 100K workflows</span></div>
+          <div role="cell"><p>Strong state-persistence capacity, but no worker or business code runs between the three states.</p></div>
         </article>
 
         <article class="comparison-row dbos-row" role="row">
@@ -173,15 +215,15 @@
           <div role="cell"><strong>300K+ Actions/s</strong><span>not workflows/s</span></div>
           <div role="cell"><strong>Depends on workflow</strong><span>start, activities, retries, timers…</span></div>
           <div role="cell"><strong>Managed fleet</strong><span>hardware not disclosed</span></div>
-          <div role="cell"><p>Three regular Activities usually mean at least four Actions: one Workflow start plus three Activity Actions. Local Activities use a different counting boundary. APS is not FerricStore state-actions/s.</p></div>
+          <div role="cell"><p>Actions are billable server operations. Three regular Activities generally consume at least one start Action plus three Activity Actions; retries, timers, Signals, and Heartbeats add more.</p></div>
         </article>
       </div>
 
       <aside class="comparison-note">
-        <strong>For a three-step comparison:</strong>
-        <span>FerricStore arithmetic: 3 state actions + create.</span>
-        <span>DBOS model: 3 step checkpoints + start + complete = 5 Postgres writes.</span>
-        <span>Temporal model with 3 regular Activities: at least 3 Activity Actions + Workflow start = 4 Actions, before retries, timers, Signals, or Heartbeats.</span>
+        <strong>What 300K Actions/s could mean:</strong>
+        <span>With three regular Activities, a minimal workflow is about four Actions: one Workflow start + three Activity Actions.</span>
+        <span>300K ÷ 4 = 75K workflows/s is only a derived ceiling if nothing else generates Actions and the Worker fleet keeps up. Temporal does not publish it as workflows/s.</span>
+        <span>Local Activities are counted differently: markers from one Workflow Task are grouped into one Action. Do not apply the four-Action conversion to that shape.</span>
       </aside>
     </section>
 
@@ -191,22 +233,22 @@
           <span class="eyebrow">THROUGHPUT IS NOT LATENCY</span>
           <h2 id="latency-title">What we actually know about response time</h2>
         </div>
-        <p>A million workflows finishing quickly does not reveal how long an individual workflow waited.</p>
+        <p>We now have latency for the fused chain, but not for the Azure worker-driven run.</p>
       </div>
 
       <div class="latency-grid">
         <article class="latency-card ferric-latency">
-          <span>FERRICSTORE</span>
+          <span>FERRICSTORE WORKER</span>
           <strong>Unknown</strong>
-          <small>p50 / p95 / p99 workflow latency</small>
+          <small>54K Azure run latency percentiles</small>
           <p>The Azure run reports throughput and aggregate elapsed time only. ≈18.5 seconds is the service time for all one million workflows—not 18.5 seconds per workflow and not 18.5 milliseconds.</p>
         </article>
 
-        <article class="latency-card dbos-latency">
-          <span>DBOS</span>
-          <strong>≈40 ms</strong>
-          <small>separate 2024 five-step average</small>
-          <p>DBOS published about 40 ms for a five-step transactional workflow averaged over 1,000 executions. That was a different experiment from the 43K workflows/s no-step throughput run.</p>
+        <article class="latency-card fused-latency">
+          <span>FERRICSTORE FUSED</span>
+          <strong>27 ms</strong>
+          <small>3-step p99 · p50 18.1 ms</small>
+          <p>This is measured end-to-end batch latency for the public <code>run_steps_many</code> path. The chain persists three named states, history, and completion with no application code between states.</p>
         </article>
 
         <article class="latency-card temporal-latency">
@@ -219,13 +261,13 @@
 
       <div class="latency-context">
         <div>
-          <span class="eyebrow">TEMPORAL SERVICE LATENCY</span>
-          <h3>API latency is not full workflow latency</h3>
-          <p>Temporal separately publishes a 200 ms p99 per-region latency SLO. Its reference table shows p99 of 54 ms for Workflow Start, 40 ms for Signal, and 61 ms for Signal-With-Start. Those operations are only parts of a multi-step workflow.</p>
+          <span class="eyebrow">WHY 27 MS DOES NOT “BEAT” 850 MS</span>
+          <h3>One persists states; the other schedules Activities</h3>
+          <p>The FerricStore fused chain performs no application work between its states. Temporal’s example includes three Activity scheduling cycles. The numbers demonstrate different costs, not a winner.</p>
         </div>
         <div class="latency-rule">
-          <strong>Do not conclude “FerricStore is faster” from throughput alone.</strong>
-          <p>FerricStore needs matched low-load and saturated three-step runs with end-to-end p50, p95, p99, and p99.9 before its latency can be compared with DBOS or Temporal.</p>
+          <strong>The fair test is worker-driven versus Activity-driven.</strong>
+          <p>Run three no-op FerricFlow state handlers against three no-op Temporal regular Activities with matched payloads, deployment distance, load, and durability. Report throughput and full latency tails.</p>
         </div>
       </div>
     </section>
@@ -233,14 +275,14 @@
     <section class="next-test" aria-labelledby="next-test-title">
       <div>
         <span class="eyebrow">THE NEXT CREDIBLE BENCHMARK</span>
-        <h2 id="next-test-title">Measure the three-step claim directly</h2>
-        <p>The current number is strong throughput evidence for one step. This is what would turn the 162,180 state-actions/s arithmetic into a real comparison.</p>
+        <h2 id="next-test-title">Run the matched worker test</h2>
+        <p>The fused three-step result is measured. What is still missing is a fair test of three real worker boundaries against three Temporal Activities.</p>
       </div>
       <ol>
-        <li><span>01</span><p><strong>Same workflow shape</strong>Three no-op durable steps, identical payloads, no retries.</p></li>
-        <li><span>02</span><p><strong>Two load levels</strong>Low load for inherent latency; saturation for capacity and queueing.</p></li>
-        <li><span>03</span><p><strong>Both unit families</strong>Report workflows/s and state actions/s, plus creates separately.</p></li>
-        <li><span>04</span><p><strong>Latency tails</strong>End-to-end p50, p95, p99, p99.9 and maximum, not only averages.</p></li>
+        <li><span>01</span><p><strong>Same application work</strong>Three no-op handlers versus three no-op regular Activities.</p></li>
+        <li><span>02</span><p><strong>Same operating distance</strong>Record client, service, and Worker locations plus hardware.</p></li>
+        <li><span>03</span><p><strong>Low and high load</strong>Separate inherent latency from queueing and saturation.</p></li>
+        <li><span>04</span><p><strong>Native and shared units</strong>Workflows/s, Actions or state steps/s, p50, p95, p99, p99.9, errors.</p></li>
       </ol>
     </section>
 
@@ -252,23 +294,25 @@
       </div>
       <div class="source-actions">
         <a href="https://github.com/ferricstore/ferricstore/blob/cf71ad1e895d1a7baa4e75fe2751ee87197a99c8/docs/benchmarks.md">FerricStore public summary <span>↗</span></a>
-        <a href="https://github.com/ferricstore/ferricstore-python/blob/8623d63b5b05feb082ea1b514675489d014635be/docs/benchmark.md">FerricStore Python run details <span>↗</span></a>
-        <a href="https://github.com/ferricstore/ferricstore-python/blob/8623d63b5b05feb082ea1b514675489d014635be/examples/state_machine_workflow_benchmark.py">FerricStore benchmark code <span>↗</span></a>
+        <a href="https://github.com/ferricstore/ferricstore-python/blob/004d16a8a95bc0a5e4a9657fe9a2efde0bdbb974/docs/benchmark.md">FerricStore worker run details <span>↗</span></a>
+        <a href="https://github.com/ferricstore/ferricstore-python/blob/004d16a8a95bc0a5e4a9657fe9a2efde0bdbb974/docs/protocol-benchmark-history.md#restate-high-load-profile-final-local-validation">FerricStore fused run details <span>↗</span></a>
+        <a href="https://github.com/ferricstore/ferricstore-python/blob/004d16a8a95bc0a5e4a9657fe9a2efde0bdbb974/src/ferricstore/client_producer.py#L179-L220">Fused workflow API boundary <span>↗</span></a>
+        <a href="https://github.com/ferricstore/ferricstore/blob/cf71ad1e895d1a7baa4e75fe2751ee87197a99c8/docs/flow-vs-temporal-usage.md">FerricFlow runtime comparison <span>↗</span></a>
+        <a href="https://github.com/ferricstore/ferricstore-python/blob/004d16a8a95bc0a5e4a9657fe9a2efde0bdbb974/docs/compare.md">FerricFlow / Temporal concepts <span>↗</span></a>
         <a href="https://dbos.dev/blog/benchmarking-workflow-execution-scalability-on-postgres">DBOS throughput benchmark <span>↗</span></a>
         <a href="https://www.dbos.dev/blog/dbos-vs-aws-step-functions-benchmark">DBOS latency reference <span>↗</span></a>
         <a href="https://temporal.io/cloud">Temporal Cloud scale claim <span>↗</span></a>
         <a href="https://docs.temporal.io/cloud/actions">Temporal Action definitions <span>↗</span></a>
-        <a href="https://github.com/temporalio/documentation/blob/adab4d6b12ec0525d13126fa369ddc7a4cba6c0b/docs/design-patterns/performance-latency-patterns.mdx">Temporal latency guide <span>↗</span></a>
-        <a href="https://pages.temporal.io/rs/250-WIU-007/images/migration-guide-2024.pdf?version=0/">Temporal p99 reference <span>↗</span></a>
+        <a href="https://github.com/temporalio/documentation/blob/5b56ddca7d409a82f2d74e21f20edf35f29ad483/docs/design-patterns/performance-latency-patterns.mdx">Temporal latency guide <span>↗</span></a>
       </div>
     </section>
   </main>
 
   <footer>
     <a class="brand" href="../"><span class="brand-mark" aria-hidden="true">F</span><span><strong>FerricStore</strong><small>Interactive demos</small></span></a>
-    <p>Measured facts · Explicit arithmetic · Honest unknowns</p>
+    <p>Measured facts · Clear execution models · Honest unknowns</p>
   </footer>
 
-  <script src="./benchmark.js?v=2"></script>
+  <script src="./benchmark.js?v=3"></script>
 </body>
 </html>

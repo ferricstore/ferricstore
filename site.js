@@ -104,7 +104,7 @@
       id: "benchmark-explainer",
       title: "Workflow Benchmark, Explained",
       icon: "▥",
-      description: "Decode 54K workflows per second, translate steps into state actions, and compare the published DBOS and Temporal boundaries.",
+      description: "See what 54K worker-driven and 104K fused workflows per second actually mean, then compare their boundaries with Temporal and DBOS.",
       topics: ["Featured", "Architecture"],
       accent: "#22d3ee"
     },
