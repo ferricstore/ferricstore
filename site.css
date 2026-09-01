@@ -443,6 +443,31 @@ footer {
 
 .demo-card p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.58; }
 
+.card-insight {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.card-insight span {
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 850;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.card-insight strong {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.5;
+}
+
 .card-footer {
   display: flex;
   align-items: center;
