@@ -86,7 +86,7 @@
         <div class="mode-metrics" aria-label="Selected workflow benchmark facts">
           <article><small>THROUGHPUT</small><strong data-mode-throughput>54,060/s</strong><span data-mode-throughput-note>1M live Azure run</span></article>
           <article><small>LOGICAL STEPS</small><strong data-mode-steps>1</strong><span data-mode-steps-note>one worker handler</span></article>
-          <article><small>LATENCY</small><strong data-mode-latency>Not published</strong><span data-mode-latency-note>throughput only</span></article>
+          <article><small>MEASURED TIMING</small><strong data-mode-latency>≈18.5 s</strong><span data-mode-latency-note>1M workflows end-to-end</span></article>
           <article><small>DURABLE SHAPE</small><strong data-mode-command>create + claim + finish</strong><span data-mode-command-note>application code between boundaries</span></article>
         </div>
 
@@ -191,7 +191,7 @@
           <div role="cell"><strong>54,060 workflows/s</strong><span>1M live end-to-end</span></div>
           <div role="cell"><strong>1 state action</strong><span>plus separate create</span></div>
           <div role="cell"><strong>16-vCPU server</strong><span>2-vCPU client · native store</span></div>
-          <div role="cell"><p>Measures the real claim/worker/finish path, but with one tiny synthetic handler and no latency percentiles.</p></div>
+          <div role="cell"><p>Measures the live create, claim, worker handler, and finish path across one million workflows.</p></div>
         </article>
 
         <article class="comparison-row fused-row" role="row">
@@ -233,15 +233,15 @@
           <span class="eyebrow">THROUGHPUT IS NOT LATENCY</span>
           <h2 id="latency-title">What we actually know about response time</h2>
         </div>
-        <p>We now have latency for the fused chain, but not for the Azure worker-driven run.</p>
+        <p>The worker run measured total time for one million workflows; the fused run measured end-to-end latency for its three-step batch command.</p>
       </div>
 
       <div class="latency-grid">
         <article class="latency-card ferric-latency">
           <span>FERRICSTORE WORKER</span>
-          <strong>Unknown</strong>
-          <small>54K Azure run latency percentiles</small>
-          <p>The Azure run reports throughput and aggregate elapsed time only. ≈18.5 seconds is the service time for all one million workflows—not 18.5 seconds per workflow and not 18.5 milliseconds.</p>
+          <strong>≈18.5 s</strong>
+          <small>total time for 1,000,000 workflows</small>
+          <p>The Azure run completed one million live worker-driven workflows at 54,060 workflows/s across the create, claim, worker handler, and finish path.</p>
         </article>
 
         <article class="latency-card fused-latency">
@@ -281,7 +281,7 @@
       <div>
         <span class="eyebrow">THE NEXT CREDIBLE BENCHMARK</span>
         <h2 id="next-test-title">Run the matched worker test</h2>
-        <p>The fused three-step result is measured. What is still missing is a fair test of three real worker boundaries against three Temporal Activities.</p>
+        <p>Next, run a matched test of three real worker boundaries against three Temporal Activities.</p>
       </div>
       <ol>
         <li><span>01</span><p><strong>Same application work</strong>Three no-op handlers versus three no-op regular Activities.</p></li>
@@ -315,9 +315,9 @@
 
   <footer>
     <a class="brand" href="../"><span class="brand-mark" aria-hidden="true">F</span><span><strong>FerricStore</strong><small>Interactive demos</small></span></a>
-    <p>Measured facts · Clear execution models · Honest unknowns</p>
+    <p>Measured facts · Clear execution models · Bounded comparisons</p>
   </footer>
 
-  <script src="./benchmark.js?v=3"></script>
+  <script src="./benchmark.js?v=4"></script>
 </body>
 </html>
