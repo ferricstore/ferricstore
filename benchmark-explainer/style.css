@@ -1041,6 +1041,39 @@ input[type="range"] {
   font-size: 11px;
 }
 
+.latency-step-math {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.latency-step-math > div {
+  padding: 9px 10px;
+  border-top: 1px solid rgba(52, 211, 153, 0.22);
+}
+
+.latency-step-math span,
+.latency-step-math strong {
+  display: block;
+}
+
+.latency-step-math span {
+  color: var(--faint);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.latency-step-math strong {
+  margin-top: 4px;
+  color: var(--green);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
 .ferric-latency {
   border-color: rgba(251, 191, 36, 0.28);
 }
