@@ -10,7 +10,7 @@
   note.innerHTML = gallery
     ? '<span aria-hidden="true">i</span><p><strong>How to read these demos:</strong> Workflow handlers are at-least-once, external effects need guarded execution plus stable idempotency keys, and animated performance/cost figures are illustrative rather than benchmarks.</p><details><summary>Accuracy notes</summary><p>Current workflows use explicit states, durable transitions, leases, fencing, signals, and guarded effects. Data latency, capacity, memory, availability, and cost depend on hardware, topology, settings, and workload.</p></details>'
     : workflowDemo
-      ? '<span aria-hidden="true">i</span><p><strong>Durability boundary:</strong> FerricFlow persists explicit state and fences stale writes. Handlers are at-least-once; guard external calls with <code>ctx.effect(...)</code> and reuse a provider/application idempotency key where supported.</p><details><summary>Current SDK pattern</summary><p>Use <code>client.workflow(...)</code>, <code>@flow.state(...)</code>, <code>transition(...)</code>/<code>complete(...)</code>, durable <code>signal(...)</code>, and <code>job.flow.spawn_children(...)</code>. For a fused immediate step boundary, <code>client.step_continue(...)</code> or <code>ctx.flow.step_continue(...)</code> saves updates, advances the logical state, and returns a fresh running lease/fence. The worker still executes the step. Derive external-operation keys from workflow ID + logical effect + version and reuse the same key across retries. Scenario timings and costs are illustrative, not benchmarks.</p></details>'
+      ? '<span aria-hidden="true">i</span><p><strong>Durability boundary:</strong> FerricFlow persists explicit state and fences stale writes. Durable closures replay committed results; external operations still need a stable provider/application idempotency key for the pre-commit retry window.</p><details><summary>Current SDK pattern</summary><p>Python SDK 0.13.1 supports <code>client.workflow(...)</code>, <code>@flow.state(...)</code>, <code>transition(...)</code>/<code>complete(...)</code>, durable <code>ctx.step(name=..., run=..., to_state=...)</code>, and direct <code>client.step(job, ...)</code>/<code>client.advance(job, ...)</code>. These job-based APIs infer identity, partition, state, lease, and fencing information; do not pass a worker or <code>return_job</code> flag. The worker still executes the closure. Derive external-operation keys from workflow ID + logical operation + version and reuse them across retries. Scenario timings and costs are illustrative, not benchmarks.</p></details>'
       : '<span aria-hidden="true">i</span><p><strong>Illustrative scenario:</strong> Commands and data structures are real FerricStore features. Latency, capacity, availability, memory, and price figures depend on hardware, topology, durability settings, and workload.</p><details><summary>How to read metrics</summary><p>Treat animated numbers as teaching aids, not benchmark results or infrastructure quotes. Validate production claims with a reproducible benchmark on the intended deployment.</p></details>';
 
   var anchor = document.querySelector("nav, .nav, .demo-nav, .topbar");
@@ -27,7 +27,7 @@
     Array.from(new Set(blocks)).forEach(function (block) {
       var previous = block.previousElementSibling;
       var existing = previous && previous.classList.contains("code-accuracy-label") ? previous : null;
-      var conceptual = /(ctx\.step|@client\.workflow|job\.effect|ctx\.sleep|sleep_with_signal|ctx\.parallel|ctx\.circuit_breaker|ctx\.compensate|job\.fanout)/.test(block.textContent);
+      var conceptual = /(@client\.workflow|job\.effect|ctx\.sleep|sleep_with_signal|ctx\.parallel|ctx\.circuit_breaker|ctx\.compensate|job\.fanout)/.test(block.textContent);
       if (!conceptual) {
         if (existing) existing.remove();
         return;
@@ -35,7 +35,7 @@
       if (existing) return;
       var label = document.createElement("div");
       label.className = "code-accuracy-label";
-      label.textContent = "Conceptual pseudocode — current Python SDK uses WorkflowClient, @flow.state, explicit outcomes, and ctx.effect for guarded external calls.";
+      label.textContent = "Conceptual pseudocode — current Python SDK uses WorkflowClient, @flow.state, explicit outcomes, and ctx.step for durable closures.";
       block.insertAdjacentElement("beforebegin", label);
     });
   }

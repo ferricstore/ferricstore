@@ -86,8 +86,8 @@
       if (codeBadge) { codeBadge.textContent = 'VOLATILE LOCK'; codeBadge.style.background = 'rgba(239,68,68,0.25)'; codeBadge.style.color = '#fca5a5'; }
       if (step3Text) step3Text.textContent = 'Race Condition (Double-Book)';
     } else {
-      if (codeTitle) codeTitle.textContent = currentSdk === 'steps' ? 'ticket_continue.py' : 'ticket_fsm.py';
-      if (codeKicker) codeKicker.textContent = currentSdk === 'steps' ? 'FLOW.STEP_CONTINUE API' : 'FERRICSTORE STATES API';
+      if (codeTitle) codeTitle.textContent = currentSdk === 'steps' ? 'ticket_step.py' : 'ticket_fsm.py';
+      if (codeKicker) codeKicker.textContent = currentSdk === 'steps' ? 'DURABLE STEP API' : 'FERRICSTORE STATE HANDLERS';
       if (codeBadge) { codeBadge.textContent = 'DURABLE CART TIMER'; codeBadge.style.background = 'rgba(16,185,129,0.25)'; codeBadge.style.color = '#6ee7b7'; }
       if (step3Text) step3Text.textContent = 'Fenced Seat Handoff';
     }

@@ -105,14 +105,14 @@
           <div class="file-info">
             <span class="file-icon">py</span>
             <div>
-              <h2 id="code-title" data-code-title>ticket_continue.py</h2>
+              <h2 id="code-title" data-code-title>ticket_fsm.py</h2>
               <small data-code-kicker>FERRICSTORE SCHEDULED STATE API</small>
             </div>
           </div>
           <div class="code-controls">
             <div class="sdk-style-toggle" data-sdk-toggle>
-              <button type="button" class="sdk-btn" data-sdk-style="steps">Fused Continue</button>
-              <button type="button" class="sdk-btn is-active" data-sdk-style="states">Current SDK</button>
+              <button type="button" class="sdk-btn" data-sdk-style="steps">Durable Step</button>
+              <button type="button" class="sdk-btn is-active" data-sdk-style="states">State Handlers</button>
             </div>
             <span class="badge-durable" data-code-badge>DURABLE CART TIMER</span>
           </div>
@@ -130,7 +130,7 @@
 <span data-line="9"><b class="ln">9</b><span>    <i class="c"># Both Stripe charges succeed for $280 ➔ DOUBLE BOOKING!</i></span></span>
 <span data-line="10"><b class="ln">10</b><span>    postgres.<i class="fn">execute</i>(<q>"UPDATE seats SET status = 'sold'"</q>)</span></span></code></pre>
 
-        <!-- Code Block: After Mode (Fused continuation) -->
+        <!-- Code Block: After Mode (Durable step) -->
         <pre class="code-block" data-code="after-steps" hidden><code>import time
 from ferricstore import FlowClient
 
@@ -141,18 +141,13 @@ job = client.start_and_claim(
     payload={"seat": "A12", "buyer": "buyer-1"},
 )
 
-hold = seats.hold(
-    job.payload, idempotency_key=f"{job.id}:hold:v1",
-)
-job = client.step_continue(
-    job.id,
-    lease_token=job.lease_token,
-    fencing_token=job.fencing_token,
-    from_state=job.run_state,
+job, hold = client.step(
+    job,
+    name="hold-seat:v1",
+    run=lambda: seats.hold(
+        job.payload, idempotency_key=f"{job.id}:hold:v1",
+    ),
     to_state="persist_hold",
-    values={"hold": hold},
-    worker="checkout-1",
-    return_job=True,
 )
 
 # Timers use a scheduled transition so no worker stays alive for 10 minutes.
@@ -398,7 +393,7 @@ def transfer(ctx):
     </section>
   </main>
 
-  <script src="./ticket.js?v=5"></script>
-  <script src="../shared/accuracy.js?v=9"></script>
+  <script src="./ticket.js?v=6"></script>
+  <script src="../shared/accuracy.js?v=10"></script>
 </body>
 </html>

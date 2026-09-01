@@ -82,8 +82,8 @@
       if (codeKicker) codeKicker.textContent = 'CELERY CHORDS (UNPROTECTED)';
       if (codeBadge) { codeBadge.textContent = 'VOLATILE BARRIER'; codeBadge.style.background = 'rgba(239,68,68,0.2)'; codeBadge.style.color = '#fca5a5'; }
     } else {
-      if (codeTitle) codeTitle.textContent = currentSdk === 'steps' ? 'transcode_continue.py' : 'transcode_fsm.py';
-      if (codeKicker) codeKicker.textContent = currentSdk === 'steps' ? 'FLOW.STEP_CONTINUE API' : 'FERRICSTORE STATES API';
+      if (codeTitle) codeTitle.textContent = currentSdk === 'steps' ? 'transcode_step.py' : 'transcode_fsm.py';
+      if (codeKicker) codeKicker.textContent = currentSdk === 'steps' ? 'DURABLE STEP API' : 'FERRICSTORE STATE HANDLERS';
       if (codeBadge) { codeBadge.textContent = 'DURABLE PARALLEL'; codeBadge.style.background = 'rgba(16,185,129,0.15)'; codeBadge.style.color = '#34d399'; }
     }
   }

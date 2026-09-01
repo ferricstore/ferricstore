@@ -146,7 +146,7 @@
           </div>
         </article>
 
-        <!-- RIGHT: WITH FERRICSTORE (FUSED CONTINUE & STATES API TOGGLE) -->
+        <!-- RIGHT: WITH FERRICSTORE (DURABLE STEP & STATE HANDLERS TOGGLE) -->
         <article class="arena-card good" data-card-right>
           <div class="arena-head">
             <div class="arena-title-wrap">
@@ -156,11 +156,11 @@
             <span class="status-pill good" data-right-status-pill>Committed</span>
           </div>
 
-          <!-- SDK Paradigm Switcher (fused continuation vs. state handlers) -->
+          <!-- SDK Paradigm Switcher (durable closure vs. state handlers) -->
           <div class="api-switcher-bar">
             <button type="button" class="api-toggle" data-api-mode="steps">
-              <span>Fused Continue</span>
-              <small>Real FLOW.STEP_CONTINUE command</small>
+              <span>Durable Step</span>
+              <small>Closure result + state committed together</small>
             </button>
             <button type="button" class="api-toggle is-active" data-api-mode="states">
               <span>🔀 States API</span>
@@ -170,7 +170,7 @@
 
           <!-- Code Snippet with safety highlights -->
           <div class="code-box">
-            <pre><code data-right-code-content># Real fused step boundary
+            <pre><code data-right-code-content># Durable closure + state boundary
 from ferricstore import FlowClient
 
 client = FlowClient.from_url("ferric://127.0.0.1:6388")
@@ -179,18 +179,16 @@ job = client.start_and_claim(
     initial_state="charge", worker="checkout-1",
 )
 
-# Use a stable provider key: STEP_CONTINUE does not dedupe Stripe.
-charge = stripe.Charge.create(
-    amount=15000, idempotency_key=f"{job.id}:charge:v1",
-)
-job = client.step_continue(
-    job.id,
-    lease_token=job.lease_token,
-    fencing_token=job.fencing_token,
-    from_state=job.run_state,
+# The closure may retry before its result commits, so keep this key stable.
+job, charge = client.step(
+    job,
+    name="charge-customer:v1",
+    run=lambda: {
+        "id": stripe.Charge.create(
+            amount=15000, idempotency_key=f"{job.id}:charge:v1",
+        ).id,
+    },
     to_state="reserve",
-    values={"tx_id": charge.id},
-    return_job=True,
 )</code></pre>
           </div>
 
@@ -352,7 +350,7 @@ job = client.step_continue(
             <tr>
               <th>Operation / Workload</th>
               <th>Without FerricStore (Naive Script)</th>
-              <th>Fused <code>STEP_CONTINUE</code></th>
+              <th>Durable <code>step()</code></th>
               <th>States API (@flow.state)</th>
               <th>Required effect protection</th>
             </tr>
@@ -392,7 +390,7 @@ job = client.step_continue(
     </section>
   </main>
 
-  <script src="./determinism.js?v=5"></script>
-  <script src="../shared/accuracy.js?v=9"></script>
+  <script src="./determinism.js?v=6"></script>
+  <script src="../shared/accuracy.js?v=10"></script>
 </body>
 </html>

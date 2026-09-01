@@ -130,6 +130,8 @@
 
   var declinedToggle = document.querySelector("[data-declined-toggle]");
   var successToggle = document.querySelector("[data-success-toggle]");
+  var codeExampleTabs = document.querySelectorAll("[data-code-example-tab]");
+  var codeExamples = document.querySelectorAll("[data-code-example]");
 
   function render() {
     var data = stepsData[currentStep];
@@ -258,6 +260,20 @@
       schedule();
     });
   }
+
+  codeExampleTabs.forEach(function (tab) {
+    tab.addEventListener("click", function () {
+      var selected = tab.getAttribute("data-code-example-tab");
+      codeExampleTabs.forEach(function (candidate) {
+        var active = candidate === tab;
+        candidate.classList.toggle("is-active", active);
+        candidate.setAttribute("aria-selected", active ? "true" : "false");
+      });
+      codeExamples.forEach(function (example) {
+        example.hidden = example.getAttribute("data-code-example") !== selected;
+      });
+    });
+  });
 
   render();
   schedule();

@@ -87,8 +87,8 @@
       if (codeKicker) codeKicker.textContent = 'BLIND WHILE-TRUE (UNPROTECTED)';
       if (codeBadge) { codeBadge.textContent = 'NO GUARDS'; codeBadge.style.background = 'rgba(239,68,68,0.25)'; codeBadge.style.color = '#fca5a5'; }
     } else {
-      if (codeTitle) codeTitle.textContent = currentSdk === 'steps' ? 'agent_continue.py' : 'agent_fsm.py';
-      if (codeKicker) codeKicker.textContent = currentSdk === 'steps' ? 'FLOW.STEP_CONTINUE API' : 'FERRICSTORE STATES API';
+      if (codeTitle) codeTitle.textContent = currentSdk === 'steps' ? 'agent_step.py' : 'agent_fsm.py';
+      if (codeKicker) codeKicker.textContent = currentSdk === 'steps' ? 'DURABLE STEP API' : 'FERRICSTORE STATE HANDLERS';
       if (codeBadge) { codeBadge.textContent = 'BUDGET + BREAKER'; codeBadge.style.background = 'rgba(16,185,129,0.25)'; codeBadge.style.color = '#6ee7b7'; }
     }
   }

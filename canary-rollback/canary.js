@@ -88,8 +88,8 @@
       if (codeBadge) { codeBadge.textContent = 'VOLATILE SCRIPT'; codeBadge.style.background = 'rgba(239,68,68,0.25)'; codeBadge.style.color = '#fca5a5'; }
       if (step3Text) step3Text.textContent = 'Broken Canary Stuck Live';
     } else {
-      if (codeTitle) codeTitle.textContent = currentSdk === 'steps' ? 'canary_continue.py' : 'canary_fsm.py';
-      if (codeKicker) codeKicker.textContent = currentSdk === 'steps' ? 'FLOW.STEP_CONTINUE API' : 'FERRICSTORE STATES API';
+      if (codeTitle) codeTitle.textContent = currentSdk === 'steps' ? 'canary_step.py' : 'canary_fsm.py';
+      if (codeKicker) codeKicker.textContent = currentSdk === 'steps' ? 'DURABLE STEP API' : 'FERRICSTORE STATE HANDLERS';
       if (codeBadge) { codeBadge.textContent = 'DURABLE CANARY'; codeBadge.style.background = 'rgba(16,185,129,0.25)'; codeBadge.style.color = '#6ee7b7'; }
       if (step3Text) step3Text.textContent = 'Datadog 5xx ➔ rollback state';
     }

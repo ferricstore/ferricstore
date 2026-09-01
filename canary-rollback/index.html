@@ -105,14 +105,14 @@
           <div class="file-info">
             <span class="file-icon">py</span>
             <div>
-              <h2 id="code-title" data-code-title>canary_continue.py</h2>
+              <h2 id="code-title" data-code-title>canary_fsm.py</h2>
               <small data-code-kicker>FERRICSTORE STATE + SIGNAL API</small>
             </div>
           </div>
           <div class="code-controls">
             <div class="sdk-style-toggle" data-sdk-toggle>
-              <button type="button" class="sdk-btn" data-sdk-style="steps">Fused Continue</button>
-              <button type="button" class="sdk-btn is-active" data-sdk-style="states">Current SDK</button>
+              <button type="button" class="sdk-btn" data-sdk-style="steps">Durable Step</button>
+              <button type="button" class="sdk-btn is-active" data-sdk-style="states">State Handlers</button>
             </div>
             <span class="badge-durable" data-code-badge>DURABLE CANARY</span>
           </div>
@@ -131,7 +131,7 @@
 <span data-line="10"><b class="ln">10</b><span>    time.<i class="fn">sleep</i>(86400)</span></span>
 <span data-line="11"><b class="ln">11</b><span>    envoy.<i class="fn">set_weight</i>(<q>"v2.4.0"</q>, 100)</span></span></code></pre>
 
-        <!-- Code Block: After Mode (Fused continuation) -->
+        <!-- Code Block: After Mode (Durable step) -->
         <pre class="code-block" data-code="after-steps" hidden><code>import time
 from ferricstore import FlowClient
 
@@ -141,17 +141,14 @@ job = client.start_and_claim(
     initial_state="route_canary", worker="deployer-1",
 )
 
-# Run one step, then atomically persist its result and keep working.
-route = envoy.set_weight("v2.4.0", 10, request_id=f"{job.id}:route-10:v1")
-job = client.step_continue(
-    job.id,
-    lease_token=job.lease_token,
-    fencing_token=job.fencing_token,
-    from_state=job.run_state,
+# Run one durable closure, commit its result, and keep working.
+job, route = client.step(
+    job,
+    name="route-canary-10:v1",
+    run=lambda: envoy.set_weight(
+        "v2.4.0", 10, request_id=f"{job.id}:route-10:v1",
+    ),
     to_state="capture_baseline",
-    values={"route": route},
-    worker="deployer-1",
-    return_job=True,
 )
 
 # A 24-hour wait should park the flow and release the worker lease.
@@ -464,7 +461,7 @@ client.signal(
     </section>
   </main>
 
-  <script src="./canary.js?v=5"></script>
-  <script src="../shared/accuracy.js?v=9"></script>
+  <script src="./canary.js?v=6"></script>
+  <script src="../shared/accuracy.js?v=10"></script>
 </body>
 </html>

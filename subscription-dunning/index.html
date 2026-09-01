@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>SaaS Subscription & Time-Travel Dunning | FerricStore Demos</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css?v=2">
+  <link rel="stylesheet" href="./style.css?v=3">
   <link rel="stylesheet" href="../shared/polish.css">
   <link rel="stylesheet" href="../shared/accuracy.css?v=5">
 </head>
@@ -162,10 +162,73 @@
       </footer>
     </section>
 
-    <!-- Python Code Example -->
-    <section style="margin-bottom: 60px;">
-      <h3 style="font-size: 20px; margin-bottom: 12px;">FerricStore Python SDK: Clean Multi-Day Subscriptions</h3>
-      <pre style="background: #080614; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 20px; font-family: var(--font-mono); font-size: 13px; color: #e2e8f0; overflow-x: auto;"><code># Fused immediate step + durable multi-day timer
+    <!-- Python Code Examples -->
+    <section class="code-example-section">
+      <div class="code-example-heading">
+        <div>
+          <span>PYTHON SDK 0.13.1</span>
+          <h3>Clean Multi-Day Subscriptions</h3>
+        </div>
+        <div class="code-example-tabs" role="tablist" aria-label="Python SDK example style">
+          <button type="button" role="tab" aria-selected="true" class="is-active" data-code-example-tab="states">State Handlers</button>
+          <button type="button" role="tab" aria-selected="false" data-code-example-tab="steps">Durable Step</button>
+        </div>
+      </div>
+
+      <pre class="sdk-code-block" data-code-example="states"><code># State handlers keep the refreshed claim inside ctx
+import time
+from ferricstore import WorkflowClient, complete, transition
+
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
+billing = client.workflow(type="saas-subscription", initial_state="welcome")
+
+@billing.state("welcome")
+def welcome(ctx):
+    ctx.step(
+        name="welcome-email:v1",
+        run=lambda: email.send_welcome(
+            ctx.payload["user_id"],
+            idempotency_key=f"{ctx.id}:welcome:v1",
+        ),
+        to_state="welcome_sent",
+    )
+    # Persist the wait and release the worker until Day 14.
+    return transition(
+        "pre_billing_warning",
+        run_at_ms=int(time.time() * 1000) + 14 * 86_400_000,
+    )
+
+@billing.state("pre_billing_warning")
+def pre_billing_warning(ctx):
+    ctx.step(
+        name="warning-email:v1",
+        run=lambda: email.send_warning(
+            ctx.payload["user_id"],
+            idempotency_key=f"{ctx.id}:warning:v1",
+        ),
+        to_state="warning_sent",
+    )
+    return transition(
+        "charge",
+        run_at_ms=int(time.time() * 1000) + 86_400_000,
+    )
+
+@billing.state("charge")
+def charge(ctx):
+    payment = ctx.step(
+        name="invoice:2026-09:v1",
+        run=lambda: stripe.charge(
+            9900,
+            idempotency_key=f"{ctx.id}:invoice:2026-09:v1",
+        ),
+        to_state="charge_recorded",
+    )
+    return complete(result=payment)
+
+billing.start("sub-user-42", payload={"user_id": "user-42"})
+billing.worker().run()</code></pre>
+
+      <pre class="sdk-code-block" data-code-example="steps" hidden><code># Direct durable-step API for a custom claim loop
 import time
 from ferricstore import FlowClient
 
@@ -176,22 +239,19 @@ job = client.start_and_claim(
     payload={"user_id": "user-42"},
 )
 
-email.send_welcome(
-    job.payload["user_id"], idempotency_key=f"{job.id}:welcome:v1",
+# The closure result and next state are committed together. The returned job
+# carries the refreshed lease and fence required for the next operation.
+job, _ = client.step(
+    job,
+    name="welcome-email:v1",
+    run=lambda: email.send_welcome(
+        job.payload["user_id"],
+        idempotency_key=f"{job.id}:welcome:v1",
+    ),
+    to_state="welcome_sent",
 )
 
-# Save the completed step and continue immediately with a fresh lease + fence.
-job = client.step_continue(
-    job.id,
-    lease_token=job.lease_token,
-    fencing_token=job.fencing_token,
-    from_state=job.run_state,
-    to_state="schedule_warning",
-    worker="billing-1",
-    return_job=True,
-)
-
-# Park until day 14; no Python process or worker lease stays alive.
+# Park until Day 14; no Python process or worker lease stays alive.
 client.transition(
     job.id,
     lease_token=job.lease_token,
@@ -202,7 +262,7 @@ client.transition(
 )</code></pre>
     </section>
   </main>
-  <script src="./dunning.js?v=5"></script>
-  <script src="../shared/accuracy.js?v=9"></script>
+  <script src="./dunning.js?v=6"></script>
+  <script src="../shared/accuracy.js?v=10"></script>
 </body>
 </html>

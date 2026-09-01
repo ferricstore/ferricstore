@@ -2,11 +2,11 @@
   'use strict';
 
   var currentScenario = 'double-charge';
-  var currentApiMode = 'states'; // 'steps' shows the real fused continuation API
+  var currentApiMode = 'states'; // 'steps' shows the durable closure API
   var isAnimating = false;
   var animTimeouts = [];
 
-  var doubleChargeContinueCode = `# ✓ REAL FUSED STEP: persist output + advance + renew ownership
+  var doubleChargeContinueCode = `# ✓ DURABLE STEP: journal result + advance + renew ownership
 from ferricstore import FlowClient
 
 client = FlowClient.from_url("ferric://127.0.0.1:6388")
@@ -16,24 +16,21 @@ job = client.start_and_claim(
     payload={"amount": 15000},
 )
 
-# STEP_CONTINUE does not make Stripe exactly-once. Keep this key stable.
-charge = stripe.Charge.create(
-    amount=job.payload["amount"],
-    idempotency_key=f"{job.id}:charge:v1",
-)
-job = client.step_continue(
-    job.id,
-    lease_token=job.lease_token,
-    fencing_token=job.fencing_token,
-    from_state=job.run_state,
+# The closure may retry before its result commits. Keep this provider key stable.
+job, charge = client.step(
+    job,
+    name="charge-customer:v1",
+    run=lambda: {
+        "id": stripe.Charge.create(
+            amount=job.payload["amount"],
+            idempotency_key=f"{job.id}:charge:v1",
+        ).id,
+    },
     to_state="reserve",
-    values={"tx_id": charge.id},
-    worker="checkout-1",
-    return_job=True,
 )
 # job now carries the fresh lease + fence for the next step.`;
 
-  var llmContinueCode = `# ✓ REAL FUSED STEP: save the expensive result before rendering
+  var llmContinueCode = `# ✓ DURABLE STEP: save the expensive result before rendering
 from ferricstore import FlowClient
 
 client = FlowClient.from_url("ferric://127.0.0.1:6388")
@@ -43,24 +40,18 @@ job = client.start_and_claim(
     payload={"prompt": "Summarize the launch research"},
 )
 
-# Application guard: the same operation_id returns the same stored result.
-summary = llm.generate_once(
-    operation_id=f"{job.id}:query:v1",
-    prompt=job.payload["prompt"],
-)
-job = client.step_continue(
-    job.id,
-    lease_token=job.lease_token,
-    fencing_token=job.fencing_token,
-    from_state=job.run_state,
+job, summary = client.step(
+    job,
+    name="generate-summary:v1",
+    run=lambda: llm.generate_once(
+        operation_id=f"{job.id}:query:v1",
+        prompt=job.payload["prompt"],
+    ),
     to_state="render_pdf",
-    values={"summary": summary},
-    worker="agent-1",
-    return_job=True,
 )
 # A crash after this command resumes at render_pdf, not query.`;
 
-  var inventoryContinueCode = `# ✓ REAL FUSED STEP: durable state plus an idempotent SQL mutation
+  var inventoryContinueCode = `# ✓ DURABLE STEP: journal result plus an idempotent SQL mutation
 from ferricstore import FlowClient
 
 client = FlowClient.from_url("ferric://127.0.0.1:6388")
@@ -70,20 +61,15 @@ job = client.start_and_claim(
     payload={"sku": "SKU-849", "qty": 1},
 )
 
-# The database must deduplicate this mutation ID if the worker retries.
-remaining = postgres.decrement_once(
-    mutation_id=f"{job.id}:decrement:v1",
-    sku=job.payload["sku"], qty=job.payload["qty"],
-)
-job = client.step_continue(
-    job.id,
-    lease_token=job.lease_token,
-    fencing_token=job.fencing_token,
-    from_state=job.run_state,
+# The database must deduplicate this mutation ID if the closure retries.
+job, remaining = client.step(
+    job,
+    name="decrement-inventory:v1",
+    run=lambda: postgres.decrement_once(
+        mutation_id=f"{job.id}:decrement:v1",
+        sku=job.payload["sku"], qty=job.payload["qty"],
+    ),
     to_state="send_email",
-    values={"remaining": remaining},
-    worker="warehouse-1",
-    return_job=True,
 )`;
 
   var scenarios = {
@@ -106,7 +92,7 @@ job = client.step_continue(
       naiveBilled: '$300.00',
       ferricBilled: '$150.00',
       divergence: 'Stale writes fenced',
-      replayStepsText: `<span>FLOW.STEP_CONTINUE resumes from the committed next state.</span><br><span>The stable Stripe key separately prevents a repeated charge.</span>`,
+      replayStepsText: `<span>step() replays the committed result and resumes from the next state.</span><br><span>The stable Stripe key separately prevents a repeated charge before commit.</span>`,
       replayStatesText: `<span>⚡ FSM State Machine: States "charge" &amp; "reserve" already committed in Raft log.</span><br><span>⚡ Replacement worker loads state "send_receipt" after reclaim.</span><br><span>✉️ State "send_receipt": Dispatches receipt and calls complete()!</span>`
     },
     'llm-tokens': {
@@ -128,7 +114,7 @@ job = client.step_continue(
       naiveBilled: '8,000 Tokens',
       ferricBilled: '4,000 Tokens',
       divergence: 'Stale writes fenced',
-      replayStepsText: `<span>FLOW.STEP_CONTINUE resumes at render_pdf with the stored summary.</span><br><span>An application guard separately prevents repeated model spend.</span>`,
+      replayStepsText: `<span>step() resumes at render_pdf with the stored summary.</span><br><span>The stable operation ID protects the pre-commit retry window.</span>`,
       replayStatesText: `<span>⚡ FSM Replay: States "ai_query" &amp; "render_pdf" already committed in Raft log.</span><br><span>⚡ Replacement worker resumes at "send_email" after reclaim.</span><br><span>✉️ Completed without burning duplicate LLM tokens!</span>`
     },
     'inventory-lock': {
@@ -150,7 +136,7 @@ job = client.step_continue(
       naiveBilled: 'Stock: 8 (Bug)',
       ferricBilled: 'Stock: 9 (Exact)',
       divergence: 'Stale writes fenced',
-      replayStepsText: `<span>FLOW.STEP_CONTINUE resumes at send_email.</span><br><span>The database mutation ID separately prevents a second decrement.</span>`,
+      replayStepsText: `<span>step() resumes at send_email with the stored result.</span><br><span>The database mutation ID separately prevents a second decrement before commit.</span>`,
       replayStatesText: `<span>⚡ FSM Replay: State "decrement" sealed in Raft log.</span><br><span>⚡ Replacement worker resumes at "send_email" after reclaim.</span><br><span>✉️ Inventory count protected from double-decrement!</span>`
     }
   };
@@ -217,7 +203,7 @@ job = client.step_continue(
     if (scenTitle) scenTitle.textContent = data.title;
     if (leftCodeEl) leftCodeEl.innerHTML = data.leftCode;
     if (rightCodeEl) rightCodeEl.innerHTML = currentApiMode === 'steps' ? data.stepsCode : data.statesCode;
-    if (rightTitle) rightTitle.textContent = currentApiMode === 'steps' ? 'Fused Step Continue' : 'Durable SDK (States API - FSM)';
+    if (rightTitle) rightTitle.textContent = currentApiMode === 'steps' ? 'Durable Step Closure' : 'Durable SDK (State Handlers)';
   }
 
   function resetToInitialState() {
@@ -514,7 +500,7 @@ job = client.step_continue(
       btn.classList.add('is-active');
       currentApiMode = btn.getAttribute('data-api-mode') || 'states';
       renderScenarioDetails();
-      log('info', 'Switched view to: ' + (currentApiMode === 'steps' ? 'Real FLOW.STEP_CONTINUE' : 'Current States API (@flow.state FSM)'));
+      log('info', 'Switched view to: ' + (currentApiMode === 'steps' ? 'Durable step() closure' : 'State handlers (@flow.state FSM)'));
     });
   });
 

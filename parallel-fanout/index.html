@@ -105,14 +105,14 @@
           <div class="file-info">
             <span class="file-icon">py</span>
             <div>
-              <h2 id="code-title" data-code-title>transcode_continue.py</h2>
+              <h2 id="code-title" data-code-title>transcode_fsm.py</h2>
               <small data-code-kicker>FERRICSTORE CHILD FLOW API</small>
             </div>
           </div>
           <div class="code-controls">
             <div class="sdk-style-toggle" data-sdk-toggle>
-              <button type="button" class="sdk-btn" data-sdk-style="steps">Fused Continue</button>
-              <button type="button" class="sdk-btn is-active" data-sdk-style="states">Current SDK</button>
+              <button type="button" class="sdk-btn" data-sdk-style="steps">Durable Step</button>
+              <button type="button" class="sdk-btn is-active" data-sdk-style="states">State Handlers</button>
             </div>
             <span class="badge-durable" data-code-badge>DURABLE PARALLEL</span>
           </div>
@@ -130,7 +130,7 @@
 <span data-line="9"><b class="ln">9</b><span>    <i class="c"># ❌ 15 completed chunks discarded from memory. Entire job restarts!</i></span></span>
 <span data-line="10"><b class="ln">10</b><span>    <i class="k">return</i> <i class="fn">chord</i>(header)(callback)</span></span></code></pre>
 
-        <!-- Code Block: After Mode (Fused continuation) -->
+        <!-- Code Block: After Mode (Durable step) -->
         <pre class="code-block" data-code="after-steps" hidden><code>from ferricstore import FlowClient
 
 client = FlowClient.from_url("ferric://127.0.0.1:6388")
@@ -139,20 +139,15 @@ job = client.start_and_claim(
     initial_state="render", worker="gpu-9", payload={"chunk": 9},
 )
 
-# The worker runs the step. Then FerricStore durably saves its output,
-# advances the logical state, and returns a fresh running lease + fence.
-rendered = render_chunk_once(
-    job.payload["chunk"], operation_id=f"{job.id}:render:v1",
-)
-job = client.step_continue(
-    job.id,
-    lease_token=job.lease_token,
-    fencing_token=job.fencing_token,
-    from_state=job.run_state,
+# The closure result and state change commit together. The returned job
+# carries the refreshed lease + fence for immediate continuation.
+job, rendered = client.step(
+    job,
+    name="render-chunk:v1",
+    run=lambda: render_chunk_once(
+        job.payload["chunk"], operation_id=f"{job.id}:render:v1",
+    ),
     to_state="ready_to_stitch",
-    values={"rendered": rendered},
-    worker="gpu-9",
-    return_job=True,
 )</code></pre>
 
         <!-- Code Block: After Mode (States) -->
@@ -334,7 +329,7 @@ def stitch(job):
     </section>
   </main>
 
-  <script src="./fanout.js?v=5"></script>
-  <script src="../shared/accuracy.js?v=9"></script>
+  <script src="./fanout.js?v=6"></script>
+  <script src="../shared/accuracy.js?v=10"></script>
 </body>
 </html>

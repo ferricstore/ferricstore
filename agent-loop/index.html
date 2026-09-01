@@ -105,14 +105,14 @@
           <div class="file-info">
             <span class="file-icon">py</span>
             <div>
-              <h2 id="code-title" data-code-title>agent_continue.py</h2>
+              <h2 id="code-title" data-code-title>agent_fsm.py</h2>
               <small data-code-kicker>FERRICSTORE BUDGET + EFFECT API</small>
             </div>
           </div>
           <div class="code-controls">
             <div class="sdk-style-toggle" data-sdk-toggle>
-              <button type="button" class="sdk-btn" data-sdk-style="steps">Fused Continue</button>
-              <button type="button" class="sdk-btn is-active" data-sdk-style="states">Current SDK</button>
+              <button type="button" class="sdk-btn" data-sdk-style="steps">Durable Step</button>
+              <button type="button" class="sdk-btn is-active" data-sdk-style="states">State Handlers</button>
             </div>
             <span class="badge-durable" data-code-badge>BUDGET + BREAKER</span>
           </div>
@@ -128,7 +128,7 @@
 <span data-line="7"><b class="ln">7</b><span>    <i class="c"># 💥 Worker crashes on turn 8 ➔ All memory wiped from RAM!</i></span></span>
 <span data-line="8"><b class="ln">8</b><span>    memory.<i class="fn">append</i>(result)</span></span></code></pre>
 
-        <!-- Code Block: After Mode (Fused continuation) -->
+        <!-- Code Block: After Mode (Durable step) -->
         <pre class="code-block" data-code="after-steps" hidden><code>from ferricstore import FlowClient
 
 client = FlowClient.from_url("ferric://127.0.0.1:6388")
@@ -139,21 +139,14 @@ job = client.start_and_claim(
     values={"turn": 1, "spent_cents": 0},
 )
 
-# The worker performs one guarded agent turn.
-turn = agent.execute(
-    job.payload["query"], idempotency_key=f"{job.id}:turn:1:v1",
-)
-
-# STEP_CONTINUE is the durable boundary between plan and observe.
-job = client.step_continue(
-    job.id,
-    lease_token=job.lease_token,
-    fencing_token=job.fencing_token,
-    from_state=job.run_state,
+# Persist one guarded agent turn and advance atomically.
+job, turn = client.step(
+    job,
+    name="agent-turn:1:v1",
+    run=lambda: agent.execute(
+        job.payload["query"], idempotency_key=f"{job.id}:turn:1:v1",
+    ).to_dict(),
     to_state="observe",
-    values={"memory": turn.memory, "spent_cents": turn.cost_cents},
-    worker="agent-1",
-    return_job=True,
 )
 
 # The same worker may continue immediately using the fresh lease + fence.
@@ -389,7 +382,7 @@ def turn(ctx):
     </section>
   </main>
 
-  <script src="./loop.js?v=5"></script>
-  <script src="../shared/accuracy.js?v=9"></script>
+  <script src="./loop.js?v=6"></script>
+  <script src="../shared/accuracy.js?v=10"></script>
 </body>
 </html>

@@ -187,7 +187,7 @@
     <!-- Python Code Example -->
     <section style="margin-bottom: 60px;">
       <h3 style="font-size: 20px; margin-bottom: 12px;">FerricStore Python SDK: Stream Rate-Limiting</h3>
-      <pre style="background: #080614; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 20px; font-family: var(--font-mono); font-size: 13px; color: #e2e8f0; overflow-x: auto;"><code># Real rate-limit command + fused pipeline continuation
+      <pre style="background: #080614; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 20px; font-family: var(--font-mono); font-size: 13px; color: #e2e8f0; overflow-x: auto;"><code># Real rate-limit command + durable pipeline continuation
 import time
 from ferricstore import FlowClient
 
@@ -211,23 +211,18 @@ if not limit.allowed:
         run_at_ms=int(time.time() * 1000) + limit.reset_ms,
     )
 else:
-    summary = ai.categorize_once(
-        operation_id=f"{job.id}:categorize:v1",
-        prompt=job.payload["prompt"],
-    )
-    client.step_continue(
-        job.id,
-        lease_token=job.lease_token,
-        fencing_token=job.fencing_token,
-        from_state=job.run_state,
+    job, summary = client.step(
+        job,
+        name="categorize-product:v1",
+        run=lambda: ai.categorize_once(
+            operation_id=f"{job.id}:categorize:v1",
+            prompt=job.payload["prompt"],
+        ),
         to_state="flush",
-        values={"summary": summary},
-        worker="stream-1",
-        return_job=True,
     )</code></pre>
     </section>
   </main>
   <script src="./stream.js?v=4"></script>
-  <script src="../shared/accuracy.js?v=9"></script>
+  <script src="../shared/accuracy.js?v=10"></script>
 </body>
 </html>
