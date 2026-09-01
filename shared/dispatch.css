@@ -504,13 +504,114 @@ body.fs-dispatch[data-fs-demo="workflow-explainer"] .scenario-badge .badge-label
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .node-sub { color: var(--fs-muted) !important; }
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .sms-push-box,
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .sms-push-box * { color: #742b25 !important; }
-body.fs-dispatch[data-fs-demo="workflow-explainer"] .node-emoji,
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .sms-icon { display: none !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .workflow-icon-sprite {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .node-circle {
+  width: 60px !important;
+  height: 60px !important;
   border: 1px solid var(--fs-ink) !important;
   border-radius: 3px !important;
   background: var(--fs-paper-bright) !important;
   box-shadow: none !important;
+  color: var(--fs-ink-soft) !important;
+  transform: none !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .node-icon {
+  width: 28px;
+  height: 28px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+  vector-effect: non-scaling-stroke;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .stations-list { gap: 14px; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item {
+  min-width: 116px;
+  padding: 8px 6px 10px;
+  border-radius: 4px;
+  outline: none;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item:focus-visible {
+  outline: 3px solid var(--fs-signal-ink);
+  outline-offset: 3px;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .node-badge {
+  right: -5px;
+  bottom: -5px;
+  width: 21px;
+  height: 21px;
+  border: 1px solid var(--fs-ink) !important;
+  border-radius: 2px !important;
+  background: var(--fs-ink) !important;
+  color: var(--fs-paper-bright) !important;
+  font-size: var(--fs-type-micro) !important;
+  letter-spacing: 0 !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .node-title {
+  margin-top: 2px;
+  color: var(--fs-ink) !important;
+  font-size: 15px !important;
+  line-height: 1.35 !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .node-sub {
+  color: var(--fs-muted) !important;
+  font-size: 13px !important;
+  line-height: 1.4 !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .stepper-rail {
+  height: 3px;
+  background: var(--fs-line-soft) !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .stepper-fill-line {
+  background: var(--fs-signal-ink) !important;
+  background-image: none !important;
+  box-shadow: none !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .stepper-fill-line[data-state="risk"] { background: #745800 !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .stepper-fill-line[data-state="failure"] { background: #8f2f3d !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .stepper-fill-line[data-state="success"] { background: var(--fs-green) !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-active {
+  background: var(--fs-strip);
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-risk .node-circle,
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-unsafe .node-circle {
+  border-color: var(--fs-yellow) !important;
+  background: #f7f1db !important;
+  color: #745800 !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-risk .node-badge,
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-unsafe .node-badge {
+  border-color: #745800 !important;
+  background: #745800 !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-failure .node-circle {
+  border-color: #8f2f3d !important;
+  background: #fbf1f2 !important;
+  color: #8f2f3d !important;
+  animation: none !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-failure .node-badge {
+  border-color: #8f2f3d !important;
+  background: #8f2f3d !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-success .node-circle,
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-committed .node-circle {
+  border-color: var(--fs-green) !important;
+  background: #edf6f1 !important;
+  color: var(--fs-green) !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-success .node-badge,
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-committed .node-badge {
+  border-color: var(--fs-green) !important;
+  background: var(--fs-green) !important;
 }
 
 body.fs-dispatch[data-fs-demo="split-lab"] .workflow-actions { display: none !important; }

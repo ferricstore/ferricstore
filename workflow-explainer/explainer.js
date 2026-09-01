@@ -209,7 +209,6 @@
   var st4Title = document.querySelector("[data-st-4-title]");
   var st4Sub = document.querySelector("[data-st-4-sub]");
   var st5Icon = document.querySelector("[data-st-5-icon]");
-  var st5Badge = document.querySelector("[data-st-5-badge]");
   var st5Title = document.querySelector("[data-st-5-title]");
   var st5Sub = document.querySelector("[data-st-5-sub]");
 
@@ -222,20 +221,18 @@
 
   function updateDynamicLabels() {
     if (mode === "after") {
-      if (st4Icon) st4Icon.textContent = "🛡️";
-      if (st4Title) st4Title.textContent = "4. Durable Resume";
+      if (st4Icon) st4Icon.setAttribute("href", "#wf-icon-resume");
+      if (st4Title) st4Title.textContent = "Durable Resume";
       if (st4Sub) st4Sub.textContent = "0 Duplicate Work";
-      if (st5Icon) st5Icon.textContent = "🎉";
-      if (st5Badge) st5Badge.textContent = "✓";
-      if (st5Title) st5Title.textContent = "5. Exact $150";
+      if (st5Icon) st5Icon.setAttribute("href", "#wf-icon-complete");
+      if (st5Title) st5Title.textContent = "Exact $150";
       if (st5Sub) st5Sub.textContent = "Happy Customer";
     } else {
-      if (st4Icon) st4Icon.textContent = "🔄";
-      if (st4Title) st4Title.textContent = "4. Full Restart";
+      if (st4Icon) st4Icon.setAttribute("href", "#wf-icon-restart");
+      if (st4Title) st4Title.textContent = "Full Restart";
       if (st4Sub) st4Sub.textContent = "Repeats Step 1 & 2";
-      if (st5Icon) st5Icon.textContent = "⚠️";
-      if (st5Badge) st5Badge.textContent = "⚠️";
-      if (st5Title) st5Title.textContent = "5. $300 Penalty";
+      if (st5Icon) st5Icon.setAttribute("href", "#wf-icon-penalty");
+      if (st5Title) st5Title.textContent = "$300 Penalty";
       if (st5Sub) st5Sub.textContent = "Double Billed!";
     }
   }
@@ -260,11 +257,23 @@
       var isActive = idx === currentStep;
       node.classList.toggle("is-done", isDone);
       node.classList.toggle("is-active", isActive);
+      node.classList.toggle("is-unsafe", mode === "before" && isDone);
+      node.classList.toggle("is-committed", mode === "after" && isDone);
+      node.classList.toggle("is-risk", mode === "before" && isActive && currentStep < 2);
+      node.classList.toggle("is-failure", mode === "before" && isActive && currentStep >= 2);
+      node.classList.toggle("is-success", mode === "after" && isActive);
+      node.setAttribute("aria-pressed", String(isActive));
+      if (isActive) node.setAttribute("aria-current", "step");
+      else node.removeAttribute("aria-current");
+      var nodeTitle = node.querySelector(".node-title");
+      var nodeSub = node.querySelector(".node-sub");
+      node.setAttribute("aria-label", (nodeTitle ? nodeTitle.textContent : "Stage " + (idx + 1)) + (nodeSub ? ". " + nodeSub.textContent : ""));
     });
 
     // Progress Line Fill
     if (progressFill) {
       progressFill.style.width = (currentStep * 25) + "%";
+      progressFill.dataset.state = mode === "after" ? "success" : (currentStep < 2 ? "risk" : "failure");
     }
 
     // Moving Package Box

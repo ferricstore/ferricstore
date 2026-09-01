@@ -8,7 +8,7 @@
   <meta name="description" content="A simple, visual explanation of what durable workflows are, the pain of unexpected crashes (double-billing, lost orders), and how FerricStore provides video game save points for real-world software.">
   <link rel="stylesheet" href="./style.css">
   <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=11">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=12">
 </head>
 <body class="fs-dispatch">
   <!--
@@ -91,61 +91,93 @@
         </div>
       </header>
 
+      <svg class="workflow-icon-sprite" aria-hidden="true" focusable="false">
+        <defs>
+          <symbol id="wf-icon-card" viewBox="0 0 24 24">
+            <rect x="3" y="5" width="18" height="14" rx="2"></rect>
+            <path d="M3 10h18M7 15h4"></path>
+          </symbol>
+          <symbol id="wf-icon-stock" viewBox="0 0 24 24">
+            <path d="m4 7 8-4 8 4-8 4-8-4Z"></path>
+            <path d="M4 7v10l8 4 8-4V7M12 11v10"></path>
+          </symbol>
+          <symbol id="wf-icon-crash" viewBox="0 0 24 24">
+            <path d="m13 2-9 12h7l-1 8 10-13h-7V2Z"></path>
+          </symbol>
+          <symbol id="wf-icon-restart" viewBox="0 0 24 24">
+            <path d="M3 12a9 9 0 1 0 3-6.7L3 8"></path>
+            <path d="M3 3v5h5"></path>
+          </symbol>
+          <symbol id="wf-icon-resume" viewBox="0 0 24 24">
+            <path d="m12 3 7 3v5c0 5-3.2 8.3-7 10-3.8-1.7-7-5-7-10V6l7-3Z"></path>
+            <path d="m8.5 12 2.2 2.2 4.8-5"></path>
+          </symbol>
+          <symbol id="wf-icon-penalty" viewBox="0 0 24 24">
+            <circle cx="10" cy="12" r="7"></circle>
+            <path d="M10 8v8M12.5 9.5H8.8a1.8 1.8 0 0 0 0 3.5h2.4a1.8 1.8 0 0 1 0 3.5H7.5M19 6v7M19 17h.01"></path>
+          </symbol>
+          <symbol id="wf-icon-complete" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="9"></circle>
+            <path d="m8 12 2.7 2.7L16.5 9"></path>
+          </symbol>
+        </defs>
+      </svg>
+
       <!-- 5-Station Stepper Track -->
       <div class="stepper-track-wrap">
         <div class="stepper-rail">
           <div class="stepper-fill-line" data-progress-fill></div>
         </div>
 
-        <div class="stations-list" role="list">
+        <div class="stations-list" role="group" aria-label="Workflow stages">
           <!-- Station 0 -->
-          <div class="station-node-item is-active" data-station="0" role="listitem" tabindex="0">
+          <div class="station-node-item is-active" data-station="0" role="button" aria-pressed="true" tabindex="0">
             <div class="node-circle">
-              <span class="node-emoji">💳</span>
+              <svg class="node-icon" aria-hidden="true" focusable="false"><use href="#wf-icon-card"></use></svg>
               <span class="node-badge">1</span>
             </div>
-            <strong class="node-title">1. Charge Card</strong>
+            <strong class="node-title">Charge Card</strong>
             <span class="node-sub" data-st-1-sub>Authorized $150</span>
           </div>
 
           <!-- Station 1 -->
-          <div class="station-node-item" data-station="1" role="listitem" tabindex="0">
+          <div class="station-node-item" data-station="1" role="button" aria-pressed="false" tabindex="0">
             <div class="node-circle">
-              <span class="node-emoji">📦</span>
+              <svg class="node-icon" aria-hidden="true" focusable="false"><use href="#wf-icon-stock"></use></svg>
               <span class="node-badge">2</span>
             </div>
-            <strong class="node-title">2. Pick Stock</strong>
+            <strong class="node-title">Pick Stock</strong>
             <span class="node-sub" data-st-2-sub>Warehouse Shelf</span>
           </div>
 
           <!-- Station 2 (Crash Zone) -->
-          <div class="station-node-item station-crash-item" data-station="2" role="listitem" tabindex="0">
+          <div class="station-node-item station-crash-item" data-station="2" role="button" aria-pressed="false" tabindex="0">
             <div class="node-circle">
-              <span class="node-emoji">💥</span>
+              <svg class="node-icon" aria-hidden="true" focusable="false"><use href="#wf-icon-crash"></use></svg>
               <span class="node-badge">3</span>
             </div>
-            <strong class="node-title">3. Server Crash!</strong>
+            <strong class="node-title">Server Crash</strong>
             <span class="node-sub" data-st-3-sub>Outage Zone</span>
           </div>
 
           <!-- Station 3 -->
-          <div class="station-node-item" data-station="3" role="listitem" tabindex="0">
+          <div class="station-node-item" data-station="3" role="button" aria-pressed="false" tabindex="0">
             <div class="node-circle">
-              <span class="node-emoji" data-st-4-icon>🛡️</span>
+              <svg class="node-icon" aria-hidden="true" focusable="false"><use data-st-4-icon href="#wf-icon-restart"></use></svg>
               <span class="node-badge">4</span>
             </div>
-            <strong class="node-title" data-st-4-title>4. Durable Resume</strong>
-            <span class="node-sub" data-st-4-sub>0 Duplicate Work</span>
+            <strong class="node-title" data-st-4-title>Full Restart</strong>
+            <span class="node-sub" data-st-4-sub>Repeats Step 1 &amp; 2</span>
           </div>
 
           <!-- Station 4 -->
-          <div class="station-node-item" data-station="4" role="listitem" tabindex="0">
+          <div class="station-node-item" data-station="4" role="button" aria-pressed="false" tabindex="0">
             <div class="node-circle">
-              <span class="node-emoji" data-st-5-icon>🎉</span>
-              <span class="node-badge" data-st-5-badge>✓</span>
+              <svg class="node-icon" aria-hidden="true" focusable="false"><use data-st-5-icon href="#wf-icon-penalty"></use></svg>
+              <span class="node-badge">5</span>
             </div>
-            <strong class="node-title" data-st-5-title>5. Exact $150</strong>
-            <span class="node-sub" data-st-5-sub>Happy Customer</span>
+            <strong class="node-title" data-st-5-title>$300 Penalty</strong>
+            <span class="node-sub" data-st-5-sub>Double Billed!</span>
           </div>
         </div>
       </div>
@@ -156,9 +188,9 @@
         <div class="gates-track">
           <div class="gate-col"><span>Gate 1</span></div>
           <div class="gate-col"><span>Gate 2</span></div>
-          <div class="gate-col crash-col"><span>Crash Zone 💥</span></div>
+          <div class="gate-col crash-col"><span>Crash Zone</span></div>
           <div class="gate-col"><span>Gate 4</span></div>
-          <div class="gate-col"><span>Delivery 🚚</span></div>
+          <div class="gate-col"><span>Delivery</span></div>
         </div>
 
         <!-- Belt Viewport -->
@@ -338,7 +370,7 @@
     </section>
   </main>
 
-  <script src="./explainer.js?v=4"></script>
+  <script src="./explainer.js?v=5"></script>
   <script src="../shared/accuracy.js?v=10"></script>
   <script src="../shared/dispatch.js?v=11"></script>
 </body>
