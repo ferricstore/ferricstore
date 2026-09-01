@@ -102,9 +102,9 @@
     },
     {
       id: "benchmark-explainer",
-      title: "Benchmarks That Mean Something",
+      title: "Workflow Benchmark, Explained",
       icon: "▥",
-      description: "Explore measured workflow, Stream, and Pub/Sub results while keeping units, hardware, durability, and limitations visible.",
+      description: "Decode 54K workflows per second, translate steps into state actions, and compare the published DBOS and Temporal boundaries.",
       topics: ["Featured", "Architecture"],
       accent: "#22d3ee"
     },
