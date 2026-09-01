@@ -635,6 +635,22 @@ body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-strip-signature[data-fs-
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-strip-signature[data-fs-workflow-mode] li:is(.is-success, .is-committed) { background: var(--fs-success-soft) !important; }
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-strip-signature[data-fs-workflow-mode] li:is(.is-success, .is-committed)::after { background: var(--fs-green) !important; }
 
+/* Split Lab gives restart and durable resume distinct state semantics. */
+body.fs-dispatch[data-fs-demo="split-lab"] .fs-strip-signature[data-fs-split-mode] li {
+  background: var(--fs-strip) !important;
+  box-shadow: none;
+}
+body.fs-dispatch[data-fs-demo="split-lab"] .fs-strip-signature[data-fs-split-mode] li::after { background: var(--fs-line) !important; }
+body.fs-dispatch[data-fs-demo="split-lab"] .fs-strip-signature[data-fs-split-mode] li.is-current {
+  box-shadow: inset 0 -3px 0 var(--fs-ink) !important;
+}
+body.fs-dispatch[data-fs-demo="split-lab"] .fs-strip-signature[data-fs-split-mode] li:is(.is-volatile, .is-repeat) { background: var(--fs-warning-soft) !important; }
+body.fs-dispatch[data-fs-demo="split-lab"] .fs-strip-signature[data-fs-split-mode] li:is(.is-volatile, .is-repeat)::after { background: var(--fs-yellow) !important; }
+body.fs-dispatch[data-fs-demo="split-lab"] .fs-strip-signature[data-fs-split-mode] li.is-failure { background: var(--fs-failure-soft) !important; }
+body.fs-dispatch[data-fs-demo="split-lab"] .fs-strip-signature[data-fs-split-mode] li.is-failure::after { background: var(--fs-red) !important; }
+body.fs-dispatch[data-fs-demo="split-lab"] .fs-strip-signature[data-fs-split-mode] li:is(.is-success, .is-committed) { background: var(--fs-success-soft) !important; }
+body.fs-dispatch[data-fs-demo="split-lab"] .fs-strip-signature[data-fs-split-mode] li:is(.is-success, .is-committed)::after { background: var(--fs-green) !important; }
+
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-active {
   background: transparent !important;
   box-shadow: inset 0 -3px 0 var(--fs-ink);
@@ -783,6 +799,25 @@ body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-disclosure .pain-list li
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-disclosure .solution-list li::before { background: var(--fs-green); }
 
 body.fs-dispatch[data-fs-demo="split-lab"] .workflow-actions { display: none !important; }
+
+body.fs-dispatch[data-fs-demo="split-lab"] .demo-accuracy {
+  width: min(1180px, calc(100% - 40px));
+  margin: 22px auto 0 !important;
+  border: 1px solid var(--fs-ink) !important;
+  border-radius: 0 !important;
+  color: var(--fs-ink-soft) !important;
+  background: var(--fs-paper-bright) !important;
+}
+body.fs-dispatch[data-fs-demo="split-lab"] .demo-accuracy summary {
+  color: var(--fs-ink) !important;
+  background: var(--fs-strip) !important;
+}
+body.fs-dispatch[data-fs-demo="split-lab"] .demo-accuracy > div { border-color: var(--fs-line) !important; }
+body.fs-dispatch[data-fs-demo="split-lab"] .demo-accuracy p,
+body.fs-dispatch[data-fs-demo="split-lab"] .demo-accuracy strong,
+body.fs-dispatch[data-fs-demo="split-lab"] .demo-accuracy code { color: var(--fs-ink-soft) !important; }
+body.fs-dispatch[data-fs-demo="split-lab"] .demo-accuracy strong,
+body.fs-dispatch[data-fs-demo="split-lab"] .demo-accuracy code { color: var(--fs-ink) !important; }
 
 body.fs-dispatch .fs-experiment .stage-panel,
 body.fs-dispatch .fs-experiment .code-panel,
@@ -1467,6 +1502,10 @@ body.fs-dispatch[data-fs-surface="catalog"] footer p { font-size: 14px; line-hei
   .fs-evaluation-path { grid-template-columns: 1fr; }
   .fs-evaluation-path > p { border-right: 0; border-bottom: 1px solid var(--fs-ink); }
   body.fs-dispatch[data-fs-surface="catalog"] .demo-grid { grid-template-columns: 1fr; }
+  body.fs-dispatch[data-fs-demo="split-lab"] .fs-outcome { order: 3; border-top: 0; }
+  body.fs-dispatch[data-fs-demo="split-lab"] .fs-run-group { order: 4; }
+  body.fs-dispatch[data-fs-demo="split-lab"] .fs-experiment { order: 5; }
+  body.fs-dispatch[data-fs-demo="split-lab"] .fs-evidence-link { order: 6; }
 }
 
 @media (max-width: 520px) {
@@ -1506,6 +1545,21 @@ body.fs-dispatch[data-fs-surface="catalog"] footer p { font-size: 14px; line-hei
   .fs-strip-signature figcaption span { display: block; border-right: 0; border-bottom: 1px solid rgba(255,255,255,.2); }
   .fs-strip-signature ol { scroll-snap-type: x proximity; }
   .fs-strip-signature li { min-width: 132px; scroll-snap-align: start; }
+  body.fs-dispatch[data-fs-demo="split-lab"] .fs-primary-controls .workflow-modes button {
+    min-height: 62px !important;
+    padding-block: 8px !important;
+  }
+  body.fs-dispatch[data-fs-demo="split-lab"] .fs-primary-controls .workflow-modes button span {
+    display: block !important;
+  }
+  body.fs-dispatch[data-fs-demo="split-lab"] .fs-strip-signature ol {
+    grid-template-columns: none;
+    grid-auto-columns: 132px;
+    grid-auto-flow: column;
+  }
+  body.fs-dispatch[data-fs-demo="split-lab"] .demo-accuracy {
+    width: calc(100% - 24px);
+  }
   .fs-scroll-hint {
     display: block;
     margin: 0;

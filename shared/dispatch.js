@@ -92,13 +92,13 @@
     },
     "split-lab": {
       code: "WF-09",
-      title: "Crash the worker in the middle",
-      summary: "Follow an AI research workflow through planning, search, summarization, lease expiry, and fenced reclaim.",
-      outcome: "Verify that a replacement worker claims the durable middle state and continues from there.",
+      title: "Same crash. Restart or resume?",
+      summary: "Run one mid-workflow crash twice. Without FerricStore, Worker B restarts and repeats completed work. With FerricStore, it resumes from named state.",
+      outcome: "Compare restart from Plan with durable resume at Summarize.",
       kind: "handoff",
-      steps: ["plan", "search", "summarize", "crash", "reclaim", "done"],
+      steps: ["plan", "search", "summarize", "crash", "restart", "finish"],
       target: "#direction-view",
-      action: "Run crash and reclaim",
+      action: "Run restart path",
       actionTarget: "[data-action='run']"
     },
     "idempotency-determinism": {
@@ -363,7 +363,13 @@
       }
     }
 
-    var destination = metrics || document.querySelector(".fs-accuracy-disclosure") || main.querySelector(".fs-disclosure");
+    var directAccuracy = document.querySelector(".demo-accuracy");
+    if (directAccuracy) {
+      directAccuracy.classList.add("fs-accuracy-disclosure");
+      directAccuracy.id = "evaluation-evidence";
+    }
+
+    var destination = metrics || directAccuracy || document.querySelector(".fs-accuracy-disclosure") || main.querySelector(".fs-disclosure");
     var evidenceLink = firstView.querySelector(".fs-evidence-link");
     if (destination) {
       destination.id = "evaluation-evidence";
@@ -482,6 +488,72 @@
       });
     }
 
+    function splitLabMode() {
+      var selected = document.querySelector('[data-mode][aria-pressed="true"]');
+      return selected && selected.dataset.mode === "durable" ? "durable" : "unmanaged";
+    }
+
+    function syncSplitLabSignature(normalized) {
+      if (id !== "split-lab") return;
+      var durable = splitLabMode() === "durable";
+      var labels = durable
+        ? ["plan", "search", "summarize", "crash", "resume", "finish"]
+        : ["plan", "search", "summarize", "crash", "restart", "repeat + finish"];
+      var explanation = durable
+        ? "FerricStore keeps Plan and Search; Worker B resumes at Summarize with a newer fence."
+        : "Process memory is lost; Worker B restarts at Plan and repeats completed work.";
+      var caption = signature.querySelector("figcaption strong");
+
+      signature.dataset.fsSplitMode = durable ? "durable" : "unmanaged";
+      signature.setAttribute("aria-label", "Mechanism map: " + labels.join(", "));
+      if (caption) caption.textContent = explanation;
+
+      signatureSteps.forEach(function (step, stepIndex) {
+        var label = step.querySelector("strong");
+        if (label) label.textContent = labels[stepIndex];
+        step.classList.remove("is-volatile", "is-repeat", "is-failure", "is-committed", "is-success");
+
+        if (stepIndex < normalized) {
+          if (stepIndex === 3) step.classList.add("is-failure");
+          else if (stepIndex >= 4) step.classList.add(durable ? "is-success" : "is-repeat");
+          else step.classList.add(durable ? "is-committed" : "is-volatile");
+        }
+
+        if (stepIndex === normalized) {
+          if (stepIndex === 3) step.classList.add("is-failure");
+          else if (stepIndex >= 4) step.classList.add(durable ? "is-success" : "is-repeat");
+          else step.classList.add(durable ? "is-committed" : "is-volatile");
+          step.setAttribute("aria-current", "step");
+        } else {
+          step.removeAttribute("aria-current");
+        }
+      });
+    }
+
+    function syncSplitLabFrame() {
+      if (id !== "split-lab") return;
+      var durable = splitLabMode() === "durable";
+      var actionName = durable ? "durable resume" : "restart path";
+      var outcome = intro.querySelector(".fs-outcome span");
+      var runLabel = document.querySelector("[data-run-label]");
+      var sourceLabel = runLabel ? runLabel.textContent.trim() : "Run workflow";
+      var busy = /pause|waiting/i.test(sourceLabel);
+
+      if (outcome) {
+        outcome.textContent = durable
+          ? "Plan and Search stay saved. Worker B resumes at Summarize under fence 42."
+          : "Process memory is lost. Worker B restarts at Plan and repeats Plan and Search.";
+      }
+
+      if (/run again/i.test(sourceLabel)) proxy.textContent = "Run " + actionName + " again";
+      else if (/resume/i.test(sourceLabel)) proxy.textContent = "Resume " + actionName;
+      else if (busy) proxy.textContent = "Running " + actionName + "…";
+      else proxy.textContent = "Run " + actionName;
+
+      proxy.disabled = busy;
+      syncSplitLabSignature(lastSignatureIndex);
+    }
+
     function setSignatureIndex(index) {
       if (!Number.isFinite(index)) return;
       var normalized = Math.max(0, Math.min(signatureSteps.length - 1, Math.round(index)));
@@ -491,8 +563,9 @@
         step.classList.toggle("is-done", stepIndex < normalized);
       });
       syncWorkflowSignature(normalized);
+      syncSplitLabSignature(normalized);
       signature.dataset.fsCurrentStep = String(normalized + 1);
-      if (id === "workflow-explainer") {
+      if (id === "workflow-explainer" || id === "split-lab") {
         window.requestAnimationFrame(function () { centerSignatureStep(signatureSteps[normalized]); });
       }
     }
@@ -537,6 +610,7 @@
       proxy.disabled = Boolean(original && original.disabled);
       var live = liveStatusText();
       if (live) intro.querySelector(".fs-run-status").textContent = "Live: " + live;
+      syncSplitLabFrame();
     }
 
     proxy.addEventListener("click", function () {
@@ -544,7 +618,7 @@
       var status = intro.querySelector(".fs-run-status");
       if (!original || original.disabled) {
         status.textContent = "The experiment is already running or waiting for its next available action.";
-        target.scrollIntoView({ behavior: "smooth", block: "start" });
+        if (id !== "split-lab") target.scrollIntoView({ behavior: "smooth", block: "start" });
         return;
       }
       original.click();
@@ -568,11 +642,23 @@
       window.setTimeout(syncExperiment, 0);
       window.setTimeout(syncExperiment, 180);
       window.setTimeout(syncExperiment, 700);
-      target.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      if (id === "split-lab" && window.matchMedia("(max-width: 780px)").matches) {
+        var verdict = target.querySelector(".lab-verdict");
+        if (verdict) {
+          window.setTimeout(function () {
+            verdict.scrollIntoView({
+              behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+              block: "start"
+            });
+          }, 120);
+        }
+      } else if (id !== "split-lab") {
+        target.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
     });
 
     function selectedSetup() {
-      var selected = document.querySelector('[role="tab"][aria-selected="true"], [aria-pressed="true"].scenario-choice');
+      var selected = document.querySelector('[role="tab"][aria-selected="true"], [aria-pressed="true"].scenario-choice, [data-mode][aria-pressed="true"]');
       if (!selected) return "";
       var strong = selected.querySelector("strong");
       return (strong ? strong.textContent : selected.textContent).trim().replace(/\s+/g, " ").slice(0, 72);
@@ -583,11 +669,16 @@
       intro.querySelector(".fs-run-status").textContent = selected
         ? "Current setup: " + selected + ". Ready to run."
         : "Ready to run in this browser.";
+      syncSplitLabFrame();
     }
 
     document.addEventListener("click", function (event) {
-      if (event.target.closest('[role="tab"], .scenario-choice')) {
-        window.setTimeout(updateReadyStatus, 0);
+      var modeChoice = event.target.closest("[data-mode]");
+      if (event.target.closest('[role="tab"], .scenario-choice, [data-mode]')) {
+        window.setTimeout(function () {
+          if (id === "split-lab" && modeChoice) setSignatureIndex(0);
+          updateReadyStatus();
+        }, 0);
       }
     });
 
