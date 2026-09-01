@@ -181,8 +181,8 @@ def hold(ctx):
     return transition("check_payment", run_at_ms=int(time.time() * 1000) + 600_000)
 
 @flow.state("check_payment")
-def check_payment(job):
-    if billing.paid(job.id):
+def check_payment(ctx):
+    if billing.paid(ctx.id):
         return complete(result=b"confirmed")
     return transition("transfer")
 
