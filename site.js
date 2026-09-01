@@ -101,6 +101,14 @@
       accent: "#38bdf8"
     },
     {
+      id: "benchmark-explainer",
+      title: "Benchmarks That Mean Something",
+      icon: "▥",
+      description: "Explore measured workflow, Stream, and Pub/Sub results while keeping units, hardware, durability, and limitations visible.",
+      topics: ["Featured", "Architecture"],
+      accent: "#22d3ee"
+    },
+    {
       id: "hot-cold-storage",
       title: "Hot & Cold Storage",
       icon: "▦",

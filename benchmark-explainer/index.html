@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="An interactive, evidence-backed explanation of FerricStore workflow, Stream, and Pub/Sub benchmark results.">
+  <meta name="theme-color" content="#071018">
+  <title>Benchmarks That Mean Something | FerricStore Demos</title>
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./style.css?v=1">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
+</head>
+<body>
+  <a class="skip-link" href="#benchmark-workbench">Skip to benchmark explorer</a>
+
+  <nav class="top-nav" aria-label="Demo navigation">
+    <a class="brand" href="../">
+      <span class="brand-mark" aria-hidden="true">F</span>
+      <span><strong>FerricStore</strong><small>Benchmark explainer</small></span>
+    </a>
+    <a class="back-link" href="../">← Back to all demos</a>
+  </nav>
+
+  <main>
+    <header class="hero">
+      <div class="hero-copy">
+        <span class="eyebrow">MEASURE THE BOUNDARY, NOT THE HYPE</span>
+        <h1>Benchmarks that<br><span>mean something.</span></h1>
+        <p>Throughput only becomes useful when the unit, workload, hardware, durability boundary, and limitations stay attached to the number. Explore three measured FerricStore workloads without mixing unlike operations.</p>
+        <div class="hero-badges" aria-label="Benchmark evidence status">
+          <span>HISTORICAL REFERENCE</span>
+          <span>PUBLIC METHODOLOGY</span>
+          <span>NO UNIVERSAL CLAIM</span>
+        </div>
+      </div>
+
+      <aside class="number-anatomy" aria-label="Anatomy of a useful benchmark number">
+        <span class="anatomy-kicker">A USEFUL NUMBER NEEDS</span>
+        <ol>
+          <li><span>01</span><strong>Unit</strong><small>workflow, publish, delivery, or entry?</small></li>
+          <li><span>02</span><strong>Boundary</strong><small>what does success acknowledge?</small></li>
+          <li><span>03</span><strong>Shape</strong><small>batch, fanout, shards, and concurrency</small></li>
+          <li><span>04</span><strong>Tail</strong><small>p95/p99 still matter beside throughput</small></li>
+        </ol>
+      </aside>
+    </header>
+
+    <aside class="evidence-note" aria-label="Benchmark evidence limitation">
+      <span aria-hidden="true">i</span>
+      <p><strong>Evidence boundary:</strong> these values come from the public benchmark summary at repository commit <code>cf71ad1e</code>. Raw logs are not committed, so they are historical reference points—not a promise for different hardware or workloads. Derived calculators below are arithmetic illustrations.</p>
+    </aside>
+
+    <section class="headline-section" aria-labelledby="headline-title">
+      <div class="section-heading">
+        <div>
+          <span class="eyebrow">THREE DIFFERENT UNITS</span>
+          <h2 id="headline-title">Do not put these on one leaderboard</h2>
+        </div>
+        <p>Choose a result to see what was measured and why it matters.</p>
+      </div>
+
+      <div class="headline-grid" role="tablist" aria-label="Select benchmark workload">
+        <button type="button" class="headline-card is-active" role="tab" aria-selected="true" data-select-view="workflows">
+          <span class="card-index">01 · DURABLE WORKFLOWS</span>
+          <strong>54,060</strong>
+          <small>workflows / second</small>
+          <p>End-to-end live workflow rate over a 1M-workflow Azure run.</p>
+        </button>
+        <button type="button" class="headline-card" role="tab" aria-selected="false" data-select-view="streams">
+          <span class="card-index">02 · DURABLE STREAM APPENDS</span>
+          <strong>687,797</strong>
+          <small>entries / second</small>
+          <p>Embedded batched appends across 12 partition Streams on one local host.</p>
+        </button>
+        <button type="button" class="headline-card" role="tab" aria-selected="false" data-select-view="pubsub">
+          <span class="card-index">03 · LIVE PUB/SUB FANOUT</span>
+          <strong>2.35M</strong>
+          <small>delivered messages / second</small>
+          <p>293,794 publishes/s multiplied by measured fanout 8 with batch events.</p>
+        </button>
+      </div>
+    </section>
+
+    <section class="workbench" id="benchmark-workbench" aria-labelledby="workbench-title">
+      <div class="workbench-head">
+        <div>
+          <span class="eyebrow">INTERACTIVE EXPLAINER</span>
+          <h2 id="workbench-title">What does the number help you decide?</h2>
+        </div>
+        <div class="view-tabs" role="tablist" aria-label="Benchmark details">
+          <button type="button" role="tab" aria-selected="true" class="is-active" data-view-tab="workflows">Workflows</button>
+          <button type="button" role="tab" aria-selected="false" data-view-tab="streams">Streams</button>
+          <button type="button" role="tab" aria-selected="false" data-view-tab="pubsub">Pub/Sub</button>
+        </div>
+      </div>
+
+      <article class="benchmark-panel" data-view-panel="workflows">
+        <header class="panel-title">
+          <div>
+            <span>AZURE · 1M LIVE WORKFLOWS</span>
+            <h3>End-to-end workflow capacity</h3>
+          </div>
+          <div class="result-pill"><strong>54,060/s</strong><small>best balanced 16-vCPU result</small></div>
+        </header>
+
+        <div class="context-grid">
+          <div><small>Measured unit</small><strong>Created and completed workflow</strong></div>
+          <div><small>Server</small><strong>16 vCPU · 32 Flow shards</strong></div>
+          <div><small>Client shape</small><strong>Single Python SDK client VM</strong></div>
+          <div><small>Mode</small><strong>Sync live create + process</strong></div>
+        </div>
+
+        <div class="panel-grid">
+          <section class="chart-card" aria-labelledby="workflow-scale-title">
+            <div class="mini-heading">
+              <div><span>SERVER CPU SCALE</span><h4 id="workflow-scale-title">More CPU increased the default-shard workflow rate</h4></div>
+              <small>Same 1M live workload</small>
+            </div>
+            <div class="bar-chart" aria-label="Sync workflow throughput by server vCPU">
+              <div class="bar-row"><span>4 vCPU</span><div><i style="--bar: 35.3%"></i></div><strong>16,005/s</strong></div>
+              <div class="bar-row"><span>8 vCPU</span><div><i style="--bar: 61.0%"></i></div><strong>27,674/s</strong></div>
+              <div class="bar-row"><span>16 vCPU</span><div><i style="--bar: 100%"></i></div><strong>45,375/s</strong></div>
+            </div>
+            <p class="chart-note">The 54,060/s headline comes from a separate 16-vCPU shard sweep where 32 shards was the best balanced workflow setting.</p>
+          </section>
+
+          <section class="calculator-card" aria-labelledby="workflow-calc-title">
+            <div class="mini-heading"><div><span>ARITHMETIC STARTING POINT</span><h4 id="workflow-calc-title">Translate a target rate into reference capacity</h4></div></div>
+            <label for="workflow-target">Target workflow rate <strong data-workflow-target-label>100,000/s</strong></label>
+            <input id="workflow-target" type="range" min="10000" max="250000" step="10000" value="100000" data-workflow-target>
+            <div class="calculator-results">
+              <div><small>Reference-equivalent units</small><strong data-workflow-units>2</strong></div>
+              <div><small>Target ÷ measured rate</small><strong data-workflow-ratio>1.85×</strong></div>
+              <div><small>1M-workflow service time</small><strong>≈18.5s</strong></div>
+            </div>
+            <p>This is division, not a scaling forecast. Network, storage, replication, side effects, and tail latency must be load-tested in your deployment.</p>
+          </section>
+        </div>
+
+        <div class="meaning-grid">
+          <section><span>WHY IT MATTERS</span><h4>It budgets orchestration overhead</h4><p>An end-to-end workflow rate is useful when estimating how much durable coordination can fit before business logic and external APIs become the bottleneck.</p></section>
+          <section><span>WHAT IT DOES NOT PROVE</span><h4>Your workflow will reach 54K/s</h4><p>The measured handlers and environment differ from your payloads, side effects, indexes, network, storage, and reliability topology. No latency percentile is implied.</p></section>
+          <section><span>CORRECT COMPARISON</span><h4>Workflow completion vs. workflow completion</h4><p>Do not compare one completed workflow—which can contain several durable operations—to one Stream entry, SQL write, or HTTP request.</p></section>
+        </div>
+      </article>
+
+      <article class="benchmark-panel" data-view-panel="streams" hidden>
+        <header class="panel-title">
+          <div>
+            <span>APPLE M4 MAX · ONE-NODE RAFT</span>
+            <h3>Durable Stream append topology</h3>
+          </div>
+          <div class="result-pill"><strong data-stream-headline>687,797/s</strong><small>selected appended-entry rate</small></div>
+        </header>
+
+        <div class="context-grid">
+          <div><small>Measured unit</small><strong>Appended Stream entry</strong></div>
+          <div><small>Durability</small><strong>Local durable WAL commit</strong></div>
+          <div><small>Batch shape</small><strong>32 concurrent × 1,024 entries</strong></div>
+          <div><small>Claim boundary</small><strong>Local optimization baseline</strong></div>
+        </div>
+
+        <div class="panel-grid">
+          <section class="chart-card" aria-labelledby="stream-topology-title">
+            <div class="mini-heading"><div><span>SELECT THE TOPOLOGY</span><h4 id="stream-topology-title">Partitioning helps only when the workload can use it</h4></div></div>
+            <div class="topology-options" role="radiogroup" aria-label="Stream benchmark topology">
+              <button type="button" role="radio" aria-checked="false" data-stream-option data-rate="395391" data-label="One hot Stream">One Stream <strong>395,391/s</strong></button>
+              <button type="button" role="radio" aria-checked="true" class="is-active" data-stream-option data-rate="687797" data-label="12 partition Streams">12 partitions <strong>687,797/s</strong></button>
+              <button type="button" role="radio" aria-checked="false" data-stream-option data-rate="391017" data-label="Interleaved distinct shards">Distinct shards <strong>391,017/s</strong></button>
+              <button type="button" role="radio" aria-checked="false" data-stream-option data-rate="253338" data-label="64 topics on one shard">One forced shard <strong>253,338/s</strong></button>
+            </div>
+            <div class="selected-topology"><span data-stream-label>12 partition Streams</span><strong data-stream-rate>687,797 entries/s</strong><i data-stream-bar></i></div>
+          </section>
+
+          <section class="calculator-card" aria-labelledby="stream-calc-title">
+            <div class="mini-heading"><div><span>DERIVED DRAIN TIME</span><h4 id="stream-calc-title">How long would a backlog represent?</h4></div></div>
+            <label for="stream-backlog">Backlog size <strong data-stream-backlog-label>10M entries</strong></label>
+            <input id="stream-backlog" type="range" min="1" max="100" step="1" value="10" data-stream-backlog>
+            <div class="calculator-results two-up">
+              <div><small>At selected measured rate</small><strong data-stream-seconds>≈14.5s</strong></div>
+              <div><small>Entries per millisecond</small><strong data-stream-per-ms>688</strong></div>
+            </div>
+            <p>The calculator assumes a continuously saturated producer and no consumers competing for resources. It is not a recovery-time objective.</p>
+          </section>
+        </div>
+
+        <div class="meaning-grid">
+          <section><span>WHY IT MATTERS</span><h4>It exposes hot-shard limits</h4><p>The topology changes how much durable work can proceed in parallel. The best result came from sufficiently large batches distributed across 12 partition Streams.</p></section>
+          <section><span>WHAT IT DOES NOT PROVE</span><h4>More partitions always win</h4><p>Interleaving or forcing many topics onto one shard produced much lower rates. On one host, extra groups can add durability overhead instead of capacity.</p></section>
+          <section><span>CORRECT COMPARISON</span><h4>Match the acknowledgement boundary</h4><p>This path includes a one-node Raft command, deterministic projection, and local fsynced WAL. Compare only with systems configured for an equivalent success boundary.</p></section>
+        </div>
+      </article>
+
+      <article class="benchmark-panel" data-view-panel="pubsub" hidden>
+        <header class="panel-title">
+          <div>
+            <span>APPLE M4 MAX · LOOPBACK TCP · FANOUT 8</span>
+            <h3>Publish rate is not delivery rate</h3>
+          </div>
+          <div class="result-pill"><strong data-pubsub-deliveries>2.35M/s</strong><small>selected delivered-message rate</small></div>
+        </header>
+
+        <div class="context-grid">
+          <div><small>Payload</small><strong>256 bytes</strong></div>
+          <div><small>Pipeline depth</small><strong>1,024</strong></div>
+          <div><small>Publishers</small><strong>4</strong></div>
+          <div><small>Subscribers</small><strong>8 exact-channel fanout</strong></div>
+        </div>
+
+        <div class="panel-grid">
+          <section class="chart-card" aria-labelledby="pubsub-shape-title">
+            <div class="mini-heading"><div><span>SELECT THE EVENT FORMAT</span><h4 id="pubsub-shape-title">One publish creates eight deliveries</h4></div></div>
+            <div class="pubsub-options" role="radiogroup" aria-label="PubSub event format">
+              <button type="button" role="radio" aria-checked="false" data-pubsub-option="legacy">Legacy event frames <strong>184,921 pub/s</strong></button>
+              <button type="button" role="radio" aria-checked="true" class="is-active" data-pubsub-option="batch">Negotiated batch events <strong>293,794 pub/s</strong></button>
+            </div>
+            <div class="fanout-equation" aria-live="polite">
+              <div><small>PUBLISH INPUT</small><strong data-pubsub-publishes>293,794/s</strong></div>
+              <span>×</span>
+              <div><small>FANOUT</small><strong>8</strong></div>
+              <span>=</span>
+              <div><small>DELIVERY OUTPUT</small><strong data-pubsub-output>≈2.35M/s</strong></div>
+            </div>
+          </section>
+
+          <section class="calculator-card" aria-labelledby="pubsub-memory-title">
+            <div class="mini-heading"><div><span>WHY BATCH EVENTS HELP</span><h4 id="pubsub-memory-title">Less framing and retained heap</h4></div></div>
+            <div class="delta-list">
+              <div><small>Frames per subscriber / 1,024 messages</small><strong>1,024 → 1</strong></div>
+              <div><small>Encoded bytes</small><strong>422,912 → 267,428</strong><span>−36.8%</span></div>
+              <div><small>Retained heap words</small><strong>67,622 → 10</strong></div>
+            </div>
+            <p>The logical delivery count stays the same. The optimization changes batching and encoding, not the meaning or order of the messages.</p>
+          </section>
+        </div>
+
+        <div class="meaning-grid">
+          <section><span>WHY IT MATTERS</span><h4>Fanout multiplies outbound work</h4><p>A publish-only number hides subscriber delivery cost. Capacity planning needs both the input rate and total delivered messages across subscribers.</p></section>
+          <section><span>WHAT IT DOES NOT PROVE</span><h4>WAN or subscriber processing speed</h4><p>The run used loopback TCP and validated delivery counts. It does not measure remote networks, application callbacks, or durable replay—Pub/Sub is live fanout.</p></section>
+          <section><span>CORRECT COMPARISON</span><h4>Keep fanout and event format fixed</h4><p>Comparing fanout 1 with fanout 8, or individual frames with negotiated batches, changes the work. Report both publishes/s and deliveries/s.</p></section>
+        </div>
+      </article>
+    </section>
+
+    <section class="rules-section" aria-labelledby="rules-title">
+      <div class="section-heading">
+        <div><span class="eyebrow">BEFORE TRUSTING A CHART</span><h2 id="rules-title">Ask four questions</h2></div>
+      </div>
+      <div class="rules-grid">
+        <article><span>01</span><h3>What completed?</h3><p>A workflow, batch request, Stream entry, publish, and subscriber delivery are different units.</p></article>
+        <article><span>02</span><h3>What was durable?</h3><p>Match replication, WAL/fsync, acknowledgement, and ordering semantics before comparing systems.</p></article>
+        <article><span>03</span><h3>What shaped the load?</h3><p>Keep payload, concurrency, batching, shards, fanout, retention, and resource guards visible.</p></article>
+        <article><span>04</span><h3>Where is the tail?</h3><p>Peak throughput without p95/p99 latency can hide storage stalls and queueing under saturation.</p></article>
+      </div>
+    </section>
+
+    <section class="source-section" aria-labelledby="source-title">
+      <div>
+        <span class="eyebrow">SOURCE &amp; REPRODUCTION</span>
+        <h2 id="source-title">Keep the methodology attached</h2>
+        <p>The public benchmark document includes workload commands, comparison boundaries, shard sweeps, and rejected experiments. FerricStore intentionally does not publish current KV SET/GET numbers until the native-protocol baseline is rerun.</p>
+      </div>
+      <div class="source-actions">
+        <a href="https://github.com/ferricstore/ferricstore/blob/cf71ad1e895d1a7baa4e75fe2751ee87197a99c8/docs/benchmarks.md">Open pinned benchmark source <span>↗</span></a>
+        <a href="https://github.com/ferricstore/ferricstore/tree/cf71ad1e895d1a7baa4e75fe2751ee87197a99c8/bench">Open benchmark runners <span>↗</span></a>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <a class="brand" href="../"><span class="brand-mark" aria-hidden="true">F</span><span><strong>FerricStore</strong><small>Interactive demos</small></span></a>
+    <p>Historical evidence · Explicit units · Reproduce before capacity planning</p>
+  </footer>
+
+  <script src="./benchmark.js?v=1"></script>
+</body>
+</html>
