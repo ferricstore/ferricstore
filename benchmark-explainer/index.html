@@ -205,9 +205,9 @@
         <article class="comparison-row dbos-row" role="row">
           <div role="cell"><strong>DBOS</strong><span>published April 2026</span></div>
           <div role="cell"><strong>43,000 workflows/s</strong><span>86,000 Postgres writes/s</span></div>
-          <div role="cell"><strong>0 steps</strong><span>start + complete = 2 writes</span></div>
+          <div role="cell"><strong>3 execution phases</strong><span>start → no-op body → complete · 0 <code>@DBOS.step</code> calls</span></div>
           <div role="cell"><strong>96-vCPU RDS</strong><span>384 GB · 120K IOPS io2</span></div>
-          <div role="cell"><p>FerricStore’s headline is 1.26× higher, but DBOS measured a different persistence model on very different hardware.</p></div>
+          <div role="cell"><p>DBOS persists workflow start and completion as two writes; its benchmark body executes between them without a checkpointed application step.</p></div>
         </article>
 
         <article class="comparison-row temporal-row" role="row">
@@ -305,6 +305,7 @@
         <a href="https://github.com/ferricstore/ferricstore/blob/cf71ad1e895d1a7baa4e75fe2751ee87197a99c8/docs/flow-vs-temporal-usage.md">FerricFlow runtime comparison <span>↗</span></a>
         <a href="https://github.com/ferricstore/ferricstore-python/blob/004d16a8a95bc0a5e4a9657fe9a2efde0bdbb974/docs/compare.md">FerricFlow / Temporal concepts <span>↗</span></a>
         <a href="https://dbos.dev/blog/benchmarking-workflow-execution-scalability-on-postgres">DBOS throughput benchmark <span>↗</span></a>
+        <a href="https://github.com/dbos-inc/dbos-postgres-benchmark/blob/e0afaac820ac7ee1bb261c4aabe3461122e8953a/benchmarks/dbos_start_workflow.py#L89-L110">DBOS benchmark code <span>↗</span></a>
         <a href="https://www.dbos.dev/blog/dbos-vs-aws-step-functions-benchmark">DBOS latency reference <span>↗</span></a>
         <a href="https://temporal.io/cloud">Temporal Cloud scale claim <span>↗</span></a>
         <a href="https://docs.temporal.io/cloud/actions">Temporal Action definitions <span>↗</span></a>
