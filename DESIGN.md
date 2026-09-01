@@ -1,21 +1,23 @@
 ---
 name: FerricStore Dispatch Strip Board
-description: A warm, mechanical evaluation system that makes durable work, failure, recovery, and evidence inspectable.
+description: A crisp, mechanical evaluation system that makes durable work, failure, recovery, and evidence inspectable.
 colors:
-  paper: "#eeece4"
-  paper-bright: "#faf8f1"
-  strip: "#f4f0e3"
-  ink: "#12272f"
-  ink-soft: "#294049"
-  muted: "#5e6d6f"
-  line: "#aeb5ad"
-  line-soft: "#d4d5cc"
-  signal-orange: "#b94721"
-  signal-orange-dark: "#913516"
-  success-green: "#587360"
-  warning-yellow: "#d9b84b"
-  failure-red: "#a43e34"
-  evidence-blue: "#365f73"
+  paper: "#f3f6f4"
+  paper-bright: "#fcfefb"
+  strip: "#e7ece8"
+  ink: "#0d222b"
+  ink-soft: "#2e454e"
+  muted: "#566b72"
+  line: "#aebbb5"
+  line-soft: "#d8dfda"
+  signal-lime: "#c9e84c"
+  signal-lime-hover: "#b8da34"
+  signal-ink: "#526b00"
+  signal-soft: "#eff7cf"
+  success-green: "#19765b"
+  warning-yellow: "#8a6500"
+  failure-red: "#b33a48"
+  evidence-blue: "#205f91"
   surface-white: "#ffffff"
   terminal-deep: "#101b20"
   terminal-text: "#eff4ef"
@@ -82,15 +84,15 @@ spacing:
   panel: "34px"
 components:
   button-primary:
-    backgroundColor: "{colors.signal-orange}"
-    textColor: "{colors.surface-white}"
+    backgroundColor: "{colors.signal-lime}"
+    textColor: "{colors.ink}"
     typography: "{typography.ui-label}"
     rounded: "{rounded.control}"
     padding: "0 18px"
     height: "50px"
   button-primary-hover:
-    backgroundColor: "{colors.signal-orange-dark}"
-    textColor: "{colors.surface-white}"
+    backgroundColor: "{colors.signal-lime-hover}"
+    textColor: "{colors.ink}"
   button-secondary:
     backgroundColor: "transparent"
     textColor: "{colors.ink}"
@@ -159,7 +161,7 @@ components:
 
 **Creative North Star: "Dispatch Strip Board"**
 
-Dispatch Strip Board treats durable workflow state like a paper progress strip moving through named rails. The world is warm, inspectable, and operational: deep blue-black frames hold pale working surfaces, compact stamps identify state, and signal orange marks the action or transition that deserves attention.
+Dispatch Strip Board treats durable workflow state like a paper progress strip moving through named rails. The world is crisp, inspectable, and operational: graphite frames hold cool mineral working surfaces, compact stamps identify state, and FerricStore lime marks the action or transition that deserves attention.
 
 The system is built for evaluation rather than spectacle. An architect should recognize a failure, run the mechanism, verify recovery and its boundary, then follow the evidence toward adoption. The first viewport therefore pairs a concise thesis and direct action with a live mechanism; supporting prose, code, comparisons, and evidence follow only after the system has shown its work.
 
@@ -167,20 +169,22 @@ It deliberately rejects the generic gradient demo shell. Personality comes from 
 
 **Key Characteristics:**
 
-- Warm evaluation paper over deep blue-black rails.
-- Signal orange reserved for primary action and current state.
+- Cool mineral paper over graphite rails.
+- Signal lime reserved for the primary action and current state.
 - Condensed structural headings paired with hyperlegible proof copy.
 - Compact bordered panels, stamped labels, and square mechanical controls.
 - Live state movement before supporting prose, code, and evidence.
 
 ## Colors
 
-The palette combines warm paper neutrals with a deep blue-black structural ink, one signal orange, and restrained semantic colors for outcome, warning, failure, and evidence.
+The palette combines cool mineral neutrals with graphite structural ink, one acid-lime product signal, and restrained semantic colors for outcome, warning, failure, and evidence.
 
 ### Primary
 
-- **Signal Orange** (`{colors.signal-orange}`): Primary run actions, the current mechanism marker, selection, focus, and active emphasis.
-- **Dark Signal Orange** (`{colors.signal-orange-dark}`): Hover states, emphasized outcomes, and compact action labels that need stronger contrast on paper.
+- **Signal Lime** (`{colors.signal-lime}`): Primary run actions, the current mechanism surface, selection, and active emphasis. It always carries graphite text.
+- **Signal Lime Hover** (`{colors.signal-lime-hover}`): Hover state for lime-filled actions.
+- **Signal Ink** (`{colors.signal-ink}`): Focus rings, current-state markers, emphasized outcomes, and compact labels that need strong contrast on paper.
+- **Signal Soft** (`{colors.signal-soft}`): A restrained current-state wash inside mechanism strips.
 
 ### Secondary
 
@@ -204,9 +208,9 @@ The palette combines warm paper neutrals with a deep blue-black structural ink, 
 
 ### Named Rules
 
-**The Signal Is Earned Rule.** Use signal orange for the primary action, current mechanism mark, focus, selection, or evidence-link emphasis; do not wash whole surfaces in it.
+**The Signal Is Earned Rule.** Use signal lime for the primary action and current mechanism state; use signal ink for focus and compact emphasis. Do not wash broad surfaces in either.
 
-**The Paper Before Glow Rule.** The world is warm paper and solid rails; generic gradient demo shells are outside the system.
+**The Paper Before Glow Rule.** The world is cool mineral paper and solid rails; generic gradient demo shells are outside the system.
 
 ## Typography
 
@@ -243,12 +247,12 @@ At 1000px, demo intro share increases and four-column evidence becomes two colum
 
 ## Elevation & Depth
 
-The system is flat by default. One-pixel ink and rule lines, alternating paper tones, dark rails, and nested panels establish depth structurally. The catalog hero apparatus uses one ambient shadow (`0 20px 42px rgba(18, 39, 47, 0.14)`), and the primary run action uses a smaller state shadow (`0 10px 20px rgba(164, 62, 52, 0.16)`). Experiment surfaces, stage headers, catalog rows, disclosures, and ordinary controls remain unshadowed.
+The system is flat by default. One-pixel ink and rule lines, alternating paper tones, dark rails, and nested panels establish depth structurally. The catalog hero apparatus uses one ambient shadow (`0 20px 42px rgba(13, 34, 43, 0.13)`), and the primary run action uses a smaller state shadow (`0 10px 20px rgba(82, 107, 0, 0.14)`). Experiment surfaces, stage headers, catalog rows, disclosures, and ordinary controls remain unshadowed.
 
 ### Shadow Vocabulary
 
-- **Apparatus Shadow** (`0 20px 42px rgba(18, 39, 47, 0.14)`): The catalog's dark workflow preview only.
-- **Action Shadow** (`0 10px 20px rgba(164, 62, 52, 0.16)`): The primary run control at rest.
+- **Apparatus Shadow** (`0 20px 42px rgba(13, 34, 43, 0.13)`): The catalog's dark workflow preview only.
+- **Action Shadow** (`0 10px 20px rgba(82, 107, 0, 0.14)`): The primary run control at rest.
 
 ### Named Rules
 
@@ -265,8 +269,8 @@ The form language is square and mechanical with only enough corner relief to avo
 ### Buttons
 
 - **Shape:** Compact mechanical rectangles with 4px corners and a minimum 44px touch target; the primary run action is 50px high.
-- **Primary:** Signal-orange fill, white text, 1px ink border, 18px horizontal padding, and bold 14px labeling.
-- **Hover / Focus / Active:** Hover shifts to dark signal orange and lifts 1px; active returns to the rail. Keyboard focus is a 3px signal-orange outline with a 3px offset. Motion uses 180ms ease-out and collapses under reduced-motion preferences.
+- **Primary:** Signal-lime fill, graphite text, 1px ink border, 18px horizontal padding, and bold 14px labeling.
+- **Hover / Focus / Active:** Hover shifts to the darker lime step and lifts 1px; active returns to the rail. Keyboard focus is a 3px signal-ink outline with a 3px offset. Motion uses 180ms ease-out and collapses under reduced-motion preferences.
 - **Secondary:** Transparent paper with ink text and border; hover inverts to ink with white text.
 
 ### Setup Choices
@@ -284,7 +288,7 @@ The form language is square and mechanical with only enough corner relief to avo
 ### Inputs / Fields
 
 - **Style:** Search uses a bright-paper fill, 1px ink border, 3px corners, and a 44px touch target.
-- **Focus:** The shared 3px orange focus outline sits outside the field without replacing its border.
+- **Focus:** The shared 3px signal-ink focus outline sits outside the field without replacing its border.
 
 ### Navigation
 
@@ -293,7 +297,7 @@ The form language is square and mechanical with only enough corner relief to avo
 
 ### Mechanism Map
 
-The signature component is a dark framed progress strip with a compact caption rail and one cell per named state. Each cell shows an ordinal and condensed uppercase state name. The current cell carries an orange hanging marker; completed cells shift to recovery paper and green markers. JavaScript advances the existing strip from live route signals so the summary and the underlying experiment describe the same run.
+The signature component is a dark framed progress strip with a compact caption rail and one cell per named state. Each cell shows an ordinal and condensed uppercase state name. The current cell uses a soft-lime fill and signal-ink hanging marker; completed cells shift to recovery paper and green markers. JavaScript advances the existing strip from live route signals so the summary and the underlying experiment describe the same run.
 
 **The Same-Strip Rule.** Updates advance the existing strip with current and done stamps rather than replacing it with a disconnected success graphic.
 
@@ -303,11 +307,11 @@ Metrics are arranged as one bordered four-cell band with 18px interior padding a
 
 ### Disclosures
 
-Supporting code, comparisons, sources, accuracy notes, and technical boundaries use native `details` rows. The 58px summary is condensed and left-aligned, with a small orange Open/Close state at the edge; opened content sits on white behind a soft rule.
+Supporting code, comparisons, sources, accuracy notes, and technical boundaries use native `details` rows. The 58px summary is condensed and left-aligned, with a small signal-ink Open/Close state at the edge; opened content sits on bright paper behind a soft rule.
 
 ### Catalog Rows
 
-Catalog demos are rows rather than floating cards: a dark code stamp, a concise title and description, and an orange open cue separated by top rules. Hover changes the paper tone but does not lift the row. Filters and search sit in a border-block control rail above the list.
+Catalog demos are rows rather than floating cards: a dark code stamp, a concise title and description, and a signal-ink open cue separated by top rules. Hover changes the paper tone but does not lift the row. Filters and search sit in a border-block control rail above the list.
 
 ## Do's and Don'ts
 
@@ -322,7 +326,7 @@ Catalog demos are rows rather than floating cards: a dark code stamp, a concise 
 ### Don't:
 
 - **Don't** return to a generic gradient hero or an interchangeable floating-card demo shell.
-- **Don't** use signal orange as a broad decorative wash or use semantic status colors without state meaning.
+- **Don't** use signal lime as a broad decorative wash or use semantic status colors without state meaning.
 - **Don't** hide the live experiment behind introductory prose, code, or a separate detail page.
 - **Don't** imply exactly-once handler execution, unsupported guarantees, or adoption evidence through celebratory visual treatment.
 - **Don't** round every surface into pills or add shadows where a rail, rule, or paper layer already establishes hierarchy.

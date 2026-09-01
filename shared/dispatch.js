@@ -255,7 +255,7 @@
   }
 
   function svgLogo() {
-    return '<svg viewBox="0 0 32 32" aria-hidden="true"><path d="M5 6h21v5H11v4h12v5H11v7H5z" fill="currentColor"/><path d="M22 15h5v12h-5z" fill="#d8682a"/></svg>';
+    return '<svg viewBox="0 0 32 32" aria-hidden="true"><path d="M5 6h21v5H11v4h12v5H11v7H5z" fill="currentColor"/><path d="M22 15h5v12h-5z" fill="#c9e84c"/></svg>';
   }
 
   function makeNav(config) {
