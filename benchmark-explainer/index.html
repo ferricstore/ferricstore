@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#071018">
   <title>Workflow Benchmark, Explained | FerricStore Demos</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css?v=4">
+  <link rel="stylesheet" href="./style.css?v=5">
   <link rel="stylesheet" href="../shared/accuracy.css?v=5">
 </head>
 <body>
@@ -153,28 +153,10 @@
     <section class="comparison-section" aria-labelledby="comparison-title">
       <div class="section-heading">
         <div>
-          <span class="eyebrow">FERRICSTORE · DBOS · TEMPORAL</span>
-          <h2 id="comparison-title">Compare published units, not brand headlines</h2>
+          <span class="eyebrow">FERRICSTORE · DBOS</span>
+          <h2 id="comparison-title">Compare measured workflow runs</h2>
         </div>
-        <p>These references answer different questions. The table shows what can—and cannot—be concluded.</p>
-      </div>
-
-      <div class="model-map" aria-label="Temporal and FerricFlow execution model comparison">
-        <article>
-          <small>TEMPORAL</small>
-          <strong>Workflow code + Activities</strong>
-          <p>A Worker replays durable Event History to reconstruct workflow state, then schedules or resumes application Activities.</p>
-        </article>
-        <div class="shared-split">
-          <span>SHARED DEPLOYMENT IDEA</span>
-          <strong>producer → durable service → worker</strong>
-          <p>Both separate the process that starts work from long-running workers.</p>
-        </div>
-        <article>
-          <small>FERRICFLOW</small>
-          <strong>Explicit state pipeline</strong>
-          <p>A Worker claims a named durable state and reports the next state. FerricFlow does not replay application handlers.</p>
-        </article>
+        <p>Both runs report workflows per second, with their workflow shape, persistence model, and hardware shown beside the result.</p>
       </div>
 
       <div class="comparison-table" role="table" aria-label="Published workflow benchmark comparison">
@@ -210,21 +192,7 @@
           <div role="cell"><p>DBOS persists workflow start and completion as two writes; its benchmark body executes between them without a checkpointed application step.</p></div>
         </article>
 
-        <article class="comparison-row temporal-row" role="row">
-          <div role="cell"><strong>Temporal Cloud</strong><span>managed service claim</span></div>
-          <div role="cell"><strong>300K+ Actions/s</strong><span>not workflows/s</span></div>
-          <div role="cell"><strong>Depends on workflow</strong><span>start, activities, retries, timers…</span></div>
-          <div role="cell"><strong>Managed fleet</strong><span>hardware not disclosed</span></div>
-          <div role="cell"><p>Actions are billable server operations. Three regular Activities generally consume at least one start Action plus three Activity Actions; retries, timers, Signals, and Heartbeats add more.</p></div>
-        </article>
       </div>
-
-      <aside class="comparison-note">
-        <strong>What 300K Actions/s could mean:</strong>
-        <span>With three regular Activities, a minimal workflow is about four Actions: one Workflow start + three Activity Actions.</span>
-        <span>300K ÷ 4 = 75K workflows/s is only a derived ceiling if nothing else generates Actions and the Worker fleet keeps up. Temporal does not publish it as workflows/s.</span>
-        <span>Local Activities are counted differently: markers from one Workflow Task are grouped into one Action. Do not apply the four-Action conversion to that shape.</span>
-      </aside>
     </section>
 
     <section class="latency-section" aria-labelledby="latency-title">
@@ -287,7 +255,7 @@
         <li><span>01</span><p><strong>Same application work</strong>Three no-op handlers versus three no-op regular Activities.</p></li>
         <li><span>02</span><p><strong>Same operating distance</strong>Record client, service, and Worker locations plus hardware.</p></li>
         <li><span>03</span><p><strong>Low and high load</strong>Separate inherent latency from queueing and saturation.</p></li>
-        <li><span>04</span><p><strong>Native and shared units</strong>Workflows/s, Actions or state steps/s, p50, p95, p99, p99.9, errors.</p></li>
+        <li><span>04</span><p><strong>Native and shared units</strong>Workflows/s, handler or Activity completions/s, p50, p95, p99, p99.9, errors.</p></li>
       </ol>
     </section>
 
@@ -307,8 +275,6 @@
         <a href="https://dbos.dev/blog/benchmarking-workflow-execution-scalability-on-postgres">DBOS throughput benchmark <span>↗</span></a>
         <a href="https://github.com/dbos-inc/dbos-postgres-benchmark/blob/e0afaac820ac7ee1bb261c4aabe3461122e8953a/benchmarks/dbos_start_workflow.py#L89-L110">DBOS benchmark code <span>↗</span></a>
         <a href="https://www.dbos.dev/blog/dbos-vs-aws-step-functions-benchmark">DBOS latency reference <span>↗</span></a>
-        <a href="https://temporal.io/cloud">Temporal Cloud scale claim <span>↗</span></a>
-        <a href="https://docs.temporal.io/cloud/actions">Temporal Action definitions <span>↗</span></a>
         <a href="https://github.com/temporalio/documentation/blob/5b56ddca7d409a82f2d74e21f20edf35f29ad483/docs/design-patterns/performance-latency-patterns.mdx">Temporal latency guide <span>↗</span></a>
       </div>
     </section>
