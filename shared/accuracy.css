@@ -11,7 +11,7 @@
   background: rgba(15, 23, 42, 0.92);
   color: #e2e8f0;
   box-shadow: 0 12px 32px rgba(2, 6, 23, 0.18);
-  font: 500 12px/1.45 Inter, ui-sans-serif, system-ui, sans-serif;
+  font: 500 12px/1.45 "Atkinson Hyperlegible", ui-sans-serif, system-ui, sans-serif;
 }
 
 .demo-accuracy-note > span {

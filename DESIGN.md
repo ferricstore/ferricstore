@@ -41,27 +41,52 @@ typography:
     letterSpacing: "-0.02em"
   panel-title:
     fontFamily: '"Barlow Condensed", "Arial Narrow", sans-serif'
-    fontSize: "19px"
+    fontSize: "21px"
     fontWeight: 600
     lineHeight: 1.5
     letterSpacing: "-0.02em"
   body:
     fontFamily: '"Atkinson Hyperlegible", ui-sans-serif, system-ui, sans-serif'
-    fontSize: "16px"
+    fontSize: "17px"
     fontWeight: 400
     lineHeight: 1.62
     fontFeature: '"tnum" 1'
+  supporting:
+    fontFamily: '"Atkinson Hyperlegible", ui-sans-serif, system-ui, sans-serif'
+    fontSize: "15px"
+    fontWeight: 400
+    lineHeight: 1.5
   ui-label:
     fontFamily: '"Atkinson Hyperlegible", ui-sans-serif, system-ui, sans-serif'
-    fontSize: "14px"
+    fontSize: "15px"
     fontWeight: 700
+    lineHeight: 1.5
+  metadata:
+    fontFamily: '"Atkinson Hyperlegible", ui-sans-serif, system-ui, sans-serif'
+    fontSize: "13px"
+    fontWeight: 400
     lineHeight: 1.5
   micro-label:
     fontFamily: '"Atkinson Hyperlegible", ui-sans-serif, system-ui, sans-serif'
-    fontSize: "11px"
+    fontSize: "12px"
     fontWeight: 700
-    lineHeight: 1.5
+    lineHeight: 1.4
     letterSpacing: "0.06em"
+  state-label:
+    fontFamily: '"Barlow Condensed", "Arial Narrow", sans-serif'
+    fontSize: "18px"
+    fontWeight: 600
+    lineHeight: 1.25
+  card-title:
+    fontFamily: '"Barlow Condensed", "Arial Narrow", sans-serif'
+    fontSize: "23px"
+    fontWeight: 600
+    lineHeight: 1.25
+  metric:
+    fontFamily: '"Barlow Condensed", "Arial Narrow", sans-serif'
+    fontSize: "26px"
+    fontWeight: 600
+    lineHeight: 1.2
   mono:
     fontFamily: '"SFMono-Regular", Consolas, "Liberation Mono", monospace'
     fontWeight: 400
@@ -227,8 +252,13 @@ The palette combines cool mineral neutrals with graphite structural ink, one aci
 - **Section Title** (`{typography.section-title}`): Catalog and evidence section headings.
 - **Panel Title** (`{typography.panel-title}`): Disclosure labels and compact structural headers.
 - **Body** (`{typography.body}`): Introductory explanation and proof copy; the demo summary stays near a 54-character measure and longer accuracy notes stay near 75 characters.
+- **Supporting** (`{typography.supporting}`): Catalog descriptions, evidence notes, and other explanatory text that must remain easy to scan.
 - **UI Label** (`{typography.ui-label}`): Run controls, setup choices, links, and state-bearing actions.
+- **Metadata** (`{typography.metadata}`): Run status, telemetry notes, and compact secondary information.
 - **Micro Label** (`{typography.micro-label}`): Route codes, mechanism numbers, stamps, and uppercase operational notation.
+- **State Label** (`{typography.state-label}`): Named states inside the shared mechanism strip.
+- **Card Title** (`{typography.card-title}`): Demo names in catalog rows.
+- **Metric** (`{typography.metric}`): Evidence-strip values and compact measured results.
 - **Mono** (`{typography.mono}`): Source, identifiers, fencing tokens, and machine output.
 
 ### Named Rules
@@ -269,7 +299,7 @@ The form language is square and mechanical with only enough corner relief to avo
 ### Buttons
 
 - **Shape:** Compact mechanical rectangles with 4px corners and a minimum 44px touch target; the primary run action is 50px high.
-- **Primary:** Signal-lime fill, graphite text, 1px ink border, 18px horizontal padding, and bold 14px labeling.
+- **Primary:** Signal-lime fill, graphite text, 1px ink border, 18px horizontal padding, and bold 15px labeling.
 - **Hover / Focus / Active:** Hover shifts to the darker lime step and lifts 1px; active returns to the rail. Keyboard focus is a 3px signal-ink outline with a 3px offset. Motion uses 180ms ease-out and collapses under reduced-motion preferences.
 - **Secondary:** Transparent paper with ink text and border; hover inverts to ink with white text.
 
@@ -303,7 +333,7 @@ The signature component is a dark framed progress strip with a compact caption r
 
 ### Evidence Strip
 
-Metrics are arranged as one bordered four-cell band with 18px interior padding and rule dividers. It collapses to two columns at 1000px and one column at 520px. Values use condensed 24px type; labels and boundaries remain muted and explicit.
+Metrics are arranged as one bordered four-cell band with 18px interior padding and rule dividers. It collapses to two columns at 1000px and one column at 520px. Values use condensed 26px type; labels and boundaries remain muted and explicit.
 
 ### Disclosures
 
