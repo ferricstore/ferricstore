@@ -1086,8 +1086,48 @@ input[type="range"] {
   font-size: 11px;
 }
 
-.latency-card p {
+.latency-card > p {
   margin: 26px 0 0;
+}
+
+.latency-step-list {
+  display: grid;
+  gap: 8px;
+  margin: 20px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.latency-step-list li {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  padding: 9px 10px;
+  border: 1px solid rgba(52, 211, 153, 0.16);
+  border-radius: 9px;
+  background: rgba(52, 211, 153, 0.05);
+}
+
+.latency-step-list li > span {
+  color: var(--green);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.latency-step-list p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.latency-step-list p strong {
+  display: block;
+  color: var(--text);
+  font-size: 11px;
 }
 
 .ferric-latency {

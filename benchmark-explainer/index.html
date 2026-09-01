@@ -247,8 +247,13 @@
         <article class="latency-card fused-latency">
           <span>FERRICSTORE FUSED</span>
           <strong>27 ms</strong>
-          <small>3-step p99 · p50 18.1 ms</small>
-          <p>This is measured end-to-end batch latency for the public <code>run_steps_many</code> path. The chain persists three named states, history, and completion with no application code between states.</p>
+          <small>p99 for all 3 steps together · p50 18.1 ms</small>
+          <ol class="latency-step-list" aria-label="What the three fused workflow steps record">
+            <li><span>01</span><p><strong>Start</strong> Create the workflow and persist its first named state.</p></li>
+            <li><span>02</span><p><strong>Advance</strong> Persist the second named state in workflow history.</p></li>
+            <li><span>03</span><p><strong>Finish</strong> Persist the final named state and mark the workflow completed.</p></li>
+          </ol>
+          <p><strong>27 ms covers this entire chain.</strong> Per-step latency was not measured, so this result cannot be read as 9 ms per step. No application code runs between these states.</p>
         </article>
 
         <article class="latency-card temporal-latency">
