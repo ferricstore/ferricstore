@@ -8,8 +8,17 @@
   <title>FerricStore Interactive Demos</title>
   <link rel="icon" href="./favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="./site.css?v=1">
+  <link rel="stylesheet" href="./shared/dispatch.css?v=8">
 </head>
-<body>
+<body class="fs-dispatch">
+  <!--
+  THESIS: Durable work should be inspectable as it moves; this surface refuses the generic gradient hero and interchangeable demo-card catalog.
+  OWN-WORLD: Warm evaluation paper, deep blue-black rails, signal orange, flight-progress strips, stamped states, compact rules, and square mechanical controls.
+  STORY: An engineering leader recognizes a failure, runs the mechanism, verifies recovery and its boundary, then follows evidence toward adoption.
+  FIRST VIEWPORT: A concise decision thesis and primary action sit beside a live workflow strip; the recovery mechanism is visible before catalog prose.
+  FORM: Dispatch Strip Board, sixth grounded direction, seed 2ac9d312.
+  FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
+  -->
   <a class="skip-link" href="#demo-grid">Skip to demos</a>
 
   <header class="site-header">
@@ -26,12 +35,11 @@
   <main>
     <section class="hero" aria-labelledby="hero-title">
       <div class="hero-copy">
-        <span class="eyebrow">DURABLE SYSTEMS, MADE VISIBLE</span>
-        <h1 id="hero-title">See recovery happen.<br><span>State by state.</span></h1>
-        <p>Explore self-contained simulations of FerricStore workflows, queues, streaming, caching, and coordination patterns. Every demo is interactive and runs directly in your browser.</p>
+        <h1 id="hero-title">Watch durable work survive failure.</h1>
+        <p>Run self-contained workflow, queue, coordination, and data-structure experiments. Each demo exposes the state transition, failure boundary, and recovery behavior an architect needs to evaluate FerricStore.</p>
         <div class="hero-actions">
-          <a class="primary-action" href="./workflow-explainer/">Start with Workflows for Humans <span aria-hidden="true">→</span></a>
-          <a class="secondary-action" href="#demo-grid">Browse all 20 demos</a>
+          <a class="primary-action" href="./workflow-explainer/">Run your first recovery <span aria-hidden="true">→</span></a>
+          <a class="secondary-action" href="#demo-grid">Browse all mechanisms</a>
         </div>
       </div>
       <div class="hero-visual" aria-label="Workflow recovery preview">
@@ -58,8 +66,7 @@
     <section class="catalog" aria-labelledby="catalog-title">
       <header class="catalog-header">
         <div>
-          <span class="eyebrow">DEMO COLLECTION</span>
-          <h2 id="catalog-title">Choose a system behavior to explore</h2>
+          <h2 id="catalog-title">Choose a mechanism to evaluate</h2>
         </div>
         <p><span data-visible-count>20</span> unique demos</p>
       </header>
@@ -90,6 +97,7 @@
     <p>Open source · Browser-based demonstrations · No account required</p>
   </footer>
 
-  <script src="./site.js?v=3"></script>
+  <script src="./site.js?v=4"></script>
+  <script src="./shared/dispatch.js?v=8"></script>
 </body>
 </html>

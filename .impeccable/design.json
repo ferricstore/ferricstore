@@ -1,0 +1,242 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-01T12:55:58Z",
+  "title": "Design System: FerricStore Dispatch Strip Board",
+  "extensions": {
+    "colorMeta": {
+      "paper": {
+        "role": "neutral",
+        "displayName": "Evaluation Paper",
+        "canonical": "#eeece4",
+        "tonalRamp": ["oklch(15% 0.011 95.2)", "oklch(27% 0.011 95.2)", "oklch(39% 0.011 95.2)", "oklch(51% 0.011 95.2)", "oklch(63% 0.011 95.2)", "oklch(75% 0.011 95.2)", "oklch(87% 0.011 95.2)", "oklch(95% 0.011 95.2)"]
+      },
+      "paper-bright": {
+        "role": "neutral",
+        "displayName": "Bright Paper",
+        "canonical": "#faf8f1",
+        "tonalRamp": ["oklch(15% 0.009 93.6)", "oklch(27% 0.009 93.6)", "oklch(39% 0.009 93.6)", "oklch(51% 0.009 93.6)", "oklch(63% 0.009 93.6)", "oklch(75% 0.009 93.6)", "oklch(87% 0.009 93.6)", "oklch(95% 0.009 93.6)"]
+      },
+      "strip": {
+        "role": "neutral",
+        "displayName": "Progress Strip",
+        "canonical": "#f4f0e3",
+        "tonalRamp": ["oklch(15% 0.018 92.7)", "oklch(27% 0.018 92.7)", "oklch(39% 0.018 92.7)", "oklch(51% 0.018 92.7)", "oklch(63% 0.018 92.7)", "oklch(75% 0.018 92.7)", "oklch(87% 0.018 92.7)", "oklch(95% 0.018 92.7)"]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Rail Ink",
+        "canonical": "#12272f",
+        "tonalRamp": ["oklch(15% 0.031 224.8)", "oklch(27% 0.031 224.8)", "oklch(39% 0.031 224.8)", "oklch(51% 0.031 224.8)", "oklch(63% 0.031 224.8)", "oklch(75% 0.031 224.8)", "oklch(87% 0.031 224.8)", "oklch(95% 0.031 224.8)"]
+      },
+      "ink-soft": {
+        "role": "neutral",
+        "displayName": "Soft Ink",
+        "canonical": "#294049",
+        "tonalRamp": ["oklch(15% 0.033 224.5)", "oklch(27% 0.033 224.5)", "oklch(39% 0.033 224.5)", "oklch(51% 0.033 224.5)", "oklch(63% 0.033 224.5)", "oklch(75% 0.033 224.5)", "oklch(87% 0.033 224.5)", "oklch(95% 0.033 224.5)"]
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Muted Notation",
+        "canonical": "#5e6d6f",
+        "tonalRamp": ["oklch(15% 0.018 206.4)", "oklch(27% 0.018 206.4)", "oklch(39% 0.018 206.4)", "oklch(51% 0.018 206.4)", "oklch(63% 0.018 206.4)", "oklch(75% 0.018 206.4)", "oklch(87% 0.018 206.4)", "oklch(95% 0.018 206.4)"]
+      },
+      "line": {
+        "role": "neutral",
+        "displayName": "Rule Line",
+        "canonical": "#aeb5ad",
+        "tonalRamp": ["oklch(15% 0.014 141.8)", "oklch(27% 0.014 141.8)", "oklch(39% 0.014 141.8)", "oklch(51% 0.014 141.8)", "oklch(63% 0.014 141.8)", "oklch(75% 0.014 141.8)", "oklch(87% 0.014 141.8)", "oklch(95% 0.014 141.8)"]
+      },
+      "line-soft": {
+        "role": "neutral",
+        "displayName": "Soft Rule Line",
+        "canonical": "#d4d5cc",
+        "tonalRamp": ["oklch(15% 0.012 111.8)", "oklch(27% 0.012 111.8)", "oklch(39% 0.012 111.8)", "oklch(51% 0.012 111.8)", "oklch(63% 0.012 111.8)", "oklch(75% 0.012 111.8)", "oklch(87% 0.012 111.8)", "oklch(95% 0.012 111.8)"]
+      },
+      "signal-orange": {
+        "role": "primary",
+        "displayName": "Signal Orange",
+        "canonical": "#b94721",
+        "tonalRamp": ["oklch(15% 0.156 37.9)", "oklch(27% 0.156 37.9)", "oklch(39% 0.156 37.9)", "oklch(51% 0.156 37.9)", "oklch(63% 0.156 37.9)", "oklch(75% 0.156 37.9)", "oklch(87% 0.156 37.9)", "oklch(95% 0.156 37.9)"]
+      },
+      "signal-orange-dark": {
+        "role": "primary",
+        "displayName": "Dark Signal Orange",
+        "canonical": "#913516",
+        "tonalRamp": ["oklch(15% 0.132 37.9)", "oklch(27% 0.132 37.9)", "oklch(39% 0.132 37.9)", "oklch(51% 0.132 37.9)", "oklch(63% 0.132 37.9)", "oklch(75% 0.132 37.9)", "oklch(87% 0.132 37.9)", "oklch(95% 0.132 37.9)"]
+      },
+      "success-green": {
+        "role": "secondary",
+        "displayName": "Recovery Green",
+        "canonical": "#587360",
+        "tonalRamp": ["oklch(15% 0.043 154.1)", "oklch(27% 0.043 154.1)", "oklch(39% 0.043 154.1)", "oklch(51% 0.043 154.1)", "oklch(63% 0.043 154.1)", "oklch(75% 0.043 154.1)", "oklch(87% 0.043 154.1)", "oklch(95% 0.043 154.1)"]
+      },
+      "warning-yellow": {
+        "role": "secondary",
+        "displayName": "Boundary Yellow",
+        "canonical": "#d9b84b",
+        "tonalRamp": ["oklch(15% 0.132 92.2)", "oklch(27% 0.132 92.2)", "oklch(39% 0.132 92.2)", "oklch(51% 0.132 92.2)", "oklch(63% 0.132 92.2)", "oklch(75% 0.132 92.2)", "oklch(87% 0.132 92.2)", "oklch(95% 0.132 92.2)"]
+      },
+      "failure-red": {
+        "role": "secondary",
+        "displayName": "Failure Red",
+        "canonical": "#a43e34",
+        "tonalRamp": ["oklch(15% 0.137 28.5)", "oklch(27% 0.137 28.5)", "oklch(39% 0.137 28.5)", "oklch(51% 0.137 28.5)", "oklch(63% 0.137 28.5)", "oklch(75% 0.137 28.5)", "oklch(87% 0.137 28.5)", "oklch(95% 0.137 28.5)"]
+      },
+      "evidence-blue": {
+        "role": "secondary",
+        "displayName": "Evidence Blue",
+        "canonical": "#365f73",
+        "tonalRamp": ["oklch(15% 0.056 230.9)", "oklch(27% 0.056 230.9)", "oklch(39% 0.056 230.9)", "oklch(51% 0.056 230.9)", "oklch(63% 0.056 230.9)", "oklch(75% 0.056 230.9)", "oklch(87% 0.056 230.9)", "oklch(95% 0.056 230.9)"]
+      },
+      "surface-white": {
+        "role": "neutral",
+        "displayName": "Surface White",
+        "canonical": "#ffffff",
+        "tonalRamp": ["oklch(15% 0 0)", "oklch(27% 0 0)", "oklch(39% 0 0)", "oklch(51% 0 0)", "oklch(63% 0 0)", "oklch(75% 0 0)", "oklch(87% 0 0)", "oklch(95% 0 0)"]
+      },
+      "terminal-deep": {
+        "role": "neutral",
+        "displayName": "Terminal Deep",
+        "canonical": "#101b20",
+        "tonalRamp": ["oklch(15% 0.019 227.9)", "oklch(27% 0.019 227.9)", "oklch(39% 0.019 227.9)", "oklch(51% 0.019 227.9)", "oklch(63% 0.019 227.9)", "oklch(75% 0.019 227.9)", "oklch(87% 0.019 227.9)", "oklch(95% 0.019 227.9)"]
+      },
+      "terminal-text": {
+        "role": "neutral",
+        "displayName": "Terminal Text",
+        "canonical": "#eff4ef",
+        "tonalRamp": ["oklch(15% 0.008 145.5)", "oklch(27% 0.008 145.5)", "oklch(39% 0.008 145.5)", "oklch(51% 0.008 145.5)", "oklch(63% 0.008 145.5)", "oklch(75% 0.008 145.5)", "oklch(87% 0.008 145.5)", "oklch(95% 0.008 145.5)"]
+      }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Display", "purpose": "Catalog thesis only." },
+      "headline": { "displayName": "Demo Headline", "purpose": "Short first-viewport mechanism titles." },
+      "section-title": { "displayName": "Section Title", "purpose": "Catalog and evidence section headings." },
+      "panel-title": { "displayName": "Panel Title", "purpose": "Disclosure labels and compact structural headers." },
+      "body": { "displayName": "Proof Copy", "purpose": "Mechanism summaries, boundaries, and evaluation prose." },
+      "ui-label": { "displayName": "UI Label", "purpose": "Run controls, choices, and evidence links." },
+      "micro-label": { "displayName": "Operational Stamp", "purpose": "Route codes, ordinals, and compact state notation." },
+      "mono": { "displayName": "Machine State", "purpose": "Code, identifiers, fencing tokens, and terminal output." }
+    },
+    "shadows": [
+      { "name": "apparatus", "value": "0 20px 42px rgba(18, 39, 47, 0.14)", "purpose": "Catalog workflow preview only." },
+      { "name": "action", "value": "0 10px 20px rgba(164, 62, 52, 0.16)", "purpose": "Primary run action at rest." }
+    ],
+    "motion": [
+      { "name": "control-state", "value": "180ms ease-out", "purpose": "Background, color, and one-pixel lift changes on primary and secondary controls." },
+      { "name": "reduced-motion", "value": "0.01ms", "purpose": "Transition and animation duration under prefers-reduced-motion; iteration is limited to one and scrolling becomes automatic." }
+    ],
+    "breakpoints": [
+      { "name": "evidence-two-column", "value": "1000px" },
+      { "name": "stacked-first-view", "value": "780px" },
+      { "name": "single-column-rail", "value": "520px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Run Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Starts the current experiment and carries the one dominant action in the first viewport.",
+      "html": "<button class=\"ds-btn-primary\" type=\"button\">RUN THE RECOVERY</button>",
+      "css": ".ds-btn-primary { min-height: 50px; padding: 0 18px; border: 1px solid #12272f; border-radius: 4px; background: #b94721; color: #fff; box-shadow: 0 10px 20px rgba(164, 62, 52, 0.16); font-family: \"Atkinson Hyperlegible\", ui-sans-serif, system-ui, sans-serif; font-size: 14px; font-weight: 700; cursor: pointer; transition: background-color 180ms ease-out, color 180ms ease-out, transform 180ms ease-out; } .ds-btn-primary:hover { background: #913516; transform: translateY(-1px); } .ds-btn-primary:active { transform: translateY(0); } .ds-btn-primary:focus-visible { outline: 3px solid #b94721; outline-offset: 3px; } @media (prefers-reduced-motion: reduce) { .ds-btn-primary { transition-duration: 0.01ms; } }"
+    },
+    {
+      "name": "Secondary Mechanical Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Reveals code or provides a secondary action without competing with the run control.",
+      "html": "<button class=\"ds-btn-secondary\" type=\"button\" aria-expanded=\"false\">INSPECT CODE</button>",
+      "css": ".ds-btn-secondary { min-height: 50px; padding: 0 14px; border: 1px solid #12272f; border-radius: 4px; background: transparent; color: #12272f; font-family: \"Atkinson Hyperlegible\", ui-sans-serif, system-ui, sans-serif; font-size: 14px; font-weight: 700; cursor: pointer; transition: background-color 180ms ease-out, color 180ms ease-out; } .ds-btn-secondary:hover { background: #12272f; color: #fff; } .ds-btn-secondary:active { background: #294049; color: #fff; } .ds-btn-secondary:focus-visible { outline: 3px solid #b94721; outline-offset: 3px; } @media (prefers-reduced-motion: reduce) { .ds-btn-secondary { transition-duration: 0.01ms; } }"
+    },
+    {
+      "name": "Setup Choice Rack",
+      "kind": "custom",
+      "refersTo": "setup-choice",
+      "description": "Presents route modes or scenarios as compact, left-aligned mechanical choices.",
+      "html": "<div class=\"ds-setup-rack\" role=\"tablist\" aria-label=\"Experiment setup\"><button class=\"ds-setup-choice ds-is-selected\" type=\"button\" role=\"tab\" aria-selected=\"true\">WITH FERRICSTORE</button><button class=\"ds-setup-choice\" type=\"button\" role=\"tab\" aria-selected=\"false\">WITHOUT DURABLE STATE</button></div>",
+      "css": ".ds-setup-rack { display: grid; grid-template-columns: 1fr; gap: 5px; } .ds-setup-choice { width: 100%; min-height: 46px; padding: 9px 12px; border: 1px solid #aeb5ad; border-radius: 3px; background: #faf8f1; color: #12272f; font-family: \"Atkinson Hyperlegible\", ui-sans-serif, system-ui, sans-serif; font-size: 14px; font-weight: 700; text-align: left; cursor: pointer; } .ds-setup-choice:hover { border-color: #12272f; background: #f4f0e3; } .ds-setup-choice.ds-is-selected, .ds-setup-choice[aria-selected=\"true\"] { border-color: #12272f; background: #12272f; color: #fff; } .ds-setup-choice:focus-visible { outline: 3px solid #b94721; outline-offset: 3px; }"
+    },
+    {
+      "name": "Evaluation Navigation",
+      "kind": "nav",
+      "refersTo": "evaluation-nav",
+      "description": "Keeps product identity, route identity, and adoption paths visible above every demo.",
+      "html": "<nav class=\"ds-eval-nav\" aria-label=\"Demo navigation\"><a class=\"ds-brand\" href=\"#\"><svg viewBox=\"0 0 32 32\" aria-hidden=\"true\"><path d=\"M5 6h21v5H11v4h12v5H11v7H5z\" fill=\"currentColor\"/><path d=\"M22 15h5v12h-5z\" fill=\"#b94721\"/></svg><span><strong>FerricStore</strong><small>Evaluation lab</small></span></a><span class=\"ds-route\"><b>WF-01</b><span>Workflows, without the hand-waving</span></span><span class=\"ds-links\"><a href=\"#\">All demos</a><a href=\"#\">Documentation</a><a href=\"#\">Source</a></span></nav>",
+      "css": ".ds-eval-nav { display: grid; grid-template-columns: minmax(190px, 1fr) minmax(260px, 1.4fr) minmax(290px, 1fr); min-height: 64px; align-items: center; border-bottom: 1px solid #12272f; background: #faf8f1; color: #12272f; font-family: \"Atkinson Hyperlegible\", ui-sans-serif, system-ui, sans-serif; } .ds-eval-nav > * { min-width: 0; padding-inline: clamp(16px, 2.7vw, 42px); } .ds-brand { display: flex; min-height: 64px; align-items: center; gap: 10px; border-right: 1px solid #aeb5ad; color: inherit; text-decoration: none; } .ds-brand svg { width: 28px; height: 28px; } .ds-brand span { display: grid; line-height: 1.05; } .ds-brand strong { font-family: \"Barlow Condensed\", \"Arial Narrow\", sans-serif; font-size: 18px; } .ds-brand small { margin-top: 3px; color: #5e6d6f; font-size: 11px; } .ds-route { display: flex; min-height: 64px; align-items: center; gap: 12px; border-right: 1px solid #aeb5ad; overflow: hidden; } .ds-route b { padding: 3px 7px; background: #12272f; color: #faf8f1; font-size: 11px; letter-spacing: 0.06em; } .ds-route span { overflow: hidden; font-size: 13px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; } .ds-links { display: flex; justify-content: flex-end; gap: 6px; } .ds-links a { display: inline-flex; min-height: 44px; align-items: center; padding-inline: 8px; color: #294049; font-size: 13px; font-weight: 700; } .ds-links a:hover { color: #913516; } .ds-eval-nav a:focus-visible { outline: 3px solid #b94721; outline-offset: 3px; } @media (max-width: 780px) { .ds-eval-nav { grid-template-columns: 1fr auto; } .ds-eval-nav > * { padding-inline: 14px; } .ds-brand { border-right: 0; } .ds-route { grid-column: 1 / -1; grid-row: 2; min-height: 44px; border-top: 1px solid #aeb5ad; border-right: 0; } .ds-links a:not(:first-child) { display: none; } }"
+    },
+    {
+      "name": "Mechanism Map",
+      "kind": "custom",
+      "refersTo": "mechanism-map",
+      "description": "Summarizes named durable states and advances the same strip as the live route runs.",
+      "html": "<figure class=\"ds-mechanism\" aria-label=\"Mechanism map\"><figcaption><span>MECHANISM MAP</span><strong>One committed workflow moves to a replacement owner.</strong></figcaption><ol><li class=\"ds-cell ds-is-done\"><span>01</span><strong>CLAIM</strong></li><li class=\"ds-cell ds-is-done\"><span>02</span><strong>RUN</strong></li><li class=\"ds-cell ds-is-current\"><span>03</span><strong>CRASH</strong></li><li class=\"ds-cell\"><span>04</span><strong>RECLAIM</strong></li><li class=\"ds-cell ds-is-outcome\"><span>05</span><strong>COMPLETE</strong></li></ol><p class=\"ds-scroll-hint\">Scroll the state rail to inspect every step.</p></figure>",
+      "css": ".ds-mechanism { margin: 0; border: 1px solid #12272f; background: #12272f; color: #faf8f1; font-family: \"Atkinson Hyperlegible\", ui-sans-serif, system-ui, sans-serif; } .ds-mechanism figcaption { display: grid; grid-template-columns: 118px 1fr; min-height: 48px; align-items: center; border-bottom: 1px solid rgba(255,255,255,0.28); } .ds-mechanism figcaption > * { padding: 10px 14px; } .ds-mechanism figcaption span { border-right: 1px solid rgba(255,255,255,0.28); color: #d9ddd7; font-size: 11px; text-transform: uppercase; } .ds-mechanism figcaption strong { font-size: 13px; font-weight: 400; } .ds-mechanism ol { display: grid; grid-template-columns: repeat(5, minmax(92px, 1fr)); gap: 1px; margin: 0; padding: 1px; overflow-x: auto; background: rgba(255,255,255,0.22); list-style: none; } .ds-cell { position: relative; display: grid; min-height: 72px; align-content: space-between; gap: 10px; padding: 10px 12px; background: #f4f0e3; color: #12272f; } .ds-cell::after { position: absolute; top: 0; right: 10px; width: 9px; height: 18px; background: #aeb5ad; content: \"\"; clip-path: polygon(0 0,100% 0,100% 75%,50% 100%,0 75%); } .ds-cell > span { color: #5e6d6f; font-size: 10px; letter-spacing: 0.08em; } .ds-cell > strong { font-family: \"Barlow Condensed\", \"Arial Narrow\", sans-serif; font-size: 16px; font-weight: 600; } .ds-cell.ds-is-current::after { background: #b94721; } .ds-cell.ds-is-done { background: #dfe7dd; } .ds-cell.ds-is-done::after, .ds-cell.ds-is-outcome::after { background: #587360; } .ds-scroll-hint { display: none; } @media (max-width: 520px) { .ds-mechanism figcaption { display: block; } .ds-mechanism figcaption span { display: block; border-right: 0; border-bottom: 1px solid rgba(255,255,255,0.2); } .ds-mechanism ol { scroll-snap-type: x proximity; } .ds-cell { min-width: 132px; scroll-snap-align: start; } .ds-scroll-hint { display: block; margin: 0; padding: 8px 12px; border-top: 1px solid rgba(255,255,255,0.2); color: #d9ddd7; font-size: 11px; } }"
+    },
+    {
+      "name": "Evidence Strip",
+      "kind": "card",
+      "refersTo": "evidence-strip",
+      "description": "Keeps the live result, boundary, and supporting facts in one compact ruled band.",
+      "html": "<section class=\"ds-evidence\" aria-label=\"Evaluation evidence\"><article><small>OWNERSHIP</small><strong>fence 42</strong><span>replacement worker</span></article><article><small>RECOVERY</small><strong>after lease expiry</strong><span>same named state</span></article><article><small>HANDLER</small><strong>at-least-once</strong><span>effects need idempotency</span></article><article><small>OUTCOME</small><strong>completed</strong><span>stale write rejected</span></article></section>",
+      "css": ".ds-evidence { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); border: 1px solid #12272f; background: #faf8f1; color: #12272f; font-family: \"Atkinson Hyperlegible\", ui-sans-serif, system-ui, sans-serif; } .ds-evidence article { display: grid; min-width: 0; gap: 4px; padding: 16px 18px; border-right: 1px solid #aeb5ad; } .ds-evidence article:last-child { border-right: 0; } .ds-evidence small { color: #5e6d6f; font-size: 11px; } .ds-evidence strong { font-family: \"Barlow Condensed\", \"Arial Narrow\", sans-serif; font-size: 24px; font-weight: 600; } .ds-evidence span { color: #5e6d6f; font-size: 12px; } @media (max-width: 1000px) { .ds-evidence { grid-template-columns: repeat(2, minmax(0,1fr)); } .ds-evidence article:nth-child(2) { border-right: 0; } .ds-evidence article:nth-child(-n+2) { border-bottom: 1px solid #aeb5ad; } } @media (max-width: 520px) { .ds-evidence { grid-template-columns: 1fr; } .ds-evidence article { border-right: 0; border-bottom: 1px solid #aeb5ad; } .ds-evidence article:last-child { border-bottom: 0; } }"
+    },
+    {
+      "name": "Technical Disclosure",
+      "kind": "custom",
+      "refersTo": "disclosure-row",
+      "description": "Defers supporting code, comparisons, and caveats while keeping their purpose visible.",
+      "html": "<details class=\"ds-disclosure\"><summary><span>Accuracy and SDK boundary</span><small>Open</small></summary><div><p>Workflow handlers remain at-least-once. Guard external effects with a stable idempotency key.</p></div></details>",
+      "css": ".ds-disclosure { border-top: 1px solid #12272f; border-bottom: 1px solid #12272f; background: #faf8f1; color: #12272f; font-family: \"Atkinson Hyperlegible\", ui-sans-serif, system-ui, sans-serif; } .ds-disclosure summary { display: flex; min-height: 58px; align-items: center; justify-content: space-between; gap: 20px; padding: 0 18px; cursor: pointer; font-family: \"Barlow Condensed\", \"Arial Narrow\", sans-serif; font-size: 19px; font-weight: 600; list-style: none; } .ds-disclosure summary::-webkit-details-marker { display: none; } .ds-disclosure summary:hover { background: #f4f0e3; } .ds-disclosure summary:focus-visible { outline: 3px solid #b94721; outline-offset: 3px; } .ds-disclosure summary small { color: #913516; font-family: \"Atkinson Hyperlegible\", ui-sans-serif, system-ui, sans-serif; font-size: 12px; } .ds-disclosure[open] summary small { font-size: 0; } .ds-disclosure[open] summary small::after { content: \"Close\"; font-size: 12px; } .ds-disclosure > div { padding: clamp(18px,3vw,38px); border-top: 1px solid #d4d5cc; background: #fff; } .ds-disclosure p { max-width: 75ch; margin: 0; color: #294049; line-height: 1.62; }"
+    },
+    {
+      "name": "Catalog Search Field",
+      "kind": "input",
+      "refersTo": "search-field",
+      "description": "Searches the mechanism catalog from the same ruled control band as the filters.",
+      "html": "<label class=\"ds-search\"><span aria-hidden=\"true\">⌕</span><span class=\"ds-visually-hidden\">Search demos</span><input type=\"search\" placeholder=\"Search demos\" autocomplete=\"off\"></label>",
+      "css": ".ds-search { display: flex; min-height: 44px; align-items: center; gap: 8px; padding: 0 12px; border: 1px solid #12272f; border-radius: 3px; background: #faf8f1; color: #12272f; font-family: \"Atkinson Hyperlegible\", ui-sans-serif, system-ui, sans-serif; } .ds-search input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: #12272f; font: inherit; } .ds-search:hover { background: #f4f0e3; } .ds-search:focus-within { outline: 3px solid #b94721; outline-offset: 3px; } .ds-visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }"
+    },
+    {
+      "name": "Catalog Demo Row",
+      "kind": "card",
+      "refersTo": "catalog-row",
+      "description": "Presents each demo as a ruled evaluation row instead of a floating marketing card.",
+      "html": "<article class=\"ds-demo-row\"><a href=\"#\"><span class=\"ds-demo-code\">WF</span><span class=\"ds-demo-copy\"><strong>Crash a live worker</strong><small>Watch a replacement reclaim the durable middle state.</small></span><span class=\"ds-demo-open\">OPEN →</span></a></article>",
+      "css": ".ds-demo-row { border-top: 1px solid #aeb5ad; background: transparent; font-family: \"Atkinson Hyperlegible\", ui-sans-serif, system-ui, sans-serif; } .ds-demo-row a { display: grid; grid-template-columns: 42px 1fr auto; gap: 14px; align-items: center; padding: 18px 8px; color: #12272f; text-decoration: none; } .ds-demo-row:hover { border-color: #12272f; background: #f4f0e3; } .ds-demo-row a:focus-visible { outline: 3px solid #b94721; outline-offset: 3px; } .ds-demo-code { display: grid; min-height: 64px; place-items: center; border-radius: 2px; background: #12272f; color: #fff; font-family: \"Barlow Condensed\", \"Arial Narrow\", sans-serif; font-size: 13px; font-weight: 700; } .ds-demo-copy { display: grid; gap: 4px; } .ds-demo-copy strong { font-family: \"Barlow Condensed\", \"Arial Narrow\", sans-serif; font-size: 21px; font-weight: 600; } .ds-demo-copy small { max-width: 58ch; color: #5e6d6f; font-size: 13px; } .ds-demo-open { color: #913516; font-size: 12px; font-weight: 700; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Dispatch Strip Board",
+    "overview": "Dispatch Strip Board treats durable workflow state like a paper progress strip moving through named rails. The world is warm, inspectable, and operational: deep blue-black frames hold pale working surfaces, compact stamps identify state, and signal orange marks the action or transition that deserves attention.\n\nThe system is built for evaluation rather than spectacle. An architect should recognize a failure, run the mechanism, verify recovery and its boundary, then follow the evidence toward adoption. The first viewport therefore pairs a concise thesis and direct action with a live mechanism; supporting prose, code, comparisons, and evidence follow only after the system has shown its work.\n\nIt deliberately rejects the generic gradient demo shell. Personality comes from paper, rails, separators, stamped states, condensed headings, and mechanical control geometry rather than decorative glow or interchangeable cards.",
+    "keyCharacteristics": [
+      "Warm evaluation paper over deep blue-black rails.",
+      "Signal orange reserved for primary action and current state.",
+      "Condensed structural headings paired with hyperlegible proof copy.",
+      "Compact bordered panels, stamped labels, and square mechanical controls.",
+      "Live state movement before supporting prose, code, and evidence."
+    ],
+    "rules": [
+      { "name": "The Signal Is Earned Rule", "body": "Use signal orange for the primary action, current mechanism mark, focus, selection, or evidence-link emphasis; do not wash whole surfaces in it.", "section": "colors" },
+      { "name": "The Paper Before Glow Rule", "body": "The world is warm paper and solid rails; generic gradient demo shells are outside the system.", "section": "colors" },
+      { "name": "The Two-Voice Rule", "body": "Use Barlow Condensed to name structures and Atkinson Hyperlegible to explain and verify them; reserve mono for code and machine state.", "section": "typography" },
+      { "name": "The Mechanism-First Rule", "body": "In demo first viewports, the thesis, primary action, and live mechanism must appear before supporting prose or code.", "section": "layout" },
+      { "name": "The Flat-by-Default Rule", "body": "Borders and tonal surfaces carry hierarchy; shadows belong only to the catalog hero apparatus and the primary action.", "section": "elevation" },
+      { "name": "The Mechanical Corner Rule", "body": "Controls and state markers stay square or gently relieved, never pill-soft unless a route-specific mechanism already requires it.", "section": "shapes" },
+      { "name": "The Same-Strip Rule", "body": "Updates advance the existing strip with current and done stamps rather than replacing it with a disconnected success graphic.", "section": "components" }
+    ],
+    "dos": [
+      "Do put the runnable mechanism and its current state in the first viewport.",
+      "Do keep failure, recovery, and the evaluation boundary attached to the same strip or evidence flow.",
+      "Do use paper tones, one-pixel rules, stamps, and condensed labels to create structure before adding elevation.",
+      "Do preserve visible focus, 44px minimum targets, reduced motion, and horizontal rail scrolling on narrow screens.",
+      "Do use route-specific diagrams inside the shared Dispatch framing when they make the mechanism clearer."
+    ],
+    "donts": [
+      "Don't return to a generic gradient hero or an interchangeable floating-card demo shell.",
+      "Don't use signal orange as a broad decorative wash or use semantic status colors without state meaning.",
+      "Don't hide the live experiment behind introductory prose, code, or a separate detail page.",
+      "Don't imply exactly-once handler execution, unsupported guarantees, or adoption evidence through celebratory visual treatment.",
+      "Don't round every surface into pills or add shadows where a rail, rule, or paper layer already establishes hierarchy."
+    ]
+  }
+}

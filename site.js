@@ -7,151 +7,151 @@
     {
       id: "workflow-explainer",
       title: "Workflows for Humans",
-      icon: "🎮",
+      icon: "WF",
       description: "Learn durable workflows through a familiar save-point story before exploring leases, retries, and recovery.",
-      topics: ["Featured", "Getting started", "AI & workflows"],
+      topics: ["Workflows", "Start here"],
       accent: "#6366f1"
     },
     {
       id: "ai-agent-workflow",
       title: "AI Agent & Human Approval",
-      icon: "🤖",
+      icon: "AI",
       description: "Park a long-running agent in a durable approval state, survive a host restart, and resume from an external signal.",
-      topics: ["Featured", "AI & workflows", "Reliability"],
+      topics: ["Workflows", "Coordination"],
       accent: "#34d399"
     },
     {
       id: "travel-saga",
       title: "Travel Booking Saga",
-      icon: "✈",
+      icon: "SG",
       description: "Coordinate flight, hotel, and car reservations with explicit compensation steps when a later booking fails.",
-      topics: ["AI & workflows", "Reliability"],
+      topics: ["Workflows", "Coordination"],
       accent: "#f59e0b"
     },
     {
       id: "subscription-dunning",
       title: "Subscription Dunning",
-      icon: "↻",
+      icon: "DN",
       description: "Move a subscription through retry windows, payment recovery, and cancellation using durable timers and explicit state.",
-      topics: ["AI & workflows"],
+      topics: ["Workflows"],
       accent: "#f472b6"
     },
     {
       id: "ticket-reservation",
       title: "Flash-Sale Reservation",
-      icon: "🎟",
+      icon: "TK",
       description: "Hold scarce inventory with durable expiration, guarded ownership, and a clean transition from reservation to purchase.",
-      topics: ["Getting started", "AI & workflows"],
+      topics: ["Workflows", "Coordination"],
       accent: "#f97316"
     },
     {
       id: "canary-rollback",
       title: "Canary Rollback",
-      icon: "◒",
+      icon: "CN",
       description: "Model deployment observation, health thresholds, promotion, and rollback as visible durable states.",
-      topics: ["AI & workflows", "Reliability"],
+      topics: ["Workflows", "Coordination"],
       accent: "#fbbf24"
     },
     {
       id: "parallel-fanout",
       title: "Parallel Fan-Out",
-      icon: "⑂",
+      icon: "FX",
       description: "Split a batch into independently recoverable children, then join their results without replaying successful work.",
-      topics: ["AI & workflows", "Queues & messaging"],
+      topics: ["Workflows", "Queues & streams"],
       accent: "#60a5fa"
     },
     {
       id: "agent-loop",
       title: "Agent Reliability Controls",
-      icon: "◎",
+      icon: "AG",
       description: "Stop runaway agent spend with durable budgets and protect downstream services with persistent circuit state.",
-      topics: ["Featured", "AI & workflows", "Reliability"],
+      topics: ["Workflows", "Coordination"],
       accent: "#ec4899"
     },
     {
       id: "split-lab",
       title: "Split Lab",
-      icon: "⚡",
+      icon: "SL",
       description: "Crash an AI research worker during summarization and watch a replacement resume from durable state without repeating completed work.",
-      topics: ["Featured", "AI & workflows", "Reliability"],
+      topics: ["Workflows", "Start here"],
       accent: "#8b5cf6"
     },
     {
       id: "idempotency-determinism",
       title: "Idempotency & Determinism",
-      icon: "◇",
+      icon: "ID",
       description: "Explore the duplicate-side-effect boundary and protect retries with stable operation identities and guarded effects.",
-      topics: ["Getting started", "AI & workflows", "Reliability"],
+      topics: ["Workflows", "Coordination"],
       accent: "#a78bfa"
     },
     {
       id: "zombie-fencing",
       title: "Zombie Worker Fencing",
-      icon: "⛨",
+      icon: "FN",
       description: "See a stale worker return after lease expiry and lose its write to a newer monotonic fencing token.",
-      topics: ["Architecture", "Reliability"],
+      topics: ["Coordination"],
       accent: "#fb7185"
     },
     {
       id: "architecture-comparison",
       title: "Architecture Comparison",
-      icon: "◫",
+      icon: "CP",
       description: "Compare volatile scripts, queues, database polling, and durable workflow state under the same failure conditions.",
-      topics: ["Featured", "Architecture", "Reliability"],
+      topics: ["Coordination", "Start here"],
       accent: "#38bdf8"
     },
     {
       id: "benchmark-explainer",
       title: "Workflow Benchmark, Explained",
-      icon: "▥",
+      icon: "BM",
       description: "See what 54K worker-driven and 104K fused workflows per second actually mean, then compare their boundaries with Temporal and DBOS.",
-      topics: ["Featured", "Architecture"],
+      topics: ["Coordination", "Start here"],
       accent: "#22d3ee"
     },
     {
       id: "hot-cold-storage",
       title: "Hot & Cold Storage",
-      icon: "▦",
+      icon: "HC",
       description: "Follow values between memory and disk-backed storage as pressure changes, without losing the logical keyspace.",
-      topics: ["Data structures", "Architecture"],
+      topics: ["Data structures"],
       accent: "#2dd4bf"
     },
     {
       id: "rate-limiting-stream",
       title: "Rate Limiting & Micro-Batching",
-      icon: "≋",
+      icon: "RL",
       description: "Absorb a webhook burst into a durable stream, enforce throughput limits, and process bounded batches.",
-      topics: ["Queues & messaging", "Architecture"],
+      topics: ["Queues & streams", "Coordination"],
       accent: "#22d3ee"
     },
     {
       id: "beginner-queue",
       title: "Your First Durable Queue",
-      icon: "→",
+      icon: "Q1",
       description: "Enqueue, claim, lease, retry, and complete a background job with the core ownership rules made visible.",
-      topics: ["Getting started", "Queues & messaging"],
+      topics: ["Queues & streams", "Start here"],
       accent: "#818cf8"
     },
     {
       id: "cache-stampede",
       title: "Cache Stampede Shield",
-      icon: "☂",
+      icon: "CS",
       description: "Coordinate one recomputation while concurrent callers reuse the result instead of overwhelming the origin.",
-      topics: ["Getting started", "Data structures", "Reliability"],
+      topics: ["Data structures", "Coordination"],
       accent: "#34d399"
     },
     {
       id: "stream-vs-pubsub",
       title: "Streams vs. Pub/Sub",
-      icon: "⇄",
+      icon: "SP",
       description: "Contrast replayable consumer-group delivery with live broadcast messaging and choose the right primitive.",
-      topics: ["Getting started", "Queues & messaging", "Architecture"],
+      topics: ["Queues & streams", "Coordination"],
       accent: "#38bdf8"
     },
     {
       id: "hash-field-ttl",
       title: "Hash Field TTL",
-      icon: "⌛",
+      icon: "TTL",
       description: "Expire individual hash fields independently while the surrounding object and its other fields remain available.",
       topics: ["Data structures"],
       accent: "#f59e0b"
@@ -159,9 +159,9 @@
     {
       id: "probabilistic-cache",
       title: "Probabilistic Filters",
-      icon: "∿",
+      icon: "PF",
       description: "Use Bloom and Cuckoo filters to reject definite misses early and reduce unnecessary origin lookups.",
-      topics: ["Data structures", "Architecture"],
+      topics: ["Data structures"],
       accent: "#c084fc"
     }
   ];
@@ -172,7 +172,7 @@
     ids.add(demo.id);
   });
 
-  var topicOrder = ["All", "AI & workflows", "Getting started", "Featured", "Queues & messaging", "Data structures", "Architecture", "Reliability"];
+  var topicOrder = ["All", "Workflows", "Queues & streams", "Coordination", "Data structures"];
   var grid = document.querySelector("[data-demo-grid]");
   var filters = document.querySelector("[data-filters]");
   var search = document.querySelector("[data-search]");
