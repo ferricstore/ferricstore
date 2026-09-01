@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#071018">
   <title>Workflow Benchmark, Explained | FerricStore Demos</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css?v=6">
+  <link rel="stylesheet" href="./style.css?v=7">
   <link rel="stylesheet" href="../shared/accuracy.css?v=5">
 </head>
 <body>
@@ -238,36 +238,22 @@
 
       <div class="latency-context">
         <div>
-          <span class="eyebrow">WHY 27 MS DOES NOT “BEAT” 850 MS</span>
-          <h3>One persists states; the other schedules Activities</h3>
-          <p>The FerricStore fused chain performs no application work between its states. Temporal’s example includes three Activity scheduling cycles. The numbers demonstrate different costs, not a winner.</p>
+          <span class="eyebrow">TEMPORAL DOCUMENTATION</span>
+          <h3>Approximate three-Activity results on Temporal Cloud</h3>
+          <p>Temporal documents these as approximate benchmarks for a three-Activity transaction workflow. It states that actual results vary by region, Activity implementation, and server load.</p>
         </div>
         <div class="latency-rule">
-          <strong>The fair test is worker-driven versus Activity-driven.</strong>
-          <p>Run three no-op FerricFlow state handlers against three no-op Temporal regular Activities with matched payloads, deployment distance, load, and durability. Report throughput and full latency tails.</p>
+          <strong>Documented total latency</strong>
+          <p>Regular Activities: ≈850 ms. Local Activities: ≈275 ms. Eager Workflow Start with Local Activities: ≈265 ms.</p>
         </div>
       </div>
-    </section>
-
-    <section class="next-test" aria-labelledby="next-test-title">
-      <div>
-        <span class="eyebrow">THE NEXT CREDIBLE BENCHMARK</span>
-        <h2 id="next-test-title">Run the matched worker test</h2>
-        <p>Next, run a matched test of three real worker boundaries against three Temporal Activities.</p>
-      </div>
-      <ol>
-        <li><span>01</span><p><strong>Same application work</strong>Three no-op handlers versus three no-op regular Activities.</p></li>
-        <li><span>02</span><p><strong>Same operating distance</strong>Record client, service, and Worker locations plus hardware.</p></li>
-        <li><span>03</span><p><strong>Low and high load</strong>Separate inherent latency from queueing and saturation.</p></li>
-        <li><span>04</span><p><strong>Native and shared units</strong>Workflows/s, handler or Activity completions/s, p50, p95, p99, p99.9, errors.</p></li>
-      </ol>
     </section>
 
     <section class="source-section" aria-labelledby="source-title">
       <div>
         <span class="eyebrow">SOURCES &amp; LIMITATIONS</span>
         <h2 id="source-title">Every number links back to its boundary</h2>
-        <p>FerricStore values are historical references; raw Azure logs are not committed. DBOS and Temporal values are their own published results and claims. None of the cross-system rows is an apples-to-apples benchmark.</p>
+        <p>FerricStore, DBOS, and Temporal values come from separate published runs with different workloads, environments, and measurement boundaries.</p>
       </div>
       <div class="source-actions">
         <a href="https://github.com/ferricstore/ferricstore/blob/cf71ad1e895d1a7baa4e75fe2751ee87197a99c8/docs/benchmarks.md">FerricStore public summary <span>↗</span></a>

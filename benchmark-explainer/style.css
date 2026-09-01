@@ -166,7 +166,6 @@ footer {
 
 .hero h1,
 .section-heading h2,
-.next-test h2,
 .source-section h2 {
   margin: 0;
   letter-spacing: -0.05em;
@@ -206,7 +205,6 @@ footer {
 .comparison-table,
 .latency-card,
 .latency-context,
-.next-test,
 .source-section {
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -339,14 +337,12 @@ footer {
 }
 
 .section-heading h2,
-.next-test h2,
 .source-section h2 {
   margin-top: 12px;
   font-size: clamp(34px, 5vw, 54px);
 }
 
 .section-heading > p,
-.next-test > div > p,
 .source-section > div:first-child > p {
   margin: 0;
   color: var(--muted);
@@ -1141,53 +1137,12 @@ input[type="range"] {
   margin-bottom: 0;
 }
 
-.next-test,
 .source-section {
   display: grid;
   grid-template-columns: 0.85fr 1.15fr;
   gap: 54px;
   margin-bottom: 28px;
   padding: 36px;
-}
-
-.next-test ol {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 10px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.next-test li {
-  display: grid;
-  grid-template-columns: 30px 1fr;
-  gap: 10px;
-  align-items: start;
-  padding: 16px;
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.018);
-}
-
-.next-test li > span {
-  color: var(--cyan);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 10px;
-}
-
-.next-test li p {
-  display: grid;
-  gap: 4px;
-  margin: 0;
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1.5;
-}
-
-.next-test li strong {
-  color: var(--text);
-  font-size: 12px;
 }
 
 .source-section {
@@ -1251,7 +1206,6 @@ footer p {
   .math-layout,
   .mode-panel,
   .fused-proof,
-  .next-test,
   .source-section {
     grid-template-columns: 1fr;
   }
@@ -1436,7 +1390,6 @@ footer p {
     grid-template-columns: 1fr;
   }
 
-  .next-test ol,
   .source-actions {
     grid-template-columns: 1fr;
   }
@@ -1475,7 +1428,6 @@ footer p {
   .scale-card,
   .latency-card,
   .latency-context,
-  .next-test,
   .source-section {
     padding: 20px;
   }
@@ -1504,7 +1456,6 @@ footer p {
   }
 
   .section-heading h2,
-  .next-test h2,
   .source-section h2 {
     font-size: 36px;
   }
