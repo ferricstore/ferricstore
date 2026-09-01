@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=11">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=15">
 </head>
 <body class="fs-dispatch" data-mode="before">
   <!--
@@ -142,8 +142,8 @@
 <span data-line="8"><b class="ln">8</b><span></span></span>
 <span data-line="9"><b class="ln">9</b><span><i class="c"># 2. Worker automatically claims with monotonic lease fencing</i></span></span>
 <span data-line="10"><b class="ln">10</b><span><i class="k">def</i> <i class="fn">handle_email</i>(job):</span></span>
-<span data-line="11"><b class="ln">11</b><span>    email_service.<i class="fn">send</i>(job.payload)</span></span>
-<span data-line="12"><b class="ln">12</b><span>    <i class="k">return</i> b<q>"sent"</q>  <i class="c"># Persist completion after the guarded effect</i></span></span>
+<span data-line="11"><b class="ln">11</b><span>    email_service.<i class="fn">send</i>(job.payload, idempotency_key=job.id)</span></span>
+<span data-line="12"><b class="ln">12</b><span>    <i class="k">return</i> b<q>"sent"</q></span></span>
 <span data-line="13"><b class="ln">13</b><span></span></span>
 <span data-line="14"><b class="ln">14</b><span>emails.<i class="fn">worker</i>(concurrency=10).<i class="fn">run</i>(handle_email)</span></span></code></pre>
       </article>
@@ -403,6 +403,6 @@
 
   <script src="./queue.js?v=4"></script>
   <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=11"></script>
+  <script src="../shared/dispatch.js?v=13"></script>
 </body>
 </html>

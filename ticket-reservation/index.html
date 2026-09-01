@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=11">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=15">
 </head>
 <body class="fs-dispatch" data-mode="before">
   <!--
@@ -119,8 +119,8 @@
           </div>
           <div class="code-controls">
             <div class="sdk-style-toggle" data-sdk-toggle>
-              <button type="button" class="sdk-btn" data-sdk-style="steps">Durable Step</button>
-              <button type="button" class="sdk-btn is-active" data-sdk-style="states">State Handlers</button>
+              <button type="button" class="sdk-btn" data-sdk-style="steps">Advanced step</button>
+              <button type="button" class="sdk-btn is-active" data-sdk-style="states">Simple states</button>
             </div>
             <span class="badge-durable" data-code-badge>DURABLE CART TIMER</span>
           </div>
@@ -177,10 +177,7 @@ flow = client.workflow(type="ticket-hold", initial_state="hold")
 
 @flow.state("hold")
 def hold(ctx):
-    @ctx.effect("seat-hold", "tickets.hold", operation_digest=f"hold:{ctx.id}:v1")
-    def reserve():
-        return seats.hold(ctx.payload, request_id=f"{ctx.id}:hold:v1")
-    reserve()
+    seats.hold(ctx.payload, request_id=f"{ctx.id}:hold:v1")
     return transition("check_payment", run_at_ms=int(time.time() * 1000) + 600_000)
 
 @flow.state("check_payment")
@@ -191,10 +188,7 @@ def check_payment(job):
 
 @flow.state("transfer")
 def transfer(ctx):
-    @ctx.effect("seat-transfer", "tickets.assign", operation_digest=f"transfer:{ctx.id}:v1")
-    def assign():
-        seats.assign_next(ctx.id, fencing_token=ctx.fencing_token)
-    assign()
+    seats.assign_next(ctx.id, fencing_token=ctx.fencing_token)
     return complete(result=b"transferred")</code></pre>
       </article>
 
@@ -403,6 +397,6 @@ def transfer(ctx):
 
   <script src="./ticket.js?v=6"></script>
   <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=11"></script>
+  <script src="../shared/dispatch.js?v=13"></script>
 </body>
 </html>

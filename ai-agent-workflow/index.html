@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="./style.css?v=4">
   <link rel="stylesheet" href="../shared/polish.css">
   <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=11">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=15">
 </head>
 <body class="fs-dispatch">
   <!--
@@ -169,70 +169,50 @@
 
     <!-- Python Code Example -->
     <section style="margin-bottom: 60px;">
-      <h3 style="font-size: 20px; margin-bottom: 12px;">FerricStore Python SDK: State Transition &amp; External Signal</h3>
-      <p class="sdk-example-note">Animated excerpts omit surrounding handler and <code>@ctx.effect</code> declarations; the signal itself is shown directly. FerricStore states and arguments below match the animation, while provider calls are application-owned adapters.</p>
-      <pre style="background: #080614; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 20px; font-family: var(--font-mono); font-size: 13px; color: #e2e8f0; overflow-x: auto;"><code># 1. The Multi-Agent AI Workflow State Machine
-from ferricstore import WorkflowClient, transition, complete
+      <h3 style="font-size: 20px; margin-bottom: 12px;">Python: states and an approval signal</h3>
+      <p class="sdk-example-note">This example keeps the workflow path visible. Provider adapters are abbreviated; production idempotency and effect guards are covered in the implementation notes below.</p>
+      <pre style="background: #080614; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 20px; font-family: var(--font-mono); font-size: 13px; color: #e2e8f0; overflow-x: auto;"><code>from ferricstore import WorkflowClient, transition, complete
 
 client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
 flow = client.workflow(type="ad-campaign-agent", initial_state="research")
 
 @flow.state("research")
 def research(ctx):
-    @ctx.effect("research", "web.scrape", operation_digest=f"research:{ctx.id}:v1")
-    def scrape():
-        return web_scraper.run(operation_id=f"{ctx.id}:research:v1")
-    competitors = scrape()
+    competitors = web_scraper.run(ctx.payload["campaign"])
     return transition("draft_plan", payload={"competitors": competitors})
 
 @flow.state("draft_plan")
 def draft(ctx):
-    @ctx.effect("draft", "llm.create", operation_digest=f"draft:{ctx.id}:v1")
-    def create_plan():
-        return llm.create_campaign(ctx.payload["competitors"])
-    plan = create_plan()
-
-    @ctx.effect("approval-request", "slack.post", operation_digest=f"approval:{ctx.id}:v1")
-    def request_approval():
-        slack.post_approval_request(
-            channel="#finance-approvals", job_id=ctx.id, plan=plan,
-            idempotency_key=f"{ctx.id}:approval:v1",
-        )
-    request_approval()
-    # ⏸️ Transition to a durable waiting state and yield this handler:
+    plan = llm.create_campaign(ctx.payload["competitors"])
+    slack.post_approval_request(
+        job_id=ctx.id, plan=plan,
+        idempotency_key=f"{ctx.id}:approval:v1",
+    )
     return transition("await_approval", payload={"plan": plan})
 
 @flow.state("launch_campaign")
 def launch(ctx):
-    @ctx.effect("launch", "google-ads.create", operation_digest=f"launch:{ctx.id}:v1")
-    def create_campaign():
-        return google_ads.create_campaign(
-            budget=50000, request_id=f"{ctx.id}:launch:v1",
-        )
-    res = create_campaign()
-    return complete(result=res)
+    campaign = google_ads.create_campaign(
+        ctx.payload["plan"], request_id=f"{ctx.id}:launch:v1",
+    )
+    return complete(result=campaign)
 
-# -------------------------------------------------------------
-# 2. The Slack Webhook API Endpoint (FastAPI / Flask)
-# -------------------------------------------------------------
 @app.post("/webhooks/slack/approve")
 def slack_webhook(payload: dict):
     job_id = payload["job_id"]
-    # ⚡ External signal commands the workflow to transition to the next state:
     client.signal(
         job_id, signal="approved", if_state="await_approval",
         transition_to="launch_campaign", values={"approved_by": payload["user"]},
         idempotency_key=f"{job_id}:approve:{payload['action_id']}:v1",
     )
-    return {"status": "workflow_resumed"}
+    return {"status": "resumed"}
 
-# Start from the producer process; run workers in the worker process.
 flow.start("camp-9842", payload={"campaign": "Summer SaaS Growth Blast"})
 flow.worker().run()</code></pre>
     </section>
   </main>
   <script src="./agent.js?v=6"></script>
   <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=11"></script>
+  <script src="../shared/dispatch.js?v=13"></script>
 </body>
 </html>

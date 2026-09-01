@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="./style.css">
   <link rel="stylesheet" href="../shared/polish.css">
   <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=11">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=15">
 </head>
 <body class="fs-dispatch">
   <!--
@@ -195,44 +195,28 @@
 
     <!-- Python Code Example -->
     <section style="margin-bottom: 60px;">
-      <h3 style="font-size: 20px; margin-bottom: 12px;">FerricStore Python SDK: Stream Rate-Limiting</h3>
-      <pre style="background: #080614; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 20px; font-family: var(--font-mono); font-size: 13px; color: #e2e8f0; overflow-x: auto;"><code># Real rate-limit command + durable pipeline continuation
-import time
-from ferricstore import FlowClient
+      <h3 style="font-size: 20px; margin-bottom: 12px;">Python: rate-limit a workflow state</h3>
+      <pre style="background: #080614; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 20px; font-family: var(--font-mono); font-size: 13px; color: #e2e8f0; overflow-x: auto;"><code>from ferricstore import WorkflowClient, transition
 
-client = FlowClient.from_url("ferric://127.0.0.1:6388")
-job = client.start_and_claim(
-    "webhook-912", type="shopify-webhook-stream",
-    initial_state="categorize", worker="stream-1",
-    payload={"prompt": "Classify this product update"},
-)
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
+flow = client.workflow(type="shopify-webhook", initial_state="categorize")
 
-limit = client.ratelimit_add(
-    "rl:openai:categorize", window_ms=1_000, max=100,
-)
-if not limit.allowed:
-    client.transition(
-        job.id,
-        lease_token=job.lease_token,
-        fencing_token=job.fencing_token,
-        from_state=job.run_state,
-        to_state="categorize",
-        run_at_ms=int(time.time() * 1000) + limit.reset_ms,
+@flow.state("categorize")
+def categorize(ctx):
+    limit = ctx.client.ratelimit_add(
+        "rl:openai:categorize", window_ms=1_000, max=100,
     )
-else:
-    job, summary = client.step(
-        job,
-        name="categorize-product:v1",
-        run=lambda: ai.categorize_once(
-            operation_id=f"{job.id}:categorize:v1",
-            prompt=job.payload["prompt"],
-        ),
-        to_state="flush",
-    )</code></pre>
+    if not limit.allowed:
+        return transition("categorize", run_at_ms=ctx.now_ms + limit.reset_ms)
+
+    summary = ai.categorize(ctx.payload["prompt"])
+    return transition("flush", values={"summary": summary})
+
+flow.worker().run()</code></pre>
     </section>
   </main>
   <script src="./stream.js?v=4"></script>
   <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=11"></script>
+  <script src="../shared/dispatch.js?v=13"></script>
 </body>
 </html>

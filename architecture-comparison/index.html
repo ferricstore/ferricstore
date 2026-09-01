@@ -8,7 +8,7 @@
   <meta name="description" content="An interactive architectural comparison showing how In-Memory tasks, Message Queues (SQS/RabbitMQ), DIY Database polling, and FerricStore Durable Workflows behave under real-world server crashes.">
   <link rel="stylesheet" href="./style.css">
   <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=11">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=15">
 </head>
 <body class="fs-dispatch">
   <!--
@@ -332,7 +332,7 @@
           <button class="code-tab-btn is-active" type="button" data-code-tab="memory">🧠 In-Memory Async</button>
         </div>
 
-        <pre class="code-preview-box"><code data-code-content># FerricStore Python SDK: explicit durable states
+        <pre class="code-preview-box"><code data-code-content># FerricStore Python SDK: one handler per durable state
 from ferricstore import WorkflowClient, complete, transition
 
 client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
@@ -340,37 +340,23 @@ checkout = client.workflow(type="ai-checkout", initial_state="charge")
 
 @checkout.state("charge")
 def charge(ctx):
-    @ctx.effect(
-        "stripe-charge",
-        "payment.charge",
-        operation_digest=f"stripe:{ctx.id}:v1",
+    tx = stripe.charge(
+        ctx.payload["amount"],
+        idempotency_key=f"{ctx.id}:charge:v1",
     )
-    def call_stripe():
-        return stripe.charge(
-            ctx.payload["amount"],
-            idempotency_key=f"{ctx.id}:charge:v1",
-        )
-
-    tx = call_stripe()
-    return transition("summarize", values={"tx": tx})
+    return transition("summarize", values={"tx_id": tx.id})
 
 @checkout.state("summarize")
 def summarize(ctx):
-    @ctx.effect("llm-summary", "llm.generate", operation_digest=f"summary:{ctx.id}:v1")
-    def call_llm():
-        return llm.generate(ctx.payload["prompt"])
-    summary = call_llm()
+    summary = llm.generate(ctx.payload["prompt"])
     return transition("deliver", values={"summary": summary})
 
 @checkout.state("deliver")
 def deliver(ctx):
-    @ctx.effect("receipt", "email.send", operation_digest=f"receipt:{ctx.id}:v1")
-    def send():
-        email.send_receipt(
-            ctx.payload["email"], tx=ctx.value("tx"),
-            idempotency_key=f"{ctx.id}:receipt:v1",
-        )
-    send()
+    email.send_receipt(
+        ctx.payload["email"], tx_id=ctx.value("tx_id"),
+        idempotency_key=f"{ctx.id}:receipt:v1",
+    )
     return complete(result=b"sent")
 
 checkout.worker().run()</code></pre>
@@ -387,8 +373,8 @@ checkout.worker().run()</code></pre>
     </section>
   </main>
 
-  <script src="./comparison.js?v=5"></script>
+  <script src="./comparison.js?v=6"></script>
   <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=11"></script>
+  <script src="../shared/dispatch.js?v=13"></script>
 </body>
 </html>

@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="./style.css?v=5">
   <link rel="stylesheet" href="../shared/polish.css">
   <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=11">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=15">
 </head>
 <body class="fs-dispatch">
   <!--
@@ -177,16 +177,16 @@
       <div class="code-example-heading">
         <div>
           <span>PYTHON SDK 0.13.1</span>
-          <h3>Clean Multi-Day Subscriptions</h3>
+          <h3>Multi-day billing in five states</h3>
         </div>
         <div class="code-example-tabs" role="tablist" aria-label="Python SDK example style">
-          <button type="button" role="tab" aria-selected="true" class="is-active" data-code-example-tab="states">State Handlers</button>
-          <button type="button" role="tab" aria-selected="false" data-code-example-tab="steps">Durable Step</button>
+          <button type="button" role="tab" aria-selected="true" class="is-active" data-code-example-tab="states">Simple states</button>
+          <button type="button" role="tab" aria-selected="false" data-code-example-tab="steps">Advanced step</button>
         </div>
       </div>
-      <p class="sdk-example-note">Animated excerpts omit the surrounding <code>@ctx.effect</code> declarations. The State Handlers tab matches all five stages; Durable Step focuses on the first boundary in a custom claim loop. <code>email</code>, <code>sms</code>, and <code>stripe</code> are application-owned adapters.</p>
+      <p class="sdk-example-note">Simple states shows the main workflow path. Advanced step exposes the lower-level custom claim loop. Provider calls are abbreviated; optional effect governance is covered in the implementation notes below.</p>
 
-      <pre class="sdk-code-block" data-code-example="states"><code># State handlers implement the same five-stage recovery shown above
+      <pre class="sdk-code-block" data-code-example="states"><code># Each transition persists the next state and its due time.
 import time
 from ferricstore import WorkflowClient, complete, transition
 
@@ -197,116 +197,44 @@ DAY_MS = 86_400_000
 def in_days(days):
     return int(time.time() * 1000) + days * DAY_MS
 
-def charge_subscription(workflow_id, attempt):
-    # Return a codec-friendly result from the application-owned Stripe adapter.
-    payment = stripe.charge(
-        9900,
-        idempotency_key=(
-            f"{workflow_id}:invoice:2026-09:attempt-{attempt}:v1"
-        ),
+def send_email(ctx, template, **kwargs):
+    email.send(
+        template, ctx.payload["user_id"],
+        idempotency_key=f"{ctx.id}:{template}:v1",
+        **kwargs,
     )
-    return {"status": payment.status, "payment_id": payment.id}
+
+def charge_or_retry(ctx, attempt, next_state=None):
+    payment = stripe.charge(
+        9_900,
+        idempotency_key=f"{ctx.id}:invoice:attempt-{attempt}:v1",
+    )
+    if payment.status == "paid" or next_state is None:
+        return complete(result={"payment_id": payment.id})
+    send_email(ctx, f"dunning-{attempt}", attempt=attempt)
+    return transition(next_state, run_at_ms=in_days(3))
 
 @billing.state("welcome")
 def welcome(ctx):
-    @ctx.effect(
-        "welcome-email", "email.send",
-        operation_digest=f"welcome:{ctx.id}:v1",
-    )
-    def send_welcome():
-        return email.send_welcome(
-            ctx.payload["user_id"],
-            idempotency_key=f"{ctx.id}:welcome:v1",
-        )
-
-    send_welcome()
-    # Persist the wait and release the worker until Day 14.
-    return transition(
-        "pre_billing_warning",
-        run_at_ms=in_days(14),
-    )
+    send_email(ctx, "welcome")
+    return transition("pre_billing_warning", run_at_ms=in_days(14))
 
 @billing.state("pre_billing_warning")
 def pre_billing_warning(ctx):
-    @ctx.effect(
-        "warning-email", "email.send",
-        operation_digest=f"warning:{ctx.id}:v1",
-    )
-    def send_warning():
-        return email.send_warning(
-            ctx.payload["user_id"],
-            idempotency_key=f"{ctx.id}:warning:v1",
-        )
-
-    send_warning()
-    return transition(
-        "charge",
-        run_at_ms=in_days(1),
-    )
+    send_email(ctx, "billing-warning")
+    return transition("charge", run_at_ms=in_days(1))
 
 @billing.state("charge")
 def charge(ctx):
-    @ctx.effect(
-        "charge-attempt-1", "stripe.charge",
-        operation_digest=f"charge:{ctx.id}:attempt-1:v1",
-    )
-    def charge_once():
-        return charge_subscription(ctx.id, attempt=1)
-
-    attempt = charge_once()
-    if attempt["status"] == "paid":
-        return complete(result=attempt)
-
-    @ctx.effect(
-        "dunning-email-1", "email.send",
-        operation_digest=f"dunning:{ctx.id}:attempt-1:v1",
-    )
-    def send_dunning():
-        return email.send_dunning(
-            ctx.payload["user_id"],
-            idempotency_key=f"{ctx.id}:dunning-1:v1",
-        )
-
-    send_dunning()
-    return transition("retry_1", run_at_ms=in_days(3))
+    return charge_or_retry(ctx, 1, "retry_1")
 
 @billing.state("retry_1")
 def retry_1(ctx):
-    @ctx.effect(
-        "charge-attempt-2", "stripe.charge",
-        operation_digest=f"charge:{ctx.id}:attempt-2:v1",
-    )
-    def charge_once():
-        return charge_subscription(ctx.id, attempt=2)
-
-    attempt = charge_once()
-    if attempt["status"] == "paid":
-        return complete(result=attempt)
-
-    @ctx.effect(
-        "card-update-sms", "sms.send",
-        operation_digest=f"sms:{ctx.id}:attempt-1:v1",
-    )
-    def send_update_link():
-        return sms.send_update_link(
-            ctx.payload["user_id"],
-            idempotency_key=f"{ctx.id}:sms-1:v1",
-        )
-
-    send_update_link()
-    return transition("retry_2", run_at_ms=in_days(3))
+    return charge_or_retry(ctx, 2, "retry_2")
 
 @billing.state("retry_2")
 def retry_2(ctx):
-    @ctx.effect(
-        "charge-attempt-3", "stripe.charge",
-        operation_digest=f"charge:{ctx.id}:attempt-3:v1",
-    )
-    def charge_once():
-        return charge_subscription(ctx.id, attempt=3)
-
-    payment = charge_once()
-    return complete(result=payment)
+    return charge_or_retry(ctx, 3)
 
 billing.start("sub-user-42", payload={"user_id": "user-42"})
 billing.worker().run()</code></pre>
@@ -347,6 +275,6 @@ client.transition(
   </main>
   <script src="./dunning.js?v=7"></script>
   <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=11"></script>
+  <script src="../shared/dispatch.js?v=13"></script>
 </body>
 </html>

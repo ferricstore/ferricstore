@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=11">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=15">
 </head>
 <body class="fs-dispatch" data-mode="before">
   <!--
@@ -119,8 +119,8 @@
           </div>
           <div class="code-controls">
             <div class="sdk-style-toggle" data-sdk-toggle>
-              <button type="button" class="sdk-btn" data-sdk-style="steps">Durable Step</button>
-              <button type="button" class="sdk-btn is-active" data-sdk-style="states">State Handlers</button>
+              <button type="button" class="sdk-btn" data-sdk-style="steps">Advanced step</button>
+              <button type="button" class="sdk-btn is-active" data-sdk-style="states">Simple states</button>
             </div>
             <span class="badge-durable" data-code-badge>DURABLE CANARY</span>
           </div>
@@ -178,29 +178,21 @@ flow = client.workflow(type="canary-release", initial_state="canary")
 
 @flow.state("canary")
 def canary(ctx):
-    @ctx.effect("route-canary", "envoy.route", operation_digest=f"canary:{ctx.id}:v1")
-    def route():
-        envoy.set_weight("v2.4.0", 10, request_id=f"{ctx.id}:canary:v1")
-    route()
+    envoy.set_weight("v2.4.0", 10, request_id=f"{ctx.id}:canary:v1")
     return transition("soak", run_at_ms=int(time.time() * 1000) + 86_400_000)
 
 @flow.state("soak")
 def soak(ctx):
-    @ctx.effect("promote", "envoy.route", operation_digest=f"promote:{ctx.id}:v1")
-    def promote():
-        envoy.set_weight("v2.4.0", 100, request_id=f"{ctx.id}:promote:v1")
-    promote()
+    envoy.set_weight("v2.4.0", 100, request_id=f"{ctx.id}:promote:v1")
     return complete(result=b"promoted")
 
 @flow.state("rollback")
 def rollback(ctx):
-    @ctx.effect("rollback", "envoy.route", operation_digest=f"rollback:{ctx.id}:v1")
-    def restore():
-        envoy.set_weight("v2.3.9", 100, request_id=f"{ctx.id}:rollback:v1")
-    restore()
+    envoy.set_weight("v2.3.9", 100, request_id=f"{ctx.id}:rollback:v1")
     return complete(result=b"rolled back")
 
-# Datadog can move a waiting soak directly to rollback:
+# Datadog can move a waiting soak directly to rollback.
+run_id = "deploy-240"
 client.signal(
     run_id, signal="5xx", if_state="soak", transition_to="rollback",
     idempotency_key=f"{run_id}:5xx:v1",
@@ -471,6 +463,6 @@ client.signal(
 
   <script src="./canary.js?v=6"></script>
   <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=11"></script>
+  <script src="../shared/dispatch.js?v=13"></script>
 </body>
 </html>

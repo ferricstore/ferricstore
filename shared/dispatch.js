@@ -616,6 +616,13 @@
       codeButton.setAttribute("aria-controls", codePanels.map(function (panel) { return panel.id; }).join(" "));
       codeButton.addEventListener("click", function () {
         var open = target.classList.toggle("fs-code-open");
+        if (open) {
+          var solutionMode = document.querySelector('[data-mode-btn="after"], [data-mode-btn="bloom"]');
+          if (solutionMode && solutionMode.getAttribute("aria-selected") !== "true") solutionMode.click();
+
+          var simpleStates = document.querySelector('[data-sdk-style="states"], [data-code-example-tab="states"], [data-api-mode="states"]');
+          if (simpleStates) simpleStates.click();
+        }
         codeButton.textContent = open ? "Hide code" : "Inspect code";
         codeButton.setAttribute("aria-expanded", String(open));
       });

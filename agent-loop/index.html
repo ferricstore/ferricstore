@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=11">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=15">
 </head>
 <body class="fs-dispatch" data-mode="before">
   <!--
@@ -119,8 +119,8 @@
           </div>
           <div class="code-controls">
             <div class="sdk-style-toggle" data-sdk-toggle>
-              <button type="button" class="sdk-btn" data-sdk-style="steps">Durable Step</button>
-              <button type="button" class="sdk-btn is-active" data-sdk-style="states">State Handlers</button>
+              <button type="button" class="sdk-btn" data-sdk-style="steps">Advanced step</button>
+              <button type="button" class="sdk-btn is-active" data-sdk-style="states">Simple states</button>
             </div>
             <span class="badge-durable" data-code-badge>BUDGET + BREAKER</span>
           </div>
@@ -179,12 +179,14 @@ flow = client.workflow(type="react-agent", initial_state="turn")
 )
 def turn(ctx):
     turn_no = int((ctx.value("turn", b"0") or b"0").decode())
+    request_key = f"{ctx.id}:tool:{turn_no}:v1"
+
     @ctx.effect(
-        "agent-tool", "ai.tool",
-        operation_digest=f"tool:{ctx.id}:{turn_no}:v1",
+        f"agent-tool:{turn_no}", "ai.tool",
+        idempotency_key=request_key,
     )
     def call_tool():
-        return agent.execute(ctx.payload)
+        return agent.execute(ctx.payload, idempotency_key=request_key)
 
     result = call_tool()
     if result.done:
@@ -392,6 +394,6 @@ def turn(ctx):
 
   <script src="./loop.js?v=6"></script>
   <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=11"></script>
+  <script src="../shared/dispatch.js?v=13"></script>
 </body>
 </html>
