@@ -10,81 +10,81 @@
     before: [
       {
         stationIndex: 0,
-        title: "1. 💳 Credit Card Charged ($150.00)",
+        title: "1. Credit Card Charged ($150.00)",
         badge: "STEP 1 · VOLATILE RAM",
         badgeType: "bad",
         desc: "Customer clicks \"Buy Sneakers\". The server charges $150 to their card, but only stores the confirmation in temporary server memory.",
         checkpointVal: "Step 1 [Payment] In Temporary RAM (Unsaved)",
         packagePos: "0%",
-        pkgIcon: "💳",
+        pkgIcon: "#wf-icon-card",
         pkgKicker: "ORDER #9842 · $150.00",
         pkgStatus: "Stored in RAM Only",
         pkgClass: "",
         bankAmount: "$150.00",
         bankClass: "",
         smsType: "alert-bad",
-        smsMsg: "<strong>💳 Bank Notification:</strong> Charged $150.00 at SneakerStore (Kept only in temporary server memory)."
+        smsMsg: "<strong>Bank notification:</strong> Charged $150.00 at SneakerStore (kept only in temporary server memory)."
       },
       {
         stationIndex: 1,
-        title: "2. 📦 Item Picked from Warehouse",
+        title: "2. Item Picked from Warehouse",
         badge: "STEP 2 · VOLATILE RAM",
         badgeType: "bad",
         desc: "Warehouse reserves sneaker size. The reservation ID is also kept only in temporary server memory.",
         checkpointVal: "Step 2 [Warehouse] In Temporary RAM (Unsaved)",
         packagePos: "25%",
-        pkgIcon: "📦",
+        pkgIcon: "#wf-icon-stock",
         pkgKicker: "ORDER #9842 · $150.00",
         pkgStatus: "Item Picked (RAM)",
         pkgClass: "",
         bankAmount: "$150.00",
         bankClass: "",
         smsType: "alert-bad",
-        smsMsg: "<strong>📦 Warehouse Update:</strong> Stock reserved. Step 2 done."
+        smsMsg: "<strong>Warehouse update:</strong> Stock reserved. Step 2 done."
       },
       {
         stationIndex: 2,
-        title: "3. 💥 Server Crash / Power Outage!",
-        badge: "💥 DISASTER OCCURS",
+        title: "3. Server Crash / Power Outage",
+        badge: "DISASTER OCCURS",
         badgeType: "bad",
         desc: "The cloud server suddenly crashes (OOM / timeout / network drop). Because there were no checkpoints, ALL memory is instantly wiped clean!",
         checkpointVal: "MEMORY WIPED · ALL PROGRESS LOST",
         packagePos: "50%",
-        pkgIcon: "💥",
+        pkgIcon: "#wf-icon-crash",
         pkgKicker: "CRASH OCCURRED",
         pkgStatus: "SERVER DIED · RAM LOST",
         pkgClass: "is-exploded",
         bankAmount: "$150.00",
         bankClass: "",
         smsType: "alert-bad",
-        smsMsg: "<strong>💥 SERVER CRASH:</strong> Process RAM vanished. The server completely forgot it already charged the customer!"
+        smsMsg: "<strong>Server crash:</strong> Process RAM vanished. The server completely forgot it already charged the customer!"
       },
       {
         stationIndex: 3,
-        title: "4. 🔄 Blind Full Restart (Customer Double-Billed!)",
-        badge: "⚠️ UNCHECKPOINTED RETRY",
+        title: "4. Blind Full Restart (Customer Double-Billed)",
+        badge: "UNCHECKPOINTED RETRY",
         badgeType: "bad",
         desc: "A generic retry script restarts the order from the beginning. It doesn\x27t know Step 1 already ran, so it charges the customer\x27s card A SECOND TIME!",
         checkpointVal: "RESTARTING FROM STEP 1 (NO CHECKPOINTS)",
         packagePos: "75%",
-        pkgIcon: "😱",
+        pkgIcon: "#wf-icon-penalty",
         pkgKicker: "DOUBLE BILLED · $300.00",
         pkgStatus: "CHARGED TWICE!",
         pkgClass: "is-exploded",
         bankAmount: "$300.00 (2x!)",
         bankClass: "is-double-charged",
         smsType: "alert-bad",
-        smsMsg: "<strong>🚨 DOUBLE CHARGE ALERT:</strong> Card billed AGAIN for $150.00 (Total: $300.00)! Customer gets angry bank alert."
+        smsMsg: "<strong>Double charge alert:</strong> Card billed again for $150.00 (total: $300.00)."
       },
       {
         stationIndex: 4,
-        title: "5. ⚠️ Chaotic Outcome: Broken State & Refunds",
-        badge: "⚠️ HIGH COST FAILURE",
+        title: "5. Chaotic Outcome: Broken State & Refunds",
+        badge: "HIGH COST FAILURE",
         badgeType: "bad",
         desc: "The order eventually arrives, but the customer was billed twice ($300), warehouse inventory was deducted twice, and support must spend hours issuing refunds.",
         checkpointVal: "COMPLETED WITH 2X COST PENALTY",
         packagePos: "100%",
-        pkgIcon: "💸",
+        pkgIcon: "#wf-icon-penalty",
         pkgKicker: "SUPPORT NIGHTMARE",
         pkgStatus: "2x Charge Penalty",
         pkgClass: "is-exploded",
@@ -97,88 +97,88 @@
     after: [
       {
         stationIndex: 0,
-        title: "1. 💳 Credit Card Charged ($150.00)",
+        title: "1. Credit Card Charged ($150.00)",
         badge: "STEP 1 · CHECKPOINT SAVED",
         badgeType: "good",
         desc: "Customer clicks \"Buy Sneakers\". The app charges $150 with a provider idempotency key, then durably advances workflow state.",
         checkpointVal: "Step 1 [Payment] Committed to Durable State",
         packagePos: "0%",
-        pkgIcon: "💳",
+        pkgIcon: "#wf-icon-card",
         pkgKicker: "ORDER #9842 · $150.00",
         pkgStatus: "Saved on Disk",
         pkgClass: "is-shielded",
         bankAmount: "$150.00",
         bankClass: "",
         smsType: "alert-good",
-        smsMsg: "<strong>💳 Bank Notification:</strong> Charged $150.00. FerricStore durably saved payment receipt to disk."
+        smsMsg: "<strong>Bank notification:</strong> Charged $150.00. FerricStore durably saved the payment receipt to disk."
       },
       {
         stationIndex: 1,
-        title: "2. 📦 Item Picked from Warehouse",
+        title: "2. Item Picked from Warehouse",
         badge: "STEP 2 · CHECKPOINT SAVED",
         badgeType: "good",
         desc: "Warehouse reserves sneaker size and the workflow commits the next state. External payment and inventory calls remain protected by their stable provider keys.",
         checkpointVal: "Step 2 [Warehouse] Committed to Durable State",
         packagePos: "25%",
-        pkgIcon: "📦",
+        pkgIcon: "#wf-icon-stock",
         pkgKicker: "ORDER #9842 · $150.00",
         pkgStatus: "Saved on Disk",
         pkgClass: "is-shielded",
         bankAmount: "$150.00",
         bankClass: "",
         smsType: "alert-good",
-        smsMsg: "<strong>📦 Checkpoint Committed:</strong> Payment ($150) + Warehouse Stock locked in FerricStore disk log."
+        smsMsg: "<strong>Checkpoint committed:</strong> Payment ($150) and warehouse stock are recorded in the FerricStore disk log."
       },
       {
         stationIndex: 2,
-        title: "3. 💥 Server Crash (State Safe in FerricStore!)",
-        badge: "🛡️ SHIELDED BY FERRICSTORE",
+        title: "3. Server Crash (State Safe in FerricStore)",
+        badge: "SHIELDED BY FERRICSTORE",
         badgeType: "good",
         desc: "The cloud server crashes mid-order! But unlike volatile RAM, FerricStore holds all completed steps safely on disk. Zero data is lost.",
         checkpointVal: "FERRICSTORE HOLDS CHECKPOINTS ON DISK",
         packagePos: "50%",
-        pkgIcon: "🛡️",
+        pkgIcon: "#wf-icon-resume",
         pkgKicker: "CRASH ISOLATED",
         pkgStatus: "SAFE ON DISK",
         pkgClass: "is-shielded",
         bankAmount: "$150.00",
         bankClass: "",
         smsType: "alert-good",
-        smsMsg: "<strong>🛡️ COMMITTED STATE RECOVERED:</strong> The worker died, but the committed receipts remain durable. A compatible worker can reclaim the current state."
+        smsMsg: "<strong>Committed state recovered:</strong> The worker died, but the committed receipts remain durable. A compatible worker can reclaim the current state."
       },
       {
         stationIndex: 3,
-        title: "4. 🚀 Rescue Server Reclaims Durable State",
-        badge: "✓ FENCED RESUME",
+        title: "4. Replacement Server Reclaims Durable State",
+        badge: "FENCED RESUME",
         badgeType: "good",
         desc: "A new server claims the current state with a newer fence. The payment remains protected by its provider idempotency key.",
         checkpointVal: "DURABLE STATE RECLAIMED WITH NEW FENCE",
         packagePos: "75%",
-        pkgIcon: "🚚",
+        pkgIcon: "#wf-icon-resume",
         pkgKicker: "GUARDED BILL · $150.00",
         pkgStatus: "Courier Dispatched",
         pkgClass: "is-shielded",
         bankAmount: "$150.00 (provider key)",
         bankClass: "",
         smsType: "alert-good",
-        smsMsg: "<strong>✓ PROVIDER KEY REUSED:</strong> The workflow resumes from Step 4 and reuses the stable payment idempotency key. The payment provider decides duplicate-call behavior."
+        smsMsg: "<strong>Provider key reused:</strong> The workflow resumes from Step 4 and reuses the stable payment idempotency key. The payment provider decides duplicate-call behavior."
       },
       {
         stationIndex: 4,
-        title: "5. 🎉 Delivery with Durable Completion",
-        badge: "✓ DURABLE COMPLETION",
+        title: "5. Delivery with Durable Completion",
+        badge: "DURABLE COMPLETION",
         badgeType: "good",
         desc: "Order delivered on time. Durable state and guarded external effects let recovery continue without a stale worker overwriting newer progress.",
         checkpointVal: "WORKFLOW COMPLETED DURABLY",
         packagePos: "100%",
-        pkgIcon: "🎉",
+        pkgIcon: "#wf-icon-complete",
         pkgKicker: "HAPPY CUSTOMER",
         pkgStatus: "Delivered Flawlessly!",
         pkgClass: "is-shielded",
         bankAmount: "$150.00",
         bankClass: "",
         smsType: "alert-good",
-        smsMsg: "<strong>🎉 Successful Execution:</strong> The charge uses a stable provider idempotency key, committed workflow states are reused, and the order completes after recovery."
+        smsMsg: "<strong>Successful execution:</strong> The charge uses a stable provider idempotency key, committed workflow states are reused, and the order completes after recovery."
       }
     ]
   };
@@ -187,6 +187,8 @@
   var modeButtons = document.querySelectorAll("[data-mode]");
   var stationNodes = document.querySelectorAll("[data-station]");
   var progressFill = document.querySelector("[data-progress-fill]");
+  var stepperTrack = document.querySelector(".stepper-track-wrap");
+  var conveyorArena = document.querySelector(".conveyor-arena");
   
   var glidingPackage = document.querySelector("[data-package]");
   var pkgIcon = document.querySelector("[data-pkg-icon]");
@@ -218,6 +220,26 @@
   var replayBtn = document.querySelector("[data-replay]");
   var crashBtn = document.querySelector("[data-smash-crash]");
   var liveStatusText = document.querySelector("[data-live-status-text]");
+
+  function scrollRailTo(scroller, left) {
+    if (!scroller || scroller.scrollWidth <= scroller.clientWidth) return;
+    var maxLeft = scroller.scrollWidth - scroller.clientWidth;
+    scroller.scrollTo({
+      left: Math.max(0, Math.min(maxLeft, left)),
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth"
+    });
+  }
+
+  function keepCurrentStageVisible(activeNode, totalSteps) {
+    window.requestAnimationFrame(function () {
+      if (activeNode && stepperTrack) {
+        scrollRailTo(stepperTrack, activeNode.offsetLeft - (stepperTrack.clientWidth - activeNode.offsetWidth) / 2);
+      }
+      if (conveyorArena && totalSteps > 1) {
+        scrollRailTo(conveyorArena, (conveyorArena.scrollWidth - conveyorArena.clientWidth) * currentStep / (totalSteps - 1));
+      }
+    });
+  }
 
   function updateDynamicLabels() {
     if (mode === "after") {
@@ -252,6 +274,7 @@
     });
 
     // 5 Station Nodes
+    var activeStation = null;
     stationNodes.forEach(function (node, idx) {
       var isDone = idx < currentStep;
       var isActive = idx === currentStep;
@@ -268,6 +291,7 @@
       var nodeTitle = node.querySelector(".node-title");
       var nodeSub = node.querySelector(".node-sub");
       node.setAttribute("aria-label", (nodeTitle ? nodeTitle.textContent : "Stage " + (idx + 1)) + (nodeSub ? ". " + nodeSub.textContent : ""));
+      if (isActive) activeStation = node;
     });
 
     // Progress Line Fill
@@ -280,7 +304,7 @@
     if (glidingPackage) {
       glidingPackage.style.left = step.packagePos;
       glidingPackage.className = "gliding-package " + step.pkgClass;
-      if (pkgIcon) pkgIcon.textContent = step.pkgIcon;
+      if (pkgIcon) pkgIcon.setAttribute("href", step.pkgIcon);
       if (pkgKicker) pkgKicker.textContent = step.pkgKicker;
       if (pkgStatus) pkgStatus.textContent = step.pkgStatus;
     }
@@ -302,9 +326,10 @@
     if (narrativeDesc) narrativeDesc.textContent = step.desc;
     if (checkpointVal) checkpointVal.textContent = step.checkpointVal;
     if (stepIndicator) stepIndicator.textContent = "Step " + (currentStep + 1) + " of " + list.length;
+    keepCurrentStageVisible(activeStation, list.length);
 
     // Controls
-    if (pauseBtn) pauseBtn.textContent = isPaused ? "▶ Play" : "⏸ Pause";
+    if (pauseBtn) pauseBtn.textContent = isPaused ? "Play" : "Pause";
     if (liveStatusText) liveStatusText.textContent = isPaused ? "Paused" : "Auto-advancing animation";
   }
 

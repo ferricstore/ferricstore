@@ -448,6 +448,40 @@
     var routeSignal = routeSignals[id] || {};
     var lastSignatureIndex = 0;
 
+    function centerSignatureStep(step) {
+      var rail = signature.querySelector("ol");
+      if (!rail || !step || rail.scrollWidth <= rail.clientWidth) return;
+      var targetLeft = step.offsetLeft - (rail.clientWidth - step.offsetWidth) / 2;
+      var maxLeft = rail.scrollWidth - rail.clientWidth;
+      rail.scrollTo({
+        left: Math.max(0, Math.min(maxLeft, targetLeft)),
+        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth"
+      });
+    }
+
+    function syncWorkflowSignature(normalized) {
+      if (id !== "workflow-explainer") return;
+      var selectedMode = document.querySelector('[data-mode][aria-selected="true"]');
+      var isDurable = Boolean(selectedMode && selectedMode.dataset.mode === "after");
+      var labels = isDurable
+        ? ["charge", "stock", "crash", "resume", "complete"]
+        : ["charge", "stock", "crash", "restart", "penalty"];
+      signature.dataset.fsWorkflowMode = isDurable ? "after" : "before";
+      signature.setAttribute("aria-label", "Mechanism map: " + labels.join(", "));
+      signatureSteps.forEach(function (step, stepIndex) {
+        step.classList.remove("is-unsafe", "is-risk", "is-failure", "is-committed", "is-success");
+        var label = step.querySelector("strong");
+        if (label) label.textContent = labels[stepIndex];
+        if (stepIndex < normalized) step.classList.add(isDurable ? "is-committed" : "is-unsafe");
+        if (stepIndex === normalized) {
+          step.classList.add(isDurable ? "is-success" : (normalized < 2 ? "is-risk" : "is-failure"));
+          step.setAttribute("aria-current", "step");
+        } else {
+          step.removeAttribute("aria-current");
+        }
+      });
+    }
+
     function setSignatureIndex(index) {
       if (!Number.isFinite(index)) return;
       var normalized = Math.max(0, Math.min(signatureSteps.length - 1, Math.round(index)));
@@ -456,7 +490,11 @@
         step.classList.toggle("is-current", stepIndex === normalized);
         step.classList.toggle("is-done", stepIndex < normalized);
       });
+      syncWorkflowSignature(normalized);
       signature.dataset.fsCurrentStep = String(normalized + 1);
+      if (id === "workflow-explainer") {
+        window.requestAnimationFrame(function () { centerSignatureStep(signatureSteps[normalized]); });
+      }
     }
 
     function liveStepIndex() {

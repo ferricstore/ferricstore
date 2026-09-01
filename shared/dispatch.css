@@ -16,6 +16,13 @@ body.fs-dispatch {
   --fs-yellow: #8a6500;
   --fs-red: #b33a48;
   --fs-blue: #205f91;
+  --fs-success-soft: color-mix(in srgb, var(--fs-green) 8%, var(--fs-paper-bright));
+  --fs-warning-soft: color-mix(in srgb, var(--fs-yellow) 9%, var(--fs-paper-bright));
+  --fs-failure-soft: color-mix(in srgb, var(--fs-red) 7%, var(--fs-paper-bright));
+  --fs-terminal-deep: #101b20;
+  --fs-terminal-text: #eff4ef;
+  --fs-terminal-success: color-mix(in srgb, var(--fs-green) 30%, var(--fs-terminal-deep));
+  --fs-terminal-failure: color-mix(in srgb, var(--fs-red) 30%, var(--fs-terminal-deep));
   --fs-shadow: 0 20px 42px rgba(13, 34, 43, 0.13);
   --fs-type-body: 17px;
   --fs-type-ui: 15px;
@@ -502,8 +509,6 @@ body.fs-dispatch[data-fs-demo="workflow-explainer"] .scenario-badge .badge-label
   color: #fff !important;
 }
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .node-sub { color: var(--fs-muted) !important; }
-body.fs-dispatch[data-fs-demo="workflow-explainer"] .sms-push-box,
-body.fs-dispatch[data-fs-demo="workflow-explainer"] .sms-push-box * { color: #742b25 !important; }
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .sms-icon { display: none !important; }
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .workflow-icon-sprite {
   position: absolute;
@@ -575,8 +580,8 @@ body.fs-dispatch[data-fs-demo="workflow-explainer"] .stepper-fill-line {
   background-image: none !important;
   box-shadow: none !important;
 }
-body.fs-dispatch[data-fs-demo="workflow-explainer"] .stepper-fill-line[data-state="risk"] { background: #745800 !important; }
-body.fs-dispatch[data-fs-demo="workflow-explainer"] .stepper-fill-line[data-state="failure"] { background: #8f2f3d !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .stepper-fill-line[data-state="risk"] { background: var(--fs-yellow) !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .stepper-fill-line[data-state="failure"] { background: var(--fs-red) !important; }
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .stepper-fill-line[data-state="success"] { background: var(--fs-green) !important; }
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-active {
   background: var(--fs-strip);
@@ -584,28 +589,28 @@ body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-active
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-risk .node-circle,
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-unsafe .node-circle {
   border-color: var(--fs-yellow) !important;
-  background: #f7f1db !important;
-  color: #745800 !important;
+  background: var(--fs-warning-soft) !important;
+  color: var(--fs-yellow) !important;
 }
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-risk .node-badge,
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-unsafe .node-badge {
-  border-color: #745800 !important;
-  background: #745800 !important;
+  border-color: var(--fs-yellow) !important;
+  background: var(--fs-yellow) !important;
 }
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-failure .node-circle {
-  border-color: #8f2f3d !important;
-  background: #fbf1f2 !important;
-  color: #8f2f3d !important;
+  border-color: var(--fs-red) !important;
+  background: var(--fs-failure-soft) !important;
+  color: var(--fs-red) !important;
   animation: none !important;
 }
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-failure .node-badge {
-  border-color: #8f2f3d !important;
-  background: #8f2f3d !important;
+  border-color: var(--fs-red) !important;
+  background: var(--fs-red) !important;
 }
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-success .node-circle,
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-committed .node-circle {
   border-color: var(--fs-green) !important;
-  background: #edf6f1 !important;
+  background: var(--fs-success-soft) !important;
   color: var(--fs-green) !important;
 }
 body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-success .node-badge,
@@ -613,6 +618,169 @@ body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-commit
   border-color: var(--fs-green) !important;
   background: var(--fs-green) !important;
 }
+
+/* WF-01 uses color for durable meaning; graphite alone marks the current position. */
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-strip-signature[data-fs-workflow-mode] li {
+  background: var(--fs-strip) !important;
+  box-shadow: none;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-strip-signature[data-fs-workflow-mode] li::after { background: var(--fs-line) !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-strip-signature[data-fs-workflow-mode] li.is-current {
+  box-shadow: inset 0 -3px 0 var(--fs-ink) !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-strip-signature[data-fs-workflow-mode] li:is(.is-risk, .is-unsafe) { background: var(--fs-warning-soft) !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-strip-signature[data-fs-workflow-mode] li:is(.is-risk, .is-unsafe)::after { background: var(--fs-yellow) !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-strip-signature[data-fs-workflow-mode] li.is-failure { background: var(--fs-failure-soft) !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-strip-signature[data-fs-workflow-mode] li.is-failure::after { background: var(--fs-red) !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-strip-signature[data-fs-workflow-mode] li:is(.is-success, .is-committed) { background: var(--fs-success-soft) !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-strip-signature[data-fs-workflow-mode] li:is(.is-success, .is-committed)::after { background: var(--fs-green) !important; }
+
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item.is-active {
+  background: transparent !important;
+  box-shadow: inset 0 -3px 0 var(--fs-ink);
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .station-node-item:focus-visible {
+  outline-color: var(--fs-ink) !important;
+}
+
+/* Retire the inherited purple demo shell while keeping the conveyor mechanism. */
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .belt-viewport {
+  border: 1px solid var(--fs-ink-soft) !important;
+  border-radius: 3px !important;
+  background: var(--fs-terminal-deep) !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .belt-rolling-lines {
+  background-image: repeating-linear-gradient(90deg, rgba(239, 244, 239, 0.035), rgba(239, 244, 239, 0.035) 20px, transparent 20px, transparent 40px) !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .gliding-package {
+  border: 1px solid var(--fs-muted) !important;
+  border-radius: 4px !important;
+  background: color-mix(in srgb, var(--fs-ink-soft) 58%, var(--fs-terminal-deep)) !important;
+  color: var(--fs-paper-bright) !important;
+  box-shadow: 0 10px 22px rgba(13, 34, 43, 0.24) !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .gliding-package.is-shielded {
+  border-color: var(--fs-green) !important;
+  background: var(--fs-terminal-success) !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .gliding-package.is-exploded {
+  border-color: var(--fs-red) !important;
+  background: var(--fs-terminal-failure) !important;
+  animation: shake 0.45s 2 !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .pkg-icon-box {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .pkg-info-box small { color: var(--fs-terminal-text) !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .pkg-info-box strong { color: var(--fs-paper-bright) !important; }
+
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .bank-card {
+  border: 1px solid var(--fs-ink-soft) !important;
+  border-radius: 4px !important;
+  background: var(--fs-ink) !important;
+  background-image: none !important;
+  box-shadow: none !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .bank-card.is-double-charged {
+  border-color: var(--fs-red) !important;
+  background: var(--fs-terminal-failure) !important;
+  animation: none !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .card-brand,
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .balance-label { color: var(--fs-terminal-text) !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .balance-val { color: var(--fs-paper-bright) !important; }
+
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .device-header,
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .narrative-step-pill,
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .stage-live-indicator,
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .gate-col span {
+  color: var(--fs-muted) !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .live-dot { color: var(--fs-blue) !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .live-dot::before,
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .pulse-indicator {
+  background: var(--fs-blue) !important;
+  box-shadow: none !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .gate-col.crash-col span { color: var(--fs-red) !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .narrative-desc {
+  color: var(--fs-ink-soft) !important;
+  font-size: var(--fs-type-supporting) !important;
+  line-height: 1.58 !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .narrative-badge {
+  border-radius: 2px !important;
+  font-size: var(--fs-type-meta) !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .narrative-badge.is-good {
+  background: var(--fs-success-soft) !important;
+  color: var(--fs-green) !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .narrative-badge.is-bad {
+  background: var(--fs-failure-soft) !important;
+  color: var(--fs-red) !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .checkpoint-status-bar {
+  border: 1px solid var(--fs-line) !important;
+  border-radius: 3px !important;
+  background: var(--fs-paper-bright) !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .checkpoint-status-bar .cp-label { color: var(--fs-signal-ink) !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .checkpoint-status-bar .cp-val { color: var(--fs-ink) !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .sms-push-box {
+  border-radius: 3px !important;
+  color: var(--fs-ink-soft) !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .sms-push-box.alert-good {
+  border-color: color-mix(in srgb, var(--fs-green) 52%, var(--fs-paper-bright)) !important;
+  background: var(--fs-success-soft) !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .sms-push-box.alert-bad {
+  border-color: color-mix(in srgb, var(--fs-red) 46%, var(--fs-paper-bright)) !important;
+  background: var(--fs-failure-soft) !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .sms-push-box,
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .sms-push-box * { color: var(--fs-ink-soft) !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .sms-push-box.alert-good strong { color: var(--fs-green) !important; }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .sms-push-box.alert-bad strong { color: var(--fs-red) !important; }
+
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .crash-btn {
+  border-color: var(--fs-red) !important;
+  background: var(--fs-failure-soft) !important;
+  color: var(--fs-red) !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .crash-btn:hover {
+  background: var(--fs-red) !important;
+  color: var(--fs-paper-bright) !important;
+  transform: none !important;
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .control-icon {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-disclosure :where(.pain-list, .solution-list) li::before {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 8px;
+  margin-top: 8px;
+  border-radius: 2px;
+  content: "";
+}
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-disclosure .pain-list li::before { background: var(--fs-red); }
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-disclosure .solution-list li::before { background: var(--fs-green); }
 
 body.fs-dispatch[data-fs-demo="split-lab"] .workflow-actions { display: none !important; }
 
@@ -1318,6 +1486,38 @@ body.fs-dispatch[data-fs-surface="catalog"] footer p { font-size: 14px; line-hei
   body.fs-dispatch .fs-experiment .conveyor-arena {
     max-width: 100%;
     overflow-x: auto !important;
+  }
+  body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-strip-signature ol {
+    display: flex !important;
+    grid-template-columns: none !important;
+    scroll-padding-inline: 12px;
+    scrollbar-color: var(--fs-line) var(--fs-paper);
+  }
+  body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-strip-signature li {
+    min-width: 132px !important;
+    flex: 0 0 132px;
+  }
+  body.fs-dispatch[data-fs-demo="workflow-explainer"] .stepper-track-wrap,
+  body.fs-dispatch[data-fs-demo="workflow-explainer"] .conveyor-arena {
+    scroll-padding-inline: 12px;
+    scrollbar-color: var(--fs-line) var(--fs-paper);
+  }
+  body.fs-dispatch[data-fs-demo="workflow-explainer"] .fs-strip-signature ol::-webkit-scrollbar-thumb,
+  body.fs-dispatch[data-fs-demo="workflow-explainer"] .stepper-track-wrap::-webkit-scrollbar-thumb,
+  body.fs-dispatch[data-fs-demo="workflow-explainer"] .conveyor-arena::-webkit-scrollbar-thumb {
+    background: var(--fs-line);
+  }
+  body.fs-dispatch[data-fs-demo="workflow-explainer"] .stage-header {
+    align-items: stretch !important;
+    flex-direction: column;
+  }
+  body.fs-dispatch[data-fs-demo="workflow-explainer"] .stage-actions,
+  body.fs-dispatch[data-fs-demo="workflow-explainer"] .crash-btn {
+    width: 100%;
+  }
+  body.fs-dispatch[data-fs-demo="workflow-explainer"] .crash-btn {
+    min-height: 44px;
+    justify-content: center;
   }
   body.fs-dispatch[data-fs-surface="catalog"] .site-header,
   body.fs-dispatch[data-fs-surface="catalog"] main,
