@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>SaaS Subscription & Time-Travel Dunning | FerricStore Demos</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css?v=3">
+  <link rel="stylesheet" href="./style.css?v=4">
   <link rel="stylesheet" href="../shared/polish.css">
   <link rel="stylesheet" href="../shared/accuracy.css?v=5">
 </head>
@@ -118,8 +118,9 @@
           <p style="margin: 0 0 12px; font-size: 13.5px; color: var(--text-muted);" data-narrative-desc>
             Customer activates Acme Pro Plan. The flow persists a trial state with a scheduled next eligibility time; no application handler stays blocked.
           </p>
+          <div class="narrative-code-note">SIMPLIFIED EXCERPT · COMPLETE WORKFLOW BELOW</div>
           <div style="font-family: var(--font-mono); font-size: 11.5px; color: #fbbf24; background: rgba(0,0,0,0.4); padding: 8px; border-radius: 4px;" data-narrative-code>
-            return transition('send_warning', run_at_ms=day_14_ms)
+            return transition("pre_billing_warning", run_at_ms=day_14_ms)
           </div>
         </div>
       </div>
@@ -174,55 +175,128 @@
           <button type="button" role="tab" aria-selected="false" data-code-example-tab="steps">Durable Step</button>
         </div>
       </div>
+      <p class="sdk-example-note">Animated excerpts omit the surrounding <code>@ctx.effect</code> declarations. The State Handlers tab matches all five stages; Durable Step focuses on the first boundary in a custom claim loop. <code>email</code>, <code>sms</code>, and <code>stripe</code> are application-owned adapters.</p>
 
-      <pre class="sdk-code-block" data-code-example="states"><code># State handlers keep the refreshed claim inside ctx
+      <pre class="sdk-code-block" data-code-example="states"><code># State handlers implement the same five-stage recovery shown above
 import time
 from ferricstore import WorkflowClient, complete, transition
 
 client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
 billing = client.workflow(type="saas-subscription", initial_state="welcome")
+DAY_MS = 86_400_000
+
+def in_days(days):
+    return int(time.time() * 1000) + days * DAY_MS
+
+def charge_subscription(workflow_id, attempt):
+    # Return a codec-friendly result from the application-owned Stripe adapter.
+    payment = stripe.charge(
+        9900,
+        idempotency_key=(
+            f"{workflow_id}:invoice:2026-09:attempt-{attempt}:v1"
+        ),
+    )
+    return {"status": payment.status, "payment_id": payment.id}
 
 @billing.state("welcome")
 def welcome(ctx):
-    ctx.step(
-        name="welcome-email:v1",
-        run=lambda: email.send_welcome(
+    @ctx.effect(
+        "welcome-email", "email.send",
+        operation_digest=f"welcome:{ctx.id}:v1",
+    )
+    def send_welcome():
+        return email.send_welcome(
             ctx.payload["user_id"],
             idempotency_key=f"{ctx.id}:welcome:v1",
-        ),
-        to_state="welcome_sent",
-    )
+        )
+
+    send_welcome()
     # Persist the wait and release the worker until Day 14.
     return transition(
         "pre_billing_warning",
-        run_at_ms=int(time.time() * 1000) + 14 * 86_400_000,
+        run_at_ms=in_days(14),
     )
 
 @billing.state("pre_billing_warning")
 def pre_billing_warning(ctx):
-    ctx.step(
-        name="warning-email:v1",
-        run=lambda: email.send_warning(
+    @ctx.effect(
+        "warning-email", "email.send",
+        operation_digest=f"warning:{ctx.id}:v1",
+    )
+    def send_warning():
+        return email.send_warning(
             ctx.payload["user_id"],
             idempotency_key=f"{ctx.id}:warning:v1",
-        ),
-        to_state="warning_sent",
-    )
+        )
+
+    send_warning()
     return transition(
         "charge",
-        run_at_ms=int(time.time() * 1000) + 86_400_000,
+        run_at_ms=in_days(1),
     )
 
 @billing.state("charge")
 def charge(ctx):
-    payment = ctx.step(
-        name="invoice:2026-09:v1",
-        run=lambda: stripe.charge(
-            9900,
-            idempotency_key=f"{ctx.id}:invoice:2026-09:v1",
-        ),
-        to_state="charge_recorded",
+    @ctx.effect(
+        "charge-attempt-1", "stripe.charge",
+        operation_digest=f"charge:{ctx.id}:attempt-1:v1",
     )
+    def charge_once():
+        return charge_subscription(ctx.id, attempt=1)
+
+    attempt = charge_once()
+    if attempt["status"] == "paid":
+        return complete(result=attempt)
+
+    @ctx.effect(
+        "dunning-email-1", "email.send",
+        operation_digest=f"dunning:{ctx.id}:attempt-1:v1",
+    )
+    def send_dunning():
+        return email.send_dunning(
+            ctx.payload["user_id"],
+            idempotency_key=f"{ctx.id}:dunning-1:v1",
+        )
+
+    send_dunning()
+    return transition("retry_1", run_at_ms=in_days(3))
+
+@billing.state("retry_1")
+def retry_1(ctx):
+    @ctx.effect(
+        "charge-attempt-2", "stripe.charge",
+        operation_digest=f"charge:{ctx.id}:attempt-2:v1",
+    )
+    def charge_once():
+        return charge_subscription(ctx.id, attempt=2)
+
+    attempt = charge_once()
+    if attempt["status"] == "paid":
+        return complete(result=attempt)
+
+    @ctx.effect(
+        "card-update-sms", "sms.send",
+        operation_digest=f"sms:{ctx.id}:attempt-1:v1",
+    )
+    def send_update_link():
+        return sms.send_update_link(
+            ctx.payload["user_id"],
+            idempotency_key=f"{ctx.id}:sms-1:v1",
+        )
+
+    send_update_link()
+    return transition("retry_2", run_at_ms=in_days(3))
+
+@billing.state("retry_2")
+def retry_2(ctx):
+    @ctx.effect(
+        "charge-attempt-3", "stripe.charge",
+        operation_digest=f"charge:{ctx.id}:attempt-3:v1",
+    )
+    def charge_once():
+        return charge_subscription(ctx.id, attempt=3)
+
+    payment = charge_once()
     return complete(result=payment)
 
 billing.start("sub-user-42", payload={"user_id": "user-42"})
@@ -262,7 +336,7 @@ client.transition(
 )</code></pre>
     </section>
   </main>
-  <script src="./dunning.js?v=6"></script>
+  <script src="./dunning.js?v=7"></script>
   <script src="../shared/accuracy.js?v=10"></script>
 </body>
 </html>

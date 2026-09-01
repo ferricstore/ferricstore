@@ -129,6 +129,17 @@ h1, h2, h3, h4, .hero-pill, .badge-label, .ctrl-btn {
   background: #080614; border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md); padding: 20px;
 }
+
+.narrative-code-note,
+.sdk-example-note {
+  color: #fbbf24;
+  font: 750 10.5px/1.45 var(--font-mono);
+  letter-spacing: 0.035em;
+}
+.narrative-code-note { margin: 0 0 6px; }
+.sdk-example-note { margin: 0 0 14px; color: #cbd5e1; font: 500 12.5px/1.6 var(--font-sans); letter-spacing: 0; }
+.sdk-example-note code { color: #fbbf24; }
+[data-narrative-code] { white-space: pre-wrap; overflow-wrap: anywhere; }
 .agent-badge { display: inline-flex; padding: 3px 10px; border-radius: var(--radius-full); font-size: 11px; font-weight: 800; text-transform: uppercase; margin-bottom: 8px; }
 .agent-badge.good { background: rgba(16, 185, 129, 0.2); color: #34d399; }
 .agent-badge.warn { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }

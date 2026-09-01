@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Multi-Agent AI & Human-in-the-Loop | FerricStore Demos</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css?v=3">
+  <link rel="stylesheet" href="./style.css?v=4">
   <link rel="stylesheet" href="../shared/polish.css">
   <link rel="stylesheet" href="../shared/accuracy.css?v=5">
 </head>
@@ -113,6 +113,7 @@
           <p style="margin: 0 0 12px; font-size: 13.5px; color: var(--text-muted);" data-narrative-desc>
             Scraping 24 competitor ad accounts and keyword bids. The step result is durably cached in FerricStore's disk log.
           </p>
+          <div class="narrative-code-note">SIMPLIFIED EXCERPT · COMPLETE WORKFLOW BELOW</div>
           <div style="font-family: var(--font-mono); font-size: 11.5px; color: #a78bfa; background: rgba(0,0,0,0.4); padding: 8px; border-radius: 4px;" data-narrative-code>
             return transition("draft_plan", payload={"competitors": competitors})
           </div>
@@ -160,6 +161,7 @@
     <!-- Python Code Example -->
     <section style="margin-bottom: 60px;">
       <h3 style="font-size: 20px; margin-bottom: 12px;">FerricStore Python SDK: State Transition &amp; External Signal</h3>
+      <p class="sdk-example-note">Animated excerpts omit surrounding handler and <code>@ctx.effect</code> declarations; the signal itself is shown directly. FerricStore states and arguments below match the animation, while provider calls are application-owned adapters.</p>
       <pre style="background: #080614; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 20px; font-family: var(--font-mono); font-size: 13px; color: #e2e8f0; overflow-x: auto;"><code># 1. The Multi-Agent AI Workflow State Machine
 from ferricstore import WorkflowClient, transition, complete
 
@@ -213,10 +215,14 @@ def slack_webhook(payload: dict):
         transition_to="launch_campaign", values={"approved_by": payload["user"]},
         idempotency_key=f"{job_id}:approve:{payload['action_id']}:v1",
     )
-    return {"status": "workflow_resumed"}</code></pre>
+    return {"status": "workflow_resumed"}
+
+# Start from the producer process; run workers in the worker process.
+flow.start("camp-9842", payload={"campaign": "Summer SaaS Growth Blast"})
+flow.worker().run()</code></pre>
     </section>
   </main>
-  <script src="./agent.js?v=5"></script>
+  <script src="./agent.js?v=6"></script>
   <script src="../shared/accuracy.js?v=10"></script>
 </body>
 </html>

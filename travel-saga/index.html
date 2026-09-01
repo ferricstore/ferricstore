@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Travel Booking & Reversible Sagas | FerricStore Demos</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css?v=2">
+  <link rel="stylesheet" href="./style.css?v=3">
   <link rel="stylesheet" href="../shared/polish.css">
   <link rel="stylesheet" href="../shared/accuracy.css?v=5">
 </head>
@@ -116,8 +116,9 @@
           <p style="margin: 0 0 12px; font-size: 13.5px; color: var(--text-muted);" data-narrative-desc>
             Stripe payment succeeded with a stable provider idempotency key; refund is an explicit state.
           </p>
+          <div class="narrative-code-note">SIMPLIFIED EXCERPT · COMPLETE WORKFLOW BELOW</div>
           <div style="font-family: var(--font-mono); font-size: 11.5px; color: #34d399; background: rgba(0,0,0,0.4); padding: 8px; border-radius: 4px;" data-narrative-code>
-            stripe.charge(85000, idempotency_key=f'{job.id}:charge:v1')
+            stripe.charge(85_000, idempotency_key=f'{ctx.id}:charge:v1')
           </div>
         </div>
       </div>
@@ -163,6 +164,7 @@
     <!-- Python Code Example -->
     <section style="margin-bottom: 60px;">
       <h3 style="font-size: 20px; margin-bottom: 12px;">FerricStore Python SDK: Reversible Sagas</h3>
+      <p class="sdk-example-note">Animated excerpts omit the surrounding <code>@ctx.effect</code> declarations. FerricStore states and transitions below match all three scenarios; Stripe, Delta, Marriott, and Hertz calls are application-owned adapters.</p>
       <pre style="background: #080614; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 20px; font-family: var(--font-mono); font-size: 13px; color: #e2e8f0; overflow-x: auto;"><code># Compensations are explicit states; every provider mutation has a stable key
 from ferricstore import WorkflowClient, transition, complete
 
@@ -173,7 +175,7 @@ saga = client.workflow(type="vacation-checkout", initial_state="charge_card")
 def charge(ctx):
     @ctx.effect("charge", "stripe.charge", operation_digest=f"charge:{ctx.id}:v1")
     def call_stripe():
-        return stripe.charge(850.00, idempotency_key=f"{ctx.id}:charge:v1")
+        return stripe.charge(85_000, idempotency_key=f"{ctx.id}:charge:v1")
     tx = call_stripe()
     return transition("book_flight", values={"tx_id": tx.id})
 
@@ -229,10 +231,13 @@ def refund_card(ctx):
     def refund():
         stripe.refund(ctx.value("tx_id"), idempotency_key=f"{ctx.id}:refund:v1")
     refund()
-    return complete(result={"status": "ROLLED_BACK"})</code></pre>
+    return complete(result={"status": "ROLLED_BACK"})
+
+saga.start("trip-42", payload={"customer_id": "customer-42"})
+saga.worker().run()</code></pre>
     </section>
   </main>
-  <script src="./saga.js?v=5"></script>
+  <script src="./saga.js?v=6"></script>
   <script src="../shared/accuracy.js?v=10"></script>
 </body>
 </html>
