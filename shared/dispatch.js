@@ -247,6 +247,31 @@
     "benchmark-explainer": { status: "[data-current-run-label], [aria-pressed='true'][data-mode-button]", actionIndex: 2 }
   };
 
+  // One plain-language sentence per route. Keep the technical mechanism in
+  // the page, but give a first-time visitor a lesson they can repeat.
+  var plainLessons = {
+    "workflow-explainer": "A replacement worker can continue from the last saved step instead of starting over.",
+    "ai-agent-workflow": "The agent can pause for a person’s approval; the host does not need to stay running while it waits.",
+    "travel-saga": "If a later booking fails, the workflow runs the earlier bookings’ undo steps in reverse order.",
+    "subscription-dunning": "Payment retries and cancellation dates stay scheduled even when no process is running.",
+    "ticket-reservation": "When a hold expires, a newer buyer can take the seat while the old buyer’s write is rejected.",
+    "canary-rollback": "A deployment can wait while health is observed, then roll back from the saved decision after a restart.",
+    "parallel-fanout": "If one child job fails, only that child is retried; the successful children stay finished.",
+    "agent-loop": "A saved budget stops runaway work, and a saved circuit state pauses calls to a failing service.",
+    "split-lab": "The same crash either repeats finished work or resumes from the saved middle step, depending on the mode.",
+    "idempotency-determinism": "A stable operation ID lets a retry reuse one external effect instead of creating a duplicate.",
+    "zombie-fencing": "A worker that returns late may finish its code, but its older write cannot beat the newer owner’s write.",
+    "architecture-comparison": "Each architecture remembers a different amount after the same crash; durable workflow state remembers the named step.",
+    "benchmark-explainer": "A throughput number only means something when the unit, workload, hardware, and execution boundary are stated.",
+    "hot-cold-storage": "The key stays addressable while its value moves between fast memory and disk-backed storage.",
+    "rate-limiting-stream": "A durable buffer absorbs a burst so downstream workers process a controlled rate and batch size.",
+    "beginner-queue": "A job moves from queued to claimed to completed, and an expired claim can be safely taken by another worker.",
+    "cache-stampede": "Many callers can share one recomputation instead of all hitting the origin at the same time.",
+    "stream-vs-pubsub": "Pub/Sub reaches listeners that are online; a stream keeps events so a reader can catch up later.",
+    "hash-field-ttl": "Each field can expire on its own while the surrounding object and its other fields remain.",
+    "probabilistic-cache": "A compact filter can reject a definite miss early; a possible hit still needs an origin lookup."
+  };
+
   function routeId() {
     var parts = window.location.pathname.split("/").filter(Boolean);
     var last = parts[parts.length - 1] || "";
@@ -298,14 +323,20 @@
     var intro = document.createElement("div");
     intro.className = "fs-intro";
     intro.innerHTML =
-      '<div class="fs-intro-copy"><h1>' + config.title + '</h1><p>' + config.summary + '</p></div>' +
+      '<div class="fs-intro-copy"><h1>' + config.title + '</h1><p>' + config.summary + '</p>' +
+      (plainLessons[routeId()] ? '<p class="fs-plain-language"><strong>In plain language</strong><span>' + plainLessons[routeId()] + '</span></p>' : '') + '</div>' +
       '<div class="fs-run-group"><button type="button" class="fs-primary-run">' + config.action + '</button>' +
       '<p class="fs-run-status" aria-live="polite">Ready to run in this browser.</p></div>' +
       '<p class="fs-outcome"><strong>What to verify</strong><span>' + config.outcome + '</span></p>' +
       '<a class="fs-evidence-link" href="#evaluation-evidence">Inspect evaluation evidence</a>';
     if (controls) {
       controls.classList.add("fs-primary-controls");
-      intro.insertBefore(controls, intro.querySelector(".fs-outcome"));
+      var choiceHint = document.createElement("p");
+      choiceHint.className = "fs-choice-hint";
+      choiceHint.textContent = "1. Choose a path";
+      intro.insertBefore(choiceHint, intro.querySelector(".fs-run-group"));
+      intro.insertBefore(controls, intro.querySelector(".fs-run-group"));
+      intro.querySelector(".fs-run-group").insertAdjacentHTML("afterbegin", '<span class="fs-action-hint">2. Run the experiment</span>');
     }
     return intro;
   }
@@ -369,7 +400,7 @@
       directAccuracy.id = "evaluation-evidence";
     }
 
-    var destination = metrics || directAccuracy || document.querySelector(".fs-accuracy-disclosure") || main.querySelector(".fs-disclosure");
+    var destination = directAccuracy || metrics || document.querySelector(".fs-accuracy-disclosure") || main.querySelector(".fs-disclosure");
     var evidenceLink = firstView.querySelector(".fs-evidence-link");
     if (destination) {
       destination.id = "evaluation-evidence";
@@ -382,6 +413,12 @@
     Array.prototype.slice.call(document.querySelectorAll('[role="tablist"]')).forEach(function (tablist) {
       if (tablist.dataset.fsKeyboardReady) return;
       tablist.dataset.fsKeyboardReady = "true";
+      function syncTabOrder() {
+        Array.prototype.slice.call(tablist.querySelectorAll('[role="tab"]')).forEach(function (tab) {
+          tab.tabIndex = tab.getAttribute("aria-selected") === "true" ? 0 : -1;
+        });
+      }
+      syncTabOrder();
       tablist.addEventListener("keydown", function (event) {
         if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].indexOf(event.key) === -1) return;
         var tabs = Array.prototype.slice.call(tablist.querySelectorAll('[role="tab"]')).filter(function (tab) {
@@ -398,7 +435,9 @@
         event.preventDefault();
         tabs[current].focus();
         tabs[current].click();
+        syncTabOrder();
       });
+      tablist.addEventListener("click", function () { window.setTimeout(syncTabOrder, 0); });
     });
   }
 
@@ -414,6 +453,15 @@
     });
   }
 
+  function normalizeLiveRegions(target) {
+    // The shared run status is the single announcement channel. Route-local
+    // labels still update visually, but mirrored live regions no longer make
+    // screen readers repeat the same transition several times.
+    Array.prototype.slice.call(target.querySelectorAll("[aria-live]")).forEach(function (node) {
+      node.removeAttribute("aria-live");
+    });
+  }
+
   function enhanceDemo(id, config) {
     document.body.dataset.fsSurface = "demo";
     document.body.dataset.fsDemo = id;
@@ -424,7 +472,9 @@
     var target = document.querySelector(config.target);
     if (!target) return;
 
-    var controls = hero && hero.querySelector(".mode-container, .mode-toggle-wrap, #workflow-controls");
+    var controlSelector = ".mode-container, .mode-toggle-wrap, #workflow-controls, .mode-switch, .paradigm-selector-grid, .scenario-selector-bar";
+    var controls = hero && hero.querySelector(controlSelector);
+    if (!controls) controls = document.querySelector(controlSelector);
     if (!controls && id === "split-lab") controls = document.querySelector("#workflow-controls .workflow-modes");
     var firstView = document.createElement("section");
     firstView.className = "fs-first-view";
@@ -606,6 +656,13 @@
     function syncExperiment() {
       var stepIndex = liveStepIndex();
       if (Number.isFinite(stepIndex)) setSignatureIndex(stepIndex);
+      var activeStep = routeSignal.step ? document.querySelector(routeSignal.step) : null;
+      if (activeStep) {
+        Array.prototype.slice.call(activeStep.parentElement ? activeStep.parentElement.children : []).forEach(function (peer) {
+          peer.removeAttribute("aria-current");
+        });
+        activeStep.setAttribute("aria-current", "step");
+      }
       var original = findPrimaryButton(config);
       proxy.disabled = Boolean(original && original.disabled);
       var live = liveStatusText();
@@ -622,7 +679,7 @@
         return;
       }
       original.click();
-      status.textContent = "Action sent to the live experiment.";
+      status.textContent = "Running " + config.title.toLowerCase() + "…";
       if (Number.isFinite(routeSignal.actionIndex)) setSignatureIndex(routeSignal.actionIndex);
       if (id === "split-lab") {
         target.dataset.fsAutoCrash = "true";
@@ -707,13 +764,8 @@
       codeButton.setAttribute("aria-controls", codePanels.map(function (panel) { return panel.id; }).join(" "));
       codeButton.addEventListener("click", function () {
         var open = target.classList.toggle("fs-code-open");
-        if (open) {
-          var solutionMode = document.querySelector('[data-mode-btn="after"], [data-mode-btn="bloom"]');
-          if (solutionMode && solutionMode.getAttribute("aria-selected") !== "true") solutionMode.click();
-
-          var simpleStates = document.querySelector('[data-sdk-style="states"], [data-code-example-tab="states"], [data-api-mode="states"]');
-          if (simpleStates) simpleStates.click();
-        }
+        // Code is supporting evidence; opening it must not silently change
+        // the selected scenario or comparison mode.
         codeButton.textContent = open ? "Hide code" : "Inspect code";
         codeButton.setAttribute("aria-expanded", String(open));
       });
@@ -740,6 +792,7 @@
     }
 
     enhanceSecondary(main, firstView, hero);
+    normalizeLiveRegions(target);
     installDisclosureKeyboard();
     installTabKeyboard();
   }
