@@ -458,6 +458,13 @@ body.fs-dispatch[data-fs-surface="demo"] main.container {
 .fs-primary-controls .scenario-tabs .scen-tab * ,
 .fs-primary-controls .paradigm-selector-grid .paradigm-btn * { color: inherit !important; }
 
+/* The choice itself is the first task. Keep implementation labels available
+   in the source/evidence layer, but do not let them push the Run action out
+   of the first viewport. */
+.fs-primary-controls .scenario-tabs .scen-tab small,
+.fs-primary-controls.paradigm-selector-grid .paradigm-btn .p-header,
+.fs-primary-controls.paradigm-selector-grid .paradigm-btn small { display: none !important; }
+
 .fs-experiment {
   min-width: 0;
   padding: clamp(18px, 2.5vw, 34px);
