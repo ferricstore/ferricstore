@@ -453,11 +453,13 @@
     });
   }
 
-  function normalizeLiveRegions(target) {
+  function normalizeLiveRegions() {
     // The shared run status is the single announcement channel. Route-local
     // labels still update visually, but mirrored live regions no longer make
     // screen readers repeat the same transition several times.
-    Array.prototype.slice.call(target.querySelectorAll("[aria-live]")).forEach(function (node) {
+    Array.prototype.slice.call(document.querySelectorAll("[aria-live]")).filter(function (node) {
+      return !node.classList.contains("fs-run-status");
+    }).forEach(function (node) {
       node.removeAttribute("aria-live");
     });
   }
@@ -486,7 +488,17 @@
     firstView.append(intro, experiment);
     main.insertBefore(firstView, main.firstChild);
 
-    if (hero) hero.classList.add("fs-retired-hero");
+    if (hero) {
+      // The shared intro owns the page-level heading. Demote the legacy hero
+      // heading before retiring it so assistive technology sees one h1.
+      Array.prototype.slice.call(hero.querySelectorAll("h1")).forEach(function (heading) {
+        var replacement = document.createElement("h2");
+        replacement.className = heading.className;
+        replacement.innerHTML = heading.innerHTML;
+        heading.replaceWith(replacement);
+      });
+      hero.classList.add("fs-retired-hero");
+    }
 
     var oldNav = document.querySelector(".demo-nav, .top-nav, .flagship-nav");
     var nav = makeNav(config);
@@ -773,6 +785,7 @@
     }
 
     var experimentObserver = new MutationObserver(function () {
+      normalizeLiveRegions();
       if (id === "split-lab" && target.dataset.fsAutoCrash === "true") {
         var crash = document.querySelector('[data-action="crash"]');
         if (crash && !crash.disabled) {
@@ -782,7 +795,7 @@
       }
       window.requestAnimationFrame(syncExperiment);
     });
-    experimentObserver.observe(target, { attributes: true, childList: true, characterData: true, subtree: true, attributeFilter: ["class", "aria-selected", "aria-pressed", "disabled"] });
+    experimentObserver.observe(target, { attributes: true, childList: true, characterData: true, subtree: true, attributeFilter: ["class", "aria-selected", "aria-pressed", "aria-live", "disabled"] });
     Array.prototype.slice.call(document.querySelectorAll(routeSignal.status || "")).forEach(function (statusNode) {
       if (!target.contains(statusNode)) experimentObserver.observe(statusNode, { attributes: true, childList: true, characterData: true, subtree: true });
     });
@@ -792,7 +805,7 @@
     }
 
     enhanceSecondary(main, firstView, hero);
-    normalizeLiveRegions(target);
+    normalizeLiveRegions();
     installDisclosureKeyboard();
     installTabKeyboard();
   }
