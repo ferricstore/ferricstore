@@ -262,9 +262,11 @@ capacity, the repository includes equivalent ECS-on-EC2 profiles:
 Both profiles use `awsvpc`, an internal NLB, isolated liveness probes, the
 authenticated HTTP/TLS listener, and the same native ACL-user bootstrap. ECS
 replaces failed tasks and Auto Scaling replaces failed EC2 container instances.
-The instance root volume is local to that instance: a task replacement on a
-surviving host can reuse `/data`, but an instance replacement loses its local
-copy and a cluster node is rebuilt from its two surviving replicas. Read the
+The clustered profile retains terminated EC2 root volumes (`delete_on_termination
+= false`) and tags them by node slot. A task replacement on a surviving host
+reuses `/data`; an instance replacement starts the node on a fresh root and
+rebuilds its active copy from the two surviving replicas, while the old volume
+remains available for manual recovery. Read the
 [single-task](../docs/aws-ecs-single-task.md) or
 [cluster](../docs/aws-ecs-cluster.md) contract before applying.
 

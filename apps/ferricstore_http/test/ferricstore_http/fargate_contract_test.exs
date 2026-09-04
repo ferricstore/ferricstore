@@ -70,8 +70,12 @@ defmodule FerricstoreHttp.FargateContractTest do
       assert stack.main =~ ~s(preserve_client_ip = true)
     end
 
+    assert cluster.main =~ "delete_on_termination = false"
+    assert cluster.main =~ "Retained = \"true\""
+    assert cluster.main =~ "FerricStore data mount is missing"
+    assert cluster.outputs =~ "retained"
     assert single.outputs =~ "oss-single-task-ecs-ec2-ephemeral"
-    assert cluster.outputs =~ "oss-three-node-ecs-ec2-cluster-ephemeral-replicas"
+    assert cluster.outputs =~ "oss-three-node-ecs-ec2-cluster-retained-replicas"
   end
 
   defp read_stack(name) do

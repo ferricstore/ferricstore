@@ -63,11 +63,11 @@ output "private_subnet_ids" {
 }
 
 output "deployment_profile" {
-  value = "oss-three-node-ecs-ec2-cluster-ephemeral-replicas"
+  value = "oss-three-node-ecs-ec2-cluster-retained-replicas"
 }
 
 output "failure_contract" {
-  value = "One task or container instance/AZ may be replaced and recover from the other two. Never replace or upgrade two slots together; simultaneous loss of two replicas can lose quorum or data. Loss of all three root volumes loses all data."
+  value = "One task or container instance/AZ may be replaced and recover from the other two. Never replace or upgrade two slots together; simultaneous loss of two replicas can lose quorum or data. Terminated root volumes are retained for manual recovery; deleting all retained volumes loses all data."
 }
 
 output "ecs_capacity_providers" {

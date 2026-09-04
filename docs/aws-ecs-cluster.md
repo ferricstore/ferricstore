@@ -1,7 +1,7 @@
 # AWS ECS-on-EC2 Cluster Support
 
-Status: supported OSS profile with an explicit ephemeral-replica failure
-contract.
+Status: supported OSS profile with three retained, instance-local replica
+volumes and an explicit one-replica replacement contract.
 
 Implementation:
 [`deploy/aws/ecs-cluster`](https://github.com/ferricstore/ferricstore/tree/main/deploy/aws/ecs-cluster)
@@ -21,7 +21,7 @@ The closest Kubernetes mapping is:
 | Running task | Pod | One FerricStore process and its task-lifetime `/data` mount |
 | ECS service | Stateful controller for one slot | Keeps exactly one logical node running and replaces it when necessary |
 | ECS cluster | Scheduler boundary | Runs the three services; it is not the FerricStore Raft cluster |
-| EC2 container instance | Node | One per AZ, owned by a per-slot capacity provider, with an encrypted root volume |
+| EC2 container instance | Node | One per AZ, owned by a per-slot capacity provider, with a retained encrypted root volume |
 | Cloud Map service | Headless per-pod DNS identity | Moves one stable slot name to its current task IP |
 
 A single ECS task cannot be a fault-tolerant cluster. This profile is one
@@ -80,6 +80,34 @@ private IP and instance-local disk are replaceable implementation details.
 The NLB DNS name is the stable client bootstrap endpoint. SDK route metadata
 advertises the three per-slot Cloud Map names, so clients never need a raw task
 IP.
+
+### Protecting An Existing Cluster's Volumes
+
+The launch template applies `delete_on_termination = false` to new EC2
+instances. If a cluster was created before that setting was applied, update
+the termination flag on each currently running `node-0`, `node-1`, and `node-2`
+instance once, before any planned replacement:
+
+```bash
+for instance_id in $(aws ec2 describe-instances \
+  --filters \
+    'Name=tag:NodeSlot,Values=node-0,node-1,node-2' \
+    'Name=instance-state-name,Values=running' \
+  --query 'Reservations[].Instances[].InstanceId' \
+  --output text); do
+  root_device_name="$(aws ec2 describe-instances \
+    --instance-ids "${instance_id}" \
+    --query 'Reservations[0].Instances[0].RootDeviceName' \
+    --output text)"
+  aws ec2 modify-instance-attribute \
+    --instance-id "${instance_id}" \
+    --block-device-mappings "[{\"DeviceName\":\"${root_device_name}\",\"Ebs\":{\"DeleteOnTermination\":false}}]"
+done
+```
+
+This changes only the EC2 termination policy; it does not stop the instance,
+detach the volume, or modify FerricStore data. Verify the setting with
+`aws ec2 describe-instances` before continuing a rollout.
 
 AWS documents that each `awsvpc` ECS task receives its own ENI, ECS service
 discovery registers the task private IP, and the DNS form is
@@ -153,8 +181,10 @@ can replace tasks.
 
 For one failed slot:
 
-1. The old task stops; its IP and ENI are lost. Its `/data` remains only if the
-   EC2 container instance survives.
+1. The old task stops; its IP and ENI are lost. Its `/data` remains when the EC2
+   container instance survives. If the instance is replaced, AWS retains the
+   old encrypted root volume as a tagged unattached EBS volume, while the new
+   instance starts with a fresh root and an empty `/data` directory.
 2. The other two voters retain quorum and continue serving.
 3. The slot's ECS service starts a blank replacement in its assigned AZ.
 4. ECS changes the Cloud Map record to the replacement IP.
@@ -181,7 +211,8 @@ directory, and verifies both old and intervening data on the replacement.
 | DNS briefly returns an old address | Task startup waits for its own address; peers retry every five seconds | Yes |
 | Temporary loss of quorum | Readiness fails, but liveness does not ask ECS to destroy more replica disks | Degraded until quorum returns |
 | Two instance/root volumes lost or replaced together | Only one old replica may remain; quorum and safe automatic recovery are not guaranteed | No |
-| All three instances/root volumes lost or stack destroyed | No remaining source exists from which to rebuild | Data loss |
+| All three active instances are lost | No automatic quorum/data recovery; retained old EBS volumes require manual recovery before serving the original database | Not automatic; restore manually |
+| Retained EBS volumes are manually deleted without a snapshot | No remaining source exists from which to rebuild | Data loss |
 | Autoscaling or desired count other than one per slot | Duplicate identities or uncoordinated members | No |
 | Parallel `aws ecs update-service` on multiple slots | Multiple local copies disappear together | No |
 | Client caches a raw task IP | Connection breaks after replacement | No; clients must use NLB/Cloud Map names |
@@ -236,13 +267,19 @@ one-slot-at-a-time maintenance plan.
 
 FerricStore data is stored only on three encrypted EC2 root volumes. There is
 no S3, DynamoDB, or service-managed EBS data plane in this profile. S3 and
-DynamoDB are not required for node discovery or normal Raft operation.
+DynamoDB are not required for node discovery or normal Raft operation. The
+launch template sets `delete_on_termination = false` and tags each root volume
+with its node slot, so an instance replacement or stack teardown does not
+physically delete the volume. A replacement instance still starts with its own
+fresh root and is rebuilt from the surviving replicas; the retained old volume
+is a manual recovery source, not an automatic attachment.
 
 The tradeoff is mathematical rather than AWS-specific: replication can rebuild
 one missing copy only while enough other copies remain. An orchestrator can
 restart tasks, but cannot reconstruct data after all authoritative copies are
-gone. An instance replacement removes its root volume; the replacement node is
-rebuilt from the surviving replicas. See
+gone from the active cluster. An instance replacement retains the old root
+volume but starts the replacement node on a fresh root, which is rebuilt from
+the surviving replicas. See
 [ECS container instances](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs_container_instances.html).
 
 AWS Secrets Manager is used only for the Erlang cookie so all nodes can
@@ -437,6 +474,12 @@ Prometheus-compatible service for production history. AWS documents an ECS
 ECS collection path using the AWS Distro for OpenTelemetry collector and
 Amazon Managed Service for Prometheus in its
 [ECS metrics ingestion guide](https://docs.aws.amazon.com/prometheus/latest/userguide/AMP-onboard-ingest-metrics-OpenTelemetry-ECS.html).
+
+Do not run `terraform destroy` for a live database. It destroys the ECS
+services, networking, and cluster control plane. The retained root volumes are
+left unattached in EBS and must be manually recovered or snapshotted; they are
+not an active service after teardown. Delete them only after confirming that
+the data is no longer needed.
 
 ## What Is Still Not Provided
 

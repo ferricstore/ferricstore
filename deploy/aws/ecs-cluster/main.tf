@@ -428,10 +428,14 @@ resource "aws_launch_template" "ecs_instance" {
     device_name = "/dev/xvda"
 
     ebs {
-      volume_size           = var.ec2_root_volume_gib
-      volume_type           = "gp3"
-      encrypted             = true
-      delete_on_termination = true
+      volume_size = var.ec2_root_volume_gib
+      volume_type = "gp3"
+      encrypted   = true
+      # Keep the root volume when an ASG replaces an instance. The replacement
+      # starts with a fresh root and rebuilds its replica from the surviving
+      # nodes, but the old volume remains available for forensic recovery or a
+      # manually coordinated restore instead of being physically deleted.
+      delete_on_termination = false
     }
   }
 
@@ -441,6 +445,20 @@ resource "aws_launch_template" "ecs_instance" {
     tags = {
       Name     = "${var.name_prefix}-${each.key}-ecs-instance"
       NodeSlot = each.key
+    }
+  }
+
+  # Root volumes contain FerricStore's instance-local replica. Tag them so an
+  # operator can find retained volumes after an instance replacement or stack
+  # teardown; delete_on_termination is deliberately false above.
+  tag_specifications {
+    resource_type = "volume"
+
+    tags = {
+      Name     = "${var.name_prefix}-${each.key}-ferricstore-data"
+      NodeSlot = each.key
+      DataRole = "FerricStoreReplica"
+      Retained = "true"
     }
   }
 
@@ -533,7 +551,10 @@ resource "aws_ecs_task_definition" "node" {
       image     = var.container_image
       essential = false
       user      = "0:0"
-      command   = ["/bin/sh", "-c", "chown 10001:10001 /data && chmod 0700 /data"]
+      # A host_path bind mount is expected here. Failing closed protects the
+      # database if the instance bootstrap has not prepared the mount and ECS
+      # would otherwise create an empty directory on the root filesystem.
+      command = ["/bin/sh", "-ec", "grep -Eq '[[:space:]]/data[[:space:]]' /proc/self/mountinfo || { echo 'FerricStore data mount is missing' >&2; exit 1; }; chown 10001:10001 /data && chmod 0700 /data"]
 
       mountPoints = [{
         sourceVolume  = "data"

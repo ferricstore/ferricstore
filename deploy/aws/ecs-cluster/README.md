@@ -32,11 +32,13 @@ the two surviving nodes to the replacement's empty `/data` volume.
 - Image upgrades are supported only through `scripts/deploy-sequential.sh`,
   which replaces one slot and verifies full local catch-up before continuing.
 - Two simultaneous instance/root-volume losses are not supported. They can
-  remove quorum and are a data-loss risk. Loss of all three root volumes loses
-  all data.
+  remove quorum and are a data-loss risk. Irrecoverably deleting all three
+  retained root volumes loses all data.
 - There is no S3, DynamoDB, or EFS data dependency. Each node uses an encrypted
-  gp3 root volume on its EC2 instance; replacing that instance loses that node's
-  local copy, which is rebuilt from the other two replicas.
+  gp3 root volume on its EC2 instance. The volume is retained when an instance
+  is terminated, while a replacement starts with a fresh root and rebuilds its
+  active replica from the other two nodes. The retained old volume is available
+  for manual recovery and is tagged `Retained=true`.
 - This profile has exactly three nodes. Do not change a service's desired count.
   The per-AZ capacity providers already use Auto Scaling for failed-instance
   replacement.
@@ -77,6 +79,34 @@ terraform output -raw endpoint
 
 The endpoint and the three Cloud Map names are private to the VPC. Clients must
 run in the VPC, a peered VPC, or a network connected through VPN/Direct Connect.
+
+### Protect An Existing Cluster's Volumes
+
+The launch template applies `delete_on_termination = false` to new instances.
+If this stack was already running before that setting was applied, update the
+termination flag on the three current instances once, before any planned
+replacement:
+
+```bash
+for instance_id in $(aws ec2 describe-instances \
+  --filters \
+    'Name=tag:NodeSlot,Values=node-0,node-1,node-2' \
+    'Name=instance-state-name,Values=running' \
+  --query 'Reservations[].Instances[].InstanceId' \
+  --output text); do
+  root_device_name="$(aws ec2 describe-instances \
+    --instance-ids "${instance_id}" \
+    --query 'Reservations[0].Instances[0].RootDeviceName' \
+    --output text)"
+  aws ec2 modify-instance-attribute \
+    --instance-id "${instance_id}" \
+    --block-device-mappings "[{\"DeviceName\":\"${root_device_name}\",\"Ebs\":{\"DeleteOnTermination\":false}}]"
+done
+```
+
+This changes only the EC2 termination policy; it does not stop the instance,
+detach the volume, or modify FerricStore data. Verify the flag with
+`aws ec2 describe-instances` before continuing a rollout.
 
 ## HTTP Command API
 
@@ -276,7 +306,13 @@ pull and control-plane egress independently in each AZ but are often a material
 part of the cost. A private-ECR design can replace them with the appropriate VPC
 endpoints.
 
-Destroying the stack destroys every replica and all FerricStore data:
+Do not run `terraform destroy` for a live database. It destroys the ECS
+services, networking, and cluster control plane. The EC2 root volumes are
+intentionally configured with `delete_on_termination = false`, so they remain
+as unattached, tagged EBS volumes instead of being physically deleted; the
+database is not automatically served after teardown and must be manually
+recovered or snapshotted. Delete those retained volumes only after confirming
+that the data is no longer needed.
 
 ```bash
 terraform destroy
