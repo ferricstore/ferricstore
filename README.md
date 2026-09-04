@@ -66,7 +66,7 @@ dashboard are included in this OSS repository and release image.
 | FlowGuard governance | Durable effect reservations, approvals, circuits, budgets, strict leased concurrency limits, per-Flow governance ledgers, global overview/list surfaces, and structured denials. |
 | Operations | Browser dashboard, local operational Mix CLI, Flow query and index inspection, schedules, policies, governance, failures, retention, storage, keyspace, clients, streams, Pub/Sub, slow log, Raft/consensus, doctor diagnostics, health probes, and Prometheus metrics. |
 | Security | Protected mode, named ACL users, command/key/channel rules, dashboard bootstrap/login and ACL-scoped accounts, TLS/mTLS, trusted-proxy controls, CSRF/origin validation, login throttling, session revocation, and audit logging. |
-| Durability and deployment | Sharded WARaft consensus, disk-backed authoritative records, restart recovery, compaction, memory pressure/admission controls, multi-node routing, Docker multi-arch images, ephemeral single-task and three-node AWS Fargate OSS profiles, Kubernetes, bare-metal releases, and embedded mode. |
+| Durability and deployment | Sharded WARaft consensus, disk-backed authoritative records, restart recovery, compaction, memory pressure/admission controls, multi-node routing, Docker multi-arch images, ephemeral single-task and three-node AWS ECS/Fargate OSS profiles, ECS-on-EC2 profiles, Kubernetes, bare-metal releases, and embedded mode. |
 
 ## Scope And Boundaries
 
@@ -603,7 +603,9 @@ Operations and reference:
 - [Embedded Mode](guides/embedded-mode.md) — in-process Elixir setup, command coverage, storage, and multiple instances.
 - [Redis Migration Guide](guides/redis-migration.md) — compatibility matrix generation, workload assessment, and import strategy.
 - [Configuration](guides/configuration.md) — server config and production defaults.
-- [Deployment](guides/deployment.md) — Docker, AWS Fargate, Kubernetes, bare metal, clustering.
+- [Deployment](guides/deployment.md) — Docker, AWS ECS/Fargate, ECS-on-EC2, Kubernetes, bare metal, clustering.
+- [AWS ECS-on-EC2 single-task support](docs/aws-ecs-single-task.md) — EC2 capacity provider, local volume lifecycle, HTTP/TLS, ACL bootstrap, and replacement behavior.
+- [AWS ECS-on-EC2 cluster support](docs/aws-ecs-cluster.md) — three per-AZ EC2 capacity providers, Cloud Map discovery, recovery, telemetry, and guarded upgrades.
 - [AWS Fargate single-task support](docs/aws-fargate-single-task.md) — exact OSS contract, architecture, lifecycle, and data-loss behavior.
 - [AWS Fargate cluster support](docs/aws-fargate-cluster.md) — three stable node slots, discovery, replacement recovery, guarded upgrades, and failure limits.
 - [Security](guides/security.md) — ACL, protected mode, dashboard accounts, TLS/mTLS, trusted proxies, and audit logging.

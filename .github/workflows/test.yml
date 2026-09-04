@@ -17,13 +17,13 @@ jobs:
   # ===========================================================================
   # Terraform deployment profiles
   # ===========================================================================
-  terraform-fargate:
+  terraform-aws-ecs:
     name: "Terraform (${{ matrix.profile }})"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        profile: [fargate, fargate-cluster]
+        profile: [fargate, fargate-cluster, ecs, ecs-cluster]
     defaults:
       run:
         working-directory: deploy/aws/${{ matrix.profile }}

@@ -55,8 +55,27 @@ defmodule FerricstoreHttp.FargateContractTest do
     assert cluster =~ "deploy-sequential.sh"
   end
 
+  test "ECS-on-EC2 profiles provide capacity, local storage, and HTTP wiring" do
+    single = read_stack("ecs")
+    cluster = read_stack("ecs-cluster")
+
+    for stack <- [single, cluster] do
+      assert stack.main =~ ~s(requires_compatibilities = ["EC2"])
+      assert stack.main =~ ~s(resource "aws_launch_template" "ecs_instance")
+      assert stack.main =~ ~s(resource "aws_autoscaling_group" "ecs_instance")
+      assert stack.main =~ ~s(resource "aws_ecs_capacity_provider" "ec2")
+      assert stack.main =~ ~s(host_path = "/var/lib/ferricstore/)
+      assert stack.main =~ ~s(network_mode             = "awsvpc")
+      assert stack.main =~ ~s(name          = "http-api")
+      assert stack.main =~ ~s(preserve_client_ip = true)
+    end
+
+    assert single.outputs =~ "oss-single-task-ecs-ec2-ephemeral"
+    assert cluster.outputs =~ "oss-three-node-ecs-ec2-cluster-ephemeral-replicas"
+  end
+
   defp read_stack(name) do
-    root = Path.join([@repo_root, "deploy", "aws", name])
+    root = Path.expand(Path.join([@repo_root, "deploy", "aws", name]))
 
     %{
       main: File.read!(Path.join(root, "main.tf")),

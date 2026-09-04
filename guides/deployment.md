@@ -1,7 +1,7 @@
 # Deployment Guide
 
 This guide covers running FerricStore as a server: native release, Docker,
-AWS Fargate, Kubernetes, and cluster layouts. For local development, start with
+AWS ECS/Fargate, ECS-on-EC2, Kubernetes, and cluster layouts. For local development, start with
 [Getting Started](getting-started.md). For production security, pair this guide
 with [Security](security.md).
 
@@ -246,6 +246,27 @@ data dependency. It tolerates one task-disk loss; simultaneous loss or upgrade
 of two replicas is unsupported, and loss of all three loses all data. See the
 [cluster support contract](../docs/aws-fargate-cluster.md) for discovery,
 health, rollout, and failure details.
+
+## AWS ECS on EC2
+
+Fargate is already an ECS launch type. If you need ECS to manage your own EC2
+capacity, the repository includes equivalent ECS-on-EC2 profiles:
+
+- [`deploy/aws/ecs`](https://github.com/ferricstore/ferricstore/tree/main/deploy/aws/ecs)
+  runs one task on an ECS-optimized EC2 container instance through a capacity
+  provider.
+- [`deploy/aws/ecs-cluster`](https://github.com/ferricstore/ferricstore/tree/main/deploy/aws/ecs-cluster)
+  runs one task per AZ on three per-slot capacity providers, preserving the
+  stable Cloud Map and Raft discovery contract from the Fargate cluster.
+
+Both profiles use `awsvpc`, an internal NLB, isolated liveness probes, the
+authenticated HTTP/TLS listener, and the same native ACL-user bootstrap. ECS
+replaces failed tasks and Auto Scaling replaces failed EC2 container instances.
+The instance root volume is local to that instance: a task replacement on a
+surviving host can reuse `/data`, but an instance replacement loses its local
+copy and a cluster node is rebuilt from its two surviving replicas. Read the
+[single-task](../docs/aws-ecs-single-task.md) or
+[cluster](../docs/aws-ecs-cluster.md) contract before applying.
 
 ## Kubernetes
 

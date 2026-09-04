@@ -171,6 +171,14 @@ On an existing three-node cluster, follow its staged sequential procedure when
 changing HTTP mode because ECS target-group changes can trigger task
 replacement.
 
+The same HTTP contract is available for ECS-on-EC2 in the
+[single-task](../deploy/aws/ecs/README.md#http-command-api) and
+[clustered](../deploy/aws/ecs-cluster/README.md#http-command-api) profiles. The
+listener, NLB TLS termination, Basic/ACL authentication, and `/metrics` routes
+are unchanged; only the ECS capacity layer differs. The ECS-on-EC2 profiles use
+an encrypted EC2 root volume for `/data`, so an instance replacement has the
+same data and ACL implications as an empty Fargate task replacement.
+
 ## Invocation routes and outbound targets
 
 Invocation routes and the background runner are separate opt-ins. Definitions and invocation
