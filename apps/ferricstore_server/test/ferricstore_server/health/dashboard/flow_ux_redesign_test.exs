@@ -317,7 +317,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
 
       refute html =~ ~s(class="flow-facets")
       assert html =~ "50 matching records"
-      assert html =~ "Ready now"
+      assert html =~ "Due now"
       assert html =~ "42"
       assert html =~ "12"
       assert html =~ "22"
@@ -906,7 +906,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
           %{}
         )
 
-      assert html =~ "Create Durable Schedule"
+      assert html =~ "Create durable schedule"
       assert html =~ ~s(name="action" value="create")
       assert html =~ ~s(name="schedule_kind")
       assert html =~ ~s(name="cron")

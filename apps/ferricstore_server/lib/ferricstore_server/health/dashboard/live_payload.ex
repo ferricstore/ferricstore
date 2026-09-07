@@ -492,7 +492,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
     %{
       "flow_overview" =>
         render_flow_overview(data.summary, data.filtered_sampled, data.sample_limit),
-      "flow_issue_cards" => render_flow_issue_cards(data.summary),
+      "flow_issue_cards" => render_flow_issue_cards(data.summary, data),
       "flow_projection_health" =>
         render_flow_projection_health(Map.get(data, :projection, Projection.default_health())),
       "flow_state_breakdown" => render_flow_state_breakdown(data.types),

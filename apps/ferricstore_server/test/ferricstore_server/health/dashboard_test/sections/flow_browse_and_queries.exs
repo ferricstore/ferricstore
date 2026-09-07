@@ -335,7 +335,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
 
           assert String.contains?(
                    html,
-                   ~s(title="Use a quick sliding window or Custom for From/To")
+                   ~s(title="Quick ranges override From/To; select All time to use custom dates")
                  )
 
           assert String.contains?(html, ~s(title="Apply Flow state filters"))

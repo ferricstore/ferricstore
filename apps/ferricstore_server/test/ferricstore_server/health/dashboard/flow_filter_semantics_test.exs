@@ -92,7 +92,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
 
     assert guided_html =~ "<legend>Indexed attribute predicate</legend>"
     assert guided_html =~ "<legend>State metadata predicate</legend>"
-    assert guided_html =~ "Workflow type filters records; Partition is the data ACL scope."
+    assert guided_html =~ "Filters records, not permissions."
 
     assert guided_html =~ "Required query, routing, and data ACL scope."
 

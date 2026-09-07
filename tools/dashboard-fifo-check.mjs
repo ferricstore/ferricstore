@@ -41,6 +41,9 @@ try {
     assert.equal(url.searchParams.get('type'), 'invoice_dispatch');
     assert.equal(url.searchParams.get('state'), 'queued');
     assert.equal(await page.locator('.flow-fifo-table tbody tr').count(), 1);
+    assert.equal(await page.locator('#flow-state-summaries').getAttribute('open'), null);
+    const laneY = (await page.locator('.flow-fifo-table').boundingBox()).y;
+    assert.ok(laneY < (await page.locator('#flow-state-summaries').boundingBox()).y);
   });
 
   await check('bounded member inspector supports keyboard and retains its state after refresh', async page => {
@@ -112,12 +115,34 @@ try {
     for(const width of [1280,1440,1920]) {
       await page.setViewportSize({width,height:1000});
       await page.goto(base + lanePath('customer-1042'));
+      for (const field of await page.locator('.flow-state-filter-form .flow-filter-field').all()) {
+        assert.ok(await field.evaluate(node => {
+          const label = node.querySelector('span').getBoundingClientRect();
+          const control = node.querySelector('input, select').getBoundingClientRect();
+          return Math.abs(label.x - control.x) < 2 && control.y >= label.bottom && control.y - label.bottom < 10;
+        }), 'filter label separated from control');
+      }
       await page.locator('.flow-fifo-members > summary').click();
       assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth <= innerWidth));
       await page.locator('[aria-label="FIFO lanes"]').screenshot({path:`${out}/fifo-${width}.png`});
       await page.locator('.flow-fifo-member-list a').first().evaluate(node => { node.textContent = 'workflow-' + 'x'.repeat(160); });
       assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth <= innerWidth), 'long identifier layout fixture overflowed');
     }
+  });
+
+  await check('state summaries stay neutral for a blocked lane and persist across refresh', async page => {
+    await page.goto(base + lanePath('customer-1042'));
+    const summary = page.locator('#flow-state-summaries');
+    await summary.locator('summary').click();
+    assert.ok((await summary.innerText()).includes('Due time reached'));
+    assert.ok(!(await summary.innerText()).includes('workers should drain'));
+    assert.ok(!(await summary.innerText()).includes('no running sample'));
+    assert.equal(await summary.locator('.bar-yellow, td.c-yellow').count(), 0);
+    assert.ok((await page.locator('.flow-fifo-table').innerText()).includes('blocked by active flow'));
+    await page.locator('.subpage-title').click();
+    await page.waitForTimeout(2300);
+    assert.equal(await summary.getAttribute('open'), '');
+    assert.equal(new URL(await page.locator('body').getAttribute('data-dashboard-live-url'),base).searchParams.get('partition_key'),'customer-1042');
   });
 } finally { await browser.close(); }
 if(results.some(r=>!r.passed)) process.exitCode=1;

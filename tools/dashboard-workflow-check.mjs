@@ -49,7 +49,32 @@ try {
     await disclosure.locator("summary").click();
     await page.waitForTimeout(2300);
     assert.notEqual(await disclosure.getAttribute("open"), null);
-    assert.ok((await page.locator("[data-dashboard-instance]").innerText()).includes("4000"));
+    assert.ok((await page.locator("[data-dashboard-instance]").innerText()).includes(new URL(base).host));
+  });
+
+  await check("attention investigation retains partition on initial and live responses", async (page) => {
+    await goto(page, "/dashboard/flow?partition_key=customer-2048");
+    const action = page.locator('.flow-attention-strip').getByRole('link', {name:'Investigate'});
+    const initial = await action.getAttribute('href');
+    assert.equal(new URL(initial, base).searchParams.get('partition_key'), 'customer-2048');
+    const liveUrl = await page.locator('body').getAttribute('data-dashboard-live-url');
+    const response = await page.request.get(new URL(liveUrl, base).href);
+    assert.equal(response.status(), 200);
+    const payload = await response.json();
+    assert.ok(payload.components.flow_issue_cards.includes('partition_key=customer-2048'));
+    await action.click();
+    await page.waitForURL(url=>url.pathname.endsWith('/failures'));
+    assert.equal(new URL(page.url()).searchParams.get('partition_key'),'customer-2048');
+    assert.ok(!(await page.locator('body').innerText()).includes('ai-pipeline-agent-402'));
+  });
+
+  await check("compact query controls expose results at a normal desktop height", async (page) => {
+    await page.setViewportSize({width:1280,height:720});
+    await goto(page, query);
+    const rows = page.locator('.flow-query-table-wrap');
+    assert.ok((await rows.boundingBox()).y < 670, 'results remain below the first viewport');
+    assert.ok((await page.locator('[data-flow-query-field="state"]').innerText()).includes('Empty includes all states.'));
+    assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth <= innerWidth));
   });
 
   await check("journal selection, keyboard modes, hash links and metadata navigation", async (page) => {

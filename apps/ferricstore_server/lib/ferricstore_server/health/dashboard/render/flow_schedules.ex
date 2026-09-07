@@ -33,13 +33,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
     open = if Map.has_key?(data, :draft), do: " open", else: ""
 
     """
-    <details class="flow-policy-panel" style="margin-bottom: 24px;" id="flow-schedule-create-panel"#{open}>
-      <summary style="cursor: pointer; font-weight: 600; color: #818cf8; list-style: none; display: flex; align-items: center; justify-content: space-between; user-select: none;">
-        <span style="display: inline-flex; align-items: center; gap: 8px; font-size: 0.95rem;">
-          <span style="font-size: 1.1rem;">⏱️</span> Create Durable Schedule
-        </span>
-        <span style="font-size: 0.8rem; color: #94a3b8; font-weight: 400;">(click to expand)</span>
-      </summary>
+    <details class="dashboard-disclosure" id="flow-schedule-create-panel"#{open}>
+      <summary>Create durable schedule</summary>
 
       <form class="flow-policy-form" action="/dashboard/flow/schedules" method="post" style="margin-top: 16px;" data-dashboard-single-submit>
         <input type="hidden" name="action" value="create">

@@ -13,6 +13,15 @@ authorization, routing, and mutation execution.
   be classified as terminal through substring matching.
 - Ordinary queued, scheduled, and FIFO waiting is neutral. Expired leases and
   terminal failures require attention. Sampled counts are not global totals.
+- Due time does not establish claimability. State summaries must not diagnose
+  worker starvation from zero running records in a filtered sample. Attention
+  actions retain the same type and partition on initial and live renders.
+- Exact type/state/partition views with observed FIFO lanes lead with the lane
+  inspector. State summaries remain available in a native disclosure; broader
+  and empty views keep the state table first. Live component IDs stay stable.
+- States filter labels and controls stay grouped, with range/from/to in one UTC
+  fieldset. Long logical steps allow wrapping at underscores without changing
+  their text or inserting unescaped HTML.
 - Overview type summaries are a pure reduction of the authorized, filtered
   sample. Never replace them with unscoped `FLOW.INFO` counts; automatic
   partitions, explicit partitions, and custom states must keep the same scope.
@@ -37,6 +46,9 @@ authorization, routing, and mutation execution.
 - Returned query rows precede charts and usage details. Charts describe the
   current page, not the complete workflow population. Query quality remains
   visible, and authenticated continuation cursors are unchanged.
+- Query operation, scope, state, and limit share an adaptive primary field row.
+  Successful result counts sit in the result header; idle and error messages
+  remain visible without being mistaken for a successful empty result.
 - Guided run tables show supported returned fields only; omitted worker/value
   metadata must not be represented as confirmed absence. Scoped detail links
   remain the path to those fields. History tables retain their event metadata.

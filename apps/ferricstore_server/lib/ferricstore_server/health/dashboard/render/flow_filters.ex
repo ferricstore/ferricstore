@@ -78,30 +78,51 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
 
     """
     <div class="flow-filter-panel">
-      <form class="flow-filter-form" action="/dashboard/flow/states" method="get">
-        <label for="flow-state-type-filter">Type</label>
+      <form class="flow-filter-form flow-state-filter-form" action="/dashboard/flow/states" method="get">
+        <label class="flow-filter-field" for="flow-state-type-filter">
+        <span>Type</span>
         <input id="flow-state-type-filter" class="flow-search-input mono" type="search" name="type" value="#{escape_attr(type_filter || "")}" list="flow-state-type-options" placeholder="all types" autocomplete="off" title="Filter by workflow type; enter any known type for bounded cold lookup">
         #{type_datalist}
-        <label for="flow-state-state-filter">State</label>
+        </label>
+        <label class="flow-filter-field" for="flow-state-state-filter">
+        <span>State</span>
         <select id="flow-state-state-filter" class="flow-search-input" name="state" title="Filter by current workflow state">
           #{state_options}
         </select>
-        <label for="flow-state-partition-filter">Partition</label>
+        </label>
+        <label class="flow-filter-field" for="flow-state-partition-filter">
+        <span>Partition</span>
         <input id="flow-state-partition-filter" class="flow-search-input mono" type="search" name="partition_key" value="#{escape_attr(partition_key || "")}" placeholder="type + partition for cold" title="Filter by partition; one explicit type and partition enable cold terminal queries">
-        <label for="flow-state-name-filter">ID</label>
+        </label>
+        <label class="flow-filter-field" for="flow-state-name-filter">
+        <span>ID</span>
         <input id="flow-state-name-filter" class="flow-search-input mono" type="search" name="q" value="#{escape_attr(name_filter || "")}" placeholder="contains" title="Filter by Flow ID substring">
-        <label for="flow-state-range-filter">Updated</label>
-        <select id="flow-state-range-filter" class="flow-search-input flow-filter-range" name="range" title="Use a quick sliding window or Custom for From/To">
+        </label>
+        <fieldset class="flow-filter-time-group">
+        <legend>Updated time (UTC)</legend>
+        <label class="flow-filter-field" for="flow-state-range-filter">
+        <span>Range</span>
+        <select id="flow-state-range-filter" class="flow-search-input flow-filter-range" name="range" title="Quick ranges override From/To; select All time to use custom dates">
           #{range_options}
         </select>
-        <label for="flow-state-from-filter">From UTC</label>
+        </label>
+        <label class="flow-filter-field" for="flow-state-from-filter">
+        <span>From UTC</span>
         <input id="flow-state-from-filter" class="flow-search-input mono flow-filter-time" type="datetime-local" name="from" step="60" value="#{escape_attr(custom_from_value)}" title="Custom UTC start time, used when Updated is All time">
-        <label for="flow-state-to-filter">To UTC</label>
+        </label>
+        <label class="flow-filter-field" for="flow-state-to-filter">
+        <span>To UTC</span>
         <input id="flow-state-to-filter" class="flow-search-input mono flow-filter-time" type="datetime-local" name="to" step="60" value="#{escape_attr(custom_to_value)}" title="Custom UTC end time, used when Updated is All time">
-        <label for="flow-state-limit-filter">Recent Limit</label>
+        </label>
+        </fieldset>
+        <div class="flow-filter-actions">
+        <label class="flow-filter-field" for="flow-state-limit-filter">
+        <span>Recent Limit</span>
         <input id="flow-state-limit-filter" class="flow-search-input mono flow-filter-limit" type="number" name="limit" min="1" max="#{@flow_dashboard_max_recent_limit}" value="#{limit}" title="Maximum recent records shown below">
+        </label>
         <button class="flow-search-button" type="submit" title="Apply Flow state filters">Apply</button>
         #{clear}
+        </div>
       </form>
       <div class="flow-filter-note">
         Showing #{escape(flow_filter_summary(filters))} · #{format_number(filtered_sampled)} matching of #{format_number(total_sampled)} sampled records

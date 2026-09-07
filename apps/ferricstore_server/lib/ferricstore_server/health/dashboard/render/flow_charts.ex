@@ -4,19 +4,25 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
 
   @flow_dashboard_timeline_chart_max_events 80
 
-  def render_flow_issue_cards(summary) do
+  def render_flow_issue_cards(summary, data \\ %{}) do
     due_now = Map.get(summary, :due_now_sampled, 0)
     expired = Map.get(summary, :expired_leases_sampled, 0)
     failed = Map.get(summary, :failed, 0)
 
-    render_flow_issue_cards(due_now, expired, failed)
+    render_flow_issue_cards(due_now, expired, failed, data)
   end
 
-  def render_flow_issue_cards(_due_now, 0, 0), do: ""
+  def render_flow_issue_cards(due_now, expired, failed),
+    do: render_flow_issue_cards(due_now, expired, failed, %{})
 
-  def render_flow_issue_cards(_due_now, expired, failed) do
+  defp render_flow_issue_cards(_due_now, 0, 0, _data), do: ""
+
+  defp render_flow_issue_cards(_due_now, expired, failed, data) do
     expired_class = if expired > 0, do: "badge-pressure", else: "badge-ok"
     failed_class = if failed > 0, do: "badge-pressure", else: "badge-ok"
+
+    path =
+      FerricstoreServer.Health.Dashboard.Render.FlowOverview.flow_failure_investigation_path(data)
 
     """
     <section class="flow-attention-strip" aria-label="Workflow attention in current sample">
@@ -24,6 +30,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
       <span><span class="badge #{expired_class}">#{format_number(expired)}</span> Expired leases</span>
       <span><span class="badge #{failed_class}">#{format_number(failed)}</span> Failed</span>
       <span class="c-muted">Current sample</span>
+      <a class="flow-link" href="#{escape_attr(path)}">Investigate</a>
     </section>
     """
   end
@@ -32,7 +39,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
     states = Enum.take(states, 16)
 
     metrics = [
-      {:due, "Due", :due_now, "bar-yellow"},
+      {:due, "Due", :due_now, "bar-neutral"},
       {:running, "Running", :running, "bar-green"},
       {:retry, "Retry", :retrying, "bar-blue"},
       {:failed, "Failed", :failed, "bar-red"},

@@ -15,7 +15,7 @@
   <div id="flow-query-panel-guided" role="tabpanel" aria-labelledby="flow-query-tab-guided"<%= if guided_active, do: "", else: " hidden" %> data-flow-query-mode="guided">
     <%= render_flow_query_kind_help(filters.kind) %>
     <form class="flow-filter-form flow-query-form" action="/dashboard/flow/query" method="get" data-flow-query-form>
-      <div class="flow-query-fields">
+      <div class="flow-query-fields flow-query-primary-fields">
         <label class="flow-query-field">
           <span>Query operation</span>
           <select class="flow-search-input" name="kind" title="Flow query to run" data-flow-query-kind>

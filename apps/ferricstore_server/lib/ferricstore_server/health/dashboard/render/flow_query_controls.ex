@@ -118,7 +118,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
     <label class="flow-query-field" data-flow-query-field="type" data-flow-query-kinds="#{flow_query_kinds_attr(kinds)}"#{hidden}>
       Workflow Type
       <input class="flow-search-input mono" name="type" value="#{escape_attr(type || "")}" placeholder="#{escape_attr(placeholder)}" list="flow-query-type-options" autocomplete="off" data-flow-query-required-kinds="#{flow_query_kinds_attr(kinds)}"#{required}#{disabled}>
-      <span class="flow-field-help">Workflow type filters records; Partition is the data ACL scope. With a partition, Show options suggests observed types.</span>
+      <span class="flow-field-help">Filters records, not permissions.</span>
     </label>
     """
   end
@@ -136,7 +136,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
       Map.get(
         doc,
         :state_help,
-        "Leave empty to include all states. When a flow is running, Workflow step narrows its active logical step."
+        "Empty includes all states."
       )
 
     """
@@ -158,7 +158,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
     <label class="flow-query-field" data-flow-query-field="run_state" data-flow-query-kinds="#{flow_query_kinds_attr(kinds)}"#{hidden}>
       Workflow step
       <input class="flow-search-input mono" name="run_state" value="#{escape_attr(run_state)}" placeholder="any step" list="flow-query-workflow-step-options" autocomplete="off"#{disabled}>
-      <span class="flow-field-help">Optional logical step while a workflow is running.</span>
+      <span class="flow-field-help">Logical step of a running workflow.</span>
     </label>
     """
   end
@@ -389,7 +389,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
         if (idHelp) idHelp.textContent = doc.id_help || "Required id for this query.";
         if (stateInput) stateInput.placeholder = doc.state_placeholder || "all states";
         if (stateHelp) {
-          stateHelp.textContent = doc.state_help || "Leave empty to include all states. When a flow is running, Workflow step narrows its active logical step.";
+          stateHelp.textContent = doc.state_help || "Empty includes all states.";
         }
         if (partitionInput) {
           partitionInput.placeholder = doc.partition_placeholder || "required";

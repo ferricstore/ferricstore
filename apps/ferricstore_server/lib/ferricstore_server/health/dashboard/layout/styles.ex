@@ -102,6 +102,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-attention-strip { display: flex; align-items: center; flex-wrap: wrap; gap: 12px 24px; padding: 12px 0; margin: 0 0 12px; border-block: 1px solid var(--line); font-size: 0.82rem; }
       .flow-attention-strip h2 { font-size: 0.875rem; color: #fca5a5; }
       .flow-attention-strip > span { display: inline-flex; align-items: center; gap: 8px; }
+      .flow-attention-strip > a { margin-left: auto; text-decoration: underline; text-underline-offset: 3px; }
       .flow-execution-summary { display: grid; grid-template-columns: minmax(0, 2fr) minmax(90px, 0.65fr) minmax(70px, 0.5fr) minmax(160px, 1fr); gap: 20px; margin: 12px 0 20px; }
       .flow-execution-summary > div { min-width: 0; }
       .flow-execution-summary dt { color: var(--text-muted); font-size: 0.75rem; margin-bottom: 6px; }
@@ -136,6 +137,13 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-filter-field { display: grid; gap: 4px; min-width: 0; }
       .flow-filter-form .flow-filter-field .flow-search-input { width: 100%; text-transform: none; }
       .flow-filter-form .flow-filter-field .flow-filter-limit { width: 80px; }
+      .flow-filter-form.flow-state-filter-form { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: end; gap: 12px; width: 100%; flex: 1 0 100%; }
+      .flow-state-filter-form .flow-search-input { min-width: 0; max-width: none; }
+      .flow-filter-time-group { grid-column: span 3; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; border: 0; padding: 0; min-width: 0; }
+      .flow-filter-time-group legend { color: var(--text-muted); font-size: 0.7rem; padding-bottom: 6px; }
+      .flow-filter-actions { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
+      .flow-filter-actions .flow-filter-clear { padding-block: 8px; }
+      .bar-neutral { background: var(--text-muted); }
       .flow-filter-form select { min-width: 220px; }
       .flow-filter-form input[type="search"] { min-width: 160px; }
       .flow-failure-triage { margin-bottom: 18px; }
@@ -470,7 +478,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-runs-table td { vertical-align: top; padding: 12px; }
       .flow-run-identity .flow-link { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .flow-run-secondary { display: block; margin-top: 4px; color: var(--text-muted); font-size: 0.75rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .flow-run-step { display: block; margin-bottom: 6px; overflow-wrap: anywhere; }
+      .flow-run-step { display: block; margin-bottom: 6px; overflow-wrap: break-word; }
       .flow-run-reason { display: block; overflow-wrap: anywhere; line-height: 1.45; }
       .flow-run-timing > span { display: block; white-space: nowrap; font-size: 0.75rem; margin-bottom: 6px; }
       .flow-run-timing .c-muted { display: block; font-size: 0.7rem; }
@@ -690,21 +698,26 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-query-output { border-top: 1px solid var(--line); padding-top: 2px; }
       .flow-query-provenance { margin: 10px 0; color: var(--text-muted); font-size: 0.78rem; overflow-wrap: anywhere; }
       .flow-query-provenance p { margin: 4px 0; }
+      .flow-query-result-count { margin-left: 8px; color: var(--text-muted); font-size: 0.8rem; font-weight: 400; }
       .flow-query-provenance summary { cursor: pointer; }
       .flow-query-provenance pre { max-height: 240px; overflow: auto; white-space: pre-wrap; margin: 8px 0; }
       .flow-query-draft-status { color: #fbbf24; font-size: 0.82rem; margin: 10px 0; }
       .flow-query-console { padding: 0; }
-      .flow-query-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+      .flow-query-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; flex-wrap: wrap; }
       .flow-query-payload-note { color: var(--text-muted); font-size: 0.75rem; }
-      .flow-query-form { display: grid; gap: 18px; width: 100%; }
+      .flow-query-form { display: grid; gap: 12px; width: 100%; }
       .flow-query-fields { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: start; gap: 14px 20px; }
+      .flow-query-primary-fields { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+      @media (min-width: 1280px) {
+        .flow-query-primary-fields:has(> [data-flow-query-field="run_state"]:not([hidden])) { grid-template-columns: minmax(180px, 1.2fr) repeat(2, minmax(160px, 1fr)) repeat(2, minmax(120px, 0.85fr)) minmax(64px, 0.4fr); }
+      }
       .flow-query-console .flow-query-field { display: grid; gap: 6px; margin: 0; min-width: 0; font-size: 0.75rem; text-transform: none; }
       .flow-query-console .flow-search-input { width: 100%; height: 36px; min-width: 0; max-width: none; font-size: 0.82rem; }
       .flow-query-console .flow-field-help { font-size: 0.75rem; color: var(--text-muted); line-height: 1.4; }
-      .flow-query-console .flow-query-help { border: 0; border-radius: 0; background: transparent; padding: 0; margin-bottom: 20px; align-items: start; }
+      .flow-query-console .flow-query-help { border: 0; border-radius: 0; background: transparent; padding: 0; margin-bottom: 12px; align-items: start; }
       .flow-query-console .flow-query-help-detail { max-width: 65ch; }
       .flow-query-console .flow-query-discovery { border: 0; border-block: 1px solid var(--line); border-radius: 0; background: transparent; }
-      .flow-query-console .flow-query-discovery-summary { padding: 12px 0; }
+      .flow-query-console .flow-query-discovery-summary { padding: 8px 0; }
       .flow-query-advanced { border-block: 1px solid var(--line); }
       .flow-query-advanced > summary { cursor: pointer; padding: 12px 0; color: var(--text-body); font-size: 0.82rem; }
       .flow-query-advanced-body { display: grid; gap: 20px; padding: 8px 0 20px; }

@@ -1,6 +1,15 @@
 <% data = assigns.data %>
+<% filters = flow_states_page_filters(data) %>
+<%
+lane_scope? =
+  Map.get(data, :fifo_lanes, []) != [] and
+    Enum.all?([:type, :state, :partition_key], fn key ->
+      value = Map.get(filters, key)
+      is_binary(value) and value != ""
+    end)
+%>
 <%= page_head("Flow States - FerricStore", 2, chartjs: true) %>
-<body data-dashboard-live-page="flow-states" data-dashboard-live-url="<%= flow_states_live_url(flow_states_page_filters(data)) %>" data-dashboard-live-interval-ms="2000">
+<body data-dashboard-live-page="flow-states" data-dashboard-live-url="<%= flow_states_live_url(filters) %>" data-dashboard-live-interval-ms="2000">
 <div class="layout">
 <%= render_sidebar_static("flow_states") %>
 <main class="main-content">
@@ -9,9 +18,25 @@
 <%= render_page_intro("Flow States", "Filter sampled workflows by type, state, partition, time range, and name to find live workflow distribution.") %>
 <%= render_flow_context_tools(data, "flow_states") %>
 <%= render_flow_type_filter(data) %>
-<%= render_live_component("flow_states_chart", render_flow_states_chart(data.states)) %>
-<%= render_live_component("flow_states_table", render_flow_states_table(data.states, data.total_sampled, data.filtered_sampled, data.sample_limit, flow_states_page_filters(data))) %>
+<%= if lane_scope? do %>
 <%= render_live_component("flow_fifo_lanes", render_flow_fifo_lanes(Map.get(data, :fifo_lanes, []), data.total_sampled, data.sample_limit)) %>
+<details class="dashboard-disclosure" id="flow-state-summaries">
+<summary>State summaries</summary>
+<div class="dashboard-disclosure-body">
+<%= render_live_component("flow_states_table", render_flow_states_table(data.states, data.total_sampled, data.filtered_sampled, data.sample_limit, filters)) %>
+<%= render_live_component("flow_states_chart", render_flow_states_chart(data.states)) %>
+</div>
+</details>
+<% else %>
+<%= render_live_component("flow_states_table", render_flow_states_table(data.states, data.total_sampled, data.filtered_sampled, data.sample_limit, filters)) %>
+<%= render_live_component("flow_fifo_lanes", render_flow_fifo_lanes(Map.get(data, :fifo_lanes, []), data.total_sampled, data.sample_limit)) %>
+<details class="dashboard-disclosure" id="flow-state-pressure">
+<summary>State pressure</summary>
+<div class="dashboard-disclosure-body">
+<%= render_live_component("flow_states_chart", render_flow_states_chart(data.states)) %>
+</div>
+</details>
+<% end %>
 <%= render_live_component("flow_recent_records", render_flow_recent_records(data.records, flow_states_page_limit(data))) %>
 </div>
 </main>

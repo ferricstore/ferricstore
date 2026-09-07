@@ -941,7 +941,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowQueryWorkbenchTest do
     refute query =~ "state ="
     refute Map.has_key?(params, "state")
     assert data.filters.state == nil
-    assert Dashboard.render_flow_query_page(data) =~ "Leave empty to include all states."
+    assert Dashboard.render_flow_query_page(data) =~ "Empty includes all states."
   end
 
   defp query_filters do

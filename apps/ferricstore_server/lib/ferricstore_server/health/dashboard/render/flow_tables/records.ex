@@ -22,7 +22,6 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
 
         _ ->
           Enum.map_join(states, "\n", fn state ->
-            due_class = if state.due_now > 0, do: "c-yellow", else: ""
             expired_class = if state.expired_leases > 0, do: "c-red", else: ""
             retry_class = if Map.get(state, :retrying, 0) > 0, do: "c-yellow", else: ""
             failed_class = if Map.get(state, :failed, 0) > 0, do: "c-red", else: ""
@@ -34,7 +33,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
               <td class="#{flow_state_class(state.state)}">#{escape(state.state)}</td>
               <td>#{render_flow_state_mode_badge(Map.get(state, :mode, :parallel))}</td>
               <td>#{format_number(state.count)}</td>
-              <td class="#{due_class}">#{format_number(state.due_now)}</td>
+              <td>#{format_number(state.due_now)}</td>
               <td>#{format_number(state.running)}</td>
               <td class="#{retry_class}">#{format_number(Map.get(state, :retrying, 0))}</td>
               <td class="#{failed_class}">#{format_number(Map.get(state, :failed, 0))}</td>
@@ -57,7 +56,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
           <th>State</th>
           <th>Mode #{info_icon("FIFO states preserve per-partition order and let at most one active Flow block each partition lane. Parallel is the default.")}</th>
           <th>Sample Count</th>
-          <th>Due Now #{info_icon("Non-terminal flows with run_at/next_run_at at or before now. Workers should be able to claim them.")}</th>
+          <th>Due Now #{info_icon("Non-terminal flows whose scheduled time has passed. Due time alone does not establish claimability; FIFO ordering, leases, and policy limits may still block a claim.")}</th>
           <th>Running #{info_icon("Flows currently leased to workers through FLOW.CLAIM_DUE.")}</th>
           <th>Retrying #{info_icon("Non-terminal flows with attempts > 0. They were retried and may be waiting for their next run time.")}</th>
           <th>Failed #{info_icon("Terminal failed flows. They are not claimable unless user logic rewinds or creates new work.")}</th>
@@ -98,11 +97,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
       Map.get(state, :max_attempts_reached, 0) > 0 ->
         ~s(<span class="c-red">retry attempts maxed</span>)
 
-      state.due_now > 0 and state.running == 0 ->
-        ~s(<span class="c-yellow">due work, no running sample</span>)
-
       state.due_now > 0 ->
-        ~s(<span class="c-yellow">workers should drain</span>)
+        ~s(<span class="c-muted">Due time reached</span>)
 
       Map.get(state, :retrying, 0) > 0 ->
         ~s(<span class="c-yellow">retry backoff/attempts</span>)
@@ -329,6 +325,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
             status = flow_record_status_label(record)
             partition = flow_record_partition_key(record)
             detail_path = flow_detail_path(id, partition)
+            logical_state = flow_record_logical_state(record)
+            wrapped_state = logical_state |> escape() |> String.replace("_", "_<wbr>")
 
             status_badge =
               cond do
@@ -361,7 +359,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
                 <span class="flow-run-secondary" title="#{escape_attr(flow_record_type(record))}">#{escape(flow_record_type(record))}</span>
                 <span class="flow-run-secondary mono" title="Partition">#{escape(partition || "auto/global")}</span>
               </td>
-              <td><span class="flow-run-step mono">#{escape(flow_record_logical_state(record))}</span>#{status_badge}</td>
+              <td><span class="flow-run-step mono" title="#{escape_attr(logical_state)}">#{wrapped_state}</span>#{status_badge}</td>
               <td><span class="flow-run-reason">#{escape(flow_waiting_reason(record))}</span><span class="flow-run-secondary">#{format_number(flow_record_attempts(record))} attempts</span></td>
               <td class="flow-run-timing"><span><span class="c-muted">Run</span> #{format_timestamp_ms_or_dash(flow_record_run_at_ms(record))}</span><span><span class="c-muted">Updated</span> #{format_timestamp_ms_or_dash(flow_record_updated_at_ms(record))}</span></td>
               <td>#{render_flow_value_ref_badges(record, :detail_link)}</td>

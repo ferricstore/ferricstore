@@ -18,7 +18,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowOverview do
       #{render_flow_overview_metric("Queued", queued_count, "ready or scheduled")}
       #{render_flow_overview_metric("Running", running_count, "leased by workers")}
       #{render_flow_overview_metric("Failed", failed_count, "terminal failures")}
-      #{render_flow_overview_metric("Ready now", due_count, "scheduled time reached")}
+      #{render_flow_overview_metric("Due now", due_count, "scheduled time reached")}
     </dl>
     """
   end
@@ -51,6 +51,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowOverview do
   end
 
   def render_flow_context_tools, do: render_flow_context_tools(%{}, nil)
+
+  def flow_failure_investigation_path(data) do
+    context = flow_investigation_context(data)
+    flow_context_path("/dashboard/flow/failures", flow_failures_context_params(context))
+  end
 
   def render_flow_context_tools(data, active) when is_map(data) do
     render_flow_context_tools(data, active, [])

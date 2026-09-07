@@ -8,7 +8,7 @@
 <div class="content">
 <%= render_flow_context_tools(data, "flow") %>
 <%= render_flow_overview_filter(data) %>
-<%= render_live_component("flow_issue_cards", render_flow_issue_cards(data.summary)) %>
+<%= render_live_component("flow_issue_cards", render_flow_issue_cards(data.summary, data)) %>
 <%= render_live_component("flow_overview", render_flow_overview(data.summary, Map.get(data, :filtered_sampled, data.total_sampled), data.sample_limit)) %>
 <%= render_live_component("flow_recent_records", render_flow_recent_records(data.records)) %>
 <details class="dashboard-disclosure">
