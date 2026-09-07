@@ -246,6 +246,210 @@ AWS Secrets Manager is used only for the Erlang cookie so all nodes can
 authenticate distribution connections without writing the secret into
 Terraform state. It does not store FerricStore data or membership.
 
+## Production TLS Readiness
+
+The supplied Terraform profile is an internal, plaintext baseline. It exposes
+the native protocol through a TCP NLB listener on `6388`, runs Erlang
+distribution on `9100`, restricts `4369` and `9100` to the task security group,
+and uses a strong cookie to authenticate cluster nodes. A private VPC, security
+groups, and the Erlang cookie reduce exposure, but none of them encrypt network
+traffic. Fargate storage encryption is encryption at rest and does not change
+this network contract.
+
+Production has separate TLS decisions for each traffic path:
+
+| Traffic path | Minimum production treatment |
+|---|---|
+| Native SDK/client to NLB and node | FerricStore native TLS on `6389`, server certificate verification, and `FERRICSTORE_REQUIRE_TLS=true` |
+| HTTP client to NLB | Optional `http_tls_certificate_arn` enables NLB TLS termination; the hop to task port `8080` stays plaintext, as described under [HTTP API And Client Discovery](#http-api-and-client-discovery) |
+| Node to node Raft and cluster messages | Erlang distribution TLS on fixed port `9100`, or a tested ECS Service Connect TLS proxy path |
+| EPMD discovery on `4369` | Keep security-group-to-itself isolation; proxy it too if policy requires every inter-task byte encrypted |
+| Metrics and HTTP health endpoints | Keep private and security-group scoped; use a TLS sidecar/proxy if policy also requires encryption for observability traffic |
+
+TLS is not a replacement for authorization. Enable protected mode, provision
+durable ACL credentials from a secrets system, and keep the strong Erlang
+cookie even when mutual TLS is enabled.
+
+### Recommended Client Path: End-To-End Native TLS
+
+Use a TCP NLB listener and TCP target groups on `6389`. TCP passthrough keeps
+TLS end to end: the SDK negotiates directly with the FerricStore node selected
+by the NLB. Do not change the NLB listener to `TLS` if mutual TLS or application
+certificate verification must terminate at FerricStore. AWS documents that a
+TCP listener passes encrypted bytes through without decrypting them and that
+NLB TLS listeners do not implement mTLS: [NLB listeners](https://docs.aws.amazon.com/elasticloadbalancing/latest/network/load-balancer-listeners.html).
+
+Each task needs the following FerricStore settings:
+
+```text
+FERRICSTORE_NATIVE_TLS_PORT=6389
+FERRICSTORE_NATIVE_TLS_CERT_FILE=/run/ferricstore-tls/server.crt
+FERRICSTORE_NATIVE_TLS_KEY_FILE=/run/ferricstore-tls/server.key
+FERRICSTORE_NATIVE_TLS_CA_CERT_FILE=/run/ferricstore-tls/ca.crt
+FERRICSTORE_REQUIRE_TLS=true
+FERRICSTORE_NATIVE_ADVERTISE_TLS_PORT=6389
+```
+
+`FERRICSTORE_NATIVE_TLS_CA_CERT_FILE` enables client-certificate verification.
+Omit it only when server-authenticated TLS plus ACL authentication is the
+intentional policy. The SDK must trust the issuing CA, verify the server name,
+and present its client certificate and key when mTLS is enabled.
+
+Update the task and NLB together:
+
+1. Add a named task port mapping for `6389`.
+2. Add a client-CIDR-scoped security-group rule for `6389`.
+3. Change the three native target groups and the NLB listener to TCP `6389`.
+4. Keep the liveness target-group check on the isolated `6381` HTTP endpoint.
+5. Remove client ingress to `6388` after every SDK uses TLS. The plaintext
+   listener may still exist inside the task, but `FERRICSTORE_REQUIRE_TLS=true`
+   makes it reject plaintext native requests.
+
+Do not use only the NLB name in certificate planning. SDKs bootstrap through
+the NLB and then use the three node names in route metadata. Every node
+certificate must therefore be valid for both:
+
+- the private Route 53 bootstrap name that points to the NLB, for example
+  `ferricstore.internal.example.com`; and
+- that task's stable Cloud Map identity, for example
+  `node-0.ferricstore.local`.
+
+The AWS-generated NLB hostname is not a certificate identity controlled by the
+deployment. Create a private Route 53 alias for it and use that controlled name
+in SDK configuration. Prefer one key and certificate per stable node slot. A
+shared wildcard certificate is simpler but spreads one private key across all
+three failure domains.
+
+### Recommended Cluster Path: Erlang Distribution TLS
+
+The least disruptive way to encrypt Raft and cluster messages is Erlang/OTP
+distribution TLS. It preserves the current Cloud Map identities, periodic EPMD
+reconnect behavior, and fixed distribution port.
+
+Give every node a certificate signed by the same internal CA and create
+`/run/ferricstore-tls/inet_tls.conf` with peer verification for both roles:
+
+```erlang
+[{server, [
+  {certfile, "/run/ferricstore-tls/node.crt"},
+  {keyfile, "/run/ferricstore-tls/node.key"},
+  {cacertfile, "/run/ferricstore-tls/ca.crt"},
+  {verify, verify_peer},
+  {fail_if_no_peer_cert, true}
+]},
+{client, [
+  {certfile, "/run/ferricstore-tls/node.crt"},
+  {keyfile, "/run/ferricstore-tls/node.key"},
+  {cacertfile, "/run/ferricstore-tls/ca.crt"},
+  {verify, verify_peer}
+]}].
+```
+
+Extend, rather than replace, the existing release options so the distribution
+port remains deterministic:
+
+```text
+ELIXIR_ERL_OPTIONS=+fnu -proto_dist inet_tls -ssl_dist_optfile /run/ferricstore-tls/inet_tls.conf -kernel inet_dist_listen_min 9100 inet_dist_listen_max 9100
+```
+
+The task security group should continue to allow `9100` only from itself.
+EPMD on `4369` still exchanges discovery metadata in plaintext in this design;
+the Raft log, command values, process messages, and other Erlang distribution
+payloads use TLS on `9100`. See the complete configuration and security
+requirements in [Node-to-Node TLS](../guides/security.md#step-4-enable-tls-for-distribution).
+
+### Alternative Cluster Path: ECS Service Connect TLS
+
+ECS Service Connect can issue, rotate, and distribute certificates from AWS
+Private CA and encrypt traffic between its managed proxies. It can proxy raw
+TCP when `appProtocol` is not set. AWS explicitly limits the guarantee to
+traffic that passes through the Service Connect agents:
+[Service Connect TLS](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-connect-tls.html),
+[ECS port mappings](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_PortMapping.html).
+
+To use it for this topology, all three node services must join the same Service
+Connect namespace as clients and servers, and each stable slot must expose
+named raw-TCP endpoints for both `epmd` (`4369`) and `distribution` (`9100`).
+Configure the TLS issuer CA, ECS infrastructure role, KMS key policy, proxy CPU
+and memory, proxy logs, client aliases, and ingress ports. Then make peer
+connections resolve the proxy aliases and remove security-group paths that
+allow direct cross-task connections to bypass the proxies.
+
+This is not a drop-in switch for the current Terraform:
+
+- the current startup gate expects its Cloud Map identity to resolve to its
+  task IP, while Service Connect aliases resolve inside client tasks to the
+  managed proxy;
+- EPMD returns the port used for the subsequent distribution connection, so
+  both stages must follow the same proxy design;
+- Service Connect terminates TLS at the agents, leaving task-local proxy-to-app
+  traffic unencrypted; and
+- NLB clients outside the Service Connect namespace are not covered, so native
+  client TLS is still required.
+
+Keep separate Cloud Map identity and Service Connect endpoint names, or update
+and test the startup identity gate before reusing a name. The repository does
+not currently ship or claim a validated Service Connect variant. Treat it as a
+production architecture change and do not remove Erlang distribution TLS until
+replacement, recovery, and upgrade tests demonstrate that no cluster path can
+bypass the proxies. AWS describes how to verify that TLS starts and terminates
+at the two agents in [Verifying Service Connect TLS](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/verify-tls-enabled.html).
+
+### Certificate Delivery And Rotation
+
+Certificates and private keys must not live only on a task's replaceable disk,
+inside the container image, or in Terraform state. For native TLS, store the
+PEM material in Secrets Manager or another durable secrets system and add a
+nonessential init container that writes it into a task-scoped shared volume.
+Make the FerricStore container depend on the init container with the `SUCCESS`
+condition so it cannot start unless certificate delivery exits successfully.
+ECS does not allow a `SUCCESS` dependency on an essential container:
+[container dependencies](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_ContainerDependency.html).
+Grant the task role only the required `secretsmanager:GetSecretValue` and KMS
+permissions, prevent the init container from logging secret values, and make
+private-key files readable only by the FerricStore runtime user.
+
+ECS secret values injected at container start do not update inside an existing
+task after rotation. AWS requires a new task or forced deployment to receive
+the new version: [ECS Secrets Manager injection](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/secrets-envvar-secrets-manager.html).
+FerricStore also reads its native TLS files at startup. Rotate safely by:
+
+1. publishing a trust bundle that accepts both the old and new CA when the CA
+   changes;
+2. issuing and storing the new node and client certificates;
+3. registering task definition revisions that reference the new secret
+   versions;
+4. running the supplied one-node-at-a-time rollout script;
+5. waiting for strict full-recovery after each replacement; and
+6. removing the old CA only after every node and client has moved.
+
+Do not force all three services to deploy simultaneously during certificate
+rotation. That would discard all three task-local replicas together and violate
+the storage failure contract regardless of whether TLS is configured correctly.
+
+### Production TLS Acceptance Tests
+
+Complete these checks before calling the deployment production-ready:
+
+- A TLS-capable SDK can bootstrap through the private NLB alias, follows route
+  metadata to all three stable node names, and can read and write through each.
+- Plaintext native connections to `6388` are rejected and the security group no
+  longer admits client traffic on that port.
+- An SDK using an unknown CA or wrong server name fails closed before
+  authentication. When mTLS is enabled, a missing client certificate also
+  fails closed.
+- A node using an unknown CA certificate cannot join; a node with the correct
+  certificate but wrong cookie also cannot join.
+- A one-slot task replacement gets a new IP, reconnects with TLS, catches up
+  from the surviving quorum, and passes the strict recovery check.
+- Certificate rotation succeeds one slot at a time without quorum loss, and
+  old certificates fail after the overlap window closes.
+- If Service Connect is selected, agent metrics/logs and AWS's TLS verification
+  procedure prove that both EPMD and distribution connections traverse the
+  proxies; a direct task-IP attempt is blocked.
+- Metrics and health endpoints are either covered by the declared TLS proxy or
+  explicitly accepted as private, security-group-scoped plaintext exceptions.
+
 ## Prometheus And Fargate Telemetry
 
 FerricStore exposes Prometheus text metrics at `GET /metrics` on the dashboard
@@ -448,6 +652,9 @@ Amazon Managed Service for Prometheus in its
   replicated, but losing all replicas loses that catalog with the data.
 - Native-protocol TLS or end-to-end application TLS. The optional NLB TLS
   listener protects HTTP clients but forwards over the private VPC in plaintext.
+- Turnkey ACL bootstrap, certificate issuance/rotation, or Service Connect
+  wiring. The baseline keeps the endpoint internal and disables protected mode;
+  operators must implement and test the production TLS plan above.
 
 These require a durable recovery source, stronger external orchestration, or a
 different deployment platform/storage contract. They cannot be honestly

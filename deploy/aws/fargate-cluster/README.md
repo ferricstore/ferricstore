@@ -185,6 +185,25 @@ terraform apply
 Terraform resource targeting is intentionally limited here to staging a
 stateful migration; review both plans before approving them.
 
+## Production TLS
+
+The quick-start stack is an internal plaintext baseline; Fargate, private
+subnets, security groups, and the Erlang cookie do not encrypt client or
+node-to-node traffic. Do not expose it or call it production-ready without an
+explicit TLS and authentication deployment.
+
+Follow the complete [production TLS readiness
+guide](../../../docs/aws-fargate-cluster.md#production-tls-readiness). It covers:
+
+- end-to-end FerricStore native TLS or mTLS through an NLB TCP listener;
+- certificate names for both the NLB alias and per-node Cloud Map identities;
+- Erlang distribution TLS for Raft and cluster messages;
+- the constraints of an alternative AWS Private CA and Service Connect design;
+- Secrets Manager delivery and safe one-node-at-a-time certificate rotation;
+  and
+- acceptance tests for plaintext rejection, peer authentication, task-IP
+  replacement, recovery, and certificate rotation.
+
 ## Safe Upgrade
 
 Do not let Terraform or ECS roll all three services together.
