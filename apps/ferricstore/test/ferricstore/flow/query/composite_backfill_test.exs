@@ -1,13 +1,14 @@
 defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Flow.{Keys, LMDB, StorageScope}
+  alias Ferricstore.Flow.{Keys, LMDB, Locator, StorageScope}
 
   alias Ferricstore.Flow.Query.{
     CompositeBackfill,
     CompositeCounter,
     CompositeIndex,
-    IndexDefinition
+    IndexDefinition,
+    QueryRowCodec
   }
 
   defmodule Provider do
@@ -346,6 +347,70 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
     assert :not_found = LMDB.get(lmdb_path(data_dir), CompositeIndex.reverse_key(stale.state_key))
   end
 
+  test "atomically projects a retained terminal row when the live primary is absent" do
+    data_dir = tmp_data_dir("retained-terminal")
+    ctx = %{data_dir: data_dir, shard_count: 1}
+
+    projected = guarded_projected_record("terminal", 3)
+
+    {:value, query_row} = projected.projection_guard
+
+    assert :ok = LMDB.write_batch(lmdb_path(data_dir), [{:put, projected.state_key, query_row}])
+
+    assert {:ok, %{projected_records: 1, written_entries: 1}} =
+             CompositeBackfill.project_page(ctx, 0, [projected], [definition()],
+               read_entries_fun: fn _ctx, 0, _keys ->
+                 flunk("retained rows must not be re-read from primary storage")
+               end
+             )
+
+    assert {:ok, [entry]} =
+             CompositeIndex.entries(
+               definition(),
+               projected.record,
+               projected.state_key,
+               projected.expire_at_ms
+             )
+
+    assert {:ok, _value} = LMDB.get(lmdb_path(data_dir), entry.key)
+  end
+
+  test "retries when a retained row changes before its projection transaction" do
+    data_dir = tmp_data_dir("retained-terminal-race")
+    ctx = %{data_dir: data_dir, shard_count: 1}
+
+    projected = guarded_projected_record("terminal-race", 3)
+
+    assert :ok =
+             LMDB.write_batch(lmdb_path(data_dir), [
+               {:put, projected.state_key, "newer-query-row"}
+             ])
+
+    assert {:error, :query_backfill_concurrent_change} =
+             CompositeBackfill.project_page(ctx, 0, [projected], [definition()],
+               read_entries_fun: fn _ctx, 0, _keys ->
+                 flunk("the guarded transaction must fail before primary verification")
+               end
+             )
+  end
+
+  test "rejects an invalid retained-row projection guard" do
+    data_dir = tmp_data_dir("invalid-retained-guard")
+    ctx = %{data_dir: data_dir, shard_count: 1}
+
+    projected =
+      projected_record("invalid-terminal", 3)
+      |> Map.put(:projection_guard, {:value, "not-a-query-row"})
+
+    assert :ok =
+             LMDB.write_batch(lmdb_path(data_dir), [
+               {:put, projected.state_key, "not-a-query-row"}
+             ])
+
+    assert {:error, :invalid_query_backfill_record} =
+             CompositeBackfill.project_page(ctx, 0, [projected], [definition()])
+  end
+
   test "detects an expiry-only concurrent change after projection" do
     data_dir = tmp_data_dir("expiry-race")
     ctx = %{data_dir: data_dir, shard_count: 1}
@@ -469,6 +534,55 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
         version: version
       }
     }
+  end
+
+  defp full_projected_record(id, version) do
+    projected = projected_record(id, version)
+
+    %{
+      projected
+      | record: projected.state_key |> encoded_record(version) |> Ferricstore.Flow.decode_record()
+    }
+  end
+
+  defp guarded_projected_record(id, version) do
+    projected = full_projected_record(id, version)
+    encoded = query_row_blob!(projected)
+    assert {:ok, row} = QueryRowCodec.decode(encoded, projected.state_key)
+
+    projected
+    |> Map.put(:record, row.record)
+    |> Map.put(:expire_at_ms, row.expire_at_ms)
+    |> Map.put(:projection_guard, {:value, encoded})
+  end
+
+  defp query_row_blob!(projected) do
+    encoded_record = Ferricstore.Flow.encode_record(projected.record)
+
+    locator =
+      Locator.new!(
+        flow_id: projected.record.id,
+        kind: :state,
+        version: projected.record.version,
+        raft_index: projected.record.version,
+        file_id: {:waraft_apply_projection, projected.record.version},
+        offset: 0,
+        value_size: byte_size(encoded_record),
+        checksum: :crypto.hash(:sha256, encoded_record),
+        expire_at_ms: projected.expire_at_ms,
+        segment_generation: 0,
+        frame_size: byte_size(encoded_record) + 128
+      )
+
+    assert {:ok, encoded} =
+             QueryRowCodec.encode(
+               projected.state_key,
+               projected.record,
+               locator,
+               projected.expire_at_ms
+             )
+
+    encoded
   end
 
   defp definition do

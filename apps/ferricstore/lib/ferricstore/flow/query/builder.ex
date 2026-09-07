@@ -23,7 +23,7 @@ defmodule Ferricstore.Flow.Query.Builder do
           | :by_root
           | :by_correlation
 
-  @spec build(kind(), map()) ::
+  @spec build(kind(), map(), keyword()) ::
           {:ok, %{query: binary(), params: map()}}
           | {:error,
              :invalid_query_filter
@@ -34,18 +34,30 @@ defmodule Ferricstore.Flow.Query.Builder do
              | :query_partition_required
              | :unsupported_field
              | :unsupported_query_shape}
-  def build(kind, filters) when is_map(filters) do
+  def build(kind, filters, opts \\ [])
+
+  def build(kind, filters, opts) when is_map(filters) and is_list(opts) do
+    allow_unpartitioned? =
+      Keyword.get(opts, :allow_unpartitioned, Map.get(filters, :allow_unpartitioned, false))
+
     with :ok <- validate_kind(kind),
          {:ok, partition_key} <-
-           required_binary(filters, :partition_key, :query_partition_required),
+           validate_partition_key(filters, allow_unpartitioned?),
          {:ok, limit} <- limit(filters),
          {:ok, direction} <- direction(filters),
          {:ok, predicates, params, order_field} <- predicates(kind, filters),
          {:ok, predicates, params} <- time_predicate(predicates, params, filters, order_field),
          {:ok, cursor, params} <- cursor(filters, params),
          {:ok, return_clause} <- return_clause(filters) do
-      predicates = ["partition_key = @partition_key" | predicates]
-      params = Map.put(params, "partition_key", partition_key)
+      {predicates, params} =
+        case partition_key do
+          key when is_binary(key) and key != "" ->
+            {["partition_key = @partition_key" | predicates],
+             Map.put(params, "partition_key", key)}
+
+          _other ->
+            {predicates, params}
+        end
 
       query =
         IO.iodata_to_binary([
@@ -65,7 +77,7 @@ defmodule Ferricstore.Flow.Query.Builder do
     end
   end
 
-  def build(_kind, _filters), do: {:error, :invalid_query_filter}
+  def build(_kind, _filters, _opts), do: {:error, :invalid_query_filter}
 
   defp validate_kind(kind)
        when kind in [
@@ -368,6 +380,19 @@ defmodule Ferricstore.Flow.Query.Builder do
            ])}
       end
     end
+  end
+
+  defp validate_partition_key(filters, true) do
+    case Map.get(filters, :partition_key) do
+      nil -> {:ok, nil}
+      "" -> {:ok, nil}
+      value when is_binary(value) -> {:ok, value}
+      _invalid -> {:error, :invalid_query_filter}
+    end
+  end
+
+  defp validate_partition_key(filters, false) do
+    required_binary(filters, :partition_key, :query_partition_required)
   end
 
   defp required_binary(filters, key, error) do

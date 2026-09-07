@@ -328,7 +328,9 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorkerTest do
   test "fences failed projection before resumable physical cleanup" do
     {ctx, registry, worker, data_dir} = test_context("retirement")
     on_exit(fn -> File.rm_rf!(data_dir) end)
-    {:ok, registry_pid} = start_registry(ctx, registry)
+    catalog_path = Path.join(data_dir, "retirement-catalog.json")
+    write_catalog!(catalog_path, 1, [catalog_index("retirement-index", 1)])
+    {:ok, registry_pid} = start_registry(ctx, registry, catalog_path: catalog_path)
     {:ok, %{indexes: [index | _]}} = IndexRegistry.snapshot(ctx, 0)
     complete_build!(registry, index.build_id)
 
@@ -379,7 +381,9 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorkerTest do
 
     GenServer.stop(worker_pid)
     GenServer.stop(registry_pid)
-    {:ok, _resumed_registry_pid} = start_registry(ctx, registry)
+
+    {:ok, _resumed_registry_pid} =
+      start_registry(ctx, registry, catalog_path: catalog_path)
 
     {:ok, _resumed_worker_pid} =
       start_worker(ctx, registry, worker,
@@ -409,6 +413,8 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorkerTest do
 
     assert {:ok, %{retirement: %{status: :complete}}} =
              IndexRegistry.status(registry, index.definition.id, index.definition.version)
+
+    assert {:ok, :idle} = IndexLifecycleWorker.run_once(worker)
   end
 
   test "continues retirement cleanup under operational pressure" do
@@ -891,8 +897,10 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorkerTest do
   defp advance_validation(%{phase: :counter} = checkpoint, definition_count),
     do: %{checkpoint | phase: :cleanup, cursor: "", definition_position: definition_count}
 
-  defp start_registry(ctx, registry) do
-    {:ok, pid} = IndexRegistry.start_link(instance_ctx: ctx, name: registry)
+  defp start_registry(ctx, registry, opts \\ []) do
+    {:ok, pid} =
+      IndexRegistry.start_link(Keyword.merge([instance_ctx: ctx, name: registry], opts))
+
     Process.unlink(pid)
     {:ok, pid}
   end

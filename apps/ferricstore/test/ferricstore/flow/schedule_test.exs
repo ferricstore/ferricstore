@@ -2065,6 +2065,54 @@ defmodule Ferricstore.Flow.ScheduleTest do
     assert target.type == target_type
   end
 
+  test "operator schedule mutations reject stale expected state and version" do
+    now_ms = 31_000
+    schedule_id = unique_flow_id("schedule-expected-version")
+
+    assert {:ok, _created} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :interval,
+               every_ms: 60_000,
+               start_at_ms: now_ms + 60_000,
+               now_ms: now_ms,
+               target: [id_prefix: schedule_id <> "-target", type: "guarded-schedule"]
+             )
+
+    assert {:ok, created} = FerricStore.flow_schedule_get(schedule_id)
+
+    stale_opts =
+      [
+        expected_state: created.state,
+        expected_version: created.version + 1,
+        now_ms: now_ms + 1
+      ]
+
+    assert {:error, stale_pause} = FerricStore.flow_schedule_pause(schedule_id, stale_opts)
+    assert stale_pause =~ "changed"
+
+    assert {:ok, %{state: "active", version: version}} =
+             FerricStore.flow_schedule_get(schedule_id)
+
+    assert version == created.version
+
+    guarded_opts =
+      [
+        expected_state: created.state,
+        expected_version: created.version,
+        now_ms: now_ms + 2
+      ]
+
+    assert {:ok, paused} = FerricStore.flow_schedule_pause(schedule_id, guarded_opts)
+    assert paused.state == "paused"
+
+    assert {:error, stale_fire} = FerricStore.flow_schedule_fire(schedule_id, guarded_opts)
+    assert stale_fire =~ "changed"
+
+    assert {:error, stale_delete} = FerricStore.flow_schedule_delete(schedule_id, guarded_opts)
+    assert stale_delete =~ "changed"
+    assert {:ok, %{state: "paused"}} = FerricStore.flow_schedule_get(schedule_id)
+  end
+
   test "schedule lifecycle writes explicit signal history events" do
     now_ms = 4_040
     schedule_id = unique_flow_id("schedule-history-events")

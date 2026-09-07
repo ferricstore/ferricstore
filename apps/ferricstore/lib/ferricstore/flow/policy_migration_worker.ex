@@ -31,12 +31,37 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
       instance_ctx = Keyword.get(opts, :instance_ctx) || FerricStore.Instance.get(:default)
       server_name = Keyword.get(opts, :name, name(instance_ctx))
 
-      GenServer.start_link(__MODULE__, Keyword.put(opts, :instance_ctx, instance_ctx),
-        name: server_name
-      )
+      init_opts =
+        opts
+        |> Keyword.put(:instance_ctx, instance_ctx)
+        |> Keyword.put(:server_name, server_name)
+
+      GenServer.start_link(__MODULE__, init_opts, name: server_name)
     else
       :ignore
     end
+  end
+
+  @typedoc "A bounded operational snapshot published by a policy migration worker."
+  @type health_snapshot :: %{
+          status: :healthy | :warning | :degraded | :unavailable,
+          issues: [map()],
+          updated_at_ms: non_neg_integer() | nil
+        }
+
+  @doc "Returns the latest non-blocking operational snapshot for a worker name or instance."
+  @spec health_snapshot(atom() | FerricStore.Instance.t()) :: health_snapshot()
+  def health_snapshot(%{} = instance_ctx), do: health_snapshot(name(instance_ctx))
+
+  def health_snapshot(server_name) when is_atom(server_name) do
+    table = health_table_name(server_name)
+
+    case :ets.lookup(table, :snapshot) do
+      [{:snapshot, snapshot}] when is_map(snapshot) -> snapshot
+      _ -> unavailable_health_snapshot()
+    end
+  rescue
+    ArgumentError -> unavailable_health_snapshot()
   end
 
   @doc false
@@ -51,8 +76,17 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
 
   @impl true
   def init(opts) do
+    health_table =
+      opts
+      |> Keyword.fetch!(:server_name)
+      |> health_table_name()
+      |> new_health_table()
+
     state = %{
       instance_ctx: Keyword.fetch!(opts, :instance_ctx),
+      health_table: health_table,
+      health_by_shard: %{},
+      published_health_signature: nil,
       interval_ms:
         positive_opt(
           opts,
@@ -120,8 +154,9 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
     }
 
     state =
-      schedule_run(
-        state,
+      state
+      |> publish_health()
+      |> schedule_run(
         nonnegative_opt(
           opts,
           :initial_delay_ms,
@@ -151,11 +186,18 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
       ) do
     state = clear_task_pid(state, shard_index, run_token, :snapshot_pid, snapshot_pid)
 
-    if not snapshot_result?(result) do
-      Logger.warning(
-        "Flow policy catalog snapshot failed for shard #{shard_index}: #{inspect(result)}"
-      )
-    end
+    state =
+      if snapshot_result?(result) do
+        state
+      else
+        Logger.warning(
+          "Flow policy catalog snapshot failed for shard #{shard_index}: #{inspect(result)}"
+        )
+
+        state
+        |> record_shard_health(shard_index, {:error, {:snapshot_failed, result}})
+        |> publish_health()
+      end
 
     {:noreply, schedule_run(state, 0)}
   end
@@ -164,11 +206,18 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
         {:policy_catalog_snapshot_cleaned, shard_index, run_token, cleanup_pid, result},
         state
       ) do
-    if result != :ok do
-      Logger.warning(
-        "Flow policy catalog snapshot cleanup failed for shard #{shard_index}: #{inspect(result)}"
-      )
-    end
+    state =
+      if result == :ok do
+        state
+      else
+        Logger.warning(
+          "Flow policy catalog snapshot cleanup failed for shard #{shard_index}: #{inspect(result)}"
+        )
+
+        state
+        |> record_shard_health(shard_index, {:error, {:snapshot_cleanup_failed, result}})
+        |> publish_health()
+      end
 
     state = clear_task_pid(state, shard_index, run_token, :cleanup_pid, cleanup_pid)
     {:noreply, schedule_run(state, 0)}
@@ -210,7 +259,8 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
 
   defp run_shards(%{instance_ctx: %{shard_count: shard_count}} = state)
        when shard_count <= 0 do
-    {%{state | next_shard_index: 0, sweep_remaining: 0, sweep_more_work?: false}, false}
+    state = %{state | next_shard_index: 0, sweep_remaining: 0, sweep_more_work?: false}
+    {publish_health(state), false}
   end
 
   defp run_shards(state) do
@@ -226,6 +276,7 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
     {next_state, chunk_more_work?} =
       Enum.reduce(shard_indexes, {state, false}, fn shard_index, {next_state, more_work?} ->
         {next_state, result} = run_shard(next_state, shard_index)
+        next_state = record_shard_health(next_state, shard_index, result)
         {next_state, shard_result_more_work?(result, shard_index, more_work?)}
       end)
 
@@ -234,20 +285,105 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
     sweep_more_work? = state.sweep_more_work? or chunk_more_work?
 
     if remaining_after_run == 0 do
-      {%{
-         next_state
-         | next_shard_index: next_shard_index,
-           sweep_remaining: shard_count,
-           sweep_more_work?: false
-       }, sweep_more_work?}
+      next_state = %{
+        next_state
+        | next_shard_index: next_shard_index,
+          sweep_remaining: shard_count,
+          sweep_more_work?: false
+      }
+
+      {publish_health(next_state), sweep_more_work?}
     else
-      {%{
-         next_state
-         | next_shard_index: next_shard_index,
-           sweep_remaining: remaining_after_run,
-           sweep_more_work?: sweep_more_work?
-       }, true}
+      next_state = %{
+        next_state
+        | next_shard_index: next_shard_index,
+          sweep_remaining: remaining_after_run,
+          sweep_more_work?: sweep_more_work?
+      }
+
+      {publish_health(next_state), true}
     end
+  end
+
+  defp record_shard_health(state, shard_index, {:ok, _result}) do
+    %{state | health_by_shard: Map.delete(state.health_by_shard, shard_index)}
+  end
+
+  defp record_shard_health(state, _shard_index, {:retry, _reason}), do: state
+
+  defp record_shard_health(state, shard_index, {:error, reason}) do
+    now_ms = System.system_time(:millisecond)
+    previous = Map.get(state.health_by_shard, shard_index, %{})
+
+    issue = %{
+      shard: shard_index,
+      severity: health_severity(reason),
+      reason: reason,
+      occurrences: Map.get(previous, :occurrences, 0) + 1,
+      first_seen_at_ms: Map.get(previous, :first_seen_at_ms, now_ms),
+      last_seen_at_ms: now_ms
+    }
+
+    %{state | health_by_shard: Map.put(state.health_by_shard, shard_index, issue)}
+  end
+
+  defp record_shard_health(state, shard_index, result) do
+    record_shard_health(state, shard_index, {:error, {:invalid_result, result}})
+  end
+
+  defp health_severity(reason)
+       when reason in [
+              :policy_catalog_state_projection_pending,
+              :flow_policy_migration_projection_pending,
+              :flow_policy_catalog_projection_pending
+            ],
+       do: :warning
+
+  defp health_severity(_reason), do: :degraded
+
+  defp publish_health(state) do
+    issues = state.health_by_shard |> Map.values() |> Enum.sort_by(& &1.shard)
+
+    status =
+      cond do
+        Enum.any?(issues, &(&1.severity == :degraded)) -> :degraded
+        issues != [] -> :warning
+        true -> :healthy
+      end
+
+    signature =
+      {status,
+       Enum.map(issues, fn issue ->
+         {issue.shard, issue.severity, issue.reason, issue.occurrences}
+       end)}
+
+    if signature == state.published_health_signature do
+      state
+    else
+      snapshot = %{
+        status: status,
+        issues: issues,
+        updated_at_ms: System.system_time(:millisecond)
+      }
+
+      true = :ets.insert(state.health_table, {:snapshot, snapshot})
+      %{state | published_health_signature: signature}
+    end
+  end
+
+  defp new_health_table(table) do
+    :ets.new(table, [
+      :named_table,
+      :protected,
+      :set,
+      read_concurrency: true
+    ])
+  end
+
+  defp health_table_name(server_name), do: :"#{server_name}.OperationalHealth"
+
+  defp unavailable_health_snapshot do
+    %{status: :unavailable, issues: [], updated_at_ms: nil}
   end
 
   defp valid_sweep_remaining(remaining, shard_count)

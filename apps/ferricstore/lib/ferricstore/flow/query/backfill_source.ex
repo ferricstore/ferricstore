@@ -2,7 +2,7 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
   @moduledoc false
 
   alias Ferricstore.Flow.{Keys, LMDB, RecordIdentity}
-  alias Ferricstore.Flow.Query.SourceCatalog
+  alias Ferricstore.Flow.Query.{QueryRow, QueryRowCodec, SourceCatalog}
   alias Ferricstore.Store.Router
 
   @root "flow-query-backfill:1:"
@@ -387,7 +387,23 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
     if is_function(read_entries, 3) and is_function(decode_record, 1) do
       case read_entries.(ctx, shard_index, state_keys) do
         {:ok, entries} when is_list(entries) and length(entries) == length(state_keys) ->
-          decode_current_records(state_keys, entries, decode_record, max_bytes)
+          with {:ok, missing_keys, primary_bytes} <-
+                 missing_primary_keys(state_keys, entries, max_bytes),
+               {:ok, retained_rows} <-
+                 read_retained_rows(
+                   ctx,
+                   shard_index,
+                   missing_keys,
+                   max_bytes - primary_bytes
+                 ) do
+            decode_current_records(
+              state_keys,
+              entries,
+              retained_rows,
+              decode_record,
+              max_bytes
+            )
+          end
 
         :unavailable ->
           {:error, :query_backfill_primary_unavailable}
@@ -403,12 +419,70 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
     end
   end
 
-  defp decode_current_records(state_keys, entries, decode_record, max_bytes) do
+  defp missing_primary_keys(state_keys, entries, max_bytes) do
+    Enum.zip(state_keys, entries)
+    |> Enum.reduce_while({:ok, [], 0}, fn
+      {state_key, nil}, {:ok, missing, bytes} ->
+        {:cont, {:ok, [state_key | missing], bytes}}
+
+      {_state_key, {encoded, expire_at_ms}}, {:ok, missing, bytes}
+      when is_binary(encoded) and is_integer(expire_at_ms) and expire_at_ms >= 0 and
+             expire_at_ms <= @max_expiry ->
+        next_bytes = bytes + byte_size(encoded)
+
+        if next_bytes <= max_bytes,
+          do: {:cont, {:ok, missing, next_bytes}},
+          else: {:halt, {:error, :query_backfill_hydration_budget_exceeded}}
+
+      {_state_key, _invalid}, _acc ->
+        {:halt, {:error, :invalid_query_backfill_primary_read}}
+    end)
+    |> case do
+      {:ok, reversed, bytes} -> {:ok, Enum.reverse(reversed), bytes}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp read_retained_rows(_ctx, _shard_index, [], _remaining_bytes), do: {:ok, %{}}
+
+  defp read_retained_rows(_ctx, _shard_index, _state_keys, remaining_bytes)
+       when remaining_bytes <= 0,
+       do: {:error, :query_backfill_hydration_budget_exceeded}
+
+  defp read_retained_rows(ctx, shard_index, state_keys, remaining_bytes) do
+    keys = state_keys ++ Enum.map(state_keys, &LMDB.cold_park_key_for_state_key/1)
+
+    case LMDB.get_many_bounded(lmdb_path(ctx, shard_index), keys, remaining_bytes) do
+      {:ok, values, _bytes} when length(values) == length(keys) ->
+        {rows, parks} = Enum.split(values, length(state_keys))
+
+        {:ok,
+         Map.new(Enum.zip([state_keys, rows, parks]), fn {key, row, park} ->
+           {key, {row, park}}
+         end)}
+
+      {:ok, _values, _bytes} ->
+        {:error, :invalid_query_backfill_row_read}
+
+      {:error, reason}
+      when reason in [:batch_value_budget_exceeded, :batch_key_budget_exceeded] ->
+        {:error, :query_backfill_hydration_budget_exceeded}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp decode_current_records(state_keys, entries, retained_rows, decode_record, max_bytes) do
     Enum.zip(state_keys, entries)
     |> Enum.reduce_while({:ok, [], 0}, fn
       {state_key, nil}, {:ok, acc, bytes} ->
-        tombstone = %{state_key: state_key, record: nil, expire_at_ms: 0}
-        {:cont, {:ok, [tombstone | acc], bytes}}
+        decode_missing_record(
+          state_key,
+          Map.get(retained_rows, state_key, {:not_found, :not_found}),
+          acc,
+          bytes
+        )
 
       {state_key, {encoded, expire_at_ms}}, {:ok, acc, bytes}
       when is_binary(encoded) and is_integer(expire_at_ms) and expire_at_ms >= 0 and
@@ -445,6 +519,75 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
       {:error, _reason} = error -> error
     end
   end
+
+  defp decode_missing_record(state_key, {:not_found, :not_found}, acc, bytes) do
+    tombstone = %{
+      state_key: state_key,
+      record: nil,
+      expire_at_ms: 0,
+      projection_guard: :missing
+    }
+
+    {:cont, {:ok, [tombstone | acc], bytes}}
+  end
+
+  defp decode_missing_record(
+         state_key,
+         {{:ok, encoded}, :not_found},
+         acc,
+         bytes
+       )
+       when is_binary(encoded) do
+    case QueryRowCodec.decode(encoded, state_key) do
+      {:ok, %QueryRow{record: %{state: state}} = row} ->
+        if LMDB.terminal_state?(state) do
+          projected = %{
+            state_key: state_key,
+            record: row.record,
+            expire_at_ms: row.expire_at_ms,
+            projection_guard: {:value, encoded}
+          }
+
+          {:cont, {:ok, [projected | acc], bytes + byte_size(encoded)}}
+        else
+          tombstone = %{
+            state_key: state_key,
+            record: nil,
+            expire_at_ms: 0,
+            projection_guard: {:value, encoded}
+          }
+
+          {:cont, {:ok, [tombstone | acc], bytes + byte_size(encoded)}}
+        end
+
+      :error ->
+        {:halt, {:error, :corrupt_query_backfill_record}}
+    end
+  end
+
+  defp decode_missing_record(state_key, {{:ok, encoded}, {:ok, park}}, acc, bytes)
+       when is_binary(encoded) and is_binary(park) do
+    with {:ok, %QueryRow{} = row} <- QueryRowCodec.decode(encoded, state_key),
+         :ok <- Ferricstore.Flow.Query.BackfillRetainedRow.validate_park(row, park) do
+      projected = %{
+        state_key: state_key,
+        record: row.record,
+        expire_at_ms: row.expire_at_ms,
+        projection_guard: {:parked, encoded, park}
+      }
+
+      {:cont, {:ok, [projected | acc], bytes + byte_size(encoded) + byte_size(park)}}
+    else
+      :error -> {:halt, {:error, :corrupt_query_backfill_record}}
+      {:error, _reason} = error -> {:halt, error}
+    end
+  end
+
+  defp decode_missing_record(_state_key, {:not_found, {:ok, _park}}, _acc, _bytes),
+    do: {:halt, {:error, :query_backfill_concurrent_change}}
+
+  defp decode_missing_record(_state_key, _invalid, _acc, _bytes),
+    do: {:halt, {:error, :invalid_query_backfill_row_read}}
 
   defp decode_record(encoded) do
     {:ok, Ferricstore.Flow.decode_record(encoded)}

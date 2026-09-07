@@ -71,8 +71,8 @@ defmodule Ferricstore.Flow.Schedule do
     :timezone
   ]
   @get_option_keys [:partition_key, :payload, :payload_max_bytes]
-  @fire_option_keys [:fire_at_ms, :now_ms]
-  @status_option_keys [:now_ms]
+  @fire_option_keys [:expected_state, :expected_version, :fire_at_ms, :now_ms]
+  @status_option_keys [:expected_state, :expected_version, :now_ms]
   @fire_due_option_keys [:block_ms, :lease_ms, :limit, :now_ms, :worker]
   @target_option_keys [
     :correlation_id,
@@ -182,6 +182,7 @@ defmodule Ferricstore.Flow.Schedule do
              )
            ),
          :ok <- require_schedule_record(record),
+         :ok <- require_expected_schedule(record, opts),
          :ok <- require_active_schedule(record),
          {:ok, claimed} <- claim_manual_schedule(ctx, record) do
       fire_manual_one(ctx, claimed, fire_at_ms, now_ms)
@@ -263,13 +264,16 @@ defmodule Ferricstore.Flow.Schedule do
              flow_id(id),
              Internal.put(partition_key: partition_key(id), payload: false)
            ),
-         :ok <- require_schedule_record(record) do
+         :ok <- require_schedule_record(record),
+         :ok <- require_expected_schedule(record, opts) do
       cancel_opts =
         [
           partition_key: partition_key(id),
           fencing_token: Map.get(record, :fencing_token, 0)
         ]
         |> maybe_put(:now_ms, now_ms)
+        |> maybe_put(:expect_state, Keyword.get(opts, :expected_state))
+        |> maybe_put(:expected_version, Keyword.get(opts, :expected_version))
         |> Internal.put()
 
       case Flow.cancel(ctx, flow_id(id), cancel_opts) do
@@ -1393,6 +1397,36 @@ defmodule Ferricstore.Flow.Schedule do
   defp require_paused_schedule(%{state: @paused_state}), do: :ok
   defp require_paused_schedule(_record), do: {:error, "ERR flow schedule is not paused"}
 
+  defp require_expected_schedule(record, opts) do
+    with :ok <- require_expected_schedule_version(record, Keyword.get(opts, :expected_version)),
+         :ok <- require_expected_schedule_state(record, Keyword.get(opts, :expected_state)) do
+      :ok
+    end
+  end
+
+  defp require_expected_schedule_version(_record, nil), do: :ok
+
+  defp require_expected_schedule_version(%{version: version}, version)
+       when is_integer(version) and version >= 0,
+       do: :ok
+
+  defp require_expected_schedule_version(_record, version)
+       when is_integer(version) and version >= 0,
+       do: {:error, "ERR flow schedule changed concurrently"}
+
+  defp require_expected_schedule_version(_record, _version),
+    do: {:error, "ERR flow schedule expected_version must be a non-negative integer"}
+
+  defp require_expected_schedule_state(_record, nil), do: :ok
+  defp require_expected_schedule_state(%{state: state}, state) when is_binary(state), do: :ok
+
+  defp require_expected_schedule_state(_record, state)
+       when is_binary(state) and state != "",
+       do: {:error, "ERR flow schedule changed concurrently"}
+
+  defp require_expected_schedule_state(_record, _state),
+    do: {:error, "ERR flow schedule expected_state must be a non-empty string"}
+
   defp mutable_schedule_record(ctx, id, opts) do
     with :ok <- validate_opts(opts),
          :ok <- validate_option_fields(opts, @status_option_keys, "option"),
@@ -1408,7 +1442,8 @@ defmodule Ferricstore.Flow.Schedule do
                payload_max_bytes: schedule_hydration_max_bytes()
              )
            ),
-         :ok <- require_schedule_record(record) do
+         :ok <- require_schedule_record(record),
+         :ok <- require_expected_schedule(record, opts) do
       {:ok, record, now_ms}
     end
   end

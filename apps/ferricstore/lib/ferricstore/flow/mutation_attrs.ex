@@ -626,6 +626,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- Internal.reject_reserved_id(id, opts),
          {:ok, lease_token} <- optional_lease_token(opts),
          {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
+         {:ok, expected_version} <- optional_non_neg_integer_or_nil(opts, :expected_version),
+         {:ok, expect_state} <- optional_binary_or_nil(opts, :expect_state, nil),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(Ferricstore.Flow.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_now_ms(opts),
@@ -638,6 +640,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
         %{
           id: id,
           fencing_token: fencing_token,
+          expected_version: expected_version,
+          expect_state: expect_state,
           partition_key: partition_key
         }
         |> maybe_put_attr(:lease_token, lease_token)
