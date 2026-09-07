@@ -5,9 +5,10 @@
 <div class="layout">
 <%= render_live_component("sidebar", render_sidebar(data, "overview")) %>
 <main class="main-content">
-<div class="content" data-live-component="content">
+<h1 class="sr-only">Overview</h1>
+<div class="content">
 <%= render_page_intro("Overview", "Fast health snapshot for uptime, memory, cache hit rate, cold-read pressure, storage, consensus, and recent slow commands.") %>
-<%= render_overview_content(data) %>
+<%= render_live_component("content", render_overview_content(data)) %>
 </div>
 </main>
 </div>

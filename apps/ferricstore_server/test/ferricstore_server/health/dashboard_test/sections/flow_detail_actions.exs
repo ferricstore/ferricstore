@@ -23,9 +23,10 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailActions do
           html = Dashboard.render_flow_detail_page(data)
 
           assert String.contains?(html, id)
-          assert String.contains?(html, "Why waiting")
+          assert String.contains?(html, "Execution summary")
           assert String.contains?(html, "Timeline")
-          assert String.contains?(html, "scheduled for future")
+          assert String.contains?(html, "Scheduled (")
+          assert String.contains?(html, "Durable timer waiting for scheduled execution")
         end
 
         test "Flow detail timeline renders transition, retry, and terminal events" do
@@ -107,7 +108,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailActions do
           assert String.contains?(html, ~s(id="flow-event-))
           assert String.contains?(html, "ready")
           assert String.contains?(html, "Step Waterfall")
-          assert String.contains?(html, "Step durations")
+          assert String.contains?(html, ~s(aria-label="Step timing"))
           assert String.contains?(html, ~s(class="flow-step-waterfall"))
           assert String.contains?(html, ~s(class="flow-step-waterfall-row"))
           assert String.contains?(html, ~s(class="flow-step-waterfall-track"))

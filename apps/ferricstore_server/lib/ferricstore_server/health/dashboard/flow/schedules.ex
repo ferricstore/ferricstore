@@ -5,11 +5,17 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Schedules do
 
   @default_limit 100
   @max_limit 500
+  @draft_fields ~w(id schedule_kind cron every_ms delay_ms target_type target_partition
+                   overlap_policy timezone max_fires target_payload overwrite)
 
   @spec opts_from_query(binary()) :: keyword()
   def opts_from_query(query) when is_binary(query) do
-    params = QueryDecoder.decode(query)
+    query |> QueryDecoder.decode() |> opts_from_params()
+  end
 
+  def opts_from_query(_query), do: []
+
+  defp opts_from_params(params) do
     []
     |> put_opt(:state, normalize_state(Map.get(params, "state")))
     |> put_opt(:kind, normalize_kind(Map.get(params, "kind")))
@@ -19,7 +25,19 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Schedules do
     |> Enum.reverse()
   end
 
-  def opts_from_query(_query), do: []
+  # A create-only principal need not have catalog read permission. Error rendering
+  # reflects the bounded request draft without reading any schedules or policies.
+  def create_error_page(params, reason) do
+    %{
+      draft: Map.take(params, @draft_fields),
+      filters: params |> opts_from_params() |> filters_from_opts(),
+      flash: %{kind: :error, message: error_message(reason)},
+      catalog_loaded: false
+    }
+  end
+
+  defp error_message(reason) when is_binary(reason), do: reason
+  defp error_message(_reason), do: "Schedule could not be created. Review the form and retry."
 
   @spec collect_page(keyword()) :: map()
   def collect_page(opts \\ []) when is_list(opts) do
@@ -58,22 +76,29 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Schedules do
       {_action, ""} ->
         {:error, "schedule id is required"}
 
+      {"create", id} ->
+        apply_create_schedule(id, params)
+
       {"fire", id} ->
         with :ok <- validate_destructive_confirmation(params),
-             :ok <- validate_expected_schedule(id, params) do
-          apply_result(FerricStore.flow_schedule_fire(id, now_ms: now_ms), "fired #{id}")
+             {:ok, opts} <- schedule_mutation_opts(params, now_ms) do
+          apply_result(FerricStore.flow_schedule_fire(id, opts), "fired #{id}")
         end
 
       {"pause", id} ->
-        apply_result(FerricStore.flow_schedule_pause(id, now_ms: now_ms), "paused #{id}")
+        with {:ok, opts} <- schedule_mutation_opts(params, now_ms) do
+          apply_result(FerricStore.flow_schedule_pause(id, opts), "paused #{id}")
+        end
 
       {"resume", id} ->
-        apply_result(FerricStore.flow_schedule_resume(id, now_ms: now_ms), "resumed #{id}")
+        with {:ok, opts} <- schedule_mutation_opts(params, now_ms) do
+          apply_result(FerricStore.flow_schedule_resume(id, opts), "resumed #{id}")
+        end
 
       {"delete", id} ->
         with :ok <- validate_destructive_confirmation(params),
-             :ok <- validate_expected_schedule(id, params) do
-          apply_result(FerricStore.flow_schedule_delete(id, now_ms: now_ms), "deleted #{id}")
+             {:ok, opts} <- schedule_mutation_opts(params, now_ms) do
+          apply_result(FerricStore.flow_schedule_delete(id, opts), "deleted #{id}")
         end
 
       _other ->
@@ -86,6 +111,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Schedules do
   @spec form_command(map()) :: binary()
   def form_command(params) when is_map(params) do
     case Map.get(params, "action") do
+      "create" -> "FLOW.SCHEDULE.CREATE"
       "fire" -> "FLOW.SCHEDULE.FIRE"
       "pause" -> "FLOW.SCHEDULE.PAUSE"
       "resume" -> "FLOW.SCHEDULE.RESUME"
@@ -122,19 +148,19 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Schedules do
   defp validate_destructive_confirmation(_params),
     do: {:error, "schedule action confirmation is required"}
 
-  defp validate_expected_schedule(id, params) do
+  defp schedule_mutation_opts(params, now_ms) do
     with {:ok, expected_version} <- parse_expected_version(Map.get(params, "expected_version")),
          expected_state when is_binary(expected_state) and expected_state != "" <-
-           params |> Map.get("expected_state", "") |> String.trim(),
-         {:ok, %{} = schedule} <- FerricStore.flow_schedule_get(id),
-         true <-
-           Map.get(schedule, :version) == expected_version and
-             Map.get(schedule, :state) == expected_state do
-      :ok
+           params |> Map.get("expected_state", "") |> String.trim() do
+      {:ok,
+       [
+         expected_state: expected_state,
+         expected_version: expected_version,
+         now_ms: now_ms
+       ]}
     else
-      {:ok, nil} -> {:error, "schedule changed or was deleted; refresh before retrying"}
       {:error, reason} -> {:error, reason}
-      _other -> {:error, "schedule changed; refresh before retrying"}
+      _other -> {:error, "schedule state is required; refresh before retrying"}
     end
   end
 
@@ -232,4 +258,127 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Schedules do
     do: %{kind: :error, message: message}
 
   defp flash_from_params(_params), do: nil
+
+  defp apply_create_schedule(id, params) do
+    schedule_kind = params |> Map.get("schedule_kind", "cron") |> String.trim()
+    target_type = params |> Map.get("target_type", "") |> String.trim()
+    target_partition = params |> Map.get("target_partition", "") |> String.trim()
+    target_payload_raw = params |> Map.get("target_payload", "") |> String.trim()
+    overlap_policy_raw = params |> Map.get("overlap_policy", "skip") |> String.trim()
+    overwrite = (params |> Map.get("overwrite", "false") |> String.trim()) in ["true", "on", "1"]
+    timezone = params |> Map.get("timezone", "Etc/UTC") |> String.trim()
+
+    cond do
+      target_type == "" ->
+        {:error, "target workflow type is required"}
+
+      true ->
+        with {:ok, timing_opts} <- parse_timing_opts(schedule_kind, params),
+             {:ok, payload} <- parse_payload_json(target_payload_raw),
+             {:ok, overlap_policy} <-
+               parse_overlap_policy(schedule_kind, overlap_policy_raw),
+             {:ok, max_fires} <-
+               parse_max_fires(schedule_kind, Map.get(params, "max_fires")) do
+          target_opts =
+            [type: target_type]
+            |> maybe_put_kw(:partition_key, if(target_partition != "", do: target_partition))
+            |> maybe_put_kw(:payload, payload)
+
+          create_opts =
+            timing_opts
+            |> Keyword.put(:target, target_opts)
+            |> Keyword.put(:overwrite, overwrite)
+            |> maybe_put_kw(
+              :timezone,
+              if(schedule_kind == "cron" and timezone != "", do: timezone)
+            )
+            |> maybe_put_kw(
+              :overlap_policy,
+              overlap_policy
+            )
+            |> maybe_put_kw(:max_fires, max_fires)
+
+          apply_result(
+            FerricStore.flow_schedule_create(id, create_opts),
+            "created schedule #{id}"
+          )
+        end
+    end
+  end
+
+  defp parse_overlap_policy(kind, policy) when kind in ["cron", "interval"] do
+    case policy do
+      "allow" ->
+        {:ok, :allow}
+
+      "skip" ->
+        {:ok, :skip}
+
+      "queue_after_previous" ->
+        {:ok, :queue_after_previous}
+
+      "fail_schedule" ->
+        {:ok, :fail_schedule}
+
+      _other ->
+        {:error,
+         "overlap policy must be one of: allow, skip, queue_after_previous, fail_schedule"}
+    end
+  end
+
+  defp parse_overlap_policy(_kind, _policy), do: {:ok, nil}
+
+  defp parse_timing_opts("cron", params) do
+    case params |> Map.get("cron", "") |> String.trim() do
+      "" -> {:error, "cron expression is required"}
+      cron -> {:ok, [cron: cron]}
+    end
+  end
+
+  defp parse_timing_opts("interval", params) do
+    case params |> Map.get("every_ms", "") |> String.trim() |> Integer.parse() do
+      {ms, ""} when ms > 0 -> {:ok, [every_ms: ms]}
+      _other -> {:error, "interval (every_ms) must be a positive integer in milliseconds"}
+    end
+  end
+
+  defp parse_timing_opts("delay", params) do
+    case params |> Map.get("delay_ms", "") |> String.trim() |> Integer.parse() do
+      {ms, ""} when ms >= 0 -> {:ok, [delay_ms: ms]}
+      _other -> {:error, "delay (delay_ms) must be a non-negative integer in milliseconds"}
+    end
+  end
+
+  defp parse_timing_opts(_other, _params), do: {:error, "unsupported schedule kind"}
+
+  defp parse_payload_json(""), do: {:ok, nil}
+
+  defp parse_payload_json(raw) when is_binary(raw) do
+    case Jason.decode(raw) do
+      {:ok, decoded} -> {:ok, decoded}
+      {:error, _reason} -> {:error, "target payload must be valid JSON"}
+    end
+  end
+
+  defp parse_payload_json(_), do: {:ok, nil}
+
+  defp parse_max_fires(_kind, value) when value in [nil, ""], do: {:ok, nil}
+
+  defp parse_max_fires(kind, raw) when kind in ["cron", "interval"] and is_binary(raw) do
+    case raw |> String.trim() |> Integer.parse() do
+      {int, ""} when int > 0 -> {:ok, int}
+      _other -> {:error, "max fires must be a positive integer"}
+    end
+  end
+
+  defp parse_max_fires(_kind, raw) when is_binary(raw) do
+    if String.trim(raw) == "",
+      do: {:ok, nil},
+      else: {:error, "max fires is only supported for recurring schedules"}
+  end
+
+  defp parse_max_fires(_kind, _raw), do: {:error, "max fires must be a positive integer"}
+
+  defp maybe_put_kw(opts, _key, nil), do: opts
+  defp maybe_put_kw(opts, key, value), do: Keyword.put(opts, key, value)
 end

@@ -546,6 +546,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           assert String.contains?(html, "Flow Failures")
           assert String.contains?(html, "Recovery Actions")
           assert String.contains?(html, "FLOW.RECLAIM")
+          assert String.contains?(html, ~s(name="confirm_reclaim" value="true" required))
           assert String.contains?(html, "failed-flow")
           assert String.contains?(html, "terminal failed")
         end
@@ -652,6 +653,57 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           assert_received {:signal_history_scan, ^id}
         end
 
+        test "signals page preserves partition scope and only scans matching histories" do
+          flow_type = "dashboard-signal-partition-#{System.unique_integer([:positive])}"
+          matching_id = "dashboard-signal-matching-#{System.unique_integer([:positive])}"
+          other_id = "dashboard-signal-other-#{System.unique_integer([:positive])}"
+          matching_partition = "tenant-signal-a"
+          other_partition = "tenant-signal-b"
+          previous_history = Application.get_env(:ferricstore, :flow_dashboard_flow_history_fun)
+          test_pid = self()
+
+          assert :ok =
+                   FerricStore.flow_create(matching_id,
+                     type: flow_type,
+                     partition_key: matching_partition,
+                     state: "queued",
+                     run_at_ms: 1_000,
+                     now_ms: 1_000
+                   )
+
+          assert :ok =
+                   FerricStore.flow_create(other_id,
+                     type: flow_type,
+                     partition_key: other_partition,
+                     state: "queued",
+                     run_at_ms: 1_000,
+                     now_ms: 1_000
+                   )
+
+          Application.put_env(:ferricstore, :flow_dashboard_flow_history_fun, fn id, opts ->
+            send(test_pid, {:partition_signal_history_scan, id, opts})
+            {:ok, []}
+          end)
+
+          on_exit(fn -> restore_env(:flow_dashboard_flow_history_fun, previous_history) end)
+
+          data =
+            Dashboard.collect_flow_signals_page(
+              type: flow_type,
+              partition_key: matching_partition,
+              scan_history: true
+            )
+
+          html = Dashboard.render_flow_signals_page(data)
+
+          assert data.filters.partition_key == matching_partition
+          assert html =~ ~s(name="partition_key" value="#{matching_partition}")
+          assert html =~ "partition #{matching_partition}"
+          assert_received {:partition_signal_history_scan, ^matching_id, opts}
+          assert opts[:partition_key] == matching_partition
+          refute_received {:partition_signal_history_scan, ^other_id, _opts}
+        end
+
         test "lineage page uses the canonical query and renders graph/table components" do
           previous = Application.get_env(:ferricstore, :flow_dashboard_flow_query_fun)
           test_pid = self()
@@ -704,7 +756,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
             Dashboard.collect_flow_query_page(kind: "history")
             |> Dashboard.render_flow_query_page()
 
-          assert String.contains?(idle, "Flow Query Explorer")
+          assert String.contains?(idle, "Flow Query Studio")
           assert String.contains?(idle, "Enter an id")
           assert String.contains?(idle, "FLOW.HISTORY")
           assert String.contains?(idle, "Flow ID")
@@ -749,7 +801,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
               }
             })
 
-          assert String.contains?(html, "Safe Query Explorer")
+          assert String.contains?(html, "Flow Query Studio")
           assert String.contains?(html, "FLOW.QUERY")
           assert String.contains?(html, "Workflow Type")
           assert String.contains?(html, "State")

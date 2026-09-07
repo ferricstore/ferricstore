@@ -2,12 +2,15 @@
 <% filters = flow_failures_page_filters(data) %>
 <div class="flow-policy-panel">
   <div class="section-title">Recovery Actions <%= info_icon("Reclaim only takes expired running leases through FLOW.RECLAIM. Failed terminal flows are listed for triage; retry/rewind stays on the Flow detail page.") %></div>
-  <form class="flow-policy-form" action="/dashboard/flow/failures" method="post">
+  <form class="flow-policy-form" action="/dashboard/flow/failures" method="post" data-dashboard-single-submit aria-describedby="flow-reclaim-scope-note">
     <input type="hidden" name="action" value="reclaim">
+    <input type="hidden" name="return_q" value="<%= escape_attr(filters.q || "") %>">
+    <input type="hidden" name="return_limit" value="<%= filters.limit %>">
+    <input type="hidden" name="return_exact" value="<%= if filters.scan_exact, do: "true", else: "false" %>">
     <div class="flow-policy-grid">
       <label class="flow-policy-field">
         <span>Type</span>
-        <input class="flow-search-input mono" name="type" value="<%= escape_attr(filters.type || "") %>" placeholder="required" title="Workflow type to reclaim expired running leases from">
+        <input class="flow-search-input mono" name="type" value="<%= escape_attr(filters.type || "") %>" placeholder="required" title="Workflow type to reclaim expired running leases from" required>
       </label>
       <label class="flow-policy-field">
         <span>Partition</span>
@@ -28,11 +31,13 @@
     </div>
     <div class="flow-policy-actions">
       <label class="flow-check-label" title="Required before the dashboard sends FLOW.RECLAIM.">
-        <input type="checkbox" name="confirm_reclaim" value="true">
+        <input type="checkbox" name="confirm_reclaim" value="true" required>
         I reviewed the expired leases and understand this changes lease ownership.
       </label>
       <button class="flow-search-button flow-danger-button" type="submit">Reclaim expired leases</button>
     </div>
-    <div class="flow-filter-note">Requires +FLOW.RECLAIM. This only reclaims expired running leases; terminal failed flows are retried or rewound from the detail page.</div>
+    <div id="flow-reclaim-scope-note" class="flow-filter-note<%= if filters.q, do: " c-yellow", else: "" %>">
+      <%= if filters.q do %>Search text narrows this evidence only. <% end %>Reclaim uses the Type and Partition above, up to Limit; a blank Partition applies across partitions. Terminal failed flows are retried or rewound from the detail page. Requires +FLOW.RECLAIM.
+    </div>
   </form>
 </div>

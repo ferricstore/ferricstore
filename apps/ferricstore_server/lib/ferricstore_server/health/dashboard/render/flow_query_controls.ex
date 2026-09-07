@@ -34,9 +34,13 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
         end
 
       _idle ->
-        render_flow_query_discovery_message(
-          "Enter a workflow type, then choose Show options to load its queryable states and metadata."
-        )
+        if discovery_suggestions?(discovery) do
+          render_ready_flow_query_discovery(discovery)
+        else
+          render_flow_query_discovery_message(
+            "Enter a workflow type, then choose Show options to load its queryable states and metadata."
+          )
+        end
     end
   end
 
@@ -48,6 +52,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
 
   def render_flow_query_discovery_datalists(discovery) when is_map(discovery) do
     types = Map.get(discovery, :available_types, [])
+    partitions = Map.get(discovery, :available_partitions, [])
     lifecycle_states = Map.get(discovery, :lifecycle_states, [])
     workflow_steps = Map.get(discovery, :workflow_steps, [])
     attributes = Map.get(discovery, :indexed_attributes, [])
@@ -62,6 +67,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
 
     """
     <datalist id="flow-query-type-options">#{render_datalist_options(types)}</datalist>
+    <datalist id="flow-query-partition-options">#{render_datalist_options(partitions)}</datalist>
     <datalist id="flow-query-lifecycle-state-options">#{render_datalist_options(lifecycle_states)}</datalist>
     <datalist id="flow-query-workflow-step-options">#{render_datalist_options(workflow_steps)}</datalist>
     <datalist id="flow-query-attribute-options">#{render_datalist_options(attributes)}</datalist>
@@ -89,16 +95,29 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
     """
   end
 
-  def render_flow_query_type_field(%{type: type} = filters) do
+  def render_flow_query_type_field(filters), do: render_flow_query_type_field(filters, %{})
+
+  def render_flow_query_type_field(%{type: type} = filters, discovery) do
     kinds = ~w(list search stats terminals failures stuck)
     hidden = flow_query_hidden_attr(filters, kinds)
     disabled = flow_query_disabled_attr(filters, kinds)
     required = flow_query_required_attr(filters, kinds)
 
+    available_types = Map.get(discovery, :available_types, [])
+
+    placeholder =
+      case available_types do
+        [first | _] when is_binary(first) and first != "" ->
+          "e.g. #{first} (or select from list)"
+
+        _ ->
+          "e.g. order_fulfillment (or select from list)"
+      end
+
     """
     <label class="flow-query-field" data-flow-query-field="type" data-flow-query-kinds="#{flow_query_kinds_attr(kinds)}"#{hidden}>
       Workflow Type
-      <input class="flow-search-input mono" name="type" value="#{escape_attr(type || "")}" placeholder="email" list="flow-query-type-options" autocomplete="off" data-flow-query-required-kinds="#{flow_query_kinds_attr(kinds)}"#{required}#{disabled}>
+      <input class="flow-search-input mono" name="type" value="#{escape_attr(type || "")}" placeholder="#{escape_attr(placeholder)}" list="flow-query-type-options" autocomplete="off" data-flow-query-required-kinds="#{flow_query_kinds_attr(kinds)}"#{required}#{disabled}>
       <span class="flow-field-help">Workflow type filters records; Partition is the data ACL scope. With a partition, Show options suggests observed types.</span>
     </label>
     """
@@ -117,12 +136,12 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
       Map.get(
         doc,
         :state_help,
-        "Leave empty to include all states. Terminal queries remain limited to terminal states."
+        "Leave empty to include all states. When a flow is running, Workflow step narrows its active logical step."
       )
 
     """
     <label class="flow-query-field" data-flow-query-field="state" data-flow-query-kinds="#{flow_query_kinds_attr(kinds)}"#{hidden}>
-      Lifecycle state
+      Flow state
       <input class="flow-search-input mono" name="state" value="#{escape_attr(state || "")}" placeholder="#{escape_attr(placeholder)}" list="flow-query-lifecycle-state-options" autocomplete="off" data-flow-query-state-input data-flow-query-required-kinds="#{flow_query_kinds_attr(required_kinds)}"#{required}#{disabled}>
       <span class="flow-field-help" data-flow-query-state-help>#{escape(help)}</span>
     </label>
@@ -170,6 +189,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
         <input class="flow-search-input mono" name="attribute_value" value="#{escape_attr(attribute_value)}" placeholder="acme" data-default-placeholder="acme" list="flow-query-attribute-value-options" autocomplete="off" data-flow-query-scalar-value#{value_disabled}>
       </div>
       <span class="flow-field-help">Typed scalar used only when attribute key is present.</span>
+      <span class="flow-field-error" data-flow-query-scalar-error role="status" hidden></span>
     </label>
     """
   end
@@ -206,6 +226,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
         <input class="flow-search-input mono" name="state_meta_value" value="#{escape_attr(value)}" placeholder="high" data-default-placeholder="high" list="flow-query-state-meta-value-options" autocomplete="off" data-flow-query-scalar-value#{value_disabled}>
       </div>
       <span class="flow-field-help">Typed scalar for the indexed metadata key.</span>
+      <span class="flow-field-error" data-flow-query-scalar-error role="status" hidden></span>
     </label>
     """
   end
@@ -237,8 +258,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
 
     """
     <label class="flow-query-field">
-      Partition
-      <input class="flow-search-input mono" name="partition_key" value="#{escape_attr(partition_key || "")}" placeholder="#{escape_attr(placeholder)}" data-flow-query-partition-input data-flow-query-required-kinds="#{flow_query_kinds_attr(required_kinds)}"#{required}>
+      Partition Key
+      <input class="flow-search-input mono" name="partition_key" value="#{escape_attr(partition_key || "")}" placeholder="#{escape_attr(placeholder)}" list="flow-query-partition-options" autocomplete="off" data-flow-query-partition-input data-flow-query-required-kinds="#{flow_query_kinds_attr(required_kinds)}"#{required}>
       <span class="flow-field-help" data-flow-query-partition-help>#{escape(help)}</span>
     </label>
     """
@@ -273,6 +294,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
       <input class="flow-search-input mono flow-filter-time" type="datetime-local" name="to" step="60" value="#{escape_attr(flow_filter_time_value(filters.to_ms))}" title="Optional end time for index queries"#{disabled}>
       <span class="flow-field-help">Optional upper bound for indexed query time.</span>
     </label>
+    <span class="flow-field-error" data-flow-query-time-error role="status" hidden></span>
     """
   end
 
@@ -296,11 +318,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
     """
     <script>
     (() => {
-      const form = document.currentScript.closest(".flow-policy-panel")?.querySelector("[data-flow-query-form]");
+      const form = document.currentScript.closest("[data-flow-query-workbench]")?.querySelector("[data-flow-query-form]");
       if (!form) return;
       const docs = #{docs_json};
       const select = form.querySelector("[data-flow-query-kind]");
-      const help = form.closest(".flow-policy-panel")?.querySelector("[data-flow-query-help]");
+      const help = form.closest("[data-flow-query-workbench]")?.querySelector("[data-flow-query-help]");
       const idLabel = form.querySelector("[data-flow-query-id-label]");
       const idInput = form.querySelector("[data-flow-query-id-input]");
       const idHelp = form.querySelector("[data-flow-query-id-help]");
@@ -309,6 +331,16 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
       const partitionInput = form.querySelector("[data-flow-query-partition-input]");
       const partitionHelp = form.querySelector("[data-flow-query-partition-help]");
       const scalarGroups = Array.from(form.querySelectorAll("[data-flow-query-scalar-group]"));
+      const fromTime = form.elements.namedItem("from");
+      const toTime = form.elements.namedItem("to");
+      const timeError = form.querySelector("[data-flow-query-time-error]");
+      const validateTimeBounds = () => {
+        if (!fromTime || !toTime) return;
+        const reversed = !fromTime.disabled && !toTime.disabled && fromTime.value && toTime.value && fromTime.value > toTime.value;
+        const message = reversed ? "End UTC must be at or after start UTC." : "";
+        toTime.setCustomValidity(message);
+        if (timeError) { timeError.textContent = message; timeError.hidden = !message; }
+      };
       const setText = (selector, value) => {
         const node = help && help.querySelector(selector);
         if (node) node.textContent = value || "";
@@ -323,6 +355,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
         input.disabled = group.hidden || !acceptsValue;
         input.required = !group.hidden && acceptsValue && Boolean(key?.value);
         input.placeholder = acceptsValue ? (input.dataset.defaultPlaceholder || input.placeholder) : "No value";
+        const value = input.value.trim();
+        let message = "";
+        if (!input.disabled && key?.value && value) {
+          if (type.value === "boolean" && !/^(true|false)$/i.test(value)) message = "Enter true or false.";
+          if (type.value === "integer" && !/^[+-]?[0-9]+$/.test(value)) message = "Enter a whole number.";
+          if (type.value === "float" && (!/^[+-]?(?:[0-9]+(?:[.][0-9]*)?|[.][0-9]+)(?:[eE][+-]?[0-9]+)?$/.test(value) || !Number.isFinite(Number(value)))) message = "Enter a finite number.";
+        }
+        input.setCustomValidity(message);
+        input.setAttribute("aria-invalid", message ? "true" : "false");
+        const error = group.querySelector("[data-flow-query-scalar-error]");
+        if (error) { error.textContent = message; error.hidden = !message; }
       };
       const update = () => {
         const kind = select?.value || "list";
@@ -346,7 +389,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
         if (idHelp) idHelp.textContent = doc.id_help || "Required id for this query.";
         if (stateInput) stateInput.placeholder = doc.state_placeholder || "all states";
         if (stateHelp) {
-          stateHelp.textContent = doc.state_help || "Leave empty to include all states. Terminal queries remain limited to terminal states.";
+          stateHelp.textContent = doc.state_help || "Leave empty to include all states. When a flow is running, Workflow step narrows its active logical step.";
         }
         if (partitionInput) {
           partitionInput.placeholder = doc.partition_placeholder || "required";
@@ -355,14 +398,29 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
           partitionHelp.textContent = doc.partition_help || "Required query, routing, and data ACL scope.";
         }
         scalarGroups.forEach(updateScalarGroup);
+        validateTimeBounds();
       };
       select?.addEventListener("change", update);
       scalarGroups.forEach((group) => {
         group.querySelector("[data-flow-query-scalar-type]")?.addEventListener("change", () => updateScalarGroup(group));
         const key = form.elements.namedItem(group.dataset.flowQueryScalarKey || "");
         key?.addEventListener("input", () => updateScalarGroup(group));
+        group.querySelector("[data-flow-query-scalar-value]")?.addEventListener("input", () => updateScalarGroup(group));
       });
+      fromTime?.addEventListener("input", validateTimeBounds);
+      toTime?.addEventListener("input", validateTimeBounds);
       update();
+
+      form.querySelectorAll("[data-flow-query-fill]").forEach((choice) => {
+        choice.addEventListener("click", () => {
+          const input = form.elements.namedItem(choice.dataset.flowQueryFill || "");
+          if (input) {
+            input.value = choice.dataset.flowQueryValue || "";
+            input.dispatchEvent(new Event("input", {bubbles: true}));
+            input.focus();
+          }
+        });
+      });
     })();
     </script>
     """
@@ -374,7 +432,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
     """
     <script>
     (() => {
-      const panel = document.currentScript.closest(".flow-policy-panel");
+      const panel = document.currentScript.closest("[data-flow-query-workbench]");
       if (!panel) return;
       const tabs = Array.from(panel.querySelectorAll("[data-flow-query-mode-tab]"));
       const modes = panel.querySelectorAll("[data-flow-query-mode]");
@@ -408,6 +466,43 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
           event.preventDefault();
           activate(tabs[nextIndex].dataset.flowQueryModeTab);
           tabs[nextIndex].focus();
+        });
+      });
+
+      const copyStatus = panel.querySelector("[data-flow-query-copy-status]");
+      const setCopyStatus = (message) => {
+        if (copyStatus) copyStatus.textContent = message || "";
+      };
+      const fallbackCopy = (text) => {
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.setAttribute("readonly", "readonly");
+        textarea.style.position = "fixed";
+        textarea.style.left = "-9999px";
+        document.body.appendChild(textarea);
+        textarea.select();
+        try {
+          document.execCommand("copy");
+          setCopyStatus("Copied");
+        } catch (_error) {
+          setCopyStatus("Copy failed");
+        } finally {
+          document.body.removeChild(textarea);
+        }
+      };
+      panel.querySelectorAll("[data-flow-query-copy-field]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const form = button.closest("form");
+          const field = form?.elements.namedItem(button.dataset.flowQueryCopyField || "");
+          const text = field?.value || "";
+          setCopyStatus("");
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text)
+              .then(() => setCopyStatus("Copied"))
+              .catch(() => fallbackCopy(text));
+          } else {
+            fallbackCopy(text);
+          }
         });
       });
       activate("#{active}");
@@ -452,7 +547,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
     type = Map.get(discovery, :type) || ""
 
     lifecycle_states =
-      render_discovery_values(Map.get(discovery, :lifecycle_states, []), "No states found")
+      render_discovery_values(
+        Map.get(discovery, :lifecycle_states, []),
+        "No states found",
+        "state"
+      )
 
     lifecycle_states =
       if Map.get(discovery, :lifecycle_states_truncated?, false),
@@ -462,7 +561,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
         else: lifecycle_states
 
     workflow_steps =
-      render_discovery_values(Map.get(discovery, :workflow_steps, []), "None configured")
+      render_discovery_values(
+        Map.get(discovery, :workflow_steps, []),
+        "None configured",
+        "run_state"
+      )
 
     workflow_steps =
       if Map.get(discovery, :workflow_steps_truncated?, false),
@@ -472,7 +575,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
     attributes =
       render_discovery_values(
         Map.get(discovery, :indexed_attributes, []),
-        "None configured"
+        "None configured",
+        "attribute_key"
       )
 
     attribute_values =
@@ -500,23 +604,38 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
         render_discovery_named_group(
           "Observed workflow types",
           Map.get(discovery, :available_types, []),
-          Map.get(discovery, :types_truncated?, false)
+          Map.get(discovery, :types_truncated?, false),
+          "type"
         )
       else
         ""
       end
+
+    partition_values =
+      render_discovery_named_group(
+        "Observed partitions",
+        Map.get(discovery, :available_partitions, []),
+        false,
+        "partition_key"
+      )
 
     title =
       if type == "",
         do: "Observed query options",
         else: "Query fields for <code>#{escape(type)}</code>"
 
+    open = if Map.get(discovery, :status) == :ready, do: " open", else: ""
+
     """
-    <div class="flow-query-discovery" data-flow-query-discovery>
-      <div class="flow-query-discovery-title">#{title}</div>
+    <details class="flow-query-discovery"#{open} data-flow-query-discovery>
+      <summary class="flow-query-discovery-summary">
+        <span class="flow-query-discovery-title">#{title}</span>
+        <span class="flow-query-discovery-hint">Observed values and indexed fields</span>
+      </summary>
       <div class="flow-query-discovery-groups">
         #{type_values}
-        <div><span>Lifecycle states</span><div>#{lifecycle_states}</div></div>
+        #{partition_values}
+        <div><span>Flow states</span><div>#{lifecycle_states}</div></div>
         <div><span>Workflow steps</span><div>#{workflow_steps}</div></div>
         <div><span>Indexed attributes</span><div>#{attributes}</div></div>
         <div><span>Indexed state metadata</span><div>#{state_meta}</div></div>
@@ -524,7 +643,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
         #{state_meta_values}
         #{restricted}
       </div>
-    </div>
+    </details>
     """
   end
 
@@ -536,18 +655,22 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
     """
   end
 
-  defp render_discovery_values(values, empty_message) when is_list(values) do
+  defp render_discovery_values(values, empty_message, target) when is_list(values) do
     case Enum.filter(values, &(is_binary(&1) and &1 != "")) do
       [] ->
         ~s(<span class="flow-query-discovery-empty">#{escape(empty_message)}</span>)
 
       names ->
-        Enum.map_join(names, "", fn name -> ~s(<code>#{escape(name)}</code>) end)
+        Enum.map_join(names, "", &render_discovery_choice(&1, target))
     end
   end
 
-  defp render_discovery_values(_values, empty_message),
+  defp render_discovery_values(_values, empty_message, _target),
     do: ~s(<span class="flow-query-discovery-empty">#{escape(empty_message)}</span>)
+
+  defp render_discovery_choice(value, target) do
+    ~s(<button type="button" class="flow-query-discovery-choice" data-flow-query-fill="#{escape_attr(target)}" data-flow-query-value="#{escape_attr(value)}">#{escape(value)}</button>)
+  end
 
   defp render_datalist_options(values) when is_list(values) do
     values
@@ -579,10 +702,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
   defp scalar_datalist_value(value) when is_boolean(value), do: [to_string(value)]
   defp scalar_datalist_value(_invalid), do: []
 
-  defp render_discovery_named_group(_label, [], _truncated?), do: ""
+  defp render_discovery_named_group(_label, [], _truncated?, _target), do: ""
 
-  defp render_discovery_named_group(label, values, truncated?) do
-    rendered = render_discovery_values(values, "")
+  defp render_discovery_named_group(label, values, truncated?, target) do
+    rendered = render_discovery_values(values, "", target)
 
     rendered =
       if truncated?,
@@ -590,6 +713,15 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
         else: rendered
 
     ~s(<div><span>#{escape(label)}</span><div>#{rendered}</div></div>)
+  end
+
+  defp discovery_suggestions?(discovery) do
+    Enum.any?([:available_types, :available_partitions], fn key ->
+      case Map.get(discovery, key, []) do
+        [_first | _rest] -> true
+        _empty -> false
+      end
+    end)
   end
 
   defp render_discovery_value_group(_label, []), do: ""
@@ -671,16 +803,16 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
 
   def flow_query_kind_options do
     [
-      {"list", "FLOW.QUERY: list"},
-      {"search", "FLOW.QUERY: metadata"},
-      {"stats", "FLOW.STATS"},
-      {"terminals", "FLOW.QUERY: terminals"},
-      {"failures", "FLOW.QUERY: failures"},
-      {"stuck", "FLOW.QUERY: expired leases"},
-      {"history", "FLOW.HISTORY"},
-      {"by_parent", "FLOW.QUERY: parent"},
-      {"by_root", "FLOW.QUERY: root"},
-      {"by_correlation", "FLOW.QUERY: correlation"}
+      {"list", "List workflow runs"},
+      {"search", "Search indexed metadata"},
+      {"stats", "Count workflow runs"},
+      {"terminals", "Find terminal workflows"},
+      {"failures", "Find failed workflows"},
+      {"stuck", "Find expired leases"},
+      {"history", "Inspect workflow history"},
+      {"by_parent", "Find direct children"},
+      {"by_root", "Find root lineage"},
+      {"by_correlation", "Find correlated workflows"}
     ]
   end
 
@@ -717,13 +849,13 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
         command: "FLOW.QUERY",
         purpose: "List terminal workflows for a type.",
         detail:
-          "Use this to audit completed, failed, or cancelled workflow retention and terminal distribution."
+          "Audit completed, failed, or cancelled workflow retention and terminal distribution within one partition."
       },
       "failures" => %{
         command: "FLOW.QUERY",
         purpose: "List failed workflows for a type.",
         detail:
-          "Use this to inspect failure pressure before retrying, rewinding, or running retention cleanup."
+          "Inspect failure pressure before retrying, rewinding, or running retention cleanup."
       },
       "stuck" => %{
         command: "FLOW.QUERY",
@@ -843,6 +975,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
   def flow_signals_filter_query(filters) when is_map(filters) do
     []
     |> maybe_put_query_param("type", Map.get(filters, :type))
+    |> maybe_put_query_param("partition_key", Map.get(filters, :partition_key))
     |> maybe_put_query_param("signal", Map.get(filters, :signal))
     |> maybe_put_query_param("q", Map.get(filters, :q))
     |> maybe_put_query_param("scan", if(Map.get(filters, :scan_history), do: "true", else: nil))

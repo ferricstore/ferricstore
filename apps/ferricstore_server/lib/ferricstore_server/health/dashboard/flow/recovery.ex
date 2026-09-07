@@ -140,6 +140,26 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
 
   def apply_form(_params), do: {:error, "ERR recovery form must be a map"}
 
+  @spec redirect_location(map(), {:ok, map()} | {:error, binary()}) :: binary()
+  def redirect_location(params, result) when is_map(params) do
+    scope = recovery_return_scope(params)
+
+    result_params =
+      case result do
+        {:ok, result} ->
+          %{
+            "status" => "reclaimed",
+            "type" => Map.get(result, :type, Map.get(params, "type", "")),
+            "count" => Map.get(result, :reclaimed, 0)
+          }
+
+        {:error, reason} ->
+          %{"status" => "error", "message" => reason}
+      end
+
+    "/dashboard/flow/failures?" <> URI.encode_query(Map.merge(scope, result_params))
+  end
+
   @spec flow_failures_filters_from_opts(keyword()) :: map()
   defp flow_failures_filters_from_opts(opts) when is_list(opts) do
     %{
@@ -158,7 +178,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
         %{
           kind: :ok,
           message:
-            "Reclaimed #{PolicyRetention.query_integer(params, "count")} expired lease(s) for #{Map.get(params, "type", "Flow")}"
+            "Reclaimed #{PolicyRetention.query_integer(params, "count")} expired lease(s) for #{Map.get(params, "type", "Flow")}. Evidence may update shortly while query projections catch up."
         }
 
       "error" ->
@@ -347,4 +367,33 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
         end
     end
   end
+
+  defp recovery_return_scope(params) do
+    %{}
+    |> maybe_put_return_param(
+      "type",
+      normalize_flow_type_filter(Map.get(params, "type"))
+    )
+    |> maybe_put_return_param(
+      "partition_key",
+      normalize_flow_partition_query(Map.get(params, "partition_key"))
+    )
+    |> maybe_put_return_param("q", normalize_flow_name_filter(Map.get(params, "return_q")))
+    |> maybe_put_return_limit(Map.get(params, "return_limit"))
+    |> maybe_put_return_exact(Map.get(params, "return_exact"))
+  end
+
+  defp maybe_put_return_limit(scope, value) do
+    case value |> to_string() |> String.trim() |> Integer.parse() do
+      {limit, ""} when limit >= 1 and limit <= 200 -> Map.put(scope, "limit", limit)
+      _other -> scope
+    end
+  end
+
+  defp maybe_put_return_exact(scope, value) do
+    if normalize_flow_boolean_filter(value), do: Map.put(scope, "exact", "true"), else: scope
+  end
+
+  defp maybe_put_return_param(scope, _key, value) when value in [nil, ""], do: scope
+  defp maybe_put_return_param(scope, key, value), do: Map.put(scope, key, value)
 end

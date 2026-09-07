@@ -7,12 +7,15 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
     memory = data.memory
     conns = data.connections
     cluster = data.cluster
+    subsystem_status = dashboard_subsystem_status(Map.get(data, :subsystem_health, %{}))
 
     # Status dot color
     {dot_class, status_text} =
       cond do
         overview.status != :ok -> {"dot-red", "degraded"}
+        subsystem_status in [:degraded, :unavailable] -> {"dot-red", "degraded"}
         memory.pressure_level == :reject -> {"dot-red", "rejecting"}
+        subsystem_status == :warning -> {"dot-yellow", "warning"}
         memory.pressure_level == :pressure -> {"dot-yellow", "pressure"}
         memory.pressure_level == :warning -> {"dot-yellow", "warning"}
         true -> {"dot-green", "healthy"}
@@ -88,10 +91,202 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
     """
   end
 
+  def render_operator_attention(data) do
+    items = operator_attention_items(data)
+
+    body =
+      case items do
+        [] ->
+          """
+          <div class="operator-attention-clear">
+            <span class="status-dot dot-green" aria-hidden="true"></span>
+            <span>No active warnings in the bounded operational snapshot.</span>
+          </div>
+          """
+
+        _ ->
+          Enum.map_join(items, "\n", &render_operator_attention_item/1)
+      end
+
+    """
+    <section class="operator-attention" aria-labelledby="operator-attention-title">
+      <div class="section-title" id="operator-attention-title">Operator Attention <span class="badge badge-idle">#{length(items)}</span></div>
+      <div class="operator-attention-list">#{body}</div>
+    </section>
+    """
+  end
+
+  defp operator_attention_items(data) do
+    []
+    |> add_policy_migration_attention(Map.get(data, :subsystem_health, %{}))
+    |> add_shard_attention(Map.get(data, :shards, []))
+    |> add_memory_attention(Map.get(data, :memory, %{}))
+    |> add_flow_attention(Map.get(data, :flow_summary, %{}))
+    |> Enum.reverse()
+  end
+
+  defp add_policy_migration_attention(items, subsystem_health) do
+    policy = Map.get(subsystem_health, :policy_migration, %{})
+    status = Map.get(policy, :status, :healthy)
+    issues = Map.get(policy, :issues, [])
+
+    cond do
+      status in [:healthy, :disabled] ->
+        items
+
+      issues == [] ->
+        [
+          %{
+            severity: if(status == :warning, do: :warning, else: :degraded),
+            title: "Policy migration health unavailable",
+            detail: "The policy migration worker has not published a current health snapshot.",
+            href: "/dashboard/flow/policies",
+            action: "Inspect policies"
+          }
+          | items
+        ]
+
+      true ->
+        Enum.reduce(issues, items, fn issue, acc ->
+          reason = Map.get(issue, :reason)
+
+          title =
+            if reason == :policy_catalog_state_projection_pending do
+              "Policy migration waiting on its state projection"
+            else
+              "Policy migration reported #{format_health_reason(reason)}"
+            end
+
+          detail =
+            "Shard #{Map.get(issue, :shard, "-")} · #{format_number(Map.get(issue, :occurrences, 1))} occurrence(s)"
+
+          [
+            %{
+              severity: Map.get(issue, :severity, status),
+              title: title,
+              detail: detail,
+              href: "/dashboard/flow/policies",
+              action: "Inspect policies"
+            }
+            | acc
+          ]
+        end)
+    end
+  end
+
+  defp add_shard_attention(items, shards) do
+    Enum.reduce(shards, items, fn shard, acc ->
+      if Map.get(shard, :status) == "ok" do
+        acc
+      else
+        [
+          %{
+            severity: :degraded,
+            title: "Shard #{Map.get(shard, :index, "-")} is unavailable",
+            detail: "The shard process is not reporting an operational state.",
+            href: "/dashboard/raft",
+            action: "Inspect consensus"
+          }
+          | acc
+        ]
+      end
+    end)
+  end
+
+  defp add_memory_attention(items, memory) do
+    case Map.get(memory, :pressure_level, :normal) do
+      level when level in [:warning, :pressure, :reject] ->
+        [
+          %{
+            severity: if(level == :warning, do: :warning, else: :degraded),
+            title: "Memory guard is #{level}",
+            detail: "Admission or writes may be constrained until memory pressure falls.",
+            href: "/dashboard",
+            action: "Inspect memory"
+          }
+          | items
+        ]
+
+      _ ->
+        items
+    end
+  end
+
+  defp add_flow_attention(items, summary) do
+    items =
+      case Map.get(summary, :failed, 0) do
+        count when is_integer(count) and count > 0 ->
+          [
+            %{
+              severity: :warning,
+              title: "#{format_number(count)} sampled failed workflows",
+              detail: "Bounded sample; open Failures for focused triage.",
+              href: "/dashboard/flow/failures",
+              action: "Inspect failures"
+            }
+            | items
+          ]
+
+        _ ->
+          items
+      end
+
+    case Map.get(summary, :expired_leases_sampled, 0) do
+      count when is_integer(count) and count > 0 ->
+        noun = if count == 1, do: "lease", else: "leases"
+
+        [
+          %{
+            severity: :warning,
+            title: "#{format_number(count)} sampled expired #{noun}",
+            detail: "Expired running work may be eligible for guarded reclaim.",
+            href: "/dashboard/flow/failures",
+            action: "Inspect recovery"
+          }
+          | items
+        ]
+
+      _ ->
+        items
+    end
+  end
+
+  defp render_operator_attention_item(item) do
+    severity = if item.severity == :degraded, do: "degraded", else: "warning"
+
+    """
+    <article class="operator-attention-item operator-attention-#{severity}">
+      <div>
+        <strong>#{escape(item.title)}</strong>
+        <span>#{escape(item.detail)}</span>
+      </div>
+      <a href="#{item.href}">#{escape(item.action)}</a>
+    </article>
+    """
+  end
+
+  defp dashboard_subsystem_status(subsystem_health) do
+    subsystem_health
+    |> Map.values()
+    |> Enum.map(&Map.get(&1, :status, :healthy))
+    |> Enum.reduce(:healthy, fn
+      status, _acc when status in [:degraded, :unavailable] -> :degraded
+      :warning, :healthy -> :warning
+      _status, acc -> acc
+    end)
+  end
+
+  defp format_health_reason(reason) when is_atom(reason),
+    do: reason |> Atom.to_string() |> String.replace("_", " ")
+
+  defp format_health_reason(reason) when is_binary(reason), do: reason
+  defp format_health_reason(_reason), do: "an operational error"
+
   def render_cache_performance(data) do
     has_samples = hotcold_has_samples?(data)
     hit_color = if has_samples, do: hit_rate_color(data.hit_ratio), else: "#8b949e"
     hit_value = if has_samples, do: "#{data.hit_ratio}%", else: "No read samples"
+    hit_class = if has_samples, do: "", else: " hit-rate-empty"
 
     # RAM bar color -- always green (fast path)
     # Disk bar color -- orange (slow path)
@@ -102,7 +297,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
     <div class="section-title">Cache Performance</div>
     <div class="cache-hero">
       <div class="hit-rate-card">
-        <div class="hit-rate-num" style="color:#{hit_color};">#{escape(hit_value)}</div>
+        <div class="hit-rate-num#{hit_class}" style="color:#{hit_color};">#{escape(hit_value)}</div>
         <div class="hit-rate-label">Hit Rate #{sampled_tag(data.sample_rate)}</div>
         <div class="hit-rate-sub">
           <span>#{format_rate(data.hits_per_sec)}</span> hits/sec #{sampled_tag(data.sample_rate)} &middot;

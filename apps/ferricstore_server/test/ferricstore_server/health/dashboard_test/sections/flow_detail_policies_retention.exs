@@ -233,13 +233,34 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
                 head_status: "blocked by active flow",
                 blocked_by_id: "dashboard-flow-fifo-detail",
                 blocked_by_worker: "detail-worker",
-                lease_expires_at_ms: 60_000
+                lease_expires_at_ms: 60_000,
+                coverage: :sampled,
+                order_known: true,
+                members_omitted: 0,
+                members: [
+                  %{
+                    id: "dashboard-flow-fifo-detail",
+                    state_enter_seq: 1,
+                    status: :leased,
+                    worker: "detail-worker",
+                    lease_expires_at_ms: 60_000,
+                    run_at_ms: 1_000
+                  },
+                  %{
+                    id: "dashboard-flow-fifo-next",
+                    state_enter_seq: 2,
+                    status: :due,
+                    worker: nil,
+                    lease_expires_at_ms: nil,
+                    run_at_ms: 1_000
+                  }
+                ]
               }
             })
 
           assert String.contains?(html, "State mode")
           assert String.contains?(html, "FIFO")
-          assert String.contains?(html, "Logical State")
+          assert String.contains?(html, "Logical state")
           assert String.contains?(html, "blocked by active flow")
           assert String.contains?(html, "dashboard-flow-fifo-next")
           assert String.contains?(html, "detail-worker")

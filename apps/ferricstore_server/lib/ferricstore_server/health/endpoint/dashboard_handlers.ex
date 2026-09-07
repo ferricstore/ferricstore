@@ -334,6 +334,15 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
     end
   end
 
+  def handle_flow_schedule_error(socket, transport, params, reason) do
+    body =
+      params
+      |> Dashboard.Flow.Schedules.create_error_page(reason)
+      |> Dashboard.render_flow_schedules_page()
+
+    Response.send_html_response(socket, transport, 422, "Unprocessable Content", body)
+  end
+
   def handle_keyspace_page(socket, transport, peer, headers, query) do
     case Auth.observability_authorized?(peer, headers) do
       false ->

@@ -7,7 +7,7 @@
 <%= render_subpage_header("Flow Lineage") %>
 <div class="content">
 <%= render_page_intro("Flow Lineage", "Trace workflow relationships by parent, root, or correlation id for debugging fanout and dependency chains.") %>
-<%= render_flow_subnav("lineage") %>
+<%= render_flow_context_tools(data, "flow_lineage") %>
 <%= render_flow_lineage_controls(data) %>
 <%= render_flow_lineage_summary(data) %>
 <%= render_flow_lineage_graph(data) %>

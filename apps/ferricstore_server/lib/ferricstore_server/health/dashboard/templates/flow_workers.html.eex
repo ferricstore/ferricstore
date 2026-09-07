@@ -7,7 +7,7 @@
 <%= render_subpage_header("Flow Workers") %>
 <div class="content">
 <%= render_page_intro("Flow Workers", "Track worker leases, running jobs, lease age, and stalled worker pressure.") %>
-<%= render_flow_subnav("workers") %>
+<%= render_flow_context_tools(data, "flow_workers") %>
 <%= render_live_component("flow_workers_chart", render_flow_workers_chart(data.workers)) %>
 <%= render_live_component("flow_workers", render_flow_workers(data.workers)) %>
 <%= render_live_component("flow_fifo_lanes", render_flow_fifo_lanes(Map.get(data, :fifo_lanes, []), data.total_sampled, data.sample_limit)) %>

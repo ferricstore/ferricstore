@@ -39,7 +39,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
       end
 
     """
-    <div class="section-title">Sample Preview <span class="badge badge-idle">sampled #{format_number(Map.get(data, :total_sampled, 0))} / #{format_number(Map.get(data, :sample_limit, @flow_dashboard_sample_limit))}</span></div>
+    <div class="section-title">Sample Preview <span class="badge badge-idle">#{sampled_scan_label(Map.get(data, :total_sampled, 0), Map.get(data, :sample_limit, @flow_dashboard_sample_limit))}</span></div>
     <div class="flow-card-grid">
       #{render_flow_stat_card("Active Timeouts", Map.get(data, :active_timeout_eligible_sampled, 0), "overdue active Flow records that cleanup will fail")}
       #{render_flow_stat_card("Terminal Deletes", Map.get(data, :terminal_eligible_sampled, 0), "expired terminal Flow records that cleanup will remove")}
@@ -151,7 +151,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
 
     """
     <div class="section-title">Sampled Active Timeouts <span class="badge badge-idle">#{format_number(length(candidates))}</span></div>
-    <table>
+    <div class="table-scroll" role="region" aria-label="Sampled active workflow timeouts" tabindex="0"><table>
       <thead>
         <tr>
           <th>Flow</th>
@@ -167,7 +167,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
       <tbody>
         #{rows}
       </tbody>
-    </table>
+    </table></div>
     """
   end
 
@@ -187,7 +187,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
 
     """
     <div class="section-title">Sampled Terminal Deletions <span class="badge badge-idle">#{format_number(length(candidates))}</span></div>
-    <table>
+    <div class="table-scroll" role="region" aria-label="Sampled terminal workflow deletions" tabindex="0"><table>
       <thead>
         <tr>
           <th>Flow</th>
@@ -203,7 +203,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
       <tbody>
         #{rows}
       </tbody>
-    </table>
+    </table></div>
     """
   end
 

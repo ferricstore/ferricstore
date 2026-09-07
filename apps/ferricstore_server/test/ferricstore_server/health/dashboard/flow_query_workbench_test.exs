@@ -429,6 +429,14 @@ defmodule FerricstoreServer.Health.Dashboard.FlowQueryWorkbenchTest do
     assert html =~ ~s(name="action" value="run")
     assert html =~ ~s(name="action" value="explain")
     assert html =~ ~s(name="action" value="analyze")
+    assert html =~ ~s(data-flow-query-copy-field="fql")
+    assert html =~ ~s(data-flow-query-copy-field="params_json")
+    assert html =~ ~s(data-flow-query-copy-status)
+    assert html =~ "Copy FQL"
+    assert html =~ "Copy params"
+    assert html =~ "navigator.clipboard.writeText"
+    assert html =~ ~S|document.execCommand("copy")|
+    refute html =~ "ferricstore_query_history"
     assert html =~ ~s(method="post")
     assert html =~ ~s(event.key === "ArrowRight")
     assert html =~ ~s(event.key === "ArrowLeft")
@@ -649,6 +657,14 @@ defmodule FerricstoreServer.Health.Dashboard.FlowQueryWorkbenchTest do
       Dashboard.collect_flow_query_workbench_page(prepared, form, acl_username: username)
 
     assert Enum.map(data.result.rows, & &1.id) == ["flow-visible"]
+
+    html =
+      FerricstoreServer.Health.Dashboard.Render.FlowQueryResults.render_flow_query_table(
+        data.result
+      )
+
+    assert html =~ "/dashboard/flow/flow-visible?partition_key=tenant-a"
+    refute html =~ "flow-wrong-partition"
   end
 
   test "keeps projected result columns readable in the mobile scroll container" do

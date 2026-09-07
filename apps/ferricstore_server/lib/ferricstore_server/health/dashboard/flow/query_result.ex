@@ -338,12 +338,31 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.QueryResult do
       |> Map.put(:columns, columns)
       |> Map.put(:column_selectors, selectors)
       |> Map.put(:source, request.source)
+      |> maybe_put(:routing_partition, routing_partition(request.predicate))
     else
       result
     end
   end
 
   defp decorate(result, _request), do: result
+
+  defp routing_partition({:and, predicates}) do
+    predicates
+    |> Enum.flat_map(fn
+      {:eq, :partition_key, {:literal, :keyword, value}} when is_binary(value) and value != "" ->
+        [value]
+
+      _ ->
+        []
+    end)
+    |> Enum.uniq()
+    |> case do
+      [partition] -> partition
+      _ -> nil
+    end
+  end
+
+  defp routing_partition(_predicate), do: nil
 
   defp projection_columns(%Request{source: :runs, projection: :all}) do
     selectors =

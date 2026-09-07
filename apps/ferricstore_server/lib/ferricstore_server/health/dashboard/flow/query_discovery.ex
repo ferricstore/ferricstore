@@ -122,6 +122,49 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.QueryDiscovery do
 
   def finish(_pending, _filters, _result), do: empty_discovery(nil, @common_states, [])
 
+  @doc false
+  @spec merge_sample_records(discovery(), [map()]) :: discovery()
+  def merge_sample_records(discovery, records)
+      when is_map(discovery) and is_list(records) do
+    observed_types = observed_types(records)
+    observed_partitions = observed_partitions(records)
+    observed_states = observed_field_values(%{rows: records}, nil, :state)
+    observed_steps = observed_field_values(%{rows: records}, nil, :run_state)
+
+    types = fallback_values(Map.get(discovery, :available_types, []), observed_types)
+
+    partitions =
+      fallback_values(Map.get(discovery, :available_partitions, []), observed_partitions)
+
+    lifecycle_states =
+      merge_suggestions(Map.get(discovery, :lifecycle_states, []), observed_states)
+
+    workflow_steps =
+      merge_suggestions(Map.get(discovery, :workflow_steps, []), observed_steps)
+
+    discovery
+    |> Map.put(:available_types, Enum.take(types, @max_type_suggestions))
+    |> Map.put(:available_partitions, Enum.take(partitions, @max_type_suggestions))
+    |> Map.put(
+      :types_truncated?,
+      Map.get(discovery, :types_truncated?, false) or length(types) > @max_type_suggestions
+    )
+    |> Map.put(:lifecycle_states, Enum.take(lifecycle_states, @max_state_suggestions))
+    |> Map.put(
+      :lifecycle_states_truncated?,
+      Map.get(discovery, :lifecycle_states_truncated?, false) or
+        length(lifecycle_states) > @max_state_suggestions
+    )
+    |> Map.put(:workflow_steps, Enum.take(workflow_steps, @max_state_suggestions))
+    |> Map.put(
+      :workflow_steps_truncated?,
+      Map.get(discovery, :workflow_steps_truncated?, false) or
+        length(workflow_steps) > @max_state_suggestions
+    )
+  end
+
+  def merge_sample_records(discovery, _records) when is_map(discovery), do: discovery
+
   defp start_policy_discovery(base, filters) do
     caller = self()
     reply_ref = make_ref()
@@ -202,13 +245,22 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.QueryDiscovery do
     end
   end
 
+  @global_type_discovery_query "FROM runs WHERE updated_at_ms >= 0 ORDER BY updated_at_ms DESC LIMIT 65 RETURN RECORDS (type, partition_key)"
+
   defp load_type_discovery(base, filters) do
-    partition_key = Map.fetch!(filters, :partition_key)
+    partition_key = normalized_name(Map.get(filters, :partition_key))
+
+    {query, params} =
+      if is_binary(partition_key) and partition_key != "" do
+        {@type_discovery_query, %{"partition" => partition_key}}
+      else
+        {@global_type_discovery_query, %{}}
+      end
 
     result =
       Calls.bounded_dashboard_call(
         fn ->
-          Calls.flow_dashboard_flow_query(@type_discovery_query, %{"partition" => partition_key})
+          Calls.flow_dashboard_flow_query(query, params)
         end,
         Calls.flow_dashboard_query_discovery_fetch_timeout_ms(),
         :query_discovery_types
@@ -216,12 +268,15 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.QueryDiscovery do
 
     case result do
       {:ok, {:ok, response}} ->
-        types = response |> response_rows() |> observed_types()
+        rows = response_rows(response)
+        types = observed_types(rows)
+        partitions = observed_partitions(rows)
 
         %{
           base
           | status: :ready,
             available_types: Enum.take(types, @max_type_suggestions),
+            available_partitions: Enum.take(partitions, @max_type_suggestions),
             types_truncated?: length(types) > @max_type_suggestions
         }
         |> Map.put(:scope, partition_key)
@@ -281,6 +336,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.QueryDiscovery do
       status: :idle,
       type: type,
       available_types: if(is_binary(type), do: [type], else: []),
+      available_partitions: [],
       types_truncated?: false,
       generation: nil,
       lifecycle_states: Enum.take(lifecycle_states, @max_state_suggestions),
@@ -324,7 +380,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.QueryDiscovery do
   end
 
   defp type_discovery_requested?(filters) do
-    Map.get(filters, :inspect) == true and is_binary(Map.get(filters, :partition_key))
+    Map.get(filters, :inspect) == true or Map.get(filters, :inspect) == "true"
   end
 
   defp load_value_discovery(discovery, %{inspect: true} = filters) do
@@ -453,6 +509,21 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.QueryDiscovery do
     |> normalized_names()
     |> Enum.sort()
   end
+
+  defp observed_partitions(rows) do
+    rows
+    |> Enum.map(fn
+      row when is_map(row) -> field(row, :partition_key)
+      _invalid -> nil
+    end)
+    |> normalized_names()
+    |> Enum.sort()
+  end
+
+  defp fallback_values([], observed), do: observed
+  defp fallback_values(existing, _observed), do: existing
+
+  defp merge_suggestions(existing, observed), do: Enum.uniq(existing ++ Enum.sort(observed))
 
   defp suggested_lifecycle_states(filters, observed_states) do
     @common_states

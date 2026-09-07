@@ -88,7 +88,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.DoctorPages do
     """
     <div class="section-title">Actions</div>
     <div class="flow-card-grid">
-      <form class="flow-card flow-card-wide" action="/dashboard/doctor" method="post">
+      <form class="flow-card flow-card-wide" action="/dashboard/doctor" method="post" data-dashboard-single-submit>
         <input type="hidden" name="action" value="start_check">
         <div class="flow-card-label">Start background check</div>
         <div class="flow-card-detail">Runs the selected doctor scope as a background job and keeps the result queryable by job id.</div>
@@ -101,12 +101,23 @@ defmodule FerricstoreServer.Health.Dashboard.Render.DoctorPages do
         </select>
         <button type="submit" class="flow-action-button">Start</button>
       </form>
-      <form class="flow-card flow-card-wide" action="/dashboard/doctor" method="post">
-        <input type="hidden" name="action" value="repair_flow_lmdb">
+      <div class="flow-card flow-card-wide">
         <div class="flow-card-label">Repair Flow projection</div>
         <div class="flow-card-detail">Starts FERRICSTORE.DOCTOR START REPAIR PROJECTIONS for the LMDB cold/query projection. Flow hot indexes stay on the normal apply path.</div>
-        <button type="submit" class="flow-action-button">Repair Flow LMDB</button>
-      </form>
+        <details class="flow-action-confirm">
+          <summary class="flow-action-button">Review repair</summary>
+          <div class="flow-action-confirm-panel">
+            <strong>Confirm projection reconciliation</strong>
+            <span>This starts one bounded background repair job. An existing repair for this instance will not be duplicated.</span>
+            <form action="/dashboard/doctor" method="post" data-dashboard-single-submit>
+              <input type="hidden" name="action" value="repair_flow_lmdb">
+              <input type="hidden" name="confirm_action" value="true">
+              <input type="hidden" name="expected_action" value="repair_flow_lmdb">
+              <button type="submit" class="flow-action-button">Confirm Repair Flow LMDB</button>
+            </form>
+          </div>
+        </details>
+      </div>
     </div>
     """
   end
@@ -122,11 +133,19 @@ defmodule FerricstoreServer.Health.Dashboard.Render.DoctorPages do
             cancel =
               if Map.get(job, "status") == "running" do
                 """
-                <form action="/dashboard/doctor" method="post" style="display:inline">
-                  <input type="hidden" name="action" value="cancel">
-                  <input type="hidden" name="job_id" value="#{escape_attr(Map.get(job, "job_id", ""))}">
-                  <button type="submit" class="flow-link-button">Cancel</button>
-                </form>
+                <details class="flow-action-confirm">
+                  <summary class="flow-link-button">Cancel</summary>
+                  <div class="flow-action-confirm-panel">
+                    <strong>Cancel running job</strong>
+                    <span class="mono">#{escape(Map.get(job, "job_id", ""))}</span>
+                    <form action="/dashboard/doctor" method="post" data-dashboard-single-submit>
+                      <input type="hidden" name="action" value="cancel">
+                      <input type="hidden" name="job_id" value="#{escape_attr(Map.get(job, "job_id", ""))}">
+                      <input type="hidden" name="expected_status" value="running">
+                      <button type="submit" class="flow-danger-button">Confirm cancel</button>
+                    </form>
+                  </div>
+                </details>
                 """
               else
                 ""

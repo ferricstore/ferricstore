@@ -2,7 +2,8 @@
 <% result = data.result %>
 <div class="section-title">Result <span class="badge badge-idle"><%= escape(flow_query_result_command(result)) %></span></div>
 <%= render_flow_query_status(result) %>
-<%= render_flow_query_metadata(result) %>
-<%= render_flow_query_visualization(result) %>
+<%= render_flow_query_provenance(data) %>
 <%= render_flow_query_table(result) %>
 <%= render_flow_query_continuation(result) %>
+<%= render_flow_query_metadata(result) %>
+<%= render_flow_query_visualization(result) %>

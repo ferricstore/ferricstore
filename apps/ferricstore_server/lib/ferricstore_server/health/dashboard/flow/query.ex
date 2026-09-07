@@ -3,6 +3,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
 
   alias Ferricstore.Commands.PreparedCommand
   alias Ferricstore.Flow.Attributes
+  alias Ferricstore.Flow.Internal
   alias Ferricstore.Flow.Query.{Builder, Field, Limits, Request}
   alias FerricstoreServer.Health.Dashboard.Access, as: DashboardAccess
 
@@ -40,7 +41,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   ]
   @flow_query_predicate_labels %{
     type: "Workflow type",
-    state: "Lifecycle state",
+    state: "Flow state",
     run_state: "Workflow step",
     attribute: "Attribute filters",
     state_meta: "State metadata",
@@ -125,7 +126,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
       )
       |> QueryVisualization.attach()
 
-    discovery = QueryDiscovery.finish(pending_discovery, filters, result)
+    discovery =
+      pending_discovery
+      |> QueryDiscovery.finish(filters, result)
+      |> maybe_populate_fallback_types_and_partitions(acl_username)
+
     result = maybe_put_inspection_discovery_message(result, filters.inspect, discovery)
 
     %{
@@ -364,7 +369,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
 
     records = collect_flow_records_sample_for_acl(@flow_dashboard_sample_limit, acl_username)
 
-    type_records = filter_flow_records_by_type(records, filters.type)
+    partition_records = filter_flow_records_by_partition(records, filters.partition_key)
+    type_records = filter_flow_records_by_type(partition_records, filters.type)
     filtered_records = filter_flow_records_by_name(type_records, filters.q)
 
     {signals, signal_scan} = collect_flow_signal_rows(filtered_records, filters)
@@ -387,6 +393,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
 
     []
     |> maybe_put_query_opt(:type, normalize_flow_type_filter(Map.get(params, "type")))
+    |> maybe_put_query_opt(
+      :partition_key,
+      normalize_flow_partition_query(Map.get(params, "partition_key"))
+    )
     |> maybe_put_query_opt(:signal, normalize_flow_name_filter(Map.get(params, "signal")))
     |> maybe_put_query_opt(:q, normalize_flow_name_filter(Map.get(params, "q")))
     |> maybe_put_query_opt(:limit, normalize_flow_limit_filter(Map.get(params, "limit")))
@@ -400,6 +410,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   def signals_page_filters(data) when is_map(data) do
     Map.get(data, :filters, %{
       type: nil,
+      partition_key: nil,
       signal: nil,
       q: nil,
       limit: @flow_dashboard_recent_limit,
@@ -492,15 +503,36 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
 
   defp flow_lineage_hints(records) do
     records
+    |> Enum.reject(&Internal.reserved_type?(flow_record_type(&1)))
     |> Enum.flat_map(fn record ->
+      partition_key = flow_record_partition_key(record)
+
       [
-        %{mode: "root", label: "root", id: flow_record_root_id(record)},
-        %{mode: "parent", label: "parent", id: flow_record_parent_id(record)},
-        %{mode: "correlation", label: "correlation", id: flow_record_correlation_id(record)}
+        %{
+          mode: "root",
+          label: "root",
+          id: flow_record_root_id(record),
+          partition_key: partition_key
+        },
+        %{
+          mode: "parent",
+          label: "parent",
+          id: flow_record_parent_id(record),
+          partition_key: partition_key
+        },
+        %{
+          mode: "correlation",
+          label: "correlation",
+          id: flow_record_correlation_id(record),
+          partition_key: partition_key
+        }
       ]
     end)
-    |> Enum.filter(&(is_binary(&1.id) and &1.id != ""))
-    |> Enum.uniq_by(fn hint -> {hint.mode, hint.id} end)
+    |> Enum.filter(fn hint ->
+      is_binary(hint.id) and hint.id != "" and is_binary(hint.partition_key) and
+        hint.partition_key != ""
+    end)
+    |> Enum.uniq_by(fn hint -> {hint.mode, hint.id, hint.partition_key} end)
     |> Enum.take(8)
   end
 
@@ -695,6 +727,17 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   end
 
   defp maybe_put_inspection_discovery_message(result, _inspect?, _discovery), do: result
+
+  defp maybe_populate_fallback_types_and_partitions(
+         %{available_types: types} = discovery,
+         acl_username
+       )
+       when types == [] or is_nil(types) do
+    records = collect_flow_records_sample_for_acl(400, acl_username)
+    QueryDiscovery.merge_sample_records(discovery, records)
+  end
+
+  defp maybe_populate_fallback_types_and_partitions(discovery, _acl_username), do: discovery
 
   defp normalize_flow_query_kind("terminals"), do: "terminals"
   defp normalize_flow_query_kind("search"), do: "search"
@@ -1145,6 +1188,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   defp flow_signals_filters_from_opts(opts) when is_list(opts) do
     %{
       type: normalize_flow_type_filter(Keyword.get(opts, :type)),
+      partition_key: normalize_flow_partition_query(Keyword.get(opts, :partition_key)),
       signal: normalize_flow_name_filter(Keyword.get(opts, :signal)),
       q: normalize_flow_name_filter(Keyword.get(opts, :q)),
       limit: normalize_flow_limit_filter(Keyword.get(opts, :limit)),

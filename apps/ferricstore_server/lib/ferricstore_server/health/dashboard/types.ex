@@ -17,7 +17,15 @@ defmodule FerricstoreServer.Health.Dashboard.Types do
           slowlog: [slowlog_entry()],
           merge: [merge_status()],
           namespace_config: [Ferricstore.NamespaceConfig.ns_entry()],
-          cluster: cluster_data()
+          cluster: cluster_data(),
+          subsystem_health: %{policy_migration: subsystem_health()}
+        }
+
+  @typedoc "A non-blocking operational snapshot published by a background subsystem."
+  @type subsystem_health :: %{
+          status: :healthy | :warning | :degraded | :unavailable | :disabled,
+          issues: [map()],
+          updated_at_ms: non_neg_integer() | nil
         }
 
   @typedoc "Overview section data."

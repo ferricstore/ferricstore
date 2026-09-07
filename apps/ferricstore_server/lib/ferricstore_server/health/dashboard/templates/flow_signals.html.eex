@@ -7,7 +7,7 @@
 <%= render_subpage_header("Flow Signals") %>
 <div class="content">
 <%= render_page_intro("Flow Signals", "Inspect recent FLOW.SIGNAL events and jump from a signal to its target workflow history.") %>
-<%= render_flow_subnav("signals") %>
+<%= render_flow_context_tools(data, "flow_signals") %>
 <%= render_flow_signals_filter(data) %>
 <%= render_live_component("flow_signals_table", render_flow_signals_table(data.signals, data.total_sampled, data.filtered_sampled, data.sample_limit, flow_signals_page_filters(data))) %>
 </div>

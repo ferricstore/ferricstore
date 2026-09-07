@@ -133,37 +133,29 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Projection do
 
     """
     <div class="section-title">Projection Health</div>
-    <div class="flow-card-grid">
-      <div class="flow-card">
-        <div class="flow-card-label">LMDB</div>
-        <div class="flow-card-value" style="font-size:1.2rem;">#{escape(to_string(data.lmdb_projection))}</div>
-        <div class="flow-card-detail">cold/query projection runs after durable Flow writes</div>
-      </div>
-      <div class="flow-card">
-        <div class="flow-card-label">Health</div>
-        <div class="flow-card-value #{health_class}" style="font-size:1.2rem;">#{escape(rollup.health)}</div>
-        <div class="flow-card-detail">#{format_number(rollup.shards)} shard projection row(s)</div>
-      </div>
-      <div class="flow-card">
-        <div class="flow-card-label">Lag</div>
-        <div class="flow-card-value" style="font-size:1.2rem;">#{format_number(rollup.lag)}</div>
-        <div class="flow-card-detail">requested index minus durable projected index</div>
-      </div>
-      <div class="flow-card">
-        <div class="flow-card-label">Pending</div>
-        <div class="flow-card-value" style="font-size:1.2rem;">#{format_number(rollup.pending_ops)}</div>
-        <div class="flow-card-detail">writer queue ops, oldest #{format_number(rollup.oldest_pending_age_us)}us</div>
-      </div>
-      <div class="flow-card">
-        <div class="flow-card-label">Failures</div>
-        <div class="flow-card-value #{if rollup.failures > 0, do: "c-red", else: "c-green"}" style="font-size:1.2rem;">#{format_number(rollup.failures)}</div>
-        <div class="flow-card-detail">enqueue, flush, persist, or degraded projection events</div>
-      </div>
-      <div class="flow-card">
-        <div class="flow-card-label">Flush Windows</div>
-        <div class="flow-card-value" style="font-size:1.2rem;">#{format_duration_ms(data.lmdb_flush_interval_ms)} / #{format_duration_ms(data.history_flush_interval_ms)}</div>
-        <div class="flow-card-detail">state and history projector batching</div>
-      </div>
+    <dl class="flow-projection-ledger" aria-label="Projection health metrics">
+      #{render_projection_metric("LMDB", to_string(data.lmdb_projection), "cold/query projection after durable Flow writes")}
+      #{render_projection_metric("Health", rollup.health, "#{format_number(rollup.shards)} shard projection row(s)", health_class)}
+      #{render_projection_metric("Lag", rollup.lag, "requested index minus durable projected index")}
+      #{render_projection_metric("Pending", rollup.pending_ops, "writer queue ops, oldest #{format_number(rollup.oldest_pending_age_us)}us")}
+      #{render_projection_metric("Failures", rollup.failures, "enqueue, flush, persist, or degraded projection events", if(rollup.failures > 0, do: "c-red", else: "c-green"))}
+      #{render_projection_metric("Flush Windows", "#{format_duration_ms(data.lmdb_flush_interval_ms)} / #{format_duration_ms(data.history_flush_interval_ms)}", "state and history projector batching")}
+    </dl>
+    """
+  end
+
+  defp render_projection_metric(label, value, detail, value_class \\ "") do
+    rendered_value =
+      case value do
+        value when is_integer(value) -> format_number(value)
+        value -> escape(to_string(value))
+      end
+
+    """
+    <div>
+      <dt>#{escape(label)}</dt>
+      <dd class="#{escape_attr(value_class)}">#{rendered_value}</dd>
+      <span>#{escape(detail)}</span>
     </div>
     """
   end

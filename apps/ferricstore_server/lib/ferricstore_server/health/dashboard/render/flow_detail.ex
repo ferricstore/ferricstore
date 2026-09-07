@@ -1,4 +1,6 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
+  alias FerricstoreServer.Health.Dashboard.ValuePreview
+
   import FerricstoreServer.Health.Dashboard.Format
 
   import FerricstoreServer.Health.Dashboard.FlowRecord,
@@ -67,39 +69,182 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
 
   def render_flow_detail(data) do
     record = data.record
-    state = flow_record_state(record)
     logical_state = flow_record_logical_state(record)
     state_mode = Map.get(data, :state_mode, :parallel)
 
     """
-    <div class="section-title">Flow Detail <span class="badge #{flow_state_badge_class(state)}">#{escape(state)}</span></div>
-    <div class="flow-detail-grid">
-      <div class="flow-card flow-card-wide">
-        <div class="flow-card-label">ID</div>
-        <div class="flow-card-value mono" style="font-size:1rem;">#{escape(flow_record_id(record))}</div>
-        <div class="flow-card-detail">type #{escape(flow_record_type(record))}</div>
-      </div>
-      <div class="flow-card">
-        <div class="flow-card-label">Why waiting</div>
-        <div class="flow-card-value" style="font-size:1rem;">#{escape(data.waiting_reason)}</div>
-        <div class="flow-card-detail">computed from current durable state</div>
-      </div>
-      <div class="flow-card">
-        <div class="flow-card-label">State mode</div>
-        <div class="flow-card-value #{flow_detail_mode_class(state_mode)}" style="font-size:1rem;">#{escape(flow_detail_mode_label(state_mode))}</div>
-        <div class="flow-card-detail">logical state #{escape(logical_state)}</div>
-      </div>
-      <div class="flow-card">
-        <div class="flow-card-label">Fencing</div>
-        <div class="flow-card-value">#{escape(to_string(flow_field(record, :fencing_token, "-")))}</div>
-        <div class="flow-card-detail">lease safety token</div>
-      </div>
-    </div>
-    #{render_flow_detail_table(record)}
+    #{render_flow_breadcrumb(record)}
+    #{render_flow_diagnostic_hero(data)}
+    <section id="workflow-summary" class="workflow-detail-section" aria-labelledby="workflow-summary-title">
+      <h2 class="sr-only" id="workflow-summary-title">Execution summary</h2>
+      <dl class="flow-execution-summary">
+        <div class="flow-execution-step"><dt>Logical state</dt><dd class="mono">#{escape(logical_state)}</dd></div>
+        <div><dt>State mode</dt><dd class="#{flow_detail_mode_class(state_mode)}">#{escape(flow_detail_mode_label(state_mode))}</dd></div>
+        <div><dt>Attempts</dt><dd>#{format_number(flow_record_attempts(record))}</dd></div>
+        <div><dt>Updated</dt><dd>#{format_timestamp_ms_or_dash(flow_record_updated_at_ms(record))}</dd></div>
+      </dl>
+    </section>
+    #{render_flow_detail_sections(record)}
+    """
+  end
+
+  def render_flow_detail_metadata(%{record: nil}), do: ""
+
+  def render_flow_detail_metadata(data) do
+    record = data.record
+
+    """
+    #{render_flow_runtime_table(record)}
+    #{render_flow_data_table(record)}
+    #{render_flow_relationships_table(record)}
     #{render_flow_detail_fifo_lane(data)}
     #{render_flow_detail_signals(data)}
-    #{render_flow_rewind_action(data)}
-    #{render_flow_signal_action(data)}
+    """
+  end
+
+  def render_flow_detail_sections(record \\ nil) do
+    """
+    <nav class="flow-detail-sections" aria-label="Workflow detail sections">
+      <a href="#workflow-timeline">Execution</a>
+      <a href="#workflow-data">Data</a>
+      <a href="#workflow-relationships">Relationships</a>
+      <a href="#workflow-actions">Actions</a>
+      #{FerricstoreServer.Health.Dashboard.Render.FlowNavigation.related_runs_link(record)}
+    </nav>
+    """
+  end
+
+  def render_flow_actions(data) do
+    """
+    <details class="flow-operations-panel">
+      <summary>
+        <span>Workflow Actions</span>
+        <span class="c-muted">Rewind or send an external signal</span>
+      </summary>
+      <div class="flow-operations-panel-body">
+        #{render_flow_rewind_action(data)}
+        #{render_flow_signal_action(data)}
+      </div>
+    </details>
+    """
+  end
+
+  def render_flow_breadcrumb(nil), do: ""
+
+  def render_flow_breadcrumb(record) do
+    id = flow_record_id(record)
+    type = flow_record_type(record)
+    partition_key = flow_record_partition_key(record) || "auto/global"
+    type_query = URI.encode_query(%{"type" => type, "partition_key" => partition_key})
+
+    """
+    <header class="flow-entity-header">
+      <div class="flow-breadcrumb">
+        <a href="/dashboard">Dashboard</a>
+        <span class="flow-breadcrumb-sep">/</span>
+        <a href="/dashboard/flow">Flows</a>
+        <span class="flow-breadcrumb-sep">/</span>
+        <span class="flow-entity-identity">
+          <a href="/dashboard/flow/states?#{escape_attr(type_query)}">#{escape(type)}</a>
+          <span class="flow-breadcrumb-sep">/</span>
+          <span class="flow-breadcrumb-current">#{escape(id)}</span>
+        </span>
+        <button type="button" class="copy-btn-inline" data-copy-text="#{escape_attr(id)}" aria-label="Copy workflow ID" title="Copy workflow ID">Copy ID</button>
+        <button type="button" class="copy-btn-inline flow-entity-scope" data-copy-text="#{escape_attr(partition_key)}" aria-label="Copy partition key" title="Copy partition key">#{escape(partition_key)}</button>
+      </div>
+    </header>
+    """
+  end
+
+  def render_flow_diagnostic_hero(%{record: nil}), do: ""
+
+  def render_flow_diagnostic_hero(data) do
+    record = data.record
+    state = flow_record_state(record)
+    waiting_reason = Map.get(data, :waiting_reason, "")
+    worker = flow_record_worker(record)
+    partition_key = flow_record_partition_key(record) || "auto/global"
+    now = System.system_time(:millisecond)
+    lease_expires = flow_record_lease_expires_at_ms(record)
+
+    {hero_class, indicator_class, status_title, detail_text} =
+      cond do
+        state == "running" and is_integer(lease_expires) and lease_expires < now ->
+          {"hero-blocked", "status-dot dot-red", "Lease Expired (Worker: #{worker || "unknown"})",
+           "Lease deadline passed #{format_duration_ms(now - lease_expires)} ago. Work is reclaimable."}
+
+        state == "running" ->
+          lease_remaining =
+            if is_integer(lease_expires) and lease_expires > now,
+              do: " · Lease expires in #{format_duration_ms(lease_expires - now)}",
+              else: ""
+
+          {"hero-running", "status-dot dot-green", "Leased to #{worker || "unknown worker"}",
+           "Durable state: running#{lease_remaining}."}
+
+        state == "failed" ->
+          attempts = flow_record_attempts(record)
+
+          {"hero-failed", "status-dot dot-red", "Terminal Failed",
+           "Execution stopped after #{attempts} attempt(s)."}
+
+        state == "completed" ->
+          {"hero-completed", "status-dot dot-green", "Completed",
+           "Workflow completed successfully. Final state is durable."}
+
+        state == "cancelled" ->
+          {"hero-idle", "status-dot", "Cancelled", "Workflow execution was explicitly cancelled."}
+
+        match?(
+          %{fifo_lane: %{head_status: status}}
+          when status in ["blocked by active flow", "blocked by expired lease"],
+          data
+        ) ->
+          head_id =
+            get_in(data, [:fifo_lane, :head_id]) ||
+              get_in(data, [:fifo_lane, :blocked_by_id]) || "head"
+
+          if get_in(data, [:fifo_lane, :head_status]) == "blocked by expired lease" do
+            {"hero-blocked", "status-dot dot-red", "FIFO head lease expired",
+             "Head: #{head_id} · Partition: #{partition_key}."}
+          else
+            {"hero-idle", "status-dot", "Waiting behind FIFO head",
+             "Head: #{head_id} · Partition: #{partition_key}."}
+          end
+
+        flow_scheduled_future?(record) ->
+          run_at = flow_record_run_at_ms(record)
+
+          duration =
+            if is_integer(run_at) and run_at > now,
+              do: "in #{format_duration_ms(run_at - now)}",
+              else: ""
+
+          {"hero-idle", "status-dot", "Scheduled (#{duration})",
+           "Durable timer waiting for scheduled execution at #{format_timestamp_ms_or_dash(run_at)}."}
+
+        flow_due_now?(record) ->
+          {"hero-idle", "status-dot", "Ready for worker claim",
+           "Scheduled time reached · Logical state: #{flow_record_logical_state(record)}."}
+
+        true ->
+          {"hero-idle", "status-dot", "Active · #{waiting_reason}",
+           "State: #{state} · Partition: #{partition_key} · Logical: #{flow_record_logical_state(record)}."}
+      end
+
+    """
+    <div class="flow-diagnostic-hero #{hero_class}" role="region" aria-label="Flow Execution Status">
+      <div class="flow-hero-main">
+        <span class="flow-status-indicator #{indicator_class}" aria-hidden="true"></span>
+        <div class="flow-hero-info">
+          <div class="flow-hero-title">
+            <span>#{escape(status_title)}</span>
+            <span class="badge #{flow_state_badge_class(state)}">#{escape(state)}</span>
+          </div>
+          <div class="flow-hero-subtitle">#{escape(detail_text)}</div>
+        </div>
+      </div>
+    </div>
     """
   end
 
@@ -125,25 +270,53 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
   def render_flow_detail_signals(_data), do: ""
 
   def render_flow_detail_table(record) do
+    render_flow_runtime_table(record) <>
+      render_flow_data_table(record) <>
+      render_flow_relationships_table(record)
+  end
+
+  defp render_flow_runtime_table(record) do
     fields = [
-      {"Type", flow_record_type(record)},
-      {"State", flow_record_state(record)},
-      {"Logical State", flow_record_logical_state(record)},
-      {"Partition", flow_record_partition_key(record) || "auto/global"},
-      {"Worker", flow_record_worker(record) || "-"},
       {"Priority", flow_field(record, :priority, 0)},
       {"Attempts", flow_field(record, :attempts, flow_field(record, :attempt, 0))},
+      {"Fencing token", flow_field(record, :fencing_token, "-")},
       {"Run At", format_timestamp_ms_or_dash(flow_record_run_at_ms(record))},
       {"Lease Expires", format_timestamp_ms_or_dash(flow_record_lease_expires_at_ms(record))},
-      {"Updated", format_timestamp_ms_or_dash(flow_record_updated_at_ms(record))},
-      {"Parent", flow_field(record, :parent_flow_id, "-")},
-      {"Root", flow_field(record, :root_flow_id, "-")},
-      {"Correlation", flow_field(record, :correlation_id, "-")},
+      {"Updated", format_timestamp_ms_or_dash(flow_record_updated_at_ms(record))}
+    ]
+
+    render_flow_detail_field_table(fields, "Workflow runtime", "Runtime")
+  end
+
+  defp render_flow_data_table(record) do
+    fields = [
       {"Attributes", {:safe, render_flow_attribute_badges(record)}},
       {"State Meta", {:safe, render_flow_state_meta_badges(record)}},
       {"Value Refs", {:safe, render_flow_value_ref_badges(record)}}
     ]
 
+    """
+    <section id="workflow-data" class="workflow-detail-section" aria-labelledby="workflow-data-title">
+      #{render_flow_detail_field_table(fields, "Workflow data", "Data", "workflow-data-title")}
+    </section>
+    """
+  end
+
+  defp render_flow_relationships_table(record) do
+    fields = [
+      {"Parent", flow_field(record, :parent_flow_id, "-")},
+      {"Root", flow_field(record, :root_flow_id, "-")},
+      {"Correlation", flow_field(record, :correlation_id, "-")}
+    ]
+
+    """
+    <section id="workflow-relationships" class="workflow-detail-section" aria-labelledby="workflow-relationships-title">
+      #{render_flow_detail_field_table(fields, "Workflow relationships", "Relationships", "workflow-relationships-title")}
+    </section>
+    """
+  end
+
+  defp render_flow_detail_field_table(fields, aria_label, title, title_id \\ nil) do
     rows =
       Enum.map_join(fields, "\n", fn {label, value} ->
         rendered =
@@ -163,12 +336,12 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
       end)
 
     """
-    <div class="section-title">Current State</div>
-    <table>
+    <div class="section-title"#{if title_id, do: ~s( id="#{escape_attr(title_id)}"), else: ""}>#{escape(title)}</div>
+    <div class="table-scroll" role="region" aria-label="#{escape_attr(aria_label)}" tabindex="0"><table>
       <tbody>
         #{rows}
       </tbody>
-    </table>
+    </table></div>
     """
   end
 
@@ -255,7 +428,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
     """
     <div class="flow-policy-panel">
       <div class="section-title">Rewind #{info_icon("Rewind creates a durable FLOW.REWIND command to move this flow back to a selected state from its own loaded history.")}</div>
-      <form class="flow-policy-form" action="#{escape_attr(action)}" method="post">
+      <form class="flow-policy-form" action="#{escape_attr(action)}" method="post" data-dashboard-single-submit>
         <input type="hidden" name="id" value="#{escape_attr(id)}">
         #{partition_input}
         <div class="flow-policy-grid">
@@ -296,7 +469,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
     """
     <div class="flow-policy-panel">
       <div class="section-title">Send Signal #{info_icon("External signal records a signal payload event and can optionally transition the flow state.")}</div>
-      <form class="flow-policy-form" action="#{escape_attr(action)}" method="post">
+      <form class="flow-policy-form" action="#{escape_attr(action)}" method="post" data-dashboard-single-submit>
         <input type="hidden" name="id" value="#{escape_attr(id)}">
         #{partition_input}
         <div class="flow-policy-grid">
@@ -367,13 +540,23 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
     rows =
       Enum.map_join(refs, "\n", fn entry ->
         anchor = flow_value_ref_anchor(entry.ref)
-        preview = flow_value_store_preview(status, values_by_ref, entry.ref)
+        value = Map.get(values_by_ref, entry.ref, :not_loaded)
+        ready = status == :ok and value not in [nil, :not_loaded]
+
+        preview =
+          if ready,
+            do: ValuePreview.render(value),
+            else: %{
+              value: flow_value_store_preview(status, values_by_ref, entry.ref),
+              truncated: false
+            }
+
         label = escape_attr(entry.label)
         ref = escape_attr(entry.ref)
 
         """
-        <div id="#{anchor}" class="flow-value-row" data-flow-value-ref="#{ref}" data-flow-value-label="#{label}">
-          <pre class="flow-value-preview" data-flow-value-preview>#{escape(preview)}</pre>
+        <div id="#{anchor}" class="flow-value-row" data-flow-value-ref="#{ref}" data-flow-value-label="#{label}" data-flow-value-state="#{if ready, do: "ready", else: "unavailable"}" data-flow-value-truncated="#{preview.truncated}">
+          <pre class="flow-value-preview" data-flow-value-preview>#{escape(preview.value)}</pre>
         </div>
         """
       end)
@@ -414,7 +597,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
 
   def render_flow_value_modal do
     """
-    <div id="flow-value-modal" class="flow-value-modal" hidden role="dialog" aria-modal="true" aria-labelledby="flow-value-modal-title">
+    <dialog id="flow-value-modal" class="flow-value-modal" hidden aria-labelledby="flow-value-modal-title">
       <div class="flow-value-modal-backdrop" data-flow-value-modal-close></div>
       <div class="flow-value-modal-panel">
         <div class="flow-value-modal-header">
@@ -424,13 +607,15 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
           </div>
           <button class="flow-value-modal-close" type="button" data-flow-value-modal-close title="Close value inspector">Close</button>
         </div>
-        <pre id="flow-value-modal-body" class="flow-value-modal-body"></pre>
+        <p id="flow-value-modal-status" class="c-muted" role="status" aria-live="polite"></p>
+        <pre id="flow-value-modal-body" class="flow-value-modal-body" hidden></pre>
         <div class="flow-value-modal-actions">
-          <button id="flow-value-modal-copy" class="flow-search-button" type="button" title="Copy the displayed value">Copy</button>
+          <button id="flow-value-modal-copy" class="flow-search-button" type="button" title="Copy the displayed value" disabled>Copy</button>
+          <button id="flow-value-modal-retry" class="flow-search-button" type="button" hidden>Retry</button>
           <span id="flow-value-modal-copy-status" class="c-muted"></span>
         </div>
       </div>
-    </div>
+    </dialog>
     """
   end
 
@@ -483,11 +668,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
     <div class="flow-card-grid">
       #{card_html}
     </div>
-    <table>
+    <div class="table-scroll" role="region" aria-label="Workflow value references" tabindex="0"><table>
       <tbody>
         #{rows}
       </tbody>
-    </table>
+    </table></div>
     """
   end
 

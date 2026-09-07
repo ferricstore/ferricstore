@@ -8,8 +8,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
   @flow_dashboard_history_default_count 50
   @flow_dashboard_history_max_count 250
   @flow_dashboard_keydir_select_batch 256
-  @flow_dashboard_keydir_scan_multiplier 64
+  @flow_dashboard_keydir_scan_multiplier 16
   @flow_dashboard_keydir_scan_floor 2_048
+  @flow_dashboard_keydir_global_scan_cap 10_000
 
   def collect_flow_summary, do: collect_summary()
   def collect_flow_records_sample(limit), do: collect_records_sample(limit)
@@ -25,6 +26,25 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
       &FerricstoreServer.Health.Dashboard.Access.flow_record_allowed_for_acl?(&1, username)
     )
   end
+
+  @doc false
+  def flow_sample_scan_plan(limit, shard_count)
+      when is_integer(limit) and limit > 0 and is_integer(shard_count) and shard_count > 0 do
+    budget =
+      limit
+      |> Kernel.*(@flow_dashboard_keydir_scan_multiplier)
+      |> max(@flow_dashboard_keydir_scan_floor)
+      |> min(@flow_dashboard_keydir_global_scan_cap)
+
+    per_shard = div(budget, shard_count)
+    remainder = rem(budget, shard_count)
+
+    for index <- 0..(shard_count - 1) do
+      per_shard + if(index < remainder, do: 1, else: 0)
+    end
+  end
+
+  def flow_sample_scan_plan(_limit, _shard_count), do: []
 
   def flow_type_summaries(records), do: type_summaries(records)
   def flow_available_types(records), do: available_types(records)
@@ -74,8 +94,12 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
       when is_integer(sc) and sc > 0 and is_tuple(keydir_refs) and tuple_size(keydir_refs) >= sc ->
         per_shard = max(1, div(limit + sc - 1, sc))
 
-        0..(sc - 1)
-        |> Enum.flat_map(&collect_records_from_keydir(ctx, &1, per_shard))
+        limit
+        |> flow_sample_scan_plan(sc)
+        |> Enum.with_index()
+        |> Enum.flat_map(fn {scan_limit, index} ->
+          collect_records_from_keydir(ctx, index, per_shard, scan_limit, fn _record -> true end)
+        end)
         |> Enum.take(limit)
 
       :error ->
@@ -93,21 +117,17 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
     case FerricStore.Instance.fetch(:default) do
       {:ok, %{shard_count: sc, keydir_refs: keydir_refs} = ctx}
       when is_integer(sc) and sc > 0 and is_tuple(keydir_refs) and tuple_size(keydir_refs) >= sc ->
-        per_shard_scan_limit =
-          max(
-            @flow_dashboard_keydir_scan_floor,
-            div(limit + sc - 1, sc) * @flow_dashboard_keydir_scan_multiplier
-          )
-
-        0..(sc - 1)
-        |> Enum.reduce_while([], fn index, records ->
+        limit
+        |> flow_sample_scan_plan(sc)
+        |> Enum.with_index()
+        |> Enum.reduce_while([], fn {scan_limit, index}, records ->
           remaining = limit - length(records)
 
           if remaining <= 0 do
             {:halt, records}
           else
             visible_records =
-              collect_records_from_keydir(ctx, index, remaining, per_shard_scan_limit, visible?)
+              collect_records_from_keydir(ctx, index, remaining, scan_limit, visible?)
 
             {:cont, records ++ visible_records}
           end
@@ -128,13 +148,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
     |> Enum.group_by(&flow_record_type/1)
     |> Enum.reject(fn {type, _records} -> type in [nil, ""] end)
     |> Enum.map(fn {type, type_records} ->
-      exact_info = safe_flow_info(type)
-      counts = flow_counts_for_type(type_records, exact_info)
-
-      counts
+      type_records
+      |> flow_counts_for_type()
       |> Map.put(:type, type)
       |> Map.put(:sampled, length(type_records))
-      |> Map.put(:exact, Map.get(counts, :count_source) == :exact)
+      |> Map.put(:exact, false)
     end)
     |> Enum.sort_by(fn type ->
       -(Map.get(type, :active, 0) + Map.get(type, :failed, 0) + Map.get(type, :queued, 0))
@@ -276,29 +294,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
     normalize_history_cursor(Map.get(params, "history_after"))
   end
 
-  def normalize_type_filter(type) when is_binary(type) do
-    type = String.trim(type)
-
-    case String.downcase(type) do
-      "" -> nil
-      "all" -> nil
-      _ -> type
-    end
-  end
-
-  def normalize_type_filter(_type), do: nil
-
-  def normalize_state_filter(state) when is_binary(state) do
-    state = String.trim(state)
-
-    case String.downcase(state) do
-      "" -> nil
-      "all" -> nil
-      _ -> state
-    end
-  end
-
-  def normalize_state_filter(_state), do: nil
+  def normalize_type_filter(type), do: normalize_name_filter(type)
+  def normalize_state_filter(state), do: normalize_name_filter(state)
 
   def normalize_name_filter(query) when is_binary(query) do
     query = String.trim(query)
@@ -431,28 +428,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
     end
   end
 
-  defp collect_records_from_keydir(ctx, index, per_shard) do
-    keydir = elem(ctx.keydir_refs, index)
-
-    try do
-      collect_records_from_keydir_select(
-        ctx,
-        keydir,
-        per_shard,
-        max(
-          @flow_dashboard_keydir_scan_floor,
-          per_shard * @flow_dashboard_keydir_scan_multiplier
-        ),
-        fn _record -> true end
-      )
-    rescue
-      ArgumentError -> []
-    catch
-      :exit, _ -> []
-    end
-  end
-
-  defp collect_records_from_keydir(ctx, index, wanted, scan_limit, visible?) do
+  defp collect_records_from_keydir(ctx, index, wanted, scan_limit, visible?)
+       when scan_limit > 0 do
     keydir = elem(ctx.keydir_refs, index)
 
     try do
@@ -464,10 +441,13 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
     end
   end
 
+  defp collect_records_from_keydir(_ctx, _index, _wanted, _scan_limit, _visible?), do: []
+
   defp collect_records_from_keydir_select(ctx, keydir, wanted, scan_limit, visible?) do
     match_spec = [{{:"$1", :_, :_, :_, :_, :_, :_}, [], [:"$1"]}]
+    batch_size = keydir_scan_batch_size(scan_limit)
 
-    case :ets.select(keydir, match_spec, @flow_dashboard_keydir_select_batch) do
+    case :ets.select(keydir, match_spec, batch_size) do
       :"$end_of_table" ->
         []
 
@@ -484,6 +464,16 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
           visible?
         )
     end
+  end
+
+  defp keydir_scan_batch_size(scan_limit) do
+    batch_count =
+      div(
+        scan_limit + @flow_dashboard_keydir_select_batch - 1,
+        @flow_dashboard_keydir_select_batch
+      )
+
+    max(1, div(scan_limit, batch_count))
   end
 
   defp collect_records_from_keydir_continue(
@@ -577,48 +567,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
     :exit, _ -> nil
   end
 
-  defp safe_flow_info(type) do
-    case FerricStore.flow_info(type) do
-      {:ok, info} when is_map(info) -> info
-      _ -> nil
-    end
-  rescue
-    _ -> nil
-  catch
-    :exit, _ -> nil
-  end
-
-  defp flow_counts_for_type(records, info) when is_map(info) do
-    states = flow_state_counts(records)
-    sampled = flow_counts_for_type(records, nil)
-    queued = flow_count(info, :queued)
-    running = flow_count(info, :running)
-    completed = flow_count(info, :completed)
-    failed = flow_count(info, :failed)
-    cancelled = flow_count(info, :cancelled)
-    terminal = completed + failed + cancelled
-    total = queued + running + terminal
-
-    if total < sampled.total do
-      sampled
-    else
-      %{
-        total: total,
-        active: queued + running,
-        queued: queued,
-        running: running,
-        completed: completed,
-        failed: failed,
-        cancelled: cancelled,
-        terminal: terminal,
-        inflight: flow_count(info, :inflight),
-        states: states,
-        count_source: :exact
-      }
-    end
-  end
-
-  defp flow_counts_for_type(records, _info) do
+  defp flow_counts_for_type(records) do
     states = flow_state_counts(records)
     queued = Map.get(states, "queued", 0)
     running = Map.get(states, "running", 0)
@@ -641,13 +590,6 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
       states: states,
       count_source: :sampled
     }
-  end
-
-  defp flow_count(map, key) when is_map(map) do
-    case flow_field(map, key, 0) do
-      n when is_integer(n) and n >= 0 -> n
-      _ -> 0
-    end
   end
 
   defp flow_state_counts(records) do

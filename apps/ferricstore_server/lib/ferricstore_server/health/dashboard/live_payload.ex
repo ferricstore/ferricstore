@@ -6,6 +6,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   alias FerricstoreServer.Health.Dashboard.Flow.{Browse, Detail, Projection, Query}
   alias FerricstoreServer.Health.Endpoint.FlowPaths
   alias FerricstoreServer.Health.QueryDecoder
+  alias FerricstoreServer.Health.Dashboard.ValuePreview
 
   import FerricstoreServer.Health.Dashboard.Flow.Calls
 
@@ -286,6 +287,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
 
     live_component_payload(%{
       "flow_detail" => render_flow_detail(data),
+      "flow_detail_metadata" => render_flow_detail_metadata(data),
       "flow_debug" => render_flow_debug(data),
       "flow_history" =>
         render_flow_history_timeline(
@@ -337,7 +339,6 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
     params = QueryDecoder.decode(query)
     ref = params |> Map.get("ref", "") |> String.trim()
     flow_id = params |> Map.get("flow", "") |> String.trim()
-    partition_key = params |> Map.get("partition_key", "") |> String.trim()
 
     cond do
       ref == "" ->
@@ -348,11 +349,12 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
 
       true ->
         opts =
-          if partition_key == "",
-            do: [values: false],
-            else: [values: false, partition_key: partition_key]
+          query
+          |> Detail.opts_from_query()
+          |> Keyword.take([:partition_key, :history_count, :history_before, :history_after])
+          |> Keyword.put(:values, false)
+          |> Keyword.merge(DashboardAccess.flow_acl_opts(access_opts))
 
-        opts = Keyword.merge(opts, DashboardAccess.flow_acl_opts(access_opts))
         data = Detail.collect_page(flow_id, opts)
         visible_refs = flow_detail_value_refs(data.record, data.history) |> MapSet.new(& &1.ref)
 
@@ -379,14 +381,21 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
            timeout_ms,
            :value
          ) do
-      {:ok, {:ok, [value]}} ->
+      {:ok, {:ok, [nil]}} ->
         {:ok,
          %{
            generated_at_ms: System.system_time(:millisecond),
-           status: "ok",
-           ref: ref,
-           value: flow_value_preview(value)
+           status: "missing",
+           ref: ref
          }}
+
+      {:ok, {:ok, [value]}} ->
+        {:ok,
+         Map.merge(ValuePreview.render(value), %{
+           generated_at_ms: System.system_time(:millisecond),
+           status: "ok",
+           ref: ref
+         })}
 
       {:ok, {:ok, _values}} ->
         {:ok, live_flow_value_error(ref, "unexpected value result count")}
@@ -410,8 +419,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
       generated_at_ms: System.system_time(:millisecond),
       status: "error",
       ref: ref,
-      error: message,
-      value: message
+      error: message
     }
   end
 
@@ -471,6 +479,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
 
   defp render_overview_content(data) do
     """
+    #{render_operator_attention(data)}
     #{render_cache_performance(data.hotcold)}
     #{render_lifecycle(data.lifecycle)}
     #{render_shards(data.shards)}

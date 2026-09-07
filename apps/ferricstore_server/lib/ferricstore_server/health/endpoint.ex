@@ -574,10 +574,19 @@ defmodule FerricstoreServer.Health.Endpoint do
           :ok ->
             result = FerricstoreServer.Health.Dashboard.apply_flow_schedule_form(params)
 
-            location =
-              FerricstoreServer.Health.Dashboard.Flow.Schedules.redirect_location(params, result)
+            case {Map.get(params, "action"), result} do
+              {"create", {:error, reason}} ->
+                DashboardHandlers.handle_flow_schedule_error(socket, transport, params, reason)
 
-            send_redirect_response(socket, transport, location)
+              _other ->
+                location =
+                  FerricstoreServer.Health.Dashboard.Flow.Schedules.redirect_location(
+                    params,
+                    result
+                  )
+
+                send_redirect_response(socket, transport, location)
+            end
 
           {:redirect_login, location} ->
             send_redirect_response(socket, transport, location)
@@ -702,20 +711,10 @@ defmodule FerricstoreServer.Health.Endpoint do
                :html
              ) do
           :ok ->
-            location =
-              case FerricstoreServer.Health.Dashboard.apply_flow_failures_form(params) do
-                {:ok, result} ->
-                  "/dashboard/flow/failures?" <>
-                    URI.encode_query(%{
-                      "status" => "reclaimed",
-                      "type" => Map.get(result, :type, ""),
-                      "count" => Map.get(result, :reclaimed, 0)
-                    })
+            result = FerricstoreServer.Health.Dashboard.apply_flow_failures_form(params)
 
-                {:error, reason} ->
-                  "/dashboard/flow/failures?" <>
-                    URI.encode_query(%{"status" => "error", "message" => reason})
-              end
+            location =
+              FerricstoreServer.Health.Dashboard.flow_failures_redirect_location(params, result)
 
             send_redirect_response(socket, transport, location)
 
@@ -1282,7 +1281,7 @@ defmodule FerricstoreServer.Health.Endpoint do
 
       true ->
         {id, opts} = FlowPaths.decode_flow_detail_request(encoded_id)
-        opts = Auth.dashboard_flow_collect_opts(opts, peer, headers)
+        opts = Auth.dashboard_flow_collect_opts(Keyword.put(opts, :values, false), peer, headers)
         data = FerricstoreServer.Health.Dashboard.collect_flow_detail_page(id, opts)
         body = FerricstoreServer.Health.Dashboard.render_flow_detail_page(data)
         send_html_response(socket, transport, 200, "OK", body)

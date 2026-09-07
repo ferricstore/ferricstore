@@ -21,6 +21,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryPolicy do
   defdelegate render_flow_query_type_field(filters),
     to: FerricstoreServer.Health.Dashboard.Render.FlowQueryControls
 
+  defdelegate render_flow_query_type_field(filters, discovery),
+    to: FerricstoreServer.Health.Dashboard.Render.FlowQueryControls
+
   defdelegate render_flow_query_state_field(filters),
     to: FerricstoreServer.Health.Dashboard.Render.FlowQueryControls
 

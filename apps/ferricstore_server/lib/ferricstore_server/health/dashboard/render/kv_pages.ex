@@ -94,13 +94,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
   def render_keyspace_table(data) do
     rows = Map.get(data, :rows, [])
     sampled = Map.get(data, :total_sampled, length(rows))
+    searched? = Map.get(data, :searched?, true)
 
     body =
-      case rows do
-        [] ->
+      case {searched?, rows} do
+        {false, _rows} ->
+          ~s(<tr><td colspan="8" class="c-muted">Enter an exact key or prefix to inspect key metadata. Submit an empty search only when you intentionally want a bounded sample.</td></tr>)
+
+        {true, []} ->
           ~s(<tr><td colspan="8" class="c-muted">No key metadata matched this query.</td></tr>)
 
-        _ ->
+        {true, _rows} ->
           Enum.map_join(rows, "\n", fn row ->
             internal =
               if Map.get(row, :internal?, false) do
@@ -124,14 +128,20 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
           end)
       end
 
-    """
-    <div class="section-title">Key Metadata <span class="badge badge-idle">sampled #{format_number(sampled)}</span></div>
+    badge = if searched?, do: "sampled #{format_number(sampled)}", else: "awaiting query"
+
+    table = """
     <table>
       <thead>
         <tr><th>Logical Key</th><th>Type</th><th>Shard</th><th>Location</th><th>Size</th><th>TTL</th><th>LFU</th><th>Physical Key</th></tr>
       </thead>
       <tbody>#{body}</tbody>
     </table>
+    """
+
+    """
+    <div class="section-title">Key Metadata <span class="badge badge-idle">#{badge}</span></div>
+    #{accessible_table("Key metadata", table)}
     """
   end
 

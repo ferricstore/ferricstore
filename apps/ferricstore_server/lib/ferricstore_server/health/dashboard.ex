@@ -302,9 +302,11 @@ defmodule FerricstoreServer.Health.Dashboard do
         normalize_doctor_form_result(doctor_command(["START", "CHECK", "SCOPE", scope]))
 
       "repair_flow_lmdb" ->
-        normalize_doctor_form_result(
-          doctor_command(["START", "REPAIR", "PROJECTIONS", "SCOPE", "FLOW_LMDB"])
-        )
+        with :ok <- validate_doctor_repair_confirmation(params) do
+          normalize_doctor_form_result(
+            doctor_command(["START", "REPAIR", "PROJECTIONS", "SCOPE", "FLOW_LMDB"])
+          )
+        end
 
       "cancel" ->
         job_id = params |> Map.get("job_id", "") |> String.trim()
@@ -317,6 +319,19 @@ defmodule FerricstoreServer.Health.Dashboard do
 
       _ ->
         {:error, "unknown doctor action"}
+    end
+  end
+
+  defp validate_doctor_repair_confirmation(params) do
+    cond do
+      Map.get(params, "confirm_action") not in ["true", "on", "yes", "1"] ->
+        {:error, "repair confirmation is required"}
+
+      Map.get(params, "expected_action") != "repair_flow_lmdb" ->
+        {:error, "repair action changed; review it again"}
+
+      true ->
+        :ok
     end
   end
 
@@ -685,6 +700,11 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc "Runs the explicit recovery form on the Flow failures page."
   @spec apply_flow_failures_form(map()) :: {:ok, map()} | {:error, binary()}
   def apply_flow_failures_form(params), do: Recovery.apply_form(params)
+
+  @doc false
+  @spec flow_failures_redirect_location(map(), {:ok, map()} | {:error, binary()}) :: binary()
+  def flow_failures_redirect_location(params, result),
+    do: Recovery.redirect_location(params, result)
 
   @doc "Renders the Flow failures and recovery page."
   @spec render_flow_failures_page(map()) :: binary()

@@ -195,6 +195,7 @@ defmodule FerricstoreServer.Health.Dashboard.Templates do
 
   defp render_overview_content(data) do
     """
+    #{render_operator_attention(data)}
     #{render_cache_performance(data.hotcold)}
     #{render_lifecycle(data.lifecycle)}
     #{render_shards(data.shards)}

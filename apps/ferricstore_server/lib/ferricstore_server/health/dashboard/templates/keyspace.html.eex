@@ -5,8 +5,9 @@
   "limit" => Map.get(data.filters, :limit, 50),
   "include_internal" => if(Map.get(data.filters, :include_internal, false), do: "true", else: "")
 }) %>
+<% live_url = if Map.get(data, :searched?, false), do: "/dashboard/api/keyspace?" <> query, else: "/dashboard/api/keyspace" %>
 <%= page_head("Keyspace - FerricStore", 10) %>
-<body data-dashboard-live-page="keyspace" data-dashboard-live-url="/dashboard/api/keyspace?<%= query %>" data-dashboard-live-interval-ms="10000">
+<body data-dashboard-live-page="keyspace" data-dashboard-live-url="<%= live_url %>" data-dashboard-live-interval-ms="10000">
 <div class="layout">
 <%= render_sidebar_static("keyspace") %>
 <main class="main-content">

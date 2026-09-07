@@ -49,6 +49,29 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
             }
           }
 
+          function clearTransientQueryParams() {
+            var flash = document.querySelector("[data-dashboard-transient-query]");
+            if (!flash || !window.history || !window.history.replaceState) { return; }
+
+            var url = new URL(window.location.href);
+            var changed = false;
+            var names = (flash.dataset.dashboardTransientQuery || "").split(",");
+
+            for (var i = 0; i < names.length; i += 1) {
+              var name = names[i].trim();
+              if (name && url.searchParams.has(name)) {
+                url.searchParams.delete(name);
+                changed = true;
+              }
+            }
+
+            if (changed) {
+              var query = url.searchParams.toString();
+              var cleanUrl = url.pathname + (query ? "?" + query : "") + url.hash;
+              window.history.replaceState(window.history.state, "", cleanUrl);
+            }
+          }
+
           function findComponent(name) {
             var nodes = document.querySelectorAll("[data-live-component]");
             for (var i = 0; i < nodes.length; i += 1) {
@@ -63,21 +86,49 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
             var modal = document.getElementById("flow-value-modal");
             if (modal && !modal.hidden) { return true; }
 
+            var selection = window.getSelection && window.getSelection();
+            if (selection && !selection.isCollapsed) { return true; }
+
             var active = document.activeElement;
             if (!active || !active.closest) { return false; }
-            return !!active.closest("input, textarea, select, button, [data-dashboard-live-pause]");
+            return !!active.closest("input, textarea, select, [data-dashboard-live-pause], .table-scroll, .flow-journal-card");
           }
 
           function patchComponents(components) {
-            if (!components || dashboardInteractionPaused()) { return; }
+            if (!components || dashboardInteractionPaused()) { return false; }
             Object.keys(components).forEach(function (name) {
               var target = findComponent(name);
               var nextHtml = components[name];
               if (!target || typeof nextHtml !== "string") { return; }
               if (target.innerHTML !== nextHtml) {
+                var openNavGroups = [];
+                var openDisclosures = [];
+                target.querySelectorAll("details[data-dashboard-disclosure-key][open]").forEach(function (group) {
+                  openDisclosures.push(group.getAttribute("data-dashboard-disclosure-key"));
+                });
+                target.querySelectorAll("details[data-dashboard-nav-group][open]").forEach(function (group) {
+                  openNavGroups.push(group.getAttribute("data-dashboard-nav-group"));
+                });
                 target.innerHTML = nextHtml;
+                openDisclosures.forEach(function (key) {
+                  var group = target.querySelector('details[data-dashboard-disclosure-key="' + CSS.escape(key) + '"]');
+                  if (group) { group.open = true; }
+                });
+                openNavGroups.forEach(function (groupName) {
+                  var group = target.querySelector('details[data-dashboard-nav-group="' + CSS.escape(groupName) + '"]');
+                  if (group) { group.open = true; }
+                });
+                if (typeof applyJournalState === "function") {
+                  applyJournalState(target);
+                }
               }
             });
+            return true;
+          }
+
+          function decodeDashboardHash(value) {
+            try { return decodeURIComponent(value); }
+            catch (_error) { return ""; }
           }
 
           function setupFlowValueInspector() {
@@ -89,14 +140,54 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
             var bodyNode = document.getElementById("flow-value-modal-body");
             var copyButton = document.getElementById("flow-value-modal-copy");
             var copyStatus = document.getElementById("flow-value-modal-copy-status");
+            var statusNode = document.getElementById("flow-value-modal-status");
+            var retryButton = document.getElementById("flow-value-modal-retry");
+            var modalOpener = null;
+            var requestGeneration = 0;
+            var requestController = null;
+            var requestTimer = null;
+            var selection = null;
+
+            function cancelValueRequest() {
+              requestGeneration += 1;
+              if (requestController) { requestController.abort(); requestController = null; }
+              if (requestTimer) { window.clearTimeout(requestTimer); requestTimer = null; }
+            }
+
+            function setValueState(state, value, message, truncated) {
+              modal.dataset.state = state;
+              modal.setAttribute("aria-busy", state === "loading" ? "true" : "false");
+              if (bodyNode) { bodyNode.textContent = state === "ready" ? value : ""; bodyNode.hidden = state !== "ready"; }
+              if (statusNode) { statusNode.textContent = message || ""; statusNode.hidden = !message; }
+              if (copyButton) {
+                copyButton.disabled = state !== "ready";
+                copyButton.textContent = truncated ? "Copy preview" : "Copy";
+              }
+              if (retryButton) { retryButton.hidden = !selection || (state !== "missing" && state !== "error"); }
+              setCopyStatus("");
+            }
 
             function setCopyStatus(text) {
               if (copyStatus) { copyStatus.textContent = text || ""; }
             }
 
             function closeModal() {
+              cancelValueRequest();
+              selection = null;
+              modal.close();
               modal.hidden = true;
               setCopyStatus("");
+              if (modalOpener && modalOpener.isConnected) { modalOpener.focus(); }
+              modalOpener = null;
+            }
+
+            function showModal(link) {
+              if (!modal.open) {
+                modalOpener = link && typeof link.focus === "function" ? link : document.activeElement;
+                modal.hidden = false;
+                modal.showModal();
+              }
+              modal.querySelector("button[data-flow-value-modal-close]").focus();
             }
 
             function fallbackCopy(text) {
@@ -105,7 +196,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
               textarea.setAttribute("readonly", "readonly");
               textarea.style.position = "fixed";
               textarea.style.left = "-9999px";
-              document.body.appendChild(textarea);
+              modal.appendChild(textarea);
               textarea.select();
               try {
                 document.execCommand("copy");
@@ -113,16 +204,19 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
               } catch (_error) {
                 setCopyStatus("Copy failed");
               } finally {
-                document.body.removeChild(textarea);
+                textarea.remove();
+                if (!modal.hidden && copyButton) { copyButton.focus(); }
               }
             }
 
             function copyValue() {
+              if (modal.dataset.state !== "ready") { return; }
+              var generation = requestGeneration;
               var text = bodyNode ? bodyNode.textContent : "";
               if (navigator.clipboard && navigator.clipboard.writeText) {
                 navigator.clipboard.writeText(text)
-                  .then(function () { setCopyStatus("Copied"); })
-                  .catch(function () { fallbackCopy(text); });
+                  .then(function () { if (generation === requestGeneration && modal.open) { setCopyStatus("Copied"); } })
+                  .catch(function () { if (generation === requestGeneration && modal.open) { fallbackCopy(text); } });
               } else {
                 fallbackCopy(text);
               }
@@ -132,13 +226,16 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
               var preview = row ? row.querySelector("[data-flow-value-preview]") : null;
               var ref = link.getAttribute("data-flow-value-ref") || (row && row.getAttribute("data-flow-value-ref")) || link.getAttribute("title") || "";
               var label = link.getAttribute("data-flow-value-label") || (row && row.getAttribute("data-flow-value-label")) || link.textContent || "value";
-              var value = preview ? preview.textContent : "Value is not loaded on this page.";
+              if (!preview || row.getAttribute("data-flow-value-state") !== "ready") {
+                return openFromRef(ref, label, link);
+              }
 
+              cancelValueRequest();
+              selection = null;
               if (refNode) { refNode.textContent = label + " · " + ref; }
-              if (bodyNode) { bodyNode.textContent = value; }
-              setCopyStatus("");
-              modal.hidden = false;
-              if (copyButton) { copyButton.focus(); }
+              var truncated = row.getAttribute("data-flow-value-truncated") === "true";
+              setValueState("ready", preview.textContent, truncated ? "Preview truncated to 8 KiB." : "", truncated);
+              showModal(link);
               return true;
             }
 
@@ -190,10 +287,17 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
               params.set("ref", ref);
 
               var partition = sourceUrl.searchParams.get("partition_key");
-              if (!partition) {
+              if (!partition && sourceUrl.pathname === window.location.pathname) {
                 partition = new URLSearchParams(window.location.search).get("partition_key");
               }
               if (partition) { params.set("partition_key", partition); }
+              ["history_count", "history_before", "history_after"].forEach(function (key) {
+                var value = sourceUrl.searchParams.get(key);
+                if (!value && sourceUrl.pathname === window.location.pathname) {
+                  value = new URLSearchParams(window.location.search).get(key);
+                }
+                if (value) { params.set(key, value); }
+              });
 
               return "/dashboard/api/flow/value?" + params.toString();
             }
@@ -202,28 +306,56 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
               var url = flowValueRequestUrl(ref, link);
               if (!ref || !url) { return false; }
 
+              cancelValueRequest();
+              var generation = requestGeneration;
+              var controller = new AbortController();
+              requestController = controller;
+              selection = { ref: ref, label: label, link: link };
               if (refNode) { refNode.textContent = (label || "value") + " · " + ref; }
-              if (bodyNode) { bodyNode.textContent = "Loading value..."; }
-              setCopyStatus("");
-              modal.hidden = false;
-              if (copyButton) { copyButton.focus(); }
+              setValueState("loading", "", "Loading value...");
+              showModal(link);
+              requestTimer = window.setTimeout(function () {
+                if (generation !== requestGeneration || !modal.open) { return; }
+                cancelValueRequest();
+                setValueState("error", "", "Value request timed out. Retry to load it again.");
+              }, 15000);
 
               fetch(url, {
                 cache: "no-store",
+                signal: controller.signal,
                 headers: { "accept": "application/json" }
               })
                 .then(function (response) {
-                  if (!response.ok) { throw new Error("value request failed"); }
+                  if (generation !== requestGeneration || !modal.open) { return null; }
+                  if (response.status === 401) {
+                    var next = new URL(window.location.href);
+                    var anchor = link && flowValueAnchorFromHref(link);
+                    if (anchor) { next.hash = anchor; }
+                    window.location.assign("/dashboard/login?next=" + encodeURIComponent(next.pathname + next.search + next.hash));
+                    return null;
+                  }
+                  if (!response.ok) { throw new Error("Value request failed. Retry to load it again."); }
                   return response.json();
                 })
                 .then(function (payload) {
-                  if (!payload || payload.status !== "ok") {
-                    throw new Error((payload && payload.error) || "value unavailable");
+                  if (generation !== requestGeneration || !modal.open || !payload) { return; }
+                  if (payload.status === "missing") {
+                    setValueState("missing", "", "No stored value is available for this reference.");
+                  } else if (payload.status === "ok" && typeof payload.value === "string") {
+                    setValueState("ready", payload.value, payload.truncated ? "Preview truncated to 8 KiB." : (payload.value === "" ? "Empty value." : ""), payload.truncated);
+                  } else {
+                    throw new Error(payload.error || "Value unavailable. Retry to load it again.");
                   }
-                  if (bodyNode) { bodyNode.textContent = payload.value || ""; }
                 })
                 .catch(function (error) {
-                  if (bodyNode) { bodyNode.textContent = error.message || "Value unavailable."; }
+                  if (generation !== requestGeneration || !modal.open || error.name === "AbortError") { return; }
+                  setValueState("error", "", error.message || "Value unavailable. Retry to load it again.");
+                })
+                .finally(function () {
+                  if (generation !== requestGeneration) { return; }
+                  window.clearTimeout(requestTimer);
+                  requestTimer = null;
+                  requestController = null;
                 });
 
               return true;
@@ -255,7 +387,8 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
               var hash = window.location.hash || "";
               if (hash.length < 2) { return; }
 
-              var anchor = decodeURIComponent(hash.slice(1));
+              var anchor = decodeDashboardHash(hash.slice(1));
+              if (!anchor) { return; }
               var row = document.getElementById(anchor);
               var link = findValueLinkForAnchor(anchor);
 
@@ -299,10 +432,31 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
               }
             });
 
-            document.addEventListener("keydown", function (event) {
-              if (event.key === "Escape" && !modal.hidden) {
+            modal.addEventListener("cancel", function (event) {
+              event.preventDefault();
+              closeModal();
+            });
+
+            if (retryButton) {
+              retryButton.addEventListener("click", function () {
+                if (selection && modal.dataset.state !== "loading") {
+                  openFromRef(selection.ref, selection.label, selection.link);
+                }
+              });
+            }
+
+            modal.addEventListener("keydown", function (event) {
+              if (event.key !== "Tab") { return; }
+              var controls = Array.from(modal.querySelectorAll("button:not([disabled]), [href], [tabindex='0']"))
+                .filter(function (node) { return node.getClientRects().length > 0; });
+              var first = controls[0];
+              var last = controls[controls.length - 1];
+              if (event.shiftKey && document.activeElement === first) {
                 event.preventDefault();
-                closeModal();
+                last.focus();
+              } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
               }
             });
 
@@ -314,8 +468,215 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
             openFromHash();
           }
 
+          var activeJournalMode = (function () {
+            try {
+              var mode = localStorage.getItem("ferricstore_journal_mode");
+              return mode === "table" ? "table" : "tree";
+            } catch (_e) { return "tree"; }
+          })();
+          var activeSelectedStepId = null;
+
+          function selectJournalStepFromHash() {
+            var anchor = decodeDashboardHash((window.location.hash || "").slice(1));
+            var target = document.getElementById(anchor);
+            if (target) {
+              var parent = target.parentElement;
+              while (parent) {
+                if (parent.tagName === "DETAILS") { parent.open = true; }
+                parent = parent.parentElement;
+              }
+              if (target.tagName === "DETAILS") { target.open = true; }
+            }
+            if (anchor.indexOf("journal-flow-event-") !== 0) { return; }
+
+            var step = document.getElementById(anchor);
+            if (!step || !step.classList.contains("journal-step")) { return; }
+
+            activeJournalMode = "tree";
+            activeSelectedStepId = step.getAttribute("data-flow-event-id");
+            applyJournalState(document);
+          }
+
+          function applyJournalState(container) {
+            var root = container || document;
+            var cards = root.matches && root.matches(".flow-journal-card") ? [root] : root.querySelectorAll(".flow-journal-card");
+            cards.forEach(function (card) {
+              var buttons = card.querySelectorAll("[data-journal-view-toggle]");
+              buttons.forEach(function (btn) {
+                var match = btn.getAttribute("data-journal-view-toggle") === activeJournalMode;
+                btn.classList.toggle("active", match);
+                btn.setAttribute("aria-selected", match ? "true" : "false");
+                btn.tabIndex = match ? 0 : -1;
+              });
+
+              var views = card.querySelectorAll("[data-journal-view]");
+              views.forEach(function (view) {
+                var match = view.getAttribute("data-journal-view") === activeJournalMode;
+                view.hidden = !match;
+              });
+
+              var steps = card.querySelectorAll(".journal-step");
+              var hasSelectedStep = false;
+              steps.forEach(function (step) {
+                var isSelected = step.getAttribute("data-flow-event-id") === activeSelectedStepId;
+                hasSelectedStep = hasSelectedStep || isSelected;
+                var trigger = step.querySelector(".journal-step-trigger");
+                var inspector = trigger && document.getElementById(trigger.getAttribute("aria-controls"));
+                step.classList.toggle("is-selected", isSelected);
+                if (trigger) { trigger.setAttribute("aria-expanded", isSelected ? "true" : "false"); }
+                if (inspector) { inspector.hidden = !isSelected; }
+              });
+              var workspace = card.querySelector(".flow-journal-workspace");
+              var inspectorPanel = card.querySelector(".flow-journal-inspector");
+              if (workspace) { workspace.classList.toggle("has-selected-event", hasSelectedStep); }
+              if (inspectorPanel) { inspectorPanel.hidden = !hasSelectedStep; }
+            });
+          }
+
+          function toggleJournalStep(step) {
+            var eventId = step && step.getAttribute("data-flow-event-id");
+            if (!eventId) { return; }
+            activeSelectedStepId = activeSelectedStepId === eventId ? null : eventId;
+            applyJournalState(document);
+          }
+
+          function setupFlowJournalInteractions() {
+            window.addEventListener("hashchange", selectJournalStepFromHash);
+
+            document.addEventListener("click", function (event) {
+              var eventLink = event.target.closest('a[href^="#journal-flow-event-"]');
+              if (eventLink) {
+                var linkedStep = document.getElementById(decodeDashboardHash(eventLink.getAttribute("href").slice(1)));
+                if (linkedStep) {
+                  activeJournalMode = "tree";
+                  activeSelectedStepId = linkedStep.getAttribute("data-flow-event-id");
+                  applyJournalState(document);
+                }
+              }
+              var toggleBtn = event.target.closest("[data-journal-view-toggle]");
+              if (toggleBtn) {
+                event.preventDefault();
+                activeJournalMode = toggleBtn.getAttribute("data-journal-view-toggle") || "tree";
+                try { localStorage.setItem("ferricstore_journal_mode", activeJournalMode); } catch (_e) {}
+                applyJournalState(document);
+                return;
+              }
+
+              var trigger = event.target.closest(".journal-step-trigger");
+              if (trigger) {
+                toggleJournalStep(trigger.closest(".journal-step"));
+              }
+            });
+
+            document.addEventListener("keydown", function (event) {
+              var tab = event.target.closest("[data-journal-view-toggle]");
+              if (tab && ["ArrowRight", "ArrowDown", "ArrowLeft", "ArrowUp", "Home", "End"].indexOf(event.key) >= 0) {
+                var tabs = Array.from(tab.closest("[role=tablist]").querySelectorAll("[data-journal-view-toggle]"));
+                var index = tabs.indexOf(tab);
+                var backwards = event.key === "ArrowLeft" || event.key === "ArrowUp";
+                var next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (index + (backwards ? -1 : 1) + tabs.length) % tabs.length;
+                event.preventDefault();
+                tabs[next].click();
+                tabs[next].focus();
+                return;
+              }
+              var trigger = event.target.closest(".journal-step-trigger");
+              if (!trigger) { return; }
+
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                toggleJournalStep(trigger.closest(".journal-step"));
+              } else if (event.key === "Escape" && activeSelectedStepId) {
+                event.preventDefault();
+                activeSelectedStepId = null;
+                applyJournalState(document);
+                trigger.focus();
+              }
+            });
+          }
+
+          function setupGlobalShortcutsAndCopy() {
+            document.addEventListener("click", function (event) {
+              var copyBtn = event.target.closest(".copy-btn-inline");
+              if (copyBtn) {
+                event.preventDefault();
+                var text = copyBtn.getAttribute("data-copy-text") || copyBtn.textContent;
+                var originalHtml = copyBtn.innerHTML;
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                  navigator.clipboard.writeText(text);
+                }
+                copyBtn.classList.add("copied");
+                copyBtn.textContent = "✓ Copied";
+                setTimeout(function () {
+                  copyBtn.classList.remove("copied");
+                  copyBtn.innerHTML = originalHtml;
+                }, 1400);
+              }
+
+              var closeKeyboardModal = event.target.closest("[data-keyboard-modal-close]");
+              if (closeKeyboardModal) {
+                var modal = document.getElementById("keyboard-shortcuts-modal");
+                if (modal) { modal.hidden = true; }
+              }
+            });
+
+            var pendingKey = "";
+            document.addEventListener("keydown", function (event) {
+              var tag = event.target.tagName;
+              if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
+                if (event.key === "Escape") { event.target.blur(); }
+                return;
+              }
+
+              var modal = document.getElementById("keyboard-shortcuts-modal");
+              if (event.key === "?" || (event.key === "/" && event.shiftKey)) {
+                event.preventDefault();
+                if (modal) { modal.hidden = !modal.hidden; }
+                return;
+              }
+
+              if (event.key === "Escape") {
+                if (modal && !modal.hidden) { modal.hidden = true; return; }
+              }
+
+              if (event.key === "/") {
+                var search = document.querySelector(".flow-search-input");
+                if (search) {
+                  event.preventDefault();
+                  search.focus();
+                  search.select();
+                }
+                return;
+              }
+
+              if (event.key === "g") {
+                pendingKey = "g";
+                setTimeout(function () { pendingKey = ""; }, 1000);
+                return;
+              }
+
+              if (pendingKey === "g") {
+                pendingKey = "";
+                if (event.key === "f") { window.location.href = "/dashboard/flow"; }
+                if (event.key === "d") { window.location.href = "/dashboard/flow/due"; }
+                if (event.key === "w") { window.location.href = "/dashboard/flow/workers"; }
+                if (event.key === "l") { window.location.href = "/dashboard/flow/lineage"; }
+                if (event.key === "o") { window.location.href = "/dashboard"; }
+              }
+            });
+          }
+
           onReady(function () {
+            document.querySelectorAll("[data-dashboard-instance]").forEach(function (instance) {
+              instance.textContent = window.location.host;
+              instance.title = window.location.origin;
+            });
+            clearTransientQueryParams();
             setupFlowValueInspector();
+            setupFlowJournalInteractions();
+            setupGlobalShortcutsAndCopy();
+            applyJournalState(document);
+            selectJournalStepFromHash();
 
             document.addEventListener("submit", function (event) {
               var form = event.target.closest && event.target.closest("[data-dashboard-single-submit]");
@@ -394,6 +755,11 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
             function tick() {
               if (document.hidden) { schedule(intervalMs); return; }
               if (inFlight) { return; }
+              if (dashboardInteractionPaused()) {
+                setLiveStatus("paused", "Updates paused while editing", false);
+                schedule(intervalMs);
+                return;
+              }
               inFlight = true;
               retryButton.disabled = true;
 
@@ -411,13 +777,17 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
                   return response.json();
                 })
                 .then(function (payload) {
-                  patchComponents(payload.components);
+                  var componentsPatched = patchComponents(payload.components);
                   ensureLiveStatusMounted();
-                  lastSuccessAt = payload.generated_at_ms || Date.now();
-                  root.dataset.dashboardLiveLastUpdateMs = String(lastSuccessAt);
-                  root.dataset.dashboardLiveError = "";
-                  failureCount = 0;
-                  setLiveStatus("live", formatFreshness(), false);
+                  if (componentsPatched) {
+                    lastSuccessAt = payload.generated_at_ms || Date.now();
+                    root.dataset.dashboardLiveLastUpdateMs = String(lastSuccessAt);
+                    root.dataset.dashboardLiveError = "";
+                    failureCount = 0;
+                    setLiveStatus("live", formatFreshness(), false);
+                  } else {
+                    setLiveStatus("paused", "Updates paused while editing", false);
+                  }
                   schedule(intervalMs);
                 })
                 .catch(function (error) {
@@ -453,7 +823,9 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
   def render_subpage_header(title) do
     """
     <div class="subpage-header">
+      <a class="dashboard-brand" href="/dashboard">FerricStore</a>
       <h1 class="subpage-title">#{escape(title)}</h1>
+      <span class="dashboard-instance mono" data-dashboard-instance aria-label="Connected instance"></span>
     </div>
     """
   end
@@ -461,9 +833,20 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
   def render_page_intro(title, body) do
     """
     <section class="page-intro" aria-label="#{escape_attr(title)} page purpose">
-      <div class="page-intro-title">#{escape(title)}</div>
       <p>#{escape(body)}</p>
     </section>
+    """
+  end
+
+  def render_dashboard_disclosure(title, badge, content, opts \\ [])
+      when is_binary(title) and is_binary(content) and is_list(opts) do
+    open_attr = if Keyword.get(opts, :open, false), do: " open", else: ""
+
+    """
+    <details class="dashboard-disclosure"#{open_attr}>
+      <summary><span>#{escape(title)}</span><span class="badge badge-idle">#{escape(to_string(badge))}</span></summary>
+      <div class="dashboard-disclosure-body">#{content}</div>
+    </details>
     """
   end
 
@@ -588,20 +971,29 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
   defp sidebar_sections do
     [
       {"System", [{"overview", "/dashboard", "Overview", :primary}]},
-      {"FerricFlow",
+      {"Workflows",
        [
-         {"flow", "/dashboard/flow", "Overview", :primary},
-         {"flow_states", "/dashboard/flow/states", "States / FIFO", :sub},
-         {"flow_workers", "/dashboard/flow/workers", "Workers", :sub},
-         {"flow_due", "/dashboard/flow/due", "Due Work", :sub},
-         {"flow_schedules", "/dashboard/flow/schedules", "Schedules", :sub},
-         {"flow_failures", "/dashboard/flow/failures", "Failures", :sub},
-         {"flow_lineage", "/dashboard/flow/lineage", "Lineage", :sub},
-         {"flow_query", "/dashboard/flow/query", "Query Explorer", :sub},
-         {"flow_signals", "/dashboard/flow/signals", "Signals", :sub},
-         {"flow_policies", "/dashboard/flow/policies", "Policies", :sub},
-         {"flow_governance", "/dashboard/flow/governance", "Governance", :sub},
-         {"flow_retention", "/dashboard/flow/retention", "Retention", :sub}
+         {:subgroup, "workflow-nav-operate", "Operate",
+          [
+            {"flow", "/dashboard/flow", "Overview", :primary},
+            {"flow_states", "/dashboard/flow/states", "States / FIFO", :sub},
+            {"flow_due", "/dashboard/flow/due", "Due Work", :sub},
+            {"flow_workers", "/dashboard/flow/workers", "Workers", :sub},
+            {"flow_schedules", "/dashboard/flow/schedules", "Schedules", :sub}
+          ]},
+         {:subgroup, "workflow-nav-investigate", "Investigate",
+          [
+            {"flow_failures", "/dashboard/flow/failures", "Failures", :sub},
+            {"flow_query", "/dashboard/flow/query", "Query Studio", :sub},
+            {"flow_lineage", "/dashboard/flow/lineage", "Lineage", :sub},
+            {"flow_signals", "/dashboard/flow/signals", "Signals", :sub}
+          ]},
+         {:subgroup, "workflow-nav-configure", "Configure",
+          [
+            {"flow_policies", "/dashboard/flow/policies", "Policies", :sub},
+            {"flow_governance", "/dashboard/flow/governance", "Governance", :sub},
+            {"flow_retention", "/dashboard/flow/retention", "Retention", :sub}
+          ]}
        ]},
       {"KV / Data",
        [
@@ -634,16 +1026,39 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
   end
 
   defp render_sidebar_section({section, items}, active, badges) do
-    rendered_items =
-      Enum.map_join(items, "\n", fn {key, href, label, depth} ->
-        render_sidebar_link(key, href, label, depth, active, badges)
-      end)
+    open? = Enum.any?(items, &sidebar_entry_active?(&1, active))
+
+    open_attr = if open?, do: " open", else: ""
+
+    rendered_items = Enum.map_join(items, "\n", &render_sidebar_entry(&1, active, badges))
 
     """
-    <div class="nav-section">#{escape(section)}</div>
-    #{rendered_items}
+    <details class="nav-group" data-dashboard-nav-group="#{escape_attr(section)}"#{open_attr}>
+      <summary>#{escape(section)}</summary>
+      <div class="nav-group-links">#{rendered_items}</div>
+    </details>
     """
   end
+
+  defp sidebar_entry_active?({:subgroup, _id, _label, items}, active),
+    do: Enum.any?(items, &sidebar_entry_active?(&1, active))
+
+  defp sidebar_entry_active?({key, _href, _label, _depth}, active),
+    do: sidebar_item_active?(key, active)
+
+  defp render_sidebar_entry({:subgroup, id, label, items}, active, badges) do
+    links = Enum.map_join(items, "\n", &render_sidebar_entry(&1, active, badges))
+
+    """
+    <div class="nav-subgroup" role="group" aria-labelledby="#{escape_attr(id)}">
+      <div class="nav-subgroup-label" id="#{escape_attr(id)}">#{escape(label)}</div>
+      #{links}
+    </div>
+    """
+  end
+
+  defp render_sidebar_entry({key, href, label, depth}, active, badges),
+    do: render_sidebar_link(key, href, label, depth, active, badges)
 
   defp render_sidebar_link(key, href, label, depth, active, badges) do
     active? = sidebar_item_active?(key, active)
@@ -660,6 +1075,47 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
       end
 
     ~s(<a class="#{active_class}#{depth_class}" href="#{href}"#{current_attr}><span class="nav-label">#{escape(label)}</span>#{badge_html}</a>)
+  end
+
+  def render_keyboard_shortcuts_modal do
+    """
+    <div id="keyboard-shortcuts-modal" class="keyboard-modal" hidden aria-hidden="true" role="dialog" aria-modal="true" aria-label="Keyboard Shortcuts">
+      <div class="keyboard-card">
+        <div class="keyboard-header">
+          <div class="keyboard-title">Keyboard Shortcuts</div>
+          <button type="button" class="dashboard-modal-close" data-keyboard-modal-close aria-label="Close shortcuts dialog">Close</button>
+        </div>
+        <div class="keyboard-row">
+          <span>Search Flow / Partition</span>
+          <div class="keyboard-keys"><kbd>/</kbd></div>
+        </div>
+        <div class="keyboard-row">
+          <span>Go to Query Studio</span>
+          <div class="keyboard-keys"><kbd>G</kbd> <kbd>F</kbd></div>
+        </div>
+        <div class="keyboard-row">
+          <span>Go to Due Work</span>
+          <div class="keyboard-keys"><kbd>G</kbd> <kbd>D</kbd></div>
+        </div>
+        <div class="keyboard-row">
+          <span>Go to Workers</span>
+          <div class="keyboard-keys"><kbd>G</kbd> <kbd>W</kbd></div>
+        </div>
+        <div class="keyboard-row">
+          <span>Go to Lineage</span>
+          <div class="keyboard-keys"><kbd>G</kbd> <kbd>L</kbd></div>
+        </div>
+        <div class="keyboard-row">
+          <span>Go to System Overview</span>
+          <div class="keyboard-keys"><kbd>G</kbd> <kbd>O</kbd></div>
+        </div>
+        <div class="keyboard-row">
+          <span>Close any modal or dialog</span>
+          <div class="keyboard-keys"><kbd>Esc</kbd></div>
+        </div>
+      </div>
+    </div>
+    """
   end
 
   defp sidebar_item_active?("flow", "flow_detail"), do: true

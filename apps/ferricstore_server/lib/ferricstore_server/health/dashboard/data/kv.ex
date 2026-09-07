@@ -41,7 +41,8 @@ defmodule FerricstoreServer.Health.Dashboard.Data.KV do
   def collect_keyspace_page(opts \\ []) do
     filters = keyspace_filters(opts)
     acl_username = Access.keyspace_acl_username(opts)
-    {rows, sampled} = collect_keyspace_rows(filters)
+    searched? = keyspace_query_submitted?(opts)
+    {rows, sampled} = if searched?, do: collect_keyspace_rows(filters), else: {[], 0}
     rows = Access.filter_keyspace_rows_for_acl(rows, acl_username)
     visible_sampled = if is_binary(acl_username), do: length(rows), else: sampled
 
@@ -49,9 +50,24 @@ defmodule FerricstoreServer.Health.Dashboard.Data.KV do
       filters: filters,
       rows: rows,
       inspected: inspect_keyspace_key(filters.key, rows),
-      total_sampled: visible_sampled
+      total_sampled: visible_sampled,
+      searched?: searched?
     }
   end
+
+  defp keyspace_query_submitted?(opts) when is_map(opts) do
+    Enum.any?(["key", "prefix", "include_internal", "limit"], &Map.has_key?(opts, &1)) or
+      Enum.any?([:key, :prefix, :include_internal, :limit], &Map.has_key?(opts, &1))
+  end
+
+  defp keyspace_query_submitted?(opts) when is_list(opts) do
+    Enum.any?([:key, :prefix, :include_internal, :limit], &Keyword.has_key?(opts, &1)) or
+      Enum.any?(["key", "prefix", "include_internal", "limit"], fn key ->
+        List.keymember?(opts, key, 0)
+      end)
+  end
+
+  defp keyspace_query_submitted?(_opts), do: false
 
   def collect_commands_page do
     slowlog = Operational.collect_slowlog()

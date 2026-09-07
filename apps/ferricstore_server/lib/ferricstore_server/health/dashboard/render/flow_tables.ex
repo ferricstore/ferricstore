@@ -72,6 +72,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables do
   defdelegate render_flow_lineage_rows(records), to: Lineage
   defdelegate flow_query_result_command(result), to: FlowQueryResults
   defdelegate render_flow_query_status(result), to: FlowQueryResults
+  defdelegate render_flow_query_provenance(data), to: FlowQueryResults
   defdelegate render_flow_query_metadata(result), to: FlowQueryResults
   defdelegate render_flow_query_visualization(result), to: FlowQueryResults
   defdelegate render_flow_query_table(result), to: FlowQueryResults

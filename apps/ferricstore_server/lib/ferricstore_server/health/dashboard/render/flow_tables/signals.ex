@@ -45,8 +45,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Signals do
 
     title = flow_signals_table_title(total_sampled, filtered_sampled, sample_limit, filters, mode)
 
-    """
-    <div class="section-title">#{title}</div>
+    table = """
     <table>
       <thead>
         #{render_flow_signals_table_head(mode)}
@@ -55,6 +54,13 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Signals do
         #{rows}
       </tbody>
     </table>
+    """
+
+    label = if mode == :detail, do: "Workflow signal history", else: "Workflow signals"
+
+    """
+    <div class="section-title">#{title}</div>
+    #{accessible_table(label, table)}
     """
   end
 
@@ -107,7 +113,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Signals do
   def flow_signals_table_title(total_sampled, filtered_sampled, sample_limit, filters, :page)
       when is_integer(total_sampled) and is_integer(filtered_sampled) and
              is_integer(sample_limit) do
-    "Flow Signals <span class=\"badge badge-idle\">#{escape(flow_signals_filter_summary(filters))}</span> <span class=\"badge badge-idle\">sampled #{format_number(filtered_sampled)} / #{format_number(total_sampled)} / #{format_number(sample_limit)}</span>"
+    "Flow Signals <span class=\"badge badge-idle\">#{escape(flow_signals_filter_summary(filters))}</span> <span class=\"badge badge-idle\">#{bounded_sample_label(filtered_sampled, total_sampled, sample_limit)}</span>"
   end
 
   def flow_signals_table_title(
@@ -137,7 +143,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Signals do
   end
 
   def flow_signal_event_href(row, :detail) do
-    "#" <> flow_history_event_anchor(Map.get(row, :event_id, "-"))
+    "#journal-" <> flow_history_event_anchor(Map.get(row, :event_id, "-"))
   end
 
   def flow_signal_event_href(row, :page) do
@@ -145,8 +151,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Signals do
     id = Map.get(row, :id, "")
 
     case id do
-      "" -> "#" <> anchor
-      id -> flow_detail_path(id, Map.get(row, :partition_key)) <> "#" <> anchor
+      "" -> "#journal-" <> anchor
+      id -> flow_detail_path(id, Map.get(row, :partition_key)) <> "#journal-" <> anchor
     end
   end
 

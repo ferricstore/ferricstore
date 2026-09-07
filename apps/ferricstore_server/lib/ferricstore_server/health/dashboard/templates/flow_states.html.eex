@@ -7,7 +7,7 @@
 <%= render_subpage_header("Flow States") %>
 <div class="content">
 <%= render_page_intro("Flow States", "Filter sampled workflows by type, state, partition, time range, and name to find live workflow distribution.") %>
-<%= render_flow_subnav("states") %>
+<%= render_flow_context_tools(data, "flow_states") %>
 <%= render_flow_type_filter(data) %>
 <%= render_live_component("flow_states_chart", render_flow_states_chart(data.states)) %>
 <%= render_live_component("flow_states_table", render_flow_states_table(data.states, data.total_sampled, data.filtered_sampled, data.sample_limit, flow_states_page_filters(data))) %>

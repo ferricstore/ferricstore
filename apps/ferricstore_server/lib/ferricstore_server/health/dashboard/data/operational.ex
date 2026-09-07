@@ -2,6 +2,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
   @moduledoc false
 
   alias Ferricstore.{DataDir, Health, MemoryGuard, NamespaceConfig, SlowLog, Stats}
+  alias Ferricstore.Flow.PolicyMigrationWorker
   alias Ferricstore.Merge.Scheduler, as: MergeScheduler
   alias Ferricstore.Raft.Cluster, as: RaftCluster
   alias Ferricstore.Raft.WARaftBackend
@@ -29,8 +30,23 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
       cluster: collect_cluster(),
       lifecycle: collect_lifecycle(),
       flow_summary: flow_summary,
+      subsystem_health: collect_subsystem_health(),
       storage_summary: collect_storage_summary()
     }
+  end
+
+  def collect_subsystem_health do
+    policy_migration =
+      if Application.get_env(:ferricstore, :flow_policy_migration_worker_enabled, true) do
+        case FerricStore.Instance.fetch(:default) do
+          {:ok, ctx} -> PolicyMigrationWorker.health_snapshot(ctx)
+          :error -> %{status: :unavailable, issues: [], updated_at_ms: nil}
+        end
+      else
+        %{status: :disabled, issues: [], updated_at_ms: nil}
+      end
+
+    %{policy_migration: policy_migration}
   end
 
   def collect_slowlog_page, do: %{slowlog: collect_slowlog()}

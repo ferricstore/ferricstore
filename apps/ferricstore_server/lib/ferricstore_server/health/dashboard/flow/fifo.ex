@@ -4,6 +4,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Fifo do
   import FerricstoreServer.Health.Dashboard.FlowRecord
 
   @flow_terminal_states ~w(completed failed cancelled)
+  @member_preview_limit 8
 
   @spec annotate_state_summaries([map()]) :: [map()]
   def annotate_state_summaries(states) when is_list(states) do
@@ -24,14 +25,17 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Fifo do
   def lane_summaries(records) when is_list(records) do
     policies = policy_cache_from_records(records)
 
-    records
-    |> Enum.filter(&fifo_lane_record?(&1, policies))
-    |> Enum.group_by(fn record ->
-      {flow_record_type(record), flow_record_logical_state(record),
-       flow_record_partition_key(record)}
-    end)
+    groups =
+      records
+      |> Enum.filter(&fifo_lane_record?(&1, policies))
+      |> Enum.group_by(fn record ->
+        {flow_record_type(record), flow_record_logical_state(record),
+         flow_record_partition_key(record)}
+      end)
+
+    groups
     |> Enum.map(fn {{type, state, partition_key}, lane_records} ->
-      summarize_lane(type, state, partition_key, lane_records)
+      summarize_lane(type, state, partition_key, lane_records, map_size(groups) == 1)
     end)
     |> Enum.sort_by(fn lane ->
       {-lane.running, -lane.due, -lane.waiting, lane.type, lane.state, lane.partition_key}
@@ -58,7 +62,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Fifo do
 
   defp fifo_lane_record?(_record, _policies), do: false
 
-  defp summarize_lane(type, state, partition_key, records) do
+  defp summarize_lane(type, state, partition_key, records, preview?) do
     running = Enum.filter(records, &(flow_record_state(&1) == "running"))
     live_running = Enum.reject(running, &flow_expired_lease?/1)
     expired_running = Enum.filter(running, &flow_expired_lease?/1)
@@ -67,12 +71,17 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Fifo do
     blocker = Enum.min_by(live_running, &fifo_record_order/1, fn -> nil end)
     expired_blocker = Enum.min_by(expired_running, &fifo_record_order/1, fn -> nil end)
     head = blocker || expired_blocker || head_waiting
+    members = if preview?, do: member_previews(records), else: []
 
     %{
       type: type,
       state: state,
       partition_key: partition_key,
       mode: :fifo,
+      coverage: :sampled,
+      members: members,
+      members_omitted: max(length(records) - length(members), 0),
+      order_known: preview? and Enum.all?(records, &is_integer(flow_record_state_enter_seq(&1))),
       count: length(records),
       running: length(running),
       waiting: length(waiting_records),
@@ -85,6 +94,56 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Fifo do
       blocked_by_worker: flow_record_worker(blocker || expired_blocker),
       lease_expires_at_ms: flow_record_lease_expires_at_ms(blocker || expired_blocker)
     }
+  end
+
+  # Select a fixed-size preview without sorting or copying the entire lane.
+  defp member_previews(records) do
+    now = System.system_time(:millisecond)
+
+    records
+    |> Enum.reduce(:gb_trees.empty(), fn record, selected ->
+      role = if flow_record_state(record) == "running", do: 0, else: 1
+      key = {role, fifo_record_order(record)}
+
+      if :gb_trees.size(selected) < @member_preview_limit or
+           key < elem(:gb_trees.largest(selected), 0) do
+        selected = :gb_trees.enter(key, record, selected)
+
+        if :gb_trees.size(selected) > @member_preview_limit do
+          {_key, _record, selected} = :gb_trees.take_largest(selected)
+          selected
+        else
+          selected
+        end
+      else
+        selected
+      end
+    end)
+    |> :gb_trees.values()
+    |> Enum.map(fn record ->
+      %{
+        id: flow_record_id(record),
+        state_enter_seq: flow_record_state_enter_seq(record),
+        worker: flow_record_worker(record),
+        lease_expires_at_ms: flow_record_lease_expires_at_ms(record),
+        run_at_ms: flow_record_run_at_ms(record),
+        status: member_status(record, now)
+      }
+    end)
+  end
+
+  defp member_status(record, now) do
+    running? = flow_record_state(record) == "running"
+    lease = flow_record_lease_expires_at_ms(record)
+    run_at = flow_record_run_at_ms(record)
+
+    cond do
+      running? and is_integer(lease) and lease > 0 and lease <= now -> :expired
+      running? -> :leased
+      is_integer(run_at) and run_at > now -> :scheduled
+      is_integer(run_at) -> :due
+      true -> :waiting
+    end
   end
 
   defp lane_head_status(%{} = _blocker, _expired_blocker, _head_waiting),

@@ -215,20 +215,40 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.CollectionAndOverview 
           assert String.contains?(html, "Merge Status")
         end
 
-        test "contains Flow nav link to sub-page", %{html: html} do
-          assert String.contains?(html, ~s(href="/dashboard/flow"))
-          assert String.contains?(html, "FerricFlow")
+        test "groups workflow tools beneath the Workflows parent", %{html: html} do
+          assert html =~ ~s(<summary>Workflows</summary>)
+
+          assert html =~
+                   ~r/href="\/dashboard\/flow"[^>]*><span class="nav-label">Overview<\/span>/
+
+          workflows_position =
+            html
+            |> :binary.match(~s(<summary>Workflows</summary>))
+            |> elem(0)
+
+          states_position =
+            html
+            |> :binary.match(~s(href="/dashboard/flow/states"))
+            |> elem(0)
+
+          messaging_position =
+            html
+            |> :binary.match(~s(<summary>Messaging</summary>))
+            |> elem(0)
+
+          assert workflows_position < states_position
+          assert states_position < messaging_position
         end
 
         test "groups sidebar by dashboard subject", %{html: html} do
-          assert String.contains?(html, ~s(<div class="nav-section">FerricFlow</div>))
+          assert String.contains?(html, ~s(<summary>Workflows</summary>))
           assert String.contains?(html, ~s(href="/dashboard/flow/states"))
           assert String.contains?(html, "States / FIFO")
-          assert String.contains?(html, ~s(<div class="nav-section">KV / Data</div>))
-          assert String.contains?(html, ~s(<div class="nav-section">Messaging</div>))
+          assert String.contains?(html, ~s(<summary>KV / Data</summary>))
+          assert String.contains?(html, ~s(<summary>Messaging</summary>))
           assert String.contains?(html, ~s(href="/dashboard/streams"))
           assert String.contains?(html, ~s(href="/dashboard/pubsub"))
-          assert String.contains?(html, ~s(<div class="nav-section">Control Plane</div>))
+          assert String.contains?(html, ~s(<summary>Control Plane</summary>))
           assert String.contains?(html, ~s(href="/dashboard/security"))
         end
 

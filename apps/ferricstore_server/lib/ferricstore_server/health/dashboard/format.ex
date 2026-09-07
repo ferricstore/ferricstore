@@ -16,6 +16,24 @@ defmodule FerricstoreServer.Health.Dashboard.Format do
     end
   end
 
+  def bounded_sample_label(filtered, sampled, scan_cap)
+      when is_integer(filtered) and is_integer(sampled) and is_integer(scan_cap) do
+    if filtered == sampled do
+      "#{format_number(filtered)} matching records · scan cap #{format_number(scan_cap)}"
+    else
+      "#{format_number(filtered)} matching of #{format_number(sampled)} sampled · scan cap #{format_number(scan_cap)}"
+    end
+  end
+
+  def sampled_scan_label(sampled, scan_cap)
+      when is_integer(sampled) and is_integer(scan_cap) do
+    "#{format_number(sampled)} sampled records · scan cap #{format_number(scan_cap)}"
+  end
+
+  def accessible_table(label, table_html) when is_binary(label) and is_binary(table_html) do
+    ~s(<div class="table-scroll" role="region" aria-label="#{escape_attr(label)}" tabindex="0">#{table_html}</div>)
+  end
+
   def hit_rate_color(ratio) do
     cond do
       ratio >= 90.0 -> "#3fb950"

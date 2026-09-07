@@ -1259,7 +1259,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           html = Dashboard.render(data)
 
           merge_pos = :binary.match(html, "Merge Status") |> elem(0)
-          config_pos = :binary.match(html, "Config") |> elem(0)
+          config_pos = :binary.match(html, ~s(<span class="nav-label">Config</span>)) |> elem(0)
 
           assert config_pos > merge_pos
         end

@@ -122,6 +122,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
           <button class="flow-search-button" type="submit" title="Save this Flow policy">Save Policy</button>
         </div>
       </form>
+      #{FerricstoreServer.Health.Dashboard.Render.FlowFormScripts.policy_script()}
     </div>
     """
   end
@@ -137,34 +138,16 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
 
   def render_flow_policy_flash(_flash), do: ""
 
-  def render_flow_policy_preview(editor) do
-    scope =
-      case Map.get(editor, :state, "") do
-        state when is_binary(state) and state != "" -> "state override: #{state}"
-        _ -> "global defaults for this type"
-      end
-
-    ttl = format_duration_ms(Map.get(editor, :retention_ttl_ms, 0))
-    history = format_number(Map.get(editor, :history_max_events, 0))
-    mode = flow_policy_mode_label(Map.get(editor, :mode, :parallel))
-    indexed_attributes = Map.get(editor, :indexed_attributes) || ""
-    indexed_state_meta = Map.get(editor, :indexed_state_meta) || ""
-
-    max_active =
-      case Map.get(editor, :max_active_ms) do
-        value when is_integer(value) and value > 0 -> format_duration_ms(value)
-        _ -> "unlimited"
-      end
-
+  def render_flow_policy_preview(_editor) do
     """
-    <div class="flow-policy-preview">
+    <div class="flow-policy-preview" style="display: none;">
       <div class="flow-policy-preview-title">Review before saving</div>
-      <div>Scope: <span class="mono">#{escape(scope)}</span></div>
-      <div>State mode: <span class="mono">#{escape(mode)}</span>. FIFO requires every entering Flow to carry a partition key and rejects priority.</div>
-      <div>Indexes: attributes <span class="mono">#{escape(if(indexed_attributes == "", do: "-", else: indexed_attributes))}</span>, state meta <span class="mono">#{escape(if(indexed_state_meta == "", do: "-", else: indexed_state_meta))}</span></div>
-      <div>Retry: #{format_number(Map.get(editor, :max_retries, 0))} attempts, #{escape(to_string(Map.get(editor, :backoff_kind, :exponential)))} backoff, exhausted to <span class="mono">#{escape(to_string(Map.get(editor, :exhausted_to, "failed")))}</span></div>
-      <div>Max active: <span class="mono">#{escape(max_active)}</span> for each new Flow record of this type.</div>
-      <div>Retention: keep terminal Flow records for #{escape(ttl)} and retain up to #{history} history events before cleanup.</div>
+      <div>Scope: <span class="mono" data-policy-preview="scope"></span></div>
+      <div>State mode: <span class="mono" data-policy-preview="mode"></span>. FIFO requires every entering Flow to carry a partition key and rejects priority.</div>
+      <div>Indexes: <span class="mono" data-policy-preview="indexes"></span></div>
+      <div>Retry: <span data-policy-preview="retry"></span></div>
+      <div>Type-level max active: <span class="mono" data-policy-preview="max-active"></span> for each new Flow record of this type.</div>
+      <div>Retention: <span data-policy-preview="retention"></span></div>
       <div class="flow-filter-note">Requires +FLOW.POLICY.SET. The save operation writes durable policy config; active Flow records keep their current state.</div>
     </div>
     """
@@ -267,7 +250,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
     """
     <div class="section-title">Current Flow Policies <span class="badge badge-idle">#{format_number(length(policies))}</span></div>
     #{scan_note}
-    <table>
+    <div class="table-scroll" role="region" aria-label="Current workflow policies" tabindex="0"><table>
       <thead>
         <tr>
           <th>Type</th>
@@ -285,7 +268,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
       <tbody>
         #{rows}
       </tbody>
-    </table>
+    </table></div>
     """
   end
 

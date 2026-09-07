@@ -4,19 +4,24 @@
 <div class="layout">
 <%= render_sidebar_static("flow") %>
 <main class="main-content">
-<%= render_subpage_header("FerricFlow") %>
+<%= render_subpage_header("Workflows") %>
 <div class="content">
-<%= render_page_intro("FerricFlow", "Monitor workflow lifecycle state, projection health, due work, failures, and debug links for individual flows.") %>
-<%= render_flow_subnav("overview") %>
+<%= render_flow_context_tools(data, "flow") %>
 <%= render_flow_overview_filter(data) %>
-<%= render_live_component("flow_overview", render_flow_overview(data.summary, Map.get(data, :filtered_sampled, data.total_sampled), data.sample_limit)) %>
 <%= render_live_component("flow_issue_cards", render_flow_issue_cards(data.summary)) %>
-<%= render_live_component("flow_projection_health", render_flow_projection_health(Map.get(data, :projection, default_flow_projection_health()))) %>
+<%= render_live_component("flow_overview", render_flow_overview(data.summary, Map.get(data, :filtered_sampled, data.total_sampled), data.sample_limit)) %>
+<%= render_live_component("flow_recent_records", render_flow_recent_records(data.records)) %>
+<details class="dashboard-disclosure">
+<summary>Workload breakdown</summary>
+<div class="dashboard-disclosure-body">
 <%= render_live_component("flow_state_breakdown", render_flow_state_breakdown(data.types)) %>
 <%= render_live_component("flow_workers", render_flow_workers(data.workers)) %>
-<%= render_live_component("flow_recent_records", render_flow_recent_records(data.records)) %>
+</div>
+</details>
+<%= render_live_component("flow_projection_health", render_flow_projection_health(Map.get(data, :projection, default_flow_projection_health()))) %>
 </div>
 </main>
 </div>
+<%= render_keyboard_shortcuts_modal() %>
 </body>
 </html>

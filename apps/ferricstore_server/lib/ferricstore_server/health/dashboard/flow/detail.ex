@@ -99,11 +99,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
   def collect_page(id, opts) when is_binary(id) and is_list(opts) do
     partition_key = flow_detail_partition_key(opts)
     history_page_opts = flow_detail_history_page_opts(opts)
+    {record_result, sampled_records} = flow_detail_record(id, partition_key)
 
     {record_status, record} =
-      id
-      |> flow_detail_record(partition_key)
-      |> authorize_flow_detail_record(opts)
+      authorize_flow_detail_record(record_result, opts)
 
     {history_status, history, history_page} = flow_detail_history(id, record, history_page_opts)
 
@@ -117,7 +116,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
     record_partition_key = if is_map(record), do: flow_record_partition_key(record), else: nil
     detail_partition_key = flow_detail_url_partition_key(partition_key || record_partition_key)
     history_page = flow_detail_history_page_links(id, detail_partition_key, history_page)
-    {state_mode, fifo_lane} = flow_detail_fifo_lane(record)
+    {state_mode, fifo_lane} = flow_detail_fifo_lane(record, sampled_records)
 
     %{
       id: id,
@@ -138,7 +137,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
     }
   end
 
-  defp flow_detail_fifo_lane(%{} = record) do
+  defp flow_detail_fifo_lane(%{} = record, sampled_records) do
     type = flow_record_type(record)
     logical_state = flow_record_logical_state(record)
     partition_key = flow_record_partition_key(record)
@@ -146,8 +145,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
 
     lane =
       if mode == :fifo and is_binary(partition_key) and partition_key != "" do
-        @flow_dashboard_sample_limit
-        |> collect_flow_records_sample()
+        sampled_records
         |> Enum.filter(&same_fifo_lane?(&1, type, logical_state, partition_key))
         |> include_flow_record(record)
         |> Fifo.lane_summaries()
@@ -164,7 +162,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
     :exit, _ -> {:parallel, nil}
   end
 
-  defp flow_detail_fifo_lane(_record), do: {:parallel, nil}
+  defp flow_detail_fifo_lane(_record, _sampled_records), do: {:parallel, nil}
 
   defp authorize_flow_detail_record({:ok, %{} = record} = result, opts) do
     case DashboardAccess.keyspace_acl_username(opts) do
@@ -368,38 +366,41 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
   end
 
   defp flow_detail_record(id, partition_key) do
+    records = collect_flow_records_sample(@flow_dashboard_sample_limit)
+
     sampled =
-      @flow_dashboard_sample_limit
-      |> collect_flow_records_sample()
-      |> Enum.find(fn record ->
+      Enum.find(records, fn record ->
         flow_record_id(record) == id and flow_detail_partition_match?(record, partition_key)
       end)
 
-    case sampled do
-      %{} = record ->
-        {:ok, record}
+    result =
+      case sampled do
+        %{} = record ->
+          {:ok, record}
 
-      nil ->
-        timeout_ms = flow_dashboard_detail_fetch_timeout_ms()
-        opts = flow_dashboard_get_opts(partition_key)
+        nil ->
+          timeout_ms = flow_dashboard_detail_fetch_timeout_ms()
+          opts = flow_dashboard_get_opts(partition_key)
 
-        case bounded_dashboard_call(
-               fn -> flow_dashboard_flow_get(id, opts) end,
-               timeout_ms,
-               :record
-             ) do
-          {:ok, {:ok, %{} = record}} -> {:ok, record}
-          {:ok, {:ok, nil}} -> {:not_found, nil}
-          {:ok, {:error, reason}} -> {{:error, reason}, nil}
-          {:ok, _other} -> {{:error, :unexpected_flow_get_result}, nil}
-          {:error, :timeout} -> {:timeout, nil}
-          {:error, reason} -> {{:error, reason}, nil}
-        end
-    end
+          case bounded_dashboard_call(
+                 fn -> flow_dashboard_flow_get(id, opts) end,
+                 timeout_ms,
+                 :record
+               ) do
+            {:ok, {:ok, %{} = record}} -> {:ok, record}
+            {:ok, {:ok, nil}} -> {:not_found, nil}
+            {:ok, {:error, reason}} -> {{:error, reason}, nil}
+            {:ok, _other} -> {{:error, :unexpected_flow_get_result}, nil}
+            {:error, :timeout} -> {:timeout, nil}
+            {:error, reason} -> {{:error, reason}, nil}
+          end
+      end
+
+    {result, records}
   rescue
-    reason -> {{:error, reason}, nil}
+    reason -> {{{:error, reason}, nil}, []}
   catch
-    :exit, reason -> {{:exit, reason}, nil}
+    :exit, reason -> {{{:exit, reason}, nil}, []}
   end
 
   defp flow_detail_partition_match?(_record, nil), do: true

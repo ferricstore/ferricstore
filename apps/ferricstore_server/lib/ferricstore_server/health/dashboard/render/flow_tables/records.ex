@@ -49,8 +49,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
 
     filter_label = flow_filter_summary(filters)
 
-    """
-    <div class="section-title">Flow States <span class="badge badge-idle">#{escape(filter_label)}</span> <span class="badge badge-idle">sampled #{format_number(filtered_sampled)} / #{format_number(total_sampled)} / #{format_number(sample_limit)}</span></div>
+    table = """
     <table>
       <thead>
         <tr>
@@ -73,66 +72,16 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
       </tbody>
     </table>
     """
+
+    """
+    <div class="section-title">Flow States <span class="badge badge-idle">#{escape(filter_label)}</span> <span class="badge badge-idle">#{bounded_sample_label(filtered_sampled, total_sampled, sample_limit)}</span></div>
+    #{accessible_table("Flow states", table)}
+    """
   end
 
   def render_flow_fifo_lanes(lanes, total_sampled, sample_limit) do
-    rows =
-      case lanes do
-        [] ->
-          ~s(<tr><td colspan="11" class="c-muted">No FIFO lanes discovered in the current bounded sample.</td></tr>)
-
-        _ ->
-          Enum.map_join(lanes, "\n", &render_flow_fifo_lane_row/1)
-      end
-
-    """
-    <div class="section-title">FIFO Lanes <span class="badge badge-idle">#{format_number(length(lanes))}</span> <span class="badge badge-idle">sampled #{format_number(total_sampled)} / #{format_number(sample_limit)}</span></div>
-    <div class="flow-help">FIFO lanes are grouped by type, logical state, and partition key. A live running head blocks only that lane; other partitions and other states can still be claimed.</div>
-    <table>
-      <thead>
-        <tr><th>Type</th><th>State</th><th>Partition</th><th>Status</th><th>Head</th><th>Next</th><th>Blocked By</th><th>Worker</th><th>Waiting</th><th>Due</th><th>Lease Expires</th></tr>
-      </thead>
-      <tbody>
-        #{rows}
-      </tbody>
-    </table>
-    """
+    FerricstoreServer.Health.Dashboard.Render.FlowFifo.render(lanes, total_sampled, sample_limit)
   end
-
-  defp render_flow_fifo_lane_row(lane) do
-    status = Map.get(lane, :head_status, "idle")
-    status_class = flow_fifo_lane_status_class(status)
-    head_id = Map.get(lane, :head_id)
-    waiting_head_id = Map.get(lane, :waiting_head_id)
-    blocked_by_id = Map.get(lane, :blocked_by_id)
-
-    """
-    <tr>
-      <td class="mono">#{escape(Map.get(lane, :type, ""))}</td>
-      <td class="#{flow_state_class(Map.get(lane, :state, ""))}">#{escape(Map.get(lane, :state, ""))}</td>
-      <td class="mono">#{escape(Map.get(lane, :partition_key, ""))}</td>
-      <td><span class="badge #{status_class}">#{escape(status)}</span></td>
-      <td class="mono">#{render_optional_flow_link(head_id, Map.get(lane, :partition_key))}</td>
-      <td class="mono">#{render_optional_flow_link(waiting_head_id, Map.get(lane, :partition_key))}</td>
-      <td class="mono">#{render_optional_flow_link(blocked_by_id, Map.get(lane, :partition_key))}</td>
-      <td class="mono">#{escape(Map.get(lane, :blocked_by_worker) || "-")}</td>
-      <td>#{format_number(Map.get(lane, :waiting, 0))}</td>
-      <td>#{format_number(Map.get(lane, :due, 0))}</td>
-      <td>#{format_timestamp_ms_or_dash(Map.get(lane, :lease_expires_at_ms))}</td>
-    </tr>
-    """
-  end
-
-  defp render_optional_flow_link(id, partition_key) when is_binary(id) and id != "" do
-    render_flow_id_link(id, partition_key)
-  end
-
-  defp render_optional_flow_link(_id, _partition_key), do: "-"
-
-  defp flow_fifo_lane_status_class("blocked by active flow"), do: "badge-pressure"
-  defp flow_fifo_lane_status_class("blocked by expired lease"), do: "badge-pressure"
-  defp flow_fifo_lane_status_class("head claimable"), do: "badge-ok"
-  defp flow_fifo_lane_status_class(_status), do: "badge-idle"
 
   defp render_flow_state_mode_badge(:fifo), do: ~s(<span class="badge badge-ok">FIFO</span>)
   defp render_flow_state_mode_badge("fifo"), do: render_flow_state_mode_badge(:fifo)
@@ -198,8 +147,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
           end)
       end
 
-    """
-    <div class="section-title">State Breakdown</div>
+    table = """
     <table>
       <thead>
         <tr><th>Type</th><th>Count Source</th><th>Total</th><th>Active</th><th>Queued</th><th>Running</th><th>Completed</th><th>Failed</th><th>Cancelled</th><th>Observed States</th></tr>
@@ -208,6 +156,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
         #{rows}
       </tbody>
     </table>
+    """
+
+    """
+    <div class="section-title">State Breakdown</div>
+    #{accessible_table("Workflow state breakdown", table)}
     """
   end
 
@@ -242,8 +195,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
           end)
       end
 
-    """
-    <div class="section-title">Workers / Leases</div>
+    table = """
     <table>
       <thead>
         <tr><th>Worker</th><th>Running</th><th>Expired</th><th>Oldest Expired By</th></tr>
@@ -252,6 +204,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
         #{rows}
       </tbody>
     </table>
+    """
+
+    """
+    <div class="section-title">Workers / Leases</div>
+    #{accessible_table("Workflow workers and leases", table)}
     """
   end
 
@@ -279,8 +236,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
           end)
       end
 
-    """
-    <div class="section-title">Running Records <span class="badge badge-idle">sampled #{format_number(total_sampled)} / #{format_number(sample_limit)}</span></div>
+    table = """
     <table>
       <thead>
         <tr><th>ID</th><th>Type</th><th>Worker</th><th>Status</th><th>Lease Expires</th><th>Lease Token</th><th>Fencing</th></tr>
@@ -289,6 +245,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
         #{rows}
       </tbody>
     </table>
+    """
+
+    """
+    <div class="section-title">Running Records <span class="badge badge-idle">#{sampled_scan_label(total_sampled, sample_limit)}</span></div>
+    #{accessible_table("Running workflow records", table)}
     """
   end
 
@@ -314,8 +275,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
           end)
       end
 
-    """
-    <div class="section-title">#{escape(title)} <span class="badge badge-idle">sampled #{format_number(total_sampled)} / #{format_number(sample_limit)}</span></div>
+    table = """
     <table>
       <thead>
         <tr><th>ID</th><th>Type</th><th>State</th><th>Why Waiting</th><th>Run At</th><th>Priority</th><th>Values</th></tr>
@@ -324,6 +284,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
         #{rows}
       </tbody>
     </table>
+    """
+
+    """
+    <div class="section-title">#{escape(title)} <span class="badge badge-idle">#{sampled_scan_label(total_sampled, sample_limit)}</span></div>
+    #{accessible_table(title <> " workflow records", table)}
     """
   end
 
@@ -355,27 +320,55 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     rows =
       case records do
         [] ->
-          ~s(<tr><td colspan="10" class="c-muted">No Flow records discovered</td></tr>)
+          ~s(<tr><td colspan="6" class="c-muted">No Flow records discovered in the current scope</td></tr>)
 
         _ ->
           Enum.map_join(records, "\n", fn record ->
             id = flow_record_id(record)
             state = flow_record_state(record)
-            state_class = flow_state_class(state)
             status = flow_record_status_label(record)
+            partition = flow_record_partition_key(record)
+            detail_path = flow_detail_path(id, partition)
+
+            status_badge =
+              cond do
+                status == "expired lease" ->
+                  ~s(<span class="badge badge-failed">expired lease</span>)
+
+                state == "running" ->
+                  ~s(<span class="badge badge-running">leased</span>)
+
+                status == "due" ->
+                  ~s(<span class="badge badge-due">due</span>)
+
+                status == "retrying" ->
+                  ~s(<span class="badge badge-retrying">retrying</span>)
+
+                state == "failed" ->
+                  ~s(<span class="badge badge-failed">failed</span>)
+
+                state == "completed" ->
+                  ~s(<span class="badge badge-completed">completed</span>)
+
+                true ->
+                  ~s(<span class="badge badge-idle">#{escape(if status == "terminal", do: state, else: status)}</span>)
+              end
 
             """
             <tr>
-              <td class="mono">#{render_flow_id_link(id, flow_record_partition_key(record))}</td>
-              <td class="mono">#{escape(flow_record_type(record))}</td>
-              <td class="#{state_class}">#{escape(state)}</td>
-              <td>#{escape(status)}</td>
-              <td>#{format_number(flow_record_attempts(record))}</td>
-              <td class="mono">#{escape(flow_record_worker(record) || "-")}</td>
-              <td>#{escape(flow_waiting_reason(record))}</td>
-              <td>#{format_timestamp_ms_or_dash(flow_record_run_at_ms(record))}</td>
-              <td>#{format_timestamp_ms_or_dash(flow_record_updated_at_ms(record))}</td>
+              <td class="flow-run-identity">
+                <div class="mono">#{render_flow_id_link(id, partition)}</div>
+                <span class="flow-run-secondary" title="#{escape_attr(flow_record_type(record))}">#{escape(flow_record_type(record))}</span>
+                <span class="flow-run-secondary mono" title="Partition">#{escape(partition || "auto/global")}</span>
+              </td>
+              <td><span class="flow-run-step mono">#{escape(flow_record_logical_state(record))}</span>#{status_badge}</td>
+              <td><span class="flow-run-reason">#{escape(flow_waiting_reason(record))}</span><span class="flow-run-secondary">#{format_number(flow_record_attempts(record))} attempts</span></td>
+              <td class="flow-run-timing"><span><span class="c-muted">Run</span> #{format_timestamp_ms_or_dash(flow_record_run_at_ms(record))}</span><span><span class="c-muted">Updated</span> #{format_timestamp_ms_or_dash(flow_record_updated_at_ms(record))}</span></td>
               <td>#{render_flow_value_ref_badges(record, :detail_link)}</td>
+              <td class="flow-row-actions">
+                <a class="flow-link" href="#{detail_path}" title="Inspect workflow">Inspect</a>
+                <button type="button" class="copy-btn-inline" data-copy-text="#{escape_attr(id)}" title="Copy Flow ID">Copy</button>
+              </td>
             </tr>
             """
           end)
@@ -392,14 +385,14 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
 
     """
     <div class="section-title">Recent Flow Records#{limit_badge}</div>
-    <table>
+    <div class="table-scroll" role="region" aria-label="Recent workflow records" tabindex="0"><table class="flow-runs-table">
       <thead>
-        <tr><th>ID</th><th>Type</th><th>State</th><th>Status</th><th>Attempts</th><th>Worker</th><th>Why Waiting</th><th>Run At</th><th>Updated</th><th>Values</th></tr>
+        <tr><th>Workflow</th><th>State</th><th>Activity</th><th>Timing (UTC)</th><th>Values</th><th>Actions</th></tr>
       </thead>
       <tbody>
         #{rows}
       </tbody>
-    </table>
+    </table></div>
     """
   end
 end

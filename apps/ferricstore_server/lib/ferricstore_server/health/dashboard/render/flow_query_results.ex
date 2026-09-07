@@ -50,9 +50,22 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
 
   def render_flow_query_status(_result), do: ""
 
+  defdelegate render_flow_query_provenance(data),
+    to: FerricstoreServer.Health.Dashboard.Render.FlowQueryProvenance,
+    as: :render
+
   def render_flow_query_metadata(result) when is_map(result) do
     quality = render_metadata_group("Query Quality", Map.get(result, :quality), @quality_fields)
-    usage = render_metadata_group("Query Usage", Map.get(result, :usage), @usage_fields)
+
+    usage =
+      case render_metadata_group("Query Usage", Map.get(result, :usage), @usage_fields) do
+        "" ->
+          ""
+
+        group ->
+          ~s(<details class="flow-query-usage"><summary>Performance details</summary>#{group}</details>)
+      end
+
     page = render_page_status(Map.get(result, :page))
 
     if quality == "" and usage == "" and page == "" do
@@ -71,7 +84,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     rendered = Enum.map_join(charts, "", &render_page_chart/1)
 
     """
-    <details class="flow-query-visualization" open>
+    <details class="flow-query-visualization">
       <summary>
         <span>Visualize current page</span>
         <span class="badge badge-idle">Current page &middot; #{format_number(row_count)} rows</span>
@@ -93,7 +106,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     value = Map.get(scalar, :value)
 
     """
-    <div class="flow-query-table-wrap">
+    <div class="flow-query-table-wrap" role="region" aria-label="Query scalar result" tabindex="0">
       <table class="flow-query-table">
         <caption class="sr-only">Query scalar result</caption>
         <thead><tr><th scope="col">Result</th><th scope="col">Value</th></tr></thead>
@@ -103,19 +116,21 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     """
   end
 
-  def render_flow_query_table(%{
-        presentation: :workbench,
-        columns: columns,
-        column_selectors: selectors,
-        rows: rows,
-        source: source
-      })
+  def render_flow_query_table(
+        %{
+          presentation: :workbench,
+          columns: columns,
+          column_selectors: selectors,
+          rows: rows,
+          source: source
+        } = result
+      )
       when is_list(columns) and is_list(selectors) and is_list(rows) do
     header = Enum.map_join(columns, "", &"<th scope=\"col\">#{escape(&1)}</th>")
-    body = render_projected_rows(rows, source, selectors)
+    body = render_projected_rows(rows, source, selectors, Map.get(result, :routing_partition))
 
     """
-    <div class="flow-query-table-wrap">
+    <div class="flow-query-table-wrap" role="region" aria-label="Projected query records" tabindex="0">
       <table class="flow-query-table flow-query-projection-table">
         <caption class="sr-only">Query result records</caption>
         <thead><tr>#{header}</tr></thead>
@@ -125,9 +140,21 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     """
   end
 
+  def render_flow_query_table(%{command: "FLOW.QUERY", rows: rows} = result)
+      when is_list(rows) and not is_map_key(result, :scalar) do
+    result
+    |> Map.merge(%{
+      presentation: :workbench,
+      columns: ["Workflow", "Type", "State", "Updated"],
+      column_selectors: [:run_id, :type, :state, :updated_at_ms],
+      source: :runs
+    })
+    |> render_flow_query_table()
+  end
+
   def render_flow_query_table(result) do
     """
-    <div class="flow-query-table-wrap">
+    <div class="flow-query-table-wrap" role="region" aria-label="Query result records" tabindex="0">
       <table class="flow-query-table">
         <caption class="sr-only">Query result records</caption>
         <thead>
@@ -394,15 +421,15 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     end)
   end
 
-  defp render_projected_rows([], _source, selectors) do
+  defp render_projected_rows([], _source, selectors, _partition) do
     colspan = max(length(selectors), 1)
     ~s(<tr><td colspan="#{colspan}" class="c-muted">No rows.</td></tr>)
   end
 
-  defp render_projected_rows(rows, source, selectors) do
+  defp render_projected_rows(rows, source, selectors, partition) do
     Enum.map_join(rows, "\n", fn
       row when is_map(row) ->
-        cells = Enum.map_join(selectors, "", &render_projected_cell(row, source, &1))
+        cells = Enum.map_join(selectors, "", &render_projected_cell(row, source, &1, partition))
         "<tr>#{cells}</tr>"
 
       other ->
@@ -412,20 +439,24 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     end)
   end
 
-  defp render_projected_cell(record, :runs, :run_id) do
+  defp render_projected_cell(record, :runs, :run_id, routing_partition) do
     value = projected_value(record, :runs, :run_id)
-    partition = projected_value(record, :runs, :partition_key)
+    partition = projected_value(record, :runs, :partition_key) || routing_partition
 
-    case value do
-      id when is_binary(id) and id != "" ->
+    case {value, partition} do
+      {id, partition}
+      when is_binary(id) and id != "" and is_binary(partition) and partition != "" ->
         ~s(<td class="mono">#{render_flow_id_link(id, partition)}</td>)
+
+      {id, _} when is_binary(id) and id != "" ->
+        ~s(<td class="mono" title="Include partition_key in the projection to open this workflow.">#{escape(id)}</td>)
 
       _missing ->
         ~s(<td class="c-muted">-</td>)
     end
   end
 
-  defp render_projected_cell(record, source, selector) do
+  defp render_projected_cell(record, source, selector, _partition) do
     value = projected_value(record, source, selector)
     class = projected_cell_class(selector, value)
     ~s(<td class="#{class}">#{escape(display_projected_value(selector, value))}</td>)
@@ -601,7 +632,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
       """
       <section class="flow-query-plan-section">
         <div class="flow-query-plan-title">Estimates and Bounds</div>
-        <div class="flow-query-table-wrap">
+        <div class="flow-query-table-wrap" role="region" aria-label="Query plan estimates and bounds" tabindex="0">
           <table class="flow-query-plan-metrics">
             <caption class="sr-only">Query plan estimates and bounds</caption>
             <thead><tr><th scope="col">Resource</th><th scope="col">Estimate</th><th scope="col">Actual</th><th scope="col">Hard bound</th></tr></thead>
@@ -690,7 +721,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     """
     <section class="flow-query-plan-section">
       <div class="flow-query-plan-title">Alternatives</div>
-      <div class="flow-query-table-wrap"><table><caption class="sr-only">Alternative query plans</caption><thead><tr><th scope="col">Path</th><th scope="col">Source</th><th scope="col">Why not selected</th></tr></thead><tbody>#{rows}</tbody></table></div>
+      <div class="flow-query-table-wrap" role="region" aria-label="Alternative query plans" tabindex="0"><table><caption class="sr-only">Alternative query plans</caption><thead><tr><th scope="col">Path</th><th scope="col">Source</th><th scope="col">Why not selected</th></tr></thead><tbody>#{rows}</tbody></table></div>
     </section>
     """
   end

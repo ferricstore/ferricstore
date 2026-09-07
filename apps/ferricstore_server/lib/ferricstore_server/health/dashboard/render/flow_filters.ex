@@ -104,7 +104,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
         #{clear}
       </form>
       <div class="flow-filter-note">
-        Showing #{escape(flow_filter_summary(filters))} · #{format_number(filtered_sampled)} / #{format_number(total_sampled)} sampled records
+        Showing #{escape(flow_filter_summary(filters))} · #{format_number(filtered_sampled)} matching of #{format_number(total_sampled)} sampled records
         #{info_icon("Updated quick ranges are sliding windows and override custom From/To. Custom times are interpreted as UTC. One explicit type and partition enable bounded cold terminal lookup. All-type views remain sampled. Limit applies to Recent Flow Records only.")}
       </div>
     </div>
@@ -114,6 +114,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
   def render_flow_signals_filter(data) do
     filters = flow_signals_page_filters(data)
     type_filter = Map.get(filters, :type)
+    partition_key = Map.get(filters, :partition_key)
     signal_filter = Map.get(filters, :signal)
     name_filter = Map.get(filters, :q)
     available_types = Map.get(data, :available_types, [])
@@ -136,16 +137,28 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
     """
     <div class="flow-filter-panel">
       <form class="flow-filter-form" action="/dashboard/flow/signals" method="get">
-        <label for="flow-signal-type-filter">Type</label>
-        <select id="flow-signal-type-filter" class="flow-search-input" name="type" title="Filter signals by workflow type">
-          #{type_options}
-        </select>
-        <label for="flow-signal-name-filter">Signal</label>
-        <input id="flow-signal-name-filter" class="flow-search-input mono" type="search" name="signal" value="#{escape_attr(signal_filter || "")}" placeholder="contains" title="Filter by signal name substring">
-        <label for="flow-signal-id-filter">Flow ID</label>
-        <input id="flow-signal-id-filter" class="flow-search-input mono" type="search" name="q" value="#{escape_attr(name_filter || "")}" placeholder="contains" title="Filter by Flow ID substring">
-        <label for="flow-signal-limit-filter">Limit</label>
-        <input id="flow-signal-limit-filter" class="flow-search-input mono flow-filter-limit" type="number" name="limit" min="1" max="#{@flow_dashboard_max_recent_limit}" value="#{limit}" title="Maximum signal rows shown below">
+        <label class="flow-filter-field" for="flow-signal-type-filter">
+          <span>Type</span>
+          <select id="flow-signal-type-filter" class="flow-search-input" name="type" title="Filter signals by workflow type">
+            #{type_options}
+          </select>
+        </label>
+        <label class="flow-filter-field" for="flow-signal-partition-filter">
+          <span>Partition</span>
+          <input id="flow-signal-partition-filter" class="flow-search-input mono" type="search" name="partition_key" value="#{escape_attr(partition_key || "")}" placeholder="optional" title="Filter sampled workflows before reading any histories">
+        </label>
+        <label class="flow-filter-field" for="flow-signal-name-filter">
+          <span>Signal</span>
+          <input id="flow-signal-name-filter" class="flow-search-input mono" type="search" name="signal" value="#{escape_attr(signal_filter || "")}" placeholder="contains" title="Filter by signal name substring">
+        </label>
+        <label class="flow-filter-field" for="flow-signal-id-filter">
+          <span>Flow ID</span>
+          <input id="flow-signal-id-filter" class="flow-search-input mono" type="search" name="q" value="#{escape_attr(name_filter || "")}" placeholder="contains" title="Filter by Flow ID substring">
+        </label>
+        <label class="flow-filter-field" for="flow-signal-limit-filter">
+          <span>Limit</span>
+          <input id="flow-signal-limit-filter" class="flow-search-input mono flow-filter-limit" type="number" name="limit" min="1" max="#{@flow_dashboard_max_recent_limit}" value="#{limit}" title="Maximum signal rows shown below">
+        </label>
         <label class="flow-check-label" title="Read recent Flow histories for the sampled flows. This is intentionally opt-in because it can be expensive under load.">
           <input type="checkbox" name="scan" value="true"#{scan_checked}> Scan histories
         </label>
@@ -153,7 +166,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
         #{clear}
       </form>
       <div class="flow-filter-note">
-        Showing #{escape(flow_signals_filter_summary(filters))} · #{format_number(filtered_sampled)} / #{format_number(total_sampled)} sampled records
+        Showing #{escape(flow_signals_filter_summary(filters))} · #{format_number(filtered_sampled)} matching of #{format_number(total_sampled)} sampled records
         #{scan_status}
         #{info_icon("Default view avoids history scans so the dashboard stays cheap during soak. Enable Scan histories to inspect recent sampled history, or use Flow detail for full paginated history.")}
       </div>
@@ -248,7 +261,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
   def flow_filter_partition_label(partition_key), do: "partition #{partition_key}"
 
   def flow_signal_filter_active?(filters) do
-    Enum.any?([:type, :signal, :q], fn key ->
+    Enum.any?([:type, :partition_key, :signal, :q], fn key ->
       case Map.get(filters, key) do
         nil -> false
         "" -> false
@@ -261,6 +274,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
   def flow_signals_filter_summary(filters) do
     [
       Map.get(filters, :type) || "all types",
+      flow_filter_partition_label(Map.get(filters, :partition_key)),
       flow_signal_name_label(Map.get(filters, :signal)),
       flow_filter_name_label(Map.get(filters, :q)),
       flow_filter_limit_label(Map.get(filters, :limit)),

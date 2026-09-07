@@ -7,7 +7,7 @@
       <%= render_subpage_header("FerricFlow Retention") %>
       <div class="content">
         <%= render_page_intro("FerricFlow Retention", "Preview and run guarded active-runtime enforcement and terminal workflow cleanup so stuck work and retained data do not grow forever.") %>
-        <%= render_flow_subnav("retention") %>
+        <%= render_flow_context_tools(data, "flow_retention") %>
         <%= render_flow_retention_summary(data) %>
         <%= render_flow_retention_controls(data) %>
         <%= render_flow_retention_commands() %>
