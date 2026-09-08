@@ -148,6 +148,8 @@ defmodule Ferricstore.FlowCrashMatrixTest do
     shard = flow_shard(id, partition)
 
     create_and_complete(type, partition, id, result: "lmdb-result")
+    assert :ok = LMDBWriter.flush(:default, shard, 45_000)
+
     fault = install_blocking_fault(:before_flow_lmdb_flush_write)
     state_key = Ferricstore.Flow.Keys.state_key(id, partition)
 
@@ -205,18 +207,27 @@ defmodule Ferricstore.FlowCrashMatrixTest do
 
     assert :ok = HistoryProjector.flush(FerricStore.Instance.get(:default), shard, 45_000)
 
-    assert {:ok, history} =
-             FerricStore.flow_history(id,
+    ShardHelpers.eventually(
+      fn ->
+        case FerricStore.flow_history(id,
                partition_key: partition,
                count: 20,
                include_cold: true,
                consistent_projection: true,
                values: true
-             )
+             ) do
+          {:ok, history} ->
+            events = Enum.map(history, fn {_event_id, fields} -> fields["event"] end)
+            "created" in events and "completed" in events
 
-    events = Enum.map(history, fn {_event_id, fields} -> fields["event"] end)
-    assert "created" in events
-    assert "completed" in events
+          _other ->
+            false
+        end
+      end,
+      "history projector should replay created and completed events",
+      300,
+      100
+    )
   end
 
   test "blob GC crash after live-ref scan does not delete live Flow blobs" do

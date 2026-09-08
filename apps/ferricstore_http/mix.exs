@@ -37,7 +37,7 @@ defmodule FerricstoreHttp.MixProject do
       {:cowlib,
        github: "ninenines/cowlib", ref: "834c19854c2d6b6b0840d7ff90b0775e9f67f631", override: true},
       {:jason, "~> 1.4"},
-      {:mint, "~> 1.9.3"},
+      {:mint, "~> 1.10.0"},
       {:msgpax, "~> 2.4.0"},
       {:arch_test, "~> 0.3.1", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4.7", only: [:dev, :test], runtime: false},
