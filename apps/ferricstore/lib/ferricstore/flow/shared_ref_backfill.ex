@@ -1537,9 +1537,6 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
 
       {:error, reason} ->
         raise "shared-ref backfill failed to decode expired LMDB QueryRows: #{inspect(reason)}"
-
-      other ->
-        raise "shared-ref backfill expired LMDB QueryRow read returned #{inspect(other)}"
     end
   end
 
