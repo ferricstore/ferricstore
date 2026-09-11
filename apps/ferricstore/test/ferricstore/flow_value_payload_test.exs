@@ -520,6 +520,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
 
   test "retention sweeper runs cleanup through Flow command path" do
     id = unique_id("flow-value-retention-sweeper")
+    now_ms = Ferricstore.HLC.now_ms()
     parent = self()
     handler_id = "flow-retention-sweeper-test-#{System.unique_integer([:positive])}"
 
@@ -539,9 +540,9 @@ defmodule Ferricstore.FlowValuePayloadTest do
                type: "value-retention-sweeper",
                partition_key: "tenant-retention",
                payload: %{large: String.duplicate("s", 256)},
-               retention_ttl_ms: 100,
-               run_at_ms: 1_000,
-               now_ms: 1_000
+               retention_ttl_ms: 60_000,
+               run_at_ms: now_ms,
+               now_ms: now_ms
              )
 
     assert {:ok, created} = FerricStore.flow_get(id, partition_key: "tenant-retention")
@@ -551,7 +552,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
                partition_key: "tenant-retention",
                worker: "worker-retention-sweeper",
                limit: 1,
-               now_ms: 1_000
+               now_ms: now_ms
              )
 
     assert :ok =
@@ -559,24 +560,49 @@ defmodule Ferricstore.FlowValuePayloadTest do
                partition_key: "tenant-retention",
                fencing_token: claimed.fencing_token,
                result: %{ok: true},
-               now_ms: 1_100
+               now_ms: now_ms
              )
 
+    ctx = FerricStore.Instance.get(:default)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
     assert {:ok, completed} = FerricStore.flow_get(id, partition_key: "tenant-retention")
+    cleanup_now_ms = completed.terminal_retention_until_ms + 1
+    sweeper_name = :"flow_retention_sweeper_test_#{System.unique_integer([:positive])}"
 
-    :ok = Ferricstore.HLC.update({completed.terminal_retention_until_ms + 1, 0})
+    sweeper =
+      start_supervised!(
+        Supervisor.child_spec(
+          {Ferricstore.Flow.RetentionSweeper,
+           name: sweeper_name,
+           initial_delay_ms: 86_400_000,
+           pressure_detector_fun: fn -> false end,
+           cleanup_fun: fn opts ->
+             FerricStore.flow_retention_cleanup(Keyword.put(opts, :now_ms, cleanup_now_ms))
+           end,
+           compaction_fun: fn -> :ok end},
+          id: sweeper_name
+        )
+      )
 
-    assert pid = Process.whereis(Ferricstore.Flow.RetentionSweeper)
-    send(pid, :sweep)
+    send(sweeper, :sweep)
 
     cleaned = await_retention_sweeper_cleanup!(5_000)
 
     assert cleaned.flows >= 1
     assert cleaned.history >= 1
     assert cleaned.values >= 2
-    assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
-    assert {:ok, nil} = internal_get(created.payload_ref)
-    assert {:ok, nil} = internal_get(completed.result_ref)
+
+    ShardHelpers.eventually(
+      fn ->
+        Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count) == :ok and
+          FerricStore.flow_get(id, partition_key: "tenant-retention") == {:ok, nil} and
+          internal_get(created.payload_ref) == {:ok, nil} and
+          internal_get(completed.result_ref) == {:ok, nil}
+      end,
+      "retention cleanup should remove the Flow and its owned values",
+      100,
+      20
+    )
   end
 
   test "rewind from terminal back to active clears value ref expiration" do
