@@ -332,6 +332,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.HelpersPart02 do
           ])
 
         assert %FerricStore.Instance{} = ctx
+        start_peer_lmdb_flush_coordinator!(node.name, ctx.name)
 
         assert :ok =
                  :rpc.call(node.name, WARaftBackend, :start, [
@@ -339,6 +340,21 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.HelpersPart02 do
                    [bootstrap: false, log_module: :ferricstore_waraft_spike_segment_log] ++
                      backend_opts
                  ])
+      end
+
+      defp start_peer_lmdb_flush_coordinator!(node_name, instance_name) do
+        child_spec =
+          Supervisor.child_spec(
+            {Ferricstore.Flow.LMDBFlushCoordinator, instance_name: instance_name},
+            id: Ferricstore.Flow.LMDBFlushCoordinator.name(instance_name)
+          )
+
+        case :rpc.call(node_name, Supervisor, :start_child, [:kernel_sup, child_spec]) do
+          {:ok, pid} when is_pid(pid) -> :ok
+          {:ok, pid, _info} when is_pid(pid) -> :ok
+          {:error, {:already_started, pid}} when is_pid(pid) -> :ok
+          other -> flunk("failed to start peer LMDB flush coordinator: #{inspect(other)}")
+        end
       end
 
       defp key_for_shard(ctx, shard_index, prefix) do
