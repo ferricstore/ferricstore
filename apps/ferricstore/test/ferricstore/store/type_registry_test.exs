@@ -47,4 +47,22 @@ defmodule Ferricstore.Store.TypeRegistryTest do
     assert :ok = TypeRegistry.serialized_claim_status("filter", :bloom, store)
     assert :ok = TypeRegistry.check_type("filter", :bloom, store)
   end
+
+  test "rolling back a freshly created type claim does not read promotion state" do
+    parent = self()
+    type_key = CompoundKey.type_key("hash")
+
+    store = %{
+      compound_get: fn _redis_key, _compound_key ->
+        flunk("a fresh type-claim rollback must not inspect promotion state")
+      end,
+      compound_delete: fn "hash", ^type_key ->
+        send(parent, :type_deleted)
+        :ok
+      end
+    }
+
+    assert :ok = TypeRegistry.rollback_created_type("hash", store)
+    assert_receive :type_deleted
+  end
 end

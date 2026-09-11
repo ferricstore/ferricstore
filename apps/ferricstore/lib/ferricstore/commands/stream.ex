@@ -646,7 +646,7 @@ defmodule Ferricstore.Commands.Stream do
   end
 
   defp rollback_new_stream_type_marker(key, store, {:ok, :created}, write_error) do
-    case TypeRegistry.delete_type(key, store) do
+    case TypeRegistry.rollback_created_type(key, store) do
       :ok ->
         write_error
 
@@ -671,7 +671,7 @@ defmodule Ferricstore.Commands.Stream do
 
     type_result =
       case type_status do
-        {:ok, :created} -> TypeRegistry.delete_type(key, store)
+        {:ok, :created} -> TypeRegistry.rollback_created_type(key, store)
         _existing_or_untyped -> :ok
       end
 
@@ -1154,7 +1154,7 @@ defmodule Ferricstore.Commands.Stream do
 
     type_result =
       case type_status do
-        {:ok, :created} -> TypeRegistry.delete_type(key, store)
+        {:ok, :created} -> TypeRegistry.rollback_created_type(key, store)
         _existing_or_untyped -> :ok
       end
 

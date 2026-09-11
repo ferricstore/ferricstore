@@ -542,6 +542,7 @@ defmodule Ferricstore.Commands.SetTest.Sections.Sadd do
           s1_type = CompoundKey.type_key("s1")
           s2_type = CompoundKey.type_key("s2")
           dst_type = CompoundKey.type_key("dst")
+          dst_promotion = CompoundKey.promotion_marker_key("dst")
           dst_list_meta = CompoundKey.list_meta_key("dst")
           dst_stream_meta = CompoundKey.stream_meta_key("dst")
 
@@ -555,6 +556,7 @@ defmodule Ferricstore.Commands.SetTest.Sections.Sadd do
               "s1", ^s1_type -> "set"
               "s2", ^s2_type -> "set"
               "dst", ^dst_type -> nil
+              "dst", ^dst_promotion -> nil
             end,
             compound_scan: fn
               "s1", _prefix -> [{"a", "1"}, {"b", "1"}]
@@ -644,6 +646,7 @@ defmodule Ferricstore.Commands.SetTest.Sections.Sadd do
           s1_type = CompoundKey.type_key("s1")
           s2_type = CompoundKey.type_key("s2")
           dst_type = CompoundKey.type_key("dst")
+          dst_promotion = CompoundKey.promotion_marker_key("dst")
           dst_list_meta = CompoundKey.list_meta_key("dst")
           dst_stream_meta = CompoundKey.stream_meta_key("dst")
 
@@ -654,6 +657,7 @@ defmodule Ferricstore.Commands.SetTest.Sections.Sadd do
               "s1", ^s1_type -> "set"
               "s2", ^s2_type -> "set"
               "dst", ^dst_type -> nil
+              "dst", ^dst_promotion -> nil
             end,
             compound_scan: fn
               "s1", _prefix -> [{"a", "1"}]

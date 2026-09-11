@@ -137,7 +137,7 @@ defmodule Ferricstore.Commands.Set.Destination do
   end
 
   defp rollback_new_set_type_marker(key, store, {:ok, :created}, write_error) do
-    case TypeRegistry.delete_type(key, store) do
+    case TypeRegistry.rollback_created_type(key, store) do
       :ok ->
         write_error
 

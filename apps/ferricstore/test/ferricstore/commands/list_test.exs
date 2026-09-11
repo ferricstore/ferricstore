@@ -25,6 +25,7 @@ defmodule Ferricstore.Commands.ListTest do
 
   defp list_cleanup_failure_store do
     type_key = CompoundKey.type_key("mylist")
+    promotion_key = CompoundKey.promotion_marker_key("mylist")
     meta_key = CompoundKey.list_meta_key("mylist")
     element_key = CompoundKey.list_element("mylist", 0)
     {:ok, meta_deleted} = Agent.start_link(fn -> false end)
@@ -33,6 +34,9 @@ defmodule Ferricstore.Commands.ListTest do
       compound_get: fn
         "mylist", ^type_key ->
           "list"
+
+        "mylist", ^promotion_key ->
+          nil
 
         "mylist", ^meta_key ->
           unless Agent.get(meta_deleted, & &1) do

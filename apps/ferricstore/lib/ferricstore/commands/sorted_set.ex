@@ -694,7 +694,7 @@ defmodule Ferricstore.Commands.SortedSet do
   end
 
   defp rollback_new_zset_type_marker(key, store, {:ok, :created}, write_error) do
-    case TypeRegistry.delete_type(key, store) do
+    case TypeRegistry.rollback_created_type(key, store) do
       :ok ->
         write_error
 
@@ -706,7 +706,7 @@ defmodule Ferricstore.Commands.SortedSet do
   defp rollback_new_zset_type_marker(_key, _store, :ok, write_error), do: write_error
 
   defp persist_zadd_entries(key, [], result, store, {:ok, :created}) do
-    case TypeRegistry.delete_type(key, store) do
+    case TypeRegistry.rollback_created_type(key, store) do
       :ok -> result
       {:error, _} = error -> error
     end

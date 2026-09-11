@@ -36,10 +36,14 @@ defmodule Ferricstore.Commands.SetTest do
 
   defp set_cleanup_failure_store do
     type_key = CompoundKey.type_key("myset")
+    promotion_key = CompoundKey.promotion_marker_key("myset")
     member_key = CompoundKey.set_member("myset", "only")
 
     %{
-      compound_get: fn "myset", ^type_key -> "set" end,
+      compound_get: fn
+        "myset", ^type_key -> "set"
+        "myset", ^promotion_key -> nil
+      end,
       compound_batch_get: fn "myset", [^member_key] -> ["1"] end,
       compound_batch_delete: fn "myset", [^member_key] -> :ok end,
       compound_batch_put: fn "myset", [{^member_key, "1", 0}] -> :ok end,

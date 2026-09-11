@@ -269,6 +269,12 @@ defmodule Ferricstore.Store.TypeRegistry do
     end
   end
 
+  @doc false
+  @spec rollback_created_type(binary(), map()) :: :ok | {:error, term()}
+  def rollback_created_type(redis_key, store) do
+    Ops.compound_delete(store, redis_key, CompoundKey.type_key(redis_key))
+  end
+
   defp cleanup_promoted_collection(redis_key, store) do
     case Ops.compound_get(store, redis_key, Promotion.marker_key(redis_key)) do
       nil ->
