@@ -11,7 +11,27 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
 
   alias Ferricstore.Commands.Native
   alias Ferricstore.FetchOrCompute
+  alias Ferricstore.FetchOrCompute.Worker
   alias Ferricstore.Store.Router
+
+  defmodule ImmediateStorage do
+    @test_pid_key {__MODULE__, :test_pid}
+
+    def set_test_pid(pid), do: :persistent_term.put(@test_pid_key, pid)
+    def clear_test_pid, do: :persistent_term.erase(@test_pid_key)
+
+    def get(_ctx, _key), do: nil
+
+    def fetch_or_compute_lock(_ctx, _key, _token, ttl_ms) do
+      send(:persistent_term.get(@test_pid_key), {:immediate_storage_lock_ttl, ttl_ms})
+      :ok
+    end
+
+    def fetch_or_compute_release(_ctx, _key, _token), do: :ok
+    def fetch_or_compute_publish(_ctx, _key, _value, _ttl_ms, _token), do: :ok
+    def fetch_or_compute_fail(_ctx, _key, _token, _message, _ttl_ms), do: :ok
+    def fetch_or_compute_outcome(_ctx, _key), do: :pending
+  end
 
   setup_all do
     Ferricstore.Test.ShardHelpers.wait_default_quorum_writable(60_000)
@@ -104,10 +124,14 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
     test "uses the requested lease ttl instead of the coordinator default" do
       key = ukey("requested_ttl")
       parent = self()
+      ctx = FerricStore.Instance.get(:default)
+      {:ok, worker} = Worker.start_link(storage_module: ImmediateStorage)
+      ImmediateStorage.set_test_pid(parent)
+      on_exit(fn -> ImmediateStorage.clear_test_pid() end)
 
       owner =
         spawn(fn ->
-          result = FetchOrCompute.fetch_or_compute(key, 100, "hint")
+          result = fetch_with_worker(worker, ctx, key, 100)
           send(parent, {:ttl_owner_result, self(), result})
           Process.sleep(:infinity)
         end)
@@ -115,7 +139,8 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
       on_exit(fn -> if Process.alive?(owner), do: Process.exit(owner, :kill) end)
 
       assert_receive {:ttl_owner_result, ^owner, {:compute, "hint", _token}}, 1_000
-      waiter = Task.async(fn -> FetchOrCompute.fetch_or_compute(key, 100, "hint") end)
+      assert_receive {:immediate_storage_lock_ttl, 100}, 1_000
+      waiter = Task.async(fn -> fetch_with_worker(worker, ctx, key, 100) end)
 
       assert {:ok, {:error, :timeout}} = Task.yield(waiter, 1_000)
     end
@@ -636,6 +661,14 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
   end
 
   defp eventually(_fun, 0), do: false
+
+  defp fetch_with_worker(worker, ctx, key, ttl_ms) do
+    GenServer.call(
+      worker,
+      {:fetch_or_compute, ctx, {ctx.name, key}, key, ttl_ms, "hint", self()},
+      :infinity
+    )
+  end
 
   defp start_custom_instance(name) do
     data_dir =

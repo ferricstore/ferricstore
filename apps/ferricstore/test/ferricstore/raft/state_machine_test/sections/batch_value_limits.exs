@@ -5,7 +5,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.BatchValueLimits do
     quote do
       alias Ferricstore.Raft.StateMachineTest.CurrentStateMachine, as: StateMachine
       alias Ferricstore.Raft.WARaftStorage
-      alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey, LFU, ListOps}
+      alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey, LFU, ListOps, Promotion}
       alias Ferricstore.Store.Shard.{CompoundMemberIndex, ZSetIndex}
 
       describe "replicated batch value limits" do
@@ -1518,6 +1518,269 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.BatchValueLimits do
 
           assert [{^exact_key, "1234", 0, _lfu, {:waraft_segment, 42}, _offset, 4}] =
                    :ets.lookup(ets, exact_key)
+        end
+
+        @tag :segment_batch_preparation
+        test "segment projection prepares traced batches and promotion keys together" do
+          redis_key = "segment-prepared-compound"
+          compound_key = CompoundKey.hash_field(redis_key, "field")
+
+          commands = [
+            {:ferricstore_latency_trace, {:put, "plain", "value", 0}},
+            {:ferricstore_latency_trace, {:compound_put, compound_key, "one", 0}},
+            {:compound_delete_prefix, CompoundKey.hash_prefix(redis_key)}
+          ]
+
+          assert {
+                   {:ferricstore_segment_prepared_batch,
+                    {:generic,
+                     [
+                       {:put, "plain", "value", 0},
+                       {:compound_put, ^compound_key, "one", 0},
+                       {:compound_delete_prefix, _prefix}
+                     ]}},
+                   [^redis_key]
+                 } =
+                   WARaftStorage.__prepare_segment_projection_command_for_test__({
+                     :batch,
+                     commands
+                   })
+
+          plain_commands =
+            Enum.map(1..1_024, fn index ->
+              {:ferricstore_latency_trace, {:put, "plain-#{index}", "value", 0}}
+            end)
+
+          assert {
+                   {:ferricstore_segment_prepared_batch, {:put_batch, prepared_entries}},
+                   []
+                 } =
+                   WARaftStorage.__prepare_segment_projection_command_for_test__({
+                     :batch,
+                     plain_commands
+                   })
+
+          assert length(prepared_entries) == 1_024
+
+          assert {
+                   {:ferricstore_segment_prepared_batch, {:generic, []}},
+                   []
+                 } =
+                   WARaftStorage.__prepare_segment_projection_command_for_test__({
+                     :batch,
+                     []
+                   })
+
+          marker_key = Promotion.marker_key(redis_key)
+
+          assert {{:delete, ^marker_key}, [^redis_key]} =
+                   WARaftStorage.__prepare_segment_projection_command_for_test__({
+                     :delete,
+                     marker_key
+                   })
+
+          assert {
+                   {:ferricstore_segment_prepared_batch, {:delete_batch, [^marker_key]}},
+                   [^redis_key]
+                 } =
+                   WARaftStorage.__prepare_segment_projection_command_for_test__({
+                     :batch,
+                     [{:delete, marker_key}]
+                   })
+
+          hash_key = CompoundKey.hash_field(redis_key, "hash-field")
+          set_key = CompoundKey.set_member(redis_key, "set-member")
+          zset_key = CompoundKey.zset_member(redis_key, "zset-member")
+          type_key = CompoundKey.type_key(redis_key)
+
+          for command <- [
+                {:put, hash_key, "value", 0},
+                {:put_blob_ref, set_key, "encoded-ref", 0},
+                {:delete, zset_key},
+                {:put_batch, [{type_key, "hash", 0}, {hash_key, "value", 0}]},
+                {:put_blob_batch, [{set_key, "encoded-ref", 0, :blob_ref}]},
+                {:delete_batch, [marker_key, hash_key, marker_key]}
+              ] do
+            {prepared, promotion_keys} =
+              WARaftStorage.__prepare_segment_projection_command_for_test__(command)
+
+            assert is_tuple(prepared)
+            assert [^redis_key] = promotion_keys
+          end
+
+          assert {_prepared, []} =
+                   WARaftStorage.__prepare_segment_projection_command_for_test__({
+                     :put_batch,
+                     [{"plain-only", "value", 0}]
+                   })
+
+          assert {_prepared, [^redis_key]} =
+                   WARaftStorage.__prepare_segment_projection_command_for_test__({
+                     :batch,
+                     [
+                       {:put, hash_key, "value", 0},
+                       {:put_blob_ref, set_key, "encoded-ref", 0},
+                       {:put_batch, [{zset_key, "value", 0}]},
+                       {:put_blob_batch, [{type_key, "hash", 0, :value}]},
+                       {:delete, marker_key},
+                       {:delete_batch, [hash_key, marker_key]}
+                     ]
+                   })
+
+          binary_safe_key = <<"owner%", 0, "with%00-separator">>
+          binary_safe_hash = CompoundKey.hash_field(binary_safe_key, <<"field%", 0>>)
+          binary_safe_type = CompoundKey.type_key(binary_safe_key)
+          binary_safe_marker = Promotion.marker_key(binary_safe_key)
+
+          assert {_prepared, [^binary_safe_key]} =
+                   WARaftStorage.__prepare_segment_projection_command_for_test__({
+                     :put_batch,
+                     [
+                       {binary_safe_hash, "value", 0},
+                       {binary_safe_type, "hash", 0},
+                       {binary_safe_marker, "marker", 0}
+                     ]
+                   })
+
+          assert {_prepared, [<<>>]} =
+                   WARaftStorage.__prepare_segment_projection_command_for_test__({
+                     :delete_batch,
+                     [
+                       CompoundKey.hash_field(<<>>, <<"field", 0>>),
+                       CompoundKey.type_key(<<>>),
+                       CompoundKey.promotion_marker_key(<<>>)
+                     ]
+                   })
+        end
+
+        @tag :segment_batch_preparation
+        test "segment projection keeps promotion marker deletes on the state machine path", %{
+          state: state
+        } do
+          redis_key = "segment-marker-delete-fallback"
+          marker_key = Promotion.marker_key(redis_key)
+          position = {:raft_log_pos, 44, 1}
+
+          assert :unsupported =
+                   WARaftStorage.__segment_project_command_for_test__(
+                     {:delete, marker_key},
+                     position,
+                     state
+                   )
+
+          assert :unsupported =
+                   WARaftStorage.__segment_project_command_for_test__(
+                     {:delete_batch, ["plain", marker_key]},
+                     position,
+                     state
+                   )
+
+          assert :unsupported =
+                   WARaftStorage.__segment_project_command_for_test__(
+                     {:batch, [{:delete, marker_key}]},
+                     position,
+                     state
+                   )
+        end
+
+        @tag :segment_batch_preparation
+        test "segment recovery holds promotion latches while projecting compound commands", %{
+          state: state
+        } do
+          redis_key = "segment-recovery-promotion-latch"
+          compound_key = CompoundKey.hash_field(redis_key, "field")
+          latch_table = :ets.new(:segment_recovery_promotion_latch, [:set, :public])
+          instance_ctx = %{FerricStore.Instance.get(:default) | latch_refs: {latch_table}}
+          state = %{state | shard_index: 0, instance_ctx: instance_ctx}
+          owner = %{instance_ctx: instance_ctx, shard_index: 0}
+          latch = Promotion.acquire_compaction_latch(owner, redis_key)
+
+          recovery =
+            Task.async(fn ->
+              WARaftStorage.__recover_segment_projected_command_for_test__(
+                {:compound_delete, compound_key},
+                {:raft_log_pos, 44, 1},
+                state
+              )
+            end)
+
+          try do
+            assert nil == Task.yield(recovery, 50)
+          after
+            Promotion.release_compaction_latch(latch)
+          end
+
+          assert {:ok, _next_state, %{history: %{}}} = Task.await(recovery, 5_000)
+        end
+
+        @tag :segment_batch_preparation
+        test "segment recovery holds promotion latches while projecting raw compound storage keys",
+             %{state: state} do
+          redis_key = "segment-recovery-raw-promotion-latch"
+          storage_key = CompoundKey.hash_field(redis_key, "field")
+          latch_table = :ets.new(:segment_recovery_raw_promotion_latch, [:set, :public])
+          instance_ctx = %{FerricStore.Instance.get(:default) | latch_refs: {latch_table}}
+          state = %{state | shard_index: 0, instance_ctx: instance_ctx}
+          owner = %{instance_ctx: instance_ctx, shard_index: 0}
+          latch = Promotion.acquire_compaction_latch(owner, redis_key)
+
+          recovery =
+            Task.async(fn ->
+              WARaftStorage.__recover_segment_projected_command_for_test__(
+                {:put, storage_key, "value", 0},
+                {:raft_log_pos, 46, 1},
+                state
+              )
+            end)
+
+          try do
+            assert nil == Task.yield(recovery, 50)
+          after
+            Promotion.release_compaction_latch(latch)
+          end
+
+          assert {:ok, _next_state, %{history: %{}}} = Task.await(recovery, 5_000)
+        end
+
+        @tag :segment_batch_preparation
+        test "segment recovery releases its speculative latch before state-machine fallback", %{
+          state: state,
+          ets: ets
+        } do
+          redis_key = "segment-recovery-promoted-fallback"
+          compound_key = CompoundKey.hash_field(redis_key, "field")
+          state = promoted_cleanup_test_state(state)
+
+          {state, _log_path} =
+            promoted_single_fixture(state, ets, 0, redis_key, :hash, [
+              {compound_key, "value", 0}
+            ])
+
+          previous_timeout =
+            Application.get_env(:ferricstore, :promotion_compaction_latch_timeout_ms)
+
+          Application.put_env(:ferricstore, :promotion_compaction_latch_timeout_ms, 10)
+
+          on_exit(fn ->
+            case previous_timeout do
+              nil ->
+                Application.delete_env(:ferricstore, :promotion_compaction_latch_timeout_ms)
+
+              timeout_ms ->
+                Application.put_env(
+                  :ferricstore,
+                  :promotion_compaction_latch_timeout_ms,
+                  timeout_ms
+                )
+            end
+          end)
+
+          assert {:ok, _next_state, %{history: %{}}} =
+                   WARaftStorage.__recover_segment_projected_command_for_test__(
+                     {:compound_delete, compound_key},
+                     {:raft_log_pos, 45, 1},
+                     state
+                   )
         end
 
         @tag :segment_compound_count_failure

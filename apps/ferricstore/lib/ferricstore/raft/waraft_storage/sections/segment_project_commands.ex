@@ -58,6 +58,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
         end
       end
 
+      defp segment_project_command({:delete, <<"PM:", _::binary>>}, _position, _sm_state),
+        do: :unsupported
+
       defp segment_project_command({:delete, key}, _position, sm_state) when is_binary(key) do
         redis_key = CompoundKey.extract_redis_key(key)
 
@@ -378,18 +381,22 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
 
       defp segment_project_command({:delete_batch, keys}, position, sm_state)
            when is_list(keys) do
-        if segment_projection_keys_locked?(sm_state, keys) do
-          case delete_batch_entry_commands(keys) do
-            {:ok, commands} -> segment_project_generic_batch(commands, position, sm_state)
-            :error -> :unsupported
-          end
-        else
-          if Enum.all?(keys, &is_binary/1) do
+        cond do
+          Enum.any?(keys, &segment_project_promotion_marker_key?/1) ->
+            :unsupported
+
+          segment_projection_keys_locked?(sm_state, keys) ->
+            case delete_batch_entry_commands(keys) do
+              {:ok, commands} -> segment_project_generic_batch(commands, position, sm_state)
+              :error -> :unsupported
+            end
+
+          Enum.all?(keys, &is_binary/1) ->
             new_sm_state = Enum.reduce(keys, sm_state, &segment_project_delete(&2, &1))
             {:ok, new_sm_state, {:ok, List.duplicate(:ok, length(keys))}, length(keys)}
-          else
+
+          true ->
             :unsupported
-          end
         end
       end
 
@@ -452,17 +459,18 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
 
       defp segment_project_command({:batch, commands}, position, sm_state)
            when is_list(commands) do
-        case segment_project_decode_batch(commands, :unknown, [], []) do
-          {:put_batch, entries} ->
-            segment_project_command({:put_batch, entries}, position, sm_state)
+        {prepared_batch, _promotion_keys} =
+          segment_project_decode_batch(commands, :unknown, [], [], nil)
 
-          {:delete_batch, keys} ->
-            segment_project_command({:delete_batch, keys}, position, sm_state)
-
-          {:generic, commands} ->
-            segment_project_generic_batch(commands, position, sm_state)
-        end
+        segment_project_prepared_batch(prepared_batch, position, sm_state)
       end
+
+      defp segment_project_command(
+             {:ferricstore_segment_prepared_batch, prepared_batch},
+             position,
+             sm_state
+           ),
+           do: segment_project_prepared_batch(prepared_batch, position, sm_state)
 
       defp segment_project_command(_command, _position, _sm_state), do: :unsupported
 
@@ -496,49 +504,454 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
         end
       end
 
-      defp segment_project_decode_batch([], :put, _decoded_acc, entries) do
-        {:put_batch, Enum.reverse(entries)}
+      defp segment_project_prepared_batch({:put_batch, entries}, position, sm_state),
+        do: segment_project_command({:put_batch, entries}, position, sm_state)
+
+      defp segment_project_prepared_batch({:delete_batch, keys}, position, sm_state),
+        do: segment_project_command({:delete_batch, keys}, position, sm_state)
+
+      defp segment_project_prepared_batch({:generic, commands}, position, sm_state),
+        do: segment_project_generic_batch(commands, position, sm_state)
+
+      defp prepare_segment_projection_command({:batch, commands}) when is_list(commands) do
+        case segment_project_prepare_plain_put_batch(commands, []) do
+          {:ok, entries} ->
+            {{:ferricstore_segment_prepared_batch, {:put_batch, entries}}, []}
+
+          :not_plain_put_batch ->
+            {prepared_batch, promotion_keys} =
+              segment_project_decode_batch(
+                commands,
+                :unknown,
+                [],
+                [],
+                :none
+              )
+
+            {{:ferricstore_segment_prepared_batch, prepared_batch}, promotion_keys}
+        end
       end
 
-      defp segment_project_decode_batch([], :delete, _decoded_acc, keys) do
-        {:delete_batch, Enum.reverse(keys)}
+      defp prepare_segment_projection_command(command),
+        do: {command, segment_projection_promotion_keys(command)}
+
+      defp segment_project_prepare_plain_put_batch([], []),
+        do: :not_plain_put_batch
+
+      defp segment_project_prepare_plain_put_batch([], entries),
+        do: {:ok, Enum.reverse(entries)}
+
+      defp segment_project_prepare_plain_put_batch([command | rest], entries) do
+        case decoded_replay_command(command) do
+          {:put, key, value, expire_at_ms}
+          when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) and
+                 expire_at_ms >= 0 ->
+            if segment_project_plain_preparation_key?(key) do
+              segment_project_prepare_plain_put_batch(
+                rest,
+                [{key, value, expire_at_ms} | entries]
+              )
+            else
+              :not_plain_put_batch
+            end
+
+          _other ->
+            :not_plain_put_batch
+        end
       end
 
-      defp segment_project_decode_batch([], _kind, decoded_acc, _fast_acc) do
-        {:generic, Enum.reverse(decoded_acc)}
+      defp segment_project_plain_preparation_key?(key) when is_binary(key) do
+        case key do
+          <<"H:", _::binary>> -> false
+          <<"S:", _::binary>> -> false
+          <<"Z:", _::binary>> -> false
+          <<"T:", _::binary>> -> false
+          <<"PM:", _::binary>> -> false
+          _plain -> true
+        end
       end
 
-      defp segment_project_decode_batch([command | rest], kind, decoded_acc, fast_acc) do
+      defp segment_project_decode_batch([], :put, _decoded_acc, entries, promotion_keys) do
+        {{:put_batch, Enum.reverse(entries)},
+         segment_project_promotion_accumulator_to_list(promotion_keys)}
+      end
+
+      defp segment_project_decode_batch([], :delete, _decoded_acc, keys, promotion_keys) do
+        {{:delete_batch, Enum.reverse(keys)},
+         segment_project_promotion_accumulator_to_list(promotion_keys)}
+      end
+
+      defp segment_project_decode_batch([], _kind, decoded_acc, _fast_acc, promotion_keys) do
+        {{:generic, Enum.reverse(decoded_acc)},
+         segment_project_promotion_accumulator_to_list(promotion_keys)}
+      end
+
+      defp segment_project_decode_batch(
+             [command | rest],
+             kind,
+             decoded_acc,
+             fast_acc,
+             promotion_keys
+           ) do
         decoded = decoded_replay_command(command)
+        promotion_keys = segment_project_batch_promotion_keys(decoded, promotion_keys)
 
         case {kind, decoded} do
           {:unknown, {:put, key, value, expire_at_ms}}
           when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) and
                  expire_at_ms >= 0 ->
-            segment_project_decode_batch(rest, :put, [decoded | decoded_acc], [
-              {key, value, expire_at_ms} | fast_acc
-            ])
+            segment_project_decode_batch(
+              rest,
+              :put,
+              [decoded | decoded_acc],
+              [{key, value, expire_at_ms} | fast_acc],
+              promotion_keys
+            )
 
           {:put, {:put, key, value, expire_at_ms}}
           when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) and
                  expire_at_ms >= 0 ->
-            segment_project_decode_batch(rest, :put, [decoded | decoded_acc], [
-              {key, value, expire_at_ms} | fast_acc
-            ])
+            segment_project_decode_batch(
+              rest,
+              :put,
+              [decoded | decoded_acc],
+              [{key, value, expire_at_ms} | fast_acc],
+              promotion_keys
+            )
 
           {:unknown, {:delete, key}} when is_binary(key) ->
-            segment_project_decode_batch(rest, :delete, [decoded | decoded_acc], [key | fast_acc])
+            segment_project_decode_batch(
+              rest,
+              :delete,
+              [decoded | decoded_acc],
+              [key | fast_acc],
+              promotion_keys
+            )
 
           {:delete, {:delete, key}} when is_binary(key) ->
-            segment_project_decode_batch(rest, :delete, [decoded | decoded_acc], [key | fast_acc])
+            segment_project_decode_batch(
+              rest,
+              :delete,
+              [decoded | decoded_acc],
+              [key | fast_acc],
+              promotion_keys
+            )
 
           {:generic, _decoded} ->
-            segment_project_decode_batch(rest, :generic, [decoded | decoded_acc], [])
+            segment_project_decode_batch(
+              rest,
+              :generic,
+              [decoded | decoded_acc],
+              [],
+              promotion_keys
+            )
 
           {_homogeneous, _decoded} ->
-            segment_project_decode_batch(rest, :generic, [decoded | decoded_acc], [])
+            segment_project_decode_batch(
+              rest,
+              :generic,
+              [decoded | decoded_acc],
+              [],
+              promotion_keys
+            )
         end
       end
+
+      defp segment_project_batch_promotion_keys(
+             _command,
+             nil
+           ),
+           do: nil
+
+      defp segment_project_batch_promotion_keys(
+             {:compound_put, compound_key, _value, _expiry},
+             acc
+           ),
+           do: segment_project_batch_compound_key(compound_key, acc)
+
+      defp segment_project_batch_promotion_keys(
+             {:put, key, _value, _expiry},
+             acc
+           ),
+           do: segment_project_batch_storage_key(key, acc)
+
+      defp segment_project_batch_promotion_keys(
+             {:put_blob_ref, key, _value, _expiry},
+             acc
+           ),
+           do: segment_project_batch_storage_key(key, acc)
+
+      defp segment_project_batch_promotion_keys({:delete, key}, acc),
+        do: segment_project_batch_storage_key(key, acc)
+
+      defp segment_project_batch_promotion_keys({:put_batch, entries}, acc)
+           when is_list(entries),
+           do: segment_project_batch_storage_entries(entries, acc)
+
+      defp segment_project_batch_promotion_keys({:put_blob_batch, entries}, acc)
+           when is_list(entries),
+           do: segment_project_batch_storage_entries(entries, acc)
+
+      defp segment_project_batch_promotion_keys({:delete_batch, keys}, acc)
+           when is_list(keys),
+           do: segment_project_batch_storage_keys(keys, acc)
+
+      defp segment_project_batch_promotion_keys(
+             {:compound_put_blob_ref, compound_key, _value, _expiry},
+             acc
+           ),
+           do: segment_project_batch_compound_key(compound_key, acc)
+
+      defp segment_project_batch_promotion_keys({:compound_delete, compound_key}, acc),
+        do: segment_project_batch_compound_key(compound_key, acc)
+
+      defp segment_project_batch_promotion_keys(
+             {:compound_batch_put, redis_key, _entries},
+             acc
+           )
+           when is_binary(redis_key),
+           do: segment_project_batch_add_promotion_key(redis_key, acc)
+
+      defp segment_project_batch_promotion_keys(
+             {:compound_blob_batch_put, redis_key, _entries},
+             acc
+           )
+           when is_binary(redis_key),
+           do: segment_project_batch_add_promotion_key(redis_key, acc)
+
+      defp segment_project_batch_promotion_keys(
+             {:compound_batch_delete, redis_key, _keys},
+             acc
+           )
+           when is_binary(redis_key),
+           do: segment_project_batch_add_promotion_key(redis_key, acc)
+
+      defp segment_project_batch_promotion_keys({:compound_delete_prefix, prefix}, acc),
+        do: segment_project_batch_compound_key(prefix, acc)
+
+      defp segment_project_batch_promotion_keys(_command, acc), do: acc
+
+      defp segment_project_batch_compound_key(compound_key, acc) when is_binary(compound_key),
+        do:
+          segment_project_batch_add_promotion_key(
+            CompoundKey.extract_redis_key(compound_key),
+            acc
+          )
+
+      defp segment_project_batch_compound_key(_compound_key, acc), do: acc
+
+      defp segment_project_promotion_accumulator_to_list(nil), do: nil
+      defp segment_project_promotion_accumulator_to_list(:none), do: []
+
+      defp segment_project_promotion_accumulator_to_list(
+             {:keys, owners, _seen_tokens, _seen_owners}
+           ),
+           do: Enum.reverse(owners)
+
+      defp segment_project_batch_storage_key(<<"H:", _::binary>> = key, acc),
+        do: segment_project_batch_storage_key_with_token(key, acc)
+
+      defp segment_project_batch_storage_key(<<"S:", _::binary>> = key, acc),
+        do: segment_project_batch_storage_key_with_token(key, acc)
+
+      defp segment_project_batch_storage_key(<<"Z:", _::binary>> = key, acc),
+        do: segment_project_batch_storage_key_with_token(key, acc)
+
+      defp segment_project_batch_storage_key(<<"T:", _::binary>> = key, acc),
+        do: segment_project_batch_storage_key_with_token(key, acc)
+
+      defp segment_project_batch_storage_key(<<"PM:", _::binary>> = key, acc),
+        do: segment_project_batch_storage_key_with_token(key, acc)
+
+      defp segment_project_batch_storage_key(_key, acc), do: acc
+
+      defp segment_project_batch_storage_key_with_token(key, acc) do
+        case segment_project_promotion_owner_token(key) do
+          {:ok, encoded_owner, storage_key} ->
+            segment_project_batch_add_storage_owner(encoded_owner, storage_key, acc)
+
+          :none ->
+            acc
+        end
+      end
+
+      defp segment_project_promotion_key_for_storage_key(key) do
+        case segment_project_promotion_owner_key(key) do
+          {:ok, owner} -> [owner]
+          :none -> []
+        end
+      end
+
+      defp segment_project_batch_storage_keys(keys, acc) do
+        Enum.reduce(segment_project_promotion_keys_for_storage_keys(keys), acc, fn owner, acc ->
+          segment_project_batch_add_promotion_key(owner, acc)
+        end)
+      end
+
+      defp segment_project_batch_storage_entries(entries, acc) do
+        Enum.reduce(segment_project_promotion_keys_for_storage_entries(entries), acc, fn owner,
+                                                                                         acc ->
+          segment_project_batch_add_promotion_key(owner, acc)
+        end)
+      end
+
+      defp segment_project_batch_add_promotion_key(_owner, nil), do: nil
+
+      defp segment_project_batch_add_promotion_key(owner, :none),
+        do: {:keys, [owner], nil, MapSet.new([owner])}
+
+      defp segment_project_batch_add_promotion_key(
+             owner,
+             {:keys, owners, seen_tokens, seen_owners}
+           ) do
+        cond do
+          seen_owners != nil and MapSet.member?(seen_owners, owner) ->
+            {:keys, owners, seen_tokens, seen_owners}
+
+          is_nil(seen_owners) ->
+            {:keys, [owner | owners], seen_tokens, MapSet.new([owner])}
+
+          true ->
+            {:keys, [owner | owners], seen_tokens, MapSet.put(seen_owners, owner)}
+        end
+      end
+
+      defp segment_project_batch_add_storage_owner(
+             _encoded_owner,
+             _storage_key,
+             nil
+           ),
+           do: nil
+
+      defp segment_project_batch_add_storage_owner(encoded_owner, storage_key, :none) do
+        owner = CompoundKey.extract_redis_key(storage_key)
+        {:keys, [owner], MapSet.new([encoded_owner]), MapSet.new([owner])}
+      end
+
+      defp segment_project_batch_add_storage_owner(
+             encoded_owner,
+             storage_key,
+             {:keys, owners, seen_tokens, seen_owners}
+           ) do
+        cond do
+          seen_tokens != nil and MapSet.member?(seen_tokens, encoded_owner) ->
+            {:keys, owners, seen_tokens, seen_owners}
+
+          true ->
+            owner = CompoundKey.extract_redis_key(storage_key)
+
+            seen_tokens =
+              if seen_tokens,
+                do: MapSet.put(seen_tokens, encoded_owner),
+                else: MapSet.new([encoded_owner])
+
+            if seen_owners != nil and MapSet.member?(seen_owners, owner) do
+              {:keys, owners, seen_tokens, seen_owners}
+            else
+              seen_owners =
+                if seen_owners, do: MapSet.put(seen_owners, owner), else: MapSet.new([owner])
+
+              {:keys, [owner | owners], seen_tokens, seen_owners}
+            end
+        end
+      end
+
+      defp segment_project_promotion_owner_key(<<"H:", _::binary>> = key),
+        do: {:ok, CompoundKey.extract_redis_key(key)}
+
+      defp segment_project_promotion_owner_key(<<"S:", _::binary>> = key),
+        do: {:ok, CompoundKey.extract_redis_key(key)}
+
+      defp segment_project_promotion_owner_key(<<"Z:", _::binary>> = key),
+        do: {:ok, CompoundKey.extract_redis_key(key)}
+
+      defp segment_project_promotion_owner_key(<<"T:", _::binary>> = key),
+        do: {:ok, CompoundKey.extract_redis_key(key)}
+
+      defp segment_project_promotion_owner_key(<<"PM:", _::binary>> = key),
+        do: {:ok, CompoundKey.extract_redis_key(key)}
+
+      defp segment_project_promotion_owner_key(_key), do: :none
+
+      defp segment_project_promotion_owner_token(<<"H:", rest::binary>> = key),
+        do: {:ok, segment_project_encoded_owner(rest), key}
+
+      defp segment_project_promotion_owner_token(<<"S:", rest::binary>> = key),
+        do: {:ok, segment_project_encoded_owner(rest), key}
+
+      defp segment_project_promotion_owner_token(<<"Z:", rest::binary>> = key),
+        do: {:ok, segment_project_encoded_owner(rest), key}
+
+      defp segment_project_promotion_owner_token(<<"T:", encoded_owner::binary>> = key),
+        do: {:ok, encoded_owner, key}
+
+      defp segment_project_promotion_owner_token(<<"PM:", encoded_owner::binary>> = key),
+        do: {:ok, encoded_owner, key}
+
+      defp segment_project_promotion_owner_token(_key), do: :none
+
+      defp segment_project_encoded_owner(rest) do
+        case :binary.split(rest, <<0>>) do
+          [encoded_owner | _sub_key] -> encoded_owner
+        end
+      end
+
+      defp segment_project_promotion_marker_key?(<<"PM:", _::binary>>), do: true
+      defp segment_project_promotion_marker_key?(_key), do: false
+
+      defp segment_project_promotion_keys_for_storage_keys(keys) when is_list(keys) do
+        {owners, _seen} = segment_project_collect_storage_keys(keys, [], nil)
+        Enum.reverse(owners)
+      end
+
+      defp segment_project_collect_storage_keys([], owners, seen), do: {owners, seen}
+
+      defp segment_project_collect_storage_keys([key | rest], owners, seen) do
+        {owners, seen} = segment_project_collect_promotion_owner(key, owners, seen)
+        segment_project_collect_storage_keys(rest, owners, seen)
+      end
+
+      defp segment_project_promotion_keys_for_storage_entries(entries) when is_list(entries) do
+        {owners, _seen} = segment_project_collect_storage_entries(entries, [], nil)
+        Enum.reverse(owners)
+      end
+
+      defp segment_project_collect_storage_entries([], owners, seen), do: {owners, seen}
+
+      defp segment_project_collect_storage_entries([entry | rest], owners, seen) do
+        key = segment_project_storage_entry_key(entry)
+        {owners, seen} = segment_project_collect_promotion_owner(key, owners, seen)
+        segment_project_collect_storage_entries(rest, owners, seen)
+      end
+
+      defp segment_project_collect_promotion_owner(key, owners, seen) do
+        case segment_project_promotion_owner_token(key) do
+          :none ->
+            {owners, seen}
+
+          {:ok, encoded_owner, storage_key} when is_nil(seen) ->
+            {[CompoundKey.extract_redis_key(storage_key) | owners], MapSet.new([encoded_owner])}
+
+          {:ok, encoded_owner, storage_key} ->
+            if MapSet.member?(seen, encoded_owner) do
+              {owners, seen}
+            else
+              {
+                [CompoundKey.extract_redis_key(storage_key) | owners],
+                MapSet.put(seen, encoded_owner)
+              }
+            end
+        end
+      end
+
+      defp segment_project_storage_entry_key({key, _value, _expire_at_ms}) when is_binary(key),
+        do: key
+
+      defp segment_project_storage_entry_key({key, _value, _expire_at_ms, _kind})
+           when is_binary(key),
+           do: key
+
+      defp segment_project_storage_entry_key(_entry), do: nil
 
       defp segment_project_generic_batch(commands, position, sm_state) do
         if Enum.all?(commands, &segment_projectable_batch_command?(sm_state, &1)) do
@@ -569,6 +982,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
 
       defp segment_projectable_batch_command?(sm_state, {:put, key, value, expire_at_ms}),
         do: segment_projectable_put?(sm_state, key, value, expire_at_ms)
+
+      defp segment_projectable_batch_command?(_sm_state, {:delete, <<"PM:", _::binary>>}),
+        do: false
 
       defp segment_projectable_batch_command?(_sm_state, {:delete, key}), do: is_binary(key)
 
@@ -869,10 +1285,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
         now = storage_expiry_cutoff_ms()
 
         case :ets.lookup(Map.fetch!(sm_state, :ets), marker_key) do
-          [{^marker_key, type, expire_at_ms, _lfu, _fid, _offset, _value_size}]
-          when type in ["hash", "set", "zset"] and
-                 (expire_at_ms == 0 or expire_at_ms > now) ->
-            true
+          [{^marker_key, value, expire_at_ms, _lfu, _fid, _offset, _value_size}]
+          when is_binary(value) and (expire_at_ms == 0 or expire_at_ms > now) ->
+            match?({:ok, _type, :promoted, _generation}, Promotion.decode_marker(value))
 
           _missing_or_invalid ->
             false
@@ -1062,6 +1477,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
         @doc false
         def __segment_project_command_for_test__(command, position, sm_state),
           do: segment_project_command(command, position, sm_state)
+
+        @doc false
+        def __prepare_segment_projection_command_for_test__(command),
+          do: prepare_segment_projection_command(command)
       end
 
       defp emit_segment_projection_apply_telemetry(

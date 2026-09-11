@@ -43,10 +43,14 @@ defmodule Ferricstore.Commands.HashTest do
 
   defp hash_cleanup_failure_store do
     type_key = CompoundKey.type_key("hash")
+    promotion_key = CompoundKey.promotion_marker_key("hash")
     field_key = CompoundKey.hash_field("hash", "f1")
 
     %{
-      compound_get: fn "hash", ^type_key -> "hash" end,
+      compound_get: fn
+        "hash", ^type_key -> "hash"
+        "hash", ^promotion_key -> nil
+      end,
       compound_batch_get: fn "hash", [^field_key] -> ["v1"] end,
       compound_batch_get_meta: fn "hash", [^field_key] -> [{"v1", 0}] end,
       compound_batch_delete: fn "hash", [^field_key] -> :ok end,

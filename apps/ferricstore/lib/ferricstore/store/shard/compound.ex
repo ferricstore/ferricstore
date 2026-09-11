@@ -184,6 +184,16 @@ defmodule Ferricstore.Store.Shard.Compound do
   @doc false
   def promoted_store(state, redis_key), do: Promoted.promoted_store(state, redis_key)
 
+  @spec promotion_candidate_status(
+          map(),
+          binary(),
+          :hash | :set | :zset,
+          non_neg_integer()
+        ) :: :live | :stale | :retry | {:invalid, term()}
+  @doc false
+  def promotion_candidate_status(state, redis_key, type, threshold),
+    do: Promoted.promotion_candidate_status(state, redis_key, type, threshold)
+
   @spec promoted_read(binary(), binary(), map()) ::
           {:ok, binary() | nil}
           | {:ok, binary(), non_neg_integer()}

@@ -742,6 +742,58 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.V2AppendBatchNosyncNif do
           assert nil == GenServer.call(pid, {:compound_get, redis_key, field})
         end
 
+        @tag :direct_promotion_delete_race
+        test "direct exact prefix deletion captures promotion routing and generation atomically" do
+          {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+          on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
+
+          redis_key = "promoted_hash_prefix_delete_race"
+          prefix = CompoundKey.hash_prefix(redis_key)
+          field = CompoundKey.hash_field(redis_key, "one")
+          marker_key = Promotion.marker_key(redis_key)
+          dedicated_path = Promotion.dedicated_path(dir, 0, :hash, redis_key)
+
+          :ok = GenServer.call(pid, {:compound_put, redis_key, field, "1", 0})
+          :ok = GenServer.call(pid, :flush)
+          File.mkdir_p!(dedicated_path)
+          File.touch!(Path.join(dedicated_path, "00000.log"))
+
+          :sys.replace_state(pid, fn state ->
+            %{
+              state
+              | promoted_instances: Map.put(state.promoted_instances, redis_key, dedicated_path)
+            }
+          end)
+
+          keydir = :sys.get_state(pid).keydir
+          owner = %{instance_ctx: ctx, shard_index: 0}
+          latch = Promotion.acquire_compaction_latch(owner, redis_key)
+
+          deletion =
+            Task.async(fn ->
+              GenServer.call(pid, {:compound_delete_prefix, redis_key, prefix})
+            end)
+
+          try do
+            assert nil == Task.yield(deletion, 100)
+
+            generation = Promotion.new_generation()
+            marker = Promotion.encode_marker(:hash, :promoted, generation)
+
+            :ets.insert(
+              keydir,
+              {marker_key, marker, 0, LFU.initial(), 0, 0, byte_size(marker)}
+            )
+          after
+            Promotion.release_compaction_latch(latch)
+          end
+
+          assert :ok = Task.await(deletion, 5_000)
+          assert Process.alive?(pid)
+          assert [] == :ets.lookup(keydir, marker_key)
+          refute File.dir?(dedicated_path)
+        end
+
         test "multiple puts before flush are all readable" do
           {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
           on_exit(fn -> cleanup_shard(pid, ctx, dir) end)

@@ -254,6 +254,112 @@ defmodule Ferricstore.Store.PromotionRecoveryGuardTest do
     assert [] = :ets.lookup(ctx.keydir, member_key)
   end
 
+  test "versioned cleanup intent preserves a newer live shared incarnation", ctx do
+    redis_key = "stale-versioned-cleanup-intent"
+    marker = Promotion.marker_key(redis_key)
+    generation = Promotion.new_generation()
+
+    put_shared_record(
+      ctx,
+      marker,
+      Promotion.encode_marker(:hash, :cleanup, generation),
+      0
+    )
+
+    type_key = CompoundKey.type_key(redis_key)
+    member_key = put_shared_hash_field(ctx, redis_key, "new-field", "new-value")
+
+    {:ok, dedicated_path} = Promotion.open_dedicated(ctx.data_dir, 0, :hash, redis_key)
+
+    assert %{} = Promotion.recover_promoted(ctx.shard_path, ctx.keydir, ctx.data_dir, 0)
+    assert [] = :ets.lookup(ctx.keydir, marker)
+    refute File.dir?(dedicated_path)
+
+    assert [{^type_key, "hash", 0, _lfu, 0, _offset, _value_size}] =
+             :ets.lookup(ctx.keydir, type_key)
+
+    assert [{^member_key, "new-value", 0, _lfu, 0, _offset, _value_size}] =
+             :ets.lookup(ctx.keydir, member_key)
+  end
+
+  test "legacy cleanup intent preserves a newer live shared incarnation", ctx do
+    redis_key = "stale-legacy-cleanup-intent"
+    marker = Promotion.marker_key(redis_key)
+    put_shared_record(ctx, marker, "cleanup:hash", 0)
+
+    type_key = CompoundKey.type_key(redis_key)
+    member_key = put_shared_hash_field(ctx, redis_key, "new-field", "new-value")
+
+    {:ok, dedicated_path} = Promotion.open_dedicated(ctx.data_dir, 0, :hash, redis_key)
+
+    assert %{} = Promotion.recover_promoted(ctx.shard_path, ctx.keydir, ctx.data_dir, 0)
+    assert [] = :ets.lookup(ctx.keydir, marker)
+    refute File.dir?(dedicated_path)
+
+    assert [{^type_key, "hash", 0, _lfu, 0, _offset, _value_size}] =
+             :ets.lookup(ctx.keydir, type_key)
+
+    assert [{^member_key, "new-value", 0, _lfu, 0, _offset, _value_size}] =
+             :ets.lookup(ctx.keydir, member_key)
+  end
+
+  for {name, marker_value} <- [
+        {"versioned", :versioned},
+        {"legacy", "cleanup:hash"}
+      ] do
+    test "#{name} hash cleanup intent preserves a recreated shared set", ctx do
+      redis_key = "stale-#{unquote(name)}-hash-cleanup-with-live-set"
+      marker = Promotion.marker_key(redis_key)
+
+      marker_value =
+        case unquote(Macro.escape(marker_value)) do
+          :versioned ->
+            Promotion.encode_marker(:hash, :cleanup, Promotion.new_generation())
+
+          legacy ->
+            legacy
+        end
+
+      put_shared_record(ctx, marker, marker_value, 0)
+
+      type_key = CompoundKey.type_key(redis_key)
+      member_key = CompoundKey.set_member(redis_key, "member")
+      put_shared_record(ctx, type_key, "set", 0)
+      put_shared_record(ctx, member_key, "1", 0)
+
+      {:ok, old_hash_path} = Promotion.open_dedicated(ctx.data_dir, 0, :hash, redis_key)
+
+      assert %{} = Promotion.recover_promoted(ctx.shard_path, ctx.keydir, ctx.data_dir, 0)
+      assert [] = :ets.lookup(ctx.keydir, marker)
+      refute File.dir?(old_hash_path)
+
+      assert [{^type_key, "set", 0, _lfu, 0, _offset, _value_size}] =
+               :ets.lookup(ctx.keydir, type_key)
+
+      assert [{^member_key, "1", 0, _lfu, 0, _offset, _value_size}] =
+               :ets.lookup(ctx.keydir, member_key)
+    end
+  end
+
+  test "malformed versioned intent fails closed without deleting marker or data", ctx do
+    redis_key = "malformed-versioned-cleanup-intent"
+    marker = Promotion.marker_key(redis_key)
+    encoded = Promotion.encode_marker(:hash, :cleanup, Promotion.new_generation())
+    malformed = binary_part(encoded, 0, byte_size(encoded) - 1)
+    put_shared_record(ctx, marker, malformed, 0)
+    member_key = put_shared_hash_field(ctx, redis_key, "field", "value")
+
+    assert_raise RuntimeError, ~r/malformed_versioned_marker/, fn ->
+      Promotion.recover_promoted(ctx.shard_path, ctx.keydir, ctx.data_dir, 0)
+    end
+
+    assert [{^marker, ^malformed, 0, _lfu, 0, _offset, _value_size}] =
+             :ets.lookup(ctx.keydir, marker)
+
+    assert [{^member_key, "value", 0, _lfu, 0, _offset, _value_size}] =
+             :ets.lookup(ctx.keydir, member_key)
+  end
+
   test "an unreadable cold marker aborts recovery without deleting the marker", ctx do
     redis_key = "unreadable-marker"
     {marker, offset, value_size} = put_marker(ctx, redis_key, "hash", :cold)

@@ -522,7 +522,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
       end
 
       defp clear_pending_write_process_state do
+        release_apply_promotion_latches()
         Enum.each(@sm_pending_write_keys, &Process.delete/1)
+      end
+
+      defp release_apply_promotion_latches do
+        case Process.get(:sm_apply_promoted_latches, :undefined) do
+          :undefined ->
+            :ok
+
+          held ->
+            held
+            |> Map.values()
+            |> Enum.each(&Promotion.release_compaction_latch/1)
+        end
+
+        :ok
       end
 
       defp dispatch_pending_compound_promotions(state) do
@@ -535,16 +550,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
               send(pid, {:promoted_maintenance_after_commit, redis_key, maintenance})
             end)
 
-            Process.get(:sm_pending_compound_promotion_removals, MapSet.new())
-            |> Enum.reject(&Map.has_key?(cleanups, &1))
-            |> Enum.each(fn redis_key ->
-              send(pid, {:remove_promoted_after_commit, redis_key})
+            Process.get(:sm_pending_compound_promotion_removals, %{})
+            |> Enum.reject(fn {redis_key, _generation} -> Map.has_key?(cleanups, redis_key) end)
+            |> Enum.each(fn {redis_key, generation} ->
+              send(pid, {:remove_promoted_after_commit, redis_key, generation})
             end)
 
-            Enum.each(cleanups, fn {redis_key, {type, dedicated_path}} ->
+            Enum.each(cleanups, fn {redis_key, {type, dedicated_path, generation}} ->
               send(
                 pid,
-                {:cleanup_promoted_after_commit, redis_key, type, dedicated_path}
+                {:cleanup_promoted_after_commit, redis_key, type, dedicated_path, generation}
               )
             end)
 

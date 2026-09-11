@@ -70,12 +70,10 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
   end
 
   defp decode_promoted_marker_type(type_str) do
-    case CompoundKey.decode_type(type_str) do
-      type when type in [:hash, :set, :zset] -> type
-      _other -> nil
+    case Promotion.decode_marker(type_str) do
+      {:ok, type, :promoted, _generation} -> type
+      _missing_invalid_or_intent -> nil
     end
-  rescue
-    _ -> nil
   end
 
   def promoted_store_for_compound(state, redis_key, compound_key) do
@@ -854,10 +852,17 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
     mk = Promotion.marker_key(redis_key)
 
     case :ets.lookup(state.keydir, mk) do
-      [{^mk, "hash", _, _, _, _, _}] -> CompoundKey.hash_prefix(redis_key)
-      [{^mk, "set", _, _, _, _, _}] -> CompoundKey.set_prefix(redis_key)
-      [{^mk, "zset", _, _, _, _, _}] -> CompoundKey.zset_prefix(redis_key)
+      [{^mk, value, _, _, _, _, _}] -> promoted_prefix_for_marker(value, redis_key)
       _ -> nil
+    end
+  end
+
+  defp promoted_prefix_for_marker(value, redis_key) do
+    case Promotion.decode_marker(value) do
+      {:ok, :hash, :promoted, _generation} -> CompoundKey.hash_prefix(redis_key)
+      {:ok, :set, :promoted, _generation} -> CompoundKey.set_prefix(redis_key)
+      {:ok, :zset, :promoted, _generation} -> CompoundKey.zset_prefix(redis_key)
+      _missing_invalid_or_intent -> nil
     end
   end
 
@@ -1023,19 +1028,47 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
         nil ->
           state
 
-        {type, prefix} ->
-          if promotion_type_metadata_ready?(state, redis_key, type) do
-            count = ShardETS.prefix_count_entries(state, prefix)
+        {type, _prefix} ->
+          case promotion_candidate_status(state, redis_key, type, threshold) do
+            status when status in [:live, :retry] ->
+              start_compound_promotion(state, redis_key, type, threshold)
 
-            if is_integer(count) and count > threshold do
-              start_compound_promotion(state, redis_key, type)
-            else
+            :stale ->
               state
-            end
-          else
-            state
+
+            {:invalid, _reason} ->
+              state
           end
       end
+    end
+  end
+
+  @spec promotion_candidate_status(
+          map(),
+          binary(),
+          :hash | :set | :zset,
+          non_neg_integer()
+        ) :: :live | :stale | :retry | {:invalid, term()}
+  @doc false
+  def promotion_candidate_status(state, redis_key, type, threshold)
+      when type in [:hash, :set, :zset] and is_integer(threshold) and threshold >= 0 do
+    prefix =
+      case type do
+        :hash -> CompoundKey.hash_prefix(redis_key)
+        :set -> CompoundKey.set_prefix(redis_key)
+        :zset -> CompoundKey.zset_prefix(redis_key)
+      end
+
+    if promotion_type_metadata_ready?(state, redis_key, type) do
+      case ShardETS.indexed_prefix_count_entries(state, prefix) do
+        {:ok, count} when count > threshold -> :live
+        {:ok, _count} -> :stale
+        {:error, reason} when reason in [:limit_exceeded, :hlc_drift_exceeded] -> :retry
+        {:error, reason} -> {:invalid, reason}
+        :unavailable -> :retry
+      end
+    else
+      :stale
     end
   end
 
@@ -1057,7 +1090,7 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
     ArgumentError -> false
   end
 
-  defp start_compound_promotion(state, redis_key, type) do
+  defp start_compound_promotion(state, redis_key, type, threshold) do
     pending = Map.get(state, :compound_promotion_pending, %{})
     worker = Map.get(state, :compound_promotion_worker)
 
@@ -1065,8 +1098,9 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
          match?(%{redis_key: ^redis_key}, worker) do
       state
     else
-      send(self(), {:start_compound_promotion, redis_key, type})
-      Map.put(state, :compound_promotion_pending, Map.put(pending, redis_key, type))
+      candidate = {type, threshold}
+      send(self(), {:start_compound_promotion, redis_key, candidate})
+      Map.put(state, :compound_promotion_pending, Map.put(pending, redis_key, candidate))
     end
   end
 

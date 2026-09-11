@@ -623,6 +623,15 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
   def prefix_count_entries(keydir, prefix),
     do: do_prefix_count_entries(nil, keydir, prefix)
 
+  @spec indexed_prefix_count_entries(map(), binary()) ::
+          {:ok, non_neg_integer()} | {:error, term()} | :unavailable
+  @doc false
+  def indexed_prefix_count_entries(%{keydir: _keydir} = state, prefix)
+      when is_binary(prefix),
+      do: indexed_prefix_count(state, prefix)
+
+  def indexed_prefix_count_entries(_state, _prefix), do: :unavailable
+
   def do_prefix_count_entries(state, keydir, prefix) do
     case indexed_prefix_count(state, prefix) do
       {:ok, count} -> count

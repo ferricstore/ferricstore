@@ -21,6 +21,58 @@ defmodule Ferricstore.Store.PromotionLatchTest do
     :ok
   end
 
+  test "promotion marker codec preserves type, lifecycle state, and opaque generation" do
+    first_generation = Promotion.new_generation()
+    second_generation = Promotion.new_generation()
+
+    refute second_generation == first_generation
+
+    Enum.each([:hash, :set, :zset], fn type ->
+      Enum.each([:promoted, :fallback, :cleanup], fn lifecycle_state ->
+        marker = Promotion.encode_marker(type, lifecycle_state, first_generation)
+
+        assert {:ok, ^type, ^lifecycle_state, ^first_generation} =
+                 Promotion.decode_marker(marker)
+      end)
+    end)
+
+    assert {:ok, :hash, :promoted, 0} = Promotion.decode_marker("hash")
+    assert "hash" == Promotion.encode_marker(:hash, :promoted, 0)
+    assert "fallback:set" == Promotion.encode_marker(:set, :fallback, 0)
+    assert "cleanup:zset" == Promotion.encode_marker(:zset, :cleanup, 0)
+    assert :error = Promotion.decode_marker("not-a-promotion-marker")
+
+    assert {:error, :malformed_versioned_marker} =
+             Promotion.decode_marker(<<0xF3, 0x50, 0x4D, 1, 0, 0, 0::unsigned-big-64>>)
+
+    assert {:error, :unsupported_marker_version} =
+             Promotion.decode_marker(<<0xF3, 0x50, 0x4D, 2, 0, 0, 1::unsigned-big-64>>)
+
+    encoded = Promotion.encode_marker(:hash, :cleanup, first_generation)
+
+    assert {:error, :malformed_versioned_marker} =
+             encoded
+             |> binary_part(0, byte_size(encoded) - 1)
+             |> Promotion.decode_marker()
+  end
+
+  test "promotion generations remain unique without HLC runtime state" do
+    atomics_key = :ferricstore_hlc_ref
+    previous_ref = :persistent_term.get(atomics_key, :missing)
+    :persistent_term.erase(atomics_key)
+
+    try do
+      generations = Enum.map(1..1_024, fn _ -> Promotion.new_generation() end)
+      assert Enum.all?(generations, &(&1 > 0))
+      assert MapSet.size(MapSet.new(generations)) == length(generations)
+    after
+      case previous_ref do
+        :missing -> :persistent_term.erase(atomics_key)
+        ref -> :persistent_term.put(atomics_key, ref)
+      end
+    end
+  end
+
   test "await_compaction_latch times out with telemetry when owner stays alive" do
     Application.put_env(:ferricstore, :promotion_compaction_latch_timeout_ms, 5)
 
@@ -81,6 +133,76 @@ defmodule Ferricstore.Store.PromotionLatchTest do
 
     try do
       assert :ok = Promotion.await_compaction_latch(owner, redis_key)
+    after
+      Promotion.release_compaction_latch(token)
+      :ets.delete(tab)
+    end
+  end
+
+  test "apply latch acquisition rejects a recorded promotion failure without leaking ownership" do
+    tab = :ets.new(:promotion_failed_apply_acquire, [:set, :public])
+    ctx = %FerricStore.Instance{latch_refs: {tab}}
+    owner = %{instance_ctx: ctx, shard_index: 0}
+    redis_key = "promotion_failed_apply_acquire"
+    latch_key = {:promoted_compaction, redis_key}
+
+    :ok = Promotion.record_compound_promotion_failure(owner, redis_key, :copy_failed)
+
+    assert_raise RuntimeError, ~r/compound promotion failed.*copy_failed/, fn ->
+      Promotion.acquire_compaction_latch_for_apply(owner, redis_key)
+    end
+
+    assert :ets.lookup(tab, latch_key) == []
+
+    :ok = Promotion.clear_compound_promotion_fence(owner, redis_key)
+    :ets.delete(tab)
+  end
+
+  test "multi-key apply acquisition releases earlier latches when a later fence fails" do
+    tab = :ets.new(:promotion_failed_multi_apply_acquire, [:set, :public])
+    ctx = %FerricStore.Instance{latch_refs: {tab}}
+    owner = %{instance_ctx: ctx, shard_index: 0}
+    first_key = "promotion_multi_apply_a"
+    failed_key = "promotion_multi_apply_b"
+
+    :ok = Promotion.record_compound_promotion_failure(owner, failed_key, :copy_failed)
+
+    assert_raise RuntimeError, ~r/compound promotion failed.*copy_failed/, fn ->
+      Promotion.with_compaction_latches_for_apply(owner, [failed_key, first_key], fn ->
+        flunk("the protected operation must not run")
+      end)
+    end
+
+    assert :ets.lookup(tab, {:promoted_compaction, first_key}) == []
+    assert :ets.lookup(tab, {:promoted_compaction, failed_key}) == []
+
+    :ok = Promotion.clear_compound_promotion_fence(owner, failed_key)
+    :ets.delete(tab)
+  end
+
+  test "multi-key apply bypasses key normalization when no latch table exists" do
+    source = File.read!(@promotion_path)
+
+    assert Regex.match?(
+             ~r/with_compaction_latches_for_apply\(owner, redis_keys, fun\).*?case latch_table\(owner\) do.*?nil\s*->\s*fun\.\(\)/s,
+             source
+           )
+  end
+
+  @tag timeout: 500
+  test "blocking acquisition remains non-reentrant for the current owner" do
+    Application.put_env(:ferricstore, :promotion_compaction_latch_timeout_ms, 5)
+
+    tab = :ets.new(:promotion_latch_non_reentrant_acquire, [:set, :public])
+    ctx = %FerricStore.Instance{latch_refs: {tab}}
+    owner = %{instance_ctx: ctx, shard_index: 0}
+    redis_key = "promotion_latch_non_reentrant_acquire"
+    token = Promotion.acquire_compaction_latch(owner, redis_key)
+
+    try do
+      assert_raise RuntimeError, ~r/compaction latch timeout/, fn ->
+        Promotion.acquire_compaction_latch(owner, redis_key)
+      end
     after
       Promotion.release_compaction_latch(token)
       :ets.delete(tab)

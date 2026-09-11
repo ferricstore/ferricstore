@@ -844,6 +844,12 @@ defmodule Ferricstore.Store.Shard.ETS do
   def prefix_count_entries(state_or_keydir, prefix),
     do: PrefixScan.prefix_count_entries(state_or_keydir, prefix)
 
+  @spec indexed_prefix_count_entries(map(), binary()) ::
+          {:ok, non_neg_integer()} | {:error, term()} | :unavailable
+  @doc false
+  def indexed_prefix_count_entries(state, prefix),
+    do: PrefixScan.indexed_prefix_count_entries(state, prefix)
+
   @doc false
   def prefix_collect_keys(keydir, prefix), do: PrefixScan.prefix_collect_keys(keydir, prefix)
 

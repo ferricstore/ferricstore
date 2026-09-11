@@ -1729,15 +1729,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
       end
 
       defp promoted_compound_path(ctx, redis_key, compound_key_or_prefix) do
-        Promotion.await_compaction_latch(ctx, redis_key)
-
-        case compound_type_from_key(compound_key_or_prefix) do
-          nil ->
-            nil
-
-          type ->
-            promoted_catalog_path(ctx, redis_key) || promoted_marker_path(ctx, redis_key, type)
+        case Process.get(:sm_pending_writes, :undefined) do
+          pending when is_list(pending) -> hold_apply_promotion_latch(ctx, redis_key)
+          :undefined -> Promotion.await_compaction_latch(ctx, redis_key)
         end
+
+        path =
+          case compound_type_from_key(compound_key_or_prefix) do
+            nil ->
+              nil
+
+            type ->
+              promoted_catalog_path(ctx, redis_key) || promoted_marker_path(ctx, redis_key, type)
+          end
+
+        run_promoted_route_test_hook(redis_key, compound_key_or_prefix, path)
+        path
+      end
+
+      if Mix.env() == :test do
+        defp run_promoted_route_test_hook(redis_key, compound_key_or_prefix, path) do
+          case Process.get(:ferricstore_promoted_route_hook) do
+            hook when is_function(hook, 3) -> hook.(redis_key, compound_key_or_prefix, path)
+            _missing -> :ok
+          end
+        end
+      else
+        defp run_promoted_route_test_hook(_redis_key, _compound_key_or_prefix, _path), do: :ok
       end
 
       defp promoted_catalog_path(ctx, redis_key) do
@@ -1754,7 +1772,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
 
       defp promoted_instance_removal_pending?(redis_key) do
         case Process.get(:sm_pending_compound_promotion_removals) do
-          %MapSet{} = removals -> MapSet.member?(removals, redis_key)
+          removals when is_map(removals) -> Map.has_key?(removals, redis_key)
           _not_applying -> false
         end
       end
@@ -1763,13 +1781,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         marker_key = Promotion.marker_key(redis_key)
         marker_ctx = promoted_marker_ctx(ctx)
 
-        type =
-          case cross_shard_ets_read(marker_ctx, marker_key) do
-            "hash" -> :hash
-            "set" -> :set
-            "zset" -> :zset
-            _other -> nil
-          end
+        type = promoted_marker_type(cross_shard_ets_read(marker_ctx, marker_key))
 
         if type do
           Promotion.dedicated_path(
@@ -1784,10 +1796,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
       defp promoted_marker_path(ctx, redis_key, type) do
         marker_key = Promotion.marker_key(redis_key)
         marker_ctx = promoted_marker_ctx(ctx)
-        expected_type = Atom.to_string(type)
 
-        case cross_shard_ets_read(marker_ctx, marker_key) do
-          ^expected_type ->
+        case Promotion.decode_marker(cross_shard_ets_read(marker_ctx, marker_key)) do
+          {:ok, ^type, :promoted, _generation} ->
             Promotion.dedicated_path(
               promoted_data_dir(ctx),
               ctx_index(ctx),
@@ -1795,37 +1806,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
               redis_key
             )
 
-          nil ->
-            if live_promotion_marker_entry?(marker_ctx.keydir, marker_key) do
-              Promotion.dedicated_path(
-                promoted_data_dir(ctx),
-                ctx_index(ctx),
-                type,
-                redis_key
-              )
-            end
-
           _other_type ->
             nil
         end
       end
 
+      defp promoted_marker_type(value) when is_binary(value) do
+        case Promotion.decode_marker(value) do
+          {:ok, type, :promoted, _generation} -> type
+          _missing_invalid_or_intent -> nil
+        end
+      end
+
+      defp promoted_marker_type(_value), do: nil
+
       defp promoted_marker_ctx(%{keydir: _keydir} = ctx), do: ctx
       defp promoted_marker_ctx(%{ets: keydir} = ctx), do: Map.put(ctx, :keydir, keydir)
-
-      defp live_promotion_marker_entry?(keydir, marker_key) do
-        now = apply_now_ms()
-
-        case :ets.lookup(keydir, marker_key) do
-          [{^marker_key, _value, expire_at_ms, _lfu, _fid, _offset, _value_size}] ->
-            expire_at_ms == 0 or expire_at_ms > now
-
-          _missing ->
-            false
-        end
-      rescue
-        ArgumentError -> false
-      end
 
       defp promoted_compound_batch_path(ctx, redis_key, compound_entries) do
         {targets, _cached_types} =

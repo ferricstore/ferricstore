@@ -178,8 +178,9 @@ defmodule Ferricstore.Flow.RetentionSweeper do
         end),
       compaction_fun:
         Keyword.get(opts, :compaction_fun, fn -> trigger_merge_checks(instance_ctx) end),
+      task_starter_fun: Keyword.get(opts, :task_starter_fun, &Task.start/1),
       compaction_ref: nil,
-      last_compaction_mono_ms: nil,
+      last_compaction_attempt_mono_ms: nil,
       continuation: nil,
       catchup_burst_count: 0,
       consecutive_limit_hits: 0,
@@ -486,14 +487,21 @@ defmodule Ferricstore.Flow.RetentionSweeper do
 
   defp maybe_trigger_compaction(:ok, counts, pressure?, limit_hit?, state) do
     if should_trigger_compaction?(counts, pressure?, limit_hit?, state) do
-      {:ok, pid} = Task.start(fn -> state.compaction_fun.() end)
-      ref = Process.monitor(pid)
+      case start_compaction_task(state) do
+        {:ok, pid} when is_pid(pid) ->
+          ref = Process.monitor(pid)
 
-      {%{
-         state
-         | compaction_ref: ref,
-           last_compaction_mono_ms: System.monotonic_time(:millisecond)
-       }, true}
+          {%{
+             state
+             | compaction_ref: ref,
+               last_compaction_attempt_mono_ms: System.monotonic_time(:millisecond)
+           }, true}
+
+        {:error, reason} ->
+          Logger.warning("Flow retention compaction task did not start: #{inspect(reason)}")
+
+          {%{state | last_compaction_attempt_mono_ms: System.monotonic_time(:millisecond)}, false}
+      end
     else
       {state, false}
     end
@@ -514,11 +522,23 @@ defmodule Ferricstore.Flow.RetentionSweeper do
     Map.get(counts, :flows, 0) + Map.get(counts, :history, 0) + Map.get(counts, :values, 0)
   end
 
-  defp compaction_due?(%{last_compaction_mono_ms: nil}), do: true
+  defp compaction_due?(%{last_compaction_attempt_mono_ms: nil}), do: true
 
   defp compaction_due?(state) do
-    System.monotonic_time(:millisecond) - state.last_compaction_mono_ms >=
+    System.monotonic_time(:millisecond) - state.last_compaction_attempt_mono_ms >=
       state.pressure_compaction_interval_ms
+  end
+
+  defp start_compaction_task(state) do
+    case state.task_starter_fun.(fn -> state.compaction_fun.() end) do
+      {:ok, pid} when is_pid(pid) -> {:ok, pid}
+      {:error, reason} -> {:error, reason}
+      other -> {:error, {:invalid_task_start_result, other}}
+    end
+  rescue
+    error -> {:error, {:exception, error}}
+  catch
+    kind, reason -> {:error, {kind, reason}}
   end
 
   defp trigger_merge_checks(instance_ctx) do

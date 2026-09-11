@@ -64,69 +64,89 @@ defmodule Ferricstore.MemoryGuardEvictionTest do
 
   describe "cold read promotion gating" do
     test "cold read promotes to hot when skip_promotion is off" do
-      MemoryGuard.set_skip_promotion(false)
+      with_pressure_flag_writers_suspended(fn ->
+        MemoryGuard.set_skip_promotion(false)
 
-      # Write a key, then evict its value to make it cold
-      Router.put(FerricStore.Instance.get(:default), "promo_test", "hello", 0)
+        # Write a key, then evict its value to make it cold
+        Router.put(FerricStore.Instance.get(:default), "promo_test", "hello", 0)
 
-      Ferricstore.Test.ShardHelpers.eventually(
-        fn ->
-          Router.get(FerricStore.Instance.get(:default), "promo_test") != nil
-        end,
-        "promo_test not readable",
-        20,
-        10
-      )
+        Ferricstore.Test.ShardHelpers.eventually(
+          fn ->
+            Router.get(FerricStore.Instance.get(:default), "promo_test") != nil
+          end,
+          "promo_test not readable",
+          20,
+          10
+        )
 
-      # Evict to cold
-      idx = Router.shard_for(FerricStore.Instance.get(:default), "promo_test")
-      keydir = :"keydir_#{idx}"
-      :ets.update_element(keydir, "promo_test", {2, nil})
+        # Evict to cold
+        idx = Router.shard_for(FerricStore.Instance.get(:default), "promo_test")
+        keydir = :"keydir_#{idx}"
+        :ets.update_element(keydir, "promo_test", {2, nil})
 
-      # Read should promote back to hot
-      value = Router.get(FerricStore.Instance.get(:default), "promo_test")
-      assert value == "hello"
+        # Read should promote back to hot
+        value = Router.get(FerricStore.Instance.get(:default), "promo_test")
+        assert value == "hello"
 
-      # Check ETS — value should be re-cached (hot)
-      case :ets.lookup(keydir, "promo_test") do
-        [{_, v, _, _, _, _, _}] -> assert v != nil
-        _ -> flunk("key not found in ETS")
-      end
+        # Check ETS — value should be re-cached (hot)
+        case :ets.lookup(keydir, "promo_test") do
+          [{_, v, _, _, _, _, _}] -> assert v != nil
+          _ -> flunk("key not found in ETS")
+        end
+      end)
     end
 
     test "cold read stays cold when skip_promotion is on" do
-      MemoryGuard.set_skip_promotion(true)
+      with_pressure_flag_writers_suspended(fn ->
+        MemoryGuard.set_skip_promotion(true)
 
-      Router.put(FerricStore.Instance.get(:default), "nopromo_test", "world", 0)
+        Router.put(FerricStore.Instance.get(:default), "nopromo_test", "world", 0)
 
-      Ferricstore.Test.ShardHelpers.eventually(
-        fn ->
-          Router.get(FerricStore.Instance.get(:default), "nopromo_test") != nil
-        end,
-        "nopromo_test not readable",
-        20,
-        10
-      )
+        Ferricstore.Test.ShardHelpers.eventually(
+          fn ->
+            Router.get(FerricStore.Instance.get(:default), "nopromo_test") != nil
+          end,
+          "nopromo_test not readable",
+          20,
+          10
+        )
 
-      idx = Router.shard_for(FerricStore.Instance.get(:default), "nopromo_test")
-      keydir = :"keydir_#{idx}"
-      :ets.update_element(keydir, "nopromo_test", {2, nil})
+        idx = Router.shard_for(FerricStore.Instance.get(:default), "nopromo_test")
+        keydir = :"keydir_#{idx}"
+        :ets.update_element(keydir, "nopromo_test", {2, nil})
 
-      # Read should return value but NOT promote
-      value = Router.get(FerricStore.Instance.get(:default), "nopromo_test")
-      assert value == "world"
+        # Read should return value but NOT promote
+        value = Router.get(FerricStore.Instance.get(:default), "nopromo_test")
+        assert value == "world"
 
-      # Check ETS — value should still be nil (cold)
-      case :ets.lookup(keydir, "nopromo_test") do
-        [{_, v, _, _, _, _, _}] -> assert v == nil
-        _ -> flunk("key not found in ETS")
-      end
+        # Check ETS — value should still be nil (cold)
+        case :ets.lookup(keydir, "nopromo_test") do
+          [{_, v, _, _, _, _, _}] -> assert v == nil
+          _ -> flunk("key not found in ETS")
+        end
+      end)
     end
   end
 
   # ---------------------------------------------------------------------------
   # NIF allocator bytes in stats
   # ---------------------------------------------------------------------------
+
+  defp with_pressure_flag_writers_suspended(fun) do
+    writers =
+      [MemoryGuard, Ferricstore.OperationalGuard]
+      |> Enum.filter(&Process.whereis/1)
+
+    Enum.each(writers, &:sys.suspend/1)
+
+    try do
+      fun.()
+    after
+      writers
+      |> Enum.reverse()
+      |> Enum.each(&:sys.resume/1)
+    end
+  end
 
   describe "NIF allocator tracking" do
     test "stats includes nif_allocated_bytes field" do

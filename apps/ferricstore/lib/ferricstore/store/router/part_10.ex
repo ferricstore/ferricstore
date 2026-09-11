@@ -454,13 +454,27 @@ defmodule Ferricstore.Store.Router.Part10 do
 
       defp promoted_compound_collection_key?(keydir, marker_key, now) do
         case :ets.lookup(keydir, marker_key) do
-          [{_, _value, 0, _lfu, _fid, _off, _vsize}] -> true
-          [{_, _value, exp, _lfu, _fid, _off, _vsize}] when exp > now -> true
-          _ -> false
+          [{_, value, 0, _lfu, _fid, _off, _vsize}] ->
+            promoted_marker_value?(value)
+
+          [{_, value, exp, _lfu, _fid, _off, _vsize}] when exp > now ->
+            promoted_marker_value?(value)
+
+          _ ->
+            false
         end
       rescue
         ArgumentError -> false
       end
+
+      defp promoted_marker_value?(value) when is_binary(value) do
+        match?(
+          {:ok, _type, :promoted, _generation},
+          Ferricstore.Store.Promotion.decode_marker(value)
+        )
+      end
+
+      defp promoted_marker_value?(_value), do: false
 
       # Type metadata already contains the escaped logical key. Reuse it
       # instead of escaping the same Redis key again for the promotion probe.

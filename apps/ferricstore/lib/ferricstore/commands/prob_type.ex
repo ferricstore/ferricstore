@@ -79,11 +79,11 @@ defmodule Ferricstore.Commands.ProbType do
         :ok
 
       {:error, _reason} = error ->
-        if marker_created?, do: TypeRegistry.delete_type(key, store)
+        if marker_created?, do: TypeRegistry.rollback_created_type(key, store)
         error
 
       invalid ->
-        if marker_created?, do: TypeRegistry.delete_type(key, store)
+        if marker_created?, do: TypeRegistry.rollback_created_type(key, store)
         {:error, {:invalid_probabilistic_metadata_put_result, invalid}}
     end
   end

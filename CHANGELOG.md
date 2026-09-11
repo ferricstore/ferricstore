@@ -20,6 +20,13 @@ All notable changes to FerricStore will be documented here.
 - Hardened workflow mutation, schedule, circuit, stream waiter, Pub/Sub, and
   observability paths used by the dashboard, with expanded integration and
   browser-level regression coverage.
+- Corrected retention-sweeper timing and compaction-start failure handling so
+  short terminal TTLs remain deterministic and cleanup retries stay bounded.
+- Serialized promoted compound routing through durable publication, rechecked
+  deferred candidates against the exact indexed cardinality, and made exact
+  prefix, batch, and collection deletion retire promotion metadata and storage.
+  Contended post-commit retirement now defers through the bounded retry queue
+  instead of blocking or terminating the shard.
 
 ## 0.11.14 - 2026-08-29
 

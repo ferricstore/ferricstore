@@ -249,4 +249,45 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
     send(pid, :sweep)
     refute_receive :compaction_called, 100
   end
+
+  test "compaction task start failure does not stop retention cleanup" do
+    name = :"flow_retention_sweeper_test_#{System.unique_integer([:positive])}"
+    parent = self()
+
+    {:ok, pid} =
+      RetentionSweeper.start_link(
+        name: name,
+        initial_delay_ms: 60_000,
+        interval_ms: 60_000,
+        pressure_interval_ms: 60_000,
+        pressure_compaction_interval_ms: 60_000,
+        pressure_detector_fun: fn -> true end,
+        cleanup_fun: fn opts ->
+          send(parent, {:cleanup_called, opts})
+          {:ok, %{flows: 1, history: 0, values: 0}}
+        end,
+        task_starter_fun: fn _fun ->
+          send(parent, :compaction_start_attempted)
+          {:error, :system_limit}
+        end
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
+
+    send(pid, :sweep)
+
+    assert_receive {:cleanup_called, _opts}, 500
+    assert_receive :compaction_start_attempted, 500
+    assert Process.alive?(pid)
+
+    info = RetentionSweeper.info(name)
+    assert info.last_sweep.status == :ok
+    assert info.last_sweep.compaction_triggered? == false
+
+    send(pid, :sweep)
+    assert_receive {:cleanup_called, _opts}, 500
+    refute_receive :compaction_start_attempted, 50
+  end
 end

@@ -994,8 +994,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
       test "unified segment batch decoder routes homogeneous put and delete commands directly" do
         source = Ferricstore.Test.SourceFiles.waraft_storage_source()
 
-        assert source =~ "{:put_batch, entries} ->"
-        assert source =~ "{:delete_batch, keys} ->"
+        assert source =~
+                 "segment_project_prepared_batch({:put_batch, entries}, position, sm_state)"
+
+        assert source =~
+                 "segment_project_prepared_batch({:delete_batch, keys}, position, sm_state)"
 
         refute source =~ "segment_project_batch_fast_path(commands, position, sm_state)",
                "the one-pass decoder already handles homogeneous batches; mixed batches should not rescan the list through the old fast-path"
@@ -1004,7 +1007,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
       test "unified segment generic batch projection decodes and classifies in one pass" do
         source = Ferricstore.Test.SourceFiles.waraft_storage_source()
 
-        assert source =~ "segment_project_decode_batch(commands, :unknown, [], [])"
+        assert source =~ "segment_project_decode_batch(commands, :unknown, [], [], nil)"
+        assert source =~ "decoded = decoded_replay_command(command)"
+
+        assert source =~
+                 "promotion_keys = segment_project_batch_promotion_keys(decoded, promotion_keys)"
 
         refute source =~ "commands = Enum.map(commands, &decoded_replay_command/1)",
                "projection should not decode once and then scan again for homogeneous batches"

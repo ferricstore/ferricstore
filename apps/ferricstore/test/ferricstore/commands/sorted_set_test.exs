@@ -37,10 +37,14 @@ defmodule Ferricstore.Commands.SortedSetTest do
 
   defp zset_cleanup_failure_store do
     type_key = CompoundKey.type_key("zs")
+    promotion_key = CompoundKey.promotion_marker_key("zs")
     member_key = CompoundKey.zset_member("zs", "only")
 
     %{
-      compound_get: fn "zs", ^type_key -> "zset" end,
+      compound_get: fn
+        "zs", ^type_key -> "zset"
+        "zs", ^promotion_key -> nil
+      end,
       compound_batch_get: fn "zs", [^member_key] -> ["1.0"] end,
       compound_batch_delete: fn "zs", [^member_key] -> :ok end,
       compound_batch_put: fn "zs", [{^member_key, "1.0", 0}] -> :ok end,

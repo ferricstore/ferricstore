@@ -231,8 +231,11 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       state = :sys.get_state(shard)
       marker_key = Promotion.marker_key(key)
 
-      assert [{^marker_key, "hash", _exp, _lfu, _fid, _off, _vsize}] =
+      assert [{^marker_key, marker_value, _exp, _lfu, _fid, _off, _vsize}] =
                :ets.lookup(state.keydir, marker_key)
+
+      assert {:ok, :hash, :promoted, generation} = Promotion.decode_marker(marker_value)
+      assert generation > 0
 
       :sys.replace_state(shard, fn state ->
         dedicated_path = promoted_path!(state, key)
@@ -635,7 +638,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       assert "value_1" == Hash.handle("HGET", [live_key, "field_1"], real_store())
     end
 
-    test "compaction with all fields deleted" do
+    test "deleting all fields retires the dedicated compaction target" do
       store = real_store()
       key = ukey("all_del")
       promote_hash(store, key)
@@ -648,14 +651,14 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       shard_idx = Router.shard_for(ctx, key)
       shard = Router.shard_name(ctx, shard_idx)
 
-      :sys.replace_state(shard, fn state ->
-        dedicated_path = promoted_path!(state, key)
-        ShardCompound.compact_dedicated(state, key, dedicated_path)
-      end)
+      ShardHelpers.eventually(
+        fn -> not promoted?(key) end,
+        "deleting the final field should retire dedicated storage"
+      )
 
-      # Should not crash
-      dir = dedicated_dir(key)
-      assert log_file_count(dir) >= 1
+      assert nil == shard |> :sys.get_state() |> ShardCompound.promoted_store(key)
+      refute File.dir?(dedicated_dir(key))
+      assert {:ok, "none"} = FerricStore.type(key)
     end
 
     test "concurrent reads and writes on promoted hash" do

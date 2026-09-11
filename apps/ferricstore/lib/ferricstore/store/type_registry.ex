@@ -20,7 +20,7 @@ defmodule Ferricstore.Store.TypeRegistry do
   3. Returns `{:error, wrongtype_message}` if the type mismatches
   """
 
-  alias Ferricstore.Store.{CompoundKey, Ops, ReadResult}
+  alias Ferricstore.Store.{CompoundKey, LocalTxStore, Ops, Promotion, ReadResult}
 
   @wrongtype_msg "WRONGTYPE Operation against a key holding the wrong kind of value"
 
@@ -258,13 +258,59 @@ defmodule Ferricstore.Store.TypeRegistry do
   ## Parameters
 
     - `redis_key` - the Redis key whose type to remove
-    - `store` - the store (Instance, LocalTxStore, or closure map)
+    - `store` - the store (Instance, LocalTxStore, or closure map). A promoted
+      collection requires an owner-aware Instance or closure map so its
+      dedicated storage can be retired atomically.
   """
-  @spec delete_type(binary(), map()) :: :ok
+  @spec delete_type(binary(), map()) :: :ok | {:error, term()} | ReadResult.failure()
   def delete_type(redis_key, store) do
     type_key = CompoundKey.type_key(redis_key)
-    Ops.compound_delete(store, redis_key, type_key)
+
+    with :ok <- cleanup_promoted_collection(redis_key, store) do
+      Ops.compound_delete(store, redis_key, type_key)
+    end
   end
+
+  @doc false
+  @spec rollback_created_type(binary(), map()) :: :ok | {:error, term()}
+  def rollback_created_type(redis_key, store) do
+    Ops.compound_delete(store, redis_key, CompoundKey.type_key(redis_key))
+  end
+
+  defp cleanup_promoted_collection(redis_key, store) do
+    case Ops.compound_get(store, redis_key, Promotion.marker_key(redis_key)) do
+      nil ->
+        :ok
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
+      marker when is_binary(marker) ->
+        case Promotion.decode_marker(marker) do
+          {:ok, type, :promoted, _generation} ->
+            cleanup_promoted_prefix(store, redis_key, type)
+
+          {:ok, _type, _intent, _generation} ->
+            :ok
+
+          {:error, reason} ->
+            ReadResult.failure({:invalid_promotion_marker, reason})
+
+          :error ->
+            ReadResult.failure(:invalid_promotion_marker)
+        end
+    end
+  end
+
+  defp cleanup_promoted_prefix(%LocalTxStore{}, _redis_key, _type),
+    do: ReadResult.failure(:promoted_cleanup_requires_owner_context)
+
+  defp cleanup_promoted_prefix(store, redis_key, type),
+    do: Ops.compound_delete_prefix(store, redis_key, promotable_prefix(type, redis_key))
+
+  defp promotable_prefix(:hash, redis_key), do: CompoundKey.hash_prefix(redis_key)
+  defp promotable_prefix(:set, redis_key), do: CompoundKey.set_prefix(redis_key)
+  defp promotable_prefix(:zset, redis_key), do: CompoundKey.zset_prefix(redis_key)
 
   @doc """
   Checks that a key either does not exist or has the expected type,
