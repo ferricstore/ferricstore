@@ -247,7 +247,29 @@ defmodule Ferricstore.FlowProductionRecoveryTest do
 
     restarted_ctx = FerricStore.Instance.get(:default)
     assert shard_index == Router.shard_for(restarted_ctx, state_key)
-    assert :not_found = LMDB.get(lmdb_path, state_key)
+
+    # Startup preserves cold metadata until bounded retention cleanup has
+    # released its history and shared-value references.
+    case LMDB.get(lmdb_path, state_key) do
+      :not_found -> :ok
+      {:ok, _expired_query_row} -> :ok
+    end
+
+    assert {:ok, _cleanup} =
+             FerricStore.flow_retention_cleanup(limit: 10, now_ms: cancel_now_ms + 10_000)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.flush_all(
+               restarted_ctx.name,
+               restarted_ctx.shard_count,
+               45_000
+             )
+
+    assert :ok =
+             ShardHelpers.eventually(
+               fn -> LMDB.get(lmdb_path, state_key) == :not_found end,
+               "retention cleanup should delete the expired QueryRow"
+             )
   end
 
   defp start_background_projection_work(ctx) do
