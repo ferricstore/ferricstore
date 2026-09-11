@@ -73,7 +73,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
     build_opts =
       [
         data_dir: dir,
-        shard_count: 1
+        shard_count: 1,
+        query_index_provider: FerricStore.Flow.QueryIndexProvider.Disabled
       ]
       |> maybe_put_opt(:blob_side_channel_threshold_bytes, opts)
       |> maybe_put_opt(:hot_cache_max_value_size, opts)

@@ -10,7 +10,7 @@ defmodule Ferricstore.Store.FlushDurableEnumerationTest do
       Path.join(System.tmp_dir!(), "flush_durable_#{System.unique_integer([:positive])}")
 
     name = :"flush_durable_#{System.unique_integer([:positive])}"
-    ctx = FerricStore.Instance.build(name, data_dir: data_dir, shard_count: 1)
+    ctx = build_instance(name, data_dir)
     Ferricstore.DataDir.ensure_layout!(data_dir, 1)
 
     on_exit(fn -> cleanup(ctx, data_dir) end)
@@ -190,7 +190,7 @@ defmodule Ferricstore.Store.FlushDurableEnumerationTest do
       Path.join(System.tmp_dir!(), "flush_mirror_health_#{System.unique_integer([:positive])}")
 
     name = :"flush_mirror_health_#{System.unique_integer([:positive])}"
-    ctx = FerricStore.Instance.build(name, data_dir: data_dir, shard_count: 1)
+    ctx = build_instance(name, data_dir)
     Ferricstore.DataDir.ensure_layout!(data_dir, 1)
 
     on_exit(fn -> cleanup(ctx, data_dir) end)
@@ -207,7 +207,7 @@ defmodule Ferricstore.Store.FlushDurableEnumerationTest do
       Path.join(System.tmp_dir!(), "flush_fail_closed_#{System.unique_integer([:positive])}")
 
     name = :"flush_fail_closed_#{System.unique_integer([:positive])}"
-    ctx = FerricStore.Instance.build(name, data_dir: data_dir, shard_count: 1)
+    ctx = build_instance(name, data_dir)
     Ferricstore.DataDir.ensure_layout!(data_dir, 1)
 
     on_exit(fn -> cleanup(ctx, data_dir) end)
@@ -242,7 +242,7 @@ defmodule Ferricstore.Store.FlushDurableEnumerationTest do
       Path.join(System.tmp_dir!(), "flush_owner_death_#{System.unique_integer([:positive])}")
 
     name = :"flush_owner_death_#{System.unique_integer([:positive])}"
-    ctx = FerricStore.Instance.build(name, data_dir: data_dir, shard_count: 1)
+    ctx = build_instance(name, data_dir)
     Ferricstore.DataDir.ensure_layout!(data_dir, 1)
 
     on_exit(fn -> cleanup(ctx, data_dir) end)
@@ -281,6 +281,14 @@ defmodule Ferricstore.Store.FlushDurableEnumerationTest do
       data_dir: data_dir,
       instance_ctx: ctx,
       flow_shared_ref_backfill?: false
+    )
+  end
+
+  defp build_instance(name, data_dir) do
+    FerricStore.Instance.build(name,
+      data_dir: data_dir,
+      shard_count: 1,
+      query_index_provider: FerricStore.Flow.QueryIndexProvider.Disabled
     )
   end
 

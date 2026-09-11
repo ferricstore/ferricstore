@@ -164,6 +164,7 @@ defmodule Ferricstore.Store.RouterRestartFallbackTest do
       FerricStore.Instance.build(name,
         data_dir: tmp_dir,
         shard_count: 1,
+        query_index_provider: FerricStore.Flow.QueryIndexProvider.Disabled,
         hot_cache_max_value_size: 0,
         read_sample_rate: 0
       )

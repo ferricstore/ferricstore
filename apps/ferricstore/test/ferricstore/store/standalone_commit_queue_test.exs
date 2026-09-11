@@ -493,7 +493,14 @@ defmodule Ferricstore.Store.StandaloneCommitQueueTest do
       )
 
     name = :"standalone_commit_queue_#{System.unique_integer([:positive])}"
-    ctx = FerricStore.Instance.build(name, data_dir: data_dir, shard_count: 1)
+
+    ctx =
+      FerricStore.Instance.build(name,
+        data_dir: data_dir,
+        shard_count: 1,
+        query_index_provider: FerricStore.Flow.QueryIndexProvider.Disabled
+      )
+
     Ferricstore.DataDir.ensure_layout!(data_dir, 1)
 
     {:ok, pid} =
