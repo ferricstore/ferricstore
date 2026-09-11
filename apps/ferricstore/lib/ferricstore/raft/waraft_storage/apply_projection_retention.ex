@@ -482,7 +482,7 @@ defmodule Ferricstore.Raft.WARaftStorage.ApplyProjectionRetention do
 
   defp decode_entry(<<@format_version, key_bytes::unsigned-big-16, rest::binary>>) do
     with true <- key_bytes > 0 and key_bytes <= @max_key_bytes,
-         <<key::binary-size(key_bytes), expire_at_ms::unsigned-big-64,
+         <<key::binary-size(^key_bytes), expire_at_ms::unsigned-big-64,
            value_bytes::unsigned-big-32, value::binary>> <- rest,
          true <- value_bytes <= @max_value_bytes,
          true <- byte_size(value) == value_bytes do

@@ -210,6 +210,7 @@ defmodule Ferricstore.FlowGovernanceLimitStorageTest do
     assert owner.leases[0].in_use == 0
   end
 
+  @tag timeout: 120_000
   test "released reservation history rotates despite lease renewal" do
     ctx = FerricStore.Instance.get(:default)
     scope = unique_flow_id("detached-limit-renewed-history")

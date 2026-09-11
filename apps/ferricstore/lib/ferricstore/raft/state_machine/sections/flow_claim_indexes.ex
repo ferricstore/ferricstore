@@ -91,7 +91,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimIndexes do
               nil -> []
             end
 
-          if flow_due_any_index_enabled?() do
+          with_flow_due_any do
             case flow_due_any_index_key(record) do
               key when is_binary(key) -> [{key, record.id} | entries]
               nil -> entries
@@ -145,10 +145,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimIndexes do
         end
       end
 
-      defp flow_claim_move_due_any_indexes(_state, []), do: :ok
-
       defp flow_claim_move_due_any_indexes(state, plans) do
-        if flow_due_any_index_enabled?() do
+        with_flow_due_any do
           {moves, deletes, puts} =
             Enum.reduce(plans, {[], [], %{}}, fn plan, acc ->
               {record, next} = flow_claim_plan_pair(plan)
@@ -540,7 +538,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimIndexes do
       defp flow_claim_due_index_plan(record, next, moves, deletes, puts) do
         {moves, deletes, puts} = flow_due_state_index_plan(record, next, {moves, deletes, puts})
 
-        if flow_due_any_index_enabled?() do
+        with_flow_due_any do
           flow_due_any_index_plan(record, next, {moves, deletes, puts})
         else
           {moves, deletes, puts}
@@ -775,41 +773,70 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimIndexes do
       end
 
       defp flow_transition_move_due_indexes_nonempty(state, plans) do
-        {moves, deletes, puts, _from_due_cache, _to_due_cache, _from_any_cache, _to_any_cache} =
-          Enum.reduce(plans, {[], [], %{}, nil, nil, nil, nil}, fn plan,
-                                                                   {moves, deletes, puts,
-                                                                    from_due_cache, to_due_cache,
-                                                                    from_any_cache, to_any_cache} ->
-            {record, next} = flow_claim_plan_pair(plan)
+        {moves, deletes, puts} =
+          with_flow_due_any do
+            {moves, deletes, puts, _from_due_cache, _to_due_cache, _from_any_cache, _to_any_cache} =
+              Enum.reduce(plans, {[], [], %{}, nil, nil, nil, nil}, fn plan,
+                                                                       {moves, deletes, puts,
+                                                                        from_due_cache,
+                                                                        to_due_cache,
+                                                                        from_any_cache,
+                                                                        to_any_cache} ->
+                {record, next} = flow_claim_plan_pair(plan)
 
-            {from_due_key, from_due_cache} =
-              flow_claim_cached_due_index_key(from_due_cache, record)
+                {from_due_key, from_due_cache} =
+                  flow_claim_cached_due_index_key(from_due_cache, record)
 
-            {to_due_key, to_due_cache} = flow_claim_cached_due_index_key(to_due_cache, next)
+                {to_due_key, to_due_cache} = flow_claim_cached_due_index_key(to_due_cache, next)
 
-            {moves, deletes, puts} =
-              flow_due_index_plan(from_due_key, to_due_key, record, next, {moves, deletes, puts})
+                {moves, deletes, puts} =
+                  flow_due_index_plan(from_due_key, to_due_key, record, next, {
+                    moves,
+                    deletes,
+                    puts
+                  })
 
-            if flow_due_any_index_enabled?() do
-              {from_any_key, from_any_cache} =
-                flow_claim_cached_due_any_index_key(from_any_cache, record)
+                {from_any_key, from_any_cache} =
+                  flow_claim_cached_due_any_index_key(from_any_cache, record)
 
-              {to_any_key, to_any_cache} = flow_claim_cached_due_any_index_key(to_any_cache, next)
+                {to_any_key, to_any_cache} =
+                  flow_claim_cached_due_any_index_key(to_any_cache, next)
 
-              {moves, deletes, puts} =
-                flow_due_index_plan(
-                  from_any_key,
-                  to_any_key,
-                  record,
-                  next,
-                  {moves, deletes, puts}
-                )
+                {moves, deletes, puts} =
+                  flow_due_index_plan(from_any_key, to_any_key, record, next, {
+                    moves,
+                    deletes,
+                    puts
+                  })
 
-              {moves, deletes, puts, from_due_cache, to_due_cache, from_any_cache, to_any_cache}
-            else
-              {moves, deletes, puts, from_due_cache, to_due_cache, from_any_cache, to_any_cache}
-            end
-          end)
+                {moves, deletes, puts, from_due_cache, to_due_cache, from_any_cache, to_any_cache}
+              end)
+
+            {moves, deletes, puts}
+          else
+            {moves, deletes, puts, _from_due_cache, _to_due_cache} =
+              Enum.reduce(plans, {[], [], %{}, nil, nil}, fn plan,
+                                                             {moves, deletes, puts,
+                                                              from_due_cache, to_due_cache} ->
+                {record, next} = flow_claim_plan_pair(plan)
+
+                {from_due_key, from_due_cache} =
+                  flow_claim_cached_due_index_key(from_due_cache, record)
+
+                {to_due_key, to_due_cache} = flow_claim_cached_due_index_key(to_due_cache, next)
+
+                {moves, deletes, puts} =
+                  flow_due_index_plan(from_due_key, to_due_key, record, next, {
+                    moves,
+                    deletes,
+                    puts
+                  })
+
+                {moves, deletes, puts, from_due_cache, to_due_cache}
+              end)
+
+            {moves, deletes, puts}
+          end
 
         with :ok <- flow_index_move_lifecycle_entries(state, Enum.reverse(moves)),
              :ok <- flow_zset_lifecycle_index_delete_grouped(state, deletes) do

@@ -644,7 +644,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
           case enqueue_lmdb_mirror_group(state, shard_index, shard_ops, shard_after_flush) do
             :ok -> {:cont, :ok}
             {:error, reason} -> {:halt, {:error, {:lmdb_shard, shard_index, reason}}}
-            other -> {:halt, {:error, {:lmdb_shard, shard_index, other}}}
           end
         end)
       end

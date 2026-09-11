@@ -233,6 +233,20 @@ defmodule Ferricstore.Raft.StateMachine do
           release_cursor_interval: pos_integer()
         }
 
+  @flow_due_any_index_enabled Application.compile_env(
+                                :ferricstore,
+                                :flow_due_any_index,
+                                false
+                              )
+
+  defmacrop with_flow_due_any(clauses) do
+    if @flow_due_any_index_enabled do
+      Keyword.fetch!(clauses, :do)
+    else
+      Keyword.fetch!(clauses, :else)
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Replicated state callbacks
   # ---------------------------------------------------------------------------

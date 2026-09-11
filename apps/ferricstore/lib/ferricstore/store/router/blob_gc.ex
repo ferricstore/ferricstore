@@ -791,9 +791,6 @@ defmodule Ferricstore.Store.Router.BlobGC do
 
           true ->
             true
-
-          other ->
-            :erlang.error({:badbool, :or, other})
         end
     end
   end
@@ -822,11 +819,9 @@ defmodule Ferricstore.Store.Router.BlobGC do
     case (case Ferricstore.Flow.Keys.state_key?(key) do
             false -> Ferricstore.Flow.Keys.value_key?(key)
             true -> true
-            other -> :erlang.error({:badbool, :or, other})
           end) do
       false -> blob_gc_flow_history_entry_key?(key)
       true -> true
-      other -> :erlang.error({:badbool, :or, other})
     end
   end
 

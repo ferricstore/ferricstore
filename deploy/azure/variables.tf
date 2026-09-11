@@ -43,13 +43,13 @@ variable "ssh_public_key_path" {
 variable "elixir_version" {
   description = "Elixir version to install"
   type        = string
-  default     = "1.19.5"
+  default     = "1.20.4"
 }
 
 variable "otp_version" {
   description = "Erlang/OTP version to install"
   type        = string
-  default     = "28.3.1"
+  default     = "29.0.5"
 }
 
 variable "shard_count" {

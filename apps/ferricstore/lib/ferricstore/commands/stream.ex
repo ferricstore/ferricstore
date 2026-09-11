@@ -788,24 +788,20 @@ defmodule Ferricstore.Commands.Stream do
 
   defp raw_xrange(key, range_start, range_end, count, %FerricStore.Instance{} = store)
        when is_integer(count) and count > 0 do
-    if Ops.has_compound?(store) do
-      {type_key, entry_prefix} = CompoundKey.stream_read_keys(key)
+    {type_key, entry_prefix} = CompoundKey.stream_read_keys(key)
 
-      with {:ok, marker, pairs} <-
-             Entries.typed_raw_range_page(
-               store,
-               key,
-               type_key,
-               entry_prefix,
-               range_start,
-               range_end,
-               count
-             ),
-           :ok <- Meta.ensure_read_marker(key, marker, store) do
-        {:ok, pairs}
-      end
-    else
-      :fallback
+    with {:ok, marker, pairs} <-
+           Entries.typed_raw_range_page(
+             store,
+             key,
+             type_key,
+             entry_prefix,
+             range_start,
+             range_end,
+             count
+           ),
+         :ok <- Meta.ensure_read_marker(key, marker, store) do
+      {:ok, pairs}
     end
   end
 
@@ -840,29 +836,25 @@ defmodule Ferricstore.Commands.Stream do
          %FerricStore.Instance{} = store
        )
        when is_integer(count) and count > 0 do
-    if Ops.has_compound?(store) and paged_stream_range?(store) do
-      {type_key, entry_prefix} = CompoundKey.stream_read_keys(key)
+    {type_key, entry_prefix} = CompoundKey.stream_read_keys(key)
 
-      case Meta.entries(key, store) do
-        [{^key, len, _first, _last, _ms, _seq}] when len > 0 ->
-          with {:ok, marker, pairs} <-
-                 Entries.typed_raw_reverse_full_range(
-                   store,
-                   key,
-                   type_key,
-                   entry_prefix,
-                   len,
-                   count
-                 ),
-               :ok <- Meta.ensure_read_marker(key, marker, store) do
-            {:ok, pairs}
-          end
+    case Meta.entries(key, store) do
+      [{^key, len, _first, _last, _ms, _seq}] when len > 0 ->
+        with {:ok, marker, pairs} <-
+               Entries.typed_raw_reverse_full_range(
+                 store,
+                 key,
+                 type_key,
+                 entry_prefix,
+                 len,
+                 count
+               ),
+             :ok <- Meta.ensure_read_marker(key, marker, store) do
+          {:ok, pairs}
+        end
 
-        _empty_failure_or_uncached ->
-          :fallback
-      end
-    else
-      :fallback
+      _empty_failure_or_uncached ->
+        :fallback
     end
   end
 

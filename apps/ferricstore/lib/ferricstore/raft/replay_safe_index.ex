@@ -109,7 +109,6 @@ defmodule Ferricstore.Raft.ReplaySafeIndex do
 
         case {write_result, close_result} do
           {:ok, :ok} -> :ok
-          {{:error, reason}, _close_result} -> {:error, reason}
           {:ok, {:error, reason}} -> {:error, reason}
         end
 

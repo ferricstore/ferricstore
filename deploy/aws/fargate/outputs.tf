@@ -3,6 +3,26 @@ output "endpoint" {
   value       = "ferric://${aws_lb.this.dns_name}:${local.native_port}"
 }
 
+output "http_endpoint" {
+  description = "Private HTTP command API endpoint, or null when http_enabled is false."
+  value = var.http_enabled ? format(
+    "%s://%s:%d",
+    var.http_tls_certificate_arn == null ? "http" : "https",
+    var.http_hostname == null ? aws_lb.this.dns_name : var.http_hostname,
+    var.http_listener_port
+  ) : null
+}
+
+output "http_readiness_endpoint" {
+  description = "Unauthenticated HTTP API readiness endpoint, or null when HTTP is disabled."
+  value = var.http_enabled ? format(
+    "%s://%s:%d/ready",
+    var.http_tls_certificate_arn == null ? "http" : "https",
+    var.http_hostname == null ? aws_lb.this.dns_name : var.http_hostname,
+    var.http_listener_port
+  ) : null
+}
+
 output "deployment_profile" {
   description = "FerricStore deployment contract implemented by this stack."
   value       = "oss-single-task-ephemeral"

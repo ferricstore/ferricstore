@@ -1200,6 +1200,81 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
     assert {:delete, state_key} in ops
   end
 
+  test "late query-only projection preserves a retained terminal query row" do
+    path = tmp_lmdb_path("retained_terminal_query_row")
+    keydir = :ets.new(:retained_terminal_query_row_source, [:set, :public])
+    state_key = Ferricstore.Flow.Keys.state_key("retained-terminal", "tenant-a")
+
+    record =
+      active_flow_record("retained-terminal", "jobs", "tenant-a")
+      |> Map.merge(%{version: 3, state: "failed", updated_at_ms: 30, next_run_at_ms: nil})
+
+    encoded_record = Ferricstore.Flow.encode_record(record)
+
+    locator =
+      Locator.new!(
+        flow_id: "retained-terminal",
+        kind: :state,
+        version: 3,
+        raft_index: 3,
+        file_id: {:waraft_apply_projection, 3},
+        offset: 0,
+        value_size: byte_size(encoded_record),
+        frame_size: 1_024,
+        segment_generation: 0,
+        checksum: :crypto.hash(:sha256, encoded_record)
+      )
+
+    assert {:ok, projected} = QueryRowCodec.encode(state_key, record, locator, 0)
+
+    reverse_key = LMDB.terminal_by_state_key_key(state_key)
+    terminal_key = "retained-terminal-index-entry"
+
+    assert :ok =
+             LMDB.write_batch(path, [
+               {:put, state_key, projected},
+               {:put, reverse_key, terminal_key}
+             ])
+
+    :ets.insert(keydir, {state_key, nil, 0, :flow_state_deleted, :deleted, 0, 0})
+
+    state = %{
+      path: path,
+      shard_index: 0,
+      instance_ctx: %{keydir_refs: {keydir}},
+      terminal_count_inits: MapSet.new()
+    }
+
+    assert {:ok, ops, _state} =
+             ProjectionOps.expand_ops(state, [
+               {:project_flow_query_state_from_source, state_key, 3}
+             ])
+
+    refute {:delete, state_key} in ops
+  end
+
+  test "query-only projection deletes a missing source without a terminal marker" do
+    path = tmp_lmdb_path("missing_query_source")
+    keydir = :ets.new(:missing_query_source, [:set, :public])
+    state_key = Ferricstore.Flow.Keys.state_key("deleted-query-source", "tenant-a")
+
+    :ets.insert(keydir, {state_key, nil, 0, :flow_state_deleted, :deleted, 0, 0})
+
+    state = %{
+      path: path,
+      shard_index: 0,
+      instance_ctx: %{keydir_refs: {keydir}},
+      terminal_count_inits: MapSet.new()
+    }
+
+    assert {:ok, ops, _state} =
+             ProjectionOps.expand_ops(state, [
+               {:project_flow_query_state_from_source, state_key, 3}
+             ])
+
+    assert {:delete, state_key} in ops
+  end
+
   defp tmp_lmdb_path(prefix) do
     path =
       Path.join(

@@ -174,7 +174,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.HelpersPart01 do
 
       defp scan_storage_metadata_journal(<<"FSMJ1", size::32, crc::32, rest::binary>>, latest)
            when byte_size(rest) >= size do
-        <<payload::binary-size(size), tail::binary>> = rest
+        <<payload::binary-size(^size), tail::binary>> = rest
 
         if :erlang.crc32(payload) == crc do
           scan_storage_metadata_journal(tail, :erlang.binary_to_term(payload, [:safe]))

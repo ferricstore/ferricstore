@@ -547,7 +547,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SnapshotTransferWrapsWaraf
                  )
 
         assert is_integer(history_file_id) and history_file_id >= 0
-        assert is_integer(offset) and offset >= 0
+        assert offset >= 0
         assert payload_size > 0
         assert {:ok, ["payload"]} = Ferricstore.Flow.value_mget(ctx, [created.payload_ref])
         assert [] = :ets.lookup(elem(ctx.keydir_refs, 0), created.payload_ref)

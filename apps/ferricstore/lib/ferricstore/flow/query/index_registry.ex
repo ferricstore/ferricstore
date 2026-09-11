@@ -1182,9 +1182,6 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
     }
   end
 
-  defp ensure_validation_checkpoint_phase(%{phase: :done}),
-    do: {:error, :invalid_query_index_validation_checkpoint_transition}
-
   defp ensure_validation_checkpoint_phase(%{phase: phase, fenced: false})
        when phase != :source,
        do: {:error, :query_index_validation_not_fenced}

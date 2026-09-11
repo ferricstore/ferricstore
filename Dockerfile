@@ -1,13 +1,13 @@
 # ============================================================
 # Stage 1: Rust toolchain
 # ============================================================
-ARG RUST_VERSION=1.94.0
-FROM rust:${RUST_VERSION}-slim-bookworm@sha256:a86cada82e36ebd7a9bffed7548792c55a952fdb20718eea9278a936bcb76e62 AS rust-toolchain
+ARG RUST_VERSION=1.98.0
+FROM rust:${RUST_VERSION}-slim-bookworm@sha256:1469a27c125cb5a3aebfa4f4e4665d935b02fb72cc093b2c974b3d740e43f157 AS rust-toolchain
 
 # ============================================================
 # Stage 2: Build
 # ============================================================
-FROM hexpm/elixir:1.19.5-erlang-28.4.1-ubuntu-noble-20260217@sha256:a0ee05779f7231b1f679ce540b63741e0ec56b181947ff00556b13370ad080f8 AS builder
+FROM hexpm/elixir:1.20.4-erlang-29.0.5-ubuntu-noble-20260810@sha256:e77a33445c3beb9f361e649f705b5852944a3153f13a7c7bfd7a95a5a7c5f0d2 AS builder
 
 # Install system deps + Rust
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -32,7 +32,9 @@ ENV HEX_HTTP_CONCURRENCY=2
 # Copy mix files (all apps needed for umbrella resolution)
 COPY mix.exs mix.lock ./
 COPY apps/ferricstore/mix.exs apps/ferricstore/mix.exs
+COPY apps/ferricstore_cluster_consul/mix.exs apps/ferricstore_cluster_consul/mix.exs
 COPY apps/ferricstore_server/mix.exs apps/ferricstore_server/mix.exs
+COPY apps/ferricstore_http/mix.exs apps/ferricstore_http/mix.exs
 COPY config/config.exs config/prod.exs config/runtime.exs config/
 
 # Copy source for the standalone Docker image
@@ -42,6 +44,7 @@ COPY apps/ferricstore/src apps/ferricstore/src
 COPY apps/ferricstore/priv/flow_query apps/ferricstore/priv/flow_query
 COPY apps/ferricstore_server/native apps/ferricstore_server/native
 COPY apps/ferricstore_server/lib apps/ferricstore_server/lib
+COPY apps/ferricstore_http/lib apps/ferricstore_http/lib
 COPY rel rel
 
 RUN mix deps.unlock --unused && mix deps.get --only prod
@@ -55,10 +58,10 @@ RUN mix release ferricstore
 # ============================================================
 # Stage 3: Runtime
 # ============================================================
-FROM ubuntu:noble-20260217@sha256:186072bba1b2f436cbb91ef2567abca677337cfc786c86e107d25b7072feef0c
+FROM ubuntu:noble-20260810@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3t64 libncurses6 libstdc++6 \
+    ca-certificates libssl3t64 libncurses6 libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system --gid 10001 ferricstore \
@@ -78,11 +81,14 @@ ENV FERRICSTORE_DATA_DIR=/data
 ENV FERRICSTORE_NATIVE_PORT=6388
 ENV FERRICSTORE_HEALTH_PORT=6380
 ENV FERRICSTORE_HEALTH_PROBE_PORT=6381
+ENV FERRICSTORE_HTTP_ENABLED=false
+ENV FERRICSTORE_HTTP_BIND=0.0.0.0
+ENV FERRICSTORE_HTTP_PORT=8080
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 ENV ELIXIR_ERL_OPTIONS="+fnu"
 
-EXPOSE 6388 6380 6381
+EXPOSE 6388 6380 6381 8080
 
 USER ferricstore
 

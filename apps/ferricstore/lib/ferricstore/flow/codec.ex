@@ -694,8 +694,6 @@ defmodule Ferricstore.Flow.Codec do
     base_fields ++ Support.normalize_history_decoded_meta(meta_fields)
   end
 
-  defp decode_history_fields_term(_value, _context), do: []
-
   defp decode_record_bin(rest) do
     with {:ok, flags, rest} <- decode_int(rest),
          flags when is_integer(flags) <- flags,

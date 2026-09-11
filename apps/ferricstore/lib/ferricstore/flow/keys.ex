@@ -516,11 +516,33 @@ defmodule Ferricstore.Flow.Keys do
   def history_key?(key), do: internal_key_with_remainder?(key, "}:h:")
 
   def due_key(type, state, priority, partition_key \\ nil) do
+    due_key_from_index_components(
+      index_component(type),
+      index_component(state),
+      priority,
+      partition_key
+    )
+  end
+
+  @doc false
+  def due_key_from_index_components(encoded_type, encoded_state, priority, partition_key)
+      when is_binary(encoded_type) and is_binary(encoded_state) do
+    due_key_from_tag_and_index_components(
+      tag(partition_key),
+      encoded_type,
+      encoded_state,
+      priority
+    )
+  end
+
+  @doc false
+  def due_key_from_tag_and_index_components(partition_tag, encoded_type, encoded_state, priority)
+      when is_binary(partition_tag) and is_binary(encoded_type) and is_binary(encoded_state) do
     "f:" <>
-      tag(partition_key) <>
+      partition_tag <>
       ":d:" <>
-      index_component(type) <>
-      ":" <> index_component(state) <> ":p" <> Integer.to_string(priority)
+      encoded_type <>
+      ":" <> encoded_state <> ":p" <> Integer.to_string(priority)
   end
 
   def due_any_key(type, priority, partition_key \\ nil) do

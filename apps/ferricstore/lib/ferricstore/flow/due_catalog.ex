@@ -699,8 +699,6 @@ defmodule Ferricstore.Flow.DueCatalog do
     end)
   end
 
-  defp rebuild_expected_catalog(_entries), do: {:error, :invalid_entries}
-
   defp canonical_entry(due_key, %{score: score}) do
     with true <- valid_score?(score),
          {:ok, metadata} <- Keys.decode_due_key(due_key) do

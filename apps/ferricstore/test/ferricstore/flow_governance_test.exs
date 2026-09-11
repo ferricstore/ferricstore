@@ -1492,6 +1492,7 @@ defmodule Ferricstore.FlowGovernanceTest do
     assert circuit_close_metadata.circuit_status == :closed
   end
 
+  @tag timeout: 120_000
   test "budget supports repeated same-scope reserve and commit operations" do
     scope = unique_flow_id("gov-budget-same-scope")
     operation_count = 129

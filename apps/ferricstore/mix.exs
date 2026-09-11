@@ -1,7 +1,7 @@
 defmodule Ferricstore.MixProject do
   use Mix.Project
 
-  @version "0.11.6"
+  @version "0.11.14"
 
   def project do
     [
@@ -11,7 +11,7 @@ defmodule Ferricstore.MixProject do
       config_path: "../../config/config.exs",
       deps_path: "../../deps",
       lockfile: "../../mix.lock",
-      elixir: "~> 1.19",
+      elixir: "~> 1.20",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -37,6 +37,7 @@ defmodule Ferricstore.MixProject do
         "../../guides/getting-started.md",
         "../../guides/kv-store.md",
         "../../guides/embedded-mode.md",
+        "../../guides/http-api.md",
         "../../guides/flow-elixir-sdk.md",
         "../../guides/commands.md",
         "../../guides/redis-migration.md",
@@ -48,6 +49,9 @@ defmodule Ferricstore.MixProject do
         "../../docs/flow-vs-temporal-usage.md",
         "../../docs/benchmarks.md",
         "../../docs/native-protocol.md",
+        "../../docs/http/api.md",
+        "../../docs/http/architecture.md",
+        "../../docs/http/testing-and-benchmarks.md",
         "../../docs/flow-query.md",
         "../../docs/flow-production-readiness.md",
         "../../docs/aws-fargate-single-task.md",
@@ -57,7 +61,7 @@ defmodule Ferricstore.MixProject do
       ],
       groups_for_extras: [
         Guides: Path.wildcard("../../guides/*.md"),
-        References: Path.wildcard("../../docs/*.md")
+        References: Path.wildcard("../../docs/**/*.md")
       ],
       source_url: "https://github.com/ferricstore/ferricstore",
       homepage_url: "https://github.com/ferricstore/ferricstore"
@@ -89,11 +93,10 @@ defmodule Ferricstore.MixProject do
 
   defp deps do
     [
-      {:rustler_precompiled, "~> 0.8"},
-      {:rustler, "~> 0.37", optional: true},
+      {:rustler_precompiled, "~> 0.9"},
+      {:rustler, "~> 0.38", optional: true},
       {:wa_raft, "~> 0.1", hex: :ferricstore_waraft},
-      {:libcluster, "3.3.3"},
-      {:libcluster_consul, "1.3.0", optional: true},
+      {:libcluster, "3.5.0"},
       {:libcluster_etcd, "1.1.2", optional: true},
       {:telemetry, "~> 1.4"},
       {:jason, "~> 1.4"},

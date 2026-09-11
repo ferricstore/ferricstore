@@ -15,6 +15,32 @@ env:
 
 jobs:
   # ===========================================================================
+  # Terraform deployment profiles
+  # ===========================================================================
+  terraform-fargate:
+    name: "Terraform (${{ matrix.profile }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [fargate, fargate-cluster]
+    defaults:
+      run:
+        working-directory: deploy/aws/${{ matrix.profile }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive
+      - name: Initialize providers without a backend
+        run: terraform init -backend=false -input=false
+      - name: Validate Terraform
+        run: terraform validate
+
+  # ===========================================================================
   # Build (Ubuntu)
   # ===========================================================================
   build-ubuntu:
@@ -24,8 +50,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -37,8 +63,8 @@ jobs:
         uses: actions/cache@v5
         with:
           path: deps
-          key: mix-deps-Linux-1.19-28-${{ hashFiles('mix.lock') }}
-          restore-keys: mix-deps-Linux-1.19-28-
+          key: mix-deps-Linux-1.20.4-29.0.5-${{ hashFiles('mix.lock') }}
+          restore-keys: mix-deps-Linux-1.20.4-29.0.5-
 
       - name: Cache Cargo
         uses: actions/cache@v5
@@ -60,6 +86,13 @@ jobs:
 
       - name: Install dependencies
         run: mix deps.get
+
+      - name: Verify dependency lock hygiene
+        run: |
+          for mix_env in dev test bench prod; do
+            MIX_ENV="$mix_env" mix deps.get --check-locked
+            MIX_ENV="$mix_env" mix deps.unlock --check-unused
+          done
 
       - name: Audit Hex dependencies
         run: |
@@ -125,6 +158,11 @@ jobs:
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
 
+      - name: Build publishable Hex package
+        run: |
+          package_dir="$(mktemp -d)"
+          (cd apps/ferricstore && mix hex.build --unpack --output "$package_dir/ferricstore")
+
       - name: Validate native query benchmark contracts
         run: |
           MIX_ENV=bench mix deps.get
@@ -163,8 +201,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -176,8 +214,8 @@ jobs:
         uses: actions/cache@v5
         with:
           path: deps
-          key: mix-deps-macOS-1.19-28-${{ hashFiles('mix.lock') }}
-          restore-keys: mix-deps-macOS-1.19-28-
+          key: mix-deps-macOS-1.20.4-29.0.5-${{ hashFiles('mix.lock') }}
+          restore-keys: mix-deps-macOS-1.20.4-29.0.5-
 
       - name: Cache Cargo
         uses: actions/cache@v5
@@ -258,8 +296,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -304,8 +342,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -361,8 +399,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -416,8 +454,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -448,8 +486,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -487,8 +525,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -523,8 +561,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -547,6 +585,159 @@ jobs:
           retention-days: 14
 
   # ===========================================================================
+  # HTTP protocol tests (ubuntu)
+  # ===========================================================================
+  test-http-ubuntu:
+    name: "HTTP protocol tests (ubuntu)"
+    needs: build-ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v8
+        with:
+          name: build-Linux
+          path: .
+      - name: Ensure dependencies
+        run: mix deps.get
+      - name: Run HTTP quality, architecture, and protocol tests
+        run: mix quality.http
+      - uses: actions/upload-artifact@v7
+        if: always()
+        continue-on-error: true
+        with:
+          name: test-results-http-ubuntu
+          path: test-results/
+          retention-days: 14
+
+  test-http-python-sdk-ubuntu:
+    name: "Python SDK over TLS HTTP (ubuntu)"
+    needs: build-ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: ferricstore/ferricstore-python
+          ref: v0.11.8
+          path: ferricstore-python
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: ferricstore-python/pyproject.toml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v8
+        with:
+          name: build-Linux
+          path: .
+      - name: Install dependencies
+        run: |
+          mix deps.get
+          python -m pip install --upgrade pip
+          python -m pip install -e "./ferricstore-python[dev]"
+      - name: Run Python SDK through the in-process TLS listener
+        env:
+          FERRICSTORE_PYTHON_SDK_PATH: ${{ github.workspace }}/ferricstore-python
+          FERRICSTORE_PYTHON_EXECUTABLE: python
+        run: >-
+          mix test
+          apps/ferricstore_http/test/ferricstore_http/python_sdk_integration_test.exs
+          --include python_sdk_integration --timeout 300000
+
+  test-http-official-sdks-ubuntu:
+    name: "Go, TypeScript, Elixir, and Java SDKs over TLS HTTP (ubuntu)"
+    needs: build-ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: ferricstore/ferricstore-go
+          ref: v0.11.10
+          path: ferricstore-go
+      - uses: actions/checkout@v6
+        with:
+          repository: ferricstore/ferricstore-typescript
+          ref: 87d84c4e0631952ca4438f0cfb0e93b267830d6d
+          path: ferricstore-typescript
+      - uses: actions/checkout@v6
+        with:
+          repository: ferricstore/ferricstore-elixir
+          ref: v0.11.13
+          path: ferricstore-elixir
+      - uses: actions/checkout@v6
+        with:
+          repository: ferricstore/ferricstore-java
+          ref: 75b20cdd3fb0dffdddf372bd659f71e40f8e2f3f
+          path: ferricstore-java
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.6"
+          cache-dependency-path: ferricstore-go/go.sum
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24.x"
+          cache: npm
+          cache-dependency-path: ferricstore-typescript/package-lock.json
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          cache-dependency-path: ferricstore-java/pom.xml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v8
+        with:
+          name: build-Linux
+          path: .
+      - name: Install server dependencies
+        run: mix deps.get
+      - name: Install TypeScript SDK dependencies
+        working-directory: ferricstore-typescript
+        run: npm ci
+      - name: Install Elixir SDK dependencies
+        working-directory: ferricstore-elixir
+        run: mix deps.get
+      - name: Run official SDKs through the in-process TLS listener
+        env:
+          FERRICSTORE_GO_SDK_PATH: ${{ github.workspace }}/ferricstore-go
+          FERRICSTORE_GO_EXECUTABLE: go
+          FERRICSTORE_TYPESCRIPT_SDK_PATH: ${{ github.workspace }}/ferricstore-typescript
+          FERRICSTORE_ELIXIR_SDK_PATH: ${{ github.workspace }}/ferricstore-elixir
+          FERRICSTORE_ELIXIR_EXECUTABLE: elixir
+          FERRICSTORE_JAVA_SDK_PATH: ${{ github.workspace }}/ferricstore-java
+        run: >-
+          mix test
+          apps/ferricstore_http/test/ferricstore_http/sdk_integration_test.exs
+          apps/ferricstore_http/test/ferricstore_http/java_sdk_integration_test.exs
+          --include sdk_integration --include java_sdk_integration --timeout 300000
+
+  # ===========================================================================
   # Durability tests (ubuntu only — shard-kill, jepsen, large alloc)
   # ===========================================================================
   test-durability:
@@ -557,8 +748,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -621,8 +812,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -657,8 +848,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex

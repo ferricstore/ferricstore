@@ -850,7 +850,6 @@ defmodule FerricstoreServer.Native.Session do
       else: binary
   end
 
-  defp native_tx_result({:error, _reason} = error), do: native_value(error)
   defp native_tx_result(nil), do: nil
   defp native_tx_result(results) when is_list(results), do: Enum.map(results, &native_value/1)
   defp native_tx_result(other), do: native_value(other)

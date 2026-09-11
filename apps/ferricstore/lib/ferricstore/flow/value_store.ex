@@ -502,7 +502,7 @@ defmodule Ferricstore.Flow.ValueStore do
 
   defp waraft_segment_file_id?(_file_id), do: false
 
-  defp flow_value_maybe_materialize_lmdb_value(ctx, ref, value) when is_binary(value) do
+  defp flow_value_maybe_materialize_lmdb_value(ctx, ref, value) do
     shard_index = Router.shard_for(ctx, ref)
 
     case BlobValue.maybe_materialize(
@@ -515,8 +515,6 @@ defmodule Ferricstore.Flow.ValueStore do
       {:error, _reason} -> nil
     end
   end
-
-  defp flow_value_maybe_materialize_lmdb_value(_ctx, _ref, value), do: value
 
   defp flow_value_read_lmdb_locator(ctx, key, {file_id, offset, _value_size}) do
     shard_index = Router.shard_for(ctx, key)

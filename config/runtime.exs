@@ -686,8 +686,8 @@ if config_env() == :prod do
     #               FERRICSTORE_GOSSIP_IF_ADDR is set explicitly)
     #   "dns"     — DNS A-record polling (good for Kubernetes headless services)
     #   "epmd"    — static node list from FERRICSTORE_CLUSTER_NODES
-    #   "consul"  — Consul service discovery (requires libcluster_consul dep)
-    #   "etcd"    — etcd service discovery (requires libcluster_etcd dep)
+    #   "consul"  — Consul service discovery (bundled in the server release)
+    #   "etcd"    — etcd service discovery (bundled in the server release)
     #   "none"    — disable libcluster (manual CLUSTER.JOIN only)
     discovery = System.get_env("FERRICSTORE_DISCOVERY", "gossip")
 
@@ -747,27 +747,42 @@ if config_env() == :prod do
           ]
 
       "consul" ->
+        node_basename = node_name |> to_string() |> String.split("@") |> hd()
+
         config :libcluster,
           topologies: [
             ferricstore: [
-              strategy: ClusterConsul.Strategy,
+              strategy: Cluster.Strategy.Consul,
               config: [
-                agent_url: System.get_env("FERRICSTORE_CONSUL_URL", "http://localhost:8500"),
-                service_name: System.get_env("FERRICSTORE_CONSUL_SERVICE", "ferricstore"),
+                base_url: System.get_env("FERRICSTORE_CONSUL_URL", "http://localhost:8500"),
+                access_token: System.get_env("FERRICSTORE_CONSUL_TOKEN"),
+                list_using: [{Cluster.Strategy.Consul.Health, passing: true}],
+                service: [
+                  name: System.get_env("FERRICSTORE_CONSUL_SERVICE", "ferricstore")
+                ],
+                node_basename: node_basename,
                 polling_interval: 5_000
               ]
             ]
           ]
 
       "etcd" ->
+        etcd_nodes =
+          System.get_env("FERRICSTORE_ETCD_ENDPOINTS", "http://localhost:2379")
+          |> String.split(",", trim: true)
+
+        directory =
+          System.get_env("FERRICSTORE_ETCD_PREFIX", "/ferricstore/nodes")
+          |> String.trim("/")
+
         config :libcluster,
           topologies: [
             ferricstore: [
-              strategy: Cluster.Strategy.Etcd,
+              strategy: LibclusterEtcd.Strategy,
               config: [
-                endpoints: System.get_env("FERRICSTORE_ETCD_ENDPOINTS", "http://localhost:2379"),
-                prefix: System.get_env("FERRICSTORE_ETCD_PREFIX", "/ferricstore/nodes"),
-                node_basename: node_name |> to_string() |> String.split("@") |> hd()
+                etcd_nodes: etcd_nodes,
+                directory: directory,
+                polling_interval: 5_000
               ]
             ]
           ]

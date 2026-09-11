@@ -89,7 +89,7 @@ defmodule Ferricstore.Flow.Query.IndexRegistryJournal do
         {:ok, Enum.reverse(events), valid_bytes}
 
       true ->
-        <<payload::binary-size(size), tail::binary>> = rest
+        <<payload::binary-size(^size), tail::binary>> = rest
 
         with true <- :crypto.hash(:sha256, payload) == digest,
              {:ok, {@tag, @version, event}} <- TermCodec.decode(payload) do

@@ -207,7 +207,7 @@ defmodule FerricstoreServer.ConnectionAclIssuesTest do
       # match either of the case clauses in fast_get.
       handled_tags = [:sent, :error_after_header]
       fallback_result = :fallback
-      refute is_tuple(fallback_result) and elem(fallback_result, 0) in handled_tags
+      refute fallback_result in handled_tags
 
       # The fix should either:
       # 1. Add a :fallback clause to fast_get that falls through to dispatch_normal

@@ -1,8 +1,7 @@
 defmodule Ferricstore.Store.ReadResultTest do
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Store.ReadResult
-  alias Ferricstore.Store.TypeRegistry
+  alias Ferricstore.Store.{ReadResult, StringRead, TypeRegistry}
 
   alias Ferricstore.Commands.{
     Bitmap,
@@ -342,6 +341,18 @@ defmodule Ferricstore.Store.ReadResultTest do
                nil,
                fn _redis_key, _compound_key -> failure end
              )
+  end
+
+  test "batch string reads disambiguate external-term prefixes from compound values" do
+    encoded_value = <<131, 1, 2, 3>>
+
+    assert {:error, "WRONGTYPE" <> _rest} =
+             StringRead.result_with_lookup("key", encoded_value, fn _key, _compound_key ->
+               "hash"
+             end)
+
+    assert {:ok, ^encoded_value} =
+             StringRead.result_with_lookup("key", encoded_value, fn _key, _compound_key -> nil end)
   end
 
   test "flow history hot reads fail as a whole when a batch member is unavailable" do

@@ -1320,9 +1320,6 @@ defmodule Ferricstore.Flow.Hibernation do
 
       {:error, _reason} = error ->
         error
-
-      _invalid ->
-        {:error, :invalid_cold_row}
     end
   rescue
     _error -> {:error, :invalid_cold_row}

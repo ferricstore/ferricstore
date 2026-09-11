@@ -469,8 +469,6 @@ defmodule Ferricstore.Flow.Query.StatisticsWorker do
       valid_range_order?(after_key, before_key)
   end
 
-  defp valid_probe_range?(_range), do: false
-
   defp valid_range_bound?("", _prefix), do: true
 
   defp valid_range_bound?(bound, prefix),

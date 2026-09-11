@@ -54,6 +54,8 @@ defmodule Ferricstore.Commands.KeyDiscovery do
     FLOW.APPROVAL.GET FLOW.APPROVAL.LIST FLOW.CIRCUIT.GET FLOW.BUDGET.GET FLOW.BUDGET.LIST
     FLOW.LIMIT.GET FLOW.LIMIT.LIST FLOW.HISTORY
     FLOW.SCHEDULE.GET FLOW.SCHEDULE.LIST FLOW.VALUE.MGET
+    INVOCATION.DEFINITION.GET INVOCATION.DEFINITION.LIST INVOCATION.GET
+    INVOCATION.PARTITION.LIST
   ))
 
   @write_key_commands MapSet.new(~w(
@@ -82,6 +84,7 @@ defmodule Ferricstore.Commands.KeyDiscovery do
     FLOW.BUDGET.COMMIT FLOW.BUDGET.RELEASE FLOW.LIMIT.LEASE FLOW.LIMIT.SPEND FLOW.LIMIT.RELEASE
     FLOW.SCHEDULE.CREATE FLOW.SCHEDULE.DELETE FLOW.SCHEDULE.FIRE FLOW.SCHEDULE.PAUSE
     FLOW.SCHEDULE.RESUME FLOW.SCHEDULE.FIRE_DUE
+    INVOCATION.DEFINITION.PUT INVOCATION.CREATE
   ))
 
   @read_write_key_commands MapSet.new(~w(
@@ -110,7 +113,7 @@ defmodule Ferricstore.Commands.KeyDiscovery do
   @channel_acl_commands ~w(PUBLISH PUBSUB SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE)
 
   @structured_native_commands MapSet.new(~w(
-    FLOW.STEP_CONTINUE FLOW.START_AND_CLAIM FLOW.RUN_STEPS_MANY
+    FLOW.QUERY FLOW.VALUE.MGET FLOW.STEP_CONTINUE FLOW.START_AND_CLAIM FLOW.RUN_STEPS_MANY
     FLOW.SCHEDULE.CREATE FLOW.SCHEDULE.GET FLOW.SCHEDULE.DELETE FLOW.SCHEDULE.FIRE_DUE
     FLOW.SCHEDULE.LIST FLOW.SCHEDULE.FIRE FLOW.SCHEDULE.PAUSE FLOW.SCHEDULE.RESUME
     FLOW.EFFECT.RESERVE FLOW.EFFECT.CONFIRM FLOW.EFFECT.FAIL FLOW.EFFECT.COMPENSATE
@@ -121,6 +124,14 @@ defmodule Ferricstore.Commands.KeyDiscovery do
     FLOW.BUDGET.LIST FLOW.LIMIT.LEASE FLOW.LIMIT.SPEND FLOW.LIMIT.RELEASE
     FLOW.LIMIT.GET FLOW.LIMIT.LIST
   ))
+
+  @doc false
+  @spec structured_native_command?(binary()) :: boolean()
+  def structured_native_command?(command) when is_binary(command) do
+    MapSet.member?(@structured_native_commands, String.upcase(command))
+  end
+
+  def structured_native_command?(_command), do: false
 
   # These commands can mutate data or control-plane state outside one data
   # shard. Treat read-only subcommands conservatively because routing metadata

@@ -26,8 +26,8 @@ jobs:
       - name: Set up Elixir
         uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
           hexpm-mirrors: |
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
@@ -39,8 +39,8 @@ jobs:
         uses: actions/cache@v5
         with:
           path: deps
-          key: mix-bench-deps-${{ runner.os }}-1.19-28-${{ hashFiles('mix.lock') }}
-          restore-keys: mix-bench-deps-${{ runner.os }}-1.19-28-
+          key: mix-bench-deps-${{ runner.os }}-1.20.4-29.0.5-${{ hashFiles('mix.lock') }}
+          restore-keys: mix-bench-deps-${{ runner.os }}-1.20.4-29.0.5-
 
       - name: Install dependencies
         run: mix deps.get

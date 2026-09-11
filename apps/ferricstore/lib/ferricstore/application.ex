@@ -852,14 +852,8 @@ defmodule Ferricstore.Application do
   @spec schedule_large_value_check(non_neg_integer(), (non_neg_integer() -> term())) :: :ok
   def schedule_large_value_check(shard_count, check_fun \\ &check_large_values/1)
       when is_integer(shard_count) and shard_count >= 0 and is_function(check_fun, 1) do
-    case Task.start(fn -> check_fun.(shard_count) end) do
-      {:ok, _pid} ->
-        :ok
-
-      {:error, reason} ->
-        Logger.warning("Could not start embedded large-value diagnostic: #{inspect(reason)}")
-        :ok
-    end
+    {:ok, _pid} = Task.start(fn -> check_fun.(shard_count) end)
+    :ok
   end
 
   # Runs the large value check and emits a warning + telemetry if any are found.

@@ -52,6 +52,9 @@ pub struct WalHandle {
     read_file: Mutex<File>,
 }
 
+#[rustler::resource_impl]
+impl rustler::Resource for WalHandle {}
+
 impl WalHandle {
     /// Open a WAL file, spawn the background I/O thread.
     pub fn open(

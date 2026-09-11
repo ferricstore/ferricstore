@@ -486,7 +486,6 @@ defmodule Ferricstore.Flow.Governance.LimitStorageCleaner do
   end
 
   defp schedule(%{timer: nil} = state), do: schedule(state, cleanup_interval_ms())
-  defp schedule(state), do: state
 
   defp schedule(%{timer: nil} = state, delay_ms)
        when is_integer(delay_ms) and delay_ms >= 0 do

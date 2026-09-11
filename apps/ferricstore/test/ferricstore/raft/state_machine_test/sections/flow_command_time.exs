@@ -1975,13 +1975,36 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
           Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
           Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
           Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 10_000)
-          state = %{state | flow_lmdb_mirror?: true}
+
+          instance_name =
+            :"#{state.ets}_lmdb_#{System.unique_integer([:positive])}"
+
+          keydir_refs =
+            :erlang.make_tuple(shard_index + 1, nil)
+            |> put_elem(shard_index, state.ets)
+
+          instance_ctx = %{
+            name: instance_name,
+            data_dir: state.data_dir,
+            data_dir_expanded: state.data_dir_expanded,
+            keydir_refs: keydir_refs,
+            checkpoint_flags: :atomics.new(shard_index + 1, signed: false),
+            disk_pressure: :atomics.new(shard_index + 1, signed: false)
+          }
+
+          state = %{
+            state
+            | flow_lmdb_mirror?: true,
+              instance_ctx: instance_ctx,
+              instance_name: instance_name
+          }
 
           setup_flow_indexes(state)
 
           {:ok, writer_pid} =
             Ferricstore.Flow.LMDBWriter.start_link(
               instance_name: state.instance_name,
+              instance_ctx: state.instance_ctx,
               shard_index: shard_index,
               data_dir: state.data_dir
             )

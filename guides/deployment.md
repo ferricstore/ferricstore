@@ -32,6 +32,12 @@ Environment variables:
 | `FERRICSTORE_NATIVE_PORT` | `6388` | Ferric native protocol TCP listen port |
 | `FERRICSTORE_HEALTH_PORT` | `6380` | Legacy dashboard, metrics, and health port |
 | `FERRICSTORE_HEALTH_PROBE_PORT` | `6381` | Isolated liveness/readiness port |
+| `FERRICSTORE_HTTP_ENABLED` | `false` | Start the bundled HTTP/HTTPS command API |
+| `FERRICSTORE_HTTP_BIND` | `127.0.0.1` | Numeric HTTP listener bind address |
+| `FERRICSTORE_HTTP_PORT` | `8080` | HTTP/HTTPS API listener port |
+| `FERRICSTORE_HTTP_TLS_ENABLED` | `false` | Require a configured certificate and key for the API listener |
+| `FERRICSTORE_HTTP_TLS_CERT_FILE` | none | PEM certificate-chain path |
+| `FERRICSTORE_HTTP_TLS_KEY_FILE` | none | Matching PEM private-key path |
 | `FERRICSTORE_DATA_DIR` | `/data` | Bitcask + WAL data directory |
 | `FERRICSTORE_SHARD_COUNT` | `0` (auto) | Number of shards (0 = CPU count) |
 | `FERRICSTORE_PROTECTED_MODE` | `true` | Reject non-localhost without auth |
@@ -78,17 +84,38 @@ The TCP acceptor uses the following socket options (hardcoded in `ferricstore_se
 docker run -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
-  quay.io/ferricstore/ferricstore:0.11.6
+  quay.io/ferricstore/ferricstore:0.11.14
 ```
 
 The official image is published publicly to Quay.io:
 
 ```bash
-docker pull quay.io/ferricstore/ferricstore:0.11.6
+docker pull quay.io/ferricstore/ferricstore:0.11.14
 ```
 
 Current release images are published as multi-arch images for `linux/amd64`
 and `linux/arm64`.
+
+### HTTPS API
+
+The image includes the HTTP application and exposes port `8080`, but does not
+start that listener by default. Mount a certificate and key read-only, then set
+the HTTP TLS variables:
+
+```bash
+docker run --rm -p 6388:6388 -p 8080:8080 \
+  -e FERRICSTORE_HTTP_ENABLED=true \
+  -e FERRICSTORE_HTTP_TLS_ENABLED=true \
+  -e FERRICSTORE_HTTP_TLS_CERT_FILE=/run/secrets/ferricstore/http-cert.pem \
+  -e FERRICSTORE_HTTP_TLS_KEY_FILE=/run/secrets/ferricstore/http-key.pem \
+  -v "$PWD/certs:/run/secrets/ferricstore:ro" \
+  -v ferricstore_data:/data \
+  quay.io/ferricstore/ferricstore:0.11.14
+```
+
+Create a least-privilege ACL identity before sending requests. Certificate
+generation, client verification, command examples, and the complete listener
+configuration are in [HTTP and HTTPS API](http-api.md).
 
 ### Docker Production Notes
 
@@ -100,7 +127,7 @@ docker run -p 6388:6388 \
   --security-opt seccomp=unconfined \
   -e FERRICSTORE_PROTECTED_MODE=true \
   -v /mnt/nvme/ferricstore:/data \
-  quay.io/ferricstore/ferricstore:0.11.6
+  quay.io/ferricstore/ferricstore:0.11.14
 ```
 
 #### Why io_uring Matters
@@ -168,6 +195,14 @@ terraform plan
 terraform apply
 ```
 
+FerricStore `0.11.11+` can expose the authenticated HTTP command API from the
+same task. Set `http_enabled = true` to add a private HTTP listener and
+`http_endpoint` output. For production client encryption, also set a matching
+`http_hostname`, an ACM/IAM `http_tls_certificate_arn`, and normally
+`http_listener_port = 443`; the existing NLB terminates TLS and forwards to the
+task over the private VPC. See the stack README for ACL bootstrap, unauthenticated
+health/metrics routes, and the exact TLS boundary.
+
 All data is lost when the task stops or is replaced, so this layout is for
 disposable development, demos, SDK integration, CI, caches, and similar OSS
 workloads. EFS is not used because FerricStore's LMDB projection cannot safely
@@ -197,6 +232,13 @@ terraform plan
 terraform apply
 ```
 
+The cluster profile has the same opt-in HTTP/HTTPS endpoint. One HTTP target
+group follows each stable node slot, so the NLB endpoint stays fixed when Cloud
+Map and ECS move a replacement task to a new IP. On a running cluster, adding
+or removing those target groups must use the documented staged apply plus
+`scripts/deploy-sequential.sh`; an unrestricted target-group change can deploy
+all three stateful services concurrently.
+
 Image changes are registered by Terraform but deployed only through
 `scripts/deploy-sequential.sh`. It replaces one node and verifies full local
 catch-up before touching the next. The cluster has no S3, DynamoDB, EFS, or EBS
@@ -220,7 +262,7 @@ spec:
     spec:
       containers:
         - name: ferricstore
-          image: quay.io/ferricstore/ferricstore:0.11.6
+          image: quay.io/ferricstore/ferricstore:0.11.14
           ports:
             - name: native
               containerPort: 6388

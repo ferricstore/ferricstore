@@ -336,7 +336,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
         score = Map.fetch!(record, :next_run_at_ms)
 
         with :ok <- flow_index_put_new_lifecycle_members(state, due_key, [{id, score}]) do
-          if flow_due_any_index_enabled?() do
+          with_flow_due_any do
             due_any_key = FlowKeys.due_any_key(type, priority, partition_key)
             flow_index_put_new_lifecycle_members(state, due_any_key, [{id, score}])
           else
@@ -584,7 +584,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
             {FlowKeys.due_key(record.type, record.state, record.priority, partition_key), record}
           ]
 
-          if flow_due_any_index_enabled?() do
+          with_flow_due_any do
             [
               {FlowKeys.due_any_key(record.type, record.priority, partition_key), record}
               | entries
@@ -1133,8 +1133,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
             flow_history_hot_evict_event_ids(record, event_id, version, previous_history_ms)
           )
 
-        with :ok <-
-               flow_history_put_or_queue_entry(state, entry) do
+        with :ok <- flow_history_put_or_queue_entry(state, entry) do
           if flow_async_history_enabled?(state) do
             :ok
           else
@@ -1199,6 +1198,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
       end
 
       defp flow_async_history?(_state), do: true
+
+      defp flow_async_history_enabled?(%{flow_async_history: enabled}) when is_boolean(enabled),
+        do: enabled
 
       defp flow_async_history_enabled?(_state), do: true
 

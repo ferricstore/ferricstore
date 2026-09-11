@@ -445,7 +445,6 @@ defmodule Ferricstore.Flow.Governance.Effect do
       end
     else
       :skip -> :ok
-      {:error, _reason} = error -> error
     end
   end
 

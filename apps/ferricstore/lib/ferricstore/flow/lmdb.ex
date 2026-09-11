@@ -334,6 +334,12 @@ defmodule Ferricstore.Flow.LMDB do
       else: {:ok, []}
   end
 
+  @doc false
+  def prefix_entries_initialized(path, prefix, limit)
+      when is_binary(path) and is_binary(prefix) and is_integer(limit) and limit >= 0 do
+    prefix_entries(path, prefix, limit)
+  end
+
   def prefix_entries_after(path, prefix, after_key, limit)
       when is_binary(path) and is_binary(prefix) and is_binary(after_key) and
              is_integer(limit) and limit >= 0 do
@@ -1324,7 +1330,6 @@ defmodule Ferricstore.Flow.LMDB do
       {:ok, [{:compare, terminal_key, terminal_value} | ops]}
     else
       false -> {:error, :invalid_terminal_index_value}
-      :missing -> {:error, :invalid_terminal_index_value}
       :error -> {:error, :invalid_terminal_index_value}
       {:error, _reason} = error -> error
     end
@@ -1385,7 +1390,6 @@ defmodule Ferricstore.Flow.LMDB do
        ]}
     else
       false -> {:error, :invalid_terminal_index_value}
-      :missing -> {:error, :invalid_terminal_index_value}
       :error -> {:error, :invalid_terminal_index_value}
       {:error, _reason} = error -> error
     end

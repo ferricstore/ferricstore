@@ -20,4 +20,25 @@ defmodule Ferricstore.DependencySecurityGuardTest do
     assert schedule =~ "Cron.next_run_at_ms"
     assert cron =~ "Tz.TimeZoneDatabase"
   end
+
+  test "Elixir and native Rustler dependencies stay aligned" do
+    core_mix = File.read!(Path.join(@repo_root, "apps/ferricstore/mix.exs"))
+    server_mix = File.read!(Path.join(@repo_root, "apps/ferricstore_server/mix.exs"))
+
+    for mix_source <- [core_mix, server_mix] do
+      assert mix_source =~ ~s({:rustler_precompiled, "~> 0.9"})
+      assert mix_source =~ ~s({:rustler, "~> 0.38", optional: true})
+    end
+
+    cargo_manifests = [
+      "apps/ferricstore/native/ferricstore_bitcask/Cargo.toml",
+      "apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml",
+      "apps/ferricstore_server/native/native_protocol_nif/Cargo.toml"
+    ]
+
+    for relative_path <- cargo_manifests do
+      manifest = File.read!(Path.join(@repo_root, relative_path))
+      assert manifest =~ ~s(rustler = { version = "0.38")
+    end
+  end
 end

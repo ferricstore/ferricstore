@@ -50,7 +50,7 @@ defmodule Ferricstore.Flow.Query.CoveringCodec do
                   |> MapSet.new()
 
   @type value :: nil | boolean() | integer() | float() | binary() | [value()]
-  @type record :: %{required(:id) => binary(), required(:version) => non_neg_integer()}
+  @type decoded_record :: %{required(:id) => binary(), required(:version) => non_neg_integer()}
 
   @doc false
   @spec max_encoded_bytes() :: pos_integer()
@@ -113,7 +113,7 @@ defmodule Ferricstore.Flow.Query.CoveringCodec do
 
   def encode(_record), do: :error
 
-  @spec decode(binary(), binary(), non_neg_integer()) :: {:ok, record()} | :error
+  @spec decode(binary(), binary(), non_neg_integer()) :: {:ok, decoded_record()} | :error
   def decode(encoded, id, version)
       when is_binary(encoded) and byte_size(encoded) >= 4 and
              byte_size(encoded) <= @maximum_bytes and is_binary(id) and id != "" and
@@ -231,9 +231,9 @@ defmodule Ferricstore.Flow.Query.CoveringCodec do
   defp decode_dynamic_fields(count, encoded, previous_name, record) when count > 0 do
     with <<name_bytes::unsigned-big-16, rest::binary>> <- encoded,
          true <- name_bytes > 0 and name_bytes <= @maximum_dynamic_name_bytes,
-         <<name::binary-size(name_bytes), value_bytes::unsigned-big-32, rest::binary>> <- rest,
+         <<name::binary-size(^name_bytes), value_bytes::unsigned-big-32, rest::binary>> <- rest,
          true <- value_bytes > 0 and value_bytes <= @maximum_bytes,
-         <<encoded_value::binary-size(value_bytes), rest::binary>> <- rest,
+         <<encoded_value::binary-size(^value_bytes), rest::binary>> <- rest,
          true <- is_nil(previous_name) or name > previous_name,
          {:ok, field} <- Field.parse(name),
          true <- supported_dynamic_field?(field),

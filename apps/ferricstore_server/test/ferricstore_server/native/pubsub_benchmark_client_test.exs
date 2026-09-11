@@ -114,7 +114,7 @@ defmodule FerricstoreServer.Native.PubSubBenchmarkClientTest do
   test "retains an incomplete pushed frame for the next socket read" do
     frame = Codec.encode_event(0x0010, %{"event" => "PUBSUB_MESSAGE"})
     split_at = byte_size(frame) - 3
-    <<partial::binary-size(split_at), final::binary>> = frame
+    <<partial::binary-size(^split_at), final::binary>> = frame
 
     assert {[], ^partial} = NativePubSubClient.decode_server_frames(partial)
 

@@ -215,13 +215,27 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     assert workflow =~ "context: ."
     assert workflow =~ "outputs: type=docker,dest=/tmp/ferricstore-sdk-image.tar"
     assert workflow =~ "docker load --input"
-    assert count_occurrences(workflow, "ref: v0.11.5") == 4
+    assert workflow =~ "repository: ferricstore/ferricstore-go\n            ref: v0.11.10"
+
+    assert workflow =~
+             "repository: ferricstore/ferricstore-python\n            ref: d4012267b18049ef8581cdaab79a7b50b9c8f5cd"
+
+    assert workflow =~
+             "repository: ferricstore/ferricstore-typescript\n            ref: e016d2440145dbb265fddb384fdbcf7b479e66a5"
+
+    assert workflow =~ "repository: ferricstore/ferricstore-elixir\n            ref: v0.11.13"
+
+    assert workflow =~
+             "repository: ferricstore/ferricstore-java\n            ref: 75b20cdd3fb0dffdddf372bd659f71e40f8e2f3f"
+
+    refute workflow =~ "ref: v0.11.6"
 
     for repository <- [
           "ferricstore/ferricstore-go",
           "ferricstore/ferricstore-python",
           "ferricstore/ferricstore-typescript",
-          "ferricstore/ferricstore-elixir"
+          "ferricstore/ferricstore-elixir",
+          "ferricstore/ferricstore-java"
         ] do
       assert workflow =~ "repository: #{repository}"
     end
@@ -236,7 +250,14 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     assert workflow =~ ~s|--url "$FERRICSTORE_AUTH_URL"|
     assert workflow =~ "mix test --only integration"
     assert workflow =~ "mix run bench/kv_benchmark.exs"
+    assert workflow =~ "jdx/mise-action@v4"
+    assert workflow =~ "mise run integration:candidate"
     refute workflow =~ "continue-on-error: true"
+
+    test_workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
+
+    assert test_workflow =~
+             "repository: ferricstore/ferricstore-java\n          ref: 75b20cdd3fb0dffdddf372bd659f71e40f8e2f3f"
   end
 
   test "container workflows publish only to the official Quay.io repository" do

@@ -308,11 +308,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
       defp flow_claim_priorities(nil), do: [2, 1, 0]
       defp flow_claim_priorities(priority), do: [priority]
 
-      @flow_due_any_index_enabled Application.compile_env(
-                                    :ferricstore,
-                                    :flow_due_any_index,
-                                    false
-                                  )
       @flow_due_catalog_page_size 256
       @flow_due_catalog_min_key_budget 512
       @flow_due_catalog_max_key_budget 4_096
@@ -323,8 +318,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
       @flow_hibernation_backfill_scan_entries 1_000
       @flow_hibernation_max_promotions 1_000
       @flow_hibernation_bucket_ms 60_000
-
-      defp flow_due_any_index_enabled?, do: @flow_due_any_index_enabled
 
       if @flow_claim_due_phase_telemetry do
         defp flow_claim_due_phase_emit(phase, metadata, fun) when is_function(fun, 0) do
@@ -1072,7 +1065,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
             ]
 
             due_entries =
-              if flow_due_any_index_enabled?() do
+              with_flow_due_any do
                 [
                   {FlowKeys.due_any_key(type, priority, partition_key), id, due_at_ms}
                   | due_entries

@@ -525,8 +525,18 @@ defmodule Ferricstore.FlowTest do
     :persistent_term.put(backend_key, updated_backend)
 
     on_exit(fn ->
-      :persistent_term.put(instance_key, original_instance)
-      :persistent_term.put(backend_key, original_backend)
+      current_instance = FerricStore.Instance.get(:default)
+      current_backend = :persistent_term.get(backend_key)
+
+      :persistent_term.put(
+        instance_key,
+        %{current_instance | apply_context: original_instance.apply_context}
+      )
+
+      :persistent_term.put(
+        backend_key,
+        %{current_backend | apply_context: original_backend.apply_context}
+      )
 
       restore_type = "apply-context-restore:#{System.unique_integer([:positive])}"
 

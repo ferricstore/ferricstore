@@ -298,9 +298,6 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
 
       :error ->
         {:error, :invalid_query_row}
-
-      {:error, _reason} ->
-        {:error, :invalid_query_row}
     end
   rescue
     _error -> {:error, :invalid_query_row}
@@ -328,8 +325,8 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
          true <- metadata_bytes <= @maximum_metadata_bytes,
          true <- scope_bytes + metadata_bytes <= @maximum_metadata_bytes,
          true <- byte_size(payload) == scope_bytes + locator_bytes + metadata_bytes,
-         <<encoded_scope::binary-size(scope_bytes), encoded_locator::binary-size(locator_bytes),
-           encoded_metadata::binary-size(metadata_bytes)>> <- payload,
+         <<encoded_scope::binary-size(^scope_bytes), encoded_locator::binary-size(^locator_bytes),
+           encoded_metadata::binary-size(^metadata_bytes)>> <- payload,
          {:ok, scope_prefix} <- decode_scope_prefix(encoded_scope),
          {:ok, locator} <- decode_locator(encoded_locator, id, version, expire_at_ms),
          {:ok, record} <- decode_metadata(encoded_metadata, id, version, decode_plan),
@@ -369,8 +366,9 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
          true <- metadata_bytes <= @maximum_metadata_bytes,
          true <- scope_bytes + metadata_bytes <= @maximum_metadata_bytes,
          true <- byte_size(payload) == scope_bytes + locator_bytes + metadata_bytes,
-         <<_encoded_scope::binary-size(scope_bytes), encoded_locator::binary-size(locator_bytes),
-           _encoded_metadata::binary-size(metadata_bytes)>> <- payload,
+         <<_encoded_scope::binary-size(^scope_bytes),
+           encoded_locator::binary-size(^locator_bytes),
+           _encoded_metadata::binary-size(^metadata_bytes)>> <- payload,
          {:ok, locator} <- decode_locator(encoded_locator, id, version, expire_at_ms) do
       {:ok,
        %QueryRowReference{
@@ -546,11 +544,11 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
            byte_size(payload) ==
              builtin_bytes + internal_bytes + projection_config_bytes + attribute_bytes +
                state_meta_bytes,
-         <<encoded_builtin::binary-size(builtin_bytes),
-           encoded_internal::binary-size(internal_bytes),
-           encoded_projection_config::binary-size(projection_config_bytes),
-           encoded_attributes::binary-size(attribute_bytes),
-           encoded_state_meta::binary-size(state_meta_bytes)>> <- payload,
+         <<encoded_builtin::binary-size(^builtin_bytes),
+           encoded_internal::binary-size(^internal_bytes),
+           encoded_projection_config::binary-size(^projection_config_bytes),
+           encoded_attributes::binary-size(^attribute_bytes),
+           encoded_state_meta::binary-size(^state_meta_bytes)>> <- payload,
          {:ok, builtin_record} <- decode_builtin_record(encoded_builtin, id, version),
          {:ok, _internal_fields} <- decode_internal_fields(encoded_internal),
          {:ok, _projection_config} <- decode_projection_config(encoded_projection_config),
@@ -585,11 +583,11 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
            byte_size(payload) ==
              builtin_bytes + internal_bytes + projection_config_bytes + attribute_bytes +
                state_meta_bytes,
-         <<encoded_builtin::binary-size(builtin_bytes),
-           encoded_internal::binary-size(internal_bytes),
-           encoded_projection_config::binary-size(projection_config_bytes),
-           encoded_attributes::binary-size(attribute_bytes),
-           encoded_state_meta::binary-size(state_meta_bytes)>> <- payload,
+         <<encoded_builtin::binary-size(^builtin_bytes),
+           encoded_internal::binary-size(^internal_bytes),
+           encoded_projection_config::binary-size(^projection_config_bytes),
+           encoded_attributes::binary-size(^attribute_bytes),
+           encoded_state_meta::binary-size(^state_meta_bytes)>> <- payload,
          {:ok, builtin_record} <- decode_builtin_record(encoded_builtin, id, version),
          {:ok, internal_fields} <- decode_internal_fields(encoded_internal),
          {:ok, projection_config} <- decode_projection_config(encoded_projection_config),
@@ -817,7 +815,7 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
   defp decode_indexed_attribute_names(count, encoded, previous, names) when count > 0 do
     with <<name_bytes::unsigned-big-8, rest::binary>> <- encoded,
          true <- name_bytes > 0 and name_bytes <= @maximum_dynamic_name_bytes,
-         <<name::binary-size(name_bytes), rest::binary>> <- rest,
+         <<name::binary-size(^name_bytes), rest::binary>> <- rest,
          true <- is_nil(previous) or name > previous,
          {:ok, ^name} <- Attributes.normalize_name(name) do
       decode_indexed_attribute_names(count - 1, rest, name, [:binary.copy(name) | names])
@@ -1025,7 +1023,7 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
        when count > 0 do
     with <<state_bytes::unsigned-big-8, rest::binary>> <- encoded,
          true <- state_bytes > 0 and state_bytes <= @maximum_dynamic_name_bytes,
-         <<state::binary-size(state_bytes), entry_count::unsigned-big-8, rest::binary>> <- rest,
+         <<state::binary-size(^state_bytes), entry_count::unsigned-big-8, rest::binary>> <- rest,
          true <- entry_count <= @maximum_state_meta_entries,
          true <- is_nil(previous_state) or state > previous_state,
          true <- valid_dynamic_name?(state, true),
@@ -1075,7 +1073,7 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
   defp validate_state_meta_states(count, encoded, previous_state, bytes) when count > 0 do
     with <<state_bytes::unsigned-big-8, rest::binary>> <- encoded,
          true <- state_bytes > 0 and state_bytes <= @maximum_dynamic_name_bytes,
-         <<state::binary-size(state_bytes), entry_count::unsigned-big-8, rest::binary>> <- rest,
+         <<state::binary-size(^state_bytes), entry_count::unsigned-big-8, rest::binary>> <- rest,
          true <- entry_count <= @maximum_state_meta_entries,
          true <- is_nil(previous_state) or state > previous_state,
          true <- valid_dynamic_name?(state, true),
@@ -1103,7 +1101,7 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
        when count > 0 do
     with <<state_bytes::unsigned-big-8, rest::binary>> <- encoded,
          true <- state_bytes > 0 and state_bytes <= @maximum_dynamic_name_bytes,
-         <<state::binary-size(state_bytes), entry_count::unsigned-big-8, rest::binary>> <- rest,
+         <<state::binary-size(^state_bytes), entry_count::unsigned-big-8, rest::binary>> <- rest,
          true <- entry_count <= @maximum_state_meta_entries,
          true <- is_nil(previous_state) or state > previous_state,
          true <- valid_dynamic_name?(state, true),
@@ -1178,7 +1176,7 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
        when count > 0 do
     with <<name_bytes::unsigned-big-8, rest::binary>> <- encoded,
          true <- name_bytes > 0 and name_bytes <= @maximum_dynamic_name_bytes,
-         <<name::binary-size(name_bytes), rest::binary>> <- rest,
+         <<name::binary-size(^name_bytes), rest::binary>> <- rest,
          true <- is_nil(previous_name) or name > previous_name,
          true <- valid_field?(namespace, name),
          {:ok, value, rest, semantic_value_bytes} <-
@@ -1226,7 +1224,7 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
        when count > 0 do
     with <<name_bytes::unsigned-big-8, rest::binary>> <- encoded,
          true <- name_bytes > 0 and name_bytes <= @maximum_dynamic_name_bytes,
-         <<name::binary-size(name_bytes), rest::binary>> <- rest,
+         <<name::binary-size(^name_bytes), rest::binary>> <- rest,
          true <- is_nil(previous_name) or name > previous_name,
          true <- valid_field?(namespace, name),
          {:ok, fields, rest, semantic_value_bytes} <-
@@ -1306,7 +1304,7 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
        when count > 0 do
     with <<name_bytes::unsigned-big-8, rest::binary>> <- encoded,
          true <- name_bytes > 0 and name_bytes <= @maximum_dynamic_name_bytes,
-         <<name::binary-size(name_bytes), rest::binary>> <- rest,
+         <<name::binary-size(^name_bytes), rest::binary>> <- rest,
          true <- is_nil(previous_name) or name > previous_name,
          true <- valid_field?(namespace, name),
          {:ok, rest, semantic_value_bytes} <-

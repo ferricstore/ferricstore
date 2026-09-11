@@ -124,6 +124,147 @@ defmodule FerricstoreServer.Native.ResourceBudgetTest do
     assert %{chunk_bytes: 0} = ResourceBudget.usage(name)
   end
 
+  test "scoped leases enforce limits and release exactly once" do
+    name = :"native_resource_scoped_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {ResourceBudget,
+       name: name,
+       limits: %{executions: 1, lanes: 1, blocking_requests: 1, chunk_streams: 1, chunk_bytes: 1}}
+    )
+
+    assert {:ok, token} = ResourceBudget.acquire_scoped(name, :executions, 1)
+
+    assert {:error, {:limit, :executions}} =
+             ResourceBudget.acquire_scoped(name, :executions, 1)
+
+    assert ResourceBudget.usage(name).executions == 1
+    parent = self()
+
+    waiter =
+      spawn(fn ->
+        result = ResourceBudget.acquire_wait(name, :executions, self(), 1)
+        send(parent, {:scoped_waiter_admitted, self(), result})
+
+        receive do
+          :release ->
+            with {:ok, waiter_token} <- result,
+                 do: ResourceBudget.release(name, waiter_token)
+        end
+      end)
+
+    assert eventually(fn -> ResourceBudget.waiting(name).executions == 1 end)
+    assert :ok = ResourceBudget.release_scoped(token)
+    assert_receive {:scoped_waiter_admitted, ^waiter, {:ok, _waiter_token}}
+    send(waiter, :release)
+    assert eventually(fn -> ResourceBudget.usage(name).executions == 0 end)
+    assert :ok = ResourceBudget.release_scoped(token)
+  end
+
+  test "scoped leases cannot be released by another process" do
+    name = :"native_resource_scoped_owner_check_#{System.unique_integer([:positive])}"
+    start_supervised!({ResourceBudget, name: name})
+    assert {:ok, token} = ResourceBudget.acquire_scoped(name, :executions, 1)
+
+    assert {:error, :lease_owner_mismatch} =
+             Task.async(fn -> ResourceBudget.release_scoped(token) end) |> Task.await()
+
+    assert ResourceBudget.usage(name).executions == 1
+    assert :ok = ResourceBudget.release_scoped(token)
+  end
+
+  test "scoped leases are reclaimed when their owner exits" do
+    name = :"native_resource_scoped_owner_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {ResourceBudget,
+       name: name,
+       scoped_sweep_interval_ms: 10,
+       limits: %{executions: 2, lanes: 1, blocking_requests: 1, chunk_streams: 1, chunk_bytes: 1}}
+    )
+
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        assert {:ok, _first} = ResourceBudget.acquire_scoped(name, :executions, 1)
+        assert {:ok, _second} = ResourceBudget.acquire_scoped(name, :executions, 1)
+        send(parent, {:scoped_leases_acquired, self()})
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive {:scoped_leases_acquired, ^owner}
+    assert ResourceBudget.usage(name).executions == 2
+    Process.exit(owner, :kill)
+    assert eventually(fn -> ResourceBudget.usage(name).executions == 0 end)
+  end
+
+  test "a saturated scoped acquire reclaims a dead owner before returning busy" do
+    name = :"native_resource_scoped_saturated_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {ResourceBudget, name: name, scoped_sweep_interval_ms: 60_000, limits: %{executions: 1}}
+    )
+
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        assert {:ok, _token} = ResourceBudget.acquire_scoped(name, :executions, 1)
+        send(parent, {:saturated_scoped_lease_acquired, self()})
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive {:saturated_scoped_lease_acquired, ^owner}
+    monitor_ref = Process.monitor(owner)
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^monitor_ref, :process, ^owner, :killed}
+
+    assert {:ok, replacement} = ResourceBudget.acquire_scoped(name, :executions, 1)
+    assert :ok = ResourceBudget.release_scoped(replacement)
+    assert ResourceBudget.usage(name).executions == 0
+  end
+
+  @tag :lock_free_resource_budget
+  test "normal scoped lease accounting does not use the coordinator mailbox" do
+    name = :"native_resource_scoped_fast_path_#{System.unique_integer([:positive])}"
+
+    pid =
+      start_supervised!({ResourceBudget, name: name, scoped_sweep_interval_ms: 60_000})
+
+    on_exit(fn ->
+      try do
+        if Process.alive?(pid), do: :sys.resume(pid)
+      catch
+        :exit, _reason -> :ok
+      end
+    end)
+
+    :ok = :sys.suspend(pid)
+    assert {:ok, token} = ResourceBudget.acquire_scoped(name, :executions, 1)
+    assert :ok = ResourceBudget.release_scoped(token)
+    assert {:message_queue_len, 0} = Process.info(pid, :message_queue_len)
+    :ok = :sys.resume(pid)
+  end
+
+  test "stale registry handles are rejected after the coordinator is killed" do
+    name = :"native_resource_stale_registry_#{System.unique_integer([:positive])}"
+    {:ok, pid} = ResourceBudget.start_link(name: name)
+    Process.unlink(pid)
+    monitor_ref = Process.monitor(pid)
+
+    on_exit(fn ->
+      :persistent_term.erase({ResourceBudget, :budget, name})
+      :persistent_term.erase({ResourceBudget, :budget, pid})
+    end)
+
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^monitor_ref, :process, ^pid, :killed}
+
+    assert {:error, :resource_budget_unavailable} =
+             ResourceBudget.acquire_scoped(name, :executions, 1)
+  end
+
   @tag :lock_free_resource_budget
   test "non-waiting accounting does not block on the coordinator mailbox" do
     name = :"native_resource_fast_path_#{System.unique_integer([:positive])}"

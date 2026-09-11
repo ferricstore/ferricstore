@@ -984,7 +984,7 @@ defmodule Ferricstore.Flow.Query.ReferenceParser do
        do: take_number(original, rest, size + 1)
 
   defp take_number(original, rest, size) do
-    <<number::binary-size(size), _suffix::binary>> = original
+    <<number::binary-size(^size), _suffix::binary>> = original
     {number, rest}
   end
 
@@ -996,7 +996,7 @@ defmodule Ferricstore.Flow.Query.ReferenceParser do
   end
 
   defp take_identifier(original, rest, size) do
-    <<identifier::binary-size(size), _suffix::binary>> = original
+    <<identifier::binary-size(^size), _suffix::binary>> = original
     {identifier, rest}
   end
 

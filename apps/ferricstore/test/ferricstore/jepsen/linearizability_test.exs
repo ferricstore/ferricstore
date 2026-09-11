@@ -244,8 +244,9 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
               end)
 
             assert read_version >= acc,
-                   "Monotonicity violated on #{node.name}: " <>
-                     "previously saw v#{acc} but now reading v#{read_version}"
+                   "Monotonicity violated on #{node.name}: previously saw v" <>
+                     Integer.to_string(acc) <>
+                     " but now reading v" <> Integer.to_string(read_version)
 
             max(acc, read_version)
           end)

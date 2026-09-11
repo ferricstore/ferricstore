@@ -13,6 +13,7 @@ locals {
   native_port        = 6388
   dashboard_port     = 6380
   health_probe_port  = 6381
+  http_target_port   = 8080
 }
 
 check "valid_fargate_task_size" {
@@ -29,6 +30,16 @@ check "valid_fargate_task_size" {
       false
     )
     error_message = "memory must be a Fargate-supported size for the selected cpu value."
+  }
+}
+
+check "valid_http_tls_configuration" {
+  assert {
+    condition = (
+      var.http_tls_certificate_arn == null ||
+      (var.http_enabled && var.http_hostname != null)
+    )
+    error_message = "http_tls_certificate_arn requires http_enabled=true and an http_hostname covered by the certificate."
   }
 }
 
@@ -102,7 +113,7 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-# The default GHCR image requires internet egress. A single NAT gateway keeps
+# The default Quay.io image requires internet egress. A single NAT gateway keeps
 # this reference deployment compact; use an ECR image plus VPC endpoints or a
 # NAT gateway per AZ when your availability/cost requirements differ.
 resource "aws_eip" "nat" {
@@ -177,6 +188,17 @@ resource "aws_vpc_security_group_ingress_rule" "native" {
   description       = "Ferric native protocol from approved clients"
   from_port         = local.native_port
   to_port           = local.native_port
+  ip_protocol       = "tcp"
+  cidr_ipv4         = each.value
+}
+
+resource "aws_vpc_security_group_ingress_rule" "http" {
+  for_each = var.http_enabled ? toset(local.client_cidr_blocks) : toset([])
+
+  security_group_id = aws_security_group.task.id
+  description       = "Ferric HTTP API from approved clients"
+  from_port         = local.http_target_port
+  to_port           = local.http_target_port
   ip_protocol       = "tcp"
   cidr_ipv4         = each.value
 }
@@ -314,7 +336,7 @@ resource "aws_ecs_task_definition" "this" {
         }
       ]
 
-      portMappings = [
+      portMappings = concat([
         {
           name          = "native"
           containerPort = local.native_port
@@ -333,13 +355,24 @@ resource "aws_ecs_task_definition" "this" {
           hostPort      = local.health_probe_port
           protocol      = "tcp"
         }
-      ]
+        ], var.http_enabled ? [
+        {
+          name          = "http-api"
+          containerPort = local.http_target_port
+          hostPort      = local.http_target_port
+          protocol      = "tcp"
+        }
+      ] : [])
 
       environment = [
         { name = "FERRICSTORE_DATA_DIR", value = "/data" },
         { name = "FERRICSTORE_NATIVE_PORT", value = tostring(local.native_port) },
         { name = "FERRICSTORE_HEALTH_PORT", value = tostring(local.dashboard_port) },
         { name = "FERRICSTORE_HEALTH_PROBE_PORT", value = tostring(local.health_probe_port) },
+        { name = "FERRICSTORE_HTTP_ENABLED", value = tostring(var.http_enabled) },
+        { name = "FERRICSTORE_HTTP_BIND", value = "0.0.0.0" },
+        { name = "FERRICSTORE_HTTP_PORT", value = tostring(local.http_target_port) },
+        { name = "FERRICSTORE_HTTP_TLS_ENABLED", value = "false" },
         { name = "FERRICSTORE_SHARD_COUNT", value = tostring(var.shard_count) },
         { name = "FERRICSTORE_PROTECTED_MODE", value = "false" }
       ]
@@ -380,7 +413,7 @@ resource "aws_ecs_task_definition" "this" {
 }
 
 # -----------------------------------------------------------------------------
-# Native TCP endpoint and single-task ECS service
+# Native and optional HTTP endpoints plus the single-task ECS service
 # -----------------------------------------------------------------------------
 
 resource "aws_lb" "this" {
@@ -413,6 +446,31 @@ resource "aws_lb_target_group" "native" {
   }
 }
 
+resource "aws_lb_target_group" "http" {
+  count = var.http_enabled ? 1 : 0
+
+  name               = "${var.name_prefix}-http"
+  port               = local.http_target_port
+  protocol           = "TCP"
+  target_type        = "ip"
+  vpc_id             = aws_vpc.this.id
+  preserve_client_ip = true
+
+  deregistration_delay = 120
+
+  health_check {
+    enabled             = true
+    protocol            = "HTTP"
+    port                = tostring(local.health_probe_port)
+    path                = "/health/ready"
+    matcher             = "200"
+    interval            = 30
+    timeout             = 10
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+  }
+}
+
 resource "aws_lb_listener" "native" {
   load_balancer_arn = aws_lb.this.arn
   port              = local.native_port
@@ -421,6 +479,34 @@ resource "aws_lb_listener" "native" {
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.native.arn
+  }
+}
+
+resource "aws_lb_listener" "http" {
+  count = var.http_enabled && var.http_tls_certificate_arn == null ? 1 : 0
+
+  load_balancer_arn = aws_lb.this.arn
+  port              = var.http_listener_port
+  protocol          = "TCP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.http[0].arn
+  }
+}
+
+resource "aws_lb_listener" "https" {
+  count = var.http_enabled && var.http_tls_certificate_arn != null ? 1 : 0
+
+  load_balancer_arn = aws_lb.this.arn
+  port              = var.http_listener_port
+  protocol          = "TLS"
+  certificate_arn   = var.http_tls_certificate_arn
+  ssl_policy        = var.http_tls_security_policy
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.http[0].arn
   }
 }
 
@@ -455,9 +541,21 @@ resource "aws_ecs_service" "this" {
     container_port   = local.native_port
   }
 
+  dynamic "load_balancer" {
+    for_each = var.http_enabled ? [1] : []
+
+    content {
+      target_group_arn = aws_lb_target_group.http[0].arn
+      container_name   = local.container_name
+      container_port   = local.http_target_port
+    }
+  }
+
   depends_on = [
     aws_iam_role_policy_attachment.execution,
     aws_iam_role_policy.task,
-    aws_lb_listener.native
+    aws_lb_listener.native,
+    aws_lb_listener.http,
+    aws_lb_listener.https
   ]
 }

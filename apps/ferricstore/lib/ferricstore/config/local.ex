@@ -23,7 +23,6 @@ defmodule Ferricstore.Config.Local do
       #=> %{"log_level" => "debug"}
   """
 
-  require Logger
   use GenServer
 
   @table :ferricstore_config_local

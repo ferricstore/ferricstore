@@ -428,6 +428,53 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistorySupportsRangeReverseEventWork
         assert Enum.map(reverse_terminal_records, & &1.id) == [completed.id, cancelled.id]
       end
 
+      test "flow_terminals returns completed failed and cancelled records with the same timestamp" do
+        type = uid("flow-terminal-tie")
+        partition = uid("tenant-flow-terminal-tie")
+        now_ms = 2_000
+
+        completed =
+          create_claimed_flow(uid("flow-terminal-tie-completed"), partition, type, "worker")
+
+        failed =
+          create_claimed_flow(uid("flow-terminal-tie-failed"), partition, type, "worker")
+
+        cancelled =
+          create_claimed_flow(uid("flow-terminal-tie-cancelled"), partition, type, "worker")
+
+        assert {:ok, _} =
+                 flow_complete_and_get(completed.id, completed.lease_token,
+                   partition_key: partition,
+                   fencing_token: completed.fencing_token,
+                   now_ms: now_ms
+                 )
+
+        assert {:ok, _} =
+                 flow_fail_and_get(failed.id, failed.lease_token,
+                   partition_key: partition,
+                   fencing_token: failed.fencing_token,
+                   now_ms: now_ms
+                 )
+
+        assert {:ok, _} =
+                 flow_cancel_and_get(cancelled.id,
+                   partition_key: partition,
+                   lease_token: cancelled.lease_token,
+                   fencing_token: cancelled.fencing_token,
+                   now_ms: now_ms
+                 )
+
+        assert {:ok, records} =
+                 FerricStore.flow_terminals(type,
+                   partition_key: partition,
+                   state: "any",
+                   count: 20
+                 )
+
+        assert records |> Enum.map(& &1.state) |> Enum.sort() ==
+                 ~w(cancelled completed failed)
+      end
+
       test "cold terminal query seeks to filtered time window instead of sampling prefix head" do
         previous_limit = Application.get_env(:ferricstore, :flow_lmdb_query_scan_limit)
 

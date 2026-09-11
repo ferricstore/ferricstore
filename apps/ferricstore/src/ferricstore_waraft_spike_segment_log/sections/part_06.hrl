@@ -568,7 +568,10 @@ maybe_run_writer_registry_hook(Phase, Registry) ->
         {ok, {delete_once, Phase, Notify}} ->
             application:unset_env(ferricstore, waraft_segment_log_writer_registry_hook),
             Notify ! {waraft_segment_log_writer_registry_hook, Phase},
-            catch ets:delete(Registry),
+            try ets:delete(Registry)
+            catch
+                _:_ -> ok
+            end,
             ok;
         _ ->
             ok
@@ -579,7 +582,10 @@ maybe_run_offset_registry_hook(Phase) ->
         {ok, {delete_once, Phase, Notify}} ->
             application:unset_env(ferricstore, waraft_segment_log_offset_registry_hook),
             Notify ! {waraft_segment_log_offset_registry_hook, Phase},
-            catch ets:delete(?OFFSET_REGISTRY),
+            try ets:delete(?OFFSET_REGISTRY)
+            catch
+                _:_ -> ok
+            end,
             ok;
         _ ->
             ok

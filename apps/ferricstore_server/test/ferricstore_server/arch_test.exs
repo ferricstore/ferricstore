@@ -22,4 +22,9 @@ defmodule FerricstoreServer.ArchTest do
     modules_matching("FerricstoreServer.Native.Connection.**")
     |> should_not_depend_on(modules_matching("FerricstoreServer.Health.**"))
   end
+
+  test "protocol and management modules do not depend on the HTTP application" do
+    modules_matching("FerricstoreServer.**")
+    |> should_not_depend_on(modules_matching("FerricstoreHttp.**"))
+  end
 end

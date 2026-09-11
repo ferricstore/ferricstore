@@ -32,12 +32,16 @@ Run one development node:
 docker run -p 6388:6388 -p 6380:6380 -p 6381:6381 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
-  quay.io/ferricstore/ferricstore:0.11.6
+  quay.io/ferricstore/ferricstore:0.11.14
 ```
 
 Published SDKs connect to `ferric://127.0.0.1:6388`. The operations dashboard
 is at <http://127.0.0.1:6380/dashboard>, metrics are at `/metrics`, and isolated
 liveness/readiness probes use port `6381`.
+
+The same release also contains an opt-in HTTP/HTTPS command and invocation API.
+It is disabled by default; see [HTTP and HTTPS API](guides/http-api.md) for TLS,
+ACL, Docker, and client configuration.
 
 `FERRICSTORE_PROTECTED_MODE=false` is for local development only. With
 protected mode enabled, bootstrap the first durable ACL user at
@@ -48,10 +52,9 @@ protected mode enabled, bootstrap the first durable ACL user at
 ## OSS Capability Map
 
 The FQL1 query planner, schedules, governance primitives, and operations
-dashboard are included in this OSS repository and release image; they are not
-enterprise-only add-ons.
+dashboard are included in this OSS repository and release image.
 
-| Area | Included in FerricStore OSS `0.11.6` |
+| Area | Included in FerricStore OSS `0.11.14` |
 | --- | --- |
 | Durable KV and data structures | Strings, hashes with field TTL, lists, sets, sorted sets, streams and consumer groups, Pub/Sub, transactions, blocking reads, bitmaps, HyperLogLog, GEO, Bloom and Cuckoo filters, Count-Min Sketch, TopK, and TDigest. |
 | FerricStore-native helpers | Compare-and-swap, fenced distributed locks, fixed-window rate limiting, cache-aside/stampede protection, key diagnostics, quotas, and cluster inspection. |
@@ -76,7 +79,7 @@ enterprise-only add-ons.
   rejects shapes for which the server cannot produce an advertised bounded
   plan.
 - `partition_key` is an application routing, co-location, and bounded-query
-  key. It is not an OSS tenant-control-plane requirement.
+  key. It does not imply a separate HTTP security namespace.
 - FQL does not return payload, result, error, named-value, lease-token, fencing,
   or retention fields. QueryRows and covering indexes hold query-visible
   metadata; payload/value bytes are hydrated through point, claim, or value-ref
@@ -87,9 +90,8 @@ enterprise-only add-ons.
 
 ## Interfaces And Published SDKs
 
-The published SDKs use the same Ferric native protocol. The `0.11.5` SDK
-release lines are compatibility-tested against the OSS server at version
-`0.11.6`:
+The published SDKs use the same Ferric native protocol. Their current release
+lines are compatibility-tested against the OSS server at version `0.11.14`:
 
 | Interface | Package or module | Source |
 | --- | --- | --- |
@@ -97,13 +99,14 @@ release lines are compatibility-tested against the OSS server at version
 | Go | [`github.com/ferricstore/ferricstore-go`](https://pkg.go.dev/github.com/ferricstore/ferricstore-go) | [`ferricstore/ferricstore-go`](https://github.com/ferricstore/ferricstore-go) |
 | Elixir native client | [`ferricstore_sdk`](https://hex.pm/packages/ferricstore_sdk) | [`ferricstore/ferricstore-elixir`](https://github.com/ferricstore/ferricstore-elixir) |
 | TypeScript / Node.js | [`@ferricstore/ferricstore`](https://www.npmjs.com/package/@ferricstore/ferricstore) | [`ferricstore/ferricstore-typescript`](https://github.com/ferricstore/ferricstore-typescript) |
+| Java 17+ | [`io.github.ferricstore:ferricstore-java`](https://central.sonatype.com/artifact/io.github.ferricstore/ferricstore-java) | [`ferricstore/ferricstore-java`](https://github.com/ferricstore/ferricstore-java) |
+| HTTP/HTTPS API | `/v1/commands`, `/v1/invocations`, and scoped values | This repository |
 | Embedded Elixir server API | [`ferricstore`](https://hex.pm/packages/ferricstore) | This repository |
 | Local operational CLI | `mix ferricstore.*` tasks | This repository |
 
-All four native SDK `0.11.5` release lines retain FerricStore `0.11.4` as their
+All five native SDK release lines retain FerricStore `0.11.4` as their
 minimum server version and negotiate the Stream mode-34 producer fast path when
 the server advertises it. Native wire protocol v1 is unchanged.
-No Java SDK is currently published.
 
 ## Beta Status
 
@@ -561,7 +564,7 @@ FerricStore can also run inside an Elixir application.
 
 ```elixir
 # mix.exs
-{:ferricstore, "~> 0.11.6"}
+{:ferricstore, "~> 0.11.14"}
 ```
 
 ```elixir
@@ -579,6 +582,8 @@ Start here:
 - [Key-Value Store](guides/kv-store.md) — how the durable KV/data-structure store works.
 - [Workflow usage examples](docs/flow-vs-temporal-usage.md) — queues, workflows, retries, fanout, signals, and value refs.
 - [Native protocol](docs/native-protocol.md) — typed framing, values, opcodes, compact query results, multiplexing, routing, and backpressure.
+- [HTTP and HTTPS API](guides/http-api.md) — TLS setup, ACL identities, Docker, command batches, invocations, and operational controls.
+- [HTTP wire contract](docs/http/api.md) — binary-safe JSON, MessagePack, errors, and invocation routes.
 - [Benchmarks](docs/benchmarks.md) — latest Azure FerricFlow results and native KV benchmark requirements.
 
 FerricFlow:

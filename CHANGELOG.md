@@ -4,6 +4,91 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.14 - 2026-08-29
+
+- Made the core Hex package dependency graph publishable while retaining
+  `libcluster` 3.5.0 by moving the upstream Consul adapter into a release-only
+  umbrella support application.
+- Corrected Consul and etcd discovery to use each adapter's actual strategy
+  module and option contract, including healthy Consul service lookup and
+  normalized etcd endpoints and key directories.
+- Added a required CI gate that builds and unpacks the core Hex package before
+  a release tag can be merged.
+
+## 0.11.13 - 2026-08-28
+
+- Upgraded the supported runtime baseline to Elixir 1.20.4, Erlang/OTP 29.0.5,
+  and Rust 1.98.0 across local tooling, CI, release images, and deployment
+  examples.
+- Updated Hex and Cargo dependencies, including Rustler 0.38 and
+  RustlerPrecompiled 0.9, while retaining strict compiler, security, and
+  allocation gates.
+- Fixed strict-compiler findings and cross-test runtime-state restoration
+  without weakening correctness assertions, performance thresholds, retry
+  budgets, or timeouts.
+
+## 0.11.12 - 2026-08-26
+
+- Accelerated eligible homogeneous command-gateway GET batches and ordered
+  same-shard SET batches while retaining ACL, internal-key, resource-limit,
+  response-limit, deadline, and positional error semantics.
+- Reduced FerricFlow query and write-path allocation and LMDB lookup overhead
+  without allowing read-side storage creation.
+- Added Java SDK compatibility coverage for native TCP/TLS and authenticated
+  HTTP/HTTPS on Java 17 and Java 21.
+
+## 0.11.11 - 2026-08-23
+
+- Added the HTTP/HTTPS command and invocation application to the OSS umbrella
+  and release, disabled by default and backed directly by the shared
+  authentication and command gateways.
+- Added TLS 1.2/1.3 listener configuration, bounded protocol controls,
+  invocation target protections, architecture enforcement, real ACL gateway
+  tests, and Python SDK TLS integration coverage.
+
+## 0.11.10 - 2026-08-23
+
+- Added caller-owned, deadline-bounded blocking list and Stream execution to
+  the transport-neutral command gateway. Ordered pipelines may contain
+  blocking commands, while independent requests are never coalesced across a
+  blocking wait; cancellation releases waiters and resource-budget leases.
+- Reconciled transient WARaft participant/member configuration timeouts during
+  node joins instead of rolling back already-converged shards, preventing
+  partial three-node membership after a slow cluster start.
+- Contained malformed and invalid UTF-8 gateway command names as typed request
+  errors before command planning or execution.
+
+## 0.11.9 - 2026-08-22
+
+- Added structured native descriptors to the transport-neutral command gateway
+  so in-process HTTP transports can execute the complete stateless Flow command
+  surface through canonical parsing, ACL, routing, deadline, and resource paths.
+- Validated the HTTP-enabled Go, Python, Elixir, and TypeScript SDK release
+  lines while retaining FerricStore 0.11.4 as the native compatibility floor.
+
+## 0.11.8 - 2026-08-22
+
+- Preserved durable terminal QueryRows when late query-only projection work
+  observes a hot source that was intentionally pruned after projection. The
+  atomic terminal reverse marker now distinguishes retained terminal state
+  from a real deletion, while normal source-deletion cleanup remains intact.
+- Made fixed-index FQL terminal reads synchronize pending cold projection work
+  before answering, eliminating read-after-write omissions across completed,
+  failed, and cancelled records, including equal-timestamp transitions.
+
+## 0.11.7 - 2026-08-22
+
+- Added transport-neutral authentication and command gateways so trusted
+  in-process protocol adapters can reuse the same ACL, command preparation,
+  resource-budget, deadline, and ordered batch-execution contracts as the
+  native TCP server without a loopback network hop.
+- Revalidated prepared command batches immediately before execution, retained
+  bounded resource accounting across shared gateway calls, and added direct
+  gateway coverage for structured native commands and ACL-sensitive keys.
+- Allowed structured `FLOW.QUERY` requests through the shared gateway while
+  preserving command discovery, authorization, bounded planning, diagnostics,
+  and native execution semantics for HTTP and future transports.
+
 ## 0.11.6 - 2026-08-19
 
 - Added a single-task AWS ECS/Fargate OSS deployment profile with private

@@ -3,6 +3,7 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutorTest do
 
   alias Ferricstore.Flow.Query.{Budget, FixedIndexExecutor, Limits, RecordProjection, Request}
   alias Ferricstore.Flow.Query
+  alias Ferricstore.Flow.ReadAPI
   alias Ferricstore.Test.IsolatedInstance
 
   test "explicit fixed-index projections skip the full allowlisted intermediate" do
@@ -71,6 +72,45 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutorTest do
 
     assert div(scan_entries, range_seeks) == Limits.max_results() + 1
     assert (Limits.max_results() + 1) * 128 * 1_024 <= Budget.default().executor_memory_bytes
+  end
+
+  test "fixed terminal reads synchronize the cold projection before answering" do
+    ctx = IsolatedInstance.checkout(shard_count: 1)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "fixed-terminal-consistency-#{suffix}"
+    type = "invoice-terminal-consistency-#{suffix}"
+    id = "failed-terminal-consistency-#{suffix}"
+
+    try do
+      assert :ok =
+               Ferricstore.Flow.create(ctx, id,
+                 type: type,
+                 state: "failed",
+                 partition_key: partition,
+                 now_ms: 1_000
+               )
+
+      assert {:ok, built} =
+               Ferricstore.Flow.Query.Builder.build(:terminals, %{
+                 partition_key: partition,
+                 type: type,
+                 limit: 20
+               })
+
+      assert {:ok, request} = Query.prepare_reference("FQL1", built.query, built.params)
+
+      {result, calls} =
+        execute_with_call_trace_args({ReadAPI, :terminals, 3}, fn ->
+          Query.execute(ctx, request)
+        end)
+
+      assert {:ok, %{records: [%{id: ^id}]}} = result
+      assert [[_read_ctx, ^type, opts]] = calls
+      assert Keyword.fetch!(opts, :include_cold)
+      assert Keyword.fetch!(opts, :consistent_projection)
+    after
+      IsolatedInstance.checkin(ctx)
+    end
   end
 
   test "normalizes the indexed reader's candidate ceiling as a scan-budget error" do
@@ -220,6 +260,45 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutorTest do
         1 + traced_calls(module, function, arity)
     after
       0 -> 0
+    end
+  end
+
+  defp execute_with_call_trace_args({module, function, arity} = mfa, execute_fun) do
+    parent = self()
+    reference = make_ref()
+
+    executor =
+      spawn(fn ->
+        receive do
+          :execute ->
+            send(parent, {reference, execute_fun.()})
+            receive do: (:stop -> :ok)
+        end
+      end)
+
+    Code.ensure_loaded!(module)
+    :erlang.trace(executor, true, [:call, {:tracer, self()}])
+    :erlang.trace_pattern(mfa, true, [:local])
+
+    try do
+      send(executor, :execute)
+      assert_receive {^reference, result}, 5_000
+      trace_reference = :erlang.trace_delivered(executor)
+      assert_receive {:trace_delivered, ^executor, ^trace_reference}, 1_000
+      {result, traced_call_args(module, function, arity, [])}
+    after
+      :erlang.trace_pattern(mfa, false, [:local])
+      :erlang.trace(executor, false, [:call])
+      send(executor, :stop)
+    end
+  end
+
+  defp traced_call_args(module, function, arity, acc) do
+    receive do
+      {:trace, _pid, :call, {^module, ^function, args}} when length(args) == arity ->
+        traced_call_args(module, function, arity, [args | acc])
+    after
+      0 -> Enum.reverse(acc)
     end
   end
 end

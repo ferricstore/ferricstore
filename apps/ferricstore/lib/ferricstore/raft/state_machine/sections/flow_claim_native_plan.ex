@@ -260,7 +260,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
         prefix_size = byte_size(prefix)
 
         with true <- byte_size(due_key) > prefix_size,
-             <<^prefix::binary-size(prefix_size), priority_bin::binary>> <- due_key do
+             <<^prefix::binary-size(^prefix_size), priority_bin::binary>> <- due_key do
           case Integer.parse(priority_bin) do
             {priority, ""} -> {:ok, priority}
             _ -> :error

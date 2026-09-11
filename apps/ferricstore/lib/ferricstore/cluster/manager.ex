@@ -796,7 +796,7 @@ defmodule Ferricstore.Cluster.Manager do
   end
 
   defp add_member_to_shard(shard_idx, target_node, membership, timeout_ms, attempts_left \\ 3) do
-    case RaftCluster.add_member(shard_idx, target_node, membership, timeout_ms: timeout_ms) do
+    case cluster_add_member(shard_idx, target_node, membership, timeout_ms) do
       :ok ->
         :ok
 
@@ -827,6 +827,8 @@ defmodule Ferricstore.Cluster.Manager do
   end
 
   defp transient_add_member_error?(:not_ready), do: true
+  defp transient_add_member_error?(:participant_config_timeout), do: true
+  defp transient_add_member_error?(:member_config_timeout), do: true
   defp transient_add_member_error?(:peer_ready_timeout), do: true
   defp transient_add_member_error?(:timeout), do: true
   defp transient_add_member_error?({:timeout, _reason}), do: true
@@ -834,6 +836,16 @@ defmodule Ferricstore.Cluster.Manager do
   defp transient_add_member_error?({:membership_unknown_outcome, _reason}), do: true
   defp transient_add_member_error?({:add_member_unknown_outcome, _reason}), do: true
   defp transient_add_member_error?(_reason), do: false
+
+  defp cluster_add_member(shard_idx, target_node, membership, timeout_ms) do
+    case Process.get(:ferricstore_cluster_manager_add_member_hook) do
+      hook when is_function(hook, 4) ->
+        hook.(shard_idx, target_node, membership, timeout_ms)
+
+      _missing_hook ->
+        RaftCluster.add_member(shard_idx, target_node, membership, timeout_ms: timeout_ms)
+    end
+  end
 
   defp target_member_now?(target_node, shard_idx) do
     case Target.target_member?(target_node, shard_idx) do

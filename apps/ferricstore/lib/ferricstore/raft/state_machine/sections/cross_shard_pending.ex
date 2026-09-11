@@ -1403,7 +1403,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
       defp flow_create_fast_due_any_key(%{next_run_at_ms: nil}, _tag, _type), do: nil
 
       defp flow_create_fast_due_any_key(%{priority: priority}, tag, type) do
-        if flow_due_any_index_enabled?() do
+        with_flow_due_any do
           flow_due_any_key_with_tag(tag, type, priority)
         else
           nil

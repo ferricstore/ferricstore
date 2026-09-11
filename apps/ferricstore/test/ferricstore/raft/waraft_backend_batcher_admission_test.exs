@@ -6,6 +6,7 @@ defmodule Ferricstore.Raft.WARaftBackendBatcherAdmissionTest do
   alias Ferricstore.Raft.ApplyContext
   alias Ferricstore.Raft.ReplyAwaiter
   alias Ferricstore.Raft.Batcher, as: RaftBatcher
+  alias Ferricstore.Test.ShardHelpers
 
   test "namespace queue rejects writes after the next batch reaches its cap" do
     pid = start_batcher(65_001, namespace_batch_max: 2)
@@ -321,6 +322,8 @@ defmodule Ferricstore.Raft.WARaftBackendBatcherAdmissionTest do
   end
 
   test "generic async single submission preserves the scalar reply contract" do
+    ShardHelpers.restore_default_waraft!()
+
     key = "batcher:single:#{System.unique_integer([:positive])}"
     {from, token} = ReplyAwaiter.new()
 

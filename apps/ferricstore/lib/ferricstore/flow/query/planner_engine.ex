@@ -198,7 +198,6 @@ defmodule Ferricstore.Flow.Query.PlannerEngine do
       {:ok, planner_memory_bytes + executor_memory_bytes + budget.response_bytes}
     else
       false -> {:error, :query_memory_budget_exceeded}
-      {:error, _reason} = error -> error
     end
   end
 

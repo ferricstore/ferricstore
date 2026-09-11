@@ -355,7 +355,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
 
       defp flow_claim_due_keys(state, type, :any, partition_keys, priority)
            when is_list(partition_keys) do
-        if flow_due_any_index_enabled?() do
+        with_flow_due_any do
           Enum.map(partition_keys, &FlowKeys.due_any_key(type, priority, &1))
         else
           flow_claim_due_matching_keys(state, type, :any, partition_keys, priority)
@@ -370,7 +370,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
              priority
            )
            when is_list(partition_keys) do
-        if flow_due_any_index_enabled?() do
+        with_flow_due_any do
           Enum.map(partition_keys, &FlowKeys.due_any_key(type, priority, &1))
         else
           flow_claim_due_matching_keys(state, type, state_filter, partition_keys, priority)
@@ -401,7 +401,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
 
       defp flow_claim_due_keys(state, type, :any, partition_key, priority)
            when partition_key not in [:any, :auto] do
-        if flow_due_any_index_enabled?() do
+        with_flow_due_any do
           [FlowKeys.due_any_key(type, priority, partition_key)]
         else
           flow_claim_due_matching_keys(state, type, :any, partition_key, priority)
@@ -416,7 +416,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
              priority
            )
            when partition_key not in [:any, :auto] do
-        if flow_due_any_index_enabled?() do
+        with_flow_due_any do
           [FlowKeys.due_any_key(type, priority, partition_key)]
         else
           flow_claim_due_matching_keys(state, type, state_filter, partition_key, priority)

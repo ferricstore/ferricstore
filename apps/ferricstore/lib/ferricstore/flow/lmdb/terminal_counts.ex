@@ -52,8 +52,6 @@ defmodule Ferricstore.Flow.LMDB.TerminalCounts do
     end
   end
 
-  defp count_keys_uncached(_path, []), do: {:ok, []}
-
   defp count_keys_uncached(path, count_keys) do
     case Access.get_many(path, count_keys) do
       {:ok, results} ->

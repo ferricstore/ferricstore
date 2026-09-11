@@ -15,6 +15,7 @@ locals {
   native_port        = 6388
   dashboard_port     = 6380
   health_probe_port  = 6381
+  http_target_port   = 8080
   epmd_port          = 4369
   distribution_port  = 9100
 
@@ -51,6 +52,16 @@ check "valid_fargate_task_size" {
       false
     )
     error_message = "memory must be a Fargate-supported size for the selected cpu value."
+  }
+}
+
+check "valid_http_tls_configuration" {
+  assert {
+    condition = (
+      var.http_tls_certificate_arn == null ||
+      (var.http_enabled && var.http_hostname != null)
+    )
+    error_message = "http_tls_certificate_arn requires http_enabled=true and an http_hostname covered by the certificate."
   }
 }
 
@@ -119,7 +130,7 @@ resource "aws_route_table_association" "public" {
 
 # A NAT gateway per AZ avoids making task recovery depend on another AZ. For a
 # private ECR-only deployment these can be replaced with the required VPC
-# endpoints, but the default GHCR image needs internet egress.
+# endpoints, but a public Quay.io image needs internet egress.
 resource "aws_eip" "nat" {
   count  = 3
   domain = "vpc"
@@ -184,6 +195,17 @@ resource "aws_vpc_security_group_ingress_rule" "native" {
   description       = "Ferric native protocol from approved clients"
   from_port         = local.native_port
   to_port           = local.native_port
+  ip_protocol       = "tcp"
+  cidr_ipv4         = each.value
+}
+
+resource "aws_vpc_security_group_ingress_rule" "http" {
+  for_each = var.http_enabled ? toset(local.client_cidr_blocks) : toset([])
+
+  security_group_id = aws_security_group.task.id
+  description       = "Ferric HTTP API from approved clients"
+  from_port         = local.http_target_port
+  to_port           = local.http_target_port
   ip_protocol       = "tcp"
   cidr_ipv4         = each.value
 }
@@ -397,7 +419,7 @@ resource "aws_ecs_task_definition" "node" {
         condition     = "SUCCESS"
       }]
 
-      portMappings = [
+      portMappings = concat([
         {
           name          = "native"
           containerPort = local.native_port
@@ -428,13 +450,24 @@ resource "aws_ecs_task_definition" "node" {
           hostPort      = local.distribution_port
           protocol      = "tcp"
         }
-      ]
+        ], var.http_enabled ? [
+        {
+          name          = "http-api"
+          containerPort = local.http_target_port
+          hostPort      = local.http_target_port
+          protocol      = "tcp"
+        }
+      ] : [])
 
       environment = [
         { name = "FERRICSTORE_DATA_DIR", value = "/data" },
         { name = "FERRICSTORE_NATIVE_PORT", value = tostring(local.native_port) },
         { name = "FERRICSTORE_HEALTH_PORT", value = tostring(local.dashboard_port) },
         { name = "FERRICSTORE_HEALTH_PROBE_PORT", value = tostring(local.health_probe_port) },
+        { name = "FERRICSTORE_HTTP_ENABLED", value = tostring(var.http_enabled) },
+        { name = "FERRICSTORE_HTTP_BIND", value = "0.0.0.0" },
+        { name = "FERRICSTORE_HTTP_PORT", value = tostring(local.http_target_port) },
+        { name = "FERRICSTORE_HTTP_TLS_ENABLED", value = "false" },
         { name = "FERRICSTORE_SHARD_COUNT", value = tostring(var.shard_count) },
         { name = "FERRICSTORE_PROTECTED_MODE", value = "false" },
         { name = "FERRICSTORE_NODE_HOST", value = local.node_hosts[each.key] },
@@ -531,6 +564,34 @@ resource "aws_lb_target_group" "native" {
   }
 }
 
+resource "aws_lb_target_group" "http" {
+  for_each = var.http_enabled ? local.node_slots : {}
+
+  name               = "${var.name_prefix}-${replace(each.key, "node-", "n")}-http"
+  port               = local.http_target_port
+  protocol           = "TCP"
+  target_type        = "ip"
+  vpc_id             = aws_vpc.this.id
+  preserve_client_ip = true
+
+  deregistration_delay = 30
+
+  # ECS replaces tasks that fail any attached target group's health check.
+  # Use the isolated node liveness endpoint so API overload or a temporary
+  # quorum/readiness outage cannot trigger destruction of replica disks.
+  health_check {
+    enabled             = true
+    protocol            = "HTTP"
+    port                = tostring(local.health_probe_port)
+    path                = "/health/live"
+    matcher             = "200"
+    interval            = 30
+    timeout             = 10
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+  }
+}
+
 resource "aws_lb_listener" "native" {
   load_balancer_arn = aws_lb.this.arn
   port              = local.native_port
@@ -552,6 +613,66 @@ resource "aws_lb_listener" "native" {
 
       target_group {
         arn    = aws_lb_target_group.native["node-2"].arn
+        weight = 1
+      }
+    }
+  }
+}
+
+resource "aws_lb_listener" "http" {
+  count = var.http_enabled && var.http_tls_certificate_arn == null ? 1 : 0
+
+  load_balancer_arn = aws_lb.this.arn
+  port              = var.http_listener_port
+  protocol          = "TCP"
+
+  default_action {
+    type = "forward"
+
+    forward {
+      target_group {
+        arn    = aws_lb_target_group.http["node-0"].arn
+        weight = 1
+      }
+
+      target_group {
+        arn    = aws_lb_target_group.http["node-1"].arn
+        weight = 1
+      }
+
+      target_group {
+        arn    = aws_lb_target_group.http["node-2"].arn
+        weight = 1
+      }
+    }
+  }
+}
+
+resource "aws_lb_listener" "https" {
+  count = var.http_enabled && var.http_tls_certificate_arn != null ? 1 : 0
+
+  load_balancer_arn = aws_lb.this.arn
+  port              = var.http_listener_port
+  protocol          = "TLS"
+  certificate_arn   = var.http_tls_certificate_arn
+  ssl_policy        = var.http_tls_security_policy
+
+  default_action {
+    type = "forward"
+
+    forward {
+      target_group {
+        arn    = aws_lb_target_group.http["node-0"].arn
+        weight = 1
+      }
+
+      target_group {
+        arn    = aws_lb_target_group.http["node-1"].arn
+        weight = 1
+      }
+
+      target_group {
+        arn    = aws_lb_target_group.http["node-2"].arn
         weight = 1
       }
     }
@@ -593,6 +714,16 @@ resource "aws_ecs_service" "node" {
     container_port   = local.native_port
   }
 
+  dynamic "load_balancer" {
+    for_each = var.http_enabled ? [1] : []
+
+    content {
+      target_group_arn = aws_lb_target_group.http[each.key].arn
+      container_name   = local.container_name
+      container_port   = local.http_target_port
+    }
+  }
+
   service_registries {
     registry_arn = aws_service_discovery_service.node[each.key].arn
   }
@@ -608,6 +739,8 @@ resource "aws_ecs_service" "node" {
     aws_iam_role_policy_attachment.execution,
     aws_iam_role_policy.execution_secret,
     aws_iam_role_policy.task,
-    aws_lb_listener.native
+    aws_lb_listener.native,
+    aws_lb_listener.http,
+    aws_lb_listener.https
   ]
 }

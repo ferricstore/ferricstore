@@ -106,8 +106,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         Router.shard_for(instance_ctx, key)
       end
 
-      defp cross_shard_route_key(_instance_ctx, _key, default_idx), do: default_idx
-
       defp cross_shard_state_for_key(anchor_state, key) when is_binary(key) do
         instance_ctx = cross_shard_instance_ctx(anchor_state)
 
@@ -149,25 +147,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         if instance_data_path?(ctx, state), do: ctx, else: nil
       end
 
-      defp cross_shard_instance_ctx(%{instance_ctx: ctx}) when is_map(ctx) do
-        if Map.has_key?(ctx, :shard_count) and Map.has_key?(ctx, :keydir_refs) do
-          ctx
-        else
-          nil
-        end
-      end
-
       defp cross_shard_instance_ctx(state) do
         case instance_ctx_for_state(state) do
           %FerricStore.Instance{} = ctx ->
             if instance_data_path?(ctx, state), do: ctx, else: nil
-
-          ctx when is_map(ctx) ->
-            if Map.has_key?(ctx, :shard_count) and Map.has_key?(ctx, :keydir_refs) do
-              ctx
-            else
-              nil
-            end
 
           _ ->
             nil

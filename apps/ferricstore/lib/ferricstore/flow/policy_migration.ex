@@ -137,7 +137,7 @@ defmodule Ferricstore.Flow.PolicyMigration do
       when status_tag in [0, 1] and indexed_tag in [0, 1] and
              generation <= @max_exact_score and type_size > 0 and
              byte_size(payload) == type_size + indexed_size do
-    <<type::binary-size(type_size), indexed::binary-size(indexed_size)>> = payload
+    <<type::binary-size(^type_size), indexed::binary-size(^indexed_size)>> = payload
 
     with {:ok, indexed_state_meta} <- decode_indexed_state_meta(indexed_tag, indexed) do
       {:ok,
@@ -173,8 +173,8 @@ defmodule Ferricstore.Flow.PolicyMigration do
       when status_tag in [0, 1] and token_size > 0 and token_size <= 64 and
              source_token_size > 0 and source_token_size <= 64 and
              byte_size(payload) == token_size + source_token_size + cursor_size do
-    <<run_token::binary-size(token_size), source_token::binary-size(source_token_size),
-      cursor::binary-size(cursor_size)>> = payload
+    <<run_token::binary-size(^token_size), source_token::binary-size(^source_token_size),
+      cursor::binary-size(^cursor_size)>> = payload
 
     {:ok,
      %{
@@ -472,7 +472,7 @@ defmodule Ferricstore.Flow.PolicyMigration do
 
   defp staged_backfill_primary_key(stage_key, prefix) do
     case stage_key do
-      <<^prefix::binary-size(byte_size(prefix)), primary_key::binary>> when primary_key != "" ->
+      <<^prefix::binary-size(byte_size(^prefix)), primary_key::binary>> when primary_key != "" ->
         {:ok, primary_key}
 
       _invalid ->
@@ -557,7 +557,6 @@ defmodule Ferricstore.Flow.PolicyMigration do
         else
           false -> {:error, :corrupt_policy_catalog_primary}
           :error -> {:error, :corrupt_policy_catalog_primary}
-          {:error, _reason} = error -> error
         end
 
       :unavailable ->
@@ -843,7 +842,7 @@ defmodule Ferricstore.Flow.PolicyMigration do
 
   defp decode_work_cursor(<<@work_cursor::binary, token_size::unsigned-big-8, payload::binary>>)
        when token_size > 0 and token_size <= 64 and byte_size(payload) >= token_size do
-    <<run_token::binary-size(token_size), after_key::binary>> = payload
+    <<run_token::binary-size(^token_size), after_key::binary>> = payload
     prefix = staging_prefix(run_token)
 
     case after_key do

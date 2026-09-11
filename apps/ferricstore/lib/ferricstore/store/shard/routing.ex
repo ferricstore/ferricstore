@@ -1453,14 +1453,6 @@ defmodule Ferricstore.Store.Shard.Routing do
         end
       end
 
-      defp handle_forwarded_quorum(
-             {:put, _key, _value, _expire_at_ms},
-             _from,
-             %{writes_paused: true} = state
-           ) do
-        {:reply, {:error, "ERR shard writes paused for sync"}, state}
-      end
-
       defp handle_forwarded_quorum({:put, key, value, expire_at_ms}, from, state) do
         ShardWrites.handle_put(key, value, expire_at_ms, from, state)
       end
@@ -1559,10 +1551,6 @@ defmodule Ferricstore.Store.Shard.Routing do
              state
            ) do
         ShardNativeOps.handle_list_op_lmove(src_key, dst_key, from_dir, to_dir, state)
-      end
-
-      defp handle_forwarded_quorum(command, from, state) when is_tuple(command) do
-        handle_call(command, from, state)
       end
     end
   end

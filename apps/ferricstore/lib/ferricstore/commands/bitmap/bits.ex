@@ -42,7 +42,7 @@ defmodule Ferricstore.Commands.Bitmap.Bits do
       s = max(s, 0)
       e = min(e, len - 1)
       slice_size = e - s + 1
-      <<_::binary-size(s), slice::binary-size(slice_size), _::binary>> = bin
+      <<_::binary-size(^s), slice::binary-size(^slice_size), _::binary>> = bin
       popcount(slice)
     end
   end

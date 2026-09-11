@@ -304,7 +304,6 @@ defmodule Ferricstore.Flow.Governance.ReleaseOutbox do
       {:ok, values} when is_list(values) -> {:ok, values}
       :unavailable -> {:error, "ERR flow governance release outbox shard unavailable"}
       {:error, _reason} = error -> error
-      _invalid -> {:error, "ERR flow governance release outbox read failed"}
     end
   end
 

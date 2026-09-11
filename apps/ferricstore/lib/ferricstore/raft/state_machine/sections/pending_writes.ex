@@ -374,9 +374,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
             :ok
 
           batches when is_list(batches) ->
-            if batches != [] do
-              Process.put(:sm_pending_flow_native_flush?, true)
-            end
+            Process.put(:sm_pending_flow_native_flush?, true)
 
             case apply_flow_native_batches(batches) do
               :ok ->
@@ -786,8 +784,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
       catch
         :exit, _ -> :ok
       end
-
-      defp notify_cross_shard_active_file_sync(_ctx, _shard_index), do: :ok
 
       defp mark_cross_shard_checkpoint_dirty(state, shard_index) do
         case checkpoint_ctx_for_state(state) do

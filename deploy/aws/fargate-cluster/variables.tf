@@ -120,13 +120,71 @@ variable "shard_count" {
 }
 
 variable "allowed_client_cidr_blocks" {
-  description = "CIDRs allowed to reach the native endpoint. An empty list uses the stack VPC CIDR."
+  description = "CIDRs allowed to reach the native endpoint and the optional HTTP endpoint. An empty list uses the stack VPC CIDR."
   type        = list(string)
   default     = []
 
   validation {
     condition     = alltrue([for cidr in var.allowed_client_cidr_blocks : can(cidrnetmask(cidr))])
     error_message = "Every allowed client entry must be a valid IPv4 CIDR."
+  }
+}
+
+variable "http_enabled" {
+  description = "Expose FerricStore's authenticated HTTP command API through the internal NLB."
+  type        = bool
+  default     = false
+}
+
+variable "http_listener_port" {
+  description = "Client-facing NLB port for HTTP or HTTPS. Each task listener remains on unprivileged port 8080."
+  type        = number
+  default     = 8080
+
+  validation {
+    condition = (
+      var.http_listener_port >= 1 &&
+      var.http_listener_port <= 65535 &&
+      floor(var.http_listener_port) == var.http_listener_port &&
+      var.http_listener_port != 6388
+    )
+    error_message = "http_listener_port must be an integer from 1 through 65535 and must not collide with native port 6388."
+  }
+}
+
+variable "http_tls_certificate_arn" {
+  description = "Optional ACM or IAM certificate ARN. When set, the NLB terminates TLS before forwarding over the private VPC."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.http_tls_certificate_arn == null || can(regex("^arn:[^:]+:(acm|iam):", var.http_tls_certificate_arn))
+    error_message = "http_tls_certificate_arn must be null or an ACM/IAM certificate ARN."
+  }
+}
+
+variable "http_tls_security_policy" {
+  description = "NLB TLS security policy used when http_tls_certificate_arn is set."
+  type        = string
+  default     = "ELBSecurityPolicy-TLS13-1-2-Res-2021-06"
+
+  validation {
+    condition     = startswith(var.http_tls_security_policy, "ELBSecurityPolicy-")
+    error_message = "http_tls_security_policy must be an Elastic Load Balancing security policy name."
+  }
+}
+
+variable "http_hostname" {
+  description = "Optional client DNS name used in the HTTP endpoint output. Required for TLS and must resolve to the NLB outside this stack."
+  type        = string
+  default     = null
+
+  validation {
+    condition = (
+      var.http_hostname == null ||
+      can(regex("^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$", var.http_hostname))
+    )
+    error_message = "http_hostname must be null or a valid DNS hostname."
   }
 }
 

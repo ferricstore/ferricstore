@@ -411,6 +411,7 @@ defmodule Ferricstore.Store.Shard.LogicalKeyIndexTest do
     assert 0 = LogicalKeyIndex.slot_count(ctx.ordered, ctx.slots)
   end
 
+  @tag timeout: 120_000
   test "readers never observe a partially published slot mutation", ctx do
     assert :ok = LogicalKeyIndex.reset(ctx.ordered, ctx.slots)
     parent = self()

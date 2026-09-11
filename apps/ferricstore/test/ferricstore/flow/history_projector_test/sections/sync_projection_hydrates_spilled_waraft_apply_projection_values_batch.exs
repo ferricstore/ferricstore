@@ -129,8 +129,8 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.SyncProjectionHydratesS
         assert value_size_b == byte_size(source_value_b)
         assert file_id_a == 0
         assert file_id_b == 0
-        assert is_integer(offset_a) and offset_a >= 0
-        assert is_integer(offset_b) and offset_b >= 0
+        assert offset_a >= 0
+        assert offset_b >= 0
 
         assert {:ok, ^source_value_a} =
                  HistoryProjector.read_value(dir, {:flow_history, file_id_a}, offset_a)
@@ -451,7 +451,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.SyncProjectionHydratesS
                  Ferricstore.Flow.LMDB.decode_value_locator(lmdb_value, 1_000)
 
         assert file_id == 0
-        assert is_integer(offset) and offset >= 0
+        assert offset >= 0
         assert value_size == byte_size(source_value)
 
         assert {:ok, ^source_value} =

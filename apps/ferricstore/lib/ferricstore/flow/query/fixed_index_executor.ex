@@ -265,7 +265,7 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutor do
       count: request.limit,
       query_scan_limit: @candidate_scan_limit,
       include_cold: true,
-      consistent_projection: false,
+      consistent_projection: Shape.terminal_states?(descriptor.states),
       rev: descriptor.direction == :desc
     ]
     |> maybe_put_range(descriptor.updated_range)

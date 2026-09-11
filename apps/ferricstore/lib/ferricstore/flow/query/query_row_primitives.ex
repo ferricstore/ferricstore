@@ -121,7 +121,7 @@ defmodule Ferricstore.Flow.Query.QueryRowPrimitives do
       when is_integer(maximum_binary_bytes) and maximum_binary_bytes > 0 do
     with {:ok, bytes, rest} <- decode_u64(encoded),
          true <- bytes <= maximum_binary_bytes,
-         <<value::binary-size(bytes), tail::binary>> <- rest do
+         <<value::binary-size(^bytes), tail::binary>> <- rest do
       {:ok, :binary.copy(value), tail, bytes}
     else
       _invalid -> :error
@@ -164,7 +164,7 @@ defmodule Ferricstore.Flow.Query.QueryRowPrimitives do
       when is_integer(maximum_binary_bytes) and maximum_binary_bytes > 0 do
     with {:ok, bytes, rest} <- decode_u64(encoded),
          true <- bytes <= maximum_binary_bytes,
-         <<_value::binary-size(bytes), tail::binary>> <- rest do
+         <<_value::binary-size(^bytes), tail::binary>> <- rest do
       {:ok, tail, bytes}
     else
       _invalid -> :error
@@ -213,7 +213,7 @@ defmodule Ferricstore.Flow.Query.QueryRowPrimitives do
        when count > 0 do
     with {:ok, bytes, rest} <- decode_u64(encoded),
          true <- bytes <= maximum_binary_bytes,
-         <<value::binary-size(bytes), tail::binary>> <- rest do
+         <<value::binary-size(^bytes), tail::binary>> <- rest do
       decode_binary_list(
         count - 1,
         tail,
@@ -233,7 +233,7 @@ defmodule Ferricstore.Flow.Query.QueryRowPrimitives do
        when count > 0 do
     with {:ok, bytes, rest} <- decode_u64(encoded),
          true <- bytes <= maximum_binary_bytes,
-         <<value::binary-size(bytes), tail::binary>> <- rest,
+         <<value::binary-size(^bytes), tail::binary>> <- rest,
          false <- MapSet.member?(seen, value) do
       skip_binary_list(
         count - 1,

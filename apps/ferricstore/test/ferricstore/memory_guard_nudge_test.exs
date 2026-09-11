@@ -20,6 +20,7 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
 
     original_state = :sys.get_state(MemoryGuard)
     original_ctx = FerricStore.Instance.get(:default)
+    original_process_rss_fn = original_ctx.process_rss_fn
     orig_reject = MemoryGuard.reject_writes?()
     orig_keydir = MemoryGuard.keydir_full?()
 
@@ -36,8 +37,17 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
         :exit, _ -> :ok
       end
 
-      :sys.replace_state(MemoryGuard, fn _current -> original_state end)
-      :persistent_term.put({FerricStore.Instance, :default}, original_ctx)
+      current_ctx = FerricStore.Instance.get(:default)
+
+      :sys.replace_state(MemoryGuard, fn _current ->
+        %{original_state | pressure_flags: current_ctx.pressure_flags}
+      end)
+
+      FerricStore.Instance.inject_callbacks(
+        :default,
+        process_rss_fn: original_process_rss_fn
+      )
+
       MemoryGuard.set_reject_writes(orig_reject)
       MemoryGuard.set_keydir_full(orig_keydir)
       ShardHelpers.flush_all_keys()

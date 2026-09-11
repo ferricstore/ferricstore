@@ -367,7 +367,10 @@ stop_orphaned_waraft_sup() ->
         undefined ->
             ok;
         _Pid ->
-            _ = catch supervisor:stop(Name, shutdown, infinity),
+            try supervisor:stop(Name, shutdown, infinity)
+            catch
+                _:_ -> ok
+            end,
             kill_orphaned_waraft_sup(Name)
     end.
 

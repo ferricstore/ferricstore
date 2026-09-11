@@ -565,9 +565,6 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
 
           {:error, :backend_unavailable} ->
             :ok
-
-          {:error, reason} ->
-            {:error, {:blob_protection_barrier_failed, reason}}
         end
       end
 
@@ -583,9 +580,6 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
 
           {:error, :backend_unavailable} ->
             :ok
-
-          {:error, reason} ->
-            {:error, {:sync_pause_barrier_failed, reason}}
         end
       end
 

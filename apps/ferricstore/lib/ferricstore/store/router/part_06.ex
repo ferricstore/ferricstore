@@ -397,7 +397,6 @@ defmodule Ferricstore.Store.Router.Part06 do
            }}
         else
           false -> {:error, "ERR flow policy migration projection pending"}
-          {:ok, nil} -> {:error, "ERR flow policy migration projection pending"}
           :unavailable -> {:error, "ERR flow policy migration shard unavailable"}
           :error -> {:error, "ERR flow policy migration job is corrupt"}
           {:error, _reason} = error -> error
@@ -618,8 +617,6 @@ defmodule Ferricstore.Store.Router.Part06 do
         merged
       end
 
-      defp flow_batch_read_with_status(_ctx, []), do: []
-
       defp flow_batch_read_with_status(ctx, keys) do
         values_by_index =
           keys
@@ -788,7 +785,7 @@ defmodule Ferricstore.Store.Router.Part06 do
                 {:error, :query_storage_inconsistent}
             end
 
-          {:ok, [], true} when keys == [] ->
+          {:ok, [], true} ->
             {:ok, chunks}
 
           {:error, reason} ->

@@ -203,9 +203,6 @@ defmodule Ferricstore.Store.ColdRead do
   defp normalize_current_batch_values({:error, reason}, expected_count),
     do: List.duplicate({:error, reason}, expected_count)
 
-  defp normalize_current_batch_values(invalid, expected_count),
-    do: List.duplicate({:error, {:invalid_batch_result, invalid}}, expected_count)
-
   defp current_batch_failure({:error, reason}), do: reason
   defp current_batch_failure(nil), do: :not_found
   defp current_batch_failure(other), do: {:unexpected_pread_result, other}

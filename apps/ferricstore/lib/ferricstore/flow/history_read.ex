@@ -808,7 +808,7 @@ defmodule Ferricstore.Flow.HistoryRead do
           entries =
             scanned
             |> Enum.flat_map(fn
-              {<<^prefix::binary-size(prefix_size), event_id::binary>>, value}
+              {<<^prefix::binary-size(^prefix_size), event_id::binary>>, value}
               when is_binary(value) ->
                 [{event_id, Codec.decode_history_fields(value, decode_context)}]
 

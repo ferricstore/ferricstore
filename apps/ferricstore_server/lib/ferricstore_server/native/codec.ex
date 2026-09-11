@@ -710,7 +710,7 @@ defmodule FerricstoreServer.Native.Codec do
         )
 
       true ->
-        <<prefix::binary-size(remaining), suffix::binary>> = segment
+        <<prefix::binary-size(^remaining), suffix::binary>> = segment
 
         do_chunk_binary_segments(
           [suffix | rest],
@@ -1046,7 +1046,7 @@ defmodule FerricstoreServer.Native.Codec do
     do: Enum.reverse([body | acc])
 
   defp chunks(body, chunk_bytes, acc) do
-    <<chunk::binary-size(chunk_bytes), rest::binary>> = body
+    <<chunk::binary-size(^chunk_bytes), rest::binary>> = body
     chunks(rest, chunk_bytes, [chunk | acc])
   end
 
@@ -1336,8 +1336,6 @@ defmodule FerricstoreServer.Native.Codec do
     end
   end
 
-  defp compact_binary_list_payload(_values), do: nil
-
   defp compact_binary_map_payload(value) when is_map(value) do
     encoded =
       Enum.reduce_while(value, [], fn
@@ -1358,8 +1356,6 @@ defmodule FerricstoreServer.Native.Codec do
     end
   end
 
-  defp compact_binary_map_payload(_value), do: nil
-
   defp compact_binary_map_entries_payload(entries) when is_list(entries) do
     encoded =
       Enum.reduce_while(entries, [], fn
@@ -1379,8 +1375,6 @@ defmodule FerricstoreServer.Native.Codec do
         |> IO.iodata_to_binary()
     end
   end
-
-  defp compact_binary_map_entries_payload(_entries), do: nil
 
   defp compact_flow_value_ref_payload(value) do
     ref = map_get_either(value, :ref, "ref")
@@ -2429,7 +2423,7 @@ defmodule FerricstoreServer.Native.Codec do
   end
 
   defp take_compact_binary(<<len::unsigned-32, rest::binary>>) when byte_size(rest) >= len do
-    <<value::binary-size(len), next::binary>> = rest
+    <<value::binary-size(^len), next::binary>> = rest
     {:ok, value, next}
   end
 
@@ -2592,7 +2586,7 @@ defmodule FerricstoreServer.Native.Codec do
     do: {:error, "ERR native value has unknown or truncated tag"}
 
   defp decode_binary(len, rest) when byte_size(rest) >= len do
-    <<value::binary-size(len), next::binary>> = rest
+    <<value::binary-size(^len), next::binary>> = rest
     {:ok, value, next}
   end
 
@@ -2777,7 +2771,7 @@ defmodule FerricstoreServer.Native.Codec do
     do: {:error, "ERR native map value is truncated"}
 
   defp skip_binary(len, rest) when byte_size(rest) >= len do
-    <<_value::binary-size(len), next::binary>> = rest
+    <<_value::binary-size(^len), next::binary>> = rest
     {:ok, next}
   end
 

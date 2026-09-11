@@ -41,7 +41,7 @@ defmodule FerricStore.Pipe do
   defstruct commands: []
 
   alias Ferricstore.Commands.PreparedAccumulatorCommand
-  alias Ferricstore.Store.ReadResult
+  alias Ferricstore.Store.StringRead
 
   @doc "Creates a new empty pipeline."
   @spec new() :: t()
@@ -143,7 +143,7 @@ defmodule FerricStore.Pipe do
         :all_gets ->
           keys = Enum.map(ordered, fn {:get, k} -> k end)
           values = Ferricstore.Store.Router.batch_get(ctx, keys)
-          pipeline_get_results(ctx, keys, values)
+          StringRead.batch_results(ctx, keys, values)
 
         :all_sets ->
           kv_pairs = Enum.map(ordered, fn {:set, k, v, _opts} -> {k, v} end)
@@ -222,61 +222,11 @@ defmodule FerricStore.Pipe do
     Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
   end
 
-  defp pipeline_get_results(ctx, keys, values) do
-    keys
-    |> Enum.zip(values)
-    |> Enum.map(fn {key, value} -> pipeline_get_result(ctx, key, value) end)
-  end
-
-  defp pipeline_get_result(ctx, key, value) do
-    pipeline_get_result_with_lookup(key, value, fn redis_key, compound_key ->
-      Ferricstore.Store.Router.compound_get(ctx, redis_key, compound_key)
-    end)
-  end
-
-  defp pipeline_get_result_with_lookup(
-         _key,
-         {:error, {:storage_read_failed, _reason}} = failure,
-         _compound_get
-       ),
-       do: ReadResult.command_error(failure)
-
-  defp pipeline_get_result_with_lookup(_key, value, _compound_get) when not is_nil(value),
-    do: {:ok, value}
-
-  defp pipeline_get_result_with_lookup(key, nil, compound_get) do
-    case pipeline_compound_data_structure_status(key, compound_get) do
-      :compound -> {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
-      :plain -> {:ok, nil}
-      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
-    end
-  end
-
-  defp pipeline_compound_data_structure_status(key, compound_get) do
-    type_key = Ferricstore.Store.CompoundKey.type_key(key)
-    list_meta_key = Ferricstore.Store.CompoundKey.list_meta_key(key)
-
-    case compound_get.(key, type_key) do
-      {:error, {:storage_read_failed, _reason}} = failure ->
-        failure
-
-      nil ->
-        case compound_get.(key, list_meta_key) do
-          {:error, {:storage_read_failed, _reason}} = failure -> failure
-          nil -> :plain
-          _list_meta -> :compound
-        end
-
-      _type_marker ->
-        :compound
-    end
-  end
-
   if Mix.env() == :test do
     @doc false
     def __pipeline_get_result_for_test__(key, value, compound_get)
         when is_function(compound_get, 2) do
-      pipeline_get_result_with_lookup(key, value, compound_get)
+      StringRead.result_with_lookup(key, value, compound_get)
     end
   end
 

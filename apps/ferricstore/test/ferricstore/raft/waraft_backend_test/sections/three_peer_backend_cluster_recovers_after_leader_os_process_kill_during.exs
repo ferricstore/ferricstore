@@ -654,6 +654,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.ThreePeerBackendClusterRec
                        {:put, "backend-cluster-flap:minority:#{cycle}", "minority", 0}
                      ])
 
+            _majority_leader = wait_for_waraft_backend_leader(majority_names, 0, 200)
+
             cycle_expected =
               for i <- 1..5 do
                 key = "backend-cluster-flap:#{cycle}:#{i}"

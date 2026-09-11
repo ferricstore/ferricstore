@@ -868,6 +868,40 @@ These environment variables are read from `config/runtime.exs` in production (`M
 | `FERRICSTORE_NATIVE_TLS_CA_CERT_FILE` | unset | Path to CA certificate for client verification |
 | `FERRICSTORE_REQUIRE_TLS` | `false` | Reject non-TLS connections when TLS is configured |
 
+### HTTP and HTTPS API
+
+The HTTP application is included in the release and disabled by default. Its values are validated
+before the listener starts.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRICSTORE_HTTP_ENABLED` | `false` | Start the HTTP/HTTPS API listener |
+| `FERRICSTORE_HTTP_BIND` | `127.0.0.1` | Numeric IPv4 or IPv6 bind address; the container image sets `0.0.0.0` while keeping the listener disabled |
+| `FERRICSTORE_HTTP_PORT` | `8080` | HTTP/HTTPS API port |
+| `FERRICSTORE_HTTP2_ENABLED` | `false` | Advertise HTTP/2 in addition to HTTP/1.1 |
+| `FERRICSTORE_HTTP_TLS_ENABLED` | `false` | Enable TLS; certificate and key paths become required |
+| `FERRICSTORE_HTTP_TLS_CERT_FILE` | unset | PEM certificate-chain path |
+| `FERRICSTORE_HTTP_TLS_KEY_FILE` | unset | Matching PEM private-key path |
+| `FERRICSTORE_HTTP_REQUEST_TIMEOUT_MS` | `30000` | Absolute command-request time budget |
+| `FERRICSTORE_HTTP_MAX_BODY_BYTES` | `1048576` | Maximum request body size |
+| `FERRICSTORE_HTTP_MAX_BATCH_COMMANDS` | `1000` | Maximum commands in one request |
+| `FERRICSTORE_HTTP_MAX_CONNECTIONS` | `1024` | Maximum accepted connections |
+| `FERRICSTORE_HTTP_MAX_IN_FLIGHT_REQUESTS` | `1024` | Maximum admitted concurrent streams |
+| `FERRICSTORE_HTTP_METRICS_ENABLED` | `true` | Start the HTTP metrics collector and expose `/metrics` |
+| `FERRICSTORE_HTTP_INVOCATIONS_ENABLED` | `false` | Enable authenticated invocation and scoped-value routes |
+| `FERRICSTORE_HTTP_INVOCATION_DEFINITIONS_FILE` | unset | JSON definition file loaded through the runner identity at startup |
+| `FERRICSTORE_HTTP_RUNNER_ENABLED` | `false` | Start the invocation runner; requires invocations and its own ACL credentials |
+| `FERRICSTORE_HTTP_RUNNER_USERNAME` | unset | Default environment variable containing the runner ACL username |
+| `FERRICSTORE_HTTP_RUNNER_PASSWORD` | unset | Default environment variable containing the runner ACL password |
+| `FERRICSTORE_HTTP_RUNNER_TARGET_TIMEOUT_MS` | `30000` | Default outbound target deadline |
+| `FERRICSTORE_HTTP_TARGET_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1` | Comma-separated outbound target host allowlist |
+| `FERRICSTORE_HTTP_TARGET_REQUIRE_HTTPS` | `false` | Reject non-HTTPS target URLs when true |
+| `FERRICSTORE_HTTP_TARGET_DENY_PRIVATE_NETWORKS` | `true` | Reject private, loopback, link-local, and translated-private targets unless explicitly allowed |
+| `FERRICSTORE_HTTP_TARGET_MAX_RESPONSE_BYTES` | `1048576` | Maximum accepted target response body |
+
+See [HTTP and HTTPS API](http-api.md) for certificates, ACL setup, Docker, client examples,
+invocation controls, and outbound-target restrictions.
+
 ### Connection
 
 | Variable | Default | Description |

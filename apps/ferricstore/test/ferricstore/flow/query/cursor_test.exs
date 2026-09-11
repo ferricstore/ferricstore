@@ -55,7 +55,8 @@ defmodule Ferricstore.Flow.Query.CursorTest do
     binding = cursor_binding()
     assert {:ok, token} = Cursor.issue(binding, "seek", key: @key, now_ms: 100)
 
-    <<prefix::binary-size(byte_size(token) - 1), last>> = token
+    token_prefix_size = byte_size(token) - 1
+    <<prefix::binary-size(^token_prefix_size), last>> = token
     tampered = <<prefix::binary, Bitwise.bxor(last, 1)>>
 
     assert {:error, :query_cursor_invalid} =

@@ -15,6 +15,17 @@ defmodule FerricstoreServer.Native.ResourceBudget do
     :outbound_bytes
   ]
   @resource_indexes @resources |> Enum.with_index(1) |> Map.new()
+  @scoped_lease_key {__MODULE__, :scoped_lease}
+  @default_scoped_sweep_interval_ms 100
+
+  defmodule ScopedLease do
+    @moduledoc false
+
+    @enforce_keys [:owner, :reference]
+    defstruct @enforce_keys
+
+    @opaque t :: %__MODULE__{owner: pid(), reference: reference()}
+  end
 
   def start_link(opts \\ []) do
     name = Keyword.get(opts, :name, __MODULE__)
@@ -33,6 +44,33 @@ defmodule FerricstoreServer.Native.ResourceBudget do
       when is_atom(resource) and is_pid(owner) and is_integer(amount) and amount >= 0 do
     with {:ok, budget} <- lookup_budget(server) do
       grant_fast_lease(budget, resource, owner, amount, true)
+    end
+  end
+
+  @doc """
+  Acquires a non-transferable lease optimized for a short synchronous scope.
+
+  Scoped leases retain the global ceiling and owner-death cleanup while
+  aggregating bookkeeping by owner. They cannot be resized or released by a
+  different process.
+  """
+  @spec acquire_scoped(GenServer.server(), atom(), non_neg_integer()) ::
+          {:ok, ScopedLease.t()} | {:error, term()}
+  def acquire_scoped(server \\ __MODULE__, resource, amount)
+      when is_atom(resource) and is_integer(amount) and amount >= 0 do
+    with {:ok, budget} <- lookup_scoped_budget(server) do
+      grant_scoped_lease(budget, resource, amount)
+    end
+  end
+
+  @spec release_scoped(ScopedLease.t()) :: :ok | {:error, :lease_owner_mismatch}
+  def release_scoped(%ScopedLease{owner: owner}) when owner != self(),
+    do: {:error, :lease_owner_mismatch}
+
+  def release_scoped(%ScopedLease{reference: reference}) do
+    case Process.delete({@scoped_lease_key, reference}) do
+      {budget, resource, amount} -> release_scoped_lease(budget, self(), resource, amount)
+      nil -> :ok
     end
   end
 
@@ -128,7 +166,11 @@ defmodule FerricstoreServer.Native.ResourceBudget do
   def init(opts) do
     limits = default_limits() |> Map.merge(Map.new(Keyword.get(opts, :limits, %{})))
 
-    with :ok <- validate_limits(limits) do
+    scoped_sweep_interval_ms =
+      Keyword.get(opts, :scoped_sweep_interval_ms, @default_scoped_sweep_interval_ms)
+
+    with :ok <- validate_limits(limits),
+         :ok <- validate_scoped_sweep_interval(scoped_sweep_interval_ms) do
       counters = :atomics.new(length(@resources), signed: true)
       waiter_counters = :atomics.new(length(@resources), signed: false)
 
@@ -155,12 +197,21 @@ defmodule FerricstoreServer.Native.ResourceBudget do
           {:read_concurrency, true}
         ])
 
+      scoped_owner_leases =
+        :ets.new(:native_resource_budget_scoped_owner_leases, [
+          :set,
+          :public,
+          {:read_concurrency, true},
+          {:write_concurrency, :auto}
+        ])
+
       budget = %{
         coordinator: self(),
         counters: counters,
         waiter_counters: waiter_counters,
         leases: leases,
         owner_leases: owner_leases,
+        scoped_owner_leases: scoped_owner_leases,
         tracked_owners: tracked_owners,
         limits: limits
       }
@@ -172,17 +223,20 @@ defmodule FerricstoreServer.Native.ResourceBudget do
 
       Enum.each(registry_keys, &:persistent_term.put(&1, budget))
 
-      {:ok,
-       %{
-         budget: budget,
-         registry_keys: registry_keys,
-         owner_monitors: %{},
-         monitors: %{},
-         waiter_queues: Map.new(@resources, &{&1, :queue.new()}),
-         waiting: %{},
-         waiting_by_owner: %{},
-         waiting_counts: Map.new(@resources, &{&1, 0})
-       }}
+      state = %{
+        budget: budget,
+        registry_keys: registry_keys,
+        scoped_sweep_interval_ms: scoped_sweep_interval_ms,
+        owner_monitors: %{},
+        monitors: %{},
+        waiter_queues: Map.new(@resources, &{&1, :queue.new()}),
+        waiting: %{},
+        waiting_by_owner: %{},
+        waiting_counts: Map.new(@resources, &{&1, 0})
+      }
+
+      schedule_scoped_sweep(state)
+      {:ok, state}
     else
       {:error, reason} -> {:stop, reason}
     end
@@ -227,6 +281,11 @@ defmodule FerricstoreServer.Native.ResourceBudget do
   def handle_call({:resize, token, amount}, _from, state),
     do: {:reply, resize_fast_lease(state.budget, token, amount), state}
 
+  def handle_call({:reclaim_scoped, resource}, _from, state) do
+    state = reclaim_dead_scoped_owners(state, resource)
+    {:reply, :ok, state}
+  end
+
   def handle_call({:release, token}, _from, state),
     do: {:reply, :ok, release_and_grant_waiters(state, token)}
 
@@ -256,6 +315,12 @@ defmodule FerricstoreServer.Native.ResourceBudget do
   end
 
   @impl true
+  def handle_info(:sweep_scoped_leases, state) do
+    state = reclaim_dead_scoped_owners(state, :all)
+    schedule_scoped_sweep(state)
+    {:noreply, state}
+  end
+
   def handle_info({:DOWN, monitor_ref, :process, owner, _reason}, state) do
     case Map.get(state.monitors, monitor_ref) do
       ^owner ->
@@ -325,6 +390,74 @@ defmodule FerricstoreServer.Native.ResourceBudget do
             {:error, {:limit, resource}}
         end
     end
+  end
+
+  defp grant_scoped_lease(budget, resource, amount) do
+    if resource in @resources do
+      case reserve(budget, resource, amount) do
+        :ok -> register_scoped_lease(budget, self(), resource, amount)
+        {:error, :limit} -> reclaim_and_retry_scoped_lease(budget, resource, amount)
+      end
+    else
+      {:error, {:unknown_resource, resource}}
+    end
+  end
+
+  defp reclaim_and_retry_scoped_lease(budget, resource, amount) do
+    with :ok <- request_scoped_reclamation(budget.coordinator, resource),
+         :ok <- reserve(budget, resource, amount) do
+      register_scoped_lease(budget, self(), resource, amount)
+    else
+      {:error, :limit} -> {:error, {:limit, resource}}
+      {:error, _reason} -> {:error, :resource_budget_unavailable}
+    end
+  end
+
+  defp request_scoped_reclamation(coordinator, _resource) when coordinator == self(),
+    do: {:error, :resource_budget_unavailable}
+
+  defp request_scoped_reclamation(coordinator, resource) do
+    GenServer.call(coordinator, {:reclaim_scoped, resource})
+  catch
+    :exit, _reason -> {:error, :resource_budget_unavailable}
+  end
+
+  defp register_scoped_lease(budget, owner, resource, amount) do
+    key = {owner, resource}
+
+    try do
+      _owner_amount =
+        :ets.update_counter(budget.scoped_owner_leases, key, {2, amount}, {key, 0})
+
+      reference = make_ref()
+      Process.put({@scoped_lease_key, reference}, {budget, resource, amount})
+
+      {:ok, %ScopedLease{owner: owner, reference: reference}}
+    rescue
+      ArgumentError ->
+        release_amount(budget, resource, amount)
+        {:error, :resource_budget_unavailable}
+    end
+  end
+
+  defp release_scoped_lease(budget, owner, resource, amount) do
+    case decrement_scoped_owner_lease(budget.scoped_owner_leases, owner, resource, amount) do
+      :ok ->
+        release_amount(budget, resource, amount)
+        notify_capacity(budget, resource)
+
+      :unavailable ->
+        :ok
+    end
+  end
+
+  defp decrement_scoped_owner_lease(table, owner, resource, amount) do
+    key = {owner, resource}
+    remaining = :ets.update_counter(table, key, {2, -amount})
+    if remaining == 0, do: :ets.delete_object(table, {key, 0})
+    :ok
+  rescue
+    ArgumentError -> :unavailable
   end
 
   defp resize_fast_lease(budget, token, amount) do
@@ -467,7 +600,11 @@ defmodule FerricstoreServer.Native.ResourceBudget do
   end
 
   defp notify_capacity(budget, resource) do
-    GenServer.cast(budget.coordinator, {:capacity_available, resource})
+    if waiter_count(budget, resource) > 0 do
+      GenServer.cast(budget.coordinator, {:capacity_available, resource})
+    end
+
+    :ok
   end
 
   defp usage_snapshot(budget) do
@@ -508,7 +645,7 @@ defmodule FerricstoreServer.Native.ResourceBudget do
   defp lookup_budget(server) do
     case :persistent_term.get(registry_key(server), :missing) do
       %{coordinator: coordinator, leases: leases} = budget ->
-        if Process.alive?(coordinator) and :ets.info(leases) != :undefined do
+        if :ets.info(leases, :owner) == coordinator do
           {:ok, budget}
         else
           {:error, :resource_budget_unavailable}
@@ -519,6 +656,17 @@ defmodule FerricstoreServer.Native.ResourceBudget do
     end
   rescue
     ArgumentError -> {:error, :resource_budget_unavailable}
+  end
+
+  # Scoped registration touches its ETS table before returning a lease and
+  # rolls back the atomic reservation if that table has disappeared. Avoiding
+  # a duplicate liveness probe keeps the per-request execution path lock-free
+  # while preserving fail-closed behavior during coordinator shutdown.
+  defp lookup_scoped_budget(server) do
+    case :persistent_term.get(registry_key(server), :missing) do
+      %{coordinator: _coordinator} = budget -> {:ok, budget}
+      :missing -> {:error, :resource_budget_unavailable}
+    end
   end
 
   defp registry_key(server), do: {__MODULE__, :budget, server}
@@ -544,6 +692,10 @@ defmodule FerricstoreServer.Native.ResourceBudget do
     waiter_ref = make_ref()
     state = ensure_owner_monitor(state, owner)
     :atomics.add(state.budget.waiter_counters, Map.fetch!(@resource_indexes, resource), 1)
+
+    # Close the race where capacity is released after the failed fast acquire
+    # but before this waiter becomes visible to release-side notifications.
+    GenServer.cast(self(), {:capacity_available, resource})
 
     %{
       state
@@ -653,7 +805,10 @@ defmodule FerricstoreServer.Native.ResourceBudget do
         maybe_compact_waiter_queue(acc, resource)
       end)
 
-    released_resources = release_owner_leases(state.budget, owner)
+    released_resources =
+      state.budget
+      |> release_owner_leases(owner)
+      |> MapSet.union(release_scoped_owner_leases(state.budget, owner))
 
     Enum.reduce(released_resources, state, fn resource, acc ->
       grant_waiters(acc, resource)
@@ -694,6 +849,77 @@ defmodule FerricstoreServer.Native.ResourceBudget do
           resources
       end
     end)
+  end
+
+  defp release_scoped_owner_leases(budget, owner) do
+    rows =
+      try do
+        :ets.match_object(budget.scoped_owner_leases, {{owner, :_}, :_})
+      rescue
+        ArgumentError -> []
+      end
+
+    Enum.reduce(rows, MapSet.new(), fn {{^owner, resource} = key, _amount}, resources ->
+      case safe_take_lease(budget.scoped_owner_leases, key) do
+        [{^key, amount}] ->
+          release_amount(budget, resource, amount)
+          MapSet.put(resources, resource)
+
+        _already_released ->
+          resources
+      end
+    end)
+  end
+
+  defp reclaim_dead_scoped_owners(state, requested_resource) do
+    rows =
+      try do
+        :ets.tab2list(state.budget.scoped_owner_leases)
+      rescue
+        ArgumentError -> []
+      end
+
+    released_resources =
+      Enum.reduce(rows, MapSet.new(), fn row, resources ->
+        reclaim_dead_scoped_owner(row, resources, state.budget, requested_resource)
+      end)
+
+    Enum.reduce(released_resources, state, fn resource, acc ->
+      grant_waiters(acc, resource)
+    end)
+  end
+
+  defp reclaim_dead_scoped_owner(
+         {{owner, resource} = key, _amount},
+         resources,
+         budget,
+         requested_resource
+       ) do
+    if scoped_resource_requested?(resource, requested_resource) and not Process.alive?(owner) do
+      reclaim_scoped_owner_lease(key, resource, resources, budget)
+    else
+      resources
+    end
+  end
+
+  defp reclaim_scoped_owner_lease(key, resource, resources, budget) do
+    case safe_take_lease(budget.scoped_owner_leases, key) do
+      [{^key, amount}] ->
+        release_amount(budget, resource, amount)
+        MapSet.put(resources, resource)
+
+      _already_released ->
+        resources
+    end
+  end
+
+  defp scoped_resource_requested?(_resource, :all), do: true
+  defp scoped_resource_requested?(resource, resource), do: true
+  defp scoped_resource_requested?(_resource, _requested), do: false
+
+  defp schedule_scoped_sweep(state) do
+    Process.send_after(self(), :sweep_scoped_leases, state.scoped_sweep_interval_ms)
+    :ok
   end
 
   defp maybe_compact_waiter_queue(state, resource) do
@@ -761,4 +987,10 @@ defmodule FerricstoreServer.Native.ResourceBudget do
       resource -> {:error, {:invalid_resource_limit, resource, Map.get(limits, resource)}}
     end
   end
+
+  defp validate_scoped_sweep_interval(interval) when is_integer(interval) and interval > 0,
+    do: :ok
+
+  defp validate_scoped_sweep_interval(interval),
+    do: {:error, {:invalid_scoped_sweep_interval_ms, interval}}
 end

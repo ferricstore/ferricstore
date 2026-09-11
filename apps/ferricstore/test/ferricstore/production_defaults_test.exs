@@ -192,9 +192,9 @@ defmodule Ferricstore.ProductionDefaultsTest do
              ~r/FROM rust:\$\{RUST_VERSION\}-slim-bookworm@sha256:[0-9a-f]{64} AS rust-toolchain/
 
     assert dockerfile =~
-             ~r/FROM hexpm\/elixir:1\.19\.5-erlang-28\.4\.1-ubuntu-noble-20260217@sha256:[0-9a-f]{64} AS builder/
+             ~r/FROM hexpm\/elixir:1\.20\.4-erlang-29\.0\.5-ubuntu-noble-20260810@sha256:[0-9a-f]{64} AS builder/
 
-    assert dockerfile =~ ~r/FROM ubuntu:noble-20260217@sha256:[0-9a-f]{64}/
+    assert dockerfile =~ ~r/FROM ubuntu:noble-20260810@sha256:[0-9a-f]{64}/
 
     assert dockerfile =~ "COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo"
     assert dockerfile =~ "COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup"

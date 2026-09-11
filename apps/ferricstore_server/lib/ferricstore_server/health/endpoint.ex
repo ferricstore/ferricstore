@@ -68,8 +68,6 @@ defmodule FerricstoreServer.Health.Endpoint do
   alias FerricstoreServer.Health.Endpoint.Session
   alias FerricstoreServer.Health.Dashboard.Accounts
 
-  require Logger
-
   @listener_ref :"#{__MODULE__}"
   # ---------------------------------------------------------------------------
   # Public API

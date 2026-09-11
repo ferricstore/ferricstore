@@ -334,7 +334,7 @@ defmodule FerricstoreBench.NativePubSubClient do
     if byte_size(body_and_rest) < body_len do
       {Enum.reverse(frames), buffer}
     else
-      <<encoded_body::binary-size(body_len), rest::binary>> = body_and_rest
+      <<encoded_body::binary-size(^body_len), rest::binary>> = body_and_rest
       body = maybe_decompress(encoded_body, flags)
 
       case body do

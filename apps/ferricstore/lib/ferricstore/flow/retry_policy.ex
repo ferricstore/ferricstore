@@ -978,8 +978,6 @@ defmodule Ferricstore.Flow.RetryPolicy do
       old_max_attempts_states?(fetch_policy(policy, :states, "states", nil))
   end
 
-  defp old_max_attempts_policy?(_policy), do: false
-
   defp old_max_attempts_states?(states) when is_map(states) do
     Enum.any?(states, fn
       {_state, %{retry: retry}} when is_map(retry) -> old_max_attempts_retry?(retry)

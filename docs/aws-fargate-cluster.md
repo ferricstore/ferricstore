@@ -7,9 +7,9 @@ Implementation:
 [`deploy/aws/fargate-cluster`](https://github.com/ferricstore/ferricstore/tree/main/deploy/aws/fargate-cluster)
 
 The Terraform input intentionally has no default image. Use an image built from
-this repository revision or a later release and pin its digest. The older
-`0.11.5` image predates the stable release identity, periodic EPMD reconnect,
-and rollout recovery check required by this profile.
+this repository revision or a later release and pin its digest. The HTTP API
+requires `0.11.11` or later. Older images also predate parts of the stable
+release identity, periodic EPMD reconnect, and rollout recovery contract.
 
 ## What A Fargate Task Means
 
@@ -31,7 +31,7 @@ three independently failing processes and disks.
 
 ```mermaid
 flowchart TD
-  C["Clients in private network"] --> NLB["Internal Network Load Balancer"]
+  C["Native or HTTP clients<br/>in private network"] --> NLB["Internal Network Load Balancer"]
   NLB --> N0["node-0 ECS service / AZ A"]
   NLB --> N1["node-1 ECS service / AZ B"]
   NLB --> N2["node-2 ECS service / AZ C"]
@@ -47,8 +47,9 @@ flowchart TD
 ```
 
 Each slot has one stable logical node name, one Cloud Map A record, one ECS
-service, one task definition family, and one NLB target group. Its private IP
-and disk are replaceable implementation details.
+service, one task definition family, one native NLB target group, and an
+optional HTTP target group. Its private IP and disk are replaceable
+implementation details.
 
 ## How Nodes Discover One Another
 
@@ -82,6 +83,69 @@ AWS documents that each Fargate task receives its own ENI, ECS service discovery
 registers the task private IP, and the DNS form is
 `<service>.<namespace>`: [Fargate task networking](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/fargate-task-networking.html),
 [ECS service discovery](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-discovery.html).
+
+## HTTP API And Client Discovery
+
+Set `http_enabled = true` to run the in-process HTTP command listener on port
+`8080` in each of the same three FerricStore containers. This does not create a
+sidecar, another ECS service, or another FerricStore cluster. Terraform adds:
+
+- the HTTP port and environment to every node task definition;
+- one HTTP IP target group per stable slot;
+- a second listener on the existing internal NLB; and
+- a second ECS target-group registration for each service.
+
+HTTP clients use the single `http_endpoint` output, not task IPs or per-node
+Cloud Map names. ECS re-registers a replacement task's new ENI address in both
+target groups, while the NLB DNS name remains unchanged. Amazon ECS supports
+multiple target groups for Fargate services and requires `ip` targets for
+`awsvpc` tasks: [multiple target groups](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/register-multiple-targetgroups.html),
+[NLB with ECS](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/nlb.html).
+
+The API uses the same command gateway and replicated ACL catalog as the native
+protocol. `POST /v1/commands` always requires HTTP Basic credentials. Create a
+least-privilege ACL identity through a trusted native administration connection
+before enabling application traffic. `GET /health`, `GET /ready`, and the HTTP
+listener's `GET /metrics` do not require credentials, so the NLB must remain
+internal and `allowed_client_cidr_blocks` must be kept narrow.
+
+The stack does not provision application users through Terraform. Send `ACL
+SETUSER` once through a VPC-connected native FerricStore client after cluster
+readiness; the committed user is then available on every node through the
+replicated ACL catalog. See the stack
+[Create An HTTP User](../deploy/aws/fargate-cluster/README.md#create-an-http-user)
+procedure. A surviving quorum restores the user to a replacement node, while
+loss of every task-local replica loses it with the rest of the cluster data.
+
+Plain HTTP is supported only for a trusted private network. For client TLS,
+provide an ACM/IAM `http_tls_certificate_arn`, set `http_hostname` to a DNS name
+covered by that certificate, and normally use `http_listener_port = 443`. The
+operator must create that private DNS alias to the NLB. The NLB then terminates
+TLS 1.2/1.3 and forwards plaintext TCP to task port `8080` inside the private
+VPC. Application-native TLS is still required when policy demands encryption
+all the way to the task. AWS documents NLB certificate termination and TCP
+targets in [TLS listeners](https://docs.aws.amazon.com/elasticloadbalancing/latest/network/load-balancer-listeners.html).
+
+### Changing HTTP Mode On A Running Cluster
+
+Adding or removing an ECS target group starts a service deployment. A normal
+Terraform apply can update all three services concurrently, which is unsafe for
+task-local replica disks. For a live cluster, stage the change and let the
+guarded rollout combine the desired task definition and target-group list one
+slot at a time:
+
+1. Edit `http_enabled` and the related listener/TLS variables.
+2. When enabling, use a targeted apply for `aws_ecs_task_definition.node`,
+   `aws_lb_target_group.http`, and the two optional HTTP listener resources.
+   When disabling, target only `aws_ecs_task_definition.node` first.
+3. Run `scripts/deploy-sequential.sh`. It updates the task definition and exact
+   native/HTTP target-group list for one service, waits for ECS stability and
+   full replica recovery, and only then continues.
+4. Run a normal `terraform apply` to reconcile or remove remaining resources.
+
+The stack README contains the exact commands. This migration is separate from
+an ordinary image-only apply because the ECS load-balancer configuration itself
+can replace tasks.
 
 ## Replacement Sequence
 
@@ -131,8 +195,10 @@ reason to stop and replace its task. With task-local disks, a readiness-induced
 replacement loop would repeatedly erase a recovering replica and could cascade
 during a quorum outage.
 
-Therefore the ECS and NLB automation checks `/health/live`. Operators can use
-`/health/ready`; sequential upgrades use the stricter
+Therefore the ECS container and both native/HTTP NLB target groups check the
+isolated `/health/live` route on port `6381`. They do not use the API listener's
+overload-sensitive `/health` route. Operators can use `/health/ready` and the
+HTTP API's `/ready`; sequential upgrades use the stricter
 `Ferricstore.Cluster.Recovery.ready?()` check. This prioritizes retaining local
 replicas over hiding every recovering target from the NLB. Applications should
 retry transient errors during a replacement.
@@ -151,15 +217,17 @@ registers new revisions, and `skip_destroy` keeps the service's previous
 revision active so ECS can still replace its old task before the rollout reaches
 that slot. The supplied rollout script then:
 
-1. updates one service;
+1. updates one service with the latest task definition and desired native/HTTP
+   target-group list;
 2. waits for ECS stability;
 3. uses ECS Exec to poll the node's strict recovery status;
 4. refuses to continue if recovery does not converge; and
 5. repeats for the next slot.
 
-This protects image changes. Some Terraform changes to an ECS service, load
-balancer, network, or service registry can independently start a deployment;
-those changes require a one-slot-at-a-time maintenance plan.
+This protects image changes and the explicitly staged HTTP-mode migration.
+Other Terraform changes to an ECS service, load balancer, network, or service
+registry can independently start a deployment; those changes require their own
+one-slot-at-a-time maintenance plan.
 
 ## Storage And The No-S3/No-DynamoDB Decision
 
@@ -192,7 +260,8 @@ Production has separate TLS decisions for each traffic path:
 
 | Traffic path | Minimum production treatment |
 |---|---|
-| SDK/client to NLB and node | FerricStore native TLS on `6389`, server certificate verification, and `FERRICSTORE_REQUIRE_TLS=true` |
+| Native SDK/client to NLB and node | FerricStore native TLS on `6389`, server certificate verification, and `FERRICSTORE_REQUIRE_TLS=true` |
+| HTTP client to NLB | Optional `http_tls_certificate_arn` enables NLB TLS termination; the hop to task port `8080` stays plaintext, as described under [HTTP API And Client Discovery](#http-api-and-client-discovery) |
 | Node to node Raft and cluster messages | Erlang distribution TLS on fixed port `9100`, or a tested ECS Service Connect TLS proxy path |
 | EPMD discovery on `4369` | Keep security-group-to-itself isolation; proxy it too if policy requires every inter-task byte encrypted |
 | Metrics and HTTP health endpoints | Keep private and security-group scoped; use a TLS sidecar/proxy if policy also requires encryption for observability traffic |
@@ -287,7 +356,7 @@ The task security group should continue to allow `9100` only from itself.
 EPMD on `4369` still exchanges discovery metadata in plaintext in this design;
 the Raft log, command values, process messages, and other Erlang distribution
 payloads use TLS on `9100`. See the complete configuration and security
-requirements in [Node-to-Node TLS](../guides/security.md#node-to-node-tls-erlang-distribution).
+requirements in [Node-to-Node TLS](../guides/security.md#step-4-enable-tls-for-distribution).
 
 ### Alternative Cluster Path: ECS Service Connect TLS
 
@@ -330,12 +399,15 @@ at the two agents in [Verifying Service Connect TLS](https://docs.aws.amazon.com
 
 Certificates and private keys must not live only on a task's replaceable disk,
 inside the container image, or in Terraform state. For native TLS, store the
-PEM material in Secrets Manager or another durable secrets system and add an
-essential init container that writes it into a task-scoped shared volume before
-FerricStore starts. Give the init container only the required
-`secretsmanager:GetSecretValue` and KMS permissions, prevent it from logging
-secret values, and make private-key files readable only by the FerricStore
-runtime user.
+PEM material in Secrets Manager or another durable secrets system and add a
+nonessential init container that writes it into a task-scoped shared volume.
+Make the FerricStore container depend on the init container with the `SUCCESS`
+condition so it cannot start unless certificate delivery exits successfully.
+ECS does not allow a `SUCCESS` dependency on an essential container:
+[container dependencies](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_ContainerDependency.html).
+Grant the task role only the required `secretsmanager:GetSecretValue` and KMS
+permissions, prevent the init container from logging secret values, and make
+private-key files readable only by the FerricStore runtime user.
 
 ECS secret values injected at container start do not update inside an existing
 task after rotation. AWS requires a new task or forced deployment to receive
@@ -363,8 +435,9 @@ Complete these checks before calling the deployment production-ready:
   metadata to all three stable node names, and can read and write through each.
 - Plaintext native connections to `6388` are rejected and the security group no
   longer admits client traffic on that port.
-- An SDK using an unknown CA, wrong server name, or missing client certificate
-  fails closed before authentication.
+- An SDK using an unknown CA or wrong server name fails closed before
+  authentication. When mTLS is enabled, a missing client certificate also
+  fails closed.
 - A node using an unknown CA certificate cannot join; a node with the correct
   certificate but wrong cookie also cannot join.
 - A one-slot task replacement gets a new IP, reconnects with TLS, catches up
@@ -388,6 +461,8 @@ port, `6380`. Prometheus should scrape every stable Cloud Map node name directly
 
 Do not scrape only the NLB. The NLB can route consecutive scrapes to different
 tasks, which hides a missing replica and mixes three processes into one target.
+The optional HTTP API's `/metrics` route is also load-balanced and focuses on
+HTTP listener activity; it is not a replacement for per-node cluster scraping.
 The scraper must run in the VPC, a connected network that can resolve the
 private namespace, or as another ECS/Fargate service in the VPC.
 
@@ -572,7 +647,11 @@ Amazon Managed Service for Prometheus in its
 - Zero-error traffic draining while a live node is still catching up; the NLB
   uses liveness to avoid destructive replacement loops.
 - Automatic serialization of arbitrary infrastructure changes outside the
-  supplied task-definition rollout.
+  supplied task-definition/HTTP-mode rollout.
+- Durable ACL bootstrap independent of the three task disks. ACL changes are
+  replicated, but losing all replicas loses that catalog with the data.
+- Native-protocol TLS or end-to-end application TLS. The optional NLB TLS
+  listener protects HTTP clients but forwards over the private VPC in plaintext.
 - Turnkey ACL bootstrap, certificate issuance/rotation, or Service Connect
   wiring. The baseline keeps the endpoint internal and disables protected mode;
   operators must implement and test the production TLS plan above.

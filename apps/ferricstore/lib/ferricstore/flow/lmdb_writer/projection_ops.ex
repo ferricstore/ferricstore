@@ -656,10 +656,25 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     )
   end
 
-  defp expand_missing_flow_query_state_projection(projection_state, state_key, acc) do
-    with {:ok, query_row_ops} <- query_row_delete_ops(state_key) do
-      acc = prepend_ops(acc, query_row_ops)
-      expand_composite_removal(projection_state, state_key, acc)
+  defp expand_missing_flow_query_state_projection(
+         %{path: path} = projection_state,
+         state_key,
+         acc
+       ) do
+    with {:ok, terminal_key, acc} <- terminal_reverse_value(path, state_key, acc) do
+      if is_binary(terminal_key) do
+        # Terminal state is deliberately pruned from the hot source after its durable
+        # projection lands. A later query-only outbox item can therefore observe a
+        # source miss even though the terminal row is still retained. Preserve that
+        # row while its atomic terminal reverse marker exists; retention cleanup
+        # removes the marker before a real query-row deletion is allowed.
+        {:ok, acc}
+      else
+        with {:ok, query_row_ops} <- query_row_delete_ops(state_key) do
+          acc = prepend_ops(acc, query_row_ops)
+          expand_composite_removal(projection_state, state_key, acc)
+        end
+      end
     end
   end
 
