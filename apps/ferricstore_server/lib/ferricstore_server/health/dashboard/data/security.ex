@@ -151,8 +151,6 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
     "#{MapSet.size(commands)} explicit commands"
   end
 
-  defp access_label(_user), do: "Restricted"
-
   defp unrestricted_keys?(:all), do: true
 
   defp unrestricted_keys?(patterns) when is_list(patterns) do

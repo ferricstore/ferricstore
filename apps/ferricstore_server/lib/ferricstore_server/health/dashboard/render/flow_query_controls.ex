@@ -531,7 +531,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
            form |> Map.get(:error_positions, %{}) |> Map.get(field),
          text when is_binary(text) <- Map.get(form, field),
          true <- byte <= byte_size(text) + 1,
-         <<prefix::binary-size(byte - 1), rest::binary>> <- text,
+         prefix_size = byte - 1,
+         <<prefix::binary-size(^prefix_size), rest::binary>> <- text,
          true <- String.valid?(prefix) do
       next =
         case String.next_codepoint(rest) do
