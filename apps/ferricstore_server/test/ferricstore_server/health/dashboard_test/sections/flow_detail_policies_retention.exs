@@ -749,7 +749,12 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
           assert String.contains?(html, "retention-flow-1")
           assert String.contains?(html, "active-timeout-flow-1")
           assert String.contains?(html, "Active Timeouts")
-          assert String.contains?(html, "Active timeouts consume the shared limit before terminal deletions")
+
+          assert String.contains?(
+                   html,
+                   "Active timeouts consume the shared limit before terminal deletions"
+                 )
+
           assert String.contains?(html, "Global record limit")
           refute String.contains?(html, "Active Flow records are not touched")
         end
@@ -793,16 +798,22 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
           refute_received {:retention_cleanup, _opts}
 
           assert {:ok, :review, review} =
-                   Dashboard.apply_flow_retention_form(%{"action" => "review_cleanup", "limit" => "7"})
+                   Dashboard.apply_flow_retention_form(%{
+                     "action" => "review_cleanup",
+                     "limit" => "7"
+                   })
+
           refute_received {:retention_cleanup, _opts}
           fields = Map.new(review, fn {key, value} -> {to_string(key), to_string(value)} end)
 
           assert {:ok, :cleanup, %{active_timeouts: 4, flows: 1, history: 2, values: 3, limit: 7}} =
-                   Dashboard.apply_flow_retention_form(Map.merge(fields, %{
-                     "action" => "cleanup",
-                     "limit" => "7",
-                     "confirm_cleanup" => "true"
-                   }))
+                   Dashboard.apply_flow_retention_form(
+                     Map.merge(fields, %{
+                       "action" => "cleanup",
+                       "limit" => "7",
+                       "confirm_cleanup" => "true"
+                     })
+                   )
 
           assert_received {:retention_cleanup, [limit: 7]}
         end

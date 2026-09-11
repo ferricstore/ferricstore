@@ -284,7 +284,9 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
 
     case data.client_coverage.status do
       :invalid_filters ->
-        {:error, :invalid_filters, "Search must be 256 characters or fewer; restart invalid pagination."}
+        {:error, :invalid_filters,
+         "Search must be 256 characters or fewer; restart invalid pagination."}
+
       _ ->
         live_component_payload(%{
           "clients_summary" => render_clients_summary(data.connections, data.clients),
@@ -294,7 +296,8 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   end
 
   def slowlog_payload(%{slowlog_status: :unavailable}) do
-    {:error, :invalid_filters, "Slow Log collection failed. Last successful samples retained; retry to refresh."}
+    {:error, :invalid_filters,
+     "Slow Log collection failed. Last successful samples retained; retry to refresh."}
   end
 
   def slowlog_payload(data) do

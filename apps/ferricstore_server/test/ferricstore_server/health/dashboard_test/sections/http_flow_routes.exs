@@ -319,10 +319,20 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
           end)
 
           review_response =
-            http_post_form(port, "/dashboard/flow/retention", %{"action" => "review_cleanup", "limit" => "3"})
+            http_post_form(port, "/dashboard/flow/retention", %{
+              "action" => "review_cleanup",
+              "limit" => "3"
+            })
+
           assert extract_status_code(review_response) == 302
           refute_received {:retention_cleanup, _opts}
-          review_fields = review_response |> extract_header("location") |> URI.parse() |> Map.fetch!(:query) |> URI.decode_query()
+
+          review_fields =
+            review_response
+            |> extract_header("location")
+            |> URI.parse()
+            |> Map.fetch!(:query)
+            |> URI.decode_query()
 
           response =
             http_post_form(port, "/dashboard/flow/retention", %{

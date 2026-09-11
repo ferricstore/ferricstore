@@ -49,7 +49,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Signals do
     count_label =
       if mode == :page and not Map.get(filters, :scan_history, false),
         do: "Not scanned",
-        else: "#{format_number(event_count)} signal #{if event_count == 1, do: "event", else: "events"}"
+        else:
+          "#{format_number(event_count)} signal #{if event_count == 1, do: "event", else: "events"}"
 
     title = title <> ~s( <span class="badge badge-idle">#{count_label}</span>)
 

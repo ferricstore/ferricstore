@@ -238,7 +238,9 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
       })
 
     assert flash_html =~ ~s(data-dashboard-transient-query="status,count,message")
-    assert FerricstoreServer.Health.Dashboard.Layout.dashboard_live_script() =~ "window.history.replaceState"
+
+    assert FerricstoreServer.Health.Dashboard.Layout.dashboard_live_script() =~
+             "window.history.replaceState"
   end
 
   test "guided stats requires the state predicate it actually counts" do

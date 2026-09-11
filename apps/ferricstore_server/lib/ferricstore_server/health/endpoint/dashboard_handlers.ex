@@ -276,6 +276,7 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
     if Auth.observability_authorized?(peer, headers) do
       data = Dashboard.collect_clients_page(QueryDecoder.decode(query))
       body = Dashboard.render_clients_page(data)
+
       if data.client_coverage.status == :invalid_filters do
         Response.send_html_response(socket, transport, 422, "Unprocessable Content", body)
       else

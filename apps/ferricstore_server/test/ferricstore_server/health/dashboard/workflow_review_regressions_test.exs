@@ -133,7 +133,10 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowReviewRegressionsTest do
     assert controls =~ ~s(value="review_cleanup")
     assert controls =~ "Global record limit"
 
-    review = FerricstoreServer.Health.Dashboard.Flow.RetentionReview.prepare(3) |> Map.put(:kind, :review)
+    review =
+      FerricstoreServer.Health.Dashboard.Flow.RetentionReview.prepare(3)
+      |> Map.put(:kind, :review)
+
     reviewed = FlowRetention.render_flow_retention_controls(%{flash: review})
     assert reviewed =~ ~r/name="confirm_cleanup"[^>]*required/
     assert reviewed =~ ~s(value="cleanup")

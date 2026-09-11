@@ -530,7 +530,10 @@ defmodule FerricstoreServer.Health.Endpoint do
 
         requirement =
           if Map.get(params, "review_only") == "true" do
-            [requirement, FerricstoreServer.Health.Dashboard.Flow.Governance.review_requirement(params)]
+            [
+              requirement,
+              FerricstoreServer.Health.Dashboard.Flow.Governance.review_requirement(params)
+            ]
           else
             requirement
           end
@@ -545,7 +548,8 @@ defmodule FerricstoreServer.Health.Endpoint do
 
             if Map.get(params, "review_only") == "true" do
               {result, data} =
-                FerricstoreServer.Health.Dashboard.Flow.Governance.review_page(params,
+                FerricstoreServer.Health.Dashboard.Flow.Governance.review_page(
+                  params,
                   Auth.dashboard_collect_opts(peer, headers)
                 )
 
@@ -560,12 +564,17 @@ defmodule FerricstoreServer.Health.Endpoint do
                    ) do
                 {:ok, _} = result ->
                   location =
-                    FerricstoreServer.Health.Dashboard.Flow.Governance.redirect_location(params, result)
+                    FerricstoreServer.Health.Dashboard.Flow.Governance.redirect_location(
+                      params,
+                      result
+                    )
 
                   send_redirect_response(socket, transport, location)
 
                 {:error, reason} ->
-                  data = FerricstoreServer.Health.Dashboard.Flow.Governance.error_page(params, reason)
+                  data =
+                    FerricstoreServer.Health.Dashboard.Flow.Governance.error_page(params, reason)
+
                   body = FerricstoreServer.Health.Dashboard.render_flow_governance_page(data)
                   send_html_response(socket, transport, 422, "Unprocessable Entity", body)
               end
@@ -686,7 +695,10 @@ defmodule FerricstoreServer.Health.Endpoint do
             result = FerricstoreServer.Health.Dashboard.apply_flow_retention_form(params)
 
             location =
-              FerricstoreServer.Health.Dashboard.Flow.PolicyRetention.retention_redirect_location(params, result)
+              FerricstoreServer.Health.Dashboard.Flow.PolicyRetention.retention_redirect_location(
+                params,
+                result
+              )
 
             send_redirect_response(socket, transport, location)
 
