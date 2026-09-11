@@ -897,7 +897,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
       end
 
       defp flow_read_lmdb_records_including_expired(state, keys) do
-        flow_read_lmdb_records_at(state, keys, 0, include_expired: true)
+        flow_read_lmdb_records_at(state, keys, apply_now_ms(),
+          include_expired: true,
+          expired_query_row_fallback: true
+        )
       end
 
       defp flow_read_lmdb_records_at(state, keys, now_ms, opts) do

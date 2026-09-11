@@ -1615,6 +1615,18 @@ defmodule Ferricstore.FlowWriteContractTest do
              recovery_source
            )
 
+    assert Regex.match?(
+             ~r/:ok\s*=\s*Ferricstore\.Flow\.LMDBRebuilder\.reconcile_startup_shard\(/,
+             startup_source
+           )
+
+    assert length(
+             Regex.scan(
+               ~r/:ok\s*=\s*Ferricstore\.Flow\.LMDBRebuilder\.reconcile_startup_shard\(/,
+               recovery_source
+             )
+           ) == 2
+
     rebuild_source =
       Ferricstore.Test.SourceFiles.private_function_source!(
         recovery_source,

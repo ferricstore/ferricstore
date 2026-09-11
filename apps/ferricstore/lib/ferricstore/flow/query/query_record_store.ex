@@ -51,18 +51,32 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
       when is_map(ctx) and is_integer(shard_index) and shard_index >= 0 and is_binary(path) and
              path != "" and is_list(state_keys) and is_integer(now_ms) and now_ms >= 0 and
              is_integer(max_input_bytes) and max_input_bytes > 0 and is_list(opts) do
-    query_row_read = Keyword.get(opts, :query_row_read, &QueryRowStore.read_references_many/4)
+    expired_fallback? = Keyword.get(opts, :expired_query_row_fallback, false)
+
+    query_row_read =
+      Keyword.get(
+        opts,
+        :query_row_read,
+        if(expired_fallback?,
+          do: &QueryRowStore.read_many/4,
+          else: &QueryRowStore.read_references_many/4
+        )
+      )
+
     hydrate = Keyword.get(opts, :hydrate, &RecordHydrator.read_many/4)
     repair_locators = Keyword.get(opts, :repair_locators, &QueryRowRelocator.repair_many/4)
 
     with true <-
-           is_function(query_row_read, 4) and is_function(hydrate, 4) and
+           is_boolean(expired_fallback?) and is_function(query_row_read, 4) and
+             is_function(hydrate, 4) and
              is_function(repair_locators, 4),
          {:ok, include_expired?} <- include_expired_mode(opts),
+         true <- not expired_fallback? or include_expired?,
          row_visibility_ms = if(include_expired?, do: 0, else: now_ms),
          normalized_opts =
            opts
            |> Keyword.put(:include_expired, include_expired?)
+           |> Keyword.put(:expired_query_row_fallback, expired_fallback?)
            |> Keyword.put(:hydration_now_ms, now_ms)
            |> Keyword.put(:repair_locators, repair_locators),
          {:ok, hydration_opts} <- prepare_hydration_deadline(normalized_opts),
@@ -241,7 +255,16 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
           )
 
         {_attempt, true} ->
-          {:error, :query_storage_inconsistent}
+          if Keyword.fetch!(opts, :expired_query_row_fallback) do
+            restore_expired_query_row_records(
+              rows,
+              positions,
+              hydrated,
+              Keyword.fetch!(opts, :hydration_now_ms)
+            )
+          else
+            {:error, :query_storage_inconsistent}
+          end
 
         {_attempt, false} ->
           {:ok, records}
@@ -596,6 +619,43 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
        {%QueryRow{}, index} -> Map.fetch!(values, index)
        {%QueryRowReference{}, index} -> Map.fetch!(values, index)
      end)}
+  rescue
+    _error -> {:error, :query_storage_inconsistent}
+  end
+
+  defp restore_expired_query_row_records(rows, positions, hydrated, now_ms) do
+    hydrated_by_position = positions |> Enum.zip(hydrated) |> Map.new()
+
+    rows
+    |> Enum.with_index()
+    |> Enum.reduce_while({:ok, []}, fn
+      {nil, _index}, {:ok, acc} ->
+        {:cont, {:ok, [nil | acc]}}
+
+      {row, index}, {:ok, acc}
+      when is_struct(row, QueryRow) or is_struct(row, QueryRowReference) ->
+        case Map.fetch(hydrated_by_position, index) do
+          {:ok, record} when is_map(record) ->
+            {:cont, {:ok, [record | acc]}}
+
+          {:ok, nil}
+          when is_struct(row, QueryRow) and row.expire_at_ms > 0 and row.expire_at_ms <= now_ms ->
+            case QueryRow.internal_record(row) do
+              {:ok, record} -> {:cont, {:ok, [record | acc]}}
+              :error -> {:halt, {:error, :query_storage_inconsistent}}
+            end
+
+          _missing_or_live ->
+            {:halt, {:error, :query_storage_inconsistent}}
+        end
+
+      {_invalid, _index}, _acc ->
+        {:halt, {:error, :query_storage_inconsistent}}
+    end)
+    |> case do
+      {:ok, records} -> {:ok, Enum.reverse(records)}
+      {:error, _reason} = error -> error
+    end
   rescue
     _error -> {:error, :query_storage_inconsistent}
   end

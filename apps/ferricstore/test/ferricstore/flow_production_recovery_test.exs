@@ -6,6 +6,7 @@ defmodule Ferricstore.FlowProductionRecoveryTest do
   @moduletag :shard_kill
   @moduletag timeout: 180_000
 
+  alias Ferricstore.Flow.{Keys, LMDB}
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
@@ -228,6 +229,29 @@ defmodule Ferricstore.FlowProductionRecoveryTest do
 
     assert {:ok, nil} = FerricStore.flow_get(id, partition_key: partition)
     assert {:ok, %{records: []}} = FerricStore.flow_query(query, params)
+
+    restarted_ctx = FerricStore.Instance.get(:default)
+    state_key = Keys.state_key(id, partition)
+    shard_index = Router.shard_for(restarted_ctx, state_key)
+
+    lmdb_path =
+      isolated.tmp_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> LMDB.path()
+
+    case LMDB.get(lmdb_path, state_key) do
+      :not_found -> :ok
+      {:ok, _stale_query_row} -> :ok
+    end
+
+    assert {:ok, _cleanup} =
+             FerricStore.flow_retention_cleanup(limit: 10, now_ms: cancel_now_ms + 10_000)
+
+    assert :ok =
+             ShardHelpers.eventually(
+               fn -> LMDB.get(lmdb_path, state_key) == :not_found end,
+               "retention should delete the expired QueryRow after its WAL source is retired"
+             )
   end
 
   defp start_background_projection_work(ctx) do

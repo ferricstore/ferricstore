@@ -141,27 +141,87 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
 
   test "expired LMDB-only state with a retired source does not block startup", test_ctx do
     expired_at_ms = System.system_time(:millisecond) - 1
+    owned_ref = Keys.value_key("expired-lmdb-source", :result, 1, "tenant")
 
     rec =
       record("expired-lmdb-source",
         state: "cancelled",
         next_run_at_ms: nil,
         terminal_retention_until_ms: expired_at_ms,
-        payload_ref: shared_ref("expired-lmdb-source")
+        payload_ref: shared_ref("expired-lmdb-source"),
+        result_ref: owned_ref
       )
 
     state_key = insert_unhydratable_lmdb_record!(test_ctx, rec, expired_at_ms)
+    registry_key = Keys.shared_value_ref_registry_key(rec.id, rec.partition_key)
+    cleanup_index = Keys.retention_cleanup_index_key(rec.id, rec.partition_key)
+    cleanup_member = Keys.retention_cleanup_member_key(rec.id, owned_ref, rec.partition_key)
+
+    append_primary!(test_ctx, [
+      {owned_ref, Flow.encode_value("result")},
+      {registry_key, :erlang.term_to_binary([rec.payload_ref], [:deterministic])},
+      {cleanup_member, Ferricstore.Flow.RetentionCleanupMember.encode(cleanup_index, owned_ref)}
+    ])
 
     assert :ok = run!(test_ctx)
     assert :ets.member(test_ctx.keydir, Keys.shared_value_ref_backfill_key(0))
-    refute :ets.member(test_ctx.keydir, Keys.retention_guard_key(rec.id, rec.partition_key))
+    assert :ets.member(test_ctx.keydir, Keys.retention_guard_key(rec.id, rec.partition_key))
 
-    refute :ets.member(
+    assert :ets.member(
              test_ctx.keydir,
              Keys.shared_value_ref_registry_key(rec.id, rec.partition_key)
            )
 
+    native = NativeOrderedIndex.get(test_ctx.flow_index, test_ctx.flow_lookup)
+
+    assert :ets.member(test_ctx.keydir, cleanup_member)
+    assert 1 == NativeOrderedIndex.count_all(native, cleanup_index)
+
     assert {:ok, _query_row} = LMDB.get(LMDB.path(test_ctx.shard_path), state_key)
+  end
+
+  test "LMDB state deleted after discovery fails closed", test_ctx do
+    rec = record("deleted-after-discovery")
+    state_key = insert_lmdb_record!(test_ctx, rec)
+    lmdb_path = LMDB.path(test_ctx.shard_path)
+
+    Application.put_env(:ferricstore, :flow_shared_ref_backfill_phase_hook, fn
+      {:read_batch, :scan_lmdb_states, _metadata} ->
+        assert :ok = LMDB.write_batch(lmdb_path, [{:delete, state_key}])
+
+      _event ->
+        :ok
+    end)
+
+    assert_raise RuntimeError, ~r/shared-ref backfill.*LMDB QueryRow/i, fn ->
+      run!(test_ctx)
+    end
+
+    refute :ets.member(test_ctx.keydir, Keys.shared_value_ref_backfill_key(0))
+  end
+
+  test "expired scoped LMDB state preserves its physical retention identity", test_ctx do
+    expired_at_ms = System.system_time(:millisecond) - 1
+    scope = <<42::unsigned-big-64>>
+    assert {:ok, physical_partition} = StorageScope.physical_partition_key("tenant", scope)
+
+    rec =
+      record("expired-scoped-source",
+        state: "cancelled",
+        partition_key: physical_partition,
+        system_metadata: scope_metadata(42),
+        next_run_at_ms: nil,
+        terminal_retention_until_ms: expired_at_ms
+      )
+
+    insert_unhydratable_lmdb_record!(test_ctx, rec, expired_at_ms)
+
+    assert :ok = run!(test_ctx)
+
+    assert :ets.member(
+             test_ctx.keydir,
+             Keys.retention_guard_key(rec.id, physical_partition)
+           )
   end
 
   test "unexpired LMDB-only state with a missing source still fails closed", test_ctx do

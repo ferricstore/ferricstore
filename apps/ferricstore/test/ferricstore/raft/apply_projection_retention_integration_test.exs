@@ -8,6 +8,32 @@ defmodule Ferricstore.Raft.ApplyProjectionRetentionIntegrationTest do
 
   @retained_count 4_097
 
+  test "production compaction captures one expiry cutoff for retention and relocation" do
+    root = tmp_root()
+    keydir = :ets.new(:apply_projection_single_expiry_cutoff, [:ordered_set, :public])
+    ctx = %{data_dir: root, keydir_refs: {keydir}}
+    storage_root = Path.join([root, "waraft", "ferricstore_waraft_backend.1"])
+    lmdb_path = root |> Ferricstore.DataDir.shard_data_path(0) |> LMDB.path()
+    calls = :counters.new(1, [])
+
+    expiry_cutoff = fn ->
+      :counters.add(calls, 1, 1)
+      1_000
+    end
+
+    assert :ok =
+             WARaftStorage.__compact_apply_projection_log_for_test__(
+               storage_root,
+               ctx,
+               0,
+               2,
+               lmdb_path,
+               expiry_cutoff
+             )
+
+    assert :counters.get(calls, 1) == 1
+  end
+
   test "production compaction spills a large retention set without splitting one Raft frame" do
     root = tmp_root()
     keydir = :ets.new(:apply_projection_retention_integration, [:ordered_set, :public])

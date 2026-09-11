@@ -90,6 +90,64 @@ defmodule Ferricstore.Flow.Query.QueryRecordStoreTest do
              )
   end
 
+  test "retention can fall back to validated metadata for an expired row with a retired source" do
+    record = record("run-expired-retired", 2)
+    key = state_key(record)
+    expired_row = %{row(record, 10) | expire_at_ms: 500}
+    reads = :counters.new(1, [])
+
+    row_read = fn _path, [^key], 0, _max_bytes ->
+      :counters.add(reads, 1, 1)
+      {:ok, [expired_row], 100, true}
+    end
+
+    hydrate = fn _ctx, 0, [{^key, _locator}], opts ->
+      assert Keyword.fetch!(opts, :include_expired)
+      {:ok, [nil]}
+    end
+
+    assert {:ok, [^record], true} =
+             QueryRecordStore.read_many(context(), 0, "/lmdb", [key], 1_000, 10_000,
+               include_expired: true,
+               expired_query_row_fallback: true,
+               query_row_read: row_read,
+               hydrate: hydrate
+             )
+
+    assert :counters.get(reads, 1) == 2
+  end
+
+  test "expired fallback preserves successfully hydrated references in the same batch" do
+    expired = record("run-expired-mixed", 2)
+    live = record("run-live-mixed", 3)
+    expired_key = state_key(expired)
+    live_key = state_key(live)
+    expired_row = %{row(expired, 10) | expire_at_ms: 500}
+    live_reference = reference(live, 20)
+
+    row_read = fn _path, [^expired_key, ^live_key], 0, _max_bytes ->
+      {:ok, [expired_row, live_reference], 200, true}
+    end
+
+    hydrate = fn _ctx, 0, [{^expired_key, _}, {^live_key, _}], _opts ->
+      {:ok, [nil, live]}
+    end
+
+    assert {:ok, [^expired, ^live], true} =
+             QueryRecordStore.read_many(
+               context(),
+               0,
+               "/lmdb",
+               [expired_key, live_key],
+               1_000,
+               10_000,
+               include_expired: true,
+               expired_query_row_fallback: true,
+               query_row_read: row_read,
+               hydrate: hydrate
+             )
+  end
+
   test "rejects a non-boolean include-expired mode before reading storage" do
     key = state_key(record("run-invalid-expiry-mode", 1))
 

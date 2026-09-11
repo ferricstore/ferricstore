@@ -4,6 +4,7 @@ defmodule Ferricstore.Flow.LMDBRebuilderTest do
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.LMDBFlushCoordinator
   alias Ferricstore.Flow.LMDBRebuilder
+  alias Ferricstore.Flow.LMDBWriter
   alias Ferricstore.Flow.Locator
 
   alias Ferricstore.Flow.Query.{
@@ -172,6 +173,183 @@ defmodule Ferricstore.Flow.LMDBRebuilderTest do
     send(holder.pid, :release_reconcile_holder)
     assert :ok = Task.await(holder)
     assert :ok = Task.await(reconcile)
+  end
+
+  test "default startup keeps its shard permit through shared-ref backfill" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lmdb_startup_backfill_permit_#{System.unique_integer([:positive])}"
+      )
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+    active_file_path = Ferricstore.Store.Shard.ETS.file_path(shard_path, 0)
+    File.touch!(active_file_path)
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:put, "seed", <<1>>}])
+    assert :ok = Ferricstore.Flow.LMDB.release(lmdb_path)
+    assert Ferricstore.Flow.LMDB.env_present?(lmdb_path)
+
+    keydir = :ets.new(:lmdb_startup_backfill_permit_keydir, [:set, :public])
+    parent = self()
+    blocked = :atomics.new(1, [])
+    previous_hook = Application.get_env(:ferricstore, :flow_shared_ref_backfill_lmdb_hook)
+
+    Application.put_env(:ferricstore, :flow_shared_ref_backfill_lmdb_hook, fn
+      :write_batch, [path, ops] ->
+        if :atomics.exchange(blocked, 1, 1) == 0 do
+          send(parent, :startup_backfill_blocked)
+
+          receive do
+            :release_startup_backfill -> :ok
+          end
+        end
+
+        Ferricstore.Flow.LMDB.write_batch(path, ops)
+
+      _operation, _args ->
+        :passthrough
+    end)
+
+    on_exit(fn ->
+      case previous_hook do
+        nil -> Application.delete_env(:ferricstore, :flow_shared_ref_backfill_lmdb_hook)
+        hook -> Application.put_env(:ferricstore, :flow_shared_ref_backfill_lmdb_hook, hook)
+      end
+
+      Ferricstore.Flow.LMDB.release(lmdb_path)
+      File.rm_rf!(data_dir)
+    end)
+
+    startup =
+      Task.async(fn ->
+        LMDBRebuilder.reconcile_startup_shard(
+          shard_path,
+          keydir,
+          0,
+          %{name: :default, data_dir: data_dir},
+          nil,
+          nil,
+          nil,
+          nil,
+          active_file_id: 0,
+          active_file_path: active_file_path
+        )
+      end)
+
+    assert_receive :startup_backfill_blocked, 5_000
+
+    contender =
+      Task.async(fn ->
+        LMDBFlushCoordinator.with_shard_permit(:default, 0, fn ->
+          send(parent, :startup_contender_acquired)
+          :ok
+        end)
+      end)
+
+    contender_blocked? = Task.yield(contender, 100) == nil
+    send(startup.pid, :release_startup_backfill)
+
+    assert :ok = Task.await(startup, 5_000)
+    assert :ok = Task.await(contender, 5_000)
+    assert_receive :startup_contender_acquired
+    assert contender_blocked?
+  end
+
+  test "named-instance startup completes shared-ref backfill" do
+    unique = System.unique_integer([:positive, :monotonic])
+    instance_name = String.to_atom("lmdb_named_startup_#{unique}")
+    data_dir = Path.join(System.tmp_dir!(), "ferricstore_lmdb_named_startup_#{unique}")
+
+    start_supervised!({LMDBFlushCoordinator, instance_name: instance_name})
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+    active_file_path = Ferricstore.Store.Shard.ETS.file_path(shard_path, 0)
+    File.touch!(active_file_path)
+    keydir = :ets.new(:lmdb_named_startup_keydir, [:set, :public])
+    parent = self()
+    previous_hook = Application.get_env(:ferricstore, :flow_shared_ref_backfill_lmdb_hook)
+
+    Application.put_env(:ferricstore, :flow_shared_ref_backfill_lmdb_hook, fn
+      :write_batch, [path, ops] ->
+        send(parent, :named_startup_backfill)
+        Ferricstore.Flow.LMDB.write_batch(path, ops)
+
+      _operation, _args ->
+        :passthrough
+    end)
+
+    on_exit(fn ->
+      case previous_hook do
+        nil -> Application.delete_env(:ferricstore, :flow_shared_ref_backfill_lmdb_hook)
+        hook -> Application.put_env(:ferricstore, :flow_shared_ref_backfill_lmdb_hook, hook)
+      end
+
+      Ferricstore.Flow.LMDB.release(lmdb_path)
+      File.rm_rf!(data_dir)
+    end)
+
+    assert :ok =
+             LMDBRebuilder.reconcile_startup_shard(
+               shard_path,
+               keydir,
+               0,
+               %{name: instance_name, data_dir: data_dir, keydir_refs: {keydir}},
+               nil,
+               nil,
+               nil,
+               nil,
+               active_file_id: 0,
+               active_file_path: active_file_path
+             )
+
+    assert_receive :named_startup_backfill
+  end
+
+  test "snapshot startup accepts the writer's flushed suspended barrier" do
+    unique = System.unique_integer([:positive, :monotonic])
+    instance_name = String.to_atom("lmdb_snapshot_startup_#{unique}")
+    data_dir = Path.join(System.tmp_dir!(), "ferricstore_lmdb_snapshot_startup_#{unique}")
+    instance_ctx = %{name: instance_name, data_dir: data_dir, shard_count: 1}
+
+    start_supervised!({LMDBFlushCoordinator, instance_name: instance_name})
+
+    start_supervised!(
+      {LMDBWriter, shard_index: 0, data_dir: data_dir, instance_ctx: instance_ctx}
+    )
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+    active_file_path = Ferricstore.Store.Shard.ETS.file_path(shard_path, 0)
+    File.touch!(active_file_path)
+    keydir = :ets.new(:lmdb_snapshot_startup_keydir, [:set, :public])
+
+    on_exit(fn ->
+      _ = LMDBWriter.resume_after_snapshot_install(instance_name, 0)
+      Ferricstore.Flow.LMDB.release(lmdb_path)
+      File.rm_rf!(data_dir)
+    end)
+
+    assert :ok = LMDBWriter.prepare_snapshot_install(instance_name, 0)
+
+    assert :ok =
+             LMDBRebuilder.reconcile_startup_shard(
+               shard_path,
+               keydir,
+               0,
+               instance_ctx,
+               nil,
+               nil,
+               nil,
+               nil,
+               active_file_id: 0,
+               active_file_path: active_file_path,
+               shared_ref_backfill?: false
+             )
   end
 
   test "online reconciliation preserves active metadata for keydir-evicted cold flows" do

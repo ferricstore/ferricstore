@@ -203,18 +203,19 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
 
         ensure_native_flow_index!(flow_index, flow_lookup)
 
-        Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
-          shard_data_path,
-          keydir,
-          shard_index,
-          ctx,
-          zset_score_index,
-          zset_score_lookup,
-          flow_index,
-          flow_lookup,
-          active_file_id: active_file_id,
-          active_file_path: active_file_path
-        )
+        :ok =
+          Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
+            shard_data_path,
+            keydir,
+            shard_index,
+            ctx,
+            zset_score_index,
+            zset_score_lookup,
+            flow_index,
+            flow_lookup,
+            active_file_id: active_file_id,
+            active_file_path: active_file_path
+          )
 
         active_file_size = recovery_file_size(active_file_path)
 
@@ -308,20 +309,21 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
 
         ShardLifecycle.validate_prob_files(shard_data_path, shard_index, keydir)
 
-        Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
-          shard_data_path,
-          keydir,
-          shard_index,
-          ctx,
-          sm_state.zset_score_index_name,
-          sm_state.zset_score_lookup_name,
-          sm_state.flow_index_name,
-          sm_state.flow_lookup_name,
-          force_full_reconcile?: true,
-          reason: :segment_replay,
-          active_file_id: sm_state.active_file_id,
-          active_file_path: sm_state.active_file_path
-        )
+        :ok =
+          Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
+            shard_data_path,
+            keydir,
+            shard_index,
+            ctx,
+            sm_state.zset_score_index_name,
+            sm_state.zset_score_lookup_name,
+            sm_state.flow_index_name,
+            sm_state.flow_lookup_name,
+            force_full_reconcile?: true,
+            reason: :segment_replay,
+            active_file_id: sm_state.active_file_id,
+            active_file_path: sm_state.active_file_path
+          )
 
         sm_state
         |> Map.put(:active_file_size, recovery_file_size(sm_state.active_file_path))
