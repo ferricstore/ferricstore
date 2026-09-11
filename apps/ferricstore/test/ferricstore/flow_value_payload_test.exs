@@ -607,15 +607,17 @@ defmodule Ferricstore.FlowValuePayloadTest do
 
   test "rewind from terminal back to active clears value ref expiration" do
     id = unique_id("flow-value-rewind-retention")
+    now_ms = Ferricstore.HLC.now_ms()
+    payload = %{large: String.duplicate("x", 256)}
 
     assert :ok =
              FerricStore.flow_create(id,
                type: "value-rewind-retention",
                partition_key: "tenant-retention",
-               payload: %{large: String.duplicate("x", 256)},
-               retention_ttl_ms: 100,
-               run_at_ms: 1_000,
-               now_ms: 1_000
+               payload: payload,
+               retention_ttl_ms: 60_000,
+               run_at_ms: now_ms,
+               now_ms: now_ms
              )
 
     assert {:ok, created} = FerricStore.flow_get(id, partition_key: "tenant-retention")
@@ -628,35 +630,44 @@ defmodule Ferricstore.FlowValuePayloadTest do
                partition_key: "tenant-retention",
                worker: "worker-retention",
                limit: 1,
-               now_ms: 1_000
+               now_ms: now_ms
              )
 
     assert :ok =
              FerricStore.flow_complete(id, claimed.lease_token,
                partition_key: "tenant-retention",
-               fencing_token: claimed.fencing_token
+               fencing_token: claimed.fencing_token,
+               now_ms: now_ms
              )
+
+    assert {:ok, completed} = FerricStore.flow_get(id, partition_key: "tenant-retention")
+    cleanup_now_ms = completed.terminal_retention_until_ms + 1
 
     assert :ok =
              FerricStore.flow_rewind(id,
                partition_key: "tenant-retention",
-               to_event: created_event_id
+               to_event: created_event_id,
+               now_ms: now_ms
              )
 
     assert {:ok, rewound} = FerricStore.flow_get(id, partition_key: "tenant-retention")
 
     assert rewound.state == created.state
     assert rewound.payload_ref == created.payload_ref
+    assert rewound.terminal_retention_until_ms == nil
 
-    Process.sleep(150)
+    assert Ferricstore.CommandTime.with_now_ms(cleanup_now_ms, fn ->
+             assert {:ok, fetched} =
+                      FerricStore.flow_get(id, partition_key: "tenant-retention", full: true)
 
-    assert {:ok, fetched} =
-             FerricStore.flow_get(id, partition_key: "tenant-retention", full: true)
+             assert fetched.state == created.state
+             assert fetched.payload == payload
 
-    assert fetched.state == created.state
-    assert fetched.payload == %{large: String.duplicate("x", 256)}
-    assert {:ok, [%{large: large_blob}]} = FerricStore.flow_value_mget([created.payload_ref])
-    assert large_blob == String.duplicate("x", 256)
+             assert {:ok, [%{large: large_blob}]} =
+                      FerricStore.flow_value_mget([created.payload_ref])
+
+             assert large_blob == payload.large
+           end)
   end
 
   test "batch APIs also persist full value fields" do
