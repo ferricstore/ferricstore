@@ -184,7 +184,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowRecord do
         "terminal: #{state}"
 
       state == "running" and flow_expired_lease?(record) ->
-        "lease expired; reclaimable by workers"
+        "lease expired; check recovery eligibility"
 
       state == "running" and is_binary(worker) and worker != "" ->
         "leased by #{worker}"
@@ -196,7 +196,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowRecord do
         "scheduled for future"
 
       state == "queued" ->
-        "due now, waiting for worker claim"
+        "due time reached; waiting in queued"
 
       true ->
         "waiting in #{state}"

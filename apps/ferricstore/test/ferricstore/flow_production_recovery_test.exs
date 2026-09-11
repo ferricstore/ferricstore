@@ -6,6 +6,7 @@ defmodule Ferricstore.FlowProductionRecoveryTest do
   @moduletag :shard_kill
   @moduletag timeout: 180_000
 
+  alias Ferricstore.Flow.{Keys, LMDB}
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
@@ -24,7 +25,7 @@ defmodule Ferricstore.FlowProductionRecoveryTest do
       ShardHelpers.teardown_isolated_data_dir(isolated)
     end)
 
-    :ok
+    {:ok, isolated: isolated}
   end
 
   test "Flow truth, hot indexes, blob values, history, and cold projection survive supervised shard crash" do
@@ -162,6 +163,95 @@ defmodule Ferricstore.FlowProductionRecoveryTest do
     assert missing_shards == []
 
     assert {:ok, _stats} = Router.sweep_blob_garbage(restarted_ctx)
+  end
+
+  test "an FQL-visible Flow can expire before a restart without blocking recovery", %{
+    isolated: isolated
+  } do
+    id = unique("expired-query-restart")
+    type = unique("expired-query-restart-type")
+    partition = unique("expired-query-restart-partition")
+    now_ms = System.system_time(:millisecond)
+
+    query =
+      "FROM runs WHERE partition_key = @partition AND run_id = @id RETURN RECORD"
+
+    params = %{"partition" => partition, "id" => id}
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: type,
+               state: "recorded",
+               partition_key: partition,
+               idempotent: true,
+               run_at_ms: now_ms,
+               now_ms: now_ms
+             )
+
+    assert :ok =
+             ShardHelpers.eventually(
+               fn ->
+                 match?({:ok, %{records: [%{id: ^id}]}}, FerricStore.flow_query(query, params))
+               end,
+               "Flow should become visible through FQL before cancellation"
+             )
+
+    assert {:ok, [%{id: ^id} = claimed]} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               states: ["recorded"],
+               worker: "expiry-restart-test",
+               limit: 1,
+               now_ms: now_ms + 1
+             )
+
+    cancel_now_ms = System.system_time(:millisecond)
+
+    assert :ok =
+             FerricStore.flow_cancel(id,
+               partition_key: partition,
+               lease_token: claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               ttl_ms: 1,
+               now_ms: cancel_now_ms
+             )
+
+    assert :ok =
+             ShardHelpers.eventually(
+               fn ->
+                 FerricStore.flow_get(id, partition_key: partition) == {:ok, nil} and
+                   match?({:ok, %{records: []}}, FerricStore.flow_query(query, params))
+               end,
+               "expired Flow should disappear from primary and query reads"
+             )
+
+    :ok = ShardHelpers.restart_current_data_dir(isolated)
+
+    assert {:ok, nil} = FerricStore.flow_get(id, partition_key: partition)
+    assert {:ok, %{records: []}} = FerricStore.flow_query(query, params)
+
+    restarted_ctx = FerricStore.Instance.get(:default)
+    state_key = Keys.state_key(id, partition)
+    shard_index = Router.shard_for(restarted_ctx, state_key)
+
+    lmdb_path =
+      isolated.tmp_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> LMDB.path()
+
+    case LMDB.get(lmdb_path, state_key) do
+      :not_found -> :ok
+      {:ok, _stale_query_row} -> :ok
+    end
+
+    assert {:ok, _cleanup} =
+             FerricStore.flow_retention_cleanup(limit: 10, now_ms: cancel_now_ms + 10_000)
+
+    assert :ok =
+             ShardHelpers.eventually(
+               fn -> LMDB.get(lmdb_path, state_key) == :not_found end,
+               "retention should delete the expired QueryRow after its WAL source is retired"
+             )
   end
 
   defp start_background_projection_work(ctx) do

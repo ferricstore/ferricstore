@@ -43,6 +43,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Capabilities do
       %{
         label: "Probe",
         value: "FERRICSTORE.CAPABILITIES",
+        class: "ops-summary-code",
         detail: "stable read-only SDK/native contract"
       }
     ])
@@ -65,7 +66,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Capabilities do
       end)
 
     """
-    <div class="section-title">Capability Flags</div>
+    <h2 class="section-title">Capability Flags</h2>
     #{table_scroll("Capability flags", """
     <table>
     <thead>

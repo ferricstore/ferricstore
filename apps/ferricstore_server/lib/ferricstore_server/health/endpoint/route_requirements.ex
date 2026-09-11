@@ -20,7 +20,19 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
   def dashboard_api_path?(_path), do: false
 
   @spec dashboard_route_requirement(binary(), binary()) :: requirement()
-  def dashboard_route_requirement("GET", path) do
+  def dashboard_route_requirement(method, path),
+    do:
+      route_requirement(
+        method,
+        path,
+        if(method in ["GET", "POST"], do: {"INFO", []}, else: {"*", []})
+      )
+
+  @doc false
+  def known_dashboard_route_requirement(method, path),
+    do: route_requirement(method, path, :unsupported)
+
+  defp route_requirement("GET", path, fallback) do
     {clean_path, query} = split_path_query(path)
 
     case clean_path do
@@ -46,7 +58,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
       "/dashboard/flow/states" -> flow_partition_view_requirement("FLOW.QUERY", query)
       "/dashboard/flow/workers" -> {"FLOW.QUERY", []}
       "/dashboard/flow/due" -> {"FLOW.QUERY", []}
-      "/dashboard/flow/schedules" -> {"FLOW.SCHEDULE.LIST", key: {"*", :read}}
+      "/dashboard/flow/schedules" -> flow_schedule_page_requirement(query)
       "/dashboard/flow/failures" -> flow_index_view_requirement("FLOW.QUERY", query)
       "/dashboard/flow/lineage" -> flow_partition_view_requirement("FLOW.QUERY", query)
       "/dashboard/flow/query" -> flow_query_page_requirement(query)
@@ -75,11 +87,11 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
       "/dashboard/api/streams" -> {"XINFO", []}
       "/dashboard/api/pubsub" -> {"PUBSUB", []}
       "/dashboard/api/prefixes" -> {"SCAN", key: {"*", :read}}
-      _ -> flow_detail_or_default_requirement(clean_path, query)
+      _ -> flow_detail_or_default_requirement(clean_path, query, fallback)
     end
   end
 
-  def dashboard_route_requirement("POST", path) do
+  defp route_requirement("POST", path, fallback) do
     {clean_path, _query} = split_path_query(path)
 
     case clean_path do
@@ -120,11 +132,11 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
         {"FERRICSTORE.DOCTOR", []}
 
       _ ->
-        flow_rewind_or_default_requirement(clean_path)
+        flow_rewind_or_default_requirement(clean_path, fallback)
     end
   end
 
-  def dashboard_route_requirement(_method, _path), do: {"*", []}
+  defp route_requirement(_method, _path, fallback), do: fallback
 
   @spec flow_retention_form_requirement(map()) :: requirement()
   def flow_retention_form_requirement(%{"action" => "cleanup"}) do
@@ -138,7 +150,6 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     type =
       params
       |> Map.get("type", "")
-      |> String.trim()
 
     if type == "" do
       {"FLOW.POLICY.SET", []}
@@ -151,11 +162,26 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
   def flow_schedule_form_requirement(params) do
     command = Schedules.form_command(params)
 
-    if command == "FLOW.SCHEDULE.GET" do
-      {command, []}
-    else
-      {command, key: {"*", :write}}
+    cond do
+      command == "FLOW.SCHEDULE.GET" ->
+        {command, []}
+
+      command == "FLOW.SCHEDULE.CREATE" and Schedules.replacement?(params) ->
+        [{command, key: {"*", :write}}, {"FLOW.SCHEDULE.GET", []}]
+
+      true ->
+        {command, key: {"*", :write}}
     end
+  end
+
+  defp flow_schedule_page_requirement(query) do
+    command =
+      case QueryDecoder.decode(query) do
+        %{"id" => id} when is_binary(id) and id != "" -> "FLOW.SCHEDULE.GET"
+        _ -> "FLOW.SCHEDULE.LIST"
+      end
+
+    {command, key: {"*", :read}}
   end
 
   @spec flow_reclaim_form_requirement(map()) :: requirement()
@@ -163,7 +189,6 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     partition_key =
       params
       |> Map.get("partition_key", "")
-      |> String.trim()
 
     if partition_key == "" do
       {"FLOW.RECLAIM", key: {"*", :write}}
@@ -177,7 +202,6 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     key =
       params
       |> Map.get("partition_key", "")
-      |> String.trim()
       |> case do
         "" -> id
         partition_key -> partition_key
@@ -195,7 +219,6 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     key =
       params
       |> Map.get("partition_key", "")
-      |> String.trim()
       |> case do
         "" -> id
         partition_key -> partition_key
@@ -210,11 +233,11 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
 
   @spec flow_governance_form_requirement(map()) :: requirement()
   def flow_governance_form_requirement(%{"action" => "close_circuit"} = params) do
-    flow_governance_scope_requirement("FLOW.CIRCUIT.CLOSE", params)
+    circuit_mutation_requirement("FLOW.CIRCUIT.CLOSE", params)
   end
 
   def flow_governance_form_requirement(%{"action" => "open_circuit"} = params) do
-    flow_governance_scope_requirement("FLOW.CIRCUIT.OPEN", params)
+    circuit_mutation_requirement("FLOW.CIRCUIT.OPEN", params)
   end
 
   def flow_governance_form_requirement(%{"action" => "approve_approval"} = params) do
@@ -227,6 +250,17 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
 
   def flow_governance_form_requirement(_params), do: {"FLOW.GOVERNANCE.OVERVIEW", []}
 
+  defp circuit_mutation_requirement(command, params) do
+    scope = Map.get(params, "scope", "")
+
+    read =
+      if scope == "",
+        do: {"FLOW.CIRCUIT.GET", []},
+        else: {"FLOW.CIRCUIT.GET", key: {scope, :read}}
+
+    [flow_governance_scope_requirement(command, params), read]
+  end
+
   defp flow_governance_scope_requirement(command, params) do
     flow_governance_scope_requirement(command, params, "scope")
   end
@@ -235,7 +269,6 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     scope =
       params
       |> Map.get(field, "")
-      |> String.trim()
 
     if scope == "" do
       {command, []}
@@ -248,13 +281,29 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     overview = {"FLOW.GOVERNANCE.OVERVIEW", key: {"*", :read}}
     params = QueryDecoder.decode(query)
 
-    required_query_params = ~w(meta_partition_key meta_type meta_state meta_key meta_value)
+    required_query_params = ~w(meta_partition_key meta_type meta_state meta_key)
 
-    if Enum.all?(required_query_params, &present_query_param?(params, &1)) do
-      partition_key = params |> Map.fetch!("meta_partition_key") |> String.trim()
-      [overview, {"FLOW.QUERY", key: {partition_key, :read}}]
-    else
-      overview
+    requirements =
+      if Enum.all?(required_query_params, &present_query_param?(params, &1)) and
+           is_binary(Map.get(params, "meta_value")) do
+        partition_key = params |> Map.fetch!("meta_partition_key")
+        [overview, {"FLOW.QUERY", key: {partition_key, :read}}]
+      else
+        [overview]
+      end
+
+    requirements =
+      case Map.get(params, "circuit_review_scope") do
+        scope when is_binary(scope) and scope != "" ->
+          requirements ++ [{"FLOW.CIRCUIT.GET", key: {scope, :read}}]
+
+        _ ->
+          requirements
+      end
+
+    case requirements do
+      [single] -> single
+      multiple -> multiple
     end
   rescue
     _ -> {"FLOW.GOVERNANCE.OVERVIEW", key: {"*", :read}}
@@ -262,7 +311,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
 
   defp present_query_param?(params, key) do
     case Map.get(params, key) do
-      value when is_binary(value) -> String.trim(value) != ""
+      value when is_binary(value) -> value != ""
       _other -> false
     end
   end
@@ -272,7 +321,6 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
       query
       |> QueryDecoder.decode()
       |> Map.get("id", "")
-      |> String.trim()
 
     partition_key = flow_partition_key_from_query(query)
 
@@ -290,24 +338,23 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     _ -> {"FLOW.GET", []}
   end
 
-  defp flow_detail_or_default_requirement("/dashboard/flow/" <> encoded_id, query) do
+  defp flow_detail_or_default_requirement("/dashboard/flow/" <> encoded_id, query, _fallback) do
     id = decoded_component_or_empty(encoded_id)
     {"FLOW.GET", key: {flow_acl_key_from_query(id, query), :read}}
   end
 
-  defp flow_detail_or_default_requirement("/dashboard/api/flow/" <> encoded_id, query) do
+  defp flow_detail_or_default_requirement("/dashboard/api/flow/" <> encoded_id, query, _fallback) do
     id = decoded_component_or_empty(encoded_id)
     {"FLOW.GET", key: {flow_acl_key_from_query(id, query), :read}}
   end
 
-  defp flow_detail_or_default_requirement(_path, _query), do: {"INFO", []}
+  defp flow_detail_or_default_requirement(_path, _query, fallback), do: fallback
 
   defp flow_value_requirement(query) do
     flow_id =
       query
       |> QueryDecoder.decode()
       |> Map.get("flow", "")
-      |> String.trim()
 
     partition_key = flow_partition_key_from_query(query)
 
@@ -329,8 +376,8 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     key =
       query
       |> QueryDecoder.decode()
-      |> Map.get("key", "")
-      |> String.trim()
+      |> FerricstoreServer.Health.Dashboard.Data.KV.keyspace_filters()
+      |> Map.fetch!(:key)
 
     if key == "" do
       {"SCAN", []}
@@ -355,12 +402,11 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     kind = Map.get(params, "kind", "list")
     command = flow_query_command_requirement(kind)
     partition_key = flow_partition_key_from_query(query)
-    type = params |> Map.get("type", "") |> String.trim()
+    type = params |> Map.get("type", "")
 
     key =
       params
       |> Map.get("id", "")
-      |> String.trim()
       |> flow_acl_key_from_query(query)
 
     flow_query_key_requirement(command, kind, key, partition_key, type)
@@ -377,7 +423,6 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     partition_key =
       params
       |> Map.get("partition_key", "")
-      |> String.trim()
 
     if partition_key == "" do
       {command, key: {"*", :read}}
@@ -421,7 +466,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
 
   defp flow_query_command_requirement(_kind), do: "FLOW.QUERY"
 
-  defp flow_rewind_or_default_requirement("/dashboard/flow/" <> encoded_action) do
+  defp flow_rewind_or_default_requirement("/dashboard/flow/" <> encoded_action, fallback) do
     cond do
       match?({:ok, _id}, FlowPaths.decode_flow_rewind_action(encoded_action)) ->
         {"FLOW.REWIND", []}
@@ -430,11 +475,11 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
         {"FLOW.SIGNAL", []}
 
       true ->
-        {"FLOW.REWIND", []}
+        if fallback == :unsupported, do: :unsupported, else: {"FLOW.REWIND", []}
     end
   end
 
-  defp flow_rewind_or_default_requirement(_path), do: {"INFO", []}
+  defp flow_rewind_or_default_requirement(_path, fallback), do: fallback
 
   defp flow_acl_key_from_query(id, query) do
     case flow_partition_key_from_query(query) do
@@ -447,7 +492,6 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     query
     |> QueryDecoder.decode()
     |> Map.get("partition_key", "")
-    |> String.trim()
   rescue
     _ -> ""
   end

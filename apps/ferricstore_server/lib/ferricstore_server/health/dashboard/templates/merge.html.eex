@@ -3,7 +3,7 @@
 <body data-dashboard-live-page="merge" data-dashboard-live-url="/dashboard/api/merge" data-dashboard-live-interval-ms="10000">
 <div class="layout">
 <%= render_sidebar_static("merge") %>
-<main class="main-content">
+<main class="main-content" id="dashboard-main" tabindex="-1">
 <%= render_subpage_header("Merge Status") %>
 <div class="content">
 <%= render_page_intro("Merge Status", "Watch compaction progress, reclaimed bytes, and shards currently doing storage maintenance work.") %>

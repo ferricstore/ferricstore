@@ -104,6 +104,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
          {:ok, type} <- required_binary(opts, :type),
          :ok <- Internal.reject_reserved_type(type, opts),
          {:ok, state} <- optional_binary(opts, :state, @default_state),
+         :ok <- reject_running_state_transition(state),
          {:ok, parent_flow_id} <- optional_binary_or_nil(opts, :parent_flow_id, nil),
          :ok <- validate_ref_size(:parent_flow_id, parent_flow_id),
          {:ok, root_flow_id} <- optional_binary_or_nil(opts, :root_flow_id, nil),
@@ -626,6 +627,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- Internal.reject_reserved_id(id, opts),
          {:ok, lease_token} <- optional_lease_token(opts),
          {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
+         {:ok, expected_version} <- optional_non_neg_integer_or_nil(opts, :expected_version),
+         {:ok, expect_state} <- optional_binary_or_nil(opts, :expect_state, nil),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(Ferricstore.Flow.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_now_ms(opts),
@@ -638,6 +641,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
         %{
           id: id,
           fencing_token: fencing_token,
+          expected_version: expected_version,
+          expect_state: expect_state,
           partition_key: partition_key
         }
         |> maybe_put_attr(:lease_token, lease_token)
@@ -682,6 +687,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- validate_id(id),
          :ok <- Internal.reject_reserved_id(id, opts),
          {:ok, to_event} <- required_binary(opts, :to_event),
+         {:ok, expected_version} <- optional_non_neg_integer_or_nil(opts, :expected_version),
          {:ok, expect_state} <- optional_binary_or_nil(opts, :expect_state, nil),
          {:ok, run_at_ms} <- optional_non_neg_integer_or_nil(opts, :run_at_ms),
          {:ok, now} <- optional_now_ms(opts),
@@ -692,6 +698,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
         %{
           id: id,
           to_event: to_event,
+          expected_version: expected_version,
           expect_state: expect_state,
           run_at_ms: run_at_ms,
           reason_ref: nil,

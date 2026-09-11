@@ -3,7 +3,7 @@
 <body>
 <div class="layout">
 <%= render_sidebar_static("doctor") %>
-<main class="main-content">
+<main class="main-content" id="dashboard-main" tabindex="-1">
 <%= render_subpage_header("Doctor") %>
 <div class="content">
 <%= render_page_intro("Doctor", "Run operator diagnostics and safe repair jobs through the same FERRICSTORE.DOCTOR command available over the native protocol.") %>
@@ -11,7 +11,7 @@
 <%= render_doctor_summary(Map.get(data, :check, %{})) %>
 <%= render_doctor_checks(Map.get(data, :check, %{})) %>
 <%= render_doctor_actions() %>
-<%= render_doctor_jobs(Map.get(data, :jobs, [])) %>
+<%= render_doctor_jobs(Map.get(data, :jobs_result, Map.get(data, :jobs, []))) %>
 <%= render_doctor_command_reference(Map.get(data, :command_reference, [])) %>
 </div>
 </main>

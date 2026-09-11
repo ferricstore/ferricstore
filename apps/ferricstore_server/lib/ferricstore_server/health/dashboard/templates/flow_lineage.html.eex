@@ -1,17 +1,21 @@
 <% data = assigns.data %>
 <%= page_head("Flow Lineage - FerricStore", nil) %>
-<body>
+<body class="flow-lineage-page">
 <div class="layout">
 <%= render_sidebar_static("flow_lineage") %>
-<main class="main-content">
+<main class="main-content" id="dashboard-main" tabindex="-1">
 <%= render_subpage_header("Flow Lineage") %>
 <div class="content">
 <%= render_page_intro("Flow Lineage", "Trace workflow relationships by parent, root, or correlation id for debugging fanout and dependency chains.") %>
-<%= render_flow_subnav("lineage") %>
+<%= render_flow_context_tools(data, "flow_lineage") %>
 <%= render_flow_lineage_controls(data) %>
+<%= render_flow_lineage_status(data) %>
+<%= if data.result.status == :ok do %>
 <%= render_flow_lineage_summary(data) %>
-<%= render_flow_lineage_graph(data) %>
 <%= render_flow_lineage_table(data) %>
+<%= render_flow_lineage_pagination(data) %>
+<%= if data.records != [], do: render_flow_lineage_graph(data) %>
+<% end %>
 </div>
 </main>
 </div>

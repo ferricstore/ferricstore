@@ -6,6 +6,7 @@ defmodule FerricstoreServer.Health.Dashboard.Templates do
   require EEx
 
   import FerricstoreServer.Health.Dashboard.Layout
+  import FerricstoreServer.Health.Dashboard.Format, only: [escape: 1, escape_attr: 1]
   import FerricstoreServer.Health.Dashboard.Render.Admin
   import FerricstoreServer.Health.Dashboard.Render.Capabilities
   import FerricstoreServer.Health.Dashboard.Render.DoctorPages
@@ -193,8 +194,17 @@ defmodule FerricstoreServer.Health.Dashboard.Templates do
     :assigns
   ])
 
+  EEx.function_from_file(
+    :def,
+    :flow_action_error,
+    Path.join(@templates_dir, "flow_action_error.html.eex"),
+    [:assigns]
+  )
+
   defp render_overview_content(data) do
     """
+    #{render_operator_attention(data)}
+    #{FerricstoreServer.Health.Dashboard.Render.RecentRates.render(data)}
     #{render_cache_performance(data.hotcold)}
     #{render_lifecycle(data.lifecycle)}
     #{render_shards(data.shards)}

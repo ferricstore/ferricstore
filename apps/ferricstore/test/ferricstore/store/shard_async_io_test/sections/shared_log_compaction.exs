@@ -349,7 +349,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
           ctx =
             FerricStore.Instance.build(name,
               data_dir: dir,
-              shard_count: 1
+              shard_count: 1,
+              query_index_provider: FerricStore.Flow.QueryIndexProvider.Disabled
             )
 
           try do
@@ -931,7 +932,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
           ctx =
             FerricStore.Instance.build(name,
               data_dir: dir,
-              shard_count: 1
+              shard_count: 1,
+              query_index_provider: FerricStore.Flow.QueryIndexProvider.Disabled
             )
 
           try do
@@ -989,7 +991,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
           ctx =
             FerricStore.Instance.build(name,
               data_dir: dir,
-              shard_count: 1
+              shard_count: 1,
+              query_index_provider: FerricStore.Flow.QueryIndexProvider.Disabled
             )
 
           try do
@@ -1053,7 +1056,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
           ctx =
             FerricStore.Instance.build(name,
               data_dir: dir,
-              shard_count: 1
+              shard_count: 1,
+              query_index_provider: FerricStore.Flow.QueryIndexProvider.Disabled
             )
 
           try do
@@ -1112,7 +1116,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
           ctx =
             FerricStore.Instance.build(name,
               data_dir: dir,
-              shard_count: 1
+              shard_count: 1,
+              query_index_provider: FerricStore.Flow.QueryIndexProvider.Disabled
             )
 
           try do
@@ -1170,7 +1175,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
           ctx =
             FerricStore.Instance.build(name,
               data_dir: dir,
-              shard_count: 1
+              shard_count: 1,
+              query_index_provider: FerricStore.Flow.QueryIndexProvider.Disabled
             )
 
           try do
@@ -1229,7 +1235,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
           ctx =
             FerricStore.Instance.build(name,
               data_dir: dir,
-              shard_count: 1
+              shard_count: 1,
+              query_index_provider: FerricStore.Flow.QueryIndexProvider.Disabled
             )
 
           try do

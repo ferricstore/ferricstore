@@ -5,7 +5,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Projection do
 
   def default_flow_projection_health do
     %{
-      lmdb_projection: :lagged,
+      lmdb_projection: :asynchronous,
       lmdb_flush_interval_ms: 0,
       history_flush_interval_ms: 0,
       metrics: []
@@ -32,17 +32,19 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Projection do
 
     health =
       cond do
-        totals.failures > 0 -> "failures"
         totals.degraded > 0 -> "degraded"
         totals.lag > 0 or totals.pending_ops > 0 -> "pending"
+        rows == [] or Enum.any?(rows, &(not &1.current_observed)) -> "unavailable"
         true -> "healthy"
       end
 
     Map.merge(totals, %{health: health, shards: length(rows)})
   end
 
-  def flow_projection_health_class(%{failures: failures, degraded: degraded})
-      when failures > 0 or degraded > 0,
+  def flow_projection_health_class(%{health: "unavailable"}), do: "c-muted"
+
+  def flow_projection_health_class(%{degraded: degraded})
+      when degraded > 0,
       do: "c-red"
 
   def flow_projection_health_class(%{lag: lag, pending_ops: pending_ops})
@@ -70,12 +72,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Projection do
           persist_failures: 0,
           enqueue_failures: 0,
           flush_failures: 0,
-          failures: 0
+          failures: 0,
+          current_observed: false
         })
 
       row =
         row
         |> Map.put(field, value)
+        |> Map.put(
+          :current_observed,
+          row.current_observed or field in [:lag, :pending_ops, :degraded]
+        )
         |> then(fn row ->
           failures =
             Map.get(row, :persist_failures, 0) + Map.get(row, :enqueue_failures, 0) +
@@ -128,42 +135,50 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Projection do
 
   def render_flow_projection_health(data) do
     data = Map.merge(default_flow_projection_health(), data)
-    rollup = flow_projection_rollup(Map.get(data, :metrics, []))
+    metrics = Map.get(data, :metrics, [])
+    rollup = flow_projection_rollup(metrics)
     health_class = flow_projection_health_class(rollup)
+    fields = MapSet.new(metrics, &projection_metric_field(&1.name))
+    lag = if MapSet.member?(fields, :lag), do: rollup.lag, else: "Unavailable"
+    pending = if MapSet.member?(fields, :pending_ops), do: rollup.pending_ops, else: "Unavailable"
+
+    oldest =
+      if MapSet.member?(fields, :oldest_pending_age_us),
+        do: "#{format_number(rollup.oldest_pending_age_us)}us",
+        else: "not reported"
+
+    failures =
+      if Enum.any?(
+           [:persist_failures, :enqueue_failures, :flush_failures],
+           &MapSet.member?(fields, &1)
+         ),
+         do: rollup.failures,
+         else: "Unavailable"
 
     """
-    <div class="section-title">Projection Health</div>
-    <div class="flow-card-grid">
-      <div class="flow-card">
-        <div class="flow-card-label">LMDB</div>
-        <div class="flow-card-value" style="font-size:1.2rem;">#{escape(to_string(data.lmdb_projection))}</div>
-        <div class="flow-card-detail">cold/query projection runs after durable Flow writes</div>
-      </div>
-      <div class="flow-card">
-        <div class="flow-card-label">Health</div>
-        <div class="flow-card-value #{health_class}" style="font-size:1.2rem;">#{escape(rollup.health)}</div>
-        <div class="flow-card-detail">#{format_number(rollup.shards)} shard projection row(s)</div>
-      </div>
-      <div class="flow-card">
-        <div class="flow-card-label">Lag</div>
-        <div class="flow-card-value" style="font-size:1.2rem;">#{format_number(rollup.lag)}</div>
-        <div class="flow-card-detail">requested index minus durable projected index</div>
-      </div>
-      <div class="flow-card">
-        <div class="flow-card-label">Pending</div>
-        <div class="flow-card-value" style="font-size:1.2rem;">#{format_number(rollup.pending_ops)}</div>
-        <div class="flow-card-detail">writer queue ops, oldest #{format_number(rollup.oldest_pending_age_us)}us</div>
-      </div>
-      <div class="flow-card">
-        <div class="flow-card-label">Failures</div>
-        <div class="flow-card-value #{if rollup.failures > 0, do: "c-red", else: "c-green"}" style="font-size:1.2rem;">#{format_number(rollup.failures)}</div>
-        <div class="flow-card-detail">enqueue, flush, persist, or degraded projection events</div>
-      </div>
-      <div class="flow-card">
-        <div class="flow-card-label">Flush Windows</div>
-        <div class="flow-card-value" style="font-size:1.2rem;">#{format_duration_ms(data.lmdb_flush_interval_ms)} / #{format_duration_ms(data.history_flush_interval_ms)}</div>
-        <div class="flow-card-detail">state and history projector batching</div>
-      </div>
+    <h2 class="section-title">Projection Health</h2>
+    <dl class="flow-projection-ledger" aria-label="Projection health metrics">
+      #{render_projection_metric("LMDB", "asynchronous", "consistency model; current lag is measured separately")}
+      #{render_projection_metric("Health", rollup.health, "#{format_number(rollup.shards)} shard projection row(s)", health_class)}
+      #{render_projection_metric("Lag", lag, "requested index minus durable projected index")}
+      #{render_projection_metric("Pending", pending, "writer queue ops, oldest #{oldest}")}
+      #{render_projection_metric("Historical failures", failures, "enqueue, flush and persist failures since start; not current health")}
+      #{render_projection_metric("Flush Windows", "#{format_duration_ms(data.lmdb_flush_interval_ms)} / #{format_duration_ms(data.history_flush_interval_ms)}", "state and history projector batching")}
+    </dl>
+    """
+  end
+
+  defp render_projection_metric(label, value, detail, value_class \\ "") do
+    rendered_value =
+      case value do
+        value when is_integer(value) -> format_number(value)
+        value -> escape(to_string(value))
+      end
+
+    """
+    <div>
+      <dt>#{escape(label)}</dt>
+      <dd class="#{escape_attr(value_class)}">#{rendered_value}<span>#{escape(detail)}</span></dd>
     </div>
     """
   end

@@ -4,6 +4,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
   alias FerricstoreServer.Health.Dashboard.Access, as: DashboardAccess
   alias FerricstoreServer.Health.Dashboard.Data.Operational
   alias FerricstoreServer.Health.QueryDecoder
+  alias FerricstoreServer.Health.Dashboard.Flow.PolicyEditor
+  alias FerricstoreServer.Health.Dashboard.Flow.ManagementActions
+  alias FerricstoreServer.Health.Dashboard.Flow.RetentionReview
 
   import FerricstoreServer.Health.Dashboard.Flow.Sample
   import FerricstoreServer.Health.Dashboard.FlowRecord
@@ -41,7 +44,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
     edit_type =
       opts
       |> Keyword.get(:edit_type, "")
-      |> flow_policy_clean_form_value()
+      |> clean_form_value()
       |> authorized_flow_policy_edit_type(acl_username)
 
     types =
@@ -54,7 +57,13 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
 
     %{
       policies: Enum.map(types, &flow_policy_row(&1, configured_types)),
-      editor: flow_policy_editor_data(edit_type),
+      action_capabilities: ManagementActions.policy(acl_username, edit_type),
+      index_catalog: FerricstoreServer.Health.Dashboard.Flow.IndexCatalog.collect(opts),
+      editor:
+        PolicyEditor.load(
+          edit_type,
+          clean_form_value(Keyword.get(opts, :edit_state, ""))
+        ),
       flash: Keyword.get(opts, :flash),
       active_types: active_types,
       configured_types: MapSet.size(configured_types),
@@ -66,13 +75,27 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
   end
 
   def apply_policy_form(params) when is_map(params) do
+    case FerricstoreServer.Health.Dashboard.Flow.DurationFields.normalize(
+           params,
+           ~w(base_ms max_ms max_active_ms retention_ttl_ms)
+         ) do
+      {:ok, normalized} -> apply_normalized_policy_form(normalized)
+      {:error, {_field, reason}} -> {:error, reason}
+    end
+  end
+
+  def apply_policy_form(_params), do: {:error, "ERR policy form must be a map"}
+
+  defp apply_normalized_policy_form(params) do
     with {:ok, type} <- flow_policy_required_form_value(params, "type", "flow type"),
          {:ok, state} <- flow_policy_optional_form_value(params, "state"),
+         :ok <- flow_policy_form_scope(params, state),
          {:ok, mode} <- flow_policy_form_mode(params),
          {:ok, retry} <- flow_policy_form_retry_opts(params),
          {:ok, retention} <- flow_policy_form_retention_opts(params),
          {:ok, max_active_ms} <- flow_policy_form_max_active_ms(params),
          {:ok, indexes} <- flow_policy_form_index_opts(params),
+         {:ok, expected_generation} <- flow_policy_form_expected_generation(params),
          {:ok, existing_opts} <- flow_policy_existing_set_opts(type),
          opts =
            flow_policy_merge_form_opts(
@@ -84,7 +107,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
              max_active_ms,
              indexes
            ),
-         {:ok, _policy} <- FerricStore.flow_policy_set(type, opts) do
+         {:ok, _policy} <-
+           FerricStore.flow_policy_set(type, Keyword.merge(opts, expected_generation)) do
       {:ok, type}
     else
       {:error, reason} when is_binary(reason) -> {:error, reason}
@@ -92,14 +116,32 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
     end
   end
 
-  def apply_policy_form(_params), do: {:error, "ERR policy form must be a map"}
+  defp flow_policy_form_scope(_params, nil), do: :ok
+
+  defp flow_policy_form_scope(params, state) when is_binary(state) do
+    fields = ~w(max_active_ms indexed_attributes indexed_state_meta)
+
+    if Enum.any?(fields, &Map.has_key?(params, &1)),
+      do: {:error, "ERR state overrides cannot change type-wide settings; edit type defaults"},
+      else: :ok
+  end
+
+  defp flow_policy_form_expected_generation(params) do
+    if Map.has_key?(params, "expected_generation") do
+      with {:ok, generation} <- flow_policy_form_integer(params, "expected_generation", 0) do
+        {:ok, [expected_generation: generation]}
+      end
+    else
+      {:ok, []}
+    end
+  end
 
   def policy_flash_from_query(query) when is_binary(query) do
     params = QueryDecoder.decode(query)
 
     case Map.get(params, "status") do
       "ok" ->
-        type = params |> Map.get("type", "") |> flow_policy_clean_form_value()
+        type = params |> Map.get("type", "") |> clean_form_value()
         %{kind: :ok, message: "Policy saved", type: type}
 
       "error" ->
@@ -133,12 +175,13 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
     preview_limit = min(limit, @flow_dashboard_retention_candidate_preview_limit)
     active_timeout_preview = Enum.take(active_timeout_candidates, preview_limit)
 
-    terminal_preview =
-      Enum.take(terminal_candidates, max(preview_limit - length(active_timeout_preview), 0))
+    terminal_preview = Enum.take(terminal_candidates, preview_limit)
 
     %{
       now_ms: now_ms,
       limit: limit,
+      limit_input: Keyword.get(opts, :limit, limit),
+      action_capabilities: ManagementActions.retention(acl_username),
       sample_limit: @flow_dashboard_sample_limit,
       total_sampled: length(records),
       filtered_sampled: length(records),
@@ -170,8 +213,12 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
         "dry_run" ->
           {:ok, :dry_run, %{limit: limit}}
 
+        "review_cleanup" ->
+          {:ok, :review, RetentionReview.prepare(limit)}
+
         "cleanup" ->
-          with :ok <- flow_retention_cleanup_confirmed(params) do
+          with :ok <- flow_retention_cleanup_confirmed(params),
+               :ok <- RetentionReview.validate(params, limit) do
             case flow_dashboard_retention_cleanup(limit: limit) do
               {:ok, result} when is_map(result) ->
                 {:ok, :cleanup, flow_retention_cleanup_counts(result, limit)}
@@ -188,17 +235,57 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
           end
 
         _other ->
-          {:error, "ERR retention action must be dry_run or cleanup"}
+          {:error, "ERR retention action must be dry_run, review_cleanup, or cleanup"}
       end
     end
   end
 
   def apply_retention_form(_params), do: {:error, "ERR retention form must be a map"}
 
+  def retention_redirect_location(params, result) do
+    response =
+      case result do
+        {:ok, :dry_run, values} ->
+          Map.put(values, :status, "dry_run")
+
+        {:ok, :review, values} ->
+          Map.put(values, :status, "review")
+
+        {:ok, :cleanup, values} ->
+          Map.put(values, :status, "ok")
+
+        {:error, reason} ->
+          %{
+            status: "error",
+            message: reason,
+            limit: Map.get(params, "limit", ""),
+            action: Map.get(params, "action", "")
+          }
+      end
+
+    "/dashboard/flow/retention?" <> URI.encode_query(response)
+  end
+
   def retention_flash_from_query(query) when is_binary(query) do
     params = QueryDecoder.decode(query)
 
     case Map.get(params, "status") do
+      "review" ->
+        limit = flow_retention_limit!(Map.get(params, "limit"))
+
+        case RetentionReview.validate(params, limit) do
+          :ok ->
+            %{
+              kind: :review,
+              limit: limit,
+              reviewed_limit: Map.get(params, "reviewed_limit"),
+              reviewed_at_ms: Map.get(params, "reviewed_at_ms")
+            }
+
+          {:error, reason} ->
+            %{kind: :error, message: reason}
+        end
+
       "dry_run" ->
         limit = flow_retention_limit!(Map.get(params, "limit"))
         %{kind: :dry_run, message: "Dry run ready", limit: limit}
@@ -231,7 +318,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
     _ -> nil
   end
 
-  def clean_form_value(value), do: flow_policy_clean_form_value(value)
+  def clean_form_value(value) when is_binary(value), do: value
+  def clean_form_value(value), do: to_string(value)
   def query_integer(params, key), do: flow_retention_query_integer(params, key)
 
   defp flow_retention_cleanup_confirmed(params) do
@@ -240,7 +328,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
         :ok
 
       _ ->
-        {:error, "ERR cleanup requires confirm_cleanup=true after reviewing the sample preview"}
+        {:error, "ERR cleanup requires confirmation after reviewing the global operation"}
     end
   end
 
@@ -359,6 +447,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
         %{
           type: type,
           source: source,
+          generation: Map.get(policy, :generation, 0),
           retry: Map.get(policy, :retry, %{}),
           retention: Map.get(policy, :retention, %{}),
           max_active_ms: flow_policy_field(policy, :max_active_ms, nil),
@@ -450,62 +539,6 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
 
   defp flow_policy_scan_metadata(policy_scan, nil), do: Map.delete(policy_scan, :types)
   defp flow_policy_scan_metadata(_policy_scan, _username), do: %{restricted: true}
-
-  @spec flow_policy_editor_data(binary() | nil) :: map()
-  defp flow_policy_editor_data(type) do
-    type = flow_policy_clean_form_value(type || "")
-
-    policy =
-      case type do
-        "" ->
-          flow_policy_default_response(type)
-
-        _ ->
-          case FerricStore.flow_policy_get(type) do
-            {:ok, policy} when is_map(policy) -> policy
-            _ -> flow_policy_default_response(type)
-          end
-      end
-
-    retry = Map.get(policy, :retry, Ferricstore.Flow.RetryPolicy.default())
-    backoff = flow_policy_field(retry, :backoff, Ferricstore.Flow.RetryPolicy.default().backoff)
-    retention = Map.get(policy, :retention, Ferricstore.Flow.RetryPolicy.default_retention())
-
-    indexed_attributes =
-      policy
-      |> Map.get(:indexed_attributes, [])
-      |> flow_policy_indexed_attributes_string()
-
-    %{
-      type: type,
-      state: "",
-      mode: :parallel,
-      indexed_attributes: indexed_attributes,
-      indexed_state_meta: flow_policy_field(policy, :indexed_state_meta, "") || "",
-      max_retries: flow_policy_field(retry, :max_retries, 3),
-      backoff_kind: flow_policy_field(backoff, :kind, :exponential),
-      base_ms: flow_policy_field(backoff, :base_ms, 1_000),
-      max_ms: flow_policy_field(backoff, :max_ms, 30_000),
-      jitter_pct: flow_policy_field(backoff, :jitter_pct, 20),
-      exhausted_to: flow_policy_field(retry, :exhausted_to, "failed"),
-      max_active_ms: flow_policy_field(policy, :max_active_ms, nil) || "",
-      retention_ttl_ms: flow_policy_field(retention, :ttl_ms, 604_800_000),
-      history_max_events: flow_policy_field(retention, :history_max_events, 100_000)
-    }
-  end
-
-  @spec flow_policy_default_response(binary()) :: map()
-  defp flow_policy_default_response(type) do
-    %{
-      type: type,
-      max_active_ms: nil,
-      retry: Ferricstore.Flow.RetryPolicy.default(),
-      retention:
-        Ferricstore.Flow.RetryPolicy.default_retention()
-        |> Map.delete(:history_hot_max_events),
-      states: %{}
-    }
-  end
 
   @spec flow_policy_existing_set_opts(binary()) :: {:ok, keyword()} | {:error, binary()}
   defp flow_policy_existing_set_opts(type) do
@@ -628,12 +661,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
          mode,
          retry,
          retention,
-         max_active_ms,
+         _max_active_ms,
          _indexes
        )
        when is_binary(state) do
-    existing_opts = flow_policy_apply_max_active_action(existing_opts, max_active_ms)
-
     states =
       existing_opts
       |> Keyword.get(:states, [])
@@ -809,7 +840,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
   @spec flow_policy_required_form_value(map(), binary(), binary()) ::
           {:ok, binary()} | {:error, binary()}
   defp flow_policy_required_form_value(params, field, label) do
-    case flow_policy_clean_form_value(Map.get(params, field, "")) do
+    case clean_form_value(Map.get(params, field, "")) do
       "" -> {:error, "ERR #{label} is required"}
       value -> {:ok, value}
     end
@@ -817,7 +848,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
 
   @spec flow_policy_optional_form_value(map(), binary()) :: {:ok, binary() | nil}
   defp flow_policy_optional_form_value(params, field) do
-    case flow_policy_clean_form_value(Map.get(params, field, "")) do
+    case clean_form_value(Map.get(params, field, "")) do
       "" -> {:ok, nil}
       value -> {:ok, value}
     end
@@ -851,14 +882,6 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
 
   defp flow_policy_maybe_put_index_action(opts, _key, :preserve), do: opts
   defp flow_policy_maybe_put_index_action(opts, key, action), do: Keyword.put(opts, key, action)
-
-  defp flow_policy_indexed_attributes_string(names) when is_list(names) do
-    names
-    |> Enum.reject(&(&1 in [nil, ""]))
-    |> Enum.map_join(", ", &to_string/1)
-  end
-
-  defp flow_policy_indexed_attributes_string(_names), do: ""
 
   @spec flow_retention_form_limit(term()) :: {:ok, pos_integer()} | {:error, binary()}
   defp flow_retention_form_limit(nil), do: {:ok, @flow_dashboard_retention_default_limit}

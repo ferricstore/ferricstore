@@ -578,24 +578,31 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
       |> Enum.filter(&(&1.state in [:retiring, :failed]))
       |> Enum.sort_by(&{&1.definition.id, &1.definition.version})
 
-    with {:ok, index, status} <- select_retirement(state.registry, candidates),
-         {:ok, shards} <- select_retirement_shards(status, state) do
-      case shards do
-        :complete ->
-          {:ok, :idle}
+    case select_retirement(state.registry, candidates) do
+      {:ok, :complete} ->
+        {:ok, :idle}
 
-        :backend_not_ready ->
-          {:ok, :backend_not_ready}
+      {:ok, index, status} ->
+        with {:ok, shards} <- select_retirement_shards(status, state) do
+          case shards do
+            :complete ->
+              {:ok, :idle}
 
-        shards ->
-          run_shard_batch(state, shards, fn {shard_index, checkpoint} ->
-            run_retirement_phase(state, index, shard_index, checkpoint)
-          end)
-      end
-    else
-      {:ok, :complete} -> {:ok, :idle}
-      {:error, :query_index_not_found} -> {:ok, :idle}
-      {:error, _reason} = error -> error
+            :backend_not_ready ->
+              {:ok, :backend_not_ready}
+
+            shards ->
+              run_shard_batch(state, shards, fn {shard_index, checkpoint} ->
+                run_retirement_phase(state, index, shard_index, checkpoint)
+              end)
+          end
+        end
+
+      {:error, :query_index_not_found} ->
+        {:ok, :idle}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 

@@ -12,6 +12,27 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
   alias FerricstoreServer.Health.Endpoint.Session
   alias FerricstoreServer.Health.QueryDecoder
 
+  def handle_flow_action_result(socket, transport, id, action, params, result) do
+    alias FerricstoreServer.Health.Dashboard.Flow.ActionForm
+
+    case result do
+      {:ok, ^id, partition_key} ->
+        status = if action == :rewind, do: "rewound", else: "signaled"
+        scope = Map.put(ActionForm.return_params(params), "status", status)
+
+        Response.send_redirect_response(
+          socket,
+          transport,
+          FlowPaths.flow_detail_location(id, partition_key, scope)
+        )
+
+      {:error, reason} ->
+        data = ActionForm.error_page(id, action, params, reason)
+        html = Dashboard.render_flow_action_error_page(data)
+        Response.send_html_response(socket, transport, 422, "Unprocessable Entity", html)
+    end
+  end
+
   def handle_slowlog_page(socket, transport, peer, headers) do
     render_static_page(
       socket,
@@ -161,6 +182,41 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
          transport,
          _peer,
          _headers,
+         :create,
+         actor,
+         params,
+         {:error, message}
+       ) do
+    data =
+      FerricstoreServer.Health.Dashboard.Data.Security.account_error_page(actor, params, message)
+
+    body = Dashboard.render_security_page(data)
+    Response.send_html_response(socket, transport, 422, "Unprocessable Entity", body)
+  end
+
+  defp respond_to_security_mutation(
+         socket,
+         transport,
+         _peer,
+         _headers,
+         :rules,
+         actor,
+         params,
+         {:error, message}
+       ) do
+    data =
+      FerricstoreServer.Health.Dashboard.Data.Security.account_error_page(actor, params, message)
+      |> Map.put(:modifier_form_only?, true)
+
+    body = Dashboard.render_security_page(data)
+    Response.send_html_response(socket, transport, 422, "Unprocessable Entity", body)
+  end
+
+  defp respond_to_security_mutation(
+         socket,
+         transport,
+         _peer,
+         _headers,
          action,
          _actor,
          params,
@@ -216,15 +272,19 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
     end
   end
 
-  def handle_clients_page(socket, transport, peer, headers) do
-    render_static_page(
-      socket,
-      transport,
-      peer,
-      headers,
-      &Dashboard.collect_clients_page/0,
-      &Dashboard.render_clients_page/1
-    )
+  def handle_clients_page(socket, transport, peer, headers, query \\ "") do
+    if Auth.observability_authorized?(peer, headers) do
+      data = Dashboard.collect_clients_page(QueryDecoder.decode(query))
+      body = Dashboard.render_clients_page(data)
+
+      if data.client_coverage.status == :invalid_filters do
+        Response.send_html_response(socket, transport, 422, "Unprocessable Content", body)
+      else
+        Response.send_html_response(socket, transport, 200, "OK", body)
+      end
+    else
+      Response.send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    end
   end
 
   def handle_storage_page(socket, transport, peer, headers) do
@@ -295,24 +355,38 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
     )
   end
 
-  def handle_flow_workers_page(socket, transport, peer, headers) do
+  def handle_flow_workers_page(socket, transport, peer, headers, query \\ "") do
     render_flow_static_page(
       socket,
       transport,
       peer,
       headers,
-      &Dashboard.collect_flow_workers_page/1,
+      fn access ->
+        Dashboard.collect_flow_workers_page(
+          Keyword.merge(
+            FerricstoreServer.Health.Dashboard.Flow.Browse.scope_opts_from_query(query),
+            access
+          )
+        )
+      end,
       &Dashboard.render_flow_workers_page/1
     )
   end
 
-  def handle_flow_due_page(socket, transport, peer, headers) do
+  def handle_flow_due_page(socket, transport, peer, headers, query \\ "") do
     render_flow_static_page(
       socket,
       transport,
       peer,
       headers,
-      &Dashboard.collect_flow_due_page/1,
+      fn access ->
+        Dashboard.collect_flow_due_page(
+          Keyword.merge(
+            FerricstoreServer.Health.Dashboard.Flow.Browse.scope_opts_from_query(query),
+            access
+          )
+        )
+      end,
       &Dashboard.render_flow_due_page/1
     )
   end
@@ -331,6 +405,26 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
 
         body = Dashboard.render_flow_schedules_page(data)
         Response.send_html_response(socket, transport, 200, "OK", body)
+    end
+  end
+
+  def handle_flow_schedule_error(socket, transport, params, reason) do
+    body =
+      params
+      |> Dashboard.Flow.Schedules.create_error_page(reason)
+      |> Dashboard.render_flow_schedules_page()
+
+    Response.send_html_response(socket, transport, 422, "Unprocessable Content", body)
+  end
+
+  def handle_flow_schedule_review(socket, transport, params) do
+    case Dashboard.Flow.Schedules.preview_form(params) do
+      {:ok, data} ->
+        body = Dashboard.render_flow_schedules_page(data)
+        Response.send_html_response(socket, transport, 200, "OK", body)
+
+      {:error, reason} ->
+        handle_flow_schedule_error(socket, transport, params, reason)
     end
   end
 
@@ -414,7 +508,12 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
 
         data = Dashboard.collect_flow_states_page(opts)
         body = Dashboard.render_flow_states_page(data)
-        Response.send_html_response(socket, transport, 200, "OK", body)
+
+        if map_size(Map.get(data.filters, :errors, %{})) == 0 do
+          Response.send_html_response(socket, transport, 200, "OK", body)
+        else
+          Response.send_html_response(socket, transport, 422, "Unprocessable Content", body)
+        end
     end
   end
 
@@ -446,7 +545,8 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
         data =
           [
             flash: Dashboard.flow_policy_flash_from_query(query),
-            edit_type: Map.get(params, "edit", "")
+            edit_type: Map.get(params, "edit", ""),
+            edit_state: Map.get(params, "edit_state", "")
           ]
           |> Auth.dashboard_flow_collect_opts(peer, headers)
           |> Dashboard.collect_flow_policies_page()
@@ -471,6 +571,15 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
         body = Dashboard.render_flow_governance_page(data)
         Response.send_html_response(socket, transport, 200, "OK", body)
     end
+  end
+
+  def handle_flow_policy_error(socket, transport, params, reason) do
+    body =
+      params
+      |> Dashboard.Flow.PolicyEditor.error_page(reason)
+      |> Dashboard.render_flow_policies_page()
+
+    Response.send_html_response(socket, transport, 422, "Unprocessable Content", body)
   end
 
   def handle_flow_retention(socket, transport, peer, headers, query) do
@@ -541,7 +650,10 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
           |> Dashboard.collect_flow_query_page()
 
         body = Dashboard.render_flow_query_page(data)
-        Response.send_html_response(socket, transport, 200, "OK", body)
+
+        if map_size(Map.get(data.filters, :errors, %{})) > 0,
+          do: Response.send_html_response(socket, transport, 422, "Unprocessable Entity", body),
+          else: Response.send_html_response(socket, transport, 200, "OK", body)
     end
   end
 
@@ -659,12 +771,10 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
         id =
           decoded_query
           |> Map.get("id", "")
-          |> String.trim()
 
         partition_key =
           decoded_query
           |> Map.get("partition_key", "")
-          |> String.trim()
 
         location =
           case {id, partition_key} do

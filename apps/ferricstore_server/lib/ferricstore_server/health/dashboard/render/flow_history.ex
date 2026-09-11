@@ -3,7 +3,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
   import FerricstoreServer.Health.Dashboard.FlowRecord
 
   @flow_dashboard_history_default_count 50
-  @flow_dashboard_value_preview_bytes 8 * 1024
+  @inline_detail_page_bytes 64 * 1024
+  @inline_detail_field_bytes 8 * 1024
   @flow_terminal_states ~w(completed failed cancelled)
 
   def flow_signal_rows(record, history) when is_map(record) and is_list(history) do
@@ -34,7 +35,49 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
     |> String.downcase() == "signaled"
   end
 
+  defp journal_signal_name(fields) do
+    name = flow_field_string(fields, :signal, "")
+
+    if flow_signal_event?(fields) and name != "" do
+      preview = bounded_inline_detail(name, 256)
+      suffix = if preview.truncated, do: "... (truncated)", else: ""
+      ~s(<span class="journal-signal-name mono">#{escape(preview.value)}#{suffix}</span>)
+    else
+      ""
+    end
+  end
+
+  def render_flow_history_timeline(_history, :forbidden, _page) do
+    ~s(<div class="flow-section-note" role="status">History restricted. Requires FLOW.HISTORY access for this workflow.</div>)
+  end
+
   def render_flow_history_timeline(history, status, page) do
+    timeline_rows = history |> flow_history_timeline_rows() |> with_inline_detail_budget()
+    event_count = length(timeline_rows)
+    event_label = if event_count == 1, do: "event", else: "events"
+
+    journal_html =
+      cond do
+        status == :timeout ->
+          ~s(<div class="flow-lineage-empty">History temporarily unavailable: FLOW.HISTORY timed out.</div>)
+
+        match?({:error, _}, status) ->
+          {_tag, reason} = status
+
+          ~s(<div class="flow-lineage-empty">History temporarily unavailable: #{escape(dashboard_internal_error("FLOW.HISTORY failed", reason))}</div>)
+
+        match?({:exit, _}, status) ->
+          {_tag, reason} = status
+
+          ~s(<div class="flow-lineage-empty">History temporarily unavailable: #{escape(dashboard_internal_error("FLOW.HISTORY exited", :exit, reason))}</div>)
+
+        timeline_rows == [] ->
+          ~s(<div class="flow-lineage-empty">No history events found yet</div>)
+
+        true ->
+          render_flow_journal_steps(timeline_rows)
+      end
+
     rows =
       cond do
         status == :timeout ->
@@ -50,13 +93,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
 
           ~s(<tr><td colspan="8" class="c-muted">History temporarily unavailable: #{escape(dashboard_internal_error("FLOW.HISTORY exited", :exit, reason))}</td></tr>)
 
-        history == [] ->
+        timeline_rows == [] ->
           ~s(<tr><td colspan="8" class="c-muted">No history events found yet</td></tr>)
 
         true ->
-          history
-          |> flow_history_timeline_rows()
-          |> Enum.map_join("\n", fn row ->
+          Enum.map_join(timeline_rows, "\n", fn row ->
             fields = row.fields
             anchor = flow_history_event_anchor(row.event_id)
 
@@ -64,30 +105,310 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
             <tr id="#{anchor}" class="timeline-event-row">
               <td class="mono"><a class="flow-event-link" href="##{anchor}">#{escape(to_string(row.event_id))}</a></td>
               <td>#{format_timestamp_ms_or_dash(row.time_ms)}</td>
-              <td>#{flow_history_action_html(fields)}</td>
+              <td>#{flow_history_action_html(fields)}#{render_flow_raw_event_details(row)}</td>
               <td>#{escape(flow_history_state_move(row))}</td>
               <td>#{escape(flow_history_version_summary(fields))}</td>
               <td>#{escape(flow_history_attempt_summary(fields))}</td>
               <td class="mono">#{escape(flow_history_worker_summary(fields))}</td>
-              <td class="mono">#{flow_history_refs_summary_html(fields)}</td>
+              <td class="mono">#{flow_history_refs_summary_html(fields, row)}</td>
             </tr>
             """
           end)
       end
 
     """
-    <div class="section-title">Timeline</div>
-    #{render_flow_history_pagination(page)}
-    <table>
-      <thead>
-        <tr><th>Event</th><th>Time</th><th>Action</th><th>State Change</th><th>Version</th><th>Attempts</th><th>Worker</th><th>Values</th></tr>
-      </thead>
-      <tbody>
-        #{rows}
-      </tbody>
-    </table>
+    <div class="flow-journal-card" data-flow-history-detail-byte-budget="#{@inline_detail_page_bytes}">
+      <div class="flow-card-header">
+        <div class="flow-card-header-title">
+          <span>Execution Journal</span>
+          <span class="badge badge-idle">#{format_number(event_count)} #{event_label} on this page</span>
+        </div>
+        <div class="view-toggle" role="tablist" aria-label="Journal View Mode">
+          <button type="button" role="tab" class="active" id="journal-tab-tree" aria-controls="journal-panel-tree" data-journal-view-toggle="tree" aria-selected="true" tabindex="0">Journal</button>
+          <button type="button" role="tab" id="journal-tab-table" aria-controls="journal-panel-table" data-journal-view-toggle="table" aria-selected="false" tabindex="-1">Raw Events</button>
+        </div>
+      </div>
+      #{render_flow_history_controls(page, status)}
+      #{if Enum.any?(timeline_rows, &event_has_inline_error?/1), do: ~s(<p class="flow-section-note">Expanded inline diagnostics: 64 KiB page budget; up to 8 KiB per field.</p>), else: ""}
+      <div id="journal-panel-tree" role="tabpanel" aria-labelledby="journal-tab-tree" data-journal-view="tree">
+        #{journal_html}
+      </div>
+      <div id="journal-panel-table" role="tabpanel" aria-labelledby="journal-tab-table" data-journal-view="table" hidden>
+        <h2 class="section-title sr-only">Timeline</h2>
+        <div class="table-scroll" role="region" aria-label="Workflow history events" tabindex="0"><table>
+          <thead>
+            <tr><th>Event</th><th>Time</th><th>Action</th><th>State Change</th><th>Version</th><th>Attempts</th><th>Worker</th><th>Values</th></tr>
+          </thead>
+          <tbody>
+            #{rows}
+          </tbody>
+        </table></div>
+      </div>
+    </div>
     """
   end
+
+  def render_flow_journal_steps([]) do
+    ~s(<div class="flow-lineage-empty">No history events found yet</div>)
+  end
+
+  def render_flow_journal_steps(rows) do
+    {step_items, inspectors} =
+      rows
+      |> with_inline_detail_budget()
+      |> Enum.map(fn row ->
+        fields = row.fields
+        anchor = flow_history_event_anchor(row.event_id)
+        action_label = flow_history_event_label(fields)
+        state_move = flow_history_state_move(row)
+        node_class = flow_journal_node_class(row)
+        worker = flow_history_worker_summary(fields)
+
+        worker_badge =
+          if worker != "-",
+            do: ~s(<span class="flow-pill mono">worker: #{escape(worker)}</span>),
+            else: ""
+
+        attempts = flow_history_attempt_summary(fields)
+
+        attempts_badge =
+          if attempts != "-", do: ~s(<span class="flow-pill">#{escape(attempts)}</span>), else: ""
+
+        values_html = flow_history_refs_summary_html(fields, row)
+
+        values_section =
+          if values_html != "-",
+            do:
+              ~s(<div class="journal-step-values" style="margin-top: 6px;">#{values_html}</div>),
+            else: ""
+
+        inspector_id = "journal-inspector-#{anchor}"
+        inspector = render_flow_journal_event_inspector(row, inspector_id)
+
+        step = """
+        <div class="journal-step" id="journal-#{anchor}" data-flow-event-id="#{escape_attr(to_string(row.event_id))}">
+          <div class="journal-step-node #{node_class}"></div>
+          <div class="journal-step-trigger" tabindex="0" role="button" aria-expanded="false" aria-controls="#{escape_attr(inspector_id)}">
+            <div class="journal-step-body">
+              <div class="journal-step-top">
+                <span class="journal-step-title">#{escape(action_label)} <span class="c-muted" style="font-size:0.75rem; font-weight:normal;">##{escape(to_string(row.event_id))}</span></span>
+                <span class="journal-step-duration">#{format_timestamp_ms_or_dash(row.time_ms)}</span>
+              </div>
+              <div class="journal-step-meta">
+                <span class="badge #{flow_state_badge_class(row.to_state)}">#{escape(state_move)}</span>
+                #{journal_signal_name(row.fields)}
+                #{worker_badge}
+                #{attempts_badge}
+              </div>
+            </div>
+          </div>
+          #{values_section}
+        </div>
+        """
+
+        {step, inspector}
+      end)
+      |> Enum.unzip()
+
+    """
+    <div class="flow-journal-workspace">
+      <div class="flow-journal-tree">
+        #{Enum.join(step_items, "\n")}
+      </div>
+      <aside class="flow-journal-inspector" hidden aria-label="Selected event">
+        #{Enum.join(inspectors, "\n")}
+      </aside>
+    </div>
+    """
+  end
+
+  defp render_flow_journal_event_inspector(row, inspector_id) do
+    fields = row.fields
+
+    details =
+      [
+        {"Event", to_string(row.event_id)},
+        {"Occurred", format_timestamp_ms_or_dash(row.time_ms)},
+        {"Action", flow_history_event_label(fields)},
+        {"State change", flow_history_state_move(row)},
+        {"Worker", flow_history_worker_summary(fields)},
+        {"Attempts", flow_history_attempt_summary(fields)}
+      ] ++ flow_event_specific_details(fields)
+
+    rows =
+      details
+      |> Enum.reject(fn {_label, value} -> value in [nil, "", "-"] end)
+      |> Enum.map_join("\n", fn {label, value} ->
+        """
+        <div class="journal-event-inspector-item">
+          <dt>#{escape(label)}</dt>
+          <dd class="mono">#{escape(value)}</dd>
+        </div>
+        """
+      end)
+
+    """
+    <div class="journal-event-inspector" hidden id="#{escape_attr(inspector_id)}" role="region" aria-label="Event details for #{escape_attr(to_string(row.event_id))}">
+      <div class="journal-event-inspector-title">Event details</div>
+      <dl class="journal-event-inspector-grid">
+        #{rows}
+      </dl>
+      #{render_flow_event_errors(row)}
+    </div>
+    """
+  end
+
+  defp render_flow_raw_event_details(row) do
+    details =
+      row.fields
+      |> flow_event_specific_details()
+      |> Enum.reject(fn {_label, value} -> value in [nil, "", "-"] end)
+      |> Enum.map_join("", fn {label, value} ->
+        ~s(<div><dt>#{escape(label)}</dt><dd class="mono">#{escape(value)}</dd></div>)
+      end)
+
+    """
+    <details class="flow-raw-event-details">
+      <summary>Event fields</summary>
+      <dl>#{details}</dl>
+      #{if event_has_inline_error?(row), do: ~s(<a class="flow-event-link" href="#journal-#{flow_history_event_anchor(row.event_id)}">Inspect error and reason</a>), else: ""}
+    </details>
+    """
+  end
+
+  defp flow_event_specific_details(fields) do
+    [
+      {"Signal name", :signal},
+      {"Idempotency key", :idempotency_key},
+      {"Rewind target event", :to_event},
+      {"Retry decision", :retry_decision},
+      {"Retry reason", :retry_reason},
+      {"Fencing token", :fencing_token}
+    ]
+    |> Enum.map(fn {label, key} ->
+      value = bounded_flow_history_detail(flow_field(fields, key, nil))
+
+      value =
+        if key == :idempotency_key and value == "-" and flow_signal_event?(fields),
+          do: "Not recorded in event",
+          else: value
+
+      {label, value}
+    end)
+  end
+
+  defp with_inline_detail_budget(rows) do
+    fields =
+      Enum.reduce(rows, 0, fn row, count ->
+        count + Enum.count([:error, :reason], &(flow_field(row.fields, &1, nil) not in [nil, ""]))
+      end)
+
+    limit = min(@inline_detail_field_bytes, div(@inline_detail_page_bytes, max(fields, 1)))
+    Enum.map(rows, &Map.put(&1, :inline_detail_limit, limit))
+  end
+
+  defp event_has_inline_error?(row),
+    do: Enum.any?([:error, :reason], &(flow_field(row.fields, &1, nil) not in [nil, ""]))
+
+  defp render_flow_event_errors(row) do
+    fields = row.fields
+    limit = Map.get(row, :inline_detail_limit, @inline_detail_field_bytes)
+
+    [{"Error", :error}, {"Reason", :reason}]
+    |> Enum.map_join("", fn {label, key} ->
+      case flow_field(fields, key, nil) do
+        value when value in [nil, ""] ->
+          ""
+
+        value ->
+          full = bounded_inline_detail(value, limit)
+          preview = bounded_flow_history_detail(full.value)
+
+          note =
+            cond do
+              full.truncated and limit < @inline_detail_field_bytes ->
+                "#{label} preview limited by 64 KiB page budget (#{limit} bytes for this field)"
+
+              full.truncated ->
+                "#{label} preview limited to 8 KiB"
+
+              is_binary(value) ->
+                "Complete #{String.downcase(label)}"
+
+              true ->
+                "#{label} detail (bounded inspection)"
+            end
+
+          """
+          <div class="journal-event-inspector-item"><strong>#{label}</strong><p class="mono">#{escape(preview)}</p></div>
+          <details class="flow-history-full-detail">
+            <summary>#{note}</summary>
+            <pre>#{escape(full.value)}</pre>
+          </details>
+          """
+      end
+    end)
+  end
+
+  defp bounded_inline_detail(value, limit) do
+    preview = FerricstoreServer.Health.Dashboard.ValuePreview.render(value)
+
+    if byte_size(preview.value) > limit do
+      prefix = binary_part(preview.value, 0, limit)
+
+      valid =
+        case :unicode.characters_to_binary(prefix, :utf8, :utf8) do
+          value when is_binary(value) -> value
+          {:incomplete, value, _} -> value
+        end
+
+      %{value: valid, truncated: true}
+    else
+      preview
+    end
+  end
+
+  defp bounded_flow_history_detail(nil), do: "-"
+  defp bounded_flow_history_detail(""), do: "-"
+
+  defp bounded_flow_history_detail(value) when is_binary(value) do
+    if String.length(value) > 512, do: String.slice(value, 0, 512) <> "...", else: value
+  end
+
+  defp bounded_flow_history_detail(value) when is_atom(value) or is_number(value),
+    do: to_string(value)
+
+  defp bounded_flow_history_detail(value),
+    do: inspect(value, limit: 10, printable_limit: 512)
+
+  defp flow_journal_node_class(row) do
+    fields = row.fields
+    label = flow_history_event_label(fields)
+
+    cond do
+      label in ["Failed", "Fail"] or row.to_state == "failed" -> "node-error"
+      label in ["Retry", "Retried"] -> "node-warn"
+      flow_signal_event?(fields) -> "node-warn"
+      flow_history_terminal_event?(fields) -> "node-ok"
+      true -> "node-active"
+    end
+  end
+
+  defp render_flow_history_controls(%{has_older: false, has_newer: false} = page, :ok) do
+    scoped? =
+      Enum.any?(
+        [:older_url, :newer_url, :before, :after_cursor],
+        &(Map.get(page, &1) not in [nil, ""])
+      )
+
+    if scoped? or
+         Map.get(page, :count, @flow_dashboard_history_default_count) !=
+           @flow_dashboard_history_default_count,
+       do: render_flow_history_pagination(page),
+       else: ""
+  end
+
+  defp render_flow_history_controls(page, _status), do: render_flow_history_pagination(page)
 
   def render_flow_history_pagination(nil), do: ""
 
@@ -193,12 +514,39 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
     end
   end
 
-  def render_flow_value_ref_badge(record, mode, %{label: label, ref: ref}) do
-    anchor = flow_value_ref_anchor(ref)
+  def render_flow_value_ref_badge(record, mode, %{label: label, ref: ref} = entry) do
+    source =
+      if Map.get(entry, :source) in ["historical", "history event"],
+        do: "historical",
+        else: "current"
+
+    event_id = Map.get(entry, :event_id)
+
+    suffix =
+      if source == "historical" and event_id not in [nil, ""],
+        do: ":event:" <> Base.url_encode64(to_string(event_id), padding: false),
+        else: ""
+
+    anchor = flow_value_ref_anchor(ref) <> suffix
     href = flow_value_ref_href(record, mode, anchor)
     title = "Open #{label} value"
 
-    ~s(<a class="flow-pill flow-value-ref-link" href="#{escape_attr(href)}" title="#{escape_attr(title)}" aria-label="#{escape_attr(title)}" data-flow-value-ref="#{escape_attr(ref)}" data-flow-value-label="#{escape_attr(label)}">#{escape(label)}</a>)
+    provenance =
+      [
+        {"source", source},
+        {"workflow", if(is_map(record), do: flow_record_id(record), else: nil)},
+        {"partition",
+         if(is_map(record), do: flow_record_partition_key(record) || "auto/global", else: nil)},
+        {"event", Map.get(entry, :event_id)},
+        {"action", Map.get(entry, :action)},
+        {"time", Map.get(entry, :time)}
+      ]
+      |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
+      |> Enum.map_join("", fn {key, value} ->
+        ~s( data-flow-value-#{key}="#{escape_attr(to_string(value))}")
+      end)
+
+    ~s(<a class="flow-pill flow-value-ref-link" href="#{escape_attr(href)}" title="#{escape_attr(title)}" aria-label="#{escape_attr(title)}" data-flow-value-ref="#{escape_attr(ref)}" data-flow-value-label="#{escape_attr(label)}"#{provenance}>#{escape(label)}</a>)
   end
 
   def flow_value_ref_href(record, :detail_link, anchor) when is_map(record) do
@@ -264,28 +612,12 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
   def flow_value_preview(:not_loaded), do: "not loaded"
   def flow_value_preview(nil), do: "missing"
 
-  def flow_value_preview(value) when is_binary(value) do
-    if String.valid?(value) do
-      flow_truncate_preview(value)
-    else
-      value
-      |> inspect(limit: :infinity, printable_limit: @flow_dashboard_value_preview_bytes)
-      |> flow_truncate_preview()
-    end
-  end
-
   def flow_value_preview(value) do
-    value
-    |> inspect(pretty: true, limit: 50, printable_limit: @flow_dashboard_value_preview_bytes)
-    |> flow_truncate_preview()
+    FerricstoreServer.Health.Dashboard.ValuePreview.render(value).value
   end
 
   def flow_truncate_preview(value) when is_binary(value) do
-    if String.length(value) > @flow_dashboard_value_preview_bytes do
-      String.slice(value, 0, @flow_dashboard_value_preview_bytes) <> "\n... truncated ..."
-    else
-      value
-    end
+    flow_value_preview(value)
   end
 
   def flow_history_event_time_ms(event_id, fields) do
@@ -408,11 +740,21 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
     flow_first_non_empty_binary(fields, [:worker, :lease_owner]) || "-"
   end
 
-  def flow_history_refs_summary_html(fields) do
+  def flow_history_refs_summary_html(fields, row \\ nil) do
+    provenance =
+      if is_map(row),
+        do: %{
+          source: "historical",
+          event_id: to_string(row.event_id),
+          action: flow_history_event_label(fields),
+          time: format_timestamp_ms_or_dash(row.time_ms)
+        },
+        else: %{source: "historical"}
+
     badges =
       fields
       |> flow_value_ref_entries("history event")
-      |> Enum.map(&render_flow_value_ref_badge(nil, :local, &1))
+      |> Enum.map(&render_flow_value_ref_badge(nil, :local, Map.merge(&1, provenance)))
 
     case badges do
       [] -> "-"
@@ -439,12 +781,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
 
   def flow_state_class("failed"), do: "c-red"
   def flow_state_class("cancelled"), do: "c-yellow"
-  def flow_state_class("running"), do: "c-green"
   def flow_state_class(_state), do: ""
 
   def flow_state_badge_class("failed"), do: "badge-pressure"
   def flow_state_badge_class("cancelled"), do: "badge-warning"
   def flow_state_badge_class(state) when state in @flow_terminal_states, do: "badge-ok"
-  def flow_state_badge_class("running"), do: "badge-merging"
   def flow_state_badge_class(_state), do: "badge-idle"
 end

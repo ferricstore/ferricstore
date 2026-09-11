@@ -69,6 +69,7 @@ defmodule Ferricstore.Test.IsolatedInstance do
     # Ensure data dir layout (ETS tables created by Shard.init)
     Ferricstore.DataDir.ensure_layout!(tmp_dir, shard_count)
     :ok = Ferricstore.Flow.LMDB.ensure_shard_dirs(tmp_dir, shard_count)
+    {:ok, _pid} = Ferricstore.Flow.LMDBFlushCoordinator.start_link(instance_name: name)
     start_query_services(ctx)
 
     for i <- 0..(shard_count - 1) do
@@ -196,6 +197,8 @@ defmodule Ferricstore.Test.IsolatedInstance do
       end
     end
 
+    stop_lmdb_flush_coordinator(ctx)
+
     # Delete ETS tables
     for i <- 0..(ctx.shard_count - 1) do
       try do
@@ -243,4 +246,13 @@ defmodule Ferricstore.Test.IsolatedInstance do
   end
 
   defp stop_query_services(_ctx), do: :ok
+
+  defp stop_lmdb_flush_coordinator(ctx) do
+    case Process.whereis(Ferricstore.Flow.LMDBFlushCoordinator.name(ctx.name)) do
+      nil -> :ok
+      pid -> GenServer.stop(pid, :normal, 5_000)
+    end
+  catch
+    :exit, _reason -> :ok
+  end
 end

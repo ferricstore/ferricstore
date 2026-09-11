@@ -271,19 +271,47 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         shard_path,
         keydir,
         shard_index,
-        %{name: :default} = instance_ctx,
+        instance_ctx,
         zset_score_index,
         zset_score_lookup,
         flow_index,
         flow_lookup,
         opts
       ) do
+    instance_name = Map.get(instance_ctx || %{}, :name, :default)
+
+    LMDBFlushCoordinator.with_shard_permit(instance_name, shard_index, fn ->
+      do_reconcile_startup_shard(
+        shard_path,
+        keydir,
+        shard_index,
+        instance_ctx,
+        zset_score_index,
+        zset_score_lookup,
+        flow_index,
+        flow_lookup,
+        opts
+      )
+    end)
+  end
+
+  defp do_reconcile_startup_shard(
+         shard_path,
+         keydir,
+         shard_index,
+         %{name: :default} = instance_ctx,
+         zset_score_index,
+         zset_score_lookup,
+         flow_index,
+         flow_lookup,
+         opts
+       ) do
     lmdb_path = LMDB.path(shard_path)
 
     result =
       cond do
         Keyword.get(opts, :force_full_reconcile?, false) ->
-          case reconcile_shard(
+          case do_reconcile_shard(
                  shard_path,
                  keydir,
                  shard_index,
@@ -292,8 +320,10 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
                  zset_score_lookup,
                  flow_index,
                  flow_lookup,
-                 rotate_policy_source?: true,
-                 reset_active_projection?: true
+                 Keyword.merge(opts,
+                   rotate_policy_source?: true,
+                   reset_active_projection?: true
+                 )
                ) do
             :ok ->
               :telemetry.execute(
@@ -313,7 +343,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
           end
 
         LMDB.flush_in_progress?(lmdb_path) ->
-          case reconcile_shard(
+          case do_reconcile_shard(
                  shard_path,
                  keydir,
                  shard_index,
@@ -322,8 +352,10 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
                  zset_score_lookup,
                  flow_index,
                  flow_lookup,
-                 rotate_policy_source?: true,
-                 reset_active_projection?: true
+                 Keyword.merge(opts,
+                   rotate_policy_source?: true,
+                   reset_active_projection?: true
+                 )
                ) do
             :ok ->
               :telemetry.execute(
@@ -343,7 +375,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
           end
 
         not LMDB.env_present?(lmdb_path) ->
-          case reconcile_shard(
+          case do_reconcile_shard(
                  shard_path,
                  keydir,
                  shard_index,
@@ -352,8 +384,10 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
                  zset_score_lookup,
                  flow_index,
                  flow_lookup,
-                 rotate_policy_source?: true,
-                 reset_active_projection?: true
+                 Keyword.merge(opts,
+                   rotate_policy_source?: true,
+                   reset_active_projection?: true
+                 )
                ) do
             :ok ->
               :telemetry.execute(
@@ -417,19 +451,19 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     end
   end
 
-  def reconcile_startup_shard(
-        shard_path,
-        keydir,
-        shard_index,
-        instance_ctx,
-        zset_score_index,
-        zset_score_lookup,
-        flow_index,
-        flow_lookup,
-        opts
-      ) do
+  defp do_reconcile_startup_shard(
+         shard_path,
+         keydir,
+         shard_index,
+         instance_ctx,
+         zset_score_index,
+         zset_score_lookup,
+         flow_index,
+         flow_lookup,
+         opts
+       ) do
     with :ok <-
-           reconcile_shard(
+           do_reconcile_shard(
              shard_path,
              keydir,
              shard_index,
@@ -437,7 +471,8 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
              zset_score_index,
              zset_score_lookup,
              flow_index,
-             flow_lookup
+             flow_lookup,
+             opts
            ) do
       maybe_run_shared_ref_backfill(
         shard_path,
@@ -472,7 +507,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
                flow_index,
                flow_lookup
              ) do
-        reconcile_shard(
+        do_reconcile_shard(
           shard_path,
           keydir,
           shard_index,

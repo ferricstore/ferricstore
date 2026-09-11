@@ -1,7 +1,7 @@
 <% data = assigns.data %>
 <% filters = flow_failures_page_filters(data) %>
-<div class="flow-filter-panel">
-  <form class="flow-filter-form" action="/dashboard/flow/failures" method="get">
+<div class="flow-filter-panel flow-failure-filter-panel">
+  <form class="flow-filter-form flow-failure-filter-form" action="/dashboard/flow/failures" method="get">
     <label>
       Type
       <input class="flow-search-input mono" type="search" name="type" value="<%= escape_attr(filters.type || "") %>" list="flow-failure-type-options" placeholder="workflow type" autocomplete="off" title="Filter by workflow type; required for exact scan">
@@ -19,11 +19,18 @@
       Limit
       <input class="flow-search-input mono flow-filter-limit" type="number" min="1" max="200" name="limit" value="<%= filters.limit %>" title="Maximum rows to render">
     </label>
-    <label class="flow-check-label" title="Run bounded exact FLOW.QUERY plans for one workflow type in the selected partition.">
-      <input type="checkbox" name="exact" value="true" <%= if Map.get(filters, :scan_exact, false), do: "checked", else: "" %>>
-      Exact scan
-    </label>
+    <fieldset class="flow-scan-mode" role="radiogroup" aria-label="Scan precision">
+      <legend>Scan precision</legend>
+      <label title="Use the fast bounded dashboard sample.">
+        <input type="radio" name="exact" value="false" <%= unless Map.get(filters, :scan_exact, false), do: "checked", else: "" %>>
+        <span>Sample</span>
+      </label>
+      <label title="Run bounded exact FLOW.QUERY plans for one workflow type in the selected partition.">
+        <input type="radio" name="exact" value="true" <%= if Map.get(filters, :scan_exact, false), do: "checked", else: "" %>>
+        <span>Exact</span>
+      </label>
+    </fieldset>
     <button class="flow-search-button" type="submit">Apply</button>
   </form>
-  <span class="flow-filter-note">Default view uses the bounded dashboard sample. Exact scan requires a workflow type and partition, then uses FLOW.QUERY. ID contains filters the returned bounded rows. Actions are explicit.</span>
+  <span class="flow-filter-note">Sample is fast and bounded. Exact scan requires a workflow type and partition, then uses FLOW.QUERY. ID contains filters the returned bounded rows.</span>
 </div>

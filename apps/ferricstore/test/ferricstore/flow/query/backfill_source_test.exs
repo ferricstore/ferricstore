@@ -1,8 +1,8 @@
 defmodule Ferricstore.Flow.Query.BackfillSourceTest do
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Flow.{Keys, LMDB, PolicyMigration, StorageScope}
-  alias Ferricstore.Flow.Query.BackfillSource
+  alias Ferricstore.Flow.{Keys, LMDB, Locator, PolicyMigration, StorageScope}
+  alias Ferricstore.Flow.Query.{BackfillSource, QueryRowCodec}
 
   setup do
     suffix = System.unique_integer([:positive, :monotonic])
@@ -250,7 +250,80 @@ defmodule Ferricstore.Flow.Query.BackfillSourceTest do
 
     assert page.done?
     assert page.scanned_entries == 1
-    assert page.records == [%{state_key: state_key, record: nil, expire_at_ms: 0}]
+
+    assert page.records == [
+             %{
+               state_key: state_key,
+               record: nil,
+               expire_at_ms: 0,
+               projection_guard: :missing
+             }
+           ]
+  end
+
+  test "hydrates a retained terminal query row when the live state key is absent", %{ctx: ctx} do
+    build_id = "retained-terminal-state"
+    state_key = Keys.state_key("completed", "tenant-a")
+
+    record =
+      encoded_record("completed", "tenant-a", 3, "completed")
+      |> Ferricstore.Flow.decode_record()
+
+    expiry = 9_000_000_000_000
+    put_catalog_member!(ctx, record.type, state_key, 0)
+
+    assert :ok =
+             LMDB.write_batch(lmdb_path(ctx), [
+               {:put, state_key, query_row_blob!(state_key, record, expiry)}
+             ])
+
+    snapshot_all!(ctx, build_id, 1)
+
+    assert {:ok, page} =
+             BackfillSource.page(ctx, 0, build_id, "", 1, 1_024 * 1_024,
+               read_entries_fun: fn _ctx, 0, [^state_key] -> {:ok, [nil]} end
+             )
+
+    assert [projected] = page.records
+    assert projected.state_key == state_key
+    assert projected.expire_at_ms == expiry
+    assert projected.record.id == "completed"
+    assert projected.record.state == "completed"
+    assert projected.record.version == 3
+    assert {:value, encoded_guard} = projected.projection_guard
+    assert is_binary(encoded_guard)
+  end
+
+  test "does not resurrect a retained nonterminal row after its live state disappears", %{
+    ctx: ctx
+  } do
+    build_id = "stale-active-state"
+    state_key = Keys.state_key("stale-active", "tenant-a")
+
+    record =
+      encoded_record("stale-active", "tenant-a", 2, "running")
+      |> Ferricstore.Flow.decode_record()
+
+    put_catalog_member!(ctx, record.type, state_key, 0)
+
+    assert :ok =
+             LMDB.write_batch(lmdb_path(ctx), [
+               {:put, state_key, query_row_blob!(state_key, record, 0)}
+             ])
+
+    snapshot_all!(ctx, build_id, 1)
+
+    assert {:ok, page} =
+             BackfillSource.page(ctx, 0, build_id, "", 1, 1_024 * 1_024,
+               read_entries_fun: fn _ctx, 0, [^state_key] -> {:ok, [nil]} end
+             )
+
+    assert [tombstone] = page.records
+    assert tombstone.state_key == state_key
+    assert tombstone.record == nil
+    assert tombstone.expire_at_ms == 0
+    assert {:value, encoded_guard} = tombstone.projection_guard
+    assert is_binary(encoded_guard)
   end
 
   test "preserves the primary storage expiry for active records", %{ctx: ctx} do
@@ -269,6 +342,135 @@ defmodule Ferricstore.Flow.Query.BackfillSourceTest do
              )
 
     assert [%{state_key: ^state_key, expire_at_ms: ^expiry}] = page.records
+  end
+
+  test "backfills a cold-parked scheduled row without reading its WAL payload", %{ctx: ctx} do
+    {state_key, row_blob, park_blob, row} = parked_row!(ctx)
+    page = parked_page!(ctx)
+    assert [projected] = page.records
+    assert projected.record == row.record
+    assert projected.projection_guard == {:parked, row_blob, park_blob}
+    assert page.hydrated_bytes == byte_size(row_blob) + byte_size(park_blob)
+
+    definition =
+      Ferricstore.Flow.Query.IndexDefinition.new!(%{
+        id: "parked_by_updated",
+        version: 1,
+        fields: [{:partition_key, :asc}, {:updated_at_ms, :desc}]
+      })
+
+    assert {:ok, %{projected_records: 1}} =
+             Ferricstore.Flow.Query.CompositeBackfill.project_page(
+               ctx,
+               0,
+               page.records,
+               [definition],
+               projection_definitions: [definition],
+               read_entries_fun: fn _, _, _ ->
+                 flunk("guarded parked metadata needs no WAL read")
+               end
+             )
+
+    assert {:ok, 1} =
+             Ferricstore.Flow.Query.IndexValidation.DataPasses.validate_source_rows(
+               ctx,
+               0,
+               [definition],
+               [state_key],
+               1_048_576,
+               []
+             )
+
+    assert :ok =
+             LMDB.write_batch(lmdb_path(ctx), [
+               {:delete, LMDB.cold_park_key_for_state_key(state_key)}
+             ])
+
+    assert {:error, :query_backfill_concurrent_change} =
+             Ferricstore.Flow.Query.CompositeBackfill.project_page(
+               ctx,
+               0,
+               page.records,
+               [definition],
+               projection_definitions: [definition]
+             )
+
+    tombstone_page = parked_page!(ctx)
+    assert [tombstone] = tombstone_page.records
+    assert tombstone.record == nil
+
+    assert :ok =
+             LMDB.write_batch(lmdb_path(ctx), [
+               {:put, LMDB.cold_park_key_for_state_key(state_key), park_blob}
+             ])
+
+    assert {:error, :query_backfill_concurrent_change} =
+             Ferricstore.Flow.Query.CompositeBackfill.project_page(
+               ctx,
+               0,
+               tombstone_page.records,
+               [definition],
+               projection_definitions: [definition]
+             )
+
+    assert {:ok, 1} =
+             Ferricstore.Flow.Query.IndexValidation.DataPasses.validate_source_rows(
+               ctx,
+               0,
+               [definition],
+               [state_key],
+               1_048_576,
+               []
+             )
+  end
+
+  test "mismatched or corrupt parked metadata is not treated as deletion", %{ctx: ctx} do
+    {state_key, _row_blob, park_blob, row} = parked_row!(ctx)
+    park_key = LMDB.cold_park_key_for_state_key(state_key)
+    {:ok, park} = LMDB.decode_cold_park(park_blob)
+    stale = LMDB.encode_cold_park(%{row.locator | version: row.record.version + 1}, park)
+    assert :ok = LMDB.write_batch(lmdb_path(ctx), [{:put, park_key, stale}])
+    assert {:error, :query_backfill_concurrent_change} = parked_page(ctx)
+    assert :ok = LMDB.write_batch(lmdb_path(ctx), [{:put, park_key, "corrupt"}])
+    assert {:error, :corrupt_query_backfill_record} = parked_page(ctx)
+  end
+
+  defp parked_row!(ctx) do
+    key = Keys.state_key("parked", "tenant-a")
+    record = encoded_record("parked", "tenant-a", 3, "queued") |> Ferricstore.Flow.decode_record()
+    blob = query_row_blob!(key, record, 0)
+    {:ok, row} = QueryRowCodec.decode(blob, key)
+
+    park =
+      LMDB.encode_cold_park(row.locator, %{
+        state_key: key,
+        type: record.type,
+        state: record.state,
+        partition_key: record.partition_key,
+        due_at_ms: record.next_run_at_ms
+      })
+
+    put_catalog_member!(ctx, record.type, key, 0)
+
+    assert :ok =
+             LMDB.write_batch(lmdb_path(ctx), [
+               {:put, key, blob},
+               {:put, LMDB.cold_park_key_for_state_key(key), park}
+             ])
+
+    snapshot_all!(ctx, "parked-build", 1)
+    {key, blob, park, row}
+  end
+
+  defp parked_page(ctx) do
+    BackfillSource.page(ctx, 0, "parked-build", "", 1, 1_048_576,
+      read_entries_fun: fn _, _, [_key] -> {:ok, [nil]} end
+    )
+  end
+
+  defp parked_page!(ctx) do
+    assert {:ok, page} = parked_page(ctx)
+    page
   end
 
   defp snapshot_all!(ctx, build_id, page_size) do
@@ -290,11 +492,11 @@ defmodule Ferricstore.Flow.Query.BackfillSourceTest do
              ])
   end
 
-  defp encoded_record(id, partition_key, version) do
+  defp encoded_record(id, partition_key, version, state \\ "failed") do
     %{
       id: id,
       type: "invoice",
-      state: "failed",
+      state: state,
       version: version,
       attempts: 0,
       fencing_token: 0,
@@ -324,6 +526,26 @@ defmodule Ferricstore.Flow.Query.BackfillSourceTest do
       child_groups: %{}
     }
     |> Ferricstore.Flow.encode_record()
+  end
+
+  defp query_row_blob!(state_key, record, expire_at_ms) do
+    locator =
+      Locator.new!(
+        flow_id: record.id,
+        kind: :state,
+        version: record.version,
+        raft_index: record.version,
+        file_id: {:waraft_apply_projection, record.version},
+        offset: 0,
+        value_size: 512,
+        checksum: :crypto.hash(:sha256, Ferricstore.Flow.encode_record(record)),
+        expire_at_ms: expire_at_ms,
+        segment_generation: 0,
+        frame_size: 1_024
+      )
+
+    assert {:ok, encoded} = QueryRowCodec.encode(state_key, record, locator, expire_at_ms)
+    encoded
   end
 
   defp scope_metadata(value), do: %{0x8001 => {1, :uint64, :isolation_scope, value}}

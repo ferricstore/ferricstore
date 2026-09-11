@@ -9,7 +9,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowScheduleSafetyTest do
     :ok
   end
 
-  test "Fire and Delete render server-validated confirmation forms" do
+  test "every schedule mutation renders state/version fencing and duplicate-submit protection" do
     html =
       FlowSchedules.render_flow_schedules_table(
         [%{id: "daily", state: "active", version: 7, target: %{type: "email"}}],
@@ -26,6 +26,9 @@ defmodule FerricstoreServer.Health.Dashboard.FlowScheduleSafetyTest do
     assert html =~ ~s(name="q" value="day")
     assert html =~ ~s(name="limit" value="25")
     assert html =~ ~s(data-dashboard-single-submit)
+
+    assert html =~
+             ~r/<form[^>]*data-dashboard-single-submit[^>]*>.*?name="action" value="pause".*?name="expected_state" value="active".*?name="expected_version" value="7"/s
   end
 
   test "Fire requires explicit confirmation and does not mutate on rejection" do
@@ -61,6 +64,26 @@ defmodule FerricstoreServer.Health.Dashboard.FlowScheduleSafetyTest do
     assert {:ok, %{} = _current} = FerricStore.flow_schedule_get(schedule.id)
   end
 
+  test "Pause and Resume reject stale or duplicate submissions" do
+    schedule = create_schedule("pause-resume")
+    pause = state_change_params(schedule, "pause")
+
+    assert {:ok, _message} = Schedules.apply_form(pause)
+    assert {:error, duplicate_pause} = Schedules.apply_form(pause)
+    assert duplicate_pause =~ "changed"
+
+    assert {:ok, paused} = FerricStore.flow_schedule_get(schedule.id)
+    assert paused.state == "paused"
+
+    resume = state_change_params(paused, "resume")
+    assert {:ok, _message} = Schedules.apply_form(resume)
+    assert {:error, duplicate_resume} = Schedules.apply_form(resume)
+    assert duplicate_resume =~ "changed"
+
+    assert {:ok, resumed} = FerricStore.flow_schedule_get(schedule.id)
+    assert resumed.state == "active"
+  end
+
   defp create_schedule(label) do
     id = "dashboard-schedule-safety-#{label}-#{System.unique_integer([:positive])}"
     now_ms = System.system_time(:millisecond)
@@ -83,6 +106,15 @@ defmodule FerricstoreServer.Health.Dashboard.FlowScheduleSafetyTest do
       "id" => schedule.id,
       "action" => action,
       "confirm_action" => "true",
+      "expected_state" => schedule.state,
+      "expected_version" => Integer.to_string(schedule.version)
+    }
+  end
+
+  defp state_change_params(schedule, action) do
+    %{
+      "id" => schedule.id,
+      "action" => action,
       "expected_state" => schedule.state,
       "expected_version" => Integer.to_string(schedule.version)
     }

@@ -2,11 +2,12 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
   @moduledoc false
 
   alias Ferricstore.{DataDir, Health, MemoryGuard, NamespaceConfig, SlowLog, Stats}
+  alias Ferricstore.Flow.PolicyMigrationWorker
   alias Ferricstore.Merge.Scheduler, as: MergeScheduler
-  alias Ferricstore.Raft.Cluster, as: RaftCluster
   alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.Store.SegmentFilename
   alias FerricstoreServer.Health.Dashboard.StorageSnapshotCache
+  alias FerricstoreServer.Health.Dashboard.Data.Clients
 
   import FerricstoreServer.Health.Dashboard.Format, only: [safe_ets_size: 1]
 
@@ -14,34 +15,77 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
     only: [config_command_reference: 0, runtime_config_parameter_reference: 0]
 
   @default_storage_summary_ttl_ms 30_000
-  @dashboard_client_limit 500
 
   def collect_dashboard(flow_summary) do
+    slowlog = slowlog_snapshot()
+
     %{
+      generated_at_ms: System.system_time(:millisecond),
       overview: collect_overview(),
       shards: collect_shards(),
       hotcold: collect_hotcold(),
       memory: collect_memory(),
       connections: collect_connections(),
-      slowlog: collect_slowlog(),
+      slowlog: slowlog.entries,
+      slowlog_status: slowlog.status,
+      slowlog_error: slowlog.error,
       merge: collect_merge(),
       namespace_config: NamespaceConfig.get_all(),
       cluster: collect_cluster(),
       lifecycle: collect_lifecycle(),
       flow_summary: flow_summary,
+      subsystem_health: collect_subsystem_health(),
       storage_summary: collect_storage_summary()
     }
   end
 
-  def collect_slowlog_page, do: %{slowlog: collect_slowlog()}
+  def collect_subsystem_health do
+    policy_migration =
+      if Application.get_env(:ferricstore, :flow_policy_migration_worker_enabled, true) do
+        case FerricStore.Instance.fetch(:default) do
+          {:ok, ctx} -> PolicyMigrationWorker.health_snapshot(ctx)
+          :error -> %{status: :unavailable, issues: [], updated_at_ms: nil}
+        end
+      else
+        %{status: :disabled, issues: [], updated_at_ms: nil}
+      end
+
+    %{policy_migration: policy_migration}
+  end
+
+  def collect_slowlog_page do
+    snapshot = slowlog_snapshot()
+    %{slowlog: snapshot.entries, slowlog_status: snapshot.status, slowlog_error: snapshot.error}
+  end
+
   def collect_merge_page, do: %{merge: collect_merge()}
 
   def collect_config_page do
     %{
       namespace_config: NamespaceConfig.get_all(),
       config_commands: config_command_reference(),
-      config_parameters: runtime_config_parameter_reference()
+      config_parameters: collect_config_parameters()
     }
+  end
+
+  defp collect_config_parameters do
+    values =
+      try do
+        Ferricstore.Config.get("*") |> Map.new()
+      catch
+        :exit, _ -> %{}
+      end
+
+    Enum.map(runtime_config_parameter_reference(), fn entry ->
+      {value, source} =
+        if entry.parameter == "log_level" do
+          {to_string(Logger.level()), "Logger.level"}
+        else
+          {Map.get(values, entry.parameter), "CONFIG GET"}
+        end
+
+      Map.merge(entry, %{value: value, source: if(is_nil(value), do: "Unavailable", else: source)})
+    end)
   end
 
   def collect_raft_page do
@@ -54,16 +98,15 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
     end
   end
 
-  def collect_clients_page do
-    snapshot = collect_client_snapshot()
+  def collect_clients_page(opts \\ []) do
+    snapshot = Clients.snapshot(opts)
 
-    connections =
-      collect_connections()
-      |> Map.put(:pubsub, snapshot.pubsub)
-      |> Map.put(:transactions, snapshot.transactions)
-      |> Map.put(:oldest_age_seconds, snapshot.oldest_age_seconds)
-
-    %{clients: snapshot.clients, connections: connections}
+    %{
+      clients: snapshot.clients,
+      connections: Map.put(collect_connections(), :summary_scope, :shown),
+      client_coverage: Map.drop(snapshot, [:clients]),
+      client_filters: snapshot.filters
+    }
   end
 
   def collect_storage_page do
@@ -168,27 +211,35 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
 
   def collect_memory do
     try do
-      stats = MemoryGuard.stats()
-
-      %{
-        total_bytes: stats.total_bytes,
-        max_bytes: stats.max_bytes,
-        ratio: stats.ratio,
-        pressure_level: stats.pressure_level,
-        eviction_policy: stats.eviction_policy,
-        shards: stats.shards
-      }
+      MemoryGuard.stats() |> memory_snapshot()
     catch
       :exit, _ ->
         %{
           total_bytes: 0,
           max_bytes: 0,
           ratio: 0.0,
-          pressure_level: :ok,
+          pressure_level: :unavailable,
           eviction_policy: :volatile_lru,
           shards: %{}
         }
     end
+  end
+
+  def memory_snapshot(stats) do
+    Map.take(stats, [
+      :total_bytes,
+      :max_bytes,
+      :ratio,
+      :pressure_level,
+      :eviction_policy,
+      :shards,
+      :rss_bytes,
+      :rss_ratio,
+      :rss_pressure_level,
+      :memory_limit,
+      :keydir_bytes,
+      :keydir_max_ram
+    ])
   end
 
   def collect_connections do
@@ -199,16 +250,22 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
     }
   end
 
-  def collect_slowlog do
+  def collect_slowlog, do: slowlog_snapshot().entries
+
+  def slowlog_snapshot(reader \\ &SlowLog.get/1) do
     try do
-      SlowLog.get(128)
-      |> Enum.map(fn {id, timestamp_us, duration_us, command} ->
-        %{id: id, timestamp_us: timestamp_us, duration_us: duration_us, command: command}
-      end)
+      entries =
+        reader.(128)
+        |> Enum.take(128)
+        |> Enum.map(fn {id, timestamp_us, duration_us, command} ->
+          %{id: id, timestamp_us: timestamp_us, duration_us: duration_us, command: command}
+        end)
+
+      %{status: :ok, entries: entries, error: nil}
     rescue
-      _ -> []
+      error -> %{status: :unavailable, entries: [], error: Exception.message(error)}
     catch
-      :exit, _ -> []
+      kind, reason -> %{status: :unavailable, entries: [], error: inspect({kind, reason})}
     end
   end
 
@@ -538,155 +595,110 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
     Enum.map(0..(shard_count() - 1), &collect_waraft_overview/1)
   end
 
-  def collect_waraft_overview(i) do
-    case RaftCluster.members(i, 1_000) do
-      {:ok, members, leader} ->
-        {last_applied, term} =
-          case WARaftBackend.storage_position(i) do
-            {:ok, {:raft_log_pos, index, position_term}}
-            when is_integer(index) and is_integer(position_term) ->
-              {index, position_term}
+  def collect_waraft_overview(i, opts \\ []) do
+    readers = [
+      Keyword.get(opts, :status, &WARaftBackend.status/1),
+      Keyword.get(opts, :position, &WARaftBackend.storage_position/1)
+    ]
 
-            _other ->
-              {0, 0}
-          end
-
-        %{
-          shard: i,
-          status: :ok,
-          leader: leader,
-          current_term: term,
-          commit_index: last_applied,
-          last_applied: last_applied,
-          log_size: 0,
-          members: members
-        }
-
-      _error ->
-        unavailable_raft_shard(i)
-    end
-  catch
-    :exit, _ -> unavailable_raft_shard(i)
-  end
-
-  def collect_client_list do
-    collect_client_snapshot().clients
-  end
-
-  defp collect_client_snapshot do
-    try do
-      snapshot = FerricstoreServer.Connection.Registry.snapshot(@dashboard_client_limit)
-
-      if snapshot.registered_count > 0 do
-        now = System.monotonic_time(:millisecond)
-
-        %{
-          clients: collect_client_list_from_registry(snapshot.clients),
-          pubsub: snapshot.pubsub_count,
-          transactions: snapshot.transaction_count,
-          oldest_age_seconds: max(0, div(now - (snapshot.oldest_created_at_ms || now), 1_000))
-        }
-      else
-        ranch_clients = collect_client_list_from_ranch()
-
-        %{
-          clients: Enum.take(ranch_clients, @dashboard_client_limit),
-          pubsub: Enum.count(ranch_clients, &String.contains?(&1.flags, "S")),
-          transactions: Enum.count(ranch_clients, &String.contains?(&1.flags, "M")),
-          oldest_age_seconds: ranch_clients |> Enum.map(& &1.age_seconds) |> Enum.max(fn -> 0 end)
-        }
+    readers =
+      case Keyword.get(opts, :members) do
+        reader when is_function(reader, 1) -> readers ++ [reader]
+        _ -> readers
       end
-    catch
-      _, _ -> %{clients: [], pubsub: 0, transactions: 0, oldest_age_seconds: 0}
-    end
-  end
 
-  defp collect_client_list_from_registry(summaries) do
-    now = System.monotonic_time(:millisecond)
-
-    Enum.map(summaries, fn summary ->
-      created =
-        if is_integer(Map.get(summary, :created_at_ms)),
-          do: Map.get(summary, :created_at_ms),
-          else: now
-
-      %{
-        pid: Map.get(summary, :pid, self()),
-        client_id: Map.get(summary, :client_id),
-        client_name: Map.get(summary, :client_name),
-        username: Map.get(summary, :username),
-        peer: Map.get(summary, :peer, "unknown"),
-        age_seconds: max(0, div(now - created, 1000)),
-        flags: Map.get(summary, :flags, "")
-      }
-    end)
-  end
-
-  defp collect_client_list_from_ranch do
-    try do
-      pids = :ranch.procs(FerricstoreServer.Native.Listener, :connections)
-      now = System.monotonic_time(:millisecond)
-
-      Enum.map(pids, fn pid ->
-        info = Process.info(pid, [:dictionary, :current_function])
-
-        {peer, age, flags} =
-          case info do
-            nil ->
-              {"unknown:0", 0, ""}
-
-            kw ->
-              dict = Keyword.get(kw, :dictionary, [])
-              state = Keyword.get(dict, :"$conn_state", nil)
-
-              peer_str =
-                case state do
-                  %{peer: {ip, port}} -> "#{:inet.ntoa(ip) |> to_string()}:#{port}"
-                  _ -> "unknown:0"
-                end
-
-              created =
-                case state do
-                  %{created_at: ts} when is_integer(ts) -> ts
-                  _ -> now
-                end
-
-              flag_list =
-                []
-                |> then(fn f ->
-                  if state && Map.get(state, :multi_state) == :queuing, do: ["M" | f], else: f
-                end)
-                |> then(fn f ->
-                  if state && Map.get(state, :pubsub_channels), do: ["S" | f], else: f
-                end)
-                |> then(fn f ->
-                  if state && Map.get(state, :tracking) && Map.get(state.tracking, :enabled),
-                    do: ["T" | f],
-                    else: f
-                end)
-
-              {peer_str, max(0, div(now - created, 1000)), Enum.join(flag_list)}
-          end
-
-        %{pid: pid, peer: peer, age_seconds: age, flags: flags}
+    # Storage's public deadline is much longer than a dashboard request. These
+    # read-only workers are scoped to one shard and killed on deadline expiry.
+    [status, position | membership] =
+      Task.async_stream(readers, &safe_raft_read(&1, i),
+        max_concurrency: 3,
+        timeout: Keyword.get(opts, :timeout, 1_000),
+        on_timeout: :kill_task
+      )
+      |> Enum.map(fn
+        {:ok, result} -> result
+        {:exit, reason} -> {:error, reason}
       end)
-    catch
-      _, _ -> []
+
+    members =
+      case membership do
+        [result] -> result
+        [] -> raft_membership(status)
+      end
+
+    raft_snapshot(i, members, status, position)
+  end
+
+  defp raft_membership(status) when is_list(status) do
+    case Keyword.get(status, :config) do
+      %{version: 1, membership: members} = config when is_list(members) ->
+        members =
+          Enum.map(:wa_raft_server.get_config_members(config), fn {:raft_identity, name,
+                                                                   member_node} ->
+            {name, member_node}
+          end)
+
+        identity = {Keyword.get(status, :leader_name), Keyword.get(status, :leader_id)}
+        leader = Enum.find(members, &(&1 == identity))
+        {:ok, members, leader}
+
+      _ ->
+        {:error, :unavailable}
     end
   end
 
-  defp unavailable_raft_shard(i) do
+  defp raft_membership(_status), do: {:error, :unavailable}
+
+  defp safe_raft_read(reader, index) do
+    reader.(index)
+  rescue
+    error -> {:error, Exception.message(error)}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  def raft_snapshot(i, membership, server_status, position) do
+    status =
+      if is_list(server_status) and Keyword.keyword?(server_status), do: server_status, else: []
+
+    term = raft_index(Keyword.get(status, :current_term))
+    commit = raft_index(Keyword.get(status, :commit_index))
+
+    applied =
+      case position do
+        {:ok, {:raft_log_pos, index, _term}} -> raft_index(index)
+        _ -> nil
+      end
+
+    {members, leader, membership_ok?} =
+      case membership do
+        {:ok, members, leader} when is_list(members) -> {members, leader, true}
+        _ -> {[], nil, false}
+      end
+
+    available = Enum.count([term, commit, applied], &is_integer/1)
+
     %{
       shard: i,
-      status: :unavailable,
-      leader: nil,
-      current_term: 0,
-      commit_index: 0,
-      last_applied: 0,
-      log_size: 0,
-      members: []
+      status:
+        cond do
+          membership_ok? and available == 3 -> :ok
+          membership_ok? or available > 0 -> :partial
+          true -> :unavailable
+        end,
+      leader: leader,
+      current_term: term,
+      commit_index: commit,
+      last_applied: applied,
+      log_size: nil,
+      members: members
     }
   end
+
+  defp raft_index(value) when is_integer(value) and value >= 0, do: value
+  defp raft_index(_value), do: nil
+
+  def collect_client_list, do: Clients.snapshot().clients
 
   defp shard_count, do: :persistent_term.get(:ferricstore_shard_count, 4)
 end

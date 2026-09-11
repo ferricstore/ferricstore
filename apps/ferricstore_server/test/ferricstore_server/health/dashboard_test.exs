@@ -66,8 +66,10 @@ defmodule FerricstoreServer.Health.DashboardTest do
           ".acl-action-note",
           ".sidebar-session span"
         ] do
-      assert css =~ "#{selector} { color: #94a3b8;"
+      assert css =~ "#{selector} { color: var(--text-muted);"
     end
+
+    assert css =~ "--text-muted: #a5b4b0;"
   end
 
   test "Flow governance budget table renders remaining overage and reservation columns" do

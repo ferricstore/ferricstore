@@ -3,7 +3,7 @@
 <body data-dashboard-live-page="prefixes" data-dashboard-live-url="/dashboard/api/prefixes" data-dashboard-live-interval-ms="10000">
 <div class="layout">
 <%= render_sidebar_static("prefixes") %>
-<main class="main-content">
+<main class="main-content" id="dashboard-main" tabindex="-1">
 <%= render_subpage_header("Key Prefixes") %>
 <div class="content">
 <%= render_page_intro("Key Prefixes", "Sample keydir distribution by prefix and correlate prefix size with sampled hot/cold read pressure.") %>

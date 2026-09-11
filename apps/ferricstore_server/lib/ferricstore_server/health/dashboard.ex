@@ -222,8 +222,8 @@ defmodule FerricstoreServer.Health.Dashboard do
           clients: [Types.client_data()],
           connections: Types.connections_data()
         }
-  def collect_clients_page do
-    Operational.collect_clients_page()
+  def collect_clients_page(opts \\ []) do
+    Operational.collect_clients_page(opts)
   end
 
   @doc """
@@ -273,15 +273,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
   @spec collect_doctor_page(map() | keyword()) :: map()
   def collect_doctor_page(opts \\ %{}) do
-    check = doctor_command(["CHECK"])
-    jobs = doctor_command(["LIST"])
-
-    %{
-      check: check,
-      jobs: Map.get(jobs, "jobs", []),
-      flash: doctor_flash(opts),
-      command_reference: doctor_command_reference()
-    }
+    FerricstoreServer.Health.Dashboard.DoctorSupport.collect_page(opts)
   end
 
   @doc """
@@ -300,9 +292,11 @@ defmodule FerricstoreServer.Health.Dashboard do
         normalize_doctor_form_result(doctor_command(["START", "CHECK", "SCOPE", scope]))
 
       "repair_flow_lmdb" ->
-        normalize_doctor_form_result(
-          doctor_command(["START", "REPAIR", "PROJECTIONS", "SCOPE", "FLOW_LMDB"])
-        )
+        with :ok <- validate_doctor_repair_confirmation(params) do
+          normalize_doctor_form_result(
+            doctor_command(["START", "REPAIR", "PROJECTIONS", "SCOPE", "FLOW_LMDB"])
+          )
+        end
 
       "cancel" ->
         job_id = params |> Map.get("job_id", "") |> String.trim()
@@ -315,6 +309,19 @@ defmodule FerricstoreServer.Health.Dashboard do
 
       _ ->
         {:error, "unknown doctor action"}
+    end
+  end
+
+  defp validate_doctor_repair_confirmation(params) do
+    cond do
+      Map.get(params, "confirm_action") not in ["true", "on", "yes", "1"] ->
+        {:error, "repair confirmation is required"}
+
+      Map.get(params, "expected_action") != "repair_flow_lmdb" ->
+        {:error, "repair action changed; review it again"}
+
+      true ->
+        :ok
     end
   end
 
@@ -562,8 +569,9 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc """
   Builds a live component payload for dashboard API paths.
   """
-  @spec live_payload(binary()) :: {:ok, map()} | :not_found
-  @spec live_payload(binary(), keyword() | map()) :: {:ok, map()} | :not_found
+  @spec live_payload(binary()) :: {:ok, map()} | {:error, :invalid_filters, binary()} | :not_found
+  @spec live_payload(binary(), keyword() | map()) ::
+          {:ok, map()} | {:error, :invalid_filters, binary()} | :not_found
   def live_payload(path), do: LivePayload.live_payload(path)
   def live_payload(path, opts), do: LivePayload.live_payload(path, opts)
 
@@ -684,6 +692,11 @@ defmodule FerricstoreServer.Health.Dashboard do
   @spec apply_flow_failures_form(map()) :: {:ok, map()} | {:error, binary()}
   def apply_flow_failures_form(params), do: Recovery.apply_form(params)
 
+  @doc false
+  @spec flow_failures_redirect_location(map(), {:ok, map()} | {:error, binary()}) :: binary()
+  def flow_failures_redirect_location(params, result),
+    do: Recovery.redirect_location(params, result)
+
   @doc "Renders the Flow failures and recovery page."
   @spec render_flow_failures_page(map()) :: binary()
   def render_flow_failures_page(data) do
@@ -784,6 +797,9 @@ defmodule FerricstoreServer.Health.Dashboard do
   def render_flow_detail_page(data) do
     render_template(Templates.flow_detail(%{data: data}))
   end
+
+  def render_flow_action_error_page(data),
+    do: render_template(Templates.flow_action_error(%{data: data}))
 
   @spec render_template(binary()) :: binary()
   defp render_template(html), do: String.trim_leading(html)

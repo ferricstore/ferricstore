@@ -686,6 +686,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
       defp flow_require_schedule_version(_record, _expected_version),
         do: {:error, "ERR flow schedule changed concurrently"}
 
+      defp flow_require_expected_version(_record, nil), do: :ok
+
+      defp flow_require_expected_version(%{version: expected_version}, expected_version), do: :ok
+
+      defp flow_require_expected_version(_record, _expected_version),
+        do: {:error, "ERR flow changed concurrently"}
+
       defp flow_require_schedule_active(%{state: "active"}), do: :ok
       defp flow_require_schedule_active(_record), do: {:error, "ERR flow schedule is not active"}
 
@@ -1465,7 +1472,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
         do: {:error, "ERR flow items must be a non-empty list"}
 
       defp flow_prepare_cancel_existing_record(record, attrs, now_ms) do
-        with :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)),
+        with :ok <- flow_require_expected_version(record, Map.get(attrs, :expected_version)),
+             :ok <- flow_require_expected_state(record, Map.get(attrs, :expect_state)),
+             :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)),
              :ok <- flow_reject_terminal_current(record),
              :ok <- flow_require_transition_lease(record, Map.get(attrs, :lease_token)) do
           version = Map.fetch!(record, :version) + 1

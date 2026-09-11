@@ -3,13 +3,16 @@
 <body>
 <div class="layout">
 <%= render_sidebar_static("config") %>
-<main class="main-content">
+<main class="main-content" id="dashboard-main" tabindex="-1">
 <%= render_subpage_header("Config") %>
 <div class="content">
 <%= render_page_intro("Config", "Inspect runtime configuration commands, current namespace overrides, and tunable server parameters.") %>
-<%= render_config_commands(Map.get(data, :config_commands, config_command_reference())) %>
-<%= render_config_table(data.namespace_config) %>
 <%= render_config_parameters(Map.get(data, :config_parameters, runtime_config_parameter_reference())) %>
+<%= render_config_table(data.namespace_config) %>
+<details class="flow-section-disclosure">
+<summary>Configuration command reference</summary>
+<%= render_config_commands(Map.get(data, :config_commands, config_command_reference())) %>
+</details>
 </div>
 </main>
 </div>

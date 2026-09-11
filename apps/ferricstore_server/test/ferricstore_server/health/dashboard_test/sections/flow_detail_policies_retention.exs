@@ -233,13 +233,34 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
                 head_status: "blocked by active flow",
                 blocked_by_id: "dashboard-flow-fifo-detail",
                 blocked_by_worker: "detail-worker",
-                lease_expires_at_ms: 60_000
+                lease_expires_at_ms: 60_000,
+                coverage: :sampled,
+                order_known: true,
+                members_omitted: 0,
+                members: [
+                  %{
+                    id: "dashboard-flow-fifo-detail",
+                    state_enter_seq: 1,
+                    status: :leased,
+                    worker: "detail-worker",
+                    lease_expires_at_ms: 60_000,
+                    run_at_ms: 1_000
+                  },
+                  %{
+                    id: "dashboard-flow-fifo-next",
+                    state_enter_seq: 2,
+                    status: :due,
+                    worker: nil,
+                    lease_expires_at_ms: nil,
+                    run_at_ms: 1_000
+                  }
+                ]
               }
             })
 
           assert String.contains?(html, "State mode")
           assert String.contains?(html, "FIFO")
-          assert String.contains?(html, "Logical State")
+          assert String.contains?(html, "Workflow state")
           assert String.contains?(html, "blocked by active flow")
           assert String.contains?(html, "dashboard-flow-fifo-next")
           assert String.contains?(html, "detail-worker")
@@ -409,9 +430,9 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
       end
 
       describe "collect_flow_policies_page/0 and render_flow_policies_page/1" do
-        test "renders a create and update policy form" do
+        test "renders a create and update policy form after loading a type" do
           html =
-            Dashboard.collect_flow_policies_page()
+            Dashboard.collect_flow_policies_page(edit_type: "new-dashboard-policy")
             |> Dashboard.render_flow_policies_page()
 
           assert String.contains?(html, ~s(id="flow-policy-editor"))
@@ -721,14 +742,20 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
 
           assert String.contains?(html, "FerricFlow Retention")
           assert String.contains?(html, ~s(action="/dashboard/flow/retention"))
-          assert String.contains?(html, "Dry Run")
-          assert String.contains?(html, "Run Cleanup")
+          assert String.contains?(html, "Refresh sampled preview")
+          assert String.contains?(html, "Review global cleanup")
+          refute String.contains?(html, ">Run Cleanup</button>")
           assert String.contains?(html, "FLOW.RETENTION_CLEANUP")
           assert String.contains?(html, "retention-flow-1")
           assert String.contains?(html, "active-timeout-flow-1")
           assert String.contains?(html, "Active Timeouts")
-          assert String.contains?(html, "fails overdue active Flow records")
-          assert String.contains?(html, "terminal Flow records")
+
+          assert String.contains?(
+                   html,
+                   "Active timeouts consume the shared limit before terminal deletions"
+                 )
+
+          assert String.contains?(html, "Global record limit")
           refute String.contains?(html, "Active Flow records are not touched")
         end
 
@@ -770,12 +797,23 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
 
           refute_received {:retention_cleanup, _opts}
 
-          assert {:ok, :cleanup, %{active_timeouts: 4, flows: 1, history: 2, values: 3, limit: 7}} =
+          assert {:ok, :review, review} =
                    Dashboard.apply_flow_retention_form(%{
-                     "action" => "cleanup",
-                     "limit" => "7",
-                     "confirm_cleanup" => "true"
+                     "action" => "review_cleanup",
+                     "limit" => "7"
                    })
+
+          refute_received {:retention_cleanup, _opts}
+          fields = Map.new(review, fn {key, value} -> {to_string(key), to_string(value)} end)
+
+          assert {:ok, :cleanup, %{active_timeouts: 4, flows: 1, history: 2, values: 3, limit: 7}} =
+                   Dashboard.apply_flow_retention_form(
+                     Map.merge(fields, %{
+                       "action" => "cleanup",
+                       "limit" => "7",
+                       "confirm_cleanup" => "true"
+                     })
+                   )
 
           assert_received {:retention_cleanup, [limit: 7]}
         end

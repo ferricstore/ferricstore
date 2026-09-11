@@ -4,57 +4,102 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
 
   @flow_dashboard_timeline_chart_max_events 80
 
-  def render_flow_issue_cards(summary) do
+  def render_flow_issue_cards(summary, data \\ %{}) do
     due_now = Map.get(summary, :due_now_sampled, 0)
     expired = Map.get(summary, :expired_leases_sampled, 0)
     failed = Map.get(summary, :failed, 0)
 
-    if due_now == 0 and expired == 0 and failed == 0 do
-      ""
-    else
-      render_flow_issue_cards(due_now, expired, failed)
-    end
+    render_flow_issue_cards(due_now, expired, failed, data)
   end
 
-  def render_flow_issue_cards(due_now, expired, failed) do
-    due_class = if due_now > 0, do: "badge-warning", else: "badge-ok"
+  def render_flow_issue_cards(due_now, expired, failed),
+    do: render_flow_issue_cards(due_now, expired, failed, %{})
+
+  defp render_flow_issue_cards(_due_now, 0, 0, _data), do: ""
+
+  defp render_flow_issue_cards(_due_now, expired, failed, data) do
     expired_class = if expired > 0, do: "badge-pressure", else: "badge-ok"
     failed_class = if failed > 0, do: "badge-pressure", else: "badge-ok"
 
+    path =
+      FerricstoreServer.Health.Dashboard.Render.FlowOverview.flow_failure_investigation_path(data)
+
     """
-    <div class="section-title">Task Issues</div>
-    <div class="flow-issue-row">
-      <div class="flow-issue"><span class="badge #{due_class}">#{format_number(due_now)}</span><span>due now in sample</span></div>
-      <div class="flow-issue"><span class="badge #{expired_class}">#{format_number(expired)}</span><span>expired leases in sample</span></div>
-      <div class="flow-issue"><span class="badge #{failed_class}">#{format_number(failed)}</span><span>failed terminal flows</span></div>
-    </div>
+    <section class="flow-attention-strip" aria-label="Workflow attention in current sample">
+      <h2>Needs attention</h2>
+      <span><span class="badge #{expired_class}">#{format_number(expired)}</span> Expired leases</span>
+      <span><span class="badge #{failed_class}">#{format_number(failed)}</span> Failed</span>
+      <span class="c-muted">Current sample</span>
+      <a class="flow-link" href="#{escape_attr(path)}">Investigate</a>
+    </section>
     """
   end
 
   def render_flow_states_chart(states) do
-    rows =
-      states
-      |> Enum.take(16)
-      |> Enum.map(fn state ->
-        %{
-          label: "#{state.type}:#{state.state}",
-          values: [
-            {"Due", state.due_now, "bar-yellow"},
-            {"Running", state.running, "bar-green"},
-            {"Retry", Map.get(state, :retrying, 0), "bar-blue"},
-            {"Failed", Map.get(state, :failed, 0), "bar-red"},
-            {"Expired", state.expired_leases, "bar-red"}
-          ]
-        }
+    total = length(states)
+    states = Enum.take(states, 16)
+
+    metrics = [
+      {:due, "Due", :due_now, "bar-neutral"},
+      {:running, "Running", :running, "bar-green"},
+      {:retry, "Retry", :retrying, "bar-blue"},
+      {:failed, "Failed", :failed, "bar-red"},
+      {:expired, "Expired", :expired_leases, "bar-red"}
+    ]
+
+    maxima =
+      Map.new(metrics, fn {metric, _label, field, _class} ->
+        maximum =
+          states
+          |> Enum.map(&numeric_metric_value(Map.get(&1, field, 0)))
+          |> Enum.max(fn -> 0 end)
+          |> max(1)
+
+        {metric, maximum}
       end)
 
+    rows =
+      case states do
+        [] ->
+          ~s(<tr><td colspan="7" class="chart-empty">No state pressure data</td></tr>)
+
+        states ->
+          Enum.map_join(states, "\n", fn state ->
+            label = "#{Map.get(state, :type, "")}:#{Map.get(state, :state, "")}"
+
+            cells =
+              Enum.map_join(metrics, "\n", fn {metric, _label, field, class} ->
+                value = numeric_metric_value(Map.get(state, field, 0))
+                width = round(value / Map.fetch!(maxima, metric) * 100)
+
+                """
+                <td class="flow-state-pressure-cell" data-metric="#{metric}">
+                  <span class="flow-state-pressure-track" aria-hidden="true"><span class="flow-state-pressure-fill #{class}" style="width: #{width}%"></span></span>
+                  <span class="flow-state-pressure-value">#{format_number(value)}</span>
+                </td>
+                """
+              end)
+
+            """
+            <tr data-state="#{escape_attr(label)}">
+              <th scope="row" class="flow-state-pressure-label"><span title="#{escape_attr(label)}">#{escape(label)}</span></th>
+              <td class="flow-state-pressure-count">#{format_number(Map.get(state, :count, 0))}</td>
+              #{cells}
+            </tr>
+            """
+          end)
+      end
+
     """
-    <div class="section-title">State Charts</div>
-    <div class="chart-grid">
-      <div class="chart-card">
-        <div class="chart-title">State pressure</div>
-        #{render_bar_chart(rows)}
-      </div>
+    <h2 class="section-title">State Pressure</h2>
+    #{chart_coverage(length(states), total)}
+    <div class="table-scroll flow-state-pressure-region" role="region" aria-label="Workflow state pressure" tabindex="0">
+      <table class="flow-state-pressure-matrix">
+        <thead>
+          <tr><th>Type:state</th><th>Sample</th>#{Enum.map_join(metrics, "", fn {_metric, label, _field, _class} -> "<th>#{label}</th>" end)}</tr>
+        </thead>
+        <tbody>#{rows}</tbody>
+      </table>
     </div>
     """
   end
@@ -74,7 +119,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
       end)
 
     """
-    <div class="section-title">Worker Charts</div>
+    <h2 class="section-title">Worker Charts</h2>
+    #{chart_coverage(length(rows), length(workers))}
     <div class="chart-grid">
       <div class="chart-card">
         <div class="chart-title">Lease health by worker</div>
@@ -84,44 +130,58 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
     """
   end
 
+  defp chart_coverage(shown, total) when shown < total do
+    ~s(<p class="flow-section-note">#{shown} of #{total} groups in table order; #{total - shown} omitted. The corresponding table retains the full loaded sample.</p>)
+  end
+
+  defp chart_coverage(_shown, _total), do: ""
+
   def render_flow_due_chart(due_now, scheduled) do
     rows = [
       %{
-        label: "Claim readiness",
+        label: "Current sample",
         values: [
-          {"Due now", length(due_now), "bar-yellow"},
+          {"Due now", length(due_now), "bar-neutral"},
           {"Scheduled", length(scheduled), "bar-blue"}
         ]
       }
     ]
 
     """
-    <div class="section-title">Due Charts</div>
-    <div class="chart-grid">
-      <div class="chart-card">
-        <div class="chart-title">Due vs scheduled</div>
-        #{render_bar_chart(rows)}
-      </div>
-    </div>
+    <section class="flow-due-summary" aria-label="Sampled due and scheduled work">
+      <h2 class="section-title">Due vs scheduled</h2>
+      <p class="flow-section-note">Due time alone does not establish claimability; FIFO ordering, leases, and policy limits may block a claim.</p>
+      #{render_bar_chart(rows)}
+    </section>
     """
   end
 
   def render_flow_timeline_chart(history) do
-    timeline =
-      history
-      |> flow_history_timeline_rows()
+    timeline = flow_history_timeline_rows(history)
+
+    rows =
+      timeline
       |> Enum.take(@flow_dashboard_timeline_chart_max_events)
       |> Enum.reverse()
+      |> flow_timeline_duration_rows()
 
-    """
-    <div class="section-title">Step Waterfall</div>
-    <div class="chart-grid">
-      <div class="chart-card">
-        <div class="chart-title">Step durations</div>
-        #{render_timeline_sequence(timeline)}
-      </div>
-    </div>
-    """
+    if Enum.any?(rows, &(is_integer(&1.duration_ms) and &1.duration_ms > 0)) do
+      scope_note =
+        if length(timeline) > @flow_dashboard_timeline_chart_max_events,
+          do:
+            ~s(<p class="flow-timeline-caption">Latest #{@flow_dashboard_timeline_chart_max_events} of #{length(timeline)} events on this page</p>),
+          else: ""
+
+      """
+      <section class="flow-timing-section" aria-label="Event intervals">
+        <h2 class="section-title">Event intervals</h2>
+        #{render_flow_step_waterfall(rows)}
+        #{scope_note}
+      </section>
+      """
+    else
+      ""
+    end
   end
 
   def render_bar_chart([]), do: ~s(<div class="chart-empty">No chart data</div>)
@@ -139,7 +199,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
         bars =
           Enum.map_join(row.values, "\n", fn {label, value, class} ->
             value = numeric_metric_value(value)
-            width = max(2, round(value / max_value * 100))
+            width = if value > 0, do: max(2, round(value / max_value * 100)), else: 0
 
             """
             <div class="chart-bar-line">
@@ -161,28 +221,23 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
     ~s(<div class="chart-bars">#{row_html}</div>)
   end
 
-  def render_timeline_sequence([]), do: ~s(<div class="chart-empty">No timeline events</div>)
-
-  def render_timeline_sequence(timeline) do
-    rows = flow_timeline_duration_rows(timeline)
+  defp render_flow_step_waterfall(rows) do
     range = flow_step_waterfall_range(rows)
     axis_html = render_flow_step_waterfall_axis(range)
     row_html = Enum.map_join(rows, "\n", &render_flow_step_waterfall_row(&1, range))
-    caption = "#{length(rows)} events on this page · click a row to jump to the event row"
 
     """
     <div class="flow-step-waterfall">
       <div class="flow-step-waterfall-scroll">
         <div class="flow-step-waterfall-header">
-          <span>Step</span>
+          <span>Event</span>
           <span class="flow-step-waterfall-axis">#{axis_html}</span>
-          <span>Elapsed</span>
+          <span>To next event</span>
         </div>
         <div class="flow-step-waterfall-rows">
           #{row_html}
         </div>
       </div>
-      <div class="flow-timeline-caption">#{escape(caption)}</div>
     </div>
     """
   end
@@ -199,7 +254,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
       rows
       |> Enum.map(fn row ->
         case row.time_ms do
-          time when is_integer(time) -> time + max(Map.get(row, :duration_ms, 0), 0)
+          time when is_integer(time) -> time + max(Map.get(row, :duration_ms) || 0, 0)
           _ -> nil
         end
       end)
@@ -219,7 +274,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
   end
 
   def render_flow_step_waterfall_axis(%{min_time: nil}) do
-    ~s(<span class="flow-step-waterfall-axis-label" style="left: 0%">event order</span>)
+    ~s(<span class="flow-step-waterfall-axis-label" data-axis-edge="start" style="left: 0%">event order</span>)
   end
 
   def render_flow_step_waterfall_axis(%{total_ms: total_ms}) do
@@ -229,7 +284,14 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
       left = flow_step_waterfall_percent(offset_ms, total_ms)
       label = "+" <> format_duration_ms(offset_ms)
 
-      ~s(<span class="flow-step-waterfall-axis-label" style="left: #{left}%">#{escape(label)}</span>)
+      edge =
+        cond do
+          offset_ms == 0 -> ~s( data-axis-edge="start")
+          offset_ms == total_ms -> ~s( data-axis-edge="end")
+          true -> ""
+        end
+
+      ~s(<span class="flow-step-waterfall-axis-label"#{edge} style="left: #{left}%">#{escape(label)}</span>)
     end)
   end
 
@@ -239,23 +301,29 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
     label = flow_timeline_node_label_text(row)
     state_move = flow_history_state_move(row)
     action = flow_history_event_label(row.fields)
-    duration_ms = max(Map.get(row, :duration_ms, 0), 0)
+    duration_ms = max(Map.get(row, :duration_ms) || 0, 0)
     offset_ms = flow_step_waterfall_offset_ms(row, range)
     left = flow_step_waterfall_percent(offset_ms, range.total_ms)
     width = flow_step_waterfall_width_percent(duration_ms, range.total_ms, left)
     class = flow_timeline_bar_class(row)
-    duration = format_duration_ms(duration_ms)
+    duration = flow_timeline_duration_label(row)
     offset = "+" <> format_duration_ms(offset_ms)
 
+    bar =
+      if is_integer(Map.get(row, :duration_ms)),
+        do:
+          ~s(<span class="flow-step-waterfall-bar #{class}" style="left: #{left}%; width: #{width}%"></span>),
+        else: ""
+
     """
-    <a class="flow-step-waterfall-row" href="##{anchor}" title="#{escape_attr(title)}">
+    <a class="flow-step-waterfall-row" href="#journal-#{anchor}" title="#{escape_attr(title)}">
       <span class="flow-step-waterfall-label">
         <span class="flow-step-waterfall-step">#{escape(label)}</span>
         <span class="flow-step-waterfall-state">#{escape(action)} · #{escape(state_move)}</span>
       </span>
       <span class="flow-step-waterfall-track">
         <span class="flow-step-waterfall-marker" style="left: #{left}%"></span>
-        <span class="flow-step-waterfall-bar #{class}" style="left: #{left}%; width: #{width}%"></span>
+        #{bar}
       </span>
       <span class="flow-step-waterfall-duration">
         <span>#{escape(duration)}</span>
@@ -303,10 +371,12 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
 
   def flow_timeline_duration_rows(timeline) do
     timeline
-    |> Enum.with_index()
-    |> Enum.map(fn {row, index} ->
-      next_row = Enum.at(timeline, index + 1)
-      Map.put(row, :duration_ms, flow_timeline_duration_ms(row, next_row))
+    |> Enum.zip(Enum.drop(timeline, 1) ++ [nil])
+    |> Enum.map(fn {row, next_row} ->
+      Map.merge(row, %{
+        duration_ms: flow_timeline_duration_ms(row, next_row),
+        has_end_event: not is_nil(next_row)
+      })
     end)
   end
 
@@ -315,15 +385,22 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
     end_ms - start_ms
   end
 
-  def flow_timeline_duration_ms(_row, _next_row), do: 0
+  def flow_timeline_duration_ms(_row, _next_row), do: nil
+
+  defp flow_timeline_duration_label(%{duration_ms: duration}) when is_integer(duration),
+    do: format_duration_ms(duration)
+
+  defp flow_timeline_duration_label(%{has_end_event: false}), do: "No next event"
+  defp flow_timeline_duration_label(_row), do: "Unavailable"
 
   def flow_timeline_bar_class(row) do
     fields = row.fields
+    label = flow_history_event_label(fields)
+    state = fields |> flow_history_current_state() |> String.downcase()
 
     cond do
+      label in ["Retry", "Failed"] or state == "failed" -> "bar-red"
       flow_history_terminal_event?(fields) -> "bar-green"
-      flow_history_event_label(fields) == "Retry" -> "bar-red"
-      flow_history_event_label(fields) == "Failed" -> "bar-red"
       true -> "bar-blue"
     end
   end
@@ -348,7 +425,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
       format_timestamp_ms_or_dash(row.time_ms),
       flow_history_event_label(row.fields),
       flow_history_state_move(row),
-      "duration #{format_duration_ms(Map.get(row, :duration_ms, 0))}"
+      "to next event: #{flow_timeline_duration_label(row)}"
     ]
     |> Enum.reject(&(&1 in ["", "-"]))
     |> Enum.join(" · ")

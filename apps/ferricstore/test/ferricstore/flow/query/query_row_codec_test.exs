@@ -131,6 +131,27 @@ defmodule Ferricstore.Flow.Query.QueryRowCodecTest do
              )
   end
 
+  test "restores terminal retention time from an expired covering row" do
+    terminal =
+      record()
+      |> Map.put(:state, "cancelled")
+      |> Map.put(:next_run_at_ms, nil)
+      |> Map.put(:terminal_retention_until_ms, 2_000)
+
+    assert {:ok, encoded} =
+             QueryRowCodec.encode(
+               @state_key,
+               terminal,
+               locator(expire_at_ms: 2_000),
+               2_000
+             )
+
+    assert {:ok, %QueryRow{} = row} = QueryRowCodec.decode(encoded, @state_key, 0)
+    refute Map.has_key?(row.record, :terminal_retention_until_ms)
+
+    assert {:ok, %{terminal_retention_until_ms: 2_000}} = QueryRow.internal_record(row)
+  end
+
   test "encoding is deterministic across nested map insertion order" do
     first = record()
 

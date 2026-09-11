@@ -17,7 +17,15 @@ defmodule FerricstoreServer.Health.Dashboard.Types do
           slowlog: [slowlog_entry()],
           merge: [merge_status()],
           namespace_config: [Ferricstore.NamespaceConfig.ns_entry()],
-          cluster: cluster_data()
+          cluster: cluster_data(),
+          subsystem_health: %{policy_migration: subsystem_health()}
+        }
+
+  @typedoc "A non-blocking operational snapshot published by a background subsystem."
+  @type subsystem_health :: %{
+          status: :healthy | :warning | :degraded | :unavailable | :disabled,
+          issues: [map()],
+          updated_at_ms: non_neg_integer() | nil
         }
 
   @typedoc "Overview section data."
@@ -51,12 +59,18 @@ defmodule FerricstoreServer.Health.Dashboard.Types do
 
   @typedoc "Memory pressure data."
   @type memory_data :: %{
-          total_bytes: non_neg_integer(),
-          max_bytes: non_neg_integer(),
-          ratio: float(),
-          pressure_level: Ferricstore.MemoryGuard.pressure_level(),
-          eviction_policy: atom(),
-          shards: %{non_neg_integer() => %{bytes: non_neg_integer(), ratio: float()}}
+          required(:total_bytes) => non_neg_integer(),
+          required(:max_bytes) => non_neg_integer(),
+          required(:ratio) => float(),
+          required(:pressure_level) => Ferricstore.MemoryGuard.pressure_level() | :unavailable,
+          required(:eviction_policy) => atom(),
+          required(:shards) => %{non_neg_integer() => %{bytes: non_neg_integer(), ratio: float()}},
+          optional(:rss_bytes) => non_neg_integer(),
+          optional(:rss_ratio) => float(),
+          optional(:rss_pressure_level) => Ferricstore.MemoryGuard.pressure_level(),
+          optional(:memory_limit) => non_neg_integer(),
+          optional(:keydir_bytes) => non_neg_integer(),
+          optional(:keydir_max_ram) => non_neg_integer()
         }
 
   @typedoc "Connection metrics."
@@ -125,10 +139,12 @@ defmodule FerricstoreServer.Health.Dashboard.Types do
 
   @typedoc "Configuration parameter reference row."
   @type config_parameter_entry :: %{
-          parameter: binary(),
-          scope: binary(),
-          mutability: binary(),
-          notes: binary()
+          required(:parameter) => binary(),
+          required(:scope) => binary(),
+          required(:mutability) => binary(),
+          required(:notes) => binary(),
+          optional(:value) => binary() | nil,
+          optional(:source) => binary()
         }
 
   @typedoc "Configuration dashboard page data."

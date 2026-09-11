@@ -237,19 +237,20 @@ defmodule Ferricstore.Store.Shard.Startup do
 
           profile_startup_phase(index, :flow_lmdb_rebuild, fn ->
             unless raft_projection_owner?(ctx) do
-              Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
-                path,
-                keydir,
-                index,
-                ctx,
-                zset_score_index,
-                zset_score_lookup,
-                flow_index,
-                flow_lookup,
-                active_file_id: active_file_id,
-                active_file_path: active_file_path,
-                shared_ref_backfill?: flow_shared_ref_backfill?
-              )
+              :ok =
+                Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
+                  path,
+                  keydir,
+                  index,
+                  ctx,
+                  zset_score_index,
+                  zset_score_lookup,
+                  flow_index,
+                  flow_lookup,
+                  active_file_id: active_file_id,
+                  active_file_path: active_file_path,
+                  shared_ref_backfill?: flow_shared_ref_backfill?
+                )
             end
 
             :ok

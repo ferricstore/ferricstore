@@ -4,6 +4,8 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
   alias Ferricstore.Flow.Query.Limits
   alias FerricstoreServer.Health.Dashboard
   alias FerricstoreServer.Acl
+  alias FerricstoreServer.Health.Dashboard.Flow.Recovery
+  alias FerricstoreServer.Health.Dashboard.Flow.QueryDiscovery
   alias FerricstoreServer.Health.Dashboard.Render.FlowQueryControls
 
   setup do
@@ -59,7 +61,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
     assert input_tag(failures_html, "state") =~ "disabled"
     assert required_input?(input_tag(failures_html, "type"))
     assert required_input?(input_tag(failures_html, "partition_key"))
-    assert input_tag(failures_html, "partition_key") =~ ~s(placeholder="required")
+    assert input_tag(failures_html, "partition_key") =~ ~s|placeholder="required"|
 
     assert required_input?(input_tag(history_html, "id"))
     refute required_input?(input_tag(history_html, "partition_key"))
@@ -70,6 +72,11 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
 
   test "query modes and actions expose complete keyboard and contextual semantics" do
     guided_html = render_query_page("search", :guided)
+
+    assert guided_html =~ ~s(class="flow-query-workspace")
+    assert guided_html =~ ~s(class="flow-query-input")
+    assert guided_html =~ ~s(class="flow-query-output")
+    assert guided_html =~ ~s(aria-label="Query results and diagnostics")
 
     assert guided_html =~
              ~s(id="flow-query-tab-guided" aria-controls="flow-query-panel-guided" aria-selected="true" tabindex="0")
@@ -85,7 +92,8 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
 
     assert guided_html =~ "<legend>Indexed attribute predicate</legend>"
     assert guided_html =~ "<legend>State metadata predicate</legend>"
-    assert guided_html =~ "Workflow type filters records; Partition is the data ACL scope."
+    assert guided_html =~ "Filters records, not permissions."
+
     assert guided_html =~ "Required query, routing, and data ACL scope."
 
     run_position = :binary.match(guided_html, ~s(data-flow-query-run-action)) |> elem(0)
@@ -104,6 +112,137 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
              ~s(id="flow-query-panel-advanced" role="tabpanel" aria-labelledby="flow-query-tab-advanced")
   end
 
+  test "failure recovery is evidence-first and separated from terminal triage" do
+    now_ms = System.system_time(:millisecond)
+
+    html =
+      Dashboard.render_flow_failures_page(%{
+        filters: %{
+          type: "email",
+          partition_key: "tenant-a",
+          q: "checkout",
+          limit: 40,
+          scan_exact: true
+        },
+        available_types: ["email"],
+        flash: nil,
+        summary: %{total: 2, failed: 1, expired_leases: 1, maxed: 0},
+        total_sampled: 2,
+        filtered_sampled: 2,
+        sample_limit: 400,
+        exact_scan_status: %{failures: :ok, stuck: :ok},
+        candidates: [
+          %{
+            id: "expired-running-flow",
+            type: "email",
+            state: "running",
+            partition_key: "tenant-a",
+            worker: "worker-a",
+            lease_expires_at_ms: now_ms - 1_000,
+            updated_at_ms: now_ms - 1_000
+          },
+          %{
+            id: "terminal-failed-flow",
+            type: "email",
+            state: "failed",
+            partition_key: "tenant-a",
+            updated_at_ms: now_ms
+          }
+        ]
+      })
+
+    expired_position = position!(html, "Expired Running Leases")
+    expired_row_position = position!(html, "expired-running-flow")
+    actions_position = position!(html, "Recovery Actions")
+    terminal_position = position!(html, "Failure and Retry-Exhaustion Records")
+    terminal_row_position = position!(html, "terminal-failed-flow")
+
+    assert expired_position < expired_row_position
+    assert expired_row_position < actions_position
+    assert actions_position < terminal_position
+    assert terminal_position < terminal_row_position
+
+    assert html =~ ~s(data-dashboard-single-submit)
+    assert html =~ ~s(name="return_q" value="checkout")
+    assert html =~ ~s(name="return_limit" value="40")
+    assert html =~ ~s(name="return_exact" value="true")
+    assert html =~ "Search text narrows this evidence only"
+    assert html =~ "A blank Partition uses automatic partitions"
+
+    recovery_form = form_html(html, "/dashboard/flow/failures", "post")
+    assert required_input?(input_tag(recovery_form, "type"))
+  end
+
+  test "failure recovery redirects preserve the investigation scope" do
+    params = %{
+      "type" => "email jobs",
+      "partition_key" => "tenant/a",
+      "return_q" => "checkout failed",
+      "return_limit" => "80",
+      "return_exact" => "true"
+    }
+
+    location =
+      Recovery.redirect_location(params, {:ok, %{type: "email jobs", reclaimed: 2}})
+
+    %URI{path: path, query: query} = URI.parse(location)
+
+    assert path == "/dashboard/flow/failures"
+
+    assert URI.decode_query(query) == %{
+             "count" => "2",
+             "exact" => "true",
+             "limit" => "80",
+             "partition_key" => "tenant/a",
+             "q" => "checkout failed",
+             "status" => "reclaimed",
+             "type" => "email jobs"
+           }
+
+    error_location = Recovery.redirect_location(params, {:error, "ERR confirmation is required"})
+    %URI{query: error_query} = URI.parse(error_location)
+
+    assert URI.decode_query(error_query) == %{
+             "exact" => "true",
+             "limit" => "80",
+             "message" => "ERR confirmation is required",
+             "partition_key" => "tenant/a",
+             "q" => "checkout failed",
+             "status" => "error",
+             "type" => "email jobs"
+           }
+
+    assert %{kind: :ok, message: flash_message} =
+             Recovery.flash_from_query(URI.parse(location).query)
+
+    assert flash_message =~ "Reclaimed 2 expired lease(s) for email jobs"
+    assert flash_message =~ "Evidence may update shortly"
+
+    flash_html =
+      Dashboard.render_flow_failures_page(%{
+        filters: %{
+          type: "email jobs",
+          partition_key: "tenant/a",
+          q: "checkout failed",
+          limit: 80,
+          scan_exact: true
+        },
+        available_types: ["email jobs"],
+        flash: %{kind: :ok, message: flash_message},
+        summary: %{total: 0, failed: 0, expired_leases: 0, maxed: 0},
+        total_sampled: 0,
+        filtered_sampled: 0,
+        sample_limit: 400,
+        exact_scan_status: %{failures: :ok, stuck: :ok},
+        candidates: []
+      })
+
+    assert flash_html =~ ~s(data-dashboard-transient-query="status,count,message")
+
+    assert FerricstoreServer.Health.Dashboard.Layout.dashboard_live_script() =~
+             "window.history.replaceState"
+  end
+
   test "guided stats requires the state predicate it actually counts" do
     parent = self()
 
@@ -117,6 +256,21 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
     assert data.result.status == :idle
     assert data.result.message == "Enter a workflow state"
     refute_receive {:unexpected_stats, _type, _opts}
+  end
+
+  test "guided fixed-index queries require a partition before reaching the engine" do
+    parent = self()
+
+    Application.put_env(:ferricstore, :flow_dashboard_flow_query_fun, fn query, params ->
+      send(parent, {:unexpected_unpartitioned_query, query, params})
+      {:ok, %{records: []}}
+    end)
+
+    data = Dashboard.collect_flow_query_page(kind: "list", type: "email")
+
+    assert data.result.status == :idle
+    assert data.result.message == "Enter a partition key"
+    refute_receive {:unexpected_unpartitioned_query, _query, _params}
   end
 
   test "guided stats forwards only predicates supported by FLOW.STATS" do
@@ -163,7 +317,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
 
     cases = [
       {[kind: "failures", type: "email", state: "queued", partition_key: "tenant-a"],
-       "Lifecycle state is not supported by failures"},
+       "Flow state is not supported by failures"},
       {[
          kind: "list",
          type: "email",
@@ -438,7 +592,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
         to_ms: 1_000
       )
 
-    assert reversed_time.result.status == :idle
+    assert reversed_time.result.status == :error
     assert reversed_time.result.message == "From UTC must not be later than To UTC"
     refute_receive {:unexpected_query, _query, _params}
   end
@@ -494,13 +648,15 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
     assert data.discovery.indexed_state_meta == "risk_tier"
 
     assert Jason.decode!(data.workbench.params_json) == %{
-             "partition" => "tenant-a",
-             "type" => "email"
+             "partition" => "default",
+             "type" => "workflow"
            }
 
     html = Dashboard.render_flow_query_page(data)
 
     assert html =~ ~s(data-flow-query-discovery)
+    assert html =~ ~s(<details class="flow-query-discovery" open data-flow-query-discovery>)
+    assert html =~ ~s(<summary class="flow-query-discovery-summary")
     assert html =~ "Query fields for <code>email</code>"
     assert html =~ ~s(<option value="review"></option>)
     assert html =~ ~s(<option value="customer"></option>)
@@ -667,6 +823,67 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
     assert data.discovery.type == nil
     assert data.discovery.indexed_attributes == []
     refute_receive {:unexpected_policy_get, _type, _opts}
+  end
+
+  test "idle query discovery exposes sampled types and partitions as form fill actions" do
+    html =
+      FlowQueryControls.render_flow_query_discovery(%{
+        status: :idle,
+        type: nil,
+        available_types: ["order_fulfillment"],
+        available_partitions: ["tenant-acme"]
+      })
+
+    assert html =~ "Observed query options"
+    assert html =~ ~s(<details class="flow-query-discovery" data-flow-query-discovery>)
+    assert html =~ ~s(<summary class="flow-query-discovery-summary")
+    refute html =~ ~s(<details class="flow-query-discovery" open)
+
+    assert html =~
+             ~s(<button type="button" class="flow-query-discovery-choice" data-flow-query-fill="type" data-flow-query-value="order_fulfillment">order_fulfillment</button>)
+
+    assert html =~
+             ~s(<button type="button" class="flow-query-discovery-choice" data-flow-query-fill="partition_key" data-flow-query-value="tenant-acme">tenant-acme</button>)
+  end
+
+  test "sample discovery exposes persisted workflow states and running workflow steps" do
+    discovery = %{
+      status: :idle,
+      type: nil,
+      available_types: [],
+      available_partitions: [],
+      lifecycle_states: ["queued", "running"],
+      lifecycle_states_truncated?: false,
+      workflow_steps: [],
+      workflow_steps_truncated?: false
+    }
+
+    enriched =
+      QueryDiscovery.merge_sample_records(discovery, [
+        %{
+          type: "scheduled_audit",
+          partition_key: "system",
+          state: "scheduled_wait",
+          run_state: nil
+        },
+        %{
+          type: "order_fulfillment",
+          partition_key: "tenant-acme",
+          state: "running",
+          run_state: "shipping_label_created"
+        }
+      ])
+
+    assert enriched.available_types == ["order_fulfillment", "scheduled_audit"]
+    assert enriched.available_partitions == ["system", "tenant-acme"]
+    assert enriched.lifecycle_states == ["queued", "running", "scheduled_wait"]
+    assert enriched.workflow_steps == ["shipping_label_created"]
+
+    html = FlowQueryControls.render_flow_query_discovery(enriched)
+    assert html =~ ~s(data-flow-query-fill="state" data-flow-query-value="scheduled_wait")
+
+    assert html =~
+             ~s(data-flow-query-fill="run_state" data-flow-query-value="shipping_label_created")
   end
 
   test "policy discovery overlaps normal query execution" do
@@ -1096,36 +1313,38 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
     assert opts[:status] == "expired"
     assert html =~ ~s(<option value="expired" selected>expired</option>)
 
-    for name <- ~w(meta_type meta_state meta_key meta_value meta_partition_key) do
+    for name <- ~w(meta_type meta_state meta_key meta_partition_key) do
       assert required_input?(input_tag(html, name))
     end
+
+    refute required_input?(input_tag(html, "meta_value"))
   end
 
-  test "empty optional filters normalize to unfiltered semantics on sampled screens" do
+  test "empty optional filters are absent while whitespace filters remain literal" do
     state_opts =
       Dashboard.flow_states_opts_from_query(
-        URI.encode_query(%{"type" => "all", "state" => "", "partition_key" => " "})
+        URI.encode_query(%{"type" => "", "state" => "", "partition_key" => " "})
       )
 
     failure_opts =
       Dashboard.flow_failures_opts_from_query(
-        URI.encode_query(%{"type" => "all", "partition_key" => "", "q" => " "})
+        URI.encode_query(%{"type" => "", "partition_key" => "", "q" => " "})
       )
 
     signal_opts =
       Dashboard.flow_signals_opts_from_query(
-        URI.encode_query(%{"type" => "all", "signal" => "", "q" => " "})
+        URI.encode_query(%{"type" => "", "signal" => "", "q" => " "})
       )
 
     refute Keyword.has_key?(state_opts, :type)
     refute Keyword.has_key?(state_opts, :state)
-    refute Keyword.has_key?(state_opts, :partition_key)
+    assert Keyword.fetch!(state_opts, :partition_key) == " "
     refute Keyword.has_key?(failure_opts, :type)
     refute Keyword.has_key?(failure_opts, :partition_key)
-    refute Keyword.has_key?(failure_opts, :q)
+    assert Keyword.fetch!(failure_opts, :q) == " "
     refute Keyword.has_key?(signal_opts, :type)
     refute Keyword.has_key?(signal_opts, :signal)
-    refute Keyword.has_key?(signal_opts, :q)
+    assert Keyword.fetch!(signal_opts, :q) == " "
   end
 
   test "sampled type selects preserve an explicit predicate missing from the sample" do
@@ -1209,8 +1428,30 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
       })
 
     assert html =~ "Auto-refresh paused"
-    assert html =~ "inspected 4 of 20 matching workflows"
+    assert html =~ "3 histories read (4 attempted)"
+    assert html =~ "Partial coverage"
     assert html =~ "1 history read failed"
+  end
+
+  test "Flow Signals keeps each desktop filter label with its control" do
+    html =
+      FerricstoreServer.Health.Dashboard.Render.FlowFilters.render_flow_signals_filter(%{
+        available_types: ["email"],
+        filters: %{
+          type: "email",
+          partition_key: "tenant-a",
+          signal: nil,
+          q: nil,
+          limit: 40,
+          scan_history: false
+        }
+      })
+
+    assert html =~
+             ~r/<label class="flow-filter-field"[^>]*>\s*<span>Limit<\/span>\s*<input[^>]+name="limit"[^>]*>\s*<\/label>/s
+
+    assert html =~
+             ~r/<label class="flow-filter-field"[^>]*>\s*<span>Partition<\/span>\s*<input[^>]+name="partition_key"[^>]*>\s*<\/label>/s
   end
 
   test "state filters always expose exact terminal states for bounded cold lookup" do
@@ -1323,6 +1564,21 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
   defp form_html(html, action) do
     [_, form] = Regex.run(~r/<form[^>]*action="#{action}"[^>]*>(.*?)<\/form>/s, html)
     form
+  end
+
+  defp form_html(html, action, method) do
+    [_, form] =
+      Regex.run(
+        ~r/<form[^>]*action="#{action}"[^>]*method="#{method}"[^>]*>(.*?)<\/form>/s,
+        html
+      )
+
+    form
+  end
+
+  defp position!(html, text) do
+    {position, _length} = :binary.match(html, text)
+    position
   end
 
   defp terminal_record(id, type, state, updated_at_ms) do

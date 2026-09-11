@@ -97,13 +97,17 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowSchedules do
                      ]
                    )
 
+          assert {:ok, current} = FerricStore.flow_schedule_get(schedule_id)
+
           response =
             http_post_form(
               FerricstoreServer.Health.Endpoint.port(),
               "/dashboard/flow/schedules",
               %{
                 "id" => schedule_id,
-                "action" => "pause"
+                "action" => "pause",
+                "expected_state" => current.state,
+                "expected_version" => Integer.to_string(current.version)
               }
             )
 

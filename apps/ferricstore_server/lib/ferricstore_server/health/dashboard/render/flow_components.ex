@@ -4,6 +4,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowComponents do
   alias FerricstoreServer.Health.Dashboard.Flow.Recovery
 
   import FerricstoreServer.Health.Dashboard.Format
+  import FerricstoreServer.Health.Dashboard.FlowRecord, only: [flow_expired_lease?: 1]
 
   import FerricstoreServer.Health.Dashboard.Render.FlowFilters,
     only: [render_flow_type_datalist: 2]
@@ -93,6 +94,24 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowComponents do
   def render_flow_lineage_table(data), do: component_flow_lineage_table(%{data: data})
   def render_flow_query_controls(data), do: component_flow_query_controls(%{data: data})
   def render_flow_query_result(data), do: component_flow_query_result(%{data: data})
+
+  defp flow_failure_groups(data) do
+    data
+    |> Map.get(:candidates, [])
+    |> Enum.split_with(&flow_expired_lease?/1)
+  end
+
+  defp render_expired_lease_rows([]) do
+    ~s(<tr><td colspan="9" class="c-muted">No expired running leases found in the current bounded view.</td></tr>)
+  end
+
+  defp render_expired_lease_rows(records), do: render_flow_failures_rows(records)
+
+  defp render_failure_triage_rows([]) do
+    ~s(<tr><td colspan="9" class="c-muted">No failed or retry-exhausted workflows found in the current bounded view.</td></tr>)
+  end
+
+  defp render_failure_triage_rows(records), do: render_flow_failures_rows(records)
 
   defp flow_failures_page_filters(data), do: Recovery.page_filters(data)
 end

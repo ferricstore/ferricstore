@@ -68,6 +68,34 @@ defmodule Ferricstore.Flow.MutationAttrsTest do
              )
   end
 
+  test "create attrs rejects unleased running state before replicated mutation preparation" do
+    for opts <- [
+          [type: "email", state: "running"],
+          [type: "email", state: "running", worker: "worker", lease_ms: 30_000]
+        ] do
+      assert {:error, "ERR flow running state is only entered by FLOW.CLAIM_DUE"} =
+               MutationAttrs.create_attrs("flow-running", opts)
+    end
+  end
+
+  test "batch and spawned child creation share the unleased running rejection" do
+    error = {:error, "ERR flow running state is only entered by FLOW.CLAIM_DUE"}
+
+    children = [
+      %{id: "queued-child", type: "email", state: "queued"},
+      %{id: "running-child", type: "email", state: "running"}
+    ]
+
+    assert MutationAttrs.create_many_attrs(children, [], "partition") == error
+
+    assert MutationAttrs.spawn_children_attrs("parent", children,
+             partition_key: "partition",
+             group_id: "children",
+             exhaust_to: %{success: "completed", failure: "failed"},
+             fencing_token: 0
+           ) == error
+  end
+
   test "create_attrs rejects timestamps that cannot be represented exactly by Flow indexes" do
     above_exact_integer = 9_007_199_254_740_992
 

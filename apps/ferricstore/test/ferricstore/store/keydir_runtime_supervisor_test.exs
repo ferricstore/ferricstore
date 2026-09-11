@@ -22,6 +22,7 @@ defmodule Ferricstore.Store.KeydirRuntimeSupervisorTest do
     end)
 
     ctx = FerricStore.Instance.get(name)
+    flush_coordinator = Ferricstore.Flow.LMDBFlushCoordinator.name(name)
     owner_name = :"#{name}.KeydirTableOwner"
     shard_supervisor_name = :"#{name}.ShardSupervisor"
     shard_name = elem(ctx.shard_names, 0)
@@ -30,6 +31,7 @@ defmodule Ferricstore.Store.KeydirRuntimeSupervisorTest do
     old_shard_supervisor = Process.whereis(shard_supervisor_name)
     old_shard = Process.whereis(shard_name)
 
+    assert is_pid(Process.whereis(flush_coordinator))
     assert is_pid(old_owner)
     assert is_pid(old_shard_supervisor)
     assert is_pid(old_shard)

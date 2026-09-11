@@ -4,6 +4,23 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.15 - 2026-09-11
+
+- Redesigned the OSS dashboard around operational workflow investigation,
+  including scoped query controls, projections and exports, schedule and
+  governance actions, lineage, recovery evidence, freshness indicators, and
+  protected-mode ACL enforcement.
+- Fixed restart recovery for expired Flow QueryRows whose authoritative WAL
+  source has already retired, while keeping live rows fail-closed, preserving
+  scoped retention identity, and serializing startup reconciliation through the
+  per-shard LMDB permit.
+- Made apply-projection compaction use one expiry cutoff across retention and
+  relocation, and made every shard and WARaft startup caller fail closed when
+  LMDB reconciliation cannot complete.
+- Hardened workflow mutation, schedule, circuit, stream waiter, Pub/Sub, and
+  observability paths used by the dashboard, with expanded integration and
+  browser-level regression coverage.
+
 ## 0.11.14 - 2026-08-29
 
 - Made the core Hex package dependency graph publishable while retaining

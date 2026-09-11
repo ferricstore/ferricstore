@@ -129,6 +129,14 @@ defmodule FerricstoreServer.Application do
         FerricstoreServer.Management.ACL
       )
     end
+
+    unless Application.get_env(:ferricstore, FerricStore.ManagementCapabilities) do
+      Application.put_env(
+        :ferricstore,
+        FerricStore.ManagementCapabilities,
+        FerricstoreServer.Management.Capabilities
+      )
+    end
   end
 
   defp listener_connection_count(listener) do

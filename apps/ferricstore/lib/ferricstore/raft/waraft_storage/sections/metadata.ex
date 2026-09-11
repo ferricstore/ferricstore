@@ -345,6 +345,27 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
             ) do
           compact_apply_projection_log(root_dir, ctx, shard_index, trim_index, lmdb_path)
         end
+
+        @doc false
+        def __compact_apply_projection_log_for_test__(
+              root_dir,
+              ctx,
+              shard_index,
+              trim_index,
+              lmdb_path,
+              expiry_cutoff
+            )
+            when is_function(expiry_cutoff, 0) do
+          compact_apply_projection_log(
+            root_dir,
+            ctx,
+            shard_index,
+            trim_index,
+            lmdb_path,
+            [lmdb_path],
+            expiry_cutoff.()
+          )
+        end
       end
 
       defp collect_segment_projection_relocations(ctx, shard_index) do
@@ -755,17 +776,38 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
              relocation_lmdb_paths
            )
            when is_list(relocation_lmdb_paths) and relocation_lmdb_paths != [] do
+        compact_apply_projection_log(
+          root_dir,
+          ctx,
+          shard_index,
+          trim_index,
+          retention_lmdb_path,
+          relocation_lmdb_paths,
+          storage_expiry_cutoff_ms()
+        )
+      end
+
+      defp compact_apply_projection_log(
+             root_dir,
+             ctx,
+             shard_index,
+             trim_index,
+             retention_lmdb_path,
+             relocation_lmdb_paths,
+             expiry_cutoff_ms
+           )
+           when is_list(relocation_lmdb_paths) and relocation_lmdb_paths != [] and
+                  is_integer(expiry_cutoff_ms) and expiry_cutoff_ms >= 0 do
         with {:ok, retention} <- ApplyProjectionRetention.open(root_dir, trim_index) do
           try do
-            expiry_cutoff_ms = storage_expiry_cutoff_ms()
-
             with {:ok, retention} <-
                    collect_apply_projection_retention(
                      retention,
                      ctx,
                      shard_index,
                      trim_index,
-                     retention_lmdb_path
+                     retention_lmdb_path,
+                     expiry_cutoff_ms
                    ),
                  {:ok, retention} <- ApplyProjectionRetention.finish(retention),
                  :ok <- compact_apply_projection_retention(root_dir, trim_index, retention),
@@ -863,10 +905,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
              ctx,
              shard_index,
              trim_index,
-             retention_lmdb_path
+             retention_lmdb_path,
+             expiry_cutoff_ms
            ) do
-        expiry_cutoff_ms = storage_expiry_cutoff_ms()
-
         with {:ok, retention} <-
                collect_apply_projection_keydir_retention(
                  retention,

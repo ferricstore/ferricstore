@@ -21,6 +21,7 @@ defmodule FerricstoreServer.Spec.HttpEndpointsTest do
   use ExUnit.Case, async: false
   @moduletag :global_state
 
+  alias FerricstoreServer.Health.Dashboard.Assets
   alias FerricstoreServer.Health.Endpoint, as: HealthEndpoint
 
   setup do
@@ -314,7 +315,7 @@ defmodule FerricstoreServer.Spec.HttpEndpointsTest do
       refute String.contains?(body, ~s(http-equiv="refresh"))
       assert String.contains?(body, ~s(data-dashboard-live-page="overview"))
       assert String.contains?(body, ~s(data-dashboard-live-url="/dashboard/api/overview"))
-      assert String.contains?(body, "dashboard-live.js")
+      assert String.contains?(body, ~s(<script src="#{Assets.path(:js)}" defer></script>))
     end
 
     test "flow dashboard is a live shell without full-page meta refresh" do
@@ -325,7 +326,7 @@ defmodule FerricstoreServer.Spec.HttpEndpointsTest do
       refute String.contains?(body, ~s(http-equiv="refresh"))
       assert String.contains?(body, ~s(data-dashboard-live-page="flow"))
       assert String.contains?(body, ~s(data-dashboard-live-url="/dashboard/api/flow"))
-      assert String.contains?(body, "dashboard-live.js")
+      assert String.contains?(body, ~s(<script src="#{Assets.path(:js)}" defer></script>))
     end
   end
 

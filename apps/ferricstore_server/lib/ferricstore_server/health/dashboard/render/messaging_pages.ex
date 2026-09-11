@@ -3,6 +3,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
 
   import FerricstoreServer.Health.Dashboard.Format
   import FerricstoreServer.Health.Dashboard.Render.Overview
+  alias FerricstoreServer.Health.Dashboard.Render.TableFilter
 
   def render_stream_activity_summary(data) do
     summary = Map.get(data, :summary, %{})
@@ -12,8 +13,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
       %{label: "Appends", value: format_number(Map.get(summary, :appends, 0))},
       %{label: "Consumer Events", value: format_number(Map.get(summary, :consumer_events, 0))},
       %{label: "Streams", value: format_number(Map.get(summary, :unique_streams, 0))},
-      %{label: "Latest", value: timestamp_or_idle(Map.get(summary, :latest_at_us))}
-    ])
+      latest_stream_card(Map.get(summary, :latest_at_us))
+    ]) <> snapshot_scope_note(:streams)
   end
 
   def render_stream_top_streams(data) do
@@ -22,7 +23,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
     body =
       case rows do
         [] ->
-          ~s(<tr><td colspan="5" class="c-muted">No stream mutations recorded yet.</td></tr>)
+          ~s(<tr><td colspan="5" class="c-muted">No visible stream mutations in the retained activity window.</td></tr>)
 
         _ ->
           Enum.map_join(rows, "\n", fn row ->
@@ -39,9 +40,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
       end
 
     """
-    <div class="section-title">Active Streams <span class="badge badge-idle">metadata only</span></div>
+    #{TableFilter.controls("stream-top-table", "Filter loaded streams")}
     #{table_scroll("Active streams", """
-    <table>
+    <table id="stream-top-table" data-dashboard-row-count="#{length(rows)}">
       <thead><tr><th>Stream Key</th><th>Mutations</th><th>Appends</th><th>Last Entry</th><th>Last Seen</th></tr></thead>
       <tbody>#{body}</tbody>
     </table>
@@ -72,9 +73,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
       end
 
     """
-    <div class="section-title">Stream Consumers <span class="badge badge-idle">consumer groups</span></div>
+    #{TableFilter.controls("stream-consumers-table", "Filter loaded streams and consumer groups")}
     #{table_scroll("Stream consumers", """
-    <table>
+    <table id="stream-consumers-table" data-dashboard-row-count="#{length(groups)}">
       <thead><tr><th>Stream Key</th><th>Group</th><th>Consumers</th><th>Pending</th><th>Last Delivered</th></tr></thead>
       <tbody>#{body}</tbody>
     </table>
@@ -88,7 +89,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
     body =
       case waiters do
         [] ->
-          ~s(<tr><td colspan="4" class="c-muted">No blocked XREAD/XREADGROUP waiters.</td></tr>)
+          ~s(<tr><td colspan="4" class="c-muted">No visible blocked readers in this bounded snapshot.</td></tr>)
 
         _ ->
           Enum.map_join(waiters, "\n", fn row ->
@@ -104,9 +105,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
       end
 
     """
-    <div class="section-title">Blocked Readers <span class="badge badge-idle">live waiters</span></div>
+    #{TableFilter.controls("stream-waiters-table", "Filter loaded blocked stream readers")}
     #{table_scroll("Blocked stream readers", """
-    <table>
+    <table id="stream-waiters-table" data-dashboard-row-count="#{length(waiters)}">
       <thead><tr><th>Stream Key</th><th>Waiters</th><th>Oldest Wait</th><th>Last Seen ID</th></tr></thead>
       <tbody>#{body}</tbody>
     </table>
@@ -116,12 +117,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
 
   def render_stream_activity_log(data) do
     entries = Map.get(data, :entries, [])
-    count_label = if entries == [], do: "none", else: "#{length(entries)} recent"
 
     body =
       case entries do
         [] ->
-          ~s(<tr><td colspan="10" class="c-muted">No stream producer or consumer activity recorded yet.</td></tr>)
+          ~s(<tr><td colspan="10" class="c-muted">No visible stream activity in the last 128 retained events.</td></tr>)
 
         _ ->
           Enum.map_join(entries, "\n", fn entry ->
@@ -143,9 +143,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
       end
 
     """
-    <div class="section-title">Recent Stream Activity <span class="badge badge-idle">#{escape(count_label)}</span></div>
+    #{TableFilter.controls("stream-activity-table", "Filter loaded stream activity")}
     #{table_scroll("Recent stream activity", """
-    <table>
+    <table id="stream-activity-table" data-dashboard-row-count="#{length(entries)}">
       <thead>
         <tr><th>ID</th><th>Time</th><th>Role</th><th>Command</th><th>Stream Key</th><th>Result</th><th>Entry ID</th><th>Shape</th><th>Consumer</th><th>Trim</th></tr>
       </thead>
@@ -174,7 +174,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
         label: "Subscribers",
         value: format_optional_number(Map.get(summary, :active_subscribers, 0))
       }
-    ])
+    ]) <> snapshot_scope_note(:pubsub)
   end
 
   defp format_optional_number(nil), do: "-"
@@ -186,7 +186,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
     body =
       case rows do
         [] ->
-          ~s(<tr><td colspan="2" class="c-muted">No active exact channel subscriptions.</td></tr>)
+          ~s(<tr><td colspan="2" class="c-muted">No visible exact channel subscriptions in this bounded snapshot.</td></tr>)
 
         _ ->
           Enum.map_join(rows, "\n", fn row ->
@@ -200,9 +200,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
       end
 
     """
-    <div class="section-title">Channels <span class="badge badge-idle">active subscriptions</span></div>
+    <h2 class="section-title">Channels <span class="badge badge-idle">active subscriptions</span></h2>
+    #{TableFilter.controls("pubsub-channels-table", "Filter loaded channels")}
     #{table_scroll("Pub/Sub channels", """
-    <table>
+    <table id="pubsub-channels-table">
       <thead><tr><th>Channel</th><th>Subscribers</th></tr></thead>
       <tbody>#{body}</tbody>
     </table>
@@ -216,7 +217,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
     body =
       case rows do
         [] ->
-          ~s(<tr><td colspan="2" class="c-muted">No active pattern subscriptions.</td></tr>)
+          ~s(<tr><td colspan="2" class="c-muted">No visible pattern subscriptions in this bounded snapshot.</td></tr>)
 
         _ ->
           Enum.map_join(rows, "\n", fn row ->
@@ -230,9 +231,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
       end
 
     """
-    <div class="section-title">Patterns <span class="badge badge-idle">PSUBSCRIBE</span></div>
+    <h2 class="section-title">Patterns <span class="badge badge-idle">PSUBSCRIBE</span></h2>
+    #{TableFilter.controls("pubsub-patterns-table", "Filter loaded subscription patterns")}
     #{table_scroll("Pub/Sub patterns", """
-    <table>
+    <table id="pubsub-patterns-table">
       <thead><tr><th>Pattern</th><th>Subscribers</th></tr></thead>
       <tbody>#{body}</tbody>
     </table>
@@ -247,7 +249,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
     body =
       case entries do
         [] ->
-          ~s(<tr><td colspan="7" class="c-muted">No Pub/Sub publish or subscription activity recorded yet.</td></tr>)
+          ~s(<tr><td colspan="7" class="c-muted">No visible Pub/Sub activity in the last 128 retained events.</td></tr>)
 
         _ ->
           Enum.map_join(entries, "\n", fn entry ->
@@ -266,9 +268,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
       end
 
     """
-    <div class="section-title">Recent Pub/Sub Activity <span class="badge badge-idle">#{escape(count_label)}</span></div>
+    <h2 class="section-title">Recent Pub/Sub Activity <span class="badge badge-idle">#{escape(count_label)}</span></h2>
+    #{TableFilter.controls("pubsub-activity-table", "Filter loaded Pub/Sub activity")}
     #{table_scroll("Recent Pub/Sub activity", """
-    <table>
+    <table id="pubsub-activity-table">
       <thead><tr><th>ID</th><th>Time</th><th>Command</th><th>Target Type</th><th>Target</th><th>Shape</th><th>Delivery</th></tr></thead>
       <tbody>#{body}</tbody>
     </table>
@@ -280,6 +283,14 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
   defp table_scroll(label, table) do
     ~s(<div class="table-scroll" role="region" aria-label="#{escape_attr(label)}" tabindex="0">#{table}</div>)
   end
+
+  defp snapshot_scope_note(:streams),
+    do:
+      ~s(<p class="flow-section-note">Activity covers the last 128 retained events. Consumer groups and blocked readers show up to 100 visible rows, inspecting at most 10,000 group entries or stream keys. Matching data outside these bounds may be absent.</p>)
+
+  defp snapshot_scope_note(:pubsub),
+    do:
+      ~s(<p class="flow-section-note">Channel and pattern tables show up to 100 visible rows from at most 10,000 entries per catalog. Activity covers the last 128 retained events. Matching data outside these bounds may be absent.</p>)
 
   defp stream_count_label(%{command: "XADD", field_pairs: n}) when is_integer(n),
     do: "#{format_number(n)} field pairs"
@@ -330,8 +341,32 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
 
   defp pubsub_publish_delivery(_entry), do: "-"
 
-  defp timestamp_or_idle(nil), do: "idle"
-  defp timestamp_or_idle(timestamp_us), do: timestamp_or_dash(timestamp_us)
+  defp latest_stream_card(nil),
+    do: %{label: "Latest", value: "idle", class: "ops-summary-code c-muted"}
+
+  defp latest_stream_card(timestamp_us) when is_integer(timestamp_us) and timestamp_us > 0 do
+    case DateTime.from_unix(timestamp_us, :microsecond) do
+      {:ok, datetime} ->
+        full = DateTime.to_iso8601(datetime)
+
+        time =
+          datetime |> DateTime.truncate(:millisecond) |> DateTime.to_time() |> Time.to_iso8601()
+
+        %{
+          label: "Latest",
+          value: datetime |> DateTime.to_date() |> Date.to_iso8601(),
+          class: "ops-summary-timestamp",
+          detail_html:
+            ~s(<time class="stream-latest-time" datetime="#{full}" title="#{format_timestamp_us(timestamp_us)}">#{time} UTC</time>)
+        }
+
+      {:error, _} ->
+        %{label: "Latest", value: "-", class: "ops-summary-code c-muted"}
+    end
+  end
+
+  defp latest_stream_card(_),
+    do: %{label: "Latest", value: "-", class: "ops-summary-code c-muted"}
 
   defp timestamp_or_dash(timestamp_us) when is_integer(timestamp_us) and timestamp_us > 0 do
     format_timestamp_us(timestamp_us)

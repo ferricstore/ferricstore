@@ -1,10 +1,27 @@
 <% data = assigns.data %>
-<div class="section-title">Failure / Recovery Records <span class="badge badge-idle">sample <%= format_number(data.total_sampled) %> / <%= format_number(data.sample_limit) %></span></div>
-<table>
+<% {expired_leases, failure_records} = flow_failure_groups(data) %>
+<section class="flow-failure-recovery-section" aria-label="Expired lease recovery">
+<h2 class="section-title">Expired Running Leases <span class="badge badge-idle"><%= length(expired_leases) %> shown</span> <span class="badge badge-idle"><%= sampled_scan_label(data.total_sampled, data.sample_limit) %></span></h2>
+<div class="table-scroll" role="region" aria-label="Expired running leases" tabindex="0"><table>
   <thead>
-    <tr><th>ID</th><th>Type</th><th>State</th><th>Reason</th><th>Attempts</th><th>Worker</th><th>Lease Until</th><th>Updated</th><th>Values</th></tr>
+    <tr><th>Workflow / partition</th><th>Type</th><th>Runtime status</th><th>Reason</th><th>Attempts</th><th>Worker</th><th>Lease Until</th><th>Updated</th><th>Values</th></tr>
   </thead>
   <tbody>
-    <%= render_flow_failures_rows(data.candidates) %>
+    <%= render_expired_lease_rows(expired_leases) %>
   </tbody>
-</table>
+</table></div>
+<%= render_flow_recovery_actions(data) %>
+</section>
+
+<section aria-label="Terminal failure triage">
+<h2 class="section-title">Failure and Retry-Exhaustion Records <span class="badge badge-idle"><%= length(failure_records) %> shown</span></h2>
+<div class="table-scroll" role="region" aria-label="Failed and retry-exhausted workflows" tabindex="0"><table>
+  <thead>
+    <tr><th>Workflow / partition</th><th>Type</th><th>Runtime status</th><th>Reason</th><th>Attempts</th><th>Worker</th><th>Lease Until</th><th>Updated</th><th>Values</th></tr>
+  </thead>
+  <tbody>
+    <%= render_failure_triage_rows(failure_records) %>
+  </tbody>
+</table></div>
+<div class="flow-section-note">Open a workflow to inspect its history and use the guarded single-workflow recovery controls.</div>
+</section>

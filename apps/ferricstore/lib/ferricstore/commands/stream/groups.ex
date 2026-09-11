@@ -233,14 +233,14 @@ defmodule Ferricstore.Commands.Stream.Groups do
   end
 
   @spec snapshot(non_neg_integer()) :: [map()]
-  def snapshot(limit \\ 100) do
+  def snapshot(limit \\ 100, visible? \\ fn _ -> true end) do
     ensure_table()
     limit = max(limit, 0)
 
     if limit == 0 do
       []
     else
-      :ets.foldl(
+      Ferricstore.ObservabilitySnapshot.fold(
         fn
           {{cache_key, group}, last_delivered, consumers, pending}, acc
           when is_binary(group) and is_map(consumers) and is_map(pending) ->
@@ -254,7 +254,9 @@ defmodule Ferricstore.Commands.Stream.Groups do
                   pending: map_size(pending)
                 }
 
-                insert_group_snapshot(row, cache_key, acc, limit)
+                if visible?.(row),
+                  do: insert_group_snapshot(row, cache_key, acc, limit),
+                  else: acc
 
               nil ->
                 acc

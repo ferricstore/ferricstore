@@ -2,19 +2,25 @@ defmodule Ferricstore.ReleaseVersionTest do
   use ExUnit.Case, async: true
 
   @repo_root Path.expand("../../../..", __DIR__)
-  @release_version "0.11.14"
+  @release_version "0.11.15"
 
   @project_files [
     "mix.exs",
     "apps/ferricstore/mix.exs",
-    "apps/ferricstore_server/mix.exs"
+    "apps/ferricstore_server/mix.exs",
+    "apps/ferricstore_http/mix.exs",
+    "apps/ferricstore_cluster_consul/mix.exs"
   ]
 
   @current_release_docs [
     "README.md",
+    "deploy/aws/fargate/README.md",
+    "deploy/aws/fargate/terraform.tfvars.example",
+    "deploy/aws/fargate/variables.tf",
     "guides/deployment.md",
     "guides/embedded-mode.md",
-    "guides/getting-started.md"
+    "guides/getting-started.md",
+    "guides/http-api.md"
   ]
 
   test "umbrella projects publish one release version" do

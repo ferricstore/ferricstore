@@ -89,16 +89,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.QueryVisualization do
   defp category_chart(rows, source, {field, selector}) do
     counts =
       Enum.reduce(rows, %{}, fn row, acc ->
-        case selected_value(row, source, selector) do
-          value when is_binary(value) and value != "" ->
-            Map.update(acc, value, 1, &(&1 + 1))
-
-          value when is_integer(value) or is_float(value) or is_boolean(value) ->
-            Map.update(acc, to_string(value), 1, &(&1 + 1))
-
-          _missing_or_complex ->
-            acc
-        end
+        identity = row |> selected_value(source, selector) |> category_identity()
+        Map.update(acc, identity, 1, &(&1 + 1))
       end)
 
     case bounded_category_values(counts) do
@@ -108,18 +100,40 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.QueryVisualization do
   end
 
   defp bounded_category_values(counts) do
-    sorted = Enum.sort_by(counts, fn {label, count} -> {-count, label} end)
+    sorted = Enum.sort_by(counts, fn {identity, count} -> {-count, category_label(identity)} end)
+
+    values = fn entries ->
+      Enum.map(entries, fn {identity, count} ->
+        %{identity: identity, label: category_label(identity), count: count}
+      end)
+    end
 
     if length(sorted) <= @max_category_values do
-      Enum.map(sorted, fn {label, count} -> %{label: label, count: count} end)
+      values.(sorted)
     else
       {visible, remaining} = Enum.split(sorted, @max_named_values)
       other_count = Enum.reduce(remaining, 0, fn {_label, count}, total -> total + count end)
 
-      Enum.map(visible, fn {label, count} -> %{label: label, count: count} end) ++
-        [%{label: "Other", count: other_count}]
+      values.(visible) ++
+        [%{identity: :remaining, label: "Remaining categories", count: other_count}]
     end
   end
+
+  defp category_identity(nil), do: :null
+
+  defp category_identity(value) when is_binary(value),
+    do: if(String.valid?(value), do: {:text, value}, else: {:binary, value})
+
+  defp category_identity(value) when is_boolean(value), do: {:boolean, value}
+  defp category_identity(value) when is_integer(value), do: {:integer, value}
+  defp category_identity(value) when is_float(value), do: {:decimal, value}
+  defp category_identity(_value), do: :structured
+
+  defp category_label(:null), do: "null"
+  defp category_label(:structured), do: "Structured values"
+  defp category_label({:text, value}), do: Jason.encode!(value)
+  defp category_label({:binary, value}), do: "Base64 " <> Base.encode64(value)
+  defp category_label({_type, value}), do: to_string(value)
 
   defp time_chart(rows, source, {field, selector}) do
     values =

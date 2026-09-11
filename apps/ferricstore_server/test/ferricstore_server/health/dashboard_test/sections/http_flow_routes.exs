@@ -55,6 +55,49 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
           assert String.contains?(body, "Flow Detail")
         end
 
+        @tag :workflow_widgets
+        test "detail page and refresh defer value reads until the scoped value endpoint is requested" do
+          id = "dashboard-lazy-value-#{System.unique_integer([:positive])}"
+          partition = "dashboard-lazy-partition"
+          ref = "payload:#{id}"
+          test_pid = self()
+          previous = Application.get_env(:ferricstore, :flow_dashboard_flow_value_mget_fun)
+
+          Application.put_env(:ferricstore, :flow_dashboard_flow_value_mget_fun, fn refs ->
+            send(test_pid, {:lazy_value_read, refs})
+            {:ok, Enum.map(refs, fn _ -> "payload-only-after-opening" end)}
+          end)
+
+          on_exit(fn -> restore_env(:flow_dashboard_flow_value_mget_fun, previous) end)
+
+          assert :ok =
+                   FerricStore.flow_create(id,
+                     type: "dashboard-lazy-values",
+                     partition_key: partition,
+                     state: "queued",
+                     payload_ref: ref,
+                     run_at_ms: 1_000
+                   )
+
+          port = HealthEndpoint.port()
+          scope = URI.encode_query(%{"partition_key" => partition})
+
+          for path <- ["/dashboard/flow/#{id}?#{scope}", "/dashboard/api/flow/#{id}?#{scope}"] do
+            response = http_get(port, path)
+            assert response =~ "HTTP/1.1 200 OK"
+            refute response =~ "payload-only-after-opening"
+            refute_receive {:lazy_value_read, _}
+          end
+
+          value_params =
+            URI.encode_query(%{"flow" => id, "partition_key" => partition, "ref" => ref})
+
+          response = http_get(port, "/dashboard/api/flow/value?#{value_params}")
+          assert response =~ "HTTP/1.1 200 OK"
+          assert response =~ "payload-only-after-opening"
+          assert_receive {:lazy_value_read, [^ref]}
+        end
+
         test "redirects Flow lookup searches to encoded detail URLs" do
           id = "dashboard-flow-lookup/#{System.unique_integer([:positive])} with space"
 
@@ -162,7 +205,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
                 {"/dashboard/flow/due?refresh=1", "Due / Scheduled"},
                 {"/dashboard/flow/failures", "Flow Failures"},
                 {"/dashboard/flow/lineage", "Flow Lineage"},
-                {"/dashboard/flow/query", "Flow Query Explorer"},
+                {"/dashboard/flow/query", "Flow Query Studio"},
                 {"/dashboard/flow/signals", "Flow Signals"},
                 {"/dashboard/flow/policies", "FerricFlow Policies"},
                 {"/dashboard/flow/governance", "FerricFlow Governance"},
@@ -275,10 +318,28 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
             Application.delete_env(:ferricstore, :flow_dashboard_retention_cleanup_fun)
           end)
 
+          review_response =
+            http_post_form(port, "/dashboard/flow/retention", %{
+              "action" => "review_cleanup",
+              "limit" => "3"
+            })
+
+          assert extract_status_code(review_response) == 302
+          refute_received {:retention_cleanup, _opts}
+
+          review_fields =
+            review_response
+            |> extract_header("location")
+            |> URI.parse()
+            |> Map.fetch!(:query)
+            |> URI.decode_query()
+
           response =
             http_post_form(port, "/dashboard/flow/retention", %{
               "action" => "cleanup",
               "limit" => "3",
+              "reviewed_limit" => review_fields["reviewed_limit"],
+              "reviewed_at_ms" => review_fields["reviewed_at_ms"],
               "confirm_cleanup" => "true"
             })
 
@@ -298,7 +359,58 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
           assert get_response |> extract_body() |> String.contains?("4 active flows timed out")
         end
 
-        test "POST /dashboard/flow/policies redirects invalid forms to a visible error" do
+        test "POST /dashboard/flow/failures preserves the investigation scope" do
+          port = HealthEndpoint.port()
+          test_pid = self()
+
+          Application.put_env(:ferricstore, :flow_dashboard_flow_reclaim_fun, fn type, opts ->
+            send(test_pid, {:flow_reclaim, type, opts})
+            {:ok, [%{id: "reclaimed-flow"}]}
+          end)
+
+          on_exit(fn ->
+            Application.delete_env(:ferricstore, :flow_dashboard_flow_reclaim_fun)
+          end)
+
+          response =
+            http_post_form(port, "/dashboard/flow/failures", %{
+              "action" => "reclaim",
+              "type" => "email jobs",
+              "partition_key" => "tenant/a",
+              "worker" => "recovery-worker",
+              "limit" => "25",
+              "lease_ms" => "30000",
+              "confirm_reclaim" => "true",
+              "return_q" => "checkout failed",
+              "return_limit" => "80",
+              "return_exact" => "true"
+            })
+
+          assert extract_status_code(response) == 302
+
+          location = extract_header(response, "location")
+          %URI{path: path, query: query} = URI.parse(location)
+
+          assert path == "/dashboard/flow/failures"
+
+          assert URI.decode_query(query) == %{
+                   "count" => "1",
+                   "exact" => "true",
+                   "limit" => "80",
+                   "partition_key" => "tenant/a",
+                   "q" => "checkout failed",
+                   "status" => "reclaimed",
+                   "type" => "email jobs"
+                 }
+
+          assert_received {:flow_reclaim, "email jobs", opts}
+          assert opts[:partition_keys] == ["tenant/a"]
+          assert opts[:worker] == "recovery-worker"
+          assert opts[:limit] == 25
+          assert opts[:lease_ms] == 30_000
+        end
+
+        test "POST /dashboard/flow/policies returns invalid forms with a visible error" do
           port = HealthEndpoint.port()
 
           response =
@@ -314,15 +426,10 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
               "history_max_events" => "25"
             })
 
-          assert extract_status_code(response) == 302
-          location = extract_header(response, "location")
-          assert location =~ "/dashboard/flow/policies?"
-          assert location =~ "status=error"
-
-          get_response = http_get(port, location)
-          assert get_response =~ "HTTP/1.1 200 OK"
-          assert get_response |> extract_body() |> String.contains?("ERR flow type is required")
-          assert get_response |> extract_body() |> String.contains?("flow-alert-error")
+          assert extract_status_code(response) == 422
+          refute extract_header(response, "location")
+          assert response |> extract_body() |> String.contains?("ERR flow type is required")
+          assert response |> extract_body() |> String.contains?("flow-alert-error")
         end
 
         test "Flow detail page renders rewind success and error flash messages" do
@@ -387,10 +494,14 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
 
           encoded_id = URI.encode(id, &URI.char_unreserved?/1)
 
+          assert {:ok, reviewed} = FerricStore.flow_get(id, partition_key: partition_key)
+
           response =
             http_post_form(port, "/dashboard/flow/#{encoded_id}/rewind", %{
               "partition_key" => partition_key,
               "to_event" => created_event_id,
+              "expect_state" => reviewed.state,
+              "expected_version" => to_string(reviewed.version),
               "confirm_rewind" => "true"
             })
 

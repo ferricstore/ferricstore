@@ -1,6 +1,25 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
   import FerricstoreServer.Health.Dashboard.Format
   import FerricstoreServer.Health.Dashboard.Render.Overview
+  alias FerricstoreServer.Health.Dashboard.Render.{TableFilter, TableValue}
+
+  def slowlog_data(data) do
+    %{
+      status: Map.get(data, :slowlog_status, :ok),
+      entries: Map.get(data, :slowlog, []),
+      error: Map.get(data, :slowlog_error)
+    }
+  end
+
+  def render_slowlog_summary(%{status: :unavailable}) do
+    render_ops_summary("Slow Log unavailable", [
+      %{label: "Entries", value: "Unavailable", class: "c-muted"},
+      %{label: "Worst", value: "Unavailable", class: "c-muted"},
+      %{label: "Avg", value: "Unavailable", class: "c-muted"}
+    ])
+  end
+
+  def render_slowlog_summary(%{entries: entries}), do: render_slowlog_summary(entries)
 
   def render_slowlog_summary(entries) do
     count = length(entries)
@@ -12,10 +31,15 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
       %{label: "Entries", value: format_number(count)},
       %{
         label: "Worst",
-        value: format_duration_us(worst_us),
-        class: slowlog_duration_class(worst_us)
+        value: if(count > 0, do: format_duration_us(worst_us), else: "No samples"),
+        class:
+          if(count > 0, do: slowlog_duration_class(worst_us), else: "ops-summary-code c-muted")
       },
-      %{label: "Avg", value: format_duration_us(avg_us)},
+      %{
+        label: "Avg",
+        value: if(count > 0, do: format_duration_us(avg_us), else: "No samples"),
+        class: if(count > 0, do: "", else: "ops-summary-code c-muted")
+      },
       %{label: "Total Time", value: format_duration_us(total_us)}
     ])
   end
@@ -23,6 +47,18 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
   def slowlog_duration_class(duration_us) when duration_us >= 1_000_000, do: "c-red"
   def slowlog_duration_class(duration_us) when duration_us >= 100_000, do: "c-yellow"
   def slowlog_duration_class(_duration_us), do: ""
+
+  def render_slowlog_table(%{status: :unavailable} = snapshot) do
+    """
+    <h2 class="section-title">Slow Log unavailable</h2>
+    <div class="flow-alert flow-alert-error" role="status">
+      <p>#{escape(Map.get(snapshot, :error) || "Slow commands could not be collected.")}</p>
+      <a class="flow-link" href="/dashboard/slowlog">Retry Slow Log</a>
+    </div>
+    """
+  end
+
+  def render_slowlog_table(%{entries: entries}), do: render_slowlog_table(entries)
 
   def render_slowlog_table(entries) do
     count = length(entries)
@@ -44,15 +80,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
               <td>#{entry.id}</td>
               <td class="mono">#{escape(time_str)}</td>
               <td>#{duration_ms} ms</td>
-              <td class="mono">#{escape(cmd_str)}</td>
+              <td class="mono">#{TableValue.render(cmd_str, "command", nil, entry.id)}</td>
             </tr>
             """
           end)
       end
 
     """
-    <div class="section-title">Slow Log <span class="badge badge-idle">#{escape(count_label)}</span></div>
-    <table>
+    <h2 class="section-title">Slow Log <span class="badge badge-idle">#{escape(count_label)}</span></h2>
+    #{TableFilter.controls("slowlog-table", "Filter loaded slow commands")}
+    #{accessible_table("Slow log entries", """
+    <table id="slowlog-table">
       <thead>
         <tr><th>ID</th><th>Time</th><th>Duration</th><th>Command</th></tr>
       </thead>
@@ -60,6 +98,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
         #{rows}
       </tbody>
     </table>
+    """)}
     """
   end
 
@@ -127,7 +166,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
       end)
 
     """
-    <div class="section-title">Merge Status <span class="badge badge-idle">#{escape(summary_label)}</span></div>
+    <h2 class="section-title">Merge Status <span class="badge badge-idle">#{escape(summary_label)}</span></h2>
     <table>
       <thead>
         <tr><th>Shard</th><th>Mode</th><th>Status</th><th>Last Merge</th><th>Merges</th><th>Reclaimed</th></tr>
@@ -186,7 +225,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
       end
 
     """
-    <div class="section-title">Namespace Config <span class="badge badge-idle">#{escape(count_label)}</span></div>
+    <h2 class="section-title">Namespace Config <span class="badge badge-idle">#{escape(count_label)}</span></h2>
     #{body}
     """
   end
@@ -318,7 +357,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
       end)
 
     """
-    <div class="section-title">#{escape(title)} <span class="badge badge-idle">#{length(commands)}</span></div>
+    <h2 class="section-title">#{escape(title)} <span class="badge badge-idle">#{length(commands)}</span></h2>
     <div class="table-scroll" role="region" aria-label="#{escape(title)}" tabindex="0">
     <table>
       <thead>
@@ -342,6 +381,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
         """
         <tr>
           <td class="mono">#{escape(entry.parameter)}</td>
+          <td class="mono">#{config_value(entry.parameter, Map.get(entry, :value))}</td>
+          <td>#{escape(Map.get(entry, :source) || "Unavailable")}</td>
           <td>#{escape(entry.scope)}</td>
           <td><span class="badge badge-idle">#{escape(entry.mutability)}</span></td>
           <td>#{escape(entry.notes)}</td>
@@ -350,17 +391,64 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
       end)
 
     """
-    <div class="section-title">Runtime Parameters <span class="badge badge-idle">read-write #{read_write}</span> <span class="badge badge-idle">read-only #{read_only}</span> <span class="badge badge-idle">node-local #{node_local}</span></div>
-    <table>
+    <h2 class="section-title">Runtime Parameters <span class="badge badge-idle">read-write #{read_write}</span> <span class="badge badge-idle">read-only #{read_only}</span> <span class="badge badge-idle">node-local #{node_local}</span></h2>
+    <div class="table-scroll" role="region" aria-label="Runtime parameters" tabindex="0">
+    <table class="config-parameters-table">
+      <colgroup><col class="config-name"><col class="config-value"><col class="config-source"><col class="config-scope"><col class="config-mode"><col class="config-notes"></colgroup>
       <thead>
-        <tr><th>Parameter</th><th>Scope</th><th>Mode</th><th>Notes</th></tr>
+        <tr><th>Parameter</th><th>Effective value</th><th>Source</th><th>Scope</th><th>Mode</th><th>Notes</th></tr>
       </thead>
       <tbody>
         #{rows}
       </tbody>
     </table>
+    </div>
     """
   end
+
+  defp config_value("requirepass", _value), do: "Redacted"
+  defp config_value(_parameter, nil), do: "Unavailable"
+
+  defp config_value("native-tls-port", value) when value in [0, "0"],
+    do: ~s(0 <span class="flow-filter-note">TLS listener not configured</span>)
+
+  defp config_value("notify-keyspace-events", ""),
+    do: ~s(Empty string <span class="flow-filter-note">Notifications disabled</span>)
+
+  defp config_value("maxmemory", value) when value in [0, "0"],
+    do: ~s(0 bytes <span class="flow-filter-note">No explicit process-memory ceiling</span>)
+
+  defp config_value(parameter, "")
+       when parameter in [
+              "tls-cert-file",
+              "tls-key-file",
+              "tls-ca-cert-file",
+              "native-tls-cert-file",
+              "native-tls-key-file",
+              "native-tls-ca-cert-file"
+            ],
+       do: "Not configured"
+
+  defp config_value(_parameter, ""), do: "Empty string"
+
+  defp config_value(parameter, value)
+       when parameter in [
+              "keydir-max-ram",
+              "hot-cache-max-ram",
+              "hot-cache-min-ram",
+              "hot-cache-max-value-size",
+              "maxmemory"
+            ] do
+    case Integer.parse(to_string(value)) do
+      {bytes, ""} when bytes >= 0 ->
+        ~s(#{format_bytes(bytes)} <span class="flow-filter-note">#{bytes} bytes</span>)
+
+      _ ->
+        escape(to_string(value))
+    end
+  end
+
+  defp config_value(_parameter, value), do: escape(to_string(value))
 
   def render_cluster_info(cluster) do
     node_str = Atom.to_string(cluster.node_name)
@@ -395,7 +483,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
       end
 
     """
-    <div class="section-title">Cluster #{cluster_badge}</div>
+    <h2 class="section-title">Cluster #{cluster_badge}</h2>
     <div class="conn-row" style="flex-direction:column; align-items:flex-start;">
       <div style="font-size:0.85rem;">
         <span class="conn-label">Node: </span>
@@ -411,10 +499,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
     healthy = Enum.count(raft_shards, &(&1.status == :ok))
     leaders = Enum.count(raft_shards, &match?({_name, _node}, &1.leader))
 
-    max_lag =
-      Enum.reduce(raft_shards, 0, fn shard, acc ->
-        max(acc, max(shard.commit_index - shard.last_applied, 0))
-      end)
+    lags = raft_shards |> Enum.map(&consensus_lag/1) |> Enum.filter(&is_integer/1)
+    complete? = total > 0 and length(lags) == total
+    max_lag = Enum.max(lags, fn -> nil end)
 
     render_ops_summary("WARaft Consensus Summary", [
       %{
@@ -424,13 +511,27 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
       },
       %{
         label: "Max Apply Lag",
-        value: format_number(max_lag),
-        class: consensus_lag_class(max_lag)
+        value: if(complete?, do: Integer.to_string(max_lag), else: "Unavailable"),
+        class: if(complete?, do: consensus_lag_class(max_lag), else: "c-muted"),
+        detail:
+          if(complete?,
+            do: "commit minus storage-applied index",
+            else: "#{length(lags)} / #{total} shards measured"
+          )
       },
       %{label: "Leaders", value: "#{format_number(leaders)} / #{format_number(total)}"}
     ])
   end
 
+  defp consensus_lag(%{commit_index: commit, last_applied: applied})
+       when is_integer(commit) and is_integer(applied), do: max(commit - applied, 0)
+
+  defp consensus_lag(_shard), do: nil
+
+  defp consensus_index(value) when is_integer(value), do: Integer.to_string(value)
+  defp consensus_index(_value), do: "Unavailable"
+
+  def consensus_lag_class(nil), do: "c-muted"
   def consensus_lag_class(lag) when lag > 1_000, do: "c-red"
   def consensus_lag_class(lag) when lag > 100, do: "c-yellow"
   def consensus_lag_class(_lag), do: "c-green"
@@ -451,6 +552,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
         status_html =
           case rs.status do
             :ok -> ~s(<span class="c-green">ok</span>)
+            :partial -> ~s(<span class="c-yellow">partial</span>)
             _ -> ~s(<span class="c-red">unavailable</span>)
           end
 
@@ -464,7 +566,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
               class = if is_local, do: "c-green", else: ""
               leader_str = "#{name}@#{leader_node}"
 
-              ~s(<span class="#{class} mono" title="#{escape_attr(leader_str)}">#{escape(short_consensus_member(name, leader_node))}</span>)
+              ~s(<span class="#{class} mono">#{TableValue.render(leader_str, "leader", short_consensus_member(name, leader_node), rs.shard)}</span>)
           end
 
         members_str =
@@ -473,41 +575,36 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
               "-"
 
             members ->
-              Enum.map_join(members, ", ", fn {name, n} -> short_consensus_member(name, n) end)
+              Enum.map_join(members, ", ", fn {name, n} -> "#{name}@#{n}" end)
           end
 
-        lag = rs.commit_index - rs.last_applied
-
-        lag_class =
-          cond do
-            lag > 1000 -> "c-red"
-            lag > 100 -> "c-yellow"
-            true -> ""
-          end
+        lag_class = consensus_lag_class(consensus_lag(rs))
 
         """
         <tr>
           <td>#{rs.shard}</td>
           <td>#{status_html}</td>
           <td>#{leader_html}</td>
-          <td>#{rs.current_term}</td>
-          <td>#{format_number(rs.commit_index)}</td>
-          <td class="#{lag_class}">#{format_number(rs.last_applied)}</td>
-          <td class="mono" style="font-size:0.75rem;">#{escape(members_str)}</td>
+          <td>#{consensus_index(rs.current_term)}</td>
+          <td>#{consensus_index(rs.commit_index)}</td>
+          <td class="#{lag_class}">#{consensus_index(rs.last_applied)}</td>
+          <td class="mono">#{TableValue.render(members_str, "consensus members", nil, rs.shard)}</td>
         </tr>
         """
       end)
 
     """
-    <div class="section-title">Per-Shard WARaft State #{summary_badge}</div>
+    <h2 class="section-title">Per-Shard WARaft State #{summary_badge}</h2>
+    #{accessible_table("Per-shard consensus state", """
     <table>
       <thead>
-        <tr><th>Shard</th><th>Status</th><th>Leader</th><th>Term</th><th>Commit Idx</th><th>Applied Idx</th><th>Members</th></tr>
+        <tr><th>Shard</th><th>Status</th><th>Leader</th><th>Term</th><th>Commit Idx</th><th>Storage Applied Idx</th><th>Members</th></tr>
       </thead>
       <tbody>
         #{rows}
       </tbody>
     </table>
+    """)}
     """
   end
 
@@ -525,6 +622,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
   end
 
   def render_clients_summary(conns, clients) do
+    shown? = Map.get(conns, :summary_scope) == :shown
+
     oldest_age =
       Map.get_lazy(conns, :oldest_age_seconds, fn ->
         clients
@@ -547,20 +646,87 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
         value: format_number(conns.blocked),
         class: if(conns.blocked > 0, do: "c-yellow", else: "")
       },
-      %{label: "Tracking", value: format_number(conns.tracking), detail: "#{pubsub} Pub/Sub"},
       %{
-        label: "Transactions",
+        label: "Tracking",
+        value: format_number(conns.tracking),
+        detail: "#{pubsub} #{if shown?, do: "shown ", else: ""}Pub/Sub"
+      },
+      %{
+        label: if(shown?, do: "Shown transactions", else: "Transactions"),
         value: format_number(transactions),
-        detail: "Oldest #{format_uptime(oldest_age)}"
+        detail: "Oldest #{if shown?, do: "shown ", else: ""}#{format_uptime(oldest_age)}"
       }
     ])
   end
 
-  def render_clients_table(clients) do
+  def render_clients_page_table(data) do
+    coverage = Map.get(data, :client_coverage, %{})
+    filters = Map.get(data, :client_filters, %{q: "", cursor: ""})
+    clients = Map.get(data, :clients, [])
+    total = Map.get(coverage, :total_registered)
+    next_cursor = Map.get(coverage, :next_cursor)
+
+    next =
+      if next_cursor do
+        href =
+          "/dashboard/clients?" <> URI.encode_query(%{"q" => filters.q, "cursor" => next_cursor})
+
+        ~s(<a class="flow-link" href="#{escape_attr(href)}">Next connections</a>)
+      else
+        ""
+      end
+
+    coverage_note =
+      cond do
+        Map.get(coverage, :status) == :invalid_filters ->
+          "Search must be 256 characters or fewer; page cursors must be at most 128 bytes. Correct the search and retry."
+
+        Map.get(coverage, :status) == :expired_cursor ->
+          "Continuation expired after a connection closed. Restart search to inspect current connections."
+
+        Map.get(coverage, :status) == :unavailable ->
+          "Client registry unavailable. Restart the search to retry."
+
+        Map.get(coverage, :complete?, true) ->
+          "End of the registry traversal."
+
+        Map.get(coverage, :scanned_count, 0) >= 10_000 ->
+          "Scan budget reached. Continue to inspect remaining connections."
+
+        true ->
+          "More registered connections remain."
+      end
+
+    """
+    <form class="flow-filter-form" action="/dashboard/clients" method="get" aria-label="Search registered connections">
+      <label class="flow-field">Name, user, address, ID or flags
+        <input class="flow-search-input" type="search" name="q" maxlength="256" value="#{escape_attr(filters.q)}">
+      </label>
+      <button class="flow-search-button" type="submit">Search connections</button>
+      <a class="flow-filter-clear" href="/dashboard/clients">Restart search</a>
+    </form>
+    <p class="flow-filter-note" role="status">#{length(clients)} shown / #{if is_integer(total), do: format_number(total), else: "unknown"} registered. #{coverage_note} Pages are live registry traversals; connections can change between requests.</p>
+    #{render_clients_table(clients, if(Map.get(coverage, :status, :ok) != :ok, do: "No page collected; correct the search or restart to retry", else: "No matching connections in this bounded page"))}
+    <nav aria-label="Connection pages">#{next}</nav>
+    """
+  end
+
+  def clients_live_url(data) do
+    filters = Map.get(data, :client_filters, %{q: "", cursor: ""})
+
+    query =
+      [{"q", filters.q}, {"cursor", filters.cursor}]
+      |> Enum.reject(fn {_key, value} -> value == "" end)
+      |> URI.encode_query()
+
+    "/dashboard/api/clients" <> if(query == "", do: "", else: "?" <> query)
+  end
+
+  def render_clients_table(clients, empty_message \\ "No active connections") do
     rows =
       case clients do
         [] ->
-          ~s(<tr><td colspan="6" class="c-muted">No active connections</td></tr>)
+          ~s(<tr><td colspan="6" class="c-muted">#{escape(empty_message)}</td></tr>)
 
         _ ->
           Enum.map_join(clients, "\n", fn c ->
@@ -571,20 +737,22 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
 
             """
             <tr>
-              <td class="mono">#{escape(id_str)}</td>
-              <td>#{escape(name)}</td>
-              <td class="mono">#{escape(user)}</td>
-              <td class="mono">#{escape(c.peer)}</td>
+              <td class="mono">#{TableValue.render(id_str, "client ID", nil, id_str)}</td>
+              <td>#{TableValue.render(name, "client name", nil, id_str)}</td>
+              <td class="mono">#{TableValue.render(user, "username", nil, id_str)}</td>
+              <td class="mono">#{TableValue.render(c.peer, "client address", nil, id_str)}</td>
               <td>#{format_uptime(c.age_seconds)}</td>
-              <td>#{escape(c.flags)}</td>
+              <td>#{TableValue.render(c.flags, "client flags", nil, id_str)}</td>
             </tr>
             """
           end)
       end
 
     """
-    <div class="section-title">Active Connections <span class="badge badge-idle">#{length(clients)}</span></div>
-    <table>
+    <h2 class="section-title">Active Connections <span class="badge badge-idle">#{length(clients)}</span></h2>
+    #{TableFilter.controls("clients-table", "Filter loaded clients by user, name or address")}
+    #{accessible_table("Active connections", """
+    <table id="clients-table">
       <thead>
         <tr><th>ID</th><th>Name</th><th>User</th><th>Client Address</th><th>Age</th><th>Flags</th></tr>
       </thead>
@@ -592,7 +760,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
         #{rows}
       </tbody>
     </table>
-        <div style="margin-top:8px; font-size:0.72rem; color:#8b949e;">
+    """)}
+    <div style="margin-top:8px; font-size:0.75rem; color:#8b949e;">
       Flags: M=in MULTI transaction, S=subscribed (pub/sub), T=tracking enabled
     </div>
     """

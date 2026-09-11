@@ -178,7 +178,14 @@ defmodule Ferricstore.Store.ShardCompactionWorkerTest do
       )
 
     name = :"shard_compaction_worker_#{System.unique_integer([:positive])}"
-    ctx = FerricStore.Instance.build(name, data_dir: dir, shard_count: 1)
+
+    ctx =
+      FerricStore.Instance.build(name,
+        data_dir: dir,
+        shard_count: 1,
+        query_index_provider: FerricStore.Flow.QueryIndexProvider.Disabled
+      )
+
     :ok = Ferricstore.DataDir.ensure_layout!(dir, 1)
 
     {:ok, pid} =

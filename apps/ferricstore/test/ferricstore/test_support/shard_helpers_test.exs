@@ -287,7 +287,13 @@ defmodule Ferricstore.Test.ShardHelpersTest do
     root = Path.join(System.tmp_dir!(), Atom.to_string(name))
     File.rm_rf!(root)
     Ferricstore.DataDir.ensure_layout!(root, 1)
-    foreign_ctx = FerricStore.Instance.build(name, data_dir: root, shard_count: 1)
+
+    foreign_ctx =
+      FerricStore.Instance.build(name,
+        data_dir: root,
+        shard_count: 1,
+        query_index_provider: FerricStore.Flow.QueryIndexProvider.Disabled
+      )
 
     on_exit(fn ->
       WARaftBackend.stop()

@@ -429,6 +429,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
         partition_key = Map.get(attrs, :partition_key)
 
         with {:ok, record} <- flow_require_record(state, id, partition_key),
+             :ok <- flow_require_expected_version(record, Map.get(attrs, :expected_version)),
              :ok <- flow_require_rewindable(record),
              :ok <- flow_require_expected_state(record, Map.get(attrs, :expect_state)),
              {:ok, target_fields} <-

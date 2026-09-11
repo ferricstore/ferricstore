@@ -178,16 +178,25 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirementsTest do
     assert RouteRequirements.flow_governance_form_requirement(%{
              "action" => "open_circuit",
              "scope" => "tenant-a:payments"
-           }) == {"FLOW.CIRCUIT.OPEN", key: {"tenant-a:payments", :write}}
+           }) == [
+             {"FLOW.CIRCUIT.OPEN", key: {"tenant-a:payments", :write}},
+             {"FLOW.CIRCUIT.GET", key: {"tenant-a:payments", :read}}
+           ]
 
     assert RouteRequirements.flow_governance_form_requirement(%{
              "action" => "close_circuit",
              "scope" => "tenant-a:payments"
-           }) == {"FLOW.CIRCUIT.CLOSE", key: {"tenant-a:payments", :write}}
+           }) == [
+             {"FLOW.CIRCUIT.CLOSE", key: {"tenant-a:payments", :write}},
+             {"FLOW.CIRCUIT.GET", key: {"tenant-a:payments", :read}}
+           ]
 
     assert RouteRequirements.flow_governance_form_requirement(%{
              "action" => "open_circuit",
              "scope" => " "
-           }) == {"FLOW.CIRCUIT.OPEN", []}
+           }) == [
+             {"FLOW.CIRCUIT.OPEN", key: {" ", :write}},
+             {"FLOW.CIRCUIT.GET", key: {" ", :read}}
+           ]
   end
 end

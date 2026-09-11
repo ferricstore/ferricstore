@@ -429,6 +429,14 @@ defmodule FerricstoreServer.Health.Dashboard.FlowQueryWorkbenchTest do
     assert html =~ ~s(name="action" value="run")
     assert html =~ ~s(name="action" value="explain")
     assert html =~ ~s(name="action" value="analyze")
+    assert html =~ ~s(data-flow-query-copy-field="fql")
+    assert html =~ ~s(data-flow-query-copy-field="params_json")
+    assert html =~ ~s(data-flow-query-copy-status)
+    assert html =~ "Copy FQL"
+    assert html =~ "Copy params"
+    assert html =~ "window.dashboardCopyText"
+    assert html =~ "Copy failed. Select and copy manually."
+    refute html =~ "ferricstore_query_history"
     assert html =~ ~s(method="post")
     assert html =~ ~s(event.key === "ArrowRight")
     assert html =~ ~s(event.key === "ArrowLeft")
@@ -649,6 +657,14 @@ defmodule FerricstoreServer.Health.Dashboard.FlowQueryWorkbenchTest do
       Dashboard.collect_flow_query_workbench_page(prepared, form, acl_username: username)
 
     assert Enum.map(data.result.rows, & &1.id) == ["flow-visible"]
+
+    html =
+      FerricstoreServer.Health.Dashboard.Render.FlowQueryResults.render_flow_query_table(
+        data.result
+      )
+
+    assert html =~ "/dashboard/flow/flow-visible?partition_key=tenant-a"
+    refute html =~ "flow-wrong-partition"
   end
 
   test "keeps projected result columns readable in the mobile scroll container" do
@@ -846,10 +862,12 @@ defmodule FerricstoreServer.Health.Dashboard.FlowQueryWorkbenchTest do
     assert html =~ ~s(<svg class="flow-query-time-chart" role="img")
     assert html =~ ~s(<rect class="flow-query-time-bar )
 
-    assert html =~
+    assert FerricstoreServer.Health.Dashboard.Layout.Styles.stylesheet() =~
              ".flow-query-chart-segment { fill: none; stroke: var(--flow-query-chart-color);"
 
-    assert html =~ ".flow-query-time-bar { fill: var(--flow-query-chart-color);"
+    assert FerricstoreServer.Health.Dashboard.Layout.Styles.stylesheet() =~
+             ".flow-query-time-bar { fill: var(--flow-query-chart-color);"
+
     refute html =~ "flow-query-chart-track"
   end
 
@@ -890,7 +908,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowQueryWorkbenchTest do
     assert %{charts: [%{field: "state", values: values}]} = visualization
     assert length(values) == 12
     assert Enum.sum(Enum.map(values, & &1.count)) == 40
-    assert List.last(values).label == "Other"
+    assert List.last(values).label == "Remaining categories"
   end
 
   test "guided query results skip unused sampling and chart only returned rows" do
@@ -925,7 +943,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowQueryWorkbenchTest do
     refute query =~ "state ="
     refute Map.has_key?(params, "state")
     assert data.filters.state == nil
-    assert Dashboard.render_flow_query_page(data) =~ "Leave empty to include all states."
+    assert Dashboard.render_flow_query_page(data) =~ "Empty includes all states."
   end
 
   defp query_filters do

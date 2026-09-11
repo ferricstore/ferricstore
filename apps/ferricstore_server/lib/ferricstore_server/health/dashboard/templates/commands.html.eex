@@ -3,7 +3,7 @@
 <body data-dashboard-live-page="commands" data-dashboard-live-url="/dashboard/api/commands" data-dashboard-live-interval-ms="10000">
 <div class="layout">
 <%= render_sidebar_static("commands") %>
-<main class="main-content">
+<main class="main-content" id="dashboard-main" tabindex="-1">
 <%= render_subpage_header("Commands") %>
 <div class="content">
 <%= render_page_intro("Commands", "Understand command traffic, slow command shape, and which command families map to the generic KV engine.") %>

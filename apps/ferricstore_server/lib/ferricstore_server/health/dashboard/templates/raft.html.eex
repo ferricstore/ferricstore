@@ -3,7 +3,7 @@
 <body data-dashboard-live-page="raft" data-dashboard-live-url="/dashboard/api/raft" data-dashboard-live-interval-ms="5000">
 <div class="layout">
 <%= render_sidebar_static("raft") %>
-<main class="main-content">
+<main class="main-content" id="dashboard-main" tabindex="-1">
 <%= render_subpage_header("Consensus") %>
 <div class="content">
 <%= render_page_intro("Consensus", "Check WARaft shard leadership, commit/apply lag, cluster membership, and replication health.") %>

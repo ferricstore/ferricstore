@@ -17,6 +17,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.DoctorPages do
 
   def render_doctor_flash(_flash), do: ""
 
+  def render_doctor_summary(%{"error" => _} = check) do
+    render_doctor_collection_error("Doctor CHECK unavailable", check) <>
+      render_ops_summary("Doctor Summary", [
+        %{label: "Status", value: "Unavailable", class: "c-red"},
+        %{label: "Checks", value: "Unavailable"},
+        %{label: "Warnings", value: "Unavailable"},
+        %{label: "Errors", value: "Unavailable"},
+        %{label: "Duration", value: "Unavailable"}
+      ])
+  end
+
   def render_doctor_summary(check) do
     status = Map.get(check, "status", "error")
     checks = Map.get(check, "checks", [])
@@ -53,7 +64,12 @@ defmodule FerricstoreServer.Health.Dashboard.Render.DoctorPages do
     rows =
       case Map.get(check, "checks", []) do
         [] ->
-          ~s(<tr><td colspan="5" class="c-muted">No doctor checks returned</td></tr>)
+          message =
+            if Map.has_key?(check, "error"),
+              do: "Checks unavailable; retry diagnostics.",
+              else: "No doctor checks returned"
+
+          ~s(<tr><td colspan="5" class="c-muted">#{message}</td></tr>)
 
         checks ->
           Enum.map_join(checks, "\n", fn item ->
@@ -72,44 +88,66 @@ defmodule FerricstoreServer.Health.Dashboard.Render.DoctorPages do
       end
 
     """
-    <div class="section-title">Checks</div>
-    <table>
+    <h2 class="section-title">Checks</h2>
+    <div class="table-scroll" role="region" aria-label="Doctor checks" tabindex="0"><table>
       <thead>
         <tr><th>Scope</th><th>Status</th><th>Meaning</th><th>Key metrics</th><th>Command</th></tr>
       </thead>
       <tbody>
         #{rows}
       </tbody>
-    </table>
+    </table></div>
     """
   end
 
   def render_doctor_actions do
     """
-    <div class="section-title">Actions</div>
+    <h2 class="section-title">Actions</h2>
     <div class="flow-card-grid">
-      <form class="flow-card flow-card-wide" action="/dashboard/doctor" method="post">
+      <form class="flow-card flow-card-wide" action="/dashboard/doctor" method="post" data-dashboard-single-submit>
         <input type="hidden" name="action" value="start_check">
         <div class="flow-card-label">Start background check</div>
         <div class="flow-card-detail">Runs the selected doctor scope as a background job and keeps the result queryable by job id.</div>
-        <label class="flow-form-label" for="doctor-scope">Scope</label>
-        <select id="doctor-scope" name="scope">
+        <label class="flow-field" for="doctor-scope"><span>Scope</span>
+        <select class="flow-search-input" id="doctor-scope" name="scope">
           <option value="ALL">All</option>
           <option value="BITCASK">Bitcask / keydir</option>
           <option value="BLOB_REFS">Blob refs</option>
           <option value="FLOW_LMDB">Flow LMDB</option>
         </select>
-        <button type="submit" class="flow-action-button">Start</button>
+        </label>
+        <button type="submit" class="flow-search-button">Start check</button>
       </form>
-      <form class="flow-card flow-card-wide" action="/dashboard/doctor" method="post">
-        <input type="hidden" name="action" value="repair_flow_lmdb">
+      <div class="flow-card flow-card-wide">
         <div class="flow-card-label">Repair Flow projection</div>
         <div class="flow-card-detail">Starts FERRICSTORE.DOCTOR START REPAIR PROJECTIONS for the LMDB cold/query projection. Flow hot indexes stay on the normal apply path.</div>
-        <button type="submit" class="flow-action-button">Repair Flow LMDB</button>
-      </form>
+        <details class="flow-action-confirm">
+          <summary class="flow-search-button">Review repair</summary>
+          <div class="flow-action-confirm-panel">
+            <strong>Confirm projection reconciliation</strong>
+            <span>This starts one bounded background repair job. An existing repair for this instance will not be duplicated.</span>
+            <form action="/dashboard/doctor" method="post" data-dashboard-single-submit>
+              <input type="hidden" name="action" value="repair_flow_lmdb">
+              <input type="hidden" name="confirm_action" value="true">
+              <input type="hidden" name="expected_action" value="repair_flow_lmdb">
+              <button type="submit" class="flow-search-button">Confirm Repair Flow LMDB</button>
+            </form>
+          </div>
+        </details>
+      </div>
     </div>
     """
   end
+
+  def render_doctor_jobs(%{"error" => _} = result) do
+    render_doctor_collection_error("Doctor LIST unavailable", result) <>
+      case Map.get(result, "jobs", []) do
+        [] -> ""
+        jobs -> render_doctor_jobs(jobs)
+      end
+  end
+
+  def render_doctor_jobs(%{} = result), do: render_doctor_jobs(Map.get(result, "jobs", []))
 
   def render_doctor_jobs(jobs) do
     rows =
@@ -122,11 +160,19 @@ defmodule FerricstoreServer.Health.Dashboard.Render.DoctorPages do
             cancel =
               if Map.get(job, "status") == "running" do
                 """
-                <form action="/dashboard/doctor" method="post" style="display:inline">
-                  <input type="hidden" name="action" value="cancel">
-                  <input type="hidden" name="job_id" value="#{escape_attr(Map.get(job, "job_id", ""))}">
-                  <button type="submit" class="flow-link-button">Cancel</button>
-                </form>
+                <details class="flow-action-confirm">
+                  <summary class="flow-link-button">Cancel</summary>
+                  <div class="flow-action-confirm-panel">
+                    <strong>Cancel running job</strong>
+                    <span class="mono">#{escape(Map.get(job, "job_id", ""))}</span>
+                    <form action="/dashboard/doctor" method="post" data-dashboard-single-submit>
+                      <input type="hidden" name="action" value="cancel">
+                      <input type="hidden" name="job_id" value="#{escape_attr(Map.get(job, "job_id", ""))}">
+                      <input type="hidden" name="expected_status" value="running">
+                      <button type="submit" class="flow-danger-button">Confirm cancel</button>
+                    </form>
+                  </div>
+                </details>
                 """
               else
                 ""
@@ -146,7 +192,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.DoctorPages do
       end
 
     """
-    <div class="section-title">Background Jobs</div>
+    <h2 class="section-title">Background Jobs</h2>
+    <div class="table-scroll" role="region" aria-label="Doctor jobs" tabindex="0">
     <table>
       <thead>
         <tr><th>Job</th><th>Kind</th><th>Status</th><th>Scopes</th><th>Result</th><th>Action</th></tr>
@@ -155,6 +202,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.DoctorPages do
         #{rows}
       </tbody>
     </table>
+    </div>
+    """
+  end
+
+  defp render_doctor_collection_error(title, result) do
+    """
+    <div class="flow-alert flow-alert-error" role="status">
+      <strong>#{escape(title)}</strong>
+      <p>#{escape(Map.get(result, "error", "Diagnostics could not be collected."))}</p>
+      <a class="flow-link" href="/dashboard/doctor">Retry diagnostics</a>
+    </div>
     """
   end
 
@@ -171,11 +229,13 @@ defmodule FerricstoreServer.Health.Dashboard.Render.DoctorPages do
       end)
 
     """
-    <div class="section-title">Command Reference</div>
+    <h2 class="section-title">Command Reference</h2>
+    <div class="table-scroll" role="region" aria-label="Doctor command reference" tabindex="0">
     <table>
       <thead><tr><th>Command</th><th>Purpose</th><th>Permission</th></tr></thead>
       <tbody>#{rows}</tbody>
     </table>
+    </div>
     """
   end
 

@@ -80,6 +80,7 @@ defmodule FerricstoreHttp.SdkIntegrationTest do
         "--",
         "vitest",
         "run",
+        "--no-file-parallelism",
         "tests/integration/live-http-command-surface.test.ts",
         "tests/integration/live-store-flow.test.ts",
         "tests/integration/live-governance-workflow.test.ts",

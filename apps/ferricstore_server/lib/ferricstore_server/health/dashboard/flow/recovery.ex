@@ -3,7 +3,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
 
   alias Ferricstore.Flow.Query.Builder
   alias FerricstoreServer.Health.Dashboard.Access, as: DashboardAccess
-  alias FerricstoreServer.Health.Dashboard.Flow.PolicyRetention
+  alias FerricstoreServer.Health.Dashboard.Flow.{PolicyRetention, QueryResult}
+  alias FerricstoreServer.Health.Dashboard.Flow.ManagementActions
+  alias FerricstoreServer.Health.Endpoint.RouteRequirements
   alias FerricstoreServer.Health.QueryDecoder
 
   import FerricstoreServer.Health.Dashboard.Flow.Calls
@@ -26,11 +28,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
       |> flow_available_types()
       |> maybe_include_flow_type(filters.type)
 
-    {queried_records, exact_scan_status} =
+    {queried_records, exact_scan_status, exact_scan_results} =
       if filters.scan_exact do
         flow_recovery_query_records(filters, available_types)
       else
-        {[], %{failures: :skipped, stuck: :skipped}}
+        {[], %{failures: :skipped, stuck: :skipped}, %{}}
       end
 
     records =
@@ -50,6 +52,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
 
     %{
       candidates: candidates,
+      reclaim_scopes: reclaim_scopes(candidates, acl_username),
       summary: flow_recovery_summary(candidates),
       filters: filters,
       available_types: available_types,
@@ -57,6 +60,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
       filtered_sampled: length(records),
       sample_limit: @flow_dashboard_sample_limit,
       exact_scan_status: exact_scan_status,
+      exact_scan_results: exact_scan_results,
       flash: Keyword.get(opts, :flash),
       generated_at_ms: System.system_time(:millisecond)
     }
@@ -103,6 +107,47 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
     })
   end
 
+  def reclaim_groups(data) do
+    Map.get_lazy(data, :reclaim_scopes, fn ->
+      reclaim_scopes(Map.get(data, :candidates, []), nil)
+    end)
+  end
+
+  def prepare_reclaim_path(group, filters) do
+    params = %{
+      "type" => group.type,
+      "partition_key" => group.partition_key,
+      "limit" => Map.get(filters, :limit, @flow_dashboard_recent_limit),
+      "exact" => if(Map.get(filters, :scan_exact, false), do: "true", else: "false")
+    }
+
+    params = maybe_put_return_param(params, "q", Map.get(filters, :q))
+
+    "/dashboard/flow/failures?" <> URI.encode_query(params) <> "#flow-reclaim-form"
+  end
+
+  defp reclaim_scopes(records, username) do
+    records
+    |> Enum.filter(&flow_expired_lease?/1)
+    |> Enum.group_by(&{flow_record_type(&1), flow_record_partition_key(&1)})
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.map(fn {{type, partition}, rows} ->
+      exact? = is_binary(type) and type != "" and is_binary(partition) and partition != ""
+
+      %{
+        type: type,
+        partition_key: partition,
+        count: length(rows),
+        can_prepare?:
+          exact? and
+            ManagementActions.allowed?(
+              username,
+              RouteRequirements.flow_reclaim_form_requirement(%{"partition_key" => partition})
+            )
+      }
+    end)
+  end
+
   @spec apply_form(map()) :: {:ok, map()} | {:error, binary()}
   def apply_form(params) when is_map(params) do
     with "reclaim" <- Map.get(params, "action", "reclaim"),
@@ -119,7 +164,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
              limit: limit,
              lease_ms: lease_ms
            ]
-           |> maybe_put_query_opt(:partition_key, partition_key)
+           |> maybe_put_reclaim_partition(partition_key)
            |> Enum.reverse(),
          {:ok, reclaimed} <- flow_dashboard_flow_reclaim(type, opts) do
       {:ok, %{type: type, reclaimed: length(reclaimed), worker: opts[:worker]}}
@@ -140,6 +185,31 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
 
   def apply_form(_params), do: {:error, "ERR recovery form must be a map"}
 
+  defp maybe_put_reclaim_partition(opts, nil), do: opts
+
+  defp maybe_put_reclaim_partition(opts, partition),
+    do: Keyword.put(opts, :partition_keys, [partition])
+
+  @spec redirect_location(map(), {:ok, map()} | {:error, binary()}) :: binary()
+  def redirect_location(params, result) when is_map(params) do
+    scope = recovery_return_scope(params)
+
+    result_params =
+      case result do
+        {:ok, result} ->
+          %{
+            "status" => "reclaimed",
+            "type" => Map.get(result, :type, Map.get(params, "type", "")),
+            "count" => Map.get(result, :reclaimed, 0)
+          }
+
+        {:error, reason} ->
+          %{"status" => "error", "message" => reason}
+      end
+
+    "/dashboard/flow/failures?" <> URI.encode_query(Map.merge(scope, result_params))
+  end
+
   @spec flow_failures_filters_from_opts(keyword()) :: map()
   defp flow_failures_filters_from_opts(opts) when is_list(opts) do
     %{
@@ -158,7 +228,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
         %{
           kind: :ok,
           message:
-            "Reclaimed #{PolicyRetention.query_integer(params, "count")} expired lease(s) for #{Map.get(params, "type", "Flow")}"
+            "Reclaimed #{PolicyRetention.query_integer(params, "count")} expired lease(s) for #{Map.get(params, "type", "Flow")}. Evidence may update shortly while query projections catch up."
         }
 
       "error" ->
@@ -180,16 +250,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
     end
   end
 
-  @spec flow_recovery_query_records(map(), [binary()]) ::
-          {[map()],
-           %{
-             failures: :ok | :skipped | {:error, term()},
-             stuck: :ok | :skipped | {:error, term()}
-           }}
+  @spec flow_recovery_query_records(map(), [binary()]) :: {[map()], map(), map()}
   defp flow_recovery_query_records(%{type: type} = filters, _available_types)
        when is_binary(type) and type != "" do
     if is_binary(filters.partition_key),
-      do: flow_recovery_query_records_for_types([type], filters),
+      do: flow_recovery_query_records_for_type(type, filters),
       else: flow_recovery_partition_required()
   end
 
@@ -200,31 +265,18 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
   defp flow_recovery_query_records(_filters, _available_types),
     do: flow_recovery_partition_required()
 
-  @spec flow_recovery_query_records_for_types([binary()], map()) ::
-          {[map()],
-           %{
-             failures: :ok | :skipped | {:error, term()},
-             stuck: :ok | :skipped | {:error, term()}
-           }}
-  defp flow_recovery_query_records_for_types(types, filters) do
+  @spec flow_recovery_query_records_for_type(binary(), map()) :: {[map()], map(), map()}
+  defp flow_recovery_query_records_for_type(type, filters) do
     timeout_ms = flow_dashboard_list_fetch_timeout_ms()
 
-    Enum.reduce(types, {[], %{failures: :skipped, stuck: :skipped}}, fn type,
-                                                                        {acc_records, acc_status} ->
-      {failures, failures_status} =
-        flow_recovery_query_source(:failures, type, filters, timeout_ms)
+    {failures, failures_status, failures_result} =
+      flow_recovery_query_source(:failures, type, filters, timeout_ms)
 
-      {stuck, stuck_status} =
-        flow_recovery_query_source(:stuck, type, filters, timeout_ms)
+    {stuck, stuck_status, stuck_result} =
+      flow_recovery_query_source(:stuck, type, filters, timeout_ms)
 
-      {
-        acc_records ++ failures ++ stuck,
-        %{
-          failures: flow_recovery_merge_status(acc_status.failures, failures_status),
-          stuck: flow_recovery_merge_status(acc_status.stuck, stuck_status)
-        }
-      }
-    end)
+    {failures ++ stuck, %{failures: failures_status, stuck: stuck_status},
+     %{failures: failures_result, stuck: stuck_result}}
   end
 
   defp flow_recovery_query_source(kind, type, filters, timeout_ms) do
@@ -245,35 +297,47 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
         timeout_ms
       )
     else
-      {:error, reason} -> {[], {:error, reason}}
+      {:error, reason} -> {[], {:error, reason}, %{}}
     end
   end
 
   @spec flow_recovery_exact_source((-> term()), non_neg_integer()) ::
-          {[map()], :ok | {:error, term()}}
+          {[map()], :ok | {:error, term()}, map()}
   defp flow_recovery_exact_source(fun, timeout_ms) do
     case bounded_dashboard_call(fun, timeout_ms, :flow_recovery_exact) do
-      {:ok, {:ok, records}} when is_list(records) -> {records, :ok}
-      {:ok, {:ok, %{records: records}}} when is_list(records) -> {records, :ok}
-      {:ok, {:error, reason}} -> {[], {:error, reason}}
-      {:error, reason} -> {[], {:error, reason}}
-      other -> {[], {:error, {:unexpected, other}}}
+      {:ok, {:ok, records}} when is_list(records) ->
+        {records, :ok, %{}}
+
+      {:ok, {:ok, %{records: records} = response}} when is_list(records) ->
+        recovery_page(response)
+
+      {:ok, {:ok, %{"records" => records} = response}} when is_list(records) ->
+        recovery_page(response)
+
+      {:ok, {:error, reason}} ->
+        {[], {:error, reason}, %{}}
+
+      {:error, reason} ->
+        {[], {:error, reason}, %{}}
+
+      other ->
+        {[], {:error, {:unexpected, other}}, %{}}
     end
   end
 
-  defp flow_recovery_merge_status({:error, _} = error, _next), do: error
-  defp flow_recovery_merge_status(_previous, {:error, _} = error), do: error
-  defp flow_recovery_merge_status(:skipped, :ok), do: :ok
-  defp flow_recovery_merge_status(:ok, :ok), do: :ok
+  defp recovery_page(response) do
+    result = QueryResult.success("FLOW.QUERY", response)
+    {result.rows, :ok, Map.take(result, [:page, :quality])}
+  end
 
   defp flow_recovery_partition_required do
     error = {:error, :query_partition_required}
-    {[], %{failures: error, stuck: error}}
+    {[], %{failures: error, stuck: error}, %{}}
   end
 
   defp flow_recovery_type_required do
     error = {:error, :query_type_required}
-    {[], %{failures: error, stuck: error}}
+    {[], %{failures: error, stuck: error}, %{}}
   end
 
   defp flow_recovery_candidate?(record) do
@@ -311,8 +375,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
   defp maybe_include_flow_type(types, _type), do: types
 
   defp flow_dashboard_required_form_value(params, key, label) do
-    case flow_dashboard_optional_form_value(params, key) do
-      {:ok, value} when is_binary(value) -> {:ok, value}
+    case Map.get(params, key) do
+      value when is_binary(value) and value != "" -> {:ok, value}
       _ -> {:error, "ERR #{label} is required"}
     end
   end
@@ -347,4 +411,33 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
         end
     end
   end
+
+  defp recovery_return_scope(params) do
+    %{}
+    |> maybe_put_return_param(
+      "type",
+      normalize_flow_type_filter(Map.get(params, "type"))
+    )
+    |> maybe_put_return_param(
+      "partition_key",
+      normalize_flow_partition_query(Map.get(params, "partition_key"))
+    )
+    |> maybe_put_return_param("q", normalize_flow_name_filter(Map.get(params, "return_q")))
+    |> maybe_put_return_limit(Map.get(params, "return_limit"))
+    |> maybe_put_return_exact(Map.get(params, "return_exact"))
+  end
+
+  defp maybe_put_return_limit(scope, value) do
+    case value |> to_string() |> String.trim() |> Integer.parse() do
+      {limit, ""} when limit >= 1 and limit <= 200 -> Map.put(scope, "limit", limit)
+      _other -> scope
+    end
+  end
+
+  defp maybe_put_return_exact(scope, value) do
+    if normalize_flow_boolean_filter(value), do: Map.put(scope, "exact", "true"), else: scope
+  end
+
+  defp maybe_put_return_param(scope, _key, value) when value in [nil, ""], do: scope
+  defp maybe_put_return_param(scope, key, value), do: Map.put(scope, key, value)
 end

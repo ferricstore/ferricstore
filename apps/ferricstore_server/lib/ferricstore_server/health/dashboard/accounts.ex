@@ -170,7 +170,10 @@ defmodule FerricstoreServer.Health.Dashboard.Accounts do
   defp custom_modifiers(_value), do: {:error, "ACL modifiers must be text."}
 
   defp credential_or_state_modifier?(modifier) do
-    String.starts_with?(modifier, ">") or MapSet.member?(@separate_control_modifiers, modifier)
+    candidate = String.trim_leading(modifier)
+
+    String.starts_with?(candidate, [">", "<", "#", "!"]) or
+      MapSet.member?(@separate_control_modifiers, candidate)
   end
 
   defp confirmed_password(params) do

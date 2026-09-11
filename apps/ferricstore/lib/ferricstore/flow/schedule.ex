@@ -59,6 +59,8 @@ defmodule Ferricstore.Flow.Schedule do
     :cron,
     :delay_ms,
     :end_at_ms,
+    :expected_state,
+    :expected_version,
     :every_ms,
     :kind,
     :max_fires,
@@ -71,8 +73,8 @@ defmodule Ferricstore.Flow.Schedule do
     :timezone
   ]
   @get_option_keys [:partition_key, :payload, :payload_max_bytes]
-  @fire_option_keys [:fire_at_ms, :now_ms]
-  @status_option_keys [:now_ms]
+  @fire_option_keys [:expected_state, :expected_version, :fire_at_ms, :now_ms]
+  @status_option_keys [:expected_state, :expected_version, :now_ms]
   @fire_due_option_keys [:block_ms, :lease_ms, :limit, :now_ms, :worker]
   @target_option_keys [
     :correlation_id,
@@ -103,35 +105,52 @@ defmodule Ferricstore.Flow.Schedule do
          {:ok, definition} <- definition(id, opts) do
       flow_id = flow_id(id)
 
-      create_opts = [
-        type: @schedule_type,
-        state: @active_state,
-        partition_key: partition_key(id),
-        schedule_metadata: Metadata.from_definition(definition),
-        payload: definition,
-        run_at_ms: Map.fetch!(definition, :next_run_at_ms),
-        now_ms: Map.fetch!(definition, :created_at_ms)
-      ]
+      if overwrite? and
+           (Keyword.has_key?(opts, :expected_version) or Keyword.has_key?(opts, :expected_state)) do
+        replace(ctx, flow_id, definition, opts)
+      else
+        create_opts = [
+          type: @schedule_type,
+          state: @active_state,
+          partition_key: partition_key(id),
+          schedule_metadata: Metadata.from_definition(definition),
+          payload: definition,
+          run_at_ms: Map.fetch!(definition, :next_run_at_ms),
+          now_ms: Map.fetch!(definition, :created_at_ms)
+        ]
 
-      case Flow.create_internal(ctx, flow_id, create_opts) do
-        :ok ->
-          emit_schedule_event(ctx, definition, @schedule_event_created)
-          {:ok, view(%{id: flow_id, state: @active_state, payload: definition})}
+        case Flow.create_internal(ctx, flow_id, create_opts) do
+          :ok ->
+            emit_schedule_event(ctx, definition, @schedule_event_created)
+            {:ok, view(%{id: flow_id, state: @active_state, payload: definition})}
 
-        {:ok, _record} ->
-          emit_schedule_event(ctx, definition, @schedule_event_created)
-          {:ok, view(%{id: flow_id, state: @active_state, payload: definition})}
+          {:ok, _record} ->
+            emit_schedule_event(ctx, definition, @schedule_event_created)
+            {:ok, view(%{id: flow_id, state: @active_state, payload: definition})}
 
-        {:error, "ERR flow already exists"} when overwrite? ->
-          replace(ctx, flow_id, definition)
+          {:error, "ERR flow already exists"} when overwrite? ->
+            replace(ctx, flow_id, definition, opts)
 
-        {:error, _reason} = error ->
-          error
+          {:error, _reason} = error ->
+            error
+        end
       end
     end
   end
 
   def create(_ctx, _id, _opts), do: {:error, "ERR flow schedule opts must be a keyword list"}
+
+  @doc false
+  def preview(id, opts) when is_binary(id) and is_list(opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_option_fields(opts, @create_option_keys, "option"),
+         :ok <- validate_id(id),
+         {:ok, definition} <- definition(id, opts) do
+      {:ok, view(%{id: flow_id(id), state: @active_state, payload: definition})}
+    end
+  end
+
+  def preview(_id, _opts), do: {:error, "ERR flow schedule opts must be a keyword list"}
 
   @spec get(FerricStore.Instance.t(), schedule_id(), keyword()) ::
           {:ok, map() | nil} | {:error, binary()}
@@ -182,6 +201,7 @@ defmodule Ferricstore.Flow.Schedule do
              )
            ),
          :ok <- require_schedule_record(record),
+         :ok <- require_expected_schedule(record, opts),
          :ok <- require_active_schedule(record),
          {:ok, claimed} <- claim_manual_schedule(ctx, record) do
       fire_manual_one(ctx, claimed, fire_at_ms, now_ms)
@@ -263,13 +283,16 @@ defmodule Ferricstore.Flow.Schedule do
              flow_id(id),
              Internal.put(partition_key: partition_key(id), payload: false)
            ),
-         :ok <- require_schedule_record(record) do
+         :ok <- require_schedule_record(record),
+         :ok <- require_expected_schedule(record, opts) do
       cancel_opts =
         [
           partition_key: partition_key(id),
           fencing_token: Map.get(record, :fencing_token, 0)
         ]
         |> maybe_put(:now_ms, now_ms)
+        |> maybe_put(:expect_state, Keyword.get(opts, :expected_state))
+        |> maybe_put(:expected_version, Keyword.get(opts, :expected_version))
         |> Internal.put()
 
       case Flow.cancel(ctx, flow_id(id), cancel_opts) do
@@ -1393,6 +1416,36 @@ defmodule Ferricstore.Flow.Schedule do
   defp require_paused_schedule(%{state: @paused_state}), do: :ok
   defp require_paused_schedule(_record), do: {:error, "ERR flow schedule is not paused"}
 
+  defp require_expected_schedule(record, opts) do
+    with :ok <- require_expected_schedule_version(record, Keyword.get(opts, :expected_version)),
+         :ok <- require_expected_schedule_state(record, Keyword.get(opts, :expected_state)) do
+      :ok
+    end
+  end
+
+  defp require_expected_schedule_version(_record, nil), do: :ok
+
+  defp require_expected_schedule_version(%{version: version}, version)
+       when is_integer(version) and version >= 0,
+       do: :ok
+
+  defp require_expected_schedule_version(_record, version)
+       when is_integer(version) and version >= 0,
+       do: {:error, "ERR flow schedule changed concurrently"}
+
+  defp require_expected_schedule_version(_record, _version),
+    do: {:error, "ERR flow schedule expected_version must be a non-negative integer"}
+
+  defp require_expected_schedule_state(_record, nil), do: :ok
+  defp require_expected_schedule_state(%{state: state}, state) when is_binary(state), do: :ok
+
+  defp require_expected_schedule_state(_record, state)
+       when is_binary(state) and state != "",
+       do: {:error, "ERR flow schedule changed concurrently"}
+
+  defp require_expected_schedule_state(_record, _state),
+    do: {:error, "ERR flow schedule expected_state must be a non-empty string"}
+
   defp mutable_schedule_record(ctx, id, opts) do
     with :ok <- validate_opts(opts),
          :ok <- validate_option_fields(opts, @status_option_keys, "option"),
@@ -1408,7 +1461,8 @@ defmodule Ferricstore.Flow.Schedule do
                payload_max_bytes: schedule_hydration_max_bytes()
              )
            ),
-         :ok <- require_schedule_record(record) do
+         :ok <- require_schedule_record(record),
+         :ok <- require_expected_schedule(record, opts) do
       {:ok, record, now_ms}
     end
   end
@@ -1420,7 +1474,7 @@ defmodule Ferricstore.Flow.Schedule do
   defp schedule_resume_run_at(_record, _now_ms),
     do: {:error, "ERR flow schedule has no next run time"}
 
-  defp replace(ctx, flow_id, definition) do
+  defp replace(ctx, flow_id, definition, opts) do
     id = Map.fetch!(definition, :id)
 
     with {:ok, record} <-
@@ -1433,7 +1487,8 @@ defmodule Ferricstore.Flow.Schedule do
                payload_max_bytes: schedule_hydration_max_bytes()
              )
            ),
-         :ok <- require_schedule_record(record) do
+         :ok <- require_schedule_record(record),
+         :ok <- require_expected_schedule(record, opts) do
       replace_with_state(
         ctx,
         record,
@@ -1474,10 +1529,16 @@ defmodule Ferricstore.Flow.Schedule do
           target: target,
           ownership_secret: TargetOwnership.new_secret(),
           created_at_ms: now_ms,
+          initial_run_at_ms: next_run_at_ms,
           next_run_at_ms: next_run_at_ms,
           fire_count: 0
         }
         |> maybe_put(:every_ms, every_ms)
+        |> maybe_put(:delay_ms, if(kind == :delay, do: next_run_at_ms - now_ms))
+        |> maybe_put(
+          :start_at_ms,
+          if(kind in [:interval, :cron], do: Keyword.get(opts, :start_at_ms))
+        )
         |> maybe_put(:cron, cron)
         |> maybe_put(:timezone, timezone)
         |> maybe_put(:catchup_policy, catchup_policy)
@@ -1859,6 +1920,9 @@ defmodule Ferricstore.Flow.Schedule do
       updated_at_ms: Map.get(record, :updated_at_ms),
       kind: Map.fetch!(definition, :kind),
       created_at_ms: Map.get(definition, :created_at_ms),
+      initial_run_at_ms: Map.get(definition, :initial_run_at_ms),
+      start_at_ms: Map.get(definition, :start_at_ms),
+      delay_ms: Map.get(definition, :delay_ms),
       every_ms: Map.get(definition, :every_ms),
       cron: Map.get(definition, :cron),
       next_run_at_ms: visible_next_run_at_ms(record, definition),

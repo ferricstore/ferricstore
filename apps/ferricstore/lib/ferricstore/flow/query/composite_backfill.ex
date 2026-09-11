@@ -2,7 +2,15 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
   @moduledoc false
 
   alias Ferricstore.Flow.{Keys, LMDB, RecordIdentity}
-  alias Ferricstore.Flow.Query.{CompositeProjection, IndexDefinition, Limits}
+
+  alias Ferricstore.Flow.Query.{
+    CompositeProjection,
+    IndexDefinition,
+    Limits,
+    QueryRow,
+    QueryRowCodec
+  }
+
   alias Ferricstore.Store.Router
 
   @max_page_records Limits.max_projection_page_records()
@@ -10,6 +18,7 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
   @max_projection_definitions 32
   @max_exact_integer 9_007_199_254_740_991
   @max_expiry 0xFFFF_FFFF_FFFF_FFFF
+  @max_query_row_bytes QueryRowCodec.max_encoded_bytes()
   @max_projection_operation_bytes 16 * 1_024 * 1_024
 
   @spec max_page_records() :: pos_integer()
@@ -61,7 +70,7 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
              projection_definitions,
              operation_budget
            ),
-         :ok <- LMDB.write_batch(lmdb_path(ctx, shard_index), ops),
+         :ok <- write_projection_ops(lmdb_path(ctx, shard_index), ops),
          :ok <- verify_current_records(ctx, shard_index, records, opts) do
       {:ok,
        %{
@@ -91,7 +100,8 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
         records,
         {:ok, [], initial_cache, 0},
         fn record, {:ok, acc, cache, bytes} ->
-          with {:ok, action, state_key, projected, expire_at_ms} <- validate_record(record),
+          with {:ok, action, state_key, projected, expire_at_ms, projection_guard} <-
+                 validate_record(record),
                {:ok, ops, cache} <-
                  projection_action(
                    action,
@@ -103,6 +113,8 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
                    projection_definitions,
                    cache
                  ),
+               {:ok, guard_ops} <- projection_guard_ops(state_key, projection_guard),
+               ops <- guard_ops ++ ops,
                next_bytes <- bytes + operation_bytes(ops),
                true <- next_bytes <= operation_budget do
             {:cont, {:ok, :lists.reverse(ops, acc), cache, next_bytes}}
@@ -119,27 +131,35 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
     end
   end
 
-  defp validate_record(%{state_key: state_key, record: nil, expire_at_ms: 0})
+  defp validate_record(%{state_key: state_key, record: nil, expire_at_ms: 0} = projected)
        when is_binary(state_key) and state_key != "" do
-    if Keys.state_key?(state_key),
-      do: {:ok, :remove, state_key, nil, 0},
-      else: {:error, :invalid_query_backfill_record}
+    projection_guard = Map.get(projected, :projection_guard)
+
+    if Keys.state_key?(state_key) and
+         valid_projection_guard?(state_key, nil, 0, projection_guard),
+       do: {:ok, :remove, state_key, nil, 0, projection_guard},
+       else: {:error, :invalid_query_backfill_record}
   end
 
-  defp validate_record(%{
-         state_key: state_key,
-         record: record,
-         expire_at_ms: expire_at_ms
-       })
+  defp validate_record(
+         %{
+           state_key: state_key,
+           record: record,
+           expire_at_ms: expire_at_ms
+         } = projected
+       )
        when is_binary(state_key) and state_key != "" and is_map(record) and
               is_integer(expire_at_ms) and expire_at_ms >= 0 and expire_at_ms <= @max_expiry do
+    projection_guard = Map.get(projected, :projection_guard)
+
     case {Map.get(record, :id), Map.get(record, :version)} do
       {id, version}
       when is_binary(id) and is_integer(version) and version >= 0 and
              version <= @max_exact_integer ->
-        if record_owns_state_key?(record, state_key),
-          do: {:ok, :reconcile, state_key, record, expire_at_ms},
-          else: {:error, :invalid_query_backfill_record}
+        if record_owns_state_key?(record, state_key) and
+             valid_projection_guard?(state_key, record, expire_at_ms, projection_guard),
+           do: {:ok, :reconcile, state_key, record, expire_at_ms, projection_guard},
+           else: {:error, :invalid_query_backfill_record}
 
       _invalid ->
         {:error, :invalid_query_backfill_record}
@@ -226,7 +246,7 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
   end
 
   defp validate_records(records) do
-    with true <- Enum.all?(records, &match?({:ok, _, _, _, _}, validate_record(&1))),
+    with true <- Enum.all?(records, &match?({:ok, _, _, _, _, _}, validate_record(&1))),
          state_keys <- Enum.map(records, & &1.state_key),
          true <- length(state_keys) == length(Enum.uniq(state_keys)) do
       :ok
@@ -238,25 +258,110 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
   defp verify_current_records(_ctx, _shard_index, [], _opts), do: :ok
 
   defp verify_current_records(ctx, shard_index, records, opts) do
+    records = Enum.reject(records, &retained_query_row?/1)
     read_entries = Keyword.get(opts, :read_entries_fun, &Router.read_shard_entries/3)
     state_keys = Enum.map(records, & &1.state_key)
 
-    if is_function(read_entries, 3) do
-      case read_entries.(ctx, shard_index, state_keys) do
-        {:ok, entries} when is_list(entries) and length(entries) == length(records) ->
-          verify_entries(records, entries)
+    cond do
+      records == [] ->
+        :ok
 
-        :unavailable ->
-          {:error, :query_backfill_primary_unavailable}
+      is_function(read_entries, 3) ->
+        case read_entries.(ctx, shard_index, state_keys) do
+          {:ok, entries} when is_list(entries) and length(entries) == length(records) ->
+            verify_entries(records, entries)
 
-        {:error, _reason} = error ->
-          error
+          :unavailable ->
+            {:error, :query_backfill_primary_unavailable}
 
-        _invalid ->
-          {:error, :invalid_query_backfill_primary_read}
-      end
-    else
-      {:error, :invalid_query_backfill_reader}
+          {:error, _reason} = error ->
+            error
+
+          _invalid ->
+            {:error, :invalid_query_backfill_primary_read}
+        end
+
+      true ->
+        {:error, :invalid_query_backfill_reader}
+    end
+  end
+
+  defp retained_query_row?(%{record: record, projection_guard: {:value, encoded}}),
+    do: is_map(record) and is_binary(encoded)
+
+  defp retained_query_row?(%{record: record, projection_guard: {:parked, encoded, park}}),
+    do: is_map(record) and is_binary(encoded) and is_binary(park)
+
+  defp retained_query_row?(_record), do: false
+
+  defp valid_projection_guard?(_state_key, _record, _expire_at_ms, nil), do: true
+  defp valid_projection_guard?(_state_key, nil, 0, :missing), do: true
+
+  defp valid_projection_guard?(state_key, nil, 0, {:value, encoded})
+       when is_binary(encoded) and byte_size(encoded) <= @max_query_row_bytes do
+    case QueryRowCodec.decode(encoded, state_key) do
+      {:ok, %QueryRow{record: %{state: state}}} -> not LMDB.terminal_state?(state)
+      _invalid -> false
+    end
+  end
+
+  defp valid_projection_guard?(state_key, record, expire_at_ms, {:value, encoded})
+       when is_map(record) and is_binary(encoded) and
+              byte_size(encoded) <= @max_query_row_bytes do
+    case QueryRowCodec.decode(encoded, state_key) do
+      {:ok, %QueryRow{record: ^record, expire_at_ms: ^expire_at_ms}} ->
+        LMDB.terminal_state?(Map.get(record, :state))
+
+      _invalid ->
+        false
+    end
+  end
+
+  defp valid_projection_guard?(state_key, record, expire_at_ms, {:parked, encoded, park})
+       when is_map(record) and is_binary(encoded) and byte_size(encoded) <= @max_query_row_bytes and
+              is_binary(park) do
+    case QueryRowCodec.decode(encoded, state_key) do
+      {:ok, %QueryRow{record: ^record, expire_at_ms: ^expire_at_ms} = row} ->
+        Ferricstore.Flow.Query.BackfillRetainedRow.validate_park(row, park) == :ok
+
+      _invalid ->
+        false
+    end
+  end
+
+  defp valid_projection_guard?(_state_key, _record, _expire_at_ms, _guard), do: false
+
+  defp projection_guard_ops(_state_key, nil), do: {:ok, []}
+
+  defp projection_guard_ops(state_key, :missing),
+    do:
+      {:ok,
+       [
+         {:compare_missing, state_key},
+         {:compare_missing, LMDB.cold_park_key_for_state_key(state_key)}
+       ]}
+
+  defp projection_guard_ops(state_key, {:value, encoded}),
+    do:
+      {:ok,
+       [
+         {:compare, state_key, encoded},
+         {:compare_missing, LMDB.cold_park_key_for_state_key(state_key)}
+       ]}
+
+  defp projection_guard_ops(state_key, {:parked, encoded, park}),
+    do:
+      {:ok,
+       [
+         {:compare, state_key, encoded},
+         {:compare, LMDB.cold_park_key_for_state_key(state_key), park}
+       ]}
+
+  defp write_projection_ops(path, ops) do
+    case LMDB.write_batch(path, ops) do
+      :ok -> :ok
+      {:error, {:compare_failed, _key}} -> {:error, :query_backfill_concurrent_change}
+      {:error, _reason} = error -> error
     end
   end
 

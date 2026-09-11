@@ -3,16 +3,16 @@
 <body data-dashboard-live-page="streams" data-dashboard-live-url="/dashboard/api/streams" data-dashboard-live-interval-ms="5000">
 <div class="layout">
 <%= render_sidebar_static("streams") %>
-<main class="main-content">
+<main class="main-content" id="dashboard-main" tabindex="-1">
 <%= render_subpage_header("Streams") %>
 <div class="content">
 <%= render_page_intro("Streams", "Inspect recent stream append and mutation activity without exposing stream payload fields or values.") %>
 <%= render_messaging_subnav("streams") %>
 <%= render_live_component("streams_summary", render_stream_activity_summary(data)) %>
-<%= render_live_component("streams_top", render_stream_top_streams(data)) %>
-<%= render_live_component("streams_consumers", render_stream_consumers(data)) %>
-<%= render_live_component("streams_waiters", render_stream_waiters(data)) %>
-<%= render_live_component("streams_log", render_stream_activity_log(data)) %>
+<%= render_dashboard_disclosure("Active Streams", length(Map.get(data, :top_streams, [])), render_live_component("streams_top", render_stream_top_streams(data)), open: Map.get(data, :top_streams, []) != [], live_count: "streams_top") %>
+<%= render_dashboard_disclosure("Recent Activity", length(Map.get(data, :entries, [])), render_live_component("streams_log", render_stream_activity_log(data)), open: Map.get(data, :entries, []) != [], live_count: "streams_log") %>
+<%= render_dashboard_disclosure("Consumer Groups", length(Map.get(data, :consumer_groups, [])), render_live_component("streams_consumers", render_stream_consumers(data)), open: Map.get(data, :consumer_groups, []) != [], live_count: "streams_consumers") %>
+<%= render_dashboard_disclosure("Blocked Readers", length(Map.get(data, :waiters, [])), render_live_component("streams_waiters", render_stream_waiters(data)), open: Map.get(data, :waiters, []) != [], live_count: "streams_waiters") %>
 </div>
 </main>
 </div>

@@ -369,10 +369,10 @@ defmodule Ferricstore.PubSub do
   Returns bounded Pub/Sub subscription metadata for observability dashboards.
   """
   @spec subscription_snapshot(non_neg_integer()) :: map()
-  def subscription_snapshot(limit \\ 100) do
+  def subscription_snapshot(limit \\ 100, visible? \\ fn _ -> true end) do
     limit = max(limit, 0)
-    channels = channel_snapshot(limit)
-    patterns = pattern_snapshot(limit)
+    channels = channel_snapshot(limit, visible?)
+    patterns = pattern_snapshot(limit, visible?)
     exact_subscriptions = safe_ets_size(@channels_table)
     pattern_subscriptions = safe_ets_size(@patterns_table)
 
@@ -751,8 +751,8 @@ defmodule Ferricstore.PubSub do
 
   defp delete_pattern_subscriptions([], _pid), do: :ok
 
-  defp channel_snapshot(limit) do
-    bounded_snapshot(@channel_cache_table, limit, :channel, &channel_snapshot_entry/1)
+  defp channel_snapshot(limit, visible?) do
+    bounded_snapshot(@channel_cache_table, limit, :channel, &channel_snapshot_entry/1, visible?)
   rescue
     _ -> []
   catch
@@ -763,8 +763,8 @@ defmodule Ferricstore.PubSub do
     {channel, subscriber_count}
   end
 
-  defp pattern_snapshot(limit) do
-    bounded_snapshot(@pattern_cache_table, limit, :pattern, &pattern_snapshot_entry/1)
+  defp pattern_snapshot(limit, visible?) do
+    bounded_snapshot(@pattern_cache_table, limit, :pattern, &pattern_snapshot_entry/1, visible?)
   rescue
     _ -> []
   catch
@@ -777,16 +777,19 @@ defmodule Ferricstore.PubSub do
 
   defp active_subscriber_count, do: safe_ets_size(@monitors_table)
 
-  defp bounded_snapshot(_table, 0, _name_key, _mapper), do: []
+  defp bounded_snapshot(_table, 0, _name_key, _mapper, _visible?), do: []
 
-  defp bounded_snapshot(table, limit, name_key, mapper) do
+  defp bounded_snapshot(table, limit, name_key, mapper, visible?) do
     if :ets.whereis(table) == :undefined do
       []
     else
-      :ets.foldl(
+      Ferricstore.ObservabilitySnapshot.fold(
         fn row, entries ->
           {name, subscribers} = mapper.(row)
-          insert_snapshot_entry(name, subscribers, entries, limit)
+
+          if visible?.(%{name_key => name, subscribers: subscribers}),
+            do: insert_snapshot_entry(name, subscribers, entries, limit),
+            else: entries
         end,
         :gb_sets.empty(),
         table

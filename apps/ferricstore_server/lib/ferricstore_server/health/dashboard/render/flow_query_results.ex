@@ -1,7 +1,8 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
   @moduledoc false
 
-  alias Ferricstore.Flow.Query.Field
+  alias FerricstoreServer.Health.Dashboard.Flow.QueryProjection
+  alias FerricstoreServer.Health.Dashboard.Render.{FlowQueryExport, TableValue}
 
   import FerricstoreServer.Health.Dashboard.Format
   import FerricstoreServer.Health.Dashboard.FlowRecord
@@ -35,6 +36,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
   @time_plot_right 12
   @time_plot_top 18
   @time_plot_bottom 130
+  @inspector_max_bytes 64 * 1024
+  @inspector_page_max_bytes 1024 * 1024
+  @inspector_max_depth 64
 
   def flow_query_result_command(%{command: command}) when is_binary(command), do: command
   def flow_query_result_command(_result), do: "FLOW.QUERY"
@@ -50,9 +54,22 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
 
   def render_flow_query_status(_result), do: ""
 
+  defdelegate render_flow_query_provenance(data),
+    to: FerricstoreServer.Health.Dashboard.Render.FlowQueryProvenance,
+    as: :render
+
   def render_flow_query_metadata(result) when is_map(result) do
     quality = render_metadata_group("Query Quality", Map.get(result, :quality), @quality_fields)
-    usage = render_metadata_group("Query Usage", Map.get(result, :usage), @usage_fields)
+
+    usage =
+      case render_metadata_group("Query Usage", Map.get(result, :usage), @usage_fields) do
+        "" ->
+          ""
+
+        group ->
+          ~s(<details class="flow-query-usage"><summary>Performance details</summary>#{group}</details>)
+      end
+
     page = render_page_status(Map.get(result, :page))
 
     if quality == "" and usage == "" and page == "" do
@@ -67,11 +84,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
   def render_flow_query_visualization(%{
         visualization: %{scope: :current_page, row_count: row_count, charts: charts}
       })
-      when is_integer(row_count) and is_list(charts) and charts != [] do
+      when is_integer(row_count) and row_count > 1 and is_list(charts) and charts != [] do
     rendered = Enum.map_join(charts, "", &render_page_chart/1)
 
     """
-    <details class="flow-query-visualization" open>
+    <details class="flow-query-visualization">
       <summary>
         <span>Visualize current page</span>
         <span class="badge badge-idle">Current page &middot; #{format_number(row_count)} rows</span>
@@ -83,6 +100,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
 
   def render_flow_query_visualization(_result), do: ""
 
+  def render_flow_query_table(%{status: status}) when status != :ok, do: ""
+
   def render_flow_query_table(%{explain: explain}) when is_map(explain) do
     render_explain(explain)
   end
@@ -93,7 +112,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     value = Map.get(scalar, :value)
 
     """
-    <div class="flow-query-table-wrap">
+    <div class="flow-query-table-wrap" role="region" aria-label="Query scalar result" tabindex="0">
       <table class="flow-query-table">
         <caption class="sr-only">Query scalar result</caption>
         <thead><tr><th scope="col">Result</th><th scope="col">Value</th></tr></thead>
@@ -103,19 +122,33 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     """
   end
 
-  def render_flow_query_table(%{
-        presentation: :workbench,
-        columns: columns,
-        column_selectors: selectors,
-        rows: rows,
-        source: source
-      })
+  def render_flow_query_table(
+        %{
+          presentation: :workbench,
+          columns: columns,
+          column_selectors: selectors,
+          rows: rows,
+          source: source
+        } = result
+      )
       when is_list(columns) and is_list(selectors) and is_list(rows) do
-    header = Enum.map_join(columns, "", &"<th scope=\"col\">#{escape(&1)}</th>")
-    body = render_projected_rows(rows, source, selectors)
+    labels = Map.get(result, :column_labels, columns)
+    header = Enum.map_join(labels, "", &"<th scope=\"col\">#{escape(&1)}</th>")
+
+    body =
+      render_projected_rows(
+        rows,
+        source,
+        selectors,
+        Map.get(result, :routing_partition),
+        %{
+          captured_at: Map.get(result, :captured_at_ms),
+          guided: Map.get(result, :guided_projection, false)
+        }
+      )
 
     """
-    <div class="flow-query-table-wrap">
+    <div class="flow-query-table-wrap" role="region" aria-label="Projected query records" tabindex="0">
       <table class="flow-query-table flow-query-projection-table">
         <caption class="sr-only">Query result records</caption>
         <thead><tr>#{header}</tr></thead>
@@ -125,9 +158,22 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     """
   end
 
+  def render_flow_query_table(%{command: "FLOW.QUERY", rows: rows} = result)
+      when is_list(rows) and not is_map_key(result, :scalar) do
+    result
+    |> Map.merge(%{
+      presentation: :workbench,
+      columns: QueryProjection.guided_labels(nil),
+      column_selectors: QueryProjection.guided_fields(nil),
+      guided_projection: true,
+      source: :runs
+    })
+    |> render_flow_query_table()
+  end
+
   def render_flow_query_table(result) do
     """
-    <div class="flow-query-table-wrap">
+    <div class="flow-query-table-wrap" role="region" aria-label="Query result records" tabindex="0">
       <table class="flow-query-table">
         <caption class="sr-only">Query result records</caption>
         <thead>
@@ -139,12 +185,40 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     """
   end
 
+  def render_flow_query_continuation(%{navigation: navigation}) when is_map(navigation) do
+    position =
+      case Map.get(navigation, :page_number) do
+        number when is_integer(number) -> "Page #{number}"
+        _ -> "Continuation page"
+      end
+
+    """
+    <nav class="flow-query-pagination" aria-label="Query result pages">
+      #{render_page_form(Map.get(navigation, :first), "First page")}
+      #{render_page_form(Map.get(navigation, :previous), "Previous page")}
+      <span class="flow-section-note" aria-current="page">#{position}</span>
+      #{render_page_form(Map.get(navigation, :next), "Next page")}
+    </nav>
+    """
+  end
+
   def render_flow_query_continuation(%{continuation: continuation})
       when is_map(continuation) do
+    render_page_form(continuation, "Next page")
+  end
+
+  def render_flow_query_continuation(_result), do: ""
+
+  defp render_page_form(nil, _label), do: ""
+
+  defp render_page_form(continuation, label) do
     fql = Map.get(continuation, :fql, "")
     params_json = Map.get(continuation, :params_json, "{}")
-    cursor = Map.get(continuation, :cursor, "")
+    cursor = Map.get(continuation, :cursor) || ""
     surface = render_continuation_surface(continuation)
+    history = Jason.encode!(Map.get(continuation, :cursor_history, []))
+    page_number = Map.get(continuation, :page_number) || ""
+    page_action = Map.get(continuation, :page_action, :page)
 
     """
     <form class="flow-query-pagination" action="/dashboard/flow/query" method="post">
@@ -152,12 +226,13 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
       <input type="hidden" name="fql" value="#{escape_attr(fql)}">
       <input type="hidden" name="params_json" value="#{escape_attr(params_json)}">
       <input type="hidden" name="cursor" value="#{escape_attr(cursor)}">
-      <button class="flow-search-button secondary" type="submit" name="action" value="run">Next page</button>
+      <input type="hidden" name="cursor_history" value="#{escape_attr(history)}">
+      <input type="hidden" name="page_number" value="#{page_number}">
+      <input type="hidden" name="page_action" value="#{page_action}">
+      <button class="flow-search-button secondary" type="submit" name="action" value="run">#{label}</button>
     </form>
     """
   end
-
-  def render_flow_query_continuation(_result), do: ""
 
   defp render_continuation_surface(%{mode: :guided, guided_query: guided_query})
        when is_binary(guided_query) and guided_query != "" do
@@ -272,22 +347,25 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
         <span>#{escape(time_endpoint_label(first, :from_ms))}</span>
         <span>#{escape(time_endpoint_label(last, :to_ms))}</span>
       </div>
+      <details class="flow-query-time-values"><summary>Time bucket values</summary>
+        <div class="table-scroll" role="region" aria-label="#{escape_attr(title)} time bucket values" tabindex="0"><table>
+          <thead><tr><th scope="col">Start (UTC)</th><th scope="col">End (UTC)</th><th scope="col">Rows</th></tr></thead>
+          <tbody>#{Enum.map_join(values, "", fn value -> "<tr><td>#{escape(time_endpoint_label(value, :from_ms))}</td><td>#{escape(time_endpoint_label(value, :to_ms))}</td><td class=\"num\">#{value.count}</td></tr>" end)}</tbody>
+        </table></div>
+      </details>
     </section>
     """
   end
 
   defp render_time_grid(maximum) do
-    midpoint = div(maximum + 1, 2)
+    [maximum, div(maximum, 2), 0]
+    |> Enum.uniq()
+    |> Enum.map_join("", fn label ->
+      y = @time_plot_bottom - label * (@time_plot_bottom - @time_plot_top) / maximum
 
-    [
-      {@time_plot_top, maximum},
-      {div(@time_plot_top + @time_plot_bottom, 2), midpoint},
-      {@time_plot_bottom, 0}
-    ]
-    |> Enum.map_join("", fn {y, label} ->
       """
-      <line class="flow-query-time-grid" x1="#{@time_plot_left}" y1="#{y}" x2="#{@time_chart_width - @time_plot_right}" y2="#{y}"></line>
-      <text class="flow-query-time-tick" x="#{@time_plot_left - 7}" y="#{y + 3}" text-anchor="end">#{format_number(label)}</text>
+      <line class="flow-query-time-grid" x1="#{@time_plot_left}" y1="#{svg_number(y)}" x2="#{@time_chart_width - @time_plot_right}" y2="#{svg_number(y)}"></line>
+      <text class="flow-query-time-tick" x="#{@time_plot_left - 7}" y="#{svg_number(y + 3)}" text-anchor="end">#{format_number(label)}</text>
       """
     end)
   end
@@ -334,7 +412,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     ~s(<tr><td colspan="6" class="c-muted">No rows.</td></tr>)
   end
 
-  def render_flow_query_rows(%{command: "FLOW.HISTORY", rows: rows}) do
+  def render_flow_query_rows(%{command: "FLOW.HISTORY", rows: rows} = result) do
     Enum.map_join(rows, "\n", fn entry ->
       {event_id, fields} = normalize_flow_history_entry(entry)
 
@@ -345,7 +423,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
         <td>#{flow_history_action_html(fields)}</td>
         <td>#{format_timestamp_ms_or_dash(flow_history_event_time_ms(event_id, fields))}</td>
         <td class="mono">#{escape(flow_history_worker_summary(fields))}</td>
-        <td>#{flow_history_refs_summary_html(fields)}</td>
+        <td>#{render_history_refs(fields, event_id, Map.get(result, :history_scope))}</td>
       </tr>
       """
     end)
@@ -394,76 +472,185 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     end)
   end
 
-  defp render_projected_rows([], _source, selectors) do
+  defp render_history_refs(fields, event_id, %{id: id, partition_key: partition, count: count})
+       when is_binary(id) and id != "" do
+    fields
+    |> flow_value_ref_entries("history event")
+    |> Enum.map_join(" ", fn entry ->
+      anchor =
+        flow_value_ref_anchor(entry.ref) <>
+          ":event:" <> Base.url_encode64(to_string(event_id), padding: false)
+
+      href =
+        flow_detail_path(id, partition, %{"history_event" => event_id, "history_count" => count}) <>
+          "#" <> anchor
+
+      ~s(<a class="flow-pill" href="#{escape_attr(href)}" title="Inspect historical #{escape_attr(entry.label)}">#{escape(entry.label)}</a>)
+    end)
+    |> case do
+      "" -> "-"
+      links -> links
+    end
+  end
+
+  defp render_history_refs(fields, _event_id, _scope) do
+    fields
+    |> flow_value_ref_entries("history event")
+    |> Enum.map_join(" ", &escape(&1.label))
+    |> case do
+      "" -> "-"
+      labels -> labels
+    end
+  end
+
+  defp render_projected_rows([], _source, selectors, _partition, _captured_at) do
     colspan = max(length(selectors), 1)
     ~s(<tr><td colspan="#{colspan}" class="c-muted">No rows.</td></tr>)
   end
 
-  defp render_projected_rows(rows, source, selectors) do
-    Enum.map_join(rows, "\n", fn
-      row when is_map(row) ->
-        cells = Enum.map_join(selectors, "", &render_projected_cell(row, source, &1))
-        "<tr>#{cells}</tr>"
+  defp render_projected_rows(rows, source, selectors, partition, captured_at) do
+    {rendered, _remaining} =
+      Enum.map_reduce(rows, @inspector_page_max_bytes, fn
+        row, remaining when is_map(row) ->
+          {cells, remaining} =
+            Enum.map_reduce(selectors, remaining, fn selector, budget ->
+              case QueryProjection.value(row, source, selector) do
+                value when is_map(value) or is_list(value) ->
+                  {content, budget} = render_projected_json(row, selector, value, budget)
+                  {~s(<td class="mono">#{content}</td>), budget}
 
-      other ->
-        colspan = max(length(selectors), 1)
+                _scalar ->
+                  {render_projected_cell(row, source, selector, partition, captured_at), budget}
+              end
+            end)
 
-        ~s(<tr><td colspan="#{colspan}" class="mono">#{escape(display_cell_value(other))}</td></tr>)
-    end)
+          {"<tr>#{Enum.join(cells)}</tr>", remaining}
+
+        other, remaining ->
+          colspan = max(length(selectors), 1)
+
+          {~s(<tr><td colspan="#{colspan}" class="mono">#{escape(display_cell_value(other))}</td></tr>),
+           remaining}
+      end)
+
+    Enum.join(rendered, "\n")
   end
 
-  defp render_projected_cell(record, :runs, :run_id) do
-    value = projected_value(record, :runs, :run_id)
-    partition = projected_value(record, :runs, :partition_key)
+  defp render_projected_cell(record, :runs, :run_id, routing_partition, _captured_at) do
+    value = QueryProjection.value(record, :runs, :run_id)
+    partition = QueryProjection.value(record, :runs, :partition_key) || routing_partition
 
-    case value do
-      id when is_binary(id) and id != "" ->
+    case {value, partition} do
+      {id, partition}
+      when is_binary(id) and id != "" and is_binary(partition) and partition != "" ->
         ~s(<td class="mono">#{render_flow_id_link(id, partition)}</td>)
+
+      {id, _} when is_binary(id) and id != "" ->
+        ~s(<td class="mono" title="Include partition_key in the projection to open this workflow.">#{escape(id)}</td>)
 
       _missing ->
         ~s(<td class="c-muted">-</td>)
     end
   end
 
-  defp render_projected_cell(record, source, selector) do
-    value = projected_value(record, source, selector)
+  defp render_projected_cell(record, :runs, :lease_deadline_ms, _partition, %{
+         captured_at: captured_at
+       })
+       when is_integer(captured_at) do
+    case QueryProjection.value(record, :runs, :lease_deadline_ms) do
+      deadline when is_integer(deadline) and deadline > 0 ->
+        delta = captured_at - deadline
+
+        relative =
+          if delta >= 0,
+            do: "#{format_duration_ms(delta)} expired",
+            else: "in #{format_duration_ms(-delta)}"
+
+        ~s(<td class="mono">#{format_timestamp_ms_or_dash(deadline)}<span class="flow-field-help">#{escape(relative)} at capture</span></td>)
+
+      _missing ->
+        ~s(<td class="c-muted">-</td>)
+    end
+  end
+
+  defp render_projected_cell(record, :runs, :run_state, _partition, %{guided: true}) do
+    value = flow_record_logical_state(record)
+    ~s(<td class="#{flow_state_class(value)}">#{escape(value)}</td>)
+  end
+
+  defp render_projected_cell(record, source, selector, _partition, _captured_at) do
+    value = QueryProjection.value(record, source, selector)
     class = projected_cell_class(selector, value)
-    ~s(<td class="#{class}">#{escape(display_projected_value(selector, value))}</td>)
+    content = escape(display_projected_value(selector, value))
+    ~s(<td class="#{class}">#{content}</td>)
   end
 
-  defp projected_value(record, :runs, selector)
-       when selector in [:attributes, :state_meta] do
-    fetch_value(record, selector)
-  end
+  defp render_projected_json(_record, _selector, _value, 0), do: inspector_page_limit()
 
-  defp projected_value(record, :runs, selector) do
-    case Field.fetch(record, selector) do
-      {:ok, value} -> value
-      :missing -> nil
+  defp render_projected_json(record, selector, value, remaining) do
+    label = "projected " <> selector_label(selector)
+
+    case format_inspector_json(value, min(@inspector_max_bytes, remaining)) do
+      {:ok, json} ->
+        preview = if is_map(value), do: "JSON object", else: "JSON array"
+
+        identity =
+          {flow_record_id(record), flow_record_partition_key(record),
+           flow_field(record, :event_id, nil), selector}
+
+        html = TableValue.render(json, label, preview, identity)
+
+        if byte_size(html) <= remaining,
+          do: {html, remaining - byte_size(html)},
+          else: inspector_page_limit()
+
+      {:error, :too_large} when remaining < @inspector_max_bytes ->
+        inspector_page_limit()
+
+      {:error, :too_large} ->
+        {~s(<span class="c-muted">JSON value exceeds the 64 KiB inspector limit</span>),
+         remaining}
+
+      {:error, :too_deep} ->
+        {~s(<span class="c-muted">JSON nesting exceeds the 64-level inspector limit</span>),
+         remaining}
+
+      {:error, _reason} ->
+        {~s(<span class="c-muted">JSON inspection unavailable</span>), remaining}
     end
   end
 
-  defp projected_value(record, :events, {:event_field, name}) do
-    case fetch_value(record, :fields) do
-      fields when is_map(fields) -> fetch_value(fields, name)
-      _missing -> nil
+  defp format_inspector_json(value, max_bytes) do
+    with {:ok, json} <- FlowQueryExport.encode_value(value, max_bytes) do
+      if inspector_depth?(value, @inspector_max_depth) do
+        formatted = Jason.Formatter.pretty_print_to_iodata(json)
+
+        if IO.iodata_length(formatted) <= max_bytes,
+          do: {:ok, IO.iodata_to_binary(formatted)},
+          else: {:error, :too_large}
+      else
+        {:error, :too_deep}
+      end
     end
   end
 
-  defp projected_value(record, :events, selector) when selector in [:event_id, :fields],
-    do: fetch_value(record, selector)
+  # Bound indentation amplification before formatting already-serialized JSON.
+  defp inspector_depth?(value, 0) when is_map(value) or is_list(value), do: false
 
-  defp projected_value(_record, _source, _selector), do: nil
+  defp inspector_depth?(value, depth) when is_map(value),
+    do: Enum.all?(value, fn {_key, nested} -> inspector_depth?(nested, depth - 1) end)
 
-  defp fetch_value(map, key) when is_map(map) and is_atom(key) do
-    case Map.fetch(map, key) do
-      {:ok, value} -> value
-      :error -> Map.get(map, Atom.to_string(key))
-    end
-  end
+  defp inspector_depth?(value, depth) when is_list(value),
+    do: Enum.all?(value, &inspector_depth?(&1, depth - 1))
 
-  defp fetch_value(map, key) when is_map(map) and is_binary(key), do: Map.get(map, key)
-  defp fetch_value(_map, _key), do: nil
+  defp inspector_depth?(_scalar, _depth), do: true
+
+  defp inspector_page_limit,
+    do: {~s|<span class="c-muted">Page JSON inspector limit reached (1 MiB)</span>|, 0}
+
+  defp selector_label(selector) when is_atom(selector), do: Atom.to_string(selector)
+  defp selector_label({kind, name}), do: "#{kind}.#{name}"
+  defp selector_label({:state_meta, state, name}), do: "state_meta.#{state}.#{name}"
 
   defp projected_cell_class(:state, value) when is_binary(value), do: flow_state_class(value)
   defp projected_cell_class(_selector, value) when is_integer(value), do: "mono num"
@@ -478,7 +665,21 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
             ] and is_integer(value),
        do: format_timestamp_ms_or_dash(value)
 
+  defp display_projected_value({kind, _key}, value)
+       when kind in [:attribute, :event_field] and is_binary(value),
+       do: quoted_scalar(value)
+
+  defp display_projected_value({:state_meta, _state, _key}, value) when is_binary(value),
+    do: quoted_scalar(value)
+
   defp display_projected_value(_selector, value), do: display_cell_value(value)
+
+  defp quoted_scalar(value) do
+    case Jason.encode(value) do
+      {:ok, json} -> json
+      {:error, _} -> inspect(value, limit: 20, printable_limit: 512)
+    end
+  end
 
   defp display_cell_value(nil), do: "null"
   defp display_cell_value(value) when is_binary(value), do: value
@@ -570,8 +771,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     {:result_records, "Result records", :number},
     {:response_bytes, "Response bytes", :bytes},
     {:executor_memory_bytes, "Executor memory", :bytes},
-    {:wall_time_ms, "Wall time", :duration_ms},
-    {:wall_time_us, "Wall time", :duration_us},
+    {:wall_time, "Wall time", :duration_us},
     {:cost, "Planner cost", :number},
     {:scan_records, "Scan records", :number}
   ]
@@ -579,7 +779,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
   defp render_explain_metrics(estimate, actual, bounds) do
     rows =
       Enum.flat_map(@explain_metrics, fn {key, label, format} ->
-        values = [Map.get(estimate, key), Map.get(actual, key), Map.get(bounds, key)]
+        values = Enum.map([estimate, actual, bounds], &explain_metric_value(&1, key))
 
         if Enum.all?(values, &is_nil/1) do
           []
@@ -601,7 +801,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
       """
       <section class="flow-query-plan-section">
         <div class="flow-query-plan-title">Estimates and Bounds</div>
-        <div class="flow-query-table-wrap">
+        <div class="flow-query-table-wrap" role="region" aria-label="Query plan estimates and bounds" tabindex="0">
           <table class="flow-query-plan-metrics">
             <caption class="sr-only">Query plan estimates and bounds</caption>
             <thead><tr><th scope="col">Resource</th><th scope="col">Estimate</th><th scope="col">Actual</th><th scope="col">Hard bound</th></tr></thead>
@@ -613,7 +813,23 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     end
   end
 
+  defp explain_metric_value(metrics, :wall_time) do
+    case {Map.get(metrics, :wall_time_us), Map.get(metrics, :wall_time_ms)} do
+      {value, _} when is_integer(value) -> {:wall_time_us, value}
+      {_, value} when is_integer(value) -> {:wall_time_ms, value}
+      _missing -> nil
+    end
+  end
+
+  defp explain_metric_value(metrics, key), do: Map.get(metrics, key)
+
   defp metric_cell(nil, _format), do: ~s(<td class="c-muted">-</td>)
+
+  defp metric_cell({:wall_time_us, value}, _format),
+    do: ~s(<td class="mono">#{value} us</td>)
+
+  defp metric_cell({:wall_time_ms, value}, _format),
+    do: ~s(<td class="mono">#{format_duration_ms(value)}</td>)
 
   defp metric_cell(value, format),
     do: ~s(<td class="mono">#{escape(format_explain_metric(value, format))}</td>)
@@ -677,11 +893,16 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     rows =
       Enum.map_join(alternatives, "", fn alternative ->
         comparison = Map.get(alternative, :comparison, %{}) || %{}
+        index = Map.get(alternative, :index)
+        estimate = Map.get(alternative, :estimate, %{}) || %{}
 
         """
         <tr>
+          <td class="mono">#{escape(to_string(explain_index_name(index) || "-"))}#{render_alternative_identity(index)}</td>
           <td class="mono">#{escape(human_value(Map.get(alternative, :path)))}</td>
           <td class="mono">#{escape(human_value(Map.get(alternative, :record_source)))}</td>
+          #{metric_cell(Map.get(estimate, :cost), :exact_number)}
+          #{metric_cell(Map.get(comparison, :cost_delta), :exact_number)}
           <td class="mono">#{escape(human_value(Map.get(comparison, :reason_not_selected)))}</td>
         </tr>
         """
@@ -690,12 +911,24 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     """
     <section class="flow-query-plan-section">
       <div class="flow-query-plan-title">Alternatives</div>
-      <div class="flow-query-table-wrap"><table><caption class="sr-only">Alternative query plans</caption><thead><tr><th scope="col">Path</th><th scope="col">Source</th><th scope="col">Why not selected</th></tr></thead><tbody>#{rows}</tbody></table></div>
+      <div class="flow-query-table-wrap" role="region" aria-label="Alternative query plans" tabindex="0"><table class="flow-query-projection-table"><caption class="sr-only">Alternative query plans</caption><thead><tr><th scope="col">Index</th><th scope="col">Path</th><th scope="col">Source</th><th scope="col">Estimated cost</th><th scope="col">Cost delta</th><th scope="col">Why not selected</th></tr></thead><tbody>#{rows}</tbody></table></div>
     </section>
     """
   end
 
   defp render_explain_alternatives(_alternatives), do: ""
+
+  defp render_alternative_identity(index) when is_map(index) do
+    details =
+      plan_identifier_item("Generation", Map.get(index, :generation)) <>
+        plan_identifier_item("Build ID", Map.get(index, :build_id))
+
+    if details == "",
+      do: "",
+      else: ~s(<details><summary>Index identity</summary><dl>#{details}</dl></details>)
+  end
+
+  defp render_alternative_identity(_index), do: ""
 
   defp human_value(nil), do: ""
   defp human_value(value) when is_binary(value), do: String.replace(value, "_", " ")

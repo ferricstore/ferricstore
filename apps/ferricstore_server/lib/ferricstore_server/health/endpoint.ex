@@ -206,6 +206,24 @@ defmodule FerricstoreServer.Health.Endpoint do
     end
   end
 
+  defp dispatch_request(
+         socket,
+         transport,
+         "GET",
+         "/dashboard/assets/" <> _name = path,
+         _peer,
+         _headers,
+         _body
+       ) do
+    case FerricstoreServer.Health.Dashboard.Assets.fetch(path) do
+      {:ok, content_type, body} ->
+        Response.send_asset_response(socket, transport, content_type, body)
+
+      :error ->
+        send_response(socket, transport, 404, "Not Found", ~s({"error":"not found"}))
+    end
+  end
+
   defp dispatch_request(socket, transport, "GET", "/dashboard/login", _peer, _headers, _body) do
     render_dashboard_login(socket, transport, "")
   end
@@ -451,20 +469,22 @@ defmodule FerricstoreServer.Health.Endpoint do
                :html
              ) do
           :ok ->
-            location =
-              case FerricstoreServer.Health.Dashboard.apply_flow_policy_form(params) do
-                {:ok, type} ->
+            case FerricstoreServer.Health.Dashboard.apply_flow_policy_form(params) do
+              {:ok, type} ->
+                location =
                   "/dashboard/flow/policies?" <>
-                    URI.encode_query(%{"status" => "ok", "type" => type, "edit" => type})
+                    URI.encode_query(%{
+                      "status" => "ok",
+                      "type" => type,
+                      "edit" => type,
+                      "edit_state" => Map.get(params, "state", "")
+                    }) <> "#flow-policy-editor"
 
-                {:error, reason} ->
-                  type = Map.get(params, "type", "")
+                send_redirect_response(socket, transport, location)
 
-                  "/dashboard/flow/policies?" <>
-                    URI.encode_query(%{"status" => "error", "message" => reason, "edit" => type})
-              end
-
-            send_redirect_response(socket, transport, location)
+              {:error, reason} ->
+                DashboardHandlers.handle_flow_policy_error(socket, transport, params, reason)
+            end
 
           {:redirect_login, location} ->
             send_redirect_response(socket, transport, location)
@@ -508,6 +528,16 @@ defmodule FerricstoreServer.Health.Endpoint do
         params = FlowPaths.decode_form_body(body)
         requirement = RouteRequirements.flow_governance_form_requirement(params)
 
+        requirement =
+          if Map.get(params, "review_only") == "true" do
+            [
+              requirement,
+              FerricstoreServer.Health.Dashboard.Flow.Governance.review_requirement(params)
+            ]
+          else
+            requirement
+          end
+
         case Auth.authorize_command_request(peer, headers, requirement, :html) do
           :ok ->
             approver =
@@ -516,15 +546,39 @@ defmodule FerricstoreServer.Health.Endpoint do
                 _open_mode -> "dashboard"
               end
 
-            result =
-              FerricstoreServer.Health.Dashboard.apply_flow_governance_form(params,
-                approver: approver
-              )
+            if Map.get(params, "review_only") == "true" do
+              {result, data} =
+                FerricstoreServer.Health.Dashboard.Flow.Governance.review_page(
+                  params,
+                  Auth.dashboard_collect_opts(peer, headers)
+                )
 
-            location =
-              FerricstoreServer.Health.Dashboard.Flow.Governance.redirect_location(params, result)
+              body = FerricstoreServer.Health.Dashboard.render_flow_governance_page(data)
 
-            send_redirect_response(socket, transport, location)
+              if result == :ok,
+                do: send_html_response(socket, transport, 200, "OK", body),
+                else: send_html_response(socket, transport, 422, "Unprocessable Entity", body)
+            else
+              case FerricstoreServer.Health.Dashboard.apply_flow_governance_form(params,
+                     approver: approver
+                   ) do
+                {:ok, _} = result ->
+                  location =
+                    FerricstoreServer.Health.Dashboard.Flow.Governance.redirect_location(
+                      params,
+                      result
+                    )
+
+                  send_redirect_response(socket, transport, location)
+
+                {:error, reason} ->
+                  data =
+                    FerricstoreServer.Health.Dashboard.Flow.Governance.error_page(params, reason)
+
+                  body = FerricstoreServer.Health.Dashboard.render_flow_governance_page(data)
+                  send_html_response(socket, transport, 422, "Unprocessable Entity", body)
+              end
+            end
 
           {:redirect_login, location} ->
             send_redirect_response(socket, transport, location)
@@ -570,12 +624,25 @@ defmodule FerricstoreServer.Health.Endpoint do
 
         case Auth.authorize_command_request(peer, headers, requirement, :html) do
           :ok ->
-            result = FerricstoreServer.Health.Dashboard.apply_flow_schedule_form(params)
+            if Map.get(params, "action") == "create" and Map.get(params, "preview") == "true" do
+              DashboardHandlers.handle_flow_schedule_review(socket, transport, params)
+            else
+              result = FerricstoreServer.Health.Dashboard.apply_flow_schedule_form(params)
 
-            location =
-              FerricstoreServer.Health.Dashboard.Flow.Schedules.redirect_location(params, result)
+              case {Map.get(params, "action"), result} do
+                {"create", {:error, reason}} ->
+                  DashboardHandlers.handle_flow_schedule_error(socket, transport, params, reason)
 
-            send_redirect_response(socket, transport, location)
+                _other ->
+                  location =
+                    FerricstoreServer.Health.Dashboard.Flow.Schedules.redirect_location(
+                      params,
+                      result
+                    )
+
+                  send_redirect_response(socket, transport, location)
+              end
+            end
 
           {:redirect_login, location} ->
             send_redirect_response(socket, transport, location)
@@ -625,30 +692,13 @@ defmodule FerricstoreServer.Health.Endpoint do
                :html
              ) do
           :ok ->
+            result = FerricstoreServer.Health.Dashboard.apply_flow_retention_form(params)
+
             location =
-              case FerricstoreServer.Health.Dashboard.apply_flow_retention_form(params) do
-                {:ok, :dry_run, result} ->
-                  "/dashboard/flow/retention?" <>
-                    URI.encode_query(%{
-                      "status" => "dry_run",
-                      "limit" => Map.get(result, :limit, 100)
-                    })
-
-                {:ok, :cleanup, result} ->
-                  "/dashboard/flow/retention?" <>
-                    URI.encode_query(%{
-                      "status" => "ok",
-                      "limit" => Map.get(result, :limit, 100),
-                      "active_timeouts" => Map.get(result, :active_timeouts, 0),
-                      "flows" => Map.get(result, :flows, 0),
-                      "history" => Map.get(result, :history, 0),
-                      "values" => Map.get(result, :values, 0)
-                    })
-
-                {:error, reason} ->
-                  "/dashboard/flow/retention?" <>
-                    URI.encode_query(%{"status" => "error", "message" => reason})
-              end
+              FerricstoreServer.Health.Dashboard.Flow.PolicyRetention.retention_redirect_location(
+                params,
+                result
+              )
 
             send_redirect_response(socket, transport, location)
 
@@ -700,20 +750,10 @@ defmodule FerricstoreServer.Health.Endpoint do
                :html
              ) do
           :ok ->
-            location =
-              case FerricstoreServer.Health.Dashboard.apply_flow_failures_form(params) do
-                {:ok, result} ->
-                  "/dashboard/flow/failures?" <>
-                    URI.encode_query(%{
-                      "status" => "reclaimed",
-                      "type" => Map.get(result, :type, ""),
-                      "count" => Map.get(result, :reclaimed, 0)
-                    })
+            result = FerricstoreServer.Health.Dashboard.apply_flow_failures_form(params)
 
-                {:error, reason} ->
-                  "/dashboard/flow/failures?" <>
-                    URI.encode_query(%{"status" => "error", "message" => reason})
-              end
+            location =
+              FerricstoreServer.Health.Dashboard.flow_failures_redirect_location(params, result)
 
             send_redirect_response(socket, transport, location)
 
@@ -763,7 +803,7 @@ defmodule FerricstoreServer.Health.Endpoint do
             params =
               body
               |> FlowPaths.decode_form_body()
-              |> Map.put_new("id", id)
+              |> Map.put("id", id)
 
             case Auth.authorize_command_request(
                    peer,
@@ -772,21 +812,14 @@ defmodule FerricstoreServer.Health.Endpoint do
                    :html
                  ) do
               :ok ->
-                location =
-                  case FerricstoreServer.Health.Dashboard.apply_flow_rewind_form(params) do
-                    {:ok, id, partition_key} ->
-                      FlowPaths.flow_detail_location(id, partition_key, %{"status" => "rewound"})
-
-                    {:error, reason} ->
-                      partition_key = Map.get(params, "partition_key", "")
-
-                      FlowPaths.flow_detail_location(id, partition_key, %{
-                        "status" => "error",
-                        "message" => reason
-                      })
-                  end
-
-                send_redirect_response(socket, transport, location)
+                DashboardHandlers.handle_flow_action_result(
+                  socket,
+                  transport,
+                  id,
+                  :rewind,
+                  params,
+                  FerricstoreServer.Health.Dashboard.apply_flow_rewind_form(params)
+                )
 
               {:redirect_login, location} ->
                 send_redirect_response(socket, transport, location)
@@ -817,7 +850,7 @@ defmodule FerricstoreServer.Health.Endpoint do
             params =
               body
               |> FlowPaths.decode_form_body()
-              |> Map.put_new("id", id)
+              |> Map.put("id", id)
 
             case Auth.authorize_command_request(
                    peer,
@@ -826,21 +859,14 @@ defmodule FerricstoreServer.Health.Endpoint do
                    :html
                  ) do
               :ok ->
-                location =
-                  case FerricstoreServer.Health.Dashboard.apply_flow_signal_form(params) do
-                    {:ok, id, partition_key} ->
-                      FlowPaths.flow_detail_location(id, partition_key, %{"status" => "signaled"})
-
-                    {:error, reason} ->
-                      partition_key = Map.get(params, "partition_key", "")
-
-                      FlowPaths.flow_detail_location(id, partition_key, %{
-                        "status" => "error",
-                        "message" => reason
-                      })
-                  end
-
-                send_redirect_response(socket, transport, location)
+                DashboardHandlers.handle_flow_action_result(
+                  socket,
+                  transport,
+                  id,
+                  :signal,
+                  params,
+                  FerricstoreServer.Health.Dashboard.apply_flow_signal_form(params)
+                )
 
               {:redirect_login, location} ->
                 send_redirect_response(socket, transport, location)
@@ -935,6 +961,15 @@ defmodule FerricstoreServer.Health.Endpoint do
           {:ok, payload} ->
             Response.send_live_json_response(socket, transport, payload)
 
+          {:error, :invalid_filters, message} ->
+            send_response(
+              socket,
+              transport,
+              422,
+              "Unprocessable Content",
+              Jason.encode!(%{error: message})
+            )
+
           :not_found ->
             send_response(socket, transport, 404, "Not Found", ~s({"error":"not found"}))
         end
@@ -982,6 +1017,10 @@ defmodule FerricstoreServer.Health.Endpoint do
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/clients", peer, headers) do
     DashboardHandlers.handle_clients_page(socket, transport, peer, headers)
+  end
+
+  defp dispatch_request(socket, transport, "GET", "/dashboard/clients?" <> query, peer, headers) do
+    DashboardHandlers.handle_clients_page(socket, transport, peer, headers, query)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/storage", peer, headers) do
@@ -1077,11 +1116,11 @@ defmodule FerricstoreServer.Health.Endpoint do
          socket,
          transport,
          "GET",
-         "/dashboard/flow/workers?" <> _query,
+         "/dashboard/flow/workers?" <> query,
          peer,
          headers
        ) do
-    DashboardHandlers.handle_flow_workers_page(socket, transport, peer, headers)
+    DashboardHandlers.handle_flow_workers_page(socket, transport, peer, headers, query)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/due", peer, headers) do
@@ -1092,11 +1131,11 @@ defmodule FerricstoreServer.Health.Endpoint do
          socket,
          transport,
          "GET",
-         "/dashboard/flow/due?" <> _query,
+         "/dashboard/flow/due?" <> query,
          peer,
          headers
        ) do
-    DashboardHandlers.handle_flow_due_page(socket, transport, peer, headers)
+    DashboardHandlers.handle_flow_due_page(socket, transport, peer, headers, query)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/schedules", peer, headers) do
@@ -1280,7 +1319,7 @@ defmodule FerricstoreServer.Health.Endpoint do
 
       true ->
         {id, opts} = FlowPaths.decode_flow_detail_request(encoded_id)
-        opts = Auth.dashboard_flow_collect_opts(opts, peer, headers)
+        opts = Auth.dashboard_flow_collect_opts(Keyword.put(opts, :values, false), peer, headers)
         data = FerricstoreServer.Health.Dashboard.collect_flow_detail_page(id, opts)
         body = FerricstoreServer.Health.Dashboard.render_flow_detail_page(data)
         send_html_response(socket, transport, 200, "OK", body)
