@@ -1,5 +1,6 @@
 <% data = assigns.data %>
 <% query = URI.encode_query(%{
+  "mode" => Map.get(data.filters, :mode, if(Map.get(data.filters, :key, "") == "", do: "prefix", else: "exact")),
   "key" => Map.get(data.filters, :key, ""),
   "prefix" => Map.get(data.filters, :prefix, ""),
   "limit" => Map.get(data.filters, :limit, 50),
@@ -10,7 +11,7 @@
 <body data-dashboard-live-page="keyspace" data-dashboard-live-url="<%= live_url %>" data-dashboard-live-interval-ms="10000">
 <div class="layout">
 <%= render_sidebar_static("keyspace") %>
-<main class="main-content">
+<main class="main-content" id="dashboard-main" tabindex="-1">
 <%= render_subpage_header("Keyspace") %>
 <div class="content">
 <%= render_page_intro("Keyspace", "Find keys, inspect metadata, and confirm whether values are hot in memory, cold in Bitcask/WARaft segments, or represented by blob refs without loading large payloads.") %>

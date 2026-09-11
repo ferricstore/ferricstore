@@ -214,6 +214,11 @@ defmodule FerricstoreServer.Health.Endpoint.Session do
     end
   end
 
+  @doc false
+  def current_username do
+    session_user(Process.get(@request_headers_process_key, %{}))
+  end
+
   def cookie_value(headers, name) do
     headers
     |> Map.get("cookie", "")

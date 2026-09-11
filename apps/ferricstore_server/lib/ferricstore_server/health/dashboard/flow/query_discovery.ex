@@ -593,11 +593,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.QueryDiscovery do
   defp normalized_names(_values), do: []
 
   defp normalized_name(value) when is_binary(value) do
-    if String.valid?(value) and byte_size(value) <= @max_suggestion_bytes do
-      case String.trim(value) do
-        "" -> nil
-        normalized -> normalized
-      end
+    if value != "" and String.valid?(value) and byte_size(value) <= @max_suggestion_bytes do
+      value
     else
       nil
     end

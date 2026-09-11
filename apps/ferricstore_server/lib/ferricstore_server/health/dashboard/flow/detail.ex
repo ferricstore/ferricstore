@@ -19,20 +19,34 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
   @flow_dashboard_history_default_count 50
   @flow_dashboard_value_ref_limit 40
 
+  def action_snapshot(%{record: record}) when is_map(record) do
+    %{
+      available: true,
+      version: to_string(flow_field(record, :version, "")),
+      state: flow_record_state(record)
+    }
+  end
+
+  def action_snapshot(_data), do: %{available: false, version: nil, state: nil}
+
   @spec apply_rewind_form(map()) :: {:ok, binary(), binary() | nil} | {:error, binary()}
   def apply_rewind_form(params) when is_map(params) do
     with :ok <- flow_rewind_confirmed(params),
          {:ok, id} <- flow_rewind_required_form_value(params, "id", "flow id"),
          partition_key = normalize_flow_partition_query(Map.get(params, "partition_key")),
          {:ok, to_event} <- flow_rewind_required_form_value(params, "to_event", "target event"),
-         {:ok, run_at_ms} <- flow_rewind_optional_non_neg_integer(params, "run_at_ms"),
-         {:ok, record} <- flow_rewind_current_record(id, partition_key),
+         {:ok, expect_state} <-
+           flow_rewind_required_form_value(params, "expect_state", "reviewed state"),
+         {:ok, expected_version} <- flow_rewind_required_version(params),
+         {:ok, run_at_ms} <-
+           FerricstoreServer.Health.Dashboard.Flow.ActionForm.resolve_schedule(params),
          {:ok, _target_state} <- flow_rewind_existing_target_state(id, partition_key, to_event),
          opts =
            flow_rewind_opts(partition_key,
              to_event: to_event,
              run_at_ms: run_at_ms,
-             expect_state: flow_record_state(record)
+             expect_state: expect_state,
+             expected_version: expected_version
            ),
          :ok <- flow_rewind_apply(id, opts) do
       {:ok, id, flow_detail_url_partition_key(partition_key)}
@@ -52,6 +66,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
          {:ok, transition_to} <- flow_signal_optional_binary(params, "transition_to"),
          {:ok, idempotency_key} <- flow_signal_optional_binary(params, "idempotency_key"),
          {:ok, if_state} <- flow_signal_optional_binary(params, "if_state"),
+         :ok <- validate_signal_transition(transition_to, if_state),
          opts =
            flow_signal_opts(partition_key,
              signal: signal,
@@ -68,6 +83,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
   end
 
   def apply_signal_form(_params), do: {:error, "ERR signal form must be a map"}
+
+  defp validate_signal_transition(transition, nil) when is_binary(transition),
+    do: {:error, "ERR If State is required when Transition To is set"}
+
+  defp validate_signal_transition(_transition, _state), do: :ok
 
   @spec opts_from_query(binary()) :: keyword()
   def opts_from_query(query) when is_binary(query) do
@@ -88,6 +108,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
       normalize_flow_history_cursor(Map.get(params, "history_before"))
     )
     |> maybe_put_query_opt(:history_after, normalize_flow_history_after_cursor(params))
+    |> maybe_put_query_opt(
+      :history_event,
+      normalize_flow_history_cursor(Map.get(params, "history_event"))
+    )
     |> Enum.reverse()
   end
 
@@ -104,7 +128,15 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
     {record_status, record} =
       authorize_flow_detail_record(record_result, opts)
 
-    {history_status, history, history_page} = flow_detail_history(id, record, history_page_opts)
+    {history_status, history, history_page} =
+      if DashboardAccess.flow_command_allowed_for_acl?(
+           "FLOW.HISTORY",
+           DashboardAccess.keyspace_acl_username(opts)
+         ) do
+        flow_detail_history(id, record, history_page_opts)
+      else
+        {:forbidden, [], history_page_opts}
+      end
 
     {values_status, value_refs, values_by_ref} =
       if Keyword.get(opts, :values, true) do
@@ -123,6 +155,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
       partition_key: detail_partition_key,
       record: record,
       record_status: record_status,
+      action_capabilities:
+        action_capabilities(record, DashboardAccess.keyspace_acl_username(opts)),
       history: history,
       history_status: history_status,
       history_page: history_page,
@@ -135,6 +169,28 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
       fifo_lane: fifo_lane,
       generated_at_ms: System.system_time(:millisecond)
     }
+  end
+
+  defp action_capabilities(nil, _username), do: %{signal: false, rewind: false}
+
+  defp action_capabilities(record, username) do
+    key =
+      flow_detail_url_partition_key(flow_record_partition_key(record)) || flow_record_id(record)
+
+    writable? =
+      is_nil(username) or FerricstoreServer.Acl.check_key_access(username, key, :write) == :ok
+
+    %{
+      signal:
+        writable? and DashboardAccess.flow_command_allowed_for_acl?("FLOW.SIGNAL", username),
+      rewind:
+        writable? and DashboardAccess.flow_command_allowed_for_acl?("FLOW.REWIND", username) and
+          DashboardAccess.flow_command_allowed_for_acl?("FLOW.HISTORY", username)
+    }
+  rescue
+    _ -> %{signal: false, rewind: false}
+  catch
+    :exit, _ -> %{signal: false, rewind: false}
   end
 
   defp flow_detail_fifo_lane(%{} = record, sampled_records) do
@@ -226,7 +282,6 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
         {:ok, nil}
 
       value when is_binary(value) ->
-        value = String.trim(value)
         if value == "", do: {:ok, nil}, else: {:ok, value}
 
       _ ->
@@ -266,10 +321,12 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
     end
   end
 
+  defp flow_rewind_required_form_value(%{"id" => id}, "id", _label)
+       when is_binary(id) and id != "", do: {:ok, id}
+
   defp flow_rewind_required_form_value(params, key, label) do
     case Map.get(params, key) do
       value when is_binary(value) ->
-        value = String.trim(value)
         if value == "", do: {:error, "ERR #{label} is required"}, else: {:ok, value}
 
       _ ->
@@ -277,37 +334,15 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
     end
   end
 
-  defp flow_rewind_optional_non_neg_integer(params, key) do
-    case Map.get(params, key) do
-      nil ->
-        {:ok, nil}
-
-      "" ->
-        {:ok, nil}
-
-      value when is_binary(value) ->
-        value = String.trim(value)
-
-        case Integer.parse(value) do
-          {parsed, ""} when parsed >= 0 -> {:ok, parsed}
-          _ -> {:error, "ERR #{key} must be a non-negative integer"}
-        end
-
-      value when is_integer(value) and value >= 0 ->
-        {:ok, value}
-
+  defp flow_rewind_required_version(params) do
+    with {:ok, value} <-
+           flow_rewind_required_form_value(params, "expected_version", "reviewed version"),
+         {version, ""} when version >= 0 <- Integer.parse(value) do
+      {:ok, version}
+    else
       _ ->
-        {:error, "ERR #{key} must be a non-negative integer"}
-    end
-  end
-
-  defp flow_rewind_current_record(id, partition_key) do
-    case FerricStore.flow_get(id, flow_dashboard_get_opts(partition_key)) do
-      {:ok, %{} = record} -> {:ok, record}
-      {:ok, nil} -> {:error, "ERR flow not found"}
-      {:error, reason} when is_binary(reason) -> {:error, reason}
-      {:error, reason} -> {:error, dashboard_internal_error("ERR FLOW.GET failed", reason)}
-      other -> {:error, dashboard_internal_error("ERR unexpected FLOW.GET result", other)}
+        {:error,
+         "ERR reviewed version is missing or invalid. Review the workflow before rewinding."}
     end
   end
 
@@ -412,15 +447,20 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
   defp flow_dashboard_get_opts(partition_key), do: [payload: false, partition_key: partition_key]
 
   defp flow_detail_history_page_opts(opts) when is_list(opts) do
-    before = normalize_flow_history_cursor(Keyword.get(opts, :history_before))
+    event = normalize_flow_history_cursor(Keyword.get(opts, :history_event))
+
+    before =
+      if is_nil(event), do: normalize_flow_history_cursor(Keyword.get(opts, :history_before))
 
     after_cursor =
-      if is_nil(before), do: normalize_flow_history_cursor(Keyword.get(opts, :history_after))
+      if is_nil(event) and is_nil(before),
+        do: normalize_flow_history_cursor(Keyword.get(opts, :history_after))
 
     %{
       count: normalize_flow_history_count(Keyword.get(opts, :history_count)),
       before: before,
       after_cursor: after_cursor,
+      event: event,
       has_older: false,
       has_newer: false,
       oldest_event_id: nil,
@@ -495,6 +535,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
     |> Keyword.put(:rev, true)
   end
 
+  defp flow_detail_history_cursor_opts(opts, %{event: event}) when is_binary(event),
+    do: Keyword.put(opts, :from_event, event)
+
   defp flow_detail_history_cursor_opts(opts, %{after_cursor: after_cursor})
        when is_binary(after_cursor),
        do: Keyword.put(opts, :from_event, after_cursor)
@@ -528,6 +571,20 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
        page
        | has_older: page_events != [],
          has_newer: has_newer,
+         oldest_event_id: flow_history_page_oldest_event_id(page_events),
+         newest_event_id: flow_history_page_newest_event_id(page_events)
+     }}
+  end
+
+  defp flow_detail_history_page(history, %{event: event, count: count} = page)
+       when is_binary(event) do
+    page_events = Enum.take(history, count)
+
+    {page_events,
+     %{
+       page
+       | has_older: page_events != [],
+         has_newer: length(history) > count,
          oldest_event_id: flow_history_page_oldest_event_id(page_events),
          newest_event_id: flow_history_page_newest_event_id(page_events)
      }}
@@ -616,6 +673,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
        when is_binary(after_cursor) do
     %{"history_after" => after_cursor, "history_count" => count}
   end
+
+  defp flow_detail_history_current_params(%{event: event, count: count}) when is_binary(event),
+    do: %{"history_event" => event, "history_count" => count}
 
   defp flow_detail_history_current_params(%{count: @flow_dashboard_history_default_count}),
     do: %{}

@@ -1,5 +1,5 @@
 <% data = assigns.data %>
-<div class="section-title">Lineage Map</div>
-<div class="flow-lineage-map">
+<details class="dashboard-disclosure">
+  <summary>Relationship preview</summary>
   <%= render_flow_lineage_nodes(data.records, data.filters) %>
-</div>
+</details>

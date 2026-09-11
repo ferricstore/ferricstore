@@ -3,7 +3,7 @@
 <body data-dashboard-live-page="reads" data-dashboard-live-url="/dashboard/api/reads" data-dashboard-live-interval-ms="5000">
 <div class="layout">
 <%= render_sidebar_static("reads") %>
-<main class="main-content">
+<main class="main-content" id="dashboard-main" tabindex="-1">
 <%= render_subpage_header("Read Path") %>
 <div class="content">
 <%= render_page_intro("Read Path", "Track hot-cache efficiency, cold-read pressure, miss rate, and which prefixes are forcing disk access.") %>

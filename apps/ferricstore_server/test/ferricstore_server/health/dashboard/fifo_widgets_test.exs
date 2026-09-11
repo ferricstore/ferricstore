@@ -3,6 +3,7 @@ defmodule FerricstoreServer.Health.Dashboard.FifoWidgetsTest do
 
   alias FerricstoreServer.Health.Dashboard
   alias FerricstoreServer.Health.Dashboard.Flow.Fifo
+  alias FerricstoreServer.Health.Dashboard.Flow.Sample
   alias FerricstoreServer.Health.Dashboard.Render.FlowDetail
   alias FerricstoreServer.Health.Dashboard.Render.FlowNavigation
   alias FerricstoreServer.Health.Dashboard.Render.FlowTables.Records
@@ -15,6 +16,55 @@ defmodule FerricstoreServer.Health.Dashboard.FifoWidgetsTest do
     type = "fifo-widget-#{System.unique_integer([:positive])}"
     assert {:ok, _} = FerricStore.flow_policy_set(type, states: %{"queued" => [mode: :fifo]})
     %{type: type}
+  end
+
+  test "running summaries use logical-state policy and identify mixed modes", %{type: type} do
+    fifo = Map.merge(record(type, 1), %{state: "running", run_state: "queued"})
+    parallel = Map.merge(record(type, 2), %{state: "running", run_state: "review"})
+    [summary] = [fifo] |> Sample.flow_state_summaries() |> Fifo.annotate_state_summaries()
+    assert summary.state == "running"
+    assert summary.mode == :fifo
+
+    [mixed] = [fifo, parallel] |> Sample.flow_state_summaries() |> Fifo.annotate_state_summaries()
+    assert mixed.mode == :mixed
+    html = Records.render_flow_states_table([mixed], 2, 2, 400, %{})
+    assert html =~ ">mixed</span>"
+    assert html =~ "logical states"
+  end
+
+  test "running filter retains the matching leased FIFO lane in initial and live views", %{
+    type: type
+  } do
+    id = "fifo-running-#{System.unique_integer([:positive])}"
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: type,
+               state: "queued",
+               partition_key: id,
+               run_at_ms: 1
+             )
+
+    assert {:ok, [_]} =
+             FerricStore.flow_claim_due(type,
+               state: "queued",
+               partition_key: id,
+               worker: "worker",
+               limit: 1,
+               lease_ms: 60_000
+             )
+
+    query = URI.encode_query(%{"type" => type, "state" => "running", "partition_key" => id})
+
+    data =
+      query |> Dashboard.flow_states_opts_from_query() |> Dashboard.collect_flow_states_page()
+
+    assert [%{mode: :fifo, state: "running"}] = data.states
+    assert [%{state: "queued", blocked_by_id: ^id}] = data.fifo_lanes
+    assert [%{id: ^id}] = data.records
+    assert {:ok, live} = Dashboard.live_payload("flow/states?" <> query)
+    assert live.components["flow_fifo_lanes"] =~ id
+    assert live.components["flow_states_table"] =~ ">FIFO</span>"
   end
 
   test "lane member previews retain at most eight lean records in entry order", %{type: type} do

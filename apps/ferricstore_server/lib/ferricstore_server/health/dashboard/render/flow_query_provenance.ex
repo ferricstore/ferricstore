@@ -35,9 +35,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryProvenance do
 
     """
     <div class="flow-query-provenance" data-flow-query-provenance data-flow-query-result-mode="#{mode}">
-      <p>Result captured <time datetime="#{timestamp}">#{format_timestamp_ms_or_dash(captured_at)} UTC</time></p>
+      <p>Result captured <time datetime="#{timestamp}">#{format_timestamp_ms_or_dash(captured_at)}</time></p>
       <p>#{scope_summary(mode, filters)}</p>
-      <details><summary>Executed inputs</summary><pre>#{executed_inputs(mode, filters, form)}</pre></details>
+      <details><summary>Executed inputs</summary><pre tabindex="0" role="region" aria-label="Executed query inputs">#{executed_inputs(mode, filters, form)}</pre></details>
     </div>
     <p class="flow-query-draft-status" data-flow-query-draft-status hidden role="status" aria-live="polite"></p>
     #{draft_script()}
@@ -81,9 +81,20 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryProvenance do
   defp executed_inputs("guided", filters, _form) do
     filters
     |> Map.take(@input_fields)
+    |> maybe_put_time_field(filters)
     |> Jason.encode!(pretty: true)
     |> escape()
   end
+
+  defp maybe_put_time_field(inputs, %{kind: kind}) when kind not in ["stats", "history"],
+    do:
+      Map.put(
+        inputs,
+        :time_field,
+        if(kind == "stuck", do: "lease_deadline_ms", else: "updated_at_ms")
+      )
+
+  defp maybe_put_time_field(inputs, _filters), do: inputs
 
   defp draft_script do
     """

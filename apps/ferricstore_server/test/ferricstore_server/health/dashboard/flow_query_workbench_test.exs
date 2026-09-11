@@ -434,8 +434,8 @@ defmodule FerricstoreServer.Health.Dashboard.FlowQueryWorkbenchTest do
     assert html =~ ~s(data-flow-query-copy-status)
     assert html =~ "Copy FQL"
     assert html =~ "Copy params"
-    assert html =~ "navigator.clipboard.writeText"
-    assert html =~ ~S|document.execCommand("copy")|
+    assert html =~ "window.dashboardCopyText"
+    assert html =~ "Copy failed. Select and copy manually."
     refute html =~ "ferricstore_query_history"
     assert html =~ ~s(method="post")
     assert html =~ ~s(event.key === "ArrowRight")
@@ -862,10 +862,12 @@ defmodule FerricstoreServer.Health.Dashboard.FlowQueryWorkbenchTest do
     assert html =~ ~s(<svg class="flow-query-time-chart" role="img")
     assert html =~ ~s(<rect class="flow-query-time-bar )
 
-    assert html =~
+    assert FerricstoreServer.Health.Dashboard.Layout.Styles.stylesheet() =~
              ".flow-query-chart-segment { fill: none; stroke: var(--flow-query-chart-color);"
 
-    assert html =~ ".flow-query-time-bar { fill: var(--flow-query-chart-color);"
+    assert FerricstoreServer.Health.Dashboard.Layout.Styles.stylesheet() =~
+             ".flow-query-time-bar { fill: var(--flow-query-chart-color);"
+
     refute html =~ "flow-query-chart-track"
   end
 
@@ -906,7 +908,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowQueryWorkbenchTest do
     assert %{charts: [%{field: "state", values: values}]} = visualization
     assert length(values) == 12
     assert Enum.sum(Enum.map(values, & &1.count)) == 40
-    assert List.last(values).label == "Other"
+    assert List.last(values).label == "Remaining categories"
   end
 
   test "guided query results skip unused sampling and chart only returned rows" do

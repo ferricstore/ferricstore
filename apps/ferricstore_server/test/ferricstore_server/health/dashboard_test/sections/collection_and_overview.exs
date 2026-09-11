@@ -151,7 +151,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.CollectionAndOverview 
           refute String.contains?(html, ~s(http-equiv="refresh"))
           assert String.contains?(html, ~s(data-dashboard-live-page="overview"))
           assert String.contains?(html, ~s(data-dashboard-live-url="/dashboard/api/overview"))
-          assert String.contains?(html, "dashboard-live.js")
+          assert String.contains?(html, FerricstoreServer.Health.Dashboard.Assets.path(:js))
           assert String.contains?(html, ~s(data-live-component="content"))
         end
 
@@ -165,7 +165,10 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.CollectionAndOverview 
         end
 
         test "uses a semantic main landmark", %{html: html} do
-          assert String.contains?(html, ~s(<main class="main-content">))
+          assert String.contains?(
+                   html,
+                   ~s(<main class="main-content" id="dashboard-main" tabindex="-1">)
+                 )
         end
 
         test "contains top bar with key metrics", %{html: html} do
@@ -301,7 +304,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.CollectionAndOverview 
           refute String.contains?(body, ~s(http-equiv="refresh"))
           assert String.contains?(body, ~s(data-dashboard-live-page="overview"))
           assert String.contains?(body, ~s(data-dashboard-live-url="/dashboard/api/overview"))
-          assert String.contains?(body, "dashboard-live.js")
+          assert String.contains?(body, FerricstoreServer.Health.Dashboard.Assets.path(:js))
         end
 
         test "response contains all dashboard sections" do

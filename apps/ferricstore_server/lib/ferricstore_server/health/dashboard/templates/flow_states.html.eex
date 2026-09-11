@@ -12,32 +12,35 @@ lane_scope? =
 <body data-dashboard-live-page="flow-states" data-dashboard-live-url="<%= flow_states_live_url(filters) %>" data-dashboard-live-interval-ms="2000">
 <div class="layout">
 <%= render_sidebar_static("flow_states") %>
-<main class="main-content">
+<main class="main-content" id="dashboard-main" tabindex="-1">
 <%= render_subpage_header("Flow States") %>
 <div class="content">
 <%= render_page_intro("Flow States", "Filter sampled workflows by type, state, partition, time range, and name to find live workflow distribution.") %>
 <%= render_flow_context_tools(data, "flow_states") %>
 <%= render_flow_type_filter(data) %>
+<%= if map_size(Map.get(filters, :errors, %{})) == 0 do %>
+<%= render_live_component("flow_states_sources", render_flow_states_sources(data)) %>
 <%= if lane_scope? do %>
-<%= render_live_component("flow_fifo_lanes", render_flow_fifo_lanes(Map.get(data, :fifo_lanes, []), data.total_sampled, data.sample_limit)) %>
+<%= render_live_component("flow_fifo_lanes", render_flow_fifo_lanes(Map.get(data, :fifo_lanes, []), data.total_sampled, data.sample_limit, Map.get(data, :fifo_coverage, %{}))) %>
 <details class="dashboard-disclosure" id="flow-state-summaries">
 <summary>State summaries</summary>
 <div class="dashboard-disclosure-body">
-<%= render_live_component("flow_states_table", render_flow_states_table(data.states, data.total_sampled, data.filtered_sampled, data.sample_limit, filters)) %>
-<%= render_live_component("flow_states_chart", render_flow_states_chart(data.states)) %>
+<%= render_live_component("flow_states_table", render_flow_states_table(data.states, data.total_sampled, data.filtered_sampled, data.sample_limit, filters, Map.get(data, :source_status, :ok))) %>
+<%= render_live_component("flow_states_chart", if(Map.get(data, :source_status) == :unavailable, do: "", else: render_flow_states_chart(data.states))) %>
 </div>
 </details>
 <% else %>
-<%= render_live_component("flow_states_table", render_flow_states_table(data.states, data.total_sampled, data.filtered_sampled, data.sample_limit, filters)) %>
-<%= render_live_component("flow_fifo_lanes", render_flow_fifo_lanes(Map.get(data, :fifo_lanes, []), data.total_sampled, data.sample_limit)) %>
+<%= render_live_component("flow_states_table", render_flow_states_table(data.states, data.total_sampled, data.filtered_sampled, data.sample_limit, filters, Map.get(data, :source_status, :ok))) %>
+<%= render_live_component("flow_fifo_lanes", render_flow_fifo_lanes(Map.get(data, :fifo_lanes, []), data.total_sampled, data.sample_limit, Map.get(data, :fifo_coverage, %{}))) %>
 <details class="dashboard-disclosure" id="flow-state-pressure">
 <summary>State pressure</summary>
 <div class="dashboard-disclosure-body">
-<%= render_live_component("flow_states_chart", render_flow_states_chart(data.states)) %>
+<%= render_live_component("flow_states_chart", if(Map.get(data, :source_status) == :unavailable, do: "", else: render_flow_states_chart(data.states))) %>
 </div>
 </details>
 <% end %>
-<%= render_live_component("flow_recent_records", render_flow_recent_records(data.records, flow_states_page_limit(data))) %>
+<%= render_live_component("flow_recent_records", render_flow_recent_records(data.records, flow_states_page_limit(data), Map.get(data, :source_status, :ok))) %>
+<% end %>
 </div>
 </main>
 </div>

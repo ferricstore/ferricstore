@@ -96,6 +96,10 @@ defmodule FerricstoreServer.Health.Dashboard.Access do
 
   def flow_lineage_filter_result_for_acl(result, nil), do: result
 
+  def flow_lineage_filter_result_for_acl(%{status: status} = result, _username)
+      when status in [:idle, :error, :timeout],
+      do: result
+
   def flow_lineage_filter_result_for_acl(result, username) when is_map(result) do
     records =
       result
@@ -121,28 +125,34 @@ defmodule FerricstoreServer.Health.Dashboard.Access do
   def filter_stream_activity_for_acl(entries, nil), do: entries
 
   def filter_stream_activity_for_acl(entries, username) when is_list(entries) do
-    Enum.filter(entries, fn
-      %{key: key} when is_binary(key) ->
-        case FerricstoreServer.Acl.check_key_access(username, key, :read) do
-          :ok -> true
-          {:error, _reason} -> false
-        end
-
-      _entry ->
-        false
-    end)
+    Enum.filter(entries, &stream_entry_allowed_for_acl?(&1, username))
   end
+
+  def stream_entry_allowed_for_acl?(_entry, nil), do: true
+
+  def stream_entry_allowed_for_acl?(%{key: key}, username) when is_binary(key),
+    do: FerricstoreServer.Acl.check_key_access(username, key, :read) == :ok
+
+  def stream_entry_allowed_for_acl?(_entry, _username), do: false
 
   def filter_pubsub_channels_for_acl(rows, nil), do: rows
 
   def filter_pubsub_channels_for_acl(rows, username) when is_list(rows) do
-    Enum.filter(rows, fn
-      %{channel: channel} when is_binary(channel) -> pubsub_channel_allowed?(username, channel)
-      %{pattern: pattern} when is_binary(pattern) -> pubsub_channel_allowed?(username, pattern)
-      %{target: target} when is_binary(target) -> pubsub_channel_allowed?(username, target)
-      _row -> false
-    end)
+    Enum.filter(rows, &pubsub_entry_allowed_for_acl?(&1, username))
   end
+
+  def pubsub_entry_allowed_for_acl?(_row, nil), do: true
+
+  def pubsub_entry_allowed_for_acl?(%{channel: channel}, username) when is_binary(channel),
+    do: pubsub_channel_allowed?(username, channel)
+
+  def pubsub_entry_allowed_for_acl?(%{pattern: pattern}, username) when is_binary(pattern),
+    do: pubsub_channel_allowed?(username, pattern)
+
+  def pubsub_entry_allowed_for_acl?(%{target: target}, username) when is_binary(target),
+    do: pubsub_channel_allowed?(username, target)
+
+  def pubsub_entry_allowed_for_acl?(_row, _username), do: false
 
   defp pubsub_channel_allowed?(username, channel) do
     case FerricstoreServer.Acl.get_user(username) do

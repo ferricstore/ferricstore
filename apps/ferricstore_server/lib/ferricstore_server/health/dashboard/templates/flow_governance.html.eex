@@ -8,17 +8,21 @@
 <body>
   <div class="layout">
     <%= render_sidebar_static("flow_governance") %>
-    <main class="main-content">
+    <main class="main-content" id="dashboard-main" tabindex="-1">
       <%= render_subpage_header("FerricFlow Governance") %>
       <div class="content">
         <%= render_page_intro("FerricFlow Governance", "Inspect approval requests, durable budget counters, and distributed credit-limit leases used by governed workflows.") %>
+        <%= if Map.get(data, :governance_form_only?, false) do %>
+        <%= render_flow_governance_form_recovery(data) %>
+        <% else %>
         <%= render_flow_context_tools(data, "flow_governance") %>
         <%= render_flow_governance_summary(data) %>
         <%= render_flow_governance_filters(data) %>
         <%= render_dashboard_disclosure("Approvals", length(approvals), render_flow_governance_approvals(approvals, Map.get(data, :filters, %{})), open: Map.get(counts, :pending_approvals, 0) > 0) %>
-        <%= render_dashboard_disclosure("Circuits", length(circuits), render_flow_governance_circuit_actions() <> render_flow_governance_circuit_graph(circuits) <> render_flow_governance_circuits(circuits) <> render_flow_governance_circuit_timeline(circuits), open: Map.get(counts, :open_circuits, 0) + Map.get(counts, :half_open_circuits, 0) > 0) %>
+        <%= render_dashboard_disclosure("Circuits", length(circuits), render_flow_governance_circuit_actions(Map.get(data, :filters, %{})) <> render_flow_governance_circuit_graph(circuits) <> render_flow_governance_circuits(circuits, Map.get(data, :filters, %{})) <> render_flow_governance_circuit_timeline(circuits), open: Map.get(counts, :open_circuits, 0) + Map.get(counts, :half_open_circuits, 0) > 0 or is_map(get_in(data, [:filters, :circuit_review]))) %>
         <%= render_dashboard_disclosure("Budgets and Limits", length(budgets) + length(limits), render_flow_governance_budgets(budgets) <> render_flow_governance_limits(limits), open: budgets != [] or limits != []) %>
         <%= render_dashboard_disclosure("State Metadata", "query", render_flow_governance_state_meta_filters(data) <> render_flow_governance_state_meta(data), open: state_meta_open?(data)) %>
+        <% end %>
       </div>
     </main>
   </div>

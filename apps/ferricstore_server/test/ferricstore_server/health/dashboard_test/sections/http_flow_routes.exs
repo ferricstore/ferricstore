@@ -318,10 +318,18 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
             Application.delete_env(:ferricstore, :flow_dashboard_retention_cleanup_fun)
           end)
 
+          review_response =
+            http_post_form(port, "/dashboard/flow/retention", %{"action" => "review_cleanup", "limit" => "3"})
+          assert extract_status_code(review_response) == 302
+          refute_received {:retention_cleanup, _opts}
+          review_fields = review_response |> extract_header("location") |> URI.parse() |> Map.fetch!(:query) |> URI.decode_query()
+
           response =
             http_post_form(port, "/dashboard/flow/retention", %{
               "action" => "cleanup",
               "limit" => "3",
+              "reviewed_limit" => review_fields["reviewed_limit"],
+              "reviewed_at_ms" => review_fields["reviewed_at_ms"],
               "confirm_cleanup" => "true"
             })
 
@@ -386,13 +394,13 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
                  }
 
           assert_received {:flow_reclaim, "email jobs", opts}
-          assert opts[:partition_key] == "tenant/a"
+          assert opts[:partition_keys] == ["tenant/a"]
           assert opts[:worker] == "recovery-worker"
           assert opts[:limit] == 25
           assert opts[:lease_ms] == 30_000
         end
 
-        test "POST /dashboard/flow/policies redirects invalid forms to a visible error" do
+        test "POST /dashboard/flow/policies returns invalid forms with a visible error" do
           port = HealthEndpoint.port()
 
           response =
@@ -408,15 +416,10 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
               "history_max_events" => "25"
             })
 
-          assert extract_status_code(response) == 302
-          location = extract_header(response, "location")
-          assert location =~ "/dashboard/flow/policies?"
-          assert location =~ "status=error"
-
-          get_response = http_get(port, location)
-          assert get_response =~ "HTTP/1.1 200 OK"
-          assert get_response |> extract_body() |> String.contains?("ERR flow type is required")
-          assert get_response |> extract_body() |> String.contains?("flow-alert-error")
+          assert extract_status_code(response) == 422
+          refute extract_header(response, "location")
+          assert response |> extract_body() |> String.contains?("ERR flow type is required")
+          assert response |> extract_body() |> String.contains?("flow-alert-error")
         end
 
         test "Flow detail page renders rewind success and error flash messages" do
@@ -481,10 +484,14 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
 
           encoded_id = URI.encode(id, &URI.char_unreserved?/1)
 
+          assert {:ok, reviewed} = FerricStore.flow_get(id, partition_key: partition_key)
+
           response =
             http_post_form(port, "/dashboard/flow/#{encoded_id}/rewind", %{
               "partition_key" => partition_key,
               "to_event" => created_event_id,
+              "expect_state" => reviewed.state,
+              "expected_version" => to_string(reviewed.version),
               "confirm_rewind" => "true"
             })
 

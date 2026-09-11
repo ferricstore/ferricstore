@@ -44,6 +44,14 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Signals do
       end
 
     title = flow_signals_table_title(total_sampled, filtered_sampled, sample_limit, filters, mode)
+    event_count = length(signals)
+
+    count_label =
+      if mode == :page and not Map.get(filters, :scan_history, false),
+        do: "Not scanned",
+        else: "#{format_number(event_count)} signal #{if event_count == 1, do: "event", else: "events"}"
+
+    title = title <> ~s( <span class="badge badge-idle">#{count_label}</span>)
 
     table = """
     <table>
@@ -59,7 +67,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Signals do
     label = if mode == :detail, do: "Workflow signal history", else: "Workflow signals"
 
     """
-    <div class="section-title">#{title}</div>
+    <h2 class="section-title">#{title}</h2>
     #{accessible_table(label, table)}
     """
   end
@@ -83,7 +91,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Signals do
 
     """
     <tr>
-      <td class="mono">#{render_flow_id_link(id, partition_key)}</td>
+      <td class="flow-run-identity mono">#{render_flow_id_link(id, partition_key)}<span class="flow-run-secondary mono" title="Partition">#{escape(partition_key || "auto/global")}</span></td>
       <td class="mono">#{escape(Map.get(row, :type, "-"))}</td>
       <td class="mono"><a class="flow-event-link" href="#{flow_signal_event_href(row, :page)}">#{escape(Map.get(row, :event_id, "-"))}</a></td>
       <td>#{format_timestamp_ms_or_dash(Map.get(row, :time_ms))}</td>
@@ -113,7 +121,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Signals do
   def flow_signals_table_title(total_sampled, filtered_sampled, sample_limit, filters, :page)
       when is_integer(total_sampled) and is_integer(filtered_sampled) and
              is_integer(sample_limit) do
-    "Flow Signals <span class=\"badge badge-idle\">#{escape(flow_signals_filter_summary(filters))}</span> <span class=\"badge badge-idle\">#{bounded_sample_label(filtered_sampled, total_sampled, sample_limit)}</span>"
+    "Flow Signals <span class=\"badge badge-idle\">#{escape(flow_signals_filter_summary(filters))}</span>"
   end
 
   def flow_signals_table_title(
@@ -164,6 +172,14 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Signals do
       row
       |> Map.get(:fields, %{})
       |> flow_value_ref_entries("signal event")
+      |> Enum.map(
+        &Map.merge(&1, %{
+          source: "historical",
+          event_id: Map.get(row, :event_id),
+          action: "Signaled",
+          time: format_timestamp_ms_or_dash(Map.get(row, :time_ms))
+        })
+      )
       |> Enum.map(&render_flow_value_ref_badge(record, badge_mode, &1))
 
     case badges do

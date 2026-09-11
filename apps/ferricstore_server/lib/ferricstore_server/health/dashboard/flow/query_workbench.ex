@@ -3,8 +3,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.QueryWorkbench do
 
   alias Ferricstore.Commands.PreparedCommand
   alias Ferricstore.Flow.Query.{Error, Limits, Request}
+  alias FerricstoreServer.Acl
   alias FerricstoreServer.Connection.Auth, as: ConnectionAuth
-  alias FerricstoreServer.Health.Dashboard.Flow.QueryResult
+  alias FerricstoreServer.Health.Dashboard.Flow.{QueryPagination, QueryResult}
   alias FerricstoreServer.Native.FQLParser
 
   import FerricstoreServer.Health.Dashboard.Flow.Calls
@@ -28,7 +29,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.QueryWorkbench do
           fql: binary(),
           params_json: binary(),
           cursor: binary() | nil,
-          guided_query: binary() | nil
+          guided_query: binary() | nil,
+          errors: %{optional(:fql | :params_json) => binary()}
         }
 
   @spec default_form() :: form()
@@ -39,18 +41,34 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.QueryWorkbench do
       fql: String.trim(@default_query),
       params_json: @default_params_json,
       cursor: nil,
-      guided_query: nil
+      guided_query: nil,
+      errors: %{}
     }
   end
 
   @spec default_form(map()) :: form()
-  def default_form(filters) when is_map(filters) do
-    params = %{
-      "partition" => default_parameter(Map.get(filters, :partition_key), "default"),
-      "type" => default_parameter(Map.get(filters, :type), "workflow")
-    }
+  def default_form(filters) when is_map(filters), do: default_form()
 
-    %{default_form() | params_json: Jason.encode!(params, pretty: true)}
+  @doc false
+  @spec draft_scope(keyword()) :: binary() | nil
+  def draft_scope(opts) when is_list(opts) do
+    identity =
+      case Keyword.get(opts, :acl_username) do
+        username when is_binary(username) and username != "" ->
+          case Acl.get_user(username) do
+            %{enabled: true, auth_epoch: epoch} -> {:acl, username, epoch}
+            _unverified -> nil
+          end
+
+        _missing ->
+          if Application.get_env(:ferricstore, :protected_mode, true) == false,
+            do: :open_access
+      end
+
+    if identity do
+      :crypto.hash(:sha256, :erlang.term_to_binary({node(), identity}))
+      |> Base.url_encode64(padding: false)
+    end
   end
 
   @spec guided_form(binary(), map(), binary()) :: form()
@@ -70,14 +88,32 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.QueryWorkbench do
   def prepare(params) when is_map(params) do
     form = form_from_params(params)
 
-    with {:ok, mode} <- requested_mode(params),
-         {:ok, typed_params} <- decode_parameters(form.params_json),
-         {:ok, prepared} <- prepare_command(form.fql, typed_params),
+    with {:ok, form} <- QueryPagination.prepare(params, form),
+         {:ok, mode} <- requested_mode(params),
+         {:ok, typed_params} <- field_result(decode_parameters(form.params_json), :params_json),
+         {:ok, prepared} <- field_result(prepare_command(form.fql, typed_params), :fql),
+         prepared = reset_page_cursor(prepared, form),
          {:ok, prepared} <- set_cursor(prepared, form.cursor, mode),
-         {:ok, prepared} <- set_mode(prepared, mode) do
-      {:ok, prepared, form}
+         {:ok, prepared} <- field_result(set_mode(prepared, mode), :fql) do
+      {:ok, prepared, form_for_request(form, prepared, params)}
     else
-      {:error, reason} -> {:error, form, format_error(reason)}
+      {:error, {field, reason}} when field in [:fql, :params_json] ->
+        message = format_error(reason)
+        form = Map.put(form, :errors, %{field => message})
+
+        form =
+          case reason do
+            %Error{position: %{byte: byte} = position} when is_integer(byte) and byte > 0 ->
+              Map.put(form, :error_positions, %{field => position})
+
+            _unpositioned ->
+              form
+          end
+
+        {:error, form, message}
+
+      {:error, reason} ->
+        {:error, form, format_error(reason)}
     end
   end
 
@@ -138,24 +174,32 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.QueryWorkbench do
   end
 
   @spec attach_continuation(map(), form()) :: map()
-  def attach_continuation(
-        %{status: :ok, page: %{has_more: true, cursor: cursor}} = result,
-        form
-      )
-      when is_binary(cursor) and cursor != "" and is_map(form) do
-    continuation = %{
-      action: :run,
-      mode: Map.get(form, :mode, :advanced),
-      fql: Map.get(form, :fql, ""),
-      params_json: Map.get(form, :params_json, "{}"),
-      cursor: cursor,
-      guided_query: Map.get(form, :guided_query)
-    }
-
-    Map.put(result, :continuation, continuation)
+  def attach_continuation(result, form) when is_map(form) do
+    result
+    |> QueryResult.present(form)
+    |> QueryPagination.attach(form)
   end
 
   def attach_continuation(result, _form), do: result
+
+  defp reset_page_cursor(%PreparedCommand{ast: {:flow_query, request}} = prepared, %{
+         page_action: :first
+       }),
+       do: %{prepared | ast: {:flow_query, %{request | cursor: nil}}}
+
+  defp reset_page_cursor(prepared, _form), do: prepared
+
+  defp form_for_request(
+         %{cursor: nil} = form,
+         %PreparedCommand{ast: {:flow_query, %Request{cursor: {:literal, :keyword, cursor}}}},
+         params
+       ) do
+    form
+    |> Map.put(:cursor, cursor)
+    |> Map.put(:page_number, if(Map.has_key?(params, "page_number"), do: form.page_number))
+  end
+
+  defp form_for_request(form, _prepared, _params), do: form
 
   defp form_from_params(params) do
     action = normalize_action(Map.get(params, "action"))
@@ -166,7 +210,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.QueryWorkbench do
       fql: normalize_text(Map.get(params, "fql")),
       params_json: normalize_params_json(Map.get(params, "params_json")),
       cursor: normalize_cursor(Map.get(params, "cursor")),
-      guided_query: normalize_guided_query(Map.get(params, "guided_query"))
+      guided_query: normalize_guided_query(Map.get(params, "guided_query")),
+      errors: %{}
     }
   end
 
@@ -201,15 +246,24 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.QueryWorkbench do
 
   defp normalize_cursor(_value), do: nil
 
-  defp default_parameter(value, _default) when is_binary(value) and value != "", do: value
-  defp default_parameter(_value, default), do: default
-
   defp requested_mode(params) do
     case Map.get(params, "action", "run") do
       action when is_map_key(@actions, action) -> {:ok, Map.fetch!(@actions, action)}
       _invalid -> {:error, "ERR query action must be run, explain, or analyze"}
     end
   end
+
+  defp field_result({:error, %Error{reason: reason} = error}, _field)
+       when reason in [
+              :invalid_parameters,
+              :invalid_parameter_type,
+              :missing_parameter,
+              :unexpected_parameter
+            ],
+       do: {:error, {:params_json, error}}
+
+  defp field_result({:error, reason}, field), do: {:error, {field, reason}}
+  defp field_result(result, _field), do: result
 
   defp decode_parameters(""), do: {:ok, %{}}
 

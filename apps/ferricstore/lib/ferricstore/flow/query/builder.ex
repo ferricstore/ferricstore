@@ -175,7 +175,7 @@ defmodule Ferricstore.Flow.Query.Builder do
   end
 
   defp optional_type(predicates, params, nil), do: {:ok, predicates, params}
-  defp optional_type(predicates, params, "any"), do: {:ok, predicates, params}
+  defp optional_type(predicates, params, :any), do: {:ok, predicates, params}
 
   defp optional_type(predicates, params, type) when is_binary(type) and type != "" do
     {:ok, ["type = @type" | predicates], Map.put(params, "type", type)}
@@ -183,7 +183,7 @@ defmodule Ferricstore.Flow.Query.Builder do
 
   defp optional_type(_predicates, _params, _type), do: {:error, :invalid_query_filter}
 
-  defp optional_state(predicates, params, state) when state in [nil, "any"],
+  defp optional_state(predicates, params, state) when state in [nil, :any],
     do: {:ok, predicates, params}
 
   defp optional_state(predicates, params, state) when is_binary(state) and state != "" do
@@ -192,7 +192,7 @@ defmodule Ferricstore.Flow.Query.Builder do
 
   defp optional_state(_predicates, _params, _state), do: {:error, :invalid_query_filter}
 
-  defp optional_run_state(predicates, params, run_state) when run_state in [nil, "any"],
+  defp optional_run_state(predicates, params, run_state) when run_state in [nil, :any],
     do: {:ok, predicates, params}
 
   defp optional_run_state(predicates, params, run_state)
@@ -271,7 +271,7 @@ defmodule Ferricstore.Flow.Query.Builder do
       else: {:ok, predicates, params}
   end
 
-  defp terminal_predicate(state) when state in [nil, "any"] do
+  defp terminal_predicate(state) when state in [nil, :any] do
     params =
       @terminal_states
       |> Enum.with_index()

@@ -55,7 +55,7 @@ defmodule Ferricstore.Commands.Stream.Waiters do
   end
 
   @spec snapshot(non_neg_integer()) :: [map()]
-  def snapshot(limit \\ 100) do
+  def snapshot(limit \\ 100, visible? \\ fn _ -> true end) do
     ensure_table()
     limit = max(limit, 0)
 
@@ -71,7 +71,9 @@ defmodule Ferricstore.Commands.Stream.Waiters do
           |> snapshot_waiter_keys(
             System.monotonic_time(:microsecond),
             limit,
-            :gb_sets.empty()
+            :gb_sets.empty(),
+            visible?,
+            10_000
           )
 
         ranked
@@ -87,18 +89,22 @@ defmodule Ferricstore.Commands.Stream.Waiters do
     :exit, _ -> []
   end
 
-  defp snapshot_waiter_keys(:"$end_of_table", _now_us, _limit, acc), do: acc
+  defp snapshot_waiter_keys(:"$end_of_table", _now_us, _limit, acc, _visible?, _budget), do: acc
+  defp snapshot_waiter_keys(_key, _now_us, _limit, acc, _visible?, 0), do: acc
 
-  defp snapshot_waiter_keys(stream_key, now_us, limit, acc) do
+  defp snapshot_waiter_keys(stream_key, now_us, limit, acc, visible?, budget) do
     next_key = :ets.next(@stream_waiters_table, stream_key)
 
     acc =
       case waiter_snapshot_row(stream_key, now_us) do
-        nil -> acc
-        row -> insert_waiter_snapshot(row, stream_key, acc, limit)
+        nil ->
+          acc
+
+        row ->
+          if visible?.(row), do: insert_waiter_snapshot(row, stream_key, acc, limit), else: acc
       end
 
-    snapshot_waiter_keys(next_key, now_us, limit, acc)
+    snapshot_waiter_keys(next_key, now_us, limit, acc, visible?, budget - 1)
   end
 
   defp waiter_snapshot_row(stream_key, now_us) do

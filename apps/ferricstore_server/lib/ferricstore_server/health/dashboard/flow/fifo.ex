@@ -2,29 +2,54 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Fifo do
   @moduledoc false
 
   import FerricstoreServer.Health.Dashboard.FlowRecord
+  import FerricstoreServer.Health.Dashboard.Flow.Calls
 
   @flow_terminal_states ~w(completed failed cancelled)
   @member_preview_limit 8
 
   @spec annotate_state_summaries([map()]) :: [map()]
   def annotate_state_summaries(states) when is_list(states) do
-    policies = policy_cache_from_type_states(states)
-
-    Enum.map(states, fn state ->
-      Map.put(
-        state,
-        :mode,
-        effective_state_mode(policies, Map.get(state, :type), Map.get(state, :state))
-      )
-    end)
+    annotate_state_summaries(states, policy_cache_from_type_states(states))
   end
 
   def annotate_state_summaries(_states), do: []
 
+  def annotate_state_summaries(states, policies) do
+    Enum.map(states, fn state ->
+      modes =
+        state
+        |> Map.get(:logical_states, [Map.get(state, :state)])
+        |> Enum.map(&effective_state_mode(policies, Map.get(state, :type), &1))
+        |> Enum.uniq()
+
+      mode =
+        case modes do
+          [mode] -> mode
+          _ -> :mixed
+        end
+
+      Map.put(state, :mode, mode)
+    end)
+  end
+
   @spec lane_summaries([map()]) :: [map()]
   def lane_summaries(records) when is_list(records) do
-    policies = policy_cache_from_records(records)
+    lane_snapshot(records).lanes
+  end
 
+  def lane_summaries(_records), do: []
+
+  def lane_snapshot(records, policy_records \\ nil) when is_list(records) do
+    policies = policy_cache_from_records(policy_records || records)
+
+    %{
+      lanes: summarize_lanes(records, policies),
+      coverage: policy_coverage(policies),
+      policies: policies
+    }
+  end
+
+  defp summarize_lanes(records, policies) do
     groups =
       records
       |> Enum.filter(&fifo_lane_record?(&1, policies))
@@ -42,15 +67,13 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Fifo do
     end)
   end
 
-  def lane_summaries(_records), do: []
-
-  @spec effective_state_mode(binary(), binary()) :: :parallel | :fifo
+  @spec effective_state_mode(binary(), binary()) :: :parallel | :fifo | :unknown
   def effective_state_mode(type, state) when is_binary(type) and is_binary(state) do
     %{type => safe_flow_policy(type)}
     |> effective_state_mode(type, state)
   end
 
-  def effective_state_mode(_type, _state), do: :parallel
+  def effective_state_mode(_type, _state), do: :unknown
 
   defp fifo_lane_record?(record, policies) when is_map(record) do
     state = flow_record_logical_state(record)
@@ -191,29 +214,54 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Fifo do
   end
 
   defp safe_flow_policy(type) when is_binary(type) and type != "" do
-    case FerricStore.flow_policy_get(type) do
-      {:ok, policy} when is_map(policy) -> policy
-      _ -> %{}
+    case bounded_dashboard_call(
+           fn -> flow_dashboard_flow_policy_get(type, []) end,
+           flow_dashboard_list_fetch_timeout_ms(),
+           :flow_policy
+         ) do
+      {:ok, {:ok, policy}} when is_map(policy) -> {:ok, policy}
+      _ -> {:error, :unavailable}
     end
   rescue
-    _ -> %{}
+    _ -> {:error, :unavailable}
   catch
-    :exit, _ -> %{}
+    :exit, _ -> {:error, :unavailable}
   end
 
-  defp safe_flow_policy(_type), do: %{}
+  defp safe_flow_policy(_type), do: {:error, :unavailable}
+
+  defp policy_coverage(policies) do
+    unavailable_types =
+      policies
+      |> Enum.flat_map(fn {type, result} -> if match?({:ok, _}, result), do: [], else: [type] end)
+      |> Enum.sort()
+
+    status =
+      cond do
+        unavailable_types == [] -> :ok
+        length(unavailable_types) == map_size(policies) -> :unavailable
+        true -> :partial
+      end
+
+    %{status: status, unavailable_types: unavailable_types}
+  end
 
   defp effective_state_mode(policies, type, state)
        when is_map(policies) and is_binary(type) and is_binary(state) do
-    policies
-    |> Map.get(type, %{})
-    |> Map.get(:states, %{})
-    |> Map.get(state, %{})
-    |> policy_field(:mode, :parallel)
-    |> normalize_mode()
+    case Map.get(policies, type) do
+      {:ok, policy} ->
+        policy
+        |> policy_field(:states, %{})
+        |> Map.get(state, %{})
+        |> policy_field(:mode, :parallel)
+        |> normalize_mode()
+
+      _ ->
+        :unknown
+    end
   end
 
-  defp effective_state_mode(_policies, _type, _state), do: :parallel
+  defp effective_state_mode(_policies, _type, _state), do: :unknown
 
   defp policy_field(map, key, default) when is_map(map) and is_atom(key) do
     Map.get(map, key, Map.get(map, Atom.to_string(key), default))

@@ -14,6 +14,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Messaging do
 
   def collect_streams_page(opts \\ []) do
     acl_username = Access.keyspace_acl_username(opts)
+    visible? = &Access.stream_entry_allowed_for_acl?(&1, acl_username)
 
     entries =
       @stream_activity_limit
@@ -22,13 +23,11 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Messaging do
 
     groups =
       100
-      |> StreamGroups.snapshot()
-      |> Access.filter_stream_activity_for_acl(acl_username)
+      |> StreamGroups.snapshot(visible?)
 
     waiters =
       100
-      |> StreamWaiters.snapshot()
-      |> Access.filter_stream_activity_for_acl(acl_username)
+      |> StreamWaiters.snapshot(visible?)
 
     %{
       summary: stream_activity_summary(entries),
@@ -42,7 +41,8 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Messaging do
 
   def collect_pubsub_page(opts \\ []) do
     acl_username = Access.keyspace_acl_username(opts)
-    snapshot = PubSub.subscription_snapshot(100)
+    visible? = &Access.pubsub_entry_allowed_for_acl?(&1, acl_username)
+    snapshot = PubSub.subscription_snapshot(100, visible?)
 
     channels = Access.filter_pubsub_channels_for_acl(snapshot.channels, acl_username)
     patterns = Access.filter_pubsub_channels_for_acl(snapshot.patterns, acl_username)

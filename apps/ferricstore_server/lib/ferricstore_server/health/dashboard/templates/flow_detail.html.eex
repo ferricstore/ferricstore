@@ -1,13 +1,14 @@
 <% data = assigns.data %>
 <%= page_head("Flow Detail - FerricStore", 2, chartjs: true) %>
-<body data-dashboard-live-page="flow-detail" data-dashboard-live-url="<%= flow_detail_live_url(data.id, Map.get(data, :partition_key), Map.get(data, :history_page)) %>" data-dashboard-live-interval-ms="2000">
+<body data-flow-workflow="<%= escape_attr(data.id) %>" data-flow-partition="<%= escape_attr(Map.get(data, :partition_key) || "auto/global") %>"<%= if is_map(data.record) do %> data-dashboard-live-page="flow-detail" data-dashboard-live-url="<%= flow_detail_live_url(data.id, Map.get(data, :partition_key), Map.get(data, :history_page)) %>" data-dashboard-live-interval-ms="2000"<% end %>>
 <div class="layout">
 <%= render_sidebar_static("flow_detail") %>
-<main class="main-content">
+<main class="main-content" id="dashboard-main" tabindex="-1">
 <%= render_subpage_header("Flow Detail") %>
 <div class="content">
 <%= render_flow_detail_flash(data) %>
 <%= render_live_component("flow_detail", render_flow_detail(data)) %>
+<%= if is_map(data.record) do %>
 <section id="workflow-timeline" class="workflow-detail-section" aria-label="Execution history">
 <%= render_live_component("flow_timeline_chart", render_flow_timeline_chart(data.history)) %>
 <%= render_live_component("flow_history", render_flow_history_timeline(data.history, Map.get(data, :history_status, :ok), Map.get(data, :history_page))) %>
@@ -28,10 +29,10 @@
   <%= render_flow_actions(data) %>
 </section>
 <%= render_live_component("flow_value_store", render_flow_value_store(data)) %>
+<% end %>
 </div>
 </main>
 </div>
 <%= render_flow_value_modal() %>
-<%= render_keyboard_shortcuts_modal() %>
 </body>
 </html>

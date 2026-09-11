@@ -3,7 +3,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Projection do
 
   def collect_health do
     %{
-      lmdb_projection: :lagged,
+      lmdb_projection: :asynchronous,
       lmdb_flush_interval_ms: Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms, 0),
       history_flush_interval_ms:
         Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms, 0),
@@ -13,7 +13,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Projection do
 
   def default_health do
     %{
-      lmdb_projection: :lagged,
+      lmdb_projection: :asynchronous,
       lmdb_flush_interval_ms: 0,
       history_flush_interval_ms: 0,
       metrics: []

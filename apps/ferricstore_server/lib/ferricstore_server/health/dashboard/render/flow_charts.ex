@@ -36,6 +36,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
   end
 
   def render_flow_states_chart(states) do
+    total = length(states)
     states = Enum.take(states, 16)
 
     metrics = [
@@ -90,7 +91,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
       end
 
     """
-    <div class="section-title">State Pressure</div>
+    <h2 class="section-title">State Pressure</h2>
+    #{chart_coverage(length(states), total)}
     <div class="table-scroll flow-state-pressure-region" role="region" aria-label="Workflow state pressure" tabindex="0">
       <table class="flow-state-pressure-matrix">
         <thead>
@@ -117,7 +119,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
       end)
 
     """
-    <div class="section-title">Worker Charts</div>
+    <h2 class="section-title">Worker Charts</h2>
+    #{chart_coverage(length(rows), length(workers))}
     <div class="chart-grid">
       <div class="chart-card">
         <div class="chart-title">Lease health by worker</div>
@@ -127,25 +130,29 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
     """
   end
 
+  defp chart_coverage(shown, total) when shown < total do
+    ~s(<p class="flow-section-note">#{shown} of #{total} groups in table order; #{total - shown} omitted. The corresponding table retains the full loaded sample.</p>)
+  end
+
+  defp chart_coverage(_shown, _total), do: ""
+
   def render_flow_due_chart(due_now, scheduled) do
     rows = [
       %{
-        label: "Claim readiness",
+        label: "Current sample",
         values: [
-          {"Due now", length(due_now), "bar-yellow"},
+          {"Due now", length(due_now), "bar-neutral"},
           {"Scheduled", length(scheduled), "bar-blue"}
         ]
       }
     ]
 
     """
-    <div class="section-title">Due Charts</div>
-    <div class="chart-grid">
-      <div class="chart-card">
-        <div class="chart-title">Due vs scheduled</div>
-        #{render_bar_chart(rows)}
-      </div>
-    </div>
+    <section class="flow-due-summary" aria-label="Sampled due and scheduled work">
+      <h2 class="section-title">Due vs scheduled</h2>
+      <p class="flow-section-note">Due time alone does not establish claimability; FIFO ordering, leases, and policy limits may block a claim.</p>
+      #{render_bar_chart(rows)}
+    </section>
     """
   end
 
@@ -166,8 +173,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
           else: ""
 
       """
-      <section class="flow-timing-section" aria-label="Step timing">
-        <h2 class="section-title">Step Waterfall</h2>
+      <section class="flow-timing-section" aria-label="Event intervals">
+        <h2 class="section-title">Event intervals</h2>
         #{render_flow_step_waterfall(rows)}
         #{scope_note}
       </section>
@@ -192,7 +199,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
         bars =
           Enum.map_join(row.values, "\n", fn {label, value, class} ->
             value = numeric_metric_value(value)
-            width = max(2, round(value / max_value * 100))
+            width = if value > 0, do: max(2, round(value / max_value * 100)), else: 0
 
             """
             <div class="chart-bar-line">
@@ -223,9 +230,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
     <div class="flow-step-waterfall">
       <div class="flow-step-waterfall-scroll">
         <div class="flow-step-waterfall-header">
-          <span>Step</span>
+          <span>Event</span>
           <span class="flow-step-waterfall-axis">#{axis_html}</span>
-          <span>Elapsed</span>
+          <span>To next event</span>
         </div>
         <div class="flow-step-waterfall-rows">
           #{row_html}
@@ -383,16 +390,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
   defp flow_timeline_duration_label(%{duration_ms: duration}) when is_integer(duration),
     do: format_duration_ms(duration)
 
-  defp flow_timeline_duration_label(%{has_end_event: false}), do: "No end event"
+  defp flow_timeline_duration_label(%{has_end_event: false}), do: "No next event"
   defp flow_timeline_duration_label(_row), do: "Unavailable"
 
   def flow_timeline_bar_class(row) do
     fields = row.fields
+    label = flow_history_event_label(fields)
+    state = fields |> flow_history_current_state() |> String.downcase()
 
     cond do
+      label in ["Retry", "Failed"] or state == "failed" -> "bar-red"
       flow_history_terminal_event?(fields) -> "bar-green"
-      flow_history_event_label(fields) == "Retry" -> "bar-red"
-      flow_history_event_label(fields) == "Failed" -> "bar-red"
       true -> "bar-blue"
     end
   end
@@ -417,7 +425,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
       format_timestamp_ms_or_dash(row.time_ms),
       flow_history_event_label(row.fields),
       flow_history_state_move(row),
-      "duration #{flow_timeline_duration_label(row)}"
+      "to next event: #{flow_timeline_duration_label(row)}"
     ]
     |> Enum.reject(&(&1 in ["", "-"]))
     |> Enum.join(" · ")

@@ -3,9 +3,10 @@
 <body>
 <div class="layout">
 <%= render_sidebar_static("flow_query") %>
-<main class="main-content">
+<main class="main-content" id="dashboard-main" tabindex="-1">
 <%= render_subpage_header("Flow Query Studio") %>
 <div class="content">
+<%= FerricstoreServer.Health.Dashboard.Render.FlowOverview.render_flow_scope_contract(data) %>
 <div class="flow-query-workspace">
   <section class="flow-query-input" aria-label="Query input">
     <%= render_flow_query_controls(data) %>

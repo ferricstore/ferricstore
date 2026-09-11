@@ -3083,6 +3083,8 @@ defmodule Ferricstore.Flow.ScheduleTest do
           },
           created_at_ms: now_ms,
           next_run_at_ms: now_ms,
+          initial_run_at_ms: now_ms,
+          start_at_ms: now_ms,
           fire_count: 0,
           every_ms: 100,
           catchup_policy: :fire_once,

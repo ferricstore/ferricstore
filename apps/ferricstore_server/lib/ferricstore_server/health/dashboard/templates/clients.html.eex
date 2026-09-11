@@ -1,14 +1,15 @@
 <% data = assigns.data %>
-<%= page_head("Client List - FerricStore", 5) %>
-<body data-dashboard-live-page="clients" data-dashboard-live-url="/dashboard/api/clients" data-dashboard-live-interval-ms="5000">
+<% live? = get_in(data, [:client_coverage, :status]) not in [:invalid_filters, :expired_cursor] %>
+<%= page_head("Client List - FerricStore", if(live?, do: 5, else: nil)) %>
+<body<%= if live?, do: ~s( data-dashboard-live-page="clients" data-dashboard-live-url="#{escape_attr(clients_live_url(data))}" data-dashboard-live-interval-ms="5000"), else: "" %>>
 <div class="layout">
 <%= render_sidebar_static("clients") %>
-<main class="main-content">
+<main class="main-content" id="dashboard-main" tabindex="-1">
 <%= render_subpage_header("Client List") %>
 <div class="content">
 <%= render_page_intro("Clients", "See active native protocol connections, authenticated user metadata, connection flags, and blocked client pressure.") %>
 <%= render_live_component("clients_summary", render_clients_summary(data.connections, data.clients)) %>
-<%= render_live_component("clients_table", render_clients_table(data.clients)) %>
+<%= render_live_component("clients_table", render_clients_page_table(data)) %>
 </div>
 </main>
 </div>

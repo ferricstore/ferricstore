@@ -30,6 +30,21 @@ async function check(name, fn) {
   }
 }
 try {
+  await check('running state retains logical FIFO policy and lanes through refresh', async page => {
+    await page.goto(base + '/dashboard/flow/states?type=invoice_dispatch&state=running');
+    const table = page.locator('[data-live-component="flow_states_table"]');
+    assert.ok((await table.innerText()).includes('FIFO'));
+    assert.ok(!(await table.innerText()).includes('parallel'));
+    assert.equal(await page.locator('.flow-fifo-table tbody tr').count(), 2);
+    const liveUrl = await page.locator('body').getAttribute('data-dashboard-live-url');
+    const refreshed = page.waitForResponse(response => response.url() === new URL(liveUrl, base).href);
+    const payload = await (await refreshed).json();
+    assert.ok(payload.components.flow_states_table.includes('>FIFO<'));
+    assert.ok(!payload.components.flow_states_table.includes('parallel'));
+    assert.ok(payload.components.flow_fifo_lanes.includes('customer-1042'));
+    assert.ok(payload.components.flow_fifo_lanes.includes('customer-2048'));
+  });
+
   await check('overview stays compact and Inspect lane preserves all three scope fields', async page => {
     await page.goto(base + '/dashboard/flow/states?type=invoice_dispatch');
     assert.equal(await page.locator('.flow-fifo-table tbody tr').count(), 3);

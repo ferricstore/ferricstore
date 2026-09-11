@@ -3,7 +3,7 @@
 <body>
   <div class="layout">
     <%= render_sidebar_static("flow_schedules") %>
-    <main class="main-content">
+    <main class="main-content" id="dashboard-main" tabindex="-1">
       <%= render_subpage_header("FerricFlow Schedules") %>
       <div class="content">
         <%= render_page_intro("FerricFlow Schedules", "Inspect durable schedules, pause/resume active campaigns, manually fire a schedule, and delete schedules that should no longer run.") %>

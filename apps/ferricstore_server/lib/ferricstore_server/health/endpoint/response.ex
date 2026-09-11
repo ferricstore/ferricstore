@@ -67,6 +67,12 @@ defmodule FerricstoreServer.Health.Endpoint.Response do
     send_response(socket, transport, status_code, status_text, "text/plain; charset=utf-8", body)
   end
 
+  def send_asset_response(socket, transport, content_type, body) do
+    send_response(socket, transport, 200, "OK", content_type, body, [
+      {"Cache-Control", "public, max-age=31536000, immutable"}
+    ])
+  end
+
   @spec send_live_json_response(:inet.socket(), module(), map()) :: :ok
   def send_live_json_response(socket, transport, payload) when is_map(payload) do
     {payload, csrf_header} = Session.protect_live_payload(payload)
@@ -130,7 +136,16 @@ defmodule FerricstoreServer.Health.Endpoint.Response do
     status_text = validate_header_value!(status_text)
     content_type = validate_header_value!(content_type)
     content_length = byte_size(body)
-    headers = encode_http_headers(security_headers(content_type) ++ extra_headers)
+
+    overrides =
+      MapSet.new(Enum.map(extra_headers, fn {name, _value} -> String.downcase(name) end))
+
+    base_headers =
+      Enum.reject(security_headers(content_type), fn {name, _} ->
+        MapSet.member?(overrides, String.downcase(name))
+      end)
+
+    headers = encode_http_headers(base_headers ++ extra_headers)
 
     response =
       "HTTP/1.1 #{status_code} #{status_text}\r\n" <>

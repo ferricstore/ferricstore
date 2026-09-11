@@ -15,6 +15,22 @@ defmodule Ferricstore.Flow.Governance.CircuitStore do
   @max_error_class_bytes 256
   @max_error_class_input_bytes 262_144
   @max_exact_integer 9_007_199_254_740_991
+  @review_fields Map.keys(Map.from_struct(%Circuit{}))
+
+  @doc false
+  def review_fingerprint(circuit) when is_map(circuit) do
+    circuit |> Map.take(@review_fields) |> fingerprint()
+  end
+
+  @doc false
+  def missing_review_fingerprint(scope), do: fingerprint({:missing_circuit, scope})
+
+  defp fingerprint(value) do
+    value
+    |> :erlang.term_to_binary([:deterministic])
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.url_encode64(padding: false)
+  end
 
   def open(ctx, scope, opts \\ [])
 
@@ -27,11 +43,12 @@ defmodule Ferricstore.Flow.Governance.CircuitStore do
         AtomicRecord.mutate(
           ctx,
           key,
-          &decode/1,
+          &decode_manual_review/1,
           &encode/1,
-          fn -> {:ok, Circuit.new(scope, rule_opts)} end,
-          fn circuit ->
-            with :ok <- validate_mutation_time(circuit, now_ms) do
+          fn -> {:ok, {Circuit.new(scope, rule_opts), :missing}} end,
+          fn {circuit, existence} ->
+            with :ok <- validate_manual_review(circuit, existence, opts),
+                 :ok <- validate_mutation_time(circuit, now_ms) do
               opened =
                 circuit
                 |> Circuit.configure(rule_opts)
@@ -62,11 +79,12 @@ defmodule Ferricstore.Flow.Governance.CircuitStore do
         AtomicRecord.mutate(
           ctx,
           key,
-          &decode/1,
+          &decode_manual_review/1,
           &encode/1,
-          fn -> {:ok, Circuit.new(scope, failure_threshold: 1, open_ms: 30_000)} end,
-          fn circuit ->
-            with :ok <- validate_mutation_time(circuit, now_ms) do
+          fn -> {:ok, {Circuit.new(scope, failure_threshold: 1, open_ms: 30_000), :missing}} end,
+          fn {circuit, existence} ->
+            with :ok <- validate_manual_review(circuit, existence, opts),
+                 :ok <- validate_mutation_time(circuit, now_ms) do
               closed = Circuit.record_manual_close(circuit, now_ms)
               {:ok, closed, public(closed)}
             end
@@ -371,6 +389,29 @@ defmodule Ferricstore.Flow.Governance.CircuitStore do
   defp acquire_result({:deny, denial}), do: {:error, denial}
 
   defp configure(%Circuit{} = circuit, opts), do: Circuit.configure(circuit, opts)
+
+  defp decode_manual_review(value) do
+    with {:ok, circuit} <- decode(value), do: {:ok, {circuit, :existing}}
+  end
+
+  # Re-evaluate the reviewed snapshot on every CAS retry, including missing-record creation.
+  defp validate_manual_review(circuit, existence, opts) do
+    case Keyword.fetch(opts, :expected_review) do
+      :error ->
+        :ok
+
+      {:ok, expected} ->
+        actual =
+          if existence == :missing,
+            do: missing_review_fingerprint(circuit.scope),
+            else: review_fingerprint(circuit)
+
+        if is_binary(expected) and expected == actual,
+          do: :ok,
+          else:
+            {:error, "ERR circuit changed since review; review the circuit again before retrying"}
+    end
+  end
 
   defp validate_mutation_time(%Circuit{updated_at_ms: nil}, _now_ms), do: :ok
 

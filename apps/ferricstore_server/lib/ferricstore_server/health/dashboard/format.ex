@@ -107,15 +107,21 @@ defmodule FerricstoreServer.Health.Dashboard.Format do
 
   def format_timestamp_us(timestamp_us) do
     timestamp_us
-    |> div(1_000_000)
-    |> DateTime.from_unix!()
-    |> Calendar.strftime("%Y-%m-%d %H:%M:%S")
+    |> DateTime.from_unix!(:microsecond)
+    |> readable_utc_timestamp()
   end
 
   def format_timestamp_ms(timestamp_ms) do
     timestamp_ms
     |> DateTime.from_unix!(:millisecond)
-    |> Calendar.strftime("%Y-%m-%d %H:%M:%S")
+    |> readable_utc_timestamp()
+  end
+
+  defp readable_utc_timestamp(datetime) do
+    datetime
+    |> DateTime.to_iso8601()
+    |> String.replace("T", " ")
+    |> String.replace_suffix("Z", " UTC")
   end
 
   def format_timestamp_ms_or_dash(timestamp_ms)
@@ -131,7 +137,9 @@ defmodule FerricstoreServer.Health.Dashboard.Format do
       when is_integer(timestamp_ms) and timestamp_ms > 0 do
     timestamp_ms
     |> DateTime.from_unix!(:millisecond)
-    |> Calendar.strftime("%H:%M:%S")
+    |> readable_utc_timestamp()
+    |> String.split(" ", parts: 2)
+    |> List.last()
   rescue
     _ -> "-"
   end
@@ -167,10 +175,10 @@ defmodule FerricstoreServer.Health.Dashboard.Format do
     message
   end
 
-  def info_icon(text) do
+  def info_icon(text, label \\ "Metric help") do
     attr = escape_attr(text)
 
-    ~s(<span class="info-icon" tabindex="0" role="img" aria-label="#{attr}" data-tooltip="#{attr}" title="#{attr}">i</span>)
+    ~s(<button type="button" class="info-icon" aria-label="#{escape_attr(label)}" data-tooltip="#{attr}" title="#{attr}">i</button>)
   end
 
   def escape(str) when is_binary(str) do

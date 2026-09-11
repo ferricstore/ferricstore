@@ -6,11 +6,33 @@ defmodule FerricstoreServer.Health.Dashboard.DoctorSupport do
 
   alias Ferricstore.Commands.Server, as: ServerCommands
 
+  def collect_page(opts \\ %{}, command \\ &doctor_command/1) do
+    check = command.(["CHECK"])
+    jobs = command.(["LIST"])
+
+    %{
+      check: check,
+      jobs: Map.get(jobs, "jobs", []),
+      jobs_result: jobs,
+      flash: doctor_flash(opts),
+      command_reference: doctor_command_reference()
+    }
+  end
+
   def doctor_command(args) do
     case ServerCommands.handle("FERRICSTORE.DOCTOR", args, doctor_command_store()) do
-      %{} = result -> result
-      {:error, reason} -> %{"status" => "error", "error" => reason, "checks" => []}
-      other -> %{"status" => "error", "error" => inspect(other), "checks" => []}
+      %{} = result ->
+        result
+
+      {:error, reason} ->
+        %{
+          "status" => "error",
+          "error" => if(is_binary(reason), do: reason, else: inspect(reason)),
+          "checks" => []
+        }
+
+      other ->
+        %{"status" => "error", "error" => inspect(other), "checks" => []}
     end
   rescue
     exception ->
@@ -26,16 +48,16 @@ defmodule FerricstoreServer.Health.Dashboard.DoctorSupport do
     _ -> %{}
   end
 
+  def normalize_doctor_form_result(%{"error" => error}) when is_binary(error),
+    do: {:error, error}
+
   def normalize_doctor_form_result(%{"job_id" => job_id, "status" => status}) do
-    {:ok, "doctor job #{job_id} is #{status}"}
+    {:ok, "doctor job #{job_id}; status at submission: #{status}"}
   end
 
   def normalize_doctor_form_result(%{"status" => status}) when is_binary(status) do
     {:ok, "doctor action returned #{status}"}
   end
-
-  def normalize_doctor_form_result(%{"error" => error}) when is_binary(error),
-    do: {:error, error}
 
   def normalize_doctor_form_result(other), do: {:error, inspect(other)}
 

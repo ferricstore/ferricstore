@@ -496,10 +496,17 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
                    ~s(type="text" name="username" value="managed-security-user" autocomplete="username" hidden)
 
           assert html =~ ~s(<td><div class="mono acl-rule-summary")
-          assert html =~ ".acl-rule-summary {"
-          assert html =~ "overflow-wrap: anywhere"
-          assert html =~ "max-height: 10rem"
-          assert html =~ "overflow: auto"
+          assert html =~ FerricstoreServer.Health.Dashboard.Assets.path(:css)
+
+          assert {:ok, "text/css; charset=utf-8", css} =
+                   FerricstoreServer.Health.Dashboard.Assets.fetch(
+                     FerricstoreServer.Health.Dashboard.Assets.path(:css)
+                   )
+
+          assert css =~ ".acl-rule-summary {"
+          assert css =~ "overflow-wrap: anywhere"
+          assert css =~ "max-height: 10rem"
+          assert css =~ "overflow: auto"
           refute html =~ "very-secret-password"
           refute html =~ FerricstoreServer.Acl.get_user("tenant-a-security").password
         end

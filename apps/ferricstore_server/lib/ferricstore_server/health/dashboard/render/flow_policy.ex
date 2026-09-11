@@ -1,131 +1,180 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
   import FerricstoreServer.Health.Dashboard.Format
   import FerricstoreServer.Health.Dashboard.Render.Admin, only: [render_config_command_table: 2]
+  alias FerricstoreServer.Health.Dashboard.Flow.PolicyEditor
+  alias FerricstoreServer.Health.Dashboard.Render.DurationInput
 
   @flow_dashboard_policy_state_preview_limit 6
 
-  def flow_policy_editor_data(type) do
-    type = flow_policy_clean_form_value(type || "")
+  defdelegate flow_policy_editor_data(type), to: PolicyEditor, as: :load
 
-    policy =
-      case type do
-        "" ->
-          flow_policy_default_response(type)
-
-        _ ->
-          case FerricStore.flow_policy_get(type) do
-            {:ok, policy} when is_map(policy) -> policy
-            _ -> flow_policy_default_response(type)
-          end
-      end
-
-    retry = Map.get(policy, :retry, Ferricstore.Flow.RetryPolicy.default())
-    backoff = flow_policy_field(retry, :backoff, Ferricstore.Flow.RetryPolicy.default().backoff)
-    retention = Map.get(policy, :retention, Ferricstore.Flow.RetryPolicy.default_retention())
-
-    indexed_attributes =
-      policy |> Map.get(:indexed_attributes, []) |> flow_policy_indexed_attributes_string()
-
-    %{
-      type: type,
-      state: "",
-      mode: :parallel,
-      indexed_attributes: indexed_attributes,
-      indexed_state_meta: flow_policy_field(policy, :indexed_state_meta, "") || "",
-      max_retries: flow_policy_field(retry, :max_retries, 3),
-      backoff_kind: flow_policy_field(backoff, :kind, :exponential),
-      base_ms: flow_policy_field(backoff, :base_ms, 1_000),
-      max_ms: flow_policy_field(backoff, :max_ms, 30_000),
-      jitter_pct: flow_policy_field(backoff, :jitter_pct, 20),
-      exhausted_to: flow_policy_field(retry, :exhausted_to, "failed"),
-      max_active_ms: flow_policy_field(policy, :max_active_ms, nil) || "",
-      retention_ttl_ms: flow_policy_field(retention, :ttl_ms, 604_800_000),
-      history_max_events: flow_policy_field(retention, :history_max_events, 100_000)
-    }
-  end
-
-  def flow_policy_clean_form_value(value) when is_binary(value), do: String.trim(value)
-  def flow_policy_clean_form_value(value), do: value |> to_string() |> String.trim()
+  def flow_policy_clean_form_value(value) when is_binary(value), do: value
+  def flow_policy_clean_form_value(value), do: to_string(value)
 
   def render_flow_policy_editor(data) do
-    editor = Map.get(data, :editor, flow_policy_editor_data(""))
+    editor = Map.get(data, :editor, PolicyEditor.empty())
     flash = render_flow_policy_flash(Map.get(data, :flash))
+
+    content =
+      cond do
+        get_in(data, [:action_capabilities, :save]) == false ->
+          flash <>
+            ~s(<p class="flow-section-note">Saving this scope requires +FLOW.POLICY.SET and write access to its workflow type.</p>)
+
+        Map.get(editor, :load_error, false) ->
+          ~s(<div class="flow-alert flow-alert-error" role="alert">Policy could not be loaded. Retry loading the selected scope before editing.</div>)
+
+        editor.type == "" ->
+          flash
+
+        true ->
+          render_loaded_policy_editor(editor, flash)
+      end
+
+    """
+    <section id="flow-policy-editor" aria-label="Policy editor">
+      <form class="flow-search flow-policy-scope" method="get" action="/dashboard/flow/policies#flow-policy-editor" aria-label="Policy scope">
+        <label class="flow-policy-field"><span>Workflow type</span><input class="flow-search-input mono" type="text" name="edit" value="#{escape_attr(editor.type)}" required autocomplete="off"></label>
+        <label class="flow-policy-field"><span>State</span><input class="flow-search-input mono" type="text" name="edit_state" value="#{escape_attr(editor.state)}" placeholder="Type defaults" autocomplete="off"></label>
+        <button class="flow-search-button" type="submit">Load policy</button>
+      </form>
+      #{content}
+    </section>
+    """
+  end
+
+  defp render_loaded_policy_editor(editor, flash) do
     indexed_attributes = Map.get(editor, :indexed_attributes) || ""
     indexed_state_meta = Map.get(editor, :indexed_state_meta) || ""
     max_active_ms = Map.get(editor, :max_active_ms) || ""
 
     """
-    <div id="flow-policy-editor" class="flow-policy-panel">
-      <div class="section-title">Create / Update Policy #{info_icon("Policies affect new Flow work and retry scheduling. Existing Flow records keep their durable state.")}</div>
+    <div class="flow-policy-panel">
+      <h2 class="section-title">Create / Update Policy #{info_icon("Policies affect new Flow work and retry scheduling. Existing Flow records keep their durable state.", "About policy changes")}</h2>
       #{flash}
-      <form class="flow-policy-form" action="/dashboard/flow/policies" method="post">
+      #{render_policy_type_scope_note(editor)}
+      <form class="flow-policy-form" action="/dashboard/flow/policies" method="post" data-policy-editor data-policy-draft="#{Map.get(editor, :dirty, false)}" data-dashboard-single-submit>
+        <input type="hidden" name="expected_generation" value="#{escape_attr(to_string(editor.expected_generation))}">
+        <fieldset class="flow-management-group"><legend>Scope</legend>
         <div class="flow-policy-grid">
           <label class="flow-policy-field">
             <span>Type</span>
-            <input class="flow-search-input mono" type="text" name="type" value="#{escape_attr(editor.type)}" autocomplete="off" required title="Flow type this policy applies to">
+            <input class="flow-search-input mono" type="text" name="type" value="#{escape_attr(editor.type)}" readonly required title="Loaded Flow type">
           </label>
           <label class="flow-policy-field">
             <span>State override</span>
-            <input class="flow-search-input mono" type="text" name="state" value="#{escape_attr(editor.state)}" autocomplete="off" placeholder="optional" title="Optional state-specific override for this type">
+            <input class="flow-search-input mono" type="text" name="state" value="#{escape_attr(editor.state)}" readonly placeholder="Type defaults" title="Loaded state override">
           </label>
           <label class="flow-policy-field">
             <span>State mode</span>
-            #{render_flow_policy_mode_select(Map.get(editor, :mode, :parallel))}
+            #{render_flow_policy_mode_select(Map.get(editor, :mode, :parallel), editor.state == "")}
+            #{if editor.state == "", do: "<small>Available on a state override.</small>", else: ""}
           </label>
+        </div></fieldset>
+        <fieldset class="flow-management-group"><legend>Indexing</legend>
+        <div class="flow-policy-grid">
           <label class="flow-policy-field">
             <span>Indexed attrs</span>
-            <input class="flow-search-input mono" type="text" name="indexed_attributes" value="#{escape_attr(indexed_attributes)}" autocomplete="off" placeholder="tenant, region" title="Comma-separated type-level indexed attributes used by FLOW.QUERY">
+            <input class="flow-search-input mono" type="text" name="indexed_attributes" value="#{escape_attr(indexed_attributes)}" autocomplete="off" placeholder="tenant, region" title="Comma-separated type-level indexed attributes used by FLOW.QUERY"#{if editor.state != "", do: " disabled", else: ""}>
           </label>
           <label class="flow-policy-field">
             <span>Indexed state meta</span>
-            <input class="flow-search-input mono" type="text" name="indexed_state_meta" value="#{escape_attr(indexed_state_meta)}" autocomplete="off" placeholder="risk_tier" title="Optional type-level state metadata key used by FLOW.QUERY">
+            <input class="flow-search-input mono" type="text" name="indexed_state_meta" value="#{escape_attr(indexed_state_meta)}" autocomplete="off" placeholder="risk_tier" title="Optional type-level state metadata key used by FLOW.QUERY"#{if editor.state != "", do: " disabled", else: ""}>
           </label>
+        </div></fieldset>
+        <fieldset class="flow-management-group"><legend>Retry</legend>
+        <div class="flow-policy-grid">
           <label class="flow-policy-field">
             <span>Max retries</span>
-            <input class="flow-search-input mono" type="number" name="max_retries" min="0" value="#{editor.max_retries}" required title="Maximum FLOW.RETRY attempts before the workflow is exhausted">
+            <input class="flow-search-input mono" type="#{numeric_input_type(editor.max_retries)}" name="max_retries" min="0" value="#{escape_attr(to_string(editor.max_retries))}" required title="Maximum FLOW.RETRY attempts before the workflow is exhausted" aria-describedby="policy-max_retries-error">
+            #{numeric_error("max_retries")}
           </label>
           <label class="flow-policy-field">
             <span>Backoff</span>
             #{render_flow_policy_backoff_select(editor.backoff_kind)}
           </label>
-          <label class="flow-policy-field">
-            <span>Base ms</span>
-            <input class="flow-search-input mono" type="number" name="base_ms" min="0" value="#{editor.base_ms}" required title="Initial retry delay in milliseconds">
-          </label>
-          <label class="flow-policy-field">
-            <span>Max ms</span>
-            <input class="flow-search-input mono" type="number" name="max_ms" min="0" value="#{editor.max_ms}" required title="Maximum retry delay in milliseconds">
-          </label>
+          <div class="flow-policy-field">
+            <span id="policy-base-ms-label">Initial delay</span>
+            <div class="flow-duration-control">
+            <input class="flow-search-input mono" type="text" inputmode="decimal" name="base_ms" data-duration-min="0" value="#{escape_attr(to_string(editor.base_ms))}" required title="Initial retry delay" aria-labelledby="policy-base-ms-label" aria-describedby="policy-base_ms-error">
+            #{DurationInput.units("base_ms", Map.get(editor, :base_ms_unit, "milliseconds"))}
+            </div>
+            #{numeric_error("base_ms")}
+          </div>
+          <div class="flow-policy-field">
+            <span id="policy-max-ms-label">Maximum delay</span>
+            <div class="flow-duration-control">
+            <input class="flow-search-input mono" type="text" inputmode="decimal" name="max_ms" data-duration-min="0" value="#{escape_attr(to_string(editor.max_ms))}" required title="Maximum retry delay" aria-labelledby="policy-max-ms-label" aria-describedby="policy-max_ms-error">
+            #{DurationInput.units("max_ms", Map.get(editor, :max_ms_unit, "milliseconds"))}
+            </div>
+            #{numeric_error("max_ms")}
+          </div>
           <label class="flow-policy-field">
             <span>Jitter %</span>
-            <input class="flow-search-input mono" type="number" name="jitter_pct" min="0" max="100" value="#{editor.jitter_pct}" required title="Randomized retry delay percentage to avoid synchronized retries">
+            <input class="flow-search-input mono" type="#{numeric_input_type(editor.jitter_pct)}" name="jitter_pct" min="0" max="100" value="#{escape_attr(to_string(editor.jitter_pct))}" required title="Randomized retry delay percentage to avoid synchronized retries" aria-describedby="policy-jitter_pct-error">
+            #{numeric_error("jitter_pct")}
           </label>
           <label class="flow-policy-field">
             <span>Exhausted to</span>
             <input class="flow-search-input mono" type="text" name="exhausted_to" value="#{escape_attr(editor.exhausted_to)}" autocomplete="off" required title="Terminal state used when retry attempts are exhausted">
           </label>
-          <label class="flow-policy-field">
-            <span>Max active ms</span>
-            <input class="flow-search-input mono" type="number" name="max_active_ms" min="1" max="31536000000" value="#{escape_attr(to_string(max_active_ms))}" placeholder="unlimited" title="Maximum runtime for new active Flow records; leave blank for unlimited">
-          </label>
-          <label class="flow-policy-field">
-            <span>Retention ttl ms</span>
-            <input class="flow-search-input mono" type="number" name="retention_ttl_ms" min="1" value="#{editor.retention_ttl_ms}" required title="How long terminal state, history, and generated values are retained">
-          </label>
+        </div></fieldset>
+        <fieldset class="flow-management-group"><legend>Retention</legend>
+        <div class="flow-policy-grid">
+          <div class="flow-policy-field">
+            <span id="policy-max-active-label">Maximum active duration</span>
+            <div class="flow-duration-control">
+            <input class="flow-search-input mono" type="text" inputmode="decimal" name="max_active_ms" data-duration-min="1" data-duration-max="31536000000" value="#{escape_attr(to_string(max_active_ms))}" placeholder="unlimited" title="Type-wide maximum runtime for new active Flow records; leave blank for unlimited" aria-labelledby="policy-max-active-label" aria-describedby="policy-max_active_ms-error"#{if editor.state != "", do: " disabled", else: ""}>
+            #{DurationInput.units("max_active_ms", Map.get(editor, :max_active_ms_unit, "milliseconds"), editor.state != "")}
+            </div>
+            #{numeric_error("max_active_ms")}
+          </div>
+          <div class="flow-policy-field">
+            <span id="policy-retention-label">Terminal retention</span>
+            <div class="flow-duration-control">
+            <input class="flow-search-input mono" type="text" inputmode="decimal" name="retention_ttl_ms" data-duration-min="1" value="#{escape_attr(to_string(editor.retention_ttl_ms))}" required title="How long terminal state, history, and generated values are retained" aria-labelledby="policy-retention-label" aria-describedby="policy-retention_ttl_ms-error">
+            #{DurationInput.units("retention_ttl_ms", Map.get(editor, :retention_ttl_ms_unit, "milliseconds"))}
+            </div>
+            #{numeric_error("retention_ttl_ms")}
+          </div>
           <label class="flow-policy-field">
             <span>Max history</span>
-            <input class="flow-search-input mono" type="number" name="history_max_events" min="1" value="#{editor.history_max_events}" required title="Maximum durable history events retained before cleanup can trim old events">
+            <input class="flow-search-input mono" type="#{numeric_input_type(editor.history_max_events)}" name="history_max_events" min="1" value="#{escape_attr(to_string(editor.history_max_events))}" required title="Maximum durable history events retained before cleanup can trim old events" aria-describedby="policy-history_max_events-error">
+            #{numeric_error("history_max_events")}
           </label>
-        </div>
+        </div></fieldset>
         #{render_flow_policy_preview(editor)}
+        <p class="flow-field-error" data-policy-scope-status role="status" hidden>Selection changed. Load policy before saving.</p>
+        <p class="flow-section-note" data-policy-dirty-status role="status" hidden>Unsaved changes</p>
         <div class="flow-policy-actions">
           <button class="flow-search-button" type="submit" title="Save this Flow policy">Save Policy</button>
+          <a class="flow-link" data-discard-draft href="#{escape_attr(flow_policy_edit_url(editor.type, editor.state))}">Discard changes</a>
         </div>
       </form>
+      #{FerricstoreServer.Health.Dashboard.Render.FlowFormScripts.duration_script()}
       #{FerricstoreServer.Health.Dashboard.Render.FlowFormScripts.policy_script()}
     </div>
     """
   end
+
+  defp render_policy_type_scope_note(%{state: ""}), do: ""
+
+  defp render_policy_type_scope_note(editor) do
+    url = "/dashboard/flow/policies?" <> URI.encode_query(%{"edit" => editor.type})
+
+    ~s(<p class="flow-section-note">Type-wide settings are unchanged by this state override. <a class="flow-link" href="#{escape_attr(url)}#flow-policy-editor">Edit type defaults</a> for indexes or maximum active duration.</p>)
+  end
+
+  defp numeric_input_type(value) do
+    case Integer.parse(to_string(value)) do
+      {_integer, ""} -> "number"
+      _ when value == "" -> "number"
+      _ -> "text"
+    end
+  end
+
+  defp numeric_error(name),
+    do: ~s(<small class="flow-field-error" id="policy-#{name}-error" hidden></small>)
 
   def render_flow_policy_flash(%{kind: :ok, message: message, type: type}) do
     suffix = if type in [nil, ""], do: "", else: " for #{type}"
@@ -133,12 +182,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
   end
 
   def render_flow_policy_flash(%{kind: :error, message: message}) do
-    ~s(<div class="flow-alert flow-alert-error">#{escape(message)}</div>)
+    ~s(<div class="flow-alert flow-alert-error" id="flow-policy-error" role="alert">#{escape(message)}. Your draft has been retained.</div>)
   end
 
   def render_flow_policy_flash(_flash), do: ""
 
-  def render_flow_policy_preview(_editor) do
+  def render_flow_policy_preview(editor) do
+    max_active_scope =
+      if Map.get(editor, :state, "") == "",
+        do: " for each new Flow record of this type.",
+        else: "."
+
     """
     <div class="flow-policy-preview" style="display: none;">
       <div class="flow-policy-preview-title">Review before saving</div>
@@ -146,7 +200,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
       <div>State mode: <span class="mono" data-policy-preview="mode"></span>. FIFO requires every entering Flow to carry a partition key and rejects priority.</div>
       <div>Indexes: <span class="mono" data-policy-preview="indexes"></span></div>
       <div>Retry: <span data-policy-preview="retry"></span></div>
-      <div>Type-level max active: <span class="mono" data-policy-preview="max-active"></span> for each new Flow record of this type.</div>
+      <div>Type-level max active: <span class="mono" data-policy-preview="max-active"></span>#{max_active_scope}</div>
       <div>Retention: <span data-policy-preview="retention"></span></div>
       <div class="flow-filter-note">Requires +FLOW.POLICY.SET. The save operation writes durable policy config; active Flow records keep their current state.</div>
     </div>
@@ -162,10 +216,12 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
         ~s(<option value="#{kind}"#{selected}>#{String.capitalize(kind)}</option>)
       end)
 
-    ~s(<select class="flow-search-input" name="backoff_kind" title="Retry delay strategy">#{options}</select>)
+    invalid = invalid_selection(current, ~w(none fixed linear exponential))
+
+    ~s(<select class="flow-search-input" name="backoff_kind" title="Retry delay strategy">#{invalid}#{options}</select>)
   end
 
-  def render_flow_policy_mode_select(current) do
+  def render_flow_policy_mode_select(current, disabled \\ false) do
     current = current |> to_string() |> String.downcase()
 
     [
@@ -177,8 +233,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
       ~s(<option value="#{mode}"#{selected}>#{label}</option>)
     end)
     |> then(fn options ->
-      ~s(<select class="flow-search-input" name="mode" title="State-level scheduling mode. FIFO applies only when State override is set.">#{options}</select>)
+      invalid = invalid_selection(current, ~w(parallel fifo))
+
+      ~s(<select class="flow-search-input" name="mode" title="State-level scheduling mode. FIFO applies only when State override is set."#{if disabled, do: " disabled", else: ""}>#{invalid}#{options}</select>)
     end)
+  end
+
+  defp invalid_selection(current, allowed) do
+    if current in allowed,
+      do: "",
+      else:
+        ~s(<option value="#{escape_attr(current)}" selected>Invalid selection: #{escape(current)}</option>)
   end
 
   def render_flow_policy_commands do
@@ -237,7 +302,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
         [] ->
           """
           <tr>
-            <td colspan="10" class="c-muted">No Flow types or policy overrides found in the current sample.</td>
+            <td colspan="11" class="c-muted">No Flow types or policy overrides found in the current sample.</td>
           </tr>
           """
 
@@ -248,13 +313,15 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
     scan_note = render_flow_policy_scan_note(policy_scan)
 
     """
-    <div class="section-title">Current Flow Policies <span class="badge badge-idle">#{format_number(length(policies))}</span></div>
+    <h2 class="section-title">Current Flow Policies <span class="badge badge-idle">#{format_number(length(policies))} loaded</span></h2>
     #{scan_note}
-    <div class="table-scroll" role="region" aria-label="Current workflow policies" tabindex="0"><table>
+    #{FerricstoreServer.Health.Dashboard.Render.TableFilter.controls("flow-policy-catalog", "Filter loaded policies")}
+    <div class="table-scroll" role="region" aria-label="Current workflow policies" tabindex="0"><table id="flow-policy-catalog" class="flow-policy-table">
       <thead>
         <tr>
           <th>Type</th>
           <th>Source</th>
+          <th>Generation</th>
           <th>Indexes</th>
           <th>Retries</th>
           <th>Backoff</th>
@@ -304,7 +371,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
     <tr>
       <td class="mono">#{escape(row.type)}</td>
       <td><span class="badge badge-pressure">error</span></td>
-      <td colspan="8" class="c-red">#{escape(error)}</td>
+      <td colspan="9" class="c-red">#{escape(error)}</td>
     </tr>
     """
   end
@@ -315,49 +382,85 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
 
     """
     <tr>
-      <td class="mono">#{escape(row.type)}</td>
+      <td class="mono"><a class="flow-link" href="#{escape_attr(flow_policy_edit_url(row.type))}" title="Edit policy for #{escape_attr(row.type)}">#{escape(row.type)}</a></td>
       <td><span class="badge #{flow_policy_source_class(row.source)}">#{escape(row.source)}</span></td>
+      <td class="mono">#{escape(to_string(Map.get(row, :generation, "unavailable")))}</td>
       <td>#{render_flow_policy_indexes(row)}</td>
       <td>#{format_number(flow_policy_field(retry, :max_retries, 0))}</td>
       <td>#{escape(flow_policy_backoff_summary(flow_policy_field(retry, :backoff, %{})))}</td>
       <td class="mono">#{escape(to_string(flow_policy_field(retry, :exhausted_to, "failed")))}</td>
       <td>#{escape(flow_policy_max_active_summary(Map.get(row, :max_active_ms)))}</td>
       <td>#{escape(flow_policy_retention_summary(retention))}</td>
-      <td>#{render_flow_policy_state_overrides(Map.get(row, :states, []))}</td>
+      <td>#{render_flow_policy_state_overrides(Map.get(row, :states, []), row.type)}</td>
       <td><a class="flow-search-button flow-policy-action" href="#{flow_policy_edit_url(row.type)}">Edit</a></td>
     </tr>
     """
   end
 
-  def flow_policy_edit_url(type) do
-    "/dashboard/flow/policies?" <> URI.encode_query(%{"edit" => type}) <> "#flow-policy-editor"
+  def flow_policy_edit_url(type, state \\ "") do
+    "/dashboard/flow/policies?" <>
+      URI.encode_query(%{"edit" => type, "edit_state" => state}) <> "#flow-policy-editor"
   end
 
   def flow_policy_source_class("configured"), do: "badge-ok"
   def flow_policy_source_class(_source), do: "badge-idle"
 
-  def render_flow_policy_state_overrides([]), do: ~s(<span class="c-muted">-</span>)
+  def render_flow_policy_state_overrides(states, type \\ nil)
+  def render_flow_policy_state_overrides([], _type), do: ~s(<span class="c-muted">-</span>)
 
-  def render_flow_policy_state_overrides(states) do
+  def render_flow_policy_state_overrides(states, type) do
+    render_state = fn state ->
+      retry = Map.get(state, :retry, %{})
+      retention = Map.get(state, :retention, %{})
+      mode = Map.get(state, :mode, :parallel)
+
+      title =
+        "#{flow_policy_mode_label(mode)}, max retries #{flow_policy_field(retry, :max_retries, 0)}, " <>
+          flow_policy_retention_summary(retention)
+
+      label = "#{escape(state.state)} #{escape(flow_policy_mode_label(mode))}"
+
+      if is_binary(type) do
+        ~s(<a class="flow-pill" title="#{escape_attr(title)}" href="#{escape_attr(flow_policy_edit_url(type, state.state))}">#{label}</a>)
+      else
+        ~s(<span class="flow-pill" title="#{escape_attr(title)}">#{label}</span>)
+      end
+    end
+
     preview =
       states
       |> Enum.take(@flow_dashboard_policy_state_preview_limit)
-      |> Enum.map_join("", fn state ->
-        retry = Map.get(state, :retry, %{})
-        retention = Map.get(state, :retention, %{})
-        mode = Map.get(state, :mode, :parallel)
-
-        title =
-          "#{flow_policy_mode_label(mode)}, max retries #{flow_policy_field(retry, :max_retries, 0)}, " <>
-            flow_policy_retention_summary(retention)
-
-        ~s(<span class="flow-pill" title="#{escape_attr(title)}">#{escape(state.state)} #{escape(flow_policy_mode_label(mode))}</span>)
-      end)
+      |> Enum.map_join("", render_state)
 
     extra = length(states) - @flow_dashboard_policy_state_preview_limit
 
     if extra > 0 do
-      preview <> ~s(<span class="flow-pill">+#{format_number(extra)}</span>)
+      all =
+        Enum.map_join(states, "", fn state ->
+          ~s(<div data-policy-override-name="#{escape_attr(state.state)}">#{render_state.(state)}</div>)
+        end)
+
+      preview <>
+        """
+        <details class="flow-policy-overrides">
+          <summary>+#{format_number(extra)} more; all #{length(states)} overrides</summary>
+          <label class="flow-policy-field"><span>Find a state override</span><input class="flow-search-input" type="search" data-policy-override-search autocomplete="off"></label>
+          <div class="flow-policy-override-list">#{all}</div>
+          <p class="flow-section-note" data-policy-override-empty hidden>No matching state overrides.</p>
+        </details>
+        <script>
+        (() => {
+          const panel = document.currentScript.previousElementSibling;
+          const search = panel.querySelector('[data-policy-override-search]');
+          const rows = Array.from(panel.querySelectorAll('[data-policy-override-name]'));
+          search.addEventListener('input', () => {
+            const query = search.value.toLocaleLowerCase();
+            rows.forEach(row => { row.hidden = !row.dataset.policyOverrideName.toLocaleLowerCase().includes(query); });
+            panel.querySelector('[data-policy-override-empty]').hidden = rows.some(row => !row.hidden);
+          });
+        })();
+        </script>
+        """
     else
       preview
     end
@@ -436,26 +539,4 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
   end
 
   def flow_policy_field(_map, _key, default), do: default
-
-  defp flow_policy_default_response(type) do
-    %{
-      type: type,
-      max_active_ms: nil,
-      retry: Ferricstore.Flow.RetryPolicy.default(),
-      retention:
-        Ferricstore.Flow.RetryPolicy.default_retention()
-        |> Map.delete(:history_hot_max_events),
-      indexed_attributes: [],
-      indexed_state_meta: nil,
-      states: %{}
-    }
-  end
-
-  defp flow_policy_indexed_attributes_string(names) when is_list(names) do
-    names
-    |> Enum.reject(&(&1 in [nil, ""]))
-    |> Enum.map_join(", ", &to_string/1)
-  end
-
-  defp flow_policy_indexed_attributes_string(_names), do: ""
 end

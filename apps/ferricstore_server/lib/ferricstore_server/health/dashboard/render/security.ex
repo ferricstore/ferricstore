@@ -4,6 +4,26 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
   import FerricstoreServer.Health.Dashboard.Format
   import FerricstoreServer.Health.Dashboard.Render.Overview, only: [render_ops_summary: 2]
 
+  def render_acl_security(%{modifier_form_only?: true} = data) do
+    draft = Map.get(data, :account_draft, %{})
+    username = Map.get(draft, "username", "")
+
+    """
+    <section aria-labelledby="acl-modifier-recovery-title">
+      <h2 class="section-title" id="acl-modifier-recovery-title">ACL modifiers for <span class="mono">#{escape(username)}</span></h2>
+      #{render_modifier_action(username, draft, get_in(data, [:flash, :message]))}
+      <p class="flow-section-note">Nonsecret modifiers retained. Password modifiers were removed.</p>
+      <a class="flow-link" href="/dashboard/security">Back to security</a>
+    </section>
+    """
+  end
+
+  def render_acl_security(%{account_form_only?: true} = data) do
+    render_security_flash(data.flash) <>
+      render_account_management(data) <>
+      ~s(<a class="flow-link" href="/dashboard/security">Back to security</a>)
+  end
+
   def render_acl_security(data) when is_map(data) do
     """
     #{render_acl_security_summary(data)}
@@ -19,6 +39,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
     protected_mode = Map.get(data, :protected_mode, false)
     configured_users = Map.get(data, :configured_users, false)
     current_user = Map.get(data, :current_user) || "open"
+
+    can_mutate =
+      Map.get(data, :can_manage_users, false) or Map.get(data, :can_delete_users, false)
 
     render_ops_summary("ACL Security", [
       %{
@@ -42,9 +65,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
       },
       %{
         label: "Mutation Surface",
-        value: if(Map.get(data, :can_manage_users, false), do: "enabled", else: "read only"),
-        class: if(Map.get(data, :can_manage_users, false), do: "c-green", else: "c-muted"),
-        detail: "derived from ACL.SETUSER"
+        value: if(can_mutate, do: "enabled", else: "read only"),
+        class: if(can_mutate, do: "c-green", else: "c-muted"),
+        detail: "command-specific account permissions"
       }
     ])
   end
@@ -61,19 +84,22 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
 
   def render_account_management(data) do
     if Map.get(data, :can_manage_users, false) do
+      draft = Map.get(data, :account_draft, %{})
+      role = Map.get(draft, "role", "observer")
+
       """
       <section class="acl-management" aria-labelledby="acl-management-title">
         <div class="acl-management-heading">
           <div>
-            <div class="section-title" id="acl-management-title">Account management</div>
+            <h2 class="section-title" id="acl-management-title">Account management</h2>
             <p>Create a passworded ACL identity for dashboard or native access.</p>
           </div>
           <span class="badge badge-ok">ACL.SETUSER</span>
         </div>
-        <form class="acl-create-form" action="/dashboard/security/users" method="post">
+        <form class="acl-create-form" action="/dashboard/security/users" method="post" data-dashboard-single-submit data-acl-profile-form>
           <div class="acl-form-grid">
             <label>Username
-              <input class="flow-search-input mono" type="text" name="username" maxlength="1024" autocomplete="username" required placeholder="operations-reader">
+              <input class="flow-search-input mono" type="text" name="username" maxlength="1024" autocomplete="username" required placeholder="operations-reader" value="#{escape_attr(Map.get(draft, "username", ""))}">
             </label>
             <label>Password
               <input class="flow-search-input" type="password" name="password" minlength="12" maxlength="4096" autocomplete="new-password" required>
@@ -84,21 +110,26 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
           </div>
           <fieldset class="acl-role-selector">
             <legend>Access profile</legend>
-            <label><input type="radio" name="role" value="admin" checked><span><strong>Administrator</strong><small>All commands, keys, and channels</small></span></label>
-            <label><input type="radio" name="role" value="observer"><span><strong>Observer</strong><small>Read commands with scoped keys</small></span></label>
-            <label><input type="radio" name="role" value="custom"><span><strong>Custom</strong><small>Explicit ACL modifiers</small></span></label>
+            <label><input type="radio" name="role" value="admin"#{role_checked(role, "admin")}><span><strong>Administrator</strong><small>All commands, keys, and channels</small></span></label>
+            <label><input type="radio" name="role" value="observer"#{role_checked(role, "observer")}><span><strong>Observer</strong><small>Read commands with scoped keys</small></span></label>
+            <label><input type="radio" name="role" value="custom"#{role_checked(role, "custom")}><span><strong>Custom</strong><small>Explicit ACL modifiers</small></span></label>
           </fieldset>
-          <div class="acl-form-grid acl-scope-grid">
+          <fieldset class="acl-form-grid acl-scope-grid" data-acl-profile="observer"#{if role != "observer", do: " disabled hidden", else: ""}>
+            <legend>Observer scope</legend>
             <label>Observer key pattern
-              <input class="flow-search-input mono" type="text" name="key_pattern" maxlength="4096" value="*">
+              <input class="flow-search-input mono" type="text" name="key_pattern" maxlength="4096" value="#{escape_attr(Map.get(draft, "key_pattern", "*"))}">
             </label>
             <label>Observer channel pattern
-              <input class="flow-search-input mono" type="text" name="channel_pattern" maxlength="4096" value="*">
+              <input class="flow-search-input mono" type="text" name="channel_pattern" maxlength="4096" value="#{escape_attr(Map.get(draft, "channel_pattern", "*"))}">
             </label>
-          </div>
-          <label class="acl-modifier-field">Custom ACL modifiers <span>one modifier per line</span>
-            <textarea class="mono" name="modifiers" maxlength="6000" rows="4" placeholder="+GET&#10;%R~tenant-a:*&#10;&amp;tenant-a:*"></textarea>
-          </label>
+          </fieldset>
+          <fieldset data-acl-profile="custom"#{if role != "custom", do: " disabled hidden", else: ""}>
+            <legend>Custom access</legend>
+            <label class="acl-modifier-field">Custom ACL modifiers <span>one modifier per line</span>
+              <textarea class="mono" name="modifiers" maxlength="6000" rows="4" required placeholder="+GET&#10;%R~tenant-a:*&#10;&amp;tenant-a:*">#{escape(Map.get(draft, "modifiers", ""))}</textarea>
+            </label>
+          </fieldset>
+          <p class="flow-section-note" data-acl-profile-preview role="status">#{escape(profile_summary(role))}</p>
           <div class="acl-form-actions">
             <button class="flow-search-button acl-primary-button" type="submit">Create account</button>
           </div>
@@ -106,34 +137,87 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
       </section>
       """
     else
-      """
-      <section class="acl-readonly-panel" aria-label="Account management access">
-        <div><strong>Read-only access</strong><span>Account mutations require <code>+ACL.SETUSER</code>.</span></div>
-        <span class="badge badge-idle">ACL.LIST</span>
-      </section>
-      """
+      if Map.get(data, :can_delete_users, false) do
+        """
+        <section class="acl-readonly-panel" aria-label="Account deletion access">
+          <div><strong>Account deletion</strong><span>Create, state, password, and rule changes require <code>+ACL.SETUSER</code>.</span></div>
+          <span class="badge badge-idle">ACL.DELUSER</span>
+        </section>
+        """
+      else
+        prerequisite =
+          if Map.get(data, :current_user) == nil do
+            ~s(Use protected mode and an authenticated dashboard session to manage accounts. <a href="https://github.com/ferricstore/ferricstore/blob/main/guides/security.md#dashboard-bootstrap-and-login">Secure setup and login</a>)
+          else
+            ~s(Account mutations require <code>+ACL.SETUSER</code> or <code>+ACL.DELUSER</code>.)
+          end
+
+        """
+        <section class="acl-readonly-panel" aria-label="Account management access">
+          <div><strong>Read-only access</strong><span>#{prerequisite}</span></div>
+          <span class="badge badge-idle">ACL.LIST</span>
+        </section>
+        """
+      end
     end
   end
+
+  defp role_checked(role, role), do: " checked"
+  defp role_checked(_role, _option), do: ""
+
+  defp profile_summary("admin"),
+    do: "Administrator: all commands, keys, and channels. No scope restrictions."
+
+  defp profile_summary("custom"),
+    do: "Custom: only the explicit ACL modifiers below; no implicit read access."
+
+  defp profile_summary(_),
+    do: "Observer: read access within the selected key and channel patterns."
 
   def render_acl_tester(data) do
     tester = Map.get(data, :tester, %{})
     input = Map.get(tester, :input, %{})
+    errors = Map.get(tester, :errors, %{})
+
+    target_description =
+      if Map.has_key?(errors, :targets),
+        do: "acl-target-help acl-target-error",
+        else: "acl-target-help"
 
     """
-    <div class="section-title">ACL Tester</div>
-    <div class="flow-filter-panel">
-      <form class="flow-filter-form" action="/dashboard/security" method="get" aria-label="ACL tester">
-        <label>User <input class="flow-search-input mono" type="search" name="user" value="#{escape_attr(Map.get(input, :user, ""))}" autocomplete="off" placeholder="default"></label>
-        <label>Command <input class="flow-search-input mono" type="search" name="command" value="#{escape_attr(Map.get(input, :command, ""))}" autocomplete="off" placeholder="GET"></label>
+    <h2 class="section-title">ACL Tester</h2>
+    <div class="flow-filter-panel acl-tester-panel">
+      <p class="flow-filter-note" id="acl-target-help">Check an enabled account against one or more command, key, channel, or route targets.</p>
+      #{tester_field_error(errors, :targets, "acl-target-error")}
+      <form class="flow-filter-form acl-tester-form" action="/dashboard/security" method="get" aria-label="ACL tester" aria-describedby="#{target_description}">
+        <label>User <input class="flow-search-input mono" type="search" name="user" value="#{escape_attr(Map.get(input, :user, ""))}" autocomplete="off" placeholder="default"#{tester_error_attributes(errors, :user, "acl-user-error")}>#{tester_field_error(errors, :user, "acl-user-error")}</label>
+        <label>Command <input class="flow-search-input mono" type="search" name="command" value="#{escape_attr(Map.get(input, :command, ""))}" autocomplete="off" placeholder="GET"#{tester_error_attributes(errors, :command, "acl-command-error")}>#{tester_field_error(errors, :command, "acl-command-error")}</label>
         <label>Key <input class="flow-search-input mono" type="search" name="key" value="#{escape_attr(Map.get(input, :key, ""))}" autocomplete="off" placeholder="tenant:key"></label>
         <label>Key Access #{render_key_access_select(Map.get(input, :key_access, :read))}</label>
         <label>Channel <input class="flow-search-input mono" type="search" name="channel" value="#{escape_attr(Map.get(input, :channel, ""))}" autocomplete="off" placeholder="tenant:events"></label>
+        <label>HTTP method <select class="flow-search-input mono" name="route_method">#{Enum.map_join(["GET", "POST"], "", fn method -> ~s(<option value="#{method}"#{if Map.get(input, :route_method, "GET") == method, do: " selected", else: ""}>#{method}</option>) end)}</select></label>
         <label>Route <input class="flow-search-input mono" type="search" name="route_path" value="#{escape_attr(Map.get(input, :route_path, ""))}" autocomplete="off" placeholder="/dashboard/flow"></label>
         <button class="flow-search-button" type="submit">Check</button>
       </form>
     </div>
     #{render_acl_test_results(tester)}
     """
+  end
+
+  defp tester_error_attributes(errors, field, id) do
+    if Map.has_key?(errors, field),
+      do: ~s( aria-invalid="true" aria-describedby="#{id}"),
+      else: ""
+  end
+
+  defp tester_field_error(errors, field, id) do
+    case Map.get(errors, field) do
+      nil ->
+        ""
+
+      message ->
+        ~s(<span class="flow-field-error" id="#{id}" role="alert">#{escape(message)}</span>)
+    end
   end
 
   defp render_key_access_select(selected) do
@@ -216,7 +300,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
       end
 
     """
-    <div class="section-title">Accounts <span class="badge badge-idle">ACL.LIST</span></div>
+    <h2 class="section-title">Accounts <span class="badge badge-idle">ACL.LIST</span></h2>
     #{table_scroll("ACL account list", """
     <table>
       <thead><tr><th>User</th><th>State</th><th>Authentication</th><th>Access</th><th>Rule summary</th><th>Actions</th></tr></thead>
@@ -231,18 +315,18 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
 
   defp current_badge(_username, _current_user), do: ""
 
-  defp render_user_actions(_user, _current_user, false, _can_delete_users),
+  defp render_user_actions(_user, _current_user, false, false),
     do: ~s(<span class="c-muted">View only</span>)
 
-  defp render_user_actions(user, current_user, true, can_delete_users) do
+  defp render_user_actions(user, current_user, can_manage_users, can_delete_users) do
     username = Map.get(user, :username, "")
     state = Map.get(user, :state, "off")
 
     """
     <div class="acl-row-actions">
-      #{render_state_action(username, state, current_user)}
-      #{render_password_action(username)}
-      #{render_modifier_action(username)}
+      #{if can_manage_users, do: render_state_action(username, state, current_user), else: ""}
+      #{if can_manage_users, do: render_password_action(username), else: ""}
+      #{if can_manage_users, do: render_modifier_action(username), else: ""}
       #{render_delete_action(username, current_user, can_delete_users)}
     </div>
     """
@@ -259,7 +343,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
     label = if enabled, do: "Enable", else: "Disable"
 
     """
-    <form action="/dashboard/security/users/state" method="post">
+    <form action="/dashboard/security/users/state" method="post" data-dashboard-single-submit>
       <input type="hidden" name="username" value="#{escape_attr(username)}">
       <input type="hidden" name="enabled" value="#{enabled}">
       <button class="acl-text-button" type="submit">#{label}</button>
@@ -271,7 +355,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
     """
     <details class="acl-inline-editor">
       <summary>Reset password</summary>
-      <form action="/dashboard/security/users/password" method="post">
+      <form action="/dashboard/security/users/password" method="post" data-dashboard-single-submit>
         <input type="text" name="username" value="#{escape_attr(username)}" autocomplete="username" hidden>
         <label>New password<input type="password" name="password" minlength="12" maxlength="4096" autocomplete="new-password" required></label>
         <label>Confirm<input type="password" name="password_confirmation" minlength="12" maxlength="4096" autocomplete="new-password" required></label>
@@ -281,15 +365,18 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
     """
   end
 
-  defp render_modifier_action("default"), do: ""
+  defp render_modifier_action(username, draft \\ %{}, error \\ nil)
 
-  defp render_modifier_action(username) do
+  defp render_modifier_action("default", _draft, nil), do: ""
+
+  defp render_modifier_action(username, draft, error) do
     """
-    <details class="acl-inline-editor">
+    <details class="acl-inline-editor"#{if error, do: " open", else: ""}>
       <summary>ACL modifiers</summary>
-      <form action="/dashboard/security/users/rules" method="post">
+      <form action="/dashboard/security/users/rules" method="post" data-dashboard-single-submit#{if error, do: ~s( data-dashboard-returned-draft="true"), else: ""}>
         <input type="hidden" name="username" value="#{escape_attr(username)}">
-        <label>One per line<textarea class="mono" name="modifiers" maxlength="6000" rows="4" required></textarea></label>
+        <label>One per line<textarea class="mono" name="modifiers" maxlength="6000" rows="4" required#{if error, do: ~s( aria-invalid="true" aria-describedby="acl-modifiers-error"), else: ""}>#{escape(Map.get(draft, "modifiers", ""))}</textarea></label>
+        #{if error, do: ~s(<p class="flow-field-error" id="acl-modifiers-error" role="alert">#{escape(error)}</p>), else: ""}
         <button class="flow-search-button" type="submit">Apply</button>
       </form>
     </details>
@@ -304,7 +391,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
     """
     <details class="acl-inline-editor">
       <summary class="acl-delete-button">Delete</summary>
-      <form action="/dashboard/security/users/delete" method="post">
+      <form action="/dashboard/security/users/delete" method="post" data-dashboard-single-submit>
         <input type="hidden" name="username" value="#{escape_attr(username)}">
         <p>Delete <strong class="mono">#{escape(username)}</strong>? Existing sessions will stop immediately.</p>
         <button class="flow-search-button flow-danger-button" type="submit">Confirm delete</button>
@@ -330,7 +417,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
       end)
 
     """
-    <div class="section-title">Dashboard Route Requirements</div>
+    <h2 class="section-title">Dashboard Route Requirements</h2>
     #{table_scroll("Dashboard route requirements", """
     <table>
       <thead><tr><th>Page</th><th>Method</th><th>Path</th><th>Required ACL Command</th><th>Key Scope</th></tr></thead>

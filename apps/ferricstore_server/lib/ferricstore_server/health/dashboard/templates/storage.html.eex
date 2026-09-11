@@ -3,7 +3,7 @@
 <body data-dashboard-live-page="storage" data-dashboard-live-url="/dashboard/api/storage" data-dashboard-live-interval-ms="10000">
 <div class="layout">
 <%= render_sidebar_static("storage") %>
-<main class="main-content">
+<main class="main-content" id="dashboard-main" tabindex="-1">
 <%= render_subpage_header("Storage") %>
 <div class="content">
 <%= render_page_intro("Storage", "Inspect per-shard disk footprint, Bitcask/WARaft files, hint files, and storage skew.") %>

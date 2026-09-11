@@ -13,6 +13,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
 
   @flow_dashboard_sample_limit 400
   @flow_dashboard_recent_limit 40
+  @flow_dashboard_terminal_sample_limit 100
   @flow_dashboard_overview_recent_limit 10
   @flow_terminal_states ~w(completed failed cancelled)
 
@@ -27,6 +28,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
     records =
       visible_records
       |> filter_flow_records_by_partition(filters.partition_key)
+      |> filter_flow_records_by_type(filters.type)
 
     types = flow_type_summaries(records)
 
@@ -50,6 +52,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
     params = QueryDecoder.decode(query)
 
     []
+    |> maybe_put_query_opt(:type, normalize_flow_type_filter(Map.get(params, "type")))
     |> maybe_put_query_opt(
       :partition_key,
       normalize_flow_partition_query(Map.get(params, "partition_key"))
@@ -67,13 +70,33 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
   @spec collect_states_page(keyword()) :: map()
   def collect_states_page(opts \\ []) do
     filters = flow_state_filters_from_opts(opts)
+
+    if map_size(filters.errors) == 0 do
+      collect_valid_states_page(opts, filters)
+    else
+      %{
+        filters: filters,
+        states: [],
+        fifo_lanes: [],
+        records: [],
+        available_types: [],
+        available_states: maybe_include_flow_state([], filters.state),
+        total_sampled: 0,
+        filtered_sampled: 0,
+        sample_limit: @flow_dashboard_sample_limit,
+        limit: filters.limit
+      }
+    end
+  end
+
+  defp collect_valid_states_page(opts, filters) do
     acl_username = DashboardAccess.keyspace_acl_username(opts)
 
     records =
       collect_flow_records_sample_for_acl(@flow_dashboard_sample_limit, acl_username)
       |> filter_flow_records_by_partition(filters.partition_key)
 
-    terminal_records = collect_flow_states_terminal_records(filters)
+    {terminal_source_status, terminal_records} = collect_flow_states_terminal_records(filters)
 
     type_records =
       records
@@ -84,10 +107,24 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
 
     filtered_records = filter_flow_records(type_records, filters)
     fifo_records = filter_flow_records_for_fifo_lanes(type_records, filters)
+    fifo = Fifo.lane_snapshot(fifo_records, type_records)
+
+    source_status =
+      cond do
+        terminal_source_status in [:ok, :not_requested] -> :ok
+        type_records == [] -> :unavailable
+        true -> :partial
+      end
 
     %{
-      states: filtered_records |> flow_state_summaries() |> Fifo.annotate_state_summaries(),
-      fifo_lanes: Fifo.lane_summaries(fifo_records),
+      source_status: source_status,
+      terminal_source_status: terminal_source_status,
+      states:
+        filtered_records
+        |> FerricstoreServer.Health.Dashboard.Flow.Sample.state_summaries(filters.sort)
+        |> Fifo.annotate_state_summaries(fifo.policies),
+      fifo_lanes: fifo.lanes,
+      fifo_coverage: fifo.coverage,
       records: flow_recent_records(filtered_records, filters.limit),
       available_types: flow_available_types(type_records ++ records),
       available_states:
@@ -102,7 +139,12 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
       limit: filters.limit,
       total_sampled: length(type_records),
       filtered_sampled: length(filtered_records),
-      sample_limit: max(@flow_dashboard_sample_limit, length(type_records))
+      sample_limit:
+        @flow_dashboard_sample_limit +
+          if(terminal_source_status == :not_requested,
+            do: 0,
+            else: @flow_dashboard_terminal_sample_limit
+          )
     }
   end
 
@@ -119,15 +161,17 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
     )
     |> maybe_put_query_opt(:q, normalize_flow_name_filter(Map.get(params, "q")))
     |> maybe_put_query_opt(:range, normalize_flow_range_filter(Map.get(params, "range")))
+    |> maybe_put_query_opt(:time_mode, Map.get(params, "time_mode"))
+    |> maybe_put_query_opt(:sort, Map.get(params, "sort"))
     |> maybe_put_query_opt(
       :from_ms,
-      parse_flow_time_filter(
+      parse_state_time_query(
         Map.get(params, "from_ms") || Map.get(params, "from") || Map.get(params, "from_at")
       )
     )
     |> maybe_put_query_opt(
       :to_ms,
-      parse_flow_time_filter(
+      parse_state_time_query(
         Map.get(params, "to_ms") || Map.get(params, "to") || Map.get(params, "to_at")
       )
     )
@@ -136,6 +180,15 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
   end
 
   def states_opts_from_query(_query), do: []
+
+  defp parse_state_time_query(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      value -> parse_flow_time_filter(value) || value
+    end
+  end
+
+  defp parse_state_time_query(_value), do: nil
 
   @spec states_page_filters(map()) :: map()
   def states_page_filters(data) when is_map(data) do
@@ -159,12 +212,35 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
   def collect_workers_page(opts \\ []) do
     acl_username = DashboardAccess.keyspace_acl_username(opts)
 
-    records = collect_flow_records_sample_for_acl(@flow_dashboard_sample_limit, acl_username)
+    filters =
+      scope_filters(opts)
+      |> Map.put(:worker, normalize_flow_name_filter(Keyword.get(opts, :worker)))
+      |> Map.put(
+        :sort,
+        FerricstoreServer.Health.Dashboard.Flow.Sample.normalize_summary_sort(
+          Keyword.get(opts, :sort)
+        )
+      )
+
+    records =
+      collect_flow_records_sample_for_acl(@flow_dashboard_sample_limit, acl_username)
+      |> filter_flow_records_by_type(filters.type)
+      |> filter_flow_records_by_partition(filters.partition_key)
+
+    fifo = Fifo.lane_snapshot(records)
 
     %{
-      workers: flow_worker_summaries(records),
-      running_records: Enum.filter(records, &(flow_record_state(&1) == "running")),
-      fifo_lanes: Fifo.lane_summaries(records),
+      filters: filters,
+      workers:
+        FerricstoreServer.Health.Dashboard.Flow.Sample.worker_summaries(records, filters.sort),
+      running_records:
+        Enum.filter(
+          records,
+          &(flow_record_state(&1) == "running" and
+              (is_nil(filters.worker) or (flow_record_worker(&1) || "unknown") == filters.worker))
+        ),
+      fifo_lanes: fifo.lanes,
+      fifo_coverage: fifo.coverage,
       total_sampled: length(records),
       sample_limit: @flow_dashboard_sample_limit
     }
@@ -173,17 +249,78 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
   @spec collect_due_page(keyword()) :: map()
   def collect_due_page(opts \\ []) do
     acl_username = DashboardAccess.keyspace_acl_username(opts)
+    filters = scope_filters(opts)
 
-    records = collect_flow_records_sample_for_acl(@flow_dashboard_sample_limit, acl_username)
+    records =
+      collect_flow_records_sample_for_acl(@flow_dashboard_sample_limit, acl_username)
+      |> filter_flow_records_by_type(filters.type)
+      |> filter_flow_records_by_partition(filters.partition_key)
+
+    generated_at_ms = System.system_time(:millisecond)
+    fifo = Fifo.lane_snapshot(records)
+    fifo_lanes = fifo.lanes
+
+    blockers =
+      Map.new(fifo_lanes, fn lane ->
+        {{lane.type, lane.state, lane.partition_key}, lane.blocked_by_id}
+      end)
+
+    records =
+      Enum.map(records, fn record ->
+        key =
+          {flow_record_type(record), flow_record_logical_state(record),
+           flow_record_partition_key(record)}
+
+        record
+        |> Map.put(:dashboard_snapshot_ms, generated_at_ms)
+        |> Map.put(:dashboard_fifo_blocker, Map.get(blockers, key))
+      end)
 
     %{
-      due_now: Enum.filter(records, &flow_due_now?/1),
-      scheduled: records |> Enum.filter(&flow_scheduled_future?/1) |> flow_recent_records(80),
-      fifo_lanes: Fifo.lane_summaries(records),
+      filters: filters,
+      due_now: records |> Enum.filter(&flow_due_now?/1) |> sort_scheduled_records(),
+      scheduled:
+        records
+        |> Enum.filter(&flow_scheduled_future?/1)
+        |> sort_scheduled_records()
+        |> Enum.take(80),
+      fifo_lanes: fifo_lanes,
+      fifo_coverage: fifo.coverage,
+      generated_at_ms: generated_at_ms,
       total_sampled: length(records),
       sample_limit: @flow_dashboard_sample_limit
     }
   end
+
+  def scope_opts_from_query(query) do
+    params = QueryDecoder.decode(query || "")
+
+    query
+    |> states_opts_from_query()
+    |> Keyword.take([:type, :partition_key, :sort])
+    |> maybe_put_query_opt(:worker, normalize_flow_name_filter(Map.get(params, "worker")))
+  end
+
+  defp sort_scheduled_records(records),
+    do:
+      Enum.sort_by(
+        records,
+        &{flow_record_run_at_ms(&1), flow_record_id(&1), flow_record_partition_key(&1)}
+      )
+
+  def scope_live_url(route, data) do
+    query =
+      data
+      |> Map.get(:filters, %{})
+      |> Map.take([:type, :partition_key, :worker, :sort])
+      |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
+      |> URI.encode_query()
+
+    "/dashboard/api/flow/" <> route <> if(query == "", do: "", else: "?" <> query)
+  end
+
+  defp scope_filters(opts),
+    do: opts |> flow_state_filters_from_opts() |> Map.take([:type, :partition_key])
 
   defp filter_flow_records_for_fifo_lanes(records, filters) when is_map(filters) do
     records
@@ -193,6 +330,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
   end
 
   defp filter_flow_fifo_records_by_logical_state(records, nil), do: records
+
+  defp filter_flow_fifo_records_by_logical_state(records, "running"),
+    do: Enum.filter(records, &(flow_record_state(&1) == "running"))
 
   defp filter_flow_fifo_records_by_logical_state(records, state) when is_binary(state) do
     Enum.filter(records, &(flow_record_logical_state(&1) == state))
@@ -214,16 +354,25 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
     type = Map.get(filters, :type)
 
     if is_nil(terminal_state) or not is_binary(filters.partition_key) or not is_binary(type) do
-      []
+      {:not_requested, []}
     else
-      flow_fetch_terminal_records(
-        [type],
-        terminal_state,
-        filters.limit,
-        filters.partition_key,
-        filters.from_ms,
-        filters.to_ms
-      )
+      case flow_dashboard_terminal_records(
+             type,
+             terminal_state,
+             @flow_dashboard_terminal_sample_limit,
+             filters.partition_key,
+             filters.from_ms,
+             filters.to_ms
+           ) do
+        {:ok, records} ->
+          {:ok, flow_recent_records(records, @flow_dashboard_terminal_sample_limit)}
+
+        {:error, :timeout} ->
+          {:timeout, []}
+
+        {:error, _reason} ->
+          {:error, []}
+      end
     end
   end
 
@@ -232,54 +381,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
 
   defp flow_states_terminal_fetch_state(%{state: nil, type: type})
        when is_binary(type) and type != "",
-       do: "any"
+       do: :any
 
   defp flow_states_terminal_fetch_state(_filters), do: nil
-
-  defp flow_fetch_terminal_records(
-         types,
-         terminal_state,
-         limit,
-         partition_key,
-         from_ms,
-         to_ms
-       )
-       when limit > 0 do
-    types
-    |> Enum.reduce_while({[], limit}, fn type, {acc, remaining} ->
-      if remaining <= 0 do
-        {:halt, {acc, 0}}
-      else
-        records =
-          case flow_dashboard_terminal_records(
-                 type,
-                 terminal_state,
-                 remaining,
-                 partition_key,
-                 from_ms,
-                 to_ms
-               ) do
-            {:ok, records} -> records
-            {:error, _reason} -> []
-          end
-
-        {:cont, {prepend_flow_dashboard_chunk(records, acc), max(remaining - length(records), 0)}}
-      end
-    end)
-    |> elem(0)
-    |> flatten_flow_dashboard_chunks()
-    |> flow_recent_records(limit)
-  end
-
-  defp flow_fetch_terminal_records(
-         _types,
-         _terminal_state,
-         _limit,
-         _partition_key,
-         _from_ms,
-         _to_ms
-       ),
-       do: []
 
   defp flow_dashboard_terminal_records(
          type,

@@ -224,8 +224,8 @@ defmodule FerricstoreServer.Health.Dashboard do
           clients: [Types.client_data()],
           connections: Types.connections_data()
         }
-  def collect_clients_page do
-    Operational.collect_clients_page()
+  def collect_clients_page(opts \\ []) do
+    Operational.collect_clients_page(opts)
   end
 
   @doc """
@@ -275,15 +275,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
   @spec collect_doctor_page(map() | keyword()) :: map()
   def collect_doctor_page(opts \\ %{}) do
-    check = doctor_command(["CHECK"])
-    jobs = doctor_command(["LIST"])
-
-    %{
-      check: check,
-      jobs: Map.get(jobs, "jobs", []),
-      flash: doctor_flash(opts),
-      command_reference: doctor_command_reference()
-    }
+    FerricstoreServer.Health.Dashboard.DoctorSupport.collect_page(opts)
   end
 
   @doc """
@@ -579,8 +571,9 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc """
   Builds a live component payload for dashboard API paths.
   """
-  @spec live_payload(binary()) :: {:ok, map()} | :not_found
-  @spec live_payload(binary(), keyword() | map()) :: {:ok, map()} | :not_found
+  @spec live_payload(binary()) :: {:ok, map()} | {:error, :invalid_filters, binary()} | :not_found
+  @spec live_payload(binary(), keyword() | map()) ::
+          {:ok, map()} | {:error, :invalid_filters, binary()} | :not_found
   def live_payload(path), do: LivePayload.live_payload(path)
   def live_payload(path, opts), do: LivePayload.live_payload(path, opts)
 
@@ -806,6 +799,9 @@ defmodule FerricstoreServer.Health.Dashboard do
   def render_flow_detail_page(data) do
     render_template(Templates.flow_detail(%{data: data}))
   end
+
+  def render_flow_action_error_page(data),
+    do: render_template(Templates.flow_action_error(%{data: data}))
 
   @spec render_template(binary()) :: binary()
   defp render_template(html), do: String.trim_leading(html)

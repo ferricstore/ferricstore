@@ -69,6 +69,7 @@ defmodule FerricstoreServer.Health.Endpoint.Login do
 
   def render_page(next, error) do
     safe_next = sanitize_next(next)
+    protected? = Acl.protected_mode?()
 
     form_html =
       """
@@ -84,19 +85,45 @@ defmodule FerricstoreServer.Health.Endpoint.Login do
 
     AccessPage.render(%{
       title: "FerricStore Dashboard Login",
-      kicker: "Protected mode",
+      kicker: if(protected?, do: "Protected mode on", else: "Protected mode off"),
       heading: "Sign in to the control plane",
       copy:
-        "Use a FerricStore ACL account. Every dashboard page keeps that account's command and key boundaries.",
+        if(protected?,
+          do:
+            "Use a FerricStore ACL account. Every dashboard page keeps that account's command and key boundaries.",
+          else:
+            "Protected mode is off. Dashboard requests use open access; signing in does not enable ACL enforcement."
+        ),
       error: error,
       form_html: form_html,
-      context_heading: "Access follows the live ACL policy.",
-      context_items: [
-        {"Identity", "FerricStore ACL"},
-        {"Transport", "Local or HTTPS"},
-        {"Session", "Signed and revocable"}
-      ],
-      footer_items: ["ACL-scoped access", "Revoked when credentials or rules change"]
+      context_status: if(protected?, do: "Protected access", else: "Open access"),
+      context_warning: not protected?,
+      context_heading:
+        if(protected?,
+          do: "Access follows the live ACL policy.",
+          else: "Protected mode is disabled."
+        ),
+      context_items:
+        if(protected?,
+          do: [
+            {"Identity", "FerricStore ACL"},
+            {"Transport", "Local or HTTPS"},
+            {"Session", "Signed and revocable"}
+          ],
+          else: [
+            {"Dashboard", "Open access"},
+            {"Protected mode", "off"},
+            {"Transport", "Restrictions still apply"}
+          ]
+        ),
+      footer_items:
+        if(protected?,
+          do: ["ACL-scoped access", "Revoked when credentials or rules change"],
+          else: [
+            "Signing in does not enable protected mode",
+            "Transport restrictions still apply"
+          ]
+        )
     })
   end
 

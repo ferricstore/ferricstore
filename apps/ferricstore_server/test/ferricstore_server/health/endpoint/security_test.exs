@@ -68,7 +68,7 @@ defmodule FerricstoreServer.Health.Endpoint.SecurityTest do
     assert response_header(response, "set-cookie") =~ "Max-Age=0"
   end
 
-  test "live dashboard component forms retain the request CSRF token" do
+  test "stable workflow action forms retain CSRF while live updates only replace evidence" do
     id = "csrf-live-flow-#{System.unique_integer([:positive])}"
 
     assert :ok =
@@ -81,16 +81,43 @@ defmodule FerricstoreServer.Health.Endpoint.SecurityTest do
     page_response = http_request("GET", "/dashboard/flow/#{id}", "", [])
     token = csrf_token(page_response)
     cookie = response_cookie(page_response, "ferricstore_dashboard_csrf")
+    assert status_code(page_response) == 200
+    assert is_binary(token)
+    assert is_binary(cookie)
+
+    page = response_body(page_response)
+    [_, actions] = Regex.run(~r/<section id="workflow-actions"[^>]*>(.*?)<\/section>/s, page)
+    refute actions =~ "data-live-component"
+
+    for marker <- ["data-flow-rewind-form", "data-flow-signal-form"] do
+      [form] = Regex.run(Regex.compile!("<form[^>]*#{marker}[^>]*>.*?</form>", "s"), actions)
+      assert form =~ ~s(method="post")
+      assert form =~ ~s(name="_csrf_token" value="#{token}")
+    end
+
+    [_, reviewed_version] = Regex.run(~r/data-flow-action-snapshot-version="([^"]+)"/, actions)
 
     api_response =
       http_request("GET", "/dashboard/api/flow/#{id}", "", [{"Cookie", cookie}])
 
     assert status_code(api_response) == 200
     assert {:ok, payload} = api_response |> response_body() |> Jason.decode()
-    component = payload["components"]["flow_detail"]
+    assert is_binary(payload["components"]["flow_detail"])
+    refute Map.has_key?(payload["components"], "workflow-actions")
+    refute Map.has_key?(payload["components"], "flow_actions")
 
-    assert component =~ ~s(method="post")
-    assert component =~ ~s(name="_csrf_token" value="#{token}")
+    for {_name, component} <- payload["components"] do
+      refute component =~ "data-flow-rewind-form"
+      refute component =~ "data-flow-signal-form"
+    end
+
+    assert payload["action_snapshot"] == %{
+             "available" => true,
+             "state" => "queued",
+             "version" => reviewed_version
+           }
+
+    assert response_cookie(api_response, "ferricstore_dashboard_csrf") == cookie
   end
 
   test "dashboard POST rejects a mismatched Origin even with a valid token" do

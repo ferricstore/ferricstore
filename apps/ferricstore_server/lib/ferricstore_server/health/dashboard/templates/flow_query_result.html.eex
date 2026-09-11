@@ -1,13 +1,15 @@
 <% data = assigns.data %>
 <% result = data.result %>
-<div class="section-title">Result <span class="badge badge-idle"><%= escape(flow_query_result_command(result)) %></span>
+<h2 class="section-title">Result <span class="badge badge-idle"><%= escape(flow_query_result_command(result)) %></span>
 <%= if Map.get(result, :status) == :ok do %>
 <span class="flow-query-result-count"><%= escape(Map.get(result, :message, "")) %></span>
 <% end %>
-</div>
+</h2>
 <%= if Map.get(result, :status) != :ok, do: render_flow_query_status(result) %>
 <%= render_flow_query_provenance(data) %>
+<%= FerricstoreServer.Health.Dashboard.Render.FlowQueryHelp.render_empty_recovery(data) %>
 <%= render_flow_query_table(result) %>
+<%= FerricstoreServer.Health.Dashboard.Render.FlowQueryExport.render(result) %>
 <%= render_flow_query_continuation(result) %>
 <%= render_flow_query_metadata(result) %>
 <%= render_flow_query_visualization(result) %>

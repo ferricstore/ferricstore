@@ -1,8 +1,24 @@
 <% data = assigns.data %>
 <% filters = flow_failures_page_filters(data) %>
+<% groups = Recovery.reclaim_groups(data) %>
+<%= if groups != [] do %>
+<div class="table-scroll" role="region" aria-label="Reclaim candidate groups" tabindex="0"><table>
+  <thead><tr><th>Type</th><th>Partition</th><th>Evidence</th><th>Action</th></tr></thead>
+  <tbody>
+  <%= for group <- groups do %>
+    <tr>
+      <td class="mono"><%= escape(group.type) %></td>
+      <td class="mono"><%= escape(group.partition_key || "No literal partition in evidence") %></td>
+      <td><%= group.count %> expired <%= if group.count == 1, do: "lease", else: "leases" %> shown</td>
+      <td><%= if group.can_prepare? do %><a class="flow-link" href="<%= escape_attr(Recovery.prepare_reclaim_path(group, filters)) %>">Prepare reclaim</a><% else %><span class="c-muted"><%= if group.partition_key, do: "Reclaim not authorized", else: "Exact partition required" %></span><% end %></td>
+    </tr>
+  <% end %>
+  </tbody>
+</table></div>
+<% end %>
 <div class="flow-policy-panel">
-  <div class="section-title">Recovery Actions <%= info_icon("Reclaim only takes expired running leases through FLOW.RECLAIM. Failed terminal flows are listed for triage; retry/rewind stays on the Flow detail page.") %></div>
-  <form class="flow-policy-form" action="/dashboard/flow/failures" method="post" data-dashboard-single-submit aria-describedby="flow-reclaim-scope-note">
+  <h2 class="section-title">Recovery Actions <%= info_icon("Reclaim only takes expired running leases through FLOW.RECLAIM. Failed terminal flows are listed for triage; rewind stays on the Flow detail page.") %></h2>
+  <form id="flow-reclaim-form" class="flow-policy-form" action="/dashboard/flow/failures" method="post" data-dashboard-single-submit aria-describedby="flow-reclaim-scope-note">
     <input type="hidden" name="action" value="reclaim">
     <input type="hidden" name="return_q" value="<%= escape_attr(filters.q || "") %>">
     <input type="hidden" name="return_limit" value="<%= filters.limit %>">
@@ -37,7 +53,7 @@
       <button class="flow-search-button flow-danger-button" type="submit">Reclaim expired leases</button>
     </div>
     <div id="flow-reclaim-scope-note" class="flow-filter-note<%= if filters.q, do: " c-yellow", else: "" %>">
-      <%= if filters.q do %>Search text narrows this evidence only. <% end %>Reclaim uses the Type and Partition above, up to Limit; a blank Partition applies across partitions. Terminal failed flows are retried or rewound from the detail page. Requires +FLOW.RECLAIM.
+      <%= if filters.q do %>Search text narrows this evidence only. <% end %>Reclaim uses the exact Type and Partition above, up to Limit, and may include leases outside the shown evidence. A blank Partition uses automatic partitions. Terminal failed flows can be rewound from the Flow detail page. Requires +FLOW.RECLAIM.
     </div>
   </form>
 </div>

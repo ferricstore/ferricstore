@@ -172,7 +172,8 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
             )
 
           assert_receive {:terminal_dashboard_query, query, params}
-          assert query =~ "LIMIT 25 RETURN RECORDS"
+          assert query =~ "LIMIT 100 RETURN RECORDS"
+          assert data.limit == 25
           assert params["partition_key"] == "tenant-cold-terminal"
           assert params["type"] == flow_type
           assert params["state"] == "completed"
@@ -333,10 +334,15 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           assert String.contains?(html, ~s(type="datetime-local"))
           assert String.contains?(html, ~s(title="Filter by workflow type;))
 
-          assert String.contains?(
-                   html,
-                   ~s(title="Quick ranges override From/To; select All time to use custom dates")
-                 )
+          assert html =~ ~s(name="time_mode")
+          assert html =~ ~s(value="custom" selected)
+          refute Regex.match?(~r/<select id="flow-state-range-filter"[^>]* disabled>/, html)
+          assert html =~ "range.disabled = mode.value"
+
+          for field <- ["from", "to"] do
+            [input] = Regex.run(~r/<input id="flow-state-#{field}-filter"[^>]*>/, html)
+            refute input =~ "disabled"
+          end
 
           assert String.contains?(html, ~s(title="Apply Flow state filters"))
           assert String.contains?(html, ~s(value="2026-05-25T12:30"))
@@ -421,7 +427,8 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           assert String.contains?(html, "lease deadline passed")
           assert String.contains?(html, "terminal failed")
           assert String.contains?(html, "attempts")
-          assert String.contains?(html, ~s(role="img"))
+          assert String.contains?(html, ~s(<button type="button" class="info-icon"))
+          assert String.contains?(html, ~s(aria-label="Metric help"))
 
           assert String.contains?(
                    html,
@@ -430,7 +437,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
 
           assert String.contains?(
                    html,
-                   ~s(data-tooltip="Updated quick ranges are sliding windows)
+                   ~s(data-tooltip="Relative mode uses a sliding updated-time window)
                  )
         end
 
@@ -746,7 +753,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           assert params["lineage_id"] == "root-1"
           assert data.result.command == "FLOW.QUERY"
           assert String.contains?(html, "Flow Lineage")
-          assert String.contains?(html, "Lineage Map")
+          assert String.contains?(html, "Relationship preview")
           assert String.contains?(html, "child-1")
           assert String.contains?(html, "order-1")
         end
@@ -805,7 +812,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           assert String.contains?(html, "FLOW.QUERY")
           assert String.contains?(html, "Workflow Type")
           assert String.contains?(html, "State")
-          assert String.contains?(html, "From UTC")
+          assert String.contains?(html, "Updated time from UTC")
           assert html =~ ~r/data-flow-query-field="id"[^>]*hidden/
           assert html =~ ~r/name="id"[^>]*disabled/
           assert String.contains?(html, "query-flow")
@@ -912,7 +919,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           assert String.contains?(html, "FLOW.QUERY")
           assert String.contains?(html, "Correlation ID")
           assert String.contains?(html, "Partition")
-          assert String.contains?(html, "From UTC")
+          assert String.contains?(html, "Updated time from UTC")
           assert html =~ ~r/data-flow-query-field="type"[^>]*hidden/
           assert html =~ ~r/name="type"[^>]*disabled/
           assert html =~ ~r/data-flow-query-field="state"[^>]*hidden/
@@ -927,7 +934,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
 
           assert String.contains?(html, "Projection Health")
           assert String.contains?(html, "LMDB")
-          assert String.contains?(html, "lagged")
+          assert String.contains?(html, "asynchronous")
           assert String.contains?(html, "Pending")
           refute String.contains?(html, "LMDB Mode")
           refute String.contains?(String.downcase(html), "mirror")
@@ -945,7 +952,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
               total_sampled: 0,
               sample_limit: 400,
               projection: %{
-                lmdb_projection: :lagged,
+                lmdb_projection: :asynchronous,
                 lmdb_flush_interval_ms: 1_000,
                 history_flush_interval_ms: 0,
                 metrics: [

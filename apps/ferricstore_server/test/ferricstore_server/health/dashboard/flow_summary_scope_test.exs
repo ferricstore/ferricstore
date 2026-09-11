@@ -107,7 +107,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowSummaryScopeTest do
   end
 
   defp active_count(html) do
-    [_, count] = Regex.run(~r/<dt>Active<\/dt>\s*<dd>(\d+)<\/dd>/, html)
+    [_, count] = Regex.run(~r/<dt>Active<\/dt>\s*<dd>(\d+)<span>/, html)
     String.to_integer(count)
   end
 end

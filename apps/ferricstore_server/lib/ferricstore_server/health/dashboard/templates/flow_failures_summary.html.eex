@@ -3,22 +3,18 @@
 <dl class="flow-failure-summary-ribbon" aria-label="Failure summary">
   <div>
     <dt>Failure candidates</dt>
-    <dd><%= format_number(Map.get(summary, :total, 0)) %></dd>
-    <span>sampled and projected</span>
+    <dd><%= format_number(Map.get(summary, :total, 0)) %><span>sampled and projected</span></dd>
   </div>
   <div>
     <dt>Failed</dt>
-    <dd class="c-red"><%= format_number(Map.get(summary, :failed, 0)) %></dd>
-    <span>terminal records</span>
+    <dd class="c-red"><%= format_number(Map.get(summary, :failed, 0)) %><span>terminal records</span></dd>
   </div>
   <div>
     <dt>Expired leases</dt>
-    <dd class="c-yellow"><%= format_number(Map.get(summary, :expired_leases, 0)) %></dd>
-    <span>fenced reclaim candidates</span>
+    <dd class="c-yellow"><%= format_number(Map.get(summary, :expired_leases, 0)) %><span>fenced reclaim candidates</span></dd>
   </div>
   <div>
     <dt>Maxed retries</dt>
-    <dd><%= format_number(Map.get(summary, :maxed, 0)) %></dd>
-    <span>attempt limit reached</span>
+    <dd><%= format_number(Map.get(summary, :maxed, 0)) %><span>attempt limit reached</span></dd>
   </div>
 </dl>

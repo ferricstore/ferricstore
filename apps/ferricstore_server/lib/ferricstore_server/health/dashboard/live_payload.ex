@@ -46,8 +46,9 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
     }
   end
 
-  @spec live_payload(binary()) :: {:ok, map()} | :not_found
-  @spec live_payload(binary(), keyword() | map()) :: {:ok, map()} | :not_found
+  @spec live_payload(binary()) :: {:ok, map()} | {:error, :invalid_filters, binary()} | :not_found
+  @spec live_payload(binary(), keyword() | map()) ::
+          {:ok, map()} | {:error, :invalid_filters, binary()} | :not_found
   def live_payload("keyspace", opts) do
     data = KV.collect_keyspace_page(opts)
 
@@ -78,8 +79,12 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
     live_flow_workers_payload(data)
   end
 
-  def live_payload("flow/workers?" <> _query, opts) do
-    data = Browse.collect_workers_page(DashboardAccess.flow_acl_opts(opts))
+  def live_payload("flow/workers?" <> query, opts) do
+    data =
+      Browse.collect_workers_page(
+        Keyword.merge(Browse.scope_opts_from_query(query), DashboardAccess.flow_acl_opts(opts))
+      )
+
     live_flow_workers_payload(data)
   end
 
@@ -88,8 +93,12 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
     live_flow_due_payload(data)
   end
 
-  def live_payload("flow/due?" <> _query, opts) do
-    data = Browse.collect_due_page(DashboardAccess.flow_acl_opts(opts))
+  def live_payload("flow/due?" <> query, opts) do
+    data =
+      Browse.collect_due_page(
+        Keyword.merge(Browse.scope_opts_from_query(query), DashboardAccess.flow_acl_opts(opts))
+      )
+
     live_flow_due_payload(data)
   end
 
@@ -130,11 +139,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
 
   def live_payload("slowlog") do
     data = Operational.collect_slowlog_page()
-
-    live_component_payload(%{
-      "slowlog_summary" => render_slowlog_summary(data.slowlog),
-      "slowlog_table" => render_slowlog_table(data.slowlog)
-    })
+    slowlog_payload(data)
   end
 
   def live_payload("merge") do
@@ -157,12 +162,11 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   end
 
   def live_payload("clients") do
-    data = Operational.collect_clients_page()
+    live_clients_payload([])
+  end
 
-    live_component_payload(%{
-      "clients_summary" => render_clients_summary(data.connections, data.clients),
-      "clients_table" => render_clients_table(data.clients)
-    })
+  def live_payload("clients?" <> query) do
+    live_clients_payload(QueryDecoder.decode(query))
   end
 
   def live_payload("storage") do
@@ -250,8 +254,8 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
     |> live_flow_workers_payload()
   end
 
-  def live_payload("flow/workers?" <> _query) do
-    Browse.collect_workers_page()
+  def live_payload("flow/workers?" <> query) do
+    Browse.collect_workers_page(Browse.scope_opts_from_query(query))
     |> live_flow_workers_payload()
   end
 
@@ -260,8 +264,8 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
     |> live_flow_due_payload()
   end
 
-  def live_payload("flow/due?" <> _query) do
-    Browse.collect_due_page()
+  def live_payload("flow/due?" <> query) do
+    Browse.collect_due_page(Browse.scope_opts_from_query(query))
     |> live_flow_due_payload()
   end
 
@@ -275,6 +279,31 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   def live_payload("flow/" <> encoded_id), do: live_flow_detail_payload(encoded_id, [])
   def live_payload(_path), do: :not_found
 
+  defp live_clients_payload(opts) do
+    data = Operational.collect_clients_page(opts)
+
+    case data.client_coverage.status do
+      :invalid_filters ->
+        {:error, :invalid_filters, "Search must be 256 characters or fewer; restart invalid pagination."}
+      _ ->
+        live_component_payload(%{
+          "clients_summary" => render_clients_summary(data.connections, data.clients),
+          "clients_table" => render_clients_page_table(data)
+        })
+    end
+  end
+
+  def slowlog_payload(%{slowlog_status: :unavailable}) do
+    {:error, :invalid_filters, "Slow Log collection failed. Last successful samples retained; retry to refresh."}
+  end
+
+  def slowlog_payload(data) do
+    live_component_payload(%{
+      "slowlog_summary" => render_slowlog_summary(slowlog_data(data)),
+      "slowlog_table" => render_slowlog_table(slowlog_data(data))
+    })
+  end
+
   defp live_flow_detail_payload(encoded_id, access_opts) do
     {id, opts} = decode_flow_detail_request(encoded_id)
 
@@ -285,29 +314,49 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
 
     data = Detail.collect_page(id, opts)
 
-    live_component_payload(%{
-      "flow_detail" => render_flow_detail(data),
-      "flow_detail_metadata" => render_flow_detail_metadata(data),
-      "flow_debug" => render_flow_debug(data),
-      "flow_history" =>
-        render_flow_history_timeline(
-          data.history,
-          data.history_status,
-          Map.get(data, :history_page)
-        ),
-      "flow_timeline_chart" => render_flow_timeline_chart(data.history)
-    })
+    if is_nil(data.record) do
+      {:ok, payload} =
+        live_component_payload(%{
+          "flow_detail" => render_flow_detail(data),
+          "flow_detail_metadata" => "",
+          "flow_debug" => "",
+          "flow_history" => "",
+          "flow_timeline_chart" => ""
+        })
+
+      {:ok,
+       payload
+       |> Map.put(:detail_unavailable, true)
+       |> Map.put(:action_snapshot, Detail.action_snapshot(data))}
+    else
+      {:ok, payload} =
+        live_component_payload(%{
+          "flow_detail" => render_flow_detail(data),
+          "flow_detail_metadata" => render_flow_detail_metadata(data),
+          "flow_debug" => render_flow_debug(data),
+          "flow_history" =>
+            render_flow_history_timeline(
+              data.history,
+              data.history_status,
+              Map.get(data, :history_page)
+            ),
+          "flow_timeline_chart" => render_flow_timeline_chart(data.history)
+        })
+
+      {:ok, Map.put(payload, :action_snapshot, Detail.action_snapshot(data))}
+    end
   end
 
   defp live_flow_workers_payload(data) do
     live_component_payload(%{
       "flow_workers_chart" => render_flow_workers_chart(data.workers),
-      "flow_workers" => render_flow_workers(data.workers),
+      "flow_workers" => render_flow_workers(data.workers, Map.get(data, :filters, %{})),
       "flow_fifo_lanes" =>
         render_flow_fifo_lanes(
           Map.get(data, :fifo_lanes, []),
           data.total_sampled,
-          data.sample_limit
+          data.sample_limit,
+          Map.get(data, :fifo_coverage, %{})
         ),
       "flow_running_records" =>
         render_flow_running_records(data.running_records, data.total_sampled, data.sample_limit)
@@ -321,7 +370,8 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
         render_flow_fifo_lanes(
           Map.get(data, :fifo_lanes, []),
           data.total_sampled,
-          data.sample_limit
+          data.sample_limit,
+          Map.get(data, :fifo_coverage, %{})
         ),
       "flow_due_now" =>
         render_flow_due_records("Due Now", data.due_now, data.total_sampled, data.sample_limit),
@@ -337,8 +387,8 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
 
   defp live_flow_value_payload(query, access_opts \\ []) do
     params = QueryDecoder.decode(query)
-    ref = params |> Map.get("ref", "") |> String.trim()
-    flow_id = params |> Map.get("flow", "") |> String.trim()
+    ref = Map.get(params, "ref", "")
+    flow_id = Map.get(params, "flow", "")
 
     cond do
       ref == "" ->
@@ -351,7 +401,13 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
         opts =
           query
           |> Detail.opts_from_query()
-          |> Keyword.take([:partition_key, :history_count, :history_before, :history_after])
+          |> Keyword.take([
+            :partition_key,
+            :history_count,
+            :history_before,
+            :history_after,
+            :history_event
+          ])
           |> Keyword.put(:values, false)
           |> Keyword.merge(DashboardAccess.flow_acl_opts(access_opts))
 
@@ -449,23 +505,40 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
       |> Keyword.merge(DashboardAccess.flow_acl_opts(opts))
       |> Browse.collect_states_page()
 
+    if map_size(Map.get(data.filters, :errors, %{})) > 0 do
+      {:error, :invalid_filters,
+       data.filters.errors |> Enum.sort() |> Enum.map_join(". ", &elem(&1, 1))}
+    else
+      live_valid_flow_states_payload(data)
+    end
+  end
+
+  defp live_valid_flow_states_payload(data) do
     live_component_payload(%{
-      "flow_states_chart" => render_flow_states_chart(data.states),
+      "flow_states_sources" => render_flow_states_sources(data),
+      "flow_states_chart" =>
+        if(Map.get(data, :source_status) == :unavailable,
+          do: "",
+          else: render_flow_states_chart(data.states)
+        ),
       "flow_states_table" =>
         render_flow_states_table(
           data.states,
           data.total_sampled,
           data.filtered_sampled,
           data.sample_limit,
-          data.filters
+          data.filters,
+          Map.get(data, :source_status, :ok)
         ),
       "flow_fifo_lanes" =>
         render_flow_fifo_lanes(
           Map.get(data, :fifo_lanes, []),
           data.total_sampled,
-          data.sample_limit
+          data.sample_limit,
+          Map.get(data, :fifo_coverage, %{})
         ),
-      "flow_recent_records" => render_flow_recent_records(data.records, data.limit)
+      "flow_recent_records" =>
+        render_flow_recent_records(data.records, data.limit, Map.get(data, :source_status, :ok))
     })
   end
 
@@ -480,6 +553,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   defp render_overview_content(data) do
     """
     #{render_operator_attention(data)}
+    #{FerricstoreServer.Health.Dashboard.Render.RecentRates.render(data)}
     #{render_cache_performance(data.hotcold)}
     #{render_lifecycle(data.lifecycle)}
     #{render_shards(data.shards)}
@@ -491,12 +565,17 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   defp render_flow_live_components(data) do
     %{
       "flow_overview" =>
-        render_flow_overview(data.summary, data.filtered_sampled, data.sample_limit),
+        render_flow_overview(
+          data.summary,
+          data.filtered_sampled,
+          data.sample_limit,
+          Map.get(data, :filters, %{})
+        ),
       "flow_issue_cards" => render_flow_issue_cards(data.summary, data),
       "flow_projection_health" =>
         render_flow_projection_health(Map.get(data, :projection, Projection.default_health())),
       "flow_state_breakdown" => render_flow_state_breakdown(data.types),
-      "flow_workers" => render_flow_workers(data.workers),
+      "flow_workers" => render_flow_workers(data.workers, Map.get(data, :filters, %{})),
       "flow_recent_records" => render_flow_recent_records(data.records)
     }
   end

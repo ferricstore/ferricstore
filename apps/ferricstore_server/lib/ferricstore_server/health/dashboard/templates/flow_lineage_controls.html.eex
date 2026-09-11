@@ -1,15 +1,15 @@
 <% data = assigns.data %>
 <% filters = data.filters %>
-<div class="flow-policy-panel">
-  <div class="section-title">Lineage Lookup <%= info_icon("Uses a partition-bound FLOW.QUERY lineage plan. Payload bytes are not read.") %></div>
-  <form class="flow-filter-form" action="/dashboard/flow/lineage" method="get">
+<section class="flow-lineage-lookup" aria-label="Lineage lookup">
+  <h2 class="section-title">Lineage Lookup <%= info_icon("Uses a partition-bound FLOW.QUERY lineage plan. Payload bytes are not read.") %></h2>
+  <form class="flow-filter-form flow-lineage-filter-form" action="/dashboard/flow/lineage" method="get">
     <label>
       Query
       <select class="flow-search-input mono" name="mode" title="Choose lineage index">
         <%= render_flow_lineage_mode_options(filters.mode) %>
       </select>
     </label>
-    <label>
+    <label class="flow-lineage-id-field">
       ID
       <input class="flow-search-input mono" type="search" name="id" value="<%= escape_attr(filters.target || "") %>" placeholder="parent/root/correlation id required" title="Required lineage id" required>
     </label>
@@ -23,5 +23,5 @@
     </label>
     <button class="flow-search-button" type="submit">Search</button>
   </form>
-</div>
+</section>
 <%= render_flow_lineage_hints(data.hints) %>

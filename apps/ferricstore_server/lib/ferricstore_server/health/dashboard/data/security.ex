@@ -2,7 +2,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
   @moduledoc false
 
   alias FerricstoreServer.Acl
-  alias FerricstoreServer.Acl.{Formatter, Tables}
+  alias FerricstoreServer.Acl.{CommandCategories, Formatter, Tables}
   alias FerricstoreServer.Health.Dashboard.Access
   alias FerricstoreServer.Health.Endpoint.RouteRequirements
 
@@ -55,6 +55,26 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
       tester: collect_tester(params, current_user),
       route_requirements: route_requirements(),
       generated_at_ms: System.system_time(:millisecond)
+    }
+  end
+
+  def account_error_page(actor, params, message) do
+    draft =
+      params
+      |> Map.take(~w(username role key_pattern channel_pattern modifiers))
+      |> Map.update("modifiers", "", fn value ->
+        value
+        |> String.split(["\r\n", "\n", "\r"])
+        |> Enum.reject(&(String.trim_leading(&1) |> String.starts_with?([">", "<", "#", "!"])))
+        |> Enum.join("\n")
+      end)
+
+    %{
+      current_user: actor,
+      account_form_only?: true,
+      account_draft: draft,
+      can_manage_users: true,
+      flash: %{status: "error", message: message}
     }
   end
 
@@ -116,13 +136,41 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
     }
   end
 
-  defp access_label(%{commands: :all, keys: :all}), do: "Full administrator"
+  defp access_label(%{commands: :all} = user) do
+    no_denials? = MapSet.size(Map.get(user, :denied_commands, MapSet.new())) == 0
+
+    if no_denials? and unrestricted_keys?(Map.get(user, :keys)) and
+         unrestricted_channels?(Map.get(user, :channels)) do
+      "Full administrator"
+    else
+      if no_denials?, do: "All commands; scoped access", else: "All commands with exceptions"
+    end
+  end
 
   defp access_label(%{commands: commands}) when is_struct(commands, MapSet) do
     "#{MapSet.size(commands)} explicit commands"
   end
 
   defp access_label(_user), do: "Restricted"
+
+  defp unrestricted_keys?(:all), do: true
+
+  defp unrestricted_keys?(patterns) when is_list(patterns) do
+    Enum.all?([:read, :write], fn access ->
+      Enum.any?(patterns, fn {glob, mode, _regex} ->
+        wildcard?(glob) and mode in [:rw, access]
+      end)
+    end)
+  end
+
+  defp unrestricted_keys?(_patterns), do: false
+  defp unrestricted_channels?(:all), do: true
+
+  defp unrestricted_channels?(patterns) when is_list(patterns),
+    do: Enum.any?(patterns, fn {glob, _regex} -> wildcard?(glob) end)
+
+  defp unrestricted_channels?(_patterns), do: false
+  defp wildcard?(glob), do: glob != "" and String.trim(glob, "*") == ""
 
   defp command_allowed?(username, command) when is_binary(username) do
     Acl.check_command(username, command) == :ok
@@ -151,8 +199,22 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
     channel = Map.get(params, "channel", "")
     route_path = params |> Map.get("route_path", "") |> String.trim()
     route_method = params |> Map.get("route_method", "GET") |> String.trim() |> String.upcase()
+    submitted? = Enum.any?(~w(user command key channel route_path), &Map.has_key?(params, &1))
+
+    errors =
+      if submitted? do
+        %{}
+        |> tester_user_error(user)
+        |> tester_command_error(command)
+        |> tester_target_error([command, key, channel, route_path])
+      else
+        %{}
+      end
+
+    valid_user? = not Map.has_key?(errors, :user)
 
     %{
+      errors: errors,
       input: %{
         user: user,
         command: command,
@@ -162,12 +224,76 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
         route_method: route_method,
         route_path: route_path
       },
-      command: check_command(user, command),
-      key: check_key(user, key, key_access),
-      channel: check_channel(user, channel),
-      route: check_route(user, route_method, route_path)
+      command:
+        if(valid_user?,
+          do: check_command(user, command),
+          else: idle_result("Command not checked")
+        ),
+      key:
+        if(valid_user?,
+          do: check_key(user, key, key_access),
+          else: idle_result("Key not checked")
+        ),
+      channel:
+        if(valid_user?,
+          do: check_channel(user, channel),
+          else: idle_result("Channel not checked")
+        ),
+      route:
+        if(valid_user?,
+          do: check_route(user, route_method, route_path),
+          else: idle_result("Route not checked")
+        )
     }
   end
+
+  defp tester_user_error(errors, user) do
+    case Acl.get_user(user) do
+      nil ->
+        Map.put(errors, :user, "User does not exist. Choose an account from the list above.")
+
+      %{enabled: false} ->
+        Map.put(errors, :user, "User is disabled. Choose an enabled account to test access.")
+
+      %{enabled: true} ->
+        errors
+
+      _ ->
+        Map.put(
+          errors,
+          :user,
+          "User has an invalid ACL record. Review the account configuration."
+        )
+    end
+  rescue
+    _ ->
+      Map.put(errors, :user, "Account lookup unavailable. Try again after ACL service recovers.")
+  catch
+    :exit, _ ->
+      Map.put(errors, :user, "Account lookup unavailable. Try again after ACL service recovers.")
+  end
+
+  defp tester_command_error(errors, ""), do: errors
+
+  defp tester_command_error(errors, command) do
+    if supported_command?(command),
+      do: errors,
+      else:
+        Map.put(
+          errors,
+          :command,
+          "#{command} is not a supported command. Use a command name such as GET or ACL.LIST."
+        )
+  end
+
+  defp tester_target_error(errors, targets) do
+    if Enum.all?(targets, &(&1 == "")),
+      do: Map.put(errors, :targets, "Enter a command, key, channel, or route to check."),
+      else: errors
+  end
+
+  defp supported_command?(command),
+    do: MapSet.member?(CommandCategories.acl_supported_commands(), command)
 
   defp normalize_key_access(:write), do: :write
 
@@ -180,9 +306,13 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
   defp check_command(_user, ""), do: idle_result("Command not checked")
 
   defp check_command(user, command) do
-    case Acl.check_command(user, command) do
-      :ok -> allowed_result("Command allowed", "+#{command}")
-      {:error, reason} -> denied_result("Command denied", reason)
+    if supported_command?(command) do
+      case Acl.check_command(user, command) do
+        :ok -> allowed_result("Command allowed", "+#{command}")
+        {:error, reason} -> denied_result("Command denied", reason)
+      end
+    else
+      %{status: :unsupported, label: "Unsupported command", detail: command}
     end
   rescue
     _ -> denied_result("Command denied", "ACL lookup failed")
@@ -238,14 +368,22 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
   defp check_route(_user, _method, ""), do: idle_result("Route not checked")
 
   defp check_route(user, method, path) do
-    requirement = RouteRequirements.dashboard_route_requirement(method, path)
+    requirement = RouteRequirements.known_dashboard_route_requirement(method, path)
+    evaluated = "#{method} #{path}"
 
-    case requirement_allowed?(user, requirement) do
-      :ok ->
-        allowed_result("Route allowed", format_requirement(requirement))
+    if requirement == :unsupported do
+      %{status: :unsupported, label: "Unsupported route", detail: evaluated}
+    else
+      case requirement_allowed?(user, requirement) do
+        :ok ->
+          allowed_result("Route allowed", "#{evaluated}: #{format_requirement(requirement)}")
 
-      {:error, reason} ->
-        denied_result("Route denied", "#{format_requirement(requirement)}: #{reason}")
+        {:error, reason} ->
+          denied_result(
+            "Route denied",
+            "#{evaluated}: #{format_requirement(requirement)}: #{reason}"
+          )
+      end
     end
   rescue
     _ -> denied_result("Route denied", "route lookup failed")

@@ -3,15 +3,18 @@
 <body>
   <div class="layout">
     <%= render_sidebar_static("flow_retention") %>
-    <main class="main-content">
+    <main class="main-content" id="dashboard-main" tabindex="-1">
       <%= render_subpage_header("FerricFlow Retention") %>
       <div class="content">
         <%= render_page_intro("FerricFlow Retention", "Preview and run guarded active-runtime enforcement and terminal workflow cleanup so stuck work and retained data do not grow forever.") %>
         <%= render_flow_context_tools(data, "flow_retention") %>
         <%= render_flow_retention_summary(data) %>
         <%= render_flow_retention_controls(data) %>
-        <%= render_flow_retention_commands() %>
         <%= render_flow_retention_candidates(data) %>
+        <details class="dashboard-disclosure" id="flow-retention-reference">
+          <summary>Retention commands</summary>
+          <%= render_flow_retention_commands() %>
+        </details>
       </div>
     </main>
   </div>

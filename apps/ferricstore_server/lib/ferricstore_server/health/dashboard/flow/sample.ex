@@ -180,7 +180,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
   end
 
   def overview_filters_from_opts(opts) when is_list(opts) do
-    %{partition_key: normalize_partition_query(Keyword.get(opts, :partition_key))}
+    %{
+      partition_key: normalize_partition_query(Keyword.get(opts, :partition_key)),
+      type: normalize_type_filter(Keyword.get(opts, :type))
+    }
   end
 
   def filter_records(records, filters) when is_map(filters) do
@@ -234,26 +237,34 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
   def maybe_include_state(states, _state), do: states
 
   def state_filters_from_opts(opts) when is_list(opts) do
-    range = normalize_range_filter(Keyword.get(opts, :range))
+    requested_range = normalize_range_filter(Keyword.get(opts, :range))
+    time_mode = normalize_time_mode(Keyword.get(opts, :time_mode), requested_range, opts)
+    range = if time_mode == "relative", do: requested_range || "15m", else: nil
+
+    opts =
+      if time_mode == "all", do: Keyword.drop(opts, [:from_ms, :to_ms, :from, :to]), else: opts
+
     {from_ms, to_ms} = time_bounds_from_opts(opts, range)
+    time_opts = if is_binary(range), do: [from_ms: from_ms, to_ms: to_ms], else: opts
+    time = FerricstoreServer.Health.Dashboard.Flow.TimeFilter.validate(time_opts, from_ms, to_ms)
 
     %{
       type: normalize_type_filter(Keyword.get(opts, :type)),
       state: normalize_state_filter(Keyword.get(opts, :state)),
       partition_key: normalize_partition_query(Keyword.get(opts, :partition_key)),
       q: normalize_name_filter(Keyword.get(opts, :q)),
+      sort: normalize_summary_sort(Keyword.get(opts, :sort)),
       range: range,
-      from_ms: from_ms,
-      to_ms: to_ms,
+      time_mode: time_mode,
       limit: normalize_limit_filter(Keyword.get(opts, :limit))
     }
+    |> Map.merge(time)
   end
 
   def maybe_put_query_opt(opts, _key, nil), do: opts
   def maybe_put_query_opt(opts, key, value), do: [{key, value} | opts]
 
   def normalize_partition_query(partition_key) when is_binary(partition_key) do
-    partition_key = String.trim(partition_key)
     if partition_key == "", do: nil, else: partition_key
   end
 
@@ -298,11 +309,21 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
   def normalize_state_filter(state), do: normalize_name_filter(state)
 
   def normalize_name_filter(query) when is_binary(query) do
-    query = String.trim(query)
     if query == "", do: nil, else: query
   end
 
   def normalize_name_filter(_query), do: nil
+
+  defp normalize_time_mode(mode, _range, _opts) when mode in ["all", "relative", "custom"],
+    do: mode
+
+  defp normalize_time_mode(_mode, range, _opts) when is_binary(range), do: "relative"
+
+  defp normalize_time_mode(_mode, _range, opts) do
+    if Enum.any?([:from_ms, :to_ms, :from, :to], &(Keyword.get(opts, &1) not in [nil, ""])),
+      do: "custom",
+      else: "all"
+  end
 
   def normalize_range_filter(range) when is_binary(range) do
     range = String.trim(range)
@@ -365,7 +386,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
     |> Enum.take(limit)
   end
 
-  def worker_summaries(records) do
+  def normalize_summary_sort("distribution"), do: "distribution"
+  def normalize_summary_sort(_sort), do: "attention"
+
+  def worker_summaries(records, sort \\ "attention") do
     records
     |> Enum.filter(&(flow_record_state(&1) == "running"))
     |> Enum.group_by(fn record -> flow_record_worker(record) || "unknown" end)
@@ -377,16 +401,21 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
         oldest_lease_ms: oldest_lease_ms(worker_records)
       }
     end)
-    |> Enum.sort_by(fn worker -> {-worker.running, worker.worker} end)
+    |> Enum.sort_by(fn worker ->
+      if sort == "distribution",
+        do: {-worker.running, 0, 0, worker.worker},
+        else: {-worker.expired, -worker.oldest_lease_ms, -worker.running, worker.worker}
+    end)
   end
 
-  def state_summaries(records) do
+  def state_summaries(records, sort \\ "attention") do
     records
     |> Enum.group_by(fn record -> {flow_record_type(record), flow_record_state(record)} end)
     |> Enum.map(fn {{type, state}, state_records} ->
       %{
         type: type,
         state: state,
+        logical_states: state_records |> Enum.map(&flow_record_logical_state/1) |> Enum.uniq(),
         count: length(state_records),
         due_now: Enum.count(state_records, &flow_due_now?/1),
         running: Enum.count(state_records, &(flow_record_state(&1) == "running")),
@@ -398,8 +427,12 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
       }
     end)
     |> Enum.sort_by(fn state ->
-      {-state.due_now, -state.expired_leases, -state.failed, -state.retrying, state.type,
-       state.state}
+      if sort == "distribution" do
+        {-state.due_now, -state.count, -state.running, -state.retrying, state.type, state.state}
+      else
+        {-state.expired_leases, -state.failed, -state.max_attempts_reached, -state.retrying,
+         -state.oldest_due_ms, -state.due_now, state.type, state.state}
+      end
     end)
   end
 

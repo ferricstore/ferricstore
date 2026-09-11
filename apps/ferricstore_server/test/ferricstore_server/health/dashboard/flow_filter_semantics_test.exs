@@ -167,7 +167,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
     assert html =~ ~s(name="return_limit" value="40")
     assert html =~ ~s(name="return_exact" value="true")
     assert html =~ "Search text narrows this evidence only"
-    assert html =~ "a blank Partition applies across partitions"
+    assert html =~ "A blank Partition uses automatic partitions"
 
     recovery_form = form_html(html, "/dashboard/flow/failures", "post")
     assert required_input?(input_tag(recovery_form, "type"))
@@ -238,7 +238,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
       })
 
     assert flash_html =~ ~s(data-dashboard-transient-query="status,count,message")
-    assert flash_html =~ "window.history.replaceState"
+    assert FerricstoreServer.Health.Dashboard.Layout.dashboard_live_script() =~ "window.history.replaceState"
   end
 
   test "guided stats requires the state predicate it actually counts" do
@@ -590,7 +590,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
         to_ms: 1_000
       )
 
-    assert reversed_time.result.status == :idle
+    assert reversed_time.result.status == :error
     assert reversed_time.result.message == "From UTC must not be later than To UTC"
     refute_receive {:unexpected_query, _query, _params}
   end
@@ -646,8 +646,8 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
     assert data.discovery.indexed_state_meta == "risk_tier"
 
     assert Jason.decode!(data.workbench.params_json) == %{
-             "partition" => "tenant-a",
-             "type" => "email"
+             "partition" => "default",
+             "type" => "workflow"
            }
 
     html = Dashboard.render_flow_query_page(data)
@@ -1311,12 +1311,14 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
     assert opts[:status] == "expired"
     assert html =~ ~s(<option value="expired" selected>expired</option>)
 
-    for name <- ~w(meta_type meta_state meta_key meta_value meta_partition_key) do
+    for name <- ~w(meta_type meta_state meta_key meta_partition_key) do
       assert required_input?(input_tag(html, name))
     end
+
+    refute required_input?(input_tag(html, "meta_value"))
   end
 
-  test "empty optional filters normalize to unfiltered semantics on sampled screens" do
+  test "empty optional filters are absent while whitespace filters remain literal" do
     state_opts =
       Dashboard.flow_states_opts_from_query(
         URI.encode_query(%{"type" => "", "state" => "", "partition_key" => " "})
@@ -1334,13 +1336,13 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
 
     refute Keyword.has_key?(state_opts, :type)
     refute Keyword.has_key?(state_opts, :state)
-    refute Keyword.has_key?(state_opts, :partition_key)
+    assert Keyword.fetch!(state_opts, :partition_key) == " "
     refute Keyword.has_key?(failure_opts, :type)
     refute Keyword.has_key?(failure_opts, :partition_key)
-    refute Keyword.has_key?(failure_opts, :q)
+    assert Keyword.fetch!(failure_opts, :q) == " "
     refute Keyword.has_key?(signal_opts, :type)
     refute Keyword.has_key?(signal_opts, :signal)
-    refute Keyword.has_key?(signal_opts, :q)
+    assert Keyword.fetch!(signal_opts, :q) == " "
   end
 
   test "sampled type selects preserve an explicit predicate missing from the sample" do
@@ -1424,7 +1426,8 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
       })
 
     assert html =~ "Auto-refresh paused"
-    assert html =~ "inspected 4 of 20 matching workflows"
+    assert html =~ "3 histories read (4 attempted)"
+    assert html =~ "Partial coverage"
     assert html =~ "1 history read failed"
   end
 

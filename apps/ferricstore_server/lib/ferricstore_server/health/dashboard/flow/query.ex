@@ -9,7 +9,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
 
   alias FerricstoreServer.Health.Dashboard.Flow.{
     QueryDiscovery,
+    QueryProjection,
     QueryResult,
+    QueryScope,
     QueryVisualization,
     QueryWorkbench
   }
@@ -80,7 +82,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
       result: result,
       records: Map.get(result, :records, []),
       summary: flow_lineage_summary(Map.get(result, :records, [])),
-      hints: flow_lineage_hints(sampled_records),
+      hints:
+        sampled_records
+        |> filter_flow_records_by_partition(filters.partition_key)
+        |> flow_lineage_hints(),
       total_sampled: length(sampled_records),
       sample_limit: @flow_dashboard_sample_limit,
       generated_at_ms: System.system_time(:millisecond)
@@ -99,6 +104,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
       normalize_flow_partition_query(Map.get(params, "partition_key"))
     )
     |> maybe_put_query_opt(:limit, normalize_flow_query_limit(Map.get(params, "limit")))
+    |> maybe_put_query_opt(:cursor, Map.get(params, "cursor"))
     |> Enum.reverse()
   end
 
@@ -107,6 +113,25 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   @spec collect_query_page(keyword()) :: map()
   def collect_query_page(opts \\ []) when is_list(opts) do
     filters = flow_query_filters_from_opts(opts)
+
+    if map_size(filters.errors) > 0 do
+      message =
+        [:from, :to] |> Enum.flat_map(&List.wrap(Map.get(filters.errors, &1))) |> Enum.join(". ")
+
+      %{
+        filters: filters,
+        result: %{status: :error, command: "FLOW.QUERY", rows: [], message: message},
+        discovery: QueryDiscovery.collect(%{}, %{rows: []}) |> Map.put(:type, filters.type),
+        workbench: QueryWorkbench.default_form(filters),
+        draft_scope: QueryWorkbench.draft_scope(opts),
+        generated_at_ms: System.system_time(:millisecond)
+      }
+    else
+      collect_valid_query_page(filters, opts)
+    end
+  end
+
+  defp collect_valid_query_page(filters, opts) do
     acl_username = DashboardAccess.keyspace_acl_username(opts)
     pending_discovery = QueryDiscovery.start(filters, opts)
 
@@ -117,6 +142,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
         execute_flow_query_for_acl(filters, acl_username)
       end
 
+    {guided_import, query_result} = Map.pop(query_result, :guided_import)
+
     result =
       query_result
       |> maybe_filter_inspection_result_for_acl(
@@ -124,6 +151,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
         acl_username,
         query_acl_scope
       )
+      |> attach_history_scope(filters)
       |> QueryVisualization.attach()
 
     discovery =
@@ -138,9 +166,21 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
       result: result,
       discovery: discovery,
       workbench: QueryWorkbench.default_form(filters),
+      draft_scope: QueryWorkbench.draft_scope(opts),
+      guided_import: guided_import || if(filters.inspect, do: guided_import_form(filters)),
       generated_at_ms: System.system_time(:millisecond)
     }
   end
+
+  defp attach_history_scope(%{command: "FLOW.HISTORY"} = result, filters) do
+    Map.put(result, :history_scope, %{
+      id: filters.id,
+      partition_key: filters.partition_key,
+      count: filters.limit
+    })
+  end
+
+  defp attach_history_scope(result, _filters), do: result
 
   @spec query_opts_from_query(binary()) :: keyword()
   def query_opts_from_query(query) when is_binary(query) do
@@ -182,8 +222,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
       normalize_flow_partition_query(Map.get(params, "partition_key"))
     )
     |> maybe_put_query_opt(:limit, normalize_flow_query_limit(Map.get(params, "limit")))
-    |> maybe_put_query_opt(:from_ms, parse_flow_time_filter(Map.get(params, "from")))
-    |> maybe_put_query_opt(:to_ms, parse_flow_time_filter(Map.get(params, "to")))
+    |> maybe_put_query_opt(:from_ms, Map.get(params, "from_ms") || Map.get(params, "from"))
+    |> maybe_put_query_opt(:to_ms, Map.get(params, "to_ms") || Map.get(params, "to"))
     |> maybe_put_query_opt(:rev, normalize_flow_boolean_filter(Map.get(params, "rev")))
     |> maybe_put_query_opt(
       :inspect,
@@ -214,10 +254,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
       prepared
       |> QueryWorkbench.execute()
       |> DashboardAccess.flow_query_filter_result_for_acl(acl_username, acl_scope)
-      |> QueryVisualization.attach()
       |> QueryWorkbench.attach_continuation(form)
+      |> QueryVisualization.attach()
 
     workbench_page_data(form, result, filters, pending_discovery)
+    |> Map.put(:draft_scope, QueryWorkbench.draft_scope(opts))
   end
 
   @spec collect_workbench_error_page(QueryWorkbench.form(), binary(), keyword()) :: map()
@@ -231,6 +272,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
     }
 
     workbench_page_data(form, result, opts)
+    |> Map.put(:draft_scope, QueryWorkbench.draft_scope(opts))
   end
 
   defp workbench_page_data(form, result, opts) do
@@ -260,15 +302,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
 
   defp workbench_discovery_opts(
          opts,
-         %PreparedCommand{ast: {:flow_query, %Request{predicate: {:and, predicates}}}}
-       )
-       when is_list(predicates) do
-    opts
-    |> maybe_put_workbench_discovery_opt(:type, exact_query_literal(predicates, :type))
-    |> maybe_put_workbench_discovery_opt(
-      :partition_key,
-      exact_query_literal(predicates, :partition_key)
-    )
+         %PreparedCommand{ast: {:flow_query, %Request{} = request}}
+       ) do
+    QueryScope.options(request, opts)
   end
 
   defp workbench_discovery_opts(opts, %PreparedCommand{}), do: opts
@@ -279,22 +315,6 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   end
 
   defp workbench_page_opts(_form, opts), do: opts
-
-  defp exact_query_literal(predicates, field) do
-    case Enum.flat_map(predicates, fn
-           {:eq, ^field, {:literal, _type, value}} when is_binary(value) and value != "" ->
-             [value]
-
-           _other ->
-             []
-         end) do
-      [value] -> value
-      _missing_or_ambiguous -> nil
-    end
-  end
-
-  defp maybe_put_workbench_discovery_opt(opts, _key, nil), do: opts
-  defp maybe_put_workbench_discovery_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp flow_query_acl_scope(filters) when is_map(filters) do
     partition_key = Map.get(filters, :partition_key)
@@ -423,7 +443,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
       mode: normalize_flow_lineage_mode(Keyword.get(opts, :mode)),
       target: normalize_flow_name_filter(Keyword.get(opts, :target)),
       partition_key: normalize_flow_partition_query(Keyword.get(opts, :partition_key)),
-      limit: normalize_flow_query_limit(Keyword.get(opts, :limit))
+      limit: normalize_flow_query_limit(Keyword.get(opts, :limit)),
+      cursor: Keyword.get(opts, :cursor)
     }
   end
 
@@ -452,25 +473,29 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
            Builder.build(kind, %{
              partition_key: filters.partition_key,
              id: target,
-             limit: filters.limit
+             limit: filters.limit,
+             cursor: filters.cursor
            }) do
       query_fun = fn -> flow_dashboard_flow_query(built.query, built.params) end
 
       case bounded_dashboard_call(query_fun, flow_dashboard_list_fetch_timeout_ms(), :lineage) do
-        {:ok, {:ok, %{records: records}}} when is_list(records) ->
-          lineage_success(records)
+        {:ok, {:ok, %{records: records} = response}} when is_list(records) ->
+          lineage_success(response)
+
+        {:ok, {:ok, %{"records" => records} = response}} when is_list(records) ->
+          lineage_success(response)
 
         {:ok, {:ok, records}} when is_list(records) ->
           lineage_success(records)
 
         {:ok, {:error, reason}} ->
-          %{status: :error, command: "FLOW.QUERY", records: [], message: inspect(reason)}
+          lineage_error(reason)
 
         {:error, :timeout} ->
           %{status: :timeout, command: "FLOW.QUERY", records: [], message: "query timed out"}
 
         {:error, reason} ->
-          %{status: :error, command: "FLOW.QUERY", records: [], message: inspect(reason)}
+          lineage_error(reason)
 
         _ ->
           %{
@@ -482,12 +507,32 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
       end
     else
       {:error, reason} ->
-        %{status: :error, command: "FLOW.QUERY", records: [], message: inspect(reason)}
+        lineage_error(reason)
     end
   end
 
-  defp lineage_success(records) do
-    %{status: :ok, command: "FLOW.QUERY", records: records, message: "#{length(records)} records"}
+  defp lineage_error(reason) do
+    message =
+      case reason do
+        cursor when cursor in [:query_cursor_invalid, :query_cursor_expired] ->
+          "The query cursor is invalid or expired; restart from the first page"
+
+        :invalid_query_filter ->
+          "Invalid lookup filter; check the id, partition, and limit"
+
+        _ ->
+          FerricstoreServer.Health.Dashboard.Format.dashboard_internal_error(
+            "Query service unavailable",
+            reason
+          )
+      end
+
+    %{status: :error, command: "FLOW.QUERY", records: [], message: message}
+  end
+
+  defp lineage_success(response) do
+    {records, result} = Map.pop(QueryResult.success("FLOW.QUERY", response), :rows)
+    Map.put(result, :records, records)
   end
 
   defp flow_lineage_summary(records) do
@@ -537,6 +582,13 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   end
 
   defp flow_query_filters_from_opts(opts) when is_list(opts) do
+    time =
+      FerricstoreServer.Health.Dashboard.Flow.TimeFilter.validate(
+        opts,
+        parse_flow_time_filter(Keyword.get(opts, :from_ms)),
+        parse_flow_time_filter(Keyword.get(opts, :to_ms))
+      )
+
     attribute_key = normalize_flow_name_filter(Keyword.get(opts, :attribute_key))
     attribute_value_type = metadata_value_type(opts, :attribute_value_type)
 
@@ -582,11 +634,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
       id: normalize_flow_name_filter(Keyword.get(opts, :id)),
       partition_key: normalize_flow_partition_query(Keyword.get(opts, :partition_key)),
       limit: normalize_flow_query_limit(Keyword.get(opts, :limit)),
-      from_ms: Keyword.get(opts, :from_ms),
-      to_ms: Keyword.get(opts, :to_ms),
       rev: Keyword.get(opts, :rev) == true,
       inspect: Keyword.get(opts, :inspect) == true
     }
+    |> Map.merge(time)
   end
 
   defp metadata_value_type(opts, key) do
@@ -765,6 +816,15 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
     end
   end
 
+  defp guided_import_form(filters) do
+    with :ok <- validate_flow_query_predicates(filters),
+         {:ok, "FLOW.QUERY", _call, form} <- flow_query_plan(filters) do
+      form
+    else
+      _unsupported_or_invalid -> nil
+    end
+  end
+
   defp execute_flow_query_plan(plan) do
     case plan do
       {:ok, command, fun} ->
@@ -772,6 +832,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
 
       {:ok, command, fun, continuation_form} ->
         execute_flow_query_call(command, fun, continuation_form)
+        |> Map.put(:guided_import, continuation_form)
 
       {:idle, command, message} ->
         %{status: :idle, command: command, rows: [], message: message}
@@ -1103,9 +1164,16 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
       from_ms: filters.from_ms,
       to_ms: filters.to_ms
     }
+    |> Map.put(
+      :projection,
+      if(filters.kind == "stuck",
+        do: QueryProjection.guided_fields("stuck") ++ [:partition_key],
+        else: :all
+      )
+    )
   end
 
-  defp query_builder_state(nil), do: "any"
+  defp query_builder_state(nil), do: :any
   defp query_builder_state(state), do: state
 
   defp maybe_put_builder_filter(filters, _key, nil), do: filters
@@ -1214,7 +1282,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
     records = filtered_records |> flow_recent_records(max_flows)
     timeout_ms = flow_signal_scan_fetch_timeout_ms()
 
-    {rows, completed, failed} =
+    {rows, completed, failed, history_limited} =
       records
       |> Task.async_stream(
         &flow_signal_rows_for_record(&1, timeout_ms),
@@ -1223,18 +1291,21 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
         on_timeout: :kill_task,
         timeout: timeout_ms + 250
       )
-      |> Enum.reduce({[], 0, 0}, fn
-        {:ok, {:ok, record_rows}}, {rows, completed, failed} ->
-          {[record_rows | rows], completed + 1, failed}
+      |> Enum.reduce({[], 0, 0, 0}, fn
+        {:ok, {:ok, record_rows, limited?}}, {rows, completed, failed, limited} ->
+          {[record_rows | rows], completed + 1, failed, limited + if(limited?, do: 1, else: 0)}
 
-        _failure, {rows, completed, failed} ->
-          {rows, completed, failed + 1}
+        _failure, {rows, completed, failed, limited} ->
+          {rows, completed, failed + 1, limited}
       end)
 
-    signals =
+    matching_rows =
       rows
       |> List.flatten()
       |> filter_flow_signal_rows(filters)
+
+    signals =
+      matching_rows
       |> Enum.sort_by(&flow_signal_sort_key/1, :desc)
       |> Enum.take(filters.limit)
 
@@ -1245,6 +1316,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
        inspected_flows: length(records),
        completed_flows: completed,
        failed_flows: failed,
+       history_limited_flows: history_limited,
+       history_limit: @flow_dashboard_signal_history_count,
+       matched_events: length(matching_rows),
+       result_truncated: length(matching_rows) > filters.limit,
        truncated: length(filtered_records) > length(records),
        auto_refresh: false
      }}
@@ -1267,8 +1342,12 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
            timeout_ms,
            :signals_history
          ) do
-      {:ok, {:ok, history}} when is_list(history) -> {:ok, flow_signal_rows(record, history)}
-      _ -> {:error, :history_unavailable}
+      {:ok, {:ok, history}} when is_list(history) ->
+        {:ok, flow_signal_rows(record, history),
+         length(history) >= @flow_dashboard_signal_history_count}
+
+      _ ->
+        {:error, :history_unavailable}
     end
   rescue
     _ -> {:error, :history_unavailable}

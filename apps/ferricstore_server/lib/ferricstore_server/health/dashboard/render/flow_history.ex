@@ -3,6 +3,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
   import FerricstoreServer.Health.Dashboard.FlowRecord
 
   @flow_dashboard_history_default_count 50
+  @inline_detail_page_bytes 64 * 1024
+  @inline_detail_field_bytes 8 * 1024
   @flow_terminal_states ~w(completed failed cancelled)
 
   def flow_signal_rows(record, history) when is_map(record) and is_list(history) do
@@ -33,8 +35,24 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
     |> String.downcase() == "signaled"
   end
 
+  defp journal_signal_name(fields) do
+    name = flow_field_string(fields, :signal, "")
+
+    if flow_signal_event?(fields) and name != "" do
+      preview = bounded_inline_detail(name, 256)
+      suffix = if preview.truncated, do: "... (truncated)", else: ""
+      ~s(<span class="journal-signal-name mono">#{escape(preview.value)}#{suffix}</span>)
+    else
+      ""
+    end
+  end
+
+  def render_flow_history_timeline(_history, :forbidden, _page) do
+    ~s(<div class="flow-section-note" role="status">History restricted. Requires FLOW.HISTORY access for this workflow.</div>)
+  end
+
   def render_flow_history_timeline(history, status, page) do
-    timeline_rows = flow_history_timeline_rows(history)
+    timeline_rows = history |> flow_history_timeline_rows() |> with_inline_detail_budget()
     event_count = length(timeline_rows)
     event_label = if event_count == 1, do: "event", else: "events"
 
@@ -87,19 +105,19 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
             <tr id="#{anchor}" class="timeline-event-row">
               <td class="mono"><a class="flow-event-link" href="##{anchor}">#{escape(to_string(row.event_id))}</a></td>
               <td>#{format_timestamp_ms_or_dash(row.time_ms)}</td>
-              <td>#{flow_history_action_html(fields)}</td>
+              <td>#{flow_history_action_html(fields)}#{render_flow_raw_event_details(row)}</td>
               <td>#{escape(flow_history_state_move(row))}</td>
               <td>#{escape(flow_history_version_summary(fields))}</td>
               <td>#{escape(flow_history_attempt_summary(fields))}</td>
               <td class="mono">#{escape(flow_history_worker_summary(fields))}</td>
-              <td class="mono">#{flow_history_refs_summary_html(fields)}</td>
+              <td class="mono">#{flow_history_refs_summary_html(fields, row)}</td>
             </tr>
             """
           end)
       end
 
     """
-    <div class="flow-journal-card">
+    <div class="flow-journal-card" data-flow-history-detail-byte-budget="#{@inline_detail_page_bytes}">
       <div class="flow-card-header">
         <div class="flow-card-header-title">
           <span>Execution Journal</span>
@@ -111,11 +129,12 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
         </div>
       </div>
       #{render_flow_history_controls(page, status)}
+      #{if Enum.any?(timeline_rows, &event_has_inline_error?/1), do: ~s(<p class="flow-section-note">Expanded inline diagnostics: 64 KiB page budget; up to 8 KiB per field.</p>), else: ""}
       <div id="journal-panel-tree" role="tabpanel" aria-labelledby="journal-tab-tree" data-journal-view="tree">
         #{journal_html}
       </div>
       <div id="journal-panel-table" role="tabpanel" aria-labelledby="journal-tab-table" data-journal-view="table" hidden>
-        <div class="section-title sr-only">Timeline</div>
+        <h2 class="section-title sr-only">Timeline</h2>
         <div class="table-scroll" role="region" aria-label="Workflow history events" tabindex="0"><table>
           <thead>
             <tr><th>Event</th><th>Time</th><th>Action</th><th>State Change</th><th>Version</th><th>Attempts</th><th>Worker</th><th>Values</th></tr>
@@ -136,6 +155,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
   def render_flow_journal_steps(rows) do
     {step_items, inspectors} =
       rows
+      |> with_inline_detail_budget()
       |> Enum.map(fn row ->
         fields = row.fields
         anchor = flow_history_event_anchor(row.event_id)
@@ -154,7 +174,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
         attempts_badge =
           if attempts != "-", do: ~s(<span class="flow-pill">#{escape(attempts)}</span>), else: ""
 
-        values_html = flow_history_refs_summary_html(fields)
+        values_html = flow_history_refs_summary_html(fields, row)
 
         values_section =
           if values_html != "-",
@@ -176,6 +196,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
               </div>
               <div class="journal-step-meta">
                 <span class="badge #{flow_state_badge_class(row.to_state)}">#{escape(state_move)}</span>
+                #{journal_signal_name(row.fields)}
                 #{worker_badge}
                 #{attempts_badge}
               </div>
@@ -204,21 +225,15 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
   defp render_flow_journal_event_inspector(row, inspector_id) do
     fields = row.fields
 
-    error_detail =
-      case bounded_flow_history_detail(flow_field(fields, :error, nil)) do
-        "-" -> bounded_flow_history_detail(flow_field(fields, :reason, nil))
-        detail -> detail
-      end
-
-    details = [
-      {"Event", to_string(row.event_id)},
-      {"Occurred", format_timestamp_ms_or_dash(row.time_ms)},
-      {"Action", flow_history_event_label(fields)},
-      {"State change", flow_history_state_move(row)},
-      {"Worker", flow_history_worker_summary(fields)},
-      {"Attempts", flow_history_attempt_summary(fields)},
-      {"Error", error_detail}
-    ]
+    details =
+      [
+        {"Event", to_string(row.event_id)},
+        {"Occurred", format_timestamp_ms_or_dash(row.time_ms)},
+        {"Action", flow_history_event_label(fields)},
+        {"State change", flow_history_state_move(row)},
+        {"Worker", flow_history_worker_summary(fields)},
+        {"Attempts", flow_history_attempt_summary(fields)}
+      ] ++ flow_event_specific_details(fields)
 
     rows =
       details
@@ -238,8 +253,119 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
       <dl class="journal-event-inspector-grid">
         #{rows}
       </dl>
+      #{render_flow_event_errors(row)}
     </div>
     """
+  end
+
+  defp render_flow_raw_event_details(row) do
+    details =
+      row.fields
+      |> flow_event_specific_details()
+      |> Enum.reject(fn {_label, value} -> value in [nil, "", "-"] end)
+      |> Enum.map_join("", fn {label, value} ->
+        ~s(<div><dt>#{escape(label)}</dt><dd class="mono">#{escape(value)}</dd></div>)
+      end)
+
+    """
+    <details class="flow-raw-event-details">
+      <summary>Event fields</summary>
+      <dl>#{details}</dl>
+      #{if event_has_inline_error?(row), do: ~s(<a class="flow-event-link" href="#journal-#{flow_history_event_anchor(row.event_id)}">Inspect error and reason</a>), else: ""}
+    </details>
+    """
+  end
+
+  defp flow_event_specific_details(fields) do
+    [
+      {"Signal name", :signal},
+      {"Idempotency key", :idempotency_key},
+      {"Rewind target event", :to_event},
+      {"Retry decision", :retry_decision},
+      {"Retry reason", :retry_reason},
+      {"Fencing token", :fencing_token}
+    ]
+    |> Enum.map(fn {label, key} ->
+      value = bounded_flow_history_detail(flow_field(fields, key, nil))
+
+      value =
+        if key == :idempotency_key and value == "-" and flow_signal_event?(fields),
+          do: "Not recorded in event",
+          else: value
+
+      {label, value}
+    end)
+  end
+
+  defp with_inline_detail_budget(rows) do
+    fields =
+      Enum.reduce(rows, 0, fn row, count ->
+        count + Enum.count([:error, :reason], &(flow_field(row.fields, &1, nil) not in [nil, ""]))
+      end)
+
+    limit = min(@inline_detail_field_bytes, div(@inline_detail_page_bytes, max(fields, 1)))
+    Enum.map(rows, &Map.put(&1, :inline_detail_limit, limit))
+  end
+
+  defp event_has_inline_error?(row),
+    do: Enum.any?([:error, :reason], &(flow_field(row.fields, &1, nil) not in [nil, ""]))
+
+  defp render_flow_event_errors(row) do
+    fields = row.fields
+    limit = Map.get(row, :inline_detail_limit, @inline_detail_field_bytes)
+
+    [{"Error", :error}, {"Reason", :reason}]
+    |> Enum.map_join("", fn {label, key} ->
+      case flow_field(fields, key, nil) do
+        value when value in [nil, ""] ->
+          ""
+
+        value ->
+          full = bounded_inline_detail(value, limit)
+          preview = bounded_flow_history_detail(full.value)
+
+          note =
+            cond do
+              full.truncated and limit < @inline_detail_field_bytes ->
+                "#{label} preview limited by 64 KiB page budget (#{limit} bytes for this field)"
+
+              full.truncated ->
+                "#{label} preview limited to 8 KiB"
+
+              is_binary(value) ->
+                "Complete #{String.downcase(label)}"
+
+              true ->
+                "#{label} detail (bounded inspection)"
+            end
+
+          """
+          <div class="journal-event-inspector-item"><strong>#{label}</strong><p class="mono">#{escape(preview)}</p></div>
+          <details class="flow-history-full-detail">
+            <summary>#{note}</summary>
+            <pre>#{escape(full.value)}</pre>
+          </details>
+          """
+      end
+    end)
+  end
+
+  defp bounded_inline_detail(value, limit) do
+    preview = FerricstoreServer.Health.Dashboard.ValuePreview.render(value)
+
+    if byte_size(preview.value) > limit do
+      prefix = binary_part(preview.value, 0, limit)
+
+      valid =
+        case :unicode.characters_to_binary(prefix, :utf8, :utf8) do
+          value when is_binary(value) -> value
+          {:incomplete, value, _} -> value
+        end
+
+      %{value: valid, truncated: true}
+    else
+      preview
+    end
   end
 
   defp bounded_flow_history_detail(nil), do: "-"
@@ -388,12 +514,39 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
     end
   end
 
-  def render_flow_value_ref_badge(record, mode, %{label: label, ref: ref}) do
-    anchor = flow_value_ref_anchor(ref)
+  def render_flow_value_ref_badge(record, mode, %{label: label, ref: ref} = entry) do
+    source =
+      if Map.get(entry, :source) in ["historical", "history event"],
+        do: "historical",
+        else: "current"
+
+    event_id = Map.get(entry, :event_id)
+
+    suffix =
+      if source == "historical" and event_id not in [nil, ""],
+        do: ":event:" <> Base.url_encode64(to_string(event_id), padding: false),
+        else: ""
+
+    anchor = flow_value_ref_anchor(ref) <> suffix
     href = flow_value_ref_href(record, mode, anchor)
     title = "Open #{label} value"
 
-    ~s(<a class="flow-pill flow-value-ref-link" href="#{escape_attr(href)}" title="#{escape_attr(title)}" aria-label="#{escape_attr(title)}" data-flow-value-ref="#{escape_attr(ref)}" data-flow-value-label="#{escape_attr(label)}">#{escape(label)}</a>)
+    provenance =
+      [
+        {"source", source},
+        {"workflow", if(is_map(record), do: flow_record_id(record), else: nil)},
+        {"partition",
+         if(is_map(record), do: flow_record_partition_key(record) || "auto/global", else: nil)},
+        {"event", Map.get(entry, :event_id)},
+        {"action", Map.get(entry, :action)},
+        {"time", Map.get(entry, :time)}
+      ]
+      |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
+      |> Enum.map_join("", fn {key, value} ->
+        ~s( data-flow-value-#{key}="#{escape_attr(to_string(value))}")
+      end)
+
+    ~s(<a class="flow-pill flow-value-ref-link" href="#{escape_attr(href)}" title="#{escape_attr(title)}" aria-label="#{escape_attr(title)}" data-flow-value-ref="#{escape_attr(ref)}" data-flow-value-label="#{escape_attr(label)}"#{provenance}>#{escape(label)}</a>)
   end
 
   def flow_value_ref_href(record, :detail_link, anchor) when is_map(record) do
@@ -587,11 +740,21 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
     flow_first_non_empty_binary(fields, [:worker, :lease_owner]) || "-"
   end
 
-  def flow_history_refs_summary_html(fields) do
+  def flow_history_refs_summary_html(fields, row \\ nil) do
+    provenance =
+      if is_map(row),
+        do: %{
+          source: "historical",
+          event_id: to_string(row.event_id),
+          action: flow_history_event_label(fields),
+          time: format_timestamp_ms_or_dash(row.time_ms)
+        },
+        else: %{source: "historical"}
+
     badges =
       fields
       |> flow_value_ref_entries("history event")
-      |> Enum.map(&render_flow_value_ref_badge(nil, :local, &1))
+      |> Enum.map(&render_flow_value_ref_badge(nil, :local, Map.merge(&1, provenance)))
 
     case badges do
       [] -> "-"
@@ -618,12 +781,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
 
   def flow_state_class("failed"), do: "c-red"
   def flow_state_class("cancelled"), do: "c-yellow"
-  def flow_state_class("running"), do: "c-green"
   def flow_state_class(_state), do: ""
 
   def flow_state_badge_class("failed"), do: "badge-pressure"
   def flow_state_badge_class("cancelled"), do: "badge-warning"
   def flow_state_badge_class(state) when state in @flow_terminal_states, do: "badge-ok"
-  def flow_state_badge_class("running"), do: "badge-merging"
   def flow_state_badge_class(_state), do: "badge-idle"
 end

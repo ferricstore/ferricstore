@@ -133,7 +133,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.OperationalPages do
             Dashboard.collect_streams_page()
             |> Dashboard.render_streams_page()
 
-          assert String.contains?(html, "Stream Consumers")
+          assert String.contains?(html, "Consumer Groups")
           assert String.contains?(html, "XREADGROUP")
           assert String.contains?(html, "XACK")
           assert String.contains?(html, "g1 / c1")

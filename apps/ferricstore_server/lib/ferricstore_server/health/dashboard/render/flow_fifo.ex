@@ -6,10 +6,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFifo do
   alias FerricstoreServer.Health.Dashboard.Render.FlowNavigation
   @lane_preview_limit 40
 
-  def render(lanes, total_sampled, sample_limit) do
+  def render(lanes, total_sampled, sample_limit, coverage \\ %{}) do
+    unavailable? = Map.get(coverage, :status, :ok) != :ok
+
     rows =
       if lanes == [] do
-        ~s(<tr><td colspan="4" class="c-muted">No FIFO lanes discovered in the current bounded sample.</td></tr>)
+        message =
+          if unavailable?,
+            do: "FIFO lanes could not be established for types with unavailable policies.",
+            else: "No FIFO lanes discovered in the current bounded sample."
+
+        ~s(<tr><td colspan="4" class="c-muted">#{message}</td></tr>)
       else
         lanes |> Enum.take(@lane_preview_limit) |> Enum.map_join("", &lane_row/1)
       end
@@ -22,7 +29,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFifo do
       end
 
     """
-    <div class="section-title">FIFO Lanes <span class="badge badge-idle">#{length(lanes)}</span> <span class="badge badge-idle">#{sampled_scan_label(total_sampled, sample_limit)}</span></div>
+    <h2 class="section-title">FIFO Lanes <span class="badge badge-idle">#{if unavailable?, do: "#{length(lanes)} verified lanes", else: length(lanes)}</span> <span class="badge badge-idle">#{sampled_scan_label(total_sampled, sample_limit)}</span></h2>
+    #{coverage_notice(coverage)}
     <p class="flow-section-note">Observed members, not the complete queue. Filters and sample bounds can omit an earlier member or blocker; due time alone does not establish claimability.</p>
     #{limit_note}
     <div class="table-scroll" role="region" aria-label="FIFO lanes" tabindex="0">
@@ -33,6 +41,14 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFifo do
     </div>
     """
   end
+
+  defp coverage_notice(%{status: status, unavailable_types: types}) when status != :ok do
+    """
+    <div class="pressure-alert level-warning" role="status"><div class="pressure-details"><strong>FIFO coverage unavailable#{if status == :partial, do: " for some types", else: ""}</strong><p>Policy lookup failed for <span class="mono">#{types |> Enum.join(", ") |> escape()}</span>. These types may contain FIFO lanes; execution mode is unavailable.</p></div><button type="button" class="flow-search-button" data-dashboard-refresh>Retry current scope</button></div>
+    """
+  end
+
+  defp coverage_notice(_coverage), do: ""
 
   defp lane_row(lane) do
     status = Map.get(lane, :head_status, "idle")

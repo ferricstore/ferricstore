@@ -3,7 +3,7 @@
 <body>
 <div class="layout">
 <%= render_sidebar_static("security") %>
-<main class="main-content">
+<main class="main-content" id="dashboard-main" tabindex="-1">
 <%= render_subpage_header("Security") %>
 <div class="content">
 <%= render_page_intro("Security", "Manage OSS identities and verify the effective command, key, channel, and dashboard-route access granted to each account.") %>

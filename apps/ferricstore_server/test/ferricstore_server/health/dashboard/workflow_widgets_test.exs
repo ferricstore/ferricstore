@@ -22,6 +22,7 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowWidgetsTest do
             id: "run<&",
             type: "email",
             state: "running",
+            run_state: "send_email",
             partition_key: "scope&1",
             updated_at_ms: 1_000
           }
@@ -34,9 +35,11 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowWidgetsTest do
       refute html =~ ~s(>none</span>)
       assert html =~ "run&lt;&amp;"
       assert html =~ "partition_key=scope%261"
-      assert length(Regex.scan(~r/<th scope=/, html)) == 4
-      assert length(Regex.scan(~r/<td[ >]/, html)) == 4
-      assert FlowQueryResults.render_flow_query_table(%{result | rows: []}) =~ ~s(colspan="4")
+      assert html =~ ~s(>Workflow state</th>)
+      assert html =~ "send_email"
+      assert length(Regex.scan(~r/<th scope=/, html)) == 5
+      assert length(Regex.scan(~r/<td[ >]/, html)) == 5
+      assert FlowQueryResults.render_flow_query_table(%{result | rows: []}) =~ ~s(colspan="5")
 
       history = FlowQueryResults.render_flow_query_table(%{command: "FLOW.HISTORY", rows: []})
       assert history =~ ~s(>Worker</th>)
@@ -115,7 +118,7 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowWidgetsTest do
       html = Dashboard.render_flow_detail_page(data)
 
       assert html =~ ~s(<dl class="flow-execution-summary")
-      assert html =~ "Logical state"
+      assert html =~ "Workflow state"
 
       assert position(html, ~s(data-live-component="flow_history")) <
                position(html, ~s(data-live-component="flow_detail_metadata"))
@@ -150,7 +153,7 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowWidgetsTest do
     test "measurable timing retains event links without nested chart framing" do
       html = FlowCharts.render_flow_timeline_chart(history([1_000, 2_000]))
 
-      assert html =~ "Step Waterfall"
+      assert html =~ "Event intervals"
       assert html =~ "flow-step-waterfall-row"
       assert html =~ "#journal-flow-event-"
       refute html =~ ~s(class="chart-card")
@@ -171,7 +174,7 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowWidgetsTest do
       assert FlowCharts.flow_timeline_duration_ms(%{time_ms: nil}, %{time_ms: 1}) == nil
 
       html = FlowCharts.render_flow_timeline_chart(history([1_000, 1_000, 2_000]))
-      assert html =~ "No end event"
+      assert html =~ "No next event"
       assert html =~ ">0ms</span>"
       assert html =~ ">1.0s</span>"
       assert length(Regex.scan(~r/class="flow-step-waterfall-bar /, html)) == 2
@@ -251,14 +254,20 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowWidgetsTest do
     test "query records lead diagnostics and charts remain available on demand" do
       result = %{
         status: :ok,
-        message: "1 row(s)",
-        rows: [record("ready")],
+        message: "2 row(s)",
+        rows: [record("ready"), record("failed")],
         quality: %{exactness: "projected_exact"},
         usage: %{range_seeks: 1},
         visualization: %{
           scope: :current_page,
-          row_count: 1,
-          charts: [%{kind: :category, field: "state", values: [%{label: "ready", count: 1}]}]
+          row_count: 2,
+          charts: [
+            %{
+              kind: :category,
+              field: "state",
+              values: [%{label: "ready", count: 1}, %{label: "failed", count: 1}]
+            }
+          ]
         }
       }
 
@@ -288,7 +297,8 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowWidgetsTest do
         refute html =~ "explicitly cancelled"
         refute html =~ "Waiting for Signal"
         refute html =~ "Signal action below to resume"
-        assert html =~ "Ready for worker claim"
+        assert html =~ "Due time reached"
+        refute html =~ "Ready for worker claim"
       end
     end
 

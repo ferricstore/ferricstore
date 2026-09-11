@@ -107,8 +107,8 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailActions do
           assert String.contains?(html, ~s(href="#flow-event-))
           assert String.contains?(html, ~s(id="flow-event-))
           assert String.contains?(html, "ready")
-          assert String.contains?(html, "Step Waterfall")
-          assert String.contains?(html, ~s(aria-label="Step timing"))
+          assert String.contains?(html, "Event intervals")
+          assert String.contains?(html, ~s(aria-label="Event intervals"))
           assert String.contains?(html, ~s(class="flow-step-waterfall"))
           assert String.contains?(html, ~s(class="flow-step-waterfall-row"))
           assert String.contains?(html, ~s(class="flow-step-waterfall-track"))
@@ -173,7 +173,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailActions do
 
           assert String.contains?(
                    html,
-                   ~s(title="Choose one of this flow&#39;s loaded history events")
+                   ~s(<option value="" selected disabled>Choose a target event</option>)
                  )
 
           assert String.contains?(html, ~s(title="Create a durable rewind to the selected event"))
@@ -254,6 +254,8 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailActions do
                      "id" => id,
                      "partition_key" => partition_key,
                      "to_event" => created_event_id,
+                     "expect_state" => ready.state,
+                     "expected_version" => to_string(ready.version),
                      "confirm_rewind" => "true"
                    })
 
@@ -274,10 +276,14 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailActions do
                      now_ms: 1_000
                    )
 
+          assert {:ok, reviewed} = FerricStore.flow_get(id)
+
           assert {:error, reason} =
                    Dashboard.apply_flow_rewind_form(%{
                      "id" => id,
                      "to_event" => "999999-9",
+                     "expect_state" => reviewed.state,
+                     "expected_version" => to_string(reviewed.version),
                      "confirm_rewind" => "true"
                    })
 
@@ -323,10 +329,14 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailActions do
               fields["event"] == "transitioned" and fields["state"] == "approval"
             end)
 
+          assert {:ok, reviewed} = FerricStore.flow_get(this_id)
+
           assert {:error, reason} =
                    Dashboard.apply_flow_rewind_form(%{
                      "id" => this_id,
                      "to_event" => other_transition_event_id,
+                     "expect_state" => reviewed.state,
+                     "expected_version" => to_string(reviewed.version),
                      "confirm_rewind" => "true"
                    })
 
@@ -402,10 +412,17 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailActions do
           refute String.contains?(html, "Payload/result/error refs are clickable.")
           assert String.contains?(html, ~s(id="flow-value-modal"))
           assert String.contains?(html, ~s(id="flow-value-modal-copy"))
-          assert String.contains?(html, "openFromHash")
-          assert String.contains?(html, "flowValueRequestUrl")
-          assert String.contains?(html, "flowValueAnchorFromHref")
-          assert String.contains?(html, "openFromRef")
+          assert html =~ FerricstoreServer.Health.Dashboard.Assets.path(:js)
+
+          assert {:ok, "text/javascript; charset=utf-8", js} =
+                   FerricstoreServer.Health.Dashboard.Assets.fetch(
+                     FerricstoreServer.Health.Dashboard.Assets.path(:js)
+                   )
+
+          assert js =~ "openFromHash"
+          assert String.contains?(js, "flowValueRequestUrl")
+          assert String.contains?(js, "flowValueAnchorFromHref")
+          assert String.contains?(js, "openFromRef")
           assert String.contains?(html, "payload-value")
           assert String.contains?(html, "invoice-42")
           assert String.contains?(html, "flow-value:payload")
@@ -617,24 +634,23 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailActions do
           refute String.contains?(html, "running without lease expiry")
         end
 
-        test "Flow overview exposes a search form for direct flow debugging" do
+        test "Flow overview separates direct workflow lookup from local scope" do
           html = Dashboard.collect_flow_page() |> Dashboard.render_flow_page()
 
           assert String.contains?(html, ~s(action="/dashboard/flow/lookup"))
           assert String.contains?(html, ~s(name="id"))
           assert String.contains?(html, ~s(name="partition_key"))
-          assert String.contains?(html, "Search flow ID")
+          assert String.contains?(html, "Open workflow")
+          assert Regex.match?(~r/<input[^>]*name="id"[^>]* required/, html)
           assert String.contains?(html, ~s(title="Open a flow by ID."))
 
           assert String.contains?(
                    html,
-                   ~s(title="With a Flow ID, scopes the detail lookup. Without a Flow ID, filters the overview to this partition.")
+                   ~s(title="Partition of the workflow to open")
                  )
 
-          assert String.contains?(
-                   html,
-                   ~s(title="Open a flow by ID or filter overview by partition")
-                 )
+          assert String.contains?(html, ~s(aria-label="Workflow scope"))
+          assert String.contains?(html, "Apply scope")
         end
 
         test "Flow overview can be scoped to a searched partition key" do

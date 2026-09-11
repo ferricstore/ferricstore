@@ -67,7 +67,8 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
 
       assert html =~ "flow-diagnostic-hero hero-blocked"
       assert html =~ "Lease Expired (Worker: worker-dead)"
-      assert html =~ "Work is reclaimable"
+      assert html =~ "Check state policy and claim limits before recovery"
+      refute html =~ "Work is reclaimable"
     end
 
     test "does not infer signal suspension from explanatory text" do
@@ -87,7 +88,8 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
 
       html = FlowDetail.render_flow_diagnostic_hero(data)
 
-      assert html =~ "Ready for worker claim"
+      assert html =~ "Due time reached"
+      refute html =~ "Ready for worker claim"
       refute html =~ "Waiting for Signal"
       refute html =~ "Signal action"
     end
@@ -234,7 +236,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
         ])
 
       assert html =~ ~s(href="#journal-flow-event-)
-      assert html =~ ~s(aria-label="Step timing")
+      assert html =~ ~s(aria-label="Event intervals")
     end
 
     test "waterfall axis marks both edges for contained label alignment" do
@@ -763,7 +765,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
 
       assert html =~ "child-flow-1"
       assert html =~ "child-flow-2"
-      assert html =~ ~s(class="badge badge-merging">running</span>)
+      assert html =~ ~s(class="badge badge-idle">running</span>)
       assert html =~ ~s(class="badge badge-ok">completed</span>)
       assert html =~ "parent: root-flow-0"
     end
@@ -914,12 +916,12 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
       assert html =~ ~s(name="target_type")
       assert html =~ ~s(name="overlap_policy")
       assert html =~ ~s(<option value="allow")
-      assert html =~ ~s(<option value="skip" selected>)
+      assert html =~ ~r/<option value="skip"[^>]* selected>Skip<\/option>/
       assert html =~ ~s(<option value="queue_after_previous")
       assert html =~ ~s(<option value="fail_schedule")
       refute html =~ ~s(value="cancel_previous")
       refute html =~ ~s(value="replace")
-      assert html =~ "➕ Create Schedule"
+      assert html =~ "Review schedule"
     end
 
     test "Schedules.apply_form creates cron schedule" do
@@ -934,7 +936,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
         "target_partition" => "tenant-alpha",
         "overlap_policy" => "skip",
         "timezone" => "Etc/UTC",
-        "overwrite" => "true"
+        "overwrite" => "false"
       }
 
       assert {:ok, message} = FerricstoreServer.Health.Dashboard.Flow.Schedules.apply_form(params)

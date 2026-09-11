@@ -4,6 +4,34 @@ defmodule Ferricstore.Flow.Query.BuilderTest do
   alias Ferricstore.Flow.Query
   alias Ferricstore.Flow.Query.Builder
 
+  test "any strings are literal predicates while atom any explicitly omits optional predicates" do
+    base = %{
+      partition_key: "tenant",
+      type: "any",
+      state: "any",
+      run_state: "any",
+      attribute: {"flag", ""}
+    }
+
+    assert {:ok, literal} = Builder.build(:search, base)
+    assert literal.params["type"] == "any"
+    assert literal.params["state"] == "any"
+    assert literal.params["run_state"] == "any"
+    assert literal.params["attribute_value"] == ""
+    assert {:ok, _} = Query.prepare_reference("FQL1", literal.query, literal.params)
+
+    assert {:ok, wildcard} =
+             Builder.build(:search, %{base | type: :any, state: :any, run_state: :any})
+
+    refute Map.has_key?(wildcard.params, "type")
+    refute Map.has_key?(wildcard.params, "state")
+    refute Map.has_key?(wildcard.params, "run_state")
+    assert {:ok, _} = Query.prepare_reference("FQL1", wildcard.query, wildcard.params)
+
+    assert {:error, :invalid_query_filter} =
+             Builder.build(:terminals, Map.delete(base, :attribute))
+  end
+
   test "builds every retired record-read shape as a bound FQL request" do
     cases = [
       {:list, %{partition_key: "tenant-a", type: "invoice", state: "queued"}},

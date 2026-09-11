@@ -620,6 +620,17 @@ defmodule Ferricstore.Stats do
     end
   end
 
+  @doc "Returns the observed counters for one prefix, or nil when it is not tracked."
+  @spec hotness_for_prefix(binary()) :: {non_neg_integer(), non_neg_integer()} | nil
+  def hotness_for_prefix(prefix) when is_binary(prefix) do
+    case :ets.lookup(@hotness_table, prefix) do
+      [{^prefix, hot, cold}] -> {hot, cold}
+      [] -> nil
+    end
+  rescue
+    ArgumentError -> nil
+  end
+
   @doc """
   Resets all hotness counters (both global and per-prefix).
 

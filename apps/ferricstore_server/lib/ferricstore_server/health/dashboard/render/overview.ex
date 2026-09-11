@@ -15,6 +15,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
         overview.status != :ok -> {"dot-red", "degraded"}
         subsystem_status in [:degraded, :unavailable] -> {"dot-red", "degraded"}
         memory.pressure_level == :reject -> {"dot-red", "rejecting"}
+        memory.pressure_level == :unavailable -> {"dot-yellow", "memory unavailable"}
         subsystem_status == :warning -> {"dot-yellow", "warning"}
         memory.pressure_level == :pressure -> {"dot-yellow", "pressure"}
         memory.pressure_level == :warning -> {"dot-yellow", "warning"}
@@ -28,12 +29,6 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
     hit_value =
       if hotcold_has_samples?(hotcold), do: "#{hotcold.hit_ratio}%", else: "No read samples"
 
-    # Memory bar
-    mem_pct = if memory.max_bytes > 0, do: Float.round(memory.ratio * 100, 1), else: 0.0
-    mem_bar_color = mem_bar_color(mem_pct)
-    mem_bar_width = min(mem_pct, 100)
-    memory_limit = if memory.max_bytes > 0, do: format_bytes(memory.max_bytes), else: "unlimited"
-
     # Cluster info
     cluster_label =
       case cluster.cluster_mode do
@@ -45,38 +40,37 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
 
     """
     <div class="top-bar">
+      <div class="top-bar-identity">
       <div class="logo"><span class="status-dot #{dot_class}"></span>FerricStore</div>
       <div class="sep"></div>
       <div class="metric">
         <span class="label">Node</span>
-        <span class="val" style="font-size:0.75rem;">#{escape(node_short)}</span>
+        <span class="val" title="#{escape_attr(node_short)}" style="font-size:0.75rem;">#{escape(node_short)}</span>
       </div>
       <div class="sep"></div>
       <div class="metric">
         <span class="label">Cluster</span>
-        <span class="val" style="font-size:0.85rem;">#{escape(cluster_label)}</span>
+        <span class="val" title="#{escape_attr(cluster_label)}" style="font-size:0.85rem;">#{escape(cluster_label)}</span>
       </div>
       <div class="sep"></div>
       <div class="metric">
         <span class="label">Status</span>
         <span class="val" style="font-size:0.85rem;">#{escape(status_text)}</span>
       </div>
+      </div>
+      <div class="top-bar-metrics">
       <div class="sep"></div>
       <div class="metric">
-        <span class="label">Ops/sec</span>
-        <span class="val">#{format_rate(hotcold.ops_per_sec)}</span>
+        <span class="label" title="Average commands per second since start">Avg ops/sec</span>
+        <span class="val" title="Average since start">#{format_rate(hotcold.ops_per_sec)}</span>
       </div>
       <div class="sep"></div>
       <div class="metric">
         <span class="label">Hit Rate #{sampled_tag(hotcold.sample_rate)}</span>
-        <span class="val" style="color:#{hit_color};">#{escape(hit_value)}</span>
+        <span class="val" title="#{escape_attr(hit_value)}" style="color:#{hit_color};">#{escape(hit_value)}</span>
       </div>
       <div class="sep"></div>
-      <div class="metric">
-        <span class="label">Memory</span>
-        <span class="val" style="font-size:0.85rem;">#{format_bytes(memory.total_bytes)} / #{memory_limit}</span>
-        <div class="mem-bar-wrap"><div class="mem-bar-fill" style="width:#{mem_bar_width}%;background:#{mem_bar_color};"></div></div>
-      </div>
+      #{render_memory_metrics(memory)}
       <div class="sep"></div>
       <div class="metric">
         <span class="label">Connections</span>
@@ -87,6 +81,42 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
         <span class="label">Keys</span>
         <span class="val">#{format_number(overview.total_keys)}</span>
       </div>
+      </div>
+    </div>
+    """
+  end
+
+  defp render_memory_metrics(memory) do
+    rss = Map.get(memory, :rss_bytes, 0)
+    rss_limit = if memory.max_bytes > 0, do: Map.get(memory, :memory_limit, 0), else: 0
+
+    rss_html =
+      if rss > 0 do
+        render_memory_metric("Process RSS", rss, rss_limit, Map.get(memory, :rss_ratio, 0.0))
+      else
+        ~s(<div class="metric"><span class="label">Process RSS</span><span class="val" title="Process RSS unavailable">Unavailable</span></div>)
+      end
+
+    tracked =
+      render_memory_metric(
+        "Tracked allocations",
+        memory.total_bytes,
+        memory.max_bytes,
+        memory.ratio
+      )
+
+    rss_html <> ~s(<div class="sep"></div>) <> tracked
+  end
+
+  defp render_memory_metric(label, bytes, limit, ratio) do
+    pct = if limit > 0, do: Float.round(ratio * 100, 1), else: 0.0
+    value = "#{format_bytes(bytes)} / #{if limit > 0, do: format_bytes(limit), else: "unlimited"}"
+
+    """
+    <div class="metric">
+      <span class="label">#{escape(label)}</span>
+      <span class="val" title="#{escape_attr(value)}" style="font-size:0.85rem;">#{escape(value)}</span>
+      <div class="mem-bar-wrap"><div class="mem-bar-fill" style="width:#{min(pct, 100)}%;background:#{mem_bar_color(pct)};"></div></div>
     </div>
     """
   end
@@ -110,7 +140,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
 
     """
     <section class="operator-attention" aria-labelledby="operator-attention-title">
-      <div class="section-title" id="operator-attention-title">Operator Attention <span class="badge badge-idle">#{length(items)}</span></div>
+      <h2 class="section-title" id="operator-attention-title">Operator Attention <span class="badge badge-idle">#{length(items)}</span></h2>
       <div class="operator-attention-list">#{body}</div>
     </section>
     """
@@ -288,38 +318,53 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
     hit_value = if has_samples, do: "#{data.hit_ratio}%", else: "No read samples"
     hit_class = if has_samples, do: "", else: " hit-rate-empty"
 
+    source_hits =
+      case Map.get(data, :total_hits) do
+        hits when is_number(hits) ->
+          hits
+
+        _ ->
+          case {Map.get(data, :total_hot), Map.get(data, :total_cold)} do
+            {hot, cold} when is_number(hot) and is_number(cold) -> hot + cold
+            _ -> nil
+          end
+      end
+
+    has_source_samples = is_number(source_hits) and source_hits > 0
+    empty_source = if has_samples, do: "No hit samples", else: "No read samples"
+
     # RAM bar color -- always green (fast path)
     # Disk bar color -- orange (slow path)
-    ram_bar_width = min(data.ram_ratio, 100)
-    disk_bar_width = min(data.disk_ratio, 100)
+    ram_bar_width = if has_source_samples, do: min(data.ram_ratio, 100), else: 0
+    disk_bar_width = if has_source_samples, do: min(data.disk_ratio, 100), else: 0
 
     """
-    <div class="section-title">Cache Performance</div>
+    <h2 class="section-title">Cache Performance</h2>
     <div class="cache-hero">
       <div class="hit-rate-card">
         <div class="hit-rate-num#{hit_class}" style="color:#{hit_color};">#{escape(hit_value)}</div>
         <div class="hit-rate-label">Hit Rate #{sampled_tag(data.sample_rate)}</div>
         <div class="hit-rate-sub">
           <span>#{format_rate(data.hits_per_sec)}</span> hits/sec #{sampled_tag(data.sample_rate)} &middot;
-          <span>#{format_rate(data.misses_per_sec)}</span> misses/sec
+          <span>#{format_rate(data.misses_per_sec)}</span> misses/sec &middot; averages since start
         </div>
       </div>
       <div class="source-card">
         <div style="font-size:0.75rem; color:#8b949e; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">Where hits come from</div>
         <div class="source-row">
           <div>
-            <div class="source-name">RAM #{sampled_tag(data.sample_rate)} #{info_icon("Served from ETS in-memory cache. Estimated from 1:#{data.sample_rate} sampling. Latency: about 1-5 microseconds.")}</div>
-            <div class="source-detail">fast path (~1-5us)</div>
+            <div class="source-name">RAM #{sampled_tag(data.sample_rate)} #{info_icon("Served from ETS in-memory cache. Estimated from 1:#{data.sample_rate} sampling. These counters do not measure latency.", "About RAM reads")}</div>
+            <div class="source-detail">in-memory reads &middot; latency not measured</div>
           </div>
-          <div class="source-pct c-green">#{data.ram_ratio}%</div>
+          <div class="source-pct #{if has_source_samples, do: "c-green", else: "c-muted source-pct-empty"}">#{if has_source_samples, do: "#{data.ram_ratio}%", else: empty_source}</div>
         </div>
         <div class="source-bar-wrap"><div class="source-bar-fill" style="width:#{ram_bar_width}%;background:#3fb950;"></div></div>
         <div class="source-row">
           <div>
-            <div class="source-name">Disk #{info_icon("Required Bitcask disk read. This is an exact count, not sampled. Latency is usually about 50-200 microseconds. High disk ratio means memory pressure is evicting hot keys.")}</div>
-            <div class="source-detail">slow path (~50-200us) &middot; exact</div>
+            <div class="source-name">Disk #{info_icon("Required a Bitcask disk read. This is an exact count, not sampled. These counters do not measure latency or identify why a value was absent from RAM.", "About disk reads")}</div>
+            <div class="source-detail">disk reads &middot; exact count</div>
           </div>
-          <div class="source-pct c-yellow">#{data.disk_ratio}%</div>
+          <div class="source-pct #{if has_source_samples, do: "c-yellow", else: "c-muted source-pct-empty"}">#{if has_source_samples, do: "#{data.disk_ratio}%", else: empty_source}</div>
         </div>
         <div class="source-bar-wrap"><div class="source-bar-fill" style="width:#{disk_bar_width}%;background:#d29922;"></div></div>
       </div>
@@ -368,7 +413,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
       end
 
     """
-    <div class="section-title">Key Lifecycle</div>
+    <h2 class="section-title">Key Lifecycle</h2>
     #{keydir_full_alert}<div class="cache-hero">
       <div class="source-card">
         <div style="font-size:0.75rem; color:#8b949e; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">Expired</div>
@@ -380,7 +425,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
         </div>
         <div class="source-row">
           <div>
-            <div class="source-name">Rate</div>
+            <div class="source-name">Average rate since start</div>
           </div>
           <div class="source-pct">#{format_rate(data.expired_per_sec)}/sec</div>
         </div>
@@ -395,7 +440,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
         </div>
         <div class="source-row">
           <div>
-            <div class="source-name">Rate</div>
+            <div class="source-name">Average rate since start</div>
           </div>
           <div class="source-pct #{evicted_color}">#{format_rate(data.evicted_per_sec)}/sec</div>
         </div>
@@ -447,7 +492,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
       end
 
     """
-    <div class="section-title">Shards #{summary_badge}</div>
+    <h2 class="section-title">Shards #{summary_badge}</h2>
     <table>
       <thead>
         <tr><th>Shard</th><th>Status</th><th>Keys</th><th>Memory</th><th>Disk</th></tr>
@@ -465,7 +510,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
       ""
     else
       level_str = Atom.to_string(data.pressure_level)
-      pct = if data.max_bytes > 0, do: Float.round(data.ratio * 100, 1), else: 0.0
+      tracked_ratio = if data.max_bytes > 0, do: data.ratio, else: 0.0
+      rss_ratio = Map.get(data, :rss_ratio, 0.0)
+      basis = if rss_ratio > tracked_ratio, do: "Process RSS", else: "Tracked allocations"
+      pct = Float.round(max(tracked_ratio, rss_ratio) * 100, 1)
       bar_color = mem_bar_color(pct)
       bar_width = min(pct, 100)
 
@@ -488,13 +536,13 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
       action_text =
         case data.pressure_level do
           :warning ->
-            "Consider increasing max_memory or reviewing eviction policy."
+            "Inspect process RSS and tracked allocations against their separate budgets."
 
           :pressure ->
             "Eviction active. Keys are being removed under #{escape(Atom.to_string(data.eviction_policy))} policy."
 
           :reject ->
-            "Writes are being rejected. Increase max_memory immediately."
+            "Writes are being rejected. Inspect the limiting memory budget before adjusting capacity."
 
           _ ->
             ""
@@ -524,13 +572,14 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
         end)
 
       """
-      <div class="section-title">Memory Pressure <span class="badge #{badge_class}">#{escape(level_str)}</span></div>
+      <h2 class="section-title">Memory Pressure <span class="badge #{badge_class}">#{escape(level_str)}</span></h2>
       <div class="pressure-alert #{level_class}">
         <div class="pressure-details">
-          <span>#{format_bytes(data.total_bytes)}</span> / <span>#{format_bytes(data.max_bytes)}</span> (#{pct}%)
+          <span>#{basis}</span> (#{pct}%)
           &middot; Policy: <span>#{escape(Atom.to_string(data.eviction_policy))}</span>
         </div>
         <div class="pressure-bar-wrap"><div class="pressure-bar-fill" style="width:#{bar_width}%;background:#{bar_color};"></div></div>
+        <div class="conn-row">#{render_memory_metrics(data)}</div>
         <div class="pressure-action">#{action_text}</div>
       </div>
       <table>
@@ -549,7 +598,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
     blocked_class = if data.blocked > 0, do: "c-yellow", else: ""
 
     """
-    <div class="section-title">Connections</div>
+    <h2 class="section-title">Connections</h2>
     <div class="conn-row">
       <div class="conn-item">
         <span class="conn-label">Active </span>
@@ -612,7 +661,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
       end)
 
     """
-    <div class="section-title">#{escape(title)}</div>
+    <h2 class="section-title">#{escape(title)}</h2>
     <div class="ops-summary-grid">
       #{card_html}
     </div>

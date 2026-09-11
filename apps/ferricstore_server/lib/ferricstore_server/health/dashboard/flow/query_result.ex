@@ -150,6 +150,31 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.QueryResult do
     |> maybe_put_known_map(:usage, response, @usage_fields)
   end
 
+  def present(%{status: :ok, command: "FLOW.QUERY", rows: rows} = result, %{mode: :guided} = form)
+      when is_list(rows) and not is_map_key(result, :scalar) and not is_map_key(result, :explain) do
+    if Map.get(result, :source, :runs) == :runs do
+      kind = (Map.get(form, :guided_query) || "") |> URI.decode_query() |> Map.get("kind")
+      selectors = FerricstoreServer.Health.Dashboard.Flow.QueryProjection.guided_fields(kind)
+
+      Map.merge(result, %{
+        presentation: :workbench,
+        guided_projection: true,
+        source: :runs,
+        columns: Enum.map(selectors, &Atom.to_string/1),
+        column_labels:
+          FerricstoreServer.Health.Dashboard.Flow.QueryProjection.guided_labels(kind),
+        column_selectors: selectors,
+        captured_at_ms: System.system_time(:millisecond)
+      })
+    else
+      result
+    end
+  end
+
+  def present(result, :guided), do: present(result, %{mode: :guided, guided_query: ""})
+
+  def present(result, _mode), do: result
+
   defp scalar_or_legacy(command, response) do
     case known_value(response, :result) do
       result when is_map(result) ->

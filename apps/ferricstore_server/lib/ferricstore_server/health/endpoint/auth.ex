@@ -39,6 +39,8 @@ defmodule FerricstoreServer.Health.Endpoint.Auth do
 
   defp do_authorize_request("POST", "/dashboard/logout", _peer, _headers), do: :ok
 
+  defp do_authorize_request("GET", "/dashboard/assets/" <> _name, _peer, _headers), do: :ok
+
   defp do_authorize_request(method, path, peer, headers) do
     cond do
       RouteRequirements.dashboard_path?(path) ->
@@ -116,6 +118,15 @@ defmodule FerricstoreServer.Health.Endpoint.Auth do
           {:redirect_login, unauthenticated_location(path)}
         end
     end
+  end
+
+  @doc false
+  def acl_requirement_allowed?(username, requirement) when is_binary(username) do
+    authorize_acl_requirement(username, requirement) == :ok
+  rescue
+    _ -> false
+  catch
+    :exit, _ -> false
   end
 
   defp authorize_acl_requirement(username, {"*", opts}),

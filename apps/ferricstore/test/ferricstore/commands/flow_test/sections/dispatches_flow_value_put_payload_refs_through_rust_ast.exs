@@ -325,7 +325,7 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowValuePutPayloadRe
                    :terminals,
                    %{
                      type: type,
-                     state: "any",
+                     state: :any,
                      partition_key: partition,
                      from_ms: max(failed_at_ms - 1, 0),
                      to_ms: failed_at_ms + 1,
