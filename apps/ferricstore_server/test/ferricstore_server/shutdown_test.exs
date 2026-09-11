@@ -379,7 +379,8 @@ defmodule FerricstoreServer.ShutdownTest do
       config_table: :ets.new(:test_config, [:set, :public]),
       connected_clients_fn: fn -> 0 end,
       process_rss_fn: nil,
-      server_info_fn: fn -> %{} end
+      server_info_fn: fn -> %{} end,
+      query_index_provider: FerricStore.Flow.QueryIndexProvider.Disabled
     }
   end
 end

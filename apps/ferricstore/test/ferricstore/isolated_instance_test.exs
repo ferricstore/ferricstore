@@ -77,6 +77,9 @@ defmodule Ferricstore.IsolatedInstanceTest do
       ctx = IsolatedInstance.checkout()
       name = ctx.name
       data_dir = ctx.data_dir
+      flush_coordinator = Ferricstore.Flow.LMDBFlushCoordinator.name(name)
+
+      assert is_pid(Process.whereis(flush_coordinator))
 
       FerricStore.Impl.set(ctx, "cleanup_test", "value")
       IsolatedInstance.checkin(ctx)
@@ -88,6 +91,7 @@ defmodule Ferricstore.IsolatedInstanceTest do
 
       # Data dir should be removed
       refute File.exists?(data_dir)
+      refute Process.whereis(flush_coordinator)
     end
 
     test "hash operations in isolated instance" do

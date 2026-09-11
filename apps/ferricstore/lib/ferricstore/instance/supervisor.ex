@@ -99,6 +99,18 @@ defmodule FerricStore.Instance.Supervisor do
         end)
       end
 
+    lmdb_flush_coordinator_children =
+      if name == :default do
+        []
+      else
+        [
+          Supervisor.child_spec(
+            {Ferricstore.Flow.LMDBFlushCoordinator, instance_name: ctx.name},
+            id: Ferricstore.Flow.LMDBFlushCoordinator.name(ctx.name)
+          )
+        ]
+      end
+
     query_index_provider_children =
       case FerricStore.Flow.QueryIndexProvider.child_specs(ctx) do
         {:ok, specs} -> specs
@@ -204,6 +216,7 @@ defmodule FerricStore.Instance.Supervisor do
       cleanup_children ++
         merge_children ++
         bitcask_writer_children ++
+        lmdb_flush_coordinator_children ++
         query_index_provider_children ++
         flow_lmdb_writer_children ++
         [
