@@ -4,6 +4,8 @@ defmodule Ferricstore.Flow.SchedulerTest do
   alias Ferricstore.Flow.ClaimWaiters
   alias Ferricstore.Flow.Scheduler
 
+  @claim_waiter_table :ferricstore_flow_claim_waiters
+
   test "configuration validates the batch limit and is a stable snapshot" do
     previous_limit = Application.get_env(:ferricstore, :flow_scheduler_limit)
 
@@ -97,7 +99,14 @@ defmodule Ferricstore.Flow.SchedulerTest do
       Process.exit(scheduler, :shutdown)
     end)
 
-    assert eventually(fn -> ClaimWaiters.total_count() > 0 end)
+    waiter_keys = ClaimWaiters.wait_keys("__ferricstore_schedule", "active", nil, :any)
+
+    assert eventually(
+             fn -> scheduler_waiting?(scheduler, waiter_keys) end,
+             timeout: 15_000,
+             interval: 25
+           ),
+           "scheduler did not register a waiter; state: #{inspect(scheduler_state(scheduler), limit: 10)}"
 
     now_ms = Ferricstore.CommandTime.now_ms()
     schedule_id = unique_flow_id("scheduler-future")
@@ -120,4 +129,26 @@ defmodule Ferricstore.Flow.SchedulerTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
+
+  defp scheduler_waiting?(scheduler, waiter_keys) do
+    case scheduler_state(scheduler) do
+      %{task: task} when is_pid(task) ->
+        case :ets.whereis(@claim_waiter_table) do
+          :undefined ->
+            false
+
+          table ->
+            Enum.any?(waiter_keys, &(:ets.match_object(table, {&1, task, :_, :_, :_}) != []))
+        end
+
+      _state ->
+        false
+    end
+  end
+
+  defp scheduler_state(scheduler) do
+    :sys.get_state(scheduler)
+  catch
+    :exit, reason -> {:exit, reason}
+  end
 end

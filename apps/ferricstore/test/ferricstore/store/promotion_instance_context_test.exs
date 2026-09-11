@@ -480,7 +480,7 @@ defmodule Ferricstore.Store.PromotionInstanceContextTest do
     old_hook = Application.get_env(:ferricstore, :compound_promotion_worker_test_hook)
     old_timeout = Application.get_env(:ferricstore, :promotion_compaction_latch_timeout_ms)
 
-    Application.put_env(:ferricstore, :promotion_compaction_latch_timeout_ms, 200)
+    Application.put_env(:ferricstore, :promotion_compaction_latch_timeout_ms, 1)
 
     Application.put_env(:ferricstore, :compound_promotion_worker_test_hook, fn
       ^redis_key ->
@@ -521,13 +521,22 @@ defmodule Ferricstore.Store.PromotionInstanceContextTest do
 
     assert_receive {:promotion_worker_paused, worker_pid}, 5_000
 
+    cleanup_generation = Promotion.new_generation()
+
     send(
       shard,
-      {:cleanup_promoted_after_commit, redis_key, :hash, dedicated_path,
-       Promotion.new_generation()}
+      {:cleanup_promoted_after_commit, redis_key, :hash, dedicated_path, cleanup_generation}
     )
 
-    Process.sleep(25)
+    Ferricstore.Test.ShardHelpers.eventually(fn ->
+      state = :sys.get_state(shard)
+
+      Map.has_key?(
+        state.post_commit_promotion_retry_timers,
+        {:cleanup, redis_key, :hash, dedicated_path, cleanup_generation}
+      )
+    end)
+
     send(worker_pid, :continue_promotion)
 
     Ferricstore.Test.ShardHelpers.eventually(fn ->

@@ -1097,9 +1097,12 @@ defmodule Ferricstore.Store.Shard.Info do
         retry = {:removal, redis_key, expected_generation}
 
         result =
-          Promotion.with_compaction_latch(state, redis_key, fn ->
-            post_commit_promotion_state(state, redis_key, expected_generation, :any)
-          end)
+          case Promotion.try_with_compaction_latch(state, redis_key, fn ->
+                 post_commit_promotion_state(state, redis_key, expected_generation, :any)
+               end) do
+            :busy -> {:retry, :compaction_latch_busy}
+            {:ok, result} -> result
+          end
 
         case result do
           {:ok, disposition} ->
@@ -1147,48 +1150,51 @@ defmodule Ferricstore.Store.Shard.Info do
 
         try do
           result =
-            Promotion.with_compaction_latch(state, redis_key, fn ->
-              case post_commit_promotion_state(
-                     state,
-                     redis_key,
-                     expected_generation,
-                     type
-                   ) do
-                {:ok, {:current_promoted_incarnation, ^type} = disposition} ->
-                  {:ok, disposition}
+            case Promotion.try_with_compaction_latch(state, redis_key, fn ->
+                   case post_commit_promotion_state(
+                          state,
+                          redis_key,
+                          expected_generation,
+                          type
+                        ) do
+                     {:ok, {:current_promoted_incarnation, ^type} = disposition} ->
+                       {:ok, disposition}
 
-                {:ok, {:current_promoted_incarnation, _different_type} = disposition} ->
-                  :ok =
-                    Promotion.remove_orphaned_dedicated!(
-                      redis_key,
-                      type,
-                      dedicated_path,
-                      state.data_dir,
-                      state.index
-                    )
+                     {:ok, {:current_promoted_incarnation, _different_type} = disposition} ->
+                       :ok =
+                         Promotion.remove_orphaned_dedicated!(
+                           redis_key,
+                           type,
+                           dedicated_path,
+                           state.data_dir,
+                           state.index
+                         )
 
-                  {:ok, disposition}
+                       {:ok, disposition}
 
-                {:ok, disposition} when disposition in [:deleted, :recreated_unpromoted] ->
-                  :ok =
-                    Promotion.cleanup_promoted!(
-                      redis_key,
-                      type,
-                      dedicated_path,
-                      state.shard_data_path,
-                      state.keydir,
-                      state.data_dir,
-                      state.index,
-                      state.instance_ctx,
-                      expected_generation
-                    )
+                     {:ok, disposition} when disposition in [:deleted, :recreated_unpromoted] ->
+                       :ok =
+                         Promotion.cleanup_promoted!(
+                           redis_key,
+                           type,
+                           dedicated_path,
+                           state.shard_data_path,
+                           state.keydir,
+                           state.data_dir,
+                           state.index,
+                           state.instance_ctx,
+                           expected_generation
+                         )
 
-                  {:ok, disposition}
+                       {:ok, disposition}
 
-                retry_or_fatal ->
-                  retry_or_fatal
-              end
-            end)
+                     retry_or_fatal ->
+                       retry_or_fatal
+                   end
+                 end) do
+              :busy -> {:retry, :compaction_latch_busy}
+              {:ok, result} -> result
+            end
 
           case result do
             {:ok, disposition} ->
@@ -1309,8 +1315,8 @@ defmodule Ferricstore.Store.Shard.Info do
           if attempt == 0 or
                (attempt >= max_delay_index and rem(attempt - max_delay_index, 60) == 0) do
             Logger.warning(
-              "Shard #{state.index}: deferring post-commit promotion cleanup after " <>
-                "metadata read failure for #{inspect(elem(retry, 1))}: #{inspect(reason)}"
+              "Shard #{state.index}: deferring post-commit promotion cleanup for " <>
+                "#{inspect(elem(retry, 1))}: #{inspect(reason)}"
             )
           end
 

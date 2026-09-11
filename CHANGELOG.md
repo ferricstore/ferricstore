@@ -25,6 +25,8 @@ All notable changes to FerricStore will be documented here.
 - Serialized promoted compound routing through durable publication, rechecked
   deferred candidates against the exact indexed cardinality, and made exact
   prefix, batch, and collection deletion retire promotion metadata and storage.
+  Contended post-commit retirement now defers through the bounded retry queue
+  instead of blocking or terminating the shard.
 
 ## 0.11.14 - 2026-08-29
 

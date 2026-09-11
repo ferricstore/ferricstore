@@ -20,7 +20,7 @@ defmodule Ferricstore.Store.TypeRegistry do
   3. Returns `{:error, wrongtype_message}` if the type mismatches
   """
 
-  alias Ferricstore.Store.{CompoundKey, Ops, Promotion, ReadResult}
+  alias Ferricstore.Store.{CompoundKey, LocalTxStore, Ops, Promotion, ReadResult}
 
   @wrongtype_msg "WRONGTYPE Operation against a key holding the wrong kind of value"
 
@@ -258,7 +258,9 @@ defmodule Ferricstore.Store.TypeRegistry do
   ## Parameters
 
     - `redis_key` - the Redis key whose type to remove
-    - `store` - the store (Instance, LocalTxStore, or closure map)
+    - `store` - the store (Instance, LocalTxStore, or closure map). A promoted
+      collection requires an owner-aware Instance or closure map so its
+      dedicated storage can be retired atomically.
   """
   @spec delete_type(binary(), map()) :: :ok | {:error, term()} | ReadResult.failure()
   def delete_type(redis_key, store) do
@@ -286,7 +288,7 @@ defmodule Ferricstore.Store.TypeRegistry do
       marker when is_binary(marker) ->
         case Promotion.decode_marker(marker) do
           {:ok, type, :promoted, _generation} ->
-            Ops.compound_delete_prefix(store, redis_key, promotable_prefix(type, redis_key))
+            cleanup_promoted_prefix(store, redis_key, type)
 
           {:ok, _type, _intent, _generation} ->
             :ok
@@ -299,6 +301,12 @@ defmodule Ferricstore.Store.TypeRegistry do
         end
     end
   end
+
+  defp cleanup_promoted_prefix(%LocalTxStore{}, _redis_key, _type),
+    do: ReadResult.failure(:promoted_cleanup_requires_owner_context)
+
+  defp cleanup_promoted_prefix(store, redis_key, type),
+    do: Ops.compound_delete_prefix(store, redis_key, promotable_prefix(type, redis_key))
 
   defp promotable_prefix(:hash, redis_key), do: CompoundKey.hash_prefix(redis_key)
   defp promotable_prefix(:set, redis_key), do: CompoundKey.set_prefix(redis_key)

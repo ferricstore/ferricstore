@@ -1,7 +1,8 @@
 defmodule Ferricstore.Store.TypeRegistryTest do
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Store.{CompoundKey, TypeRegistry}
+  alias Ferricstore.Store.{CompoundKey, LocalTxStore, Promotion, ReadResult, TypeRegistry}
+  alias Ferricstore.Store.Shard.CompoundMemberIndex
 
   test "check_or_set propagates type marker write errors" do
     store = %{
@@ -64,5 +65,52 @@ defmodule Ferricstore.Store.TypeRegistryTest do
 
     assert :ok = TypeRegistry.rollback_created_type("hash", store)
     assert_receive :type_deleted
+  end
+
+  test "promoted deletion fails closed without an owner-aware store" do
+    keydir = :ets.new(:promoted_type_registry_keydir, [:set, :public])
+    compound_index = :ets.new(:promoted_type_registry_compound_index, [:ordered_set, :public])
+    :ok = CompoundMemberIndex.reset(compound_index)
+
+    redis_key = "promoted-hash"
+    marker_key = Promotion.marker_key(redis_key)
+    type_key = CompoundKey.type_key(redis_key)
+    member_key = CompoundKey.hash_field(redis_key, "field")
+
+    marker = Promotion.encode_marker(:hash, :promoted, Promotion.new_generation())
+
+    :ets.insert(keydir, [
+      {marker_key, marker, 0, 0, 0, 0, byte_size(marker)},
+      {type_key, "hash", 0, 0, 0, 0, 4},
+      {member_key, "value", 0, 0, 0, 0, 5}
+    ])
+
+    tx = %LocalTxStore{
+      instance_ctx: nil,
+      shard_index: 0,
+      shard_state: %{
+        instance_ctx: nil,
+        keydir: keydir,
+        index: 0,
+        data_dir: System.tmp_dir!(),
+        shard_data_path: System.tmp_dir!(),
+        promoted_instances: %{},
+        compound_member_index: compound_index,
+        zset_score_index: nil,
+        zset_score_lookup: nil
+      }
+    }
+
+    try do
+      assert ReadResult.failure(:promoted_cleanup_requires_owner_context) ==
+               TypeRegistry.delete_type(redis_key, tx)
+
+      assert [{^marker_key, ^marker, 0, _lfu, 0, 0, _}] = :ets.lookup(keydir, marker_key)
+      assert [{^type_key, "hash", 0, _lfu, 0, 0, 4}] = :ets.lookup(keydir, type_key)
+      assert [{^member_key, "value", 0, _lfu, 0, 0, 5}] = :ets.lookup(keydir, member_key)
+    after
+      :ets.delete(compound_index)
+      :ets.delete(keydir)
+    end
   end
 end

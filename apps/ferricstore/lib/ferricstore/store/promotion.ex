@@ -417,6 +417,31 @@ defmodule Ferricstore.Store.Promotion do
   end
 
   @doc false
+  @spec try_with_compaction_latch(map(), binary(), (-> term())) :: :busy | {:ok, term()}
+  def try_with_compaction_latch(owner, redis_key, fun) when is_function(fun, 0) do
+    case compaction_latch(owner, redis_key) do
+      nil ->
+        {:ok, fun.()}
+
+      {tab, latch_key, _shard_index} ->
+        case try_acquire_scoped_compaction_latch(tab, latch_key) do
+          :busy ->
+            :busy
+
+          :already_owned ->
+            {:ok, fun.()}
+
+          token ->
+            try do
+              {:ok, fun.()}
+            after
+              release_compaction_latch(token)
+            end
+        end
+    end
+  end
+
+  @doc false
   @spec acquire_compaction_latch(map(), binary()) :: :none | {term(), term()}
   def acquire_compaction_latch(owner, redis_key) do
     case compaction_latch(owner, redis_key) do
@@ -2606,6 +2631,19 @@ defmodule Ferricstore.Store.Promotion do
           _other ->
             wait_compaction_latch_clear!(tab, latch_key, shard_index, true)
             acquire_scoped_compaction_latch(tab, latch_key, shard_index)
+        end
+    end
+  end
+
+  defp try_acquire_scoped_compaction_latch(tab, latch_key) do
+    case try_acquire_latch(tab, latch_key) do
+      {:ok, token} ->
+        token
+
+      :busy ->
+        case :ets.lookup(tab, latch_key) do
+          [{^latch_key, owner}] when owner == self() -> :already_owned
+          _other -> :busy
         end
     end
   end
