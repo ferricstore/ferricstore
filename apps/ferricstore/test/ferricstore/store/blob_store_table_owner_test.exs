@@ -4,6 +4,7 @@ defmodule Ferricstore.Store.BlobStoreTableOwnerTest do
 
   alias Ferricstore.Raft.WARaftBackend.RuntimeSupervisor
   alias Ferricstore.Raft.WARaftSegmentReader.TableOwner, as: ApplyProjectionTableOwner
+  alias Ferricstore.Flow.LMDBFlushCoordinator
   alias Ferricstore.Store.ActiveFile.TableOwner, as: ActiveFileTableOwner
   alias Ferricstore.Store.BlobStore
   alias Ferricstore.Store.BlobStore.TableOwner
@@ -121,8 +122,11 @@ defmodule Ferricstore.Store.BlobStoreTableOwnerTest do
           :"standalone_blob_runtime_#{System.unique_integer([:positive])}",
           data_dir: backend_root,
           shard_count: 1,
+          query_index_provider: FerricStore.Flow.QueryIndexProvider.Disabled,
           blob_side_channel_threshold_bytes: 64
         )
+
+      start_supervised!({LMDBFlushCoordinator, instance_name: ctx.name})
 
       try do
         assert :ok =
@@ -172,7 +176,8 @@ defmodule Ferricstore.Store.BlobStoreTableOwnerTest do
       FerricStore.Instance.build(
         :"blocked_blob_runtime_#{System.unique_integer([:positive])}",
         data_dir: root,
-        shard_count: 1
+        shard_count: 1,
+        query_index_provider: FerricStore.Flow.QueryIndexProvider.Disabled
       )
 
     try do
@@ -182,7 +187,7 @@ defmodule Ferricstore.Store.BlobStoreTableOwnerTest do
 
       assert {:ok, _fake_owner} = BlockingBlobTableOwner.start_link(TableOwner)
 
-      assert {:error, _reason} =
+      assert {:error, {:waraft_runtime_start_failed, _reason}} =
                Ferricstore.Raft.WARaftBackend.start(ctx,
                  log_module: :ferricstore_waraft_spike_segment_log
                )
@@ -234,7 +239,8 @@ defmodule Ferricstore.Store.BlobStoreTableOwnerTest do
       FerricStore.Instance.build(
         :"standalone_runtime_transition_#{System.unique_integer([:positive])}",
         data_dir: standalone_root,
-        shard_count: 1
+        shard_count: 1,
+        query_index_provider: FerricStore.Flow.QueryIndexProvider.Disabled
       )
 
     try do
@@ -244,6 +250,7 @@ defmodule Ferricstore.Store.BlobStoreTableOwnerTest do
 
       Application.put_env(:ferricstore, :data_dir, application_root)
       Application.put_env(:ferricstore, :shard_count, 1)
+      start_supervised!({LMDBFlushCoordinator, instance_name: standalone_ctx.name})
 
       assert :ok =
                Ferricstore.Raft.WARaftBackend.start(standalone_ctx,
