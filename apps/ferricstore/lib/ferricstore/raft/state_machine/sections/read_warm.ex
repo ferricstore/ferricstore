@@ -1779,14 +1779,34 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
 
       defp do_compound_delete_prefix(state, redis_key, prefix) do
         cleanup_target = promoted_prefix_cleanup_target(state, redis_key, prefix)
-        result = do_compound_member_prefix_delete(state, redis_key, prefix)
 
-        if result == :ok do
-          cleanup_promoted_prefix!(state, redis_key, cleanup_target)
-          zset_index_clear(state, redis_key)
+        promotion_generation =
+          promotion_marker_generation_for_delete(state, Promotion.marker_key(redis_key))
+
+        case {cleanup_target, promotion_generation} do
+          {_cleanup_target, :unavailable} ->
+            {:error, :promotion_marker_unavailable}
+
+          {{_type, _dedicated_path}, :none} ->
+            {:error, :promotion_marker_unavailable}
+
+          {_cleanup_target, generation} ->
+            result = do_compound_member_prefix_delete(state, redis_key, prefix)
+
+            if result == :ok do
+              if exact_compound_prefix_type(redis_key, prefix) do
+                queue_compound_promotion_removal_after_flush(
+                  Promotion.marker_key(redis_key),
+                  generation
+                )
+              end
+
+              cleanup_promoted_prefix!(state, redis_key, cleanup_target, generation)
+              zset_index_clear(state, redis_key)
+            end
+
+            result
         end
-
-        result
       end
 
       defp promoted_prefix_cleanup_target(state, redis_key, prefix) do
@@ -1809,9 +1829,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         end
       end
 
-      defp cleanup_promoted_prefix!(_state, _redis_key, nil), do: :ok
+      defp cleanup_promoted_prefix!(_state, _redis_key, nil, _generation), do: :ok
 
-      defp cleanup_promoted_prefix!(state, redis_key, {type, dedicated_path}) do
+      defp cleanup_promoted_prefix!(
+             state,
+             redis_key,
+             {type, dedicated_path},
+             generation
+           ) do
         :ok =
           Promotion.cleanup_promoted!(
             redis_key,
@@ -1821,11 +1846,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
             state.ets,
             state.data_dir,
             state.shard_index,
-            state.instance_ctx
+            state.instance_ctx,
+            generation
           )
 
         record_promoted_instance_removal(redis_key)
-        queue_compound_promotion_removal_after_flush(Promotion.marker_key(redis_key))
+
+        queue_compound_promotion_removal_after_flush(
+          Promotion.marker_key(redis_key),
+          generation
+        )
       end
 
       defp record_promoted_instance_removal(redis_key) do

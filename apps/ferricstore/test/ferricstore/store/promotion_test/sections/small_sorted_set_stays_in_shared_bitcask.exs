@@ -51,12 +51,50 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
 
             state = :sys.get_state(shard, 500)
             assert state.compound_promotion_worker == nil
-            assert state.compound_promotion_pending[key] == :zset
+            assert state.compound_promotion_pending[key] == {:zset, @test_threshold}
           after
             Promotion.release_compaction_latch(shared_log_latch)
           end
 
           assert_promoted(key)
+        end
+
+        test "deferred promotion is abandoned when cardinality returns to the threshold" do
+          store = real_store()
+          key = ukey("promote_zset_candidate_shrinks")
+          ctx = FerricStore.Instance.get(:default)
+          shard_idx = Router.shard_for(ctx, key)
+          shard = Router.shard_name(ctx, shard_idx)
+          owner = %{instance_ctx: ctx, shard_index: shard_idx}
+          shared_log_latch = Promotion.acquire_shared_log_latch(owner)
+          shard_pid = Process.whereis(shard)
+          shard_monitor = Process.monitor(shard_pid)
+
+          try do
+            populate_zset(store, key, @test_threshold + 1)
+
+            ShardHelpers.eventually(fn ->
+              state = :sys.get_state(shard)
+
+              state.compound_promotion_worker == nil and
+                state.compound_promotion_pending[key] == {:zset, @test_threshold}
+            end)
+
+            assert 1 == SortedSet.handle("ZREM", [key, "member_1"], store)
+          after
+            Promotion.release_compaction_latch(shared_log_latch)
+          end
+
+          ShardHelpers.eventually(fn ->
+            state = :sys.get_state(shard)
+
+            state.compound_promotion_worker == nil and
+              not Map.has_key?(state.compound_promotion_pending, key)
+          end)
+
+          refute promoted?(key)
+          refute_receive {:DOWN, ^shard_monitor, :process, ^shard_pid, _reason}, 500
+          assert @test_threshold == SortedSet.handle("ZCARD", [key], store)
         end
 
         test "zset crossing threshold gets promoted to dedicated Bitcask" do
@@ -279,6 +317,59 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
       # ---------------------------------------------------------------------------
 
       describe "DEL on promoted sorted set" do
+        test "DEL cancels a promotion deferred by shared-log maintenance" do
+          store = real_store()
+          key = ukey("del_pending_promoted_zset")
+          ctx = FerricStore.Instance.get(:default)
+          shard_idx = Router.shard_for(ctx, key)
+          shard = Router.shard_name(ctx, shard_idx)
+          owner = %{instance_ctx: ctx, shard_index: shard_idx}
+          shared_log_latch = Promotion.acquire_shared_log_latch(owner)
+          shard_pid = Process.whereis(shard)
+          shard_monitor = Process.monitor(shard_pid)
+
+          try do
+            populate_zset(store, key, @test_threshold + 1)
+
+            ShardHelpers.eventually(fn ->
+              state = :sys.get_state(shard)
+
+              state.compound_promotion_worker == nil and
+                state.compound_promotion_pending[key] == {:zset, @test_threshold}
+            end)
+
+            assert 1 == Strings.handle("DEL", [key], store)
+          after
+            Promotion.release_compaction_latch(shared_log_latch)
+          end
+
+          ShardHelpers.eventually(fn ->
+            state = :sys.get_state(shard)
+
+            state.compound_promotion_worker == nil and
+              not Map.has_key?(state.compound_promotion_pending, key)
+          end)
+
+          refute promoted?(key)
+          refute_receive {:DOWN, ^shard_monitor, :process, ^shard_pid, _reason}, 500
+          assert 0 == SortedSet.handle("ZCARD", [key], store)
+
+          send(shard, {:start_compound_promotion, key, {:zset, @test_threshold}})
+          state = :sys.get_state(shard)
+          assert state.compound_promotion_worker == nil
+          refute Map.has_key?(state.compound_promotion_pending, key)
+
+          dedicated_path =
+            Promotion.dedicated_path(
+              Application.fetch_env!(:ferricstore, :data_dir),
+              shard_idx,
+              :zset,
+              key
+            )
+
+          refute File.dir?(dedicated_path)
+        end
+
         test "DEL removes promoted zset and cleans up dedicated Bitcask" do
           store = real_store()
           key = ukey("del_promoted_zset")

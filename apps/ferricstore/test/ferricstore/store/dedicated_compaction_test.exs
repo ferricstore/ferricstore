@@ -231,8 +231,11 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       state = :sys.get_state(shard)
       marker_key = Promotion.marker_key(key)
 
-      assert [{^marker_key, "hash", _exp, _lfu, _fid, _off, _vsize}] =
+      assert [{^marker_key, marker_value, _exp, _lfu, _fid, _off, _vsize}] =
                :ets.lookup(state.keydir, marker_key)
+
+      assert {:ok, :hash, :promoted, generation} = Promotion.decode_marker(marker_value)
+      assert generation > 0
 
       :sys.replace_state(shard, fn state ->
         dedicated_path = promoted_path!(state, key)

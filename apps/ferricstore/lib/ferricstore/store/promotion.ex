@@ -17,8 +17,8 @@ defmodule Ferricstore.Store.Promotion do
 
   Promotion is **one-way** -- once promoted, a collection stays in its
   dedicated instance even if entries are later deleted below the threshold.
-  The dedicated instance is only removed when the entire key is deleted
-  via `DEL` / `UNLINK`.
+  The dedicated instance is removed when the logical collection becomes empty
+  or the entire key is deleted via `DEL` / `UNLINK`.
 
   ## Lists are not promoted
 
@@ -30,9 +30,10 @@ defmodule Ferricstore.Store.Promotion do
   ## Promotion marker
 
   When a key is promoted, a marker entry `PM:redis_key` is written to the
-  shared Bitcask with the type as its value (`"hash"`, `"set"`, or
-  `"zset"`). This allows the shard to rediscover promoted keys on restart
-  by scanning for `PM:` prefixed keys during initialization.
+  shared Bitcask. Its versioned value records the collection type, lifecycle
+  state, and an opaque generation token that prevents delayed cleanup from
+  deleting a newer incarnation. The shard rediscovers promoted keys on
+  restart by scanning for `PM:` prefixed keys during initialization.
 
   ## Configuration
 
@@ -69,6 +70,9 @@ defmodule Ferricstore.Store.Promotion do
   @default_compaction_latch_timeout_ms 30_000
   @default_recovery_scan_page_size 8_192
   @log_header_size 26
+  @marker_format_magic <<0xF3, 0x50, 0x4D>>
+  @marker_format_version 1
+  @marker_format_prefix <<@marker_format_magic::binary, @marker_format_version>>
   @max_log_value_size 512 * 1024 * 1024
   @tombstone_value_size 0xFFFFFFFF
 
@@ -87,6 +91,101 @@ defmodule Ferricstore.Store.Promotion do
 
   @spec marker_key(binary()) :: binary()
   def marker_key(redis_key), do: CompoundKey.promotion_marker_key(redis_key)
+
+  @type marker_lifecycle :: :promoted | :fallback | :cleanup
+  @type marker_generation :: non_neg_integer()
+
+  @doc false
+  @spec new_generation() :: marker_generation()
+  def new_generation do
+    # Generation zero identifies markers written before the versioned codec.
+    case :crypto.strong_rand_bytes(8) do
+      <<0::unsigned-big-64>> -> new_generation()
+      <<generation::unsigned-big-64>> -> generation
+    end
+  end
+
+  @doc false
+  @spec encode_marker(
+          :hash | :set | :zset,
+          marker_lifecycle(),
+          marker_generation()
+        ) :: binary()
+  def encode_marker(type, lifecycle, 0)
+      when type in [:hash, :set, :zset] and
+             lifecycle in [:promoted, :fallback, :cleanup] do
+    type_value = CompoundKey.encode_type(type)
+
+    if lifecycle == :promoted do
+      type_value
+    else
+      Atom.to_string(lifecycle) <> ":" <> type_value
+    end
+  end
+
+  def encode_marker(type, lifecycle, generation)
+      when type in [:hash, :set, :zset] and
+             lifecycle in [:promoted, :fallback, :cleanup] and
+             is_integer(generation) and generation > 0 and generation <= 0xFFFFFFFFFFFFFFFF do
+    <<@marker_format_prefix::binary, marker_lifecycle_tag(lifecycle), marker_type_tag(type),
+      generation::unsigned-big-64>>
+  end
+
+  @doc false
+  @spec decode_marker(binary()) ::
+          {:ok, :hash | :set | :zset, marker_lifecycle(), marker_generation()}
+          | {:error, :malformed_versioned_marker}
+          | {:error, :unsupported_marker_version}
+          | :error
+  def decode_marker(
+        <<@marker_format_prefix::binary, lifecycle_tag, type_tag, generation::unsigned-big-64>>
+      )
+      when generation > 0 do
+    with {:ok, lifecycle} <- decode_marker_lifecycle(lifecycle_tag),
+         {:ok, type} <- decode_marker_type(type_tag) do
+      {:ok, type, lifecycle, generation}
+    else
+      :error -> {:error, :malformed_versioned_marker}
+    end
+  end
+
+  def decode_marker(<<@marker_format_prefix::binary, _rest::binary>>),
+    do: {:error, :malformed_versioned_marker}
+
+  def decode_marker(<<@marker_format_magic::binary, _version, _rest::binary>>),
+    do: {:error, :unsupported_marker_version}
+
+  def decode_marker(<<@marker_format_magic::binary>>),
+    do: {:error, :malformed_versioned_marker}
+
+  def decode_marker("hash"), do: {:ok, :hash, :promoted, 0}
+  def decode_marker("set"), do: {:ok, :set, :promoted, 0}
+  def decode_marker("zset"), do: {:ok, :zset, :promoted, 0}
+  def decode_marker("fallback:hash"), do: {:ok, :hash, :fallback, 0}
+  def decode_marker("fallback:set"), do: {:ok, :set, :fallback, 0}
+  def decode_marker("fallback:zset"), do: {:ok, :zset, :fallback, 0}
+  def decode_marker("cleanup:hash"), do: {:ok, :hash, :cleanup, 0}
+  def decode_marker("cleanup:set"), do: {:ok, :set, :cleanup, 0}
+  def decode_marker("cleanup:zset"), do: {:ok, :zset, :cleanup, 0}
+  def decode_marker(_value), do: :error
+
+  defp marker_lifecycle_tag(:promoted), do: 0
+  defp marker_lifecycle_tag(:fallback), do: 1
+  defp marker_lifecycle_tag(:cleanup), do: 2
+
+  defp marker_type_tag(:hash), do: 0
+  defp marker_type_tag(:set), do: 1
+  defp marker_type_tag(:zset), do: 2
+
+  defp decode_marker_lifecycle(0), do: {:ok, :promoted}
+  defp decode_marker_lifecycle(1), do: {:ok, :fallback}
+  defp decode_marker_lifecycle(2), do: {:ok, :cleanup}
+  defp decode_marker_lifecycle(_tag), do: :error
+
+  defp decode_marker_type(0), do: {:ok, :hash}
+  defp decode_marker_type(1), do: {:ok, :set}
+  defp decode_marker_type(2), do: {:ok, :zset}
+  defp decode_marker_type(_tag), do: :error
 
   @doc false
   @spec flush_marker_tombstones(map(), pos_integer()) ::
@@ -304,8 +403,8 @@ defmodule Ferricstore.Store.Promotion do
   """
   @spec with_compaction_latch(map(), binary(), (-> term())) :: term()
   def with_compaction_latch(owner, redis_key, fun) when is_function(fun, 0) do
-    case acquire_compaction_latch(owner, redis_key) do
-      :none ->
+    case acquire_scoped_compaction_latch(owner, redis_key) do
+      status when status in [:none, :already_owned] ->
         fun.()
 
       token ->
@@ -327,6 +426,63 @@ defmodule Ferricstore.Store.Promotion do
       {tab, latch_key, shard_index} ->
         acquire_compaction_latch(tab, latch_key, shard_index)
         {tab, latch_key}
+    end
+  end
+
+  @doc false
+  @spec acquire_compaction_latch_for_apply(map(), binary()) :: :none | {term(), term()}
+  def acquire_compaction_latch_for_apply(owner, redis_key) do
+    token = acquire_compaction_latch(owner, redis_key)
+
+    try do
+      :ok = raise_if_compound_promotion_failed(:ok, owner, redis_key)
+      token
+    rescue
+      error ->
+        release_compaction_latch(token)
+        reraise error, __STACKTRACE__
+    catch
+      kind, reason ->
+        release_compaction_latch(token)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
+  end
+
+  @doc false
+  @spec with_compaction_latches_for_apply(map(), [binary()], (-> term())) :: term()
+  def with_compaction_latches_for_apply(_owner, [], fun) when is_function(fun, 0), do: fun.()
+
+  def with_compaction_latches_for_apply(owner, [redis_key], fun) when is_function(fun, 0) do
+    token = acquire_compaction_latch_for_apply(owner, redis_key)
+
+    try do
+      fun.()
+    after
+      release_compaction_latch(token)
+    end
+  end
+
+  def with_compaction_latches_for_apply(owner, redis_keys, fun)
+      when is_list(redis_keys) and is_function(fun, 0) do
+    case latch_table(owner) do
+      nil ->
+        fun.()
+
+      _tab ->
+        keys = redis_keys |> Enum.uniq() |> Enum.sort()
+
+        case acquire_compaction_latches_for_apply(owner, keys, []) do
+          {:ok, tokens} ->
+            try do
+              fun.()
+            after
+              release_compaction_latches(tokens)
+            end
+
+          {:raise, kind, reason, stacktrace, tokens} ->
+            release_compaction_latches(tokens)
+            :erlang.raise(kind, reason, stacktrace)
+        end
     end
   end
 
@@ -463,7 +619,7 @@ defmodule Ferricstore.Store.Promotion do
             :ok
 
           _other ->
-            wait_compaction_latch_clear!(tab, latch_key, shard_index)
+            wait_compaction_latch_clear!(tab, latch_key, shard_index, true)
         end
     end
   end
@@ -605,6 +761,7 @@ defmodule Ferricstore.Store.Promotion do
 
     active_path = find_active(shard_data_path)
     mk = marker_key(redis_key)
+    marker_value = encode_marker(type, :promoted, new_generation())
 
     # --------------------------------------------------------------------
     # Crash-safe promotion order (the crash-safe promotion ordering):
@@ -626,12 +783,12 @@ defmodule Ferricstore.Store.Promotion do
     # --------------------------------------------------------------------
 
     # Step 1: marker
-    case NIF.v2_append_record(active_path, mk, type_str, 0) do
+    case NIF.v2_append_record(active_path, mk, marker_value, 0) do
       {:ok, {moffset, mvsize}} ->
         marker_fid = file_id_from_path(active_path)
 
-        track_binary_insert(keydir, shard_index, mk, type_str, instance_ctx)
-        :ets.insert(keydir, {mk, type_str, 0, LFU.initial(), marker_fid, moffset, mvsize})
+        track_binary_insert(keydir, shard_index, mk, marker_value, instance_ctx)
+        :ets.insert(keydir, {mk, marker_value, 0, LFU.initial(), marker_fid, moffset, mvsize})
 
       {:error, reason} ->
         Logger.error(
@@ -849,11 +1006,12 @@ defmodule Ferricstore.Store.Promotion do
 
             collection_plan =
               case marker_state do
-                :promoted ->
+                {:promoted, generation} ->
                   plan_promoted_collection!(
                     redis_key,
                     type,
                     marker_key,
+                    generation,
                     shared_state,
                     shard_data_path,
                     data_dir,
@@ -862,13 +1020,26 @@ defmodule Ferricstore.Store.Promotion do
                     now
                   )
 
-                {:intent, :fallback} ->
+                {:intent, :fallback, generation} ->
                   {:fallback, marker_key, redis_key, type,
-                   dedicated_path(data_dir, shard_index, type, redis_key)}
+                   dedicated_path(data_dir, shard_index, type, redis_key), generation}
 
-                {:intent, :cleanup} ->
-                  {:cleanup, marker_key, redis_key, type,
-                   dedicated_path(data_dir, shard_index, type, redis_key), shared_state.all_keys}
+                {:intent, :cleanup, generation} ->
+                  if shared_collection_live?(shared_state) or
+                       shared_type_differs?(
+                         shared_state,
+                         redis_key,
+                         type,
+                         shard_data_path,
+                         shard_index
+                       ) do
+                    {:fallback, marker_key, redis_key, type,
+                     dedicated_path(data_dir, shard_index, type, redis_key), generation}
+                  else
+                    {:cleanup, marker_key, redis_key, type,
+                     dedicated_path(data_dir, shard_index, type, redis_key),
+                     shared_state.all_keys, generation}
+                  end
               end
 
             true = :ets.insert(recovery_plan, {0, collection_plan})
@@ -960,6 +1131,9 @@ defmodule Ferricstore.Store.Promotion do
 
             {[{redis_key, type, full_key, marker_state} | markers], actions}
 
+          {:error, reason} ->
+            fail_recovery!(:decode_marker, full_key, shard_index, reason)
+
           :error ->
             {markers, [{:delete_invalid_marker, full_key, type_str} | actions]}
         end
@@ -977,6 +1151,7 @@ defmodule Ferricstore.Store.Promotion do
          redis_key,
          type,
          marker_key,
+         generation,
          shared_state,
          shard_data_path,
          data_dir,
@@ -1030,10 +1205,10 @@ defmodule Ferricstore.Store.Promotion do
           shard_index
         )
 
-        {:fallback, marker_key, redis_key, type, dedicated_path}
+        {:fallback, marker_key, redis_key, type, dedicated_path, generation}
 
       dedicated_dead? or (dedicated_empty? and shared_dead?) ->
-        {:cleanup, marker_key, redis_key, type, dedicated_path, shared_state.all_keys}
+        {:cleanup, marker_key, redis_key, type, dedicated_path, shared_state.all_keys, generation}
 
       dedicated_empty? ->
         fail_recovery!(:scan_dedicated_log, dedicated_path, shard_index, :dedicated_state_missing)
@@ -1065,6 +1240,7 @@ defmodule Ferricstore.Store.Promotion do
 
         promoted = %{
           path: dedicated_path,
+          generation: generation,
           writes: 0,
           total_bytes: total_bytes,
           dead_bytes: max(total_bytes - live_bytes, 0),
@@ -1519,10 +1695,12 @@ defmodule Ferricstore.Store.Promotion do
     rolled_back_markers =
       :ets.foldl(
         fn
-          {_sequence, {:fallback, marker_key, _redis_key, _type, _dedicated_path}}, markers ->
+          {_sequence, {:fallback, marker_key, _redis_key, _type, _dedicated_path, _generation}},
+          markers ->
             MapSet.put(markers, marker_key)
 
-          {_sequence, {:cleanup, marker_key, _redis_key, _type, _dedicated_path, _shared_keys}},
+          {_sequence,
+           {:cleanup, marker_key, _redis_key, _type, _dedicated_path, _shared_keys, _generation}},
           markers ->
             MapSet.put(markers, marker_key)
 
@@ -1559,7 +1737,8 @@ defmodule Ferricstore.Store.Promotion do
 
     :ets.foldl(
       fn
-        {_sequence, {:fallback, marker_key, redis_key, _type, _dedicated_path}}, :ok ->
+        {_sequence, {:fallback, marker_key, redis_key, _type, _dedicated_path, _generation}},
+        :ok ->
           track_binary_delete(keydir, shard_index, marker_key, instance_ctx)
           :ets.delete(keydir, marker_key)
 
@@ -1570,7 +1749,8 @@ defmodule Ferricstore.Store.Promotion do
 
           :ok
 
-        {_sequence, {:cleanup, marker_key, redis_key, _type, _dedicated_path, shared_keys}},
+        {_sequence,
+         {:cleanup, marker_key, redis_key, _type, _dedicated_path, shared_keys, _generation}},
         :ok ->
           Enum.each(shared_keys, fn key ->
             track_binary_delete(keydir, shard_index, key, instance_ctx)
@@ -1612,17 +1792,20 @@ defmodule Ferricstore.Store.Promotion do
   defp rollback_fallbacks!(recovery_plan, shard_data_path, shard_index) do
     :ets.foldl(
       fn
-        {_sequence, {:fallback, marker_key, redis_key, type, dedicated_path}}, :ok ->
+        {_sequence, {:fallback, marker_key, redis_key, type, dedicated_path, generation}}, :ok ->
           rollback_fallback!(
             marker_key,
             redis_key,
             type,
             dedicated_path,
             shard_data_path,
-            shard_index
+            shard_index,
+            generation
           )
 
-        {_sequence, {:cleanup, marker_key, redis_key, type, dedicated_path, shared_keys}}, :ok ->
+        {_sequence,
+         {:cleanup, marker_key, redis_key, type, dedicated_path, shared_keys, generation}},
+        :ok ->
           rollback_cleanup!(
             marker_key,
             redis_key,
@@ -1630,7 +1813,8 @@ defmodule Ferricstore.Store.Promotion do
             dedicated_path,
             shared_keys,
             shard_data_path,
-            shard_index
+            shard_index,
+            generation
           )
 
         {_sequence, {:promoted, _marker_key, _redis_key, _promoted, _row_actions}}, :ok ->
@@ -1647,10 +1831,21 @@ defmodule Ferricstore.Store.Promotion do
          type,
          dedicated_path,
          shard_data_path,
-         shard_index
+         shard_index,
+         generation
        ) do
     active_path = recovery_active_shared_path!(shard_data_path, shard_index)
-    persist_recovery_intent!(active_path, marker_key, redis_key, type, :fallback, shard_index)
+
+    persist_recovery_intent!(
+      active_path,
+      marker_key,
+      redis_key,
+      type,
+      :fallback,
+      shard_index,
+      generation
+    )
+
     remove_recovery_dedicated!(dedicated_path, redis_key, shard_index)
 
     case NIF.v2_append_tombstone(active_path, marker_key) do
@@ -1682,10 +1877,21 @@ defmodule Ferricstore.Store.Promotion do
          dedicated_path,
          shared_keys,
          shard_data_path,
-         shard_index
+         shard_index,
+         generation
        ) do
     active_path = recovery_active_shared_path!(shard_data_path, shard_index)
-    persist_recovery_intent!(active_path, marker_key, redis_key, type, :cleanup, shard_index)
+
+    persist_recovery_intent!(
+      active_path,
+      marker_key,
+      redis_key,
+      type,
+      :cleanup,
+      shard_index,
+      generation
+    )
+
     remove_recovery_dedicated!(dedicated_path, redis_key, shard_index)
 
     cleanup_ops =
@@ -1746,9 +1952,10 @@ defmodule Ferricstore.Store.Promotion do
          redis_key,
          type,
          intent,
-         shard_index
+         shard_index,
+         generation
        ) do
-    intent_value = recovery_intent_value(intent, type)
+    intent_value = recovery_intent_value(intent, type, generation)
 
     case NIF.v2_append_record(active_path, marker_key, intent_value, 0) do
       {:ok, {_offset, _value_size}} ->
@@ -2054,33 +2261,7 @@ defmodule Ferricstore.Store.Promotion do
     expected_type = CompoundKey.encode_type(type)
 
     actual_type =
-      case shared_state.type_record do
-        {_key, value, _fid, _offset} when is_binary(value) ->
-          value
-
-        {type_key, _value, fid, offset} ->
-          file_path =
-            Path.join(
-              shard_data_path,
-              "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log"
-            )
-
-          read_recovery_value!(
-            file_path,
-            offset,
-            type_key,
-            :read_shared_type,
-            shard_index
-          )
-
-        nil ->
-          fail_recovery!(
-            :validate_shared_type,
-            redis_key,
-            shard_index,
-            :shared_type_missing
-          )
-      end
+      shared_recovery_type!(shared_state, redis_key, shard_data_path, shard_index)
 
     if actual_type != expected_type do
       fail_recovery!(
@@ -2089,6 +2270,50 @@ defmodule Ferricstore.Store.Promotion do
         shard_index,
         {:shared_type_mismatch, expected_type, actual_type}
       )
+    end
+  end
+
+  defp shared_type_differs?(
+         %{type_status: :live} = shared_state,
+         redis_key,
+         type,
+         shard_data_path,
+         shard_index
+       ) do
+    shared_recovery_type!(shared_state, redis_key, shard_data_path, shard_index) !=
+      CompoundKey.encode_type(type)
+  end
+
+  defp shared_type_differs?(_shared_state, _redis_key, _type, _shard_data_path, _shard_index),
+    do: false
+
+  defp shared_recovery_type!(shared_state, redis_key, shard_data_path, shard_index) do
+    case shared_state.type_record do
+      {_key, value, _fid, _offset} when is_binary(value) ->
+        value
+
+      {type_key, _value, fid, offset} ->
+        file_path =
+          Path.join(
+            shard_data_path,
+            "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log"
+          )
+
+        read_recovery_value!(
+          file_path,
+          offset,
+          type_key,
+          :read_shared_type,
+          shard_index
+        )
+
+      nil ->
+        fail_recovery!(
+          :validate_shared_type,
+          redis_key,
+          shard_index,
+          :shared_type_missing
+        )
     end
   end
 
@@ -2101,20 +2326,21 @@ defmodule Ferricstore.Store.Promotion do
       (state.type_status == :expired or MapSet.size(state.live_member_keys) == 0)
   end
 
-  defp decode_recovery_marker("hash"), do: {:ok, :hash, :promoted}
-  defp decode_recovery_marker("set"), do: {:ok, :set, :promoted}
-  defp decode_recovery_marker("zset"), do: {:ok, :zset, :promoted}
-  defp decode_recovery_marker("fallback:hash"), do: {:ok, :hash, {:intent, :fallback}}
-  defp decode_recovery_marker("fallback:set"), do: {:ok, :set, {:intent, :fallback}}
-  defp decode_recovery_marker("fallback:zset"), do: {:ok, :zset, {:intent, :fallback}}
-  defp decode_recovery_marker("cleanup:hash"), do: {:ok, :hash, {:intent, :cleanup}}
-  defp decode_recovery_marker("cleanup:set"), do: {:ok, :set, {:intent, :cleanup}}
-  defp decode_recovery_marker("cleanup:zset"), do: {:ok, :zset, {:intent, :cleanup}}
-  defp decode_recovery_marker(_type_str), do: :error
-
-  defp recovery_intent_value(intent, type) when intent in [:fallback, :cleanup] do
-    Atom.to_string(intent) <> ":" <> CompoundKey.encode_type(type)
+  defp decode_recovery_marker(value) do
+    case decode_marker(value) do
+      {:ok, type, :promoted, generation} -> {:ok, type, {:promoted, generation}}
+      {:ok, type, intent, generation} -> {:ok, type, {:intent, intent, generation}}
+      {:error, _reason} = error -> error
+      :error -> :error
+    end
   end
+
+  defp recovery_intent_value(intent, type, generation)
+       when intent in [:fallback, :cleanup] and is_integer(generation) and generation >= 0,
+       do: encode_marker(type, intent, generation)
+
+  defp recovery_intent_value(intent, type, :legacy) when intent in [:fallback, :cleanup],
+    do: Atom.to_string(intent) <> ":" <> CompoundKey.encode_type(type)
 
   defp shared_uncovered_live_compound?(shared_keys, dedicated_keys) do
     Enum.any?(shared_keys, fn key -> not MapSet.member?(dedicated_keys, key) end)
@@ -2128,7 +2354,8 @@ defmodule Ferricstore.Store.Promotion do
           atom(),
           binary(),
           non_neg_integer(),
-          term()
+          term(),
+          marker_generation() | :legacy
         ) :: :ok
   def cleanup_promoted!(
         redis_key,
@@ -2138,9 +2365,13 @@ defmodule Ferricstore.Store.Promotion do
         keydir,
         data_dir,
         shard_index,
-        instance_ctx \\ nil
+        instance_ctx \\ nil,
+        generation \\ :legacy
       )
-      when type in [:hash, :set, :zset] and is_binary(resolved_path) do
+      when type in [:hash, :set, :zset] and is_binary(resolved_path) and
+             (generation == :legacy or
+                (is_integer(generation) and generation >= 0 and
+                   generation <= 0xFFFFFFFFFFFFFFFF)) do
     expected_path = dedicated_path(data_dir, shard_index, type, redis_key)
 
     if Path.expand(resolved_path) != Path.expand(expected_path) do
@@ -2149,7 +2380,7 @@ defmodule Ferricstore.Store.Promotion do
     end
 
     mk = marker_key(redis_key)
-    intent_value = recovery_intent_value(:cleanup, type)
+    intent_value = recovery_intent_value(:cleanup, type, generation)
     type_label = type_label(type)
     active_path = recovery_active_shared_path!(shard_data_path, shard_index)
 
@@ -2200,6 +2431,37 @@ defmodule Ferricstore.Store.Promotion do
     end
 
     Logger.debug("Cleaned up promoted #{type_label} #{inspect(redis_key)} (shard #{shard_index})")
+
+    :ok
+  end
+
+  @doc false
+  @spec remove_orphaned_dedicated!(
+          binary(),
+          :hash | :set | :zset,
+          binary(),
+          binary(),
+          non_neg_integer()
+        ) :: :ok
+  def remove_orphaned_dedicated!(redis_key, type, resolved_path, data_dir, shard_index)
+      when type in [:hash, :set, :zset] and is_binary(resolved_path) and
+             is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+    expected_path = dedicated_path(data_dir, shard_index, type, redis_key)
+
+    if Path.expand(resolved_path) != Path.expand(expected_path) do
+      raise ArgumentError,
+            "resolved promotion path mismatch: expected #{inspect(expected_path)}, got #{inspect(resolved_path)}"
+    end
+
+    case Ferricstore.FS.rm_rf(resolved_path) do
+      :ok -> :ok
+      {:error, reason} -> raise "orphaned promotion directory removal failed: #{inspect(reason)}"
+    end
+
+    case fsync_dir(Path.dirname(resolved_path), :remove_orphaned_dedicated_dir) do
+      :ok -> :ok
+      {:error, reason} -> raise "orphaned promotion directory fsync failed: #{inspect(reason)}"
+    end
 
     :ok
   end
@@ -2321,6 +2583,33 @@ defmodule Ferricstore.Store.Promotion do
   defp latch_index(%{shard_index: index}), do: index
   defp latch_index(_owner), do: nil
 
+  defp acquire_scoped_compaction_latch(owner, redis_key) do
+    case compaction_latch(owner, redis_key) do
+      nil ->
+        :none
+
+      {tab, latch_key, shard_index} ->
+        acquire_scoped_compaction_latch(tab, latch_key, shard_index)
+    end
+  end
+
+  defp acquire_scoped_compaction_latch(tab, latch_key, shard_index) do
+    case :ets.insert_new(tab, {latch_key, self()}) do
+      true ->
+        {tab, latch_key}
+
+      false ->
+        case :ets.lookup(tab, latch_key) do
+          [{^latch_key, owner}] when owner == self() ->
+            :already_owned
+
+          _other ->
+            wait_compaction_latch_clear!(tab, latch_key, shard_index, true)
+            acquire_scoped_compaction_latch(tab, latch_key, shard_index)
+        end
+    end
+  end
+
   defp acquire_compaction_latch(tab, latch_key, shard_index) do
     case :ets.insert_new(tab, {latch_key, self()}) do
       true ->
@@ -2330,6 +2619,28 @@ defmodule Ferricstore.Store.Promotion do
         wait_compaction_latch_clear!(tab, latch_key, shard_index)
         acquire_compaction_latch(tab, latch_key, shard_index)
     end
+  end
+
+  defp acquire_compaction_latches_for_apply(_owner, [], tokens), do: {:ok, tokens}
+
+  defp acquire_compaction_latches_for_apply(owner, [redis_key | redis_keys], tokens) do
+    case try_acquire_compaction_latch_for_apply(owner, redis_key) do
+      {:ok, token} -> acquire_compaction_latches_for_apply(owner, redis_keys, [token | tokens])
+      {:raise, kind, reason, stacktrace} -> {:raise, kind, reason, stacktrace, tokens}
+    end
+  end
+
+  defp try_acquire_compaction_latch_for_apply(owner, redis_key) do
+    {:ok, acquire_compaction_latch_for_apply(owner, redis_key)}
+  rescue
+    error -> {:raise, :error, error, __STACKTRACE__}
+  catch
+    kind, reason -> {:raise, kind, reason, __STACKTRACE__}
+  end
+
+  defp release_compaction_latches(tokens) do
+    Enum.each(tokens, &release_compaction_latch/1)
+    :ok
   end
 
   defp try_acquire_latch(tab, latch_key) do
@@ -2357,13 +2668,23 @@ defmodule Ferricstore.Store.Promotion do
     end
   end
 
-  defp wait_compaction_latch_clear!(tab, latch_key, shard_index) do
+  defp wait_compaction_latch_clear!(tab, latch_key, shard_index),
+    do: wait_compaction_latch_clear!(tab, latch_key, shard_index, false)
+
+  defp wait_compaction_latch_clear!(tab, latch_key, shard_index, allow_current_owner?) do
     emit_compaction_latch_event(:blocked, shard_index, latch_key, 0)
 
     started_ms = System.monotonic_time(:millisecond)
     timeout_ms = compaction_latch_timeout_ms()
 
-    case wait_compaction_latch_clear(tab, latch_key, shard_index, started_ms, timeout_ms) do
+    case wait_compaction_latch_clear(
+           tab,
+           latch_key,
+           shard_index,
+           started_ms,
+           timeout_ms,
+           allow_current_owner?
+         ) do
       :ok ->
         :ok
 
@@ -2377,41 +2698,105 @@ defmodule Ferricstore.Store.Promotion do
     end
   end
 
-  defp wait_compaction_latch_clear(tab, latch_key, shard_index, started_ms, timeout_ms) do
+  defp wait_compaction_latch_clear(
+         tab,
+         latch_key,
+         shard_index,
+         started_ms,
+         timeout_ms,
+         allow_current_owner?
+       ) do
     wait_ms = max(System.monotonic_time(:millisecond) - started_ms, 0)
 
     if wait_ms >= timeout_ms do
       emit_compaction_latch_event(:timeout, shard_index, latch_key, wait_ms)
       {:error, {:timeout, wait_ms}}
     else
-      do_wait_compaction_latch_clear(tab, latch_key, shard_index, started_ms, timeout_ms)
+      do_wait_compaction_latch_clear(
+        tab,
+        latch_key,
+        shard_index,
+        started_ms,
+        timeout_ms,
+        allow_current_owner?
+      )
     end
   end
 
-  defp do_wait_compaction_latch_clear(tab, latch_key, shard_index, started_ms, timeout_ms) do
+  defp do_wait_compaction_latch_clear(
+         tab,
+         latch_key,
+         shard_index,
+         started_ms,
+         timeout_ms,
+         allow_current_owner?
+       ) do
     case :ets.lookup(tab, latch_key) do
       [] ->
         :ok
 
       [{^latch_key, owner}] ->
-        wait_for_latch_owner(tab, latch_key, owner, shard_index, started_ms, timeout_ms)
+        wait_for_latch_owner(
+          tab,
+          latch_key,
+          owner,
+          shard_index,
+          started_ms,
+          timeout_ms,
+          allow_current_owner?
+        )
     end
   end
 
-  defp wait_for_latch_owner(tab, latch_key, owner, shard_index, started_ms, timeout_ms)
+  defp wait_for_latch_owner(
+         tab,
+         latch_key,
+         owner,
+         shard_index,
+         started_ms,
+         timeout_ms,
+         allow_current_owner?
+       )
        when is_pid(owner) do
-    if Process.alive?(owner) do
-      Process.sleep(@compaction_latch_sleep_ms)
+    if allow_current_owner? and owner == self() do
+      :ok
     else
-      :ets.delete_object(tab, {latch_key, owner})
-    end
+      if Process.alive?(owner) do
+        Process.sleep(@compaction_latch_sleep_ms)
+      else
+        :ets.delete_object(tab, {latch_key, owner})
+      end
 
-    wait_compaction_latch_clear(tab, latch_key, shard_index, started_ms, timeout_ms)
+      wait_compaction_latch_clear(
+        tab,
+        latch_key,
+        shard_index,
+        started_ms,
+        timeout_ms,
+        allow_current_owner?
+      )
+    end
   end
 
-  defp wait_for_latch_owner(tab, latch_key, _owner, shard_index, started_ms, timeout_ms) do
+  defp wait_for_latch_owner(
+         tab,
+         latch_key,
+         _owner,
+         shard_index,
+         started_ms,
+         timeout_ms,
+         allow_current_owner?
+       ) do
     Process.sleep(@compaction_latch_sleep_ms)
-    wait_compaction_latch_clear(tab, latch_key, shard_index, started_ms, timeout_ms)
+
+    wait_compaction_latch_clear(
+      tab,
+      latch_key,
+      shard_index,
+      started_ms,
+      timeout_ms,
+      allow_current_owner?
+    )
   end
 
   defp compaction_latch_timeout_ms do

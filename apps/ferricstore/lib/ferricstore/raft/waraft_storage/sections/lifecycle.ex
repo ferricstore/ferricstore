@@ -721,18 +721,85 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
            ) do
         decoded_command = decoded_replay_command(command)
 
-        with_segment_projection_command_time(command, fn ->
-          do_apply_segment_projected_command(
-            decoded_command,
-            command,
-            position,
-            handle,
-            label_update
-          )
+        {projection_command, promotion_keys} =
+          prepare_segment_projection_command(decoded_command)
+
+        with_segment_projection_promotion_latches(handle.sm_state, promotion_keys, fn ->
+          with_segment_projection_command_time(command, fn ->
+            do_apply_segment_projected_command(
+              projection_command,
+              decoded_command,
+              command,
+              position,
+              handle,
+              label_update
+            )
+          end)
         end)
       end
 
+      defp with_segment_projection_promotion_latches(sm_state, promotion_keys, fun)
+           when is_function(fun, 0) do
+        Promotion.with_compaction_latches_for_apply(
+          sm_state,
+          promotion_keys,
+          fun
+        )
+      end
+
+      defp segment_projection_promotion_keys({:compound_put, compound_key, _value, _expiry}),
+        do: segment_projection_compound_key(compound_key)
+
+      defp segment_projection_promotion_keys(
+             {:compound_put_blob_ref, compound_key, _value, _expiry}
+           ),
+           do: segment_projection_compound_key(compound_key)
+
+      defp segment_projection_promotion_keys({:compound_delete, compound_key}),
+        do: segment_projection_compound_key(compound_key)
+
+      defp segment_projection_promotion_keys({:compound_batch_put, redis_key, _entries})
+           when is_binary(redis_key),
+           do: [redis_key]
+
+      defp segment_projection_promotion_keys({:compound_blob_batch_put, redis_key, _entries})
+           when is_binary(redis_key),
+           do: [redis_key]
+
+      defp segment_projection_promotion_keys({:compound_batch_delete, redis_key, _keys})
+           when is_binary(redis_key),
+           do: [redis_key]
+
+      defp segment_projection_promotion_keys({:compound_delete_prefix, prefix}),
+        do: segment_projection_compound_key(prefix)
+
+      defp segment_projection_promotion_keys({:put, key, _value, _expiry}),
+        do: segment_project_promotion_key_for_storage_key(key)
+
+      defp segment_projection_promotion_keys({:put_blob_ref, key, _value, _expiry}),
+        do: segment_project_promotion_key_for_storage_key(key)
+
+      defp segment_projection_promotion_keys({:put_batch, entries}) when is_list(entries),
+        do: segment_project_promotion_keys_for_storage_entries(entries)
+
+      defp segment_projection_promotion_keys({:put_blob_batch, entries}) when is_list(entries),
+        do: segment_project_promotion_keys_for_storage_entries(entries)
+
+      defp segment_projection_promotion_keys({:delete, key}),
+        do: segment_project_promotion_key_for_storage_key(key)
+
+      defp segment_projection_promotion_keys({:delete_batch, keys}) when is_list(keys),
+        do: segment_project_promotion_keys_for_storage_keys(keys)
+
+      defp segment_projection_promotion_keys(_command), do: []
+
+      defp segment_projection_compound_key(compound_key) when is_binary(compound_key),
+        do: [CompoundKey.extract_redis_key(compound_key)]
+
+      defp segment_projection_compound_key(_compound_key), do: []
+
       defp do_apply_segment_projected_command(
+             projection_command,
              decoded_command,
              command,
              position,
@@ -741,7 +808,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
            ) do
         started_at = System.monotonic_time()
 
-        case segment_project_command(decoded_command, position, handle.sm_state) do
+        case segment_project_command(projection_command, position, handle.sm_state) do
           {:ok, new_sm_state, result, applied_increment} ->
             emit_segment_projection_apply_telemetry(
               handle.sm_state,

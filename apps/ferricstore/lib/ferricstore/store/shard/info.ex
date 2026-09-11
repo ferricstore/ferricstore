@@ -76,11 +76,54 @@ defmodule Ferricstore.Store.Shard.Info do
         {:noreply, ShardCompound.maybe_promote(state, redis_key, compound_key, threshold)}
       end
 
-      def handle_info({:start_compound_promotion, redis_key, type}, state) do
-        case Map.get(state.compound_promotion_pending, redis_key) do
-          ^type -> {:noreply, maybe_start_compound_promotion(state, redis_key, type)}
-          _cancelled_or_stale -> {:noreply, state}
+      def handle_info(
+            {:start_compound_promotion, redis_key, {type, threshold} = candidate},
+            state
+          ) do
+        case {Map.get(state.compound_promotion_pending, redis_key),
+              Map.has_key?(state.compound_promotion_retry_timers, redis_key)} do
+          {^candidate, false} ->
+            state = maybe_start_compound_promotion(state, redis_key, type, threshold, 0)
+            {:noreply, maybe_start_pending_compound_promotion(state)}
+
+          _cancelled_stale_or_scheduled ->
+            {:noreply, state}
         end
+      end
+
+      def handle_info(
+            {:retry_compound_promotion_batch, tag},
+            state
+          ) do
+        case state.compound_promotion_retry_timer do
+          %{tag: ^tag} ->
+            state = %{state | compound_promotion_retry_timer: nil}
+            {:noreply, process_compound_promotion_retries(state)}
+
+          _stale_or_cancelled ->
+            {:noreply, state}
+        end
+      end
+
+      # Kept as a stale-message guard for tests and shutdown races. Production
+      # retries are driven by the single scheduler timer above.
+      def handle_info(
+            {:retry_compound_promotion, redis_key, {type, threshold} = candidate, tag, attempt},
+            state
+          ) do
+        case Map.get(state.compound_promotion_retry_timers, redis_key) do
+          %{tag: ^tag, attempt: ^attempt, candidate: ^candidate} ->
+            state = consume_compound_promotion_retry(state, redis_key)
+            state = maybe_start_compound_promotion(state, redis_key, type, threshold, attempt)
+            {:noreply, maybe_start_pending_compound_promotion(state)}
+
+          _stale_or_cancelled ->
+            {:noreply, state}
+        end
+      end
+
+      def handle_info(:start_pending_compound_promotion, state) do
+        {:noreply, maybe_start_pending_compound_promotion(state)}
       end
 
       def handle_info(
@@ -97,13 +140,20 @@ defmodule Ferricstore.Store.Shard.Info do
 
         case result do
           {:ok, dedicated_path} ->
-            state = install_promoted_instance(state, worker.redis_key, dedicated_path)
+            promotion_live? =
+              ShardCompound.promoted_store(state, worker.redis_key) == dedicated_path
+
             :ok = Promotion.clear_compound_promotion_fence(state, worker.redis_key)
             acknowledge_compound_promotion_worker(worker)
 
             state =
               state
-              |> reply_compound_promotion_waiters(worker.redis_key)
+              |> maybe_install_promoted_instance(
+                worker.redis_key,
+                dedicated_path,
+                promotion_live?
+              )
+              |> reply_compound_promotion_waiters(worker.redis_key, promotion_live?)
               |> maybe_start_pending_compound_promotion()
 
             {:noreply, state}
@@ -139,48 +189,79 @@ defmodule Ferricstore.Store.Shard.Info do
         {:noreply, state}
       end
 
-      def handle_info({:remove_promoted_after_commit, redis_key}, state) do
-        state =
-          state
-          |> cancel_promoted_compaction_retry(redis_key)
-          |> Map.update!(:promoted_compaction_pending, &MapSet.delete(&1, redis_key))
+      def handle_info({:remove_promoted_after_commit, redis_key, expected_generation}, state)
+          when expected_generation == :none or expected_generation == :unavailable or
+                 (is_integer(expected_generation) and expected_generation >= 0) do
+        handle_post_commit_promotion_removal(state, redis_key, expected_generation, 0)
+      end
 
-        {:noreply, %{state | promoted_instances: Map.delete(state.promoted_instances, redis_key)}}
+      def handle_info({:retry_post_commit_promotion_batch, tag}, state) do
+        case state.post_commit_promotion_retry_timer do
+          %{tag: ^tag} ->
+            state = %{state | post_commit_promotion_retry_timer: nil}
+            process_post_commit_promotion_retries(state)
+
+          _stale_or_cancelled ->
+            {:noreply, state}
+        end
       end
 
       def handle_info(
-            {:cleanup_promoted_after_commit, redis_key, type, dedicated_path},
+            {:retry_promoted_removal_after_commit, redis_key, expected_generation, tag, attempt},
             state
           )
-          when type in [:hash, :set, :zset] and is_binary(dedicated_path) do
-        try do
-          :ok =
-            Promotion.cleanup_promoted!(
+          when is_integer(attempt) and attempt > 0 do
+        retry = {:removal, redis_key, expected_generation}
+
+        case consume_post_commit_promotion_retry(state, retry, tag, attempt) do
+          {:ok, state} ->
+            handle_post_commit_promotion_removal(state, redis_key, expected_generation, attempt)
+
+          :stale ->
+            {:noreply, state}
+        end
+      end
+
+      def handle_info(
+            {:cleanup_promoted_after_commit, redis_key, type, dedicated_path,
+             expected_generation},
+            state
+          )
+          when type in [:hash, :set, :zset] and is_binary(dedicated_path) and
+                 (expected_generation == :unavailable or
+                    (is_integer(expected_generation) and expected_generation >= 0)) do
+        handle_post_commit_promoted_cleanup(
+          state,
+          redis_key,
+          type,
+          dedicated_path,
+          expected_generation,
+          0
+        )
+      end
+
+      def handle_info(
+            {:retry_promoted_cleanup_after_commit, redis_key, type, dedicated_path,
+             expected_generation, tag, attempt},
+            state
+          )
+          when type in [:hash, :set, :zset] and is_binary(dedicated_path) and
+                 is_integer(attempt) and attempt > 0 do
+        retry = {:cleanup, redis_key, type, dedicated_path, expected_generation}
+
+        case consume_post_commit_promotion_retry(state, retry, tag, attempt) do
+          {:ok, state} ->
+            handle_post_commit_promoted_cleanup(
+              state,
               redis_key,
               type,
               dedicated_path,
-              state.shard_data_path,
-              state.ets,
-              state.data_dir,
-              state.index,
-              state.instance_ctx
+              expected_generation,
+              attempt
             )
 
-          state =
-            state
-            |> cancel_promoted_compaction_retry(redis_key)
-            |> Map.update!(:promoted_compaction_pending, &MapSet.delete(&1, redis_key))
-
-          {:noreply,
-           %{state | promoted_instances: Map.delete(state.promoted_instances, redis_key)}}
-        rescue
-          error ->
-            Logger.error(
-              "Shard #{state.index}: post-commit promoted cleanup failed for " <>
-                "#{inspect(redis_key)}: #{Exception.format(:error, error, __STACKTRACE__)}"
-            )
-
-            {:stop, {:post_commit_promoted_cleanup_failed, redis_key}, state}
+          :stale ->
+            {:noreply, state}
         end
       end
 
@@ -441,7 +522,9 @@ defmodule Ferricstore.Store.Shard.Info do
       defp maybe_start_compound_promotion(
              %{compound_promotion_worker: nil} = state,
              redis_key,
-             type
+             type,
+             threshold,
+             retry_attempt
            ) do
         case ShardCompound.promoted_store(state, redis_key) do
           path when is_binary(path) ->
@@ -449,7 +532,6 @@ defmodule Ferricstore.Store.Shard.Info do
             |> delete_pending_compound_promotion(redis_key)
             |> install_promoted_instance(redis_key, path)
             |> reply_compound_promotion_waiters(redis_key)
-            |> maybe_start_pending_compound_promotion()
 
           nil ->
             state = ShardFlush.await_in_flight(state)
@@ -457,61 +539,325 @@ defmodule Ferricstore.Store.Shard.Info do
 
             case try_acquire_compound_promotion_latches(state, redis_key) do
               {:ok, latch_token, shared_log_latch_token} ->
-                state = delete_pending_compound_promotion(state, redis_key)
-                parent = self()
-                job_ref = make_ref()
-                :ok = Promotion.clear_compound_promotion_fence(state, redis_key)
-                :ok = Promotion.record_compound_promotion_running(state, redis_key)
-                state = sync_active_file_from_registry(state)
+                case ShardCompound.promotion_candidate_status(
+                       state,
+                       redis_key,
+                       type,
+                       threshold
+                     ) do
+                  :live ->
+                    state = delete_pending_compound_promotion(state, redis_key)
+                    parent = self()
+                    job_ref = make_ref()
+                    :ok = Promotion.clear_compound_promotion_fence(state, redis_key)
+                    :ok = Promotion.record_compound_promotion_running(state, redis_key)
+                    state = sync_active_file_from_registry(state)
 
-                {pid, monitor_ref} =
-                  spawn_compound_promotion_worker(
-                    state,
-                    redis_key,
-                    type,
-                    parent,
-                    job_ref,
-                    latch_token,
-                    shared_log_latch_token
-                  )
+                    {pid, monitor_ref} =
+                      spawn_compound_promotion_worker(
+                        state,
+                        redis_key,
+                        type,
+                        parent,
+                        job_ref,
+                        latch_token,
+                        shared_log_latch_token
+                      )
 
-                worker = %{
-                  job_ref: job_ref,
-                  monitor_ref: monitor_ref,
-                  pid: pid,
-                  redis_key: redis_key,
-                  type: type,
-                  latch_token: latch_token,
-                  shared_log_latch_token: shared_log_latch_token,
-                  active_file_id: state.active_file_id,
-                  active_file_path: state.active_file_path
-                }
+                    worker = %{
+                      job_ref: job_ref,
+                      monitor_ref: monitor_ref,
+                      pid: pid,
+                      redis_key: redis_key,
+                      type: type,
+                      latch_token: latch_token,
+                      shared_log_latch_token: shared_log_latch_token,
+                      active_file_id: state.active_file_id,
+                      active_file_path: state.active_file_path
+                    }
 
-                %{state | compound_promotion_worker: worker}
+                    %{state | compound_promotion_worker: worker}
 
-              :busy ->
-                Process.send_after(self(), {:start_compound_promotion, redis_key, type}, 10)
-                state
+                  :stale ->
+                    Promotion.release_compaction_latch(latch_token)
+                    Promotion.release_compaction_latch(shared_log_latch_token)
+
+                    state
+                    |> delete_pending_compound_promotion(redis_key)
+                    |> reply_compound_promotion_waiters(redis_key, false)
+
+                  :retry ->
+                    Promotion.release_compaction_latch(latch_token)
+                    Promotion.release_compaction_latch(shared_log_latch_token)
+
+                    schedule_compound_promotion_retry(
+                      state,
+                      redis_key,
+                      {type, threshold},
+                      retry_attempt,
+                      :catalog_unavailable
+                    )
+
+                  {:invalid, reason} ->
+                    Promotion.release_compaction_latch(latch_token)
+                    Promotion.release_compaction_latch(shared_log_latch_token)
+
+                    Logger.error(
+                      "Shard #{state.index}: rejecting compound promotion for " <>
+                        "#{inspect(redis_key)} because its member index is invalid: " <>
+                        inspect(reason)
+                    )
+
+                    state
+                    |> delete_pending_compound_promotion(redis_key)
+                    |> reply_compound_promotion_waiters(redis_key, false)
+                end
+
+              {:busy, busy_reason} ->
+                schedule_compound_promotion_retry(
+                  state,
+                  redis_key,
+                  {type, threshold},
+                  retry_attempt,
+                  busy_reason
+                )
             end
         end
       end
 
-      defp maybe_start_compound_promotion(state, _redis_key, _type), do: state
+      defp maybe_start_compound_promotion(
+             state,
+             _redis_key,
+             _type,
+             _threshold,
+             _retry_attempt
+           ),
+           do: state
 
       defp delete_pending_compound_promotion(state, redis_key) do
-        Map.update!(state, :compound_promotion_pending, &Map.delete(&1, redis_key))
+        state
+        |> cancel_compound_promotion_retry(redis_key)
+        |> Map.update!(:compound_promotion_pending, &Map.delete(&1, redis_key))
+        |> ensure_compound_promotion_retry_timer()
+      end
+
+      defp schedule_compound_promotion_retry(
+             state,
+             redis_key,
+             candidate,
+             retry_attempt,
+             retry_reason \\ nil
+           ) do
+        if Map.has_key?(state.compound_promotion_retry_timers, redis_key) do
+          state
+        else
+          delay_index = min(retry_attempt, length(@compound_promotion_retry_delays_ms) - 1)
+          delay_ms = Enum.at(@compound_promotion_retry_delays_ms, delay_index)
+          next_attempt = retry_attempt + 1
+          tag = make_ref()
+
+          retry = %{
+            tag: tag,
+            attempt: next_attempt,
+            candidate: candidate,
+            reason: retry_reason,
+            due_at_ms: monotonic_now_ms() + delay_ms
+          }
+
+          state
+          |> Map.update!(:compound_promotion_retry_timers, &Map.put(&1, redis_key, retry))
+          |> ensure_compound_promotion_retry_timer_at(retry.due_at_ms)
+        end
+      end
+
+      defp consume_compound_promotion_retry(state, redis_key) do
+        Map.update!(state, :compound_promotion_retry_timers, &Map.delete(&1, redis_key))
+      end
+
+      defp cancel_compound_promotion_retry(state, redis_key) do
+        state
+        |> Map.update!(:compound_promotion_retry_timers, &Map.delete(&1, redis_key))
+        |> ensure_compound_promotion_retry_timer()
+      end
+
+      defp process_compound_promotion_retries(state) do
+        now_ms = monotonic_now_ms()
+
+        due_retries =
+          state.compound_promotion_retry_timers
+          |> Enum.filter(fn {_redis_key, retry} -> retry.due_at_ms <= now_ms end)
+          |> Enum.take(@compound_promotion_retry_batch_size)
+
+        {state, blocked?} =
+          Enum.reduce_while(due_retries, {state, false}, fn {redis_key, retry}, {state, _} ->
+            case Map.get(state.compound_promotion_retry_timers, redis_key) do
+              %{tag: tag, attempt: attempt, candidate: {type, threshold}, due_at_ms: due_at_ms}
+              when tag == retry.tag and attempt == retry.attempt and due_at_ms <= now_ms ->
+                state = consume_compound_promotion_retry(state, redis_key)
+
+                state =
+                  case Map.get(state.compound_promotion_pending, redis_key) do
+                    {^type, ^threshold} ->
+                      maybe_start_compound_promotion(state, redis_key, type, threshold, attempt)
+
+                    _cancelled_or_replaced ->
+                      state
+                  end
+
+                if compound_retry_blocks_batch?(state, redis_key) do
+                  {:halt, {state, true}}
+                else
+                  {:cont, {state, false}}
+                end
+
+              _stale_or_not_due ->
+                {:cont, {state, false}}
+            end
+          end)
+
+        state = if blocked?, do: defer_due_compound_promotion_retries(state, now_ms), else: state
+        maybe_start_pending_compound_promotion(state)
+      end
+
+      defp compound_retry_blocks_batch?(state, redis_key) do
+        case Map.get(state.compound_promotion_retry_timers, redis_key) do
+          %{reason: reason} when reason in [:shared_log_latch, :catalog_unavailable] -> true
+          _other -> false
+        end
+      end
+
+      defp defer_due_compound_promotion_retries(state, now_ms) do
+        due_at_ms = now_ms + hd(@compound_promotion_retry_delays_ms)
+
+        retries =
+          Map.new(state.compound_promotion_retry_timers, fn {redis_key, retry} ->
+            if retry.due_at_ms <= now_ms do
+              {redis_key, %{retry | due_at_ms: due_at_ms}}
+            else
+              {redis_key, retry}
+            end
+          end)
+
+        %{state | compound_promotion_retry_timers: retries}
+      end
+
+      defp ensure_compound_promotion_retry_timer(state) do
+        next_due_at_ms = next_compound_promotion_retry_due_at_ms(state)
+
+        case next_due_at_ms do
+          nil -> cancel_compound_promotion_retry_timer(state)
+          due_at_ms -> ensure_compound_promotion_retry_timer_at(state, due_at_ms)
+        end
+      end
+
+      defp ensure_compound_promotion_retry_timer_at(state, due_at_ms) do
+        case state.compound_promotion_retry_timer do
+          nil ->
+            schedule_compound_promotion_retry_timer(state, due_at_ms)
+
+          %{due_at_ms: scheduled_due_at_ms} when scheduled_due_at_ms <= due_at_ms ->
+            state
+
+          %{due_at_ms: _scheduled_due_at_ms} ->
+            state
+            |> cancel_compound_promotion_retry_timer()
+            |> schedule_compound_promotion_retry_timer(due_at_ms)
+        end
+      end
+
+      defp next_compound_promotion_retry_due_at_ms(state) do
+        retry_due_at_ms =
+          Enum.reduce(state.compound_promotion_retry_timers, nil, fn {_redis_key, retry}, acc ->
+            due_at_ms = Map.get(retry, :due_at_ms, monotonic_now_ms())
+            if is_nil(acc), do: due_at_ms, else: min(acc, due_at_ms)
+          end)
+
+        scan_due_at_ms =
+          if is_nil(state.compound_promotion_worker) and
+               Enum.any?(state.compound_promotion_pending, fn {redis_key, _candidate} ->
+                 not Map.has_key?(state.compound_promotion_retry_timers, redis_key)
+               end) do
+            monotonic_now_ms() + hd(@compound_promotion_retry_delays_ms)
+          end
+
+        case {retry_due_at_ms, scan_due_at_ms} do
+          {nil, nil} -> nil
+          {due_at_ms, nil} -> due_at_ms
+          {nil, due_at_ms} -> due_at_ms
+          {retry_due_at_ms, scan_due_at_ms} -> min(retry_due_at_ms, scan_due_at_ms)
+        end
+      end
+
+      defp schedule_compound_promotion_retry_timer(state, due_at_ms) do
+        tag = make_ref()
+        delay_ms = max(due_at_ms - monotonic_now_ms(), 0)
+        timer_ref = Process.send_after(self(), {:retry_compound_promotion_batch, tag}, delay_ms)
+
+        %{
+          state
+          | compound_promotion_retry_timer: %{
+              tag: tag,
+              timer_ref: timer_ref,
+              due_at_ms: due_at_ms
+            }
+        }
+      end
+
+      defp cancel_compound_promotion_retry_timer(%{compound_promotion_retry_timer: nil} = state),
+        do: state
+
+      defp cancel_compound_promotion_retry_timer(state) do
+        _ =
+          Process.cancel_timer(state.compound_promotion_retry_timer.timer_ref,
+            async: false,
+            info: false
+          )
+
+        %{state | compound_promotion_retry_timer: nil}
+      end
+
+      defp maybe_start_pending_compound_promotion(state) do
+        state = start_pending_compound_promotions(state, @compound_promotion_retry_batch_size)
+        ensure_compound_promotion_retry_timer(state)
+      end
+
+      defp start_pending_compound_promotions(state, 0), do: state
+
+      defp start_pending_compound_promotions(
+             %{compound_promotion_worker: worker} = state,
+             _remaining
+           )
+           when not is_nil(worker),
+           do: state
+
+      defp start_pending_compound_promotions(state, remaining) do
+        case Enum.find(state.compound_promotion_pending, fn {redis_key, _candidate} ->
+               not Map.has_key?(state.compound_promotion_retry_timers, redis_key)
+             end) do
+          {redis_key, {type, threshold}} ->
+            state = maybe_start_compound_promotion(state, redis_key, type, threshold, 0)
+
+            if compound_retry_blocks_batch?(state, redis_key) do
+              state
+            else
+              start_pending_compound_promotions(state, remaining - 1)
+            end
+
+          nil ->
+            state
+        end
       end
 
       defp try_acquire_compound_promotion_latches(state, redis_key) do
         case normalize_try_latch(Promotion.try_acquire_compaction_latch(state, redis_key)) do
           :busy ->
-            :busy
+            {:busy, :key_latch}
 
           {:ok, latch_token} ->
             case normalize_try_latch(Promotion.try_acquire_shared_log_latch(state)) do
               :busy ->
                 Promotion.release_compaction_latch(latch_token)
-                :busy
+                {:busy, :shared_log_latch}
 
               {:ok, shared_log_latch_token} ->
                 {:ok, latch_token, shared_log_latch_token}
@@ -539,6 +885,8 @@ defmodule Ferricstore.Store.Shard.Info do
                 try do
                   receive do
                     {:start_compound_promotion_worker, ^job_ref} ->
+                      run_compound_promotion_worker_test_hook(redis_key)
+
                       result =
                         try do
                           Promotion.promote_collection!(
@@ -572,13 +920,8 @@ defmodule Ferricstore.Store.Shard.Info do
                           )
                       end
 
-                      release_promoted_compaction_latch_if_owned(latch_token, self())
-
-                      release_promoted_compaction_latch_if_owned(
-                        shared_log_latch_token,
-                        self()
-                      )
-
+                      transfer_promoted_compaction_latch(latch_token, parent)
+                      transfer_promoted_compaction_latch(shared_log_latch_token, parent)
                       send(parent, {:compound_promotion_complete, job_ref, self(), result})
                   after
                     5_000 -> :ok
@@ -628,21 +971,37 @@ defmodule Ferricstore.Store.Shard.Info do
         end
       end
 
+      if Mix.env() == :test do
+        defp run_compound_promotion_worker_test_hook(redis_key) do
+          case Application.get_env(:ferricstore, :compound_promotion_worker_test_hook) do
+            hook when is_function(hook, 1) -> hook.(redis_key)
+            _missing -> :ok
+          end
+        end
+      else
+        defp run_compound_promotion_worker_test_hook(_redis_key), do: :ok
+      end
+
       defp acknowledge_compound_promotion_worker(worker) do
         release_compound_promotion_worker_latches(worker)
         :ok
       end
 
       defp release_compound_promotion_worker_latches(worker) do
-        release_promoted_compaction_latch_if_owned(
+        release_compound_promotion_worker_latch(
           Map.get(worker, :latch_token, :none),
           worker.pid
         )
 
-        release_promoted_compaction_latch_if_owned(
+        release_compound_promotion_worker_latch(
           Map.get(worker, :shared_log_latch_token, :none),
           worker.pid
         )
+      end
+
+      defp release_compound_promotion_worker_latch(latch_token, worker_pid) do
+        release_promoted_compaction_latch_if_owned(latch_token, worker_pid)
+        release_promoted_compaction_latch_if_owned(latch_token, self())
       end
 
       defp refresh_active_file_size_after_compound_promotion(state, worker) do
@@ -688,16 +1047,447 @@ defmodule Ferricstore.Store.Shard.Info do
         %{state | promoted_instances: Map.put(state.promoted_instances, redis_key, info)}
       end
 
-      defp maybe_start_pending_compound_promotion(state) do
-        case Enum.at(state.compound_promotion_pending, 0) do
-          {redis_key, type} -> maybe_start_compound_promotion(state, redis_key, type)
-          nil -> state
+      defp maybe_install_promoted_instance(state, redis_key, dedicated_path, true),
+        do: install_promoted_instance(state, redis_key, dedicated_path)
+
+      defp maybe_install_promoted_instance(state, redis_key, _dedicated_path, false),
+        do: %{state | promoted_instances: Map.delete(state.promoted_instances, redis_key)}
+
+      defp retire_compound_promotion_state(state, redis_key) do
+        state
+        |> delete_pending_compound_promotion(redis_key)
+        |> reply_compound_promotion_waiters(redis_key, false)
+        |> cancel_promoted_compaction_retry(redis_key)
+        |> Map.update!(:promoted_compaction_pending, &MapSet.delete(&1, redis_key))
+        |> Map.update!(:promoted_instances, &Map.delete(&1, redis_key))
+      end
+
+      defp retire_post_commit_promotion_state(
+             state,
+             _redis_key,
+             {:current_promoted_incarnation, _type}
+           ),
+           do: state
+
+      defp retire_post_commit_promotion_state(state, redis_key, :recreated_unpromoted) do
+        state
+        |> cancel_promoted_compaction_retry(redis_key)
+        |> Map.update!(:promoted_compaction_pending, &MapSet.delete(&1, redis_key))
+        |> Map.update!(:promoted_instances, &Map.delete(&1, redis_key))
+      end
+
+      defp retire_post_commit_promotion_state(state, redis_key, :deleted),
+        do: retire_compound_promotion_state(state, redis_key)
+
+      defp handle_post_commit_promotion_removal(
+             state,
+             redis_key,
+             :unavailable,
+             _attempt
+           ) do
+        stop_for_unavailable_promotion_generation(state, redis_key, :remove)
+      end
+
+      defp handle_post_commit_promotion_removal(
+             state,
+             redis_key,
+             expected_generation,
+             attempt
+           ) do
+        retry = {:removal, redis_key, expected_generation}
+
+        result =
+          Promotion.with_compaction_latch(state, redis_key, fn ->
+            post_commit_promotion_state(state, redis_key, expected_generation, :any)
+          end)
+
+        case result do
+          {:ok, disposition} ->
+            next_state =
+              state
+              |> cancel_post_commit_promotion_retry(retry)
+              |> retire_post_commit_promotion_state(redis_key, disposition)
+              |> maybe_start_pending_compound_promotion()
+
+            {:noreply, next_state}
+
+          {:retry, reason} ->
+            schedule_post_commit_promotion_retry(
+              state,
+              retry,
+              attempt,
+              reason
+            )
+
+          {:fatal, reason} ->
+            stop_for_invalid_promotion_metadata(state, redis_key, :remove, reason)
         end
+      end
+
+      defp handle_post_commit_promoted_cleanup(
+             state,
+             redis_key,
+             _type,
+             _dedicated_path,
+             :unavailable,
+             _attempt
+           ) do
+        stop_for_unavailable_promotion_generation(state, redis_key, :cleanup)
+      end
+
+      defp handle_post_commit_promoted_cleanup(
+             state,
+             redis_key,
+             type,
+             dedicated_path,
+             expected_generation,
+             attempt
+           ) do
+        retry = {:cleanup, redis_key, type, dedicated_path, expected_generation}
+
+        try do
+          result =
+            Promotion.with_compaction_latch(state, redis_key, fn ->
+              case post_commit_promotion_state(
+                     state,
+                     redis_key,
+                     expected_generation,
+                     type
+                   ) do
+                {:ok, {:current_promoted_incarnation, ^type} = disposition} ->
+                  {:ok, disposition}
+
+                {:ok, {:current_promoted_incarnation, _different_type} = disposition} ->
+                  :ok =
+                    Promotion.remove_orphaned_dedicated!(
+                      redis_key,
+                      type,
+                      dedicated_path,
+                      state.data_dir,
+                      state.index
+                    )
+
+                  {:ok, disposition}
+
+                {:ok, disposition} when disposition in [:deleted, :recreated_unpromoted] ->
+                  :ok =
+                    Promotion.cleanup_promoted!(
+                      redis_key,
+                      type,
+                      dedicated_path,
+                      state.shard_data_path,
+                      state.keydir,
+                      state.data_dir,
+                      state.index,
+                      state.instance_ctx,
+                      expected_generation
+                    )
+
+                  {:ok, disposition}
+
+                retry_or_fatal ->
+                  retry_or_fatal
+              end
+            end)
+
+          case result do
+            {:ok, disposition} ->
+              next_state =
+                state
+                |> cancel_post_commit_promotion_retry(retry)
+                |> retire_post_commit_promotion_state(redis_key, disposition)
+                |> maybe_start_pending_compound_promotion()
+
+              {:noreply, next_state}
+
+            {:retry, reason} ->
+              schedule_post_commit_promotion_retry(
+                state,
+                retry,
+                attempt,
+                reason
+              )
+
+            {:fatal, reason} ->
+              stop_for_invalid_promotion_metadata(state, redis_key, :cleanup, reason)
+          end
+        rescue
+          error ->
+            Logger.error(
+              "Shard #{state.index}: post-commit promoted cleanup failed for " <>
+                "#{inspect(redis_key)}: #{Exception.format(:error, error, __STACKTRACE__)}"
+            )
+
+            {:stop, {:post_commit_promoted_cleanup_failed, redis_key}, state}
+        end
+      end
+
+      # Generation equality protects the deterministic dedicated path from a
+      # delayed cleanup belonging to an older collection incarnation.
+      defp post_commit_promotion_state(state, redis_key, expected_generation, expected_type) do
+        case compound_metadata_value(state, Promotion.marker_key(redis_key)) do
+          :unknown ->
+            {:retry, :promotion_marker_unavailable}
+
+          :missing ->
+            post_commit_marker_absent_state(state, redis_key)
+
+          {:present, marker_value} ->
+            case Promotion.decode_marker(marker_value) do
+              {:ok, marker_type, lifecycle, ^expected_generation}
+              when lifecycle in [:cleanup, :fallback] and
+                     (expected_type == :any or marker_type == expected_type) ->
+                post_commit_marker_absent_state(state, redis_key)
+
+              {:ok, marker_type, _lifecycle, _current_generation} ->
+                {:ok, {:current_promoted_incarnation, marker_type}}
+
+              {:error, reason} ->
+                {:fatal, reason}
+
+              :error ->
+                {:fatal, :invalid_promotion_marker}
+            end
+        end
+      end
+
+      defp post_commit_marker_absent_state(state, redis_key) do
+        case compound_metadata_value(state, CompoundKey.type_key(redis_key)) do
+          :unknown ->
+            {:retry, :compound_type_metadata_unavailable}
+
+          :missing ->
+            {:ok, :deleted}
+
+          {:present, type_value} ->
+            case decode_promotable_type(type_value) do
+              {:ok, type} -> post_commit_member_state(state, redis_key, type)
+              :other_type -> {:ok, :recreated_unpromoted}
+              :error -> {:fatal, :invalid_compound_type_metadata}
+            end
+        end
+      end
+
+      defp decode_promotable_type(type_value) do
+        case CompoundKey.decode_type(type_value) do
+          type when type in [:hash, :set, :zset] -> {:ok, type}
+          _other_type -> :other_type
+        end
+      rescue
+        FunctionClauseError -> :error
+      end
+
+      defp post_commit_member_state(state, redis_key, type) do
+        case ShardCompound.promotion_candidate_status(state, redis_key, type, 0) do
+          :live -> {:ok, :recreated_unpromoted}
+          :stale -> {:ok, :deleted}
+          :retry -> {:retry, :compound_member_index_unavailable}
+          {:invalid, reason} -> {:fatal, {:invalid_compound_member_index, reason}}
+        end
+      end
+
+      defp compound_metadata_value(state, key) do
+        case ShardReads.handle_get(key, state) do
+          {:reply, nil, _state} -> :missing
+          {:reply, value, _state} when is_binary(value) -> {:present, value}
+          {:reply, _storage_failure, _state} -> :unknown
+        end
+      rescue
+        _error -> :unknown
+      end
+
+      defp schedule_post_commit_promotion_retry(state, retry, attempt, reason) do
+        if Map.has_key?(state.post_commit_promotion_retry_timers, retry) do
+          {:noreply, state}
+        else
+          max_delay_index = length(@compound_promotion_retry_delays_ms) - 1
+          delay_index = min(attempt, max_delay_index)
+          delay_ms = Enum.at(@compound_promotion_retry_delays_ms, delay_index)
+          next_attempt = attempt + 1
+          tag = make_ref()
+
+          if attempt == 0 or
+               (attempt >= max_delay_index and rem(attempt - max_delay_index, 60) == 0) do
+            Logger.warning(
+              "Shard #{state.index}: deferring post-commit promotion cleanup after " <>
+                "metadata read failure for #{inspect(elem(retry, 1))}: #{inspect(reason)}"
+            )
+          end
+
+          timer = %{
+            tag: tag,
+            attempt: next_attempt,
+            due_at_ms: monotonic_now_ms() + delay_ms
+          }
+
+          next_state =
+            Map.update!(state, :post_commit_promotion_retry_timers, fn timers ->
+              Map.put(timers, retry, timer)
+            end)
+
+          {:noreply, ensure_post_commit_promotion_retry_timer_at(next_state, timer.due_at_ms)}
+        end
+      end
+
+      defp process_post_commit_promotion_retries(state) do
+        now_ms = monotonic_now_ms()
+
+        due_retries =
+          state.post_commit_promotion_retry_timers
+          |> Enum.filter(fn {_retry, timer} -> timer.due_at_ms <= now_ms end)
+          |> Enum.take(@compound_promotion_retry_batch_size)
+
+        result =
+          Enum.reduce_while(due_retries, {:noreply, state}, fn {retry, timer},
+                                                               {:noreply, state} ->
+            case consume_post_commit_promotion_retry(state, retry, timer.tag, timer.attempt) do
+              {:ok, state} ->
+                result =
+                  case retry do
+                    {:removal, redis_key, expected_generation} ->
+                      handle_post_commit_promotion_removal(
+                        state,
+                        redis_key,
+                        expected_generation,
+                        timer.attempt
+                      )
+
+                    {:cleanup, redis_key, type, dedicated_path, expected_generation} ->
+                      handle_post_commit_promoted_cleanup(
+                        state,
+                        redis_key,
+                        type,
+                        dedicated_path,
+                        expected_generation,
+                        timer.attempt
+                      )
+                  end
+
+                case result do
+                  {:noreply, next_state} -> {:cont, {:noreply, next_state}}
+                  {:stop, _reason, _state} = stop -> {:halt, stop}
+                end
+
+              :stale ->
+                {:cont, {:noreply, state}}
+            end
+          end)
+
+        case result do
+          {:noreply, state} -> {:noreply, ensure_post_commit_promotion_retry_timer(state)}
+          {:stop, _reason, _state} = stop -> stop
+        end
+      end
+
+      defp consume_post_commit_promotion_retry(state, retry, tag, attempt) do
+        case Map.get(state.post_commit_promotion_retry_timers, retry) do
+          %{tag: ^tag, attempt: ^attempt} ->
+            {:ok, Map.update!(state, :post_commit_promotion_retry_timers, &Map.delete(&1, retry))}
+
+          _stale_or_cancelled ->
+            :stale
+        end
+      end
+
+      defp cancel_post_commit_promotion_retry(state, retry) do
+        state
+        |> Map.update!(:post_commit_promotion_retry_timers, &Map.delete(&1, retry))
+        |> ensure_post_commit_promotion_retry_timer()
+      end
+
+      defp ensure_post_commit_promotion_retry_timer(state) do
+        next_due_at_ms = next_post_commit_promotion_retry_due_at_ms(state)
+
+        case next_due_at_ms do
+          nil -> cancel_post_commit_promotion_retry_timer(state)
+          due_at_ms -> ensure_post_commit_promotion_retry_timer_at(state, due_at_ms)
+        end
+      end
+
+      defp ensure_post_commit_promotion_retry_timer_at(state, due_at_ms) do
+        case state.post_commit_promotion_retry_timer do
+          nil ->
+            schedule_post_commit_promotion_retry_timer(state, due_at_ms)
+
+          %{due_at_ms: scheduled_due_at_ms} when scheduled_due_at_ms <= due_at_ms ->
+            state
+
+          %{due_at_ms: _scheduled_due_at_ms} ->
+            state
+            |> cancel_post_commit_promotion_retry_timer()
+            |> schedule_post_commit_promotion_retry_timer(due_at_ms)
+        end
+      end
+
+      defp next_post_commit_promotion_retry_due_at_ms(state) do
+        Enum.reduce(state.post_commit_promotion_retry_timers, nil, fn {_retry, timer}, acc ->
+          due_at_ms = Map.get(timer, :due_at_ms, monotonic_now_ms())
+          if is_nil(acc), do: due_at_ms, else: min(acc, due_at_ms)
+        end)
+      end
+
+      defp monotonic_now_ms, do: System.monotonic_time(:millisecond)
+
+      defp schedule_post_commit_promotion_retry_timer(state, due_at_ms) do
+        tag = make_ref()
+        delay_ms = max(due_at_ms - monotonic_now_ms(), 0)
+
+        timer_ref =
+          Process.send_after(self(), {:retry_post_commit_promotion_batch, tag}, delay_ms)
+
+        %{
+          state
+          | post_commit_promotion_retry_timer: %{
+              tag: tag,
+              timer_ref: timer_ref,
+              due_at_ms: due_at_ms
+            }
+        }
+      end
+
+      defp cancel_post_commit_promotion_retry_timer(
+             %{post_commit_promotion_retry_timer: nil} = state
+           ),
+           do: state
+
+      defp cancel_post_commit_promotion_retry_timer(state) do
+        _ =
+          Process.cancel_timer(
+            state.post_commit_promotion_retry_timer.timer_ref,
+            async: false,
+            info: false
+          )
+
+        %{state | post_commit_promotion_retry_timer: nil}
+      end
+
+      defp stop_for_unavailable_promotion_generation(state, redis_key, operation) do
+        reason = {:promotion_generation_unavailable, operation, redis_key}
+
+        Logger.error(
+          "Shard #{state.index}: refusing post-commit promotion #{operation} without " <>
+            "a captured generation for #{inspect(redis_key)}"
+        )
+
+        {:stop, reason, Map.put(state, :promotion_recovery_required, true)}
+      end
+
+      defp stop_for_invalid_promotion_metadata(state, redis_key, operation, metadata_reason) do
+        reason = {:invalid_promotion_metadata, operation, redis_key, metadata_reason}
+
+        Logger.error(
+          "Shard #{state.index}: refusing post-commit promotion #{operation} for " <>
+            "#{inspect(redis_key)}: #{inspect(metadata_reason)}"
+        )
+
+        {:stop, reason, Map.put(state, :promotion_recovery_required, true)}
       end
 
       defp prepare_promoted_flush_state(state) do
         state
         |> cancel_compound_promotion_worker_for_flush()
+        |> cancel_all_compound_promotion_retries()
+        |> cancel_all_post_commit_promotion_retries()
         |> cancel_promoted_compaction_worker_and_retries()
         |> reply_all_compound_promotion_waiters(false)
         |> Map.put(:compound_promotion_pending, %{})
@@ -724,6 +1514,18 @@ defmodule Ferricstore.Store.Shard.Info do
         |> sync_active_file_from_registry()
         |> refresh_active_file_size_after_compound_promotion(worker)
         |> Map.put(:compound_promotion_worker, nil)
+      end
+
+      defp cancel_all_compound_promotion_retries(state) do
+        state
+        |> cancel_compound_promotion_retry_timer()
+        |> Map.put(:compound_promotion_retry_timers, %{})
+      end
+
+      defp cancel_all_post_commit_promotion_retries(state) do
+        state
+        |> cancel_post_commit_promotion_retry_timer()
+        |> Map.put(:post_commit_promotion_retry_timers, %{})
       end
 
       defp reply_all_compound_promotion_waiters(state, promoted?) when is_boolean(promoted?) do

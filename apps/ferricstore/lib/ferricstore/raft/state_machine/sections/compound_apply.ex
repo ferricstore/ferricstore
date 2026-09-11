@@ -93,6 +93,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
         end
       end
 
+      # FLUSHDB has already durably appended promotion-marker tombstones before
+      # it reaches this apply phase. Keep ordinary PM deletes fail-closed while
+      # allowing that explicit cleanup path to retire the marker and its storage.
+      defp apply_flush_shard_delete_batch_keys(state, keys) do
+        {promotion_markers, regular_keys} =
+          Enum.split_with(keys, &match?(<<"PM:", _::binary>>, &1))
+
+        marker_results =
+          Enum.map(promotion_markers, &do_delete_flushed_promotion_marker(state, &1))
+
+        marker_results ++ apply_delete_batch_keys(state, regular_keys)
+      end
+
       defp apply_compound_batch_put_entries(state, redis_key, entries) do
         with {:ok, _count} <- admit_compound_batch_apply(state, entries) do
           apply_compound_batch_put_entries_admitted(state, redis_key, entries)
@@ -1057,7 +1070,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
         init_pending_write_process_state(state)
         Process.put(:sm_cross_shard_pending_writes, [])
         Process.put(:sm_cross_shard_pending_originals, %{})
-        Process.put(:sm_tx_promoted_latches, %{})
 
         try do
           result =
@@ -1091,10 +1103,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
             rollback_cross_shard_pending_writes_unless_published(state)
             :erlang.raise(kind, reason, __STACKTRACE__)
         after
-          release_transaction_promotion_latches()
           Process.delete(:sm_cross_shard_pending_writes)
           Process.delete(:sm_cross_shard_pending_originals)
-          Process.delete(:sm_tx_promoted_latches)
           clear_pending_write_process_state()
         end
       end
@@ -1260,15 +1270,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
             value -> Process.put(@sm_standalone_staged_key, value)
           end
         end
-      end
-
-      defp release_transaction_promotion_latches do
-        :sm_tx_promoted_latches
-        |> Process.get(%{})
-        |> Map.values()
-        |> Enum.each(&Promotion.release_compaction_latch/1)
-
-        :ok
       end
 
       defp cross_shard_pending_error_result({:error, _reason} = error), do: error

@@ -1206,13 +1206,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
       # Private: cross-shard transaction store builder
       # ---------------------------------------------------------------------------
 
-      defp hold_transaction_promotion_latch(ctx, redis_key) do
-        latch_key = {ctx.index, redis_key}
-        held = Process.get(:sm_tx_promoted_latches, %{})
+      defp hold_apply_promotion_latch(ctx, redis_key) do
+        shard_index = Map.get(ctx, :index, Map.get(ctx, :shard_index))
+        latch_key = {shard_index, redis_key}
+        held = Process.get(:sm_apply_promoted_latches, %{})
 
         unless Map.has_key?(held, latch_key) do
-          token = Promotion.acquire_compaction_latch(ctx, redis_key)
-          Process.put(:sm_tx_promoted_latches, Map.put(held, latch_key, token))
+          token = Promotion.acquire_compaction_latch_for_apply(ctx, redis_key)
+          Process.put(:sm_apply_promoted_latches, Map.put(held, latch_key, token))
         end
 
         :ok
@@ -2200,7 +2201,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
 
         promoted_target_ctx = fn redis_key, dedicated_path ->
           ctx = ctx_for_key.(redis_key)
-          hold_transaction_promotion_latch(ctx, redis_key)
+          hold_apply_promotion_latch(ctx, redis_key)
           active = Promotion.find_active(dedicated_path)
 
           Map.merge(ctx, %{
@@ -2290,6 +2291,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           when collection_type in ["hash", "set", "zset"] ->
             marker_key = Promotion.marker_key(redis_key)
 
+            generation =
+              ctx
+              |> cross_shard_compound_read(redis_key, marker_key)
+              |> promotion_marker_generation()
+
             type =
               case collection_type do
                 "hash" -> :hash
@@ -2297,9 +2303,26 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
                 "zset" -> :zset
               end
 
-            with :ok <- delete_in_ctx.(ctx, marker_key) do
-              queue_compound_promotion_removal_after_flush(marker_key)
-              queue_promoted_storage_cleanup_after_flush(redis_key, type, dedicated_path)
+            case generation do
+              :unavailable ->
+                {:error, :promotion_marker_unavailable}
+
+              generation ->
+                cleanup_marker = Promotion.encode_marker(type, :cleanup, generation)
+
+                with :ok <- put_in_ctx.(ctx, marker_key, cleanup_marker, 0) do
+                  queue_compound_promotion_removal_after_flush(marker_key, generation)
+
+                  queue_promoted_storage_cleanup_after_flush(
+                    redis_key,
+                    type,
+                    dedicated_path,
+                    generation
+                  )
+
+                  record_promoted_instance_removal(redis_key)
+                  :ok
+                end
             end
 
           _ctx, _redis_key, _collection_type, _dedicated_path ->
@@ -2476,7 +2499,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
                 :ok
 
               dedicated_path when is_binary(dedicated_path) ->
-                promoted_delete_batch.(redis_key, compound_keys, dedicated_path)
+                type_key = CompoundKey.type_key(redis_key)
+
+                collection_type =
+                  if type_key in compound_keys do
+                    cross_shard_compound_read(ctx, redis_key, type_key)
+                  end
+
+                with :ok <- promoted_delete_batch.(redis_key, compound_keys, dedicated_path) do
+                  if is_nil(collection_type) do
+                    :ok
+                  else
+                    stage_promoted_collection_removal.(
+                      ctx,
+                      redis_key,
+                      collection_type,
+                      dedicated_path
+                    )
+                  end
+                end
             end
           end,
           compound_scan: fn redis_key, prefix ->
@@ -2553,7 +2594,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
                     :ok
 
                   dedicated_path ->
-                    promoted_delete_batch.(redis_key, compound_keys, dedicated_path)
+                    with :ok <-
+                           promoted_delete_batch.(redis_key, compound_keys, dedicated_path) do
+                      case exact_compound_prefix_type(redis_key, prefix) do
+                        type when type in [:hash, :set, :zset] ->
+                          stage_promoted_collection_removal.(
+                            ctx,
+                            redis_key,
+                            CompoundKey.encode_type(type),
+                            dedicated_path
+                          )
+
+                        nil ->
+                          :ok
+                      end
+                    end
                 end
 
               {:error, :limit_exceeded} ->
@@ -2655,6 +2710,32 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
       end
 
       if Mix.env() == :test do
+        @doc false
+        def __transaction_compound_delete_prefix_for_test__(state, redis_key, prefix) do
+          case with_cross_shard_pending_writes(state, fn ->
+                 state
+                 |> build_local_raft_tx_store()
+                 |> Map.fetch!(:compound_delete_prefix)
+                 |> then(& &1.(redis_key, prefix))
+               end) do
+            {result, flushed_state} -> {result, consume_pending_state(flushed_state)}
+            other -> other
+          end
+        end
+
+        @doc false
+        def __transaction_compound_batch_delete_for_test__(state, redis_key, compound_keys) do
+          case with_cross_shard_pending_writes(state, fn ->
+                 state
+                 |> build_local_raft_tx_store()
+                 |> Map.fetch!(:compound_batch_delete)
+                 |> then(& &1.(redis_key, compound_keys))
+               end) do
+            {result, flushed_state} -> {result, consume_pending_state(flushed_state)}
+            other -> other
+          end
+        end
+
         defp cross_shard_transaction_hook(event) do
           case Application.get_env(:ferricstore, :cross_shard_transaction_hook) do
             hook when is_function(hook, 1) -> hook.(event)
@@ -2665,14 +2746,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         defp cross_shard_transaction_hook(_event), do: :ok
       end
 
-      defp queue_promoted_storage_cleanup_after_flush(redis_key, type, dedicated_path)
+      defp queue_promoted_storage_cleanup_after_flush(
+             redis_key,
+             type,
+             dedicated_path,
+             generation
+           )
            when is_binary(redis_key) and type in [:hash, :set, :zset] and
-                  is_binary(dedicated_path) do
+                  is_binary(dedicated_path) and
+                  (generation == :unavailable or
+                     (is_integer(generation) and generation >= 0)) do
         pending = Process.get(:sm_pending_promoted_storage_cleanups, %{})
 
         Process.put(
           :sm_pending_promoted_storage_cleanups,
-          Map.put(pending, redis_key, {type, dedicated_path})
+          Map.put_new(pending, redis_key, {type, dedicated_path, generation})
         )
 
         :ok

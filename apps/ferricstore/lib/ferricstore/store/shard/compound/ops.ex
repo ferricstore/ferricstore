@@ -5,6 +5,7 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
   alias Ferricstore.Store.{CompoundCommand, Promotion, ReadResult}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
+  alias Ferricstore.Store.Shard.Reads, as: ShardReads
   alias Ferricstore.Store.Shard.CompoundMemberIndex
   alias Ferricstore.Store.Shard.ZSetIndex
   alias Ferricstore.Store.Shard.Compound.{Promoted, Read}
@@ -834,33 +835,85 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
   end
 
   defp handle_compound_delete_prefix_direct(redis_key, prefix, state) do
+    Promotion.with_compaction_latch(state, redis_key, fn ->
+      do_handle_compound_delete_prefix_direct(redis_key, prefix, state)
+    end)
+  end
+
+  defp do_handle_compound_delete_prefix_direct(redis_key, prefix, state) do
     case CompoundMemberIndex.keys_for_prefix(Map.get(state, :compound_member_index), prefix) do
       {:ok, keys_to_delete} ->
-        cleanup_target = promoted_prefix_cleanup_target(state, redis_key, prefix)
+        case promotion_generation(state, redis_key) do
+          :unavailable ->
+            {:reply, {:error, :promotion_marker_unavailable}, state}
 
-        target =
-          case Promoted.promoted_store(state, redis_key) do
-            nil -> :shared
-            dedicated_path -> {:promoted, dedicated_path}
-          end
+          promotion_generation ->
+            cleanup_target = promoted_prefix_cleanup_target(state, redis_key, prefix)
 
-        case delete_compound_key_group_direct(redis_key, keys_to_delete, target, state) do
-          {:reply, :ok, new_state} ->
-            new_state = cleanup_promoted_prefix!(new_state, redis_key, cleanup_target)
+            target =
+              case Promoted.promoted_store(state, redis_key) do
+                nil -> :shared
+                dedicated_path -> {:promoted, dedicated_path}
+              end
 
-            new_state =
-              %{new_state | write_version: state.write_version + 1}
-              |> compound_member_index_delete_prefix(prefix)
-              |> ZSetIndex.clear_ready_key(redis_key)
+            case delete_compound_key_group_direct(redis_key, keys_to_delete, target, state) do
+              {:reply, :ok, new_state} ->
+                new_state =
+                  cleanup_promoted_prefix!(
+                    new_state,
+                    redis_key,
+                    cleanup_target,
+                    promotion_generation
+                  )
 
-            {:reply, :ok, new_state}
+                cancel_pending_promotion_after_direct_delete(
+                  redis_key,
+                  prefix,
+                  promotion_generation
+                )
 
-          {:reply, {:error, _reason} = error, new_state} ->
-            {:reply, error, new_state}
+                new_state =
+                  %{new_state | write_version: state.write_version + 1}
+                  |> compound_member_index_delete_prefix(prefix)
+                  |> ZSetIndex.clear_ready_key(redis_key)
+
+                {:reply, :ok, new_state}
+
+              {:reply, {:error, _reason} = error, new_state} ->
+                {:reply, error, new_state}
+            end
         end
 
       :unavailable ->
         {:reply, {:error, :compound_member_index_unavailable}, state}
+    end
+  end
+
+  defp cancel_pending_promotion_after_direct_delete(redis_key, prefix, generation) do
+    case Promoted.detect_compound_type(redis_key, prefix) do
+      {_type, ^prefix} ->
+        send(self(), {:remove_promoted_after_commit, redis_key, generation})
+
+      _not_an_exact_promotable_prefix ->
+        :ok
+    end
+  end
+
+  defp promotion_generation(state, redis_key) do
+    marker_key = Promotion.marker_key(redis_key)
+
+    case ShardReads.handle_get(marker_key, state) do
+      {:reply, nil, _state} ->
+        :none
+
+      {:reply, value, _state} when is_binary(value) ->
+        case Promotion.decode_marker(value) do
+          {:ok, _type, _lifecycle, generation} -> generation
+          _invalid -> :unavailable
+        end
+
+      _storage_failure_or_invalid ->
+        :unavailable
     end
   end
 
@@ -874,9 +927,10 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
     end
   end
 
-  defp cleanup_promoted_prefix!(state, _redis_key, nil), do: state
+  defp cleanup_promoted_prefix!(state, _redis_key, nil, _generation), do: state
 
-  defp cleanup_promoted_prefix!(state, redis_key, {type, dedicated_path}) do
+  defp cleanup_promoted_prefix!(state, redis_key, {type, dedicated_path}, generation)
+       when is_integer(generation) and generation >= 0 do
     :ok =
       Promotion.cleanup_promoted!(
         redis_key,
@@ -886,7 +940,8 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
         state.keydir,
         state.data_dir,
         state.index,
-        state.instance_ctx
+        state.instance_ctx,
+        generation
       )
 
     %{state | promoted_instances: Map.delete(state.promoted_instances, redis_key)}

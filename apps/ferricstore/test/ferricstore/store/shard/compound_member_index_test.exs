@@ -702,6 +702,9 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
     state = %{keydir: keydir, compound_member_index: index}
 
     assert 1 = ShardETS.prefix_count_entries(state, CompoundKey.set_prefix("tags"))
+
+    assert :unavailable =
+             ShardETS.indexed_prefix_count_entries(state, CompoundKey.set_prefix("tags"))
   end
 
   @tag :compound_cardinality_index
@@ -724,10 +727,9 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
     }
 
     CommandTime.with_now_ms(20, fn ->
-      assert {:error, {:storage_read_failed, {:compound_count_failed, :limit_exceeded}}} =
-               ShardETS.prefix_count_entries(state, prefix)
+      assert {:error, :limit_exceeded} = ShardETS.indexed_prefix_count_entries(state, prefix)
 
-      assert 0 = ShardETS.prefix_count_entries(state, prefix)
+      assert {:ok, 0} = ShardETS.indexed_prefix_count_entries(state, prefix)
     end)
   end
 

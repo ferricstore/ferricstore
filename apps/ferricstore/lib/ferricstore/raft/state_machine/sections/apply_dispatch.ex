@@ -658,6 +658,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
       defp validate_delete_batch_keys([]), do: :ok
 
+      defp validate_delete_batch_keys([<<"PM:", _::binary>> | _rest]),
+        do: {:error, :promotion_marker_delete_requires_cleanup}
+
       defp validate_delete_batch_keys([key | rest]) when is_binary(key),
         do: validate_delete_batch_keys(rest)
 
@@ -909,7 +912,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
              {:ok, results} <-
                with_pending_writes(state, fn ->
                  with :ok <- rewrite_flush_shard_preserved_keys(state, preserved_keys) do
-                   {:ok, apply_delete_batch_keys(state, delete_keys)}
+                   {:ok, apply_flush_shard_delete_batch_keys(state, delete_keys)}
                  end
                end),
              true <-

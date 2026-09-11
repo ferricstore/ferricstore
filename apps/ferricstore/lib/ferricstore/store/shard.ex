@@ -83,6 +83,8 @@ defmodule Ferricstore.Store.Shard do
   @default_shard_get_many_max_concurrency 4
   @default_shard_get_many_max_queued 64
   @default_promoted_compaction_retry_ms 30_000
+  @compound_promotion_retry_delays_ms [10, 20, 40, 80, 160, 320, 640, 1_000]
+  @compound_promotion_retry_batch_size 16
   @cold_read_timeout_ms 10_000
   @cold_read_compaction_retry_attempts 8
   @cold_read_compaction_retry_delay_ms 1
@@ -153,6 +155,10 @@ defmodule Ferricstore.Store.Shard do
     compaction_copy_fun: nil,
     compound_promotion_worker: nil,
     compound_promotion_pending: %{},
+    compound_promotion_retry_timers: %{},
+    compound_promotion_retry_timer: nil,
+    post_commit_promotion_retry_timers: %{},
+    post_commit_promotion_retry_timer: nil,
     compound_promotion_waiters: %{},
     promoted_compaction_worker: nil,
     promoted_compaction_pending: MapSet.new(),

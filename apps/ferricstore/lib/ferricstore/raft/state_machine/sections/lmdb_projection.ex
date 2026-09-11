@@ -910,12 +910,26 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
 
       defp active_file_shard_path?(_state, _shard_data_path), do: false
 
-      defp do_delete(state, key) do
+      defp do_delete(state, <<"PM:", _::binary>> = marker_key) do
+        redis_key = CompoundKey.extract_redis_key(marker_key)
+        :ok = hold_apply_promotion_latch(state, redis_key)
+        {:error, :promotion_marker_delete_requires_cleanup}
+      end
+
+      defp do_delete(state, key), do: do_delete_authorized(state, key)
+
+      defp do_delete_flushed_promotion_marker(state, <<"PM:", _::binary>> = marker_key),
+        do: do_delete_authorized(state, marker_key)
+
+      defp do_delete_authorized(state, key) do
         # If the key has a pending background write, flush the BitcaskWriter
         # first to ensure the PUT record lands on disk BEFORE the tombstone.
         # Without this, a background PUT arriving after the tombstone would
         # resurrect the key on recovery (Bitcask last-record-wins semantics).
-        with :ok <- flush_pending_for_key(state, key) do
+        promotion_generation = promotion_marker_generation_for_delete(state, key)
+
+        with :ok <- validate_promotion_generation_for_delete(promotion_generation),
+             :ok <- flush_pending_for_key(state, key) do
           prob_type =
             if CompoundKey.internal_key?(key), do: nil, else: prob_type_marker(state, key)
 
@@ -955,12 +969,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
                   end
                 end
 
-                queue_compound_promotion_removal_after_flush(key)
+                queue_compound_promotion_removal_after_flush(key, promotion_generation)
                 :ok
               end
           end
         end
       end
+
+      defp validate_promotion_generation_for_delete(:unavailable),
+        do: {:error, :promotion_marker_unavailable}
+
+      defp validate_promotion_generation_for_delete(_available), do: :ok
 
       defp maybe_delete_prob_type_marker(state, key, type)
            when type in [:bloom, :cms, :cuckoo, :topk] do
@@ -969,14 +988,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
 
       defp maybe_delete_prob_type_marker(_state, _key, _type), do: :ok
 
-      defp queue_compound_promotion_removal_after_flush(<<"PM:", _::binary>> = marker_key) do
+      defp queue_compound_promotion_removal_after_flush(
+             <<"PM:", _::binary>> = marker_key,
+             generation
+           )
+           when generation == :none or generation == :unavailable or
+                  (is_integer(generation) and generation >= 0) do
         redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(marker_key)
 
         case Process.get(:sm_pending_compound_promotion_removals) do
-          %MapSet{} = pending ->
+          pending when is_map(pending) ->
             Process.put(
               :sm_pending_compound_promotion_removals,
-              MapSet.put(pending, redis_key)
+              Map.put_new(pending, redis_key, generation)
             )
 
           _not_in_apply ->
@@ -986,7 +1010,29 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
         :ok
       end
 
-      defp queue_compound_promotion_removal_after_flush(_key), do: :ok
+      defp queue_compound_promotion_removal_after_flush(_key, _generation), do: :ok
+
+      defp promotion_marker_generation_for_delete(state, <<"PM:", _::binary>> = marker_key) do
+        redis_key = CompoundKey.extract_redis_key(marker_key)
+        :ok = hold_apply_promotion_latch(state, redis_key)
+
+        case do_get(state, marker_key) do
+          nil -> :none
+          value when is_binary(value) -> promotion_marker_generation(value)
+          _storage_failure_or_invalid -> :unavailable
+        end
+      end
+
+      defp promotion_marker_generation_for_delete(_state, _key), do: :none
+
+      defp promotion_marker_generation(value) when is_binary(value) do
+        case Promotion.decode_marker(value) do
+          {:ok, _type, _lifecycle, generation} -> generation
+          _invalid -> :unavailable
+        end
+      end
+
+      defp promotion_marker_generation(_missing_or_invalid), do: :unavailable
 
       defp maybe_queue_lmdb_state_delete(state, key) when is_binary(key) do
         cond do

@@ -311,6 +311,317 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.PromotedSingleMutationDurab
         end
       end
 
+      @tag :promoted_single_mutation_durability
+      test "transaction exact promoted prefix deletion retires its dedicated storage", %{
+        state: state,
+        ets: ets
+      } do
+        redis_key = "promoted-transaction-prefix-delete"
+        field_key = CompoundKey.hash_field(redis_key, "field")
+        marker_key = Promotion.marker_key(redis_key)
+        state = promoted_cleanup_test_state(state)
+
+        {state, _log_path} =
+          promoted_single_fixture(state, ets, 0, redis_key, :hash, [
+            {field_key, "value", 0}
+          ])
+
+        dedicated_path = state.promoted_instances[redis_key].path
+
+        assert {:ok, flushed_state} =
+                 StateMachine.__transaction_compound_delete_prefix_for_test__(
+                   state,
+                   redis_key,
+                   CompoundKey.hash_prefix(redis_key)
+                 )
+
+        refute Map.has_key?(flushed_state.promoted_instances, redis_key)
+        assert [] == :ets.lookup(ets, field_key)
+        assert_cleanup_marker(ets, marker_key, :hash, 0)
+
+        assert_receive {:cleanup_promoted_after_commit, ^redis_key, :hash, ^dedicated_path,
+                        _incarnation_token}
+      end
+
+      @tag :promoted_single_mutation_durability
+      test "transaction prefix deletion rejects an unreadable generation before publish", %{
+        state: state,
+        ets: ets
+      } do
+        redis_key = "promoted-transaction-unreadable-generation"
+        field_key = CompoundKey.hash_field(redis_key, "field")
+        marker_key = Promotion.marker_key(redis_key)
+        state = promoted_cleanup_test_state(state)
+
+        {state, _log_path} =
+          promoted_single_fixture(state, ets, 0, redis_key, :hash, [
+            {field_key, "value", 0}
+          ])
+
+        marker = Promotion.encode_marker(:hash, :promoted, Promotion.new_generation())
+        malformed = binary_part(marker, 0, byte_size(marker) - 1)
+
+        :ets.insert(
+          ets,
+          {marker_key, malformed, 0, LFU.initial(), 0, 0, byte_size(malformed)}
+        )
+
+        original_field = :ets.lookup(ets, field_key)
+
+        assert {:error, :promotion_marker_unavailable} =
+                 StateMachine.__transaction_compound_delete_prefix_for_test__(
+                   state,
+                   redis_key,
+                   CompoundKey.hash_prefix(redis_key)
+                 )
+
+        assert original_field == :ets.lookup(ets, field_key)
+
+        assert [{^marker_key, ^malformed, 0, _lfu, 0, 0, _size}] =
+                 :ets.lookup(ets, marker_key)
+      end
+
+      @tag :promoted_single_mutation_durability
+      test "exact promoted prefix deletion rejects a missing generation before mutation", %{
+        state: state,
+        ets: ets
+      } do
+        redis_key = "promoted-prefix-missing-generation"
+        field_key = CompoundKey.hash_field(redis_key, "field")
+        marker_key = Promotion.marker_key(redis_key)
+        state = promoted_cleanup_test_state(state)
+
+        {state, _log_path} =
+          promoted_single_fixture(state, ets, 0, redis_key, :hash, [
+            {field_key, "value", 0}
+          ])
+
+        :ets.delete(ets, marker_key)
+        original_field = :ets.lookup(ets, field_key)
+
+        assert {_state, {:error, :promotion_marker_unavailable}} =
+                 StateMachine.apply(
+                   %{},
+                   {:compound_delete_prefix, CompoundKey.hash_prefix(redis_key)},
+                   state
+                 )
+
+        assert original_field == :ets.lookup(ets, field_key)
+        assert File.dir?(state.promoted_instances[redis_key].path)
+      end
+
+      @tag :promoted_single_mutation_durability
+      test "transaction cleanup remains recoverable when no shard worker is registered", %{
+        state: state,
+        ets: ets
+      } do
+        redis_key = "promoted-transaction-durable-cleanup"
+        field_key = CompoundKey.hash_field(redis_key, "field")
+        marker_key = Promotion.marker_key(redis_key)
+        state = promoted_cleanup_test_state(state, worker?: false)
+
+        {state, _log_path} =
+          promoted_single_fixture(state, ets, 0, redis_key, :hash, [
+            {field_key, "value", 0}
+          ])
+
+        dedicated_path = state.promoted_instances[redis_key].path
+
+        assert {:ok, flushed_state} =
+                 StateMachine.__transaction_compound_delete_prefix_for_test__(
+                   state,
+                   redis_key,
+                   CompoundKey.hash_prefix(redis_key)
+                 )
+
+        refute Map.has_key?(flushed_state.promoted_instances, redis_key)
+
+        assert [{^marker_key, marker, 0, _lfu, _fid, _offset, _size}] =
+                 :ets.lookup(ets, marker_key)
+
+        assert {:ok, :hash, :cleanup, 0} = Promotion.decode_marker(marker)
+        assert File.dir?(dedicated_path)
+
+        assert %{} =
+                 Promotion.recover_promoted(
+                   state.shard_data_path,
+                   ets,
+                   state.data_dir,
+                   0,
+                   state.instance_ctx
+                 )
+
+        assert [] == :ets.lookup(ets, marker_key)
+        refute File.dir?(dedicated_path)
+      end
+
+      @tag :promoted_single_mutation_durability
+      test "transaction promoted batch deletion retires storage when it includes the type key", %{
+        state: state,
+        ets: ets
+      } do
+        redis_key = "promoted-transaction-batch-delete"
+        field_key = CompoundKey.hash_field(redis_key, "field")
+        type_key = CompoundKey.type_key(redis_key)
+        marker_key = Promotion.marker_key(redis_key)
+        state = promoted_cleanup_test_state(state)
+
+        {state, _log_path} =
+          promoted_single_fixture(state, ets, 0, redis_key, :hash, [
+            {field_key, "value", 0}
+          ])
+
+        dedicated_path = state.promoted_instances[redis_key].path
+
+        assert {:ok, flushed_state} =
+                 StateMachine.__transaction_compound_batch_delete_for_test__(
+                   state,
+                   redis_key,
+                   [field_key, type_key]
+                 )
+
+        refute Map.has_key?(flushed_state.promoted_instances, redis_key)
+        assert [] == :ets.lookup(ets, field_key)
+        assert [] == :ets.lookup(ets, type_key)
+        assert_cleanup_marker(ets, marker_key, :hash, 0)
+
+        assert_receive {:cleanup_promoted_after_commit, ^redis_key, :hash, ^dedicated_path,
+                        _incarnation_token}
+      end
+
+      @tag :promoted_single_mutation_durability
+      test "exact prefix deletion rejects an unreadable promotion generation before apply", %{
+        state: state,
+        ets: ets
+      } do
+        redis_key = "promoted-prefix-unreadable-generation"
+        field_key = CompoundKey.hash_field(redis_key, "field")
+        marker_key = Promotion.marker_key(redis_key)
+        state = promoted_cleanup_test_state(state)
+
+        {state, _log_path} =
+          promoted_single_fixture(state, ets, 0, redis_key, :hash, [
+            {field_key, "value", 0}
+          ])
+
+        marker = Promotion.encode_marker(:hash, :promoted, Promotion.new_generation())
+        malformed = binary_part(marker, 0, byte_size(marker) - 1)
+
+        :ets.insert(
+          ets,
+          {marker_key, malformed, 0, LFU.initial(), 0, 0, byte_size(malformed)}
+        )
+
+        original_field = :ets.lookup(ets, field_key)
+
+        assert {_state, {:error, :promotion_marker_unavailable}} =
+                 StateMachine.apply(
+                   %{},
+                   {:compound_delete_prefix, CompoundKey.hash_prefix(redis_key)},
+                   state
+                 )
+
+        assert original_field == :ets.lookup(ets, field_key)
+
+        assert [{^marker_key, ^malformed, 0, _lfu, 0, 0, _size}] =
+                 :ets.lookup(ets, marker_key)
+      end
+
+      @tag :promoted_single_mutation_durability
+      test "ordinary promotion marker deletion waits then fails closed", %{
+        state: state,
+        ets: ets
+      } do
+        redis_key = "ordinary-marker-delete-latch"
+        field_key = CompoundKey.hash_field(redis_key, "field")
+        marker_key = Promotion.marker_key(redis_key)
+        state = promoted_cleanup_test_state(state)
+
+        {state, _log_path} =
+          promoted_single_fixture(state, ets, 0, redis_key, :hash, [
+            {field_key, "value", 0}
+          ])
+
+        owner = %{instance_ctx: state.instance_ctx, shard_index: 0}
+        latch = Promotion.acquire_compaction_latch(owner, redis_key)
+
+        deletion =
+          Task.async(fn ->
+            StateMachine.apply(%{}, {:delete, marker_key}, state)
+          end)
+
+        try do
+          assert nil == Task.yield(deletion, 50)
+        after
+          Promotion.release_compaction_latch(latch)
+        end
+
+        assert {_next_state, {:error, :promotion_marker_delete_requires_cleanup}} =
+                 Task.await(deletion, 5_000)
+
+        assert [_marker] = :ets.lookup(ets, marker_key)
+        assert [_field] = :ets.lookup(ets, field_key)
+        assert File.dir?(state.promoted_instances[redis_key].path)
+      end
+
+      @tag :promoted_single_mutation_durability
+      test "delete batches reject promotion marker deletion atomically", %{
+        state: state,
+        ets: ets
+      } do
+        redis_key = "ordinary-marker-delete-batch"
+        field_key = CompoundKey.hash_field(redis_key, "field")
+        marker_key = Promotion.marker_key(redis_key)
+        plain_key = "ordinary-marker-delete-batch-plain"
+        state = promoted_cleanup_test_state(state)
+
+        {state, _log_path} =
+          promoted_single_fixture(state, ets, 0, redis_key, :hash, [
+            {field_key, "value", 0}
+          ])
+
+        assert {state, :ok} = StateMachine.apply(%{}, {:put, plain_key, "plain", 0}, state)
+
+        assert {_next_state, {:error, :promotion_marker_delete_requires_cleanup}} =
+                 StateMachine.apply(%{}, {:delete_batch, [plain_key, marker_key]}, state)
+
+        assert [{^plain_key, "plain", 0, _lfu, _fid, _offset, 5}] =
+                 :ets.lookup(ets, plain_key)
+
+        assert [_marker] = :ets.lookup(ets, marker_key)
+        assert [_field] = :ets.lookup(ets, field_key)
+        assert File.dir?(state.promoted_instances[redis_key].path)
+      end
+
+      defp promoted_cleanup_test_state(state, opts \\ []) do
+        suffix = System.unique_integer([:positive])
+        shard_name = :"promoted_cleanup_#{suffix}"
+
+        if Keyword.get(opts, :worker?, true) do
+          parent = self()
+          collector = spawn_link(fn -> promoted_maintenance_forward(parent) end)
+          true = Process.register(collector, shard_name)
+
+          on_exit(fn ->
+            if Process.alive?(collector), do: Process.exit(collector, :normal)
+          end)
+        end
+
+        latch = :ets.new(:promoted_cleanup_latch, [:set, :public])
+
+        instance_ctx = %{
+          FerricStore.Instance.get(:default)
+          | name: :"promoted_cleanup_#{suffix}",
+            data_dir: state.data_dir,
+            data_dir_expanded: Path.expand(state.data_dir),
+            shard_count: 1,
+            shard_names: {shard_name},
+            latch_refs: {latch}
+        }
+
+        %{state | shard_index: 0, instance_ctx: instance_ctx}
+      end
+
       defp promoted_single_fixture(state, ets, shard_index, redis_key, type, entries) do
         dedicated_path = Promotion.dedicated_path(state.data_dir, shard_index, type, redis_key)
         log_path = Path.join(dedicated_path, "00000.log")
@@ -354,6 +665,13 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.PromotedSingleMutationDurab
           :ets.new(table, [type, :public, :named_table])
           on_exit(fn -> safe_delete_ets(table) end)
         end
+      end
+
+      defp assert_cleanup_marker(ets, marker_key, type, generation) do
+        assert [{^marker_key, marker, 0, _lfu, _fid, _offset, _size}] =
+                 :ets.lookup(ets, marker_key)
+
+        assert {:ok, ^type, :cleanup, ^generation} = Promotion.decode_marker(marker)
       end
 
       defp assert_promoted_value(log_path, key, expected) do

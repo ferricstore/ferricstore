@@ -609,16 +609,34 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
            do: {:ok, sm_state, %{history: %{}}}
 
       defp recover_segment_projected_command(command, position, sm_state) do
-        with_segment_projection_command_time(command, fn ->
-          case segment_project_command(decoded_replay_command(command), position, sm_state) do
-            {:ok, next_sm_state, _result, applied_increment} ->
-              {:ok, bump_segment_projected_applied_count(next_sm_state, applied_increment),
-               %{history: %{}}}
+        decoded_command = decoded_replay_command(command)
 
-            :unsupported ->
+        {projection_command, promotion_keys} =
+          prepare_segment_projection_command(decoded_command)
+
+        projection_result =
+          with_segment_projection_promotion_latches(sm_state, promotion_keys, fn ->
+            with_segment_projection_command_time(command, fn ->
+              segment_project_command(projection_command, position, sm_state)
+            end)
+          end)
+
+        case projection_result do
+          {:ok, next_sm_state, _result, applied_increment} ->
+            {:ok, bump_segment_projected_applied_count(next_sm_state, applied_increment),
+             %{history: %{}}}
+
+          :unsupported ->
+            with_segment_projection_command_time(command, fn ->
               recover_segment_projected_state_machine_command(command, position, sm_state)
-          end
-        end)
+            end)
+        end
+      end
+
+      if Mix.env() == :test do
+        @doc false
+        def __recover_segment_projected_command_for_test__(command, position, sm_state),
+          do: recover_segment_projected_command(command, position, sm_state)
       end
 
       defp recover_segment_projected_state_machine_command(command, position, sm_state) do

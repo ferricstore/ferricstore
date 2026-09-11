@@ -13,15 +13,18 @@ defmodule Ferricstore.FlowProductionRecoveryTest do
   setup do
     old_threshold = Application.get_env(:ferricstore, :blob_side_channel_threshold_bytes)
     old_reconcile = Application.get_env(:ferricstore, :blob_protection_reconcile_enabled)
+    old_retention_sweeper = Application.get_env(:ferricstore, :flow_retention_sweeper_enabled)
 
     Application.put_env(:ferricstore, :blob_side_channel_threshold_bytes, 64)
     Application.put_env(:ferricstore, :blob_protection_reconcile_enabled, true)
+    Application.put_env(:ferricstore, :flow_retention_sweeper_enabled, false)
 
     isolated = ShardHelpers.setup_isolated_data_dir()
 
     on_exit(fn ->
       restore_env(:blob_side_channel_threshold_bytes, old_threshold)
       restore_env(:blob_protection_reconcile_enabled, old_reconcile)
+      restore_env(:flow_retention_sweeper_enabled, old_retention_sweeper)
       ShardHelpers.teardown_isolated_data_dir(isolated)
     end)
 
@@ -216,6 +219,18 @@ defmodule Ferricstore.FlowProductionRecoveryTest do
                now_ms: cancel_now_ms
              )
 
+    ctx = FerricStore.Instance.get(:default)
+    state_key = Keys.state_key(id, partition)
+    shard_index = Router.shard_for(ctx, state_key)
+
+    lmdb_path =
+      isolated.tmp_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> LMDB.path()
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count, 45_000)
+    assert {:ok, _expired_query_row} = LMDB.get(lmdb_path, state_key)
+
     assert :ok =
              ShardHelpers.eventually(
                fn ->
@@ -231,27 +246,8 @@ defmodule Ferricstore.FlowProductionRecoveryTest do
     assert {:ok, %{records: []}} = FerricStore.flow_query(query, params)
 
     restarted_ctx = FerricStore.Instance.get(:default)
-    state_key = Keys.state_key(id, partition)
-    shard_index = Router.shard_for(restarted_ctx, state_key)
-
-    lmdb_path =
-      isolated.tmp_dir
-      |> Ferricstore.DataDir.shard_data_path(shard_index)
-      |> LMDB.path()
-
-    case LMDB.get(lmdb_path, state_key) do
-      :not_found -> :ok
-      {:ok, _stale_query_row} -> :ok
-    end
-
-    assert {:ok, _cleanup} =
-             FerricStore.flow_retention_cleanup(limit: 10, now_ms: cancel_now_ms + 10_000)
-
-    assert :ok =
-             ShardHelpers.eventually(
-               fn -> LMDB.get(lmdb_path, state_key) == :not_found end,
-               "retention should delete the expired QueryRow after its WAL source is retired"
-             )
+    assert shard_index == Router.shard_for(restarted_ctx, state_key)
+    assert :not_found = LMDB.get(lmdb_path, state_key)
   end
 
   defp start_background_projection_work(ctx) do

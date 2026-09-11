@@ -1004,7 +1004,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
       test "unified segment generic batch projection decodes and classifies in one pass" do
         source = Ferricstore.Test.SourceFiles.waraft_storage_source()
 
-        assert source =~ "segment_project_decode_batch(commands, :unknown, [], [])"
+        assert source =~ "segment_project_decode_batch(commands, :unknown, [], [], [])"
+        assert source =~ "prepare_segment_projection_command(decoded_command)"
 
         refute source =~ "commands = Enum.map(commands, &decoded_replay_command/1)",
                "projection should not decode once and then scan again for homogeneous batches"
