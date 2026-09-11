@@ -8,6 +8,7 @@ defmodule Ferricstore.Store.TypeRegistryFirstClaimIntegrationTest do
   setup do
     ShardHelpers.reset_memory_guard_pressure()
     ShardHelpers.wait_shards_alive()
+    ShardHelpers.wait_default_pipeline_ready()
     :ok
   end
 
