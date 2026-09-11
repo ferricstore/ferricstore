@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   @moduledoc false
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.CommandTime
   alias Ferricstore.Flow
   alias Ferricstore.Flow.HistoryProjector
   alias Ferricstore.Flow.HistoryProjector.ValueProjection
@@ -804,7 +805,10 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
         process_record!(record, ctx, state_key, run_id)
 
       {:lmdb, state_key} ->
-        process_record!(Map.fetch!(records_by_key, state_key), ctx, state_key, run_id)
+        case Map.fetch(records_by_key, state_key) do
+          {:ok, record} -> process_record!(record, ctx, state_key, run_id)
+          :error -> :ok
+        end
     end)
   end
 
@@ -1372,6 +1376,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
       {:ok, _query_row} ->
         case read_lmdb_records!([state_key], ctx) do
           [{^state_key, record}] -> {:ok, record}
+          [] -> :not_found
           _invalid -> raise "shared-ref backfill failed to resolve LMDB state"
         end
 
@@ -1391,18 +1396,25 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
       |> max(QueryRecordStore.max_input_bytes(ctx.instance_ctx))
       |> min(@maximum_hydration_bytes)
 
-    do_read_lmdb_records!(ctx, state_keys, max_input_bytes, [])
+    do_read_lmdb_records!(
+      ctx,
+      state_keys,
+      CommandTime.now_ms(),
+      max_input_bytes,
+      []
+    )
   end
 
-  defp do_read_lmdb_records!(_ctx, [], _max_input_bytes, acc), do: Enum.reverse(acc)
+  defp do_read_lmdb_records!(_ctx, [], _visibility_ms, _max_input_bytes, acc),
+    do: Enum.reverse(acc)
 
-  defp do_read_lmdb_records!(ctx, state_keys, max_input_bytes, acc) do
+  defp do_read_lmdb_records!(ctx, state_keys, visibility_ms, max_input_bytes, acc) do
     case QueryRecordStore.read_many(
            ctx.instance_ctx,
            ctx.shard_index,
            ctx.lmdb_path,
            state_keys,
-           0,
+           visibility_ms,
            max_input_bytes,
            timeout_ms: @cold_read_timeout_ms
          ) do
@@ -1417,9 +1429,13 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
             {state_key, record} when is_binary(state_key) and is_map(record) ->
               {state_key, record}
 
+            {_state_key, nil} ->
+              nil
+
             {state_key, _missing} ->
               raise "shared-ref backfill failed to decode or hydrate LMDB QueryRow #{inspect(state_key)}"
           end)
+          |> Enum.reject(&is_nil/1)
 
         remaining = Enum.drop(state_keys, consumed)
         next_acc = Enum.reverse(page, acc)
@@ -1429,7 +1445,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
             Enum.reverse(next_acc)
 
           not complete? and remaining != [] ->
-            do_read_lmdb_records!(ctx, remaining, max_input_bytes, next_acc)
+            do_read_lmdb_records!(ctx, remaining, visibility_ms, max_input_bytes, next_acc)
 
           true ->
             raise "shared-ref backfill received an inconsistent LMDB QueryRow page"

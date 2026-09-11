@@ -139,6 +139,50 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
     refute :ets.member(test_ctx.keydir, Keys.shared_value_ref_backfill_key(0))
   end
 
+  test "expired LMDB-only state with a retired source does not block startup", test_ctx do
+    expired_at_ms = System.system_time(:millisecond) - 1
+
+    rec =
+      record("expired-lmdb-source",
+        state: "cancelled",
+        next_run_at_ms: nil,
+        terminal_retention_until_ms: expired_at_ms,
+        payload_ref: shared_ref("expired-lmdb-source")
+      )
+
+    state_key = insert_unhydratable_lmdb_record!(test_ctx, rec, expired_at_ms)
+
+    assert :ok = run!(test_ctx)
+    assert :ets.member(test_ctx.keydir, Keys.shared_value_ref_backfill_key(0))
+    refute :ets.member(test_ctx.keydir, Keys.retention_guard_key(rec.id, rec.partition_key))
+
+    refute :ets.member(
+             test_ctx.keydir,
+             Keys.shared_value_ref_registry_key(rec.id, rec.partition_key)
+           )
+
+    assert {:ok, _query_row} = LMDB.get(LMDB.path(test_ctx.shard_path), state_key)
+  end
+
+  test "unexpired LMDB-only state with a missing source still fails closed", test_ctx do
+    expires_at_ms = System.system_time(:millisecond) + 60_000
+
+    rec =
+      record("live-lmdb-source",
+        state: "cancelled",
+        next_run_at_ms: nil,
+        terminal_retention_until_ms: expires_at_ms
+      )
+
+    insert_unhydratable_lmdb_record!(test_ctx, rec, expires_at_ms)
+
+    assert_raise RuntimeError, ~r/shared-ref backfill.*(?:hydrate|storage)/i, fn ->
+      run!(test_ctx)
+    end
+
+    refute :ets.member(test_ctx.keydir, Keys.shared_value_ref_backfill_key(0))
+  end
+
   test "LMDB scan errors do not advance to the final watermark", test_ctx do
     insert_record!(test_ctx, record("lmdb-error", payload_ref: shared_ref("external")))
 
@@ -996,6 +1040,33 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
                {:put, state_key, query_row}
              ])
 
+    state_key
+  end
+
+  defp insert_unhydratable_lmdb_record!(test_ctx, record, expire_at_ms) do
+    state_key = Keys.state_key(record.id, record.partition_key)
+    encoded = Flow.encode_record(record)
+    index = System.unique_integer([:positive, :monotonic])
+
+    locator =
+      Locator.new!(
+        flow_id: record.id,
+        kind: :state,
+        version: record.version,
+        raft_index: index,
+        file_id: {:waraft_apply_projection, index},
+        offset: 0,
+        value_size: byte_size(encoded),
+        checksum: :crypto.hash(:sha256, encoded),
+        expire_at_ms: expire_at_ms,
+        segment_generation: 1,
+        frame_size: byte_size(encoded)
+      )
+
+    assert {:ok, query_row} =
+             QueryRowCodec.encode(state_key, record, locator, expire_at_ms)
+
+    assert :ok = LMDB.write_batch(LMDB.path(test_ctx.shard_path), [{:put, state_key, query_row}])
     state_key
   end
 
