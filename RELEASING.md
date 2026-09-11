@@ -11,22 +11,16 @@
 
 ## Steps
 
-1. Bump `@version` in `apps/ferricstore/mix.exs`
+1. Bump the umbrella and application versions in `mix.exs` and every
+   `apps/*/mix.exs`, update `CHANGELOG.md`, installation examples, deployment
+   image defaults, and `release_version_test.exs`.
 2. Commit: `git commit -am "release: vX.Y.Z"`
 3. Tag: `git tag vX.Y.Z`
 4. Push: `git push origin main --tags`
 5. Wait for the **Build precompiled NIFs** GitHub Actions workflow to complete
-   - Verify all 6 platform binaries appear in the GitHub Release
-6. Download checksums locally:
-   ```bash
-   mix rustler_precompiled.download Ferricstore.Bitcask.NIF --all --print
-   ```
-7. Commit the generated checksum file:
-   ```bash
-   git add apps/ferricstore/checksum-Elixir.Ferricstore.Bitcask.NIF.exs
-   git commit -m "release: update NIF checksums for vX.Y.Z"
-   ```
-8. Hex.pm publish happens automatically via the **Publish to Hex.pm** workflow
+   - Verify all 16 platform binaries appear in the GitHub Release: six Bitcask,
+     six WAL, and four native-protocol NIF archives.
+6. Hex.pm publish happens automatically via the **Publish to Hex.pm** workflow
    (requires the `HEX_API_KEY` secret). The multi-architecture container image
    also publishes automatically to `quay.io/ferricstore/ferricstore` using the
    `QUAY_USERNAME` and `QUAY_TOKEN` secrets.
