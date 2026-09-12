@@ -1760,6 +1760,294 @@ body.fs-dispatch[data-fs-surface="demo"] .fs-strip-signature { display: none; }
 .fs-primary-controls > .workflow-current-view,
 .fs-primary-controls > .workflow-hint { display: none; }
 
+/* Inner experiments share the catalog's reading surfaces, not the retired
+   dark theme. Keep the mechanism layouts and state indicators route-specific. */
+body.fs-dispatch[data-fs-surface="demo"] {
+  --fs-type-micro: 14px;
+  --fs-type-meta: 14px;
+}
+
+body.fs-dispatch[data-fs-surface="demo"] .fs-primary-controls {
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr) !important;
+  gap: 8px !important;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  min-width: 0;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-primary-controls button {
+  min-width: 0;
+  white-space: normal !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-primary-controls .mode-tab-badge {
+  display: block;
+  padding: 3px 0 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  font-size: 14px !important;
+  font-weight: 400 !important;
+  letter-spacing: 0 !important;
+  line-height: 1.4 !important;
+}
+
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment {
+  --text-main: var(--fs-ink);
+  --text-primary: var(--fs-ink);
+  --text-body: var(--fs-ink-soft);
+  --text-muted: var(--fs-muted);
+  --text-dim: var(--fs-muted);
+  color: var(--fs-ink);
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(p, strong, small, label, span, b, dt, dd, h2, h3, h4, th, td) {
+  color: var(--fs-ink) !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(p, label) {
+  font-size: 16px !important;
+  line-height: 1.6 !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(small, th, td) {
+  font-size: 14px !important;
+  line-height: 1.5 !important;
+  letter-spacing: 0 !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment button:not(.fs-primary-run):not(.fs-code-toggle) {
+  min-height: 44px !important;
+  font-size: 15px !important;
+  line-height: 1.4 !important;
+  white-space: normal !important;
+  box-shadow: none !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment button:is([aria-selected="true"], [aria-pressed="true"], .is-selected, .is-active) {
+  background: var(--fs-ink) !important;
+  color: white !important;
+  border-color: var(--fs-ink) !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment button:is([aria-selected="true"], [aria-pressed="true"], .is-selected, .is-active) * {
+  color: inherit !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment button:disabled { opacity: .5; cursor: not-allowed; }
+
+/* Light canvases and panels: explicit roles avoid recoloring moving diagram
+   parts, progress fills, and other visuals whose colors carry state. */
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(
+  .stage-panel, .stage-footer, .story-canvas, .visualizer-content,
+  .story-stepper, .stepper-wrap, .sliders-box, .stream-arena,
+  .mode-panel, .fused-proof, .lab-experience, .lab-verdict, .lab-shell,
+  .lab-trace, .lab-runtime, .lab-progress, .lab-receipts article,
+  .agent-narrative-box, .saga-narrative-box, .dunning-narrative-box,
+  .buyer-card, .central-seat-box, .canary-card, .chunks-card, .chunk-tile,
+  .guard-card, .agent-turns-card, .arena-card, .stream-item, .worker-card,
+  .gatekeeper-vault, .flow-node, .arch-showcase-box, .telemetry-card,
+  .util-box, .q-card, .msg-card, .hash-inspector-card, .b-card,
+  .explanation-box, .pipe-chamber, .mode-step, .mode-metrics,
+  .mode-metrics article, .mode-answer, .mode-boundary, .tier-card,
+  .keydir-inspect-card, .storage-inspector-content, .slider-box,
+  .lab-worker, .lab-store, .lab-message, .lab-progress li,
+  .flow-stepper li, .timer-display-box, .fields-table, .fields-table tr,
+  .fields-table th, .fields-table td, .bit-slot, .b-val-box,
+  .q-payload-box, .m-sub-box, .arena-outcome, .wc-status-box,
+  .vault-decision-box, .current-run
+) {
+  background: var(--fs-paper-bright) !important;
+  color: var(--fs-ink) !important;
+  border-color: var(--fs-line) !important;
+  box-shadow: none !important;
+  text-shadow: none !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(
+  .stage-header, .panel-header, .current-run, .story-stepper,
+  .stage-footer, .mode-answer, .mode-boundary, .lab-verdict,
+  .slack-header, .tt-header, .account-status-box, .fields-table th
+) {
+  background: var(--fs-strip) !important;
+  color: var(--fs-ink) !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(.stage-header, .panel-header, .current-run,
+  .agent-narrative-box, .saga-narrative-box, .dunning-narrative-box,
+  .slack-body, .account-status-box, .arch-showcase-box, .mode-panel,
+  .guard-card, .buyer-card, .worker-card, .gatekeeper-vault,
+  .lab-receipts, .lab-progress, .lab-runtime, .lab-message) :is(div, span) {
+  color: var(--fs-ink) !important;
+  text-shadow: none !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(.stage-meta-left, .scenario-badge) {
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(.stage-header, .stage-actions, .playback-controls) {
+  flex-wrap: wrap;
+  gap: 12px;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(.stage-meta-left, .scenario-detail, .run-id-pill) {
+  font-size: 14px !important;
+  line-height: 1.5 !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(.telemetry-sub, .pipe-stat, .slider-ticks,
+  .node-sub, .buyer-action-note, .mode-metrics span, .mode-step span,
+  .narrative-code-note, .queue-status-text, .wc-body, .lab-worker small,
+  .lab-receipts dt, .lab-code-mode, .stage-live-indicator, .control-note) {
+  color: var(--fs-muted) !important;
+  font-size: 14px !important;
+  line-height: 1.5 !important;
+  letter-spacing: 0 !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(.step-pill, .step-title, .stream-item strong,
+  .flow-node strong, .agent-node strong, .saga-node strong, .tm-node strong,
+  .q-head strong, .m-head strong, .a-head strong, .b-head strong,
+  .guard-head strong, .c-head strong, .chunks-header, .c-id, .c-status,
+  .lab-progress strong, .mode-step strong, .mode-answer strong) {
+  color: var(--fs-ink) !important;
+  font-size: 14px !important;
+  line-height: 1.5 !important;
+  letter-spacing: 0 !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(.is-active, .is-owner, .is-active-gen,
+  .is-executing, .chunk-tile.is-running):not(button):not(.ln):not(.code-section) {
+  box-shadow: none !important;
+  border-color: var(--fs-signal-ink) !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(.flow-node, .flow-stepper li, .chunk-tile,
+  .stream-item, .buyer-card, .lab-receipts article).is-active,
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .buyer-card.is-owner,
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .worker-card.is-active-gen {
+  background: var(--fs-signal-soft) !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(.live-pill, .status-pill, .node-pill,
+  .scenario-badge .badge-label, .agent-badge, .saga-badge, .c-badge,
+  .guard-badge, .q-badge, .a-badge, .m-badge, .h-badge, .b-badge,
+  .ttl-badge, .status-chip, .buyer-tag, .seat-owner-pill, .wp-token-badge,
+  .vault-lease-chip, .node-state-pill, .stream-live-tag, .s-badge, .seat-badge) {
+  color: var(--fs-ink) !important;
+  background: var(--fs-strip) !important;
+  border-color: var(--fs-line) !important;
+  font-size: 14px !important;
+  line-height: 1.4 !important;
+  letter-spacing: 0 !important;
+  text-shadow: none !important;
+  box-shadow: none !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(.outcome-callout, .barrier-row,
+  .retry-danger-box, .replay-safe-box) {
+  color: var(--fs-ink) !important;
+  background: var(--fs-strip) !important;
+  border: 1px solid var(--fs-line) !important;
+  box-shadow: none !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(.bad, .is-crashed, .is-double-billed,
+  .is-conflict, .is-zombie-rejected, .tripped) {
+  border-color: var(--fs-red) !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(.good, .is-winner, .is-cached, .is-done) {
+  border-color: var(--fs-green) !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(.text-cyan, .telemetry-val, .seat-price) { color: var(--fs-blue) !important; }
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .text-green { color: var(--fs-green) !important; }
+
+/* Code and logs alone use a dark surface, with matching readable text. */
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(pre, .code-block, .code-box, .lab-code,
+  .live-terminal-compact, .live-event-terminal, [data-narrative-code]) {
+  background: var(--fs-terminal-deep) !important;
+  color: var(--fs-terminal-text) !important;
+  border-color: #42555d !important;
+  box-shadow: none !important;
+  font-size: 14px !important;
+  line-height: 1.65 !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(pre, .code-block, .code-box, .lab-code,
+  .live-terminal-compact, .live-event-terminal, [data-narrative-code]) * {
+  color: var(--fs-terminal-text) !important;
+  text-shadow: none !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(.term-head, .term-header, .term-body, .term-stream) {
+  background: var(--fs-terminal-deep) !important;
+  color: var(--fs-terminal-text) !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .mode-panel { grid-template-columns: minmax(0, 1fr); padding: 24px; }
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .mode-step { min-width: 0; min-height: 130px; }
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .mode-answer { border-left-width: 1px; border-radius: 0; }
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .section-heading h2 { font-size: 28px !important; }
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .pipeline-grid { grid-template-columns: repeat(3, minmax(0, 1fr) auto) minmax(0, 1fr); }
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .pipe-chamber { min-width: 0; padding: 14px; }
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .lab-shell { grid-template-columns: minmax(0, 1fr); }
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .lab-code { border-left: 0; border-top: 1px solid var(--fs-line); }
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .lab-code pre { min-height: 0; }
+body.fs-dispatch[data-fs-surface="demo"] .fs-disclosure :is(p, li) { font-size: 16px !important; line-height: 1.65 !important; }
+body.fs-dispatch[data-fs-surface="demo"] .fs-disclosure small { font-size: 14px !important; }
+body.fs-dispatch[data-fs-surface="demo"] .fs-primary-controls .workflow-modes {
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr) !important;
+  gap: 8px !important;
+  padding: 0 !important;
+  border: 0 !important;
+  background: transparent !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-primary-controls.paradigm-selector-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-primary-controls button:is([aria-selected="true"], [aria-pressed="true"], .is-active, .is-selected) {
+  background: var(--fs-ink) !important;
+  color: white !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-primary-controls button:is([aria-selected="true"], [aria-pressed="true"], .is-active, .is-selected) * { color: inherit !important; }
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(.agent-narrative-box, .saga-narrative-box, .dunning-narrative-box) [data-narrative-code] {
+  color: var(--fs-terminal-text) !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(.node-badge, .s-num, .t-token) {
+  background: var(--fs-ink) !important;
+  color: white !important;
+  box-shadow: none !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(.bank-card, .gliding-package) :is(small, strong, span) { color: white !important; }
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(.sms-content, .status-summary, .fields-table code, .lab-store > code) { color: var(--fs-ink) !important; }
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment :is(.lab-store, .lab-receipts) :is(b, dt, dd, code) {
+  color: var(--fs-ink) !important;
+  font-size: 14px !important;
+  line-height: 1.5 !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .lab-store dl div { background: var(--fs-strip) !important; }
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .lab-code .file-dot { color: var(--fs-ink) !important; }
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .lab-code .lab-code-mode { color: var(--fs-terminal-text) !important; }
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .stage-footer > div:not([class]) { color: var(--fs-ink) !important; }
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .turn-item-compact {
+  color: var(--fs-ink) !important;
+  background: var(--fs-paper-bright) !important;
+  border-color: var(--fs-line) !important;
+  box-shadow: none !important;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .explanation-box {
+  align-items: flex-start;
+  gap: 14px;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .exp-icon { flex: 0 0 24px; }
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .exp-text { min-width: 0; }
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .slider-group label {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px;
+}
+body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .slider-ticks {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  font-family: var(--font-sans) !important;
+}
+@media (max-width: 760px) {
+  body.fs-dispatch[data-fs-surface="demo"] .fs-primary-controls { padding: 0 16px !important; }
+  body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .tiles-16-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .flow-node-num { flex-direction: column; gap: 6px; align-items: center; }
+  body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .pipeline-grid { grid-template-columns: minmax(0, 1fr); }
+  body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .mode-panel { padding: 16px; }
+  body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .mode-visual { grid-template-columns: minmax(0, 1fr); }
+  body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .mode-step { min-height: 0; }
+  body.fs-dispatch[data-fs-surface="demo"] .fs-experiment .mode-metrics { grid-template-columns: minmax(0, 1fr); }
+}
+
 @media (prefers-reduced-motion: reduce) {
   body.fs-dispatch *,
   body.fs-dispatch *::before,
