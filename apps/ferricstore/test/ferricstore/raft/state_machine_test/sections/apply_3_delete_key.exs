@@ -243,6 +243,56 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
                    :ets.lookup(ets, "waraft_projection_stage")
         end
 
+        test "WARaft recovery scopes and restores the replay index", %{state: state} do
+          state = Map.put(state, :waraft_recovery_before_index, 99)
+
+          writer = fn
+            [{:put, "waraft_recovery_scope", "value", 0}] ->
+              {:ok, {:waraft_apply_projection, 7}, [{:put, 0, byte_size("value")}]}
+          end
+
+          assert {new_state, {:applied_at, 7, :ok}, _effects} =
+                   StateMachine.apply_waraft_segment_recovery_command(
+                     {:put, "waraft_recovery_scope", "value", 0},
+                     %{index: 7, term: 1},
+                     state,
+                     writer
+                   )
+
+          assert new_state.waraft_recovery_before_index == 99
+        end
+
+        test "WARaft recovery restores the replay index when the projection writer fails", %{
+          state: state
+        } do
+          for failure <- [:raise, :throw] do
+            writer = fn _batch ->
+              case failure do
+                :raise -> raise "forced recovery writer failure"
+                :throw -> throw(:forced_recovery_writer_failure)
+              end
+            end
+
+            caught =
+              try do
+                StateMachine.apply_waraft_segment_recovery_command(
+                  {:put, "waraft_recovery_failure", "value", 0},
+                  %{index: 8, term: 1},
+                  state,
+                  writer
+                )
+
+                :not_raised
+              catch
+                :error, %RuntimeError{message: "forced recovery writer failure"} -> :raise
+                :throw, :forced_recovery_writer_failure -> :throw
+              end
+
+            assert caught == failure
+            refute Map.has_key?(state, :waraft_recovery_before_index)
+          end
+        end
+
         test "WARaft projection failure never publishes pending ETS rows", %{
           state: state,
           ets: ets

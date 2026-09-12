@@ -809,9 +809,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
         Enum.map(keys, &flow_state_key_present_hot?(state, &1))
       end
 
-      defp flow_registry_keys_present_hot_only(state, keys) do
-        Enum.map(keys, &:ets.member(state.ets, &1))
-      end
+      defp flow_registry_keys_present_hot_only(
+             %{@sm_waraft_recovery_before_index_key => before_raft_index} = state,
+             keys
+           ),
+           do: Enum.map(keys, &flow_keydir_key_present_before?(state, &1, before_raft_index))
+
+      defp flow_registry_keys_present_hot_only(state, keys),
+        do: Enum.map(keys, &:ets.member(state.ets, &1))
 
       defp flow_state_key_present?(state, key) do
         [present?] = flow_state_keys_present(state, [key])
@@ -832,8 +837,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
 
       defp flow_read_hot_state_record(state, key) do
         case :ets.lookup(state.ets, key) do
-          [{^key, value, 0, _lfu, _fid, _off, _vsize}] when is_binary(value) ->
-            flow_decode_hot_state_value(value)
+          [{^key, value, 0, _lfu, file_id, _off, _vsize}] when is_binary(value) ->
+            if flow_keydir_file_visible_during_recovery?(state, file_id) do
+              flow_decode_hot_state_value(value)
+            end
 
           _ ->
             flow_read_ets_record(state, key)
@@ -893,15 +900,40 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
       defp flow_read_lmdb_records(_state, []), do: []
 
       defp flow_read_lmdb_records(state, keys) do
-        flow_read_lmdb_records_at(state, keys, apply_now_ms(), [])
+        flow_read_lmdb_records_at(state, keys, apply_now_ms(), flow_lmdb_recovery_opts(state))
       end
 
       defp flow_read_lmdb_records_including_expired(state, keys) do
-        flow_read_lmdb_records_at(state, keys, apply_now_ms(),
-          include_expired: true,
-          expired_query_row_fallback: true
-        )
+        opts =
+          Keyword.merge(
+            [include_expired: true, expired_query_row_fallback: true],
+            flow_lmdb_recovery_opts(state)
+          )
+
+        flow_read_lmdb_records_at(state, keys, apply_now_ms(), opts)
       end
+
+      defp flow_lmdb_recovery_opts(%{
+             @sm_waraft_recovery_before_index_key => before_raft_index
+           }),
+           do: [before_raft_index: before_raft_index]
+
+      defp flow_lmdb_recovery_opts(_state), do: []
+
+      defp flow_recovery_before_raft_index(%{
+             @sm_waraft_recovery_before_index_key => before_raft_index
+           }),
+           do: before_raft_index
+
+      defp flow_recovery_before_raft_index(_state), do: nil
+
+      defp flow_keydir_file_visible_during_recovery?(
+             %{@sm_waraft_recovery_before_index_key => before_raft_index},
+             file_id
+           ),
+           do: QueryRecordStore.visible_file_id_before_raft_index?(file_id, before_raft_index)
+
+      defp flow_keydir_file_visible_during_recovery?(_state, _file_id), do: true
 
       defp flow_read_lmdb_records_at(state, keys, now_ms, opts) do
         ctx = instance_ctx_for_state(state)
@@ -968,15 +1000,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
       defp do_flow_lmdb_records_present(state, keys, now_ms, acc) do
         {batch, rest} = Enum.split(keys, @flow_lmdb_presence_batch_size)
         max_bytes = max(length(batch) * QueryRowCodec.max_encoded_bytes(), 1)
+        before_raft_index = flow_recovery_before_raft_index(state)
 
-        case QueryRowStore.read_many(
+        case QueryRowStore.read_references_many(
                flow_lmdb_record_path(state),
                batch,
                now_ms,
                max_bytes
              ) do
           {:ok, rows, _value_bytes, true} when length(rows) == length(batch) ->
-            present = Enum.map(rows, &(not is_nil(&1)))
+            present =
+              Enum.map(
+                rows,
+                &QueryRecordStore.visible_before_raft_index?(&1, before_raft_index)
+              )
+
             do_flow_lmdb_records_present(state, rest, now_ms, [present | acc])
 
           {:error, reason} ->
@@ -997,7 +1035,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
         end
       end
 
-      defp flow_read_state_record_status(state, key) do
+      defp flow_read_state_record_status(
+             %{@sm_waraft_recovery_before_index_key => before_raft_index} = state,
+             key
+           ) do
+        if flow_keydir_key_hidden_at_or_after?(state, key, before_raft_index),
+          do: :miss,
+          else: flow_read_state_record_status_unbounded(state, key)
+      end
+
+      defp flow_read_state_record_status(state, key),
+        do: flow_read_state_record_status_unbounded(state, key)
+
+      defp flow_read_state_record_status_unbounded(state, key) do
         case ets_lookup(state, key) do
           {:hit, value, _expire_at_ms} when is_binary(value) ->
             case flow_decode_hot_state_value(value) do
@@ -1013,6 +1063,32 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
               nil -> :miss
               record -> {:record, record}
             end
+        end
+      end
+
+      defp flow_keydir_key_present_before?(state, key, before_raft_index) do
+        case :ets.lookup(state.ets, key) do
+          [] ->
+            false
+
+          [{^key, _value, _expire_at_ms, _lfu, file_id, _offset, _value_size}] ->
+            QueryRecordStore.visible_file_id_before_raft_index?(file_id, before_raft_index)
+
+          _malformed_present_entry ->
+            true
+        end
+      end
+
+      defp flow_keydir_key_hidden_at_or_after?(state, key, before_raft_index) do
+        case :ets.lookup(state.ets, key) do
+          [{^key, _value, _expire_at_ms, _lfu, file_id, _offset, _value_size}] ->
+            not QueryRecordStore.visible_file_id_before_raft_index?(
+              file_id,
+              before_raft_index
+            )
+
+          _absent_or_malformed ->
+            false
         end
       end
 

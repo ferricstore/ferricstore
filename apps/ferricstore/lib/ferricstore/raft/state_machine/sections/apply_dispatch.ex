@@ -3279,7 +3279,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
                    flow_lmdb_record_path(state),
                    [key],
                    apply_now_ms(),
-                   max_input_bytes
+                   max_input_bytes,
+                   flow_lmdb_recovery_opts(state)
                  ) do
               {:ok, [%{state: flow_state}], true} when is_binary(flow_state) ->
                 {:ok, flow_state}

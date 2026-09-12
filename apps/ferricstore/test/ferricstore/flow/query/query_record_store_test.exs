@@ -38,6 +38,183 @@ defmodule Ferricstore.Flow.Query.QueryRecordStoreTest do
              )
   end
 
+  test "recovery reads only hydrate query rows written before the replayed command" do
+    future = record("run-from-future", 8)
+    current = record("run-at-replay-index", 7)
+    previous = record("run-before-replay-index", 3)
+    keys = Enum.map([future, current, previous], &state_key/1)
+    rows = [row(future, 80), row(current, 70), row(previous, 30)]
+
+    assert {:ok, [nil, nil, ^previous], true} =
+             QueryRecordStore.read_many(context(), 0, "/lmdb", keys, 1_000, 10_000,
+               before_raft_index: 7,
+               query_row_read: fn _path, ^keys, 1_000, _max_bytes ->
+                 {:ok, rows, 300, true}
+               end,
+               hydrate: fn _ctx, 0, requests, _opts ->
+                 assert Enum.map(requests, &elem(&1, 0)) == [state_key(previous)]
+
+                 {:ok, [previous]}
+               end,
+               repair_locators: fn _ctx, _shard, _path, _requests ->
+                 flunk("a future query row must not reach locator repair")
+               end
+             )
+  end
+
+  test "replay ordering also filters compact query-row references" do
+    previous = record("run-before-replay", 4)
+    future = record("run-after-replay", 10)
+    keys = [state_key(previous), state_key(future)]
+    rows = [reference(previous, 40), reference(future, 100)]
+
+    assert {:ok, [^previous, nil], true} =
+             QueryRecordStore.read_many(context(), 0, "/lmdb", keys, 1_000, 10_000,
+               before_raft_index: 9,
+               query_row_read: fn _path, ^keys, 1_000, _max_bytes ->
+                 {:ok, rows, 200, true}
+               end,
+               hydrate: fn _ctx, 0, [{key, _locator}], _opts ->
+                 assert key == state_key(previous)
+                 {:ok, [previous]}
+               end
+             )
+  end
+
+  test "recovery hydration retries cannot observe rows after the replay index" do
+    current = record("run-retry-current", 6)
+    future = record("run-retry-future", 9)
+    current_key = state_key(current)
+    future_key = state_key(future)
+    keys = [current_key, future_key]
+    stale = row(current, 70)
+    relocated = row(current, 71)
+    future_row = row(future, 90)
+    calls = :counters.new(2, [])
+
+    row_read = fn _path, ^keys, 1_000, _max_bytes ->
+      :counters.add(calls, 1, 1)
+      current_row = if :counters.get(calls, 1) == 1, do: stale, else: relocated
+      {:ok, [current_row, future_row], 200, true}
+    end
+
+    hydrate = fn _ctx, 0, requests, _opts ->
+      :counters.add(calls, 2, 1)
+      assert Enum.map(requests, &elem(&1, 0)) == [current_key]
+
+      case :counters.get(calls, 2) do
+        1 -> {:error, :hydrated_record_identity_mismatch}
+        2 -> {:ok, [current]}
+      end
+    end
+
+    assert {:ok, [^current, nil], true} =
+             QueryRecordStore.read_many(context(), 0, "/lmdb", keys, 1_000, 10_000,
+               before_raft_index: 7,
+               query_row_read: row_read,
+               hydrate: hydrate,
+               repair_locators: fn _ctx, _shard, _path, _requests ->
+                 flunk("a relocated eligible row must not require repair")
+               end
+             )
+
+    assert :counters.get(calls, 1) == 2
+    assert :counters.get(calls, 2) == 2
+  end
+
+  test "recovery locator repair rereads cannot observe rows after the replay index" do
+    current = record("run-repair-current", 6)
+    future = record("run-repair-future", 9)
+    current_key = state_key(current)
+    future_key = state_key(future)
+    keys = [current_key, future_key]
+    stale = row(current, 70)
+    relocated = row(current, 71)
+    future_row = row(future, 90)
+    calls = :counters.new(3, [])
+
+    row_read = fn _path, ^keys, 1_000, _max_bytes ->
+      :counters.add(calls, 1, 1)
+      current_row = if :counters.get(calls, 3) == 0, do: stale, else: relocated
+      {:ok, [current_row, future_row], 200, true}
+    end
+
+    hydrate = fn _ctx, 0, requests, _opts ->
+      :counters.add(calls, 2, 1)
+      assert Enum.map(requests, &elem(&1, 0)) == [current_key]
+
+      case :counters.get(calls, 2) do
+        1 -> {:ok, [nil]}
+        2 -> {:ok, [current]}
+      end
+    end
+
+    repair = fn _ctx, 0, "/lmdb", [{^current_key, locator}] ->
+      assert locator == stale.locator
+      :counters.add(calls, 3, 1)
+      {:ok, 1}
+    end
+
+    assert {:ok, [^current, nil], true} =
+             QueryRecordStore.read_many(context(), 0, "/lmdb", keys, 1_000, 10_000,
+               before_raft_index: 7,
+               query_row_read: row_read,
+               hydrate: hydrate,
+               repair_locators: repair
+             )
+
+    assert :counters.get(calls, 1) == 3
+    assert :counters.get(calls, 2) == 2
+    assert :counters.get(calls, 3) == 1
+  end
+
+  test "rejects an invalid replay index boundary before storage IO" do
+    key = state_key(record("invalid-replay-boundary", 1))
+
+    assert {:error, :query_storage_inconsistent} =
+             QueryRecordStore.read_many(context(), 0, "/lmdb", [key], 1_000, 10_000,
+               before_raft_index: 0,
+               query_row_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("an invalid replay boundary reached query storage")
+               end
+             )
+  end
+
+  test "replay ordering does not hide non-WARaft storage locators" do
+    record = record("bitcask-row", 12)
+    key = state_key(record)
+    query_row = row(record, 120)
+    bitcask_row = %{query_row | locator: %{query_row.locator | file_id: 1}}
+
+    assert {:ok, [^record], true} =
+             QueryRecordStore.read_many(context(), 0, "/lmdb", [key], 1_000, 10_000,
+               before_raft_index: 5,
+               query_row_read: fn _path, [^key], 1_000, _max_bytes ->
+                 {:ok, [bitcask_row], 100, true}
+               end,
+               hydrate: fn _ctx, 0, [{^key, locator}], _opts ->
+                 assert locator.file_id == 1
+                 {:ok, [record]}
+               end
+             )
+  end
+
+  test "replay file visibility is strict only for WARaft storage identities" do
+    assert QueryRecordStore.visible_file_id_before_raft_index?({:waraft_segment, 4}, 5)
+    refute QueryRecordStore.visible_file_id_before_raft_index?({:waraft_segment, 5}, 5)
+    refute QueryRecordStore.visible_file_id_before_raft_index?({:waraft_projection, 6}, 5)
+
+    refute QueryRecordStore.visible_file_id_before_raft_index?(
+             {:waraft_apply_projection, 5},
+             5
+           )
+
+    assert QueryRecordStore.visible_file_id_before_raft_index?(17, 5)
+    assert QueryRecordStore.visible_file_id_before_raft_index?(:pending, 5)
+    assert QueryRecordStore.visible_file_id_before_raft_index?({:flow_history, 99}, 5)
+    assert QueryRecordStore.visible_file_id_before_raft_index?({:waraft_segment, 99}, nil)
+  end
+
   test "hydrates strict query-row references without requiring metadata maps" do
     record = record("run-reference", 4)
     key = state_key(record)
@@ -196,6 +373,24 @@ defmodule Ferricstore.Flow.Query.QueryRecordStoreTest do
                end,
                hydrate: fn _ctx, _shard, _requests, _opts ->
                  flunk("invalid expiry mode reached authoritative storage")
+               end
+             )
+  end
+
+  test "fails closed without relocation when hydrated bytes are invalid" do
+    record = record("run-invalid-hydrated-record", 2)
+    key = state_key(record)
+
+    assert {:error, :query_storage_inconsistent} =
+             QueryRecordStore.read_many(context(), 0, "/lmdb", [key], 1_000, 10_000,
+               query_row_read: fn _path, [^key], 1_000, _max_bytes ->
+                 {:ok, [row(record, 20)], 100, true}
+               end,
+               hydrate: fn _ctx, 0, [{^key, _locator}], _opts ->
+                 {:error, :invalid_hydrated_record}
+               end,
+               repair_locators: fn _ctx, _shard, _path, _requests ->
+                 flunk("invalid hydrated bytes must not be treated as a relocation race")
                end
              )
   end

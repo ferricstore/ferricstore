@@ -71,6 +71,7 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
              is_function(hydrate, 4) and
              is_function(repair_locators, 4),
          {:ok, include_expired?} <- include_expired_mode(opts),
+         {:ok, before_raft_index} <- before_raft_index_mode(opts),
          true <- not expired_fallback? or include_expired?,
          row_visibility_ms = if(include_expired?, do: 0, else: now_ms),
          normalized_opts =
@@ -78,10 +79,18 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
            |> Keyword.put(:include_expired, include_expired?)
            |> Keyword.put(:expired_query_row_fallback, expired_fallback?)
            |> Keyword.put(:hydration_now_ms, now_ms)
+           |> Keyword.put(:before_raft_index, before_raft_index)
            |> Keyword.put(:repair_locators, repair_locators),
          {:ok, hydration_opts} <- prepare_hydration_deadline(normalized_opts),
          {:ok, rows, complete?} <-
-           read_query_rows(query_row_read, path, state_keys, row_visibility_ms, max_input_bytes),
+           read_visible_query_rows(
+             query_row_read,
+             path,
+             state_keys,
+             row_visibility_ms,
+             max_input_bytes,
+             before_raft_index
+           ),
          consumed_keys = Enum.take(state_keys, length(rows)),
          {:ok, records} <-
            hydrate_rows(
@@ -118,6 +127,57 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
       _invalid -> {:error, :query_storage_inconsistent}
     end
   end
+
+  defp before_raft_index_mode(opts) do
+    case Keyword.get(opts, :before_raft_index) do
+      nil -> {:ok, nil}
+      index when is_integer(index) and index > 0 -> {:ok, index}
+      _invalid -> {:error, :query_storage_inconsistent}
+    end
+  end
+
+  defp rows_before_raft_index(rows, nil), do: rows
+
+  defp rows_before_raft_index(rows, before_raft_index) do
+    Enum.map(rows, fn row ->
+      if visible_before_raft_index?(row, before_raft_index), do: row
+    end)
+  end
+
+  @doc false
+  @spec visible_before_raft_index?(
+          QueryRow.t() | QueryRowReference.t() | nil,
+          integer() | nil
+        ) ::
+          boolean()
+  def visible_before_raft_index?(nil, _before_raft_index), do: false
+  def visible_before_raft_index?(_row, nil), do: true
+
+  def visible_before_raft_index?(
+        %{
+          locator: %Locator{
+            raft_index: raft_index,
+            file_id: {kind, file_index}
+          }
+        },
+        before_raft_index
+      )
+      when kind in [:waraft_segment, :waraft_projection, :waraft_apply_projection] and
+             is_integer(raft_index) and file_index == raft_index and is_integer(before_raft_index),
+      do: visible_file_id_before_raft_index?({kind, file_index}, before_raft_index)
+
+  def visible_before_raft_index?(_row, _before_raft_index), do: true
+
+  @doc false
+  @spec visible_file_id_before_raft_index?(term(), integer() | nil) :: boolean()
+  def visible_file_id_before_raft_index?(_file_id, nil), do: true
+
+  def visible_file_id_before_raft_index?({kind, index}, before_raft_index)
+      when kind in [:waraft_segment, :waraft_projection, :waraft_apply_projection] and
+             is_integer(index) and is_integer(before_raft_index),
+      do: index < before_raft_index
+
+  def visible_file_id_before_raft_index?(_file_id, _before_raft_index), do: true
 
   defp prepare_hydration_deadline(opts) do
     timeout_ms = Keyword.get(opts, :timeout_ms, @default_timeout_ms)
@@ -219,6 +279,20 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
 
       _invalid ->
         {:error, :query_storage_inconsistent}
+    end
+  end
+
+  defp read_visible_query_rows(
+         reader,
+         path,
+         state_keys,
+         now_ms,
+         max_input_bytes,
+         before_raft_index
+       ) do
+    with {:ok, rows, complete?} <-
+           read_query_rows(reader, path, state_keys, now_ms, max_input_bytes) do
+      {:ok, rows_before_raft_index(rows, before_raft_index), complete?}
     end
   end
 
@@ -330,7 +404,14 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
          opts,
          no_progress_reason
        ) do
-    case read_query_rows(query_row_read, path, state_keys, now_ms, max_input_bytes) do
+    case read_visible_query_rows(
+           query_row_read,
+           path,
+           state_keys,
+           now_ms,
+           max_input_bytes,
+           Keyword.fetch!(opts, :before_raft_index)
+         ) do
       {:ok, rows, true} ->
         if hydration_locations_changed?(state_keys, previous_rows, rows, opts) do
           hydrate_rows(
@@ -392,7 +473,14 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
          :ok <- emit_locator_repair(ctx, shard_index, repaired_count),
          {:ok, _remaining_ms} <- remaining_hydration_timeout(opts),
          {:ok, repaired_rows, true} <-
-           read_query_rows(query_row_read, path, state_keys, now_ms, max_input_bytes),
+           read_visible_query_rows(
+             query_row_read,
+             path,
+             state_keys,
+             now_ms,
+             max_input_bytes,
+             Keyword.fetch!(opts, :before_raft_index)
+           ),
          true <- hydration_locations_changed?(state_keys, rows, repaired_rows, opts) do
       hydrate_rows(
         ctx,

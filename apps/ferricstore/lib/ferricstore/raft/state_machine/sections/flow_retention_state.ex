@@ -370,10 +370,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
         end
       end
 
+      if Mix.env() == :test do
+        @doc false
+        def __flow_retention_current_state_record_for_test__(state, state_key),
+          do: flow_retention_current_state_record(state, state_key)
+      end
+
       defp flow_retention_hot_state_record(state, state_key) do
         case :ets.lookup(state.ets, state_key) do
           [{^state_key, value, _expire_at_ms, _lfu, fid, offset, value_size}] ->
-            flow_retention_decode_state_record(state, state_key, value, fid, offset, value_size)
+            if flow_keydir_file_visible_during_recovery?(state, fid) do
+              flow_retention_decode_state_record(
+                state,
+                state_key,
+                value,
+                fid,
+                offset,
+                value_size
+              )
+            else
+              :miss
+            end
 
           _other ->
             :miss
@@ -581,6 +598,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
         end
       end
 
+      if Mix.env() == :test do
+        @doc false
+        def __flow_maybe_queue_hibernated_timeout_cleanup_for_test__(state, state_key, record),
+          do: flow_maybe_queue_hibernated_timeout_cleanup(state, state_key, record)
+      end
+
       defp flow_queue_hibernated_timeout_cleanup(state, state_key, record) do
         park_key = Ferricstore.Flow.LMDB.cold_park_key_for_state_key(state_key)
 
@@ -588,7 +611,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
           with {:ok, park_blob} <-
                  Ferricstore.Flow.LMDB.get(flow_lmdb_record_path(state), park_key),
                {:ok, %{locator: %Locator{} = locator} = park} <-
-                 Ferricstore.Flow.LMDB.decode_cold_park(park_blob) do
+                 Ferricstore.Flow.LMDB.decode_cold_park(park_blob),
+               true <- flow_keydir_file_visible_during_recovery?(state, locator.file_id) do
             {:ok, park, locator}
           else
             _missing_or_invalid -> :skip

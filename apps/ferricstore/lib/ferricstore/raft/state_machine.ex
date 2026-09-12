@@ -126,6 +126,7 @@ defmodule Ferricstore.Raft.StateMachine do
   @sm_apply_state_key :sm_apply_state
   @sm_standalone_staged_key :sm_standalone_staged_apply
   @sm_waraft_projection_writer_key :sm_waraft_projection_writer
+  @sm_waraft_recovery_before_index_key :waraft_recovery_before_index
   @sm_pending_write_keys [
     :sm_state_read_failure,
     :sm_state_write_failure,

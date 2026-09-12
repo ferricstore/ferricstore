@@ -336,6 +336,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
       end
 
       @doc false
+      def apply_waraft_segment_recovery_command(command, %{index: index} = meta, state, writer)
+          when is_integer(index) and index > 0 and is_function(writer, 1) do
+        previous = Map.fetch(state, @sm_waraft_recovery_before_index_key)
+        recovery_state = Map.put(state, @sm_waraft_recovery_before_index_key, index)
+
+        command
+        |> apply_waraft_segment_command(meta, recovery_state, writer)
+        |> restore_waraft_recovery_boundary(previous)
+      end
+
+      @doc false
       def consume_waraft_replay_dependencies do
         apply_state_pop(:waraft_replay_dependencies, %{history: %{}, apply_projection: %{}})
       end
@@ -368,6 +379,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
           end
         end
       end
+
+      defp restore_waraft_recovery_boundary({state, result}, previous),
+        do: {restore_waraft_recovery_boundary_state(state, previous), result}
+
+      defp restore_waraft_recovery_boundary({state, result, effects}, previous),
+        do: {restore_waraft_recovery_boundary_state(state, previous), result, effects}
+
+      defp restore_waraft_recovery_boundary_state(state, :error),
+        do: Map.delete(state, @sm_waraft_recovery_before_index_key)
+
+      defp restore_waraft_recovery_boundary_state(state, {:ok, previous}),
+        do: Map.put(state, @sm_waraft_recovery_before_index_key, previous)
 
       @doc false
       def __compensate_cross_shard_partial_writes_for_test__(state, successful_groups, originals) do

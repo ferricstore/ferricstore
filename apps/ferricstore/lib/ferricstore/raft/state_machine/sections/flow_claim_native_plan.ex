@@ -398,12 +398,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
 
       defp flow_read_hot_state_value(state, key) do
         case safe_ets_lookup(state.ets, key) do
-          [{^key, value, 0, _lfu, _pending, _touched_at, _disk_size}] when is_binary(value) ->
-            value
+          [{^key, value, 0, _lfu, file_id, _touched_at, _disk_size}] when is_binary(value) ->
+            if flow_keydir_file_visible_during_recovery?(state, file_id), do: value
 
-          [{^key, value, expire_at_ms, _lfu, _pending, _touched_at, _disk_size}]
+          [{^key, value, expire_at_ms, _lfu, file_id, _touched_at, _disk_size}]
           when is_binary(value) and is_integer(expire_at_ms) ->
-            if expire_at_ms > apply_now_ms(), do: value, else: nil
+            if flow_keydir_file_visible_during_recovery?(state, file_id) and
+                 expire_at_ms > apply_now_ms(),
+               do: value,
+               else: nil
 
           _cold_missing_or_expired ->
             nil
