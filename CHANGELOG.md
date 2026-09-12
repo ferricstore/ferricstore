@@ -4,6 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.16 - 2026-09-12
+
+- Fixed WARaft restart recovery when a live Flow QueryRow still points at a
+  stale physical frame for a later version while an earlier command is being
+  replayed. Recovery now compare-and-swap repairs the locator and retries the
+  authoritative read within the existing deadline and memory bounds.
+- Kept ordinary query reads unchanged, limited repair work for partial misses
+  to only the missing rows, preserved validated expired-row recovery, and kept
+  unresolved live rows fail-closed.
+
 ## 0.11.15 - 2026-09-11
 
 - Redesigned the OSS dashboard around operational workflow investigation,

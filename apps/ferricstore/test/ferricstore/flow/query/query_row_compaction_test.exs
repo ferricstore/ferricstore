@@ -166,6 +166,70 @@ defmodule Ferricstore.Flow.Query.QueryRowCompactionTest do
     assert {:ok, ^repaired_row} = LMDB.get(lmdb_path, state_key)
   end
 
+  test "a query repairs a stale locator that resolves to a different valid record" do
+    root = tmp_root("identity_mismatch_repair")
+    ctx = %{data_dir: root, max_value_size: 1_048_576}
+    target = record("run-stale-targe", 7)
+    stale_record = put_in(target, [:state_meta, "completed", "reason"], "no")
+    target_key = Keys.state_key(target.id, target.partition_key)
+    stale_encoded = Ferricstore.Flow.encode_record(stale_record)
+    target_encoded = Ferricstore.Flow.encode_record(target)
+
+    assert byte_size(stale_encoded) == byte_size(target_encoded)
+
+    assert :ok =
+             WARaftSegmentReader.put_apply_projection(root, 0, 14, [
+               {target_key, stale_encoded, 0}
+             ])
+
+    assert {:ok, 1} = WARaftSegmentReader.spill_apply_projection_cache(root, 0)
+    stale_physical_locator = physical_locator!(ctx, stale_record, stale_encoded, 14)
+
+    assert :ok =
+             WARaftSegmentReader.put_apply_projection(root, 0, 14, [
+               {target_key, target_encoded, 0}
+             ])
+
+    assert {:ok, 1} = WARaftSegmentReader.spill_apply_projection_cache(root, 0)
+    target_locator = physical_locator!(ctx, target, target_encoded, 14)
+
+    stale_locator = %{
+      target_locator
+      | segment_generation: stale_physical_locator.segment_generation,
+        offset: stale_physical_locator.offset,
+        frame_size: stale_physical_locator.frame_size
+    }
+
+    lmdb_path = lmdb_path(root)
+    assert {:ok, query_row} = QueryRowCodec.encode(target_key, target, stale_locator, 0)
+    assert {:ok, catalog_op} = source_catalog_op(target, target_key)
+    assert :ok = LMDB.write_batch(lmdb_path, [{:put, target_key, query_row}, catalog_op])
+
+    assert {:error, :hydrated_record_identity_mismatch} =
+             Ferricstore.Flow.RecordHydrator.read_many(
+               ctx,
+               0,
+               [{target_key, stale_locator}],
+               max_bytes: 1_000_000
+             )
+
+    assert {:ok, [%{id: "run-stale-targe", version: 7}], true} =
+             QueryRecordStore.read_many(
+               ctx,
+               0,
+               lmdb_path,
+               [target_key],
+               1_000,
+               QueryRecordStore.max_input_bytes(ctx)
+             )
+
+    assert {:ok, repaired_row} = LMDB.get(lmdb_path, target_key)
+    assert {:ok, %{locator: repaired_locator}} = QueryRowCodec.decode(repaired_row, target_key)
+    assert Locator.same_logical_record?(stale_locator, repaired_locator)
+    refute Locator.same_physical_record?(stale_locator, repaired_locator)
+    assert Locator.same_physical_record?(target_locator, repaired_locator)
+  end
+
   test "the next retention pass repairs a stale QueryRow left after the rewrite swap" do
     root = tmp_root("retention_crash_repair")
     ctx = %{data_dir: root, max_value_size: 1_048_576}
