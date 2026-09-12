@@ -31,7 +31,10 @@ defmodule Ferricstore.Flow.Query.QueryRecordStoreTest do
     assert {:ok, [^first, nil, ^third], true} =
              QueryRecordStore.read_many(context(), 0, "/lmdb", keys, 1_000, 10_000,
                query_row_read: row_read,
-               hydrate: hydrate
+               hydrate: hydrate,
+               repair_locators: fn _ctx, _shard, _path, _requests ->
+                 flunk("healthy hydration must not enter locator repair")
+               end
              )
   end
 
@@ -111,10 +114,44 @@ defmodule Ferricstore.Flow.Query.QueryRecordStoreTest do
                include_expired: true,
                expired_query_row_fallback: true,
                query_row_read: row_read,
-               hydrate: hydrate
+               hydrate: hydrate,
+               repair_locators: fn _ctx, _shard, _path, _requests ->
+                 flunk("an expired row with validated metadata must not require source repair")
+               end
              )
 
     assert :counters.get(reads, 1) == 2
+  end
+
+  test "recovers expired QueryRow metadata after an authoritative identity mismatch" do
+    record = record("run-expired-identity-fallback", 2)
+    key = state_key(record)
+    expired_row = %{row(record, 10) | expire_at_ms: 500}
+    hydration_calls = :atomics.new(1, [])
+
+    hydrate = fn _ctx, 0, [{^key, _locator}], opts ->
+      assert Keyword.fetch!(opts, :include_expired)
+
+      case :atomics.add_get(hydration_calls, 1, 1) do
+        1 -> {:error, :hydrated_record_identity_mismatch}
+        2 -> {:ok, [nil]}
+      end
+    end
+
+    assert {:ok, [%{id: "run-expired-identity-fallback"}], true} =
+             QueryRecordStore.read_many(context(), 0, "/lmdb", [key], 1_000, 10_000,
+               include_expired: true,
+               expired_query_row_fallback: true,
+               query_row_read: fn _path, [^key], 0, _max_bytes ->
+                 {:ok, [expired_row], 100, true}
+               end,
+               hydrate: hydrate,
+               repair_locators: fn _ctx, _shard, _path, _requests ->
+                 flunk("expired validated metadata must not require locator repair")
+               end
+             )
+
+    assert :atomics.get(hydration_calls, 1) == 2
   end
 
   test "expired fallback preserves successfully hydrated references in the same batch" do
@@ -300,6 +337,254 @@ defmodule Ferricstore.Flow.Query.QueryRecordStoreTest do
     assert :counters.get(calls, 3) == 1
   end
 
+  test "repairs an unchanged locator after hydration reads the wrong record" do
+    record = record("run-identity-repair", 1)
+    old = row(record, 10)
+    relocated = row(record, 20)
+    key = state_key(record)
+    calls = :counters.new(3, [])
+
+    row_read = fn _path, [^key], _visibility_ms, _max_bytes ->
+      :counters.add(calls, 1, 1)
+      current = if :counters.get(calls, 3) == 0, do: old, else: relocated
+      {:ok, [current], 100, true}
+    end
+
+    hydrate = fn _ctx, 0, [{^key, locator}], _opts ->
+      :counters.add(calls, 2, 1)
+
+      case :counters.get(calls, 2) do
+        1 ->
+          assert locator == old.locator
+          {:error, :hydrated_record_identity_mismatch}
+
+        2 ->
+          assert locator == relocated.locator
+          {:ok, [record]}
+      end
+    end
+
+    repair = fn _ctx, 0, "/lmdb", [{^key, locator}] ->
+      assert locator == old.locator
+      :counters.add(calls, 3, 1)
+      {:ok, 1}
+    end
+
+    assert {:ok, [^record], true} =
+             QueryRecordStore.read_many(context(), 0, "/lmdb", [key], 1_000, 10_000,
+               include_expired: true,
+               expired_query_row_fallback: true,
+               query_row_read: row_read,
+               hydrate: hydrate,
+               repair_locators: repair
+             )
+
+    assert :counters.get(calls, 1) == 3
+    assert :counters.get(calls, 2) == 2
+    assert :counters.get(calls, 3) == 1
+  end
+
+  test "repairs an unchanged locator after hydration cannot find its record" do
+    record = record("run-missing-repair", 1)
+    old = row(record, 10)
+    relocated = row(record, 20)
+    key = state_key(record)
+    calls = :counters.new(3, [])
+
+    row_read = fn _path, [^key], _visibility_ms, _max_bytes ->
+      :counters.add(calls, 1, 1)
+      current = if :counters.get(calls, 3) == 0, do: old, else: relocated
+      {:ok, [current], 100, true}
+    end
+
+    hydrate = fn _ctx, 0, [{^key, locator}], _opts ->
+      :counters.add(calls, 2, 1)
+
+      case :counters.get(calls, 2) do
+        1 ->
+          assert locator == old.locator
+          {:ok, [nil]}
+
+        2 ->
+          assert locator == relocated.locator
+          {:ok, [record]}
+      end
+    end
+
+    repair = fn _ctx, 0, "/lmdb", [{^key, locator}] ->
+      assert locator == old.locator
+      :counters.add(calls, 3, 1)
+      {:ok, 1}
+    end
+
+    assert {:ok, [^record], true} =
+             QueryRecordStore.read_many(context(), 0, "/lmdb", [key], 1_000, 10_000,
+               include_expired: true,
+               expired_query_row_fallback: true,
+               query_row_read: row_read,
+               hydrate: hydrate,
+               repair_locators: repair
+             )
+
+    assert :counters.get(calls, 1) == 3
+    assert :counters.get(calls, 2) == 2
+    assert :counters.get(calls, 3) == 1
+  end
+
+  test "repairs only missing rows from a partially hydrated batch" do
+    missing = record("run-partial-missing", 1)
+    healthy = record("run-partial-healthy", 1)
+    missing_key = state_key(missing)
+    healthy_key = state_key(healthy)
+    keys = [missing_key, healthy_key]
+    stale_missing = row(missing, 10)
+    repaired_missing = row(missing, 20)
+    healthy_row = row(healthy, 30)
+    calls = :counters.new(3, [])
+
+    row_read = fn _path, ^keys, 1_000, _max_bytes ->
+      :counters.add(calls, 1, 1)
+
+      rows =
+        if :counters.get(calls, 3) == 0,
+          do: [stale_missing, healthy_row],
+          else: [repaired_missing, healthy_row]
+
+      {:ok, rows, 200, true}
+    end
+
+    hydrate = fn _ctx, 0, requests, _opts ->
+      :counters.add(calls, 2, 1)
+      assert Enum.map(requests, &elem(&1, 0)) == keys
+
+      case :counters.get(calls, 2) do
+        1 -> {:ok, [nil, healthy]}
+        2 -> {:ok, [missing, healthy]}
+      end
+    end
+
+    repair = fn _ctx, 0, "/lmdb", [{^missing_key, locator}] ->
+      assert locator == stale_missing.locator
+      :counters.add(calls, 3, 1)
+      {:ok, 1}
+    end
+
+    assert {:ok, [^missing, ^healthy], true} =
+             QueryRecordStore.read_many(context(), 0, "/lmdb", keys, 1_000, 10_000,
+               query_row_read: row_read,
+               hydrate: hydrate,
+               repair_locators: repair
+             )
+
+    assert :counters.get(calls, 1) == 3
+    assert :counters.get(calls, 2) == 2
+    assert :counters.get(calls, 3) == 1
+  end
+
+  test "fails closed when identity-mismatch locator repair makes no progress" do
+    record = record("run-identity-no-repair", 1)
+    unchanged = row(record, 10)
+    key = state_key(record)
+    calls = :counters.new(3, [])
+
+    row_read = fn _path, [^key], 1_000, _max_bytes ->
+      :counters.add(calls, 1, 1)
+      {:ok, [unchanged], 100, true}
+    end
+
+    hydrate = fn _ctx, 0, [{^key, _locator}], _opts ->
+      :counters.add(calls, 2, 1)
+      {:error, :hydrated_record_identity_mismatch}
+    end
+
+    repair = fn _ctx, 0, "/lmdb", [{^key, _locator}] ->
+      :counters.add(calls, 3, 1)
+      {:ok, 0}
+    end
+
+    assert {:error, :query_storage_inconsistent} =
+             QueryRecordStore.read_many(context(), 0, "/lmdb", [key], 1_000, 10_000,
+               query_row_read: row_read,
+               hydrate: hydrate,
+               repair_locators: repair
+             )
+
+    assert :counters.get(calls, 1) == 2
+    assert :counters.get(calls, 2) == 1
+    assert :counters.get(calls, 3) == 1
+  end
+
+  test "reports storage unavailable when identity-mismatch repair cannot read storage" do
+    record = record("run-identity-repair-error", 1)
+    key = state_key(record)
+    unchanged = row(record, 10)
+
+    assert {:error, :query_storage_unavailable} =
+             QueryRecordStore.read_many(context(), 0, "/lmdb", [key], 1_000, 10_000,
+               query_row_read: fn _path, [^key], 1_000, _max_bytes ->
+                 {:ok, [unchanged], 100, true}
+               end,
+               hydrate: fn _ctx, 0, [{^key, _locator}], _opts ->
+                 {:error, :hydrated_record_identity_mismatch}
+               end,
+               repair_locators: fn _ctx, 0, "/lmdb", [{^key, _locator}] ->
+                 {:error, :lmdb_busy}
+               end
+             )
+  end
+
+  test "fails closed when identity mismatch persists after a successful repair" do
+    record = record("run-persistent-identity", 1)
+    key = state_key(record)
+    stale = row(record, 10)
+    relocated = row(record, 20)
+    repaired? = :atomics.new(1, [])
+
+    row_read = fn _path, [^key], 1_000, _max_bytes ->
+      row = if :atomics.get(repaired?, 1) == 0, do: stale, else: relocated
+      {:ok, [row], 100, true}
+    end
+
+    assert {:error, :query_storage_inconsistent} =
+             QueryRecordStore.read_many(context(), 0, "/lmdb", [key], 1_000, 10_000,
+               query_row_read: row_read,
+               hydrate: fn _ctx, 0, [{^key, _locator}], _opts ->
+                 {:error, :hydrated_record_identity_mismatch}
+               end,
+               repair_locators: fn _ctx, 0, "/lmdb", [{^key, _locator}] ->
+                 :atomics.put(repaired?, 1, 1)
+                 {:ok, 1}
+               end
+             )
+  end
+
+  test "honors the shared deadline before identity-mismatch repair" do
+    record = record("run-identity-repair-deadline", 1)
+    key = state_key(record)
+    unchanged = row(record, 10)
+    clock_calls = :atomics.new(1, [])
+
+    clock_ms = fn ->
+      call = :atomics.add_get(clock_calls, 1, 1)
+      if call < 3, do: 0, else: 10
+    end
+
+    assert {:error, :query_deadline_exceeded} =
+             QueryRecordStore.read_many(context(), 0, "/lmdb", [key], 1_000, 10_000,
+               timeout_ms: 10,
+               clock_ms: clock_ms,
+               query_row_read: fn _path, [^key], 1_000, _max_bytes ->
+                 {:ok, [unchanged], 100, true}
+               end,
+               hydrate: fn _ctx, 0, [{^key, _locator}], _opts ->
+                 {:error, :hydrated_record_identity_mismatch}
+               end,
+               repair_locators: fn _ctx, _shard, _path, _requests ->
+                 flunk("repair must not start after the shared deadline")
+               end
+             )
+  end
+
   test "shares one timeout budget across a relocated hydration retry" do
     record = record("run-deadline", 1)
     old = row(record, 10)
@@ -435,7 +720,7 @@ defmodule Ferricstore.Flow.Query.QueryRecordStoreTest do
              )
   end
 
-  test "fails closed when a located authoritative record remains missing after one retry" do
+  test "fails closed when a missing authoritative record cannot be relocated" do
     record = record("run-missing", 1)
     key = state_key(record)
     reads = :counters.new(2, [])
@@ -458,7 +743,43 @@ defmodule Ferricstore.Flow.Query.QueryRecordStoreTest do
              )
 
     assert :counters.get(reads, 1) == 2
+    assert :counters.get(reads, 2) == 1
+  end
+
+  test "recovery fallback fails closed when a live missing record cannot be relocated" do
+    record = record("run-live-recovery-missing", 1)
+    key = state_key(record)
+    reads = :counters.new(3, [])
+
+    row_read = fn _path, [^key], 0, _max_bytes ->
+      :counters.add(reads, 1, 1)
+      {:ok, [row(record, 10)], 100, true}
+    end
+
+    hydrate = fn _ctx, 0, [{^key, _locator}], opts ->
+      :counters.add(reads, 2, 1)
+      assert Keyword.fetch!(opts, :include_expired)
+      assert Keyword.fetch!(opts, :now_ms) == 1_000
+      {:ok, [nil]}
+    end
+
+    repair = fn _ctx, 0, "/lmdb", [{^key, _locator}] ->
+      :counters.add(reads, 3, 1)
+      {:ok, 0}
+    end
+
+    assert {:error, :query_storage_inconsistent} =
+             QueryRecordStore.read_many(context(), 0, "/lmdb", [key], 1_000, 10_000,
+               include_expired: true,
+               expired_query_row_fallback: true,
+               query_row_read: row_read,
+               hydrate: hydrate,
+               repair_locators: repair
+             )
+
+    assert :counters.get(reads, 1) == 2
     assert :counters.get(reads, 2) == 2
+    assert :counters.get(reads, 3) == 1
   end
 
   test "reserves decoded query-row memory before admitting authoritative bytes" do

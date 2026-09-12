@@ -7,8 +7,8 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
     MemoryBudget,
     QueryRow,
     QueryRowCodec,
-    QueryRowRelocator,
     QueryRowReference,
+    QueryRowRelocator,
     QueryRowStore
   }
 
@@ -242,16 +242,25 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
          {:ok, records} <- restore_records(rows, positions, hydrated) do
       case {attempt, Enum.any?(hydrated, &is_nil/1)} do
         {0, true} ->
-          retry_hydration(
+          retry_opts =
+            Keyword.put(
+              opts,
+              :locator_repair_keys,
+              missing_hydration_keys(state_keys, positions, hydrated)
+            )
+
+          retry_repairable_hydration(
             ctx,
             shard_index,
             path,
             state_keys,
+            rows,
             now_ms,
             max_input_bytes,
             query_row_read,
             hydrate,
-            opts
+            retry_opts,
+            :query_storage_inconsistent
           )
 
         {_attempt, true} ->
@@ -271,23 +280,7 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
       end
     else
       {:error, :hydrated_record_identity_mismatch} when attempt == 0 ->
-        retry_hydration(
-          ctx,
-          shard_index,
-          path,
-          state_keys,
-          now_ms,
-          max_input_bytes,
-          query_row_read,
-          hydrate,
-          opts
-        )
-
-      {:error, :hydrated_record_identity_mismatch} ->
-        {:error, :query_storage_inconsistent}
-
-      {:error, :query_storage_unavailable} when attempt == 0 ->
-        retry_unavailable_hydration(
+        retry_repairable_hydration(
           ctx,
           shard_index,
           path,
@@ -297,7 +290,26 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
           max_input_bytes,
           query_row_read,
           hydrate,
-          opts
+          Keyword.put(opts, :locator_repair_keys, :all),
+          :query_storage_inconsistent
+        )
+
+      {:error, :hydrated_record_identity_mismatch} ->
+        {:error, :query_storage_inconsistent}
+
+      {:error, :query_storage_unavailable} when attempt == 0 ->
+        retry_repairable_hydration(
+          ctx,
+          shard_index,
+          path,
+          state_keys,
+          rows,
+          now_ms,
+          max_input_bytes,
+          query_row_read,
+          hydrate,
+          Keyword.put(opts, :locator_repair_keys, :all),
+          :query_storage_unavailable
         )
 
       {:error, _reason} = error ->
@@ -305,7 +317,7 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
     end
   end
 
-  defp retry_unavailable_hydration(
+  defp retry_repairable_hydration(
          ctx,
          shard_index,
          path,
@@ -315,41 +327,46 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
          max_input_bytes,
          query_row_read,
          hydrate,
-         opts
+         opts,
+         no_progress_reason
        ) do
-    with {:ok, rows, true} <-
-           read_query_rows(query_row_read, path, state_keys, now_ms, max_input_bytes) do
-      if hydration_locations_changed?(previous_rows, rows) do
-        hydrate_rows(
-          ctx,
-          shard_index,
-          path,
-          state_keys,
-          rows,
-          now_ms,
-          max_input_bytes,
-          query_row_read,
-          hydrate,
-          opts,
-          1
-        )
-      else
-        repair_unchanged_locations(
-          ctx,
-          shard_index,
-          path,
-          state_keys,
-          rows,
-          now_ms,
-          max_input_bytes,
-          query_row_read,
-          hydrate,
-          opts
-        )
-      end
-    else
-      {:ok, _rows, false} -> {:error, :query_hydration_batch_too_large}
-      {:error, _reason} = error -> error
+    case read_query_rows(query_row_read, path, state_keys, now_ms, max_input_bytes) do
+      {:ok, rows, true} ->
+        if hydration_locations_changed?(state_keys, previous_rows, rows, opts) do
+          hydrate_rows(
+            ctx,
+            shard_index,
+            path,
+            state_keys,
+            rows,
+            now_ms,
+            max_input_bytes,
+            query_row_read,
+            hydrate,
+            opts,
+            1
+          )
+        else
+          repair_unchanged_locations(
+            ctx,
+            shard_index,
+            path,
+            state_keys,
+            rows,
+            now_ms,
+            max_input_bytes,
+            query_row_read,
+            hydrate,
+            opts,
+            no_progress_reason
+          )
+        end
+
+      {:ok, _rows, false} ->
+        {:error, :query_hydration_batch_too_large}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -363,18 +380,20 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
          max_input_bytes,
          query_row_read,
          hydrate,
-         opts
+         opts,
+         no_progress_reason
        ) do
     repair = Keyword.fetch!(opts, :repair_locators)
 
     with {:ok, _remaining_ms} <- remaining_hydration_timeout(opts),
-         requests when requests != [] <- repair_requests(state_keys, rows),
+         requests when requests != [] <- repair_requests(state_keys, rows, opts),
          {:ok, repaired_count} when is_integer(repaired_count) and repaired_count > 0 <-
            repair.(ctx, shard_index, path, requests),
+         :ok <- emit_locator_repair(ctx, shard_index, repaired_count),
          {:ok, _remaining_ms} <- remaining_hydration_timeout(opts),
          {:ok, repaired_rows, true} <-
            read_query_rows(query_row_read, path, state_keys, now_ms, max_input_bytes),
-         true <- hydration_locations_changed?(rows, repaired_rows) do
+         true <- hydration_locations_changed?(state_keys, rows, repaired_rows, opts) do
       hydrate_rows(
         ctx,
         shard_index,
@@ -389,66 +408,46 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
         1
       )
     else
-      {:error, :query_deadline_exceeded} = error -> error
-      {:ok, _rows, false} -> {:error, :query_hydration_batch_too_large}
-      _not_repaired -> {:error, :query_storage_unavailable}
+      {:error, :query_deadline_exceeded} = error ->
+        error
+
+      {:ok, _rows, false} ->
+        {:error, :query_hydration_batch_too_large}
+
+      {:error, _reason} ->
+        {:error, :query_storage_unavailable}
+
+      _not_repaired ->
+        continue_after_no_locator_repair(
+          ctx,
+          shard_index,
+          path,
+          state_keys,
+          rows,
+          now_ms,
+          max_input_bytes,
+          query_row_read,
+          hydrate,
+          opts,
+          no_progress_reason
+        )
     end
   end
 
-  defp repair_requests(state_keys, rows) when length(state_keys) == length(rows) do
-    state_keys
-    |> Enum.zip(rows)
-    |> Enum.reduce([], fn
-      {state_key, row}, acc when is_binary(state_key) ->
-        case row_locator(row) do
-          {:ok, %Locator{file_id: {kind, index}} = locator}
-          when kind in [:waraft_segment, :waraft_projection, :waraft_apply_projection] and
-                 is_integer(index) and index > 0 ->
-            [{state_key, locator} | acc]
-
-          _not_repairable ->
-            acc
-        end
-
-      _invalid, acc ->
-        acc
-    end)
-    |> Enum.reverse()
-  end
-
-  defp repair_requests(_state_keys, _rows), do: []
-
-  defp hydration_locations_changed?(previous_rows, rows)
-       when is_list(previous_rows) and is_list(rows) and length(previous_rows) == length(rows) do
-    previous_rows
-    |> Enum.zip(rows)
-    |> Enum.any?(fn
-      {nil, nil} ->
-        false
-
-      {previous, current} ->
-        case {row_locator(previous), row_locator(current)} do
-          {{:ok, previous}, {:ok, current}} -> previous != current
-          _invalid -> true
-        end
-    end)
-  end
-
-  defp hydration_locations_changed?(_previous_rows, _rows), do: true
-
-  defp retry_hydration(
+  defp continue_after_no_locator_repair(
          ctx,
          shard_index,
          path,
          state_keys,
+         rows,
          now_ms,
          max_input_bytes,
          query_row_read,
          hydrate,
-         opts
+         opts,
+         no_progress_reason
        ) do
-    with {:ok, rows, true} <-
-           read_query_rows(query_row_read, path, state_keys, now_ms, max_input_bytes) do
+    if Keyword.fetch!(opts, :expired_query_row_fallback) do
       hydrate_rows(
         ctx,
         shard_index,
@@ -463,8 +462,107 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
         1
       )
     else
-      {:ok, _rows, false} -> {:error, :query_hydration_batch_too_large}
-      {:error, _reason} = error -> error
+      {:error, no_progress_reason}
+    end
+  end
+
+  defp repair_requests(state_keys, rows, opts) when length(state_keys) == length(rows) do
+    state_keys
+    |> Enum.zip(rows)
+    |> Enum.reduce([], fn
+      {state_key, row}, acc when is_binary(state_key) ->
+        if not locator_repair_key?(state_key, opts) or
+             expired_fallback_record_available?(row, opts) do
+          acc
+        else
+          case row_locator(row) do
+            {:ok, %Locator{file_id: {kind, index}} = locator}
+            when kind in [:waraft_segment, :waraft_projection, :waraft_apply_projection] and
+                   is_integer(index) and index > 0 ->
+              [{state_key, locator} | acc]
+
+            _not_repairable ->
+              acc
+          end
+        end
+
+      _invalid, acc ->
+        acc
+    end)
+    |> Enum.reverse()
+  end
+
+  defp repair_requests(_state_keys, _rows, _opts), do: []
+
+  defp emit_locator_repair(ctx, shard_index, repaired_count) do
+    :telemetry.execute(
+      [:ferricstore, :flow, :query, :locator_repair],
+      %{count: repaired_count},
+      %{instance: Map.get(ctx, :name), shard_index: shard_index}
+    )
+  end
+
+  defp expired_fallback_record_available?(%QueryRow{expire_at_ms: expire_at_ms} = row, opts)
+       when is_integer(expire_at_ms) and expire_at_ms > 0 do
+    Keyword.fetch!(opts, :expired_query_row_fallback) and
+      expire_at_ms <= Keyword.fetch!(opts, :hydration_now_ms) and
+      match?({:ok, _record}, QueryRow.internal_record(row))
+  end
+
+  defp expired_fallback_record_available?(_row, _opts), do: false
+
+  defp hydration_locations_changed?(state_keys, previous_rows, rows, opts)
+       when is_list(state_keys) and is_list(previous_rows) and is_list(rows) and
+              length(state_keys) == length(previous_rows) and
+              length(previous_rows) == length(rows) do
+    state_keys
+    |> Enum.zip(Enum.zip(previous_rows, rows))
+    |> Enum.any?(fn {state_key, {previous, current}} ->
+      cond do
+        not is_binary(state_key) ->
+          true
+
+        not locator_repair_key?(state_key, opts) ->
+          false
+
+        is_nil(previous) and is_nil(current) ->
+          false
+
+        true ->
+          case {row_locator(previous), row_locator(current)} do
+            {{:ok, previous}, {:ok, current}} -> previous != current
+            _invalid -> true
+          end
+      end
+    end)
+  end
+
+  defp hydration_locations_changed?(_state_keys, _previous_rows, _rows, _opts), do: true
+
+  defp missing_hydration_keys(state_keys, positions, hydrated)
+       when is_list(state_keys) and is_list(positions) and is_list(hydrated) and
+              length(positions) == length(hydrated) do
+    state_keys = List.to_tuple(state_keys)
+
+    positions
+    |> Enum.zip(hydrated)
+    |> Enum.reduce(MapSet.new(), fn
+      {position, nil}, keys
+      when is_integer(position) and position >= 0 and position < tuple_size(state_keys) ->
+        state_key = elem(state_keys, position)
+        if is_binary(state_key), do: MapSet.put(keys, state_key), else: keys
+
+      {_position, _record}, keys ->
+        keys
+    end)
+  end
+
+  defp missing_hydration_keys(_state_keys, _positions, _hydrated), do: MapSet.new()
+
+  defp locator_repair_key?(state_key, opts) do
+    case Keyword.fetch!(opts, :locator_repair_keys) do
+      :all -> true
+      %MapSet{} = keys -> MapSet.member?(keys, state_key)
     end
   end
 

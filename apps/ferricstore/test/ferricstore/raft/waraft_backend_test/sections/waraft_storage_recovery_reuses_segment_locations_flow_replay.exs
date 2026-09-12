@@ -97,6 +97,223 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageRecoveryReuse
         end
       end
 
+      @tag :flow_replay_segment_locations
+      test "WARaft storage recovery repairs a stale same-index Flow QueryRow locator", %{
+        root: root,
+        ctx: ctx
+      } do
+        {id, partition_key, key} = flow_key_for_shard(ctx, 0, "storage-flow-stale-query-row")
+
+        attrs = %{
+          id: id,
+          type: "storage-flow-stale-query-row",
+          state: "queued",
+          partition_key: partition_key,
+          run_at_ms: 1,
+          now_ms: 1,
+          payload: "payload-v1",
+          policy_reference_captured: true
+        }
+
+        assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+        assert :ok = WARaftBackend.write(0, {:flow_create, key, attrs})
+
+        assert {:ok, {:raft_log_pos, created_index, _term}} =
+                 WARaftBackend.storage_position(0)
+
+        assert :ok =
+                 WARaftBackend.write(
+                   0,
+                   {:flow_transition, key,
+                    %{
+                      id: id,
+                      from_state: "queued",
+                      to_state: "process",
+                      fencing_token: 0,
+                      partition_key: partition_key,
+                      now_ms: 2,
+                      policy_reference_captured: true
+                    }}
+                 )
+
+        assert {:ok, {:raft_log_pos, applied_index, _term} = applied_position} =
+                 WARaftBackend.storage_position(0)
+
+        assert applied_index > created_index
+        assert :ok = WARaftBackend.stop()
+
+        lmdb_path =
+          root
+          |> Ferricstore.DataDir.shard_data_path(0)
+          |> Ferricstore.Flow.LMDB.path()
+
+        assert {:ok, current_encoded} =
+                 Ferricstore.Raft.WARaftSegmentReader.read_value_from_location_including_expired(
+                   ctx,
+                   0,
+                   {:waraft_apply_projection, applied_index},
+                   key
+                 )
+
+        current_record = Ferricstore.Flow.decode_record(current_encoded)
+
+        assert {:ok, {current_ordinal, current_offset, current_frame_size}} =
+                 Ferricstore.Raft.WARaftSegmentReader.physical_location(
+                   ctx,
+                   0,
+                   {:waraft_apply_projection, applied_index}
+                 )
+
+        current_locator =
+          Ferricstore.Flow.Locator.new!(
+            flow_id: id,
+            kind: :state,
+            version: current_record.version,
+            raft_index: applied_index,
+            file_id: {:waraft_apply_projection, applied_index},
+            segment_generation: current_ordinal,
+            offset: current_offset,
+            frame_size: current_frame_size,
+            value_size: byte_size(current_encoded),
+            checksum: :crypto.hash(:sha256, current_encoded),
+            expire_at_ms: Map.get(current_record, :terminal_retention_until_ms)
+          )
+
+        assert {:ok, encoded_query_row} =
+                 Ferricstore.Flow.Query.QueryRowCodec.encode(
+                   key,
+                   current_record,
+                   current_locator,
+                   0
+                 )
+
+        stale_record = %{current_record | state: "waiting"}
+        stale_encoded = Ferricstore.Flow.encode_record(stale_record)
+        assert byte_size(stale_encoded) == byte_size(current_encoded)
+
+        assert :ok =
+                 Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+                   root,
+                   0,
+                   applied_index,
+                   [{key, stale_encoded, 0}]
+                 )
+
+        assert {:ok, 1} =
+                 Ferricstore.Raft.WARaftSegmentReader.spill_apply_projection_cache(root, 0)
+
+        assert {:ok, {stale_ordinal, stale_offset, stale_frame_size}} =
+                 Ferricstore.Raft.WARaftSegmentReader.physical_location(
+                   ctx,
+                   0,
+                   current_locator.file_id
+                 )
+
+        assert :ok =
+                 Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+                   root,
+                   0,
+                   applied_index,
+                   [{key, current_encoded, 0}]
+                 )
+
+        assert {:ok, 1} =
+                 Ferricstore.Raft.WARaftSegmentReader.spill_apply_projection_cache(root, 0)
+
+        stale_locator = %{
+          current_locator
+          | segment_generation: stale_ordinal,
+            offset: stale_offset,
+            frame_size: stale_frame_size
+        }
+
+        assert {:ok, stale_query_row} =
+                 Ferricstore.Flow.Query.QueryRowCodec.relocate(
+                   encoded_query_row,
+                   key,
+                   current_locator,
+                   stale_locator
+                 )
+
+        assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:put, key, stale_query_row}])
+
+        assert {:error, :hydrated_record_identity_mismatch} =
+                 Ferricstore.Flow.RecordHydrator.read_many(
+                   ctx,
+                   0,
+                   [{key, stale_locator}],
+                   include_expired: true,
+                   max_bytes: 1_000_000
+                 )
+
+        storage_root = waraft_storage_root(root, 0)
+        File.rm_rf!(Path.join(storage_root, "segment_projection_log"))
+        metadata = waraft_latest_storage_metadata(root, 0)
+
+        write_waraft_storage_metadata!(
+          root,
+          0,
+          Map.put(metadata, :position, {:raft_log_pos, 1, 1})
+        )
+
+        FerricStore.Instance.cleanup(ctx.name)
+        restarted_ctx = build_ctx(root)
+        context_key = {{WARaftBackend, :context}, :ferricstore_waraft_backend}
+        :persistent_term.put(context_key, restarted_ctx)
+        handler_id = "flow-query-locator-repair-#{System.unique_integer([:positive])}"
+
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :flow, :query, :locator_repair],
+          fn event, measurements, metadata, test_pid ->
+            send(test_pid, {:flow_query_locator_repair, event, measurements, metadata})
+          end,
+          self()
+        )
+
+        try do
+          handle =
+            WARaftStorage.open(
+              %{table: :ferricstore_waraft_backend, partition: 1},
+              storage_root
+            )
+
+          try do
+            assert WARaftStorage.position(handle) == applied_position
+
+            assert_receive {:flow_query_locator_repair,
+                            [:ferricstore, :flow, :query, :locator_repair], %{count: 1},
+                            %{shard_index: 0}},
+                           1_000
+
+            assert {:ok, repaired_query_row} = Ferricstore.Flow.LMDB.get(lmdb_path, key)
+
+            assert {:ok, %{locator: repaired_locator}} =
+                     Ferricstore.Flow.Query.QueryRowCodec.decode(repaired_query_row, key)
+
+            refute Ferricstore.Flow.Locator.same_physical_record?(
+                     stale_locator,
+                     repaired_locator
+                   )
+
+            assert {:ok, [^current_encoded]} =
+                     Ferricstore.Flow.RecordHydrator.read_encoded_many(
+                       restarted_ctx,
+                       0,
+                       [{key, repaired_locator}],
+                       include_expired: true,
+                       max_bytes: 1_000_000
+                     )
+          after
+            WARaftStorage.close(handle)
+          end
+        after
+          :telemetry.detach(handler_id)
+          :persistent_term.erase(context_key)
+          FerricStore.Instance.cleanup(restarted_ctx.name)
+        end
+      end
+
       test "WARaft storage emits startup phase telemetry", %{ctx: ctx} do
         parent = self()
         handler_id = "waraft-storage-startup-phase-#{System.unique_integer([:positive])}"
