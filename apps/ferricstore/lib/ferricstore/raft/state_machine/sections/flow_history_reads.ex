@@ -76,8 +76,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
 
       defp flow_read_state_locator_value(_state, _key, _locator), do: :miss
 
-      defp flow_read_cold_park_state_value(state, key, %Locator{} = locator, _park),
-        do: flow_read_state_locator_value(state, key, locator)
+      defp flow_read_cold_park_state_value(state, key, %Locator{} = locator, _park) do
+        if flow_keydir_file_visible_during_recovery?(state, locator.file_id),
+          do: flow_read_state_locator_value(state, key, locator),
+          else: :miss
+      end
+
+      if Mix.env() == :test do
+        @doc false
+        def __flow_read_cold_park_state_value_for_test__(state, key, locator),
+          do: flow_read_cold_park_state_value(state, key, locator, %{})
+      end
 
       defp flow_locator_matches_record?(%Locator{} = locator, record) do
         Map.get(record, :id) == locator.flow_id and Map.get(record, :version) == locator.version

@@ -119,16 +119,25 @@ defmodule Ferricstore.Flow.Query.Error do
 
   defp base_payload(reason) do
     {code, message} = error(reason)
-    retryable = reason in [:query_projection_changed, :query_storage_unavailable]
+
+    retryable =
+      reason in [
+        :query_concurrency_exceeded,
+        :query_projection_changed,
+        :query_storage_unavailable
+      ]
 
     %{
       "code" => code,
       "message" => message,
       "retryable" => retryable,
       "safe_to_retry" => retryable,
-      "retry_after_ms" => 0
+      "retry_after_ms" => retry_after_ms(reason)
     }
   end
+
+  defp retry_after_ms(:query_concurrency_exceeded), do: 100
+  defp retry_after_ms(_reason), do: 0
 
   @spec known?(term()) :: boolean()
   def known?(reason), do: is_atom(reason) and Map.has_key?(@errors, reason)
@@ -149,11 +158,12 @@ defmodule Ferricstore.Flow.Query.Error do
 
   def reason(message) when is_binary(message), do: Map.fetch(@reasons_by_message, message)
 
-  @spec status(atom() | t()) :: :bad_request | :error | :noperm
+  @spec status(atom() | t()) :: :bad_request | :busy | :error | :noperm
   def status(%__MODULE__{reason: reason} = diagnostic),
     do: if(valid?(diagnostic), do: status(reason), else: :error)
 
   def status(:unauthorized_scope), do: :noperm
+  def status(:query_concurrency_exceeded), do: :busy
 
   def status(reason)
       when reason in [

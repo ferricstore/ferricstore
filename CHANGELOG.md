@@ -4,6 +4,18 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.17 - 2026-09-12
+
+- Fixed WARaft segment recovery so replayed Flow commands cannot observe LMDB,
+  keydir, value, retention, or hibernation state written by the same or a later
+  Raft command. This preserves strict log ordering when the latest QueryRow is
+  expired or its payload has already been compacted.
+- Kept live reads unchanged, filtered recovery metadata before hydration or
+  disk I/O, and used compact QueryRow references for recovery presence checks.
+- Classified Flow query admission saturation as retryable busy work with a
+  bounded retry hint, allowing clients to back off without raising concurrency
+  or memory limits.
+
 ## 0.11.16 - 2026-09-12
 
 - Fixed WARaft restart recovery when a live Flow QueryRow still points at a

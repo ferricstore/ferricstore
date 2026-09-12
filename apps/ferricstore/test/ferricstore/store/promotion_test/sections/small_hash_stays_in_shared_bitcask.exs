@@ -474,7 +474,11 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
             "promoted instance was not removed after committed string overwrite"
           )
 
-          refute File.exists?(dedicated_path)
+          ShardHelpers.eventually(
+            fn -> not File.exists?(dedicated_path) end,
+            "promoted storage was not removed after committed string overwrite"
+          )
+
           assert "replacement" == Router.get(ctx, key)
           assert {:simple, "string"} == Strings.handle("TYPE", [key], store)
 

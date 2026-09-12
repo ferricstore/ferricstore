@@ -641,7 +641,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
 
       defp recover_segment_projected_state_machine_command(command, position, sm_state) do
         apply_result =
-          StateMachine.apply_waraft_segment_command(
+          StateMachine.apply_waraft_segment_recovery_command(
             command,
             meta_from_position(position),
             sm_state,

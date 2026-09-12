@@ -417,14 +417,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
             flow_hibernation_projected_active_reverse(key, record)
 
           :query_only ->
-            flow_hibernation_persisted_active_reverse(state, key)
+            flow_hibernation_recovery_safe_active_reverse(state, key, record)
 
           {:error, _reason} = error ->
             error
 
           :none ->
-            flow_hibernation_persisted_active_reverse(state, key)
+            flow_hibernation_recovery_safe_active_reverse(state, key, record)
         end
+      end
+
+      defp flow_hibernation_recovery_safe_active_reverse(state, key, record) do
+        case flow_recovery_before_raft_index(state) do
+          nil -> flow_hibernation_persisted_active_reverse(state, key)
+          _replay_index -> flow_hibernation_projected_active_reverse(key, record)
+        end
+      end
+
+      if Mix.env() == :test do
+        @doc false
+        def __flow_hibernation_active_index_reverse_for_test__(state, key, record),
+          do: flow_hibernation_active_index_reverse(state, key, record, %{})
       end
 
       defp flow_hibernation_persisted_active_reverse(state, key) do
@@ -518,7 +531,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
           [{^key, current_value, expire_at_ms, _lfu, file_id, offset, value_size}]
           when valid_cold_location(file_id, offset, value_size) or
                  valid_waraft_segment_location(file_id, offset, value_size) ->
-            if flow_hibernation_candidate_current?(current_value, state_value, record) do
+            if flow_keydir_file_visible_during_recovery?(state, file_id) and
+                 flow_hibernation_candidate_current?(current_value, state_value, record) do
               Locator.new(
                 flow_id: Map.fetch!(record, :id),
                 kind: :state,
@@ -539,6 +553,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
       rescue
         ArgumentError -> :skip
         KeyError -> :skip
+      end
+
+      if Mix.env() == :test do
+        @doc false
+        def __flow_hibernation_locator_from_hot_for_test__(state, key, record, state_value),
+          do: flow_hibernation_locator_from_hot(state, key, record, state_value)
       end
 
       @doc false

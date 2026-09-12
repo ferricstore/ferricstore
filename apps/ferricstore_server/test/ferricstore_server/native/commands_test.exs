@@ -445,6 +445,13 @@ defmodule FerricstoreServer.Native.CommandsTest do
     def execute(_ctx, _request), do: {:error, :unauthorized_scope}
   end
 
+  defmodule SaturatedQueryEngine do
+    @behaviour FerricStore.Flow.QueryEngine
+
+    @impl true
+    def execute(_ctx, _request), do: {:error, :query_concurrency_exceeded}
+  end
+
   defmodule RaisingQueryEngine do
     @behaviour FerricStore.Flow.QueryEngine
 
@@ -2478,6 +2485,33 @@ defmodule FerricstoreServer.Native.CommandsTest do
       refute inspect(direct_error) =~ "value-secret"
       refute inspect(direct_error) =~ "tenant-secret"
     end
+  end
+
+  test "FLOW.QUERY reports admission saturation as retryable busy" do
+    query =
+      "FROM runs WHERE partition_key = 'tenant-a' AND run_id = 'run-123' RETURN RECORD"
+
+    assert {:busy, diagnostic, _state} =
+             Commands.execute(
+               @op_flow_query,
+               %{"version" => "FQL1", "query" => query},
+               state_with_query_engine(SaturatedQueryEngine)
+             )
+
+    assert diagnostic == %{
+             "code" => "query_concurrency_exceeded",
+             "message" => "ERR Flow query concurrency limit exceeded",
+             "retryable" => true,
+             "safe_to_retry" => true,
+             "retry_after_ms" => 100
+           }
+
+    assert {:busy, ^diagnostic, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "FLOW.QUERY", "args" => ["FQL1", query]},
+               state_with_query_engine(SaturatedQueryEngine)
+             )
   end
 
   test "FLOW.QUERY rejects malformed envelopes before provider dispatch" do

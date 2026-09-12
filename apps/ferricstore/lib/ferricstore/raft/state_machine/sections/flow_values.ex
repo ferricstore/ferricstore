@@ -1124,6 +1124,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
         now = apply_now_ms()
 
         case :ets.lookup(state.ets, key) do
+          [{^key, _value, _expire_at_ms, _lfu, file_id, _off, _vsize}] = entry ->
+            if flow_keydir_file_visible_during_recovery?(state, file_id) do
+              plain_expire_at_ms_from_entry(state, key, now, entry)
+            end
+
+          [] ->
+            nil
+        end
+      end
+
+      defp plain_expire_at_ms_from_entry(state, key, now, entry) do
+        case entry do
           [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
             0
 
@@ -1149,10 +1161,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
             track_keydir_binary_remove_known(state, key, value)
             :ets.delete(state.ets, key)
             nil
-
-          [] ->
-            nil
         end
+      end
+
+      if Mix.env() == :test do
+        @doc false
+        def __flow_plain_expire_at_ms_for_test__(state, key),
+          do: plain_expire_at_ms(state, key)
       end
 
       defp do_checked_put_blob_ref(state, key, encoded_ref, expire_at_ms) do

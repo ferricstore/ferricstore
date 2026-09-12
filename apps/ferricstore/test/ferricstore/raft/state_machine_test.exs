@@ -89,6 +89,10 @@ defmodule Ferricstore.Raft.StateMachineTest.CurrentStateMachine do
   defdelegate state_enter(role, state), to: StateMachine
   defdelegate tick(time, state), to: StateMachine
   defdelegate apply_waraft_segment_command(command, meta, state, writer), to: StateMachine
+
+  defdelegate apply_waraft_segment_recovery_command(command, meta, state, writer),
+    to: StateMachine
+
   defdelegate apply_standalone_command(command, state), to: StateMachine
   defdelegate apply_standalone_command(command, meta, state), to: StateMachine
   defdelegate apply_standalone_cross_shard(execute_fn, state), to: StateMachine
@@ -127,6 +131,23 @@ defmodule Ferricstore.Raft.StateMachineTest.CurrentStateMachine do
   defdelegate __normalize_flow_native_claim_result_for_test__(result), to: StateMachine
 
   defdelegate __flow_read_claim_hot_values_for_test__(state, keys, priority, partition_key),
+    to: StateMachine
+
+  defdelegate __flow_retention_current_state_record_for_test__(state, state_key),
+    to: StateMachine
+
+  defdelegate __flow_plain_expire_at_ms_for_test__(state, key), to: StateMachine
+
+  defdelegate __flow_read_cold_park_state_value_for_test__(state, key, locator),
+    to: StateMachine
+
+  defdelegate __flow_maybe_queue_hibernated_timeout_cleanup_for_test__(state, state_key, record),
+    to: StateMachine
+
+  defdelegate __flow_hibernation_active_index_reverse_for_test__(state, state_key, record),
+    to: StateMachine
+
+  defdelegate __flow_hibernation_locator_from_hot_for_test__(state, state_key, record, value),
     to: StateMachine
 
   defp canonical({:cross_shard_tx, shard_batches}) when is_list(shard_batches),
@@ -898,6 +919,412 @@ defmodule Ferricstore.Raft.StateMachineTest do
     assert [] = :ets.lookup(ets, "local-key")
   end
 
+  @tag :flow_replay_visibility
+  test "WARaft recovery hides same-command Flow state and registry entries", %{
+    state: state,
+    ets: ets
+  } do
+    setup_flow_indexes(state)
+
+    id = "replay-same-index-create"
+    partition_key = "replay-same-index-tenant"
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+    registry_key = Ferricstore.Flow.Keys.registry_key(id, partition_key)
+    replay_index = 7
+
+    future_record = %{
+      id: id,
+      type: "replay-ordering",
+      state: "cancelled",
+      partition_key: partition_key,
+      version: 2,
+      attempts: 0,
+      fencing_token: 0,
+      created_at_ms: 900,
+      updated_at_ms: 950,
+      next_run_at_ms: 1_000,
+      priority: 0,
+      incarnation: 1,
+      state_enter_seq: 1,
+      ttl_ms: nil,
+      retention_ttl_ms: 86_400_000,
+      max_active_ms: nil,
+      terminal_retention_until_ms: nil,
+      history_hot_max_events: 100,
+      history_max_events: 1_000,
+      payload_ref: nil,
+      value_refs: %{},
+      parent_flow_id: nil,
+      parent_partition_key: nil,
+      root_flow_id: id,
+      correlation_id: nil,
+      result_ref: nil,
+      error_ref: nil,
+      lease_owner: nil,
+      lease_token: nil,
+      lease_deadline_ms: 0,
+      run_state: nil,
+      child_groups: %{}
+    }
+
+    future_value = Ferricstore.Flow.encode_record(future_record)
+
+    :ets.insert(ets, {
+      state_key,
+      future_value,
+      0,
+      LFU.initial(),
+      {:waraft_apply_projection, replay_index},
+      0,
+      byte_size(future_value)
+    })
+
+    :ets.insert(ets, {
+      registry_key,
+      <<1>>,
+      0,
+      LFU.initial(),
+      {:waraft_apply_projection, replay_index},
+      0,
+      1
+    })
+
+    value_key = Ferricstore.Flow.Keys.value_key(id, :payload, 1, partition_key)
+    value_expire_at_ms = System.system_time(:millisecond) + 60_000
+
+    :ets.insert(ets, {
+      value_key,
+      "future-payload",
+      value_expire_at_ms,
+      LFU.initial(),
+      {:waraft_apply_projection, replay_index},
+      0,
+      byte_size("future-payload")
+    })
+
+    recovery_state = Map.put(state, :waraft_recovery_before_index, replay_index)
+
+    assert :miss =
+             StateMachine.__flow_retention_current_state_record_for_test__(
+               recovery_state,
+               state_key
+             )
+
+    assert StateMachine.__flow_plain_expire_at_ms_for_test__(recovery_state, value_key) == nil
+
+    assert StateMachine.__flow_plain_expire_at_ms_for_test__(state, value_key) ==
+             value_expire_at_ms
+
+    attrs = %{
+      id: id,
+      type: "replay-ordering",
+      state: "queued",
+      partition_key: partition_key,
+      run_at_ms: 1_000,
+      now_ms: 1_000,
+      policy_reference_captured: true
+    }
+
+    parent = self()
+
+    writer = fn batch ->
+      send(parent, {:recovery_projection, batch})
+
+      locations =
+        Enum.map(batch, fn
+          {:put, _key, value, _expire_at_ms} -> {:put, 0, byte_size(value)}
+          {:put_cold, _key, value, _expire_at_ms, _lfu} -> {:put, 0, byte_size(value)}
+          {:delete, key, _prob_path} -> {:delete, 0, byte_size(key)}
+        end)
+
+      {:ok, {:waraft_apply_projection, replay_index}, locations}
+    end
+
+    command =
+      {:flow_create_many, state_key, %{records: [attrs], policy_reference_captured: true}}
+
+    assert {recovered_state, {:applied_at, ^replay_index, :ok}, _effects} =
+             StateMachine.apply_waraft_segment_recovery_command(
+               command,
+               %{index: replay_index, term: 1, system_time: 1_000},
+               state,
+               writer
+             )
+
+    assert_receive {:recovery_projection, _batch}, 500
+    refute Map.has_key?(recovered_state, :waraft_recovery_before_index)
+    assert %{state: "queued", version: 1} = flow_record!(recovered_state, state_key)
+
+    later_recovery_state = Map.put(recovered_state, :waraft_recovery_before_index, 8)
+
+    assert {:ok, %{state: "queued", version: 1}} =
+             StateMachine.__flow_retention_current_state_record_for_test__(
+               later_recovery_state,
+               state_key
+             )
+
+    assert {_state, {:applied_at, 8, {:error, "ERR flow already exists"}}, _effects} =
+             StateMachine.apply_waraft_segment_recovery_command(
+               command,
+               %{index: 8, term: 1, system_time: 1_001},
+               recovered_state,
+               fn _batch -> flunk("an earlier Flow must remain visible during recovery") end
+             )
+
+    assert {_state, {:applied_at, 9, {:error, "ERR flow already exists"}}, _effects} =
+             StateMachine.apply(
+               %{index: 9, system_time: 1_002},
+               command,
+               recovered_state
+             )
+  end
+
+  @tag :flow_replay_visibility
+  test "WARaft recovery rejects future hibernation locators before payload IO", %{
+    state: state,
+    dir: dir
+  } do
+    parent = self()
+    key = "flow:{replay-hibernation}:state:run"
+    data_dir = dir |> Path.dirname() |> Path.dirname()
+    state = Map.put(state, :instance_ctx, %FerricStore.Instance{data_dir: data_dir})
+
+    locator = fn index ->
+      Ferricstore.Flow.Locator.new!(
+        flow_id: "run",
+        kind: :state,
+        version: 1,
+        raft_index: index,
+        file_id: {:waraft_apply_projection, index},
+        offset: 0,
+        value_size: 10,
+        frame_size: 32,
+        segment_generation: 0,
+        checksum: :binary.copy(<<1>>, 32)
+      )
+    end
+
+    Process.put(:ferricstore_waraft_apply_projection_disk_read_hook, fn _root, index, source ->
+      send(parent, {:projection_read, index, source})
+    end)
+
+    recovery_state = Map.put(state, :waraft_recovery_before_index, 7)
+
+    try do
+      assert :miss =
+               StateMachine.__flow_read_cold_park_state_value_for_test__(
+                 recovery_state,
+                 key,
+                 locator.(7)
+               )
+
+      refute_receive {:projection_read, 7, _source}, 50
+
+      assert :miss =
+               StateMachine.__flow_read_cold_park_state_value_for_test__(
+                 recovery_state,
+                 key,
+                 locator.(6)
+               )
+
+      assert_receive {:projection_read, 6, :latest}, 500
+    after
+      Process.delete(:ferricstore_waraft_apply_projection_disk_read_hook)
+    end
+  end
+
+  @tag :flow_replay_visibility
+  test "WARaft recovery hides future native-claim hot values", %{state: state, ets: ets} do
+    id = "replay-native-claim-future"
+    partition_key = "replay-native-claim-tenant"
+    key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+    value = Ferricstore.Flow.encode_record(replay_flow_record(id, partition_key))
+
+    :ets.insert(
+      ets,
+      {key, value, 0, LFU.initial(), {:waraft_apply_projection, 7}, 0, byte_size(value)}
+    )
+
+    recovery_state = Map.put(state, :waraft_recovery_before_index, 7)
+
+    assert [nil] =
+             StateMachine.__flow_read_claim_hot_values_for_test__(
+               recovery_state,
+               [{id, 1.0}],
+               nil,
+               partition_key
+             )
+
+    assert [^value] =
+             StateMachine.__flow_read_claim_hot_values_for_test__(
+               state,
+               [{id, 1.0}],
+               nil,
+               partition_key
+             )
+  end
+
+  @tag :flow_replay_visibility
+  test "WARaft recovery cannot hibernate through an identical future hot locator", %{
+    state: state,
+    ets: ets
+  } do
+    id = "replay-hibernation-future-hot"
+    partition_key = "replay-hibernation-hot-tenant"
+    key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+    record = replay_flow_record(id, partition_key)
+    value = Ferricstore.Flow.encode_record(record)
+
+    :ets.insert(
+      ets,
+      {key, value, 0, LFU.initial(), {:waraft_apply_projection, 7}, 0, byte_size(value)}
+    )
+
+    recovery_state = Map.put(state, :waraft_recovery_before_index, 7)
+
+    assert :skip =
+             StateMachine.__flow_hibernation_locator_from_hot_for_test__(
+               recovery_state,
+               key,
+               record,
+               value
+             )
+
+    assert {:ok, %Ferricstore.Flow.Locator{file_id: {:waraft_apply_projection, 7}}} =
+             StateMachine.__flow_hibernation_locator_from_hot_for_test__(
+               state,
+               key,
+               record,
+               value
+             )
+  end
+
+  @tag :flow_replay_visibility
+  test "WARaft recovery does not clean future hibernation metadata", %{state: state} do
+    id = "replay-future-hibernated-timeout"
+    partition_key = "replay-timeout-tenant"
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+    lmdb_path = Ferricstore.Flow.LMDB.path(state.shard_data_path)
+
+    record = %{
+      id: id,
+      type: "replay-timeout",
+      state: "queued",
+      partition_key: partition_key,
+      version: 1,
+      priority: 0,
+      state_enter_seq: 1,
+      created_at_ms: 1_000,
+      updated_at_ms: 1_000,
+      max_active_ms: 100,
+      next_run_at_ms: nil
+    }
+
+    locator =
+      Ferricstore.Flow.Locator.new!(
+        flow_id: id,
+        kind: :state,
+        version: 1,
+        raft_index: 7,
+        file_id: {:waraft_apply_projection, 7},
+        offset: 0,
+        value_size: 10,
+        frame_size: 32,
+        segment_generation: 0,
+        checksum: :binary.copy(<<1>>, 32)
+      )
+
+    park_key = Ferricstore.Flow.LMDB.cold_park_key_for_state_key(state_key)
+
+    park_blob =
+      Ferricstore.Flow.LMDB.encode_cold_park(locator,
+        due_at_ms: nil,
+        type: record.type,
+        state: record.state,
+        partition_key: partition_key,
+        state_key: state_key,
+        priority: 0
+      )
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(
+               lmdb_path,
+               [{:put, park_key, park_blob}] ++
+                 Ferricstore.Flow.LMDB.active_timeout_index_put_ops(state_key, record, 0)
+             )
+
+    Process.put(:sm_pending_lmdb_mirror_ops, [])
+    recovery_state = Map.put(state, :waraft_recovery_before_index, 7)
+
+    try do
+      assert :ok =
+               StateMachine.__flow_maybe_queue_hibernated_timeout_cleanup_for_test__(
+                 recovery_state,
+                 state_key,
+                 record
+               )
+
+      assert Process.get(:sm_pending_lmdb_mirror_ops) == []
+    after
+      Process.delete(:sm_pending_lmdb_mirror_ops)
+    end
+  end
+
+  @tag :flow_replay_visibility
+  test "WARaft recovery derives hibernation reverse metadata from the replayed record", %{
+    state: state
+  } do
+    id = "replay-hibernation-reverse"
+    partition_key = "replay-reverse-tenant"
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+    lmdb_path = Ferricstore.Flow.LMDB.path(state.shard_data_path)
+
+    current = %{
+      id: id,
+      type: "replay-reverse",
+      state: "queued",
+      partition_key: partition_key,
+      version: 1,
+      priority: 0,
+      state_enter_seq: 1,
+      created_at_ms: 1_000,
+      updated_at_ms: 1_000,
+      max_active_ms: nil,
+      next_run_at_ms: 20_000
+    }
+
+    future = %{current | state: "waiting", version: 2, state_enter_seq: 2, updated_at_ms: 2_000}
+
+    {_current_ops, current_reverse} =
+      Ferricstore.Flow.LMDB.active_index_put_ops_with_reverse(state_key, current, 0)
+
+    {_future_ops, future_reverse} =
+      Ferricstore.Flow.LMDB.active_index_put_ops_with_reverse(state_key, future, 0)
+
+    refute current_reverse == future_reverse
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
+               {:put, Ferricstore.Flow.LMDB.active_by_state_key_key(state_key), future_reverse}
+             ])
+
+    assert {:ok, ^future_reverse} =
+             StateMachine.__flow_hibernation_active_index_reverse_for_test__(
+               state,
+               state_key,
+               current
+             )
+
+    recovery_state = Map.put(state, :waraft_recovery_before_index, 7)
+
+    assert {:ok, ^current_reverse} =
+             StateMachine.__flow_hibernation_active_index_reverse_for_test__(
+               recovery_state,
+               state_key,
+               current
+             )
+  end
+
   @tag :terminal_expire_apply_guard
   test "signaling a terminal schedule with a missing old retention marker does not crash apply",
        %{
@@ -1045,6 +1472,22 @@ defmodule Ferricstore.Raft.StateMachineTest do
       safe_delete_ets(state.zset_score_index_name)
       safe_delete_ets(state.zset_score_lookup_name)
     end)
+  end
+
+  defp replay_flow_record(id, partition_key) do
+    %{
+      id: id,
+      type: "replay-ordering",
+      state: "queued",
+      partition_key: partition_key,
+      version: 1,
+      priority: 0,
+      state_enter_seq: 1,
+      created_at_ms: 1_000,
+      updated_at_ms: 1_000,
+      next_run_at_ms: 2_000,
+      max_active_ms: nil
+    }
   end
 
   defp flow_record!(state, state_key) do

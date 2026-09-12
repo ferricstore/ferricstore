@@ -1001,28 +1001,32 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
       defp flow_claim_priority_match?(_priority, _record_priority), do: false
 
       defp flow_install_hot_cold_record(state, state_key, value, %Locator{} = locator, record) do
-        case :ets.lookup(state.ets, state_key) do
-          [] ->
-            ets_value = value_for_ets(value, hot_cache_threshold(state))
-            track_keydir_binary_warm(state, ets_value)
+        if flow_keydir_file_visible_during_recovery?(state, locator.file_id) do
+          case :ets.lookup(state.ets, state_key) do
+            [] ->
+              ets_value = value_for_ets(value, hot_cache_threshold(state))
+              track_keydir_binary_warm(state, ets_value)
 
-            :ets.insert(
-              state.ets,
-              {state_key, ets_value, locator.expire_at_ms || 0, LFU.initial(), locator.file_id,
-               locator.offset, locator.value_size}
-            )
+              :ets.insert(
+                state.ets,
+                {state_key, ets_value, locator.expire_at_ms || 0, LFU.initial(), locator.file_id,
+                 locator.offset, locator.value_size}
+              )
 
-            case flow_install_hot_cold_indexes_now(state, record) do
-              :ok ->
-                :ok
+              case flow_install_hot_cold_indexes_now(state, record) do
+                :ok ->
+                  :ok
 
-              error ->
-                :ets.delete(state.ets, state_key)
-                error
-            end
+                error ->
+                  :ets.delete(state.ets, state_key)
+                  error
+              end
 
-          _ ->
-            :skip
+            _ ->
+              :skip
+          end
+        else
+          :skip
         end
       rescue
         ArgumentError -> :skip

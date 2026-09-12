@@ -14,7 +14,6 @@ defmodule Ferricstore.Flow.Query.ErrorTest do
       :query_response_budget_exceeded,
       :query_memory_budget_exceeded,
       :query_deadline_exceeded,
-      :query_concurrency_exceeded,
       :query_cursor_invalid,
       :query_cursor_expired,
       :query_cursor_too_large,
@@ -28,6 +27,14 @@ defmodule Ferricstore.Flow.Query.ErrorTest do
 
     assert Error.known?(:query_projection_changed)
     assert %{retryable: true, safe_to_retry: true} = atom_payload(:query_projection_changed)
+
+    assert %{
+             retryable: true,
+             safe_to_retry: true,
+             retry_after_ms: 100
+           } = atom_payload(:query_concurrency_exceeded)
+
+    assert Error.status(:query_concurrency_exceeded) == :busy
 
     assert %{code: "query_cursor_invalid"} = atom_payload(:query_cursor_invalid)
     assert %{code: "query_cursor_expired"} = atom_payload(:query_cursor_expired)
