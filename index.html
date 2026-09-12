@@ -9,7 +9,7 @@
   <link rel="icon" href="./favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="./site.css?v=2">
   <link rel="stylesheet" href="./shared/dispatch.css?v=20">
-  <link rel="stylesheet" href="./home.css?v=1">
+  <link rel="stylesheet" href="./home.css?v=2">
 </head>
 <body class="fs-dispatch fs-home" data-fs-surface="catalog">
   <a class="skip-link" href="#main-content">Skip to content</a>
@@ -73,6 +73,32 @@
         <p>After the worker’s lease expires, a replacement can claim the saved state and run its handler. The unfinished handler may run again; previously committed transitions remain recorded. FerricStore does not replay handler code to reconstruct workflow state.</p>
         <p>For external actions such as charging a card, use a stable idempotency key with a provider that honors it, and guarded execution where appropriate. Saving workflow progress alone does not make an external action happen exactly once.</p>
       </details>
+    </section>
+
+    <section class="home-reading" id="why-workflows" aria-labelledby="reading-title">
+      <div class="home-reading-intro">
+        <h2 id="reading-title">Why use a workflow instead of just queues?</h2>
+        <p>A queue delivers work to a consumer. When a process spans several steps, your application also needs to track dependencies, retries, waiting, and overall progress. A workflow engine brings that coordination together.</p>
+        <p>Queues remain a good fit for independent jobs and buffering traffic. Workflows become useful when the relationship between jobs matters—and can use queues underneath.</p>
+        <a class="home-text-link" href="./architecture-comparison/">Explore the architecture demo <span aria-hidden="true">→</span></a>
+      </div>
+      <ul class="home-reading-list" aria-label="Recommended articles about workflow orchestration">
+        <li>
+          <h3><a href="https://aws.amazon.com/step-functions/faqs/">When to use Step Functions vs. Amazon SQS <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7M7 7h10v10"/></svg></a></h3>
+          <p class="home-reading-source">AWS · Service comparison</p>
+          <p>AWS explains the extra application-level tracking needed with SQS, and how orchestration adds visibility into the whole execution. Start with the “Comparisons” section.</p>
+        </li>
+        <li>
+          <h3><a href="https://martinfowler.com/articles/201701-event-driven.html">What do you mean by “Event-Driven”? <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7M7 7h10v10"/></svg></a></h3>
+          <p class="home-reading-source">Martin Fowler · Architecture perspective</p>
+          <p>Fowler describes how a business process spread across event notifications can become difficult to see, debug, and change. Read “Event Notification” for the trade-off.</p>
+        </li>
+        <li>
+          <h3><a href="https://www.uber.com/us/en/blog/announcing-cadence/">Announcing Cadence 1.0 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7M7 7h10v10"/></svg></a></h3>
+          <p class="home-reading-source">Uber Engineering · Production experience</p>
+          <p>Uber explains how its workflow platform takes on common service infrastructure, including failure handling, execution inspection, and parent-child coordination.</p>
+        </li>
+      </ul>
     </section>
 
     <section class="catalog" id="demos" aria-labelledby="catalog-title">

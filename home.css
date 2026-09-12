@@ -69,6 +69,18 @@ body.fs-dispatch.fs-home .home-text-link { display: inline-flex; gap: 14px; alig
 .home-boundary p { max-width: 78ch; margin: 0 0 16px; color: var(--fs-ink-soft); font-size: 17px; line-height: 1.6; }
 .home-boundary p:last-child { padding-bottom: 16px; }
 
+.home-reading { display: grid; grid-template-columns: minmax(0,0.85fr) minmax(0,1.15fr); gap: 64px; border-top: 1px solid var(--fs-line); padding: 48px 0; }
+.home-reading h2 { max-width: 20ch; margin: 0 0 18px; font-size: clamp(32px,3.2vw,42px); font-weight: 600; line-height: 1.12; text-wrap: balance; }
+.home-reading-intro > p { margin: 0 0 16px; color: var(--fs-ink-soft); font-size: 17px; line-height: 1.6; }
+.home-reading-list { margin: 0; padding: 0; list-style: none; }
+.home-reading-list li { padding: 20px 0; border-top: 1px solid var(--fs-line-soft); }
+.home-reading-list li:first-child { padding-top: 0; border-top: 0; }
+.home-reading-list li:last-child { padding-bottom: 0; }
+.home-reading-list h3 { margin: 0; font-size: 23px; font-weight: 600; line-height: 1.25; }
+body.fs-dispatch.fs-home .home-reading-list a { display: flex; gap: 14px; align-items: center; justify-content: space-between; min-height: 44px; color: var(--fs-blue); }
+.home-reading-list a:hover { color: var(--fs-ink); }
+.home-reading-list p { margin: 8px 0 0; color: var(--fs-ink-soft); font-size: 17px; line-height: 1.55; }
+.home-reading-list .home-reading-source { margin-top: 2px; color: var(--fs-muted); font-size: 15px; }
 body.fs-dispatch.fs-home .catalog { border-top: 1px solid var(--fs-line); padding: 48px 0; scroll-margin-top: 24px; }
 body.fs-dispatch.fs-home .catalog-header { align-items: flex-end; gap: 24px; margin-bottom: 24px; }
 body.fs-dispatch.fs-home .catalog-header h2 { margin: 0 0 10px; font-size: 42px; line-height: 1.12; letter-spacing: -0.02em; }
@@ -119,6 +131,7 @@ body.fs-dispatch.fs-home footer { padding: 24px 0; align-items: center; }
   body.fs-dispatch.fs-home .hero-actions { flex-direction: row; align-items: stretch; margin-top: 22px; }
   body.fs-dispatch.fs-home .hero-actions a { flex: 1 1 180px; }
   .home-how { grid-template-columns: 1fr; gap: 28px; padding: 36px 0; }
+  .home-reading { grid-template-columns: 1fr; gap: 28px; padding: 36px 0; }
   .home-saved-work li { grid-template-columns: 24px minmax(0,1fr) auto; gap: 10px; }
   .home-saved-work li > span:last-child { grid-column: auto; }
   .home-saved-heading { flex-direction: row; gap: 12px; }
