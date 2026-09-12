@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Zombie Worker &amp; Fencing Tokens | FerricStore Demos</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css?v=2">
-  <link rel="stylesheet" href="../shared/polish.css">
-  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=20">
+  <link rel="stylesheet" href="./style.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/polish.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=20260912d">
 </head>
 <body class="fs-dispatch">
   <!--
@@ -32,30 +32,30 @@
 
   <main class="container">
     <header class="hero">
-      <div class="hero-pill">🧟 SPLIT-BRAIN &amp; ZOMBIE PREVENTION</div>
-      <h1>Zombie Workers &amp; <span class="hero-gradient">Monotonic Fencing</span></h1>
+      <div class="hero-pill">🧟 WHEN AN OLD WORKER RETURNS</div>
+      <h1>When an old worker comes back</h1>
       <p class="hero-desc">
-        When a worker freezes through lease expiry, a replacement can claim the flow with a newer fencing token. FerricStore rejects stale Flow mutations; external databases are protected only when the application also passes the token and the database enforces monotonic updates.
+        A worker pauses. Another takes over with a newer owner number. When the old worker returns, FerricStore rejects its outdated write. External databases get the same protection only when the application passes the number and the database checks it.
       </p>
     </header>
 
     <section class="stage-card">
       <header class="stage-header">
         <div class="scenario-badge">
-          <span class="badge-label" style="background: rgba(239, 68, 68, 0.18); color: #fca5a5;">DISTRIBUTED HAZARD</span>
-          <strong data-stage-name>Stage 1: Normal Execution (Worker A holds Lease Gen=1)</strong>
+          <span class="badge-label" style="background: rgba(56, 189, 248, 0.18); color: #7dd3fc;">SCENARIO</span>
+          <strong data-stage-name>Worker A pauses, Worker B takes over, the old write is rejected</strong>
         </div>
         <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-          <button class="ctrl-btn freeze-btn" data-freeze-btn>❄️ 1. Freeze Worker A (GC Pause)</button>
-          <button class="ctrl-btn promote-btn" data-promote-btn>👑 2. Promote Worker B (Gen 2)</button>
-          <button class="ctrl-btn zombie-btn" data-zombie-btn>🧟 3. Fire Zombie Stale Write</button>
+          <button class="ctrl-btn freeze-btn" data-freeze-btn>1. Pause Worker A</button>
+          <button class="ctrl-btn promote-btn" data-promote-btn>2. Let Worker B take over</button>
+          <button class="ctrl-btn zombie-btn" data-zombie-btn>3. Try the old write</button>
         </div>
       </header>
 
       <div class="current-run" aria-live="polite">
         <span>Current run</span>
-        <strong>GC pause → lease transfer → stale write blocked</strong>
-        <small data-current-run-step>Step 1 of 4 · Normal Execution (Worker A holds Lease Gen=1)</small>
+        <strong>Pause → replacement takes over → old write blocked</strong>
+        <small data-current-run-step>Step 1 of 4 · Worker A is active</small>
       </div>
 
       <!-- Stepper Track -->
@@ -63,19 +63,19 @@
         <ol class="flow-stepper" data-stepper>
           <li class="is-active" data-step="0">
             <span class="step-num">1</span>
-            <span class="step-title">Normal Lease (Gen 1)</span>
+            <span class="step-title">Worker A active (owner 1)</span>
           </li>
           <li data-step="1">
             <span class="step-num">2</span>
-            <span class="step-title">20s GC Freeze</span>
+            <span class="step-title">Worker A pauses</span>
           </li>
           <li data-step="2">
             <span class="step-num">3</span>
-            <span class="step-title">Lease Transferred (Gen 2)</span>
+            <span class="step-title">Worker B takes over (owner 2)</span>
           </li>
           <li data-step="3">
             <span class="step-num">4</span>
-            <span class="step-title">Zombie Write Blocked 💥</span>
+            <span class="step-title">Old write blocked</span>
           </li>
         </ol>
       </nav>
@@ -88,19 +88,19 @@
             <div class="wc-identity">
               <span class="wc-avatar">🅰️</span>
               <div>
-                <strong>Worker A (Pod #1)</strong>
-                <small data-worker-a-role>Active Leader (Lease Gen 1)</small>
+                <strong>Worker A (original)</strong>
+                <small data-worker-a-role>Current owner (number 1)</small>
               </div>
             </div>
-            <span class="wp-token-badge gen1" data-worker-a-token>TOKEN: GEN=1</span>
+            <span class="wp-token-badge gen1" data-worker-a-token>OWNER: 1</span>
           </div>
 
           <div class="wc-body">
             <p data-worker-a-desc>
-              Worker A claims Job #9842 with Generation 1. Heartbeat is healthy and active.
+              Worker A owns Job #9842. It is active and responding.
             </p>
             <div class="wc-status-box good" data-worker-a-status>
-              STATUS: ACTIVE (GEN=1)
+              STATUS: ACTIVE (OWNER 1)
             </div>
           </div>
         </div>
@@ -108,12 +108,12 @@
         <!-- Center Storage Gatekeeper Shield -->
         <div class="gatekeeper-vault" data-gatekeeper-vault>
           <div class="vault-shield-icon" data-vault-icon>🛡️</div>
-          <h3 data-gk-title>Raft Storage Gatekeeper</h3>
+          <h3 data-gk-title>Storage checks the owner number</h3>
           <div class="vault-lease-chip" data-vault-lease>
-            ACTIVE LEASE: GENERATION 1
+            CURRENT OWNER: 1
           </div>
           <div class="vault-decision-box" data-gk-decision>
-            ALL WRITES FROM WORKER A (GEN=1) ACCEPTED
+            WRITES FROM OWNER 1 ACCEPTED
           </div>
         </div>
 
@@ -123,19 +123,19 @@
             <div class="wc-identity">
               <span class="wc-avatar">🅱️</span>
               <div>
-                <strong>Worker B (Pod #2)</strong>
-                <small data-worker-b-role>Standby Replica</small>
+                <strong>Worker B (replacement)</strong>
+                <small data-worker-b-role>Waiting to take over</small>
               </div>
             </div>
-            <span class="wp-token-badge gen2" data-worker-b-token>TOKEN: STANDBY</span>
+            <span class="wp-token-badge gen2" data-worker-b-token>OWNER: WAITING</span>
           </div>
 
           <div class="wc-body">
             <p data-worker-b-desc>
-              Worker B is on standby in the worker pool, awaiting work or failover.
+              Worker B is waiting in the worker pool.
             </p>
             <div class="wc-status-box" data-worker-b-status>
-              STATUS: STANDBY
+              STATUS: WAITING
             </div>
           </div>
         </div>
@@ -144,43 +144,43 @@
       <!-- Live Telemetry -->
       <div class="telemetry-grid">
         <div class="telemetry-card">
-          <small>Current Storage Lease</small>
-          <div class="telemetry-val" style="color: #34d399;" data-val-gen>Generation 1</div>
-          <span class="telemetry-sub">Strictly monotonic counter</span>
+            <small>Current owner number</small>
+            <div class="telemetry-val" style="color: #34d399;" data-val-gen>Owner 1</div>
+            <span class="telemetry-sub">Only the current owner can write</span>
         </div>
         <div class="telemetry-card">
-          <small>Zombie Writes Blocked</small>
-          <div class="telemetry-val" style="color: #38bdf8;" data-val-blocked>0 Stale Writes</div>
-          <span class="telemetry-sub">Rejected at storage layer</span>
+            <small>Old writes blocked</small>
+            <div class="telemetry-val" style="color: #38bdf8;" data-val-blocked>0 old writes</div>
+            <span class="telemetry-sub">Rejected by storage</span>
         </div>
         <div class="telemetry-card">
-          <small>Database Corruption</small>
-          <div class="telemetry-val" style="color: #34d399;" data-val-corrupt>External DB must enforce fence</div>
-          <span class="telemetry-sub">External DB must enforce fence</span>
+            <small>External DB protection</small>
+            <div class="telemetry-val" style="color: #34d399;" data-val-corrupt>App must pass owner</div>
+            <span class="telemetry-sub">The DB must check it</span>
         </div>
         <div class="telemetry-card">
-          <small>Validation Latency</small>
-          <div class="telemetry-val" style="color: #38bdf8;" data-val-latency>Topology dependent</div>
-          <span class="telemetry-sub">Fenced state mutation</span>
+            <small>Recovery timing</small>
+            <div class="telemetry-val" style="color: #38bdf8;" data-val-latency>Depends on lease</div>
+            <span class="telemetry-sub">Deployment dependent</span>
         </div>
       </div>
 
       <!-- Controls -->
       <footer class="stage-footer">
         <div class="ctrl-btn-group">
-          <button class="ctrl-btn" data-pause>⏸ Pause</button>
-          <button class="ctrl-btn" data-replay>↺ Reset &amp; Replay</button>
+          <button class="ctrl-btn" data-pause>▶ Play steps</button>
+          <button class="ctrl-btn" data-replay>↺ Reset to start</button>
         </div>
         <div style="font-size: 13px; color: #cbd5e1;" data-live-status>
-          🛡️ <strong>Safety boundary:</strong> FerricStore fences its own state writes; pass the token to external stores that support monotonic write guards.
+          🛡️ <strong>Safety boundary:</strong> FerricStore blocks an older owner number. Pass that number to an external store and have it reject older writes too.
         </div>
       </footer>
     </section>
 
     <!-- Python Code Example -->
     <section style="margin-bottom: 60px;">
-      <h3 style="font-size: 20px; margin-bottom: 12px;">FerricStore Python SDK: Monotonic Fencing Tokens</h3>
-      <pre style="background: #080614; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 20px; font-family: var(--font-mono); font-size: 13px; color: #e2e8f0; overflow-x: auto;"><code># Pass the claim's fence into an external store that enforces it
+      <h3 style="font-size: 20px; margin-bottom: 12px;">Python SDK: pass the owner number to your database</h3>
+      <pre style="background: #080614; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 20px; font-family: var(--font-mono); font-size: 13px; color: #e2e8f0; overflow-x: auto;"><code># Pass the claim's owner number (fencing token) to an external store
 from ferricstore import WorkflowClient, complete
 
 client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
@@ -199,8 +199,8 @@ def sync_inventory(job):
 flow.worker().run()</code></pre>
     </section>
   </main>
-  <script src="./fencing.js?v=4"></script>
-  <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=16"></script>
+  <script src="./fencing.js?v=20260912c"></script>
+  <script src="../shared/accuracy.js?v=20260912c"></script>
+  <script src="../shared/dispatch.js?v=20260912c"></script>
 </body>
 </html>

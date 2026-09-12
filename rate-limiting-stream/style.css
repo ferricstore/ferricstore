@@ -1,4 +1,4 @@
-/* Rate Limiting & Micro-Batching Stream Stylesheet */
+/* Rate limiting and grouped-commit stream styles */
 :root {
   --bg-app: #080714;
   --bg-surface: #100e26;

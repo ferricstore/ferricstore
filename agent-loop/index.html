@@ -5,13 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Autonomous AI Agent Loop · Budget Caps &amp; Circuit Breakers</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="../shared/base.css">
-  <link rel="stylesheet" href="./style.css">
-  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="stylesheet" href="../shared/base.css?v=20260912c">
+  <link rel="stylesheet" href="./style.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/polish.css?v=20260912c">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=20">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=20260912d">
 </head>
 <body class="fs-dispatch" data-mode="before">
   <!--
@@ -56,11 +56,11 @@
       <div class="mode-switch" role="tablist" aria-label="Execution Mode">
         <button type="button" role="tab" data-mode-btn="before" aria-selected="true" class="is-selected">
           <span class="mode-tab-title">Without FerricStore</span>
-          <span class="mode-tab-badge bad">❌ Blind While-True Loop (No Budget / No Breaker)</span>
+          <span class="mode-tab-badge bad">No spend cap · no breaker</span>
         </button>
         <button type="button" role="tab" data-mode-btn="after" aria-selected="false">
           <span class="mode-tab-title">With FerricStore</span>
-          <span class="mode-tab-badge good">✓ Durable Budget Cap + 3rd-Party Circuit Breaker</span>
+          <span class="mode-tab-badge good">Saved budget · breaker after 3 errors</span>
         </button>
       </div>
     </header>
@@ -70,37 +70,37 @@
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">💰</span>
-          <small>FINANCIAL BUDGET CAP</small>
+          <small>SPEND LIMIT</small>
         </div>
-        <strong class="metric-val text-green" data-metric-budget>$5.00 Hard Ceiling</strong>
-        <span class="metric-sub" data-metric-budget-sub>Monotonic spend tracker</span>
+        <strong class="metric-val text-green" data-metric-budget>No limit</strong>
+        <span class="metric-sub" data-metric-budget-sub>No cumulative spend guard</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">⚡</span>
-          <small>3RD-PARTY CIRCUIT BREAKER</small>
+          <small>OUTAGE PROTECTION</small>
         </div>
-        <strong class="metric-val text-green" data-metric-breaker>Active (3-Fail Trip)</strong>
-        <span class="metric-sub" data-metric-breaker-sub>Protects downstream LLM APIs</span>
+        <strong class="metric-val text-green" data-metric-breaker>Disabled</strong>
+        <span class="metric-sub" data-metric-breaker-sub>Retries can continue during an outage</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">🧠</span>
-          <small>CRASH REPLAY LATENCY</small>
+          <small>WHAT A WORKER CRASH KEEPS</small>
         </div>
-        <strong class="metric-val text-cyan" data-metric-rehydrate>Durable resume</strong>
-        <span class="metric-sub" data-metric-rehydrate-sub>Effect guard prevents repeated spend</span>
+        <strong class="metric-val text-cyan" data-metric-rehydrate>Nothing saved</strong>
+        <span class="metric-sub" data-metric-rehydrate-sub>Process memory disappears on crash</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">🔨</span>
-          <small>TOOL DEDUPLICATION</small>
+          <small>EXTERNAL TOOL EFFECTS</small>
         </div>
-        <strong class="metric-val text-green" data-metric-dedup>Fenced state writes</strong>
-        <span class="metric-sub" data-metric-dedup-sub>Tool effects require idempotency</span>
+        <strong class="metric-val text-green" data-metric-dedup>Not guarded</strong>
+        <span class="metric-sub" data-metric-dedup-sub>Workflow state does not deduplicate providers</span>
       </div>
     </section>
 
@@ -113,8 +113,8 @@
           <div class="file-info">
             <span class="file-icon">py</span>
             <div>
-              <h2 id="code-title" data-code-title>agent_fsm.py</h2>
-              <small data-code-kicker>FERRICSTORE BUDGET + EFFECT API</small>
+              <h2 id="code-title" data-code-title>unmanaged_agent.py</h2>
+              <small data-code-kicker>BLIND WHILE-TRUE (UNPROTECTED)</small>
             </div>
           </div>
           <div class="code-controls">
@@ -122,7 +122,7 @@
               <button type="button" class="sdk-btn" data-sdk-style="steps">Advanced step</button>
               <button type="button" class="sdk-btn is-active" data-sdk-style="states">Simple states</button>
             </div>
-            <span class="badge-durable" data-code-badge>BUDGET + BREAKER</span>
+            <span class="badge-durable" data-code-badge>NO GUARDS</span>
           </div>
         </header>
 
@@ -167,7 +167,7 @@ client.complete(
 )</code></pre>
 
         <!-- Code Block: After Mode (States) -->
-        <pre class="code-block" data-code="after-states"><code>from ferricstore import BudgetPolicy, WorkflowClient, complete, transition
+        <pre class="code-block" data-code="after-states" hidden><code>from ferricstore import BudgetPolicy, WorkflowClient, complete, transition
 
 client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
 flow = client.workflow(type="react-agent", initial_state="turn")
@@ -201,14 +201,17 @@ def turn(ctx):
       <article class="stage-panel">
         <header class="stage-header">
           <div class="stage-meta-left">
-            <span class="run-id-pill">AGENT: <strong data-agent-id>MARKET-RESEARCH-AGENT</strong></span>
-            <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>READY</b></span>
+            <span class="run-id-pill">SCENARIO: <strong data-agent-id>MARKET RESEARCH AGENT</strong></span>
+            <span class="live-pill" data-live-pill><span class="pulse-dot" aria-hidden="true"></span> <b data-live-status>READY</b></span>
           </div>
-          <div class="playback-controls">
-            <button class="stage-btn btn-primary" data-btn-play title="Run Normal Agent Execution">⚡ Normal Run</button>
-            <button class="stage-btn btn-warning" data-btn-budget title="Simulate Runaway Loop Exceeding $5.00 Budget">💰 Test Budget Cap</button>
-            <button class="stage-btn btn-danger" data-btn-breaker title="Simulate 3rd-Party OpenAI 503 Outage (Trips Circuit Breaker)">⚡ Test Breaker (503)</button>
-            <button class="stage-btn btn-ghost" data-btn-reset title="Reset Simulation">↺</button>
+          <div class="stage-actions">
+            <p class="playback-help">Choose a case, run it, and run it again to replay the same safeguard test.</p>
+            <div class="playback-controls" aria-label="Agent safeguard scenario controls">
+              <button class="stage-btn btn-primary" data-btn-play title="Run or replay the healthy four-turn case">Run healthy case</button>
+              <button class="stage-btn btn-warning" data-btn-budget title="Test the five-dollar budget limit">Test budget limit</button>
+              <button class="stage-btn btn-danger" data-btn-breaker title="Test three consecutive 503 errors and the circuit breaker">Test outage protection</button>
+              <button class="stage-btn btn-ghost" data-btn-reset title="Clear the run and start over" aria-label="Clear the run and start over">Start over</button>
+            </div>
           </div>
         </header>
 
@@ -216,28 +219,28 @@ def turn(ctx):
         <div class="visualizer-content">
           
           <!-- Dual Safeguards Status Bar -->
-          <div class="dual-guards-grid">
+          <div class="dual-guards-grid" aria-label="Agent safeguards">
             
             <!-- Guard 1: Financial Budget Limit -->
-            <div class="guard-card" data-guard-budget-card>
+            <div class="guard-card is-warning" data-guard-budget-card>
               <div class="guard-head">
                 <span class="guard-icon">💰</span>
                 <div>
                   <strong>FINANCIAL BUDGET LIMIT</strong>
-                  <small>Hard stop on infinite spend</small>
+                  <small>Track spend across turns</small>
                 </div>
               </div>
               <div class="guard-metric-row">
-                <span class="guard-val" data-guard-budget-val>$0.45 / $5.00</span>
-                <span class="guard-badge ok" data-guard-budget-badge>✓ Within Safe Limit</span>
+                <span class="guard-val" data-guard-budget-val>No spend cap</span>
+                <span class="guard-badge warn" data-guard-budget-badge>⚠️ No guard</span>
               </div>
               <div class="guard-track">
-                <div class="guard-fill" data-guard-budget-fill style="width: 9%;"></div>
+                <div class="guard-fill" data-guard-budget-fill style="width: 0%; background: #f59e0b;"></div>
               </div>
             </div>
 
             <!-- Guard 2: 3rd-Party Circuit Breaker -->
-            <div class="guard-card" data-guard-breaker-card>
+            <div class="guard-card is-warning" data-guard-breaker-card>
               <div class="guard-head">
                 <span class="guard-icon">⚡</span>
                 <div>
@@ -246,11 +249,11 @@ def turn(ctx):
                 </div>
               </div>
               <div class="guard-metric-row">
-                <span class="guard-val" data-guard-breaker-val>State: CLOSED (Healthy)</span>
-                <span class="guard-badge ok" data-guard-breaker-badge>0 / 3 Errors</span>
+                <span class="guard-val" data-guard-breaker-val>No circuit breaker</span>
+                <span class="guard-badge warn" data-guard-breaker-badge>⚠️ No guard</span>
               </div>
               <div class="guard-track">
-                <div class="guard-fill breaker-fill" data-guard-breaker-fill style="width: 0%;"></div>
+                <div class="guard-fill breaker-fill" data-guard-breaker-fill style="width: 0%; background: #f59e0b;"></div>
               </div>
             </div>
 
@@ -259,10 +262,10 @@ def turn(ctx):
           <!-- ReAct Agent Turns Visualizer Widget -->
           <div class="agent-turns-card">
             <div class="agent-turns-header">
-              <span>REACT REASONING TURNS (CHECKPOINTED TO RAFT)</span>
-              <span class="turns-counter" data-turns-counter>Turn 1 of 4</span>
+              <span>AGENT TURNS · FOLLOW EACH RESULT</span>
+              <span class="turns-counter" data-turns-counter>Turn 0 of 4 · ready to run</span>
             </div>
-            <div class="turns-stack" data-turns-stack>
+            <div class="turns-stack" data-turns-stack role="list" aria-label="Agent turns">
               <!-- Turn items generated by JS -->
             </div>
           </div>
@@ -273,8 +276,8 @@ def turn(ctx):
               <span>📟 AGENT REASONING &amp; GUARDIAN LOG</span>
               <small data-term-speed>Live simulator</small>
             </div>
-            <div class="term-stream" data-term-stream>
-              <div class="term-row info">[00:00.000] Click "⚡ Normal Run", "💰 Test Budget Cap", or "⚡ Test Breaker (503)" to test safeguards.</div>
+            <div class="term-stream" data-term-stream role="region" aria-label="Agent event log">
+              <div class="term-row info">[00:00.000] Choose a scenario above to test the budget limit or outage protection.</div>
             </div>
           </div>
 
@@ -282,10 +285,10 @@ def turn(ctx):
 
         <!-- Outcome Callout Footer -->
         <footer class="stage-footer">
-          <div class="outcome-callout good" data-outcome-callout>
-            <small data-outcome-label>AGENT GUARDIAN OUTCOME</small>
-            <strong data-outcome-title>DUAL RELIABILITY SAFEGUARDS ACTIVE</strong>
-            <span data-outcome-sub>Budget cap protects your financial balance. Circuit breaker protects downstream 3rd-party APIs from overload during outages.</span>
+          <div class="outcome-callout bad" data-outcome-callout>
+            <small data-outcome-label>WHAT THIS RUN TEACHES</small>
+            <strong data-outcome-title>RUNAWAY SPEND &amp; 3RD-PARTY OVERLOAD</strong>
+            <span data-outcome-sub>Agent lacks financial budget caps and service circuit breakers. Infinite loops drain balances; outages cause 429 bans.</span>
           </div>
         </footer>
       </article>
@@ -392,8 +395,8 @@ def turn(ctx):
     </section>
   </main>
 
-  <script src="./loop.js?v=6"></script>
-  <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=16"></script>
+  <script src="./loop.js?v=20260912c"></script>
+  <script src="../shared/accuracy.js?v=20260912c"></script>
+  <script src="../shared/dispatch.js?v=20260912c"></script>
 </body>
 </html>

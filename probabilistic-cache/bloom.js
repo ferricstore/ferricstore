@@ -14,7 +14,9 @@
   var metricRamSub = document.querySelector('[data-metric-ram-sub]');
   var metricSpeed = document.querySelector('[data-metric-speed]');
   var metricShield = document.querySelector('[data-metric-shield]');
+  var metricShieldSub = document.querySelector('[data-metric-shield-sub]');
   var metricGuar = document.querySelector('[data-metric-guar]');
+  var metricGuarSub = document.querySelector('[data-metric-guar-sub]');
 
   var queryCard = document.querySelector('[data-query-card]');
   var queryVal = document.querySelector('[data-query-val]');
@@ -85,87 +87,102 @@
 
     if (currentMode === 'set') {
       if (codeTitle) codeTitle.textContent = 'unshielded_redis_set.py';
-      if (codeKicker) codeKicker.textContent = 'RAW STRING SET (NO PROBABILISTIC FILTER)';
+      if (codeKicker) codeKicker.textContent = 'RAW STRING SET BASELINE';
 
-      if (metricRam) metricRam.textContent = '950 MB RAM (High Cost)';
-      if (metricRamSub) metricRamSub.textContent = 'Dict entry & robj struct overhead';
-      if (metricSpeed) metricSpeed.textContent = 'Hash-table lookup';
-      if (metricShield) metricShield.textContent = '🚨 0% Protected (DB Penetration)';
-      if (metricGuar) metricGuar.textContent = 'N/A (Raw Set)';
+      if (metricRam) metricRam.textContent = '950 MB RAM (illustrative)';
+      if (metricRamSub) metricRamSub.textContent = '10M-item model; implementation varies';
+      if (metricSpeed) metricSpeed.textContent = 'Exact set lookup';
+      if (metricShield) metricShield.textContent = 'No missing-key guard';
+      if (metricShieldSub) metricShieldSub.textContent = 'Missing requests continue to the database in this model';
+      if (metricGuar) metricGuar.textContent = 'Not applicable to a raw set';
+      if (metricGuarSub) metricGuarSub.textContent = 'The set stores exact members';
 
       if (outcomeCallout) outcomeCallout.className = 'outcome-callout bad';
-      if (outcomeLabel) outcomeLabel.textContent = 'RAW SET HAZARD';
-      if (outcomeTitle) outcomeTitle.textContent = '950 MB RAM CONSUMED &amp; DATABASE PENETRATION';
-      if (outcomeSub) outcomeSub.textContent = 'Storing 10M keys in raw Sets consumes nearly 1GB RAM. Bogus key misses bypass the cache and hammer Postgres with 10,000 queries.';
+      if (outcomeLabel) outcomeLabel.textContent = 'RAW SET MODEL';
+      if (outcomeTitle) outcomeTitle.textContent = 'THE FULL KEY LIST STAYS IN MEMORY';
+      if (outcomeSub) outcomeSub.textContent = 'This illustrative 10M-item model uses about 950 MB. Missing-key requests continue to the database in the example.';
 
     } else {
       if (codeTitle) codeTitle.textContent = 'bloom_shield.py';
       if (codeKicker) codeKicker.textContent = 'FERRICSTORE BLOOM FILTER API';
 
-      if (metricRam) metricRam.textContent = '11.98 MB (99% Saved)';
-      if (metricRamSub) metricRamSub.textContent = 'vs 950 MB for raw string sets';
+      if (metricRam) metricRam.textContent = '11.98 MB (illustrative)';
+      if (metricRamSub) metricRamSub.textContent = '10M-item model; implementation overhead is additional';
       if (metricSpeed) metricSpeed.textContent = 'Bitwise membership test';
-      if (metricShield) metricShield.textContent = 'Blocked in this run';
-      if (metricGuar) metricGuar.textContent = '0.00% False Negatives';
+      if (metricShield) metricShield.textContent = 'Ready to check';
+      if (metricShieldSub) metricShieldSub.textContent = 'Run the missing-key example below';
+      if (metricGuar) metricGuar.textContent = 'No false negatives';
+      if (metricGuarSub) metricGuarSub.textContent = 'A negative is definite; a positive still needs checking';
 
       if (outcomeCallout) outcomeCallout.className = 'outcome-callout good';
-      if (outcomeLabel) outcomeLabel.textContent = 'PROBABILISTIC CACHE BENEFIT';
-      if (outcomeTitle) outcomeTitle.textContent = '99% RAM REDUCTION &amp; ZERO DATABASE PENETRATION';
+      if (outcomeLabel) outcomeLabel.textContent = 'BLOOM FILTER MODEL';
+      if (outcomeTitle) outcomeTitle.textContent = 'A NEGATIVE CHECK CAN SKIP THE DATABASE';
       if (outcomeSub) outcomeSub.textContent = 'This illustrative 10M-item, 1% false-positive configuration uses an approximately 11.98 MB bit array; implementation overhead is additional.';
     }
   }
 
   // --- ACTION 1: Valid Key (Alice) ---
-  function runValidKey() {
+  function runValidKey(isModeReset) {
     clearLogs();
     clearAllTimeouts();
     updateModeUI();
 
     if (livePill) livePill.className = 'live-pill';
     if (liveStatus) {
-      liveStatus.textContent = currentMode === 'set'
-        ? 'STEP 1 · STANDARD SET LOOKUP'
-        : 'STEP 1 · BLOOM FILTER CHECK';
+      liveStatus.textContent = isModeReset
+        ? 'READY · CHOOSE A KEY'
+        : (currentMode === 'set' ? 'STEP 1 · STANDARD SET LOOKUP' : 'STEP 1 · BLOOM FILTER CHECK');
     }
 
     if (queryVal) queryVal.textContent = '"user_alice"';
-    if (queryBadge) { queryBadge.className = 'b-badge ok'; queryBadge.textContent = '✓ Legitimate User'; }
-    if (querySub) querySub.textContent = 'Valid registered user';
+    if (queryBadge) { queryBadge.className = 'b-badge ok'; queryBadge.textContent = '✓ Registered key'; }
+    if (querySub) querySub.textContent = 'Known user in this example';
 
-    if (matrixTitle) matrixTitle.textContent = currentMode === 'set' ? 'STANDARD SET HASH TABLE' : '3-HASH BITWISE ARRAY';
-    if (matrixSub) matrixSub.textContent = currentMode === 'set' ? 'Raw membership lookup' : '11.98 MB Memory Bitset';
+    if (matrixTitle) matrixTitle.textContent = currentMode === 'set' ? 'RAW STRING SET LOOKUP' : 'BLOOM FILTER CHECK';
+    if (matrixSub) matrixSub.textContent = currentMode === 'set' ? 'Exact membership lookup' : 'Three hash positions';
 
     if (bit1) { bit1.className = 'bit-slot'; bit1.querySelector('b').textContent = '1'; }
     if (bit2) { bit2.className = 'bit-slot'; bit2.querySelector('b').textContent = '1'; }
     if (bit3) { bit3.className = 'bit-slot'; bit3.querySelector('b').textContent = '1'; }
     if (matrixBadge) {
       matrixBadge.className = 'b-badge ok';
-      matrixBadge.textContent = currentMode === 'set' ? 'Hash-table member found' : 'All Bits Match (1-1-1)';
+      matrixBadge.textContent = currentMode === 'set' ? 'Exact member found' : 'All three positions match (1-1-1)';
     }
 
-    if (dbVal) dbVal.textContent = '0 DB Queries (Served Cache)';
-    if (dbBadge) { dbBadge.className = 'b-badge ok'; dbBadge.textContent = '✓ Healthy in this model'; }
+    if (dbVal) dbVal.textContent = '0 database queries in this run';
+    if (dbBadge) { dbBadge.className = 'b-badge ok'; dbBadge.textContent = '✓ No SQL needed in this model'; }
     if (dbFill) dbFill.style.width = '0%';
 
-    log('info', currentMode === 'set'
-      ? 'SISMEMBER valid_users user_alice ➔ Testing the standard Set...'
-      : 'BF.EXISTS bloom:valid_users user_alice ➔ Testing the Bloom Filter...');
+    if (!isModeReset) log('info', currentMode === 'set'
+      ? 'SISMEMBER valid_users user_alice ➔ Checking the raw set...'
+      : 'BF.EXISTS bloom:valid_users user_alice ➔ Checking the Bloom filter...');
+
+    if (isModeReset) {
+      if (expIcon) expIcon.textContent = '💡';
+      if (expTitle) expTitle.textContent = 'Mode selected; ready to run';
+      if (expDesc) expDesc.textContent = 'Choose Check registered key or Check 10,000 missing keys to run this example.';
+      if (outcomeLabel) outcomeLabel.textContent = 'READY';
+      if (outcomeTitle) outcomeTitle.textContent = 'CHOOSE A KEY TO CHECK';
+      if (outcomeSub) outcomeSub.textContent = 'The mode changed; no membership check has run yet.';
+      highlightCodeLine(null);
+      return;
+    }
 
     animTimeouts.push(setTimeout(function () {
       log('success', currentMode === 'set'
-        ? '✓ [SISMEMBER MATCH] user_alice was found in the standard Set hash table.'
-        : '✓ [BF.EXISTS MATCH] 3 hash slots [48291, 108420, 892011] all evaluate to 1.');
+        ? '✓ [SISMEMBER MATCH] user_alice was found in the raw set.'
+        : '✓ [BF.EXISTS MATCH] Three hash positions [48291, 108420, 892011] all evaluate to 1.');
       log('success', currentMode === 'set'
-        ? '⚡ [SERVED] Served user_alice after the exact Set membership lookup.'
-        : '⚡ [SERVED] Served user_alice after a positive membership check and application lookup.');
+        ? '⚡ [SERVED] The exact set lookup found user_alice.'
+        : '⚡ [SERVED] The positive check passed; the application can verify user_alice.');
 
       if (expIcon) expIcon.textContent = '⚡';
       if (expTitle) expTitle.textContent = currentMode === 'set'
-        ? 'Standard Set Membership Lookup'
-        : 'Positive Membership Check: Verify the Record';
+        ? 'Exact set lookup found the key'
+        : 'Possible match: verify the record';
       if (expDesc) expDesc.textContent = currentMode === 'set'
-        ? 'The exact Set lookup found this valid user. Click "🚨 2. Attacker Spam" to see how random misses fall through without a probabilistic guard.'
-        : 'All 3 hash bits matched (1-1-1). FerricStore served the user from cache. Click "🚨 2. Attacker Spam" to simulate malicious penetration attacks!';
+        ? 'The raw set found this registered user. Click Check 10,000 missing keys to see what happens when misses continue to the database.'
+        : 'All three positions matched. A positive Bloom check can still be a false positive, so the application should verify the record.';
 
       highlightCodeLine(currentMode === 'set' ? 7 : 7);
     }, 300));
@@ -178,24 +195,24 @@
     updateModeUI();
 
     if (queryVal) queryVal.textContent = '"bot_fake_9482910"';
-    if (queryBadge) { queryBadge.className = 'b-badge tripped'; queryBadge.textContent = '🚨 Malicious Bogus Key'; }
-    if (querySub) querySub.textContent = '10,000 non-existent attack queries';
+    if (queryBadge) { queryBadge.className = 'b-badge tripped'; queryBadge.textContent = 'Missing key'; }
+    if (querySub) querySub.textContent = '10,000 requests for keys that are not present';
 
     if (currentMode === 'set') {
       if (livePill) livePill.className = 'live-pill is-crash';
       if (liveStatus) liveStatus.textContent = '💥 10,000 QUERIES CRASHING POSTGRES';
 
-      if (dbVal) dbVal.textContent = '10,000 SQL Queries (Pool Exhausted)';
-      if (dbBadge) { dbBadge.className = 'b-badge tripped'; dbBadge.textContent = '💥 Postgres 504'; }
+      if (dbVal) dbVal.textContent = '10,000 SQL queries in this model';
+      if (dbBadge) { dbBadge.className = 'b-badge tripped'; dbBadge.textContent = 'Modeled 504'; }
       if (dbFill) { dbFill.style.width = '100%'; dbFill.style.background = '#ef4444'; }
 
-      log('danger', '🚨 [PENETRATION ATTACK] Attacker sent 10,000 random non-existent IDs!');
-      log('danger', '💥 [CACHE MISS FALLTHROUGH] All 10,000 misses fell through to Postgres database!');
-      log('danger', '📉 [DATABASE OUTAGE] Postgres connection pool saturated ➔ HTTP 504 Gateway Timeout!');
+      log('danger', '🚨 [MISSING KEYS] 10,000 requests asked for keys that are not present.');
+      log('danger', '💥 [CACHE MISS] All 10,000 misses continued to the Postgres database.');
+      log('danger', '📉 [MODELED RESULT] The connection pool returned HTTP 504 Gateway Timeout.');
 
       if (expIcon) expIcon.textContent = '💥';
-      if (expTitle) expTitle.textContent = 'The Cache Penetration Vulnerability';
-      if (expDesc) expDesc.textContent = 'Without a probabilistic filter, non-existent key requests bypass the cache and hammer Postgres with 10,000 SQL queries, crashing the database.';
+      if (expTitle) expTitle.textContent = 'Missing keys continue to the database';
+      if (expDesc) expDesc.textContent = 'In this model, every missing-key request reaches Postgres because the raw set has no compact negative check.';
 
       highlightCodeLine(7);
 
@@ -206,21 +223,21 @@
       if (bit1) { bit1.className = 'bit-slot'; bit1.querySelector('b').textContent = '1'; }
       if (bit2) { bit2.className = 'bit-slot is-zero'; bit2.querySelector('b').textContent = '0'; }
       if (bit3) { bit3.className = 'bit-slot'; bit3.querySelector('b').textContent = '1'; }
-      if (matrixBadge) { matrixBadge.className = 'b-badge tripped'; matrixBadge.textContent = 'Bit #2 = 0 ➔ 100% NON-EXISTENT'; }
+      if (matrixBadge) { matrixBadge.className = 'b-badge tripped'; matrixBadge.textContent = 'Position #2 = 0 ➔ definitely missing'; }
 
-      if (dbVal) dbVal.textContent = '0 DB Queries in this run';
-      if (dbBadge) { dbBadge.className = 'b-badge ok'; dbBadge.textContent = '✓ Definitive negatives'; }
+      if (dbVal) dbVal.textContent = '0 database queries in this run';
+      if (dbBadge) { dbBadge.className = 'b-badge ok'; dbBadge.textContent = '✓ Definite negatives'; }
       if (dbFill) dbFill.style.width = '0%';
 
-      log('warn', '🚨 [PENETRATION ATTACK] Attacker sent 10,000 random non-existent IDs...');
+      log('warn', '🚨 [MISSING KEYS] 10,000 requests asked for keys that are not present.');
 
       animTimeouts.push(setTimeout(function () {
-        log('success', '🛡️ [BITWISE REJECTION] Hash bit #2 evaluated to 0. Key guaranteed not to exist!');
-        log('success', '✓ [POSTGRES SAFE] In this run, all requested keys had a definitive negative result, so no database verification was needed.');
+        log('success', '🛡️ [DEFINITE NEGATIVE] Position #2 evaluated to 0. The key cannot be present.');
+        log('success', '✓ [NO SQL] In this run, every missing key was rejected before database verification.');
 
         if (expIcon) expIcon.textContent = '🛡️';
-        if (expTitle) expTitle.textContent = 'Definitive Negative Check: No Database Query';
-        if (expDesc) expDesc.textContent = 'Because a required bit was unset, the key is definitely absent. This modeled request skips the database; positive checks may still be false positives.';
+        if (expTitle) expTitle.textContent = 'Definite negative: no database query';
+        if (expDesc) expDesc.textContent = 'Because one required position was unset, the key is definitely absent. This modeled request skips the database; positive checks may still be false positives.';
 
         highlightCodeLine(8);
       }, 350));
@@ -230,21 +247,22 @@
   // --- Mode Switch Buttons ---
   modeButtons.forEach(function (btn) {
     btn.addEventListener('click', function () {
+      clearAllTimeouts();
       modeButtons.forEach(function (b) { b.classList.remove('is-selected'); b.setAttribute('aria-selected', 'false'); });
       btn.classList.add('is-selected');
       btn.setAttribute('aria-selected', 'true');
       currentMode = btn.getAttribute('data-mode-btn') || 'bloom';
       document.body.setAttribute('data-mode', currentMode);
       updateModeUI();
-      runValidKey();
+      runValidKey(true);
     });
   });
 
   // --- Playback Buttons ---
-  if (btnValid) btnValid.addEventListener('click', runValidKey);
+  if (btnValid) btnValid.addEventListener('click', function () { runValidKey(false); });
   if (btnSpam) btnSpam.addEventListener('click', runAttackerSpam);
-  if (btnReset) btnReset.addEventListener('click', runValidKey);
+  if (btnReset) btnReset.addEventListener('click', function () { runValidKey(true); });
 
   // Init
-  runValidKey();
+  runValidKey(true);
 })();

@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>SaaS Subscription & Time-Travel Dunning | FerricStore Demos</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css?v=5">
-  <link rel="stylesheet" href="../shared/polish.css">
-  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=20">
+  <link rel="stylesheet" href="./style.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/polish.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=20260912d">
 </head>
 <body class="fs-dispatch">
   <!--
@@ -22,7 +22,7 @@
   <nav class="top-nav">
     <div class="container nav-inner">
       <a href="../" class="nav-brand">
-        <span class="brand-icon">⏱️</span>
+        <span class="brand-icon">F</span>
         <span>FerricStore</span>
         <span class="nav-tag">Time-Travel Engine</span>
       </a>
@@ -32,73 +32,73 @@
 
   <main class="container">
     <header class="hero">
-      <div class="hero-pill">⏱️ TIME-TRAVEL &amp; NATIVE TIMERS</div>
+      <div class="hero-pill">SCHEDULED BILLING STATES</div>
       <h1>30-Day SaaS Billing &amp; <span class="hero-gradient">Dunning Engine</span></h1>
       <p class="hero-desc">
         Model a multi-day billing lifecycle as explicit durable states with scheduled eligibility, retry transitions, and guarded payment effects—without keeping an application handler blocked between dates.
       </p>
     </header>
 
-    <section class="stage-card">
+    <section class="stage-card" aria-label="Subscription billing and retry schedule simulator">
       <header class="stage-header">
         <div class="scenario-badge">
           <span class="badge-label" style="background: rgba(245, 158, 11, 0.18); color: #fbbf24;">LIFECYCLE</span>
-          <strong>Acme Corp ($99.00 / month SaaS Subscription)</strong>
+          <strong>Acme Pro subscription · $99/month</strong>
         </div>
         <div style="display: flex; gap: 8px;">
-          <button class="ctrl-btn" style="border-color: #ef4444; color: #fca5a5;" data-declined-toggle>Jump to Day 15 Decline</button>
-          <button class="ctrl-btn" style="border-color: #10b981; color: #6ee7b7;" data-success-toggle>Jump to Day 21 Recovery</button>
+          <button class="ctrl-btn" style="border-color: #ef4444; color: #fca5a5;" data-declined-toggle>Show Day 15 decline</button>
+          <button class="ctrl-btn" style="border-color: #10b981; color: #6ee7b7;" data-success-toggle>Show Day 21 recovery</button>
         </div>
       </header>
 
       <div class="current-run" aria-live="polite">
-        <span>Current run</span>
-        <strong>Dunning recovery</strong>
-        <small data-current-run-step>Step 1 of 5 · Day 1: Trial Started (14-Day Free Access)</small>
+        <span>Preview</span>
+        <strong>Payment retry schedule</strong>
+        <small data-current-run-step>Preview · Step 1 of 5 · Day 1: Trial starts</small>
       </div>
 
       <!-- Time Travel Scrubber Slider -->
       <div class="time-travel-panel">
         <div class="tt-header">
-          <span style="font-size: 13px; font-weight: 800; color: #fff;">⏳ Interactive Time-Travel Scrubber:</span>
-          <strong style="color: #fbbf24; font-size: 14px;" data-tt-label>Day 1: Trial Started (14-Day Free Access)</strong>
+          <span style="font-size: 13px; font-weight: 800; color: #fff;">Move through the billing schedule:</span>
+          <strong style="color: #fbbf24; font-size: 14px;" data-tt-label>Day 1: Trial starts (14-day access)</strong>
         </div>
-        <input type="range" min="0" max="4" value="0" class="tt-slider" data-tt-slider aria-label="Time Travel Slider">
+        <input type="range" min="0" max="4" value="0" class="tt-slider" data-tt-slider aria-label="Billing schedule day">
       </div>
 
       <!-- 5 Day Milestones Grid -->
       <div class="timeline-milestones-grid">
-        <div class="tm-node is-active" data-tm-node="0">
+        <div class="tm-node is-active" data-tm-node="0" role="button" aria-pressed="true" tabindex="0" aria-label="Day 1: trial starts. Active">
           <div class="tmn-head"><span>DAY 1</span><span class="node-pill">ACTIVE</span></div>
-          <div class="tmn-icon">🚀</div>
+          <div class="tmn-icon" aria-hidden="true">START</div>
           <strong>Trial Started</strong>
           <small>14-Day Free Access</small>
         </div>
 
-        <div class="tm-node" data-tm-node="1">
+        <div class="tm-node" data-tm-node="1" role="button" aria-pressed="false" tabindex="0" aria-label="Day 14: warning email. Pending">
           <div class="tmn-head"><span>DAY 14</span><span class="node-pill">PENDING</span></div>
-          <div class="tmn-icon">📧</div>
+          <div class="tmn-icon" aria-hidden="true">NOTICE</div>
           <strong>Warning Email</strong>
           <small>Trial Ending Alert</small>
         </div>
 
-        <div class="tm-node" data-tm-node="2">
+        <div class="tm-node" data-tm-node="2" role="button" aria-pressed="false" tabindex="0" aria-label="Day 15: payment attempt. Pending">
           <div class="tmn-head"><span>DAY 15</span><span class="node-pill">PENDING</span></div>
-          <div class="tmn-icon">💳</div>
+          <div class="tmn-icon" aria-hidden="true">CHARGE</div>
           <strong>Card Charge</strong>
           <small>Declined / Insufficient $</small>
         </div>
 
-        <div class="tm-node" data-tm-node="3">
+        <div class="tm-node" data-tm-node="3" role="button" aria-pressed="false" tabindex="0" aria-label="Day 18: first retry. Pending">
           <div class="tmn-head"><span>DAY 18</span><span class="node-pill">PENDING</span></div>
-          <div class="tmn-icon">📱</div>
+          <div class="tmn-icon" aria-hidden="true">RETRY</div>
           <strong>Dunning Retry #1</strong>
           <small>SMS Alert Sent</small>
         </div>
 
-        <div class="tm-node" data-tm-node="4">
+        <div class="tm-node" data-tm-node="4" role="button" aria-pressed="false" tabindex="0" aria-label="Day 21: payment recovered. Pending">
           <div class="tmn-head"><span>DAY 21</span><span class="node-pill">PENDING</span></div>
-          <div class="tmn-icon">🎉</div>
+          <div class="tmn-icon" aria-hidden="true">RECOVER</div>
           <strong>Dunning Recovered</strong>
           <small>Card Updated ($99 ✓)</small>
         </div>
@@ -109,23 +109,23 @@
         <!-- Account Status Box -->
         <div class="account-status-box">
           <div style="font-size: 11.5px; font-weight: 800; color: #94a3b8; text-transform: uppercase; margin-bottom: 12px;">
-            👤 Customer Subscription State
+            Customer subscription
           </div>
           <div style="margin-bottom: 14px;">
             <div class="as-badge trial" data-account-badge>TRIAL ACTIVE (14 DAYS REMAINING)</div>
-            <div style="font-size: 16px; font-weight: 800; color: #fff;" data-account-title>Acme Pro Plan · $99/mo</div>
+            <div style="font-size: 16px; font-weight: 800; color: #fff;" data-account-title>Acme Pro Plan · $99/month</div>
           </div>
           <div style="font-size: 13px; color: var(--text-muted); line-height: 1.5;" data-account-desc>
-            User is exploring features with full access. A payment method is on file for the end of the trial.
+            The customer has full access during the trial. A payment method is on file for renewal.
           </div>
         </div>
 
         <!-- Narrative Box -->
         <div class="dunning-narrative-box">
-          <div class="as-badge trial" data-narrative-badge>TIMER SCHEDULED</div>
-          <h3 style="margin: 0 0 6px; font-size: 18px;" data-narrative-title>Day 1: Welcome Email Sent</h3>
+          <div class="as-badge trial" data-narrative-badge>WAITING FOR DAY 14</div>
+          <h3 style="margin: 0 0 6px; font-size: 18px;" data-narrative-title>Day 1: Trial starts</h3>
           <p style="margin: 0 0 12px; font-size: 13.5px; color: var(--text-muted);" data-narrative-desc>
-            Customer activates Acme Pro Plan. The flow persists a trial state with a scheduled next eligibility time; no application handler stays blocked.
+            A 14-day trial starts. FerricStore records the next wake-up time, so no application process needs to sit and wait.
           </p>
           <div class="narrative-code-note">SIMPLIFIED EXCERPT · COMPLETE WORKFLOW BELOW</div>
           <div style="font-family: var(--font-mono); font-size: 11.5px; color: #fbbf24; background: rgba(0,0,0,0.4); padding: 8px; border-radius: 4px;" data-narrative-code>
@@ -137,37 +137,37 @@
       <!-- Live Telemetry -->
       <div class="telemetry-grid">
         <div class="telemetry-card">
-          <small>Revenue Recovered</small>
+          <small>Payment outcome</small>
           <div class="telemetry-val" style="color: #34d399;" data-val-rev>$0.00 (Trial)</div>
-          <span class="telemetry-sub">Prevented churn loss</span>
+          <span class="telemetry-sub">What the customer has paid</span>
         </div>
         <div class="telemetry-card">
-          <small>DB Polling Queries</small>
+          <small>Polling work</small>
           <div class="telemetry-val" style="color: #34d399;" data-val-queries>0 Queries</div>
-          <span class="telemetry-sub">Native Raft timer wheel</span>
+          <span class="telemetry-sub">Native timer wheel; no polling loop</span>
         </div>
         <div class="telemetry-card">
-          <small>Cron Drift</small>
+          <small>Schedule drift</small>
           <div class="telemetry-val" data-val-drift>0.00s</div>
-          <span class="telemetry-sub">Deterministic schedule</span>
+          <span class="telemetry-sub">Difference from the scheduled time</span>
         </div>
         <div class="telemetry-card">
-          <small>Grace Period</small>
+          <small>Access window</small>
           <div class="telemetry-val" style="color: #fbbf24;" data-val-grace>14 Days</div>
-          <span class="telemetry-sub">Access preserved</span>
+          <span class="telemetry-sub">How long access remains available</span>
         </div>
       </div>
 
       <!-- Controls -->
       <footer class="stage-footer">
         <div class="ctrl-btn-group">
-          <button class="ctrl-btn" data-prev>⏮ Prev</button>
-          <button class="ctrl-btn" data-pause>⏸ Pause</button>
-          <button class="ctrl-btn" data-next>Next ⏭</button>
-          <button class="ctrl-btn" data-replay>↺ Replay</button>
+          <button class="ctrl-btn" data-prev aria-label="Show previous billing milestone">Previous</button>
+          <button class="ctrl-btn" data-pause aria-label="Pause or play the billing schedule">Pause</button>
+          <button class="ctrl-btn" data-next aria-label="Show next billing milestone">Next</button>
+          <button class="ctrl-btn" data-replay aria-label="Replay the billing schedule from the beginning">Replay</button>
         </div>
         <div style="font-size: 13px; color: var(--text-dim);" data-live-status>
-          Auto-advancing simulation
+          Preview ready · choose Run to play
         </div>
       </footer>
     </section>
@@ -273,8 +273,8 @@ client.transition(
 )</code></pre>
     </section>
   </main>
-  <script src="./dunning.js?v=7"></script>
-  <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=16"></script>
+  <script src="./dunning.js?v=20260912c"></script>
+  <script src="../shared/accuracy.js?v=20260912c"></script>
+  <script src="../shared/dispatch.js?v=20260912c"></script>
 </body>
 </html>

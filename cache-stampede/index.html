@@ -5,13 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Cache Stampede &amp; Dogpiling Shield · FerricStore</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="../shared/base.css">
-  <link rel="stylesheet" href="./style.css">
-  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="stylesheet" href="../shared/base.css?v=20260912c">
+  <link rel="stylesheet" href="./style.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/polish.css?v=20260912c">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=20">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=20260912d">
 </head>
 <body class="fs-dispatch" data-mode="before">
   <!--
@@ -45,22 +45,22 @@
     <header class="demo-hero">
       <div class="hero-tag">NATIVE KV HELPER · DOGPILING SHIELD</div>
       <h1>
-        Cache Stampede &amp; Thundering Herd:<br>
-        <span class="hero-accent">10,000 Users Hit Expired Cache ➔ 1 DB Query, Not 10,000</span>
+        Many requests, one expired result:<br>
+        <span class="hero-accent">This example turns 10,000 refreshes into 1 database query</span>
       </h1>
       <p class="hero-desc">
-        On flash sales, product launches, or viral news, an expired cache key triggers the classic <strong>"Cache Stampede / Dogpiling" disaster</strong>: 10,000 concurrent requests all miss the cache at the same millisecond and slam Postgres simultaneously, crashing the database. <strong>FerricStore's native <code>FETCH_OR_COMPUTE</code> helper lets Worker #1 compute the query once</strong> while holding the other 9,999 requests in memory, then broadcasts the result to everyone with workload-dependent release latency.
+        A cache stampede happens when one popular value expires and many requests try to rebuild it at once. In this example, 10,000 requests can reach Postgres together unless the application coordinates them. <strong>With FerricStore, the native <code>FETCH_OR_COMPUTE</code> helper lets one worker compute the value</strong> while the other 9,999 wait in memory, then releases the stored result. Timing still depends on the workload.
       </p>
 
       <!-- Mode Switch Tabs -->
       <div class="mode-switch" role="tablist" aria-label="Execution Mode">
         <button type="button" role="tab" data-mode-btn="before" aria-selected="true" class="is-selected">
-          <span class="mode-tab-title">Without FerricStore (Redis)</span>
-          <span class="mode-tab-badge bad">❌ 10,000 DB Queries (Postgres Crash &amp; 504 Outage)</span>
+          <span class="mode-tab-title">Without coordination</span>
+          <span class="mode-tab-badge bad">Each miss can query the database</span>
         </button>
         <button type="button" role="tab" data-mode-btn="after" aria-selected="false">
           <span class="mode-tab-title">With FerricStore</span>
-          <span class="mode-tab-badge good">✓ FETCH_OR_COMPUTE (1 DB Query ➔ coordinated waiter release)</span>
+          <span class="mode-tab-badge good">One query, then share the result</span>
         </button>
       </div>
     </header>
@@ -72,8 +72,8 @@
           <span class="metric-icon">🗄️</span>
           <small>DATABASE QUERIES RUN</small>
         </div>
-        <strong class="metric-val text-green" data-metric-queries>1 query in this run</strong>
-        <span class="metric-sub" data-metric-queries-sub>1 worker computes, 9,999 share</span>
+        <strong class="metric-val text-green" data-metric-queries>0 queries in this warm-cache run</strong>
+        <span class="metric-sub" data-metric-queries-sub>The value is already in memory</span>
       </div>
 
       <div class="metric-card">
@@ -81,8 +81,8 @@
           <span class="metric-icon">🔌</span>
           <small>DB CONNECTION POOL</small>
         </div>
-        <strong class="metric-val text-green" data-metric-pool>1 / 100 Connections (1%)</strong>
-        <span class="metric-sub" data-metric-pool-sub>Zero pool exhaustion</span>
+        <strong class="metric-val text-green" data-metric-pool>0 / 100 Connections (0%)</strong>
+        <span class="metric-sub" data-metric-pool-sub>No database connection needed</span>
       </div>
 
       <div class="metric-card">
@@ -91,7 +91,7 @@
           <small>CLIENT P99 LATENCY</small>
         </div>
         <strong class="metric-val text-cyan" data-metric-latency>Workload-dependent</strong>
-        <span class="metric-sub" data-metric-latency-sub>Immediate in-memory delivery</span>
+        <span class="metric-sub" data-metric-latency-sub>Timing depends on the workload</span>
       </div>
 
       <div class="metric-card">
@@ -100,7 +100,7 @@
           <small>DATABASE HEALTH</small>
         </div>
         <strong class="metric-val text-green" data-metric-health>Healthy in this model</strong>
-        <span class="metric-sub" data-metric-health-sub>Zero 504 Gateway Timeouts</span>
+        <span class="metric-sub" data-metric-health-sub>Healthy in this example</span>
       </div>
     </section>
 
@@ -123,7 +123,7 @@
         </header>
 
         <!-- Code Block: Before Mode -->
-        <pre class="code-block" data-code="before" hidden><code><span data-line="1"><b class="ln">1</b><span><i class="k">def</i> <i class="fn">get_product_page</i>(product_id: <i class="t">str</i>):</span></span>
+        <pre class="code-block" data-code="before"><code><span data-line="1"><b class="ln">1</b><span><i class="k">def</i> <i class="fn">get_product_page</i>(product_id: <i class="t">str</i>):</span></span>
 <span data-line="2"><b class="ln">2</b><span>    val = redis.<i class="fn">get</i>(f<q>"product:{product_id}"</q>)</span></span>
 <span data-line="3"><b class="ln">3</b><span>    <i class="k">if</i> val <i class="k">is None</i>:</span></span>
 <span data-line="4"><b class="ln">4</b><span>        <i class="c"># 💥 CACHE EXPIRED: 10,000 requests reach here simultaneously!</i></span></span>
@@ -133,7 +133,7 @@
 <span data-line="8"><b class="ln">8</b><span>    <i class="k">return</i> val</span></span></code></pre>
 
         <!-- Code Block: After Mode -->
-        <pre class="code-block" data-code="after"><code><span data-line="1"><b class="ln">1</b><span><i class="k">def</i> <i class="fn">get_product_page</i>(product_id: <i class="t">str</i>):</span></span>
+        <pre class="code-block" data-code="after" hidden><code><span data-line="1"><b class="ln">1</b><span><i class="k">def</i> <i class="fn">get_product_page</i>(product_id: <i class="t">str</i>):</span></span>
 <span data-line="2"><b class="ln">2</b><span>    <i class="c"># ✓ NATIVE FETCH_OR_COMPUTE HELPER:</i></span></span>
 <span data-line="3"><b class="ln">3</b><span>    <i class="c"># When cache expires, Worker #1 computes DB query ONCE.</i></span></span>
 <span data-line="4"><b class="ln">4</b><span>    <i class="c"># 9,999 other requests wait in memory and receive the computed value after it is committed!</i></span></span>
@@ -152,9 +152,9 @@
             <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>WARM CACHE HIT</b></span>
           </div>
           <div class="playback-controls">
-            <button class="stage-btn btn-primary" data-btn-warm title="Simulate Normal Warm Cache Hit">⚡ Warm Hit (in-memory path)</button>
-            <button class="stage-btn btn-danger" data-btn-stampede title="Simulate Cache Expiry + 10,000 Request Stampede">💥 10,000 Stampede</button>
-            <button class="stage-btn btn-ghost" data-btn-reset title="Reset Simulation">↺</button>
+            <button class="stage-btn btn-primary" data-btn-warm title="Read the value while it is still in memory">⚡ Read warm value</button>
+            <button class="stage-btn btn-danger" data-btn-stampede title="Expire the value and send 10,000 requests">💥 Expire key + send 10,000 requests</button>
+            <button class="stage-btn btn-ghost" data-btn-reset title="Reset the example">↺ Reset</button>
           </div>
         </header>
 
@@ -168,7 +168,7 @@
               <div class="a-head">
                 <span class="a-icon">👥</span>
                 <div>
-                  <strong>INCOMING USERS</strong>
+                  <strong>REQUESTS FOR ONE VALUE</strong>
                   <small data-req-sub>10,000 concurrent requests</small>
                 </div>
               </div>
@@ -186,8 +186,8 @@
               <div class="a-head">
                 <span class="a-icon">🛡️</span>
                 <div>
-                  <strong>FETCH_OR_COMPUTE</strong>
-                  <small data-barrier-sub>In-Memory Queue &amp; Lock</small>
+                  <strong data-barrier-title>CACHE REFRESH</strong>
+                  <small data-barrier-sub>FerricStore queues duplicate requests in memory</small>
                 </div>
               </div>
               <div class="a-metric-row">
@@ -204,8 +204,8 @@
               <div class="a-head">
                 <span class="a-icon">🗄️</span>
                 <div>
-                  <strong>POSTGRES DATABASE</strong>
-                  <small data-db-sub>Connection Pool: 100 Max</small>
+                  <strong>DATABASE</strong>
+                  <small data-db-sub>Postgres connection pool · 100 max</small>
                 </div>
               </div>
               <div class="a-metric-row">
@@ -222,11 +222,11 @@
           <!-- Live Event Terminal -->
           <div class="live-terminal-compact">
             <div class="term-head">
-              <span>📟 CACHE &amp; DATABASE ACCESS TELEMETRY</span>
-              <small>Real-time Stream</small>
+              <span>📟 CACHE AND DATABASE ACTIVITY</span>
+              <small>Activity log</small>
             </div>
             <div class="term-stream" data-term-stream>
-              <div class="term-row info">[00:00.000] Product cache key warm (TTL: 60s). Ready for traffic.</div>
+              <div class="term-row info">[00:00.000] Value is warm. TTL (time to live) has 60s in this example.</div>
             </div>
           </div>
 
@@ -234,8 +234,8 @@
           <div class="explanation-box">
             <div class="exp-icon" data-exp-icon>💡</div>
             <div class="exp-text">
-              <strong data-exp-title>Warm Cache Hit: In-Memory Response</strong>
-              <p data-exp-desc>Requests are served directly from RAM without touching the database. Click "💥 10,000 Stampede" to simulate an expired cache key!</p>
+              <strong data-exp-title>Read a value already in memory</strong>
+              <p data-exp-desc>Read warm value to serve it from memory. Then use Expire key + send 10,000 requests to compare the refresh paths.</p>
             </div>
           </div>
 
@@ -244,9 +244,9 @@
         <!-- Outcome Callout Footer -->
         <footer class="stage-footer">
           <div class="outcome-callout good" data-outcome-callout>
-            <small data-outcome-label>DOGPILING SHIELD OUTCOME</small>
-            <strong data-outcome-title>9,999 DATABASE QUERIES PREVENTED</strong>
-            <span data-outcome-sub>Worker #1 fetched from Postgres in 12ms. FerricStore broadcasted the result to all 9,999 waiting clients with 1 single DB query.</span>
+            <small data-outcome-label>THIS EXAMPLE</small>
+            <strong data-outcome-title>THE WARM VALUE NEEDS NO DATABASE QUERY</strong>
+            <span data-outcome-sub>Use the expiry action to see what changes when many requests need the same value at once.</span>
           </div>
         </footer>
       </article>
@@ -257,8 +257,8 @@
     <section class="arch-comparison-section">
       <div class="catastrophe-head">
         <span class="catastrophe-pill">⚖️ ARCHITECTURE COMPARISON</span>
-        <h2>How Cache Stampedes Are Handled: Redis vs. FerricStore</h2>
-        <p>Why modern high-traffic backends use native atomic dogpiling protection.</p>
+        <h2>How this 10,000-request example handles an expired value</h2>
+        <p>Compare an uncoordinated refresh with the native FerricStore helper.</p>
       </div>
 
       <div class="arch-table-card">
@@ -266,29 +266,29 @@
           <thead>
             <tr>
               <th>SCENARIO (10,000 CONCURRENT USERS)</th>
-              <th class="bad-col">❌ REDIS / MEMCACHED</th>
-              <th class="good-col">✓ FERRICSTORE (FETCH_OR_COMPUTE)</th>
+              <th class="bad-col">❌ WITHOUT COORDINATION</th>
+              <th class="good-col">✓ WITH FERRICSTORE</th>
             </tr>
           </thead>
           <tbody>
             <tr>
               <td><strong>Cache Expiry (Second 60)</strong></td>
-              <td class="bad-text">All 10,000 requests get cache MISS and simultaneously query Postgres.</td>
+              <td class="bad-text">All 10,000 requests miss the value and can query Postgres together.</td>
               <td class="good-text"><strong>Single Compute Lock:</strong> Worker #1 computes query; 9,999 requests wait in memory.</td>
             </tr>
             <tr>
               <td><strong>Database Impact</strong></td>
-              <td class="bad-text"><strong>10,000 queries run concurrently:</strong> Exhausts DB connection pools, causing 504 Gateway Timeouts.</td>
-              <td class="good-text"><strong>1 Query Total:</strong> Postgres executes 1 query in 12ms (0% connection spike).</td>
+              <td class="bad-text"><strong>10,000 queries in this model:</strong> The modeled 100-connection pool reaches its limit and clients time out.</td>
+              <td class="good-text"><strong>1 query in this model:</strong> Postgres executes 1 query in 12ms, then the waiting requests receive the stored result.</td>
             </tr>
             <tr>
               <td><strong>P99 Client Response Time</strong></td>
-              <td class="bad-text"><strong>18,400 ms (Timeout):</strong> Users stare at spinning loading wheels and error pages.</td>
+              <td class="bad-text"><strong>18,400 ms (modeled timeout):</strong> Some clients wait for an error response.</td>
               <td class="good-text"><strong>Coordinated release:</strong> Waiting clients receive the computed value after the single computation completes.</td>
             </tr>
             <tr>
               <td><strong>Application Code Complexity</strong></td>
-              <td class="bad-text">Requires complex distributed locks (Redlock), Lua scripts, or background refresh cron jobs.</td>
+              <td class="bad-text">The application needs its own refresh coordination, such as a lock or background refresh.</td>
               <td class="good-text"><strong>1 Simple Python Call:</strong> <code>ferric.fetch_or_compute(key, ttl, fn)</code>.</td>
             </tr>
           </tbody>
@@ -300,8 +300,8 @@
     <section class="catastrophe-section">
       <div class="catastrophe-head">
         <span class="catastrophe-pill">⚠️ THE HAZARD vs. HOW FERRICSTORE PREVENTS IT</span>
-        <h2>Why High-Traffic Cache Expirations Crash Databases</h2>
-        <p>Compare standard Redis dogpiling failure modes with FerricStore's native cache shield.</p>
+        <h2>What changes when a popular value expires</h2>
+        <p>These cards describe the same modeled scenario; measure your own workload before sizing production.</p>
       </div>
 
       <div class="catastrophe-grid">
@@ -309,15 +309,15 @@
         <div class="cat-card">
           <div class="cat-head-row">
             <span class="cat-icon">💥</span>
-            <h4>DB Connection Pool Collapse</h4>
+            <h4>Many requests reach the database</h4>
           </div>
           <div class="cat-body-block">
             <div class="hazard-box">
-              <strong class="hazard-lbl">💥 The Hazard (Redis / Memcached):</strong>
+              <strong class="hazard-lbl">Without coordination:</strong>
               <p>When a popular cache key expires, many web threads can open database connections together, exhaust the Postgres pool, and trigger an outage.</p>
             </div>
             <div class="prevention-box">
-              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <strong class="prevention-lbl">With FerricStore:</strong>
               <p><strong>Native Atomic Queueing:</strong> <code>FETCH_OR_COMPUTE</code> acquires a single in-process compute lease and queues all duplicate requests in memory until the first query finishes.</p>
             </div>
           </div>
@@ -331,15 +331,15 @@
         <div class="cat-card">
           <div class="cat-head-row">
             <span class="cat-icon">💸</span>
-            <h4>$5,000 Database Over-Provisioning</h4>
+            <h4>Illustrative database sizing cost</h4>
           </div>
           <div class="cat-body-block">
             <div class="hazard-box">
-              <strong class="hazard-lbl">💥 The Hazard (Unshielded Stacks):</strong>
-              <p>Teams spend $5,000/month upgrading to massive RDS Aurora db.r6g.16xlarge instances just to survive cache stampedes that last 2 seconds.</p>
+              <strong class="hazard-lbl">Illustrative scenario:</strong>
+              <p>A team might model a $5,000/month database tier to absorb a short 2-second surge. This figure is an example, not a measured cost claim.</p>
             </div>
             <div class="prevention-box">
-              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <strong class="prevention-lbl">With FerricStore:</strong>
               <p><strong>Single-flight refresh:</strong> Requests for the same expired key can share one refresh owner while others wait or serve stale data. Size the database from measured workload and failure behavior.</p>
             </div>
           </div>
@@ -353,15 +353,15 @@
         <div class="cat-card">
           <div class="cat-head-row">
             <span class="cat-icon">🛑</span>
-            <h4>Distributed Mutex Lock Deadlock</h4>
+            <h4>Refresh coordination must recover</h4>
           </div>
           <div class="cat-body-block">
             <div class="hazard-box">
-              <strong class="hazard-lbl">💥 The Hazard (Custom Redlock Code):</strong>
+              <strong class="hazard-lbl">Without a recovery path:</strong>
               <p>Developers try to solve dogpiling using Redis locks. If the worker crashes while computing, the lock is stuck and all 10,000 users hang forever.</p>
             </div>
             <div class="prevention-box">
-              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <strong class="prevention-lbl">With FerricStore:</strong>
               <p><strong>Fenced Timeout Hand-Off:</strong> FerricStore automatically expires the compute lease if the worker dies, seamlessly promoting the next queued request to complete the fetch.</p>
             </div>
           </div>
@@ -375,15 +375,15 @@
         <div class="cat-card">
           <div class="cat-head-row">
             <span class="cat-icon">⚡</span>
-            <h4>Delayed Broadcast Lag</h4>
+            <h4>Waiting requests need a result</h4>
           </div>
           <div class="cat-body-block">
             <div class="hazard-box">
-              <strong class="hazard-lbl">💥 The Hazard (Polling Loops):</strong>
+              <strong class="hazard-lbl">Polling approach:</strong>
               <p>Client applications sleep and poll Redis in a loop waiting for the cache to warm up, causing CPU thrashing and network latency spikes.</p>
             </div>
             <div class="prevention-box">
-              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <strong class="prevention-lbl">With FerricStore:</strong>
               <p><strong>Coordinated waiter release:</strong> After the compute callback returns, waiting clients receive the stored value; latency depends on workload and topology.</p>
             </div>
           </div>
@@ -396,8 +396,8 @@
     </section>
   </main>
 
-  <script src="./stampede.js?v=4"></script>
-  <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=16"></script>
+  <script src="./stampede.js?v=20260912c"></script>
+  <script src="../shared/accuracy.js?v=20260912c"></script>
+  <script src="../shared/dispatch.js?v=20260912c"></script>
 </body>
 </html>

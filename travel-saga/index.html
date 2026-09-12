@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Travel Booking & Reversible Sagas | FerricStore Demos</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css?v=3">
-  <link rel="stylesheet" href="../shared/polish.css">
-  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=20">
+  <link rel="stylesheet" href="./style.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/polish.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=20260912d">
 </head>
 <body class="fs-dispatch">
   <!--
@@ -22,7 +22,7 @@
   <nav class="top-nav">
     <div class="container nav-inner">
       <a href="../" class="nav-brand">
-        <span class="brand-icon">✈️</span>
+        <span class="brand-icon">F</span>
         <span>FerricStore</span>
         <span class="nav-tag">Distributed Sagas</span>
       </a>
@@ -32,60 +32,60 @@
 
   <main class="container">
     <header class="hero">
-      <div class="hero-pill">💸 DISTRIBUTED SAGA ENGINE</div>
+      <div class="hero-pill">BOOKING FLOW WITH EXPLICIT UNDO STEPS</div>
       <h1>Multi-Leg Booking &amp; <span class="hero-gradient">Reversible Sagas</span></h1>
       <p class="hero-desc">
         When a 4-step vacation checkout fails at the hotel step, you can't just throw an error. Model the rollback explicitly: FerricStore durably advances through compensation states that release seats, refund cards, and rebalance the ledger.
       </p>
     </header>
 
-    <section class="stage-card">
+    <section class="stage-card" aria-label="Travel booking and compensation simulator">
       <header class="stage-header">
         <div class="scenario-badge">
           <span class="badge-label">VACATION BUNDLE</span>
-          <strong>Flights + Marriott Hotel + Rental Car ($850.00)</strong>
+          <strong>Flight + hotel + car booking · $850</strong>
         </div>
         <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-          <button class="ctrl-btn scenario-choice is-selected" style="border-color: #ef4444; color: #fca5a5;" data-fail-hotel aria-pressed="true">🏨 Hotel Sold Out</button>
-          <button class="ctrl-btn scenario-choice" style="border-color: #f59e0b; color: #fde68a;" data-fail-flight aria-pressed="false">✈️ Delta HTTP 500</button>
-          <button class="ctrl-btn scenario-choice" style="border-color: #10b981; color: #6ee7b7;" data-success-run aria-pressed="false">✓ Happy Path</button>
+          <button class="ctrl-btn scenario-choice is-selected" style="border-color: #ef4444; color: #fca5a5;" data-fail-hotel aria-pressed="true">Hotel unavailable</button>
+          <button class="ctrl-btn scenario-choice" style="border-color: #f59e0b; color: #fde68a;" data-fail-flight aria-pressed="false">Flight request fails</button>
+          <button class="ctrl-btn scenario-choice" style="border-color: #10b981; color: #6ee7b7;" data-success-run aria-pressed="false">All bookings succeed</button>
         </div>
       </header>
 
       <div class="current-run" aria-live="polite">
-        <span>Current run</span>
-        <strong data-current-run-label>Hotel sold out</strong>
-        <small data-current-run-step>Step 1 of 5 · Customer Card Authorized ($850.00)</small>
+        <span>Preview</span>
+        <strong data-current-run-label>Hotel unavailable</strong>
+        <small data-current-run-step>Preview · Step 1 of 5 · Card authorized ($850)</small>
       </div>
 
       <!-- 4 Saga Stations Grid -->
-      <div class="saga-stations-grid">
-        <div class="saga-node is-active" data-saga-node="0">
+      <div class="saga-stations-grid" role="list" aria-label="Booking progress">
+        <div class="saga-node is-active" data-saga-node="0" role="listitem" aria-label="Card authorized. Active">
           <div class="sn-head"><span>STEP 1</span><span class="node-pill">ACTIVE</span></div>
-          <div class="sn-icon">💳</div>
-          <strong>1. Card Authorized</strong>
-          <small>Stripe API ($850)</small>
+          <div class="sn-icon" aria-hidden="true">CARD</div>
+          <strong>1. Card authorized</strong>
+          <small>Payment hold · $850</small>
         </div>
 
-        <div class="saga-node" data-saga-node="1">
+        <div class="saga-node" data-saga-node="1" role="listitem" aria-label="Flight seat reserved. Pending">
           <div class="sn-head"><span>STEP 2</span><span class="node-pill">PENDING</span></div>
-          <div class="sn-icon">✈️</div>
-          <strong>2. Flight Booked</strong>
-          <small>Delta Seat #14B</small>
+          <div class="sn-icon" aria-hidden="true">FLIGHT</div>
+          <strong>2. Flight seat reserved</strong>
+          <small>Seat 14B · $350</small>
         </div>
 
-        <div class="saga-node" data-saga-node="2">
+        <div class="saga-node" data-saga-node="2" role="listitem" aria-label="Hotel room reserved. Pending">
           <div class="sn-head"><span>STEP 3</span><span class="node-pill">PENDING</span></div>
-          <div class="sn-icon">🏨</div>
-          <strong>3. Hotel Reserved</strong>
-          <small>Marriott King Suite</small>
+          <div class="sn-icon" aria-hidden="true">HOTEL</div>
+          <strong>3. Hotel room reserved</strong>
+          <small>King suite · $350</small>
         </div>
 
-        <div class="saga-node" data-saga-node="3">
+        <div class="saga-node" data-saga-node="3" role="listitem" aria-label="Car rental booked. Pending">
           <div class="sn-head"><span>STEP 4</span><span class="node-pill">PENDING</span></div>
-          <div class="sn-icon">🚗</div>
-          <strong>4. Car Rental</strong>
-          <small>Hertz SUV</small>
+          <div class="sn-icon" aria-hidden="true">CAR</div>
+          <strong>4. Car rental booked</strong>
+          <small>SUV · $150</small>
         </div>
       </div>
 
@@ -94,33 +94,33 @@
         <!-- Financial Ledger Card -->
         <div class="ledger-box">
           <div style="font-size: 11.5px; font-weight: 800; color: #94a3b8; text-transform: uppercase; margin-bottom: 12px;">
-            📊 Live Double-Entry Financial Ledger
+            Booking ledger · live values
           </div>
           <div class="ledger-row">
-            <span>Customer Card Charge</span>
+            <span>Customer payment hold</span>
             <strong data-ledger-charge>+$850.00</strong>
           </div>
           <div class="ledger-row">
-            <span>Delta Airlines Authorization</span>
+            <span>Flight seat authorization</span>
             <strong data-ledger-flight>$0.00</strong>
           </div>
           <div class="ledger-row">
-            <span>Marriott Hotel Hold</span>
+            <span>Hotel room hold</span>
             <strong data-ledger-hotel>$0.00</strong>
           </div>
           <div class="ledger-row">
-            <span>Compensating Refunds Issued</span>
+            <span>Refunds sent</span>
             <strong style="color: #fca5a5;" data-ledger-refund>$0.00</strong>
           </div>
           <div class="ledger-row total">
-            <span>Net Unbalanced Liability</span>
+            <span>Amount still unsettled</span>
             <strong data-ledger-balance>$850.00</strong>
           </div>
         </div>
 
         <!-- Narrative Box -->
         <div class="saga-narrative-box">
-          <div class="saga-badge good" data-narrative-badge>💳 STEP 1: PAYMENT OK</div>
+          <div class="saga-badge good" data-narrative-badge>PAYMENT CONFIRMED</div>
           <h3 style="margin: 0 0 6px; font-size: 18px;" data-narrative-title>1. Customer Card Authorized ($850.00)</h3>
           <p style="margin: 0 0 12px; font-size: 13.5px; color: var(--text-muted);" data-narrative-desc>
             Stripe payment succeeded with a stable provider idempotency key; refund is an explicit state.
@@ -135,37 +135,37 @@
       <!-- Live Telemetry -->
       <div class="telemetry-grid">
         <div class="telemetry-card">
-          <small>Compensation State</small>
+            <small>Next action</small>
           <div class="telemetry-val" style="color: #34d399;" data-val-comp>Normal Flow</div>
-          <span class="telemetry-sub">Zero rollbacks needed</span>
+            <span class="telemetry-sub">What the workflow does next</span>
         </div>
         <div class="telemetry-card">
-          <small>Orphaned Holds / Stranded $</small>
+            <small>Unreturned holds</small>
           <div class="telemetry-val" style="color: #34d399;" data-val-stranded>$0.00</div>
-          <span class="telemetry-sub">Explicit durable transitions</span>
+            <span class="telemetry-sub">Money still waiting to be settled</span>
         </div>
         <div class="telemetry-card">
-          <small>Rollback Cadence</small>
+            <small>Undo order</small>
           <div class="telemetry-val" data-val-cadence>Pending</div>
-          <span class="telemetry-sub">LIFO unwind sequence</span>
+            <span class="telemetry-sub">Most recent booking is undone first</span>
         </div>
         <div class="telemetry-card">
-          <small>Execution Latency</small>
+            <small>Transition timing</small>
           <div class="telemetry-val" style="color: #38bdf8;" data-val-latency>Deployment-dependent</div>
-          <span class="telemetry-sub">Topology-dependent latency</span>
+            <span class="telemetry-sub">Depends on deployment settings</span>
         </div>
       </div>
 
       <!-- Controls -->
       <footer class="stage-footer">
         <div class="ctrl-btn-group">
-          <button class="ctrl-btn" data-prev>⏮ Prev</button>
-          <button class="ctrl-btn" data-pause>⏸ Pause</button>
-          <button class="ctrl-btn" data-next>Next ⏭</button>
-          <button class="ctrl-btn" data-replay>↺ Replay</button>
+          <button class="ctrl-btn" data-prev aria-label="Show previous booking step">Previous</button>
+          <button class="ctrl-btn" data-pause aria-label="Pause or play the booking flow">Pause</button>
+          <button class="ctrl-btn" data-next aria-label="Show next booking step">Next</button>
+          <button class="ctrl-btn" data-replay aria-label="Replay the selected booking path">Replay</button>
         </div>
         <div style="font-size: 13px; color: var(--text-dim);" data-live-status>
-          Auto-advancing simulation
+          Preview ready · choose Run to play
         </div>
       </footer>
     </section>
@@ -227,8 +227,8 @@ saga.start("trip-42", payload={"customer_id": "customer-42"})
 saga.worker().run()</code></pre>
     </section>
   </main>
-  <script src="./saga.js?v=6"></script>
-  <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=16"></script>
+  <script src="./saga.js?v=20260912c"></script>
+  <script src="../shared/accuracy.js?v=20260912c"></script>
+  <script src="../shared/dispatch.js?v=20260912c"></script>
 </body>
 </html>

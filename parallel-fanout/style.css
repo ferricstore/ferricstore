@@ -505,3 +505,127 @@ body {
   20%, 60% { transform: translateX(-6px); }
   40%, 80% { transform: translateX(6px); }
 }
+
+/* Clarity pass: keep the recovery controls readable after the shared dispatch shell moves them. */
+body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .stage-actions {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
+
+body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .playback-help {
+  max-width: 48ch;
+  margin: 0;
+  color: var(--fs-ink-soft) !important;
+  font-size: 15px;
+  line-height: 1.4;
+  text-align: right;
+}
+
+body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .playback-controls {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .stage-btn {
+  min-height: 44px !important;
+  height: auto;
+  max-width: 100%;
+  padding: 9px 12px;
+  line-height: 1.25;
+  white-space: normal;
+}
+
+body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .stage-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  transform: none !important;
+}
+
+body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .stage-meta-left {
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .run-id-pill {
+  overflow-wrap: anywhere;
+  color: var(--fs-ink-soft) !important;
+}
+
+body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .run-id-pill strong {
+  color: var(--fs-ink) !important;
+}
+
+body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .metric-val {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 780px) {
+  body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .stage-header {
+    display: grid !important;
+    grid-template-columns: minmax(0, 1fr) !important;
+    gap: 12px !important;
+    align-items: start !important;
+  }
+
+  body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .playback-help {
+    max-width: none;
+    text-align: left;
+  }
+
+  body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .playback-controls {
+    display: grid !important;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .stage-btn {
+    width: 100% !important;
+    justify-content: center !important;
+  }
+
+  body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .visualizer-content {
+    padding: 14px !important;
+  }
+
+  body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .chunks-header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .chunk-tile .c-status {
+    overflow-wrap: anywhere;
+  }
+}
+
+@media (max-width: 520px) {
+  body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .playback-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .stage-btn {
+    justify-content: flex-start !important;
+    text-align: left;
+  }
+
+  body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .tiles-16-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .chunk-tile {
+    padding-inline: 4px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .stage-btn,
+  body.fs-dispatch[data-fs-demo="parallel-fanout"] .fs-experiment .chunk-tile {
+    animation: none !important;
+    transition: none !important;
+  }
+}

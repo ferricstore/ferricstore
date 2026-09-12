@@ -3,7 +3,7 @@
 
   var activeArch = "memory";
   var currentStep = 0;
-  var isPaused = false;
+  var isPaused = true;
   var timer = null;
 
   var activeChoreoTab = "dualwrite";
@@ -18,11 +18,11 @@
   "memory": [
     {
       "step": 0,
-      "title": "1. \ud83d\udcb3 Payment Authorized ($200.00)",
-      "badge": "VOLATILE PROCESS RAM",
+      "title": "1. Charge $200.00",
+      "badge": "PROGRESS IN MEMORY",
       "badgeClass": "badge-bad",
       "avatar": "\ud83d\udcb3",
-      "desc": "FastAPI background task charges $200 to customer card. The transaction ID is stored solely in process heap RAM.",
+      "desc": "The background task charges $200, but its transaction ID lives only in process memory.",
       "billed": "$200.00",
       "billedSub": "Billed in RAM only",
       "tokens": "0",
@@ -31,16 +31,16 @@
       "latencySub": "Local RAM memory",
       "reliability": "20% (F)",
       "reliabilityClass": "is-danger",
-      "n3Title": "4. Task Vanishes",
-      "n3Desc": "0% Recovery"
+      "n3Title": "4. Task is lost",
+      "n3Desc": "No recovery"
     },
     {
       "step": 1,
-      "title": "2. \ud83e\udd16 LLM Inference Executing ($0.45)",
-      "badge": "VOLATILE PROCESS RAM",
+      "title": "2. Generate the AI summary ($0.45)",
+      "badge": "PROGRESS IN MEMORY",
       "badgeClass": "badge-bad",
       "avatar": "\ud83e\udd16",
-      "desc": "OpenAI generates summary using 1,500 tokens. Output text is held in Python memory.",
+      "desc": "The AI service generates a 1,500-token summary. The result is held only in process memory.",
       "billed": "$200.00",
       "billedSub": "Billed in RAM only",
       "tokens": "1,500",
@@ -49,16 +49,16 @@
       "latencySub": "Local RAM memory",
       "reliability": "20% (F)",
       "reliabilityClass": "is-danger",
-      "n3Title": "4. Task Vanishes",
-      "n3Desc": "0% Recovery"
+      "n3Title": "4. Task is lost",
+      "n3Desc": "No recovery"
     },
     {
       "step": 2,
-      "title": "3. \ud83d\udca5 Server Dies (Process Memory Wiped!)",
-      "badge": "\ud83d\udca5 COMPLETE MEMORY AMNESIA",
+      "title": "3. Server stops; memory is cleared",
+      "badge": "MEMORY LOST",
       "badgeClass": "badge-bad",
       "avatar": "\ud83d\udca5",
-      "desc": "Server crashes due to memory pressure (OOM) or spot termination. All Python heap state is instantly erased from existence!",
+      "desc": "The server stops. Everything held in process memory disappears.",
       "billed": "$200.00 (Customer Charged)",
       "billedSub": "Ghost charge without record",
       "tokens": "1,500 (Wasted)",
@@ -67,16 +67,16 @@
       "latencySub": "No retry mechanism",
       "reliability": "0% (FAILED)",
       "reliabilityClass": "is-danger",
-      "n3Title": "4. Task Vanishes",
-      "n3Desc": "0% Recovery"
+      "n3Title": "4. Task is lost",
+      "n3Desc": "No recovery"
     },
     {
       "step": 3,
-      "title": "4. \ud83d\udc80 Complete Task Loss (Ghost Charge)",
-      "badge": "\ud83d\udc80 DISASTER FAILURE",
+      "title": "4. Task lost after the charge",
+      "badge": "NO RECOVERY",
       "badgeClass": "badge-bad",
       "avatar": "\ud83d\udcb8",
-      "desc": "No background supervisor exists. The customer was charged $200, 1,500 tokens were burned, but the receipt was never sent and no order record exists.",
+      "desc": "The customer was charged $200 and 1,500 tokens were used, but the receipt was never sent and no order record remains.",
       "billed": "$200.00 (Stolen Money!)",
       "billedSub": "Unfulfilled transaction",
       "tokens": "1,500 (Lost)",
@@ -85,18 +85,18 @@
       "latencySub": "Permanent data loss",
       "reliability": "0% (FAILED)",
       "reliabilityClass": "is-danger",
-      "n3Title": "4. Ghost Order",
-      "n3Desc": "Lost Forever"
+      "n3Title": "4. Order is lost",
+      "n3Desc": "Not recovered"
     }
   ],
   "queue": [
     {
       "step": 0,
-      "title": "1. \ud83d\udcb3 Worker 1 Charges $200.00 via SQS",
-      "badge": "CHOREOGRAPHY STEP 1",
+      "title": "1. Worker charges $200.00",
+      "badge": "MESSAGE QUEUE",
       "badgeClass": "badge-warn",
       "avatar": "\ud83d\udcec",
-      "desc": "Worker 1 pulls message from payment_queue and executes Stripe API call for $200. Prepares to forward message to llm_queue.",
+      "desc": "A worker reads the payment message, charges $200, and prepares the next message.",
       "billed": "$200.00",
       "billedSub": "Initial charge",
       "tokens": "0",
@@ -105,16 +105,16 @@
       "latencySub": "Queue polling latency",
       "reliability": "45% (C)",
       "reliabilityClass": "is-danger",
-      "n3Title": "4. SQS Dual-Write Trap",
-      "n3Desc": "Double Billed!"
+      "n3Title": "4. Retry can repeat the charge",
+      "n3Desc": "Possible duplicate"
     },
     {
       "step": 1,
-      "title": "2. \ud83e\udd16 Worker 2 Runs LLM from llm_queue",
-      "badge": "BLACK-BOX CHOREOGRAPHY",
+      "title": "2. Worker generates the AI summary",
+      "badge": "MESSAGE QUEUE",
       "badgeClass": "badge-warn",
       "avatar": "\ud83e\udd16",
-      "desc": "Message arrives in llm_queue. Worker 2 calls OpenAI API ($0.45). State is scattered across queues with zero central observability.",
+      "desc": "The next worker calls the AI service for $0.45. Progress is spread across separate messages.",
       "billed": "$200.00",
       "billedSub": "Initial charge",
       "tokens": "1,500",
@@ -123,16 +123,16 @@
       "latencySub": "Queue polling latency",
       "reliability": "45% (C)",
       "reliabilityClass": "is-danger",
-      "n3Title": "4. SQS Dual-Write Trap",
-      "n3Desc": "Double Billed!"
+      "n3Title": "4. Retry can repeat the charge",
+      "n3Desc": "Possible duplicate"
     },
     {
       "step": 2,
-      "title": "3. \ud83d\udca5 Crash Between Steps (The Dual-Write Trap!)",
-      "badge": "\u26a0\ufe0f DUAL-WRITE PARTIAL FAILURE",
+      "title": "3. Server stops between messages",
+      "badge": "NEXT MESSAGE NOT SENT",
       "badgeClass": "badge-warn",
       "avatar": "\ud83d\udca5",
-      "desc": "Worker dies after payment before publishing to the next queue (or visibility timeout expires). SQS redelivers the unacknowledged message.",
+      "desc": "The worker stops after the payment but before sending the next message. The queue later retries the original message.",
       "billed": "$200.00",
       "billedSub": "Step 1 already completed",
       "tokens": "1,500",
@@ -141,16 +141,16 @@
       "latencySub": "Waiting for queue timeout",
       "reliability": "35% (POOR)",
       "reliabilityClass": "is-danger",
-      "n3Title": "4. SQS Dual-Write Trap",
-      "n3Desc": "Double Billed!"
+      "n3Title": "4. Retry starts at the first message",
+      "n3Desc": "Whole job repeats"
     },
     {
       "step": 3,
-      "title": "4. \ud83d\udea8 Redelivery Triggers Duplicate Charge ($400)!",
-      "badge": "\ud83d\udea8 OBSERVABILITY & 2X DISASTER",
+      "title": "4. Retry charges the card again ($400)",
+      "badge": "WHOLE MESSAGE RETRIED",
       "badgeClass": "badge-bad",
       "avatar": "\ud83d\ude31",
-      "desc": "Worker 1b re-consumes from payment_queue and charges card AGAIN ($400 total)! Order state is scattered across 4 queues and DLQs.",
+      "desc": "A replacement reads the original message and charges the card again, making $400 total. The full history is split across queues.",
       "billed": "$400.00 (2x DOUBLE BILL!)",
       "billedSub": "Duplicate charge penalty",
       "tokens": "3,000 (2x Consumed)",
@@ -159,18 +159,18 @@
       "latencySub": "30s visibility timeout penalty",
       "reliability": "35% (POOR)",
       "reliabilityClass": "is-danger",
-      "n3Title": "4. Double Billed",
-      "n3Desc": "$400 Penalty!"
+      "n3Title": "4. Card charged twice",
+      "n3Desc": "$400 total"
     }
   ],
   "db": [
     {
       "step": 0,
-      "title": "1. \ud83d\udcb3 Worker Charges $200 & Updates SQL Row",
-      "badge": "SQL ROW LOCKED",
+      "title": "1. Worker charges $200 and saves a row",
+      "badge": "ROW SAVED",
       "badgeClass": "badge-warn",
       "avatar": "\ud83d\uddc4\ufe0f",
-      "desc": "Worker 1 locks job row with FOR UPDATE and updates status=PAID in Postgres database.",
+      "desc": "The worker charges $200 and records the payment in a database row.",
       "billed": "$200.00",
       "billedSub": "Recorded in DB table",
       "tokens": "0",
@@ -179,16 +179,16 @@
       "latencySub": "SQL write roundtrip",
       "reliability": "75% (B)",
       "reliabilityClass": "",
-      "n3Title": "4. Cron Recovery",
-      "n3Desc": "15s Polling Delay"
+      "n3Title": "4. Scheduled recovery",
+      "n3Desc": "Waits for the next poll"
     },
     {
       "step": 1,
-      "title": "2. \ud83e\udd16 Worker Executes LLM Inference",
-      "badge": "SQL ROW LOCKED",
+      "title": "2. Worker generates the AI summary",
+      "badge": "ROW SAVED",
       "badgeClass": "badge-warn",
       "avatar": "\ud83e\udd16",
-      "desc": "Worker 1 calls OpenAI API and prepares to write status=INFERRED into database.",
+      "desc": "The worker calls the AI service and prepares to save the new status.",
       "billed": "$200.00",
       "billedSub": "Recorded in DB table",
       "tokens": "1,500",
@@ -197,16 +197,16 @@
       "latencySub": "SQL write roundtrip",
       "reliability": "75% (B)",
       "reliabilityClass": "",
-      "n3Title": "4. Cron Recovery",
-      "n3Desc": "15s Polling Delay"
+      "n3Title": "4. Scheduled recovery",
+      "n3Desc": "Waits for the next poll"
     },
     {
       "step": 2,
-      "title": "3. \ud83d\udca5 Worker Dies (Advisory Lock Hanging!)",
-      "badge": "\ud83d\udc22 ADVISORY LOCK TIMEOUT",
+      "title": "3. Worker stops while saving",
+      "badge": "ROW LOCK RELEASES LATER",
       "badgeClass": "badge-warn",
       "avatar": "\ud83d\udca5",
-      "desc": "Worker crashes while holding database lock. The heartbeat / lease must expire before cron poller can safely touch the row.",
+      "desc": "The worker stops before the next save. The scheduled checker waits for the old lock to expire.",
       "billed": "$200.00",
       "billedSub": "Safe on disk",
       "tokens": "1,500",
@@ -215,16 +215,16 @@
       "latencySub": "Waiting for cron interval",
       "reliability": "65% (B)",
       "reliabilityClass": "",
-      "n3Title": "4. Cron Recovery",
-      "n3Desc": "15s Polling Delay"
+      "n3Title": "4. Scheduled recovery",
+      "n3Desc": "Waits for the next poll"
     },
     {
       "step": 3,
-      "title": "4. \ud83d\udc22 Cron Poller Resumes (15s Latency Delay)",
-      "badge": "\u2713 RECOVERED (HIGH LATENCY)",
+      "title": "4. Scheduled checker resumes (15s delay)",
+      "badge": "RECOVERED AFTER A WAIT",
       "badgeClass": "badge-warn",
       "avatar": "\ud83d\udc22",
-      "desc": "Cron poller wakes up after 15 seconds, detects stale lock, reads status column, and delivers receipt. Avoided double-charge, but introduced severe polling lag and database lock contention.",
+      "desc": "The checker wakes after 15 seconds, sees the saved row, and delivers the receipt. It avoids a duplicate charge but adds polling delay.",
       "billed": "$200.00 (stable key)",
       "billedSub": "No duplicate charge",
       "tokens": "1,500",
@@ -233,82 +233,82 @@
       "latencySub": "Cron polling lag",
       "reliability": "70% (MEDIOCRE)",
       "reliabilityClass": "",
-      "n3Title": "4. Slow Cron",
-      "n3Desc": "15s Lag"
+      "n3Title": "4. Recovered after waiting",
+      "n3Desc": "15s delay"
     }
   ],
   "workflow": [
     {
       "step": 0,
-      "title": "1. \ud83d\udcb3 Guarded Payment State ($200.00)",
-      "badge": "DURABLE STATE + PROVIDER KEY",
+      "title": "1. Saved payment ($200.00)",
+      "badge": "SAVED STATE + PROVIDER KEY",
       "badgeClass": "badge-good",
       "avatar": "\ud83d\udcb3",
-      "desc": "The handler reuses one Stripe idempotency key for this logical charge and records the resulting workflow transition durably.",
+      "desc": "The worker reuses one Stripe idempotency key and saves the payment state before continuing.",
       "billed": "$200.00",
       "billedSub": "Stable Stripe key reused",
       "tokens": "0",
       "tokensSub": "Awaiting LLM step",
-      "latency": "Durable commit",
+      "latency": "Saved state",
       "latencySub": "Topology dependent",
       "reliability": "Configured durability",
       "reliabilityClass": "is-success",
-      "n3Title": "Recovery after reclaim",
+      "n3Title": "Recovery after takeover",
       "n3Desc": "Provider key reused"
     },
     {
       "step": 1,
-      "title": "2. \ud83e\udd16 Guarded LLM Result Stored",
-      "badge": "DURABLE STATE + EFFECT GUARD",
+      "title": "2. Saved AI summary",
+      "badge": "SAVED STATE + EFFECT GUARD",
       "badgeClass": "badge-good",
       "avatar": "\ud83e\udd16",
-      "desc": "A stable effect digest guards the model call; the successful transition stores the generated result for the next state.",
+      "desc": "A stable effect ID guards the model call; the saved result is ready for the next state.",
       "billed": "$200.00",
       "billedSub": "Payment provider key reused",
       "tokens": "1,500",
-      "tokensSub": "Saved to disk log",
-      "latency": "Durable commit",
+      "tokensSub": "Saved result",
+      "latency": "Saved state",
       "latencySub": "Topology dependent",
       "reliability": "Configured durability",
       "reliabilityClass": "is-success",
-      "n3Title": "Current state retained",
-      "n3Desc": "Effect digest reused"
+      "n3Title": "Saved result retained",
+      "n3Desc": "Effect ID reused"
     },
     {
       "step": 2,
-      "title": "3. \ud83d\udca5 Worker 1 Dies (Committed State Retained)",
-      "badge": "\ud83d\udee1\ufe0f SHIELDED BY FERRICSTORE",
+      "title": "3. Server stops; saved progress remains",
+      "badge": "SAVED PROGRESS",
       "badgeClass": "badge-good",
       "avatar": "\ud83d\udee1\ufe0f",
-      "desc": "Previously committed outputs remain in the Raft log. A newer fencing token rejects stale workflow-state writes after reclaim.",
+      "desc": "Earlier results remain saved. A newer owner number blocks an old worker from writing after takeover.",
       "billed": "$200.00",
       "billedSub": "Provider key remains stable",
       "tokens": "1,500",
       "tokensSub": "Committed result retained",
       "latency": "After reclaim",
-      "latencySub": "Lease and worker dependent",
-      "reliability": "Fenced recovery",
+      "latencySub": "Depends on takeover timing",
+      "reliability": "Saved progress",
       "reliabilityClass": "is-success",
-      "n3Title": "4. New fenced claim",
-      "n3Desc": "Stale writes rejected"
+      "n3Title": "4. New owner continues",
+      "n3Desc": "Old write blocked"
     },
     {
       "step": 3,
-      "title": "4. \ud83d\ude80 Replacement Worker Resumes After Reclaim",
-      "badge": "\u2713 DURABLE COMPLETION + GUARDED EFFECTS",
+      "title": "4. Replacement continues from saved state",
+      "badge": "COMPLETED + OUTSIDE CALLS GUARDED",
       "badgeClass": "badge-good",
       "avatar": "\ud83c\udf89",
-      "desc": "Worker 2 claims the current durable state with a newer fence. Stable provider keys or ctx.effect protect external payment and delivery calls.",
+      "desc": "The replacement starts at the current saved state. Stable provider keys or ctx.effect still protect outside payment and delivery calls.",
       "billed": "$200.00 (provider key)",
       "billedSub": "effect protected separately",
       "tokens": "1,500 stored",
       "tokensSub": "Effect digest protects retry",
-      "latency": "Lease-based reclaim",
+      "latency": "Takeover and resume",
       "latencySub": "Configuration dependent",
-      "reliability": "Durable + guarded",
+      "reliability": "Saved + guarded",
       "reliabilityClass": "is-success",
       "n3Title": "4. Guarded $200",
-      "n3Desc": "Happy Customer"
+      "n3Desc": "Customer receives it"
     }
   ]
 };
@@ -395,6 +395,8 @@
 
   function render() {
     var list = paradigmData[activeArch];
+    if (prevBtn) prevBtn.disabled = currentStep === 0;
+    if (nextBtn) nextBtn.disabled = currentStep >= list.length - 1;
     if (currentStep >= list.length) currentStep = 0;
     var data = list[currentStep];
 
@@ -448,13 +450,17 @@
     if (subLatency) subLatency.textContent = data.latencySub;
 
     if (valReliability) valReliability.textContent = data.reliability;
-    if (subReliability) subReliability.textContent = data.reliabilityClass === "is-success" ? "Durable state boundary" : "Vulnerable to failure";
+    if (subReliability) subReliability.textContent = data.reliabilityClass === "is-success" ? "Saved-state boundary" : "Vulnerable to failure";
     if (cardReliability) {
       cardReliability.className = "telemetry-card " + data.reliabilityClass;
     }
 
-    if (pauseBtn) pauseBtn.textContent = isPaused ? "▶ Play" : "⏸ Pause";
-    if (liveStatusText) liveStatusText.textContent = isPaused ? "Paused" : "Auto-advancing simulation";
+    if (pauseBtn) pauseBtn.textContent = isPaused ? "▶ Play steps" : "⏸ Pause";
+    if (liveStatusText) {
+      liveStatusText.textContent = currentStep >= list.length - 1
+        ? "Complete — reset to run again"
+        : (isPaused ? "Paused — choose Next step or Play steps" : "Playing steps");
+    }
   }
 
   function clearTimer() {
@@ -466,10 +472,11 @@
 
   function schedule() {
     clearTimer();
-    if (isPaused) return;
+    if (isPaused || currentStep >= paradigmData[activeArch].length - 1) return;
     var wait = currentStep === 2 ? 3200 : (currentStep === 3 ? 4200 : 2200);
     timer = window.setTimeout(function () {
-      currentStep = (currentStep + 1) % paradigmData[activeArch].length;
+      currentStep = Math.min(currentStep + 1, paradigmData[activeArch].length - 1);
+      if (currentStep >= paradigmData[activeArch].length - 1) isPaused = true;
       render();
       schedule();
     }, wait);
@@ -477,18 +484,22 @@
 
   archButtons.forEach(function (btn) {
     btn.addEventListener("click", function () {
+      clearTimer();
       activeArch = btn.dataset.arch;
       currentStep = 0;
+      isPaused = true;
       render();
-      schedule();
     });
   });
 
   stepNodes.forEach(function (node, idx) {
+    node.setAttribute("role", "button");
+    node.tabIndex = 0;
     function jump() {
+      clearTimer();
       currentStep = idx;
+      isPaused = true;
       render();
-      schedule();
     }
     node.addEventListener("click", jump);
     node.addEventListener("keydown", function (e) {
@@ -501,14 +512,17 @@
 
   if (crashBtn) {
     crashBtn.addEventListener("click", function () {
+      clearTimer();
       currentStep = 2;
+      isPaused = true;
       render();
-      schedule();
     });
   }
 
   if (pauseBtn) {
     pauseBtn.addEventListener("click", function () {
+      clearTimer();
+      if (currentStep >= paradigmData[activeArch].length - 1 && isPaused) currentStep = 0;
       isPaused = !isPaused;
       render();
       schedule();
@@ -517,28 +531,30 @@
 
   if (prevBtn) {
     prevBtn.addEventListener("click", function () {
+      clearTimer();
       var len = paradigmData[activeArch].length;
-      currentStep = (currentStep - 1 + len) % len;
+      currentStep = Math.max(0, currentStep - 1);
+      isPaused = true;
       render();
-      schedule();
     });
   }
 
   if (nextBtn) {
     nextBtn.addEventListener("click", function () {
+      clearTimer();
       var len = paradigmData[activeArch].length;
-      currentStep = (currentStep + 1) % len;
+      currentStep = Math.min(currentStep + 1, len - 1);
+      isPaused = true;
       render();
-      schedule();
     });
   }
 
   if (replayBtn) {
     replayBtn.addEventListener("click", function () {
+      clearTimer();
       currentStep = 0;
-      isPaused = false;
+      isPaused = true;
       render();
-      schedule();
     });
   }
 
@@ -568,5 +584,4 @@
 
   render();
   renderChoreo();
-  schedule();
 })();

@@ -3,14 +3,15 @@
 
   var currentStep = 0;
   var isPaused = false;
+  var hasStarted = false;
   var timer = null;
 
   var stepsData = [
   {
-    "badge": "\ud83d\udd0d RESEARCH AGENT ACTIVE",
+    "badge": "RESEARCH IN PROGRESS",
     "badgeClass": "good",
-    "title": "1. Multi-Source Competitor Research",
-    "desc": "Scraping 24 competitor ad accounts and keyword bids. Step result is durably cached in FerricStore disk log.",
+    "title": "1. Research campaign",
+    "desc": "The workflow collects competitor data. This step is saved durably so a replacement worker can continue from it.",
     "code": "return transition('draft_plan', payload={'competitors': competitors})",
     "cpu": "14.2%",
     "ram": "42 MB",
@@ -18,10 +19,10 @@
     "resume": "After claim"
   },
   {
-    "badge": "\ud83d\udcdd LLM INFERENCE ACTIVE",
+    "badge": "DRAFT IN PROGRESS",
     "badgeClass": "good",
-    "title": "2. Drafting $50,000 Marketing Campaign",
-    "desc": "LLM generates campaign strategy. Posts a guarded Slack notification containing ctx.id and transitions to 'await_approval'.",
+    "title": "2. Draft campaign",
+    "desc": "The model creates the campaign and sends a Slack approval request. The workflow then moves to its saved approval state.",
     "code": "slack.post_approval_request(channel='#finance-approvals', job_id=ctx.id, plan=plan, idempotency_key=f'{ctx.id}:approval:v1')\nreturn transition('await_approval', payload={'plan': plan})",
     "cpu": "28.5%",
     "ram": "68 MB",
@@ -29,10 +30,10 @@
     "resume": "After claim"
   },
   {
-    "badge": "\u23f8\ufe0f STATE: AWAIT_APPROVAL",
+    "badge": "WAITING FOR APPROVAL",
     "badgeClass": "warn",
-    "title": "3. Waiting for Slack Webhook Signal",
-    "desc": "Workflow is persisted in 'await_approval'. No application handler remains blocked while a durable external signal is pending.",
+    "title": "3. Wait for approval",
+    "desc": "The workflow is saved in await_approval. No application handler stays blocked while the person decides.",
     "code": "# Persisted in state 'await_approval'; handler returned",
     "cpu": "No handler",
     "ram": "Durable state",
@@ -40,10 +41,10 @@
     "resume": "After signal"
   },
   {
-    "badge": "\ud83d\udca5 CRASH RESILIENCE TEST",
+    "badge": "HOST RESTARTED",
     "badgeClass": "warn",
-    "title": "4. Simulating Cloud Host Crash While Parked",
-    "desc": "The host server was killed. The committed approval state remains durable. A compatible worker can reclaim the workflow after the signal and lease rules allow it.",
+    "title": "4. Host restarts while paused",
+    "desc": "The host stops while the workflow is waiting. The saved approval state remains; a compatible worker can reclaim it when the signal and lease rules allow.",
     "code": "# Host crashed - State safe in Raft log. Ready for incoming signal webhook",
     "cpu": "No handler",
     "ram": "Durable state",
@@ -51,10 +52,10 @@
     "resume": "Lease-dependent"
   },
   {
-    "badge": "\ud83d\ude80 SIGNAL RECEIVED \u2794 LAUNCHING",
+    "badge": "APPROVAL RECEIVED · LAUNCHING",
     "badgeClass": "good",
-    "title": "5. Webhook Sends a State-Guarded Approval Signal",
-    "desc": "The CFO approved in Slack. The webhook records a deduplicated signal only while the workflow is still awaiting approval, then advances it to launch_campaign.",
+    "title": "5. Launch after approval",
+    "desc": "The approval signal arrives from Slack. It is accepted only while the workflow is waiting, then advances the workflow to launch_campaign.",
     "code": "action_id = payload['action_id']\nclient.signal(job_id, signal='approved', if_state='await_approval', transition_to='launch_campaign', values={'approved_by': payload['user']}, idempotency_key=f'{job_id}:approve:{action_id}:v1')",
     "cpu": "6.4%",
     "ram": "24 MB",
@@ -93,6 +94,10 @@
       var isActive = idx === currentStep;
       node.classList.toggle("is-done", isDone);
       node.classList.toggle("is-active", isActive);
+      node.setAttribute("aria-pressed", String(isActive));
+      if (isActive) node.setAttribute("aria-current", "step");
+      else node.removeAttribute("aria-current");
+      node.setAttribute("aria-label", stepsData[idx].title.replace(/^\d+\.\s*/, "") + ". " + (isActive ? "Active" : (isDone ? "Complete" : "Pending")));
 
       var pill = node.querySelector(".node-pill");
       if (pill) {
@@ -115,7 +120,7 @@
     if (valWait) valWait.textContent = data.wait;
     if (valResume) valResume.textContent = data.resume;
     if (currentRunStep) {
-      currentRunStep.textContent = "Step " + (currentStep + 1) + " of " + stepsData.length + " · " + data.title.replace(/^\d+\.\s*/, "");
+      currentRunStep.textContent = (!hasStarted ? "Preview · " : "Step ") + (currentStep + 1) + " of " + stepsData.length + " · " + data.title.replace(/^\d+\.\s*/, "");
     }
 
     var canSignal = currentStep === 2 || currentStep === 3;
@@ -124,12 +129,21 @@
     if (killBtn) {
       killBtn.disabled = currentStep !== 2;
       killBtn.title = currentStep === 2
-        ? "Kill the host while the workflow is waiting for approval"
+        ? "Simulate a host restart while the workflow is waiting for approval"
         : "Available when the workflow reaches the approval wait";
     }
 
-    if (pauseBtn) pauseBtn.textContent = isPaused ? "▶ Play" : "⏸ Pause";
-    if (liveStatus) liveStatus.textContent = isPaused ? "Simulation Paused" : "Auto-advancing simulation";
+    if (prevBtn) prevBtn.disabled = currentStep === 0;
+    if (nextBtn) nextBtn.disabled = currentStep >= stepsData.length - 1;
+    if (pauseBtn) {
+      var finished = hasStarted && currentStep >= stepsData.length - 1 && isPaused;
+      pauseBtn.textContent = finished ? "Finished" : (!hasStarted || isPaused ? "Play" : "Pause");
+      pauseBtn.disabled = finished;
+      pauseBtn.setAttribute("aria-label", finished ? "Workflow finished; choose Replay to run it again" : "Pause or play the workflow");
+    }
+    if (liveStatus) liveStatus.textContent = !hasStarted
+      ? "Preview ready · choose Run to play"
+      : (finished ? "Finished · choose Replay to run again" : (isPaused ? "Paused · choose Play to continue" : "Playing automatically · Pause to inspect"));
   }
 
   function clearTimer() {
@@ -141,26 +155,43 @@
 
   function schedule() {
     clearTimer();
-    if (isPaused) return;
+    if (!hasStarted || isPaused || currentStep >= stepsData.length - 1) {
+      if (hasStarted && currentStep >= stepsData.length - 1) {
+        isPaused = true;
+        render();
+      }
+      return;
+    }
     var wait = (currentStep === 2) ? 5000 : 3000;
     timer = window.setTimeout(function () {
-      currentStep = (currentStep + 1) % stepsData.length;
+      currentStep += 1;
       render();
       schedule();
     }, wait);
   }
 
   nodes.forEach(function (node, idx) {
-    node.addEventListener("click", function () {
+    function selectNode() {
       currentStep = idx;
+      hasStarted = true;
+      isPaused = true;
+      clearTimer();
       render();
       schedule();
+    }
+    node.addEventListener("click", selectNode);
+    node.addEventListener("keydown", function (event) {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      selectNode();
     });
   });
 
   if (slackApprove) {
     slackApprove.addEventListener("click", function () {
       currentStep = 4;
+      hasStarted = true;
+      isPaused = false;
       render();
       schedule();
     });
@@ -169,6 +200,8 @@
   if (slackReject) {
     slackReject.addEventListener("click", function () {
       currentStep = 1;
+      hasStarted = true;
+      isPaused = false;
       render();
       schedule();
     });
@@ -177,6 +210,8 @@
   if (killBtn) {
     killBtn.addEventListener("click", function () {
       currentStep = 3;
+      hasStarted = true;
+      isPaused = false;
       render();
       schedule();
     });
@@ -184,7 +219,12 @@
 
   if (pauseBtn) {
     pauseBtn.addEventListener("click", function () {
-      isPaused = !isPaused;
+      if (!hasStarted) {
+        hasStarted = true;
+        isPaused = false;
+      } else {
+        isPaused = !isPaused;
+      }
       render();
       schedule();
     });
@@ -192,23 +232,28 @@
 
   if (prevBtn) {
     prevBtn.addEventListener("click", function () {
-      currentStep = (currentStep - 1 + stepsData.length) % stepsData.length;
+      hasStarted = true;
+      isPaused = true;
+      clearTimer();
+      currentStep = Math.max(0, currentStep - 1);
       render();
-      schedule();
     });
   }
 
   if (nextBtn) {
     nextBtn.addEventListener("click", function () {
-      currentStep = (currentStep + 1) % stepsData.length;
+      hasStarted = true;
+      isPaused = true;
+      clearTimer();
+      currentStep = Math.min(stepsData.length - 1, currentStep + 1);
       render();
-      schedule();
     });
   }
 
   if (replayBtn) {
     replayBtn.addEventListener("click", function () {
       currentStep = 0;
+      hasStarted = true;
       isPaused = false;
       render();
       schedule();
@@ -216,5 +261,4 @@
   }
 
   render();
-  schedule();
 })();

@@ -280,6 +280,8 @@ body {
 }
 .stage-btn:hover { background: #334155; border-color: rgba(255, 255, 255, 0.5); transform: translateY(-1px); }
 .stage-btn:active { transform: translateY(1px); }
+.stage-btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+.stage-btn:disabled:hover { background: #1e293b; border-color: rgba(255, 255, 255, 0.3); }
 .stage-btn.btn-primary {
   background: linear-gradient(135deg, #0284c7, #8b5cf6);
   border-color: rgba(255, 255, 255, 0.4);

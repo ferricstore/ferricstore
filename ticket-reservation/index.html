@@ -5,13 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>10-Minute Ticket Cart Hold · FerricStore vs Redis</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="../shared/base.css">
-  <link rel="stylesheet" href="./style.css">
-  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="stylesheet" href="../shared/base.css?v=20260912c">
+  <link rel="stylesheet" href="./style.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/polish.css?v=20260912c">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=20">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=20260912d">
 </head>
 <body class="fs-dispatch" data-mode="before">
   <!--
@@ -56,11 +56,11 @@
       <div class="mode-switch" role="tablist" aria-label="Execution Mode">
         <button type="button" role="tab" data-mode-btn="before" aria-selected="true" class="is-selected">
           <span class="mode-tab-title">Without FerricStore</span>
-          <span class="mode-tab-badge bad">❌ Redis EXPIRE (Double-Booking Hazard)</span>
+          <span class="mode-tab-badge bad">Redis expiry · timeout race</span>
         </button>
         <button type="button" role="tab" data-mode-btn="after" aria-selected="false">
           <span class="mode-tab-title">With FerricStore</span>
-          <span class="mode-tab-badge good">✓ Durable Hold + Fenced Transfer</span>
+          <span class="mode-tab-badge good">Saved hold · old buyer cannot change booking</span>
         </button>
       </div>
     </header>
@@ -70,37 +70,37 @@
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">💤</span>
-          <small>TIMER MEMORY &amp; CPU FOOTPRINT</small>
+          <small>WORKER TIME WHILE THE TIMER RUNS</small>
         </div>
-        <strong class="metric-val text-green" data-metric-cpu>No waiting handler held</strong>
-        <span class="metric-sub" data-metric-cpu-sub>Capacity depends on topology</span>
+        <strong class="metric-val text-green" data-metric-cpu>50,000 DB Polling Queries / sec</strong>
+        <span class="metric-sub" data-metric-cpu-sub>Polling keeps checking for expiry</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">⏱️</span>
-          <small>SEAT REASSIGN LATENCY</small>
+          <small>WHEN THE SEAT CAN CHANGE HANDS</small>
         </div>
-        <strong class="metric-val text-cyan" data-metric-reclaim>After hold expiry</strong>
-        <span class="metric-sub" data-metric-reclaim-sub>Immediate queue promotion</span>
+        <strong class="metric-val text-cyan" data-metric-reclaim>45.0 sec (Cron Lag)</strong>
+        <span class="metric-sub" data-metric-reclaim-sub>Illustrative delay before reassignment</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">👥</span>
-          <small>DOUBLE-BOOKING RISK</small>
+          <small>CAN TWO OWNERS WRITE?</small>
         </div>
-        <strong class="metric-val text-green" data-metric-risk>State-Guarded Handoff</strong>
-        <span class="metric-sub" data-metric-risk-sub>Strict monotonic Raft lock</span>
+        <strong class="metric-val text-green" data-metric-risk>High (Double-Booking Hazard)</strong>
+        <span class="metric-sub" data-metric-risk-sub>Expiry and payment can race</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">💰</span>
-          <small>INVENTORY REVENUE CAPTURE</small>
+          <small>INVENTORY AFTER THE HOLD</small>
         </div>
-        <strong class="metric-val text-green" data-metric-rev>Captured in this run</strong>
-        <span class="metric-sub" data-metric-rev-sub>Zero abandoned ghost locks</span>
+        <strong class="metric-val text-green" data-metric-rev>72% (Cart Leakage)</strong>
+        <span class="metric-sub" data-metric-rev-sub>Unclaimed holds can leak inventory</span>
       </div>
     </section>
 
@@ -113,8 +113,8 @@
           <div class="file-info">
             <span class="file-icon">py</span>
             <div>
-              <h2 id="code-title" data-code-title>ticket_fsm.py</h2>
-              <small data-code-kicker>FERRICSTORE SCHEDULED STATE API</small>
+              <h2 id="code-title" data-code-title>redis_checkout.py</h2>
+              <small data-code-kicker>REDIS EXPIRE (UNSYNCHRONIZED)</small>
             </div>
           </div>
           <div class="code-controls">
@@ -122,7 +122,7 @@
               <button type="button" class="sdk-btn" data-sdk-style="steps">Advanced step</button>
               <button type="button" class="sdk-btn is-active" data-sdk-style="states">Simple states</button>
             </div>
-            <span class="badge-durable" data-code-badge>DURABLE CART TIMER</span>
+            <span class="badge-durable" data-code-badge>VOLATILE LOCK</span>
           </div>
         </header>
 
@@ -169,7 +169,7 @@ client.transition(
 )</code></pre>
 
         <!-- Code Block: After Mode (States) -->
-        <pre class="code-block" data-code="after-states"><code>import time
+        <pre class="code-block" data-code="after-states" hidden><code>import time
 from ferricstore import WorkflowClient, complete, transition
 
 client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
@@ -196,15 +196,18 @@ def transfer(ctx):
       <article class="stage-panel">
         <header class="stage-header">
           <div class="stage-meta-left">
-            <span class="run-id-pill">EVENT: <strong>COLDPLAY VIP CONCERT</strong></span>
-            <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>STEP 1 OF 3</b></span>
+            <span class="run-id-pill">SCENARIO: <strong>COLDPLAY VIP · SEAT A12</strong></span>
+            <span class="live-pill" data-live-pill><span class="pulse-dot" aria-hidden="true"></span> <b data-live-status>STEP 1: HOLD ACTIVE (10:00 REMAINING)</b></span>
           </div>
-          <div class="playback-controls">
-            <button class="stage-btn btn-primary" data-btn-play title="Play Story">⚡ Play Story (3s)</button>
-            <button class="stage-btn" data-btn-step-1 title="Step 1: Buyer #1 Holds Seat">1. Hold Seat</button>
-            <button class="stage-btn btn-warning" data-btn-step-2 title="Step 2: 10-Min Timer Expires">2. 10m Expires</button>
-            <button class="stage-btn btn-danger" data-btn-step-3 title="Step 3: Concurrency Resolution">3. Resolution</button>
-            <button class="stage-btn btn-ghost" data-btn-reset title="Reset">↺</button>
+          <div class="stage-actions">
+            <p class="playback-help">Run the whole story, or inspect a numbered step. Run again to replay.</p>
+            <div class="playback-controls" aria-label="Reservation story controls">
+              <button class="stage-btn btn-primary" data-btn-play title="Run or replay the full reservation story">Run full story</button>
+              <button class="stage-btn" data-btn-step-1 title="Go to step 1: Buyer 1 holds the seat">1. Hold the seat</button>
+              <button class="stage-btn btn-warning" data-btn-step-2 title="Go to step 2: fast-forward to hold expiry">2. Fast-forward expiry</button>
+              <button class="stage-btn btn-danger" data-btn-step-3 title="Go to step 3: resolve seat ownership">3. Resolve ownership</button>
+              <button class="stage-btn btn-ghost" data-btn-reset title="Start over at step 1" aria-label="Start over at step 1">Start over</button>
+            </div>
           </div>
         </header>
 
@@ -212,20 +215,20 @@ def transfer(ctx):
         <div class="story-canvas">
           
           <!-- Step Indicator Header -->
-          <div class="story-stepper">
-            <div class="step-pill is-active" data-step-indicator="1">
+          <div class="story-stepper" role="list" aria-label="Reservation story steps">
+            <div class="step-pill is-active" role="listitem" data-step-indicator="1" aria-current="step">
               <span class="s-num">1</span>
               <span>Buyer #1 Holds Seat (10:00)</span>
             </div>
-            <div class="step-divider">➔</div>
-            <div class="step-pill" data-step-indicator="2">
+            <div class="step-divider" aria-hidden="true">➔</div>
+            <div class="step-pill" role="listitem" data-step-indicator="2">
               <span class="s-num">2</span>
               <span>10m Timer Expires</span>
             </div>
-            <div class="step-divider">➔</div>
-            <div class="step-pill" data-step-indicator="3">
+            <div class="step-divider" aria-hidden="true">➔</div>
+            <div class="step-pill" role="listitem" data-step-indicator="3">
               <span class="s-num">3</span>
-              <span data-step-3-text>Fenced Seat Handoff</span>
+              <span data-step-3-text>Race Condition (Double-Book)</span>
             </div>
           </div>
 
@@ -244,7 +247,7 @@ def transfer(ctx):
                 <div class="timer-digits" data-timer-digits>10:00</div>
                 <div class="timer-bar"><div class="timer-bar-fill" data-timer-fill style="width: 100%;"></div></div>
               </div>
-              <div class="buyer-action-note" data-buyer-1-note>Holding Seat A12 for checkout...</div>
+              <div class="buyer-action-note" data-buyer-1-note>Buyer #1 can check out before the 10-minute hold ends.</div>
             </div>
 
             <!-- Central Seat Target -->
@@ -261,13 +264,13 @@ def transfer(ctx):
               <div class="buyer-avatar">👨</div>
               <div class="buyer-meta">
                 <strong>Buyer #2 (Sarah M.)</strong>
-                <span class="buyer-tag waiting" data-buyer-2-tag>⏳ Waiting Room (Pos #1)</span>
+                <span class="buyer-tag waiting" data-buyer-2-tag>Waiting for Seat A12 (position 1)</span>
               </div>
               <div class="timer-display-box" data-buyer-2-timer-box>
                 <small>WAITING ROOM STATUS</small>
-                <div class="queue-status-text" data-buyer-2-status>Waiting for Seat A12...</div>
+                <div class="queue-status-text" data-buyer-2-status>Waiting for Seat A12.</div>
               </div>
-              <div class="buyer-action-note" data-buyer-2-note>Ready to claim if Buyer #1 abandons</div>
+              <div class="buyer-action-note" data-buyer-2-note>Can claim the seat if the hold expires.</div>
             </div>
 
           </div>
@@ -276,8 +279,8 @@ def transfer(ctx):
           <div class="explanation-box" data-explanation-box>
             <div class="exp-icon" data-exp-icon>💡</div>
             <div class="exp-text">
-              <strong data-exp-title>Step 1: Buyer #1 locks Seat #A12 for 10 minutes</strong>
-              <p data-exp-desc>The hold is durable; no application handler remains blocked. Buyer #2 is waiting in position #1. Click "2. 10m Expires" to simulate expiry.</p>
+              <strong data-exp-title>Step 1: Buyer #1 holds Seat A12 for 10 minutes</strong>
+              <p data-exp-desc>A Redis expiry key is temporary. Move to the next step to fast-forward to the timeout race.</p>
             </div>
           </div>
 
@@ -285,10 +288,10 @@ def transfer(ctx):
 
         <!-- Outcome Callout Footer -->
         <footer class="stage-footer">
-          <div class="outcome-callout good" data-outcome-callout>
-            <small data-outcome-label>CONCURRENCY OUTCOME</small>
-            <strong data-outcome-title>FENCED OWNERSHIP TRANSFER</strong>
-            <span data-outcome-sub>The hold expired and the next buyer acquired a newer ownership fence. Guard payment separately with a provider idempotency key.</span>
+          <div class="outcome-callout bad" data-outcome-callout>
+            <small data-outcome-label>WHAT THIS RUN TEACHES</small>
+            <strong data-outcome-title>REDIS VOLATILE KEY (EX=600)</strong>
+            <span data-outcome-sub>Key is not synchronized with database transactions. Race conditions will occur at second 600.</span>
           </div>
         </footer>
       </article>
@@ -395,8 +398,8 @@ def transfer(ctx):
     </section>
   </main>
 
-  <script src="./ticket.js?v=6"></script>
-  <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=16"></script>
+  <script src="./ticket.js?v=20260912c"></script>
+  <script src="../shared/accuracy.js?v=20260912c"></script>
+  <script src="../shared/dispatch.js?v=20260912c"></script>
 </body>
 </html>

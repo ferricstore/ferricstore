@@ -5,13 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Parallel Fan-Out &amp; Map-Reduce · FerricStore</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="../shared/base.css">
-  <link rel="stylesheet" href="./style.css">
-  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="stylesheet" href="../shared/base.css?v=20260912c">
+  <link rel="stylesheet" href="./style.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/polish.css?v=20260912c">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=20">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=20260912d">
 </head>
 <body class="fs-dispatch" data-mode="before">
   <!--
@@ -56,11 +56,11 @@
       <div class="mode-switch" role="tablist" aria-label="Execution Mode">
         <button type="button" role="tab" data-mode-btn="before" aria-selected="true" class="is-selected">
           <span class="mode-tab-title">Without FerricStore</span>
-          <span class="mode-tab-badge bad">❌ Celery Chords (Full Restart)</span>
+          <span class="mode-tab-badge bad">Barrier lost · restart all 16</span>
         </button>
         <button type="button" role="tab" data-mode-btn="after" aria-selected="false">
           <span class="mode-tab-title">With FerricStore</span>
-          <span class="mode-tab-badge good">✓ Durable Barrier (1-Chunk Resume)</span>
+          <span class="mode-tab-badge good">Each child saved · retry one</span>
         </button>
       </div>
     </header>
@@ -72,35 +72,35 @@
           <span class="metric-icon">💥</span>
           <small>WORKER FAILURE POINT</small>
         </div>
-        <strong class="metric-val text-red" data-metric-fail>Chunk #9 (88% Progress)</strong>
-        <span class="metric-sub">OOM / Node Eviction Crash</span>
+        <strong class="metric-val text-red" data-metric-fail>Chunk #9 at 88%</strong>
+        <span class="metric-sub" data-metric-fail-sub>Illustrative OOM / node-eviction crash</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">🔄</span>
-          <small>RE-COMPUTED CHUNKS</small>
+          <small>WORK THAT RUNS AGAIN</small>
         </div>
-        <strong class="metric-val" data-metric-chunks>1 Chunk Only</strong>
-        <span class="metric-sub" data-metric-chunks-sub>15 Chunks loaded from disk</span>
+        <strong class="metric-val" data-metric-chunks>16 chunks re-run</strong>
+        <span class="metric-sub" data-metric-chunks-sub>In-memory barrier loses completed work</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">⚡</span>
-          <small>BARRIER GATHER LATENCY</small>
+          <small>WHEN THE PARENT CAN FINISH</small>
         </div>
-        <strong class="metric-val text-cyan" data-metric-latency>After child completion</strong>
-        <span class="metric-sub">Lease-aware child reclaim</span>
+        <strong class="metric-val text-cyan" data-metric-latency>After a full restart</strong>
+        <span class="metric-sub" data-metric-latency-sub>Lost results leave the barrier waiting</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">🛡️</span>
-          <small>COMPUTE EFFICIENCY</small>
+          <small>COMPLETED WORK REUSED</small>
         </div>
-        <strong class="metric-val text-green" data-metric-eff>Committed chunks reused</strong>
-        <span class="metric-sub" data-metric-eff-sub>0 redundant GPU cycles</span>
+        <strong class="metric-val text-green" data-metric-eff>0% reused</strong>
+        <span class="metric-sub" data-metric-eff-sub>All 16 chunks run again</span>
       </div>
     </section>
 
@@ -113,8 +113,8 @@
           <div class="file-info">
             <span class="file-icon">py</span>
             <div>
-              <h2 id="code-title" data-code-title>transcode_fsm.py</h2>
-              <small data-code-kicker>FERRICSTORE CHILD FLOW API</small>
+              <h2 id="code-title" data-code-title>celery_transcode.py</h2>
+              <small data-code-kicker>CELERY CHORDS (UNPROTECTED)</small>
             </div>
           </div>
           <div class="code-controls">
@@ -122,7 +122,7 @@
               <button type="button" class="sdk-btn" data-sdk-style="steps">Advanced step</button>
               <button type="button" class="sdk-btn is-active" data-sdk-style="states">Simple states</button>
             </div>
-            <span class="badge-durable" data-code-badge>DURABLE PARALLEL</span>
+            <span class="badge-durable" data-code-badge>VOLATILE BARRIER</span>
           </div>
         </header>
 
@@ -159,7 +159,7 @@ job, rendered = client.step(
 )</code></pre>
 
         <!-- Code Block: After Mode (States) -->
-        <pre class="code-block" data-code="after-states"><code>from ferricstore import ChildSpec, WorkflowClient, complete, transition
+        <pre class="code-block" data-code="after-states" hidden><code>from ferricstore import ChildSpec, WorkflowClient, complete, transition
 
 client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
 flow = client.workflow(type="video-transcode", initial_state="fanout")
@@ -185,15 +185,18 @@ def stitch(job):
       <article class="stage-panel">
         <header class="stage-header">
           <div class="stage-meta-left">
-            <span class="run-id-pill">JOB: <strong data-job-id>4K-TRANSCODE-#8492</strong></span>
-            <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>READY</b></span>
+            <span class="run-id-pill">SCENARIO: <strong data-job-id>4K TRANSCODE · 16 CHUNKS</strong></span>
+            <span class="live-pill" data-live-pill><span class="pulse-dot" aria-hidden="true"></span> <b data-live-status>READY</b></span>
           </div>
-          <div class="playback-controls">
-            <button class="stage-btn btn-primary" data-btn-play title="Play Full Simulation">⚡ Play Simulation</button>
-            <button class="stage-btn" data-btn-step title="Fan Out Chunks">▶ Fan-Out</button>
-            <button class="stage-btn btn-danger" data-btn-crash title="Kill Worker #9">💥 Kill #9</button>
-            <button class="stage-btn btn-warning" data-btn-resume title="Recover & Gather">🔄 Recover</button>
-            <button class="stage-btn btn-ghost" data-btn-reset title="Reset Simulation">↺</button>
+          <div class="stage-actions">
+            <p class="playback-help">Run the full story, or pause at a numbered recovery step.</p>
+            <div class="playback-controls" aria-label="Parallel fan-out story controls">
+              <button class="stage-btn btn-primary" data-btn-play title="Run or replay the full fan-out recovery story">Run full story</button>
+              <button class="stage-btn" data-btn-step title="Start 16 parallel video tasks">1. Start 16 tasks</button>
+              <button class="stage-btn btn-danger" data-btn-crash title="Simulate worker 9 failing at 88 percent">2. Fail worker 9</button>
+              <button class="stage-btn btn-warning" data-btn-resume title="Recover the job and gather its results">3. Recover the job</button>
+              <button class="stage-btn btn-ghost" data-btn-reset title="Start over before fan-out" aria-label="Start over before fan-out">Start over</button>
+            </div>
           </div>
         </header>
 
@@ -204,12 +207,12 @@ def stitch(job):
               <span>PARALLEL WORKER POOL (16 CHUNKS)</span>
               <span class="chunks-counter" data-chunks-counter>0 / 16 Finished</span>
             </div>
-            <div class="tiles-16-grid" data-tiles-grid>
+            <div class="tiles-16-grid" data-tiles-grid role="list" aria-label="Sixteen child chunk states">
               <!-- 16 chunk tiles generated by JS -->
             </div>
-            <div class="barrier-row good" data-barrier-bar>
-              <span class="b-icon">🛡️</span>
-              <strong data-barrier-text>BARRIER: READY TO GATHER &amp; STITCH</strong>
+            <div class="barrier-row bad" data-barrier-bar>
+              <span class="b-icon" data-barrier-icon aria-hidden="true">⏳</span>
+              <strong data-barrier-text>BARRIER: WAITING FOR 16 CHUNKS</strong>
             </div>
           </div>
 
@@ -220,17 +223,17 @@ def stitch(job):
               <small data-term-speed>Live simulator</small>
             </div>
             <div class="term-stream" data-term-stream>
-              <div class="term-row info">[00:00.000] Click "⚡ Play Simulation" to start the 16-worker fan-out transcode.</div>
+              <div class="term-row info">[00:00.000] Choose a scenario above to start the 16-child fan-out.</div>
             </div>
           </div>
         </div>
 
         <!-- Outcome Callout -->
         <footer class="stage-footer">
-          <div class="outcome-callout good" data-outcome-callout>
-            <small data-outcome-label>RECOVERY IMPACT</small>
-            <strong data-outcome-title>EXACT-1 CHUNK RESUME (0 WASTED COMPUTE)</strong>
-            <span data-outcome-sub>Completed child results stayed durable. Only unfinished Chunk #9 was reclaimed.</span>
+          <div class="outcome-callout bad" data-outcome-callout>
+            <small data-outcome-label>WHAT THIS RUN TEACHES</small>
+            <strong data-outcome-title>16x FULL JOB RE-RUN (15 WASTED CHUNKS)</strong>
+            <span data-outcome-sub>Worker #9 crash wiped in-memory chord state. Queue restarted the entire transcode.</span>
           </div>
         </footer>
       </article>
@@ -337,8 +340,8 @@ def stitch(job):
     </section>
   </main>
 
-  <script src="./fanout.js?v=6"></script>
-  <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=16"></script>
+  <script src="./fanout.js?v=20260912c"></script>
+  <script src="../shared/accuracy.js?v=20260912c"></script>
+  <script src="../shared/dispatch.js?v=20260912c"></script>
 </body>
 </html>

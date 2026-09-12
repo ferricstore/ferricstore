@@ -6,9 +6,9 @@
   <title>What is a Workflow? Explained for Humans | FerricStore</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
   <meta name="description" content="A simple, visual explanation of what durable workflows are, the pain of unexpected crashes (double-billing, lost orders), and how FerricStore provides video game save points for real-world software.">
-  <link rel="stylesheet" href="./style.css">
-  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=20">
+  <link rel="stylesheet" href="./style.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=20260912d">
 </head>
 <body class="fs-dispatch">
   <!--
@@ -60,14 +60,14 @@
         <div class="mode-toggle" role="tablist" aria-label="Workflow Mode">
           <button class="mode-btn is-active" type="button" role="tab" data-mode="before" aria-selected="true">
             <span class="mode-text-wrap">
-              <strong>Without Workflows</strong>
-              <small>RAM Wiped · Double Charges</small>
+            <strong>Without Workflows</strong>
+            <small>Crash forgets steps · work repeats</small>
             </span>
           </button>
           <button class="mode-btn" type="button" role="tab" data-mode="after" aria-selected="false">
             <span class="mode-text-wrap">
-              <strong>With FerricStore</strong>
-              <small>Durable States · Protected Effects</small>
+            <strong>With FerricStore</strong>
+            <small>Pick up at a saved step</small>
             </span>
           </button>
         </div>
@@ -79,10 +79,11 @@
       <header class="stage-header">
         <div class="scenario-badge">
           <span class="badge-label">SCENARIO</span>
-          <strong>Customer Buys $150 Sneakers Online</strong>
+          <strong>Online sneaker order · $150</strong>
+          <span class="scenario-detail">Crash after stock is picked</span>
         </div>
         <div class="stage-actions">
-          <button class="crash-btn" type="button" data-smash-crash title="Trigger an immediate server outage">
+          <button class="crash-btn" type="button" data-smash-crash title="Jump to the simulated worker crash">
             <svg class="control-icon" aria-hidden="true" focusable="false"><use href="#wf-icon-crash"></use></svg>
             <span>Trigger server crash</span>
           </button>
@@ -134,8 +135,8 @@
               <svg class="node-icon" aria-hidden="true" focusable="false"><use href="#wf-icon-card"></use></svg>
               <span class="node-badge">1</span>
             </div>
-            <strong class="node-title">Charge Card</strong>
-            <span class="node-sub" data-st-1-sub>Authorized $150</span>
+            <strong class="node-title">Charge card</strong>
+            <span class="node-sub" data-st-1-sub>Payment authorized · $150</span>
           </div>
 
           <!-- Station 1 -->
@@ -144,8 +145,8 @@
               <svg class="node-icon" aria-hidden="true" focusable="false"><use href="#wf-icon-stock"></use></svg>
               <span class="node-badge">2</span>
             </div>
-            <strong class="node-title">Pick Stock</strong>
-            <span class="node-sub" data-st-2-sub>Warehouse Shelf</span>
+            <strong class="node-title">Reserve stock</strong>
+            <span class="node-sub" data-st-2-sub>Warehouse item held</span>
           </div>
 
           <!-- Station 2 (Crash Zone) -->
@@ -154,8 +155,8 @@
               <svg class="node-icon" aria-hidden="true" focusable="false"><use href="#wf-icon-crash"></use></svg>
               <span class="node-badge">3</span>
             </div>
-            <strong class="node-title">Server Crash</strong>
-            <span class="node-sub" data-st-3-sub>Outage Zone</span>
+            <strong class="node-title">Worker crashes</strong>
+            <span class="node-sub" data-st-3-sub>Saved state is tested</span>
           </div>
 
           <!-- Station 3 -->
@@ -164,8 +165,8 @@
               <svg class="node-icon" aria-hidden="true" focusable="false"><use data-st-4-icon href="#wf-icon-restart"></use></svg>
               <span class="node-badge">4</span>
             </div>
-            <strong class="node-title" data-st-4-title>Full Restart</strong>
-            <span class="node-sub" data-st-4-sub>Repeats Step 1 &amp; 2</span>
+            <strong class="node-title" data-st-4-title>Restart from start</strong>
+            <span class="node-sub" data-st-4-sub>Repeats earlier work</span>
           </div>
 
           <!-- Station 4 -->
@@ -174,8 +175,8 @@
               <svg class="node-icon" aria-hidden="true" focusable="false"><use data-st-5-icon href="#wf-icon-penalty"></use></svg>
               <span class="node-badge">5</span>
             </div>
-            <strong class="node-title" data-st-5-title>$300 Penalty</strong>
-            <span class="node-sub" data-st-5-sub>Double Billed!</span>
+            <strong class="node-title" data-st-5-title>Duplicate charge</strong>
+            <span class="node-sub" data-st-5-sub>Customer billed twice</span>
           </div>
         </div>
       </div>
@@ -202,7 +203,7 @@
               <svg class="pkg-icon-box" aria-hidden="true" focusable="false"><use data-pkg-icon href="#wf-icon-card"></use></svg>
               <div class="pkg-info-box">
                 <small data-pkg-kicker>ORDER #9842 · $150.00</small>
-                <strong data-pkg-status>Saved in FerricStore</strong>
+                <strong data-pkg-status>Stored in RAM only</strong>
               </div>
             </div>
           </div>
@@ -214,8 +215,8 @@
         <!-- Customer Live Device Notification Widget -->
         <div class="device-card">
           <div class="device-header">
-            <span>Customer notification</span>
-            <span class="live-dot">LIVE SYNC</span>
+            <span>Customer view</span>
+            <span class="live-dot">ILLUSTRATIVE OUTPUT</span>
           </div>
           
           <div class="bank-card" data-bank-card>
@@ -224,14 +225,14 @@
               <span>•••• 4192</span>
             </div>
             <div class="card-balance-row">
-              <span class="balance-label">Total Billed:</span>
+              <span class="balance-label">Customer billed:</span>
               <strong class="balance-val" data-bank-amount>$150.00</strong>
             </div>
           </div>
 
           <div class="sms-push-box" data-sms-box>
             <div class="sms-content" data-sms-content>
-              <strong>SneakerStore Notification:</strong> Payment authorized for $150.00. Checkpoint saved to disk.
+              <strong>Bank notification:</strong> Charged $150.00 at SneakerStore (kept only in temporary server memory).
             </div>
           </div>
         </div>
@@ -239,16 +240,16 @@
         <!-- Event Narrative & Explainer Card -->
         <div class="narrative-card">
           <div class="narrative-top">
-            <span class="narrative-badge is-good" data-narrative-badge>STEP 1 · CHECKPOINT COMMITTED</span>
+            <span class="narrative-badge is-bad" data-narrative-badge>STEP 1 · VOLATILE RAM</span>
             <span class="narrative-step-pill" data-step-indicator>Step 1 of 5</span>
           </div>
-          <h3 class="narrative-title" data-narrative-title>1. Credit Card Charged ($150.00)</h3>
+          <h3 class="narrative-title" data-narrative-title>1. Card charged ($150.00)</h3>
           <p class="narrative-desc" data-narrative-desc>
-            Customer clicks "Buy Sneakers". The application authorizes $150 with a provider idempotency key, then durably advances the workflow state.
+            Customer clicks "Buy Sneakers". The server charges $150 but keeps the confirmation only in temporary server memory.
           </p>
           <div class="checkpoint-status-bar" data-checkpoint-bar>
-            <span class="cp-label">FerricStore Disk Status:</span>
-            <strong class="cp-val" data-checkpoint-val>Step 1 [Payment] Committed &amp; Deduplicated</strong>
+            <span class="cp-label">Saved workflow state:</span>
+            <strong class="cp-val" data-checkpoint-val>Step 1 [Payment] in Temporary RAM (Unsaved)</strong>
           </div>
         </div>
       </div>
@@ -263,7 +264,7 @@
         </div>
         <div class="stage-live-indicator">
           <span class="pulse-indicator"></span>
-          <span data-live-status-text>Auto-advancing animation</span>
+          <span data-live-status-text>Steps advance automatically · use Pause to inspect</span>
         </div>
       </footer>
     </section>
@@ -359,8 +360,8 @@
     </section>
   </main>
 
-  <script src="./explainer.js?v=6"></script>
-  <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=16"></script>
+  <script src="./explainer.js?v=20260912c"></script>
+  <script src="../shared/accuracy.js?v=20260912c"></script>
+  <script src="../shared/dispatch.js?v=20260912c"></script>
 </body>
 </html>

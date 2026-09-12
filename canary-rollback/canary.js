@@ -43,9 +43,13 @@
   var liveStatus = document.querySelector('[data-live-status]');
 
   var metricCpu = document.querySelector('[data-metric-cpu]');
+  var metricCpuSub = document.querySelector('[data-metric-cpu-sub]');
   var metricCrash = document.querySelector('[data-metric-crash]');
+  var metricCrashSub = document.querySelector('[data-metric-crash-sub]');
   var metricErrors = document.querySelector('[data-metric-errors]');
+  var metricErrorsSub = document.querySelector('[data-metric-errors-sub]');
   var metricRollback = document.querySelector('[data-metric-rollback]');
+  var metricRollbackSub = document.querySelector('[data-metric-rollback-sub]');
 
   var outcomeCallout = document.querySelector('[data-outcome-callout]');
   var outcomeLabel = document.querySelector('[data-outcome-label]');
@@ -100,7 +104,11 @@
     stepPills.forEach(function (pill) {
       var num = parseInt(pill.getAttribute('data-step-indicator'), 10);
       pill.classList.remove('is-active', 'is-done');
-      if (num === step) pill.classList.add('is-active');
+      pill.removeAttribute('aria-current');
+      if (num === step) {
+        pill.classList.add('is-active');
+        pill.setAttribute('aria-current', 'step');
+      }
       else if (num < step) pill.classList.add('is-done');
     });
   }
@@ -123,7 +131,7 @@
     // Soak Timer
     if (soakCard) soakCard.className = 'canary-card';
     if (soakVal) soakVal.textContent = '0h 01m / 24h 00m (Soak Started)';
-    if (soakBadge) { soakBadge.className = 'c-badge ok'; soakBadge.textContent = currentMode === 'before' ? '⚠️ Blocking Thread (illustrative)' : '💤 Durable observation state'; }
+    if (soakBadge) { soakBadge.className = currentMode === 'before' ? 'c-badge tripped' : 'c-badge ok'; soakBadge.textContent = currentMode === 'before' ? '⚠️ Blocking Thread (illustrative)' : '💤 Durable observation state'; }
     if (soakFill) soakFill.style.width = '2%';
     if (soakSub) soakSub.textContent = currentMode === 'before' ? 'Holding open worker thread in memory' : 'No application handler held while waiting';
 
@@ -137,15 +145,19 @@
     if (expIcon) expIcon.textContent = '🚀';
     if (expTitle) expTitle.textContent = 'Step 1: Envoy shifts 10% traffic to v2.4.0 (24h Soak Started)';
     if (expDesc) expDesc.textContent = currentMode === 'before'
-      ? 'Calling time.sleep(86400) blocks an OS thread for 24 hours. Click "2. Crash at Hr 18" to simulate a server reboot.'
-      : 'The flow persists an observation state and later advances on a schedule or durable signal. Click "2. Crash at Hr 18" to test reclaim.';
+      ? 'The script sleeps in a worker thread for 24 hours. Move to the next step to simulate a host reboot.'
+      : 'The flow saves an observation state and advances later on a schedule or signal. Move to the next step to test recovery.';
 
     // Metrics
     if (currentMode === 'before') {
       if (metricCpu) metricCpu.textContent = 'Blocks an OS thread';
+      if (metricCpuSub) metricCpuSub.textContent = 'In-memory sleep holds a worker thread';
       if (metricCrash) metricCrash.textContent = '0% (Lost on Reboot)';
+      if (metricCrashSub) metricCrashSub.textContent = 'The process loses its sleep state';
       if (metricErrors) metricErrors.textContent = 'Unmonitored after crash';
+      if (metricErrorsSub) metricErrorsSub.textContent = 'No listener remains after the runner dies';
       if (metricRollback) metricRollback.textContent = 'Manual PagerDuty (45m)';
+      if (metricRollbackSub) metricRollbackSub.textContent = 'An operator must start recovery';
 
       if (outcomeCallout) outcomeCallout.className = 'outcome-callout bad';
       if (outcomeLabel) outcomeLabel.textContent = 'UNMANAGED PIPELINE HAZARD';
@@ -154,20 +166,26 @@
       highlightCodeLine(10);
     } else {
       if (metricCpu) metricCpu.textContent = 'No waiting handler held';
+      if (metricCpuSub) metricCpuSub.textContent = 'Saved state releases the worker while waiting';
       if (metricCrash) metricCrash.textContent = 'Lease-based recovery';
-      if (metricErrors) metricErrors.textContent = 'Active Signal Watch';
-      if (metricRollback) metricRollback.textContent = 'Effect-dependent';
+      if (metricCrashSub) metricCrashSub.textContent = 'A replacement can reclaim after lease expiry';
+      if (metricErrors) metricErrors.textContent = 'Signal can advance soak';
+      if (metricErrorsSub) metricErrorsSub.textContent = 'The parked state accepts a guarded 5xx signal';
+      if (metricRollback) metricRollback.textContent = 'Explicit rollback state';
+      if (metricRollbackSub) metricRollbackSub.textContent = 'Provider timing still varies';
 
       if (outcomeCallout) outcomeCallout.className = 'outcome-callout good';
       if (outcomeLabel) outcomeLabel.textContent = 'CANARY RELIABILITY OUTCOME';
-      if (outcomeTitle) outcomeTitle.textContent = 'PARKED SOAK STATE &amp; EXPLICIT RECOVERY';
-      if (outcomeSub) outcomeSub.textContent = 'Workflow sleeps in Raft quorum with 0 open threads. If the host crashes, it resumes precisely where it left off.';
+      if (outcomeTitle) outcomeTitle.textContent = 'PARKED SOAK STATE & EXPLICIT RECOVERY';
+      if (outcomeSub) outcomeSub.textContent = 'The workflow stores the soak state without holding a worker thread. After a host crash, a replacement can reclaim it after the configured lease.';
       highlightCodeLine(8);
     }
   }
 
   // --- STEP 2: Host Crash at Hour 18 ---
   function runStep2(onDone) {
+    runStep1();
+    clearAllTimeouts();
     updateStepperUI(2);
 
     if (currentMode === 'before') {
@@ -185,7 +203,7 @@
 
       if (expIcon) expIcon.textContent = '💥';
       if (expTitle) expTitle.textContent = 'Step 2 Disaster: Host Reboot Wiped Deployment Script!';
-      if (expDesc) expDesc.textContent = 'Because time.sleep() was running in Python RAM, the Kubernetes node reboot killed the process. The 10% canary is now a zombie deployment running in production with nobody monitoring it! Click "3. 5xx Rollback" to see the consequence.';
+      if (expDesc) expDesc.textContent = 'The Kubernetes node reboot killed the in-memory timer. The 10% canary stays routed, but no workflow remains to observe it. Move to the next step to see the consequence.';
 
       highlightCodeLine(8, true);
     } else {
@@ -201,7 +219,7 @@
 
       if (expIcon) expIcon.textContent = '🧠';
       if (expTitle) expTitle.textContent = 'Step 2 Success: Zero State Lost on Host Reboot';
-      if (expDesc) expDesc.textContent = 'The Kubernetes runner pod crashed, but the observation state remained durable. A replacement worker reclaimed it with a newer fence. Click "3. 5xx Rollback" to simulate an error signal.';
+      if (expDesc) expDesc.textContent = 'The runner pod crashed, but the observation state remained durable. A replacement worker can reclaim it with a newer fence. Move to the next step to send an error signal.';
 
       highlightCodeLine(8);
     }
@@ -211,6 +229,8 @@
 
   // --- STEP 3: Datadog 5xx Alert -> Rollback ---
   function runStep3() {
+    runStep2();
+    clearAllTimeouts();
     updateStepperUI(3);
 
     if (currentMode === 'before') {
@@ -230,11 +250,11 @@
 
       if (expIcon) expIcon.textContent = '🚨';
       if (expTitle) expTitle.textContent = 'Step 3 Disaster: 2.4% 5xx Errors Leaking to Real Users!';
-      if (expDesc) expDesc.textContent = 'Datadog fired a 5xx alert, but because the deployment script crashed in Step 2, nobody is listening. 10% of production traffic continues hitting the broken container until an on-call engineer wakes up at 3 AM!';
+      if (expDesc) expDesc.textContent = 'Datadog sent a 5xx alert, but the deployment script died in step 2, so no handler advances the flow. Ten percent of traffic keeps reaching the broken version until manual recovery.';
 
       if (outcomeCallout) outcomeCallout.className = 'outcome-callout bad';
       if (outcomeLabel) outcomeLabel.textContent = 'PRODUCTION OUTAGE';
-      if (outcomeTitle) outcomeTitle.textContent = 'BROKEN CANARY LEAK &amp; SLA PENALTIES';
+      if (outcomeTitle) outcomeTitle.textContent = 'BROKEN CANARY LEAK & SLA PENALTIES';
       if (outcomeSub) outcomeSub.textContent = 'Deployment script died during 24h sleep. Broken v2.4.0 left routing 10% traffic for 45 minutes, violating 99.99% uptime SLA.';
 
       highlightCodeLine(9, true);
@@ -287,7 +307,7 @@
       currentMode = btn.getAttribute('data-mode-btn') || 'after';
       document.body.setAttribute('data-mode', currentMode);
       updateActiveCodeBlock();
-      playStory();
+      runStep1();
     });
   });
 
@@ -309,6 +329,8 @@
   if (btnReset) btnReset.addEventListener('click', runStep1);
 
   // Init
+  document.body.setAttribute('data-mode', currentMode);
   updateActiveCodeBlock();
-  playStory();
+  // Leave the first state visible so visitors can choose Run or a Next step.
+  runStep1();
 })();

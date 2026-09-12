@@ -2,81 +2,81 @@
   "use strict";
 
   var currentStep = 0;
-  var isPaused = false;
+  var isPaused = true;
   var timer = null;
 
   var states = [
     {
       stepIndex: 0,
-      stageName: "Stage 1: Normal Execution (Worker A holds Lease Gen=1)",
-      workerARole: "Active Leader (Lease Gen 1)",
-      workerADesc: "Worker A claims Job #9842 with Generation 1. Heartbeat is healthy and active.",
-      workerAStatus: "STATUS: ACTIVE (GEN=1)",
+      stageName: "Stage 1: Worker A is active (owner number 1)",
+      workerARole: "Current owner (number 1)",
+      workerADesc: "Worker A owns Job #9842. It is active and responding.",
+      workerAStatus: "STATUS: ACTIVE (OWNER 1)",
       workerAFrozen: false,
       workerARejected: false,
-      workerBRole: "Standby Replica",
-      workerBDesc: "Worker B is on standby in the worker pool, awaiting work or failover.",
-      workerBStatus: "STATUS: STANDBY",
+      workerBRole: "Waiting to take over",
+      workerBDesc: "Worker B is waiting in the worker pool.",
+      workerBStatus: "STATUS: WAITING",
       workerBActive: false,
-      vaultLease: "ACTIVE LEASE: GENERATION 1",
-      vaultDecision: "ALL WRITES FROM WORKER A (GEN=1) ACCEPTED",
-      valGen: "Generation 1",
-      valBlocked: "0 Stale Writes",
-      valCorrupt: "External DB must enforce fence"
+      vaultLease: "CURRENT OWNER: 1",
+      vaultDecision: "WRITES FROM OWNER 1 ACCEPTED",
+      valGen: "Owner 1",
+      valBlocked: "0 old writes",
+      valCorrupt: "App must pass owner"
     },
     {
       stepIndex: 1,
-      stageName: "Stage 2: 20-Second Garbage Collection Pause (Worker A Freezes)",
-      workerARole: "Frozen in GC Pause (20s)",
-      workerADesc: "JVM / Node GC pause hits Worker A. Process is completely frozen; heartbeat stops responding.",
-      workerAStatus: "STATUS: FROZEN (GC PAUSE 20s)",
+      stageName: "Stage 2: Worker A pauses and stops responding",
+      workerARole: "Paused (owner number 1)",
+      workerADesc: "Worker A is frozen and no longer sends its heartbeat.",
+      workerAStatus: "STATUS: PAUSED",
       workerAFrozen: true,
       workerARejected: false,
-      workerBRole: "Detecting Heartbeat Timeout",
-      workerBDesc: "Worker B detects missing heartbeat from Worker A. Prepares leader election failover.",
-      workerBStatus: "STATUS: HEARTBEAT TIMEOUT DETECTED",
+      workerBRole: "Notices the missing heartbeat",
+      workerBDesc: "Worker B notices that Worker A is not responding and prepares to take over.",
+      workerBStatus: "STATUS: WAITING FOR TAKEOVER",
       workerBActive: false,
-      vaultLease: "LEASE EXPIRING (HEARTBEAT MISSED)",
-      vaultDecision: "SUPERVISOR PREPARING LEASE TRANSFER",
-      valGen: "Generation 1",
-      valBlocked: "0 Stale Writes",
-      valCorrupt: "External DB must enforce fence"
+      vaultLease: "OWNER 1 NO LONGER RESPONDING",
+      vaultDecision: "PREPARING A NEW OWNER NUMBER",
+      valGen: "Owner 1",
+      valBlocked: "0 old writes",
+      valCorrupt: "App must pass owner"
     },
     {
       stepIndex: 2,
-      stageName: "Stage 3: Lease Transferred to Worker B (Lease Promoted to Gen=2)",
-      workerARole: "Frozen / Stale",
-      workerADesc: "Worker A remains frozen in GC pause. Its Generation 1 lease has been revoked.",
-      workerAStatus: "STATUS: FROZEN (STALE LEASE)",
+      stageName: "Stage 3: Worker B takes over with owner number 2",
+      workerARole: "Paused / old owner",
+      workerADesc: "Worker A is still paused. Its owner number 1 is no longer current.",
+      workerAStatus: "STATUS: PAUSED (OLD OWNER)",
       workerAFrozen: true,
       workerARejected: false,
-      workerBRole: "Active Leader (Lease Gen 2)",
-      workerBDesc: "Worker B is elected successor! Increments fencing token to Gen 2 and safely commits step output to Raft log.",
-      workerBStatus: "STATUS: COMMITTED TO RAFT LOG (GEN=2)",
+      workerBRole: "Current owner (number 2)",
+      workerBDesc: "Worker B takes over with owner number 2 and saves the step result.",
+      workerBStatus: "STATUS: SAVED (OWNER 2)",
       workerBActive: true,
-      vaultLease: "ACTIVE LEASE: GENERATION 2",
-      vaultDecision: "WORKER B COMMITTED WITH GEN=2",
-      valGen: "Generation 2",
-      valBlocked: "0 Stale Writes",
-      valCorrupt: "External DB must enforce fence"
+      vaultLease: "CURRENT OWNER: 2",
+      vaultDecision: "OWNER 2 WRITE ACCEPTED",
+      valGen: "Owner 2",
+      valBlocked: "0 old writes",
+      valCorrupt: "App must pass owner"
     },
     {
       stepIndex: 3,
-      stageName: "Stage 4: Zombie Worker A Attempts Stale Write -> Intercepted & Blocked!",
-      workerARole: "Zombie Worker (Stale Gen 1)",
-      workerADesc: "Worker A unfreezes! Unaware it was replaced, Worker A attempts to write stale data with Generation 1.",
-      workerAStatus: "ATTEMPTING STALE WRITE (GEN=1)...",
+      stageName: "Stage 4: Worker A returns and tries the old write",
+      workerARole: "Old owner (number 1)",
+      workerADesc: "Worker A returns and tries to write with its old owner number 1.",
+      workerAStatus: "TRYING OLD WRITE (OWNER 1)…",
       workerAFrozen: false,
       workerARejected: true,
-      workerBRole: "Safe Committed Owner",
-      workerBDesc: "Worker B already completed the job cleanly with Generation 2.",
-      workerBStatus: "STATUS: COMMITTED TO DISK (GEN=2)",
+      workerBRole: "Safe current owner (number 2)",
+      workerBDesc: "Worker B already saved the job with owner number 2.",
+      workerBStatus: "STATUS: SAVED (OWNER 2)",
       workerBActive: true,
-      vaultLease: "ACTIVE LEASE: GENERATION 2",
-      vaultDecision: "REJECTED: incoming gen (1) < storage gen (2)<br><strong style='color: #34d399;'>FENCING_TOKEN_STALE — Flow mutation blocked</strong>",
-      valGen: "Generation 2",
-      valBlocked: "1 Stale Write Blocked",
-      valCorrupt: "Stale Flow mutation rejected"
+      vaultLease: "CURRENT OWNER: 2",
+      vaultDecision: "REJECTED: owner 1 is older than owner 2.<br><strong style='color: #34d399;'>Old worker write blocked</strong>",
+      valGen: "Owner 2",
+      valBlocked: "1 old write blocked",
+      valCorrupt: "App must check owner"
     }
   ];
 
@@ -147,8 +147,8 @@
       workerBStatus.textContent = data.workerBStatus;
       workerBStatus.className = "wc-status-box" + (data.workerBActive ? " good" : "");
     }
-    if (workerAToken) workerAToken.textContent = "TOKEN: GEN=1" + (currentStep >= 2 ? " (STALE)" : "");
-    if (workerBToken) workerBToken.textContent = currentStep >= 2 ? "TOKEN: GEN=2 (ACTIVE)" : "TOKEN: STANDBY";
+    if (workerAToken) workerAToken.textContent = "OWNER: 1" + (currentStep >= 2 ? " (OLD)" : "");
+    if (workerBToken) workerBToken.textContent = currentStep >= 2 ? "OWNER: 2 (CURRENT)" : "OWNER: WAITING";
 
     if (vaultLease) vaultLease.textContent = data.vaultLease;
     if (vaultDecision) vaultDecision.innerHTML = data.vaultDecision;
@@ -156,19 +156,28 @@
     if (valGen) valGen.textContent = data.valGen;
     if (valBlocked) valBlocked.textContent = data.valBlocked;
     if (valCorrupt) valCorrupt.textContent = data.valCorrupt;
-    if (valLatency) valLatency.textContent = "Lease-dependent";
+    if (valLatency) valLatency.textContent = "Depends on lease";
 
     if (currentRunStep) {
       currentRunStep.textContent = "Step " + (currentStep + 1) + " of " + states.length + " · " + data.stageName.replace(/^Stage \d+:\s*/, "");
     }
 
-    if (pauseBtn) pauseBtn.textContent = isPaused ? "Play" : "Pause";
+    if (pauseBtn) pauseBtn.textContent = isPaused ? "▶ Play steps" : "⏸ Pause";
   }
 
   stepperItems.forEach(function (el) {
+    el.setAttribute("role", "button");
+    el.tabIndex = 0;
+    el.addEventListener("keydown", function (event) {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        el.click();
+      }
+    });
     el.addEventListener("click", function () {
       var stepIdx = parseInt(el.getAttribute("data-step"), 10);
       if (!isNaN(stepIdx)) {
+        clearTimer();
         currentStep = stepIdx;
         isPaused = true;
         render();
@@ -178,6 +187,7 @@
 
   if (freezeBtn) {
     freezeBtn.addEventListener("click", function () {
+      clearTimer();
       currentStep = 1;
       isPaused = true;
       render();
@@ -186,6 +196,7 @@
 
   if (promoteBtn) {
     promoteBtn.addEventListener("click", function () {
+      clearTimer();
       currentStep = 2;
       isPaused = true;
       render();
@@ -194,6 +205,7 @@
 
   if (zombieBtn) {
     zombieBtn.addEventListener("click", function () {
+      clearTimer();
       currentStep = 3;
       isPaused = true;
       render();
@@ -202,25 +214,40 @@
 
   if (pauseBtn) {
     pauseBtn.addEventListener("click", function () {
+      clearTimer();
+      if (currentStep === states.length - 1 && isPaused) currentStep = 0;
       isPaused = !isPaused;
       render();
+      schedule();
     });
   }
 
   if (replayBtn) {
     replayBtn.addEventListener("click", function () {
+      clearTimer();
       currentStep = 0;
-      isPaused = false;
+      isPaused = true;
       render();
     });
   }
 
-  timer = setInterval(function () {
-    if (!isPaused) {
-      currentStep = (currentStep + 1) % states.length;
-      render();
+  function clearTimer() {
+    if (timer !== null) {
+      window.clearTimeout(timer);
+      timer = null;
     }
-  }, 4000);
+  }
+
+  function schedule() {
+    clearTimer();
+    if (isPaused || currentStep >= states.length - 1) return;
+    timer = window.setTimeout(function () {
+      currentStep += 1;
+      if (currentStep >= states.length - 1) isPaused = true;
+      render();
+      schedule();
+    }, 4000);
+  }
 
   render();
 })();

@@ -5,13 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Pub/Sub &amp; Streams · FerricStore</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="../shared/base.css">
-  <link rel="stylesheet" href="./style.css">
-  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="stylesheet" href="../shared/base.css?v=20260912c">
+  <link rel="stylesheet" href="./style.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/polish.css?v=20260912c">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=20">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=20260912d">
 </head>
 <body class="fs-dispatch" data-mode="pubsub">
   <!--
@@ -43,24 +43,24 @@
   <main class="demo-main">
     <!-- Hero Section -->
     <header class="demo-hero">
-      <div class="hero-tag">NATIVE MESSAGING PRIMITIVES · TWO PURPOSE-BUILT ENGINES</div>
+      <div class="hero-tag">Messaging basics · live or saved</div>
       <h1>
-        Pub/Sub &amp; Streams in FerricStore:<br>
-        <span class="hero-accent">Choose Ephemeral In-Memory Fanout or Durable Raft Event Logs</span>
+        Live messages or saved messages?<br>
+        <span class="hero-accent">Choose Pub/Sub for now, or Streams for catch-up</span>
       </h1>
       <p class="hero-desc">
-        FerricStore provides first-class native support for both <strong>Pub/Sub</strong> and <strong>Streams</strong>. Neither is "better"—each is engineered for different backend needs. Use <strong>Pub/Sub</strong> for ephemeral in-memory broadcast to active subscribers. Use <strong>Streams</strong> for a persisted event log, consumer-group load balancing, and replay after a worker reconnects.
+        With FerricStore, <strong>Pub/Sub</strong> sends a live message to listeners connected now; it does not save that message for later. <strong>Streams</strong> save entries and let a consumer group pick up unread work after reconnecting. Run either example to see who receives the message and what a reader can miss.
       </p>
 
       <!-- Mode Switch Tabs -->
       <div class="mode-switch" role="tablist" aria-label="Messaging Mode">
         <button type="button" role="tab" data-mode-btn="pubsub" aria-selected="true" class="is-selected">
-          <span class="mode-tab-title">📡 Live Pub/Sub (PUBLISH / SUBSCRIBE)</span>
-          <span class="mode-tab-badge mode-cyan">⚡ Ephemeral In-Memory Fanout</span>
+          <span class="mode-tab-title">📡 Pub/Sub: live broadcast</span>
+          <span class="mode-tab-badge mode-cyan">Connected listeners only</span>
         </button>
         <button type="button" role="tab" data-mode-btn="stream" aria-selected="false">
-          <span class="mode-tab-title">📜 Durable Streams (XADD / XREADGROUP)</span>
-          <span class="mode-tab-badge mode-purple">🛡️ NVMe Append Log (HLC IDs · Replay)</span>
+          <span class="mode-tab-title">📜 Streams: saved event log</span>
+          <span class="mode-tab-badge mode-purple">Saved entries + consumer group</span>
         </button>
       </div>
     </header>
@@ -70,37 +70,37 @@
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">⚙️</span>
-          <small data-metric-lbl-1>MESSAGING ARCHITECTURE</small>
+          <small data-metric-lbl-1>How messages move</small>
         </div>
-        <strong class="metric-val text-cyan" data-metric-val-1>In-Memory Socket Push</strong>
-        <span class="metric-sub" data-metric-sub-1>Zero disk/WAL write overhead</span>
+        <strong class="metric-val text-cyan" data-metric-val-1>Live broadcast</strong>
+        <span class="metric-sub" data-metric-sub-1>Connected listeners receive it now</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">⚡</span>
-          <small data-metric-lbl-2>FANOUT LATENCY</small>
+          <small data-metric-lbl-2>Where the message goes</small>
         </div>
-        <strong class="metric-val text-green" data-metric-val-2>Workload Dependent</strong>
-        <span class="metric-sub" data-metric-sub-2>Direct TCP socket delivery</span>
+        <strong class="metric-val text-green" data-metric-val-2>Not saved for later</strong>
+        <span class="metric-sub" data-metric-sub-2>No saved entry to catch up on</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">💾</span>
-          <small data-metric-lbl-3>STORAGE FOOTPRINT</small>
+          <small data-metric-lbl-3>Who receives it</small>
         </div>
-        <strong class="metric-val text-green" data-metric-val-3>No Message Log</strong>
-        <span class="metric-sub" data-metric-sub-3>Messages are not retained for replay</span>
+        <strong class="metric-val text-green" data-metric-val-3>Every connected listener</strong>
+        <span class="metric-sub" data-metric-sub-3>The same event is sent to each one</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">🎯</span>
-          <small data-metric-lbl-4>BEST USED FOR</small>
+          <small data-metric-lbl-4>Good fit</small>
         </div>
-        <strong class="metric-val text-cyan" data-metric-val-4>Cache Invalidation &amp; UI Toasts</strong>
-        <span class="metric-sub" data-metric-sub-4>Real-time client alerts</span>
+        <strong class="metric-val text-cyan" data-metric-val-4>Cache refreshes and live alerts</strong>
+        <span class="metric-sub" data-metric-sub-4>Updates that can arrive now</span>
       </div>
     </section>
 
@@ -146,13 +146,13 @@
       <article class="stage-panel">
         <header class="stage-header">
           <div class="stage-meta-left">
-            <span class="run-id-pill">CHANNEL: <strong data-target-name>cache:invalidation</strong></span>
-            <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>ACTIVE LISTENER READY</b></span>
+            <span class="run-id-pill">MESSAGE TARGET: <strong data-target-name>cache:invalidation</strong></span>
+            <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>READY TO RUN</b></span>
           </div>
           <div class="playback-controls">
-            <button class="stage-btn btn-primary" data-btn-action-1 title="Run Primary Flow">⚡ 1. Broadcast Event</button>
-            <button class="stage-btn btn-cyan" data-btn-action-2 title="Run Secondary Flow">👥 2. Multi-Subscriber Fanout</button>
-            <button class="stage-btn btn-ghost" data-btn-reset title="Reset Simulation">↺</button>
+            <button class="stage-btn btn-primary" data-btn-action-1 title="Send the example message through the selected mode">⚡ 1. Send example message</button>
+            <button class="stage-btn btn-cyan" data-btn-action-2 title="Show the selected mode handling multiple listeners or a saved worker job">👥 2. Show delivery</button>
+            <button class="stage-btn btn-ghost" data-btn-reset title="Clear this run and cancel pending steps">↺ Clear</button>
           </div>
         </header>
 
@@ -166,13 +166,13 @@
               <div class="m-head">
                 <span class="m-icon" data-icon-left>📤</span>
                 <div>
-                  <strong data-title-left>EVENT PUBLISHER</strong>
-                  <small data-sub-left>In-Memory Dispatch</small>
+                  <strong data-title-left>Event publisher</strong>
+                  <small data-sub-left>Live dispatch</small>
                 </div>
               </div>
               <div class="m-metric-row">
-                <span class="m-val text-cyan" data-val-left>PUBLISH event</span>
-                <span class="m-badge ok" data-badge-left>Live push</span>
+                  <span class="m-val text-cyan" data-val-left>Ready to publish</span>
+                  <span class="m-badge ok" data-badge-left>Ready now</span>
               </div>
               <div class="m-sub-box">
                 <code data-code-left>PUBLISH "cache:invalidation" "product:42"</code>
@@ -184,13 +184,13 @@
               <div class="m-head">
                 <span class="m-icon" data-icon-mid>⚡</span>
                 <div>
-                  <strong data-title-mid>IN-MEMORY FANOUT</strong>
-                  <small data-sub-mid>Zero Disk Overhead</small>
+                  <strong data-title-mid>Live broadcast</strong>
+                  <small data-sub-mid>Not saved for later</small>
                 </div>
               </div>
               <div class="m-metric-row">
-                <span class="m-val text-green" data-val-mid>Ephemeral Message</span>
-                <span class="m-badge ok" data-badge-mid>✓ Zero Disk I/O</span>
+                  <span class="m-val text-green" data-val-mid>Message goes out now</span>
+                  <span class="m-badge ok" data-badge-mid>✓ No saved entry</span>
               </div>
               <div class="m-track">
                 <div class="m-fill" data-fill-mid style="width: 100%;"></div>
@@ -202,13 +202,13 @@
               <div class="m-head">
                 <span class="m-icon" data-icon-right>📥</span>
                 <div>
-                  <strong data-title-right>CONNECTED SUBSCRIBERS</strong>
-                  <small data-sub-right>3 Active Microservice Pods</small>
+                  <strong data-title-right>Connected listeners</strong>
+                  <small data-sub-right>3 active listeners</small>
                 </div>
               </div>
               <div class="m-metric-row">
-                <span class="m-val text-green" data-val-right>3 / 3 Delivered</span>
-                <span class="m-badge ok" data-badge-right>✓ Live Push</span>
+                  <span class="m-val text-green" data-val-right>3 of 3 received</span>
+                  <span class="m-badge ok" data-badge-right>✓ Received now</span>
               </div>
               <div class="m-track">
                 <div class="m-fill consumer-fill" data-fill-right style="width: 100%;"></div>
@@ -220,11 +220,11 @@
           <!-- Live Event Terminal -->
           <div class="live-terminal-compact">
             <div class="term-head">
-              <span>📟 REAL-TIME MESSAGING LOG</span>
-              <small>Live Stream</small>
+              <span>Run log</span>
+              <small>Updates as you click</small>
             </div>
             <div class="term-stream" data-term-stream>
-              <div class="term-row info">[00:00.000] FerricStore messaging ready. Subscribed to live channels.</div>
+              <div class="term-row info">[00:00.000] Preview ready. Choose a mode, then send the example message.</div>
             </div>
           </div>
 
@@ -232,8 +232,8 @@
           <div class="explanation-box">
             <div class="exp-icon" data-exp-icon>💡</div>
             <div class="exp-text">
-              <strong data-exp-title>Live Pub/Sub: In-Memory Broadcast</strong>
-              <p data-exp-desc>Messages are pushed directly to currently connected subscribers and are not retained for replay. Click "⚡ 1. Broadcast Event" to watch the fanout.</p>
+              <strong data-exp-title>Preview: live message, no saved copy</strong>
+              <p data-exp-desc>Pub/Sub reaches listeners connected now. Run step 1, then step 2 to see who receives it and what a reader cannot catch up on later.</p>
             </div>
           </div>
 
@@ -242,9 +242,9 @@
         <!-- Outcome Callout Footer -->
         <footer class="stage-footer">
           <div class="outcome-callout good" data-outcome-callout>
-            <small data-outcome-label>PUBSUB ARCHITECTURE BENEFIT</small>
-            <strong data-outcome-title>EPHEMERAL FANOUT TO ACTIVE SUBSCRIBERS</strong>
-            <span data-outcome-sub>Pub/Sub pushes notifications to listeners that are connected now; it does not create a replayable message log.</span>
+            <small data-outcome-label>What this run shows</small>
+            <strong data-outcome-title>Ready to compare live and saved messages</strong>
+            <span data-outcome-sub>Run the named actions to see who receives the message now and which mode keeps a saved entry for a worker.</span>
           </div>
         </footer>
       </article>
@@ -313,7 +313,7 @@
           </div>
           <p class="uc-desc">Distributing 50,000 video encoding or email generation jobs across 10 background worker instances.</p>
           <div class="uc-highlight">
-            <strong>Why Streams are Perfect:</strong> Consumer groups (<code>XREADGROUP</code>) balance work evenly; unacked tasks are auto-reclaimed.
+            <strong>Why Streams fit:</strong> Consumer groups (<code>XREADGROUP</code>) share work; unacknowledged entries can be reclaimed under the configured rules.
           </div>
           <div class="uc-code-pill">
             <code>client.xreadgroup("workers", "w1", {"jobs": ">"})</code>
@@ -372,8 +372,8 @@
 
   </main>
 
-  <script src="./stream_pubsub.js?v=3"></script>
-  <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=16"></script>
+  <script src="./stream_pubsub.js?v=20260912c"></script>
+  <script src="../shared/accuracy.js?v=20260912c"></script>
+  <script src="../shared/dispatch.js?v=20260912c"></script>
 </body>
 </html>

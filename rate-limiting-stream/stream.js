@@ -23,6 +23,7 @@
   var valDropped = document.querySelector("[data-val-dropped]");
   var valLatency = document.querySelector("[data-val-latency]");
   var currentRunValue = document.querySelector("[data-current-run-value]");
+  var statusSummary = document.querySelector("[data-status-summary]");
 
   var pauseBtn = document.querySelector("[data-pause]");
   var resetBtn = document.querySelector("[data-reset-btn]");
@@ -30,21 +31,21 @@
 
   function update() {
     if (inboundLabel) inboundLabel.textContent = inboundRate.toLocaleString() + " events / sec";
-    if (outboundLabel) outboundLabel.textContent = outboundLimit.toLocaleString() + " req / sec (Max)";
+    if (outboundLabel) outboundLabel.textContent = outboundLimit.toLocaleString() + " req / sec (configured)";
 
     var batchSize = Math.min(100, Math.max(10, Math.round(inboundRate / 50)));
-    var bufferPercent = Math.min(100, Math.max(5, Math.round((inboundRate / 5000) * 85)));
+    var bufferPercent = (Math.round(inboundRate / 100) / 5000) * 100;
 
     if (pipeIngest) pipeIngest.textContent = inboundRate.toLocaleString() + " Webhooks/s";
-    if (pipeBatch) pipeBatch.textContent = batchSize + " Items / Batch";
-    if (pipeBucket) pipeBucket.textContent = outboundLimit + " Tokens / Sec";
-    if (pipeDispatch) pipeDispatch.textContent = outboundLimit + " Req/s Clean";
+    if (pipeBatch) pipeBatch.textContent = batchSize + " items / group (example)";
+    if (pipeBucket) pipeBucket.textContent = "Up to " + outboundLimit + " requests / sec";
+    if (pipeDispatch) pipeDispatch.textContent = outboundLimit + " requests/s (configured)";
 
     if (bufferBar) {
-      bufferBar.style.width = isPaused ? "0%" : bufferPercent + "%";
+      bufferBar.style.width = bufferPercent + "%";
     }
     if (bufferStat) {
-      bufferStat.textContent = "Queue Buffer: " + Math.round((inboundRate / 100)) + " / 5,000 · Durable buffer";
+      bufferStat.textContent = "Example buffer: " + Math.round((inboundRate / 100)) + " / 5,000 · waiting for API limit " + outboundLimit + "/s";
     }
 
     if (valInbound) valInbound.textContent = isPaused ? "0 / s (Paused)" : inboundRate.toLocaleString() + " / s";
@@ -53,12 +54,17 @@
     if (valLatency) valLatency.textContent = "Workload-dependent";
     if (currentRunValue) {
       currentRunValue.textContent = "Shopify webhook surge → OpenAI categorization · "
-        + inboundRate.toLocaleString() + " inbound → "
-        + outboundLimit.toLocaleString() + " downstream"
+        + inboundRate.toLocaleString() + " configured inbound → "
+        + outboundLimit.toLocaleString() + " configured downstream"
         + (isPaused ? " · Paused" : "");
     }
 
-    if (pauseBtn) pauseBtn.textContent = isPaused ? "▶ Resume Stream" : "⏸ Pause Stream";
+    if (pauseBtn) pauseBtn.textContent = isPaused ? "▶ Resume example" : "⏸ Pause example";
+    if (statusSummary) {
+      statusSummary.innerHTML = isPaused
+        ? "⏸ <strong>Paused:</strong> incoming work is held in the example buffer; no requests leave for the API."
+        : "🛡️ <strong>With FerricStore:</strong> incoming webhooks wait in saved buffer space while the API accepts only the configured rate.";
+    }
   }
 
   if (inboundSlider) {

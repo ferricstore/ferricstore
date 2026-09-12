@@ -5,13 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>The Beginner's First Queue · FerricStore</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="../shared/base.css">
-  <link rel="stylesheet" href="./style.css">
-  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="stylesheet" href="../shared/base.css?v=20260912c">
+  <link rel="stylesheet" href="./style.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/polish.css?v=20260912c">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=20">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=20260912d">
 </head>
 <body class="fs-dispatch" data-mode="before">
   <!--
@@ -43,24 +43,24 @@
   <main class="demo-main">
     <!-- Hero Section -->
     <header class="demo-hero">
-      <div class="hero-tag">BEGINNER FUNDAMENTALS · ZERO-CONFIG QUEUES</div>
+      <div class="hero-tag">Beginner guide · compare queue setups</div>
       <h1>
-        The Beginner's First Queue:<br>
-        <span class="hero-accent">Durable Background Jobs Without Celery, RabbitMQ, or Redis</span>
+        The beginner's first queue:<br>
+        <span class="hero-accent">See a background job wait, run, and recover</span>
       </h1>
       <p class="hero-desc">
-        Running background tasks often means coordinating a broker, workers, retries, and state. FerricStore exposes a simple lifecycle: <strong>Enqueue ➔ Claim ➔ Complete</strong>. If a worker crashes, the job becomes claimable after its lease expires; fencing rejects stale state writes. External email or payment calls still need an idempotency key.
+        Choose a simplified queue setup or <strong>With FerricStore</strong>, then follow the numbered actions: add an example email, simulate a worker crash, and inspect the retry. A worker may try the job again; a stable idempotency key lets the email or payment provider recognize the same outside request.
       </p>
 
       <!-- Mode Switch Tabs -->
       <div class="mode-switch" role="tablist" aria-label="Execution Mode">
         <button type="button" role="tab" data-mode-btn="before" aria-selected="true" class="is-selected">
-          <span class="mode-tab-title">Without FerricStore (Celery + SQS)</span>
-          <span class="mode-tab-badge bad">❌ 4 Cloud Services + Zombie Duplicate Charges</span>
+          <span class="mode-tab-title">Without FerricStore</span>
+          <span class="mode-tab-badge bad">Example: Celery + SQS setup</span>
         </button>
         <button type="button" role="tab" data-mode-btn="after" aria-selected="false">
           <span class="mode-tab-title">With FerricStore</span>
-          <span class="mode-tab-badge good">✓ 1 Native Engine + Fenced Monotonic Leases</span>
+          <span class="mode-tab-badge good">✓ One engine, durable queue state</span>
         </button>
       </div>
     </header>
@@ -70,37 +70,37 @@
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">⚙️</span>
-          <small>SETUP COMPLEXITY</small>
+          <small>Setup in this example</small>
         </div>
-        <strong class="metric-val text-green" data-metric-setup>1 Unified Binary (&lt;20MB)</strong>
-        <span class="metric-sub" data-metric-setup-sub>Zero external brokers or databases</span>
+        <strong class="metric-val text-red" data-metric-setup>Several moving parts</strong>
+        <span class="metric-sub" data-metric-setup-sub>Example: Celery + SQS + worker</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">⚡</span>
-          <small>CRASH RECLAIM LATENCY</small>
+          <small>Wait after a crash</small>
         </div>
-        <strong class="metric-val text-cyan" data-metric-reclaim>After lease expiry</strong>
-        <span class="metric-sub" data-metric-reclaim-sub>Configurable lease and reclaim</span>
+        <strong class="metric-val text-cyan" data-metric-reclaim>Configured wait</strong>
+        <span class="metric-sub" data-metric-reclaim-sub>Example configuration: 300 seconds</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">🛡️</span>
-          <small>DUPLICATE EXECUTION RISK</small>
+          <small>Repeat attempts</small>
         </div>
-        <strong class="metric-val text-green" data-metric-dup>Stale writes fenced</strong>
-        <span class="metric-sub" data-metric-dup-sub>Effects require idempotency</span>
+        <strong class="metric-val text-red" data-metric-dup>Needs an outside guard</strong>
+        <span class="metric-sub" data-metric-dup-sub>An email request may be tried again</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">💾</span>
-          <small>QUEUE DURABILITY</small>
+          <small>Saved job state</small>
         </div>
-        <strong class="metric-val text-green" data-metric-dur>Durable queue state</strong>
-        <span class="metric-sub" data-metric-dur-sub>Depends on configured topology</span>
+        <strong class="metric-val text-red" data-metric-dur>Depends on setup</strong>
+        <span class="metric-sub" data-metric-dur-sub>Retention and acknowledgements vary</span>
       </div>
     </section>
 
@@ -123,12 +123,12 @@
         </header>
 
         <!-- Code Block: Before Mode -->
-        <pre class="code-block" data-code="before" hidden><code><span data-line="1"><b class="ln">1</b><span><i class="c"># ❌ Traditional Celery + RabbitMQ / SQS Stack:</i></span></span>
+        <pre class="code-block" data-code="before" hidden><code><span data-line="1"><b class="ln">1</b><span><i class="c"># Example Celery + RabbitMQ / SQS-style setup:</i></span></span>
 <span data-line="2"><b class="ln">2</b><span><i class="dec">@app.task</i>(bind=<i class="k">True</i>, max_retries=3)</span></span>
 <span data-line="3"><b class="ln">3</b><span><i class="k">def</i> <i class="fn">send_welcome_email</i>(self, user_id):</span></span>
-<span data-line="4"><b class="ln">4</b><span>    <i class="c"># 💥 If worker crashes or hangs for 30s:</i></span></span>
-<span data-line="5"><b class="ln">5</b><span>    <i class="c"># SQS visibility timeout elapses ➔ Worker #2 runs simultaneously!</i></span></span>
-<span data-line="6"><b class="ln">6</b><span>    <i class="c"># Result: Customer receives 2 duplicate emails or charges!</i></span></span>
+<span data-line="4"><b class="ln">4</b><span>    <i class="c"># Example failure path: worker crashes or hangs for 30s:</i></span></span>
+<span data-line="5"><b class="ln">5</b><span>    <i class="c"># With a 300s visibility setting, another worker waits for expiry.</i></span></span>
+<span data-line="6"><b class="ln">6</b><span>    <i class="c"># The email request may be attempted again; guard it with a stable key.</i></span></span>
 <span data-line="7"><b class="ln">7</b><span>    email_service.<i class="fn">send</i>(user_id)</span></span></code></pre>
 
         <!-- Code Block: After Mode -->
@@ -140,7 +140,7 @@
 <span data-line="6"><b class="ln">6</b><span><i class="c"># 1. Enqueue job with idempotency key</i></span></span>
 <span data-line="7"><b class="ln">7</b><span>emails.<i class="fn">enqueue</i>(<q>"email-8492"</q>, payload=b<q>"welcome:user_42"</q>, idempotent=<i class="k">True</i>)</span></span>
 <span data-line="8"><b class="ln">8</b><span></span></span>
-<span data-line="9"><b class="ln">9</b><span><i class="c"># 2. Worker automatically claims with monotonic lease fencing</i></span></span>
+<span data-line="9"><b class="ln">9</b><span><i class="c"># 2. Worker claims a lease; stale state writes are rejected</i></span></span>
 <span data-line="10"><b class="ln">10</b><span><i class="k">def</i> <i class="fn">handle_email</i>(job):</span></span>
 <span data-line="11"><b class="ln">11</b><span>    email_service.<i class="fn">send</i>(job.payload, idempotency_key=job.id)</span></span>
 <span data-line="12"><b class="ln">12</b><span>    <i class="k">return</i> b<q>"sent"</q></span></span>
@@ -152,14 +152,14 @@
       <article class="stage-panel">
         <header class="stage-header">
           <div class="stage-meta-left">
-            <span class="run-id-pill">JOB: <strong>email-8492 (welcome:user_42)</strong></span>
-            <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>QUEUED IN RAFT</b></span>
+            <span class="run-id-pill">EXAMPLE JOB: <strong>email-8492 (welcome:user_42)</strong></span>
+            <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>READY TO ADD JOB</b></span>
           </div>
           <div class="playback-controls">
-            <button class="stage-btn btn-primary" data-btn-clean title="Run Clean Job (Enqueue -> Claim -> Complete)">⚡ 1. Clean Run</button>
-            <button class="stage-btn btn-danger" data-btn-crash title="Simulate Worker Crash Mid-Job">💥 2. Worker Crash</button>
-            <button class="stage-btn btn-warning" data-btn-reclaim title="Reclaim after lease expiry and retry with fencing">🛡️ 3. Fenced Retry</button>
-            <button class="stage-btn btn-ghost" data-btn-reset title="Reset Simulation">↺</button>
+            <button class="stage-btn btn-primary" data-btn-clean title="Add the example job, let a worker run it, and show the result">⚡ 1. Run clean job</button>
+            <button class="stage-btn btn-danger" data-btn-crash title="Stop the worker while it is processing the example job">💥 2. Simulate worker crash</button>
+            <button class="stage-btn btn-warning" data-btn-reclaim title="After the configured wait, let another worker try the job">🛡️ 3. Run recovery retry</button>
+            <button class="stage-btn btn-ghost" data-btn-reset title="Clear this run and cancel pending steps">↺ Clear</button>
           </div>
         </header>
 
@@ -173,13 +173,13 @@
               <div class="q-head">
                 <span class="q-icon">📥</span>
                 <div>
-                  <strong>ENQUEUE PAYLOAD</strong>
-                  <small>FLOW.CREATE</small>
+                  <strong>Add to queue</strong>
+                  <small data-enqueue-detail>Simple queue setup</small>
                 </div>
               </div>
               <div class="q-metric-row">
                 <span class="q-val" data-enqueue-val>email-8492</span>
-                <span class="q-badge ok" data-enqueue-badge>✓ Idempotent</span>
+                  <span class="q-badge ok" data-enqueue-badge>Example email</span>
               </div>
               <div class="q-payload-box">
                 <code>welcome:user_42</code>
@@ -191,13 +191,13 @@
               <div class="q-head">
                 <span class="q-icon">🔄</span>
                 <div>
-                  <strong>QUEUE STATE</strong>
-                  <small data-state-sub>Raft Log Record</small>
+                  <strong>Queue state</strong>
+                  <small data-state-sub>Waiting list</small>
                 </div>
               </div>
               <div class="q-metric-row">
-                <span class="q-val text-cyan" data-state-val>STATE: queued</span>
-                <span class="q-badge ok" data-state-badge>Lease: None</span>
+                  <span class="q-val text-cyan" data-state-val>Ready to add</span>
+                  <span class="q-badge ok" data-state-badge>No job yet</span>
               </div>
               <div class="q-track">
                 <div class="q-fill" data-state-fill style="width: 33%;"></div>
@@ -209,13 +209,13 @@
               <div class="q-head">
                 <span class="q-icon">👷</span>
                 <div>
-                  <strong>WORKER POOL</strong>
-                  <small data-worker-sub>Lease &amp; Fencing Token</small>
+                  <strong>Worker</strong>
+                  <small data-worker-sub>Waiting for a job</small>
                 </div>
               </div>
               <div class="q-metric-row">
-                <span class="q-val text-green" data-worker-val>Worker #1 Active</span>
-                <span class="q-badge ok" data-worker-badge>Token #101</span>
+                  <span class="q-val text-green" data-worker-val>Worker #1 ready</span>
+                  <span class="q-badge ok" data-worker-badge>No job held</span>
               </div>
               <div class="q-track">
                 <div class="q-fill worker-fill" data-worker-fill style="width: 50%;"></div>
@@ -227,11 +227,11 @@
           <!-- Live Event Terminal -->
           <div class="live-terminal-compact">
             <div class="term-head">
-              <span>📟 QUEUE EXECUTION &amp; LEASE TELEMETRY</span>
-              <small>Real-time Stream</small>
+              <span>Run log</span>
+              <small>Updates as you click</small>
             </div>
             <div class="term-stream" data-term-stream>
-              <div class="term-row info">[00:00.000] Queue initialized. Ready to process background jobs.</div>
+              <div class="term-row info">[00:00.000] Preview ready. Run step 1 to add the example email job.</div>
             </div>
           </div>
 
@@ -239,8 +239,8 @@
           <div class="explanation-box">
             <div class="exp-icon" data-exp-icon>💡</div>
             <div class="exp-text">
-              <strong data-exp-title>Simple 3-Line Python Background Queue</strong>
-              <p data-exp-desc>Jobs are enqueued with Raft durability. Click "⚡ 1. Clean Run" to watch Worker #1 process the email, or "💥 2. Worker Crash" to test crash recovery!</p>
+              <strong data-exp-title>Preview: the job is waiting</strong>
+              <p data-exp-desc>Choose a mode, then run step 1. The numbered actions show who holds the email job, why it waits, and what happens after a worker stops.</p>
             </div>
           </div>
 
@@ -249,9 +249,9 @@
         <!-- Outcome Callout Footer -->
         <footer class="stage-footer">
           <div class="outcome-callout good" data-outcome-callout>
-            <small data-outcome-label>QUEUE RELIABILITY OUTCOME</small>
-            <strong data-outcome-title>DURABLE LEASED BACKGROUND QUEUE</strong>
-            <span data-outcome-sub>FerricStore provides a unified durable queue lifecycle. Crashed jobs become claimable after lease expiry with a newer fencing token.</span>
+            <small data-outcome-label>What this run shows</small>
+            <strong data-outcome-title>Ready to compare the two queue setups</strong>
+            <span data-outcome-sub>Run the named actions to see who holds the job, why it waits, and whether a replacement worker can try it.</span>
           </div>
         </footer>
       </article>
@@ -262,38 +262,38 @@
     <section class="arch-comparison-section">
       <div class="catastrophe-head">
         <span class="catastrophe-pill">⚖️ ARCHITECTURE COMPARISON</span>
-        <h2>How Background Queues Are Built: Celery vs. FerricStore</h2>
-        <p>Why modern engineering teams replace complex Celery/RabbitMQ clusters with FerricStore queues.</p>
+        <h2>How these queue setups differ</h2>
+        <p>This is an illustrative comparison of one Celery + RabbitMQ/Redis/SQS setup and a With FerricStore setup; deployments vary.</p>
       </div>
 
       <div class="arch-table-card">
         <table class="arch-table">
           <thead>
             <tr>
-              <th>QUEUE REQUIREMENT</th>
-              <th class="bad-col">❌ CELERY + RABBITMQ + REDIS</th>
-              <th class="good-col">✓ FERRICSTORE QUEUE CLIENT</th>
+              <th>Question</th>
+              <th class="bad-col">Without FerricStore · example setup</th>
+              <th class="good-col">With FerricStore · queue client</th>
             </tr>
           </thead>
           <tbody>
             <tr>
               <td><strong>Required Infrastructure</strong></td>
-              <td class="bad-text">Requires <strong>4 separate servers</strong>: RabbitMQ broker + Redis result backend + Celery workers + Postgres database.</td>
-              <td class="good-text"><strong>1 Single Binary (&lt;20MB):</strong> Queue, worker leasing, and durability run inside 1 unified engine.</td>
+              <td class="bad-text">This example uses <strong>4 separate services</strong>: RabbitMQ broker + Redis result backend + Celery workers + Postgres database.</td>
+              <td class="good-text"><strong>Example configuration: 1 binary (&lt;20MB):</strong> Queue, worker leasing, and durability run inside one engine.</td>
             </tr>
             <tr>
               <td><strong>Worker Crash Mid-Job</strong></td>
-              <td class="bad-text">Visibility timeout takes <strong>300 seconds (5 minutes)</strong> to expire before another worker can retry the job.</td>
-              <td class="good-text"><strong>Configurable lease reclaim:</strong> eligible for reassignment after lease expiry.</td>
+              <td class="bad-text"><strong>Example configuration: 300 seconds (5 minutes)</strong> before another worker can retry the job.</td>
+              <td class="good-text"><strong>Configurable lease reclaim:</strong> another worker can claim the job after the active lease expires.</td>
             </tr>
             <tr>
-              <td><strong>Zombie Double Execution</strong></td>
-              <td class="bad-text">If Worker #1 hangs and wakes up after timeout, it executes the job a 2nd time (duplicate customer charges).</td>
-              <td class="good-text"><strong>Monotonic Fencing Tokens:</strong> FerricStore rejects stale workflow-state mutations. External stores must also validate the token, or use an idempotent guarded effect.</td>
+              <td><strong>Repeat attempt during a pause</strong></td>
+              <td class="bad-text">In this email example, a worker that outlives the example wait may attempt the request again. The email provider still needs a stable idempotency key.</td>
+              <td class="good-text"><strong>Lease numbers reject stale state writes:</strong> FerricStore rejects an old worker's state update. External effects still need an idempotent guarded request.</td>
             </tr>
             <tr>
               <td><strong>Job History &amp; Querying</strong></td>
-              <td class="bad-text">RabbitMQ deletes messages after ack; querying past jobs requires writing custom database logging code.</td>
+              <td class="bad-text">In this example, RabbitMQ removes messages after acknowledgement; queryable history needs separate logging.</td>
               <td class="good-text"><strong>Built-in FQL1 Query Engine:</strong> Query active and historical queue runs with <code>FLOW.QUERY</code> anytime.</td>
             </tr>
           </tbody>
@@ -304,9 +304,9 @@
     <!-- Catastrophe Section -->
     <section class="catastrophe-section">
       <div class="catastrophe-head">
-        <span class="catastrophe-pill">⚠️ THE HAZARD vs. HOW FERRICSTORE PREVENTS IT</span>
-        <h2>Why Traditional Message Queues Break in Production</h2>
-        <p>Compare standard RabbitMQ/Celery failure modes with FerricStore's durable queue engine.</p>
+        <span class="catastrophe-pill">⚠️ Failure paths to inspect</span>
+        <h2>Specific failure scenarios in this example</h2>
+        <p>These illustrative RabbitMQ/Celery and SQS paths show what can wait, repeat, or need an application guard.</p>
       </div>
 
       <div class="catastrophe-grid">
@@ -314,21 +314,21 @@
         <div class="cat-card">
           <div class="cat-head-row">
             <span class="cat-icon">🧟</span>
-            <h4>The Zombie Duplicate Storm</h4>
+            <h4>An email request may be repeated</h4>
           </div>
           <div class="cat-body-block">
             <div class="hazard-box">
-              <strong class="hazard-lbl">💥 The Hazard (SQS / RabbitMQ):</strong>
-              <p>Worker #1 pauses during a Java GC cycle. The visibility timeout expires, and Worker #2 picks up the job. Worker #1 wakes up and BOTH charge the customer.</p>
+              <strong class="hazard-lbl">💥 Email example (SQS / RabbitMQ):</strong>
+              <p>Worker #1 pauses during a Java GC cycle. In this example, the visibility timeout expires and Worker #2 picks up the job. Worker #1 may wake up and attempt the email request too.</p>
             </div>
             <div class="prevention-box">
-              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
-              <p><strong>Monotonic Fencing Tokens:</strong> Every lease receives an incrementing epoch token. When Worker #1 attempts to finish with stale Token 101, FerricStore rejects the write.</p>
+              <strong class="prevention-lbl">🛡️ With FerricStore:</strong>
+              <p><strong>Lease fencing:</strong> Every lease receives an incrementing number. When Worker #1 attempts to finish with stale Token 101, FerricStore rejects the state write.</p>
             </div>
           </div>
           <div class="cat-footer-row">
-            <span class="cat-cost">🚨 Duplicate $250 Stripe Charge</span>
-            <span class="cat-fix-badge">✓ Fenced Stale Writes</span>
+            <span class="cat-cost">Illustrative: duplicate $250 Stripe request</span>
+            <span class="cat-fix-badge">✓ Stale state write rejected</span>
           </div>
         </div>
 
@@ -340,17 +340,17 @@
           </div>
           <div class="cat-body-block">
             <div class="hazard-box">
-              <strong class="hazard-lbl">💥 The Hazard (Celery Architecture):</strong>
-              <p>To run simple background jobs, beginners must provision RabbitMQ, Redis, Celery daemon supervisors, and Postgres, costing $400/mo in cloud overhead.</p>
+              <strong class="hazard-lbl">💥 Deployment example (Celery):</strong>
+              <p>This example provisions RabbitMQ, Redis, Celery daemon supervisors, and Postgres; one illustrative cloud setup is shown as costing $400/mo.</p>
             </div>
             <div class="prevention-box">
-              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
-              <p><strong>Zero-Infrastructure Single Engine:</strong> FerricStore manages 100,000+ queue jobs per second with zero external databases or message brokers.</p>
+              <strong class="prevention-lbl">🛡️ With FerricStore:</strong>
+              <p><strong>One engine:</strong> The illustrative capacity example shows 100,000+ queue jobs per second without external databases or message brokers; validate any deployment for its workload.</p>
             </div>
           </div>
           <div class="cat-footer-row">
-            <span class="cat-cost">💸 $400/Mo Infrastructure Sprawl</span>
-            <span class="cat-fix-badge">✓ 1 Single Unified Engine</span>
+            <span class="cat-cost">Illustrative setup: $400/mo</span>
+            <span class="cat-fix-badge">✓ 1 unified engine example</span>
           </div>
         </div>
 
@@ -362,17 +362,17 @@
           </div>
           <div class="cat-body-block">
             <div class="hazard-box">
-              <strong class="hazard-lbl">💥 The Hazard (Memory Brokers):</strong>
-              <p>A downstream API outage backs up 500,000 unacknowledged messages in RabbitMQ RAM, crashing the broker and losing queued work.</p>
+              <strong class="hazard-lbl">💥 Illustrative overload scenario:</strong>
+              <p>A downstream API outage backs up 500,000 unacknowledged messages in RabbitMQ RAM. The broker may run out of memory; the outcome depends on the deployment.</p>
             </div>
             <div class="prevention-box">
-              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <strong class="prevention-lbl">🛡️ With FerricStore:</strong>
               <p><strong>Disk-backed queue state:</strong> FerricStore persists queued jobs through its configured storage and replication topology. Validate capacity and memory use for the intended workload.</p>
             </div>
           </div>
           <div class="cat-footer-row">
-            <span class="cat-cost">🚨 Dropped Background Work</span>
-            <span class="cat-fix-badge">✓ Millions of Jobs on Disk</span>
+            <span class="cat-cost">Illustrative: 500,000 waiting messages</span>
+            <span class="cat-fix-badge">✓ Saved queue state</span>
           </div>
         </div>
 
@@ -380,29 +380,29 @@
         <div class="cat-card">
           <div class="cat-head-row">
             <span class="cat-icon">⏳</span>
-            <h4>5-Minute Visibility Timeout Lag</h4>
+            <h4>Configured visibility wait</h4>
           </div>
           <div class="cat-body-block">
             <div class="hazard-box">
-              <strong class="hazard-lbl">💥 The Hazard (SQS Visibility Delay):</strong>
-              <p>When a worker crashes, SQS forces the message to wait for the full 5-minute visibility timeout to expire before any other worker can touch it.</p>
+              <strong class="hazard-lbl">💥 Example SQS visibility setting:</strong>
+              <p>In this example, a worker crash leaves the message waiting for the configured 5-minute visibility timeout before another worker can touch it.</p>
             </div>
             <div class="prevention-box">
-              <strong class="prevention-lbl">🛡️ How FerricStore Prevents It:</strong>
+              <strong class="prevention-lbl">🛡️ With FerricStore:</strong>
               <p><strong>Lease-based reclaim:</strong> after the active lease expires, another worker can claim the job with a newer fence.</p>
             </div>
           </div>
           <div class="cat-footer-row">
-            <span class="cat-cost">📉 5-Minute Processing Delay</span>
-            <span class="cat-fix-badge">✓ Fenced Hand-Off</span>
+            <span class="cat-cost">Example: 5-minute wait</span>
+            <span class="cat-fix-badge">✓ Lease-based hand-off</span>
           </div>
         </div>
       </div>
     </section>
   </main>
 
-  <script src="./queue.js?v=4"></script>
-  <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=16"></script>
+  <script src="./queue.js?v=20260912c"></script>
+  <script src="../shared/accuracy.js?v=20260912c"></script>
+  <script src="../shared/dispatch.js?v=20260912c"></script>
 </body>
 </html>

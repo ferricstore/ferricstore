@@ -6,24 +6,24 @@
   var MODE_COPY = {
     unmanaged: {
       codeFile: "research_process.py",
-      codeMode: "Process memory",
-      storeKicker: "PROCESS MEMORY",
-      storeTitle: "Volatile working state",
-      workerADetail: "original process",
-      workerBDetail: "replacement process",
-      firstLink: "memory",
-      secondLink: "restart",
+      codeMode: "Restart path",
+      storeKicker: "NO SAVED PROGRESS",
+      storeTitle: "Process memory",
+      workerADetail: "original worker",
+      workerBDetail: "replacement worker",
+      firstLink: "local memory",
+      secondLink: "starts over",
       progress: ["Plan", "Search", "Summarize", "Crash", "Restart", "Finish"]
     },
     durable: {
       codeFile: "research_workflow.py",
-      codeMode: "FerricStore states",
-      storeKicker: "FERRICSTORE",
-      storeTitle: "Durable workflow state",
-      workerADetail: "original lease owner",
-      workerBDetail: "compatible replacement",
-      firstLink: "commit",
-      secondLink: "lease",
+      codeMode: "Resume path",
+      storeKicker: "SAVED PROGRESS",
+      storeTitle: "FerricStore state",
+      workerADetail: "original worker",
+      workerBDetail: "replacement worker",
+      firstLink: "saved state",
+      secondLink: "takes over",
       progress: ["Plan", "Search", "Summarize", "Crash", "Resume", "Finish"]
     }
   };
@@ -46,27 +46,27 @@
     mount.innerHTML = [
       '<div class="lab-experience" data-lab-live>',
       '  <section class="lab-verdict" aria-labelledby="lab-verdict-title">',
-      '    <header><div><h2 id="lab-verdict-title">Restart versus durable resume</h2><p data-verdict-summary>Run both paths to compare the same worker crash.</p></div><div class="lab-verdict-next"><strong data-verdict-title aria-live="polite">Waiting for both runs</strong><button type="button" data-verdict-action hidden>Run other path</button></div></header>',
+      '    <header><div><h2 id="lab-verdict-title">Restart or resume after the same crash</h2><p data-verdict-summary>Run both paths to compare what survives.</p></div><div class="lab-verdict-next"><strong data-verdict-title aria-live="polite">Choose a path, then run it</strong><button type="button" data-verdict-action hidden>Run other path</button></div></header>',
       '    <div class="lab-receipts">',
-      '      <article data-receipt-mode="unmanaged" class="is-current"><header><div><strong>Without FerricStore</strong><span>Process memory is lost</span></div><b data-receipt-status>Not run</b></header><dl><div><dt>Recovery</dt><dd data-receipt-recovery>—</dd></div><div><dt>State retained</dt><dd data-receipt-retained>—</dd></div><div><dt>Work repeated</dt><dd data-receipt-repeated>—</dd></div><div><dt>Fence</dt><dd data-receipt-fence>Not used</dd></div></dl></article>',
-      '      <article data-receipt-mode="durable"><header><div><strong>With FerricStore</strong><span>Named state survives</span></div><b data-receipt-status>Not run</b></header><dl><div><dt>Recovery</dt><dd data-receipt-recovery>—</dd></div><div><dt>State retained</dt><dd data-receipt-retained>—</dd></div><div><dt>Work repeated</dt><dd data-receipt-repeated>—</dd></div><div><dt>Fence</dt><dd data-receipt-fence>—</dd></div></dl></article>',
+      '      <article data-receipt-mode="unmanaged" class="is-current"><header><div><strong>Restart from the beginning</strong><span>Process memory is lost</span></div><b data-receipt-status>Not run</b></header><dl><div><dt>Recovery</dt><dd data-receipt-recovery>—</dd></div><div><dt>Progress kept</dt><dd data-receipt-retained>—</dd></div><div><dt>Work repeated</dt><dd data-receipt-repeated>—</dd></div><div><dt>Old worker write</dt><dd data-receipt-fence>Not needed</dd></div></dl></article>',
+      '      <article data-receipt-mode="durable"><header><div><strong>Resume saved progress</strong><span>FerricStore keeps Plan and Search</span></div><b data-receipt-status>Not run</b></header><dl><div><dt>Recovery</dt><dd data-receipt-recovery>—</dd></div><div><dt>Progress kept</dt><dd data-receipt-retained>—</dd></div><div><dt>Work repeated</dt><dd data-receipt-repeated>—</dd></div><div><dt>Old worker write</dt><dd data-receipt-fence>—</dd></div></dl></article>',
       '    </div>',
       '  </section>',
       '  <div class="lab-shell">',
       '    <section class="lab-trace" aria-label="Execution trace">',
-      '      <header><div><span class="lab-header-label">LIVE RUN</span><strong>report-204</strong></div><span class="status-pill" data-status>Idle</span></header>',
-      '      <ol class="lab-progress" aria-label="Workflow progress">',
+      '      <header><div><span class="lab-header-label">WORKFLOW</span><strong>report-204</strong></div><span class="status-pill" data-status>Ready</span></header>',
+      '      <ol class="lab-progress" aria-label="Recovery steps">',
       '        <li data-rank="0"><span>01</span><strong data-progress-label>Plan</strong></li><li data-rank="1"><span>02</span><strong data-progress-label>Search</strong></li><li data-rank="2"><span>03</span><strong data-progress-label>Summarize</strong></li>',
       '        <li data-rank="3"><span>04</span><strong data-progress-label>Crash</strong></li><li data-rank="4"><span>05</span><strong data-progress-label>Restart</strong></li><li data-rank="5"><span>06</span><strong data-progress-label>Finish</strong></li>',
       '      </ol>',
       '      <div class="lab-runtime">',
-      '        <article class="lab-worker" data-worker-a><span>WORKER A</span><strong data-worker-a-label>Ready</strong><small data-worker-a-detail>original process</small></article>',
+      '        <article class="lab-worker" data-worker-a><span>ORIGINAL WORKER</span><strong data-worker-a-label>Ready</strong><small data-worker-a-detail>original worker</small></article>',
       '        <div class="lab-link" aria-hidden="true"><span></span><b data-link-a>memory</b></div>',
-      '        <article class="lab-store"><span data-store-kicker>PROCESS MEMORY</span><strong data-store-title>Volatile working state</strong><dl><div><dt>Current state</dt><dd data-flow-state>Ready</dd></div><div><dt>Fence</dt><dd data-fence>Not used</dd></div></dl><code data-persisted>no values yet</code></article>',
+      '        <article class="lab-store"><span data-store-kicker>NO SAVED PROGRESS</span><strong data-store-title>Process memory</strong><dl><div><dt>Current state</dt><dd data-flow-state>Ready</dd></div><div><dt>Old worker write</dt><dd data-fence>Not needed</dd></div></dl><code data-persisted>no values yet</code></article>',
       '        <div class="lab-link" aria-hidden="true"><span></span><b data-link-b>restart</b></div>',
-      '        <article class="lab-worker" data-worker-b><span>WORKER B</span><strong data-worker-b-label>Standby</strong><small data-worker-b-detail>replacement process</small></article>',
+      '        <article class="lab-worker" data-worker-b><span>REPLACEMENT WORKER</span><strong data-worker-b-label>Standby</strong><small data-worker-b-detail>replacement worker</small></article>',
       '      </div>',
-      '      <div class="lab-message"><span class="lab-message-marker" aria-hidden="true"></span><p data-message>Ready to run the restart path.</p></div>',
+      '      <div class="lab-message"><span class="lab-message-marker" aria-hidden="true"></span><p data-message>Choose a path, then run it. The crash happens during Summarize.</p></div>',
       '    </section>',
       '    <section class="lab-code" aria-label="Implementation code">',
       '      <header><div><span class="file-dot" aria-hidden="true">py</span><strong data-code-file>research_process.py</strong></div><span class="lab-code-mode" data-code-mode>Process memory</span></header>',
@@ -99,7 +99,7 @@
       '<span class="code-section" data-code-phase="idle">flow.start("report-204", payload={"topic": "workflow recovery"})</span>',
       '<span data-code-phase="idle">flow.worker().run()</span>',
       '      </code></pre>',
-      '      <footer><span data-code-footer>Crash loses local results. Restart repeats Plan and Search.</span><strong data-code-pointer>Ready</strong></footer>',
+      '      <footer><span data-code-footer>The crash point is during Summarize.</span><strong data-code-pointer>Ready</strong></footer>',
       '    </section>',
       '  </div>',
       '</div>'
@@ -150,7 +150,26 @@
       receipt.querySelector("[data-receipt-recovery]").textContent = result ? result.recovery : "—";
       receipt.querySelector("[data-receipt-retained]").textContent = result ? result.retained : "—";
       receipt.querySelector("[data-receipt-repeated]").textContent = result ? result.repeated : "—";
-      receipt.querySelector("[data-receipt-fence]").textContent = result ? result.fence : mode === "unmanaged" ? "Not used" : "—";
+      receipt.querySelector("[data-receipt-fence]").textContent = result ? result.fence : mode === "unmanaged" ? "Not needed" : "—";
+    }
+
+    function displayMessage(state) {
+      var messages = {
+        idle: "Choose a path, then run it. The crash happens during Summarize.",
+        plan: "Worker A is planning. Continue until the crash point.",
+        replan: "The restart path is repeating Plan from the beginning.",
+        search: "Worker A saved the search results. Continue to Summarize.",
+        research: "The restart path is repeating Search after the crash.",
+        summarize: "Ready: crash the original worker now to test recovery.",
+        resummarize: "The restart path is summarizing the repeated results.",
+        crashed: "Worker A stopped. Continue to see what the replacement can recover.",
+        recovering: "Worker B resumed at Summarize with saved Plan and Search.",
+        restarting: "Worker B is starting again at Plan because progress was not saved.",
+        complete: state.mode === "durable"
+          ? "Done. Saved Plan and Search were used; no earlier states repeated."
+          : "Done. The restart path repeated Plan and Search (2 states)."
+      };
+      return messages[state.phase] || state.message;
     }
 
     function updateVerdict(state) {
@@ -158,16 +177,16 @@
       updateReceipt("durable", state);
       if (results.unmanaged && results.durable) {
         verdictTitle.textContent = "Same crash. Different recovery.";
-        verdictSummary.textContent = "Restart repeated 2 states. Durable resume repeated 0.";
+        verdictSummary.textContent = "Restart repeated 2 states; saved progress repeated 0.";
         verdictAction.hidden = true;
       } else if (results.unmanaged || results.durable) {
-        verdictTitle.textContent = results.unmanaged ? "Restart path recorded" : "Durable resume recorded";
+        verdictTitle.textContent = results.unmanaged ? "Restart result recorded" : "Resume result recorded";
         verdictSummary.textContent = "Run the other path to keep both results side by side.";
         verdictAction.hidden = false;
-        verdictAction.textContent = results.unmanaged ? "Run durable resume" : "Run restart path";
+        verdictAction.textContent = results.unmanaged ? "Run saved-progress path" : "Run restart path";
       } else {
-        verdictTitle.textContent = state.status === "IDLE" ? "Waiting for both runs" : "Running the " + (state.mode === "durable" ? "durable resume" : "restart") + " path";
-        verdictSummary.textContent = "The same crash either loses process memory or resumes from named state.";
+        verdictTitle.textContent = state.status === "IDLE" ? "Choose a path, then run it" : "Running the " + (state.mode === "durable" ? "saved-progress" : "restart") + " path";
+        verdictSummary.textContent = "The same crash either loses local progress or resumes saved Plan and Search.";
         verdictAction.hidden = true;
       }
     }
@@ -216,14 +235,14 @@
       workerB.classList.toggle("is-active", workerBActive);
       workerB.classList.toggle("is-complete", state.activeWorker === "worker-b" && state.status === "COMPLETED");
 
-      if (workerAStopped) workerALabel.textContent = durable ? "Lease expired" : "Process stopped";
+      if (workerAStopped) workerALabel.textContent = durable ? "Original stopped" : "Process stopped";
       else workerALabel.textContent = workerAActive ? "Running" : "Ready";
 
       if (!workerBActive) workerBLabel.textContent = "Standby";
       else if (state.status === "COMPLETED") workerBLabel.textContent = "Completed";
-      else if (durable) workerBLabel.textContent = "Resuming state";
-      else if (phaseIsReplay(state.phase)) workerBLabel.textContent = "Repeating work";
-      else workerBLabel.textContent = "Restarting";
+      else if (durable) workerBLabel.textContent = "Resuming saved progress";
+      else if (phaseIsReplay(state.phase)) workerBLabel.textContent = "Repeating earlier work";
+      else workerBLabel.textContent = "Starting over";
     }
 
     engine.subscribe(function (envelope) {
@@ -253,8 +272,8 @@
       codeFile.textContent = copy.codeFile;
       codeMode.textContent = copy.codeMode;
       codeFooter.textContent = durable
-        ? "Saved state lets Worker B resume at Summarize."
-        : "Crash loses local results. Restart repeats Plan and Search.";
+        ? "Saved Plan and Search let Worker B resume at Summarize."
+        : "The crash loses local results, so Worker B repeats Plan and Search.";
 
       updateProgress(state, rank, copy);
       updateWorkers(state);
@@ -267,26 +286,28 @@
       linkA.textContent = copy.firstLink;
       linkB.textContent = copy.secondLink;
       flowState.textContent = global.FerricDemo.phaseLabel(state.phase);
-      fence.textContent = durable ? String(state.fencingToken) : "Not used";
+      if (!durable) fence.textContent = "Not needed";
+      else if (state.previousFencingToken) fence.textContent = "Old write blocked: " + state.previousFencingToken + " → " + state.fencingToken;
+      else fence.textContent = "Saved progress protected";
 
       var keys = Object.keys(durable ? state.persisted : state.volatile);
       if (keys.length) persisted.textContent = (durable ? "saved: " : state.repeatedSteps.length ? "rebuilt: " : "in memory: ") + keys.join(", ");
       else if (!durable && rank >= 3) persisted.textContent = "lost on crash: plan, search";
       else persisted.textContent = "no values yet";
 
-      message.textContent = state.message;
+      message.textContent = displayMessage(state);
 
       if (state.status === "COMPLETED") {
         results[state.mode] = durable ? {
-          recovery: "Durable resume",
+          recovery: "Resume saved progress",
           retained: "Plan + Search",
           repeated: "0 states",
-          fence: String(state.previousFencingToken || 41) + " → " + String(state.fencingToken)
+          fence: "Blocked: " + String(state.previousFencingToken || 41) + " → " + String(state.fencingToken)
         } : {
           recovery: "Restart from Plan",
           retained: "None",
           repeated: String(state.repeatedSteps.length) + " states",
-          fence: "Not used"
+          fence: "Not needed"
         };
       }
       updateVerdict(state);

@@ -211,3 +211,139 @@ h1, h2, h3, h4, .hero-pill, .badge-label, .ctrl-btn {
 .sdk-example-note { margin: 0 0 14px; color: #cbd5e1; font: 500 12.5px/1.6 var(--font-sans); letter-spacing: 0; }
 .sdk-example-note code { color: #fbbf24; }
 [data-narrative-code] { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* Clarity pass: present the billing schedule as a readable set of milestones
+   and keep the current customer consequence visible beside each readout. */
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .time-travel-panel,
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .tm-node,
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .account-status-box,
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .dunning-narrative-box,
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .telemetry-card,
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .current-run {
+  border-color: var(--fs-line, #aebbb5) !important;
+  border-radius: 3px !important;
+  background: var(--fs-paper-bright, #fcfefb) !important;
+  box-shadow: none !important;
+  color: var(--fs-ink, #0d222b) !important;
+}
+
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .time-travel-panel {
+  padding: 16px;
+}
+
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .tt-header {
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .tt-header span,
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .tt-header strong,
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .tmn-head,
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .tm-node small,
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .current-run small,
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .telemetry-sub {
+  color: var(--fs-ink-soft, #2e454e) !important;
+}
+
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .tt-slider {
+  background: var(--fs-line-soft, #d8dfda) !important;
+}
+
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .tt-slider::-webkit-slider-thumb {
+  background: var(--fs-signal-ink, #526b00);
+  box-shadow: none;
+}
+
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .tt-slider::-moz-range-thumb {
+  border: 0;
+  background: var(--fs-signal-ink, #526b00);
+}
+
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .tm-node {
+  min-height: 126px;
+  text-align: left;
+  transform: none !important;
+}
+
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .tm-node:hover,
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .tm-node:focus-visible {
+  border-color: var(--fs-signal-ink, #526b00) !important;
+  background: var(--fs-paper-bright, #fcfefb) !important;
+}
+
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .tm-node.is-active {
+  border-color: var(--fs-signal-ink, #526b00) !important;
+  background: var(--fs-signal-soft, #eff7cf) !important;
+  box-shadow: inset 0 -3px 0 var(--fs-signal-ink, #526b00) !important;
+}
+
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .tm-node.is-done {
+  border-color: var(--fs-green, #19765b) !important;
+  background: var(--fs-success-soft, #edf6f1) !important;
+}
+
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .tm-node.is-declined {
+  border-color: var(--fs-red, #b33a48) !important;
+  background: var(--fs-failure-soft, #fbf1f2) !important;
+  box-shadow: inset 0 -3px 0 var(--fs-red, #b33a48) !important;
+}
+
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .as-badge.trial {
+  background: var(--fs-signal-soft, #eff7cf) !important;
+  color: var(--fs-signal-ink, #526b00) !important;
+}
+
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .as-badge.pastdue {
+  background: var(--fs-failure-soft, #fbf1f2) !important;
+  color: var(--fs-red, #b33a48) !important;
+}
+
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .as-badge.active {
+  background: var(--fs-success-soft, #edf6f1) !important;
+  color: var(--fs-green, #19765b) !important;
+}
+
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .tm-node strong,
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .current-run strong,
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .telemetry-val,
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .dunning-narrative-box h3,
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .account-status-box [data-account-title] {
+  color: var(--fs-ink, #0d222b) !important;
+}
+
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .tmn-icon {
+  margin: 8px 0;
+  color: var(--fs-signal-ink, #526b00);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  line-height: 1.2;
+}
+
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .dunning-narrative-box [data-narrative-desc],
+body.fs-dispatch[data-fs-demo="subscription-dunning"] .account-status-box [data-account-desc] {
+  color: var(--fs-ink-soft, #2e454e) !important;
+}
+
+@media (max-width: 520px) {
+  body.fs-dispatch[data-fs-demo="subscription-dunning"] .stage-header {
+    align-items: stretch !important;
+    flex-direction: column;
+  }
+
+  body.fs-dispatch[data-fs-demo="subscription-dunning"] .stage-header > div:last-child {
+    display: grid !important;
+    grid-template-columns: 1fr;
+    width: 100%;
+  }
+
+  body.fs-dispatch[data-fs-demo="subscription-dunning"] .stage-header > div:last-child .ctrl-btn {
+    width: 100%;
+    white-space: normal;
+  }
+
+  body.fs-dispatch[data-fs-demo="subscription-dunning"] .timeline-milestones-grid {
+    grid-template-columns: 1fr;
+  }
+}

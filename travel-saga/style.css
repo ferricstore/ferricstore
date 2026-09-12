@@ -161,3 +161,125 @@ h1, h2, h3, h4, .hero-pill, .badge-label, .ctrl-btn {
 .ctrl-btn-group { display: inline-flex; align-items: center; gap: 8px; }
 .ctrl-btn { height: 38px; padding: 0 16px; border-radius: var(--radius-sm); background: rgba(255, 255, 255, 0.06); border: 1px solid var(--border-subtle); color: #fff; font-size: 13px; font-weight: 650; cursor: pointer; }
 .ctrl-btn:hover { background: rgba(255, 255, 255, 0.12); }
+
+/* Clarity pass: treat each booking and compensation step as a selectable
+   state, with a plain-language outcome beside the ledger values. */
+body.fs-dispatch[data-fs-demo="travel-saga"] .stage-header {
+  align-items: flex-start;
+}
+
+body.fs-dispatch[data-fs-demo="travel-saga"] .scenario-badge {
+  max-width: 32ch;
+  line-height: 1.35;
+}
+
+body.fs-dispatch[data-fs-demo="travel-saga"] .scenario-choice {
+  min-width: 142px;
+  white-space: normal;
+}
+
+body.fs-dispatch[data-fs-demo="travel-saga"] .saga-node {
+  min-height: 132px;
+  padding: 12px;
+  border: 1px solid var(--fs-line, #aebbb5) !important;
+  border-radius: 3px !important;
+  background: var(--fs-strip, #e7ece8) !important;
+  box-shadow: none !important;
+  color: var(--fs-ink, #0d222b) !important;
+  text-align: left;
+  transform: none !important;
+}
+
+body.fs-dispatch[data-fs-demo="travel-saga"] .saga-node:hover,
+body.fs-dispatch[data-fs-demo="travel-saga"] .saga-node:focus-visible {
+  border-color: var(--fs-signal-ink, #526b00) !important;
+  background: var(--fs-paper-bright, #fcfefb) !important;
+}
+
+body.fs-dispatch[data-fs-demo="travel-saga"] .saga-node.is-active {
+  border-color: var(--fs-signal-ink, #526b00) !important;
+  background: var(--fs-signal-soft, #eff7cf) !important;
+  box-shadow: inset 0 -3px 0 var(--fs-signal-ink, #526b00) !important;
+}
+
+body.fs-dispatch[data-fs-demo="travel-saga"] .saga-node.is-done {
+  border-color: var(--fs-green, #19765b) !important;
+  background: var(--fs-success-soft, #edf6f1) !important;
+}
+
+body.fs-dispatch[data-fs-demo="travel-saga"] .saga-node.is-failed {
+  border-color: var(--fs-red, #b33a48) !important;
+  background: var(--fs-failure-soft, #fbf1f2) !important;
+  box-shadow: inset 0 -3px 0 var(--fs-red, #b33a48) !important;
+  animation: none !important;
+}
+
+body.fs-dispatch[data-fs-demo="travel-saga"] .saga-node.is-compensated {
+  border-color: var(--fs-yellow, #8a6500) !important;
+  background: var(--fs-warning-soft, #f7f1db) !important;
+  box-shadow: inset 0 -3px 0 var(--fs-yellow, #8a6500) !important;
+}
+
+body.fs-dispatch[data-fs-demo="travel-saga"] .sn-head,
+body.fs-dispatch[data-fs-demo="travel-saga"] .saga-node small,
+body.fs-dispatch[data-fs-demo="travel-saga"] .current-run small {
+  color: var(--fs-muted, #566b72) !important;
+}
+
+body.fs-dispatch[data-fs-demo="travel-saga"] .saga-node strong,
+body.fs-dispatch[data-fs-demo="travel-saga"] .current-run strong,
+body.fs-dispatch[data-fs-demo="travel-saga"] .telemetry-val {
+  color: var(--fs-ink, #0d222b) !important;
+}
+
+body.fs-dispatch[data-fs-demo="travel-saga"] .sn-icon {
+  margin: 8px 0;
+  color: var(--fs-signal-ink, #526b00);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  line-height: 1.2;
+}
+
+body.fs-dispatch[data-fs-demo="travel-saga"] .ledger-box,
+body.fs-dispatch[data-fs-demo="travel-saga"] .saga-narrative-box,
+body.fs-dispatch[data-fs-demo="travel-saga"] .telemetry-card,
+body.fs-dispatch[data-fs-demo="travel-saga"] .current-run {
+  border-color: var(--fs-line, #aebbb5) !important;
+  border-radius: 3px !important;
+  background: var(--fs-paper-bright, #fcfefb) !important;
+  box-shadow: none !important;
+  color: var(--fs-ink, #0d222b) !important;
+}
+
+body.fs-dispatch[data-fs-demo="travel-saga"] .ledger-row {
+  border-color: var(--fs-line-soft, #d8dfda) !important;
+  color: var(--fs-ink-soft, #2e454e) !important;
+}
+
+body.fs-dispatch[data-fs-demo="travel-saga"] .ledger-box > div:first-child {
+  color: var(--fs-muted, #566b72) !important;
+}
+
+body.fs-dispatch[data-fs-demo="travel-saga"] .ledger-row strong,
+body.fs-dispatch[data-fs-demo="travel-saga"] .saga-narrative-box h3,
+body.fs-dispatch[data-fs-demo="travel-saga"] .saga-narrative-box [data-narrative-desc],
+body.fs-dispatch[data-fs-demo="travel-saga"] .telemetry-sub {
+  color: var(--fs-ink-soft, #2e454e) !important;
+}
+
+@media (max-width: 520px) {
+  body.fs-dispatch[data-fs-demo="travel-saga"] .stage-header > div:last-child {
+    display: grid !important;
+    grid-template-columns: 1fr;
+    width: 100%;
+  }
+
+  body.fs-dispatch[data-fs-demo="travel-saga"] .scenario-choice {
+    width: 100%;
+  }
+
+  body.fs-dispatch[data-fs-demo="travel-saga"] .saga-stations-grid {
+    grid-template-columns: 1fr;
+  }
+}

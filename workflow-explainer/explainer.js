@@ -4,13 +4,14 @@
   var mode = "before"; // "before" (Without Workflows) or "after" (With FerricStore)
   var currentStep = 0;
   var isPaused = false;
+  var hasStarted = false;
   var timer = null;
 
   var stepsData = {
     before: [
       {
         stationIndex: 0,
-        title: "1. Credit Card Charged ($150.00)",
+        title: "1. Card charged ($150.00)",
         badge: "STEP 1 · VOLATILE RAM",
         badgeType: "bad",
         desc: "Customer clicks \"Buy Sneakers\". The server charges $150 to their card, but only stores the confirmation in temporary server memory.",
@@ -27,7 +28,7 @@
       },
       {
         stationIndex: 1,
-        title: "2. Item Picked from Warehouse",
+        title: "2. Stock reserved",
         badge: "STEP 2 · VOLATILE RAM",
         badgeType: "bad",
         desc: "Warehouse reserves sneaker size. The reservation ID is also kept only in temporary server memory.",
@@ -44,7 +45,7 @@
       },
       {
         stationIndex: 2,
-        title: "3. Server Crash / Power Outage",
+        title: "3. Worker crashes",
         badge: "DISASTER OCCURS",
         badgeType: "bad",
         desc: "The cloud server suddenly crashes (OOM / timeout / network drop). Because there were no checkpoints, ALL memory is instantly wiped clean!",
@@ -61,7 +62,7 @@
       },
       {
         stationIndex: 3,
-        title: "4. Blind Full Restart (Customer Double-Billed)",
+        title: "4. Retry starts from the beginning",
         badge: "UNCHECKPOINTED RETRY",
         badgeType: "bad",
         desc: "A generic retry script restarts the order from the beginning. It doesn\x27t know Step 1 already ran, so it charges the customer\x27s card A SECOND TIME!",
@@ -78,7 +79,7 @@
       },
       {
         stationIndex: 4,
-        title: "5. Chaotic Outcome: Broken State & Refunds",
+        title: "5. Duplicate payment and inventory work",
         badge: "HIGH COST FAILURE",
         badgeType: "bad",
         desc: "The order eventually arrives, but the customer was billed twice ($300), warehouse inventory was deducted twice, and support must spend hours issuing refunds.",
@@ -97,7 +98,7 @@
     after: [
       {
         stationIndex: 0,
-        title: "1. Credit Card Charged ($150.00)",
+        title: "1. Card charged ($150.00)",
         badge: "STEP 1 · CHECKPOINT SAVED",
         badgeType: "good",
         desc: "Customer clicks \"Buy Sneakers\". The app charges $150 with a provider idempotency key, then durably advances workflow state.",
@@ -114,7 +115,7 @@
       },
       {
         stationIndex: 1,
-        title: "2. Item Picked from Warehouse",
+        title: "2. Stock reserved",
         badge: "STEP 2 · CHECKPOINT SAVED",
         badgeType: "good",
         desc: "Warehouse reserves sneaker size and the workflow commits the next state. External payment and inventory calls remain protected by their stable provider keys.",
@@ -131,7 +132,7 @@
       },
       {
         stationIndex: 2,
-        title: "3. Server Crash (State Safe in FerricStore)",
+        title: "3. Worker crashes; saved state stays",
         badge: "SHIELDED BY FERRICSTORE",
         badgeType: "good",
         desc: "The cloud server crashes mid-order! But unlike volatile RAM, FerricStore holds all completed steps safely on disk. Zero data is lost.",
@@ -148,7 +149,7 @@
       },
       {
         stationIndex: 3,
-        title: "4. Replacement Server Reclaims Durable State",
+        title: "4. Replacement worker resumes",
         badge: "FENCED RESUME",
         badgeType: "good",
         desc: "A new server claims the current state with a newer fence. The payment remains protected by its provider idempotency key.",
@@ -165,10 +166,10 @@
       },
       {
         stationIndex: 4,
-        title: "5. Delivery with Durable Completion",
+        title: "5. This order completes",
         badge: "DURABLE COMPLETION",
         badgeType: "good",
-        desc: "Order delivered on time. Durable state and guarded external effects let recovery continue without a stale worker overwriting newer progress.",
+        desc: "This order completes after recovery. Durable state and guarded external effects let the replacement worker continue without a stale worker overwriting newer progress.",
         checkpointVal: "WORKFLOW COMPLETED DURABLY",
         packagePos: "100%",
         pkgIcon: "#wf-icon-complete",
@@ -244,18 +245,18 @@
   function updateDynamicLabels() {
     if (mode === "after") {
       if (st4Icon) st4Icon.setAttribute("href", "#wf-icon-resume");
-      if (st4Title) st4Title.textContent = "Durable Resume";
-      if (st4Sub) st4Sub.textContent = "0 Duplicate Work";
+      if (st4Title) st4Title.textContent = "Resume saved step";
+      if (st4Sub) st4Sub.textContent = "No duplicate work";
       if (st5Icon) st5Icon.setAttribute("href", "#wf-icon-complete");
-      if (st5Title) st5Title.textContent = "Exact $150";
-      if (st5Sub) st5Sub.textContent = "Happy Customer";
+      if (st5Title) st5Title.textContent = "Complete this order";
+      if (st5Sub) st5Sub.textContent = "This run billed $150";
     } else {
       if (st4Icon) st4Icon.setAttribute("href", "#wf-icon-restart");
-      if (st4Title) st4Title.textContent = "Full Restart";
-      if (st4Sub) st4Sub.textContent = "Repeats Step 1 & 2";
+      if (st4Title) st4Title.textContent = "Restart from start";
+      if (st4Sub) st4Sub.textContent = "Repeats earlier work";
       if (st5Icon) st5Icon.setAttribute("href", "#wf-icon-penalty");
-      if (st5Title) st5Title.textContent = "$300 Penalty";
-      if (st5Sub) st5Sub.textContent = "Double Billed!";
+      if (st5Title) st5Title.textContent = "Duplicate charge";
+      if (st5Sub) st5Sub.textContent = "Customer billed $300";
     }
   }
 
@@ -329,8 +330,19 @@
     keepCurrentStageVisible(activeStation, list.length);
 
     // Controls
-    if (pauseBtn) pauseBtn.textContent = isPaused ? "Play" : "Pause";
-    if (liveStatusText) liveStatusText.textContent = isPaused ? "Paused" : "Auto-advancing animation";
+    if (prevBtn) prevBtn.disabled = currentStep === 0;
+    if (nextBtn) nextBtn.disabled = currentStep >= list.length - 1;
+    if (pauseBtn) {
+      var finished = hasStarted && currentStep >= list.length - 1 && isPaused;
+      pauseBtn.textContent = finished ? "Finished" : (!hasStarted || isPaused ? "Play" : "Pause");
+      pauseBtn.disabled = finished;
+      pauseBtn.setAttribute("aria-label", finished ? "Workflow finished; choose Replay to run it again" : "Pause or play the workflow");
+    }
+    if (liveStatusText) {
+      liveStatusText.textContent = !hasStarted
+        ? "Preview ready · choose Run to play"
+        : (finished ? "Finished · choose Replay to run again" : (isPaused ? "Paused · choose Play to continue" : "Playing automatically · Pause to inspect"));
+    }
   }
 
   function clearTimer() {
@@ -342,10 +354,16 @@
 
   function schedule() {
     clearTimer();
-    if (isPaused) return;
+    if (!hasStarted || isPaused || currentStep >= stepsData[mode].length - 1) {
+      if (hasStarted && currentStep >= stepsData[mode].length - 1) {
+        isPaused = true;
+        render();
+      }
+      return;
+    }
     var wait = currentStep === 2 ? 3200 : (currentStep === 4 ? 4000 : 2200);
     timer = window.setTimeout(function () {
-      currentStep = (currentStep + 1) % stepsData[mode].length;
+      currentStep += 1;
       render();
       schedule();
     }, wait);
@@ -356,14 +374,19 @@
     btn.addEventListener("click", function () {
       mode = btn.dataset.mode;
       currentStep = 0;
+      hasStarted = false;
+      isPaused = false;
+      clearTimer();
       render();
-      schedule();
     });
   });
 
   stationNodes.forEach(function (node, idx) {
     function jump() {
       currentStep = idx;
+      hasStarted = true;
+      isPaused = true;
+      clearTimer();
       render();
       schedule();
     }
@@ -379,6 +402,8 @@
   if (crashBtn) {
     crashBtn.addEventListener("click", function () {
       currentStep = 2; // Jump directly to crash step
+      hasStarted = true;
+      isPaused = false;
       render();
       schedule();
     });
@@ -386,7 +411,12 @@
 
   if (pauseBtn) {
     pauseBtn.addEventListener("click", function () {
-      isPaused = !isPaused;
+      if (!hasStarted) {
+        hasStarted = true;
+        isPaused = false;
+      } else {
+        isPaused = !isPaused;
+      }
       render();
       schedule();
     });
@@ -395,24 +425,29 @@
   if (prevBtn) {
     prevBtn.addEventListener("click", function () {
       var len = stepsData[mode].length;
-      currentStep = (currentStep - 1 + len) % len;
+      hasStarted = true;
+      isPaused = true;
+      clearTimer();
+      currentStep = Math.max(0, currentStep - 1);
       render();
-      schedule();
     });
   }
 
   if (nextBtn) {
     nextBtn.addEventListener("click", function () {
       var len = stepsData[mode].length;
-      currentStep = (currentStep + 1) % len;
+      hasStarted = true;
+      isPaused = true;
+      clearTimer();
+      currentStep = Math.min(len - 1, currentStep + 1);
       render();
-      schedule();
     });
   }
 
   if (replayBtn) {
     replayBtn.addEventListener("click", function () {
       currentStep = 0;
+      hasStarted = true;
       isPaused = false;
       render();
       schedule();
@@ -420,5 +455,4 @@
   }
 
   render();
-  schedule();
 })();

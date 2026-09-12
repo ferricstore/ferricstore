@@ -41,9 +41,13 @@
   var liveStatus = document.querySelector('[data-live-status]');
 
   var metricCpu = document.querySelector('[data-metric-cpu]');
+  var metricCpuSub = document.querySelector('[data-metric-cpu-sub]');
   var metricReclaim = document.querySelector('[data-metric-reclaim]');
+  var metricReclaimSub = document.querySelector('[data-metric-reclaim-sub]');
   var metricRisk = document.querySelector('[data-metric-risk]');
+  var metricRiskSub = document.querySelector('[data-metric-risk-sub]');
   var metricRev = document.querySelector('[data-metric-rev]');
+  var metricRevSub = document.querySelector('[data-metric-rev-sub]');
 
   var outcomeCallout = document.querySelector('[data-outcome-callout]');
   var outcomeLabel = document.querySelector('[data-outcome-label]');
@@ -98,7 +102,11 @@
     stepPills.forEach(function (pill) {
       var num = parseInt(pill.getAttribute('data-step-indicator'), 10);
       pill.classList.remove('is-active', 'is-done');
-      if (num === step) pill.classList.add('is-active');
+      pill.removeAttribute('aria-current');
+      if (num === step) {
+        pill.classList.add('is-active');
+        pill.setAttribute('aria-current', 'step');
+      }
       else if (num < step) pill.classList.add('is-done');
     });
   }
@@ -109,14 +117,14 @@
     updateStepperUI(1);
 
     if (livePill) livePill.className = 'live-pill';
-    if (liveStatus) liveStatus.textContent = 'STEP 1: HELD IN CART (10:00)';
+    if (liveStatus) liveStatus.textContent = 'STEP 1: HOLD ACTIVE (10:00 REMAINING)';
 
     // Buyer 1
     if (buyer1Card) buyer1Card.className = 'buyer-card buyer-1 is-owner';
     if (buyer1Tag) { buyer1Tag.className = 'buyer-tag'; buyer1Tag.textContent = '🛒 In Cart (Holding Seat)'; }
     if (timerDigits) timerDigits.textContent = '10:00';
     if (timerFill) { timerFill.style.width = '100%'; timerFill.style.background = 'linear-gradient(90deg, #f59e0b, #ef4444)'; }
-    if (buyer1Note) buyer1Note.textContent = 'Holding Seat A12 for 10:00 checkout...';
+    if (buyer1Note) buyer1Note.textContent = 'Buyer #1 can check out before the 10-minute hold ends.';
 
     // Seat
     if (seatBox) {
@@ -132,23 +140,27 @@
 
     // Buyer 2
     if (buyer2Card) buyer2Card.className = 'buyer-card buyer-2';
-    if (buyer2Tag) { buyer2Tag.className = 'buyer-tag waiting'; buyer2Tag.textContent = '⏳ Waiting Room (Pos #1)'; }
-    if (buyer2Status) buyer2Status.textContent = 'Waiting for Seat A12...';
-    if (buyer2Note) buyer2Note.textContent = 'Ready to claim if Buyer #1 abandons';
+    if (buyer2Tag) { buyer2Tag.className = 'buyer-tag waiting'; buyer2Tag.textContent = 'Waiting for Seat A12 (position 1)'; }
+    if (buyer2Status) buyer2Status.textContent = 'Waiting for Seat A12.';
+    if (buyer2Note) buyer2Note.textContent = 'Can claim the seat if the hold expires.';
 
     // Explanation
     if (expIcon) expIcon.textContent = '💡';
-    if (expTitle) expTitle.textContent = 'Step 1: Buyer #1 locks Seat #A12 for 10 minutes';
+    if (expTitle) expTitle.textContent = 'Step 1: Buyer #1 holds Seat A12 for 10 minutes';
     if (expDesc) expDesc.textContent = currentMode === 'before'
-      ? 'Redis sets a volatile key: redis.set("seat:A12", "buyer_1", ex=600). Click "2. 10m Expires" to fast-forward.'
-      : 'FerricStore persists the hold state without keeping an application handler blocked. Click "2. 10m Expires" to fast-forward.';
+      ? 'A Redis expiry key is temporary. Move to the next step to fast-forward to the timeout race.'
+      : 'The hold is saved as workflow state; no application handler waits 10 minutes. Move to the next step to fast-forward.';
 
     // Metrics
     if (currentMode === 'before') {
       if (metricCpu) metricCpu.textContent = '50,000 DB Polling Queries / sec';
+      if (metricCpuSub) metricCpuSub.textContent = 'Polling keeps checking for expiry';
       if (metricReclaim) metricReclaim.textContent = '45.0 sec (Cron Lag)';
+      if (metricReclaimSub) metricReclaimSub.textContent = 'Illustrative delay before reassignment';
       if (metricRisk) metricRisk.textContent = 'High (Double-Booking Hazard)';
+      if (metricRiskSub) metricRiskSub.textContent = 'Expiry and payment can race';
       if (metricRev) metricRev.textContent = '72% (Cart Leakage)';
+      if (metricRevSub) metricRevSub.textContent = 'Unclaimed holds can leak inventory';
 
       if (outcomeCallout) outcomeCallout.className = 'outcome-callout bad';
       if (outcomeLabel) outcomeLabel.textContent = 'CONCURRENCY MODE';
@@ -157,20 +169,26 @@
       highlightCodeLine(5);
     } else {
       if (metricCpu) metricCpu.textContent = 'No waiting handler held';
+      if (metricCpuSub) metricCpuSub.textContent = 'Scheduled state frees the worker while waiting';
       if (metricReclaim) metricReclaim.textContent = 'After hold expiry';
+      if (metricReclaimSub) metricReclaimSub.textContent = 'A newer owner can claim after expiry';
       if (metricRisk) metricRisk.textContent = 'State-Guarded Handoff';
+      if (metricRiskSub) metricRiskSub.textContent = 'Fencing rejects the stale write';
       if (metricRev) metricRev.textContent = 'Captured in this run';
+      if (metricRevSub) metricRevSub.textContent = 'Payment still needs provider idempotency';
 
       if (outcomeCallout) outcomeCallout.className = 'outcome-callout good';
       if (outcomeLabel) outcomeLabel.textContent = 'CONCURRENCY MODE';
       if (outcomeTitle) outcomeTitle.textContent = 'FERRICSTORE DURABLE TIMER';
-      if (outcomeSub) outcomeSub.textContent = 'The durable hold expires; the next buyer can claim ownership with a newer fence.';
+      if (outcomeSub) outcomeSub.textContent = 'The durable hold expires; the next buyer can claim ownership with a newer fence. Payment still needs a provider idempotency key.';
       highlightCodeLine(4);
     }
   }
 
   // --- STEP 2: 10m Timer Expires ---
   function runStep2(onDone) {
+    runStep1();
+    clearAllTimeouts();
     updateStepperUI(2);
 
     if (livePill) livePill.className = 'live-pill is-crash';
@@ -185,8 +203,8 @@
     if (expIcon) expIcon.textContent = '⏰';
     if (expTitle) expTitle.textContent = 'Step 2: 10-Minute Cart Hold Elapses';
     if (expDesc) expDesc.textContent = currentMode === 'before'
-      ? 'Redis key seat:A12 vanishes. But database still has status="held"! Click "3. Resolution" to see what happens.'
-      : 'Workflow wakes up from Raft log instantly. Checks payment status. Click "3. Resolution" to see the handoff.';
+      ? 'The Redis key disappears, but the database still says “held.” Move to the next step to see the two writes race.'
+      : 'The saved workflow state wakes up and checks payment status. Move to the next step to see the ownership handoff.';
 
     highlightCodeLine(currentMode === 'before' ? 8 : 7, true);
     if (onDone) animTimeouts.push(setTimeout(onDone, 1000));
@@ -194,6 +212,8 @@
 
   // --- STEP 3: Resolution ---
   function runStep3() {
+    runStep2();
+    clearAllTimeouts();
     updateStepperUI(3);
 
     if (currentMode === 'before') {
@@ -223,11 +243,11 @@
 
       if (expIcon) expIcon.textContent = '💥';
       if (expTitle) expTitle.textContent = 'Step 3 Disaster: Both Buyers Billed for 1 Seat!';
-      if (expDesc) expDesc.textContent = 'Because Redis key expiration was not atomic with the DB transaction, both Buyer #1 and Buyer #2 were charged $280 for Seat A12. Venue security will turn away Buyer #2 at the gate!';
+      if (expDesc) expDesc.textContent = 'Redis expiry was not atomic with the database update, so both buyers were charged $280 for Seat A12. The venue still has only one seat.';
 
       if (outcomeCallout) outcomeCallout.className = 'outcome-callout bad';
       if (outcomeLabel) outcomeLabel.textContent = 'FLASH SALE DISASTER';
-      if (outcomeTitle) outcomeTitle.textContent = 'DOUBLE-BOOKING &amp; CHARGEBACK DISASTER';
+      if (outcomeTitle) outcomeTitle.textContent = 'DOUBLE-BOOKING & CHARGEBACK DISASTER';
       if (outcomeSub) outcomeSub.textContent = 'Redis expiration lag caused Seat #A12 to be sold to Buyer #1 and Buyer #2 simultaneously ($560 total charged for 1 seat).';
 
       highlightCodeLine(10, true);
@@ -259,7 +279,7 @@
 
       if (expIcon) expIcon.textContent = '🎉';
       if (expTitle) expTitle.textContent = 'Step 3 Success: Fenced Seat Handoff';
-      if (expDesc) expDesc.textContent = 'The expired hold advanced to Buyer #2 with a newer fence. A stale worker cannot overwrite that state; payment remains a separately guarded effect.';
+      if (expDesc) expDesc.textContent = 'The expired hold advanced to Buyer #2 with a newer fence. A late worker cannot overwrite that state; payment remains a separately guarded effect.';
 
       if (outcomeCallout) outcomeCallout.className = 'outcome-callout good';
       if (outcomeLabel) outcomeLabel.textContent = 'CONCURRENCY OUTCOME';
@@ -289,7 +309,7 @@
       currentMode = btn.getAttribute('data-mode-btn') || 'after';
       document.body.setAttribute('data-mode', currentMode);
       updateActiveCodeBlock();
-      playStory();
+      runStep1();
     });
   });
 
@@ -311,6 +331,8 @@
   if (btnReset) btnReset.addEventListener('click', runStep1);
 
   // Init
+  document.body.setAttribute('data-mode', currentMode);
   updateActiveCodeBlock();
-  playStory();
+  // Leave the first state visible so visitors can choose Run or a Next step.
+  runStep1();
 })();

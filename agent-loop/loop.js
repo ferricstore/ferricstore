@@ -32,9 +32,13 @@
   var termStream = document.querySelector('[data-term-stream]');
 
   var metricBudget = document.querySelector('[data-metric-budget]');
+  var metricBudgetSub = document.querySelector('[data-metric-budget-sub]');
   var metricBreaker = document.querySelector('[data-metric-breaker]');
+  var metricBreakerSub = document.querySelector('[data-metric-breaker-sub]');
   var metricRehydrate = document.querySelector('[data-metric-rehydrate]');
+  var metricRehydrateSub = document.querySelector('[data-metric-rehydrate-sub]');
   var metricDedup = document.querySelector('[data-metric-dedup]');
+  var metricDedupSub = document.querySelector('[data-metric-dedup-sub]');
 
   var outcomeCallout = document.querySelector('[data-outcome-callout]');
   var outcomeLabel = document.querySelector('[data-outcome-label]');
@@ -96,38 +100,57 @@
   function resetToIdle() {
     clearAllTimeouts();
     if (turnsStack) turnsStack.innerHTML = '';
-    if (turnsCounter) turnsCounter.textContent = 'Turn 0 of 4';
+    if (turnsCounter) turnsCounter.textContent = 'Turn 0 of 4 · ready to run';
 
-    // Reset Budget Guard
-    if (guardBudgetCard) guardBudgetCard.className = 'guard-card';
-    if (guardBudgetVal) guardBudgetVal.textContent = '$0.00 / $5.00';
-    if (guardBudgetBadge) { guardBudgetBadge.className = 'guard-badge ok'; guardBudgetBadge.textContent = '✓ Within Safe Limit'; }
-    if (guardBudgetFill) { guardBudgetFill.style.width = '0%'; guardBudgetFill.style.background = 'linear-gradient(90deg, #10b981, #f59e0b)'; }
+    // Reset the guard readouts to match the selected execution mode.
+    if (currentMode === 'before') {
+      if (guardBudgetCard) guardBudgetCard.className = 'guard-card is-warning';
+      if (guardBudgetVal) guardBudgetVal.textContent = 'No spend cap';
+      if (guardBudgetBadge) { guardBudgetBadge.className = 'guard-badge warn'; guardBudgetBadge.textContent = '⚠️ No guard'; }
+      if (guardBudgetFill) { guardBudgetFill.style.width = '0%'; guardBudgetFill.style.background = '#f59e0b'; }
 
-    // Reset Breaker Guard
-    if (guardBreakerCard) guardBreakerCard.className = 'guard-card';
-    if (guardBreakerVal) guardBreakerVal.textContent = 'State: CLOSED (Healthy)';
-    if (guardBreakerBadge) { guardBreakerBadge.className = 'guard-badge ok'; guardBreakerBadge.textContent = '0 / 3 Errors'; }
-    if (guardBreakerFill) { guardBreakerFill.style.width = '0%'; guardBreakerFill.style.background = 'linear-gradient(90deg, #10b981, #ef4444)'; }
+      if (guardBreakerCard) guardBreakerCard.className = 'guard-card is-warning';
+      if (guardBreakerVal) guardBreakerVal.textContent = 'No circuit breaker';
+      if (guardBreakerBadge) { guardBreakerBadge.className = 'guard-badge warn'; guardBreakerBadge.textContent = '⚠️ No guard'; }
+      if (guardBreakerFill) { guardBreakerFill.style.width = '0%'; guardBreakerFill.style.background = '#f59e0b'; }
+    } else {
+      if (guardBudgetCard) guardBudgetCard.className = 'guard-card';
+      if (guardBudgetVal) guardBudgetVal.textContent = '$0.00 / $5.00';
+      if (guardBudgetBadge) { guardBudgetBadge.className = 'guard-badge ok'; guardBudgetBadge.textContent = '✓ Within Safe Limit'; }
+      if (guardBudgetFill) { guardBudgetFill.style.width = '0%'; guardBudgetFill.style.background = 'linear-gradient(90deg, #10b981, #f59e0b)'; }
+
+      if (guardBreakerCard) guardBreakerCard.className = 'guard-card';
+      if (guardBreakerVal) guardBreakerVal.textContent = 'State: CLOSED (Healthy)';
+      if (guardBreakerBadge) { guardBreakerBadge.className = 'guard-badge ok'; guardBreakerBadge.textContent = '0 / 3 Errors'; }
+      if (guardBreakerFill) { guardBreakerFill.style.width = '0%'; guardBreakerFill.style.background = 'linear-gradient(90deg, #10b981, #ef4444)'; }
+    }
 
     if (livePill) livePill.className = 'live-pill';
     if (liveStatus) liveStatus.textContent = 'READY';
 
     if (currentMode === 'before') {
       if (metricBudget) metricBudget.textContent = 'No Limit ($4,000 Risk)';
+      if (metricBudgetSub) metricBudgetSub.textContent = 'No cumulative spend guard';
       if (metricBreaker) metricBreaker.textContent = 'Disabled (Slams 503 APIs)';
+      if (metricBreakerSub) metricBreakerSub.textContent = 'Retries can continue during an outage';
       if (metricRehydrate) metricRehydrate.textContent = 'Lost on Crash (0.0ms)';
+      if (metricRehydrateSub) metricRehydrateSub.textContent = 'Process memory disappears on worker crash';
       if (metricDedup) metricDedup.textContent = '0% (Duplicate Tools)';
+      if (metricDedupSub) metricDedupSub.textContent = 'Workflow state does not deduplicate provider effects';
 
       if (outcomeCallout) outcomeCallout.className = 'outcome-callout bad';
       if (outcomeLabel) outcomeLabel.textContent = 'UNPROTECTED AGENT HAZARD';
-      if (outcomeTitle) outcomeTitle.textContent = 'RUNAWAY SPEND &amp; 3RD-PARTY OVERLOAD';
+      if (outcomeTitle) outcomeTitle.textContent = 'RUNAWAY SPEND & 3RD-PARTY OVERLOAD';
       if (outcomeSub) outcomeSub.textContent = 'Agent lacks financial budget caps and service circuit breakers. Infinite loops drain balances; outages cause 429 bans.';
     } else {
       if (metricBudget) metricBudget.textContent = '$5.00 Hard Ceiling';
+      if (metricBudgetSub) metricBudgetSub.textContent = 'Cumulative spend stops at the saved limit';
       if (metricBreaker) metricBreaker.textContent = 'Active (3-Fail Trip)';
+      if (metricBreakerSub) metricBreakerSub.textContent = 'Opens after 3 consecutive failures';
       if (metricRehydrate) metricRehydrate.textContent = 'Durable resume';
+      if (metricRehydrateSub) metricRehydrateSub.textContent = 'Saved state can resume from the next turn';
       if (metricDedup) metricDedup.textContent = 'Fenced state writes';
+      if (metricDedupSub) metricDedupSub.textContent = 'External tools still need idempotency keys';
 
       if (outcomeCallout) outcomeCallout.className = 'outcome-callout good';
       if (outcomeLabel) outcomeLabel.textContent = 'AGENT GUARDIAN OUTCOME';
@@ -140,7 +163,10 @@
     if (!turnsStack) return;
     var row = document.createElement('div');
     row.className = 'turn-item-compact ' + status;
-    row.innerHTML = `<div class="t-info"><strong>Turn ${num}: ${action}</strong><small>${status === 'done' ? '✓ Checkpointed' : (status === 'crashed' ? '❌ 503 Error' : '⚡ Trip Breaker')}</small></div><span class="t-cost">+${cost}</span>`;
+    var stateLabel = currentMode === 'before' ? 'Completed · memory only' : 'Completed · progress saved';
+    row.innerHTML = `<div class="t-info"><strong>Turn ${num}: ${action}</strong><small>${status === 'done' ? stateLabel : (status === 'crashed' ? '❌ API request failed' : '⚡ Trip Breaker')}</small></div><span class="t-cost">+${cost}</span>`;
+    row.setAttribute('role', 'listitem');
+    row.setAttribute('aria-label', 'Turn ' + num + ': ' + action.replace(/&amp;/g, '&') + '. Cost ' + cost + '. ' + (status === 'done' ? stateLabel : (status === 'crashed' ? 'API request failed.' : 'Circuit breaker trip.')));
     turnsStack.appendChild(row);
   }
 
@@ -148,6 +174,7 @@
   function runNormalSimulation() {
     clearLogs();
     resetToIdle();
+    if (liveStatus) liveStatus.textContent = 'RUNNING: RESEARCH BRIEFING';
     log('info', '🤖 Starting autonomous market research agent query: "Analyze EV battery supply chain trends"...');
 
     var turns = [
@@ -161,11 +188,13 @@
       animTimeouts.push(setTimeout(function () {
         if (turnsCounter) turnsCounter.textContent = `Turn ${t.num} of 4`;
         addTurnRow(t.num, t.action, t.cost, 'done');
-        log('success', `✓ [TURN ${t.num}] ${t.action} completed. Next workflow state committed durably.`);
+        log('success', currentMode === 'before'
+          ? `✓ [TURN ${t.num}] ${t.action} completed. Next state remains in worker memory.`
+          : `✓ [TURN ${t.num}] ${t.action} completed. Next workflow state committed durably.`);
 
         var pct = Math.round((t.spend / 5.00) * 100);
-        if (guardBudgetVal) guardBudgetVal.textContent = `$${t.spend.toFixed(2)} / $5.00`;
-        if (guardBudgetFill) guardBudgetFill.style.width = pct + '%';
+        if (guardBudgetVal) guardBudgetVal.textContent = currentMode === 'before' ? `$${t.spend.toFixed(2)} spent · no cap` : `$${t.spend.toFixed(2)} / $5.00`;
+        if (guardBudgetFill) guardBudgetFill.style.width = currentMode === 'before' ? '0%' : pct + '%';
 
         highlightCodeLine(idx === 0 ? 3 : 15);
       }, (idx + 1) * 600));
@@ -173,7 +202,9 @@
 
     animTimeouts.push(setTimeout(function () {
       if (liveStatus) liveStatus.textContent = 'SUCCESS: BRIEFING COMPLETE';
-      log('cyan', '🎉 Workflow finished in 4 turns ($0.44 total). Budget safe (9% used), Circuit Breaker healthy (0 errors).');
+      log('cyan', currentMode === 'before'
+        ? '🎉 Workflow finished in 4 turns ($0.44 total). No budget cap or circuit breaker protected this run.'
+        : '🎉 Workflow finished in 4 turns ($0.44 total). Budget safe (9% used), Circuit Breaker healthy (0 errors).');
     }, 3000));
   }
 
@@ -278,7 +309,8 @@
       currentMode = btn.getAttribute('data-mode-btn') || 'after';
       document.body.setAttribute('data-mode', currentMode);
       updateActiveCodeBlock();
-      runNormalSimulation();
+      resetToIdle();
+      clearLogs();
     });
   });
 
@@ -296,9 +328,11 @@
   if (btnPlay) btnPlay.addEventListener('click', runNormalSimulation);
   if (btnBudget) btnBudget.addEventListener('click', runBudgetCapSimulation);
   if (btnBreaker) btnBreaker.addEventListener('click', runBreakerSimulation);
-  if (btnReset) btnReset.addEventListener('click', function () { resetToIdle(); log('info', 'Reset. Choose a test button to run.'); });
+  if (btnReset) btnReset.addEventListener('click', function () { resetToIdle(); clearLogs(); log('info', 'Ready. Choose a case to run.'); });
 
   // Init
+  document.body.setAttribute('data-mode', currentMode);
   updateActiveCodeBlock();
-  runNormalSimulation();
+  // Leave the agent at a truthful ready state so visitors can choose a scenario.
+  resetToIdle();
 })();

@@ -3,12 +3,12 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Rate-Limiting &amp; Micro-Batching Stream | FerricStore Demos</title>
+  <title>Rate-limit a webhook rush | FerricStore Demos</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css">
-  <link rel="stylesheet" href="../shared/polish.css">
-  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=20">
+  <link rel="stylesheet" href="./style.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/polish.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=20260912d">
 </head>
 <body class="fs-dispatch">
   <!--
@@ -32,26 +32,26 @@
 
   <main class="container">
     <header class="hero">
-      <div class="hero-pill">🌊 HIGH-THROUGHPUT EVENT STREAMING</div>
-      <h1>Rate Limiting &amp; <span class="hero-gradient">Micro-Batching</span></h1>
+      <div class="hero-pill">🌊 WEBHOOK RUSH · DURABLE BUFFER</div>
+      <h1>Rate-limit a webhook rush:<br><span class="hero-gradient">save incoming work, send it at a safe pace</span></h1>
       <p class="hero-desc">
-        Model webhook bursts with a durable buffer, micro-batched commits, and token-bucket backpressure. The animation shows one configured workload; throughput, commit latency, and overload behavior depend on topology and limits.
+        This example receives Shopify webhooks faster than an OpenAI categorization API can accept them. Adjust the example rates to see incoming work wait in a durable buffer, commit in small groups, and leave at the configured limit. The values are example settings, not measurements.
       </p>
       <div class="demo-current-context" role="status" aria-live="polite">
-        <span>Current run</span>
-        <strong data-current-run-value>Shopify webhook surge → OpenAI categorization · 2,500 inbound → 100 downstream</strong>
+        <span>Current example</span>
+        <strong data-current-run-value>Shopify webhook surge → OpenAI categorization · 2,500 configured inbound → 100 configured downstream</strong>
       </div>
     </header>
 
     <section class="stage-card">
       <header class="stage-header">
         <div class="scenario-badge">
-          <span class="badge-label" style="background: rgba(6, 182, 212, 0.18); color: #67e8f9;">STREAM PIPELINE</span>
-          <strong>Shopify Webhook Surge ➔ OpenAI Categorization API</strong>
+              <span class="badge-label" style="background: rgba(6, 182, 212, 0.18); color: #67e8f9;">WEBHOOK PIPELINE</span>
+              <strong>Shopify webhook rush ➔ OpenAI categorization API</strong>
         </div>
         <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-          <button class="ctrl-btn burst-btn" data-burst-btn>⚡ Trigger 5,000 Burst Surge</button>
-          <button class="ctrl-btn" data-reset-btn>↺ Reset Defaults</button>
+          <button class="ctrl-btn burst-btn" data-burst-btn>⚡ Set inbound rate to 5,000</button>
+          <button class="ctrl-btn" data-reset-btn>↺ Reset example</button>
         </div>
       </header>
 
@@ -59,27 +59,27 @@
       <div class="sliders-box">
         <div class="slider-group">
           <label>
-            <span>📥 Inbound Webhook Ingest Rate:</span>
+            <span>📥 Incoming webhook rate</span>
             <strong style="color: #67e8f9;" data-inbound-label>2,500 events / sec</strong>
           </label>
-          <input type="range" min="100" max="5000" step="100" value="2500" class="stream-slider cyan" data-inbound-slider aria-label="Inbound Flood Slider">
+          <input type="range" min="100" max="5000" step="100" value="2500" class="stream-slider cyan" data-inbound-slider aria-label="Incoming webhook rate">
           <div class="slider-ticks">
-            <span>100 ev/s (Calm)</span>
-            <span>2,500 ev/s (Normal)</span>
-            <span>5,000 ev/s (Surge Spike)</span>
+            <span>100 events/s (low)</span>
+            <span>2,500 events/s (example)</span>
+            <span>5,000 events/s (burst setting)</span>
           </div>
         </div>
 
         <div class="slider-group">
           <label>
-            <span>🎯 Downstream API Rate Limit:</span>
-            <strong style="color: #34d399;" data-outbound-label>100 req / sec (Max)</strong>
+            <span>🎯 Downstream API limit</span>
+            <strong style="color: #34d399;" data-outbound-label>100 req / sec (configured)</strong>
           </label>
-          <input type="range" min="20" max="500" step="10" value="100" class="stream-slider green" data-outbound-slider aria-label="Outbound Rate Slider">
+          <input type="range" min="20" max="500" step="10" value="100" class="stream-slider green" data-outbound-slider aria-label="Downstream API request limit">
           <div class="slider-ticks">
-            <span>20 req/s</span>
-            <span>100 req/s (Standard API Tier)</span>
-            <span>500 req/s</span>
+            <span>20 requests/s</span>
+            <span>100 requests/s (example)</span>
+            <span>500 requests/s</span>
           </div>
         </div>
       </div>
@@ -87,48 +87,48 @@
       <!-- Real-Time Visual Pipeline Flow Arena -->
       <div class="stream-arena">
         <div class="arena-header">
-          <span class="arena-title">LIVE TRAFFIC SMOOTHING PIPELINE</span>
-          <span class="stream-live-tag"><span class="pulse-dot"></span> STREAM ACTIVE</span>
+          <span class="arena-title">What happens to each webhook</span>
+          <span class="stream-live-tag"><span class="pulse-dot"></span> EXAMPLE READY</span>
         </div>
 
         <div class="pipeline-grid">
           <!-- Step 1: Ingest -->
           <div class="pipe-chamber ingest-chamber">
             <div class="chamber-head">
-              <small>1. INGESTION BURST</small>
+              <small>1. Incoming webhooks</small>
               <strong data-pipe-ingest>2,500 Webhooks/s</strong>
             </div>
             <div class="chamber-visual">
               <div class="particle-track inbound" data-particle-inbound>
                 <div class="particle-wave"></div>
               </div>
-              <div class="pipe-stat">Shopify Webhooks Ingested</div>
+              <div class="pipe-stat">Shopify sends work into the buffer</div>
             </div>
           </div>
 
           <div class="pipe-connector">➔</div>
 
-          <!-- Step 2: Buffer & Raft Micro-Batching -->
+          <!-- Step 2: Buffer and small groups -->
           <div class="pipe-chamber batch-chamber">
             <div class="chamber-head">
-              <small>2. RAFT MICRO-BATCHING</small>
-              <strong data-pipe-batch>50 Items / Batch</strong>
+              <small>2. Save in small groups</small>
+              <strong data-pipe-batch>50 items / group (example)</strong>
             </div>
             <div class="chamber-visual">
               <div class="buffer-bar-wrap">
                 <div class="buffer-bar" data-buffer-bar style="width: 45%;"></div>
               </div>
-              <div class="pipe-stat" data-buffer-stat>Queue Buffer: 45 / 5,000 · Durable batch</div>
+              <div class="pipe-stat" data-buffer-stat>Example buffer: 45 / 5,000 · waiting for the API limit</div>
             </div>
           </div>
 
           <div class="pipe-connector">➔</div>
 
-          <!-- Step 3: Token Bucket -->
+          <!-- Step 3: Release gate -->
           <div class="pipe-chamber bucket-chamber">
             <div class="chamber-head">
-              <small>3. TOKEN BUCKET</small>
-              <strong data-pipe-bucket>100 Tokens / Sec</strong>
+              <small>3. Release gate</small>
+              <strong data-pipe-bucket>Up to 100 requests / sec</strong>
             </div>
             <div class="chamber-visual">
               <div class="bucket-visual">
@@ -136,7 +136,7 @@
                   <span class="t-token">●</span><span class="t-token">●</span><span class="t-token">●</span><span class="t-token">●</span><span class="t-token">●</span>
                 </div>
               </div>
-              <div class="pipe-stat">Leak Rate: 100/sec (modeled within limit)</div>
+              <div class="pipe-stat">Only the configured number leaves each second</div>
             </div>
           </div>
 
@@ -145,14 +145,14 @@
           <!-- Step 4: Dispatch -->
           <div class="pipe-chamber dispatch-chamber">
             <div class="chamber-head">
-              <small>4. DOWNSTREAM DISPATCH</small>
-              <strong data-pipe-dispatch>100 Req/s Clean</strong>
+              <small>4. Send to the API</small>
+              <strong data-pipe-dispatch>100 requests/s (configured)</strong>
             </div>
             <div class="chamber-visual">
               <div class="particle-track outbound" data-particle-outbound>
                 <div class="particle-wave-smooth"></div>
               </div>
-              <div class="pipe-stat">OpenAI API (modeled healthy)</div>
+              <div class="pipe-stat">OpenAI API receives work at its configured limit</div>
             </div>
           </div>
         </div>
@@ -161,34 +161,34 @@
       <!-- Live Telemetry -->
       <div class="telemetry-grid">
         <div class="telemetry-card">
-          <small>Inbound Ingestion</small>
+          <small>Incoming webhooks</small>
           <div class="telemetry-val" style="color: #67e8f9;" data-val-inbound>2,500 / s</div>
-          <span class="telemetry-sub">Raw webhook traffic</span>
+          <span class="telemetry-sub">Configured source rate</span>
         </div>
         <div class="telemetry-card">
-          <small>Downstream Dispatched</small>
+          <small>Sent to downstream API</small>
           <div class="telemetry-val" style="color: #34d399;" data-val-outbound>100 / s</div>
-          <span class="telemetry-sub">Throttled &amp; protected</span>
+          <span class="telemetry-sub">Released at the configured limit</span>
         </div>
         <div class="telemetry-card">
-          <small>HTTP 429 Errors</small>
+          <small>HTTP 429 responses</small>
           <div class="telemetry-val" style="color: #34d399;" data-val-dropped>0 in this run</div>
-          <span class="telemetry-sub">Modeled below the configured limit</span>
+          <span class="telemetry-sub">Example remains below the configured limit</span>
         </div>
         <div class="telemetry-card">
-          <small>Batch Commit Latency</small>
+          <small>Commit latency</small>
           <div class="telemetry-val" style="color: #38bdf8;" data-val-latency>Workload-dependent</div>
-          <span class="telemetry-sub">Durability and topology dependent</span>
+          <span class="telemetry-sub">Depends on durability and topology</span>
         </div>
       </div>
 
       <!-- Controls & Status -->
       <footer class="stage-footer">
         <div class="ctrl-btn-group">
-          <button class="ctrl-btn" data-pause>⏸ Pause Stream</button>
+          <button class="ctrl-btn" data-pause>⏸ Pause incoming work</button>
         </div>
-        <div class="status-summary" style="font-size: 13px; color: #cbd5e1;">
-          🛡️ <strong>FerricStore Ingestion:</strong> Traffic surge is safely buffered on disk and smoothed to downstream API limits.
+        <div class="status-summary" data-status-summary style="font-size: 13px; color: #cbd5e1;">
+          🛡️ <strong>With FerricStore:</strong> Incoming webhooks wait in saved buffer space while the API accepts only the configured rate.
         </div>
       </footer>
     </section>
@@ -215,8 +215,8 @@ def categorize(ctx):
 flow.worker().run()</code></pre>
     </section>
   </main>
-  <script src="./stream.js?v=4"></script>
-  <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=16"></script>
+  <script src="./stream.js?v=20260912c"></script>
+  <script src="../shared/accuracy.js?v=20260912c"></script>
+  <script src="../shared/dispatch.js?v=20260912c"></script>
 </body>
 </html>

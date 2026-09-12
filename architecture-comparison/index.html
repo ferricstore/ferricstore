@@ -6,9 +6,9 @@
   <title>Workflows vs. Queues, In-Memory &amp; DBs | FerricStore</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
   <meta name="description" content="An interactive architectural comparison showing how In-Memory tasks, Message Queues (SQS/RabbitMQ), DIY Database polling, and FerricStore Durable Workflows behave under real-world server crashes.">
-  <link rel="stylesheet" href="./style.css">
-  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=20">
+  <link rel="stylesheet" href="./style.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=20260912d">
 </head>
 <body class="fs-dispatch">
   <!--
@@ -35,13 +35,13 @@
   <main class="container">
     <!-- Hero Header -->
     <header class="hero">
-      <div class="hero-pill">⚡ ARCHITECTURAL MATRIX</div>
+      <div class="hero-pill">⚡ CHOOSE HOW PROGRESS IS SAVED</div>
       <h1>
-        Workflows vs. Other Solutions.<br>
-        <span class="hero-gradient">What Happens When Servers Die?</span>
+        Four ways to handle the same crash.<br>
+        <span class="hero-gradient">See what each one remembers.</span>
       </h1>
       <p class="hero-desc">
-        Why do engineering teams adopt <strong>durable workflows</strong> when they already have Redis queues, Celery, RabbitMQ, SQS, or Postgres cron jobs? Switch paradigms below to see the failure modes in action.
+        Choose an approach, then move through the same payment and AI task. The server stops before the final step so you can compare what is saved and where recovery begins.
       </p>
 
       <!-- 4 Paradigm Selector Cards -->
@@ -50,40 +50,40 @@
         <button class="paradigm-btn is-active" type="button" role="tab" data-arch="memory" aria-selected="true">
           <div class="p-header">
             <span class="p-icon">🧠</span>
-            <span class="p-tag">VOLATILE RAM</span>
+            <span class="p-tag">MEMORY ONLY</span>
           </div>
-          <strong>In-Memory Async</strong>
-          <small>FastAPI BackgroundTasks · Threading · Promises</small>
+          <strong>In-memory task</strong>
+          <small>Progress disappears when the process stops</small>
         </button>
 
         <!-- 2. Message Queues -->
         <button class="paradigm-btn" type="button" role="tab" data-arch="queue" aria-selected="false">
           <div class="p-header">
             <span class="p-icon">📬</span>
-            <span class="p-tag">JOB LEVEL</span>
+            <span class="p-tag">WHOLE JOB RETRY</span>
           </div>
-          <strong>Message Queues</strong>
-          <small>AWS SQS · RabbitMQ · Redis PubSub · BullMQ</small>
+          <strong>Message queue</strong>
+          <small>A retry usually starts with the whole message</small>
         </button>
 
         <!-- 3. DIY Database Polling -->
         <button class="paradigm-btn" type="button" role="tab" data-arch="db" aria-selected="false">
           <div class="p-header">
             <span class="p-icon">🗄️</span>
-            <span class="p-tag">HIGH CONTENTION</span>
+            <span class="p-tag">POLLING</span>
           </div>
-          <strong>DIY Database + Cron</strong>
-          <small>Postgres Status Columns · Advisory Locks · Cron</small>
+          <strong>Database + scheduled check</strong>
+          <small>Saved rows, but recovery waits for a poll</small>
         </button>
 
         <!-- 4. FerricStore Durable Workflows -->
         <button class="paradigm-btn" type="button" role="tab" data-arch="workflow" aria-selected="false">
           <div class="p-header">
             <span class="p-icon">🛡️</span>
-            <span class="p-tag">DURABLE + FENCED</span>
+            <span class="p-tag">SAVED STATES</span>
           </div>
-          <strong>FerricStore Workflows</strong>
-          <small>Explicit States · Fencing · Lease-Aware Resume</small>
+          <strong>FerricStore workflow</strong>
+          <small>Continue from a saved state after a crash</small>
         </button>
       </div>
     </header>
@@ -93,11 +93,11 @@
       <header class="stage-header">
         <div class="scenario-badge">
           <span class="badge-label">SCENARIO</span>
-          <strong>AI Order: $200 Payment + 1,500 Token LLM Pipeline</strong>
+          <strong>Same test: $200 payment + 1,500-token AI task</strong>
         </div>
         <div class="stage-actions">
           <button class="crash-btn" type="button" data-smash-crash title="Trigger an immediate server outage">
-            <span>💥 Simulate Server Crash Now!</span>
+            <span>Stop the server at the crash point</span>
           </button>
         </div>
       </header>
@@ -112,7 +112,7 @@
           </div>
           <div class="flow-node-icon">💳</div>
           <strong>1. Charge $200.00</strong>
-          <small data-n0-desc>Payment Gateway API</small>
+          <small data-n0-desc>Payment call</small>
         </div>
 
         <!-- Step 2 -->
@@ -122,8 +122,8 @@
             <span class="node-state-pill" data-n1-state>PENDING</span>
           </div>
           <div class="flow-node-icon">🤖</div>
-          <strong>2. LLM Inference</strong>
-          <small data-n1-desc>1,500 Tokens ($0.45)</small>
+          <strong>2. Generate summary</strong>
+          <small data-n1-desc>1,500 tokens ($0.45)</small>
         </div>
 
         <!-- Step 3 -->
@@ -133,8 +133,8 @@
             <span class="node-state-pill" data-n2-state>CRASH POINT</span>
           </div>
           <div class="flow-node-icon">💥</div>
-          <strong>3. Server Dies!</strong>
-          <small data-n2-desc>OOM / Spot Termination</small>
+          <strong>3. Server stops</strong>
+          <small data-n2-desc>The process is interrupted</small>
         </div>
 
         <!-- Step 4 -->
@@ -144,8 +144,8 @@
             <span class="node-state-pill" data-n3-state>RECOVERY</span>
           </div>
           <div class="flow-node-icon" data-n3-icon>🛡️</div>
-          <strong data-n3-title>4. Durable Delivery</strong>
-          <small data-n3-desc>Send Customer Receipt</small>
+          <strong data-n3-title>4. Continue or lose progress</strong>
+          <small data-n3-desc>Send the receipt</small>
         </div>
       </div>
 
@@ -154,10 +154,10 @@
         <div class="showcase-icon-avatar" data-showcase-avatar>🛡️</div>
         <div class="showcase-details">
           <div class="showcase-header">
-            <span class="showcase-badge badge-good" data-showcase-badge>FERRICSTORE · DURABLE STATE RESUME</span>
+          <span class="showcase-badge badge-good" data-showcase-badge>SAVED PROGRESS</span>
             <span class="step-pill" data-step-counter>Step 1 of 4</span>
           </div>
-          <h3 data-showcase-title>1. 💳 Payment Authorized ($200.00)</h3>
+          <h3 data-showcase-title>1. Payment authorized ($200.00)</h3>
           <p data-showcase-desc>
             FerricStore commits explicit workflow state durably. Protect the payment call separately with a stable operation digest or provider idempotency key.
           </p>
@@ -167,25 +167,25 @@
       <!-- Real-Time Metrics & Cost Telemetry Grid -->
       <div class="telemetry-grid">
         <div class="telemetry-card" data-card-billed>
-          <small>Total Money Billed</small>
+          <small>Money billed</small>
           <div class="telemetry-val" data-val-billed>$200.00</div>
           <span class="telemetry-sub" data-sub-billed>Stable provider key required</span>
         </div>
 
         <div class="telemetry-card" data-card-tokens>
-          <small>LLM Tokens Consumed</small>
+          <small>AI tokens used</small>
           <div class="telemetry-val" data-val-tokens>1,500</div>
           <span class="telemetry-sub" data-sub-tokens>0 repeated tokens</span>
         </div>
 
         <div class="telemetry-card" data-card-latency>
-          <small>Crash Recovery Latency</small>
+          <small>Recovery timing</small>
           <div class="telemetry-val" data-val-latency>Lease-aware</div>
           <span class="telemetry-sub" data-sub-latency>Deployment-dependent recovery</span>
         </div>
 
         <div class="telemetry-card is-success" data-card-reliability>
-          <small>Reliability Rating</small>
+          <small>What survives</small>
           <div class="telemetry-val" data-val-reliability>Configured durability</div>
           <span class="telemetry-sub" data-sub-reliability>State durability boundary</span>
         </div>
@@ -194,14 +194,14 @@
       <!-- Playback Controls Toolbar -->
       <footer class="stage-footer">
         <div class="ctrl-btn-group">
-          <button class="ctrl-btn" type="button" data-prev aria-label="Previous Step">⏮ Previous</button>
-          <button class="ctrl-btn" type="button" data-pause aria-label="Pause or Play">⏸ Pause</button>
-          <button class="ctrl-btn" type="button" data-next aria-label="Next Step">Next ⏭</button>
-          <button class="ctrl-btn" type="button" data-replay aria-label="Replay Scenario">↺ Replay</button>
+          <button class="ctrl-btn" type="button" data-prev aria-label="Previous step">⏮ Previous</button>
+          <button class="ctrl-btn" type="button" data-pause aria-label="Play or pause steps">▶ Play steps</button>
+          <button class="ctrl-btn" type="button" data-next aria-label="Next step">Next step ⏭</button>
+          <button class="ctrl-btn" type="button" data-replay aria-label="Reset example">↺ Reset example</button>
         </div>
         <div class="stage-live-indicator">
           <span class="pulse-indicator"></span>
-          <span data-live-status-text>Auto-advancing simulation</span>
+          <span data-live-status-text>Ready — choose an approach, then inspect each step</span>
         </div>
       </footer>
     </section>
@@ -228,7 +228,7 @@
               <td><span class="bad-tag">❌ Process RAM</span></td>
               <td><span class="warn-tag">⚠️ Message Body Only</span></td>
               <td><span class="warn-tag">⚠️ Custom SQL Rows</span></td>
-              <td class="td-highlight"><span class="good-tag">✓ Configured Durable Topology</span></td>
+              <td class="td-highlight"><span class="good-tag">✓ Configured saved-state topology</span></td>
             </tr>
             <tr>
               <td><strong>Crash Granularity</strong></td>
@@ -242,7 +242,7 @@
               <td><span class="bad-tag">❌ Impossible</span></td>
               <td><span class="bad-tag">❌ Redelivers Whole Message</span></td>
               <td><span class="warn-tag">⚠️ Complex Custom Sagas</span></td>
-              <td class="td-highlight"><span class="good-tag">✓ Automatic Idempotency Key</span></td>
+              <td class="td-highlight"><span class="good-tag">✓ Stable outside-call key</span></td>
             </tr>
             <tr>
               <td><strong>Zombie Worker Protection</strong></td>
@@ -256,7 +256,7 @@
               <td><span class="bad-tag">❌ Never (Data Lost)</span></td>
               <td><span class="warn-tag">⚠️ 30,000ms Visibility Timeout</span></td>
               <td><span class="warn-tag">⚠️ 5,000ms - 15,000ms Polling Loop</span></td>
-              <td class="td-highlight"><span class="good-tag">✓ Durable, Fenced Resume</span></td>
+              <td class="td-highlight"><span class="good-tag">✓ Saved progress after takeover</span></td>
             </tr>
 
             <tr>
@@ -373,8 +373,8 @@ checkout.worker().run()</code></pre>
     </section>
   </main>
 
-  <script src="./comparison.js?v=6"></script>
-  <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=16"></script>
+  <script src="./comparison.js?v=20260912c"></script>
+  <script src="../shared/accuracy.js?v=20260912c"></script>
+  <script src="../shared/dispatch.js?v=20260912c"></script>
 </body>
 </html>

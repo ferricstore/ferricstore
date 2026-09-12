@@ -28,7 +28,7 @@ job, charge = client.step(
     },
     to_state="reserve",
 )
-# job now carries the fresh lease + fence for the next step.`;
+# job now carries the fresh ownership proof for the next step.`;
 
   var llmContinueCode = `# ✓ DURABLE STEP: save the expensive result before rendering
 from ferricstore import FlowClient
@@ -74,70 +74,70 @@ job, remaining = client.step(
 
   var scenarios = {
     'double-charge': {
-      title: 'Scenario A: E-Commerce Checkout ($150.00 Order #8492)',
+      title: '$150 checkout: a charge is retried',
       leftCode: `<span class="c-comment"># ❌ NAIVE SCRIPT: No step persistence</span>\n<span class="c-kw">import</span> stripe, inventory, email\n\n<span class="c-kw">def</span> <span class="c-fn">process_order</span>(order_id, amount):\n    <span class="c-danger"># ❌ Unmemoized: Re-executes on retry &amp; bills card again!\n    charge = stripe.Charge.create(amount=amount)</span>\n    inventory.lock_sku(order_id)\n    <span class="c-crash-line"># 💥 Worker crashes here (SIGKILL / OOM)</span>\n    email.send_receipt(charge.id)`,
       stepsCode: doubleChargeContinueCode,
       statesCode: `<span class="c-comment"># ✓ CURRENT SDK: durable states + guarded external effects</span>\n<span class="c-kw">from</span> ferricstore <span class="c-kw">import</span> WorkflowClient, complete, transition\n\nclient = WorkflowClient.from_url(<span class="c-str">"ferric://127.0.0.1:6388"</span>)\nflow = client.workflow(type=<span class="c-str">"checkout-saga"</span>, initial_state=<span class="c-str">"charge"</span>)\n\n<span class="c-decorator">@flow.state</span>(<span class="c-str">"charge"</span>)\n<span class="c-kw">def</span> <span class="c-fn">charge</span>(ctx):\n    <span class="c-decorator">@ctx.effect</span>(<span class="c-str">"charge"</span>, <span class="c-str">"stripe.charge"</span>, operation_digest=f<span class="c-str">"charge:{ctx.id}:v1"</span>)\n    <span class="c-kw">def</span> <span class="c-fn">call_stripe</span>():\n        <span class="c-kw">return</span> stripe.Charge.create(\n            amount=ctx.payload[<span class="c-str">"amount"</span>], idempotency_key=f<span class="c-str">"{ctx.id}:charge:v1"</span>\n        )\n    res = call_stripe()\n    <span class="c-kw">return</span> transition(<span class="c-str">"reserve"</span>, payload=ctx.payload, values={<span class="c-str">"tx_id"</span>: res.id.encode()})\n\n<span class="c-decorator">@flow.state</span>(<span class="c-str">"reserve"</span>)\n<span class="c-kw">def</span> <span class="c-fn">reserve</span>(ctx):\n    inventory.lock_sku(ctx.payload[<span class="c-str">"order_id"</span>], idempotency_key=f<span class="c-str">"{ctx.id}:reserve:v1"</span>)\n    <span class="c-crash-line"># 💥 A crash cannot roll the workflow state backward</span>\n    <span class="c-kw">return</span> transition(<span class="c-str">"send_receipt"</span>, payload=ctx.payload)\n\n<span class="c-decorator">@flow.state</span>(<span class="c-str">"send_receipt"</span>, claim_values=[<span class="c-str">"tx_id"</span>])\n<span class="c-kw">def</span> <span class="c-fn">send_receipt</span>(ctx):\n    <span class="c-decorator">@ctx.effect</span>(<span class="c-str">"receipt"</span>, <span class="c-str">"email.send"</span>, operation_digest=f<span class="c-str">"receipt:{ctx.id}:v1"</span>)\n    <span class="c-kw">def</span> <span class="c-fn">send</span>(): email.send(ctx.value(<span class="c-str">"tx_id"</span>))\n    send()\n    <span class="c-kw">return</span> complete(result=<span class="c-str">b"paid"</span>)`,
       s1Title: 'Charge Customer $150.00',
       s1LeftSub: 'Stripe API: POST /v1/charges (tx_a48f2910)',
-      s1RightSubSteps: 'Continued to "reserve" with a fresh lease + fence',
-      s1RightSubStates: 'State "charge" committed to Raft quorum',
+      s1RightSubSteps: 'Continued to "reserve" with saved progress',
+      s1RightSubStates: 'Saved state "charge" before continuing',
       s2Title: 'Lock Warehouse Inventory (SKU #849)',
       s2Sub: 'Stock decremented 10 ➔ 9 in Postgres',
       s3Title: 'Send Customer Email Receipt',
       leftOutcome: '$300.00 CHARGED (DOUBLE BILLED!)',
       leftOutcomeSub: 'Step 1 was not persisted to disk. Celery retry re-called Stripe with a new transaction ID.',
       rightOutcome: 'DURABLE STATE + GUARDED CHARGE',
-      rightOutcomeSub: 'FerricStore fences stale state writes; Stripe needs a stable idempotency key or ctx.effect guard.',
+      rightOutcomeSub: 'Saved workflow progress continues the task; Stripe still needs a stable idempotency key or ctx.effect guard.',
       naiveBilled: '$300.00',
       ferricBilled: '$150.00',
-      divergence: 'Stale writes fenced',
-      replayStepsText: `<span>step() replays the committed result and resumes from the next state.</span><br><span>The stable Stripe key separately prevents a repeated charge before commit.</span>`,
-      replayStatesText: `<span>⚡ FSM State Machine: States "charge" &amp; "reserve" already committed in Raft log.</span><br><span>⚡ Replacement worker loads state "send_receipt" after reclaim.</span><br><span>✉️ State "send_receipt": Dispatches receipt and calls complete()!</span>`
+      divergence: 'Older write blocked',
+      replayStepsText: `<span>Saved result: the retry resumes from the next step.</span><br><span>The stable Stripe key also prevents a repeated charge before the save.</span>`,
+      replayStatesText: `<span>Saved progress: "charge" and "reserve" are already recorded.</span><br><span>The replacement worker starts at "send_receipt" after it takes over.</span><br><span>Receipt sent and the workflow completes.</span>`
     },
     'llm-tokens': {
-      title: 'Scenario B: AI Token & Compute Waste (4,000 Token Generation)',
+      title: 'AI report: the 4,000-token result is retried',
       leftCode: `<span class="c-comment"># ❌ NAIVE SCRIPT: Wastes 4,000 tokens on retry</span>\n<span class="c-kw">import</span> openai, pdf, email\n\n<span class="c-kw">def</span> <span class="c-fn">generate_report</span>(prompt):\n    <span class="c-danger"># ❌ Expensive 4,000 token LLM query runs again on retry!\n    summary = openai.complete(prompt)</span>\n    pdf.render(summary)\n    <span class="c-crash-line"># 💥 Worker crashes during email upload</span>\n    email.send_attachment()`,
       stepsCode: llmContinueCode,
       statesCode: `<span class="c-comment"># ✓ CURRENT SDK: persist the LLM result between states</span>\n<span class="c-kw">from</span> ferricstore <span class="c-kw">import</span> WorkflowClient, complete, transition\n\nclient = WorkflowClient.from_url(<span class="c-str">"ferric://127.0.0.1:6388"</span>)\nflow = client.workflow(type=<span class="c-str">"ai-report"</span>, initial_state=<span class="c-str">"query"</span>)\n\n<span class="c-decorator">@flow.state</span>(<span class="c-str">"query"</span>)\n<span class="c-kw">def</span> <span class="c-fn">query</span>(ctx):\n    <span class="c-decorator">@ctx.effect</span>(<span class="c-str">"llm"</span>, <span class="c-str">"openai.complete"</span>, operation_digest=f<span class="c-str">"llm:{ctx.id}:v1"</span>)\n    <span class="c-kw">def</span> <span class="c-fn">call_llm</span>(): <span class="c-kw">return</span> openai.complete(ctx.payload[<span class="c-str">"prompt"</span>])\n    summary = call_llm()\n    <span class="c-kw">return</span> transition(<span class="c-str">"render"</span>, payload=ctx.payload, values={<span class="c-str">"summary"</span>: summary.encode()})\n\n<span class="c-decorator">@flow.state</span>(<span class="c-str">"render"</span>, claim_values=[<span class="c-str">"summary"</span>])\n<span class="c-kw">def</span> <span class="c-fn">render</span>(ctx):\n    pdf.render(ctx.value(<span class="c-str">"summary"</span>))\n    <span class="c-crash-line"># 💥 A retry resumes this state with the stored summary</span>\n    <span class="c-kw">return</span> transition(<span class="c-str">"send_email"</span>)\n\n<span class="c-decorator">@flow.state</span>(<span class="c-str">"send_email"</span>)\n<span class="c-kw">def</span> <span class="c-fn">send_email</span>(ctx):\n    <span class="c-decorator">@ctx.effect</span>(<span class="c-str">"email"</span>, <span class="c-str">"email.send"</span>, operation_digest=f<span class="c-str">"email:{ctx.id}:v1"</span>)\n    <span class="c-kw">def</span> <span class="c-fn">send</span>(): email.send()\n    send()\n    <span class="c-kw">return</span> complete(result=<span class="c-str">b"sent"</span>)`,
       s1Title: 'Synthesize 4,000-Token LLM Report',
       s1LeftSub: 'OpenAI API: 4,000 Tokens ($0.12)',
-      s1RightSubSteps: 'Saved summary; continued with a fresh lease + fence',
-      s1RightSubStates: 'State "ai_query" payload committed to disk',
+      s1RightSubSteps: 'Saved summary; continued with saved progress',
+      s1RightSubStates: 'Saved the AI result before continuing',
       s2Title: 'Render 12-Page PDF Document',
       s2Sub: 'Generated PDF saved to local buffer',
       s3Title: 'Upload &amp; Email Attachment',
       leftOutcome: '8,000 TOKENS BURNED (2x API COST)',
       leftOutcomeSub: 'Naive retry re-executed Step 1 from scratch, wasting LLM latency and $0.24 API cost.',
       rightOutcome: 'DURABLE STATE + GUARDED LLM CALL',
-      rightOutcomeSub: 'The state is durable; guard the LLM call if repeated token spend must be prevented.',
+      rightOutcomeSub: 'The saved result is reused; guard the LLM call if repeated token spend must be prevented.',
       naiveBilled: '8,000 Tokens',
       ferricBilled: '4,000 Tokens',
-      divergence: 'Stale writes fenced',
-      replayStepsText: `<span>step() resumes at render_pdf with the stored summary.</span><br><span>The stable operation ID protects the pre-commit retry window.</span>`,
-      replayStatesText: `<span>⚡ FSM Replay: States "ai_query" &amp; "render_pdf" already committed in Raft log.</span><br><span>⚡ Replacement worker resumes at "send_email" after reclaim.</span><br><span>✉️ Completed without burning duplicate LLM tokens!</span>`
+      divergence: 'Older write blocked',
+      replayStepsText: `<span>Saved result: the retry resumes at render_pdf with the stored summary.</span><br><span>The stable operation ID protects the call before the save.</span>`,
+      replayStatesText: `<span>Saved progress: "ai_query" and "render_pdf" are already recorded.</span><br><span>The replacement worker starts at "send_email" after it takes over.</span><br><span>Completed without burning duplicate LLM tokens.</span>`
     },
     'inventory-lock': {
-      title: 'Scenario C: Inventory Double-Decrement Bug',
+      title: 'Inventory update: stock is decremented twice',
       leftCode: `<span class="c-comment"># ❌ NAIVE SCRIPT: Stock decremented twice</span>\n<span class="c-kw">import</span> postgres, email\n\n<span class="c-kw">def</span> <span class="c-fn">fulfill_order</span>(sku, qty):\n    <span class="c-danger"># ❌ Decrements stock in Postgres: stock = stock - 1 (qty=9)\n    postgres.execute("UPDATE inventory SET qty = qty - 1")</span>\n    <span class="c-crash-line"># 💥 Worker crashes</span>\n    email.send_confirmation()`,
       stepsCode: inventoryContinueCode,
       statesCode: `<span class="c-comment"># ✓ CURRENT SDK: idempotent external mutation + durable transition</span>\n<span class="c-kw">from</span> ferricstore <span class="c-kw">import</span> WorkflowClient, complete, transition\n\nclient = WorkflowClient.from_url(<span class="c-str">"ferric://127.0.0.1:6388"</span>)\nflow = client.workflow(type=<span class="c-str">"inventory-sync"</span>, initial_state=<span class="c-str">"decrement"</span>)\n\n<span class="c-decorator">@flow.state</span>(<span class="c-str">"decrement"</span>)\n<span class="c-kw">def</span> <span class="c-fn">decrement</span>(ctx):\n    <span class="c-decorator">@ctx.effect</span>(<span class="c-str">"decrement"</span>, <span class="c-str">"postgres.inventory"</span>, operation_digest=f<span class="c-str">"decrement:{ctx.id}:v1"</span>)\n    <span class="c-kw">def</span> <span class="c-fn">update</span>():\n        postgres.decrement(ctx.payload[<span class="c-str">"sku"</span>], ctx.payload[<span class="c-str">"qty"</span>], idempotency_key=f<span class="c-str">"{ctx.id}:decrement:v1"</span>)\n    update()\n    <span class="c-kw">return</span> transition(<span class="c-str">"send_email"</span>, payload=ctx.payload)\n\n<span class="c-decorator">@flow.state</span>(<span class="c-str">"send_email"</span>)\n<span class="c-kw">def</span> <span class="c-fn">send_email</span>(ctx):\n    <span class="c-decorator">@ctx.effect</span>(<span class="c-str">"email"</span>, <span class="c-str">"email.send"</span>, operation_digest=f<span class="c-str">"email:{ctx.id}:v1"</span>)\n    <span class="c-kw">def</span> <span class="c-fn">send</span>(): email.send()\n    send()\n    <span class="c-kw">return</span> complete(result=<span class="c-str">b"done"</span>)`,
       s1Title: 'Decrement Inventory (UPDATE items SET stock - 1)',
       s1LeftSub: 'Postgres: Stock updated 10 ➔ 9',
-      s1RightSubSteps: 'Continued to "send_email" with a fresh lease + fence',
-      s1RightSubStates: 'State "decrement" committed (Stock: 9)',
+      s1RightSubSteps: 'Continued to "send_email" with saved progress',
+      s1RightSubStates: 'Saved state "decrement" before continuing (Stock: 9)',
       s2Title: 'Generate Shipping Label &amp; Barcode',
       s2Sub: 'FedEx Tracking #9402 generated',
       s3Title: 'Send Confirmation Email',
       leftOutcome: 'INVENTORY CORRUPTED (STOCK = 8 INSTEAD OF 9)',
       leftOutcomeSub: 'Because Step 1 had no disk checkpoint, retry ran the SQL update twice for 1 single order.',
       rightOutcome: 'ACCURATE INVENTORY (STOCK = 9 EXACT)',
-      rightOutcomeSub: 'The committed decrement state is not revisited after reclaim; external inventory writes still need their own stable key.',
+      rightOutcomeSub: 'Saved progress is not repeated; external inventory writes still need their own stable key.',
       naiveBilled: 'Stock: 8 (Bug)',
       ferricBilled: 'Stock: 9 (Exact)',
-      divergence: 'Stale writes fenced',
-      replayStepsText: `<span>step() resumes at send_email with the stored result.</span><br><span>The database mutation ID separately prevents a second decrement before commit.</span>`,
-      replayStatesText: `<span>⚡ FSM Replay: State "decrement" sealed in Raft log.</span><br><span>⚡ Replacement worker resumes at "send_email" after reclaim.</span><br><span>✉️ Inventory count protected from double-decrement!</span>`
+      divergence: 'Older write blocked',
+      replayStepsText: `<span>Saved result: the retry resumes at send_email with the stored result.</span><br><span>The mutation ID separately prevents a second decrement before the save.</span>`,
+      replayStatesText: `<span>Saved progress: "decrement" is already recorded.</span><br><span>The replacement worker starts at "send_email" after it takes over.</span><br><span>Inventory count is protected from a second decrement.</span>`
     }
   };
 
@@ -172,6 +172,9 @@ job, remaining = client.step(
   var leftOutcomeSub = document.querySelector('[data-left-outcome-sub]');
   var rightOutcome = document.querySelector('[data-right-outcome]');
   var rightOutcomeSub = document.querySelector('[data-right-outcome-sub]');
+  var badgeScenario = document.querySelector('[data-badge-scenario]');
+  var leftStatusPill = document.querySelector('[data-left-status-pill]');
+  var rightStatusPill = document.querySelector('[data-right-status-pill]');
 
   var valNaiveBilled = document.querySelector('[data-val-naive-billed]');
   var valFerricBilled = document.querySelector('[data-val-ferric-billed]');
@@ -203,14 +206,24 @@ job, remaining = client.step(
     if (scenTitle) scenTitle.textContent = data.title;
     if (leftCodeEl) leftCodeEl.innerHTML = data.leftCode;
     if (rightCodeEl) rightCodeEl.innerHTML = currentApiMode === 'steps' ? data.stepsCode : data.statesCode;
-    if (rightTitle) rightTitle.textContent = currentApiMode === 'steps' ? 'Durable Step Closure' : 'Durable SDK (State Handlers)';
+    if (rightTitle) rightTitle.textContent = currentApiMode === 'steps' ? 'Save each action' : 'Save named states';
   }
 
   function resetToInitialState() {
+    if (btnCrash) btnCrash.disabled = true;
+    if (btnRetry) btnRetry.disabled = true;
     clearAllTimeouts();
     isAnimating = false;
     renderScenarioDetails();
     var data = scenarios[currentScenario];
+
+    if (badgeScenario) {
+      badgeScenario.textContent = 'READY TO RUN';
+      badgeScenario.style.background = 'rgba(56, 189, 248, 0.18)';
+      badgeScenario.style.color = '#7dd3fc';
+    }
+    if (leftStatusPill) leftStatusPill.textContent = 'No saved progress';
+    if (rightStatusPill) rightStatusPill.textContent = 'Ready to save';
 
     // Left reset
     if (leftStep1) {
@@ -262,9 +275,9 @@ job, remaining = client.step(
 
     // Outcome text reset
     if (leftOutcome) leftOutcome.textContent = 'WAITING FOR EXECUTION';
-    if (leftOutcomeSub) leftOutcomeSub.textContent = 'Click "⚡ Play Live Interactive Simulation" or "▶ 1. Initial Run" above.';
+    if (leftOutcomeSub) leftOutcomeSub.textContent = 'Choose a failure above, then run the example.';
     if (rightOutcome) rightOutcome.textContent = 'WAITING FOR EXECUTION';
-    if (rightOutcomeSub) rightOutcomeSub.textContent = 'Durable Raft quorum engine standing by at ferric://127.0.0.1:6388.';
+    if (rightOutcomeSub) rightOutcomeSub.textContent = 'Saved progress is ready to compare with the retry.';
 
     if (valNaiveBilled) valNaiveBilled.textContent = '$0.00';
     if (valFerricBilled) valFerricBilled.textContent = '$0.00';
@@ -277,15 +290,22 @@ job, remaining = client.step(
   function runInitialSteps(onDone) {
     resetToInitialState();
     isAnimating = true;
+    if (badgeScenario) {
+      badgeScenario.textContent = 'RUNNING';
+      badgeScenario.style.background = 'rgba(139, 92, 246, 0.18)';
+      badgeScenario.style.color = '#c4b5fd';
+    }
+    if (leftStatusPill) leftStatusPill.textContent = 'Running';
+    if (rightStatusPill) rightStatusPill.textContent = 'Running';
     var data = scenarios[currentScenario];
     if (termStatus) termStatus.innerHTML = '<span class="pulse-dot" style="background:#8b5cf6; box-shadow: 0 0 8px #8b5cf6;"></span> EXECUTING INITIAL RUN...';
 
-    log('info', '🚀 Dispatched workflow order #8492 to worker-pod-1...');
+    log('info', 'Started the selected example with one worker.');
 
     // Step 1 Executing
     if (leftStep1) { leftStep1.className = 'stream-item is-executing'; leftStep1.querySelector('small').textContent = 'Executing...'; }
     if (rightStep1) { rightStep1.className = 'stream-item is-executing'; rightStep1.querySelector('small').textContent = 'Executing...'; }
-    log('warn', '💳 Step 1: Calling external API for: ' + data.s1Title);
+    log('warn', 'Action 1: ' + data.s1Title);
 
     animTimeouts.push(setTimeout(function () {
       // Step 1 Completed
@@ -299,16 +319,16 @@ job, remaining = client.step(
         rightStep1.className = 'stream-item done';
         rightStep1.querySelector('small').textContent = currentApiMode === 'steps' ? data.s1RightSubSteps : data.s1RightSubStates;
         rightStep1.querySelector('.s-badge').className = 's-badge green';
-        rightStep1.querySelector('.s-badge').textContent = 'Raft Disk Saved';
+        rightStep1.querySelector('.s-badge').textContent = 'Progress saved';
       }
       if (valNaiveBilled) valNaiveBilled.textContent = '$150.00';
       if (valFerricBilled) valFerricBilled.textContent = '$150.00';
-      log('success', '✓ Step 1 Success: Result durably committed before the command returned.');
+      log('success', 'Action 1 saved before the command continued.');
 
       // Step 2 Executing
       if (leftStep2) { leftStep2.className = 'stream-item is-executing'; leftStep2.querySelector('small').textContent = 'Executing...'; }
       if (rightStep2) { rightStep2.className = 'stream-item is-executing'; rightStep2.querySelector('small').textContent = 'Executing...'; }
-      log('info', '📦 Step 2: Executing ' + data.s2Title);
+      log('info', 'Action 2: ' + data.s2Title);
 
       animTimeouts.push(setTimeout(function () {
         // Step 2 Completed
@@ -322,9 +342,9 @@ job, remaining = client.step(
           rightStep2.className = 'stream-item done';
           rightStep2.querySelector('small').textContent = 'Durable state committed before continuing';
           rightStep2.querySelector('.s-badge').className = 's-badge green';
-          rightStep2.querySelector('.s-badge').textContent = 'Raft Disk Saved';
+          rightStep2.querySelector('.s-badge').textContent = 'Progress saved';
         }
-        log('success', '✓ Step 2 Success: State persisted to disk log.');
+        log('success', 'Action 2 saved before the crash point.');
 
         // Step 3 In-flight
         if (leftStep3) {
@@ -343,6 +363,7 @@ job, remaining = client.step(
         if (rightOutcome) rightOutcome.textContent = 'IN-FLIGHT EXECUTION (STEP 3 ACTIVE)';
 
         if (termStatus) termStatus.innerHTML = '<span class="pulse-dot" style="background:#38bdf8; box-shadow:0 0 8px #38bdf8;"></span> IN-FLIGHT EXECUTION (STEP 3)';
+        if (btnCrash) btnCrash.disabled = false;
         isAnimating = false;
         if (onDone) onDone();
       }, 700));
@@ -352,12 +373,21 @@ job, remaining = client.step(
 
   function injectCrash(onDone) {
     clearAllTimeouts();
+    if (btnCrash) btnCrash.disabled = true;
+    if (btnRetry) btnRetry.disabled = false;
     isAnimating = true;
     if (termStatus) termStatus.innerHTML = '<span class="pulse-dot" style="background:#ef4444; box-shadow: 0 0 8px #ef4444;"></span> WORKER CRASH DETECTED (SIGKILL)';
+    if (badgeScenario) {
+      badgeScenario.textContent = 'CRASH DETECTED';
+      badgeScenario.style.background = 'rgba(239, 68, 68, 0.18)';
+      badgeScenario.style.color = '#fca5a5';
+    }
+    if (leftStatusPill) leftStatusPill.textContent = 'Progress lost';
+    if (rightStatusPill) rightStatusPill.textContent = 'Progress saved';
 
-    log('danger', '💥 [FATAL CRASH] SIGKILL (Exit code 137 / Out-of-Memory). worker-pod-1 terminated unexpectedly!');
-    log('danger', '🚨 Left Side: Volatile container RAM wiped to 0MB. All uncommitted in-memory states lost.');
-    log('cyan', '🛡️ Right Side (FerricStore): Prior states safely recorded on Raft disk. Ready for replacement worker.');
+    log('danger', 'Worker stopped before the last action finished.');
+    log('danger', 'Without saved progress, local memory was lost.');
+    log('cyan', 'With FerricStore, earlier progress is ready for a replacement worker.');
 
     if (leftStep3) {
       leftStep3.className = 'stream-item crash is-crashed';
@@ -372,10 +402,10 @@ job, remaining = client.step(
       rightStep3.querySelector('.s-badge').textContent = 'Resuming...';
     }
 
-    if (leftOutcome) leftOutcome.textContent = 'WORKER DIED MID-EXECUTION';
-    if (leftOutcomeSub) leftOutcomeSub.textContent = 'In-memory RAM lost. Celery/SQS queue will now attempt to retry from line 1.';
-    if (rightOutcome) rightOutcome.textContent = 'DISK CHECKPOINTS INTACT';
-    if (rightOutcomeSub) rightOutcomeSub.textContent = 'Prior states are safe in the Raft log. A replacement worker can reclaim the flow.';
+    if (leftOutcome) leftOutcome.textContent = 'WORKER STOPPED BEFORE COMPLETION';
+    if (leftOutcomeSub) leftOutcomeSub.textContent = 'Local memory was lost. The retry starts from the first action.';
+    if (rightOutcome) rightOutcome.textContent = 'SAVED PROGRESS AVAILABLE';
+    if (rightOutcomeSub) rightOutcomeSub.textContent = 'Earlier progress is saved. A replacement worker can continue from the next action.';
 
     isAnimating = false;
     if (onDone) animTimeouts.push(setTimeout(onDone, 900));
@@ -383,11 +413,19 @@ job, remaining = client.step(
 
   function simulateWorkerRetry(onDone) {
     clearAllTimeouts();
+    if (btnRetry) btnRetry.disabled = true;
     isAnimating = true;
     var data = scenarios[currentScenario];
     if (termStatus) termStatus.innerHTML = '<span class="pulse-dot" style="background:#f59e0b; box-shadow: 0 0 8px #f59e0b;"></span> REPLACEMENT WORKER RETRY IN PROGRESS...';
+    if (badgeScenario) {
+      badgeScenario.textContent = 'RETRY IN PROGRESS';
+      badgeScenario.style.background = 'rgba(245, 158, 11, 0.18)';
+      badgeScenario.style.color = '#fcd34d';
+    }
+    if (leftStatusPill) leftStatusPill.textContent = 'Repeating work';
+    if (rightStatusPill) rightStatusPill.textContent = 'Using saved progress';
 
-    log('warn', '🔄 Queue scheduler spawns worker-pod-2 to resume workflow...');
+    log('warn', 'A replacement worker takes over the example.');
 
     // Left Side Retry: Re-runs Step 1
     if (leftStep1) {
@@ -396,16 +434,16 @@ job, remaining = client.step(
       leftStep1.querySelector('.s-badge').className = 's-badge red';
       leftStep1.querySelector('.s-badge').textContent = '2x Double Charge!';
     }
-    log('danger', '❌ [HAZARD] Naive Worker has no disk checkpoint. Re-executing Step 1... CARD CHARGED AGAIN (+$150.00)!');
+    log('danger', 'No saved progress: the first action runs again.');
 
     // Right Side Retry: Instant Cache Hit
     if (rightStep1) {
       rightStep1.className = 'stream-item done is-cached';
       rightStep1.querySelector('small').textContent = '✓ Prior state committed; external effect guarded separately';
       rightStep1.querySelector('.s-badge').className = 's-badge green';
-      rightStep1.querySelector('.s-badge').textContent = 'Durable state';
+      rightStep1.querySelector('.s-badge').textContent = 'Saved state';
     }
-    log('cyan', '⚡ [FERRICSTORE] Prior state already committed. Stable provider key protects the Stripe effect.');
+    log('cyan', 'Saved progress: the first action is not run again.');
 
     animTimeouts.push(setTimeout(function () {
       // Step 2 on Left: Repeated
@@ -415,16 +453,16 @@ job, remaining = client.step(
         leftStep2.querySelector('.s-badge').className = 's-badge red';
         leftStep2.querySelector('.s-badge').textContent = 'Corrupted (8)';
       }
-      log('danger', '❌ [HAZARD] Naive Worker decremented Postgres stock a second time! Inventory desynced.');
+      log('danger', 'The retry repeats the second action too.');
 
       // Step 2 on Right: Instant Cache Hit
       if (rightStep2) {
         rightStep2.className = 'stream-item done is-cached';
         rightStep2.querySelector('small').textContent = '✓ Prior state committed; mutation must be idempotent';
         rightStep2.querySelector('.s-badge').className = 's-badge green';
-        rightStep2.querySelector('.s-badge').textContent = 'Durable state';
+        rightStep2.querySelector('.s-badge').textContent = 'Saved state';
       }
-      log('cyan', '⚡ [FERRICSTORE] Prior state is committed; inventory mutation uses its own idempotency boundary.');
+      log('cyan', 'The saved state skips completed work; the outside mutation still needs its own stable key.');
 
       animTimeouts.push(setTimeout(function () {
         // Step 3 executes to completion on both
@@ -456,11 +494,18 @@ job, remaining = client.step(
 
         if (valNaiveBilled) valNaiveBilled.textContent = data.naiveBilled;
         if (valFerricBilled) valFerricBilled.textContent = data.ferricBilled;
-        if (valReplayTime) valReplayTime.textContent = 'After reclaim';
+        if (valReplayTime) valReplayTime.textContent = 'After takeover';
         if (valDivergence) valDivergence.textContent = data.divergence;
+        if (badgeScenario) {
+          badgeScenario.textContent = 'SIMULATION COMPLETE';
+          badgeScenario.style.background = 'rgba(16, 185, 129, 0.18)';
+          badgeScenario.style.color = '#6ee7b7';
+        }
+        if (leftStatusPill) leftStatusPill.textContent = 'Retry complete';
+        if (rightStatusPill) rightStatusPill.textContent = 'Saved progress used';
 
         if (termStatus) termStatus.innerHTML = '<span class="pulse-dot" style="background:#34d399; box-shadow: 0 0 8px #34d399;"></span> SIMULATION COMPLETE';
-        log('success', '🎉 Simulation Complete! State recovery is durable; external effects still use stable idempotency keys or ctx.effect.');
+        log('success', 'Example complete. Saved workflow state and stable outside-action keys work together.');
 
         isAnimating = false;
         if (onDone) onDone();
@@ -471,7 +516,7 @@ job, remaining = client.step(
 
   function playFullAutoSimulation() {
     clearLogs();
-    log('info', '🎬 Starting full automatic live failure simulation...');
+    log('info', 'Running the full example...');
     runInitialSteps(function () {
       animTimeouts.push(setTimeout(function () {
         injectCrash(function () {
@@ -488,8 +533,11 @@ job, remaining = client.step(
     tab.addEventListener('click', function () {
       scenTabs.forEach(function (t) { t.classList.remove('is-active'); });
       tab.classList.add('is-active');
+      scenTabs.forEach(function (t) { t.setAttribute('aria-selected', String(t === tab)); });
       currentScenario = tab.getAttribute('data-scenario') || 'double-charge';
-      playFullAutoSimulation();
+      resetToInitialState();
+      clearLogs();
+      log('info', 'Selected ' + scenarios[currentScenario].title + '. Run the example when ready.');
     });
   });
 
@@ -499,8 +547,9 @@ job, remaining = client.step(
       apiToggles.forEach(function (b) { b.classList.remove('is-active'); });
       btn.classList.add('is-active');
       currentApiMode = btn.getAttribute('data-api-mode') || 'states';
-      renderScenarioDetails();
-      log('info', 'Switched view to: ' + (currentApiMode === 'steps' ? 'Durable step() closure' : 'State handlers (@flow.state FSM)'));
+      resetToInitialState();
+      clearLogs();
+      log('info', 'Selected ' + (currentApiMode === 'steps' ? 'save each action' : 'save named states') + '. Run the example when ready.');
     });
   });
 
@@ -534,10 +583,12 @@ job, remaining = client.step(
     btnReset.addEventListener('click', function () {
       resetToInitialState();
       clearLogs();
-      log('info', 'Simulation reset. Click "⚡ Play Live Interactive Simulation" to begin.');
+      log('info', 'Example reset. Choose a failure, then run it.');
     });
   }
 
-  // Run automatically on first load so the user sees live motion immediately!
-  playFullAutoSimulation();
+  // Start on the first state so visitors can choose the failure before running it.
+  resetToInitialState();
+  clearLogs();
+  log('info', 'Ready. Choose a failure, then run the example.');
 })();

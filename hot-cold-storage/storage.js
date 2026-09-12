@@ -30,8 +30,10 @@
 
   var ramPct = document.querySelector('[data-ram-pct]');
   var ramFill = document.querySelector('[data-ram-fill]');
+  var ramCapacity = document.querySelector('[data-ram-capacity]');
   var diskPct = document.querySelector('[data-disk-pct]');
   var diskFill = document.querySelector('[data-disk-fill]');
+  var diskCapacity = document.querySelector('[data-disk-capacity]');
 
   var livePill = document.querySelector('[data-live-pill]');
   var liveStatus = document.querySelector('[data-live-status]');
@@ -72,25 +74,27 @@
     if (currentMode === 'before') {
       // REDIS 100% IN-MEMORY
       if (metricCost) metricCost.textContent = 'Provider quote required';
-      if (metricCostSub) metricCostSub.textContent = 'Pure RAM sizing for ' + sizeGb + ' GB';
+      if (metricCostSub) metricCostSub.textContent = 'RAM-only sizing for ' + sizeGb + ' GB';
 
       if (metricRam) metricRam.textContent = sizeGb + ' GB RAM';
       if (metricRamSub) metricRamSub.textContent = '100% of data locked in RAM';
 
-      if (metricEviction) metricEviction.textContent = 'High Risk (OOM / Evict)';
-      if (metricEvictionSub) metricEvictionSub.textContent = 'LRU deletes keys when full';
+      if (metricEviction) metricEviction.textContent = 'Policy decides';
+      if (metricEvictionSub) metricEvictionSub.textContent = 'Writes may fail or eligible keys may be evicted';
 
-      if (metricLatency) metricLatency.textContent = 'In-memory path';
-      if (metricLatencySub) metricLatencySub.textContent = 'No disk tiering available';
+      if (metricLatency) metricLatency.textContent = 'RAM-only path';
+      if (metricLatencySub) metricLatencySub.textContent = 'There is no cold disk tier in this mode';
 
-      if (hotRamVal) hotRamVal.textContent = sizeGb + ' GB RAM Used';
-      if (hotBadge) { hotBadge.className = 'tier-badge'; hotBadge.textContent = '⚠️ Expensive RAM'; }
-      if (coldDiskVal) coldDiskVal.textContent = '0 GB (RAM Only)';
-      if (coldBadge) { coldBadge.className = 'tier-badge'; coldBadge.textContent = 'No Cold Tier'; }
+      if (hotRamVal) hotRamVal.textContent = sizeGb.toLocaleString() + ' GB RAM Required';
+      if (hotBadge) { hotBadge.className = 'tier-badge'; hotBadge.textContent = 'RAM-only mode'; }
+      if (coldDiskVal) coldDiskVal.textContent = '0 GB · No cold tier';
+      if (coldBadge) { coldBadge.className = 'tier-badge'; coldBadge.textContent = 'Not used'; }
 
-      if (ramPct) ramPct.textContent = '100% Saturated (' + sizeGb + ' GB)';
+      if (ramCapacity) ramCapacity.textContent = 'RAM REQUIRED FOR DATASET · NO FIXED CAPACITY';
+      if (ramPct) ramPct.textContent = '100% of dataset (' + sizeGb.toLocaleString() + ' GB)';
       if (ramFill) { ramFill.style.width = '100%'; ramFill.style.background = '#ef4444'; }
-      if (diskPct) diskPct.textContent = '0% Used (No Tiering)';
+      if (diskCapacity) diskCapacity.textContent = 'NVMe SSD DISK · NO COLD TIER IN THIS MODE';
+      if (diskPct) diskPct.textContent = '0% used (no cold tier)';
       if (diskFill) diskFill.style.width = '0%';
 
       if (keydirStatus) { keydirStatus.textContent = 'STATUS: RAM ONLY'; keydirStatus.style.borderColor = '#ef4444'; keydirStatus.style.color = '#fca5a5'; }
@@ -99,9 +103,9 @@
       if (kdPath) kdPath.textContent = 'In-Memory Hash Table (Evicts on OOM)';
 
       if (outcomeCallout) outcomeCallout.className = 'outcome-callout bad';
-      if (outcomeLabel) outcomeLabel.textContent = 'REDIS RAM TAX HAZARD';
-      if (outcomeTitle) outcomeTitle.textContent = 'HIGH CLOUD COST &amp; LRU KEY EVICTION';
-      if (outcomeSub) outcomeSub.textContent = 'A pure in-memory model needs RAM for the full ' + sizeGb + ' GB dataset plus overhead. Pressure behavior depends on the configured eviction and persistence policies.';
+      if (outcomeLabel) outcomeLabel.textContent = 'RAM-ONLY MODEL';
+      if (outcomeTitle) outcomeTitle.textContent = 'ALL VALUES NEED RAM IN THIS EXAMPLE';
+      if (outcomeSub) outcomeSub.textContent = 'This model needs RAM for the full ' + sizeGb.toLocaleString() + ' GB dataset plus overhead. Pressure behavior depends on the configured eviction and persistence policies.';
 
     } else {
       // FERRICSTORE HOT RAM + COLD NVMe
@@ -112,22 +116,24 @@
       if (metricCostSub) metricCostSub.textContent = 'RAM + NVMe deployment';
 
       if (metricRam) metricRam.textContent = ramUsed + ' GB RAM';
-      if (metricRamSub) metricRamSub.textContent = 'Illustrative 0.4% hot set for ' + sizeGb + ' GB';
+      if (metricRamSub) metricRamSub.textContent = 'Illustrative 0.4% hot set for ' + sizeGb.toLocaleString() + ' GB';
 
-      if (metricEviction) metricEviction.textContent = 'Disk record retained';
-      if (metricEvictionSub) metricEvictionSub.textContent = 'MemoryGuard preserves disk records';
+      if (metricEviction) metricEviction.textContent = 'Disk record can remain';
+      if (metricEvictionSub) metricEvictionSub.textContent = 'MemoryGuard can release the RAM copy';
 
       if (metricLatency) metricLatency.textContent = 'Direct offset read';
-      if (metricLatencySub) metricLatencySub.textContent = 'Direct offset read, zero file scanning';
+      if (metricLatencySub) metricLatencySub.textContent = 'Keydir points to the value; no full-file scan';
 
       if (hotRamVal) hotRamVal.textContent = ramUsed + ' GB RAM Used';
       if (hotBadge) { hotBadge.className = 'tier-badge ok'; hotBadge.textContent = '✓ In-memory hot reads'; }
       if (coldDiskVal) coldDiskVal.textContent = diskUsed + ' GB On Disk';
-      if (coldBadge) { coldBadge.className = 'tier-badge ok'; coldBadge.textContent = '✓ Direct Pread'; }
+      if (coldBadge) { coldBadge.className = 'tier-badge ok'; coldBadge.textContent = '✓ Direct pread()'; }
 
-      if (ramPct) ramPct.textContent = Math.round((ramUsed / 4.0) * 100) + '% Used (' + ramUsed + ' GB / 4GB)';
+      if (ramCapacity) ramCapacity.textContent = 'SERVER RAM CAPACITY (4.0 GB MAX)';
+      if (ramPct) ramPct.textContent = Math.round((ramUsed / 4.0) * 100) + '% used (' + ramUsed + ' GB / 4.0 GB)';
       if (ramFill) { ramFill.style.width = Math.round((ramUsed / 4.0) * 100) + '%'; ramFill.style.background = 'linear-gradient(90deg, #10b981, #f59e0b)'; }
-      if (diskPct) diskPct.textContent = Math.round((sizeGb / 2000) * 100) + '% Used (' + sizeGb + ' GB / 2TB)';
+      if (diskCapacity) diskCapacity.textContent = 'NVMe SSD DISK (2,000 GB CAPACITY)';
+      if (diskPct) diskPct.textContent = Math.round((sizeGb / 2000) * 100) + '% used (' + sizeGb.toLocaleString() + ' GB / 2,000 GB)';
       if (diskFill) { diskFill.style.width = Math.round((sizeGb / 2000) * 100) + '%'; diskFill.style.background = 'linear-gradient(90deg, #0284c7, #38bdf8)'; }
 
       if (keydirStatus) { keydirStatus.textContent = 'STATUS: COLD NVMe'; keydirStatus.style.borderColor = '#0284c7'; keydirStatus.style.color = '#38bdf8'; }
@@ -137,29 +143,42 @@
 
       if (outcomeCallout) outcomeCallout.className = 'outcome-callout good';
       if (outcomeLabel) outcomeLabel.textContent = 'STORAGE ARCHITECTURE OUTCOME';
-      if (outcomeTitle) outcomeTitle.textContent = 'BOUNDED HOT SET + DISK-BACKED VALUES';
-      if (outcomeSub) outcomeSub.textContent = 'This model places ' + sizeGb + ' GB on disk with a bounded hot set. Production memory, price, and latency require deployment-specific sizing.';
+      if (outcomeTitle) outcomeTitle.textContent = 'HOT VALUES IN RAM; COLD VALUES ON DISK';
+      if (outcomeSub) outcomeSub.textContent = 'This illustrative model places ' + sizeGb.toLocaleString() + ' GB on disk with a bounded hot set. Production memory, price, and latency require deployment-specific sizing.';
     }
   }
 
   // --- ACTION 1: Normal Hot Key Read/Write ---
-  function runNormalHotRead() {
+  function runNormalHotRead(isModeReset) {
     clearLogs();
     clearAllTimeouts();
     if (livePill) livePill.className = 'live-pill';
-    if (liveStatus) liveStatus.textContent = 'HOT KEY READ: IN-MEMORY PATH';
+    if (liveStatus) liveStatus.textContent = isModeReset ? 'NORMAL (READY)' : (currentMode === 'before' ? 'HOT KEY READ: RAM-ONLY PATH' : 'HOT KEY READ: IN-MEMORY PATH');
 
-    log('info', 'GET session:user:42 ➔ Key found in Hot ETS RAM table...');
+    if (!isModeReset) log('info', 'GET session:user:42 ➔ Key found in Hot ETS RAM table...');
+
+    if (isModeReset) {
+      if (expIcon) expIcon.textContent = '💡';
+      if (expTitle) expTitle.textContent = 'Mode selected; ready to run';
+      if (expDesc) expDesc.textContent = 'Choose Read from memory, Test RAM pressure, or Read from disk to run this mode.';
+      if (outcomeLabel) outcomeLabel.textContent = 'READY';
+      if (outcomeTitle) outcomeTitle.textContent = 'CHOOSE AN ACTION TO TEST THIS MODE';
+      if (outcomeSub) outcomeSub.textContent = 'The mode changed; no storage action has run yet.';
+      return;
+    }
 
     animTimeouts.push(setTimeout(function () {
       log('success', '✓ [HOT READ] Value served from the ETS-backed in-memory path without a cold-value disk read.');
-      if (keydirStatus) { keydirStatus.textContent = 'STATUS: HOT RAM'; keydirStatus.style.borderColor = '#10b981'; keydirStatus.style.color = '#6ee7b7'; }
+      if (keydirStatus) { keydirStatus.textContent = currentMode === 'before' ? 'STATUS: RAM ONLY' : 'STATUS: HOT RAM'; keydirStatus.style.borderColor = '#10b981'; keydirStatus.style.color = '#6ee7b7'; }
       if (kdHotVal) kdHotVal.textContent = '"session_token_xyz8492" (IN RAM)';
-      if (kdPath) kdPath.textContent = 'ETS-backed in-memory lookup';
+      if (kdLocator) kdLocator.textContent = currentMode === 'before' ? 'None (RAM-only value)' : 'File #14, Offset: 8,388,608, Size: 128 KB';
+      if (kdPath) kdPath.textContent = currentMode === 'before' ? 'In-memory lookup' : 'ETS-backed in-memory lookup';
 
       if (expIcon) expIcon.textContent = '⚡';
-      if (expTitle) expTitle.textContent = 'Hot Key Read From ETS RAM';
-      if (expDesc) expDesc.textContent = 'Active sessions and selected small values use the in-memory hot path. Measure actual latency on the target deployment.';
+      if (expTitle) expTitle.textContent = currentMode === 'before' ? 'Read from RAM-only storage' : 'Read from the hot RAM tier';
+      if (expDesc) expDesc.textContent = currentMode === 'before'
+        ? 'This mode keeps the value in RAM. Try Test RAM pressure to see what the configured policy does when the limit is reached.'
+        : 'Active sessions and selected small values use the in-memory hot path. Try Test RAM pressure to see MemoryGuard release a RAM copy.';
     }, 400));
   }
 
@@ -172,12 +191,12 @@
       if (livePill) livePill.className = 'live-pill is-crash';
       if (liveStatus) liveStatus.textContent = '🚨 OOM / EVICTION SPIKE';
 
-      log('danger', '💥 [REDIS SATURATION] RAM exceeded 100%! Redis triggered maxmemory-policy: allkeys-lru.');
-      log('danger', '🗑️ [DATA LOSS] 100,000 user shopping carts and active sessions deleted permanently!');
+      log('danger', '💥 [RAM LIMIT] The dataset reached the configured in-memory limit; this run uses maxmemory-policy: allkeys-lru.');
+      log('danger', '🗑️ [EVICTION] This run models 100,000 cached carts and active sessions being evicted.');
 
       if (expIcon) expIcon.textContent = '💥';
-      if (expTitle) expTitle.textContent = 'Redis Silent LRU Eviction Disaster';
-      if (expDesc) expDesc.textContent = 'Because Redis has no disk tiering, it had to delete your users data to prevent crashing the server.';
+      if (expTitle) expTitle.textContent = 'RAM pressure caused eviction in this run';
+      if (expDesc) expDesc.textContent = 'This RAM-only example uses an LRU policy when memory fills. Eligible cached values are evicted; the exact behavior depends on the configured policy.';
     } else {
       if (livePill) livePill.className = 'live-pill is-crash';
       if (liveStatus) liveStatus.textContent = '⚡ MEMORYGUARD DEMOTING TO NVMe';
@@ -210,7 +229,12 @@
     clearAllTimeouts();
 
     if (currentMode === 'before') {
-      log('danger', '❌ Redis has no cold disk tier. All reads must come from RAM.');
+      if (livePill) livePill.className = 'live-pill is-crash';
+      if (liveStatus) liveStatus.textContent = 'COLD READ: NO COLD TIER';
+      log('danger', '❌ This RAM-only mode has no cold disk tier, so the requested value must be in RAM.');
+      if (expIcon) expIcon.textContent = '❄️';
+      if (expTitle) expTitle.textContent = 'No disk-backed value in this mode';
+      if (expDesc) expDesc.textContent = 'Switch to With FerricStore to inspect a cold value addressed by its Keydir file offset.';
     } else {
       if (livePill) livePill.className = 'live-pill';
       if (liveStatus) liveStatus.textContent = 'COLD READ: DIRECT PREAD';
@@ -222,8 +246,8 @@
         log('success', '✓ [READ COMPLETE] A direct POSIX pread() returned the modeled 128KB payload. Timing depends on hardware and workload.');
 
         if (expIcon) expIcon.textContent = '❄️';
-        if (expTitle) expTitle.textContent = 'Cold NVMe Read via Direct Offset';
-        if (expDesc) expDesc.textContent = 'FerricStore avoids full disk scans by storing the exact byte offset in the Keydir, delivering sub-millisecond cold data retrieval.';
+        if (expTitle) expTitle.textContent = 'Read a cold value from NVMe';
+        if (expDesc) expDesc.textContent = 'The Keydir stores the exact byte offset, so this example avoids a full disk scan. Measure latency on the target hardware and workload.';
       }, 500));
     }
   }
@@ -231,13 +255,14 @@
   // --- Mode Buttons ---
   modeButtons.forEach(function (btn) {
     btn.addEventListener('click', function () {
+      clearAllTimeouts();
       modeButtons.forEach(function (b) { b.classList.remove('is-selected'); b.setAttribute('aria-selected', 'false'); });
       btn.classList.add('is-selected');
       btn.setAttribute('aria-selected', 'true');
       currentMode = btn.getAttribute('data-mode-btn') || 'after';
       document.body.setAttribute('data-mode', currentMode);
       updateDatasetCalculations();
-      runNormalHotRead();
+      runNormalHotRead(true);
     });
   });
 
@@ -247,12 +272,12 @@
   }
 
   // --- Playback Buttons ---
-  if (btnNormal) btnNormal.addEventListener('click', runNormalHotRead);
+  if (btnNormal) btnNormal.addEventListener('click', function () { runNormalHotRead(false); });
   if (btnPressure) btnPressure.addEventListener('click', runMemoryPressure);
   if (btnCold) btnCold.addEventListener('click', runColdRead);
-  if (btnReset) btnReset.addEventListener('click', function () { updateDatasetCalculations(); runNormalHotRead(); });
+  if (btnReset) btnReset.addEventListener('click', function () { clearAllTimeouts(); clearLogs(); updateDatasetCalculations(); runNormalHotRead(true); });
 
   // Init
   updateDatasetCalculations();
-  runNormalHotRead();
+  runNormalHotRead(true);
 })();

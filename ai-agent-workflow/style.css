@@ -187,3 +187,121 @@ h1, h2, h3, h4, .hero-pill, .badge-label, .ctrl-btn {
   .current-run { grid-template-columns: auto 1fr; }
   .current-run small { grid-column: 1 / -1; text-align: left; }
 }
+
+/* Clarity pass: make the state machine readable as a sequence of plain,
+   selectable steps inside the shared Dispatch Strip experiment surface. */
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .agent-stations-grid {
+  gap: 8px;
+}
+
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .agent-node {
+  min-height: 126px;
+  padding: 12px;
+  border: 1px solid var(--fs-line, #aebbb5) !important;
+  border-radius: 3px !important;
+  background: var(--fs-strip, #e7ece8) !important;
+  box-shadow: none !important;
+  color: var(--fs-ink, #0d222b) !important;
+  text-align: left;
+  transform: none !important;
+}
+
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .agent-node:hover,
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .agent-node:focus-visible {
+  border-color: var(--fs-signal-ink, #526b00) !important;
+  background: var(--fs-paper-bright, #fcfefb) !important;
+}
+
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .agent-node.is-active {
+  border-color: var(--fs-signal-ink, #526b00) !important;
+  background: var(--fs-signal-soft, #eff7cf) !important;
+  box-shadow: inset 0 -3px 0 var(--fs-signal-ink, #526b00) !important;
+}
+
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .agent-node.is-done {
+  border-color: var(--fs-green, #19765b) !important;
+  background: var(--fs-success-soft, #edf6f1) !important;
+}
+
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .an-head,
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .agent-node small {
+  color: var(--fs-muted, #566b72) !important;
+}
+
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .agent-node strong {
+  color: var(--fs-ink, #0d222b) !important;
+  font-size: 15px;
+  line-height: 1.3;
+}
+
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .an-icon {
+  margin: 8px 0;
+  color: var(--fs-signal-ink, #526b00);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  line-height: 1.2;
+}
+
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .slack-modal-box,
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .agent-narrative-box,
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .telemetry-card,
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .current-run {
+  border-color: var(--fs-line, #aebbb5) !important;
+  border-radius: 3px !important;
+  background: var(--fs-paper-bright, #fcfefb) !important;
+  box-shadow: none !important;
+  color: var(--fs-ink, #0d222b) !important;
+}
+
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .slack-header,
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .slack-body,
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .agent-narrative-box h3,
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .telemetry-val,
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .current-run strong {
+  color: var(--fs-ink, #0d222b) !important;
+}
+
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .slack-body {
+  background: var(--fs-strip, #e7ece8) !important;
+}
+
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .slack-body > div {
+  color: var(--fs-ink-soft, #2e454e) !important;
+}
+
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .slack-body > div:first-child {
+  color: var(--fs-ink, #0d222b) !important;
+}
+
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .slack-body > div:last-child {
+  color: var(--fs-green, #19765b) !important;
+}
+
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .agent-narrative-box [data-narrative-desc],
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .telemetry-sub,
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .current-run small {
+  color: var(--fs-ink-soft, #2e454e) !important;
+}
+
+body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .control-note {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--fs-muted, #566b72);
+  font-size: 15px;
+  line-height: 1.45;
+}
+
+@media (max-width: 520px) {
+  body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .agent-stations-grid {
+    grid-template-columns: 1fr;
+  }
+
+  body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .slack-actions {
+    flex-direction: column;
+  }
+
+  body.fs-dispatch[data-fs-demo="ai-agent-workflow"] .control-note {
+    order: 3;
+  }
+}

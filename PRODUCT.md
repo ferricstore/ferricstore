@@ -8,9 +8,9 @@ web
 
 ## Users
 
-The primary audience is engineering leaders and software architects evaluating whether FerricStore is a credible fit for durable workflows, queues, coordination, and related state-management problems. They need to understand the mechanism behind each demonstration and gather enough evidence to make an adoption or deeper-evaluation decision.
+The catalog welcomes people evaluating FerricStore, including non-developers, engineering leaders, and software architects. A visitor should understand the problem and the result without already knowing workflow or distributed-systems terminology.
 
-Developers learning durable workflow concepts are an important secondary audience, but the catalog should prioritize technical credibility, architectural clarity, and evaluation value over introductory entertainment.
+Lead with familiar tasks, clear controls, and a short explanation of what changes. Keep technical detail, code, and evidence available for developers who want to examine the mechanism. Plain language must preserve technical accuracy, not replace it with broader promises.
 
 ## Product Purpose
 

@@ -3,21 +3,22 @@
 
   var currentStep = 0;
   var isPaused = false;
+  var hasStarted = false;
   var timer = null;
 
   var stepsData = [
   {
     "day": 1,
-    "ttLabel": "Day 1: Trial Started (14-Day Free Access)",
+    "ttLabel": "Day 1: Trial starts (14-day access)",
     "badge": "TRIAL ACTIVE",
     "badgeClass": "trial",
-    "narrativeBadge": "TIMER SCHEDULED",
-    "narrativeTitle": "Day 1: Welcome Email Sent",
-    "narrativeDesc": "Customer activates Acme Pro Plan. The flow persists a trial state with a scheduled next eligibility time; no application handler stays blocked.",
+    "narrativeBadge": "WAITING FOR DAY 14",
+    "narrativeTitle": "Day 1: Trial starts",
+    "narrativeDesc": "A 14-day trial starts. FerricStore records the next wake-up time, so no application process needs to sit and wait.",
     "code": "send_welcome()\nreturn transition('pre_billing_warning', run_at_ms=day_14_ms)",
     "acctBadge": "TRIAL ACTIVE (14 DAYS REMAINING)",
     "acctBadgeClass": "trial",
-    "acctDesc": "User exploring features with full access. Payment method on file.",
+    "acctDesc": "The customer has full access during the trial. A payment method is on file for renewal.",
     "rev": "$0.00 (Trial)",
     "queries": "0 Queries",
     "drift": "0.00s",
@@ -27,12 +28,12 @@
   },
   {
     "day": 14,
-    "ttLabel": "Day 14: Pre-Billing Warning Email",
+    "ttLabel": "Day 14: Warning email",
     "badge": "TIMER EXPIRED",
     "badgeClass": "trial",
-    "narrativeBadge": "14-DAY WAKEUP",
-    "narrativeTitle": "Day 14: Notice Dispatched",
-    "narrativeDesc": "The warning state became eligible on Day 14; worker scheduling determines the actual claim time.",
+    "narrativeBadge": "WARNING READY",
+    "narrativeTitle": "Day 14: Warning email",
+    "narrativeDesc": "The warning becomes eligible on Day 14. A worker claims it when available and sends the notice.",
     "code": "send_warning()\nreturn transition('charge', run_at_ms=day_15_ms)",
     "acctBadge": "TRIAL ENDING IN 24H",
     "acctBadgeClass": "trial",
@@ -46,12 +47,12 @@
   },
   {
     "day": 15,
-    "ttLabel": "Day 15: Charge Attempted ($99.00 / mo)",
+    "ttLabel": "Day 15: Payment attempt ($99/month)",
     "badge": "CARD DECLINED",
     "badgeClass": "pastdue",
-    "narrativeBadge": "GRACE PERIOD ACTIVE",
-    "narrativeTitle": "Day 15: Card Declined",
-    "narrativeDesc": "Stripe returned 'insufficient_funds'. Workflow entered grace period and scheduled Dunning Retry #1 in 3 days.",
+    "narrativeBadge": "PAYMENT DECLINED",
+    "narrativeTitle": "Day 15: Card declined",
+    "narrativeDesc": "The card is declined for insufficient funds. The workflow enters a 7-day grace period and schedules retry #1 in 3 days.",
     "code": "attempt = charge_once()\nsend_dunning()\nreturn transition('retry_1', run_at_ms=day_18_ms)  # when declined",
     "acctBadge": "PAST DUE (DUNNING ACTIVE)",
     "acctBadgeClass": "pastdue",
@@ -65,12 +66,12 @@
   },
   {
     "day": 18,
-    "ttLabel": "Day 18: Dunning Retry #1 (SMS + Email)",
+    "ttLabel": "Day 18: Retry #1 (SMS + email)",
     "badge": "DUNNING CADENCE 1",
     "badgeClass": "pastdue",
-    "narrativeBadge": "AUTOMATED ESCALATION",
-    "narrativeTitle": "Day 18: Multi-Channel Alert",
-    "narrativeDesc": "Workflow wakes up on Day 18. Sends SMS warning with direct 1-click card update link. Schedules final retry for Day 21.",
+    "narrativeBadge": "RETRY #1 SCHEDULED",
+    "narrativeTitle": "Day 18: Payment reminder",
+    "narrativeDesc": "The workflow wakes on Day 18, sends an SMS with a card-update link, and schedules the final retry for Day 21.",
     "code": "attempt = charge_once()\nsend_update_link()\nreturn transition('retry_2', run_at_ms=day_21_ms)  # when declined",
     "acctBadge": "PAST DUE (RETRY #1)",
     "acctBadgeClass": "pastdue",
@@ -84,12 +85,12 @@
   },
   {
     "day": 21,
-    "ttLabel": "Day 21: Card Updated ($99.00 Recovered!)",
+    "ttLabel": "Day 21: Payment recovered ($99)",
     "badge": "SUBSCRIPTION RECOVERED",
     "badgeClass": "active",
-    "narrativeBadge": "CHURN PREVENTED",
-    "narrativeTitle": "Day 21: $99.00 Charge Succeeded!",
-    "narrativeDesc": "Customer updated the card. The retry reused a stable Stripe idempotency key and the workflow completed durably.",
+    "narrativeBadge": "PAYMENT RECOVERED",
+    "narrativeTitle": "Day 21: $99 payment succeeds",
+    "narrativeDesc": "The customer updates the card. The retry reuses a stable payment key and the workflow finishes durably.",
     "code": "payment = charge_once()\nreturn complete(result=payment)",
     "acctBadge": "ACTIVE SUBSCRIBER (PAID \u2713)",
     "acctBadgeClass": "active",
@@ -136,7 +137,10 @@
   function render() {
     var data = stepsData[currentStep];
 
-    if (slider) slider.value = String(currentStep);
+    if (slider) {
+      slider.value = String(currentStep);
+      slider.setAttribute("aria-valuetext", data.ttLabel);
+    }
     if (ttLabel) ttLabel.textContent = data.ttLabel;
 
     nodes.forEach(function (node, idx) {
@@ -145,6 +149,11 @@
       node.classList.toggle("is-done", isDone);
       node.classList.toggle("is-active", isActive);
       node.classList.toggle("is-declined", data.declined && idx === 2);
+      node.setAttribute("aria-pressed", String(isActive));
+      if (isActive) node.setAttribute("aria-current", "step");
+      else node.removeAttribute("aria-current");
+      var nodeTitle = node.querySelector("strong");
+      node.setAttribute("aria-label", (nodeTitle ? nodeTitle.textContent : "Billing milestone " + (idx + 1)) + ". " + (isActive ? "Active" : (isDone ? "Complete" : "Pending")));
 
       var pill = node.querySelector(".node-pill");
       if (pill) {
@@ -160,7 +169,10 @@
     }
     if (acctDesc) acctDesc.textContent = data.acctDesc;
 
-    if (narrativeBadge) narrativeBadge.textContent = data.narrativeBadge;
+    if (narrativeBadge) {
+      narrativeBadge.textContent = data.narrativeBadge;
+      narrativeBadge.className = "as-badge " + data.badgeClass;
+    }
     if (narrativeTitle) narrativeTitle.textContent = data.narrativeTitle;
     if (narrativeDesc) narrativeDesc.textContent = data.narrativeDesc;
     if (narrativeCode) narrativeCode.textContent = data.code;
@@ -170,10 +182,19 @@
     if (valDrift) valDrift.textContent = data.drift;
     if (valGrace) valGrace.textContent = data.grace;
 
-    if (currentRunStep) currentRunStep.textContent = "Step " + (currentStep + 1) + " of " + stepsData.length + " · " + data.ttLabel;
+    if (currentRunStep) currentRunStep.textContent = (!hasStarted ? "Preview · " : "Step ") + (currentStep + 1) + " of " + stepsData.length + " · " + data.ttLabel;
 
-    if (pauseBtn) pauseBtn.textContent = isPaused ? "▶ Play" : "⏸ Pause";
-    if (liveStatus) liveStatus.textContent = (isPaused ? "Paused" : "Running") + " · Dunning recovery · Step " + (currentStep + 1) + " of " + stepsData.length;
+    if (prevBtn) prevBtn.disabled = currentStep === 0;
+    if (nextBtn) nextBtn.disabled = currentStep >= stepsData.length - 1;
+    if (pauseBtn) {
+      var finished = hasStarted && currentStep >= stepsData.length - 1 && isPaused;
+      pauseBtn.textContent = finished ? "Finished" : (!hasStarted || isPaused ? "Play" : "Pause");
+      pauseBtn.disabled = finished;
+      pauseBtn.setAttribute("aria-label", finished ? "Billing schedule finished; choose Replay to run it again" : "Pause or play the billing schedule");
+    }
+    if (liveStatus) liveStatus.textContent = !hasStarted
+      ? "Preview ready · choose Run to play"
+      : (finished ? "Finished · choose Replay to run again" : (isPaused ? "Paused · choose Play to continue" : "Playing automatically · Pause to inspect")) + " · Step " + (currentStep + 1) + " of " + stepsData.length;
   }
 
   function clearTimer() {
@@ -185,10 +206,16 @@
 
   function schedule() {
     clearTimer();
-    if (isPaused) return;
+    if (!hasStarted || isPaused || currentStep >= stepsData.length - 1) {
+      if (hasStarted && currentStep >= stepsData.length - 1) {
+        isPaused = true;
+        render();
+      }
+      return;
+    }
     var wait = (currentStep === 2) ? 4000 : 2800;
     timer = window.setTimeout(function () {
-      currentStep = (currentStep + 1) % stepsData.length;
+      currentStep += 1;
       render();
       schedule();
     }, wait);
@@ -197,22 +224,34 @@
   if (slider) {
     slider.addEventListener("input", function () {
       currentStep = parseInt(slider.value, 10);
+      hasStarted = true;
+      isPaused = true;
+      clearTimer();
       render();
       schedule();
     });
   }
 
   nodes.forEach(function (node, idx) {
-    node.addEventListener("click", function () {
+    function selectNode() {
       currentStep = idx;
+      hasStarted = true;
+      isPaused = true;
+      clearTimer();
       render();
-      schedule();
+    }
+    node.addEventListener("click", selectNode);
+    node.addEventListener("keydown", function (event) {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      selectNode();
     });
   });
 
   if (declinedToggle) {
     declinedToggle.addEventListener("click", function () {
       currentStep = 2;
+      hasStarted = true;
       isPaused = true;
       render();
       schedule();
@@ -222,6 +261,7 @@
   if (successToggle) {
     successToggle.addEventListener("click", function () {
       currentStep = 4;
+      hasStarted = true;
       isPaused = true;
       render();
       schedule();
@@ -230,7 +270,12 @@
 
   if (pauseBtn) {
     pauseBtn.addEventListener("click", function () {
-      isPaused = !isPaused;
+      if (!hasStarted) {
+        hasStarted = true;
+        isPaused = false;
+      } else {
+        isPaused = !isPaused;
+      }
       render();
       schedule();
     });
@@ -238,23 +283,28 @@
 
   if (prevBtn) {
     prevBtn.addEventListener("click", function () {
-      currentStep = (currentStep - 1 + stepsData.length) % stepsData.length;
+      hasStarted = true;
+      isPaused = true;
+      clearTimer();
+      currentStep = Math.max(0, currentStep - 1);
       render();
-      schedule();
     });
   }
 
   if (nextBtn) {
     nextBtn.addEventListener("click", function () {
-      currentStep = (currentStep + 1) % stepsData.length;
+      hasStarted = true;
+      isPaused = true;
+      clearTimer();
+      currentStep = Math.min(stepsData.length - 1, currentStep + 1);
       render();
-      schedule();
     });
   }
 
   if (replayBtn) {
     replayBtn.addEventListener("click", function () {
       currentStep = 0;
+      hasStarted = true;
       isPaused = false;
       render();
       schedule();
@@ -276,5 +326,4 @@
   });
 
   render();
-  schedule();
 })();

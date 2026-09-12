@@ -7,9 +7,9 @@
   <meta name="theme-color" content="#071018">
   <title>Workflow Benchmark, Explained | FerricStore Demos</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css?v=7">
-  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=20">
+  <link rel="stylesheet" href="./style.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=20260912d">
 </head>
 <body class="fs-dispatch">
   <!--
@@ -40,35 +40,35 @@
 
       <div class="headline-stack" aria-label="FerricStore workflow benchmark summary">
         <article class="headline-result">
-          <span>FUSED 3-STEP RESULT</span>
+          <span>RECORDED FUSED RESULT</span>
           <strong>104,696</strong>
-          <small>completed deterministic workflows / second</small>
+          <small>completed fused workflows / second</small>
         </article>
         <div class="headline-facts">
-          <div><strong>3</strong><span>declared workflow steps, persisted as one chain</span></div>
-          <div><strong>314K</strong><span>logical workflow steps/s, derived</span></div>
-          <div><strong>≈6–9 ms</strong><span>per logical step, derived from the 3-step p50–p99 totals</span></div>
+          <div><strong>3</strong><span>declared states in the measured fused chain</span></div>
+          <div><strong>314K</strong><span>logical workflow steps/s, derived from 104,696 completed workflows/s</span></div>
+          <div><strong>27 ms</strong><span>p99 for the complete 3-step chain</span></div>
         </div>
       </div>
     </header>
 
     <aside class="evidence-note" aria-label="Benchmark evidence boundary">
       <span aria-hidden="true">i</span>
-      <p><strong>Do not read this as 104,696 three-step business processes.</strong> The fused benchmark records an already-known state chain in one durable command. No HTTP call, model inference, payment, or other application handler runs between its steps.</p>
+      <p><strong>These are recorded results, not a live test.</strong> Throughput means completed workflows per second. p99 means 99 out of 100 recorded requests finished within the stated time. The fused benchmark records an already-known state chain in one durable command; no HTTP call, model inference, payment, or other application handler runs between its states.</p>
     </aside>
 
     <section class="math-section" id="workflow-modes" aria-labelledby="modes-title">
       <div class="section-heading">
         <div>
           <span class="eyebrow">WHAT THE NUMBERS MEAN</span>
-          <h2 id="modes-title">Choose the execution model first</h2>
+          <h2 id="modes-title">Choose a recorded result</h2>
         </div>
-        <p>The useful question is not “which number is larger?” It is “does application code need to run between durable states?”</p>
+        <p>The useful question is not “which number is larger?” It is “does application code need to run between saved states?”</p>
       </div>
 
       <div class="mode-switch" role="tablist" aria-label="Workflow execution model">
-        <button type="button" role="tab" aria-selected="true" aria-controls="mode-panel" data-mode-button="worker">Worker-driven workflow</button>
-        <button type="button" role="tab" aria-selected="false" aria-controls="mode-panel" data-mode-button="fused">Fused deterministic chain</button>
+        <button type="button" role="tab" aria-selected="true" aria-controls="mode-panel" data-mode-button="worker">Worker-driven (recorded)</button>
+        <button type="button" role="tab" aria-selected="false" aria-controls="mode-panel" data-mode-button="fused">Fused chain (recorded)</button>
       </div>
 
       <div class="mode-panel" id="mode-panel" role="tabpanel" aria-live="polite">
@@ -93,9 +93,9 @@
         </div>
 
         <div class="mode-metrics" aria-label="Selected workflow benchmark facts">
-          <article><small>THROUGHPUT</small><strong data-mode-throughput>54,060/s</strong><span data-mode-throughput-note>1M live Azure run</span></article>
+          <article><small>THROUGHPUT</small><strong data-mode-throughput>54,060/s</strong><span data-mode-throughput-note>recorded Azure run · 1M workflows</span></article>
           <article><small>LOGICAL STEPS</small><strong data-mode-steps>1</strong><span data-mode-steps-note>one worker handler</span></article>
-          <article><small>MEASURED TIMING</small><strong data-mode-latency>≈18.5 s</strong><span data-mode-latency-note>1M workflows end-to-end</span></article>
+          <article><small>MEASURED TIMING</small><strong data-mode-latency>≈18.5 s</strong><span data-mode-latency-note>recorded total for 1M workflows</span></article>
           <article><small>DURABLE SHAPE</small><strong data-mode-command>create + claim + finish</strong><span data-mode-command-note>application code between boundaries</span></article>
         </div>
 
@@ -230,11 +230,11 @@
             <li><span>02</span><p><strong>Advance</strong> Persist the second named state in workflow history.</p></li>
             <li><span>03</span><p><strong>Finish</strong> Persist the final named state and mark the workflow completed.</p></li>
           </ol>
-          <div class="latency-step-math" aria-label="Average-equivalent time per logical step">
-            <div><span>p50 equivalent</span><strong>18.1 ÷ 3 ≈ 6.0 ms/step</strong></div>
-            <div><span>p99 equivalent</span><strong>27.0 ÷ 3 = 9.0 ms/step</strong></div>
+          <div class="latency-step-math" aria-label="Recorded total timing for the complete fused chain">
+            <div><span>p50 total</span><strong>18.1 ms for all 3 steps</strong></div>
+            <div><span>p99 total</span><strong>27.0 ms for all 3 steps</strong></div>
           </div>
-          <p><strong>Think of this as roughly 6–9 ms of total time per logical step.</strong> These are divided end-to-end totals, not separately measured step latencies; individual steps may take different amounts of time. No application code runs between them.</p>
+          <p><strong>p99 is 27.0 ms for the complete three-step command.</strong> In plain terms, 99 out of 100 recorded requests finished within 27.0 ms. This is not a separately measured time for each state. No application code runs between them.</p>
         </article>
 
         <article class="latency-card temporal-latency">
@@ -284,7 +284,7 @@
     <p>Measured facts · Clear execution models · Bounded comparisons</p>
   </footer>
 
-  <script src="./benchmark.js?v=4"></script>
-  <script src="../shared/dispatch.js?v=16"></script>
+  <script src="./benchmark.js?v=20260912c"></script>
+  <script src="../shared/dispatch.js?v=20260912c"></script>
 </body>
 </html>

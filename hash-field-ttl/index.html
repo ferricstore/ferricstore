@@ -5,13 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Sub-Key Hash Field TTLs · FerricStore</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="../shared/base.css">
-  <link rel="stylesheet" href="./style.css?v=2">
-  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="stylesheet" href="../shared/base.css?v=20260912c">
+  <link rel="stylesheet" href="./style.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/polish.css?v=20260912c">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=20">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=20260912d">
 </head>
 <body class="fs-dispatch" data-mode="before">
   <!--
@@ -45,22 +45,22 @@
     <header class="demo-hero">
       <div class="hero-tag">ADVANCED IN-MEMORY KV · SUB-KEY EXPIRY</div>
       <h1>
-        Hash Field-Level TTLs (<code>HEXPIRE</code>):<br>
-        <span class="hero-accent">Expire Individual Attributes Inside 1 Object Without Key Explosion</span>
+        Let parts of one record expire:<br>
+        <span class="hero-accent">Use a field-level TTL for a login code or cart hold</span>
       </h1>
       <p class="hero-desc">
-        Without field-level TTL support, applications often split transient attributes into separate keys or add cleanup logic. <strong>FerricStore supports native sub-key millisecond expirations on compound hashes (<code>HEXPIRE</code> / <code>HPEXPIRE</code>)</strong>, so selected fields expire while other fields in the parent hash remain unchanged.
+        A TTL (time to live) says when a value should expire. <strong>FerricStore supports native field-level TTLs on a compound hash with <code>HEXPIRE</code> / <code>HPEXPIRE</code></strong>, so a login code or cart hold can expire while the rest of the same user record remains available.
       </p>
 
       <!-- Mode Switch Tabs -->
       <div class="mode-switch" role="tablist" aria-label="Execution Mode">
         <button type="button" role="tab" data-mode-btn="before" aria-selected="true" class="is-selected">
-          <span class="mode-tab-title">Legacy Key Explosion (Redis pre-7.4)</span>
-          <span class="mode-tab-badge bad">❌ 10 Top-Level Keys per User (10x RAM Bloat)</span>
+          <span class="mode-tab-title">Separate keys for expiring values</span>
+          <span class="mode-tab-badge bad">Each temporary value gets its own key in this example</span>
         </button>
         <button type="button" role="tab" data-mode-btn="after" aria-selected="false">
-          <span class="mode-tab-title">FerricStore Compound Hash TTL</span>
-          <span class="mode-tab-badge good">✓ 1 Single Key + Native HEXPIRE (90% Leaner)</span>
+          <span class="mode-tab-title">With FerricStore · field-level TTL</span>
+          <span class="mode-tab-badge good">✓ One record; selected fields expire</span>
         </button>
       </div>
     </header>
@@ -70,37 +70,37 @@
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">🔑</span>
-          <small>TOP-LEVEL KEYS STORED</small>
+          <small>RECORD KEYS IN THIS EXAMPLE</small>
         </div>
-        <strong class="metric-val text-green" data-metric-keys>1,000,000 Keys (90% Saved)</strong>
-        <span class="metric-sub" data-metric-keys-sub>1 compound key per user object</span>
+        <strong class="metric-val text-green" data-metric-keys>10,000,000 Keys</strong>
+        <span class="metric-sub" data-metric-keys-sub>Illustrative 1M-user model · 10 per user</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">💾</span>
-          <small>METADATA RAM OVERHEAD</small>
+          <small>MODELED METADATA MEMORY</small>
         </div>
-        <strong class="metric-val text-cyan" data-metric-ram>320 MB (10x Leaner)</strong>
-        <span class="metric-sub" data-metric-ram-sub>Zero redundant dict header overhead</span>
+        <strong class="metric-val text-cyan" data-metric-ram>3.2 GB (illustrative)</strong>
+        <span class="metric-sub" data-metric-ram-sub>Modeled dictionary metadata for this example</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">⚡</span>
-          <small>ATOMICITY &amp; SHARDING</small>
+          <small>HOW UPDATES ARE GROUPED</small>
         </div>
-        <strong class="metric-val text-green" data-metric-atomic>Single-shard atomic</strong>
-        <span class="metric-sub" data-metric-atomic-sub>No cross-key transactions needed</span>
+        <strong class="metric-val text-green" data-metric-atomic>Separate-key updates</strong>
+        <span class="metric-sub" data-metric-atomic-sub>Several keys must be changed together</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">⏱️</span>
-          <small>EXPIRY PRECISION</small>
+          <small>TIME-TO-LIVE PRECISION</small>
         </div>
-        <strong class="metric-val text-green" data-metric-precision>Millisecond TTL command</strong>
-        <span class="metric-sub" data-metric-precision-sub>Lazy touch + sweep eviction</span>
+        <strong class="metric-val text-green" data-metric-precision>Separate expiry setup</strong>
+        <span class="metric-sub" data-metric-precision-sub>TTL means time to live; this example uses 5s and 10s</span>
       </div>
     </section>
 
@@ -123,7 +123,7 @@
         </header>
 
         <!-- Code Block: Before Mode -->
-        <pre class="code-block" data-code="before" hidden><code><span data-line="1"><b class="ln">1</b><span><i class="c"># ❌ Legacy Redis Workaround (Key Explosion):</i></span></span>
+        <pre class="code-block" data-code="before"><code><span data-line="1"><b class="ln">1</b><span><i class="c"># Separate-key example:</i></span></span>
 <span data-line="2"><b class="ln">2</b><span><i class="c"># To expire a 2FA code or cart hold, we must create separate keys:</i></span></span>
 <span data-line="3"><b class="ln">3</b><span>redis.<i class="fn">hset</i>(<q>"user:42:profile"</q>, <q>"name"</q>, <q>"Alice"</q>)</span></span>
 <span data-line="4"><b class="ln">4</b><span>redis.<i class="fn">setex</i>(<q>"user:42:token"</q>, 300, <q>"jwt_9842"</q>)     <i class="c"># Key 2</i></span></span>
@@ -132,7 +132,7 @@
 <span data-line="7"><b class="ln">7</b><span><i class="c"># 💥 1,000,000 users = 10,000,000 keys ➔ 3.2GB wasted on Redis dict metadata!</i></span></span></code></pre>
 
         <!-- Code Block: After Mode -->
-        <pre class="code-block" data-code="after"><code><span data-line="1"><b class="ln">1</b><span><i class="c"># ✓ FerricStore Native Sub-Key Field Expiry (HEXPIRE):</i></span></span>
+        <pre class="code-block" data-code="after" hidden><code><span data-line="1"><b class="ln">1</b><span><i class="c"># FerricStore field-level expiry (HEXPIRE):</i></span></span>
 <span data-line="2"><b class="ln">2</b><span><i class="c"># Store all user attributes in ONE compound hash:</i></span></span>
 <span data-line="3"><b class="ln">3</b><span>client.<i class="fn">hset</i>(<q>"user:42"</q>, {<q>"name"</q>: <q>"Alice"</q>, <q>"role"</q>: <q>"admin"</q>})</span></span>
 <span data-line="4"><b class="ln">4</b><span></span></span>
@@ -150,12 +150,12 @@
         <header class="stage-header">
           <div class="stage-meta-left">
             <span class="run-id-pill">KEY: <strong>user:42</strong></span>
-            <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>STEP 1 · LEGACY 2FA KEY TTL</b></span>
+            <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>READY · CHOOSE A FIELD ACTION</b></span>
           </div>
           <div class="playback-controls">
-            <button class="stage-btn btn-primary" data-btn-set-2fa title="Set 2FA Code with 5s TTL">⚡ 1. Set 2FA (5s TTL)</button>
-            <button class="stage-btn btn-cyan" data-btn-set-cart title="Set Cart Reservation with 10s TTL">🛒 2. Add Cart (10s TTL)</button>
-            <button class="stage-btn btn-ghost" data-btn-reset title="Reset Simulation">↺</button>
+            <button class="stage-btn btn-primary" data-btn-set-2fa title="Set a login code that expires in 5 seconds">⚡ Set login code for 5s</button>
+            <button class="stage-btn btn-cyan" data-btn-set-cart title="Hold a cart item for 10 seconds">🛒 Hold cart item for 10s</button>
+            <button class="stage-btn btn-ghost" data-btn-reset title="Reset the example">↺ Reset</button>
           </div>
         </header>
 
@@ -167,19 +167,19 @@
             <div class="h-head">
               <span class="h-icon">🗂️</span>
               <div>
-                <strong>COMPOUND HASH: <code>user:42</code></strong>
+                <strong>USER DATA: <code>user:42</code></strong>
                 <small data-hash-summary>4 Fields · Sub-Key Expiry Active</small>
               </div>
-              <span class="h-badge ok">✓ Single Shard Atomic</span>
+              <span class="h-badge ok">Same values, different layouts</span>
             </div>
 
             <div class="fields-table-wrap">
               <table class="fields-table">
                 <thead>
                   <tr>
-                    <th>FIELD NAME</th>
-                    <th>STORED VALUE</th>
-                    <th>FIELD TTL (HEXPIRE)</th>
+                    <th>FIELD</th>
+                    <th>VALUE</th>
+                    <th>TIME TO LIVE (TTL)</th>
                     <th>STATUS</th>
                   </tr>
                 </thead>
@@ -220,11 +220,11 @@
           <!-- Live Event Terminal -->
           <div class="live-terminal-compact">
             <div class="term-head">
-              <span>📟 KEYDIR SUB-KEY SWEEPER TELEMETRY</span>
-              <small>Real-time Stream</small>
+              <span>📟 FIELD EXPIRY ACTIVITY</span>
+              <small>Activity log</small>
             </div>
             <div class="term-stream" data-term-stream>
-              <div class="term-row info">[00:00.000] user:42 initialized with 2 permanent profile fields.</div>
+              <div class="term-row info">[00:00.000] Ready. The user record starts with two fields that do not expire.</div>
             </div>
           </div>
 
@@ -232,8 +232,8 @@
           <div class="explanation-box">
             <div class="exp-icon" data-exp-icon>💡</div>
             <div class="exp-text">
-              <strong data-exp-title>Sub-Key Field Expiry: 1 Key Replaces 10 Separate Keys</strong>
-              <p data-exp-desc>FerricStore tracks millisecond TTLs on individual hash attributes. When auth_2fa expires, only that single field is purged, keeping the user profile completely intact.</p>
+              <strong data-exp-title>One record, separate expiry timers</strong>
+              <p data-exp-desc>Set login code for 5s to expire only auth_2fa. The name and role fields stay in the same user record.</p>
             </div>
           </div>
 
@@ -242,9 +242,9 @@
         <!-- Outcome Callout Footer -->
         <footer class="stage-footer">
           <div class="outcome-callout good" data-outcome-callout>
-            <small data-outcome-label>ADVANCED KV BENEFIT</small>
-            <strong data-outcome-title>90% RAM SAVINGS &amp; ZERO KEY EXPLOSION</strong>
-            <span data-outcome-sub>By supporting HEXPIRE natively on compound hashes, FerricStore eliminates millions of redundant top-level keys and enables atomic single-shard updates.</span>
+            <small data-outcome-label>FIELD-LEVEL EXPIRY</small>
+            <strong data-outcome-title>ONE RECORD CAN KEEP ITS PERMANENT FIELDS</strong>
+            <span data-outcome-sub>Run either action, then watch only the selected field disappear when its timer reaches zero.</span>
           </div>
         </footer>
       </article>
@@ -255,8 +255,8 @@
     <section class="arch-comparison-section">
       <div class="catastrophe-head">
         <span class="catastrophe-pill">⚖️ ARCHITECTURE COMPARISON</span>
-        <h2>How Transient Attributes Are Handled: Redis vs. FerricStore</h2>
-        <p>Why modern engineering teams replace top-level key explosion with native compound hash field TTLs.</p>
+        <h2>Two ways to expire a login code or cart hold</h2>
+        <p>Compare separate keys with one compound hash whose selected fields have their own TTL.</p>
       </div>
 
       <div class="arch-table-card">
@@ -264,30 +264,30 @@
           <thead>
             <tr>
               <th>CAPABILITY</th>
-              <th class="bad-col">❌ LEGACY REDIS / MEMCACHED</th>
-              <th class="good-col">✓ FERRICSTORE (HEXPIRE &amp; HPEXPIRE)</th>
+              <th class="bad-col">❌ SEPARATE-KEY EXAMPLE</th>
+              <th class="good-col">✓ WITH FERRICSTORE</th>
             </tr>
           </thead>
           <tbody>
             <tr>
               <td><strong>Transient Attribute Storage</strong></td>
-              <td class="bad-text"><strong>Key Explosion:</strong> Must create separate string keys (<code>user:42:token</code>, <code>user:42:2fa</code>, <code>user:42:cart</code>) because Redis pre-7.4 only expired entire top-level keys.</td>
-              <td class="good-text"><strong>1 Single Compound Hash:</strong> All attributes live under <code>user:42</code> with independent millisecond expiry timestamps.</td>
+              <td class="bad-text"><strong>Separate keys:</strong> The login code and cart hold live outside <code>user:42:profile</code> so each can expire on its own.</td>
+              <td class="good-text"><strong>One compound hash:</strong> All attributes live under <code>user:42</code> with independent expiry timestamps.</td>
             </tr>
             <tr>
               <td><strong>Memory Overhead (1M Users)</strong></td>
-              <td class="bad-text"><strong>3.2 GB RAM:</strong> 10,000,000 dict headers, robj structs, and jemalloc allocations.</td>
-              <td class="good-text"><strong>320 MB RAM (10x Leaner):</strong> 1,000,000 keys with compact internal field tables.</td>
+              <td class="bad-text"><strong>3.2 GB in this model:</strong> 10,000,000 dict headers, robj structs, and jemalloc allocations.</td>
+              <td class="good-text"><strong>320 MB in this model:</strong> 1,000,000 keys with compact internal field tables.</td>
             </tr>
             <tr>
               <td><strong>Atomic Updates</strong></td>
-              <td class="bad-text"><strong>Complex Transactions:</strong> Multi-key updates require <code>MULTI/EXEC</code> or Lua scripts and fail if keys cross cluster slots.</td>
-              <td class="good-text"><strong>Single-Shard Fast Path:</strong> Atomic updates to any combination of fields in 1 single roundtrip.</td>
+              <td class="bad-text"><strong>Several keys:</strong> Updates to separate keys need coordination when they must change together.</td>
+              <td class="good-text"><strong>One record:</strong> Updates to fields in the same hash can use the single-shard path.</td>
             </tr>
             <tr>
               <td><strong>Code Simplicity</strong></td>
-              <td class="bad-text">Developers write custom cron jobs to clean up expired fields inside JSON strings.</td>
-              <td class="good-text"><strong>Native Command:</strong> <code>client.hexpire("user:42", 300, ["token"])</code>.</td>
+              <td class="bad-text">The application manages several keys and their expiry commands.</td>
+              <td class="good-text"><strong>Native command:</strong> <code>client.hexpire("user:42", 300, ["token"])</code>.</td>
             </tr>
           </tbody>
         </table>
@@ -296,8 +296,8 @@
 
   </main>
 
-  <script src="./hash_ttl.js?v=5"></script>
-  <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=16"></script>
+  <script src="./hash_ttl.js?v=20260912c"></script>
+  <script src="../shared/accuracy.js?v=20260912c"></script>
+  <script src="../shared/dispatch.js?v=20260912c"></script>
 </body>
 </html>

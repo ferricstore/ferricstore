@@ -1096,3 +1096,29 @@ body {
   transform: translateY(-2px);
   box-shadow: 0 14px 40px var(--primary-glow);
 }
+
+/* Clarity pass: keep the selected scenario and the next action visible even
+   when the shared evaluation shell replaces the original hero. */
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .scenario-badge {
+  flex-wrap: wrap;
+  row-gap: 3px;
+}
+
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .scenario-detail {
+  flex-basis: 100%;
+  margin-left: 0;
+  color: var(--fs-muted, #566b72);
+  font-size: 15px;
+  line-height: 1.4;
+}
+
+body.fs-dispatch[data-fs-demo="workflow-explainer"] .stage-live-indicator {
+  max-width: 28ch;
+  line-height: 1.4;
+}
+
+@media (max-width: 520px) {
+  body.fs-dispatch[data-fs-demo="workflow-explainer"] .scenario-detail {
+    font-size: 15px;
+  }
+}

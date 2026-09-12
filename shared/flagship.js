@@ -6,7 +6,7 @@
 
   var design = document.body.dataset.design || "lab";
   var directions = [
-    { id: "lab", path: "split-lab", short: "Split Lab", title: "Code and recovery, side by side", desc: "Follow real Python workflow handlers while a replacement worker resumes from durable state." }
+    { id: "lab", path: "split-lab", short: "Split Lab", title: "Start over or carry on?", desc: "Run the same research task after a crash: restart from the beginning, or resume the progress that was saved." }
   ];
   var meta = directions.filter(function (item) { return item.id === design; })[0] || directions[0];
 
@@ -41,15 +41,15 @@
   function phaseLabel(phase) {
     return {
       idle: "Ready",
-      plan: "Plan",
+      plan: "Planning",
       replan: "Repeat plan",
-      search: "Search",
+      search: "Search sources",
       research: "Repeat search",
-      summarize: "Summarize",
+      summarize: "Summarizing",
       resummarize: "Repeat summary",
-      crashed: "Worker crashed",
-      recovering: "Lease reclaimed",
-      restarting: "Restarting",
+      crashed: "Worker stopped",
+      recovering: "Resuming saved state",
+      restarting: "Starting over",
       complete: "Completed"
     }[phase] || phase;
   }
@@ -77,8 +77,8 @@
     '    <section id="direction-view" class="direction-view" aria-label="Interactive AI workflow demonstration"></section>',
     '    <details class="demo-accuracy">',
     '      <summary>Accuracy and SDK notes</summary>',
-    '      <div><p><strong>Durability boundary:</strong> FerricStore persists explicit workflow state and rejects stale writes through lease and fencing checks. A compatible worker can reclaim the current state after the lease expires.</p>',
-    '      <p><strong>External effects:</strong> Handlers remain at-least-once. Use <code>@ctx.effect(...)</code> to reserve, fence, and confirm a call. <code>operation_digest</code> versions the logical operation; <code>idempotency_key</code> stays stable for the external request. Neither makes the handler exactly-once.</p>',
+    '      <div><p><strong>Saved-progress boundary:</strong> FerricStore persists named workflow states and blocks an old worker from writing after a replacement takes over. A compatible worker can reclaim the current state after the lease expires.</p>',
+    '      <p><strong>External effects:</strong> Handlers remain at-least-once. Use <code>@ctx.effect(...)</code> to reserve, guard, and confirm a call. <code>operation_digest</code> versions the logical operation; <code>idempotency_key</code> stays stable for the external request. Neither makes the handler exactly-once.</p>',
     '      <p>This is an interaction model, not a performance benchmark. Counts and identifiers are fixed scenario data used to explain the state transition.</p></div>',
     '    </details>',
     '  </main>',

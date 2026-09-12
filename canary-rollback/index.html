@@ -5,13 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Canary Deployment &amp; Durable 24h Soak · FerricStore</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="../shared/base.css">
-  <link rel="stylesheet" href="./style.css">
-  <link rel="stylesheet" href="../shared/polish.css">
+  <link rel="stylesheet" href="../shared/base.css?v=20260912c">
+  <link rel="stylesheet" href="./style.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/polish.css?v=20260912c">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=20">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=20260912d">
 </head>
 <body class="fs-dispatch" data-mode="before">
   <!--
@@ -56,11 +56,11 @@
       <div class="mode-switch" role="tablist" aria-label="Execution Mode">
         <button type="button" role="tab" data-mode-btn="before" aria-selected="true" class="is-selected">
           <span class="mode-tab-title">Without FerricStore</span>
-          <span class="mode-tab-badge bad">❌ Fragile Script (Blocks Threads / Lost on Crash)</span>
+          <span class="mode-tab-badge bad">Worker sleep · state lost on crash</span>
         </button>
         <button type="button" role="tab" data-mode-btn="after" aria-selected="false">
           <span class="mode-tab-title">With FerricStore</span>
-          <span class="mode-tab-badge good">✓ Durable State + Signal + Rollback</span>
+          <span class="mode-tab-badge good">Saved progress · undo the update on alert</span>
         </button>
       </div>
     </header>
@@ -70,37 +70,37 @@
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">💤</span>
-          <small>24-HOUR SOAK CPU USAGE</small>
+          <small>WORKER TIME DURING THE 24-HOUR WAIT</small>
         </div>
-        <strong class="metric-val text-green" data-metric-cpu>No waiting handler held</strong>
-        <span class="metric-sub" data-metric-cpu-sub>Observation state is persisted</span>
+        <strong class="metric-val text-green" data-metric-cpu>Blocks an OS thread</strong>
+        <span class="metric-sub" data-metric-cpu-sub>In-memory sleep holds a worker thread</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">💥</span>
-          <small>SERVER CRASH RESILIENCE</small>
+          <small>WHAT SURVIVES A HOST REBOOT?</small>
         </div>
-        <strong class="metric-val text-cyan" data-metric-crash>Lease-based recovery</strong>
-        <span class="metric-sub" data-metric-crash-sub>Reclaim timing is configurable</span>
+        <strong class="metric-val text-cyan" data-metric-crash>0% (Lost on Reboot)</strong>
+        <span class="metric-sub" data-metric-crash-sub>Sleep state disappears with the process</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">🚨</span>
-          <small>DATADOG 5XX ERROR SPIKE</small>
+          <small>ERROR SIGNAL AFTER THE WAIT</small>
         </div>
-        <strong class="metric-val text-red" data-metric-errors>2.40% (Threshold: 0.50%)</strong>
-        <span class="metric-sub" data-metric-errors-sub>Signal advances the parked soak state</span>
+        <strong class="metric-val text-red" data-metric-errors>Unmonitored after crash</strong>
+        <span class="metric-sub" data-metric-errors-sub>No listener remains after a crash</span>
       </div>
 
       <div class="metric-card">
         <div class="metric-head">
           <span class="metric-icon">↩</span>
-          <small>ROLLBACK REMEDIATION TIME</small>
+          <small>HOW ROLLBACK STARTS</small>
         </div>
-        <strong class="metric-val text-green" data-metric-rollback>Explicit rollback state</strong>
-        <span class="metric-sub" data-metric-rollback-sub>Provider latency dependent</span>
+        <strong class="metric-val text-green" data-metric-rollback>Manual PagerDuty (45m)</strong>
+        <span class="metric-sub" data-metric-rollback-sub>An operator must start recovery</span>
       </div>
     </section>
 
@@ -113,8 +113,8 @@
           <div class="file-info">
             <span class="file-icon">py</span>
             <div>
-              <h2 id="code-title" data-code-title>canary_fsm.py</h2>
-              <small data-code-kicker>FERRICSTORE STATE + SIGNAL API</small>
+              <h2 id="code-title" data-code-title>deploy_script.py</h2>
+              <small data-code-kicker>UNMANAGED TIME.SLEEP (FRAGILE)</small>
             </div>
           </div>
           <div class="code-controls">
@@ -122,7 +122,7 @@
               <button type="button" class="sdk-btn" data-sdk-style="steps">Advanced step</button>
               <button type="button" class="sdk-btn is-active" data-sdk-style="states">Simple states</button>
             </div>
-            <span class="badge-durable" data-code-badge>DURABLE CANARY</span>
+            <span class="badge-durable" data-code-badge>VOLATILE SCRIPT</span>
           </div>
         </header>
 
@@ -170,7 +170,7 @@ client.transition(
 )</code></pre>
 
         <!-- Code Block: After Mode (States) -->
-        <pre class="code-block" data-code="after-states"><code>import time
+        <pre class="code-block" data-code="after-states" hidden><code>import time
 from ferricstore import WorkflowClient, complete, transition
 
 client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
@@ -203,15 +203,18 @@ client.signal(
       <article class="stage-panel">
         <header class="stage-header">
           <div class="stage-meta-left">
-            <span class="run-id-pill">SERVICE: <strong>PAYMENT-GATEWAY-v2.4.0</strong></span>
-            <span class="live-pill" data-live-pill><span class="pulse-dot"></span> <b data-live-status>STEP 1 OF 3</b></span>
+            <span class="run-id-pill">SCENARIO: <strong>PAYMENT GATEWAY · v2.4.0</strong></span>
+            <span class="live-pill" data-live-pill><span class="pulse-dot" aria-hidden="true"></span> <b data-live-status>STEP 1: 10% CANARY LIVE (24H SOAK)</b></span>
           </div>
-          <div class="playback-controls">
-            <button class="stage-btn btn-primary" data-btn-play title="Play 3-Step Story">⚡ Play Story (3s)</button>
-            <button class="stage-btn" data-btn-step-1 title="Step 1: Route 10% Canary & Park on Disk">1. Route 10%</button>
-            <button class="stage-btn btn-danger" data-btn-step-2 title="Step 2: Server Reboots at Hour 18 (Crash Recovery)">2. Crash at Hr 18</button>
-            <button class="stage-btn btn-warning" data-btn-step-3 title="Step 3: Datadog 5xx alert advances to rollback">3. 5xx Rollback</button>
-            <button class="stage-btn btn-ghost" data-btn-reset title="Reset Simulation">↺</button>
+          <div class="stage-actions">
+            <p class="playback-help">Run the whole story, or inspect a numbered step.</p>
+            <div class="playback-controls" aria-label="Canary release story controls">
+              <button class="stage-btn btn-primary" data-btn-play title="Run or replay the full three-step release story">Run full story</button>
+              <button class="stage-btn" data-btn-step-1 title="Go to step 1: try the update on 10 percent of traffic">1. Try the update</button>
+              <button class="stage-btn btn-danger" data-btn-step-2 title="Go to step 2: simulate a host reboot at hour 18">2. Simulate host reboot</button>
+              <button class="stage-btn btn-warning" data-btn-step-3 title="Go to step 3: report server errors and inspect rollback">3. Report server errors</button>
+              <button class="stage-btn btn-ghost" data-btn-reset title="Start over at step 1" aria-label="Start over at step 1">Start over</button>
+            </div>
           </div>
         </header>
 
@@ -219,20 +222,20 @@ client.signal(
         <div class="story-canvas">
           
           <!-- Step Indicator Header -->
-          <div class="story-stepper">
-            <div class="step-pill is-active" data-step-indicator="1">
+          <div class="story-stepper" role="list" aria-label="Canary release story steps">
+            <div class="step-pill is-active" role="listitem" data-step-indicator="1" aria-current="step">
               <span class="s-num">1</span>
-              <span>Route 10% (durable observation)</span>
+              <span>Try update on 10% of traffic</span>
             </div>
-            <div class="step-divider">➔</div>
-            <div class="step-pill" data-step-indicator="2">
+            <div class="step-divider" aria-hidden="true">➔</div>
+            <div class="step-pill" role="listitem" data-step-indicator="2">
               <span class="s-num">2</span>
               <span>Host Crash at Hour 18</span>
             </div>
-            <div class="step-divider">➔</div>
-            <div class="step-pill" data-step-indicator="3">
+            <div class="step-divider" aria-hidden="true">➔</div>
+            <div class="step-pill" role="listitem" data-step-indicator="3">
               <span class="s-num">3</span>
-              <span data-step-3-text>Datadog 5xx ➔ rollback state</span>
+              <span data-step-3-text>Broken Canary Stuck Live</span>
             </div>
           </div>
 
@@ -263,15 +266,15 @@ client.signal(
                 <span class="c-icon">⏱️</span>
                 <div>
                   <strong>24-HOUR SOAK OBSERVATION</strong>
-                  <small data-soak-sub>Observation state persisted</small>
+                  <small data-soak-sub>Holding open worker thread in memory</small>
                 </div>
               </div>
               <div class="c-metric-row">
-                <span class="c-val text-cyan" data-soak-val>18h 32m / 24h 00m</span>
-                <span class="c-badge ok" data-soak-badge>💤 No handler blocked</span>
+                <span class="c-val text-cyan" data-soak-val>0h 01m / 24h 00m (Soak Started)</span>
+                <span class="c-badge tripped" data-soak-badge>⚠️ Blocking Thread (illustrative)</span>
               </div>
               <div class="c-track">
-                <div class="c-fill soak-fill" data-soak-fill style="width: 77%;"></div>
+                <div class="c-fill soak-fill" data-soak-fill style="width: 2%;"></div>
               </div>
             </div>
 
@@ -300,7 +303,7 @@ client.signal(
             <div class="exp-icon" data-exp-icon>💡</div>
             <div class="exp-text">
               <strong data-exp-title>Step 1: Envoy shifts 10% traffic to v2.4.0 (24h Soak Started)</strong>
-              <p data-exp-desc>The flow persists an observation state and returns the handler. Click "2. Crash at Hr 18" to simulate a Kubernetes host reboot.</p>
+              <p data-exp-desc>The script sleeps in a worker thread for 24 hours. Move to the next step to simulate a host reboot.</p>
             </div>
           </div>
 
@@ -308,10 +311,10 @@ client.signal(
 
         <!-- Outcome Callout Footer -->
         <footer class="stage-footer">
-          <div class="outcome-callout good" data-outcome-callout>
-            <small data-outcome-label>CANARY RELIABILITY OUTCOME</small>
-            <strong data-outcome-title>DURABLE OBSERVATION + EXPLICIT ROLLBACK</strong>
-            <span data-outcome-sub>The flow persists observation state, survives worker replacement, and advances on a durable 5xx signal.</span>
+          <div class="outcome-callout bad" data-outcome-callout>
+            <small data-outcome-label>WHAT THIS RUN TEACHES</small>
+            <strong data-outcome-title>VOLATILE IN-MEMORY 24-HOUR SLEEP</strong>
+            <span data-outcome-sub>Holding 24-hour sleep in Python memory wastes worker threads and will be wiped if the runner pod reboots.</span>
           </div>
         </footer>
       </article>
@@ -331,9 +334,9 @@ client.signal(
         <table class="arch-table">
           <thead>
             <tr>
-              <th>CANARY REQUIREMENT</th>
-              <th class="bad-col">❌ THE USUAL WAY (Jenkins / Cron / Bash)</th>
-              <th class="good-col">✓ THE FERRICSTORE WAY</th>
+              <th scope="col">CANARY REQUIREMENT</th>
+              <th scope="col" class="bad-col">THE USUAL WAY (Jenkins / Cron / Bash)</th>
+              <th scope="col" class="good-col">THE FERRICSTORE WAY</th>
             </tr>
           </thead>
           <tbody>
@@ -461,8 +464,8 @@ client.signal(
     </section>
   </main>
 
-  <script src="./canary.js?v=6"></script>
-  <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=16"></script>
+  <script src="./canary.js?v=20260912c"></script>
+  <script src="../shared/accuracy.js?v=20260912c"></script>
+  <script src="../shared/dispatch.js?v=20260912c"></script>
 </body>
 </html>

@@ -4,13 +4,14 @@
   var currentMode = "hotelFail";
   var currentStep = 0;
   var isPaused = false;
+  var hasStarted = false;
   var timer = null;
 
   var normalSteps = [
   {
-    "badge": "\ud83d\udcb3 STRIPE CHARGED ($850.00)",
+    "badge": "PAYMENT CONFIRMED · $850",
     "badgeClass": "good",
-    "title": "1. Customer Card Authorized ($850.00)",
+    "title": "1. Customer payment authorized ($850)",
     "desc": "Stripe payment uses a stable provider key; the refund is an explicit compensation state.",
     "code": "stripe.charge(85_000, idempotency_key=f'{ctx.id}:charge:v1')",
     "charge": "+$850.00",
@@ -27,9 +28,9 @@
     "compensatedNodes": []
   },
   {
-    "badge": "\u2708\ufe0f DELTA SEAT CONFIRMED",
+    "badge": "FLIGHT SEAT CONFIRMED",
     "badgeClass": "good",
-    "title": "2. Delta Flight DL402 Seat Reserved",
+    "title": "2. Flight seat reserved",
     "desc": "Flight seat uses a stable request ID; cancellation is an explicit next state.",
     "code": "delta.book_seat('DL402', request_id=f'{ctx.id}:flight:v1')",
     "charge": "+$850.00",
@@ -46,9 +47,9 @@
     "compensatedNodes": []
   },
   {
-    "badge": "\ud83c\udfe8 MARRIOTT ROOM CONFIRMED",
+    "badge": "HOTEL ROOM CONFIRMED",
     "badgeClass": "good",
-    "title": "3. Marriott Suite Booked ($350.00)",
+    "title": "3. Hotel room booked ($350)",
     "desc": "Hotel booking uses a stable request ID so a retried handler reuses the same operation.",
     "code": "marriott.book_suite(request_id=f'{ctx.id}:hotel:v1')",
     "charge": "+$850.00",
@@ -65,9 +66,9 @@
     "compensatedNodes": []
   },
   {
-    "badge": "\ud83c\udf89 VACATION BUNDLE COMPLETE",
+    "badge": "BOOKING COMPLETE",
     "badgeClass": "good",
-    "title": "4. Hertz SUV Rented ($150.00) · Booking Complete",
+    "title": "4. Car rental booked ($150) · booking complete",
     "desc": "All 4 suppliers confirmed. Vacation confirmed with zero balance discrepancy.",
     "code": "rental = hertz.book_suv(request_id=f'{ctx.id}:car:v1')\nreturn complete(result={'status': 'BOOKING_COMPLETE', 'rental_id': rental.id})",
     "charge": "+$850.00",
@@ -86,9 +87,9 @@
 ];
   var hotelFailSteps = [
   {
-    "badge": "\ud83d\udcb3 STEP 1: PAYMENT OK",
+    "badge": "PAYMENT CONFIRMED",
     "badgeClass": "good",
-    "title": "1. Customer Card Authorized ($850.00)",
+    "title": "1. Customer payment authorized ($850)",
     "desc": "Stripe payment succeeded with a stable provider idempotency key; refund is an explicit state.",
     "code": "stripe.charge(85_000, idempotency_key=f'{ctx.id}:charge:v1')",
     "charge": "+$850.00",
@@ -105,9 +106,9 @@
     "compensatedNodes": []
   },
   {
-    "badge": "\u2708\ufe0f STEP 2: FLIGHT OK",
+    "badge": "FLIGHT SEAT CONFIRMED",
     "badgeClass": "good",
-    "title": "2. Delta Flight DL402 Seat Reserved",
+    "title": "2. Flight seat reserved",
     "desc": "Delta seat is held with a stable request ID; cancellation is an explicit state.",
     "code": "delta.book_seat('DL402', request_id=f'{ctx.id}:flight:v1')",
     "charge": "+$850.00",
@@ -124,9 +125,9 @@
     "compensatedNodes": []
   },
   {
-    "badge": "\u274c STEP 3 FAILED (HOTEL SOLD OUT)",
+    "badge": "HOTEL UNAVAILABLE",
     "badgeClass": "bad",
-    "title": "3. Marriott API: 0 Rooms Available!",
+    "title": "3. Hotel has no rooms available",
     "desc": "HotelSoldOutException transitions the durable workflow into explicit compensation states.",
     "code": "return transition('cancel_seat')  # then refund_card",
     "charge": "+$850.00",
@@ -143,9 +144,9 @@
     "compensatedNodes": []
   },
   {
-    "badge": "\ud83d\udd04 UNWINDING STEP 2: FLIGHT RELEASED",
+    "badge": "UNDOING STEP 2 · FLIGHT RELEASED",
     "badgeClass": "warn",
-    "title": "Compensating Delta Flight DL402",
+    "title": "Undo step 2: release the flight seat",
     "desc": "The cancellation state uses a stable request ID, so reclaim cannot release the seat twice.",
     "code": "delta.cancel_seat(ctx.value('seat_id'), request_id=f'{ctx.id}:cancel:v1')",
     "charge": "+$850.00",
@@ -164,9 +165,9 @@
     ]
   },
   {
-    "badge": "\u2713 SAGA COMPLETE: $850.00 REFUNDED",
+    "badge": "BOOKING ROLLED BACK · $850 REFUNDED",
     "badgeClass": "good",
-    "title": "Compensating Step 1: Customer Fully Refunded",
+    "title": "Undo step 1: refund the customer",
     "desc": "The refund state uses a stable Stripe key, so a retried handler reuses the same refund operation.",
     "code": "stripe.refund(ctx.value('tx_id'), idempotency_key=f'{ctx.id}:refund:v1')",
     "charge": "$0.00 (Refunded)",
@@ -189,9 +190,9 @@
 
   var flightFailSteps = [
   {
-    "badge": "💳 STEP 1: PAYMENT OK",
+    "badge": "PAYMENT CONFIRMED",
     "badgeClass": "good",
-    "title": "1. Customer Card Authorized ($850.00)",
+    "title": "1. Customer payment authorized ($850)",
     "desc": "Stripe payment succeeded with a stable provider idempotency key; refund is an explicit state.",
     "code": "stripe.charge(85_000, idempotency_key=f'{ctx.id}:charge:v1')",
     "charge": "+$850.00",
@@ -208,9 +209,9 @@
     "compensatedNodes": []
   },
   {
-    "badge": "❌ STEP 2: DELTA HTTP 500",
+    "badge": "FLIGHT REQUEST FAILED",
     "badgeClass": "bad",
-    "title": "2. Delta Booking Returned an Ambiguous 500",
+    "title": "2. Flight request failed; outcome is unknown",
     "desc": "A transport error does not prove whether the seat was created. The workflow records the ambiguous outcome and verifies the stable request ID before calling the hotel.",
     "code": "return transition('verify_flight')  # do not call hotel yet",
     "charge": "+$850.00",
@@ -227,9 +228,9 @@
     "compensatedNodes": []
   },
   {
-    "badge": "🔎 FLIGHT OUTCOME VERIFIED",
+    "badge": "FLIGHT OUTCOME VERIFIED",
     "badgeClass": "warn",
-    "title": "Delta Confirms No Seat Was Created",
+    "title": "Delta confirms no seat was created",
     "desc": "The stable request ID is absent at Delta. There is no flight to cancel, so the saga skips the hotel and moves directly to refund_card.",
     "code": "seat = delta.get_booking(request_id=f'{ctx.id}:flight:v1')\nif not seat: return transition('refund_card')",
     "charge": "+$850.00",
@@ -246,9 +247,9 @@
     "compensatedNodes": []
   },
   {
-    "badge": "✓ SAGA COMPLETE: $850.00 REFUNDED",
+    "badge": "BOOKING ROLLED BACK · $850 REFUNDED",
     "badgeClass": "good",
-    "title": "Compensating Step 1: Customer Fully Refunded",
+    "title": "Undo step 1: refund the customer",
     "desc": "Only the card needs compensation. The refund uses a stable Stripe key, while the hotel and car were never called.",
     "code": "stripe.refund(ctx.value('tx_id'), idempotency_key=f'{ctx.id}:refund:v1')",
     "charge": "$0.00 (Refunded)",
@@ -273,9 +274,9 @@
   }
 
   function getModeLabel() {
-    if (currentMode === "hotelFail") return "Hotel sold out";
-    if (currentMode === "flightFail") return "Delta HTTP 500";
-    return "Happy path";
+    if (currentMode === "hotelFail") return "Hotel unavailable";
+    if (currentMode === "flightFail") return "Flight request fails";
+    return "All bookings succeed";
   }
 
   var nodes = document.querySelectorAll("[data-saga-node]");
@@ -322,6 +323,10 @@
       node.classList.toggle("is-done", isDone);
       node.classList.toggle("is-failed", isFailed);
       node.classList.toggle("is-compensated", isCompensated);
+      if (isActive) node.setAttribute("aria-current", "step");
+      else node.removeAttribute("aria-current");
+      var nodeTitle = node.querySelector("strong");
+      node.setAttribute("aria-label", (nodeTitle ? nodeTitle.textContent : "Booking step " + (idx + 1)) + ". " + (isFailed ? "Failed" : (isCompensated ? "Refunded" : (isActive ? "Active" : (isDone ? "Complete" : "Pending")))));
 
       var pill = node.querySelector(".node-pill");
       if (pill) {
@@ -354,7 +359,7 @@
 
     var modeLabel = getModeLabel();
     var stepTitle = data.title.replace(/^\d+\.\s*/, "");
-    var stepLabel = "Step " + (currentStep + 1) + " of " + steps.length + " · " + stepTitle;
+    var stepLabel = (!hasStarted ? "Preview · " : "Step ") + (currentStep + 1) + " of " + steps.length + " · " + stepTitle;
     if (currentRunLabel) currentRunLabel.textContent = modeLabel;
     if (currentRunStep) currentRunStep.textContent = stepLabel;
 
@@ -369,8 +374,17 @@
       choice.button.setAttribute("aria-pressed", String(selected));
     });
 
-    if (pauseBtn) pauseBtn.textContent = isPaused ? "▶ Play" : "⏸ Pause";
-    if (liveStatus) liveStatus.textContent = (isPaused ? "Paused" : "Running") + " · " + modeLabel + " · Step " + (currentStep + 1) + " of " + steps.length;
+    if (prevBtn) prevBtn.disabled = currentStep === 0;
+    if (nextBtn) nextBtn.disabled = currentStep >= steps.length - 1;
+    if (pauseBtn) {
+      var finished = hasStarted && currentStep >= steps.length - 1 && isPaused;
+      pauseBtn.textContent = finished ? "Finished" : (!hasStarted || isPaused ? "Play" : "Pause");
+      pauseBtn.disabled = finished;
+      pauseBtn.setAttribute("aria-label", finished ? "Booking path finished; choose Replay to run it again" : "Pause or play the booking flow");
+    }
+    if (liveStatus) liveStatus.textContent = !hasStarted
+      ? "Preview ready · choose Run to play"
+      : (finished ? "Finished · choose Replay to run again" : (isPaused ? "Paused · choose Play to continue" : "Playing automatically · Pause to inspect")) + " · " + modeLabel + " · Step " + (currentStep + 1) + " of " + steps.length;
   }
 
   function clearTimer() {
@@ -382,23 +396,34 @@
 
   function schedule() {
     clearTimer();
-    if (isPaused) return;
+    var steps = getSteps();
+    if (!hasStarted || isPaused || currentStep >= steps.length - 1) {
+      if (hasStarted && currentStep >= steps.length - 1) {
+        isPaused = true;
+        render();
+      }
+      return;
+    }
     var wait = (currentStep === 2) ? 3800 : 2600;
     timer = window.setTimeout(function () {
       var steps = getSteps();
-      currentStep = (currentStep + 1) % steps.length;
+      currentStep += 1;
       render();
       schedule();
     }, wait);
   }
 
+  // These stations represent bookings, not timeline indexes. Failure paths
+  // include verification and refunds, so use Previous/Next to inspect them.
+
   if (failHotelBtn) {
     failHotelBtn.addEventListener("click", function () {
       currentMode = "hotelFail";
       currentStep = 0;
+      hasStarted = false;
       isPaused = false;
+      clearTimer();
       render();
-      schedule();
     });
   }
 
@@ -406,9 +431,10 @@
     successRunBtn.addEventListener("click", function () {
       currentMode = "normal";
       currentStep = 0;
+      hasStarted = false;
       isPaused = false;
+      clearTimer();
       render();
-      schedule();
     });
   }
 
@@ -416,15 +442,21 @@
     failFlightBtn.addEventListener("click", function () {
       currentMode = "flightFail";
       currentStep = 0;
+      hasStarted = false;
       isPaused = false;
+      clearTimer();
       render();
-      schedule();
     });
   }
 
   if (pauseBtn) {
     pauseBtn.addEventListener("click", function () {
-      isPaused = !isPaused;
+      if (!hasStarted) {
+        hasStarted = true;
+        isPaused = false;
+      } else {
+        isPaused = !isPaused;
+      }
       render();
       schedule();
     });
@@ -433,24 +465,29 @@
   if (prevBtn) {
     prevBtn.addEventListener("click", function () {
       var len = getSteps().length;
-      currentStep = (currentStep - 1 + len) % len;
+      hasStarted = true;
+      isPaused = true;
+      clearTimer();
+      currentStep = Math.max(0, currentStep - 1);
       render();
-      schedule();
     });
   }
 
   if (nextBtn) {
     nextBtn.addEventListener("click", function () {
       var len = getSteps().length;
-      currentStep = (currentStep + 1) % len;
+      hasStarted = true;
+      isPaused = true;
+      clearTimer();
+      currentStep = Math.min(len - 1, currentStep + 1);
       render();
-      schedule();
     });
   }
 
   if (replayBtn) {
     replayBtn.addEventListener("click", function () {
       currentStep = 0;
+      hasStarted = true;
       isPaused = false;
       render();
       schedule();
@@ -458,5 +495,4 @@
   }
 
   render();
-  schedule();
 })();

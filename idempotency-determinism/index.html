@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Determinism &amp; Idempotency: Steps vs. States API | FerricStore Demos</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css?v=2">
-  <link rel="stylesheet" href="../shared/polish.css">
-  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=20">
+  <link rel="stylesheet" href="./style.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/polish.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=20260912d">
 </head>
 <body class="fs-dispatch">
   <!--
@@ -32,28 +32,28 @@
 
   <main class="container">
     <header class="hero">
-      <div class="hero-pill">🔁 STEP &amp; STATE DISK PERSISTENCE</div>
-      <h1>Determinism &amp; Idempotency: <br><span class="hero-gradient">With vs. Without FerricStore</span></h1>
+      <div class="hero-pill">🔁 SAVE PROGRESS + GUARD OUTSIDE CALLS</div>
+      <h1>What a retry repeats:<br><span class="hero-gradient">with and without saved progress</span></h1>
       <p class="hero-desc">
-        FerricStore durably records explicit state transitions and fences stale workers. Handlers remain at-least-once, so payment, LLM, inventory, and email calls must use a stable provider idempotency key or <code>ctx.effect(...)</code>.
+        FerricStore saves explicit workflow states and blocks an older worker from writing after a replacement takes over. Outside calls still run at-least-once, so payment, LLM, inventory, and email calls need a stable provider idempotency key or <code>ctx.effect(...)</code>.
       </p>
     </header>
 
     <!-- Interactive Scenario Tabs -->
     <section class="scenario-selector-bar">
-      <span class="scenario-label">SELECT REAL-WORLD PERSISTENCE SCENARIO:</span>
-      <div class="scenario-tabs">
-        <button type="button" class="scen-tab is-active" data-scenario="double-charge">
-          <span>💳 Scenario A: Stripe Double-Billing</span>
-          <small>Unmemoized Call vs. Raft Checkpoint + Key</small>
+      <span class="scenario-label">1. CHOOSE A FAILURE TO TRACE</span>
+      <div class="scenario-tabs" role="tablist" aria-label="Failure scenario">
+        <button type="button" role="tab" aria-selected="true" class="scen-tab is-active" data-scenario="double-charge">
+          <span>Stripe payment repeated</span>
+          <small>What happens when a charge is retried?</small>
         </button>
-        <button type="button" class="scen-tab" data-scenario="llm-tokens">
-          <span>🤖 Scenario B: AI Token &amp; Compute Waste</span>
-          <small>Re-Running 4,000 Tokens vs. Step Disk Cache</small>
+        <button type="button" role="tab" aria-selected="false" class="scen-tab" data-scenario="llm-tokens">
+          <span>AI work repeated</span>
+          <small>What happens when a 4,000-token result is lost?</small>
         </button>
-        <button type="button" class="scen-tab" data-scenario="inventory-lock">
-          <span>📦 Scenario C: Inventory Double-Decrement</span>
-          <small>Unchecked Script vs. Sealed FSM State</small>
+        <button type="button" role="tab" aria-selected="false" class="scen-tab" data-scenario="inventory-lock">
+          <span>Inventory changed twice</span>
+          <small>What happens when a stock update is retried?</small>
         </button>
       </div>
     </section>
@@ -64,15 +64,16 @@
       <!-- Stage Header with Controls -->
       <header class="stage-header">
         <div class="scenario-badge">
-          <span class="badge-label" data-badge-scenario style="background: rgba(239, 68, 68, 0.18); color: #fca5a5;">HAZARD ACTIVE</span>
-          <strong data-scenario-title>Scenario A: E-Commerce Checkout ($150.00 Order #8492)</strong>
+          <span class="badge-label" data-badge-scenario style="background: rgba(56, 189, 248, 0.18); color: #7dd3fc;">READY TO RUN</span>
+          <strong data-scenario-title>$150 checkout: a charge is retried</strong>
         </div>
         <div class="ctrl-btn-group">
-          <button class="ctrl-btn auto-play-btn" data-btn-autoplay>⚡ Play Live Interactive Simulation</button>
-          <button class="ctrl-btn" data-btn-step1>▶ 1. Initial Run</button>
-          <button class="ctrl-btn crash-btn" data-btn-crash>💥 2. Inject Crash</button>
-          <button class="ctrl-btn retry-btn" data-btn-retry>🔄 3. Worker Retry</button>
-          <button class="ctrl-btn" data-btn-reset>↺ Reset</button>
+          <span class="stage-instruction">2. Run the selected example</span>
+          <button class="ctrl-btn auto-play-btn" data-btn-autoplay>Run the full example</button>
+          <button class="ctrl-btn" data-btn-step1>Run until the crash point</button>
+          <button class="ctrl-btn crash-btn" data-btn-crash>Crash the worker</button>
+          <button class="ctrl-btn retry-btn" data-btn-retry>Retry and finish</button>
+          <button class="ctrl-btn" data-btn-reset>Reset example</button>
         </div>
       </header>
 
@@ -83,10 +84,10 @@
         <article class="arena-card bad" data-card-left>
           <div class="arena-head">
             <div class="arena-title-wrap">
-              <span class="side-badge bad">❌ WITHOUT FERRICSTORE</span>
-              <h3>Naive Python / Celery Worker</h3>
+              <span class="side-badge bad">❌ WITHOUT SAVED PROGRESS</span>
+              <h3>Retry starts from the beginning</h3>
             </div>
-            <span class="status-pill bad" data-left-status-pill>0% Step Persistence</span>
+            <span class="status-pill bad" data-left-status-pill>No saved progress</span>
           </div>
 
           <!-- Code Snippet with danger highlights -->
@@ -149,9 +150,9 @@
 
           <!-- Outcome Footer -->
           <div class="arena-outcome bad">
-            <small>CUSTOMER &amp; SYSTEM IMPACT</small>
-            <strong data-left-outcome style="color: #ef4444;">$300.00 CHARGED (DOUBLE BILLED!)</strong>
-            <span data-left-outcome-sub>Because Step 1 was not persisted to durable disk log, retry repeats all previous side-effects.</span>
+            <small>RESULT: START AGAIN</small>
+            <strong data-left-outcome style="color: #ef4444;">Waiting for the example</strong>
+            <span data-left-outcome-sub>Run the selected failure to see what a retry repeats.</span>
           </div>
         </article>
 
@@ -159,21 +160,21 @@
         <article class="arena-card good" data-card-right>
           <div class="arena-head">
             <div class="arena-title-wrap">
-              <span class="side-badge good">✓ WITH FERRICSTORE</span>
-              <h3 data-right-title>Durable SDK (States API - FSM)</h3>
+              <span class="side-badge good">✓ WITH SAVED PROGRESS</span>
+              <h3 data-right-title>Saved workflow states</h3>
             </div>
-            <span class="status-pill good" data-right-status-pill>Committed</span>
+            <span class="status-pill good" data-right-status-pill>Ready to save</span>
           </div>
 
           <!-- SDK Paradigm Switcher (durable closure vs. state handlers) -->
           <div class="api-switcher-bar">
             <button type="button" class="api-toggle" data-api-mode="steps">
-              <span>Durable Step</span>
-              <small>Closure result + state committed together</small>
+              <span>Save each action</span>
+              <small>Save the result before moving on</small>
             </button>
             <button type="button" class="api-toggle is-active" data-api-mode="states">
-              <span>🔀 States API</span>
-              <small>Atomic Transitions (@flow.state)</small>
+              <span>🔀 Save named states</span>
+              <small>Move between named states</small>
             </button>
           </div>
 
@@ -207,7 +208,7 @@ job, charge = client.step(
               <span class="s-dot">1</span>
               <div class="s-info">
                 <strong data-right-s1-title>Charge Customer $150.00</strong>
-                <small data-right-tx1>Committed to Raft Disk with Key: wf_9842_chg</small>
+                <small data-right-tx1>Saved before the workflow continued</small>
               </div>
               <span class="s-badge green" data-right-s1-badge>Billed $150</span>
             </div>
@@ -216,7 +217,7 @@ job, charge = client.step(
               <span class="s-dot">2</span>
               <div class="s-info">
                 <strong data-right-s2-title>Lock Inventory (SKU #849)</strong>
-                <small data-right-s2-sub>Durable state committed before continuing</small>
+                <small data-right-s2-sub>Saved before the workflow continued</small>
               </div>
               <span class="s-badge green">Locked</span>
             </div>
@@ -232,7 +233,7 @@ job, charge = client.step(
 
             <!-- Replay Safe Box -->
             <div class="replay-safe-box" data-right-replay-box style="display: none;">
-              <div class="replay-head" data-replay-box-head>⚡ REPLACEMENT WORKER RESUMES AFTER RECLAIM:</div>
+              <div class="replay-head" data-replay-box-head>⚡ REPLACEMENT WORKER CONTINUES FROM SAVED PROGRESS:</div>
               <div class="replay-step" data-replay-step-1>
                 <span>✓ State 1: <strong style="color: #34d399;">Already committed</strong> (charge protected by provider key)</span>
               </div>
@@ -247,9 +248,9 @@ job, charge = client.step(
 
           <!-- Outcome Footer -->
           <div class="arena-outcome good">
-            <small>CUSTOMER &amp; SYSTEM IMPACT</small>
-            <strong data-right-outcome style="color: #34d399;">DURABLE STATE + GUARDED CHARGE</strong>
-            <span data-right-outcome-sub>The state transition is durable; Stripe still needs a stable idempotency key or guarded effect.</span>
+            <small>RESULT: CONTINUE SAVED PROGRESS</small>
+            <strong data-right-outcome style="color: #34d399;">Waiting for the example</strong>
+            <span data-right-outcome-sub>Run the selected failure to compare saved progress with a retry.</span>
           </div>
         </article>
 
@@ -260,35 +261,35 @@ job, charge = client.step(
         <div class="term-header">
           <div class="term-title-wrap">
             <span class="term-icon">📟</span>
-            <strong>LIVE WORKER EVENT STREAM &amp; REPLAY AUDIT LOG</strong>
+            <strong>WORKER ACTIVITY &amp; RETRY LOG</strong>
           </div>
-          <span class="term-status" data-term-status><span class="pulse-dot"></span> SIMULATION READY</span>
+          <span class="term-status" data-term-status><span class="pulse-dot"></span> READY TO RUN</span>
         </div>
         <div class="term-body" data-term-body>
-          <div class="term-line info">[00:00.000] System ready. Click "⚡ Play Live Interactive Simulation" or use the step buttons above to trigger live failure recovery.</div>
+          <div class="term-line info">[00:00.000] Ready. Choose a failure, then run the example.</div>
         </div>
       </div>
 
       <!-- Comparative Telemetry Metrics -->
       <div class="telemetry-grid">
         <div class="telemetry-card">
-          <small>Naive Total Billed</small>
+          <small>Without saved progress</small>
           <div class="telemetry-val" style="color: #ef4444;" data-val-naive-billed>$300.00</div>
           <span class="telemetry-sub">2x Double charge ($150 penalty)</span>
         </div>
         <div class="telemetry-card">
-          <small>FerricStore Billed</small>
+          <small>With saved progress</small>
           <div class="telemetry-val" style="color: #34d399;" data-val-ferric-billed>$150.00</div>
           <span class="telemetry-sub">Charge protected by provider key</span>
         </div>
         <div class="telemetry-card">
-          <small>Replay Disk Lookup</small>
+          <small>Where retry resumes</small>
           <div class="telemetry-val" style="color: #38bdf8;" data-val-replay-time>After reclaim</div>
-          <span class="telemetry-sub">Lease and topology dependent</span>
+          <span class="telemetry-sub">Depends on the setup</span>
         </div>
         <div class="telemetry-card">
-          <small>Duplicate Execution</small>
-          <div class="telemetry-val" style="color: #34d399;" data-val-divergence>Stale writes fenced</div>
+          <small>Outside action safety</small>
+          <div class="telemetry-val" style="color: #34d399;" data-val-divergence>Needs a stable key</div>
           <span class="telemetry-sub">Handlers can run at-least-once</span>
         </div>
       </div>
@@ -399,8 +400,8 @@ job, charge = client.step(
     </section>
   </main>
 
-  <script src="./determinism.js?v=6"></script>
-  <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=16"></script>
+  <script src="./determinism.js?v=20260912c"></script>
+  <script src="../shared/accuracy.js?v=20260912c"></script>
+  <script src="../shared/dispatch.js?v=20260912c"></script>
 </body>
 </html>

@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Multi-Agent AI & Human-in-the-Loop | FerricStore Demos</title>
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./style.css?v=4">
-  <link rel="stylesheet" href="../shared/polish.css">
-  <link rel="stylesheet" href="../shared/accuracy.css?v=5">
-  <link rel="stylesheet" href="../shared/dispatch.css?v=20">
+  <link rel="stylesheet" href="./style.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/polish.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/accuracy.css?v=20260912c">
+  <link rel="stylesheet" href="../shared/dispatch.css?v=20260912d">
 </head>
 <body class="fs-dispatch">
   <!--
@@ -22,7 +22,7 @@
   <nav class="top-nav">
     <div class="container nav-inner">
       <a href="../" class="nav-brand">
-        <span class="brand-icon">⚡</span>
+        <span class="brand-icon">F</span>
         <span>FerricStore</span>
         <span class="nav-tag">AI Agent Demo</span>
       </a>
@@ -32,65 +32,65 @@
 
   <main class="container">
     <header class="hero">
-      <div class="hero-pill">🤖 MULTI-AGENT ORCHESTRATION</div>
+      <div class="hero-pill">AI WORKFLOW WITH A HUMAN CHECKPOINT</div>
       <h1>Long-Running AI &amp; <span class="hero-gradient">Human-in-the-Loop</span></h1>
       <p class="hero-desc">
         AI agent chains can pause for days awaiting human approval. The workflow persists an <code>await_approval</code> state without holding an application handler until a webhook sends a durable, state-guarded signal.
       </p>
     </header>
 
-    <section class="stage-card">
+    <section class="stage-card" aria-label="AI campaign approval and host recovery simulator">
       <header class="stage-header">
         <div class="scenario-badge">
           <span class="badge-label">SCENARIO</span>
-          <strong>Autonomous $50k Marketing Campaign Generator</strong>
+          <strong>AI prepares a $50,000 campaign for approval</strong>
         </div>
         <div style="display: flex; gap: 8px;">
-          <button class="ctrl-btn" style="border-color: #ef4444; color: #fca5a5;" data-kill-btn disabled>💥 Kill Server Mid-Wait</button>
+          <button class="ctrl-btn" style="border-color: #ef4444; color: #fca5a5;" data-kill-btn disabled>Simulate host restart while waiting</button>
         </div>
       </header>
 
       <div class="current-run" aria-live="polite">
-        <span>Current run</span>
-        <strong>Human approval with host recovery</strong>
-        <small data-current-run-step>Step 1 of 5 · Multi-Source Competitor Research</small>
+        <span>Preview</span>
+        <strong>Approval wait with host recovery</strong>
+        <small data-current-run-step>Preview · Step 1 of 5 · Research campaign</small>
       </div>
 
       <!-- 5 Agent Stations Grid -->
       <div class="agent-stations-grid">
-        <div class="agent-node is-active" data-agent-node="0">
+        <div class="agent-node is-active" data-agent-node="0" role="button" aria-pressed="true" tabindex="0" aria-label="Research campaign. Active">
           <div class="an-head"><span>STAGE 1</span><span class="node-pill">ACTIVE</span></div>
-          <div class="an-icon">🔍</div>
-          <strong>1. Market Research</strong>
-          <small>Web Scraping Agent</small>
+          <div class="an-icon" aria-hidden="true">SEARCH</div>
+          <strong>1. Research campaign</strong>
+          <small>Collects competitor data</small>
         </div>
 
-        <div class="agent-node" data-agent-node="1">
+        <div class="agent-node" data-agent-node="1" role="button" aria-pressed="false" tabindex="0" aria-label="Draft campaign. Pending">
           <div class="an-head"><span>STAGE 2</span><span class="node-pill">PENDING</span></div>
-          <div class="an-icon">📝</div>
-          <strong>2. Ad Generation</strong>
-          <small>Drafts $50k Plan</small>
+          <div class="an-icon" aria-hidden="true">DRAFT</div>
+          <strong>2. Draft campaign</strong>
+          <small>Creates the $50k plan</small>
         </div>
 
-        <div class="agent-node" data-agent-node="2">
+        <div class="agent-node" data-agent-node="2" role="button" aria-pressed="false" tabindex="0" aria-label="Wait for approval. Pending">
           <div class="an-head"><span>STAGE 3</span><span class="node-pill">PENDING</span></div>
-          <div class="an-icon">⏸️</div>
-          <strong>3. State: await_approval</strong>
-          <small>Durable waiting state</small>
+          <div class="an-icon" aria-hidden="true">WAIT</div>
+          <strong>3. Wait for approval</strong>
+          <small>Saved state; no handler waits</small>
         </div>
 
-        <div class="agent-node" data-agent-node="3">
+        <div class="agent-node" data-agent-node="3" role="button" aria-pressed="false" tabindex="0" aria-label="Host restarts while paused. Pending">
           <div class="an-head"><span>STAGE 4</span><span class="node-pill">PENDING</span></div>
-          <div class="an-icon">🛡️</div>
-          <strong>4. Crash / Host Reboot</strong>
-          <small>Zero State Loss</small>
+          <div class="an-icon" aria-hidden="true">HOST</div>
+          <strong>4. Host restarts while paused</strong>
+          <small>Saved approval state remains</small>
         </div>
 
-        <div class="agent-node" data-agent-node="4">
+        <div class="agent-node" data-agent-node="4" role="button" aria-pressed="false" tabindex="0" aria-label="Launch after approval. Pending">
           <div class="an-head"><span>STAGE 5</span><span class="node-pill">PENDING</span></div>
-          <div class="an-icon">🚀</div>
-          <strong>5. Ad Launch</strong>
-          <small>Triggered by Signal</small>
+          <div class="an-icon" aria-hidden="true">LAUNCH</div>
+          <strong>5. Launch after approval</strong>
+          <small>Signal starts the next step</small>
         </div>
       </div>
 
@@ -104,23 +104,24 @@
               <span>Slack Notification: #finance-approvals</span>
             </div>
             <div class="slack-body">
-              <div style="font-weight: 800; color: #fff; margin-bottom: 4px;">🤖 AI Marketing Agent requests budget signoff:</div>
+              <div style="font-weight: 800; color: #fff; margin-bottom: 4px;">The campaign is ready for budget approval:</div>
               <div style="color: #cbd5e1; margin-bottom: 6px;">Campaign: <em>"Summer SaaS Growth Blast"</em> (Job ID: <code>#camp-9842</code>)</div>
               <div style="font-family: var(--font-mono); color: #34d399; font-size: 13px; font-weight: 750;">Total Budget: $50,000.00 USD</div>
             </div>
           </div>
           <div class="slack-actions">
-            <button class="slack-btn-approve" data-slack-approve disabled>✓ Approve in Slack ($50k)</button>
-            <button class="slack-btn-reject" data-slack-reject disabled>✕ Request Revisions</button>
+            <button class="slack-btn-approve" data-slack-approve disabled>Approve and launch ($50k)</button>
+            <button class="slack-btn-reject" data-slack-reject disabled>Request changes</button>
+            <p class="control-note" id="approval-help">These choices unlock when the workflow is waiting for approval.</p>
           </div>
         </div>
 
         <!-- Narrative Box -->
         <div class="agent-narrative-box">
-          <div class="agent-badge good" data-narrative-badge>🔍 RESEARCH AGENT ACTIVE</div>
-          <h3 style="margin: 0 0 6px; font-size: 18px;" data-narrative-title>1. Multi-Source Competitor Research</h3>
+          <div class="agent-badge good" data-narrative-badge>RESEARCH IN PROGRESS</div>
+          <h3 style="margin: 0 0 6px; font-size: 18px;" data-narrative-title>1. Research campaign</h3>
           <p style="margin: 0 0 12px; font-size: 13.5px; color: var(--text-muted);" data-narrative-desc>
-            Scraping 24 competitor ad accounts and keyword bids. The step result is durably cached in FerricStore's disk log.
+            The workflow collects competitor data. This step is saved durably so a replacement worker can continue from it.
           </p>
           <div class="narrative-code-note">SIMPLIFIED EXCERPT · COMPLETE WORKFLOW BELOW</div>
           <div style="font-family: var(--font-mono); font-size: 11.5px; color: #a78bfa; background: rgba(0,0,0,0.4); padding: 8px; border-radius: 4px;" data-narrative-code>
@@ -132,37 +133,37 @@
       <!-- Live Telemetry -->
       <div class="telemetry-grid">
         <div class="telemetry-card">
-          <small>Server CPU</small>
+          <small>Host activity</small>
           <div class="telemetry-val" style="color: #34d399;" data-val-cpu>14.2%</div>
           <span class="telemetry-sub">Illustrative per-stage activity</span>
         </div>
         <div class="telemetry-card">
-          <small>Worker / State Memory</small>
+          <small>Memory and saved state</small>
           <div class="telemetry-val" style="color: #34d399;" data-val-ram>42 MB</div>
-          <span class="telemetry-sub">Process or durable state footprint</span>
+          <span class="telemetry-sub">Process memory versus durable state</span>
         </div>
         <div class="telemetry-card">
-          <small>Wait State</small>
+          <small>Waiting</small>
           <div class="telemetry-val" data-val-wait>0s</div>
-          <span class="telemetry-sub">Current transition timing</span>
+          <span class="telemetry-sub">No handler stays blocked</span>
         </div>
         <div class="telemetry-card">
-          <small>Resume Boundary</small>
+          <small>Resume from</small>
           <div class="telemetry-val" style="color: #38bdf8;" data-val-resume>After claim</div>
-          <span class="telemetry-sub">Where execution continues</span>
+          <span class="telemetry-sub">Where the next worker starts</span>
         </div>
       </div>
 
       <!-- Controls -->
       <footer class="stage-footer">
         <div class="ctrl-btn-group">
-          <button class="ctrl-btn" data-prev>⏮ Prev</button>
-          <button class="ctrl-btn" data-pause>⏸ Pause</button>
-          <button class="ctrl-btn" data-next>Next ⏭</button>
-          <button class="ctrl-btn" data-replay>↺ Replay</button>
+          <button class="ctrl-btn" data-prev aria-label="Show previous workflow step">Previous</button>
+          <button class="ctrl-btn" data-pause aria-label="Pause or play the workflow">Pause</button>
+          <button class="ctrl-btn" data-next aria-label="Show next workflow step">Next</button>
+          <button class="ctrl-btn" data-replay aria-label="Replay the workflow from the beginning">Replay</button>
         </div>
         <div style="font-size: 13px; color: var(--text-dim);" data-live-status>
-          Auto-advancing simulation
+          Preview ready · choose Run to play
         </div>
       </footer>
     </section>
@@ -211,8 +212,8 @@ flow.start("camp-9842", payload={"campaign": "Summer SaaS Growth Blast"})
 flow.worker().run()</code></pre>
     </section>
   </main>
-  <script src="./agent.js?v=6"></script>
-  <script src="../shared/accuracy.js?v=10"></script>
-  <script src="../shared/dispatch.js?v=16"></script>
+  <script src="./agent.js?v=20260912c"></script>
+  <script src="../shared/accuracy.js?v=20260912c"></script>
+  <script src="../shared/dispatch.js?v=20260912c"></script>
 </body>
 </html>
