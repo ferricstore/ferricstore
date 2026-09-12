@@ -1582,10 +1582,12 @@ defmodule Ferricstore.FlowWriteContractTest do
 
   test "cold Flow state reads use QueryRows and authoritative hydration only" do
     state_machine_source = Ferricstore.Test.SourceFiles.state_machine_source()
+    flow_source = Ferricstore.Test.SourceFiles.flow_source()
 
-    assert state_machine_source =~ "QueryRowStore.read_many"
     assert state_machine_source =~ "QueryRecordStore.read_many"
     assert state_machine_source =~ "flow_read_lmdb_records_including_expired"
+    assert flow_source =~ "QueryRowStore.read_many"
+    assert flow_source =~ "QueryRowStore.read_references_many"
 
     refute state_machine_source =~ ":sm_pending_lmdb_values"
     refute state_machine_source =~ "flow_decode_lmdb_blob"
