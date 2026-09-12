@@ -8,8 +8,8 @@
       id: "workflow-explainer",
       title: "Workflows for Humans",
       icon: "WF",
-      description: "Learn durable workflows through a familiar save-point story before exploring leases, retries, and recovery.",
-      inspect: "Which steps are volatile, which are committed, and who may continue after a crash.",
+      description: "See how saving progress helps a task pick up after a crash.",
+      inspect: "What is saved, what may repeat, and where work continues.",
       topics: ["Workflows", "Start here"],
       accent: "#6366f1"
     },
@@ -17,26 +17,26 @@
       id: "ai-agent-workflow",
       title: "AI Agent & Human Approval",
       icon: "AI",
-      description: "Park a long-running agent in a durable approval state, survive a host restart, and resume from an external signal.",
-      inspect: "The durable approval state, restart boundary, and external signal that resumes work.",
+      description: "Pause an AI task until a person approves it, even if the server restarts while it waits.",
+      inspect: "The approval that lets the task continue.",
       topics: ["Workflows", "Coordination"],
       accent: "#34d399"
     },
     {
       id: "travel-saga",
-      title: "Travel Booking Saga",
+      title: "When a Travel Booking Fails",
       icon: "SG",
-      description: "Coordinate flight, hotel, and car reservations with explicit compensation steps when a later booking fails.",
-      inspect: "The compensation order and which earlier bookings must be undone after a failure.",
+      description: "Book a flight, hotel, and car. See what gets cancelled if one booking fails.",
+      inspect: "Which earlier bookings are undone, and in what order.",
       topics: ["Workflows", "Coordination"],
       accent: "#f59e0b"
     },
     {
       id: "subscription-dunning",
-      title: "Subscription Dunning",
+      title: "When a Subscription Payment Fails",
       icon: "DN",
-      description: "Move a subscription through retry windows, payment recovery, and cancellation using durable timers and explicit state.",
-      inspect: "Retry due times, recovered payment state, and the cancellation boundary.",
+      description: "Try a failed payment again later, send reminders, or cancel the subscription.",
+      inspect: "When the next attempt happens and what changes if payment succeeds.",
       topics: ["Workflows"],
       accent: "#f472b6"
     },
@@ -44,143 +44,143 @@
       id: "ticket-reservation",
       title: "Flash-Sale Reservation",
       icon: "TK",
-      description: "Hold scarce inventory with durable expiration, guarded ownership, and a clean transition from reservation to purchase.",
-      inspect: "Lease expiry, the new owner's fence, and rejection of a stale buyer.",
+      description: "Hold a ticket for a buyer, then release it if they do not pay in time.",
+      inspect: "Why the first buyer cannot use an expired reservation after someone else takes it.",
       topics: ["Workflows", "Coordination"],
       accent: "#f97316"
     },
     {
       id: "canary-rollback",
-      title: "Canary Rollback",
+      title: "Undo an Unhealthy Software Update",
       icon: "CN",
-      description: "Model deployment observation, health thresholds, promotion, and rollback as visible durable states.",
-      inspect: "The durable soak state, health signal, restart, and rollback decision.",
+      description: "Try an update on a small scale, check for problems, and decide whether to keep it.",
+      inspect: "The check that triggers a return to the previous version.",
       topics: ["Workflows", "Coordination"],
       accent: "#fbbf24"
     },
     {
       id: "parallel-fanout",
-      title: "Parallel Fan-Out",
+      title: "Run Many Tasks Together",
       icon: "FX",
-      description: "Split a batch into independently recoverable children, then join their results without replaying successful work.",
-      inspect: "Which child failed, which fifteen stayed committed, and how the join completes.",
+      description: "Split a large job into smaller tasks and bring their results together.",
+      inspect: "One failed task runs again while the fifteen saved results stay in place.",
       topics: ["Workflows", "Queues & streams"],
       accent: "#60a5fa"
     },
     {
       id: "agent-loop",
-      title: "Agent Reliability Controls",
+      title: "Set Limits for an AI Agent",
       icon: "AG",
-      description: "Stop runaway agent spend with durable budgets and protect downstream services with persistent circuit state.",
-      inspect: "Budget remaining, circuit state, and the stop reason for a guarded run.",
+      description: "Give an AI agent a spending limit and pause requests to a service that keeps failing.",
+      inspect: "How much budget is left and why the agent stops.",
       topics: ["Workflows", "Coordination"],
       accent: "#ec4899"
     },
     {
       id: "split-lab",
-      title: "Split Lab",
+      title: "Start Over or Carry On?",
       icon: "SL",
-      description: "Crash an AI research worker during summarization and watch a replacement resume from durable state without repeating completed work.",
-      inspect: "The exact middle state reclaimed by a replacement worker after lease expiry.",
+      description: "Interrupt an AI research task. Compare starting from scratch with continuing from saved progress.",
+      inspect: "Where the replacement picks up and which work has already been saved.",
       topics: ["Workflows", "Start here"],
       accent: "#8b5cf6"
     },
     {
       id: "idempotency-determinism",
-      title: "Idempotency & Determinism",
+      title: "Avoid Repeating an Outside Action",
       icon: "ID",
-      description: "Explore the duplicate-side-effect boundary and protect retries with stable operation identities and guarded effects.",
-      inspect: "How a stable operation identity lets a retry reuse the same external-effect boundary.",
+      description: "See why trying a task again needs care when it calls a payment provider or another service.",
+      inspect: "How keeping the same action reference helps handle repeated attempts.",
       topics: ["Workflows", "Coordination"],
       accent: "#a78bfa"
     },
     {
       id: "zombie-fencing",
-      title: "Zombie Worker Fencing",
+      title: "Stop an Old Worker Overwriting Progress",
       icon: "FN",
-      description: "See a stale worker return after lease expiry and lose its write to a newer monotonic fencing token.",
-      inspect: "The newer fencing generation and the stale write FerricStore rejects.",
+      description: "A worker is a part of your application that does a job. What if it comes back after its replacement has taken over?",
+      inspect: "Why FerricStore rejects the old worker’s attempt to save changes.",
       topics: ["Coordination"],
       accent: "#fb7185"
     },
     {
       id: "architecture-comparison",
-      title: "Architecture Comparison",
+      title: "Four Ways to Handle a Crash",
       icon: "CP",
-      description: "Compare volatile scripts, queues, database polling, and durable workflow state under the same failure conditions.",
-      inspect: "What each architecture remembers after the identical crash and how it recovers.",
+      description: "Compare a script, a queue, a database-based approach, and a workflow when the same failure happens.",
+      inspect: "What each approach remembers and how work starts again.",
       topics: ["Coordination", "Start here"],
       accent: "#38bdf8"
     },
     {
       id: "benchmark-explainer",
-      title: "Workflow Benchmark, Explained",
+      title: "Workflow Speed Tests, Explained",
       icon: "BM",
-      description: "See what 54K worker-driven and 104K fused workflows per second actually mean, then compare their boundaries with Temporal and DBOS.",
-      inspect: "Execution boundary, workload, hardware, throughput unit, and stated limitations behind each number.",
+      description: "Understand the 54K and 104K workflows-per-second results from two different tests, with context from Temporal and DBOS.",
+      inspect: "What each test measures, which machines it uses, and what the numbers can tell you.",
       topics: ["Coordination", "Start here"],
       accent: "#22d3ee"
     },
     {
       id: "hot-cold-storage",
-      title: "Hot & Cold Storage",
+      title: "Move Data Between Memory and Disk",
       icon: "HC",
-      description: "Follow values between memory and disk-backed storage as pressure changes, without losing the logical keyspace.",
-      inspect: "The logical key remains available as its value moves to disk and warms back into memory.",
+      description: "See how data moves to disk when memory fills up, and comes back when needed.",
+      inspect: "The same data stays available even when its storage location changes.",
       topics: ["Data structures"],
       accent: "#2dd4bf"
     },
     {
       id: "rate-limiting-stream",
-      title: "Rate Limiting & Micro-Batching",
+      title: "Handle a Sudden Rush of Jobs",
       icon: "RL",
-      description: "Absorb a webhook burst into a durable stream, enforce throughput limits, and process bounded batches.",
-      inspect: "Buffer depth, allowed rate, batch size, and worker drain behavior during a burst.",
+      description: "Keep incoming jobs waiting safely, then process them in small groups at a set pace.",
+      inspect: "How many jobs are waiting and how quickly they are handled.",
       topics: ["Queues & streams", "Coordination"],
       accent: "#22d3ee"
     },
     {
       id: "beginner-queue",
-      title: "Your First Durable Queue",
+      title: "How a Job Queue Works",
       icon: "Q1",
-      description: "Enqueue, claim, lease, retry, and complete a background job with the core ownership rules made visible.",
-      inspect: "Job state, lease owner, expiry, and safe reclaim by the next worker.",
+      description: "Add a job to a waiting list, pick it up, and try it again if something goes wrong.",
+      inspect: "Who is doing the job and when a replacement can take over.",
       topics: ["Queues & streams", "Start here"],
       accent: "#818cf8"
     },
     {
       id: "cache-stampede",
-      title: "Cache Stampede Shield",
+      title: "Share One Result with Many Requests",
       icon: "CS",
-      description: "Coordinate one recomputation while concurrent callers reuse the result instead of overwhelming the origin.",
-      inspect: "One recompute owner, waiting callers, and the reduction in origin requests.",
+      description: "When many people ask for the same missing result, calculate it once and share it.",
+      inspect: "One task does the calculation while the other requests wait.",
       topics: ["Data structures", "Coordination"],
       accent: "#34d399"
     },
     {
       id: "stream-vs-pubsub",
-      title: "Streams vs. Pub/Sub",
+      title: "What Happens to Missed Messages?",
       icon: "SP",
-      description: "Contrast replayable consumer-group delivery with live broadcast messaging and choose the right primitive.",
-      inspect: "What an offline consumer misses, what can replay, and when acknowledgment matters.",
+      description: "Compare messages saved for later with live messages that only reach connected listeners.",
+      inspect: "Which messages a listener can catch up on after reconnecting.",
       topics: ["Queues & streams", "Coordination"],
       accent: "#38bdf8"
     },
     {
       id: "hash-field-ttl",
-      title: "Hash Field TTL",
+      title: "Let Parts of a Record Expire",
       icon: "TTL",
-      description: "Expire individual hash fields independently while the surrounding object and its other fields remain available.",
-      inspect: "Each field's independent expiry while the rest of the hash remains available.",
+      description: "Set different time limits for pieces of information in the same record.",
+      inspect: "One piece expires while the rest of the record stays available.",
       topics: ["Data structures"],
       accent: "#f59e0b"
     },
     {
       id: "probabilistic-cache",
-      title: "Probabilistic Filters",
+      title: "Skip Searches That Cannot Match",
       icon: "PF",
-      description: "Use Bloom and Cuckoo filters to reject definite misses early and reduce unnecessary origin lookups.",
-      inspect: "Definite misses rejected before origin and possible hits that still require a lookup.",
+      description: "Use a quick check to rule out missing items before searching the main data store.",
+      inspect: "A definite no skips the search. A possible yes still needs checking.",
       topics: ["Data structures"],
       accent: "#c084fc"
     }
@@ -193,6 +193,7 @@
   });
 
   var topicOrder = ["All", "Workflows", "Queues & streams", "Coordination", "Data structures"];
+  var topicLabels = {"Queues & streams": "Jobs & messages", "Coordination": "Working together", "Data structures": "Storing data"};
   var grid = document.querySelector("[data-demo-grid]");
   var filters = document.querySelector("[data-filters]");
   var search = document.querySelector("[data-search]");
@@ -207,7 +208,7 @@
     article.className = "demo-card";
     article.dataset.demoId = demo.id;
     article.dataset.topics = demo.topics.join("|");
-    article.dataset.search = [demo.title, demo.description, demo.inspect].concat(demo.topics).join(" ").toLowerCase();
+    article.dataset.search = [demo.id.replace(/-/g, " "), demo.title, demo.description, demo.inspect].concat(demo.topics, demo.topics.map(function (topic) { return topicLabels[topic] || topic; })).join(" ").toLowerCase();
     article.style.setProperty("--card-accent", demo.accent);
 
     var link = document.createElement("a");
@@ -233,7 +234,7 @@
     var insight = document.createElement("div");
     insight.className = "card-insight";
     var insightLabel = document.createElement("span");
-    insightLabel.textContent = "Inspect";
+    insightLabel.textContent = "Watch for";
     var insightText = document.createElement("strong");
     insightText.textContent = demo.inspect;
     insight.append(insightLabel, insightText);
@@ -245,7 +246,7 @@
     demo.topics.slice(0, 2).forEach(function (topic) {
       var tag = document.createElement("span");
       tag.className = "card-tag";
-      tag.textContent = topic;
+      tag.textContent = topicLabels[topic] || topic;
       tags.appendChild(tag);
     });
     var open = document.createElement("span");
@@ -291,7 +292,7 @@
     button.className = "filter-button";
     button.dataset.topic = topic;
     button.setAttribute("aria-pressed", String(topic === activeTopic));
-    button.textContent = topic;
+    button.textContent = topicLabels[topic] || topic;
     button.addEventListener("click", function () { selectTopic(topic); });
     filters.appendChild(button);
   });

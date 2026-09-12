@@ -10,6 +10,7 @@ related_targets: ["agent-loop/index.html","ai-agent-workflow/index.html","archit
 - Scope: the catalog and all 20 static interactive demo routes.
 - Visitor mode: Persuade through direct technical demonstration.
 - Audience: engineering leaders and software architects evaluating FerricStore for adoption.
+- Homepage language: welcome non-developers too. Explain workflows through familiar tasks, use plain-language demo labels, and leave implementation vocabulary to the technical guides and demos. Preserve accuracy about saved progress and steps that may run again.
 - Job: understand a mechanism, cause or inspect failure and recovery, verify boundaries, then continue to source or documentation.
 - Homepage first visit: understand that FerricStore is a workflow and queue server, distinguish application execution from saved workflow state, then explore the demos or get started locally.
 - Homepage primary action: How it works, an in-page introduction before the catalog. Experienced visitors can jump directly to Demos from navigation.

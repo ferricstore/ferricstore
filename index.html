@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="FerricStore is an open-source durable workflow and queue server. Learn how your services run the code while FerricStore saves progress, then explore interactive demos.">
+  <meta name="description" content="FerricStore helps software keep track of multi-step tasks and pick up from saved progress after a crash. See how it works with simple, interactive demos.">
   <meta name="theme-color" content="#f3f6f4">
-  <title>FerricStore — Durable workflows and queues</title>
+  <title>FerricStore — Keep track of every step</title>
   <link rel="icon" href="./favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="./site.css?v=2">
   <link rel="stylesheet" href="./shared/dispatch.css?v=20">
@@ -29,74 +29,74 @@
   <main id="main-content" tabindex="-1">
     <section class="hero" aria-labelledby="hero-title">
       <div class="hero-copy">
-        <h1 id="hero-title">Durable workflows.<br>Built around your code.</h1>
-        <p><strong>FerricStore is an open-source workflow and queue server.</strong> It saves each job’s progress and coordinates retries and waiting, so your services can continue work after a restart.</p>
+        <h1 id="hero-title">Keep progress.<br>Even after a crash.</h1>
+        <p><strong>FerricStore helps software keep track of tasks with several steps.</strong> It records progress so work can continue from a saved step after a crash, instead of starting the whole task again.</p>
         <div class="hero-actions">
           <a class="primary-action" href="#how-it-works">How it works <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v16m-6-6 6 6 6-6"/></svg></a>
-          <a class="secondary-action" href="https://github.com/ferricstore/ferricstore/blob/main/guides/getting-started.md">Get started locally</a>
+          <a class="secondary-action" href="#demos">Try a demo</a>
         </div>
-        <p class="home-sdk-note">Use Python, Go, TypeScript, Java, or Elixir.<br>Your application code runs in your own services.</p>
+        <p class="home-sdk-note">Open-source software that your team runs alongside your application.</p>
       </div>
       <figure class="home-workflow" aria-labelledby="report-example">
         <figcaption id="report-example">Example: creating a report</figcaption>
         <div class="home-worker">
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="7" rx="1"/><rect x="3" y="14" width="18" height="7" rx="1"/><path d="M7 6.5h1m-1 11h1m5-11h4m-4 11h4"/></svg>
-          <div><strong>Your application</strong><span>Runs the code for each step</span></div>
+          <div><strong>Your application</strong><span>Does the work at each step</span></div>
         </div>
-        <p class="home-connection"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3v18m-4-4 4 4 4-4M17 21V3m-4 4 4-4 4 4"/></svg>Claims work · saves progress</p>
+        <p class="home-connection"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3v18m-4-4 4 4 4-4M17 21V3m-4 4 4-4 4 4"/></svg>Gets the next step · saves progress</p>
         <div class="home-saved-work">
-          <div class="home-saved-heading"><strong>FerricStore</strong><span>Keeps the workflow state</span></div>
+          <div class="home-saved-heading"><strong>FerricStore</strong><span>Remembers the progress</span></div>
           <ol>
             <li><span class="home-step-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m5 12 4 4 10-10"/></svg></span><strong>Collect data</strong><span>Saved</span></li>
             <li class="home-resume"><span class="home-step-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 12h16m-6-6 6 6-6 6"/></svg></span><strong>Write summary</strong><span>Resume here</span></li>
             <li><span class="home-step-mark" aria-hidden="true">3</span><strong>Send report</strong><span>Next</span></li>
           </ol>
         </div>
-        <p class="home-recovery"><strong>If a worker stops</strong>, another can claim the saved state after the temporary claim expires. The workflow’s progress stays in FerricStore.</p>
+        <p class="home-recovery"><strong>If the application crashes while writing the summary</strong>, it can pick up at that step. The saved data from step 1 is still there. The unfinished summary may need to be written again.</p>
       </figure>
     </section>
 
     <section class="home-how" id="how-it-works" aria-labelledby="how-title">
       <div class="home-how-intro">
-        <h2 id="how-title">Your services do the work.<br>FerricStore keeps track.</h2>
-        <p>A workflow is a job with named steps, such as collecting data, writing a summary, and sending a report. FerricStore stores which step is ready, who owns it, and what happens next.</p>
-        <p>Use it for background jobs, AI agents waiting for approval, or processes spanning services. Start with one job and add steps as it grows.</p>
-        <a class="home-text-link" href="https://github.com/ferricstore/ferricstore#what-is-a-flow">Read the workflow model <span aria-hidden="true">→</span></a>
+        <h2 id="how-title">What is a workflow?</h2>
+        <p>A workflow is a task broken into steps. To create a report, for example, you collect data, write a summary, then send it.</p>
+        <p>Your application does the work. FerricStore remembers which step it has reached and whether it should continue, try again later, or wait for someone’s approval.</p>
+        <a class="home-text-link" href="https://github.com/ferricstore/ferricstore#what-is-a-flow">Read the technical guide <span aria-hidden="true">→</span></a>
       </div>
       <ol class="home-lifecycle">
-        <li><span aria-hidden="true">1</span><div><h3>Claim a ready step</h3><p>A worker in your service gets a temporary claim, called a lease, to process that step.</p></div></li>
-        <li><span aria-hidden="true">2</span><div><h3>Run your application code</h3><p>Call a model, generate a report, or contact another service. Your handler runs outside FerricStore.</p></div></li>
-        <li><span aria-hidden="true">3</span><div><h3>Save what happens next</h3><p>Complete the job, move to the next named step, retry later, or wait for a signal such as human approval.</p></div></li>
+        <li><span aria-hidden="true">1</span><div><h3>Pick up a step</h3><p>Your application asks FerricStore for work that is ready to start.</p></div></li>
+        <li><span aria-hidden="true">2</span><div><h3>Do the work</h3><p>The application carries out that step, such as writing the report’s summary.</p></div></li>
+        <li><span aria-hidden="true">3</span><div><h3>Save progress</h3><p>It tells FerricStore what is done and what should happen next.</p></div></li>
       </ol>
       <details class="home-boundary">
         <summary>What happens to unfinished work after a crash?</summary>
-        <p>After the worker’s lease expires, a replacement can claim the saved state and run its handler. The unfinished handler may run again; previously committed transitions remain recorded. FerricStore does not replay handler code to reconstruct workflow state.</p>
-        <p>For external actions such as charging a card, use a stable idempotency key with a provider that honors it, and guarded execution where appropriate. Saving workflow progress alone does not make an external action happen exactly once.</p>
+        <p>The part of your application doing the work has a time limit for holding it. If it stops and that time runs out, another can take over from the saved step. An unfinished step may run again, but the progress already saved stays recorded.</p>
+        <p>Some actions need extra care. If a step charges a card, for example, it should send the same payment reference when trying again. The payment provider must recognize that reference and prevent a second charge. Saving progress alone does not prevent duplicate payments.</p>
       </details>
     </section>
 
     <section class="home-reading" id="why-workflows" aria-labelledby="reading-title">
       <div class="home-reading-intro">
-        <h2 id="reading-title">Why use a workflow instead of just queues?</h2>
-        <p>A queue delivers work to a consumer. When a process spans several steps, your application also needs to track dependencies, retries, waiting, and overall progress. A workflow engine brings that coordination together.</p>
-        <p>Queues remain a good fit for independent jobs and buffering traffic. Workflows become useful when the relationship between jobs matters—and can use queues underneath.</p>
-        <a class="home-text-link" href="./architecture-comparison/">Explore the architecture demo <span aria-hidden="true">→</span></a>
+        <h2 id="reading-title">Why not just use a queue?</h2>
+        <p>A queue is a list of jobs waiting to be picked up. It works well when each job stands on its own.</p>
+        <p>But what if the hotel booking fails after the flight is booked? A workflow tracks the whole trip: what is done, what comes next, and what needs to be cancelled. You can still use queues to deliver the work.</p>
+        <a class="home-text-link" href="./architecture-comparison/">See the approaches side by side <span aria-hidden="true">→</span></a>
       </div>
       <ul class="home-reading-list" aria-label="Recommended articles about workflow orchestration">
         <li>
           <h3><a href="https://aws.amazon.com/step-functions/faqs/">When to use Step Functions vs. Amazon SQS <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7M7 7h10v10"/></svg></a></h3>
           <p class="home-reading-source">AWS · Service comparison</p>
-          <p>AWS explains the extra application-level tracking needed with SQS, and how orchestration adds visibility into the whole execution. Start with the “Comparisons” section.</p>
+          <p>AWS explains why queues alone need extra code to track a task across several steps. See the “Comparisons” section.</p>
         </li>
         <li>
           <h3><a href="https://martinfowler.com/articles/201701-event-driven.html">What do you mean by “Event-Driven”? <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7M7 7h10v10"/></svg></a></h3>
-          <p class="home-reading-source">Martin Fowler · Architecture perspective</p>
-          <p>Fowler describes how a business process spread across event notifications can become difficult to see, debug, and change. Read “Event Notification” for the trade-off.</p>
+          <p class="home-reading-source">Martin Fowler · Software design</p>
+          <p>When systems pass messages to each other, the full process can be hard to follow. Fowler explains this in “Event Notification.”</p>
         </li>
         <li>
           <h3><a href="https://www.uber.com/us/en/blog/announcing-cadence/">Announcing Cadence 1.0 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7M7 7h10v10"/></svg></a></h3>
-          <p class="home-reading-source">Uber Engineering · Production experience</p>
-          <p>Uber explains how its workflow platform takes on common service infrastructure, including failure handling, execution inspection, and parent-child coordination.</p>
+          <p class="home-reading-source">Uber Engineering · Lessons from real use</p>
+          <p>Uber describes using workflows to retry failed work, see each task’s progress, and manage related tasks.</p>
         </li>
       </ul>
     </section>
@@ -105,21 +105,21 @@
       <header class="catalog-header">
         <div>
           <h2 id="catalog-title">See it in action</h2>
-          <p>Explore failure, recovery, and coordination in your browser. No setup or account needed.</p>
+          <p>Choose an example, run it, and see what happens when something goes wrong. No setup or account needed.</p>
         </div>
         <p class="home-result-count" role="status" aria-live="polite" aria-atomic="true"><span data-visible-count>20</span> demos shown</p>
       </header>
 
       <nav class="home-start-path" aria-label="Suggested demos">
-        <strong>New here? Start with recovery.</strong>
+        <strong>New here? Start with saved progress.</strong>
         <a href="./workflow-explainer/">Understand saved progress <span aria-hidden="true">→</span></a>
-        <a href="./split-lab/">Compare restart and resume <span aria-hidden="true">→</span></a>
-        <a href="./benchmark-explainer/">Explore the benchmarks <span aria-hidden="true">→</span></a>
+        <a href="./split-lab/">Start over or carry on? <span aria-hidden="true">→</span></a>
+        <a href="./benchmark-explainer/">See the speed test results <span aria-hidden="true">→</span></a>
       </nav>
 
       <details class="home-boundary home-demo-note">
-        <summary>About these simulations and benchmark results</summary>
-        <p>Most demos are browser simulations: their timings, costs, and capacity values are illustrative. The benchmark explainer presents sourced historical measurements with the hardware, workload, units, and limitations attached. These pages do not run a FerricStore server in your browser.</p>
+        <summary>Are these demos running a real server?</summary>
+        <p>No. Most demos are interactive examples that show how things work, not live tests of FerricStore. Their time, cost, and capacity figures are examples. The speed test page is different: it shows recorded measurements, with sources and the test conditions explained.</p>
       </details>
 
       <div class="catalog-controls">
@@ -140,7 +140,7 @@
     </section>
 
     <section class="home-get-started" aria-labelledby="get-started-title">
-      <div><h2 id="get-started-title">Try it with your own code.</h2><p>Run FerricStore locally and connect an SDK. The getting-started guide walks through setup and your first workflow.</p><p class="home-release-note">Open source · Apache 2.0 · Currently in beta</p></div>
+      <div><h2 id="get-started-title">Ready to try it in your application?</h2><p>The setup guide helps your development team install FerricStore and build a first workflow. It supports Python, Go, TypeScript, Java, and Elixir.</p><p class="home-release-note">Open source · Apache 2.0 · Currently in beta</p></div>
       <div><a class="primary-action" href="https://github.com/ferricstore/ferricstore/blob/main/guides/getting-started.md">Open the getting-started guide</a><a class="home-text-link" href="https://github.com/ferricstore/ferricstore">View the source on GitHub <span aria-hidden="true">→</span></a></div>
     </section>
   </main>
@@ -148,12 +148,12 @@
   <footer>
     <a class="brand footer-brand" href="./">
       <span class="brand-mark" aria-hidden="true">F</span>
-      <span><strong>FerricStore</strong><small>Durable workflows &amp; queues</small></span>
+      <span><strong>FerricStore</strong><small>Workflows &amp; queues</small></span>
     </a>
-    <p>Open source · Browser-based demonstrations · No account required</p>
+    <p>Open source · Try the demos in your browser · No account needed</p>
   </footer>
 
-  <script src="./site.js?v=6"></script>
+  <script src="./site.js?v=7"></script>
   <script src="./shared/dispatch.js?v=17"></script>
 </body>
 </html>
