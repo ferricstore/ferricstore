@@ -815,6 +815,8 @@
     var hero = document.querySelector(".hero");
     var catalog = document.querySelector(".catalog");
     if (!hero || !catalog) return;
+    // The product homepage supplies its own introduction and evaluation links.
+    if (document.body.classList.contains("fs-home")) return;
 
     var path = document.createElement("nav");
     path.className = "fs-evaluation-path";

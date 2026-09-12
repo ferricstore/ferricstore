@@ -3,79 +3,104 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Interactive FerricStore demos for durable workflows, queues, streaming, caching, and resilient execution.">
-  <meta name="theme-color" content="#090b12">
-  <title>FerricStore Interactive Demos</title>
+  <meta name="description" content="FerricStore is an open-source durable workflow and queue server. Learn how your services run the code while FerricStore saves progress, then explore interactive demos.">
+  <meta name="theme-color" content="#f3f6f4">
+  <title>FerricStore — Durable workflows and queues</title>
   <link rel="icon" href="./favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="./site.css?v=2">
   <link rel="stylesheet" href="./shared/dispatch.css?v=20">
+  <link rel="stylesheet" href="./home.css?v=1">
 </head>
-<body class="fs-dispatch">
-  <!--
-  THESIS: Durable work should be inspectable as it moves; this surface refuses the generic gradient hero and interchangeable demo-card catalog.
-  OWN-WORLD: Warm evaluation paper, deep blue-black rails, signal orange, flight-progress strips, stamped states, compact rules, and square mechanical controls.
-  STORY: An engineering leader recognizes a failure, runs the mechanism, verifies recovery and its boundary, then follows evidence toward adoption.
-  FIRST VIEWPORT: A concise decision thesis and primary action sit beside a live workflow strip; the recovery mechanism is visible before catalog prose.
-  FORM: Dispatch Strip Board, sixth grounded direction, seed 2ac9d312.
-  FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
-  -->
-  <a class="skip-link" href="#demo-grid">Skip to demos</a>
+<body class="fs-dispatch fs-home" data-fs-surface="catalog">
+  <a class="skip-link" href="#main-content">Skip to content</a>
 
   <header class="site-header">
-    <a class="brand" href="./" aria-label="FerricStore demos home">
+    <a class="brand" href="./" aria-label="FerricStore home">
       <span class="brand-mark" aria-hidden="true">F</span>
-      <span><strong>FerricStore</strong><small>Interactive demos</small></span>
+      <span><strong>FerricStore</strong><small>Workflows &amp; queues</small></span>
     </a>
     <nav aria-label="Primary navigation">
-      <a href="https://github.com/ferricstore/ferricstore">GitHub</a>
+      <a href="#how-it-works">How it works</a>
+      <a href="#demos">Demos</a>
       <a href="https://github.com/ferricstore/ferricstore#readme">Documentation</a>
     </nav>
   </header>
 
-  <main>
+  <main id="main-content" tabindex="-1">
     <section class="hero" aria-labelledby="hero-title">
       <div class="hero-copy">
-        <h1 id="hero-title">Watch durable work survive failure.</h1>
-        <p>Run self-contained workflow, queue, coordination, and data-structure experiments. Each demo exposes the state transition, failure boundary, and recovery behavior an architect needs to evaluate FerricStore.</p>
+        <h1 id="hero-title">Durable workflows.<br>Built around your code.</h1>
+        <p><strong>FerricStore is an open-source workflow and queue server.</strong> It saves each job’s progress and coordinates retries and waiting, so your services can continue work after a restart.</p>
         <div class="hero-actions">
-          <a class="primary-action" href="./workflow-explainer/">Run your first recovery <span aria-hidden="true">→</span></a>
-          <a class="secondary-action" href="#demo-grid">Browse all mechanisms</a>
+          <a class="primary-action" href="#how-it-works">How it works <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v16m-6-6 6 6 6-6"/></svg></a>
+          <a class="secondary-action" href="https://github.com/ferricstore/ferricstore/blob/main/guides/getting-started.md">Get started locally</a>
         </div>
+        <p class="home-sdk-note">Use Python, Go, TypeScript, Java, or Elixir.<br>Your application code runs in your own services.</p>
       </div>
-      <div class="hero-visual" aria-label="Workflow recovery preview">
-        <div class="visual-head"><span>RUN</span><strong>report-204</strong><i>RECOVERED</i></div>
-        <ol>
-          <li class="is-done"><span>01</span><strong>Plan</strong><small>saved</small></li>
-          <li class="is-done"><span>02</span><strong>Search</strong><small>saved</small></li>
-          <li class="is-crash"><span>03</span><strong>Crash</strong><small>worker A</small></li>
-          <li class="is-active"><span>04</span><strong>Resume</strong><small>worker B</small></li>
-        </ol>
-        <div class="state-card">
-          <span>FERRICSTORE STATE</span>
-          <strong>summarize</strong>
-          <code>fence: 42 · plan ✓ · facts ✓</code>
+      <figure class="home-workflow" aria-labelledby="report-example">
+        <figcaption id="report-example">Example: creating a report</figcaption>
+        <div class="home-worker">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="7" rx="1"/><rect x="3" y="14" width="18" height="7" rx="1"/><path d="M7 6.5h1m-1 11h1m5-11h4m-4 11h4"/></svg>
+          <div><strong>Your application</strong><span>Runs the code for each step</span></div>
         </div>
-      </div>
+        <p class="home-connection"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3v18m-4-4 4 4 4-4M17 21V3m-4 4 4-4 4 4"/></svg>Claims work · saves progress</p>
+        <div class="home-saved-work">
+          <div class="home-saved-heading"><strong>FerricStore</strong><span>Keeps the workflow state</span></div>
+          <ol>
+            <li><span class="home-step-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m5 12 4 4 10-10"/></svg></span><strong>Collect data</strong><span>Saved</span></li>
+            <li class="home-resume"><span class="home-step-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 12h16m-6-6 6 6-6 6"/></svg></span><strong>Write summary</strong><span>Resume here</span></li>
+            <li><span class="home-step-mark" aria-hidden="true">3</span><strong>Send report</strong><span>Next</span></li>
+          </ol>
+        </div>
+        <p class="home-recovery"><strong>If a worker stops</strong>, another can claim the saved state after the temporary claim expires. The workflow’s progress stays in FerricStore.</p>
+      </figure>
     </section>
 
-    <aside class="accuracy-note">
-      <span aria-hidden="true">i</span>
-      <p><strong>How to read these demos:</strong> Most are interactive simulations, so their timings, costs, and capacity values are illustrative. The benchmark explainer is explicitly sourced historical evidence and keeps its hardware, workload, units, and limitations attached. Workflow handlers remain at-least-once, so external effects need guarded execution and stable idempotency keys.</p>
-    </aside>
+    <section class="home-how" id="how-it-works" aria-labelledby="how-title">
+      <div class="home-how-intro">
+        <h2 id="how-title">Your services do the work.<br>FerricStore keeps track.</h2>
+        <p>A workflow is a job with named steps, such as collecting data, writing a summary, and sending a report. FerricStore stores which step is ready, who owns it, and what happens next.</p>
+        <p>Use it for background jobs, AI agents waiting for approval, or processes spanning services. Start with one job and add steps as it grows.</p>
+        <a class="home-text-link" href="https://github.com/ferricstore/ferricstore#what-is-a-flow">Read the workflow model <span aria-hidden="true">→</span></a>
+      </div>
+      <ol class="home-lifecycle">
+        <li><span aria-hidden="true">1</span><div><h3>Claim a ready step</h3><p>A worker in your service gets a temporary claim, called a lease, to process that step.</p></div></li>
+        <li><span aria-hidden="true">2</span><div><h3>Run your application code</h3><p>Call a model, generate a report, or contact another service. Your handler runs outside FerricStore.</p></div></li>
+        <li><span aria-hidden="true">3</span><div><h3>Save what happens next</h3><p>Complete the job, move to the next named step, retry later, or wait for a signal such as human approval.</p></div></li>
+      </ol>
+      <details class="home-boundary">
+        <summary>What happens to unfinished work after a crash?</summary>
+        <p>After the worker’s lease expires, a replacement can claim the saved state and run its handler. The unfinished handler may run again; previously committed transitions remain recorded. FerricStore does not replay handler code to reconstruct workflow state.</p>
+        <p>For external actions such as charging a card, use a stable idempotency key with a provider that honors it, and guarded execution where appropriate. Saving workflow progress alone does not make an external action happen exactly once.</p>
+      </details>
+    </section>
 
-    <section class="catalog" aria-labelledby="catalog-title">
+    <section class="catalog" id="demos" aria-labelledby="catalog-title">
       <header class="catalog-header">
         <div>
-          <h2 id="catalog-title">Choose a mechanism to evaluate</h2>
+          <h2 id="catalog-title">See it in action</h2>
+          <p>Explore failure, recovery, and coordination in your browser. No setup or account needed.</p>
         </div>
-        <p><span data-visible-count>20</span> unique demos</p>
+        <p class="home-result-count" role="status" aria-live="polite" aria-atomic="true"><span data-visible-count>20</span> demos shown</p>
       </header>
 
+      <nav class="home-start-path" aria-label="Suggested demos">
+        <strong>New here? Start with recovery.</strong>
+        <a href="./workflow-explainer/">Understand saved progress <span aria-hidden="true">→</span></a>
+        <a href="./split-lab/">Compare restart and resume <span aria-hidden="true">→</span></a>
+        <a href="./benchmark-explainer/">Explore the benchmarks <span aria-hidden="true">→</span></a>
+      </nav>
+
+      <details class="home-boundary home-demo-note">
+        <summary>About these simulations and benchmark results</summary>
+        <p>Most demos are browser simulations: their timings, costs, and capacity values are illustrative. The benchmark explainer presents sourced historical measurements with the hardware, workload, units, and limitations attached. These pages do not run a FerricStore server in your browser.</p>
+      </details>
+
       <div class="catalog-controls">
-        <div class="filters" role="tablist" aria-label="Filter demos by topic" data-filters></div>
+        <div class="filters" role="group" aria-label="Filter demos by topic" data-filters></div>
         <label class="search">
           <span class="visually-hidden">Search demos</span>
-          <span aria-hidden="true">⌕</span>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg>
           <input type="search" placeholder="Search demos" autocomplete="off" data-search>
         </label>
       </div>
@@ -84,20 +109,25 @@
 
       <div class="empty-state" hidden data-empty-state>
         <strong>No demos match that search.</strong>
-        <button type="button" data-clear-search>Clear search</button>
+        <button type="button" data-clear-search>Reset search and filters</button>
       </div>
+    </section>
+
+    <section class="home-get-started" aria-labelledby="get-started-title">
+      <div><h2 id="get-started-title">Try it with your own code.</h2><p>Run FerricStore locally and connect an SDK. The getting-started guide walks through setup and your first workflow.</p><p class="home-release-note">Open source · Apache 2.0 · Currently in beta</p></div>
+      <div><a class="primary-action" href="https://github.com/ferricstore/ferricstore/blob/main/guides/getting-started.md">Open the getting-started guide</a><a class="home-text-link" href="https://github.com/ferricstore/ferricstore">View the source on GitHub <span aria-hidden="true">→</span></a></div>
     </section>
   </main>
 
   <footer>
     <a class="brand footer-brand" href="./">
       <span class="brand-mark" aria-hidden="true">F</span>
-      <span><strong>FerricStore</strong><small>Durable KV and workflow state engine</small></span>
+      <span><strong>FerricStore</strong><small>Durable workflows &amp; queues</small></span>
     </a>
     <p>Open source · Browser-based demonstrations · No account required</p>
   </footer>
 
-  <script src="./site.js?v=5"></script>
-  <script src="./shared/dispatch.js?v=16"></script>
+  <script src="./site.js?v=6"></script>
+  <script src="./shared/dispatch.js?v=17"></script>
 </body>
 </html>

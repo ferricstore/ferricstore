@@ -11,7 +11,9 @@ related_targets: ["agent-loop/index.html","ai-agent-workflow/index.html","archit
 - Visitor mode: Persuade through direct technical demonstration.
 - Audience: engineering leaders and software architects evaluating FerricStore for adoption.
 - Job: understand a mechanism, cause or inspect failure and recovery, verify boundaries, then continue to source or documentation.
-- Primary action: run the current experiment within the first viewport.
+- Homepage first visit: understand that FerricStore is a workflow and queue server, distinguish application execution from saved workflow state, then explore the demos or get started locally.
+- Homepage primary action: How it works, an in-page introduction before the catalog. Experienced visitors can jump directly to Demos from navigation.
+- Demo primary action: run the current experiment within the first viewport.
 - Proof: existing simulations, state histories, measured benchmark evidence, documented technical boundaries, and source/documentation links.
 - Constraints: preserve behavior and factual claims; no invented customers, benchmarks, guarantees, comparisons, or enterprise positioning; static GitHub Pages; accessible at 390×844 and 1440×900.
 - Chosen direction: Dispatch Strip Board—workflow state is a physical progress strip moving through named rails, with claims, failures, handoffs, and recovery marked in place.

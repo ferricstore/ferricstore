@@ -278,7 +278,7 @@
   function selectTopic(topic) {
     activeTopic = topic;
     filters.querySelectorAll("button").forEach(function (button) {
-      button.setAttribute("aria-selected", String(button.dataset.topic === topic));
+      button.setAttribute("aria-pressed", String(button.dataset.topic === topic));
     });
     applyFilters();
   }
@@ -290,8 +290,7 @@
     button.type = "button";
     button.className = "filter-button";
     button.dataset.topic = topic;
-    button.setAttribute("role", "tab");
-    button.setAttribute("aria-selected", String(topic === activeTopic));
+    button.setAttribute("aria-pressed", String(topic === activeTopic));
     button.textContent = topic;
     button.addEventListener("click", function () { selectTopic(topic); });
     filters.appendChild(button);
