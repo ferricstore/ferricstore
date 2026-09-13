@@ -6,18 +6,24 @@ if Enum.any?(Application.started_applications(), fn {app, _, _} -> app == :ferri
 end
 
 # Script to boot FerricStore with rich sample workflows for dashboard inspection
+worktree? = Application.get_env(:ferricstore, :dev_worktree?, false)
+
 demo_data_dir =
   System.get_env("FERRICSTORE_DASHBOARD_DEMO_DATA_DIR") ||
     Path.join(
-      System.tmp_dir!(),
+      Path.expand("../tmp", __DIR__),
       "ferricstore-dashboard-demo-#{System.system_time(:microsecond)}"
     )
 
 Logger.configure(level: :warning)
 Application.put_env(:ferricstore, :data_dir, demo_data_dir)
 Application.put_env(:ferricstore, :shard_count, 1)
-Application.put_env(:ferricstore, :native_port, 6389)
-Application.put_env(:ferricstore, :health_port, 4000)
+
+unless worktree? do
+  Application.put_env(:ferricstore, :native_port, 6389)
+  Application.put_env(:ferricstore, :health_port, 4000)
+end
+
 Application.put_env(:ferricstore, :protected_mode, false)
 Application.put_env(:ferricstore, :dashboard_allow_insecure_http, true)
 Application.put_env(:ferricstore, :flow_policy_migration_worker_initial_delay_ms, 0)
@@ -26,6 +32,8 @@ Application.put_env(:ferricstore, :flow_policy_migration_worker_catchup_delay_ms
 Application.ensure_all_started(:ranch)
 Application.ensure_all_started(:ferricstore)
 Application.ensure_all_started(:ferricstore_server)
+
+dashboard_url = "http://localhost:#{FerricstoreServer.Health.Endpoint.port()}"
 
 now = System.system_time(:millisecond)
 
@@ -587,57 +595,43 @@ if MapSet.new(Enum.map(related.records, & &1.id)) !=
    do: raise("Dashboard demo query omitted a scheduled FIFO member: #{inspect(related)}")
 
 IO.puts("==> 12 sample workflows and 15 FIFO examples successfully created!")
-IO.puts("    -> FIFO:        http://localhost:4000/dashboard/flow/states?type=invoice_dispatch")
+IO.puts("    -> FIFO:        #{dashboard_url}/dashboard/flow/states?type=invoice_dispatch")
+
+IO.puts("    1. [Running]    #{dashboard_url}/dashboard/flow/#{id1}?partition_key=tenant-acme")
+
+IO.puts("    2. [Awaiting]   #{dashboard_url}/dashboard/flow/#{id2}?partition_key=tenant-globex")
+
+IO.puts("    3. [Retry due]  #{dashboard_url}/dashboard/flow/#{id3}?partition_key=tenant-stripe")
+
+IO.puts("    4. [Completed]  #{dashboard_url}/dashboard/flow/#{id4}?partition_key=tenant-acme")
+
+IO.puts("    5. [Scheduled]  #{dashboard_url}/dashboard/flow/#{id5}?partition_key=system")
+
+IO.puts("    6. [AI Pipeline]#{dashboard_url}/dashboard/flow/#{id6}?partition_key=tenant-openai")
 
 IO.puts(
-  "    1. [Running]    http://localhost:4000/dashboard/flow/#{id1}?partition_key=tenant-acme"
+  "    7. [Crypto Settle]#{dashboard_url}/dashboard/flow/#{id7}?partition_key=tenant-binance"
 )
 
-IO.puts(
-  "    2. [Awaiting]   http://localhost:4000/dashboard/flow/#{id2}?partition_key=tenant-globex"
-)
+IO.puts("    8. [Transcode]  #{dashboard_url}/dashboard/flow/#{id8}?partition_key=tenant-media")
 
-IO.puts(
-  "    3. [Retry due]  http://localhost:4000/dashboard/flow/#{id3}?partition_key=tenant-stripe"
-)
+IO.puts("    9. [Fraud Rev]  #{dashboard_url}/dashboard/flow/#{id9}?partition_key=tenant-fintech")
 
-IO.puts(
-  "    4. [Completed]  http://localhost:4000/dashboard/flow/#{id4}?partition_key=tenant-acme"
-)
+IO.puts("   10. [DB Migrate] #{dashboard_url}/dashboard/flow/#{id10}?partition_key=system-ops")
 
-IO.puts("    5. [Scheduled]  http://localhost:4000/dashboard/flow/#{id5}?partition_key=system")
+IO.puts("   11. [IoT Fleet]  #{dashboard_url}/dashboard/flow/#{id11}?partition_key=tenant-fleet")
 
-IO.puts(
-  "    6. [AI Pipeline]http://localhost:4000/dashboard/flow/#{id6}?partition_key=tenant-openai"
-)
+IO.puts("   12. [SaaS Renew] #{dashboard_url}/dashboard/flow/#{id12}?partition_key=tenant-saas")
 
-IO.puts(
-  "    7. [Crypto Settle]http://localhost:4000/dashboard/flow/#{id7}?partition_key=tenant-binance"
-)
-
-IO.puts(
-  "    8. [Transcode]  http://localhost:4000/dashboard/flow/#{id8}?partition_key=tenant-media"
-)
-
-IO.puts(
-  "    9. [Fraud Rev]  http://localhost:4000/dashboard/flow/#{id9}?partition_key=tenant-fintech"
-)
-
-IO.puts(
-  "   10. [DB Migrate] http://localhost:4000/dashboard/flow/#{id10}?partition_key=system-ops"
-)
-
-IO.puts(
-  "   11. [IoT Fleet]  http://localhost:4000/dashboard/flow/#{id11}?partition_key=tenant-fleet"
-)
-
-IO.puts(
-  "   12. [SaaS Renew] http://localhost:4000/dashboard/flow/#{id12}?partition_key=tenant-saas"
-)
-
-IO.puts("    -> Overview:    http://localhost:4000/dashboard/flow")
-IO.puts("    -> Query:       http://localhost:4000/dashboard/flow/query")
+IO.puts("    -> Overview:    #{dashboard_url}/dashboard/flow")
+IO.puts("    -> Query:       #{dashboard_url}/dashboard/flow/query")
 IO.puts("    -> Data:        #{demo_data_dir}")
-IO.puts("==> Server listening on http://localhost:4000 ...")
+IO.puts("    -> Native:      ferric://127.0.0.1:#{FerricstoreServer.Native.Listener.port()}")
+
+IO.puts(
+  "    -> Probe:       http://127.0.0.1:#{FerricstoreServer.Health.ProbeEndpoint.port()}/health/ready"
+)
+
+IO.puts("==> Server listening on #{dashboard_url} ...")
 
 Process.sleep(:infinity)

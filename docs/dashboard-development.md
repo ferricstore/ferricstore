@@ -521,12 +521,19 @@ per-source quality and continuation availability without automatically fetching
 more pages. Manual Signals scans display their captured UTC time and stay paused.
 
 On a development machine, start the isolated synthetic demo. It disables
-protected mode and uses HTTP port 4000 and native port 6389; do not expose it as
-a production deployment.
+protected mode; do not expose it as a production deployment. In the main
+checkout it uses dashboard port 4000 and native port 6389. Linked Git worktrees
+keep their OS-assigned development ports. Each demo creates a fresh data
+directory under that checkout's `tmp/` and prints its actual URLs and data path.
 
 ```sh
 mix run --no-start --no-halt scripts/run_dashboard_demo.exs
 ```
+
+For a worktree, pass the printed dashboard URL to browser harnesses through
+`DASHBOARD_URL` (or `QUERY_BASE_URL` where documented below). Do not reuse a
+different checkout's URL or `FERRICSTORE_DASHBOARD_DEMO_DATA_DIR`. An explicit
+data-directory override is retained across runs and must belong to this demo.
 
 The browser harness expects this demo's workflow IDs and Chrome. Install its
 Playwright dependency outside the repository, then run:

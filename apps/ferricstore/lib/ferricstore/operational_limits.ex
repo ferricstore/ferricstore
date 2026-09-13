@@ -109,12 +109,11 @@ defmodule Ferricstore.OperationalLimits do
 
   @spec memory_limit_bytes(keyword()) :: non_neg_integer()
   def memory_limit_bytes(opts \\ []) do
-    positive_int(
+    positive_int([
       Keyword.get(opts, :memory_bytes),
       configured_int(:operational_memory_limit_bytes),
-      configured_int(:max_memory_bytes),
-      safe_memory_limit()
-    ) || 0
+      configured_int(:max_memory_bytes)
+    ]) || safe_memory_limit() || 0
   end
 
   @spec classify_ratio(nil | number(), map()) :: level()
@@ -183,39 +182,15 @@ defmodule Ferricstore.OperationalLimits do
   defp detected_disk_capacity(data_dir) do
     path = existing_parent(data_dir)
 
-    case System.cmd("df", ["-Pk", path], stderr_to_stdout: true) do
-      {output, 0} -> parse_df(output, path)
-      _ -> unknown_disk(path)
+    case Ferricstore.Bitcask.NIF.disk_capacity(path) do
+      {:ok, total, used, available} ->
+        %{path: path, total_bytes: total, used_bytes: used, available_bytes: available}
+
+      _ ->
+        unknown_disk(path)
     end
   rescue
     _ -> unknown_disk(data_dir)
-  end
-
-  defp parse_df(output, path) do
-    output
-    |> String.split("\n", trim: true)
-    |> List.last()
-    |> case do
-      nil ->
-        unknown_disk(path)
-
-      line ->
-        parts = String.split(line, ~r/\s+/, trim: true)
-
-        with [_, blocks, used, available | _] <- parts,
-             {blocks, ""} <- Integer.parse(blocks),
-             {used, ""} <- Integer.parse(used),
-             {available, ""} <- Integer.parse(available) do
-          %{
-            path: path,
-            total_bytes: blocks * 1024,
-            used_bytes: used * 1024,
-            available_bytes: available * 1024
-          }
-        else
-          _ -> unknown_disk(path)
-        end
-    end
   end
 
   defp unknown_disk(path) do
@@ -268,10 +243,6 @@ defmodule Ferricstore.OperationalLimits do
 
   defp positive_int(value1, value2, default) do
     positive_int([value1, value2, default])
-  end
-
-  defp positive_int(value1, value2, value3, default) do
-    positive_int([value1, value2, value3, default])
   end
 
   defp configured_int(key) do

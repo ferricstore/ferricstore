@@ -746,6 +746,157 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
     assert {:ok, ^encoded_record, 0} = ProjectionOps.read_source_value(state, state_key)
   end
 
+  @tag :source_batch
+  test "batch source reads preserve key checks, request order, expiry, and tombstones" do
+    root = tmp_lmdb_path("batch_source_reads")
+    File.mkdir_p!(root)
+    first_path = Path.join(root, "00000.log")
+    second_path = Path.join(root, "00001.log")
+
+    assert {:ok, [{first_offset, _}, {second_offset, _}]} =
+             Ferricstore.Bitcask.NIF.v2_append_batch(
+               first_path,
+               [{"batch-first", "first-value", 0}, {"batch-second", "second-value", 0}]
+             )
+
+    assert {:ok, [{third_offset, _}]} =
+             Ferricstore.Bitcask.NIF.v2_append_batch(
+               second_path,
+               [{"batch-third", "third-value", 0}]
+             )
+
+    state = %{shard_data_path: root, instance_ctx: %{data_dir: root}, shard_index: 0}
+
+    assert {:ok,
+            [
+              {:ok, "second-value", 222},
+              {:ok, "third-value", 333},
+              :not_found,
+              {:ok, "hot-value", 444},
+              {:ok, "first-value", 111}
+            ]} =
+             ProjectionOps.read_source_locations(state, [
+               {"batch-second", nil, 222, 0, second_offset},
+               {"batch-third", nil, 333, 1, third_offset},
+               {"batch-deleted", nil, 0, :deleted, 0},
+               {"batch-hot", "hot-value", 444, :cached, 0},
+               {"batch-first", nil, 111, 0, first_offset}
+             ])
+
+    assert {:ok, [:not_found]} =
+             ProjectionOps.read_source_locations(state, [
+               {"wrong-key", nil, 333, 0, first_offset}
+             ])
+
+    assert {:ok, {deleted_offset, _}} =
+             Ferricstore.Bitcask.NIF.v2_append_tombstone(first_path, "physical-deleted")
+
+    assert {:ok, {expired_offset, _}} =
+             Ferricstore.Bitcask.NIF.v2_append_record(first_path, "physical-expired", "value", 1)
+
+    assert {:ok, "value", 1} =
+             expired_source =
+             ProjectionOps.read_source_location(
+               state,
+               "physical-expired",
+               nil,
+               1,
+               0,
+               expired_offset
+             )
+
+    assert {:ok, [:not_found, ^expired_source]} =
+             ProjectionOps.read_source_locations(state, [
+               {"physical-deleted", nil, 0, 0, deleted_offset},
+               {"physical-expired", nil, 1, 0, expired_offset}
+             ])
+  end
+
+  @tag :source_batch
+  test "batch source reads preserve WARaft locations alongside Bitcask values" do
+    root = tmp_lmdb_path("batch_mixed_source_reads")
+    File.mkdir_p!(root)
+    path = Path.join(root, "00000.log")
+    raft_key = "batch-waraft-source"
+
+    assert {:ok, [{bitcask_offset, _}]} =
+             Ferricstore.Bitcask.NIF.v2_append_batch(path, [{"batch-bitcask", "bitcask-value", 0}])
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(root, 0, 1, [
+               {raft_key, "waraft-value", 0}
+             ])
+
+    state = %{shard_data_path: root, instance_ctx: %{data_dir: root}, shard_index: 0}
+
+    assert {:ok,
+            [
+              {:ok, "waraft-value", 202},
+              {:ok, "bitcask-value", 101}
+            ]} =
+             ProjectionOps.read_source_locations(state, [
+               {raft_key, nil, 202, {:waraft_apply_projection, 1}, 0},
+               {"batch-bitcask", nil, 101, 0, bitcask_offset}
+             ])
+  end
+
+  @tag :source_batch
+  test "batch source reads materialize blob references after keyed reads" do
+    root = tmp_lmdb_path("batch_blob_source_reads")
+    File.mkdir_p!(root)
+    path = Path.join(root, "00000.log")
+    first_payload = :binary.copy("first-blob-", 16)
+    second_payload = :binary.copy("second-blob-", 16)
+
+    assert {:ok, first_ref} = Ferricstore.Store.BlobStore.put(root, 0, first_payload)
+    assert {:ok, second_ref} = Ferricstore.Store.BlobStore.put(root, 0, second_payload)
+
+    first_encoded_ref = Ferricstore.Store.BlobRef.encode!(first_ref)
+    second_encoded_ref = Ferricstore.Store.BlobRef.encode!(second_ref)
+
+    assert {:ok, [{first_offset, _}, {second_offset, _}]} =
+             Ferricstore.Bitcask.NIF.v2_append_batch(
+               path,
+               [
+                 {"batch-blob-first", first_encoded_ref, 0},
+                 {"batch-blob-second", second_encoded_ref, 0}
+               ]
+             )
+
+    state = %{
+      shard_data_path: root,
+      instance_ctx: %{data_dir: root, blob_side_channel_threshold_bytes: 64},
+      shard_index: 0
+    }
+
+    assert {:ok,
+            [
+              {:ok, ^second_payload, 22},
+              {:ok, ^first_payload, 11}
+            ]} =
+             ProjectionOps.read_source_locations(state, [
+               {"batch-blob-second", nil, 22, 0, second_offset},
+               {"batch-blob-first", nil, 11, 0, first_offset}
+             ])
+  end
+
+  @tag :source_batch
+  test "batch source reads reject malformed and oversized requests" do
+    assert {:error, {:invalid_source_read_request, nil}} =
+             ProjectionOps.read_source_locations(%{}, [nil])
+
+    assert {:error, :source_read_batch_limit_exceeded} =
+             ProjectionOps.read_source_locations(
+               %{},
+               List.duplicate({"batch-key", nil, 0, :deleted, 0}, 513)
+             )
+
+    oversized_key = :binary.copy("k", 64 * 1024 * 1024 - 63)
+
+    assert {:error, :source_read_batch_bytes_exceeded} =
+             ProjectionOps.read_source_locations(%{}, [{oversized_key, nil, 0, :deleted, 0}])
+  end
+
   test "Flow projection stores compact query metadata and its durable source locator" do
     root = tmp_lmdb_path("query_row_projection")
     path = Path.join(root, "query")

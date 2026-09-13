@@ -52,8 +52,10 @@ defmodule Ferricstore.Flow.LMDB.Cold do
     |> Enum.join(":")
   end
 
+  def due_prefix, do: "flow:due:v1:"
+
   def due_bucket_prefix(bucket_ms) when is_integer(bucket_ms) and bucket_ms >= 0 do
-    "flow:due:v1:" <> encode_u64(bucket_ms)
+    due_prefix() <> encode_u64(bucket_ms)
   end
 
   def due_type_bucket_prefix(bucket_ms, type)

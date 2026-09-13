@@ -371,6 +371,9 @@ defmodule Ferricstore.Store.BlobStore.Read do
       defp validate_segment_payload(payload, %BlobRef{}) when is_binary(payload),
         do: {:error, :size_mismatch}
 
+      defp validate_segment_payload(:eof, %BlobRef{size: 0} = ref),
+        do: validate_segment_payload("", ref)
+
       defp validate_segment_payload(:eof, %BlobRef{}), do: {:error, :enoent}
       defp validate_segment_payload(_payload, %BlobRef{}), do: {:error, :size_mismatch}
 
@@ -604,14 +607,6 @@ defmodule Ferricstore.Store.BlobStore.Read do
             error
         end
       end
-
-      @doc """
-      Recovers append-segment files by truncating the first partial or corrupt tail.
-
-      This is called lazily before the first append in a VM and is also public for
-      startup/lifecycle tests. Older valid records before the bad tail remain
-      readable.
-      """
     end
   end
 end

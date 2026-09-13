@@ -431,6 +431,78 @@ defmodule Ferricstore.Store.Router.Part07 do
         end
       end
 
+      defp flow_claim_due_any_empty_precheck(ctx, idx, attrs) do
+        with true <- flow_claim_due_empty_precheck_allowed?(ctx, idx),
+             {:ok, states} <- flow_claim_due_precheck_states(Map.get(attrs, :state)),
+             priority when is_integer(priority) <- Map.get(attrs, :priority),
+             {:ok, native} <- direct_flow_index_read(ctx, idx, & &1) do
+          type = Ferricstore.Flow.Keys.index_component(Map.fetch!(attrs, :type))
+
+          suffixes =
+            Enum.map(states, fn state ->
+              "}:d:" <>
+                type <>
+                ":" <>
+                Ferricstore.Flow.Keys.index_component(state) <>
+                ":p" <> Integer.to_string(priority)
+            end)
+
+          now_ms = flow_claim_due_precheck_now_ms(attrs)
+
+          with true <- flow_claim_due_any_hot_empty?(native, suffixes, now_ms),
+               true <- flow_claim_due_any_cold_empty?(ctx, idx, attrs),
+               # Promotion may publish a hot key and remove its cold row between
+               # the two reads. Recheck hot keys before accepting an empty result.
+               true <- flow_claim_due_any_hot_empty?(native, suffixes, now_ms) do
+            :empty
+          else
+            _ -> :unknown
+          end
+        else
+          _ -> :unknown
+        end
+      rescue
+        _ -> :unknown
+      catch
+        _kind, _reason -> :unknown
+      end
+
+      defp flow_claim_due_any_hot_empty?(native, suffixes, now_ms) do
+        # An incomplete page cannot prove absence. Never add an unbounded scan
+        # to a busy claim just to avoid writing an empty claim to Raft.
+        page_limit = 128
+
+        with keys when is_list(keys) <-
+               NativeFlowIndex.due_count_keys_page(native, nil, page_limit),
+             true <- length(keys) < page_limit do
+          matching_keys = Enum.filter(keys, &String.ends_with?(&1, suffixes))
+          NativeFlowIndex.due_keys_present(native, matching_keys, now_ms) == []
+        else
+          _ -> false
+        end
+      end
+
+      defp flow_claim_due_any_cold_empty?(ctx, idx, attrs) do
+        if Map.get(attrs, :cold_due_mode) == :skip or not Ferricstore.Flow.Hibernation.enabled?() do
+          true
+        else
+          # One prefix seek is sufficient to prove there is no cold work. Any
+          # cold row conservatively falls back to the authoritative claim path.
+          with path when is_binary(path) <- flow_claim_due_cold_precheck_path(ctx, idx),
+               true <- Ferricstore.FS.dir?(path),
+               {:ok, []} <-
+                 Ferricstore.Flow.LMDB.prefix_entries_initialized(
+                   path,
+                   Ferricstore.Flow.LMDB.cold_due_prefix(),
+                   1
+                 ) do
+            true
+          else
+            _ -> false
+          end
+        end
+      end
+
       defp flow_claim_due_empty_precheck(ctx, idx, type, state, priority, partition_key, attrs) do
         with true <- flow_claim_due_empty_precheck_allowed?(ctx, idx),
              {:ok, due_keys} <- flow_claim_due_precheck_keys(type, state, priority, partition_key),
@@ -981,7 +1053,13 @@ defmodule Ferricstore.Store.Router.Part07 do
         key = "f:{flow-claim-any-" <> Integer.to_string(idx) <> "}:d"
         shard_attrs = Map.put(attrs, :limit, shard_limit)
 
-        case raft_write(ctx, idx, key, {:flow_claim_due, key, shard_attrs}) do
+        result =
+          case flow_claim_due_any_empty_precheck(ctx, idx, shard_attrs) do
+            :empty -> {:ok, []}
+            :unknown -> raft_write(ctx, idx, key, {:flow_claim_due, key, shard_attrs})
+          end
+
+        case result do
           {:ok, records} when is_list(records) ->
             record_count = length(records)
 

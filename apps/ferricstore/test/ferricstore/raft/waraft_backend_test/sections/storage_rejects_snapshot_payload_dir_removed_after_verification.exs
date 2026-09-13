@@ -15,6 +15,68 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageRejectsSnapshotPayl
       alias Ferricstore.Raft.WARaftBackendTest.LabelCounter
       alias Ferricstore.Raft.WARaftBackendTest.OversizedLabel
 
+      @tag :snapshot_post_swap_recovery
+      test "startup rolls back a snapshot rejected during post-swap state reconstruction", %{
+        root: root,
+        ctx: ctx
+      } do
+        assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+        assert :ok = WARaftBackend.write(0, {:put, "snapshot:post-swap:sentinel", "original", 0})
+        assert {:ok, old_position} = WARaftBackend.storage_position(0)
+        assert :ok = WARaftBackend.stop()
+
+        snapshot_path = Path.join(root, "snapshot-post-swap-failure")
+        File.mkdir_p!(Path.join(snapshot_path, "data"))
+        # Valid directory contents are staged, but shard reconstruction rejects
+        # this ambiguous numeric log name after the live directory has swapped.
+        File.write!(Path.join([snapshot_path, "data", "0.log"]), "invalid snapshot")
+        position = {:raft_log_pos, 100, 1}
+
+        File.write!(
+          Path.join(snapshot_path, "ferricstore_snapshot.term"),
+          :erlang.term_to_binary(%{
+            version: 1,
+            position: position,
+            label: nil,
+            config: nil,
+            apply_context: ctx.apply_context,
+            payload_dirs: [:data]
+          })
+        )
+
+        root_dir = Path.join([root, "waraft", "ferricstore_waraft_backend.1"])
+
+        handle = %{
+          ctx: ctx,
+          shard_index: 0,
+          root_dir: root_dir,
+          sm_state: nil,
+          position: old_position,
+          label: nil,
+          config: nil
+        }
+
+        assert_raise RuntimeError, ~r/noncanonical/, fn ->
+          WARaftStorage.open_snapshot(snapshot_path, position, handle)
+        end
+
+        assert File.exists?(Path.join(root_dir, "snapshot_install.term"))
+
+        FerricStore.Instance.cleanup(ctx.name)
+        recovered_ctx = build_ctx(root)
+        on_exit(fn -> FerricStore.Instance.cleanup(recovered_ctx.name) end)
+
+        assert :ok =
+                 WARaftBackend.start(recovered_ctx,
+                   log_module: :ferricstore_waraft_spike_segment_log,
+                   bootstrap: false
+                 )
+
+        assert "original" == Router.get(recovered_ctx, "snapshot:post-swap:sentinel")
+        refute File.exists?(Path.join(root_dir, "snapshot_install.term"))
+        refute File.exists?(Path.join([root, "shard_0", "0.log"]))
+      end
+
       @tag :snapshot_swap_phase_durability
       test "snapshot install syncs rollback backups before promoting staged payload", %{
         root: root,

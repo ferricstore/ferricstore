@@ -153,24 +153,71 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert File.lstat!(marker_path).type == :regular
   end
 
-  test "recover_shard invalidates cached append offsets after truncating a corrupt record", %{
+  test "recover_shard refuses to truncate interior corruption and preserves later blobs", %{
     root: root
   } do
+    first_payload = "first-payload"
+    middle_payload = "middle-payload"
+    last_payload = "last-payload"
+
+    assert {:ok, [first_ref, middle_ref, last_ref]} =
+             BlobStore.put_many(root, 0, [first_payload, middle_payload, last_payload])
+
+    middle_header_offset = middle_ref.offset - 48
+    overwrite_segment_payload!(root, 0, middle_ref, "broken-payload")
+    assert {:ok, {segment_path, _offset, _size}} = BlobStore.file_ref(root, 0, first_ref)
+    before_recovery = File.read!(segment_path)
+
+    assert {:ok, ^last_payload} = BlobStore.get(root, 0, last_ref)
+
+    assert {:error, {:corrupt_blob_segment, ^segment_path, ^middle_header_offset}} =
+             BlobStore.recover_shard(root, 0)
+
+    assert File.read!(segment_path) == before_recovery
+    assert {:ok, ^first_payload} = BlobStore.get(root, 0, first_ref)
+    assert {:error, :checksum_mismatch} = BlobStore.get(root, 0, middle_ref)
+    assert {:ok, ^last_payload} = BlobStore.get(root, 0, last_ref)
+  end
+
+  test "recover_shard refuses to truncate a corrupt final active record", %{root: root} do
     first_payload = :binary.copy("a", 128)
-    second_payload = :binary.copy("b", 128)
-    third_payload = :binary.copy("c", 128)
+    last_payload = :binary.copy("b", 128)
 
     assert {:ok, first_ref} = BlobStore.put(root, 0, first_payload)
-    assert {:ok, second_ref} = BlobStore.put(root, 0, second_payload)
-    overwrite_segment_payload!(root, 0, second_ref, :binary.copy("x", 128))
+    assert {:ok, last_ref} = BlobStore.put(root, 0, last_payload)
+    last_header_offset = last_ref.offset - 48
+    overwrite_segment_payload!(root, 0, last_ref, :binary.copy("x", 128))
+    assert {:ok, {segment_path, _offset, _size}} = BlobStore.file_ref(root, 0, first_ref)
+    before_recovery = File.read!(segment_path)
 
-    assert {:ok, %{truncated_segments: 1}} = BlobStore.recover_shard(root, 0)
+    assert {:error, {:corrupt_blob_segment, ^segment_path, ^last_header_offset}} =
+             BlobStore.recover_shard(root, 0)
+
+    assert File.read!(segment_path) == before_recovery
     assert {:ok, ^first_payload} = BlobStore.get(root, 0, first_ref)
-    assert {:error, _reason} = BlobStore.get(root, 0, second_ref)
+    assert {:error, :checksum_mismatch} = BlobStore.get(root, 0, last_ref)
 
-    assert {:ok, third_ref} = BlobStore.put(root, 0, third_payload)
-    assert third_ref.offset == second_ref.offset
-    assert {:ok, ^third_payload} = BlobStore.get(root, 0, third_ref)
+    assert {:error, {:corrupt_blob_segment, ^segment_path, ^last_header_offset}} =
+             BlobStore.put(root, 0, :binary.copy("c", 128))
+
+    assert File.read!(segment_path) == before_recovery
+  end
+
+  test "recover_shard refuses to truncate when segment scanning returns an I/O error", %{
+    root: root
+  } do
+    assert {:ok, ref} = BlobStore.put(root, 0, :binary.copy("payload", 32))
+    segment_path = BlobRef.path(root, 0, ref)
+    before_recovery = File.read!(segment_path)
+
+    Process.put(:ferricstore_blob_store_open_recovery_hook, fn path, _modes ->
+      File.open(path, [:append, :raw, :binary])
+    end)
+
+    on_exit(fn -> Process.delete(:ferricstore_blob_store_open_recovery_hook) end)
+
+    assert {:error, :ebadf} = BlobStore.recover_shard(root, 0)
+    assert File.read!(segment_path) == before_recovery
   end
 
   test "get and verify reject corrupt segment headers even when payload bytes match", %{

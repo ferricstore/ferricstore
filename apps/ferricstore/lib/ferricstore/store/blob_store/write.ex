@@ -525,23 +525,32 @@ defmodule Ferricstore.Store.BlobStore.Write do
 
         case Map.get(held, key) do
           nil ->
-            :ok = acquire_blob_lock(key)
-            Process.put(@held_locks_key, Map.put(held, key, 1))
+            {:ok, stale_owner?} = acquire_blob_lock(key)
 
-            try do
-              fun.()
-            after
-              release_blob_lock(key)
+            if stale_owner? do
+              invalidate_blob_caches(data_dir, shard_index)
             end
+
+            Process.put(@held_locks_key, Map.put(held, key, 1))
+            run_with_blob_lock(data_dir, shard_index, key, fun)
 
           count when is_integer(count) and count > 0 ->
             Process.put(@held_locks_key, Map.put(held, key, count + 1))
+            run_with_blob_lock(data_dir, shard_index, key, fun)
+        end
+      end
 
-            try do
-              fun.()
-            after
-              release_blob_lock(key)
-            end
+      defp run_with_blob_lock(data_dir, shard_index, key, fun) do
+        try do
+          fun.()
+        catch
+          kind, reason ->
+            # A write can reach disk before a hook or NIF raises. Force the next
+            # owner through recovery so it cannot trust a stale append offset.
+            invalidate_blob_caches(data_dir, shard_index)
+            :erlang.raise(kind, reason, __STACKTRACE__)
+        after
+          release_blob_lock(key)
         end
       end
 
@@ -550,7 +559,7 @@ defmodule Ferricstore.Store.BlobStore.Write do
 
         case :ets.insert_new(@lock_table, {key, self()}) do
           true ->
-            :ok
+            {:ok, false}
 
           false ->
             wait_for_blob_lock(key)
@@ -562,15 +571,32 @@ defmodule Ferricstore.Store.BlobStore.Write do
           [{^key, holder}] when is_pid(holder) ->
             if Process.alive?(holder) do
               blob_lock_backoff()
+              acquire_blob_lock(key)
             else
-              :ets.select_delete(@lock_table, [{{key, holder}, [], [true]}])
+              # Replace the dead owner atomically. A delete followed by an
+              # insert would let another writer proceed with stale caches.
+              case :ets.select_replace(@lock_table, [
+                     {{key, holder}, [], [{:const, {key, self()}}]}
+                   ]) do
+                1 ->
+                  {:ok, true}
+
+                0 ->
+                  acquire_blob_lock(key)
+              end
             end
 
           _other ->
-            :ok
+            acquire_blob_lock(key)
         end
+      end
 
-        acquire_blob_lock(key)
+      defp invalidate_blob_caches(data_dir, shard_index) do
+        clear_active_segment_cache(data_dir, shard_index)
+        clear_segment_dir_cache(data_dir, shard_index)
+        ensure_recovery_table()
+        :ets.delete(@recovery_table, {data_dir, shard_index})
+        :ok
       end
 
       defp release_blob_lock(key) do

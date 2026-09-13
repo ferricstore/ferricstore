@@ -23,11 +23,23 @@ Compile:
 mix compile
 ```
 
-Run the server locally:
+Run the development server locally:
 
 ```bash
-MIX_ENV=prod FERRICSTORE_DATA_DIR=/tmp/ferricstore mix run --no-halt
+mix run --no-halt scripts/run_dev.exs
 ```
+
+The launcher prints the actual native, dashboard, and health-probe endpoints
+and the data directory. Linked Git worktrees use checkout-local data and
+OS-assigned ports, so they can run beside the main checkout. The ports can
+change after a restart; use the printed endpoints when configuring SDKs or
+browser checks. Tests use separate temporary data directories and ephemeral
+ports for each run.
+
+Do not share a data directory, build directory, or native build output between
+running checkouts. Explicit endpoint or data-directory overrides are your
+responsibility to keep distinct. Production release configuration is separate
+from these development defaults.
 
 Build a release:
 

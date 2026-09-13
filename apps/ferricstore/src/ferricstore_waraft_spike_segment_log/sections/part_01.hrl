@@ -110,9 +110,11 @@ cached_config(Log) ->
     case {last_index(Log), persistent_term:get(latest_config_cache_key(Dir), undefined)} of
         {Last, {Index, Config}} when is_integer(Last), is_integer(Index), Index =< Last ->
             {ok, Index, Config};
-        {Last, {not_found, CoveredLast}}
-          when is_integer(Last), is_integer(CoveredLast), Last =< CoveredLast ->
-            none_cached;
+        {Last, {not_found, Watermark}} when is_integer(Last), is_reference(Watermark) ->
+            case Last =< atomics:get(Watermark, 1) of
+                true -> none_cached;
+                false -> not_found
+            end;
         _Other ->
             not_found
     end.
@@ -165,10 +167,22 @@ cache_latest_config_not_found(Dir, Last) when is_integer(Last) ->
     case persistent_term:get(CacheKey, undefined) of
         {ExistingIndex, _ExistingConfig} when is_integer(ExistingIndex) ->
             ok;
-        {not_found, ExistingLast} when is_integer(ExistingLast), ExistingLast >= Last ->
-            ok;
+        {not_found, Watermark} when is_reference(Watermark) ->
+            advance_config_miss_watermark(Watermark, atomics:get(Watermark, 1), Last);
         _Other ->
-            persistent_term:put(CacheKey, {not_found, Last})
+            %% The reference is stable for this cache lifetime. Replacing a tuple
+            %% on every ordinary append causes VM-wide literal collection.
+            Watermark = atomics:new(1, [{signed, false}]),
+            atomics:put(Watermark, 1, Last),
+            persistent_term:put(CacheKey, {not_found, Watermark})
+    end.
+
+advance_config_miss_watermark(_Watermark, Existing, Last) when Existing >= Last ->
+    ok;
+advance_config_miss_watermark(Watermark, Existing, Last) ->
+    case atomics:compare_exchange(Watermark, 1, Existing, Last) of
+        ok -> ok;
+        Actual -> advance_config_miss_watermark(Watermark, Actual, Last)
     end.
 
 cache_latest_config_not_found_if_missing(_Dir, undefined) ->
@@ -213,10 +227,14 @@ restore_latest_config_cache(Dir, {Index, Config}, Last)
     %% append rescan disk until a new config entry is appended.
     persistent_term:put(latest_config_cache_key(Dir), {Index, Config}),
     restored;
-restore_latest_config_cache(Dir, {not_found, CoveredLast}, Last)
-  when is_integer(CoveredLast), is_integer(Last), Last =< CoveredLast ->
-    persistent_term:put(latest_config_cache_key(Dir), {not_found, CoveredLast}),
-    restored;
+restore_latest_config_cache(Dir, {not_found, Watermark}, Last)
+  when is_reference(Watermark), is_integer(Last) ->
+    case Last =< atomics:get(Watermark, 1) of
+        true ->
+            persistent_term:put(latest_config_cache_key(Dir), {not_found, Watermark}),
+            restored;
+        false -> not_restored
+    end;
 restore_latest_config_cache(_Dir, _Previous, _Last) ->
     not_restored.
 

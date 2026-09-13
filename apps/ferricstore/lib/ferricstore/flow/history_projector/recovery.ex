@@ -5,7 +5,9 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
   alias Ferricstore.Flow.HistoryProjectedIndex
   alias Ferricstore.Flow.HistoryProjector
   alias Ferricstore.Flow.HistoryProjector.KeyCodec
+  alias Ferricstore.Flow.HistoryProjector.Keydir
   alias Ferricstore.Flow.HistoryProjector.Log
+  alias Ferricstore.Flow.HistoryProjector.Trim
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.Locator
   alias Ferricstore.Flow.Query.QueryRowCodec
@@ -14,15 +16,19 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
   @max_exact_integer 9_007_199_254_740_991
+  @tombstone_batch_size 4_096
 
   def recover_history_log(instance_ctx, shard_index, shard_data_path, keydir_override) do
     file_path = HistoryProjector.history_file_path(shard_data_path, 0)
+    keydir = keydir_override || HistoryProjector.keydir(instance_ctx, shard_index)
+    recovery_ctx = {instance_ctx, shard_index, shard_data_path, keydir}
 
-    case Log.reduce_metadata_pages(file_path, {:ok, %{}}, &accumulate_live_history_record/2) do
-      {:ok, {:ok, live_records}} ->
-        keydir = keydir_override || HistoryProjector.keydir(instance_ctx, shard_index)
-
-        with {:ok, {entries, locations}} <-
+    case Log.reduce_metadata_pages(file_path, {:ok, %{}, %{}}, fn record, acc ->
+           recover_history_record(record, acc, recovery_ctx)
+         end) do
+      {:ok, {:ok, live_records, tombstones}} ->
+        with :ok <- delete_recovered_tombstones(tombstones, recovery_ctx),
+             {:ok, {entries, locations}} <-
                recovered_history_entries(live_records, keydir, shard_data_path),
              :ok <-
                HistoryProjector.publish_lmdb_history_locations(
@@ -61,6 +67,57 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
 
   def live_history_records(records) do
     Enum.reduce(records, {:ok, %{}}, &accumulate_live_history_record/2)
+  end
+
+  defp recover_history_record(_record, {:error, _reason} = error, _ctx), do: error
+
+  defp recover_history_record(record, {:ok, live_records, tombstones}, ctx) do
+    with {:ok, live_records} <- accumulate_live_history_record(record, {:ok, live_records}) do
+      tombstones =
+        case record do
+          {key, _offset, _size, _expiry, true} ->
+            case KeyCodec.parse_history_entry_key(key) do
+              {:ok, history_key, event_id, _event_ms} ->
+                Map.put(tombstones, key, {history_key, event_id, key})
+
+              :error ->
+                tombstones
+            end
+
+          _live ->
+            tombstones
+        end
+
+      if map_size(tombstones) >= @tombstone_batch_size do
+        with :ok <- delete_recovered_tombstones(tombstones, ctx) do
+          {:ok, live_records, %{}}
+        end
+      else
+        {:ok, live_records, tombstones}
+      end
+    end
+  end
+
+  defp delete_recovered_tombstones(tombstones, _ctx) when map_size(tombstones) == 0, do: :ok
+
+  defp delete_recovered_tombstones(
+         tombstones,
+         {instance_ctx, shard_index, shard_data_path, keydir}
+       ) do
+    # Replay durable deletes into derived views in bounded batches. A later
+    # live record for the same event is republished after the scan completes.
+    items = Map.values(tombstones)
+
+    with :ok <- Trim.delete_lmdb_history_entries(shard_data_path, items) do
+      Trim.evict_hot_history_items(
+        items,
+        instance_ctx,
+        shard_index,
+        keydir,
+        Trim.history_native_index(instance_ctx, shard_index, items),
+        %{delete_keydir_row: &Keydir.delete_keydir_row/4}
+      )
+    end
   end
 
   defp accumulate_live_history_record(_record, {:error, _reason} = error), do: error

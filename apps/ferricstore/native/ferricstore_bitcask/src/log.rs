@@ -20,4 +20,5 @@ mod tests {
     include!("sections/log_tests_part_01.rs");
     include!("sections/log_tests_part_02.rs");
     include!("sections/log_tests_part_03.rs");
+    include!("sections/log_tests_part_04.rs");
 }

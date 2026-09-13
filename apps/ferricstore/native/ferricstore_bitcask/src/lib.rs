@@ -72,6 +72,7 @@ pub mod io_backend;
 pub mod log;
 mod path_open;
 pub mod prob_txn;
+mod system_capacity;
 pub mod tdigest;
 pub mod topk;
 pub mod tracking_alloc;

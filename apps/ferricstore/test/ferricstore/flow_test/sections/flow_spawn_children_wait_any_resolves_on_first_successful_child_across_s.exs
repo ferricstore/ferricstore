@@ -517,6 +517,173 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstS
         assert :counters.get(ctx.write_version, shard_index + 1) > before_claim
       end
 
+      @tag :idle_claim
+      test "all-partition claims avoid Raft writes for an empty type without hiding newly due work" do
+        ctx = FerricStore.Instance.get(:default)
+        type = uid("empty-any")
+        versions = fn -> for i <- 1..ctx.shard_count, do: :counters.get(ctx.write_version, i) end
+
+        assert {:ok, _} =
+                 flow_create_and_get(uid("unrelated"),
+                   type: type <> "-other",
+                   state: "queued",
+                   partition_key: "other",
+                   run_at_ms: 1_000,
+                   now_ms: 1_000
+                 )
+
+        before_empty = versions.()
+
+        opts = [
+          partition_key: :any,
+          state: "queued",
+          worker: "idle-check",
+          lease_ms: 30_000,
+          limit: 8,
+          now_ms: 1_000,
+          reclaim_expired: false
+        ]
+
+        for _ <- 1..3, do: assert({:ok, []} = FerricStore.flow_claim_due(type, opts))
+        assert versions.() == before_empty
+
+        id = uid("newly-due")
+
+        assert {:ok, _} =
+                 flow_create_and_get(id,
+                   type: type,
+                   state: "queued",
+                   partition_key: "new-partition",
+                   run_at_ms: 1_000,
+                   now_ms: 1_000
+                 )
+
+        assert {:ok, [%{id: ^id}]} = FerricStore.flow_claim_due(type, opts)
+      end
+
+      @tag :idle_claim
+      test "all-partition empty precheck respects future deadlines and encoded type boundaries" do
+        ctx = FerricStore.Instance.get(:default)
+        type = uid("any:deadline:p0}")
+        id = uid("future-any")
+
+        assert {:ok, _} =
+                 flow_create_and_get(id,
+                   type: type,
+                   state: "wait:ing",
+                   partition_key: "p:one",
+                   run_at_ms: 1_100,
+                   now_ms: 1_000
+                 )
+
+        opts = [
+          partition_key: :any,
+          state: "wait:ing",
+          worker: "future-check",
+          lease_ms: 30_000,
+          limit: 1,
+          reclaim_expired: false
+        ]
+
+        before_empty = for i <- 1..ctx.shard_count, do: :counters.get(ctx.write_version, i)
+        assert {:ok, []} = FerricStore.flow_claim_due(type, Keyword.put(opts, :now_ms, 1_000))
+
+        assert for(i <- 1..ctx.shard_count, do: :counters.get(ctx.write_version, i)) ==
+                 before_empty
+
+        assert {:ok, [%{id: ^id}]} =
+                 FerricStore.flow_claim_due(type, Keyword.put(opts, :now_ms, 1_100))
+      end
+
+      @tag :idle_claim
+      test "all-partition empty precheck falls back when its bounded catalog page is full" do
+        ctx = FerricStore.Instance.get(:default)
+        type = "zz-" <> uid("page-target")
+        partition = uid("page-partition")
+        id = uid("page-target")
+
+        assert {:ok, _} =
+                 flow_create_and_get(id,
+                   type: type,
+                   state: "queued",
+                   partition_key: partition,
+                   run_at_ms: 1_000,
+                   now_ms: 1_000
+                 )
+
+        idx =
+          Ferricstore.Store.Router.shard_for(ctx, Ferricstore.Flow.Keys.state_key(id, partition))
+
+        {index, lookup} = Ferricstore.Flow.NativeOrderedIndex.table_names(ctx.name, idx)
+        native = Ferricstore.Flow.NativeOrderedIndex.get(index, lookup)
+
+        keys =
+          for i <- 1..128,
+              do: Ferricstore.Flow.Keys.due_key("aa-filler-#{i}", "queued", 0, partition)
+
+        try do
+          for key <- keys,
+              do: Ferricstore.Flow.NativeOrderedIndex.put_member(native, key, "filler", 1_000)
+
+          assert {:ok, [%{id: ^id}]} =
+                   FerricStore.flow_claim_due(type,
+                     partition_key: :any,
+                     state: "queued",
+                     worker: "page-check",
+                     lease_ms: 30_000,
+                     limit: 1,
+                     now_ms: 1_000,
+                     reclaim_expired: false
+                   )
+        after
+          for key <- keys,
+              do: Ferricstore.Flow.NativeOrderedIndex.delete_member(native, key, "filler")
+        end
+      end
+
+      @tag :idle_claim
+      test "all-partition empty precheck does not hide hibernated work" do
+        ctx = FerricStore.Instance.get(:default)
+        type = uid("cold-any")
+        id = uid("cold-any")
+        now_ms = System.system_time(:millisecond)
+        run_at = now_ms + 301_000
+
+        assert {:ok, _} =
+                 flow_create_and_get(id,
+                   type: type,
+                   state: "waiting",
+                   partition_key: "cold-any",
+                   run_at_ms: run_at,
+                   now_ms: now_ms
+                 )
+
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+        state_key = Ferricstore.Flow.Keys.state_key(id, "cold-any")
+        idx = Ferricstore.Store.Router.shard_for(ctx, state_key)
+
+        path =
+          ctx.data_dir |> Ferricstore.DataDir.shard_data_path(idx) |> Ferricstore.Flow.LMDB.path()
+
+        assert {:ok, [_ | _]} =
+                 Ferricstore.Flow.LMDB.prefix_entries_initialized(
+                   path,
+                   Ferricstore.Flow.LMDB.cold_due_prefix(),
+                   1
+                 )
+
+        assert {:ok, [%{id: ^id}]} =
+                 FerricStore.flow_claim_due(type,
+                   partition_key: :any,
+                   state: "waiting",
+                   worker: "cold-check",
+                   lease_ms: 30_000,
+                   limit: 1,
+                   now_ms: run_at,
+                   reclaim_expired: false
+                 )
+      end
+
       test "flow_claim_due skips Raft writes when all selected partition keys are empty" do
         ctx = FerricStore.Instance.get(:default)
         type = uid("flow-empty-claim-many")

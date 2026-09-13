@@ -86,6 +86,10 @@ defmodule Ferricstore.Flow.SchedulerTest do
   end
 
   test "a scheduler waiting on an empty store wakes for a newly-created future schedule" do
+    ctx = FerricStore.Instance.get(:default)
+    versions = fn -> for i <- 1..ctx.shard_count, do: :counters.get(ctx.write_version, i) end
+    before_idle = versions.()
+
     {:ok, scheduler} =
       Scheduler.start_link(
         name: nil,
@@ -107,6 +111,9 @@ defmodule Ferricstore.Flow.SchedulerTest do
              interval: 25
            ),
            "scheduler did not register a waiter; state: #{inspect(scheduler_state(scheduler), limit: 10)}"
+
+    assert versions.() == before_idle,
+           "registering an idle scheduler must not append empty claims to every Raft shard"
 
     now_ms = Ferricstore.CommandTime.now_ms()
     schedule_id = unique_flow_id("scheduler-future")

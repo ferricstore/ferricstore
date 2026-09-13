@@ -3,6 +3,78 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest.Sections.SegmentLogCapsEtsTailWh
 
   defmacro __using__(_opts) do
     quote do
+      @tag :config_cache_idle
+      test "config misses advance without replacing the global cache on ordinary appends" do
+        with_segment_log_memory_env(
+          max_bytes: 1_000,
+          max_entries: 1,
+          min_entries: 1,
+          records_per_segment: 64,
+          fun: fn _root, log, _log_name ->
+            provider = :ferricstore_waraft_spike_segment_log
+            assert :ok = provider.init(log)
+            assert {:ok, state} = provider.open(log)
+            dir = :wa_raft_part_sup.registered_partition_path(elem(log, 3), elem(log, 4))
+            cache_key = {provider, :latest_config, :filename.join(dir, ~c"segment_log")}
+
+            try do
+              assert :ok =
+                       provider.append(
+                         {:log_view, log, 0, 0, :undefined},
+                         [{1, {:cmd, "first"}}],
+                         :strict,
+                         :low
+                       )
+
+              assert :not_found = provider.config(log)
+              cached = :persistent_term.get(cache_key)
+
+              for index <- 2..20 do
+                assert :ok =
+                         provider.append(
+                           {:log_view, log, 1, index - 1, :undefined},
+                           [{1, {:cmd, "next"}}],
+                           :strict,
+                           :low
+                         )
+
+                assert :not_found = provider.config(log)
+
+                assert :persistent_term.get(cache_key) == cached,
+                       "ordinary appends must not replace persistent_term and trigger global literal collection"
+              end
+
+              assert {:ok, _} = provider.truncate(log, 10, state)
+              assert :not_found = provider.config(log)
+              config = %{version: 1, membership: [{:peer, node()}]}
+
+              assert :ok =
+                       provider.append(
+                         {:log_view, log, 1, 9, :undefined},
+                         [{1, {:cmd, {:config, config}}}],
+                         :strict,
+                         :low
+                       )
+
+              assert {:ok, 10, ^config} = provider.config(log)
+
+              assert :ok = provider.close(log, state)
+              assert {:ok, _} = provider.open(log)
+              assert {:ok, 10, ^config} = provider.config(log)
+              assert {:ok, _} = provider.truncate(log, 10, state)
+              assert :not_found = provider.config(log)
+              assert {:ok, _} = provider.reset(log, {:raft_log_pos, 30, 2}, state)
+              assert :not_found = provider.config(log)
+              assert :ok = provider.close(log, state)
+              assert {:ok, _} = provider.open(log)
+              assert :not_found = provider.config(log)
+            after
+              provider.close(log, state)
+            end
+          end
+        )
+      end
+
       @tag :waraft_noncanonical_append_entry
       test "segment log rejects noncanonical binary append entries" do
         with_segment_log_memory_env(

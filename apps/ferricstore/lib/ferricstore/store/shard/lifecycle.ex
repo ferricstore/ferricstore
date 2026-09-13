@@ -91,6 +91,30 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     end
   end
 
+  # The default WARaft projection rebuilds its keydir outside this recovery
+  # scan, so repair its active log before any append writer observes EOF. The
+  # caller must pass the highest (still appendable) log; sealed logs are never
+  # repaired here.
+  @spec recover_active_file_tail(binary(), non_neg_integer()) :: non_neg_integer()
+  @doc false
+  def recover_active_file_tail(log_path, shard_index) do
+    case NIF.v2_recover_torn_tail(log_path) do
+      {:ok, size} when is_integer(size) and size >= 0 ->
+        size
+
+      {:error, reason} ->
+        fail_recovery_scan!(:recover_active_file_tail, log_path, shard_index, reason)
+
+      other ->
+        fail_recovery_scan!(
+          :recover_active_file_tail,
+          log_path,
+          shard_index,
+          {:unexpected, other}
+        )
+    end
+  end
+
   # Recovers the ETS keydir from hint files or by scanning log files.
   # Uses last-writer-wins semantics (higher file_id + higher offset wins).
   @spec recover_keydir(binary(), :ets.tid(), non_neg_integer(), term()) :: :ok
@@ -115,13 +139,16 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
           |> Enum.filter(&regular_hint_file?(shard_path, &1))
           |> Enum.sort_by(&hint_file_id/1)
 
+        active_log_name = List.last(log_files)
+
         recover_from_hints_or_logs(
           shard_path,
           keydir,
           shard_index,
           log_files,
           hint_files,
-          instance_ctx
+          instance_ctx,
+          active_log_name
         )
 
         BinaryAccounting.rebuild(keydir, shard_index, instance_ctx)
@@ -162,11 +189,18 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   @spec recover_from_log(binary(), binary(), :ets.tid(), non_neg_integer(), term()) :: :ok
   @doc false
   def recover_from_log(shard_path, log_name, keydir, shard_index, instance_ctx \\ nil) do
-    recover_log_records(shard_path, log_name, keydir, shard_index, instance_ctx)
+    recover_log_records(shard_path, log_name, keydir, shard_index, instance_ctx, false)
     BinaryAccounting.rebuild(keydir, shard_index, instance_ctx)
   end
 
-  defp recover_log_records(shard_path, log_name, keydir, shard_index, instance_ctx) do
+  defp recover_log_records(
+         shard_path,
+         log_name,
+         keydir,
+         shard_index,
+         instance_ctx,
+         repair_tail?
+       ) do
     log_path = Path.join(shard_path, log_name)
     fid = log_name |> String.trim_trailing(".log") |> String.to_integer()
 
@@ -177,7 +211,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
       shard_index,
       fid,
       instance_ctx,
-      :recover_from_log
+      :recover_from_log,
+      repair_tail?
     )
   end
 
@@ -187,7 +222,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
          keydir,
          shard_index,
          offset,
-         instance_ctx
+         instance_ctx,
+         repair_tail?
        ) do
     log_path = Path.join(shard_path, log_name)
     fid = log_file_id(log_name)
@@ -199,7 +235,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
       shard_index,
       fid,
       instance_ctx,
-      :recover_from_log_from_offset
+      :recover_from_log_from_offset,
+      repair_tail?
     )
   end
 
@@ -210,7 +247,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
          shard_index,
          fid,
          instance_ctx,
-         operation
+         operation,
+         repair_tail?
        ) do
     page_size = recovery_scan_page_size()
 
@@ -222,7 +260,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
       shard_index,
       fid,
       instance_ctx,
-      operation
+      operation,
+      repair_tail?
     )
   end
 
@@ -234,7 +273,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
          shard_index,
          fid,
          instance_ctx,
-         operation
+         operation,
+         repair_tail?
        ) do
     case NIF.v2_scan_file_page(log_path, offset, page_size) do
       {:ok, records, next_offset, done?} ->
@@ -250,6 +290,12 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
 
         cond do
           done? ->
+            if repair_tail? do
+              repair_active_tail_if_needed!(log_path, next_offset, shard_index, operation)
+            else
+              reject_sealed_tail_if_needed!(log_path, next_offset, shard_index, operation)
+            end
+
             :ok
 
           is_integer(next_offset) and next_offset > offset ->
@@ -261,7 +307,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
               shard_index,
               fid,
               instance_ctx,
-              operation
+              operation,
+              repair_tail?
             )
 
           true ->
@@ -528,9 +575,24 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     end
   end
 
-  defp recover_from_hints_or_logs(shard_path, keydir, shard_index, log_files, [], instance_ctx) do
+  defp recover_from_hints_or_logs(
+         shard_path,
+         keydir,
+         shard_index,
+         log_files,
+         [],
+         instance_ctx,
+         active_log_name
+       ) do
     Enum.each(log_files, fn log_name ->
-      recover_log_records(shard_path, log_name, keydir, shard_index, instance_ctx)
+      recover_log_records(
+        shard_path,
+        log_name,
+        keydir,
+        shard_index,
+        instance_ctx,
+        log_name == active_log_name
+      )
     end)
   end
 
@@ -540,7 +602,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
          shard_index,
          log_files,
          hint_files,
-         instance_ctx
+         instance_ctx,
+         active_log_name
        ) do
     hint_by_fid =
       Map.new(hint_files, fn hint_name ->
@@ -566,23 +629,42 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
                 # Hint files contain live entries only. Scan tombstone metadata
                 # from the paired log so deletes still override older hints
                 # without reloading full values during startup.
-                recover_tombstones_from_log(
+                {:ok, validated_end} =
+                  recover_tombstones_from_log(
+                    shard_path,
+                    log_name,
+                    keydir,
+                    shard_index,
+                    instance_ctx,
+                    log_name == active_log_name
+                  )
+
+                # A hint may have captured physical size after a torn append.
+                Map.put(acc, fid, min(covered_offset, validated_end))
+
+              {:error, _fid} ->
+                recover_log_records(
                   shard_path,
                   log_name,
                   keydir,
                   shard_index,
-                  instance_ctx
+                  instance_ctx,
+                  log_name == active_log_name
                 )
 
-                Map.put(acc, fid, covered_offset)
-
-              {:error, _fid} ->
-                recover_log_records(shard_path, log_name, keydir, shard_index, instance_ctx)
                 acc
             end
 
           :error ->
-            recover_log_records(shard_path, log_name, keydir, shard_index, instance_ctx)
+            recover_log_records(
+              shard_path,
+              log_name,
+              keydir,
+              shard_index,
+              instance_ctx,
+              log_name == active_log_name
+            )
+
             acc
         end
       end)
@@ -593,7 +675,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
       shard_index,
       log_files,
       hint_offsets,
-      instance_ctx
+      instance_ctx,
+      active_log_name
     )
   end
 
@@ -665,7 +748,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
          _shard_index,
          [],
          _hint_offsets,
-         _instance_ctx
+         _instance_ctx,
+         _active_log_name
        ),
        do: :ok
 
@@ -675,7 +759,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
          shard_index,
          log_files,
          hint_offsets,
-         instance_ctx
+         instance_ctx,
+         active_log_name
        ) do
     Enum.each(log_files, fn log_name ->
       fid = log_file_id(log_name)
@@ -688,7 +773,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
             keydir,
             shard_index,
             covered_offset,
-            instance_ctx
+            instance_ctx,
+            log_name == active_log_name
           )
 
         :error ->
@@ -705,7 +791,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
          keydir,
          shard_index,
          covered_offset,
-         instance_ctx
+         instance_ctx,
+         repair_tail?
        ) do
     log_path = Path.join(shard_path, log_name)
 
@@ -720,7 +807,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
           keydir,
           shard_index,
           covered_offset,
-          instance_ctx
+          instance_ctx,
+          repair_tail?
         )
 
       {:ok, %File.Stat{type: :regular, size: ^covered_offset}} ->
@@ -740,7 +828,14 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   defp log_file_id(name), do: name |> String.trim_trailing(".log") |> String.to_integer()
   defp hint_file_id(name), do: name |> String.trim_trailing(".hint") |> String.to_integer()
 
-  defp recover_tombstones_from_log(shard_path, log_name, keydir, shard_index, instance_ctx) do
+  defp recover_tombstones_from_log(
+         shard_path,
+         log_name,
+         keydir,
+         shard_index,
+         instance_ctx,
+         repair_tail?
+       ) do
     log_path = Path.join(shard_path, log_name)
     fid = log_file_id(log_name)
 
@@ -753,15 +848,29 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
            fid,
            instance_ctx
          ) do
-      :ok ->
-        :ok
+      {:ok, validated_end} ->
+        {:ok, validated_end}
 
       {:error, reason} ->
         Logger.warning(
           "Shard #{shard_index}: tombstone scan failed for #{log_path}: #{inspect(reason)}; falling back to full metadata scan"
         )
 
-        recover_tombstones_from_full_scan(log_path, keydir, shard_index, fid, instance_ctx)
+        # Invalidate before any repair: later appends could otherwise grow the
+        # file past an obsolete hint boundary and make it appear valid again.
+        case HintMetadata.prepare_publish(Path.rootname(log_path) <> ".hint", shard_path) do
+          :ok -> :ok
+          {:error, error} -> fail_recovery_scan!(:invalidate_hint, log_path, shard_index, error)
+        end
+
+        recover_tombstones_from_full_scan(
+          log_path,
+          keydir,
+          shard_index,
+          fid,
+          instance_ctx,
+          repair_tail?
+        )
     end
   end
 
@@ -782,7 +891,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
 
         cond do
           done? == true and is_integer(next_offset) and next_offset >= offset ->
-            :ok
+            {:ok, next_offset}
 
           done? == false and is_integer(next_offset) and next_offset > offset ->
             recover_tombstone_pages(
@@ -807,7 +916,14 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     end
   end
 
-  defp recover_tombstones_from_full_scan(log_path, keydir, shard_index, fid, instance_ctx) do
+  defp recover_tombstones_from_full_scan(
+         log_path,
+         keydir,
+         shard_index,
+         fid,
+         instance_ctx,
+         repair_tail?
+       ) do
     recover_tombstones_from_full_scan_pages(
       log_path,
       0,
@@ -815,7 +931,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
       keydir,
       shard_index,
       fid,
-      instance_ctx
+      instance_ctx,
+      repair_tail?
     )
   end
 
@@ -826,7 +943,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
          keydir,
          shard_index,
          fid,
-         instance_ctx
+         instance_ctx,
+         repair_tail?
        ) do
     case NIF.v2_scan_file_page(log_path, offset, page_size) do
       {:ok, records, next_offset, done?} ->
@@ -848,7 +966,23 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
 
         cond do
           done? ->
-            :ok
+            if repair_tail? do
+              repair_active_tail_if_needed!(
+                log_path,
+                next_offset,
+                shard_index,
+                :recover_tombstones_from_full_scan
+              )
+            else
+              reject_sealed_tail_if_needed!(
+                log_path,
+                next_offset,
+                shard_index,
+                :recover_tombstones_from_full_scan
+              )
+            end
+
+            {:ok, next_offset}
 
           is_integer(next_offset) and next_offset > offset ->
             recover_tombstones_from_full_scan_pages(
@@ -858,7 +992,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
               keydir,
               shard_index,
               fid,
-              instance_ctx
+              instance_ctx,
+              repair_tail?
             )
 
           true ->
@@ -895,6 +1030,76 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     )
 
     raise "#{operation} failed to scan #{log_path}: #{inspect(reason)}"
+  end
+
+  defp repair_active_tail_if_needed!(log_path, valid_end, shard_index, operation) do
+    case File.lstat(log_path) do
+      {:ok, %File.Stat{type: :regular, size: ^valid_end}} ->
+        :ok
+
+      {:ok, %File.Stat{type: :regular, size: size}} when size > valid_end ->
+        case NIF.v2_recover_torn_tail(log_path) do
+          {:ok, ^valid_end} ->
+            :ok
+
+          {:ok, recovered_end} ->
+            fail_recovery_scan!(
+              operation,
+              log_path,
+              shard_index,
+              {:recovery_boundary_changed, valid_end, recovered_end}
+            )
+
+          {:error, reason} ->
+            fail_recovery_scan!(operation, log_path, shard_index, reason)
+
+          other ->
+            fail_recovery_scan!(operation, log_path, shard_index, {:unexpected, other})
+        end
+
+      {:ok, %File.Stat{type: :regular, size: size}} ->
+        fail_recovery_scan!(
+          operation,
+          log_path,
+          shard_index,
+          {:scan_past_file_end, valid_end, size}
+        )
+
+      {:ok, %File.Stat{type: type}} ->
+        fail_recovery_scan!(operation, log_path, shard_index, {:unsafe_file_type, type})
+
+      {:error, reason} ->
+        fail_recovery_scan!(operation, log_path, shard_index, {:stat_failed, reason})
+    end
+  end
+
+  defp reject_sealed_tail_if_needed!(log_path, valid_end, shard_index, operation) do
+    case File.lstat(log_path) do
+      {:ok, %File.Stat{type: :regular, size: ^valid_end}} ->
+        :ok
+
+      {:ok, %File.Stat{type: :regular, size: size}} when size > valid_end ->
+        fail_recovery_scan!(
+          operation,
+          log_path,
+          shard_index,
+          {:torn_tail_in_sealed_log, valid_end, size}
+        )
+
+      {:ok, %File.Stat{type: :regular, size: size}} ->
+        fail_recovery_scan!(
+          operation,
+          log_path,
+          shard_index,
+          {:scan_past_file_end, valid_end, size}
+        )
+
+      {:ok, %File.Stat{type: type}} ->
+        fail_recovery_scan!(operation, log_path, shard_index, {:unsafe_file_type, type})
+
+      {:error, reason} ->
+        fail_recovery_scan!(operation, log_path, shard_index, {:stat_failed, reason})
+    end
   end
 
   defp recover_hint_tombstone(

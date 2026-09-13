@@ -5,7 +5,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   alias Ferricstore.Flow.{Keys, Locator, ProjectionLocator}
   alias Ferricstore.Flow.Query.{CompositeProjection, Limits, QueryRowCodec, SourceCatalog}
   alias Ferricstore.Raft.WARaftSegmentReader
-  alias Ferricstore.Store.BlobValue
+  alias Ferricstore.Store.{BlobValue, ColdRead}
 
   @default_source_pending_retries 100
   @default_source_pending_sleep_ms 1
@@ -15,6 +15,10 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   @min_composite_prefetch_records 2
   @max_composite_prefetch_records Limits.max_projection_page_records()
   @history_projection_page_size 1_024
+  @max_source_read_batch 512
+  @max_source_read_input_bytes 64 * 1024 * 1024
+  @source_read_input_overhead_bytes 64
+  @source_read_timeout_ms 10_000
   @terminal_states ["completed", "failed", "cancelled"]
 
   def expand_ops(state, []) do
@@ -895,6 +899,236 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     |> do_read_source_entry(key, pending_retries, pending_sleep_ms)
     |> without_source_location()
   end
+
+  @typedoc false
+  @type source_read_request ::
+          {binary(), term(), non_neg_integer(), term(), non_neg_integer()}
+
+  @typedoc false
+  @type source_read_batch_result ::
+          {:ok, term(), non_neg_integer()} | :not_found | {:error, term()}
+
+  @doc "Reads a bounded batch of source locations, preserving request order."
+  @spec read_source_locations(map(), [source_read_request()]) ::
+          {:ok, [source_read_batch_result()]} | {:error, term()}
+  def read_source_locations(state, requests) when is_map(state) and is_list(requests) do
+    cond do
+      length(requests) > @max_source_read_batch ->
+        {:error, :source_read_batch_limit_exceeded}
+
+      true ->
+        with :ok <- validate_source_read_requests(requests),
+             :ok <- validate_source_read_input_bytes(requests) do
+          try do
+            do_read_source_locations(state, requests)
+          rescue
+            error -> {:error, {:source_batch_read_failed, error}}
+          catch
+            kind, reason -> {:error, {:source_batch_read_failed, {kind, reason}}}
+          end
+        end
+    end
+  end
+
+  def read_source_locations(_state, _requests),
+    do: {:error, :invalid_source_read_batch}
+
+  defp validate_source_read_requests(requests) do
+    case Enum.find_index(requests, &(not valid_source_read_request?(&1))) do
+      nil -> :ok
+      index -> {:error, {:invalid_source_read_request, Enum.at(requests, index)}}
+    end
+  end
+
+  defp valid_source_read_request?({key, _cached_value, expire_at_ms, _file_id, offset})
+       when is_binary(key) and is_integer(expire_at_ms) and expire_at_ms >= 0 and
+              is_integer(offset) and offset >= 0,
+       do: true
+
+  defp valid_source_read_request?(_request), do: false
+
+  defp validate_source_read_input_bytes(requests) do
+    case Enum.reduce_while(requests, 0, fn {key, _cached_value, _expire_at_ms, _file_id, _offset},
+                                           total ->
+           next_total = total + byte_size(key) + @source_read_input_overhead_bytes
+
+           if next_total <= @max_source_read_input_bytes do
+             {:cont, next_total}
+           else
+             {:halt, :exceeded}
+           end
+         end) do
+      :exceeded -> {:error, :source_read_batch_bytes_exceeded}
+      _total -> :ok
+    end
+  end
+
+  defp do_read_source_locations(_state, []), do: {:ok, []}
+
+  defp do_read_source_locations(state, requests) do
+    indexed_requests = Enum.with_index(requests)
+
+    {bitcask_requests, other_requests} =
+      Enum.split_with(indexed_requests, fn
+        {{_key, _cached_value, _expire_at_ms, file_id, _offset}, _index} ->
+          is_integer(file_id) and file_id >= 0
+      end)
+
+    with {:ok, results} <- read_bitcask_source_locations(state, bitcask_requests, %{}),
+         {:ok, results} <- read_non_bitcask_source_locations(state, other_requests, results) do
+      {:ok, Enum.map(indexed_requests, fn {_request, index} -> Map.fetch!(results, index) end)}
+    end
+  end
+
+  defp read_bitcask_source_locations(_state, [], results), do: {:ok, results}
+
+  defp read_bitcask_source_locations(
+         %{shard_data_path: shard_data_path} = state,
+         indexed_requests,
+         results
+       )
+       when is_binary(shard_data_path) do
+    locations =
+      Enum.map(indexed_requests, fn
+        {{key, _cached_value, _expire_at_ms, file_id, offset}, _index} ->
+          {bitcask_file_path(shard_data_path, file_id), offset, key}
+      end)
+
+    case ColdRead.pread_batch_keyed(locations, @source_read_timeout_ms) do
+      {:ok, values} when is_list(values) and length(values) == length(indexed_requests) ->
+        materialize_bitcask_source_values(state, indexed_requests, values, results)
+
+      {:ok, values} when is_list(values) ->
+        {:error, {:source_batch_result_count_mismatch, length(indexed_requests), length(values)}}
+
+      {:error, reason} ->
+        {:error, {:source_batch_read_failed, reason}}
+    end
+  end
+
+  defp read_bitcask_source_locations(_state, _indexed_requests, _results),
+    do: {:error, :source_batch_context_unavailable}
+
+  defp materialize_bitcask_source_values(state, indexed_requests, values, results) do
+    {binary_entries, results} =
+      Enum.zip(indexed_requests, values)
+      |> Enum.reduce({[], results}, fn
+        {{{_key, _cached_value, expire_at_ms, _file_id, _offset}, index}, value},
+        {binary_entries, results}
+        when is_binary(value) ->
+          {[{index, expire_at_ms, value} | binary_entries], results}
+
+        {{{_key, _cached_value, _expire_at_ms, _file_id, _offset}, index}, nil},
+        {binary_entries, results} ->
+          {binary_entries, Map.put(results, index, :not_found)}
+
+        {{{_key, _cached_value, _expire_at_ms, _file_id, _offset}, index}, {:error, reason}},
+        {binary_entries, results} ->
+          {binary_entries, Map.put(results, index, {:error, reason})}
+
+        {{{_key, _cached_value, _expire_at_ms, _file_id, _offset}, index}, invalid},
+        {binary_entries, results} ->
+          {binary_entries,
+           Map.put(results, index, {:error, {:invalid_source_batch_value, invalid}})}
+      end)
+
+    binary_entries = Enum.reverse(binary_entries)
+    materialized = materialize_source_values(state, Enum.map(binary_entries, &elem(&1, 2)))
+
+    if length(materialized) != length(binary_entries) do
+      {:error,
+       {:source_batch_materialization_count_mismatch, length(binary_entries),
+        length(materialized)}}
+    else
+      results =
+        Enum.zip(binary_entries, materialized)
+        |> Enum.reduce(results, fn {{index, expire_at_ms, _value}, materialized_value}, results ->
+          result =
+            case materialized_value do
+              {:ok, value} -> {:ok, value, expire_at_ms}
+              {:error, reason} -> {:error, reason}
+              invalid -> {:error, {:invalid_source_materialization, invalid}}
+            end
+
+          Map.put(results, index, result)
+        end)
+
+      {:ok, results}
+    end
+  end
+
+  defp materialize_source_values(state, values) do
+    case state do
+      %{instance_ctx: ctx, shard_index: shard_index}
+      when is_map(ctx) and is_integer(shard_index) and shard_index >= 0 ->
+        BlobValue.maybe_materialize_many(
+          Map.get(ctx, :data_dir),
+          shard_index,
+          BlobValue.threshold(ctx),
+          values
+        )
+
+      _ ->
+        Enum.map(values, &{:ok, &1})
+    end
+  end
+
+  defp read_non_bitcask_source_locations(state, indexed_requests, results) do
+    Enum.reduce_while(indexed_requests, {:ok, results}, fn
+      {{key, cached_value, expire_at_ms, file_id, offset}, index}, {:ok, results} ->
+        result =
+          read_non_bitcask_source_location(
+            state,
+            key,
+            cached_value,
+            expire_at_ms,
+            file_id,
+            offset
+          )
+
+        {:cont, {:ok, Map.put(results, index, result)}}
+    end)
+  end
+
+  defp read_non_bitcask_source_location(
+         _state,
+         key,
+         _cached_value,
+         _expire_at_ms,
+         :pending,
+         _offset
+       ),
+       do: {:error, {:source_pending, key}}
+
+  defp read_non_bitcask_source_location(
+         _state,
+         _key,
+         _cached_value,
+         _expire_at_ms,
+         :deleted,
+         _offset
+       ),
+       do: :not_found
+
+  defp read_non_bitcask_source_location(state, key, cached_value, expire_at_ms, file_id, offset)
+       when is_tuple(file_id) do
+    read_source_location(state, key, cached_value, expire_at_ms, file_id, offset)
+  end
+
+  defp read_non_bitcask_source_location(
+         state,
+         _key,
+         cached_value,
+         expire_at_ms,
+         _file_id,
+         _offset
+       )
+       when is_binary(cached_value) do
+    source_read_result(state, {:ok, cached_value}, expire_at_ms)
+  end
+
+  defp read_non_bitcask_source_location(state, key, cached_value, expire_at_ms, file_id, offset),
+    do: read_source_location(state, key, cached_value, expire_at_ms, file_id, offset)
 
   defp read_source_flow(state, key) do
     {pending_retries, pending_sleep_ms} = source_pending_config()
