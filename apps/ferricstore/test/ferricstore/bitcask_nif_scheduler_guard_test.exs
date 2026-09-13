@@ -22,11 +22,13 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
     v2_pread_at
     v2_pread_batch
     v2_scan_file_page
+    v2_recover_torn_tail
     v2_scan_tombstones_page
     v2_scan_key_states
     v2_fsync
     v2_fsync_dir
     v2_available_disk_space
+    disk_capacity
     io_uring_available
   )
   @dirty_io_probabilistic_nifs ~w(

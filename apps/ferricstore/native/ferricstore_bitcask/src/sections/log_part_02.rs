@@ -1,3 +1,9 @@
+// Tail probing is only used after a structural truncation. Read one bounded
+// window at a time so a corrupt header cannot force the whole suffix into
+// memory. The overlap lets candidate headers straddle adjacent windows.
+const TORN_TAIL_PROBE_WINDOW_BYTES: usize = 1024 * 1024;
+const MAX_TORN_TAIL_CRC_BYTES_PER_WINDOW: usize = 32 * 1024 * 1024;
+
 /// Reads records from a log file at arbitrary offsets or sequentially.
 pub struct LogReader {
     file: File,
@@ -129,7 +135,7 @@ impl LogReader {
     ///
     /// This keeps BEAM startup recovery from materializing a whole large
     /// Bitcask file scan in one NIF result. `done=true` means EOF or a tolerant
-    /// truncated/corrupt tail was reached, matching `iter_metadata_*_tolerant`.
+    /// structurally truncated tail was reached; integrity errors are returned.
     pub fn iter_metadata_page_from_offset_tolerant(
         &mut self,
         offset: u64,
@@ -138,6 +144,238 @@ impl LogReader {
         self.file.seek(SeekFrom::Start(offset))?;
         iter_metadata_page_tolerant(&mut self.file, offset, limit)
     }
+}
+
+/// Recover the append boundary of an active log after a structurally torn tail.
+///
+/// A short final header is unambiguous: no complete record can fit in fewer
+/// than `HEADER_SIZE` bytes, so the bytes can be discarded. Once a complete
+/// header exists but its key/value body is short, probe the bounded suffix for
+/// a later CRC-valid record. A candidate, or an exceeded probe budget, fails
+/// closed and leaves the file untouched. CRC and format errors remain fatal as
+/// well. Any truncation is serialized with all in-process appenders and synced
+/// before the repaired boundary is returned.
+pub fn recover_torn_tail(path: &Path) -> Result<u64> {
+    let write_file = crate::open_write_nofollow(path)?;
+    let append_lock = io_backend::append_lock_for_file(path, &write_file)?;
+    let _guard = io_backend::lock_append(&append_lock)?;
+
+    // Re-read the size after taking the append lock. A writer may have
+    // completed while this recovery call was waiting for the lock.
+    let file_len = write_file.metadata()?.len();
+    let read_file = crate::open_random_read(path)?;
+    if !same_file_identity(&write_file, &read_file)? {
+        return Err(LogError("log path changed while recovering".into()));
+    }
+
+    let mut reader = std::io::BufReader::new(read_file);
+    let mut valid_end = 0u64;
+    let mut saw_truncated_tail = false;
+
+    loop {
+        match read_next_record_metadata(&mut reader, valid_end) {
+            Ok(Some(record)) => {
+                valid_end = valid_end
+                    .checked_add(record.record_size)
+                    .ok_or_else(|| LogError("record offset overflow".into()))?;
+            }
+            Ok(None) => break,
+            Err(error) if error.is_truncated_record() => {
+                saw_truncated_tail = true;
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let mut read_file = reader.into_inner();
+
+    let current_file_len = write_file.metadata()?.len();
+    if current_file_len != file_len {
+        return Err(LogError(format!(
+            "log changed while recovering: started at {file_len} bytes, ended at {current_file_len}"
+        )));
+    }
+
+    if valid_end > current_file_len {
+        return Err(LogError(format!(
+            "log grew while recovering: scanned through {valid_end} bytes, expected {current_file_len}"
+        )));
+    }
+
+    if saw_truncated_tail && current_file_len - valid_end >= HEADER_SIZE as u64 {
+        match probe_torn_tail(&mut read_file, valid_end, current_file_len)? {
+            TornTailProbe::NoLaterRecord => {}
+            TornTailProbe::LaterRecord => {
+                return Err(LogError(format!(
+                    "ambiguous truncated tail at {valid_end} bytes; preserving {current_file_len} bytes (later record candidate)"
+                )));
+            }
+            TornTailProbe::BudgetExceeded => {
+                return Err(LogError(format!(
+                    "ambiguous truncated tail at {valid_end} bytes; preserving {current_file_len} bytes (probe budget exceeded)"
+                )));
+            }
+        }
+    }
+
+    if valid_end < current_file_len {
+        let final_file_len = write_file.metadata()?.len();
+        if final_file_len != current_file_len {
+            return Err(LogError(format!(
+                "log changed while recovering: started at {current_file_len} bytes, ended at {final_file_len}"
+            )));
+        }
+        write_file.set_len(valid_end)?;
+        write_file.sync_data()?;
+    }
+
+    Ok(valid_end)
+}
+
+#[cfg(unix)]
+fn same_file_identity(first: &File, second: &File) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let first_metadata = first.metadata()?;
+    let second_metadata = second.metadata()?;
+    Ok(first_metadata.dev() == second_metadata.dev()
+        && first_metadata.ino() == second_metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(_first: &File, _second: &File) -> std::io::Result<bool> {
+    // The supported non-Unix targets do not expose a portable file identity
+    // through std::fs. Both opens still reject final-component symlinks.
+    Ok(true)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TornTailProbe {
+    NoLaterRecord,
+    LaterRecord,
+    BudgetExceeded,
+}
+
+/// Search a torn suffix for any complete CRC-valid record candidate.
+///
+/// There is no sync marker in the record format, so every byte is a possible
+/// candidate boundary. Scan one MiB windows with a header-sized overlap and
+/// reset the CRC-work budget for each window. This keeps work linear in the
+/// suffix length while still allowing an ordinary large crash tail to be
+/// repaired. Candidate bodies are hashed directly from the window when they
+/// fit; otherwise they are streamed through one fixed-size buffer.
+fn probe_torn_tail(
+    file: &mut File,
+    suffix_start: u64,
+    file_len: u64,
+) -> Result<TornTailProbe> {
+    let suffix_len = file_len
+        .checked_sub(suffix_start)
+        .ok_or_else(|| LogError("torn tail starts past end of file".into()))?;
+    if suffix_len < HEADER_SIZE as u64 {
+        return Ok(TornTailProbe::NoLaterRecord);
+    }
+
+    let max_candidate_start = file_len - HEADER_SIZE as u64;
+    let overlap = HEADER_SIZE - 1;
+    let window_capacity = TORN_TAIL_PROBE_WINDOW_BYTES + overlap;
+    let suffix_len_usize = usize::try_from(suffix_len).unwrap_or(window_capacity);
+    let mut window = vec![0u8; window_capacity.min(suffix_len_usize)];
+    let mut chunk_start = suffix_start;
+
+    while chunk_start <= max_candidate_start {
+        let read_start = chunk_start;
+        let read_end = chunk_start
+            .checked_add(window.len() as u64)
+            .unwrap_or(file_len)
+            .min(file_len);
+        let window_len = usize::try_from(read_end - read_start)
+            .map_err(|_| LogError("torn tail probe window is too large".into()))?;
+
+        file.seek(SeekFrom::Start(read_start))?;
+        file.read_exact(&mut window[..window_len])?;
+
+        let next_chunk_start = chunk_start
+            .checked_add(TORN_TAIL_PROBE_WINDOW_BYTES as u64)
+            .unwrap_or(max_candidate_start + 1);
+        let candidate_end = next_chunk_start.min(max_candidate_start + 1);
+        let mut crc_work = 0usize;
+
+        let mut candidate_start = chunk_start;
+        while candidate_start < candidate_end {
+            let header_offset = usize::try_from(candidate_start - read_start)
+                .map_err(|_| LogError("torn tail candidate offset does not fit".into()))?;
+            let header_end = header_offset + HEADER_SIZE;
+            let header = &window[header_offset..header_end];
+            let key_size = u16::from_le_bytes(header[20..22].try_into().unwrap()) as usize;
+            let value_size_raw = u32::from_le_bytes(header[22..26].try_into().unwrap());
+            let value_size = if value_size_raw == TOMBSTONE {
+                0
+            } else {
+                let value_size = value_size_raw as usize;
+                if value_size > MAX_VALUE_SIZE {
+                    candidate_start += 1;
+                    continue;
+                }
+                value_size
+            };
+            let Some(body_len) = key_size.checked_add(value_size) else {
+                candidate_start += 1;
+                continue;
+            };
+            let Some(record_len) = HEADER_SIZE.checked_add(body_len) else {
+                candidate_start += 1;
+                continue;
+            };
+            let Some(record_end) = candidate_start.checked_add(record_len as u64) else {
+                candidate_start += 1;
+                continue;
+            };
+            if record_end > file_len {
+                candidate_start += 1;
+                continue;
+            }
+
+            let crc_len = record_len - std::mem::size_of::<u32>();
+            if crc_len > MAX_TORN_TAIL_CRC_BYTES_PER_WINDOW
+                || crc_work > MAX_TORN_TAIL_CRC_BYTES_PER_WINDOW - crc_len
+            {
+                return Ok(TornTailProbe::BudgetExceeded);
+            }
+            crc_work += crc_len;
+
+            let stored_crc = u32::from_le_bytes(header[0..4].try_into().unwrap());
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&header[4..]);
+
+            let body_offset = header_end;
+            let body_end = body_offset + body_len;
+            let window_end = window_len;
+            if body_end <= window_end {
+                hasher.update(&window[body_offset..body_end]);
+            } else {
+                let body_file_offset = candidate_start
+                    .checked_add(HEADER_SIZE as u64)
+                    .ok_or_else(|| LogError("torn tail body offset overflow".into()))?;
+                file.seek(SeekFrom::Start(body_file_offset))?;
+                hash_exact(file, body_len, &mut hasher, "torn tail candidate")?;
+            }
+
+            if hasher.finalize() == stored_crc {
+                return Ok(TornTailProbe::LaterRecord);
+            }
+
+            candidate_start += 1;
+        }
+
+        if candidate_end > max_candidate_start {
+            break;
+        }
+        chunk_start = next_chunk_start;
+    }
+
+    Ok(TornTailProbe::NoLaterRecord)
 }
 
 // ---------------------------------------------------------------------------

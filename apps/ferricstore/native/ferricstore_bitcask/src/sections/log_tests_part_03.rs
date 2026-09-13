@@ -624,6 +624,258 @@
         assert_eq!(records[1].key, b"good2");
     }
 
+    #[test]
+    fn reopen_after_short_header_tail_preserves_following_append() {
+        let dir = temp_dir();
+        let path = dir.path().join("reopen_torn_tail.log");
+
+        let (valid_end, torn_offset) = {
+            let mut writer = LogWriter::open(&path, 1).unwrap();
+            let valid_offset = writer.write(b"valid", b"value", 0).unwrap();
+            let torn_offset = writer.write(b"torn", b"value", 0).unwrap();
+            writer.sync().unwrap();
+            (
+                valid_offset + (HEADER_SIZE + b"valid".len() + b"value".len()) as u64,
+                torn_offset,
+            )
+        };
+
+        // Simulate a crash before the second record's header completed. A
+        // tail shorter than one complete header cannot contain another record.
+        let torn_tail_len = 2u64;
+        let torn_file_len = torn_offset + torn_tail_len;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(torn_file_len).unwrap();
+        drop(file);
+
+        let recovered_end = recover_torn_tail(&path).unwrap();
+        assert_eq!(recovered_end, valid_end);
+        assert_eq!(fs::metadata(&path).unwrap().len(), valid_end);
+
+        // A restart must append at the repaired boundary, not after the
+        // unparseable tail.
+        let appended_offset = {
+            let mut writer = LogWriter::open(&path, 1).unwrap();
+            let offset = writer.write(b"after", b"value", 0).unwrap();
+            writer.sync().unwrap();
+            offset
+        };
+
+        assert_eq!(
+            appended_offset, valid_end,
+            "reopen append must begin at the last complete record"
+        );
+
+        let mut reader = LogReader::open(&path).unwrap();
+        let records = reader.iter_from_start_tolerant().unwrap();
+        assert_eq!(records.len(), 2, "the post-restart record must be recoverable");
+        assert_eq!(records[1].key, b"after");
+    }
+
+    #[test]
+    fn recover_torn_tail_repairs_partial_value_without_later_record() {
+        let dir = temp_dir();
+        let path = dir.path().join("partial_value_torn_tail.log");
+
+        let (valid_end, torn_offset) = {
+            let mut writer = LogWriter::open(&path, 1).unwrap();
+            let valid_offset = writer.write(b"valid", b"value", 0).unwrap();
+            let torn_offset = writer.write(b"torn", b"value", 0).unwrap();
+            writer.sync().unwrap();
+            (
+                valid_offset + (HEADER_SIZE + b"valid".len() + b"value".len()) as u64,
+                torn_offset,
+            )
+        };
+
+        // Keep a complete header, key, and only part of the value. The
+        // bounded probe must find no later CRC-valid record and repair this
+        // ordinary crash tail.
+        let truncate_at = torn_offset + HEADER_SIZE as u64 + b"torn".len() as u64 + 2;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(truncate_at).unwrap();
+        drop(file);
+
+        let recovered_end = recover_torn_tail(&path).unwrap();
+        assert_eq!(recovered_end, valid_end);
+        assert_eq!(fs::metadata(&path).unwrap().len(), valid_end);
+
+        let appended_offset = {
+            let mut writer = LogWriter::open(&path, 1).unwrap();
+            let offset = writer.write(b"after", b"value", 0).unwrap();
+            writer.sync().unwrap();
+            offset
+        };
+        assert_eq!(appended_offset, valid_end);
+    }
+
+    #[test]
+    fn recover_torn_tail_repairs_partial_key_without_later_record() {
+        let dir = temp_dir();
+        let path = dir.path().join("partial_key_torn_tail.log");
+
+        let (valid_end, torn_offset) = {
+            let mut writer = LogWriter::open(&path, 1).unwrap();
+            let valid_offset = writer.write(b"valid", b"value", 0).unwrap();
+            let torn_offset = writer.write(b"torn-key", b"value", 0).unwrap();
+            writer.sync().unwrap();
+            (
+                valid_offset + (HEADER_SIZE + b"valid".len() + b"value".len()) as u64,
+                torn_offset,
+            )
+        };
+
+        // Keep a complete header and only part of the key. This is an
+        // ordinary torn tail, not an integrity failure.
+        let truncate_at = torn_offset + HEADER_SIZE as u64 + 2;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(truncate_at).unwrap();
+        drop(file);
+
+        let recovered_end = recover_torn_tail(&path).unwrap();
+        assert_eq!(recovered_end, valid_end);
+        assert_eq!(fs::metadata(&path).unwrap().len(), valid_end);
+    }
+
+    #[test]
+    fn recover_torn_tail_preserves_bytes_after_ambiguous_large_record() {
+        let dir = temp_dir();
+        let path = dir.path().join("ambiguous_torn_tail.log");
+
+        let valid_end = {
+            let mut writer = LogWriter::open(&path, 1).unwrap();
+            let valid_end = writer.write(b"valid", b"value", 0).unwrap()
+                + (HEADER_SIZE + b"valid".len() + b"value".len()) as u64;
+            let large_value = vec![0xAB; 1_000_000];
+            writer.write(b"torn", &large_value, 0).unwrap();
+            writer.sync().unwrap();
+            valid_end
+        };
+
+        // Keep a complete torn header and two body bytes. A later append is
+        // therefore indistinguishable from the missing 1 MiB record body.
+        let torn_file_len = valid_end + HEADER_SIZE as u64 + 2;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(torn_file_len).unwrap();
+        drop(file);
+
+        let appended_offset = {
+            let mut writer = LogWriter::open(&path, 1).unwrap();
+            let offset = writer.write(b"after", b"value", 0).unwrap();
+            writer.sync().unwrap();
+            offset
+        };
+        assert!(
+            appended_offset > valid_end,
+            "later record must begin inside the ambiguous suffix"
+        );
+        let before_recovery = fs::read(&path).unwrap();
+
+        let error = recover_torn_tail(&path).unwrap_err();
+        assert!(
+            error.0.contains("ambiguous truncated tail"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before_recovery,
+            "ambiguous recovery must not discard bytes after the torn record"
+        );
+
+        let mut reader = LogReader::open(&path).unwrap();
+        let appended = reader.read_at(appended_offset).unwrap().unwrap();
+        assert_eq!(appended.key, b"after");
+        assert_eq!(appended.value, Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn torn_tail_probe_rejects_candidate_over_crc_work_budget() {
+        let dir = temp_dir();
+        let path = dir.path().join("candidate_crc_budget.log");
+        let value_size = (MAX_TORN_TAIL_CRC_BYTES_PER_WINDOW + 1) as u32;
+        let record_len = HEADER_SIZE as u64 + value_size as u64;
+        let mut header = [0u8; HEADER_SIZE];
+        header[22..26].copy_from_slice(&value_size.to_le_bytes());
+        fs::write(&path, header).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(record_len).unwrap();
+        drop(file);
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert_eq!(
+            probe_torn_tail(&mut file, 0, record_len).unwrap(),
+            TornTailProbe::BudgetExceeded
+        );
+    }
+
+    #[test]
+    fn torn_tail_probe_bounds_aggregate_crc_work_per_window() {
+        let dir = temp_dir();
+        let path = dir.path().join("candidate_crc_window_budget.log");
+        let value_size = 600 * 1024;
+        let candidate_count = 55;
+        let record_len = HEADER_SIZE + value_size;
+        let file_len = record_len + (candidate_count - 1) * HEADER_SIZE;
+        let mut bytes = vec![0u8; file_len];
+
+        // Put many individually acceptable candidate headers in one probe
+        // window. Their complete bodies overlap and are deliberately invalid,
+        // so the aggregate CRC budget is the only reason to stop.
+        for index in 0..candidate_count {
+            let offset = index * HEADER_SIZE;
+            bytes[offset + 22..offset + 26]
+                .copy_from_slice(&(value_size as u32).to_le_bytes());
+        }
+        fs::write(&path, &bytes).unwrap();
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert_eq!(
+            probe_torn_tail(&mut file, 0, file_len as u64).unwrap(),
+            TornTailProbe::BudgetExceeded
+        );
+    }
+
+    #[test]
+    fn recover_torn_tail_fails_closed_on_crc_corruption() {
+        let dir = temp_dir();
+        let path = dir.path().join("crc_corruption.log");
+
+        let mut writer = LogWriter::open(&path, 1).unwrap();
+        writer.write(b"key", b"value", 0).unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+
+        let original_len = fs::metadata(&path).unwrap().len();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write as _;
+        file.seek(io::SeekFrom::Start(HEADER_SIZE as u64 + 3)).unwrap();
+        file.write_all(b"X").unwrap();
+        file.sync_data().unwrap();
+        drop(file);
+
+        let error = recover_torn_tail(&path).unwrap_err();
+        assert!(error.0.contains("CRC mismatch"), "unexpected error: {error}");
+        assert_eq!(fs::metadata(&path).unwrap().len(), original_len);
+    }
+
     // ------------------------------------------------------------------
     // Mixed scan: live records + tombstones + varying expiry
     // ------------------------------------------------------------------

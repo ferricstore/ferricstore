@@ -614,6 +614,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AckedWritesSurviveWaraftSe
         end
       end
 
+      @tag :config_cache_idle
       test "segment log open caches config miss from loaded records", %{root: root, ctx: ctx} do
         assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -627,7 +628,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AckedWritesSurviveWaraftSe
           {:ferricstore_waraft_spike_segment_log, :latest_config,
            segment_dir |> Path.absname() |> String.to_charlist()}
 
-        assert {:not_found, live_last_index} = :persistent_term.get(cache_key, :missing)
+        assert {:not_found, live_watermark} = :persistent_term.get(cache_key, :missing)
+        live_last_index = :atomics.get(live_watermark, 1)
         assert is_integer(live_last_index) and live_last_index >= 10
 
         assert :ok = WARaftBackend.stop()
@@ -638,7 +640,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AckedWritesSurviveWaraftSe
         log = waraft_segment_log_record(0)
         last_index = :ferricstore_waraft_spike_segment_log.last_index(log)
         assert is_integer(last_index) and last_index >= 10
-        assert :persistent_term.get(cache_key, :missing) == {:not_found, last_index}
+        assert {:not_found, reopened_watermark} = :persistent_term.get(cache_key, :missing)
+        assert :atomics.get(reopened_watermark, 1) == last_index
       after
         WARaftBackend.stop()
       end

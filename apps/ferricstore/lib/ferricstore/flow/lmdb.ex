@@ -142,6 +142,8 @@ defmodule Ferricstore.Flow.LMDB do
 
   def cold_due_key(attrs), do: Ferricstore.Flow.LMDB.Cold.due_key(attrs)
 
+  def cold_due_prefix, do: Ferricstore.Flow.LMDB.Cold.due_prefix()
+
   def cold_due_bucket_prefix(bucket_ms),
     do: Ferricstore.Flow.LMDB.Cold.due_bucket_prefix(bucket_ms)
 

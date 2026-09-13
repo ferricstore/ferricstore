@@ -4,6 +4,24 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.18 - 2026-09-13
+
+- Hardened restart recovery for active Bitcask and blob segments: repair only
+  unambiguous incomplete tails, preserve corrupt or ambiguous data, reject torn
+  sealed segments, and invalidate stale append offsets after writer failure.
+- Reconciled durable Flow state and history deletions with their derived LMDB
+  indexes, rebuilt policy mirrors after projection failure, and recovered
+  promoted collection metadata from WARaft-backed locations.
+- Removed per-append global-term replacement from the Raft configuration miss
+  cache and skipped provably empty scheduler claims without Raft writes. The
+  empty check is bounded, single-node only, and falls back on uncertain state.
+- Replaced recurring disk-capacity subprocesses with native sampling and avoided
+  unnecessary host-memory detection when explicit limits are configured. Memory
+  protection thresholds, polling intervals, and query admission are unchanged.
+- Isolated development worktrees with checkout-local storage and OS-assigned
+  listener ports; local launchers now print their actual endpoints.
+- No client wire-format or SDK API changes are required for this patch.
+
 ## 0.11.17 - 2026-09-12
 
 - Fixed WARaft segment recovery so replayed Flow commands cannot observe LMDB,

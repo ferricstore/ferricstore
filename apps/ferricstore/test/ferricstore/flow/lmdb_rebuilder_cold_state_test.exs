@@ -37,6 +37,26 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdStateTest do
              )
   end
 
+  @tag :flow_deleted_marker
+  test "active index rebuild ignores a Flow deletion marker" do
+    keydir = :ets.new(:flow_active_index_deleted_marker, [:set])
+    state_key = Keys.state_key("deleted-active-index")
+
+    :ets.insert(keydir, {state_key, nil, 0, :flow_state_deleted, :deleted, 0, 0})
+
+    assert :ok =
+             LMDBRebuilder.rebuild_active_indexes_from_keydir(
+               System.tmp_dir!(),
+               keydir,
+               0,
+               nil,
+               nil,
+               nil,
+               nil,
+               nil
+             )
+  end
+
   test "cached WARaft state is pinned and physicalized before rebuilding query rows" do
     data_dir =
       Path.join(

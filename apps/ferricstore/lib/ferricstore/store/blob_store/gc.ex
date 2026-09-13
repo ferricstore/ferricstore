@@ -7,6 +7,15 @@ defmodule Ferricstore.Store.BlobStore.GC do
       alias Ferricstore.Store.BlobRef
       alias Ferricstore.Store.BlobStore.TableOwner
 
+      @doc """
+      Recovers append-segment files by repairing an unambiguous incomplete tail
+      of the active segment. Incomplete tails in sealed segments, and any corrupt
+      or ambiguous tails, are preserved and reported as errors.
+
+      This is called lazily before the first append in a VM and is also public for
+      startup/lifecycle tests. Older valid records before the bad tail remain
+      readable.
+      """
       @spec recover_shard(binary(), non_neg_integer()) ::
               {:ok,
                %{
@@ -17,8 +26,7 @@ defmodule Ferricstore.Store.BlobStore.GC do
               | {:error, term()}
       def recover_shard(data_dir, shard_index)
           when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
-        clear_active_segment_cache(data_dir, shard_index)
-        clear_segment_dir_cache(data_dir, shard_index)
+        invalidate_blob_caches(data_dir, shard_index)
         shard_path = Ferricstore.DataDir.blob_shard_path(data_dir, shard_index)
 
         with {:ok, paths} <- segment_files(shard_path),

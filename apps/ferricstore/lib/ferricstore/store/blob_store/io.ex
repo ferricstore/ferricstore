@@ -7,6 +7,14 @@ defmodule Ferricstore.Store.BlobStore.IO do
       alias Ferricstore.Store.BlobRef
       alias Ferricstore.Store.BlobStore.TableOwner
 
+      # Torn-tail recovery scans in bounded windows. The overlap lets a magic
+      # marker and its complete header straddle two windows without materializing
+      # the whole suffix. Healthy segments continue to use the normal prefix scan.
+      @torn_tail_probe_bytes 1_048_576
+      @torn_tail_probe_overlap_bytes @segment_header_bytes - 1
+      @torn_tail_probe_read_bytes @torn_tail_probe_bytes - @torn_tail_probe_overlap_bytes
+      @torn_tail_probe_hash_bytes 32 * 1024 * 1024
+
       defp segment_path(data_dir, shard_index, segment_id) do
         Path.join([
           Ferricstore.DataDir.blob_shard_path(data_dir, shard_index),
@@ -23,6 +31,8 @@ defmodule Ferricstore.Store.BlobStore.IO do
           {:error, reason} -> {:error, reason}
         end
       end
+
+      defp pread_exact_open(_io, _offset, 0), do: {:ok, ""}
 
       defp pread_exact_open(io, offset, size) do
         case :file.pread(io, offset, size) do
@@ -318,11 +328,17 @@ defmodule Ferricstore.Store.BlobStore.IO do
              {:ok, io} <- open_blob_recovery_path(path, [:read, :write, :raw, :binary]) do
           try do
             with :ok <- verify_open_file_identity(io, path, expected_stat),
-                 {:ok, size} <- file_size(io),
-                 {:ok, valid_size} <- scan_segment(io, 0, size),
-                 {:ok, truncated_bytes} <-
-                   maybe_truncate_segment(io, path, size, valid_size, can_truncate?) do
-              {:ok, truncated_bytes}
+                 {:ok, size} <- file_size(io) do
+              case scan_segment(io, 0, size) do
+                {:ok, valid_size} ->
+                  maybe_recover_torn_segment(io, path, size, valid_size, can_truncate?)
+
+                {:error, {:corrupt_blob_segment, offset}} ->
+                  corrupt_segment_error(path, offset, can_truncate?)
+
+                {:error, reason} ->
+                  {:error, reason}
+              end
             end
           after
             :file.close(io)
@@ -354,6 +370,189 @@ defmodule Ferricstore.Store.BlobStore.IO do
         end
       end
 
+      defp maybe_recover_torn_segment(io, path, size, size, can_truncate?),
+        do: maybe_truncate_segment(io, path, size, size, can_truncate?)
+
+      defp maybe_recover_torn_segment(_io, path, _size, valid_size, false),
+        do: corrupt_segment_error(path, valid_size, false)
+
+      defp maybe_recover_torn_segment(io, path, size, valid_size, true) do
+        case validate_torn_tail(io, size, valid_size) do
+          :ok ->
+            maybe_truncate_segment(io, path, size, valid_size, true)
+
+          {:error, {:torn_tail_probe, reason}} ->
+            corrupt_torn_tail_error(path, valid_size, reason)
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      # A complete header whose payload runs past EOF is normally a crash tail.
+      # Before truncating it, stream the suffix for a complete magic/header/SHA
+      # record that may have been appended after the torn body.
+      defp validate_torn_tail(_io, size, valid_size)
+           when size - valid_size < @segment_header_bytes,
+           do: :ok
+
+      defp validate_torn_tail(io, size, valid_size) do
+        probe_torn_tail_stream(io, valid_size, size, <<>>, 0)
+      end
+
+      defp probe_torn_tail_stream(_io, offset, size, _overlap, _hash_bytes)
+           when offset >= size,
+           do: :ok
+
+      defp probe_torn_tail_stream(io, offset, size, overlap, hash_bytes) do
+        read_size = min(@torn_tail_probe_read_bytes, size - offset)
+
+        case :file.pread(io, offset, read_size) do
+          {:ok, chunk} when is_binary(chunk) and byte_size(chunk) == read_size ->
+            window = overlap <> chunk
+            window_start = offset - byte_size(overlap)
+
+            case probe_torn_tail_window(
+                   io,
+                   window,
+                   window_start,
+                   size,
+                   hash_bytes,
+                   0
+                 ) do
+              {:ok, next_hash_bytes} ->
+                next_offset = offset + read_size
+
+                if next_offset >= size do
+                  :ok
+                else
+                  next_overlap =
+                    binary_part(
+                      window,
+                      byte_size(window) - @torn_tail_probe_overlap_bytes,
+                      @torn_tail_probe_overlap_bytes
+                    )
+
+                  probe_torn_tail_stream(io, next_offset, size, next_overlap, next_hash_bytes)
+                end
+
+              {:error, _reason} = error ->
+                error
+            end
+
+          {:ok, _short} ->
+            {:error, :size_mismatch}
+
+          :eof ->
+            {:error, :size_mismatch}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+      end
+
+      defp probe_torn_tail_window(
+             io,
+             window,
+             window_start,
+             size,
+             hash_bytes,
+             search_offset
+           ) do
+        window_size = byte_size(window)
+
+        if search_offset + @segment_header_bytes > window_size do
+          {:ok, hash_bytes}
+        else
+          case :binary.match(
+                 window,
+                 @segment_header_magic,
+                 scope: {search_offset, window_size - search_offset}
+               ) do
+            :nomatch ->
+              {:ok, hash_bytes}
+
+            {candidate_offset, _magic_size} ->
+              candidate_end = candidate_offset + @segment_header_bytes
+              candidate_absolute_offset = window_start + candidate_offset
+
+              cond do
+                candidate_end > window_size ->
+                  {:ok, hash_bytes}
+
+                true ->
+                  header = binary_part(window, candidate_offset, @segment_header_bytes)
+
+                  case decode_segment_header(header) do
+                    {:ok, payload_size, checksum} ->
+                      payload_offset = candidate_absolute_offset + @segment_header_bytes
+
+                      cond do
+                        payload_offset > size or payload_size > size - payload_offset ->
+                          probe_torn_tail_window(
+                            io,
+                            window,
+                            window_start,
+                            size,
+                            hash_bytes,
+                            candidate_offset + 1
+                          )
+
+                        hash_bytes + payload_size > @torn_tail_probe_hash_bytes ->
+                          {:error, {:torn_tail_probe, :hash_budget_exceeded}}
+
+                        true ->
+                          case hash_torn_tail_candidate(
+                                 io,
+                                 window,
+                                 candidate_offset,
+                                 payload_offset,
+                                 payload_size
+                               ) do
+                            {:ok, ^checksum} ->
+                              {:error, {:torn_tail_probe, :complete_record_found}}
+
+                            {:ok, _other_checksum} ->
+                              probe_torn_tail_window(
+                                io,
+                                window,
+                                window_start,
+                                size,
+                                hash_bytes + payload_size,
+                                candidate_offset + 1
+                              )
+
+                            {:error, reason} ->
+                              {:error, reason}
+                          end
+                      end
+
+                    :error ->
+                      probe_torn_tail_window(
+                        io,
+                        window,
+                        window_start,
+                        size,
+                        hash_bytes,
+                        candidate_offset + 1
+                      )
+                  end
+              end
+          end
+        end
+      end
+
+      defp hash_torn_tail_candidate(io, window, candidate_offset, payload_offset, payload_size) do
+        payload_end = candidate_offset + @segment_header_bytes + payload_size
+
+        if payload_end <= byte_size(window) do
+          payload = binary_part(window, candidate_offset + @segment_header_bytes, payload_size)
+          {:ok, :crypto.hash(:sha256, payload)}
+        else
+          hash_file_range(io, payload_offset, payload_size, :crypto.hash_init(:sha256))
+        end
+      end
+
       defp scan_segment(_io, offset, size) when offset == size, do: {:ok, offset}
 
       defp scan_segment(_io, offset, size) when size - offset < @segment_header_bytes,
@@ -371,15 +570,16 @@ defmodule Ferricstore.Store.BlobStore.IO do
                   next_offset > size ->
                     {:ok, offset}
 
-                  segment_payload_matches?(io, payload_offset, payload_size, checksum) ->
-                    scan_segment(io, next_offset, size)
-
                   true ->
-                    {:ok, offset}
+                    case segment_payload_matches?(io, payload_offset, payload_size, checksum) do
+                      :ok -> scan_segment(io, next_offset, size)
+                      {:error, :checksum_mismatch} -> {:error, {:corrupt_blob_segment, offset}}
+                      {:error, reason} -> {:error, reason}
+                    end
                 end
 
               :error ->
-                {:ok, offset}
+                {:error, {:corrupt_blob_segment, offset}}
             end
 
           {:ok, _short} ->
@@ -402,10 +602,20 @@ defmodule Ferricstore.Store.BlobStore.IO do
 
       defp segment_payload_matches?(io, payload_offset, payload_size, checksum) do
         case hash_file_range(io, payload_offset, payload_size, :crypto.hash_init(:sha256)) do
-          {:ok, ^checksum} -> true
-          _ -> false
+          {:ok, ^checksum} -> :ok
+          {:ok, _other_checksum} -> {:error, :checksum_mismatch}
+          {:error, reason} -> {:error, reason}
         end
       end
+
+      defp corrupt_segment_error(path, _offset, false),
+        do: {:error, {:corrupt_immutable_blob_segment, path}}
+
+      defp corrupt_segment_error(path, offset, true),
+        do: {:error, {:corrupt_blob_segment, path, offset}}
+
+      defp corrupt_torn_tail_error(path, offset, reason),
+        do: {:error, {:corrupt_blob_segment, path, offset, reason}}
 
       defp maybe_truncate_segment(_io, _path, size, size, _can_truncate?), do: {:ok, 0}
 
@@ -413,11 +623,16 @@ defmodule Ferricstore.Store.BlobStore.IO do
         {:error, {:corrupt_immutable_blob_segment, path}}
       end
 
-      defp maybe_truncate_segment(io, _path, size, valid_size, true) do
-        with {:ok, _} <- :file.position(io, valid_size),
+      defp maybe_truncate_segment(io, path, size, valid_size, true) do
+        with {:ok, current_size} <- file_size(io),
+             true <- current_size == size,
+             {:ok, _} <- :file.position(io, valid_size),
              :ok <- :file.truncate(io),
              :ok <- :file.sync(io) do
           {:ok, size - valid_size}
+        else
+          false -> {:error, {:blob_segment_changed, path}}
+          {:error, reason} -> {:error, reason}
         end
       end
 

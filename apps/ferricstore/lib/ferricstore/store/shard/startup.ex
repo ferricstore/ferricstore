@@ -118,7 +118,7 @@ defmodule Ferricstore.Store.Shard.Startup do
           path = Ferricstore.DataDir.shard_data_path(data_dir, index)
 
           {active_file_id, active_file_size, active_file_path} =
-            ensure_initial_files!(path, index, fsync_dir_fun)
+            ensure_initial_files!(path, index, fsync_dir_fun, ctx)
 
           # Create/clear named ETS tables.
           # Use instance-scoped names from ctx if available, else default naming.
@@ -410,7 +410,7 @@ defmodule Ferricstore.Store.Shard.Startup do
         end
       end
 
-      defp ensure_initial_files!(path, index, fsync_dir_fun) do
+      defp ensure_initial_files!(path, index, fsync_dir_fun, ctx) do
         dir_created? = not Ferricstore.FS.dir?(path)
         Ferricstore.FS.mkdir_p!(path)
 
@@ -442,6 +442,13 @@ defmodule Ferricstore.Store.Shard.Startup do
           index,
           fsync_dir_fun
         )
+
+        active_file_size =
+          if raft_projection_owner?(ctx) do
+            ShardLifecycle.recover_active_file_tail(active_file_path, index)
+          else
+            active_file_size
+          end
 
         {active_file_id, active_file_size, active_file_path}
       end

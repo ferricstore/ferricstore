@@ -10,6 +10,8 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   alias Ferricstore.Flow.LMDBRebuilder.TerminalProjection
   alias Ferricstore.Flow.Locator
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
+  alias Ferricstore.Flow.LMDBWriter.ProjectionOps
+  alias Ferricstore.Flow.PolicyMirrorRecovery
   alias Ferricstore.Flow.PolicyMigration
   alias Ferricstore.Flow.Query.{CompositeProjection, QueryRowCodec, SourceCatalog}
   alias Ferricstore.Flow.SharedRefBackfill
@@ -49,6 +51,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
                %{seen: 0, active: 0, terminal: 0, cold_read_errors: 0},
                fn entries, acc ->
                  entries
+                 |> Enum.reject(&flow_state_delete_marker?/1)
                  |> ColdState.read_and_decode(shard_path, shard_index, instance_ctx)
                  |> Enum.reduce(
                    %{acc | seen: acc.seen + length(entries)},
@@ -182,7 +185,16 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
                    acc
                  )
                end
+             ),
+           {:ok, policy_mirror_rebuilt} <-
+             reconcile_policy_mirrors(
+               lmdb_path,
+               keydir,
+               shard_path,
+               shard_index,
+               instance_ctx
              ) do
+        stats = Map.put(stats, :policy_mirror_rebuilt, policy_mirror_rebuilt)
         stats = TerminalCounts.persist(stats, lmdb_path)
 
         lmdb_active_rebuild_result =
@@ -644,62 +656,59 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
          query_index_definitions,
          acc
        ) do
-    decoded = ColdState.read_and_decode(entries, shard_path, shard_index, instance_ctx)
+    source_entries = Enum.reject(entries, &flow_state_delete_marker?/1)
+    deleted_entries = Enum.filter(entries, &flow_state_delete_marker?/1)
+    decoded = ColdState.read_and_decode(source_entries, shard_path, shard_index, instance_ctx)
 
     {ops, terminal_prunes, active_records, projected_records, projection_read_errors} =
       Enum.reduce(decoded, {[], [], [], [], 0}, fn decoded_state, state ->
         reconcile_decoded_state(decoded_state, lmdb_path, state)
       end)
 
-    composite_result =
-      rebuild_composite_projection_ops(
+    finish = fn write_result, read_errors ->
+      finish_reconcile_batch(
+        write_result,
+        entries,
         lmdb_path,
-        Enum.reverse(projected_records),
-        query_index_definitions
+        keydir,
+        shard_path,
+        shard_index,
+        instance_ctx,
+        zset_score_index,
+        zset_score_lookup,
+        flow_index,
+        flow_lookup,
+        prune_terminal_keydir?,
+        terminal_prunes,
+        active_records,
+        length(decoded),
+        read_errors,
+        acc
       )
+    end
 
-    case composite_result do
-      {:ok, composite_ops} ->
-        finish_reconcile_batch(
-          LMDB.write_batch(lmdb_path, :lists.reverse(ops, composite_ops)),
-          entries,
-          lmdb_path,
-          keydir,
-          shard_path,
-          shard_index,
-          instance_ctx,
-          zset_score_index,
-          zset_score_lookup,
-          flow_index,
-          flow_lookup,
-          prune_terminal_keydir?,
-          terminal_prunes,
-          active_records,
-          length(decoded),
-          projection_read_errors,
-          acc
-        )
+    case deleted_state_projection_ops(lmdb_path, deleted_entries, query_index_definitions) do
+      {:ok, deleted_ops} ->
+        case rebuild_composite_projection_ops(
+               lmdb_path,
+               Enum.reverse(projected_records),
+               query_index_definitions
+             ) do
+          {:ok, composite_ops} ->
+            finish.(
+              LMDB.write_batch(
+                lmdb_path,
+                :lists.reverse(ops, deleted_ops ++ composite_ops)
+              ),
+              projection_read_errors
+            )
+
+          {:error, _reason} ->
+            finish.({:error, :composite_projection_rebuild_failed}, projection_read_errors)
+        end
 
       {:error, _reason} ->
-        finish_reconcile_batch(
-          {:error, :composite_projection_rebuild_failed},
-          entries,
-          lmdb_path,
-          keydir,
-          shard_path,
-          shard_index,
-          instance_ctx,
-          zset_score_index,
-          zset_score_lookup,
-          flow_index,
-          flow_lookup,
-          prune_terminal_keydir?,
-          terminal_prunes,
-          active_records,
-          length(decoded),
-          projection_read_errors,
-          acc
-        )
+        finish.({:error, :deleted_state_projection_rebuild_failed}, projection_read_errors + 1)
     end
   end
 
@@ -779,6 +788,85 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
             active: acc.active + length(active_records),
             lmdb_errors: acc.lmdb_errors + projection_read_errors + 1
         }
+    end
+  end
+
+  defp deleted_state_projection_ops(_lmdb_path, [], _definitions), do: {:ok, []}
+
+  defp deleted_state_projection_ops(lmdb_path, entries, definitions) when is_list(entries) do
+    Enum.reduce_while(entries, {:ok, []}, fn
+      {state_key, nil, 0, :flow_state_deleted, :deleted, _offset, _value_size},
+      {:ok, reversed_ops}
+      when is_binary(state_key) ->
+        case LMDB.get(lmdb_path, state_key) do
+          :not_found ->
+            {:cont, {:ok, reversed_ops}}
+
+          {:ok, query_row} when is_binary(query_row) ->
+            case deleted_state_projection_ops(lmdb_path, state_key, query_row, definitions) do
+              {:ok, ops} -> {:cont, {:ok, :lists.reverse(ops, reversed_ops)}}
+              {:error, _reason} = error -> {:halt, error}
+            end
+
+          {:error, _reason} = error ->
+            {:halt, error}
+
+          invalid ->
+            {:halt, {:error, {:invalid_deleted_state_projection_read, state_key, invalid}}}
+        end
+
+      invalid, _acc ->
+        {:halt, {:error, {:invalid_deleted_state_projection_entry, invalid}}}
+    end)
+    |> case do
+      {:ok, reversed_ops} -> {:ok, Enum.reverse(reversed_ops)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp deleted_state_projection_ops(lmdb_path, state_key, query_row, definitions) do
+    with {:ok, %{record: record}} <- QueryRowCodec.decode(query_row, state_key),
+         {:ok, fixed_query_ops} <-
+           ProjectionOps.stale_fixed_query_delete_ops(lmdb_path, state_key, nil),
+         {:ok, active_ops} <- LMDB.active_index_delete_ops_result(lmdb_path, state_key),
+         {:ok, terminal_ops} <-
+           TerminalProjection.cleanup_stale_terminal_ops(lmdb_path, state_key, record),
+         {:ok, source_catalog_delete} <- source_catalog_delete_op(record, state_key),
+         {:ok, composite_ops} <-
+           stale_composite_delete_ops(lmdb_path, state_key, definitions) do
+      {:ok,
+       [{:compare, state_key, query_row}, {:delete, state_key}] ++
+         fixed_query_ops ++
+         active_ops ++
+         terminal_ops ++
+         composite_ops ++
+         [source_catalog_delete]}
+    else
+      :error -> {:error, :invalid_deleted_state_projection}
+      {:error, _reason} = error -> error
+    end
+  rescue
+    ArgumentError -> {:error, :invalid_deleted_state_projection}
+  end
+
+  defp source_catalog_delete_op(%{type: type}, state_key)
+       when is_binary(type) and type != "" and is_binary(state_key) do
+    SourceCatalog.delete_op(Flow.Keys.type_catalog_member_key(type, state_key))
+  end
+
+  defp source_catalog_delete_op(_record, _state_key),
+    do: {:error, :invalid_deleted_state_source_catalog}
+
+  defp stale_composite_delete_ops(lmdb_path, state_key, definitions) do
+    case CompositeProjection.remove(
+           lmdb_path,
+           state_key,
+           definitions,
+           CompositeProjection.new_cache()
+         ) do
+      {:ok, ops, _cache} -> {:ok, ops}
+      {:error, _reason} = error -> error
+      invalid -> {:error, {:invalid_deleted_state_composite_projection, invalid}}
     end
   end
 
@@ -980,6 +1068,26 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
       terminal_reverse_cleanup_ops: cleanup_op_count
     }
   end
+
+  defp reconcile_policy_mirrors(
+         lmdb_path,
+         keydir,
+         shard_path,
+         shard_index,
+         instance_ctx
+       )
+       when is_map(instance_ctx) do
+    PolicyMirrorRecovery.reconcile_shard(
+      lmdb_path,
+      keydir,
+      shard_path,
+      shard_index,
+      instance_ctx
+    )
+  end
+
+  defp reconcile_policy_mirrors(_lmdb_path, _keydir, _shard_path, _shard_index, _instance_ctx),
+    do: {:ok, 0}
 
   defp cleanup_stale_terminal_reverse(lmdb_path, keydir, shard_path) do
     TerminalProjection.cleanup_stale_terminal_reverse(lmdb_path, keydir, fn entry ->
@@ -1901,6 +2009,13 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   end
 
   defp flow_state_entry?(_entry), do: false
+
+  defp flow_state_delete_marker?(
+         {_key, nil, 0, :flow_state_deleted, :deleted, _offset, _value_size}
+       ),
+       do: true
+
+  defp flow_state_delete_marker?(_entry), do: false
 
   defp track_binary_remove(keydir, shard_index, key, instance_ctx) do
     ref = keydir_binary_ref(instance_ctx, shard_index)

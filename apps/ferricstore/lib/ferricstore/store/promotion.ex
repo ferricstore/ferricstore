@@ -1001,7 +1001,7 @@ defmodule Ferricstore.Store.Promotion do
 
     try do
       {all_markers, marker_actions} =
-        plan_recovery_markers!(shard_data_path, keydir, shard_index)
+        plan_recovery_markers!(shard_data_path, keydir, shard_index, instance_ctx)
 
       now =
         ExpiryContext.capture()
@@ -1056,7 +1056,8 @@ defmodule Ferricstore.Store.Promotion do
                          redis_key,
                          type,
                          shard_data_path,
-                         shard_index
+                         shard_index,
+                         instance_ctx
                        ) do
                     {:fallback, marker_key, redis_key, type,
                      dedicated_path(data_dir, shard_index, type, redis_key), generation}
@@ -1113,7 +1114,7 @@ defmodule Ferricstore.Store.Promotion do
     end
   end
 
-  defp plan_recovery_markers!(shard_data_path, keydir, shard_index) do
+  defp plan_recovery_markers!(shard_data_path, keydir, shard_index, instance_ctx) do
     pm_prefix = "PM:"
     pm_len = byte_size(pm_prefix)
 
@@ -1134,13 +1135,13 @@ defmodule Ferricstore.Store.Promotion do
           if is_binary(value) do
             value
           else
-            file_path =
-              Path.join(
-                shard_data_path,
-                "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log"
-              )
-
-            read_recovery_value!(file_path, offset, full_key, :read_marker, shard_index)
+            read_shared_recovery_value!(
+              {shard_data_path, instance_ctx, shard_index},
+              fid,
+              offset,
+              full_key,
+              :read_marker
+            )
           end
 
         case decode_recovery_marker(type_str) do
@@ -1227,7 +1228,8 @@ defmodule Ferricstore.Store.Promotion do
           redis_key,
           type,
           shard_data_path,
-          shard_index
+          shard_index,
+          instance_ctx
         )
 
         {:fallback, marker_key, redis_key, type, dedicated_path, generation}
@@ -2080,6 +2082,31 @@ defmodule Ferricstore.Store.Promotion do
     end
   end
 
+  defp read_shared_recovery_value!(
+         {shard_data_path, _instance_ctx, shard_index},
+         fid,
+         offset,
+         key,
+         operation
+       )
+       when is_integer(fid) and fid >= 0 do
+    path = Path.join(shard_data_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
+    read_recovery_value!(path, offset, key, operation, shard_index)
+  end
+
+  defp read_shared_recovery_value!(
+         {_shard_data_path, _instance_ctx, shard_index} = location_ctx,
+         fid,
+         offset,
+         key,
+         operation
+       ) do
+    case promotion_entry_value(location_ctx, key, nil, fid, offset) do
+      {:ok, value} -> value
+      {:error, reason} -> fail_recovery!(operation, {fid, offset, key}, shard_index, reason)
+    end
+  end
+
   defp recovery_log_files!(dir, shard_index) do
     case list_log_files_result(dir) do
       {:ok, []} ->
@@ -2281,12 +2308,13 @@ defmodule Ferricstore.Store.Promotion do
          redis_key,
          type,
          shard_data_path,
-         shard_index
+         shard_index,
+         instance_ctx
        ) do
     expected_type = CompoundKey.encode_type(type)
 
     actual_type =
-      shared_recovery_type!(shared_state, redis_key, shard_data_path, shard_index)
+      shared_recovery_type!(shared_state, redis_key, shard_data_path, shard_index, instance_ctx)
 
     if actual_type != expected_type do
       fail_recovery!(
@@ -2303,33 +2331,35 @@ defmodule Ferricstore.Store.Promotion do
          redis_key,
          type,
          shard_data_path,
-         shard_index
+         shard_index,
+         instance_ctx
        ) do
-    shared_recovery_type!(shared_state, redis_key, shard_data_path, shard_index) !=
+    shared_recovery_type!(shared_state, redis_key, shard_data_path, shard_index, instance_ctx) !=
       CompoundKey.encode_type(type)
   end
 
-  defp shared_type_differs?(_shared_state, _redis_key, _type, _shard_data_path, _shard_index),
-    do: false
+  defp shared_type_differs?(
+         _shared_state,
+         _redis_key,
+         _type,
+         _shard_data_path,
+         _shard_index,
+         _instance_ctx
+       ),
+       do: false
 
-  defp shared_recovery_type!(shared_state, redis_key, shard_data_path, shard_index) do
+  defp shared_recovery_type!(shared_state, redis_key, shard_data_path, shard_index, instance_ctx) do
     case shared_state.type_record do
       {_key, value, _fid, _offset} when is_binary(value) ->
         value
 
       {type_key, _value, fid, offset} ->
-        file_path =
-          Path.join(
-            shard_data_path,
-            "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log"
-          )
-
-        read_recovery_value!(
-          file_path,
+        read_shared_recovery_value!(
+          {shard_data_path, instance_ctx, shard_index},
+          fid,
           offset,
           type_key,
-          :read_shared_type,
-          shard_index
+          :read_shared_type
         )
 
       nil ->

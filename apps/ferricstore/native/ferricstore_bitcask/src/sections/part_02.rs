@@ -3,21 +3,7 @@ const MAX_SCAN_FILE_PAGE_RECORDS: usize = 65_536;
 fn available_disk_space_for_path(path: &std::path::Path) -> Result<u64, String> {
     #[cfg(unix)]
     {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-
-        let path = CString::new(path.as_os_str().as_bytes()).map_err(|error| error.to_string())?;
-        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        let result = unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) };
-
-        if result != 0 {
-            return Err(format!(
-                "statvfs failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-
-        let stat = unsafe { stat.assume_init() };
+        let stat = system_capacity::statvfs_for_path(path)?;
         u64::try_from(u128::from(stat.f_bavail) * u128::from(stat.f_frsize))
             .map_err(|_| "available disk space overflow".to_owned())
     }
@@ -100,6 +86,17 @@ fn v2_scan_file_page<'a>(
             Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
         },
         Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+/// Validate an active log and truncate only a structurally incomplete final
+/// record. Integrity and format errors are returned to the caller.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_recover_torn_tail<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
+    match log::recover_torn_tail(std::path::Path::new(&path)) {
+        Ok(valid_end) => Ok((atoms::ok(), valid_end).encode(env)),
+        Err(error) => Ok((atoms::error(), error.to_string()).encode(env)),
     }
 }
 
