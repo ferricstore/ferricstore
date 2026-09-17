@@ -158,6 +158,29 @@ defmodule Ferricstore.Commands.NativeAstParserContractTest do
               [{"child", [partition_key: "tenant", type: "job", payload: "payload"]}], []}
   end
 
+  test "FLOW.REWIND retains binary reasons and rejects unsupported reason forms" do
+    assert ast("FLOW.REWIND", [
+             "flow-1",
+             "TO_EVENT",
+             "1-0",
+             "REASON",
+             "operator corrected"
+           ]) ==
+             {:flow_rewind, "flow-1", [to_event: "1-0", reason: "operator corrected"]}
+
+    assert ast("FLOW.REWIND", [
+             "flow-1",
+             "TO_EVENT",
+             "1-0",
+             "REASON_REF",
+             "external"
+           ]) ==
+             {:flow_rewind, "flow-1", {:error, "ERR syntax error"}}
+
+    assert ast("FLOW.REWIND", ["flow-1", "TO_EVENT", "1-0", "REASON"]) ==
+             {:flow_rewind, "flow-1", {:error, "ERR syntax error"}}
+  end
+
   test "repeated Flow list options preserve order without append-based quadratic accumulation" do
     value_args = Enum.flat_map(1..1_000, fn index -> ["VALUE", "key-#{index}", "value"] end)
 

@@ -1077,8 +1077,6 @@ defmodule FerricstoreServer.Native.Codec do
        do: :state_attrs
 
   defp compact_claim_job_mode({_id, _partition, _lease, _fencing}), do: :base
-  defp compact_claim_job_mode(%{"id" => _id}), do: :state_attrs
-  defp compact_claim_job_mode(%{id: _id}), do: :state_attrs
   defp compact_claim_job_mode(_job), do: nil
 
   defp compact_response_payload(opcode, :ok, value)
@@ -1244,28 +1242,6 @@ defmodule FerricstoreServer.Native.Codec do
 
   defp compact_claim_job_item({id, partition_key, lease_token, fencing_token}),
     do: compact_claim_job_item([id, partition_key, lease_token, fencing_token])
-
-  defp compact_claim_job_item(%{"id" => id} = job) do
-    compact_claim_job_item([
-      id,
-      Map.get(job, "partition_key"),
-      Map.get(job, "lease_token"),
-      Map.get(job, "fencing_token"),
-      Map.get(job, "run_state") || Map.get(job, "state"),
-      Map.get(job, "attributes", %{})
-    ])
-  end
-
-  defp compact_claim_job_item(%{id: id} = job) do
-    compact_claim_job_item([
-      id,
-      Map.get(job, :partition_key),
-      Map.get(job, :lease_token),
-      Map.get(job, :fencing_token),
-      Map.get(job, :run_state) || Map.get(job, :state),
-      Map.get(job, :attributes, %{})
-    ])
-  end
 
   defp compact_claim_job_item(_job), do: :error
 

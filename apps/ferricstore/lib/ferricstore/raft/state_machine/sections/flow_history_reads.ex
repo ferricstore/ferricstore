@@ -237,7 +237,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
              correlation_id: flow_nilable_history_field(fields, "correlation_id"),
              result_ref: flow_nilable_history_field(fields, "result_ref"),
              error_ref:
-               Map.get(attrs, :reason_ref) || flow_nilable_history_field(fields, "error_ref"),
+               flow_value_ref(
+                 attrs,
+                 :error,
+                 Map.fetch!(record, :id),
+                 Map.fetch!(record, :version) + 1,
+                 Map.get(record, :partition_key),
+                 flow_nilable_history_field(fields, "error_ref")
+               ),
              value_refs: flow_history_named_value_refs_field(fields),
              lease_owner: nil,
              lease_token: nil,

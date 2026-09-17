@@ -439,8 +439,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
 
           with :ok <- flow_validate_record_keys(record),
                :ok <- flow_validate_record_keys(next),
+               :ok <- flow_maybe_put_record_value(state, next, attrs, :error),
                :ok <- flow_transition_move_indexes(state, [{record, next}]),
-               :ok <- flow_refresh_record_value_expirations(state, next, %{}),
+               :ok <- flow_refresh_record_value_expirations(state, next, attrs),
                state_key = FlowKeys.state_key(id, partition_key),
                :ok <- flow_put_state_record(state, state_key, next),
                :ok <- flow_queue_lmdb_reactivated_state_projection(state, state_key, next),

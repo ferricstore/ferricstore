@@ -24,7 +24,8 @@ defmodule Ferricstore.Raft.BlobCommand.FlowAttrs do
     :flow_fail,
     :flow_fail_many,
     :flow_cancel,
-    :flow_cancel_many
+    :flow_cancel_many,
+    :flow_rewind
   ]
 
   def prepare_flow_attrs(data_dir, shard_index, threshold, attrs) do

@@ -704,6 +704,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
           reason_ref: nil,
           partition_key: partition_key
         }
+        |> maybe_put_cancel_reason(opts)
         |> maybe_put_attr(:now_ms, now)
 
       {:ok, attrs}

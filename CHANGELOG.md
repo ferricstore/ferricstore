@@ -4,6 +4,20 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.19 - 2026-09-17
+
+- Schedule resolved nonterminal child joins at their resolution time so parents
+  can be claimed again, including custom successor states and cross-shard joins.
+  Terminal successors remain outside the due index; retry attempts are unchanged.
+- Preserve full record and job-map responses when native compact claim codecs
+  are negotiated. Explicit compact job responses retain their existing format
+  and fast path; full records no longer lose metadata or selected values.
+- Accept `FLOW.REWIND REASON` through the generic command parser and persist the
+  supplied reason with its history reference, including large binary reasons.
+  Unsupported external `REASON_REF` inputs remain rejected.
+- Existing parents already stalled with a missing due time are not automatically
+  repaired. This patch does not add a startup scan or modify historical records.
+
 ## 0.11.18 - 2026-09-13
 
 - Hardened restart recovery for active Bitcask and blob segments: repair only

@@ -727,7 +727,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
                 updated_at_ms: now_ms,
                 child_groups: updated_groups
               })
-              |> flow_clear_parent_if_resolved(resolved_group)
+              |> flow_clear_parent_if_resolved(resolved_group, now_ms)
               |> flow_stamp_terminal_retention(now_ms)
 
             {:ok, next}
@@ -825,17 +825,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
 
       defp flow_child_group_parent_state(parent, _group), do: Map.fetch!(parent, :state)
 
-      defp flow_clear_parent_if_resolved(next, %{"resolved" => resolved})
-           when resolved in ["success", "failure"] do
+      defp flow_clear_parent_if_resolved(next, %{"resolved" => resolved}, now_ms)
+           when resolved in ["success", "failure"] and is_integer(now_ms) do
+        next_run_at_ms =
+          if Ferricstore.Flow.LMDB.terminal_state?(Map.get(next, :state)),
+            do: nil,
+            else: now_ms
+
         next
-        |> Map.put(:next_run_at_ms, nil)
+        |> Map.put(:next_run_at_ms, next_run_at_ms)
         |> Map.put(:ttl_ms, nil)
         |> Map.put(:lease_owner, nil)
         |> Map.put(:lease_token, nil)
         |> Map.put(:lease_deadline_ms, 0)
       end
 
-      defp flow_clear_parent_if_resolved(next, _group), do: next
+      defp flow_clear_parent_if_resolved(next, _group, _now_ms), do: next
 
       defp flow_maybe_apply_resolved_parent_terminal(state, parent, now_ms) do
         case Map.get(parent, :state) do

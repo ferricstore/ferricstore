@@ -474,6 +474,21 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     assert_flow_blob_marker(root, marker, payload)
   end
 
+  test "prepares Flow rewind reasons through the existing value side channel", %{
+    ctx: ctx,
+    root: root
+  } do
+    reason = :binary.copy("reason", 1024)
+    command = {:flow_rewind, "state-key", %{id: "rewind", to_event: "1-0", error: reason}}
+
+    assert BlobCommand.side_channel_candidate?(ctx, command)
+
+    assert {:ok, {:flow_rewind, "state-key", %{error: marker}}} =
+             BlobCommand.prepare(ctx, 0, command, single_member?: true)
+
+    assert_flow_blob_marker(root, marker, reason)
+  end
+
   test "prepares idempotent Flow create payloads as pre-externalized value refs", %{
     ctx: ctx,
     root: root
