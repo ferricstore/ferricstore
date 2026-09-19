@@ -4,10 +4,15 @@ defmodule Ferricstore.Flow.LMDBRebuilderPruneRaceTest do
   alias Ferricstore.Flow.{Keys, LMDBRebuilder}
   alias Ferricstore.Raft.WARaftSegmentReader
 
-  for {replace?, before_prune?} <- [{false, false}, {true, false}, {true, true}] do
-    @replace replace?
-    @before_prune before_prune?
-    test "terminal rebuild pruning accounts only the deleted row (replacement=#{replace?}, before_prune=#{before_prune?})" do
+  for {replace?, before_prune?, lfu_only?} <- [
+        {false, false, false},
+        {true, false, false},
+        {true, true, false},
+        {false, false, true}
+      ] do
+    @tag replacement: replace?, before_prune: before_prune?, lfu_only: lfu_only?
+    test "terminal rebuild pruning accounts only the deleted row (replacement=#{replace?}, before_prune=#{before_prune?}, lfu_only=#{lfu_only?})",
+         %{replacement: replace?, before_prune: before_prune?, lfu_only: lfu_only?} do
       data_dir =
         Path.join(System.tmp_dir!(), "rebuild-prune-#{System.unique_integer([:positive])}")
 
@@ -38,13 +43,15 @@ defmodule Ferricstore.Flow.LMDBRebuilderPruneRaceTest do
       newer =
         Ferricstore.Flow.encode_record(%{
           record
-          | state: if(@before_prune, do: "completed", else: "queued"),
-            version: if(@before_prune, do: 1, else: 2),
+          | state: if(before_prune?, do: "completed", else: "queued"),
+            version: if(before_prune?, do: 1, else: 2),
             incarnation: 2
         })
 
-      old_row = {key, encoded, 0, 0, {:waraft_apply_projection, 1}, 0, byte_size(encoded)}
-      new_row = {key, newer, 0, 0, {:waraft_apply_projection, 2}, 0, byte_size(newer)}
+      old_lfu = if(lfu_only?, do: {:flow_state_version, 1, 0}, else: 0)
+      new_lfu = if(lfu_only?, do: {:flow_state_version, 1, 17}, else: 0)
+      old_row = {key, encoded, 0, old_lfu, {:waraft_apply_projection, 1}, 0, byte_size(encoded)}
+      new_row = {key, newer, 0, new_lfu, {:waraft_apply_projection, 2}, 0, byte_size(newer)}
       true = :ets.insert(keydir, old_row)
       :atomics.put(bytes, 1, offheap(key) + offheap(encoded))
 
@@ -66,12 +73,19 @@ defmodule Ferricstore.Flow.LMDBRebuilderPruneRaceTest do
             _ -> false
           end)
 
-        if pruning? or (@before_prune and not Process.get(:prune_hook_called, false)) do
+        if pruning? or (before_prune? and not Process.get(:prune_hook_called, false)) do
           Process.put(:prune_hook_called, true)
 
-          if @replace do
-            true = :ets.insert(keydir, new_row)
-            :atomics.put(bytes, 1, offheap(key) + offheap(newer))
+          cond do
+            lfu_only? ->
+              true = :ets.update_element(keydir, key, {4, new_lfu})
+
+            replace? ->
+              true = :ets.insert(keydir, new_row)
+              :atomics.put(bytes, 1, offheap(key) + offheap(newer))
+
+            true ->
+              :ok
           end
         end
 
@@ -96,7 +110,7 @@ defmodule Ferricstore.Flow.LMDBRebuilderPruneRaceTest do
 
         assert Process.get(:prune_hook_called)
 
-        if @replace do
+        if replace? do
           assert :ets.lookup(keydir, key) == [new_row]
           assert :atomics.get(bytes, 1) == offheap(key) + offheap(newer)
         else

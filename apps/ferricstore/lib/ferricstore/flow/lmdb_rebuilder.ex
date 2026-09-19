@@ -2003,7 +2003,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
          ^incarnation <- Map.get(current, :incarnation),
          true <- LMDB.terminal_state?(Map.get(current, :state)),
          :ok <- ensure_apply_projection_row_durable(instance_ctx, shard_index, row),
-         true <- Ferricstore.Store.Keydir.delete_exact(keydir, row) do
+         true <- Ferricstore.Store.Keydir.delete_unchanged_source(keydir, row) do
       track_pruned_binary_remove(row, shard_index, instance_ctx)
     end
 

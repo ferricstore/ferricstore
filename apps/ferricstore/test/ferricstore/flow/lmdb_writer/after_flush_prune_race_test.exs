@@ -24,6 +24,17 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushPruneRaceTest do
     end
   end
 
+  test "terminal prune deletes the unchanged source after an LFU-only update" do
+    for action_kind <- [:direct, :from_source] do
+      run_prune_race(
+        action_kind,
+        {:flow_state_version, 1, 0},
+        {:flow_state_version, 1, 17},
+        :lfu_only
+      )
+    end
+  end
+
   test "terminal prune fails closed when the source projection is not durable" do
     id = "after-flush-prune-missing-#{System.unique_integer([:positive])}"
     state_key = Keys.state_key(id)
@@ -54,6 +65,10 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushPruneRaceTest do
 
   test "hibernation eviction keeps a writer publication from racing index cleanup" do
     run_post_delete_race(:hibernate)
+  end
+
+  test "hibernation eviction deletes the unchanged source after an LFU-only update" do
+    run_lfu_only_hibernation()
   end
 
   test "terminal prune does not clean indexes when an absent source appears while waiting" do
@@ -144,7 +159,7 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushPruneRaceTest do
     end)
   end
 
-  defp run_prune_race(action_kind, old_lfu, new_lfu) do
+  defp run_prune_race(action_kind, old_lfu, new_lfu, mutation \\ :replacement) do
     test_pid = self()
     hook_ref = make_ref()
     suffix = System.unique_integer([:positive])
@@ -230,7 +245,10 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushPruneRaceTest do
         send(test_pid, {hook_ref, :called, index, source})
 
         if source == :latest and index == projection_index do
-          true = :ets.insert(ets, new_row)
+          case mutation do
+            :replacement -> true = :ets.insert(ets, new_row)
+            :lfu_only -> true = :ets.update_element(ets, state_key, {4, new_lfu})
+          end
         end
 
         :ok
@@ -251,27 +269,40 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushPruneRaceTest do
 
     assert :ok = AfterFlush.apply_after_flush(action)
     assert_receive {^hook_ref, :called, ^projection_index, :latest}
-    assert [^new_row] = :ets.lookup(ets, state_key)
 
-    assert {:ok,
-            %{
-              id: ^id,
-              state: "queued",
-              version: 2,
-              payload_ref: "new-payload",
-              root_flow_id: root_flow_id,
-              correlation_id: correlation_id
-            }} = AfterFlush.flow_record_from_keydir_row(data_dir, 0, state_key, new_row)
+    case mutation do
+      :replacement ->
+        assert [^new_row] = :ets.lookup(ets, state_key)
 
-    assert root_flow_id == old_record.root_flow_id
-    assert correlation_id == old_record.correlation_id
+        assert {:ok,
+                %{
+                  id: ^id,
+                  state: "queued",
+                  version: 2,
+                  payload_ref: "new-payload",
+                  root_flow_id: root_flow_id,
+                  correlation_id: correlation_id
+                }} = AfterFlush.flow_record_from_keydir_row(data_dir, 0, state_key, new_row)
 
-    assert [{{^state_index_key, ^id}, 1.0}] =
-             :ets.lookup(zset_lookup, {state_index_key, id})
+        assert root_flow_id == old_record.root_flow_id
+        assert correlation_id == old_record.correlation_id
 
-    Enum.each(metadata_index_keys, fn index_key ->
-      assert {:ok, 1.0} = NativeOrderedIndex.score_of(native, index_key, id)
-    end)
+        assert [{{^state_index_key, ^id}, 1.0}] =
+                 :ets.lookup(zset_lookup, {state_index_key, id})
+
+        Enum.each(metadata_index_keys, fn index_key ->
+          assert {:ok, 1.0} = NativeOrderedIndex.score_of(native, index_key, id)
+        end)
+
+      :lfu_only ->
+        assert [] = :ets.lookup(ets, state_key)
+
+        assert [] = :ets.lookup(zset_lookup, {state_index_key, id})
+
+        Enum.each(metadata_index_keys, fn index_key ->
+          assert :miss = NativeOrderedIndex.score_of(native, index_key, id)
+        end)
+    end
 
     Process.delete(:ferricstore_waraft_apply_projection_disk_read_hook)
     NativeOrderedIndex.unregister(flow_index, flow_lookup)
@@ -454,6 +485,118 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushPruneRaceTest do
     Enum.each(index_keys, fn index_key ->
       assert [{{^index_key, ^id}, 1.0}] = :ets.lookup(zset_lookup, {index_key, id})
       assert {:ok, 2.0} = NativeOrderedIndex.score_of(native, index_key, id)
+    end)
+  end
+
+  defp run_lfu_only_hibernation do
+    test_pid = self()
+    hook_ref = make_ref()
+    suffix = System.unique_integer([:positive])
+    id = "after-flush-lfu-only-hibernate-#{suffix}"
+    state_key = Keys.state_key(id)
+    projection_index = System.unique_integer([:positive])
+    data_dir = Path.join(System.tmp_dir!(), "ferricstore-#{id}")
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    ets = :ets.new(String.to_atom("after_flush_lfu_hibernate_keydir_#{suffix}"), [:set, :public])
+
+    zset_index =
+      :ets.new(String.to_atom("after_flush_lfu_hibernate_zset_#{suffix}"), [:ordered_set, :public])
+
+    zset_lookup =
+      :ets.new(String.to_atom("after_flush_lfu_hibernate_lookup_#{suffix}"), [:set, :public])
+
+    instance_name = String.to_atom("after_flush_lfu_hibernate_#{suffix}")
+    {flow_index, flow_lookup} = NativeOrderedIndex.table_names(instance_name, 0)
+    native = NativeOrderedIndex.reset(flow_index, flow_lookup)
+    publication_ctx = publication_ctx()
+
+    record =
+      flow_record(id, suffix, %{state: "queued", version: 1, next_run_at_ms: 100, priority: 0})
+
+    encoded = Ferricstore.Flow.encode_record(record)
+    old_lfu = {:flow_state_version, 1, 0}
+    new_lfu = {:flow_state_version, 1, 17}
+
+    row =
+      {state_key, nil, 0, old_lfu, {:waraft_apply_projection, projection_index}, 0,
+       byte_size(encoded)}
+
+    locator = %Locator{
+      flow_id: id,
+      kind: :state,
+      version: 1,
+      raft_index: 1,
+      file_id: {:waraft_apply_projection, projection_index},
+      offset: 0,
+      value_size: byte_size(encoded)
+    }
+
+    index_keys = Hibernation.hot_index_keys(record, due_any?: true)
+    true = :ets.insert(ets, row)
+
+    assert :ok =
+             WARaftSegmentReader.put_apply_projection(
+               data_dir,
+               0,
+               projection_index,
+               [{state_key, encoded, 0}]
+             )
+
+    Enum.each(index_keys, fn index_key ->
+      assert :ok = ZSetIndex.mark_ready_empty(zset_index, zset_lookup, index_key)
+      assert :ok = ZSetIndex.put_member(zset_index, zset_lookup, index_key, id, "1")
+      assert :ok = NativeOrderedIndex.put_member(native, index_key, id, 1)
+    end)
+
+    on_exit(fn ->
+      Process.delete(:ferricstore_waraft_apply_projection_disk_read_hook)
+      Process.delete(:ferricstore_after_flush_hot_delete_hook)
+      NativeOrderedIndex.unregister(flow_index, flow_lookup)
+
+      WARaftSegmentReader.delete_apply_projection_entries(
+        data_dir,
+        0,
+        [{projection_index, state_key}]
+      )
+
+      File.rm_rf!(data_dir)
+    end)
+
+    Process.put(
+      :ferricstore_waraft_apply_projection_disk_read_hook,
+      fn _root, index, source ->
+        send(test_pid, {hook_ref, :called, index, source})
+
+        if source == :latest and index == projection_index do
+          true = :ets.update_element(ets, state_key, {4, new_lfu})
+        end
+
+        :ok
+      end
+    )
+
+    action =
+      {:hibernate_flow_evict_hot,
+       %{
+         data_dir: data_dir,
+         shard_index: 0,
+         ets: ets,
+         flow_index: flow_index,
+         flow_lookup: flow_lookup,
+         zset_index: zset_index,
+         zset_lookup: zset_lookup,
+         state_key: state_key,
+         record: record,
+         locator: locator
+       }}
+
+    assert :ok = AfterFlush.apply_after_flush(action, publication_ctx)
+    assert_receive {^hook_ref, :called, ^projection_index, :latest}
+    assert [] = :ets.lookup(ets, state_key)
+
+    Enum.each(index_keys, fn index_key ->
+      assert [] = :ets.lookup(zset_lookup, {index_key, id})
+      assert :miss = NativeOrderedIndex.score_of(native, index_key, id)
     end)
   end
 

@@ -273,21 +273,15 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
              value_size == locator.value_size do
           with :ok <- ensure_apply_projection_row_durable(data_dir, shard_index, row) do
             with_publication_write(publication_ctx, shard_index, fn ->
-              case :ets.lookup(ets, state_key) do
-                [^row] ->
-                  if Keydir.delete_exact(ets, row) do
-                    after_hot_delete_hook(:hibernate, ets, row)
+              if Keydir.delete_unchanged_source(ets, row) do
+                after_hot_delete_hook(:hibernate, ets, row)
 
-                    case cleanup.() do
-                      :ok -> {:ok, true}
-                      {:error, _reason} = error -> error
-                    end
-                  else
-                    {:ok, false}
-                  end
-
-                _stale ->
-                  {:ok, false}
+                case cleanup.() do
+                  :ok -> {:ok, true}
+                  {:error, _reason} = error -> error
+                end
+              else
+                {:ok, false}
               end
             end)
           end
@@ -483,7 +477,7 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
   end
 
   defp delete_pruned_keydir_entry(ets, row) do
-    if Keydir.delete_exact(ets, row) do
+    if Keydir.delete_unchanged_source(ets, row) do
       after_hot_delete_hook(:terminal, ets, row)
       :ok
     else

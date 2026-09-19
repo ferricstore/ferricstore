@@ -33,6 +33,61 @@ defmodule Ferricstore.Store.KeydirConcurrencyTest do
     end
   end
 
+  test "unchanged source delete ignores numeric and tagged LFU counter changes" do
+    cases = [
+      {"numeric", LFU.initial(), LFU.initial() + 1},
+      {
+        "tagged",
+        {:flow_state_version, 7, LFU.initial()},
+        {:flow_state_version, 7, LFU.initial() + 1}
+      }
+    ]
+
+    Enum.each(cases, fn {label, observed_lfu, current_lfu} ->
+      table = new_keydir()
+      key = "keydir-source-lfu-#{label}"
+      observed = {key, "old", 10, observed_lfu, 1, 20, 3}
+      current = put_elem(observed, 3, current_lfu)
+
+      try do
+        true = :ets.insert(table, current)
+
+        assert Keydir.delete_unchanged_source(table, observed)
+        assert [] = :ets.lookup(table, key)
+      after
+        :ets.delete(table)
+      end
+    end)
+  end
+
+  test "unchanged source delete preserves every non-LFU identity field" do
+    observed = {"keydir-source-identity", "old", 10, {:flow_state_version, 7, 1}, 1, 20, 3}
+
+    replacements = [
+      put_elem(observed, 3, {:flow_state_version, 8, 2}),
+      put_elem(observed, 3, 1),
+      put_elem(observed, 1, "new"),
+      put_elem(observed, 2, 11),
+      put_elem(observed, 4, 2),
+      put_elem(observed, 5, 21),
+      put_elem(observed, 6, 4)
+    ]
+
+    Enum.each(replacements, fn replacement ->
+      table = new_keydir()
+      key = elem(observed, 0)
+
+      try do
+        true = :ets.insert(table, replacement)
+
+        refute Keydir.delete_unchanged_source(table, observed)
+        assert [^replacement] = :ets.lookup(table, key)
+      after
+        :ets.delete(table)
+      end
+    end)
+  end
+
   test "exact replacement cannot resurrect a stale cold value" do
     table = new_keydir()
     key = "keydir-cas-warm"

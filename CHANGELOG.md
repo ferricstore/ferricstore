@@ -31,6 +31,9 @@ All notable changes to FerricStore will be documented here.
 - Match delayed terminal cleanup to the Flow incarnation, not just its version,
   and require source-based cleanup to match its durable query projection. Reusing
   an expired Flow ID no longer lets old cleanup remove the replacement.
+- Ignore read-side LFU counter changes during validated terminal and hibernation
+  cleanup while retaining all source identity checks, so reads cannot prevent
+  eligible hot records and indexes from being removed.
 
 ## 0.11.18 - 2026-09-13
 
