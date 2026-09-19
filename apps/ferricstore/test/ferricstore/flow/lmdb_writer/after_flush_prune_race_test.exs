@@ -1,6 +1,8 @@
 defmodule Ferricstore.Flow.LMDBWriter.AfterFlushPruneRaceTest do
   use ExUnit.Case, async: false
 
+  @writer_wait_timeout_ms 5_000
+
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.Locator
   alias Ferricstore.Flow.Hibernation
@@ -11,6 +13,18 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushPruneRaceTest do
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Raft.WARaftSegmentReader
   alias Ferricstore.Store.Shard.ZSetIndex
+
+  test "writer cleanup works from a separate on-exit process and is idempotent" do
+    writer = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> Process.exit(writer, :kill) end)
+
+    assert :ok =
+             Task.async(fn -> stop_writer_if_needed!(writer) end)
+             |> Task.await(@writer_wait_timeout_ms)
+
+    refute Process.alive?(writer)
+    assert :ok = stop_writer_if_needed!(writer)
+  end
 
   test "terminal prune keeps newer tagged rows and metadata for both actions" do
     for action_kind <- [:direct, :from_source] do
@@ -236,7 +250,7 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushPruneRaceTest do
         [{projection_index, state_key}]
       )
 
-      File.rm_rf!(data_dir)
+      Ferricstore.Test.LMDBFixture.cleanup_data_dir!(data_dir)
     end)
 
     Process.put(
@@ -311,7 +325,7 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushPruneRaceTest do
       {projection_index, state_key}
     ])
 
-    File.rm_rf!(data_dir)
+    Ferricstore.Test.LMDBFixture.cleanup_data_dir!(data_dir)
   end
 
   defp run_post_delete_race(:terminal) do
@@ -364,18 +378,22 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushPruneRaceTest do
     end)
 
     Process.put(:ferricstore_after_flush_hot_delete_hook, fn :terminal, _ets, _row ->
-      spawn(fn ->
-        Ferricstore.Store.PublicationEpoch.with_write(publication_ctx, 0, fn ->
-          true = :ets.insert(ets, new_row)
-          assert :ok = ZSetIndex.put_member(zset_index, zset_lookup, state_index_key, id, "1")
+      {writer_pid, writer_ref} =
+        spawn_monitor(fn ->
+          Ferricstore.Store.PublicationEpoch.with_write(publication_ctx, 0, fn ->
+            true = :ets.insert(ets, new_row)
+            assert :ok = ZSetIndex.put_member(zset_index, zset_lookup, state_index_key, id, "1")
 
-          Enum.each(metadata_index_keys, fn index_key ->
-            assert :ok = NativeOrderedIndex.put_member(native, index_key, id, 2)
+            Enum.each(metadata_index_keys, fn index_key ->
+              assert :ok = NativeOrderedIndex.put_member(native, index_key, id, 2)
+            end)
           end)
 
           send(test_pid, {hook_ref, :writer_done})
         end)
-      end)
+
+      on_exit(fn -> stop_writer_if_needed!(writer_pid) end)
+      send(test_pid, {hook_ref, :writer_spawned, writer_pid, writer_ref})
 
       refute_receive {^hook_ref, :writer_done}, 50
       send(test_pid, {hook_ref, :hook_returned})
@@ -389,8 +407,10 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushPruneRaceTest do
        old_record.incarnation}
 
     assert :ok = AfterFlush.apply_after_flush(action, publication_ctx)
-    assert_receive {^hook_ref, :hook_returned}
-    assert_receive {^hook_ref, :writer_done}
+    assert_receive {^hook_ref, :writer_spawned, writer_pid, writer_ref}
+    assert_receive {^hook_ref, :hook_returned}, @writer_wait_timeout_ms
+    assert_receive {^hook_ref, :writer_done}, @writer_wait_timeout_ms
+    assert_receive {:DOWN, ^writer_ref, :process, ^writer_pid, :normal}, @writer_wait_timeout_ms
     assert [^new_row] = :ets.lookup(ets, state_key)
     assert [{{^state_index_key, ^id}, 1.0}] = :ets.lookup(zset_lookup, {state_index_key, id})
 
@@ -444,18 +464,22 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushPruneRaceTest do
     end)
 
     Process.put(:ferricstore_after_flush_hot_delete_hook, fn :hibernate, _ets, _row ->
-      spawn(fn ->
-        Ferricstore.Store.PublicationEpoch.with_write(publication_ctx, 0, fn ->
-          true = :ets.insert(ets, row)
+      {writer_pid, writer_ref} =
+        spawn_monitor(fn ->
+          Ferricstore.Store.PublicationEpoch.with_write(publication_ctx, 0, fn ->
+            true = :ets.insert(ets, row)
 
-          Enum.each(index_keys, fn index_key ->
-            assert :ok = ZSetIndex.put_member(zset_index, zset_lookup, index_key, id, "1")
-            assert :ok = NativeOrderedIndex.put_member(native, index_key, id, 2)
+            Enum.each(index_keys, fn index_key ->
+              assert :ok = ZSetIndex.put_member(zset_index, zset_lookup, index_key, id, "1")
+              assert :ok = NativeOrderedIndex.put_member(native, index_key, id, 2)
+            end)
           end)
 
           send(test_pid, {hook_ref, :writer_done})
         end)
-      end)
+
+      on_exit(fn -> stop_writer_if_needed!(writer_pid) end)
+      send(test_pid, {hook_ref, :writer_spawned, writer_pid, writer_ref})
 
       refute_receive {^hook_ref, :writer_done}, 50
       send(test_pid, {hook_ref, :hook_returned})
@@ -478,8 +502,10 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushPruneRaceTest do
        }}
 
     assert :ok = AfterFlush.apply_after_flush(action, publication_ctx)
-    assert_receive {^hook_ref, :hook_returned}
-    assert_receive {^hook_ref, :writer_done}
+    assert_receive {^hook_ref, :writer_spawned, writer_pid, writer_ref}
+    assert_receive {^hook_ref, :hook_returned}, @writer_wait_timeout_ms
+    assert_receive {^hook_ref, :writer_done}, @writer_wait_timeout_ms
+    assert_receive {:DOWN, ^writer_ref, :process, ^writer_pid, :normal}, @writer_wait_timeout_ms
     assert [^row] = :ets.lookup(ets, state_key)
 
     Enum.each(index_keys, fn index_key ->
@@ -559,7 +585,7 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushPruneRaceTest do
         [{projection_index, state_key}]
       )
 
-      File.rm_rf!(data_dir)
+      Ferricstore.Test.LMDBFixture.cleanup_data_dir!(data_dir)
     end)
 
     Process.put(
@@ -603,6 +629,17 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushPruneRaceTest do
   defp publication_ctx do
     latch = :ets.new(:after_flush_publication_latch, [:set, :public])
     %{publication_epoch: :atomics.new(1, signed: false), latch_refs: {latch}}
+  end
+
+  defp stop_writer_if_needed!(writer_pid) do
+    writer_ref = Process.monitor(writer_pid)
+    Process.exit(writer_pid, :kill)
+
+    receive do
+      {:DOWN, ^writer_ref, :process, ^writer_pid, _reason} -> :ok
+    after
+      @writer_wait_timeout_ms -> flunk("fixture writer did not terminate")
+    end
   end
 
   defp seed_query_row!(lmdb_path, state_key, record) do

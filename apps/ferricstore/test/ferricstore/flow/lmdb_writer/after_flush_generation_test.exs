@@ -85,7 +85,7 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushGenerationTest do
     true = :ets.insert(keydir, row)
     seed_query_row!(lmdb_path, state_key, durable_record)
 
-    on_exit(fn -> File.rm_rf!(data_dir) end)
+    on_exit(fn -> Ferricstore.Test.LMDBFixture.cleanup_data_dir!(data_dir) end)
 
     action = source_action(data_dir, keydir, state_key, 1)
 
@@ -111,12 +111,37 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushGenerationTest do
     true = :ets.insert(keydir, row)
     seed_query_row!(lmdb_path, state_key, source_record)
 
-    on_exit(fn -> File.rm_rf!(data_dir) end)
+    on_exit(fn -> Ferricstore.Test.LMDBFixture.cleanup_data_dir!(data_dir) end)
 
     action = source_action(data_dir, keydir, state_key, 1)
 
     assert :ok = AfterFlush.apply_after_flush(action)
     assert [] = :ets.lookup(keydir, state_key)
+  end
+
+  test "fixture cleanup releases only its LMDB path before removing the directory" do
+    first_data_dir = temp_data_dir("cleanup-first")
+    second_data_dir = temp_data_dir("cleanup-second")
+    first_lmdb_path = LMDB.path(Ferricstore.DataDir.shard_data_path(first_data_dir, 0))
+    second_lmdb_path = LMDB.path(Ferricstore.DataDir.shard_data_path(second_data_dir, 0))
+
+    on_exit(fn ->
+      Ferricstore.Test.LMDBFixture.cleanup_data_dir!(first_data_dir)
+      Ferricstore.Test.LMDBFixture.cleanup_data_dir!(second_data_dir)
+    end)
+
+    assert :ok = LMDB.write_batch(first_lmdb_path, [{:put, "first", "value"}])
+    assert :ok = LMDB.write_batch(second_lmdb_path, [{:put, "second", "value"}])
+
+    assert :ok = Ferricstore.Test.LMDBFixture.cleanup_data_dir!(first_data_dir)
+    refute File.exists?(first_data_dir)
+
+    File.mkdir_p!(first_lmdb_path)
+    assert {:ok, 0} = Ferricstore.Bitcask.NIF.lmdb_release(first_lmdb_path)
+    assert {:ok, 1} = Ferricstore.Bitcask.NIF.lmdb_release(second_lmdb_path)
+
+    assert :ok = Ferricstore.Test.LMDBFixture.cleanup_data_dir!(second_data_dir)
+    refute File.exists?(second_data_dir)
   end
 
   defp prune_action(ets, state_key, id, version, incarnation) do

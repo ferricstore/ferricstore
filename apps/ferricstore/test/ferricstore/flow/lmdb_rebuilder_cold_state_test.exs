@@ -88,7 +88,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdStateTest do
 
     on_exit(fn ->
       WARaftSegmentReader.clear_apply_projection_cache(data_dir, 0)
-      File.rm_rf!(data_dir)
+      Ferricstore.Test.LMDBFixture.cleanup_data_dir!(data_dir)
     end)
 
     assert :ok =
@@ -176,7 +176,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdStateTest do
 
     on_exit(fn ->
       Process.delete(:ferricstore_waraft_apply_projection_disk_read_hook)
-      File.rm_rf!(data_dir)
+      Ferricstore.Test.LMDBFixture.cleanup_data_dir!(data_dir)
     end)
 
     assert :ok =
@@ -207,7 +207,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdStateTest do
        byte_size(encoded)}
     )
 
-    on_exit(fn -> File.rm_rf!(data_dir) end)
+    on_exit(fn -> Ferricstore.Test.LMDBFixture.cleanup_data_dir!(data_dir) end)
 
     assert {:error,
             {:flow_lmdb_reconcile_unhealthy,
@@ -236,7 +236,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdStateTest do
       {state_key, nil, 0, LFU.initial(), {:waraft_apply_projection, index}, 0, 16}
     )
 
-    on_exit(fn -> File.rm_rf!(data_dir) end)
+    on_exit(fn -> Ferricstore.Test.LMDBFixture.cleanup_data_dir!(data_dir) end)
 
     assert {:error,
             {:flow_lmdb_reconcile_unhealthy,
@@ -295,7 +295,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdStateTest do
     on_exit(fn ->
       Process.delete(:ferricstore_waraft_apply_projection_disk_read_hook)
       WARaftSegmentReader.clear_apply_projection_cache(data_dir, 0)
-      File.rm_rf!(data_dir)
+      Ferricstore.Test.LMDBFixture.cleanup_data_dir!(data_dir)
     end)
 
     assert :ok =
@@ -372,7 +372,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdStateTest do
     on_exit(fn ->
       Process.delete(:ferricstore_waraft_apply_projection_disk_read_hook)
       WARaftSegmentReader.clear_apply_projection_cache(data_dir, 0)
-      File.rm_rf!(data_dir)
+      Ferricstore.Test.LMDBFixture.cleanup_data_dir!(data_dir)
     end)
 
     assert :ok =
@@ -437,7 +437,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdStateTest do
     on_exit(fn ->
       Process.delete(:ferricstore_waraft_apply_projection_disk_read_hook)
       WARaftSegmentReader.clear_apply_projection_cache(data_dir, 0)
-      File.rm_rf!(data_dir)
+      Ferricstore.Test.LMDBFixture.cleanup_data_dir!(data_dir)
     end)
 
     assert :ok =
@@ -495,7 +495,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdStateTest do
     on_exit(fn ->
       Process.delete(:flow_rebuilder_source_churn_calls)
       Process.delete(:ferricstore_waraft_apply_projection_disk_read_hook)
-      File.rm_rf!(data_dir)
+      Ferricstore.Test.LMDBFixture.cleanup_data_dir!(data_dir)
     end)
 
     assert {:error,
@@ -569,7 +569,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdStateTest do
     on_exit(fn ->
       Process.delete(:ferricstore_waraft_apply_projection_disk_read_hook)
       WARaftSegmentReader.clear_apply_projection_cache(data_dir, 0)
-      File.rm_rf!(data_dir)
+      Ferricstore.Test.LMDBFixture.cleanup_data_dir!(data_dir)
     end)
 
     assert :ok =
