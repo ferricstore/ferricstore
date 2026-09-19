@@ -2,6 +2,12 @@ name: Tests
 
 on:
   workflow_dispatch:
+    inputs:
+      core_test_seed:
+        description: Optional deterministic ExUnit seed for core test shards
+        required: false
+        default: ""
+        type: string
   push:
     branches: ["main"]
   pull_request:
@@ -356,6 +362,8 @@ jobs:
         run: mix deps.get
       - name: Run ferricstore tests
         timeout-minutes: 45
+        env:
+          CORE_TEST_SEED: ${{ inputs.core_test_seed }}
         run: |
           selection_file=$(mktemp)
           trap 'rm -f "$selection_file"' EXIT
@@ -377,13 +385,32 @@ jobs:
             exit 1
           fi
 
-          mix test "${files[@]}" --timeout 30000
+          test_args=("${files[@]}" --timeout 30000)
+          if [ -n "${CORE_TEST_SEED:-}" ]; then
+            if [[ ! "$CORE_TEST_SEED" =~ ^[0-9]+$ ]]; then
+              echo "CORE_TEST_SEED must contain only decimal digits" >&2
+              exit 1
+            fi
+            test_args+=(--seed "$CORE_TEST_SEED")
+          fi
+          mix test "${test_args[@]}"
       - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
         with:
           name: test-results-core-ubuntu-${{ matrix.partition }}
           path: test-results/
+          retention-days: 14
+      - name: Upload core test diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-diagnostics-core-ubuntu-${{ matrix.partition }}
+          path: |
+            /tmp/ferricstore_test_audit/*.log
+            erl_crash.dump
+          if-no-files-found: ignore
           retention-days: 14
 
   test-core-macos:
@@ -413,6 +440,8 @@ jobs:
         run: mix deps.get
       - name: Run ferricstore tests
         timeout-minutes: 80
+        env:
+          CORE_TEST_SEED: ${{ inputs.core_test_seed }}
         run: |
           selection_file=$(mktemp)
           trap 'rm -f "$selection_file"' EXIT
@@ -434,13 +463,36 @@ jobs:
             exit 1
           fi
 
-          mix test "${files[@]}" --timeout 30000
+          test_args=("${files[@]}" --timeout 30000)
+          if [ -n "${CORE_TEST_SEED:-}" ]; then
+            if [[ ! "$CORE_TEST_SEED" =~ ^[0-9]+$ ]]; then
+              echo "CORE_TEST_SEED must contain only decimal digits" >&2
+              exit 1
+            fi
+            test_args+=(--seed "$CORE_TEST_SEED")
+          fi
+          mix test "${test_args[@]}"
       - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
         with:
           name: test-results-core-macos-${{ matrix.partition }}
           path: test-results/
+          retention-days: 14
+      - name: Upload core test diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-diagnostics-core-macos-${{ matrix.partition }}
+          path: |
+            /tmp/ferricstore_test_audit/*.log
+            /Users/runner/Library/Logs/DiagnosticReports/beam*.ips
+            /Users/runner/Library/Logs/DiagnosticReports/beam*.crash
+            /Library/Logs/DiagnosticReports/beam*.ips
+            /Library/Logs/DiagnosticReports/beam*.crash
+            erl_crash.dump
+          if-no-files-found: ignore
           retention-days: 14
 
   # WARaft's backend suite is intentionally one async:false test module. ExUnit

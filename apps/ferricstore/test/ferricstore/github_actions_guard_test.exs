@@ -65,6 +65,118 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     assert workflow =~ "test-results-waraft-macos"
   end
 
+  test "core shards always upload audit and BEAM crash diagnostics" do
+    workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
+    ubuntu = workflow_section(workflow, "  test-core-ubuntu:", "  test-core-macos:")
+    macos = workflow_section(workflow, "  test-core-macos:", "  test-waraft-ubuntu:")
+
+    for {platform, section} <- [{"ubuntu", ubuntu}, {"macos", macos}] do
+      assert section =~ "test_args=(\"${files[@]}\" --timeout 30000)",
+             "#{platform} core test arguments changed"
+
+      assert section =~ "mix test \"${test_args[@]}\""
+
+      diagnostics = workflow_step(section, "Upload core test diagnostics")
+      assert diagnostics =~ "if: always()"
+      assert diagnostics =~ "uses: actions/upload-artifact@v7"
+      assert diagnostics =~ "/tmp/ferricstore_test_audit/*.log"
+      assert diagnostics =~ "erl_crash.dump"
+    end
+
+    macos_diagnostics = workflow_step(macos, "Upload core test diagnostics")
+    assert macos_diagnostics =~ "/Users/runner/Library/Logs/DiagnosticReports/beam*.ips"
+    assert macos_diagnostics =~ "/Users/runner/Library/Logs/DiagnosticReports/beam*.crash"
+    assert macos_diagnostics =~ "/Library/Logs/DiagnosticReports/beam*.ips"
+    assert macos_diagnostics =~ "/Library/Logs/DiagnosticReports/beam*.crash"
+  end
+
+  test "core shard dispatch seed is validated without changing normal runs" do
+    workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
+    ubuntu = workflow_section(workflow, "  test-core-ubuntu:", "  test-core-macos:")
+    macos = workflow_section(workflow, "  test-core-macos:", "  test-waraft-ubuntu:")
+
+    assert workflow =~ "core_test_seed:"
+    assert workflow =~ "default: \"\""
+    assert count_occurrences(workflow, "CORE_TEST_SEED: ${{ inputs.core_test_seed }}") == 2
+
+    for section <- [ubuntu, macos] do
+      assert section =~ "test_args=(\"${files[@]}\" --timeout 30000)"
+      assert section =~ "if [ -n \"${CORE_TEST_SEED:-}\" ]; then"
+      assert section =~ "if [[ ! \"$CORE_TEST_SEED\" =~ ^[0-9]+$ ]]; then"
+      assert section =~ "test_args+=(--seed \"$CORE_TEST_SEED\")"
+      assert section =~ "mix test \"${test_args[@]}\""
+    end
+  end
+
+  test "core shard seed is forwarded safely for empty and valid inputs" do
+    workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
+
+    sections = [
+      workflow_section(workflow, "  test-core-ubuntu:", "  test-core-macos:"),
+      workflow_section(workflow, "  test-core-macos:", "  test-waraft-ubuntu:")
+    ]
+
+    expected_args = [
+      "test",
+      "apps/ferricstore/test/ferricstore/github_actions_guard_test.exs",
+      "--timeout",
+      "30000"
+    ]
+
+    for section <- sections do
+      {status, args, _output} = run_core_script(section, "")
+      assert status == 0
+      assert args == expected_args
+
+      {status, args, _output} = run_core_script(section, "246870")
+      assert status == 0
+      assert args == expected_args ++ ["--seed", "246870"]
+    end
+  end
+
+  test "core shard seed rejects nonnumeric and shell-like input" do
+    workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
+
+    sections = [
+      workflow_section(workflow, "  test-core-ubuntu:", "  test-core-macos:"),
+      workflow_section(workflow, "  test-core-macos:", "  test-waraft-ubuntu:")
+    ]
+
+    marker =
+      Path.join(System.tmp_dir!(), "core-seed-marker-#{System.unique_integer([:positive])}")
+
+    for invalid_seed <- ["not-a-number", "1; touch #{marker}"], section <- sections do
+      {status, args, _output} = run_core_script(section, invalid_seed)
+      refute status == 0
+      assert args == []
+    end
+
+    refute File.exists?(marker)
+    File.rm(marker)
+  end
+
+  test "core shard test failure status propagates" do
+    workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
+
+    sections = [
+      workflow_section(workflow, "  test-core-ubuntu:", "  test-core-macos:"),
+      workflow_section(workflow, "  test-core-macos:", "  test-waraft-ubuntu:")
+    ]
+
+    expected_args = [
+      "test",
+      "apps/ferricstore/test/ferricstore/github_actions_guard_test.exs",
+      "--timeout",
+      "30000"
+    ]
+
+    for section <- sections do
+      {status, args, _output} = run_core_script(section, "", "17")
+      assert status == 17
+      assert args == expected_args
+    end
+  end
+
   test "destructive suites fail on every non-zero test command" do
     workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
 
@@ -288,6 +400,90 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     |> String.split(pattern)
     |> length()
     |> Kernel.-(1)
+  end
+
+  defp workflow_section(workflow, start_marker, end_marker) do
+    [_, body] = String.split(workflow, start_marker, parts: 2)
+    [section, _] = String.split(body, end_marker, parts: 2)
+    section
+  end
+
+  defp workflow_step(section, name) do
+    marker = "      - name: #{name}\n"
+    [_, body] = String.split(section, marker, parts: 2)
+    [step | _] = String.split(body, "\n      - ", parts: 2)
+    marker <> step
+  end
+
+  defp run_core_script(section, seed) do
+    run_core_script(section, seed, "0")
+  end
+
+  defp run_core_script(section, seed, mix_exit_status) do
+    temp_dir =
+      Path.join(System.tmp_dir!(), "github-actions-guard-#{System.unique_integer([:positive])}")
+
+    bin_dir = Path.join(temp_dir, "bin")
+    mix_args_path = Path.join(temp_dir, "mix-args")
+    script_path = Path.join(temp_dir, "core-tests.sh")
+    File.mkdir_p!(bin_dir)
+
+    File.write!(
+      Path.join(bin_dir, "elixir"),
+      "#!/usr/bin/env bash\nprintf '%s\\n' apps/ferricstore/test/ferricstore/github_actions_guard_test.exs\n"
+    )
+
+    File.write!(
+      Path.join(bin_dir, "mix"),
+      "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$MIX_ARGS_FILE\"\nexit \"${MIX_EXIT_STATUS:-0}\"\n"
+    )
+
+    File.chmod!(Path.join(bin_dir, "elixir"), 0o755)
+    File.chmod!(Path.join(bin_dir, "mix"), 0o755)
+
+    script =
+      section
+      |> workflow_step("Run ferricstore tests")
+      |> workflow_run_script()
+      |> String.replace("${{ matrix.partition }}", "1")
+
+    File.write!(script_path, script <> "\n")
+
+    try do
+      {output, status} =
+        System.cmd(
+          "bash",
+          ["-e", script_path],
+          cd: @repo_root,
+          env: [
+            {"PATH", "#{bin_dir}:#{System.get_env("PATH", "")}"},
+            {"CORE_TEST_SEED", seed},
+            {"MIX_ARGS_FILE", mix_args_path},
+            {"MIX_EXIT_STATUS", mix_exit_status}
+          ],
+          stderr_to_stdout: true
+        )
+
+      args =
+        if File.exists?(mix_args_path) do
+          mix_args_path |> File.read!() |> String.split("\n", trim: true)
+        else
+          []
+        end
+
+      {status, args, output}
+    after
+      File.rm_rf!(temp_dir)
+    end
+  end
+
+  defp workflow_run_script(step) do
+    [_, body] = String.split(step, "        run: |\n", parts: 2)
+
+    body
+    |> String.split("\n")
+    |> Enum.map(&String.replace_prefix(&1, "          ", ""))
+    |> Enum.join("\n")
   end
 
   defp literal_test_paths(path) do
