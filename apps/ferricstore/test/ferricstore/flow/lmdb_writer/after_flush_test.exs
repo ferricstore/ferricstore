@@ -42,7 +42,7 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushTest do
 
     action =
       {:prune_terminal_flow, "/data", 0, ets, nil, nil, nil, nil, "state-key", "type",
-       "completed", nil, nil, nil, nil, "flow-1", 1}
+       "completed", nil, nil, nil, nil, "flow-1", 1, nil}
 
     assert {:error, :source_keydir_unavailable} =
              AfterFlush.apply_after_flush(action)
@@ -151,17 +151,33 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushTest do
     zset_lookup = :ets.new(:after_flush_terminal_lookup, [:set])
     state_key = "flow:{flow:terminal-prune}:state:a"
 
+    encoded =
+      Ferricstore.Flow.encode_record(%{
+        id: "flow-1",
+        type: "type",
+        state: "completed",
+        version: 1,
+        attempts: 0,
+        fencing_token: 0,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        next_run_at_ms: 0,
+        priority: 0,
+        partition_key: nil,
+        root_flow_id: "flow-1"
+      })
+
     true =
       :ets.insert(
         ets,
-        {state_key, "encoded", 0, {:flow_state_version, 1, 0}, :deleted, 0, 0}
+        {state_key, encoded, 0, {:flow_state_version, 1, 0}, :deleted, 0, byte_size(encoded)}
       )
 
     true = :ets.delete(zset_lookup)
 
     action =
       {:prune_terminal_flow, "/data", 0, ets, zset_index, zset_lookup, nil, nil, state_key,
-       "type", "completed", nil, nil, nil, nil, "flow-1", 1}
+       "type", "completed", nil, nil, nil, nil, "flow-1", 1, nil}
 
     assert {:error, :zset_index_unavailable} = AfterFlush.apply_after_flush(action)
   end
@@ -173,7 +189,7 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushTest do
 
     action =
       {:prune_terminal_flow, "/data", 0, ets, nil, nil, nil, nil, state_key, "type", "completed",
-       nil, nil, nil, nil, "flow-1", 1}
+       nil, nil, nil, nil, "flow-1", 1, nil}
 
     assert {:error, :invalid_source_flow_record} = AfterFlush.apply_after_flush(action)
     assert :ets.member(ets, state_key)

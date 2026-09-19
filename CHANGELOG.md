@@ -4,7 +4,7 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
-## 0.11.19 - 2026-09-17
+## 0.11.19 - 2026-09-19
 
 - Schedule resolved nonterminal child joins at their resolution time so parents
   can be claimed again, including custom successor states and cross-shard joins.
@@ -17,6 +17,20 @@ All notable changes to FerricStore will be documented here.
   Unsupported external `REASON_REF` inputs remain rejected.
 - Existing parents already stalled with a missing due time are not automatically
   repaired. This patch does not add a startup scan or modify historical records.
+- Route compound-key expiry through the logical parent shard and expire opaque
+  fetch-or-compute outcomes on their supplied owner shard. Stale snapshots no
+  longer reject unrelated expiry entries; renewed generations remain protected.
+- Retry bounded Flow projection batches when their source changes during a
+  durability read, including newer records and deletion markers. Missing current
+  sources and exhausted retries still fail closed instead of reporting healthy.
+- Compare terminal keydir rows exactly before pruning, preserving concurrent
+  replacements and accounting only for the bytes actually removed.
+- Serialize terminal and hibernation hot-index cleanup with the existing
+  per-shard publication epoch. Disk reads remain outside the critical section,
+  and delayed cleanup rechecks its source before deleting rows or indexes.
+- Match delayed terminal cleanup to the Flow incarnation, not just its version,
+  and require source-based cleanup to match its durable query projection. Reusing
+  an expired Flow ID no longer lets old cleanup remove the replacement.
 
 ## 0.11.18 - 2026-09-13
 

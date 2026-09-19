@@ -771,7 +771,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   def handle_info({:apply_after_flush, action}, state) do
-    case apply_after_flush(action) do
+    case apply_after_flush(action, state.instance_ctx) do
       :ok ->
         {:noreply, state}
 
@@ -905,7 +905,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
     case flush_ops_and_marker(state, ops, started_at) do
       {:ok, state, expanded_op_count} ->
-        case AfterFlush.apply_actions(after_flush) do
+        case AfterFlush.apply_actions(after_flush, state.instance_ctx) do
           :ok ->
             emit_flush(:ok, state, started_at, op_count, expanded_op_count, pending_age_us)
 
@@ -1179,7 +1179,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   def terminal_hot_ttl_ms, do: AfterFlush.terminal_hot_ttl_ms()
 
-  defp apply_after_flush(action), do: AfterFlush.apply_after_flush(action)
+  defp apply_after_flush(action, publication_ctx),
+    do: AfterFlush.apply_after_flush(action, publication_ctx)
 
   def delete_apply_projection_cache_for_row(data_dir, shard_index, row) do
     AfterFlush.delete_apply_projection_cache_for_row(data_dir, shard_index, row)

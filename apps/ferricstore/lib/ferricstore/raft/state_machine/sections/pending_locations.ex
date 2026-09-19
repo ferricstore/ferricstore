@@ -1192,7 +1192,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
             {:prune_terminal_flow, data_dir, shard_index, state.ets, zset_index, zset_lookup,
              flow_index, flow_lookup, state_key, type, terminal_state,
              Map.get(record, :partition_key), Map.get(record, :parent_flow_id),
-             Map.get(record, :root_flow_id), Map.get(record, :correlation_id), id, version}
+             Map.get(record, :root_flow_id), Map.get(record, :correlation_id), id, version,
+             Map.get(record, :incarnation)}
 
           queue_pending_lmdb_mirror_after_flush(
             {:defer_after_flush, Ferricstore.Flow.LMDBWriter.terminal_hot_ttl_ms(), action}

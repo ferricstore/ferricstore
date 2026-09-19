@@ -129,7 +129,7 @@ defmodule Ferricstore.Store.Router.Part09 do
               {key, expire_at_ms}
               when is_binary(key) and is_integer(expire_at_ms) and
                      expire_at_ms > 0 ->
-                shard_for(ctx, key) == shard_index
+                expiry_batch_entry_on_shard?(ctx, shard_index, key)
 
               _invalid ->
                 false
@@ -138,6 +138,7 @@ defmodule Ferricstore.Store.Router.Part09 do
         if valid? do
           command = {:expire_if_batch, entries}
           {route_key, _expire_at_ms} = hd(entries)
+          route_key = CompoundKey.extract_redis_key(route_key)
 
           if durable_raft_ctx?(ctx) do
             raft_write(ctx, shard_index, route_key, command)
@@ -150,6 +151,22 @@ defmodule Ferricstore.Store.Router.Part09 do
         else
           {:error, :invalid_expiry_batch}
         end
+      end
+
+      # Fetch-or-compute failure outcomes are opaque hashes of their logical
+      # key, so their owning shard cannot be recovered from the storage key.
+      # The sweeper supplies their shard. Conditional apply on that shard is a
+      # no-op if the snapshot row vanished; checking membership here would reject
+      # unrelated entries in the same batch. No other shard is accessed.
+      defp expiry_batch_entry_on_shard?(
+             _ctx,
+             _shard_index,
+             <<"FC:", _digest::binary-size(32)>>
+           ),
+           do: true
+
+      defp expiry_batch_entry_on_shard?(ctx, shard_index, key) do
+        shard_for(ctx, CompoundKey.extract_redis_key(key)) == shard_index
       end
 
       @doc false

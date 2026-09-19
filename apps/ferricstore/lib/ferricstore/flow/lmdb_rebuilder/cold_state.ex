@@ -21,53 +21,106 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
   def read_and_decode(entries, shard_path), do: read_and_decode(entries, shard_path, nil, nil)
 
   def read_and_decode(entries, shard_path, shard_index, instance_ctx) do
+    {decoded, _changed_keys} =
+      read_and_decode_with_status(entries, shard_path, shard_index, instance_ctx, nil)
+
+    decoded
+  end
+
+  @doc false
+  def read_and_decode_with_status(entries, shard_path, shard_index, instance_ctx, source_keydir) do
     {hot, cold} =
       Enum.split_with(entries, fn
         {_key, value, _expire_at_ms, _lfu, _fid, _off, _vsize} when is_binary(value) -> true
         _entry -> false
       end)
 
-    hot_decoded = decode_hot_entries(hot, shard_index, instance_ctx)
+    {hot_decoded, hot_changed_keys} =
+      decode_hot_entries(hot, shard_index, instance_ctx, source_keydir)
 
-    cold_decoded =
-      cold
-      |> cold_locations(shard_path)
-      |> read_cold_locations(shard_index, instance_ctx)
+    {cold_locations, invalid_changed_keys} =
+      cold_locations_with_status(cold, shard_path, source_keydir)
 
-    hot_decoded ++ cold_decoded
+    {cold_decoded, cold_changed_keys} =
+      read_cold_locations_with_status(
+        cold_locations,
+        shard_index,
+        instance_ctx,
+        source_keydir
+      )
+
+    {hot_decoded ++ cold_decoded,
+     Enum.uniq(hot_changed_keys ++ invalid_changed_keys ++ cold_changed_keys)}
   end
 
-  defp decode_hot_entries(entries, shard_index, instance_ctx) do
+  defp decode_hot_entries(entries, shard_index, instance_ctx, source_keydir) do
     physical_locations = hot_waraft_physical_locations(entries, shard_index, instance_ctx)
+    changed_group_keys = changed_hot_groups(entries, physical_locations, source_keydir)
 
-    Enum.flat_map(entries, fn {key, value, expire_at_ms, _lfu, fid, off, vsize} ->
-      case Map.get(physical_locations, fid, :direct) do
-        {:ok, physical_location} ->
-          key
-          |> decode_state_record(
-            value,
-            expire_at_ms,
-            shard_index,
-            instance_ctx,
-            {fid, off, vsize}
-          )
-          |> physicalize_decoded_rows(physical_location)
+    decoded =
+      Enum.flat_map(entries, fn {key, value, expire_at_ms, _lfu, fid, off, vsize} ->
+        case Map.get(physical_locations, fid, :direct) do
+          {:ok, physical_location} ->
+            key
+            |> decode_state_record(
+              value,
+              expire_at_ms,
+              shard_index,
+              instance_ctx,
+              {fid, off, vsize}
+            )
+            |> physicalize_decoded_rows(physical_location)
 
-        {:error, reason} ->
-          observe_cold_read_error(1, {:waraft_segment_location_failed, reason})
-          []
+          {:error, reason} ->
+            if Map.get(changed_group_keys, fid, []) == [] do
+              observe_cold_read_error(1, {:waraft_segment_location_failed, reason})
+            end
 
-        :direct ->
-          decode_state_record(
-            key,
-            value,
-            expire_at_ms,
-            shard_index,
-            instance_ctx,
-            {fid, off, vsize}
-          )
-      end
-    end)
+            []
+
+          :direct ->
+            decode_state_record(
+              key,
+              value,
+              expire_at_ms,
+              shard_index,
+              instance_ctx,
+              {fid, off, vsize}
+            )
+        end
+      end)
+
+    changed_keys =
+      changed_group_keys
+      |> Map.values()
+      |> List.flatten()
+      |> Enum.uniq()
+
+    {decoded, changed_keys}
+  end
+
+  defp changed_hot_groups(entries, physical_locations, source_keydir) do
+    if Enum.any?(physical_locations, fn {_file_id, result} -> match?({:error, _}, result) end) do
+      entries
+      |> Enum.filter(fn entry ->
+        match?({:error, _}, Map.get(physical_locations, elem(entry, 4), :direct))
+      end)
+      |> Enum.group_by(&elem(&1, 4))
+      |> Map.new(fn {file_id, grouped} ->
+        changed_keys =
+          Enum.flat_map(grouped, fn entry ->
+            if current_source_status(source_keydir, entry) == :changed do
+              [entry_key(entry)]
+            else
+              []
+            end
+          end)
+
+        {file_id, Enum.uniq(changed_keys)}
+      end)
+    else
+      %{}
+    end
   end
 
   defp hot_waraft_physical_locations(_entries, shard_index, instance_ctx)
@@ -93,14 +146,39 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
   def read_cold_locations([], _shard_index, _instance_ctx), do: []
 
   def read_cold_locations(locations, shard_index, instance_ctx) do
+    {decoded, _changed_keys} =
+      read_cold_locations_with_status(locations, shard_index, instance_ctx, nil)
+
+    decoded
+  end
+
+  defp read_cold_locations_with_status([], _shard_index, _instance_ctx, _source_keydir),
+    do: {[], []}
+
+  defp read_cold_locations_with_status(locations, shard_index, instance_ctx, source_keydir) do
     {bitcask_locations, waraft_locations} =
       Enum.split_with(locations, fn
         {:bitcask, _path, _key, _expire_at_ms, _source_location} -> true
         _ -> false
       end)
 
-    read_bitcask_cold_locations(bitcask_locations, shard_index, instance_ctx) ++
-      read_waraft_cold_locations(waraft_locations, shard_index, instance_ctx)
+    {bitcask_decoded, bitcask_changed_keys} =
+      read_bitcask_cold_locations_with_status(
+        bitcask_locations,
+        shard_index,
+        instance_ctx,
+        source_keydir
+      )
+
+    {waraft_decoded, waraft_changed_keys} =
+      read_waraft_cold_locations_with_status(
+        waraft_locations,
+        shard_index,
+        instance_ctx,
+        source_keydir
+      )
+
+    {bitcask_decoded ++ waraft_decoded, Enum.uniq(bitcask_changed_keys ++ waraft_changed_keys)}
   end
 
   def decode_state_record(key, value, expire_at_ms, shard_index, instance_ctx) do
@@ -168,26 +246,77 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
   end
 
   defp cold_locations(entries, shard_path) do
-    Enum.flat_map(entries, fn
-      {key, nil, expire_at_ms, _lfu, fid, off, vsize}
-      when is_integer(fid) and fid >= 0 and is_integer(off) and is_integer(vsize) and off >= 0 and
-             vsize >= 0 ->
-        path = ShardETS.file_path(shard_path, fid)
-        [{:bitcask, path, key, expire_at_ms, {fid, off, vsize}}]
+    Enum.flat_map(entries, fn entry ->
+      case cold_location(entry, shard_path) do
+        {:ok, location} ->
+          [location]
 
-      {key, nil, expire_at_ms, _lfu, fid, off, vsize}
-      when valid_waraft_segment_location(fid, off, vsize) ->
-        [{:waraft, fid, key, expire_at_ms, {fid, off, vsize}}]
-
-      _entry ->
-        observe_cold_read_error(1, :source_location_unavailable)
-        []
+        :invalid ->
+          observe_cold_read_error(1, :source_location_unavailable)
+          []
+      end
     end)
   end
 
-  defp read_bitcask_cold_locations([], _shard_index, _instance_ctx), do: []
+  defp cold_locations_with_status(entries, shard_path, nil),
+    do: {cold_locations(entries, shard_path), []}
 
-  defp read_bitcask_cold_locations(locations, shard_index, instance_ctx) do
+  defp cold_locations_with_status(entries, shard_path, source_keydir) do
+    {reversed_locations, changed_keys} =
+      Enum.reduce(entries, {[], []}, fn entry, {reversed_locations, changed_keys} ->
+        case cold_location(entry, shard_path) do
+          {:ok, location} ->
+            {[location | reversed_locations], changed_keys}
+
+          :invalid ->
+            case current_source_status(source_keydir, entry) do
+              :changed ->
+                {reversed_locations, [entry_key(entry) | changed_keys]}
+
+              _ ->
+                observe_cold_read_error(1, :source_location_unavailable)
+                {reversed_locations, changed_keys}
+            end
+        end
+      end)
+
+    {Enum.reverse(reversed_locations), Enum.uniq(changed_keys)}
+  end
+
+  defp cold_location(
+         {key, nil, expire_at_ms, _lfu, fid, off, vsize},
+         shard_path
+       )
+       when is_integer(fid) and fid >= 0 and is_integer(off) and is_integer(vsize) and off >= 0 and
+              vsize >= 0 do
+    path = ShardETS.file_path(shard_path, fid)
+    {:ok, {:bitcask, path, key, expire_at_ms, {fid, off, vsize}}}
+  end
+
+  defp cold_location(
+         {key, nil, expire_at_ms, _lfu, fid, off, vsize},
+         _shard_path
+       )
+       when valid_waraft_segment_location(fid, off, vsize) do
+    {:ok, {:waraft, fid, key, expire_at_ms, {fid, off, vsize}}}
+  end
+
+  defp cold_location(_entry, _shard_path), do: :invalid
+
+  defp read_bitcask_cold_locations_with_status(
+         [],
+         _shard_index,
+         _instance_ctx,
+         _source_keydir
+       ),
+       do: {[], []}
+
+  defp read_bitcask_cold_locations_with_status(
+         locations,
+         shard_index,
+         instance_ctx,
+         source_keydir
+       ) do
     reads =
       Enum.map(locations, fn
         {:bitcask, path, key, _expire_at_ms, {_fid, off, _vsize}} -> {path, off, key}
@@ -195,72 +324,203 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
 
     case ColdRead.pread_batch_keyed(reads, @cold_read_timeout_ms) do
       {:ok, values} ->
-        locations
-        |> Enum.zip(values)
-        |> Enum.flat_map(fn
-          {{:bitcask, _path, key, expire_at_ms, source_location}, value}
-          when is_binary(value) ->
-            decode_state_record(
-              key,
-              value,
-              expire_at_ms,
-              shard_index,
-              instance_ctx,
-              source_location
-            )
+        {reversed_decoded, changed_keys} =
+          Enum.zip(locations, values)
+          |> Enum.reduce({[], []}, fn
+            {{:bitcask, _path, key, expire_at_ms, source_location}, value},
+            {reversed_decoded, changed_keys}
+            when is_binary(value) ->
+              rows =
+                decode_state_record(
+                  key,
+                  value,
+                  expire_at_ms,
+                  shard_index,
+                  instance_ctx,
+                  source_location
+                )
 
-          _ ->
-            observe_cold_read_error(1, :missing_value)
-            []
-        end)
+              {:lists.reverse(rows, reversed_decoded), changed_keys}
 
-      {:error, reason} ->
-        observe_cold_read_error(length(locations), reason)
-        []
-    end
-  end
-
-  defp read_waraft_cold_locations([], _shard_index, _instance_ctx), do: []
-
-  defp read_waraft_cold_locations(locations, shard_index, instance_ctx) do
-    locations
-    |> Enum.group_by(fn {:waraft, file_id, _key, _expire_at_ms, _source_location} ->
-      file_id
-    end)
-    |> Enum.flat_map(fn {file_id, grouped} ->
-      keys =
-        Enum.map(grouped, fn {:waraft, _file_id, key, _expire_at_ms, _source_location} ->
-          key
-        end)
-
-      case read_physical_waraft_group(instance_ctx, shard_index, file_id, keys) do
-        {:ok, values_by_key, physical_location} when is_map(values_by_key) ->
-          Enum.flat_map(grouped, fn
-            {:waraft, _file_id, key, expire_at_ms, source_location} ->
-              case Map.get(values_by_key, key) do
-                value when is_binary(value) ->
-                  key
-                  |> decode_state_record(
-                    value,
-                    expire_at_ms,
-                    shard_index,
-                    instance_ctx,
-                    source_location
-                  )
-                  |> physicalize_decoded_rows(physical_location)
+            {location, _value}, {reversed_decoded, changed_keys} ->
+              case current_source_status(source_keydir, location) do
+                :changed ->
+                  {reversed_decoded, [entry_key(location) | changed_keys]}
 
                 _ ->
-                  observe_cold_read_error(1, :missing_waraft_value)
-                  []
+                  observe_cold_read_error(1, :missing_value)
+                  {reversed_decoded, changed_keys}
               end
           end)
 
-        {:error, reason} ->
-          observe_cold_read_error(length(grouped), {:waraft_segment_read_failed, reason})
-          []
-      end
-    end)
+        {Enum.reverse(reversed_decoded), Enum.uniq(changed_keys)}
+
+      {:error, reason} ->
+        changed_keys =
+          Enum.flat_map(locations, fn location ->
+            if current_source_status(source_keydir, location) == :changed do
+              [entry_key(location)]
+            else
+              []
+            end
+          end)
+
+        if changed_keys == [] do
+          observe_cold_read_error(length(locations), reason)
+        end
+
+        {[], Enum.uniq(changed_keys)}
+    end
   end
+
+  defp read_waraft_cold_locations_with_status(
+         [],
+         _shard_index,
+         _instance_ctx,
+         _source_keydir
+       ),
+       do: {[], []}
+
+  defp read_waraft_cold_locations_with_status(
+         locations,
+         shard_index,
+         instance_ctx,
+         source_keydir
+       ) do
+    {reversed_decoded, changed_keys} =
+      locations
+      |> Enum.group_by(fn {:waraft, file_id, _key, _expire_at_ms, _source_location} ->
+        file_id
+      end)
+      |> Enum.reduce({[], []}, fn {file_id, grouped}, {reversed_decoded, all_changed_keys} ->
+        keys =
+          Enum.map(grouped, fn {:waraft, _file_id, key, _expire_at_ms, _source_location} ->
+            key
+          end)
+
+        {decoded, group_changed_keys} =
+          case read_physical_waraft_group(instance_ctx, shard_index, file_id, keys) do
+            {:ok, values_by_key, physical_location} when is_map(values_by_key) ->
+              decode_waraft_group_with_status(
+                grouped,
+                values_by_key,
+                physical_location,
+                shard_index,
+                instance_ctx,
+                source_keydir
+              )
+
+            {:error, reason} ->
+              classify_waraft_read_failure(grouped, source_keydir, reason)
+          end
+
+        {:lists.reverse(decoded, reversed_decoded), group_changed_keys ++ all_changed_keys}
+      end)
+
+    {Enum.reverse(reversed_decoded), Enum.uniq(changed_keys)}
+  end
+
+  defp decode_waraft_group_with_status(
+         grouped,
+         values_by_key,
+         physical_location,
+         shard_index,
+         instance_ctx,
+         source_keydir
+       ) do
+    {reversed_decoded, changed_keys} =
+      Enum.reduce(grouped, {[], []}, fn
+        {:waraft, _file_id, key, expire_at_ms, source_location} = location,
+        {reversed_decoded, changed_keys} ->
+          case Map.get(values_by_key, key) do
+            value when is_binary(value) ->
+              rows =
+                key
+                |> decode_state_record(
+                  value,
+                  expire_at_ms,
+                  shard_index,
+                  instance_ctx,
+                  source_location
+                )
+                |> physicalize_decoded_rows(physical_location)
+
+              {:lists.reverse(rows, reversed_decoded), changed_keys}
+
+            _ ->
+              case current_source_status(source_keydir, location) do
+                :changed ->
+                  {reversed_decoded, [key | changed_keys]}
+
+                _ ->
+                  observe_cold_read_error(1, :missing_waraft_value)
+                  {reversed_decoded, changed_keys}
+              end
+          end
+      end)
+
+    {Enum.reverse(reversed_decoded), Enum.uniq(changed_keys)}
+  end
+
+  defp classify_waraft_read_failure(grouped, source_keydir, reason) do
+    changed_keys =
+      Enum.flat_map(grouped, fn location ->
+        if current_source_status(source_keydir, location) == :changed do
+          [entry_key(location)]
+        else
+          []
+        end
+      end)
+
+    if changed_keys == [] do
+      observe_cold_read_error(length(grouped), {:waraft_segment_read_failed, reason})
+    end
+
+    {[], Enum.uniq(changed_keys)}
+  end
+
+  defp current_source_status(nil, _location), do: :unknown
+
+  defp current_source_status(
+         source_keydir,
+         {:bitcask, _path, key, _expire_at_ms, source_location}
+       ) do
+    current_source_status(source_keydir, key, source_location)
+  end
+
+  defp current_source_status(
+         source_keydir,
+         {:waraft, _file_id, key, _expire_at_ms, source_location}
+       ) do
+    current_source_status(source_keydir, key, source_location)
+  end
+
+  defp current_source_status(source_keydir, {key, _value, _expire_at_ms, _lfu, fid, off, vsize})
+       when is_binary(key) do
+    current_source_status(source_keydir, key, {fid, off, vsize})
+  end
+
+  defp current_source_status(_source_keydir, _location), do: :unknown
+
+  defp current_source_status(source_keydir, key, source_location)
+       when is_binary(key) and is_tuple(source_location) and tuple_size(source_location) == 3 do
+    case :ets.lookup(source_keydir, key) do
+      [{^key, _value, _expire_at_ms, _lfu, fid, off, vsize}] ->
+        if {fid, off, vsize} == source_location, do: :current, else: :changed
+
+      [] ->
+        :changed
+
+      _invalid ->
+        :unknown
+    end
+  rescue
+    ArgumentError -> :unknown
+  end
+
+  defp entry_key({key, _value, _expire_at_ms, _lfu, _fid, _off, _vsize}), do: key
+  defp entry_key({:bitcask, _path, key, _expire_at_ms, _source_location}), do: key
+  defp entry_key({:waraft, _file_id, key, _expire_at_ms, _source_location}), do: key
 
   defp read_physical_waraft_group(instance_ctx, shard_index, file_id, keys) do
     with {:ok, physical_location} <-
