@@ -23,6 +23,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
   @moduletag :global_state
   @moduletag :shard_kill
 
+  alias Ferricstore.CommandTime
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
@@ -340,14 +341,18 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
   describe "exists? with expired key" do
     test "returns false for a key whose TTL has passed" do
       key = ukey("expired_exists")
-      expire_at = System.os_time(:millisecond) + 150
+      now_ms = Ferricstore.HLC.now_ms()
+      expire_at = now_ms + 60_000
 
-      Router.put(FerricStore.Instance.get(:default), key, "ephemeral", expire_at)
-      assert Router.exists?(FerricStore.Instance.get(:default), key) == true
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, "ephemeral", expire_at)
 
-      Process.sleep(200)
+      assert CommandTime.with_expiry_context(now_ms, now_ms, fn ->
+               Router.exists?(FerricStore.Instance.get(:default), key)
+             end)
 
-      assert Router.exists?(FerricStore.Instance.get(:default), key) == false,
+      refute CommandTime.with_expiry_context(expire_at + 1, expire_at + 1, fn ->
+               Router.exists?(FerricStore.Instance.get(:default), key)
+             end),
              "exists? should return false for expired key"
     end
 
