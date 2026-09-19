@@ -227,6 +227,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
     ],
     rewind: [
       {"TO_EVENT", :to_event, :binary},
+      {"REASON", :reason, :binary},
       {"RUN_AT", :run_at_ms, :non_negative},
       {"EXPECT_STATE", :expect_state, :binary},
       {"NOW", :now_ms, :non_negative},

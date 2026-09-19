@@ -321,26 +321,20 @@ defmodule Ferricstore.Commands.ServerInfoTest do
       }
 
       assert {:simple, "Background saving started"} = Server.handle("BGSAVE", [], store)
-      assert_receive {:save_barrier_entered, first_pid}
+      assert_receive {:save_barrier_entered, first_pid}, 5_000
+
+      first_monitor = Process.monitor(first_pid)
+
+      on_exit(fn ->
+        send(first_pid, :release_save_barrier)
+      end)
 
       second_result = Server.handle("BGSAVE", [], store)
 
-      second_pid =
-        receive do
-          {:save_barrier_entered, pid} -> pid
-        after
-          100 -> nil
-        end
-
-      pids = [first_pid | List.wrap(second_pid)]
-      monitors = Enum.map(pids, &Process.monitor/1)
-      Enum.each(pids, &send(&1, :release_save_barrier))
-
-      for {pid, monitor} <- Enum.zip(pids, monitors) do
-        assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}
-      end
-
       assert {:error, "ERR background save already in progress"} = second_result
+
+      send(first_pid, :release_save_barrier)
+      assert_receive {:DOWN, ^first_monitor, :process, ^first_pid, :normal}, 5_000
     end
   end
 

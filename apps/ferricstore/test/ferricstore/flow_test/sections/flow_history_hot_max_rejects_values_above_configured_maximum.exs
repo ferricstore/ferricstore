@@ -182,6 +182,89 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfi
                end)
       end
 
+      test "flow_rewind persists the supplied reason and its history reference" do
+        id = uid("flow-rewind-reason")
+        partition = uid("flow-rewind-reason-partition")
+
+        assert {:ok, _} =
+                 flow_create_and_get(id,
+                   type: "rewind-reason",
+                   partition_key: partition,
+                   now_ms: 1_000,
+                   run_at_ms: 1_000
+                 )
+
+        assert {:ok, [{created_event_id, _}]} =
+                 FerricStore.flow_history(id, partition_key: partition, count: 10)
+
+        assert :ok =
+                 FerricStore.flow_rewind(id,
+                   to_event: created_event_id,
+                   partition_key: partition,
+                   expect_state: "queued",
+                   reason: "operator corrected the input",
+                   now_ms: 2_000
+                 )
+
+        assert {:ok, rewound} = FerricStore.flow_get(id, partition_key: partition)
+        assert is_binary(rewound.error_ref)
+
+        assert {:ok, ["operator corrected the input"]} =
+                 FerricStore.flow_value_mget([rewound.error_ref])
+
+        assert {:ok, events} = FerricStore.flow_history(id, partition_key: partition, count: 10)
+
+        assert Enum.any?(events, fn {_event_id, fields} ->
+                 fields["event"] == "rewound" and fields["error_ref"] == rewound.error_ref
+               end)
+
+        {rewound_event_id, _} =
+          Enum.find(events, fn {_id, fields} -> fields["event"] == "rewound" end)
+
+        assert :ok =
+                 FerricStore.flow_rewind(id,
+                   to_event: rewound_event_id,
+                   partition_key: partition,
+                   now_ms: 3_000
+                 )
+
+        assert {:ok, restored} = FerricStore.flow_get(id, partition_key: partition)
+        assert restored.error_ref == rewound.error_ref
+
+        assert {:ok, ["operator corrected the input"]} =
+                 FerricStore.flow_value_mget([restored.error_ref])
+
+        assert {:error, _} =
+                 FerricStore.flow_rewind(id,
+                   to_event: created_event_id,
+                   partition_key: partition,
+                   expect_state: "completed",
+                   reason: "must not replace the reason",
+                   now_ms: 4_000
+                 )
+
+        assert {:ok, ^restored} = FerricStore.flow_get(id, partition_key: partition)
+      end
+
+      test "flow_rewind reads back a large binary reason" do
+        id = uid("flow-rewind-large-reason")
+        reason = :binary.copy(<<0, 255, 17>>, 110_000)
+
+        assert {:ok, _} = flow_create_and_get(id, type: "rewind-large", now_ms: 1_000)
+        assert {:ok, [{created_event_id, _}]} = FerricStore.flow_history(id, count: 10)
+
+        assert :ok =
+                 FerricStore.flow_rewind(id,
+                   to_event: created_event_id,
+                   reason: reason,
+                   now_ms: 2_000
+                 )
+
+        assert {:ok, rewound} = FerricStore.flow_get(id)
+        assert is_binary(rewound.error_ref)
+        assert {:ok, [^reason]} = FerricStore.flow_value_mget([rewound.error_ref])
+      end
+
       test "flow_rewind validates target, expected state, and active leases" do
         id = uid("flow-rewind-guard")
 

@@ -4,6 +4,37 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.19 - 2026-09-19
+
+- Schedule resolved nonterminal child joins at their resolution time so parents
+  can be claimed again, including custom successor states and cross-shard joins.
+  Terminal successors remain outside the due index; retry attempts are unchanged.
+- Preserve full record and job-map responses when native compact claim codecs
+  are negotiated. Explicit compact job responses retain their existing format
+  and fast path; full records no longer lose metadata or selected values.
+- Accept `FLOW.REWIND REASON` through the generic command parser and persist the
+  supplied reason with its history reference, including large binary reasons.
+  Unsupported external `REASON_REF` inputs remain rejected.
+- Existing parents already stalled with a missing due time are not automatically
+  repaired. This patch does not add a startup scan or modify historical records.
+- Route compound-key expiry through the logical parent shard and expire opaque
+  fetch-or-compute outcomes on their supplied owner shard. Stale snapshots no
+  longer reject unrelated expiry entries; renewed generations remain protected.
+- Retry bounded Flow projection batches when their source changes during a
+  durability read, including newer records and deletion markers. Missing current
+  sources and exhausted retries still fail closed instead of reporting healthy.
+- Compare terminal keydir rows exactly before pruning, preserving concurrent
+  replacements and accounting only for the bytes actually removed.
+- Serialize terminal and hibernation hot-index cleanup with the existing
+  per-shard publication epoch. Disk reads remain outside the critical section,
+  and delayed cleanup rechecks its source before deleting rows or indexes.
+- Match delayed terminal cleanup to the Flow incarnation, not just its version,
+  and require source-based cleanup to match its durable query projection. Reusing
+  an expired Flow ID no longer lets old cleanup remove the replacement.
+- Ignore read-side LFU counter changes during validated terminal and hibernation
+  cleanup while retaining all source identity checks, so reads cannot prevent
+  eligible hot records and indexes from being removed.
+
 ## 0.11.18 - 2026-09-13
 
 - Hardened restart recovery for active Bitcask and blob segments: repair only

@@ -310,8 +310,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
         ArgumentError -> :ok
       end
 
-      File.rm_rf!(dir)
-      File.rm_rf!(root)
+      Ferricstore.Test.LMDBFixture.cleanup_data_dir!(root, shard_index)
     end)
 
     %{

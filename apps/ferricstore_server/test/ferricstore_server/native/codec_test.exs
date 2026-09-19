@@ -1050,30 +1050,80 @@ defmodule FerricstoreServer.Native.CodecTest do
     assert <<0::unsigned-16, ^tag, 2::unsigned-32, _items::binary>> = body
   end
 
-  test "command response frames fall back for compact claim job maps" do
+  test "command response frames preserve full claim job maps when compact is negotiated" do
+    record = %{
+      "id" => "flow-1",
+      "type" => "order",
+      "state" => "running",
+      "run_state" => "ready",
+      "partition_key" => "bucket-1",
+      "lease_token" => "lease-1",
+      "fencing_token" => 42,
+      "error_ref" => "error-ref",
+      "attributes" => %{"tenant" => "acme"}
+    }
+
+    assert Codec.encode_compact_flow_claim_jobs([record]) == nil
+
+    atom_record = %{
+      id: "flow-1",
+      type: "order",
+      state: "running",
+      run_state: "ready",
+      partition_key: "bucket-1",
+      lease_token: "lease-1",
+      fencing_token: 42,
+      error_ref: "error-ref",
+      attributes: %{tenant: "acme"}
+    }
+
+    assert Codec.encode_compact_flow_claim_jobs([atom_record]) == nil
+    assert NIF.encode_compact_claim_jobs_response_frame(0x0203, 2, 99, [record]) == nil
+    assert NIF.encode_compact_claim_jobs_response_frame(0x0203, 2, 99, [atom_record]) == nil
+
     [frame] =
       Codec.encode_command_response_frames(
         0x0203,
         2,
         99,
         :ok,
-        [
-          %{
-            "id" => "flow-1",
-            "partition_key" => "bucket-1",
-            "lease_token" => "lease-1",
-            "fencing_token" => 42
-          }
-        ],
+        [record],
         compact_flow_responses: true
       )
 
-    tag = Codec.compact_tags().flow_claim_jobs
-
-    <<"FSNP", 0x81, _flags, _lane::unsigned-32, 0x0203::unsigned-16, _request::unsigned-64,
+    <<"FSNP", 0x81, flags, 2::unsigned-32, 0x0203::unsigned-16, 99::unsigned-64,
       _body_len::unsigned-32, body::binary>> = frame
 
-    assert <<0::unsigned-16, ^tag, 1::unsigned-32, _items::binary>> = body
+    refute Bitwise.band(flags, Codec.flags().custom_payload) != 0
+    assert <<0::unsigned-16, value_body::binary>> = body
+    assert {:ok, [^record]} = Codec.decode_body(value_body)
+
+    for input <- [record, atom_record],
+        options <- [
+          [compact_flow_responses: true, compression: :zlib],
+          [compact_flow_responses: true, chunk_bytes: 16],
+          [compact_flow_responses: true, compression: :zlib, chunk_bytes: 16]
+        ] do
+      frames = Codec.encode_command_response_frames(0x0203, 2, 99, :ok, [input], options)
+
+      assert frames != []
+
+      body =
+        frames
+        |> Enum.map(fn frame ->
+          <<"FSNP", 0x81, frame_flags, 2::unsigned-32, 0x0203::unsigned-16, 99::unsigned-64,
+            body_len::unsigned-32, chunk::binary>> = frame
+
+          assert byte_size(chunk) == body_len
+          refute Bitwise.band(frame_flags, Codec.flags().custom_payload) != 0
+          chunk
+        end)
+        |> IO.iodata_to_binary()
+
+      body = if options[:compression] == :zlib, do: :zlib.uncompress(body), else: body
+      assert <<0::unsigned-16, value_body::binary>> = body
+      assert {:ok, [^record]} = Codec.decode_body(value_body)
+    end
   end
 
   test "command response frames compact direct Flow records when negotiated" do

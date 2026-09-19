@@ -876,6 +876,436 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenRejectsMissingWaitState
         assert resolved_grandparent.state == "completed"
         assert resolved_grandparent.child_groups["outer"]["children"][middle] == "completed"
       end
+
+      test "resolved nonterminal child join schedules the parent for a due claim" do
+        type = uid("flow-parent-join-due")
+        parent = uid("flow-parent-join-due")
+        child = uid("flow-child-join-due")
+        partition = uid("tenant-join-due")
+        join_now_ms = 2_000
+
+        assert {:ok, _created_parent} =
+                 flow_create_and_get(parent,
+                   type: type,
+                   state: "queued",
+                   partition_key: partition,
+                   now_ms: 1_000,
+                   run_at_ms: 1_000
+                 )
+
+        assert {:ok, [claimed_parent]} =
+                 FerricStore.flow_claim_due(type,
+                   state: "queued",
+                   partition_key: partition,
+                   worker: "worker-join-parent",
+                   lease_ms: 30_000,
+                   limit: 1,
+                   now_ms: 1_000
+                 )
+
+        assert {:ok, retried_parent} =
+                 flow_retry_and_get(parent, claimed_parent.lease_token,
+                   partition_key: partition,
+                   fencing_token: claimed_parent.fencing_token,
+                   error: "retry before child join",
+                   run_at_ms: 1_010,
+                   now_ms: 1_005
+                 )
+
+        assert retried_parent.attempts == 1
+
+        assert {:ok, [claimed_parent_after_retry]} =
+                 FerricStore.flow_claim_due(type,
+                   state: "queued",
+                   partition_key: partition,
+                   worker: "worker-join-parent-retry",
+                   lease_ms: 30_000,
+                   limit: 1,
+                   now_ms: 1_010
+                 )
+
+        assert {:ok, _waiting_parent} =
+                 flow_spawn_children_and_get(
+                   parent,
+                   [%{id: child, type: "child", partition_key: partition, run_at_ms: 1_000}],
+                   group_id: "join-due",
+                   wait: :all,
+                   wait_state: "waiting_children",
+                   on_child_failed: :fail_parent,
+                   on_parent_closed: :cancel_children,
+                   exhaust_to: %{success: "native_join_next", failure: "native_join_failed"},
+                   partition_key: partition,
+                   from_state: "running",
+                   lease_token: claimed_parent_after_retry.lease_token,
+                   fencing_token: claimed_parent_after_retry.fencing_token,
+                   now_ms: 1_010
+                 )
+
+        child_claim = create_claimed_flow_child(child, partition, "worker-join-child")
+
+        assert {:ok, _completed_child} =
+                 flow_complete_and_get(child, child_claim.lease_token,
+                   partition_key: partition,
+                   fencing_token: child_claim.fencing_token,
+                   now_ms: join_now_ms
+                 )
+
+        assert {:ok, joined_parent} = FerricStore.flow_get(parent, partition_key: partition)
+        assert joined_parent.state == "native_join_next"
+        assert joined_parent.run_state == "queued"
+        assert joined_parent.attempts == 1
+        assert joined_parent.next_run_at_ms == join_now_ms
+
+        assert {:ok, [reclaimed_parent]} =
+                 FerricStore.flow_claim_due(type,
+                   state: "native_join_next",
+                   partition_key: partition,
+                   worker: "worker-join-successor",
+                   lease_ms: 30_000,
+                   limit: 1,
+                   now_ms: join_now_ms
+                 )
+
+        assert reclaimed_parent.id == parent
+        assert reclaimed_parent.state == "running"
+        assert reclaimed_parent.run_state == "native_join_next"
+        assert reclaimed_parent.attempts == 1
+      end
+
+      test "wait any keeps a parent blocked until an unresolved sibling closes" do
+        type = uid("flow-parent-join-any-due")
+        parent = uid("flow-parent-join-any-due")
+        failed_child = uid("flow-child-join-any-failed")
+        successful_child = uid("flow-child-join-any-success")
+        {partition, same_partition, _other_partition} = mixed_partition_keys()
+        create_now_ms = 4_000
+        failed_now_ms = create_now_ms + 10
+        join_now_ms = create_now_ms + 20
+
+        assert {:ok, _created_parent} =
+                 flow_create_and_get(parent,
+                   type: type,
+                   state: "queued",
+                   partition_key: partition,
+                   now_ms: create_now_ms,
+                   run_at_ms: create_now_ms
+                 )
+
+        assert {:ok, [claimed_parent]} =
+                 FerricStore.flow_claim_due(type,
+                   state: "queued",
+                   partition_key: partition,
+                   worker: "worker-join-any-parent",
+                   lease_ms: 30_000,
+                   limit: 1,
+                   now_ms: create_now_ms
+                 )
+
+        assert {:ok, _waiting_parent} =
+                 flow_spawn_children_and_get(
+                   parent,
+                   [
+                     %{id: failed_child, type: "child", partition_key: partition},
+                     %{id: successful_child, type: "child", partition_key: same_partition}
+                   ],
+                   group_id: "join-any-due",
+                   wait: :any,
+                   wait_state: "waiting_children",
+                   on_child_failed: :ignore,
+                   on_parent_closed: :cancel_children,
+                   exhaust_to: %{success: "join_any_next", failure: "join_any_failed"},
+                   partition_key: partition,
+                   from_state: "running",
+                   lease_token: claimed_parent.lease_token,
+                   fencing_token: claimed_parent.fencing_token,
+                   now_ms: create_now_ms + 1
+                 )
+
+        failed_claim = create_claimed_flow_child(failed_child, partition, "worker-join-any-fail")
+
+        successful_claim =
+          create_claimed_flow_child(successful_child, same_partition, "worker-join-any-success")
+
+        assert {:ok, failed_child_record} =
+                 flow_fail_and_get(failed_child, failed_claim.lease_token,
+                   partition_key: partition,
+                   fencing_token: failed_claim.fencing_token,
+                   error: "wait any failure",
+                   now_ms: failed_now_ms
+                 )
+
+        assert failed_child_record.state == "failed"
+        assert {:ok, blocked_parent} = FerricStore.flow_get(parent, partition_key: partition)
+        assert blocked_parent.state == "waiting_children"
+        assert blocked_parent.run_state == "queued"
+        assert is_nil(blocked_parent.next_run_at_ms)
+        assert is_nil(blocked_parent.child_groups["join-any-due"]["resolved"])
+        assert blocked_parent.child_groups["join-any-due"]["children"][failed_child] == "failed"
+
+        assert blocked_parent.child_groups["join-any-due"]["children"][successful_child] ==
+                 "running"
+
+        assert {:ok, []} =
+                 FerricStore.flow_claim_due(type,
+                   state: "join_any_next",
+                   partition_key: partition,
+                   worker: "worker-join-any-before-resolution",
+                   lease_ms: 30_000,
+                   limit: 1,
+                   now_ms: failed_now_ms
+                 )
+
+        assert {:ok, _successful_child_record} =
+                 flow_complete_and_get(successful_child, successful_claim.lease_token,
+                   partition_key: same_partition,
+                   fencing_token: successful_claim.fencing_token,
+                   now_ms: join_now_ms
+                 )
+
+        assert {:ok, joined_parent} = FerricStore.flow_get(parent, partition_key: partition)
+        assert joined_parent.state == "join_any_next"
+        assert joined_parent.run_state == "queued"
+        assert joined_parent.next_run_at_ms == join_now_ms
+
+        assert {:ok, [claimed_successor]} =
+                 FerricStore.flow_claim_due(type,
+                   state: "join_any_next",
+                   partition_key: partition,
+                   worker: "worker-join-any-successor",
+                   lease_ms: 30_000,
+                   limit: 1,
+                   now_ms: join_now_ms
+                 )
+
+        assert claimed_successor.id == parent
+        assert claimed_successor.state == "running"
+        assert claimed_successor.run_state == "join_any_next"
+      end
+
+      test "resolved nonterminal child join is included in a cross-shard due scan" do
+        type = uid("flow-parent-join-cross-shard-due")
+        parent = uid("flow-parent-join-cross-shard-due")
+        child = uid("flow-child-join-cross-shard-due")
+        decoy = uid("flow-decoy-join-cross-shard-due")
+        {partition, _same_partition, other_partition} = mixed_partition_keys()
+        create_now_ms = 5_000
+        join_now_ms = create_now_ms + 20
+
+        assert shard_for(Ferricstore.Flow.Keys.state_key(parent, partition)) !=
+                 shard_for(Ferricstore.Flow.Keys.state_key(decoy, other_partition))
+
+        assert {:ok, _created_parent} =
+                 flow_create_and_get(parent,
+                   type: type,
+                   state: "queued",
+                   partition_key: partition,
+                   now_ms: create_now_ms,
+                   run_at_ms: create_now_ms
+                 )
+
+        assert {:ok, _created_decoy} =
+                 flow_create_and_get(decoy,
+                   type: type,
+                   state: "queued",
+                   partition_key: other_partition,
+                   now_ms: join_now_ms,
+                   run_at_ms: join_now_ms
+                 )
+
+        assert {:ok, [claimed_parent]} =
+                 FerricStore.flow_claim_due(type,
+                   state: "queued",
+                   partition_key: partition,
+                   worker: "worker-join-cross-shard-parent",
+                   lease_ms: 30_000,
+                   limit: 1,
+                   now_ms: create_now_ms
+                 )
+
+        assert {:ok, _waiting_parent} =
+                 flow_spawn_children_and_get(
+                   parent,
+                   [%{id: child, type: "child", partition_key: partition}],
+                   group_id: "join-cross-shard-due",
+                   wait: :all,
+                   wait_state: "waiting_children",
+                   on_child_failed: :fail_parent,
+                   on_parent_closed: :cancel_children,
+                   exhaust_to: %{success: "cross_shard_next", failure: "cross_shard_failed"},
+                   partition_key: partition,
+                   from_state: "running",
+                   lease_token: claimed_parent.lease_token,
+                   fencing_token: claimed_parent.fencing_token,
+                   now_ms: create_now_ms + 1
+                 )
+
+        child_claim = create_claimed_flow_child(child, partition, "worker-join-cross-shard-child")
+
+        assert {:ok, _completed_child} =
+                 flow_complete_and_get(child, child_claim.lease_token,
+                   partition_key: partition,
+                   fencing_token: child_claim.fencing_token,
+                   now_ms: join_now_ms
+                 )
+
+        assert {:ok, joined_parent} = FerricStore.flow_get(parent, partition_key: partition)
+        assert joined_parent.state == "cross_shard_next"
+        assert joined_parent.run_state == "queued"
+        assert joined_parent.next_run_at_ms == join_now_ms
+
+        assert {:ok, claimed} =
+                 FerricStore.flow_claim_due(type,
+                   partition_key: :any,
+                   state: :any,
+                   worker: "worker-join-cross-shard-successors",
+                   lease_ms: 30_000,
+                   limit: 2,
+                   now_ms: join_now_ms
+                 )
+
+        assert MapSet.new(Enum.map(claimed, & &1.id)) == MapSet.new([parent, decoy])
+
+        assert Enum.any?(claimed, fn record ->
+                 record.id == parent and record.state == "running" and
+                   record.run_state == "cross_shard_next"
+               end)
+
+        assert Enum.any?(claimed, fn record ->
+                 record.id == decoy and record.state == "running" and record.run_state == "queued"
+               end)
+      end
+
+      test "resolved failed child join schedules a nonterminal failure successor" do
+        assert_child_join_due_case(
+          "failure-successor",
+          :fail,
+          "join_success_next",
+          "join_failure_next",
+          true
+        )
+      end
+
+      test "resolved successful child join leaves terminal success out of the due index" do
+        assert_child_join_due_case("terminal-success", :complete, "completed", "failed", false)
+      end
+
+      test "resolved failed child join leaves terminal failure out of the due index" do
+        assert_child_join_due_case("terminal-failure", :fail, "completed", "failed", false)
+      end
+
+      defp assert_child_join_due_case(
+             label,
+             operation,
+             success_state,
+             failure_state,
+             expected_due?
+           ) do
+        type = uid("flow-join-controls-type-#{label}")
+        parent = uid("flow-join-controls-parent-#{label}")
+        child = uid("flow-join-controls-child-#{label}")
+        partition = uid("tenant-join-controls-#{label}")
+        create_now_ms = 10_000
+        join_now_ms = create_now_ms + 10
+        expected_state = if operation == :complete, do: success_state, else: failure_state
+
+        assert {:ok, _created_parent} =
+                 flow_create_and_get(parent,
+                   type: type,
+                   state: "queued",
+                   partition_key: partition,
+                   now_ms: create_now_ms,
+                   run_at_ms: create_now_ms
+                 )
+
+        assert {:ok, [claimed_parent]} =
+                 FerricStore.flow_claim_due(type,
+                   state: "queued",
+                   partition_key: partition,
+                   worker: "worker-join-controls-parent",
+                   lease_ms: 30_000,
+                   limit: 1,
+                   now_ms: create_now_ms
+                 )
+
+        assert {:ok, _waiting_parent} =
+                 flow_spawn_children_and_get(
+                   parent,
+                   [
+                     %{
+                       id: child,
+                       type: "child",
+                       partition_key: partition,
+                       run_at_ms: create_now_ms
+                     }
+                   ],
+                   group_id: "join-controls",
+                   wait: :all,
+                   wait_state: "waiting_children",
+                   on_child_failed: :fail_parent,
+                   on_parent_closed: :cancel_children,
+                   exhaust_to: %{success: success_state, failure: failure_state},
+                   partition_key: partition,
+                   from_state: "running",
+                   lease_token: claimed_parent.lease_token,
+                   fencing_token: claimed_parent.fencing_token,
+                   now_ms: create_now_ms + 1
+                 )
+
+        child_claim = create_claimed_flow_child(child, partition, "worker-join-controls-child")
+
+        child_result =
+          case operation do
+            :complete ->
+              flow_complete_and_get(child, child_claim.lease_token,
+                partition_key: partition,
+                fencing_token: child_claim.fencing_token,
+                now_ms: join_now_ms
+              )
+
+            :fail ->
+              flow_fail_and_get(child, child_claim.lease_token,
+                partition_key: partition,
+                fencing_token: child_claim.fencing_token,
+                error: "join controls failure",
+                now_ms: join_now_ms
+              )
+          end
+
+        assert {:ok, _completed_child} = child_result
+        assert {:ok, joined_parent} = FerricStore.flow_get(parent, partition_key: partition)
+        assert joined_parent.state == expected_state
+        assert joined_parent.run_state == "queued"
+
+        if expected_due? do
+          assert joined_parent.next_run_at_ms == join_now_ms
+
+          assert {:ok, [claimed_successor]} =
+                   FerricStore.flow_claim_due(type,
+                     state: expected_state,
+                     partition_key: partition,
+                     worker: "worker-join-controls-successor",
+                     lease_ms: 30_000,
+                     limit: 1,
+                     now_ms: join_now_ms
+                   )
+
+          assert claimed_successor.id == parent
+          assert claimed_successor.state == "running"
+          assert claimed_successor.run_state == expected_state
+        else
+          assert is_nil(joined_parent.next_run_at_ms)
+
+          assert {:ok, []} =
+                   FerricStore.flow_claim_due(type,
+                     state: expected_state,
+                     partition_key: partition,
+                     worker: "worker-join-controls-terminal",
+                     lease_ms: 30_000,
+                     limit: 1,
+                     now_ms: join_now_ms
+                   )
+        end
+      end
     end
   end
 end
