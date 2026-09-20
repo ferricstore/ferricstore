@@ -121,6 +121,31 @@ defmodule Ferricstore.Flow.LMDB.SegmentPinsTest do
     assert digest == :crypto.hash(:sha256, encoded)
   end
 
+  test "removing a pin entry rewrites only that entry in its batch", %{path: path} do
+    file_id = {:waraft_apply_projection, 7}
+    entries = [{"stale", 0, file_id, 10, 20}, {"live", 0, file_id, 30, 40}]
+    {:put, pin_key, encoded} = pin_op(entries)
+
+    assert :ok = LMDB.write_batch(path, [{:put, pin_key, encoded}])
+
+    assert {:ok, ops} =
+             LMDB.segment_value_pin_remove_entries_ops(pin_key, encoded, [
+               %{
+                 key: "stale",
+                 expire_at_ms: 0,
+                 source_file_id: file_id,
+                 source_offset: 10,
+                 source_value_size: 20
+               }
+             ])
+
+    assert {:compare, ^pin_key, ^encoded} = hd(ops)
+    assert :ok = LMDB.write_batch(path, ops)
+
+    assert {:ok, [%{key: "live", offset: 30, value_size: 40}]} =
+             LMDB.segment_value_pin_entries_before(path, 8, 10)
+  end
+
   test "future pins in one family do not hide older pins in the other family", %{path: path} do
     {:put, future_key, future_value} =
       pin_op([{"future", 0, {:waraft_apply_projection, 10}, 10, 20}])

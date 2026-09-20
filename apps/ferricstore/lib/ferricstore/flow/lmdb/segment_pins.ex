@@ -68,6 +68,44 @@ defmodule Ferricstore.Flow.LMDB.SegmentPins do
     value_ops ++ pin_ops
   end
 
+  def remove_entries_ops(pin_key, encoded, entries)
+      when is_binary(pin_key) and is_binary(encoded) and is_list(entries) do
+    with {:ok, %{file_id: file_id, pins: pins}} <- decode_entry({pin_key, encoded}),
+         {:ok, removals} <- normalize_removal_entries(entries),
+         {:ok, remaining} <- remove_batch_entries(file_id, pins, removals) do
+      replacement_ops = [{:compare, pin_key, encoded}]
+
+      case remaining do
+        [] ->
+          {:ok, replacement_ops ++ [{:delete, pin_key}]}
+
+        remaining ->
+          replacement =
+            Enum.map(remaining, fn %{
+                                     key: key,
+                                     expire_at_ms: expire_at_ms,
+                                     offset: offset,
+                                     value_size: value_size
+                                   } ->
+              {key, expire_at_ms, offset, value_size}
+            end)
+
+          replacement_blob = encode_batch(file_id, replacement)
+          replacement_key = batch_key(file_id, replacement_blob)
+
+          {:ok,
+           replacement_ops ++
+             [{:put, replacement_key, replacement_blob}, {:delete, pin_key}]}
+      end
+    else
+      :skip -> {:error, {:corrupt_flow_segment_value_pin, pin_key}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def remove_entries_ops(_pin_key, _encoded, _entries),
+    do: {:error, :invalid_flow_segment_value_pin_removal}
+
   def entries_before(path, trim_index, limit)
       when is_binary(path) and is_integer(trim_index) and trim_index > 0 and is_integer(limit) and
              limit > 0 do
@@ -313,6 +351,57 @@ defmodule Ferricstore.Flow.LMDB.SegmentPins do
   end
 
   defp decode_entry(_entry), do: :skip
+
+  defp normalize_removal_entries(entries) when entries != [] do
+    entries
+    |> Enum.reduce_while({:ok, []}, fn
+      %{
+        key: key,
+        expire_at_ms: expire_at_ms,
+        source_file_id: {tag, index} = file_id,
+        source_offset: offset,
+        source_value_size: value_size
+      },
+      {:ok, acc}
+      when tag in [:waraft_segment, :waraft_apply_projection] and is_binary(key) and
+             key != "" and is_integer(expire_at_ms) and expire_at_ms >= 0 and
+             is_integer(index) and index > 0 and is_integer(offset) and offset >= 0 and
+             is_integer(value_size) and value_size >= 0 ->
+        {:cont, {:ok, [{file_id, key, expire_at_ms, offset, value_size} | acc]}}
+
+      _invalid, _acc ->
+        {:halt, {:error, :invalid_flow_segment_value_pin_removal}}
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp normalize_removal_entries(_entries),
+    do: {:error, :invalid_flow_segment_value_pin_removal}
+
+  defp remove_batch_entries(file_id, pins, removals) do
+    Enum.reduce_while(removals, {:ok, pins}, fn
+      {^file_id, key, expire_at_ms, offset, value_size}, {:ok, remaining} ->
+        target = fn pin ->
+          pin.key == key and pin.expire_at_ms == expire_at_ms and pin.offset == offset and
+            pin.value_size == value_size
+        end
+
+        case Enum.split_while(remaining, &(not target.(&1))) do
+          {_before, []} ->
+            {:halt,
+             {:error, {:flow_segment_value_pin_entry_missing, file_id, key, offset, value_size}}}
+
+          {before, [_matched | after_entries]} ->
+            {:cont, {:ok, before ++ after_entries}}
+        end
+
+      {_other_file_id, _key, _expire_at_ms, _offset, _value_size}, _acc ->
+        {:halt, {:error, :flow_segment_value_pin_source_mismatch}}
+    end)
+  end
 
   defp decode_key(pin_key) do
     Enum.find_value([:waraft_apply_projection, :waraft_segment], :error, fn tag ->

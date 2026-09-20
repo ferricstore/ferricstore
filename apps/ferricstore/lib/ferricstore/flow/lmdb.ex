@@ -1088,6 +1088,9 @@ defmodule Ferricstore.Flow.LMDB do
   def segment_value_pin_batch_put_ops(entries),
     do: Ferricstore.Flow.LMDB.SegmentPins.batch_put_ops(entries)
 
+  def segment_value_pin_remove_entries_ops(pin_key, encoded, entries),
+    do: Ferricstore.Flow.LMDB.SegmentPins.remove_entries_ops(pin_key, encoded, entries)
+
   def segment_value_pin_entries_before(path, trim_index, limit),
     do: Ferricstore.Flow.LMDB.SegmentPins.entries_before(path, trim_index, limit)
 
