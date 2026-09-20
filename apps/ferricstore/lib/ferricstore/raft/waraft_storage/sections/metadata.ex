@@ -630,31 +630,82 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
                   is_binary(pin_key) do
         if expired_segment_value_pin?(expire_at_ms, expiry_cutoff_ms) do
           {:ok,
-           %{
-             key: key,
-             expire_at_ms: expire_at_ms,
-             source_file_id: file_id,
-             source_offset: offset,
-             source_value_size: value_size,
-             source_pin_key: pin_key,
-             stale?: true
-           }}
+           segment_value_pin_stale_relocation(
+             key,
+             expire_at_ms,
+             file_id,
+             offset,
+             value_size,
+             pin_key,
+             true
+           )}
         else
-          segment_value_pin_relocation_from_live_pin(
-            ctx,
-            shard_index,
-            key,
-            expire_at_ms,
-            file_id,
-            offset,
-            value_size,
-            pin_key
-          )
+          lmdb_path = flow_lmdb_path(ctx, shard_index)
+
+          case current_segment_value_pin_locator(
+                 lmdb_path,
+                 key,
+                 file_id,
+                 offset,
+                 value_size,
+                 expiry_cutoff_ms
+               ) do
+            {:current, _locator_blob} ->
+              segment_value_pin_relocation_from_live_pin(
+                ctx,
+                shard_index,
+                key,
+                expire_at_ms,
+                file_id,
+                offset,
+                value_size,
+                pin_key
+              )
+
+            {:changed, _locator_blob} ->
+              {:ok,
+               segment_value_pin_stale_relocation(
+                 key,
+                 expire_at_ms,
+                 file_id,
+                 offset,
+                 value_size,
+                 pin_key,
+                 false
+               )}
+
+            :missing ->
+              {:error, {:segment_value_pin_missing_live_value, key, file_id}}
+
+            {:error, _reason} = error ->
+              error
+          end
         end
       end
 
       defp segment_value_pin_relocation_from_pin(_ctx, _shard_index, pin, _expiry_cutoff_ms),
         do: {:error, {:bad_segment_value_pin, pin}}
+
+      defp segment_value_pin_stale_relocation(
+             key,
+             expire_at_ms,
+             file_id,
+             offset,
+             value_size,
+             pin_key,
+             expired?
+           ) do
+        %{
+          key: key,
+          expire_at_ms: expire_at_ms,
+          source_file_id: file_id,
+          source_offset: offset,
+          source_value_size: value_size,
+          source_pin_key: pin_key,
+          stale?: true,
+          expired?: expired?
+        }
+      end
 
       defp segment_value_pin_relocation_from_live_pin(
              ctx,
@@ -1079,7 +1130,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
                    value_size,
                    expiry_cutoff_ms
                  ) do
-              :current ->
+              {:current, _locator_blob} ->
                 case apply_projection_retention_entry(
                        ctx,
                        shard_index,
@@ -1098,8 +1149,11 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
                     {:halt, {:error, reason}}
                 end
 
-              :changed_or_deleted ->
+              {:changed, _locator_blob} ->
                 {:cont, {:ok, entries}}
+
+              :missing ->
+                {:halt, {:error, {:segment_value_pin_missing_live_value, key, file_id}}}
 
               {:error, reason} ->
                 {:halt, {:error, reason}}
@@ -1228,73 +1282,209 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
            ) do
         lmdb_path = flow_lmdb_path(ctx, shard_index)
 
-        ops =
-          relocations
-          |> Enum.reduce_while({:ok, []}, fn relocation, {:ok, acc} ->
-            case segment_value_pin_relocation_ops(
-                   lmdb_path,
-                   relocation,
-                   expiry_cutoff_ms
-                 ) do
-              {:ok, relocation_ops} -> {:cont, {:ok, [relocation_ops | acc]}}
-              {:error, reason} -> {:halt, {:error, reason}}
-            end
-          end)
-
-        with {:ok, op_groups} <- ops do
-          lmdb_ops =
-            op_groups
-            |> Enum.reverse()
-            |> List.flatten()
-            |> Enum.uniq()
-
+        with {:ok, lmdb_ops} <-
+               segment_value_pin_relocation_ops(lmdb_path, relocations, expiry_cutoff_ms),
+             :ok <- maybe_run_segment_value_pin_before_write_hook(lmdb_path, relocations) do
           FlowLMDB.write_batch(lmdb_path, lmdb_ops)
         end
       rescue
         error -> {:error, {:relocate_segment_value_pins_failed, error}}
       end
 
-      defp segment_value_pin_relocation_ops(
+      defp segment_value_pin_relocation_ops(lmdb_path, relocations, expiry_cutoff_ms) do
+        relocations
+        |> Enum.group_by(& &1.source_pin_key)
+        |> Enum.reduce_while({:ok, []}, fn {_source_pin_key, group}, {:ok, acc} ->
+          case segment_value_pin_relocation_group_ops(lmdb_path, group, expiry_cutoff_ms) do
+            {:ok, group_ops} -> {:cont, {:ok, [group_ops | acc]}}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+        |> case do
+          {:ok, reversed_groups} ->
+            {:ok, reversed_groups |> Enum.reverse() |> List.flatten() |> Enum.uniq()}
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp segment_value_pin_relocation_group_ops(
+             lmdb_path,
+             relocations,
+             expiry_cutoff_ms
+           ) do
+        with {:ok, actions} <-
+               build_segment_value_pin_relocation_actions(
+                 lmdb_path,
+                 relocations,
+                 expiry_cutoff_ms
+               ),
+             removals <- Enum.filter(actions, & &1.remove_pin?),
+             {:ok, pin_ops} <-
+               remove_segment_value_pin_entries(lmdb_path, relocations, removals) do
+          locator_ops =
+            Enum.flat_map(actions, fn %{locator_ops: locator_ops, value_pin_ops: value_pin_ops} ->
+              locator_ops ++ value_pin_ops
+            end)
+
+          {:ok, Enum.uniq(pin_ops ++ locator_ops)}
+        end
+      end
+
+      defp build_segment_value_pin_relocation_actions(
+             lmdb_path,
+             relocations,
+             expiry_cutoff_ms
+           ) do
+        Enum.reduce_while(relocations, {:ok, []}, fn relocation, {:ok, acc} ->
+          case segment_value_pin_relocation_action(lmdb_path, relocation, expiry_cutoff_ms) do
+            {:ok, action} -> {:cont, {:ok, [action | acc]}}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+        |> case do
+          {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp segment_value_pin_relocation_action(
+             lmdb_path,
+             %{expired?: true} = relocation,
+             expiry_cutoff_ms
+           ) do
+        case current_segment_value_pin_locator(
+               lmdb_path,
+               relocation.key,
+               relocation.source_file_id,
+               relocation.source_offset,
+               relocation.source_value_size,
+               expiry_cutoff_ms
+             ) do
+          {:current, locator_blob} ->
+            {:ok,
+             %{
+               relocation: relocation,
+               remove_pin?: true,
+               locator_ops: [{:compare, relocation.key, locator_blob}],
+               value_pin_ops: []
+             }}
+
+          {:changed, locator_blob} ->
+            {:ok,
+             %{
+               relocation: relocation,
+               remove_pin?: true,
+               locator_ops: [{:compare, relocation.key, locator_blob}],
+               value_pin_ops: []
+             }}
+
+          :missing ->
+            {:error,
+             {:segment_value_pin_missing_live_value, relocation.key, relocation.source_file_id}}
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp segment_value_pin_relocation_action(
              lmdb_path,
              %{
                key: key,
                expire_at_ms: expire_at_ms,
                source_file_id: source_file_id,
-               source_offset: source_offset,
-               source_value_size: source_value_size,
-               source_pin_key: source_pin_key
-             },
+               source_value_size: source_value_size
+             } = relocation,
              expiry_cutoff_ms
            ) do
-        with :current <-
-               current_segment_value_pin_locator(
-                 lmdb_path,
-                 key,
-                 source_file_id,
-                 source_offset,
-                 source_value_size,
-                 expiry_cutoff_ms
-               ) do
-          case source_file_id do
-            {:waraft_apply_projection, index} when is_integer(index) and index > 0 ->
-              {:ok, []}
+        case current_segment_value_pin_locator(
+               lmdb_path,
+               key,
+               source_file_id,
+               relocation.source_offset,
+               source_value_size,
+               expiry_cutoff_ms
+             ) do
+          {:current, locator_blob} ->
+            case source_file_id do
+              {:waraft_apply_projection, _index} ->
+                {:ok,
+                 %{
+                   relocation: relocation,
+                   remove_pin?: false,
+                   locator_ops: [],
+                   value_pin_ops: []
+                 }}
 
-            {:waraft_segment, index} when is_integer(index) and index > 0 ->
-              target =
-                {key, expire_at_ms, {:waraft_apply_projection, index}, 0, source_value_size}
+              {:waraft_segment, index} when is_integer(index) and index > 0 ->
+                target =
+                  {key, expire_at_ms, {:waraft_apply_projection, index}, 0, source_value_size}
 
-              {:ok,
-               FlowLMDB.segment_value_pin_batch_put_ops([target]) ++ [{:delete, source_pin_key}]}
+                {:ok,
+                 %{
+                   relocation: relocation,
+                   remove_pin?: true,
+                   locator_ops: [{:compare, key, locator_blob}],
+                   value_pin_ops: FlowLMDB.segment_value_pin_batch_put_ops([target])
+                 }}
 
-            _other ->
-              {:error, {:unsupported_segment_value_pin_source, source_file_id}}
-          end
-        else
-          :changed_or_deleted ->
-            {:ok, [{:delete, source_pin_key}]}
+              _other ->
+                {:error, {:unsupported_segment_value_pin_source, source_file_id}}
+            end
+
+          {:changed, locator_blob} ->
+            {:ok,
+             %{
+               relocation: relocation,
+               remove_pin?: true,
+               locator_ops: [{:compare, key, locator_blob}],
+               value_pin_ops: []
+             }}
+
+          :missing ->
+            {:error, {:segment_value_pin_missing_live_value, key, source_file_id}}
 
           {:error, _reason} = error ->
             error
+        end
+      end
+
+      defp remove_segment_value_pin_entries(_lmdb_path, _relocations, []), do: {:ok, []}
+
+      defp remove_segment_value_pin_entries(lmdb_path, [first | _], removals) do
+        source_pin_key = first.source_pin_key
+        relocation_entries = Enum.map(removals, & &1.relocation)
+
+        with {:ok, source_pin_blob} when is_binary(source_pin_blob) <-
+               FlowLMDB.get(lmdb_path, source_pin_key),
+             {:ok, ops} <-
+               FlowLMDB.segment_value_pin_remove_entries_ops(
+                 source_pin_key,
+                 source_pin_blob,
+                 relocation_entries
+               ) do
+          {:ok, ops}
+        else
+          :not_found ->
+            {:error, {:segment_value_pin_source_batch_missing, source_pin_key}}
+
+          {:ok, invalid_blob} ->
+            {:error, {:segment_value_pin_source_batch_invalid, source_pin_key, invalid_blob}}
+
+          {:error, _reason} = error ->
+            error
+
+          invalid ->
+            {:error, {:segment_value_pin_source_batch_read_failed, source_pin_key, invalid}}
+        end
+      end
+
+      defp maybe_run_segment_value_pin_before_write_hook(lmdb_path, relocations) do
+        case Application.get_env(:ferricstore, :waraft_segment_value_pin_before_write_hook) do
+          fun when is_function(fun, 2) -> fun.(lmdb_path, relocations)
+          _other -> :ok
         end
       end
 
@@ -1307,17 +1497,36 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
              expiry_cutoff_ms
            ) do
         case FlowLMDB.get(lmdb_path, key) do
-          {:ok, blob} ->
+          {:ok, blob} when is_binary(blob) ->
             case FlowLMDB.decode_value_locator(blob, expiry_cutoff_ms) do
-              {:ok, {^source_file_id, ^source_offset, ^source_value_size}} -> :current
-              _expired_or_changed -> :changed_or_deleted
+              {:ok, {^source_file_id, ^source_offset, ^source_value_size}} ->
+                {:current, blob}
+
+              {:ok, {_other_file_id, _other_offset, _other_value_size}} ->
+                {:changed, blob}
+
+              :expired ->
+                {:changed, blob}
+
+              :not_locator ->
+                case FlowLMDB.decode_value(blob, expiry_cutoff_ms) do
+                  {:ok, _value} -> {:changed, blob}
+                  :expired -> {:changed, blob}
+                  :error -> {:error, {:malformed_segment_value_pin_locator, key}}
+                end
+
+              :error ->
+                {:error, {:malformed_segment_value_pin_locator, key}}
             end
 
           :not_found ->
-            :changed_or_deleted
+            :missing
 
           {:error, reason} ->
             {:error, {:read_segment_value_pin_locator_failed, key, reason}}
+
+          invalid ->
+            {:error, {:invalid_segment_value_pin_locator_read, key, invalid}}
         end
       end
     end
