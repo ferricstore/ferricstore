@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.20 - 2026-09-20
+
+- Harden Flow value-pin trimming after the runtime incident: stale relocated
+  pins are removed per entry with atomic current-locator guards, preserving
+  unrelated entries in the same pin batch. True missing value sources and
+  malformed locators remain fail-closed. No corruption or data loss was
+  demonstrated, and the warning should not be treated as the cause of every
+  timeout.
+
 ## 0.11.19 - 2026-09-19
 
 - Schedule resolved nonterminal child joins at their resolution time so parents
