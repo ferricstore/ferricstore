@@ -111,9 +111,24 @@ defmodule Ferricstore.Store.Shard.Startup do
 
           flow_shared_ref_backfill? = Keyword.get(opts, :flow_shared_ref_backfill?, true)
 
-          if ctx && !raft_projection_owner?(ctx) do
+          startup_recovery_reason =
+            Ferricstore.Store.StandaloneTxLog.startup_recovery_reason(data_dir)
+
+          # Recovery is a data-dir-wide operation. Only shard zero owns that
+          # startup transition; a participant restart must retain the startup
+          # fence until the recovery owner replays the journal.
+          recovery_owner? = not is_nil(ctx) and index == 0 and not raft_projection_owner?(ctx)
+
+          if recovery_owner? do
             :ok = Ferricstore.Store.StandaloneTxLog.recover_once(data_dir)
+
+            if startup_recovery_reason != nil do
+              release_startup_recovery_fences(ctx, index, data_dir)
+            end
           end
+
+          standalone_recovery_reason =
+            Ferricstore.Store.StandaloneTxLog.startup_recovery_reason(data_dir)
 
           path = Ferricstore.DataDir.shard_data_path(data_dir, index)
 
@@ -334,6 +349,11 @@ defmodule Ferricstore.Store.Shard.Startup do
              file_stats: file_stats,
              merge_config: merge_config,
              raft?: raft?,
+             writes_paused: not is_nil(standalone_recovery_reason),
+             last_flush_error:
+               if standalone_recovery_reason do
+                 {:standalone_recovery_required, standalone_recovery_reason}
+               end,
              max_active_file_size: max_file_size,
              standalone_commit_delay_ms: standalone_commit_delay_ms,
              standalone_commit_max_ops: standalone_commit_max_ops,
@@ -391,6 +411,31 @@ defmodule Ferricstore.Store.Shard.Startup do
           _missing ->
             0
         end
+      end
+
+      defp release_startup_recovery_fences(ctx, owner_index, data_dir) do
+        for participant_index <- 0..(ctx.shard_count - 1), participant_index != owner_index do
+          shard_name = Router.shard_name(ctx, participant_index)
+
+          if Process.whereis(shard_name) do
+            case GenServer.call(
+                   shard_name,
+                   {:standalone_startup_recovery_complete, Path.expand(data_dir)},
+                   :infinity
+                 ) do
+              :ok ->
+                :ok
+
+              {:error, reason} ->
+                Logger.error(
+                  "Shard #{owner_index}: participant #{participant_index} startup recovery " <>
+                    "fence release failed: #{inspect(reason)}"
+                )
+            end
+          end
+        end
+
+        :ok
       end
 
       defp ensure_zset_index_table!(table_name, table_type) do

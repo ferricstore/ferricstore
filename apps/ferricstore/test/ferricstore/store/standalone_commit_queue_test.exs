@@ -3,7 +3,141 @@ defmodule Ferricstore.Store.StandaloneCommitQueueTest do
 
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.Shard
+  alias Ferricstore.Store.StandaloneTxLog
   alias Ferricstore.ServerCatalog
+
+  test "a blocked SET NX cannot be overtaken by a same-key PUT" do
+    test_pid = self()
+    durability_calls = :atomics.new(1, signed: false)
+    previous_hook = Application.get_env(:ferricstore, :standalone_durability_hook)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      case :atomics.add_get(durability_calls, 1, 1) do
+        1 ->
+          send(test_pid, {:durability_batch, self(), length(batch)})
+
+          receive do
+            :continue -> :passthrough
+          after
+            5_000 -> :passthrough
+          end
+
+        _ ->
+          :passthrough
+      end
+    end)
+
+    on_exit(fn -> restore_env(:standalone_durability_hook, previous_hook) end)
+
+    {pid, ctx, data_dir} = start_shard(standalone_commit_delay_ms: 0)
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    key = "queue:mixed-path:same-key"
+    opts = %{expire_at_ms: 0, get: false, keepttl: false, nx: true, xx: false}
+    conditional = Task.async(fn -> Router.set(ctx, key, "conditional", opts) end)
+
+    assert_receive {:durability_batch, worker, 1}, 1_000
+
+    unconditional = Task.async(fn -> Router.put(ctx, key, "unconditional", 0) end)
+    assert Task.yield(unconditional, 100) == nil
+
+    send(worker, :continue)
+
+    assert :ok = Task.await(conditional, 5_000)
+    assert :ok = Task.await(unconditional, 5_000)
+    assert "unconditional" == Router.get(ctx, key)
+  end
+
+  test "unconditional writes before and after conditional writes preserve order" do
+    {pid, ctx, data_dir} = start_shard([])
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    key = "queue:mixed-path:sequential"
+    opts = %{expire_at_ms: 0, get: false, keepttl: false, nx: true, xx: false}
+
+    assert :ok = Router.put(ctx, key, "before", 0)
+    assert nil == Router.set(ctx, key, "conditional", opts)
+    assert "before" == Router.get(ctx, key)
+
+    assert :ok = Router.put(ctx, key, "after", 0)
+    assert "after" == Router.get(ctx, key)
+  end
+
+  test "a non-conflicting barrier write retains progress during a conditional flush" do
+    test_pid = self()
+    previous_hook = Application.get_env(:ferricstore, :standalone_durability_hook)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      send(test_pid, {:durability_batch, self(), length(batch)})
+
+      receive do
+        :continue -> :passthrough
+      after
+        5_000 -> :passthrough
+      end
+    end)
+
+    on_exit(fn -> restore_env(:standalone_durability_hook, previous_hook) end)
+
+    {pid, ctx, data_dir} = start_shard(standalone_commit_delay_ms: 0)
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    conditional_key = "queue:mixed-path:conditional"
+    unrelated_key = "queue:mixed-path:unrelated"
+    opts = %{expire_at_ms: 0, get: false, keepttl: false, nx: true, xx: false}
+    conditional = Task.async(fn -> Router.set(ctx, conditional_key, "conditional", opts) end)
+
+    assert_receive {:durability_batch, worker, 1}, 1_000
+
+    unrelated = Task.async(fn -> Router.put(ctx, unrelated_key, "unrelated", 0) end)
+    assert {:ok, :ok} = Task.yield(unrelated, 1_000)
+    assert "unrelated" == Router.get(ctx, unrelated_key)
+
+    send(worker, :continue)
+    assert :ok = Task.await(conditional, 5_000)
+    assert "conditional" == Router.get(ctx, conditional_key)
+  end
+
+  test "a failed conditional flush replies to conflicting barrier writes and clears the queue" do
+    test_pid = self()
+    previous_hook = Application.get_env(:ferricstore, :standalone_durability_hook)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      send(test_pid, {:durability_batch, self(), length(batch)})
+
+      receive do
+        :fail -> {:error, :synthetic_eio}
+      after
+        5_000 -> {:error, :synthetic_eio}
+      end
+    end)
+
+    on_exit(fn -> restore_env(:standalone_durability_hook, previous_hook) end)
+
+    {pid, ctx, data_dir} = start_shard(standalone_commit_delay_ms: 0)
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    key = "queue:mixed-path:failure"
+    opts = %{expire_at_ms: 0, get: false, keepttl: false, nx: true, xx: false}
+    conditional = Task.async(fn -> Router.set(ctx, key, "conditional", opts) end)
+
+    assert_receive {:durability_batch, worker, 1}, 1_000
+    conflicting = Task.async(fn -> Router.put(ctx, key, "unconditional", 0) end)
+    assert Task.yield(conflicting, 100) == nil
+
+    send(worker, :fail)
+
+    expected =
+      {:error, {:standalone_durability_failed, {:bitcask_append_failed, :synthetic_eio}}}
+
+    assert ^expected = Task.await(conditional, 5_000)
+    assert ^expected = Task.await(conflicting, 5_000)
+
+    assert %{batch_count: 0, waiting_count: 0, inflight_count: 0} =
+             GenServer.call(pid, :standalone_commit_debug)
+
+    assert %{writes_paused: true} = :sys.get_state(pid)
+  end
 
   test "catalog versions advance across separate standalone flushes" do
     {pid, ctx, data_dir} = start_shard([])
@@ -56,6 +190,60 @@ defmodule Ferricstore.Store.StandaloneCommitQueueTest do
     assert :ok = GenServer.call(pid, {:standalone_cross_shard_barrier_release, owner})
     assert {:reply, :ok} = :gen_server.receive_response(pending, 5_000)
     assert "value" == Router.get(ctx, "queue:barrier-owner")
+  end
+
+  test "barrier waiters join the commit queue behind same-key conditional waiters" do
+    test_pid = self()
+    durability_calls = :atomics.new(1, signed: false)
+    previous_hook = Application.get_env(:ferricstore, :standalone_durability_hook)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      case :atomics.add_get(durability_calls, 1, 1) do
+        1 ->
+          send(test_pid, {:durability_batch, self(), length(batch)})
+
+          receive do
+            :continue -> :passthrough
+          after
+            5_000 -> :passthrough
+          end
+
+        _ ->
+          :passthrough
+      end
+    end)
+
+    on_exit(fn -> restore_env(:standalone_durability_hook, previous_hook) end)
+
+    {pid, ctx, data_dir} = start_shard(standalone_commit_delay_ms: 0)
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    owner = make_ref()
+    key = "queue:barrier-handoff:same-key"
+    opts = %{expire_at_ms: 0, get: false, keepttl: false, nx: true, xx: false}
+
+    assert :ok = GenServer.call(pid, {:standalone_cross_shard_barrier_acquire, owner})
+
+    conditional =
+      :gen_server.send_request(pid, {:standalone_commit, {:set, key, "conditional", 0, opts}})
+
+    barrier =
+      :gen_server.send_request(
+        pid,
+        {:standalone_barrier_write, {:put, key, "unconditional", 0}}
+      )
+
+    assert %{waiting_count: 1, barrier_waiting_count: 1} =
+             GenServer.call(pid, :standalone_commit_debug)
+
+    assert :ok = GenServer.call(pid, {:standalone_cross_shard_barrier_release, owner})
+    assert_receive {:durability_batch, worker, 1}, 1_000
+
+    send(worker, :continue)
+
+    assert {:reply, :ok} = :gen_server.receive_response(conditional, 5_000)
+    assert {:reply, :ok} = :gen_server.receive_response(barrier, 5_000)
+    assert "unconditional" == Router.get(ctx, key)
   end
 
   test "cross-shard participant shuts down for journal recovery when the coordinator dies" do
@@ -134,7 +322,10 @@ defmodule Ferricstore.Store.StandaloneCommitQueueTest do
 
     on_exit(fn -> restore_env(:standalone_durability_hook, previous_hook) end)
 
-    first_command = {:put, "queue:bytes:first", String.duplicate("a", 256), 0}
+    first_command =
+      {:set, "queue:bytes:first", String.duplicate("a", 256), 0,
+       %{expire_at_ms: 0, get: false, keepttl: false, nx: false, xx: false}}
+
     first_bytes = :erlang.external_size(first_command)
 
     {pid, ctx, data_dir} =
@@ -196,11 +387,13 @@ defmodule Ferricstore.Store.StandaloneCommitQueueTest do
     assert :ok =
              GenServer.call(pid, {:standalone_cross_shard_barrier_acquire, barrier_owner})
 
+    opts = %{expire_at_ms: 0, get: false, keepttl: false, nx: false, xx: false}
+
     requests =
       for index <- 1..5 do
         :gen_server.send_request(
           pid,
-          {:standalone_commit, {:put, "queue:chunk:#{index}", Integer.to_string(index), 0}}
+          {:standalone_commit, {:set, "queue:chunk:#{index}", Integer.to_string(index), 0, opts}}
         )
       end
 
@@ -243,7 +436,14 @@ defmodule Ferricstore.Store.StandaloneCommitQueueTest do
     {pid, ctx, data_dir} = start_shard(standalone_commit_delay_ms: 0)
     on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
 
-    first = :gen_server.send_request(pid, {:standalone_commit, {:put, "queue:dep:a", "a0", 0}})
+    opts = %{expire_at_ms: 0, get: false, keepttl: false, nx: false, xx: false}
+
+    first =
+      :gen_server.send_request(
+        pid,
+        {:standalone_commit, {:set, "queue:dep:a", "a0", 0, opts}}
+      )
+
     assert_receive {:durability_batch, first_worker, 1}, 1_000
 
     middle =
@@ -253,7 +453,10 @@ defmodule Ferricstore.Store.StandaloneCommitQueueTest do
       )
 
     last =
-      :gen_server.send_request(pid, {:standalone_commit, {:put, "queue:dep:b", "b2", 0}})
+      :gen_server.send_request(
+        pid,
+        {:standalone_commit, {:set, "queue:dep:b", "b2", 0, opts}}
+      )
 
     assert %{batch_count: 0, waiting_count: 2, inflight_count: 1} =
              GenServer.call(pid, :standalone_commit_debug)
@@ -316,6 +519,195 @@ defmodule Ferricstore.Store.StandaloneCommitQueueTest do
     assert {:reply, nil} = :gen_server.receive_response(second, 5_000)
     refute_receive {:durability_batch, _worker, _count}, 100
     assert "first" == Router.get(ctx, "queue:nx")
+  end
+
+  test "Router SET NX and PUT share ordering for a blocked same-key flush" do
+    test_pid = self()
+    durability_calls = :atomics.new(1, signed: false)
+    previous_hook = Application.get_env(:ferricstore, :standalone_durability_hook)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      send(test_pid, {:durability_batch, self(), length(batch)})
+
+      case :atomics.add_get(durability_calls, 1, 1) do
+        1 ->
+          receive do
+            :continue -> :passthrough
+          after
+            5_000 -> :passthrough
+          end
+
+        _later ->
+          :passthrough
+      end
+    end)
+
+    on_exit(fn -> restore_env(:standalone_durability_hook, previous_hook) end)
+
+    {pid, ctx, data_dir} = start_shard(standalone_commit_delay_ms: 0)
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    key = "queue:router:set-put"
+    opts = %{expire_at_ms: 0, get: false, keepttl: false, nx: true, xx: false}
+    conditional = Task.async(fn -> Router.set(ctx, key, "conditional", opts) end)
+
+    assert_receive {:durability_batch, conditional_worker, 1}, 1_000
+
+    unconditional = Task.async(fn -> Router.put(ctx, key, "unconditional", 0) end)
+    refute Task.yield(unconditional, 100)
+
+    send(conditional_worker, :continue)
+
+    assert :ok = Task.await(conditional, 5_000)
+    assert :ok = Task.await(unconditional, 5_000)
+    assert "unconditional" == Router.get(ctx, key)
+  end
+
+  test "unknown multi-key standalone commands use the global ordering key" do
+    command = {:unknown_multi_key_command, "queue:unknown:a", "queue:unknown:b"}
+
+    assert ["__standalone_global__"] = Shard.__standalone_command_keys_for_test__(command)
+
+    assert Shard.__standalone_command_keys_conflict_for_test__(
+             command,
+             {:put, "queue:unknown:a", "value", 0}
+           )
+  end
+
+  test "full-form standalone commands keep their direct apply paths" do
+    {pid, ctx, data_dir} = start_shard([])
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    compound_key = "H:queue:full-form:compound\0field"
+    assert :ok = Router.compound_put(ctx, "queue:full-form:compound", compound_key, "value", 0)
+    assert "value" == Router.compound_get(ctx, "queue:full-form:compound", compound_key)
+
+    assert :ok = Router.fetch_or_compute_lock(ctx, "queue:full-form:lock", "owner", 5_000)
+    assert :ok = Router.fetch_or_compute_release(ctx, "queue:full-form:lock", "owner")
+
+    assert {:ok, first} =
+             Router.server_catalog_mutate(
+               ctx,
+               "queue-full-form-catalog",
+               "subject",
+               nil,
+               nil,
+               "first",
+               10
+             )
+
+    assert {:ok, %{version: first_version}} = ServerCatalog.decode_entry(first)
+
+    assert {:ok, revision} =
+             Router.server_catalog_replace(
+               ctx,
+               "queue-full-form-catalog",
+               ServerCatalog.encode_revision(first_version),
+               [{"subject", "replacement"}],
+               1,
+               10
+             )
+
+    assert {:ok, _revision_version} = ServerCatalog.decode_revision(revision)
+  end
+
+  test "direct handlers and batched commands share one FIFO flush sequence" do
+    test_pid = self()
+    previous_hook = Application.get_env(:ferricstore, :standalone_durability_hook)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      send(test_pid, {:durability_batch, self(), length(batch)})
+
+      receive do
+        :continue -> :passthrough
+      after
+        5_000 -> :passthrough
+      end
+    end)
+
+    on_exit(fn -> restore_env(:standalone_durability_hook, previous_hook) end)
+
+    {pid, ctx, data_dir} = start_shard(standalone_commit_delay_ms: 0)
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    opts = %{expire_at_ms: 0, get: false, keepttl: false, nx: false, xx: false}
+
+    first =
+      :gen_server.send_request(
+        pid,
+        {:standalone_barrier_write, {:set, "queue:fifo:first", "first", 0, opts}}
+      )
+
+    assert_receive {:durability_batch, first_worker, 1}, 1_000
+
+    compound_key = "H:queue:fifo:compound\0field"
+
+    direct =
+      :gen_server.send_request(
+        pid,
+        {:standalone_barrier_write,
+         {:compound_put, "queue:fifo:compound", compound_key, "direct", 0}}
+      )
+
+    direct_lock_a =
+      :gen_server.send_request(
+        pid,
+        {:standalone_barrier_write,
+         {:fetch_or_compute_lock, "queue:fifo:lock:a",
+          Ferricstore.FetchOrCompute.Outcome.key("queue:fifo:lock:a"), "owner-a", 5_000}}
+      )
+
+    direct_lock_b =
+      :gen_server.send_request(
+        pid,
+        {:standalone_barrier_write,
+         {:fetch_or_compute_lock, "queue:fifo:lock:b",
+          Ferricstore.FetchOrCompute.Outcome.key("queue:fifo:lock:b"), "owner-b", 5_000}}
+      )
+
+    last =
+      :gen_server.send_request(
+        pid,
+        {:standalone_barrier_write, {:set, "queue:fifo:last", "last", 0, opts}}
+      )
+
+    assert %{batch_count: 4, inflight_count: 1} = GenServer.call(pid, :standalone_commit_debug)
+
+    send(first_worker, :continue)
+
+    assert {:reply, :ok} = :gen_server.receive_response(first, 5_000)
+    assert {:reply, :ok} = :gen_server.receive_response(direct, 5_000)
+    assert {:reply, :ok} = :gen_server.receive_response(direct_lock_a, 5_000)
+    assert {:reply, :ok} = :gen_server.receive_response(direct_lock_b, 5_000)
+    assert_receive {:durability_batch, last_worker, 1}, 1_000
+    send(last_worker, :continue)
+    assert {:reply, :ok} = :gen_server.receive_response(last, 5_000)
+
+    assert "first" == Router.get(ctx, "queue:fifo:first")
+    assert "direct" == Router.compound_get(ctx, "queue:fifo:compound", compound_key)
+    assert "last" == Router.get(ctx, "queue:fifo:last")
+  end
+
+  test "the data-dir recovery fence rejects normal and conditional writes" do
+    {pid, ctx, data_dir} = start_shard([])
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    assert :ok = StandaloneTxLog.require_recovery(data_dir, :synthetic_recovery_required)
+
+    assert {:error, "ERR shard writes paused for sync"} =
+             Router.put(ctx, "queue:fenced:put", "must-not-publish", 0)
+
+    opts = %{expire_at_ms: 0, get: false, keepttl: false, nx: true, xx: false}
+
+    assert {:error, "ERR shard writes paused for sync"} =
+             Router.set(ctx, "queue:fenced:set", "must-not-publish", opts)
+
+    assert nil == Router.get(ctx, "queue:fenced:put")
+    assert nil == Router.get(ctx, "queue:fenced:set")
+
+    assert :ok = StandaloneTxLog.recover(data_dir)
+    assert :ok = Router.put(ctx, "queue:fenced:put", "after-recovery", 0)
+    assert "after-recovery" == Router.get(ctx, "queue:fenced:put")
   end
 
   test "a conditional no-op does not advance the standalone WATCH version" do

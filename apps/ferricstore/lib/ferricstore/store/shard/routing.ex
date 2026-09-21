@@ -248,24 +248,22 @@ defmodule Ferricstore.Store.Shard.Routing do
           Process.cancel_timer(timer)
         end
 
-        flush_count = min(state.standalone_batch_count, state.standalone_commit_max_ops)
+        queued_entries = :queue.to_list(state.standalone_batch)
+        flush_mode = standalone_flush_mode(queued_entries)
+
+        flush_count =
+          standalone_flush_count(
+            queued_entries,
+            flush_mode,
+            state.standalone_commit_max_ops
+          )
+
         {flush_queue, remaining_batch} = :queue.split(flush_count, state.standalone_batch)
         entries = :queue.to_list(flush_queue)
         flush_bytes = standalone_entries_bytes(entries)
         flush_keys = standalone_entries_keys(entries)
-        sm_state = direct_sm_state(state)
-        ref = make_ref()
-        parent = self()
 
-        _pid =
-          spawn_link(fn ->
-            send(
-              parent,
-              {:standalone_commit_flushed, ref, run_standalone_batch(entries, sm_state)}
-            )
-          end)
-
-        %{
+        next_state = %{
           state
           | standalone_batch: remaining_batch,
             standalone_batch_count: state.standalone_batch_count - flush_count,
@@ -273,11 +271,101 @@ defmodule Ferricstore.Store.Shard.Routing do
             standalone_batch_keys:
               Enum.reduce(flush_keys, state.standalone_batch_keys, &MapSet.delete(&2, &1)),
             standalone_batch_timer: nil,
-            standalone_flush_ref: ref,
-            standalone_flush_entries: entries,
-            standalone_flush_bytes: flush_bytes,
-            standalone_inflight_keys: flush_keys
+            standalone_flush_ref: nil,
+            standalone_flush_entries: [],
+            standalone_flush_bytes: 0,
+            standalone_inflight_keys: MapSet.new()
         }
+
+        case flush_mode do
+          :handler ->
+            execute_standalone_handler_entry(entries, next_state)
+
+          mode when mode in [:batch, :direct] ->
+            sm_state = direct_sm_state(state)
+            ref = make_ref()
+            parent = self()
+
+            _pid =
+              spawn_link(fn ->
+                send(
+                  parent,
+                  {:standalone_commit_flushed, ref, run_standalone_flush(entries, mode, sm_state)}
+                )
+              end)
+
+            %{
+              next_state
+              | standalone_flush_ref: ref,
+                standalone_flush_entries: entries,
+                standalone_flush_bytes: flush_bytes,
+                standalone_inflight_keys: flush_keys
+            }
+        end
+      end
+
+      defp standalone_flush_mode([{_from, command, _keys, _bytes} | _entries]),
+        do: standalone_execution_mode(command)
+
+      defp standalone_flush_mode(_entries), do: :batch
+
+      defp standalone_flush_count(entries, mode, max_ops) do
+        case mode do
+          :handler ->
+            1
+
+          _ ->
+            entries
+            |> Enum.take(max_ops)
+            |> Enum.take_while(fn {_from, command, _keys, _bytes} ->
+              standalone_execution_mode(command) == mode
+            end)
+            |> length()
+            |> max(1)
+        end
+      end
+
+      defp execute_standalone_handler_entry(
+             [{from, command, _keys, _bytes}],
+             state
+           ) do
+        result =
+          try do
+            handle_call(command, from, state)
+          rescue
+            error -> {:handler_error, {:exception, error}}
+          catch
+            kind, reason -> {:handler_error, {kind, reason}}
+          end
+
+        case result do
+          {:reply, reply, new_state} ->
+            GenServer.reply(from, reply)
+            continue_after_standalone_handler(new_state)
+
+          {:noreply, new_state} ->
+            continue_after_standalone_handler(new_state)
+
+          {:stop, reason, reply, new_state} ->
+            GenServer.reply(from, {:error, {:standalone_handler_stopped, reason, reply}})
+            continue_after_standalone_handler(new_state)
+
+          {:stop, reason, new_state} ->
+            GenServer.reply(from, {:error, {:standalone_handler_stopped, reason}})
+            continue_after_standalone_handler(new_state)
+
+          {:handler_error, error} ->
+            GenServer.reply(from, {:error, {:standalone_handler_failed, error}})
+            %{state | writes_paused: true, last_flush_error: error}
+        end
+      end
+
+      defp execute_standalone_handler_entry(_entries, state), do: state
+
+      defp continue_after_standalone_handler(state) do
+        state
+        |> drain_standalone_waiting()
+        |> flush_ready_standalone_batch()
       end
 
       defp run_standalone_batch(entries, sm_state) do
@@ -298,6 +386,23 @@ defmodule Ferricstore.Store.Shard.Routing do
                 {:ok, new_sm_state, List.wrap(result)}
             end
           end
+        rescue
+          error ->
+            {:error, nil, {:exception, error}}
+        catch
+          kind, reason ->
+            {:error, nil, {kind, reason}}
+        end
+      end
+
+      defp run_standalone_flush(entries, :batch, sm_state),
+        do: run_standalone_batch(entries, sm_state)
+
+      defp run_standalone_flush(entries, :direct, sm_state) do
+        commands = Enum.map(entries, fn {_from, command, _keys, _bytes} -> command end)
+
+        try do
+          run_standalone_commands_sequential(commands, sm_state)
         rescue
           error ->
             {:error, nil, {:exception, error}}
@@ -339,7 +444,9 @@ defmodule Ferricstore.Store.Shard.Routing do
       end
 
       defp run_standalone_command(command, sm_state) do
-        case Ferricstore.Raft.StateMachine.apply_standalone_batch([command], sm_state) do
+        case Ferricstore.Raft.StateMachine.apply_standalone_command(command, sm_state) do
+          {new_sm_state, {:error, reason}, _effects} -> {:error, new_sm_state, reason}
+          {new_sm_state, result, _effects} -> {:ok, new_sm_state, result}
           {new_sm_state, {:ok, [result]}} -> {:ok, new_sm_state, result}
           {new_sm_state, {:ok, results}} when is_list(results) -> {:ok, new_sm_state, results}
           {new_sm_state, {:error, reason}} -> {:error, new_sm_state, reason}
@@ -426,6 +533,11 @@ defmodule Ferricstore.Store.Shard.Routing do
           |> drain_standalone_commits_for_sync()
 
         cond do
+          standalone_recovery_fenced?(state) ->
+            {{:error,
+              {:standalone_cross_shard_busy,
+               {:standalone_durability_failed, :prior_standalone_write_failed}}}, state}
+
           standalone_write_barrier_active?(state) ->
             {{:error, {:standalone_cross_shard_busy, :coordinator_barrier_busy}}, state}
 
@@ -642,7 +754,7 @@ defmodule Ferricstore.Store.Shard.Routing do
              %{writes_paused: true, last_flush_error: reason, data_dir: data_dir} = state
            ) do
         if standalone_recovery_required_reason(reason) != nil and
-             not Ferricstore.Store.StandaloneTxLog.recovery_required?(data_dir) do
+             is_nil(Ferricstore.Store.StandaloneTxLog.startup_recovery_reason(data_dir)) do
           %{state | writes_paused: false, last_flush_error: nil}
         else
           state
@@ -650,6 +762,15 @@ defmodule Ferricstore.Store.Shard.Routing do
       end
 
       defp clear_standalone_recovery_fence(state), do: state
+
+      defp standalone_recovery_fenced?(%{data_dir: data_dir}) do
+        Ferricstore.Store.StandaloneTxLog.recovery_required?(data_dir)
+      end
+
+      defp standalone_recovery_fenced?(_state), do: false
+
+      defp standalone_recovery_required_reason({:standalone_recovery_required, _reason} = reason),
+        do: reason
 
       defp standalone_recovery_required_reason(
              {:standalone_tx_prepare_recovery_required, _txid, _append, _establish, _rollback} =
@@ -757,7 +878,7 @@ defmodule Ferricstore.Store.Shard.Routing do
             }
 
             state =
-              case handle_call(request, from, state) do
+              case dispatch_standalone_barrier_write(state, from, request) do
                 {:reply, reply, new_state} ->
                   GenServer.reply(from, reply)
                   new_state
@@ -886,10 +1007,14 @@ defmodule Ferricstore.Store.Shard.Routing do
       end
 
       defp drain_standalone_commits_for_sync(state) do
-        state
-        |> drain_standalone_waiting()
-        |> flush_ready_standalone_batch()
-        |> await_standalone_flush()
+        if standalone_recovery_fenced?(state) do
+          state
+        else
+          state
+          |> drain_standalone_waiting()
+          |> flush_ready_standalone_batch()
+          |> await_standalone_flush()
+        end
       end
 
       defp drain_standalone_waiting(%{standalone_write_barrier: barrier} = state)
@@ -941,6 +1066,14 @@ defmodule Ferricstore.Store.Shard.Routing do
         (standalone_global_keys?(keys) and MapSet.size(inflight_keys) > 0) or
           standalone_global_keys?(inflight_keys) or
           not MapSet.disjoint?(keys, inflight_keys)
+      end
+
+      defp standalone_barrier_write_conflicts?(state, request) do
+        entry = {nil, request, standalone_command_keys(request), 0}
+
+        standalone_entry_conflicts?(entry, state.standalone_inflight_keys) or
+          standalone_entry_conflicts?(entry, state.standalone_batch_keys) or
+          standalone_entry_conflicts?(entry, state.standalone_waiting_keys)
       end
 
       defp standalone_global_keys?(keys), do: MapSet.member?(keys, @standalone_global_key)
@@ -1143,13 +1276,63 @@ defmodule Ferricstore.Store.Shard.Routing do
       end
 
       defp standalone_command_keys(command) when is_tuple(command) and tuple_size(command) > 1 do
-        case elem(command, 1) do
-          key when is_binary(key) -> MapSet.new([standalone_lock_key(key)])
-          _other -> standalone_global_keys()
+        case {elem(command, 0), elem(command, 1)} do
+          {operation, key}
+          when operation in [
+                 :put,
+                 :set,
+                 :delete,
+                 :incr,
+                 :incr_float,
+                 :append,
+                 :getset,
+                 :getdel,
+                 :getex,
+                 :setrange,
+                 :cas,
+                 :lock,
+                 :unlock,
+                 :extend,
+                 :ratelimit_add,
+                 :list_op,
+                 :compound_type_claim,
+                 :compound_batch_put,
+                 :compound_batch_delete
+               ] and is_binary(key) ->
+            MapSet.new([standalone_lock_key(key)])
+
+          _unknown_or_multi_key ->
+            standalone_global_keys()
         end
       end
 
       defp standalone_command_keys(_command), do: standalone_global_keys()
+
+      defp standalone_execution_mode(
+             {:compound_put, _redis_key, _compound_key, _value, _expire_at_ms}
+           ),
+           do: :handler
+
+      defp standalone_execution_mode({:put, _key, _value, _expire_at_ms}), do: :handler
+
+      defp standalone_execution_mode({:compound_batch_put, _redis_key, _entries}),
+        do: :handler
+
+      defp standalone_execution_mode({:compound_delete, _redis_key, _compound_key}),
+        do: :handler
+
+      defp standalone_execution_mode({:compound_batch_delete, _redis_key, _compound_keys}),
+        do: :handler
+
+      defp standalone_execution_mode({:compound_delete_prefix, _redis_key, _prefix}),
+        do: :handler
+
+      defp standalone_execution_mode({:compound_type_claim, _redis_key, _type}),
+        do: :handler
+
+      defp standalone_execution_mode(command) do
+        if Ferricstore.Raft.CommandBatching.batchable?(command), do: :batch, else: :direct
+      end
 
       defp standalone_lock_keys(keys) do
         keys
@@ -1423,10 +1606,15 @@ defmodule Ferricstore.Store.Shard.Routing do
       end
 
       defp maybe_route_default_waraft_write(command, state, local_fun) do
-        if default_waraft_write_state?(state) do
-          reply_default_waraft_write(command, state)
-        else
-          local_fun.()
+        cond do
+          standalone_recovery_fenced?(state) ->
+            {:reply, {:error, "ERR shard writes paused for sync"}, state}
+
+          default_waraft_write_state?(state) ->
+            reply_default_waraft_write(command, state)
+
+          true ->
+            local_fun.()
         end
       end
 

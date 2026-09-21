@@ -4,6 +4,9 @@ defmodule Ferricstore.Store.StandaloneTxLogTest do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.StandaloneTxLog
 
+  @journal_name "standalone_cross_shard_tx.log"
+  @manifest_name "standalone_cross_shard_tx.manifest"
+
   test "prepare and commit persist markers without rewriting the journal per transaction" do
     data_dir = tmp_dir()
     tx_log_path = Path.join(data_dir, "standalone_cross_shard_tx.log")
@@ -16,6 +19,8 @@ defmodule Ferricstore.Store.StandaloneTxLogTest do
     assert {:ok, txid} = StandaloneTxLog.prepare(data_dir, groups)
     assert is_binary(txid)
     assert File.exists?(tx_log_path)
+    refute StandaloneTxLog.recovery_required?(data_dir)
+    refute File.exists?(StandaloneTxLog.recovery_marker_path(data_dir))
 
     assert :ok = StandaloneTxLog.commit(data_dir, txid)
     assert File.exists?(tx_log_path)
@@ -93,7 +98,7 @@ defmodule Ferricstore.Store.StandaloneTxLogTest do
     assert :ok = StandaloneTxLog.recover(data_dir)
   end
 
-  test "prepare returns the txid when directory fsync fails after a complete record is visible" do
+  test "prepare fences when directory fsync fails after a complete record is visible" do
     data_dir = tmp_dir()
     file_path = Path.join(data_dir, "shard_0/000000.data")
     dir_calls = :atomics.new(1, signed: false)
@@ -108,10 +113,11 @@ defmodule Ferricstore.Store.StandaloneTxLogTest do
 
     on_exit(fn -> restore_env(:standalone_tx_log_fsync_dir_hook, previous_hook) end)
 
-    assert {:ok, txid} =
+    assert {:error, {:standalone_tx_prepare_recovery_required, _txid, :dir_eio, _, _}} =
              StandaloneTxLog.prepare(data_dir, [{file_path, [{:put, "key", "value", 0}]}])
 
-    assert :ok = StandaloneTxLog.abort(data_dir, txid)
+    assert StandaloneTxLog.recovery_required?(data_dir)
+    Application.delete_env(:ferricstore, :standalone_tx_log_fsync_dir_hook)
     assert :ok = StandaloneTxLog.recover(data_dir)
     assert :atomics.get(dir_calls, 1) >= 2
   end
@@ -276,7 +282,7 @@ defmodule Ferricstore.Store.StandaloneTxLogTest do
       end
     end)
 
-    assert {:error, {:recovery_cleanup_failed, :cleanup_eio}} = StandaloneTxLog.recover(data_dir)
+    assert {:error, :cleanup_eio} = StandaloneTxLog.recover(data_dir)
     assert :persistent_term.get(guard_key, nil) != nil
 
     assert {:error, {:standalone_tx_recovery_required, _reason}} =
@@ -497,7 +503,7 @@ defmodule Ferricstore.Store.StandaloneTxLogTest do
     assert :ok = StandaloneTxLog.recover(data_dir)
   end
 
-  test "durable terminal success is not rolled back by maintenance compaction failure" do
+  test "maintenance compaction failure leaves a retryable terminal manifest" do
     data_dir = tmp_dir()
     file_path = Path.join(data_dir, "shard_0/000000.data")
     large_value = String.duplicate("v", 4_300_000)
@@ -525,9 +531,11 @@ defmodule Ferricstore.Store.StandaloneTxLogTest do
                {file_path, [{:put, "key", large_value, 0}]}
              ])
 
+    assert {:error, :eio} = StandaloneTxLog.commit(data_dir, txid)
+    assert File.exists?(Path.join(data_dir, "standalone_cross_shard_tx.manifest"))
+
     assert :ok = StandaloneTxLog.commit(data_dir, txid)
     assert :ok = StandaloneTxLog.recover(data_dir)
-    refute File.exists?(Path.join(data_dir, "standalone_cross_shard_tx.manifest"))
   end
 
   test "a complete visible terminal after append sync error is fsynced in-call" do
@@ -695,7 +703,7 @@ defmodule Ferricstore.Store.StandaloneTxLogTest do
       ) <>
         "\n"
 
-    assert :ok = StandaloneTxLog.commit(data_dir, first_txid)
+    assert {:error, :eio} = StandaloneTxLog.commit(data_dir, first_txid)
 
     assert File.read!(Path.join(data_dir, "standalone_cross_shard_tx.log")) in [
              old_journal,
@@ -736,12 +744,12 @@ defmodule Ferricstore.Store.StandaloneTxLogTest do
              StandaloneTxLog.prepare(data_dir, [{file_path, [{:put, "key", "value", 0}]}])
 
     assert :ok = StandaloneTxLog.commit(data_dir, txid)
-    assert {:error, {:recovery_cleanup_failed, :eio}} = StandaloneTxLog.recover(data_dir)
+    assert {:error, :eio} = StandaloneTxLog.recover(data_dir)
     refute File.exists?(Path.join(data_dir, "standalone_cross_shard_tx.log"))
     refute File.exists?(Path.join(data_dir, "standalone_cross_shard_tx.manifest"))
 
     assert :ok = StandaloneTxLog.recover(data_dir)
-    assert :atomics.get(calls, 1) == 4
+    assert :atomics.get(calls, 1) == 3
   end
 
   test "successful compaction may make a repeated terminal call unknown" do
@@ -774,14 +782,14 @@ defmodule Ferricstore.Store.StandaloneTxLogTest do
              StandaloneTxLog.prepare(data_dir, [{file_path, [{:put, "key", "value", 0}]}])
 
     assert :ok = StandaloneTxLog.commit(data_dir, txid)
-    assert {:error, {:recovery_cleanup_failed, :eio}} = StandaloneTxLog.recover(data_dir)
+    assert {:error, :eio} = StandaloneTxLog.recover(data_dir)
     refute File.exists?(tx_log_path)
     refute File.exists?(Path.join(data_dir, "standalone_cross_shard_tx.manifest"))
     assert {:error, :unknown_txid} = StandaloneTxLog.commit(data_dir, txid)
     assert :ok = StandaloneTxLog.recover(data_dir)
   end
 
-  test "threshold compaction failure does not fail a durable terminal" do
+  test "threshold compaction failure leaves a retryable terminal manifest" do
     data_dir = tmp_dir()
     tx_log_path = Path.join(data_dir, "standalone_cross_shard_tx.log")
     file_path = Path.join(data_dir, "shard_0/000000.data")
@@ -836,11 +844,240 @@ defmodule Ferricstore.Store.StandaloneTxLogTest do
       end
     end)
 
+    assert {:error, :eio} = StandaloneTxLog.commit(data_dir, target_txid)
+    assert File.exists?(tx_log_path)
+    assert File.exists?(Path.join(data_dir, "standalone_cross_shard_tx.manifest"))
     assert :ok = StandaloneTxLog.commit(data_dir, target_txid)
-    refute File.exists?(tx_log_path)
-    refute File.exists?(Path.join(data_dir, "standalone_cross_shard_tx.manifest"))
-    assert {:error, :unknown_txid} = StandaloneTxLog.commit(data_dir, target_txid)
     assert :ok = StandaloneTxLog.recover(data_dir)
+  end
+
+  test "recovery markers survive persistent-term loss and clear after replay" do
+    data_dir = tmp_dir()
+    marker_path = StandaloneTxLog.recovery_marker_path(data_dir)
+    reason = {:standalone_tx_compensation_recovery_required, "txid", String.duplicate("x", 2_048)}
+
+    assert :ok = StandaloneTxLog.require_recovery(data_dir, reason)
+    assert {:ok, %{size: marker_size}} = File.stat(marker_path)
+    assert marker_size <= 1_024
+
+    :persistent_term.erase({StandaloneTxLog, :recovery_required, Path.expand(data_dir)})
+    assert StandaloneTxLog.recovery_required?(data_dir)
+
+    assert {:error, {:standalone_tx_recovery_required, _reason}} =
+             StandaloneTxLog.prepare(
+               data_dir,
+               [{Path.join(data_dir, "shard_0/000000.data"), [{:put, "key", "value", 0}]}]
+             )
+
+    assert :ok = StandaloneTxLog.recover(data_dir)
+    refute File.exists?(marker_path)
+    refute StandaloneTxLog.recovery_required?(data_dir)
+  end
+
+  test "recovery marker writes and reads do not follow symlinks" do
+    data_dir = tmp_dir()
+    marker_path = StandaloneTxLog.recovery_marker_path(data_dir)
+    victim = Path.join(data_dir, "victim")
+    File.mkdir_p!(data_dir)
+    File.write!(victim, "protected")
+    File.ln_s!(victim, marker_path)
+
+    assert :ok = StandaloneTxLog.require_recovery(data_dir, :symlink_marker)
+
+    assert File.read!(victim) == "protected"
+    assert {:ok, %File.Stat{type: :regular}} = File.lstat(marker_path)
+    :persistent_term.erase({StandaloneTxLog, :recovery_required, Path.expand(data_dir)})
+    assert StandaloneTxLog.recovery_required?(data_dir)
+    assert File.read!(victim) == "protected"
+  end
+
+  test "failed recovery-marker cleanup keeps the durable fence" do
+    data_dir = tmp_dir()
+    marker_path = StandaloneTxLog.recovery_marker_path(data_dir)
+    assert :ok = StandaloneTxLog.require_recovery(data_dir, :cleanup_fsync_failure)
+
+    Application.put_env(:ferricstore, :standalone_tx_log_fsync_dir_hook, fn _path ->
+      {:error, :cleanup_fsync_eio}
+    end)
+
+    on_exit(fn -> Application.delete_env(:ferricstore, :standalone_tx_log_fsync_dir_hook) end)
+
+    assert {:error, :cleanup_fsync_eio} = StandaloneTxLog.recover(data_dir)
+    assert File.exists?(marker_path)
+
+    :persistent_term.erase({StandaloneTxLog, :recovery_required, Path.expand(data_dir)})
+    assert StandaloneTxLog.recovery_required?(data_dir)
+
+    Application.delete_env(:ferricstore, :standalone_tx_log_fsync_dir_hook)
+    assert :ok = StandaloneTxLog.recover(data_dir)
+    refute StandaloneTxLog.recovery_required?(data_dir)
+  end
+
+  test "compaction keeps terminal metadata bounded and retries after journal removal" do
+    data_dir = tmp_dir()
+    manifest_path = Path.join(data_dir, @manifest_name)
+    large_value = String.duplicate("v", 4_300_000)
+
+    Application.put_env(:ferricstore, :standalone_tx_log_compaction_hook, fn
+      :after_journal_remove, ^data_dir -> {:error, :simulated_crash}
+      _stage, ^data_dir -> :ok
+    end)
+
+    on_exit(fn -> Application.delete_env(:ferricstore, :standalone_tx_log_compaction_hook) end)
+
+    file_path = Path.join(data_dir, "shard_0/000000.data")
+
+    assert {:ok, txid} =
+             StandaloneTxLog.prepare(data_dir, [
+               {file_path, [{:put, "first", large_value, 0}]}
+             ])
+
+    assert {:error, _reason} = StandaloneTxLog.commit(data_dir, txid)
+    assert File.exists?(manifest_path)
+    assert bounded_metadata_count(data_dir) <= 1
+    assert {:ok, %{size: manifest_size}} = File.stat(manifest_path)
+    assert manifest_size < 1_024
+
+    Application.delete_env(:ferricstore, :standalone_tx_log_compaction_hook)
+    assert :ok = StandaloneTxLog.commit(data_dir, txid)
+    refute File.exists?(manifest_path)
+    assert :ok = StandaloneTxLog.recover(data_dir)
+    refute File.exists?(Path.join(data_dir, @journal_name))
+
+    for index <- 1..6 do
+      cycle_file = Path.join(data_dir, "shard_#{index}/000000.data")
+
+      assert {:ok, cycle_txid} =
+               StandaloneTxLog.prepare(data_dir, [
+                 {cycle_file, [{:put, "cycle", large_value, 0}]}
+               ])
+
+      assert :ok = StandaloneTxLog.commit(data_dir, cycle_txid)
+      assert :ok = StandaloneTxLog.recover(data_dir)
+      assert bounded_metadata_count(data_dir) <= 1
+    end
+  end
+
+  test "terminal retries are idempotent and conflicting terminals are rejected" do
+    data_dir = tmp_dir()
+    file_path = Path.join(data_dir, "shard_0/000000.data")
+
+    assert {:ok, txid} =
+             StandaloneTxLog.prepare(data_dir, [
+               {file_path, [{:put, "key", "value", 0}]}
+             ])
+
+    assert :ok = StandaloneTxLog.commit(data_dir, txid)
+    assert :ok = StandaloneTxLog.commit(data_dir, txid)
+
+    assert {:error, {:transaction_already_terminal, :commit}} =
+             StandaloneTxLog.abort(data_dir, txid)
+
+    assert :ok = StandaloneTxLog.recover(data_dir)
+  end
+
+  test "restart completes compaction across manifest and journal boundaries" do
+    for stage <- [
+          :before_manifest_publish,
+          :after_manifest_publish,
+          :before_journal_rewrite,
+          :after_journal_remove,
+          :before_manifest_cleanup,
+          :after_manifest_remove
+        ] do
+      data_dir = tmp_dir()
+      large_value = String.duplicate("v", 4_300_000)
+      file_path = Path.join(data_dir, "shard_0/000000.data")
+
+      Application.put_env(:ferricstore, :standalone_tx_log_compaction_hook, fn
+        ^stage, ^data_dir -> {:error, :simulated_crash}
+        _other_stage, ^data_dir -> :ok
+      end)
+
+      try do
+        assert {:ok, txid} =
+                 StandaloneTxLog.prepare(data_dir, [
+                   {file_path, [{:put, "key", large_value, 0}]}
+                 ])
+
+        assert {:error, _reason} = StandaloneTxLog.commit(data_dir, txid)
+      after
+        Application.delete_env(:ferricstore, :standalone_tx_log_compaction_hook)
+      end
+
+      assert :ok = StandaloneTxLog.recover(data_dir)
+      assert :ok = StandaloneTxLog.recover(data_dir)
+      assert bounded_metadata_count(data_dir) <= 1
+      refute File.exists?(Path.join(data_dir, @journal_name))
+      refute File.exists?(Path.join(data_dir, @manifest_name))
+    end
+  end
+
+  test "restart applies preserved pending work once after journal rewrite interruption" do
+    data_dir = tmp_dir()
+    large_value = String.duplicate("v", 2_200_000)
+    first_file = Path.join(data_dir, "shard_0/000000.data")
+    second_file = Path.join(data_dir, "shard_1/000000.data")
+
+    Application.put_env(:ferricstore, :standalone_tx_log_compaction_hook, fn
+      :after_journal_rewrite, ^data_dir -> {:error, :simulated_crash}
+      _stage, ^data_dir -> :ok
+    end)
+
+    try do
+      assert {:ok, first_txid} =
+               StandaloneTxLog.prepare(data_dir, [
+                 {first_file, [{:put, "first", large_value, 0}]}
+               ])
+
+      assert {:ok, _second_txid} =
+               StandaloneTxLog.prepare(data_dir, [
+                 {second_file, [{:put, "second", large_value, 0}]}
+               ])
+
+      assert {:error, _reason} = StandaloneTxLog.commit(data_dir, first_txid)
+    after
+      Application.delete_env(:ferricstore, :standalone_tx_log_compaction_hook)
+    end
+
+    assert :ok = StandaloneTxLog.recover(data_dir)
+    assert :ok = StandaloneTxLog.recover(data_dir)
+    assert {:ok, [{"second", _offset, _size, 0, false}]} = NIF.v2_scan_file(second_file)
+    refute File.exists?(Path.join(data_dir, @journal_name))
+    refute File.exists?(Path.join(data_dir, @manifest_name))
+  end
+
+  test "directory fsync failure leaves one retryable compaction manifest" do
+    data_dir = tmp_dir()
+    large_value = String.duplicate("v", 4_300_000)
+    file_path = Path.join(data_dir, "shard_0/000000.data")
+    fsync_calls = :atomics.new(1, signed: false)
+
+    Application.put_env(:ferricstore, :standalone_tx_log_fsync_dir_hook, fn path ->
+      if :atomics.add_get(fsync_calls, 1, 1) == 3 do
+        {:error, :eio}
+      else
+        NIF.v2_fsync_dir(path)
+      end
+    end)
+
+    try do
+      assert {:ok, txid} =
+               StandaloneTxLog.prepare(data_dir, [
+                 {file_path, [{:put, "key", large_value, 0}]}
+               ])
+
+      assert {:error, _reason} = StandaloneTxLog.commit(data_dir, txid)
+      assert File.exists?(Path.join(data_dir, @manifest_name))
+    after
+      Application.delete_env(:ferricstore, :standalone_tx_log_fsync_dir_hook)
+    end
+
+    assert :ok = StandaloneTxLog.recover(data_dir)
+    assert :ok = StandaloneTxLog.recover(data_dir)
+    assert bounded_metadata_count(data_dir) <= 1
+    refute File.exists?(Path.join(data_dir, @journal_name))
+    refute File.exists?(Path.join(data_dir, @manifest_name))
   end
 
   test "recover replays pending prepared transactions and marks them committed" do
@@ -1254,7 +1491,7 @@ defmodule Ferricstore.Store.StandaloneTxLogTest do
     assert source =~ "Ferricstore.FS.read_nofollow(journal_path, @max_journal_bytes)"
     assert source =~ "append_sync_nofollow_bounded(path, line, append_limit)"
     assert source =~ "Ferricstore.FS.atomic_replace_nofollow(path, data, @max_journal_bytes)"
-    refute source =~ "manifest"
+    assert source =~ "manifest"
     refute source =~ "terminal_tombstone"
   end
 
@@ -1271,6 +1508,14 @@ defmodule Ferricstore.Store.StandaloneTxLogTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
+
+  defp bounded_metadata_count(data_dir) do
+    [@journal_name, @manifest_name]
+    |> Enum.map(&Path.join(data_dir, &1))
+    |> Enum.filter(&File.exists?/1)
+    |> Enum.map(fn path -> File.read!(path) |> String.split("\n", trim: true) |> length() end)
+    |> Enum.sum()
+  end
 
   defp encode_entry(entry), do: Base.encode64(Ferricstore.TermCodec.encode(entry))
 end
