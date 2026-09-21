@@ -9,6 +9,8 @@ defmodule Ferricstore.Store.StandaloneTxLog do
   @magic :ferricstore_standalone_cross_shard_tx_v1
   @compact_threshold_bytes 4 * 1_024 * 1_024
   @max_journal_bytes 64 * 1_024 * 1_024
+  # Legacy compressed terms must fit within the bounded journal read.
+  @max_legacy_uncompressed_bytes @max_journal_bytes
   @terminal_reserve_bytes 1_024
   @max_txid_bytes 128
 
@@ -21,13 +23,12 @@ defmodule Ferricstore.Store.StandaloneTxLog do
       stats = group_stats(groups)
 
       case with_journal_lock(data_dir, fn ->
-             append_entry_locked(
-               data_dir,
-               {@magic, :prepare, txid, groups},
-               @terminal_reserve_bytes
-             )
+             case recovery_required_reason(data_dir) do
+               nil -> persist_prepare_locked(data_dir, txid, groups)
+               reason -> {:error, {:standalone_tx_recovery_required, reason}}
+             end
            end) do
-        :ok ->
+        {:ok, ^txid} ->
           observe(:prepare, stats, %{status: :ok})
           {:ok, txid}
 
@@ -40,6 +41,12 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     end
   end
 
+  @doc """
+  Persists a commit marker before running best-effort maintenance compaction.
+
+  Compaction may drop completed terminal history, so a later duplicate call can
+  return `{:error, :unknown_txid}` once the journal has been compacted.
+  """
   @spec commit(binary(), binary()) :: :ok | {:error, term()}
   def commit(data_dir, txid) when is_binary(data_dir) and is_binary(txid) do
     case append_terminal(data_dir, :commit, txid) do
@@ -60,6 +67,12 @@ defmodule Ferricstore.Store.StandaloneTxLog do
         observe(:abort, %{count: 1}, %{status: :ok})
         :ok
 
+      {:error, {:standalone_tx_abort_persistence_failed, ^txid, reason}} ->
+        recovery_reason = {:standalone_tx_abort_recovery_required, txid, reason}
+        :ok = require_recovery(data_dir, recovery_reason)
+        observe(:abort, %{count: 1}, %{status: :error})
+        {:error, recovery_reason}
+
       {:error, _reason} = error ->
         observe(:abort, %{count: 1}, %{status: :error})
         error
@@ -68,6 +81,17 @@ defmodule Ferricstore.Store.StandaloneTxLog do
 
   @spec recover_once(binary()) :: :ok | {:error, term()}
   def recover_once(data_dir) when is_binary(data_dir), do: recover(data_dir)
+
+  @spec recovery_required?(binary()) :: boolean()
+  def recovery_required?(data_dir) when is_binary(data_dir) do
+    not is_nil(recovery_required_reason(data_dir))
+  end
+
+  @spec require_recovery(binary(), term()) :: :ok
+  def require_recovery(data_dir, reason) when is_binary(data_dir) do
+    mark_recovery_required(data_dir, reason)
+    :ok
+  end
 
   @spec recover(binary()) :: :ok | {:error, term()}
   def recover(data_dir) when is_binary(data_dir) do
@@ -91,15 +115,63 @@ defmodule Ferricstore.Store.StandaloneTxLog do
   defp recover_locked(data_dir) do
     with {:ok, pending} <- read_pending_transactions(data_dir),
          {:ok, stats} <- recover_pending(data_dir, pending),
-         :ok <- compact_committed_locked(data_dir) do
+         :ok <- recover_journal_cleanup(data_dir) do
+      clear_recovery_required(data_dir)
       {:ok, stats}
+    end
+  end
+
+  defp recover_journal_cleanup(data_dir) do
+    case compact_committed_locked(data_dir) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        observe(:compaction_failed, %{count: 1}, %{
+          data_dir_hash: :erlang.phash2(data_dir),
+          reason: inspect(reason),
+          phase: :recovery
+        })
+
+        {:error, {:recovery_cleanup_failed, reason}}
     end
   end
 
   defp append_terminal(data_dir, terminal, txid) when terminal in [:commit, :abort] do
     if valid_txid?(txid) do
       with_journal_lock(data_dir, fn ->
-        persist_terminal_locked(data_dir, terminal, txid, true)
+        case recovery_required_reason(data_dir) do
+          nil ->
+            case read_journal_state(data_dir) do
+              {:ok, {_order, prepares, terminals}} ->
+                case Map.get(terminals, txid) do
+                  ^terminal ->
+                    with :ok <- fsync_journal_file(data_dir) do
+                      fsync_dir(Path.dirname(path(data_dir)))
+                    end
+
+                  nil ->
+                    if Map.has_key?(prepares, txid) do
+                      tag_abort_terminal_failure(
+                        terminal,
+                        txid,
+                        persist_terminal_locked(data_dir, terminal, txid, true)
+                      )
+                    else
+                      {:error, :unknown_txid}
+                    end
+
+                  previous_terminal ->
+                    {:error, {:transaction_already_terminal, previous_terminal}}
+                end
+
+              {:error, _reason} = error ->
+                tag_abort_terminal_failure(terminal, txid, error)
+            end
+
+          reason ->
+            {:error, {:standalone_tx_recovery_required, reason}}
+        end
       end)
     else
       {:error, :invalid_txid}
@@ -126,8 +198,8 @@ defmodule Ferricstore.Store.StandaloneTxLog do
   end
 
   defp compact_committed_locked(data_dir) do
-    with {:ok, pending} <- read_pending_transactions(data_dir),
-         entries <- pending_entries(pending) do
+    with {:ok, journal_state} <- read_journal_state(data_dir),
+         entries <- pending_entries(pending_transactions(journal_state)) do
       rewrite_entries(data_dir, entries)
     end
   end
@@ -173,7 +245,7 @@ defmodule Ferricstore.Store.StandaloneTxLog do
   defp pending_transactions({order, prepares, terminals}) do
     order
     |> Enum.reverse()
-    |> Enum.reject(&MapSet.member?(terminals, &1))
+    |> Enum.reject(&Map.has_key?(terminals, &1))
     |> Enum.map(&{&1, Map.fetch!(prepares, &1)})
   end
 
@@ -229,21 +301,151 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     end
   end
 
-  defp persist_terminal_locked(data_dir, terminal, txid, compact?) do
-    case append_entry_locked(data_dir, {@magic, terminal, txid}) do
-      :ok when compact? -> maybe_compact_committed_locked(data_dir)
-      :ok -> :ok
-      {:error, {:journal_limit_exceeded, _reason}} -> rewrite_terminal_locked(data_dir, txid)
-      {:error, _reason} = error -> error
+  defp persist_prepare_locked(data_dir, txid, groups) do
+    entry = {@magic, :prepare, txid, groups}
+    line = encode_entry(entry) <> "\n"
+
+    if prepare_append_would_exceed_limit?(data_dir, line) do
+      case append_entry_locked(data_dir, entry, @terminal_reserve_bytes) do
+        :ok -> {:ok, txid}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      with {:ok, snapshot} <- read_journal_snapshot(data_dir) do
+        case append_entry_locked(data_dir, entry, @terminal_reserve_bytes) do
+          :ok ->
+            {:ok, txid}
+
+          {:error, append_reason} ->
+            handle_prepare_append_error(data_dir, txid, groups, snapshot, append_reason)
+        end
+      end
     end
   end
 
-  defp rewrite_terminal_locked(data_dir, txid) do
-    with {:ok, pending} <- read_pending_transactions(data_dir) do
-      pending
-      |> Enum.reject(fn {pending_txid, _groups} -> pending_txid == txid end)
-      |> pending_entries()
-      |> then(&rewrite_entries(data_dir, &1))
+  defp prepare_append_would_exceed_limit?(data_dir, line) do
+    case File.lstat(path(data_dir)) do
+      {:ok, %File.Stat{type: :regular, size: size}} ->
+        size + byte_size(line) > @max_journal_bytes - @terminal_reserve_bytes
+
+      _ ->
+        false
+    end
+  end
+
+  defp persist_terminal_locked(data_dir, terminal, txid, compact?, reclaim? \\ true) do
+    with {:ok, snapshot} <- read_journal_snapshot(data_dir) do
+      case append_entry_locked(data_dir, {@magic, terminal, txid}) do
+        :ok ->
+          terminal_persisted(data_dir, compact?)
+
+        {:error, reason} ->
+          handle_terminal_append_error(
+            data_dir,
+            terminal,
+            txid,
+            snapshot,
+            reason,
+            compact?,
+            reclaim?
+          )
+      end
+    end
+  end
+
+  defp rewrite_terminal_locked(data_dir, terminal, txid) do
+    case compact_committed_locked(data_dir) do
+      :ok -> persist_terminal_locked(data_dir, terminal, txid, true, false)
+      {:error, reason} -> {:error, {:terminal_space_reclaim_failed, reason}}
+    end
+  end
+
+  defp handle_prepare_append_error(data_dir, txid, groups, snapshot, append_reason) do
+    case prepare_visibility(data_dir, txid, groups) do
+      :visible ->
+        case fsync_journal_file_and_dir(data_dir) do
+          :ok ->
+            {:ok, txid}
+
+          {:error, establishment_reason} ->
+            restore_prepare_after_error(
+              data_dir,
+              txid,
+              snapshot,
+              append_reason,
+              establishment_reason
+            )
+        end
+
+      visibility ->
+        restore_prepare_after_error(
+          data_dir,
+          txid,
+          snapshot,
+          append_reason,
+          {:prepare_not_visible, visibility}
+        )
+    end
+  end
+
+  defp prepare_visibility(data_dir, txid, groups) do
+    case read_journal_state(data_dir) do
+      {:ok, {_order, prepares, _terminals}} ->
+        if Map.get(prepares, txid) == groups, do: :visible, else: :absent
+
+      {:error, _reason} ->
+        :corrupt
+    end
+  end
+
+  defp fsync_journal_file_and_dir(data_dir) do
+    with :ok <- fsync_journal_file(data_dir) do
+      fsync_dir(Path.dirname(path(data_dir)))
+    end
+  end
+
+  defp restore_prepare_after_error(
+         data_dir,
+         txid,
+         snapshot,
+         append_reason,
+         establishment_reason
+       ) do
+    case restore_journal(data_dir, snapshot) do
+      :ok ->
+        {:error, append_reason}
+
+      {:error, rollback_reason} ->
+        reason =
+          {:standalone_tx_prepare_recovery_required, txid, append_reason, establishment_reason,
+           rollback_reason}
+
+        mark_recovery_required(data_dir, reason)
+        {:error, reason}
+    end
+  end
+
+  defp terminal_persisted(_data_dir, false), do: :ok
+  defp terminal_persisted(data_dir, true), do: run_compaction_maintenance(data_dir, :threshold)
+
+  defp run_compaction_maintenance(data_dir, mode) when mode in [:always, :threshold] do
+    result =
+      case mode do
+        :always -> compact_committed_locked(data_dir)
+        :threshold -> maybe_compact_committed_locked(data_dir)
+      end
+
+    case result do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        observe(:compaction_failed, %{count: 1}, %{
+          data_dir_hash: :erlang.phash2(data_dir),
+          reason: inspect(reason)
+        })
+
+        :ok
     end
   end
 
@@ -254,7 +456,7 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     append_limit = @max_journal_bytes - reserve_bytes
 
     with :ok <- Ferricstore.FS.mkdir_p(dir),
-         :ok <- Ferricstore.FS.append_sync_nofollow_bounded(path, line, append_limit),
+         :ok <- append_sync_nofollow_bounded(path, line, append_limit),
          :ok <- fsync_dir(dir) do
       :ok
     else
@@ -269,9 +471,19 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     dir = Path.dirname(path)
 
     case Ferricstore.FS.rm(path) do
-      :ok -> fsync_dir(dir)
-      {:error, {:not_found, _}} -> :ok
-      {:error, _reason} = error -> error
+      :ok ->
+        fsync_dir(dir)
+
+      {:error, {:not_found, _}} ->
+        case File.lstat(dir) do
+          {:ok, %File.Stat{type: :directory}} -> fsync_dir(dir)
+          {:error, :enoent} -> :ok
+          {:ok, %File.Stat{type: type}} -> {:error, {:unsafe_journal_directory_type, type}}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -292,25 +504,119 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     end
   end
 
-  defp read_pending_transactions(data_dir) do
-    path = path(data_dir)
+  defp journal_limit_error?({:journal_limit_exceeded, _reason}), do: true
+  defp journal_limit_error?(_reason), do: false
 
-    case Ferricstore.FS.read_nofollow(path, @max_journal_bytes) do
-      {:ok, contents} ->
-        {pending_state, skipped} = reduce_journal(contents, data_dir, {[], %{}, MapSet.new()}, 0)
+  defp handle_terminal_append_error(
+         data_dir,
+         terminal,
+         txid,
+         snapshot,
+         append_reason,
+         compact?,
+         reclaim?
+       ) do
+    case terminal_visibility(data_dir, terminal, txid) do
+      :visible ->
+        with :ok <- fsync_journal_file(data_dir),
+             :ok <- fsync_dir(Path.dirname(path(data_dir))) do
+          terminal_persisted(data_dir, compact?)
+        end
 
-        if skipped > 0 do
-          observe(:corrupt_entry, %{count: skipped}, %{data_dir_hash: :erlang.phash2(data_dir)})
-          {:error, {:corrupt_entries, skipped}}
+      :absent ->
+        if reclaim? and journal_limit_error?(append_reason) do
+          rewrite_terminal_locked(data_dir, terminal, txid)
         else
-          {:ok, pending_transactions(pending_state)}
+          restore_after_append_error(data_dir, snapshot, append_reason)
+        end
+
+      :corrupt ->
+        restore_after_append_error(data_dir, snapshot, append_reason)
+    end
+  end
+
+  defp tag_abort_terminal_failure(
+         :abort,
+         txid,
+         {:error, reason}
+       ),
+       do: {:error, {:standalone_tx_abort_persistence_failed, txid, reason}}
+
+  defp tag_abort_terminal_failure(_terminal, _txid, result), do: result
+
+  defp read_pending_transactions(data_dir) do
+    with {:ok, journal_state} <- read_journal_state(data_dir) do
+      {:ok, pending_transactions(journal_state)}
+    end
+  end
+
+  defp read_journal_state(data_dir) do
+    with {:ok, {_present, _contents, journal_state}} <- read_journal_snapshot(data_dir) do
+      {:ok, journal_state}
+    end
+  end
+
+  defp read_journal_snapshot(data_dir) do
+    journal_path = path(data_dir)
+
+    case Ferricstore.FS.read_nofollow(journal_path, @max_journal_bytes) do
+      {:ok, contents} ->
+        with {:ok, journal_state} <- decode_journal_contents(contents, data_dir) do
+          {:ok, {true, contents, journal_state}}
         end
 
       {:error, {:not_found, _reason}} ->
-        {:ok, []}
+        {:ok, {false, <<>>, {[], %{}, %{}}}}
 
       {:error, _reason} = error ->
         error
+    end
+  end
+
+  defp decode_journal_contents(contents, data_dir) do
+    {journal_state, skipped} = reduce_journal(contents, data_dir, {[], %{}, %{}}, 0)
+
+    if skipped > 0 do
+      observe(:corrupt_entry, %{count: skipped}, %{data_dir_hash: :erlang.phash2(data_dir)})
+      {:error, {:corrupt_entries, skipped}}
+    else
+      {:ok, journal_state}
+    end
+  end
+
+  defp terminal_visibility(data_dir, terminal, txid) do
+    case read_journal_state(data_dir) do
+      {:ok, {_order, _prepares, terminals}} ->
+        if Map.get(terminals, txid) == terminal, do: :visible, else: :absent
+
+      {:error, _reason} ->
+        :corrupt
+    end
+  end
+
+  defp restore_after_append_error(data_dir, snapshot, append_reason) do
+    case restore_journal(data_dir, snapshot) do
+      :ok -> {:error, append_reason}
+      {:error, repair_reason} -> {:error, {:journal_repair_failed, append_reason, repair_reason}}
+    end
+  end
+
+  defp restore_journal(data_dir, {present?, contents, _journal_state}) do
+    journal_path = path(data_dir)
+    dir = Path.dirname(journal_path)
+
+    if present? do
+      with :ok <-
+             Ferricstore.FS.atomic_replace_nofollow(journal_path, contents, @max_journal_bytes),
+           :ok <- fsync_dir(dir) do
+        :ok
+      end
+    else
+      case Ferricstore.FS.rm(journal_path) do
+        :ok -> fsync_dir(dir)
+        {:error, {:not_found, _reason}} -> fsync_dir(dir)
+        {:error, _reason} = error -> error
+      end
     end
   end
 
@@ -318,25 +624,29 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     do: {pending_state, skipped}
 
   defp reduce_journal(contents, data_dir, pending_state, skipped) do
-    {line, rest} = take_journal_line(contents)
+    case take_journal_line(contents) do
+      {:unterminated, _line} ->
+        {pending_state, skipped + 1}
 
-    case trim_line_ending(line) do
-      "" ->
-        reduce_journal(rest, data_dir, pending_state, skipped)
+      {:terminated, line, rest} ->
+        case trim_line_ending(line) do
+          "" ->
+            reduce_journal(rest, data_dir, pending_state, skipped)
 
-      encoded ->
-        case decode_line(encoded, data_dir) do
-          {:ok, entry} ->
-            case accumulate_pending(entry, pending_state) do
-              {:ok, next_pending_state} ->
-                reduce_journal(rest, data_dir, next_pending_state, skipped)
+          encoded ->
+            case decode_line(encoded, data_dir) do
+              {:ok, entry} ->
+                case accumulate_pending(entry, pending_state) do
+                  {:ok, next_pending_state} ->
+                    reduce_journal(rest, data_dir, next_pending_state, skipped)
+
+                  :error ->
+                    reduce_journal(rest, data_dir, pending_state, skipped + 1)
+                end
 
               :error ->
                 reduce_journal(rest, data_dir, pending_state, skipped + 1)
             end
-
-          :error ->
-            reduce_journal(rest, data_dir, pending_state, skipped + 1)
         end
     end
   end
@@ -347,10 +657,10 @@ defmodule Ferricstore.Store.StandaloneTxLog do
         line = binary_part(contents, 0, newline_offset + 1)
         rest_offset = newline_offset + 1
         rest = binary_part(contents, rest_offset, byte_size(contents) - rest_offset)
-        {line, rest}
+        {:terminated, line, rest}
 
       :nomatch ->
-        {contents, <<>>}
+        {:unterminated, contents}
     end
   end
 
@@ -358,7 +668,7 @@ defmodule Ferricstore.Store.StandaloneTxLog do
          {@magic, :prepare, txid, groups},
          {order, prepares, terminals}
        ) do
-    if Map.has_key?(prepares, txid) or MapSet.member?(terminals, txid) do
+    if Map.has_key?(prepares, txid) or Map.has_key?(terminals, txid) do
       :error
     else
       {:ok, {[txid | order], Map.put(prepares, txid, groups), terminals}}
@@ -370,10 +680,19 @@ defmodule Ferricstore.Store.StandaloneTxLog do
          {order, prepares, terminals}
        )
        when terminal in [:commit, :abort] do
-    if Map.has_key?(prepares, txid) and not MapSet.member?(terminals, txid) do
-      {:ok, {order, Map.delete(prepares, txid), MapSet.put(terminals, txid)}}
-    else
-      :error
+    case Map.fetch(terminals, txid) do
+      {:ok, ^terminal} ->
+        {:ok, {order, prepares, terminals}}
+
+      {:ok, _previous_terminal} ->
+        :error
+
+      :error ->
+        if Map.has_key?(prepares, txid) do
+          {:ok, {order, Map.delete(prepares, txid), Map.put(terminals, txid, terminal)}}
+        else
+          :error
+        end
     end
   end
 
@@ -399,13 +718,31 @@ defmodule Ferricstore.Store.StandaloneTxLog do
 
   defp decode_line(line, data_dir) do
     with {:ok, binary} <- Base.decode64(line),
-         {:ok, term} <- TermCodec.decode(binary),
+         {:ok, term} <- decode_journal_term(binary),
          true <- valid_entry?(term, data_dir) do
       {:ok, term}
     else
       _ -> :error
     end
   end
+
+  defp decode_journal_term(
+         <<131, 80, uncompressed_size::unsigned-big-32, _compressed::binary>> = binary
+       )
+       when uncompressed_size <= @max_legacy_uncompressed_bytes do
+    # Journals written before TermCodec used safe compressed external terms.
+    case :erlang.binary_to_term(binary, [:safe, :used]) do
+      {term, used} when used == byte_size(binary) -> {:ok, term}
+      _invalid -> {:error, :invalid_external_term}
+    end
+  rescue
+    ArgumentError -> {:error, :invalid_external_term}
+  end
+
+  defp decode_journal_term(<<131, 80, _uncompressed_size::unsigned-big-32, _compressed::binary>>),
+    do: {:error, :legacy_term_too_large}
+
+  defp decode_journal_term(binary), do: TermCodec.decode(binary)
 
   defp valid_entry?({@magic, :prepare, txid, groups}, data_dir)
        when is_binary(txid) and is_list(groups),
@@ -466,12 +803,56 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     :telemetry.execute([:ferricstore, :standalone_tx_log, event], measurements, metadata)
   end
 
+  defp fsync_file(path) do
+    case Application.get_env(:ferricstore, :standalone_tx_log_fsync_file_hook) do
+      hook when is_function(hook, 1) -> hook.(path)
+      _ -> NIF.v2_fsync(path)
+    end
+  end
+
+  defp fsync_journal_file(data_dir) do
+    case File.lstat(path(data_dir)) do
+      {:ok, %File.Stat{type: :regular}} ->
+        fsync_file(path(data_dir))
+
+      {:error, :enoent} ->
+        {:error, :journal_missing}
+
+      {:ok, %File.Stat{type: type}} ->
+        {:error, {:unsafe_journal_type, type}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp append_sync_nofollow_bounded(path, payload, max_bytes) do
+    case Application.get_env(:ferricstore, :standalone_tx_log_append_hook) do
+      hook when is_function(hook, 3) -> hook.(path, payload, max_bytes)
+      _ -> Ferricstore.FS.append_sync_nofollow_bounded(path, payload, max_bytes)
+    end
+  end
+
   defp fsync_dir(path) do
     case Application.get_env(:ferricstore, :standalone_tx_log_fsync_dir_hook) do
       hook when is_function(hook, 1) -> hook.(path)
       _ -> NIF.v2_fsync_dir(path)
     end
   end
+
+  defp recovery_required_reason(data_dir) do
+    :persistent_term.get(recovery_key(data_dir), nil)
+  end
+
+  defp mark_recovery_required(data_dir, reason) do
+    :persistent_term.put(recovery_key(data_dir), reason)
+  end
+
+  defp clear_recovery_required(data_dir) do
+    :persistent_term.erase(recovery_key(data_dir))
+  end
+
+  defp recovery_key(data_dir), do: {__MODULE__, :recovery_required, Path.expand(data_dir)}
 
   defp with_journal_lock(data_dir, fun) when is_function(fun, 0) do
     lock = {{__MODULE__, Path.expand(data_dir)}, self()}

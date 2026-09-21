@@ -9,6 +9,7 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Promotion
   alias Ferricstore.Store.Shard.CompoundMemberIndex
+  alias Ferricstore.Store.StandaloneTxLog
   alias Ferricstore.Test.IsolatedInstance
   alias Ferricstore.Test.ShardHelpers
 
@@ -98,6 +99,460 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
 
     assert :ok = Router.put(ctx, coordinator_key, "after-command-error", 0)
     assert "after-command-error" == Router.get(ctx, coordinator_key)
+  end
+
+  test "visible terminal after file-sync failure prevents compensation", %{ctx: ctx} do
+    previous_trap_exit = Process.flag(:trap_exit, true)
+    on_exit(fn -> Process.flag(:trap_exit, previous_trap_exit) end)
+
+    {first, second} = different_shard_keys(ctx)
+    assert :ok = Router.put(ctx, first, "old-first", 0)
+    assert :ok = Router.put(ctx, second, "old-second", 0)
+
+    append_calls = :atomics.new(1, signed: false)
+    previous_hook = Application.get_env(:ferricstore, :standalone_tx_log_append_hook)
+
+    Application.put_env(:ferricstore, :standalone_tx_log_append_hook, fn path, payload, limit ->
+      case :atomics.add_get(append_calls, 1, 1) do
+        2 ->
+          with :ok <- Ferricstore.FS.append_sync_nofollow_bounded(path, payload, limit) do
+            {:error, :eio}
+          end
+
+        _ ->
+          Ferricstore.FS.append_sync_nofollow_bounded(path, payload, limit)
+      end
+    end)
+
+    on_exit(fn ->
+      if previous_hook do
+        Application.put_env(:ferricstore, :standalone_tx_log_append_hook, previous_hook)
+      else
+        Application.delete_env(:ferricstore, :standalone_tx_log_append_hook)
+      end
+    end)
+
+    assert :ok =
+             CrossShardOp.execute(
+               [{first, :write}, {second, :write}],
+               fn store ->
+                 :ok = store.put.(first, "new-first", 0)
+                 :ok = store.put.(second, "new-second", 0)
+               end,
+               instance: ctx
+             )
+
+    assert :atomics.get(append_calls, 1) == 2
+    assert Router.batch_get(ctx, [first, second]) == ["new-first", "new-second"]
+
+    Application.delete_env(:ferricstore, :standalone_tx_log_append_hook)
+
+    indexes = Enum.uniq([Router.shard_for(ctx, first), Router.shard_for(ctx, second)])
+
+    Enum.each(indexes, fn index ->
+      shard_name = Router.shard_name(ctx, index)
+      shard_pid = Process.whereis(shard_name)
+      Process.exit(shard_pid, :kill)
+
+      assert :ok =
+               ShardHelpers.eventually(
+                 fn -> Process.whereis(shard_name) == nil end,
+                 "shard #{index} did not stop before restart",
+                 50,
+                 20
+               )
+    end)
+
+    Enum.each(indexes, fn index ->
+      assert {:ok, _pid} =
+               Ferricstore.Store.Shard.start_link(
+                 index: index,
+                 data_dir: ctx.data_dir,
+                 instance_ctx: ctx
+               )
+    end)
+
+    assert Router.batch_get(ctx, [first, second]) == ["new-first", "new-second"]
+  end
+
+  test "failed prepare cannot replay an orphan over a later participant write", %{ctx: ctx} do
+    previous_trap_exit = Process.flag(:trap_exit, true)
+    on_exit(fn -> Process.flag(:trap_exit, previous_trap_exit) end)
+
+    {first, second} = different_shard_keys(ctx)
+
+    {coordinator_key, participant_key} =
+      if Router.shard_for(ctx, first) < Router.shard_for(ctx, second) do
+        {first, second}
+      else
+        {second, first}
+      end
+
+    assert :ok = Router.put(ctx, coordinator_key, "old-coordinator", 0)
+    assert :ok = Router.put(ctx, participant_key, "old-participant", 0)
+
+    previous_append_hook = Application.get_env(:ferricstore, :standalone_tx_log_append_hook)
+    previous_file_hook = Application.get_env(:ferricstore, :standalone_tx_log_fsync_file_hook)
+
+    Application.put_env(:ferricstore, :standalone_tx_log_append_hook, fn path, payload, limit ->
+      with :ok <- Ferricstore.FS.append_sync_nofollow_bounded(path, payload, limit) do
+        {:error, :prepare_append_eio}
+      end
+    end)
+
+    Application.put_env(:ferricstore, :standalone_tx_log_fsync_file_hook, fn _path ->
+      {:error, :prepare_file_eio}
+    end)
+
+    on_exit(fn ->
+      if previous_append_hook do
+        Application.put_env(:ferricstore, :standalone_tx_log_append_hook, previous_append_hook)
+      else
+        Application.delete_env(:ferricstore, :standalone_tx_log_append_hook)
+      end
+
+      if previous_file_hook do
+        Application.put_env(:ferricstore, :standalone_tx_log_fsync_file_hook, previous_file_hook)
+      else
+        Application.delete_env(:ferricstore, :standalone_tx_log_fsync_file_hook)
+      end
+    end)
+
+    assert {:error,
+            {:standalone_durability_failed,
+             {:bitcask_append_failed, {:standalone_tx_prepare_failed, :prepare_append_eio}}}} =
+             CrossShardOp.execute(
+               [{coordinator_key, :write}, {participant_key, :write}],
+               fn store ->
+                 :ok = store.put.(coordinator_key, "new-coordinator", 0)
+                 :ok = store.put.(participant_key, "new-participant", 0)
+               end,
+               instance: ctx
+             )
+
+    assert {:error,
+            {:standalone_cross_shard_busy,
+             {:standalone_durability_failed, :prior_standalone_write_failed}}} =
+             CrossShardOp.execute(
+               [{coordinator_key, :write}, {participant_key, :write}],
+               fn _store -> flunk("cross-shard writes must remain blocked until recovery") end,
+               instance: ctx
+             )
+
+    Application.delete_env(:ferricstore, :standalone_tx_log_append_hook)
+    Application.delete_env(:ferricstore, :standalone_tx_log_fsync_file_hook)
+
+    assert :ok = Router.put(ctx, participant_key, "later-participant", 0)
+    assert Router.get(ctx, participant_key) == "later-participant"
+
+    indexes =
+      Enum.uniq([Router.shard_for(ctx, coordinator_key), Router.shard_for(ctx, participant_key)])
+
+    pids = Enum.map(indexes, &{&1, Process.whereis(Router.shard_name(ctx, &1))})
+
+    Enum.each(pids, fn {_index, pid} -> Process.exit(pid, :kill) end)
+
+    Enum.each(indexes, fn index ->
+      assert :ok =
+               ShardHelpers.eventually(
+                 fn -> Process.whereis(Router.shard_name(ctx, index)) == nil end,
+                 "shard #{index} did not stop before restart",
+                 100,
+                 20
+               )
+    end)
+
+    Enum.each(indexes, fn index ->
+      assert {:ok, _pid} =
+               Ferricstore.Store.Shard.start_link(
+                 index: index,
+                 data_dir: ctx.data_dir,
+                 instance_ctx: ctx
+               )
+    end)
+
+    assert Router.get(ctx, coordinator_key) == "old-coordinator"
+    assert Router.get(ctx, participant_key) == "later-participant"
+  end
+
+  test "failed prepare rollback fences participant routes until recovery", %{ctx: ctx} do
+    previous_trap_exit = Process.flag(:trap_exit, true)
+    on_exit(fn -> Process.flag(:trap_exit, previous_trap_exit) end)
+
+    {first, second} = different_shard_keys(ctx)
+
+    {coordinator_key, participant_key} =
+      if Router.shard_for(ctx, first) < Router.shard_for(ctx, second) do
+        {first, second}
+      else
+        {second, first}
+      end
+
+    assert :ok = Router.put(ctx, coordinator_key, "old-coordinator", 0)
+    assert :ok = Router.put(ctx, participant_key, "old-participant", 0)
+
+    previous_append_hook = Application.get_env(:ferricstore, :standalone_tx_log_append_hook)
+    previous_file_hook = Application.get_env(:ferricstore, :standalone_tx_log_fsync_file_hook)
+    previous_dir_hook = Application.get_env(:ferricstore, :standalone_tx_log_fsync_dir_hook)
+
+    Application.put_env(:ferricstore, :standalone_tx_log_append_hook, fn path, payload, limit ->
+      with :ok <- Ferricstore.FS.append_sync_nofollow_bounded(path, payload, limit) do
+        {:error, :prepare_append_eio}
+      end
+    end)
+
+    Application.put_env(:ferricstore, :standalone_tx_log_fsync_file_hook, fn _path ->
+      {:error, :prepare_file_eio}
+    end)
+
+    Application.put_env(:ferricstore, :standalone_tx_log_fsync_dir_hook, fn _path ->
+      {:error, :rollback_eio}
+    end)
+
+    on_exit(fn ->
+      if previous_append_hook do
+        Application.put_env(:ferricstore, :standalone_tx_log_append_hook, previous_append_hook)
+      else
+        Application.delete_env(:ferricstore, :standalone_tx_log_append_hook)
+      end
+
+      if previous_file_hook do
+        Application.put_env(:ferricstore, :standalone_tx_log_fsync_file_hook, previous_file_hook)
+      else
+        Application.delete_env(:ferricstore, :standalone_tx_log_fsync_file_hook)
+      end
+
+      if previous_dir_hook do
+        Application.put_env(:ferricstore, :standalone_tx_log_fsync_dir_hook, previous_dir_hook)
+      else
+        Application.delete_env(:ferricstore, :standalone_tx_log_fsync_dir_hook)
+      end
+    end)
+
+    assert {:error,
+            {:standalone_durability_failed,
+             {:bitcask_append_failed,
+              {:standalone_tx_prepare_failed,
+               {:standalone_tx_prepare_recovery_required, _txid, :prepare_append_eio,
+                :prepare_file_eio, :rollback_eio}}}}} =
+             CrossShardOp.execute(
+               [{coordinator_key, :write}, {participant_key, :write}],
+               fn store ->
+                 :ok = store.put.(coordinator_key, "new-coordinator", 0)
+                 :ok = store.put.(participant_key, "new-participant", 0)
+               end,
+               instance: ctx
+             )
+
+    assert {:error, "ERR shard writes paused for sync"} =
+             Router.put(ctx, participant_key, "must-not-publish", 0)
+
+    assert Router.get(ctx, participant_key) == "old-participant"
+
+    Application.delete_env(:ferricstore, :standalone_tx_log_append_hook)
+    Application.delete_env(:ferricstore, :standalone_tx_log_fsync_file_hook)
+    Application.delete_env(:ferricstore, :standalone_tx_log_fsync_dir_hook)
+
+    indexes =
+      Enum.uniq([Router.shard_for(ctx, coordinator_key), Router.shard_for(ctx, participant_key)])
+
+    pids = Enum.map(indexes, &{&1, Process.whereis(Router.shard_name(ctx, &1))})
+    Enum.each(pids, fn {_index, pid} -> Process.exit(pid, :kill) end)
+
+    Enum.each(indexes, fn index ->
+      assert :ok =
+               ShardHelpers.eventually(
+                 fn -> Process.whereis(Router.shard_name(ctx, index)) == nil end,
+                 "shard #{index} did not stop before restart",
+                 100,
+                 20
+               )
+    end)
+
+    Enum.each(indexes, fn index ->
+      assert {:ok, _pid} =
+               Ferricstore.Store.Shard.start_link(
+                 index: index,
+                 data_dir: ctx.data_dir,
+                 instance_ctx: ctx
+               )
+    end)
+
+    assert Router.get(ctx, coordinator_key) == "old-coordinator"
+    assert Router.get(ctx, participant_key) == "old-participant"
+    assert :ok = Router.put(ctx, participant_key, "after-recovery", 0)
+  end
+
+  test "compensation failure fences partial participant appends until recovery", %{ctx: ctx} do
+    previous_trap_exit = Process.flag(:trap_exit, true)
+    on_exit(fn -> Process.flag(:trap_exit, previous_trap_exit) end)
+
+    {first, second} = different_shard_keys(ctx)
+    coordinator_index = min(Router.shard_for(ctx, first), Router.shard_for(ctx, second))
+    participant_index = max(Router.shard_for(ctx, first), Router.shard_for(ctx, second))
+
+    {coordinator_key, participant_key} =
+      if Router.shard_for(ctx, first) == coordinator_index do
+        {first, second}
+      else
+        {second, first}
+      end
+
+    assert :ok = Router.put(ctx, coordinator_key, "old-coordinator", 0)
+    assert :ok = Router.put(ctx, participant_key, "old-participant", 0)
+
+    coordinator_name = Router.shard_name(ctx, coordinator_index)
+    participant_name = Router.shard_name(ctx, participant_index)
+    {_, coordinator_file_path} = GenServer.call(coordinator_name, :get_active_file)
+    {_, participant_file_path} = GenServer.call(participant_name, :get_active_file)
+    append_stage = :atomics.new(1, signed: false)
+    previous_hook = Application.get_env(:ferricstore, :pending_append_hook)
+
+    Application.put_env(:ferricstore, :pending_append_hook, fn path, batch ->
+      cond do
+        path == participant_file_path and :atomics.get(append_stage, 1) == 0 ->
+          :atomics.put(append_stage, 1, 1)
+
+          [{:put, key, value, expire_at_ms}] = batch
+          assert {:ok, _locations} = NIF.v2_append_batch(path, [{key, value, expire_at_ms}])
+          {:error, :participant_append_eio}
+
+        path == coordinator_file_path and :atomics.get(append_stage, 1) == 1 ->
+          :atomics.put(append_stage, 1, 2)
+          {:error, :compensation_append_eio}
+
+        true ->
+          :passthrough
+      end
+    end)
+
+    on_exit(fn -> restore_env(:pending_append_hook, previous_hook) end)
+
+    assert {:error,
+            {:standalone_durability_failed,
+             {:cross_shard_compensation_failed,
+              {:standalone_tx_compensation_recovery_required, txid,
+               {:compensation_append_failed, :compensation_append_eio}}}}} =
+             CrossShardOp.execute(
+               [{coordinator_key, :write}, {participant_key, :write}],
+               fn store ->
+                 :ok = store.put.(coordinator_key, "new-coordinator", 0)
+                 :ok = store.put.(participant_key, "new-participant", 0)
+               end,
+               instance: ctx
+             )
+
+    assert is_binary(txid)
+    assert :atomics.get(append_stage, 1) == 2
+    assert StandaloneTxLog.recovery_required?(ctx.data_dir)
+
+    assert {:error, "ERR shard writes paused for sync"} =
+             Router.put(ctx, participant_key, "must-not-publish", 0)
+
+    assert Router.get(ctx, coordinator_key) == "old-coordinator"
+    assert Router.get(ctx, participant_key) == "old-participant"
+
+    Application.delete_env(:ferricstore, :pending_append_hook)
+    restart_shards(ctx, [coordinator_index, participant_index])
+
+    refute StandaloneTxLog.recovery_required?(ctx.data_dir)
+    refute File.exists?(Path.join(ctx.data_dir, "standalone_cross_shard_tx.log"))
+    assert Router.get(ctx, coordinator_key) == "old-coordinator"
+    assert Router.get(ctx, participant_key) == "old-participant"
+    assert :ok = Router.put(ctx, participant_key, "after-compensation-recovery", 0)
+  end
+
+  test "abort-terminal persistence failure fences participants until recovery", %{ctx: ctx} do
+    previous_trap_exit = Process.flag(:trap_exit, true)
+    on_exit(fn -> Process.flag(:trap_exit, previous_trap_exit) end)
+
+    {first, second} = different_shard_keys(ctx)
+    coordinator_index = min(Router.shard_for(ctx, first), Router.shard_for(ctx, second))
+    participant_index = max(Router.shard_for(ctx, first), Router.shard_for(ctx, second))
+
+    {coordinator_key, participant_key} =
+      if Router.shard_for(ctx, first) == coordinator_index do
+        {first, second}
+      else
+        {second, first}
+      end
+
+    assert :ok = Router.put(ctx, coordinator_key, "old-coordinator", 0)
+    assert :ok = Router.put(ctx, participant_key, "old-participant", 0)
+
+    participant_name = Router.shard_name(ctx, participant_index)
+    {_, participant_file_path} = GenServer.call(participant_name, :get_active_file)
+    participant_failed = :atomics.new(1, signed: false)
+    journal_append_calls = :atomics.new(1, signed: false)
+    directory_fsync_calls = :atomics.new(1, signed: false)
+    previous_pending_hook = Application.get_env(:ferricstore, :pending_append_hook)
+    previous_append_hook = Application.get_env(:ferricstore, :standalone_tx_log_append_hook)
+    previous_dir_hook = Application.get_env(:ferricstore, :standalone_tx_log_fsync_dir_hook)
+
+    Application.put_env(:ferricstore, :pending_append_hook, fn path, _batch ->
+      if path == participant_file_path and :atomics.get(participant_failed, 1) == 0 do
+        :atomics.put(participant_failed, 1, 1)
+        {:error, :participant_append_eio}
+      else
+        :passthrough
+      end
+    end)
+
+    Application.put_env(:ferricstore, :standalone_tx_log_append_hook, fn path, payload, limit ->
+      case :atomics.add_get(journal_append_calls, 1, 1) do
+        2 -> {:error, :abort_append_eio}
+        _ -> Ferricstore.FS.append_sync_nofollow_bounded(path, payload, limit)
+      end
+    end)
+
+    Application.put_env(:ferricstore, :standalone_tx_log_fsync_dir_hook, fn path ->
+      case :atomics.add_get(directory_fsync_calls, 1, 1) do
+        2 -> {:error, :abort_restore_eio}
+        _ -> NIF.v2_fsync_dir(path)
+      end
+    end)
+
+    on_exit(fn ->
+      restore_env(:pending_append_hook, previous_pending_hook)
+      restore_env(:standalone_tx_log_append_hook, previous_append_hook)
+      restore_env(:standalone_tx_log_fsync_dir_hook, previous_dir_hook)
+    end)
+
+    assert {:error,
+            {:standalone_durability_failed,
+             {:cross_shard_compensation_failed,
+              {:standalone_tx_abort_recovery_required, txid, _abort_reason}}}} =
+             CrossShardOp.execute(
+               [{coordinator_key, :write}, {participant_key, :write}],
+               fn store ->
+                 :ok = store.put.(coordinator_key, "new-coordinator", 0)
+                 :ok = store.put.(participant_key, "new-participant", 0)
+               end,
+               instance: ctx
+             )
+
+    assert is_binary(txid)
+    assert :atomics.get(participant_failed, 1) == 1
+    assert :atomics.get(journal_append_calls, 1) == 2
+    assert :atomics.get(directory_fsync_calls, 1) >= 2
+    assert StandaloneTxLog.recovery_required?(ctx.data_dir)
+
+    assert {:error, "ERR shard writes paused for sync"} =
+             Router.put(ctx, participant_key, "must-not-publish", 0)
+
+    assert Router.get(ctx, coordinator_key) == "old-coordinator"
+    assert Router.get(ctx, participant_key) == "old-participant"
+
+    Application.delete_env(:ferricstore, :pending_append_hook)
+    Application.delete_env(:ferricstore, :standalone_tx_log_append_hook)
+    Application.delete_env(:ferricstore, :standalone_tx_log_fsync_dir_hook)
+    restart_shards(ctx, [coordinator_index, participant_index])
+
+    refute StandaloneTxLog.recovery_required?(ctx.data_dir)
+    refute File.exists?(Path.join(ctx.data_dir, "standalone_cross_shard_tx.log"))
+    assert Router.get(ctx, coordinator_key) == "old-coordinator"
+    assert Router.get(ctx, participant_key) == "old-participant"
+    assert :ok = Router.put(ctx, participant_key, "after-abort-recovery", 0)
   end
 
   test "standalone cross-shard callbacks cannot read undeclared keys", %{ctx: ctx} do
@@ -437,7 +892,7 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     assert_receive {:EXIT, ^participant_pid, _reason}, 2_000
 
     assert :persistent_term.get(
-             {Ferricstore.Store.StandaloneTxLog, Path.expand(ctx.data_dir)},
+             {Ferricstore.Store.StandaloneTxLog, :recovery_required, Path.expand(ctx.data_dir)},
              false
            ) == false
 
@@ -731,6 +1186,33 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
       end)
     end)
   end
+
+  defp restart_shards(ctx, indexes) do
+    pids = Enum.map(indexes, &{&1, Process.whereis(Router.shard_name(ctx, &1))})
+    Enum.each(pids, fn {_index, pid} -> Process.exit(pid, :kill) end)
+
+    Enum.each(indexes, fn index ->
+      assert :ok =
+               ShardHelpers.eventually(
+                 fn -> Process.whereis(Router.shard_name(ctx, index)) == nil end,
+                 "shard #{index} did not stop before restart",
+                 100,
+                 20
+               )
+    end)
+
+    Enum.each(indexes, fn index ->
+      assert {:ok, _pid} =
+               Ferricstore.Store.Shard.start_link(
+                 index: index,
+                 data_dir: ctx.data_dir,
+                 instance_ctx: ctx
+               )
+    end)
+  end
+
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 
   defp wait_for_barrier_acquire_message(_pid, 0), do: {:error, :barrier_acquire_not_queued}
 

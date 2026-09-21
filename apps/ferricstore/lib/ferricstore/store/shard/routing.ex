@@ -420,7 +420,10 @@ defmodule Ferricstore.Store.Shard.Routing do
       defp flush_ready_standalone_batch(state), do: flush_standalone_batch(state)
 
       defp coordinate_standalone_cross_shard(participant_indices, execute_fn, state) do
-        state = drain_standalone_commits_for_sync(state)
+        state =
+          state
+          |> clear_standalone_recovery_fence()
+          |> drain_standalone_commits_for_sync()
 
         cond do
           standalone_write_barrier_active?(state) ->
@@ -454,6 +457,15 @@ defmodule Ferricstore.Store.Shard.Routing do
                  ) do
               {:ok, acquired} ->
                 {reply, state} = apply_standalone_cross_shard(execute_fn, state)
+
+                state =
+                  maybe_fence_standalone_participants(
+                    state,
+                    participant_indices,
+                    owner_token,
+                    reply
+                  )
+
                 log_standalone_barrier_release_errors(state, acquired, owner_token)
                 state = maybe_bump_cross_shard_write_versions(state, participant_indices, reply)
                 {reply, release_standalone_write_barrier(state)}
@@ -579,6 +591,93 @@ defmodule Ferricstore.Store.Shard.Routing do
           {{:error, reason}, state}
         end
       end
+
+      defp maybe_fence_standalone_participants(
+             state,
+             participant_indices,
+             owner_token,
+             reply
+           ) do
+        case standalone_recovery_required_reason(reply) do
+          nil ->
+            state
+
+          reason ->
+            Enum.each(participant_indices, fn shard_index ->
+              result =
+                try do
+                  state.instance_ctx
+                  |> Router.shard_name(shard_index)
+                  |> GenServer.call(
+                    {:standalone_cross_shard_recovery_fence, owner_token, reason},
+                    :infinity
+                  )
+                catch
+                  :exit, exit_reason -> {:error, exit_reason}
+                end
+
+              case result do
+                :ok ->
+                  :ok
+
+                {:error, fence_reason} ->
+                  Logger.error(
+                    "Shard #{state.index}: participant #{shard_index} recovery fence failed: " <>
+                      inspect(fence_reason)
+                  )
+
+                other ->
+                  Logger.error(
+                    "Shard #{state.index}: participant #{shard_index} returned an invalid " <>
+                      "recovery fence reply: #{inspect(other)}"
+                  )
+              end
+            end)
+
+            state
+        end
+      end
+
+      defp clear_standalone_recovery_fence(
+             %{writes_paused: true, last_flush_error: reason, data_dir: data_dir} = state
+           ) do
+        if standalone_recovery_required_reason(reason) != nil and
+             not Ferricstore.Store.StandaloneTxLog.recovery_required?(data_dir) do
+          %{state | writes_paused: false, last_flush_error: nil}
+        else
+          state
+        end
+      end
+
+      defp clear_standalone_recovery_fence(state), do: state
+
+      defp standalone_recovery_required_reason(
+             {:standalone_tx_prepare_recovery_required, _txid, _append, _establish, _rollback} =
+               reason
+           ),
+           do: reason
+
+      defp standalone_recovery_required_reason(
+             {:standalone_tx_compensation_recovery_required, _txid, _reason} = reason
+           ),
+           do: reason
+
+      defp standalone_recovery_required_reason(
+             {:standalone_tx_abort_recovery_required, _txid, _reason} = reason
+           ),
+           do: reason
+
+      defp standalone_recovery_required_reason(term) when is_tuple(term) do
+        term
+        |> Tuple.to_list()
+        |> Enum.find_value(&standalone_recovery_required_reason/1)
+      end
+
+      defp standalone_recovery_required_reason(term) when is_list(term) do
+        Enum.find_value(term, &standalone_recovery_required_reason/1)
+      end
+
+      defp standalone_recovery_required_reason(_term), do: nil
 
       defp standalone_write_barrier_active?(state),
         do: state.standalone_write_barrier != false

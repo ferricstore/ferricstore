@@ -137,6 +137,8 @@ defmodule Ferricstore.Store.Shard.Calls do
       end
 
       def handle_call({:standalone_commit, command}, from, state) do
+        state = clear_standalone_recovery_fence(state)
+
         cond do
           state.writes_paused ->
             {:reply, {:error, "ERR shard writes paused for sync"}, state}
@@ -156,6 +158,8 @@ defmodule Ferricstore.Store.Shard.Calls do
 
       def handle_call({:standalone_barrier_write, request}, from, state)
           when is_tuple(request) do
+        state = clear_standalone_recovery_fence(state)
+
         if standalone_write_barrier_active?(state) do
           {:noreply, enqueue_standalone_barrier_write(state, from, request)}
         else
@@ -169,7 +173,10 @@ defmodule Ferricstore.Store.Shard.Calls do
             state
           )
           when is_reference(owner_token) and is_pid(owner_pid) do
-        state = drain_standalone_commits_for_sync(state)
+        state =
+          state
+          |> clear_standalone_recovery_fence()
+          |> drain_standalone_commits_for_sync()
 
         cond do
           standalone_write_barrier_active?(state) ->
@@ -186,6 +193,19 @@ defmodule Ferricstore.Store.Shard.Calls do
 
           true ->
             {:reply, :ok, install_standalone_write_barrier(state, owner_token, owner_pid, true)}
+        end
+      end
+
+      def handle_call(
+            {:standalone_cross_shard_recovery_fence, owner_token, reason},
+            {owner_pid, _reply_tag},
+            state
+          )
+          when is_reference(owner_token) and is_pid(owner_pid) do
+        if standalone_write_barrier_owner?(state, owner_token, owner_pid) do
+          {:reply, :ok, %{state | writes_paused: true, last_flush_error: reason}}
+        else
+          {:reply, {:error, :standalone_cross_shard_barrier_not_owner}, state}
         end
       end
 
@@ -219,6 +239,8 @@ defmodule Ferricstore.Store.Shard.Calls do
             _from,
             state
           ) do
+        state = clear_standalone_recovery_fence(state)
+
         if default_waraft_write_state?(state) do
           reply_default_waraft_write(command, state)
         else

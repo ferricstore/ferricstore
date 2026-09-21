@@ -1174,9 +1174,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
                     rollback_pending_writes(state)
                     block_release_cursor_for_apply()
 
-                    {:error,
-                     {:cross_shard_compensation_failed,
-                      {:standalone_tx_abort_failed, abort_reason}}, compensated_state}
+                    recovery_reason =
+                      case abort_reason do
+                        {:standalone_tx_abort_recovery_required, _txid, _reason} = reason ->
+                          reason
+
+                        reason ->
+                          {:standalone_tx_abort_recovery_required, journal_txid, reason}
+                      end
+
+                    :ok =
+                      Ferricstore.Store.StandaloneTxLog.require_recovery(
+                        state.data_dir,
+                        recovery_reason
+                      )
+
+                    {:error, {:cross_shard_compensation_failed, recovery_reason},
+                     compensated_state}
                 end
 
               {:error, compensation_reason, compensated_state} ->
@@ -1184,8 +1198,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
                 rollback_pending_writes(state)
                 block_release_cursor_for_apply()
 
-                {:error, {:cross_shard_compensation_failed, compensation_reason},
-                 compensated_state}
+                if is_binary(journal_txid) do
+                  recovery_reason =
+                    {:standalone_tx_compensation_recovery_required, journal_txid,
+                     compensation_reason}
+
+                  :ok =
+                    Ferricstore.Store.StandaloneTxLog.require_recovery(
+                      state.data_dir,
+                      recovery_reason
+                    )
+
+                  {:error, {:cross_shard_compensation_failed, recovery_reason}, compensated_state}
+                else
+                  {:error, {:cross_shard_compensation_failed, compensation_reason},
+                   compensated_state}
+                end
             end
         end
       end

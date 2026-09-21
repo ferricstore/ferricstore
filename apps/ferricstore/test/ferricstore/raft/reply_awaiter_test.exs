@@ -52,6 +52,49 @@ defmodule Ferricstore.Raft.ReplyAwaiterTest do
     assert_received {^unrelated_ref, :do_not_consume}
   end
 
+  test "batch collection preserves replies for another waiter batch on timeout" do
+    {other_from, {_other_alias_ref, other_tag} = other_token} = ReplyAwaiter.new()
+    {from, {_alias_ref, tag} = token} = ReplyAwaiter.new()
+    GenServer.reply(other_from, :other_batch)
+
+    assert {:timeout, [], [token]} == ReplyAwaiter.collect([token], 10)
+    assert_received {^other_tag, :other_batch}
+
+    GenServer.reply(from, :late)
+    refute_receive {^tag, :late}, 50
+
+    :erlang.unalias(elem(other_token, 0))
+  end
+
+  test "tagged batch collection preserves replies for another waiter batch on timeout" do
+    {other_from, {_other_alias_ref, other_tag} = other_token} = ReplyAwaiter.new()
+    {from, {_alias_ref, tag} = token} = ReplyAwaiter.new()
+    GenServer.reply(other_from, :other_batch)
+
+    assert {:timeout, [], [{^token, :wanted}]} =
+             ReplyAwaiter.collect_tagged([{token, :wanted}], 10)
+
+    assert_received {^other_tag, :other_batch}
+
+    GenServer.reply(from, :late)
+    refute_receive {^tag, :late}, 50
+
+    :erlang.unalias(elem(other_token, 0))
+  end
+
+  test "batch collection accepts an infinite timeout" do
+    {from, token} = ReplyAwaiter.new()
+    GenServer.reply(from, :ok)
+
+    assert {:ok, [{token, :ok}], []} == ReplyAwaiter.collect([token], :infinity)
+
+    {tagged_from, tagged_token} = ReplyAwaiter.new()
+    GenServer.reply(tagged_from, :ok)
+
+    assert {:ok, [{:shard, :ok}], []} ==
+             ReplyAwaiter.collect_tagged([{tagged_token, :shard}], :infinity)
+  end
+
   test "batch collection cancels unresolved tokens on timeout" do
     {from, token} = ReplyAwaiter.new()
 
