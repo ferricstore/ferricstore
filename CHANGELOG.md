@@ -4,6 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.21 - 2026-09-22
+
+- Hardened standalone transaction recovery around partial or corrupt journals,
+  append and fsync failures, and restart ordering. Ambiguous recovery now fails
+  closed and retains a durable write fence until recovery completes.
+- Serialized standalone shard commits through one FIFO sequence across direct
+  and conditional write paths, preserving conflicting-write order while
+  allowing unrelated keys to continue. Cross-shard compensation failures remain
+  fenced until the owning recovery completes.
+
 ## 0.11.20 - 2026-09-20
 
 - Harden Flow value-pin trimming after the runtime incident: stale relocated

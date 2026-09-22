@@ -137,7 +137,12 @@ defmodule Ferricstore.Store.Shard.Calls do
       end
 
       def handle_call({:standalone_commit, command}, from, state) do
+        state = clear_standalone_recovery_fence(state)
+
         cond do
+          standalone_recovery_fenced?(state) ->
+            {:reply, {:error, "ERR shard writes paused for sync"}, state}
+
           state.writes_paused ->
             {:reply, {:error, "ERR shard writes paused for sync"}, state}
 
@@ -156,12 +161,43 @@ defmodule Ferricstore.Store.Shard.Calls do
 
       def handle_call({:standalone_barrier_write, request}, from, state)
           when is_tuple(request) do
-        if standalone_write_barrier_active?(state) do
-          {:noreply, enqueue_standalone_barrier_write(state, from, request)}
-        else
-          handle_call(request, from, state)
+        state = clear_standalone_recovery_fence(state)
+
+        dispatch_standalone_barrier_write(state, from, request)
+      end
+
+      defp dispatch_standalone_barrier_write(state, from, request) do
+        cond do
+          standalone_recovery_fenced?(state) or state.writes_paused ->
+            {:reply, {:error, "ERR shard writes paused for sync"}, state}
+
+          standalone_write_barrier_active?(state) ->
+            {:noreply, enqueue_standalone_barrier_write(state, from, request)}
+
+          standalone_barrier_write_conflicts?(state, request) ->
+            state =
+              state
+              |> enqueue_standalone_commit(from, request)
+              |> maybe_flush_full_standalone_batch()
+
+            {:noreply, state}
+
+          default_waraft_write_state?(state) or standalone_direct_barrier_write?(request) ->
+            handle_call(request, from, state)
+
+          true ->
+            state =
+              state
+              |> enqueue_standalone_commit(from, request)
+              |> maybe_flush_full_standalone_batch()
+
+            {:noreply, state}
         end
       end
+
+      # Plain puts can make progress on unrelated keys; compound/index handlers stay FIFO.
+      defp standalone_direct_barrier_write?({:put, _key, _value, _expire_at_ms}), do: true
+      defp standalone_direct_barrier_write?(_request), do: false
 
       def handle_call(
             {:standalone_cross_shard_barrier_acquire, owner_token},
@@ -169,23 +205,44 @@ defmodule Ferricstore.Store.Shard.Calls do
             state
           )
           when is_reference(owner_token) and is_pid(owner_pid) do
-        state = drain_standalone_commits_for_sync(state)
+        state =
+          state
+          |> clear_standalone_recovery_fence()
 
-        cond do
-          standalone_write_barrier_active?(state) ->
-            {:reply, {:error, :standalone_cross_shard_barrier_busy}, state}
+        if standalone_recovery_fenced?(state) do
+          {:reply, {:error, :prior_standalone_write_failed}, state}
+        else
+          state = drain_standalone_commits_for_sync(state)
 
-          not Process.alive?(owner_pid) ->
-            {:reply, {:error, :standalone_cross_shard_barrier_owner_down}, state}
+          cond do
+            standalone_write_barrier_active?(state) ->
+              {:reply, {:error, :standalone_cross_shard_barrier_busy}, state}
 
-          state.writes_paused ->
-            {:reply, {:error, :prior_standalone_write_failed}, state}
+            not Process.alive?(owner_pid) ->
+              {:reply, {:error, :standalone_cross_shard_barrier_owner_down}, state}
 
-          state.last_flush_error != nil ->
-            {:reply, {:error, state.last_flush_error}, %{state | writes_paused: true}}
+            state.writes_paused ->
+              {:reply, {:error, :prior_standalone_write_failed}, state}
 
-          true ->
-            {:reply, :ok, install_standalone_write_barrier(state, owner_token, owner_pid, true)}
+            state.last_flush_error != nil ->
+              {:reply, {:error, state.last_flush_error}, %{state | writes_paused: true}}
+
+            true ->
+              {:reply, :ok, install_standalone_write_barrier(state, owner_token, owner_pid, true)}
+          end
+        end
+      end
+
+      def handle_call(
+            {:standalone_cross_shard_recovery_fence, owner_token, reason},
+            {owner_pid, _reply_tag},
+            state
+          )
+          when is_reference(owner_token) and is_pid(owner_pid) do
+        if standalone_write_barrier_owner?(state, owner_token, owner_pid) do
+          {:reply, :ok, %{state | writes_paused: true, last_flush_error: reason}}
+        else
+          {:reply, {:error, :standalone_cross_shard_barrier_not_owner}, state}
         end
       end
 
@@ -199,6 +256,22 @@ defmodule Ferricstore.Store.Shard.Calls do
           {:reply, :ok, release_standalone_write_barrier(state)}
         else
           {:reply, {:error, :standalone_cross_shard_barrier_not_owner}, state}
+        end
+      end
+
+      def handle_call({:standalone_startup_recovery_complete, data_dir}, _from, state)
+          when is_binary(data_dir) do
+        state =
+          if Path.expand(state.data_dir) == Path.expand(data_dir) do
+            clear_standalone_recovery_fence(state)
+          else
+            state
+          end
+
+        if state.writes_paused do
+          {:reply, {:error, :standalone_startup_recovery_still_required}, state}
+        else
+          {:reply, :ok, state}
         end
       end
 
@@ -219,38 +292,45 @@ defmodule Ferricstore.Store.Shard.Calls do
             _from,
             state
           ) do
-        if default_waraft_write_state?(state) do
-          reply_default_waraft_write(command, state)
+        state = clear_standalone_recovery_fence(state)
+
+        if standalone_recovery_fenced?(state) do
+          {:reply, {:error, {:standalone_durability_failed, :prior_standalone_write_failed}},
+           state}
         else
-          state = drain_standalone_commits_for_sync(state)
+          if default_waraft_write_state?(state) do
+            reply_default_waraft_write(command, state)
+          else
+            state = drain_standalone_commits_for_sync(state)
 
-          cond do
-            state.writes_paused ->
-              {:reply, {:error, {:standalone_durability_failed, :prior_standalone_write_failed}},
-               state}
+            cond do
+              state.writes_paused ->
+                {:reply,
+                 {:error, {:standalone_durability_failed, :prior_standalone_write_failed}}, state}
 
-            state.last_flush_error != nil ->
-              {:reply, {:error, {:standalone_durability_failed, state.last_flush_error}},
-               %{state | writes_paused: true}}
+              state.last_flush_error != nil ->
+                {:reply, {:error, {:standalone_durability_failed, state.last_flush_error}},
+                 %{state | writes_paused: true}}
 
-            true ->
-              sm_state = direct_sm_state(state)
+              true ->
+                sm_state = direct_sm_state(state)
 
-              case run_standalone_command(command, sm_state) do
-                {:ok, new_sm_state, result} ->
-                  {:reply, result, apply_direct_sm_state(state, new_sm_state)}
+                case run_standalone_command(command, sm_state) do
+                  {:ok, new_sm_state, result} ->
+                    {:reply, result, apply_direct_sm_state(state, new_sm_state)}
 
-                {:error, new_sm_state, reason} ->
-                  state =
-                    if new_sm_state do
-                      apply_direct_sm_state(state, new_sm_state)
-                    else
-                      state
-                    end
+                  {:error, new_sm_state, reason} ->
+                    state =
+                      if new_sm_state do
+                        apply_direct_sm_state(state, new_sm_state)
+                      else
+                        state
+                      end
 
-                  {:reply, {:error, {:standalone_durability_failed, reason}},
-                   %{state | writes_paused: true}}
-              end
+                    {:reply, {:error, {:standalone_durability_failed, reason}},
+                     %{state | writes_paused: true}}
+                end
+            end
           end
         end
       end
@@ -299,21 +379,27 @@ defmodule Ferricstore.Store.Shard.Calls do
       end
 
       def handle_call({:forwarded_quorum, origin_node, command}, from, state) do
-        forwarded_from = Ferricstore.Raft.Batcher.remote_origin_from(origin_node, from)
-        previous_origin = Process.get(:ferricstore_forward_origin)
-        Process.put(:ferricstore_forward_origin, origin_node)
+        state = clear_standalone_recovery_fence(state)
 
-        try do
-          if default_waraft_write_state?(state) do
-            reply_default_waraft_write(command, state)
-          else
-            handle_forwarded_quorum(command, forwarded_from, state)
-          end
-        after
-          if previous_origin == nil do
-            Process.delete(:ferricstore_forward_origin)
-          else
-            Process.put(:ferricstore_forward_origin, previous_origin)
+        if standalone_recovery_fenced?(state) do
+          {:reply, {:error, "ERR shard writes paused for sync"}, state}
+        else
+          forwarded_from = Ferricstore.Raft.Batcher.remote_origin_from(origin_node, from)
+          previous_origin = Process.get(:ferricstore_forward_origin)
+          Process.put(:ferricstore_forward_origin, origin_node)
+
+          try do
+            if default_waraft_write_state?(state) do
+              reply_default_waraft_write(command, state)
+            else
+              handle_forwarded_quorum(command, forwarded_from, state)
+            end
+          after
+            if previous_origin == nil do
+              Process.delete(:ferricstore_forward_origin)
+            else
+              Process.put(:ferricstore_forward_origin, previous_origin)
+            end
           end
         end
       end

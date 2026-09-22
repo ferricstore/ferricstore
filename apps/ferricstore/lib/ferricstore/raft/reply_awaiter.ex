@@ -58,11 +58,10 @@ defmodule Ferricstore.Raft.ReplyAwaiter do
   end
 
   defp collect_pending(pending, replies, started_at, timeout_ms) do
-    elapsed = System.monotonic_time(:millisecond) - started_at
-    remaining_timeout = max(timeout_ms - elapsed, 0)
+    remaining_timeout = remaining_timeout(timeout_ms, started_at)
 
     receive do
-      {{__MODULE__, _ref} = tag, reply} ->
+      {{__MODULE__, _ref} = tag, reply} when is_map_key(pending, tag) ->
         case Map.pop(pending, tag) do
           {nil, next_pending} ->
             collect_pending(next_pending, replies, started_at, timeout_ms)
@@ -85,11 +84,10 @@ defmodule Ferricstore.Raft.ReplyAwaiter do
   end
 
   defp collect_tagged_pending(pending, replies, started_at, timeout_ms) do
-    elapsed = System.monotonic_time(:millisecond) - started_at
-    remaining_timeout = max(timeout_ms - elapsed, 0)
+    remaining_timeout = remaining_timeout(timeout_ms, started_at)
 
     receive do
-      {{__MODULE__, _ref} = tag, reply} ->
+      {{__MODULE__, _ref} = tag, reply} when is_map_key(pending, tag) ->
         case Map.pop(pending, tag) do
           {nil, next_pending} ->
             collect_tagged_pending(next_pending, replies, started_at, timeout_ms)
@@ -119,6 +117,13 @@ defmodule Ferricstore.Raft.ReplyAwaiter do
   defp cleanup(alias_ref, tag) do
     :erlang.unalias(alias_ref)
     flush_tag(tag)
+  end
+
+  defp remaining_timeout(:infinity, _started_at), do: :infinity
+
+  defp remaining_timeout(timeout_ms, started_at) do
+    elapsed = System.monotonic_time(:millisecond) - started_at
+    max(timeout_ms - elapsed, 0)
   end
 
   defp flush_tag(tag) do

@@ -1,7 +1,7 @@
 defmodule Ferricstore.MixProject do
   use Mix.Project
 
-  @version "0.11.20"
+  @version "0.11.21"
 
   def project do
     [
