@@ -43,6 +43,19 @@ files are storage debt, not replayable log entries; their stale bytes cannot
 delay recovery or become visible again. A partial first segment still receives
 normal CRC and index validation.
 
+Flow history records an optional recovery boundary inside the same durable LMDB
+environment that holds its history index. After a successful full recovery
+with no hot-history rows, the boundary binds the projected Raft index, the
+physical end of the validated history log, and its SHA-256 digest. On the next
+restart, startup checks every covered frame's CRC and the prefix digest in
+bounded native memory, then replays only later history records and tombstones.
+This avoids republishing old LMDB rows without skipping integrity validation.
+A missing boundary uses the original full recovery; a committed boundary that
+disagrees with the log fails closed rather than exposing stale LMDB history.
+Configurations with hot history or synchronous history retain full recovery.
+An incomplete final record remains eligible for the existing tolerant recovery
+path, without publishing a checkpoint for that incomplete suffix.
+
 The operational guard logs RSS/disk pressure transitions with byte budgets,
 the offset registry footprint, and the Flow admission state. It reports only
 state changes, rather than logging every one-second guard sample. Flow policy

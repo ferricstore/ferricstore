@@ -89,6 +89,26 @@ fn v2_scan_file_page<'a>(
     }
 }
 
+/// Verify the CRC of every frame ending at `prefix_bytes` and bind the
+/// validated prefix to a SHA-256 digest. A trailing append is not included.
+#[rustler::nif(schedule = "DirtyIo")]
+fn v2_validated_log_prefix_digest<'a>(
+    env: Env<'a>,
+    path: String,
+    prefix_bytes: u64,
+) -> NifResult<Term<'a>> {
+    match log::validated_prefix_digest(std::path::Path::new(&path), prefix_bytes) {
+        Ok(digest) => match OwnedBinary::new(digest.len()) {
+            Some(mut binary) => {
+                binary.as_mut_slice().copy_from_slice(&digest);
+                Ok((atoms::ok(), binary.release(env)).encode(env))
+            }
+            None => Ok((atoms::error(), "out of memory allocating digest").encode(env)),
+        },
+        Err(error) => Ok((atoms::error(), error.to_string()).encode(env)),
+    }
+}
+
 /// Validate an active log and truncate only a structurally incomplete final
 /// record. Integrity and format errors are returned to the caller.
 #[rustler::nif(schedule = "DirtyIo")]

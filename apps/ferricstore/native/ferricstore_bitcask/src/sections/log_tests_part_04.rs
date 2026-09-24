@@ -148,3 +148,43 @@ fn recover_torn_tail_finds_header_straddling_window_boundary() {
     assert_eq!(recovered.key, b"x");
     assert_eq!(recovered.value, Some(Vec::new()));
 }
+
+#[test]
+fn validated_history_prefix_binds_complete_records_and_detects_corruption() {
+    use sha2::Digest as _;
+    use std::io::{Seek as _, Write as _};
+
+    let dir = temp_dir();
+    let path = dir.path().join("history_prefix.log");
+
+    let prefix_bytes = {
+        let mut writer = LogWriter::open(&path, 1).unwrap();
+        writer.write(b"first", b"value-one", 0).unwrap();
+        writer.sync().unwrap();
+        std::fs::metadata(&path).unwrap().len()
+    };
+
+    let digest = validated_prefix_digest(&path, prefix_bytes).unwrap();
+    let expected: [u8; 32] = sha2::Sha256::digest(std::fs::read(&path).unwrap()).into();
+    assert_eq!(digest, expected);
+
+    {
+        let mut writer = LogWriter::open(&path, 1).unwrap();
+        writer.write(b"second", b"value-two", 0).unwrap();
+        writer.sync().unwrap();
+    }
+
+    assert_eq!(validated_prefix_digest(&path, prefix_bytes).unwrap(), digest);
+    assert!(validated_prefix_digest(&path, prefix_bytes + 1).is_err());
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    file.seek(SeekFrom::Start(HEADER_SIZE as u64 + 1)).unwrap();
+    file.write_all(&[0xFF]).unwrap();
+    file.sync_data().unwrap();
+
+    assert!(validated_prefix_digest(&path, prefix_bytes).is_err());
+}

@@ -18,14 +18,24 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
   @max_exact_integer 9_007_199_254_740_991
   @tombstone_batch_size 4_096
 
-  def recover_history_log(instance_ctx, shard_index, shard_data_path, keydir_override) do
+  def recover_history_log(
+        instance_ctx,
+        shard_index,
+        shard_data_path,
+        keydir_override,
+        start_offset \\ 0
+      ) do
     file_path = HistoryProjector.history_file_path(shard_data_path, 0)
     keydir = keydir_override || HistoryProjector.keydir(instance_ctx, shard_index)
     recovery_ctx = {instance_ctx, shard_index, shard_data_path, keydir}
 
-    case Log.reduce_metadata_pages(file_path, {:ok, %{}, %{}}, fn record, acc ->
+    case Log.reduce_metadata_pages(file_path, start_offset, {:ok, %{}, %{}}, fn record, acc ->
            recover_history_record(record, acc, recovery_ctx)
          end) do
+      {:ok, {:ok, live_records, tombstones}}
+      when map_size(live_records) == 0 and map_size(tombstones) == 0 ->
+        :ok
+
       {:ok, {:ok, live_records, tombstones}} ->
         with :ok <- delete_recovered_tombstones(tombstones, recovery_ctx),
              {:ok, {entries, locations}} <-
