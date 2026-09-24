@@ -55,6 +55,9 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
     previous_max_entries = Application.get_env(:ferricstore, :waraft_segment_log_max_ets_entries)
     previous_min_entries = Application.get_env(:ferricstore, :waraft_segment_log_min_ets_entries)
 
+    previous_offset_entries =
+      Application.get_env(:ferricstore, :waraft_segment_log_offset_registry_max_entries)
+
     partition = System.unique_integer([:positive])
     table = :"ferricstore_waraft_segment_log_memory_test_#{partition}"
     log_name = :"#{table}_log_#{partition}"
@@ -78,6 +81,14 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
       Application.put_env(:ferricstore, :waraft_segment_log_max_ets_entries, opts[:max_entries])
       Application.put_env(:ferricstore, :waraft_segment_log_min_ets_entries, opts[:min_entries])
 
+      if opts[:offset_entries] do
+        Application.put_env(
+          :ferricstore,
+          :waraft_segment_log_offset_registry_max_entries,
+          opts[:offset_entries]
+        )
+      end
+
       File.rm_rf!(root)
       on_exit(fn -> File.rm_rf!(root) end)
 
@@ -97,6 +108,12 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
       restore_env(:ferricstore, :waraft_segment_log_max_ets_bytes, previous_max_bytes)
       restore_env(:ferricstore, :waraft_segment_log_max_ets_entries, previous_max_entries)
       restore_env(:ferricstore, :waraft_segment_log_min_ets_entries, previous_min_entries)
+
+      restore_env(
+        :ferricstore,
+        :waraft_segment_log_offset_registry_max_entries,
+        previous_offset_entries
+      )
 
       if :ets.info(log_name) != :undefined do
         :ets.delete(log_name)
@@ -134,6 +151,488 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
 
   defp map_fold_seen({:ok, entries}) do
     {:ok, Enum.reverse(entries)}
+  end
+
+  test "disk-backed segment offsets stay bounded across append and truncate" do
+    clear_segment_offset_registry()
+
+    with_segment_log_memory_env(
+      max_bytes: 4_096,
+      max_entries: 4,
+      min_entries: 2,
+      offset_entries: 4,
+      records_per_segment: 64,
+      fun: fn _root, log, _log_name ->
+        provider = :ferricstore_waraft_spike_segment_log
+        assert :ok = provider.init(log)
+        assert {:ok, provider_state} = provider.open(log)
+
+        assert :ok =
+                 provider.append(
+                   {:log_view, log, 0, 0, :undefined},
+                   for(index <- 1..32, do: {1, {:cmd, "value-#{index}"}}),
+                   :strict,
+                   :low
+                 )
+
+        registry = :ferricstore_waraft_segment_offset_registry
+        assert :ets.info(registry, :size) <= 6
+        assert {:ok, {1, {:cmd, "value-1"}}} = provider.get(log, 1)
+        %{dir: segment_dir} = provider.memory_status(log)
+        segment_root = Path.dirname(segment_dir)
+
+        assert {:ok, {_ordinal, _offset, _size}} =
+                 provider.location_for_index(to_charlist(segment_root), 24)
+
+        assert {:ok, _} = provider.truncate(log, 24, provider_state)
+        assert :ets.info(registry, :size) <= 6
+        assert {:ok, {1, {:cmd, "value-23"}}} = provider.get(log, 23)
+        assert :not_found = provider.get(log, 24)
+        assert :not_found = provider.location_for_index(to_charlist(segment_root), 24)
+
+        assert :ok = provider.close(log, provider_state)
+        assert {:ok, _} = provider.open(log)
+        assert {:ok, {1, {:cmd, "value-1"}}} = provider.get(log, 1)
+        assert :ets.info(registry, :size) <= 6
+      end
+    )
+  end
+
+  test "evicted projection offsets preserve older disk reads and newer appends" do
+    clear_segment_offset_registry()
+
+    previous_limit =
+      Application.get_env(:ferricstore, :waraft_segment_log_offset_registry_max_entries)
+
+    Application.put_env(:ferricstore, :waraft_segment_log_offset_registry_max_entries, 4)
+
+    on_exit(fn ->
+      restore_env(:ferricstore, :waraft_segment_log_offset_registry_max_entries, previous_limit)
+    end)
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-projection-bounded-offsets-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(root) end)
+    provider = :ferricstore_waraft_spike_segment_log
+
+    assert :ok =
+             provider.write_projection_batches_sync(
+               to_charlist(root),
+               for(
+                 index <- 1..32,
+                 do: {{:raft_log_pos, index, 7}, [{"key-#{index}", "old", 0}]}
+               )
+             )
+
+    assert :ets.info(:ferricstore_waraft_segment_offset_registry, :size) <= 6
+    assert {:ok, {_ordinal, offset, size}} = provider.location_for_index(to_charlist(root), 1)
+
+    assert {:ok,
+            {0,
+             {:ferricstore_segment_apply_projection_batch, {:raft_log_pos, 1, 7},
+              [{"key-1", "old", 0}]}}} =
+             provider.read_disk_at(to_charlist(root), 1, offset, size)
+
+    assert :ok =
+             provider.write_projection_batches(
+               to_charlist(root),
+               [{{:raft_log_pos, 33, 7}, [{"key-33", "new", 0}]}]
+             )
+
+    assert {:ok,
+            {0, {:ferricstore_segment_apply_projection_batch, {:raft_log_pos, 33, 7}, entries}}} =
+             provider.read_disk(to_charlist(root), 33)
+
+    assert entries == [{"key-33", "new", 0}]
+    assert :ets.info(:ferricstore_waraft_segment_offset_registry, :size) <= 6
+  end
+
+  test "disk projection fold supplies validated physical locations during one scan" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-projection-location-fold-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(root) end)
+    provider = :ferricstore_waraft_spike_segment_log
+
+    assert :ok =
+             provider.write_projection_batches_sync(
+               to_charlist(root),
+               for(
+                 index <- 1..8,
+                 do: {{:raft_log_pos, index, 7}, [{"key-#{index}", "value-#{index}", 0}]}
+               )
+             )
+
+    clear_segment_offset_registry()
+
+    assert {:ok, locations} =
+             provider.fold_disk_with_locations(
+               to_charlist(root),
+               fn index, entry, location, acc -> [{index, entry, location} | acc] end,
+               []
+             )
+
+    assert length(locations) == 8
+
+    for {index, entry, {ordinal, offset, encoded_size}} <- locations do
+      assert is_integer(offset) and offset >= 0
+      assert encoded_size > 8
+
+      assert {:ok, ^entry} =
+               provider.read_disk_at(to_charlist(root), index, offset, encoded_size)
+
+      assert {:ok, {^ordinal, ^offset, ^encoded_size}} =
+               provider.location_for_index(to_charlist(root), index)
+    end
+  end
+
+  test "old WAL offsets use a rebuildable disk index after hot-cache eviction" do
+    clear_segment_offset_registry()
+
+    with_segment_log_memory_env(
+      max_bytes: 4_096,
+      max_entries: 4,
+      min_entries: 2,
+      offset_entries: 4,
+      records_per_segment: 64,
+      fun: fn _root, log, _log_name ->
+        provider = :ferricstore_waraft_spike_segment_log
+        assert :ok = provider.init(log)
+        assert {:ok, provider_state} = provider.open(log)
+
+        assert :ok =
+                 provider.append(
+                   {:log_view, log, 0, 0, :undefined},
+                   for(index <- 1..32, do: {1, {:cmd, "value-#{index}"}}),
+                   :strict,
+                   :low
+                 )
+
+        %{dir: dir} = provider.memory_status(log)
+        index_path = Path.join(dir, "0.idx")
+        assert File.regular?(index_path)
+        assert :ets.info(:ferricstore_waraft_segment_offset_registry, :size) <= 6
+
+        assert {:ok, {ordinal, offset, size}} =
+                 provider.location_for_index(to_charlist(Path.dirname(dir)), 1)
+
+        assert {:ok, {1, {:cmd, "value-1"}}} =
+                 provider.read_disk_at(to_charlist(Path.dirname(dir)), 1, offset, size)
+
+        assert ordinal == 0
+
+        # The index is derived. A broken sidecar must not make the WAL unreadable.
+        File.write!(index_path, <<0>>, [:write])
+
+        assert {:ok, {^ordinal, ^offset, ^size}} =
+                 provider.location_for_index(to_charlist(Path.dirname(dir)), 1)
+
+        assert :ok = provider.close(log, provider_state)
+        clear_segment_offset_registry()
+        assert {:ok, _} = provider.open(log)
+        assert {:ok, %{size: rebuilt_bytes}} = File.stat(index_path)
+        assert rebuilt_bytes >= 32 * 28
+
+        assert {:ok, {^ordinal, ^offset, ^size}} =
+                 provider.location_for_index(to_charlist(Path.dirname(dir)), 1)
+      end
+    )
+  end
+
+  test "read-ahead startup scans still detect corruption beyond the first buffer" do
+    clear_segment_offset_registry()
+
+    with_segment_log_memory_env(
+      max_bytes: 4_096,
+      max_entries: 4,
+      min_entries: 2,
+      records_per_segment: 4_096,
+      fun: fn _root, log, log_name ->
+        provider = :ferricstore_waraft_spike_segment_log
+        assert :ok = provider.init(log)
+        assert {:ok, state} = provider.open(log)
+
+        assert :ok =
+                 provider.append(
+                   {:log_view, log, 0, 0, :undefined},
+                   for(index <- 1..2_000, do: {1, {:cmd, index, :binary.copy("v", 600)}}),
+                   :strict,
+                   :low
+                 )
+
+        %{dir: segment_dir} = provider.memory_status(log)
+        log_root = Path.dirname(segment_dir)
+        assert :ok = provider.close(log, state)
+        :ets.delete_all_objects(log_name)
+        clear_segment_offset_registry()
+
+        startup_key = {Ferricstore.Application, :starting}
+        previous_starting = :persistent_term.get(startup_key, false)
+        :persistent_term.put(startup_key, true)
+
+        try do
+          assert {:ok, 2_000} =
+                   provider.fold_disk(
+                     to_charlist(log_root),
+                     fn _index, _entry, count -> count + 1 end,
+                     0
+                   )
+
+          assert {:ok, {0, offset, _encoded_size}} =
+                   provider.location_for_index(to_charlist(log_root), 1_800)
+
+          segment = Path.join(segment_dir, "0.seg")
+          assert {:ok, fd} = :file.open(to_charlist(segment), [:read, :write, :binary, :raw])
+          assert {:ok, <<old_byte>>} = :file.pread(fd, offset + 16, 1)
+          assert :ok = :file.pwrite(fd, offset + 16, <<Bitwise.bxor(old_byte, 255)>>)
+          assert :ok = :file.close(fd)
+
+          assert {:error, {:crc_mismatch, ^offset}} = provider.open(log)
+        after
+          :persistent_term.put(startup_key, previous_starting)
+        end
+      end
+    )
+  end
+
+  test "logical trim prunes sidecars without recreating indexes for trimmed records" do
+    clear_segment_offset_registry()
+
+    with_segment_log_memory_env(
+      max_bytes: 4_096,
+      max_entries: 4,
+      min_entries: 2,
+      offset_entries: 4,
+      records_per_segment: 64,
+      fun: fn _root, log, log_name ->
+        provider = :ferricstore_waraft_spike_segment_log
+        assert :ok = provider.init(log)
+        assert {:ok, state} = provider.open(log)
+
+        assert :ok =
+                 provider.append(
+                   {:log_view, log, 0, 0, :undefined},
+                   for(index <- 1..130, do: {1, {:cmd, index}}),
+                   :strict,
+                   :low
+                 )
+
+        %{dir: segment_dir} = provider.memory_status(log)
+        old_index = Path.join(segment_dir, "0.idx")
+        live_index = Path.join(segment_dir, "1.idx")
+        assert File.regular?(old_index)
+        assert File.regular?(live_index)
+
+        assert {:ok, _} = provider.trim(log, 64, state)
+        refute File.exists?(old_index)
+        assert File.regular?(live_index)
+        assert :not_found = provider.get(log, 63)
+        assert {:ok, {1, {:cmd, 64}}} = provider.get(log, 64)
+
+        assert :ok = provider.close(log, state)
+        :ets.delete_all_objects(log_name)
+        clear_segment_offset_registry()
+
+        # The obsolete physical segment is storage debt, not replayable WAL.
+        # Its corruption must not block a checkpointed restart.
+        old_segment = Path.join(segment_dir, "0.seg")
+        assert File.regular?(old_segment)
+        assert {:ok, fd} = :file.open(to_charlist(old_segment), [:read, :write, :binary, :raw])
+        assert :ok = :file.pwrite(fd, 8, <<0>>)
+        assert :ok = :file.close(fd)
+
+        assert {:ok, _} = provider.open(log)
+        refute File.exists?(old_index)
+        assert {:ok, {1, {:cmd, 64}}} = provider.get(log, 64)
+
+        assert {:ok, folded} =
+                 provider.fold_disk(
+                   to_charlist(Path.dirname(segment_dir)),
+                   fn index, _entry, seen -> [index | seen] end,
+                   []
+                 )
+
+        assert Enum.reverse(folded) == Enum.to_list(64..130)
+      end
+    )
+  end
+
+  test "offset index rebuild refuses a symlink without touching its target or unrelated files" do
+    with_segment_log_memory_env(
+      max_bytes: 4_096,
+      max_entries: 4,
+      min_entries: 2,
+      records_per_segment: 64,
+      fun: fn _root, log, _log_name ->
+        provider = :ferricstore_waraft_spike_segment_log
+        assert :ok = provider.init(log)
+        assert {:ok, state} = provider.open(log)
+
+        assert :ok =
+                 provider.append(
+                   {:log_view, log, 0, 0, :undefined},
+                   [{1, {:cmd, "unchanged"}}],
+                   :strict,
+                   :low
+                 )
+
+        %{dir: dir} = provider.memory_status(log)
+        assert :ok = provider.close(log, state)
+        index_path = Path.join(dir, "0.idx")
+        victim = Path.join(Path.dirname(dir), "victim")
+        unrelated = Path.join(dir, "notes.idx")
+        File.write!(victim, "protected")
+        File.write!(unrelated, "unrelated")
+        File.rm!(index_path)
+        File.ln_s!(victim, index_path)
+
+        assert {:error, {:unsafe_offset_index_path, :symlink}} = provider.open(log)
+        assert File.read!(victim) == "protected"
+        assert File.read!(unrelated) == "unrelated"
+      end
+    )
+  end
+
+  test "derived-index write failure does not report a durable WAL append as failed" do
+    with_segment_log_memory_env(
+      max_bytes: 4_096,
+      max_entries: 4,
+      min_entries: 2,
+      records_per_segment: 64,
+      fun: fn _root, log, _log_name ->
+        provider = :ferricstore_waraft_spike_segment_log
+        assert :ok = provider.init(log)
+        assert {:ok, state} = provider.open(log)
+        %{dir: dir} = provider.memory_status(log)
+        index_path = Path.join(dir, "0.idx")
+        victim = Path.join(Path.dirname(dir), "victim")
+        File.write!(victim, "protected")
+        File.ln_s!(victim, index_path)
+
+        assert :ok =
+                 provider.append(
+                   {:log_view, log, 0, 0, :undefined},
+                   [{1, {:cmd, "durable"}}],
+                   :strict,
+                   :low
+                 )
+
+        assert File.read!(victim) == "protected"
+        assert {:ok, {1, {:cmd, "durable"}}} = provider.get(log, 1)
+        assert :ok = provider.close(log, state)
+      end
+    )
+  end
+
+  test "a stale but checksummed sidecar never redirects an older WAL lookup" do
+    clear_segment_offset_registry()
+
+    with_segment_log_memory_env(
+      max_bytes: 4_096,
+      max_entries: 4,
+      min_entries: 2,
+      offset_entries: 4,
+      records_per_segment: 64,
+      fun: fn _root, log, _log_name ->
+        provider = :ferricstore_waraft_spike_segment_log
+        assert :ok = provider.init(log)
+        assert {:ok, _state} = provider.open(log)
+
+        assert :ok =
+                 provider.append(
+                   {:log_view, log, 0, 0, :undefined},
+                   for(index <- 1..32, do: {1, {:cmd, "value-#{index}"}}),
+                   :strict,
+                   :low
+                 )
+
+        %{dir: dir} = provider.memory_status(log)
+        root = Path.dirname(dir)
+
+        assert {:ok, {0, actual_offset, encoded_size}} =
+                 provider.location_for_index(to_charlist(root), 2)
+
+        assert actual_offset > 0
+
+        index_path = Path.join(dir, "0.idx")
+
+        body =
+          <<0xF00D2026::unsigned-big-32, 2::unsigned-big-64, 0::unsigned-big-64,
+            encoded_size::unsigned-big-32>>
+
+        forged = <<body::binary, :erlang.crc32(body)::unsigned-big-32>>
+        assert {:ok, fd} = :file.open(to_charlist(index_path), [:read, :write, :binary, :raw])
+        assert :ok = :file.pwrite(fd, 2 * 28, forged)
+        assert :ok = :file.close(fd)
+        clear_segment_offset_registry()
+
+        assert {:ok, {0, ^actual_offset, ^encoded_size}} =
+                 provider.location_for_index(to_charlist(root), 2)
+      end
+    )
+  end
+
+  test "an unavailable sidecar cannot return an older version after the hot cache evicts it" do
+    clear_segment_offset_registry()
+
+    previous_limit =
+      Application.get_env(:ferricstore, :waraft_segment_log_offset_registry_max_entries)
+
+    Application.put_env(:ferricstore, :waraft_segment_log_offset_registry_max_entries, 4)
+
+    on_exit(fn ->
+      restore_env(:ferricstore, :waraft_segment_log_offset_registry_max_entries, previous_limit)
+    end)
+
+    root =
+      Path.join([
+        System.tmp_dir!(),
+        "ferricstore-offset-sidecar-error-#{System.unique_integer([:positive])}",
+        "apply_projection_log"
+      ])
+
+    on_exit(fn -> File.rm_rf!(Path.dirname(root)) end)
+    provider = :ferricstore_waraft_spike_segment_log
+
+    assert :ok =
+             provider.write_projection_batches_sync(
+               to_charlist(root),
+               [{{:raft_log_pos, 42, 0}, [{"key", "old", 0}]}]
+             )
+
+    assert {:ok, {0, old_offset, encoded_size}} =
+             provider.location_for_index(to_charlist(root), 42)
+
+    sidecar = Path.join(root, "segment_log/0.idx")
+    File.chmod!(sidecar, 0o444)
+
+    assert :ok =
+             provider.write_projection_batches(
+               to_charlist(root),
+               [{{:raft_log_pos, 42, 0}, [{"key", "new", 0}]}]
+             )
+
+    assert :ok =
+             provider.write_projection_batches(
+               to_charlist(root),
+               for(
+                 index <- 43..50,
+                 do: {{:raft_log_pos, index, 0}, [{"key-#{index}", "val", 0}]}
+               )
+             )
+
+    assert {:ok, {0, newest_offset, _size}} = provider.location_for_index(to_charlist(root), 42)
+    assert newest_offset > old_offset
+
+    assert {:ok, {0, {:ferricstore_segment_apply_projection_batch, _, [{"key", "new", 0}]}}} =
+             provider.read_disk_at(to_charlist(root), 42, newest_offset, encoded_size)
   end
 
   test "apply projection offsets survive alternating writer processes" do

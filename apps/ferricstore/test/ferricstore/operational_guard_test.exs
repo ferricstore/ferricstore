@@ -6,6 +6,7 @@ defmodule Ferricstore.OperationalGuardTest do
   alias Ferricstore.OperationalGuard
   alias Ferricstore.Test.Eventually
   alias Ferricstore.Test.Utils
+  import ExUnit.CaptureLog
 
   setup do
     original_env =
@@ -94,6 +95,92 @@ defmodule Ferricstore.OperationalGuardTest do
 
     assert OperationalGuard.pressure?()
     assert OperationalGuard.reject_writes?()
+  end
+
+  test "logs an RSS admission transition with its memory budget and index footprint only once" do
+    name = :"operational_guard_#{System.unique_integer([:positive])}"
+
+    pressure = %{
+      data_dir: "/data",
+      shard_count: 1,
+      memory: %{level: :panic, rss_bytes: 96, limit_bytes: 100, rss_ratio: 0.96},
+      disk: %{level: :ok, used_bytes: 10, total_bytes: 100, used_ratio: 0.1}
+    }
+
+    {:ok, snapshots} = Agent.start_link(fn -> pressure end)
+    on_exit(fn -> if Process.alive?(snapshots), do: Agent.stop(snapshots) end)
+
+    logs =
+      capture_log(fn ->
+        start_supervised!(
+          {OperationalGuard,
+           name: name,
+           shard_count: 1,
+           data_dir: "/data",
+           interval_ms: 60_000,
+           limits_fun: fn _opts -> Agent.get(snapshots, & &1) end,
+           memory_stats_fun: fn ->
+             %{total_bytes: 30, ratio: 0.3, keydir_bytes: 20, keydir_ratio: 0.2}
+           end,
+           apply_disk_pressure_fun: fn _ctx, _count, _level -> :ok end,
+           apply_memory_pressure_fun: fn _level -> :ok end,
+           lmdb_reclaim_fun: fn -> {:ok, 0} end,
+           telemetry_fun: fn _event, _measurements, _metadata -> :ok end}
+        )
+
+        Eventually.assert_eventually(fn -> assert Admission.reject_new_creates?() end)
+        send(Process.whereis(name), :check)
+        assert %{running: true} = GenServer.call(name, :info)
+      end)
+
+    assert length(Regex.scan(~r/operational RSS pressure/, logs)) == 1
+    assert logs =~ "rss_bytes=96"
+    assert logs =~ "limit_bytes=100"
+    assert logs =~ "offset_registry_bytes="
+
+    Agent.update(snapshots, fn snapshot ->
+      put_in(snapshot, [:memory], %{level: :ok, rss_bytes: 40, limit_bytes: 100, rss_ratio: 0.4})
+    end)
+
+    send(Process.whereis(name), :check)
+    Eventually.assert_eventually(fn -> refute Admission.reject_new_creates?() end)
+    assert %{running: true} = GenServer.call(name, :info)
+  end
+
+  test "logs disk rejection with the filesystem budget only on transition" do
+    name = :"operational_guard_#{System.unique_integer([:positive])}"
+
+    snapshot = %{
+      data_dir: "/data",
+      shard_count: 1,
+      memory: %{level: :ok, rss_bytes: 40, limit_bytes: 100, rss_ratio: 0.4},
+      disk: %{level: :reject, used_bytes: 91, total_bytes: 100, used_ratio: 0.91}
+    }
+
+    logs =
+      capture_log(fn ->
+        start_supervised!(
+          {OperationalGuard,
+           name: name,
+           shard_count: 1,
+           data_dir: "/data",
+           interval_ms: 60_000,
+           limits_fun: fn _opts -> snapshot end,
+           apply_disk_pressure_fun: fn _ctx, _count, _level -> :ok end,
+           apply_memory_pressure_fun: fn _level -> :ok end,
+           lmdb_reclaim_fun: fn -> {:ok, 0} end,
+           telemetry_fun: fn _event, _measurements, _metadata -> :ok end}
+        )
+
+        Eventually.assert_eventually(fn -> assert OperationalGuard.reject_writes?() end)
+        send(Process.whereis(name), :check)
+        assert %{running: true} = GenServer.call(name, :info)
+      end)
+
+    assert length(Regex.scan(~r/operational disk pressure/, logs)) == 1
+    assert logs =~ "used_bytes=91"
+    assert logs =~ "total_bytes=100"
+    assert logs =~ "writes_rejected=true"
   end
 
   test "rss reject alone does not keep Flow creates paused below the hard create threshold" do

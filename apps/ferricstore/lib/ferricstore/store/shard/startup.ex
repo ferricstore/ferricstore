@@ -246,9 +246,11 @@ defmodule Ferricstore.Store.Shard.Startup do
             :ok
           end)
 
-          profile_startup_phase(index, :flow_history_projector_recover, fn ->
-            :ok = Ferricstore.Flow.HistoryProjector.recover(ctx, index, path, keydir)
-          end)
+          unless Keyword.get(opts, :defer_flow_history_recovery, false) do
+            profile_startup_phase(index, :flow_history_projector_recover, fn ->
+              :ok = Ferricstore.Flow.HistoryProjector.recover(ctx, index, path, keydir)
+            end)
+          end
 
           profile_startup_phase(index, :flow_lmdb_rebuild, fn ->
             unless raft_projection_owner?(ctx) do

@@ -4,9 +4,13 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinator do
   use GenServer
 
   @default_max_concurrent 1
+  @parallel_rebuild_memory_bytes 4 * 1024 * 1024 * 1024
 
   def default_max_concurrent do
-    @default_max_concurrent
+    if System.schedulers_online() > 1 and
+         Ferricstore.OperationalLimits.memory_limit_bytes() >= @parallel_rebuild_memory_bytes,
+       do: 2,
+       else: @default_max_concurrent
   end
 
   def start_link(opts) do
@@ -68,6 +72,10 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinator do
 
   @impl true
   def init(opts) do
+    explicit_limit? =
+      Keyword.has_key?(opts, :max_concurrent) or
+        is_integer(Application.get_env(:ferricstore, :flow_lmdb_max_concurrent_flushes))
+
     max_concurrent =
       opts
       |> Keyword.get(:max_concurrent, configured_max_concurrent())
@@ -76,6 +84,11 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinator do
     {:ok,
      %{
        max: max_concurrent,
+       runtime_max: if(explicit_limit?, do: max_concurrent, else: 1),
+       startup_fun:
+         Keyword.get(opts, :startup_fun, fn ->
+           Ferricstore.Application.starting?() or Ferricstore.Raft.WARaftBackend.starting?()
+         end),
        available: max_concurrent,
        queue: :queue.new(),
        holders: %{},
@@ -113,11 +126,10 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinator do
   end
 
   defp configured_max_concurrent do
-    Application.get_env(
-      :ferricstore,
-      :flow_lmdb_max_concurrent_flushes,
-      default_max_concurrent()
-    )
+    case Application.get_env(:ferricstore, :flow_lmdb_max_concurrent_flushes) do
+      value when is_integer(value) and value > 0 -> value
+      _unset_or_invalid -> default_max_concurrent()
+    end
   end
 
   defp acquire(pid, scope) do
@@ -161,14 +173,20 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinator do
   defp delete_active_scope(scopes, scope), do: MapSet.delete(scopes, scope)
 
   defp grant_next(state) do
-    case pop_grantable(state) do
-      {:ok, {{pid, _tag} = from, scope}, queue} ->
-        {token, state} = grant(pid, scope, %{state | queue: queue})
-        GenServer.reply(from, {:ok, token})
-        grant_next(state)
+    allowed = if state.startup_fun.(), do: state.max, else: state.runtime_max
 
-      :none ->
-        state
+    if map_size(state.holders) >= allowed do
+      state
+    else
+      case pop_grantable(state) do
+        {:ok, {{pid, _tag} = from, scope}, queue} ->
+          {token, state} = grant(pid, scope, %{state | queue: queue})
+          GenServer.reply(from, {:ok, token})
+          grant_next(state)
+
+        :none ->
+          state
+      end
     end
   end
 

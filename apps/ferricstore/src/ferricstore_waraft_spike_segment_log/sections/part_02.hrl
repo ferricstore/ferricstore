@@ -250,24 +250,27 @@ delete_before(Name, Index) ->
 clear_offset_registry_before(Dir, Index) ->
     case ensure_offset_registry() of
         ok ->
-            clear_offset_registry_before(Dir, Index, ets:first(?OFFSET_REGISTRY));
+            case lookup_offset_dir_last_index(Dir) of
+                {ok, LastIndex} ->
+                    %% Only the bounded hot tail can still be in ETS. Avoid
+                    %% scanning every other shard's offset cache on each trim.
+                    First = max(0, LastIndex - offset_registry_max_entries() + 1),
+                    Last = min(LastIndex, Index - 1),
+                    case First =< Last of
+                        true ->
+                            DirKey = offset_dir_key(Dir),
+                            lists:foreach(
+                                fun(I) -> ets:delete(?OFFSET_REGISTRY, {DirKey, I}) end,
+                                lists:seq(First, Last)
+                            );
+                        false -> ok
+                    end,
+                    maybe_prune_offset_indexes_before(Dir, Index);
+                _NoLast -> ok
+            end;
         {error, _Reason} ->
             ok
     end.
-
-clear_offset_registry_before(_Dir, _Index, '$end_of_table') ->
-    ok;
-clear_offset_registry_before(Dir, Index, Key) ->
-    Next = ets:next(?OFFSET_REGISTRY, Key),
-    DirKey = offset_dir_key(Dir),
-    case Key of
-        {{DirKey, StoredIndex}, _Ordinal, _Offset, _EncodedSize}
-          when is_integer(StoredIndex), StoredIndex < Index ->
-            true = ets:delete(?OFFSET_REGISTRY, Key);
-        _Other ->
-            ok
-    end,
-    clear_offset_registry_before(Dir, Index, Next).
 
 index_below_trim_floor(Dir, Index) when is_integer(Index), Index >= 0 ->
     case logical_trim_floor_result(Dir) of

@@ -367,7 +367,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         case read_segment_projection_log(projection_root) do
           {:ok, projection} ->
             with {:ok, entries} <- validate_segment_projection_entries(projection) do
-              {:ok, replace_with_segment_projection(sm_state, projection_root, entries),
+              {:ok, replace_with_segment_projection(sm_state, projection.locations, entries),
                position_index(projection.position),
                max_raft_position(metadata_position, projection.position)}
             end
@@ -380,10 +380,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         end
       end
 
-      defp replace_with_segment_projection(sm_state, projection_source, entries) do
+      defp replace_with_segment_projection(sm_state, locations, entries) do
         sm_state
         |> reset_segment_projection_base()
-        |> apply_segment_projection_entries(projection_source, entries)
+        |> apply_segment_projection_entries({:disk_locations, locations}, entries)
         |> recover_promoted_instances()
       end
 

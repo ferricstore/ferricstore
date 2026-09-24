@@ -12,6 +12,7 @@ defmodule Ferricstore.OperationalGuard do
   use GenServer
 
   alias Ferricstore.Store.DiskPressure
+  require Logger
 
   @pt_key :ferricstore_operational_guard
   @disk_pressure_slot 1
@@ -121,6 +122,7 @@ defmodule Ferricstore.OperationalGuard do
         Keyword.get(opts, :lmdb_reclaim_fun, &Ferricstore.Flow.LMDB.release_all/0),
       telemetry_fun: Keyword.get(opts, :telemetry_fun, &:telemetry.execute/3),
       last_snapshot: nil,
+      last_admission: nil,
       last_lmdb_mmap_reclaim_at: nil
     }
 
@@ -155,11 +157,13 @@ defmodule Ferricstore.OperationalGuard do
     state.apply_disk_pressure_fun.(state.ctx, state.shard_count, snapshot.disk.level)
     state.apply_memory_pressure_fun.(snapshot.memory.level)
     state.apply_flow_admission_fun.(snapshot)
+    admission = Ferricstore.Flow.Admission.status()
+    log_pressure_transitions(state.last_snapshot, snapshot, state.last_admission, admission)
     emit_check(state.telemetry_fun, snapshot)
     state = maybe_reclaim_lmdb_mmap(state, snapshot)
 
     Process.send_after(self(), :check, state.interval_ms)
-    {:noreply, %{state | last_snapshot: snapshot}}
+    {:noreply, %{state | last_snapshot: snapshot, last_admission: admission}}
   end
 
   defp enabled? do
@@ -418,6 +422,60 @@ defmodule Ferricstore.OperationalGuard do
         shard_count: snapshot.shard_count
       }
     )
+  end
+
+  defp log_pressure_transitions(previous, snapshot, previous_admission, admission) do
+    old_memory = if previous, do: previous.memory.level, else: :ok
+    new_memory = snapshot.memory.level
+
+    if new_memory != old_memory or admission_changed?(previous_admission, admission) do
+      if new_memory in [:pressure, :reject, :panic] or admission.reason == :rss_pressure do
+        registry = :ferricstore_waraft_segment_offset_registry
+        registry_words = :ets.info(registry, :memory)
+        registry_entries = :ets.info(registry, :size)
+
+        Logger.warning(
+          "operational RSS pressure: level=#{new_memory} rss_bytes=#{snapshot.memory.rss_bytes} " <>
+            "limit_bytes=#{snapshot.memory.limit_bytes} rss_ratio=#{snapshot.memory.rss_ratio} " <>
+            "keydir_bytes=#{snapshot.active_memory.keydir_bytes} " <>
+            "ets_bytes=#{:erlang.memory(:ets)} " <>
+            "offset_registry_entries=#{int_or(registry_entries, 0)} " <>
+            "offset_registry_bytes=#{int_or(registry_words, 0) * :erlang.system_info(:wordsize)} " <>
+            "flow_creates_paused=#{admission.reject_new_creates?} reason=#{admission.reason}"
+        )
+      else
+        if old_memory in [:pressure, :reject, :panic] or
+             (previous_admission && previous_admission.reject_new_creates?) do
+          Logger.info(
+            "operational RSS pressure cleared: rss_bytes=#{snapshot.memory.rss_bytes} " <>
+              "limit_bytes=#{snapshot.memory.limit_bytes} " <>
+              "flow_creates_paused=#{admission.reject_new_creates?}"
+          )
+        end
+      end
+    end
+
+    old_disk = if previous, do: previous.disk.level, else: :ok
+
+    if snapshot.disk.level != old_disk do
+      if snapshot.disk.level in [:pressure, :reject, :panic] do
+        Logger.warning(
+          "operational disk pressure: level=#{snapshot.disk.level} " <>
+            "used_bytes=#{snapshot.disk.used_bytes} total_bytes=#{snapshot.disk.total_bytes} " <>
+            "writes_rejected=#{reject_writes?()}"
+        )
+      else
+        if old_disk in [:pressure, :reject, :panic] do
+          Logger.info("operational disk pressure cleared: used_bytes=#{snapshot.disk.used_bytes}")
+        end
+      end
+    end
+  end
+
+  defp admission_changed?(nil, admission), do: admission.reject_new_creates?
+
+  defp admission_changed?(old, new) do
+    old.reject_new_creates? != new.reject_new_creates? or old.reason != new.reason
   end
 
   defp pressured?(level), do: level in [:pressure, :reject, :panic]

@@ -35,7 +35,11 @@ defmodule Ferricstore.Store.ShardSupervisor do
 
     children =
       Enum.flat_map(0..(shard_count - 1), fn i ->
-        shard_opts = [index: i, data_dir: data_dir]
+        shard_opts = [
+          index: i,
+          data_dir: data_dir,
+          defer_flow_history_recovery: Keyword.get(opts, :defer_flow_history_recovery, false)
+        ]
 
         shard_opts =
           if instance_ctx,

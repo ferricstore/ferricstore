@@ -55,6 +55,72 @@ defmodule Ferricstore.ApplicationTest do
   # ---------------------------------------------------------------------------
 
   describe "Ferricstore.Supervisor" do
+    test "startup history recovery overlaps shards but waits for both before returning" do
+      parent = self()
+      ctx = %{data_dir: System.tmp_dir!(), keydir_refs: {:first, :second}}
+
+      recovery = fn _ctx, shard_index, _path, _keydir ->
+        send(parent, {:history_recovery_started, shard_index, self()})
+
+        receive do
+          :complete_history_recovery -> :ok
+        end
+      end
+
+      startup =
+        Task.async(fn ->
+          Ferricstore.Application.recover_flow_history_shards(ctx, 2,
+            recover_fun: recovery,
+            max_concurrency: 2
+          )
+        end)
+
+      assert_receive {:history_recovery_started, 0, first}, 1_000
+      assert_receive {:history_recovery_started, 1, second}, 1_000
+      send(first, :complete_history_recovery)
+      refute Task.yield(startup, 50)
+      send(second, :complete_history_recovery)
+      assert :ok = Task.await(startup)
+    end
+
+    test "startup history recovery returns shard errors instead of admitting writes" do
+      ctx = %{data_dir: System.tmp_dir!(), keydir_refs: {:first, :second}}
+
+      assert {:error, {:history_recovery_failed, 1, :corrupt_history}} =
+               Ferricstore.Application.recover_flow_history_shards(ctx, 2,
+                 recover_fun: fn _ctx, index, _path, _keydir ->
+                   if index == 1, do: {:error, :corrupt_history}, else: :ok
+                 end,
+                 max_concurrency: 2
+               )
+    end
+
+    test "startup history recovery stays serial under a small memory budget" do
+      prior_limit = Application.get_env(:ferricstore, :operational_memory_limit_bytes)
+      Application.put_env(:ferricstore, :operational_memory_limit_bytes, 2 * 1024 * 1024 * 1024)
+      on_exit(fn -> restore_env(:operational_memory_limit_bytes, prior_limit) end)
+
+      parent = self()
+      ctx = %{data_dir: System.tmp_dir!(), keydir_refs: {:first, :second}}
+
+      startup =
+        Task.async(fn ->
+          Ferricstore.Application.recover_flow_history_shards(ctx, 2,
+            recover_fun: fn _ctx, index, _path, _keydir ->
+              send(parent, {:serial_history_started, index, self()})
+              receive do: (:complete_history_recovery -> :ok)
+            end
+          )
+        end)
+
+      assert_receive {:serial_history_started, 0, first}, 1_000
+      refute_receive {:serial_history_started, 1, _pid}, 50
+      send(first, :complete_history_recovery)
+      assert_receive {:serial_history_started, 1, second}, 1_000
+      send(second, :complete_history_recovery)
+      assert :ok = Task.await(startup)
+    end
+
     test "is alive after application start" do
       pid = Process.whereis(Ferricstore.Supervisor)
       assert is_pid(pid)

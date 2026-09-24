@@ -508,7 +508,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
         with {:ok, metadata} <- read_snapshot_metadata(snapshot_path),
              :ok <- verify_snapshot_position(metadata, expected_position),
              :ok <- verify_snapshot_payload_dirs(metadata, snapshot_path, handle),
-             {:ok, segment_projection_entries} <-
+             {:ok,
+              %{entries: segment_projection_entries, locations: segment_projection_locations}} <-
                read_snapshot_segment_projection(snapshot_path, metadata, expected_position),
              {:ok, install} <-
                copy_snapshot_to_shard_dirs(
@@ -519,16 +520,16 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
                ) do
           position = Map.fetch!(metadata, :position)
 
-          projection_source =
-            segment_projection_apply_source(handle.root_dir, position, segment_projection_entries)
-
           sm_state =
             build_sm_state(
               handle.ctx,
               handle.shard_index,
               Map.get(metadata, :apply_context)
             )
-            |> replace_with_segment_projection(projection_source, segment_projection_entries)
+            |> replace_with_segment_projection(
+              segment_projection_locations,
+              segment_projection_entries
+            )
             |> rebuild_indexes_from_segment_keydir(handle.ctx, handle.shard_index)
 
           new_handle =
@@ -592,11 +593,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
           end
         end
       end
-
-      defp segment_projection_apply_source(_root_dir, position, []), do: position
-
-      defp segment_projection_apply_source(root_dir, _position, _entries),
-        do: segment_projection_root(root_dir)
 
       @spec make_empty_snapshot(map(), charlist() | binary(), tuple(), term(), term()) ::
               :ok | {:error, term()}

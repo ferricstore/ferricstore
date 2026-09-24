@@ -315,6 +315,12 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
     now_ms = System.system_time(:millisecond)
     previous = Map.get(state.health_by_shard, shard_index, %{})
 
+    if Map.get(previous, :reason) != reason do
+      Logger.warning(
+        "Flow policy migration step failed for shard #{shard_index}: #{inspect(reason)}"
+      )
+    end
+
     issue = %{
       shard: shard_index,
       severity: health_severity(reason),
@@ -406,21 +412,8 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
   defp shard_result_more_work?({:retry, _reason}, _shard_index, more_work?),
     do: more_work?
 
-  defp shard_result_more_work?({:error, reason}, shard_index, more_work?) do
-    Logger.warning(
-      "Flow policy migration step failed for shard #{shard_index}: #{inspect(reason)}"
-    )
-
-    more_work?
-  end
-
-  defp shard_result_more_work?(other, shard_index, more_work?) do
-    Logger.warning(
-      "Flow policy migration step returned an invalid result for shard #{shard_index}: #{inspect(other)}"
-    )
-
-    more_work?
-  end
+  defp shard_result_more_work?({:error, _reason}, _shard_index, more_work?), do: more_work?
+  defp shard_result_more_work?(_other, _shard_index, more_work?), do: more_work?
 
   defp run_shard(state, shard_index) do
     cond do

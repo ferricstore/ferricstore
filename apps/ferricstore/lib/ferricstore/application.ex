@@ -283,6 +283,7 @@ defmodule Ferricstore.Application do
              shard_supervisor_name: Ferricstore.Store.ShardSupervisor,
              data_dir: data_dir,
              shard_count: shard_count,
+             defer_flow_history_recovery: true,
              instance_ctx: default_ctx}
           ] ++
           [
@@ -311,16 +312,24 @@ defmodule Ferricstore.Application do
 
       case Supervisor.start_link(children, opts) do
         {:ok, pid} ->
-          case Ferricstore.Raft.WARaftBackend.start(default_ctx, waraft_backend_opts()) do
+          case recover_flow_history_shards(default_ctx, shard_count) do
             :ok ->
-              :ok = Ferricstore.Flow.LMDB.ensure_shard_dirs(data_dir, shard_count)
-              mark_started(shard_count, started_at_ms)
-              {:ok, pid, app_state}
+              case Ferricstore.Raft.WARaftBackend.start(default_ctx, waraft_backend_opts()) do
+                :ok ->
+                  :ok = Ferricstore.Flow.LMDB.ensure_shard_dirs(data_dir, shard_count)
+                  mark_started(shard_count, started_at_ms)
+                  {:ok, pid, app_state}
+
+                {:error, reason} ->
+                  stop_started_supervisor(pid)
+                  cleanup_failed_start()
+                  {:error, {:waraft_start_failed, reason}}
+              end
 
             {:error, reason} ->
               stop_started_supervisor(pid)
               cleanup_failed_start()
-              {:error, {:waraft_start_failed, reason}}
+              {:error, {:flow_history_recovery_failed, reason}}
           end
 
         result ->
@@ -352,6 +361,72 @@ defmodule Ferricstore.Application do
       commit_batch_interval_ms: Ferricstore.Raft.WARaftBackend.default_commit_batch_interval_ms(),
       commit_batch_max: Ferricstore.Raft.WARaftBackend.default_commit_batch_max()
     ]
+  end
+
+  @doc false
+  def recover_flow_history_shards(ctx, shard_count, opts \\ [])
+      when is_integer(shard_count) and shard_count > 0 do
+    recovery = Keyword.get(opts, :recover_fun, &Ferricstore.Flow.HistoryProjector.recover/4)
+
+    concurrency =
+      Keyword.get_lazy(opts, :max_concurrency, fn ->
+        if System.schedulers_online() > 1 and
+             Ferricstore.OperationalLimits.memory_limit_bytes() >= 4 * 1024 * 1024 * 1024,
+           do: 2,
+           else: 1
+      end)
+
+    concurrency = if is_integer(concurrency) and concurrency > 0, do: min(concurrency, 2), else: 1
+
+    # Shards have published their own keydirs, but Raft has not started yet.
+    # Recover the largest logs first with a small memory-aware cap, then keep
+    # the startup write fence until every derived history view is ready.
+    0..(shard_count - 1)
+    |> Enum.sort_by(fn index -> -history_log_size(ctx.data_dir, index) end)
+    |> Task.async_stream(
+      fn index ->
+        path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, index)
+
+        {duration_us, result} =
+          :timer.tc(fn -> recovery.(ctx, index, path, elem(ctx.keydir_refs, index)) end)
+
+        :telemetry.execute(
+          [:ferricstore, :shard, :startup_phase],
+          %{duration_us: duration_us},
+          %{shard_index: index, phase: :flow_history_projector_recover}
+        )
+
+        {index, result}
+      end,
+      max_concurrency: concurrency,
+      ordered: false,
+      timeout: :infinity
+    )
+    |> Enum.reduce_while(:ok, fn
+      {:ok, {_index, :ok}}, :ok ->
+        {:cont, :ok}
+
+      {:ok, {index, {:error, reason}}}, :ok ->
+        {:halt, {:error, {:history_recovery_failed, index, reason}}}
+
+      {:ok, {index, other}}, :ok ->
+        {:halt, {:error, {:history_recovery_failed, index, {:unexpected_result, other}}}}
+
+      {:exit, reason}, :ok ->
+        {:halt, {:error, {:history_recovery_task_failed, reason}}}
+    end)
+  end
+
+  defp history_log_size(data_dir, shard_index) do
+    path =
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> Ferricstore.Flow.HistoryProjector.history_file_path(0)
+
+    case File.stat(path) do
+      {:ok, %{size: size}} -> size
+      _unreadable -> 0
+    end
   end
 
   defp stop_standalone_waraft_runtime do

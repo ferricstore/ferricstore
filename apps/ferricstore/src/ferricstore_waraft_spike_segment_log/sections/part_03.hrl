@@ -874,22 +874,27 @@ load_segments_bounded(Dir, Name) ->
 
 load_segments_bounded_full_scan(Dir, Name, RecordsPerSegment, Paths) ->
     StartedAt = erlang:monotonic_time(),
+    start_offset_index_build(Dir),
     Result =
         case scan_segment_paths(Paths, undefined, RecordsPerSegment, undefined, undefined, 0) of
             {ok, ScanFirst, ScanLast, _ScanCount} ->
-                TailFirst = load_tail_first_index(ScanLast, ets_memory_limits()),
-                begin_load_context(Name, Dir, StartedAt, TailFirst, ScanFirst, ScanLast),
-                case load_segment_paths(Paths, Name, undefined, RecordsPerSegment) of
-                    {ok, LastIndex} ->
-                        maybe_cache_latest_config_after_bounded_load(Dir, LastIndex),
-                        ok;
-                    {error, _Reason} = Error ->
-                        Error
+                case finish_offset_index_build() of
+                    ok ->
+                        TailFirst = load_tail_first_index(ScanLast, ets_memory_limits()),
+                        begin_load_context(Name, Dir, StartedAt, TailFirst, ScanFirst, ScanLast),
+                        case load_segment_paths(Paths, Name, undefined, RecordsPerSegment) of
+                            {ok, LastIndex} ->
+                                maybe_cache_latest_config_after_bounded_load(Dir, LastIndex),
+                                ok;
+                            {error, _Reason} = Error -> Error
+                        end;
+                    {error, _Reason} = Error -> Error
                 end;
             {error, _Reason} = Error ->
                 begin_load_context(Name, Dir, StartedAt, undefined, undefined, undefined),
                 Error
         end,
+    discard_offset_index_build(),
     finish_load_context(Name, Dir, Result).
 
 load_raft_segments_bounded(Dir, Name, RecordsPerSegment, Paths) ->
@@ -904,8 +909,19 @@ load_raft_segments_bounded(Dir, Name, RecordsPerSegment, Paths) ->
                         true -> TrimFloor;
                         false -> undefined
                     end,
-                case scan_raft_segment_paths(Paths, undefined, RecordsPerSegment, undefined, 0, TailLimit, {queue:new(), 0}, 0) of
-                    {ok, ScanFirst, ScanLast, ScanCount, TailLocations0, ScanPayloadBytes} ->
+                FirstOrdinal = TrimFloor div RecordsPerSegment,
+                LivePaths = lists:dropwhile(
+                    fun({Ordinal, _Path}) -> Ordinal < FirstOrdinal end,
+                    Paths
+                ),
+                start_offset_index_build(Dir, TrimFloor),
+                Scan = scan_raft_segment_paths(LivePaths, undefined, RecordsPerSegment, undefined, 0, TailLimit, {queue:new(), 0}, 0),
+                IndexResult = case Scan of
+                    {ok, _, _, _, _, _} -> finish_offset_index_build();
+                    {error, _} -> discard_offset_index_build()
+                end,
+                case {Scan, IndexResult} of
+                    {{ok, ScanFirst, ScanLast, ScanCount, TailLocations0, ScanPayloadBytes}, ok} ->
                         TailFirst0 = load_tail_first_index(ScanLast, Limits),
                         TailFirst = max_defined(TailFirst0, LoadFloor),
                         DiskFirst = max_defined(ScanFirst, LoadFloor),
@@ -916,12 +932,13 @@ load_raft_segments_bounded(Dir, Name, RecordsPerSegment, Paths) ->
                             ok ->
                                 maybe_cache_latest_config_after_bounded_load(Dir, ScanLast),
                                 ok;
-                            {error, _Reason} = Error ->
-                                Error
+                            {error, _} = TailError ->
+                                TailError
                         end;
-                    {error, _Reason} = Error ->
+                    {{error, _} = ScanError, _} ->
                         begin_load_context(Name, Dir, StartedAt, undefined, undefined, undefined),
-                        Error
+                        ScanError;
+                    {_, {error, _} = IndexError} -> IndexError
                 end;
             {error, _Reason} = Error ->
                 begin_load_context(Name, Dir, StartedAt, undefined, undefined, undefined),
@@ -988,9 +1005,12 @@ finish_load_context(Name, Dir, Result) ->
 maybe_validate_load_unique_index(Dir, Index) ->
     case erlang:get(?LOAD_CONTEXT) of
         #{dir := Dir} ->
-            case lookup_offset(Dir, Index) of
-                {ok, _Location} -> {error, {duplicate_record_index, Index}};
-                not_found -> ok;
+            %% A persisted sidecar describes records already on disk. During a
+            %% bounded reopen it must not be mistaken for a duplicate found in
+            %% this scan. The scan itself validates index order and CRCs.
+            case lookup_offset_registry({offset_dir_key(Dir), Index}) of
+                {ok, [_Row]} -> {error, {duplicate_record_index, Index}};
+                {ok, []} -> ok;
                 {error, _Reason} = Error -> Error
             end;
         _Other ->

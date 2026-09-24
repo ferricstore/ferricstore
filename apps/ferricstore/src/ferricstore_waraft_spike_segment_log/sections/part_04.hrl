@@ -1,5 +1,11 @@
 %% Included by ferricstore_waraft_spike_segment_log.erl; generated split section 4.
 
+segment_scan_modes() ->
+    case 'Elixir.Ferricstore.Application':'starting?'() of
+        true -> [read, raw, binary, {read_ahead, ?STARTUP_READ_AHEAD_BYTES}];
+        false -> [read, raw, binary]
+    end.
+
 read_disk_record_at(Dir, Index, Offset, EncodedSize, RecordsPerSegment) ->
     Ordinal = segment_ordinal(Index, RecordsPerSegment),
     Path = filename:join(Dir, segment_file_from_ordinal(Ordinal)),
@@ -197,7 +203,7 @@ scan_segment_paths([{Ordinal, Path} | Rest], PreviousIndex, RecordsPerSegment, F
 scan_segment(Ordinal, Path, PreviousIndex, RecordsPerSegment, FirstIndex, LastIndex, Count) ->
     case file:read_link_info(Path) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
-            case open_verified_segment_file(Path, [read, raw, binary]) of
+            case open_verified_segment_file(Path, segment_scan_modes()) of
                 {ok, Fd} ->
                     Result =
                         try scan_segment_fd(Fd, Path, PreviousIndex, 0, FileBytes, Ordinal, RecordsPerSegment, FirstIndex, LastIndex, Count) of
@@ -275,18 +281,15 @@ scan_segment_payload(Fd, Path, PreviousIndex, Offset, FileBytes, Ordinal, Record
                         ok ->
                             case recovered_index_allowed(Path, PreviousIndex, Index) of
                                 ok ->
-                                    scan_segment_fd(
-                                        Fd,
-                                        Path,
-                                        Index,
-                                        Offset + ?RECORD_HEADER_SIZE + Len,
-                                        FileBytes,
-                                        Ordinal,
-                                        RecordsPerSegment,
-                                        choose_first(FirstIndex, Index),
-                                        Index,
-                                        Count + 1
-                                    );
+                                    case index_scanned_offset(Path, Index, Ordinal, Offset, ?RECORD_HEADER_SIZE + Len) of
+                                        ok ->
+                                            scan_segment_fd(
+                                                Fd, Path, Index, Offset + ?RECORD_HEADER_SIZE + Len,
+                                                FileBytes, Ordinal, RecordsPerSegment,
+                                                choose_first(FirstIndex, Index), Index, Count + 1
+                                            );
+                                        {error, _Reason} = Error -> Error
+                                    end;
                                 {error, _Reason} = Error ->
                                     Error
                             end;
@@ -318,7 +321,7 @@ scan_raft_segment_paths([{Ordinal, Path} | Rest], PreviousIndex, RecordsPerSegme
 scan_raft_segment(Ordinal, Path, PreviousIndex, RecordsPerSegment, FirstIndex, Count, TailLimit, TailQueue, ScanPayloadBytes) ->
     case file:read_link_info(Path) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
-            case open_verified_segment_file(Path, [read, raw, binary]) of
+            case open_verified_segment_file(Path, segment_scan_modes()) of
                 {ok, Fd} ->
                     Result =
                         try scan_raft_segment_fd(
@@ -472,21 +475,17 @@ scan_raft_segment_known_index(Fd, Path, PreviousIndex, Index, Offset, FileBytes,
         ok ->
             case recovered_index_allowed(Path, PreviousIndex, Index) of
                 ok ->
-                    Location = {Index, Ordinal, Path, Offset, ?RECORD_HEADER_SIZE + Len},
-                    scan_raft_segment_fd(
-                        Fd,
-                        Path,
-                        Index,
-                        Offset + ?RECORD_HEADER_SIZE + Len,
-                        FileBytes,
-                        Ordinal,
-                        RecordsPerSegment,
-                        choose_first(FirstIndex, Index),
-                        Count + 1,
-                        TailLimit,
-                        append_tail_location(TailQueue, TailLimit, Location),
-                        ScanPayloadBytes
-                    );
+                    case index_scanned_offset(Path, Index, Ordinal, Offset, ?RECORD_HEADER_SIZE + Len) of
+                        ok ->
+                            Location = {Index, Ordinal, Path, Offset, ?RECORD_HEADER_SIZE + Len},
+                            scan_raft_segment_fd(
+                                Fd, Path, Index, Offset + ?RECORD_HEADER_SIZE + Len, FileBytes,
+                                Ordinal, RecordsPerSegment, choose_first(FirstIndex, Index),
+                                Count + 1, TailLimit,
+                                append_tail_location(TailQueue, TailLimit, Location), ScanPayloadBytes
+                            );
+                        {error, _Reason} = Error -> Error
+                    end;
                 {error, _Reason} = Error ->
                     Error
             end;
@@ -555,7 +554,7 @@ maybe_update_latest_config_from_payload(Dir, Index, Payload) ->
 load_segment(Ordinal, Path, Name, PreviousIndex, RecordsPerSegment) ->
     case file:read_link_info(Path) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
-            case open_verified_segment_file(Path, [read, raw, binary]) of
+            case open_verified_segment_file(Path, segment_scan_modes()) of
                 {ok, Fd} ->
                     try load_segment_fd(Fd, Path, Name, PreviousIndex, 0, FileBytes, Ordinal, RecordsPerSegment) of
                         {ok, LastIndex, ValidBytes} ->
@@ -702,6 +701,7 @@ load_segment_decoded_payload(Fd, Path, Name, ParsedIndex, Offset, FileBytes, Ord
         {ok, Decoded} ->
             case Decoded of
         {ParsedIndex, {_Term, _Op} = Entry} ->
+            erlang:put(?FOLD_LOCATION, {Ordinal, Offset, ?RECORD_HEADER_SIZE + Len}),
             case insert_recovered_record(Path, Name, {ParsedIndex, Entry}, ParsedIndex - 1) of
                 {ok, LastIndex} ->
                     update_latest_config_from_record(Dir, {ParsedIndex, Entry}),
@@ -767,6 +767,16 @@ maybe_store_recovered_record(Path, Name, Record) ->
 
 maybe_fold_recovered_record({Index, Entry}) ->
     case erlang:get(?FOLD_CONTEXT) of
+        #{floor := Floor, disk_records := DiskRecords} = FoldContext when Index < Floor ->
+            erlang:put(?FOLD_CONTEXT, FoldContext#{disk_records := DiskRecords + 1}),
+            folded;
+        #{callback := Fun, acc := Acc, disk_records := DiskRecords} = FoldContext when is_function(Fun, 4) ->
+            {Ordinal, Offset, EncodedSize} = erlang:get(?FOLD_LOCATION),
+            erlang:put(
+                ?FOLD_CONTEXT,
+                FoldContext#{acc := Fun(Index, Entry, {Ordinal, Offset, EncodedSize}, Acc), disk_records := DiskRecords + 1}
+            ),
+            folded;
         #{callback := Fun, acc := Acc, disk_records := DiskRecords} = FoldContext ->
             erlang:put(
                 ?FOLD_CONTEXT,

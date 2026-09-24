@@ -853,7 +853,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
         end
 
       :not_found ->
-        {:ok, %{}}
+        {:error, :projection_entry_missing_at_recorded_location}
 
       {:error, reason} ->
         {:error, reason}
@@ -1369,7 +1369,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
         end
 
       :not_found ->
-        :not_found
+        {:error, :projection_entry_missing_at_recorded_location}
 
       {:error, reason} ->
         {:error, reason}
