@@ -38,7 +38,10 @@ defmodule Ferricstore.Flow.HistoryProjector.Log do
     reduce_metadata_pages(file_path, 0, initial, reducer)
   end
 
-  defp reduce_metadata_pages(file_path, offset, acc, reducer) do
+  @doc false
+  def reduce_metadata_pages(file_path, offset, acc, reducer)
+      when is_binary(file_path) and is_integer(offset) and offset >= 0 and
+             is_function(reducer, 2) do
     case NIF.v2_scan_file_page(file_path, offset, @scan_page_records) do
       {:ok, records, next_offset, done}
       when is_list(records) and is_integer(next_offset) and next_offset >= offset and

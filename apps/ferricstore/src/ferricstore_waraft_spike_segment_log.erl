@@ -20,6 +20,8 @@
     term/2,
     config/1,
     fold_disk/3,
+    fold_disk_after/4,
+    fold_disk_with_locations/3,
     location_for_index/2,
     read_disk/2,
     read_disk_at/4,
@@ -61,6 +63,7 @@
 -define(SEGMENT_CONFIG_FILE, "segment_config.term").
 -define(TRIM_FLOOR_FILE, "trim_floor.term").
 -define(RECORD_HEADER_SIZE, 8).
+-define(STARTUP_READ_AHEAD_BYTES, 1048576).
 -define(MAX_RECORD_BYTES, 1073741824).
 -define(MAX_DISK_READER_BATCH_RECORDS, 4096).
 -define(MAX_DISK_READER_BATCH_BYTES, 1073741824).
@@ -73,9 +76,15 @@
 -define(DEFAULT_PREALLOCATE_BYTES, 0).
 -define(WRITER_REGISTRY, ferricstore_waraft_segment_writer_registry).
 -define(OFFSET_REGISTRY, ferricstore_waraft_segment_offset_registry).
+-define(OFFSET_INDEX_MAGIC, 16#F00D2026).
+-define(OFFSET_INDEX_RECORD_SIZE, 28).
+-define(OFFSET_INDEX_BUILD, ferricstore_waraft_segment_offset_index_build).
+-define(OFFSET_INDEX_READERS, ferricstore_waraft_segment_offset_index_readers).
+-define(OFFSET_INDEX_GENERATIONS, ferricstore_waraft_segment_offset_index_generations).
 -define(MEMORY_REGISTRY, ferricstore_waraft_segment_log_memory_registry).
 -define(LOAD_CONTEXT, ferricstore_waraft_segment_log_load_context).
 -define(FOLD_CONTEXT, ferricstore_waraft_segment_log_fold_context).
+-define(FOLD_LOCATION, ferricstore_waraft_segment_log_fold_location).
 -define(DEFAULT_MAX_ETS_BYTES, 536870912).
 -define(DEFAULT_MAX_ETS_ENTRIES, 65536).
 -define(DEFAULT_MIN_ETS_ENTRIES, 4096).
@@ -87,3 +96,4 @@
 -include("ferricstore_waraft_spike_segment_log/sections/part_04.hrl").
 -include("ferricstore_waraft_spike_segment_log/sections/part_05.hrl").
 -include("ferricstore_waraft_spike_segment_log/sections/part_06.hrl").
+-include("ferricstore_waraft_spike_segment_log/sections/part_07.hrl").

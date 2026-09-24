@@ -38,6 +38,7 @@ defmodule Ferricstore.Flow.Schedule do
   @dispatch_wave_size 16
   @dispatch_concurrency 8
   @default_overlap_retry_ms 1_000
+  @max_overlap_retry_backoff_ms 30_000
   @schedule_event_created "schedule_created"
   @schedule_event_fired "schedule_fired"
   @schedule_event_skipped_overlap "schedule_skipped_overlap"
@@ -363,6 +364,50 @@ defmodule Ferricstore.Flow.Schedule do
 
   @doc false
   def flow_id(id), do: "__ferricstore_schedule__:" <> id
+
+  @doc false
+  def wake_queued(ctx, id, target_id, now_ms)
+      when is_binary(id) and is_binary(target_id) and is_integer(now_ms) and now_ms >= 0 do
+    with {:ok, %{state: @active_state, payload: definition} = record} <-
+           Flow.get(
+             ctx,
+             flow_id(id),
+             Internal.put(
+               partition_key: partition_key(id),
+               payload: true,
+               payload_max_bytes: schedule_hydration_max_bytes()
+             )
+           ),
+         true <- is_map(definition),
+         ^target_id <- Map.get(definition, :last_target_id),
+         queued_due_at_ms when is_integer(queued_due_at_ms) <-
+           Map.get(definition, :overlap_queued_due_at_ms),
+         {:ok, target_state} <-
+           Router.flow_consistent_state(
+             ctx,
+             target_id,
+             target_partition_key(target_id, Map.fetch!(definition, :target))
+           ),
+         true <- Ferricstore.Flow.LMDB.terminal_state?(target_state) do
+      case Map.get(definition, :next_run_at_ms) do
+        next_run_at_ms when is_integer(next_run_at_ms) and next_run_at_ms > now_ms ->
+          definition = Map.put(definition, :next_run_at_ms, now_ms)
+
+          case replace_with_state(ctx, record, definition, @active_state, now_ms, now_ms) do
+            {:ok, _schedule} -> :woken
+            {:error, _reason} = error -> error
+          end
+
+        _already_due ->
+          :ignored
+      end
+    else
+      {:error, _reason} = error -> error
+      _not_queued_or_target_active -> :ignored
+    end
+  rescue
+    _error -> {:error, :invalid_queued_schedule}
+  end
 
   defp fire_one(
          ctx,
@@ -847,12 +892,13 @@ defmodule Ferricstore.Flow.Schedule do
   end
 
   defp queue_schedule_fire(ctx, record, definition, due_at_ms, reason, now_ms) do
-    retry_ms = Map.get(definition, :overlap_retry_ms, @default_overlap_retry_ms)
+    {retry_ms, streak} = overlap_retry_delay(definition, due_at_ms)
 
     case safe_schedule_add(now_ms, retry_ms, :next_run_at_ms) do
       {:ok, next_run_at_ms} ->
         next_definition =
           queued_definition(definition, due_at_ms, next_run_at_ms, reason, now_ms)
+          |> Map.put(:overlap_retry_streak, streak)
 
         reschedule_definition(ctx, record, next_definition, next_run_at_ms, now_ms)
 
@@ -861,6 +907,24 @@ defmodule Ferricstore.Flow.Schedule do
         |> terminal_queued_definition(due_at_ms, reason, now_ms)
         |> then(&complete_skipped_schedule(ctx, record, &1, "timestamp_limit", now_ms))
     end
+  end
+
+  defp overlap_retry_delay(definition, due_at_ms) do
+    base_ms = Map.get(definition, :overlap_retry_ms, @default_overlap_retry_ms)
+
+    previous_streak = Map.get(definition, :overlap_retry_streak, 1)
+
+    streak =
+      if Map.get(definition, :overlap_queued_due_at_ms) == due_at_ms and
+           Map.get(definition, :last_overlap_target_id) == Map.get(definition, :last_target_id) and
+           is_integer(previous_streak) and previous_streak > 0 do
+        min(previous_streak + 1, 16)
+      else
+        1
+      end
+
+    cap_ms = max(base_ms, @max_overlap_retry_backoff_ms)
+    {min(base_ms * Integer.pow(2, streak - 1), cap_ms), streak}
   end
 
   defp fail_schedule_overlap(ctx, record, definition, reason, now_ms) do
@@ -1216,6 +1280,7 @@ defmodule Ferricstore.Flow.Schedule do
     |> Map.delete(:last_overlap_at_ms)
     |> Map.delete(:last_overlap_target_id)
     |> Map.delete(:last_overlap_reason)
+    |> Map.delete(:overlap_retry_streak)
     |> Map.delete(:end_reason)
   end
 
@@ -1227,6 +1292,7 @@ defmodule Ferricstore.Flow.Schedule do
     |> Map.put(:end_reason, reason)
     |> Map.delete(:next_run_at_ms)
     |> Map.delete(:overlap_queued_due_at_ms)
+    |> Map.delete(:overlap_retry_streak)
   end
 
   defp skipped_definition(definition, due_at_ms, next_run_at_ms, reason, now_ms) do
@@ -1238,6 +1304,7 @@ defmodule Ferricstore.Flow.Schedule do
     |> Map.put(:last_overlap_reason, reason)
     |> Map.put(:next_run_at_ms, next_run_at_ms)
     |> Map.delete(:overlap_queued_due_at_ms)
+    |> Map.delete(:overlap_retry_streak)
   end
 
   defp queued_definition(definition, due_at_ms, next_run_at_ms, reason, now_ms) do
@@ -1255,6 +1322,7 @@ defmodule Ferricstore.Flow.Schedule do
     |> Map.put(:end_reason, "timestamp_limit")
     |> Map.delete(:next_run_at_ms)
     |> Map.delete(:overlap_queued_due_at_ms)
+    |> Map.delete(:overlap_retry_streak)
   end
 
   defp completed_skipped_definition(definition, reason) do
@@ -1271,6 +1339,7 @@ defmodule Ferricstore.Flow.Schedule do
     |> Map.put(:last_overlap_reason, reason)
     |> Map.delete(:next_run_at_ms)
     |> Map.delete(:overlap_queued_due_at_ms)
+    |> Map.delete(:overlap_retry_streak)
   end
 
   defp recurring_end_reason(definition, next_run_at_ms, fire_count) do

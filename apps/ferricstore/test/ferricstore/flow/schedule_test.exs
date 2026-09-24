@@ -2324,6 +2324,139 @@ defmodule Ferricstore.Flow.ScheduleTest do
     assert second_target.type == target_type
   end
 
+  test "repeated unchanged overlap backs off while preserving the queued occurrence" do
+    due_at_ms = 4_500
+    schedule_id = unique_flow_id("schedule-overlap-backoff")
+    target_prefix = unique_flow_id("schedule-overlap-backoff-target")
+
+    assert {:ok, _schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :interval,
+               every_ms: 100,
+               start_at_ms: due_at_ms,
+               now_ms: due_at_ms,
+               overlap_policy: :queue_after_previous,
+               overlap_retry_ms: 50,
+               target: [id_prefix: target_prefix, type: unique_flow_id("schedule-overlap-type")]
+             )
+
+    assert {:ok, %{fired: 1}} =
+             FerricStore.flow_schedule_fire_due(now_ms: due_at_ms, worker: "schedule-test")
+
+    for {retry_at, next_retry_at} <- [
+          {due_at_ms + 100, due_at_ms + 150},
+          {due_at_ms + 150, due_at_ms + 250},
+          {due_at_ms + 250, due_at_ms + 450}
+        ] do
+      assert {:ok, %{skipped: 1, fired: 0}} =
+               FerricStore.flow_schedule_fire_due(now_ms: retry_at, worker: "schedule-test")
+
+      assert {:ok, schedule} = FerricStore.flow_schedule_get(schedule_id)
+      assert schedule.next_run_at_ms == next_retry_at
+      assert schedule.overlap_queued_due_at_ms == due_at_ms + 100
+      assert schedule.fire_count == 1
+    end
+
+    for _ <- 1..10 do
+      assert {:ok, schedule} = FerricStore.flow_schedule_get(schedule_id)
+
+      assert {:ok, %{skipped: 1, fired: 0}} =
+               FerricStore.flow_schedule_fire_due(
+                 now_ms: schedule.next_run_at_ms,
+                 worker: "schedule-test"
+               )
+    end
+
+    assert {:ok, schedule} = FerricStore.flow_schedule_get(schedule_id)
+    assert schedule.next_run_at_ms - schedule.last_overlap_at_ms == 30_000
+    assert schedule.overlap_queued_due_at_ms == due_at_ms + 100
+    assert schedule.fire_count == 1
+  end
+
+  test "target completion wakes a backed-off queued schedule without changing its occurrence" do
+    ctx = FerricStore.Instance.get(:default)
+    due_at_ms = 4_800
+    schedule_id = unique_flow_id("schedule-overlap-wake")
+    target_prefix = unique_flow_id("schedule-overlap-wake-target")
+    target_type = unique_flow_id("schedule-overlap-wake-type")
+
+    assert {:ok, _schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :interval,
+               every_ms: 100,
+               start_at_ms: due_at_ms,
+               now_ms: due_at_ms,
+               overlap_policy: :queue_after_previous,
+               overlap_retry_ms: 50,
+               target: [id_prefix: target_prefix, type: target_type]
+             )
+
+    assert {:ok, %{fired: 1}} =
+             FerricStore.flow_schedule_fire_due(now_ms: due_at_ms, worker: "schedule-test")
+
+    for retry_at <- [due_at_ms + 100, due_at_ms + 150] do
+      assert {:ok, %{skipped: 1}} =
+               FerricStore.flow_schedule_fire_due(now_ms: retry_at, worker: "schedule-test")
+    end
+
+    target_id = "#{target_prefix}:#{due_at_ms}:1"
+    assert {:ok, waiting} = FerricStore.flow_schedule_get(schedule_id)
+    assert waiting.next_run_at_ms == due_at_ms + 250
+
+    assert :ignored =
+             Ferricstore.Flow.Schedule.wake_queued(
+               ctx,
+               schedule_id,
+               target_id,
+               due_at_ms + 175
+             )
+
+    assert {:ok, %{next_run_at_ms: next_retry}} = FerricStore.flow_schedule_get(schedule_id)
+    assert next_retry == due_at_ms + 250
+
+    assert {:ok, [job]} =
+             FerricStore.flow_claim_due(target_type,
+               worker: "schedule-overlap-worker",
+               limit: 1,
+               now_ms: due_at_ms + 175
+             )
+
+    assert job.id == target_id
+
+    assert :ok =
+             FerricStore.flow_complete(job.id, job.lease_token,
+               fencing_token: job.fencing_token,
+               now_ms: due_at_ms + 175
+             )
+
+    assert :woken =
+             Ferricstore.Flow.Schedule.wake_queued(
+               ctx,
+               schedule_id,
+               target_id,
+               due_at_ms + 175
+             )
+
+    assert {:ok, woken} = FerricStore.flow_schedule_get(schedule_id)
+    assert woken.next_run_at_ms == due_at_ms + 175
+    assert woken.overlap_queued_due_at_ms == due_at_ms + 100
+
+    assert :ignored =
+             Ferricstore.Flow.Schedule.wake_queued(
+               ctx,
+               schedule_id,
+               target_id,
+               due_at_ms + 175
+             )
+
+    assert {:ok, %{fired: 1}} =
+             FerricStore.flow_schedule_fire_due(now_ms: due_at_ms + 175, worker: "schedule-test")
+
+    assert {:ok, fired} = FerricStore.flow_schedule_get(schedule_id)
+    assert fired.fire_count == 2
+    assert fired.overlap_queued_due_at_ms == nil
+  end
+
   test "queued overlap terminates cleanly when its retry timestamp would overflow" do
     max_exact_integer = 9_007_199_254_740_991
     due_at_ms = max_exact_integer - 3

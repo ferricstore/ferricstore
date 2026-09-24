@@ -290,44 +290,58 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
              ctx,
              shard_index
            ) do
-        CompoundMemberIndex.rebuild(sm_state.compound_member_index_name, keydir)
+        profile_startup_phase(shard_index, shard_data_path, :rebuild_compound_member_index, fn ->
+          CompoundMemberIndex.rebuild(sm_state.compound_member_index_name, keydir)
+        end)
 
-        rebuild_logical_key_index!(
-          sm_state.logical_key_index_name,
-          sm_state.logical_key_slots_name,
-          keydir,
-          shard_index,
-          shard_data_path
-        )
-
-        rebuild_namespace_usage_index!(
-          sm_state.namespace_usage_index_name,
-          sm_state.namespace_usage_expiry_name,
-          keydir,
-          ctx
-        )
-
-        ShardLifecycle.validate_prob_files(shard_data_path, shard_index, keydir)
-
-        :ok =
-          Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
-            shard_data_path,
+        profile_startup_phase(shard_index, shard_data_path, :rebuild_logical_key_index, fn ->
+          rebuild_logical_key_index!(
+            sm_state.logical_key_index_name,
+            sm_state.logical_key_slots_name,
             keydir,
             shard_index,
-            ctx,
-            sm_state.zset_score_index_name,
-            sm_state.zset_score_lookup_name,
-            sm_state.flow_index_name,
-            sm_state.flow_lookup_name,
-            force_full_reconcile?: true,
-            reason: :segment_replay,
-            active_file_id: sm_state.active_file_id,
-            active_file_path: sm_state.active_file_path
+            shard_data_path
           )
+        end)
+
+        profile_startup_phase(shard_index, shard_data_path, :rebuild_namespace_usage_index, fn ->
+          rebuild_namespace_usage_index!(
+            sm_state.namespace_usage_index_name,
+            sm_state.namespace_usage_expiry_name,
+            keydir,
+            ctx
+          )
+        end)
+
+        profile_startup_phase(shard_index, shard_data_path, :validate_prob_files, fn ->
+          ShardLifecycle.validate_prob_files(shard_data_path, shard_index, keydir)
+        end)
+
+        :ok =
+          profile_startup_phase(shard_index, shard_data_path, :reconcile_flow_lmdb, fn ->
+            Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
+              shard_data_path,
+              keydir,
+              shard_index,
+              ctx,
+              sm_state.zset_score_index_name,
+              sm_state.zset_score_lookup_name,
+              sm_state.flow_index_name,
+              sm_state.flow_lookup_name,
+              force_full_reconcile?: true,
+              reason: :segment_replay,
+              active_file_id: sm_state.active_file_id,
+              active_file_path: sm_state.active_file_path
+            )
+          end)
 
         sm_state
         |> Map.put(:active_file_size, recovery_file_size(sm_state.active_file_path))
-        |> StateMachine.__flow_due_catalog_from_native_for_recovery__()
+        |> then(fn state ->
+          profile_startup_phase(shard_index, shard_data_path, :rebuild_due_catalog, fn ->
+            StateMachine.__flow_due_catalog_from_native_for_recovery__(state)
+          end)
+        end)
       end
 
       defp rebuild_logical_key_index!(ordered, slots, keydir, shard_index, shard_data_path) do
@@ -367,7 +381,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         case read_segment_projection_log(projection_root) do
           {:ok, projection} ->
             with {:ok, entries} <- validate_segment_projection_entries(projection) do
-              {:ok, replace_with_segment_projection(sm_state, projection_root, entries),
+              {:ok, replace_with_segment_projection(sm_state, projection.locations, entries),
                position_index(projection.position),
                max_raft_position(metadata_position, projection.position)}
             end
@@ -380,10 +394,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         end
       end
 
-      defp replace_with_segment_projection(sm_state, projection_source, entries) do
+      defp replace_with_segment_projection(sm_state, locations, entries) do
         sm_state
         |> reset_segment_projection_base()
-        |> apply_segment_projection_entries(projection_source, entries)
+        |> apply_segment_projection_entries({:disk_locations, locations}, entries)
         |> recover_promoted_instances()
       end
 
@@ -502,11 +516,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
             error: nil
           }
 
-          case :ferricstore_waraft_spike_segment_log.fold_disk(
-                 root_dir,
-                 &recover_segment_projected_keydir_record/3,
-                 initial
-               ) do
+          case fold_segment_recovery_tail(root_dir, replay_after_index, initial) do
             {:ok, %{error: nil} = acc} ->
               case validate_recovered_target_position(acc, target_position) do
                 :ok ->
@@ -523,6 +533,24 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
               error
           end
         end
+      end
+
+      defp fold_segment_recovery_tail(root_dir, replay_after_index, initial)
+           when is_integer(replay_after_index) and replay_after_index > 0 do
+        :ferricstore_waraft_spike_segment_log.fold_disk_after(
+          root_dir,
+          replay_after_index,
+          &recover_segment_projected_keydir_record/3,
+          initial
+        )
+      end
+
+      defp fold_segment_recovery_tail(root_dir, _replay_after_index, initial) do
+        :ferricstore_waraft_spike_segment_log.fold_disk(
+          root_dir,
+          &recover_segment_projected_keydir_record/3,
+          initial
+        )
       end
 
       defp recovery_target_index({:latest, _base_position}), do: :infinity

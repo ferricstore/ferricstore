@@ -569,7 +569,7 @@ defmodule Ferricstore.Bench.QueryPerformanceBenchmarkGuardTest do
           "diagnostic authoritative raw batch read",
           "production authoritative vector batch read",
           "production physical locator batch read",
-          "candidate registry + retained-fd vector read",
+          "candidate disk-backed offset + retained-fd vector read",
           "candidate retained-fd authoritative batch read",
           "candidate coalesced-adjacent authoritative batch read",
           "diagnostic locator SHA-256 validation",
@@ -593,12 +593,14 @@ defmodule Ferricstore.Bench.QueryPerformanceBenchmarkGuardTest do
           "retained_segment_reader_loop",
           ":file.pread(fd, locations)",
           ":file.pread(fd, offset, bytes)",
-          ":ferricstore_waraft_segment_offset_registry",
+          "candidate_registry_location!",
           "diagnostic_requests"
         ] do
       assert source =~ contract,
              "missing storage-layout diagnostic contract #{inspect(contract)}"
     end
+
+    refute source =~ ":ets.lookup(\n           :ferricstore_waraft_segment_offset_registry"
   end
 
   test "end-to-end query benchmarks use authoritative log records and compact QueryRows" do

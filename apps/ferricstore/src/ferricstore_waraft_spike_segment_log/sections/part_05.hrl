@@ -37,8 +37,12 @@ register_record_offset(Dir, Index, Ordinal, Offset, EncodedSize) ->
     register_offset_entries([offset_entry(offset_dir_key(Dir), Index, Ordinal, Offset, EncodedSize)]).
 
 maybe_register_record_offset(Dir, _Index, _Ordinal, _Offset, _EncodedSize) ->
-    case erlang:get(?LOAD_CONTEXT) of
-        #{dir := Dir} ->
+    case {erlang:get(?LOAD_CONTEXT), erlang:get(?FOLD_CONTEXT)} of
+        {#{dir := Dir}, _} ->
+            ok;
+        {_, #{callback := _}} ->
+            %% A read-only fold already has verified positions in its stream.
+            %% It must not reindex every historical frame in the hot table.
             ok;
         _Other ->
             register_record_offset(Dir, _Index, _Ordinal, _Offset, _EncodedSize)
@@ -49,12 +53,77 @@ register_offset_entries([]) ->
 register_offset_entries(Entries) ->
     case ensure_offset_registry() of
         ok ->
-            case put_offset_entries(offset_dir_markers(Entries) ++ Entries) of
-                ok -> put_offset_dir_last_entries(offset_dir_last_entries(Entries));
-                {error, _Reason} = Error -> Error
+            CachedEntries = bound_offset_entries(Entries),
+            case write_offset_index_entries(Entries) of
+                ok ->
+                    case put_offset_entries(offset_dir_markers(Entries) ++ CachedEntries) of
+                        ok -> put_offset_dir_last_entries(offset_dir_last_entries(Entries));
+                        {error, _Reason} = Error -> Error
+                    end;
+                {error, _Reason} = Error ->
+                    case erlang:get(?OFFSET_INDEX_BUILD) of
+                        {_Dir, _Buffer, _Count, _Floor} -> Error;
+                        _NormalAppend ->
+                            report_offset_index_failure(Error, Entries),
+                            case put_offset_entries(offset_dir_markers(Entries) ++ CachedEntries) of
+                                ok -> put_offset_dir_last_entries(offset_dir_last_entries(Entries));
+                                {error, _RegistryReason} = RegistryError -> RegistryError
+                            end
+                    end
             end;
         {error, _Reason} = Error ->
             Error
+    end.
+
+offset_registry_max_entries() ->
+    case application:get_env(ferricstore, waraft_segment_log_offset_registry_max_entries, 8192) of
+        Limit when is_integer(Limit), Limit > 0 -> Limit;
+        _Invalid -> 8192
+    end.
+
+bound_offset_entries(Entries) ->
+    Limit = offset_registry_max_entries(),
+    DirLast = offset_dir_last_entries(Entries),
+    Cutoffs =
+        maps:from_list(
+            [
+                begin
+                    PreviousLast =
+                        case lookup_offset_registry({DirKey, last_index}) of
+                            {ok, [{{DirKey, last_index}, last_index, Last, 0}]} -> Last;
+                            _Missing -> -1
+                        end,
+                    Latest = max(PreviousLast, BatchLast),
+                    Cutoff = max(0, Latest - Limit + 1),
+                    evict_offset_window(DirKey, PreviousLast, Cutoff, Limit),
+                    {DirKey, Cutoff}
+                end
+             || {{DirKey, last_index}, last_index, BatchLast, 0} <- DirLast
+            ]
+        ),
+    [
+        Entry
+     || {{DirKey, Index}, _Ordinal, _Offset, _Size} = Entry <- Entries,
+        Index >= maps:get(DirKey, Cutoffs)
+    ].
+
+evict_offset_window(_DirKey, PreviousLast, _Cutoff, _Limit) when PreviousLast < 0 ->
+    ok;
+evict_offset_window(DirKey, PreviousLast, Cutoff, Limit) ->
+    First = max(0, PreviousLast - Limit + 1),
+    Last = min(PreviousLast, Cutoff - 1),
+    case First =< Last of
+        true ->
+            try
+                lists:foreach(
+                    fun(Index) -> ets:delete(?OFFSET_REGISTRY, {DirKey, Index}) end,
+                    lists:seq(First, Last)
+                )
+            catch
+                error:badarg -> ok
+            end;
+        false ->
+            ok
     end.
 
 register_offset_dir_marker(Dir) ->
@@ -134,7 +203,7 @@ lookup_offset(Dir, Index) ->
         {ok, [{{_DirKey, Index}, Ordinal, Offset, EncodedSize}]} ->
             {ok, {Ordinal, Offset, EncodedSize}};
         {ok, []} ->
-            not_found;
+            lookup_offset_index(Dir, Index);
         {error, _Reason} = Error ->
             Error
     end.
@@ -360,47 +429,103 @@ locate_disk_record_offset_payload(
 rebuild_offset_registry(Dir) ->
     case ensure_offset_registry() of
         ok ->
-            clear_offset_registry_for_dir(Dir),
-            Tid = ets:new(?MODULE, [ordered_set]),
-            try
-                case existing_records_per_segment(Dir) of
-                    {ok, RecordsPerSegment} ->
-                        case segment_paths(Dir) of
-                            {ok, Paths} ->
-                                case load_segment_paths(Paths, Tid, undefined, RecordsPerSegment) of
-                                    {ok, _LastIndex} -> ok;
-                                    {error, _Reason} = Error -> Error
-                                end;
-                            {error, enoent} -> ok;
-                            {error, _Reason} = Error -> Error
-                        end;
-                    not_found ->
-                        ok;
-                    {error, _Reason} = Error ->
-                        Error
-                end
-            after
-                ets:delete(Tid)
+            case clear_offset_registry_for_dir(Dir) of
+                ok ->
+                    rebuild_offset_registry_stream(Dir);
+                {error, _Reason} = Error -> Error
             end;
         {error, _Reason} = Error ->
             Error
     end.
 
+rebuild_offset_registry_stream(Dir) ->
+    case {existing_records_per_segment(Dir), segment_paths(Dir)} of
+        {{ok, RecordsPerSegment}, {ok, Paths}} ->
+            Result = case segment_append_kind(Dir) of
+                raft_log -> rebuild_raft_offset_index(Dir, Paths, RecordsPerSegment);
+                _Projection -> rebuild_projection_offset_index(Dir, Paths, RecordsPerSegment)
+            end,
+            case Result of
+                ok ->
+                    %% The first pass seeds the bounded cache and derived index.
+                    %% Retain the original full-decode corruption check without
+                    %% retaining every decoded record in an ETS scratch table.
+                    case fold_disk(Dir, fun(_Index, _Entry, Acc) -> Acc end, ok) of
+                        {ok, ok} -> trust_offset_index_for_dir(Dir);
+                        {error, _Reason} = Error -> Error
+                    end;
+                {error, _Reason} = Error -> Error
+            end;
+        {not_found, _Paths} -> ok;
+        {_, {error, enoent}} -> ok;
+        {{error, _Reason} = Error, _} -> Error;
+        {_, {error, _Reason} = Error} -> Error
+    end.
+
+rebuild_raft_offset_index(Dir, Paths, RecordsPerSegment) ->
+    case logical_trim_floor_result(Dir) of
+        {ok, Floor} ->
+            start_offset_index_build(Dir, Floor),
+            Limit = offset_registry_max_entries(),
+            FirstOrdinal = Floor div RecordsPerSegment,
+            LivePaths = lists:dropwhile(
+                fun({Ordinal, _Path}) -> Ordinal < FirstOrdinal end,
+                Paths
+            ),
+            Scan = scan_raft_segment_paths(LivePaths, undefined, RecordsPerSegment, undefined, 0,
+                                           Limit, {queue:new(), 0}, 0),
+            IndexResult = case Scan of
+                {ok, _, _, _, _, _} -> finish_offset_index_build();
+                _ -> discard_offset_index_build()
+            end,
+            case {Scan, IndexResult} of
+                {{ok, _First, Last, _Count, Tail, _Bytes}, ok} ->
+                    maybe_cache_latest_config_after_bounded_load(Dir, Last),
+                    cache_rebuilt_offsets(Dir, Last, Tail);
+                {{error, _} = Error, _} -> Error;
+                {_, {error, _} = Error} -> Error
+            end;
+        {error, _Reason} = Error -> Error
+    end.
+
+rebuild_projection_offset_index(Dir, Paths, RecordsPerSegment) ->
+    start_offset_index_build(Dir),
+    Scan = scan_segment_paths(Paths, undefined, RecordsPerSegment, undefined, undefined, 0),
+    IndexResult = case Scan of
+        {ok, _, _, _} -> finish_offset_index_build();
+        _ -> discard_offset_index_build()
+    end,
+    case {Scan, IndexResult} of
+        {{ok, _First, Last, _Count}, ok} -> cache_rebuilt_offsets(Dir, Last, []);
+        {{error, _} = Error, _} -> Error;
+        {_, {error, _} = Error} -> Error
+    end.
+
+cache_rebuilt_offsets(Dir, Last, Tail) ->
+    DirKey = offset_dir_key(Dir),
+    Cached = [offset_entry(DirKey, Index, Ordinal, Offset, EncodedSize)
+              || {Index, Ordinal, _Path, Offset, EncodedSize} <- Tail],
+    Marker = offset_dir_marker(DirKey),
+    LastEntry = case Last of
+        N when is_integer(N), N >= 0 -> [{{DirKey, last_index}, last_index, N, 0}];
+        _ -> []
+    end,
+    put_offset_entries([Marker | Cached ++ LastEntry]).
+
 clear_offset_registry_for_dir(Dir) ->
     DirKey = offset_dir_key(Dir),
     try ets:match_delete(?OFFSET_REGISTRY, {{DirKey, '_'}, '_', '_', '_'}) of
-        true -> ok
+        true -> reset_offset_indexes_for_dir(Dir)
     catch
         error:badarg ->
             case ensure_offset_registry() of
                 ok ->
                     try ets:match_delete(?OFFSET_REGISTRY, {{DirKey, '_'}, '_', '_', '_'}) of
-                        true -> ok
+                        true -> reset_offset_indexes_for_dir(Dir)
                     catch
-                        error:badarg -> ok
+                        error:badarg -> {error, offset_registry_unavailable}
                     end;
-                {error, _Reason} ->
-                    ok
+                {error, _Reason} = Error -> Error
             end
     end.
 

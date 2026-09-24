@@ -1003,5 +1003,13 @@ defmodule Ferricstore.Raft.WARaftSegmentReaderSecurityTest do
                {:waraft_projection, projection_index},
                "flow:key"
              )
+
+    assert {:error, :projection_entry_missing_at_recorded_location} =
+             WARaftSegmentReader.read_values_from_location(
+               %{data_dir: data_dir},
+               0,
+               {:waraft_projection, projection_index},
+               ["flow:key"]
+             )
   end
 end

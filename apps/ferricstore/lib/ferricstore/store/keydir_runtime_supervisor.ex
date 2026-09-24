@@ -16,6 +16,7 @@ defmodule Ferricstore.Store.KeydirRuntimeSupervisor do
       name: Keyword.get(opts, :shard_supervisor_name, Ferricstore.Store.ShardSupervisor),
       data_dir: Keyword.get(opts, :data_dir, ctx.data_dir),
       shard_count: Keyword.get(opts, :shard_count, ctx.shard_count),
+      defer_flow_history_recovery: Keyword.get(opts, :defer_flow_history_recovery, false),
       instance_ctx: ctx
     ]
 

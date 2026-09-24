@@ -140,6 +140,62 @@ defmodule Ferricstore.Flow.ScheduleRecoveryTest do
              )
   end
 
+  test "queued overlap keeps its retry deadline and backoff across restart", %{
+    isolated_ctx: isolated
+  } do
+    due_at_ms = 18_000
+    schedule_id = unique_id("schedule-queued-restart")
+
+    assert {:ok, _schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :interval,
+               every_ms: 100,
+               start_at_ms: due_at_ms,
+               now_ms: due_at_ms,
+               overlap_policy: :queue_after_previous,
+               overlap_retry_ms: 50,
+               target: [
+                 id_prefix: unique_id("schedule-queued-restart-target"),
+                 type: unique_id("schedule-queued-restart-type")
+               ]
+             )
+
+    assert {:ok, %{fired: 1}} =
+             FerricStore.flow_schedule_fire_due(now_ms: due_at_ms, worker: "restart-scheduler")
+
+    assert {:ok, %{skipped: 1}} =
+             FerricStore.flow_schedule_fire_due(
+               now_ms: due_at_ms + 100,
+               worker: "restart-scheduler"
+             )
+
+    assert {:ok, %{skipped: 1}} =
+             FerricStore.flow_schedule_fire_due(
+               now_ms: due_at_ms + 150,
+               worker: "restart-scheduler"
+             )
+
+    assert {:ok, %{next_run_at_ms: next_retry, overlap_queued_due_at_ms: queued_due}} =
+             FerricStore.flow_schedule_get(schedule_id)
+
+    assert next_retry == due_at_ms + 250
+    assert queued_due == due_at_ms + 100
+
+    Ferricstore.Application.prep_stop(nil)
+    ShardHelpers.restart_current_data_dir(isolated)
+
+    assert {:ok, %{next_run_at_ms: ^next_retry, overlap_queued_due_at_ms: ^queued_due}} =
+             FerricStore.flow_schedule_get(schedule_id)
+
+    assert {:ok, %{skipped: 1}} =
+             FerricStore.flow_schedule_fire_due(now_ms: next_retry, worker: "restart-scheduler")
+
+    assert {:ok, schedule} = FerricStore.flow_schedule_get(schedule_id)
+    assert schedule.next_run_at_ms == due_at_ms + 450
+    assert schedule.overlap_queued_due_at_ms == queued_due
+    assert schedule.fire_count == 1
+  end
+
   test "claimed schedule is reclaimable after shard leader restart" do
     now_ms = 20_000
     schedule_id = unique_id("schedule-claimed-restart")

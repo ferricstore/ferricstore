@@ -360,25 +360,27 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
 
       defp apply_segment_projection_entries(sm_state, _position, []), do: sm_state
 
-      defp apply_segment_projection_entries(sm_state, projection_root, entries)
-           when is_binary(projection_root) do
+      defp apply_segment_projection_entries(sm_state, {:disk_locations, locations}, entries)
+           when is_list(locations) and length(locations) == length(entries) do
         now = storage_expiry_cutoff_ms()
 
-        entries
+        Enum.zip(entries, locations)
         |> Enum.with_index(1)
-        |> Enum.reduce(sm_state, fn {{key, value, expire_at_ms}, projection_index}, acc ->
-          if live_expire_at?(expire_at_ms, now) do
-            segment_project_recovered_projection_entry(
-              acc,
-              projection_root,
-              projection_index,
-              key,
-              value,
-              expire_at_ms
-            )
-          else
-            acc
-          end
+        |> Enum.reduce(sm_state, fn
+          {{{key, value, expire_at_ms}, {_ordinal, offset, _encoded_size}}, projection_index},
+          acc ->
+            if live_expire_at?(expire_at_ms, now) do
+              segment_project_recovered_projection_entry(
+                acc,
+                projection_index,
+                offset,
+                key,
+                value,
+                expire_at_ms
+              )
+            else
+              acc
+            end
         end)
       end
 
@@ -403,13 +405,12 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
 
       defp segment_project_recovered_projection_entry(
              sm_state,
-             projection_root,
              projection_index,
+             offset,
              key,
              value,
              expire_at_ms
            ) do
-        offset = projection_record_offset(projection_root, projection_index)
         sm_state = segment_project_clear_compound_for_string_put(sm_state, key)
         shard_state = shard_ets_state_from_sm(sm_state)
         threshold = segment_project_hot_cache_threshold(shard_state, key)
@@ -513,17 +514,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
       end
 
       defp segment_record_offset(_sm_state, _position), do: 0
-
-      defp projection_record_offset(projection_root, projection_index)
-           when is_binary(projection_root) and is_integer(projection_index) and
-                  projection_index > 0 do
-        case projection_record_location(projection_root, projection_index) do
-          {:ok, offset} -> offset
-          {:error, _reason} -> 0
-        end
-      end
-
-      defp projection_record_offset(_projection_root, _projection_index), do: 0
 
       defp projection_record_location(projection_root, projection_index)
            when is_binary(projection_root) and is_integer(projection_index) and

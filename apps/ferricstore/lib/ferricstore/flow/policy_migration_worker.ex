@@ -18,6 +18,8 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
   @default_backfill_batch_size 256
   @default_backfill_max_bytes 2 * 1_024 * 1_024
   @max_backfill_bytes 64 * 1_024 * 1_024
+  @projection_retry_min_ms 5_000
+  @projection_retry_max_ms 60_000
 
   @spec name(FerricStore.Instance.t() | atom()) :: atom()
   def name(%{name: instance_name}), do: name(instance_name)
@@ -145,6 +147,9 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
       cleanup_fun: Keyword.get(opts, :cleanup_fun, &PolicyMigration.cleanup_snapshot/3),
       attribute_repair_fun:
         Keyword.get(opts, :attribute_repair_fun, &PolicyAttributeCatalog.repair_next/2),
+      projection_retry_min_ms:
+        positive_opt(opts, :projection_retry_min_ms, @projection_retry_min_ms),
+      projection_retry_by_shard: %{},
       backfill_runs: %{},
       next_shard_index: 0,
       sweep_remaining: Keyword.fetch!(opts, :instance_ctx).shard_count,
@@ -235,7 +240,7 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
         )
     end
 
-    {:noreply, schedule_run(state, 0)}
+    {:noreply, schedule_run(%{state | projection_retry_by_shard: %{}}, 0)}
   end
 
   defp run_now(state) do
@@ -306,7 +311,11 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
   end
 
   defp record_shard_health(state, shard_index, {:ok, _result}) do
-    %{state | health_by_shard: Map.delete(state.health_by_shard, shard_index)}
+    %{
+      state
+      | health_by_shard: Map.delete(state.health_by_shard, shard_index),
+        projection_retry_by_shard: Map.delete(state.projection_retry_by_shard, shard_index)
+    }
   end
 
   defp record_shard_health(state, _shard_index, {:retry, _reason}), do: state
@@ -314,6 +323,12 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
   defp record_shard_health(state, shard_index, {:error, reason}) do
     now_ms = System.system_time(:millisecond)
     previous = Map.get(state.health_by_shard, shard_index, %{})
+
+    if Map.get(previous, :reason) != reason do
+      Logger.warning(
+        "Flow policy migration step failed for shard #{shard_index}: #{inspect(reason)}"
+      )
+    end
 
     issue = %{
       shard: shard_index,
@@ -324,7 +339,33 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
       last_seen_at_ms: now_ms
     }
 
-    %{state | health_by_shard: Map.put(state.health_by_shard, shard_index, issue)}
+    projection_retry_by_shard =
+      if reason == :policy_catalog_state_projection_pending do
+        attempts =
+          if Map.get(previous, :reason) == reason,
+            do: Map.get(previous, :occurrences, 0),
+            else: 0
+
+        delay_ms =
+          min(
+            state.projection_retry_min_ms * Integer.pow(2, min(attempts, 6)),
+            @projection_retry_max_ms
+          )
+
+        Map.put(
+          state.projection_retry_by_shard,
+          shard_index,
+          System.monotonic_time(:millisecond) + delay_ms
+        )
+      else
+        Map.delete(state.projection_retry_by_shard, shard_index)
+      end
+
+    %{
+      state
+      | health_by_shard: Map.put(state.health_by_shard, shard_index, issue),
+        projection_retry_by_shard: projection_retry_by_shard
+    }
   end
 
   defp record_shard_health(state, shard_index, result) do
@@ -406,23 +447,24 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
   defp shard_result_more_work?({:retry, _reason}, _shard_index, more_work?),
     do: more_work?
 
-  defp shard_result_more_work?({:error, reason}, shard_index, more_work?) do
-    Logger.warning(
-      "Flow policy migration step failed for shard #{shard_index}: #{inspect(reason)}"
-    )
-
-    more_work?
-  end
-
-  defp shard_result_more_work?(other, shard_index, more_work?) do
-    Logger.warning(
-      "Flow policy migration step returned an invalid result for shard #{shard_index}: #{inspect(other)}"
-    )
-
-    more_work?
-  end
+  defp shard_result_more_work?({:error, _reason}, _shard_index, more_work?), do: more_work?
+  defp shard_result_more_work?(_other, _shard_index, more_work?), do: more_work?
 
   defp run_shard(state, shard_index) do
+    case Map.get(state.projection_retry_by_shard, shard_index) do
+      next_retry_at_ms when is_integer(next_retry_at_ms) ->
+        if System.monotonic_time(:millisecond) < next_retry_at_ms do
+          {state, {:retry, :policy_catalog_state_projection_pending}}
+        else
+          run_shard_without_projection_cooldown(state, shard_index)
+        end
+
+      nil ->
+        run_shard_without_projection_cooldown(state, shard_index)
+    end
+  end
+
+  defp run_shard_without_projection_cooldown(state, shard_index) do
     cond do
       not backend_ready?(state.instance_ctx, shard_index) ->
         {state, {:retry, :backend_not_ready}}

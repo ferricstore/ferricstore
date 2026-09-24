@@ -13,6 +13,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
   alias Ferricstore.Flow.HistoryProjector.Trim
   alias Ferricstore.Flow.HistoryProjector.ValueProjection
   alias Ferricstore.Flow.HistoryProjectedIndex
+  alias Ferricstore.Flow.HistoryRecoveryCheckpoint
   alias Ferricstore.Store.{DiskPressure, WriteVersion}
 
   @retry_interval_ms 50
@@ -50,22 +51,30 @@ defmodule Ferricstore.Flow.HistoryProjector do
         projected = HistoryProjectedIndex.read(shard_data_path)
         publish_projected_index(instance_ctx, shard_index, shard_data_path, projected)
 
-        if Recovery.skip_history_log_recover?(shard_data_path, projected) do
-          :ok
-        else
-          case Recovery.recover_history_log(
-                 instance_ctx,
-                 shard_index,
-                 shard_data_path,
-                 keydir_override
-               ) do
-            :ok ->
-              :ok
+        keydir = keydir_override || keydir(instance_ctx, shard_index)
 
-            {:error, reason} = error ->
-              emit_recover_error(instance_ctx, shard_index, reason)
-              error
-          end
+        case HistoryRecoveryCheckpoint.recovery_offset(shard_data_path, keydir, projected) do
+          {:ok, offset} ->
+            :telemetry.execute(
+              [:ferricstore, :flow, :history_recovery_checkpoint],
+              %{prefix_bytes: offset},
+              %{shard_index: shard_index, status: :reused}
+            )
+
+            recover_history_log(instance_ctx, shard_index, shard_data_path, keydir, offset)
+
+          :full_scan ->
+            recover_full_history_log(
+              instance_ctx,
+              shard_index,
+              shard_data_path,
+              keydir,
+              projected
+            )
+
+          {:error, reason} = error ->
+            emit_recover_error(instance_ctx, shard_index, reason)
+            error
         end
 
       {:error, reason} = error ->
@@ -82,6 +91,45 @@ defmodule Ferricstore.Flow.HistoryProjector do
       reason = {:history_projector_recover_failed, error}
       emit_recover_error(instance_ctx, shard_index, reason)
       {:error, reason}
+  end
+
+  defp recover_full_history_log(instance_ctx, shard_index, shard_data_path, keydir, projected) do
+    if Recovery.skip_history_log_recover?(shard_data_path, projected) do
+      :ok
+    else
+      with :ok <- recover_history_log(instance_ctx, shard_index, shard_data_path, keydir, 0) do
+        case HistoryRecoveryCheckpoint.publish(shard_data_path, keydir) do
+          :ok ->
+            :ok
+
+          {:error, {kind, reason}}
+          when kind in [:checkpoint_write_failed, :checkpoint_validation_failed] ->
+            Logger.warning("Flow history recovery checkpoint unavailable: #{inspect(reason)}")
+            :ok
+
+          {:error, reason} ->
+            emit_recover_error(instance_ctx, shard_index, reason)
+            {:error, reason}
+        end
+      end
+    end
+  end
+
+  defp recover_history_log(instance_ctx, shard_index, shard_data_path, keydir, start_offset) do
+    case Recovery.recover_history_log(
+           instance_ctx,
+           shard_index,
+           shard_data_path,
+           keydir,
+           start_offset
+         ) do
+      :ok ->
+        :ok
+
+      {:error, reason} = error ->
+        emit_recover_error(instance_ctx, shard_index, reason)
+        error
+    end
   end
 
   @spec name(map() | nil, non_neg_integer()) :: atom()

@@ -238,7 +238,36 @@ restore_latest_config_cache(Dir, {not_found, Watermark}, Last)
 restore_latest_config_cache(_Dir, _Previous, _Last) ->
     not_restored.
 
-fold_disk(RootDir, Fun, Acc) when is_function(Fun, 3) ->
+fold_disk_with_locations(RootDir, Fun, Acc) when is_function(Fun, 4) ->
+    fold_disk(RootDir, Fun, Acc).
+
+fold_disk(RootDir, Fun, Acc) when is_function(Fun, 3); is_function(Fun, 4) ->
+    fold_disk_from_index(RootDir, 0, Fun, Acc).
+
+%% The caller has validated a durable projection through AfterIndex. Keep
+%% checking every record in the tail (including the first partial segment),
+%% but avoid opening older segments already covered by that projection.
+fold_disk_after(RootDir, AfterIndex, Fun, Acc)
+  when is_integer(AfterIndex), AfterIndex >= 0, is_function(Fun, 3) ->
+    fold_disk_after_verified_boundary(RootDir, AfterIndex + 1, Fun, Acc);
+fold_disk_after(RootDir, AfterIndex, Fun, Acc)
+  when is_integer(AfterIndex), AfterIndex >= 0, is_function(Fun, 4) ->
+    fold_disk_after_verified_boundary(RootDir, AfterIndex + 1, Fun, Acc);
+fold_disk_after(_RootDir, _AfterIndex, _Fun, _Acc) ->
+    {error, bad_index}.
+
+fold_disk_after_verified_boundary(RootDir, FirstIndex, Fun, Acc) ->
+    %% A missing first segment otherwise looks like a valid tail: the loader
+    %% permits the first index in a stream to be arbitrary. Some snapshot and
+    %% trim boundaries legitimately have no immediately following disk entry,
+    %% and a torn tail header must be repaired by the ordinary fold. For any
+    %% uncertain preflight, defer to that original validation/recovery path.
+    case read_disk(RootDir, FirstIndex) of
+        {ok, _Entry} -> fold_disk_from_index(RootDir, FirstIndex, Fun, Acc);
+        _MissingOrInvalid -> fold_disk(RootDir, Fun, Acc)
+    end.
+
+fold_disk_from_index(RootDir, FirstIndex, Fun, Acc) ->
     Dir = fold_disk_segment_dir(RootDir),
     Tid = ets:new(?MODULE, [ordered_set]),
     try
@@ -250,7 +279,7 @@ fold_disk(RootDir, Fun, Acc) when is_function(Fun, 3) ->
                             ok ->
                                 case preload_segment_config(Dir) of
                                     ok ->
-                                        fold_disk_stream(Dir, Tid, Fun, Acc);
+                                        fold_disk_stream(Dir, Tid, Fun, Acc, FirstIndex);
                                     {error, enoent} ->
                                         {ok, Acc};
                                     {error, _Reason} = Error ->
@@ -269,6 +298,7 @@ fold_disk(RootDir, Fun, Acc) when is_function(Fun, 3) ->
         end
     after
         _ = erlang:erase(?FOLD_CONTEXT),
+        _ = erlang:erase(?FOLD_LOCATION),
         ets:delete(Tid)
     end.
 
@@ -341,19 +371,59 @@ merge_apply_projection_read_record(Position, Entries, not_found) ->
 merge_apply_projection_read_record(Position, Entries, {_OldPosition, OldEntries}) ->
     {Position, merge_projection_entries(OldEntries, Entries)}.
 
-fold_disk_stream(Dir, Tid, Fun, Acc) ->
+fold_disk_stream(Dir, Tid, Fun, Acc, FirstIndex) ->
     StartedAt = erlang:monotonic_time(),
-    erlang:put(
-        ?FOLD_CONTEXT,
-        #{callback => Fun, acc => Acc, started_at => StartedAt, disk_records => 0}
-    ),
-    case load_segments(Dir, Tid) of
-        ok ->
-            Context = erlang:get(?FOLD_CONTEXT),
-            emit_segment_fold(Dir, Context),
-            {ok, maps:get(acc, Context)};
-        {error, _Reason} = Error ->
-            Error
+    case fold_disk_floor(Dir) of
+        {ok, TrimFloor} ->
+            Floor = max(TrimFloor, FirstIndex),
+            erlang:put(
+                ?FOLD_CONTEXT,
+                #{callback => Fun, acc => Acc, started_at => StartedAt,
+                  disk_records => 0, floor => Floor}
+            ),
+            LoadResult = case Floor of
+                0 -> load_segments(Dir, Tid);
+                _ -> load_segments_from_floor(Dir, Tid, Floor, FirstIndex =:= 0)
+            end,
+            case LoadResult of
+                ok ->
+                    Context = erlang:get(?FOLD_CONTEXT),
+                    emit_segment_fold(Dir, Context),
+                    {ok, maps:get(acc, Context)};
+                {error, _Reason} = Error -> Error
+            end;
+        {error, _Reason} = Error -> Error
+    end.
+
+fold_disk_floor(Dir) ->
+    case segment_append_kind(Dir) of
+        raft_log -> logical_trim_floor_result(Dir);
+        _Projection -> {ok, 0}
+    end.
+
+load_segments_from_floor(Dir, Name, Floor, CacheLatestConfig) ->
+    case records_per_segment(Dir) of
+        {ok, RecordsPerSegment} ->
+            case segment_paths(Dir) of
+                {ok, Paths} ->
+                    FirstOrdinal = Floor div RecordsPerSegment,
+                    LivePaths = lists:dropwhile(
+                        fun({Ordinal, _Path}) -> Ordinal < FirstOrdinal end,
+                        Paths
+                    ),
+                    case load_segment_paths(LivePaths, Name, undefined, RecordsPerSegment) of
+                        {ok, LastIndex} ->
+                            case CacheLatestConfig of
+                                true -> cache_latest_config_not_found_if_missing(Dir, LastIndex);
+                                false -> ok
+                            end,
+                            ok;
+                        {error, _Reason} = Error -> Error
+                    end;
+                {error, enoent} -> ok;
+                {error, _Reason} = Error -> Error
+            end;
+        {error, _Reason} = Error -> Error
     end.
 
 location_for_index(RootDir, Index) when is_integer(Index), Index >= 0 ->
@@ -1350,18 +1420,22 @@ open(#raft_log{name = Name} = Log) ->
                                                                     true = ets:delete_all_objects(Name),
                                                                     _ = ensure_offset_registry(),
                                                                     _ = ensure_memory_registry(),
-                                                                    _ = profile_startup_phase(Dir, clear_offset_registry, fun() -> clear_offset_registry_for_dir(Dir) end),
-                                                                    clear_latest_config_cache(Dir),
-                                                                    case profile_startup_phase(Dir, load_segments, fun() -> load_segments_bounded(Dir, Name) end) of
-                                                                        ok ->
-                                                                            profile_startup_phase(Dir, refresh_memory_stats, fun() -> refresh_memory_stats(Name, Dir) end),
-                                                                            profile_startup_phase(Dir, enforce_ets_memory_limit, fun() -> enforce_ets_memory_limit(Name, Dir) end),
-                                                                            {ok, #{dir => Dir}};
-                                                                        {error, _Reason} = Error ->
-                                                                            true = ets:delete_all_objects(Name),
-                                                                            clear_memory_stats(Name),
-                                                                            Error
-                                                                    end;
+                                                                     case profile_startup_phase(Dir, clear_offset_registry, fun() -> clear_offset_registry_for_dir(Dir) end) of
+                                                                         ok ->
+                                                                             clear_latest_config_cache(Dir),
+                                                                             case profile_startup_phase(Dir, load_segments, fun() -> load_segments_bounded(Dir, Name) end) of
+                                                                                 ok ->
+                                                                                     profile_startup_phase(Dir, refresh_memory_stats, fun() -> refresh_memory_stats(Name, Dir) end),
+                                                                                     profile_startup_phase(Dir, enforce_ets_memory_limit, fun() -> enforce_ets_memory_limit(Name, Dir) end),
+                                                                                     trust_offset_index_for_dir(Dir),
+                                                                                     {ok, #{dir => Dir}};
+                                                                                 {error, _Reason} = Error ->
+                                                                                     true = ets:delete_all_objects(Name),
+                                                                                     clear_memory_stats(Name),
+                                                                                     Error
+                                                                             end;
+                                                                         {error, _Reason} = Error -> Error
+                                                                     end;
                                                                 {error, _Reason} = Error ->
                                                                     Error
                                                             end;

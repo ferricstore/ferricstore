@@ -1215,20 +1215,31 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
                  shard_index,
                  projection_root,
                  relocations
-               ) do
-          relocations
+               ),
+             {:ok, %{entries: entries, locations: locations}} <-
+               read_segment_projection_log(projection_root),
+             true <- length(relocations) == length(entries) do
+          Enum.zip([relocations, entries, locations])
           |> Enum.with_index(1)
-          |> Enum.reduce_while(:ok, fn {relocation, projection_index}, :ok ->
-            case relocate_segment_projection_row(
-                   keydir,
-                   projection_root,
-                   projection_index,
-                   relocation
-                 ) do
-              :ok -> {:cont, :ok}
-              {:error, reason} -> {:halt, {:error, reason}}
-            end
+          |> Enum.reduce_while(:ok, fn
+            {{{entry, _row} = relocation, entry, {_ordinal, offset, _size}}, projection_index},
+            :ok ->
+              case relocate_segment_projection_row_at(
+                     keydir,
+                     projection_index,
+                     offset,
+                     relocation
+                   ) do
+                :ok -> {:cont, :ok}
+                {:error, reason} -> {:halt, {:error, reason}}
+              end
+
+            {_mismatched_projection, _projection_index}, :ok ->
+              {:halt, {:error, :segment_projection_relocation_mismatch}}
           end)
+        else
+          false -> {:error, :segment_projection_relocation_count_mismatch}
+          {:error, _reason} = error -> error
         end
       rescue
         error -> {:error, {:relocate_segment_projection_keydir_failed, error}}

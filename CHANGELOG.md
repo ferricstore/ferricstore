@@ -4,6 +4,18 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.22 - 2026-09-24
+
+- Bound WARaft offset memory with derived, validated disk indexes and bounded
+  read-ahead; replay Flow history after a verified durable checkpoint and fold
+  only the segment-log tail following a validated projection when possible.
+- Prevent orphaned or unrelated cold-due rows from producing empty replicated
+  schedule claims. Repeated unchanged schedule overlaps back off to 30 seconds,
+  preserve the queued due occurrence, and wake early on target completion.
+- Keep the legacy policy-catalog projection warning visible while backing off
+  repeated unsuccessful shard retries, and arm Bitcask shard drain timers only
+  when direct writes actually remain pending.
+
 ## 0.11.21 - 2026-09-22
 
 - Hardened standalone transaction recovery around partial or corrupt journals,

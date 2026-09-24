@@ -107,20 +107,34 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
              keydir,
              projection_root,
              projection_index,
-             {{key, value, expire_at_ms}, original_row}
+             relocation
            ) do
         with {:ok, projection_offset} <-
                projection_record_location(projection_root, projection_index) do
-          compare_and_relocate_segment_projection_row(
+          relocate_segment_projection_row_at(
             keydir,
-            key,
-            value,
-            expire_at_ms,
-            original_row,
             projection_index,
-            projection_offset
+            projection_offset,
+            relocation
           )
         end
+      end
+
+      defp relocate_segment_projection_row_at(
+             keydir,
+             projection_index,
+             projection_offset,
+             {{key, value, expire_at_ms}, original_row}
+           ) do
+        compare_and_relocate_segment_projection_row(
+          keydir,
+          key,
+          value,
+          expire_at_ms,
+          original_row,
+          projection_index,
+          projection_offset
+        )
       end
 
       defp compare_and_relocate_segment_projection_row(
@@ -363,7 +377,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
              %{segment_projection: nil},
              _position
            ),
-           do: {:ok, []}
+           do: {:ok, %{entries: [], locations: []}}
 
       defp read_snapshot_segment_projection(
              snapshot_path,
@@ -378,19 +392,20 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
              :ok <- verify_segment_projection_position(projection, position),
              {:ok, entries} <- validate_segment_projection_entries(projection),
              :ok <- verify_segment_projection_count(entries, expected_count) do
-          {:ok, entries}
+          {:ok, %{entries: entries, locations: projection.locations}}
         else
           {:error, reason} -> {:error, {:read_segment_projection_snapshot, reason}}
         end
       end
 
-      defp read_snapshot_segment_projection(_snapshot_path, _metadata, _position), do: {:ok, []}
+      defp read_snapshot_segment_projection(_snapshot_path, _metadata, _position),
+        do: {:ok, %{entries: [], locations: []}}
 
       defp read_segment_projection_log(projection_root) do
-        case :ferricstore_waraft_spike_segment_log.fold_disk(
+        case :ferricstore_waraft_spike_segment_log.fold_disk_with_locations(
                to_charlist(projection_root),
-               &fold_segment_projection_record/3,
-               %{header: nil, entries: [], invalid: []}
+               &fold_segment_projection_record/4,
+               %{header: nil, entries: [], locations: [], invalid: []}
              ) do
           {:ok, %{invalid: [invalid | _]}} ->
             {:error, {:bad_segment_projection_record, invalid}}
@@ -401,11 +416,14 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
           {:ok, %{header: nil}} ->
             {:error, :missing_segment_projection_header}
 
-          {:ok, %{header: {position, count}, entries: entries}} ->
+          {:ok, %{header: {position, count}, entries: entries, locations: locations}} ->
             entries = Enum.reverse(entries)
+            locations = Enum.reverse(locations)
 
-            with :ok <- verify_segment_projection_count(entries, count) do
-              {:ok, %{version: @version, position: position, entries: entries}}
+            with :ok <- verify_segment_projection_count(entries, count),
+                 :ok <- verify_segment_projection_count(locations, count) do
+              {:ok,
+               %{version: @version, position: position, entries: entries, locations: locations}}
             end
 
           {:error, reason} ->
@@ -416,6 +434,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
       defp fold_segment_projection_record(
              0,
              {0, {:ferricstore_segment_projection_header, position, count}},
+             _location,
              acc
            )
            when is_integer(count) and count >= 0 do
@@ -425,13 +444,18 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
       defp fold_segment_projection_record(
              index,
              {0, {:ferricstore_segment_projection_entry, key, value, expire_at_ms}},
+             location,
              acc
            )
            when is_integer(index) and index > 0 do
-        %{acc | entries: [{key, value, expire_at_ms} | acc.entries]}
+        %{
+          acc
+          | entries: [{key, value, expire_at_ms} | acc.entries],
+            locations: [location | acc.locations]
+        }
       end
 
-      defp fold_segment_projection_record(index, entry, acc) do
+      defp fold_segment_projection_record(index, entry, _location, acc) do
         %{acc | invalid: [{index, entry} | acc.invalid]}
       end
 

@@ -3,6 +3,155 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinatorTest do
 
   alias Ferricstore.Flow.LMDBFlushCoordinator
 
+  test "memory-budgeted default admits two independent shard rebuilds" do
+    original_limit = Application.get_env(:ferricstore, :operational_memory_limit_bytes)
+    original_concurrency = Application.get_env(:ferricstore, :flow_lmdb_max_concurrent_flushes)
+    Application.put_env(:ferricstore, :operational_memory_limit_bytes, 5 * 1024 * 1024 * 1024)
+    Application.delete_env(:ferricstore, :flow_lmdb_max_concurrent_flushes)
+
+    on_exit(fn ->
+      if original_limit == nil,
+        do: Application.delete_env(:ferricstore, :operational_memory_limit_bytes),
+        else: Application.put_env(:ferricstore, :operational_memory_limit_bytes, original_limit)
+
+      if original_concurrency == nil,
+        do: Application.delete_env(:ferricstore, :flow_lmdb_max_concurrent_flushes),
+        else:
+          Application.put_env(
+            :ferricstore,
+            :flow_lmdb_max_concurrent_flushes,
+            original_concurrency
+          )
+    end)
+
+    instance = unique_instance_name("memory_budgeted_default")
+
+    start_supervised!(
+      {LMDBFlushCoordinator, instance_name: instance, startup_fun: fn -> true end}
+    )
+
+    parent = self()
+
+    first =
+      Task.async(fn ->
+        LMDBFlushCoordinator.with_shard_permit(instance, 0, fn ->
+          send(parent, :first_rebuild_started)
+          receive do: (:release_first -> :ok)
+        end)
+      end)
+
+    assert_receive :first_rebuild_started
+
+    second =
+      Task.async(fn ->
+        LMDBFlushCoordinator.with_shard_permit(instance, 1, fn ->
+          send(parent, :second_rebuild_started)
+          receive do: (:release_second -> :ok)
+        end)
+      end)
+
+    try do
+      assert_receive :second_rebuild_started, 500
+    after
+      send(first.pid, :release_first)
+      send(second.pid, :release_second)
+      Task.await(first)
+      Task.await(second)
+    end
+  end
+
+  test "a small memory budget keeps the default serial" do
+    original_limit = Application.get_env(:ferricstore, :operational_memory_limit_bytes)
+    original_concurrency = Application.get_env(:ferricstore, :flow_lmdb_max_concurrent_flushes)
+    Application.put_env(:ferricstore, :operational_memory_limit_bytes, 2 * 1024 * 1024 * 1024)
+    Application.delete_env(:ferricstore, :flow_lmdb_max_concurrent_flushes)
+
+    on_exit(fn ->
+      if original_limit == nil,
+        do: Application.delete_env(:ferricstore, :operational_memory_limit_bytes),
+        else: Application.put_env(:ferricstore, :operational_memory_limit_bytes, original_limit)
+
+      if original_concurrency == nil,
+        do: Application.delete_env(:ferricstore, :flow_lmdb_max_concurrent_flushes),
+        else:
+          Application.put_env(
+            :ferricstore,
+            :flow_lmdb_max_concurrent_flushes,
+            original_concurrency
+          )
+    end)
+
+    instance = unique_instance_name("small_memory")
+    pid = start_supervised!({LMDBFlushCoordinator, instance_name: instance})
+    assert :sys.get_state(pid).max == 1
+  end
+
+  test "adaptive startup parallelism returns to serial when the backend is ready" do
+    original_limit = Application.get_env(:ferricstore, :operational_memory_limit_bytes)
+    original_concurrency = Application.get_env(:ferricstore, :flow_lmdb_max_concurrent_flushes)
+    Application.put_env(:ferricstore, :operational_memory_limit_bytes, 8 * 1024 * 1024 * 1024)
+    Application.delete_env(:ferricstore, :flow_lmdb_max_concurrent_flushes)
+
+    on_exit(fn ->
+      if original_limit == nil,
+        do: Application.delete_env(:ferricstore, :operational_memory_limit_bytes),
+        else: Application.put_env(:ferricstore, :operational_memory_limit_bytes, original_limit)
+
+      if original_concurrency == nil,
+        do: Application.delete_env(:ferricstore, :flow_lmdb_max_concurrent_flushes),
+        else:
+          Application.put_env(
+            :ferricstore,
+            :flow_lmdb_max_concurrent_flushes,
+            original_concurrency
+          )
+    end)
+
+    {:ok, startup} = Agent.start_link(fn -> true end)
+    on_exit(fn -> if Process.alive?(startup), do: Agent.stop(startup) end)
+
+    instance = unique_instance_name("adaptive_startup")
+
+    start_supervised!(
+      {LMDBFlushCoordinator,
+       instance_name: instance, startup_fun: fn -> Agent.get(startup, & &1) end}
+    )
+
+    parent = self()
+
+    holder = fn shard ->
+      Task.async(fn ->
+        LMDBFlushCoordinator.with_shard_permit(instance, shard, fn ->
+          send(parent, {:acquired, shard})
+          receive do: (:release -> :ok)
+        end)
+      end)
+    end
+
+    first = holder.(0)
+    second = holder.(1)
+    assert_receive {:acquired, 0}
+    assert_receive {:acquired, 1}
+
+    Agent.update(startup, fn _ -> false end)
+    third = holder.(2)
+    send(first.pid, :release)
+
+    try do
+      assert :ok = Task.await(first)
+      refute_receive {:acquired, 2}, 100
+      send(second.pid, :release)
+      assert :ok = Task.await(second)
+      assert_receive {:acquired, 2}
+    after
+      send(first.pid, :release)
+      send(second.pid, :release)
+      send(third.pid, :release)
+    end
+
+    assert :ok = Task.await(third)
+  end
+
   test "shard permits wait for their writer without blocking other shards" do
     instance_name = unique_instance_name("exclusive")
 

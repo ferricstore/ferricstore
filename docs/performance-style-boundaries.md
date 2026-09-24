@@ -28,6 +28,12 @@ Rules for hot paths:
 - Keep dispatch mechanical and data-shape stable.
 - If macro section extraction changes generated code, treat it as hot-path risk.
 
+The Bitcask Shard's 1 ms `:drain_pending` timer is armed only while writes
+remain pending (including writes staged behind an in-flight flush). The first
+direct write still attempts to flush immediately. A completed drain leaves no
+idle timer, so increasing the shard count does not add a constant stream of
+no-op callbacks; failed drains keep retrying until the pending batch clears.
+
 ## Hot-adjacent paths: focused tests plus benchmark if enqueue/apply cost changes
 
 - Flow LMDB projection enqueue/config/outbox modules.

@@ -473,6 +473,10 @@ defmodule Ferricstore.Bitcask.NIF do
           | {:error, term()}
   def v2_scan_file_page(_path, _start_offset, _limit), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec v2_validated_log_prefix_digest(binary(), non_neg_integer()) ::
+          {:ok, <<_::256>>} | {:error, term()}
+  def v2_validated_log_prefix_digest(_path, _prefix_bytes), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec v2_recover_torn_tail(binary()) :: {:ok, non_neg_integer()} | {:error, term()}
   def v2_recover_torn_tail(_path), do: :erlang.nif_error(:nif_not_loaded)
 

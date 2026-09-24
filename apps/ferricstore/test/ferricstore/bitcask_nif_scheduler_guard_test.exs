@@ -9,6 +9,7 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
     v2_copy_records
     v2_copy_records_preserve_tombstones
     v2_read_hint_file_page
+    v2_validated_log_prefix_digest
     v2_write_hint_file
   )
   @dirty_io_blocking_nifs ~w(

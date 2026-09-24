@@ -81,6 +81,15 @@ A queued occurrence keeps its original logical due time. If it is released
 after additional intervals elapsed, that occurrence fires once and the later
 elapsed periods are coalesced.
 
+For `queue_after_previous`, the first check uses `overlap_retry_ms` (1 second
+by default). Repeated checks of the same still-active target back off up to
+30 seconds (or the configured retry if it is longer), with the retry deadline
+and streak persisted in the schedule.
+Completing a scheduled target signals the local scheduler to advance that
+queued deadline after it verifies the target is terminal. A missed notification,
+including one across nodes or a restart, leaves the durable retry as a
+bounded fallback; neither the queued occurrence nor its due time is discarded.
+
 ## Create An Interval Schedule
 
 Embedded Elixir:

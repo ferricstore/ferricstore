@@ -16,6 +16,7 @@ defmodule Ferricstore.Store.Shard.Flush do
 
   # Record header size for dead byte accounting (same as @bitcask_header_size).
   @record_header_size 26
+  @drain_timer_key {__MODULE__, :drain_timer}
 
   # -------------------------------------------------------------------
   # Flush pending writes
@@ -29,7 +30,11 @@ defmodule Ferricstore.Store.Shard.Flush do
   @spec flush_pending(map()) :: map()
   @doc false
   def flush_pending(%{pending: []} = state), do: state
-  def flush_pending(%{flush_in_flight: op_id} = state) when op_id != nil, do: state
+
+  def flush_pending(%{flush_in_flight: op_id} = state) when op_id != nil do
+    schedule_drain_pending_for_pending(state)
+    state
+  end
 
   def flush_pending(%{pending: pending} = state) do
     raw_batch = Enum.reverse(pending)
@@ -63,6 +68,7 @@ defmodule Ferricstore.Store.Shard.Flush do
     else
       {:error, reason} ->
         Ferricstore.Store.DiskPressure.set(state.instance_ctx, state.index)
+        schedule_drain_pending_for_pending(state)
 
         Logger.error(
           "Shard #{state.index}: flush_pending (nosync) failed: #{inspect(reason)} — retaining #{length(raw_batch)} pending entries"
@@ -734,7 +740,7 @@ defmodule Ferricstore.Store.Shard.Flush do
   # -------------------------------------------------------------------
 
   @doc """
-  Schedules the periodic `:drain_pending` timer tick. The tick drains
+  Schedules one `:drain_pending` timer while writes are pending. The tick drains
   `state.pending` to the active file via `v2_append_batch_nosync` —
   i.e. BEAM memory → kernel page cache. It does NOT fsync. Data-file
   durability is owned by `Ferricstore.Store.BitcaskCheckpointer`, which
@@ -742,6 +748,32 @@ defmodule Ferricstore.Store.Shard.Flush do
   """
   @spec schedule_drain_pending(non_neg_integer()) :: reference()
   def schedule_drain_pending(ms) do
-    Process.send_after(self(), :drain_pending, ms)
+    case Process.get(@drain_timer_key) do
+      ref when is_reference(ref) ->
+        case Process.read_timer(ref) do
+          false -> put_drain_timer(ms)
+          _remaining -> ref
+        end
+
+      _missing ->
+        put_drain_timer(ms)
+    end
+  end
+
+  @doc false
+  def drain_pending_timer_fired, do: Process.delete(@drain_timer_key)
+
+  @doc false
+  def schedule_drain_pending_for_pending(%{pending: []}), do: :ok
+
+  def schedule_drain_pending_for_pending(%{pending: [_ | _]}) do
+    schedule_drain_pending(Process.get(:flush_interval_ms, 1))
+    :ok
+  end
+
+  defp put_drain_timer(ms) do
+    ref = Process.send_after(self(), :drain_pending, ms)
+    Process.put(@drain_timer_key, ref)
+    ref
   end
 end

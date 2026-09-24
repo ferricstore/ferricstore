@@ -1687,7 +1687,7 @@ defmodule Ferricstore.FlowWriteContractTest do
 
     assert length(
              Regex.scan(
-               ~r/:ok\s*=\s*Ferricstore\.Flow\.LMDBRebuilder\.reconcile_startup_shard\(/,
+               ~r/Ferricstore\.Flow\.LMDBRebuilder\.reconcile_startup_shard\(/,
                recovery_source
              )
            ) == 2
@@ -1699,6 +1699,11 @@ defmodule Ferricstore.FlowWriteContractTest do
       )
 
     assert rebuild_source =~ "force_full_reconcile?: true"
+
+    assert Regex.match?(
+             ~r/:ok\s*=\s*profile_startup_phase\([^)]*:reconcile_flow_lmdb,\s*fn\s*->\s*Ferricstore\.Flow\.LMDBRebuilder\.reconcile_startup_shard\(/s,
+             rebuild_source
+           )
 
     assert rebuild_source =~
              "Map.put(:active_file_size, recovery_file_size(sm_state.active_file_path))"

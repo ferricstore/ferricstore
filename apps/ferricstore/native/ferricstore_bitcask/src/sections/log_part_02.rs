@@ -146,6 +146,47 @@ impl LogReader {
     }
 }
 
+/// Verify every complete frame in a committed prefix, then hash those exact
+/// bytes. The returned digest binds a derived recovery checkpoint to the
+/// authoritative log without retaining its keys or values in BEAM memory.
+pub fn validated_prefix_digest(path: &Path, prefix_bytes: u64) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+
+    let file = crate::open_random_read(path)?;
+    if file.metadata()?.len() < prefix_bytes {
+        return Err(LogError("history checkpoint prefix exceeds log length".into()));
+    }
+
+    let mut reader = std::io::BufReader::with_capacity(1024 * 1024, file);
+    let mut offset = 0u64;
+
+    while offset < prefix_bytes {
+        let record = read_next_record_metadata(&mut reader, offset)?
+            .ok_or_else(|| LogError("history checkpoint prefix ends before EOF".into()))?;
+        offset = offset
+            .checked_add(record.record_size)
+            .ok_or_else(|| LogError("history checkpoint offset overflow".into()))?;
+
+        if offset > prefix_bytes {
+            return Err(LogError("history checkpoint cuts through a record".into()));
+        }
+    }
+
+    reader.seek(SeekFrom::Start(0))?;
+    let mut digest = Sha256::new();
+    let mut remaining = prefix_bytes;
+    let mut buffer = [0u8; 64 * 1024];
+
+    while remaining > 0 {
+        let length = remaining.min(buffer.len() as u64) as usize;
+        reader.read_exact(&mut buffer[..length])?;
+        digest.update(&buffer[..length]);
+        remaining -= length as u64;
+    }
+
+    Ok(digest.finalize().into())
+}
+
 /// Recover the append boundary of an active log after a structurally torn tail.
 ///
 /// A short final header is unambiguous: no complete record can fit in fewer

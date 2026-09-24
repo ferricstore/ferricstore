@@ -237,9 +237,12 @@ defmodule Ferricstore.Bench.QueryStorageLayout do
         |> Map.put("production physical locator batch read/page-#{page}", fn dataset ->
           production_physical_locator_read(dataset, page)
         end)
-        |> Map.put("candidate registry + retained-fd vector read/page-#{page}", fn dataset ->
-          candidate_registry_authoritative_vector_read(dataset, page)
-        end)
+        |> Map.put(
+          "candidate disk-backed offset + retained-fd vector read/page-#{page}",
+          fn dataset ->
+            candidate_registry_authoritative_vector_read(dataset, page)
+          end
+        )
         |> Map.put("candidate retained-fd authoritative batch read/page-#{page}", fn dataset ->
           candidate_retained_authoritative_raw_read(dataset, page)
         end)
@@ -279,9 +282,12 @@ defmodule Ferricstore.Bench.QueryStorageLayout do
       |> Map.put("production physical locator batch read/page-#{page}", fn dataset ->
         production_physical_locator_read(dataset, page)
       end)
-      |> Map.put("candidate registry + retained-fd vector read/page-#{page}", fn dataset ->
-        candidate_registry_authoritative_vector_read(dataset, page)
-      end)
+      |> Map.put(
+        "candidate disk-backed offset + retained-fd vector read/page-#{page}",
+        fn dataset ->
+          candidate_registry_authoritative_vector_read(dataset, page)
+        end
+      )
       |> Map.put("candidate retained-fd authoritative batch read/page-#{page}", fn dataset ->
         candidate_retained_authoritative_raw_read(dataset, page)
       end)
@@ -511,20 +517,20 @@ defmodule Ferricstore.Bench.QueryStorageLayout do
   end
 
   defp candidate_registry_location!(request) do
-    dir_key = request.path |> Path.dirname() |> Path.expand()
+    root = request.path |> Path.dirname() |> Path.dirname()
 
-    case :ets.lookup(
-           :ferricstore_waraft_segment_offset_registry,
-           {dir_key, request.index}
+    case :ferricstore_waraft_spike_segment_log.location_for_index(
+           to_charlist(root),
+           request.index
          ) do
-      [{{^dir_key, index}, ordinal, offset, encoded_size}]
-      when index == request.index and is_integer(ordinal) and ordinal >= 0 and
+      {:ok, {ordinal, offset, encoded_size}}
+      when is_integer(ordinal) and ordinal >= 0 and
              is_integer(offset) and offset >= 0 and is_integer(encoded_size) and
              encoded_size >= 8 ->
         %{request | ordinal: ordinal, offset: offset, encoded_size: encoded_size}
 
       invalid ->
-        raise "invalid candidate offset-registry result: #{inspect(invalid)}"
+        raise "invalid candidate disk-backed offset result: #{inspect(invalid)}"
     end
   end
 

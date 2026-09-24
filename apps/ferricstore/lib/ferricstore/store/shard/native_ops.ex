@@ -474,6 +474,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
           {:error, reason, rolled_back_state}
       end
     else
+      ShardFlush.schedule_drain_pending_for_pending(new_state)
       {:ok, new_state}
     end
   end

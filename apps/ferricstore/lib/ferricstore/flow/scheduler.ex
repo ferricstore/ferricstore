@@ -17,11 +17,38 @@ defmodule Ferricstore.Flow.Scheduler do
   use GenServer
 
   alias Ferricstore.Flow.Schedule
+  alias Ferricstore.Flow.Schedule.TargetOwnership
+
+  @max_wake_tasks 32
 
   @default_initial_delay_ms 2_000
   @default_error_sleep_ms 1_000
   @default_limit 100
   @default_max_claim_limit 1_000
+
+  def name(%{name: instance_name}), do: name(instance_name)
+  def name(:default), do: __MODULE__
+  def name(instance_name) when is_atom(instance_name), do: :"#{instance_name}.Flow.Scheduler"
+
+  @doc false
+  def notify_target_terminal(%{name: instance_name}, %{id: target_id, state: state} = record)
+      when is_binary(target_id) and is_binary(state) do
+    if Ferricstore.Flow.LMDB.terminal_state?(state) do
+      case TargetOwnership.schedule_id(record) do
+        id when is_binary(id) ->
+          if pid = Process.whereis(name(instance_name)) do
+            GenServer.cast(pid, {:target_terminal, id, target_id})
+          end
+
+        _other ->
+          :ok
+      end
+    end
+
+    :ok
+  end
+
+  def notify_target_terminal(_ctx, _record), do: :ok
 
   def start_link(opts \\ []) do
     case Keyword.get(opts, :name, __MODULE__) do
@@ -43,6 +70,7 @@ defmodule Ferricstore.Flow.Scheduler do
      %{
        ctx: Keyword.get(opts, :ctx, FerricStore.Instance.get(:default)),
        task: nil,
+       wake_tasks: MapSet.new(),
        config: config
      }}
   end
@@ -80,6 +108,32 @@ defmodule Ferricstore.Flow.Scheduler do
   end
 
   @impl true
+  def handle_cast({:target_terminal, schedule_id, target_id}, state) do
+    if state.config.enabled? and MapSet.size(state.wake_tasks) < @max_wake_tasks do
+      parent = self()
+
+      {:ok, task} =
+        Task.start_link(fn ->
+          result =
+            Schedule.wake_queued(
+              state.ctx,
+              schedule_id,
+              target_id,
+              System.system_time(:millisecond)
+            )
+
+          send(parent, {:wake_queued_done, self(), result})
+        end)
+
+      {:noreply, %{state | wake_tasks: MapSet.put(state.wake_tasks, task)}}
+    else
+      {:noreply, state}
+    end
+  end
+
+  @impl true
+  def handle_info(:fire_due, %{config: %{enabled?: false}} = state), do: {:noreply, state}
+
   def handle_info(:fire_due, %{task: task} = state) when is_pid(task), do: {:noreply, state}
 
   def handle_info(:fire_due, state) do
@@ -118,6 +172,16 @@ defmodule Ferricstore.Flow.Scheduler do
 
   def handle_info({:fire_due_done, _old_task, _result}, state), do: {:noreply, state}
 
+  def handle_info({:wake_queued_done, task, result}, state) do
+    state = %{state | wake_tasks: MapSet.delete(state.wake_tasks, task)}
+
+    if result == :woken do
+      Process.send_after(self(), :fire_due, 0)
+    end
+
+    {:noreply, state}
+  end
+
   def handle_info({:EXIT, task, :normal}, %{task: task} = state), do: {:noreply, state}
 
   def handle_info({:EXIT, task, _reason}, %{task: task} = state) do
@@ -125,7 +189,9 @@ defmodule Ferricstore.Flow.Scheduler do
     {:noreply, %{state | task: nil}}
   end
 
-  def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
+  def handle_info({:EXIT, pid, _reason}, state) do
+    {:noreply, %{state | wake_tasks: MapSet.delete(state.wake_tasks, pid)}}
+  end
 
   defp worker, do: "ferricstore-scheduler:" <> Atom.to_string(node())
 

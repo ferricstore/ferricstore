@@ -426,13 +426,14 @@ defmodule Ferricstore.ProductionDefaultsTest do
     refute lmdb_source =~ ":off"
   end
 
-  test "Flow LMDB background flushes stay serial by default" do
+  test "Flow LMDB flush defaults adapt to memory while preserving an explicit override" do
     config_exs = File.read!(Path.join(@repo_root, "config/config.exs"))
     bench_exs = File.read!(Path.join(@repo_root, "config/bench.exs"))
     runtime_exs = File.read!(Path.join(@repo_root, "config/runtime.exs"))
 
-    assert Ferricstore.Flow.LMDBFlushCoordinator.default_max_concurrent() == 1
-    assert runtime_exs =~ ~s(FERRICSTORE_FLOW_LMDB_MAX_CONCURRENT_FLUSHES", "1")
+    assert Ferricstore.Flow.LMDBFlushCoordinator.default_max_concurrent() in [1, 2]
+    assert runtime_exs =~ ~s|System.get_env("FERRICSTORE_FLOW_LMDB_MAX_CONCURRENT_FLUSHES")|
+    assert runtime_exs =~ "nil -> nil"
     refute config_exs =~ "flow_lmdb_max_concurrent_flushes"
     refute bench_exs =~ "flow_lmdb_max_concurrent_flushes"
   end
