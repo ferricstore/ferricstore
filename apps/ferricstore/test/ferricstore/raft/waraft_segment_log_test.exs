@@ -153,6 +153,72 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
     {:ok, Enum.reverse(entries)}
   end
 
+  defp corrupt_segment_crc!(path) do
+    <<length::unsigned-big-32, crc::unsigned-big-32, rest::binary>> = File.read!(path)
+
+    File.write!(
+      path,
+      <<length::unsigned-big-32, Bitwise.bxor(crc, 1)::unsigned-big-32, rest::binary>>
+    )
+  end
+
+  test "a projection-bound disk fold reads only the Raft tail after its covered index" do
+    with_segment_log_memory_env(
+      max_bytes: 4_096,
+      max_entries: 4,
+      min_entries: 2,
+      records_per_segment: 4,
+      fun: fn _root, log, _log_name ->
+        provider = :ferricstore_waraft_spike_segment_log
+        assert :ok = provider.init(log)
+        assert {:ok, provider_state} = provider.open(log)
+
+        assert :ok =
+                 provider.append(
+                   {:log_view, log, 0, 0, :undefined},
+                   for(index <- 1..12, do: {1, {:cmd, index}}),
+                   :strict,
+                   :low
+                 )
+
+        segment_root = log |> provider.memory_status() |> Map.fetch!(:dir) |> Path.dirname()
+        fold = fn index, entry, acc -> [{index, entry} | acc] end
+
+        assert {:ok, all} = provider.fold_disk(segment_root, fold, []) |> map_fold_seen()
+        assert Enum.map(all, &elem(&1, 0)) == Enum.to_list(1..12)
+
+        assert {:ok, tail} =
+                 provider.fold_disk_after(segment_root, 7, fold, []) |> map_fold_seen()
+
+        assert Enum.map(tail, &elem(&1, 0)) == Enum.to_list(8..12)
+
+        assert {:ok, partial} =
+                 provider.fold_disk_after(segment_root, 6, fold, []) |> map_fold_seen()
+
+        assert Enum.map(partial, &elem(&1, 0)) == Enum.to_list(7..12)
+
+        assert :ok = provider.close(log, provider_state)
+
+        segment_dir = provider.memory_status(log).dir
+        corrupt_segment_crc!(Path.join(segment_dir, "0.seg"))
+
+        assert {:error, {:crc_mismatch, 0}} = provider.fold_disk(segment_root, fold, [])
+        assert {:ok, recovered_tail} = provider.fold_disk_after(segment_root, 7, fold, [])
+        assert Enum.map(recovered_tail, &elem(&1, 0)) == Enum.to_list(12..8//-1)
+
+        corrupt_segment_crc!(Path.join(segment_dir, "3.seg"))
+        assert {:error, {:crc_mismatch, 0}} = provider.fold_disk_after(segment_root, 7, fold, [])
+
+        corrupt_segment_crc!(Path.join(segment_dir, "3.seg"))
+        corrupt_segment_crc!(Path.join(segment_dir, "0.seg"))
+        File.rm!(Path.join(segment_dir, "2.seg"))
+
+        assert {:error, {:non_contiguous_record_index, 7, 12}} =
+                 provider.fold_disk_after(segment_root, 7, fold, [])
+      end
+    )
+  end
+
   test "disk-backed segment offsets stay bounded across append and truncate" do
     clear_segment_offset_registry()
 

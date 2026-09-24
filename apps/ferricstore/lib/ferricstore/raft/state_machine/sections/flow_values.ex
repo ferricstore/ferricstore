@@ -47,8 +47,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       defp flow_after_history_fast_record?(record), do: flow_history_trim_skippable?(record)
 
       defp flow_after_history_put(state, record) do
-        with :ok <- flow_history_trim(state, record) do
-          maybe_queue_terminal_lmdb_history_indexes(state, record)
+        with :ok <- flow_history_trim(state, record),
+             :ok <- maybe_queue_terminal_lmdb_history_indexes(state, record) do
+          Ferricstore.Flow.Scheduler.notify_target_terminal(state.instance_ctx, record)
+          :ok
         end
       end
 

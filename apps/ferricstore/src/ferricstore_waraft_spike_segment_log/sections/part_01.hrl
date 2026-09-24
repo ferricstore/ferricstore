@@ -242,6 +242,32 @@ fold_disk_with_locations(RootDir, Fun, Acc) when is_function(Fun, 4) ->
     fold_disk(RootDir, Fun, Acc).
 
 fold_disk(RootDir, Fun, Acc) when is_function(Fun, 3); is_function(Fun, 4) ->
+    fold_disk_from_index(RootDir, 0, Fun, Acc).
+
+%% The caller has validated a durable projection through AfterIndex. Keep
+%% checking every record in the tail (including the first partial segment),
+%% but avoid opening older segments already covered by that projection.
+fold_disk_after(RootDir, AfterIndex, Fun, Acc)
+  when is_integer(AfterIndex), AfterIndex >= 0, is_function(Fun, 3) ->
+    fold_disk_after_verified_boundary(RootDir, AfterIndex + 1, Fun, Acc);
+fold_disk_after(RootDir, AfterIndex, Fun, Acc)
+  when is_integer(AfterIndex), AfterIndex >= 0, is_function(Fun, 4) ->
+    fold_disk_after_verified_boundary(RootDir, AfterIndex + 1, Fun, Acc);
+fold_disk_after(_RootDir, _AfterIndex, _Fun, _Acc) ->
+    {error, bad_index}.
+
+fold_disk_after_verified_boundary(RootDir, FirstIndex, Fun, Acc) ->
+    %% A missing first segment otherwise looks like a valid tail: the loader
+    %% permits the first index in a stream to be arbitrary. Some snapshot and
+    %% trim boundaries legitimately have no immediately following disk entry,
+    %% and a torn tail header must be repaired by the ordinary fold. For any
+    %% uncertain preflight, defer to that original validation/recovery path.
+    case read_disk(RootDir, FirstIndex) of
+        {ok, _Entry} -> fold_disk_from_index(RootDir, FirstIndex, Fun, Acc);
+        _MissingOrInvalid -> fold_disk(RootDir, Fun, Acc)
+    end.
+
+fold_disk_from_index(RootDir, FirstIndex, Fun, Acc) ->
     Dir = fold_disk_segment_dir(RootDir),
     Tid = ets:new(?MODULE, [ordered_set]),
     try
@@ -253,7 +279,7 @@ fold_disk(RootDir, Fun, Acc) when is_function(Fun, 3); is_function(Fun, 4) ->
                             ok ->
                                 case preload_segment_config(Dir) of
                                     ok ->
-                                        fold_disk_stream(Dir, Tid, Fun, Acc);
+                                        fold_disk_stream(Dir, Tid, Fun, Acc, FirstIndex);
                                     {error, enoent} ->
                                         {ok, Acc};
                                     {error, _Reason} = Error ->
@@ -345,10 +371,11 @@ merge_apply_projection_read_record(Position, Entries, not_found) ->
 merge_apply_projection_read_record(Position, Entries, {_OldPosition, OldEntries}) ->
     {Position, merge_projection_entries(OldEntries, Entries)}.
 
-fold_disk_stream(Dir, Tid, Fun, Acc) ->
+fold_disk_stream(Dir, Tid, Fun, Acc, FirstIndex) ->
     StartedAt = erlang:monotonic_time(),
     case fold_disk_floor(Dir) of
-        {ok, Floor} ->
+        {ok, TrimFloor} ->
+            Floor = max(TrimFloor, FirstIndex),
             erlang:put(
                 ?FOLD_CONTEXT,
                 #{callback => Fun, acc => Acc, started_at => StartedAt,
@@ -356,7 +383,7 @@ fold_disk_stream(Dir, Tid, Fun, Acc) ->
             ),
             LoadResult = case Floor of
                 0 -> load_segments(Dir, Tid);
-                _ -> load_segments_from_floor(Dir, Tid, Floor)
+                _ -> load_segments_from_floor(Dir, Tid, Floor, FirstIndex =:= 0)
             end,
             case LoadResult of
                 ok ->
@@ -374,7 +401,7 @@ fold_disk_floor(Dir) ->
         _Projection -> {ok, 0}
     end.
 
-load_segments_from_floor(Dir, Name, Floor) ->
+load_segments_from_floor(Dir, Name, Floor, CacheLatestConfig) ->
     case records_per_segment(Dir) of
         {ok, RecordsPerSegment} ->
             case segment_paths(Dir) of
@@ -386,7 +413,10 @@ load_segments_from_floor(Dir, Name, Floor) ->
                     ),
                     case load_segment_paths(LivePaths, Name, undefined, RecordsPerSegment) of
                         {ok, LastIndex} ->
-                            cache_latest_config_not_found_if_missing(Dir, LastIndex),
+                            case CacheLatestConfig of
+                                true -> cache_latest_config_not_found_if_missing(Dir, LastIndex);
+                                false -> ok
+                            end,
                             ok;
                         {error, _Reason} = Error -> Error
                     end;

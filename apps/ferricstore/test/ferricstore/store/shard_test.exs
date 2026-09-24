@@ -3,6 +3,7 @@ defmodule Ferricstore.Store.ShardTest do
 
   alias Ferricstore.Store.{CompoundKey, DiskPressure, TypeRegistry}
   alias Ferricstore.Test.IsolatedInstance
+  import Ferricstore.Test.Eventually
 
   setup do
     ctx = IsolatedInstance.checkout(shard_count: 1)
@@ -64,6 +65,51 @@ defmodule Ferricstore.Store.ShardTest do
   end
 
   describe "flush" do
+    test "idle shards do not wake for empty drain ticks", %{shard: shard} do
+      # Count actual drain messages so an unrelated expiry sweep cannot make
+      # the assertion depend on the shard heap size or machine load.
+      assert 1 == :erlang.trace(shard, true, [:receive, {:tracer, self()}])
+      Process.sleep(80)
+      assert 1 == :erlang.trace(shard, false, [:receive])
+
+      refute_receive {:trace, ^shard, :receive, :drain_pending}, 0
+    end
+
+    test "pending writes behind an in-flight flush still drain promptly", %{shard: shard} do
+      :sys.replace_state(shard, fn state -> %{state | flush_in_flight: make_ref()} end)
+
+      assert :ok = GenServer.call(shard, {:put, "queued-behind-flush", "value", 0})
+      assert :sys.get_state(shard).pending_count == 1
+
+      :sys.replace_state(shard, fn state -> %{state | flush_in_flight: nil} end)
+
+      assert eventually(fn -> :sys.get_state(shard).pending_count == 0 end,
+               timeout: 1_000,
+               interval: 2
+             )
+
+      assert "value" == GenServer.call(shard, {:get, "queued-behind-flush"})
+    end
+
+    test "compound writes behind an in-flight flush also arm the drain", %{shard: shard} do
+      :sys.replace_state(shard, fn state -> %{state | flush_in_flight: make_ref()} end)
+
+      key = "H:queued-compound" <> <<0>> <> "field"
+
+      assert :ok =
+               GenServer.call(shard, {:compound_put, "queued-compound", key, "value", 0})
+
+      assert :sys.get_state(shard).pending_count == 1
+      :sys.replace_state(shard, fn state -> %{state | flush_in_flight: nil} end)
+
+      assert eventually(fn -> :sys.get_state(shard).pending_count == 0 end,
+               timeout: 1_000,
+               interval: 2
+             )
+
+      assert "value" == GenServer.call(shard, {:get, key})
+    end
+
     test "returns an error when pending writes cannot be persisted", %{shard: shard} do
       missing_dir =
         Path.join(System.tmp_dir!(), "missing_flush_dir_#{System.unique_integer([:positive])}")

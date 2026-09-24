@@ -134,6 +134,152 @@ defmodule Ferricstore.Flow.SchedulerTest do
            )
   end
 
+  test "orphaned cold schedules and unrelated cold work do not append empty claims" do
+    ctx = FerricStore.Instance.get(:default)
+    now_ms = Ferricstore.CommandTime.now_ms()
+
+    for shard <- 0..(ctx.shard_count - 1) do
+      path =
+        ctx.data_dir
+        |> Ferricstore.DataDir.shard_data_path(shard)
+        |> Ferricstore.Flow.LMDB.path()
+
+      orphan_key =
+        Ferricstore.Flow.LMDB.cold_due_key(
+          type: "__ferricstore_schedule",
+          state: "active",
+          partition_key: "old-schedule",
+          priority: 0,
+          due_at_ms: now_ms - 60_000,
+          flow_id: "missing-schedule-#{shard}",
+          version: 1
+        )
+
+      unrelated_key =
+        Ferricstore.Flow.LMDB.cold_due_key(
+          type: "unrelated-work",
+          state: "queued",
+          partition_key: "unrelated",
+          priority: 0,
+          due_at_ms: now_ms - 60_000,
+          flow_id: "unrelated-#{shard}",
+          version: 1
+        )
+
+      unrelated_park = "flow:park:v1:unrelated-#{shard}"
+
+      assert :ok =
+               Ferricstore.Flow.LMDB.write_batch(path, [
+                 {:put, orphan_key, "flow:park:v1:missing-schedule-#{shard}"},
+                 {:put, unrelated_key, unrelated_park},
+                 {:put, unrelated_park, "unrelated-park"}
+               ])
+
+      on_exit(fn ->
+        Ferricstore.Flow.LMDB.write_batch(path, [
+          {:delete, orphan_key},
+          {:delete, unrelated_key},
+          {:delete, unrelated_park}
+        ])
+      end)
+    end
+
+    versions = fn -> for i <- 1..ctx.shard_count, do: :counters.get(ctx.write_version, i) end
+    before_idle = versions.()
+
+    {:ok, scheduler} =
+      Scheduler.start_link(
+        name: nil,
+        enabled: true,
+        initial_delay_ms: 0,
+        error_sleep_ms: 5_000
+      )
+
+    on_exit(fn ->
+      Process.unlink(scheduler)
+      Process.exit(scheduler, :shutdown)
+    end)
+
+    waiter_keys = ClaimWaiters.wait_keys("__ferricstore_schedule", "active", nil, :any)
+
+    assert eventually(fn -> scheduler_waiting?(scheduler, waiter_keys) end,
+             timeout: 15_000,
+             interval: 25
+           )
+
+    assert versions.() == before_idle
+  end
+
+  test "a committed target completion wakes a queued schedule before its fallback retry" do
+    scheduler = Process.whereis(Scheduler)
+    assert is_pid(scheduler)
+
+    now_ms = System.system_time(:millisecond)
+    schedule_id = unique_flow_id("schedule-completion-wake")
+    target_prefix = unique_flow_id("schedule-completion-wake-target")
+    target_type = unique_flow_id("schedule-completion-wake-type")
+
+    assert {:ok, _schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :interval,
+               every_ms: 100,
+               start_at_ms: now_ms - 100,
+               now_ms: now_ms - 100,
+               overlap_policy: :queue_after_previous,
+               overlap_retry_ms: 10_000,
+               target: [id_prefix: target_prefix, type: target_type]
+             )
+
+    assert {:ok, %{fired: 1}} =
+             FerricStore.flow_schedule_fire_due(now_ms: now_ms - 100, worker: "wake-test")
+
+    assert {:ok, %{skipped: 1}} =
+             FerricStore.flow_schedule_fire_due(now_ms: now_ms, worker: "wake-test")
+
+    assert {:ok, waiting} = FerricStore.flow_schedule_get(schedule_id)
+    assert waiting.next_run_at_ms == now_ms + 10_000
+
+    previous_config = :sys.get_state(scheduler).config
+
+    on_exit(fn ->
+      if Process.alive?(scheduler) do
+        :sys.replace_state(scheduler, fn state -> %{state | config: previous_config} end)
+      end
+    end)
+
+    :sys.replace_state(scheduler, fn state ->
+      %{state | config: %{state.config | enabled?: true}}
+    end)
+
+    assert {:ok, [job]} =
+             FerricStore.flow_claim_due(target_type,
+               worker: "schedule-completion-worker",
+               limit: 1,
+               now_ms: now_ms
+             )
+
+    assert :ok =
+             FerricStore.flow_complete(job.id, job.lease_token,
+               fencing_token: job.fencing_token,
+               now_ms: now_ms
+             )
+
+    assert eventually(
+             fn ->
+               match?({:ok, %{fire_count: 2}}, FerricStore.flow_schedule_get(schedule_id))
+             end,
+             timeout: 5_000,
+             interval: 25
+           )
+
+    :sys.replace_state(scheduler, fn state -> %{state | config: previous_config} end)
+
+    assert eventually(fn -> :sys.get_state(scheduler).task == nil end,
+             timeout: 5_000,
+             interval: 25
+           )
+  end
+
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 

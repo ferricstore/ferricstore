@@ -486,7 +486,7 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
         new_state =
           if state.flush_in_flight == nil,
             do: ShardFlush.flush_pending(new_state),
-            else: new_state
+            else: tap(new_state, &ShardFlush.schedule_drain_pending_for_pending/1)
 
         new_state =
           new_state
@@ -590,7 +590,7 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
     new_state =
       if state.flush_in_flight == nil,
         do: ShardFlush.flush_pending(new_state),
-        else: new_state
+        else: tap(new_state, &ShardFlush.schedule_drain_pending_for_pending/1)
 
     {last_compound_key, _value, _expire_at_ms} = List.last(entries)
 

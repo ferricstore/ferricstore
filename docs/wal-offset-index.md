@@ -42,6 +42,16 @@ segment that can contain an untrimmed record. Fully trimmed physical segment
 files are storage debt, not replayable log entries; their stale bytes cannot
 delay recovery or become visible again. A partial first segment still receives
 normal CRC and index validation.
+When a durable segment projection has been validated, state-machine replay
+starts its disk fold at the first record *after* that projection's Raft index.
+The first tail record must pass the normal record checks; if its preflight is
+missing or invalid, recovery uses the original full fold instead of assuming a
+contiguous tail (including the existing torn-final-record recovery behavior).
+Corrupt replayed segments still fail recovery. Reads of a partial first
+segment still validate its earlier frames, while fully covered segments are
+left to the independent Raft-log open validation. Without a projection,
+startup retains the full fold. This optimization adds no recurring work to
+live writes.
 
 Flow history records an optional recovery boundary inside the same durable LMDB
 environment that holds its history index. After a successful full recovery
@@ -60,4 +70,8 @@ The operational guard logs RSS/disk pressure transitions with byte budgets,
 the offset registry footprint, and the Flow admission state. It reports only
 state changes, rather than logging every one-second guard sample. Flow policy
 catalog projection gaps retain their fail-closed health status; identical
-retries are logged once until the condition recovers or changes.
+retries are logged once until the condition recovers or changes. A shard with
+the persistent `:policy_catalog_state_projection_pending` warning uses a
+bounded per-shard retry delay (5–60 seconds), including when other shards are
+catching up; a successful retry clears the delay. Explicit attribute-repair
+requests wake the worker immediately.

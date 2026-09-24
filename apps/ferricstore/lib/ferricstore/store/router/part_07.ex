@@ -486,15 +486,14 @@ defmodule Ferricstore.Store.Router.Part07 do
         if Map.get(attrs, :cold_due_mode) == :skip or not Ferricstore.Flow.Hibernation.enabled?() do
           true
         else
-          # One prefix seek is sufficient to prove there is no cold work. Any
-          # cold row conservatively falls back to the authoritative claim path.
+          # Only an exact, bounded negative proof can bypass the replicated
+          # claim. An unrelated or orphaned cold row cannot satisfy this type;
+          # an active park, incomplete scan, or unavailable LMDB falls back.
           with path when is_binary(path) <- flow_claim_due_cold_precheck_path(ctx, idx),
-               true <- Ferricstore.FS.dir?(path),
-               {:ok, []} <-
-                 Ferricstore.Flow.LMDB.prefix_entries_initialized(
+               true <-
+                 Ferricstore.Flow.ColdDuePrecheck.empty_for_type?(
                    path,
-                   Ferricstore.Flow.LMDB.cold_due_prefix(),
-                   1
+                   Map.fetch!(attrs, :type)
                  ) do
             true
           else

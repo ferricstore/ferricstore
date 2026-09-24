@@ -20,6 +20,7 @@
     term/2,
     config/1,
     fold_disk/3,
+    fold_disk_after/4,
     fold_disk_with_locations/3,
     location_for_index/2,
     read_disk/2,

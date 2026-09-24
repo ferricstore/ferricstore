@@ -2,6 +2,8 @@ defmodule Ferricstore.Flow.Schedule.TargetOwnership do
   @moduledoc false
 
   @attribute "ferricstore.schedule.owner.v1"
+  @schedule_id_attribute "ferricstore.schedule.id.v1"
+  @schedule_correlation_prefix "__ferricstore_schedule__:"
   @secret_bytes 32
 
   @spec new_secret() :: binary()
@@ -9,8 +11,24 @@ defmodule Ferricstore.Flow.Schedule.TargetOwnership do
 
   @spec attributes(map(), binary()) :: %{binary() => binary()}
   def attributes(definition, target_id) when is_map(definition) and is_binary(target_id) do
-    %{@attribute => digest(definition, target_id)}
+    %{
+      @attribute => digest(definition, target_id),
+      @schedule_id_attribute => Map.fetch!(definition, :id)
+    }
   end
+
+  @spec schedule_id(map()) :: binary() | nil
+  def schedule_id(%{attributes: attributes, correlation_id: correlation_id}) do
+    case attributes do
+      %{@schedule_id_attribute => id} when is_binary(id) and id != "" -> id
+      _other -> schedule_id_from_correlation(correlation_id)
+    end
+  end
+
+  def schedule_id(_record), do: nil
+
+  defp schedule_id_from_correlation(@schedule_correlation_prefix <> id) when id != "", do: id
+  defp schedule_id_from_correlation(_other), do: nil
 
   @spec owned?(map(), map(), binary()) :: boolean()
   def owned?(record, definition, target_id)

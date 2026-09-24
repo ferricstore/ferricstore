@@ -326,7 +326,7 @@ defmodule Ferricstore.Store.Shard.Info do
         new_state =
           if state.flush_in_flight == nil,
             do: flush_pending(new_state),
-            else: new_state
+            else: tap(new_state, &ShardFlush.schedule_drain_pending_for_pending/1)
 
         {:noreply, new_state}
       end
@@ -377,11 +377,16 @@ defmodule Ferricstore.Store.Shard.Info do
       end
 
       def handle_info(:drain_pending, state) do
+        ShardFlush.drain_pending_timer_fired()
         # Drain any pending writes from BEAM memory to the active file
         # (page cache only — NO fsync). BitcaskCheckpointer is responsible
         # for actual disk durability on its own, longer tick.
         state = flush_pending(state)
-        schedule_drain_pending(Process.get(:flush_interval_ms, @flush_interval_ms))
+
+        if state.pending != [] do
+          schedule_drain_pending(Process.get(:flush_interval_ms, @flush_interval_ms))
+        end
+
         {:noreply, state}
       end
 

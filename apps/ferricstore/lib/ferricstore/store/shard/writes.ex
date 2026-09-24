@@ -459,6 +459,7 @@ defmodule Ferricstore.Store.Shard.Writes do
           {true, ShardFlush.flush_pending(staged_state)}
 
         true ->
+          ShardFlush.schedule_drain_pending_for_pending(staged_state)
           {false, staged_state}
       end
 

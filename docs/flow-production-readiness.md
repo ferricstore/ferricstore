@@ -108,6 +108,14 @@ Monitor:
 
 Operational rule: current Flow state is authoritative; projection lag affects query freshness, not command correctness.
 
+For single-member, any-partition `FLOW.CLAIM_DUE`, the read-only empty precheck
+may omit a Raft command only when the hot index is empty and a complete,
+bounded scan of cold-due rows finds no matching type with a present park record.
+Orphaned due rows and unrelated types cannot satisfy the claim. An incomplete
+scan, unavailable LMDB, in-progress reconcile, or matching cold park takes the
+original replicated path. In particular, an internal schedule may be cold;
+absence from the hot index alone is never proof that it is not due.
+
 ## Retention And Cleanup
 
 Retention deletes logical Flow records after terminal TTLs and history/value policies allow it. Disk space may not be reclaimed immediately because append-only storage still needs compaction/release to catch up.

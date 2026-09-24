@@ -323,7 +323,6 @@ defmodule Ferricstore.Store.Shard.Startup do
               )
           }
 
-          schedule_drain_pending(flush_ms)
           ShardLifecycle.schedule_expiry_sweep()
           ShardLifecycle.schedule_frag_check()
 
