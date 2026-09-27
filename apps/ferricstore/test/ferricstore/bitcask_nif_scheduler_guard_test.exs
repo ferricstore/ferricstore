@@ -23,6 +23,7 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
     v2_pread_at
     v2_pread_batch
     v2_scan_file_page
+    v2_scan_file_page_buffered
     v2_recover_torn_tail
     v2_scan_tombstones_page
     v2_scan_key_states
@@ -164,6 +165,7 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
     for function <- [
           "v2_pread_at",
           "v2_scan_file_page",
+          "v2_scan_file_page_buffered",
           "v2_scan_tombstones_page",
           "v2_read_hint_file_page",
           "v2_pread_batch"
