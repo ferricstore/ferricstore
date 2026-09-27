@@ -329,6 +329,52 @@
     }
 
     #[test]
+    fn metadata_pages_resume_at_exact_boundary_after_buffered_read_ahead() {
+        let dir = temp_dir();
+        let path = dir.path().join("metadata_pages.log");
+        let mut writer = LogWriter::open(&path, 1).unwrap();
+        let large_value = vec![0xAB; 300 * 1024];
+        let first = writer.write(b"large", &large_value, 123).unwrap();
+        let second = writer.write(b"small", b"value", 456).unwrap();
+        let third = writer.write_tombstone(b"deleted").unwrap();
+        drop(writer);
+
+        let mut reader = LogReader::open(&path).unwrap();
+        let (records, next, done) = reader
+            .iter_metadata_page_from_offset_buffered_tolerant(first, 1)
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].value_size, large_value.len() as u32);
+        assert_eq!(next, second);
+        assert!(!done);
+
+        let next_record = reader.read_next_metadata(next).unwrap().unwrap();
+        assert_eq!(next_record.key, b"small");
+        assert_eq!(next_record.offset, next);
+
+        let (records, next, done) = reader
+            .iter_metadata_page_from_offset_buffered_tolerant(next, 1)
+            .unwrap();
+        assert_eq!(records[0].key, b"small");
+        assert_eq!(next, third);
+        assert!(!done);
+
+        let (records, next, done) = reader
+            .iter_metadata_page_from_offset_buffered_tolerant(next, 1)
+            .unwrap();
+        assert!(records[0].is_tombstone);
+        assert_eq!(next, fs::metadata(&path).unwrap().len());
+        assert!(!done);
+
+        let (records, end, done) = reader
+            .iter_metadata_page_from_offset_buffered_tolerant(next, 1)
+            .unwrap();
+        assert!(records.is_empty());
+        assert_eq!(end, next);
+        assert!(done);
+    }
+
+    #[test]
     fn writer_offset_tracks_correctly_across_multiple_writes() {
         let dir = temp_dir();
         let path = dir.path().join("data.log");

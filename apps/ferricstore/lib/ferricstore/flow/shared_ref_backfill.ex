@@ -14,6 +14,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   alias Ferricstore.Flow.RetentionCleanupMember
   alias Ferricstore.Flow.RetentionGuard
   alias Ferricstore.ServerCatalog
+  alias Ferricstore.Store.BlobRef
   alias Ferricstore.Store.BlobValue
   alias Ferricstore.Store.ColdRead
   alias Ferricstore.Store.LFU
@@ -28,6 +29,10 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   @default_fsync_timeout_ms 30_000
   @maximum_hydration_bytes 1 * 1_024 * 1_024 * 1_024
   @staging_root "__ferricstore:shared-ref-backfill:v2:"
+  @rebuild_owner_cache_key {__MODULE__, :rebuild_owner_cache}
+  @max_rebuild_cached_owners 64
+  @max_rebuild_cached_owner_bytes 2 * 1_024 * 1_024
+  @max_rebuild_cached_owner_value_bytes 64 * 1_024
 
   defguardp valid_waraft_location(file_id, offset, value_size)
             when is_tuple(file_id) and tuple_size(file_id) == 2 and
@@ -1839,6 +1844,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   defp shared_count_key?(key), do: flow_suffix?(key, ":svc:")
   defp retention_guard_key?(key), do: flow_suffix?(key, ":rtg:")
   defp flow_state_key?(key), do: flow_suffix?(key, ":s:")
+
   defp cleanup_member_key?(key), do: flow_suffix?(key, ":rtm:")
 
   defp flow_suffix?(key, prefix) do
@@ -1873,8 +1879,66 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   defp rebuild_cleanup_pages!(_ctx, :"$end_of_table"), do: :ok
 
   defp rebuild_cleanup_pages!(ctx, {entries, continuation}) do
-    register_cleanup_entries!(ctx, entries)
+    rebuild_cleanup_page!(ctx, entries)
     rebuild_cleanup_pages!(ctx, :ets.select(continuation))
+  end
+
+  defp rebuild_cleanup_page!(ctx, entries) do
+    previous_cache = Process.get(@rebuild_owner_cache_key, :missing)
+    Process.put(@rebuild_owner_cache_key, %{owners: %{}, bytes: 0})
+
+    try do
+      do_rebuild_cleanup_page!(ctx, entries)
+    after
+      case previous_cache do
+        :missing -> Process.delete(@rebuild_owner_cache_key)
+        previous -> Process.put(@rebuild_owner_cache_key, previous)
+      end
+    end
+  end
+
+  defp do_rebuild_cleanup_page!(ctx, entries) do
+    inserts =
+      Enum.reduce(entries, [], fn
+        {:key, key}, acc when is_binary(key) ->
+          if cleanup_member_key?(key) do
+            case lookup_primary_value!(ctx, key) do
+              {:ok, value} ->
+                case validate_cleanup_member!(ctx, key, value) do
+                  {:ok, index_key, _owned_key} ->
+                    [{index_key, key, 0} | acc]
+
+                  {:stale, index_key, _owned_key} ->
+                    persist_deletes!(ctx, [key])
+
+                    if ctx.native,
+                      do: NativeOrderedIndex.delete_member(ctx.native, index_key, key)
+
+                    acc
+                end
+
+              :not_found ->
+                acc
+            end
+          else
+            acc
+          end
+
+        {:invalid}, _acc ->
+          raise "shared-ref backfill encountered an invalid keydir row"
+
+        _invalid, _acc ->
+          raise "shared-ref backfill encountered an invalid keydir key"
+      end)
+
+    if ctx.native do
+      inserts
+      |> Enum.reverse()
+      |> Enum.chunk_every(128)
+      |> Enum.each(fn chunk -> :ok = NativeOrderedIndex.put_entries(ctx.native, chunk) end)
+    end
+
+    :ok
   end
 
   defp register_cleanup_entries!(ctx, entries) do
@@ -1933,7 +1997,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
        ) do
     state_key = "f:" <> tag <> ":s:" <> owner_id
 
-    case lookup_record!(ctx, state_key) do
+    case lookup_cleanup_owner_record!(ctx, state_key) do
       :not_found ->
         {:stale, index_key, owned_key}
 
@@ -1958,6 +2022,73 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
       _mismatched ->
         raise "shared-ref backfill found forged cleanup member owner"
     end
+  end
+
+  defp lookup_cleanup_owner_record!(ctx, state_key) do
+    case Process.get(@rebuild_owner_cache_key) do
+      %{owners: _owners, bytes: _bytes} = cache ->
+        cached_hot_owner_record!(ctx, state_key, cache)
+
+      _not_rebuilding ->
+        lookup_record!(ctx, state_key)
+    end
+  end
+
+  defp cached_hot_owner_record!(ctx, state_key, cache) do
+    case :ets.lookup(ctx.keydir, state_key) do
+      [{^state_key, encoded, _expiry, _lfu, _file_id, _offset, _size}]
+      when is_binary(encoded) ->
+        if BlobRef.encoded_size?(byte_size(encoded)) do
+          lookup_record!(ctx, state_key)
+        else
+          case Map.get(cache.owners, state_key) do
+            {^encoded, record} ->
+              {:ok, record}
+
+            _stale_or_missing ->
+              {old, owners} = Map.pop(cache.owners, state_key)
+              old_bytes = if is_tuple(old), do: byte_size(elem(old, 0)), else: 0
+              cache = %{cache | owners: owners, bytes: max(cache.bytes - old_bytes, 0)}
+              record = decode_record!(state_key, encoded)
+              maybe_cache_hot_owner!(state_key, encoded, record, cache)
+              {:ok, record}
+          end
+        end
+
+      _cold_or_missing ->
+        lookup_record!(ctx, state_key)
+    end
+  rescue
+    ArgumentError -> lookup_record!(ctx, state_key)
+  end
+
+  defp maybe_cache_hot_owner!(state_key, encoded, record, cache) do
+    size = byte_size(encoded)
+
+    if size <= @max_rebuild_cached_owner_value_bytes and
+         cache.bytes + size <= @max_rebuild_cached_owner_bytes and
+         map_size(cache.owners) < @max_rebuild_cached_owners do
+      Process.put(@rebuild_owner_cache_key, %{
+        cache
+        | owners: Map.put(cache.owners, state_key, {encoded, record}),
+          bytes: cache.bytes + size
+      })
+
+      call_rebuild_owner_cache_hook(state_key, encoded)
+    else
+      Process.put(@rebuild_owner_cache_key, cache)
+    end
+  end
+
+  if Mix.env() == :test do
+    defp call_rebuild_owner_cache_hook(state_key, encoded) do
+      case Application.get_env(:ferricstore, :flow_shared_ref_rebuild_owner_cache_hook) do
+        hook when is_function(hook, 2) -> hook.(state_key, encoded)
+        _missing -> :ok
+      end
+    end
+  else
+    defp call_rebuild_owner_cache_hook(_state_key, _encoded), do: :ok
   end
 
   defp cleanup_member_key(tag, owner_id, owned_key) do

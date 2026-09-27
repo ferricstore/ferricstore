@@ -8,6 +8,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
       alias Ferricstore.Flow.HistoryProjector
       alias Ferricstore.Flow.Keys, as: FlowKeys
       alias Ferricstore.Flow.LMDB, as: FlowLMDB
+      alias Ferricstore.Raft.CommandStamp
       alias Ferricstore.Raft.StateMachine
       alias Ferricstore.Raft.WARaftSegmentReader
       alias Ferricstore.Store.BlobRef
@@ -637,14 +638,14 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
            do: {:ok, sm_state, %{history: %{}}}
 
       defp recover_segment_projected_command(command, position, sm_state) do
-        decoded_command = decoded_replay_command(command)
+        {state_machine_command, decoded_command} = prepare_recovery_command(command)
 
         {projection_command, promotion_keys} =
           prepare_segment_projection_command(decoded_command)
 
         projection_result =
           with_segment_projection_promotion_latches(sm_state, promotion_keys, fn ->
-            with_segment_projection_command_time(command, fn ->
+            with_segment_projection_command_time(state_machine_command, fn ->
               segment_project_command(projection_command, position, sm_state)
             end)
           end)
@@ -655,11 +656,24 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
              %{history: %{}}}
 
           :unsupported ->
-            with_segment_projection_command_time(command, fn ->
-              recover_segment_projected_state_machine_command(command, position, sm_state)
+            with_segment_projection_command_time(state_machine_command, fn ->
+              recover_segment_projected_state_machine_command(
+                state_machine_command,
+                position,
+                sm_state
+              )
             end)
         end
       end
+
+      defp prepare_recovery_command({:ttb, binary} = original) when is_binary(binary) do
+        case CommandStamp.decode_ttb(binary) do
+          {:ok, stamped} -> {stamped, decoded_replay_command(stamped)}
+          {:error, :invalid_preencoded_command} -> {original, decoded_replay_command(original)}
+        end
+      end
+
+      defp prepare_recovery_command(command), do: {command, decoded_replay_command(command)}
 
       if Mix.env() == :test do
         @doc false

@@ -540,6 +540,91 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
              NativeOrderedIndex.range_slice(native, index_key, :neg_inf, :inf, false, 0, :all)
   end
 
+  test "completed cleanup rebuild revalidates an owner changed during its page", test_ctx do
+    id = "changing-cleanup-owner"
+    payload_ref = Keys.value_key(id, :payload, 1, "tenant")
+    result_ref = Keys.value_key(id, :result, 1, "tenant")
+    rec = record(id, payload_ref: payload_ref, result_ref: result_ref)
+    insert_record!(test_ctx, rec)
+
+    append_primary!(test_ctx, [
+      {payload_ref, Flow.encode_value("payload")},
+      {result_ref, Flow.encode_value("result")}
+    ])
+
+    assert :ok = run!(test_ctx)
+    NativeOrderedIndex.reset(test_ctx.flow_index, test_ctx.flow_lookup)
+
+    state_key = Keys.state_key(rec.id, rec.partition_key)
+    prior_encoded = Flow.encode_record(rec)
+    changed_encoded = Flow.encode_record(%{rec | partition_key: "different-tenant", version: 2})
+    hook_calls = :atomics.new(1, signed: false)
+    previous_hook = Application.get_env(:ferricstore, :flow_shared_ref_rebuild_owner_cache_hook)
+
+    Application.put_env(:ferricstore, :flow_shared_ref_rebuild_owner_cache_hook, fn ^state_key,
+                                                                                    _encoded ->
+      if :atomics.compare_exchange(hook_calls, 1, 0, 1) == :ok do
+        true = :ets.update_element(test_ctx.keydir, state_key, {2, changed_encoded})
+      end
+    end)
+
+    on_exit(fn ->
+      if previous_hook == nil,
+        do: Application.delete_env(:ferricstore, :flow_shared_ref_rebuild_owner_cache_hook),
+        else:
+          Application.put_env(
+            :ferricstore,
+            :flow_shared_ref_rebuild_owner_cache_hook,
+            previous_hook
+          )
+    end)
+
+    assert_raise RuntimeError, ~r/forged cleanup member owner/, fn ->
+      run!(test_ctx)
+    end
+
+    assert :atomics.get(hook_calls, 1) == 1
+
+    Application.delete_env(:ferricstore, :flow_shared_ref_rebuild_owner_cache_hook)
+    true = :ets.update_element(test_ctx.keydir, state_key, {2, prior_encoded})
+    NativeOrderedIndex.reset(test_ctx.flow_index, test_ctx.flow_lookup)
+    assert :ok = run!(test_ctx)
+
+    native = NativeOrderedIndex.get(test_ctx.flow_index, test_ctx.flow_lookup)
+    index_key = Keys.retention_cleanup_index_key(rec.id, rec.partition_key)
+    assert 2 == NativeOrderedIndex.count_all(native, index_key)
+  end
+
+  test "completed cleanup rebuild batches members without losing index entries", test_ctx do
+    owners =
+      for i <- 1..260 do
+        id = "batch-cleanup-#{i}"
+        owned_ref = Keys.value_key(id, :result, 1, "tenant")
+        {record(id, result_ref: owned_ref), owned_ref}
+      end
+
+    rows =
+      Enum.flat_map(owners, fn {rec, owned_ref} ->
+        [
+          {Keys.state_key(rec.id, rec.partition_key), Flow.encode_record(rec)},
+          {owned_ref, Flow.encode_value("result")}
+        ]
+      end)
+
+    append_primary!(test_ctx, rows)
+    assert :ok = run!(test_ctx)
+
+    NativeOrderedIndex.reset(test_ctx.flow_index, test_ctx.flow_lookup)
+    assert :ok = run!(test_ctx)
+
+    native = NativeOrderedIndex.get(test_ctx.flow_index, test_ctx.flow_lookup)
+
+    Enum.each(owners, fn {rec, _owned_ref} ->
+      index_key = Keys.retention_cleanup_index_key(rec.id, rec.partition_key)
+      assert 1 == NativeOrderedIndex.count_all(native, index_key)
+    end)
+  end
+
   test "governance owner comes from the encoded record, not an ambiguous key prefix", test_ctx do
     short = record("order")
     shadow = record("order:child")

@@ -370,13 +370,11 @@ defmodule Ferricstore.Application do
 
     concurrency =
       Keyword.get_lazy(opts, :max_concurrency, fn ->
-        if System.schedulers_online() > 1 and
-             Ferricstore.OperationalLimits.memory_limit_bytes() >= 4 * 1024 * 1024 * 1024,
-           do: 2,
-           else: 1
+        Ferricstore.OperationalLimits.memory_limit_bytes()
+        |> Ferricstore.OperationalLimits.startup_recovery_concurrency()
       end)
 
-    concurrency = if is_integer(concurrency) and concurrency > 0, do: min(concurrency, 2), else: 1
+    concurrency = if is_integer(concurrency) and concurrency > 0, do: min(concurrency, 3), else: 1
 
     # Shards have published their own keydirs, but Raft has not started yet.
     # Recover the largest logs first with a small memory-aware cap, then keep

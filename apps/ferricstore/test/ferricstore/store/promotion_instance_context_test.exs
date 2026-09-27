@@ -547,7 +547,10 @@ defmodule Ferricstore.Store.PromotionInstanceContextTest do
         ) and File.dir?(dedicated_path)
     end)
 
-    assert GenServer.call(shard, {:promoted?, redis_key}, 1_000)
+    # The 1 ms deadline exercises the deferred cleanup path. A read may race
+    # the worker's latch handoff even after its state and directory are visible.
+    restore_env(:promotion_compaction_latch_timeout_ms, old_timeout)
+    assert GenServer.call(shard, {:promoted?, redis_key}, 5_000)
   end
 
   test "stale removal drops an old promoted route without cancelling a new pending incarnation",

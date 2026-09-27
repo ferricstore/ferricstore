@@ -11,9 +11,28 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
       alias Ferricstore.Raft.MembershipGate
       alias Ferricstore.Raft.WARaftBackend.Batcher, as: NamespaceBatcher
       alias Ferricstore.Raft.WARaftBackend.BatcherSupervisor, as: NamespaceBatcherSupervisor
+      alias Ferricstore.Raft.WARaftBackend.StartupPreopen
       alias Ferricstore.Raft.WARaftBackend.SyncGate
 
       defp start_partitions(specs) when is_list(specs) do
+        ctx = context!(@table)
+        memory_bytes = ctx.max_memory_bytes
+
+        case StartupPreopen.prepare(specs, memory_bytes, ctx.memory_limit) do
+          :ok ->
+            try do
+              start_preopened_partitions(specs)
+            after
+              StartupPreopen.cancel(specs)
+            end
+
+          {:error, _reason} = error ->
+            StartupPreopen.cancel(specs)
+            error
+        end
+      end
+
+      defp start_preopened_partitions(specs) do
         supervisor = :wa_raft_sup.default_name(@app)
         max_concurrency = startup_partition_concurrency(length(specs))
 

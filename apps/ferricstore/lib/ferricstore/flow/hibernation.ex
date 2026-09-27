@@ -428,6 +428,53 @@ defmodule Ferricstore.Flow.Hibernation do
     {:error, :invalid_promotion_scan, promotion_scan_result(fallback_cursor, acc)}
   end
 
+  @doc false
+  def empty_promotion_scan_cursor(
+        start_ms,
+        horizon_ms,
+        cursor,
+        bucket_ms,
+        recent_pages,
+        backfill_pages
+      )
+      when is_integer(start_ms) and start_ms >= 0 and start_ms <= @max_u64 and
+             is_integer(horizon_ms) and horizon_ms >= start_ms and horizon_ms <= @max_u64 and
+             is_integer(bucket_ms) and bucket_ms > 0 and bucket_ms <= @max_u64 and
+             is_integer(recent_pages) and recent_pages > 0 and
+             recent_pages <= @max_promotion_scan_pages and is_integer(backfill_pages) and
+             backfill_pages > 0 and backfill_pages <= @max_promotion_scan_pages do
+    first = LMDB.cold_due_bucket_ms(start_ms, bucket_ms)
+    last = LMDB.cold_due_bucket_ms(horizon_ms, bucket_ms)
+    recent_start = max(first, last - (recent_pages - 1) * bucket_ms)
+
+    start_cursor =
+      normalize_promotion_scan_cursor(
+        cursor || %{bucket_ms: recent_start, after_key: nil},
+        first,
+        last,
+        bucket_ms
+      )
+
+    pages_to_wrap = div(last - start_cursor.bucket_ms, bucket_ms) + 1
+
+    next_bucket =
+      if pages_to_wrap <= backfill_pages,
+        do: first,
+        else: start_cursor.bucket_ms + backfill_pages * bucket_ms
+
+    {:ok, %{bucket_ms: next_bucket, after_key: nil}}
+  end
+
+  def empty_promotion_scan_cursor(
+        _start_ms,
+        _horizon_ms,
+        _cursor,
+        _bucket_ms,
+        _recent_pages,
+        _backfill_pages
+      ),
+      do: {:error, :invalid_promotion_scan}
+
   defp do_reduce_promotion_buckets(
          first_bucket,
          last_bucket,

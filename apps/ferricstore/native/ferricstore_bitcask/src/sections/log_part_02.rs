@@ -144,6 +144,25 @@ impl LogReader {
         self.file.seek(SeekFrom::Start(offset))?;
         iter_metadata_page_tolerant(&mut self.file, offset, limit)
     }
+
+    /// Startup history recovery scans use buffered reads to validate large
+    /// streams without a read syscall for every record header and key.
+    pub fn iter_metadata_page_from_offset_buffered_tolerant(
+        &mut self,
+        offset: u64,
+        limit: usize,
+    ) -> Result<(Vec<RecordMetadata>, u64, bool)> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        // Each record has a small header and key followed by value bytes. Avoid
+        // issuing a separate read syscall for each piece while validating a
+        // page; the next page seeks to its exact returned record boundary.
+        let mut reader = std::io::BufReader::with_capacity(256 * 1024, &mut self.file);
+        let page = iter_metadata_page_tolerant(&mut reader, offset, limit)?;
+        // The buffer may have read into the following page. Preserve the
+        // original file cursor contract for callers that reuse this reader.
+        self.file.seek(SeekFrom::Start(page.1))?;
+        Ok(page)
+    }
 }
 
 /// Verify every complete frame in a committed prefix, then hash those exact

@@ -83,6 +83,44 @@ defmodule Ferricstore.ApplicationTest do
       assert :ok = Task.await(startup)
     end
 
+    @tag :history_three
+    @tag timeout: 180_000
+    test "larger memory budget recovers three history shards before starting the fourth" do
+      prior_limit = Application.get_env(:ferricstore, :operational_memory_limit_bytes)
+      Application.put_env(:ferricstore, :operational_memory_limit_bytes, 5 * 1024 * 1024 * 1024)
+      on_exit(fn -> restore_env(:operational_memory_limit_bytes, prior_limit) end)
+
+      if System.schedulers_online() >= 3 do
+        parent = self()
+        ctx = %{data_dir: System.tmp_dir!(), keydir_refs: {:first, :second, :third, :fourth}}
+
+        recovery = fn _ctx, index, _path, _keydir ->
+          send(parent, {:parallel_history_started, index, self()})
+          receive do: (:release_history -> :ok)
+        end
+
+        startup =
+          Task.async(fn ->
+            Ferricstore.Application.recover_flow_history_shards(ctx, 4, recover_fun: recovery)
+          end)
+
+        assert_receive {:parallel_history_started, 0, first}, 1_000
+        assert_receive {:parallel_history_started, 1, second}, 1_000
+        assert_receive {:parallel_history_started, 2, third}, 1_000
+        refute_receive {:parallel_history_started, 3, _pid}, 50
+
+        send(first, :release_history)
+        assert_receive {:parallel_history_started, 3, fourth}, 1_000
+        refute Task.yield(startup, 50)
+
+        Enum.each([second, third, fourth], &send(&1, :release_history))
+        assert :ok = Task.await(startup)
+      else
+        assert Ferricstore.OperationalLimits.startup_recovery_concurrency(5 * 1024 * 1024 * 1024) <=
+                 2
+      end
+    end
+
     test "startup history recovery returns shard errors instead of admitting writes" do
       ctx = %{data_dir: System.tmp_dir!(), keydir_refs: {:first, :second}}
 

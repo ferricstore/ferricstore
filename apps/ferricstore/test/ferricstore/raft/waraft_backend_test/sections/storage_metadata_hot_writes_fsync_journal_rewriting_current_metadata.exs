@@ -152,6 +152,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageMetadataHotWritesFs
         end
       end
 
+      @tag :bounded_checkpoint
       test "segment projection checkpoint runs in background with pending guard", %{ctx: ctx} do
         assert {:ok, _apps} = Application.ensure_all_started(:telemetry)
 
@@ -257,6 +258,173 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageMetadataHotWritesFs
         end
       end
 
+      @tag :bounded_checkpoint
+      test "checkpoint rejects a keydir scan after the shard position advances", %{ctx: ctx} do
+        parent = self()
+        handler_id = {__MODULE__, :stale_checkpoint_cut, make_ref()}
+
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :waraft, :segment_projection_checkpoint, :stop],
+          &__MODULE__.handle_segment_projection_checkpoint_telemetry/4,
+          parent
+        )
+
+        previous_every =
+          Application.get_env(:ferricstore, :waraft_segment_projection_checkpoint_every)
+
+        previous_interval =
+          Application.get_env(:ferricstore, :waraft_segment_projection_checkpoint_min_interval_ms)
+
+        previous_hook =
+          Application.get_env(:ferricstore, :waraft_segment_projection_checkpoint_hook)
+
+        hook = fn
+          :before_scan, _metadata ->
+            send(parent, {:checkpoint_before_scan, self()})
+
+            receive do
+              :resume_scan -> :ok
+            after
+              10_000 -> :ok
+            end
+
+          _phase, _metadata ->
+            :ok
+        end
+
+        try do
+          Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, :never)
+
+          Application.put_env(
+            :ferricstore,
+            :waraft_segment_projection_checkpoint_min_interval_ms,
+            30_000
+          )
+
+          Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_hook, hook)
+          assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, 2)
+          assert :ok = WARaftBackend.write(0, {:put, "checkpoint-cut:k1", "v1", 0})
+          assert_receive {:checkpoint_before_scan, checkpoint_pid}, 2_000
+
+          assert :ok = WARaftBackend.write(0, {:put, "checkpoint-cut:k2", "v2", 0})
+          send(checkpoint_pid, :resume_scan)
+
+          assert_receive {:waraft_segment_projection_checkpoint,
+                          [:ferricstore, :waraft, :segment_projection_checkpoint, :stop],
+                          _measurements, %{result: :stale_cut, shard_index: 0}},
+                         2_000
+
+          assert "v2" == Router.get(ctx, "checkpoint-cut:k2")
+
+          assert Keyword.fetch!(waraft_storage_status(0), :segment_projection_checkpoint_pending?) ==
+                   false
+
+          Application.put_env(
+            :ferricstore,
+            :waraft_segment_projection_checkpoint_min_interval_ms,
+            0
+          )
+
+          assert :ok = WARaftBackend.write(0, {:put, "checkpoint-cut:k3", "v3", 0})
+          refute_receive {:checkpoint_before_scan, _another_pid}, 100
+        after
+          Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, :never)
+          WARaftBackend.stop()
+          restore_env(:waraft_segment_projection_checkpoint_every, previous_every)
+          restore_env(:waraft_segment_projection_checkpoint_min_interval_ms, previous_interval)
+          restore_env(:waraft_segment_projection_checkpoint_hook, previous_hook)
+          :telemetry.detach(handler_id)
+        end
+      end
+
+      @tag :bounded_checkpoint
+      test "background checkpoint defers another shard while one snapshot is running", %{
+        root: root
+      } do
+        parent = self()
+        multi_root = Path.join(root, "bounded-checkpoint")
+        Ferricstore.DataDir.ensure_layout!(multi_root, 2)
+        Ferricstore.Store.ActiveFile.init(2)
+        ctx = build_ctx(multi_root, shard_count: 2)
+
+        handler_id = {__MODULE__, :bounded_checkpoint, make_ref()}
+
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :waraft, :segment_projection_checkpoint, :stop],
+          &__MODULE__.handle_segment_projection_checkpoint_telemetry/4,
+          parent
+        )
+
+        previous_every =
+          Application.get_env(:ferricstore, :waraft_segment_projection_checkpoint_every)
+
+        previous_interval =
+          Application.get_env(:ferricstore, :waraft_segment_projection_checkpoint_min_interval_ms)
+
+        previous_hook =
+          Application.get_env(:ferricstore, :waraft_segment_projection_checkpoint_hook)
+
+        hook = fn :before_write, %{shard_index: shard_index} ->
+          send(parent, {:checkpoint_slot_acquired, self(), shard_index})
+
+          receive do
+            :release_checkpoint -> :ok
+          after
+            10_000 -> :ok
+          end
+        end
+
+        try do
+          Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, :never)
+
+          Application.put_env(
+            :ferricstore,
+            :waraft_segment_projection_checkpoint_min_interval_ms,
+            0
+          )
+
+          Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_hook, hook)
+          assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          key0 = key_for_shard(ctx, 0, "bounded-checkpoint:0")
+          key1 = key_for_shard(ctx, 1, "bounded-checkpoint:1")
+
+          Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, 2)
+          assert :ok = WARaftBackend.write(0, {:put, key0, "v0", 0})
+          assert_receive {:checkpoint_slot_acquired, checkpoint_pid, 0}, 2_000
+
+          assert :ok = WARaftBackend.write(1, {:put, key1, "v1", 0})
+
+          assert_receive {:waraft_segment_projection_checkpoint,
+                          [:ferricstore, :waraft, :segment_projection_checkpoint, :stop],
+                          _measurements, %{result: :busy, shard_index: 1}},
+                         2_000
+
+          refute_receive {:checkpoint_slot_acquired, _other_pid, 1}, 100
+          assert "v1" == Router.get(ctx, key1)
+
+          send(checkpoint_pid, :release_checkpoint)
+
+          assert_receive {:waraft_segment_projection_checkpoint,
+                          [:ferricstore, :waraft, :segment_projection_checkpoint, :stop],
+                          _measurements, %{result: :ok, shard_index: 0}},
+                         2_000
+        after
+          Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, :never)
+          WARaftBackend.stop()
+          restore_env(:waraft_segment_projection_checkpoint_every, previous_every)
+          restore_env(:waraft_segment_projection_checkpoint_min_interval_ms, previous_interval)
+          restore_env(:waraft_segment_projection_checkpoint_hook, previous_hook)
+          :telemetry.detach(handler_id)
+          FerricStore.Instance.cleanup(ctx.name)
+        end
+      end
+
+      @tag :bounded_checkpoint
       test "trim reuses background segment projection checkpoint", %{ctx: ctx} do
         assert {:ok, _apps} = Application.ensure_all_started(:telemetry)
 
@@ -346,6 +514,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageMetadataHotWritesFs
         end
       end
 
+      @tag :bounded_checkpoint
       test "background segment projection checkpoint does not clobber active projection rows", %{
         root: root,
         ctx: ctx
@@ -430,6 +599,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageMetadataHotWritesFs
         end
       end
 
+      @tag :bounded_checkpoint
       test "background segment projection checkpoint is serialized with projection trim", %{
         ctx: ctx
       } do

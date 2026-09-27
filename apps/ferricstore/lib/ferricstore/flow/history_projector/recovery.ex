@@ -29,9 +29,12 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
     keydir = keydir_override || HistoryProjector.keydir(instance_ctx, shard_index)
     recovery_ctx = {instance_ctx, shard_index, shard_data_path, keydir}
 
-    case Log.reduce_metadata_pages(file_path, start_offset, {:ok, %{}, %{}}, fn record, acc ->
-           recover_history_record(record, acc, recovery_ctx)
-         end) do
+    case Log.reduce_metadata_pages_buffered(
+           file_path,
+           start_offset,
+           {:ok, %{}, %{}},
+           fn record, acc -> recover_history_record(record, acc, recovery_ctx) end
+         ) do
       {:ok, {:ok, live_records, tombstones}}
       when map_size(live_records) == 0 and map_size(tombstones) == 0 ->
         :ok

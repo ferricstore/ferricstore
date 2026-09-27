@@ -3,14 +3,9 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinator do
 
   use GenServer
 
-  @default_max_concurrent 1
-  @parallel_rebuild_memory_bytes 4 * 1024 * 1024 * 1024
-
   def default_max_concurrent do
-    if System.schedulers_online() > 1 and
-         Ferricstore.OperationalLimits.memory_limit_bytes() >= @parallel_rebuild_memory_bytes,
-       do: 2,
-       else: @default_max_concurrent
+    Ferricstore.OperationalLimits.memory_limit_bytes()
+    |> Ferricstore.OperationalLimits.startup_recovery_concurrency()
   end
 
   def start_link(opts) do
@@ -127,8 +122,11 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinator do
 
   defp configured_max_concurrent do
     case Application.get_env(:ferricstore, :flow_lmdb_max_concurrent_flushes) do
-      value when is_integer(value) and value > 0 -> value
-      _unset_or_invalid -> default_max_concurrent()
+      value when is_integer(value) and value > 0 ->
+        value
+
+      _unset_or_invalid ->
+        default_max_concurrent()
     end
   end
 

@@ -4,6 +4,20 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.23 - 2026-09-27
+
+- Shorten crash restart by buffering validated Flow-history tail scans only at
+  startup, preopening independent Raft storage shards within memory-aware
+  limits, and admitting up to three concurrent startup LMDB rebuilds. Normal
+  LMDB flush admission returns to one worker after startup.
+- Batch recovery-only Flow value-pin writes and shared-ref cleanup index inserts;
+  reuse only page-local, exactly matching hot owner records. WAL frames,
+  references, and derived history boundaries remain validated.
+- Prove empty cold-due windows during WAL replay with bounded LMDB reads and
+  transaction checks, falling back to the original scan on uncertainty.
+  Serialize and validate background projection checkpoints without treating
+  them as a crash-recovery shortcut.
+
 ## 0.11.22 - 2026-09-24
 
 - Bound WARaft offset memory with derived, validated disk indexes and bounded

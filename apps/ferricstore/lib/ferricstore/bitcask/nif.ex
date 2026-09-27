@@ -473,6 +473,13 @@ defmodule Ferricstore.Bitcask.NIF do
           | {:error, term()}
   def v2_scan_file_page(_path, _start_offset, _limit), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec v2_scan_file_page_buffered(binary(), non_neg_integer(), pos_integer()) ::
+          {:ok, [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), boolean()}],
+           non_neg_integer(), boolean()}
+          | {:error, term()}
+  def v2_scan_file_page_buffered(_path, _start_offset, _limit),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec v2_validated_log_prefix_digest(binary(), non_neg_integer()) ::
           {:ok, <<_::256>>} | {:error, term()}
   def v2_validated_log_prefix_digest(_path, _prefix_bytes), do: :erlang.nif_error(:nif_not_loaded)
@@ -745,6 +752,10 @@ defmodule Ferricstore.Bitcask.NIF do
           {:ok, [{binary(), binary()}]} | {:error, term()}
   def lmdb_prefix_entries(_path, _prefix, _limit, _map_size),
     do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec lmdb_last_txn_id(binary(), non_neg_integer()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def lmdb_last_txn_id(_path, _map_size), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec lmdb_prefix_entries_after(
           binary(),

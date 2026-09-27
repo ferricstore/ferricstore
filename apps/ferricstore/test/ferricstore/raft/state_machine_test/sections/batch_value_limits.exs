@@ -1713,6 +1713,55 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.BatchValueLimits do
           assert {:ok, _next_state, %{history: %{}}} = Task.await(recovery, 5_000)
         end
 
+        @tag :segment_replay_decode
+        test "segment recovery reuses decoded TTB without dropping apply-context wrappers", %{
+          state: state
+        } do
+          key = "f:{segment-ttb-state}:s"
+
+          record =
+            Ferricstore.Flow.Codec.encode_record(%{
+              id: "segment-ttb-state",
+              type: "job",
+              state: "running",
+              version: 1,
+              created_at_ms: 1,
+              updated_at_ms: 1
+            })
+
+          {written_state, :ok} = StateMachine.apply(%{}, {:put, key, record, 0}, state)
+
+          context = Ferricstore.Raft.ApplyContext.new(compound_member_apply_budget: 1)
+          encoded_context = Ferricstore.Raft.ApplyContext.encode(context)
+
+          command =
+            Ferricstore.Raft.CommandStamp.to_ttb(
+              {:ferricstore_apply_context, encoded_context, {:flow_consistent_state, key}}
+            )
+
+          {:ok, stamped_command} =
+            command |> elem(1) |> Ferricstore.Raft.CommandStamp.decode_ttb()
+
+          position = {:raft_log_pos, 77, 2}
+
+          assert {:ok, replayed, %{history: %{}}} =
+                   WARaftStorage.__recover_segment_projected_command_for_test__(
+                     command,
+                     position,
+                     written_state
+                   )
+
+          assert {:ok, expected, %{history: %{}}} =
+                   WARaftStorage.__recover_segment_projected_command_for_test__(
+                     stamped_command,
+                     position,
+                     written_state
+                   )
+
+          assert replayed.apply_context_encoded == encoded_context
+          assert replayed == expected
+        end
+
         @tag :segment_batch_preparation
         test "segment recovery holds promotion latches while projecting raw compound storage keys",
              %{state: state} do
