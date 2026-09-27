@@ -520,7 +520,7 @@ defmodule Ferricstore.Flow.HibernationTest do
     assert init_source =~ "flow_hibernation_promotion_cursor: nil"
     assert claim_source =~ "Hibernation.reduce_promotion_buckets("
     assert claim_source =~ "Ferricstore.Flow.LMDB.prefix_entries_after("
-    assert claim_source =~ "apply_state_put(\n              :flow_hibernation_promotion_cursor"
+    assert claim_source =~ ~r/apply_state_put\(\s*:flow_hibernation_promotion_cursor/
 
     assert callbacks_source =~
              "Map.put(state, :flow_hibernation_promotion_cursor, cursor)"
@@ -685,6 +685,65 @@ defmodule Ferricstore.Flow.HibernationTest do
         hot_window_ms: 1,
         safety_margin_ms: 0
       )
+    end
+  end
+
+  test "closed-form empty promotion cursor matches the bounded page walker" do
+    bucket_ms = 60_000
+    first = 120_000
+    empty_scan = fn _prefix, _after_key, _limit -> {:ok, []} end
+    ignore_entry = fn _entry, acc -> {:cont, acc} end
+
+    for bucket_count <- [1, 2, 7, 16, 17, 64, 65, 130] do
+      horizon = first + (bucket_count - 1) * bucket_ms
+      recent_start = max(first, horizon - 15 * bucket_ms)
+
+      cursors = [
+        nil,
+        %{bucket_ms: first, after_key: nil},
+        %{bucket_ms: horizon, after_key: nil},
+        %{
+          bucket_ms: recent_start,
+          after_key: LMDB.cold_due_bucket_prefix(recent_start) <> ":resume"
+        },
+        %{bucket_ms: first - bucket_ms, after_key: nil}
+      ]
+
+      for cursor <- cursors do
+        assert {:ok, recent} =
+                 Hibernation.reduce_promotion_buckets(
+                   recent_start,
+                   horizon,
+                   nil,
+                   [bucket_ms: bucket_ms, max_pages: 16, max_entries: 128],
+                   :empty,
+                   empty_scan,
+                   ignore_entry
+                 )
+
+        backfill_cursor = cursor || %{bucket_ms: recent_start, after_key: nil}
+
+        assert {:ok, backfill} =
+                 Hibernation.reduce_promotion_buckets(
+                   first,
+                   horizon,
+                   backfill_cursor,
+                   [bucket_ms: bucket_ms, max_pages: 64, max_entries: 1_000],
+                   recent.acc,
+                   empty_scan,
+                   ignore_entry
+                 )
+
+        assert {:ok, backfill.cursor} ==
+                 Hibernation.empty_promotion_scan_cursor(
+                   first,
+                   horizon,
+                   cursor,
+                   bucket_ms,
+                   16,
+                   64
+                 )
+      end
     end
   end
 

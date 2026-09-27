@@ -97,6 +97,9 @@ defmodule Ferricstore.Raft.StateMachineTest.CurrentStateMachine do
   defdelegate apply_standalone_command(command, meta, state), to: StateMachine
   defdelegate apply_standalone_cross_shard(execute_fn, state), to: StateMachine
 
+  defdelegate __recovery_empty_cold_due_cursor_for_test__(state, path, start_ms, horizon_ms),
+    to: StateMachine
+
   defdelegate __apply_pending_locations_for_test__(state, file_id, batch, locations),
     to: StateMachine
 
@@ -331,6 +334,230 @@ defmodule Ferricstore.Raft.StateMachineTest do
              StateMachine.apply(%{}, command, state)
 
     assert [] = :ets.lookup(ets, "old-async")
+  end
+
+  @tag :replay_empty_cold_due
+  test "recovery proves an empty cold-due bucket window and rejects a later row", %{
+    state: state,
+    dir: dir
+  } do
+    path = Ferricstore.Flow.LMDB.path(dir)
+    recovery_state = Map.put(state, :waraft_recovery_before_index, 42)
+    start_ms = 120_000
+    horizon_ms = 360_000
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put, "unrelated", "value"}])
+
+    assert {:ok, cursor, transaction_id} =
+             StateMachine.__recovery_empty_cold_due_cursor_for_test__(
+               recovery_state,
+               path,
+               start_ms,
+               horizon_ms
+             )
+
+    assert is_map(cursor)
+    assert Ferricstore.Flow.LMDB.last_txn_id(path) == {:ok, transaction_id}
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(path, [
+               Ferricstore.Flow.LMDB.flush_in_progress_put_op()
+             ])
+
+    assert :not_proven =
+             StateMachine.__recovery_empty_cold_due_cursor_for_test__(
+               recovery_state,
+               path,
+               start_ms,
+               horizon_ms
+             )
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(path, [
+               Ferricstore.Flow.LMDB.flush_in_progress_delete_op()
+             ])
+
+    malformed_key = Ferricstore.Flow.LMDB.cold_due_bucket_prefix(start_ms)
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put, malformed_key, "malformed"}])
+
+    assert :not_proven =
+             StateMachine.__recovery_empty_cold_due_cursor_for_test__(
+               recovery_state,
+               path,
+               start_ms,
+               horizon_ms
+             )
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:delete, malformed_key}])
+
+    for bucket <- [start_ms, 180_000, horizon_ms] do
+      due_key =
+        Ferricstore.Flow.LMDB.Cold.due_key(%{
+          bucket_ms: bucket,
+          due_at_ms: bucket,
+          type: "job",
+          state: "queued",
+          partition_key: "tenant",
+          priority: 0,
+          flow_id: "due-#{bucket}",
+          version: 1
+        })
+
+      assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put, due_key, "park-key"}])
+
+      assert :not_proven =
+               StateMachine.__recovery_empty_cold_due_cursor_for_test__(
+                 recovery_state,
+                 path,
+                 start_ms,
+                 horizon_ms
+               )
+
+      assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:delete, due_key}])
+    end
+
+    outside_due =
+      Ferricstore.Flow.LMDB.Cold.due_key(%{
+        bucket_ms: 420_000,
+        due_at_ms: 420_000,
+        type: "job",
+        state: "queued",
+        partition_key: "tenant",
+        priority: 0,
+        flow_id: "outside-window",
+        version: 1
+      })
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put, outside_due, "park-key"}])
+
+    assert {:ok, _cursor, _txn} =
+             StateMachine.__recovery_empty_cold_due_cursor_for_test__(
+               recovery_state,
+               path,
+               start_ms,
+               horizon_ms
+             )
+
+    assert :not_proven =
+             StateMachine.__recovery_empty_cold_due_cursor_for_test__(
+               state,
+               path,
+               start_ms,
+               horizon_ms
+             )
+  end
+
+  @tag :replay_empty_cold_due
+  test "an empty recovery claim preserves the authoritative cursor and result", %{
+    state: state,
+    dir: dir
+  } do
+    path = Ferricstore.Flow.LMDB.path(dir)
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put, "unrelated", "value"}])
+
+    attrs = %{
+      type: "job",
+      state: "queued",
+      worker: "empty-claim-worker",
+      lease_ms: 30_000,
+      limit: 1,
+      priority: 0,
+      partition_key: "tenant",
+      now_ms: 240_000,
+      cold_due_mode: :allow
+    }
+
+    command = {:flow_claim_due, nil, attrs}
+    meta = %{index: 43, system_time: 240_000}
+
+    for cursor <- [
+          nil,
+          %{bucket_ms: 180_000, after_key: nil},
+          %{
+            bucket_ms: 180_000,
+            after_key: Ferricstore.Flow.LMDB.cold_due_bucket_prefix(180_000) <> ":resume"
+          }
+        ] do
+      initial = %{state | flow_hibernation_promotion_cursor: cursor}
+
+      {normal, {:applied_at, 43, normal_result}, _normal_effects} =
+        StateMachine.apply(meta, command, initial)
+
+      recovery_state = Map.put(initial, :waraft_recovery_before_index, 43)
+
+      {replayed, {:applied_at, 43, replay_result}, _replay_effects} =
+        StateMachine.apply(meta, command, recovery_state)
+
+      assert normal_result == {:ok, []}
+      assert replay_result == normal_result
+      assert is_map(normal.flow_hibernation_promotion_cursor)
+
+      assert replayed.flow_hibernation_promotion_cursor ==
+               normal.flow_hibernation_promotion_cursor
+    end
+  end
+
+  @tag :replay_empty_cold_due
+  test "a concurrent LMDB commit falls back to the authoritative claim scan", %{
+    state: state,
+    dir: dir
+  } do
+    path = Ferricstore.Flow.LMDB.path(dir)
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put, "unrelated", "value"}])
+
+    attrs = %{
+      type: "job",
+      state: "queued",
+      worker: "stale-proof-worker",
+      lease_ms: 30_000,
+      limit: 1,
+      priority: 0,
+      partition_key: "tenant",
+      now_ms: 240_000,
+      cold_due_mode: :allow
+    }
+
+    command = {:flow_claim_due, nil, attrs}
+    meta = %{index: 44, system_time: 240_000}
+
+    {normal, {:applied_at, 44, normal_result}, _effects} =
+      StateMachine.apply(meta, command, state)
+
+    previous_hook = Application.get_env(:ferricstore, :flow_recovery_cold_due_proof_hook)
+    parent = self()
+    handler_id = {:replay_cold_due_stale, make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :flow, :replay_cold_due_proof, :stale],
+      fn _event, measurements, metadata, pid ->
+        send(pid, {:stale_cold_due_proof, measurements, metadata})
+      end,
+      parent
+    )
+
+    Application.put_env(:ferricstore, :flow_recovery_cold_due_proof_hook, fn lmdb_path ->
+      :ok =
+        Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:put, "changed-during-proof", "value"}])
+    end)
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+
+      if previous_hook == nil,
+        do: Application.delete_env(:ferricstore, :flow_recovery_cold_due_proof_hook),
+        else: Application.put_env(:ferricstore, :flow_recovery_cold_due_proof_hook, previous_hook)
+    end)
+
+    recovery_state = Map.put(state, :waraft_recovery_before_index, 44)
+
+    {replayed, {:applied_at, 44, replay_result}, _effects} =
+      StateMachine.apply(meta, command, recovery_state)
+
+    assert_receive {:stale_cold_due_proof, %{count: 1}, %{shard_index: shard_index}}, 1_000
+    assert shard_index == state.shard_index
+    assert replay_result == normal_result
+    assert replayed.flow_hibernation_promotion_cursor == normal.flow_hibernation_promotion_cursor
   end
 
   test "replicated Flow state reads are ordered and do not mutate state", %{

@@ -682,6 +682,14 @@ fn lmdb_prefix_entries<'a>(
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
+fn lmdb_last_txn_id<'a>(env: Env<'a>, path: String, map_size: u64) -> NifResult<Term<'a>> {
+    match lmdb_store(&path, map_size) {
+        Ok(store) => Ok((atoms::ok(), store.env.info().last_txn_id as u64).encode(env)),
+        Err(error) => Ok((atoms::error(), error).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn lmdb_prefix_entries_after<'a>(
     env: Env<'a>,

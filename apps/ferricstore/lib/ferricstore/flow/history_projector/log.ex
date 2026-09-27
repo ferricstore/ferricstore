@@ -42,7 +42,18 @@ defmodule Ferricstore.Flow.HistoryProjector.Log do
   def reduce_metadata_pages(file_path, offset, acc, reducer)
       when is_binary(file_path) and is_integer(offset) and offset >= 0 and
              is_function(reducer, 2) do
-    case NIF.v2_scan_file_page(file_path, offset, @scan_page_records) do
+    reduce_metadata_pages_with(file_path, offset, acc, reducer, &NIF.v2_scan_file_page/3)
+  end
+
+  @doc false
+  def reduce_metadata_pages_buffered(file_path, offset, acc, reducer)
+      when is_binary(file_path) and is_integer(offset) and offset >= 0 and
+             is_function(reducer, 2) do
+    reduce_metadata_pages_with(file_path, offset, acc, reducer, &NIF.v2_scan_file_page_buffered/3)
+  end
+
+  defp reduce_metadata_pages_with(file_path, offset, acc, reducer, scanner) do
+    case scanner.(file_path, offset, @scan_page_records) do
       {:ok, records, next_offset, done}
       when is_list(records) and is_integer(next_offset) and next_offset >= offset and
              is_boolean(done) ->
@@ -53,7 +64,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Log do
             {:ok, next_acc}
 
           next_offset > offset ->
-            reduce_metadata_pages(file_path, next_offset, next_acc, reducer)
+            reduce_metadata_pages_with(file_path, next_offset, next_acc, reducer, scanner)
 
           true ->
             {:error, {:history_scan_stalled, offset}}

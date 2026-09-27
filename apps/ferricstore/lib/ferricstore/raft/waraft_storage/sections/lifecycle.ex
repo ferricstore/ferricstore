@@ -35,6 +35,15 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
 
       @spec open(map(), charlist() | binary()) :: handle()
       def open(options, root_dir) do
+        case Ferricstore.Raft.WARaftBackend.StartupPreopen.take(to_path(root_dir), options) do
+          {:ok, handle} -> handle
+          :not_preopened -> open_unprepared(options, root_dir)
+          {:error, reason} -> raise "failed to adopt preopened WARaft storage: #{inspect(reason)}"
+        end
+      end
+
+      @doc false
+      def open_unprepared(options, root_dir) do
         root_dir = to_path(root_dir)
         ctx = Ferricstore.Raft.WARaftBackend.context!(Map.fetch!(options, :table))
         shard_index = Map.fetch!(options, :partition) - 1
@@ -406,6 +415,24 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
       def read(_command, _position, _handle), do: :ok
 
       @spec info(term(), handle()) :: {:ok, handle()} | :ignore
+      def info(
+            {:ferricstore_waraft_segment_projection_checkpoint_cut, worker, ref, position},
+            handle
+          )
+          when is_pid(worker) and is_reference(ref) do
+        result =
+          case Map.get(handle, :segment_projection_checkpoint) do
+            %{ref: ^ref, position: ^position} ->
+              if handle.position == position, do: :ok, else: :stale
+
+            _other ->
+              :stale
+          end
+
+        send(worker, {:ferricstore_waraft_segment_projection_checkpoint_cut, ref, result})
+        {:ok, handle}
+      end
+
       def info({:ferricstore_waraft_segment_projection_checkpoint_done, ref, result}, handle) do
         finish_segment_projection_checkpoint(ref, result, handle)
       end

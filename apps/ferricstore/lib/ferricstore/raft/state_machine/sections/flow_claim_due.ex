@@ -19,6 +19,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
       alias Ferricstore.Flow.DueCatalog
       alias Ferricstore.Flow.Hibernation
       alias Ferricstore.Flow.HistoryProjector
+      alias Ferricstore.Flow.LMDB
       alias Ferricstore.Flow.Locator
       alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
       alias Ferricstore.Flow.Keys, as: FlowKeys
@@ -318,6 +319,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
       @flow_hibernation_backfill_scan_entries 1_000
       @flow_hibernation_max_promotions 1_000
       @flow_hibernation_bucket_ms 60_000
+      @flow_hibernation_max_due_ms 0xFFFF_FFFF_FFFF_FFFF
 
       if @flow_claim_due_phase_telemetry do
         defp flow_claim_due_phase_emit(phase, metadata, fun) when is_function(fun, 0) do
@@ -616,101 +618,239 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
              remaining
            ) do
         if flow_hibernation_enabled?(state) and remaining > 0 do
-          promote_limit = flow_hibernation_promote_limit(remaining)
           path = flow_lmdb_record_path(state)
           {start_ms, horizon_ms} = flow_hibernation_promotion_window(now_ms, state)
-          scan_fun = flow_hibernation_promotion_scan_fun(path)
 
-          reduce_fun = fn {due_key, park_key}, acc ->
-            next_acc =
-              case flow_promote_cold_due_entry(
-                     state,
-                     path,
-                     due_key,
-                     park_key,
-                     type,
-                     state_filter,
-                     partition_key,
-                     priority,
-                     now_ms
-                   ) do
-                :ok ->
-                  %{acc | promoted: acc.promoted + 1}
+          case recovery_empty_cold_due_cursor(state, path, start_ms, horizon_ms, remaining) do
+            {:ok, cursor, transaction_id} ->
+              call_recovery_cold_due_proof_hook(path)
 
-                {:stale_due, cleanup_batch} ->
-                  %{
-                    acc
-                    | stale_due_cleanups: [cleanup_batch | acc.stale_due_cleanups]
-                  }
+              if LMDB.last_txn_id(path) == {:ok, transaction_id} do
+                apply_state_put(:flow_hibernation_promotion_cursor, cursor)
+                0
+              else
+                :telemetry.execute(
+                  [:ferricstore, :flow, :replay_cold_due_proof, :stale],
+                  %{count: 1},
+                  %{shard_index: state.shard_index}
+                )
 
-                _skip ->
-                  acc
+                scan_and_promote_cold_due(
+                  state,
+                  type,
+                  state_filter,
+                  partition_key,
+                  priority,
+                  now_ms,
+                  remaining,
+                  path,
+                  start_ms,
+                  horizon_ms
+                )
               end
 
-            if next_acc.promoted >= promote_limit,
-              do: {:halt, next_acc},
-              else: {:cont, next_acc}
+            :not_proven ->
+              scan_and_promote_cold_due(
+                state,
+                type,
+                state_filter,
+                partition_key,
+                priority,
+                now_ms,
+                remaining,
+                path,
+                start_ms,
+                horizon_ms
+              )
           end
+        else
+          0
+        end
+      end
 
-          recent_start_ms =
-            flow_hibernation_recent_start_ms(
+      defp scan_and_promote_cold_due(
+             state,
+             type,
+             state_filter,
+             partition_key,
+             priority,
+             now_ms,
+             remaining,
+             path,
+             start_ms,
+             horizon_ms
+           ) do
+        promote_limit = flow_hibernation_promote_limit(remaining)
+        scan_fun = flow_hibernation_promotion_scan_fun(path)
+
+        reduce_fun = fn {due_key, park_key}, acc ->
+          next_acc =
+            case flow_promote_cold_due_entry(
+                   state,
+                   path,
+                   due_key,
+                   park_key,
+                   type,
+                   state_filter,
+                   partition_key,
+                   priority,
+                   now_ms
+                 ) do
+              :ok ->
+                %{acc | promoted: acc.promoted + 1}
+
+              {:stale_due, cleanup_batch} ->
+                %{
+                  acc
+                  | stale_due_cleanups: [cleanup_batch | acc.stale_due_cleanups]
+                }
+
+              _skip ->
+                acc
+            end
+
+          if next_acc.promoted >= promote_limit,
+            do: {:halt, next_acc},
+            else: {:cont, next_acc}
+        end
+
+        recent_start_ms =
+          flow_hibernation_recent_start_ms(
+            start_ms,
+            horizon_ms,
+            @flow_hibernation_bucket_ms,
+            @flow_hibernation_recent_scan_pages
+          )
+
+        recent_result =
+          Hibernation.reduce_promotion_buckets(
+            recent_start_ms,
+            horizon_ms,
+            nil,
+            [
+              bucket_ms: @flow_hibernation_bucket_ms,
+              max_pages: @flow_hibernation_recent_scan_pages,
+              max_entries: @flow_hibernation_recent_scan_entries
+            ],
+            flow_hibernation_scan_initial_acc(),
+            scan_fun,
+            reduce_fun
+          )
+
+        recent_acc = flow_hibernation_scan_acc(recent_result)
+
+        if recent_acc.promoted >= promote_limit do
+          flow_queue_stale_due_cleanups(path, recent_acc)
+          recent_acc.promoted
+        else
+          cursor =
+            flow_hibernation_promotion_cursor(state) ||
+              %{bucket_ms: recent_start_ms, after_key: nil}
+
+          backfill_result =
+            Hibernation.reduce_promotion_buckets(
               start_ms,
               horizon_ms,
-              @flow_hibernation_bucket_ms,
-              @flow_hibernation_recent_scan_pages
-            )
-
-          recent_result =
-            Hibernation.reduce_promotion_buckets(
-              recent_start_ms,
-              horizon_ms,
-              nil,
+              cursor,
               [
                 bucket_ms: @flow_hibernation_bucket_ms,
-                max_pages: @flow_hibernation_recent_scan_pages,
-                max_entries: @flow_hibernation_recent_scan_entries
+                max_pages: @flow_hibernation_backfill_scan_pages,
+                max_entries: @flow_hibernation_backfill_scan_entries
               ],
-              flow_hibernation_scan_initial_acc(),
+              recent_acc,
               scan_fun,
               reduce_fun
             )
 
-          recent_acc = flow_hibernation_scan_acc(recent_result)
+          apply_state_put(
+            :flow_hibernation_promotion_cursor,
+            flow_hibernation_scan_cursor(backfill_result, cursor)
+          )
 
-          if recent_acc.promoted >= promote_limit do
-            flow_queue_stale_due_cleanups(path, recent_acc)
-            recent_acc.promoted
-          else
-            cursor =
-              flow_hibernation_promotion_cursor(state) ||
-                %{bucket_ms: recent_start_ms, after_key: nil}
+          backfill_acc = flow_hibernation_scan_acc(backfill_result)
+          flow_queue_stale_due_cleanups(path, backfill_acc)
+          backfill_acc.promoted
+        end
+      end
 
-            backfill_result =
-              Hibernation.reduce_promotion_buckets(
-                start_ms,
-                horizon_ms,
-                cursor,
-                [
-                  bucket_ms: @flow_hibernation_bucket_ms,
-                  max_pages: @flow_hibernation_backfill_scan_pages,
-                  max_entries: @flow_hibernation_backfill_scan_entries
-                ],
-                recent_acc,
-                scan_fun,
-                reduce_fun
-              )
+      defp recovery_empty_cold_due_cursor(
+             %{@sm_waraft_recovery_before_index_key => index} = state,
+             path,
+             start_ms,
+             horizon_ms,
+             _remaining
+           )
+           when is_integer(index) and index > 0 do
+        first_bucket = LMDB.cold_due_bucket_ms(start_ms, @flow_hibernation_bucket_ms)
+        last_bucket = LMDB.cold_due_bucket_ms(horizon_ms, @flow_hibernation_bucket_ms)
 
-            apply_state_put(
-              :flow_hibernation_promotion_cursor,
-              flow_hibernation_scan_cursor(backfill_result, cursor)
-            )
-
-            backfill_acc = flow_hibernation_scan_acc(backfill_result)
-            flow_queue_stale_due_cleanups(path, backfill_acc)
-            backfill_acc.promoted
-          end
+        if last_bucket > @flow_hibernation_max_due_ms - @flow_hibernation_bucket_ms do
+          :not_proven
         else
-          0
+          first_prefix = LMDB.cold_due_bucket_prefix(first_bucket)
+          # Bucket numbers are fixed-width decimal keys. Truncating one digit
+          # puts the lower bound before even a malformed row exactly equal to
+          # the first bucket prefix; the next bucket is an exclusive upper bound.
+          after_key = binary_part(first_prefix, 0, byte_size(first_prefix) - 1)
+          before_key = LMDB.cold_due_bucket_prefix(last_bucket + @flow_hibernation_bucket_ms)
+
+          # Never reuse a proof across Raft entries: writes may change LMDB as
+          # replay advances. A concurrent commit here or after the cursor scan
+          # discards the proof and takes the original bucket-by-bucket path.
+          with false <- LMDB.flush_in_progress?(path),
+               {:ok, transaction_id} <- LMDB.last_txn_id(path),
+               {:ok, [], true, 0} <-
+                 LMDB.range_entries_bounded(
+                   path,
+                   LMDB.cold_due_prefix(),
+                   after_key,
+                   before_key,
+                   1,
+                   1_048_576
+                 ),
+               {:ok, ^transaction_id} <- LMDB.last_txn_id(path),
+               false <- LMDB.flush_in_progress?(path),
+               {:ok, cursor} <- empty_cold_due_scan_cursor(state, start_ms, horizon_ms) do
+            {:ok, cursor, transaction_id}
+          else
+            _uncertain -> :not_proven
+          end
+        end
+      rescue
+        _ -> :not_proven
+      end
+
+      defp recovery_empty_cold_due_cursor(_state, _path, _start_ms, _horizon_ms, _remaining),
+        do: :not_proven
+
+      if Mix.env() == :test do
+        defp call_recovery_cold_due_proof_hook(path) do
+          case Application.get_env(:ferricstore, :flow_recovery_cold_due_proof_hook) do
+            hook when is_function(hook, 1) -> hook.(path)
+            _missing -> :ok
+          end
+        end
+      else
+        defp call_recovery_cold_due_proof_hook(_path), do: :ok
+      end
+
+      if Mix.env() == :test do
+        @doc false
+        def __recovery_empty_cold_due_cursor_for_test__(state, path, start_ms, horizon_ms),
+          do: recovery_empty_cold_due_cursor(state, path, start_ms, horizon_ms, 1)
+      end
+
+      defp empty_cold_due_scan_cursor(state, start_ms, horizon_ms) do
+        case Hibernation.empty_promotion_scan_cursor(
+               start_ms,
+               horizon_ms,
+               flow_hibernation_promotion_cursor(state),
+               @flow_hibernation_bucket_ms,
+               @flow_hibernation_recent_scan_pages,
+               @flow_hibernation_backfill_scan_pages
+             ) do
+          {:ok, cursor} -> {:ok, cursor}
+          {:error, _reason} -> :not_proven
         end
       end
 

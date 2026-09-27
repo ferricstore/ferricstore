@@ -69,6 +69,28 @@ fn v2_scan_file_page<'a>(
     start_offset: u64,
     limit: usize,
 ) -> NifResult<Term<'a>> {
+    scan_file_page(env, path, start_offset, limit, false)
+}
+
+/// The same bounded CRC-validating scanner with startup-only read buffering.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_scan_file_page_buffered<'a>(
+    env: Env<'a>,
+    path: String,
+    start_offset: u64,
+    limit: usize,
+) -> NifResult<Term<'a>> {
+    scan_file_page(env, path, start_offset, limit, true)
+}
+
+fn scan_file_page<'a>(
+    env: Env<'a>,
+    path: String,
+    start_offset: u64,
+    limit: usize,
+    buffered: bool,
+) -> NifResult<Term<'a>> {
     let limit = match validate_scan_file_page_limit(limit) {
         Ok(limit) => limit,
         Err(error) => return Ok((atoms::error(), error).encode(env)),
@@ -77,8 +99,11 @@ fn v2_scan_file_page<'a>(
     let p = std::path::Path::new(&path);
 
     match log::LogReader::open(p) {
-        Ok(mut reader) => match reader.iter_metadata_page_from_offset_tolerant(start_offset, limit)
-        {
+        Ok(mut reader) => match if buffered {
+            reader.iter_metadata_page_from_offset_buffered_tolerant(start_offset, limit)
+        } else {
+            reader.iter_metadata_page_from_offset_tolerant(start_offset, limit)
+        } {
             Ok((records, next_offset, done)) => match encode_scan_records(env, &records) {
                 Ok(results) => Ok((atoms::ok(), results, next_offset, done).encode(env)),
                 Err(e) => Ok((atoms::error(), e).encode(env)),

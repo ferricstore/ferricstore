@@ -97,6 +97,114 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageRecoveryReuse
         end
       end
 
+      @tag :recovery_pin_batch
+      test "startup locator replay batches validated Flow pin writes across WAL records", %{
+        root: root,
+        ctx: ctx
+      } do
+        parent = self()
+        handler_id = {:recovered_pin_batches, make_ref()}
+
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :waraft, :storage, :recovery_pin_batch],
+          fn _event, measurements, metadata, pid ->
+            send(pid, {:recovered_pin_batch, measurements, metadata})
+          end,
+          parent
+        )
+
+        on_exit(fn -> :telemetry.detach(handler_id) end)
+
+        assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+        refs =
+          for i <- 1..4 do
+            key = Ferricstore.Flow.Keys.value_key("recovered-pin-#{i}", :payload, 1, "tenant")
+
+            assert Ferricstore.Flow.HistoryProjector.ValueProjection.generated_flow_value_ref?(
+                     key
+                   )
+
+            assert :ok =
+                     Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+                       root,
+                       0,
+                       1_000 + i,
+                       [{key, "value-#{i}", 0}]
+                     )
+
+            key
+          end
+
+        assert :ok =
+                 Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+                   root,
+                   0,
+                   1_005,
+                   [{hd(refs), "latest", 0}]
+                 )
+
+        assert {:ok, 5} =
+                 Ferricstore.Raft.WARaftSegmentReader.spill_apply_projection_cache(root, 0)
+
+        shard_path = Ferricstore.DataDir.shard_data_path(root, 0)
+        state = %{shard_data_path: shard_path, shard_index: 0}
+
+        assert ^state =
+                 WARaftStorage.__recover_apply_projection_value_locators_for_test__(
+                   state,
+                   waraft_storage_root(root, 0)
+                 )
+
+        assert_receive {:recovered_pin_batch, %{ops: 10}, %{shard_index: 0, result: :ok}},
+                       1_000
+
+        lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+
+        Enum.each(refs, fn key ->
+          assert {:ok, _encoded_locator} = Ferricstore.Flow.LMDB.get(lmdb_path, key)
+        end)
+
+        assert {:ok, encoded_latest} = Ferricstore.Flow.LMDB.get(lmdb_path, hd(refs))
+
+        assert {:ok, {:flow_value_locator, 1, 0, {:waraft_apply_projection, 1_005}, 0, 6}} =
+                 Ferricstore.TermCodec.decode(encoded_latest)
+      end
+
+      @tag :recovery_pin_batch
+      test "batched locator replay fails closed when LMDB cannot accept the pins", %{
+        root: root,
+        ctx: ctx
+      } do
+        assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+        key = Ferricstore.Flow.Keys.value_key("pin-write-failure", :payload, 1, "tenant")
+
+        assert :ok =
+                 Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+                   root,
+                   0,
+                   1_001,
+                   [{key, "value", 0}]
+                 )
+
+        assert {:ok, 1} =
+                 Ferricstore.Raft.WARaftSegmentReader.spill_apply_projection_cache(root, 0)
+
+        blocked_shard_path = Path.join(root, "blocked-pin-shard")
+        File.write!(blocked_shard_path, "not a directory")
+        state = %{shard_data_path: blocked_shard_path, shard_index: 0}
+
+        assert_raise RuntimeError,
+                     ~r/failed to recover WARaft apply projection value locators/,
+                     fn ->
+                       WARaftStorage.__recover_apply_projection_value_locators_for_test__(
+                         state,
+                         waraft_storage_root(root, 0)
+                       )
+                     end
+      end
+
       @tag :flow_replay_segment_locations
       test "WARaft recovery rebuilds a stale same-index QueryRow without future-state hydration",
            %{
@@ -500,6 +608,218 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageRecoveryReuse
           assert build_us >= 0
         after
           :telemetry.detach(handler_id)
+        end
+      end
+
+      @tag :startup_preopen
+      test "preopened shard storage survives handoff and recovers writes on restart", %{
+        root: root
+      } do
+        multi_root = Path.join(root, "preopened-partitions")
+        Ferricstore.DataDir.ensure_layout!(multi_root, 3)
+        Ferricstore.Store.ActiveFile.init(3)
+
+        opts =
+          multi_root
+          |> instance_opts(shard_count: 3)
+          |> Keyword.put(:max_memory_bytes, 5 * 1024 * 1024 * 1024)
+
+        ctx =
+          FerricStore.Instance.build(
+            :"preopen_high_memory_#{System.unique_integer([:positive])}",
+            opts
+          )
+
+        previous = Application.get_env(:ferricstore, :waraft_start_preopen_concurrency)
+        Application.delete_env(:ferricstore, :waraft_start_preopen_concurrency)
+
+        try do
+          assert Ferricstore.OperationalLimits.startup_recovery_concurrency(ctx.max_memory_bytes) ==
+                   min(System.schedulers_online(), 3)
+
+          assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          keys =
+            for shard <- 0..2 do
+              key = key_for_shard(ctx, shard, "preopen-restart:#{shard}")
+              assert :ok = WARaftBackend.write(shard, {:put, key, "v#{shard}", 0})
+              assert is_pid(:ets.info(elem(ctx.keydir_refs, shard), :owner))
+
+              preopen_key =
+                {Ferricstore.Raft.WARaftBackend.StartupPreopen,
+                 Path.expand(
+                   Path.join(multi_root, "waraft/ferricstore_waraft_backend.#{shard + 1}")
+                 )}
+
+              assert :persistent_term.get(preopen_key, nil) == nil
+              {key, "v#{shard}"}
+            end
+
+          assert :ok = WARaftBackend.stop()
+          FerricStore.Instance.cleanup(ctx.name)
+          Ferricstore.Store.ActiveFile.init(3)
+
+          restarted =
+            FerricStore.Instance.build(
+              :"preopen_restarted_#{System.unique_integer([:positive])}",
+              opts
+            )
+
+          try do
+            assert :ok =
+                     WARaftBackend.start(restarted,
+                       log_module: :ferricstore_waraft_spike_segment_log
+                     )
+
+            Enum.each(keys, fn {key, value} -> assert value == Router.get(restarted, key) end)
+          after
+            WARaftBackend.stop()
+            FerricStore.Instance.cleanup(restarted.name)
+          end
+        after
+          restore_env(:waraft_start_preopen_concurrency, previous)
+        end
+      end
+
+      @tag :startup_preopen
+      test "four preopen workers require six GiB and four schedulers" do
+        alias Ferricstore.Raft.WARaftBackend.StartupPreopen
+
+        assert StartupPreopen.default_concurrency(nil, nil) == 1
+
+        if System.schedulers_online() >= 3 do
+          assert StartupPreopen.default_concurrency(
+                   5 * 1024 * 1024 * 1024,
+                   5 * 1024 * 1024 * 1024
+                 ) == 3
+        end
+
+        if System.schedulers_online() >= 4 do
+          assert StartupPreopen.default_concurrency(
+                   5 * 1024 * 1024 * 1024,
+                   6 * 1024 * 1024 * 1024
+                 ) == 4
+
+          assert StartupPreopen.default_concurrency(
+                   3 * 1024 * 1024 * 1024,
+                   6 * 1024 * 1024 * 1024
+                 ) == 1
+        end
+      end
+
+      @tag :startup_preopen
+      test "failed preopen fails startup closed and a later start recovers", %{root: root} do
+        multi_root = Path.join(root, "preopen-failure")
+        Ferricstore.DataDir.ensure_layout!(multi_root, 5)
+        Ferricstore.Store.ActiveFile.init(5)
+        ctx = build_ctx(multi_root, shard_count: 5)
+
+        previous = Application.get_env(:ferricstore, :waraft_start_preopen_concurrency)
+        previous_hook = Application.get_env(:ferricstore, :waraft_start_preopen_hook)
+        Application.put_env(:ferricstore, :waraft_start_preopen_concurrency, 4)
+
+        Application.put_env(:ferricstore, :waraft_start_preopen_hook, fn
+          %{partition: 5}, _root -> raise "injected preopen failure"
+          _options, _root -> :ok
+        end)
+
+        try do
+          assert {:error, {:preopen_failed, %RuntimeError{} = reason, _stacktrace}} =
+                   WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          assert Exception.message(reason) == "injected preopen failure"
+          Application.delete_env(:ferricstore, :waraft_start_preopen_hook)
+
+          assert :ok =
+                   WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          key = key_for_shard(ctx, 4, "preopen-retry")
+          assert :ok = WARaftBackend.write(4, {:put, key, "value", 0})
+          assert "value" == Router.get(ctx, key)
+        after
+          WARaftBackend.stop()
+          FerricStore.Instance.cleanup(ctx.name)
+          restore_env(:waraft_start_preopen_concurrency, previous)
+          restore_env(:waraft_start_preopen_hook, previous_hook)
+        end
+      end
+
+      @tag :startup_preopen
+      test "small memory budgets keep normal serial storage opening", %{root: root} do
+        multi_root = Path.join(root, "serial-small-budget")
+        Ferricstore.DataDir.ensure_layout!(multi_root, 2)
+        Ferricstore.Store.ActiveFile.init(2)
+        ctx = build_ctx(multi_root, shard_count: 2)
+
+        previous = Application.get_env(:ferricstore, :waraft_start_preopen_concurrency)
+        previous_hook = Application.get_env(:ferricstore, :waraft_start_preopen_hook)
+        Application.delete_env(:ferricstore, :waraft_start_preopen_concurrency)
+
+        Application.put_env(:ferricstore, :waraft_start_preopen_hook, fn _, _ ->
+          raise "small-budget startup must not preopen shards"
+        end)
+
+        try do
+          assert ctx.max_memory_bytes < 4 * 1_024 * 1_024 * 1_024
+          assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+          key = key_for_shard(ctx, 1, "serial-small-budget")
+          assert :ok = WARaftBackend.write(1, {:put, key, "value", 0})
+          assert "value" == Router.get(ctx, key)
+        after
+          WARaftBackend.stop()
+          FerricStore.Instance.cleanup(ctx.name)
+          restore_env(:waraft_start_preopen_concurrency, previous)
+          restore_env(:waraft_start_preopen_hook, previous_hook)
+        end
+      end
+
+      @tag :startup_preopen
+      test "a free preopen slot prepares the next shard before its peer finishes", %{root: root} do
+        multi_root = Path.join(root, "preopen-free-slot")
+        Ferricstore.DataDir.ensure_layout!(multi_root, 3)
+        Ferricstore.Store.ActiveFile.init(3)
+        ctx = build_ctx(multi_root, shard_count: 3)
+        parent = self()
+
+        previous = Application.get_env(:ferricstore, :waraft_start_preopen_concurrency)
+        previous_hook = Application.get_env(:ferricstore, :waraft_start_preopen_hook)
+        Application.put_env(:ferricstore, :waraft_start_preopen_concurrency, 2)
+
+        Application.put_env(:ferricstore, :waraft_start_preopen_hook, fn options, _root ->
+          send(parent, {:preopen_finished_recovery, options.partition, self()})
+
+          if options.partition == 2 do
+            receive do
+              :release_second_shard -> :ok
+            after
+              10_000 -> :ok
+            end
+          end
+        end)
+
+        start =
+          Task.async(fn ->
+            WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+          end)
+
+        try do
+          assert_receive {:preopen_finished_recovery, 2, second_worker}, 5_000
+          assert_receive {:preopen_finished_recovery, 1, _first_worker}, 5_000
+          assert_receive {:preopen_finished_recovery, 3, _third_worker}, 5_000
+          assert Task.yield(start, 100) == nil
+
+          send(second_worker, :release_second_shard)
+          assert :ok = Task.await(start, 10_000)
+
+          for shard <- 0..2 do
+            assert {:ok, {:raft_log_pos, _, _}} = WARaftBackend.storage_position(shard)
+          end
+        after
+          Task.shutdown(start, :brutal_kill)
+          WARaftBackend.stop()
+          FerricStore.Instance.cleanup(ctx.name)
+          restore_env(:waraft_start_preopen_concurrency, previous)
+          restore_env(:waraft_start_preopen_hook, previous_hook)
         end
       end
 

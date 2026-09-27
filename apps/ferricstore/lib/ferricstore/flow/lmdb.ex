@@ -337,6 +337,13 @@ defmodule Ferricstore.Flow.LMDB do
   end
 
   @doc false
+  def last_txn_id(path) when is_binary(path) do
+    if Ferricstore.FS.dir?(path),
+      do: NIF.lmdb_last_txn_id(path, map_size()),
+      else: {:error, :enoent}
+  end
+
+  @doc false
   def prefix_entries_initialized(path, prefix, limit)
       when is_binary(path) and is_binary(prefix) and is_integer(limit) and limit >= 0 do
     prefix_entries(path, prefix, limit)

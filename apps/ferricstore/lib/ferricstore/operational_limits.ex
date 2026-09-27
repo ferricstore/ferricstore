@@ -20,8 +20,23 @@ defmodule Ferricstore.OperationalLimits do
 
   @default_inline_value_max_bytes 64 * 1024
   @default_blob_threshold_bytes 256 * 1024
+  @parallel_startup_memory_bytes 4 * 1024 * 1024 * 1024
+  @three_shard_startup_memory_bytes div(9 * 1024 * 1024 * 1024, 2)
 
   @type level :: :ok | :warn | :pressure | :reject | :panic | :unknown
+
+  @spec startup_recovery_concurrency(term()) :: 1 | 2 | 3
+  def startup_recovery_concurrency(memory_bytes) when is_integer(memory_bytes) do
+    schedulers = System.schedulers_online()
+
+    cond do
+      schedulers >= 3 and memory_bytes >= @three_shard_startup_memory_bytes -> 3
+      schedulers > 1 and memory_bytes >= @parallel_startup_memory_bytes -> 2
+      true -> 1
+    end
+  end
+
+  def startup_recovery_concurrency(_unknown), do: 1
 
   @spec snapshot(keyword()) :: map()
   def snapshot(opts \\ []) do

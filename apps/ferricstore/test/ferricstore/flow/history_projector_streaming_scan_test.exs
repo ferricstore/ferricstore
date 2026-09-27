@@ -19,6 +19,42 @@ defmodule Ferricstore.Flow.HistoryProjectorStreamingScanTest do
     assert log_source =~ "NIF.v2_scan_file_page"
   end
 
+  test "startup buffered pages match runtime pages and validate large values" do
+    large_size = 300 * 1024
+
+    dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_buffered_history_#{System.unique_integer([:positive])}"
+      )
+
+    path = Path.join(dir, "00000.log")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+
+    assert {:ok, [_, _]} =
+             NIF.v2_append_batch(path, [
+               {"large", :binary.copy(<<0xA5>>, large_size), 0},
+               {"small", "value", 0}
+             ])
+
+    for scanner <- [&NIF.v2_scan_file_page/3, &NIF.v2_scan_file_page_buffered/3] do
+      assert {:ok, [{"large", 0, ^large_size, 0, false}], next, false} = scanner.(path, 0, 1)
+
+      assert {:ok, [{"small", ^next, 5, 0, false}], end_offset, false} =
+               scanner.(path, next, 1)
+
+      assert {:ok, [], ^end_offset, true} = scanner.(path, end_offset, 1)
+    end
+
+    {:ok, file} = :file.open(path, [:read, :write, :binary])
+    :ok = :file.pwrite(file, 26 + byte_size("large"), <<0x00>>)
+    :ok = :file.close(file)
+
+    assert {:error, _reason} = NIF.v2_scan_file_page(path, 0, 1)
+    assert {:error, _reason} = NIF.v2_scan_file_page_buffered(path, 0, 1)
+  end
+
   test "history page fold continues past one page and keeps latest tombstone semantics" do
     dir =
       Path.join(

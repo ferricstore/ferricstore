@@ -51,6 +51,25 @@ defmodule Ferricstore.Flow.LMDBUnitTest do
     refute File.exists?(path)
   end
 
+  test "LMDB transaction identity changes on a committed write without creating missing storage" do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lmdb_txn_identity_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    assert {:error, :enoent} = LMDB.last_txn_id(path)
+    refute File.exists?(path)
+
+    assert :ok = LMDB.write_batch(path, [{:put, "cold:one", "one"}])
+    assert {:ok, first} = LMDB.last_txn_id(path)
+    assert :ok = LMDB.write_batch(path, [{:put, "cold:two", "two"}])
+    assert {:ok, later} = LMDB.last_txn_id(path)
+    assert later > first
+  end
+
   test "active reverse delete planning preserves corruption and read failures" do
     state_key = "state-key"
     reverse_key = LMDB.active_by_state_key_key(state_key)

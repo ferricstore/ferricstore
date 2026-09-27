@@ -226,6 +226,11 @@ if config_env() == :prod do
          nil -> nil
          configured -> String.to_integer(configured)
        end),
+    waraft_start_preopen_concurrency:
+      (case System.get_env("FERRICSTORE_WARAFT_START_PREOPEN_CONCURRENCY") do
+         nil -> nil
+         configured -> String.to_integer(configured)
+       end),
     flow_hibernation_enabled: boolean_env.("FERRICSTORE_FLOW_HIBERNATION_ENABLED", true),
     flow_governance_limit_storage_cleanup_interval_ms:
       String.to_integer(

@@ -498,15 +498,20 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       defp segment_projection_checkpoint_interval_due?(handle) do
         interval_ms = segment_projection_checkpoint_min_interval_ms()
         last_ms = Map.get(handle, :segment_projection_checkpoint_started_at_ms, 0)
+        now_ms = System.monotonic_time(:millisecond)
+        retry_after_ms = Map.get(handle, :segment_projection_checkpoint_retry_after_ms)
 
         cond do
+          is_integer(retry_after_ms) and now_ms < retry_after_ms ->
+            false
+
           interval_ms <= 0 ->
             true
 
           last_ms <= 0 ->
             true
 
-          System.monotonic_time(:millisecond) - last_ms >= interval_ms ->
+          now_ms - last_ms >= interval_ms ->
             true
 
           true ->
@@ -527,12 +532,14 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
           {:ok, pid} =
             Task.start(fn ->
               {metadata, result} =
-                run_segment_projection_checkpoint(
+                run_bounded_segment_projection_checkpoint(
                   handle.root_dir,
                   handle.ctx,
                   handle.shard_index,
                   position,
-                  keydir
+                  keydir,
+                  ref,
+                  storage_name
                 )
 
               send(
@@ -585,7 +592,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       defp finish_segment_projection_checkpoint_result(handle, position, :ok) do
         if position_index(position) >=
              position_index(Map.get(handle, :segment_projection_position, @zero_pos)) do
-          Map.put(handle, :segment_projection_position, position)
+          handle
+          |> Map.put(:segment_projection_position, position)
+          |> Map.delete(:segment_projection_checkpoint_retry_after_ms)
         else
           handle
         end
@@ -595,14 +604,73 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
         finish_segment_projection_checkpoint_result(handle, position, :ok)
       end
 
+      defp finish_segment_projection_checkpoint_result(handle, _position, {:ok, :busy}),
+        do: handle
+
+      defp finish_segment_projection_checkpoint_result(handle, _position, {:ok, :stale_cut}),
+        do:
+          Map.put(
+            handle,
+            :segment_projection_checkpoint_retry_after_ms,
+            System.monotonic_time(:millisecond) + 300_000
+          )
+
       defp finish_segment_projection_checkpoint_result(handle, _position, {:error, _reason}),
         do: handle
 
       defp finish_segment_projection_checkpoint_result(handle, _position, _other), do: handle
 
-      defp run_segment_projection_checkpoint(root_dir, ctx, shard_index, position, keydir) do
+      defp run_bounded_segment_projection_checkpoint(
+             root_dir,
+             ctx,
+             shard_index,
+             position,
+             keydir,
+             ref,
+             storage_name
+           ) do
+        # A shard has its own pending guard, but checkpoints on different shards
+        # must not all scan and serialize their keydirs at the same time. A busy
+        # slot defers this attempt until a later write satisfies the cadence.
+        lock = {{__MODULE__, :background_segment_projection_checkpoint}, self()}
+
+        case :global.trans(
+               lock,
+               fn ->
+                 run_segment_projection_checkpoint(
+                   root_dir,
+                   ctx,
+                   shard_index,
+                   position,
+                   keydir,
+                   ref,
+                   storage_name
+                 )
+               end,
+               [node()],
+               0
+             ) do
+          :aborted ->
+            {%{shard_index: shard_index, position: position, entries: 0}, {:ok, :busy}}
+
+          result ->
+            result
+        end
+      end
+
+      defp run_segment_projection_checkpoint(
+             root_dir,
+             ctx,
+             shard_index,
+             position,
+             keydir,
+             ref,
+             storage_name
+           ) do
         with_segment_projection_lock(root_dir, fn ->
           now = storage_expiry_cutoff_ms()
+          metadata = %{shard_index: shard_index, position: position, entries: 0}
+          call_segment_projection_checkpoint_hook(:before_scan, metadata)
 
           case segment_projection_entries_from_keydir(keydir, ctx, shard_index, now) do
             :unavailable ->
@@ -611,16 +679,18 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
 
             {:ok, {entries, entry_count}} ->
               metadata = %{shard_index: shard_index, position: position, entries: entry_count}
-              emit_segment_projection_checkpoint_start(metadata)
-              call_segment_projection_checkpoint_hook(:before_write, metadata)
 
-              result =
-                with :ok <-
-                       write_segment_projection_checkpoint_unlocked(root_dir, position, entries) do
-                  :ok
-                end
+              case validate_segment_projection_checkpoint_cut(storage_name, ref, position) do
+                :ok ->
+                  emit_segment_projection_checkpoint_start(metadata)
+                  call_segment_projection_checkpoint_hook(:before_write, metadata)
 
-              {metadata, result}
+                  {metadata,
+                   write_segment_projection_checkpoint_unlocked(root_dir, position, entries)}
+
+                :stale ->
+                  {metadata, {:ok, :stale_cut}}
+              end
 
             {:error, reason} ->
               metadata = %{shard_index: shard_index, position: position, entries: 0}
@@ -643,6 +713,20 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
         error ->
           {%{shard_index: shard_index, position: position, entries: 0},
            {:error, {:segment_projection_checkpoint_failed, error}}}
+      end
+
+      defp validate_segment_projection_checkpoint_cut(storage_name, ref, position) do
+        send_storage_info(
+          storage_name,
+          {:ferricstore_waraft_segment_projection_checkpoint_cut, self(), ref, position}
+        )
+
+        receive do
+          {:ferricstore_waraft_segment_projection_checkpoint_cut, ^ref, :ok} -> :ok
+          {:ferricstore_waraft_segment_projection_checkpoint_cut, ^ref, :stale} -> :stale
+        after
+          5_000 -> :stale
+        end
       end
 
       defp segment_projection_entries_from_keydir(keydir, ctx, shard_index, now) do
@@ -778,13 +862,16 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
 
       defp segment_projection_checkpoint_result(:ok), do: :ok
       defp segment_projection_checkpoint_result({:ok, :stale}), do: :stale
+      defp segment_projection_checkpoint_result({:ok, :busy}), do: :busy
+      defp segment_projection_checkpoint_result({:ok, :stale_cut}), do: :stale_cut
       defp segment_projection_checkpoint_result({:error, _reason}), do: :error
       defp segment_projection_checkpoint_result(_other), do: :error
 
       defp segment_projection_checkpoint_reason({:error, reason}), do: reason
 
-      defp segment_projection_checkpoint_reason(other) when other not in [:ok, {:ok, :stale}],
-        do: other
+      defp segment_projection_checkpoint_reason(other)
+           when other not in [:ok, {:ok, :stale}, {:ok, :busy}, {:ok, :stale_cut}],
+           do: other
 
       defp segment_projection_checkpoint_reason(_result), do: nil
 

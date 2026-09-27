@@ -580,10 +580,22 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
         case :ferricstore_waraft_spike_segment_log.fold_disk(
                to_charlist(projection_root),
                &recover_apply_projection_value_locator_record/3,
-               %{sm_state: sm_state, error: nil}
+               %{
+                 sm_state: sm_state,
+                 error: nil,
+                 pending_pin_ops: [],
+                 pending_pin_count: 0,
+                 pending_pin_bytes: 0
+               }
              ) do
-          {:ok, %{error: nil, sm_state: recovered_sm_state}} ->
-            recovered_sm_state
+          {:ok, %{error: nil} = acc} ->
+            case flush_recovered_value_pin_ops(acc) do
+              {:ok, %{sm_state: recovered_sm_state}} ->
+                recovered_sm_state
+
+              {:error, reason} ->
+                raise "failed to recover WARaft apply projection value locators: #{inspect(reason)}"
+            end
 
           {:ok, %{error: reason}} ->
             raise "failed to recover WARaft apply projection value locators: #{inspect(reason)}"
@@ -594,6 +606,12 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
           {:error, reason} ->
             raise "failed to recover WARaft apply projection value locators: #{inspect(reason)}"
         end
+      end
+
+      if Mix.env() == :test do
+        @doc false
+        def __recover_apply_projection_value_locators_for_test__(sm_state, root_dir),
+          do: recover_apply_projection_value_locators!(sm_state, root_dir)
       end
 
       defp recover_apply_projection_value_locator_record(
@@ -613,8 +631,11 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
         case position_index(position) do
           index when is_integer(index) and index > 0 ->
             case recover_apply_projection_value_locator_entries(acc.sm_state, index, entries) do
-              :ok -> acc
-              {:error, reason} -> %{acc | error: reason}
+              {:ok, ops} ->
+                case queue_recovered_value_pin_ops(acc, ops) do
+                  {:ok, next} -> next
+                  {:error, reason} -> %{acc | error: reason}
+                end
             end
 
           _bad_index ->
@@ -643,13 +664,85 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
 
         case entries do
           [] ->
-            :ok
+            {:ok, []}
 
           [_ | _] ->
-            sm_state.shard_data_path
-            |> FlowLMDB.path()
-            |> FlowLMDB.write_batch(FlowLMDB.segment_value_pin_batch_put_ops(entries))
+            {:ok, FlowLMDB.segment_value_pin_batch_put_ops(entries)}
         end
+      end
+
+      @recovered_value_pin_max_ops 256
+      @recovered_value_pin_max_bytes 2 * 1_024 * 1_024
+
+      defp queue_recovered_value_pin_ops(acc, []), do: {:ok, acc}
+
+      defp queue_recovered_value_pin_ops(acc, ops) do
+        count = length(ops)
+
+        bytes =
+          Enum.reduce(ops, 0, fn
+            {:put, key, value}, total when is_binary(key) and is_binary(value) ->
+              total + byte_size(key) + byte_size(value) + 64
+
+            other, total ->
+              total + :erlang.external_size(other)
+          end)
+
+        flush_first? =
+          acc.pending_pin_count > 0 and
+            (acc.pending_pin_count + count > @recovered_value_pin_max_ops or
+               acc.pending_pin_bytes + bytes > @recovered_value_pin_max_bytes)
+
+        with {:ok, ready} <-
+               if(flush_first?, do: flush_recovered_value_pin_ops(acc), else: {:ok, acc}) do
+          if count > @recovered_value_pin_max_ops or bytes > @recovered_value_pin_max_bytes do
+            case write_recovered_value_pin_ops(ready.sm_state, ops) do
+              :ok -> {:ok, ready}
+              {:error, _reason} = error -> error
+            end
+          else
+            queued = %{
+              ready
+              | pending_pin_ops: [ops | ready.pending_pin_ops],
+                pending_pin_count: ready.pending_pin_count + count,
+                pending_pin_bytes: ready.pending_pin_bytes + bytes
+            }
+
+            if queued.pending_pin_count >= @recovered_value_pin_max_ops or
+                 queued.pending_pin_bytes >= @recovered_value_pin_max_bytes,
+               do: flush_recovered_value_pin_ops(queued),
+               else: {:ok, queued}
+          end
+        end
+      end
+
+      defp flush_recovered_value_pin_ops(%{pending_pin_count: 0} = acc), do: {:ok, acc}
+
+      defp flush_recovered_value_pin_ops(acc) do
+        ops = acc.pending_pin_ops |> Enum.reverse() |> List.flatten()
+
+        case write_recovered_value_pin_ops(acc.sm_state, ops) do
+          :ok ->
+            {:ok, %{acc | pending_pin_ops: [], pending_pin_count: 0, pending_pin_bytes: 0}}
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp write_recovered_value_pin_ops(sm_state, ops) do
+        result =
+          sm_state.shard_data_path
+          |> FlowLMDB.path()
+          |> FlowLMDB.write_batch(ops)
+
+        :telemetry.execute(
+          [:ferricstore, :waraft, :storage, :recovery_pin_batch],
+          %{ops: length(ops)},
+          %{shard_index: sm_state.shard_index, result: result}
+        )
+
+        result
       end
 
       defp generated_flow_value_ref?(key) do

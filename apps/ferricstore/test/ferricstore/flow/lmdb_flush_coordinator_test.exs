@@ -6,7 +6,7 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinatorTest do
   test "memory-budgeted default admits two independent shard rebuilds" do
     original_limit = Application.get_env(:ferricstore, :operational_memory_limit_bytes)
     original_concurrency = Application.get_env(:ferricstore, :flow_lmdb_max_concurrent_flushes)
-    Application.put_env(:ferricstore, :operational_memory_limit_bytes, 5 * 1024 * 1024 * 1024)
+    Application.put_env(:ferricstore, :operational_memory_limit_bytes, 4 * 1024 * 1024 * 1024)
     Application.delete_env(:ferricstore, :flow_lmdb_max_concurrent_flushes)
 
     on_exit(fn ->
@@ -150,6 +150,83 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinatorTest do
     end
 
     assert :ok = Task.await(third)
+  end
+
+  test "larger memory budget uses available schedulers and returns to one runtime permit" do
+    previous_limit = Application.get_env(:ferricstore, :operational_memory_limit_bytes)
+    previous_global = Application.get_env(:ferricstore, :flow_lmdb_max_concurrent_flushes)
+
+    Application.put_env(:ferricstore, :operational_memory_limit_bytes, 5 * 1024 * 1024 * 1024)
+    Application.delete_env(:ferricstore, :flow_lmdb_max_concurrent_flushes)
+
+    on_exit(fn ->
+      if previous_limit == nil,
+        do: Application.delete_env(:ferricstore, :operational_memory_limit_bytes),
+        else: Application.put_env(:ferricstore, :operational_memory_limit_bytes, previous_limit)
+
+      if previous_global == nil,
+        do: Application.delete_env(:ferricstore, :flow_lmdb_max_concurrent_flushes),
+        else:
+          Application.put_env(:ferricstore, :flow_lmdb_max_concurrent_flushes, previous_global)
+    end)
+
+    {:ok, startup} = Agent.start_link(fn -> true end)
+    on_exit(fn -> if Process.alive?(startup), do: Agent.stop(startup) end)
+
+    instance = unique_instance_name("startup_only_three")
+
+    coordinator =
+      start_supervised!(
+        {LMDBFlushCoordinator,
+         instance_name: instance, startup_fun: fn -> Agent.get(startup, & &1) end}
+      )
+
+    startup_permits = min(System.schedulers_online(), 3)
+    assert %{max: ^startup_permits, runtime_max: 1} = :sys.get_state(coordinator)
+    parent = self()
+
+    holders =
+      for shard <- 0..(startup_permits - 1) do
+        Task.async(fn ->
+          LMDBFlushCoordinator.with_shard_permit(instance, shard, fn ->
+            send(parent, {:startup_permit, shard})
+            receive do: (:release -> :ok)
+          end)
+        end)
+      end
+
+    try do
+      for shard <- 0..(startup_permits - 1) do
+        assert_receive {:startup_permit, ^shard}, 1_000
+      end
+
+      Agent.update(startup, fn _ -> false end)
+
+      runtime =
+        Task.async(fn ->
+          LMDBFlushCoordinator.with_shard_permit(instance, startup_permits, fn ->
+            send(parent, :runtime_permit)
+            :ok
+          end)
+        end)
+
+      holders
+      |> Enum.take(startup_permits - 1)
+      |> Enum.each(fn holder ->
+        send(holder.pid, :release)
+        assert :ok = Task.await(holder)
+        refute_receive :runtime_permit, 100
+      end)
+
+      last_holder = List.last(holders)
+      send(last_holder.pid, :release)
+      assert :ok = Task.await(last_holder)
+
+      assert_receive :runtime_permit, 1_000
+      assert :ok = Task.await(runtime)
+    after
+      Enum.each(holders, fn holder -> send(holder.pid, :release) end)
+    end
   end
 
   test "shard permits wait for their writer without blocking other shards" do
