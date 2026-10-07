@@ -852,23 +852,26 @@ defmodule FerricstoreServer.Native.ResourceBudget do
   end
 
   defp release_scoped_owner_leases(budget, owner) do
-    rows =
-      try do
-        :ets.match_object(budget.scoped_owner_leases, {{owner, :_}, :_})
-      rescue
-        ArgumentError -> []
-      end
+    case :ets.info(budget.scoped_owner_leases, :size) do
+      size when size in [0, :undefined] ->
+        MapSet.new()
 
-    Enum.reduce(rows, MapSet.new(), fn {{^owner, resource} = key, _amount}, resources ->
-      case safe_take_lease(budget.scoped_owner_leases, key) do
-        [{^key, amount}] ->
-          release_amount(budget, resource, amount)
-          MapSet.put(resources, resource)
+      _nonempty ->
+        # The complete key is indexed; a partial owner match scans every owner.
+        # Resource kinds are a fixed, small set, independent of connection count.
+        Enum.reduce(@resources, MapSet.new(), fn resource, resources ->
+          key = {owner, resource}
 
-        _already_released ->
-          resources
-      end
-    end)
+          case safe_take_lease(budget.scoped_owner_leases, key) do
+            [{^key, amount}] ->
+              release_amount(budget, resource, amount)
+              MapSet.put(resources, resource)
+
+            _already_released ->
+              resources
+          end
+        end)
+    end
   end
 
   defp reclaim_dead_scoped_owners(state, requested_resource) do

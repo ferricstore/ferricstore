@@ -86,6 +86,7 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinator do
          end),
        available: max_concurrent,
        queue: :queue.new(),
+       waiting: MapSet.new(),
        holders: %{},
        active_scopes: MapSet.new()
      }}
@@ -93,7 +94,14 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinator do
 
   @impl true
   def handle_call({:acquire, scope}, from, state) do
-    state = %{state | queue: :queue.in({from, scope}, state.queue)}
+    monitor = Process.monitor(elem(from, 0))
+
+    state = %{
+      state
+      | queue: :queue.in({from, scope, monitor}, state.queue),
+        waiting: MapSet.put(state.waiting, monitor)
+    }
+
     {:noreply, grant_next(state)}
   end
 
@@ -104,7 +112,14 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinator do
 
   @impl true
   def handle_info({:DOWN, token, :process, _pid, _reason}, state) do
-    {:noreply, release_token(state, token)}
+    if MapSet.member?(state.waiting, token) do
+      queue = :queue.filter(fn {_from, _scope, monitor} -> monitor != token end, state.queue)
+
+      {:noreply,
+       grant_next(%{state | queue: queue, waiting: MapSet.delete(state.waiting, token)})}
+    else
+      {:noreply, release_token(state, token)}
+    end
   end
 
   defp coordinator_pid(instance_name) do
@@ -136,14 +151,13 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinator do
     :exit, _reason -> :unavailable
   end
 
-  defp grant(pid, scope, state) do
-    token = Process.monitor(pid)
-
+  defp grant(pid, scope, token, state) do
     {token,
      %{
        state
        | available: state.available - 1,
          holders: Map.put(state.holders, token, {pid, scope}),
+         waiting: MapSet.delete(state.waiting, token),
          active_scopes: put_active_scope(state.active_scopes, scope)
      }}
   end
@@ -177,8 +191,8 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinator do
       state
     else
       case pop_grantable(state) do
-        {:ok, {{pid, _tag} = from, scope}, queue} ->
-          {token, state} = grant(pid, scope, %{state | queue: queue})
+        {:ok, {{pid, _tag} = from, scope, monitor}, queue} ->
+          {token, state} = grant(pid, scope, monitor, %{state | queue: queue})
           GenServer.reply(from, {:ok, token})
           grant_next(state)
 
@@ -203,7 +217,7 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinator do
 
   defp pop_grantable(queue, blocked, active_scopes, remaining) do
     case :queue.out(queue) do
-      {{:value, {_from, scope} = entry}, rest} ->
+      {{:value, {_from, scope, _monitor} = entry}, rest} ->
         if scope != nil and MapSet.member?(active_scopes, scope) do
           pop_grantable(rest, :queue.in(entry, blocked), active_scopes, remaining - 1)
         else

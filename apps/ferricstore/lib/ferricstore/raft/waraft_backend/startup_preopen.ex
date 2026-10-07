@@ -99,6 +99,8 @@ defmodule Ferricstore.Raft.WARaftBackend.StartupPreopen do
 
     {pid, monitor} =
       spawn_monitor(fn ->
+        parent_monitor = Process.monitor(parent)
+
         try do
           handle = WARaftStorage.open_unprepared(options, root)
           call_preopen_hook(options, root)
@@ -116,10 +118,15 @@ defmodule Ferricstore.Raft.WARaftBackend.StartupPreopen do
 
             {:waraft_preopen_cancel, ^ref} ->
               :ok
+
+            {:DOWN, ^parent_monitor, :process, ^parent, _reason} ->
+              :ok
           end
         rescue
           error -> send(parent, {:waraft_preopen_failed, ref, error, __STACKTRACE__})
         after
+          Process.demonitor(parent_monitor, [:flush])
+
           case :persistent_term.get(registry_key(root), nil) do
             {pid, ^ref} when pid == self() -> :persistent_term.erase(registry_key(root))
             _other -> :ok

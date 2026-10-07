@@ -1,5 +1,6 @@
 defmodule Ferricstore.Store.PublicationEpoch do
   @moduledoc false
+  @read_spin_retries 8
 
   @type token ::
           :noop
@@ -40,8 +41,12 @@ defmodule Ferricstore.Store.PublicationEpoch do
   def end_write(:noop), do: :ok
 
   def end_write({ref, position, odd_epoch, latch_table, latch_key, owner}) do
-    finish_atomic_write(ref, position, odd_epoch)
-    delete_writer_latch(latch_table, latch_key, owner)
+    # Only the close that advances this token's epoch may release its latch.
+    # An old token can share its owner pid with a newer publication.
+    if :atomics.compare_exchange(ref, position, odd_epoch, odd_epoch + 1) == :ok do
+      delete_writer_latch(latch_table, latch_key, owner)
+    end
+
     :ok
   end
 
@@ -90,6 +95,7 @@ defmodule Ferricstore.Store.PublicationEpoch do
     latch_table = elem(latch_refs, shard_index)
     latch_key = {__MODULE__, :writer, shard_index}
     delete_any_writer_latch(latch_table, latch_key)
+    Ferricstore.Store.PromotedPublication.reset(%{latch_refs: latch_refs}, shard_index)
     :ok
   end
 
@@ -119,23 +125,29 @@ defmodule Ferricstore.Store.PublicationEpoch do
     end
   end
 
-  defp read_stable(ref, descriptors, fun) do
+  defp read_stable(ref, descriptors, fun), do: read_stable(ref, descriptors, fun, 0)
+
+  defp read_stable(ref, descriptors, fun, retries) do
     before = read_epochs(ref, descriptors, [])
 
     if Enum.any?(before, &(rem(&1, 2) == 1)) do
       repair_dead_writer_epochs(ref, descriptors, before)
-      :erlang.yield()
-      read_stable(ref, descriptors, fun)
+      pause_publication_read(retries)
+      read_stable(ref, descriptors, fun, retries + 1)
     else
       result = fun.()
 
       if before == read_epochs(ref, descriptors, []) do
         result
       else
-        read_stable(ref, descriptors, fun)
+        pause_publication_read(retries)
+        read_stable(ref, descriptors, fun, retries + 1)
       end
     end
   end
+
+  defp pause_publication_read(retries) when retries < @read_spin_retries, do: :erlang.yield()
+  defp pause_publication_read(_retries), do: Process.sleep(1)
 
   defp read_epochs(_ref, [], acc), do: Enum.reverse(acc)
 
@@ -154,6 +166,10 @@ defmodule Ferricstore.Store.PublicationEpoch do
   end
 
   defp acquire_writer_latch(latch_table, latch_key) do
+    acquire_writer_latch(latch_table, latch_key, 0)
+  end
+
+  defp acquire_writer_latch(latch_table, latch_key, retries) do
     case :ets.insert_new(latch_table, {latch_key, self()}) do
       true ->
         :ok
@@ -165,19 +181,19 @@ defmodule Ferricstore.Store.PublicationEpoch do
 
           [{^latch_key, owner}] when is_pid(owner) ->
             if Process.alive?(owner) do
-              :erlang.yield()
+              pause_publication_read(retries)
             else
               :ets.delete_object(latch_table, {latch_key, owner})
             end
 
-            acquire_writer_latch(latch_table, latch_key)
+            acquire_writer_latch(latch_table, latch_key, retries + 1)
 
           [stale] ->
             :ets.delete_object(latch_table, stale)
-            acquire_writer_latch(latch_table, latch_key)
+            acquire_writer_latch(latch_table, latch_key, retries + 1)
 
           [] ->
-            acquire_writer_latch(latch_table, latch_key)
+            acquire_writer_latch(latch_table, latch_key, retries + 1)
         end
     end
   rescue

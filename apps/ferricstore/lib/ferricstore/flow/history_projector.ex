@@ -455,7 +455,18 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   def handle_cast({:project_to, index}, state) do
     requested_index = max_index(state.requested_index, index)
-    {:noreply, flush_pending(%{state | requested_index: requested_index})}
+    next_state = %{state | requested_index: requested_index}
+
+    # The cast has no synchronous durability reply. Let already queued history
+    # entries/requests accumulate behind one prompt timer instead of syncing a
+    # new replay marker for each request. Only handled casts contribute to this
+    # target; the requested-index atomics may describe unseen history messages.
+    next_state =
+      if state.requested_index == nil or state.flush_timer == nil,
+        do: schedule_flush_soon(next_state),
+        else: next_state
+
+    {:noreply, next_state}
   end
 
   @impl true

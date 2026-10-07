@@ -185,7 +185,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotInstall do
 
         case File.lstat(source) do
           {:ok, %{type: :directory}} ->
-            copy_dir(source, staged)
+            copy_payload_dir(source, staged, kind)
 
           {:ok, %{type: type}} ->
             {:error, {:source_not_directory, source, type}}
@@ -432,7 +432,16 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotInstall do
         end
       end
 
-      defp copy_dir(source, dest) do
+      defp copy_payload_dir(source, dest, :data) do
+        runtime_lock = Path.join(FlowLMDB.path(source), "lock.mdb")
+        copy_dir(source, dest, runtime_lock)
+      end
+
+      defp copy_payload_dir(source, dest, _kind), do: copy_dir(source, dest)
+
+      defp copy_dir(source, dest), do: copy_dir(source, dest, nil)
+
+      defp copy_dir(source, dest, runtime_lock) do
         with :ok <- reset_dir(dest) do
           case File.lstat(source) do
             {:ok, %{type: :directory}} ->
@@ -441,7 +450,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotInstall do
                      Enum.reduce_while(children, :ok, fn child, :ok ->
                        case copy_snapshot_payload_entry(
                               Path.join(source, child),
-                              Path.join(dest, child)
+                              Path.join(dest, child),
+                              runtime_lock
                             ) do
                          :ok -> {:cont, :ok}
                          {:error, _reason} = error -> {:halt, error}
@@ -465,15 +475,22 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotInstall do
         end
       end
 
-      defp copy_snapshot_payload_entry(source, dest) do
+      defp copy_snapshot_payload_entry(source, dest, runtime_lock) do
         case File.lstat(source) do
           {:ok, %{type: :directory}} ->
-            copy_dir(source, dest)
+            copy_dir(source, dest, runtime_lock)
 
           {:ok, %{type: :regular}} ->
-            case Ferricstore.FS.copy_sync_nofollow(source, dest) do
-              :ok -> :ok
-              {:error, reason} -> {:error, {:copy_file, source, reason}}
+            if source == runtime_lock do
+              # LMDB recreates coordination state when opening the copied data
+              # environment. Copying its live lock file can block on flock and
+              # would transfer process-local mutex/reader state into a snapshot.
+              :ok
+            else
+              case Ferricstore.FS.copy_sync_nofollow(source, dest) do
+                :ok -> :ok
+                {:error, reason} -> {:error, {:copy_file, source, reason}}
+              end
             end
 
           {:ok, %{type: type}} ->

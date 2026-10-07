@@ -682,6 +682,68 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageRecoveryReuse
       end
 
       @tag :startup_preopen
+      @tag :review_regression
+      test "prepared storage worker releases its tables when startup caller dies", %{root: root} do
+        multi_root = Path.join(root, "preopen-caller-exit")
+        Ferricstore.DataDir.ensure_layout!(multi_root, 2)
+        Ferricstore.Store.ActiveFile.init(2)
+        ctx = build_ctx(multi_root, shard_count: 2)
+        parent = self()
+        old_limit = Application.get_env(:ferricstore, :waraft_start_preopen_concurrency)
+        old_hook = Application.get_env(:ferricstore, :waraft_start_preopen_hook)
+        Application.put_env(:ferricstore, :waraft_start_preopen_concurrency, 2)
+
+        Application.put_env(:ferricstore, :waraft_start_preopen_hook, fn options, _ ->
+          send(parent, {:review_preopen_worker, options.partition, self()})
+
+          if options.partition == 2,
+            do:
+              (receive do
+                 :release_review_worker -> :ok
+               end)
+        end)
+
+        starter =
+          spawn(fn ->
+            WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+          end)
+
+        registry_key =
+          {Ferricstore.Raft.WARaftBackend.StartupPreopen,
+           Path.expand(Path.join(multi_root, "waraft/ferricstore_waraft_backend.1"))}
+
+        try do
+          assert_receive {:review_preopen_worker, 1, first}, 5_000
+          assert_receive {:review_preopen_worker, 2, second}, 5_000
+
+          on_exit(fn ->
+            Process.exit(first, :kill)
+            Process.exit(second, :kill)
+            :persistent_term.erase(registry_key)
+          end)
+
+          assert_eventually(
+            fn ->
+              match?({^first, _}, :persistent_term.get(registry_key, nil))
+            end,
+            true
+          )
+
+          monitor = Process.monitor(first)
+          Process.exit(starter, :kill)
+          send(second, :release_review_worker)
+          assert_receive {:DOWN, ^monitor, :process, ^first, _}, 2_000
+          assert :persistent_term.get(registry_key, nil) == nil
+        after
+          Process.exit(starter, :kill)
+          WARaftBackend.stop()
+          FerricStore.Instance.cleanup(ctx.name)
+          restore_env(:waraft_start_preopen_concurrency, old_limit)
+          restore_env(:waraft_start_preopen_hook, old_hook)
+        end
+      end
+
+      @tag :startup_preopen
       test "four preopen workers require six GiB and four schedulers" do
         alias Ferricstore.Raft.WARaftBackend.StartupPreopen
 

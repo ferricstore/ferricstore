@@ -635,6 +635,8 @@ if config_env() == :prod do
        end),
     waraft_generic_batch_window_ms:
       String.to_integer(System.get_env("FERRICSTORE_WARAFT_GENERIC_BATCH_WINDOW_MS", "0")),
+    waraft_single_hset_coalescing:
+      System.get_env("FERRICSTORE_WARAFT_SINGLE_HSET_COALESCING", "false") in ["true", "1"],
     waraft_generic_batch_during_flush:
       System.get_env("FERRICSTORE_WARAFT_GENERIC_BATCH_DURING_FLUSH", "true") in [
         "1",

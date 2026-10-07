@@ -33,7 +33,7 @@ defmodule FerricStore.API.Lists do
   def lpush(key, elements) when is_list(elements) do
     ctx = default_ctx()
 
-    Router.list_op(ctx, key, {:lpush, elements})
+    push_and_notify(ctx, key, elements, :lpush)
     |> wrap_result()
   end
 
@@ -55,8 +55,18 @@ defmodule FerricStore.API.Lists do
   def rpush(key, elements) when is_list(elements) do
     ctx = default_ctx()
 
-    Router.list_op(ctx, key, {:rpush, elements})
+    push_and_notify(ctx, key, elements, :rpush)
     |> wrap_result()
+  end
+
+  defp push_and_notify(ctx, key, elements, direction) do
+    result = Router.list_op(ctx, key, {direction, elements})
+
+    if is_integer(result) and result > 0 do
+      Ferricstore.Store.Ops.on_push(ctx, key)
+    end
+
+    result
   end
 
   @doc """

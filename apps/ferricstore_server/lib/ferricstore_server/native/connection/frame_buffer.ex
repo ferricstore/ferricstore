@@ -8,11 +8,16 @@ defmodule FerricstoreServer.Native.Connection.FrameBuffer do
   @max_coalesced_continuation_bytes 64 * 1024
   @max_u32 4_294_967_295
   @max_frame_body_bytes min(@max_buffer_bytes - @header_bytes, @max_u32)
+  # Conservative 64-bit BEAM allowance for a binary reference/header, list cell,
+  # decoded frame tuple, and boxed request ID. Use the same estimate across the
+  # receive/decode boundary to avoid a redundant resize for single-frame reads.
+  @retained_metadata_bytes 128
   @magic "FSNP"
   @version 1
   @response_direction 0x80
 
   defstruct chunks_rev: [],
+            chunk_count: 0,
             buffered_bytes: 0,
             header: "",
             expected_bytes: nil
@@ -21,6 +26,7 @@ defmodule FerricstoreServer.Native.Connection.FrameBuffer do
 
   @type t :: %__MODULE__{
           chunks_rev: [binary()],
+          chunk_count: non_neg_integer(),
           buffered_bytes: non_neg_integer(),
           header: binary(),
           expected_bytes: expected_bytes()
@@ -115,11 +121,23 @@ defmodule FerricstoreServer.Native.Connection.FrameBuffer do
   end
 
   @doc false
+  @spec retained_bytes(t() | map()) :: non_neg_integer()
+  def retained_bytes(%{buffered_bytes: bytes, chunk_count: count}) do
+    bytes + count * @retained_metadata_bytes
+  end
+
+  @doc false
+  @spec retained_frame_bytes(non_neg_integer()) :: pos_integer()
+  def retained_frame_bytes(body_bytes) do
+    frame_bytes(body_bytes) + @retained_metadata_bytes
+  end
+
+  @doc false
   @spec stats(t()) :: map()
   def stats(%__MODULE__{} = buffer) do
     %{
       buffered_bytes: buffer.buffered_bytes,
-      chunk_count: length(buffer.chunks_rev),
+      chunk_count: buffer.chunk_count,
       complete?: complete?(buffer),
       header_bytes: byte_size(buffer.header),
       storage: :iodata
@@ -132,6 +150,7 @@ defmodule FerricstoreServer.Native.Connection.FrameBuffer do
     %{
       buffer
       | chunks_rev: [data | buffer.chunks_rev],
+        chunk_count: buffer.chunk_count + 1,
         buffered_bytes: buffer.buffered_bytes + byte_size(data),
         header: append_header(buffer.header, data)
     }

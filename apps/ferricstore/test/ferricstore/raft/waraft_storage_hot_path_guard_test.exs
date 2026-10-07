@@ -117,8 +117,8 @@ defmodule Ferricstore.Raft.WARaftStorageHotPathGuardTest do
     assert String.split(open_source, "validate_open_segment_file(Path, Fd)", parts: 2)
            |> hd() =~ "file:open(Path"
 
-    assert source =~ "file:read_file_info(Fd)"
-    assert source =~ "file:read_link_info(Path)"
+    assert source =~ "file:read_file_info(Fd, [raw])"
+    assert source =~ "file:read_link_info(Path, [raw])"
   end
 
   test "segment recovery and truncation verify descriptor identity after open" do
@@ -189,7 +189,7 @@ defmodule Ferricstore.Raft.WARaftStorageHotPathGuardTest do
 
     [copy_source] =
       Regex.run(
-        ~r/defp copy_snapshot_payload_entry\(source, dest\).*?^      end/ms,
+        ~r/defp copy_snapshot_payload_entry\(source, dest, runtime_lock\).*?^      end/ms,
         source
       )
 

@@ -100,8 +100,15 @@ defmodule FerricstoreHttp.Admission.StreamHandler do
   defp admit(stream_id, req, opts) do
     case Admission.acquire() do
       :ok ->
-        {commands, next} = :cowboy_stream.init(stream_id, req, opts)
-        {commands, {:accepted, next}}
+        try do
+          {commands, next} = :cowboy_stream.init(stream_id, req, opts)
+          {commands, {:accepted, next}}
+        catch
+          kind, reason ->
+            # Cowboy cannot call terminate/3 when init/3 never returns state.
+            Admission.release()
+            :erlang.raise(kind, reason, __STACKTRACE__)
+        end
 
       {:error, :request_limit} ->
         headers = %{

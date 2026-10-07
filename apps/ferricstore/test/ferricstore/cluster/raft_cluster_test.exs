@@ -59,6 +59,143 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
   # index and the written value is immediately readable.
   # ---------------------------------------------------------------------------
 
+  test "promoted cached fields replicate and remain readable without a shard callback", %{
+    nodes: nodes
+  } do
+    alias Ferricstore.Store.CompoundKey
+    key = "cluster-promoted-publication:#{System.unique_integer([:positive])}"
+    fields = Enum.map(1..128, &CompoundKey.hash_field(key, "field-#{&1}"))
+    writer = hd(nodes)
+
+    assert :ok =
+             remote_router(writer.name, :compound_put, [key, CompoundKey.type_key(key), "hash", 0])
+
+    for version <- 1..4 do
+      entries = Enum.map(fields, &{&1, "version-#{version}", 0})
+      assert :ok = remote_router(writer.name, :compound_batch_put, [key, entries])
+
+      for node <- nodes do
+        eventually(fn ->
+          assert remote_router(node.name, :compound_get, [key, hd(fields)]) ==
+                   "version-#{version}"
+
+          assert remote_router(node.name, :compound_get, [key, List.last(fields)]) ==
+                   "version-#{version}"
+        end)
+      end
+    end
+
+    for node <- nodes do
+      index = remote_router(node.name, :shard_for, [key])
+      shard = remote_router(node.name, :shard_name, [index])
+
+      eventually(fn ->
+        assert :erpc.call(node.name, GenServer, :call, [shard, {:promoted?, key}])
+      end)
+
+      :ok = :erpc.call(node.name, :sys, :suspend, [shard])
+      reader = Task.async(fn -> remote_router(node.name, :compound_get, [key, hd(fields)]) end)
+
+      try do
+        assert Task.yield(reader, 1_000) == {:ok, "version-4"}
+      after
+        :erpc.call(node.name, :sys, :resume, [shard])
+        Task.shutdown(reader, :brutal_kill)
+      end
+    end
+  end
+
+  test "public single-field HSET counts insertions in Raft order and applies on the writing node",
+       %{
+         nodes: nodes
+       } do
+    key = "cluster-single-hset:#{System.unique_integer([:positive])}"
+    seeds = Map.new(1..128, &{"seed-#{&1}", "seed"})
+    assert :ok = :erpc.call(hd(nodes).name, FerricStore, :hset, [key, seeds], 15_000)
+
+    replies =
+      for i <- 0..15 do
+        node = Enum.at(nodes, rem(i, length(nodes)))
+
+        Task.async(fn ->
+          ctx = :erpc.call(node.name, FerricStore.Instance, :get, [:default])
+
+          :erpc.call(
+            node.name,
+            FerricStore.Impl,
+            :hset,
+            [ctx, key, %{"shared" => "value-#{i}"}],
+            15_000
+          )
+        end)
+      end
+      |> Task.await_many(30_000)
+
+    assert Enum.count(replies, &(&1 == {:ok, 1})) == 1
+    assert Enum.count(replies, &(&1 == {:ok, 0})) == 15
+
+    for node <- nodes do
+      field = "writer-#{node.index}"
+      value = "local-value-#{node.index}"
+
+      assert :ok =
+               :erpc.call(node.name, FerricStore, :hset, [key, %{field => value}], 15_000)
+
+      assert {:ok, ^value} = :erpc.call(node.name, FerricStore, :hget, [key, field])
+
+      for replica <- nodes do
+        eventually(fn ->
+          assert :erpc.call(replica.name, FerricStore, :hget, [key, field]) == {:ok, value}
+        end)
+      end
+    end
+  end
+
+  test "grouped promoted HSET commits preserve scalar counts and writing-node local apply", %{
+    nodes: nodes
+  } do
+    key = "cluster-grouped-hset:#{System.unique_integer([:positive])}"
+    seeds = Map.new(1..128, &{"seed-#{&1}", "seed"})
+    assert :ok = :erpc.call(hd(nodes).name, FerricStore, :hset, [key, seeds], 15_000)
+
+    for node <- nodes do
+      index = remote_router(node.name, :shard_for, [key])
+      shard = remote_router(node.name, :shard_name, [index])
+
+      eventually(fn ->
+        assert :erpc.call(node.name, GenServer, :call, [shard, {:promoted?, key}])
+      end)
+
+      a = "group-a-#{node.index}"
+      b = "group-b-#{node.index}"
+
+      commands = [
+        {:hset_single, key, a, "first"},
+        {:hset_single, key, b, "second"},
+        {:hset_single, key, a, "last"}
+      ]
+
+      assert {:ok, [1, 1, 0]} =
+               :erpc.call(
+                 node.name,
+                 Ferricstore.Raft.WARaftBackend,
+                 :write_batch,
+                 [index, commands],
+                 15_000
+               )
+
+      assert {:ok, "last"} = :erpc.call(node.name, FerricStore, :hget, [key, a])
+      assert {:ok, "second"} = :erpc.call(node.name, FerricStore, :hget, [key, b])
+
+      for replica <- nodes do
+        eventually(fn ->
+          assert {:ok, "last"} = :erpc.call(replica.name, FerricStore, :hget, [key, a])
+          assert {:ok, "second"} = :erpc.call(replica.name, FerricStore, :hget, [key, b])
+        end)
+      end
+    end
+  end
+
   describe "RA-001: entry committed to quorum before ACK" do
     @tag :cluster
     test "write returns :ok only after Raft commit on local node", %{nodes: nodes} do

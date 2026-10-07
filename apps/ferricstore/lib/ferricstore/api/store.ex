@@ -286,6 +286,7 @@ defmodule FerricStore.API.Store do
       exists?: fn k -> Router.exists?(ctx, k) end,
       keys: fn -> Router.keys(ctx) end,
       prob_write: fn cmd -> Router.prob_write(ctx, cmd) end,
+      hset_single: fn key, field, value -> Router.hset_single(ctx, key, field, value) end,
       # Compound ops route through Router so they get the same not_leader →
       # forward + read-your-write barrier as plain Router.put. Going direct
       # to the local shard skips that and silently loses writes when the

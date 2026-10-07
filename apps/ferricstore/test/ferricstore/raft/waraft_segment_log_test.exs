@@ -162,6 +162,94 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
     )
   end
 
+  test "heartbeat term folds do not probe disk for indexes beyond the durable tail" do
+    with_segment_log_memory_env(
+      max_bytes: 1_000_000,
+      max_entries: 128,
+      min_entries: 2,
+      records_per_segment: 128,
+      fun: fn _root, log, _log_name ->
+        provider = :ferricstore_waraft_spike_segment_log
+        assert :ok = provider.init(log)
+        assert {:ok, provider_state} = provider.open(log)
+
+        try do
+          entries = for i <- 1..32, do: {1, {i, {:put, "key:#{i}", "value", 0}}}
+
+          assert :ok =
+                   provider.append({:log_view, log, 0, 0, :undefined}, entries, :strict, :high)
+
+          assert provider.last_index(log) == 32
+          probe = {provider, :read_log_disk_record, 2}
+          :erlang.trace_pattern(probe, true, [:local])
+
+          try do
+            task =
+              Task.async(fn ->
+                receive do
+                  :run ->
+                    provider.fold_terms(
+                      log,
+                      1,
+                      128,
+                      fn index, term, acc ->
+                        [{index, term} | acc]
+                      end,
+                      []
+                    )
+                end
+              end)
+
+            pid = task.pid
+            :erlang.trace(pid, true, [:call, :arity, {:tracer, self()}])
+            send(pid, :run)
+            assert {:ok, terms} = Task.await(task, 10_000)
+            assert Enum.reverse(terms) == for(i <- 1..32, do: {i, 1})
+            delivered = :erlang.trace_delivered(:all)
+            assert_receive {:trace_delivered, :all, ^delivered}, 5_000
+            refute_receive {:trace, ^pid, :call, ^probe}, 0
+          after
+            :erlang.trace_pattern(probe, false, [:local])
+          end
+        after
+          provider.close(log, provider_state)
+        end
+      end
+    )
+  end
+
+  test "bounded heartbeat term folds retain demoted entries and fail closed on their CRC" do
+    with_segment_log_memory_env(
+      max_bytes: 4_096,
+      max_entries: 4,
+      min_entries: 2,
+      records_per_segment: 128,
+      fun: fn _root, log, log_name ->
+        provider = :ferricstore_waraft_spike_segment_log
+        assert :ok = provider.init(log)
+        assert {:ok, provider_state} = provider.open(log)
+
+        try do
+          entries = for i <- 1..16, do: {1, {i, {:put, "key:#{i}", "value", 0}}}
+
+          assert :ok =
+                   provider.append({:log_view, log, 0, 0, :undefined}, entries, :strict, :high)
+
+          assert :ets.lookup(log_name, 1) == []
+          assert provider.last_index(log) == 16
+          fold = fn index, term, acc -> [{index, term} | acc] end
+          assert {:ok, terms} = provider.fold_terms(log, 1, 64, fold, [])
+          assert Enum.reverse(terms) == for(i <- 1..16, do: {i, 1})
+          segment = Path.join(to_string(provider_state.dir), "0.seg")
+          corrupt_segment_crc!(segment)
+          assert {:error, {:crc_mismatch, 0}} = provider.fold_terms(log, 1, 64, fold, [])
+        after
+          provider.close(log, provider_state)
+        end
+      end
+    )
+  end
+
   test "a projection-bound disk fold reads only the Raft tail after its covered index" do
     with_segment_log_memory_env(
       max_bytes: 4_096,

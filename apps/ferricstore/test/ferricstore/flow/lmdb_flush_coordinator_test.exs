@@ -325,6 +325,53 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinatorTest do
     refute_received :unserialized_mutation
   end
 
+  test "dead queued callers are removed while a long-running holder retains its permit" do
+    instance = unique_instance_name("queued_down")
+
+    coordinator =
+      start_supervised!({LMDBFlushCoordinator, instance_name: instance, max_concurrent: 1})
+
+    parent = self()
+
+    holder =
+      spawn(fn ->
+        LMDBFlushCoordinator.with_shard_permit(instance, 0, fn ->
+          send(parent, :review_holder_ready)
+
+          receive do
+            :release_review_holder -> :ok
+          end
+        end)
+      end)
+
+    on_exit(fn -> Process.exit(holder, :kill) end)
+    assert_receive :review_holder_ready, 1_000
+
+    waiter =
+      spawn(fn ->
+        LMDBFlushCoordinator.with_shard_permit(instance, 1, fn ->
+          send(parent, :dead_waiter_ran)
+        end)
+      end)
+
+    on_exit(fn -> Process.exit(waiter, :kill) end)
+
+    Ferricstore.Test.ShardHelpers.eventually(fn ->
+      :queue.len(:sys.get_state(coordinator).queue) == 1
+    end)
+
+    Process.exit(waiter, :kill)
+
+    Ferricstore.Test.ShardHelpers.eventually(fn ->
+      :queue.is_empty(:sys.get_state(coordinator).queue)
+    end)
+
+    assert map_size(:sys.get_state(coordinator).holders) == 1
+    send(holder, :release_review_holder)
+    assert :ok = LMDBFlushCoordinator.with_shard_permit(instance, 1, fn -> :ok end)
+    refute_received :dead_waiter_ran
+  end
+
   test "a failed acquisition fails closed without executing the mutation" do
     coordinator = self()
 

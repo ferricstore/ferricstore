@@ -764,7 +764,8 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp retained_inbound_bytes(state, buffer_stats) do
-    buffer_stats.buffered_bytes + state.decoded_retained_bytes + state.queued_request_bytes
+    FrameBuffer.retained_bytes(buffer_stats) + state.decoded_retained_bytes +
+      state.queued_request_bytes
   end
 
   defp discard_decoded_frame(state, decoded_bytes) do
@@ -1422,7 +1423,7 @@ defmodule FerricstoreServer.Native.Connection do
   defp request_id({_lane_id, _opcode, request_id, _flags, _body}), do: request_id
   defp flags({_lane_id, _opcode, _request_id, flags, _body}), do: flags
   defp body({_lane_id, _opcode, _request_id, _flags, body}), do: body
-  defp frame_memory_bytes(frame), do: FrameBuffer.frame_bytes(byte_size(body(frame)))
+  defp frame_memory_bytes(frame), do: FrameBuffer.retained_frame_bytes(byte_size(body(frame)))
 
   defp trace?(frame), do: Bitwise.band(flags(frame), @flag_trace) != 0
 

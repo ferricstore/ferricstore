@@ -2,7 +2,7 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
   @moduledoc false
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Store.{CompoundCommand, Promotion, ReadResult}
+  alias Ferricstore.Store.{CompoundCommand, PromotedPublication, Promotion, ReadResult}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
   alias Ferricstore.Store.Shard.Reads, as: ShardReads
@@ -19,7 +19,9 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
     if state.raft? do
       handle_compound_put_raft(redis_key, compound_key, value, expire_at_ms, state)
     else
-      handle_compound_put_direct(redis_key, compound_key, value, expire_at_ms, state)
+      PromotedPublication.with_scope(fn ->
+        handle_compound_put_direct(redis_key, compound_key, value, expire_at_ms, state)
+      end)
     end
   end
 
@@ -35,7 +37,9 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
     if state.raft? do
       handle_compound_batch_put_raft(redis_key, entries, state)
     else
-      handle_compound_batch_put_direct(redis_key, entries, state)
+      PromotedPublication.with_scope(fn ->
+        handle_compound_batch_put_direct(redis_key, entries, state)
+      end)
     end
   end
 
@@ -45,7 +49,9 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
     if state.raft? do
       handle_compound_delete_raft(redis_key, compound_key, state)
     else
-      handle_compound_delete_direct(redis_key, compound_key, state)
+      PromotedPublication.with_scope(fn ->
+        handle_compound_delete_direct(redis_key, compound_key, state)
+      end)
     end
   end
 
@@ -57,7 +63,9 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
     if state.raft? do
       handle_compound_batch_delete_raft(redis_key, compound_keys, state)
     else
-      handle_compound_batch_delete_direct(redis_key, compound_keys, state)
+      PromotedPublication.with_scope(fn ->
+        handle_compound_batch_delete_direct(redis_key, compound_keys, state)
+      end)
     end
   end
 
@@ -506,26 +514,28 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
                expire_at_ms
              ) do
           {:ok, {fid, offset, value_size, record_size}} ->
-            state =
-              Promoted.track_promoted_dead_bytes(state, redis_key, compound_key, record_size)
+            PromotedPublication.publish(state, fn ->
+              state =
+                Promoted.track_promoted_dead_bytes(state, redis_key, compound_key, record_size)
 
-            ShardETS.ets_insert_with_location(
-              state,
-              compound_key,
-              value,
-              expire_at_ms,
-              fid,
-              offset,
-              value_size
-            )
+              ShardETS.ets_insert_with_location(
+                state,
+                compound_key,
+                value,
+                expire_at_ms,
+                fid,
+                offset,
+                value_size
+              )
 
-            new_state =
-              state
-              |> Promoted.bump_promoted_writes(redis_key)
-              |> ZSetIndex.apply_put(redis_key, compound_key, value)
-              |> Map.put(:write_version, state.write_version + 1)
+              new_state =
+                state
+                |> Promoted.bump_promoted_writes(redis_key)
+                |> ZSetIndex.apply_put(redis_key, compound_key, value)
+                |> Map.put(:write_version, state.write_version + 1)
 
-            {:reply, :ok, new_state}
+              {:reply, :ok, new_state}
+            end)
 
           {:error, reason} ->
             Logger.error("Shard #{state.index}: promoted write failed: #{inspect(reason)}")
@@ -612,31 +622,35 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
 
     case Promoted.promoted_write_batch_values(state, dedicated_path, entries) do
       {:ok, locations} ->
-        new_state =
-          entries
-          |> Enum.zip(locations)
-          |> Enum.reduce(state, fn
-            {{compound_key, value, expire_at_ms}, {fid, offset, value_size, record_size}}, acc ->
-              acc = Promoted.track_promoted_dead_bytes(acc, redis_key, compound_key, record_size)
+        PromotedPublication.publish(state, fn ->
+          new_state =
+            entries
+            |> Enum.zip(locations)
+            |> Enum.reduce(state, fn
+              {{compound_key, value, expire_at_ms}, {fid, offset, value_size, record_size}},
+              acc ->
+                acc =
+                  Promoted.track_promoted_dead_bytes(acc, redis_key, compound_key, record_size)
 
-              true =
-                ShardETS.ets_insert_with_location(
-                  acc,
-                  compound_key,
-                  value,
-                  expire_at_ms,
-                  fid,
-                  offset,
-                  value_size
-                )
+                true =
+                  ShardETS.ets_insert_with_location(
+                    acc,
+                    compound_key,
+                    value,
+                    expire_at_ms,
+                    fid,
+                    offset,
+                    value_size
+                  )
 
-              acc
-          end)
-          |> Promoted.bump_promoted_writes(redis_key)
-          |> ZSetIndex.apply_puts(redis_key, entries)
-          |> Map.put(:write_version, state.write_version + length(entries))
+                acc
+            end)
+            |> Promoted.bump_promoted_writes(redis_key)
+            |> ZSetIndex.apply_puts(redis_key, entries)
+            |> Map.put(:write_version, state.write_version + length(entries))
 
-        {:reply, :ok, new_state}
+          {:reply, :ok, new_state}
+        end)
 
       {:error, reason} ->
         Logger.error("Shard #{state.index}: promoted batch write failed: #{inspect(reason)}")
@@ -718,16 +732,18 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
 
         case Promoted.promoted_tombstone(dedicated_path, compound_key) do
           {:ok, _} ->
-            state = Promoted.track_promoted_delete_bytes(state, redis_key, compound_key)
-            ShardETS.ets_delete_key(state, compound_key)
+            PromotedPublication.publish(state, fn ->
+              state = Promoted.track_promoted_delete_bytes(state, redis_key, compound_key)
+              ShardETS.ets_delete_key(state, compound_key)
 
-            new_state =
-              state
-              |> Promoted.bump_promoted_writes(redis_key)
-              |> ZSetIndex.apply_delete(redis_key, compound_key)
-              |> Map.put(:write_version, state.write_version + 1)
+              new_state =
+                state
+                |> Promoted.bump_promoted_writes(redis_key)
+                |> ZSetIndex.apply_delete(redis_key, compound_key)
+                |> Map.put(:write_version, state.write_version + 1)
 
-            {:reply, :ok, new_state}
+              {:reply, :ok, new_state}
+            end)
 
           {:error, reason} ->
             Logger.error("Shard #{state.index}: promoted tombstone failed: #{inspect(reason)}")
@@ -782,23 +798,25 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
 
     case Promoted.promoted_tombstone_batch(dedicated_path, compound_keys) do
       {:ok, _locations} ->
-        state =
-          Enum.reduce(compound_keys, state, fn compound_key, acc ->
-            Promoted.track_promoted_delete_bytes(acc, redis_key, compound_key)
+        PromotedPublication.publish(state, fn ->
+          state =
+            Enum.reduce(compound_keys, state, fn compound_key, acc ->
+              Promoted.track_promoted_delete_bytes(acc, redis_key, compound_key)
+            end)
+
+          Enum.each(compound_keys, fn compound_key ->
+            ShardETS.ets_delete_key(state, compound_key)
           end)
 
-        Enum.each(compound_keys, fn compound_key ->
-          ShardETS.ets_delete_key(state, compound_key)
+          new_state =
+            Enum.reduce(compound_keys, state, fn compound_key, acc ->
+              ZSetIndex.apply_delete(acc, redis_key, compound_key)
+            end)
+            |> Promoted.bump_promoted_writes(redis_key)
+            |> Map.put(:write_version, state.write_version + length(compound_keys))
+
+          {:reply, :ok, new_state}
         end)
-
-        new_state =
-          Enum.reduce(compound_keys, state, fn compound_key, acc ->
-            ZSetIndex.apply_delete(acc, redis_key, compound_key)
-          end)
-          |> Promoted.bump_promoted_writes(redis_key)
-          |> Map.put(:write_version, state.write_version + length(compound_keys))
-
-        {:reply, :ok, new_state}
 
       {:error, reason} ->
         Logger.error("Shard #{state.index}: promoted tombstone batch failed: #{inspect(reason)}")
@@ -835,8 +853,10 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
   end
 
   defp handle_compound_delete_prefix_direct(redis_key, prefix, state) do
-    Promotion.with_compaction_latch(state, redis_key, fn ->
-      do_handle_compound_delete_prefix_direct(redis_key, prefix, state)
+    PromotedPublication.with_scope(fn ->
+      Promotion.with_compaction_latch(state, redis_key, fn ->
+        do_handle_compound_delete_prefix_direct(redis_key, prefix, state)
+      end)
     end)
   end
 

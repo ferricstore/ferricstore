@@ -486,6 +486,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         field_key = CompoundKey.hash_field(key, field)
 
         case sm_store_compound_get(state, key, type_key) do
+          {:error, _reason} = error ->
+            error
+
           nil ->
             apply_hset_single_new_hash(state, key, type_key, field_key, value)
 
@@ -514,11 +517,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       end
 
       defp apply_hset_single_existing_hash(state, key, field_key, value) do
-        existed? = sm_store_compound_get(state, key, field_key) != nil
+        case sm_store_compound_get(state, key, field_key) do
+          {:error, _reason} = error ->
+            error
 
-        case do_compound_put(state, key, field_key, value, 0) do
-          :ok -> if existed?, do: 0, else: 1
-          {:error, _reason} = error -> error
+          existing ->
+            case do_compound_put(state, key, field_key, value, 0) do
+              :ok -> if is_nil(existing), do: 1, else: 0
+              {:error, _reason} = error -> error
+            end
         end
       end
 

@@ -53,23 +53,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
 
         case validate_promoted_append_location(append_promoted_tombstone(active, compound_key)) do
           {:ok, _location} ->
-            track_keydir_binary_remove(state, compound_key)
-            :ets.delete(state.ets, compound_key)
+            Ferricstore.Store.PromotedPublication.publish(state, fn ->
+              track_keydir_binary_remove(state, compound_key)
+              :ets.delete(state.ets, compound_key)
 
-            CompoundMemberIndex.delete(
-              Map.get(state, :compound_member_index_name),
-              compound_key
-            )
+              CompoundMemberIndex.delete(
+                Map.get(state, :compound_member_index_name),
+                compound_key
+              )
 
-            sm_tx_mark_deleted(compound_key)
-            queue_promoted_maintenance_after_flush(redis_key, maintenance)
+              sm_tx_mark_deleted(compound_key)
+              queue_promoted_maintenance_after_flush(redis_key, maintenance)
 
-            queue_promoted_revision_delete_after_flush(
-              Map.get(state, :compound_revision_index_name),
-              compound_key
-            )
+              queue_promoted_revision_delete_after_flush(
+                Map.get(state, :compound_revision_index_name),
+                compound_key
+              )
 
-            :ok
+              :ok
+            end)
 
           {:error, _reason} = err ->
             err

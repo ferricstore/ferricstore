@@ -85,6 +85,7 @@ defmodule FerricstoreHttp.Auth.Cache do
       pending: %{},
       flights: %{},
       waiters: %{},
+      caller_monitors: %{},
       timer: nil
     }
 
@@ -125,7 +126,9 @@ defmodule FerricstoreHttp.Auth.Cache do
       {nil, _waiters} ->
         {:noreply, state}
 
-      {task_ref, waiters} ->
+      {{task_ref, monitor}, waiters} ->
+        Process.demonitor(monitor, [:flush])
+        state = %{state | caller_monitors: Map.delete(state.caller_monitors, monitor)}
         pending = Map.fetch!(state.pending, task_ref)
         flight_waiters = Map.delete(pending.waiters, waiter_ref)
 
@@ -157,6 +160,11 @@ defmodule FerricstoreHttp.Auth.Cache do
     {:noreply, complete(ref, {:error, :authentication_unavailable}, state)}
   end
 
+  def handle_info({:DOWN, monitor, :process, _pid, _reason}, state)
+      when is_map_key(state.caller_monitors, monitor) do
+    handle_cast({:cancel_waiter, Map.fetch!(state.caller_monitors, monitor)}, state)
+  end
+
   def handle_info(:sweep, state) do
     prune(state)
     {:noreply, schedule_sweep(state)}
@@ -182,7 +190,7 @@ defmodule FerricstoreHttp.Auth.Cache do
             %{flight | waiters: Map.put(flight.waiters, waiter_ref, {from, :coalesced})}
           end)
 
-        {:noreply, %{state | pending: pending, waiters: Map.put(state.waiters, waiter_ref, ref)}}
+        {:noreply, track_waiter(%{state | pending: pending}, waiter_ref, ref, from)}
 
       :error ->
         start_flight(cache_key, flight_key, waiter_ref, authenticate, from, state)
@@ -206,13 +214,24 @@ defmodule FerricstoreHttp.Auth.Cache do
       waiters: %{waiter_ref => {from, :miss}}
     }
 
-    {:noreply,
-     %{
-       state
-       | pending: Map.put(state.pending, task.ref, pending),
-         flights: Map.put(state.flights, flight_key, task.ref),
-         waiters: Map.put(state.waiters, waiter_ref, task.ref)
-     }}
+    state =
+      %{
+        state
+        | pending: Map.put(state.pending, task.ref, pending),
+          flights: Map.put(state.flights, flight_key, task.ref)
+      }
+
+    {:noreply, track_waiter(state, waiter_ref, task.ref, from)}
+  end
+
+  defp track_waiter(state, waiter_ref, task_ref, {caller, _tag}) do
+    monitor = Process.monitor(caller)
+
+    %{
+      state
+      | waiters: Map.put(state.waiters, waiter_ref, {task_ref, monitor}),
+        caller_monitors: Map.put(state.caller_monitors, monitor, waiter_ref)
+    }
   end
 
   defp call_fetch(cache_key, flight_scope, authenticate, timeout) do
@@ -267,16 +286,22 @@ defmodule FerricstoreHttp.Auth.Cache do
   defp complete(ref, result, state) do
     {pending, remaining} = Map.pop!(state.pending, ref)
 
-    waiters =
-      Enum.reduce(pending.waiters, state.waiters, fn {waiter_ref, _waiter}, waiters ->
-        Map.delete(waiters, waiter_ref)
+    state =
+      Enum.reduce(pending.waiters, state, fn {waiter_ref, _waiter}, acc ->
+        {_task_ref, monitor} = Map.fetch!(acc.waiters, waiter_ref)
+        Process.demonitor(monitor, [:flush])
+
+        %{
+          acc
+          | waiters: Map.delete(acc.waiters, waiter_ref),
+            caller_monitors: Map.delete(acc.caller_monitors, monitor)
+        }
       end)
 
     state = %{
       state
       | pending: remaining,
-        flights: Map.delete(state.flights, pending.flight_key),
-        waiters: waiters
+        flights: Map.delete(state.flights, pending.flight_key)
     }
 
     state = maybe_cache(result, pending.cache_key, state)
@@ -316,13 +341,10 @@ defmodule FerricstoreHttp.Auth.Cache do
   defp prune(state) do
     now_ms = state.clock.()
 
-    Enum.each(:ets.tab2list(state.table), fn
-      {cache_key, _session, expires_at_ms, _last_used_ms} when expires_at_ms <= now_ms ->
-        :ets.delete(state.table, cache_key)
-
-      _active ->
-        :ok
-    end)
+    # Expiry only needs the timestamp; keep session payloads in ETS.
+    :ets.select_delete(state.table, [
+      {{:_, :_, :"$1", :_}, [{:"=<", :"$1", now_ms}], [true]}
+    ])
 
     overflow = max(:ets.info(state.table, :size) - state.max_entries, 0)
 
@@ -332,7 +354,7 @@ defmodule FerricstoreHttp.Auth.Cache do
   defp evict_lru(_table, 0), do: :ok
 
   defp evict_lru(table, 1) do
-    case :ets.foldl(&least_recent/2, nil, table) do
+    case Enum.reduce(lru_metadata(table), nil, &least_recent/2) do
       {cache_key, _session, _expires_at_ms, _last_used_ms} -> :ets.delete(table, cache_key)
       nil -> :ok
     end
@@ -340,7 +362,7 @@ defmodule FerricstoreHttp.Auth.Cache do
 
   defp evict_lru(table, count) do
     table
-    |> :ets.tab2list()
+    |> lru_metadata()
     |> Enum.sort_by(fn {cache_key, _session, _expires_at_ms, last_used_ms} ->
       {last_used_ms, cache_key}
     end)
@@ -348,6 +370,13 @@ defmodule FerricstoreHttp.Auth.Cache do
     |> Enum.each(fn {cache_key, _session, _expires_at_ms, _last_used_ms} ->
       :ets.delete(table, cache_key)
     end)
+  end
+
+  defp lru_metadata(table) do
+    # Preserve expiry/recency ordering without copying arbitrary session terms.
+    :ets.select(table, [
+      {{:"$1", :_, :"$2", :"$3"}, [], [{{:"$1", nil, :"$2", :"$3"}}]}
+    ])
   end
 
   defp least_recent(entry, nil), do: entry

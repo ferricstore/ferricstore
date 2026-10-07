@@ -375,7 +375,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
         Enum.reduce_while(shard_dir_specs(handle), :ok, fn {kind, source}, :ok ->
           dest = Path.join(snapshot_path, Atom.to_string(kind))
 
-          with :ok <- copy_dir(source, dest),
+          with :ok <- copy_payload_dir(source, dest, kind),
                :ok <- maybe_run_snapshot_create_hook({:copied, kind}) do
             {:cont, :ok}
           else

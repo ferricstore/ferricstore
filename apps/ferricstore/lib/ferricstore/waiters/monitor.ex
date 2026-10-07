@@ -59,6 +59,18 @@ defmodule Ferricstore.Waiters.Monitor do
   @impl true
   def init(_opts) do
     ensure_table()
+    # The registry belongs to the application and survives this process.
+    # References created by the previous monitor process cannot deliver DOWN
+    # here; rearm them for both live callers and already-dead callers.
+    :ets.foldl(
+      fn {pid, _old_ref}, :ok ->
+        true = :ets.insert(@table, {pid, Process.monitor(pid)})
+        :ok
+      end,
+      :ok,
+      @table
+    )
+
     {:ok, %{}}
   end
 

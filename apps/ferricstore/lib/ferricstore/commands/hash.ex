@@ -669,7 +669,17 @@ defmodule Ferricstore.Commands.Hash do
 
   defp hset_args(_args, _store), do: {:error, "ERR wrong number of arguments for 'hset' command"}
 
-  defp hset_fields(key, field_value_pairs, store) do
+  defp hset_fields(key, [field, value], store) do
+    case Ops.hset_single(store, key, field, value) do
+      :unsupported -> hset_fields_generic(key, [field, value], store)
+      result -> result
+    end
+  end
+
+  defp hset_fields(key, field_value_pairs, store),
+    do: hset_fields_generic(key, field_value_pairs, store)
+
+  defp hset_fields_generic(key, field_value_pairs, store) do
     with type_status when type_status in [:ok, {:ok, :created}] <-
            TypeRegistry.command_check_or_set_status(key, :hash, store) do
       FieldOps.set_pairs(field_value_pairs, key, store, type_status)

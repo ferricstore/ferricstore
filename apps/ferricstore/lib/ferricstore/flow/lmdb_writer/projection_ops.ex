@@ -21,7 +21,9 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   @source_read_timeout_ms 10_000
   @terminal_states ["completed", "failed", "cancelled"]
 
-  def expand_ops(state, []) do
+  def expand_ops(state, ops), do: expand_ops(state, ops, :wait)
+
+  def expand_ops(state, [], _source_wait) do
     state =
       state
       |> Map.put(:terminal_atomic_write?, false)
@@ -30,14 +32,14 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     {:ok, [], state}
   end
 
-  def expand_ops(state, ops) do
+  def expand_ops(state, ops, source_wait) do
     with {:ok, definitions} <- query_index_definitions(state) do
       expansion_state = Map.put(state, :query_index_definitions, definitions)
       ops = coalesce_flow_state_projections(ops)
       projection_keys = projection_prefetch_keys(ops)
 
       with {:ok, prepared_sources} <-
-             prepare_durable_flow_projection_sources(expansion_state, ops),
+             prepare_durable_flow_projection_sources(expansion_state, ops, source_wait),
            {:ok, prepared_sources} <-
              physicalize_prepared_sources(expansion_state, prepared_sources) do
         expansion_state =
@@ -88,9 +90,61 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
 
         {:error, _reason} = error ->
           error
+
+        {:retry, _reason} = retry ->
+          retry
       end
     end
   end
+
+  defp prepare_durable_flow_projection_sources(state, ops, :wait),
+    do: prepare_durable_flow_projection_sources(state, ops)
+
+  defp prepare_durable_flow_projection_sources(state, ops, source_wait)
+       when source_wait in [:probe, :final] do
+    with {:ok, prepared} <- prepare_flow_projection_sources_batch(state, ops, source_wait),
+         :ok <- ensure_prepared_sources_durable(state, prepared) do
+      {:ok, prepared}
+    else
+      {:error, {:query_row_source_changed, _key}} = changed when source_wait == :probe ->
+        {:retry, changed}
+
+      result ->
+        result
+    end
+  end
+
+  defp prepare_flow_projection_sources_batch(state, ops, mode) do
+    Enum.reduce_while(ops, {:ok, %{}, nil}, fn op, {:ok, prepared, waiting} ->
+      case prepare_flow_projection_source_batch(state, op, mode) do
+        :skip -> {:cont, {:ok, prepared, waiting}}
+        {:ok, key, result} -> {:cont, {:ok, Map.put(prepared, key, result), waiting}}
+        {:retry, reason} -> {:cont, {:ok, prepared, waiting || reason}}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, prepared, nil} -> {:ok, prepared}
+      {:ok, _, reason} -> {:retry, reason}
+      error -> error
+    end
+  end
+
+  defp prepare_flow_projection_source_batch(state, {kind, key, version}, mode)
+       when kind in [:project_flow_state_from_source, :project_flow_query_state_from_source] and
+              is_binary(key) and is_integer(version) and version >= 0 do
+    # Observe every source once per attempt. The writer waits after returning
+    # the permit, instead of sleeping once per missing key while holding it.
+    case do_read_source_flow_at_version(state, key, version, 0, 0) do
+      :not_found when mode == :probe -> {:retry, {:projection_source_missing, key}}
+      {:error, {:source_version_unavailable, _}} = error when mode == :probe -> {:retry, error}
+      {:error, {:source_pending, _}} = error when mode == :probe -> {:retry, error}
+      result -> prepared_source_result(key, result)
+    end
+  end
+
+  defp prepare_flow_projection_source_batch(state, op, _mode),
+    do: prepare_flow_projection_source(state, op)
 
   defp coalesce_flow_state_projections(ops) do
     winners = projection_winners(ops, 0, %{})
@@ -1337,6 +1391,9 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       @max_source_pending_retries
     )
   end
+
+  @doc false
+  def source_wait_config, do: source_pending_config()
 
   def source_pending_sleep_ms do
     :ferricstore

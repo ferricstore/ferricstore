@@ -40,344 +40,356 @@ defmodule Ferricstore.Store.Shard.Startup do
           data_dir = Keyword.fetch!(opts, :data_dir)
           flush_ms = Keyword.get(opts, :flush_interval_ms, @flush_interval_ms)
           ctx = Keyword.get(opts, :instance_ctx)
-          fsync_dir_fun = Keyword.get(opts, :fsync_dir_fun, &NIF.v2_fsync_dir/1)
 
-          apply_context =
-            case ctx do
-              %{apply_context: %Ferricstore.Raft.ApplyContext{} = context} ->
-                context
+          Ferricstore.Store.PromotedPublication.with_lifecycle(
+            %{instance_ctx: ctx || %{}, index: index},
+            fn ->
+              fsync_dir_fun = Keyword.get(opts, :fsync_dir_fun, &NIF.v2_fsync_dir/1)
 
-              _missing_context ->
-                Ferricstore.Raft.ApplyContext.from_runtime()
-            end
+              apply_context =
+                case ctx do
+                  %{apply_context: %Ferricstore.Raft.ApplyContext{} = context} ->
+                    context
 
-          apply_context_encoded = Ferricstore.Raft.ApplyContext.encode(apply_context)
+                  _missing_context ->
+                    Ferricstore.Raft.ApplyContext.from_runtime()
+                end
 
-          release_cursor_interval =
-            Keyword.get_lazy(opts, :release_cursor_interval, fn ->
-              Application.get_env(:ferricstore, :release_cursor_interval, 200_000)
-            end)
+              apply_context_encoded = Ferricstore.Raft.ApplyContext.encode(apply_context)
 
-          flow_async_history =
-            Keyword.get_lazy(opts, :flow_async_history, &flow_async_history_enabled?/0)
+              release_cursor_interval =
+                Keyword.get_lazy(opts, :release_cursor_interval, fn ->
+                  Application.get_env(:ferricstore, :release_cursor_interval, 200_000)
+                end)
 
-          standalone_commit_delay_ms =
-            positive_runtime_option(opts, :standalone_fsync_max_delay_ms, @flush_interval_ms)
+              flow_async_history =
+                Keyword.get_lazy(opts, :flow_async_history, &flow_async_history_enabled?/0)
 
-          standalone_commit_max_ops =
-            positive_runtime_option(
-              opts,
-              :standalone_fsync_max_ops,
-              @default_standalone_fsync_max_ops
-            )
+              standalone_commit_delay_ms =
+                positive_runtime_option(opts, :standalone_fsync_max_delay_ms, @flush_interval_ms)
 
-          standalone_commit_max_queued_ops =
-            positive_runtime_option(
-              opts,
-              :standalone_commit_max_queued_ops,
-              @default_standalone_commit_max_queued_ops
-            )
-
-          standalone_commit_max_queued_bytes =
-            positive_runtime_option(
-              opts,
-              :standalone_commit_max_queued_bytes,
-              @default_standalone_commit_max_queued_bytes
-            )
-
-          get_many_max_concurrency =
-            positive_runtime_option(
-              opts,
-              :shard_get_many_max_concurrency,
-              @default_shard_get_many_max_concurrency
-            )
-
-          get_many_max_queued =
-            non_negative_runtime_option(
-              opts,
-              :shard_get_many_max_queued,
-              @default_shard_get_many_max_queued
-            )
-
-          get_many_pread_batch = Keyword.get(opts, :get_many_pread_batch)
-          get_many_waraft_batch = Keyword.get(opts, :get_many_waraft_batch)
-
-          promoted_compaction_retry_ms =
-            positive_runtime_option(
-              opts,
-              :promoted_compaction_retry_ms,
-              @default_promoted_compaction_retry_ms
-            )
-
-          flow_shared_ref_backfill? = Keyword.get(opts, :flow_shared_ref_backfill?, true)
-
-          startup_recovery_reason =
-            Ferricstore.Store.StandaloneTxLog.startup_recovery_reason(data_dir)
-
-          # Recovery is a data-dir-wide operation. Only shard zero owns that
-          # startup transition; a participant restart must retain the startup
-          # fence until the recovery owner replays the journal.
-          recovery_owner? = not is_nil(ctx) and index == 0 and not raft_projection_owner?(ctx)
-
-          if recovery_owner? do
-            :ok = Ferricstore.Store.StandaloneTxLog.recover_once(data_dir)
-
-            if startup_recovery_reason != nil do
-              release_startup_recovery_fences(ctx, index, data_dir)
-            end
-          end
-
-          standalone_recovery_reason =
-            Ferricstore.Store.StandaloneTxLog.startup_recovery_reason(data_dir)
-
-          path = Ferricstore.DataDir.shard_data_path(data_dir, index)
-
-          {active_file_id, active_file_size, active_file_path} =
-            ensure_initial_files!(path, index, fsync_dir_fun, ctx)
-
-          # Create/clear named ETS tables.
-          # Use instance-scoped names from ctx if available, else default naming.
-          keydir_name =
-            if ctx, do: elem(ctx.keydir_refs, index), else: :"keydir_#{index}"
-
-          keydir = prepare_startup_keydir(keydir_name, ctx, index)
-          Ferricstore.Store.PublicationEpoch.reset(ctx || %{}, index)
-
-          # Remove any leftover hot_cache table from a previous run.
-          case :ets.whereis(:"hot_cache_#{index}") do
-            :undefined -> :ok
-            _ref -> :ets.delete(:"hot_cache_#{index}")
-          end
-
-          instance_name = if ctx, do: ctx.name, else: :default
-          compound_member_index = CompoundMemberIndex.table_name(instance_name, index)
-          CompoundMemberIndex.ensure_table!(compound_member_index)
-          compound_revision_index = CompoundRevisionIndex.table_name(instance_name, index)
-          CompoundRevisionIndex.ensure_table!(compound_revision_index)
-
-          {logical_key_index, logical_key_slots} =
-            LogicalKeyIndex.table_names(instance_name, index)
-
-          LogicalKeyIndex.ensure_tables!(logical_key_index, logical_key_slots)
-
-          {namespace_usage_index, namespace_usage_expiry} =
-            NamespaceUsageIndex.table_names(instance_name, index)
-
-          NamespaceUsageIndex.ensure_tables!(namespace_usage_index, namespace_usage_expiry)
-          {zset_score_index, zset_score_lookup} = ZSetIndex.table_names(instance_name, index)
-          ensure_zset_index_table!(zset_score_index, :ordered_set)
-          ensure_zset_index_table!(zset_score_lookup, :set)
-          {flow_index, flow_lookup} = NativeFlowIndex.table_names(instance_name, index)
-
-          # v2: recover ETS keydir from hint files or by scanning log files BEFORE
-          # starting Raft. This ensures cold entries ({key, nil, ..., fid, off, vsize})
-          # are in ETS when ra replays WAL entries via apply/3. Without this, replayed
-          # read-modify-write commands (INCR, APPEND, etc.) see ETS misses during
-          # replay and start from nil instead of the correct prior value.
-          # 7-tuple format: {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
-          # Must run BEFORE recover_promoted so PM: markers are in ETS.
-          profile_startup_phase(index, :recover_keydir, fn ->
-            unless raft_projection_owner?(ctx) do
-              ShardLifecycle.recover_keydir(path, keydir, index, ctx)
-            end
-
-            :ok
-          end)
-
-          promoted =
-            profile_startup_phase(index, :recover_promoted, fn ->
-              Ferricstore.Store.Promotion.recover_promoted(
-                path,
-                keydir,
-                data_dir,
-                index,
-                ctx
-              )
-            end)
-
-          :ok =
-            Ferricstore.Store.Promotion.clear_compound_promotion_fences(%{
-              instance_ctx: ctx,
-              index: index
-            })
-
-          profile_startup_phase(index, :compound_member_index_rebuild, fn ->
-            unless raft_projection_owner?(ctx) do
-              CompoundMemberIndex.rebuild(compound_member_index, keydir)
-            end
-
-            :ok
-          end)
-
-          profile_startup_phase(index, :logical_key_index_rebuild, fn ->
-            case LogicalKeyIndex.rebuild(logical_key_index, logical_key_slots, keydir, path) do
-              :ok -> :ok
-              {:error, reason} -> throw({:shard_init_failed, reason})
-            end
-          end)
-
-          profile_startup_phase(index, :namespace_usage_index_rebuild, fn ->
-            unless raft_projection_owner?(ctx) do
-              rebuild_opts = [
-                now_ms: System.system_time(:millisecond),
-                blob_threshold_bytes: BlobValue.threshold(ctx),
-                entry_bytes_fun: &NamespaceUsage.entry_bytes(ctx, &1)
-              ]
-
-              case NamespaceUsageIndex.rebuild_tracked(
-                     namespace_usage_index,
-                     namespace_usage_expiry,
-                     keydir,
-                     rebuild_opts
-                   ) do
-                :ok -> :ok
-                {:error, reason} -> throw({:shard_init_failed, reason})
-              end
-            end
-
-            :ok
-          end)
-
-          profile_startup_phase(index, :flow_native_index_init, fn ->
-            unless raft_projection_owner?(ctx) do
-              NativeFlowIndex.reset(flow_index, flow_lookup)
-            end
-
-            :ok
-          end)
-
-          unless Keyword.get(opts, :defer_flow_history_recovery, false) do
-            profile_startup_phase(index, :flow_history_projector_recover, fn ->
-              :ok = Ferricstore.Flow.HistoryProjector.recover(ctx, index, path, keydir)
-            end)
-          end
-
-          profile_startup_phase(index, :flow_lmdb_rebuild, fn ->
-            unless raft_projection_owner?(ctx) do
-              :ok =
-                Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
-                  path,
-                  keydir,
-                  index,
-                  ctx,
-                  zset_score_index,
-                  zset_score_lookup,
-                  flow_index,
-                  flow_lookup,
-                  active_file_id: active_file_id,
-                  active_file_path: active_file_path,
-                  shared_ref_backfill?: flow_shared_ref_backfill?
+              standalone_commit_max_ops =
+                positive_runtime_option(
+                  opts,
+                  :standalone_fsync_max_ops,
+                  @default_standalone_fsync_max_ops
                 )
-            end
 
-            :ok
-          end)
+              standalone_commit_max_queued_ops =
+                positive_runtime_option(
+                  opts,
+                  :standalone_commit_max_queued_ops,
+                  @default_standalone_commit_max_queued_ops
+                )
 
-          flow_due_catalog =
-            profile_startup_phase(index, :flow_due_catalog_rebuild, fn ->
-              %{flow_index_name: flow_index, flow_lookup_name: flow_lookup}
-              |> Ferricstore.Raft.StateMachine.__flow_due_catalog_from_native_for_recovery__()
-              |> Map.fetch!(:flow_due_catalog)
-            end)
+              standalone_commit_max_queued_bytes =
+                positive_runtime_option(
+                  opts,
+                  :standalone_commit_max_queued_bytes,
+                  @default_standalone_commit_max_queued_bytes
+                )
 
-          active_file_size = startup_file_size(active_file_path)
+              get_many_max_concurrency =
+                positive_runtime_option(
+                  opts,
+                  :shard_get_many_max_concurrency,
+                  @default_shard_get_many_max_concurrency
+                )
 
-          keydir = publish_startup_keydir(keydir, keydir_name, ctx)
+              get_many_max_queued =
+                non_negative_runtime_option(
+                  opts,
+                  :shard_get_many_max_queued,
+                  @default_shard_get_many_max_queued
+                )
 
-          # Default-instance replication is owned by WARaftBackend. Shard GenServers
-          # still own local keydir/read/recovery state.
-          raft? = false
+              get_many_pread_batch = Keyword.get(opts, :get_many_pread_batch)
+              get_many_waraft_batch = Keyword.get(opts, :get_many_waraft_batch)
 
-          profile_startup_phase(index, :validate_prob_files, fn ->
-            unless raft_projection_owner?(ctx) do
-              ShardLifecycle.validate_prob_files(path, index, keydir)
-            end
+              promoted_compaction_retry_ms =
+                positive_runtime_option(
+                  opts,
+                  :promoted_compaction_retry_ms,
+                  @default_promoted_compaction_retry_ms
+                )
 
-            :ok
-          end)
+              flow_shared_ref_backfill? = Keyword.get(opts, :flow_shared_ref_backfill?, true)
 
-          # Publish active file metadata to ActiveFile registry
-          Ferricstore.Store.ActiveFile.publish(ctx, index, active_file_id, active_file_path, path)
+              startup_recovery_reason =
+                Ferricstore.Store.StandaloneTxLog.startup_recovery_reason(data_dir)
 
-          # Compute per-file dead bytes stats from disk sizes + ETS live data.
-          file_stats =
-            profile_startup_phase(index, :compute_file_stats, fn ->
-              compute_file_stats(path, keydir)
-            end)
+              # Recovery is a data-dir-wide operation. Only shard zero owns that
+              # startup transition; a participant restart must retain the startup
+              # fence until the recovery owner replays the journal.
+              recovery_owner? = not is_nil(ctx) and index == 0 and not raft_projection_owner?(ctx)
 
-          # Read merge config for fragmentation thresholds
-          merge_config_overrides = Keyword.get(opts, :merge_config, %{})
+              if recovery_owner? do
+                :ok = Ferricstore.Store.StandaloneTxLog.recover_once(data_dir)
 
-          merge_config = %{
-            fragmentation_threshold:
-              Map.get(
-                merge_config_overrides,
-                :fragmentation_threshold,
-                @default_fragmentation_threshold
-              ),
-            dead_bytes_threshold:
-              Map.get(
-                merge_config_overrides,
-                :dead_bytes_threshold,
-                @default_dead_bytes_threshold
+                if startup_recovery_reason != nil do
+                  release_startup_recovery_fences(ctx, index, data_dir)
+                end
+              end
+
+              standalone_recovery_reason =
+                Ferricstore.Store.StandaloneTxLog.startup_recovery_reason(data_dir)
+
+              path = Ferricstore.DataDir.shard_data_path(data_dir, index)
+
+              {active_file_id, active_file_size, active_file_path} =
+                ensure_initial_files!(path, index, fsync_dir_fun, ctx)
+
+              # Create/clear named ETS tables.
+              # Use instance-scoped names from ctx if available, else default naming.
+              keydir_name =
+                if ctx, do: elem(ctx.keydir_refs, index), else: :"keydir_#{index}"
+
+              keydir = prepare_startup_keydir(keydir_name, ctx, index)
+              Ferricstore.Store.PublicationEpoch.reset(ctx || %{}, index)
+
+              # Remove any leftover hot_cache table from a previous run.
+              case :ets.whereis(:"hot_cache_#{index}") do
+                :undefined -> :ok
+                _ref -> :ets.delete(:"hot_cache_#{index}")
+              end
+
+              instance_name = if ctx, do: ctx.name, else: :default
+              compound_member_index = CompoundMemberIndex.table_name(instance_name, index)
+              CompoundMemberIndex.ensure_table!(compound_member_index)
+              compound_revision_index = CompoundRevisionIndex.table_name(instance_name, index)
+              CompoundRevisionIndex.ensure_table!(compound_revision_index)
+
+              {logical_key_index, logical_key_slots} =
+                LogicalKeyIndex.table_names(instance_name, index)
+
+              LogicalKeyIndex.ensure_tables!(logical_key_index, logical_key_slots)
+
+              {namespace_usage_index, namespace_usage_expiry} =
+                NamespaceUsageIndex.table_names(instance_name, index)
+
+              NamespaceUsageIndex.ensure_tables!(namespace_usage_index, namespace_usage_expiry)
+              {zset_score_index, zset_score_lookup} = ZSetIndex.table_names(instance_name, index)
+              ensure_zset_index_table!(zset_score_index, :ordered_set)
+              ensure_zset_index_table!(zset_score_lookup, :set)
+              {flow_index, flow_lookup} = NativeFlowIndex.table_names(instance_name, index)
+
+              # v2: recover ETS keydir from hint files or by scanning log files BEFORE
+              # starting Raft. This ensures cold entries ({key, nil, ..., fid, off, vsize})
+              # are in ETS when ra replays WAL entries via apply/3. Without this, replayed
+              # read-modify-write commands (INCR, APPEND, etc.) see ETS misses during
+              # replay and start from nil instead of the correct prior value.
+              # 7-tuple format: {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
+              # Must run BEFORE recover_promoted so PM: markers are in ETS.
+              profile_startup_phase(index, :recover_keydir, fn ->
+                unless raft_projection_owner?(ctx) do
+                  ShardLifecycle.recover_keydir(path, keydir, index, ctx)
+                end
+
+                :ok
+              end)
+
+              promoted =
+                profile_startup_phase(index, :recover_promoted, fn ->
+                  Ferricstore.Store.Promotion.recover_promoted(
+                    path,
+                    keydir,
+                    data_dir,
+                    index,
+                    ctx
+                  )
+                end)
+
+              :ok =
+                Ferricstore.Store.Promotion.clear_compound_promotion_fences(%{
+                  instance_ctx: ctx,
+                  index: index
+                })
+
+              profile_startup_phase(index, :compound_member_index_rebuild, fn ->
+                unless raft_projection_owner?(ctx) do
+                  CompoundMemberIndex.rebuild(compound_member_index, keydir)
+                end
+
+                :ok
+              end)
+
+              profile_startup_phase(index, :logical_key_index_rebuild, fn ->
+                case LogicalKeyIndex.rebuild(logical_key_index, logical_key_slots, keydir, path) do
+                  :ok -> :ok
+                  {:error, reason} -> throw({:shard_init_failed, reason})
+                end
+              end)
+
+              profile_startup_phase(index, :namespace_usage_index_rebuild, fn ->
+                unless raft_projection_owner?(ctx) do
+                  rebuild_opts = [
+                    now_ms: System.system_time(:millisecond),
+                    blob_threshold_bytes: BlobValue.threshold(ctx),
+                    entry_bytes_fun: &NamespaceUsage.entry_bytes(ctx, &1)
+                  ]
+
+                  case NamespaceUsageIndex.rebuild_tracked(
+                         namespace_usage_index,
+                         namespace_usage_expiry,
+                         keydir,
+                         rebuild_opts
+                       ) do
+                    :ok -> :ok
+                    {:error, reason} -> throw({:shard_init_failed, reason})
+                  end
+                end
+
+                :ok
+              end)
+
+              profile_startup_phase(index, :flow_native_index_init, fn ->
+                unless raft_projection_owner?(ctx) do
+                  NativeFlowIndex.reset(flow_index, flow_lookup)
+                end
+
+                :ok
+              end)
+
+              unless Keyword.get(opts, :defer_flow_history_recovery, false) do
+                profile_startup_phase(index, :flow_history_projector_recover, fn ->
+                  :ok = Ferricstore.Flow.HistoryProjector.recover(ctx, index, path, keydir)
+                end)
+              end
+
+              profile_startup_phase(index, :flow_lmdb_rebuild, fn ->
+                unless raft_projection_owner?(ctx) do
+                  :ok =
+                    Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
+                      path,
+                      keydir,
+                      index,
+                      ctx,
+                      zset_score_index,
+                      zset_score_lookup,
+                      flow_index,
+                      flow_lookup,
+                      active_file_id: active_file_id,
+                      active_file_path: active_file_path,
+                      shared_ref_backfill?: flow_shared_ref_backfill?
+                    )
+                end
+
+                :ok
+              end)
+
+              flow_due_catalog =
+                profile_startup_phase(index, :flow_due_catalog_rebuild, fn ->
+                  %{flow_index_name: flow_index, flow_lookup_name: flow_lookup}
+                  |> Ferricstore.Raft.StateMachine.__flow_due_catalog_from_native_for_recovery__()
+                  |> Map.fetch!(:flow_due_catalog)
+                end)
+
+              active_file_size = startup_file_size(active_file_path)
+
+              keydir = publish_startup_keydir(keydir, keydir_name, ctx)
+
+              # Default-instance replication is owned by WARaftBackend. Shard GenServers
+              # still own local keydir/read/recovery state.
+              raft? = false
+
+              profile_startup_phase(index, :validate_prob_files, fn ->
+                unless raft_projection_owner?(ctx) do
+                  ShardLifecycle.validate_prob_files(path, index, keydir)
+                end
+
+                :ok
+              end)
+
+              # Publish active file metadata to ActiveFile registry
+              Ferricstore.Store.ActiveFile.publish(
+                ctx,
+                index,
+                active_file_id,
+                active_file_path,
+                path
               )
-          }
 
-          ShardLifecycle.schedule_expiry_sweep()
-          ShardLifecycle.schedule_frag_check()
+              # Compute per-file dead bytes stats from disk sizes + ETS live data.
+              file_stats =
+                profile_startup_phase(index, :compute_file_stats, fn ->
+                  compute_file_stats(path, keydir)
+                end)
 
-          max_file_size =
-            if ctx, do: ctx.max_active_file_size, else: @default_max_active_file_size
+              # Read merge config for fragmentation thresholds
+              merge_config_overrides = Keyword.get(opts, :merge_config, %{})
 
-          {:ok,
-           %__MODULE__{
-             ets: keydir,
-             keydir: keydir,
-             index: index,
-             data_dir: data_dir,
-             shard_data_path: path,
-             instance_ctx: ctx,
-             apply_context: apply_context,
-             apply_context_encoded: apply_context_encoded,
-             release_cursor_interval: release_cursor_interval,
-             flow_async_history: flow_async_history,
-             active_file_id: active_file_id,
-             active_file_path: active_file_path,
-             active_file_size: active_file_size,
-             pending: [],
-             flush_in_flight: nil,
-             promoted_instances: promoted,
-             file_stats: file_stats,
-             merge_config: merge_config,
-             raft?: raft?,
-             writes_paused: not is_nil(standalone_recovery_reason),
-             last_flush_error:
-               if standalone_recovery_reason do
-                 {:standalone_recovery_required, standalone_recovery_reason}
-               end,
-             max_active_file_size: max_file_size,
-             standalone_commit_delay_ms: standalone_commit_delay_ms,
-             standalone_commit_max_ops: standalone_commit_max_ops,
-             standalone_commit_max_queued_ops: standalone_commit_max_queued_ops,
-             standalone_commit_max_queued_bytes: standalone_commit_max_queued_bytes,
-             get_many_max_concurrency: get_many_max_concurrency,
-             get_many_max_queued: get_many_max_queued,
-             get_many_pread_batch: get_many_pread_batch,
-             get_many_waraft_batch: get_many_waraft_batch,
-             promoted_compaction_retry_ms: promoted_compaction_retry_ms,
-             compound_member_index: compound_member_index,
-             compound_revision_index: compound_revision_index,
-             logical_key_index: logical_key_index,
-             logical_key_slots: logical_key_slots,
-             namespace_usage_index: namespace_usage_index,
-             namespace_usage_expiry: namespace_usage_expiry,
-             blob_side_channel_threshold_bytes: BlobValue.threshold(ctx),
-             zset_score_index: zset_score_index,
-             zset_score_lookup: zset_score_lookup,
-             flow_index: flow_index,
-             flow_lookup: flow_lookup,
-             flow_due_catalog: flow_due_catalog
-           }, {:continue, {:flush_interval, flush_ms}}}
+              merge_config = %{
+                fragmentation_threshold:
+                  Map.get(
+                    merge_config_overrides,
+                    :fragmentation_threshold,
+                    @default_fragmentation_threshold
+                  ),
+                dead_bytes_threshold:
+                  Map.get(
+                    merge_config_overrides,
+                    :dead_bytes_threshold,
+                    @default_dead_bytes_threshold
+                  )
+              }
+
+              ShardLifecycle.schedule_expiry_sweep()
+              ShardLifecycle.schedule_frag_check()
+
+              max_file_size =
+                if ctx, do: ctx.max_active_file_size, else: @default_max_active_file_size
+
+              {:ok,
+               %__MODULE__{
+                 ets: keydir,
+                 keydir: keydir,
+                 index: index,
+                 data_dir: data_dir,
+                 shard_data_path: path,
+                 instance_ctx: ctx,
+                 apply_context: apply_context,
+                 apply_context_encoded: apply_context_encoded,
+                 release_cursor_interval: release_cursor_interval,
+                 flow_async_history: flow_async_history,
+                 active_file_id: active_file_id,
+                 active_file_path: active_file_path,
+                 active_file_size: active_file_size,
+                 pending: [],
+                 flush_in_flight: nil,
+                 promoted_instances: promoted,
+                 file_stats: file_stats,
+                 merge_config: merge_config,
+                 raft?: raft?,
+                 writes_paused: not is_nil(standalone_recovery_reason),
+                 last_flush_error:
+                   if standalone_recovery_reason do
+                     {:standalone_recovery_required, standalone_recovery_reason}
+                   end,
+                 max_active_file_size: max_file_size,
+                 standalone_commit_delay_ms: standalone_commit_delay_ms,
+                 standalone_commit_max_ops: standalone_commit_max_ops,
+                 standalone_commit_max_queued_ops: standalone_commit_max_queued_ops,
+                 standalone_commit_max_queued_bytes: standalone_commit_max_queued_bytes,
+                 get_many_max_concurrency: get_many_max_concurrency,
+                 get_many_max_queued: get_many_max_queued,
+                 get_many_pread_batch: get_many_pread_batch,
+                 get_many_waraft_batch: get_many_waraft_batch,
+                 promoted_compaction_retry_ms: promoted_compaction_retry_ms,
+                 compound_member_index: compound_member_index,
+                 compound_revision_index: compound_revision_index,
+                 logical_key_index: logical_key_index,
+                 logical_key_slots: logical_key_slots,
+                 namespace_usage_index: namespace_usage_index,
+                 namespace_usage_expiry: namespace_usage_expiry,
+                 blob_side_channel_threshold_bytes: BlobValue.threshold(ctx),
+                 zset_score_index: zset_score_index,
+                 zset_score_lookup: zset_score_lookup,
+                 flow_index: flow_index,
+                 flow_lookup: flow_lookup,
+                 flow_due_catalog: flow_due_catalog
+               }, {:continue, {:flush_interval, flush_ms}}}
+            end
+          )
         catch
           {:shard_init_failed, reason} -> {:stop, reason}
         end

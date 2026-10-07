@@ -151,6 +151,57 @@ defmodule FerricstoreHttp.Auth.CacheTest do
     assert_eventually(fn -> Cache.stats().pending == 0 end)
   end
 
+  test "caller death cancels orphan authentication work without waiting for its timeout" do
+    parent = self()
+    key = Cache.reference(__MODULE__, FerricstoreHttp.TestBackend, :dead_caller)
+
+    caller =
+      spawn(fn ->
+        Cache.fetch(
+          key,
+          :peer,
+          fn ->
+            send(parent, {:orphan_authentication, self()})
+            Process.sleep(:infinity)
+          end,
+          :infinity
+        )
+      end)
+
+    on_exit(fn -> Process.exit(caller, :kill) end)
+    assert_receive {:orphan_authentication, task}, 1_000
+    monitor = Process.monitor(task)
+    Process.exit(caller, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^task, _}, 1_000
+    assert_eventually(fn -> Cache.stats().pending == 0 end)
+  end
+
+  test "one dead waiter does not cancel authentication needed by a live waiter" do
+    parent = self()
+    key = Cache.reference(__MODULE__, FerricstoreHttp.TestBackend, :surviving_caller)
+
+    authenticate = fn ->
+      send(parent, {:shared_authentication, self()})
+
+      receive do
+        :finish_auth -> {:ok, :session}
+      end
+    end
+
+    first = spawn(fn -> Cache.fetch(key, :peer, authenticate, :infinity) end)
+    on_exit(fn -> Process.exit(first, :kill) end)
+    assert_receive {:shared_authentication, worker}, 1_000
+    second = Task.async(fn -> Cache.fetch(key, :peer, authenticate, 5_000) end)
+    assert_eventually(fn -> map_size(:sys.get_state(Cache).waiters) == 2 end)
+    Process.exit(first, :kill)
+    assert_eventually(fn -> map_size(:sys.get_state(Cache).waiters) == 1 end)
+    assert Process.alive?(worker)
+    send(worker, :finish_auth)
+    assert {:ok, :session, :coalesced} = Task.await(second)
+    assert Cache.stats().pending == 0
+    assert {:monitors, []} = Process.info(Process.whereis(Cache), :monitors)
+  end
+
   test "expires sessions and evicts the least recently used entry", %{clock: clock} do
     first = Cache.reference(__MODULE__, FerricstoreHttp.TestBackend, :first)
     second = Cache.reference(__MODULE__, FerricstoreHttp.TestBackend, :second)
@@ -203,6 +254,34 @@ defmodule FerricstoreHttp.Auth.CacheTest do
     assert {:ok, :hot_session, :hit} = Cache.fetch(key, :peer, fn -> flunk() end, 1_000)
     assert [{^key, :hot_session, _expires_at_ms, touched_at_ms}] = :ets.lookup(Cache, key)
     assert touched_at_ms == inserted_at_ms + 1_000
+  end
+
+  test "sweep respects the exact expiry boundary with negative monotonic timestamps", %{
+    clock: clock
+  } do
+    Agent.update(clock, fn _ -> -20_000 end)
+    session = {:opaque, :"$1", %{roles: ["reader", "writer"]}}
+    assert {:ok, ^session, :miss} = Cache.fetch("expired", :peer, fn -> {:ok, session} end, 1_000)
+    Agent.update(clock, &(&1 + 1))
+    assert {:ok, ^session, :miss} = Cache.fetch("live", :peer, fn -> {:ok, session} end, 1_000)
+    Agent.update(clock, fn _ -> -10_000 end)
+
+    send(Cache, :sweep)
+    assert Cache.stats().entries == 1
+    refute :ets.member(Cache, "expired")
+    assert {:ok, ^session, :hit} = Cache.fetch("live", :peer, fn -> flunk() end, 1_000)
+  end
+
+  test "LRU eviction keeps opaque sessions intact and uses the key to break ties" do
+    session = %{session: {:opaque, :"$_"}, roles: Enum.to_list(1..64)}
+
+    for key <- ["b", "a", "c"] do
+      assert {:ok, ^session, :miss} = Cache.fetch(key, :peer, fn -> {:ok, session} end, 1_000)
+    end
+
+    refute :ets.member(Cache, "a")
+    assert {:ok, ^session, :hit} = Cache.fetch("b", :peer, fn -> flunk() end, 1_000)
+    assert {:ok, ^session, :hit} = Cache.fetch("c", :peer, fn -> flunk() end, 1_000)
   end
 
   test "invalidates only the matching stale session" do

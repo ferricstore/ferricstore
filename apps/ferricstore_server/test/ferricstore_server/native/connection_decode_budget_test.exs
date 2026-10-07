@@ -790,6 +790,42 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
     assert FrameBuffer.materialize(complete) == frame
   end
 
+  test "buffer accounting work stays constant as the fragment list grows" do
+    reductions = fn fragments ->
+      Task.async(fn ->
+        # Keep collection of the fixture itself outside this work-complexity
+        # measurement; the assertion does not depend on wall-clock timings.
+        Process.flag(:min_heap_size, 1_000_000)
+        body = :binary.copy("x", fragments + 1)
+        header = binary_part(Codec.encode_frame(@ping_opcode, 0, 47, body), 0, 24)
+
+        buffer =
+          Enum.reduce(1..fragments, FrameBuffer.from_binary(header, fragments + 1), fn _, acc ->
+            {:incomplete, next} = FrameBuffer.append(acc, "x", fragments + 1, fragments + 25)
+            next
+          end)
+
+        assert FrameBuffer.stats(buffer).chunk_count == fragments + 1
+
+        assert {:incomplete, ^buffer} =
+                 FrameBuffer.append(buffer, "", fragments + 1, fragments + 25)
+
+        :erlang.garbage_collect()
+        {:reductions, before} = Process.info(self(), :reductions)
+        Enum.each(1..1_000, fn _ -> FrameBuffer.stats(buffer) end)
+        {:reductions, after_count} = Process.info(self(), :reductions)
+        after_count - before
+      end)
+      |> Task.await(5_000)
+    end
+
+    small = reductions.(64)
+    large = reductions.(16_384)
+
+    assert large <= small * 2,
+           "accounting cost grew with fragments: #{small} reductions versus #{large}"
+  end
+
   test "accepts a complete maximum-size frame coalesced with continuation bytes" do
     max_frame_bytes = 32
     max_buffer_bytes = max_frame_bytes + 24
@@ -957,6 +993,55 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
     assert length(chunks) > 64
     Enum.each(chunks, fn chunk -> assert :ok = :gen_tcp.send(socket, chunk) end)
     assert receive_response_ids(socket, 1) == [44]
+  end
+
+  @tag :queued_request_byte_budget
+  test "tiny received fragments exhaust metadata admission before the raw payload budget" do
+    budget = :"native_fragment_metadata_#{System.unique_integer([:positive])}"
+    start_supervised!({ResourceBudget, name: budget, limits: %{inbound_bytes: 256}})
+    listener = :"native_fragment_listener_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      :ranch.child_spec(
+        listener,
+        :ranch_tcp,
+        %{socket_opts: [port: 0], num_acceptors: 1},
+        FerricstoreServer.Native.Connection,
+        %{resource_budget: budget}
+      )
+    )
+
+    port = :ranch.get_port(listener)
+
+    {:ok, socket} =
+      :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, nodelay: true], 1_000)
+
+    on_exit(fn -> :gen_tcp.close(socket) end)
+    frame = Codec.encode_frame(@ping_opcode, 0, 446, String.duplicate("x", 128))
+    assert :ok = :gen_tcp.send(socket, binary_part(frame, 0, 24))
+    assert eventually(fn -> ResourceBudget.usage(budget).inbound_bytes > 0 end)
+
+    Enum.reduce_while(1..4, ResourceBudget.usage(budget).inbound_bytes, fn _, before ->
+      case :gen_tcp.send(socket, "x") do
+        :ok ->
+          # Wait for each receive to be accounted before sending the next byte,
+          # so the test models retained fragments rather than TCP coalescing.
+          assert eventually(fn -> ResourceBudget.usage(budget).inbound_bytes != before end)
+          after_bytes = ResourceBudget.usage(budget).inbound_bytes
+          if after_bytes == 0, do: {:halt, 0}, else: {:cont, after_bytes}
+
+        {:error, :closed} ->
+          {:halt, 0}
+      end
+    end)
+
+    assert_socket_closed(socket)
+    assert eventually(fn -> ResourceBudget.usage(budget).inbound_bytes == 0 end)
+    # The released capacity must remain usable for an ordinary complete frame.
+    {:ok, healthy} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false], 1_000)
+    on_exit(fn -> :gen_tcp.close(healthy) end)
+    assert :ok = :gen_tcp.send(healthy, Codec.encode_frame(@ping_opcode, 0, 447, ""))
+    assert receive_response_ids(healthy, 1) == [447]
   end
 
   @tag :queued_request_byte_budget

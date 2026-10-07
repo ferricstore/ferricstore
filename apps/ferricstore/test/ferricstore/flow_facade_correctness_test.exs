@@ -11,10 +11,16 @@ defmodule Ferricstore.FlowFacadeCorrectnessTest do
     partition_key = "tenant-corrupt"
     state_key = Keys.state_key(id, partition_key)
 
-    assert :ok = Router.put(ctx, state_key, "not-a-flow-record", 0)
+    try do
+      assert :ok = Router.put(ctx, state_key, "not-a-flow-record", 0)
 
-    assert {:error, "ERR invalid flow record"} =
-             Flow.get(ctx, id, partition_key: partition_key)
+      assert {:error, "ERR invalid flow record"} =
+               Flow.get(ctx, id, partition_key: partition_key)
+    after
+      # This fixture uses the default durable instance. Leave a durable delete
+      # so a later application's restart cannot replay our intentional poison.
+      :ok = Router.delete(ctx, state_key)
+    end
   end
 
   test "lease governance renewal preserves storage unavailability" do

@@ -24,6 +24,7 @@ defmodule Ferricstore.OperationalGuard do
 
   @default_interval_ms 1_000
   @default_lmdb_mmap_reclaim_interval_ms 10_000
+  @rewrite_index_reclaim_interval_ms 30_000
 
   @spec start_link(keyword()) :: GenServer.on_start() | :ignore
   def start_link(opts \\ []) do
@@ -161,9 +162,37 @@ defmodule Ferricstore.OperationalGuard do
     log_pressure_transitions(state.last_snapshot, snapshot, state.last_admission, admission)
     emit_check(state.telemetry_fun, snapshot)
     state = maybe_reclaim_lmdb_mmap(state, snapshot)
+    state = maybe_start_rewrite_index_reclaim(state)
 
     Process.send_after(self(), :check, state.interval_ms)
     {:noreply, %{state | last_snapshot: snapshot, last_admission: admission}}
+  end
+
+  def handle_info(:reclaim_rewrite_indexes, state) do
+    case :ferricstore_waraft_spike_segment_log.reclaim_abandoned_rewrite_indexes() do
+      {:ok, %{directories: dirs, offset_entries: entries}} when entries > 0 ->
+        state.telemetry_fun.(
+          [:ferricstore, :waraft, :segment_log, :rewrite_index_reclaim],
+          %{directories: dirs, offset_entries: entries},
+          %{}
+        )
+
+      _no_abandoned_entries ->
+        :ok
+    end
+
+    Process.send_after(self(), :reclaim_rewrite_indexes, @rewrite_index_reclaim_interval_ms)
+    {:noreply, state}
+  end
+
+  defp maybe_start_rewrite_index_reclaim(state) do
+    if Map.get(state, :rewrite_index_reclaim_started?, false) do
+      state
+    else
+      # Also arms maintenance for an existing guard after a code upgrade.
+      send(self(), :reclaim_rewrite_indexes)
+      Map.put(state, :rewrite_index_reclaim_started?, true)
+    end
   end
 
   defp enabled? do

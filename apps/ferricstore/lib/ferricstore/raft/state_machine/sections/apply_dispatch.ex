@@ -668,6 +668,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         do: {:error, :invalid_delete_batch_key}
 
       defp apply_flush_shard(state, ra_index) do
+        Ferricstore.Store.PromotedPublication.with_lifecycle(state, fn ->
+          do_apply_flush_shard_protected(state, ra_index)
+        end)
+      end
+
+      defp do_apply_flush_shard_protected(state, ra_index) do
         result =
           try do
             :ets.safe_fixtable(state.ets, true)
@@ -1365,6 +1371,37 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
       defp do_apply_generic_batch_commands(
              state,
+             [{:hset_single, key, _, _}, {:hset_single, key, _, _} | _] = commands,
+             results,
+             count,
+             stream_store
+           ) do
+        {group, remaining} = take_promoted_hset_group(commands, key, [], 0, 0)
+
+        case prepare_promoted_hset_group(state, key, group) do
+          {:ok, entries, replies, path} ->
+            case do_promoted_compound_batch_put(state, key, entries, path) do
+              :ok ->
+                do_apply_generic_batch_commands(
+                  state,
+                  remaining,
+                  Enum.reverse(replies, results),
+                  count + length(group),
+                  stream_store
+                )
+
+              {:error, _reason} = error ->
+                error
+            end
+
+          :fallback ->
+            [command | rest] = commands
+            do_apply_generic_single(state, command, rest, results, count, stream_store)
+        end
+      end
+
+      defp do_apply_generic_batch_commands(
+             state,
              [{:stream_append, key, :auto, fields, nil, false} | rest],
              results,
              count,
@@ -1421,6 +1458,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
              count,
              stream_store
            ) do
+        do_apply_generic_single(state, command, rest, results, count, stream_store)
+      end
+
+      defp do_apply_generic_single(state, command, rest, results, count, stream_store) do
         materialize_pending_fast_deletes(state)
         {result, stream_store} = apply_generic_batch_command(state, command, stream_store)
 
@@ -1446,6 +1487,90 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
               count + 1,
               stream_store
             )
+        end
+      end
+
+      defp take_promoted_hset_group(
+             [{:hset_single, key, field, value} = command | rest] = commands,
+             key,
+             acc,
+             count,
+             bytes
+           )
+           when is_binary(field) and is_binary(value) and count < 128 do
+        next_bytes = bytes + byte_size(key) + byte_size(field) + byte_size(value) + 128
+
+        if next_bytes <= 1_048_576 do
+          take_promoted_hset_group(rest, key, [command | acc], count + 1, next_bytes)
+        else
+          {Enum.reverse(acc), commands}
+        end
+      end
+
+      defp take_promoted_hset_group(commands, _key, acc, _count, _bytes),
+        do: {Enum.reverse(acc), commands}
+
+      defp prepare_promoted_hset_group(state, key, [_first, _second | _] = group) do
+        type_key = CompoundKey.type_key(key)
+
+        with false <- standalone_staged_apply?() and not waraft_segment_projection_apply?(),
+             false <- cross_shard_pending_active?(),
+             [] <- Process.get(:sm_pending_writes, []),
+             pending when map_size(pending) == 0 <- Process.get(:sm_pending_values, %{}),
+             :ok <- check_fetch_or_compute_lock(state, key, nil),
+             [{^type_key, "hash", 0, _, _, _, _}] <- safe_ets_lookup(state.ets, type_key),
+             true <-
+               Enum.all?(group, fn {:hset_single, _, _, value} ->
+                 Ferricstore.Raft.ApplyLimits.validate_value(state, value) == :ok and
+                   not Ferricstore.Raft.BlobCommand.side_channel_candidate?(
+                     Map.get(state, :instance_ctx) || %{},
+                     {:put, key, value, 0}
+                   )
+               end),
+             first_field = CompoundKey.hash_field(key, elem(hd(group), 2)),
+             path when is_binary(path) <- promoted_compound_path(state, key, first_field),
+             {:ok, entries, replies} <- prepare_cached_hset_entries(state, key, group) do
+          {:ok, entries, replies, path}
+        else
+          _ -> :fallback
+        end
+      end
+
+      defp prepare_promoted_hset_group(_state, _key, _group), do: :fallback
+
+      defp prepare_cached_hset_entries(state, key, group) do
+        Enum.reduce_while(group, {:ok, [], [], MapSet.new()}, fn
+          {:hset_single, _, field, value}, {:ok, entries, replies, seen} ->
+            compound_key = CompoundKey.hash_field(key, field)
+
+            existence =
+              case safe_ets_lookup(state.ets, compound_key) do
+                [] ->
+                  false
+
+                [{^compound_key, cached, 0, _, fid, off, size}]
+                when is_binary(cached) and is_integer(fid) and fid >= 0 and
+                       is_integer(off) and off >= 0 and is_integer(size) and size >= 0 ->
+                  if BlobValue.threshold(Map.get(state, :instance_ctx)) > 0 and
+                       BlobRef.encoded_size?(byte_size(cached)), do: :fallback, else: true
+
+                _cold_expiring_or_invalid ->
+                  :fallback
+              end
+
+            if existence == :fallback do
+              {:halt, :fallback}
+            else
+              added = if existence or MapSet.member?(seen, compound_key), do: 0, else: 1
+
+              {:cont,
+               {:ok, [{compound_key, value, 0} | entries], [added | replies],
+                MapSet.put(seen, compound_key)}}
+            end
+        end)
+        |> case do
+          {:ok, entries, replies, _seen} -> {:ok, Enum.reverse(entries), Enum.reverse(replies)}
+          :fallback -> :fallback
         end
       end
 

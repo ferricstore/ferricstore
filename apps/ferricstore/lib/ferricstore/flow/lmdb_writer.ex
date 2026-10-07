@@ -975,9 +975,20 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp flush_ops_and_marker(state, ops, started_at) do
+    {source_retries, sleep_ms} = ProjectionOps.source_wait_config()
+    flush_ops_and_marker_attempt(state, ops, started_at, source_retries, sleep_ms)
+  end
+
+  defp flush_ops_and_marker_attempt(state, ops, started_at, source_retries, sleep_ms) do
+    source_wait = if source_retries > 0, do: :probe, else: :final
+
     case LMDBFlushCoordinator.with_shard_permit(state.instance_name, state.shard_index, fn ->
-           flush_ops_and_marker_with_permit(state, ops, started_at)
+           flush_ops_and_marker_with_permit(state, ops, started_at, source_wait)
          end) do
+      {:retry, _reason} when source_retries > 0 ->
+        if sleep_ms > 0, do: Process.sleep(sleep_ms)
+        flush_ops_and_marker_attempt(state, ops, started_at, source_retries - 1, sleep_ms)
+
       {:error, :lmdb_flush_coordinator_unavailable} ->
         {:error, :lmdb_flush_coordinator_unavailable, state}
 
@@ -986,23 +997,30 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
-  defp flush_ops_and_marker_with_permit(state, ops, started_at) do
+  defp flush_ops_and_marker_with_permit(state, ops, started_at, source_wait) do
     try do
       do_flush_ops_and_marker_with_permit(
         state,
         ops,
         started_at,
-        @max_compare_conflict_retries
+        @max_compare_conflict_retries,
+        source_wait
       )
     catch
       kind, reason -> {:error, {kind, reason}, state}
     end
   end
 
-  defp do_flush_ops_and_marker_with_permit(state, source_ops, started_at, retries_remaining) do
+  defp do_flush_ops_and_marker_with_permit(
+         state,
+         source_ops,
+         started_at,
+         retries_remaining,
+         source_wait
+       ) do
     with {:ok, ready_state} <- maybe_ensure_lmdb_ready(state, source_ops),
          {:ok, expanded_ops, projected_state} <-
-           ProjectionOps.expand_ops(ready_state, source_ops),
+           ProjectionOps.expand_ops(ready_state, source_ops, source_wait),
          :ok <-
            Ferricstore.FaultInjection.maybe_pause(:before_flow_lmdb_flush_write, %{
              instance_name: projected_state.instance_name,
@@ -1020,11 +1038,15 @@ defmodule Ferricstore.Flow.LMDBWriter do
           state,
           source_ops,
           started_at,
-          retries_remaining - 1
+          retries_remaining - 1,
+          source_wait
         )
 
       {:error, reason} ->
         {:error, reason, state}
+
+      {:retry, _} = retry ->
+        retry
     end
   end
 

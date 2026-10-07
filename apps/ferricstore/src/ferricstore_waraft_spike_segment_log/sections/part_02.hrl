@@ -342,7 +342,7 @@ set_logical_trim_floor(Dir, Index) when is_integer(Index), Index >= 0 ->
     Path = trim_floor_path(Dir),
     TmpPath = Path ++ ".tmp." ++ unique_suffix(),
     Metadata = #{version => 1, index => Index},
-    case filelib:ensure_dir(Path) of
+    case metadata_ensure_dir(Path) of
         ok ->
             case write_file_sync(TmpPath, encode_external_term(Metadata)) of
                 ok ->
@@ -379,7 +379,7 @@ write_records(Dir, Records) ->
         ok ->
             case check_append_failure_marker(Dir) of
                 ok ->
-                    case filelib:ensure_dir(filename:join(Dir, "dummy")) of
+                    case metadata_ensure_dir(filename:join(Dir, "dummy")) of
                         ok ->
                             case validate_segment_log_dir(Dir) of
                                 ok ->
@@ -417,7 +417,7 @@ write_records_nosync(Dir, Records) ->
         ok ->
             case check_append_failure_marker(Dir) of
                 ok ->
-                    case filelib:ensure_dir(filename:join(Dir, "dummy")) of
+                    case metadata_ensure_dir(filename:join(Dir, "dummy")) of
                         ok ->
                             case validate_segment_log_dir(Dir) of
                                 ok ->
@@ -723,7 +723,7 @@ preallocate_keep_size_unavailable(_BinaryPath) ->
     end.
 
 validate_segment_file_for_append(Path) ->
-    case file:read_link_info(Path) of
+    case file:read_link_info(Path, [raw]) of
         {ok, #file_info{type = regular}} ->
             ok;
         {ok, #file_info{type = Type}} ->
@@ -735,7 +735,7 @@ validate_segment_file_for_append(Path) ->
     end.
 
 validate_open_segment_file(Path, Fd) ->
-    case {file:read_file_info(Fd), file:read_link_info(Path)} of
+    case {file:read_file_info(Fd, [raw]), file:read_link_info(Path, [raw])} of
         {{ok, #file_info{
             type = regular,
             major_device = MajorDevice,
@@ -915,7 +915,7 @@ append_failure_marker_path(Dir) ->
 
 check_append_failure_marker(Dir) ->
     Path = append_failure_marker_path(Dir),
-    case file:read_link_info(Path) of
+    case file:read_link_info(Path, [raw]) of
         {ok, #file_info{type = regular, size = Size}} when Size =< ?MAX_SEGMENT_METADATA_BYTES ->
             read_append_failure_marker(Path);
         {ok, #file_info{type = regular, size = Size}} ->

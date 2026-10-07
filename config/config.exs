@@ -73,6 +73,8 @@ config :ferricstore,
   waraft_commit_priority: :high,
   waraft_generic_batch_window_ms: 0,
   waraft_generic_batch_during_flush: true,
+  # Opt-in: improves saturated HSET throughput, but paced latency can worsen.
+  waraft_single_hset_coalescing: false,
   waraft_apply_log_batch_size: 4_096,
   ra_low_priority_commands_flush_size: 512
 

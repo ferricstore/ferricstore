@@ -1,7 +1,7 @@
 %% Included by ferricstore_waraft_spike_segment_log.erl; generated split section 5.
 
 validate_segment_log_dir(Dir) ->
-    case file:read_link_info(Dir) of
+    case file:read_link_info(Dir, [raw]) of
         {ok, #file_info{type = directory}} ->
             ok;
         {ok, #file_info{type = Type}} ->
@@ -257,9 +257,13 @@ locate_offset_on_disk(_Dir, _Index) ->
 locate_disk_record_offset(Dir, Index, RecordsPerSegment) ->
     Ordinal = segment_ordinal(Index, RecordsPerSegment),
     Path = filename:join(Dir, segment_file_from_ordinal(Ordinal)),
-    case file:read_link_info(Path) of
+    case file:read_link_info(Path, [raw]) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
-            case open_verified_segment_file(Path, [read, raw, binary]) of
+            %% Sparse projection indexes legitimately have no derived slot.
+            %% Buffer the verified fallback scan while retaining its full CRC
+            %% and latest-frame traversal, instead of issuing tiny raw reads.
+            case open_verified_segment_file(Path, [read, raw, binary,
+                                                   {read_ahead, ?OFFSET_SCAN_READ_AHEAD_BYTES}]) of
                 {ok, Fd} ->
                     Result =
                         try locate_disk_record_offset_fd(Fd, Path, Index, 0, FileBytes, Ordinal, RecordsPerSegment) of
@@ -527,6 +531,141 @@ clear_offset_registry_for_dir(Dir) ->
                     end;
                 {error, _Reason} = Error -> Error
             end
+    end.
+
+%% Retire rebuildable RAM state only. In contrast to the recovery reset above,
+%% this must never remove a sidecar belonging to a renamed/replacement log.
+retire_segment_runtime_dir(Dir0) ->
+    retire_segment_runtime_dir(Dir0, false).
+
+retire_segment_runtime_dir(Dir0, Untrusted) ->
+    Dir = cache_dir_key(Dir0),
+    _ = drop_offset_runtime_entries([offset_dir_key(Dir)]),
+    retire_segment_runtime_metadata(Dir, Untrusted).
+
+drop_offset_runtime_entries([]) -> 0;
+drop_offset_runtime_entries(Dirs) ->
+    Membership = maps:from_list([{Dir, true} || Dir <- Dirs]),
+    try ets:select_delete(?OFFSET_REGISTRY, [
+        {{{'$1', '_'}, '_', '_', '_'},
+         [{is_map_key, '$1', {const, Membership}}], [true]}
+    ]) of
+        Removed -> Removed
+    catch error:badarg -> 0 end.
+
+retire_segment_runtime_metadata(Dir) ->
+    retire_segment_runtime_metadata(Dir, false).
+
+retire_segment_runtime_metadata(Dir, Untrusted) ->
+    UntrustedKey = {?MODULE, offset_index_untrusted, offset_dir_key(Dir)},
+    case Untrusted of
+        true -> persistent_term:put(UntrustedKey, true);
+        false -> persistent_term:erase(UntrustedKey)
+    end,
+    _ = persistent_term:erase(segment_config_cache_key(Dir)),
+    ok = clear_logical_trim_floor_cache(Dir),
+    ok = clear_latest_config_cache(Dir),
+    _ = erlang:erase({?MODULE, offset_index_pruned_before, Dir}),
+    close_retired_offset_readers(Dir),
+    case temporary_rewrite_dir(Dir) of
+        true ->
+            %% Unique staging/backup names cannot accumulate tombstone rows.
+            try ets:delete(?OFFSET_INDEX_GENERATIONS, Dir)
+            catch error:badarg -> ok end,
+            ok;
+        false ->
+            %% Other processes may still hold readers for this live path. A
+            %% fresh generation makes their next access reopen the descriptor.
+            update_offset_index_generation(Dir)
+    end.
+
+close_retired_offset_readers(Dir) ->
+    Readers = case erlang:get(?OFFSET_INDEX_READERS) of
+        Cached when is_list(Cached) -> Cached;
+        _ -> []
+    end,
+    Kept = lists:filter(fun({Path, Fd, _Generation}) ->
+        case filename:dirname(Path) =:= Dir of
+            true -> _ = file:close(Fd), false;
+            false -> true
+        end
+    end, Readers),
+    case Kept of
+        [] -> erlang:erase(?OFFSET_INDEX_READERS);
+        _ -> erlang:put(?OFFSET_INDEX_READERS, Kept)
+    end,
+    ok.
+
+temporary_rewrite_dir(Dir) ->
+    Base = unicode:characters_to_list(filename:basename(Dir)),
+    lists:any(fun(Prefix) ->
+        case lists:prefix(Prefix, Base) of
+            true ->
+                Suffix = lists:nthtail(length(Prefix), Base),
+                Suffix =/= [] andalso lists:all(fun(C) -> C >= $0 andalso C =< $9 end, Suffix);
+            false -> false
+        end
+    end, ["segment_log" ++ ?REWRITE_STAGING_PREFIX, "segment_log" ++ ?REWRITE_BACKUP_PREFIX]).
+
+%% Safe for maintenance and upgrades: only missing, well-formed rewrite paths
+%% are eligible; live/canonical/unsafe paths and live writer owners are retained.
+%% Select marker rows in bounded pages, then delete offsets in one traversal.
+reclaim_abandoned_rewrite_indexes() ->
+    try ets:select(?OFFSET_REGISTRY, [
+        {{{'$1', dir_marker}, dir_marker, '_', '_'}, [{is_binary, '$1'}], ['$1']}
+    ], 128) of
+        Page ->
+            Candidates = reclaimable_rewrite_dirs(Page, []),
+            Dirs = lists:filter(fun(DirKey) ->
+                %% Recheck after collection. Maintenance never waits for or
+                %% invalidates a live owner, including a cached fd being reused.
+                Dir = unicode:characters_to_list(DirKey),
+                path_exists(Dir) =:= false andalso retire_abandoned_rewrite_writers(Dir)
+            end, Candidates),
+            Removed = drop_offset_runtime_entries(Dirs),
+            lists:foreach(fun(DirKey) ->
+                ok = retire_segment_runtime_metadata(unicode:characters_to_list(DirKey))
+            end, Dirs),
+            {ok, #{directories => length(Dirs), offset_entries => Removed}}
+    catch error:badarg -> {ok, #{directories => 0, offset_entries => 0}} end.
+
+reclaimable_rewrite_dirs('$end_of_table', Acc) -> Acc;
+reclaimable_rewrite_dirs({Dirs, Continuation}, Acc) ->
+    Eligible = lists:filter(fun(DirKey) ->
+        Dir = unicode:characters_to_list(DirKey),
+        is_list(Dir) andalso temporary_rewrite_dir(Dir) andalso
+            path_exists(Dir) =:= false andalso not rewrite_writer_owner_alive(Dir)
+    end, Dirs),
+    reclaimable_rewrite_dirs(ets:select(Continuation), Eligible ++ Acc).
+
+rewrite_writer_entries(Dir) ->
+    WriterDir = writer_dir_from_dir(Dir),
+    try
+        ets:match_object(?WRITER_REGISTRY, {'_', WriterDir, '_', '_', '_'}) ++
+        ets:match_object(?WRITER_REGISTRY, {'_', WriterDir, '_', '_'})
+    catch error:badarg -> [] end.
+
+rewrite_writer_owner_alive(Dir) ->
+    lists:any(fun rewrite_writer_entry_owner_alive/1, rewrite_writer_entries(Dir)).
+
+rewrite_writer_entry_owner_alive({{Owner, _}, _, _, _, _}) when is_pid(Owner) ->
+    is_process_alive(Owner);
+rewrite_writer_entry_owner_alive({{Owner, _}, _, _, _}) when is_pid(Owner) ->
+    is_process_alive(Owner);
+rewrite_writer_entry_owner_alive(_) -> true.
+
+retire_abandoned_rewrite_writers(Dir) ->
+    Entries = rewrite_writer_entries(Dir),
+    case lists:any(fun rewrite_writer_entry_owner_alive/1, Entries) of
+        true -> false;
+        false ->
+            %% A dead owner's raw fd is already closed. Delete the exact row,
+            %% not its key, so a changed registry entry cannot be overwritten.
+            lists:foreach(fun(Entry) ->
+                try ets:delete_object(?WRITER_REGISTRY, Entry)
+                catch error:badarg -> ok end
+            end, Entries),
+            path_exists(Dir) =:= false andalso not rewrite_writer_owner_alive(Dir)
     end.
 
 offset_dir_key(Dir) ->
@@ -1069,7 +1208,7 @@ preload_segment_config(Dir) ->
     end.
 
 read_segment_metadata_file(Path, TooLargeReason) ->
-    case file:read_link_info(Path) of
+    case file:read_link_info(Path, [raw]) of
         {ok, #file_info{type = regular, size = Size}} when Size =< ?MAX_SEGMENT_METADATA_BYTES ->
             case read_segment_file_nofollow(Path, ?MAX_SEGMENT_METADATA_BYTES) of
                 {error, {too_large, Detail}} ->

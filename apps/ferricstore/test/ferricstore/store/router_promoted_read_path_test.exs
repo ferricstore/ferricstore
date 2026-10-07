@@ -2,7 +2,7 @@ defmodule Ferricstore.Store.RouterPromotedReadPathTest do
   use ExUnit.Case, async: false
   @moduletag :global_state
 
-  alias Ferricstore.Store.{CompoundKey, Router}
+  alias Ferricstore.Store.{CompoundKey, PublicationEpoch, Router}
   alias Ferricstore.Test.IsolatedInstance
 
   setup do
@@ -144,6 +144,92 @@ defmodule Ferricstore.Store.RouterPromotedReadPathTest do
       refute_received {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], _measurements,
                        _metadata}
     end)
+  end
+
+  test "default WARaft cached HGET completes while its shard callback is suspended" do
+    ctx = FerricStore.Instance.get(:default)
+    redis_key = unique_key("default-promoted-hot-get")
+    fields = Map.new(1..128, &{"field-#{&1}", "value-#{&1}"})
+    assert {:ok, 128} = FerricStore.Impl.hset(ctx, redis_key, fields)
+    shard = Router.shard_name(ctx, Router.shard_for(ctx, redis_key))
+
+    Ferricstore.Test.ShardHelpers.eventually(
+      fn -> GenServer.call(shard, {:promoted?, redis_key}) end,
+      "default hash was not promoted"
+    )
+
+    on_exit(fn -> FerricStore.Impl.del(ctx, [redis_key]) end)
+    :sys.suspend(shard)
+    reader = Task.async(fn -> FerricStore.Impl.hget(ctx, redis_key, "field-128") end)
+
+    try do
+      assert Task.yield(reader, 500) == {:ok, {:ok, "value-128"}}
+    after
+      :sys.resume(shard)
+      Task.shutdown(reader, :brutal_kill)
+    end
+  end
+
+  test "default WARaft promoted TTL is rechecked after waiting for publication" do
+    ctx = FerricStore.Instance.get(:default)
+    redis_key = unique_key("default-promoted-expiring-get")
+    field = CompoundKey.hash_field(redis_key, "field-128")
+    fields = Map.new(1..128, &{"field-#{&1}", "value-#{&1}"})
+    assert {:ok, 128} = FerricStore.Impl.hset(ctx, redis_key, fields)
+    index = Router.shard_for(ctx, redis_key)
+    shard = Router.shard_name(ctx, index)
+
+    Ferricstore.Test.ShardHelpers.eventually(
+      fn -> GenServer.call(shard, {:promoted?, redis_key}) end,
+      "default hash was not promoted"
+    )
+
+    expiry = Ferricstore.HLC.now_ms() + 200
+    assert :ok = Router.compound_put(ctx, redis_key, field, "expiring", expiry)
+    token = PublicationEpoch.begin_write(ctx, index)
+    reader = Task.async(fn -> Router.compound_get(ctx, redis_key, field) end)
+
+    try do
+      assert Task.yield(reader, 20) == nil
+      Process.sleep(max(expiry - Ferricstore.HLC.now_ms() + 20, 0))
+      PublicationEpoch.end_write(token)
+      assert Task.await(reader) == nil
+    after
+      PublicationEpoch.end_write(token)
+      Task.shutdown(reader, :brutal_kill)
+      FerricStore.Impl.del(ctx, [redis_key])
+    end
+  end
+
+  test "default WARaft cold promoted rows retain the serialized fallback" do
+    ctx = FerricStore.Instance.get(:default)
+    redis_key = unique_key("default-promoted-cold-get")
+    field = CompoundKey.hash_field(redis_key, "field-128")
+    fields = Map.new(1..128, &{"field-#{&1}", "value-#{&1}"})
+    assert {:ok, 128} = FerricStore.Impl.hset(ctx, redis_key, fields)
+    index = Router.shard_for(ctx, redis_key)
+    shard = Router.shard_name(ctx, index)
+
+    Ferricstore.Test.ShardHelpers.eventually(
+      fn -> GenServer.call(shard, {:promoted?, redis_key}) end,
+      "default hash was not promoted"
+    )
+
+    keydir = elem(ctx.keydir_refs, index)
+    [row] = :ets.lookup(keydir, field)
+    :ets.insert(keydir, put_elem(row, 1, nil))
+    :sys.suspend(shard)
+    reader = Task.async(fn -> Router.compound_get(ctx, redis_key, field) end)
+
+    try do
+      assert Task.yield(reader, 20) == nil
+      :sys.resume(shard)
+      assert Task.await(reader) == "value-128"
+    after
+      :sys.resume(shard)
+      Task.shutdown(reader, :brutal_kill)
+      FerricStore.Impl.del(ctx, [redis_key])
+    end
   end
 
   defp promote_hash(ctx, redis_key) do

@@ -89,12 +89,13 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
         :ok = Ferricstore.Flow.LMDBRebuilder.init_startup_active_rebuild_limiter()
 
         config = backend_config!(opts)
+        startup_budget = startup_wait_timeout_ms()
 
         profile_startup_phase(:ensure_waraft_app_started, %{shard_count: ctx.shard_count}, fn ->
           :ok = ensure_started()
         end)
 
-        with_startup_write_fence(fn ->
+        with_startup_write_fence(startup_budget, fn ->
           profile_startup_phase(:stop_existing_backend, %{shard_count: ctx.shard_count}, fn ->
             _ = stop()
             :ok
@@ -115,13 +116,84 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       @spec starting?() :: boolean()
       def starting?, do: :persistent_term.get(@starting_key, false) == true
 
-      defp with_startup_write_fence(fun) when is_function(fun, 0) do
+      defp with_startup_write_fence(startup_budget, fun) when is_function(fun, 0) do
         :persistent_term.put(@starting_key, true)
 
         try do
-          fun.()
+          with_startup_storage_timeout(startup_budget, fun)
         after
           :persistent_term.erase(@starting_key)
+        end
+      end
+
+      defp with_startup_storage_timeout(startup_budget, fun) do
+        key = :raft_storage_call_timeout
+        previous = Application.fetch_env(:wa_raft, key)
+
+        current =
+          case previous do
+            :error -> 60_000
+            {:ok, :infinity} -> :infinity
+            {:ok, value} -> positive_integer_option!(key, value)
+          end
+
+        timeout = if current == :infinity, do: :infinity, else: max(current, startup_budget)
+
+        if timeout == current do
+          fun.()
+        else
+          # WARaft bootstrap and its nested snapshot calls use this dependency
+          # option. Keep them inside FerricStore's startup budget; otherwise the
+          # default 60-second inner call can abort an otherwise healthy startup.
+          {guard, monitor, token} = guard_startup_storage_timeout(previous, timeout)
+
+          try do
+            :ok = Application.put_env(:wa_raft, key, timeout)
+            fun.()
+          after
+            restore_startup_storage_timeout(previous, timeout)
+            send(guard, {token, :release})
+            Process.demonitor(monitor, [:flush])
+          end
+        end
+      end
+
+      defp guard_startup_storage_timeout(previous, timeout) do
+        owner = self()
+        token = make_ref()
+
+        {guard, monitor} =
+          spawn_monitor(fn ->
+            owner_monitor = Process.monitor(owner)
+            send(owner, {token, :armed})
+
+            receive do
+              {^token, :release} ->
+                Process.demonitor(owner_monitor, [:flush])
+
+              {:DOWN, ^owner_monitor, :process, ^owner, _reason} ->
+                # An untrappable caller exit bypasses try/after. Do not leave
+                # an extended ordinary storage timeout behind after cancellation.
+                restore_startup_storage_timeout(previous, timeout)
+            end
+          end)
+
+        receive do
+          {^token, :armed} ->
+            {guard, monitor, token}
+
+          {:DOWN, ^monitor, :process, ^guard, reason} ->
+            exit({:startup_timeout_guard_failed, reason})
+        end
+      end
+
+      defp restore_startup_storage_timeout(previous, timeout) do
+        # Preserve a configuration change observed while startup was in flight.
+        if Application.fetch_env(:wa_raft, :raft_storage_call_timeout) == {:ok, timeout} do
+          case previous do
+            :error -> Application.delete_env(:wa_raft, :raft_storage_call_timeout)
+            {:ok, value} -> Application.put_env(:wa_raft, :raft_storage_call_timeout, value)
+          end
         end
       end
 
@@ -231,6 +303,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
         :persistent_term.erase({@context_key, @table})
         :persistent_term.erase(@inflight_bytes_key)
         :persistent_term.erase(@max_inflight_bytes_key)
+        Ferricstore.Raft.WARaftBackend.HsetCadence.clear()
         SyncGate.clear_shards(shard_count)
         erase_cached_voter_nodes(shard_count)
         :persistent_term.erase(@shard_count_key)
@@ -302,13 +375,46 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       def write(shard_index, command) when valid_shard_index_shape(shard_index) do
         with_sync_write(shard_index, fn ->
           case maybe_namespace_window_write(shard_index, command) do
-            :direct -> commit_or_redirect(shard_index, command, 2)
+            :direct -> commit_direct_or_coalesce(shard_index, command)
             result -> result
           end
         end)
       end
 
       def write(shard_index, _command), do: invalid_shard_index_error(shard_index)
+
+      defp commit_direct_or_coalesce(shard_index, {:hset_single, _, _, value} = command) do
+        if Application.get_env(:ferricstore, :waraft_single_hset_coalescing, false) == true,
+          do: coalesce_contended_hset(shard_index, command, value),
+          else: commit_or_redirect(shard_index, command, 2)
+      end
+
+      defp commit_direct_or_coalesce(shard_index, command),
+        do: commit_or_redirect(shard_index, command, 2)
+
+      defp coalesce_contended_hset(shard_index, command, value) do
+        # Invalid values must not poison unrelated valid callers in a coalesced
+        # batch. Keep their original command-level validation/error ordering.
+        case context(@table) do
+          {:ok, ctx} ->
+            lightly_loaded? =
+              is_integer(max_inflight_commit_bytes()) and
+                inflight_commit_bytes(shard_index) < 2 * estimated_commit_bytes(command)
+
+            # Coalesce only once concurrent work is already present; otherwise
+            # preserve the low-load path and its original commit-window policy.
+
+            busy_cadence? = Ferricstore.Raft.WARaftBackend.HsetCadence.busy?(shard_index)
+
+            if busy_cadence? and not lightly_loaded? and
+                 Ferricstore.Raft.ApplyLimits.validate_value(ctx, value) == :ok,
+               do: NamespaceBatcher.write_single(shard_index, command),
+               else: commit_or_redirect(shard_index, command, 2)
+
+          _ ->
+            commit_or_redirect(shard_index, command, 2)
+        end
+      end
 
       @spec write_async(non_neg_integer(), tuple(), GenServer.from()) :: :ok | {:direct, term()}
       def write_async(shard_index, _command, from) when invalid_shard_index_shape(shard_index) do
@@ -807,6 +913,12 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       def __commit_delete_batch_direct__(shard_index, keys) when is_list(keys) do
         commit_or_redirect(shard_index, {:delete_batch, keys}, 2)
       end
+
+      @doc false
+      def max_inflight_commit_bytes, do: :persistent_term.get(@max_inflight_bytes_key, :infinity)
+
+      @doc false
+      def estimated_commit_bytes(command), do: estimated_term_bytes(command)
 
       @spec inflight_commit_bytes(non_neg_integer()) :: non_neg_integer()
       def inflight_commit_bytes(shard_index) when invalid_shard_index_shape(shard_index), do: 0

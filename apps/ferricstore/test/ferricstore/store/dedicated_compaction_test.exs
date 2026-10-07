@@ -344,6 +344,71 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       assert count == expected_count
     end
 
+    test "read-side LFU updates cannot strand locators in a deleted compaction source" do
+      store = real_store()
+      key = ukey("compact_lfu_race")
+      promote_hash(store, key)
+      ctx = FerricStore.Instance.get(:default)
+      shard = Router.shard_name(ctx, Router.shard_for(ctx, key))
+      state = :sys.get_state(shard)
+      path = promoted_path!(state, key)
+      field = CompoundKey.hash_field(key, "field_1")
+      [before] = :ets.lookup(state.keydir, field)
+      new_lfu = elem(before, 3) + 1
+
+      Process.put(:ferricstore_promoted_compaction_after_collect_hook, fn ^key, entries ->
+        if Enum.any?(entries, fn {entry_key, _, _, _} -> entry_key == field end) do
+          :ets.update_element(state.keydir, field, {4, new_lfu})
+        end
+      end)
+
+      try do
+        assert {:ok, _} = ShardCompound.compact_dedicated_result(state, key, path)
+      after
+        Process.delete(:ferricstore_promoted_compaction_after_collect_hook)
+      end
+
+      [after_row] = :ets.lookup(state.keydir, field)
+      assert elem(after_row, 3) == new_lfu
+      assert elem(after_row, 4) > elem(before, 4)
+
+      file =
+        Path.join(
+          path,
+          String.pad_leading(Integer.to_string(elem(after_row, 4)), 5, "0") <> ".log"
+        )
+
+      assert {:ok, "value_1"} = NIF.v2_pread_at(file, elem(after_row, 5))
+    end
+
+    test "cache eviction during compaction keeps the cold row on its durable relocated file" do
+      store = real_store()
+      key = ukey("compact_eviction_race")
+      promote_hash(store, key)
+      ctx = FerricStore.Instance.get(:default)
+      state = :sys.get_state(Router.shard_name(ctx, Router.shard_for(ctx, key)))
+      path = promoted_path!(state, key)
+      field = CompoundKey.hash_field(key, "field_1")
+      [before] = :ets.lookup(state.keydir, field)
+
+      Process.put(:ferricstore_promoted_compaction_after_collect_hook, fn ^key, entries ->
+        if Enum.any?(entries, fn {entry_key, _, _, _} -> entry_key == field end) do
+          :ets.update_element(state.keydir, field, {2, nil})
+        end
+      end)
+
+      try do
+        assert {:ok, _} = ShardCompound.compact_dedicated_result(state, key, path)
+      after
+        Process.delete(:ferricstore_promoted_compaction_after_collect_hook)
+      end
+
+      [after_row] = :ets.lookup(state.keydir, field)
+      assert elem(after_row, 1) == nil
+      assert elem(after_row, 4) > elem(before, 4)
+      assert Router.compound_get(ctx, key, field) == "value_1"
+    end
+
     test "concurrent promoted HSET wins over stale compaction snapshot" do
       store = real_store()
       key = ukey("compact_hset_race")
@@ -467,6 +532,55 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
                       }}
 
       assert log_files(dedicated_path) == ["00000.log", "00001.log"]
+    end
+
+    test "a failed old-value removal must retain the newer tombstone file for recovery" do
+      store = real_store()
+      key = ukey("cleanup_tombstone_order")
+      promote_hash(store, key)
+      ctx = FerricStore.Instance.get(:default)
+      state = :sys.get_state(Router.shard_name(ctx, Router.shard_for(ctx, key)))
+      path = promoted_path!(state, key)
+      File.touch!(Path.join(path, "00001.log"))
+      assert Hash.handle("HDEL", [key, "field_1"], store) == 1
+
+      Process.put(:ferricstore_promoted_compaction_list_hook, fn ^path ->
+        {:ok, ["00001.log", "00000.log", "00002.log"]}
+      end)
+
+      Process.put(:ferricstore_promoted_compaction_remove_hook, fn file ->
+        if Path.basename(file) == "00000.log",
+          do: {:error, {:permission_denied, "injected"}},
+          else: Ferricstore.FS.rm(file)
+      end)
+
+      try do
+        assert {:error, _} = ShardCompound.compact_dedicated_result(state, key, path)
+      after
+        Process.delete(:ferricstore_promoted_compaction_list_hook)
+        Process.delete(:ferricstore_promoted_compaction_remove_hook)
+      end
+
+      assert File.exists?(Path.join(path, "00000.log"))
+      recovered = :ets.new(:tombstone_cleanup_recovery, [:public, :set])
+
+      try do
+        :ets.insert(recovered, :ets.lookup(state.keydir, Promotion.marker_key(key)))
+
+        assert Map.has_key?(
+                 Promotion.recover_promoted(
+                   state.shard_data_path,
+                   recovered,
+                   ctx.data_dir,
+                   state.index
+                 ),
+                 key
+               )
+
+        assert :ets.lookup(recovered, CompoundKey.hash_field(key, "field_1")) == []
+      after
+        :ets.delete(recovered)
+      end
     end
   end
 

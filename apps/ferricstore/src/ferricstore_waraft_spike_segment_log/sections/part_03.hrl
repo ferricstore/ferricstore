@@ -7,7 +7,7 @@ write_append_failure_marker(Dir, Reason) ->
         version => 1,
         reason => Reason
     },
-    case filelib:ensure_dir(MarkerPath) of
+    case metadata_ensure_dir(MarkerPath) of
         ok ->
             case write_file_sync(TmpPath, encode_external_term(Marker)) of
                 ok ->
@@ -294,7 +294,7 @@ prepare_projection_stream_stage(
  ) ->
     case remove_tree(Staging) of
         ok ->
-            case filelib:ensure_dir(filename:join(Staging, "dummy")) of
+            case metadata_ensure_dir(filename:join(Staging, "dummy")) of
                 ok ->
                     case write_segment_config(Staging, RecordsPerSegment) of
                         ok ->
@@ -405,7 +405,7 @@ call_apply_projection_retention_page(PageFun, Cursor) ->
 prepare_rewrite_stage(Staging, Records, RecordsPerSegment) ->
     case remove_tree(Staging) of
         ok ->
-            case filelib:ensure_dir(filename:join(Staging, "dummy")) of
+            case metadata_ensure_dir(filename:join(Staging, "dummy")) of
                 ok ->
                     case write_segment_config(Staging, RecordsPerSegment) of
                         ok ->
@@ -429,7 +429,7 @@ prepare_rewrite_stage(Staging, Records, RecordsPerSegment) ->
 prepare_projection_upsert_stage(Staging, SourceDir, KeepFun, Records, RecordsPerSegment) ->
     case remove_tree(Staging) of
         ok ->
-            case filelib:ensure_dir(filename:join(Staging, "dummy")) of
+            case metadata_ensure_dir(filename:join(Staging, "dummy")) of
                 ok ->
                     case write_segment_config(Staging, RecordsPerSegment) of
                         ok ->
@@ -501,7 +501,7 @@ stream_disk_segment_paths([{SourceOrdinal, Path} | Rest], DestDir, KeepFun, Reco
     end.
 
 stream_disk_segment_path(Path, DestDir, KeepFun, RecordsPerSegment, SourceOrdinal, Ordinal, RecordsRev, Rollbacks) ->
-    case file:read_link_info(Path) of
+    case file:read_link_info(Path, [raw]) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
             case open_verified_segment_file(Path, [read, raw, binary]) of
                 {ok, Fd} ->
@@ -673,7 +673,7 @@ swap_rewrite_dirs(Dir, Staging, Backup) ->
         ok ->
             case maybe_run_rewrite_hook(after_live_backup) of
                 ok ->
-                    case rename_path(Staging, Dir) of
+                    case rename_rewrite_dir(Staging, Dir) of
                         ok -> sync_dir(filename:dirname(Dir));
                         {error, _Reason} = Error -> Error
                     end;
@@ -689,7 +689,7 @@ move_live_to_backup(Dir, Backup) ->
         true ->
             case remove_tree(Backup) of
                 ok ->
-                    case rename_path(Dir, Backup) of
+                    case rename_rewrite_dir(Dir, Backup) of
                         ok -> sync_dir(filename:dirname(Dir));
                         {error, _Reason} = Error -> Error
                     end;
@@ -745,7 +745,7 @@ rollback_rewrite(Dir, #{staging := Staging, backup := Backup}) ->
         true ->
             case remove_tree(Dir) of
                 ok ->
-                    case rename_path(Backup, Dir) of
+                    case rename_rewrite_dir(Backup, Dir) of
                         ok -> cleanup_rewrite_marker(Dir, Staging);
                         {error, _Reason} = Error -> Error
                     end;
@@ -765,12 +765,12 @@ recover_without_backup(Dir, Staging) ->
         false ->
             case path_exists(Staging) of
                 true ->
-                    case rename_path(Staging, Dir) of
+                    case rename_rewrite_dir(Staging, Dir) of
                         ok -> cleanup_rewrite_marker(Dir, Staging);
                         {error, _Reason} = Error -> Error
                     end;
                 false ->
-                    case filelib:ensure_dir(filename:join(Dir, "dummy")) of
+                    case metadata_ensure_dir(filename:join(Dir, "dummy")) of
                         ok -> cleanup_rewrite_marker(Dir, Staging);
                         {error, Reason} -> {error, {ensure_recovered_dir, Reason}}
                     end;
@@ -1134,7 +1134,7 @@ existing_records_per_segment(Dir) ->
 read_disk_record(Dir, Index, RecordsPerSegment) ->
     Ordinal = segment_ordinal(Index, RecordsPerSegment),
     Path = filename:join(Dir, segment_file_from_ordinal(Ordinal)),
-    case file:read_link_info(Path) of
+    case file:read_link_info(Path, [raw]) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
             case open_verified_segment_file(Path, [read, raw, binary]) of
                 {ok, Fd} ->

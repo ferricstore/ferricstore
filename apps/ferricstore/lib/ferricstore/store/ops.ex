@@ -789,6 +789,17 @@ defmodule Ferricstore.Store.Ops do
   def compound_type_claim(store, redis_key, type),
     do: CompoundOps.compound_type_claim(store, redis_key, type)
 
+  @doc false
+  @spec hset_single(store(), binary(), binary(), binary()) ::
+          0 | 1 | :unsupported | {:error, term()}
+  def hset_single(%FerricStore.Instance{} = ctx, key, field, value),
+    do: Router.hset_single(ctx, key, field, value)
+
+  def hset_single(%{hset_single: fun}, key, field, value) when is_function(fun, 3),
+    do: fun.(key, field, value)
+
+  def hset_single(_store, _key, _field, _value), do: :unsupported
+
   def compound_get(store, redis_key, compound_key),
     do: CompoundOps.compound_get(store, redis_key, compound_key)
 

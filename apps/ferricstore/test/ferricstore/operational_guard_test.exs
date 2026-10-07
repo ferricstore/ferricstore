@@ -5,6 +5,7 @@ defmodule Ferricstore.OperationalGuardTest do
   alias Ferricstore.Flow.Admission
   alias Ferricstore.OperationalGuard
   alias Ferricstore.Test.Eventually
+  alias Ferricstore.Test.SegmentRuntimeFixture
   alias Ferricstore.Test.Utils
   import ExUnit.CaptureLog
 
@@ -95,6 +96,62 @@ defmodule Ferricstore.OperationalGuardTest do
 
     assert OperationalGuard.pressure?()
     assert OperationalGuard.reject_writes?()
+  end
+
+  test "startup maintenance reclaims abandoned rewrite indexes without deleting data" do
+    suffix = Base.url_encode64(:crypto.strong_rand_bytes(8), padding: false)
+    root = Path.join(System.tmp_dir!(), "guard-rewrite-reclaim-#{System.pid()}-#{suffix}")
+    dir = Path.join(root, "segment_log")
+    abandoned = dir <> ".rewrite.staging.123"
+    provider = :ferricstore_waraft_spike_segment_log
+
+    assert :ok =
+             provider.write_projection_batches_sync(to_charlist(root), [
+               {{:raft_log_pos, 1, 0}, [{"k", "v", 0}]}
+             ])
+
+    table = :ferricstore_waraft_segment_offset_registry
+    live = :ets.match_object(table, {{dir, :_}, :_, :_, :_})
+
+    :ets.insert(
+      table,
+      Enum.map(live, fn {{_, index}, ordinal, offset, size} ->
+        {{abandoned, index}, ordinal, offset, size}
+      end)
+    )
+
+    bytes = File.read!(Path.join(dir, "0.idx"))
+    parent = self()
+    on_exit(fn -> SegmentRuntimeFixture.cleanup(root) end)
+
+    snapshot = %{
+      data_dir: root,
+      shard_count: 1,
+      memory: %{level: :ok, rss_bytes: 10, limit_bytes: 100, rss_ratio: 0.1},
+      disk: %{level: :ok, used_bytes: 10, total_bytes: 100, used_ratio: 0.1}
+    }
+
+    start_supervised!(
+      {OperationalGuard,
+       name: :"guard_rewrite_reclaim_#{suffix}",
+       shard_count: 1,
+       data_dir: root,
+       interval_ms: 60_000,
+       limits_fun: fn _ -> snapshot end,
+       apply_disk_pressure_fun: fn _, _, _ -> :ok end,
+       apply_memory_pressure_fun: fn _ -> :ok end,
+       telemetry_fun: fn event, measurements, _ -> send(parent, {event, measurements}) end}
+    )
+
+    assert_receive {[:ferricstore, :waraft, :segment_log, :rewrite_index_reclaim],
+                    %{directories: dirs, offset_entries: removed}},
+                   5_000
+
+    assert dirs >= 1
+    assert removed >= length(live)
+    assert :ets.match_object(table, {{abandoned, :_}, :_, :_, :_}) == []
+    assert :ets.match_object(table, {{dir, :_}, :_, :_, :_}) == live
+    assert File.read!(Path.join(dir, "0.idx")) == bytes
   end
 
   test "logs an RSS admission transition with its memory budget and index footprint only once" do
