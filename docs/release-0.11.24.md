@@ -92,6 +92,19 @@ through the shared file server. It now reads each file once through raw local
 I/O and checks all five forbidden tokens against that content. Every source and
 assertion remains covered; the complete updated-head CI is the release gate.
 
+The updated follow-up passed all 31 PR CI jobs and was merged as #49. Its main
+run then exposed an active-Flow projection fixture starting an LMDB writer with
+no isolated source-keydir context. The fixture now uses the same explicit,
+uniquely named context and keydir reference as its adjacent claim fixture.
+Backlog, successful flush and absent cold-state assertions remain intact; the
+production writer still fails closed when source context is unavailable.
+
+The next PR matrix exposed stream atomic-append fixtures assuming the default
+backend was already running. Starting their module after explicitly stopping
+the backend reproduced the same 17 failures at seed 397824. The module now uses
+the existing per-test shard cleanup/readiness helper, retaining every atomicity,
+linearization and durable-entry assertion.
+
 ## Verification
 
 Before release preparation, the current cleanup source passed 173 scoped

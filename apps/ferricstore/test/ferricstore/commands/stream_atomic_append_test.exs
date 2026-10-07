@@ -7,8 +7,14 @@ defmodule Ferricstore.Commands.StreamAtomicAppendTest do
   alias Ferricstore.Commands.Stream.{AtomicAppend, Groups, Index, Meta}
   alias Ferricstore.Store.{CompoundKey, Ops}
   alias Ferricstore.TermCodec
+  alias Ferricstore.Test.ShardHelpers
 
   @max_u64 18_446_744_073_709_551_615
+
+  setup do
+    ShardHelpers.flush_all_keys()
+    :ok
+  end
 
   test "typed one-shot XRANGE preserves live, missing, expired, and wrong-type behavior" do
     live_key = unique_key("typed-range-live")
