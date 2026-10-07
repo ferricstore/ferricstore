@@ -171,6 +171,13 @@ defmodule Ferricstore.Commands.HashSingleWARaftTest do
     assert_file_server_independent_hset(ctx, key, :cold)
   end
 
+  test "durable promoted HSET recovers lost WAL boundary metadata without the file server", %{
+    ctx: ctx,
+    key: key
+  } do
+    assert_file_server_independent_hset(ctx, key, :cache_loss)
+  end
+
   defp assert_file_server_independent_hset(ctx, key, residency) do
     assert {:ok, 128} = Impl.hset(ctx, key, Map.new(1..128, &{"seed-#{&1}", "seed"}))
     shard = Router.shard_name(ctx, Router.shard_for(ctx, key))
@@ -186,6 +193,14 @@ defmodule Ferricstore.Commands.HashSingleWARaftTest do
       field = CompoundKey.hash_field(key, "field")
       keydir = elem(ctx.keydir_refs, Router.shard_for(ctx, key))
       assert :ets.update_element(keydir, field, {2, nil})
+    end
+
+    if residency == :cache_loss do
+      index = Router.shard_for(ctx, key)
+      dir = Path.join(ctx.data_dir, "waraft/ferricstore_waraft_backend.#{index + 1}/segment_log")
+      registry = :ferricstore_waraft_segment_log_memory_registry
+      [row] = :ets.match_object(registry, {:_, dir, :_, :_, :_, :_})
+      :ets.delete_object(registry, row)
     end
 
     :ok = :sys.suspend(:file_server_2)

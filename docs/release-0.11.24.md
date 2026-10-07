@@ -51,6 +51,17 @@ before asserting connected-quorum rejection, and exhaust the bounded retention
 API's continuation pages before asserting deletion of a recovered expired row.
 Those focused OS-kill/recovery cases pass locally.
 
+The next matrix passes cluster, shard-kill, Jepsen and large-allocation lanes.
+Its diagnostics identify a genuine file-server dependency after WAL memory
+registry loss: durable boundary recovery enumerates segment names through the
+shared server from an asynchronous append worker. That enumeration now uses
+the same raw primitive listing while retaining every filename for existing
+ordinal/type/CRC validation. A failing-first lost-cache suspension regression,
+explicit public HSET cache-loss coverage and 99 provider/security/HSET/cleanup
+checks pass locally. A separate promotion fixture now installs its 1-ms fault
+deadline only after ordinary type/field setup and worker readiness; all 24
+promotion-context checks pass at the failing seed without changing assertions.
+
 ## Verification
 
 Before release preparation, the current cleanup source passed 173 scoped

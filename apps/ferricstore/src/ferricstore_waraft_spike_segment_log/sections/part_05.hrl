@@ -1102,7 +1102,11 @@ put_offset_entries(Entries) ->
     end.
 
 segment_paths(Dir) ->
-    case file:list_dir(Dir) of
+    %% The memory-boundary cache can disappear while an asynchronous append
+    %% worker is running. Its verified recovery must not queue behind the
+    %% shared file server. Keep all names (including unsafe/malformed ones)
+    %% for the existing ordinal, type and CRC checks below.
+    case prim_file:list_dir(Dir) of
         {ok, Files} ->
             case segment_file_ordinals(Files, []) of
                 {ok, Segments} ->

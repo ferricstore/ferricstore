@@ -31,7 +31,9 @@ All notable changes to FerricStore will be documented here.
   snapshot payloads. Keep data files and recovery validation intact.
 - Reduce unrelated file-server queueing with raw local metadata reads, bound
   heartbeat term folds at the durable log tail, and buffer CRC-verified sparse
-  offset fallback scans. Retain workload-specific latency tradeoffs and existing
+  offset fallback scans. Recover lost WAL memory-boundary metadata without
+  shared file-server directory queueing, preserving ordinal/type/CRC checks.
+  Retain workload-specific latency tradeoffs and existing
   durability policy; this release does not claim to resolve every long snapshot
   handoff timeout.
 
