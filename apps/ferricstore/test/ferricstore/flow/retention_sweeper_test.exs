@@ -17,7 +17,7 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
     parent = self()
 
     {:ok, pid} =
-      RetentionSweeper.start_link(
+      start_sweeper(
         name: name,
         initial_delay_ms: 60_000,
         interval_ms: 60_000,
@@ -29,10 +29,6 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
           {:ok, %{flows: 0, history: 5, values: 0, continuation: "next"}}
         end
       )
-
-    on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
-    end)
 
     send(pid, :sweep)
 
@@ -50,7 +46,7 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
     calls = :atomics.new(1, [])
 
     {:ok, pid} =
-      RetentionSweeper.start_link(
+      start_sweeper(
         name: name,
         initial_delay_ms: 60_000,
         interval_ms: 60_000,
@@ -69,10 +65,6 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
         end
       )
 
-    on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
-    end)
-
     send(pid, :sweep)
 
     assert_receive {:cleanup_called, 1, [limit: 100]}, 500
@@ -84,7 +76,7 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
     parent = self()
 
     {:ok, pid} =
-      RetentionSweeper.start_link(
+      start_sweeper(
         name: name,
         initial_delay_ms: 60_000,
         interval_ms: 60_000,
@@ -96,10 +88,6 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
           {:ok, %{flows: 5, history: 100, values: 100, continuation: nil}}
         end
       )
-
-    on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
-    end)
 
     send(pid, :sweep)
 
@@ -117,7 +105,7 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
     parent = self()
 
     {:ok, pid} =
-      RetentionSweeper.start_link(
+      start_sweeper(
         name: name,
         initial_delay_ms: 60_000,
         interval_ms: 60_000,
@@ -129,10 +117,6 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
           {:ok, %{flows: 2, history: 0, values: 0, active_timeouts: 3, continuation: "next"}}
         end
       )
-
-    on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
-    end)
 
     send(pid, :sweep)
 
@@ -149,7 +133,7 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
     parent = self()
 
     {:ok, pid} =
-      RetentionSweeper.start_link(
+      start_sweeper(
         name: name,
         initial_delay_ms: 60_000,
         interval_ms: 60_000,
@@ -163,10 +147,6 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
           {:ok, %{flows: 1, history: 0, values: 0, continuation: "next"}}
         end
       )
-
-    on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
-    end)
 
     send(pid, :sweep)
 
@@ -184,7 +164,7 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
     parent = self()
 
     {:ok, pid} =
-      RetentionSweeper.start_link(
+      start_sweeper(
         name: name,
         initial_delay_ms: 60_000,
         interval_ms: 60_000,
@@ -203,10 +183,6 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
         end
       )
 
-    on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
-    end)
-
     send(pid, :sweep)
 
     assert_receive {:cleanup_called, [limit: 20]}, 500
@@ -223,7 +199,7 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
     parent = self()
 
     {:ok, pid} =
-      RetentionSweeper.start_link(
+      start_sweeper(
         name: name,
         initial_delay_ms: 60_000,
         interval_ms: 60_000,
@@ -239,10 +215,6 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
         end
       )
 
-    on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
-    end)
-
     send(pid, :sweep)
     assert_receive :compaction_called, 500
     Process.sleep(10)
@@ -255,7 +227,7 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
     parent = self()
 
     {:ok, pid} =
-      RetentionSweeper.start_link(
+      start_sweeper(
         name: name,
         initial_delay_ms: 60_000,
         interval_ms: 60_000,
@@ -272,10 +244,6 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
         end
       )
 
-    on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
-    end)
-
     send(pid, :sweep)
 
     assert_receive {:cleanup_called, _opts}, 500
@@ -289,5 +257,9 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
     send(pid, :sweep)
     assert_receive {:cleanup_called, _opts}, 500
     refute_receive :compaction_start_attempted, 50
+  end
+
+  defp start_sweeper(opts) do
+    {:ok, start_supervised!({RetentionSweeper, opts})}
   end
 end

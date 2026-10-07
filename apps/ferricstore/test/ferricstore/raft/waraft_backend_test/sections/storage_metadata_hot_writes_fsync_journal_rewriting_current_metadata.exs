@@ -153,6 +153,54 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageMetadataHotWritesFs
       end
 
       @tag :bounded_checkpoint
+      @tag :review_regression
+      test "successful background checkpoints honor their minimum interval", %{ctx: ctx} do
+        parent = self()
+
+        keys = [
+          :waraft_segment_projection_checkpoint_every,
+          :waraft_segment_projection_checkpoint_min_interval_ms,
+          :waraft_segment_projection_checkpoint_hook
+        ]
+
+        previous = Enum.map(keys, &{&1, Application.get_env(:ferricstore, &1)})
+
+        try do
+          Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, :never)
+
+          Application.put_env(
+            :ferricstore,
+            :waraft_segment_projection_checkpoint_min_interval_ms,
+            60_000
+          )
+
+          Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_hook, fn
+            :before_scan, _ -> send(parent, :review_checkpoint_scan)
+            _, _ -> :ok
+          end)
+
+          assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+          Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, 1)
+          assert :ok = WARaftBackend.write(0, {:put, "checkpoint-interval:first", "v", 0})
+          assert_receive :review_checkpoint_scan, 2_000
+
+          assert_eventually(
+            fn ->
+              Keyword.fetch!(waraft_storage_status(0), :segment_projection_checkpoint_pending?)
+            end,
+            false
+          )
+
+          assert :ok = WARaftBackend.write(0, {:put, "checkpoint-interval:second", "v", 0})
+          refute_receive :review_checkpoint_scan, 200
+        after
+          Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, :never)
+          WARaftBackend.stop()
+          Enum.each(previous, fn {key, value} -> restore_env(key, value) end)
+        end
+      end
+
+      @tag :bounded_checkpoint
       test "segment projection checkpoint runs in background with pending guard", %{ctx: ctx} do
         assert {:ok, _apps} = Application.ensure_all_started(:telemetry)
 

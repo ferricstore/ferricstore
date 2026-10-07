@@ -661,27 +661,20 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
   end
 
   defp publish_promoted_compaction_page(state, new_fid, live_entries, results) do
-    ref = Support.keydir_binary_ref(state)
-    hot_cache_threshold = ShardETS.hot_cache_threshold(state)
-
     live_entries
     |> Enum.zip(results)
     |> Enum.each(fn
-      {{key, value, expire_at_ms, old_row}, {offset, value_size}} ->
-        case :ets.lookup(state.keydir, key) do
-          [^old_row] ->
-            value_for_ets = ShardETS.value_for_ets(value, hot_cache_threshold)
-            Support.track_binary_insert(ref, state, key, value_for_ets)
-            old_lfu = elem(old_row, 3)
-
-            :ets.insert(
-              state.keydir,
-              {key, value_for_ets, expire_at_ms, old_lfu, new_fid, offset, value_size}
-            )
-
-          _changed_or_deleted ->
-            :ok
-        end
+      {{key, _value, expire_at_ms,
+        {key, _cached_value, expire_at_ms, _lfu, old_fid, old_offset, old_size}},
+       {offset, value_size}} ->
+        # Reads can update LFU or cache residency while the compaction latch
+        # protects the logical disk version. Relocate that version atomically,
+        # retaining its current cache/LFU state rather than stranding the row in
+        # an old file that will be removed. Deleted/replaced versions do not match.
+        :ets.select_replace(state.keydir, [
+          {{key, :"$1", expire_at_ms, :"$2", old_fid, old_offset, old_size}, [],
+           [{{{:const, key}, :"$1", expire_at_ms, :"$2", new_fid, offset, value_size}}]}
+        ])
     end)
 
     :ok
@@ -789,14 +782,32 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
   defp remove_dedicated_logs_before(state, dedicated_path, new_fid) do
     case list_dedicated_logs(dedicated_path) do
       {:ok, files} ->
+        # A partial cleanup must leave every newer tombstone above any retained
+        # older values. Directory enumeration order is not a replay order.
+        files =
+          Enum.sort_by(files, fn name ->
+            case dedicated_log_file_id(name) do
+              {:ok, fid} -> {0, fid}
+              _other -> {1, name}
+            end
+          end)
+
         Enum.reduce_while(files, :ok, fn name, :ok ->
           case dedicated_log_file_id(name) do
             {:ok, fid} when fid < new_fid ->
               path = Path.join(dedicated_path, name)
 
-              case Ferricstore.FS.rm(path) do
+              case remove_dedicated_log(path) do
                 :ok ->
-                  {:cont, :ok}
+                  # Persist this deleted prefix before removing a newer file;
+                  # unlink call order alone is insufficient across power loss.
+                  case dedicated_fsync_dir(state, dedicated_path, :remove_old_log_prefix) do
+                    :ok ->
+                      {:cont, :ok}
+
+                    {:error, reason} ->
+                      {:halt, {:error, {:remove_old_log_sync_failed, path, reason}}}
+                  end
 
                 {:error, reason} ->
                   Logger.error(
@@ -839,6 +850,13 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
     case Process.get(:ferricstore_promoted_compaction_list_hook) do
       fun when is_function(fun, 1) -> fun.(dedicated_path)
       _missing -> Ferricstore.FS.ls(dedicated_path)
+    end
+  end
+
+  defp remove_dedicated_log(path) do
+    case Process.get(:ferricstore_promoted_compaction_remove_hook) do
+      fun when is_function(fun, 1) -> fun.(path)
+      _missing -> Ferricstore.FS.rm(path)
     end
   end
 

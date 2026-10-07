@@ -32,7 +32,14 @@ fold_binary(Log, Start, End, SizeLimit, Func, Acc) ->
     fold_binary_impl(Log, Start, End, 0, SizeLimit, Func, Acc).
 
 fold_terms(Log, Start, End, Func, Acc) ->
-    fold_terms_impl(Log, Start, End, Func, Acc).
+    %% Heartbeats include new entries beyond the follower's durable tail. Those
+    %% indexes have no local terms to compare; probing them would scan the same
+    %% segment from its beginning for every new entry. Use the durable boundary,
+    %% not the bounded ETS tail, so demoted entries still take the validated read.
+    case last_index(Log) of
+        undefined -> {ok, Acc};
+        Last -> fold_terms_impl(Log, Start, min(End, Last), Func, Acc)
+    end.
 
 get(#raft_log{name = Name} = Log, Index) ->
     Dir = log_dir(Log),
@@ -518,7 +525,7 @@ open_disk_reader_file(Dir, Index, ExpectedOrdinal, RecordsPerSegment) ->
             {error, {segment_ordinal_mismatch, Ordinal, ExpectedOrdinal}};
         true ->
             Path = filename:join(Dir, segment_file_from_ordinal(Ordinal)),
-            case file:read_link_info(Path) of
+            case file:read_link_info(Path, [raw]) of
                 {ok, #file_info{type = regular, size = FileBytes}} ->
                     case open_verified_segment_file(Path, [read, raw, binary]) of
                         {ok, Fd} ->
@@ -925,7 +932,7 @@ reset_disk_to_position(RootDir, {raft_log_pos, Index, Term})
         when is_integer(Index), Index >= 0, is_integer(Term), Term >= 0 ->
     Dir = fold_disk_segment_dir(RootDir),
     Record = {Index, {Term, undefined}},
-    case filelib:ensure_dir(filename:join(Dir, "dummy")) of
+    case metadata_ensure_dir(filename:join(Dir, "dummy")) of
         ok ->
             case validate_segment_log_dir(Dir) of
                 ok ->
@@ -960,7 +967,7 @@ fold_disk_segment_dir(RootDir) ->
 
 ensure_segment_config(RootDir) ->
     Dir = fold_disk_segment_dir(RootDir),
-    case filelib:ensure_dir(filename:join(Dir, "dummy")) of
+    case metadata_ensure_dir(filename:join(Dir, "dummy")) of
         ok ->
             case validate_segment_log_dir(Dir) of
                 ok ->
@@ -979,7 +986,7 @@ ensure_segment_config(RootDir) ->
 
 write_projection(RootDir, Position, Entries) when is_list(Entries) ->
     Dir = fold_disk_segment_dir(RootDir),
-    case filelib:ensure_dir(filename:join(Dir, "dummy")) of
+    case metadata_ensure_dir(filename:join(Dir, "dummy")) of
         ok ->
             rewrite_records(Dir, projection_records(Position, Entries));
         {error, Reason} ->
@@ -993,7 +1000,7 @@ write_projection_batches(_RootDir, []) ->
     ok;
 write_projection_batches(RootDir, Batches) when is_list(Batches) ->
     Dir = fold_disk_segment_dir(RootDir),
-    case filelib:ensure_dir(filename:join(Dir, "dummy")) of
+    case metadata_ensure_dir(filename:join(Dir, "dummy")) of
         ok ->
             case projection_batch_records(Batches, []) of
                 {ok, Records} -> write_projection_batch_records(Dir, Records, nosync);
@@ -1007,7 +1014,7 @@ write_projection_batches_sync(_RootDir, []) ->
     ok;
 write_projection_batches_sync(RootDir, Batches) when is_list(Batches) ->
     Dir = fold_disk_segment_dir(RootDir),
-    case filelib:ensure_dir(filename:join(Dir, "dummy")) of
+    case metadata_ensure_dir(filename:join(Dir, "dummy")) of
         ok ->
             case projection_batch_records(Batches, []) of
                 {ok, Records} -> write_projection_batch_records(Dir, Records, sync);
@@ -1020,7 +1027,7 @@ write_projection_batches_sync(RootDir, Batches) when is_list(Batches) ->
 compact_apply_projection(RootDir, TrimIndex, RetainedBatches)
   when is_integer(TrimIndex), TrimIndex >= 0, is_list(RetainedBatches) ->
     Dir = fold_disk_segment_dir(RootDir),
-    case filelib:ensure_dir(filename:join(Dir, "dummy")) of
+    case metadata_ensure_dir(filename:join(Dir, "dummy")) of
         ok ->
             case segment_append_kind(Dir) of
                 apply_projection ->
@@ -1046,7 +1053,7 @@ compact_apply_projection(_RootDir, TrimIndex, _RetainedBatches) ->
 compact_apply_projection_stream(RootDir, TrimIndex, PageFun)
   when is_integer(TrimIndex), TrimIndex >= 0, is_function(PageFun, 1) ->
     Dir = fold_disk_segment_dir(RootDir),
-    case filelib:ensure_dir(filename:join(Dir, "dummy")) of
+    case metadata_ensure_dir(filename:join(Dir, "dummy")) of
         ok ->
             case segment_append_kind(Dir) of
                 apply_projection ->
@@ -1401,7 +1408,7 @@ init(#raft_log{name = Name}) ->
 
 open(#raft_log{name = Name} = Log) ->
     Dir = log_dir(Log),
-    case filelib:ensure_dir(filename:join(filename:dirname(Dir), "dummy")) of
+    case metadata_ensure_dir(filename:join(filename:dirname(Dir), "dummy")) of
         ok ->
             case validate_segment_log_dir(Dir) of
                 ok ->
@@ -1409,7 +1416,7 @@ open(#raft_log{name = Name} = Log) ->
                         ok ->
                             case recover_rewrite(Dir) of
                                 ok ->
-                                    case filelib:ensure_dir(filename:join(Dir, "dummy")) of
+                                    case metadata_ensure_dir(filename:join(Dir, "dummy")) of
                                         ok ->
                                             case validate_segment_log_dir(Dir) of
                                                 ok ->

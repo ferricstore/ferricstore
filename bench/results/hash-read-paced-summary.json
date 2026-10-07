@@ -1,0 +1,326 @@
+{
+  "cohort": "paced",
+  "aggregation": "per-trial histogram percentiles, then medians/ranges across three trials",
+  "trials": [
+    {
+      "variant": "baseline",
+      "trial": 1,
+      "operations": {
+        "hash_write": {
+          "count": 9232,
+          "max_us": 688330,
+          "p50_us": 35500,
+          "p95_us": 55400,
+          "p99_us": 68900
+        },
+        "hash_read": {
+          "count": 18481,
+          "max_us": 336166,
+          "p50_us": 65,
+          "p95_us": 18200,
+          "p99_us": 25600
+        },
+        "kv_read": {
+          "count": 9241,
+          "max_us": 142,
+          "p50_us": 5,
+          "p95_us": 13,
+          "p99_us": 25
+        }
+      },
+      "ops_per_second": 611.7663153990591,
+      "compactions": 0,
+      "compaction_failures": 0
+    },
+    {
+      "variant": "baseline",
+      "trial": 2,
+      "operations": {
+        "hash_write": {
+          "count": 9304,
+          "max_us": 710774,
+          "p50_us": 32700,
+          "p95_us": 57300,
+          "p99_us": 68700
+        },
+        "hash_read": {
+          "count": 18600,
+          "max_us": 387274,
+          "p50_us": 32,
+          "p95_us": 17500,
+          "p99_us": 27400
+        },
+        "kv_read": {
+          "count": 9301,
+          "max_us": 39,
+          "p50_us": 3,
+          "p95_us": 8,
+          "p99_us": 13
+        }
+      },
+      "ops_per_second": 617.0970157450384,
+      "compactions": 0,
+      "compaction_failures": 0
+    },
+    {
+      "variant": "baseline",
+      "trial": 3,
+      "operations": {
+        "hash_write": {
+          "count": 9248,
+          "max_us": 786008,
+          "p50_us": 32900,
+          "p95_us": 55000,
+          "p99_us": 68900
+        },
+        "hash_read": {
+          "count": 18500,
+          "max_us": 495406,
+          "p50_us": 33,
+          "p95_us": 17500,
+          "p99_us": 25400
+        },
+        "kv_read": {
+          "count": 9250,
+          "max_us": 42,
+          "p50_us": 4,
+          "p95_us": 9,
+          "p99_us": 16
+        }
+      },
+      "ops_per_second": 613.6151445219731,
+      "compactions": 0,
+      "compaction_failures": 0
+    },
+    {
+      "variant": "cached",
+      "trial": 1,
+      "operations": {
+        "hash_write": {
+          "count": 9324,
+          "max_us": 659433,
+          "p50_us": 28300,
+          "p95_us": 51100,
+          "p99_us": 65000
+        },
+        "hash_read": {
+          "count": 18652,
+          "max_us": 324,
+          "p50_us": 7,
+          "p95_us": 17,
+          "p99_us": 29
+        },
+        "kv_read": {
+          "count": 9326,
+          "max_us": 118,
+          "p50_us": 5,
+          "p95_us": 11,
+          "p99_us": 22
+        }
+      },
+      "ops_per_second": 617.5564126160904,
+      "compactions": 0,
+      "compaction_failures": 0
+    },
+    {
+      "variant": "cached",
+      "trial": 2,
+      "operations": {
+        "hash_write": {
+          "count": 9249,
+          "max_us": 724032,
+          "p50_us": 27900,
+          "p95_us": 50300,
+          "p99_us": 133000
+        },
+        "hash_read": {
+          "count": 18488,
+          "max_us": 70,
+          "p50_us": 5,
+          "p95_us": 12,
+          "p99_us": 17
+        },
+        "kv_read": {
+          "count": 9244,
+          "max_us": 49,
+          "p50_us": 4,
+          "p95_us": 8,
+          "p99_us": 13
+        }
+      },
+      "ops_per_second": 613.4383760917183,
+      "compactions": 0,
+      "compaction_failures": 0
+    },
+    {
+      "variant": "cached",
+      "trial": 3,
+      "operations": {
+        "hash_write": {
+          "count": 9379,
+          "max_us": 524830,
+          "p50_us": 26700,
+          "p95_us": 43400,
+          "p99_us": 66600
+        },
+        "hash_read": {
+          "count": 18766,
+          "max_us": 114,
+          "p50_us": 6,
+          "p95_us": 15,
+          "p99_us": 21
+        },
+        "kv_read": {
+          "count": 9383,
+          "max_us": 151,
+          "p50_us": 5,
+          "p95_us": 10,
+          "p99_us": 16
+        }
+      },
+      "ops_per_second": 622.4403306569958,
+      "compactions": 0,
+      "compaction_failures": 0
+    }
+  ],
+  "variants": {
+    "baseline": {
+      "ops_per_second": {
+        "median": 613.6151445219731,
+        "min": 611.7663153990591,
+        "max": 617.0970157450384
+      },
+      "hash_write_p50_us": {
+        "median": 32900,
+        "min": 32700,
+        "max": 35500
+      },
+      "hash_write_p95_us": {
+        "median": 55400,
+        "min": 55000,
+        "max": 57300
+      },
+      "hash_write_p99_us": {
+        "median": 68900,
+        "min": 68700,
+        "max": 68900
+      },
+      "hash_write_max_us": {
+        "median": 710774,
+        "min": 688330,
+        "max": 786008
+      },
+      "hash_read_p50_us": {
+        "median": 33,
+        "min": 32,
+        "max": 65
+      },
+      "hash_read_p95_us": {
+        "median": 17500,
+        "min": 17500,
+        "max": 18200
+      },
+      "hash_read_p99_us": {
+        "median": 25600,
+        "min": 25400,
+        "max": 27400
+      },
+      "hash_read_max_us": {
+        "median": 387274,
+        "min": 336166,
+        "max": 495406
+      },
+      "kv_read_p50_us": {
+        "median": 4,
+        "min": 3,
+        "max": 5
+      },
+      "kv_read_p95_us": {
+        "median": 9,
+        "min": 8,
+        "max": 13
+      },
+      "kv_read_p99_us": {
+        "median": 16,
+        "min": 13,
+        "max": 25
+      },
+      "kv_read_max_us": {
+        "median": 42,
+        "min": 39,
+        "max": 142
+      }
+    },
+    "cached": {
+      "ops_per_second": {
+        "median": 617.5564126160904,
+        "min": 613.4383760917183,
+        "max": 622.4403306569958
+      },
+      "hash_write_p50_us": {
+        "median": 27900,
+        "min": 26700,
+        "max": 28300
+      },
+      "hash_write_p95_us": {
+        "median": 50300,
+        "min": 43400,
+        "max": 51100
+      },
+      "hash_write_p99_us": {
+        "median": 66600,
+        "min": 65000,
+        "max": 133000
+      },
+      "hash_write_max_us": {
+        "median": 659433,
+        "min": 524830,
+        "max": 724032
+      },
+      "hash_read_p50_us": {
+        "median": 6,
+        "min": 5,
+        "max": 7
+      },
+      "hash_read_p95_us": {
+        "median": 15,
+        "min": 12,
+        "max": 17
+      },
+      "hash_read_p99_us": {
+        "median": 21,
+        "min": 17,
+        "max": 29
+      },
+      "hash_read_max_us": {
+        "median": 114,
+        "min": 70,
+        "max": 324
+      },
+      "kv_read_p50_us": {
+        "median": 5,
+        "min": 4,
+        "max": 5
+      },
+      "kv_read_p95_us": {
+        "median": 10,
+        "min": 8,
+        "max": 11
+      },
+      "kv_read_p99_us": {
+        "median": 16,
+        "min": 13,
+        "max": 22
+      },
+      "kv_read_max_us": {
+        "median": 118,
+        "min": 49,
+        "max": 151
+      }
+    }
+  },
+  "router_checksums": {
+    "baseline": "23efba0228a5706f4bd85f997affa155",
+    "cached": "206e3d558ba282821ced061f3624223f"
+  }
+}

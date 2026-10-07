@@ -497,7 +497,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
 
       defp segment_projection_checkpoint_interval_due?(handle) do
         interval_ms = segment_projection_checkpoint_min_interval_ms()
-        last_ms = Map.get(handle, :segment_projection_checkpoint_started_at_ms, 0)
+        last_ms = Map.get(handle, :segment_projection_checkpoint_started_at_ms)
         now_ms = System.monotonic_time(:millisecond)
         retry_after_ms = Map.get(handle, :segment_projection_checkpoint_retry_after_ms)
 
@@ -508,7 +508,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
           interval_ms <= 0 ->
             true
 
-          last_ms <= 0 ->
+          not is_integer(last_ms) ->
             true
 
           now_ms - last_ms >= interval_ms ->

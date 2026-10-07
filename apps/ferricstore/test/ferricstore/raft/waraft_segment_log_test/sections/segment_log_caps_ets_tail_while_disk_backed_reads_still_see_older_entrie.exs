@@ -199,8 +199,40 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest.Sections.SegmentLogCapsEtsTailWh
             assert :ets.info(registry) != :undefined
             :ets.delete(registry)
 
-            assert :ferricstore_waraft_spike_segment_log.first_index(log) == 1
-            assert :ferricstore_waraft_spike_segment_log.last_index(log) == 3
+            :ok = :sys.suspend(:file_server_2)
+
+            recovery =
+              Task.async(fn ->
+                {:ferricstore_waraft_spike_segment_log.first_index(log),
+                 :ferricstore_waraft_spike_segment_log.last_index(log)}
+              end)
+
+            {early, blocked} =
+              try do
+                early = Task.yield(recovery, 500)
+
+                blocked =
+                  if early == nil,
+                    do: {
+                      Process.info(recovery.pid, :current_stacktrace),
+                      Process.info(Process.whereis(:file_server_2), :messages)
+                    }
+
+                {early, blocked}
+              after
+                :sys.resume(:file_server_2)
+              end
+
+            result =
+              case early do
+                nil -> Task.await(recovery, 10_000)
+                {:ok, value} -> value
+              end
+
+            assert result == {1, 3}
+
+            assert early == {:ok, result},
+                   "boundary recovery blocked: #{inspect(blocked, limit: :infinity)}"
 
             assert %{disk_first_index: 1, disk_last_index: 3, ets_entries: 1} =
                      :ferricstore_waraft_spike_segment_log.memory_status(log)

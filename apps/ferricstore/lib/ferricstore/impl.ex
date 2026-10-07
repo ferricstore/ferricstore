@@ -1022,6 +1022,10 @@ defmodule FerricStore.Impl do
     {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
   end
 
+  # Command handlers already support concrete instances through Store.Ops.
+  # Reuse that representation instead of allocating a callback map per call.
+  defp build_store(%FerricStore.Instance{} = ctx), do: ctx
+
   defp build_store(ctx) do
     %{
       __instance_ctx__: ctx,
@@ -1053,6 +1057,7 @@ defmodule FerricStore.Impl do
       extend: fn key, owner, ttl -> Router.extend(ctx, key, owner, ttl) end,
       ratelimit_add: fn key, w, m, c -> Router.ratelimit_add(ctx, key, w, m, c) end,
       list_op: fn key, op -> Router.list_op(ctx, key, op) end,
+      on_push: fn key, count -> Ferricstore.Store.Ops.on_push(ctx, key, count) end,
       prob_write: fn cmd -> Router.prob_write(ctx, cmd) end,
       key_lifecycle: fn command -> Router.key_lifecycle(ctx, command) end,
       stream_append: fn key, id_spec, fields, trim_opts, nomkstream ->

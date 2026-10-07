@@ -1,0 +1,151 @@
+diff --git a/apps/ferricstore/lib/ferricstore/flow/lmdb.ex b/apps/ferricstore/lib/ferricstore/flow/lmdb.ex
+--- a/apps/ferricstore/lib/ferricstore/flow/lmdb.ex
++++ b/apps/ferricstore/lib/ferricstore/flow/lmdb.ex
+@@ -296,6 +296,32 @@ defmodule Ferricstore.Flow.LMDB do
+     end
+   end
+
++  @doc false
++  def recovery_flush_in_progress?(path) when is_binary(path) do
++    # Recovery shards must not serialize their repeated metadata probes through
++    # the shared file server. Keep the same no-follow checks on the local files
++    # used by the native LMDB environment, without caching their existence.
++    present? =
++      recovery_path_type?(path, :directory) and
++        (recovery_path_type?(Path.join(path, "data.mdb"), :regular) or
++           recovery_path_type?(Path.join(path, "lock.mdb"), :regular))
++
++    if present? do
++      path
++      |> get(flush_in_progress_key())
++      |> normalize_flush_marker_read()
++    else
++      false
++    end
++  end
++
++  defp recovery_path_type?(path, type) do
++    case :file.read_link_info(path, [:raw, {:time, :posix}]) do
++      {:ok, info} -> File.Stat.from_record(info).type == type
++      _missing_or_unsafe -> false
++    end
++  end
++
+   @doc false
+   def __normalize_flush_marker_read_for_test__(result), do: normalize_flush_marker_read(result)
+
+diff --git a/apps/ferricstore/lib/ferricstore/raft/state_machine/sections/flow_claim_due.ex b/apps/ferricstore/lib/ferricstore/raft/state_machine/sections/flow_claim_due.ex
+--- a/apps/ferricstore/lib/ferricstore/raft/state_machine/sections/flow_claim_due.ex
++++ b/apps/ferricstore/lib/ferricstore/raft/state_machine/sections/flow_claim_due.ex
+@@ -797,7 +797,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
+           # Never reuse a proof across Raft entries: writes may change LMDB as
+           # replay advances. A concurrent commit here or after the cursor scan
+           # discards the proof and takes the original bucket-by-bucket path.
+-          with false <- LMDB.flush_in_progress?(path),
++          with false <- LMDB.recovery_flush_in_progress?(path),
+                {:ok, transaction_id} <- LMDB.last_txn_id(path),
+                {:ok, [], true, 0} <-
+                  LMDB.range_entries_bounded(
+@@ -809,7 +809,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
+                    1_048_576
+                  ),
+                {:ok, ^transaction_id} <- LMDB.last_txn_id(path),
+-               false <- LMDB.flush_in_progress?(path),
++               false <- LMDB.recovery_flush_in_progress?(path),
+                {:ok, cursor} <- empty_cold_due_scan_cursor(state, start_ms, horizon_ms) do
+             {:ok, cursor, transaction_id}
+           else
+diff --git a/apps/ferricstore/test/ferricstore/flow/lmdb_test.exs b/apps/ferricstore/test/ferricstore/flow/lmdb_test.exs
+--- a/apps/ferricstore/test/ferricstore/flow/lmdb_test.exs
++++ b/apps/ferricstore/test/ferricstore/flow/lmdb_test.exs
+@@ -351,6 +351,39 @@ defmodule Ferricstore.Flow.LMDBUnitTest do
+     refute LMDB.env_present?(file_link_env)
+   end
+
++  test "recovery flush probes preserve markers and recheck replaced or unsafe paths" do
++    root =
++      Path.join(System.tmp_dir!(), "lmdb-recovery-probe-#{System.unique_integer([:positive])}")
++
++    path = Path.join(root, "environment")
++    moved = Path.join(root, "moved")
++    linked = Path.join(root, "linked")
++
++    on_exit(fn ->
++      LMDB.release(path)
++      File.rm_rf!(root)
++    end)
++
++    refute LMDB.recovery_flush_in_progress?(path)
++    refute File.exists?(path)
++    assert :ok = LMDB.write_batch(path, [LMDB.flush_in_progress_put_op()])
++    assert LMDB.recovery_flush_in_progress?(path)
++    assert :ok = LMDB.write_batch(path, [LMDB.flush_in_progress_delete_op()])
++    refute LMDB.recovery_flush_in_progress?(path)
++    assert :ok = LMDB.write_batch(path, [LMDB.flush_in_progress_put_op()])
++    assert LMDB.recovery_flush_in_progress?(path)
++
++    File.ln_s!(path, linked)
++    refute LMDB.recovery_flush_in_progress?(linked)
++    assert :ok = LMDB.release(path)
++    File.rename!(path, moved)
++    File.mkdir_p!(path)
++    refute LMDB.recovery_flush_in_progress?(path)
++    File.ln_s!(Path.join(moved, "data.mdb"), Path.join(path, "data.mdb"))
++    refute LMDB.recovery_flush_in_progress?(path)
++    refute File.exists?(Path.join(path, "lock.mdb"))
++  end
++
+   test "history index delete planning preserves metadata read and decode failures" do
+     history_key = LMDB.history_index_key("history-owner", "event-1", 10)
+
+diff --git a/apps/ferricstore/test/ferricstore/raft/state_machine_test.exs b/apps/ferricstore/test/ferricstore/raft/state_machine_test.exs
+--- a/apps/ferricstore/test/ferricstore/raft/state_machine_test.exs
++++ b/apps/ferricstore/test/ferricstore/raft/state_machine_test.exs
+@@ -336,6 +336,47 @@ defmodule Ferricstore.Raft.StateMachineTest do
+     assert [] = :ets.lookup(ets, "old-async")
+   end
+
++  @tag :replay_empty_cold_due
++  test "recovery cold-due proofs progress independently of the shared file server", %{
++    state: state,
++    dir: dir
++  } do
++    path = Ferricstore.Flow.LMDB.path(dir)
++    recovery_state = Map.put(state, :waraft_recovery_before_index, 42)
++    assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put, "unrelated", "value"}])
++
++    probe = fn ->
++      StateMachine.__recovery_empty_cold_due_cursor_for_test__(
++        recovery_state,
++        path,
++        120_000,
++        360_000
++      )
++    end
++
++    # Warm module loading and the LMDB environment before isolating metadata I/O.
++    assert {:ok, expected_cursor, expected_txn} = probe.()
++
++    task =
++      Task.async(fn ->
++        receive do
++          :probe -> probe.()
++        end
++      end)
++
++    file_server = Process.whereis(:file_server_2)
++    assert is_pid(file_server)
++    :ok = :sys.suspend(file_server)
++
++    try do
++      send(task.pid, :probe)
++      assert {:ok, {:ok, ^expected_cursor, ^expected_txn}} = Task.yield(task, 500)
++    after
++      :sys.resume(file_server)
++      Task.shutdown(task, :brutal_kill)
++    end
++  end
++
+   @tag :replay_empty_cold_due
+   test "recovery proves an empty cold-due bucket window and rejects a later row", %{
+     state: state,

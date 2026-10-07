@@ -4,6 +4,39 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.24 - 2026-10-06
+
+- Update Mint to 1.10.2 to address the newly published HTTP response-framing and
+  HTTP/2 memory-limit advisories, and retain strict native checks on Rust 1.99.
+- Retire temporary WARaft rewrite offsets and metadata when directories are
+  removed or replaced, and periodically reclaim indexes for already-abandoned
+  rewrite directories. Protect live writers, preserve rollback sidecar trust,
+  and invalidate stale readers without deleting authoritative records.
+- Fence promoted reads across durable publication, failed mutations, transactions
+  and restart. Use one atomic WARaft operation for eligible single-field HSETs
+  with exact insertion counts, and bound explicit HSET append groups. Automatic
+  synchronous coalescing is opt-in and remains disabled by default.
+- Release the shared LMDB flush permit while waiting for missing versioned Flow
+  sources, bound reconciliation pages to query admission limits, and coalesce
+  handled history requests while retaining sync-before-watermark barriers.
+- Preserve immutable value locators across read-side LFU/cache updates during
+  compaction, and remove old log files in durably synced numeric order so partial
+  cleanup cannot resurrect deleted fields.
+- Clean up orphan authentication, asynchronous await, LMDB permit and blocking
+  list waiters on caller death/restart. Preserve FIFO list wake-up chains and
+  absolute deadlines, and charge retained native fragment/frame metadata to
+  inbound admission.
+- Respect validated startup storage-call budgets, release prepared storage when
+  its caller exits, and omit only LMDB's runtime coordination lock from durable
+  snapshot payloads. Keep data files and recovery validation intact.
+- Reduce unrelated file-server queueing with raw local metadata reads, bound
+  heartbeat term folds at the durable log tail, and buffer CRC-verified sparse
+  offset fallback scans. Recover lost WAL memory-boundary metadata without
+  shared file-server directory queueing, preserving ordinal/type/CRC checks.
+  Retain workload-specific latency tradeoffs and existing
+  durability policy; this release does not claim to resolve every long snapshot
+  handoff timeout.
+
 ## 0.11.23 - 2026-09-27
 
 - Shorten crash restart by buffering validated Flow-history tail scans only at

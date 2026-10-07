@@ -48,79 +48,96 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
         ctx = Ferricstore.Raft.WARaftBackend.context!(Map.fetch!(options, :table))
         shard_index = Map.fetch!(options, :partition) - 1
 
-        case profile_startup_phase(shard_index, root_dir, :recover_pending_snapshot_install, fn ->
-               recover_pending_snapshot_install(root_dir, ctx, shard_index)
-             end) do
-          :ok ->
-            :ok
+        Ferricstore.Store.PromotedPublication.with_lifecycle(
+          %{instance_ctx: ctx, shard_index: shard_index},
+          fn ->
+            case profile_startup_phase(
+                   shard_index,
+                   root_dir,
+                   :recover_pending_snapshot_install,
+                   fn ->
+                     recover_pending_snapshot_install(root_dir, ctx, shard_index)
+                   end
+                 ) do
+              :ok ->
+                :ok
 
-          {:error, reason} ->
-            raise "failed to recover WARaft snapshot install: #{inspect(reason)}"
-        end
-
-        metadata =
-          profile_startup_phase(shard_index, root_dir, :read_metadata, fn ->
-            root_dir
-            |> metadata_path()
-            |> read_metadata!(ctx, shard_index)
-            |> ensure_initial_storage_metadata!(root_dir, storage_apply_context(%{ctx: ctx}))
-          end)
-
-        profile_startup_phase(shard_index, root_dir, :ensure_apply_projection_log, fn ->
-          ensure_apply_projection_segment_log_ready!(root_dir)
-        end)
-
-        sm_state =
-          profile_startup_phase(shard_index, root_dir, :build_state, fn ->
-            build_sm_state(ctx, shard_index, Map.get(metadata, :apply_context))
-          end)
-
-        {sm_state, recovered_position, replay_dependencies, recovered_config} =
-          profile_startup_phase(shard_index, root_dir, :recover_segment_projected_keydir, fn ->
-            maybe_recover_segment_projected!(sm_state, root_dir, metadata)
-          end)
-
-        Ferricstore.Raft.WARaftBackend.cache_config(shard_index, recovered_config)
-
-        sm_state =
-          profile_startup_phase(
-            shard_index,
-            root_dir,
-            :recover_apply_projection_value_locators,
-            fn ->
-              recover_apply_projection_value_locators!(sm_state, root_dir)
+              {:error, reason} ->
+                raise "failed to recover WARaft snapshot install: #{inspect(reason)}"
             end
-          )
 
-        sm_state =
-          profile_startup_phase(shard_index, root_dir, :rebuild_segment_indexes, fn ->
-            rebuild_indexes_from_segment_keydir(sm_state, ctx, shard_index)
-          end)
+            metadata =
+              profile_startup_phase(shard_index, root_dir, :read_metadata, fn ->
+                root_dir
+                |> metadata_path()
+                |> read_metadata!(ctx, shard_index)
+                |> ensure_initial_storage_metadata!(root_dir, storage_apply_context(%{ctx: ctx}))
+              end)
 
-        metadata_position = Map.get(metadata, :position, @zero_pos)
+            profile_startup_phase(shard_index, root_dir, :ensure_apply_projection_log, fn ->
+              ensure_apply_projection_segment_log_ready!(root_dir)
+            end)
 
-        handle = %{
-          options: options,
-          ctx: ctx,
-          root_dir: root_dir,
-          shard_index: shard_index,
-          sm_state: sm_state,
-          position: recovered_position,
-          persisted_position: metadata_position,
-          segment_projection_position: metadata_position,
-          last_clean_position: metadata_position,
-          replay_dependencies: replay_dependencies,
-          label: Map.get(metadata, :label),
-          config: recovered_config,
-          bitcask_dirty?: false
-        }
+            sm_state =
+              profile_startup_phase(shard_index, root_dir, :build_state, fn ->
+                build_sm_state(ctx, shard_index, Map.get(metadata, :apply_context))
+              end)
 
-        last_clean_position =
-          if replay_dependencies_ready?(handle), do: recovered_position, else: metadata_position
+            {sm_state, recovered_position, replay_dependencies, recovered_config} =
+              profile_startup_phase(
+                shard_index,
+                root_dir,
+                :recover_segment_projected_keydir,
+                fn ->
+                  maybe_recover_segment_projected!(sm_state, root_dir, metadata)
+                end
+              )
 
-        handle
-        |> Map.put(:last_clean_position, last_clean_position)
-        |> register_segment_projection_context()
+            Ferricstore.Raft.WARaftBackend.cache_config(shard_index, recovered_config)
+
+            sm_state =
+              profile_startup_phase(
+                shard_index,
+                root_dir,
+                :recover_apply_projection_value_locators,
+                fn ->
+                  recover_apply_projection_value_locators!(sm_state, root_dir)
+                end
+              )
+
+            sm_state =
+              profile_startup_phase(shard_index, root_dir, :rebuild_segment_indexes, fn ->
+                rebuild_indexes_from_segment_keydir(sm_state, ctx, shard_index)
+              end)
+
+            metadata_position = Map.get(metadata, :position, @zero_pos)
+
+            handle = %{
+              options: options,
+              ctx: ctx,
+              root_dir: root_dir,
+              shard_index: shard_index,
+              sm_state: sm_state,
+              position: recovered_position,
+              persisted_position: metadata_position,
+              segment_projection_position: metadata_position,
+              last_clean_position: metadata_position,
+              replay_dependencies: replay_dependencies,
+              label: Map.get(metadata, :label),
+              config: recovered_config,
+              bitcask_dirty?: false
+            }
+
+            last_clean_position =
+              if replay_dependencies_ready?(handle),
+                do: recovered_position,
+                else: metadata_position
+
+            handle
+            |> Map.put(:last_clean_position, last_clean_position)
+            |> register_segment_projection_context()
+          end
+        )
       end
 
       @spec close(handle()) :: :ok | {:error, term()}
@@ -526,9 +543,14 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
       def open_snapshot(snapshot_path, expected_position, handle) do
         snapshot_path = to_path(snapshot_path)
 
-        with_flow_lmdb_snapshot_install(handle, fn ->
-          do_open_snapshot(snapshot_path, expected_position, handle)
-        end)
+        Ferricstore.Store.PromotedPublication.with_lifecycle(
+          %{instance_ctx: handle.ctx, shard_index: handle.shard_index},
+          fn ->
+            with_flow_lmdb_snapshot_install(handle, fn ->
+              do_open_snapshot(snapshot_path, expected_position, handle)
+            end)
+          end
+        )
       end
 
       defp do_open_snapshot(snapshot_path, expected_position, handle) do

@@ -36,6 +36,55 @@ defmodule Ferricstore.Bitcask.AsyncTest do
              )
   end
 
+  test "a completion-bound waiter reports proxy death instead of hanging forever" do
+    parent = self()
+
+    caller =
+      Task.async(fn ->
+        Async.await(
+          fn proxy, _corr_id ->
+            send(parent, {:review_proxy, proxy})
+            :ok
+          end,
+          :infinity
+        )
+      end)
+
+    try do
+      assert_receive {:review_proxy, proxy}, 1_000
+      Process.exit(proxy, :kill)
+      assert {:ok, {:error, {:proxy_exit, :killed}}} = Task.yield(caller, 1_000)
+    after
+      Task.shutdown(caller, :brutal_kill)
+    end
+  end
+
+  test "a submitted completion-bound proxy exits when its caller is killed" do
+    parent = self()
+
+    caller =
+      spawn(fn ->
+        Async.await(
+          fn proxy, _corr_id ->
+            send(parent, {:review_orphan_proxy, proxy})
+            :ok
+          end,
+          :infinity
+        )
+      end)
+
+    assert_receive {:review_orphan_proxy, proxy}, 1_000
+
+    on_exit(fn ->
+      Process.exit(caller, :kill)
+      Process.exit(proxy, :kill)
+    end)
+
+    monitor = Process.monitor(proxy)
+    Process.exit(caller, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^proxy, _}, 1_000
+  end
+
   test "recursive removal waits for a definitive native completion" do
     source =
       __DIR__

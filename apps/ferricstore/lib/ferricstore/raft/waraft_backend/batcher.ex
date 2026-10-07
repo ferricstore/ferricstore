@@ -2,10 +2,10 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
   @moduledoc """
   Namespace-window batcher for the WARaft replacement backend.
 
-  The normal WARaft write path stays direct. This process is used only when a
-  namespace explicitly configures a `window_ms` larger than the default, so the
-  common SET/DEL hot path does not pay a GenServer hop just to discover there is
-  nothing to coalesce.
+  Namespace windows and admitted bulk writes use this process. Contended
+  single-field HSETs also coalesce behind an in-flight flush, without adding a
+  fixed batching delay. Their pending byte footprint is bounded. The common
+  SET/DEL path and lightly loaded single HSETs retain direct submission.
   """
 
   use GenServer
@@ -15,10 +15,12 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
   alias Ferricstore.Raft.WARaftBackend.Batcher.Telemetry
 
   @call_timeout 30_000
+  @single_call_timeout 10_000
   @handoff_timeout 1_000
   @default_max_batch_size 10_000
   @default_hot_batch_window_ms 1
   @default_generic_batch_window_ms 0
+  @single_queue_max_bytes 1_048_576
 
   defstruct [
     :shard_index,
@@ -100,6 +102,31 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
   catch
     :exit, {:noproc, _} -> commit_single_direct(shard_index, command)
     :exit, {:normal, _} -> commit_single_direct(shard_index, command)
+  end
+
+  @spec write_single(non_neg_integer(), tuple()) :: term()
+  @doc false
+  def write_single(shard_index, command) do
+    window_ms = generic_batch_window_ms()
+    limit = single_queue_limit()
+
+    if (window_ms > 0 or generic_batch_during_flush?()) and
+         limit >= 65_536 and
+         Ferricstore.Raft.WARaftBackend.estimated_commit_bytes([command]) + 32 <= limit do
+      case Process.whereis(name(shard_index)) do
+        nil ->
+          commit_single_direct(shard_index, command)
+
+        pid ->
+          try do
+            GenServer.call(pid, {:write_single, command, window_ms}, @single_call_timeout)
+          catch
+            :exit, _reason -> Ferricstore.ErrorReasons.write_timeout_unknown()
+          end
+      end
+    else
+      commit_single_direct(shard_index, command)
+    end
   end
 
   @spec write_batch(non_neg_integer(), [tuple()]) :: term()
@@ -279,6 +306,42 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
 
   def handle_call({:write_batch, _commands, _window_ms}, _from, %{stopping?: true} = state),
     do: {:reply, {:error, :shutting_down}, state}
+
+  def handle_call({:write_single, _command, _window_ms}, _from, %{stopping?: true} = state),
+    do: {:reply, {:error, :shutting_down}, state}
+
+  def handle_call({:write_single, command, window_ms}, from, state) do
+    commands = [command]
+
+    queued_bytes = hot_slot_bytes(state.batch_slot)
+
+    if queued_bytes + Ferricstore.Raft.WARaftBackend.estimated_commit_bytes(commands) + 32 >
+         single_queue_limit() do
+      {:reply, {:error, :batcher_overloaded}, state}
+    else
+      case admit_hot_batch_group(state, commands) do
+        {:error, reason} ->
+          {:reply, {:error, reason}, state}
+
+        {:ok, admitted_state, usage} ->
+          state = enqueue_hot_batch(admitted_state, {:single, from}, commands, window_ms, usage)
+
+          cond do
+            in_flight?(state, :batch) ->
+              {:noreply, state}
+
+            window_ms == 0 ->
+              {:noreply, flush_hot_batch_slot(state)}
+
+            state.batch_slot.count >= state.hot_max_batch_size ->
+              {:noreply, flush_hot_batch_slot(state)}
+
+            true ->
+              {:noreply, state}
+          end
+      end
+    end
+  end
 
   def handle_call({:write_batch, commands, window_ms}, from, state) do
     case admit_hot_batch_group(state, commands) do
@@ -976,6 +1039,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
 
   defp enqueue_hot_batch(state, from, commands, window_ms, usage) do
     slot = state.batch_slot || new_hot_slot(window_ms, :flush_hot_batch)
+    slot = Map.put(slot, :bytes, hot_slot_bytes(slot))
 
     %{
       state
@@ -985,7 +1049,8 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
             count: slot.count + usage.replies,
             command_work: slot.command_work + usage.command_items,
             compound_work: slot.compound_work + usage.compound_members,
-            visit_work: slot.visit_work + usage.visits
+            visit_work: slot.visit_work + usage.visits,
+            bytes: slot.bytes + Ferricstore.Raft.WARaftBackend.estimated_commit_bytes(commands)
         }
     }
   end
@@ -1032,12 +1097,22 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
       command_work: 0,
       compound_work: 0,
       visit_work: 0,
+      bytes: 0,
       timer_ref: timer_ref,
       timer_token: token,
       window_ms: window_ms,
       created_mono: System.monotonic_time()
     }
   end
+
+  defp hot_slot_bytes(nil), do: 0
+  defp hot_slot_bytes(%{bytes: bytes}), do: bytes
+
+  defp hot_slot_bytes(slot),
+    do:
+      Enum.reduce(slot.groups, 0, fn {_target, items}, bytes ->
+        bytes + Ferricstore.Raft.WARaftBackend.estimated_commit_bytes(items)
+      end)
 
   defp flush_hot_batch_slot(state, mode \\ :async)
   defp flush_hot_batch_slot(%{batch_slot: nil} = state, _mode), do: state
@@ -1351,5 +1426,12 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
     # Keep zero-window generic batches on the batcher so callers arriving behind
     # an in-flight flush coalesce without adding a fixed latency window.
     Application.get_env(:ferricstore, :waraft_generic_batch_during_flush, true) == true
+  end
+
+  defp single_queue_limit do
+    case Ferricstore.Raft.WARaftBackend.max_inflight_commit_bytes() do
+      :infinity -> @single_queue_max_bytes
+      bytes when is_integer(bytes) -> min(bytes, @single_queue_max_bytes)
+    end
   end
 end

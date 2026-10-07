@@ -480,8 +480,6 @@ defmodule Ferricstore.Store.PromotionInstanceContextTest do
     old_hook = Application.get_env(:ferricstore, :compound_promotion_worker_test_hook)
     old_timeout = Application.get_env(:ferricstore, :promotion_compaction_latch_timeout_ms)
 
-    Application.put_env(:ferricstore, :promotion_compaction_latch_timeout_ms, 1)
-
     Application.put_env(:ferricstore, :compound_promotion_worker_test_hook, fn
       ^redis_key ->
         send(test_pid, {:promotion_worker_paused, self()})
@@ -520,6 +518,10 @@ defmodule Ferricstore.Store.PromotionInstanceContextTest do
              )
 
     assert_receive {:promotion_worker_paused, worker_pid}, 5_000
+
+    # Apply the injected deadline to the deferred-cleanup scenario, after the
+    # ordinary type/field writes and worker startup have finished.
+    Application.put_env(:ferricstore, :promotion_compaction_latch_timeout_ms, 1)
 
     cleanup_generation = Promotion.new_generation()
 

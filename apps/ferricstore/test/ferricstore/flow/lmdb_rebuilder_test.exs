@@ -473,6 +473,89 @@ defmodule Ferricstore.Flow.LMDBRebuilderTest do
              )
   end
 
+  test "large composite reconciliation preserves every row and count across bounded pages" do
+    unique = System.unique_integer([:positive])
+
+    data_dir =
+      Path.join(System.tmp_dir!(), "ferricstore_lmdb_composite_pages_#{System.pid()}_#{unique}")
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+    file_path = Ferricstore.Store.Shard.ETS.file_path(shard_path, 0)
+    File.touch!(file_path)
+    keydir = :ets.new(:lmdb_rebuilder_large_composite_keydir, [:set])
+    limit = Ferricstore.Flow.Query.Limits.max_projection_page_records()
+
+    records =
+      for index <- 1..(limit * 2 + 17) do
+        if rem(index, 2) == 0,
+          do: terminal_record("paged-#{index}", "tenant-paged", index),
+          else: active_record("paged-#{index}", "tenant-paged", index)
+      end
+
+    batch =
+      Enum.map(records, fn record ->
+        {Keys.state_key(record.id, record.partition_key), Ferricstore.Flow.encode_record(record),
+         0}
+      end)
+
+    assert {:ok, locations} = Ferricstore.Bitcask.NIF.v2_append_batch(file_path, batch)
+
+    rows =
+      Enum.zip(batch, locations)
+      |> Enum.map(fn {{key, value, expiry}, {offset, size}} ->
+        {key, value, expiry, 0, 0, offset, size}
+      end)
+
+    true = :ets.insert(keydir, rows)
+
+    ctx = %{
+      name: :lmdb_rebuilder_large_composite,
+      query_index_provider: ActiveCompositeProvider,
+      flow_lmdb_mirror_degraded: :atomics.new(1, [])
+    }
+
+    on_exit(fn -> Ferricstore.Test.LMDBFixture.cleanup_data_dir!(data_dir) end)
+    definition = ActiveCompositeProvider.definition()
+
+    for _pass <- 1..2 do
+      :atomics.put(ctx.flow_lmdb_mirror_degraded, 1, 1)
+
+      assert :ok =
+               LMDBRebuilder.reconcile_shard(shard_path, keydir, 0, ctx, nil, nil, nil, nil)
+
+      assert :atomics.get(ctx.flow_lmdb_mirror_degraded, 1) == 0
+      refute Ferricstore.Flow.LMDB.flush_in_progress?(lmdb_path)
+
+      for record <- records do
+        state_key = Keys.state_key(record.id, record.partition_key)
+        assert {:ok, row} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+        assert {:ok, %{record: rebuilt}} = QueryRowCodec.decode(row, state_key)
+
+        assert {rebuilt.id, rebuilt.version, rebuilt.state} ==
+                 {record.id, record.version, record.state}
+
+        assert {:ok, [%{key: entry_key, value: entry_value}]} =
+                 CompositeIndex.entries(definition, record, state_key, 0)
+
+        assert {:ok, ^entry_value} = Ferricstore.Flow.LMDB.get(lmdb_path, entry_key)
+
+        assert {:ok, reverse} =
+                 Ferricstore.Flow.LMDB.get(lmdb_path, CompositeIndex.reverse_key(state_key))
+
+        assert {:ok, [^entry_key]} = CompositeIndex.decode_reverse_value(reverse, state_key)
+      end
+
+      for state <- ["queued", "completed"] do
+        expected = Enum.count(records, &(&1.state == state))
+
+        assert {:ok, ^expected} =
+                 CompositeCounter.read(lmdb_path, definition, nil, ["tenant-paged", state])
+      end
+    end
+  end
+
   test "online reconciliation preserves a hot-pruned terminal projection and repairs its count" do
     data_dir =
       Path.join(

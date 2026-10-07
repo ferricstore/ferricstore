@@ -120,6 +120,111 @@ defmodule FerricstoreServer.Native.BlockingTest do
     assert_receive {:DOWN, ^monitor_ref, :process, ^worker, :normal}, 500
   end
 
+  test "list workers rearm after a consumed notification finds no remaining value" do
+    for command <- ["BLPOP", "BRPOP", "BLMPOP", "BLMOVE"] do
+      key = "native:blocking:{rearm-#{System.unique_integer([:positive])}}:#{command}"
+      destination = key <> ":destination"
+
+      args =
+        case command do
+          "BLMPOP" -> ["0", "1", key, "LEFT"]
+          "BLMOVE" -> [key, destination, "LEFT", "RIGHT", "0"]
+          _ -> [key, "0"]
+        end
+
+      assert {:ok, prepared} = Session.prepare_command(%{"command" => command, "args" => args})
+
+      state = %{
+        instance_ctx: FerricStore.Instance.get(:default),
+        acl_cache: :full_access,
+        require_auth: false,
+        authenticated: true
+      }
+
+      meta = %{request_id: make_ref()}
+      assert {:ok, worker, monitor} = Blocking.start_prepared(prepared, state, meta)
+
+      try do
+        assert wait_until(fn -> Ferricstore.Waiters.count(key) == 1 end) == :ok
+        # Model a push wake-up whose value another consumer already removed.
+        assert ^worker = Ferricstore.Waiters.notify_push(key)
+        assert wait_until(fn -> Ferricstore.Waiters.count(key) == 1 end) == :ok
+
+        assert 1 =
+                 Ferricstore.Commands.List.handle_ast(
+                   {:rpush, [key, "later"]},
+                   state.instance_ctx
+                 )
+
+        assert_receive {:native_blocking_response, ^meta, ^worker, :ok, result}, 1_000
+        assert "later" in List.flatten([result])
+        assert_receive {:DOWN, ^monitor, :process, ^worker, :normal}, 1_000
+      after
+        Process.exit(worker, :kill)
+        Ferricstore.Waiters.cleanup(worker)
+        FerricStore.del(key)
+        FerricStore.del(destination)
+      end
+    end
+  end
+
+  for command <- ["BLPOP", "BRPOP", "BLMPOP", "BLMOVE"] do
+    @command command
+    test "#{command} drains a multi-value push through FIFO waiter handoffs" do
+      key = "native:blocking:{fifo-#{System.unique_integer([:positive])}}:source"
+      ctx = FerricStore.Instance.get(:default)
+
+      state = %{
+        instance_ctx: ctx,
+        acl_cache: :full_access,
+        require_auth: false,
+        authenticated: true
+      }
+
+      on_exit(fn -> FerricStore.del(key) end)
+
+      workers =
+        for position <- 1..3 do
+          destination = key <> ":destination:#{position}"
+
+          args =
+            case @command do
+              "BLMPOP" -> ["0", "1", key, "LEFT"]
+              "BLMOVE" -> [key, destination, "LEFT", "RIGHT", "0"]
+              _ -> [key, "0"]
+            end
+
+          assert {:ok, prepared} =
+                   Session.prepare_command(%{"command" => @command, "args" => args})
+
+          meta = %{request_id: make_ref()}
+          assert {:ok, worker, monitor} = Blocking.start_prepared(prepared, state, meta)
+
+          on_exit(fn ->
+            Process.exit(worker, :kill)
+            Ferricstore.Waiters.cleanup(worker)
+            FerricStore.del(destination)
+          end)
+
+          assert wait_until(fn -> Ferricstore.Waiters.count(key) == position end) == :ok
+          {worker, monitor, meta}
+        end
+
+      assert 3 = Ferricstore.Commands.List.handle_ast({:rpush, [key, "one", "two", "three"]}, ctx)
+
+      expected =
+        if @command == "BRPOP", do: ["three", "two", "one"], else: ["one", "two", "three"]
+
+      for {{worker, monitor, meta}, value} <- Enum.zip(workers, expected) do
+        assert_receive {:native_blocking_response, ^meta, ^worker, :ok, result}, 1_000
+        assert value in List.flatten([result])
+        assert_receive {:DOWN, ^monitor, :process, ^worker, :normal}, 1_000
+      end
+
+      assert {:ok, 0} = FerricStore.llen(key)
+    end
+  end
+
   test "blocking results retain outbound capacity after the worker exits" do
     budget = start_outbound_budget(10_000)
     counter = OutboundBudget.new_counter()
@@ -157,6 +262,102 @@ defmodule FerricstoreServer.Native.BlockingTest do
     assert_receive {:DOWN, ^monitor_ref, :process, ^worker, :normal}, 1_000
     assert OutboundBudget.usage(counter) == 0
     assert ResourceBudget.usage(budget).outbound_bytes == 0
+  end
+
+  test "completed list-worker cleanup does not scale with unrelated waiter keys" do
+    budget = start_outbound_budget(1_000_000)
+    ctx = FerricStore.Instance.get(:default)
+    key = "native:blocking:cleanup-cost:#{System.unique_integer([:positive])}"
+
+    measure = fn ->
+      assert {:ok, 1} = FerricStore.rpush(key, ["value"])
+      {:ok, prepared} = Session.prepare_command(%{"command" => "BLPOP", "args" => [key, "0"]})
+
+      state = %{
+        instance_ctx: ctx,
+        acl_cache: :full_access,
+        require_auth: false,
+        authenticated: true,
+        resource_budget: budget,
+        outbound_counter: OutboundBudget.new_counter(),
+        max_outbound_bytes: 1_000_000
+      }
+
+      meta = %{request_id: make_ref()}
+      {:ok, worker, monitor} = Blocking.start_prepared(prepared, state, meta)
+
+      try do
+        assert_receive {:native_blocking_response_budgeted, ^meta, ^worker, :ok, [^key, "value"],
+                        lease},
+                       1_000
+
+        {:reductions, reductions} = Process.info(worker, :reductions)
+        :ok = OutboundBudget.release(lease)
+        send(worker, {:native_blocking_outbound_released, lease.resource_token})
+        assert_receive {:DOWN, ^monitor, :process, ^worker, :normal}, 1_000
+        reductions
+      after
+        Process.exit(worker, :kill)
+      end
+    end
+
+    try do
+      small = measure.()
+      for i <- 1..4_096, do: Ferricstore.Waiters.register("#{key}:unrelated:#{i}", self(), 0)
+      large = measure.()
+      assert large < small * 2, "cleanup work grew from #{small} to #{large} reductions"
+      assert Ferricstore.Waiters.count("#{key}:unrelated:1") == 1
+    after
+      Ferricstore.Waiters.cleanup(self())
+      FerricStore.del(key)
+    end
+  end
+
+  test "a completed multi-key pop unregisters every watched key before worker exit" do
+    budget = start_outbound_budget(1_000_000)
+    first = "native:blocking:multi-cleanup:#{System.unique_integer([:positive])}"
+    second = first <> ":second"
+
+    {:ok, prepared} =
+      Session.prepare_command(%{"command" => "BLPOP", "args" => [first, second, first, "0"]})
+
+    state = %{
+      instance_ctx: FerricStore.Instance.get(:default),
+      acl_cache: :full_access,
+      require_auth: false,
+      authenticated: true,
+      resource_budget: budget,
+      outbound_counter: OutboundBudget.new_counter(),
+      max_outbound_bytes: 1_000_000
+    }
+
+    meta = %{request_id: make_ref()}
+    {:ok, worker, monitor} = Blocking.start_prepared(prepared, state, meta)
+
+    try do
+      assert :ok =
+               wait_until(fn ->
+                 Ferricstore.Waiters.count(first) == 1 and Ferricstore.Waiters.count(second) == 1
+               end)
+
+      assert {:ok, 1} = FerricStore.rpush(second, ["value"])
+
+      assert_receive {:native_blocking_response_budgeted, ^meta, ^worker, :ok, [^second, "value"],
+                      lease},
+                     1_000
+
+      assert Process.alive?(worker)
+      assert Ferricstore.Waiters.count(first) == 0
+      assert Ferricstore.Waiters.count(second) == 0
+      :ok = OutboundBudget.release(lease)
+      send(worker, {:native_blocking_outbound_released, lease.resource_token})
+      assert_receive {:DOWN, ^monitor, :process, ^worker, :normal}, 1_000
+    after
+      Process.exit(worker, :kill)
+      Ferricstore.Waiters.cleanup(worker)
+      FerricStore.del(first)
+      FerricStore.del(second)
+    end
   end
 
   test "blocking result overflow emits a bounded close signal without the result" do

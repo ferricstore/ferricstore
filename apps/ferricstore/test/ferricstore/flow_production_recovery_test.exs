@@ -255,8 +255,9 @@ defmodule Ferricstore.FlowProductionRecoveryTest do
       {:ok, _expired_query_row} -> :ok
     end
 
-    assert {:ok, _cleanup} =
-             FerricStore.flow_retention_cleanup(limit: 10, now_ms: cancel_now_ms + 10_000)
+    # Cleanup is a bounded, paginated API. A successful first page does not
+    # imply the terminal phase has visited this cold row after recovery.
+    cleanup_pages = drain_retention_pages(cancel_now_ms + 10_000, nil, 64, [])
 
     assert :ok =
              Ferricstore.Flow.LMDBWriter.flush_all(
@@ -268,8 +269,29 @@ defmodule Ferricstore.FlowProductionRecoveryTest do
     assert :ok =
              ShardHelpers.eventually(
                fn -> LMDB.get(lmdb_path, state_key) == :not_found end,
-               "retention cleanup should delete the expired QueryRow"
+               "retention cleanup should delete the expired QueryRow; pages=#{inspect(cleanup_pages)}"
              )
+  end
+
+  defp drain_retention_pages(_now, _continuation, 0, pages),
+    do: flunk("retention cleanup did not complete within 64 bounded pages: #{inspect(pages)}")
+
+  defp drain_retention_pages(now, continuation, remaining, pages) do
+    assert {:ok, page} =
+             FerricStore.flow_retention_cleanup(
+               limit: 10,
+               now_ms: now,
+               continuation: continuation
+             )
+
+    pages = [page | pages]
+
+    if page.more? do
+      assert is_binary(page.continuation)
+      drain_retention_pages(now, page.continuation, remaining - 1, pages)
+    else
+      Enum.reverse(pages)
+    end
   end
 
   defp start_background_projection_work(ctx) do

@@ -13,11 +13,14 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   alias Ferricstore.Flow.LMDBWriter.ProjectionOps
   alias Ferricstore.Flow.PolicyMirrorRecovery
   alias Ferricstore.Flow.PolicyMigration
-  alias Ferricstore.Flow.Query.{CompositeProjection, QueryRowCodec, SourceCatalog}
+  alias Ferricstore.Flow.Query.{CompositeProjection, Limits, QueryRowCodec, SourceCatalog}
   alias Ferricstore.Flow.SharedRefBackfill
   alias Ferricstore.Store.Shard.ZSetIndex
 
   @batch_size 512
+  # State reconciliation prefetches one composite reverse row per source.
+  # Keep its entire page inside the projection admission bound.
+  @state_page_size min(@batch_size, Limits.max_projection_page_records())
   @max_reconcile_source_retries 2
   @default_history_projection_page_size 4_096
   @max_history_projection_page_size 65_536
@@ -1952,7 +1955,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   end
 
   defp safe_select_initial_state_entry_page(keydir) do
-    {:ok, :ets.select(keydir, keydir_match_spec(), @batch_size)}
+    {:ok, :ets.select(keydir, keydir_match_spec(), @state_page_size)}
   rescue
     ArgumentError -> {:error, :source_keydir_unavailable}
   end
@@ -1967,7 +1970,8 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     :ets.safe_fixtable(keydir, true)
 
     try do
-      {:ok, state_entry_chunk_present?(:ets.select(keydir, keydir_match_spec(), @batch_size))}
+      {:ok,
+       state_entry_chunk_present?(:ets.select(keydir, keydir_match_spec(), @state_page_size))}
     after
       :ets.safe_fixtable(keydir, false)
     end

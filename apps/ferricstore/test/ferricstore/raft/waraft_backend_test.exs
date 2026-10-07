@@ -48,6 +48,9 @@ Code.require_file(
   __DIR__
 )
 
+Code.require_file("waraft_backend_test/sections/snapshot_copy_durability.exs", __DIR__)
+Code.require_file("waraft_backend_test/sections/startup_storage_deadline.exs", __DIR__)
+
 Code.require_file(
   "waraft_backend_test/sections/startup_finalizes_interrupted_snapshot_swap_after_metadata_persisted.exs",
   __DIR__
@@ -243,6 +246,9 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
   use Ferricstore.Raft.WARaftBackendTest.Sections.RestartRecoversMissingCurrentStorageMetadataUsingPreviousDurable
 
   use Ferricstore.Raft.WARaftBackendTest.Sections.StorageRejectsSnapshotPayloadDirRemovedAfterVerification
+
+  use Ferricstore.Raft.WARaftBackendTest.Sections.SnapshotCopyDurability
+  use Ferricstore.Raft.WARaftBackendTest.Sections.StartupStorageDeadline
 
   use Ferricstore.Raft.WARaftBackendTest.Sections.StartupFinalizesInterruptedSnapshotSwapAfterMetadataPersisted
 

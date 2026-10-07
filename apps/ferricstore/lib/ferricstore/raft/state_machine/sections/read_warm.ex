@@ -1557,38 +1557,40 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
                length(entries)
              ) do
           {:ok, locations} ->
-            entries
-            |> Enum.zip(disk_entries)
-            |> Enum.zip(locations)
-            |> Enum.each(fn {{{compound_key, value, expire_at_ms}, {_key, disk_val, _exp}},
-                             {offset, value_size}} ->
-              ets_val = value_for_ets(value, hot_cache_threshold(state))
-              track_keydir_binary_delta(state, compound_key, ets_val, expire_at_ms)
+            Ferricstore.Store.PromotedPublication.publish(state, fn ->
+              entries
+              |> Enum.zip(disk_entries)
+              |> Enum.zip(locations)
+              |> Enum.each(fn {{{compound_key, value, expire_at_ms}, {_key, disk_val, _exp}},
+                               {offset, value_size}} ->
+                ets_val = value_for_ets(value, hot_cache_threshold(state))
+                track_keydir_binary_delta(state, compound_key, ets_val, expire_at_ms)
 
-              :ets.insert(
-                state.ets,
-                {compound_key, ets_val, expire_at_ms, LFU.initial(), fid, offset, value_size}
+                :ets.insert(
+                  state.ets,
+                  {compound_key, ets_val, expire_at_ms, LFU.initial(), fid, offset, value_size}
+                )
+
+                CompoundMemberIndex.put(
+                  Map.get(state, :compound_member_index_name),
+                  compound_key,
+                  expire_at_ms
+                )
+
+                sm_tx_put_pending(compound_key, value, expire_at_ms)
+
+                zset_index_put(state, redis_key, compound_key, disk_val)
+              end)
+
+              queue_promoted_maintenance_after_flush(redis_key, maintenance)
+
+              queue_promoted_revision_puts_after_flush(
+                Map.get(state, :compound_revision_index_name),
+                Enum.map(entries, fn {compound_key, _value, _expire_at_ms} -> compound_key end)
               )
 
-              CompoundMemberIndex.put(
-                Map.get(state, :compound_member_index_name),
-                compound_key,
-                expire_at_ms
-              )
-
-              sm_tx_put_pending(compound_key, value, expire_at_ms)
-
-              zset_index_put(state, redis_key, compound_key, disk_val)
+              :ok
             end)
-
-            queue_promoted_maintenance_after_flush(redis_key, maintenance)
-
-            queue_promoted_revision_puts_after_flush(
-              Map.get(state, :compound_revision_index_name),
-              Enum.map(entries, fn {compound_key, _value, _expire_at_ms} -> compound_key end)
-            )
-
-            :ok
 
           {:error, _reason} = error ->
             error
@@ -1730,27 +1732,29 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         case NIF.v2_append_ops_batch(active, ops) do
           {:ok, locations} ->
             with :ok <- validate_promoted_tombstone_batch(locations, length(compound_keys)) do
-              Enum.each(compound_keys, fn compound_key ->
-                track_keydir_binary_remove(state, compound_key)
-                :ets.delete(state.ets, compound_key)
+              Ferricstore.Store.PromotedPublication.publish(state, fn ->
+                Enum.each(compound_keys, fn compound_key ->
+                  track_keydir_binary_remove(state, compound_key)
+                  :ets.delete(state.ets, compound_key)
 
-                CompoundMemberIndex.delete(
-                  Map.get(state, :compound_member_index_name),
-                  compound_key
+                  CompoundMemberIndex.delete(
+                    Map.get(state, :compound_member_index_name),
+                    compound_key
+                  )
+
+                  sm_tx_mark_deleted(compound_key)
+                  zset_index_delete(state, redis_key, compound_key)
+                end)
+
+                queue_promoted_maintenance_after_flush(redis_key, maintenance)
+
+                queue_promoted_revision_deletes_after_flush(
+                  Map.get(state, :compound_revision_index_name),
+                  compound_keys
                 )
 
-                sm_tx_mark_deleted(compound_key)
-                zset_index_delete(state, redis_key, compound_key)
+                :ok
               end)
-
-              queue_promoted_maintenance_after_flush(redis_key, maintenance)
-
-              queue_promoted_revision_deletes_after_flush(
-                Map.get(state, :compound_revision_index_name),
-                compound_keys
-              )
-
-              :ok
             end
 
           {:error, _reason} = err ->
@@ -1885,29 +1889,31 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           {:ok, {offset, _record_size}} ->
             value_size = byte_size(disk_val)
 
-            track_keydir_binary_delta(state, compound_key, value_for, expire_at_ms)
+            Ferricstore.Store.PromotedPublication.publish(state, fn ->
+              track_keydir_binary_delta(state, compound_key, value_for, expire_at_ms)
 
-            :ets.insert(
-              state.ets,
-              {compound_key, value_for, expire_at_ms, LFU.initial(), fid, offset, value_size}
-            )
+              :ets.insert(
+                state.ets,
+                {compound_key, value_for, expire_at_ms, LFU.initial(), fid, offset, value_size}
+              )
 
-            CompoundMemberIndex.put(
-              Map.get(state, :compound_member_index_name),
-              compound_key,
-              expire_at_ms
-            )
+              CompoundMemberIndex.put(
+                Map.get(state, :compound_member_index_name),
+                compound_key,
+                expire_at_ms
+              )
 
-            sm_tx_put_pending(compound_key, value, expire_at_ms)
+              sm_tx_put_pending(compound_key, value, expire_at_ms)
 
-            queue_promoted_maintenance_after_flush(redis_key, maintenance)
+              queue_promoted_maintenance_after_flush(redis_key, maintenance)
 
-            queue_promoted_revision_put_after_flush(
-              Map.get(state, :compound_revision_index_name),
-              compound_key
-            )
+              queue_promoted_revision_put_after_flush(
+                Map.get(state, :compound_revision_index_name),
+                compound_key
+              )
 
-            :ok
+              :ok
+            end)
 
           {:error, _reason} = err ->
             err

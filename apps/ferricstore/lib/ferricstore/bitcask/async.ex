@@ -23,34 +23,43 @@ defmodule Ferricstore.Bitcask.Async do
 
   @spec await(submit_fun(), timeout()) :: result()
   def await(submit_fun, timeout_ms) do
+    caller = self()
     parent = :erlang.alias()
     ref = make_ref()
     corr_id = System.unique_integer([:positive, :monotonic])
 
-    proxy =
-      spawn(fn ->
+    {proxy, proxy_monitor} =
+      spawn_monitor(fn ->
+        caller_monitor = Process.monitor(caller)
+
+        # This one-shot process exits after replying or cancellation. BEAM
+        # removes its caller monitor on exit, including exceptional exits.
         case submit(submit_fun, corr_id) do
-          :ok -> proxy_receive(parent, ref, corr_id, timeout_ms)
+          :ok -> proxy_receive(parent, ref, corr_id, caller_monitor)
           {:error, _reason} = error -> maybe_send_result(parent, ref, error)
         end
       end)
 
-    receive do
-      {^ref, result} ->
-        cleanup_alias(parent, ref)
-        result
+    try do
+      receive do
+        {^ref, result} ->
+          result
+
+        {:DOWN, ^proxy_monitor, :process, ^proxy, reason} ->
+          {:error, {:proxy_exit, reason}}
+      after
+        timeout_ms ->
+          receive do
+            {^ref, result} -> result
+          after
+            0 ->
+              stop_proxy(proxy, ref)
+              {:error, :timeout}
+          end
+      end
     after
-      timeout_ms ->
-        receive do
-          {^ref, result} ->
-            cleanup_alias(parent, ref)
-            result
-        after
-          0 ->
-            cleanup_alias(parent, ref)
-            stop_proxy(proxy, ref)
-            {:error, :timeout}
-        end
+      cleanup_alias(parent, ref)
+      Process.demonitor(proxy_monitor, [:flush])
     end
   end
 
@@ -66,7 +75,7 @@ defmodule Ferricstore.Bitcask.Async do
     kind, reason -> {:error, {:submit_failed, kind, reason}}
   end
 
-  defp proxy_receive(parent, ref, corr_id, timeout_ms) do
+  defp proxy_receive(parent, ref, corr_id, caller_monitor) do
     receive do
       {:tokio_complete, ^corr_id, :ok} ->
         maybe_send_result(parent, ref, {:ok, :ok})
@@ -79,8 +88,8 @@ defmodule Ferricstore.Bitcask.Async do
 
       {^ref, :cancel} ->
         :ok
-    after
-      timeout_ms ->
+
+      {:DOWN, ^caller_monitor, :process, _caller, _reason} ->
         :ok
     end
   end

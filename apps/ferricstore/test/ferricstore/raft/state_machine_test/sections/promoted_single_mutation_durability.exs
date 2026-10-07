@@ -622,6 +622,491 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.PromotedSingleMutationDurab
         %{state | shard_index: 0, instance_ctx: instance_ctx}
       end
 
+      @tag :promoted_single_mutation_durability
+      test "actual promoted apply batches keep their epoch across separate append phases", %{
+        state: state,
+        ets: ets
+      } do
+        key = "promoted-apply-publication-phases"
+        fields = Enum.map(["a", "b"], &CompoundKey.hash_field(key, &1))
+        state = promoted_publication_test_state(state)
+
+        {state, _path} =
+          promoted_single_fixture(state, ets, 0, key, :hash, Enum.map(fields, &{&1, "old", 0}))
+
+        parent = self()
+
+        writer =
+          Task.async(fn ->
+            Process.put(:ferricstore_promoted_publication_hook, fn ->
+              count = Process.get(:publication_phase, 0) + 1
+              Process.put(:publication_phase, count)
+
+              if count == 2 do
+                send(parent, {:between_publications, self()})
+
+                receive do
+                  :continue -> :ok
+                after
+                  5_000 -> raise "publication timeout"
+                end
+              end
+            end)
+
+            StateMachine.apply(
+              %{},
+              {:batch, Enum.map(fields, &{:compound_put, &1, "new", 0})},
+              state
+            )
+          end)
+
+        assert_receive {:between_publications, publisher}, 2_000
+        assert :ets.lookup_element(ets, hd(fields), 2) == "new"
+        assert :ets.lookup_element(ets, List.last(fields), 2) == "old"
+
+        reader =
+          Task.async(fn ->
+            Ferricstore.Store.PromotedPublication.read(state.instance_ctx, 0, fn ->
+              Enum.map(fields, &:ets.lookup_element(ets, &1, 2))
+            end)
+          end)
+
+        try do
+          assert Task.yield(reader, 20) == nil
+          send(publisher, :continue)
+          assert {_state, {:ok, [:ok, :ok]}} = Task.await(writer)
+          assert Task.await(reader) == ["new", "new"]
+        after
+          send(publisher, :continue)
+          Task.shutdown(writer, :brutal_kill)
+          Task.shutdown(reader, :brutal_kill)
+        end
+      end
+
+      @tag :promoted_single_mutation_durability
+      test "actual promoted apply errors after publication keep the shortcut fenced", %{
+        state: state,
+        ets: ets
+      } do
+        key = "promoted-apply-later-error"
+        field = CompoundKey.hash_field(key, "a")
+        state = promoted_publication_test_state(state)
+        {state, _path} = promoted_single_fixture(state, ets, 0, key, :hash, [{field, "old", 0}])
+
+        Process.put(:ferricstore_promoted_append_hook, fn :record, _path, _payload ->
+          if Process.get(:published_once, false) do
+            {:error, :forced_later_append_failure}
+          else
+            Process.put(:published_once, true)
+            :passthrough
+          end
+        end)
+
+        try do
+          {_state, result} =
+            StateMachine.apply(
+              %{},
+              {:batch, [{:compound_put, field, "new", 0}, {:compound_put, field, "later", 0}]},
+              state
+            )
+
+          refute result == {:ok, [:ok, :ok]}
+
+          assert Ferricstore.Store.PromotedPublication.read(state.instance_ctx, 0, fn ->
+                   :ets.lookup_element(ets, field, 2)
+                 end) == :fallback
+        after
+          Process.delete(:ferricstore_promoted_append_hook)
+          Process.delete(:published_once)
+        end
+      end
+
+      @tag :promoted_single_mutation_durability
+      test "failed actual promoted transaction publication retains its failure fence", %{
+        state: state,
+        ets: ets
+      } do
+        key = "promoted-transaction-publication-failure"
+        field = CompoundKey.hash_field(key, "a")
+        state = promoted_publication_test_state(state)
+        {state, _path} = promoted_single_fixture(state, ets, 0, key, :hash, [{field, "old", 0}])
+        previous = Application.get_env(:ferricstore, :cross_shard_transaction_hook)
+
+        Application.put_env(:ferricstore, :cross_shard_transaction_hook, fn
+          {:published_group, _idx} -> raise "forced transaction publication failure"
+          _event -> :ok
+        end)
+
+        try do
+          assert_raise RuntimeError, "forced transaction publication failure", fn ->
+            StateMachine.apply(%{}, {:tx_execute, [{"HSET", [key, "a", "new"]}], nil}, state)
+          end
+
+          assert Ferricstore.Store.PromotedPublication.read(state.instance_ctx, 0, fn ->
+                   :ets.lookup_element(ets, field, 2)
+                 end) == :fallback
+        after
+          if previous,
+            do: Application.put_env(:ferricstore, :cross_shard_transaction_hook, previous),
+            else: Application.delete_env(:ferricstore, :cross_shard_transaction_hook)
+        end
+      end
+
+      defp promoted_publication_test_state(state) do
+        state = promoted_cleanup_test_state(state)
+
+        ctx = %{
+          state.instance_ctx
+          | publication_epoch: :atomics.new(1, signed: false),
+            keydir_refs: {state.ets}
+        }
+
+        %{state | instance_ctx: ctx}
+      end
+
+      @tag :promoted_single_mutation_durability
+      test "single HSET rejects an invalid cold field before durable publication", %{
+        state: state,
+        ets: ets
+      } do
+        key = "promoted-single-invalid-cold-field"
+        field = CompoundKey.hash_field(key, "field")
+        state = promoted_publication_test_state(state)
+        {state, path} = promoted_single_fixture(state, ets, 0, key, :hash, [{field, "old", 0}])
+        [row] = :ets.lookup(ets, field)
+        invalid = row |> put_elem(1, nil) |> put_elem(5, :invalid_offset)
+        :ets.insert(ets, invalid)
+        before_size = File.stat!(path).size
+
+        assert {_state, {:error, _reason}} =
+                 StateMachine.apply(%{}, {:hset_single, key, "field", "new"}, state)
+
+        assert :ets.lookup(ets, field) == [invalid]
+        assert File.stat!(path).size == before_size
+      end
+
+      @tag :promoted_single_mutation_durability
+      test "consecutive promoted HSETs share one validated durable append and ordered counts", %{
+        state: state,
+        ets: ets
+      } do
+        key = "promoted-hset-group-commit"
+        field = CompoundKey.hash_field(key, "existing")
+        state = promoted_publication_test_state(state)
+        {state, _path} = promoted_single_fixture(state, ets, 0, key, :hash, [{field, "old", 0}])
+        counter = make_ref()
+        Process.put(counter, [])
+
+        Process.put(:ferricstore_promoted_append_hook, fn operation, _path, _payload ->
+          Process.put(counter, [operation | Process.get(counter)])
+          :passthrough
+        end)
+
+        try do
+          assert {_state, {:ok, [0, 1, 0]}} =
+                   StateMachine.apply_waraft_segment_command(
+                     {:batch,
+                      [
+                        {:hset_single, key, "existing", "new"},
+                        {:hset_single, key, "missing", "first"},
+                        {:hset_single, key, "missing", "last"}
+                      ]},
+                     %{},
+                     state,
+                     fn _batch -> flunk("promoted group unexpectedly used shared projection") end
+                   )
+
+          assert Process.get(counter) == [:batch]
+          assert :ets.lookup_element(ets, field, 2) == "new"
+          assert :ets.lookup_element(ets, CompoundKey.hash_field(key, "missing"), 2) == "last"
+        after
+          Process.delete(counter)
+          Process.delete(:ferricstore_promoted_append_hook)
+        end
+      end
+
+      @tag :promoted_single_mutation_durability
+      test "promoted HSET groups reject malformed append results before publishing", %{
+        state: state,
+        ets: ets
+      } do
+        key = "hset-group-invalid-append"
+        state = promoted_publication_test_state(state)
+        fields = Enum.map(["a", "b"], &CompoundKey.hash_field(key, &1))
+
+        {state, path} =
+          promoted_single_fixture(state, ets, 0, key, :hash, Enum.map(fields, &{&1, "old", 0}))
+
+        before = Enum.map(fields, &:ets.lookup(ets, &1))
+        size = File.stat!(path).size
+
+        Process.put(:ferricstore_promoted_append_hook, fn :batch, _, _ ->
+          {:ok, [{-1, 3}, {0, 3}]}
+        end)
+
+        try do
+          assert {_state, {:error, _}} =
+                   StateMachine.apply_waraft_segment_command(
+                     {:batch, Enum.map(["a", "b"], &{:hset_single, key, &1, "new"})},
+                     %{},
+                     state,
+                     fn _ -> flunk("unexpected shared projection") end
+                   )
+
+          assert Enum.map(fields, &:ets.lookup(ets, &1)) == before
+          assert File.stat!(path).size == size
+        after
+          Process.delete(:ferricstore_promoted_append_hook)
+        end
+      end
+
+      @tag :promoted_single_mutation_durability
+      test "cold-read failure in a HSET run remains fail-closed on the sequential fallback", %{
+        state: state,
+        ets: ets
+      } do
+        key = "hset-group-cold-fallback"
+        state = promoted_publication_test_state(state)
+        fields = Enum.map(["a", "b"], &CompoundKey.hash_field(key, &1))
+
+        {state, path} =
+          promoted_single_fixture(state, ets, 0, key, :hash, Enum.map(fields, &{&1, "old", 0}))
+
+        [row] = :ets.lookup(ets, hd(fields))
+        :ets.insert(ets, row |> put_elem(1, nil) |> put_elem(5, :invalid_offset))
+        before = Enum.map(fields, &:ets.lookup(ets, &1))
+        size = File.stat!(path).size
+
+        assert {_state, {:error, _}} =
+                 StateMachine.apply_waraft_segment_command(
+                   {:batch, Enum.map(["a", "b"], &{:hset_single, key, &1, "new"})},
+                   %{},
+                   state,
+                   fn _ -> flunk("unexpected shared projection") end
+                 )
+
+        assert Enum.map(fields, &:ets.lookup(ets, &1)) == before
+        assert File.stat!(path).size == size
+      end
+
+      @tag :promoted_single_mutation_durability
+      test "a non-HSET command remains an ordering barrier between promoted writes", %{
+        state: state,
+        ets: ets
+      } do
+        key = "hset-group-ordering"
+        state = promoted_publication_test_state(state)
+        field = CompoundKey.hash_field(key, "counter")
+        {state, _path} = promoted_single_fixture(state, ets, 0, key, :hash, [{field, "0", 0}])
+
+        assert {_state, {:ok, [0, 2, 0]}} =
+                 StateMachine.apply_waraft_segment_command(
+                   {:batch,
+                    [
+                      {:hset_single, key, "counter", "1"},
+                      {:hincrby, key, "counter", 1},
+                      {:hset_single, key, "counter", "3"}
+                    ]},
+                   %{},
+                   state,
+                   fn _ -> flunk("unexpected shared projection") end
+                 )
+
+        assert :ets.lookup_element(ets, field, 2) == "3"
+      end
+
+      @tag :promoted_single_mutation_durability
+      test "a large HSET run is split at the bounded group size with exact reply ordering", %{
+        state: state,
+        ets: ets
+      } do
+        key = "hset-group-bounds"
+        state = promoted_publication_test_state(state)
+        {state, _path} = promoted_single_fixture(state, ets, 0, key, :hash, [])
+        counter = make_ref()
+        Process.put(counter, [])
+
+        Process.put(:ferricstore_promoted_append_hook, fn operation, _, payload ->
+          width = if operation == :batch, do: length(payload), else: 1
+          Process.put(counter, [{operation, width} | Process.get(counter)])
+          :passthrough
+        end)
+
+        try do
+          assert {_state, {:ok, replies}} =
+                   StateMachine.apply_waraft_segment_command(
+                     {:batch, Enum.map(1..129, &{:hset_single, key, "field-#{&1}", "value"})},
+                     %{},
+                     state,
+                     fn _ -> flunk("unexpected shared projection") end
+                   )
+
+          assert replies == List.duplicate(1, 129)
+          assert Process.get(counter) == [{:record, 1}, {:batch, 128}]
+        after
+          Process.delete(counter)
+          Process.delete(:ferricstore_promoted_append_hook)
+        end
+      end
+
+      @tag :promoted_single_mutation_durability
+      test "grouped HSET values recover from the dedicated log into a fresh keydir", %{
+        state: state,
+        ets: ets
+      } do
+        key = "hset-group-recovery"
+        state = promoted_publication_test_state(state)
+        a = CompoundKey.hash_field(key, "a")
+        b = CompoundKey.hash_field(key, "b")
+        {state, path} = promoted_single_fixture(state, ets, 0, key, :hash, [{a, "old", 0}])
+
+        assert {_state, {:ok, [0, 1, 0]}} =
+                 StateMachine.apply_waraft_segment_command(
+                   {:batch,
+                    [
+                      {:hset_single, key, "a", "new"},
+                      {:hset_single, key, "b", "first"},
+                      {:hset_single, key, "b", "last"}
+                    ]},
+                   %{},
+                   state,
+                   fn _ -> flunk("unexpected shared projection") end
+                 )
+
+        fresh = :ets.new(:group_recovered_keydir, [:ordered_set, :public])
+        :ets.insert(fresh, :ets.lookup(ets, Promotion.marker_key(key)))
+        recovered = Promotion.recover_promoted(state.shard_data_path, fresh, state.data_dir, 0)
+        assert Map.has_key?(recovered, key)
+
+        for {field, value} <- [{a, "new"}, {b, "last"}] do
+          assert [{^field, _cached, 0, _lfu, 0, offset, _size}] = :ets.lookup(fresh, field)
+          assert {:ok, ^value} = NIF.v2_pread_at(path, offset)
+        end
+      end
+
+      @tag :promoted_single_mutation_durability
+      test "readers wait for grouped HSET publication after its durable append", %{
+        state: state,
+        ets: ets
+      } do
+        key = "hset-group-publication"
+        state = promoted_publication_test_state(state)
+        fields = Enum.map(["a", "b"], &CompoundKey.hash_field(key, &1))
+
+        {state, path} =
+          promoted_single_fixture(state, ets, 0, key, :hash, Enum.map(fields, &{&1, "old", 0}))
+
+        parent = self()
+
+        writer =
+          Task.async(fn ->
+            Process.put(:ferricstore_promoted_publication_hook, fn ->
+              send(parent, {:group_before_publish, self()})
+
+              receive do
+                :continue -> :ok
+              after
+                5_000 -> raise "group publication timeout"
+              end
+            end)
+
+            StateMachine.apply_waraft_segment_command(
+              {:batch, Enum.map(["a", "b"], &{:hset_single, key, &1, "new"})},
+              %{},
+              state,
+              fn _ -> flunk("unexpected shared projection") end
+            )
+          end)
+
+        assert_receive {:group_before_publish, publisher}, 2_000
+        for field <- fields, do: assert_promoted_value(path, field, "new")
+        assert Enum.map(fields, &:ets.lookup_element(ets, &1, 2)) == ["old", "old"]
+
+        reader =
+          Task.async(fn ->
+            Ferricstore.Store.PromotedPublication.read(state.instance_ctx, 0, fn ->
+              Enum.map(fields, &:ets.lookup_element(ets, &1, 2))
+            end)
+          end)
+
+        try do
+          assert Task.yield(reader, 20) == nil
+          send(publisher, :continue)
+          assert {_state, {:ok, [0, 0]}} = Task.await(writer)
+          assert Task.await(reader) == ["new", "new"]
+        after
+          send(publisher, :continue)
+          Task.shutdown(writer, :brutal_kill)
+          Task.shutdown(reader, :brutal_kill)
+        end
+      end
+
+      @tag :promoted_single_mutation_durability
+      test "an expired field in a HSET run uses sequential TTL-aware insertion counts", %{
+        state: state,
+        ets: ets
+      } do
+        key = "hset-group-expiry"
+        state = promoted_publication_test_state(state)
+        field = CompoundKey.hash_field(key, "a")
+        {state, path} = promoted_single_fixture(state, ets, 0, key, :hash, [{field, "old", 1}])
+
+        assert {_state, {:ok, [1, 0]}} =
+                 StateMachine.apply_waraft_segment_command(
+                   {:batch,
+                    [{:hset_single, key, "a", "first"}, {:hset_single, key, "a", "last"}]},
+                   %{system_time: 1_000},
+                   state,
+                   fn _ -> flunk("unexpected shared projection") end
+                 )
+
+        assert [{^field, "last", 0, _, _, _, _}] = :ets.lookup(ets, field)
+        assert_promoted_value(path, field, "last")
+      end
+
+      @tag :promoted_single_mutation_durability
+      test "a HSET run splits at the byte bound before the command-count bound", %{
+        state: state,
+        ets: ets
+      } do
+        key = "hset-group-byte-bound"
+        state = promoted_publication_test_state(state)
+
+        state = %{
+          state
+          | instance_ctx: %{state.instance_ctx | blob_side_channel_threshold_bytes: 0}
+        }
+
+        {state, _path} = promoted_single_fixture(state, ets, 0, key, :hash, [])
+        value = :binary.copy("x", 400_000)
+        Process.put(:group_append_widths, [])
+
+        Process.put(:ferricstore_promoted_append_hook, fn operation, _, payload ->
+          width = if operation == :batch, do: length(payload), else: 1
+
+          Process.put(:group_append_widths, [
+            {operation, width} | Process.get(:group_append_widths)
+          ])
+
+          :passthrough
+        end)
+
+        try do
+          assert {_state, {:ok, [1, 1, 1]}} =
+                   StateMachine.apply_waraft_segment_command(
+                     {:batch, Enum.map(["a", "b", "c"], &{:hset_single, key, &1, value})},
+                     %{},
+                     state,
+                     fn _ -> flunk("unexpected shared projection") end
+                   )
+
+          assert Process.get(:group_append_widths) == [{:record, 1}, {:batch, 2}]
+        after
+          Process.delete(:group_append_widths)
+          Process.delete(:ferricstore_promoted_append_hook)
+        end
+      end
+
       defp promoted_single_fixture(state, ets, shard_index, redis_key, type, entries) do
         dedicated_path = Promotion.dedicated_path(state.data_dir, shard_index, type, redis_key)
         log_path = Path.join(dedicated_path, "00000.log")

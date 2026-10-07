@@ -167,7 +167,7 @@ defmodule FerricstoreServer.Native.Blocking do
           other -> native_result(other)
         end
       after
-        Waiters.cleanup(self())
+        cleanup_list_waiters(keys)
       end
     else
       {:error, reason} -> {:bad_request, reason}
@@ -177,18 +177,25 @@ defmodule FerricstoreServer.Native.Blocking do
   defp run_blmove(args, store) do
     with {:ok, source, destination, from_dir, to_dir, timeout_ms} <-
            BlockingCmd.parse_blmove_args(args) do
+      keys = [source]
+
       try do
-        case ListCmd.handle_ast({:lmove, source, destination, from_dir, to_dir}, store) do
+        move = fn ->
+          case ListCmd.handle_ast({:lmove, source, destination, from_dir, to_dir}, store) do
+            value when is_binary(value) -> finish_list_pop(keys, source, store, value)
+            other -> other
+          end
+        end
+
+        case move.() do
           nil ->
-            wait_for_list([source], timeout_ms, fn ->
-              ListCmd.handle_ast({:lmove, source, destination, from_dir, to_dir}, store)
-            end)
+            wait_for_list([source], timeout_ms, move)
 
           other ->
             native_result(other)
         end
       after
-        Waiters.cleanup(self())
+        cleanup_list_waiters(keys)
       end
     else
       {:error, reason} -> {:bad_request, reason}
@@ -205,7 +212,7 @@ defmodule FerricstoreServer.Native.Blocking do
           other -> native_result(other)
         end
       after
-        Waiters.cleanup(self())
+        cleanup_list_waiters(keys)
       end
     else
       {:error, reason} -> {:bad_request, reason}
@@ -241,7 +248,7 @@ defmodule FerricstoreServer.Native.Blocking do
       case ListCmd.handle_ast({ast_tag, key}, store) do
         nil -> {:cont, nil}
         {:error, _reason} = error -> {:halt, error}
-        value -> {:halt, [key, value]}
+        value -> {:halt, finish_list_pop(keys, key, store, [key, value])}
       end
     end)
   end
@@ -254,30 +261,63 @@ defmodule FerricstoreServer.Native.Blocking do
         nil -> {:cont, nil}
         [] -> {:cont, nil}
         {:error, _reason} = error -> {:halt, error}
-        value when is_list(value) -> {:halt, [key, value]}
-        value -> {:halt, [key, [value]]}
+        value when is_list(value) -> {:halt, finish_list_pop(keys, key, store, [key, value])}
+        value -> {:halt, finish_list_pop(keys, key, store, [key, [value]])}
       end
     end)
   end
 
+  defp cleanup_list_waiters(keys) do
+    # A list worker registers only its parsed keys. Binding the ETS key avoids
+    # scanning every unrelated blocked client on ordinary request completion.
+    Enum.each(keys, &Waiters.unregister(&1, self()))
+  end
+
+  defp finish_list_pop(keys, key, store, result) do
+    # A push wakes one waiter. Pass the wake-up along after consuming values,
+    # preserving FIFO without racing every blocked client for the same batch.
+    # Drop our registration first, including the register/recheck fast path.
+    cleanup_list_waiters(keys)
+
+    case ListCmd.handle_ast({:llen, key}, store) do
+      remaining when is_integer(remaining) and remaining > 0 -> Waiters.notify_push(key)
+      _empty_or_error -> :ok
+    end
+
+    result
+  end
+
   defp wait_for_list(keys, timeout_ms, pop_fun) do
     deadline = deadline(timeout_ms)
-    Enum.each(keys, &Waiters.register(&1, self(), waiter_deadline(deadline)))
+    register_and_wait_for_list(Enum.uniq(keys), deadline, pop_fun)
+  end
 
-    case pop_fun.() do
-      nil -> wait_list_loop(deadline, pop_fun)
-      other -> native_result(other)
+  defp register_and_wait_for_list(keys, deadline, pop_fun) do
+    if deadline_expired?(deadline) do
+      final_wait_result(pop_fun)
+    else
+      Enum.each(keys, fn key ->
+        Waiters.unregister(key, self())
+        Waiters.register(key, self(), waiter_deadline(deadline))
+      end)
+
+      # Recheck after registering to close the gap between a lost pop and the
+      # next push. Keep the original absolute deadline across all wake-ups.
+      case pop_fun.() do
+        nil -> wait_list_loop(keys, deadline, pop_fun)
+        other -> native_result(other)
+      end
     end
   end
 
-  defp wait_list_loop(deadline, pop_fun) do
+  defp wait_list_loop(keys, deadline, pop_fun) do
     if deadline_expired?(deadline) do
       final_wait_result(pop_fun)
     else
       receive do
         {:waiter_notify, _key} ->
           case pop_fun.() do
-            nil -> wait_list_loop(deadline, pop_fun)
+            nil -> register_and_wait_for_list(keys, deadline, pop_fun)
             other -> native_result(other)
           end
       after

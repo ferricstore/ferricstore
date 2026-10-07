@@ -225,6 +225,38 @@ defmodule FerricstoreServer.Native.ResourceBudgetTest do
     assert ResourceBudget.usage(name).executions == 0
   end
 
+  test "monitored owner death reclaims all its scoped resources and preserves other owners" do
+    name = :"native_resource_mixed_owner_#{System.unique_integer([:positive])}"
+    start_supervised!({ResourceBudget, name: name, scoped_sweep_interval_ms: 60_000})
+    assert {:ok, surviving} = ResourceBudget.acquire_scoped(name, :executions, 2)
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        {:ok, _tracked} = ResourceBudget.acquire(name, :lanes, self(), 1)
+        {:ok, _first} = ResourceBudget.acquire_scoped(name, :executions, 1)
+        {:ok, _second} = ResourceBudget.acquire_scoped(name, :executions, 1)
+        {:ok, _bytes} = ResourceBudget.acquire_scoped(name, :chunk_bytes, 7)
+        send(parent, :mixed_owner_ready)
+        Process.sleep(:infinity)
+      end)
+
+    try do
+      assert_receive :mixed_owner_ready
+      assert %{executions: 4, lanes: 1, chunk_bytes: 7} = ResourceBudget.usage(name)
+      Process.exit(owner, :kill)
+
+      assert eventually(fn ->
+               match?(%{executions: 2, lanes: 0, chunk_bytes: 0}, ResourceBudget.usage(name))
+             end)
+    after
+      Process.exit(owner, :kill)
+      ResourceBudget.release_scoped(surviving)
+    end
+
+    assert ResourceBudget.usage(name).executions == 0
+  end
+
   @tag :lock_free_resource_budget
   test "normal scoped lease accounting does not use the coordinator mailbox" do
     name = :"native_resource_scoped_fast_path_#{System.unique_integer([:positive])}"

@@ -38,6 +38,7 @@
     write_projection_batches_sync/2,
     compact_apply_projection/3,
     compact_apply_projection_stream/3,
+    reclaim_abandoned_rewrite_indexes/0,
     close_process_writers/1
 ]).
 
@@ -64,6 +65,7 @@
 -define(TRIM_FLOOR_FILE, "trim_floor.term").
 -define(RECORD_HEADER_SIZE, 8).
 -define(STARTUP_READ_AHEAD_BYTES, 1048576).
+-define(OFFSET_SCAN_READ_AHEAD_BYTES, 262144).
 -define(MAX_RECORD_BYTES, 1073741824).
 -define(MAX_DISK_READER_BATCH_RECORDS, 4096).
 -define(MAX_DISK_READER_BATCH_BYTES, 1073741824).

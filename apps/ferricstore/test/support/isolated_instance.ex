@@ -29,7 +29,11 @@ defmodule Ferricstore.Test.IsolatedInstance do
   """
   def checkout(opts \\ []) do
     name = :"test_instance_#{:erlang.unique_integer([:positive])}"
-    tmp_dir = Path.join(System.tmp_dir!(), "ferricstore_isolated_#{name}")
+    # unique_integer/1 only distinguishes names within one BEAM lifetime. An
+    # interrupted earlier run can leave metadata under the same name, so each
+    # checkout also needs a cross-VM-unique directory.
+    suffix = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+    tmp_dir = Path.join(System.tmp_dir!(), "ferricstore_isolated_#{name}_#{suffix}")
     File.mkdir_p!(tmp_dir)
 
     shard_count = Keyword.get(opts, :shard_count, 2)

@@ -283,6 +283,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.LeaderWait do
         :persistent_term.put(@shard_count_key, ctx.shard_count)
         :persistent_term.put(@inflight_bytes_key, :atomics.new(ctx.shard_count, signed: false))
         :persistent_term.put(@max_inflight_bytes_key, config.max_inflight_commit_bytes)
+        Ferricstore.Raft.WARaftBackend.HsetCadence.init(ctx.shard_count)
         SyncGate.init_shards(ctx.shard_count)
 
         :ok =

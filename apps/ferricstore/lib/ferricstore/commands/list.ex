@@ -182,15 +182,13 @@ defmodule Ferricstore.Commands.List do
     do: {:error, "ERR wrong number of arguments for 'rpoplpush' command"}
 
   def handle("LPUSHX", [key | elements], store) when elements != [] do
-    with :ok <- TypeRegistry.command_check_type(key, :list, store),
-         do: execute_list_op(key, store, {:lpushx, elements})
+    pushx_args([key | elements], store, :lpushx)
   end
 
   def handle("LPUSHX", _, _), do: {:error, "ERR wrong number of arguments for 'lpushx' command"}
 
   def handle("RPUSHX", [key | elements], store) when elements != [] do
-    with :ok <- TypeRegistry.command_check_type(key, :list, store),
-         do: execute_list_op(key, store, {:rpushx, elements})
+    pushx_args([key | elements], store, :rpushx)
   end
 
   def handle("RPUSHX", _, _), do: {:error, "ERR wrong number of arguments for 'rpushx' command"}
@@ -370,8 +368,15 @@ defmodule Ferricstore.Commands.List do
   defp rollback_new_list_type_marker(_key, _store, :ok, write_error), do: write_error
 
   defp pushx_args([key | elements], store, direction) when elements != [] do
-    with :ok <- TypeRegistry.command_check_type(key, :list, store),
-         do: execute_list_op(key, store, {direction, elements})
+    with :ok <- TypeRegistry.command_check_type(key, :list, store) do
+      result = execute_list_op(key, store, {direction, elements})
+
+      if is_integer(result) and result > 0 do
+        Ops.on_push(store, key)
+      end
+
+      result
+    end
   end
 
   defp pushx_args(_args, _store, :lpushx),

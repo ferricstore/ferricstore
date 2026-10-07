@@ -1,0 +1,1908 @@
+{
+  "trials": [
+    {
+      "case": "saturated",
+      "mode": "direct",
+      "trial": 1,
+      "operations": {
+        "hash_write": {
+          "count": 30274,
+          "max_us": 782039,
+          "p50_us": 60100,
+          "p95_us": 76600,
+          "p99_us": 89900,
+          "p999_us": 662000
+        },
+        "hash_read": {
+          "count": 60548,
+          "max_us": 575,
+          "p50_us": 8,
+          "p95_us": 20,
+          "p99_us": 32,
+          "p999_us": 69
+        },
+        "kv_read": {
+          "count": 30274,
+          "max_us": 234,
+          "p50_us": 6,
+          "p95_us": 13,
+          "p99_us": 21,
+          "p999_us": 44
+        },
+        "cycle": {
+          "count": 30258,
+          "max_us": 782073,
+          "p50_us": 60100,
+          "p95_us": 76500,
+          "p99_us": 89200,
+          "p999_us": 662000
+        }
+      },
+      "ops_per_second": 1004.508500857249,
+      "compactions": 8,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "retries": 0,
+          "shard": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "retries": 0,
+          "shard": 1
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "retries": 0,
+          "shard": 2
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "retries": 0,
+          "shard": 3
+        }
+      ]
+    },
+    {
+      "case": "saturated",
+      "mode": "direct",
+      "trial": 2,
+      "operations": {
+        "hash_write": {
+          "count": 30226,
+          "max_us": 802444,
+          "p50_us": 59800,
+          "p95_us": 77000,
+          "p99_us": 94300,
+          "p999_us": 713000
+        },
+        "hash_read": {
+          "count": 60452,
+          "max_us": 4688,
+          "p50_us": 8,
+          "p95_us": 20,
+          "p99_us": 31,
+          "p999_us": 69
+        },
+        "kv_read": {
+          "count": 30226,
+          "max_us": 366,
+          "p50_us": 6,
+          "p95_us": 12,
+          "p99_us": 20,
+          "p999_us": 42
+        },
+        "cycle": {
+          "count": 30210,
+          "max_us": 802480,
+          "p50_us": 59900,
+          "p95_us": 77000,
+          "p99_us": 93500,
+          "p999_us": 709000
+        }
+      },
+      "ops_per_second": 1002.8097317996552,
+      "compactions": 6,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "case": "saturated",
+      "mode": "direct",
+      "trial": 3,
+      "operations": {
+        "hash_write": {
+          "count": 30102,
+          "max_us": 797607,
+          "p50_us": 60400,
+          "p95_us": 77200,
+          "p99_us": 90400,
+          "p999_us": 719000
+        },
+        "hash_read": {
+          "count": 60204,
+          "max_us": 781,
+          "p50_us": 8,
+          "p95_us": 19,
+          "p99_us": 29,
+          "p999_us": 53
+        },
+        "kv_read": {
+          "count": 30102,
+          "max_us": 293,
+          "p50_us": 6,
+          "p95_us": 12,
+          "p99_us": 19,
+          "p999_us": 38
+        },
+        "cycle": {
+          "count": 30086,
+          "max_us": 797635,
+          "p50_us": 60500,
+          "p95_us": 77200,
+          "p99_us": 90500,
+          "p999_us": 719000
+        }
+      },
+      "ops_per_second": 998.8711680675402,
+      "compactions": 4,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "case": "saturated",
+      "mode": "coalesced",
+      "trial": 1,
+      "operations": {
+        "hash_write": {
+          "count": 46677,
+          "max_us": 701873,
+          "p50_us": 39000,
+          "p95_us": 44800,
+          "p99_us": 53100,
+          "p999_us": 503000
+        },
+        "hash_read": {
+          "count": 93354,
+          "max_us": 2364,
+          "p50_us": 5,
+          "p95_us": 17,
+          "p99_us": 24,
+          "p999_us": 40
+        },
+        "kv_read": {
+          "count": 46677,
+          "max_us": 94,
+          "p50_us": 4,
+          "p95_us": 10,
+          "p99_us": 17,
+          "p999_us": 28
+        },
+        "cycle": {
+          "count": 46661,
+          "max_us": 701885,
+          "p50_us": 39000,
+          "p95_us": 44800,
+          "p99_us": 53100,
+          "p999_us": 503000
+        }
+      },
+      "ops_per_second": 1548.8572043134097,
+      "compactions": 12,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "case": "saturated",
+      "mode": "coalesced",
+      "trial": 2,
+      "operations": {
+        "hash_write": {
+          "count": 46758,
+          "max_us": 688334,
+          "p50_us": 39000,
+          "p95_us": 44100,
+          "p99_us": 53900,
+          "p999_us": 499000
+        },
+        "hash_read": {
+          "count": 93516,
+          "max_us": 2797,
+          "p50_us": 5,
+          "p95_us": 17,
+          "p99_us": 24,
+          "p999_us": 41
+        },
+        "kv_read": {
+          "count": 46758,
+          "max_us": 145,
+          "p50_us": 4,
+          "p95_us": 10,
+          "p99_us": 17,
+          "p999_us": 26
+        },
+        "cycle": {
+          "count": 46742,
+          "max_us": 688347,
+          "p50_us": 39000,
+          "p95_us": 44100,
+          "p99_us": 53500,
+          "p999_us": 486000
+        }
+      },
+      "ops_per_second": 1551.742101644152,
+      "compactions": 12,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "case": "saturated",
+      "mode": "coalesced",
+      "trial": 3,
+      "operations": {
+        "hash_write": {
+          "count": 46615,
+          "max_us": 687289,
+          "p50_us": 39000,
+          "p95_us": 45000,
+          "p99_us": 55900,
+          "p999_us": 491000
+        },
+        "hash_read": {
+          "count": 93230,
+          "max_us": 349,
+          "p50_us": 5,
+          "p95_us": 17,
+          "p99_us": 24,
+          "p999_us": 42
+        },
+        "kv_read": {
+          "count": 46615,
+          "max_us": 244,
+          "p50_us": 4,
+          "p95_us": 10,
+          "p99_us": 17,
+          "p999_us": 30
+        },
+        "cycle": {
+          "count": 46599,
+          "max_us": 687330,
+          "p50_us": 39000,
+          "p95_us": 45000,
+          "p99_us": 56000,
+          "p999_us": 491000
+        }
+      },
+      "ops_per_second": 1546.831548766789,
+      "compactions": 12,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "case": "paced",
+      "mode": "direct",
+      "trial": 1,
+      "operations": {
+        "hash_write": {
+          "count": 9330,
+          "max_us": 706504,
+          "p50_us": 19800,
+          "p95_us": 33000,
+          "p99_us": 54000,
+          "p999_us": 637000
+        },
+        "hash_read": {
+          "count": 18662,
+          "max_us": 496,
+          "p50_us": 10,
+          "p95_us": 22,
+          "p99_us": 31,
+          "p999_us": 55
+        },
+        "kv_read": {
+          "count": 9331,
+          "max_us": 232,
+          "p50_us": 7,
+          "p95_us": 15,
+          "p99_us": 21,
+          "p999_us": 36
+        },
+        "cycle": {
+          "count": 9327,
+          "max_us": 706527,
+          "p50_us": 19800,
+          "p95_us": 33100,
+          "p99_us": 54000,
+          "p999_us": 637000
+        }
+      },
+      "ops_per_second": 619.03207419747,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "case": "paced",
+      "mode": "direct",
+      "trial": 2,
+      "operations": {
+        "hash_write": {
+          "count": 9256,
+          "max_us": 787878,
+          "p50_us": 20000,
+          "p95_us": 34200,
+          "p99_us": 71300,
+          "p999_us": 684000
+        },
+        "hash_read": {
+          "count": 18514,
+          "max_us": 229,
+          "p50_us": 10,
+          "p95_us": 22,
+          "p99_us": 32,
+          "p999_us": 65
+        },
+        "kv_read": {
+          "count": 9257,
+          "max_us": 72,
+          "p50_us": 7,
+          "p95_us": 14,
+          "p99_us": 21,
+          "p999_us": 34
+        },
+        "cycle": {
+          "count": 9253,
+          "max_us": 787921,
+          "p50_us": 20100,
+          "p95_us": 34200,
+          "p99_us": 71300,
+          "p999_us": 684000
+        }
+      },
+      "ops_per_second": 613.8537984174552,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "case": "paced",
+      "mode": "direct",
+      "trial": 3,
+      "operations": {
+        "hash_write": {
+          "count": 9249,
+          "max_us": 681748,
+          "p50_us": 21500,
+          "p95_us": 37200,
+          "p99_us": 72000,
+          "p999_us": 652000
+        },
+        "hash_read": {
+          "count": 18494,
+          "max_us": 1226,
+          "p50_us": 10,
+          "p95_us": 22,
+          "p99_us": 34,
+          "p999_us": 66
+        },
+        "kv_read": {
+          "count": 9247,
+          "max_us": 648,
+          "p50_us": 6,
+          "p95_us": 14,
+          "p99_us": 22,
+          "p999_us": 46
+        },
+        "cycle": {
+          "count": 9247,
+          "max_us": 681782,
+          "p50_us": 21500,
+          "p95_us": 37200,
+          "p99_us": 72000,
+          "p999_us": 652000
+        }
+      },
+      "ops_per_second": 612.7568014638312,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "case": "paced",
+      "mode": "coalesced",
+      "trial": 1,
+      "operations": {
+        "hash_write": {
+          "count": 9341,
+          "max_us": 718277,
+          "p50_us": 21200,
+          "p95_us": 37600,
+          "p99_us": 44800,
+          "p999_us": 549000
+        },
+        "hash_read": {
+          "count": 18660,
+          "max_us": 77,
+          "p50_us": 7,
+          "p95_us": 19,
+          "p99_us": 26,
+          "p999_us": 41
+        },
+        "kv_read": {
+          "count": 9330,
+          "max_us": 74,
+          "p50_us": 6,
+          "p95_us": 12,
+          "p99_us": 18,
+          "p999_us": 30
+        },
+        "cycle": {
+          "count": 9330,
+          "max_us": 718312,
+          "p50_us": 21100,
+          "p95_us": 37600,
+          "p99_us": 44800,
+          "p999_us": 549000
+        }
+      },
+      "ops_per_second": 619.0875653266652,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "case": "paced",
+      "mode": "coalesced",
+      "trial": 2,
+      "operations": {
+        "hash_write": {
+          "count": 9356,
+          "max_us": 662415,
+          "p50_us": 23200,
+          "p95_us": 37200,
+          "p99_us": 43900,
+          "p999_us": 484000
+        },
+        "hash_read": {
+          "count": 18714,
+          "max_us": 867,
+          "p50_us": 7,
+          "p95_us": 19,
+          "p99_us": 26,
+          "p999_us": 43
+        },
+        "kv_read": {
+          "count": 9357,
+          "max_us": 141,
+          "p50_us": 6,
+          "p95_us": 11,
+          "p99_us": 17,
+          "p999_us": 30
+        },
+        "cycle": {
+          "count": 9352,
+          "max_us": 662453,
+          "p50_us": 23200,
+          "p95_us": 37200,
+          "p99_us": 44000,
+          "p999_us": 484000
+        }
+      },
+      "ops_per_second": 620.7367264431142,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "case": "paced",
+      "mode": "coalesced",
+      "trial": 3,
+      "operations": {
+        "hash_write": {
+          "count": 9361,
+          "max_us": 611468,
+          "p50_us": 22900,
+          "p95_us": 36700,
+          "p99_us": 49300,
+          "p999_us": 536000
+        },
+        "hash_read": {
+          "count": 18738,
+          "max_us": 930,
+          "p50_us": 7,
+          "p95_us": 21,
+          "p99_us": 31,
+          "p999_us": 58
+        },
+        "kv_read": {
+          "count": 9369,
+          "max_us": 181,
+          "p50_us": 6,
+          "p95_us": 13,
+          "p99_us": 21,
+          "p999_us": 57
+        },
+        "cycle": {
+          "count": 9361,
+          "max_us": 611494,
+          "p50_us": 22900,
+          "p95_us": 36800,
+          "p99_us": 49300,
+          "p999_us": 536000
+        }
+      },
+      "ops_per_second": 620.8589278703537,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "case": "low_load",
+      "mode": "direct",
+      "trial": 1,
+      "operations": {
+        "hash_write": {
+          "count": 5878,
+          "max_us": 390217,
+          "p50_us": 19200,
+          "p95_us": 22000,
+          "p99_us": 26400,
+          "p999_us": 302000
+        },
+        "hash_read": {
+          "count": 11756,
+          "max_us": 61,
+          "p50_us": 10,
+          "p95_us": 19,
+          "p99_us": 25,
+          "p999_us": 39
+        },
+        "kv_read": {
+          "count": 5878,
+          "max_us": 65,
+          "p50_us": 7,
+          "p95_us": 12,
+          "p99_us": 17,
+          "p999_us": 26
+        },
+        "cycle": {
+          "count": 5874,
+          "max_us": 390256,
+          "p50_us": 19200,
+          "p95_us": 22100,
+          "p99_us": 26500,
+          "p999_us": 302000
+        }
+      },
+      "ops_per_second": 779.3506032591984,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "case": "low_load",
+      "mode": "direct",
+      "trial": 2,
+      "operations": {
+        "hash_write": {
+          "count": 5898,
+          "max_us": 402259,
+          "p50_us": 19100,
+          "p95_us": 22000,
+          "p99_us": 27200,
+          "p999_us": 303000
+        },
+        "hash_read": {
+          "count": 11796,
+          "max_us": 202,
+          "p50_us": 9,
+          "p95_us": 19,
+          "p99_us": 27,
+          "p999_us": 46
+        },
+        "kv_read": {
+          "count": 5898,
+          "max_us": 56,
+          "p50_us": 7,
+          "p95_us": 12,
+          "p99_us": 19,
+          "p999_us": 37
+        },
+        "cycle": {
+          "count": 5894,
+          "max_us": 402300,
+          "p50_us": 19100,
+          "p95_us": 22000,
+          "p99_us": 27200,
+          "p999_us": 303000
+        }
+      },
+      "ops_per_second": 782.003575896311,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "case": "low_load",
+      "mode": "direct",
+      "trial": 3,
+      "operations": {
+        "hash_write": {
+          "count": 5862,
+          "max_us": 314496,
+          "p50_us": 19900,
+          "p95_us": 24200,
+          "p99_us": 28100,
+          "p999_us": 278000
+        },
+        "hash_read": {
+          "count": 11724,
+          "max_us": 371,
+          "p50_us": 10,
+          "p95_us": 24,
+          "p99_us": 39,
+          "p999_us": 102
+        },
+        "kv_read": {
+          "count": 5862,
+          "max_us": 74,
+          "p50_us": 7,
+          "p95_us": 15,
+          "p99_us": 23,
+          "p999_us": 55
+        },
+        "cycle": {
+          "count": 5858,
+          "max_us": 314532,
+          "p50_us": 19900,
+          "p95_us": 24200,
+          "p99_us": 28100,
+          "p999_us": 278000
+        }
+      },
+      "ops_per_second": 776.5973411344581,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "case": "low_load",
+      "mode": "coalesced",
+      "trial": 1,
+      "operations": {
+        "hash_write": {
+          "count": 5917,
+          "max_us": 317010,
+          "p50_us": 19100,
+          "p95_us": 22000,
+          "p99_us": 27100,
+          "p999_us": 304000
+        },
+        "hash_read": {
+          "count": 11834,
+          "max_us": 94,
+          "p50_us": 9,
+          "p95_us": 19,
+          "p99_us": 26,
+          "p999_us": 43
+        },
+        "kv_read": {
+          "count": 5917,
+          "max_us": 39,
+          "p50_us": 7,
+          "p95_us": 13,
+          "p99_us": 18,
+          "p999_us": 28
+        },
+        "cycle": {
+          "count": 5913,
+          "max_us": 317042,
+          "p50_us": 19100,
+          "p95_us": 22000,
+          "p99_us": 27200,
+          "p999_us": 304000
+        }
+      },
+      "ops_per_second": 784.5705977627075,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "case": "low_load",
+      "mode": "coalesced",
+      "trial": 2,
+      "operations": {
+        "hash_write": {
+          "count": 5901,
+          "max_us": 315218,
+          "p50_us": 20000,
+          "p95_us": 23200,
+          "p99_us": 27400,
+          "p999_us": 254000
+        },
+        "hash_read": {
+          "count": 11802,
+          "max_us": 144,
+          "p50_us": 9,
+          "p95_us": 19,
+          "p99_us": 26,
+          "p999_us": 47
+        },
+        "kv_read": {
+          "count": 5901,
+          "max_us": 40,
+          "p50_us": 7,
+          "p95_us": 12,
+          "p99_us": 18,
+          "p999_us": 29
+        },
+        "cycle": {
+          "count": 5897,
+          "max_us": 315254,
+          "p50_us": 20000,
+          "p95_us": 23200,
+          "p99_us": 27500,
+          "p999_us": 254000
+        }
+      },
+      "ops_per_second": 782.2002194627679,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "case": "low_load",
+      "mode": "coalesced",
+      "trial": 3,
+      "operations": {
+        "hash_write": {
+          "count": 5620,
+          "max_us": 381666,
+          "p50_us": 20000,
+          "p95_us": 27400,
+          "p99_us": 32100,
+          "p999_us": 270000
+        },
+        "hash_read": {
+          "count": 11240,
+          "max_us": 247,
+          "p50_us": 11,
+          "p95_us": 28,
+          "p99_us": 43,
+          "p999_us": 125
+        },
+        "kv_read": {
+          "count": 5620,
+          "max_us": 696,
+          "p50_us": 8,
+          "p95_us": 18,
+          "p99_us": 28,
+          "p999_us": 99
+        },
+        "cycle": {
+          "count": 5616,
+          "max_us": 381687,
+          "p50_us": 20100,
+          "p95_us": 27500,
+          "p99_us": 32200,
+          "p999_us": 270000
+        }
+      },
+      "ops_per_second": 743.2718768504304,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ]
+    }
+  ],
+  "cases": {
+    "saturated": {
+      "direct": {
+        "ops_per_second": {
+          "median": 1002.8097317996552,
+          "min": 998.8711680675402,
+          "max": 1004.508500857249
+        },
+        "hash_write_p50_us": {
+          "median": 60100,
+          "min": 59800,
+          "max": 60400
+        },
+        "hash_write_p95_us": {
+          "median": 77000,
+          "min": 76600,
+          "max": 77200
+        },
+        "hash_write_p99_us": {
+          "median": 90400,
+          "min": 89900,
+          "max": 94300
+        },
+        "hash_write_p999_us": {
+          "median": 713000,
+          "min": 662000,
+          "max": 719000
+        },
+        "hash_write_max_us": {
+          "median": 797607,
+          "min": 782039,
+          "max": 802444
+        },
+        "hash_read_p50_us": {
+          "median": 8,
+          "min": 8,
+          "max": 8
+        },
+        "hash_read_p95_us": {
+          "median": 20,
+          "min": 19,
+          "max": 20
+        },
+        "hash_read_p99_us": {
+          "median": 31,
+          "min": 29,
+          "max": 32
+        },
+        "hash_read_p999_us": {
+          "median": 69,
+          "min": 53,
+          "max": 69
+        },
+        "hash_read_max_us": {
+          "median": 781,
+          "min": 575,
+          "max": 4688
+        },
+        "kv_read_p50_us": {
+          "median": 6,
+          "min": 6,
+          "max": 6
+        },
+        "kv_read_p95_us": {
+          "median": 12,
+          "min": 12,
+          "max": 13
+        },
+        "kv_read_p99_us": {
+          "median": 20,
+          "min": 19,
+          "max": 21
+        },
+        "kv_read_p999_us": {
+          "median": 42,
+          "min": 38,
+          "max": 44
+        },
+        "kv_read_max_us": {
+          "median": 293,
+          "min": 234,
+          "max": 366
+        },
+        "cycle_p50_us": {
+          "median": 60100,
+          "min": 59900,
+          "max": 60500
+        },
+        "cycle_p95_us": {
+          "median": 77000,
+          "min": 76500,
+          "max": 77200
+        },
+        "cycle_p99_us": {
+          "median": 90500,
+          "min": 89200,
+          "max": 93500
+        },
+        "cycle_p999_us": {
+          "median": 709000,
+          "min": 662000,
+          "max": 719000
+        },
+        "cycle_max_us": {
+          "median": 797635,
+          "min": 782073,
+          "max": 802480
+        }
+      },
+      "coalesced": {
+        "ops_per_second": {
+          "median": 1548.8572043134097,
+          "min": 1546.831548766789,
+          "max": 1551.742101644152
+        },
+        "hash_write_p50_us": {
+          "median": 39000,
+          "min": 39000,
+          "max": 39000
+        },
+        "hash_write_p95_us": {
+          "median": 44800,
+          "min": 44100,
+          "max": 45000
+        },
+        "hash_write_p99_us": {
+          "median": 53900,
+          "min": 53100,
+          "max": 55900
+        },
+        "hash_write_p999_us": {
+          "median": 499000,
+          "min": 491000,
+          "max": 503000
+        },
+        "hash_write_max_us": {
+          "median": 688334,
+          "min": 687289,
+          "max": 701873
+        },
+        "hash_read_p50_us": {
+          "median": 5,
+          "min": 5,
+          "max": 5
+        },
+        "hash_read_p95_us": {
+          "median": 17,
+          "min": 17,
+          "max": 17
+        },
+        "hash_read_p99_us": {
+          "median": 24,
+          "min": 24,
+          "max": 24
+        },
+        "hash_read_p999_us": {
+          "median": 41,
+          "min": 40,
+          "max": 42
+        },
+        "hash_read_max_us": {
+          "median": 2364,
+          "min": 349,
+          "max": 2797
+        },
+        "kv_read_p50_us": {
+          "median": 4,
+          "min": 4,
+          "max": 4
+        },
+        "kv_read_p95_us": {
+          "median": 10,
+          "min": 10,
+          "max": 10
+        },
+        "kv_read_p99_us": {
+          "median": 17,
+          "min": 17,
+          "max": 17
+        },
+        "kv_read_p999_us": {
+          "median": 28,
+          "min": 26,
+          "max": 30
+        },
+        "kv_read_max_us": {
+          "median": 145,
+          "min": 94,
+          "max": 244
+        },
+        "cycle_p50_us": {
+          "median": 39000,
+          "min": 39000,
+          "max": 39000
+        },
+        "cycle_p95_us": {
+          "median": 44800,
+          "min": 44100,
+          "max": 45000
+        },
+        "cycle_p99_us": {
+          "median": 53500,
+          "min": 53100,
+          "max": 56000
+        },
+        "cycle_p999_us": {
+          "median": 491000,
+          "min": 486000,
+          "max": 503000
+        },
+        "cycle_max_us": {
+          "median": 688347,
+          "min": 687330,
+          "max": 701885
+        }
+      }
+    },
+    "paced": {
+      "direct": {
+        "ops_per_second": {
+          "median": 613.8537984174552,
+          "min": 612.7568014638312,
+          "max": 619.03207419747
+        },
+        "hash_write_p50_us": {
+          "median": 20000,
+          "min": 19800,
+          "max": 21500
+        },
+        "hash_write_p95_us": {
+          "median": 34200,
+          "min": 33000,
+          "max": 37200
+        },
+        "hash_write_p99_us": {
+          "median": 71300,
+          "min": 54000,
+          "max": 72000
+        },
+        "hash_write_p999_us": {
+          "median": 652000,
+          "min": 637000,
+          "max": 684000
+        },
+        "hash_write_max_us": {
+          "median": 706504,
+          "min": 681748,
+          "max": 787878
+        },
+        "hash_read_p50_us": {
+          "median": 10,
+          "min": 10,
+          "max": 10
+        },
+        "hash_read_p95_us": {
+          "median": 22,
+          "min": 22,
+          "max": 22
+        },
+        "hash_read_p99_us": {
+          "median": 32,
+          "min": 31,
+          "max": 34
+        },
+        "hash_read_p999_us": {
+          "median": 65,
+          "min": 55,
+          "max": 66
+        },
+        "hash_read_max_us": {
+          "median": 496,
+          "min": 229,
+          "max": 1226
+        },
+        "kv_read_p50_us": {
+          "median": 7,
+          "min": 6,
+          "max": 7
+        },
+        "kv_read_p95_us": {
+          "median": 14,
+          "min": 14,
+          "max": 15
+        },
+        "kv_read_p99_us": {
+          "median": 21,
+          "min": 21,
+          "max": 22
+        },
+        "kv_read_p999_us": {
+          "median": 36,
+          "min": 34,
+          "max": 46
+        },
+        "kv_read_max_us": {
+          "median": 232,
+          "min": 72,
+          "max": 648
+        },
+        "cycle_p50_us": {
+          "median": 20100,
+          "min": 19800,
+          "max": 21500
+        },
+        "cycle_p95_us": {
+          "median": 34200,
+          "min": 33100,
+          "max": 37200
+        },
+        "cycle_p99_us": {
+          "median": 71300,
+          "min": 54000,
+          "max": 72000
+        },
+        "cycle_p999_us": {
+          "median": 652000,
+          "min": 637000,
+          "max": 684000
+        },
+        "cycle_max_us": {
+          "median": 706527,
+          "min": 681782,
+          "max": 787921
+        }
+      },
+      "coalesced": {
+        "ops_per_second": {
+          "median": 620.7367264431142,
+          "min": 619.0875653266652,
+          "max": 620.8589278703537
+        },
+        "hash_write_p50_us": {
+          "median": 22900,
+          "min": 21200,
+          "max": 23200
+        },
+        "hash_write_p95_us": {
+          "median": 37200,
+          "min": 36700,
+          "max": 37600
+        },
+        "hash_write_p99_us": {
+          "median": 44800,
+          "min": 43900,
+          "max": 49300
+        },
+        "hash_write_p999_us": {
+          "median": 536000,
+          "min": 484000,
+          "max": 549000
+        },
+        "hash_write_max_us": {
+          "median": 662415,
+          "min": 611468,
+          "max": 718277
+        },
+        "hash_read_p50_us": {
+          "median": 7,
+          "min": 7,
+          "max": 7
+        },
+        "hash_read_p95_us": {
+          "median": 19,
+          "min": 19,
+          "max": 21
+        },
+        "hash_read_p99_us": {
+          "median": 26,
+          "min": 26,
+          "max": 31
+        },
+        "hash_read_p999_us": {
+          "median": 43,
+          "min": 41,
+          "max": 58
+        },
+        "hash_read_max_us": {
+          "median": 867,
+          "min": 77,
+          "max": 930
+        },
+        "kv_read_p50_us": {
+          "median": 6,
+          "min": 6,
+          "max": 6
+        },
+        "kv_read_p95_us": {
+          "median": 12,
+          "min": 11,
+          "max": 13
+        },
+        "kv_read_p99_us": {
+          "median": 18,
+          "min": 17,
+          "max": 21
+        },
+        "kv_read_p999_us": {
+          "median": 30,
+          "min": 30,
+          "max": 57
+        },
+        "kv_read_max_us": {
+          "median": 141,
+          "min": 74,
+          "max": 181
+        },
+        "cycle_p50_us": {
+          "median": 22900,
+          "min": 21100,
+          "max": 23200
+        },
+        "cycle_p95_us": {
+          "median": 37200,
+          "min": 36800,
+          "max": 37600
+        },
+        "cycle_p99_us": {
+          "median": 44800,
+          "min": 44000,
+          "max": 49300
+        },
+        "cycle_p999_us": {
+          "median": 536000,
+          "min": 484000,
+          "max": 549000
+        },
+        "cycle_max_us": {
+          "median": 662453,
+          "min": 611494,
+          "max": 718312
+        }
+      }
+    },
+    "low_load": {
+      "direct": {
+        "ops_per_second": {
+          "median": 779.3506032591984,
+          "min": 776.5973411344581,
+          "max": 782.003575896311
+        },
+        "hash_write_p50_us": {
+          "median": 19200,
+          "min": 19100,
+          "max": 19900
+        },
+        "hash_write_p95_us": {
+          "median": 22000,
+          "min": 22000,
+          "max": 24200
+        },
+        "hash_write_p99_us": {
+          "median": 27200,
+          "min": 26400,
+          "max": 28100
+        },
+        "hash_write_p999_us": {
+          "median": 302000,
+          "min": 278000,
+          "max": 303000
+        },
+        "hash_write_max_us": {
+          "median": 390217,
+          "min": 314496,
+          "max": 402259
+        },
+        "hash_read_p50_us": {
+          "median": 10,
+          "min": 9,
+          "max": 10
+        },
+        "hash_read_p95_us": {
+          "median": 19,
+          "min": 19,
+          "max": 24
+        },
+        "hash_read_p99_us": {
+          "median": 27,
+          "min": 25,
+          "max": 39
+        },
+        "hash_read_p999_us": {
+          "median": 46,
+          "min": 39,
+          "max": 102
+        },
+        "hash_read_max_us": {
+          "median": 202,
+          "min": 61,
+          "max": 371
+        },
+        "kv_read_p50_us": {
+          "median": 7,
+          "min": 7,
+          "max": 7
+        },
+        "kv_read_p95_us": {
+          "median": 12,
+          "min": 12,
+          "max": 15
+        },
+        "kv_read_p99_us": {
+          "median": 19,
+          "min": 17,
+          "max": 23
+        },
+        "kv_read_p999_us": {
+          "median": 37,
+          "min": 26,
+          "max": 55
+        },
+        "kv_read_max_us": {
+          "median": 65,
+          "min": 56,
+          "max": 74
+        },
+        "cycle_p50_us": {
+          "median": 19200,
+          "min": 19100,
+          "max": 19900
+        },
+        "cycle_p95_us": {
+          "median": 22100,
+          "min": 22000,
+          "max": 24200
+        },
+        "cycle_p99_us": {
+          "median": 27200,
+          "min": 26500,
+          "max": 28100
+        },
+        "cycle_p999_us": {
+          "median": 302000,
+          "min": 278000,
+          "max": 303000
+        },
+        "cycle_max_us": {
+          "median": 390256,
+          "min": 314532,
+          "max": 402300
+        }
+      },
+      "coalesced": {
+        "ops_per_second": {
+          "median": 782.2002194627679,
+          "min": 743.2718768504304,
+          "max": 784.5705977627075
+        },
+        "hash_write_p50_us": {
+          "median": 20000,
+          "min": 19100,
+          "max": 20000
+        },
+        "hash_write_p95_us": {
+          "median": 23200,
+          "min": 22000,
+          "max": 27400
+        },
+        "hash_write_p99_us": {
+          "median": 27400,
+          "min": 27100,
+          "max": 32100
+        },
+        "hash_write_p999_us": {
+          "median": 270000,
+          "min": 254000,
+          "max": 304000
+        },
+        "hash_write_max_us": {
+          "median": 317010,
+          "min": 315218,
+          "max": 381666
+        },
+        "hash_read_p50_us": {
+          "median": 9,
+          "min": 9,
+          "max": 11
+        },
+        "hash_read_p95_us": {
+          "median": 19,
+          "min": 19,
+          "max": 28
+        },
+        "hash_read_p99_us": {
+          "median": 26,
+          "min": 26,
+          "max": 43
+        },
+        "hash_read_p999_us": {
+          "median": 47,
+          "min": 43,
+          "max": 125
+        },
+        "hash_read_max_us": {
+          "median": 144,
+          "min": 94,
+          "max": 247
+        },
+        "kv_read_p50_us": {
+          "median": 7,
+          "min": 7,
+          "max": 8
+        },
+        "kv_read_p95_us": {
+          "median": 13,
+          "min": 12,
+          "max": 18
+        },
+        "kv_read_p99_us": {
+          "median": 18,
+          "min": 18,
+          "max": 28
+        },
+        "kv_read_p999_us": {
+          "median": 29,
+          "min": 28,
+          "max": 99
+        },
+        "kv_read_max_us": {
+          "median": 40,
+          "min": 39,
+          "max": 696
+        },
+        "cycle_p50_us": {
+          "median": 20000,
+          "min": 19100,
+          "max": 20100
+        },
+        "cycle_p95_us": {
+          "median": 23200,
+          "min": 22000,
+          "max": 27500
+        },
+        "cycle_p99_us": {
+          "median": 27500,
+          "min": 27200,
+          "max": 32200
+        },
+        "cycle_p999_us": {
+          "median": 270000,
+          "min": 254000,
+          "max": 304000
+        },
+        "cycle_max_us": {
+          "median": 317042,
+          "min": 315254,
+          "max": 381687
+        }
+      }
+    }
+  },
+  "publication_identity": {
+    "otp": "29",
+    "elixir": "1.20.4",
+    "sha256": {
+      "apps/ferricstore/lib/ferricstore/api/store.ex": "7f1aa1ac916ad15fe9eee5fd77ff6cbe02cde15c5f0388c362b911e07f5d6409",
+      "apps/ferricstore/lib/ferricstore/commands/hash.ex": "6b0555387474438e5e71721e47e20bace30df9ceb933f4bcdfda3264e76492b0",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/apply_dispatch.ex": "38b2f13bfe11dfddb3ab5dc7fe14484af10f1eb0be9919d5e52daaaa0a5d8d05",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/async_apply.ex": "ef632c3b1456b3242658abee3e6e1bc2266185af9e350a59879a766287e39d23",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/compound_apply.ex": "c1618c09b9bfb2992ee931ff124f270432d60dd35e4bb34dc6ab580f1170fb4a",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/cross_shard_pending.ex": "186833ef6db9a8bd401b313f9cb69aa4463b194f9f36bd74d8fea80b78179c25",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/pending_writes.ex": "8409fe625dbfbc8be11ec2a4c9d59ba4c89e4e20a7ef0203d8902385dce96898",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/read_warm.ex": "42317fe19049327ffeeb15688d44829529e47936a993fbd33031bde9abab3ef5",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_backend/batcher.ex": "a2f6784218927847ae6edd4b9dd096c8ff695c04f3ce69b02210dd29c228075e",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_backend/sections/public_api.ex": "465423e26b7264b2009215e4285686166c040d4f6c425a790834ca059e41739b",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_storage/sections/lifecycle.ex": "19df67af92f6e4047114e56482cfba5da3085633faa349f29406d74e24ac45ff",
+      "apps/ferricstore/lib/ferricstore/store/ops.ex": "8e86143ac06a319aa49d9159579e07b80e52174fcd0dd264b4123659a4880cbb",
+      "apps/ferricstore/lib/ferricstore/store/promoted_publication.ex": "2b9e2288bd30594e35362a57be202b5f95a1d711364927bab3d2004cb65fffad",
+      "apps/ferricstore/lib/ferricstore/store/publication_epoch.ex": "370bd4826e3373bd655cbc20761b75196b05c6c53685775f15e0fc505c0108f5",
+      "apps/ferricstore/lib/ferricstore/store/shard/compound/ops.ex": "d23784f27ed86cb61396c186aa88400939e7388c2c144ef17e735f20c30e19ef",
+      "apps/ferricstore/lib/ferricstore/store/shard/compound/promoted.ex": "5884ec89314e3114833eb284475fa62ff351d70dac0442a57ec7513e85ec9791",
+      "apps/ferricstore/lib/ferricstore/store/shard/startup.ex": "86078bdf66da2545e2291ac1e9133235631dae7bfa7984fc6e639053e4a7d579"
+    },
+    "beam_md5": {
+      "Ferricstore.Raft.StateMachine": "06b3f0edb61ae3c7c4f7594312325213",
+      "Ferricstore.Raft.WARaftStorage": "41f57f34d29d4f137cc413f90df13ab1",
+      "Ferricstore.Store.PromotedPublication": "e364f8e74415c9bd528709cc46e32c42",
+      "Ferricstore.Store.PublicationEpoch": "41ff76f4390d8bac7bfca10bb3369e9a"
+    },
+    "erl_flags": "+S 8:8"
+  }
+}

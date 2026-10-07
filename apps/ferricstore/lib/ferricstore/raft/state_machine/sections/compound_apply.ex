@@ -447,23 +447,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
              offset,
              value_size
            ) do
-        ets_value = value_for_ets(logical_value, hot_cache_threshold(state))
-        track_keydir_binary_delta(state, compound_key, ets_value, expire_at_ms)
+        Ferricstore.Store.PromotedPublication.publish(state, fn ->
+          ets_value = value_for_ets(logical_value, hot_cache_threshold(state))
+          track_keydir_binary_delta(state, compound_key, ets_value, expire_at_ms)
 
-        :ets.insert(
-          state.ets,
-          {compound_key, ets_value, expire_at_ms, LFU.initial(), fid, offset, value_size}
-        )
+          :ets.insert(
+            state.ets,
+            {compound_key, ets_value, expire_at_ms, LFU.initial(), fid, offset, value_size}
+          )
 
-        CompoundMemberIndex.put(
-          Map.get(state, :compound_member_index_name),
-          compound_key,
-          expire_at_ms
-        )
+          CompoundMemberIndex.put(
+            Map.get(state, :compound_member_index_name),
+            compound_key,
+            expire_at_ms
+          )
 
-        sm_tx_put_pending(compound_key, logical_value, expire_at_ms)
-        remove_tx_deleted_key(compound_key)
-        zset_index_put(state, redis_key, compound_key, logical_value)
+          sm_tx_put_pending(compound_key, logical_value, expire_at_ms)
+          remove_tx_deleted_key(compound_key)
+          zset_index_put(state, redis_key, compound_key, logical_value)
+        end)
       end
 
       defp compound_blob_batch_target(state, redis_key, [first | rest]) do
@@ -1262,7 +1264,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
           |> acquire_cross_shard_publication_epochs(ctx, [])
 
         try do
-          fun.()
+          Ferricstore.Store.PromotedPublication.with_scope(fn ->
+            Enum.each(successful_groups, fn {idx, _, _, _, _, _} ->
+              Ferricstore.Store.PromotedPublication.publish(
+                %{instance_ctx: ctx, shard_index: idx},
+                fn -> :ok end
+              )
+            end)
+
+            fun.()
+          end)
         after
           Enum.each(tokens, &PublicationEpoch.end_write/1)
         end

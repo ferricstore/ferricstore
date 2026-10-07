@@ -1,0 +1,33 @@
+{
+  "source": "e5f59ba7959710773729812343ae9bcd62d8d15f",
+  "diagnostic_only": true,
+  "repeated_failures": [
+    {
+      "round": 1,
+      "bytes": 2807544,
+      "deleted_directories": [
+        "/var/folders/n3/4p13zj5n0kjbs8xk2qb4jq080000gn/T/opencode/rewrite-baseline-29061/data/segment_log.rewrite.staging.2"
+      ],
+      "stale_entries": 8194
+    },
+    {
+      "round": 2,
+      "bytes": 4184120,
+      "deleted_directories": [
+        "/var/folders/n3/4p13zj5n0kjbs8xk2qb4jq080000gn/T/opencode/rewrite-baseline-29061/data/segment_log.rewrite.staging.2",
+        "/var/folders/n3/4p13zj5n0kjbs8xk2qb4jq080000gn/T/opencode/rewrite-baseline-29061/data/segment_log.rewrite.staging.4"
+      ],
+      "stale_entries": 16388
+    },
+    {
+      "round": 3,
+      "bytes": 5560696,
+      "deleted_directories": [
+        "/var/folders/n3/4p13zj5n0kjbs8xk2qb4jq080000gn/T/opencode/rewrite-baseline-29061/data/segment_log.rewrite.staging.4",
+        "/var/folders/n3/4p13zj5n0kjbs8xk2qb4jq080000gn/T/opencode/rewrite-baseline-29061/data/segment_log.rewrite.staging.6",
+        "/var/folders/n3/4p13zj5n0kjbs8xk2qb4jq080000gn/T/opencode/rewrite-baseline-29061/data/segment_log.rewrite.staging.2"
+      ],
+      "stale_entries": 24582
+    }
+  ]
+}

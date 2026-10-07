@@ -9,7 +9,7 @@ segment_scan_modes() ->
 read_disk_record_at(Dir, Index, Offset, EncodedSize, RecordsPerSegment) ->
     Ordinal = segment_ordinal(Index, RecordsPerSegment),
     Path = filename:join(Dir, segment_file_from_ordinal(Ordinal)),
-    case file:read_link_info(Path) of
+    case file:read_link_info(Path, [raw]) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
             case open_verified_segment_file(Path, [read, raw, binary]) of
                 {ok, Fd} ->
@@ -201,7 +201,7 @@ scan_segment_paths([{Ordinal, Path} | Rest], PreviousIndex, RecordsPerSegment, F
     end.
 
 scan_segment(Ordinal, Path, PreviousIndex, RecordsPerSegment, FirstIndex, LastIndex, Count) ->
-    case file:read_link_info(Path) of
+    case file:read_link_info(Path, [raw]) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
             case open_verified_segment_file(Path, segment_scan_modes()) of
                 {ok, Fd} ->
@@ -319,7 +319,7 @@ scan_raft_segment_paths([{Ordinal, Path} | Rest], PreviousIndex, RecordsPerSegme
     end.
 
 scan_raft_segment(Ordinal, Path, PreviousIndex, RecordsPerSegment, FirstIndex, Count, TailLimit, TailQueue, ScanPayloadBytes) ->
-    case file:read_link_info(Path) of
+    case file:read_link_info(Path, [raw]) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
             case open_verified_segment_file(Path, segment_scan_modes()) of
                 {ok, Fd} ->
@@ -552,7 +552,7 @@ maybe_update_latest_config_from_payload(Dir, Index, Payload) ->
     end.
 
 load_segment(Ordinal, Path, Name, PreviousIndex, RecordsPerSegment) ->
-    case file:read_link_info(Path) of
+    case file:read_link_info(Path, [raw]) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
             case open_verified_segment_file(Path, segment_scan_modes()) of
                 {ok, Fd} ->
@@ -895,7 +895,7 @@ record_fits_file(Offset, Len, FileBytes) ->
     Offset + ?RECORD_HEADER_SIZE + Len =< FileBytes.
 
 validate_existing_segment_file(Path) ->
-    case file:read_link_info(Path) of
+    case file:read_link_info(Path, [raw]) of
         {ok, #file_info{type = regular}} ->
             ok;
         {ok, #file_info{type = Type}} ->

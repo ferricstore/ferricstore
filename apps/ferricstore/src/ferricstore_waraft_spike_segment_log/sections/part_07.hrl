@@ -93,7 +93,7 @@ reset_offset_indexes_for_dir(Dir) ->
                                 case parse_segment_ordinal(filename:basename(File, ".idx")) of
                                     {ok, _Ordinal} ->
                                         Path = filename:join(Dir, File),
-                                        case file:read_link_info(Path) of
+                                        case file:read_link_info(Path, [raw]) of
                                             {ok, #file_info{type = regular}} -> file:delete(Path);
                                             {ok, #file_info{type = Type}} -> {error, {unsafe_offset_index_path, Type}};
                                             {error, _Reason} = Error -> Error
@@ -142,7 +142,7 @@ prune_offset_index_files(Dir, BeforeOrdinal) ->
                             case parse_segment_ordinal(filename:basename(File, ".idx")) of
                                 {ok, Ordinal} when Ordinal < BeforeOrdinal ->
                                     Path = filename:join(Dir, File),
-                                    case file:read_link_info(Path) of
+                                    case file:read_link_info(Path, [raw]) of
                                         {ok, #file_info{type = regular}} -> file:delete(Path);
                                         _Unsafe -> {error, unsafe_offset_index_path}
                                     end;
@@ -177,8 +177,16 @@ offset_index_generation(Path) ->
     Dir = filename:dirname(Path),
     try ets:lookup(?OFFSET_INDEX_GENERATIONS, Dir) of
         [{Dir, Generation}] -> Generation;
-        [] -> undefined
-    catch error:badarg -> undefined
+        [] -> missing_offset_index_generation(Dir)
+    catch error:badarg -> missing_offset_index_generation(Dir)
+    end.
+
+missing_offset_index_generation(Dir) ->
+    case temporary_rewrite_dir(Dir) of
+        %% Never reuse an old temporary descriptor after its generation is
+        %% retired, and never allocate a per-abandoned-directory tombstone.
+        true -> make_ref();
+        false -> undefined
     end.
 
 index_scanned_offset(Path, Index, Ordinal, Offset, EncodedSize) ->
@@ -267,7 +275,7 @@ flush_offset_index_rows(Fd, Start, Buffer) ->
     file:pwrite(Fd, Start, lists:reverse(Buffer)).
 
 open_offset_index_for_write(Path) ->
-    case file:read_link_info(Path) of
+    case file:read_link_info(Path, [raw]) of
         {ok, #file_info{type = regular}} ->
             open_verified_segment_file(Path, [read, write, raw, binary]);
         {ok, #file_info{type = Type}} ->

@@ -1,0 +1,346 @@
+{
+  "aggregation": "medians and ranges of trial metrics, not pooled percentiles",
+  "server_compiler": "10.0.3",
+  "scenarios": {
+    "installed/1": {
+      "baseline": {
+        "ops_per_second": {
+          "median": 3694.2579054799935,
+          "min": 3661.3201546423907,
+          "max": 3720.7043348218062
+        },
+        "write_p50_us": {
+          "median": 7859,
+          "min": 7838,
+          "max": 7917
+        },
+        "write_p95_us": {
+          "median": 9998,
+          "min": 9648,
+          "max": 10220
+        },
+        "write_p99_us": {
+          "median": 14039,
+          "min": 13226,
+          "max": 14398
+        },
+        "read_p50_us": {
+          "median": 111,
+          "min": 108,
+          "max": 113
+        },
+        "read_p95_us": {
+          "median": 263,
+          "min": 232,
+          "max": 298
+        },
+        "read_p99_us": {
+          "median": 445,
+          "min": 378,
+          "max": 463
+        }
+      },
+      "bounded": {
+        "ops_per_second": {
+          "median": 3899.1487284571435,
+          "min": 3829.26628189614,
+          "max": 4100.376852092969
+        },
+        "write_p50_us": {
+          "median": 7793,
+          "min": 7755,
+          "max": 7810
+        },
+        "write_p95_us": {
+          "median": 9446,
+          "min": 9237,
+          "max": 9727
+        },
+        "write_p99_us": {
+          "median": 12614,
+          "min": 12197,
+          "max": 12788
+        },
+        "read_p50_us": {
+          "median": 106,
+          "min": 106,
+          "max": 108
+        },
+        "read_p95_us": {
+          "median": 227,
+          "min": 217,
+          "max": 261
+        },
+        "read_p99_us": {
+          "median": 376,
+          "min": 342,
+          "max": 448
+        }
+      },
+      "median_change_pct": {
+        "ops_per_second": 5.546197050108992,
+        "write_p50_us": -0.8398015014632887,
+        "write_p95_us": -5.521104220844164,
+        "write_p99_us": -10.15029560510008,
+        "read_p50_us": -4.504504504504503,
+        "read_p95_us": -13.688212927756648,
+        "read_p99_us": -15.505617977528086
+      }
+    },
+    "installed/3": {
+      "baseline": {
+        "ops_per_second": {
+          "median": 230.87072960889716,
+          "min": 225.14766428060616,
+          "max": 237.56927041487182
+        },
+        "write_p50_us": {
+          "median": 149801,
+          "min": 141802,
+          "max": 151773
+        },
+        "write_p95_us": {
+          "median": 301338,
+          "min": 300791,
+          "max": 301633
+        },
+        "write_p99_us": {
+          "median": 356700,
+          "min": 338772,
+          "max": 378461
+        },
+        "read_p50_us": {
+          "median": 107,
+          "min": 104,
+          "max": 109
+        },
+        "read_p95_us": {
+          "median": 159,
+          "min": 158,
+          "max": 164
+        },
+        "read_p99_us": {
+          "median": 202,
+          "min": 194,
+          "max": 216
+        }
+      },
+      "bounded": {
+        "ops_per_second": {
+          "median": 694.4489335314483,
+          "min": 656.7388675652104,
+          "max": 736.6996487643561
+        },
+        "write_p50_us": {
+          "median": 16773,
+          "min": 16762,
+          "max": 17798
+        },
+        "write_p95_us": {
+          "median": 134808,
+          "min": 134598,
+          "max": 134867
+        },
+        "write_p99_us": {
+          "median": 247837,
+          "min": 247647,
+          "max": 247904
+        },
+        "read_p50_us": {
+          "median": 98,
+          "min": 95,
+          "max": 104
+        },
+        "read_p95_us": {
+          "median": 168,
+          "min": 166,
+          "max": 198
+        },
+        "read_p99_us": {
+          "median": 248,
+          "min": 238,
+          "max": 317
+        }
+      },
+      "median_change_pct": {
+        "ops_per_second": 200.79557278996276,
+        "write_p50_us": -88.80314550637178,
+        "write_p95_us": -55.26352467992752,
+        "write_p99_us": -30.519484160358846,
+        "read_p50_us": -8.41121495327103,
+        "read_p95_us": 5.660377358490565,
+        "read_p99_us": 22.77227722772277
+      }
+    },
+    "deadline/1": {
+      "baseline": {
+        "ops_per_second": {
+          "median": 3590.135522951747,
+          "min": 3532.8884249176886,
+          "max": 4315.557843220544
+        },
+        "write_p50_us": {
+          "median": 7884,
+          "min": 7629,
+          "max": 7950
+        },
+        "write_p95_us": {
+          "median": 10251,
+          "min": 9984,
+          "max": 11089
+        },
+        "write_p99_us": {
+          "median": 22262,
+          "min": 14634,
+          "max": 28890
+        },
+        "read_p50_us": {
+          "median": 112,
+          "min": 93,
+          "max": 121
+        },
+        "read_p95_us": {
+          "median": 243,
+          "min": 202,
+          "max": 312
+        },
+        "read_p99_us": {
+          "median": 406,
+          "min": 348,
+          "max": 477
+        }
+      },
+      "bounded": {
+        "ops_per_second": {
+          "median": 4067.335246895128,
+          "min": 3849.2524095483,
+          "max": 4369.585160601478
+        },
+        "write_p50_us": {
+          "median": 7762,
+          "min": 7578,
+          "max": 7857
+        },
+        "write_p95_us": {
+          "median": 10048,
+          "min": 9652,
+          "max": 10452
+        },
+        "write_p99_us": {
+          "median": 14543,
+          "min": 12090,
+          "max": 15142
+        },
+        "read_p50_us": {
+          "median": 100,
+          "min": 93,
+          "max": 108
+        },
+        "read_p95_us": {
+          "median": 257,
+          "min": 181,
+          "max": 272
+        },
+        "read_p99_us": {
+          "median": 422,
+          "min": 272,
+          "max": 443
+        }
+      },
+      "median_change_pct": {
+        "ops_per_second": 13.29196964550896,
+        "write_p50_us": -1.547437848807709,
+        "write_p95_us": -1.9802946054043535,
+        "write_p99_us": -34.67343455215165,
+        "read_p50_us": -10.71428571428571,
+        "read_p95_us": 5.7613168724279795,
+        "read_p99_us": 3.9408866995073843
+      }
+    },
+    "deadline/3": {
+      "baseline": {
+        "ops_per_second": {
+          "median": 360.9002467889745,
+          "min": 322.43098208749694,
+          "max": 389.180086008799
+        },
+        "write_p50_us": {
+          "median": 74286,
+          "min": 65657,
+          "max": 89586
+        },
+        "write_p95_us": {
+          "median": 192578,
+          "min": 182639,
+          "max": 193749
+        },
+        "write_p99_us": {
+          "median": 264039,
+          "min": 259622,
+          "max": 267671
+        },
+        "read_p50_us": {
+          "median": 105,
+          "min": 104,
+          "max": 113
+        },
+        "read_p95_us": {
+          "median": 148,
+          "min": 146,
+          "max": 166
+        },
+        "read_p99_us": {
+          "median": 197,
+          "min": 190,
+          "max": 218
+        }
+      },
+      "bounded": {
+        "ops_per_second": {
+          "median": 2065.1012046379615,
+          "min": 1755.5731847300563,
+          "max": 2222.152756083378
+        },
+        "write_p50_us": {
+          "median": 16781,
+          "min": 10558,
+          "max": 16791
+        },
+        "write_p95_us": {
+          "median": 21612,
+          "min": 20867,
+          "max": 28712
+        },
+        "write_p99_us": {
+          "median": 33702,
+          "min": 28641,
+          "max": 54844
+        },
+        "read_p50_us": {
+          "median": 86,
+          "min": 86,
+          "max": 87
+        },
+        "read_p95_us": {
+          "median": 137,
+          "min": 135,
+          "max": 141
+        },
+        "read_p99_us": {
+          "median": 192,
+          "min": 183,
+          "max": 195
+        }
+      },
+      "median_change_pct": {
+        "ops_per_second": 472.208310471305,
+        "write_p50_us": -77.41027919123388,
+        "write_p95_us": -88.77753429779102,
+        "write_p99_us": -87.23597650347108,
+        "read_p50_us": -18.0952380952381,
+        "read_p95_us": -7.432432432432434,
+        "read_p99_us": -2.538071065989844
+      }
+    }
+  }
+}

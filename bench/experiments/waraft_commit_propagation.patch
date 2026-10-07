@@ -1,0 +1,22 @@
+# Apply after waraft_commit_deadline.patch. Experimental; NOT recommended yet.
+diff --git a/src/wa_raft_server.erl b/src/wa_raft_server.erl
+--- a/src/wa_raft_server.erl
++++ b/src/wa_raft_server.erl
+@@ -1316,7 +1316,16 @@
+     State3 = leader_advance_commit_index(State2),
+     State4 = leader_apply_log(State3),
+     ?RAFT_GATHER(Table, 'leader.apply.func', erlang:monotonic_time(microsecond) - StartT),
+-    {keep_state, maybe_heartbeat(State4), ?HEARTBEAT_TIMEOUT(State4)};
++    % Followers already persisted this prefix, but must learn its newly
++    % committed index before applying it. Propagate that progress immediately
++    % instead of waiting for the idle heartbeat timer. Do not flush a pending
++    % client batch here: its original batching deadline remains authoritative.
++    State5 = case State4#raft_state.commit_index > CommitIndex andalso
++        State4#raft_state.handover =:= undefined of
++        true -> lists:foldl(fun heartbeat/2, State4, config_participant_identities(config(State4)));
++        false -> maybe_heartbeat(State4)
++    end,
++    {keep_state, State5, ?HEARTBEAT_TIMEOUT(State5)};
+
+ %% and failures.
+ leader(

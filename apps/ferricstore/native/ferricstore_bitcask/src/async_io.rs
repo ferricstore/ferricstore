@@ -646,11 +646,7 @@ mod tests {
             handles.push(rt.spawn_blocking(move || {
                 let now = active.fetch_add(1, Ordering::SeqCst) + 1;
 
-                max_seen
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |prev| {
-                        Some(prev.max(now))
-                    })
-                    .ok();
+                max_seen.fetch_max(now, Ordering::SeqCst);
 
                 std::thread::sleep(Duration::from_millis(200));
                 active.fetch_sub(1, Ordering::SeqCst);

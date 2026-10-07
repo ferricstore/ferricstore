@@ -120,7 +120,7 @@
         writer.commit().unwrap();
 
         let mut reader = HintReader::open(&path).unwrap();
-        assert!(reader.read_all().unwrap().is_empty());
+        assert_eq!(reader.read_all().unwrap().len(), 0);
     }
 
     // ------------------------------------------------------------------

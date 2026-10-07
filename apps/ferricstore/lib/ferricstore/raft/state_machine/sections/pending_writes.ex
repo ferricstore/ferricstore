@@ -344,9 +344,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
       end
 
       defp publish_pending_batch(state, file_id, batch, locations, publication) do
-        ctx = Map.get(state, :instance_ctx, %{})
-
-        Ferricstore.Store.PublicationEpoch.with_write(ctx, state.shard_index, fn ->
+        Ferricstore.Store.PromotedPublication.publish_existing(state, fn ->
           Ferricstore.LatencyTrace.maybe_span "server_pending_locations_us" do
             apply_pending_batch_locations(state, file_id, batch, locations, publication)
           end

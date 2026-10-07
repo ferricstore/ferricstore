@@ -48,7 +48,7 @@
         let path = dir.path().join("data.log");
         let mut w = LogWriter::open(&path, 1).unwrap();
         let results = w.write_batch_nosync(&[]).unwrap();
-        assert!(results.is_empty());
+        assert_eq!(results.len(), 0);
         assert_eq!(w.offset, 0);
     }
 
@@ -159,7 +159,7 @@
 
         let results = w.write_ops_batch_nosync(&[]).unwrap();
 
-        assert!(results.is_empty());
+        assert_eq!(results.len(), 0);
         assert_eq!(w.offset, 0);
     }
 
@@ -394,9 +394,9 @@
         let mut reader = LogReader::open(&path).unwrap();
         let records = reader.iter_from_start().unwrap();
         assert_eq!(records.len(), 2);
-        assert!(records[0].key.is_empty());
+        assert_eq!(records[0].key, b"");
         assert_eq!(records[0].value, Some(b"present".to_vec()));
-        assert!(records[1].key.is_empty());
+        assert_eq!(records[1].key, b"");
         assert_eq!(records[1].value, None);
     }
 
@@ -484,7 +484,7 @@
 
         let results = w.write_ops_batch_nosync(&[]).unwrap();
 
-        assert!(results.is_empty());
+        assert_eq!(results.len(), 0);
         assert_eq!(w.offset, offset_before);
         assert_eq!(fs::metadata(&path).unwrap().len(), offset_before);
     }
@@ -802,4 +802,3 @@
     // ------------------------------------------------------------------
     // C-4: encode_record uses a single Vec allocation
     // ------------------------------------------------------------------
-

@@ -1,0 +1,70 @@
+{
+  "reclaimed": {
+    "directories": 23,
+    "offset_entries": 188462
+  },
+  "after_reclaim": {
+    "bytes": 2938296,
+    "entries": 8194
+  },
+  "diagnostic_only": true,
+  "workspace_source_sha256": {
+    "apps/ferricstore/src/ferricstore_waraft_spike_segment_log.erl": "7945f084cddc5737c68ec04b7bb6cdcbb37807c23762cbff65dac2a576a1416f",
+    "apps/ferricstore/src/ferricstore_waraft_spike_segment_log/sections/part_01.hrl": "ed20b0f55256676940eb22f465504eab33b435b812b1ec47c873d70266e62bfb",
+    "apps/ferricstore/src/ferricstore_waraft_spike_segment_log/sections/part_02.hrl": "0c2d354f4525b54077610fddcf80b8b8cb1759d4f0a3f97c42702da89bc7805d",
+    "apps/ferricstore/src/ferricstore_waraft_spike_segment_log/sections/part_03.hrl": "59fa4d07062ed62e0a5552c8cf25311dd650b42e34c07fcf5133df7d6ac7e668",
+    "apps/ferricstore/src/ferricstore_waraft_spike_segment_log/sections/part_04.hrl": "ceaafe48ce56e58cd3b904ad54e50ba738a2d694410754022911ca5a6f1cedaa",
+    "apps/ferricstore/src/ferricstore_waraft_spike_segment_log/sections/part_05.hrl": "6374d05541d73dbd388dee7014025435ce80b3d96fc21de07ca8561ab9e730b5",
+    "apps/ferricstore/src/ferricstore_waraft_spike_segment_log/sections/part_06.hrl": "cfe38f1828c808c9641d27b712484bb00ddd92e8e8c232294426cf045fb61234",
+    "apps/ferricstore/src/ferricstore_waraft_spike_segment_log/sections/part_07.hrl": "f93d9bdf9021bbbc2bca7848b78c39f6d4b64e688d92eb1bb5212efd3f91c16a"
+  },
+  "loaded_provider_md5": "11b393416058e367e0d86f5a948a735d",
+  "offset_scan_mode": "raw",
+  "created_full_stages": 10,
+  "repeated_failures": [
+    {
+      "bytes": 1496504,
+      "entries": 8194
+    },
+    {
+      "bytes": 1496504,
+      "entries": 8194
+    },
+    {
+      "bytes": 1496504,
+      "entries": 8194
+    },
+    {
+      "bytes": 1496504,
+      "entries": 8194
+    },
+    {
+      "bytes": 1496504,
+      "entries": 8194
+    },
+    {
+      "bytes": 1496504,
+      "entries": 8194
+    },
+    {
+      "bytes": 1496504,
+      "entries": 8194
+    },
+    {
+      "bytes": 1496504,
+      "entries": 8194
+    },
+    {
+      "bytes": 1496504,
+      "entries": 8194
+    },
+    {
+      "bytes": 1496504,
+      "entries": 8194
+    }
+  ],
+  "before_reclaim": {
+    "bytes": 33092216,
+    "entries": 196656
+  }
+}

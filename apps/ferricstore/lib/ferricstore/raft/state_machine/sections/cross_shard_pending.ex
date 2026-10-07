@@ -414,57 +414,60 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
       # :pending locations and returns the disk error instead of acknowledging
       # success to the caller.
       defp with_pending_writes(state, fun) do
-        init_pending_write_process_state(state)
-        started_at = System.monotonic_time()
+        Ferricstore.Store.PromotedPublication.with_scope(fn ->
+          init_pending_write_process_state(state)
+          started_at = System.monotonic_time()
 
-        try do
-          {command_result, publication} = split_pending_write_result(fun.())
+          try do
+            {command_result, publication} = split_pending_write_result(fun.())
 
-          result = state_storage_failure_result(command_result)
+            result = state_storage_failure_result(command_result)
 
-          if pending_write_error_result?(result) do
-            rollback_pending_writes(state)
-            emit_raft_apply_telemetry(state, started_at, result, :rolled_back)
-            result
-          else
-            flush_result = flush_pending_writes(state, publication)
-            emit_raft_apply_telemetry(state, started_at, result, flush_result)
+            if pending_write_error_result?(result) do
+              rollback_pending_writes(state)
+              emit_raft_apply_telemetry(state, started_at, result, :rolled_back)
+              result
+            else
+              flush_result = flush_pending_writes(state, publication)
+              emit_raft_apply_telemetry(state, started_at, result, flush_result)
 
-            case flush_result do
-              :ok ->
-                case publish_pending_prob_files(state) do
-                  :ok ->
-                    publish_pending_compound_revisions(state)
-                    dispatch_pending_compound_promotions(state)
+              case flush_result do
+                :ok ->
+                  case publish_pending_prob_files(state) do
+                    :ok ->
+                      publish_pending_compound_revisions(state)
+                      Ferricstore.Store.PromotedPublication.finish()
+                      dispatch_pending_compound_promotions(state)
 
-                    case publish_pending_flow_history_projections(state) do
-                      :ok ->
-                        result
+                      case publish_pending_flow_history_projections(state) do
+                        :ok ->
+                          result
 
-                      {:error, reason} ->
-                        handle_flow_history_projection_publish_failure(state, reason)
-                        result
-                    end
+                        {:error, reason} ->
+                          handle_flow_history_projection_publish_failure(state, reason)
+                          result
+                      end
 
-                  {:error, _reason} = error ->
-                    error
-                end
+                    {:error, _reason} = error ->
+                      error
+                  end
 
-              {:error, _reason} = error ->
-                error
+                {:error, _reason} = error ->
+                  error
+              end
             end
+          rescue
+            error ->
+              rollback_pending_writes_unless_published(state)
+              reraise error, __STACKTRACE__
+          catch
+            kind, reason ->
+              rollback_pending_writes_unless_published(state)
+              :erlang.raise(kind, reason, __STACKTRACE__)
+          after
+            clear_pending_write_process_state()
           end
-        rescue
-          error ->
-            rollback_pending_writes_unless_published(state)
-            reraise error, __STACKTRACE__
-        catch
-          kind, reason ->
-            rollback_pending_writes_unless_published(state)
-            :erlang.raise(kind, reason, __STACKTRACE__)
-        after
-          clear_pending_write_process_state()
-        end
+        end)
       end
 
       # Most commands publish through the generic pending-write path. A

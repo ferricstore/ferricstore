@@ -321,6 +321,17 @@ defmodule Ferricstore.Raft.FlushShardApplyTest do
 
   test "derived cleanup failure keeps dedicated storage and succeeds on replay" do
     %{state: state, keydir: keydir} = start_state()
+    latch = :ets.new(:flush_publication_latch, [:set, :public])
+    refs = put_elem(Tuple.duplicate(nil, state.shard_index + 1), state.shard_index, latch)
+
+    ctx = %{
+      name: state.instance_name,
+      latch_refs: refs,
+      checkpoint_flags: :atomics.new(state.shard_index + 1, signed: false),
+      disk_pressure: :atomics.new(state.shard_index + 1, signed: false)
+    }
+
+    state = %{state | instance_ctx: ctx}
     key = "flush-derived-failure"
     true = :ets.insert(keydir, {key, "value", 0, LFU.initial(), 0, 0, 5})
 
@@ -342,16 +353,20 @@ defmodule Ferricstore.Raft.FlushShardApplyTest do
     )
 
     try do
-      assert {_old_state,
-              {:applied_at, 41,
+      assert {_old_state, {:applied_at, 41, outcome}, _effects} =
+               StateMachine.apply(%{index: 41}, {:flush_shard, {1, 0}}, state)
+
+      assert outcome ==
                {:error,
                 {:flush_shard_apply_failed,
                  {:flush_derived_state_cleanup_failed,
-                  {:lmdb_clear_failed, :forced_lmdb_clear_failure}}}}}, _effects} =
-               StateMachine.apply(%{index: 41}, {:flush_shard, {1, 0}}, state)
+                  {:lmdb_clear_failed, :forced_lmdb_clear_failure}}}}
 
       assert [] == :ets.lookup(keydir, key)
       assert File.dir?(dedicated_root)
+
+      assert Ferricstore.Store.PromotedPublication.read(ctx, state.shard_index, fn -> :partial end) ==
+               :fallback
     after
       Application.delete_env(:ferricstore, :flush_derived_lmdb_clear_hook)
     end
@@ -360,6 +375,9 @@ defmodule Ferricstore.Raft.FlushShardApplyTest do
              StateMachine.apply(%{index: 41}, {:flush_shard, {1, 0}}, state)
 
     refute File.exists?(dedicated_root)
+
+    assert Ferricstore.Store.PromotedPublication.read(ctx, state.shard_index, fn -> :recovered end) ==
+             :recovered
   end
 
   test "stream cache cleanup failure leaves the page durable rows replayable" do

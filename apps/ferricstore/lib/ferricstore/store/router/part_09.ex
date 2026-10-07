@@ -1402,6 +1402,22 @@ defmodule Ferricstore.Store.Router.Part09 do
       # Compound key operations
       # -------------------------------------------------------------------
 
+      @doc false
+      @spec hset_single(FerricStore.Instance.t(), binary(), binary(), binary()) ::
+              0 | 1 | :unsupported | {:error, term()}
+      def hset_single(ctx, key, field, value) do
+        if selected_waraft_ctx?(ctx) and
+             not Ferricstore.Raft.BlobCommand.side_channel_candidate?(ctx, {:put, key, value, 0}) do
+          # Type validation, field existence and publication belong to one Raft
+          # operation. A separate type claim adds a durable round trip and makes
+          # concurrent callers compute their insertion counts before apply. Blob
+          # candidates retain the ref-aware compound batch preparation path.
+          raft_write(ctx, shard_for(ctx, key), key, {:hset_single, key, field, value})
+        else
+          :unsupported
+        end
+      end
+
       @spec compound_get(FerricStore.Instance.t(), binary(), binary()) ::
               binary() | nil | ReadResult.failure()
       def compound_get(ctx, redis_key, compound_key) do
@@ -1411,9 +1427,43 @@ defmodule Ferricstore.Store.Router.Part09 do
         now = ExpiryContext.now_ms(expiry_context)
 
         if promoted_data_compound_key?(keydir, redis_key, compound_key, now) do
-          fallback_compound_get(ctx, idx, redis_key, compound_key)
+          case promoted_hot_compound_get(ctx, idx, keydir, compound_key) do
+            {:hit, value, lfu} ->
+              sampled_read_bookkeeping_fast(ctx, keydir, compound_key, lfu)
+              value
+
+            :fallback ->
+              fallback_compound_get(ctx, idx, redis_key, compound_key)
+          end
         else
           compound_get_from_keydir(ctx, idx, keydir, redis_key, compound_key, expiry_context)
+        end
+      end
+
+      defp promoted_hot_compound_get(ctx, idx, keydir, compound_key) do
+        # Default WARaft mutations publish through the protected apply path.
+        # Other execution adapters retain their serialized promoted reader.
+        if selected_waraft_ctx?(ctx) do
+          Ferricstore.Store.PromotedPublication.read(ctx, idx, fn ->
+            try do
+              case :ets.lookup(keydir, compound_key) do
+                [{^compound_key, value, 0, lfu, _fid, _off, _vsize}] when is_binary(value) ->
+                  {:hit, value, lfu}
+
+                [{^compound_key, value, exp, lfu, _fid, _off, _vsize}]
+                when is_binary(value) and is_integer(exp) and exp > 0 ->
+                  current_ms = ExpiryContext.capture() |> ExpiryContext.now_ms()
+                  if exp > current_ms, do: {:hit, value, lfu}, else: :fallback
+
+                _ ->
+                  :fallback
+              end
+            rescue
+              ArgumentError -> :fallback
+            end
+          end)
+        else
+          :fallback
         end
       end
 

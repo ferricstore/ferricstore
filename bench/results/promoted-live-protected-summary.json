@@ -1,0 +1,349 @@
+{
+  "cohort": "protected",
+  "aggregation": "per-trial histogram percentiles, then medians/ranges across 3 trials",
+  "trials": [
+    {
+      "variant": "baseline",
+      "trial": 1,
+      "operations": {
+        "hash_write": {
+          "count": 26839,
+          "max_us": 754260,
+          "p50_us": 60700,
+          "p95_us": 75100,
+          "p99_us": 85800
+        },
+        "hash_read": {
+          "count": 53677,
+          "max_us": 606782,
+          "p50_us": 77,
+          "p95_us": 20200,
+          "p99_us": 29600
+        },
+        "kv_read": {
+          "count": 26838,
+          "max_us": 253,
+          "p50_us": 3,
+          "p95_us": 8,
+          "p99_us": 14
+        }
+      },
+      "ops_per_second": 890.4615282987047,
+      "compactions": 4,
+      "compaction_failures": 0
+    },
+    {
+      "variant": "baseline",
+      "trial": 2,
+      "operations": {
+        "hash_write": {
+          "count": 26777,
+          "max_us": 784492,
+          "p50_us": 59800,
+          "p95_us": 75100,
+          "p99_us": 85500
+        },
+        "hash_read": {
+          "count": 53553,
+          "max_us": 606002,
+          "p50_us": 77,
+          "p95_us": 22700,
+          "p99_us": 31400
+        },
+        "kv_read": {
+          "count": 26776,
+          "max_us": 99,
+          "p50_us": 3,
+          "p95_us": 8,
+          "p99_us": 13
+        }
+      },
+      "ops_per_second": 888.4577856507374,
+      "compactions": 4,
+      "compaction_failures": 0
+    },
+    {
+      "variant": "baseline",
+      "trial": 3,
+      "operations": {
+        "hash_write": {
+          "count": 26166,
+          "max_us": 835858,
+          "p50_us": 61500,
+          "p95_us": 77900,
+          "p99_us": 91200
+        },
+        "hash_read": {
+          "count": 52329,
+          "max_us": 625895,
+          "p50_us": 87,
+          "p95_us": 23200,
+          "p99_us": 31500
+        },
+        "kv_read": {
+          "count": 26163,
+          "max_us": 230,
+          "p50_us": 3,
+          "p95_us": 9,
+          "p99_us": 15
+        }
+      },
+      "ops_per_second": 867.746583804377,
+      "compactions": 4,
+      "compaction_failures": 0
+    },
+    {
+      "variant": "protected",
+      "trial": 1,
+      "operations": {
+        "hash_write": {
+          "count": 25832,
+          "max_us": 854692,
+          "p50_us": 70400,
+          "p95_us": 95900,
+          "p99_us": 117000
+        },
+        "hash_read": {
+          "count": 51664,
+          "max_us": 1365,
+          "p50_us": 7,
+          "p95_us": 15,
+          "p99_us": 22
+        },
+        "kv_read": {
+          "count": 25832,
+          "max_us": 291,
+          "p50_us": 4,
+          "p95_us": 8,
+          "p99_us": 12
+        }
+      },
+      "ops_per_second": 857.1356568317108,
+      "compactions": 4,
+      "compaction_failures": 0
+    },
+    {
+      "variant": "protected",
+      "trial": 2,
+      "operations": {
+        "hash_write": {
+          "count": 26471,
+          "max_us": 827634,
+          "p50_us": 67100,
+          "p95_us": 95100,
+          "p99_us": 141000
+        },
+        "hash_read": {
+          "count": 52942,
+          "max_us": 5757,
+          "p50_us": 8,
+          "p95_us": 20,
+          "p99_us": 35
+        },
+        "kv_read": {
+          "count": 26471,
+          "max_us": 505,
+          "p50_us": 5,
+          "p95_us": 12,
+          "p99_us": 21
+        }
+      },
+      "ops_per_second": 877.5043056211815,
+      "compactions": 4,
+      "compaction_failures": 0
+    },
+    {
+      "variant": "protected",
+      "trial": 3,
+      "operations": {
+        "hash_write": {
+          "count": 27060,
+          "max_us": 759151,
+          "p50_us": 66600,
+          "p95_us": 89700,
+          "p99_us": 110000
+        },
+        "hash_read": {
+          "count": 54120,
+          "max_us": 342,
+          "p50_us": 7,
+          "p95_us": 17,
+          "p99_us": 27
+        },
+        "kv_read": {
+          "count": 27060,
+          "max_us": 125,
+          "p50_us": 4,
+          "p95_us": 9,
+          "p99_us": 15
+        }
+      },
+      "ops_per_second": 897.4201657541016,
+      "compactions": 4,
+      "compaction_failures": 0
+    }
+  ],
+  "variants": {
+    "baseline": {
+      "ops_per_second": {
+        "median": 888.4577856507374,
+        "min": 867.746583804377,
+        "max": 890.4615282987047
+      },
+      "hash_write_p50_us": {
+        "median": 60700,
+        "min": 59800,
+        "max": 61500
+      },
+      "hash_write_p95_us": {
+        "median": 75100,
+        "min": 75100,
+        "max": 77900
+      },
+      "hash_write_p99_us": {
+        "median": 85800,
+        "min": 85500,
+        "max": 91200
+      },
+      "hash_write_max_us": {
+        "median": 784492,
+        "min": 754260,
+        "max": 835858
+      },
+      "hash_read_p50_us": {
+        "median": 77,
+        "min": 77,
+        "max": 87
+      },
+      "hash_read_p95_us": {
+        "median": 22700,
+        "min": 20200,
+        "max": 23200
+      },
+      "hash_read_p99_us": {
+        "median": 31400,
+        "min": 29600,
+        "max": 31500
+      },
+      "hash_read_max_us": {
+        "median": 606782,
+        "min": 606002,
+        "max": 625895
+      },
+      "kv_read_p50_us": {
+        "median": 3,
+        "min": 3,
+        "max": 3
+      },
+      "kv_read_p95_us": {
+        "median": 8,
+        "min": 8,
+        "max": 9
+      },
+      "kv_read_p99_us": {
+        "median": 14,
+        "min": 13,
+        "max": 15
+      },
+      "kv_read_max_us": {
+        "median": 230,
+        "min": 99,
+        "max": 253
+      }
+    },
+    "protected": {
+      "ops_per_second": {
+        "median": 877.5043056211815,
+        "min": 857.1356568317108,
+        "max": 897.4201657541016
+      },
+      "hash_write_p50_us": {
+        "median": 67100,
+        "min": 66600,
+        "max": 70400
+      },
+      "hash_write_p95_us": {
+        "median": 95100,
+        "min": 89700,
+        "max": 95900
+      },
+      "hash_write_p99_us": {
+        "median": 117000,
+        "min": 110000,
+        "max": 141000
+      },
+      "hash_write_max_us": {
+        "median": 827634,
+        "min": 759151,
+        "max": 854692
+      },
+      "hash_read_p50_us": {
+        "median": 7,
+        "min": 7,
+        "max": 8
+      },
+      "hash_read_p95_us": {
+        "median": 17,
+        "min": 15,
+        "max": 20
+      },
+      "hash_read_p99_us": {
+        "median": 27,
+        "min": 22,
+        "max": 35
+      },
+      "hash_read_max_us": {
+        "median": 1365,
+        "min": 342,
+        "max": 5757
+      },
+      "kv_read_p50_us": {
+        "median": 4,
+        "min": 4,
+        "max": 5
+      },
+      "kv_read_p95_us": {
+        "median": 9,
+        "min": 8,
+        "max": 12
+      },
+      "kv_read_p99_us": {
+        "median": 15,
+        "min": 12,
+        "max": 21
+      },
+      "kv_read_max_us": {
+        "median": 291,
+        "min": 125,
+        "max": 505
+      }
+    }
+  },
+  "router_checksums": {
+    "baseline": "23efba0228a5706f4bd85f997affa155",
+    "protected": "cb91db20edc0ab4ed2b832fd3543a68e"
+  },
+  "publication_identity": {
+    "otp": "29",
+    "elixir": "1.20.4",
+    "sha256": {
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/apply_dispatch.ex": "4430c0c7b4b9cd8e0b94b9123fa5cb3618347dfed619722593e192d0360a65eb",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/compound_apply.ex": "c1618c09b9bfb2992ee931ff124f270432d60dd35e4bb34dc6ab580f1170fb4a",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/cross_shard_pending.ex": "186833ef6db9a8bd401b313f9cb69aa4463b194f9f36bd74d8fea80b78179c25",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/pending_writes.ex": "8409fe625dbfbc8be11ec2a4c9d59ba4c89e4e20a7ef0203d8902385dce96898",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/read_warm.ex": "42317fe19049327ffeeb15688d44829529e47936a993fbd33031bde9abab3ef5",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_storage/sections/lifecycle.ex": "19df67af92f6e4047114e56482cfba5da3085633faa349f29406d74e24ac45ff",
+      "apps/ferricstore/lib/ferricstore/store/promoted_publication.ex": "25a4d28f6f38c8225a82087396d873c3f6e09b57e422fb097bd6c73084b3ed23",
+      "apps/ferricstore/lib/ferricstore/store/publication_epoch.ex": "370bd4826e3373bd655cbc20761b75196b05c6c53685775f15e0fc505c0108f5",
+      "apps/ferricstore/lib/ferricstore/store/shard/compound/ops.ex": "d23784f27ed86cb61396c186aa88400939e7388c2c144ef17e735f20c30e19ef",
+      "apps/ferricstore/lib/ferricstore/store/shard/startup.ex": "86078bdf66da2545e2291ac1e9133235631dae7bfa7984fc6e639053e4a7d579"
+    },
+    "beam_md5": {
+      "Ferricstore.Raft.StateMachine": "de513a33b11cfb289acf752a9970a257",
+      "Ferricstore.Raft.WARaftStorage": "41f57f34d29d4f137cc413f90df13ab1",
+      "Ferricstore.Store.PromotedPublication": "3047ff37768d7a89773902acc3bd3467",
+      "Ferricstore.Store.PublicationEpoch": "41ff76f4390d8bac7bfca10bb3369e9a"
+    },
+    "erl_flags": "+S 8:8"
+  }
+}

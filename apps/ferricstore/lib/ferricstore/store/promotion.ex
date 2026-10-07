@@ -2924,7 +2924,7 @@ defmodule Ferricstore.Store.Promotion do
 
   defp numeric_log_file_id(dir, name) do
     with {:ok, fid} <- SegmentFilename.parse(name),
-         {:ok, %File.Stat{type: :regular}} <- File.lstat(Path.join(dir, name)) do
+         {:ok, %File.Stat{type: :regular}} <- File.lstat(Path.join(dir, name), [:raw]) do
       {:ok, fid}
     else
       {:error, _reason} = error -> error

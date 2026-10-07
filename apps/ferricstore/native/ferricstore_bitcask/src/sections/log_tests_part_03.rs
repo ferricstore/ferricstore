@@ -4,7 +4,7 @@
         assert_eq!(encoded.len(), HEADER_SIZE);
         let mut cursor = io::Cursor::new(&encoded);
         let r = read_next_record(&mut cursor).unwrap().unwrap();
-        assert!(r.key.is_empty());
+        assert_eq!(r.key, b"");
         // Empty value is valid (value_size=0), not a tombstone (value_size=TOMBSTONE)
         assert_eq!(r.value, Some(vec![]));
     }
@@ -322,7 +322,7 @@
         let mut w = LogWriter::open(&path, 1).unwrap();
 
         let offsets = w.write_batch_nosync(&[]).unwrap();
-        assert!(offsets.is_empty());
+        assert_eq!(offsets.len(), 0);
         assert_eq!(w.offset, 0);
     }
 

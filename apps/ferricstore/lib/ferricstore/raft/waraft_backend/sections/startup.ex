@@ -77,12 +77,16 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
       defp startup_partition_concurrency(_count), do: 1
 
       defp startup_wait_attempts do
-        :ferricstore
-        |> Application.get_env(:waraft_start_wait_timeout_ms, 300_000)
-        |> then(&positive_integer_option!(:waraft_start_wait_timeout_ms, &1))
+        startup_wait_timeout_ms()
         |> Kernel.+(9)
         |> div(10)
         |> max(1)
+      end
+
+      defp startup_wait_timeout_ms do
+        :ferricstore
+        |> Application.get_env(:waraft_start_wait_timeout_ms, 300_000)
+        |> then(&positive_integer_option!(:waraft_start_wait_timeout_ms, &1))
       end
 
       defp finish_start(shard_count, opts) do

@@ -102,6 +102,53 @@ defmodule Ferricstore.Raft.WARaftBackendBatcherAdmissionTest do
     assert %{batch_slot: nil} = :sys.get_state(pid)
   end
 
+  test "synchronous single queue bounds retained bytes behind an in-flight flush" do
+    pid = start_batcher(65_020, hot_batch_max: 1_000)
+    install_hot_queue(pid, :batch, :batch_slot, 1)
+    large = :binary.copy("x", 1_048_500)
+
+    :sys.replace_state(pid, fn state ->
+      slot = %{
+        state.batch_slot
+        | groups: [{{self(), make_ref()}, [{:hset_single, "hash", "a", large}]}]
+      }
+
+      %{state | batch_slot: slot}
+    end)
+
+    assert {:error, :batcher_overloaded} =
+             GenServer.call(
+               pid,
+               {:write_single, {:hset_single, "hash", "b", :binary.copy("y", 256)}, 0}
+             )
+
+    assert :sys.get_state(pid).batch_slot.count == 1
+    assert Process.alive?(pid)
+  end
+
+  test "a single submission does not retry when its batcher dies after handoff" do
+    previous_hook = Application.get_env(:ferricstore, :waraft_backend_batcher_call_hook)
+    Application.put_env(:ferricstore, :waraft_backend_batcher_call_hook, {:block, self()})
+    on_exit(fn -> restore_env(:waraft_backend_batcher_call_hook, previous_hook) end)
+    index = 65_021
+    pid = start_batcher(index, hot_batch_max: 128)
+
+    caller =
+      Task.async(fn -> Batcher.write_single(index, {:hset_single, "hash", "field", "value"}) end)
+
+    assert_receive {:waraft_backend_batcher_call, :__commit_single_batch_direct__, _ref, worker},
+                   1_000
+
+    try do
+      Process.exit(pid, :kill)
+      assert Task.await(caller, 1_000) == {:error, {:timeout, :unknown_outcome}}
+      refute_receive {:waraft_backend_batcher_call, _function, _ref, _pid}, 20
+    after
+      if Process.alive?(worker), do: Process.exit(worker, :kill)
+      Task.shutdown(caller, :brutal_kill)
+    end
+  end
+
   test "generic queue rolls over an idle partial slot for an individually valid group" do
     previous_hook = Application.get_env(:ferricstore, :waraft_backend_batcher_call_hook)
     Application.put_env(:ferricstore, :waraft_backend_batcher_call_hook, {:block, self()})

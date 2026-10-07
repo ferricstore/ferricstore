@@ -68,7 +68,7 @@ rewrite_marker_path(Dir) ->
     filename:join(filename:dirname(Dir), filename:basename(Dir) ++ ?REWRITE_MARKER_EXT).
 
 path_exists(Path) ->
-    case file:read_link_info(Path) of
+    case file:read_link_info(Path, [raw]) of
         {ok, #file_info{type = directory}} -> true;
         {ok, #file_info{type = Type}} -> {error, {unsafe_rewrite_path, Path, Type}};
         {error, enoent} -> false;
@@ -78,14 +78,41 @@ path_exists(Path) ->
 remove_tree(Path) ->
     case path_exists(Path) of
         true ->
-            case file:del_dir_r(Path) of
-                ok -> ok;
-                {error, Reason} -> {error, {remove_tree, Path, Reason}}
+            case close_writers_for_dir(Path) of
+                ok ->
+                    case file:del_dir_r(Path) of
+                        ok -> retire_segment_runtime_dir(Path);
+                        {error, Reason} -> {error, {remove_tree, Path, Reason}}
+                    end;
+                {error, _Reason} = Error -> Error
             end;
         false ->
-            ok;
+            case close_writers_for_dir(Path) of
+                ok -> retire_segment_runtime_dir(Path);
+                {error, _Reason} = Error -> Error
+            end;
         {error, _Reason} = Error ->
             Error
+    end.
+
+rename_rewrite_dir(From, To) ->
+    case close_writers_for_dir(From) of
+        ok ->
+            case close_writers_for_dir(To) of
+                ok ->
+                    %% Trust belongs to the physical log, not its old path.
+                    %% A rollback must not trust a stale, CRC-valid sidecar.
+                    Untrusted = persistent_term:get(
+                        {?MODULE, offset_index_untrusted, offset_dir_key(From)}, false),
+                    case file:rename(From, To) of
+                        ok ->
+                            ok = retire_segment_runtime_dir(To, Untrusted),
+                            retire_segment_runtime_dir(From);
+                        {error, Reason} -> {error, {rename, From, To, Reason}}
+                    end;
+                {error, _Reason} = Error -> Error
+            end;
+        {error, _Reason} = Error -> Error
     end.
 
 rename_path(From, To) ->
@@ -99,6 +126,15 @@ delete_file_if_exists(Path) ->
         ok -> ok;
         {error, enoent} -> ok;
         {error, Reason} -> {error, {delete_file, Path, Reason}}
+    end.
+
+%% Existing local metadata must not queue behind the shared file_server_2.
+%% Keep the same file_info/type checks; directory creation retains filelib's
+%% ordinary error handling when the parent is not already present.
+metadata_ensure_dir(Path) ->
+    case file:read_link_info(filename:dirname(Path), [raw]) of
+        {ok, #file_info{type = directory}} -> ok;
+        _Other -> filelib:ensure_dir(Path)
     end.
 
 write_file_sync(Path, Binary) ->
@@ -548,6 +584,8 @@ maybe_run_sync_dir_hook(BinaryPath) ->
         {ok, {fail_on_count, Target, Notify, Count0}}
             when is_integer(Target), Target > 0, is_integer(Count0) ->
             maybe_fail_sync_dir_count(BinaryPath, Target, Notify, Count0 + 1);
+        {ok, Hook} when is_function(Hook, 1) ->
+            Hook(BinaryPath);
         _ ->
             ok
     end.
