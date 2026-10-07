@@ -6,6 +6,8 @@ All notable changes to FerricStore will be documented here.
 
 ## 0.11.24 - 2026-10-06
 
+- Update Mint to 1.10.2 to address the newly published HTTP response-framing and
+  HTTP/2 memory-limit advisories, and retain strict native checks on Rust 1.99.
 - Retire temporary WARaft rewrite offsets and metadata when directories are
   removed or replaced, and periodically reclaim indexes for already-abandoned
   rewrite directories. Protect live writers, preserve rollback sidecar trust,

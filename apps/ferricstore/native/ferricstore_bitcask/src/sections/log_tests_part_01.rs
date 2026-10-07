@@ -175,7 +175,7 @@
         let encoded = encode_record(b"", b"value", 0);
         let mut cursor = io::Cursor::new(&encoded);
         let r = read_next_record(&mut cursor).unwrap().unwrap();
-        assert!(r.key.is_empty());
+        assert_eq!(r.key, b"");
         assert_eq!(r.value, Some(b"value".to_vec()));
     }
 
@@ -369,7 +369,7 @@
         let (records, end, done) = reader
             .iter_metadata_page_from_offset_buffered_tolerant(next, 1)
             .unwrap();
-        assert!(records.is_empty());
+        assert_eq!(records.len(), 0);
         assert_eq!(end, next);
         assert!(done);
     }

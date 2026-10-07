@@ -3890,7 +3890,7 @@ mod tests {
             0,
             8,
         );
-        assert!(exclusive.is_empty());
+        assert_eq!(exclusive.len(), 0);
     }
 
     #[test]
@@ -3967,9 +3967,12 @@ mod tests {
         assert_eq!(first, vec![due_a.to_vec(), due_b.to_vec()]);
         let second = index.count_keys_page(false, first.last().map(Vec::as_slice), 2);
         assert_eq!(second, vec![b"plain:a".to_vec(), b"plain:b".to_vec()]);
-        assert!(index
-            .count_keys_page(false, second.last().map(Vec::as_slice), 2)
-            .is_empty());
+        assert_eq!(
+            index
+                .count_keys_page(false, second.last().map(Vec::as_slice), 2)
+                .len(),
+            0
+        );
 
         assert_eq!(index.count_keys_page(true, None, 1), vec![due_a.to_vec()]);
         assert_eq!(
@@ -3979,7 +3982,7 @@ mod tests {
 
         index.set_count(due_a, 0);
         index.remove_count(due_b);
-        assert!(index.count_keys_page(true, None, 2).is_empty());
+        assert_eq!(index.count_keys_page(true, None, 2).len(), 0);
         assert_eq!(
             index.count_keys_page(false, None, 8),
             vec![b"plain:a".to_vec(), b"plain:b".to_vec()]
@@ -4293,7 +4296,7 @@ mod tests {
 
         assert_eq!(lower.key, b"state:tied");
         assert_eq!(lower.score.0, 42.0);
-        assert!(lower.member.is_empty());
+        assert_eq!(lower.member, b"");
         assert!(lower_entry_for_exact_key(b"state:tied", Bound::PosInf).is_none());
     }
 

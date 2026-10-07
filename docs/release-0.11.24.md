@@ -2,8 +2,10 @@
 
 Branch: `codex/release-0.11.24-runtime-hardening`.
 
-Status: preparing the pull request and CI. Merge to `main` and publication of
-`v0.11.24` require the owner's explicit approval after CI verification.
+Pull request: [#48](https://github.com/ferricstore/ferricstore/pull/48).
+
+Status: CI verification and fixes in progress. Merge to `main` and publication
+of `v0.11.24` require the owner's explicit approval after CI verification.
 
 ## Scope
 
@@ -22,6 +24,18 @@ Status: preparing the pull request and CI. Merge to `main` and publication of
 The native wire protocol, SDK minimum server version, and installed WARaft
 dependency stay compatible. Automatic synchronous HSET coalescing defaults off.
 The independent WARaft timer candidate remains outside this release.
+
+## CI follow-up
+
+The first CI run found newly published advisories affecting Mint 1.10.1 and
+Rust 1.99 strict compiler/Clippy findings. The HTTP client minimum is raised to
+patched Mint 1.10.2. Native test assertions retain their exact empty/nonempty
+conditions with explicit diagnostics, and the peak-count test uses the
+equivalent `fetch_max` atomic supported by the existing Rust baseline.
+Local verification passes all three Rust 1.99 Clippy targets, 667 native Rust
+tests, 19 targeted HTTP tests, both Hex dependency audits and lock hygiene.
+Bitcask Clippy also passes on Rust 1.98. The regenerated lock selects Mint
+1.10.2 and its compatible HPAX 1.1.0 dependency; WARaft remains 0.1.0.
 
 ## Verification
 

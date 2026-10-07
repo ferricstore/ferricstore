@@ -670,7 +670,7 @@ mod audit_fix_tests {
 
         let (eof, eof_cursor, eof_done) =
             scan_tombstones_page_from_path(&path, second_cursor, 2).unwrap();
-        assert!(eof.is_empty());
+        assert_eq!(eof.len(), 0);
         assert_eq!(eof_cursor, file_len);
         assert!(eof_done);
     }
@@ -956,7 +956,7 @@ mod audit_fix_tests {
             Err(error) => error,
         };
 
-        assert!(!error.is_empty());
+        assert_ne!(error, "");
         assert!(!outside.join("lmdb").exists());
     }
 
