@@ -313,6 +313,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.HelpersPart02 do
 
         for node <- nodes do
           assert :ok = :rpc.call(node.name, WARaftBackend, :stop, [])
+          stop_peer_context_owner!(node.name, instance_name)
           _ = :rpc.call(node.name, FerricStore.Instance, :cleanup, [instance_name])
         end
 
@@ -325,13 +326,23 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.HelpersPart02 do
         shard_count = Keyword.get(opts, :shard_count, 1)
         backend_opts = Keyword.take(opts, [:election_timeout_ms, :election_timeout_ms_max])
 
-        ctx =
-          :rpc.call(node.name, FerricStore.Instance, :build, [
-            waraft_backend_peer_instance_name(unique),
-            instance_opts(node.data_dir, shard_count: shard_count)
-          ])
+        instance_name = waraft_backend_peer_instance_name(unique)
+        # Instance.build creates ETS latches and other runtime tables. An RPC
+        # worker exits after returning, so a supervised process must own them.
+        owner_spec =
+          {Ferricstore.Test.WARaftPeerContextOwner,
+           instance_name: instance_name,
+           instance_opts: instance_opts(node.data_dir, shard_count: shard_count)}
+
+        {:ok, owner} = :rpc.call(node.name, Supervisor, :start_child, [:kernel_sup, owner_spec])
+        ctx = :rpc.call(node.name, GenServer, :call, [owner, :context])
 
         assert %FerricStore.Instance{} = ctx
+
+        for table <- Tuple.to_list(ctx.latch_refs) do
+          assert :rpc.call(node.name, :ets, :info, [table, :owner]) == owner
+        end
+
         start_peer_lmdb_flush_coordinator!(node.name, ctx.name)
 
         assert :ok =
@@ -340,6 +351,20 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.HelpersPart02 do
                    [bootstrap: false, log_module: :ferricstore_waraft_spike_segment_log] ++
                      backend_opts
                  ])
+      end
+
+      defp stop_peer_context_owner!(node_name, instance_name) do
+        id = {Ferricstore.Test.WARaftPeerContextOwner, instance_name}
+
+        case :rpc.call(node_name, Supervisor, :terminate_child, [:kernel_sup, id]) do
+          :ok -> :ok
+          {:error, :not_found} -> :ok
+        end
+
+        case :rpc.call(node_name, Supervisor, :delete_child, [:kernel_sup, id]) do
+          :ok -> :ok
+          {:error, :not_found} -> :ok
+        end
       end
 
       defp start_peer_lmdb_flush_coordinator!(node_name, instance_name) do

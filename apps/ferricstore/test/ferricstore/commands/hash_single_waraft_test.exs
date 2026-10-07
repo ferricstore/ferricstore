@@ -161,6 +161,17 @@ defmodule Ferricstore.Commands.HashSingleWARaftTest do
     ctx: ctx,
     key: key
   } do
+    assert_file_server_independent_hset(ctx, key, :hot)
+  end
+
+  test "durable cold promoted HSET does not wait for unrelated shared file-server work", %{
+    ctx: ctx,
+    key: key
+  } do
+    assert_file_server_independent_hset(ctx, key, :cold)
+  end
+
+  defp assert_file_server_independent_hset(ctx, key, residency) do
     assert {:ok, 128} = Impl.hset(ctx, key, Map.new(1..128, &{"seed-#{&1}", "seed"}))
     shard = Router.shard_name(ctx, Router.shard_for(ctx, key))
 
@@ -170,12 +181,21 @@ defmodule Ferricstore.Commands.HashSingleWARaftTest do
     )
 
     assert {:ok, 1} = Impl.hset(ctx, key, %{"field" => "before"})
+
+    if residency == :cold do
+      field = CompoundKey.hash_field(key, "field")
+      keydir = elem(ctx.keydir_refs, Router.shard_for(ctx, key))
+      assert :ets.update_element(keydir, field, {2, nil})
+    end
+
     :ok = :sys.suspend(:file_server_2)
     task = Task.async(fn -> Impl.hset(ctx, key, %{"field" => "after"}) end)
 
-    early =
+    {early, blocked} =
       try do
-        Task.yield(task, 500)
+        early = Task.yield(task, 500)
+        blocked = if early == nil, do: file_server_blocked_callers(task.pid, shard), else: nil
+        {early, blocked}
       after
         :sys.resume(:file_server_2)
       end
@@ -189,7 +209,30 @@ defmodule Ferricstore.Commands.HashSingleWARaftTest do
       end
 
     assert result == {:ok, 0}
-    assert early == {:ok, {:ok, 0}}
+
+    assert early == {:ok, {:ok, 0}},
+           "HSET blocked during file-server suspension: #{inspect(blocked, limit: :infinity)}"
+
     assert Impl.hget(ctx, key, "field") == {:ok, "after"}
+  end
+
+  defp file_server_blocked_callers(task, shard) do
+    {:messages, messages} = Process.info(Process.whereis(:file_server_2), :messages)
+    callers = for {:"$gen_call", {pid, _}, _request} <- messages, do: pid
+
+    names =
+      Enum.filter(Process.registered(), fn name ->
+        String.starts_with?(to_string(name), ["raft_server_", "raft_storage_", "raft_log_"])
+      end)
+
+    pids = [task, Process.whereis(shard)] ++ callers ++ Enum.map(names, &Process.whereis/1)
+
+    %{
+      requests: messages,
+      callers:
+        Enum.map(Enum.uniq(pids), fn pid ->
+          {pid, if(is_pid(pid), do: Process.info(pid, [:registered_name, :current_stacktrace]))}
+        end)
+    }
   end
 end

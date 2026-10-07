@@ -37,6 +37,14 @@ tests, 19 targeted HTTP tests, both Hex dependency audits and lock hygiene.
 Bitcask Clippy also passes on Rust 1.98. The regenerated lock selects Mint
 1.10.2 and its compatible HPAX 1.1.0 dependency; WARaft remains 0.1.0.
 
+The next matrix passes both builds, all server partitions, architecture,
+performance guards, HTTP quality and all five official SDKs. Cluster and
+shard-kill failures expose test peers creating publication latch tables inside
+short-lived RPC workers. Their contexts now have a supervised owner with
+explicit teardown; the owner-lifetime regression and all 30 backend cluster
+cases pass locally. The shared-file-server suspension guard retains its
+500-ms completion condition and now captures blocked callers on failure.
+
 ## Verification
 
 Before release preparation, the current cleanup source passed 173 scoped
