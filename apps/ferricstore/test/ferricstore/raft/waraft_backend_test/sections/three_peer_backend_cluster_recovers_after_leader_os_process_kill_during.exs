@@ -319,6 +319,16 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.ThreePeerBackendClusterRec
         kill_peer_os_process!(first_killed)
         kill_peer_os_process!(second_killed)
 
+        # The runner observing an OS kill does not mean the leader has received
+        # its own distribution DOWN signals. Exercise the connected-quorum
+        # fast rejection only after that independent observer sees both losses.
+        assert eventually(fn ->
+                 connected = :rpc.call(leader, Node, :list, [:connected])
+
+                 is_list(connected) and first_killed.name not in connected and
+                   second_killed.name not in connected
+               end)
+
         assert {:error, :no_quorum} =
                  :rpc.call(leader, WARaftBackend, :write, [
                    0,

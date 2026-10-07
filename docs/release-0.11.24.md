@@ -44,6 +44,12 @@ short-lived RPC workers. Their contexts now have a supervised owner with
 explicit teardown; the owner-lifetime regression and all 30 backend cluster
 cases pass locally. The shared-file-server suspension guard retains its
 500-ms completion condition and now captures blocked callers on failure.
+Both subsequent Linux core runs pass that guard, including the original
+111293 seed and explicit hot/cold coverage; no completion budget is raised.
+Further fixture checks wait for the leader's own distribution-loss observation
+before asserting connected-quorum rejection, and exhaust the bounded retention
+API's continuation pages before asserting deletion of a recovered expired row.
+Those focused OS-kill/recovery cases pass locally.
 
 ## Verification
 
