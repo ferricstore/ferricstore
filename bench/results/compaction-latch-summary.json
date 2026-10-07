@@ -1,0 +1,266 @@
+{
+  "accepted": false,
+  "reason": "yielding worsened saturated write p99",
+  "production_latch_policy": "whole",
+  "cohorts": {
+    "pilot": {
+      "whole": {
+        "operations": {
+          "hash_write": {
+            "count": 32769,
+            "max_us": 1144061,
+            "p50_us": 55300,
+            "p95_us": 69400,
+            "p99_us": 79000,
+            "p999_us": 765000
+          },
+          "hash_read": {
+            "count": 65538,
+            "max_us": 340,
+            "p50_us": 6,
+            "p95_us": 13,
+            "p99_us": 19,
+            "p999_us": 42
+          },
+          "kv_read": {
+            "count": 32769,
+            "max_us": 66,
+            "p50_us": 3,
+            "p95_us": 8,
+            "p99_us": 13,
+            "p999_us": 26
+          }
+        },
+        "ops_per_second": 1087.7715977737048,
+        "compactions": 8,
+        "compaction_failures": 0
+      },
+      "pages": {
+        "operations": {
+          "hash_write": {
+            "count": 32536,
+            "max_us": 780575,
+            "p50_us": 55600,
+            "p95_us": 71400,
+            "p99_us": 110000,
+            "p999_us": 702000
+          },
+          "hash_read": {
+            "count": 65072,
+            "max_us": 278,
+            "p50_us": 6,
+            "p95_us": 14,
+            "p99_us": 20,
+            "p999_us": 44
+          },
+          "kv_read": {
+            "count": 32536,
+            "max_us": 139,
+            "p50_us": 3,
+            "p95_us": 8,
+            "p99_us": 13,
+            "p999_us": 27
+          }
+        },
+        "ops_per_second": 1079.8794757456642,
+        "compactions": 8,
+        "compaction_failures": 0
+      }
+    },
+    "four-page": {
+      "whole": {
+        "operations": {
+          "hash_write": {
+            "count": 32487,
+            "max_us": 752760,
+            "p50_us": 56000,
+            "p95_us": 72100,
+            "p99_us": 84100,
+            "p999_us": 695000
+          },
+          "hash_read": {
+            "count": 64974,
+            "max_us": 257,
+            "p50_us": 6,
+            "p95_us": 14,
+            "p99_us": 19,
+            "p999_us": 42
+          },
+          "kv_read": {
+            "count": 32487,
+            "max_us": 200,
+            "p50_us": 3,
+            "p95_us": 8,
+            "p99_us": 13,
+            "p999_us": 23
+          }
+        },
+        "ops_per_second": 1078.5138638679596,
+        "compactions": 8,
+        "compaction_failures": 0
+      },
+      "pages": {
+        "operations": {
+          "hash_write": {
+            "count": 32286,
+            "max_us": 756228,
+            "p50_us": 56100,
+            "p95_us": 72200,
+            "p99_us": 131000,
+            "p999_us": 665000
+          },
+          "hash_read": {
+            "count": 64572,
+            "max_us": 293,
+            "p50_us": 6,
+            "p95_us": 14,
+            "p99_us": 19,
+            "p999_us": 41
+          },
+          "kv_read": {
+            "count": 32286,
+            "max_us": 54,
+            "p50_us": 3,
+            "p95_us": 8,
+            "p99_us": 13,
+            "p999_us": 22
+          }
+        },
+        "ops_per_second": 1071.766281521061,
+        "compactions": 8,
+        "compaction_failures": 0
+      }
+    }
+  },
+  "offered_pilot": {
+    "whole": {
+      "histograms": {
+        "client_queue_us": {
+          "count": 11996,
+          "max": 680076,
+          "p50": 1100,
+          "p95": 252000,
+          "p99": 510000,
+          "p999": 627000
+        },
+        "write_service_us": {
+          "count": 11996,
+          "max": 654384,
+          "p50": 16400,
+          "p95": 62000,
+          "p99": 89300,
+          "p999": 551000
+        },
+        "write_total_us": {
+          "count": 11996,
+          "max": 760026,
+          "p50": 17300,
+          "p95": 332000,
+          "p99": 590000,
+          "p999": 707000
+        },
+        "cycle_service_us": {
+          "count": 11996,
+          "max": 654400,
+          "p50": 16400,
+          "p95": 62000,
+          "p99": 89400,
+          "p999": 551000
+        },
+        "cycle_total_us": {
+          "count": 11996,
+          "max": 760043,
+          "p50": 17300,
+          "p95": 332000,
+          "p99": 590000,
+          "p999": 707000
+        },
+        "kv_read_us": {
+          "count": 11996,
+          "max": 25,
+          "p50": 4,
+          "p95": 7,
+          "p99": 9,
+          "p999": 14
+        },
+        "hash_read_us": {
+          "count": 23992,
+          "max": 69,
+          "p50": 7,
+          "p95": 13,
+          "p99": 17,
+          "p999": 24
+        }
+      },
+      "completed_in_window": 11993,
+      "dropped": 4,
+      "compactions": 8,
+      "quiet_compactions": 0
+    },
+    "pages": {
+      "histograms": {
+        "client_queue_us": {
+          "count": 12000,
+          "max": 632169,
+          "p50": 1200,
+          "p95": 220000,
+          "p99": 481000,
+          "p999": 610000
+        },
+        "write_service_us": {
+          "count": 12000,
+          "max": 710951,
+          "p50": 15500,
+          "p95": 57000,
+          "p99": 74100,
+          "p999": 560000
+        },
+        "write_total_us": {
+          "count": 12000,
+          "max": 712142,
+          "p50": 16300,
+          "p95": 299000,
+          "p99": 561000,
+          "p999": 690000
+        },
+        "cycle_service_us": {
+          "count": 12000,
+          "max": 710970,
+          "p50": 15500,
+          "p95": 57000,
+          "p99": 74100,
+          "p999": 560000
+        },
+        "cycle_total_us": {
+          "count": 12000,
+          "max": 712161,
+          "p50": 16300,
+          "p95": 300000,
+          "p99": 561000,
+          "p999": 690000
+        },
+        "kv_read_us": {
+          "count": 12000,
+          "max": 27,
+          "p50": 4,
+          "p95": 7,
+          "p99": 9,
+          "p999": 13
+        },
+        "hash_read_us": {
+          "count": 24000,
+          "max": 225,
+          "p50": 6,
+          "p95": 13,
+          "p99": 17,
+          "p999": 29
+        }
+      },
+      "completed_in_window": 11997,
+      "dropped": 0,
+      "compactions": 8,
+      "quiet_compactions": 0
+    }
+  },
+  "pre_experiment_source_restored": true
+}

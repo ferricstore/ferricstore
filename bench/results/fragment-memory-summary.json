@@ -1,0 +1,257 @@
+{
+  "aggregation": "medians and ranges of trial metrics, not pooled percentiles",
+  "metadata_bytes_per_fragment_or_frame": 128,
+  "frame_buffer_source_sha256": "35b18b42caed42446fc57253e898e739b12540ab1aed3c7c7c75c355a872659c",
+  "component": {
+    "1": {
+      "payload_only": {
+        "us_per_frame": {
+          "median": 1466.08166,
+          "min": 1450.5725,
+          "max": 1484.86834
+        },
+        "reductions_per_frame": {
+          "median": 356029.28,
+          "min": 356024.96,
+          "max": 356043.68
+        },
+        "charge_bytes": {
+          "median": 16408,
+          "min": 16408,
+          "max": 16408
+        }
+      },
+      "metadata": {
+        "us_per_frame": {
+          "median": 1521.1525,
+          "min": 1509.58,
+          "max": 1592.77168
+        },
+        "reductions_per_frame": {
+          "median": 356033.28,
+          "min": 356026.8,
+          "max": 356049.6
+        },
+        "charge_bytes": {
+          "median": 2116632,
+          "min": 2116632,
+          "max": 2116632
+        }
+      }
+    },
+    "64": {
+      "payload_only": {
+        "us_per_frame": {
+          "median": 21.5210625,
+          "min": 21.0731875,
+          "max": 22.586458
+        },
+        "reductions_per_frame": {
+          "median": 5599.211,
+          "min": 5599.211,
+          "max": 5599.211
+        },
+        "charge_bytes": {
+          "median": 16408,
+          "min": 16408,
+          "max": 16408
+        }
+      },
+      "metadata": {
+        "us_per_frame": {
+          "median": 22.6818545,
+          "min": 22.21525,
+          "max": 23.097729
+        },
+        "reductions_per_frame": {
+          "median": 5599.211,
+          "min": 5599.211,
+          "max": 5599.211
+        },
+        "charge_bytes": {
+          "median": 49304,
+          "min": 49304,
+          "max": 49304
+        }
+      }
+    },
+    "4096": {
+      "payload_only": {
+        "us_per_frame": {
+          "median": 1.3105,
+          "min": 1.296315,
+          "max": 1.33961
+        },
+        "reductions_per_frame": {
+          "median": 190.50068,
+          "min": 190.50068,
+          "max": 190.50068
+        },
+        "charge_bytes": {
+          "median": 16408,
+          "min": 16408,
+          "max": 16408
+        }
+      },
+      "metadata": {
+        "us_per_frame": {
+          "median": 1.322075,
+          "min": 1.31210166,
+          "max": 1.3458275
+        },
+        "reductions_per_frame": {
+          "median": 190.50068,
+          "min": 190.50068,
+          "max": 190.50068
+        },
+        "charge_bytes": {
+          "median": 17048,
+          "min": 17048,
+          "max": 17048
+        }
+      }
+    },
+    "16408": {
+      "payload_only": {
+        "us_per_frame": {
+          "median": 0.53780459,
+          "min": 0.52685333,
+          "max": 0.55336708
+        },
+        "reductions_per_frame": {
+          "median": 34.58745,
+          "min": 34.58745,
+          "max": 34.58745
+        },
+        "charge_bytes": {
+          "median": 16408,
+          "min": 16408,
+          "max": 16408
+        }
+      },
+      "metadata": {
+        "us_per_frame": {
+          "median": 0.5377995799999999,
+          "min": 0.53461375,
+          "max": 0.54476667
+        },
+        "reductions_per_frame": {
+          "median": 34.58745,
+          "min": 34.58745,
+          "max": 34.58745
+        },
+        "charge_bytes": {
+          "median": 16536,
+          "min": 16536,
+          "max": 16536
+        }
+      }
+    }
+  },
+  "socket": {
+    "1": {
+      "baseline": {
+        "ops_per_second": {
+          "median": 15471.5988692147,
+          "min": 14995.84404322195,
+          "max": 17809.296706079105
+        },
+        "p50_us": {
+          "median": 63,
+          "min": 51,
+          "max": 64
+        },
+        "p95_us": {
+          "median": 91,
+          "min": 85,
+          "max": 98
+        },
+        "p99_us": {
+          "median": 130,
+          "min": 123,
+          "max": 156
+        }
+      },
+      "current": {
+        "ops_per_second": {
+          "median": 16933.061148898578,
+          "min": 14649.567770950905,
+          "max": 18111.327554689782
+        },
+        "p50_us": {
+          "median": 52,
+          "min": 51,
+          "max": 62
+        },
+        "p95_us": {
+          "median": 90,
+          "min": 81,
+          "max": 101
+        },
+        "p99_us": {
+          "median": 149,
+          "min": 115,
+          "max": 160
+        }
+      },
+      "median_change_pct": {
+        "ops_per_second": 9.446097278232092,
+        "p50_us": -17.460317460317466,
+        "p95_us": -1.098901098901095,
+        "p99_us": 14.615384615384608
+      }
+    },
+    "16": {
+      "baseline": {
+        "ops_per_second": {
+          "median": 63690.8281967558,
+          "min": 62793.75890201217,
+          "max": 65021.33592893637
+        },
+        "p50_us": {
+          "median": 243,
+          "min": 241,
+          "max": 250
+        },
+        "p95_us": {
+          "median": 355,
+          "min": 347,
+          "max": 361
+        },
+        "p99_us": {
+          "median": 419,
+          "min": 403,
+          "max": 425
+        }
+      },
+      "current": {
+        "ops_per_second": {
+          "median": 63596.22238439037,
+          "min": 62602.03201067782,
+          "max": 63612.64329358714
+        },
+        "p50_us": {
+          "median": 247,
+          "min": 244,
+          "max": 249
+        },
+        "p95_us": {
+          "median": 357,
+          "min": 356,
+          "max": 365
+        },
+        "p99_us": {
+          "median": 423,
+          "min": 411,
+          "max": 443
+        }
+      },
+      "median_change_pct": {
+        "ops_per_second": -0.1485391461281793,
+        "p50_us": 1.6460905349794164,
+        "p95_us": 0.5633802816901401,
+        "p99_us": 0.9546539379474916
+      }
+    }
+  }
+}

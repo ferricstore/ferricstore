@@ -1,0 +1,2292 @@
+{
+  "trials": [
+    {
+      "rate": 100,
+      "route": "server",
+      "trial": 1,
+      "completed_in_window": 11123,
+      "dropped": 735,
+      "drain_seconds": 2.258167,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 11265,
+          "max": 3415564,
+          "p50": 62100,
+          "p95": 1843000,
+          "p99": 3149000,
+          "p999": 3317000
+        },
+        "write_service_us": {
+          "count": 11265,
+          "max": 1066202,
+          "p50": 92000,
+          "p95": 377000,
+          "p99": 717000,
+          "p999": 937000
+        },
+        "write_total_us": {
+          "count": 11265,
+          "max": 3735422,
+          "p50": 215000,
+          "p95": 2166000,
+          "p99": 3434000,
+          "p999": 3629000
+        },
+        "cycle_service_us": {
+          "count": 11265,
+          "max": 1066291,
+          "p50": 92100,
+          "p95": 378000,
+          "p99": 717000,
+          "p999": 937000
+        },
+        "cycle_total_us": {
+          "count": 11265,
+          "max": 3735525,
+          "p50": 215000,
+          "p95": 2166000,
+          "p99": 3434000,
+          "p999": 3629000
+        },
+        "kv_read_us": {
+          "count": 11265,
+          "max": 3936,
+          "p50": 15,
+          "p95": 41,
+          "p99": 158,
+          "p999": 679
+        },
+        "hash_read_us": {
+          "count": 22530,
+          "max": 2782,
+          "p50": 26,
+          "p95": 80,
+          "p99": 219,
+          "p999": 892
+        }
+      }
+    },
+    {
+      "rate": 100,
+      "route": "raw",
+      "trial": 1,
+      "completed_in_window": 11978,
+      "dropped": 16,
+      "drain_seconds": 0.055931,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 11984,
+          "max": 1420367,
+          "p50": 5900,
+          "p95": 803000,
+          "p99": 1230000,
+          "p999": 1358000
+        },
+        "write_service_us": {
+          "count": 11984,
+          "max": 733459,
+          "p50": 75500,
+          "p95": 249000,
+          "p99": 397000,
+          "p999": 699000
+        },
+        "write_total_us": {
+          "count": 11984,
+          "max": 1579956,
+          "p50": 94700,
+          "p95": 962000,
+          "p99": 1390000,
+          "p999": 1518000
+        },
+        "cycle_service_us": {
+          "count": 11984,
+          "max": 733968,
+          "p50": 75600,
+          "p95": 249000,
+          "p99": 397000,
+          "p999": 699000
+        },
+        "cycle_total_us": {
+          "count": 11984,
+          "max": 1580011,
+          "p50": 94900,
+          "p95": 962000,
+          "p99": 1390000,
+          "p999": 1518000
+        },
+        "kv_read_us": {
+          "count": 11984,
+          "max": 5364,
+          "p50": 16,
+          "p95": 40,
+          "p99": 129,
+          "p999": 639
+        },
+        "hash_read_us": {
+          "count": 23968,
+          "max": 5962,
+          "p50": 26,
+          "p95": 79,
+          "p99": 235,
+          "p999": 952
+        }
+      }
+    },
+    {
+      "rate": 200,
+      "route": "server",
+      "trial": 1,
+      "completed_in_window": 13033,
+      "dropped": 10829,
+      "drain_seconds": 1.062728,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 13171,
+          "max": 3331093,
+          "p50": 1031000,
+          "p95": 1913000,
+          "p99": 2306000,
+          "p999": 3204000
+        },
+        "write_service_us": {
+          "count": 13171,
+          "max": 908640,
+          "p50": 117000,
+          "p95": 336000,
+          "p99": 507000,
+          "p999": 753000
+        },
+        "write_total_us": {
+          "count": 13171,
+          "max": 3558221,
+          "p50": 1172000,
+          "p95": 2123000,
+          "p99": 2666000,
+          "p999": 3451000
+        },
+        "cycle_service_us": {
+          "count": 13171,
+          "max": 908942,
+          "p50": 117000,
+          "p95": 336000,
+          "p99": 507000,
+          "p999": 753000
+        },
+        "cycle_total_us": {
+          "count": 13171,
+          "max": 3558296,
+          "p50": 1172000,
+          "p95": 2123000,
+          "p99": 2667000,
+          "p999": 3451000
+        },
+        "kv_read_us": {
+          "count": 13171,
+          "max": 2872,
+          "p50": 14,
+          "p95": 40,
+          "p99": 143,
+          "p999": 868
+        },
+        "hash_read_us": {
+          "count": 26342,
+          "max": 8460,
+          "p50": 24,
+          "p95": 79,
+          "p99": 233,
+          "p999": 920
+        }
+      }
+    },
+    {
+      "rate": 200,
+      "route": "raw",
+      "trial": 1,
+      "completed_in_window": 15267,
+      "dropped": 8591,
+      "drain_seconds": 1.663886,
+      "compactions": 4,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 15409,
+          "max": 2357909,
+          "p50": 910000,
+          "p95": 1474000,
+          "p99": 1761000,
+          "p999": 2152000
+        },
+        "write_service_us": {
+          "count": 15409,
+          "max": 893884,
+          "p50": 108000,
+          "p95": 240000,
+          "p99": 354000,
+          "p999": 789000
+        },
+        "write_total_us": {
+          "count": 15409,
+          "max": 2475381,
+          "p50": 1029000,
+          "p95": 1634000,
+          "p99": 1962000,
+          "p999": 2375000
+        },
+        "cycle_service_us": {
+          "count": 15409,
+          "max": 893937,
+          "p50": 108000,
+          "p95": 240000,
+          "p99": 354000,
+          "p999": 789000
+        },
+        "cycle_total_us": {
+          "count": 15409,
+          "max": 2475427,
+          "p50": 1029000,
+          "p95": 1634000,
+          "p99": 1962000,
+          "p999": 2375000
+        },
+        "kv_read_us": {
+          "count": 15409,
+          "max": 85327,
+          "p50": 15,
+          "p95": 41,
+          "p99": 146,
+          "p999": 958
+        },
+        "hash_read_us": {
+          "count": 30818,
+          "max": 81578,
+          "p50": 23,
+          "p95": 79,
+          "p99": 244,
+          "p999": 1500
+        }
+      }
+    },
+    {
+      "rate": 300,
+      "route": "server",
+      "trial": 1,
+      "completed_in_window": 15387,
+      "dropped": 20474,
+      "drain_seconds": 1.634052,
+      "compactions": 0,
+      "quiet_compactions": 4,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 15526,
+          "max": 3159145,
+          "p50": 786000,
+          "p95": 1906000,
+          "p99": 2291000,
+          "p999": 2764000
+        },
+        "write_service_us": {
+          "count": 15526,
+          "max": 1012923,
+          "p50": 91000,
+          "p95": 322000,
+          "p99": 530000,
+          "p999": 856000
+        },
+        "write_total_us": {
+          "count": 15526,
+          "max": 3263775,
+          "p50": 893000,
+          "p95": 2072000,
+          "p99": 2496000,
+          "p999": 3177000
+        },
+        "cycle_service_us": {
+          "count": 15526,
+          "max": 1013037,
+          "p50": 91100,
+          "p95": 322000,
+          "p99": 530000,
+          "p999": 856000
+        },
+        "cycle_total_us": {
+          "count": 15526,
+          "max": 3263885,
+          "p50": 893000,
+          "p95": 2073000,
+          "p99": 2496000,
+          "p999": 3177000
+        },
+        "kv_read_us": {
+          "count": 15526,
+          "max": 44206,
+          "p50": 15,
+          "p95": 47,
+          "p99": 168,
+          "p999": 946
+        },
+        "hash_read_us": {
+          "count": 31052,
+          "max": 24363,
+          "p50": 25,
+          "p95": 85,
+          "p99": 243,
+          "p999": 915
+        }
+      }
+    },
+    {
+      "rate": 300,
+      "route": "raw",
+      "trial": 1,
+      "completed_in_window": 16672,
+      "dropped": 19190,
+      "drain_seconds": 0.816093,
+      "compactions": 4,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 16810,
+          "max": 2260359,
+          "p50": 852000,
+          "p95": 1446000,
+          "p99": 1747000,
+          "p999": 2141000
+        },
+        "write_service_us": {
+          "count": 16810,
+          "max": 890372,
+          "p50": 95300,
+          "p95": 222000,
+          "p99": 352000,
+          "p999": 730000
+        },
+        "write_total_us": {
+          "count": 16810,
+          "max": 2400177,
+          "p50": 965000,
+          "p95": 1590000,
+          "p99": 1903000,
+          "p999": 2318000
+        },
+        "cycle_service_us": {
+          "count": 16810,
+          "max": 890465,
+          "p50": 95400,
+          "p95": 222000,
+          "p99": 352000,
+          "p999": 730000
+        },
+        "cycle_total_us": {
+          "count": 16810,
+          "max": 2400218,
+          "p50": 965000,
+          "p95": 1590000,
+          "p99": 1903000,
+          "p999": 2318000
+        },
+        "kv_read_us": {
+          "count": 16810,
+          "max": 8819,
+          "p50": 14,
+          "p95": 41,
+          "p99": 145,
+          "p999": 632
+        },
+        "hash_read_us": {
+          "count": 33620,
+          "max": 5823,
+          "p50": 23,
+          "p95": 78,
+          "p99": 240,
+          "p999": 1200
+        }
+      }
+    },
+    {
+      "rate": 100,
+      "route": "raw",
+      "trial": 2,
+      "completed_in_window": 11993,
+      "dropped": 0,
+      "drain_seconds": 0.087726,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 12000,
+          "max": 1123977,
+          "p50": 11700,
+          "p95": 661000,
+          "p99": 853000,
+          "p999": 1021000
+        },
+        "write_service_us": {
+          "count": 12000,
+          "max": 815024,
+          "p50": 92200,
+          "p95": 247000,
+          "p99": 353000,
+          "p999": 628000
+        },
+        "write_total_us": {
+          "count": 12000,
+          "max": 1283804,
+          "p50": 134000,
+          "p95": 815000,
+          "p99": 1009000,
+          "p999": 1181000
+        },
+        "cycle_service_us": {
+          "count": 12000,
+          "max": 815051,
+          "p50": 92300,
+          "p95": 247000,
+          "p99": 353000,
+          "p999": 628000
+        },
+        "cycle_total_us": {
+          "count": 12000,
+          "max": 1283954,
+          "p50": 134000,
+          "p95": 815000,
+          "p99": 1009000,
+          "p999": 1181000
+        },
+        "kv_read_us": {
+          "count": 12000,
+          "max": 12404,
+          "p50": 15,
+          "p95": 41,
+          "p99": 188,
+          "p999": 728
+        },
+        "hash_read_us": {
+          "count": 24000,
+          "max": 13823,
+          "p50": 25,
+          "p95": 81,
+          "p99": 281,
+          "p999": 1700
+        }
+      }
+    },
+    {
+      "rate": 100,
+      "route": "server",
+      "trial": 2,
+      "completed_in_window": 11817,
+      "dropped": 137,
+      "drain_seconds": 0.890825,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 11863,
+          "max": 2090173,
+          "p50": 144000,
+          "p95": 1044000,
+          "p99": 1630000,
+          "p999": 2028000
+        },
+        "write_service_us": {
+          "count": 11863,
+          "max": 1213294,
+          "p50": 95500,
+          "p95": 359000,
+          "p99": 612000,
+          "p999": 1071000
+        },
+        "write_total_us": {
+          "count": 11863,
+          "max": 2250114,
+          "p50": 303000,
+          "p95": 1227000,
+          "p99": 1847000,
+          "p999": 2188000
+        },
+        "cycle_service_us": {
+          "count": 11863,
+          "max": 1213356,
+          "p50": 95600,
+          "p95": 359000,
+          "p99": 612000,
+          "p999": 1071000
+        },
+        "cycle_total_us": {
+          "count": 11863,
+          "max": 2250160,
+          "p50": 303000,
+          "p95": 1227000,
+          "p99": 1847000,
+          "p999": 2188000
+        },
+        "kv_read_us": {
+          "count": 11863,
+          "max": 1618,
+          "p50": 15,
+          "p95": 41,
+          "p99": 144,
+          "p999": 793
+        },
+        "hash_read_us": {
+          "count": 23726,
+          "max": 112940,
+          "p50": 26,
+          "p95": 84,
+          "p99": 244,
+          "p999": 1100
+        }
+      }
+    },
+    {
+      "rate": 200,
+      "route": "raw",
+      "trial": 2,
+      "completed_in_window": 16249,
+      "dropped": 7610,
+      "drain_seconds": 1.10464,
+      "compactions": 4,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 16390,
+          "max": 1955243,
+          "p50": 806000,
+          "p95": 1439000,
+          "p99": 1637000,
+          "p999": 1877000
+        },
+        "write_service_us": {
+          "count": 16390,
+          "max": 945202,
+          "p50": 96500,
+          "p95": 236000,
+          "p99": 338000,
+          "p999": 766000
+        },
+        "write_total_us": {
+          "count": 16390,
+          "max": 2228303,
+          "p50": 918000,
+          "p95": 1583000,
+          "p99": 1799000,
+          "p999": 2009000
+        },
+        "cycle_service_us": {
+          "count": 16390,
+          "max": 945282,
+          "p50": 96600,
+          "p95": 236000,
+          "p99": 338000,
+          "p999": 766000
+        },
+        "cycle_total_us": {
+          "count": 16390,
+          "max": 2228442,
+          "p50": 918000,
+          "p95": 1583000,
+          "p99": 1799000,
+          "p999": 2009000
+        },
+        "kv_read_us": {
+          "count": 16390,
+          "max": 58526,
+          "p50": 14,
+          "p95": 39,
+          "p99": 149,
+          "p999": 714
+        },
+        "hash_read_us": {
+          "count": 32780,
+          "max": 12630,
+          "p50": 24,
+          "p95": 81,
+          "p99": 246,
+          "p999": 1100
+        }
+      }
+    },
+    {
+      "rate": 200,
+      "route": "server",
+      "trial": 2,
+      "completed_in_window": 11943,
+      "dropped": 11918,
+      "drain_seconds": 1.867752,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 12082,
+          "max": 3600251,
+          "p50": 1109000,
+          "p95": 2247000,
+          "p99": 3045000,
+          "p999": 3463000
+        },
+        "write_service_us": {
+          "count": 12082,
+          "max": 1056469,
+          "p50": 128000,
+          "p95": 365000,
+          "p99": 637000,
+          "p999": 901000
+        },
+        "write_total_us": {
+          "count": 12082,
+          "max": 3732149,
+          "p50": 1270000,
+          "p95": 2541000,
+          "p99": 3275000,
+          "p999": 3671000
+        },
+        "cycle_service_us": {
+          "count": 12082,
+          "max": 1056569,
+          "p50": 128000,
+          "p95": 365000,
+          "p99": 637000,
+          "p999": 901000
+        },
+        "cycle_total_us": {
+          "count": 12082,
+          "max": 3732359,
+          "p50": 1270000,
+          "p95": 2541000,
+          "p99": 3275000,
+          "p999": 3671000
+        },
+        "kv_read_us": {
+          "count": 12082,
+          "max": 6985,
+          "p50": 15,
+          "p95": 41,
+          "p99": 148,
+          "p999": 905
+        },
+        "hash_read_us": {
+          "count": 24164,
+          "max": 9769,
+          "p50": 25,
+          "p95": 80,
+          "p99": 252,
+          "p999": 1100
+        }
+      }
+    },
+    {
+      "rate": 300,
+      "route": "raw",
+      "trial": 2,
+      "completed_in_window": 15759,
+      "dropped": 20102,
+      "drain_seconds": 1.077732,
+      "compactions": 4,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 15898,
+          "max": 2090998,
+          "p50": 888000,
+          "p95": 1476000,
+          "p99": 1706000,
+          "p999": 2000000
+        },
+        "write_service_us": {
+          "count": 15898,
+          "max": 809412,
+          "p50": 101000,
+          "p95": 249000,
+          "p99": 350000,
+          "p999": 700000
+        },
+        "write_total_us": {
+          "count": 15898,
+          "max": 2188134,
+          "p50": 1010000,
+          "p95": 1640000,
+          "p99": 1883000,
+          "p999": 2132000
+        },
+        "cycle_service_us": {
+          "count": 15898,
+          "max": 809557,
+          "p50": 101000,
+          "p95": 249000,
+          "p99": 350000,
+          "p999": 700000
+        },
+        "cycle_total_us": {
+          "count": 15898,
+          "max": 2188194,
+          "p50": 1010000,
+          "p95": 1640000,
+          "p99": 1883000,
+          "p999": 2133000
+        },
+        "kv_read_us": {
+          "count": 15898,
+          "max": 9691,
+          "p50": 15,
+          "p95": 42,
+          "p99": 171,
+          "p999": 954
+        },
+        "hash_read_us": {
+          "count": 31796,
+          "max": 84028,
+          "p50": 24,
+          "p95": 82,
+          "p99": 261,
+          "p999": 1300
+        }
+      }
+    },
+    {
+      "rate": 300,
+      "route": "server",
+      "trial": 2,
+      "completed_in_window": 13476,
+      "dropped": 22380,
+      "drain_seconds": 1.163665,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 13620,
+          "max": 3003386,
+          "p50": 949000,
+          "p95": 2058000,
+          "p99": 2461000,
+          "p999": 2914000
+        },
+        "write_service_us": {
+          "count": 13620,
+          "max": 978624,
+          "p50": 103000,
+          "p95": 373000,
+          "p99": 616000,
+          "p999": 823000
+        },
+        "write_total_us": {
+          "count": 13620,
+          "max": 3226133,
+          "p50": 1083000,
+          "p95": 2248000,
+          "p99": 2688000,
+          "p999": 3068000
+        },
+        "cycle_service_us": {
+          "count": 13620,
+          "max": 978664,
+          "p50": 103000,
+          "p95": 373000,
+          "p99": 616000,
+          "p999": 823000
+        },
+        "cycle_total_us": {
+          "count": 13620,
+          "max": 3226215,
+          "p50": 1083000,
+          "p95": 2248000,
+          "p99": 2689000,
+          "p999": 3068000
+        },
+        "kv_read_us": {
+          "count": 13620,
+          "max": 103134,
+          "p50": 15,
+          "p95": 42,
+          "p99": 133,
+          "p999": 587
+        },
+        "hash_read_us": {
+          "count": 27240,
+          "max": 4727,
+          "p50": 24,
+          "p95": 77,
+          "p99": 215,
+          "p999": 968
+        }
+      }
+    },
+    {
+      "rate": 100,
+      "route": "server",
+      "trial": 3,
+      "completed_in_window": 11267,
+      "dropped": 662,
+      "drain_seconds": 0.531091,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 11338,
+          "max": 2251059,
+          "p50": 586000,
+          "p95": 1716000,
+          "p99": 2006000,
+          "p999": 2214000
+        },
+        "write_service_us": {
+          "count": 11338,
+          "max": 1236386,
+          "p50": 117000,
+          "p95": 414000,
+          "p99": 745000,
+          "p999": 1076000
+        },
+        "write_total_us": {
+          "count": 11338,
+          "max": 2410978,
+          "p50": 746000,
+          "p95": 1903000,
+          "p99": 2210000,
+          "p999": 2374000
+        },
+        "cycle_service_us": {
+          "count": 11338,
+          "max": 1236490,
+          "p50": 117000,
+          "p95": 414000,
+          "p99": 745000,
+          "p999": 1076000
+        },
+        "cycle_total_us": {
+          "count": 11338,
+          "max": 2411040,
+          "p50": 746000,
+          "p95": 1904000,
+          "p99": 2210000,
+          "p999": 2374000
+        },
+        "kv_read_us": {
+          "count": 11338,
+          "max": 5202,
+          "p50": 14,
+          "p95": 38,
+          "p99": 127,
+          "p999": 622
+        },
+        "hash_read_us": {
+          "count": 22676,
+          "max": 4083,
+          "p50": 25,
+          "p95": 80,
+          "p99": 249,
+          "p999": 1100
+        }
+      }
+    },
+    {
+      "rate": 100,
+      "route": "raw",
+      "trial": 3,
+      "completed_in_window": 11999,
+      "dropped": 0,
+      "drain_seconds": 0.003427,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 12000,
+          "max": 5337,
+          "p50": 768,
+          "p95": 1800,
+          "p99": 1800,
+          "p999": 2000
+        },
+        "write_service_us": {
+          "count": 12000,
+          "max": 31586,
+          "p50": 12800,
+          "p95": 13700,
+          "p99": 14600,
+          "p999": 19500
+        },
+        "write_total_us": {
+          "count": 12000,
+          "max": 32355,
+          "p50": 13800,
+          "p95": 15000,
+          "p99": 15900,
+          "p999": 20800
+        },
+        "cycle_service_us": {
+          "count": 12000,
+          "max": 31615,
+          "p50": 12800,
+          "p95": 13700,
+          "p99": 14700,
+          "p999": 19500
+        },
+        "cycle_total_us": {
+          "count": 12000,
+          "max": 32384,
+          "p50": 13900,
+          "p95": 15100,
+          "p99": 15900,
+          "p999": 20800
+        },
+        "kv_read_us": {
+          "count": 12000,
+          "max": 110,
+          "p50": 5,
+          "p95": 9,
+          "p99": 12,
+          "p999": 17
+        },
+        "hash_read_us": {
+          "count": 24000,
+          "max": 1414,
+          "p50": 8,
+          "p95": 17,
+          "p99": 21,
+          "p999": 31
+        }
+      }
+    },
+    {
+      "rate": 200,
+      "route": "server",
+      "trial": 3,
+      "completed_in_window": 23998,
+      "dropped": 0,
+      "drain_seconds": 0.009936,
+      "compactions": 4,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 24000,
+          "max": 612864,
+          "p50": 838,
+          "p95": 335000,
+          "p99": 508000,
+          "p999": 579000
+        },
+        "write_service_us": {
+          "count": 24000,
+          "max": 690834,
+          "p50": 15900,
+          "p95": 60700,
+          "p99": 77300,
+          "p999": 620000
+        },
+        "write_total_us": {
+          "count": 24000,
+          "max": 692643,
+          "p50": 17000,
+          "p95": 415000,
+          "p99": 588000,
+          "p999": 659000
+        },
+        "cycle_service_us": {
+          "count": 24000,
+          "max": 690884,
+          "p50": 16000,
+          "p95": 60700,
+          "p99": 77400,
+          "p999": 620000
+        },
+        "cycle_total_us": {
+          "count": 24000,
+          "max": 692693,
+          "p50": 17000,
+          "p95": 415000,
+          "p99": 588000,
+          "p999": 659000
+        },
+        "kv_read_us": {
+          "count": 24000,
+          "max": 66,
+          "p50": 4,
+          "p95": 8,
+          "p99": 10,
+          "p999": 19
+        },
+        "hash_read_us": {
+          "count": 48000,
+          "max": 232,
+          "p50": 7,
+          "p95": 14,
+          "p99": 18,
+          "p999": 32
+        }
+      }
+    },
+    {
+      "rate": 200,
+      "route": "raw",
+      "trial": 3,
+      "completed_in_window": 23816,
+      "dropped": 181,
+      "drain_seconds": 0.011415,
+      "compactions": 4,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 23819,
+          "max": 840698,
+          "p50": 1200,
+          "p95": 382000,
+          "p99": 708000,
+          "p999": 805000
+        },
+        "write_service_us": {
+          "count": 23819,
+          "max": 919464,
+          "p50": 16000,
+          "p95": 64500,
+          "p99": 84400,
+          "p999": 819000
+        },
+        "write_total_us": {
+          "count": 23819,
+          "max": 920658,
+          "p50": 17000,
+          "p95": 464000,
+          "p99": 788000,
+          "p999": 885000
+        },
+        "cycle_service_us": {
+          "count": 23819,
+          "max": 919479,
+          "p50": 16000,
+          "p95": 64500,
+          "p99": 84400,
+          "p999": 819000
+        },
+        "cycle_total_us": {
+          "count": 23819,
+          "max": 920673,
+          "p50": 17000,
+          "p95": 464000,
+          "p99": 788000,
+          "p999": 885000
+        },
+        "kv_read_us": {
+          "count": 23819,
+          "max": 278,
+          "p50": 4,
+          "p95": 8,
+          "p99": 11,
+          "p999": 22
+        },
+        "hash_read_us": {
+          "count": 47638,
+          "max": 111,
+          "p50": 7,
+          "p95": 14,
+          "p99": 19,
+          "p999": 35
+        }
+      }
+    },
+    {
+      "rate": 300,
+      "route": "server",
+      "trial": 3,
+      "completed_in_window": 31754,
+      "dropped": 4112,
+      "drain_seconds": 0.508195,
+      "compactions": 8,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 31888,
+          "max": 1264544,
+          "p50": 427000,
+          "p95": 510000,
+          "p99": 1106000,
+          "p999": 1253000
+        },
+        "write_service_us": {
+          "count": 31888,
+          "max": 855773,
+          "p50": 56700,
+          "p95": 71000,
+          "p99": 82100,
+          "p999": 713000
+        },
+        "write_total_us": {
+          "count": 31888,
+          "max": 1327358,
+          "p50": 484000,
+          "p95": 586000,
+          "p99": 1175000,
+          "p999": 1308000
+        },
+        "cycle_service_us": {
+          "count": 31888,
+          "max": 855799,
+          "p50": 56700,
+          "p95": 71000,
+          "p99": 82100,
+          "p999": 713000
+        },
+        "cycle_total_us": {
+          "count": 31888,
+          "max": 1327385,
+          "p50": 484000,
+          "p95": 586000,
+          "p99": 1175000,
+          "p999": 1308000
+        },
+        "kv_read_us": {
+          "count": 31888,
+          "max": 314,
+          "p50": 4,
+          "p95": 9,
+          "p99": 13,
+          "p999": 31
+        },
+        "hash_read_us": {
+          "count": 63776,
+          "max": 255,
+          "p50": 7,
+          "p95": 15,
+          "p99": 22,
+          "p999": 52
+        }
+      }
+    },
+    {
+      "rate": 300,
+      "route": "raw",
+      "trial": 3,
+      "completed_in_window": 31681,
+      "dropped": 4188,
+      "drain_seconds": 0.450667,
+      "compactions": 8,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 31812,
+          "max": 1392686,
+          "p50": 422000,
+          "p95": 498000,
+          "p99": 1317000,
+          "p999": 1370000
+        },
+        "write_service_us": {
+          "count": 31812,
+          "max": 1001840,
+          "p50": 56200,
+          "p95": 69700,
+          "p99": 80900,
+          "p999": 880000
+        },
+        "write_total_us": {
+          "count": 31812,
+          "max": 1460349,
+          "p50": 479000,
+          "p95": 570000,
+          "p99": 1380000,
+          "p999": 1426000
+        },
+        "cycle_service_us": {
+          "count": 31812,
+          "max": 1001877,
+          "p50": 56200,
+          "p95": 69700,
+          "p99": 80900,
+          "p999": 880000
+        },
+        "cycle_total_us": {
+          "count": 31812,
+          "max": 1460373,
+          "p50": 479000,
+          "p95": 570000,
+          "p99": 1380000,
+          "p999": 1426000
+        },
+        "kv_read_us": {
+          "count": 31812,
+          "max": 389,
+          "p50": 4,
+          "p95": 9,
+          "p99": 14,
+          "p999": 33
+        },
+        "hash_read_us": {
+          "count": 63624,
+          "max": 227,
+          "p50": 7,
+          "p95": 15,
+          "p99": 24,
+          "p999": 62
+        }
+      }
+    }
+  ],
+  "rates": {
+    "100": {
+      "server": {
+        "completed_in_window": {
+          "median": 11267,
+          "min": 11123,
+          "max": 11817
+        },
+        "dropped": {
+          "median": 662,
+          "min": 137,
+          "max": 735
+        },
+        "drain_seconds": {
+          "median": 0.890825,
+          "min": 0.531091,
+          "max": 2.258167
+        },
+        "write_service_us.p50": {
+          "median": 95500,
+          "min": 92000,
+          "max": 117000
+        },
+        "write_service_us.p95": {
+          "median": 377000,
+          "min": 359000,
+          "max": 414000
+        },
+        "write_service_us.p99": {
+          "median": 717000,
+          "min": 612000,
+          "max": 745000
+        },
+        "write_service_us.p999": {
+          "median": 1071000,
+          "min": 937000,
+          "max": 1076000
+        },
+        "write_service_us.max": {
+          "median": 1213294,
+          "min": 1066202,
+          "max": 1236386
+        },
+        "write_total_us.p50": {
+          "median": 303000,
+          "min": 215000,
+          "max": 746000
+        },
+        "write_total_us.p95": {
+          "median": 1903000,
+          "min": 1227000,
+          "max": 2166000
+        },
+        "write_total_us.p99": {
+          "median": 2210000,
+          "min": 1847000,
+          "max": 3434000
+        },
+        "write_total_us.p999": {
+          "median": 2374000,
+          "min": 2188000,
+          "max": 3629000
+        },
+        "write_total_us.max": {
+          "median": 2410978,
+          "min": 2250114,
+          "max": 3735422
+        },
+        "client_queue_us.p50": {
+          "median": 144000,
+          "min": 62100,
+          "max": 586000
+        },
+        "client_queue_us.p95": {
+          "median": 1716000,
+          "min": 1044000,
+          "max": 1843000
+        },
+        "client_queue_us.p99": {
+          "median": 2006000,
+          "min": 1630000,
+          "max": 3149000
+        },
+        "client_queue_us.p999": {
+          "median": 2214000,
+          "min": 2028000,
+          "max": 3317000
+        },
+        "client_queue_us.max": {
+          "median": 2251059,
+          "min": 2090173,
+          "max": 3415564
+        }
+      },
+      "raw": {
+        "completed_in_window": {
+          "median": 11993,
+          "min": 11978,
+          "max": 11999
+        },
+        "dropped": {
+          "median": 0,
+          "min": 0,
+          "max": 16
+        },
+        "drain_seconds": {
+          "median": 0.055931,
+          "min": 0.003427,
+          "max": 0.087726
+        },
+        "write_service_us.p50": {
+          "median": 75500,
+          "min": 12800,
+          "max": 92200
+        },
+        "write_service_us.p95": {
+          "median": 247000,
+          "min": 13700,
+          "max": 249000
+        },
+        "write_service_us.p99": {
+          "median": 353000,
+          "min": 14600,
+          "max": 397000
+        },
+        "write_service_us.p999": {
+          "median": 628000,
+          "min": 19500,
+          "max": 699000
+        },
+        "write_service_us.max": {
+          "median": 733459,
+          "min": 31586,
+          "max": 815024
+        },
+        "write_total_us.p50": {
+          "median": 94700,
+          "min": 13800,
+          "max": 134000
+        },
+        "write_total_us.p95": {
+          "median": 815000,
+          "min": 15000,
+          "max": 962000
+        },
+        "write_total_us.p99": {
+          "median": 1009000,
+          "min": 15900,
+          "max": 1390000
+        },
+        "write_total_us.p999": {
+          "median": 1181000,
+          "min": 20800,
+          "max": 1518000
+        },
+        "write_total_us.max": {
+          "median": 1283804,
+          "min": 32355,
+          "max": 1579956
+        },
+        "client_queue_us.p50": {
+          "median": 5900,
+          "min": 768,
+          "max": 11700
+        },
+        "client_queue_us.p95": {
+          "median": 661000,
+          "min": 1800,
+          "max": 803000
+        },
+        "client_queue_us.p99": {
+          "median": 853000,
+          "min": 1800,
+          "max": 1230000
+        },
+        "client_queue_us.p999": {
+          "median": 1021000,
+          "min": 2000,
+          "max": 1358000
+        },
+        "client_queue_us.max": {
+          "median": 1123977,
+          "min": 5337,
+          "max": 1420367
+        }
+      }
+    },
+    "200": {
+      "server": {
+        "completed_in_window": {
+          "median": 13033,
+          "min": 11943,
+          "max": 23998
+        },
+        "dropped": {
+          "median": 10829,
+          "min": 0,
+          "max": 11918
+        },
+        "drain_seconds": {
+          "median": 1.062728,
+          "min": 0.009936,
+          "max": 1.867752
+        },
+        "write_service_us.p50": {
+          "median": 117000,
+          "min": 15900,
+          "max": 128000
+        },
+        "write_service_us.p95": {
+          "median": 336000,
+          "min": 60700,
+          "max": 365000
+        },
+        "write_service_us.p99": {
+          "median": 507000,
+          "min": 77300,
+          "max": 637000
+        },
+        "write_service_us.p999": {
+          "median": 753000,
+          "min": 620000,
+          "max": 901000
+        },
+        "write_service_us.max": {
+          "median": 908640,
+          "min": 690834,
+          "max": 1056469
+        },
+        "write_total_us.p50": {
+          "median": 1172000,
+          "min": 17000,
+          "max": 1270000
+        },
+        "write_total_us.p95": {
+          "median": 2123000,
+          "min": 415000,
+          "max": 2541000
+        },
+        "write_total_us.p99": {
+          "median": 2666000,
+          "min": 588000,
+          "max": 3275000
+        },
+        "write_total_us.p999": {
+          "median": 3451000,
+          "min": 659000,
+          "max": 3671000
+        },
+        "write_total_us.max": {
+          "median": 3558221,
+          "min": 692643,
+          "max": 3732149
+        },
+        "client_queue_us.p50": {
+          "median": 1031000,
+          "min": 838,
+          "max": 1109000
+        },
+        "client_queue_us.p95": {
+          "median": 1913000,
+          "min": 335000,
+          "max": 2247000
+        },
+        "client_queue_us.p99": {
+          "median": 2306000,
+          "min": 508000,
+          "max": 3045000
+        },
+        "client_queue_us.p999": {
+          "median": 3204000,
+          "min": 579000,
+          "max": 3463000
+        },
+        "client_queue_us.max": {
+          "median": 3331093,
+          "min": 612864,
+          "max": 3600251
+        }
+      },
+      "raw": {
+        "completed_in_window": {
+          "median": 16249,
+          "min": 15267,
+          "max": 23816
+        },
+        "dropped": {
+          "median": 7610,
+          "min": 181,
+          "max": 8591
+        },
+        "drain_seconds": {
+          "median": 1.10464,
+          "min": 0.011415,
+          "max": 1.663886
+        },
+        "write_service_us.p50": {
+          "median": 96500,
+          "min": 16000,
+          "max": 108000
+        },
+        "write_service_us.p95": {
+          "median": 236000,
+          "min": 64500,
+          "max": 240000
+        },
+        "write_service_us.p99": {
+          "median": 338000,
+          "min": 84400,
+          "max": 354000
+        },
+        "write_service_us.p999": {
+          "median": 789000,
+          "min": 766000,
+          "max": 819000
+        },
+        "write_service_us.max": {
+          "median": 919464,
+          "min": 893884,
+          "max": 945202
+        },
+        "write_total_us.p50": {
+          "median": 918000,
+          "min": 17000,
+          "max": 1029000
+        },
+        "write_total_us.p95": {
+          "median": 1583000,
+          "min": 464000,
+          "max": 1634000
+        },
+        "write_total_us.p99": {
+          "median": 1799000,
+          "min": 788000,
+          "max": 1962000
+        },
+        "write_total_us.p999": {
+          "median": 2009000,
+          "min": 885000,
+          "max": 2375000
+        },
+        "write_total_us.max": {
+          "median": 2228303,
+          "min": 920658,
+          "max": 2475381
+        },
+        "client_queue_us.p50": {
+          "median": 806000,
+          "min": 1200,
+          "max": 910000
+        },
+        "client_queue_us.p95": {
+          "median": 1439000,
+          "min": 382000,
+          "max": 1474000
+        },
+        "client_queue_us.p99": {
+          "median": 1637000,
+          "min": 708000,
+          "max": 1761000
+        },
+        "client_queue_us.p999": {
+          "median": 1877000,
+          "min": 805000,
+          "max": 2152000
+        },
+        "client_queue_us.max": {
+          "median": 1955243,
+          "min": 840698,
+          "max": 2357909
+        }
+      }
+    },
+    "300": {
+      "server": {
+        "completed_in_window": {
+          "median": 15387,
+          "min": 13476,
+          "max": 31754
+        },
+        "dropped": {
+          "median": 20474,
+          "min": 4112,
+          "max": 22380
+        },
+        "drain_seconds": {
+          "median": 1.163665,
+          "min": 0.508195,
+          "max": 1.634052
+        },
+        "write_service_us.p50": {
+          "median": 91000,
+          "min": 56700,
+          "max": 103000
+        },
+        "write_service_us.p95": {
+          "median": 322000,
+          "min": 71000,
+          "max": 373000
+        },
+        "write_service_us.p99": {
+          "median": 530000,
+          "min": 82100,
+          "max": 616000
+        },
+        "write_service_us.p999": {
+          "median": 823000,
+          "min": 713000,
+          "max": 856000
+        },
+        "write_service_us.max": {
+          "median": 978624,
+          "min": 855773,
+          "max": 1012923
+        },
+        "write_total_us.p50": {
+          "median": 893000,
+          "min": 484000,
+          "max": 1083000
+        },
+        "write_total_us.p95": {
+          "median": 2072000,
+          "min": 586000,
+          "max": 2248000
+        },
+        "write_total_us.p99": {
+          "median": 2496000,
+          "min": 1175000,
+          "max": 2688000
+        },
+        "write_total_us.p999": {
+          "median": 3068000,
+          "min": 1308000,
+          "max": 3177000
+        },
+        "write_total_us.max": {
+          "median": 3226133,
+          "min": 1327358,
+          "max": 3263775
+        },
+        "client_queue_us.p50": {
+          "median": 786000,
+          "min": 427000,
+          "max": 949000
+        },
+        "client_queue_us.p95": {
+          "median": 1906000,
+          "min": 510000,
+          "max": 2058000
+        },
+        "client_queue_us.p99": {
+          "median": 2291000,
+          "min": 1106000,
+          "max": 2461000
+        },
+        "client_queue_us.p999": {
+          "median": 2764000,
+          "min": 1253000,
+          "max": 2914000
+        },
+        "client_queue_us.max": {
+          "median": 3003386,
+          "min": 1264544,
+          "max": 3159145
+        }
+      },
+      "raw": {
+        "completed_in_window": {
+          "median": 16672,
+          "min": 15759,
+          "max": 31681
+        },
+        "dropped": {
+          "median": 19190,
+          "min": 4188,
+          "max": 20102
+        },
+        "drain_seconds": {
+          "median": 0.816093,
+          "min": 0.450667,
+          "max": 1.077732
+        },
+        "write_service_us.p50": {
+          "median": 95300,
+          "min": 56200,
+          "max": 101000
+        },
+        "write_service_us.p95": {
+          "median": 222000,
+          "min": 69700,
+          "max": 249000
+        },
+        "write_service_us.p99": {
+          "median": 350000,
+          "min": 80900,
+          "max": 352000
+        },
+        "write_service_us.p999": {
+          "median": 730000,
+          "min": 700000,
+          "max": 880000
+        },
+        "write_service_us.max": {
+          "median": 890372,
+          "min": 809412,
+          "max": 1001840
+        },
+        "write_total_us.p50": {
+          "median": 965000,
+          "min": 479000,
+          "max": 1010000
+        },
+        "write_total_us.p95": {
+          "median": 1590000,
+          "min": 570000,
+          "max": 1640000
+        },
+        "write_total_us.p99": {
+          "median": 1883000,
+          "min": 1380000,
+          "max": 1903000
+        },
+        "write_total_us.p999": {
+          "median": 2132000,
+          "min": 1426000,
+          "max": 2318000
+        },
+        "write_total_us.max": {
+          "median": 2188134,
+          "min": 1460349,
+          "max": 2400177
+        },
+        "client_queue_us.p50": {
+          "median": 852000,
+          "min": 422000,
+          "max": 888000
+        },
+        "client_queue_us.p95": {
+          "median": 1446000,
+          "min": 498000,
+          "max": 1476000
+        },
+        "client_queue_us.p99": {
+          "median": 1706000,
+          "min": 1317000,
+          "max": 1747000
+        },
+        "client_queue_us.p999": {
+          "median": 2000000,
+          "min": 1370000,
+          "max": 2141000
+        },
+        "client_queue_us.max": {
+          "median": 2090998,
+          "min": 1392686,
+          "max": 2260359
+        }
+      }
+    }
+  },
+  "seconds": 120,
+  "publication_identity": {
+    "otp": "29",
+    "elixir": "1.20.4",
+    "sha256": {
+      "apps/ferricstore/lib/ferricstore/api/store.ex": "7f1aa1ac916ad15fe9eee5fd77ff6cbe02cde15c5f0388c362b911e07f5d6409",
+      "apps/ferricstore/lib/ferricstore/commands/hash.ex": "6b0555387474438e5e71721e47e20bace30df9ceb933f4bcdfda3264e76492b0",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/apply_dispatch.ex": "38b2f13bfe11dfddb3ab5dc7fe14484af10f1eb0be9919d5e52daaaa0a5d8d05",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/async_apply.ex": "ef632c3b1456b3242658abee3e6e1bc2266185af9e350a59879a766287e39d23",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/compound_apply.ex": "c1618c09b9bfb2992ee931ff124f270432d60dd35e4bb34dc6ab580f1170fb4a",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/cross_shard_pending.ex": "186833ef6db9a8bd401b313f9cb69aa4463b194f9f36bd74d8fea80b78179c25",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/pending_writes.ex": "8409fe625dbfbc8be11ec2a4c9d59ba4c89e4e20a7ef0203d8902385dce96898",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/read_warm.ex": "42317fe19049327ffeeb15688d44829529e47936a993fbd33031bde9abab3ef5",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_backend/batcher.ex": "5835e88e7631da3e4bfaaadb64a0c41b4bf69aaec8b4e06758f4ea2dbf10afc4",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_backend/hset_cadence.ex": "c851b2429dbf18d32034901933e9627d62ac34f9846e5dd9e5ebc87eb4be24c0",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_backend/sections/leader_wait.ex": "781f545e066d7b65caa1296b9acdbaaf546072dfdefefdec997665767eed5e72",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_backend/sections/public_api.ex": "3ed4785b6b6a227d5deff0e5088115131966e213acf1c2c7fb5acd1100a48f86",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_backend/sections/startup.ex": "7381721c1ea44cad492365f522758a4de5da996852e4d5e1f5f32b9cb4abcb02",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_storage/sections/lifecycle.ex": "19df67af92f6e4047114e56482cfba5da3085633faa349f29406d74e24ac45ff",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_storage/sections/snapshot_install.ex": "b11cf0e382d4767225150ab4421a4b5d1ccdfdb5602e59d77433f48cd2add02a",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_storage/sections/snapshot_metadata.ex": "9d64b45ebfe56c1e71b07f0fc72e48d3a99232456abedac1ee55dcdfb167b5d9",
+      "apps/ferricstore/lib/ferricstore/store/ops.ex": "8e86143ac06a319aa49d9159579e07b80e52174fcd0dd264b4123659a4880cbb",
+      "apps/ferricstore/lib/ferricstore/store/promoted_publication.ex": "2b9e2288bd30594e35362a57be202b5f95a1d711364927bab3d2004cb65fffad",
+      "apps/ferricstore/lib/ferricstore/store/publication_epoch.ex": "370bd4826e3373bd655cbc20761b75196b05c6c53685775f15e0fc505c0108f5",
+      "apps/ferricstore/lib/ferricstore/store/shard/compound/ops.ex": "d23784f27ed86cb61396c186aa88400939e7388c2c144ef17e735f20c30e19ef",
+      "apps/ferricstore/lib/ferricstore/store/shard/compound/promoted.ex": "5884ec89314e3114833eb284475fa62ff351d70dac0442a57ec7513e85ec9791",
+      "apps/ferricstore/lib/ferricstore/store/shard/startup.ex": "86078bdf66da2545e2291ac1e9133235631dae7bfa7984fc6e639053e4a7d579"
+    },
+    "beam_md5": {
+      "Ferricstore.Raft.StateMachine": "06b3f0edb61ae3c7c4f7594312325213",
+      "Ferricstore.Raft.WARaftStorage": "7a23ae6ae07bfcc9ab3a1a4f8be5080c",
+      "Ferricstore.Store.PromotedPublication": "e364f8e74415c9bd528709cc46e32c42",
+      "Ferricstore.Store.PublicationEpoch": "41ff76f4390d8bac7bfca10bb3369e9a"
+    },
+    "erl_flags": "+S 8:8"
+  }
+}

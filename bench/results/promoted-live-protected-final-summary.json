@@ -1,0 +1,229 @@
+{
+  "cohort": "protected",
+  "aggregation": "per-trial histogram percentiles, then medians/ranges across 1 trials",
+  "trials": [
+    {
+      "variant": "baseline",
+      "trial": "final",
+      "operations": {
+        "hash_write": {
+          "count": 26556,
+          "max_us": 831350,
+          "p50_us": 60700,
+          "p95_us": 77900,
+          "p99_us": 90000
+        },
+        "hash_read": {
+          "count": 53111,
+          "max_us": 683716,
+          "p50_us": 68,
+          "p95_us": 22100,
+          "p99_us": 31100
+        },
+        "kv_read": {
+          "count": 26555,
+          "max_us": 1035,
+          "p50_us": 3,
+          "p95_us": 8,
+          "p99_us": 13
+        }
+      },
+      "ops_per_second": 881.4148368532437,
+      "compactions": 4,
+      "compaction_failures": 0
+    },
+    {
+      "variant": "protected",
+      "trial": "final",
+      "operations": {
+        "hash_write": {
+          "count": 26758,
+          "max_us": 925148,
+          "p50_us": 67100,
+          "p95_us": 90800,
+          "p99_us": 112000
+        },
+        "hash_read": {
+          "count": 53516,
+          "max_us": 225,
+          "p50_us": 6,
+          "p95_us": 14,
+          "p99_us": 19
+        },
+        "kv_read": {
+          "count": 26758,
+          "max_us": 154,
+          "p50_us": 3,
+          "p95_us": 8,
+          "p99_us": 11
+        }
+      },
+      "ops_per_second": 887.9554041173133,
+      "compactions": 4,
+      "compaction_failures": 0
+    }
+  ],
+  "variants": {
+    "baseline": {
+      "ops_per_second": {
+        "median": 881.4148368532437,
+        "min": 881.4148368532437,
+        "max": 881.4148368532437
+      },
+      "hash_write_p50_us": {
+        "median": 60700,
+        "min": 60700,
+        "max": 60700
+      },
+      "hash_write_p95_us": {
+        "median": 77900,
+        "min": 77900,
+        "max": 77900
+      },
+      "hash_write_p99_us": {
+        "median": 90000,
+        "min": 90000,
+        "max": 90000
+      },
+      "hash_write_max_us": {
+        "median": 831350,
+        "min": 831350,
+        "max": 831350
+      },
+      "hash_read_p50_us": {
+        "median": 68,
+        "min": 68,
+        "max": 68
+      },
+      "hash_read_p95_us": {
+        "median": 22100,
+        "min": 22100,
+        "max": 22100
+      },
+      "hash_read_p99_us": {
+        "median": 31100,
+        "min": 31100,
+        "max": 31100
+      },
+      "hash_read_max_us": {
+        "median": 683716,
+        "min": 683716,
+        "max": 683716
+      },
+      "kv_read_p50_us": {
+        "median": 3,
+        "min": 3,
+        "max": 3
+      },
+      "kv_read_p95_us": {
+        "median": 8,
+        "min": 8,
+        "max": 8
+      },
+      "kv_read_p99_us": {
+        "median": 13,
+        "min": 13,
+        "max": 13
+      },
+      "kv_read_max_us": {
+        "median": 1035,
+        "min": 1035,
+        "max": 1035
+      }
+    },
+    "protected": {
+      "ops_per_second": {
+        "median": 887.9554041173133,
+        "min": 887.9554041173133,
+        "max": 887.9554041173133
+      },
+      "hash_write_p50_us": {
+        "median": 67100,
+        "min": 67100,
+        "max": 67100
+      },
+      "hash_write_p95_us": {
+        "median": 90800,
+        "min": 90800,
+        "max": 90800
+      },
+      "hash_write_p99_us": {
+        "median": 112000,
+        "min": 112000,
+        "max": 112000
+      },
+      "hash_write_max_us": {
+        "median": 925148,
+        "min": 925148,
+        "max": 925148
+      },
+      "hash_read_p50_us": {
+        "median": 6,
+        "min": 6,
+        "max": 6
+      },
+      "hash_read_p95_us": {
+        "median": 14,
+        "min": 14,
+        "max": 14
+      },
+      "hash_read_p99_us": {
+        "median": 19,
+        "min": 19,
+        "max": 19
+      },
+      "hash_read_max_us": {
+        "median": 225,
+        "min": 225,
+        "max": 225
+      },
+      "kv_read_p50_us": {
+        "median": 3,
+        "min": 3,
+        "max": 3
+      },
+      "kv_read_p95_us": {
+        "median": 8,
+        "min": 8,
+        "max": 8
+      },
+      "kv_read_p99_us": {
+        "median": 11,
+        "min": 11,
+        "max": 11
+      },
+      "kv_read_max_us": {
+        "median": 154,
+        "min": 154,
+        "max": 154
+      }
+    }
+  },
+  "router_checksums": {
+    "baseline": "23efba0228a5706f4bd85f997affa155",
+    "protected": "cb91db20edc0ab4ed2b832fd3543a68e"
+  },
+  "publication_identity": {
+    "otp": "29",
+    "elixir": "1.20.4",
+    "sha256": {
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/apply_dispatch.ex": "4430c0c7b4b9cd8e0b94b9123fa5cb3618347dfed619722593e192d0360a65eb",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/compound_apply.ex": "c1618c09b9bfb2992ee931ff124f270432d60dd35e4bb34dc6ab580f1170fb4a",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/cross_shard_pending.ex": "186833ef6db9a8bd401b313f9cb69aa4463b194f9f36bd74d8fea80b78179c25",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/pending_writes.ex": "8409fe625dbfbc8be11ec2a4c9d59ba4c89e4e20a7ef0203d8902385dce96898",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/read_warm.ex": "42317fe19049327ffeeb15688d44829529e47936a993fbd33031bde9abab3ef5",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_storage/sections/lifecycle.ex": "19df67af92f6e4047114e56482cfba5da3085633faa349f29406d74e24ac45ff",
+      "apps/ferricstore/lib/ferricstore/store/promoted_publication.ex": "2b9e2288bd30594e35362a57be202b5f95a1d711364927bab3d2004cb65fffad",
+      "apps/ferricstore/lib/ferricstore/store/publication_epoch.ex": "370bd4826e3373bd655cbc20761b75196b05c6c53685775f15e0fc505c0108f5",
+      "apps/ferricstore/lib/ferricstore/store/shard/compound/ops.ex": "d23784f27ed86cb61396c186aa88400939e7388c2c144ef17e735f20c30e19ef",
+      "apps/ferricstore/lib/ferricstore/store/shard/startup.ex": "86078bdf66da2545e2291ac1e9133235631dae7bfa7984fc6e639053e4a7d579"
+    },
+    "beam_md5": {
+      "Ferricstore.Raft.StateMachine": "de513a33b11cfb289acf752a9970a257",
+      "Ferricstore.Raft.WARaftStorage": "41f57f34d29d4f137cc413f90df13ab1",
+      "Ferricstore.Store.PromotedPublication": "e364f8e74415c9bd528709cc46e32c42",
+      "Ferricstore.Store.PublicationEpoch": "41ff76f4390d8bac7bfca10bb3369e9a"
+    },
+    "erl_flags": "+S 8:8"
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "trials": [
+    {
+      "mode": "baseline",
+      "trial": 1,
+      "elapsed_us": 397052
+    },
+    {
+      "mode": "single_pass",
+      "trial": 1,
+      "elapsed_us": 382047
+    },
+    {
+      "mode": "single_pass",
+      "trial": 2,
+      "elapsed_us": 334073
+    },
+    {
+      "mode": "baseline",
+      "trial": 2,
+      "elapsed_us": 331259
+    },
+    {
+      "mode": "baseline",
+      "trial": 3,
+      "elapsed_us": 379836
+    },
+    {
+      "mode": "single_pass",
+      "trial": 3,
+      "elapsed_us": 451494
+    }
+  ],
+  "variants": {
+    "baseline": {
+      "median_us": 379836,
+      "min_us": 331259,
+      "max_us": 397052
+    },
+    "single_pass": {
+      "median_us": 382047,
+      "min_us": 334073,
+      "max_us": 451494
+    }
+  }
+}

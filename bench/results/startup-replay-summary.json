@@ -1,0 +1,897 @@
+{
+  "image_ids": {
+    "baseline": "sha256:91e462a3339449f4ec528c22e3913bc125dc376588ca918542a96521bc4d59cd",
+    "candidate": "sha256:54ae5a8c22ea017c7d3ec34175abe5173b6a72fb656388f94c7c2e44654fbde0"
+  },
+  "keydir_comparisons": [
+    {
+      "variant": "baseline",
+      "trial": 1,
+      "key_expiry_match": true,
+      "differing_shards": [],
+      "counts_by_shard": [
+        922,
+        1077,
+        1420,
+        1279,
+        1816,
+        1220,
+        743,
+        898,
+        105054,
+        1453,
+        96208,
+        6269,
+        106401,
+        197377,
+        107947,
+        112750
+      ],
+      "rows": 742834
+    },
+    {
+      "variant": "candidate",
+      "trial": 1,
+      "key_expiry_match": false,
+      "differing_shards": [
+        10,
+        12,
+        13,
+        14,
+        15
+      ],
+      "counts_by_shard": [
+        922,
+        1077,
+        1420,
+        1279,
+        1816,
+        1220,
+        743,
+        898,
+        105054,
+        1453,
+        96206,
+        6269,
+        106399,
+        197373,
+        107945,
+        112748
+      ],
+      "rows": 742822
+    },
+    {
+      "variant": "candidate",
+      "trial": 2,
+      "key_expiry_match": false,
+      "differing_shards": [
+        10,
+        12
+      ],
+      "counts_by_shard": [
+        922,
+        1077,
+        1420,
+        1279,
+        1816,
+        1220,
+        743,
+        898,
+        105054,
+        1453,
+        96206,
+        6269,
+        106399,
+        197377,
+        107947,
+        112750
+      ],
+      "rows": 742830
+    },
+    {
+      "variant": "baseline",
+      "trial": 2,
+      "key_expiry_match": false,
+      "differing_shards": [
+        10,
+        12,
+        13,
+        14,
+        15
+      ],
+      "counts_by_shard": [
+        922,
+        1077,
+        1420,
+        1279,
+        1816,
+        1220,
+        743,
+        898,
+        105054,
+        1453,
+        96206,
+        6269,
+        106399,
+        197373,
+        107945,
+        112748
+      ],
+      "rows": 742822
+    },
+    {
+      "variant": "baseline",
+      "trial": 3,
+      "key_expiry_match": false,
+      "differing_shards": [
+        10,
+        12,
+        13,
+        14,
+        15
+      ],
+      "counts_by_shard": [
+        922,
+        1077,
+        1420,
+        1279,
+        1816,
+        1220,
+        743,
+        898,
+        105054,
+        1453,
+        96206,
+        6269,
+        106399,
+        197373,
+        107945,
+        112748
+      ],
+      "rows": 742822
+    },
+    {
+      "variant": "candidate",
+      "trial": 3,
+      "key_expiry_match": false,
+      "differing_shards": [
+        10
+      ],
+      "counts_by_shard": [
+        922,
+        1077,
+        1420,
+        1279,
+        1816,
+        1220,
+        743,
+        898,
+        105054,
+        1453,
+        96207,
+        6269,
+        106401,
+        197377,
+        107947,
+        112750
+      ],
+      "rows": 742833
+    }
+  ],
+  "startup": {
+    "baseline": {
+      "ready_seconds": {
+        "median": 96.522901,
+        "min": 96.069048,
+        "max": 97.030199
+      },
+      "peak_gib": {
+        "median": 2.7742919921875,
+        "min": 2.6864852905273438,
+        "max": 3.1823654174804688
+      },
+      "phases": {
+        "ferricstore:waraft:backend:startup_phase:ensure_storage_runtime": {
+          "median": 5.6e-05,
+          "min": 5.4e-05,
+          "max": 6.3e-05
+        },
+        "ferricstore:waraft:backend:startup_phase:ensure_data_layout": {
+          "median": 0.001582,
+          "min": 0.0015589999999999998,
+          "max": 0.004115000000000001
+        },
+        "ferricstore:shard:startup_phase:validate_prob_files": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0
+        },
+        "ferricstore:shard:startup_phase:flow_history_projector_recover": {
+          "median": 57.76873299999999,
+          "min": 57.169685000000015,
+          "max": 58.340717
+        },
+        "ferricstore:waraft:segment_log:startup_phase:enforce_ets_memory_limit": {
+          "median": 0.00012300000000000004,
+          "min": 0.00011200000000000004,
+          "max": 0.000125
+        },
+        "ferricstore:waraft:backend:startup_phase:start_namespace_batchers": {
+          "median": 0.000294,
+          "min": 0.000245,
+          "max": 0.00032900000000000003
+        },
+        "ferricstore:waraft:storage:startup_phase:reconcile_flow_lmdb": {
+          "median": 57.387078,
+          "min": 57.10781499999999,
+          "max": 57.59918400000001
+        },
+        "ferricstore:waraft:storage:startup_phase:read_metadata": {
+          "median": 0.104064,
+          "min": 0.09958999999999998,
+          "max": 0.10577099999999999
+        },
+        "ferricstore:waraft:storage:startup_phase:rebuild_logical_key_index": {
+          "median": 1.042653,
+          "min": 1.009331,
+          "max": 1.0645499999999999
+        },
+        "ferricstore:waraft:backend:startup_phase:configure": {
+          "median": 5.9e-05,
+          "min": 4.4e-05,
+          "max": 0.0001
+        },
+        "ferricstore:shard:startup_phase:logical_key_index_rebuild": {
+          "median": 0.0004750000000000001,
+          "min": 0.0004000000000000001,
+          "max": 0.0005540000000000001
+        },
+        "ferricstore:waraft:storage:startup_phase:rebuild_due_catalog": {
+          "median": 0.009259,
+          "min": 0.008858000000000001,
+          "max": 0.009441
+        },
+        "ferricstore:waraft:backend:startup_phase:rollout_apply_context": {
+          "median": 0.012521000000000001,
+          "min": 0.012201,
+          "max": 0.01458
+        },
+        "ferricstore:waraft:segment_log:startup_phase:clear_offset_registry": {
+          "median": 0.010616,
+          "min": 0.009760999999999999,
+          "max": 0.013210000000000001
+        },
+        "ferricstore:waraft:storage:startup_phase:validate_prob_files": {
+          "median": 0.359621,
+          "min": 0.356711,
+          "max": 0.36912399999999995
+        },
+        "ferricstore:shard:startup_phase:recover_keydir": {
+          "median": 1e-06,
+          "min": 1e-06,
+          "max": 1e-06
+        },
+        "ferricstore:shard:startup_phase:compound_member_index_rebuild": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 1e-06
+        },
+        "ferricstore:waraft:storage:startup_phase:recover_apply_projection_value_locators": {
+          "median": 6.596816999999999,
+          "min": 6.335005,
+          "max": 6.598944
+        },
+        "ferricstore:waraft:backend:startup_phase:start_partitions": {
+          "median": 72.074206,
+          "min": 72.054153,
+          "max": 72.27782499999999
+        },
+        "ferricstore:waraft:storage:startup_phase:rebuild_segment_indexes": {
+          "median": 63.955699,
+          "min": 63.609739000000005,
+          "max": 64.211878
+        },
+        "ferricstore:shard:startup_phase:flow_lmdb_rebuild": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0
+        },
+        "ferricstore:waraft:backend:startup_phase:start_backend_supervisor": {
+          "median": 3.9e-05,
+          "min": 3.1e-05,
+          "max": 5.1e-05
+        },
+        "ferricstore:shard:startup_phase:namespace_usage_index_rebuild": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0
+        },
+        "ferricstore:shard:startup_phase:flow_due_catalog_rebuild": {
+          "median": 0.024007999999999995,
+          "min": 0.023979000000000007,
+          "max": 0.025174
+        },
+        "ferricstore:shard:startup_phase:compute_file_stats": {
+          "median": 0.0021119999999999997,
+          "min": 0.0019159999999999997,
+          "max": 0.0021259999999999994
+        },
+        "ferricstore:waraft:backend:startup_phase:finish_start_partition": {
+          "median": 6.420558,
+          "min": 6.285059,
+          "max": 6.427467
+        },
+        "ferricstore:shard:startup_phase:flow_native_index_init": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0
+        },
+        "ferricstore:waraft:segment_log:startup_phase:preload_segment_config": {
+          "median": 0.0024930000000000004,
+          "min": 0.002439,
+          "max": 0.0036810000000000002
+        },
+        "ferricstore:waraft:backend:startup_phase:start_partition": {
+          "median": 58.981464,
+          "min": 57.554732,
+          "max": 59.98582700000001
+        },
+        "ferricstore:shard:startup_phase:recover_promoted": {
+          "median": 0.0024709999999999997,
+          "min": 0.0023649999999999995,
+          "max": 0.002496
+        },
+        "ferricstore:waraft:segment_log:startup_phase:load_segments": {
+          "median": 8.172572,
+          "min": 8.012577,
+          "max": 8.197909999999998
+        },
+        "ferricstore:waraft:backend:startup_phase:active_file_init": {
+          "median": 1e-05,
+          "min": 8.999999999999999e-06,
+          "max": 1.7999999999999997e-05
+        },
+        "ferricstore:waraft:backend:startup_phase:finish_start": {
+          "median": 0.718974,
+          "min": 0.7084400000000001,
+          "max": 0.726666
+        },
+        "ferricstore:waraft:storage:startup_phase:build_state": {
+          "median": 2.5740119999999997,
+          "min": 2.570656,
+          "max": 2.6627109999999994
+        },
+        "ferricstore:waraft:storage:startup_phase:recover_pending_snapshot_install": {
+          "median": 0.001052,
+          "min": 0.0009710000000000002,
+          "max": 0.001092
+        },
+        "ferricstore:waraft:storage:startup_phase:rebuild_namespace_usage_index": {
+          "median": 4.752374,
+          "min": 4.748069,
+          "max": 4.810509
+        },
+        "ferricstore:waraft:segment_log:startup_phase:preload_trim_floor": {
+          "median": 0.002742,
+          "min": 0.0023239999999999997,
+          "max": 0.0028009999999999997
+        },
+        "ferricstore:waraft:backend:startup_phase:stop_existing_backend": {
+          "median": 0.008376,
+          "min": 0.008146,
+          "max": 0.009775
+        },
+        "ferricstore:waraft:storage:startup_phase:rebuild_compound_member_index": {
+          "median": 0.375986,
+          "min": 0.37237200000000004,
+          "max": 0.389426
+        },
+        "ferricstore:waraft:storage:startup_phase:ensure_apply_projection_log": {
+          "median": 0.007214999999999999,
+          "min": 0.006453999999999999,
+          "max": 0.007326
+        },
+        "ferricstore:waraft:storage:startup_phase:recover_segment_projected_keydir": {
+          "median": 144.13974000000002,
+          "min": 143.93703600000003,
+          "max": 145.33428899999998
+        },
+        "ferricstore:waraft:segment_log:startup_phase:refresh_memory_stats": {
+          "median": 0.001931,
+          "min": 0.0017350000000000002,
+          "max": 0.001969
+        },
+        "ferricstore:waraft:backend:startup_phase:ensure_waraft_app_started": {
+          "median": 1.7999999999999997e-05,
+          "min": 1.6e-05,
+          "max": 3.1e-05
+        }
+      }
+    },
+    "candidate": {
+      "ready_seconds": {
+        "median": 95.384867,
+        "min": 93.26560400000001,
+        "max": 95.458076
+      },
+      "peak_gib": {
+        "median": 2.8619384765625,
+        "min": 2.7442703247070312,
+        "max": 3.3201675415039062
+      },
+      "phases": {
+        "ferricstore:waraft:backend:startup_phase:ensure_storage_runtime": {
+          "median": 3.8e-05,
+          "min": 3.4e-05,
+          "max": 6.500000000000001e-05
+        },
+        "ferricstore:waraft:backend:startup_phase:ensure_data_layout": {
+          "median": 0.00157,
+          "min": 0.001452,
+          "max": 0.001898
+        },
+        "ferricstore:shard:startup_phase:validate_prob_files": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0
+        },
+        "ferricstore:shard:startup_phase:flow_history_projector_recover": {
+          "median": 57.652376999999994,
+          "min": 56.633604000000005,
+          "max": 59.629396
+        },
+        "ferricstore:waraft:segment_log:startup_phase:enforce_ets_memory_limit": {
+          "median": 0.00011600000000000001,
+          "min": 0.00011400000000000002,
+          "max": 0.00012000000000000004
+        },
+        "ferricstore:waraft:backend:startup_phase:start_namespace_batchers": {
+          "median": 0.000296,
+          "min": 0.000235,
+          "max": 0.000315
+        },
+        "ferricstore:waraft:storage:startup_phase:reconcile_flow_lmdb": {
+          "median": 54.213932,
+          "min": 54.038201,
+          "max": 58.830672
+        },
+        "ferricstore:waraft:storage:startup_phase:read_metadata": {
+          "median": 0.10471199999999999,
+          "min": 0.09692899999999997,
+          "max": 0.10952999999999999
+        },
+        "ferricstore:waraft:storage:startup_phase:rebuild_logical_key_index": {
+          "median": 1.043779,
+          "min": 1.021789,
+          "max": 1.0579049999999999
+        },
+        "ferricstore:waraft:backend:startup_phase:configure": {
+          "median": 9.1e-05,
+          "min": 7.000000000000001e-05,
+          "max": 0.0001
+        },
+        "ferricstore:shard:startup_phase:logical_key_index_rebuild": {
+          "median": 0.00046500000000000014,
+          "min": 0.0004490000000000002,
+          "max": 0.0005220000000000001
+        },
+        "ferricstore:waraft:storage:startup_phase:rebuild_due_catalog": {
+          "median": 0.009375,
+          "min": 0.008932,
+          "max": 0.009439
+        },
+        "ferricstore:waraft:backend:startup_phase:rollout_apply_context": {
+          "median": 0.013676,
+          "min": 0.011614000000000001,
+          "max": 0.013993
+        },
+        "ferricstore:waraft:segment_log:startup_phase:clear_offset_registry": {
+          "median": 0.010327,
+          "min": 0.010100999999999999,
+          "max": 0.010456
+        },
+        "ferricstore:waraft:storage:startup_phase:validate_prob_files": {
+          "median": 0.35426599999999997,
+          "min": 0.34534000000000004,
+          "max": 0.35767099999999996
+        },
+        "ferricstore:shard:startup_phase:recover_keydir": {
+          "median": 1e-06,
+          "min": 0.0,
+          "max": 2e-06
+        },
+        "ferricstore:shard:startup_phase:compound_member_index_rebuild": {
+          "median": 1e-06,
+          "min": 0.0,
+          "max": 1e-06
+        },
+        "ferricstore:waraft:storage:startup_phase:recover_apply_projection_value_locators": {
+          "median": 6.5276819999999995,
+          "min": 6.344134000000001,
+          "max": 6.564584000000001
+        },
+        "ferricstore:waraft:backend:startup_phase:start_partitions": {
+          "median": 70.26721400000001,
+          "min": 69.321053,
+          "max": 70.603269
+        },
+        "ferricstore:waraft:storage:startup_phase:rebuild_segment_indexes": {
+          "median": 60.895534000000005,
+          "min": 60.60761699999999,
+          "max": 65.32684499999999
+        },
+        "ferricstore:shard:startup_phase:flow_lmdb_rebuild": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0
+        },
+        "ferricstore:waraft:backend:startup_phase:start_backend_supervisor": {
+          "median": 4.1e-05,
+          "min": 4e-05,
+          "max": 4.4999999999999996e-05
+        },
+        "ferricstore:shard:startup_phase:namespace_usage_index_rebuild": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0
+        },
+        "ferricstore:shard:startup_phase:flow_due_catalog_rebuild": {
+          "median": 0.024450000000000003,
+          "min": 0.023065000000000002,
+          "max": 0.024764
+        },
+        "ferricstore:shard:startup_phase:compute_file_stats": {
+          "median": 0.0019939999999999997,
+          "min": 0.001794,
+          "max": 0.002089999999999999
+        },
+        "ferricstore:waraft:backend:startup_phase:finish_start_partition": {
+          "median": 6.414554999999999,
+          "min": 6.347768000000001,
+          "max": 6.422193
+        },
+        "ferricstore:shard:startup_phase:flow_native_index_init": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0
+        },
+        "ferricstore:waraft:segment_log:startup_phase:preload_segment_config": {
+          "median": 0.002966,
+          "min": 0.0023300000000000005,
+          "max": 0.0031940000000000007
+        },
+        "ferricstore:waraft:backend:startup_phase:start_partition": {
+          "median": 58.349649,
+          "min": 58.059270999999995,
+          "max": 58.612916999999996
+        },
+        "ferricstore:shard:startup_phase:recover_promoted": {
+          "median": 0.002486999999999999,
+          "min": 0.0023009999999999997,
+          "max": 0.0025279999999999986
+        },
+        "ferricstore:waraft:segment_log:startup_phase:load_segments": {
+          "median": 8.128278,
+          "min": 8.120804999999999,
+          "max": 8.166796
+        },
+        "ferricstore:waraft:backend:startup_phase:active_file_init": {
+          "median": 8.999999999999999e-06,
+          "min": 6e-06,
+          "max": 1.3e-05
+        },
+        "ferricstore:waraft:backend:startup_phase:finish_start": {
+          "median": 0.7161130000000001,
+          "min": 0.707757,
+          "max": 0.7411019999999999
+        },
+        "ferricstore:waraft:storage:startup_phase:build_state": {
+          "median": 6.594529,
+          "min": 2.4145609999999995,
+          "max": 6.818984000000001
+        },
+        "ferricstore:waraft:storage:startup_phase:recover_pending_snapshot_install": {
+          "median": 0.001064,
+          "min": 0.000959,
+          "max": 0.0012070000000000002
+        },
+        "ferricstore:waraft:storage:startup_phase:rebuild_namespace_usage_index": {
+          "median": 4.812943000000001,
+          "min": 4.734143,
+          "max": 4.860953
+        },
+        "ferricstore:waraft:segment_log:startup_phase:preload_trim_floor": {
+          "median": 0.002799,
+          "min": 0.002508,
+          "max": 0.003698
+        },
+        "ferricstore:waraft:backend:startup_phase:stop_existing_backend": {
+          "median": 0.010885,
+          "min": 0.007462,
+          "max": 0.011291
+        },
+        "ferricstore:waraft:storage:startup_phase:rebuild_compound_member_index": {
+          "median": 0.37512,
+          "min": 0.35671499999999995,
+          "max": 0.39381700000000003
+        },
+        "ferricstore:waraft:storage:startup_phase:ensure_apply_projection_log": {
+          "median": 0.007081,
+          "min": 0.006533999999999999,
+          "max": 0.007995
+        },
+        "ferricstore:waraft:storage:startup_phase:recover_segment_projected_keydir": {
+          "median": 135.113014,
+          "min": 132.566402,
+          "max": 135.56846500000003
+        },
+        "ferricstore:waraft:segment_log:startup_phase:refresh_memory_stats": {
+          "median": 0.002029,
+          "min": 0.001872,
+          "max": 0.0020410000000000003
+        },
+        "ferricstore:waraft:backend:startup_phase:ensure_waraft_app_started": {
+          "median": 2.7e-05,
+          "min": 2.6e-05,
+          "max": 4.2000000000000004e-05
+        }
+      }
+    }
+  },
+  "live": {
+    "baseline": {
+      "put_get/1": {
+        "ops_per_second": {
+          "median": 98.23192517602382,
+          "min": 97.0365322577586,
+          "max": 99.20617098313315
+        },
+        "p95_us": {
+          "median": 12861,
+          "min": 12831,
+          "max": 13004
+        },
+        "p99_us": {
+          "median": 14060,
+          "min": 13622,
+          "max": 14350
+        }
+      },
+      "empty_flow_claim/1": {
+        "ops_per_second": {
+          "median": 2647.277166339482,
+          "min": 2596.1787113345667,
+          "max": 2815.5989662338106
+        },
+        "p95_us": {
+          "median": 512,
+          "min": 499,
+          "max": 565
+        },
+        "p99_us": {
+          "median": 652,
+          "min": 639,
+          "max": 675
+        }
+      },
+      "put_get/16": {
+        "ops_per_second": {
+          "median": 1707.4229258026974,
+          "min": 1589.3370296764074,
+          "max": 1740.1402538663292
+        },
+        "p95_us": {
+          "median": 11975,
+          "min": 11724,
+          "max": 12677
+        },
+        "p99_us": {
+          "median": 12904,
+          "min": 12745,
+          "max": 14354
+        }
+      },
+      "empty_flow_claim/16": {
+        "ops_per_second": {
+          "median": 5021.122211420385,
+          "min": 4999.5451687423965,
+          "max": 5079.249690556634
+        },
+        "p95_us": {
+          "median": 4054,
+          "min": 4021,
+          "max": 4119
+        },
+        "p99_us": {
+          "median": 4516,
+          "min": 4405,
+          "max": 4572
+        }
+      }
+    },
+    "candidate": {
+      "put_get/1": {
+        "ops_per_second": {
+          "median": 96.2466213841622,
+          "min": 94.94713343610277,
+          "max": 99.12737928193805
+        },
+        "p95_us": {
+          "median": 13016,
+          "min": 12888,
+          "max": 13078
+        },
+        "p99_us": {
+          "median": 13988,
+          "min": 13632,
+          "max": 14391
+        }
+      },
+      "empty_flow_claim/1": {
+        "ops_per_second": {
+          "median": 2653.192571060801,
+          "min": 2643.4482660695276,
+          "max": 2709.3837436975377
+        },
+        "p95_us": {
+          "median": 544,
+          "min": 533,
+          "max": 545
+        },
+        "p99_us": {
+          "median": 660,
+          "min": 654,
+          "max": 669
+        }
+      },
+      "put_get/16": {
+        "ops_per_second": {
+          "median": 1716.3835100102724,
+          "min": 1688.0505033401596,
+          "max": 1731.4024000020765
+        },
+        "p95_us": {
+          "median": 11786,
+          "min": 11660,
+          "max": 11894
+        },
+        "p99_us": {
+          "median": 12805,
+          "min": 12603,
+          "max": 12947
+        }
+      },
+      "empty_flow_claim/16": {
+        "ops_per_second": {
+          "median": 4897.560835186153,
+          "min": 4804.875893366624,
+          "max": 4924.133833443487
+        },
+        "p95_us": {
+          "median": 4165,
+          "min": 4142,
+          "max": 4202
+        },
+        "p99_us": {
+          "median": 4604,
+          "min": 4576,
+          "max": 4636
+        }
+      }
+    }
+  },
+  "long_flow_confirmation": {
+    "baseline": {
+      "ops_per_second": {
+        "median": 4895.673174976761,
+        "min": 4867.386791926131,
+        "max": 4940.455950095349
+      },
+      "p95_us": {
+        "median": 4157,
+        "min": 4094,
+        "max": 4179
+      },
+      "p99_us": {
+        "median": 4585,
+        "min": 4538,
+        "max": 4621
+      }
+    },
+    "candidate": {
+      "ops_per_second": {
+        "median": 4919.814650750256,
+        "min": 4760.114113415872,
+        "max": 4973.832093561173
+      },
+      "p95_us": {
+        "median": 4139,
+        "min": 4094,
+        "max": 4249
+      },
+      "p99_us": {
+        "median": 4618,
+        "min": 4521,
+        "max": 4693
+      }
+    }
+  },
+  "expiry_diagnostic": {
+    "live_key_expiry_match": false,
+    "runs": [
+      {
+        "variant": "baseline",
+        "counts_by_shard": [
+          922,
+          1077,
+          1420,
+          1279,
+          1816,
+          1220,
+          743,
+          898,
+          105054,
+          1453,
+          96206,
+          6269,
+          106399,
+          197373,
+          107945,
+          112748
+        ],
+        "live_count": 742822,
+        "expired_count": 0
+      },
+      {
+        "variant": "candidate",
+        "counts_by_shard": [
+          922,
+          1077,
+          1420,
+          1279,
+          1816,
+          1220,
+          743,
+          898,
+          105056,
+          1453,
+          96208,
+          6269,
+          106403,
+          197381,
+          107946,
+          112749
+        ],
+        "live_count": 742840,
+        "expired_count": 0
+      }
+    ]
+  },
+  "quiescent_diagnostic": {
+    "fingerprints_match": false,
+    "runs": [
+      {
+        "variant": "baseline",
+        "ready_ms": 100660.151,
+        "rows": 742822,
+        "phases": {
+          "ferricstore:shard:startup_phase:flow_history_projector_recover": 59217.437000000005,
+          "ferricstore:waraft:storage:startup_phase:reconcile_flow_lmdb": 58410.211,
+          "ferricstore:waraft:storage:startup_phase:build_state": 2479.9999999999995,
+          "ferricstore:waraft:storage:startup_phase:recover_segment_projected_keydir": 150315.50199999998
+        }
+      },
+      {
+        "variant": "candidate",
+        "ready_ms": 107056.206,
+        "rows": 742958,
+        "phases": {
+          "ferricstore:shard:startup_phase:flow_history_projector_recover": 68323.447,
+          "ferricstore:waraft:storage:startup_phase:reconcile_flow_lmdb": 42166.774,
+          "ferricstore:waraft:storage:startup_phase:build_state": 2525.946999999999,
+          "ferricstore:waraft:storage:startup_phase:recover_segment_projected_keydir": 181710.64899999998
+        }
+      }
+    ]
+  }
+}

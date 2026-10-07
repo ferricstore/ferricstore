@@ -1,0 +1,193 @@
+{
+  "accepted": false,
+  "retained": "durably ordered old-log cleanup correctness fix",
+  "saturated": {
+    "whole": {
+      "operations": {
+        "hash_write": {
+          "count": 31540,
+          "max_us": 856050,
+          "p50_us": 57200,
+          "p95_us": 73600,
+          "p99_us": 86700,
+          "p999_us": 692000
+        },
+        "hash_read": {
+          "count": 63080,
+          "max_us": 406,
+          "p50_us": 6,
+          "p95_us": 16,
+          "p99_us": 28,
+          "p999_us": 82
+        },
+        "kv_read": {
+          "count": 31540,
+          "max_us": 215,
+          "p50_us": 3,
+          "p95_us": 9,
+          "p99_us": 16,
+          "p999_us": 52
+        }
+      },
+      "compactions": 8,
+      "ops_per_second": 1046.3294892556905
+    },
+    "separate": {
+      "operations": {
+        "hash_write": {
+          "count": 30959,
+          "max_us": 744475,
+          "p50_us": 59200,
+          "p95_us": 77200,
+          "p99_us": 90600,
+          "p999_us": 654000
+        },
+        "hash_read": {
+          "count": 61918,
+          "max_us": 345,
+          "p50_us": 6,
+          "p95_us": 16,
+          "p99_us": 29,
+          "p999_us": 83
+        },
+        "kv_read": {
+          "count": 30959,
+          "max_us": 212,
+          "p50_us": 3,
+          "p95_us": 9,
+          "p99_us": 16,
+          "p999_us": 53
+        }
+      },
+      "compactions": 8,
+      "ops_per_second": 1023.6730213982512
+    }
+  },
+  "offered": {
+    "whole": {
+      "histograms": {
+        "client_queue_us": {
+          "count": 12000,
+          "max": 577830,
+          "p50": 1600,
+          "p95": 279000,
+          "p99": 494000,
+          "p999": 558000
+        },
+        "write_service_us": {
+          "count": 12000,
+          "max": 656098,
+          "p50": 16300,
+          "p95": 59100,
+          "p99": 85400,
+          "p999": 625000
+        },
+        "write_total_us": {
+          "count": 12000,
+          "max": 657812,
+          "p50": 17700,
+          "p95": 359000,
+          "p99": 574000,
+          "p999": 638000
+        },
+        "cycle_service_us": {
+          "count": 12000,
+          "max": 656111,
+          "p50": 16300,
+          "p95": 59100,
+          "p99": 85400,
+          "p999": 625000
+        },
+        "cycle_total_us": {
+          "count": 12000,
+          "max": 657825,
+          "p50": 17700,
+          "p95": 359000,
+          "p99": 574000,
+          "p999": 638000
+        },
+        "kv_read_us": {
+          "count": 12000,
+          "max": 93,
+          "p50": 3,
+          "p95": 7,
+          "p99": 11,
+          "p999": 17
+        },
+        "hash_read_us": {
+          "count": 24000,
+          "max": 91,
+          "p50": 6,
+          "p95": 14,
+          "p99": 20,
+          "p999": 36
+        }
+      },
+      "completed_in_window": 11997,
+      "compactions": 8
+    },
+    "separate": {
+      "histograms": {
+        "client_queue_us": {
+          "count": 12000,
+          "max": 623193,
+          "p50": 1300,
+          "p95": 336000,
+          "p99": 537000,
+          "p999": 604000
+        },
+        "write_service_us": {
+          "count": 12000,
+          "max": 701271,
+          "p50": 16600,
+          "p95": 71800,
+          "p99": 87500,
+          "p999": 647000
+        },
+        "write_total_us": {
+          "count": 12000,
+          "max": 703154,
+          "p50": 17800,
+          "p95": 416000,
+          "p99": 617000,
+          "p999": 684000
+        },
+        "cycle_service_us": {
+          "count": 12000,
+          "max": 701287,
+          "p50": 16600,
+          "p95": 71800,
+          "p99": 87600,
+          "p999": 647000
+        },
+        "cycle_total_us": {
+          "count": 12000,
+          "max": 703170,
+          "p50": 17800,
+          "p95": 416000,
+          "p99": 617000,
+          "p999": 684000
+        },
+        "kv_read_us": {
+          "count": 12000,
+          "max": 113,
+          "p50": 3,
+          "p95": 7,
+          "p99": 11,
+          "p999": 25
+        },
+        "hash_read_us": {
+          "count": 24000,
+          "max": 284,
+          "p50": 6,
+          "p95": 14,
+          "p99": 22,
+          "p999": 53
+        }
+      },
+      "completed_in_window": 11997,
+      "compactions": 8
+    }
+  },
+  "warning": "These measure the rejected candidate before the retained cleanup repair; no production latency gain is claimed."
+}

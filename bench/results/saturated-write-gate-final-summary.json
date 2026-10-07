@@ -1,0 +1,801 @@
+{
+  "trials": [
+    {
+      "cohort": "saturated",
+      "variant": "legacy_serialized",
+      "trial": "final",
+      "operations": {
+        "hash_write": {
+          "count": 23984,
+          "max_us": 1047542,
+          "p50_us": 67500,
+          "p95_us": 84900,
+          "p99_us": 101000
+        },
+        "hash_read": {
+          "count": 47967,
+          "max_us": 579909,
+          "p50_us": 65,
+          "p95_us": 21900,
+          "p99_us": 31800
+        },
+        "kv_read": {
+          "count": 23984,
+          "max_us": 80,
+          "p50_us": 3,
+          "p95_us": 7,
+          "p99_us": 13
+        },
+        "cycle": {
+          "count": 23968,
+          "max_us": 1049094,
+          "p50_us": 75300,
+          "p95_us": 90300,
+          "p99_us": 110000
+        }
+      },
+      "ops_per_second": 795.9882755121232,
+      "compactions": 4,
+      "compaction_failures": 0
+    },
+    {
+      "cohort": "saturated",
+      "variant": "legacy_cached",
+      "trial": "final",
+      "operations": {
+        "hash_write": {
+          "count": 23065,
+          "max_us": 1003570,
+          "p50_us": 74900,
+          "p95_us": 126000,
+          "p99_us": 212000
+        },
+        "hash_read": {
+          "count": 46130,
+          "max_us": 459,
+          "p50_us": 6,
+          "p95_us": 14,
+          "p99_us": 19
+        },
+        "kv_read": {
+          "count": 23065,
+          "max_us": 73,
+          "p50_us": 3,
+          "p95_us": 8,
+          "p99_us": 13
+        },
+        "cycle": {
+          "count": 23049,
+          "max_us": 1003587,
+          "p50_us": 74900,
+          "p95_us": 127000,
+          "p99_us": 212000
+        }
+      },
+      "ops_per_second": 765.4861113513799,
+      "compactions": 4,
+      "compaction_failures": 0
+    },
+    {
+      "cohort": "saturated",
+      "variant": "atomic_cached",
+      "trial": "final",
+      "operations": {
+        "hash_write": {
+          "count": 28261,
+          "max_us": 984748,
+          "p50_us": 64100,
+          "p95_us": 83800,
+          "p99_us": 98600
+        },
+        "hash_read": {
+          "count": 56522,
+          "max_us": 227,
+          "p50_us": 6,
+          "p95_us": 14,
+          "p99_us": 20
+        },
+        "kv_read": {
+          "count": 28261,
+          "max_us": 86,
+          "p50_us": 3,
+          "p95_us": 8,
+          "p99_us": 13
+        },
+        "cycle": {
+          "count": 28245,
+          "max_us": 984772,
+          "p50_us": 64100,
+          "p95_us": 83900,
+          "p99_us": 98600
+        }
+      },
+      "ops_per_second": 937.8259335866193,
+      "compactions": 4,
+      "compaction_failures": 0
+    },
+    {
+      "cohort": "paced",
+      "variant": "legacy_serialized",
+      "trial": "final",
+      "operations": {
+        "hash_write": {
+          "count": 9176,
+          "max_us": 861942,
+          "p50_us": 35300,
+          "p95_us": 60400,
+          "p99_us": 87600
+        },
+        "hash_read": {
+          "count": 18358,
+          "max_us": 511894,
+          "p50_us": 25,
+          "p95_us": 15800,
+          "p99_us": 27300
+        },
+        "kv_read": {
+          "count": 9178,
+          "max_us": 35,
+          "p50_us": 3,
+          "p95_us": 8,
+          "p99_us": 13
+        },
+        "cycle": {
+          "count": 9172,
+          "max_us": 880001,
+          "p50_us": 42100,
+          "p95_us": 66900,
+          "p99_us": 97100
+        }
+      },
+      "ops_per_second": 608.9775452468807,
+      "compactions": 0,
+      "compaction_failures": 0
+    },
+    {
+      "cohort": "paced",
+      "variant": "legacy_cached",
+      "trial": "final",
+      "operations": {
+        "hash_write": {
+          "count": 8753,
+          "max_us": 1007642,
+          "p50_us": 34900,
+          "p95_us": 147000,
+          "p99_us": 217000
+        },
+        "hash_read": {
+          "count": 17508,
+          "max_us": 65,
+          "p50_us": 6,
+          "p95_us": 14,
+          "p99_us": 20
+        },
+        "kv_read": {
+          "count": 8754,
+          "max_us": 33,
+          "p50_us": 4,
+          "p95_us": 9,
+          "p99_us": 13
+        },
+        "cycle": {
+          "count": 8747,
+          "max_us": 1007661,
+          "p50_us": 34900,
+          "p95_us": 147000,
+          "p99_us": 217000
+        }
+      },
+      "ops_per_second": 580.8510005459153,
+      "compactions": 0,
+      "compaction_failures": 0
+    },
+    {
+      "cohort": "paced",
+      "variant": "atomic_cached",
+      "trial": "final",
+      "operations": {
+        "hash_write": {
+          "count": 9215,
+          "max_us": 967826,
+          "p50_us": 26300,
+          "p95_us": 54000,
+          "p99_us": 80200
+        },
+        "hash_read": {
+          "count": 18442,
+          "max_us": 72,
+          "p50_us": 6,
+          "p95_us": 14,
+          "p99_us": 19
+        },
+        "kv_read": {
+          "count": 9221,
+          "max_us": 267,
+          "p50_us": 3,
+          "p95_us": 8,
+          "p99_us": 13
+        },
+        "cycle": {
+          "count": 9211,
+          "max_us": 967848,
+          "p50_us": 26300,
+          "p95_us": 54000,
+          "p99_us": 80200
+        }
+      },
+      "ops_per_second": 611.5409643313484,
+      "compactions": 0,
+      "compaction_failures": 0
+    }
+  ],
+  "cohorts": {
+    "saturated": {
+      "legacy_serialized": {
+        "ops_per_second": {
+          "median": 795.9882755121232,
+          "min": 795.9882755121232,
+          "max": 795.9882755121232
+        },
+        "hash_write_p50_us": {
+          "median": 67500,
+          "min": 67500,
+          "max": 67500
+        },
+        "hash_write_p95_us": {
+          "median": 84900,
+          "min": 84900,
+          "max": 84900
+        },
+        "hash_write_p99_us": {
+          "median": 101000,
+          "min": 101000,
+          "max": 101000
+        },
+        "hash_write_max_us": {
+          "median": 1047542,
+          "min": 1047542,
+          "max": 1047542
+        },
+        "hash_read_p50_us": {
+          "median": 65,
+          "min": 65,
+          "max": 65
+        },
+        "hash_read_p95_us": {
+          "median": 21900,
+          "min": 21900,
+          "max": 21900
+        },
+        "hash_read_p99_us": {
+          "median": 31800,
+          "min": 31800,
+          "max": 31800
+        },
+        "hash_read_max_us": {
+          "median": 579909,
+          "min": 579909,
+          "max": 579909
+        },
+        "kv_read_p50_us": {
+          "median": 3,
+          "min": 3,
+          "max": 3
+        },
+        "kv_read_p95_us": {
+          "median": 7,
+          "min": 7,
+          "max": 7
+        },
+        "kv_read_p99_us": {
+          "median": 13,
+          "min": 13,
+          "max": 13
+        },
+        "kv_read_max_us": {
+          "median": 80,
+          "min": 80,
+          "max": 80
+        },
+        "cycle_p50_us": {
+          "median": 75300,
+          "min": 75300,
+          "max": 75300
+        },
+        "cycle_p95_us": {
+          "median": 90300,
+          "min": 90300,
+          "max": 90300
+        },
+        "cycle_p99_us": {
+          "median": 110000,
+          "min": 110000,
+          "max": 110000
+        },
+        "cycle_max_us": {
+          "median": 1049094,
+          "min": 1049094,
+          "max": 1049094
+        }
+      },
+      "legacy_cached": {
+        "ops_per_second": {
+          "median": 765.4861113513799,
+          "min": 765.4861113513799,
+          "max": 765.4861113513799
+        },
+        "hash_write_p50_us": {
+          "median": 74900,
+          "min": 74900,
+          "max": 74900
+        },
+        "hash_write_p95_us": {
+          "median": 126000,
+          "min": 126000,
+          "max": 126000
+        },
+        "hash_write_p99_us": {
+          "median": 212000,
+          "min": 212000,
+          "max": 212000
+        },
+        "hash_write_max_us": {
+          "median": 1003570,
+          "min": 1003570,
+          "max": 1003570
+        },
+        "hash_read_p50_us": {
+          "median": 6,
+          "min": 6,
+          "max": 6
+        },
+        "hash_read_p95_us": {
+          "median": 14,
+          "min": 14,
+          "max": 14
+        },
+        "hash_read_p99_us": {
+          "median": 19,
+          "min": 19,
+          "max": 19
+        },
+        "hash_read_max_us": {
+          "median": 459,
+          "min": 459,
+          "max": 459
+        },
+        "kv_read_p50_us": {
+          "median": 3,
+          "min": 3,
+          "max": 3
+        },
+        "kv_read_p95_us": {
+          "median": 8,
+          "min": 8,
+          "max": 8
+        },
+        "kv_read_p99_us": {
+          "median": 13,
+          "min": 13,
+          "max": 13
+        },
+        "kv_read_max_us": {
+          "median": 73,
+          "min": 73,
+          "max": 73
+        },
+        "cycle_p50_us": {
+          "median": 74900,
+          "min": 74900,
+          "max": 74900
+        },
+        "cycle_p95_us": {
+          "median": 127000,
+          "min": 127000,
+          "max": 127000
+        },
+        "cycle_p99_us": {
+          "median": 212000,
+          "min": 212000,
+          "max": 212000
+        },
+        "cycle_max_us": {
+          "median": 1003587,
+          "min": 1003587,
+          "max": 1003587
+        }
+      },
+      "atomic_cached": {
+        "ops_per_second": {
+          "median": 937.8259335866193,
+          "min": 937.8259335866193,
+          "max": 937.8259335866193
+        },
+        "hash_write_p50_us": {
+          "median": 64100,
+          "min": 64100,
+          "max": 64100
+        },
+        "hash_write_p95_us": {
+          "median": 83800,
+          "min": 83800,
+          "max": 83800
+        },
+        "hash_write_p99_us": {
+          "median": 98600,
+          "min": 98600,
+          "max": 98600
+        },
+        "hash_write_max_us": {
+          "median": 984748,
+          "min": 984748,
+          "max": 984748
+        },
+        "hash_read_p50_us": {
+          "median": 6,
+          "min": 6,
+          "max": 6
+        },
+        "hash_read_p95_us": {
+          "median": 14,
+          "min": 14,
+          "max": 14
+        },
+        "hash_read_p99_us": {
+          "median": 20,
+          "min": 20,
+          "max": 20
+        },
+        "hash_read_max_us": {
+          "median": 227,
+          "min": 227,
+          "max": 227
+        },
+        "kv_read_p50_us": {
+          "median": 3,
+          "min": 3,
+          "max": 3
+        },
+        "kv_read_p95_us": {
+          "median": 8,
+          "min": 8,
+          "max": 8
+        },
+        "kv_read_p99_us": {
+          "median": 13,
+          "min": 13,
+          "max": 13
+        },
+        "kv_read_max_us": {
+          "median": 86,
+          "min": 86,
+          "max": 86
+        },
+        "cycle_p50_us": {
+          "median": 64100,
+          "min": 64100,
+          "max": 64100
+        },
+        "cycle_p95_us": {
+          "median": 83900,
+          "min": 83900,
+          "max": 83900
+        },
+        "cycle_p99_us": {
+          "median": 98600,
+          "min": 98600,
+          "max": 98600
+        },
+        "cycle_max_us": {
+          "median": 984772,
+          "min": 984772,
+          "max": 984772
+        }
+      }
+    },
+    "paced": {
+      "legacy_serialized": {
+        "ops_per_second": {
+          "median": 608.9775452468807,
+          "min": 608.9775452468807,
+          "max": 608.9775452468807
+        },
+        "hash_write_p50_us": {
+          "median": 35300,
+          "min": 35300,
+          "max": 35300
+        },
+        "hash_write_p95_us": {
+          "median": 60400,
+          "min": 60400,
+          "max": 60400
+        },
+        "hash_write_p99_us": {
+          "median": 87600,
+          "min": 87600,
+          "max": 87600
+        },
+        "hash_write_max_us": {
+          "median": 861942,
+          "min": 861942,
+          "max": 861942
+        },
+        "hash_read_p50_us": {
+          "median": 25,
+          "min": 25,
+          "max": 25
+        },
+        "hash_read_p95_us": {
+          "median": 15800,
+          "min": 15800,
+          "max": 15800
+        },
+        "hash_read_p99_us": {
+          "median": 27300,
+          "min": 27300,
+          "max": 27300
+        },
+        "hash_read_max_us": {
+          "median": 511894,
+          "min": 511894,
+          "max": 511894
+        },
+        "kv_read_p50_us": {
+          "median": 3,
+          "min": 3,
+          "max": 3
+        },
+        "kv_read_p95_us": {
+          "median": 8,
+          "min": 8,
+          "max": 8
+        },
+        "kv_read_p99_us": {
+          "median": 13,
+          "min": 13,
+          "max": 13
+        },
+        "kv_read_max_us": {
+          "median": 35,
+          "min": 35,
+          "max": 35
+        },
+        "cycle_p50_us": {
+          "median": 42100,
+          "min": 42100,
+          "max": 42100
+        },
+        "cycle_p95_us": {
+          "median": 66900,
+          "min": 66900,
+          "max": 66900
+        },
+        "cycle_p99_us": {
+          "median": 97100,
+          "min": 97100,
+          "max": 97100
+        },
+        "cycle_max_us": {
+          "median": 880001,
+          "min": 880001,
+          "max": 880001
+        }
+      },
+      "legacy_cached": {
+        "ops_per_second": {
+          "median": 580.8510005459153,
+          "min": 580.8510005459153,
+          "max": 580.8510005459153
+        },
+        "hash_write_p50_us": {
+          "median": 34900,
+          "min": 34900,
+          "max": 34900
+        },
+        "hash_write_p95_us": {
+          "median": 147000,
+          "min": 147000,
+          "max": 147000
+        },
+        "hash_write_p99_us": {
+          "median": 217000,
+          "min": 217000,
+          "max": 217000
+        },
+        "hash_write_max_us": {
+          "median": 1007642,
+          "min": 1007642,
+          "max": 1007642
+        },
+        "hash_read_p50_us": {
+          "median": 6,
+          "min": 6,
+          "max": 6
+        },
+        "hash_read_p95_us": {
+          "median": 14,
+          "min": 14,
+          "max": 14
+        },
+        "hash_read_p99_us": {
+          "median": 20,
+          "min": 20,
+          "max": 20
+        },
+        "hash_read_max_us": {
+          "median": 65,
+          "min": 65,
+          "max": 65
+        },
+        "kv_read_p50_us": {
+          "median": 4,
+          "min": 4,
+          "max": 4
+        },
+        "kv_read_p95_us": {
+          "median": 9,
+          "min": 9,
+          "max": 9
+        },
+        "kv_read_p99_us": {
+          "median": 13,
+          "min": 13,
+          "max": 13
+        },
+        "kv_read_max_us": {
+          "median": 33,
+          "min": 33,
+          "max": 33
+        },
+        "cycle_p50_us": {
+          "median": 34900,
+          "min": 34900,
+          "max": 34900
+        },
+        "cycle_p95_us": {
+          "median": 147000,
+          "min": 147000,
+          "max": 147000
+        },
+        "cycle_p99_us": {
+          "median": 217000,
+          "min": 217000,
+          "max": 217000
+        },
+        "cycle_max_us": {
+          "median": 1007661,
+          "min": 1007661,
+          "max": 1007661
+        }
+      },
+      "atomic_cached": {
+        "ops_per_second": {
+          "median": 611.5409643313484,
+          "min": 611.5409643313484,
+          "max": 611.5409643313484
+        },
+        "hash_write_p50_us": {
+          "median": 26300,
+          "min": 26300,
+          "max": 26300
+        },
+        "hash_write_p95_us": {
+          "median": 54000,
+          "min": 54000,
+          "max": 54000
+        },
+        "hash_write_p99_us": {
+          "median": 80200,
+          "min": 80200,
+          "max": 80200
+        },
+        "hash_write_max_us": {
+          "median": 967826,
+          "min": 967826,
+          "max": 967826
+        },
+        "hash_read_p50_us": {
+          "median": 6,
+          "min": 6,
+          "max": 6
+        },
+        "hash_read_p95_us": {
+          "median": 14,
+          "min": 14,
+          "max": 14
+        },
+        "hash_read_p99_us": {
+          "median": 19,
+          "min": 19,
+          "max": 19
+        },
+        "hash_read_max_us": {
+          "median": 72,
+          "min": 72,
+          "max": 72
+        },
+        "kv_read_p50_us": {
+          "median": 3,
+          "min": 3,
+          "max": 3
+        },
+        "kv_read_p95_us": {
+          "median": 8,
+          "min": 8,
+          "max": 8
+        },
+        "kv_read_p99_us": {
+          "median": 13,
+          "min": 13,
+          "max": 13
+        },
+        "kv_read_max_us": {
+          "median": 267,
+          "min": 267,
+          "max": 267
+        },
+        "cycle_p50_us": {
+          "median": 26300,
+          "min": 26300,
+          "max": 26300
+        },
+        "cycle_p95_us": {
+          "median": 54000,
+          "min": 54000,
+          "max": 54000
+        },
+        "cycle_p99_us": {
+          "median": 80200,
+          "min": 80200,
+          "max": 80200
+        },
+        "cycle_max_us": {
+          "median": 967848,
+          "min": 967848,
+          "max": 967848
+        }
+      }
+    }
+  },
+  "publication_identity": {
+    "otp": "29",
+    "elixir": "1.20.4",
+    "sha256": {
+      "apps/ferricstore/lib/ferricstore/api/store.ex": "7f1aa1ac916ad15fe9eee5fd77ff6cbe02cde15c5f0388c362b911e07f5d6409",
+      "apps/ferricstore/lib/ferricstore/commands/hash.ex": "6b0555387474438e5e71721e47e20bace30df9ceb933f4bcdfda3264e76492b0",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/apply_dispatch.ex": "4430c0c7b4b9cd8e0b94b9123fa5cb3618347dfed619722593e192d0360a65eb",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/async_apply.ex": "ef632c3b1456b3242658abee3e6e1bc2266185af9e350a59879a766287e39d23",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/compound_apply.ex": "c1618c09b9bfb2992ee931ff124f270432d60dd35e4bb34dc6ab580f1170fb4a",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/cross_shard_pending.ex": "186833ef6db9a8bd401b313f9cb69aa4463b194f9f36bd74d8fea80b78179c25",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/pending_writes.ex": "8409fe625dbfbc8be11ec2a4c9d59ba4c89e4e20a7ef0203d8902385dce96898",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/read_warm.ex": "42317fe19049327ffeeb15688d44829529e47936a993fbd33031bde9abab3ef5",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_storage/sections/lifecycle.ex": "19df67af92f6e4047114e56482cfba5da3085633faa349f29406d74e24ac45ff",
+      "apps/ferricstore/lib/ferricstore/store/ops.ex": "8e86143ac06a319aa49d9159579e07b80e52174fcd0dd264b4123659a4880cbb",
+      "apps/ferricstore/lib/ferricstore/store/promoted_publication.ex": "2b9e2288bd30594e35362a57be202b5f95a1d711364927bab3d2004cb65fffad",
+      "apps/ferricstore/lib/ferricstore/store/publication_epoch.ex": "370bd4826e3373bd655cbc20761b75196b05c6c53685775f15e0fc505c0108f5",
+      "apps/ferricstore/lib/ferricstore/store/shard/compound/ops.ex": "d23784f27ed86cb61396c186aa88400939e7388c2c144ef17e735f20c30e19ef",
+      "apps/ferricstore/lib/ferricstore/store/shard/startup.ex": "86078bdf66da2545e2291ac1e9133235631dae7bfa7984fc6e639053e4a7d579"
+    },
+    "beam_md5": {
+      "Ferricstore.Raft.StateMachine": "78145c60741e0be486a1e1e74c554c58",
+      "Ferricstore.Raft.WARaftStorage": "41f57f34d29d4f137cc413f90df13ab1",
+      "Ferricstore.Store.PromotedPublication": "e364f8e74415c9bd528709cc46e32c42",
+      "Ferricstore.Store.PublicationEpoch": "41ff76f4390d8bac7bfca10bb3369e9a"
+    },
+    "erl_flags": "+S 8:8"
+  },
+  "checksums": {
+    "legacy_serialized": {
+      "router": "5451cbe86adfe0454604e82ea9a462cc",
+      "hash": "5b7f5b9448318bc66b0619aa2e119127"
+    },
+    "legacy_cached": {
+      "router": "ab8b8a97e0d0628cda79b71a9e06e87a",
+      "hash": "5b7f5b9448318bc66b0619aa2e119127"
+    },
+    "atomic_cached": {
+      "router": "ab8b8a97e0d0628cda79b71a9e06e87a",
+      "hash": "9649222363654795a135b3074c730cff"
+    }
+  }
+}

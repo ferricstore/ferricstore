@@ -1,0 +1,1632 @@
+{
+  "trials": [
+    {
+      "rate": 100,
+      "mode": "direct",
+      "trial": 1,
+      "offered": 12000,
+      "completed": 12000,
+      "completed_in_window": 11999,
+      "dropped": 0,
+      "maximum_queued": 0,
+      "drain_seconds": 0.003327,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 12000,
+          "max": 7349,
+          "p50": 1400,
+          "p95": 1500,
+          "p99": 1500,
+          "p999": 1700
+        },
+        "write_service_us": {
+          "count": 12000,
+          "max": 64092,
+          "p50": 13100,
+          "p95": 13800,
+          "p99": 14400,
+          "p999": 26000
+        },
+        "write_total_us": {
+          "count": 12000,
+          "max": 65485,
+          "p50": 14400,
+          "p95": 15000,
+          "p99": 15700,
+          "p999": 27400
+        },
+        "cycle_service_us": {
+          "count": 12000,
+          "max": 64140,
+          "p50": 13100,
+          "p95": 13800,
+          "p99": 14400,
+          "p999": 26000
+        },
+        "cycle_total_us": {
+          "count": 12000,
+          "max": 65533,
+          "p50": 14400,
+          "p95": 15000,
+          "p99": 15800,
+          "p999": 27400
+        },
+        "kv_read_us": {
+          "count": 12000,
+          "max": 47,
+          "p50": 5,
+          "p95": 10,
+          "p99": 13,
+          "p999": 18
+        },
+        "hash_read_us": {
+          "count": 24000,
+          "max": 791,
+          "p50": 9,
+          "p95": 18,
+          "p99": 22,
+          "p999": 28
+        }
+      }
+    },
+    {
+      "rate": 100,
+      "mode": "coalesced",
+      "trial": 1,
+      "offered": 12000,
+      "completed": 12000,
+      "completed_in_window": 11998,
+      "dropped": 0,
+      "maximum_queued": 10,
+      "drain_seconds": 0.021058,
+      "compactions": 0,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 12000,
+          "max": 123799,
+          "p50": 1300,
+          "p95": 1900,
+          "p99": 9400,
+          "p999": 85900
+        },
+        "write_service_us": {
+          "count": 12000,
+          "max": 227206,
+          "p50": 24500,
+          "p95": 77400,
+          "p99": 143000,
+          "p999": 206000
+        },
+        "write_total_us": {
+          "count": 12000,
+          "max": 283719,
+          "p50": 25700,
+          "p95": 80400,
+          "p99": 156000,
+          "p999": 246000
+        },
+        "cycle_service_us": {
+          "count": 12000,
+          "max": 227234,
+          "p50": 24500,
+          "p95": 77400,
+          "p99": 143000,
+          "p999": 206000
+        },
+        "cycle_total_us": {
+          "count": 12000,
+          "max": 283777,
+          "p50": 25700,
+          "p95": 80400,
+          "p99": 156000,
+          "p999": 246000
+        },
+        "kv_read_us": {
+          "count": 12000,
+          "max": 649,
+          "p50": 6,
+          "p95": 11,
+          "p99": 17,
+          "p999": 109
+        },
+        "hash_read_us": {
+          "count": 24000,
+          "max": 3086,
+          "p50": 9,
+          "p95": 20,
+          "p99": 31,
+          "p999": 104
+        }
+      }
+    },
+    {
+      "rate": 200,
+      "mode": "direct",
+      "trial": 1,
+      "offered": 24000,
+      "completed": 23812,
+      "completed_in_window": 23785,
+      "dropped": 188,
+      "maximum_queued": 128,
+      "drain_seconds": 0.126188,
+      "compactions": 4,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 23812,
+          "max": 949165,
+          "p50": 343000,
+          "p95": 601000,
+          "p99": 775000,
+          "p999": 914000
+        },
+        "write_service_us": {
+          "count": 23812,
+          "max": 708173,
+          "p50": 75700,
+          "p95": 103000,
+          "p99": 129000,
+          "p999": 598000
+        },
+        "write_total_us": {
+          "count": 23812,
+          "max": 1029005,
+          "p50": 423000,
+          "p95": 683000,
+          "p99": 862000,
+          "p999": 998000
+        },
+        "cycle_service_us": {
+          "count": 23812,
+          "max": 708286,
+          "p50": 75700,
+          "p95": 103000,
+          "p99": 130000,
+          "p999": 598000
+        },
+        "cycle_total_us": {
+          "count": 23812,
+          "max": 1029118,
+          "p50": 423000,
+          "p95": 683000,
+          "p99": 862000,
+          "p999": 998000
+        },
+        "kv_read_us": {
+          "count": 23812,
+          "max": 542,
+          "p50": 5,
+          "p95": 12,
+          "p99": 20,
+          "p999": 85
+        },
+        "hash_read_us": {
+          "count": 47624,
+          "max": 3222,
+          "p50": 8,
+          "p95": 20,
+          "p99": 38,
+          "p999": 121
+        }
+      }
+    },
+    {
+      "rate": 200,
+      "mode": "coalesced",
+      "trial": 1,
+      "offered": 24000,
+      "completed": 24000,
+      "completed_in_window": 23990,
+      "dropped": 0,
+      "maximum_queued": 65,
+      "drain_seconds": 0.050791,
+      "compactions": 4,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 24000,
+          "max": 379963,
+          "p50": 1400,
+          "p95": 54600,
+          "p99": 248000,
+          "p999": 331000
+        },
+        "write_service_us": {
+          "count": 24000,
+          "max": 433765,
+          "p50": 43400,
+          "p95": 71600,
+          "p99": 113000,
+          "p999": 201000
+        },
+        "write_total_us": {
+          "count": 24000,
+          "max": 459900,
+          "p50": 44600,
+          "p95": 135000,
+          "p99": 327000,
+          "p999": 411000
+        },
+        "cycle_service_us": {
+          "count": 24000,
+          "max": 433781,
+          "p50": 43500,
+          "p95": 71600,
+          "p99": 113000,
+          "p999": 201000
+        },
+        "cycle_total_us": {
+          "count": 24000,
+          "max": 459922,
+          "p50": 44600,
+          "p95": 135000,
+          "p99": 327000,
+          "p999": 411000
+        },
+        "kv_read_us": {
+          "count": 24000,
+          "max": 957,
+          "p50": 5,
+          "p95": 12,
+          "p99": 21,
+          "p999": 126
+        },
+        "hash_read_us": {
+          "count": 48000,
+          "max": 1176,
+          "p50": 8,
+          "p95": 20,
+          "p99": 40,
+          "p999": 196
+        }
+      }
+    },
+    {
+      "rate": 300,
+      "mode": "direct",
+      "trial": 1,
+      "offered": 36000,
+      "completed": 28119,
+      "completed_in_window": 27983,
+      "dropped": 7881,
+      "maximum_queued": 128,
+      "drain_seconds": 0.559966,
+      "compactions": 4,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 28119,
+          "max": 1177934,
+          "p50": 516000,
+          "p95": 595000,
+          "p99": 656000,
+          "p999": 1072000
+        },
+        "write_service_us": {
+          "count": 28119,
+          "max": 672334,
+          "p50": 67300,
+          "p95": 86300,
+          "p99": 96900,
+          "p999": 148000
+        },
+        "write_total_us": {
+          "count": 28119,
+          "max": 1235080,
+          "p50": 584000,
+          "p95": 670000,
+          "p99": 735000,
+          "p999": 1138000
+        },
+        "cycle_service_us": {
+          "count": 28119,
+          "max": 672361,
+          "p50": 67300,
+          "p95": 86300,
+          "p99": 96900,
+          "p999": 148000
+        },
+        "cycle_total_us": {
+          "count": 28119,
+          "max": 1235105,
+          "p50": 584000,
+          "p95": 670000,
+          "p99": 735000,
+          "p999": 1138000
+        },
+        "kv_read_us": {
+          "count": 28119,
+          "max": 1454,
+          "p50": 5,
+          "p95": 12,
+          "p99": 21,
+          "p999": 89
+        },
+        "hash_read_us": {
+          "count": 56238,
+          "max": 1317,
+          "p50": 8,
+          "p95": 20,
+          "p99": 36,
+          "p999": 170
+        }
+      }
+    },
+    {
+      "rate": 300,
+      "mode": "coalesced",
+      "trial": 1,
+      "offered": 36000,
+      "completed": 35313,
+      "completed_in_window": 35304,
+      "dropped": 687,
+      "maximum_queued": 128,
+      "drain_seconds": 0.024648,
+      "compactions": 8,
+      "quiet_compactions": 0,
+      "maintenance": [
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 0,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 1,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 2,
+          "retries": 0
+        },
+        {
+          "active": false,
+          "pending": 0,
+          "shard": 3,
+          "retries": 0
+        }
+      ],
+      "histograms": {
+        "client_queue_us": {
+          "count": 35313,
+          "max": 885415,
+          "p50": 1200,
+          "p95": 435000,
+          "p99": 641000,
+          "p999": 844000
+        },
+        "write_service_us": {
+          "count": 35313,
+          "max": 922975,
+          "p50": 32600,
+          "p95": 58900,
+          "p99": 87100,
+          "p999": 530000
+        },
+        "write_total_us": {
+          "count": 35313,
+          "max": 938693,
+          "p50": 33600,
+          "p95": 495000,
+          "p99": 714000,
+          "p999": 897000
+        },
+        "cycle_service_us": {
+          "count": 35313,
+          "max": 923000,
+          "p50": 32600,
+          "p95": 58900,
+          "p99": 87100,
+          "p999": 530000
+        },
+        "cycle_total_us": {
+          "count": 35313,
+          "max": 938721,
+          "p50": 33700,
+          "p95": 495000,
+          "p99": 714000,
+          "p999": 897000
+        },
+        "kv_read_us": {
+          "count": 35313,
+          "max": 105,
+          "p50": 4,
+          "p95": 7,
+          "p99": 10,
+          "p999": 20
+        },
+        "hash_read_us": {
+          "count": 70626,
+          "max": 126,
+          "p50": 6,
+          "p95": 14,
+          "p99": 18,
+          "p999": 35
+        }
+      }
+    }
+  ],
+  "rates": {
+    "100": {
+      "direct": {
+        "completed_in_window": {
+          "median": 11999,
+          "min": 11999,
+          "max": 11999
+        },
+        "dropped": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "drain_seconds": {
+          "median": 0.003327,
+          "min": 0.003327,
+          "max": 0.003327
+        },
+        "write_service_us.p50": {
+          "median": 13100,
+          "min": 13100,
+          "max": 13100
+        },
+        "write_service_us.p95": {
+          "median": 13800,
+          "min": 13800,
+          "max": 13800
+        },
+        "write_service_us.p99": {
+          "median": 14400,
+          "min": 14400,
+          "max": 14400
+        },
+        "write_service_us.p999": {
+          "median": 26000,
+          "min": 26000,
+          "max": 26000
+        },
+        "write_service_us.max": {
+          "median": 64092,
+          "min": 64092,
+          "max": 64092
+        },
+        "write_total_us.p50": {
+          "median": 14400,
+          "min": 14400,
+          "max": 14400
+        },
+        "write_total_us.p95": {
+          "median": 15000,
+          "min": 15000,
+          "max": 15000
+        },
+        "write_total_us.p99": {
+          "median": 15700,
+          "min": 15700,
+          "max": 15700
+        },
+        "write_total_us.p999": {
+          "median": 27400,
+          "min": 27400,
+          "max": 27400
+        },
+        "write_total_us.max": {
+          "median": 65485,
+          "min": 65485,
+          "max": 65485
+        },
+        "cycle_total_us.p50": {
+          "median": 14400,
+          "min": 14400,
+          "max": 14400
+        },
+        "cycle_total_us.p95": {
+          "median": 15000,
+          "min": 15000,
+          "max": 15000
+        },
+        "cycle_total_us.p99": {
+          "median": 15800,
+          "min": 15800,
+          "max": 15800
+        },
+        "cycle_total_us.p999": {
+          "median": 27400,
+          "min": 27400,
+          "max": 27400
+        },
+        "cycle_total_us.max": {
+          "median": 65533,
+          "min": 65533,
+          "max": 65533
+        },
+        "client_queue_us.p50": {
+          "median": 1400,
+          "min": 1400,
+          "max": 1400
+        },
+        "client_queue_us.p95": {
+          "median": 1500,
+          "min": 1500,
+          "max": 1500
+        },
+        "client_queue_us.p99": {
+          "median": 1500,
+          "min": 1500,
+          "max": 1500
+        },
+        "client_queue_us.p999": {
+          "median": 1700,
+          "min": 1700,
+          "max": 1700
+        },
+        "client_queue_us.max": {
+          "median": 7349,
+          "min": 7349,
+          "max": 7349
+        },
+        "kv_read_us.p50": {
+          "median": 5,
+          "min": 5,
+          "max": 5
+        },
+        "kv_read_us.p95": {
+          "median": 10,
+          "min": 10,
+          "max": 10
+        },
+        "kv_read_us.p99": {
+          "median": 13,
+          "min": 13,
+          "max": 13
+        },
+        "kv_read_us.p999": {
+          "median": 18,
+          "min": 18,
+          "max": 18
+        },
+        "kv_read_us.max": {
+          "median": 47,
+          "min": 47,
+          "max": 47
+        },
+        "hash_read_us.p50": {
+          "median": 9,
+          "min": 9,
+          "max": 9
+        },
+        "hash_read_us.p95": {
+          "median": 18,
+          "min": 18,
+          "max": 18
+        },
+        "hash_read_us.p99": {
+          "median": 22,
+          "min": 22,
+          "max": 22
+        },
+        "hash_read_us.p999": {
+          "median": 28,
+          "min": 28,
+          "max": 28
+        },
+        "hash_read_us.max": {
+          "median": 791,
+          "min": 791,
+          "max": 791
+        }
+      },
+      "coalesced": {
+        "completed_in_window": {
+          "median": 11998,
+          "min": 11998,
+          "max": 11998
+        },
+        "dropped": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "drain_seconds": {
+          "median": 0.021058,
+          "min": 0.021058,
+          "max": 0.021058
+        },
+        "write_service_us.p50": {
+          "median": 24500,
+          "min": 24500,
+          "max": 24500
+        },
+        "write_service_us.p95": {
+          "median": 77400,
+          "min": 77400,
+          "max": 77400
+        },
+        "write_service_us.p99": {
+          "median": 143000,
+          "min": 143000,
+          "max": 143000
+        },
+        "write_service_us.p999": {
+          "median": 206000,
+          "min": 206000,
+          "max": 206000
+        },
+        "write_service_us.max": {
+          "median": 227206,
+          "min": 227206,
+          "max": 227206
+        },
+        "write_total_us.p50": {
+          "median": 25700,
+          "min": 25700,
+          "max": 25700
+        },
+        "write_total_us.p95": {
+          "median": 80400,
+          "min": 80400,
+          "max": 80400
+        },
+        "write_total_us.p99": {
+          "median": 156000,
+          "min": 156000,
+          "max": 156000
+        },
+        "write_total_us.p999": {
+          "median": 246000,
+          "min": 246000,
+          "max": 246000
+        },
+        "write_total_us.max": {
+          "median": 283719,
+          "min": 283719,
+          "max": 283719
+        },
+        "cycle_total_us.p50": {
+          "median": 25700,
+          "min": 25700,
+          "max": 25700
+        },
+        "cycle_total_us.p95": {
+          "median": 80400,
+          "min": 80400,
+          "max": 80400
+        },
+        "cycle_total_us.p99": {
+          "median": 156000,
+          "min": 156000,
+          "max": 156000
+        },
+        "cycle_total_us.p999": {
+          "median": 246000,
+          "min": 246000,
+          "max": 246000
+        },
+        "cycle_total_us.max": {
+          "median": 283777,
+          "min": 283777,
+          "max": 283777
+        },
+        "client_queue_us.p50": {
+          "median": 1300,
+          "min": 1300,
+          "max": 1300
+        },
+        "client_queue_us.p95": {
+          "median": 1900,
+          "min": 1900,
+          "max": 1900
+        },
+        "client_queue_us.p99": {
+          "median": 9400,
+          "min": 9400,
+          "max": 9400
+        },
+        "client_queue_us.p999": {
+          "median": 85900,
+          "min": 85900,
+          "max": 85900
+        },
+        "client_queue_us.max": {
+          "median": 123799,
+          "min": 123799,
+          "max": 123799
+        },
+        "kv_read_us.p50": {
+          "median": 6,
+          "min": 6,
+          "max": 6
+        },
+        "kv_read_us.p95": {
+          "median": 11,
+          "min": 11,
+          "max": 11
+        },
+        "kv_read_us.p99": {
+          "median": 17,
+          "min": 17,
+          "max": 17
+        },
+        "kv_read_us.p999": {
+          "median": 109,
+          "min": 109,
+          "max": 109
+        },
+        "kv_read_us.max": {
+          "median": 649,
+          "min": 649,
+          "max": 649
+        },
+        "hash_read_us.p50": {
+          "median": 9,
+          "min": 9,
+          "max": 9
+        },
+        "hash_read_us.p95": {
+          "median": 20,
+          "min": 20,
+          "max": 20
+        },
+        "hash_read_us.p99": {
+          "median": 31,
+          "min": 31,
+          "max": 31
+        },
+        "hash_read_us.p999": {
+          "median": 104,
+          "min": 104,
+          "max": 104
+        },
+        "hash_read_us.max": {
+          "median": 3086,
+          "min": 3086,
+          "max": 3086
+        }
+      }
+    },
+    "200": {
+      "direct": {
+        "completed_in_window": {
+          "median": 23785,
+          "min": 23785,
+          "max": 23785
+        },
+        "dropped": {
+          "median": 188,
+          "min": 188,
+          "max": 188
+        },
+        "drain_seconds": {
+          "median": 0.126188,
+          "min": 0.126188,
+          "max": 0.126188
+        },
+        "write_service_us.p50": {
+          "median": 75700,
+          "min": 75700,
+          "max": 75700
+        },
+        "write_service_us.p95": {
+          "median": 103000,
+          "min": 103000,
+          "max": 103000
+        },
+        "write_service_us.p99": {
+          "median": 129000,
+          "min": 129000,
+          "max": 129000
+        },
+        "write_service_us.p999": {
+          "median": 598000,
+          "min": 598000,
+          "max": 598000
+        },
+        "write_service_us.max": {
+          "median": 708173,
+          "min": 708173,
+          "max": 708173
+        },
+        "write_total_us.p50": {
+          "median": 423000,
+          "min": 423000,
+          "max": 423000
+        },
+        "write_total_us.p95": {
+          "median": 683000,
+          "min": 683000,
+          "max": 683000
+        },
+        "write_total_us.p99": {
+          "median": 862000,
+          "min": 862000,
+          "max": 862000
+        },
+        "write_total_us.p999": {
+          "median": 998000,
+          "min": 998000,
+          "max": 998000
+        },
+        "write_total_us.max": {
+          "median": 1029005,
+          "min": 1029005,
+          "max": 1029005
+        },
+        "cycle_total_us.p50": {
+          "median": 423000,
+          "min": 423000,
+          "max": 423000
+        },
+        "cycle_total_us.p95": {
+          "median": 683000,
+          "min": 683000,
+          "max": 683000
+        },
+        "cycle_total_us.p99": {
+          "median": 862000,
+          "min": 862000,
+          "max": 862000
+        },
+        "cycle_total_us.p999": {
+          "median": 998000,
+          "min": 998000,
+          "max": 998000
+        },
+        "cycle_total_us.max": {
+          "median": 1029118,
+          "min": 1029118,
+          "max": 1029118
+        },
+        "client_queue_us.p50": {
+          "median": 343000,
+          "min": 343000,
+          "max": 343000
+        },
+        "client_queue_us.p95": {
+          "median": 601000,
+          "min": 601000,
+          "max": 601000
+        },
+        "client_queue_us.p99": {
+          "median": 775000,
+          "min": 775000,
+          "max": 775000
+        },
+        "client_queue_us.p999": {
+          "median": 914000,
+          "min": 914000,
+          "max": 914000
+        },
+        "client_queue_us.max": {
+          "median": 949165,
+          "min": 949165,
+          "max": 949165
+        },
+        "kv_read_us.p50": {
+          "median": 5,
+          "min": 5,
+          "max": 5
+        },
+        "kv_read_us.p95": {
+          "median": 12,
+          "min": 12,
+          "max": 12
+        },
+        "kv_read_us.p99": {
+          "median": 20,
+          "min": 20,
+          "max": 20
+        },
+        "kv_read_us.p999": {
+          "median": 85,
+          "min": 85,
+          "max": 85
+        },
+        "kv_read_us.max": {
+          "median": 542,
+          "min": 542,
+          "max": 542
+        },
+        "hash_read_us.p50": {
+          "median": 8,
+          "min": 8,
+          "max": 8
+        },
+        "hash_read_us.p95": {
+          "median": 20,
+          "min": 20,
+          "max": 20
+        },
+        "hash_read_us.p99": {
+          "median": 38,
+          "min": 38,
+          "max": 38
+        },
+        "hash_read_us.p999": {
+          "median": 121,
+          "min": 121,
+          "max": 121
+        },
+        "hash_read_us.max": {
+          "median": 3222,
+          "min": 3222,
+          "max": 3222
+        }
+      },
+      "coalesced": {
+        "completed_in_window": {
+          "median": 23990,
+          "min": 23990,
+          "max": 23990
+        },
+        "dropped": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "drain_seconds": {
+          "median": 0.050791,
+          "min": 0.050791,
+          "max": 0.050791
+        },
+        "write_service_us.p50": {
+          "median": 43400,
+          "min": 43400,
+          "max": 43400
+        },
+        "write_service_us.p95": {
+          "median": 71600,
+          "min": 71600,
+          "max": 71600
+        },
+        "write_service_us.p99": {
+          "median": 113000,
+          "min": 113000,
+          "max": 113000
+        },
+        "write_service_us.p999": {
+          "median": 201000,
+          "min": 201000,
+          "max": 201000
+        },
+        "write_service_us.max": {
+          "median": 433765,
+          "min": 433765,
+          "max": 433765
+        },
+        "write_total_us.p50": {
+          "median": 44600,
+          "min": 44600,
+          "max": 44600
+        },
+        "write_total_us.p95": {
+          "median": 135000,
+          "min": 135000,
+          "max": 135000
+        },
+        "write_total_us.p99": {
+          "median": 327000,
+          "min": 327000,
+          "max": 327000
+        },
+        "write_total_us.p999": {
+          "median": 411000,
+          "min": 411000,
+          "max": 411000
+        },
+        "write_total_us.max": {
+          "median": 459900,
+          "min": 459900,
+          "max": 459900
+        },
+        "cycle_total_us.p50": {
+          "median": 44600,
+          "min": 44600,
+          "max": 44600
+        },
+        "cycle_total_us.p95": {
+          "median": 135000,
+          "min": 135000,
+          "max": 135000
+        },
+        "cycle_total_us.p99": {
+          "median": 327000,
+          "min": 327000,
+          "max": 327000
+        },
+        "cycle_total_us.p999": {
+          "median": 411000,
+          "min": 411000,
+          "max": 411000
+        },
+        "cycle_total_us.max": {
+          "median": 459922,
+          "min": 459922,
+          "max": 459922
+        },
+        "client_queue_us.p50": {
+          "median": 1400,
+          "min": 1400,
+          "max": 1400
+        },
+        "client_queue_us.p95": {
+          "median": 54600,
+          "min": 54600,
+          "max": 54600
+        },
+        "client_queue_us.p99": {
+          "median": 248000,
+          "min": 248000,
+          "max": 248000
+        },
+        "client_queue_us.p999": {
+          "median": 331000,
+          "min": 331000,
+          "max": 331000
+        },
+        "client_queue_us.max": {
+          "median": 379963,
+          "min": 379963,
+          "max": 379963
+        },
+        "kv_read_us.p50": {
+          "median": 5,
+          "min": 5,
+          "max": 5
+        },
+        "kv_read_us.p95": {
+          "median": 12,
+          "min": 12,
+          "max": 12
+        },
+        "kv_read_us.p99": {
+          "median": 21,
+          "min": 21,
+          "max": 21
+        },
+        "kv_read_us.p999": {
+          "median": 126,
+          "min": 126,
+          "max": 126
+        },
+        "kv_read_us.max": {
+          "median": 957,
+          "min": 957,
+          "max": 957
+        },
+        "hash_read_us.p50": {
+          "median": 8,
+          "min": 8,
+          "max": 8
+        },
+        "hash_read_us.p95": {
+          "median": 20,
+          "min": 20,
+          "max": 20
+        },
+        "hash_read_us.p99": {
+          "median": 40,
+          "min": 40,
+          "max": 40
+        },
+        "hash_read_us.p999": {
+          "median": 196,
+          "min": 196,
+          "max": 196
+        },
+        "hash_read_us.max": {
+          "median": 1176,
+          "min": 1176,
+          "max": 1176
+        }
+      }
+    },
+    "300": {
+      "direct": {
+        "completed_in_window": {
+          "median": 27983,
+          "min": 27983,
+          "max": 27983
+        },
+        "dropped": {
+          "median": 7881,
+          "min": 7881,
+          "max": 7881
+        },
+        "drain_seconds": {
+          "median": 0.559966,
+          "min": 0.559966,
+          "max": 0.559966
+        },
+        "write_service_us.p50": {
+          "median": 67300,
+          "min": 67300,
+          "max": 67300
+        },
+        "write_service_us.p95": {
+          "median": 86300,
+          "min": 86300,
+          "max": 86300
+        },
+        "write_service_us.p99": {
+          "median": 96900,
+          "min": 96900,
+          "max": 96900
+        },
+        "write_service_us.p999": {
+          "median": 148000,
+          "min": 148000,
+          "max": 148000
+        },
+        "write_service_us.max": {
+          "median": 672334,
+          "min": 672334,
+          "max": 672334
+        },
+        "write_total_us.p50": {
+          "median": 584000,
+          "min": 584000,
+          "max": 584000
+        },
+        "write_total_us.p95": {
+          "median": 670000,
+          "min": 670000,
+          "max": 670000
+        },
+        "write_total_us.p99": {
+          "median": 735000,
+          "min": 735000,
+          "max": 735000
+        },
+        "write_total_us.p999": {
+          "median": 1138000,
+          "min": 1138000,
+          "max": 1138000
+        },
+        "write_total_us.max": {
+          "median": 1235080,
+          "min": 1235080,
+          "max": 1235080
+        },
+        "cycle_total_us.p50": {
+          "median": 584000,
+          "min": 584000,
+          "max": 584000
+        },
+        "cycle_total_us.p95": {
+          "median": 670000,
+          "min": 670000,
+          "max": 670000
+        },
+        "cycle_total_us.p99": {
+          "median": 735000,
+          "min": 735000,
+          "max": 735000
+        },
+        "cycle_total_us.p999": {
+          "median": 1138000,
+          "min": 1138000,
+          "max": 1138000
+        },
+        "cycle_total_us.max": {
+          "median": 1235105,
+          "min": 1235105,
+          "max": 1235105
+        },
+        "client_queue_us.p50": {
+          "median": 516000,
+          "min": 516000,
+          "max": 516000
+        },
+        "client_queue_us.p95": {
+          "median": 595000,
+          "min": 595000,
+          "max": 595000
+        },
+        "client_queue_us.p99": {
+          "median": 656000,
+          "min": 656000,
+          "max": 656000
+        },
+        "client_queue_us.p999": {
+          "median": 1072000,
+          "min": 1072000,
+          "max": 1072000
+        },
+        "client_queue_us.max": {
+          "median": 1177934,
+          "min": 1177934,
+          "max": 1177934
+        },
+        "kv_read_us.p50": {
+          "median": 5,
+          "min": 5,
+          "max": 5
+        },
+        "kv_read_us.p95": {
+          "median": 12,
+          "min": 12,
+          "max": 12
+        },
+        "kv_read_us.p99": {
+          "median": 21,
+          "min": 21,
+          "max": 21
+        },
+        "kv_read_us.p999": {
+          "median": 89,
+          "min": 89,
+          "max": 89
+        },
+        "kv_read_us.max": {
+          "median": 1454,
+          "min": 1454,
+          "max": 1454
+        },
+        "hash_read_us.p50": {
+          "median": 8,
+          "min": 8,
+          "max": 8
+        },
+        "hash_read_us.p95": {
+          "median": 20,
+          "min": 20,
+          "max": 20
+        },
+        "hash_read_us.p99": {
+          "median": 36,
+          "min": 36,
+          "max": 36
+        },
+        "hash_read_us.p999": {
+          "median": 170,
+          "min": 170,
+          "max": 170
+        },
+        "hash_read_us.max": {
+          "median": 1317,
+          "min": 1317,
+          "max": 1317
+        }
+      },
+      "coalesced": {
+        "completed_in_window": {
+          "median": 35304,
+          "min": 35304,
+          "max": 35304
+        },
+        "dropped": {
+          "median": 687,
+          "min": 687,
+          "max": 687
+        },
+        "drain_seconds": {
+          "median": 0.024648,
+          "min": 0.024648,
+          "max": 0.024648
+        },
+        "write_service_us.p50": {
+          "median": 32600,
+          "min": 32600,
+          "max": 32600
+        },
+        "write_service_us.p95": {
+          "median": 58900,
+          "min": 58900,
+          "max": 58900
+        },
+        "write_service_us.p99": {
+          "median": 87100,
+          "min": 87100,
+          "max": 87100
+        },
+        "write_service_us.p999": {
+          "median": 530000,
+          "min": 530000,
+          "max": 530000
+        },
+        "write_service_us.max": {
+          "median": 922975,
+          "min": 922975,
+          "max": 922975
+        },
+        "write_total_us.p50": {
+          "median": 33600,
+          "min": 33600,
+          "max": 33600
+        },
+        "write_total_us.p95": {
+          "median": 495000,
+          "min": 495000,
+          "max": 495000
+        },
+        "write_total_us.p99": {
+          "median": 714000,
+          "min": 714000,
+          "max": 714000
+        },
+        "write_total_us.p999": {
+          "median": 897000,
+          "min": 897000,
+          "max": 897000
+        },
+        "write_total_us.max": {
+          "median": 938693,
+          "min": 938693,
+          "max": 938693
+        },
+        "cycle_total_us.p50": {
+          "median": 33700,
+          "min": 33700,
+          "max": 33700
+        },
+        "cycle_total_us.p95": {
+          "median": 495000,
+          "min": 495000,
+          "max": 495000
+        },
+        "cycle_total_us.p99": {
+          "median": 714000,
+          "min": 714000,
+          "max": 714000
+        },
+        "cycle_total_us.p999": {
+          "median": 897000,
+          "min": 897000,
+          "max": 897000
+        },
+        "cycle_total_us.max": {
+          "median": 938721,
+          "min": 938721,
+          "max": 938721
+        },
+        "client_queue_us.p50": {
+          "median": 1200,
+          "min": 1200,
+          "max": 1200
+        },
+        "client_queue_us.p95": {
+          "median": 435000,
+          "min": 435000,
+          "max": 435000
+        },
+        "client_queue_us.p99": {
+          "median": 641000,
+          "min": 641000,
+          "max": 641000
+        },
+        "client_queue_us.p999": {
+          "median": 844000,
+          "min": 844000,
+          "max": 844000
+        },
+        "client_queue_us.max": {
+          "median": 885415,
+          "min": 885415,
+          "max": 885415
+        },
+        "kv_read_us.p50": {
+          "median": 4,
+          "min": 4,
+          "max": 4
+        },
+        "kv_read_us.p95": {
+          "median": 7,
+          "min": 7,
+          "max": 7
+        },
+        "kv_read_us.p99": {
+          "median": 10,
+          "min": 10,
+          "max": 10
+        },
+        "kv_read_us.p999": {
+          "median": 20,
+          "min": 20,
+          "max": 20
+        },
+        "kv_read_us.max": {
+          "median": 105,
+          "min": 105,
+          "max": 105
+        },
+        "hash_read_us.p50": {
+          "median": 6,
+          "min": 6,
+          "max": 6
+        },
+        "hash_read_us.p95": {
+          "median": 14,
+          "min": 14,
+          "max": 14
+        },
+        "hash_read_us.p99": {
+          "median": 18,
+          "min": 18,
+          "max": 18
+        },
+        "hash_read_us.p999": {
+          "median": 35,
+          "min": 35,
+          "max": 35
+        },
+        "hash_read_us.max": {
+          "median": 126,
+          "min": 126,
+          "max": 126
+        }
+      }
+    }
+  },
+  "seconds": 120,
+  "publication_identity": {
+    "otp": "29",
+    "elixir": "1.20.4",
+    "sha256": {
+      "apps/ferricstore/lib/ferricstore/api/store.ex": "7f1aa1ac916ad15fe9eee5fd77ff6cbe02cde15c5f0388c362b911e07f5d6409",
+      "apps/ferricstore/lib/ferricstore/commands/hash.ex": "6b0555387474438e5e71721e47e20bace30df9ceb933f4bcdfda3264e76492b0",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/apply_dispatch.ex": "38b2f13bfe11dfddb3ab5dc7fe14484af10f1eb0be9919d5e52daaaa0a5d8d05",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/async_apply.ex": "ef632c3b1456b3242658abee3e6e1bc2266185af9e350a59879a766287e39d23",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/compound_apply.ex": "c1618c09b9bfb2992ee931ff124f270432d60dd35e4bb34dc6ab580f1170fb4a",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/cross_shard_pending.ex": "186833ef6db9a8bd401b313f9cb69aa4463b194f9f36bd74d8fea80b78179c25",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/pending_writes.ex": "8409fe625dbfbc8be11ec2a4c9d59ba4c89e4e20a7ef0203d8902385dce96898",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/read_warm.ex": "42317fe19049327ffeeb15688d44829529e47936a993fbd33031bde9abab3ef5",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_backend/batcher.ex": "5835e88e7631da3e4bfaaadb64a0c41b4bf69aaec8b4e06758f4ea2dbf10afc4",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_backend/hset_cadence.ex": "c851b2429dbf18d32034901933e9627d62ac34f9846e5dd9e5ebc87eb4be24c0",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_backend/sections/leader_wait.ex": "781f545e066d7b65caa1296b9acdbaaf546072dfdefefdec997665767eed5e72",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_backend/sections/public_api.ex": "3ed4785b6b6a227d5deff0e5088115131966e213acf1c2c7fb5acd1100a48f86",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_backend/sections/startup.ex": "7381721c1ea44cad492365f522758a4de5da996852e4d5e1f5f32b9cb4abcb02",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_storage/sections/lifecycle.ex": "19df67af92f6e4047114e56482cfba5da3085633faa349f29406d74e24ac45ff",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_storage/sections/snapshot_install.ex": "b11cf0e382d4767225150ab4421a4b5d1ccdfdb5602e59d77433f48cd2add02a",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_storage/sections/snapshot_metadata.ex": "9d64b45ebfe56c1e71b07f0fc72e48d3a99232456abedac1ee55dcdfb167b5d9",
+      "apps/ferricstore/lib/ferricstore/store/ops.ex": "8e86143ac06a319aa49d9159579e07b80e52174fcd0dd264b4123659a4880cbb",
+      "apps/ferricstore/lib/ferricstore/store/promoted_publication.ex": "2b9e2288bd30594e35362a57be202b5f95a1d711364927bab3d2004cb65fffad",
+      "apps/ferricstore/lib/ferricstore/store/publication_epoch.ex": "370bd4826e3373bd655cbc20761b75196b05c6c53685775f15e0fc505c0108f5",
+      "apps/ferricstore/lib/ferricstore/store/shard/compound/ops.ex": "d23784f27ed86cb61396c186aa88400939e7388c2c144ef17e735f20c30e19ef",
+      "apps/ferricstore/lib/ferricstore/store/shard/compound/promoted.ex": "5884ec89314e3114833eb284475fa62ff351d70dac0442a57ec7513e85ec9791",
+      "apps/ferricstore/lib/ferricstore/store/shard/startup.ex": "86078bdf66da2545e2291ac1e9133235631dae7bfa7984fc6e639053e4a7d579"
+    },
+    "beam_md5": {
+      "Ferricstore.Raft.StateMachine": "06b3f0edb61ae3c7c4f7594312325213",
+      "Ferricstore.Raft.WARaftStorage": "7a23ae6ae07bfcc9ab3a1a4f8be5080c",
+      "Ferricstore.Store.PromotedPublication": "e364f8e74415c9bd528709cc46e32c42",
+      "Ferricstore.Store.PublicationEpoch": "41ff76f4390d8bac7bfca10bb3369e9a"
+    },
+    "erl_flags": "+S 8:8"
+  }
+}

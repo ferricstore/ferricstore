@@ -1,0 +1,199 @@
+{
+  "control": {
+    "1": {
+      "ops_per_second": {
+        "median": 3995.032698763922,
+        "min": 3958.489964420969,
+        "max": 4031.5754331068747
+      },
+      "write_p50_us": {
+        "median": 7713.5,
+        "min": 7713,
+        "max": 7714
+      },
+      "write_p95_us": {
+        "median": 8673.0,
+        "min": 8466,
+        "max": 8880
+      },
+      "write_p99_us": {
+        "median": 11335.0,
+        "min": 9620,
+        "max": 13050
+      },
+      "write_max_us": {
+        "median": 148706.0,
+        "min": 72145,
+        "max": 225267
+      }
+    },
+    "3": {
+      "ops_per_second": {
+        "median": 250.90621942970762,
+        "min": 231.99565348154735,
+        "max": 269.8167853778679
+      },
+      "write_p50_us": {
+        "median": 113382.0,
+        "min": 89734,
+        "max": 137030
+      },
+      "write_p95_us": {
+        "median": 298975.5,
+        "min": 293658,
+        "max": 304293
+      },
+      "write_p99_us": {
+        "median": 396196.0,
+        "min": 388715,
+        "max": 403677
+      },
+      "write_max_us": {
+        "median": 521136.0,
+        "min": 501697,
+        "max": 540575
+      }
+    }
+  },
+  "deadline": {
+    "1": {
+      "ops_per_second": {
+        "median": 3853.6348078746505,
+        "min": 3816.2519589806884,
+        "max": 3891.017656768612
+      },
+      "write_p50_us": {
+        "median": 7743.5,
+        "min": 7729,
+        "max": 7758
+      },
+      "write_p95_us": {
+        "median": 9406.5,
+        "min": 8891,
+        "max": 9922
+      },
+      "write_p99_us": {
+        "median": 18330.0,
+        "min": 13654,
+        "max": 23006
+      },
+      "write_max_us": {
+        "median": 224632.0,
+        "min": 210810,
+        "max": 238454
+      }
+    },
+    "3": {
+      "ops_per_second": {
+        "median": 347.27682087951547,
+        "min": 345.49293074682333,
+        "max": 349.0607110122076
+      },
+      "write_p50_us": {
+        "median": 74776.0,
+        "min": 73849,
+        "max": 75703
+      },
+      "write_p95_us": {
+        "median": 215613.5,
+        "min": 213704,
+        "max": 217523
+      },
+      "write_p99_us": {
+        "median": 289818.5,
+        "min": 283385,
+        "max": 296252
+      },
+      "write_max_us": {
+        "median": 435838.5,
+        "min": 414761,
+        "max": 456916
+      }
+    }
+  },
+  "deadline_and_propagation": {
+    "1": {
+      "ops_per_second": {
+        "median": 4080.328540159943,
+        "min": 4067.6707037851947,
+        "max": 4092.986376534691
+      },
+      "write_p50_us": {
+        "median": 7705.5,
+        "min": 7697,
+        "max": 7714
+      },
+      "write_p95_us": {
+        "median": 8457.0,
+        "min": 8396,
+        "max": 8518
+      },
+      "write_p99_us": {
+        "median": 9927.5,
+        "min": 9614,
+        "max": 10241
+      },
+      "write_max_us": {
+        "median": 63269.5,
+        "min": 49467,
+        "max": 77072
+      }
+    },
+    "3": {
+      "ops_per_second": {
+        "median": 346.4964418712298,
+        "min": 338.68613061881115,
+        "max": 354.3067531236485
+      },
+      "write_p50_us": {
+        "median": 65111.5,
+        "min": 62491,
+        "max": 67732
+      },
+      "write_p95_us": {
+        "median": 220769.0,
+        "min": 192625,
+        "max": 248913
+      },
+      "write_p99_us": {
+        "median": 583382.0,
+        "min": 463203,
+        "max": 703561
+      },
+      "write_max_us": {
+        "median": 1344978.0,
+        "min": 633301,
+        "max": 2056655
+      }
+    }
+  },
+  "propagation_leader_targeted": {
+    "3": {
+      "ops_per_second": {
+        "median": 354.07299760699203,
+        "min": 331.64432281056025,
+        "max": 376.5016724034238
+      },
+      "write_p50_us": {
+        "median": 84239.5,
+        "min": 78296,
+        "max": 90183
+      },
+      "write_p95_us": {
+        "median": 180589.0,
+        "min": 180473,
+        "max": 180705
+      },
+      "write_p99_us": {
+        "median": 232323.0,
+        "min": 226890,
+        "max": 237756
+      },
+      "write_max_us": {
+        "median": 334884.5,
+        "min": 332357,
+        "max": 337412
+      }
+    }
+  }
+}

@@ -17,6 +17,12 @@ Neither replay nor a read-only fold retains historical offsets in ETS. Logical
 trim removes fully trimmed sidecars; an incomplete sidecar build is disposable
 and can be reconstructed from the authoritative WAL. This avoids a 20-million-
 row ETS offset registry while keeping historical lookup near constant time.
+Successful rewrite-directory removal/replacement also retires its RAM offsets
+and path-keyed caches without removing replacement sidecars. The operational
+guard reclaims already-abandoned, missing temporary rewrite indexes on its first
+check and every 30 seconds; live writers, existing/unsafe paths and canonical
+directories are retained. See the [rewrite cleanup follow-up](rewrite-offset-index-cleanup-followup.md)
+for the full-cap reproduction, explicit reclamation API and verification scope.
 If a sidecar update fails after a WAL append has committed, the append keeps its
 durable outcome and that directory's sidecar is marked untrusted. Older reads
 then use verified segment scans until a complete rebuild; a stale sidecar must
@@ -163,6 +169,15 @@ commands spent approximately 53 seconds summed across workers checking
 time. Because earlier cross-command proof caching and a combined native probe
 did not produce a reliable improvement, recovery still checks each proof
 against its own LMDB transaction and retains the original scan fallback.
+
+A subsequent recovery-only attempt to bypass the shared Erlang file server for
+the proof's no-follow metadata reads was also **reverted**. Although a four-worker
+component benchmark improved by about 25%, the initial full-startup median moved
+only from 96.5 to 95.4 seconds, and later paired runs included slower candidates.
+Recovery-state snapshot differences were not fully isolated. The benchmark
+gate therefore did not accept the change; see
+[the rejected metadata experiment](startup-replay-metadata-experiment.md) for
+all measurements and validation limits.
 
 The subsequent apply-projection locator pass still validates every retained
 projection log frame and every generated Flow value reference. During startup

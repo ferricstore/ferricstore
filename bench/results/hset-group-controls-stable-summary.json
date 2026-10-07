@@ -1,0 +1,262 @@
+{
+  "trials": [
+    {
+      "trial": 1,
+      "mode": "direct",
+      "scenario": "native_set_get",
+      "cycles_per_second": 274.5355142413303,
+      "p50_us": 23800,
+      "p95_us": 48953,
+      "p99_us": 72189,
+      "cycles": 1376,
+      "clients": 8
+    },
+    {
+      "trial": 1,
+      "mode": "direct",
+      "scenario": "flow_lifecycle",
+      "cycles_per_second": 52.98182489662701,
+      "p50_us": 143016,
+      "p95_us": 198298,
+      "p99_us": 222707,
+      "cycles": 272,
+      "clients": 8
+    },
+    {
+      "trial": 1,
+      "mode": "coalesced",
+      "scenario": "native_set_get",
+      "cycles_per_second": 270.3781046375229,
+      "p50_us": 25194,
+      "p95_us": 48625,
+      "p99_us": 66223,
+      "cycles": 1356,
+      "clients": 8
+    },
+    {
+      "trial": 1,
+      "mode": "coalesced",
+      "scenario": "flow_lifecycle",
+      "cycles_per_second": 49.725413915128506,
+      "p50_us": 146534,
+      "p95_us": 197311,
+      "p99_us": 588226,
+      "cycles": 254,
+      "clients": 8
+    },
+    {
+      "trial": 2,
+      "mode": "coalesced",
+      "scenario": "native_set_get",
+      "cycles_per_second": 285.6122243627626,
+      "p50_us": 22172,
+      "p95_us": 45080,
+      "p99_us": 53403,
+      "cycles": 1432,
+      "clients": 8
+    },
+    {
+      "trial": 2,
+      "mode": "coalesced",
+      "scenario": "flow_lifecycle",
+      "cycles_per_second": 46.671695541861304,
+      "p50_us": 161456,
+      "p95_us": 230987,
+      "p99_us": 337172,
+      "cycles": 240,
+      "clients": 8
+    },
+    {
+      "trial": 2,
+      "mode": "direct",
+      "scenario": "native_set_get",
+      "cycles_per_second": 176.98564742067336,
+      "p50_us": 32598,
+      "p95_us": 80490,
+      "p99_us": 343993,
+      "cycles": 888,
+      "clients": 8
+    },
+    {
+      "trial": 2,
+      "mode": "direct",
+      "scenario": "flow_lifecycle",
+      "cycles_per_second": 47.39947966778668,
+      "p50_us": 150676,
+      "p95_us": 274004,
+      "p99_us": 320480,
+      "cycles": 241,
+      "clients": 8
+    },
+    {
+      "trial": 3,
+      "mode": "direct",
+      "scenario": "native_set_get",
+      "cycles_per_second": 299.0456257898542,
+      "p50_us": 22785,
+      "p95_us": 45007,
+      "p99_us": 52484,
+      "cycles": 1500,
+      "clients": 8
+    },
+    {
+      "trial": 3,
+      "mode": "direct",
+      "scenario": "flow_lifecycle",
+      "cycles_per_second": 48.89384574346543,
+      "p50_us": 162006,
+      "p95_us": 200122,
+      "p99_us": 275094,
+      "cycles": 248,
+      "clients": 8
+    },
+    {
+      "trial": 3,
+      "mode": "coalesced",
+      "scenario": "native_set_get",
+      "cycles_per_second": 286.3028414161384,
+      "p50_us": 23211,
+      "p95_us": 48402,
+      "p99_us": 55293,
+      "cycles": 1436,
+      "clients": 8
+    },
+    {
+      "trial": 3,
+      "mode": "coalesced",
+      "scenario": "flow_lifecycle",
+      "cycles_per_second": 50.211907821793865,
+      "p50_us": 157353,
+      "p95_us": 204545,
+      "p99_us": 228752,
+      "cycles": 259,
+      "clients": 8
+    }
+  ],
+  "cases": {
+    "native_set_get": {
+      "direct": {
+        "cycles_per_second": {
+          "median": 274.5355142413303,
+          "min": 176.98564742067336,
+          "max": 299.0456257898542
+        },
+        "p50_us": {
+          "median": 23800,
+          "min": 22785,
+          "max": 32598
+        },
+        "p95_us": {
+          "median": 48953,
+          "min": 45007,
+          "max": 80490
+        },
+        "p99_us": {
+          "median": 72189,
+          "min": 52484,
+          "max": 343993
+        }
+      },
+      "coalesced": {
+        "cycles_per_second": {
+          "median": 285.6122243627626,
+          "min": 270.3781046375229,
+          "max": 286.3028414161384
+        },
+        "p50_us": {
+          "median": 23211,
+          "min": 22172,
+          "max": 25194
+        },
+        "p95_us": {
+          "median": 48402,
+          "min": 45080,
+          "max": 48625
+        },
+        "p99_us": {
+          "median": 55293,
+          "min": 53403,
+          "max": 66223
+        }
+      }
+    },
+    "flow_lifecycle": {
+      "direct": {
+        "cycles_per_second": {
+          "median": 48.89384574346543,
+          "min": 47.39947966778668,
+          "max": 52.98182489662701
+        },
+        "p50_us": {
+          "median": 150676,
+          "min": 143016,
+          "max": 162006
+        },
+        "p95_us": {
+          "median": 200122,
+          "min": 198298,
+          "max": 274004
+        },
+        "p99_us": {
+          "median": 275094,
+          "min": 222707,
+          "max": 320480
+        }
+      },
+      "coalesced": {
+        "cycles_per_second": {
+          "median": 49.725413915128506,
+          "min": 46.671695541861304,
+          "max": 50.211907821793865
+        },
+        "p50_us": {
+          "median": 157353,
+          "min": 146534,
+          "max": 161456
+        },
+        "p95_us": {
+          "median": 204545,
+          "min": 197311,
+          "max": 230987
+        },
+        "p99_us": {
+          "median": 337172,
+          "min": 228752,
+          "max": 588226
+        }
+      }
+    }
+  },
+  "publication_identity": {
+    "otp": "29",
+    "elixir": "1.20.4",
+    "sha256": {
+      "apps/ferricstore/lib/ferricstore/api/store.ex": "7f1aa1ac916ad15fe9eee5fd77ff6cbe02cde15c5f0388c362b911e07f5d6409",
+      "apps/ferricstore/lib/ferricstore/commands/hash.ex": "6b0555387474438e5e71721e47e20bace30df9ceb933f4bcdfda3264e76492b0",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/apply_dispatch.ex": "38b2f13bfe11dfddb3ab5dc7fe14484af10f1eb0be9919d5e52daaaa0a5d8d05",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/async_apply.ex": "ef632c3b1456b3242658abee3e6e1bc2266185af9e350a59879a766287e39d23",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/compound_apply.ex": "c1618c09b9bfb2992ee931ff124f270432d60dd35e4bb34dc6ab580f1170fb4a",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/cross_shard_pending.ex": "186833ef6db9a8bd401b313f9cb69aa4463b194f9f36bd74d8fea80b78179c25",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/pending_writes.ex": "8409fe625dbfbc8be11ec2a4c9d59ba4c89e4e20a7ef0203d8902385dce96898",
+      "apps/ferricstore/lib/ferricstore/raft/state_machine/sections/read_warm.ex": "42317fe19049327ffeeb15688d44829529e47936a993fbd33031bde9abab3ef5",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_backend/batcher.ex": "5835e88e7631da3e4bfaaadb64a0c41b4bf69aaec8b4e06758f4ea2dbf10afc4",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_backend/hset_cadence.ex": "c851b2429dbf18d32034901933e9627d62ac34f9846e5dd9e5ebc87eb4be24c0",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_backend/sections/leader_wait.ex": "781f545e066d7b65caa1296b9acdbaaf546072dfdefefdec997665767eed5e72",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_backend/sections/public_api.ex": "ddb6636c189c630c0e51546ed4f4af46f675279699e99e12a38c25935e1498d4",
+      "apps/ferricstore/lib/ferricstore/raft/waraft_storage/sections/lifecycle.ex": "19df67af92f6e4047114e56482cfba5da3085633faa349f29406d74e24ac45ff",
+      "apps/ferricstore/lib/ferricstore/store/ops.ex": "8e86143ac06a319aa49d9159579e07b80e52174fcd0dd264b4123659a4880cbb",
+      "apps/ferricstore/lib/ferricstore/store/promoted_publication.ex": "2b9e2288bd30594e35362a57be202b5f95a1d711364927bab3d2004cb65fffad",
+      "apps/ferricstore/lib/ferricstore/store/publication_epoch.ex": "370bd4826e3373bd655cbc20761b75196b05c6c53685775f15e0fc505c0108f5",
+      "apps/ferricstore/lib/ferricstore/store/shard/compound/ops.ex": "d23784f27ed86cb61396c186aa88400939e7388c2c144ef17e735f20c30e19ef",
+      "apps/ferricstore/lib/ferricstore/store/shard/compound/promoted.ex": "5884ec89314e3114833eb284475fa62ff351d70dac0442a57ec7513e85ec9791",
+      "apps/ferricstore/lib/ferricstore/store/shard/startup.ex": "86078bdf66da2545e2291ac1e9133235631dae7bfa7984fc6e639053e4a7d579"
+    },
+    "beam_md5": {
+      "Ferricstore.Raft.StateMachine": "06b3f0edb61ae3c7c4f7594312325213",
+      "Ferricstore.Raft.WARaftStorage": "41f57f34d29d4f137cc413f90df13ab1",
+      "Ferricstore.Store.PromotedPublication": "e364f8e74415c9bd528709cc46e32c42",
+      "Ferricstore.Store.PublicationEpoch": "41ff76f4390d8bac7bfca10bb3369e9a"
+    },
+    "erl_flags": "+S 8:8"
+  }
+}
