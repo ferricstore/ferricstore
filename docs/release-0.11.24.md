@@ -99,6 +99,12 @@ uniquely named context and keydir reference as its adjacent claim fixture.
 Backlog, successful flush and absent cold-state assertions remain intact; the
 production writer still fails closed when source context is unavailable.
 
+The next PR matrix exposed stream atomic-append fixtures assuming the default
+backend was already running. Starting their module after explicitly stopping
+the backend reproduced the same 17 failures at seed 397824. The module now uses
+the existing per-test shard cleanup/readiness helper, retaining every atomicity,
+linearization and durable-entry assertion.
+
 ## Verification
 
 Before release preparation, the current cleanup source passed 173 scoped
