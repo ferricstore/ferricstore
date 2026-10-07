@@ -86,6 +86,12 @@ every cleanup page preserves the child's acquired shared value. Both affected
 test sections pass all 51 checks locally at seed 130940. Follow-up complete CI
 is required before tagging.
 
+That follow-up's only PR-matrix failure was a macOS source-contract scan exceeding
+its unchanged 30-second timeout while reading every production file five times
+through the shared file server. It now reads each file once through raw local
+I/O and checks all five forbidden tokens against that content. Every source and
+assertion remains covered; the complete updated-head CI is the release gate.
+
 ## Verification
 
 Before release preparation, the current cleanup source passed 173 scoped

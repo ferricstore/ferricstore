@@ -253,9 +253,9 @@ defmodule Ferricstore.ProductionDefaultsTest do
 
   test "production code has no Erlang ra dependency path" do
     root = @repo_root
-    mix_source = File.read!(Path.join(root, "apps/ferricstore/mix.exs"))
-    lock_source = File.read!(Path.join(root, "mix.lock"))
-    config_source = File.read!(Path.join(root, "config/config.exs"))
+    mix_source = File.read!(Path.join(root, "apps/ferricstore/mix.exs"), [:raw])
+    lock_source = File.read!(Path.join(root, "mix.lock"), [:raw])
+    config_source = File.read!(Path.join(root, "config/config.exs"), [:raw])
 
     refute mix_source =~ "{:" <> "ra,"
     refute mix_source =~ ":" <> "patched" <> "_wal"
@@ -275,8 +275,8 @@ defmodule Ferricstore.ProductionDefaultsTest do
         Path.wildcard(Path.join(root, "apps/ferricstore_server/lib/**/*.{ex,exs}"))
 
     for path <- production_sources,
-        token <- forbidden,
-        source = File.read!(path) do
+        source = File.read!(path, [:raw]),
+        token <- forbidden do
       refute source =~ token, "#{Path.relative_to(path, root)} still mentions #{token}"
     end
   end
