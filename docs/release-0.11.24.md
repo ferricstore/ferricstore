@@ -61,6 +61,12 @@ explicit public HSET cache-loss coverage and 99 provider/security/HSET/cleanup
 checks pass locally. A separate promotion fixture now installs its 1-ms fault
 deadline only after ordinary type/field setup and worker readiness; all 24
 promotion-context checks pass at the failing seed without changing assertions.
+The following matrix passes every Linux and specialized lane. Its remaining
+macOS fixture failures are optional-cache absence before fault injection and
+linked-sweeper teardown racing process exit. Cache-loss setup accepts and
+verifies the already-absent state, and sweeper fixtures use ExUnit-supervised
+lifetimes instead of liveness-check/manual-stop races. All 18 focused cases
+pass locally; the full latest-source matrix remains the release gate.
 
 ## Verification
 

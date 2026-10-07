@@ -199,8 +199,14 @@ defmodule Ferricstore.Commands.HashSingleWARaftTest do
       index = Router.shard_for(ctx, key)
       dir = Path.join(ctx.data_dir, "waraft/ferricstore_waraft_backend.#{index + 1}/segment_log")
       registry = :ferricstore_waraft_segment_log_memory_registry
-      [row] = :ets.match_object(registry, {:_, dir, :_, :_, :_, :_})
-      :ets.delete_object(registry, row)
+      # The optional cache may already have vanished with its former owner.
+      # Either state exercises recovery; do not require an existing row.
+      try do
+        :ets.match_delete(registry, {:_, dir, :_, :_, :_, :_})
+        assert :ets.match_object(registry, {:_, dir, :_, :_, :_, :_}) == []
+      rescue
+        ArgumentError -> assert :ets.info(registry) == :undefined
+      end
     end
 
     :ok = :sys.suspend(:file_server_2)
