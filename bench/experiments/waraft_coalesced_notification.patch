@@ -1,0 +1,67 @@
+# Apply after waraft_commit_deadline.patch. Experimental; NOT selected for release.
+diff --git a/include/wa_raft.hrl b/include/wa_raft.hrl
+--- a/include/wa_raft.hrl
++++ b/include/wa_raft.hrl
+@@ -545,4 +545,5 @@
+     %% [Leader] Absolute deadline for the current pending commit batch.
+     %% Heartbeat replies must not replace it with a later periodic timeout.
+-    commit_batch_deadline = undefined :: undefined | integer()
++    commit_batch_deadline = undefined :: undefined | integer(),
++    commit_notification = undefined :: undefined | {reference(), reference(), wa_raft_log:log_term()}
+ }).
+diff --git a/src/wa_raft_server.erl b/src/wa_raft_server.erl
+--- a/src/wa_raft_server.erl
++++ b/src/wa_raft_server.erl
+@@ -1318,4 +1318,5 @@
+     State4 = leader_apply_log(State3),
+     ?RAFT_GATHER(Table, 'leader.apply.func', erlang:monotonic_time(microsecond) - StartT),
+-    {keep_state, maybe_heartbeat(State4), ?HEARTBEAT_TIMEOUT(State4)};
++    State5 = maybe_schedule_commit_notification(CommitIndex, State4),
++    {keep_state, maybe_heartbeat(State5), ?HEARTBEAT_TIMEOUT(State5)};
+
+@@ -1668,3 +1669,14 @@
+ %% [Async Log Append]
++leader(info, {broadcast_commit, Term, Tag},
++    #raft_state{current_term = Term, commit_notification = {_Timer, Tag, Term}} = Data0) ->
++    Data1 = Data0#raft_state{commit_notification = undefined},
++    Data2 = case Data1#raft_state.handover of
++        undefined -> lists:foldl(fun heartbeat/2, Data1, config_participant_identities(config(Data1)));
++        _ActiveHandover -> Data1
++    end,
++    {keep_state, Data2, ?HEARTBEAT_TIMEOUT(Data2)};
++leader(info, {broadcast_commit, _Term, _Tag}, #raft_state{}) ->
++    keep_state_and_data;
++
+ %% A feature-flagged single-member fast path writes the local durable log on a
+ %% background process. Completion is the only point where log_view advances and
+@@ -3210,4 +3223,5 @@
+ enter_state(State, Data0) ->
++    ClearedData = cancel_commit_notification(Data0),
+     Now = erlang:monotonic_time(millisecond),
+-    Data1 = Data0#raft_state{state_start_ts = Now},
++    Data1 = ClearedData#raft_state{state_start_ts = Now},
+     Data2 = set_leader_upon_entry(State, Data1),
+@@ -4465,3 +4479,23 @@
+ -spec maybe_heartbeat(#raft_state{}) -> #raft_state{}.
++-spec maybe_schedule_commit_notification(wa_raft_log:log_index(), #raft_state{}) -> #raft_state{}.
++maybe_schedule_commit_notification(Previous,
++    #raft_state{application = App, table = Table, current_term = Term,
++        commit_index = Commit, handover = undefined, commit_notification = undefined} = Data)
++    when Commit > Previous ->
++    Tag = make_ref(),
++    Delay = max(1, ?RAFT_COMMIT_BATCH_INTERVAL(App, Table)),
++    Timer = erlang:send_after(Delay, self(), {broadcast_commit, Term, Tag}),
++    Data#raft_state{commit_notification = {Timer, Tag, Term}};
++maybe_schedule_commit_notification(_Previous, Data) ->
++    Data.
++
++-spec cancel_commit_notification(#raft_state{}) -> #raft_state{}.
++cancel_commit_notification(#raft_state{commit_notification = undefined} = Data) ->
++    Data;
++cancel_commit_notification(#raft_state{commit_notification = {Timer, Tag, Term}} = Data) ->
++    _ = erlang:cancel_timer(Timer),
++    receive {broadcast_commit, Term, Tag} -> ok after 0 -> ok end,
++    Data#raft_state{commit_notification = undefined}.
++
+ -spec leader_timeout(#raft_state{}) -> gen_statem:action().
+ -ifdef(TEST).
