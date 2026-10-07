@@ -666,10 +666,20 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.ReleaseCursorLogCompaction 
 
         test "release cursor metrics resolve instance context by name like production Raft config",
              %{
-               state: state,
-               shard_index: shard_index
+               ets: ets
              } do
           instance_name = :"cursor_metric_instance_#{System.unique_integer([:positive])}"
+          # The setup's 9000+ shard ID isolates direct state-machine tests; it
+          # is not a real instance size. Exercise a nonzero shard with only the
+          # two latch tables needed by this named-context lookup.
+          shard_index = 1
+
+          state =
+            init_state_for_release_cursor(ets,
+              shard_index: shard_index,
+              instance_ctx: nil,
+              instance_name: instance_name
+            )
 
           instance_ctx =
             FerricStore.Instance.build(instance_name,

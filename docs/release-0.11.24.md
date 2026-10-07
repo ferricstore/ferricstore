@@ -4,8 +4,8 @@ Branch: `codex/release-0.11.24-runtime-hardening`.
 
 Pull request: [#48](https://github.com/ferricstore/ferricstore/pull/48).
 
-Status: CI verification and fixes in progress. Merge to `main` and publication
-of `v0.11.24` require the owner's explicit approval after CI verification.
+Status: the owner approved release after the PR head passed all 31 CI jobs, and
+PR #48 is merged. Publication is held for main-branch CI follow-up verification.
 
 ## Scope
 
@@ -67,6 +67,24 @@ linked-sweeper teardown racing process exit. Cache-loss setup accepts and
 verifies the already-absent state, and sweeper fixtures use ExUnit-supervised
 lifetimes instead of liveness-check/manual-stop races. All 18 focused cases
 pass locally; the full latest-source matrix remains the release gate.
+
+The approved head passed all 25 test-matrix jobs and all six official SDK jobs.
+The matching main merge also passed SDK integration, benchmarks and published
+CI-image startup. Its Linux core partition hit a VM segmentation fault; a
+same-seed local replay reproduced the fault in Erlang's
+`db_hash_adapt_number_of_locks` through `ets_whereis_1`, while the named-context
+metrics fixture created roughly 10,000 latch tables from a synthetic isolation
+shard ID. That fixture now uses two shards while retaining a nonzero shard and
+the same release-cursor/index assertions. This is a bounded fixture correction,
+not a claim to have repaired Erlang's ETS implementation.
+
+The same-seed CI dispatch also exposed a shared-value retention fixture assuming
+that the first bounded cleanup call could not retire the owner. It now exercises
+the public cleanup projection barriers and continuation pages, requires exactly
+one owner retirement and verified cold-projection deletion, and checks that
+every cleanup page preserves the child's acquired shared value. Both affected
+test sections pass all 51 checks locally at seed 130940. Follow-up complete CI
+is required before tagging.
 
 ## Verification
 

@@ -1343,11 +1343,29 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfi
 
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
 
-        assert {:ok, %{flows: 0}} =
-                 Ferricstore.Store.Router.flow_retention_cleanup(ctx, %{
-                   limit: 10,
-                   now_ms: cleanup_now
-                 })
+        # Cleanup may retire the owner on the first page or finish bounded
+        # history/member work first. Require actual owner retirement while
+        # proving every page preserves the child's acquired shared reference.
+        {removed_flows, _continuation} =
+          Enum.reduce_while(1..16, {0, nil}, fn _page, {removed, continuation} ->
+            assert {:ok, page} =
+                     FerricStore.flow_retention_cleanup(
+                       limit: 10,
+                       now_ms: cleanup_now,
+                       continuation: continuation
+                     )
+
+            assert {:ok, ["shared-spawn"]} = FerricStore.flow_value_mget([shared_ref])
+            removed = removed + page.flows
+
+            if removed == 0,
+              do: {:cont, {removed, page.continuation}},
+              else: {:halt, {removed, page.continuation}}
+          end)
+
+        assert removed_flows == 1
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+        assert {:ok, nil} = FerricStore.flow_get(owner_id, partition_key: partition_key)
 
         assert {:ok, ["shared-spawn"]} = FerricStore.flow_value_mget([shared_ref])
 
