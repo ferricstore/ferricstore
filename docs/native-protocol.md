@@ -39,12 +39,20 @@ Requests may be pipelined. Responses carry the same `lane_id` and
 `request_id`. Responses may arrive out of order across lanes, but order is
 preserved within one lane.
 
-Session frames, ordered rejections such as `lane_queue_full`, and frame errors
-on a busy data lane are deferred behind that lane's earlier work instead of
-blocking the connection, so an earlier data response cannot be overtaken and
-other data lanes keep dispatching. Pending deferred rejections are bounded by
-the connection inflight limit; past that bound, or when a deferred session frame
-cannot be admitted, the frame waits on a lane-local completion barrier instead.
+Transaction and pubsub session frames (`MULTI`, `EXEC`, `DISCARD`, `WATCH`,
+`UNWATCH`, `SUBSCRIBE` and related commands, and every frame while `MULTI` is
+queuing) change connection-wide state. They wait for a lane-local completion
+barrier and then execute in stream order, so every later frame on any lane
+observes them: a write sent after `WATCH` invalidates the transaction, and a
+command sent after `MULTI` is queued.
+
+Blocking commands, ordered rejections such as `lane_queue_full`, and frame
+errors on a busy data lane only affect their own lane. They are deferred behind
+that lane's earlier work instead of blocking the connection, so an earlier data
+response cannot be overtaken and other data lanes keep dispatching. Pending
+deferred rejections are bounded by the connection inflight limit; past that
+bound, or when a deferred blocking command cannot be admitted, the frame waits
+on the lane-local completion barrier instead.
 
 Read-only and flow-control frames (`PING`, `CLIENT.INFO`, `ROUTE`,
 `ROUTE_BATCH`, `SHARDS`, `BACKPRESSURE`, `OPTIONS`, `WINDOW_UPDATE`) answer

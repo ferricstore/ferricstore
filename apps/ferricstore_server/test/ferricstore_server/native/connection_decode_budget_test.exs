@@ -37,7 +37,7 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
     source = File.read!(source_path)
 
     [_prefix, classifier_and_rest] =
-      String.split(source, "defp native_session_payload?", parts: 2)
+      String.split(source, "defp native_session_payload_kind", parts: 2)
 
     [classifier | _rest] = String.split(classifier_and_rest, "\n  defp ", parts: 2)
 

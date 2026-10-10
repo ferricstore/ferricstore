@@ -167,13 +167,16 @@ defmodule FerricstoreServer.Native.LaneBarrierReviewTest do
     assert Enum.any?(frames, &match?({:event, "AUTH_INVALIDATED"}, &1)), inspect(frames)
   end
 
-  test "a session barrier on one lane does not stall another lane", %{keys: [_, key, _]} do
+  test "a blocking command behind a busy lane does not stall another lane", %{
+    keys: [list, key, _]
+  } do
     assert :ok = FerricStore.set(key, "value")
+    assert {:ok, 1} = FerricStore.rpush(list, ["item"])
     socket = connect()
 
     send_frames(socket, [
       command(1, 50, "DEBUG", ["SLEEP", "1"]),
-      command(1, 51, "WATCH", [key]),
+      command(1, 51, "BLPOP", [list, "5"]),
       command(2, 52, "GET", [key])
     ])
 
@@ -185,13 +188,14 @@ defmodule FerricstoreServer.Native.LaneBarrierReviewTest do
     assert elapsed < 500, "lane 2 waited #{elapsed}ms behind a lane-1 barrier"
   end
 
-  test "a deferred session frame keeps lane order around it", %{keys: [_, key, _]} do
+  test "a deferred blocking command keeps lane order around it", %{keys: [list, key, _]} do
     assert :ok = FerricStore.set(key, "value")
+    assert {:ok, 1} = FerricStore.rpush(list, ["item"])
     socket = connect()
 
     send_frames(socket, [
       command(1, 70, "DEBUG", ["SLEEP", "1"]),
-      command(1, 71, "WATCH", [key]),
+      command(1, 71, "BLPOP", [list, "5"]),
       command(1, 72, "GET", [key]),
       command(2, 73, "GET", [key])
     ])
@@ -354,6 +358,50 @@ defmodule FerricstoreServer.Native.LaneBarrierReviewTest do
     assert drains <= 2, "rescanned the parked lane #{drains} times for unrelated traffic"
   end
 
+  test "a MULTI behind a busy lane still captures later frames from other lanes", %{
+    keys: [_, key, _]
+  } do
+    socket = connect()
+
+    send_frames(socket, [
+      command(1, 110, "DEBUG", ["SLEEP", "1"]),
+      command(1, 111, "MULTI", []),
+      command(2, 112, "SET", [key, "in-transaction"]),
+      command(1, 113, "EXEC", [])
+    ])
+
+    replies = Map.new(1..4, fn _ -> response_value(socket) end)
+    assert {0, "QUEUED"} = replies[112]
+    assert {0, [_]} = replies[113]
+    assert {:ok, "in-transaction"} = FerricStore.get(key)
+  end
+
+  test "a WATCH behind a busy lane still sees later writes from other lanes", %{
+    keys: [_, key, _]
+  } do
+    assert :ok = FerricStore.set(key, "original")
+    socket = connect()
+
+    send_frames(socket, [
+      command(1, 120, "DEBUG", ["SLEEP", "1"]),
+      command(1, 121, "WATCH", [key]),
+      command(2, 122, "SET", [key, "concurrent"])
+    ])
+
+    replies = Map.new(1..3, fn _ -> response_value(socket) end)
+    assert {0, _} = replies[122]
+
+    send_frames(socket, [
+      command(1, 123, "MULTI", []),
+      command(1, 124, "SET", [key, "mine"]),
+      command(1, 125, "EXEC", [])
+    ])
+
+    replies = Map.new(1..3, fn _ -> response_value(socket) end)
+    assert {0, nil} = replies[125], "EXEC should abort: the watched key changed after WATCH"
+    assert {:ok, "concurrent"} = FerricStore.get(key)
+  end
+
   defp connect do
     {:ok, socket} =
       :gen_tcp.connect({127, 0, 0, 1}, Listener.port(), [:binary, active: false], 2_000)
@@ -386,6 +434,19 @@ defmodule FerricstoreServer.Native.LaneBarrierReviewTest do
       )
 
   defp response(socket), do: socket |> read_frame(3_000) |> summarize()
+
+  defp response_value(socket) do
+    assert {:ok, {_lane, _opcode, id, <<status::unsigned-16, body::binary>>}} =
+             read_frame(socket, 3_000)
+
+    value =
+      case Codec.decode_body(body) do
+        {:ok, value} -> value
+        {:error, _reason} -> body
+      end
+
+    {id, {status, value}}
+  end
 
   defp read_frame(socket, timeout) do
     with {:ok,

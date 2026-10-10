@@ -977,9 +977,10 @@ defmodule FerricstoreServer.Native.Connection do
          lane_batches
        ) do
     # Classify once: peeking the command name is per-frame hot-path work.
-    session? = native_session_frame?(frame, state)
+    session_kind = native_session_kind(frame, state)
+    session? = session_kind != nil
 
-    if lane_gated_synchronous_frame?(state, frame, session?) do
+    if lane_gated_synchronous_frame?(state, frame, session_kind) do
       defer_lane_synchronous_frame(
         frame,
         rest,
@@ -1004,15 +1005,15 @@ defmodule FerricstoreServer.Native.Connection do
     end
   end
 
-  # Session frames on a busy data lane wait behind that lane's earlier work
-  # without blocking the connection; other lanes keep dispatching. Control
-  # frames stay connection-wide barriers.
-  defp lane_gated_synchronous_frame?(state, frame, session?) do
-    lane_id = lane_id(frame)
+  # Blocking commands on a busy data lane wait behind that lane's earlier work
+  # without blocking the connection; other lanes keep dispatching. Transaction
+  # and pubsub session commands change connection-wide state that later frames
+  # on every lane must observe in stream order, so they keep the synchronous
+  # lane barrier.
+  defp lane_gated_synchronous_frame?(state, frame, :blocking),
+    do: lane_id(frame) > @control_lane and lane_busy?(state, lane_id(frame))
 
-    lane_id > @control_lane and (session? or state.multi_state == :queuing) and
-      lane_busy?(state, lane_id) and not Commands.control_opcode?(opcode(frame))
-  end
+  defp lane_gated_synchronous_frame?(_state, _frame, _session_kind), do: false
 
   defp lane_busy?(state, lane_id), do: is_map_key(state.lane_inflight, lane_id)
 
@@ -1374,19 +1375,29 @@ defmodule FerricstoreServer.Native.Connection do
   defp maybe_prepend_response(_frame, nil, responses), do: responses
   defp maybe_prepend_response(_frame, response, responses), do: [response | responses]
 
-  defp native_session_frame?(frame, state) do
-    opcode(frame) == @op_command_exec and
-      (state.multi_state == :queuing or native_session_payload?(frame))
+  # nil for data frames; :session while MULTI is queuing or for transaction and
+  # pubsub commands; :blocking for lane-local blocking commands.
+  defp native_session_kind(frame, state) do
+    cond do
+      opcode(frame) != @op_command_exec -> nil
+      state.multi_state == :queuing -> :session
+      true -> native_session_payload_kind(frame)
+    end
   end
 
-  defp native_session_payload?(frame) do
+  defp native_session_payload_kind(frame) do
     case Codec.peek_command_name(flags(frame), body(frame)) do
       {:ok, command} ->
         command = String.upcase(command)
-        Blocking.blocking_command?(command) or Session.session_command?(command)
+
+        cond do
+          Blocking.blocking_command?(command) -> :blocking
+          Session.session_command?(command) -> :session
+          true -> nil
+        end
 
       _invalid_or_non_session ->
-        false
+        nil
     end
   end
 
