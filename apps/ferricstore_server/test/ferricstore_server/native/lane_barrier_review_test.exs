@@ -493,6 +493,44 @@ defmodule FerricstoreServer.Native.LaneBarrierReviewTest do
     assert System.monotonic_time(:millisecond) - started < 900
   end
 
+  test "per-frame dispatch cost does not grow with blocked requests on other lanes", %{
+    keys: [list, key, _]
+  } do
+    assert :ok = FerricStore.set(key, "value")
+    baseline = dispatch_reductions_per_frame(key, fn _socket -> :ok end)
+
+    loaded =
+      dispatch_reductions_per_frame(key, fn socket ->
+        send_frames(socket, for(lane <- 1..500, do: command(lane, lane, "BLPOP", [list, "0"])))
+        assert eventually(fn -> Ferricstore.Waiters.count(list) >= 500 end)
+      end)
+
+    assert loaded - baseline < 100,
+           "500 blocked requests added #{loaded - baseline} reductions per unrelated frame"
+  end
+
+  defp dispatch_reductions_per_frame(key, setup) do
+    existing = connection_pids()
+    socket = connect()
+    connection_pid = wait_for_new_connection(existing)
+    setup.(socket)
+    frames = 200
+    {:reductions, before} = Process.info(connection_pid, :reductions)
+    send_frames(socket, for(id <- 1..frames, do: command(900, 1_000 + id, "GET", [key])))
+    Enum.each(1..frames, fn _ -> response(socket) end)
+    {:reductions, after_count} = Process.info(connection_pid, :reductions)
+    :gen_tcp.close(socket)
+    div(after_count - before, frames)
+  end
+
+  defp eventually(fun, attempts \\ 200) do
+    cond do
+      fun.() -> true
+      attempts == 0 -> false
+      true -> Process.sleep(10) && eventually(fun, attempts - 1)
+    end
+  end
+
   defp connect do
     {:ok, socket} =
       :gen_tcp.connect({127, 0, 0, 1}, Listener.port(), [:binary, active: false], 2_000)

@@ -133,6 +133,7 @@ defmodule FerricstoreServer.Native.Connection do
     pubsub_subscription_token: nil,
     max_pubsub_subscription_bytes: 16 * 1024 * 1024,
     blocked_requests: %{},
+    blocked_lane_counts: %{},
     deferred_frames: %{},
     deferred_reply_total: 0,
     deferred_release_due: false,
@@ -2038,9 +2039,9 @@ defmodule FerricstoreServer.Native.Connection do
        when map_size(blocked_requests) == 0,
        do: false
 
-  defp blocked_request_for_lane?(state, lane_id) when is_integer(lane_id) do
-    Enum.any?(state.blocked_requests, fn {_pid, request} -> request.lane_id == lane_id end)
-  end
+  # Indexed by lane: this runs for every frame while any request is blocked.
+  defp blocked_request_for_lane?(state, lane_id) when is_integer(lane_id),
+    do: is_map_key(state.blocked_lane_counts, lane_id)
 
   defp blocked_request_for_lane?(_state, _lane_id), do: false
 
@@ -2591,8 +2592,11 @@ defmodule FerricstoreServer.Native.Connection do
   defp put_blocked_request(state, pid, monitor_ref, meta) do
     request = meta |> Map.put(:pid, pid) |> Map.put(:monitor_ref, monitor_ref)
 
+    lane_counts = Map.update(state.blocked_lane_counts, meta.lane_id, 1, &(&1 + 1))
+
     state
     |> put_in([Access.key(:blocked_requests), pid], request)
+    |> Map.put(:blocked_lane_counts, lane_counts)
     |> remember_connection_state()
   end
 
@@ -2602,7 +2606,13 @@ defmodule FerricstoreServer.Native.Connection do
         {nil, state}
 
       {request, blocked_requests} ->
-        state = %{state | blocked_requests: blocked_requests}
+        lane_counts =
+          case Map.fetch!(state.blocked_lane_counts, request.lane_id) do
+            1 -> Map.delete(state.blocked_lane_counts, request.lane_id)
+            count -> Map.put(state.blocked_lane_counts, request.lane_id, count - 1)
+          end
+
+        state = %{state | blocked_requests: blocked_requests, blocked_lane_counts: lane_counts}
         {request, mark_deferred_release_due(state, request.lane_id)}
     end
   end
