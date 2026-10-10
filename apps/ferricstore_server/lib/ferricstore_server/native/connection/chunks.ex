@@ -71,7 +71,8 @@ defmodule FerricstoreServer.Native.Connection.Chunks do
             {:error, "ERR native global pending chunk bytes limit exceeded", state}
 
           true ->
-            body = chunks |> Enum.reverse() |> IO.iodata_to_binary() |> Kernel.<>(body(frame))
+            # One exact-size copy; `<>` would copy again and keep append headroom.
+            body = IO.iodata_to_binary(Enum.reverse([body(frame) | chunks]))
             state = drop_chunk(state, key, previous_size)
 
             flags =

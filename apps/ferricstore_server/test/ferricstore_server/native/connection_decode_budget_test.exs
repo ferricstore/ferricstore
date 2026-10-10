@@ -9,6 +9,7 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
   @hello_opcode 0x0001
   @startup_opcode 0x000C
   @ping_opcode 0x0003
+  @client_set_name_opcode 0x0004
   @options_opcode 0x000B
   @command_exec_opcode 0x0100
   @get_opcode 0x0101
@@ -130,7 +131,13 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
         ),
         command_exec_frame_on_lane(1, 104, "MULTI", []),
         command_exec_frame_on_lane(1, 105, "EXEC", []),
-        Codec.encode_frame(@ping_opcode, 0, 106, ""),
+        # CLIENT.SETNAME is an ordered control frame; PING answers immediately.
+        Codec.encode_frame(
+          @client_set_name_opcode,
+          0,
+          106,
+          Codec.encode_value(%{"name" => "ordered-control"})
+        ),
         Codec.encode_frame(
           @get_opcode,
           1,
@@ -654,8 +661,14 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
                    Codec.encode_value(%{"key" => key})
                  ),
                  # Lane-local session frames defer behind the lane without
-                 # blocking the connection; control frames keep a bounded barrier.
-                 Codec.encode_frame(@ping_opcode, 0, 132, "")
+                 # blocking the connection; ordered control frames keep a
+                 # bounded barrier.
+                 Codec.encode_frame(
+                   @client_set_name_opcode,
+                   0,
+                   132,
+                   Codec.encode_value(%{"name" => "stalled-barrier"})
+                 )
                ]
              )
 

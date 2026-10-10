@@ -46,8 +46,12 @@ other data lanes keep dispatching. Pending deferred rejections are bounded by
 the connection inflight limit; past that bound, or when a deferred session frame
 cannot be admitted, the frame waits on a lane-local completion barrier instead.
 
-Control frames use a barrier across active data lanes, including lane work
-deferred behind them, but not work waiting on a blocking command. Barriers are
+Read-only and flow-control frames (`PING`, `CLIENT.INFO`, `ROUTE`,
+`ROUTE_BATCH`, `SHARDS`, `BACKPRESSURE`, `OPTIONS`, `WINDOW_UPDATE`) answer
+immediately and are not ordering fences. Other control frames (`HELLO`, `AUTH`,
+`STARTUP`, `CLIENT.SETNAME`, `QUIT`, event subscriptions) use a barrier across
+active data lanes, including lane work deferred behind them, but not work
+waiting on a blocking command. Barriers are
 bounded as a whole by `native_lane_barrier_timeout_ms` (default `15000` ms), and
 never extend an active frame or chunk assembly deadline. If a lane terminates,
 the peer disconnects, or the barrier deadline expires, the connection closes

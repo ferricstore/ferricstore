@@ -161,6 +161,27 @@ defmodule FerricstoreServer.Native.ResourceBudgetTest do
     assert :ok = ResourceBudget.release_scoped(token)
   end
 
+  test "saturated scoped acquires do not rescan every accounting actor per reclaim" do
+    name = :"native_resource_reclaim_scan_#{System.unique_integer([:positive])}"
+    start_supervised!({ResourceBudget, name: name, limits: %{executions: 1}})
+    assert {:ok, token} = ResourceBudget.acquire_scoped(name, :executions, 1)
+
+    gate = ResourceBudget.AccountingGate
+    coordinator = Process.whereis(name)
+    :erlang.trace_pattern({gate, :discover_interruptions, 1}, true, [:global])
+    :erlang.trace(coordinator, true, [:call])
+    on_exit(fn -> :erlang.trace_pattern({gate, :discover_interruptions, 1}, false, [:global]) end)
+
+    for _ <- 1..50 do
+      assert {:error, {:limit, :executions}} = ResourceBudget.acquire_scoped(name, :executions, 1)
+    end
+
+    :erlang.trace(coordinator, false, [:call])
+    scans = count_trace_calls(coordinator, {gate, :discover_interruptions})
+    assert scans <= 2, "50 saturated acquires ran #{scans} full actor scans"
+    assert :ok = ResourceBudget.release_scoped(token)
+  end
+
   test "scoped leases cannot be released by another process" do
     name = :"native_resource_scoped_owner_check_#{System.unique_integer([:positive])}"
     start_supervised!({ResourceBudget, name: name})
@@ -583,6 +604,15 @@ defmodule FerricstoreServer.Native.ResourceBudgetTest do
       end
     else
       :ok
+    end
+  end
+
+  defp count_trace_calls(pid, {module, function}, count \\ 0) do
+    receive do
+      {:trace, ^pid, :call, {^module, ^function, _args}} ->
+        count_trace_calls(pid, {module, function}, count + 1)
+    after
+      100 -> count
     end
   end
 end

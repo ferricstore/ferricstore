@@ -55,6 +55,10 @@ defmodule FerricstoreServer.Native.Connection do
   @cleanup_done_key :native_connection_cleanup_done
   @default_lane_barrier_timeout_ms 15_000
   @deferred_frame_metadata_bytes 64
+  # Read-only and flow-control opcodes (PING, CLIENT.INFO, ROUTE, SHARDS,
+  # BACKPRESSURE, OPTIONS, WINDOW_UPDATE, ROUTE_BATCH) change no state that
+  # earlier frames depend on, so they answer without a cross-lane barrier.
+  @unordered_control_opcodes [0x0003, 0x0005, 0x0006, 0x0007, 0x0008, 0x000B, 0x000D, 0x000F]
 
   defstruct [
     :socket,
@@ -127,6 +131,7 @@ defmodule FerricstoreServer.Native.Connection do
     blocked_requests: %{},
     deferred_frames: %{},
     deferred_reply_total: 0,
+    deferred_release_due: false,
     authenticated: false,
     require_auth: false,
     compact_flow_responses: false,
@@ -344,7 +349,7 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   def loop(%__MODULE__{} = state) do
-    state = state |> release_idle_lane_deferrals() |> remember_connection_state()
+    state = state |> maybe_release_idle_lane_deferrals() |> remember_connection_state()
 
     if state.close_after_reply or connection_deadline_expired?(state) do
       cleanup_connection(state)
@@ -971,7 +976,10 @@ defmodule FerricstoreServer.Native.Connection do
          decoded_bytes,
          lane_batches
        ) do
-    if lane_gated_synchronous_frame?(state, frame) do
+    # Classify once: peeking the command name is per-frame hot-path work.
+    session? = native_session_frame?(frame, state)
+
+    if lane_gated_synchronous_frame?(state, frame, session?) do
       defer_lane_synchronous_frame(
         frame,
         rest,
@@ -979,7 +987,8 @@ defmodule FerricstoreServer.Native.Connection do
         responses,
         decode_us,
         decoded_bytes,
-        lane_batches
+        lane_batches,
+        session?
       )
     else
       dispatch_prepared_frame_now(
@@ -989,7 +998,8 @@ defmodule FerricstoreServer.Native.Connection do
         responses,
         decode_us,
         decoded_bytes,
-        lane_batches
+        lane_batches,
+        session?
       )
     end
   end
@@ -997,12 +1007,11 @@ defmodule FerricstoreServer.Native.Connection do
   # Session frames on a busy data lane wait behind that lane's earlier work
   # without blocking the connection; other lanes keep dispatching. Control
   # frames stay connection-wide barriers.
-  defp lane_gated_synchronous_frame?(state, frame) do
+  defp lane_gated_synchronous_frame?(state, frame, session?) do
     lane_id = lane_id(frame)
 
-    lane_id > @control_lane and lane_busy?(state, lane_id) and
-      not Commands.control_opcode?(opcode(frame)) and
-      (state.multi_state == :queuing or native_session_frame?(frame, state))
+    lane_id > @control_lane and (session? or state.multi_state == :queuing) and
+      lane_busy?(state, lane_id) and not Commands.control_opcode?(opcode(frame))
   end
 
   defp lane_busy?(state, lane_id), do: is_map_key(state.lane_inflight, lane_id)
@@ -1014,7 +1023,8 @@ defmodule FerricstoreServer.Native.Connection do
          responses,
          decode_us,
          decoded_bytes,
-         lane_batches
+         lane_batches,
+         session?
        ) do
     lane_id = lane_id(frame)
     retained_bytes = max(decoded_bytes, frame_memory_bytes(frame))
@@ -1047,7 +1057,8 @@ defmodule FerricstoreServer.Native.Connection do
           responses,
           decode_us,
           decoded_bytes,
-          lane_batches
+          lane_batches,
+          session?
         )
     end
   end
@@ -1059,7 +1070,8 @@ defmodule FerricstoreServer.Native.Connection do
          responses,
          decode_us,
          decoded_bytes,
-         lane_batches
+         lane_batches,
+         session?
        ) do
     cond do
       state.multi_state == :queuing and opcode(frame) != @op_command_exec ->
@@ -1086,6 +1098,10 @@ defmodule FerricstoreServer.Native.Connection do
             dispatch_barrier_failure(frame, state, responses, decode_us, reason)
         end
 
+      opcode(frame) in @unordered_control_opcodes ->
+        state = discard_decoded_frame(state, decoded_bytes)
+        dispatch_control_frame(frame, rest, state, responses, decode_us, lane_batches)
+
       Commands.control_opcode?(opcode(frame)) ->
         state = discard_decoded_frame(state, decoded_bytes)
 
@@ -1097,7 +1113,7 @@ defmodule FerricstoreServer.Native.Connection do
             dispatch_barrier_failure(frame, state, responses, decode_us, reason)
         end
 
-      native_session_frame?(frame, state) ->
+      session? ->
         state = discard_decoded_frame(state, decoded_bytes)
 
         case synchronize_before_synchronous_frame(state, lane_batches, frame) do
@@ -1173,17 +1189,19 @@ defmodule FerricstoreServer.Native.Connection do
     )
   end
 
-  defp dispatch_control_frame(frame, rest, state, responses, decode_us) do
+  defp dispatch_control_frame(frame, rest, state, responses, decode_us, lane_batches \\ %{}) do
     case execute_control_frame(frame, state) do
       {:reply, response, state} ->
         if state.close_after_reply do
+          flush_lane_batches(lane_batches)
           {maybe_prepend_response(frame, response, responses), state}
         else
           dispatch_frames(
             rest,
             state,
             maybe_prepend_response(frame, response, responses),
-            decode_us
+            decode_us,
+            lane_batches
           )
         end
     end
@@ -1806,8 +1824,13 @@ defmodule FerricstoreServer.Native.Connection do
     state = mark_input_consumed(state)
 
     case buffer_barrier_data(state, data) do
-      {:ok, state, ready?} ->
-        state = if ready?, do: schedule_barrier_decode(state), else: state
+      {:ok, state, true} ->
+        # A complete frame is buffered: leave further input in the socket until
+        # the barrier ends and the frame is decoded (backpressure).
+        state = schedule_barrier_decode(state)
+        wait_for_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline)
+
+      {:ok, state, false} ->
         deadline = min_lane_deadline(deadline, state.frame_assembly_deadline_ms)
         deadline = min_lane_deadline(deadline, state.chunk_assembly_deadline_ms)
         continue_lane_barrier_input(state, lane_id, barrier_ref, monitor_ref, deadline)
@@ -2080,6 +2103,19 @@ defmodule FerricstoreServer.Native.Connection do
 
   defp deferred_dependency_active?(state, lane_id),
     do: lane_busy?(state, lane_id) or blocked_request_for_lane?(state, lane_id)
+
+  # Deferred lanes become runnable only when a lane goes idle or a blocking
+  # request finishes; skip the scan for unrelated traffic.
+  defp mark_deferred_release_due(%{deferred_frames: deferred_frames} = state, lane_id)
+       when is_map_key(deferred_frames, lane_id),
+       do: %{state | deferred_release_due: true}
+
+  defp mark_deferred_release_due(state, _lane_id), do: state
+
+  defp maybe_release_idle_lane_deferrals(%{deferred_release_due: true} = state),
+    do: release_idle_lane_deferrals(%{state | deferred_release_due: false})
+
+  defp maybe_release_idle_lane_deferrals(state), do: state
 
   defp release_idle_lane_deferrals(%{deferred_frames: deferred_frames} = state)
        when map_size(deferred_frames) == 0,
@@ -2442,8 +2478,14 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp take_blocked_request(state, pid) do
-    {request, blocked_requests} = Map.pop(state.blocked_requests, pid)
-    {request, %{state | blocked_requests: blocked_requests}}
+    case Map.pop(state.blocked_requests, pid) do
+      {nil, _blocked_requests} ->
+        {nil, state}
+
+      {request, blocked_requests} ->
+        state = %{state | blocked_requests: blocked_requests}
+        {request, mark_deferred_release_due(state, request.lane_id)}
+    end
   end
 
   defp maybe_send_blocking_response(_state, %{no_reply: true}, _status, _value), do: :ok
@@ -2695,6 +2737,8 @@ defmodule FerricstoreServer.Native.Connection do
       | inflight_total: max(state.inflight_total - count, 0),
         lane_inflight: lane_inflight
     }
+
+    state = if lane_count == 0, do: mark_deferred_release_due(state, lane_id), else: state
 
     release_queued_request_bytes(state, lane_id, request_bytes)
   end

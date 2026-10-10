@@ -194,6 +194,33 @@ defmodule FerricstoreServer.Native.ChunksTest do
     assert ResourceBudget.usage(budget).chunk_bytes == 0
   end
 
+  test "final chunk assembly yields an exact-size body" do
+    name = :"native_chunk_exact_size_#{System.unique_integer([:positive])}"
+    size = 256 * 1024
+
+    budget =
+      start_supervised!(
+        {ResourceBudget, name: name, limits: %{chunk_streams: 1, chunk_bytes: 4 * size}}
+      )
+
+    state =
+      chunk_state(budget, max_frame_bytes: 4 * size, max_pending_chunk_bytes: 4 * size)
+
+    first = :binary.copy("a", size)
+    last = :binary.copy("b", size)
+
+    assert {:pending, state} =
+             Chunks.reassemble({1, 0x0100, 7, @more_chunks_flag, first}, state)
+
+    assert {:ready, {1, 0x0100, 7, 0, body}, _state} =
+             Chunks.reassemble({1, 0x0100, 7, 0, last}, state)
+
+    assert body == first <> last
+    # One exact allocation: no second copy and no append growth headroom
+    # retained for the life of the assembled request.
+    assert :binary.referenced_byte_size(body) == byte_size(body)
+  end
+
   test "request decompression is incremental and output-bounded" do
     source =
       File.read!(

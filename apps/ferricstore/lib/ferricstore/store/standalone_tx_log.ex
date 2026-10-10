@@ -78,7 +78,8 @@ defmodule Ferricstore.Store.StandaloneTxLog do
 
       {:error, {:standalone_tx_abort_persistence_failed, ^txid, reason}} ->
         recovery_reason = {:standalone_tx_abort_recovery_required, txid, reason}
-        :ok = require_recovery(data_dir, recovery_reason)
+        # require_recovery fences in memory even when the durable marker fails.
+        _ = require_recovery(data_dir, recovery_reason)
         observe(:abort, %{count: 1}, %{status: :error})
         {:error, recovery_reason}
 
@@ -1184,7 +1185,20 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     :persistent_term.erase(recovery_key(data_dir))
   end
 
-  defp recovery_key(data_dir), do: {__MODULE__, :recovery_required, Path.expand(data_dir)}
+  defp recovery_key(data_dir), do: {__MODULE__, :recovery_required, canonical_dir(data_dir)}
+
+  # The write fence builds this key per write; skip Path.expand for the usual
+  # already-canonical absolute data dir.
+  defp canonical_dir(<<"/", _::binary>> = dir) do
+    if :binary.match(dir, ["//", "/./", "/../"]) == :nomatch and
+         not String.ends_with?(dir, ["/", "/.", "/.."]) do
+      dir
+    else
+      Path.expand(dir)
+    end
+  end
+
+  defp canonical_dir(dir), do: Path.expand(dir)
 
   defp with_journal_lock(data_dir, fun) when is_function(fun, 0) do
     lock = {{__MODULE__, Path.expand(data_dir)}, self()}

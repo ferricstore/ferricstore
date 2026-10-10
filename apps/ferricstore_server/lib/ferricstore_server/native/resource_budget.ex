@@ -246,6 +246,7 @@ defmodule FerricstoreServer.Native.ResourceBudget do
         budget: budget,
         registry_keys: registry_keys,
         scoped_sweep_interval_ms: scoped_sweep_interval_ms,
+        last_interruption_scan_ms: nil,
         owner_monitors: %{},
         monitors: %{},
         waiter_queues: Map.new(@resources, &{&1, :queue.new()}),
@@ -301,7 +302,7 @@ defmodule FerricstoreServer.Native.ResourceBudget do
     do: {:reply, resize_fast_lease(state.budget, token, amount), state}
 
   def handle_call({:reclaim_scoped, resource}, _from, state) do
-    AccountingGate.discover_interruptions(state.budget.accounting_gate)
+    state = maybe_discover_interruptions(state)
     state = reconcile_interrupted_accounting(state)
     state = reclaim_dead_scoped_owners(state, resource)
     {:reply, :ok, state}
@@ -1004,6 +1005,21 @@ defmodule FerricstoreServer.Native.ResourceBudget do
   defp scoped_resource_requested?(_resource, :all), do: true
   defp scoped_resource_requested?(resource, resource), do: true
   defp scoped_resource_requested?(_resource, _requested), do: false
+
+  # Owner DOWN messages already report interrupted actors; the full actor scan
+  # only closes the window before DOWN arrives. Saturated callers reclaim on
+  # every limit hit, so scan at most once per sweep interval.
+  defp maybe_discover_interruptions(state) do
+    now = System.monotonic_time(:millisecond)
+
+    if is_nil(state.last_interruption_scan_ms) or
+         now - state.last_interruption_scan_ms >= state.scoped_sweep_interval_ms do
+      AccountingGate.discover_interruptions(state.budget.accounting_gate)
+      %{state | last_interruption_scan_ms: now}
+    else
+      state
+    end
+  end
 
   defp schedule_scoped_sweep(state) do
     Process.send_after(self(), :sweep_scoped_leases, state.scoped_sweep_interval_ms)

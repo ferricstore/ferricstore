@@ -8,6 +8,8 @@ defmodule FerricstoreServer.Native.LaneBarrierReviewTest do
 
   @command_exec_opcode 0x0100
   @ping_opcode 0x0003
+  @client_set_name_opcode 0x0004
+  @window_update_opcode 0x000D
   @subscribe_events_opcode 0x0011
   @event_opcode 0x0010
 
@@ -37,7 +39,7 @@ defmodule FerricstoreServer.Native.LaneBarrierReviewTest do
     send_frames(socket, [command(1, 1, "GET", [key]), command(1, 2, "BLPOP", [list, "0"])])
     assert response(socket) == {1, 1, 0}
 
-    send_frames(socket, [ping(0, 3)])
+    send_frames(socket, [set_name(0, 3)])
     assert response(socket) == {0, 3, 0}
 
     send_frames(socket, [command(2, 4, "GET", [key])])
@@ -55,7 +57,7 @@ defmodule FerricstoreServer.Native.LaneBarrierReviewTest do
       command(1, 10, "GET", [key]),
       command(1, 11, "WATCH", [key]),
       command(1, 12, "BLPOP", [list, "5"]),
-      ping(0, 13)
+      set_name(0, 13)
     ])
 
     responses = Enum.map(1..4, fn _ -> response(socket) end)
@@ -83,7 +85,7 @@ defmodule FerricstoreServer.Native.LaneBarrierReviewTest do
     # More than one native decode batch (128 frames), with a session barrier in
     # the first batch so the barrier runs while decode input is paused.
     fillers = for id <- 100..239, do: command(2, id, "GET", [key])
-    send_frames(socket, [command(1, 1, "GET", [key]), command(1, 2, "WATCH", [key]) | fillers])
+    send_frames(socket, [command(1, 1, "GET", [key]), set_name(0, 2) | fillers])
     Enum.each(1..142, fn _ -> response(socket) end)
     disable_call_trace(connection_pid)
 
@@ -109,7 +111,7 @@ defmodule FerricstoreServer.Native.LaneBarrierReviewTest do
     ])
 
     started = System.monotonic_time(:millisecond)
-    send_frames(socket, [ping(0, 22)])
+    send_frames(socket, [set_name(0, 22)])
     drain_until_ping_or_close(socket, 22)
     elapsed = System.monotonic_time(:millisecond) - started
 
@@ -130,16 +132,14 @@ defmodule FerricstoreServer.Native.LaneBarrierReviewTest do
     :erlang.trace(connection_pid, true, [:call])
     on_exit(fn -> :erlang.trace_pattern({Lane, :barrier, 1}, false, [:global]) end)
 
-    send_frames(socket, [ping(0, 30)])
+    send_frames(socket, [set_name(0, 30)])
     assert response(socket) == {0, 30, 0}
     disable_call_trace(connection_pid)
 
     assert Enum.count(collect_calls(connection_pid), &match?({:barrier, _}, &1)) == 0
   end
 
-  test "an ACL invalidation during a barrier still emits AUTH_INVALIDATED", %{
-    keys: [_, key, _]
-  } do
+  test "an ACL invalidation during a barrier still emits AUTH_INVALIDATED" do
     existing = connection_pids()
     socket = connect()
     connection_pid = wait_for_new_connection(existing)
@@ -157,7 +157,7 @@ defmodule FerricstoreServer.Native.LaneBarrierReviewTest do
 
     send_frames(socket, [
       command(1, 41, "DEBUG", ["SLEEP", "1"]),
-      command(1, 42, "WATCH", [key])
+      set_name(0, 42)
     ])
 
     Process.sleep(200)
@@ -257,6 +257,103 @@ defmodule FerricstoreServer.Native.LaneBarrierReviewTest do
     assert busy != 0
   end
 
+  test "pipelined frames on a busy lane classify each command once", %{keys: [_, key, _]} do
+    assert :ok = FerricStore.set(key, "value")
+    existing = connection_pids()
+    socket = connect()
+    connection_pid = wait_for_new_connection(existing)
+
+    :erlang.trace_pattern({Codec, :peek_command_name, 2}, true, [:global])
+    :erlang.trace(connection_pid, true, [:call])
+    on_exit(fn -> :erlang.trace_pattern({Codec, :peek_command_name, 2}, false, [:global]) end)
+
+    send_frames(socket, for(id <- 1..20, do: command(1, id, "GET", [key])))
+    Enum.each(1..20, fn _ -> response(socket) end)
+    disable_call_trace(connection_pid)
+
+    peeks = Enum.count(collect_calls(connection_pid), &match?({:peek_command_name, _}, &1))
+    assert peeks <= 20, "classified 20 frames with #{peeks} command-name peeks"
+  end
+
+  test "a barrier stops reading once a complete frame is buffered", %{keys: [_, key, _]} do
+    assert :ok = FerricStore.set(key, "value")
+    existing = connection_pids()
+    socket = connect()
+    connection_pid = wait_for_new_connection(existing)
+
+    send_frames(socket, [command(1, 90, "DEBUG", ["SLEEP", "1"]), set_name(0, 91)])
+    Process.sleep(100)
+
+    :erlang.trace_pattern({Connection, :continue_lane_barrier_data, 6}, true, [:local])
+    :erlang.trace(connection_pid, true, [:call])
+
+    on_exit(fn ->
+      :erlang.trace_pattern({Connection, :continue_lane_barrier_data, 6}, false, [:local])
+    end)
+
+    for id <- 92..94 do
+      send_frames(socket, [command(2, id, "GET", [key])])
+      Process.sleep(50)
+    end
+
+    responses = Enum.map(1..5, fn _ -> response(socket) end)
+    disable_call_trace(connection_pid)
+
+    assert Enum.sort(lane_ids(responses, 2)) == [92, 93, 94]
+    barrier_reads = Enum.count(collect_calls(connection_pid))
+    assert barrier_reads == 1, "barrier read #{barrier_reads} packets after a frame was ready"
+  end
+
+  test "heartbeat and flow-control frames answer while a data lane is busy" do
+    socket = connect()
+
+    send_frames(socket, [
+      command(1, 100, "DEBUG", ["SLEEP", "1"]),
+      ping(0, 101),
+      Codec.encode_frame(
+        @window_update_opcode,
+        0,
+        102,
+        Codec.encode_value(%{"max_inflight_per_lane" => 64})
+      )
+    ])
+
+    started = System.monotonic_time(:millisecond)
+    first_two = Enum.map(1..2, fn _ -> response(socket) end)
+    elapsed = System.monotonic_time(:millisecond) - started
+
+    assert Enum.sort(first_two) == [{0, 101, 0}, {0, 102, 0}]
+    assert elapsed < 500, "control replies waited #{elapsed}ms behind a busy lane"
+    assert response(socket) == {1, 100, 0}
+  end
+
+  test "deferred lanes are not rescanned for unrelated traffic", %{keys: [list, key, _]} do
+    assert :ok = FerricStore.set(key, "value")
+    existing = connection_pids()
+    socket = connect()
+    connection_pid = wait_for_new_connection(existing)
+
+    # Lane 1 parks a GET behind a BLPOP that never completes during the test.
+    send_frames(socket, [command(1, 1, "BLPOP", [list, "0"]), command(1, 2, "GET", [key])])
+    Process.sleep(100)
+
+    :erlang.trace_pattern({Connection, :drain_deferred_frames, 2}, true, [:local])
+    :erlang.trace(connection_pid, true, [:call])
+
+    on_exit(fn ->
+      :erlang.trace_pattern({Connection, :drain_deferred_frames, 2}, false, [:local])
+    end)
+
+    for id <- 10..49 do
+      send_frames(socket, [command(2, id, "GET", [key])])
+      assert response(socket) == {2, id, 0}
+    end
+
+    disable_call_trace(connection_pid)
+    drains = Enum.count(collect_calls(connection_pid))
+    assert drains <= 2, "rescanned the parked lane #{drains} times for unrelated traffic"
+  end
+
   defp connect do
     {:ok, socket} =
       :gen_tcp.connect({127, 0, 0, 1}, Listener.port(), [:binary, active: false], 2_000)
@@ -277,6 +374,16 @@ defmodule FerricstoreServer.Native.LaneBarrierReviewTest do
   end
 
   defp ping(lane, id), do: Codec.encode_frame(@ping_opcode, lane, id, "")
+
+  # CLIENT.SETNAME changes connection state, so it stays an ordered control frame.
+  defp set_name(lane, id),
+    do:
+      Codec.encode_frame(
+        @client_set_name_opcode,
+        lane,
+        id,
+        Codec.encode_value(%{"name" => "barrier-#{id}"})
+      )
 
   defp response(socket), do: socket |> read_frame(3_000) |> summarize()
 
@@ -325,7 +432,7 @@ defmodule FerricstoreServer.Native.LaneBarrierReviewTest do
 
   defp collect_calls(pid, acc \\ []) do
     receive do
-      {:trace, ^pid, :call, {_module, function, [arg]}} ->
+      {:trace, ^pid, :call, {_module, function, [arg | _]}} ->
         collect_calls(pid, [{function, arg} | acc])
     after
       100 -> Enum.reverse(acc)
