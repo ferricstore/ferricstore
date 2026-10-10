@@ -5,6 +5,10 @@ defmodule FerricstoreServer.Native.Connection.Chunks do
 
   @flag_compressed 0x08
   @flag_more_chunks 0x20
+  @fragment_metadata_bytes 64
+
+  @doc false
+  def retained_metadata_bytes(state), do: Map.get(state, :pending_chunk_metadata_bytes, 0)
 
   def reassemble(frame, state) do
     key = chunk_key(frame)
@@ -27,7 +31,9 @@ defmodule FerricstoreServer.Native.Connection.Chunks do
             start_pending_chunk(state, key, flags(frame), body(frame))
         end
 
-      {{:ok, {stored_flags, chunks, total_size, stream_token, bytes_token, deadline_ms}}, true} ->
+      {{:ok,
+        {stored_flags, chunks, total_size, stream_token, bytes_token, deadline_ms, fragment_count}},
+       true} ->
         previous_size = total_size
         total_size = total_size + byte_size(body(frame))
 
@@ -39,7 +45,8 @@ defmodule FerricstoreServer.Native.Connection.Chunks do
             state,
             key,
             stored_flags,
-            [body(frame) | chunks],
+            append_fragment(chunks, body(frame)),
+            fragment_count + fragment_increment(body(frame)),
             total_size,
             previous_size,
             stream_token,
@@ -48,7 +55,9 @@ defmodule FerricstoreServer.Native.Connection.Chunks do
           )
         end
 
-      {{:ok, {stored_flags, chunks, total_size, _stream_token, bytes_token, _deadline_ms}}, false} ->
+      {{:ok,
+        {stored_flags, chunks, total_size, _stream_token, bytes_token, _deadline_ms,
+         _fragment_count}}, false} ->
         previous_size = total_size
         total_size = total_size + byte_size(body(frame))
 
@@ -182,7 +191,8 @@ defmodule FerricstoreServer.Native.Connection.Chunks do
                  state,
                  key,
                  flags,
-                 [body],
+                 append_fragment([], body),
+                 fragment_increment(body),
                  total_size,
                  0,
                  stream_token,
@@ -206,6 +216,7 @@ defmodule FerricstoreServer.Native.Connection.Chunks do
          key,
          flags,
          chunks,
+         fragment_count,
          total_size,
          previous_size,
          stream_token,
@@ -230,6 +241,7 @@ defmodule FerricstoreServer.Native.Connection.Chunks do
            key,
            flags,
            chunks,
+           fragment_count,
            total_size,
            previous_size,
            stream_token,
@@ -244,6 +256,7 @@ defmodule FerricstoreServer.Native.Connection.Chunks do
          key,
          flags,
          chunks,
+         fragment_count,
          total_size,
          previous_size,
          stream_token,
@@ -262,24 +275,29 @@ defmodule FerricstoreServer.Native.Connection.Chunks do
           Map.put(
             state.chunk_buffers,
             key,
-            {flags, chunks, total_size, stream_token, bytes_token, deadline_ms}
+            {flags, chunks, total_size, stream_token, bytes_token, deadline_ms, fragment_count}
           ),
         pending_chunk_bytes: state.pending_chunk_bytes - previous_size + total_size,
         chunk_assembly_deadline_ms: chunk_assembly_deadline_ms
     }
+    |> Map.put(
+      :pending_chunk_metadata_bytes,
+      retained_metadata_bytes(state) +
+        if(total_size > previous_size, do: @fragment_metadata_bytes, else: 0)
+    )
   end
 
   defp drop_chunk(state, key, size) do
-    dropped_deadline =
+    {dropped_deadline, dropped_count} =
       case Map.get(state.chunk_buffers, key) do
-        {_flags, _chunks, _total_size, stream_token, bytes_token, deadline_ms} ->
+        {_flags, _chunks, _total_size, stream_token, bytes_token, deadline_ms, fragment_count} ->
           budget = resource_budget(state)
           ResourceBudget.release(budget, bytes_token)
           ResourceBudget.release(budget, stream_token)
-          deadline_ms
+          {deadline_ms, fragment_count}
 
         nil ->
-          nil
+          {nil, 0}
       end
 
     chunk_buffers = Map.delete(state.chunk_buffers, key)
@@ -291,6 +309,10 @@ defmodule FerricstoreServer.Native.Connection.Chunks do
         chunk_assembly_deadline_ms:
           next_chunk_assembly_deadline(state, chunk_buffers, dropped_deadline)
     }
+    |> Map.put(
+      :pending_chunk_metadata_bytes,
+      retained_metadata_bytes(state) - dropped_count * @fragment_metadata_bytes
+    )
   end
 
   defp next_chunk_assembly_deadline(_state, chunk_buffers, _dropped_deadline)
@@ -304,10 +326,15 @@ defmodule FerricstoreServer.Native.Connection.Chunks do
 
       _removed_or_missing ->
         Enum.reduce(chunk_buffers, nil, fn
-          {_key, {_flags, _chunks, _total_size, _stream_token, _bytes_token, deadline_ms}}, nil ->
+          {_key,
+           {_flags, _chunks, _total_size, _stream_token, _bytes_token, deadline_ms,
+            _fragment_count}},
+          nil ->
             deadline_ms
 
-          {_key, {_flags, _chunks, _total_size, _stream_token, _bytes_token, deadline_ms}},
+          {_key,
+           {_flags, _chunks, _total_size, _stream_token, _bytes_token, deadline_ms,
+            _fragment_count}},
           earliest ->
             min(earliest, deadline_ms)
         end)
@@ -315,6 +342,11 @@ defmodule FerricstoreServer.Native.Connection.Chunks do
   end
 
   defp resource_budget(state), do: Map.get(state, :resource_budget, ResourceBudget)
+
+  defp append_fragment(chunks, ""), do: chunks
+  defp append_fragment(chunks, body), do: [body | chunks]
+  defp fragment_increment(""), do: 0
+  defp fragment_increment(_body), do: 1
 
   defp lane_id({lane_id, _opcode, _request_id, _flags, _body}), do: lane_id
   defp opcode({_lane_id, opcode, _request_id, _flags, _body}), do: opcode

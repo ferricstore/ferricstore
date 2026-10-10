@@ -62,6 +62,18 @@ defmodule Ferricstore.Flow.Query.RecordOrderTest do
              RecordOrder.sort_key(oversized, [{:run_id, :asc}])
   end
 
+  test "checks bounded key lists in native order without changing tie semantics" do
+    ascending = [{1, "a"}, {1, "b"}, {2, "a"}]
+    descending = Enum.reverse(ascending)
+
+    assert RecordOrder.ordered?(ascending, :asc)
+    refute RecordOrder.ordered?(Enum.reverse(ascending), :asc)
+    assert RecordOrder.ordered?(descending, :desc)
+    refute RecordOrder.ordered?(Enum.reverse(descending), :desc)
+    assert RecordOrder.ordered?([], :asc)
+    assert RecordOrder.ordered?([hd(ascending)], :desc)
+  end
+
   defp record(id) do
     %{
       id: id,

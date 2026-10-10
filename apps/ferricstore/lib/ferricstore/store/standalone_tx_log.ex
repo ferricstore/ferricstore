@@ -101,6 +101,18 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     not is_nil(recovery_required_reason(data_dir))
   end
 
+  @doc """
+  Memory-only write fence for hot paths.
+
+  Shard startup loads any durable marker through `startup_recovery_reason/1`,
+  and `require_recovery/2` / `recover/1` keep the in-memory reason current, so
+  per-write fences need not stat the marker file.
+  """
+  @spec recovery_fenced?(binary()) :: boolean()
+  def recovery_fenced?(data_dir) when is_binary(data_dir) do
+    :persistent_term.get(recovery_key(data_dir), nil) != nil
+  end
+
   @spec recovery_required_reason(binary()) :: term() | nil
   def recovery_required_reason(data_dir) when is_binary(data_dir) do
     case :persistent_term.get(recovery_key(data_dir), :standalone_recovery_term_absent) do

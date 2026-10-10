@@ -62,6 +62,9 @@ defmodule Ferricstore.Stats do
   @counter_keys_with_expiry 10
 
   @hotness_table :ferricstore_hotness
+  @hotness_meta_table :ferricstore_hotness_meta
+  @hotness_overflow_marker :overflow
+  @hotness_overflow_prefix "_other"
   @max_tracked_prefixes 1000
   @max_named_prefixes @max_tracked_prefixes - 1
   @keyspace_hit_sample_acc {__MODULE__, :keyspace_hit_sample_acc}
@@ -754,6 +757,19 @@ defmodule Ferricstore.Stats do
         :ets.delete_all_objects(@hotness_table)
     end
 
+    case :ets.whereis(@hotness_meta_table) do
+      :undefined ->
+        :ets.new(@hotness_meta_table, [
+          :set,
+          :protected,
+          :named_table,
+          {:read_concurrency, true}
+        ])
+
+      _ref ->
+        :ets.delete_all_objects(@hotness_meta_table)
+    end
+
     {:ok, %{hotness_slots: 0}}
   end
 
@@ -764,20 +780,24 @@ defmodule Ferricstore.Stats do
         {:reply, prefix, state}
 
       [] when state.hotness_slots < @max_named_prefixes ->
-        if :ets.insert_new(@hotness_table, {prefix, 0, 0}) do
-          {:reply, prefix, %{state | hotness_slots: state.hotness_slots + 1}}
+        detached_prefix = :binary.copy(prefix)
+
+        if :ets.insert_new(@hotness_table, {detached_prefix, 0, 0}) do
+          {:reply, detached_prefix, %{state | hotness_slots: state.hotness_slots + 1}}
         else
           {:reply, prefix, state}
         end
 
       [] ->
-        {:reply, "_other", state}
+        ensure_overflow_bucket()
+        {:reply, @hotness_overflow_prefix, state}
     end
   end
 
   @impl true
   def handle_call(:reset_hotness_table, _from, state) do
     :ets.delete_all_objects(@hotness_table)
+    :ets.delete_all_objects(@hotness_meta_table)
     {:reply, :ok, %{state | hotness_slots: 0}}
   end
 
@@ -890,12 +910,16 @@ defmodule Ferricstore.Stats do
           prefix
 
         [] ->
-          GenServer.call(__MODULE__, {:resolve_hotness_prefix, prefix})
+          if overflow_active?() do
+            @hotness_overflow_prefix
+          else
+            GenServer.call(__MODULE__, {:resolve_hotness_prefix, prefix})
+          end
       end
     rescue
-      ArgumentError -> "_other"
+      ArgumentError -> @hotness_overflow_prefix
     catch
-      :exit, _reason -> "_other"
+      :exit, _reason -> @hotness_overflow_prefix
     end
   end
 
@@ -904,12 +928,14 @@ defmodule Ferricstore.Stats do
       nil ->
         try do
           :ets.delete_all_objects(@hotness_table)
+          :ets.delete_all_objects(@hotness_meta_table)
         rescue
           ArgumentError -> :ok
         end
 
       pid when pid == self() ->
         :ets.delete_all_objects(@hotness_table)
+        :ets.delete_all_objects(@hotness_meta_table)
 
       _pid ->
         GenServer.call(__MODULE__, :reset_hotness_table)
@@ -917,11 +943,26 @@ defmodule Ferricstore.Stats do
   end
 
   # Atomically increments either the hot or cold counter for a prefix.
-  # Uses :ets.update_counter with a default for atomic upsert.
+  # Named rows are allocated only by the Stats owner. Avoid upserting them so a
+  # reset racing with a caller's resolve step cannot recreate an unowned row.
+  # The shared overflow bucket is also the fallback when the owner is
+  # unreachable, so it may be created here rather than dropping the read.
   @spec update_hotness(binary(), :hot | :cold) :: :ok
+  defp update_hotness(@hotness_overflow_prefix = prefix, kind) do
+    position = if kind == :hot, do: 2, else: 3
+
+    try do
+      :ets.update_counter(@hotness_table, prefix, {position, 1}, {prefix, 0, 0})
+    rescue
+      ArgumentError -> :ok
+    end
+
+    :ok
+  end
+
   defp update_hotness(prefix, :hot) do
     try do
-      :ets.update_counter(@hotness_table, prefix, {2, 1}, {prefix, 0, 0})
+      :ets.update_counter(@hotness_table, prefix, {2, 1})
     rescue
       ArgumentError -> :ok
     end
@@ -931,12 +972,36 @@ defmodule Ferricstore.Stats do
 
   defp update_hotness(prefix, :cold) do
     try do
-      :ets.update_counter(@hotness_table, prefix, {3, 1}, {prefix, 0, 0})
+      :ets.update_counter(@hotness_table, prefix, {3, 1})
     rescue
       ArgumentError -> :ok
     end
 
     :ok
+  end
+
+  defp overflow_active? do
+    :ets.member(@hotness_meta_table, @hotness_overflow_marker)
+  rescue
+    ArgumentError -> false
+  end
+
+  defp ensure_overflow_bucket do
+    case :ets.insert_new(@hotness_table, {@hotness_overflow_prefix, 0, 0}) do
+      true ->
+        :ets.insert(@hotness_meta_table, {@hotness_overflow_marker, true})
+
+      false ->
+        case :ets.lookup(@hotness_table, @hotness_overflow_prefix) do
+          [{@hotness_overflow_prefix, _, _}] ->
+            :ets.insert(@hotness_meta_table, {@hotness_overflow_marker, true})
+
+          [] ->
+            :ok
+        end
+    end
+  rescue
+    ArgumentError -> :ok
   end
 
   # Checks if the current active connection count crosses the 80% or 95%

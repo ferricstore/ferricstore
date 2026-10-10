@@ -39,6 +39,33 @@ Requests may be pipelined. Responses carry the same `lane_id` and
 `request_id`. Responses may arrive out of order across lanes, but order is
 preserved within one lane.
 
+Session frames, ordered rejections such as `lane_queue_full`, and frame errors
+on a busy data lane are deferred behind that lane's earlier work instead of
+blocking the connection, so an earlier data response cannot be overtaken and
+other data lanes keep dispatching. Pending deferred rejections are bounded by
+the connection inflight limit; past that bound, or when a deferred session frame
+cannot be admitted, the frame waits on a lane-local completion barrier instead.
+
+Control frames use a barrier across active data lanes, including lane work
+deferred behind them, but not work waiting on a blocking command. Barriers are
+bounded as a whole by `native_lane_barrier_timeout_ms` (default `15000` ms), and
+never extend an active frame or chunk assembly deadline. If a lane terminates,
+the peer disconnects, or the barrier deadline expires, the connection closes
+after already-ordered responses; work already submitted to the native engine is
+not implicitly canceled.
+
+Blocking session commands on a data lane run in a worker. Later frames on that
+same lane wait for the worker's response or termination before dispatch, while
+frames on other data lanes continue independently. A worker timeout or failure
+therefore releases the lane in order and does not silently cancel work already
+submitted to the native engine.
+
+Deferred frames share the configured connection and lane inflight and queued-byte
+limits with ordinary requests, including deferred session frames. Their retained
+payload and queue metadata also count against inbound memory admission. If an
+ordered deferred request cannot be admitted, the connection closes rather than
+sending a rejection ahead of an earlier blocked response.
+
 Version follows Cassandra's useful direction-bit pattern:
 
 ```text
@@ -933,6 +960,7 @@ Operator tuning:
 FERRICSTORE_NATIVE_MAX_FRAME_BYTES
 FERRICSTORE_NATIVE_UNAUTHENTICATED_MAX_FRAME_BYTES
 FERRICSTORE_NATIVE_FRAME_ASSEMBLY_TIMEOUT_MS
+FERRICSTORE_NATIVE_LANE_BARRIER_TIMEOUT_MS
 FERRICSTORE_NATIVE_SEND_TIMEOUT_MS
 FERRICSTORE_NATIVE_MAX_VALUE_ITEMS
 FERRICSTORE_NATIVE_MAX_VALUE_DEPTH

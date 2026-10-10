@@ -764,7 +764,7 @@ defmodule Ferricstore.Store.Shard.Routing do
       defp clear_standalone_recovery_fence(state), do: state
 
       defp standalone_recovery_fenced?(%{data_dir: data_dir}) do
-        Ferricstore.Store.StandaloneTxLog.recovery_required?(data_dir)
+        Ferricstore.Store.StandaloneTxLog.recovery_fenced?(data_dir)
       end
 
       defp standalone_recovery_fenced?(_state), do: false

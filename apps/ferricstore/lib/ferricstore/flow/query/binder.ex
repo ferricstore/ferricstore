@@ -99,8 +99,7 @@ defmodule Ferricstore.Flow.Query.Binder do
 
     cond do
       not Enum.all?(provided_names, &is_binary/1) -> {:error, :invalid_parameters}
-      Enum.any?(expected_names, &(&1 not in provided_names)) -> {:error, :missing_parameter}
-      Enum.any?(provided_names, &(&1 not in expected_names)) -> {:error, :unexpected_parameter}
+      Enum.any?(expected_names, &(not Map.has_key?(params, &1))) -> {:error, :missing_parameter}
       true -> :ok
     end
   end

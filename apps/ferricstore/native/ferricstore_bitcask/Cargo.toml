@@ -28,6 +28,10 @@ nif_version_2_15 = ["rustler/nif_version_2_15"]
 nif_version_2_16 = ["rustler/nif_version_2_16"]
 nif_version_2_17 = ["rustler/nif_version_2_17"]
 
+[[bench]]
+name = "prefix_merge_cpu"
+harness = false
+
 [dev-dependencies]
 tempfile = "3"
 

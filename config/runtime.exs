@@ -519,6 +519,8 @@ if config_env() == :prod do
       ),
     native_frame_assembly_timeout_ms:
       String.to_integer(System.get_env("FERRICSTORE_NATIVE_FRAME_ASSEMBLY_TIMEOUT_MS", "15000")),
+    native_lane_barrier_timeout_ms:
+      positive_integer_env.("FERRICSTORE_NATIVE_LANE_BARRIER_TIMEOUT_MS", 15_000),
     native_send_timeout_ms: positive_integer_env.("FERRICSTORE_NATIVE_SEND_TIMEOUT_MS", 15_000),
     native_max_value_items:
       String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_VALUE_ITEMS", "100000")),

@@ -1185,11 +1185,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
                           {:standalone_tx_abort_recovery_required, journal_txid, reason}
                       end
 
-                    :ok =
-                      Ferricstore.Store.StandaloneTxLog.require_recovery(
-                        state.data_dir,
-                        recovery_reason
-                      )
+                    recovery_reason = require_standalone_recovery(state, recovery_reason)
 
                     {:error, {:cross_shard_compensation_failed, recovery_reason},
                      compensated_state}
@@ -1205,11 +1201,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
                     {:standalone_tx_compensation_recovery_required, journal_txid,
                      compensation_reason}
 
-                  :ok =
-                    Ferricstore.Store.StandaloneTxLog.require_recovery(
-                      state.data_dir,
-                      recovery_reason
-                    )
+                  recovery_reason = require_standalone_recovery(state, recovery_reason)
 
                   {:error, {:cross_shard_compensation_failed, recovery_reason}, compensated_state}
                 else
@@ -1397,10 +1389,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
       defp prepare_standalone_cross_shard_journal(state, true, groups) do
         originals = Process.get(:sm_cross_shard_pending_originals, %{})
 
-        with {:ok, undo_groups} <- cross_shard_undo_groups(state, groups, originals),
-             {:ok, txid} <-
-               Ferricstore.Store.StandaloneTxLog.prepare(state.data_dir, undo_groups) do
-          {:ok, txid}
+        # prepare/2 fences recovery itself when rollback leaves journal state unknown.
+        with {:ok, undo_groups} <- cross_shard_undo_groups(state, groups, originals) do
+          Ferricstore.Store.StandaloneTxLog.prepare(state.data_dir, undo_groups)
+        end
+      end
+
+      defp require_standalone_recovery(state, recovery_reason) do
+        case Ferricstore.Store.StandaloneTxLog.require_recovery(
+               state.data_dir,
+               recovery_reason
+             ) do
+          :ok ->
+            recovery_reason
+
+          {:error, marker_reason} ->
+            {:standalone_recovery_marker_failed, recovery_reason, marker_reason}
         end
       end
 

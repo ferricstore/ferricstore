@@ -57,6 +57,671 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
     assert receive_response_ids(socket, @frame_count) == Enum.to_list(1..@frame_count)
   end
 
+  test "preserves FIFO when a data frame precedes a session frame on one lane" do
+    key = "native:lane:session-barrier:#{System.unique_integer([:positive, :monotonic])}"
+    assert :ok = FerricStore.set(key, "value")
+    on_exit(fn -> FerricStore.del(key) end)
+
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    requests =
+      [
+        Codec.encode_frame(
+          @get_opcode,
+          1,
+          100,
+          Codec.encode_value(%{"key" => key})
+        ),
+        Codec.encode_frame(
+          @command_exec_opcode,
+          1,
+          101,
+          Codec.encode_value(%{"command" => "MULTI", "args" => []})
+        )
+      ]
+      |> IO.iodata_to_binary()
+
+    assert :ok = :gen_tcp.send(socket, requests)
+    assert receive_response_statuses(socket, 2) == [{100, 0}, {101, 0}]
+  end
+
+  test "flushes a synchronous session response before following data on one lane" do
+    key = "native:lane:session-followed-by-data:#{System.unique_integer([:positive, :monotonic])}"
+    assert :ok = FerricStore.set(key, "value")
+    on_exit(fn -> FerricStore.del(key) end)
+
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    requests =
+      [
+        command_exec_frame_on_lane(1, 101, "WATCH", [key]),
+        Codec.encode_frame(
+          @get_opcode,
+          1,
+          102,
+          Codec.encode_value(%{"key" => key})
+        )
+      ]
+      |> IO.iodata_to_binary()
+
+    assert :ok = :gen_tcp.send(socket, requests)
+    assert receive_response_statuses(socket, 2) == [{101, 0}, {102, 0}]
+  end
+
+  test "orders multiple session and control frames around one lane batch" do
+    key =
+      "native:lane:session-control-interleave:#{System.unique_integer([:positive, :monotonic])}"
+
+    assert :ok = FerricStore.set(key, "value")
+    on_exit(fn -> FerricStore.del(key) end)
+
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    requests =
+      [
+        Codec.encode_frame(
+          @get_opcode,
+          1,
+          103,
+          Codec.encode_value(%{"key" => key})
+        ),
+        command_exec_frame_on_lane(1, 104, "MULTI", []),
+        command_exec_frame_on_lane(1, 105, "EXEC", []),
+        Codec.encode_frame(@ping_opcode, 0, 106, ""),
+        Codec.encode_frame(
+          @get_opcode,
+          1,
+          107,
+          Codec.encode_value(%{"key" => key})
+        )
+      ]
+      |> IO.iodata_to_binary()
+
+    assert :ok = :gen_tcp.send(socket, requests)
+
+    assert receive_response_statuses(socket, 5) == [
+             {103, 0},
+             {104, 0},
+             {105, 0},
+             {106, 0},
+             {107, 0}
+           ]
+  end
+
+  @tag :native_lane_barrier
+  test "waits for a blocking session command before later same-lane work" do
+    list_key = "native:lane:blocking-fifo:list:#{System.unique_integer([:positive, :monotonic])}"
+
+    counter_key =
+      "native:lane:blocking-fifo:counter:#{System.unique_integer([:positive, :monotonic])}"
+
+    get_key = "native:lane:blocking-fifo:get:#{System.unique_integer([:positive, :monotonic])}"
+    assert :ok = FerricStore.set(counter_key, "0")
+    assert :ok = FerricStore.set(get_key, "value")
+
+    on_exit(fn ->
+      FerricStore.del(list_key)
+      FerricStore.del(counter_key)
+      FerricStore.del(get_key)
+    end)
+
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    requests =
+      [
+        command_exec_frame_on_lane(1, 200, "BLPOP", [list_key, "5"]),
+        Codec.encode_frame(
+          @get_opcode,
+          1,
+          202,
+          Codec.encode_value(%{"key" => get_key})
+        ),
+        command_exec_frame_on_lane(2, 201, "INCR", [counter_key]),
+        command_exec_frame_on_lane(2, 204, "RPUSH", [list_key, "item"]),
+        command_exec_frame_on_lane(1, 203, "MULTI", [])
+      ]
+      |> IO.iodata_to_binary()
+
+    assert :ok = :gen_tcp.send(socket, requests)
+    responses = receive_response_statuses(socket, 5)
+
+    assert Enum.sort(Enum.map(responses, &elem(&1, 0))) == [200, 201, 202, 203, 204]
+
+    assert Enum.filter(responses, fn {request_id, _status} -> request_id in [200, 202, 203] end) ==
+             [{200, 0}, {202, 0}, {203, 0}]
+
+    assert FerricStore.get(counter_key) == {:ok, "1"}
+    assert FerricStore.llen(list_key) == {:ok, 0}
+  end
+
+  @tag :native_deferred_admission
+  test "deferred frames honor queued request byte caps" do
+    previous_connection_limit =
+      Application.get_env(:ferricstore, :native_max_queued_request_bytes_per_connection)
+
+    previous_lane_limit =
+      Application.get_env(:ferricstore, :native_max_queued_request_bytes_per_lane)
+
+    get_body = Codec.encode_value(%{"key" => "native:deferred-admission:key"})
+    get_bytes = FrameBuffer.retained_frame_bytes(byte_size(get_body))
+    cap = get_bytes * 2
+    generous_cap = get_bytes * 8
+
+    on_exit(fn ->
+      restore_env(:native_max_queued_request_bytes_per_connection, previous_connection_limit)
+      restore_env(:native_max_queued_request_bytes_per_lane, previous_lane_limit)
+    end)
+
+    for {connection_cap, lane_cap} <- [{cap, generous_cap}, {generous_cap, cap}] do
+      Application.put_env(
+        :ferricstore,
+        :native_max_queued_request_bytes_per_connection,
+        connection_cap
+      )
+
+      Application.put_env(:ferricstore, :native_max_queued_request_bytes_per_lane, lane_cap)
+
+      list_key =
+        "native:deferred-admission:list:#{System.unique_integer([:positive, :monotonic])}"
+
+      socket = connect()
+      on_exit(fn -> :gen_tcp.close(socket) end)
+
+      requests =
+        [
+          command_exec_frame_on_lane(1, 510, "BLPOP", [list_key, "5"]),
+          Codec.encode_frame(@get_opcode, 1, 511, get_body),
+          Codec.encode_frame(@get_opcode, 1, 512, get_body),
+          Codec.encode_frame(@get_opcode, 1, 513, get_body)
+        ]
+        |> IO.iodata_to_binary()
+
+      assert :ok = :gen_tcp.send(socket, requests)
+      assert_socket_closed(socket)
+    end
+  end
+
+  @tag :native_deferred_admission
+  test "replayed deferred frames transfer queued byte reservations once" do
+    previous_connection_limit =
+      Application.get_env(:ferricstore, :native_max_queued_request_bytes_per_connection)
+
+    previous_lane_limit =
+      Application.get_env(:ferricstore, :native_max_queued_request_bytes_per_lane)
+
+    list_key = "native:deferred-replay:list:#{System.unique_integer([:positive, :monotonic])}"
+    get_key = "native:deferred-replay:value:#{System.unique_integer([:positive, :monotonic])}"
+    get_body = Codec.encode_value(%{"key" => get_key})
+    get_bytes = FrameBuffer.retained_frame_bytes(byte_size(get_body))
+    cap = get_bytes * 2
+
+    Application.put_env(:ferricstore, :native_max_queued_request_bytes_per_connection, cap)
+    Application.put_env(:ferricstore, :native_max_queued_request_bytes_per_lane, cap)
+
+    on_exit(fn ->
+      restore_env(:native_max_queued_request_bytes_per_connection, previous_connection_limit)
+      restore_env(:native_max_queued_request_bytes_per_lane, previous_lane_limit)
+    end)
+
+    assert :ok = FerricStore.set(get_key, "value")
+    on_exit(fn -> FerricStore.del(get_key) end)
+
+    existing_connections = connection_pids()
+    socket = connect()
+    connection_pid = wait_for_new_connection(existing_connections)
+    pusher = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+    on_exit(fn -> :gen_tcp.close(pusher) end)
+
+    requests =
+      [
+        command_exec_frame_on_lane(1, 514, "BLPOP", [list_key, "5"]),
+        Codec.encode_frame(@get_opcode, 1, 515, get_body),
+        Codec.encode_frame(@get_opcode, 1, 516, get_body)
+      ]
+      |> IO.iodata_to_binary()
+
+    assert :ok = :gen_tcp.send(socket, requests)
+    assert eventually(fn -> Ferricstore.Waiters.count(list_key) == 1 end)
+
+    assert :ok =
+             :gen_tcp.send(
+               pusher,
+               command_exec_frame_on_lane(1, 517, "RPUSH", [list_key, "item"])
+             )
+
+    assert [{517, 0}] = receive_response_statuses(pusher, 1)
+    assert receive_response_statuses(socket, 3) == [{514, 0}, {515, 0}, {516, 0}]
+
+    expected = %{
+      inflight_total: 0,
+      lane_inflight: %{},
+      queued_request_bytes: 0,
+      lane_queued_request_bytes: %{},
+      deferred_inflight_total: 0,
+      deferred_lane_inflight: %{},
+      deferred_queued_request_bytes: 0,
+      deferred_lane_queued_request_bytes: %{},
+      deferred_frame_metadata_bytes: 0,
+      deferred_frames: %{}
+    }
+
+    snapshot = fn ->
+      {:dictionary, dictionary} = Process.info(connection_pid, :dictionary)
+
+      dictionary
+      |> Keyword.fetch!(:native_connection_cleanup_state)
+      |> Map.take(Map.keys(expected))
+    end
+
+    eventually(fn -> snapshot.() == expected end)
+    assert snapshot.() == expected
+  end
+
+  @tag :native_deferred_admission
+  test "same-lane blocking work at the inflight cap cannot overtake" do
+    previous_lane_limit = Application.get_env(:ferricstore, :native_max_inflight_per_lane)
+    Application.put_env(:ferricstore, :native_max_inflight_per_lane, 1)
+
+    on_exit(fn ->
+      restore_env(:native_max_inflight_per_lane, previous_lane_limit)
+    end)
+
+    suffix = System.unique_integer([:positive, :monotonic])
+    first_list = "native:deferred-inflight:first:#{suffix}"
+    second_list = "native:deferred-inflight:second:#{suffix}"
+
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    requests =
+      [
+        command_exec_frame_on_lane(1, 520, "BLPOP", [first_list, "5"]),
+        command_exec_frame_on_lane(1, 521, "BLPOP", [second_list, "5"])
+      ]
+      |> IO.iodata_to_binary()
+
+    assert :ok = :gen_tcp.send(socket, requests)
+    assert_socket_closed(socket)
+  end
+
+  @tag :native_deferred_admission
+  test "deferred session frames honor queued request byte caps" do
+    previous_connection_limit =
+      Application.get_env(:ferricstore, :native_max_queued_request_bytes_per_connection)
+
+    previous_lane_limit =
+      Application.get_env(:ferricstore, :native_max_queued_request_bytes_per_lane)
+
+    watch_body =
+      Codec.encode_value(%{
+        "command" => "WATCH",
+        "args" => [String.duplicate("native:deferred-watch:", 8)]
+      })
+
+    watch_bytes = FrameBuffer.retained_frame_bytes(byte_size(watch_body))
+
+    Application.put_env(
+      :ferricstore,
+      :native_max_queued_request_bytes_per_connection,
+      watch_bytes
+    )
+
+    Application.put_env(:ferricstore, :native_max_queued_request_bytes_per_lane, watch_bytes)
+
+    on_exit(fn ->
+      restore_env(:native_max_queued_request_bytes_per_connection, previous_connection_limit)
+      restore_env(:native_max_queued_request_bytes_per_lane, previous_lane_limit)
+    end)
+
+    list_key = "native:deferred-watch:list:#{System.unique_integer([:positive, :monotonic])}"
+
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    requests =
+      [
+        command_exec_frame_on_lane(1, 530, "BLPOP", [list_key, "5"]),
+        Codec.encode_frame(@command_exec_opcode, 1, 531, watch_body),
+        Codec.encode_frame(@command_exec_opcode, 1, 532, watch_body)
+      ]
+      |> IO.iodata_to_binary()
+
+    assert :ok = :gen_tcp.send(socket, requests)
+    assert_socket_closed(socket)
+  end
+
+  @tag :native_inflight_gate
+  test "orders a synchronous inflight error after earlier lane work" do
+    previous_lane_limit = Application.get_env(:ferricstore, :native_max_inflight_per_lane)
+    Application.put_env(:ferricstore, :native_max_inflight_per_lane, 1)
+
+    on_exit(fn ->
+      restore_env(:native_max_inflight_per_lane, previous_lane_limit)
+    end)
+
+    key = "native:lane:sync-error:#{System.unique_integer([:positive, :monotonic])}"
+    assert :ok = FerricStore.set(key, "value")
+    on_exit(fn -> FerricStore.del(key) end)
+
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    requests =
+      [
+        Codec.encode_frame(
+          @get_opcode,
+          1,
+          110,
+          Codec.encode_value(%{"key" => key})
+        ),
+        Codec.encode_frame(
+          @get_opcode,
+          1,
+          111,
+          Codec.encode_value(%{"key" => key})
+        )
+      ]
+      |> IO.iodata_to_binary()
+
+    assert :ok = :gen_tcp.send(socket, requests)
+    assert receive_response_statuses(socket, 2) == [{110, 0}, {111, 4}]
+  end
+
+  test "waits only for the session lane while draining another lane" do
+    key = "native:lane:independent:#{System.unique_integer([:positive, :monotonic])}"
+    assert :ok = FerricStore.set(key, "value")
+    on_exit(fn -> FerricStore.del(key) end)
+
+    existing_pids = connection_pids()
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+    connection_pid = wait_for_new_connection(existing_pids)
+
+    assert :ok =
+             :gen_tcp.send(
+               socket,
+               Codec.encode_frame(
+                 @get_opcode,
+                 1,
+                 120,
+                 Codec.encode_value(%{"key" => key})
+               )
+             )
+
+    assert [{120, 0}] = receive_response_statuses(socket, 1)
+    lane_pid = wait_for_lane(connection_pid, 1)
+    :erlang.suspend_process(lane_pid)
+
+    on_exit(fn ->
+      if Process.alive?(lane_pid) and Process.info(lane_pid, :status) == {:status, :suspended} do
+        :erlang.resume_process(lane_pid)
+      end
+    end)
+
+    requests =
+      [
+        Codec.encode_frame(
+          @get_opcode,
+          1,
+          121,
+          Codec.encode_value(%{"key" => key})
+        ),
+        Codec.encode_frame(
+          @get_opcode,
+          2,
+          122,
+          Codec.encode_value(%{"key" => key})
+        ),
+        command_exec_frame_on_lane(1, 123, "WATCH", [key])
+      ]
+      |> IO.iodata_to_binary()
+
+    assert :ok = :gen_tcp.send(socket, requests)
+    assert [{122, 0}] = receive_response_statuses(socket, 1)
+
+    :erlang.resume_process(lane_pid)
+    assert receive_response_statuses(socket, 2) == [{121, 0}, {123, 0}]
+  end
+
+  @tag :native_lane_barrier
+  test "buffers a later pipelined write while waiting on a lane barrier" do
+    key = "native:lane:pipelined-barrier:#{System.unique_integer([:positive, :monotonic])}"
+    assert :ok = FerricStore.set(key, "value")
+    on_exit(fn -> FerricStore.del(key) end)
+
+    existing_pids = connection_pids()
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+    connection_pid = wait_for_new_connection(existing_pids)
+
+    assert :ok =
+             :gen_tcp.send(
+               socket,
+               Codec.encode_frame(
+                 @get_opcode,
+                 1,
+                 150,
+                 Codec.encode_value(%{"key" => key})
+               )
+             )
+
+    assert [{150, 0}] = receive_response_statuses(socket, 1)
+    lane_pid = wait_for_lane(connection_pid, 1)
+    :erlang.suspend_process(lane_pid)
+
+    on_exit(fn ->
+      if Process.alive?(lane_pid) and Process.info(lane_pid, :status) == {:status, :suspended} do
+        :erlang.resume_process(lane_pid)
+      end
+    end)
+
+    assert :ok =
+             :gen_tcp.send(
+               socket,
+               [
+                 Codec.encode_frame(
+                   @get_opcode,
+                   1,
+                   151,
+                   Codec.encode_value(%{"key" => key})
+                 ),
+                 command_exec_frame_on_lane(1, 152, "WATCH", [key])
+               ]
+             )
+
+    Process.sleep(20)
+
+    assert :ok =
+             :gen_tcp.send(
+               socket,
+               Codec.encode_frame(
+                 @get_opcode,
+                 1,
+                 153,
+                 Codec.encode_value(%{"key" => key})
+               )
+             )
+
+    Process.sleep(20)
+    :erlang.resume_process(lane_pid)
+    assert receive_response_statuses(socket, 3) == [{151, 0}, {152, 0}, {153, 0}]
+  end
+
+  @tag :native_lane_barrier
+  test "closes when a lane terminates before its barrier" do
+    key = "native:lane:barrier-death:#{System.unique_integer([:positive, :monotonic])}"
+    assert :ok = FerricStore.set(key, "value")
+    on_exit(fn -> FerricStore.del(key) end)
+
+    existing_pids = connection_pids()
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+    connection_pid = wait_for_new_connection(existing_pids)
+
+    assert :ok =
+             :gen_tcp.send(
+               socket,
+               Codec.encode_frame(
+                 @get_opcode,
+                 1,
+                 160,
+                 Codec.encode_value(%{"key" => key})
+               )
+             )
+
+    assert [{160, 0}] = receive_response_statuses(socket, 1)
+    lane_pid = wait_for_lane(connection_pid, 1)
+    :erlang.suspend_process(lane_pid)
+
+    on_exit(fn ->
+      if Process.alive?(lane_pid) and Process.info(lane_pid, :status) == {:status, :suspended} do
+        :erlang.resume_process(lane_pid)
+      end
+    end)
+
+    assert :ok =
+             :gen_tcp.send(
+               socket,
+               [
+                 Codec.encode_frame(
+                   @get_opcode,
+                   1,
+                   161,
+                   Codec.encode_value(%{"key" => key})
+                 ),
+                 command_exec_frame_on_lane(1, 162, "WATCH", [key])
+               ]
+             )
+
+    Process.sleep(20)
+    Process.exit(lane_pid, :kill)
+    assert_socket_closed(socket)
+    assert eventually(fn -> not Process.alive?(connection_pid) end)
+  end
+
+  @tag :native_lane_barrier
+  test "bounds a stalled lane barrier and cleans up its resources" do
+    previous_timeout = Application.get_env(:ferricstore, :native_lane_barrier_timeout_ms)
+    Application.put_env(:ferricstore, :native_lane_barrier_timeout_ms, 50)
+
+    on_exit(fn ->
+      restore_env(:native_lane_barrier_timeout_ms, previous_timeout)
+    end)
+
+    key = "native:lane:barrier-timeout:#{System.unique_integer([:positive, :monotonic])}"
+    assert :ok = FerricStore.set(key, "value")
+    on_exit(fn -> FerricStore.del(key) end)
+
+    existing_pids = connection_pids()
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+    connection_pid = wait_for_new_connection(existing_pids)
+
+    assert :ok =
+             :gen_tcp.send(
+               socket,
+               Codec.encode_frame(
+                 @get_opcode,
+                 1,
+                 130,
+                 Codec.encode_value(%{"key" => key})
+               )
+             )
+
+    assert [{130, 0}] = receive_response_statuses(socket, 1)
+    lane_pid = wait_for_lane(connection_pid, 1)
+    :erlang.suspend_process(lane_pid)
+
+    on_exit(fn ->
+      if Process.alive?(lane_pid) and Process.info(lane_pid, :status) == {:status, :suspended} do
+        :erlang.resume_process(lane_pid)
+      end
+    end)
+
+    assert :ok =
+             :gen_tcp.send(
+               socket,
+               [
+                 Codec.encode_frame(
+                   @get_opcode,
+                   1,
+                   131,
+                   Codec.encode_value(%{"key" => key})
+                 ),
+                 # Lane-local session frames defer behind the lane without
+                 # blocking the connection; control frames keep a bounded barrier.
+                 Codec.encode_frame(@ping_opcode, 0, 132, "")
+               ]
+             )
+
+    assert_socket_closed(socket)
+    assert eventually(fn -> not Process.alive?(connection_pid) end)
+    assert eventually(fn -> ResourceBudget.usage(ResourceBudget).lanes == 0 end)
+  end
+
+  @tag :native_lane_barrier
+  test "stops a pending lane barrier when the client disconnects" do
+    previous_timeout = Application.get_env(:ferricstore, :native_lane_barrier_timeout_ms)
+    Application.put_env(:ferricstore, :native_lane_barrier_timeout_ms, 5_000)
+
+    on_exit(fn ->
+      restore_env(:native_lane_barrier_timeout_ms, previous_timeout)
+    end)
+
+    key = "native:lane:barrier-disconnect:#{System.unique_integer([:positive, :monotonic])}"
+    assert :ok = FerricStore.set(key, "value")
+    on_exit(fn -> FerricStore.del(key) end)
+
+    existing_pids = connection_pids()
+    socket = connect()
+    connection_pid = wait_for_new_connection(existing_pids)
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    assert :ok =
+             :gen_tcp.send(
+               socket,
+               Codec.encode_frame(
+                 @get_opcode,
+                 1,
+                 140,
+                 Codec.encode_value(%{"key" => key})
+               )
+             )
+
+    assert [{140, 0}] = receive_response_statuses(socket, 1)
+    lane_pid = wait_for_lane(connection_pid, 1)
+    :erlang.suspend_process(lane_pid)
+
+    on_exit(fn ->
+      if Process.alive?(lane_pid) and Process.info(lane_pid, :status) == {:status, :suspended} do
+        :erlang.resume_process(lane_pid)
+      end
+    end)
+
+    assert :ok =
+             :gen_tcp.send(
+               socket,
+               [
+                 Codec.encode_frame(
+                   @get_opcode,
+                   1,
+                   141,
+                   Codec.encode_value(%{"key" => key})
+                 ),
+                 command_exec_frame_on_lane(1, 142, "WATCH", [key])
+               ]
+             )
+
+    Process.sleep(20)
+    assert :ok = :gen_tcp.close(socket)
+    assert eventually(fn -> not Process.alive?(connection_pid) end)
+  end
+
   test "preserves an incomplete frame until the remaining socket bytes arrive" do
     socket = connect()
     on_exit(fn -> :gen_tcp.close(socket) end)
@@ -826,6 +1491,58 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
            "accounting cost grew with fragments: #{small} reductions versus #{large}"
   end
 
+  test "frame buffer preserves nonuniform fragment order across many fragments" do
+    fragments = for index <- 1..4_097, do: :binary.copy(<<rem(index, 251)>>, rem(index, 5) + 1)
+    body = IO.iodata_to_binary(fragments)
+    header = Codec.encode_frame(@ping_opcode, 0, 49, body)
+
+    {:incomplete, buffer} =
+      FrameBuffer.append(
+        FrameBuffer.new(),
+        binary_part(header, 0, 24),
+        byte_size(body),
+        byte_size(header)
+      )
+
+    buffer =
+      Enum.reduce(fragments, buffer, fn fragment, buffer ->
+        case FrameBuffer.append(buffer, fragment, byte_size(body), byte_size(header)) do
+          {:incomplete, next} -> next
+          {:ready, next} -> next
+        end
+      end)
+
+    stats = FrameBuffer.stats(buffer)
+    assert stats.chunk_count == length(fragments) + 1
+    assert FrameBuffer.materialize(buffer) == header
+  end
+
+  test "frame buffer keeps already-large fragments independent" do
+    fragment = String.duplicate("x", 8 * 1024)
+    body = String.duplicate(fragment, 64)
+    header = Codec.encode_frame(@ping_opcode, 0, 50, body)
+
+    {:incomplete, buffer} =
+      FrameBuffer.append(
+        FrameBuffer.new(),
+        binary_part(header, 0, 24),
+        byte_size(body),
+        byte_size(header)
+      )
+
+    buffer =
+      Enum.reduce(1..64, buffer, fn _, buffer ->
+        case FrameBuffer.append(buffer, fragment, byte_size(body), byte_size(header)) do
+          {:incomplete, next} -> next
+          {:ready, next} -> next
+        end
+      end)
+
+    stats = FrameBuffer.stats(buffer)
+    assert stats.chunk_count == 65
+    assert FrameBuffer.materialize(buffer) == header
+  end
+
   test "accepts a complete maximum-size frame coalesced with continuation bytes" do
     max_frame_bytes = 32
     max_buffer_bytes = max_frame_bytes + 24
@@ -993,6 +1710,55 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
     assert length(chunks) > 64
     Enum.each(chunks, fn chunk -> assert :ok = :gen_tcp.send(socket, chunk) end)
     assert receive_response_ids(socket, 1) == [44]
+  end
+
+  @tag :global_inbound_budget
+  test "closes a one-byte fragment batch when metadata exhausts inbound budget" do
+    raw_limit = 1_024
+    frame_count = 32
+
+    global_limit =
+      Application.get_env(
+        :ferricstore,
+        :native_max_global_inbound_buffer_bytes,
+        256 * 1024 * 1024
+      )
+
+    assert eventually(fn -> ResourceBudget.usage(ResourceBudget).inbound_bytes == 0 end)
+
+    usage = ResourceBudget.usage(ResourceBudget)
+    reserve_bytes = global_limit - usage.inbound_bytes - raw_limit
+    assert reserve_bytes > 0
+
+    assert {:ok, reservation} =
+             ResourceBudget.acquire(ResourceBudget, :inbound_bytes, self(), reserve_bytes)
+
+    on_exit(fn -> ResourceBudget.release(ResourceBudget, reservation) end)
+    reserved_usage = ResourceBudget.usage(ResourceBudget)
+
+    batch =
+      1..frame_count
+      |> Enum.map(fn _ ->
+        Codec.encode_frame(@ping_opcode, 1, 501, "x", @more_chunks_flag)
+      end)
+      |> IO.iodata_to_binary()
+
+    assert byte_size(batch) < raw_limit
+    assert frame_count * 64 > raw_limit
+
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    assert :ok = :gen_tcp.send(socket, batch)
+    assert_socket_closed(socket)
+
+    assert eventually(fn ->
+             usage = ResourceBudget.usage(ResourceBudget)
+
+             usage.inbound_bytes == reserved_usage.inbound_bytes and
+               usage.chunk_streams == reserved_usage.chunk_streams and
+               usage.chunk_bytes == reserved_usage.chunk_bytes
+           end)
   end
 
   @tag :queued_request_byte_budget
@@ -1236,6 +2002,11 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
     Codec.encode_frame(@command_exec_opcode, 0, request_id, body, flags)
   end
 
+  defp command_exec_frame_on_lane(lane_id, request_id, command, args, flags \\ 0) do
+    body = Codec.encode_value(%{"command" => command, "args" => args})
+    Codec.encode_frame(@command_exec_opcode, lane_id, request_id, body, flags)
+  end
+
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 
@@ -1259,6 +2030,35 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
         Process.sleep(10)
         eventually(fun, attempts - 1)
     end
+  end
+
+  defp wait_for_lane(connection_pid, lane_id, attempts \\ 100)
+
+  defp wait_for_lane(_connection_pid, _lane_id, 0),
+    do: flunk("native lane did not start")
+
+  defp wait_for_lane(connection_pid, lane_id, attempts) do
+    case Process.info(connection_pid, :dictionary) do
+      {:dictionary, dictionary} ->
+        case Keyword.get(dictionary, :native_connection_cleanup_state) do
+          %{lanes: lanes} when is_map(lanes) ->
+            case Map.get(lanes, lane_id) do
+              pid when is_pid(pid) -> pid
+              _missing -> retry_wait_for_lane(connection_pid, lane_id, attempts)
+            end
+
+          _missing ->
+            retry_wait_for_lane(connection_pid, lane_id, attempts)
+        end
+
+      _missing ->
+        retry_wait_for_lane(connection_pid, lane_id, attempts)
+    end
+  end
+
+  defp retry_wait_for_lane(connection_pid, lane_id, attempts) do
+    Process.sleep(10)
+    wait_for_lane(connection_pid, lane_id, attempts - 1)
   end
 
   defp assert_socket_closed(socket, attempts \\ 20)

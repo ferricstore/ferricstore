@@ -1281,7 +1281,7 @@ fn lmdb_prefix_merge_entries<'a>(
         }
     }
 
-    let mut selected: std::collections::BinaryHeap<(&[u8], usize, &[u8])> =
+    let mut selected: std::collections::BinaryHeap<prefix_merge::Candidate<'_>> =
         std::collections::BinaryHeap::with_capacity(cap);
     let mut scanned = 0usize;
 
@@ -1291,31 +1291,14 @@ fn lmdb_prefix_merge_entries<'a>(
             Err(error) => return Ok((atoms::error(), error.to_string()).encode(env)),
         };
 
-        for item in iter.take(cap) {
-            let (key, value) = match item {
-                Ok(entry) => entry,
-                Err(error) => return Ok((atoms::error(), error.to_string()).encode(env)),
-            };
-            scanned = scanned.saturating_add(1);
-            let candidate = (key, source, value);
-            if selected.len() < cap {
-                selected.push(candidate);
-            } else if selected.peek().is_some_and(|largest| &candidate < largest) {
-                selected.pop();
-                selected.push(candidate);
-            }
+        match prefix_merge::scan_source(&mut selected, source, cap, iter) {
+            Ok(source_scanned) => scanned = scanned.saturating_add(source_scanned),
+            Err(error) => return Ok((atoms::error(), error.to_string()).encode(env)),
         }
     }
 
     let selected = selected.into_sorted_vec();
-    let selected_bytes = selected.iter().try_fold(0usize, |bytes, (key, _, value)| {
-        bytes
-            .checked_add(key.len())
-            .and_then(|bytes| bytes.checked_add(value.len()))
-            .filter(|bytes| *bytes <= byte_cap)
-            .ok_or(())
-    });
-    if selected_bytes.is_err() {
+    if !prefix_merge::within_byte_cap(&selected, byte_cap) {
         return Ok(
             (atoms::error(), atoms::prefix_merge_byte_budget_exceeded()).encode(env)
         );

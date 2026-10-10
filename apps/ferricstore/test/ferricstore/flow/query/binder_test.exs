@@ -82,6 +82,23 @@ defmodule Ferricstore.Flow.Query.BinderTest do
              Binder.bind(request, %{"tenant" => "tenant-a", "edge" => "100"})
   end
 
+  test "preserves parameter key validation precedence around map membership" do
+    request =
+      Request.collection(
+        :execute,
+        [{:eq, :partition_key, parameter(:keyword, "tenant")}],
+        [{:updated_at_ms, :asc}],
+        10,
+        :record
+      )
+
+    assert {:error, :missing_parameter} = Binder.bind(request, %{})
+    assert {:error, :invalid_parameters} = Binder.bind(request, %{1 => "tenant-a"})
+
+    assert {:error, :unexpected_parameter} =
+             Binder.bind(request, %{"tenant" => "tenant-a", 1 => "ignored"})
+  end
+
   test "diagnostic binding names missing parameters without exposing values" do
     query =
       "FROM runs WHERE partition_key = @partition AND type = @type " <>

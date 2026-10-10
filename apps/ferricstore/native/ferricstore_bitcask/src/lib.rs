@@ -71,6 +71,7 @@ pub mod hint;
 pub mod io_backend;
 pub mod log;
 mod path_open;
+mod prefix_merge;
 pub mod prob_txn;
 mod system_capacity;
 pub mod tdigest;

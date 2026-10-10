@@ -3,6 +3,8 @@ defmodule FerricstoreServer.Native.ResourceBudget do
 
   use GenServer
 
+  alias __MODULE__.AccountingGate
+
   @resources [
     :executions,
     :lanes,
@@ -43,7 +45,7 @@ defmodule FerricstoreServer.Native.ResourceBudget do
   def acquire(server, resource, owner, amount)
       when is_atom(resource) and is_pid(owner) and is_integer(amount) and amount >= 0 do
     with {:ok, budget} <- lookup_budget(server) do
-      grant_fast_lease(budget, resource, owner, amount, true)
+      AccountingGate.run(budget, fn -> grant_fast_lease(budget, resource, owner, amount, true) end)
     end
   end
 
@@ -69,9 +71,16 @@ defmodule FerricstoreServer.Native.ResourceBudget do
 
   def release_scoped(%ScopedLease{reference: reference}) do
     case Process.delete({@scoped_lease_key, reference}) do
-      {budget, resource, amount} -> release_scoped_lease(budget, self(), resource, amount)
-      nil -> :ok
+      {budget, resource, amount} ->
+        AccountingGate.run(budget, fn ->
+          release_scoped_lease(budget, self(), resource, amount)
+        end)
+
+      nil ->
+        :ok
     end
+
+    :ok
   end
 
   @spec acquire_wait(atom(), pid(), non_neg_integer()) ::
@@ -99,10 +108,12 @@ defmodule FerricstoreServer.Native.ResourceBudget do
           GenServer.call(server, {:acquire_wait, resource, owner, amount}, :infinity)
 
         true ->
-          case grant_fast_lease(budget, resource, owner, amount, true) do
+          case AccountingGate.run(budget, fn ->
+                 grant_fast_lease(budget, resource, owner, amount, true)
+               end) do
             {:ok, token} = granted ->
               if waiter_count(budget, resource) > 0 do
-                release_fast_lease(budget, token, true)
+                AccountingGate.run(budget, fn -> release_fast_lease(budget, token, true) end)
                 GenServer.call(server, {:acquire_wait, resource, owner, amount}, :infinity)
               else
                 granted
@@ -124,24 +135,31 @@ defmodule FerricstoreServer.Native.ResourceBudget do
   def resize(server \\ __MODULE__, token, amount)
       when is_reference(token) and is_integer(amount) and amount >= 0 do
     with {:ok, budget} <- lookup_budget(server) do
-      resize_fast_lease(budget, token, amount)
+      AccountingGate.run(budget, fn -> resize_fast_lease(budget, token, amount) end)
     end
   end
 
   @spec release(GenServer.server(), reference()) :: :ok
   def release(server \\ __MODULE__, token) when is_reference(token) do
     case lookup_budget(server) do
-      {:ok, budget} -> release_fast_lease(budget, token, true)
-      {:error, :resource_budget_unavailable} -> :ok
+      {:ok, budget} ->
+        AccountingGate.run(budget, fn -> release_fast_lease(budget, token, true) end)
+
+      {:error, :resource_budget_unavailable} ->
+        :ok
     end
+
+    :ok
   end
 
   @spec release_many(GenServer.server(), [reference()]) :: :ok
   def release_many(server \\ __MODULE__, tokens) when is_list(tokens) do
     case lookup_budget(server) do
-      {:ok, budget} -> release_fast_leases(budget, tokens)
+      {:ok, budget} -> AccountingGate.run(budget, fn -> release_fast_leases(budget, tokens) end)
       {:error, :resource_budget_unavailable} -> :ok
     end
+
+    :ok
   end
 
   @spec release_async(GenServer.server(), reference()) :: :ok
@@ -206,6 +224,7 @@ defmodule FerricstoreServer.Native.ResourceBudget do
         ])
 
       budget = %{
+        accounting_gate: AccountingGate.new(),
         coordinator: self(),
         counters: counters,
         waiter_counters: waiter_counters,
@@ -282,9 +301,13 @@ defmodule FerricstoreServer.Native.ResourceBudget do
     do: {:reply, resize_fast_lease(state.budget, token, amount), state}
 
   def handle_call({:reclaim_scoped, resource}, _from, state) do
+    AccountingGate.discover_interruptions(state.budget.accounting_gate)
+    state = reconcile_interrupted_accounting(state)
     state = reclaim_dead_scoped_owners(state, resource)
     {:reply, :ok, state}
   end
+
+  def handle_call(:await_accounting, _from, state), do: {:reply, :ok, state}
 
   def handle_call({:release, token}, _from, state),
     do: {:reply, :ok, release_and_grant_waiters(state, token)}
@@ -316,6 +339,7 @@ defmodule FerricstoreServer.Native.ResourceBudget do
 
   @impl true
   def handle_info(:sweep_scoped_leases, state) do
+    state = reconcile_interrupted_accounting(state)
     state = reclaim_dead_scoped_owners(state, :all)
     schedule_scoped_sweep(state)
     {:noreply, state}
@@ -331,6 +355,7 @@ defmodule FerricstoreServer.Native.ResourceBudget do
         }
 
         :ets.delete(state.budget.tracked_owners, owner)
+        AccountingGate.owner_down(state.budget.accounting_gate, owner)
 
         {:noreply, release_owner(state, owner)}
 
@@ -374,7 +399,9 @@ defmodule FerricstoreServer.Native.ResourceBudget do
               true = :ets.insert_new(budget.leases, {token, owner, resource, amount})
               true = :ets.insert(budget.owner_leases, {owner, token})
 
-              if track_owner? and not tracked_owner?(budget, owner),
+              # The accounting gate already registers the caller once. Only a
+              # lease assigned to another process needs a separate owner check.
+              if track_owner? and owner != self() and not tracked_owner?(budget, owner),
                 do: GenServer.cast(budget.coordinator, {:track_owner, owner})
 
               {:ok, token}
@@ -394,9 +421,9 @@ defmodule FerricstoreServer.Native.ResourceBudget do
 
   defp grant_scoped_lease(budget, resource, amount) do
     if resource in @resources do
-      case reserve(budget, resource, amount) do
-        :ok -> register_scoped_lease(budget, self(), resource, amount)
+      case try_scoped_lease(budget, resource, amount) do
         {:error, :limit} -> reclaim_and_retry_scoped_lease(budget, resource, amount)
+        result -> result
       end
     else
       {:error, {:unknown_resource, resource}}
@@ -405,12 +432,21 @@ defmodule FerricstoreServer.Native.ResourceBudget do
 
   defp reclaim_and_retry_scoped_lease(budget, resource, amount) do
     with :ok <- request_scoped_reclamation(budget.coordinator, resource),
-         :ok <- reserve(budget, resource, amount) do
-      register_scoped_lease(budget, self(), resource, amount)
+         {:ok, _lease} = result <- try_scoped_lease(budget, resource, amount) do
+      result
     else
       {:error, :limit} -> {:error, {:limit, resource}}
       {:error, _reason} -> {:error, :resource_budget_unavailable}
     end
+  end
+
+  defp try_scoped_lease(budget, resource, amount) do
+    AccountingGate.run(budget, fn ->
+      case reserve(budget, resource, amount) do
+        :ok -> register_scoped_lease(budget, self(), resource, amount)
+        error -> error
+      end
+    end)
   end
 
   defp request_scoped_reclamation(coordinator, _resource) when coordinator == self(),
@@ -660,7 +696,7 @@ defmodule FerricstoreServer.Native.ResourceBudget do
 
   # Scoped registration touches its ETS table before returning a lease and
   # rolls back the atomic reservation if that table has disappeared. Avoiding
-  # a duplicate liveness probe keeps the per-request execution path lock-free
+  # a duplicate liveness probe keeps normal per-request accounting inexpensive
   # while preserving fail-closed behavior during coordinator shutdown.
   defp lookup_scoped_budget(server) do
     case :persistent_term.get(registry_key(server), :missing) do
@@ -890,6 +926,55 @@ defmodule FerricstoreServer.Native.ResourceBudget do
     Enum.reduce(released_resources, state, fn resource, acc ->
       grant_waiters(acc, resource)
     end)
+  end
+
+  defp reconcile_interrupted_accounting(state) do
+    if AccountingGate.pending_repair?(state.budget.accounting_gate) do
+      state = AccountingGate.reconcile(state.budget.accounting_gate, state, &rebuild_accounting/1)
+      Enum.reduce(@resources, state, &grant_waiters(&2, &1))
+    else
+      state
+    end
+  end
+
+  defp rebuild_accounting(state) do
+    budget = state.budget
+    :ets.delete_all_objects(budget.owner_leases)
+
+    {state, totals} =
+      :ets.foldl(
+        fn {token, owner, resource, amount}, {state, totals} ->
+          if Process.alive?(owner) do
+            :ets.insert(budget.owner_leases, {owner, token})
+            {ensure_owner_monitor(state, owner), Map.update!(totals, resource, &(&1 + amount))}
+          else
+            :ets.delete(budget.leases, token)
+            {state, totals}
+          end
+        end,
+        {state, Map.new(@resources, &{&1, 0})},
+        budget.leases
+      )
+
+    totals =
+      :ets.foldl(
+        fn {{owner, resource} = key, amount}, totals ->
+          if Process.alive?(owner) do
+            Map.update!(totals, resource, &(&1 + amount))
+          else
+            :ets.delete(budget.scoped_owner_leases, key)
+            totals
+          end
+        end,
+        totals,
+        budget.scoped_owner_leases
+      )
+
+    Enum.each(totals, fn {resource, amount} ->
+      :atomics.put(budget.counters, Map.fetch!(@resource_indexes, resource), amount)
+    end)
+
+    state
   end
 
   defp reclaim_dead_scoped_owner(

@@ -12,6 +12,7 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutor do
     MemoryBudget,
     Plan,
     Planner,
+    RecordOrder,
     RecordProjection,
     Request,
     Shape,
@@ -482,7 +483,7 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutor do
   defp validate_candidates(records, request, descriptor, boundary, plan) do
     with {:ok, keys} <- record_keys(records, descriptor),
          true <- length(records) <= request.limit + 1,
-         true <- keys == Enum.sort(keys, descriptor.direction),
+         true <- RecordOrder.ordered?(keys, descriptor.direction),
          true <- unique_ids?(records),
          true <- valid_resume?(keys, boundary, descriptor.direction),
          true <- MemoryBudget.term_bytes(records) <= plan.budget.executor_memory_bytes do
@@ -498,7 +499,7 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutor do
 
     valid =
       length(keys) <= request.limit + 1 and
-        keys == Enum.sort(keys, direction) and
+        RecordOrder.ordered?(keys, direction) and
         length(ids) == length(Enum.uniq(ids)) and
         valid_resume?(keys, boundary, direction)
 

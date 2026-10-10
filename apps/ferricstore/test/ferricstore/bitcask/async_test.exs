@@ -3,6 +3,97 @@ defmodule Ferricstore.Bitcask.AsyncTest do
 
   alias Ferricstore.Bitcask.Async
 
+  test "monitor cleanup does not scan unrelated caller messages" do
+    Enum.each(1..10_000, fn _ -> send(self(), :unrelated) end)
+    {:reductions, before_count} = Process.info(self(), :reductions)
+
+    for _ <- 1..100 do
+      assert {:ok, :ok} =
+               Async.await(
+                 fn proxy, corr_id ->
+                   send(proxy, {:tokio_complete, corr_id, :ok})
+                   :ok
+                 end,
+                 :infinity
+               )
+    end
+
+    {:reductions, after_count} = Process.info(self(), :reductions)
+    assert after_count - before_count < 100_000
+    assert {:message_queue_len, 10_000} = Process.info(self(), :message_queue_len)
+  end
+
+  test "infinite wait reports proxy death without leaking monitor messages" do
+    test_pid = self()
+
+    caller =
+      spawn(fn ->
+        result =
+          Async.await(
+            fn proxy, _corr_id ->
+              send(test_pid, {:proxy_started, proxy})
+              :ok
+            end,
+            :infinity
+          )
+
+        send(test_pid, {:result, result})
+
+        receive do
+          :inspect_mailbox -> send(test_pid, {:mailbox, Process.info(self(), :messages)})
+        end
+      end)
+
+    on_exit(fn -> Process.exit(caller, :kill) end)
+    assert_receive {:proxy_started, proxy}
+    on_exit(fn -> Process.exit(proxy, :kill) end)
+    Process.exit(proxy, :kill)
+    assert_receive {:result, {:error, {:proxy_exit, :killed}}}, 500
+    send(caller, :inspect_mailbox)
+    assert_receive {:mailbox, {:messages, []}}
+  end
+
+  test "infinite proxy wait terminates when its caller dies" do
+    test_pid = self()
+
+    caller =
+      spawn(fn ->
+        Async.await(
+          fn proxy, _corr_id ->
+            send(test_pid, {:proxy_started, proxy})
+            :ok
+          end,
+          :infinity
+        )
+      end)
+
+    on_exit(fn -> Process.exit(caller, :kill) end)
+    assert_receive {:proxy_started, proxy}
+    on_exit(fn -> Process.exit(proxy, :kill) end)
+    monitor = Process.monitor(proxy)
+    Process.exit(caller, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^proxy, _reason}, 500
+  end
+
+  test "successful completion wins over the proxy normal exit and cleans monitors" do
+    {:monitors, before_monitors} = Process.info(self(), :monitors)
+
+    for _ <- 1..100 do
+      assert {:ok, "value"} =
+               Async.await(
+                 fn proxy, corr_id ->
+                   send(proxy, {:tokio_complete, corr_id, :ok, "value"})
+                   :ok
+                 end,
+                 :infinity
+               )
+    end
+
+    assert {:monitors, ^before_monitors} = Process.info(self(), :monitors)
+    refute_received {:DOWN, _, _, _, _}
+    refute_received {{:proxy_down, _}, _, _, _, _}
+  end
+
   test "await returns four-tuple successful completions" do
     assert {:ok, "value"} =
              Async.await(

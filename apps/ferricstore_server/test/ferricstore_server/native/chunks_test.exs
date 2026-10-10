@@ -43,6 +43,157 @@ defmodule FerricstoreServer.Native.ChunksTest do
     assert ResourceBudget.usage(budget).chunk_bytes == 0
   end
 
+  test "empty continuation frames do not retain metadata" do
+    name = :"native_empty_chunk_budget_#{System.unique_integer([:positive])}"
+
+    budget =
+      start_supervised!({ResourceBudget, name: name, limits: %{chunk_streams: 1, chunk_bytes: 1}})
+
+    state = chunk_state(budget, max_frame_bytes: 64, max_pending_chunk_bytes: 1)
+
+    state =
+      Enum.reduce(1..1_000, state, fn _, state ->
+        assert {:pending, state} =
+                 Chunks.reassemble({1, 0x0100, 99, @more_chunks_flag, ""}, state)
+
+        state
+      end)
+
+    assert [{_, {_, chunks, 0, _, _, _, 0}}] = Map.to_list(state.chunk_buffers)
+    assert chunks == []
+    assert Map.get(state, :pending_chunk_metadata_bytes, 0) == 0
+    assert ResourceBudget.usage(budget).chunk_bytes == 0
+  end
+
+  test "tracks one-byte continuations without changing reassembly" do
+    body = String.duplicate("x", 1_000)
+    name = :"native_byte_chunk_budget_#{System.unique_integer([:positive])}"
+
+    budget =
+      start_supervised!(
+        {ResourceBudget, name: name, limits: %{chunk_streams: 1, chunk_bytes: 1_000}}
+      )
+
+    state = chunk_state(budget, max_frame_bytes: 1_000, max_pending_chunk_bytes: 1_000)
+
+    state =
+      Enum.reduce(1..1_000, state, fn _, state ->
+        assert {:pending, state} =
+                 Chunks.reassemble({1, 0x0100, 100, @more_chunks_flag, "x"}, state)
+
+        state
+      end)
+
+    assert [{_, {_, chunks, 1_000, _, _, _, 1_000}}] = Map.to_list(state.chunk_buffers)
+    assert length(chunks) == 1_000
+    assert Chunks.retained_metadata_bytes(state) == 1_000 * 64
+
+    assert {:ready, {1, 0x0100, 100, 0, ^body}, ready_state} =
+             Chunks.reassemble({1, 0x0100, 100, 0, ""}, state)
+
+    assert ready_state.chunk_buffers == %{}
+    assert Map.get(ready_state, :pending_chunk_metadata_bytes, 0) == 0
+    assert ResourceBudget.usage(budget).chunk_bytes == 0
+  end
+
+  test "tracks ordinary continuation fragments independently" do
+    fragment = String.duplicate("x", 8 * 1024)
+    name = :"native_large_chunk_budget_#{System.unique_integer([:positive])}"
+
+    budget =
+      start_supervised!(
+        {ResourceBudget,
+         name: name, limits: %{chunk_streams: 1, chunk_bytes: byte_size(fragment) * 64}}
+      )
+
+    state =
+      chunk_state(
+        budget,
+        max_frame_bytes: byte_size(fragment) * 64,
+        max_pending_chunk_bytes: byte_size(fragment) * 64
+      )
+
+    state =
+      Enum.reduce(1..64, state, fn _, state ->
+        assert {:pending, state} =
+                 Chunks.reassemble({1, 0x0100, 104, @more_chunks_flag, fragment}, state)
+
+        state
+      end)
+
+    assert [{_, {_, chunks, _, _, _, _, 64}}] = Map.to_list(state.chunk_buffers)
+    assert length(chunks) == 64
+    assert Chunks.retained_metadata_bytes(state) == 64 * 64
+
+    assert {:ready, _frame, ready_state} =
+             Chunks.reassemble({1, 0x0100, 104, 0, ""}, state)
+
+    assert ready_state.chunk_buffers == %{}
+    assert ResourceBudget.usage(budget).chunk_bytes == 0
+  end
+
+  test "an empty final continuation completes a valid stream" do
+    name = :"native_empty_final_budget_#{System.unique_integer([:positive])}"
+
+    budget =
+      start_supervised!({ResourceBudget, name: name, limits: %{chunk_streams: 1, chunk_bytes: 7}})
+
+    state = chunk_state(budget, max_frame_bytes: 7, max_pending_chunk_bytes: 7)
+
+    assert {:pending, state} =
+             Chunks.reassemble({1, 0x0100, 101, @more_chunks_flag, "payload"}, state)
+
+    assert {:ready, {1, 0x0100, 101, 0, "payload"}, ready_state} =
+             Chunks.reassemble({1, 0x0100, 101, 0, ""}, state)
+
+    assert ready_state.chunk_buffers == %{}
+    assert ResourceBudget.usage(budget).chunk_bytes == 0
+
+    assert {:pending, empty_state} =
+             Chunks.reassemble({1, 0x0100, 103, @more_chunks_flag, ""}, ready_state)
+
+    assert {:ready, {1, 0x0100, 103, 0, ""}, empty_ready_state} =
+             Chunks.reassemble({1, 0x0100, 103, 0, ""}, empty_state)
+
+    assert empty_ready_state.chunk_buffers == %{}
+    assert ResourceBudget.usage(budget).chunk_bytes == 0
+  end
+
+  test "preserves nonuniform fragment order across large continuation counts" do
+    fragments = for index <- 1..4_097, do: <<rem(index, 251)>>
+    expected = IO.iodata_to_binary(fragments)
+    name = :"native_fragment_order_budget_#{System.unique_integer([:positive])}"
+
+    budget =
+      start_supervised!(
+        {ResourceBudget,
+         name: name, limits: %{chunk_streams: 1, chunk_bytes: byte_size(expected)}}
+      )
+
+    state =
+      chunk_state(
+        budget,
+        max_frame_bytes: byte_size(expected),
+        max_pending_chunk_bytes: byte_size(expected)
+      )
+
+    {last, pending} = List.pop_at(fragments, -1)
+
+    state =
+      Enum.reduce(pending, state, fn fragment, state ->
+        assert {:pending, state} =
+                 Chunks.reassemble({1, 0x0100, 102, @more_chunks_flag, fragment}, state)
+
+        state
+      end)
+
+    assert {:ready, {1, 0x0100, 102, 0, ^expected}, ready_state} =
+             Chunks.reassemble({1, 0x0100, 102, 0, last}, state)
+
+    assert ready_state.chunk_buffers == %{}
+    assert ResourceBudget.usage(budget).chunk_bytes == 0
+  end
+
   test "request decompression is incremental and output-bounded" do
     source =
       File.read!(
@@ -114,8 +265,9 @@ defmodule FerricstoreServer.Native.ChunksTest do
              Chunks.reassemble({1, 0x0100, 7, 0, "6789"}, state)
 
     assert rejected_state.chunk_buffers == %{}
+    assert Chunks.retained_metadata_bytes(rejected_state) == 0
 
-    authenticated = %{state | authenticated: true, chunk_buffers: %{}, pending_chunk_bytes: 0}
+    authenticated = %{rejected_state | authenticated: true}
 
     assert {:pending, authenticated} =
              Chunks.reassemble(
@@ -127,6 +279,7 @@ defmodule FerricstoreServer.Native.ChunksTest do
              Chunks.reassemble({1, 0x0100, 8, 0, "6789"}, authenticated)
 
     assert ready_state.chunk_buffers == %{}
+    assert Chunks.retained_metadata_bytes(ready_state) == 0
   end
 
   test "unauthenticated decompression uses the smaller logical frame limit" do
@@ -157,5 +310,21 @@ defmodule FerricstoreServer.Native.ChunksTest do
       Process.sleep(10)
       eventually(fun, attempts - 1)
     end
+  end
+
+  defp chunk_state(budget, overrides) do
+    Map.merge(
+      %{
+        chunk_buffers: %{},
+        chunk_assembly_deadline_ms: nil,
+        pending_chunk_bytes: 0,
+        frame_assembly_timeout_ms: 15_000,
+        max_pending_chunks: 10,
+        max_pending_chunk_bytes: 20,
+        max_frame_bytes: 20,
+        resource_budget: budget
+      },
+      Map.new(overrides)
+    )
   end
 end

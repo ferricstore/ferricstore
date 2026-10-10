@@ -9,6 +9,9 @@ defmodule Ferricstore.Bitcask.Async do
   process and replies through a process alias, so late replies are dropped after
   timeout instead of leaking into the caller.
 
+  Caller and proxy monitor each other. A proxy exit is an error, not proof
+  that a submitted native operation was cancelled; native work may continue.
+
   This helper creates one short-lived BEAM process per wait. That cost is
   acceptable for synchronous cold reads, probabilistic reads, and cleanup
   operations, but it is not the final shape for a proven read-hot bottleneck.
@@ -22,35 +25,43 @@ defmodule Ferricstore.Bitcask.Async do
   @type result :: {:ok, term()} | {:error, term()}
 
   @spec await(submit_fun(), timeout()) :: result()
-  def await(submit_fun, timeout_ms) do
+  def await(submit_fun, timeout_ms)
+      when is_function(submit_fun, 2) and
+             (timeout_ms == :infinity or (is_integer(timeout_ms) and timeout_ms >= 0)) do
     caller = self()
     parent = :erlang.alias()
-    ref = make_ref()
+    ref = parent
     corr_id = System.unique_integer([:positive, :monotonic])
 
-    {proxy, proxy_monitor} =
-      spawn_monitor(fn ->
-        caller_monitor = Process.monitor(caller)
+    # The DOWN tag carries the request reference, preserving receive queue markers.
+    {proxy, monitor} =
+      :erlang.spawn_opt(
+        fn ->
+          caller_monitor = Process.monitor(caller)
 
-        # This one-shot process exits after replying or cancellation. BEAM
-        # removes its caller monitor on exit, including exceptional exits.
-        case submit(submit_fun, corr_id) do
-          :ok -> proxy_receive(parent, ref, corr_id, caller_monitor)
-          {:error, _reason} = error -> maybe_send_result(parent, ref, error)
-        end
-      end)
+          case submit(submit_fun, corr_id) do
+            :ok -> proxy_receive(parent, ref, corr_id, caller_monitor)
+            {:error, _reason} = error -> maybe_send_result(parent, ref, error)
+          end
+        end,
+        [{:monitor, [{:tag, {:proxy_down, ref}}]}]
+      )
 
     try do
       receive do
         {^ref, result} ->
           result
 
-        {:DOWN, ^proxy_monitor, :process, ^proxy, reason} ->
+        {{:proxy_down, ^ref}, ^monitor, :process, ^proxy, reason} ->
           {:error, {:proxy_exit, reason}}
       after
         timeout_ms ->
           receive do
-            {^ref, result} -> result
+            {^ref, result} ->
+              result
+
+            {{:proxy_down, ^ref}, ^monitor, :process, ^proxy, reason} ->
+              {:error, {:proxy_exit, reason}}
           after
             0 ->
               stop_proxy(proxy, ref)
@@ -58,8 +69,9 @@ defmodule Ferricstore.Bitcask.Async do
           end
       end
     after
+      # demonitor's :flush scans the whole mailbox; our tagged receive skips old messages.
+      Process.demonitor(monitor)
       cleanup_alias(parent, ref)
-      Process.demonitor(proxy_monitor, [:flush])
     end
   end
 
@@ -75,6 +87,7 @@ defmodule Ferricstore.Bitcask.Async do
     kind, reason -> {:error, {:submit_failed, kind, reason}}
   end
 
+  # The caller owns the deadline and stops this monitored proxy on timeout.
   defp proxy_receive(parent, ref, corr_id, caller_monitor) do
     receive do
       {:tokio_complete, ^corr_id, :ok} ->
@@ -115,6 +128,7 @@ defmodule Ferricstore.Bitcask.Async do
   defp flush_alias_reply(ref) do
     receive do
       {^ref, _result} -> flush_alias_reply(ref)
+      {{:proxy_down, ^ref}, _monitor, :process, _proxy, _reason} -> flush_alias_reply(ref)
     after
       0 -> :ok
     end

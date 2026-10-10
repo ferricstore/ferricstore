@@ -12,6 +12,7 @@ defmodule Ferricstore.Flow.Query.HistoryExecutor do
     MemoryBudget,
     Plan,
     Planner,
+    RecordOrder,
     RecordProjection
   }
 
@@ -181,8 +182,7 @@ defmodule Ferricstore.Flow.Query.HistoryExecutor do
 
   defp ordered?(event_ids, direction) do
     keys = Enum.map(event_ids, &event_key/1)
-    expected = Enum.sort(keys, direction)
-    keys == expected
+    RecordOrder.ordered?(keys, direction)
   end
 
   defp valid_resume_boundary?(_records, nil, _direction), do: true

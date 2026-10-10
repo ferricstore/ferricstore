@@ -731,8 +731,8 @@ defmodule Ferricstore.Store.Shard.ETS do
   def cold_read_warm_ets(state, key, value, exp, fid, off, vsize) do
     v = value_for_ets(value, hot_cache_threshold(state))
 
-    if v != nil and Ferricstore.MemoryGuard.skip_promotion?() do
-      # Under pressure — don't re-cache, keep cold
+    if v == nil or Ferricstore.MemoryGuard.skip_promotion?() do
+      # Uncacheable values and pressure-blocked promotions must leave the row unchanged.
       :ok
     else
       case warm_matching_cold_entry(state.keydir, key, v, exp, fid, off, vsize) do
