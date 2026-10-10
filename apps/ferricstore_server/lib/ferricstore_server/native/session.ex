@@ -32,6 +32,11 @@ defmodule FerricstoreServer.Native.Session do
   ))
 
   @spec session_command?(binary()) :: boolean()
+  def transaction_command?(cmd) when is_binary(cmd),
+    do: MapSet.member?(@transaction_passthrough, cmd)
+
+  def transaction_command?(_cmd), do: false
+
   def session_command?(cmd) when is_binary(cmd), do: MapSet.member?(@session_commands, cmd)
   def session_command?(_cmd), do: false
 

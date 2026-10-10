@@ -58,6 +58,9 @@ defmodule FerricstoreServer.Native.Connection do
   # Read-only and flow-control opcodes (PING, CLIENT.INFO, ROUTE, SHARDS,
   # BACKPRESSURE, OPTIONS, WINDOW_UPDATE, ROUTE_BATCH) change no state that
   # earlier frames depend on, so they answer without a cross-lane barrier.
+  @transaction_behind_blocked_lane "ERR native transaction command cannot follow a pending blocking command on its lane"
+  @queued_behind_parked_lane "ERR native command cannot join the transaction behind parked work on its lane; EXEC will abort"
+  @transaction_with_parked_work "ERR native MULTI cannot start while blocking commands or parked lane work are pending on this connection"
   @unordered_control_opcodes [0x0003, 0x0005, 0x0006, 0x0007, 0x0008, 0x000B, 0x000D, 0x000F]
 
   defstruct [
@@ -90,6 +93,7 @@ defmodule FerricstoreServer.Native.Connection do
     :resource_budget,
     :preauth_max_frame_bytes,
     :frame_assembly_timeout_ms,
+    :lane_barrier_timeout_ms,
     :frame_assembly_deadline_ms,
     :chunk_assembly_deadline_ms,
     :inbound_buffer_token,
@@ -269,6 +273,7 @@ defmodule FerricstoreServer.Native.Connection do
               resource_budget: Map.get(opts, :resource_budget, ResourceBudget),
               preauth_max_frame_bytes: preauth_max_frame_bytes,
               frame_assembly_timeout_ms: frame_assembly_timeout_ms,
+              lane_barrier_timeout_ms: lane_barrier_timeout_ms(),
               multi_queue_byte_limit: min(max_frame_bytes * 2, 32 * 1024 * 1024),
               watch_key_byte_limit: min(max_frame_bytes, 16 * 1024 * 1024),
               max_pubsub_subscription_bytes:
@@ -890,23 +895,39 @@ defmodule FerricstoreServer.Native.Connection do
               lane_batches
             )
 
-          key ->
-            retained_bytes = max(decoded_bytes, frame_memory_bytes(frame))
-            request_bytes = deferred_queue_request_bytes(state, frame)
+          key when is_integer(key) ->
+            if state.multi_state == :queuing or transaction_frame?(frame) do
+              # Running it after the parked work would apply connection-wide
+              # transaction state out of stream order; refuse it in lane order.
+              # A command that cannot join an open transaction aborts it.
+              state = discard_decoded_frame(state, decoded_bytes)
 
-            case defer_frame(
-                   state,
-                   key,
-                   {:native_deferred_frame, frame, retained_bytes, request_bytes},
-                   decoded_bytes,
-                   retained_bytes,
-                   request_bytes
-                 ) do
-              {:ok, state} ->
-                dispatch_frames(rest, state, responses, decode_us, lane_batches)
+              {state, reason} =
+                if state.multi_state == :queuing,
+                  do: {%{state | multi_error: true}, @queued_behind_parked_lane},
+                  else: {state, @transaction_behind_blocked_lane}
 
-              {:error, state} ->
-                dispatch_deferred_budget_failure(state, responses, decode_us, lane_batches)
+              defer_parked_reply(
+                frame,
+                rest,
+                state,
+                responses,
+                decode_us,
+                lane_batches,
+                :error,
+                reason
+              )
+            else
+              defer_parked_frame(
+                frame,
+                rest,
+                state,
+                responses,
+                decode_us,
+                decoded_bytes,
+                lane_batches,
+                key
+              )
             end
         end
 
@@ -924,23 +945,19 @@ defmodule FerricstoreServer.Native.Connection do
               lane_batches
             )
 
-          key ->
-            request_bytes = frame_memory_bytes(raw_frame)
+          _key ->
+            state = discard_decoded_frame(state, decoded_bytes)
 
-            case defer_frame(
-                   state,
-                   key,
-                   {:native_deferred_error, raw_frame, reason, decoded_bytes, request_bytes},
-                   decoded_bytes,
-                   decoded_bytes,
-                   request_bytes
-                 ) do
-              {:ok, state} ->
-                dispatch_frames(rest, state, responses, decode_us, lane_batches)
-
-              {:error, state} ->
-                dispatch_deferred_budget_failure(state, responses, decode_us, lane_batches)
-            end
+            defer_parked_reply(
+              raw_frame,
+              rest,
+              state,
+              responses,
+              decode_us,
+              lane_batches,
+              :bad_request,
+              reason
+            )
         end
 
       {:pending, state} ->
@@ -964,6 +981,90 @@ defmodule FerricstoreServer.Native.Connection do
               lane_batches
             )
         end
+    end
+  end
+
+  defp defer_parked_frame(
+         frame,
+         rest,
+         state,
+         responses,
+         decode_us,
+         decoded_bytes,
+         lane_batches,
+         key
+       ) do
+    retained_bytes = max(decoded_bytes, frame_memory_bytes(frame))
+    request_bytes = deferred_queue_request_bytes(state, frame)
+
+    case reserve_deferred_admission(state, key, request_bytes) do
+      {:ok, state} ->
+        case defer_frame(
+               state,
+               key,
+               {:native_deferred_frame, frame, retained_bytes, request_bytes},
+               decoded_bytes,
+               retained_bytes,
+               request_bytes,
+               :already_reserved
+             ) do
+          {:ok, state} ->
+            dispatch_frames(rest, state, responses, decode_us, lane_batches)
+
+          {:error, state} ->
+            dispatch_deferred_budget_failure(state, responses, decode_us, lane_batches)
+        end
+
+      {:error, state} ->
+        # Over the lane or connection queue limits: reject in lane order, as an
+        # unparked frame would be, instead of closing the connection.
+        state = discard_decoded_frame(state, decoded_bytes)
+
+        defer_parked_reply(
+          frame,
+          rest,
+          state,
+          responses,
+          decode_us,
+          lane_batches,
+          :busy,
+          parked_queue_full(key)
+        )
+    end
+  end
+
+  defp defer_parked_reply(frame, rest, state, responses, decode_us, lane_batches, status, value) do
+    case defer_reply(state, frame, status, value) do
+      {:ok, state} ->
+        dispatch_frames(rest, state, responses, decode_us, lane_batches)
+
+      {:error, state} ->
+        dispatch_deferred_budget_failure(state, responses, decode_us, lane_batches)
+    end
+  end
+
+  defp parked_queue_full(lane_id) do
+    %{
+      "code" => "lane_queue_full",
+      "message" => "ERR native lane queue is full behind pending lane work",
+      "scope" => "lane",
+      "lane_id" => lane_id,
+      "retry_after_ms" => 10
+    }
+  end
+
+  defp transaction_frame?(frame) do
+    opcode(frame) == @op_command_exec and
+      match?({:ok, _}, transaction_command_name(frame))
+  end
+
+  defp transaction_command_name(frame) do
+    with {:ok, command} <- Codec.peek_command_name(flags(frame), body(frame)),
+         command = String.upcase(command),
+         true <- Session.transaction_command?(command) do
+      {:ok, command}
+    else
+      _other -> :error
     end
   end
 
@@ -1290,6 +1391,12 @@ defmodule FerricstoreServer.Native.Connection do
           state.multi_state == :queuing ->
             {status, value, state} = execute_native_session_prepared(prepared, state)
             {:reply, status, value, state}
+
+          prepared.command == "MULTI" and
+              (map_size(state.blocked_requests) > 0 or map_size(state.deferred_frames) > 0) ->
+            # A transaction must not overlap parked lane work: frames sent before
+            # MULTI would replay inside it, and frames sent after could not join it.
+            {:reply, :error, @transaction_with_parked_work, state}
 
           Blocking.blocking_command?(prepared.command) ->
             case reserve_inflight(state, lane_id(frame)) do
@@ -1962,7 +2069,7 @@ defmodule FerricstoreServer.Native.Connection do
          raw_bytes,
          retained_bytes,
          request_bytes,
-         admission \\ :reserve
+         admission
        )
        when is_integer(raw_bytes) and raw_bytes >= 0 and is_integer(retained_bytes) and
               retained_bytes >= 0 and is_integer(request_bytes) and request_bytes >= 0 do
@@ -2325,7 +2432,8 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp lane_barrier_deadline(state) do
-    deadline = System.monotonic_time(:millisecond) + lane_barrier_timeout_ms()
+    timeout_ms = state.lane_barrier_timeout_ms || @default_lane_barrier_timeout_ms
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
     deadline = min_lane_deadline(deadline, state.frame_assembly_deadline_ms)
     min_lane_deadline(deadline, state.chunk_assembly_deadline_ms)
   end

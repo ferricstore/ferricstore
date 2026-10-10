@@ -198,8 +198,12 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
 
     assert Enum.sort(Enum.map(responses, &elem(&1, 0))) == [200, 201, 202, 203, 204]
 
-    assert Enum.filter(responses, fn {request_id, _status} -> request_id in [200, 202, 203] end) ==
-             [{200, 0}, {202, 0}, {203, 0}]
+    # MULTI cannot follow a blocking command on its lane: it is refused in lane
+    # order rather than opening late, after frames on other lanes slipped past.
+    assert [{200, 0}, {202, 0}, {203, multi_status}] =
+             Enum.filter(responses, fn {request_id, _status} -> request_id in [200, 202, 203] end)
+
+    assert multi_status != 0
 
     assert FerricStore.get(counter_key) == {:ok, "1"}
     assert FerricStore.llen(list_key) == {:ok, 0}
@@ -248,7 +252,15 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
         |> IO.iodata_to_binary()
 
       assert :ok = :gen_tcp.send(socket, requests)
-      assert_socket_closed(socket)
+      assert eventually(fn -> Ferricstore.Waiters.count(list_key) == 1 end)
+      on_exit(fn -> FerricStore.del(list_key) end)
+      assert {:ok, 1} = FerricStore.rpush(list_key, ["item"])
+
+      # The frame past the cap is rejected in lane order; the connection stays open.
+      assert [{510, 0}, {511, 0}, {512, 0}, {513, busy}] =
+               receive_response_statuses(socket, 4)
+
+      assert busy != 0
     end
   end
 
@@ -353,11 +365,17 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
       |> IO.iodata_to_binary()
 
     assert :ok = :gen_tcp.send(socket, requests)
-    assert_socket_closed(socket)
+    assert eventually(fn -> Ferricstore.Waiters.count(first_list) == 1 end)
+    on_exit(fn -> FerricStore.del(first_list) end)
+    assert {:ok, 1} = FerricStore.rpush(first_list, ["item"])
+
+    # The second BLPOP cannot overtake the first; it is rejected in lane order.
+    assert [{520, 0}, {521, busy}] = receive_response_statuses(socket, 2)
+    assert busy != 0
   end
 
   @tag :native_deferred_admission
-  test "deferred session frames honor queued request byte caps" do
+  test "parked frames over queued request byte caps get ordered busy replies" do
     previous_connection_limit =
       Application.get_env(:ferricstore, :native_max_queued_request_bytes_per_connection)
 
@@ -366,7 +384,7 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
 
     watch_body =
       Codec.encode_value(%{
-        "command" => "WATCH",
+        "command" => "GET",
         "args" => [String.duplicate("native:deferred-watch:", 8)]
       })
 
@@ -399,7 +417,18 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
       |> IO.iodata_to_binary()
 
     assert :ok = :gen_tcp.send(socket, requests)
-    assert_socket_closed(socket)
+
+    pusher = connect()
+    on_exit(fn -> :gen_tcp.close(pusher) end)
+
+    assert :ok =
+             :gen_tcp.send(pusher, command_exec_frame_on_lane(1, 533, "RPUSH", [list_key, "x"]))
+
+    # The over-cap frame is rejected in lane order and the connection stays usable.
+    assert [{530, 0}, {531, 0}, {532, busy}] = receive_response_statuses(socket, 3)
+    assert busy != 0
+    assert :ok = :gen_tcp.send(socket, Codec.encode_frame(@ping_opcode, 0, 534, ""))
+    assert [{534, 0}] = receive_response_statuses(socket, 1)
   end
 
   @tag :native_inflight_gate

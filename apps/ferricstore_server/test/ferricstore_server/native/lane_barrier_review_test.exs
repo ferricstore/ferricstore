@@ -402,6 +402,97 @@ defmodule FerricstoreServer.Native.LaneBarrierReviewTest do
     assert {:ok, "concurrent"} = FerricStore.get(key)
   end
 
+  test "MULTI is refused while a blocking command is pending on the connection", %{
+    keys: [list, key, _]
+  } do
+    socket = connect()
+    pusher = connect()
+
+    # Lane 1 parks a SET (sent before MULTI) behind a BLPOP.
+    send_frames(socket, [
+      command(1, 130, "BLPOP", [list, "5"]),
+      command(1, 131, "SET", [key, "before-multi"]),
+      command(2, 132, "MULTI", []),
+      command(2, 133, "EXEC", [])
+    ])
+
+    early = Map.new(1..2, fn _ -> response_value(socket) end)
+    assert {status, _reason} = early[132]
+    assert status != 0, "MULTI must not open while lane work is parked"
+    assert {exec_status, _} = early[133]
+    assert exec_status != 0
+
+    send_frames(pusher, [command(1, 134, "RPUSH", [list, "item"])])
+    late = Map.new(1..2, fn _ -> response_value(socket) end)
+    assert {0, _} = late[130]
+    assert {0, "OK"} = late[131]
+    assert {:ok, "before-multi"} = FerricStore.get(key)
+  end
+
+  test "a transaction command behind a blocked lane gets an ordered error", %{
+    keys: [list, key, _]
+  } do
+    assert :ok = FerricStore.set(key, "original")
+    socket = connect()
+    pusher = connect()
+
+    send_frames(socket, [
+      command(1, 140, "BLPOP", [list, "5"]),
+      command(1, 141, "WATCH", [key]),
+      command(2, 142, "GET", [key])
+    ])
+
+    # Lane 2 is unaffected; WATCH's reply stays behind BLPOP on lane 1.
+    assert {142, {0, "original"}} = response_value(socket)
+    send_frames(pusher, [command(1, 143, "RPUSH", [list, "item"])])
+    assert {140, {0, _}} = response_value(socket)
+    assert {141, {status, _reason}} = response_value(socket)
+    assert status != 0, "WATCH behind a blocked lane must not take effect late"
+  end
+
+  test "a queued command that would be parked aborts the transaction", %{keys: [_, key, _]} do
+    socket = connect()
+
+    bad_flags_frame =
+      Codec.encode_frame(
+        @command_exec_opcode,
+        1,
+        151,
+        Codec.encode_value(%{"command" => "GET", "args" => [key]}),
+        0x40
+      )
+
+    send_frames(socket, [
+      command(1, 150, "DEBUG", ["SLEEP", "1"]),
+      command(2, 152, "MULTI", []),
+      bad_flags_frame,
+      command(1, 153, "SET", [key, "parked-in-multi"]),
+      command(2, 154, "EXEC", [])
+    ])
+
+    replies = Map.new(1..5, fn _ -> response_value(socket) end)
+    assert {0, "OK"} = replies[152]
+    assert {status, _} = replies[154]
+    assert status != 0, "EXEC must abort when a queued command could not join it"
+    assert {set_status, _} = replies[153]
+    assert set_status != 0
+    assert {:ok, nil} = FerricStore.get(key)
+  end
+
+  test "the barrier timeout is fixed when the connection starts" do
+    Application.put_env(:ferricstore, :native_lane_barrier_timeout_ms, 300)
+    existing = connection_pids()
+    socket = connect()
+    wait_for_new_connection(existing)
+    # Later env changes apply to new connections, not this one.
+    Application.put_env(:ferricstore, :native_lane_barrier_timeout_ms, 60_000)
+
+    send_frames(socket, [command(1, 160, "DEBUG", ["SLEEP", "1"]), set_name(0, 161)])
+    started = System.monotonic_time(:millisecond)
+    assert :closed = drain_until_ping_or_close(socket, 161)
+    assert System.monotonic_time(:millisecond) - started < 900
+  end
+
   defp connect do
     {:ok, socket} =
       :gen_tcp.connect({127, 0, 0, 1}, Listener.port(), [:binary, active: false], 2_000)
