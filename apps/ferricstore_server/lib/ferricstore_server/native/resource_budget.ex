@@ -327,7 +327,20 @@ defmodule FerricstoreServer.Native.ResourceBudget do
 
   @impl true
   def handle_cast({:track_owner, owner}, state) do
-    {:noreply, ensure_owner_monitor(state, owner)}
+    state = ensure_owner_monitor(state, owner)
+
+    # An accounting actor can die before its registration is handled, and the
+    # DOWN for an already-dead process arrives asynchronously, possibly after a
+    # reclaim that must already see it. Settle the death now; the late DOWN is
+    # then stale and ignored.
+    if Process.alive?(owner) do
+      {:noreply, state}
+    else
+      handle_info(
+        {:DOWN, Map.fetch!(state.owner_monitors, owner), :process, owner, :noproc},
+        state
+      )
+    end
   end
 
   def handle_cast({:capacity_available, resource}, state) do

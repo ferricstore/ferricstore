@@ -519,6 +519,34 @@ defmodule FerricstoreServer.Native.ResourceBudgetTest do
   end
 
   @tag :interrupted_resource_accounting
+  test "reclaim repairs a killed accounting worker whose DOWN is still queued" do
+    name = :"native_resource_interrupted_queued_down_#{System.unique_integer([:positive])}"
+    coordinator = start_supervised!({ResourceBudget, name: name, limits: %{executions: 2}})
+    assert {:ok, held} = ResourceBudget.acquire(name, :executions, self(), 1)
+
+    for _attempt <- 1..128 do
+      # A fresh scan, then the race: the worker's DOWN lands behind the reclaim.
+      assert :ok = GenServer.call(name, {:reclaim_scoped, :all})
+      :ok = :sys.suspend(coordinator)
+
+      kill_accounting_worker(fn ->
+        case ResourceBudget.acquire_scoped(name, :executions, 1) do
+          {:ok, token} -> ResourceBudget.release_scoped(token)
+          {:error, {:limit, :executions}} -> :ok
+        end
+      end)
+
+      reclaim = Task.async(fn -> GenServer.call(name, {:reclaim_scoped, :all}) end)
+      Process.sleep(1)
+      :ok = :sys.resume(coordinator)
+      assert :ok = Task.await(reclaim)
+      assert ResourceBudget.usage(name).executions == 1
+    end
+
+    assert :ok = ResourceBudget.release(name, held)
+  end
+
+  @tag :interrupted_resource_accounting
   test "killed transferable lease accounting cannot strand byte reservations" do
     name = :"native_resource_interrupted_bytes_#{System.unique_integer([:positive])}"
     start_supervised!({ResourceBudget, name: name, limits: %{inbound_bytes: 8}})
