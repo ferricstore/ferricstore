@@ -39,7 +39,9 @@ defmodule Ferricstore.Raft.CommandStamp do
 
   @spec decode_ttb(term()) :: {:ok, stamped_command()} | {:error, :invalid_preencoded_command}
   def decode_ttb(binary) when is_binary(binary) do
-    with {:ok, term} <- TermCodec.decode(binary) do
+    # The log is written by this cluster; replay must not depend on which
+    # atoms the restarted VM happens to have created already.
+    with {:ok, term} <- TermCodec.decode_trusted(binary) do
       case term do
         {command,
          %{
