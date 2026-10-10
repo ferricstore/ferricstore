@@ -531,6 +531,56 @@ defmodule FerricstoreServer.Native.LaneBarrierReviewTest do
     end
   end
 
+  test "pubsub messages are delivered while a barrier waits", %{keys: [list, _, _]} do
+    channel = list <> ":channel"
+    socket = connect()
+    publisher = connect()
+
+    send_frames(socket, [command(2, 170, "SUBSCRIBE", [channel])])
+    assert {170, {0, _}} = response_value(socket)
+
+    # SUBSCRIBE on busy lane 1 waits on that lane's barrier for about 1s.
+    send_frames(socket, [
+      command(1, 171, "DEBUG", ["SLEEP", "1"]),
+      command(1, 172, "SUBSCRIBE", [channel <> ":other"])
+    ])
+
+    Process.sleep(150)
+    started = System.monotonic_time(:millisecond)
+    send_frames(publisher, [command(1, 173, "PUBLISH", [channel, "during-barrier"])])
+
+    assert {:ok, _frame} = read_until_body_contains(socket, "during-barrier")
+    elapsed = System.monotonic_time(:millisecond) - started
+    assert elapsed < 400, "pubsub waited #{elapsed}ms behind a lane barrier"
+  end
+
+  test "pubsub during a barrier stops at an ACL invalidation in arrival order" do
+    existing = connection_pids()
+    socket = connect()
+    connection_pid = wait_for_new_connection(existing)
+
+    send_frames(socket, [command(1, 180, "DEBUG", ["SLEEP", "1"]), set_name(0, 181)])
+    Process.sleep(150)
+    send(connection_pid, {:pubsub_message, "ordered", "before-acl"})
+    send(connection_pid, {:acl_invalidate, :all, 1})
+    send(connection_pid, {:pubsub_message, "ordered", "after-acl"})
+
+    assert {:ok, _} = read_until_body_contains(socket, "before-acl")
+    assert {:error, :closed} = read_until_body_contains(socket, "after-acl")
+  end
+
+  defp read_until_body_contains(socket, needle) do
+    case read_frame(socket, 3_000) do
+      {:ok, {_lane, _opcode, _id, body} = frame} ->
+        if :binary.match(body, needle) != :nomatch,
+          do: {:ok, frame},
+          else: read_until_body_contains(socket, needle)
+
+      error ->
+        error
+    end
+  end
+
   defp connect do
     {:ok, socket} =
       :gen_tcp.connect({127, 0, 0, 1}, Listener.port(), [:binary, active: false], 2_000)

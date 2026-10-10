@@ -137,6 +137,7 @@ defmodule FerricstoreServer.Native.Connection do
     deferred_frames: %{},
     deferred_reply_total: 0,
     deferred_release_due: false,
+    barrier_decode_continue: false,
     authenticated: false,
     require_auth: false,
     compact_flow_responses: false,
@@ -1722,12 +1723,27 @@ defmodule FerricstoreServer.Native.Connection do
     # One deadline bounds the whole synchronous frame, not each lane in turn.
     deadline = lane_barrier_deadline(state)
 
-    if lane_id(frame) == @control_lane or Commands.control_opcode?(opcode(frame)) do
-      synchronize_control_frame(state, deadline)
-    else
-      await_lane_barriers(state, [lane_id(frame)], deadline)
-    end
+    result =
+      if lane_id(frame) == @control_lane or Commands.control_opcode?(opcode(frame)) do
+        synchronize_control_frame(state, deadline)
+      else
+        await_lane_barriers(state, [lane_id(frame)], deadline)
+      end
+
+    replay_barrier_decode_continue(result)
   end
+
+  defp replay_barrier_decode_continue({:ok, %{barrier_decode_continue: true} = state}) do
+    send(self(), :native_decode_continue)
+    {:ok, %{state | barrier_decode_continue: false}}
+  end
+
+  defp replay_barrier_decode_continue({:error, reason, %{barrier_decode_continue: true} = state}) do
+    send(self(), :native_decode_continue)
+    {:error, reason, %{state | barrier_decode_continue: false}}
+  end
+
+  defp replay_barrier_decode_continue(result), do: result
 
   # Control frames follow every earlier frame, including lane-local work deferred
   # behind busy lanes. Work behind a blocking command stays deferred, as before.
@@ -1795,147 +1811,144 @@ defmodule FerricstoreServer.Native.Connection do
     end
   end
 
+  # Take every message in arrival order instead of selectively receiving
+  # barrier messages: a selective receive rescans everything left behind
+  # (pubsub under load) on each wakeup and delays its delivery until the
+  # barrier ends.
   defp wait_for_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline) do
     timeout = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    if timeout == 0 do
+      {:error, lane_barrier_timeout_error(lane_id), state}
+    else
+      receive do
+        message ->
+          handle_barrier_message(state, lane_id, barrier_ref, monitor_ref, deadline, message)
+      after
+        timeout ->
+          {:error, lane_barrier_timeout_error(lane_id), state}
+      end
+    end
+  end
+
+  defp handle_barrier_message(state, lane_id, barrier_ref, monitor_ref, deadline, message) do
     socket = state.socket
 
-    cond do
-      timeout == 0 ->
-        {:error, lane_barrier_timeout_error(lane_id), state}
+    wait = fn state ->
+      wait_for_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline)
+    end
 
-      true ->
-        receive do
-          {:native_lane_barrier, ^lane_id, ^barrier_ref} ->
-            {:ok, state}
+    case message do
+      {:native_lane_barrier, ^lane_id, ^barrier_ref} ->
+        {:ok, state}
 
-          message = {:native_lane_response, _response_lane_id, _iodata, _request_bytes} ->
-            continue_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
+      {:native_blocking_done, _meta, _pid} ->
+        continue_blocking_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
 
-          message = {:native_lane_response, _response_lane_id, _iodata} ->
-            continue_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
+      {:native_blocking_response_budgeted, _meta, _pid, _status, _value, %OutboundBudget{}} ->
+        continue_blocking_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
 
-          message =
-              {:native_lane_response_budgeted, _response_lane_id, _iodata, _request_bytes, _lease} ->
-            continue_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
+      {:native_blocking_outbound_overflow, _meta, _pid} ->
+        continue_blocking_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
 
-          message =
-              {:native_lane_responses, _response_lane_id, _iodata_list, _done_count,
-               _request_bytes} ->
-            continue_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
+      {:native_blocking_response, _meta, _pid, _status, _value} ->
+        continue_blocking_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
 
-          message = {:native_lane_responses, _response_lane_id, _iodata_list, _done_count} ->
-            continue_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
+      {tag, ^socket, data} when tag in [:tcp, :ssl] ->
+        continue_lane_barrier_data(state, lane_id, barrier_ref, monitor_ref, deadline, data)
 
-          message =
-              {:native_lane_responses_budgeted, _response_lane_id, _iodata_list, _done_count,
-               _request_bytes, _lease} ->
-            continue_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
+      {tag, ^socket} when tag in [:tcp_passive, :ssl_passive] ->
+        continue_lane_barrier_input(
+          mark_input_consumed(state),
+          lane_id,
+          barrier_ref,
+          monitor_ref,
+          deadline
+        )
 
-          message = {:native_lane_done, _response_lane_id, _request_bytes} ->
-            continue_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
+      {tag, ^socket} when tag in [:tcp_closed, :ssl_closed] ->
+        {:error, "ERR native connection closed while waiting for lane #{lane_id}", state}
 
-          message = {:native_lane_done, _response_lane_id} ->
-            continue_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
+      {tag, ^socket, reason} when tag in [:tcp_error, :ssl_error] ->
+        {:error,
+         "ERR native connection failed while waiting for lane #{lane_id}: #{inspect(reason)}",
+         state}
 
-          message = {:native_lane_done_many, _response_lane_id, _done_count, _request_bytes} ->
-            continue_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
+      :client_kill ->
+        {:error, "ERR native connection stopped while waiting for lane #{lane_id}", state}
 
-          message = {:native_lane_done_many, _response_lane_id, _done_count} ->
-            continue_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
-
-          message =
-              {:native_lane_outbound_overflow, _response_lane_id, _done_count, _request_bytes} ->
-            continue_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
-
-          message = {:native_blocking_done, _meta, _pid} ->
-            continue_blocking_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
-
-          message =
-              {:native_blocking_response_budgeted, _meta, _pid, _status, _value,
-               %OutboundBudget{}} ->
-            continue_blocking_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
-
-          message = {:native_blocking_outbound_overflow, _meta, _pid} ->
-            continue_blocking_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
-
-          message = {:native_blocking_response, _meta, _pid, _status, _value} ->
-            continue_blocking_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
-
-          {:tcp, ^socket, data} ->
-            continue_lane_barrier_data(
-              state,
-              lane_id,
-              barrier_ref,
-              monitor_ref,
-              deadline,
-              data
-            )
-
-          {:ssl, ^socket, data} ->
-            continue_lane_barrier_data(
-              state,
-              lane_id,
-              barrier_ref,
-              monitor_ref,
-              deadline,
-              data
-            )
-
-          {:tcp_passive, ^socket} ->
-            continue_lane_barrier_input(
-              mark_input_consumed(state),
-              lane_id,
-              barrier_ref,
-              monitor_ref,
-              deadline
-            )
-
-          {:ssl_passive, ^socket} ->
-            continue_lane_barrier_input(
-              mark_input_consumed(state),
-              lane_id,
-              barrier_ref,
-              monitor_ref,
-              deadline
-            )
-
-          {:tcp_closed, ^socket} ->
-            {:error, "ERR native connection closed while waiting for lane #{lane_id}", state}
-
-          {:ssl_closed, ^socket} ->
-            {:error, "ERR native connection closed while waiting for lane #{lane_id}", state}
-
-          {:tcp_error, ^socket, reason} ->
-            {:error,
-             "ERR native connection failed while waiting for lane #{lane_id}: #{inspect(reason)}",
-             state}
-
-          {:ssl_error, ^socket, reason} ->
-            {:error,
-             "ERR native connection failed while waiting for lane #{lane_id}: #{inspect(reason)}",
-             state}
-
-          :client_kill ->
-            {:error, "ERR native connection stopped while waiting for lane #{lane_id}", state}
-
-          {:acl_invalidate, username, _revision} ->
-            if Responses.acl_invalidation_affects_session?(state, username) do
-              {:error,
-               "ERR native connection authorization changed while waiting for lane #{lane_id}",
-               notify_acl_invalidated(state, username)}
-            else
-              wait_for_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline)
-            end
-
-          {:DOWN, ^monitor_ref, :process, _pid, reason} when is_reference(monitor_ref) ->
-            {:error, lane_barrier_down_error(lane_id, reason), state}
-
-          message = {:DOWN, _monitor_ref, :process, _pid, _reason} ->
-            continue_blocking_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
-        after
-          timeout ->
-            {:error, lane_barrier_timeout_error(lane_id), state}
+      {:acl_invalidate, username, _revision} ->
+        if Responses.acl_invalidation_affects_session?(state, username) do
+          {:error,
+           "ERR native connection authorization changed while waiting for lane #{lane_id}",
+           notify_acl_invalidated(state, username)}
+        else
+          wait.(state)
         end
+
+      {:DOWN, ^monitor_ref, :process, _pid, reason} ->
+        {:error, lane_barrier_down_error(lane_id, reason), state}
+
+      {:DOWN, _monitor_ref, :process, _pid, _reason} ->
+        continue_blocking_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
+
+      :native_decode_continue ->
+        # Decoding resumes after the barrier; replay the trigger then.
+        wait.(%{state | barrier_decode_continue: true})
+
+      {:native_goaway, payload} ->
+        native_send(state, Responses.encode_event(state, @op_goaway, payload), :event)
+        wait.(state)
+
+      {:native_topology_changed, payload} ->
+        maybe_send_event(
+          state,
+          "TOPOLOGY_CHANGED",
+          Map.merge(Responses.topology_payload(), payload)
+        )
+
+        wait.(state)
+
+      {:flow_claim_due_wake, :ready} ->
+        state = Commands.refresh_flow_wake_subscription(state)
+        maybe_send_event(state, "FLOW_WAKE", Commands.flow_wake_event_payload(state))
+        wait.(state)
+
+      event when elem(event, 0) in [:pubsub_message, :pubsub_pmessage] ->
+        # Pubsub is not ordered with any lane; deliver it now, coalesced as in
+        # the main loop. A non-pubsub message ends the batch and is handled next.
+        case deliver_pubsub_events(state, event) do
+          {:ok, nil} ->
+            wait.(state)
+
+          {:ok, next} ->
+            handle_barrier_message(state, lane_id, barrier_ref, monitor_ref, deadline, next)
+
+          :error ->
+            {:error, "ERR native pubsub delivery failed while waiting for lane #{lane_id}", state}
+        end
+
+      {:pubsub_messages, _channel, _messages, _lease_or_prepared} = batch ->
+        barrier_pubsub_batch(state, lane_id, batch, wait)
+
+      {:pubsub_messages, _channel, _messages} = batch ->
+        barrier_pubsub_batch(state, lane_id, batch, wait)
+
+      {:pubsub_messages, _channel, _messages, %PreparedPubSubBatch{}, _lease} = batch ->
+        barrier_pubsub_batch(state, lane_id, batch, wait)
+
+      _lane_or_other ->
+        continue_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
+    end
+  end
+
+  defp barrier_pubsub_batch(state, lane_id, batch, wait) do
+    case deliver_pubsub_batch_message(state, batch) do
+      :ok ->
+        wait.(state)
+
+      :error ->
+        {:error, "ERR native pubsub delivery failed while waiting for lane #{lane_id}", state}
     end
   end
 
@@ -2920,7 +2933,16 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp send_pubsub_events(state, first_event) do
-    {events, barrier} =
+    case deliver_pubsub_events(state, first_event) do
+      {:ok, next_message} -> continue_after_pubsub_events(state, next_message)
+      :error -> close_for_outbound_failure(state)
+    end
+  end
+
+  # Returns the first non-pubsub message the coalescer pulled, if any, so the
+  # caller handles it next in arrival order.
+  defp deliver_pubsub_events(state, first_event) do
+    {events, next_message} =
       PubSubCoalescer.collect(
         first_event,
         state.response_coalesce_max,
@@ -2937,13 +2959,13 @@ defmodule FerricstoreServer.Native.Connection do
           end
 
         case result do
-          :ok -> continue_after_pubsub_events(state, barrier)
-          {:error, _reason} -> close_for_outbound_failure(state)
+          :ok -> {:ok, next_message}
+          {:error, _reason} -> :error
         end
 
       {:error, leases} ->
         release_pubsub_leases(leases)
-        close_for_outbound_failure(state)
+        :error
     end
   end
 
@@ -2953,6 +2975,30 @@ defmodule FerricstoreServer.Native.Connection do
     do: dispatch_connection_message(state, barrier)
 
   defp send_pubsub_batch(state, channel, messages, lease, prepared) do
+    case deliver_pubsub_batch(state, channel, messages, lease, prepared) do
+      :ok -> loop(state)
+      :error -> close_for_outbound_failure(state)
+    end
+  end
+
+  defp deliver_pubsub_batch_message(state, {:pubsub_messages, channel, messages}),
+    do: deliver_pubsub_batch(state, channel, messages, nil, nil)
+
+  defp deliver_pubsub_batch_message(
+         state,
+         {:pubsub_messages, channel, messages, %OutboundBudget{} = lease}
+       ),
+       do: deliver_pubsub_batch(state, channel, messages, lease, nil)
+
+  defp deliver_pubsub_batch_message(
+         state,
+         {:pubsub_messages, channel, messages, %PreparedPubSubBatch{} = prepared, lease}
+       ),
+       do: deliver_pubsub_batch(state, channel, messages, lease, prepared)
+
+  defp deliver_pubsub_batch_message(_state, _unknown), do: :error
+
+  defp deliver_pubsub_batch(state, channel, messages, lease, prepared) do
     encoded =
       if pubsub_batch_codec_selected?(state) do
         safe_encode_guarded_pubsub_batch(state, channel, messages, prepared)
@@ -2973,18 +3019,18 @@ defmodule FerricstoreServer.Native.Connection do
               end
 
             case result do
-              :ok -> loop(state)
-              {:error, _reason} -> close_for_outbound_failure(state)
+              :ok -> :ok
+              {:error, _reason} -> :error
             end
 
           {:error, _reason} ->
             OutboundBudget.release(lease)
-            close_for_outbound_failure(state)
+            :error
         end
 
       {:error, _reason} ->
         OutboundBudget.release(lease)
-        close_for_outbound_failure(state)
+        :error
     end
   end
 
