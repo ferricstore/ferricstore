@@ -754,6 +754,15 @@ defmodule Ferricstore.Bitcask.NIF do
   def lmdb_prefix_entries(_path, _prefix, _limit, _map_size),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec lmdb_space(binary(), non_neg_integer()) ::
+          {:ok, {non_neg_integer(), non_neg_integer(), pos_integer()}} | {:error, term()}
+  def lmdb_space(_path, _map_size), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec lmdb_compact_copy(binary(), binary(), non_neg_integer()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def lmdb_compact_copy(_path, _destination, _map_size),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec lmdb_last_txn_id(binary(), non_neg_integer()) ::
           {:ok, non_neg_integer()} | {:error, term()}
   def lmdb_last_txn_id(_path, _map_size), do: :erlang.nif_error(:nif_not_loaded)

@@ -689,6 +689,68 @@ fn lmdb_last_txn_id<'a>(env: Env<'a>, path: String, map_size: u64) -> NifResult<
     }
 }
 
+/// Pages in the data file versus pages held by the B-trees (main and Flow
+/// databases plus the two meta pages); the difference is free space that LMDB
+/// reuses but never returns to the filesystem.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn lmdb_space<'a>(env: Env<'a>, path: String, map_size: u64) -> NifResult<Term<'a>> {
+    let store = match lmdb_store(&path, map_size) {
+        Ok(store) => store,
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
+    };
+
+    let rtxn = match store.env.read_txn() {
+        Ok(txn) => txn,
+        Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+    };
+
+    let db = match store.db.stat(&rtxn) {
+        Ok(stat) => stat,
+        Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+    };
+
+    let main = store.env.stat();
+    let file_pages = store.env.info().last_page_number as u64 + 1;
+    let used_pages = 2
+        + (main.branch_pages + main.leaf_pages + main.overflow_pages) as u64
+        + (db.branch_pages + db.leaf_pages + db.overflow_pages) as u64;
+
+    Ok((
+        atoms::ok(),
+        (file_pages, used_pages.min(file_pages), u64::from(main.page_size)),
+    )
+        .encode(env))
+}
+
+/// Writes a compacted copy of the environment to `destination` and fsyncs it.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn lmdb_compact_copy<'a>(
+    env: Env<'a>,
+    path: String,
+    destination: String,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    let store = match lmdb_store(&path, map_size) {
+        Ok(store) => store,
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
+    };
+
+    let file = match store
+        .env
+        .copy_to_path(&destination, heed::CompactionOption::Enabled)
+    {
+        Ok(file) => file,
+        Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+    };
+
+    match file.sync_all().and_then(|()| file.metadata()) {
+        Ok(metadata) => Ok((atoms::ok(), metadata.len()).encode(env)),
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
 #[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn lmdb_prefix_entries_after<'a>(

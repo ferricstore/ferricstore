@@ -232,6 +232,15 @@ if config_env() == :prod do
          configured -> String.to_integer(configured)
        end),
     flow_hibernation_enabled: boolean_env.("FERRICSTORE_FLOW_HIBERNATION_ENABLED", true),
+    # LMDB never shrinks its data file; at startup a shard whose file is at least
+    # this large and mostly free pages is replaced by a compacted copy.
+    flow_lmdb_startup_compaction: boolean_env.("FERRICSTORE_FLOW_LMDB_STARTUP_COMPACTION", true),
+    flow_lmdb_compaction_min_free_ratio:
+      String.to_float(System.get_env("FERRICSTORE_FLOW_LMDB_COMPACTION_MIN_FREE_RATIO", "0.5")),
+    flow_lmdb_compaction_min_file_bytes:
+      String.to_integer(
+        System.get_env("FERRICSTORE_FLOW_LMDB_COMPACTION_MIN_FILE_BYTES", "268435456")
+      ),
     flow_governance_limit_storage_cleanup_interval_ms:
       String.to_integer(
         System.get_env("FERRICSTORE_FLOW_LIMIT_STORAGE_CLEANUP_INTERVAL_MS", "1000")
