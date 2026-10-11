@@ -696,6 +696,7 @@ defmodule Ferricstore.Bitcask.NIF do
           | {:put_new, binary(), binary()}
           | {:delete, binary()}
           | {:compare, binary(), binary()}
+          | {:compare_any, binary(), [binary()]}
           | {:compare_missing, binary()}
   @type lmdb_original :: {binary(), :missing | {:value, binary()}}
 

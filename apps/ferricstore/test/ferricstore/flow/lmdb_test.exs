@@ -51,6 +51,40 @@ defmodule Ferricstore.Flow.LMDBUnitTest do
     refute File.exists?(path)
   end
 
+  test "compare_any accepts any listed encoding of the current value and is atomic" do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lmdb_compare_any_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    assert :ok = LMDB.write_batch(path, [{:put, "row", "legacy"}])
+
+    assert :ok =
+             LMDB.write_batch(path, [
+               {:compare_any, "row", ["compact", "legacy"]},
+               {:put, "row", "compact"}
+             ])
+
+    assert {:ok, "compact"} = LMDB.get(path, "row")
+
+    assert {:error, {:compare_failed, "row"}} =
+             LMDB.write_batch(path, [
+               {:compare_any, "row", ["legacy", "other"]},
+               {:delete, "row"}
+             ])
+
+    assert {:ok, "compact"} = LMDB.get(path, "row")
+
+    assert {:error, {:compare_failed, "missing"}} =
+             LMDB.write_batch(path, [{:compare_any, "missing", ["legacy"]}])
+
+    assert :ok = LMDB.write_batch(path, [{:compare_any, "row", ["compact"]}, {:delete, "row"}])
+    assert :not_found = LMDB.get(path, "row")
+  end
+
   test "LMDB transaction identity changes on a committed write without creating missing storage" do
     path =
       Path.join(

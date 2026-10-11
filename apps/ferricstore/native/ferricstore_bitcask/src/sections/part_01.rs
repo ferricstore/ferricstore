@@ -60,6 +60,7 @@ enum LmdbBatchWrite<'a> {
     PutNew(Binary<'a>, Binary<'a>),
     Delete(Binary<'a>),
     Compare(Binary<'a>, Binary<'a>),
+    CompareAny(Binary<'a>, Vec<Binary<'a>>),
     CompareMissing(Binary<'a>),
 }
 

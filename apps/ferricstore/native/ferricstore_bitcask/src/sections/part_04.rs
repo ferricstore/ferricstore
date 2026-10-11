@@ -1511,6 +1511,7 @@ fn lmdb_write_batch_impl<'a>(
                     | LmdbBatchWrite::PutNew(key, _)
                     | LmdbBatchWrite::Delete(key)
                     | LmdbBatchWrite::Compare(key, _)
+                    | LmdbBatchWrite::CompareAny(key, _)
                     | LmdbBatchWrite::CompareMissing(key) => key.as_slice(),
                 };
 
@@ -1540,6 +1541,23 @@ fn lmdb_write_batch_impl<'a>(
                     LmdbBatchWrite::Compare(key, expected) => {
                         match store.db.get(&wtxn, key.as_slice()) {
                             Ok(Some(current)) if current == expected.as_slice() => Ok(()),
+                            Ok(_) => {
+                                let key_term = binary_term(env, key.as_slice())?;
+
+                                return Ok(
+                                    (atoms::error(), (atoms::compare_failed(), key_term)).encode(env)
+                                );
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    LmdbBatchWrite::CompareAny(key, expected) => {
+                        match store.db.get(&wtxn, key.as_slice()) {
+                            Ok(Some(current))
+                                if expected.iter().any(|value| current == value.as_slice()) =>
+                            {
+                                Ok(())
+                            }
                             Ok(_) => {
                                 let key_term = binary_term(env, key.as_slice())?;
 
@@ -1602,6 +1620,7 @@ fn lmdb_record_key<'a>(record: &'a LmdbBatchWrite<'_>) -> &'a [u8] {
         | LmdbBatchWrite::PutNew(key, _)
         | LmdbBatchWrite::Delete(key)
         | LmdbBatchWrite::Compare(key, _)
+        | LmdbBatchWrite::CompareAny(key, _)
         | LmdbBatchWrite::CompareMissing(key) => key.as_slice(),
     }
 }
