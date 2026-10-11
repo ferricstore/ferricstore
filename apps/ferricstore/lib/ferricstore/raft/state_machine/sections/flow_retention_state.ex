@@ -44,8 +44,57 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
 
+      # Planning runs outside Raft apply, where state read failures are not
+      # turned into command errors. Collect them here so a storage failure is
+      # reported instead of looking like there is nothing to clean up.
       @doc false
       def flow_retention_plan(state, attrs) when is_map(state) and is_map(attrs) do
+        previous_failure =
+          Process.get(:sm_state_read_failure, :__ferricstore_retention_read_failure_unset__)
+
+        Process.put(:sm_state_read_failure, nil)
+
+        try do
+          {:ok, plan} = do_flow_retention_plan(state, attrs)
+
+          case Process.get(:sm_state_read_failure) do
+            nil ->
+              {:ok, plan}
+
+            reason ->
+              report_flow_retention_read_failure(state, reason)
+              {:ok, Map.put(plan, :state_read_failed, reason)}
+          end
+        after
+          failure = Process.get(:sm_state_read_failure)
+
+          case previous_failure do
+            :__ferricstore_retention_read_failure_unset__ ->
+              Process.delete(:sm_state_read_failure)
+
+            nil ->
+              Process.put(:sm_state_read_failure, failure)
+
+            previous ->
+              Process.put(:sm_state_read_failure, previous)
+          end
+        end
+      end
+
+      defp report_flow_retention_read_failure(state, reason) do
+        :telemetry.execute(
+          [:ferricstore, :flow, :retention, :state_read_failed],
+          %{count: 1},
+          %{shard_index: state.shard_index, reason: reason}
+        )
+
+        Logger.warning(
+          "Flow retention planning on shard #{state.shard_index} could not read Flow " <>
+            "storage and skipped the affected records: #{inspect(reason, limit: 20)}"
+        )
+      end
+
+      defp do_flow_retention_plan(state, attrs) do
         now_ms = flow_attrs_now_ms(attrs)
         limit = Map.get(attrs, :limit, 100)
         plan_kind = Map.get(attrs, :plan_kind, :all)
@@ -141,8 +190,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
                  now_ms,
                  lmdb_limit
                ) do
-            {:ok, state_keys} -> state_keys
-            {:error, _reason} -> []
+            {:ok, state_keys} ->
+              state_keys
+
+            {:error, reason} ->
+              _ = record_state_read_failure({:flow_retention_terminal_index_read_failed, reason})
+              []
           end
 
         {state_keys, _seen} =
@@ -429,8 +482,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
                  now_ms,
                  lmdb_limit
                ) do
-            {:ok, state_keys} -> state_keys
-            {:error, _reason} -> []
+            {:ok, state_keys} ->
+              state_keys
+
+            {:error, reason} ->
+              _ = record_state_read_failure({:flow_retention_active_index_read_failed, reason})
+              []
           end
 
         {state_keys, _seen} =

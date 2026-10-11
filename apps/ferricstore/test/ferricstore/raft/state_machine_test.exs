@@ -1145,6 +1145,43 @@ defmodule Ferricstore.Raft.StateMachineTest do
     assert [] = :ets.lookup(ets, "local-key")
   end
 
+  test "retention planning reports Flow storage it cannot read instead of planning nothing", %{
+    state: state
+  } do
+    unreadable_lmdb =
+      Path.join(System.tmp_dir!(), "sm_unreadable_lmdb_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(unreadable_lmdb)
+    File.write!(Path.join(unreadable_lmdb, "data.mdb"), :binary.copy(<<0xAB>>, 65_536))
+    on_exit(fn -> File.rm_rf!(unreadable_lmdb) end)
+
+    event = [:ferricstore, :flow, :retention, :state_read_failed]
+    telemetry_ref = :telemetry_test.attach_event_handlers(self(), [event])
+    on_exit(fn -> :telemetry.detach(telemetry_ref) end)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        send(
+          self(),
+          {:plan,
+           Ferricstore.Raft.StateMachine.flow_retention_plan(
+             %{state | flow_lmdb_path: unreadable_lmdb},
+             %{
+               now_ms: System.system_time(:millisecond),
+               limit: 10
+             }
+           )}
+        )
+      end)
+
+    assert_received {:plan, {:ok, %{active_candidates: [], state_read_failed: reason}}}
+    assert reason != nil
+
+    shard_index = state.shard_index
+    assert_received {^event, ^telemetry_ref, %{count: 1}, %{shard_index: ^shard_index}}
+    assert log =~ "Flow retention planning on shard #{shard_index} could not read"
+  end
+
   @tag :flow_replay_visibility
   test "WARaft recovery hides same-command Flow state and registry entries", %{
     state: state,
