@@ -1,6 +1,7 @@
 defmodule Ferricstore.Flow do
   @moduledoc false
 
+  alias Ferricstore.Flow.UserValue
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.ClaimWaiters
   alias Ferricstore.Flow.Codec
@@ -14,6 +15,7 @@ defmodule Ferricstore.Flow do
   @claim_waiter_min_wake_budget_per_ready_bucket 8
 
   def create(ctx, id, opts) when is_binary(id) and is_list(opts) do
+    UserValue.validate_opts!(opts)
     started = flow_start_time()
 
     result =
@@ -38,6 +40,7 @@ defmodule Ferricstore.Flow do
 
   def start_and_claim(ctx, id, type, initial_state, opts)
       when is_binary(id) and is_binary(type) and is_binary(initial_state) and is_list(opts) do
+    UserValue.validate_opts!(opts)
     started = flow_start_time()
 
     result =
@@ -69,6 +72,8 @@ defmodule Ferricstore.Flow do
   def run_steps_many(_ctx, [], _opts), do: :ok
 
   def run_steps_many(ctx, items, opts) when is_list(items) and is_list(opts) do
+    UserValue.validate_opts!(opts)
+    UserValue.validate_items!(items)
     started = flow_start_time()
 
     result =
@@ -419,6 +424,8 @@ defmodule Ferricstore.Flow do
 
   def create_many(ctx, partition_key, items, opts)
       when is_list(items) and is_list(opts) do
+    UserValue.validate_opts!(opts)
+    UserValue.validate_items!(items)
     started = flow_start_time()
 
     result =
@@ -464,6 +471,8 @@ defmodule Ferricstore.Flow do
 
   def spawn_children(ctx, parent_id, children, opts)
       when is_binary(parent_id) and is_list(children) and is_list(opts) do
+    UserValue.validate_opts!(opts)
+    UserValue.validate_items!(children)
     started = flow_start_time()
 
     result =
@@ -790,6 +799,7 @@ defmodule Ferricstore.Flow do
 
   def complete(ctx, id, lease_token, opts \\ [])
       when is_binary(id) and is_binary(lease_token) and is_list(opts) do
+    UserValue.validate_opts!(opts)
     started = flow_start_time()
 
     result =
@@ -854,6 +864,7 @@ defmodule Ferricstore.Flow do
 
   def transition(ctx, id, from_state, to_state, opts \\ [])
       when is_binary(id) and is_binary(from_state) and is_binary(to_state) and is_list(opts) do
+    UserValue.validate_opts!(opts)
     started = flow_start_time()
 
     result =
@@ -930,6 +941,7 @@ defmodule Ferricstore.Flow do
   def step_continue(ctx, id, lease_token, from_state, to_state, opts)
       when is_binary(id) and is_binary(lease_token) and is_binary(from_state) and
              is_binary(to_state) and is_list(opts) do
+    UserValue.validate_opts!(opts)
     started = flow_start_time()
 
     result =
@@ -1244,6 +1256,7 @@ defmodule Ferricstore.Flow do
 
   def retry(ctx, id, lease_token, opts)
       when is_binary(id) and is_binary(lease_token) and is_list(opts) do
+    UserValue.validate_opts!(opts)
     started = flow_start_time()
 
     result =
@@ -1316,6 +1329,7 @@ defmodule Ferricstore.Flow do
 
   def fail(ctx, id, lease_token, opts \\ [])
       when is_binary(id) and is_binary(lease_token) and is_list(opts) do
+    UserValue.validate_opts!(opts)
     started = flow_start_time()
 
     result =
