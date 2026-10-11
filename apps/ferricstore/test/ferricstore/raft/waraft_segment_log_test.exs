@@ -983,7 +983,10 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
 
         :erlang.trace_pattern({provider, :read_disk_record_fd, 7}, true, [:local])
         :erlang.trace(reader, true, [:call])
-        on_exit(fn -> :erlang.trace_pattern({provider, :read_disk_record_fd, 7}, false, [:local]) end)
+
+        on_exit(fn ->
+          :erlang.trace_pattern({provider, :read_disk_record_fd, 7}, false, [:local])
+        end)
 
         send(reader, :go)
         assert_receive {:got, {:ok, {1, {:cmd, "entry-50"}}}}, 5_000
@@ -1003,5 +1006,4 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
       end
     )
   end
-
 end
