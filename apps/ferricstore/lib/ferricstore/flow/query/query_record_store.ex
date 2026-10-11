@@ -844,6 +844,16 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
         {:error, :hydrated_record_identity_mismatch} = error ->
           error
 
+        # The bytes at the locator are not this record (e.g. the log was
+        # rewritten under it): repairable like an identity mismatch, and not a
+        # retryable storage outage if repair cannot move the locator.
+        {:error, reason}
+        when reason == :hydrated_record_size_mismatch or
+               (is_tuple(reason) and tuple_size(reason) == 4 and
+                  elem(reason, 0) == :record_size_mismatch) or
+               (is_tuple(reason) and tuple_size(reason) == 2 and elem(reason, 0) == :crc_mismatch) ->
+          {:error, :hydrated_record_identity_mismatch}
+
         {:error, :hydration_timeout} ->
           {:error, :query_deadline_exceeded}
 

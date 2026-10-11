@@ -769,6 +769,34 @@ defmodule Ferricstore.Flow.Query.QueryRecordStoreTest do
     assert :counters.get(calls, 3) == 1
   end
 
+  test "a location holding another record is inconsistent, not retryable, when repair cannot move it" do
+    for stale_error <- [
+          {:record_size_mismatch, 10, 180, 653},
+          {:crc_mismatch, 10},
+          :hydrated_record_size_mismatch
+        ] do
+      record = record("run-stale-location", 1)
+      unchanged = row(record, 10)
+      key = state_key(record)
+      repairs = :counters.new(1, [])
+
+      assert {:error, :query_storage_inconsistent} =
+               QueryRecordStore.read_many(context(), 0, "/lmdb", [key], 1_000, 10_000,
+                 query_row_read: fn _path, [^key], 1_000, _max_bytes ->
+                   {:ok, [unchanged], 100, true}
+                 end,
+                 hydrate: fn _ctx, 0, [{^key, _locator}], _opts -> {:error, stale_error} end,
+                 repair_locators: fn _ctx, 0, "/lmdb", [{^key, _locator}] ->
+                   :counters.add(repairs, 1, 1)
+                   {:ok, 0}
+                 end
+               ),
+             "#{inspect(stale_error)} must not be reported as retryable storage unavailability"
+
+      assert :counters.get(repairs, 1) == 1
+    end
+  end
+
   test "fails closed when identity-mismatch locator repair makes no progress" do
     record = record("run-identity-no-repair", 1)
     unchanged = row(record, 10)
