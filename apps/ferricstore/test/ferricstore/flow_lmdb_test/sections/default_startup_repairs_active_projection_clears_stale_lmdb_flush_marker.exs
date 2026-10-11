@@ -21,7 +21,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.DefaultStartupRepairsActiveProjecti
 
         on_exit(fn ->
           restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
-          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
           File.rm_rf!(data_dir)
         end)
 
@@ -137,7 +136,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.DefaultStartupRepairsActiveProjecti
         keydir = :ets.new(:flow_lmdb_default_segment_replay_reconcile_keydir, [:set])
 
         on_exit(fn ->
-          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
           File.rm_rf!(data_dir)
         end)
 

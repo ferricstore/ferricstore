@@ -26,7 +26,6 @@ defmodule Ferricstore.Raft.ServerCatalogApplyTest do
       })
 
     on_exit(fn ->
-      if :ets.info(table) != :undefined, do: :ets.delete(table)
       File.rm_rf!(root)
     end)
 

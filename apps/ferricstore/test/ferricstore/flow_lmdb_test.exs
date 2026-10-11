@@ -147,7 +147,6 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     on_exit(fn ->
       Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(data_dir, shard_index)
-      if :ets.info(source_keydir) != :undefined, do: :ets.delete(source_keydir)
       File.rm_rf!(data_dir)
     end)
 

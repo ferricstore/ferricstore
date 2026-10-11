@@ -554,7 +554,6 @@ defmodule Ferricstore.Raft.FlushShardApplyTest do
         end
       end
 
-      if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
       SharedRefBackfill.invalidate_verified_shard!(state.instance_name, state.shard_index)
       _ = LMDB.release(state.flow_lmdb_path)
       File.rm_rf!(root)
