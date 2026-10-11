@@ -613,6 +613,4 @@ defmodule FerricstoreServer.Native.ResourceBudgetTest do
       :ok
     end
   end
-
-  end
 end
