@@ -171,6 +171,15 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
          {:ok, metadata_contract} <- index_metadata_contract(ctx),
          {:ok, catalog} <-
            IndexCatalog.load(catalog_path, scope_bytes: metadata_contract.scope_bytes),
+         {:ok, catalog} <-
+           IndexCatalog.select_builtin(
+             catalog,
+             Keyword.get(
+               opts,
+               :builtin_indexes,
+               Application.get_env(:ferricstore, :flow_query_builtin_indexes, :all)
+             )
+           ),
          {:ok, loaded, persist?} <- load_registry(ctx, catalog, metadata_contract),
          {:ok, table} <- create_cache(ctx),
          state = Map.merge(loaded, %{instance_ctx: ctx, cache_table: table}),

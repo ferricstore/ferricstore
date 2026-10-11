@@ -241,6 +241,16 @@ if config_env() == :prod do
       String.to_integer(
         System.get_env("FERRICSTORE_FLOW_LMDB_COMPACTION_MIN_FILE_BYTES", "268435456")
       ),
+    # Built-in composite query indexes to maintain: "all", "none" or a
+    # comma-separated list of index ids from priv/flow_query/index-catalog.json.
+    # Deselected indexes are retired and their rows deleted; selecting one again
+    # rebuilds it once any retirement still in progress has finished.
+    flow_query_builtin_indexes:
+      (case String.trim(System.get_env("FERRICSTORE_FLOW_QUERY_BUILTIN_INDEXES", "all")) do
+         "all" -> :all
+         "none" -> :none
+         ids -> ids |> String.split(",", trim: true) |> Enum.map(&String.trim/1)
+       end),
     flow_governance_limit_storage_cleanup_interval_ms:
       String.to_integer(
         System.get_env("FERRICSTORE_FLOW_LIMIT_STORAGE_CLEANUP_INTERVAL_MS", "1000")
