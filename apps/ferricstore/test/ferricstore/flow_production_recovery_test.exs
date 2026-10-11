@@ -7,6 +7,8 @@ defmodule Ferricstore.FlowProductionRecoveryTest do
   @moduletag timeout: 180_000
 
   alias Ferricstore.Flow.{Keys, LMDB}
+  alias Ferricstore.Flow.Query.{QueryRow, QueryRowCodec}
+  alias Ferricstore.Raft.WARaftSegmentReader
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
@@ -271,6 +273,130 @@ defmodule Ferricstore.FlowProductionRecoveryTest do
                fn -> LMDB.get(lmdb_path, state_key) == :not_found end,
                "retention cleanup should delete the expired QueryRow; pages=#{inspect(cleanup_pages)}"
              )
+  end
+
+  test "retention deletes a cold expired QueryRow whose apply-projection source was compacted away by a process restart",
+       %{isolated: isolated} do
+    id = unique("expired-cold-row")
+    type = unique("expired-cold-row-type")
+    partition = unique("expired-cold-row-partition")
+    now_ms = System.system_time(:millisecond)
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: type,
+               state: "recorded",
+               partition_key: partition,
+               idempotent: true,
+               run_at_ms: now_ms,
+               now_ms: now_ms
+             )
+
+    assert {:ok, [%{id: ^id} = claimed]} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               states: ["recorded"],
+               worker: "expired-cold-row-test",
+               limit: 1,
+               now_ms: now_ms + 1
+             )
+
+    cancel_now_ms = System.system_time(:millisecond)
+
+    assert :ok =
+             FerricStore.flow_cancel(id,
+               partition_key: partition,
+               lease_token: claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               ttl_ms: 1,
+               now_ms: cancel_now_ms
+             )
+
+    ctx = FerricStore.Instance.get(:default)
+    state_key = Keys.state_key(id, partition)
+    shard_index = Router.shard_for(ctx, state_key)
+
+    lmdb_path =
+      isolated.tmp_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> LMDB.path()
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count, 45_000)
+    assert {:ok, _query_row} = LMDB.get(lmdb_path, state_key)
+
+    assert :ok =
+             ShardHelpers.eventually(
+               fn -> FerricStore.flow_get(id, partition_key: partition) == {:ok, nil} end,
+               "the cancelled Flow should expire before the restart"
+             )
+
+    # The shutdown snapshot compacts the apply-projection log. Expired
+    # QueryRows are neither retained nor relocated by that rewrite, so the
+    # cold row keeps a physical locator into a log that now holds other frames.
+    :ok = restart_as_new_process(isolated, ctx.shard_count)
+    restarted_ctx = FerricStore.Instance.get(:default)
+    assert shard_index == Router.shard_for(restarted_ctx, state_key)
+
+    assert {:ok, encoded_row} = LMDB.get(lmdb_path, state_key),
+           "a process restart must preserve the cold expired QueryRow for retention"
+
+    assert {:ok, %QueryRow{expire_at_ms: expire_at_ms, locator: locator}} =
+             QueryRowCodec.decode(encoded_row, state_key, 0)
+
+    assert expire_at_ms > 0 and expire_at_ms <= cancel_now_ms + 10_000
+    assert {:waraft_apply_projection, _raft_index} = locator.file_id
+
+    refute WARaftSegmentReader.physical_location(restarted_ctx, shard_index, locator.file_id) ==
+             {:ok, {locator.segment_generation, locator.offset, locator.frame_size}},
+           "restart compaction should have moved the apply-projection frame under the row"
+
+    cleanup_pages = drain_retention_pages(cancel_now_ms + 10_000, nil, 64, [])
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.flush_all(
+               restarted_ctx.name,
+               restarted_ctx.shard_count,
+               45_000
+             )
+
+    assert :ok =
+             ShardHelpers.eventually(
+               fn -> LMDB.get(lmdb_path, state_key) == :not_found end,
+               "retention cleanup should delete the cold expired QueryRow; pages=#{inspect(cleanup_pages)}",
+               50,
+               100
+             )
+  end
+
+  # A real process restart does not inherit VM-local LMDB writer generations,
+  # so startup must not run the in-VM "writer restarted" dirty reconcile.
+  defp restart_as_new_process(
+         %{tmp_dir: data_dir, server_started?: server_started?},
+         shard_count
+       ) do
+    for app <- [:ferricstore_server, :ferricstore],
+        Enum.any?(Application.started_applications(), &(elem(&1, 0) == app)) do
+      _ = Application.stop(app)
+    end
+
+    Ferricstore.Raft.WARaftBackend.stop()
+
+    for shard_index <- 0..(shard_count - 1) do
+      :persistent_term.erase(
+        Ferricstore.Flow.LMDBWriter.Registry.enqueue_seq_key(:default, shard_index)
+      )
+    end
+
+    Application.put_env(:ferricstore, :data_dir, data_dir)
+    {:ok, _} = Application.ensure_all_started(:ferricstore)
+    ShardHelpers.wait_shards_alive(30_000)
+
+    if server_started? do
+      {:ok, _} = Application.ensure_all_started(:ferricstore_server)
+    end
+
+    Ferricstore.Health.set_ready(true)
+    :ok
   end
 
   defp drain_retention_pages(_now, _continuation, 0, pages),
