@@ -53,7 +53,7 @@ defmodule Ferricstore.Flow.LMDBCompaction do
     compact_file = Path.join(path, @compact_file)
     min_free_ratio = Keyword.get(opts, :min_free_ratio, @default_min_free_ratio)
     min_file_bytes = Keyword.get(opts, :min_file_bytes, @default_min_file_bytes)
-    _ = File.rm(compact_file)
+    _ = Ferricstore.FS.rm(compact_file)
 
     with {:ok, %File.Stat{type: :regular, size: before_bytes}} <- File.stat(data_file),
          :ok <- threshold(before_bytes >= min_file_bytes),
@@ -61,7 +61,7 @@ defmodule Ferricstore.Flow.LMDBCompaction do
          :ok <- threshold((file_pages - used_pages) / max(file_pages, 1) >= min_free_ratio),
          {:ok, _copied_bytes} <- NIF.lmdb_compact_copy(path, compact_file, LMDB.map_size()),
          :ok <- LMDB.release(path),
-         :ok <- File.rename(compact_file, data_file),
+         :ok <- Ferricstore.FS.rename(compact_file, data_file),
          :ok <- NIF.v2_fsync_dir(path),
          {:ok, %File.Stat{size: after_bytes}} <- File.stat(data_file) do
       {:ok, %{before_bytes: before_bytes, after_bytes: after_bytes}}
@@ -73,11 +73,11 @@ defmodule Ferricstore.Flow.LMDBCompaction do
         {:ok, :skipped}
 
       {:error, _reason} = error ->
-        _ = File.rm(compact_file)
+        _ = Ferricstore.FS.rm(compact_file)
         error
 
       other ->
-        _ = File.rm(compact_file)
+        _ = Ferricstore.FS.rm(compact_file)
         {:error, {:unexpected_lmdb_compaction_result, other}}
     end
   end
