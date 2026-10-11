@@ -467,14 +467,29 @@ segment_writer_loop(Registry, Key) ->
 segment_writer_serve(Registry, Key) ->
     receive
         {segment_writer_run, From, MRef, Fun} ->
-            From ! {MRef, started},
-            Result =
-                try Fun() of
-                    Value -> Value
-                catch
-                    Class:Reason:Stacktrace -> {error, {segment_writer_failed, Class, Reason, Stacktrace}}
-                end,
-            From ! {MRef, result, Result},
+            case is_process_alive(From) of
+                true ->
+                    %% wa_raft cancels an async append by killing its caller;
+                    %% the guard makes that kill stop this write, as it did
+                    %% when the write ran in the caller itself.
+                    Guard = spawn_link(fun() -> segment_writer_guard(From) end),
+                    From ! {MRef, started},
+                    Result =
+                        try Fun() of
+                            Value -> Value
+                        catch
+                            Class:Reason:Stacktrace -> {error, {segment_writer_failed, Class, Reason, Stacktrace}}
+                        end,
+                    true = unlink(Guard),
+                    true = exit(Guard, kill),
+                    From ! {MRef, result, Result};
+                false ->
+                    %% The caller died before this request was taken: no write.
+                    ok
+            end,
+            segment_writer_serve(Registry, Key);
+        {segment_writer_sync, From, MRef} ->
+            From ! {MRef, synced},
             segment_writer_serve(Registry, Key)
     after ?SEGMENT_WRITER_IDLE_MS ->
         %% Unregister first; a request racing this exit sees DOWN before
@@ -487,6 +502,44 @@ segment_writer_serve(Registry, Key) ->
         after 0 ->
             ok
         end
+    end.
+
+%% Ties one request's write to its caller, one way: the guard is linked to the
+%% writer and only monitors the caller, so a killed caller kills the writer,
+%% while a writer that dies for another reason leaves a live caller running
+%% (it gets {segment_writer_down, Reason}).
+segment_writer_guard(Caller) ->
+    MRef = erlang:monitor(process, Caller),
+    receive
+        {'DOWN', MRef, process, Caller, Reason} ->
+            exit({segment_writer_caller_down, Reason})
+    end.
+
+%% wa_raft rolls back a cancelled async append (close_process_writers, then
+%% truncate) as soon as its caller is dead, which can be before the guard has
+%% killed the writer. The write ran in this directory's segment writer, so wait
+%% until the writer has died with that caller or has finished the request
+%% before the rollback truncates.
+await_segment_writer_idle(Dir) ->
+    Registry = ensure_writer_registry(),
+    Key = {segment_writer_proc, writer_dir_from_dir(Dir)},
+    case writer_registry_lookup(Registry, Key) of
+        [{Key, Pid}] when is_pid(Pid) ->
+            MRef = erlang:monitor(process, Pid),
+            Pid ! {segment_writer_sync, self(), MRef},
+            Timeout = file_writer_call_timeout_ms(),
+            receive
+                {MRef, synced} ->
+                    erlang:demonitor(MRef, [flush]),
+                    ok;
+                {'DOWN', MRef, process, Pid, _Reason} ->
+                    ok
+            after Timeout ->
+                erlang:demonitor(MRef, [flush]),
+                {error, {segment_writer_busy, Pid, Timeout}}
+            end;
+        _None ->
+            ok
     end.
 
 %% A writer keeps descriptors across appends. A destructive rewrite can only

@@ -1476,7 +1476,11 @@ close(Log, _State) ->
     ok.
 
 close_process_writers(#raft_log{} = Log) ->
-    close_writers_for_dir_owner(log_dir(Log), self()).
+    Dir = log_dir(Log),
+    case await_segment_writer_idle(Dir) of
+        ok -> close_writers_for_dir_owner(Dir, self());
+        {error, _Reason} = Error -> Error
+    end.
 
 reset(#raft_log{name = Name} = Log, #raft_log_pos{index = Index, term = Term}, State) ->
     Record = {Index, {Term, undefined}},
