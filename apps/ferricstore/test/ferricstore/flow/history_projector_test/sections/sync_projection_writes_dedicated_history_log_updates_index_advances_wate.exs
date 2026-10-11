@@ -417,7 +417,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.SyncProjectionWritesDed
         assert {:ok,
                 {_event_id, _event_ms, _expire_at_ms, _compound_key, {:flow_history, 0}, offset,
                  value_size}} =
-                 Ferricstore.Flow.LMDB.decode_history_index_location(lmdb_value)
+                 Ferricstore.Flow.LMDB.decode_history_index_location_row(lmdb_key, lmdb_value)
 
         assert value_size > 0
         assert {:ok, value} = HistoryProjector.read_value(dir, {:flow_history, 0}, offset)
@@ -486,7 +486,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.SyncProjectionWritesDed
           assert {:ok,
                   {_event_id, _event_ms, _expire_at_ms, _compound_key, {:flow_history, 0}, offset,
                    _value_size}} =
-                   Ferricstore.Flow.LMDB.decode_history_index_location(lmdb_value)
+                   Ferricstore.Flow.LMDB.decode_history_index_location_row(lmdb_key, lmdb_value)
 
           assert {:ok, value} = HistoryProjector.read_value(dir, {:flow_history, 0}, offset)
           assert value == entry.value
@@ -558,7 +558,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.SyncProjectionWritesDed
                  Ferricstore.Flow.LMDB.get(Ferricstore.Flow.LMDB.path(dir), lmdb_key)
 
         assert {:ok, {_event_id, 3_001, _expire, _compound, {:flow_history, 0}, _offset, _size}} =
-                 Ferricstore.Flow.LMDB.decode_history_index_location(lmdb_value)
+                 Ferricstore.Flow.LMDB.decode_history_index_location_row(lmdb_key, lmdb_value)
       end
 
       test "recover with zero hot history scans log when projected marker is behind LMDB" do
@@ -637,7 +637,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.SyncProjectionWritesDed
         assert {:ok,
                 {^unprojected_event_id, 3_004, _expire, _compound, {:flow_history, 0}, _offset,
                  _size}} =
-                 Ferricstore.Flow.LMDB.decode_history_index_location(lmdb_value)
+                 Ferricstore.Flow.LMDB.decode_history_index_location_row(lmdb_key, lmdb_value)
       end
 
       test "recover with zero hot history rejects a directory at the history log path" do
@@ -709,7 +709,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.SyncProjectionWritesDed
                  Ferricstore.Flow.LMDB.get(Ferricstore.Flow.LMDB.path(dir), lmdb_key)
 
         assert {:ok, {_event_id, 3_002, _expire, _compound, {:flow_history, 0}, _offset, _size}} =
-                 Ferricstore.Flow.LMDB.decode_history_index_location(lmdb_value)
+                 Ferricstore.Flow.LMDB.decode_history_index_location_row(lmdb_key, lmdb_value)
       end
 
       test "sync projection does not copy Flow values already durable in LMDB" do

@@ -1139,6 +1139,34 @@ defmodule Ferricstore.Flow.LMDB do
           value_size
         )
 
+  def encode_history_index_row(
+        history_index_key,
+        event_id,
+        event_ms,
+        compound_key,
+        expire_at_ms,
+        location
+      ),
+      do:
+        Ferricstore.Flow.LMDB.IndexCodec.encode_history_index_row(
+          history_index_key,
+          event_id,
+          event_ms,
+          compound_key,
+          expire_at_ms,
+          location
+        )
+
+  def decode_history_index_row(history_index_key, blob),
+    do: Ferricstore.Flow.LMDB.IndexCodec.decode_history_index_row(history_index_key, blob)
+
+  def decode_history_index_location_row(history_index_key, blob),
+    do:
+      Ferricstore.Flow.LMDB.IndexCodec.decode_history_index_location_row(
+        history_index_key,
+        blob
+      )
+
   def encode_history_expire_value(history_index_key),
     do: Ferricstore.Flow.LMDB.IndexCodec.encode_history_expire_value(history_index_key)
 
@@ -1709,7 +1737,7 @@ defmodule Ferricstore.Flow.LMDB do
 
   defp history_index_delete_ops_from_read_result({:ok, history_value}, history_index_key)
        when is_binary(history_value) do
-    case decode_history_index_value(history_value) do
+    case decode_history_index_row(history_index_key, history_value) do
       {:ok, {event_id, event_ms, expire_at_ms, _compound_key}} ->
         if history_index_entry_key?(history_index_key, event_id, event_ms) do
           ops = [{:delete, history_index_key}]

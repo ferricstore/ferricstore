@@ -2512,23 +2512,24 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     case existing_history_index_location(path, history_index_key) do
       {:ok, {{:flow_history, _file_id} = file_ref, offset, value_size}} ->
         {:ok,
-         Ferricstore.Flow.LMDB.encode_history_index_value(
+         Ferricstore.Flow.LMDB.encode_history_index_row(
+           history_index_key,
            event_id,
            event_ms,
            compound_key,
            expire_at_ms,
-           file_ref,
-           offset,
-           value_size
+           {file_ref, offset, value_size}
          )}
 
       {:ok, nil} ->
         {:ok,
-         Ferricstore.Flow.LMDB.encode_history_index_value(
+         Ferricstore.Flow.LMDB.encode_history_index_row(
+           history_index_key,
            event_id,
            event_ms,
            compound_key,
-           expire_at_ms
+           expire_at_ms,
+           nil
          )}
 
       {:error, _reason} = error ->
@@ -2537,20 +2538,24 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   def existing_history_index_location(path, history_index_key) do
-    path
-    |> Ferricstore.Flow.LMDB.get(history_index_key)
-    |> existing_history_index_location_result()
+    existing_history_index_location_result(
+      history_index_key,
+      Ferricstore.Flow.LMDB.get(path, history_index_key)
+    )
   end
 
   @doc false
   def __existing_history_index_location_result_for_test__(result),
-    do: existing_history_index_location_result(result)
+    do: existing_history_index_location_result(nil, result)
 
-  defp existing_history_index_location_result(:not_found), do: {:ok, nil}
-  defp existing_history_index_location_result({:error, _reason} = error), do: error
+  defp existing_history_index_location_result(_history_index_key, :not_found), do: {:ok, nil}
 
-  defp existing_history_index_location_result({:ok, value}) when is_binary(value) do
-    case Ferricstore.Flow.LMDB.decode_history_index_location(value) do
+  defp existing_history_index_location_result(_history_index_key, {:error, _reason} = error),
+    do: error
+
+  defp existing_history_index_location_result(history_index_key, {:ok, value})
+       when is_binary(value) do
+    case Ferricstore.Flow.LMDB.decode_history_index_location_row(history_index_key, value) do
       {:ok,
        {_event_id, _event_ms, _expire_at_ms, _compound_key, {:flow_history, _file_id} = file_ref,
         offset, value_size}}
@@ -2565,7 +2570,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     end
   end
 
-  defp existing_history_index_location_result(invalid),
+  defp existing_history_index_location_result(_history_index_key, invalid),
     do: {:error, {:invalid_history_index_read, invalid}}
 
   def maybe_history_expire_put(ops, expire_at_ms, history_index_key) do

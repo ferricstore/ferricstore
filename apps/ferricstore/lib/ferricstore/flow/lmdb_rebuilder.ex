@@ -1561,7 +1561,14 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
 
     event_ops = [
       {:put, history_index_key,
-       LMDB.encode_history_index_value(event_id, event_ms, compound_key, expire_at_ms)}
+       LMDB.encode_history_index_row(
+         history_index_key,
+         event_id,
+         event_ms,
+         compound_key,
+         expire_at_ms,
+         nil
+       )}
     ]
 
     event_ops =

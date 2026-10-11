@@ -392,7 +392,7 @@ defmodule Ferricstore.Flow.HistoryRead do
       case Ferricstore.Flow.LMDB.get_many(lmdb_path, lmdb_keys) do
         {:ok, lmdb_values} ->
           cold_values_by_event_results(missing_ids, lmdb_values, fn event_id, lmdb_value ->
-            cold_value_from_lmdb(shard_path, event_id, lmdb_value)
+            cold_value_from_lmdb(shard_path, history_key, event_id, lmdb_value)
           end)
 
         {:error, reason} ->
@@ -833,15 +833,23 @@ defmodule Ferricstore.Flow.HistoryRead do
     end
   end
 
-  defp cold_value_from_lmdb(shard_path, event_id, {:ok, lmdb_value}),
-    do: cold_value_from_lmdb(shard_path, event_id, lmdb_value)
+  defp cold_value_from_lmdb(shard_path, history_key, event_id, {:ok, lmdb_value}),
+    do: cold_value_from_lmdb(shard_path, history_key, event_id, lmdb_value)
 
-  defp cold_value_from_lmdb(_shard_path, _event_id, :not_found), do: :miss
+  defp cold_value_from_lmdb(_shard_path, _history_key, _event_id, :not_found), do: :miss
 
-  defp cold_value_from_lmdb(shard_path, event_id, lmdb_value) when is_binary(lmdb_value) do
+  defp cold_value_from_lmdb(shard_path, history_key, event_id, lmdb_value)
+       when is_binary(lmdb_value) do
     now = CommandTime.now_ms()
 
-    case Ferricstore.Flow.LMDB.decode_history_index_location(lmdb_value) do
+    history_index_key =
+      Ferricstore.Flow.LMDB.history_index_key(
+        history_key,
+        event_id,
+        Ferricstore.Flow.HistoryEvent.ms(event_id)
+      )
+
+    case Ferricstore.Flow.LMDB.decode_history_index_location_row(history_index_key, lmdb_value) do
       {:ok, {^event_id, _event_ms, expire_at_ms, _compound_key, file_ref, offset, _value_size}} ->
         cond do
           expire_at_ms > 0 and expire_at_ms <= now ->
@@ -859,7 +867,7 @@ defmodule Ferricstore.Flow.HistoryRead do
     end
   end
 
-  defp cold_value_from_lmdb(_shard_path, _event_id, _lmdb_value),
+  defp cold_value_from_lmdb(_shard_path, _history_key, _event_id, _lmdb_value),
     do: {:error, :invalid_history_index_result}
 
   def query_fetch_count(query) do

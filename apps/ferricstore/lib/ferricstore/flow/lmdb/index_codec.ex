@@ -25,6 +25,9 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
   # v2 query index value (CRC32-checked): expiry, discovery component and the
   # state key's tag; the digests, id and update time come from the key.
   @compact_query_index_version 0xC6
+  # v2 history index value: expiry and optional history-log location; event
+  # id, event time and compound key come from the key.
+  @compact_history_index_version 0xC7
 
   def terminal_index_prefix(state_index_key) when is_binary(state_index_key) do
     "flow-terminal-index:" <>
@@ -778,6 +781,105 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
       _invalid -> :error
     end
   end
+
+  @doc """
+  Encodes the value stored under `history_index_key`: just the expiry and the
+  history-log location when the key reproduces the other fields, otherwise the
+  self-describing v1 value.
+  """
+  def encode_history_index_row(
+        history_index_key,
+        event_id,
+        event_ms,
+        compound_key,
+        expire_at_ms,
+        location
+      ) do
+    case {derived_history_index_fields(history_index_key), location} do
+      {{:ok, {^event_id, ^event_ms, ^compound_key}}, nil}
+      when is_integer(expire_at_ms) and expire_at_ms >= 0 and expire_at_ms <= @max_u64 ->
+        <<@compact_history_index_version, expire_at_ms::unsigned-big-64, 0>>
+
+      {{:ok, {^event_id, ^event_ms, ^compound_key}},
+       {{:flow_history, file_id}, offset, value_size}}
+      when is_integer(expire_at_ms) and expire_at_ms >= 0 and expire_at_ms <= @max_u64 and
+             is_integer(file_id) and file_id >= 0 and file_id <= @max_u64 and
+             is_integer(offset) and offset >= 0 and offset <= @max_u64 and
+             is_integer(value_size) and value_size >= 0 and value_size <= @max_u64 ->
+        <<@compact_history_index_version, expire_at_ms::unsigned-big-64, 1,
+          file_id::unsigned-big-64, offset::unsigned-big-64, value_size::unsigned-big-64>>
+
+      {_not_derivable, nil} ->
+        encode_history_index_value(event_id, event_ms, compound_key, expire_at_ms)
+
+      {_not_derivable, {file_ref, offset, value_size}} ->
+        encode_history_index_value(
+          event_id,
+          event_ms,
+          compound_key,
+          expire_at_ms,
+          file_ref,
+          offset,
+          value_size
+        )
+    end
+  end
+
+  def decode_history_index_row(history_index_key, blob) do
+    case decode_history_index_location_row(history_index_key, blob) do
+      {:ok, {event_id, event_ms, expire_at_ms, compound_key, _file_ref, _offset, _value_size}} ->
+        {:ok, {event_id, event_ms, expire_at_ms, compound_key}}
+
+      :error ->
+        :error
+    end
+  end
+
+  def decode_history_index_location_row(
+        history_index_key,
+        <<@compact_history_index_version, expire_at_ms::unsigned-big-64, location::binary>>
+      ) do
+    with {:ok, {event_id, event_ms, compound_key}} <-
+           derived_history_index_fields(history_index_key) do
+      case location do
+        <<0>> ->
+          {:ok, {event_id, event_ms, expire_at_ms, compound_key, nil, nil, nil}}
+
+        <<1, file_id::unsigned-big-64, offset::unsigned-big-64, value_size::unsigned-big-64>> ->
+          {:ok,
+           {event_id, event_ms, expire_at_ms, compound_key, {:flow_history, file_id}, offset,
+            value_size}}
+
+        _invalid ->
+          :error
+      end
+    end
+  end
+
+  def decode_history_index_location_row(_key, <<@compact_history_index_version, _::binary>>),
+    do: :error
+
+  def decode_history_index_location_row(_key, blob), do: decode_history_index_location(blob)
+
+  defp derived_history_index_fields(history_index_key) when is_binary(history_index_key) do
+    global = "flow-history-index:"
+    global_bytes = byte_size(global)
+
+    with <<^global::binary-size(^global_bytes), rest::binary>> <- history_index_key,
+         [history_key, time_and_event] <- :binary.split(rest, <<0>>),
+         true <- history_key != "" and not String.starts_with?(history_key, @digest_component_tag),
+         <<time::binary-size(20), 0, event_id::binary>> <- time_and_event,
+         true <- decimal_digits?(time),
+         event_ms when event_ms <= @max_u64 <- String.to_integer(time),
+         true <- event_id != "" and not String.starts_with?(event_id, @digest_component_tag) do
+      {:ok,
+       {event_id, event_ms, Ferricstore.Store.CompoundKey.stream_prefix(history_key) <> event_id}}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp derived_history_index_fields(_history_index_key), do: :error
 
   def decode_history_index_value(blob) when is_binary(blob) do
     case TermCodec.decode(blob) do

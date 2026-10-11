@@ -114,7 +114,7 @@ defmodule Ferricstore.Flow.LMDBIndexDecode do
     do: {:error, :invalid_history_index_entries}
 
   defp decode_history_entry(key, value) do
-    case LMDB.decode_history_index_value(value) do
+    case LMDB.decode_history_index_row(key, value) do
       {:ok, {event_id, event_ms, expire_at_ms, _compound_key}} ->
         if LMDB.history_index_entry_key?(key, event_id, event_ms),
           do: {:ok, event_id, event_ms, expire_at_ms},

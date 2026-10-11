@@ -155,6 +155,73 @@ defmodule Ferricstore.Flow.LMDB.IndexCodecTest do
     assert :error = IndexCodec.decode_query_index_row("flow-query-index:bad", <<0xC6>>)
   end
 
+  test "history index rows keep only the expiry and log location when the key holds the rest" do
+    alias Ferricstore.Flow.Keys
+    alias Ferricstore.Store.CompoundKey
+
+    for partition_key <- ["tenant-a", nil] do
+      history_key = Keys.history_key("order-1", partition_key)
+      event_id = "1791750917227-1"
+      event_ms = 1_791_750_917_227
+      key = IndexCodec.history_index_key(history_key, event_id, event_ms)
+      compound_key = CompoundKey.stream_prefix(history_key) <> event_id
+
+      for {expire_at_ms, location} <- [{0, nil}, {9, {{:flow_history, 3}, 120, 77}}] do
+        legacy =
+          case location do
+            nil ->
+              IndexCodec.encode_history_index_value(
+                event_id,
+                event_ms,
+                compound_key,
+                expire_at_ms
+              )
+
+            {file_ref, offset, size} ->
+              IndexCodec.encode_history_index_value(
+                event_id,
+                event_ms,
+                compound_key,
+                expire_at_ms,
+                file_ref,
+                offset,
+                size
+              )
+          end
+
+        compact =
+          IndexCodec.encode_history_index_row(
+            key,
+            event_id,
+            event_ms,
+            compound_key,
+            expire_at_ms,
+            location
+          )
+
+        assert byte_size(compact) <= 34
+        assert byte_size(compact) * 2 < byte_size(legacy)
+
+        for value <- [compact, legacy] do
+          assert IndexCodec.decode_history_index_row(key, value) ==
+                   IndexCodec.decode_history_index_value(legacy)
+
+          assert IndexCodec.decode_history_index_location_row(key, value) ==
+                   IndexCodec.decode_history_index_location(legacy)
+        end
+      end
+
+      assert IndexCodec.encode_history_index_row(key, event_id, event_ms, "X:other", 0, nil) ==
+               IndexCodec.encode_history_index_value(event_id, event_ms, "X:other", 0)
+
+      assert :error =
+               IndexCodec.decode_history_index_row("flow-history-index:bad", <<0xC7, 0::64, 0>>)
+
+      assert :error = IndexCodec.decode_history_index_row(key, <<0xC7, 1>>)
+      assert :error = IndexCodec.decode_history_index_location_row(key, <<0xC7, 0::64, 2>>)
+    end
+  end
+
   test "all index value decoders reject trailing external-term bytes" do
     active_key = IndexCodec.active_index_key("index", "id", 10)
 

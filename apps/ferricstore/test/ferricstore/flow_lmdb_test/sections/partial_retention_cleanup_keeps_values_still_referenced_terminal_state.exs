@@ -552,14 +552,14 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
                    10
                  )
 
-        assert Enum.all?(lmdb_entries, fn {_key, value} ->
+        assert Enum.all?(lmdb_entries, fn {key, value} ->
                  match?(
                    {:ok,
                     {_event_id, _event_ms, _expire_at_ms, _compound_key, {:flow_history, 0},
                      offset, value_size}}
                    when is_integer(offset) and offset >= 0 and is_integer(value_size) and
                           value_size > 0,
-                   Ferricstore.Flow.LMDB.decode_history_index_location(value)
+                   Ferricstore.Flow.LMDB.decode_history_index_location_row(key, value)
                  )
                end)
 

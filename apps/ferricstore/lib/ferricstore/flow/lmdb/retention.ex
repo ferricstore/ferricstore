@@ -345,7 +345,7 @@ defmodule Ferricstore.Flow.LMDB.Retention do
         |> Enum.reduce_while({:ok, base_ops, 0}, fn
           {history_index_key, history_value}, {:ok, ops_acc, swept_acc}
           when is_binary(history_index_key) and is_binary(history_value) ->
-            case IndexCodec.decode_history_index_value(history_value) do
+            case IndexCodec.decode_history_index_row(history_index_key, history_value) do
               {:ok, {event_id, event_ms, _expire_at_ms, _compound_key}} ->
                 cond do
                   not IndexCodec.history_index_entry_key?(
@@ -436,7 +436,7 @@ defmodule Ferricstore.Flow.LMDB.Retention do
   end
 
   defp expired_live_history_ops(expire_key, history_index_key, history_value, now_ms) do
-    case IndexCodec.decode_history_index_value(history_value) do
+    case IndexCodec.decode_history_index_row(history_index_key, history_value) do
       {:ok, {event_id, event_ms, expire_at_ms, _compound_key}} ->
         cond do
           not IndexCodec.history_index_entry_key?(history_index_key, event_id, event_ms) ->
@@ -722,7 +722,7 @@ defmodule Ferricstore.Flow.LMDB.Retention do
   end
 
   defp maybe_delete_history_expire_key(ops, history_index_key, history_value) do
-    case IndexCodec.decode_history_index_value(history_value) do
+    case IndexCodec.decode_history_index_row(history_index_key, history_value) do
       {:ok, {_event_id, _event_ms, expire_at_ms, _compound_key}} when expire_at_ms > 0 ->
         expire_key = IndexCodec.history_expire_key(expire_at_ms, history_index_key)
         expire_value = IndexCodec.encode_history_expire_value(history_index_key)

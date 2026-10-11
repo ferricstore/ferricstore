@@ -60,9 +60,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorWriterProjectsTerminalHistory
 
         assert {:ok, entries} = Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 10)
 
-        assert Enum.map(entries, fn {_key, value} ->
+        assert Enum.map(entries, fn {key, value} ->
                  {:ok, {event_id, event_ms, 60_000, compound_key}} =
-                   Ferricstore.Flow.LMDB.decode_history_index_value(value)
+                   Ferricstore.Flow.LMDB.decode_history_index_row(key, value)
 
                  {event_id, event_ms, compound_key}
                end) == [
@@ -148,7 +148,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorWriterProjectsTerminalHistory
         assert {:ok, value} = Ferricstore.Flow.LMDB.get(path, history_index_key)
 
         assert {:ok, {^event_id, ^event_ms, 60_000, ^compound_key, {:flow_history, 7}, 123, 456}} =
-                 Ferricstore.Flow.LMDB.decode_history_index_location(value)
+                 Ferricstore.Flow.LMDB.decode_history_index_location_row(history_index_key, value)
       end
 
       test "lagged writer defers timer flush while writes continue under max lag" do
