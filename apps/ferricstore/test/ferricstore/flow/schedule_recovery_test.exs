@@ -31,7 +31,7 @@ defmodule Ferricstore.Flow.ScheduleRecoveryTest do
                  id: target_id,
                  type: target_type,
                  partition_key: target_partition,
-                 payload: %{restart: true}
+                 payload: %{"restart" => true}
                ]
              )
 
@@ -59,7 +59,7 @@ defmodule Ferricstore.Flow.ScheduleRecoveryTest do
              FerricStore.flow_get(target_id, partition_key: target_partition, payload: true)
 
     assert target.type == target_type
-    assert target.payload == %{restart: true}
+    assert target.payload == %{"restart" => true}
 
     assert {:ok, %{state: "completed"}} = FerricStore.flow_schedule_get(schedule_id)
 
@@ -88,7 +88,7 @@ defmodule Ferricstore.Flow.ScheduleRecoveryTest do
                  id_prefix: target_prefix,
                  type: target_type,
                  partition_key: target_partition,
-                 payload: %{restart_catchup: true}
+                 payload: %{"restart_catchup" => true}
                ]
              )
 
@@ -117,7 +117,7 @@ defmodule Ferricstore.Flow.ScheduleRecoveryTest do
 
     target_id = "#{target_prefix}:#{due_at_ms}:1"
 
-    assert {:ok, %{id: ^target_id, payload: %{restart_catchup: true}}} =
+    assert {:ok, %{id: ^target_id, payload: %{"restart_catchup" => true}}} =
              FerricStore.flow_get(target_id,
                partition_key: target_partition,
                payload: true

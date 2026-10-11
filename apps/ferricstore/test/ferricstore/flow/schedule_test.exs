@@ -99,7 +99,7 @@ defmodule Ferricstore.Flow.ScheduleTest do
                  type: target_type,
                  state: "queued",
                  partition_key: target_partition,
-                 payload: %{source: "schedule"}
+                 payload: %{"source" => "schedule"}
                ]
              )
 
@@ -120,7 +120,7 @@ defmodule Ferricstore.Flow.ScheduleTest do
 
     assert target.type == target_type
     assert target.state == "queued"
-    assert target.payload == %{source: "schedule"}
+    assert target.payload == %{"source" => "schedule"}
 
     assert {:ok, fired_schedule} = FerricStore.flow_schedule_get(schedule_id)
     assert fired_schedule.state == "completed"

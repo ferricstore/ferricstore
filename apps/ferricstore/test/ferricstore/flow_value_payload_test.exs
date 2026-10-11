@@ -18,7 +18,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
 
   test "create stores a full payload value and claim/get hydrate it from internal storage" do
     id = unique_id("flow-value-create")
-    payload = %{order_id: 123, items: ["book", "pen"]}
+    payload = %{"order_id" => 123, "items" => ["book", "pen"]}
 
     assert :ok =
              FerricStore.flow_create(id,
@@ -77,7 +77,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
                partition_key: "tenant-a",
                lease_token: claimed.lease_token,
                fencing_token: claimed.fencing_token,
-               payload: %{step: "waiting"},
+               payload: %{"step" => "waiting"},
                run_at_ms: 2_000,
                now_ms: 1_100
              )
@@ -96,13 +96,13 @@ defmodule Ferricstore.FlowValuePayloadTest do
                now_ms: 2_000
              )
 
-    assert reclaimed.payload == %{step: "waiting"}
+    assert reclaimed.payload == %{"step" => "waiting"}
 
     assert :ok =
              FerricStore.flow_retry(id, reclaimed.lease_token,
                partition_key: "tenant-a",
                fencing_token: reclaimed.fencing_token,
-               error: %{reason: "temporary"},
+               error: %{"reason" => "temporary"},
                run_at_ms: 3_000,
                now_ms: 2_100
              )
@@ -117,8 +117,8 @@ defmodule Ferricstore.FlowValuePayloadTest do
     refute Map.has_key?(fetched_ref_only, :error)
 
     assert {:ok, fetched} = FerricStore.flow_get(id, partition_key: "tenant-a", full: true)
-    assert fetched.payload == %{step: "waiting"}
-    assert fetched.error == %{reason: "temporary"}
+    assert fetched.payload == %{"step" => "waiting"}
+    assert fetched.error == %{"reason" => "temporary"}
   end
 
   test "complete and fail store result/error values without requiring public refs" do
@@ -151,7 +151,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
              FerricStore.flow_complete(complete_claim.id, complete_claim.lease_token,
                partition_key: "tenant-a",
                fencing_token: complete_claim.fencing_token,
-               result: %{status: "sent"},
+               result: %{"status" => "sent"},
                now_ms: 1_100
              )
 
@@ -159,7 +159,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
              FerricStore.flow_fail(fail_claim.id, fail_claim.lease_token,
                partition_key: "tenant-a",
                fencing_token: fail_claim.fencing_token,
-               error: %{code: "bad_input"},
+               error: %{"code" => "bad_input"},
                now_ms: 1_100
              )
 
@@ -175,8 +175,8 @@ defmodule Ferricstore.FlowValuePayloadTest do
     assert {:ok, fetched_failed} =
              FerricStore.flow_get(fail_claim.id, partition_key: "tenant-a", full: true)
 
-    assert fetched_completed.result == %{status: "sent"}
-    assert fetched_failed.error == %{code: "bad_input"}
+    assert fetched_completed.result == %{"status" => "sent"}
+    assert fetched_failed.error == %{"code" => "bad_input"}
   end
 
   test "terminal retention does not materialize existing generated payload value refs" do
@@ -186,7 +186,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
              FerricStore.flow_create(id,
                type: "value-retention",
                partition_key: "tenant-retention",
-               payload: %{large: String.duplicate("x", 256)},
+               payload: %{"large" => String.duplicate("x", 256)},
                retention_ttl_ms: 20,
                run_at_ms: 1_000
              )
@@ -212,7 +212,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
 
     wait_terminal_removed!(id, "tenant-retention")
 
-    assert {:ok, [%{large: large_blob_after_terminal_expiry}]} =
+    assert {:ok, [%{"large" => large_blob_after_terminal_expiry}]} =
              FerricStore.flow_value_mget([created.payload_ref])
 
     assert large_blob_after_terminal_expiry == String.duplicate("x", 256)
@@ -271,7 +271,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
              FerricStore.flow_create(id,
                type: "value-cancel-retention",
                partition_key: "tenant-retention",
-               payload: %{large: String.duplicate("x", 256)},
+               payload: %{"large" => String.duplicate("x", 256)},
                retention_ttl_ms: 100,
                run_at_ms: 1_000
              )
@@ -289,7 +289,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
 
     wait_terminal_removed!(id, "tenant-retention")
 
-    assert {:ok, [%{large: large_blob_after_terminal_expiry}]} =
+    assert {:ok, [%{"large" => large_blob_after_terminal_expiry}]} =
              FerricStore.flow_value_mget([created.payload_ref])
 
     assert large_blob_after_terminal_expiry == String.duplicate("x", 256)
@@ -305,7 +305,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
              FerricStore.flow_create(id,
                type: "value-cancel-reason-ref",
                partition_key: "tenant-retention",
-               payload: %{large: String.duplicate("x", 256)},
+               payload: %{"large" => String.duplicate("x", 256)},
                retention_ttl_ms: 100,
                run_at_ms: 1_000
              )
@@ -328,14 +328,14 @@ defmodule Ferricstore.FlowValuePayloadTest do
 
   test "cancel stores inline reason payload as an owned terminal value" do
     id = unique_id("flow-value-cancel-reason")
-    reason = %{code: "user_cancelled", details: String.duplicate("x", 256)}
+    reason = %{"code" => "user_cancelled", "details" => String.duplicate("x", 256)}
     now_ms = Ferricstore.HLC.now_ms()
 
     assert :ok =
              FerricStore.flow_create(id,
                type: "value-cancel-reason",
                partition_key: "tenant-retention",
-               payload: %{large: String.duplicate("p", 256)},
+               payload: %{"large" => String.duplicate("p", 256)},
                retention_ttl_ms: 2_000,
                run_at_ms: now_ms,
                now_ms: now_ms
@@ -387,7 +387,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
              FerricStore.flow_create(id,
                type: "value-retention-cleanup",
                partition_key: "tenant-retention",
-               payload: %{large: String.duplicate("p", 256)},
+               payload: %{"large" => String.duplicate("p", 256)},
                retention_ttl_ms: 60_000,
                run_at_ms: 1_000,
                now_ms: 1_000
@@ -407,7 +407,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
              FerricStore.flow_complete(id, claimed.lease_token,
                partition_key: "tenant-retention",
                fencing_token: claimed.fencing_token,
-               result: %{ok: true},
+               result: %{"ok" => true},
                now_ms: 1_100
              )
 
@@ -539,7 +539,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
              FerricStore.flow_create(id,
                type: "value-retention-sweeper",
                partition_key: "tenant-retention",
-               payload: %{large: String.duplicate("s", 256)},
+               payload: %{"large" => String.duplicate("s", 256)},
                retention_ttl_ms: 60_000,
                run_at_ms: now_ms,
                now_ms: now_ms
@@ -559,7 +559,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
              FerricStore.flow_complete(id, claimed.lease_token,
                partition_key: "tenant-retention",
                fencing_token: claimed.fencing_token,
-               result: %{ok: true},
+               result: %{"ok" => true},
                now_ms: now_ms
              )
 
@@ -608,7 +608,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
   test "rewind from terminal back to active clears value ref expiration" do
     id = unique_id("flow-value-rewind-retention")
     now_ms = Ferricstore.HLC.now_ms()
-    payload = %{large: String.duplicate("x", 256)}
+    payload = %{"large" => String.duplicate("x", 256)}
 
     assert :ok =
              FerricStore.flow_create(id,
@@ -663,10 +663,10 @@ defmodule Ferricstore.FlowValuePayloadTest do
              assert fetched.state == created.state
              assert fetched.payload == payload
 
-             assert {:ok, [%{large: large_blob}]} =
+             assert {:ok, [%{"large" => large_blob}]} =
                       FerricStore.flow_value_mget([created.payload_ref])
 
-             assert large_blob == payload.large
+             assert large_blob == payload["large"]
            end)
   end
 
@@ -681,9 +681,9 @@ defmodule Ferricstore.FlowValuePayloadTest do
              FerricStore.flow_create_many(
                partition,
                [
-                 %{id: complete_id, payload: %{kind: "complete"}},
-                 %{id: retry_id, payload: %{kind: "retry"}},
-                 %{id: fail_id, payload: %{kind: "fail"}}
+                 %{id: complete_id, payload: %{"kind" => "complete"}},
+                 %{id: retry_id, payload: %{"kind" => "retry"}},
+                 %{id: fail_id, payload: %{"kind" => "fail"}}
                ],
                type: type,
                run_at_ms: 1_000,
@@ -735,8 +735,8 @@ defmodule Ferricstore.FlowValuePayloadTest do
                    id: retry_id,
                    lease_token: retry_claim.lease_token,
                    fencing_token: retry_claim.fencing_token,
-                   error: %{retry: true},
-                   payload: %{kind: "retry-updated"}
+                   error: %{"retry" => true},
+                   payload: %{"kind" => "retry-updated"}
                  }
                ],
                run_at_ms: 2_000,
@@ -753,7 +753,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
                    id: fail_id,
                    lease_token: fail_claim.lease_token,
                    fencing_token: fail_claim.fencing_token,
-                   error: {:bad, :input}
+                   error: {"bad", "input"}
                  }
                ],
                now_ms: 1_100
@@ -776,10 +776,10 @@ defmodule Ferricstore.FlowValuePayloadTest do
              FerricStore.flow_get(fail_id, partition_key: partition, full: true)
 
     assert fetched_completed.result == ["done"]
-    assert fetched_retried.payload == %{kind: "retry-updated"}
-    assert fetched_retried.error == %{retry: true}
-    assert fetched_failed.payload == %{kind: "fail"}
-    assert fetched_failed.error == {:bad, :input}
+    assert fetched_retried.payload == %{"kind" => "retry-updated"}
+    assert fetched_retried.error == %{"retry" => true}
+    assert fetched_failed.payload == %{"kind" => "fail"}
+    assert fetched_failed.error == {"bad", "input"}
   end
 
   test "history only hydrates stored values when values option is requested" do
@@ -790,7 +790,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
              FerricStore.flow_create(id,
                type: "value-history",
                partition_key: partition,
-               payload: %{input: 1},
+               payload: %{"input" => 1},
                run_at_ms: 1_000,
                now_ms: 1_000
              )
@@ -807,7 +807,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
              FerricStore.flow_complete(id, claimed.lease_token,
                partition_key: partition,
                fencing_token: claimed.fencing_token,
-               result: %{output: 2},
+               result: %{"output" => 2},
                now_ms: 1_100
              )
 
@@ -822,10 +822,10 @@ defmodule Ferricstore.FlowValuePayloadTest do
 
     value_events = Map.new(value_history, fn {_event_id, fields} -> {fields["event"], fields} end)
 
-    assert value_events["created"]["payload"] == %{input: 1}
-    assert value_events["claimed"]["payload"] == %{input: 1}
-    assert value_events["completed"]["payload"] == %{input: 1}
-    assert value_events["completed"]["result"] == %{output: 2}
+    assert value_events["created"]["payload"] == %{"input" => 1}
+    assert value_events["claimed"]["payload"] == %{"input" => 1}
+    assert value_events["completed"]["payload"] == %{"input" => 1}
+    assert value_events["completed"]["result"] == %{"output" => 2}
   end
 
   defp wait_terminal_removed!(id, partition_key) do
