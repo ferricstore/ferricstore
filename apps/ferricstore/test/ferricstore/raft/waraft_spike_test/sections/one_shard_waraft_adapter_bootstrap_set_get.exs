@@ -832,8 +832,9 @@ defmodule Ferricstore.Raft.WARaftSpikeTest.Sections.OneShardWaraftAdapterBootstr
             {term, {make_ref(), {:write, :ferricstore_waraft_spike, "segment:reuse:1", "v1"}}}
 
           assert {:ok, view} = :wa_raft_log.append(view, [entry1])
-          assert_receive {:waraft_segment_log_file_open, path}, 1_000
-          assert_receive {:waraft_segment_log_file_sync, ^path}, 1_000
+          # The directory's long-lived segment writer may already hold the fd
+          # from bootstrap appends, so this append need not open the file.
+          assert_receive {:waraft_segment_log_file_sync, path}, 1_000
 
           entry2 =
             {term, {make_ref(), {:write, :ferricstore_waraft_spike, "segment:reuse:2", "v2"}}}

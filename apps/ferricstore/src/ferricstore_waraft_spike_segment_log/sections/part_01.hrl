@@ -1384,7 +1384,7 @@ append(View, Entries, _Mode, _Priority) ->
     case append_decode(Last + 1, Entries) of
         {ok, Records} ->
             Dir = log_dir(Log),
-            case write_records(Dir, Records) of
+            case run_in_segment_writer(Dir, fun() -> write_records(Dir, Records) end) of
                 ok ->
                     true = ets:insert(Name, Records),
                     update_latest_config_from_records(Dir, Records),
