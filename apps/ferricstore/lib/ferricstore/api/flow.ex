@@ -362,8 +362,7 @@ defmodule FerricStore.API.Flow do
   """
   @spec flow_schedule_create(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_schedule_create(id, opts) when is_binary(id) and is_list(opts) do
-    if is_list(opts),
-      do: Ferricstore.Flow.UserValue.validate_opts!(Keyword.get(opts, :target, []))
+    Ferricstore.Flow.UserValue.validate_opts!(Keyword.get(opts, :target, []))
 
     Ferricstore.Flow.Schedule.create(default_ctx(), id, opts)
   end

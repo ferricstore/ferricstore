@@ -431,7 +431,7 @@ segment_writer_pid(Dir) ->
                 true ->
                     {ok, Pid};
                 false ->
-                    _ = (catch ets:delete_object(Registry, {Key, Pid})),
+                    ok = safe_delete_writer_object(Registry, {Key, Pid}),
                     start_segment_writer(Registry, Key)
             end;
         _ ->
@@ -479,7 +479,7 @@ segment_writer_serve(Registry, Key) ->
     after ?SEGMENT_WRITER_IDLE_MS ->
         %% Unregister first; a request racing this exit sees DOWN before
         %% "started" and retries against a fresh writer.
-        _ = (catch ets:delete_object(Registry, {Key, self()})),
+        ok = safe_delete_writer_object(Registry, {Key, self()}),
         receive
             {segment_writer_run, _From, _MRef, _Fun} = Late ->
                 self() ! Late,
@@ -607,3 +607,10 @@ drop_cached_offset_index_fd() ->
     end.
 
 file_identity(#file_info{major_device = Device, inode = Inode}) -> {Device, Inode}.
+
+safe_delete_writer_object(Registry, Object) ->
+    try ets:delete_object(Registry, Object) of
+        true -> ok
+    catch
+        error:badarg -> ok
+    end.
