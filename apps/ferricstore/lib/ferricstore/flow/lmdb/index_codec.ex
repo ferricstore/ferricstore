@@ -22,6 +22,9 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
   # v2 terminal index value: only the expiry; id, update time, state key and
   # count key are derived from the terminal index key.
   @compact_terminal_index_version 0xC4
+  # v2 query index value (CRC32-checked): expiry, discovery component and the
+  # state key's tag; the digests, id and update time come from the key.
+  @compact_query_index_version 0xC6
 
   def terminal_index_prefix(state_index_key) when is_binary(state_index_key) do
     "flow-terminal-index:" <>
@@ -146,13 +149,19 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
 
     {
       query_index_key_from_descriptor(descriptor, id, updated_at_ms),
-      encode_query_index_value_from_descriptor(
-        descriptor,
-        id,
-        updated_at_ms,
-        expire_at_ms,
-        state_key
-      )
+      case compact_query_index_value(descriptor, id, expire_at_ms, state_key) do
+        {:ok, value} ->
+          value
+
+        :error ->
+          encode_query_index_value_from_descriptor(
+            descriptor,
+            id,
+            updated_at_ms,
+            expire_at_ms,
+            state_key
+          )
+      end
     }
   end
 
@@ -671,6 +680,103 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
     end
   rescue
     _ -> :error
+  end
+
+  def decode_query_index_row(
+        key,
+        <<@compact_query_index_version, checksum::unsigned-big-32, body::binary>>
+      )
+      when is_binary(key) do
+    with true <- :erlang.crc32(body) == checksum,
+         {:ok, {family_digest, index_digest, id, updated_at_ms}} <- query_index_key_fields(key),
+         <<expire_at_ms::unsigned-big-64, rest::binary>> <- body,
+         {:ok, discovery_component, rest} <- decode_optional_component(rest),
+         true <-
+           is_nil(discovery_component) or
+             byte_size(discovery_component) <= @max_query_discovery_component_bytes,
+         {:ok, state_key} <- decode_query_index_state_key(rest, id) do
+      {:ok,
+       {family_digest, index_digest, discovery_component, id, updated_at_ms, expire_at_ms,
+        state_key}}
+    else
+      _invalid -> :error
+    end
+  end
+
+  def decode_query_index_row(_key, <<@compact_query_index_version, _rest::binary>>), do: :error
+  def decode_query_index_row(_key, blob), do: decode_query_index_value(blob)
+
+  defp compact_query_index_value(
+         {_family_digest, _index_digest, discovery_component},
+         id,
+         expire_at_ms,
+         state_key
+       ) do
+    with true <- bounded_component(id, @max_raw_identity_component_bytes) == id,
+         {:ok, discovery_part} <- encode_optional_component(discovery_component),
+         {:ok, state_part} <- encode_query_index_state_key(state_key, id) do
+      body = IO.iodata_to_binary([<<expire_at_ms::unsigned-big-64>>, discovery_part, state_part])
+      {:ok, <<@compact_query_index_version, :erlang.crc32(body)::unsigned-big-32, body::binary>>}
+    else
+      _not_compactable -> :error
+    end
+  end
+
+  defp encode_optional_component(nil), do: {:ok, <<0>>}
+
+  defp encode_optional_component(value) when is_binary(value) and byte_size(value) <= 0xFFFF,
+    do: {:ok, [<<1, byte_size(value)::unsigned-big-16>>, value]}
+
+  defp encode_optional_component(_value), do: :error
+
+  defp decode_optional_component(<<0, rest::binary>>), do: {:ok, nil, rest}
+
+  defp decode_optional_component(<<1, size::unsigned-big-16, rest::binary>>) do
+    case rest do
+      <<value::binary-size(^size), rest::binary>> -> {:ok, value, rest}
+      _truncated -> :error
+    end
+  end
+
+  defp decode_optional_component(_invalid), do: :error
+
+  # The state key of a Flow ends with ":s:" <> id, so usually only its tag
+  # prefix is stored.
+  defp encode_query_index_state_key(nil, _id), do: {:ok, <<0>>}
+
+  defp encode_query_index_state_key(state_key, id) when byte_size(state_key) <= 0xFFFF do
+    suffix = ":s:" <> id
+    prefix_bytes = byte_size(state_key) - byte_size(suffix)
+
+    if prefix_bytes > 0 and binary_part(state_key, prefix_bytes, byte_size(suffix)) == suffix,
+      do: {:ok, [<<1, prefix_bytes::unsigned-big-16>>, binary_part(state_key, 0, prefix_bytes)]},
+      else: {:ok, [<<2, byte_size(state_key)::unsigned-big-16>>, state_key]}
+  end
+
+  defp encode_query_index_state_key(_state_key, _id), do: :error
+
+  defp decode_query_index_state_key(<<0>>, _id), do: {:ok, nil}
+
+  defp decode_query_index_state_key(<<tag, size::unsigned-big-16, rest::binary>>, id)
+       when tag in [1, 2] and byte_size(rest) == size and size > 0 do
+    if tag == 1, do: {:ok, rest <> ":s:" <> id}, else: {:ok, rest}
+  end
+
+  defp decode_query_index_state_key(_invalid, _id), do: :error
+
+  defp query_index_key_fields(key) do
+    prefix = query_index_global_prefix() <> @query_index_key_tag
+    prefix_bytes = byte_size(prefix)
+
+    with <<^prefix::binary-size(^prefix_bytes), family_digest::binary-size(32),
+           index_digest::binary-size(32), 0, time::binary-size(20), 0, id::binary>> <- key,
+         true <- decimal_digits?(time),
+         updated_at_ms when updated_at_ms <= @max_u64 <- String.to_integer(time),
+         true <- id != "" and not String.starts_with?(id, @digest_component_tag) do
+      {:ok, {family_digest, index_digest, id, updated_at_ms}}
+    else
+      _invalid -> :error
+    end
   end
 
   def decode_history_index_value(blob) when is_binary(blob) do

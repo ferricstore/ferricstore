@@ -126,7 +126,7 @@ defmodule Ferricstore.Flow.LMDBIndexDecode do
   end
 
   defp decode_query_entry(key, value) do
-    case LMDB.decode_query_index_value(value) do
+    case LMDB.decode_query_index_row(key, value) do
       {:ok,
        {family_digest, index_digest, _discovery_component, id, updated_at_ms, expire_at_ms,
         state_key}} ->

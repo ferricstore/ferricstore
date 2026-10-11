@@ -113,6 +113,48 @@ defmodule Ferricstore.Flow.LMDB.IndexCodecTest do
     end
   end
 
+  test "query index rows keep only what their key cannot hold and still read v1 values" do
+    alias Ferricstore.Flow.Keys
+
+    index_key = Keys.state_index_key("invoice.process", "queued", "tenant-a")
+
+    for {id, state_key} <- [
+          {"order-1", Keys.state_key("order-1", "tenant-a")},
+          {"order-2", nil},
+          {"order-3", "f:{elsewhere}:x:order-3"}
+        ] do
+      {key, compact} =
+        IndexCodec.query_index_entry(index_key, id, 1_791_750_926_967, 55, state_key)
+
+      legacy =
+        IndexCodec.encode_query_index_value(index_key, id, 1_791_750_926_967, 55, state_key)
+
+      assert {:ok, expected} = IndexCodec.decode_query_index_value(legacy)
+
+      assert byte_size(compact) < div(byte_size(legacy), 2),
+             "compact #{byte_size(compact)}B vs legacy #{byte_size(legacy)}B"
+
+      assert {:ok, ^expected} = IndexCodec.decode_query_index_row(key, compact)
+      assert {:ok, ^expected} = IndexCodec.decode_query_index_row(key, legacy)
+
+      other_key = elem(IndexCodec.query_index_entry(index_key, id <> "x", 1, 0, nil), 0)
+      assert {:ok, decoded_other} = IndexCodec.decode_query_index_row(other_key, compact)
+      refute decoded_other == expected
+
+      for offset <- [1, 6, byte_size(compact) - 1] do
+        <<head::binary-size(^offset), byte, tail::binary>> = compact
+        corrupted = head <> <<Bitwise.bxor(byte, 0xFF)>> <> tail
+        assert :error = IndexCodec.decode_query_index_row(key, corrupted)
+      end
+    end
+
+    long_id = String.duplicate("x", 300)
+    {long_key, long_value} = IndexCodec.query_index_entry(index_key, long_id, 1, 0, nil)
+    assert {:ok, _} = IndexCodec.decode_query_index_value(long_value)
+    assert {:ok, _} = IndexCodec.decode_query_index_row(long_key, long_value)
+    assert :error = IndexCodec.decode_query_index_row("flow-query-index:bad", <<0xC6>>)
+  end
+
   test "all index value decoders reject trailing external-term bytes" do
     active_key = IndexCodec.active_index_key("index", "id", 10)
 

@@ -1566,6 +1566,9 @@ defmodule Ferricstore.Flow.LMDB do
   def decode_query_index_value(blob),
     do: Ferricstore.Flow.LMDB.IndexCodec.decode_query_index_value(blob)
 
+  def decode_query_index_row(key, blob),
+    do: Ferricstore.Flow.LMDB.IndexCodec.decode_query_index_row(key, blob)
+
   def decode_history_index_value(blob),
     do: Ferricstore.Flow.LMDB.IndexCodec.decode_history_index_value(blob)
 
