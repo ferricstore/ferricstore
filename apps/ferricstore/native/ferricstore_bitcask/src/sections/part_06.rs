@@ -1143,4 +1143,15 @@ mod page_cache_policy_tests {
         assert_eq!(bounded_dontneed_range(-1, 64), None);
         assert_eq!(bounded_dontneed_range(64, 128), Some((64, 128)));
     }
+
+    #[test]
+    fn cold_reads_keep_pages_for_values_the_hot_cache_will_not_hold() {
+        // Values up to the default hot-cache limit are promoted to ETS, so their
+        // page-cache copy is redundant; larger values are never cached and would
+        // otherwise be re-read from disk on every access.
+        assert!(should_drop_cold_read_pages(0));
+        assert!(should_drop_cold_read_pages(COLD_READ_DROP_MAX_VALUE_BYTES));
+        assert!(!should_drop_cold_read_pages(COLD_READ_DROP_MAX_VALUE_BYTES + 1));
+        assert!(!should_drop_cold_read_pages(16 * 1024 * 1024));
+    }
 }

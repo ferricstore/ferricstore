@@ -674,12 +674,26 @@ offset_dir_key(Dir) ->
 read_log_disk_record(Log, Index) when is_integer(Index), Index >= 0 ->
     Dir = log_dir(Log),
     case existing_records_per_segment(Dir) of
-        {ok, RecordsPerSegment} -> read_disk_record(Dir, Index, RecordsPerSegment);
+        {ok, RecordsPerSegment} -> read_indexed_disk_record(Dir, Index, RecordsPerSegment);
         not_found -> not_found;
         {error, _Reason} = Error -> Error
     end;
 read_log_disk_record(_Log, _Index) ->
     not_found.
+
+%% Use the offset registry / .idx sidecar when it knows the record; scanning the
+%% segment from offset 0 makes catch-up reads beyond the ETS window quadratic.
+%% Fall back to the scan when the location is unknown or does not verify.
+read_indexed_disk_record(Dir, Index, RecordsPerSegment) ->
+    case lookup_offset(Dir, Index) of
+        {ok, {_Ordinal, Offset, EncodedSize}} ->
+            case read_disk_record_at(Dir, Index, Offset, EncodedSize, RecordsPerSegment) of
+                {ok, _Entry} = Found -> Found;
+                _StaleOrMissing -> read_disk_record(Dir, Index, RecordsPerSegment)
+            end;
+        _NotIndexed ->
+            read_disk_record(Dir, Index, RecordsPerSegment)
+    end.
 
 memory_boundaries(Name, Dir) ->
     case memory_registry_lookup(Name) of

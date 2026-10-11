@@ -593,13 +593,11 @@ fn v2_pread_batch<'a>(env: Env<'a>, path: String, locations: Vec<u64>) -> NifRes
             for &(orig_idx, offset) in &sorted {
                 let term = match log::pread_record_from_file(&file, offset) {
                     Ok(Some(record)) => {
-                        fadvise_dontneed(
+                        fadvise_dontneed_cold_read(
                             &file,
-                            offset as i64,
-                            (log::HEADER_SIZE
-                                + record.key.len()
-                                + record.value.as_ref().map_or(0, Vec::len))
-                                as i64,
+                            offset,
+                            record.key.len(),
+                            record.value.as_ref().map_or(0, Vec::len),
                         );
                         match record.value {
                             Some(value) => {

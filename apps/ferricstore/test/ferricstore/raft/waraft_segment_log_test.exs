@@ -951,4 +951,57 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
   end
 
   use Ferricstore.Raft.WARaftSegmentLogTest.Sections.DefaultSegmentSizeDoesNotRollOverDuringNormalHotBatches
+
+  test "disk-backed get reads an indexed record directly instead of scanning its segment" do
+    with_segment_log_memory_env(
+      max_bytes: 1_000,
+      max_entries: 1,
+      min_entries: 1,
+      records_per_segment: 64,
+      fun: fn _root, log, _log_name ->
+        provider = :ferricstore_waraft_spike_segment_log
+        assert :ok = provider.init(log)
+        assert {:ok, _state} = provider.open(log)
+
+        for index <- 1..60 do
+          assert :ok =
+                   provider.append(
+                     {:log_view, log, max(index - 1, 0), index - 1, :undefined},
+                     [{1, {:cmd, "entry-#{index}"}}],
+                     :strict,
+                     :low
+                   )
+        end
+
+        parent = self()
+
+        reader =
+          spawn(fn ->
+            receive do: (:go -> :ok)
+            send(parent, {:got, provider.get(log, 50)})
+          end)
+
+        :erlang.trace_pattern({provider, :read_disk_record_fd, 7}, true, [:local])
+        :erlang.trace(reader, true, [:call])
+        on_exit(fn -> :erlang.trace_pattern({provider, :read_disk_record_fd, 7}, false, [:local]) end)
+
+        send(reader, :go)
+        assert_receive {:got, {:ok, {1, {:cmd, "entry-50"}}}}, 5_000
+
+        scans =
+          Stream.repeatedly(fn ->
+            receive do
+              {:trace, ^reader, :call, {^provider, :read_disk_record_fd, _args}} -> :scan
+            after
+              100 -> :done
+            end
+          end)
+          |> Enum.take_while(&(&1 == :scan))
+          |> length()
+
+        assert scans == 0, "get scanned the segment from offset 0 #{scans} time(s)"
+      end
+    )
+  end
+
 end
