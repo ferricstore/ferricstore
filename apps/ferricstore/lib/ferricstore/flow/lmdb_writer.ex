@@ -1042,6 +1042,19 @@ defmodule Ferricstore.Flow.LMDBWriter do
           source_wait
         )
 
+      # Online backfill commits composite counters without the flush permit, so a
+      # counter cached earlier in this expansion can be older than a reverse row
+      # read later. Re-expanding starts from a fresh projection cache.
+      {:error, :invalid_composite_counter}
+      when retries_remaining > 0 ->
+        do_flush_ops_and_marker_with_permit(
+          state,
+          source_ops,
+          started_at,
+          retries_remaining - 1,
+          source_wait
+        )
+
       {:error, reason} ->
         {:error, reason, state}
 
