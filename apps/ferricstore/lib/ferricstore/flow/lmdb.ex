@@ -1326,7 +1326,7 @@ defmodule Ferricstore.Flow.LMDB do
        )
        when is_binary(terminal_value) do
     with {:ok, {id, updated_at_ms, expire_at_ms, stored_state_key, count_key}} <-
-           decode_terminal_index_entry(terminal_value),
+           decode_terminal_index_entry_row(terminal_key, terminal_value),
          true <- terminal_index_entry_key?(terminal_key, id, updated_at_ms),
          :ok <- validate_terminal_delete_state_key(state_key, stored_state_key) do
       ops =
@@ -1379,7 +1379,7 @@ defmodule Ferricstore.Flow.LMDB do
        )
        when is_binary(terminal_value) do
     with {:ok, {id, updated_at_ms, expire_at_ms, stored_state_key, count_key}} <-
-           decode_terminal_index_entry(terminal_value),
+           decode_terminal_index_entry_row(terminal_key, terminal_value),
          true <- terminal_index_entry_key?(terminal_key, id, updated_at_ms),
          :ok <- validate_terminal_delete_state_key(state_key, stored_state_key),
          {:ok, count, count_value} <- terminal_count_from_read_result(count_reader.(count_key)) do
@@ -1504,6 +1504,33 @@ defmodule Ferricstore.Flow.LMDB do
 
   def decode_terminal_expire_value(blob),
     do: Ferricstore.Flow.LMDB.IndexCodec.decode_terminal_expire_value(blob)
+
+  def encode_terminal_index_row(
+        terminal_key,
+        id,
+        updated_at_ms,
+        expire_at_ms,
+        state_key,
+        count_key
+      ),
+      do:
+        Ferricstore.Flow.LMDB.IndexCodec.encode_terminal_index_row(
+          terminal_key,
+          id,
+          updated_at_ms,
+          expire_at_ms,
+          state_key,
+          count_key
+        )
+
+  def decode_terminal_index_row(terminal_key, blob),
+    do: Ferricstore.Flow.LMDB.IndexCodec.decode_terminal_index_row(terminal_key, blob)
+
+  def decode_terminal_index_entry_row(terminal_key, blob),
+    do: Ferricstore.Flow.LMDB.IndexCodec.decode_terminal_index_entry_row(terminal_key, blob)
+
+  def terminal_index_row_count_key(terminal_key, blob),
+    do: Ferricstore.Flow.LMDB.IndexCodec.terminal_index_row_count_key(terminal_key, blob)
 
   def encode_count(count), do: Ferricstore.Flow.LMDB.IndexCodec.encode_count(count)
 

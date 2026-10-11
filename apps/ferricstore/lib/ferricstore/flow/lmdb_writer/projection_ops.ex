@@ -863,7 +863,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       {:ok, terminal_key} when is_binary(terminal_key) ->
         case get_fun.(terminal_key) do
           {:ok, terminal_value} when is_binary(terminal_value) ->
-            case Ferricstore.Flow.LMDB.terminal_index_count_key(terminal_value) do
+            case Ferricstore.Flow.LMDB.terminal_index_row_count_key(terminal_key, terminal_value) do
               {:ok, count_key} ->
                 acc = put_terminal_reverse_state(acc, state_key, terminal_key)
                 expand_path_op(path, {:terminal_delete, terminal_key, state_key, count_key}, acc)
@@ -1601,7 +1601,8 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
 
     value =
-      Ferricstore.Flow.LMDB.encode_terminal_index_value(
+      Ferricstore.Flow.LMDB.encode_terminal_index_row(
+        terminal_key,
         id,
         updated_at_ms,
         expire_at_ms,
@@ -2068,14 +2069,15 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
 
   defp validate_terminal_index_value(terminal_key, value, state_key, count_key) do
     with {:ok, {id, updated_at_ms, _expire_at_ms, ^state_key}} <-
-           Ferricstore.Flow.LMDB.decode_terminal_index_value(value),
+           Ferricstore.Flow.LMDB.decode_terminal_index_row(terminal_key, value),
          true <-
            Ferricstore.Flow.LMDB.terminal_index_entry_key?(
              terminal_key,
              id,
              updated_at_ms
            ),
-         {:ok, ^count_key} <- Ferricstore.Flow.LMDB.terminal_index_count_key(value) do
+         {:ok, ^count_key} <-
+           Ferricstore.Flow.LMDB.terminal_index_row_count_key(terminal_key, value) do
       :ok
     else
       _invalid -> {:error, :invalid_terminal_index_value}
@@ -2594,7 +2596,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   def maybe_put_expire_key(ops, terminal_key, value, state_key, count_key) do
-    case Ferricstore.Flow.LMDB.decode_terminal_index_value(value) do
+    case Ferricstore.Flow.LMDB.decode_terminal_index_row(terminal_key, value) do
       {:ok, {_id, _updated_at_ms, expire_at_ms, _state_key}} when expire_at_ms > 0 ->
         expire_key = Ferricstore.Flow.LMDB.terminal_expire_key(expire_at_ms, terminal_key)
 
@@ -2611,7 +2613,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   def maybe_delete_old_expire_key(ops, _terminal_key, nil, _state_key, _count_key), do: ops
 
   def maybe_delete_old_expire_key(ops, terminal_key, old_value, state_key, count_key) do
-    case Ferricstore.Flow.LMDB.decode_terminal_index_value(old_value) do
+    case Ferricstore.Flow.LMDB.decode_terminal_index_row(terminal_key, old_value) do
       {:ok, {_id, _updated_at_ms, expire_at_ms, _state_key}} when expire_at_ms > 0 ->
         expire_key = Ferricstore.Flow.LMDB.terminal_expire_key(expire_at_ms, terminal_key)
 

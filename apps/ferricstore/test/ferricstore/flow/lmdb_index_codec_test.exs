@@ -54,6 +54,65 @@ defmodule Ferricstore.Flow.LMDB.IndexCodecTest do
     assert :error = IndexCodec.decode_terminal_expire_row(expire_key, <<0xC3, 0>>)
   end
 
+  test "terminal index rows keep only the expiry when the key holds the other fields" do
+    alias Ferricstore.Flow.Keys
+
+    for partition_key <- ["tenant-a", nil] do
+      index_key = Keys.state_index_key("invoice.process", "completed", partition_key)
+      state_key = Keys.state_key("order-1", partition_key)
+      terminal_key = IndexCodec.terminal_index_key(index_key, "order-1", 1_791_750_926_967)
+      count_key = IndexCodec.terminal_count_key(index_key)
+
+      compact =
+        IndexCodec.encode_terminal_index_row(
+          terminal_key,
+          "order-1",
+          1_791_750_926_967,
+          1_792_355_726_967,
+          state_key,
+          count_key
+        )
+
+      legacy =
+        IndexCodec.encode_terminal_index_value(
+          "order-1",
+          1_791_750_926_967,
+          1_792_355_726_967,
+          state_key,
+          count_key
+        )
+
+      assert byte_size(compact) == 9
+
+      for value <- [compact, legacy] do
+        assert {:ok, {"order-1", 1_791_750_926_967, 1_792_355_726_967, ^state_key}} =
+                 IndexCodec.decode_terminal_index_row(terminal_key, value)
+
+        assert {:ok, {"order-1", 1_791_750_926_967, 1_792_355_726_967, ^state_key, ^count_key}} =
+                 IndexCodec.decode_terminal_index_entry_row(terminal_key, value)
+
+        assert {:ok, ^count_key} = IndexCodec.terminal_index_row_count_key(terminal_key, value)
+      end
+
+      # Fields the key cannot reproduce keep the self-describing v1 value.
+      for {id, state_key_value} <- [{"order-1", nil}, {"order-2", state_key}] do
+        assert IndexCodec.encode_terminal_index_row(
+                 terminal_key,
+                 id,
+                 1,
+                 2,
+                 state_key_value,
+                 count_key
+               ) ==
+                 IndexCodec.encode_terminal_index_value(id, 1, 2, state_key_value, count_key)
+      end
+
+      assert :error = IndexCodec.decode_terminal_index_row("flow-terminal-index:bad", compact)
+      assert :error = IndexCodec.decode_terminal_index_row(terminal_key, <<0xC4, 1>>)
+      assert :missing = IndexCodec.terminal_index_row_count_key(terminal_key, <<0xC4>>)
+    end
+  end
+
   test "all index value decoders reject trailing external-term bytes" do
     active_key = IndexCodec.active_index_key("index", "id", 10)
 

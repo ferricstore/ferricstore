@@ -7,7 +7,7 @@ defmodule Ferricstore.Flow.LMDBIndexDecode do
       when is_list(entries) and is_binary(path) and is_integer(now_ms) and now_ms >= 0 do
     reduce_entries(entries, fn
       key, value, acc ->
-        case LMDB.decode_terminal_index_value(value) do
+        case LMDB.decode_terminal_index_row(key, value) do
           {:ok, {id, updated_at_ms, expire_at_ms, state_key}} ->
             cond do
               not LMDB.terminal_index_entry_key?(key, id, updated_at_ms) ->

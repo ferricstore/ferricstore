@@ -1039,7 +1039,8 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     terminal_key = LMDB.terminal_index_key(index_key, record.id, updated_at_ms)
 
     terminal_value =
-      LMDB.encode_terminal_index_value(
+      LMDB.encode_terminal_index_row(
+        terminal_key,
         record.id,
         updated_at_ms,
         projection_expire_at_ms,

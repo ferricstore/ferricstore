@@ -329,7 +329,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjection do
     |> Enum.reduce_while({:ok, []}, fn
       {terminal_key, value}, {:ok, reversed_ops}
       when is_binary(terminal_key) and is_binary(value) ->
-        case LMDB.decode_terminal_index_value(value) do
+        case LMDB.decode_terminal_index_row(terminal_key, value) do
           {:ok, {^id, _updated_at_ms, _expire_at_ms, nil}} ->
             append_stale_terminal_delete(
               terminal_key,

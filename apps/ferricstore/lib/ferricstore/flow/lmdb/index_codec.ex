@@ -19,6 +19,9 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
   # v2 terminal expiry value: the terminal key, state key and count key are all
   # derived from the expiry key. Distinct from v1, an external term (byte 131).
   @compact_terminal_expire_value <<0xC3>>
+  # v2 terminal index value: only the expiry; id, update time, state key and
+  # count key are derived from the terminal index key.
+  @compact_terminal_index_version 0xC4
 
   def terminal_index_prefix(state_index_key) when is_binary(state_index_key) do
     "flow-terminal-index:" <>
@@ -428,6 +431,77 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
       ),
       do: raise(ArgumentError, "terminal index fields are invalid")
 
+  @doc """
+  Encodes the value stored under `terminal_key`: just the expiry when the key
+  reproduces every other field, otherwise the self-describing v1 value.
+  """
+  def encode_terminal_index_row(
+        terminal_key,
+        id,
+        updated_at_ms,
+        expire_at_ms,
+        state_key,
+        count_key
+      )
+      when is_binary(terminal_key) and is_integer(expire_at_ms) and expire_at_ms >= 0 and
+             expire_at_ms <= @max_u64 do
+    if derived_terminal_index_fields(terminal_key) ==
+         {:ok, {id, updated_at_ms, state_key, count_key}},
+       do: <<@compact_terminal_index_version, expire_at_ms::unsigned-big-64>>,
+       else: encode_terminal_index_value(id, updated_at_ms, expire_at_ms, state_key, count_key)
+  end
+
+  def encode_terminal_index_row(
+        _terminal_key,
+        id,
+        updated_at_ms,
+        expire_at_ms,
+        state_key,
+        count_key
+      ),
+      do: encode_terminal_index_value(id, updated_at_ms, expire_at_ms, state_key, count_key)
+
+  def decode_terminal_index_row(terminal_key, blob) do
+    case decode_terminal_index_entry_row(terminal_key, blob) do
+      {:ok, {id, updated_at_ms, expire_at_ms, state_key, _count_key}} ->
+        {:ok, {id, updated_at_ms, expire_at_ms, state_key}}
+
+      :error ->
+        :error
+    end
+  end
+
+  def decode_terminal_index_entry_row(
+        terminal_key,
+        <<@compact_terminal_index_version, expire_at_ms::unsigned-big-64>>
+      ) do
+    case derived_terminal_index_fields(terminal_key) do
+      {:ok, {id, updated_at_ms, state_key, count_key}} ->
+        {:ok, {id, updated_at_ms, expire_at_ms, state_key, count_key}}
+
+      :error ->
+        :error
+    end
+  end
+
+  def decode_terminal_index_entry_row(
+        _terminal_key,
+        <<@compact_terminal_index_version, _::binary>>
+      ),
+      do: :error
+
+  def decode_terminal_index_entry_row(_terminal_key, blob) when is_binary(blob),
+    do: decode_terminal_index_entry(blob)
+
+  def decode_terminal_index_entry_row(_terminal_key, _blob), do: :error
+
+  def terminal_index_row_count_key(terminal_key, blob) do
+    case decode_terminal_index_entry_row(terminal_key, blob) do
+      {:ok, {_id, _updated_at_ms, _expire_at_ms, _state_key, count_key}} -> {:ok, count_key}
+      :error -> :missing
+    end
+  end
+
   def encode_terminal_expire_value(terminal_key, state_key, count_key)
       when is_binary(terminal_key) and (is_binary(state_key) or is_nil(state_key)) and
              is_binary(count_key) do
@@ -481,6 +555,13 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
   # The state key and count key that a raw (not digested) terminal index key
   # implies; any digested component makes them underivable.
   defp derived_terminal_expire_fields(terminal_key) do
+    case derived_terminal_index_fields(terminal_key) do
+      {:ok, {_id, _updated_at_ms, state_key, count_key}} -> {:ok, {state_key, count_key}}
+      :error -> :error
+    end
+  end
+
+  defp derived_terminal_index_fields(terminal_key) when is_binary(terminal_key) do
     global = terminal_index_global_prefix()
     global_bytes = byte_size(global)
 
@@ -492,13 +573,23 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
          true <- not String.starts_with?(index_component, @digest_component_tag),
          <<time::binary-size(20), 0, id::binary>> <- time_and_id,
          true <- decimal_digits?(time),
+         updated_at_ms when updated_at_ms <= @max_u64 <- String.to_integer(time),
          true <- id != "" and not String.starts_with?(id, @digest_component_tag),
          ["f:{" <> _tag = tag_prefix, _index_suffix] <- :binary.split(index_component, "}:i:") do
-      {:ok, {tag_prefix <> "}:s:" <> id, terminal_count_prefix() <> index_component}}
+      {:ok,
+       {id, updated_at_ms, derived_state_key(tag_prefix, id),
+        terminal_count_prefix() <> index_component}}
     else
       _invalid -> :error
     end
   end
+
+  defp derived_terminal_index_fields(_terminal_key), do: :error
+
+  # Flows without a partition key are indexed under the global tag but stored
+  # under their auto-partition tag.
+  defp derived_state_key("f:{f", id), do: Ferricstore.Flow.Keys.state_key(id, nil)
+  defp derived_state_key(tag_prefix, id), do: tag_prefix <> "}:s:" <> id
 
   defp decimal_digits?(digits), do: digits != "" and digits =~ ~r/\A[0-9]+\z/
 

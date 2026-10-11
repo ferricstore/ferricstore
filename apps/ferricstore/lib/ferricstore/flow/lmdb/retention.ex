@@ -525,14 +525,15 @@ defmodule Ferricstore.Flow.LMDB.Retention do
         if expire_key == IndexCodec.terminal_expire_key(marker_expire_at_ms, terminal_key) do
           case Access.get(path, terminal_key) do
             {:ok, terminal_value} ->
-              case IndexCodec.decode_terminal_index_value(terminal_value) do
+              case IndexCodec.decode_terminal_index_row(terminal_key, terminal_value) do
                 {:ok, {id, updated_at_ms, expire_at_ms, decoded_state_key}} ->
                   cond do
                     not IndexCodec.terminal_index_entry_key?(terminal_key, id, updated_at_ms) ->
                       {:error, {:invalid_terminal_index_value, terminal_key}}
 
                     decoded_state_key != state_key or
-                        IndexCodec.terminal_index_count_key(terminal_value) != {:ok, count_key} ->
+                        IndexCodec.terminal_index_row_count_key(terminal_key, terminal_value) !=
+                          {:ok, count_key} ->
                       {:error, :invalid_terminal_expire_value}
 
                     expire_at_ms > 0 and expire_at_ms <= now_ms ->
@@ -574,14 +575,15 @@ defmodule Ferricstore.Flow.LMDB.Retention do
          counts,
          now_ms
        ) do
-    case IndexCodec.decode_terminal_index_value(terminal_value) do
+    case IndexCodec.decode_terminal_index_row(terminal_key, terminal_value) do
       {:ok, {id, updated_at_ms, expire_at_ms, decoded_state_key}} ->
         cond do
           not IndexCodec.terminal_index_entry_key?(terminal_key, id, updated_at_ms) ->
             {:error, {:invalid_terminal_index_value, terminal_key}}
 
           decoded_state_key != state_key or
-              IndexCodec.terminal_index_count_key(terminal_value) != {:ok, count_key} ->
+              IndexCodec.terminal_index_row_count_key(terminal_key, terminal_value) !=
+                {:ok, count_key} ->
             {:error, {:invalid_terminal_expire_value, expire_key}}
 
           expire_at_ms > 0 and expire_at_ms <= now_ms ->

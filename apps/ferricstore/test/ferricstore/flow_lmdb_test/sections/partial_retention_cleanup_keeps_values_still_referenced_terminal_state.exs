@@ -822,9 +822,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
                  Ferricstore.Flow.LMDB.prefix_entries(lmdb_path, terminal_prefix, 10)
 
         assert ["flow-completed"] =
-                 Enum.map(terminal_entries, fn {_key, value} ->
+                 Enum.map(terminal_entries, fn {key, value} ->
                    {:ok, {id, _updated_at_ms, _expire_at_ms, _state_key}} =
-                     Ferricstore.Flow.LMDB.decode_terminal_index_value(value)
+                     Ferricstore.Flow.LMDB.decode_terminal_index_row(key, value)
 
                    id
                  end)
