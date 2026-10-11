@@ -2615,10 +2615,10 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       {:ok, {_id, _updated_at_ms, expire_at_ms, _state_key}} when expire_at_ms > 0 ->
         expire_key = Ferricstore.Flow.LMDB.terminal_expire_key(expire_at_ms, terminal_key)
 
-        expire_value =
-          Ferricstore.Flow.LMDB.encode_terminal_expire_value(terminal_key, state_key, count_key)
+        expire_values =
+          Ferricstore.Flow.LMDB.terminal_expire_values(terminal_key, state_key, count_key)
 
-        [{:compare, expire_key, expire_value}, {:delete, expire_key} | ops]
+        [{:compare_any, expire_key, expire_values}, {:delete, expire_key} | ops]
 
       _ ->
         ops

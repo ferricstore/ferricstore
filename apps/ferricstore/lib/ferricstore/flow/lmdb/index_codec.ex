@@ -16,6 +16,9 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
   @query_index_value_tag :flow_query_index
   @query_index_markers ["}:i:a:", "}:i:at:", "}:i:as:", "}:i:ap:", "}:i:sm:"]
   @max_query_discovery_component_bytes 1_024
+  # v2 terminal expiry value: the terminal key, state key and count key are all
+  # derived from the expiry key. Distinct from v1, an external term (byte 131).
+  @compact_terminal_expire_value <<0xC3>>
 
   def terminal_index_prefix(state_index_key) when is_binary(state_index_key) do
     "flow-terminal-index:" <>
@@ -428,11 +431,76 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
   def encode_terminal_expire_value(terminal_key, state_key, count_key)
       when is_binary(terminal_key) and (is_binary(state_key) or is_nil(state_key)) and
              is_binary(count_key) do
-    TermCodec.encode({terminal_key, state_key, count_key})
+    if derived_terminal_expire_fields(terminal_key) == {:ok, {state_key, count_key}},
+      do: @compact_terminal_expire_value,
+      else: TermCodec.encode({terminal_key, state_key, count_key})
   end
 
   def encode_terminal_expire_value(_terminal_key, _state_key, _count_key),
     do: raise(ArgumentError, "terminal expiration fields are invalid")
+
+  @doc """
+  Every encoding a stored expiry row for these fields may have, for guarding
+  deletes of rows written before the compact layout.
+  """
+  def terminal_expire_values(terminal_key, state_key, count_key) do
+    Enum.uniq([
+      encode_terminal_expire_value(terminal_key, state_key, count_key),
+      TermCodec.encode({terminal_key, state_key, count_key})
+    ])
+  end
+
+  def decode_terminal_expire_row(expire_key, @compact_terminal_expire_value)
+      when is_binary(expire_key) do
+    with {:ok, terminal_key} <- terminal_key_from_expire_key(expire_key),
+         {:ok, {state_key, count_key}} <- derived_terminal_expire_fields(terminal_key) do
+      {:ok, {terminal_key, state_key, count_key}}
+    else
+      _invalid -> :error
+    end
+  end
+
+  def decode_terminal_expire_row(expire_key, blob) when is_binary(expire_key),
+    do: decode_terminal_expire_value(blob)
+
+  def decode_terminal_expire_row(_expire_key, _blob), do: :error
+
+  defp terminal_key_from_expire_key(expire_key) do
+    prefix_bytes = byte_size(terminal_expire_prefix())
+
+    with true <- String.starts_with?(expire_key, terminal_expire_prefix()),
+         <<_prefix::binary-size(^prefix_bytes), time::binary-size(20), 0, terminal_key::binary>> <-
+           expire_key,
+         true <- decimal_digits?(time) and terminal_key != "" do
+      {:ok, terminal_key}
+    else
+      _invalid -> :error
+    end
+  end
+
+  # The state key and count key that a raw (not digested) terminal index key
+  # implies; any digested component makes them underivable.
+  defp derived_terminal_expire_fields(terminal_key) do
+    global = terminal_index_global_prefix()
+    global_bytes = byte_size(global)
+
+    with true <-
+           byte_size(terminal_key) <= @max_raw_identity_component_bytes and
+             not String.starts_with?(terminal_key, @digest_component_tag),
+         <<^global::binary-size(^global_bytes), rest::binary>> <- terminal_key,
+         [index_component, time_and_id] <- :binary.split(rest, <<0>>),
+         true <- not String.starts_with?(index_component, @digest_component_tag),
+         <<time::binary-size(20), 0, id::binary>> <- time_and_id,
+         true <- decimal_digits?(time),
+         true <- id != "" and not String.starts_with?(id, @digest_component_tag),
+         ["f:{" <> _tag = tag_prefix, _index_suffix] <- :binary.split(index_component, "}:i:") do
+      {:ok, {tag_prefix <> "}:s:" <> id, terminal_count_prefix() <> index_component}}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp decimal_digits?(digits), do: digits != "" and digits =~ ~r/\A[0-9]+\z/
 
   def decode_terminal_expire_value(blob) when is_binary(blob) do
     case TermCodec.decode(blob) do

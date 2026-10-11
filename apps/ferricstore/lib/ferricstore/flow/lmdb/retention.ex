@@ -467,7 +467,7 @@ defmodule Ferricstore.Flow.LMDB.Retention do
          counts,
          now_ms
        ) do
-    case IndexCodec.decode_terminal_expire_value(expire_value) do
+    case IndexCodec.decode_terminal_expire_row(expire_key, expire_value) do
       {:ok, {terminal_key, state_key, count_key}} ->
         if expire_key == IndexCodec.terminal_expire_key(marker_expire_at_ms, terminal_key) do
           case Access.get(path, terminal_key) do
@@ -520,7 +520,7 @@ defmodule Ferricstore.Flow.LMDB.Retention do
          expire_value,
          now_ms
        ) do
-    case IndexCodec.decode_terminal_expire_value(expire_value) do
+    case IndexCodec.decode_terminal_expire_row(expire_key, expire_value) do
       {:ok, {terminal_key, state_key, count_key}} ->
         if expire_key == IndexCodec.terminal_expire_key(marker_expire_at_ms, terminal_key) do
           case Access.get(path, terminal_key) do

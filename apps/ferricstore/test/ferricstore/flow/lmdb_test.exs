@@ -450,8 +450,8 @@ defmodule Ferricstore.Flow.LMDBUnitTest do
     assert {:compare, terminal_key, terminal_value} in ops
     assert {:compare, count_key, count_value} in ops
 
-    assert {:compare, expire_key,
-            LMDB.encode_terminal_expire_value(terminal_key, state_key, count_key)} in ops
+    assert {:compare_any, expire_key,
+            LMDB.terminal_expire_values(terminal_key, state_key, count_key)} in ops
 
     assert {:delete, expire_key} in ops
     assert {:delete, terminal_key} in ops
@@ -503,8 +503,8 @@ defmodule Ferricstore.Flow.LMDBUnitTest do
     assert {:compare, terminal_key, terminal_value} in ops
     assert {:compare, reverse_key, terminal_key} in ops
 
-    assert {:compare, expire_key,
-            LMDB.encode_terminal_expire_value(terminal_key, state_key, count_key)} in ops
+    assert {:compare_any, expire_key,
+            LMDB.terminal_expire_values(terminal_key, state_key, count_key)} in ops
 
     assert {:delete, terminal_key} in ops
     assert {:delete, state_key} in ops

@@ -1463,8 +1463,8 @@ defmodule Ferricstore.Flow.LMDB do
        )
        when is_integer(expire_at_ms) and expire_at_ms > 0 do
     expire_key = terminal_expire_key(expire_at_ms, terminal_key)
-    expire_value = encode_terminal_expire_value(terminal_key, state_key, count_key)
-    [{:compare, expire_key, expire_value}, {:delete, expire_key} | ops]
+    expire_values = terminal_expire_values(terminal_key, state_key, count_key)
+    [{:compare_any, expire_key, expire_values}, {:delete, expire_key} | ops]
   end
 
   defp prepend_terminal_expire_delete(
@@ -1489,6 +1489,14 @@ defmodule Ferricstore.Flow.LMDB do
   def encode_terminal_expire_value(terminal_key, state_key, count_key),
     do:
       Ferricstore.Flow.LMDB.IndexCodec.encode_terminal_expire_value(
+        terminal_key,
+        state_key,
+        count_key
+      )
+
+  def terminal_expire_values(terminal_key, state_key, count_key),
+    do:
+      Ferricstore.Flow.LMDB.IndexCodec.terminal_expire_values(
         terminal_key,
         state_key,
         count_key

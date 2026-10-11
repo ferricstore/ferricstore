@@ -4,6 +4,56 @@ defmodule Ferricstore.Flow.LMDB.IndexCodecTest do
   alias Ferricstore.Flow.LMDB.IndexCodec
   alias Ferricstore.TermCodec
 
+  test "terminal expiry rows derive their fields from the key and still read v1 values" do
+    alias Ferricstore.Flow.Keys
+
+    index_key = Keys.state_index_key("invoice.process", "completed", "tenant-a")
+    state_key = Keys.state_key("order-1", "tenant-a")
+    terminal_key = IndexCodec.terminal_index_key(index_key, "order-1", 1_791_750_926_967)
+    count_key = IndexCodec.terminal_count_key(index_key)
+    expire_key = IndexCodec.terminal_expire_key(1_792_355_726_967, terminal_key)
+
+    compact = IndexCodec.encode_terminal_expire_value(terminal_key, state_key, count_key)
+    legacy = TermCodec.encode({terminal_key, state_key, count_key})
+
+    assert byte_size(compact) == 1
+
+    for value <- [compact, legacy] do
+      assert {:ok, {^terminal_key, ^state_key, ^count_key}} =
+               IndexCodec.decode_terminal_expire_row(expire_key, value)
+    end
+
+    assert Enum.sort(IndexCodec.terminal_expire_values(terminal_key, state_key, count_key)) ==
+             Enum.sort([compact, legacy])
+
+    # Fields that the key cannot reproduce keep the self-describing v1 value.
+    for {row_state_key, row_count_key} <- [
+          {nil, count_key},
+          {Keys.state_key("order-2", "tenant-a"), count_key},
+          {state_key, IndexCodec.terminal_count_key(index_key <> "x")}
+        ] do
+      value = IndexCodec.encode_terminal_expire_value(terminal_key, row_state_key, row_count_key)
+      assert value == TermCodec.encode({terminal_key, row_state_key, row_count_key})
+
+      assert {:ok, {^terminal_key, ^row_state_key, ^row_count_key}} =
+               IndexCodec.decode_terminal_expire_row(expire_key, value)
+
+      assert IndexCodec.terminal_expire_values(terminal_key, row_state_key, row_count_key) == [
+               value
+             ]
+    end
+
+    long_id = String.duplicate("x", 300)
+    long_terminal_key = IndexCodec.terminal_index_key(index_key, long_id, 1)
+    long_state_key = Keys.state_key(long_id, "tenant-a")
+
+    assert IndexCodec.encode_terminal_expire_value(long_terminal_key, long_state_key, count_key) ==
+             TermCodec.encode({long_terminal_key, long_state_key, count_key})
+
+    assert :error = IndexCodec.decode_terminal_expire_row("flow-terminal-expire:bad", compact)
+    assert :error = IndexCodec.decode_terminal_expire_row(expire_key, <<0xC3, 0>>)
+  end
+
   test "all index value decoders reject trailing external-term bytes" do
     active_key = IndexCodec.active_index_key("index", "id", 10)
 
