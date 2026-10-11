@@ -18,7 +18,6 @@ defmodule FerricstoreServer.Native.AdmissionTest do
     on_exit(fn ->
       Enum.each([owner1, owner2, owner3], &Process.exit(&1, :kill))
       stop_if_alive(admission)
-      if :ets.whereis(table) != :undefined, do: :ets.delete(table)
     end)
 
     assert {:ok, _token1} = Admission.acquire(name, owner1)
@@ -46,7 +45,6 @@ defmodule FerricstoreServer.Native.AdmissionTest do
       name |> Process.whereis() |> stop_if_alive()
 
       Enum.each([owner1, owner2], &Process.exit(&1, :kill))
-      if :ets.whereis(table) != :undefined, do: :ets.delete(table)
     end)
 
     {:ok, admission} = Admission.start_link(name: name, table: table, max_connections: 1)

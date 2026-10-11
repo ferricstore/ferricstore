@@ -63,7 +63,6 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
       end)
 
       release_lmdb!()
-      if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
       File.rm_rf!(data_dir)
     end)
 

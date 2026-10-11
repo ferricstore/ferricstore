@@ -102,7 +102,6 @@ defmodule Ferricstore.Flow.LMDBWriter.RestartRecoveryTest do
       stop_process(writer)
       stop_process(coordinator)
       LMDB.release(lmdb_path)
-      if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
       File.rm_rf!(data_dir)
     end)
 
@@ -299,7 +298,6 @@ defmodule Ferricstore.Flow.LMDBWriter.RestartRecoveryTest do
       stop_process(writer)
       stop_process(coordinator)
       LMDB.release(lmdb_path)
-      if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
       File.rm_rf!(data_dir)
     end)
 
