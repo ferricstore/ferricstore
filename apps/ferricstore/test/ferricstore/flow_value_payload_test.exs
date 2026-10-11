@@ -219,7 +219,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
   end
 
   test "value_mget can omit values larger than max_bytes without decoding them" do
-    payload = %{large: String.duplicate("x", 512)}
+    payload = %{"large" => String.duplicate("x", 512)}
 
     assert {:ok, %{ref: ref}} =
              FerricStore.flow_value_put(payload, partition_key: "tenant-a")

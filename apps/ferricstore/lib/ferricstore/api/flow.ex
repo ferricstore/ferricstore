@@ -35,6 +35,7 @@ defmodule FerricStore.API.Flow do
   def flow_value_put(value, opts \\ [])
 
   def flow_value_put(value, opts) when is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_value!(value, :value)
     Ferricstore.Flow.value_put(default_ctx(), value, opts)
   end
 
@@ -61,6 +62,7 @@ defmodule FerricStore.API.Flow do
   """
   @spec flow_signal(binary(), keyword()) :: :ok | {:error, binary()}
   def flow_signal(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
     Ferricstore.Flow.signal(default_ctx(), id, opts)
   end
 
@@ -279,6 +281,8 @@ defmodule FerricStore.API.Flow do
   def flow_complete_many(partition_key, items, opts \\ [])
 
   def flow_complete_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
+    Ferricstore.Flow.UserValue.validate_items!(items)
     Ferricstore.Flow.complete_many(default_ctx(), partition_key, items, opts)
   end
 
@@ -572,6 +576,9 @@ defmodule FerricStore.API.Flow do
 
   def flow_transition_many(partition_key, from_state, to_state, items, opts)
       when is_binary(from_state) and is_binary(to_state) and is_list(items) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
+    Ferricstore.Flow.UserValue.validate_items!(items)
+
     Ferricstore.Flow.transition_many(
       default_ctx(),
       partition_key,
@@ -627,6 +634,8 @@ defmodule FerricStore.API.Flow do
   def flow_retry_many(partition_key, items, opts \\ [])
 
   def flow_retry_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
+    Ferricstore.Flow.UserValue.validate_items!(items)
     Ferricstore.Flow.retry_many(default_ctx(), partition_key, items, opts)
   end
 
@@ -663,6 +672,8 @@ defmodule FerricStore.API.Flow do
   def flow_fail_many(partition_key, items, opts \\ [])
 
   def flow_fail_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
+    Ferricstore.Flow.UserValue.validate_items!(items)
     Ferricstore.Flow.fail_many(default_ctx(), partition_key, items, opts)
   end
 
@@ -674,6 +685,7 @@ defmodule FerricStore.API.Flow do
   def flow_cancel(id, opts \\ [])
 
   def flow_cancel(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
     Ferricstore.Flow.cancel(default_ctx(), id, opts)
   end
 
@@ -694,6 +706,8 @@ defmodule FerricStore.API.Flow do
   def flow_cancel_many(partition_key, items, opts \\ [])
 
   def flow_cancel_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
+    Ferricstore.Flow.UserValue.validate_items!(items)
     Ferricstore.Flow.cancel_many(default_ctx(), partition_key, items, opts)
   end
 

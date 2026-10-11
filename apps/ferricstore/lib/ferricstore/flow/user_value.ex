@@ -1,18 +1,19 @@
 defmodule Ferricstore.Flow.UserValue do
   @moduledoc false
 
-  # Flow user values (payload, result, error) are replicated inside Raft
-  # commands, and replicas decode the log with safe binary_to_term. An atom that
-  # only the writer's VM had created would make the log unrecoverable after a
-  # restart, so user values may contain no atoms besides true, false and nil.
+  # Flow user values (payload, result, error, cancel reason, named values) are
+  # replicated inside Raft commands, and replicas decode the log with safe
+  # binary_to_term. An atom that only the writer's VM had created would make the
+  # log unrecoverable after a restart, so user values may contain no atoms
+  # besides true, false and nil.
 
-  @value_keys [:payload, :result, :error]
+  @value_keys [:payload, :result, :error, :reason, :values]
 
   @spec validate_opts!(term()) :: :ok
   def validate_opts!(opts) when is_list(opts) do
     Enum.each(@value_keys, fn key ->
       case Keyword.fetch(opts, key) do
-        {:ok, value} -> validate!(value, key)
+        {:ok, value} -> validate_value!(value, key)
         :error -> :ok
       end
     end)
@@ -24,15 +25,27 @@ defmodule Ferricstore.Flow.UserValue do
   def validate_items!(items) when is_list(items), do: Enum.each(items, &validate_item!/1)
   def validate_items!(_items), do: :ok
 
+  @spec validate_value!(term(), atom()) :: :ok
+  def validate_value!(value, field) do
+    if contains_atom?(value) do
+      raise ArgumentError,
+            "Flow #{field} must not contain atoms other than true, false and nil; " <>
+              "use string keys and string values (atoms are not durable across restarts)"
+    end
+
+    :ok
+  end
+
+  # Tagged tuple items such as {:id, id, :payload, payload} carry a value right
+  # after its field name; other tuple items ({id, opts}, {id, lease, opts}) carry
+  # keyword options.
   defp validate_item!(item) when is_tuple(item),
-    do: item |> Tuple.to_list() |> Enum.each(&validate_item!/1)
+    do: item |> Tuple.to_list() |> validate_tuple_elements!()
 
   defp validate_item!(item) when is_map(item) do
     Enum.each(@value_keys, fn key ->
-      case Map.fetch(item, key) do
-        {:ok, value} -> validate!(value, key)
-        :error -> :ok
-      end
+      validate_map_value!(item, key, key)
+      validate_map_value!(item, Atom.to_string(key), key)
     end)
   end
 
@@ -42,14 +55,23 @@ defmodule Ferricstore.Flow.UserValue do
 
   defp validate_item!(_item), do: :ok
 
-  defp validate!(value, field) do
-    if contains_atom?(value) do
-      raise ArgumentError,
-            "Flow #{field} must not contain atoms other than true, false and nil; " <>
-              "use string keys and string values (atoms are not durable across restarts)"
-    end
+  defp validate_tuple_elements!([field, value | rest]) when field in @value_keys do
+    validate_value!(value, field)
+    validate_tuple_elements!(rest)
+  end
 
-    :ok
+  defp validate_tuple_elements!([element | rest]) do
+    validate_item!(element)
+    validate_tuple_elements!(rest)
+  end
+
+  defp validate_tuple_elements!([]), do: :ok
+
+  defp validate_map_value!(item, map_key, field) do
+    case Map.fetch(item, map_key) do
+      {:ok, value} -> validate_value!(value, field)
+      :error -> :ok
+    end
   end
 
   defp contains_atom?(value) when value in [true, false, nil], do: false
