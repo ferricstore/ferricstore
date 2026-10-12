@@ -528,20 +528,33 @@ defmodule FerricstoreServer.Native.ResourceBudgetTest do
   @tag :interrupted_resource_accounting
   test "killed transferable lease accounting cannot strand byte reservations" do
     name = :"native_resource_interrupted_bytes_#{System.unique_integer([:positive])}"
-    start_supervised!({ResourceBudget, name: name, limits: %{inbound_bytes: 8}})
+
+    # No periodic sweep: only the owner's DOWN and the reclaim below repair counters.
+    coordinator =
+      start_supervised!(
+        {ResourceBudget,
+         name: name, limits: %{inbound_bytes: 8}, scoped_sweep_interval_ms: 60_000}
+      )
 
     for _attempt <- 1..128 do
-      kill_accounting_worker(fn ->
-        case ResourceBudget.acquire(name, :inbound_bytes, self(), 2) do
-          {:ok, token} ->
-            ResourceBudget.resize(name, token, 8)
-            ResourceBudget.resize(name, token, 4)
-            ResourceBudget.release_many(name, [token])
+      worker =
+        kill_accounting_worker(fn ->
+          case ResourceBudget.acquire(name, :inbound_bytes, self(), 2) do
+            {:ok, token} ->
+              ResourceBudget.resize(name, token, 8)
+              ResourceBudget.resize(name, token, 4)
+              ResourceBudget.release_many(name, [token])
 
-          {:error, {:limit, :inbound_bytes}} ->
-            :ok
-        end
-      end)
+            {:error, {:limit, :inbound_bytes}} ->
+              :ok
+          end
+        end)
+
+      # A lease the worker held between calls is freed when the coordinator
+      # handles its DOWN, which can arrive after the test's own DOWN.
+      assert eventually(fn ->
+               not Map.has_key?(:sys.get_state(coordinator).owner_monitors, worker)
+             end)
 
       assert :ok = GenServer.call(name, {:reclaim_scoped, :all})
       assert ResourceBudget.usage(name).inbound_bytes == 0
@@ -582,6 +595,7 @@ defmodule FerricstoreServer.Native.ResourceBudgetTest do
     Process.sleep(1)
     Process.exit(worker, :kill)
     assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}, 1_000
+    worker
   end
 
   defp repeat_accounting(operation) do
