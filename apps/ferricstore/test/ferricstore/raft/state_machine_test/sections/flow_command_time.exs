@@ -2056,10 +2056,12 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
             :telemetry.attach(
               handler_id,
               [:ferricstore, :flow, :lmdb_writer, :backlog],
-              fn _event, measurements, metadata, test_pid ->
-                send(test_pid, {:flow_lmdb_backlog, measurements, metadata})
+              # Only this test's shard: the default instance's writers share the event.
+              fn _event, measurements, metadata, {test_pid, shard} ->
+                if metadata[:shard_index] == shard,
+                  do: send(test_pid, {:flow_lmdb_backlog, measurements, metadata})
               end,
-              self()
+              {self(), shard_index}
             )
 
           due_key = Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition_key)
@@ -2139,10 +2141,12 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
             :telemetry.attach(
               handler_id,
               [:ferricstore, :flow, :lmdb_writer, :backlog],
-              fn _event, measurements, metadata, test_pid ->
-                send(test_pid, {:flow_lmdb_backlog, measurements, metadata})
+              # Only this test's shard: the default instance's writers share the event.
+              fn _event, measurements, metadata, {test_pid, shard} ->
+                if metadata[:shard_index] == shard,
+                  do: send(test_pid, {:flow_lmdb_backlog, measurements, metadata})
               end,
-              self()
+              {self(), shard_index}
             )
 
           on_exit(fn ->
@@ -2251,20 +2255,24 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
             :telemetry.attach(
               backlog_handler_id,
               [:ferricstore, :flow, :lmdb_writer, :backlog],
-              fn _event, measurements, metadata, test_pid ->
-                send(test_pid, {:flow_lmdb_backlog, measurements, metadata})
+              # Only this test's shard: the default instance's writers share the event.
+              fn _event, measurements, metadata, {test_pid, shard} ->
+                if metadata[:shard_index] == shard,
+                  do: send(test_pid, {:flow_lmdb_backlog, measurements, metadata})
               end,
-              self()
+              {self(), shard_index}
             )
 
           :ok =
             :telemetry.attach(
               degraded_handler_id,
               [:ferricstore, :flow, :lmdb_mirror, :degraded],
-              fn _event, measurements, metadata, test_pid ->
-                send(test_pid, {:flow_lmdb_degraded, measurements, metadata})
+              # Only this test's shard: the default instance's writers share the event.
+              fn _event, measurements, metadata, {test_pid, shard} ->
+                if metadata[:shard_index] == shard,
+                  do: send(test_pid, {:flow_lmdb_degraded, measurements, metadata})
               end,
-              self()
+              {self(), shard_index}
             )
 
           on_exit(fn ->
