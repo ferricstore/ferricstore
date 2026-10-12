@@ -60,11 +60,11 @@ defmodule Ferricstore.Flow.Transfer do
 
       case File.open(partial, [:write, :binary], &write_export(ctx, &1, scan)) do
         {:ok, {:ok, counts}} ->
-          :ok = File.rename(partial, path)
+          :ok = Ferricstore.FS.rename(partial, path)
           {:ok, counts}
 
         {:ok, {:error, _reason} = error} ->
-          _ = File.rm(partial)
+          _ = Ferricstore.FS.rm(partial)
           error
 
         {:error, reason} ->

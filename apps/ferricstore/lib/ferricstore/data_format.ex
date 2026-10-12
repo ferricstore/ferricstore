@@ -134,7 +134,7 @@ defmodule Ferricstore.DataFormat do
 
   defp booted_before?(data_dir) do
     match?({:ok, _state}, ReplicationMode.read(data_dir)) or
-      File.exists?(ReplicationMode.marker_path(data_dir))
+      Ferricstore.FS.exists?(ReplicationMode.marker_path(data_dir))
   end
 
   defp configured_format do
