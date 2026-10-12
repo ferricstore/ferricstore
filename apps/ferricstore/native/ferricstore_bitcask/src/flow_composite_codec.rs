@@ -247,7 +247,7 @@ mod composite_entry_codec_tests {
         ));
 
         // Data format 2: 16-byte digests, 22 characters, last one in A/Q/g/w.
-        for last in [b'A', b'Q', b'g', b'w'] {
+        for last in *b"AQgw" {
             let mut short = [b'A'; 22];
             short[21] = last;
             assert!(valid_flow_tag(
@@ -255,7 +255,7 @@ mod composite_entry_codec_tests {
             ));
         }
 
-        for last in [b'B', b'E', b'x', b'-'] {
+        for last in *b"BEx-" {
             let mut short = [b'A'; 22];
             short[21] = last;
             assert!(!valid_flow_tag(
