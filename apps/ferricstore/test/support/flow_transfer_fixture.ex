@@ -171,12 +171,20 @@ defmodule Ferricstore.Test.FlowTransferFixture do
 
   @doc "Everything a client can observe about the manifest's data."
   def snapshot(ctx, %{flows: flows, types: types, shared_refs: shared_refs} = manifest) do
+    # History reads need the LMDB projection caught up with recent writes and
+    # refuse a shard a failed flush left degraded (export repairs it the same way).
+    :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count, 60_000)
+    :ok = Ferricstore.Flow.Transfer.repair_degraded_shards(ctx)
+
     %{
       flows:
         Map.new(flows, fn {id, pk} ->
           opts = if pk, do: [partition_key: pk], else: []
           {:ok, record} = Impl.flow_get(ctx, id, opts ++ [payload: true, values: true])
-          {:ok, history} = Impl.flow_history(ctx, id, opts)
+          # Public history reads refuse a shard mid-flush; retry like a client would.
+          {:ok, history} =
+            Ferricstore.Flow.Transfer.retry_transient(fn -> Impl.flow_history(ctx, id, opts) end)
+
           {{id, pk}, %{record: record, history: history}}
         end),
       policies: Map.new(types, &{&1, Impl.flow_policy_get(ctx, &1)}),

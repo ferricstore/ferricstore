@@ -24,7 +24,18 @@ defmodule Ferricstore.Flow.Transfer do
 
   alias Ferricstore.DataDir
   alias Ferricstore.DataFormat
-  alias Ferricstore.Flow.{Codec, HistoryRead, Keys, LMDB, Policy, ValueStore}
+
+  alias Ferricstore.Flow.{
+    Codec,
+    HistoryRead,
+    Keys,
+    LMDB,
+    LMDBMirror,
+    LMDBRebuilder,
+    Policy,
+    ValueStore
+  }
+
   alias Ferricstore.Flow.HistoryProjector.KeyCodec
   alias Ferricstore.Flow.Transfer.Retag
   alias Ferricstore.Store.Router
@@ -42,6 +53,8 @@ defmodule Ferricstore.Flow.Transfer do
   # ordinary-sized Raft entries.
   @chunk_events 1_000
   @chunk_bytes 4 * 1_024 * 1_024
+  # Reads that hit a shard mid-flush are retried for up to about 20 seconds.
+  @transient_attempts 40
 
   # Run-scoped rows a restore rebuilds from the run's record.
   @derived_run_families ~w(s h rtg rtm tc svr i)
@@ -59,14 +72,19 @@ defmodule Ferricstore.Flow.Transfer do
           {:ok, counts()} | {:error, term()}
   def export(ctx, path, _opts \\ []) do
     with :ok <- flush_lmdb(ctx),
+         :ok <- repair_degraded_shards(ctx),
          {:ok, scan} <- scan(ctx),
          :ok <- refuse_unsupported(scan) do
       partial = path <> ".partial"
 
       case File.open(partial, [:write, :binary], &write_export(ctx, &1, scan)) do
         {:ok, {:ok, counts}} ->
-          :ok = Ferricstore.FS.rename(partial, path)
-          {:ok, counts}
+          with :ok <- Ferricstore.FS.rename(partial, path),
+               :ok <- Ferricstore.Bitcask.NIF.v2_fsync_dir(Path.dirname(path)) do
+            {:ok, counts}
+          else
+            {:error, reason} -> {:error, {:export_file, reason}}
+          end
 
         {:ok, {:error, _reason} = error} ->
           _ = Ferricstore.FS.rm(partial)
@@ -107,6 +125,36 @@ defmodule Ferricstore.Flow.Transfer do
     end
   end
 
+  @doc false
+  # A shard whose LMDB mirror missed an update (a failed flush, an enqueue the
+  # writer refused) refuses history reads until the next flush with work, or
+  # until its projection is reconciled from the durable records, which is what
+  # the doctor's flow_lmdb repair does. A quiesced store gets no such flush.
+  def repair_degraded_shards(ctx) do
+    Enum.reduce_while(0..(ctx.shard_count - 1)//1, :ok, fn shard, :ok ->
+      if LMDBMirror.degraded_flag?(ctx, shard) do
+        case reconcile_shard(ctx, shard) do
+          :ok -> {:cont, :ok}
+          error -> {:halt, error}
+        end
+      else
+        {:cont, :ok}
+      end
+    end)
+  end
+
+  defp reconcile_shard(ctx, shard) do
+    shard_path = DataDir.shard_data_path(ctx.data_dir, shard)
+    keydir = elem(ctx.keydir_refs, shard)
+    :ok = LMDBRebuilder.reconcile_shard(shard_path, keydir, shard, ctx, nil, nil, nil, nil)
+
+    if LMDBMirror.degraded_flag?(ctx, shard),
+      do: {:error, {:lmdb_projection_degraded, shard}},
+      else: :ok
+  rescue
+    exception -> {:error, {:lmdb_reconcile_failed, shard, Exception.message(exception)}}
+  end
+
   defp write_export(ctx, io, scan) do
     header = %{
       version: @version,
@@ -124,7 +172,12 @@ defmodule Ferricstore.Flow.Transfer do
       trailer = Map.put(counts, :sha256, :crypto.hash_final(hash))
 
       {:ok, _hash} = write_frame(io, nil, {:trailer, trailer})
-      {:ok, counts}
+
+      # The file may be all that is left of the data once the old cluster goes.
+      case :file.sync(io) do
+        :ok -> {:ok, counts}
+        {:error, reason} -> {:error, {:export_file, reason}}
+      end
     end
   end
 
@@ -222,7 +275,10 @@ defmodule Ferricstore.Flow.Transfer do
   end
 
   # Runs that expired since the scan are skipped.
-  defp read_records(ctx, state_keys) do
+  defp read_records(ctx, state_keys),
+    do: retry_transient(fn -> read_records_once(ctx, state_keys) end)
+
+  defp read_records_once(ctx, state_keys) do
     ctx
     |> Router.flow_batch_get_state_keys_with_status(state_keys)
     |> Enum.zip(state_keys)
@@ -245,8 +301,10 @@ defmodule Ferricstore.Flow.Transfer do
   defp bundle(ctx, state_key, %{id: id} = record, scan) do
     partition_key = Map.get(record, :partition_key)
 
+    history_key = Keys.history_key(id, partition_key)
+
     with {:ok, raw_history} <-
-           HistoryRead.raw_entries(ctx, id, partition_key, Keys.history_key(id, partition_key)),
+           retry_transient(fn -> HistoryRead.raw_entries(ctx, id, partition_key, history_key) end),
          {:ok, history} <- decode_history(state_key, raw_history) do
       refs = owned_value_refs(record, history)
       aux = Map.get(scan.signals, state_key, []) ++ Map.get(scan.links, state_key, [])
@@ -324,6 +382,29 @@ defmodule Ferricstore.Flow.Transfer do
   defp present_rows(keys, values) do
     for {key, value} <- Enum.zip(keys, values), is_binary(value), do: {key, value}
   end
+
+  @doc false
+  # Retries `fun` while it reports a transient storage condition: history reads
+  # refuse a shard whose LMDB mirror is mid-flush, and record reads report
+  # :unavailable for a shard that is briefly unreachable.
+  def retry_transient(fun, attempts \\ @transient_attempts, delay_ms \\ 25) do
+    case fun.() do
+      {:error, reason} = error ->
+        if attempts > 1 and transient?(reason) do
+          Process.sleep(delay_ms)
+          retry_transient(fun, attempts - 1, min(delay_ms * 2, 500))
+        else
+          error
+        end
+
+      result ->
+        result
+    end
+  end
+
+  defp transient?("ERR flow LMDB projection unavailable" <> _key), do: true
+  defp transient?({:run_read_failed, _state_key, :unavailable}), do: true
+  defp transient?(_reason), do: false
 
   ## Scan
 

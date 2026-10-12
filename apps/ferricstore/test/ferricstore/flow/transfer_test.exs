@@ -212,6 +212,90 @@ defmodule Ferricstore.Flow.TransferTest do
     end
   end
 
+  test "payloads stored as blobs travel as their bytes and are stored as blobs again", ctx do
+    source = IsolatedInstance.checkout(blob_side_channel_threshold_bytes: 1_024)
+    target = IsolatedInstance.checkout(blob_side_channel_threshold_bytes: 1_024)
+
+    on_exit(fn ->
+      IsolatedInstance.checkin(source)
+      IsolatedInstance.checkin(target)
+    end)
+
+    payload = :crypto.strong_rand_bytes(8_192) |> Base.encode64()
+
+    :ok =
+      Impl.flow_create(source, "tx:big",
+        type: "tx.big",
+        state: "queued",
+        partition_key: "tx:tenant-big",
+        payload: payload,
+        now_ms: ctx.now_ms
+      )
+
+    assert blob_bytes(source) > 8_000
+
+    {:ok, _} = Transfer.export(source, ctx.path)
+    {:ok, _} = Transfer.restore(target, ctx.path)
+
+    assert {:ok, %{payload: ^payload}} =
+             Impl.flow_get(target, "tx:big", partition_key: "tx:tenant-big", payload: true)
+
+    assert blob_bytes(target) > 8_000
+  end
+
+  # Bytes in the instance's blob segments: large values live there.
+  defp blob_bytes(instance) do
+    Path.join([instance.data_dir, "blob", "**", "*"])
+    |> Path.wildcard()
+    |> Enum.filter(&File.regular?/1)
+    |> Enum.map(&File.stat!(&1).size)
+    |> Enum.sum()
+  end
+
+  test "export repairs a shard whose LMDB projection is marked degraded", ctx do
+    # A mirror enqueue the writer refused marks the shard degraded; history reads
+    # then refuse it until the projection is reconciled.
+    :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.source.name, ctx.source.shard_count, 60_000)
+    key = Ferricstore.Flow.Keys.history_key("tx:done", "tx:tenant-a")
+    flag = Ferricstore.Store.Router.shard_for(ctx.source, key) + 1
+    :atomics.put(ctx.source.flow_lmdb_mirror_degraded, flag, 1)
+
+    assert {:ok, %{flows: flows}} = Transfer.export(ctx.source, ctx.path)
+    assert flows == length(ctx.manifest.flows) + length(ctx.manifest.schedules)
+    assert :atomics.get(ctx.source.flow_lmdb_mirror_degraded, flag) == 0
+  end
+
+  test "transient storage conditions are retried, other errors are not" do
+    {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+    flaky = fn reason ->
+      fn ->
+        case Agent.get_and_update(attempts, &{&1, &1 + 1}) do
+          n when n < 3 -> {:error, reason}
+          _n -> {:ok, :read}
+        end
+      end
+    end
+
+    # History reads refuse a shard while its LMDB mirror is mid-flush.
+    assert {:ok, :read} =
+             Transfer.retry_transient(flaky.("ERR flow LMDB projection unavailable for k"), 5, 1)
+
+    Agent.update(attempts, fn _ -> 0 end)
+
+    assert {:ok, :read} =
+             Transfer.retry_transient(flaky.({:run_read_failed, "k", :unavailable}), 5, 1)
+
+    Agent.update(attempts, fn _ -> 0 end)
+    assert {:error, :corrupt} = Transfer.retry_transient(flaky.(:corrupt), 5, 1)
+    assert Agent.get(attempts, & &1) == 1
+
+    Agent.update(attempts, fn _ -> 0 end)
+
+    assert {:error, "ERR flow LMDB projection unavailable for k"} =
+             Transfer.retry_transient(flaky.("ERR flow LMDB projection unavailable for k"), 2, 1)
+  end
+
   test "export refuses Flow data it cannot carry and leaves no file", ctx do
     {:ok, _circuit} =
       Impl.flow_circuit_open(ctx.source, "tx-circuit",
