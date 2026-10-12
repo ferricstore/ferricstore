@@ -477,7 +477,9 @@ What to know:
   circuits, budgets, limits, effects and approvals; invocation catalogs; a
   policy migration in progress) and names sample keys.
 - The restore checks the file's checksum before writing anything and refuses a
-  cluster that already holds Flow data.
+  cluster that already holds Flow data. If a restore stops partway, start the
+  new cluster again on empty data directories and rerun it; the export file is
+  unchanged and can be restored any number of times.
 
 ## Performance Checklist
 
