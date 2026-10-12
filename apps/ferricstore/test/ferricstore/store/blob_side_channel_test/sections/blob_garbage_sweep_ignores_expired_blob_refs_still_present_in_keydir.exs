@@ -130,6 +130,8 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.BlobGarbageSweepIgnores
           Process.delete(:ferricstore_blob_store_segment_gc_grace_ms)
           Ferricstore.Raft.WARaftBackend.stop()
           IsolatedInstance.checkin(ctx)
+          # The backend is a singleton: starting it above stopped the default instance's.
+          Ferricstore.Test.ShardHelpers.restore_default_waraft!()
         end
       end
 
