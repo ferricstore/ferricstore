@@ -761,17 +761,23 @@ defmodule Ferricstore.Flow.Keys do
   defp digest(value),
     do: value |> then(&:crypto.hash(:sha256, &1)) |> Base.url_encode64(padding: false)
 
-  defp valid_digest?(digest) when is_binary(digest) and byte_size(digest) == 43 do
-    case Base.url_decode64(digest, padding: false) do
-      {:ok, decoded} when byte_size(decoded) == 32 ->
-        Base.url_encode64(decoded, padding: false) == digest
+  defp valid_digest?(digest), do: canonical_digest?(digest)
 
-      _invalid ->
-        false
-    end
-  end
+  @doc false
+  # A 32-byte digest is 43 unpadded URL-safe base64 characters. The last one
+  # carries 4 data bits, so only the 16 characters with zero low bits are
+  # canonical. Checked without decoding: this runs for every key classified.
+  def canonical_digest?(<<body::binary-size(42), last>>) when last in ~c"AEIMQUYcgkosw048",
+    do: url_safe_base64?(body)
 
-  defp valid_digest?(_digest), do: false
+  def canonical_digest?(_digest), do: false
+
+  defp url_safe_base64?(<<char, rest::binary>>)
+       when char in ?A..?Z or char in ?a..?z or char in ?0..?9 or char == ?- or char == ?_,
+       do: url_safe_base64?(rest)
+
+  defp url_safe_base64?(<<>>), do: true
+  defp url_safe_base64?(_invalid), do: false
 
   defp flow_key_tag_prefix(key, marker) do
     case split_internal_flow_key(key, marker) do

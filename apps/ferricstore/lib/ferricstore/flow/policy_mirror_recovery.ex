@@ -717,17 +717,7 @@ defmodule Ferricstore.Flow.PolicyMirrorRecovery do
     ArgumentError -> false
   end
 
-  defp valid_digest?(digest) when is_binary(digest) and byte_size(digest) == 43 do
-    case Base.url_decode64(digest, padding: false) do
-      {:ok, decoded} when byte_size(decoded) == 32 ->
-        Base.url_encode64(decoded, padding: false) == digest
-
-      _invalid ->
-        false
-    end
-  end
-
-  defp valid_digest?(_digest), do: false
+  defp valid_digest?(digest), do: Keys.canonical_digest?(digest)
 
   defp valid_expiry?(expire_at_ms) do
     is_integer(expire_at_ms) and expire_at_ms >= 0 and expire_at_ms <= @max_u64

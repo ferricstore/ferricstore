@@ -98,15 +98,7 @@ defmodule Ferricstore.Flow.InternalKey do
 
   defp valid_flow_tag?(_tag), do: false
 
-  defp valid_digest?(digest) do
-    case Base.url_decode64(digest, padding: false) do
-      {:ok, decoded} when byte_size(decoded) == 32 ->
-        Base.url_encode64(decoded, padding: false) == digest
-
-      _invalid ->
-        false
-    end
-  end
+  defp valid_digest?(digest), do: Ferricstore.Flow.Keys.canonical_digest?(digest)
 
   defp valid_suffix?(""), do: true
   defp valid_suffix?(<<":", _rest::binary>>), do: true
