@@ -7,14 +7,15 @@ defmodule Ferricstore.Flow.TransferFormatUpgradeTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Flow.{Digest, Transfer}
-  alias Ferricstore.Test.{ClusterHelper, FlowTransferFixture, IsolatedInstance}
+  alias Ferricstore.Test.{ClusterHelper, FlowTransferFixture}
 
   @moduletag :cluster
   @moduletag timeout: 300_000
 
   setup do
     node = ClusterHelper.start_node(shards: 2, app_env: [data_format: 1])
-    target = IsolatedInstance.checkout()
+    # A new cluster: fresh data dirs get the default format, 2.
+    target = ClusterHelper.start_node(shards: 2)
 
     path =
       Path.join(
@@ -24,7 +25,7 @@ defmodule Ferricstore.Flow.TransferFormatUpgradeTest do
 
     on_exit(fn ->
       ClusterHelper.stop_node(node)
-      IsolatedInstance.checkin(target)
+      ClusterHelper.stop_node(target)
       File.rm(path)
     end)
 
@@ -33,7 +34,7 @@ defmodule Ferricstore.Flow.TransferFormatUpgradeTest do
 
   test "a format 1 export restores into format 2 with every ref rewritten", ctx do
     assert :erpc.call(ctx.node, Ferricstore.DataFormat, :current, []) == 1
-    assert Digest.format() == 2
+    assert :erpc.call(ctx.target, Ferricstore.DataFormat, :current, []) == 2
 
     source = :erpc.call(ctx.node, FerricStore.Instance, :get, [:default])
     now_ms = System.system_time(:millisecond)
@@ -42,10 +43,13 @@ defmodule Ferricstore.Flow.TransferFormatUpgradeTest do
     assert {:ok, counts} = :erpc.call(ctx.node, Transfer, :export, [source, ctx.path])
     assert counts.flows == length(manifest.flows) + length(manifest.schedules)
 
-    assert {:ok, ^counts} = Transfer.restore(ctx.target, ctx.path)
+    target = :erpc.call(ctx.target, FerricStore.Instance, :get, [:default])
+    assert {:ok, ^counts} = :erpc.call(ctx.target, Transfer, :restore, [target, ctx.path])
 
     expected = to_format_2(before)
-    restored = FlowTransferFixture.snapshot(ctx.target, to_format_2(manifest))
+
+    restored =
+      :erpc.call(ctx.target, FlowTransferFixture, :snapshot, [target, to_format_2(manifest)])
 
     assert restored == expected
 
