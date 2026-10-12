@@ -421,6 +421,32 @@ resources:
 
 With `static` CPU manager policy on the kubelet, this guarantees exclusive cores.
 
+## Upgrading a Cluster
+
+Upgrade nodes one at a time (rolling upgrade). New behavior that older releases
+would apply differently stays off until you raise the cluster's feature level,
+so a mixed-version cluster keeps applying every write the same way on every
+node.
+
+After every node runs the new release, check and raise the level:
+
+```bash
+bin/ferricstore rpc 'IO.inspect(FerricStore.cluster_feature_level())'
+# {:ok, %{supported: 1, active: 0, shards: [0, 0, 0, 0]}}
+
+bin/ferricstore rpc 'IO.inspect(FerricStore.raise_cluster_feature_level(1))'
+# {:ok, %{supported: 1, active: 1, shards: [1, 1, 1, 1]}}
+```
+
+- The raise checks every member first. If a node still runs an older release it
+  returns `{:error, {:members_below_feature_level, level, [{node, supported}]}}`;
+  if a node is unreachable it returns `{:error, {:feature_level_probe_failed, ...}}`.
+  Nothing changes in either case.
+- Raising is safe to repeat, including after a partial failure.
+- Levels never go down. Do not downgrade a node below the active level.
+- Once a level is active, a node whose release does not support it cannot join.
+- FLUSHDB keeps the feature level.
+
 ## Performance Checklist
 
 Before benchmarking or going to production:

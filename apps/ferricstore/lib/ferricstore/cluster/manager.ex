@@ -463,7 +463,8 @@ defmodule Ferricstore.Cluster.Manager do
   end
 
   defp do_join_node_remote_waraft(target_node, membership, state, ctx, replace?) do
-    with {:ok, target_has_data} <- Target.target_has_data?(target_node, state.shard_count),
+    with :ok <- Ferricstore.Cluster.FeatureLevel.validate_join_target(target_node, ctx),
+         {:ok, target_has_data} <- Target.target_has_data?(target_node, state.shard_count),
          :ok <- Target.validate_target_data_identity(target_node, ctx, target_has_data, replace?),
          {:ok, preexisting_membership} <- Target.target_membership_by_shard(target_node, state),
          :ok <-

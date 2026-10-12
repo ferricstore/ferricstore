@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Add cluster feature levels. New replicated behavior stays off until
+  `FerricStore.raise_cluster_feature_level/1` raises the level after a rolling
+  upgrade; the raise requires every member to support the level, levels never
+  go down, and nodes below the active level cannot join. Level 1 is the first
+  level; see the deployment guide.
+
 ## 0.11.24 - 2026-10-06
 
 - Update Mint to 1.10.2 to address the newly published HTTP response-framing and

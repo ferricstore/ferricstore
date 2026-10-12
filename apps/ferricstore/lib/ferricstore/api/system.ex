@@ -82,6 +82,49 @@ defmodule FerricStore.API.System do
   def flushall, do: GenericAPI.flushdb()
 
   # ---------------------------------------------------------------------------
+  # Cluster feature levels
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Returns the cluster feature levels: the highest level this release supports,
+  the active level (the lowest level any shard has applied) and each shard's
+  level.
+
+  New replicated behavior that older releases would apply differently is only
+  used once its level is active. See `raise_cluster_feature_level/1`.
+
+  ## Examples
+
+      iex> FerricStore.cluster_feature_level()
+      {:ok, %{supported: 1, active: 0, shards: [0, 0, 0, 0]}}
+
+  """
+  @spec cluster_feature_level() :: {:ok, map()} | {:error, term()}
+  def cluster_feature_level,
+    do: Ferricstore.Cluster.FeatureLevel.status(FerricStore.Instance.get(:default))
+
+  @doc """
+  Raises the cluster to `level` after a rolling upgrade.
+
+  Every member must run a release that supports `level`; otherwise this
+  returns `{:error, {:members_below_feature_level, level, [{node, supported}]}}`
+  and changes nothing, and an unreachable member returns
+  `{:error, {:feature_level_probe_failed, [{node, reason}]}}`. Levels never go
+  down, so downgrading below an active level is not supported. Once a level is
+  active, nodes that do not support it cannot join. Raising again is a no-op
+  and can be retried after a partial failure.
+
+  ## Examples
+
+      iex> FerricStore.raise_cluster_feature_level(1)
+      {:ok, %{supported: 1, active: 1, shards: [1, 1, 1, 1]}}
+
+  """
+  @spec raise_cluster_feature_level(pos_integer()) :: {:ok, map()} | {:error, term()}
+  def raise_cluster_feature_level(level),
+    do: Ferricstore.Cluster.FeatureLevel.raise(FerricStore.Instance.get(:default), level)
+
+  # ---------------------------------------------------------------------------
   # Pipeline
   # ---------------------------------------------------------------------------
 
