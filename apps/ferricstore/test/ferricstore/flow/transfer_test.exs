@@ -27,6 +27,15 @@ defmodule Ferricstore.Flow.TransferTest do
 
   test "a restored store shows the same runs, history, values and policies", ctx do
     before = FlowTransferFixture.snapshot(ctx.source, ctx.manifest)
+    # The export must read runs off every tier: a hibernated wait and terminal
+    # runs live outside the keydir by now.
+    :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.source.name, ctx.source.shard_count, 60_000)
+
+    for id <- ["tx:waiting", "tx:done", "tx:failed"],
+        do: refute(in_keydir?(ctx.source, id, "tx:tenant-a"), "#{id} is still in the keydir")
+
+    assert in_keydir?(ctx.source, "tx:queued", "tx:tenant-a")
+
     # Schedules are runs too; creating one installs its type's policy.
     assert {:ok, counts} = Transfer.export(ctx.source, ctx.path)
     assert counts.flows == length(ctx.manifest.flows) + length(ctx.manifest.schedules)
@@ -159,5 +168,11 @@ defmodule Ferricstore.Flow.TransferTest do
   test "the public API validates its arguments" do
     assert {:error, _reason} = FerricStore.flow_export(:not_a_path)
     assert {:error, _reason} = FerricStore.flow_restore("/tmp/x.ffx", :not_opts)
+  end
+
+  defp in_keydir?(instance, id, partition_key) do
+    key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+    shard = Ferricstore.Store.Router.shard_for(instance, key)
+    :ets.member(elem(instance.keydir_refs, shard), key)
   end
 end
