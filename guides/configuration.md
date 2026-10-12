@@ -60,6 +60,7 @@ config :ferricstore, :health_probe_port, 4001
 | Option | Type | Default | Applies to | Description |
 |--------|------|---------|------------|-------------|
 | `:data_dir` | `string` | `"data"` | Both | Root directory for Bitcask data files, WARaft segment logs, mmap structures, and hint files. Each shard gets a subdirectory. |
+| `:data_format` | `1` or `2` | `2` | Both | On-disk format for a **new** data directory; an existing directory keeps the format it records in its `data_format` file, and a contradicting setting stops the boot. See [Data Formats](deployment.md#data-formats). |
 | `:shard_count` | `integer` | `0` (auto) | Both | Number of shards. `0` = auto-detect via `System.schedulers_online()`. Each shard is a separate ETS table, Bitcask directory, and WARaft partition. More shards = more write parallelism but more file descriptors. Set at startup. |
 | `:hot_cache_max_value_size` | `integer` | `65_536` | Both | Maximum value size (bytes) stored in ETS hot cache. Values larger than this are stored as `nil` in ETS and read from Bitcask on access. Prevents large binaries from being copied on every ETS lookup. |
 | `:blob_side_channel_threshold_bytes` | `integer` | `262_144` | Both | Values at or above this size are stored in per-shard append blob segments with a small Bitcask reference. `0` disables the blob side channel. |

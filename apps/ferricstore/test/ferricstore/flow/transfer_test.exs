@@ -27,13 +27,13 @@ defmodule Ferricstore.Flow.TransferTest do
 
   test "a restored store shows the same runs, history, values and policies", ctx do
     before = FlowTransferFixture.snapshot(ctx.source, ctx.manifest)
-    flows = length(ctx.manifest.flows)
+    # Schedules are runs too; creating one installs its type's policy.
+    assert {:ok, counts} = Transfer.export(ctx.source, ctx.path)
+    assert counts.flows == length(ctx.manifest.flows) + length(ctx.manifest.schedules)
+    assert counts.shared_values == length(ctx.manifest.shared_refs)
+    assert counts.policies == length(ctx.manifest.types) + 1
 
-    assert {:ok, %{flows: ^flows, shared_values: 1, policies: 2}} =
-             Transfer.export(ctx.source, ctx.path)
-
-    assert {:ok, %{flows: ^flows, shared_values: 1, policies: 2}} =
-             Transfer.restore(ctx.target, ctx.path)
+    assert {:ok, ^counts} = Transfer.restore(ctx.target, ctx.path)
 
     assert FlowTransferFixture.snapshot(ctx.target, ctx.manifest) == before
   end
@@ -92,6 +92,18 @@ defmodule Ferricstore.Flow.TransferTest do
     assert {:ok, %{state: "waiting"}} =
              Impl.flow_get(ctx.target, "tx:waiting", partition_key: "tx:tenant-a")
 
+    # The restored schedule still fires its target run.
+    fire_at_ms = ctx.now_ms + 3_600_001
+
+    assert {:ok, %{fired: 1}} =
+             Impl.flow_schedule_fire(ctx.target, "tx:schedule",
+               now_ms: fire_at_ms,
+               fire_at_ms: fire_at_ms
+             )
+
+    assert {:ok, %{type: "tx.order"}} =
+             Impl.flow_get(ctx.target, "tx:scheduled-target", partition_key: "tx:tenant-a")
+
     # Only the restored idempotency row can make the first signal a conflict.
     assert {:error, "ERR flow signal idempotency conflict"} =
              Ferricstore.Flow.signal(ctx.target, "tx:waiting",
@@ -123,8 +135,29 @@ defmodule Ferricstore.Flow.TransferTest do
     assert Ferricstore.Flow.ValueStore.raw_mget_any(ctx.target, [link_key]) == [ref]
   end
 
+  test "export refuses Flow data it cannot carry and leaves no file", ctx do
+    {:ok, _circuit} =
+      Impl.flow_circuit_open(ctx.source, "tx-circuit",
+        failure_threshold: 1,
+        open_ms: 60_000,
+        now_ms: ctx.now_ms
+      )
+
+    assert {:error, {:unsupported_flow_data, [key | _keys]}} =
+             Transfer.export(ctx.source, ctx.path)
+
+    assert key =~ ":gov:"
+    refute File.exists?(ctx.path)
+    refute File.exists?(ctx.path <> ".partial")
+  end
+
   test "restore refuses a store that already holds flows", ctx do
     {:ok, _} = Transfer.export(ctx.source, ctx.path)
     assert {:error, {:target_not_empty, _key}} = Transfer.restore(ctx.source, ctx.path)
+  end
+
+  test "the public API validates its arguments" do
+    assert {:error, _reason} = FerricStore.flow_export(:not_a_path)
+    assert {:error, _reason} = FerricStore.flow_restore("/tmp/x.ffx", :not_opts)
   end
 end

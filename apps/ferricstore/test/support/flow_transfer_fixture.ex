@@ -12,7 +12,8 @@ defmodule Ferricstore.Test.FlowTransferFixture do
   @type manifest :: %{
           flows: [{binary(), binary() | nil}],
           types: [binary()],
-          shared_refs: [binary()]
+          shared_refs: [binary()],
+          schedules: [binary()]
         }
 
   @spec build!(FerricStore.Instance.t(), binary(), integer()) :: manifest()
@@ -110,6 +111,14 @@ defmodule Ferricstore.Test.FlowTransferFixture do
 
     {:ok, shared} = Ferricstore.Flow.value_put(ctx, "shared document", now_ms: now_ms)
 
+    # Schedules are stored as runs of a reserved type.
+    {:ok, _schedule} =
+      Impl.flow_schedule_create(ctx, id.("schedule"),
+        kind: :delay,
+        delay_ms: 3_600_000,
+        target: [id: id.("scheduled-target"), type: type, partition_key: pk]
+      )
+
     claim_complete!(ctx, type, "to-complete", pk, id.("done"), now_ms, fn job ->
       Impl.flow_complete(ctx, job.id, job.lease_token,
         partition_key: pk,
@@ -139,7 +148,8 @@ defmodule Ferricstore.Test.FlowTransferFixture do
           {id.("unpartitioned"), nil}
         ] ++ for(n <- 1..3, do: {id.("fifo-#{n}"), pk_b}),
       types: [type, fifo_type],
-      shared_refs: [shared.ref]
+      shared_refs: [shared.ref],
+      schedules: [id.("schedule")]
     }
   end
 
@@ -160,7 +170,7 @@ defmodule Ferricstore.Test.FlowTransferFixture do
   end
 
   @doc "Everything a client can observe about the manifest's data."
-  def snapshot(ctx, %{flows: flows, types: types, shared_refs: shared_refs}) do
+  def snapshot(ctx, %{flows: flows, types: types, shared_refs: shared_refs} = manifest) do
     %{
       flows:
         Map.new(flows, fn {id, pk} ->
@@ -170,7 +180,9 @@ defmodule Ferricstore.Test.FlowTransferFixture do
           {{id, pk}, %{record: record, history: history}}
         end),
       policies: Map.new(types, &{&1, Impl.flow_policy_get(ctx, &1)}),
-      shared_values: Ferricstore.Flow.value_mget(ctx, shared_refs)
+      shared_values: Ferricstore.Flow.value_mget(ctx, shared_refs),
+      schedules:
+        Map.new(Map.get(manifest, :schedules, []), &{&1, Impl.flow_schedule_get(ctx, &1)})
     }
   end
 end

@@ -421,6 +421,64 @@ resources:
 
 With `static` CPU manager policy on the kubelet, this guarantees exclusive cores.
 
+## Data Formats
+
+Each data directory records its on-disk format in a `data_format` file.
+
+- **Format 2**, the default for new data directories, keys Flow runs with
+  128-bit digests (22 characters). Measured on completed runs, that is about
+  1.7 KB less disk and 360 B less keydir memory per run than format 1.
+- **Format 1** is what data directories created before format 2 use (full
+  256-bit digests, 43 characters). They keep it: upgrading the release changes
+  nothing on disk.
+
+A node runs in its data directory's format, and a node in a different format
+cannot join the cluster. The `:data_format` setting only chooses the format of
+a new data directory.
+
+### Moving Flow Data to Format 2
+
+A format 1 cluster moves to format 2 by copying its Flow data into a new
+cluster:
+
+1. Upgrade the old cluster to this release. It keeps running in format 1.
+2. Stop the applications that write Flow data.
+3. Export from any node of the old cluster:
+
+   ```bash
+   bin/ferricstore rpc 'IO.inspect(FerricStore.flow_export("/backup/flows.ffx"))'
+   ```
+
+4. Start a new cluster on empty data directories; they are created in format 2.
+5. Restore on any node of the new cluster:
+
+   ```bash
+   bin/ferricstore rpc 'IO.inspect(FerricStore.flow_restore("/backup/flows.ffx"))'
+   ```
+
+6. Point the applications at the new cluster.
+
+Both calls return `{:ok, %{flows: n, shared_values: n, policies: n}}`.
+
+What moves: every run, schedules included, with its id, type, state, version,
+attempts, lease, timestamps, values, history and signal idempotency keys; the
+standalone shared values; the type policies. A worker holding a lease from the
+old cluster can finish its run on the new one.
+
+What to know:
+
+- Plain keys (strings, hashes, lists, sets, sorted sets, streams and the
+  probabilistic structures) are not part of the export.
+- Value refs encode the key layout, so they change. Refs stored inside runs are
+  rewritten; refs an application kept from `flow_get` or `flow_value_put`
+  point at the old cluster.
+- Policy generations start over.
+- The export refuses Flow data it cannot carry yet (governance state such as
+  circuits, budgets, limits, effects and approvals; invocation catalogs; a
+  policy migration in progress) and names sample keys.
+- The restore checks the file's checksum before writing anything and refuses a
+  cluster that already holds Flow data.
+
 ## Performance Checklist
 
 Before benchmarking or going to production:
