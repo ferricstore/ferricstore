@@ -368,6 +368,54 @@ defmodule Ferricstore.FlowProductionRecoveryTest do
              )
   end
 
+  test "a process restart keeps a completed shared-ref backfill instead of migrating again",
+       %{isolated: isolated} do
+    type = unique("backfill-restart-type")
+    partition = unique("backfill-restart-partition")
+    id = unique("backfill-restart")
+    now_ms = System.system_time(:millisecond)
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: type,
+               state: "queued",
+               partition_key: partition,
+               run_at_ms: now_ms,
+               now_ms: now_ms
+             )
+
+    ctx = FerricStore.Instance.get(:default)
+    shard_index = Router.shard_for(ctx, Keys.state_key(id, partition))
+
+    lmdb_path =
+      isolated.tmp_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> LMDB.path()
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count, 45_000)
+
+    completion_key = Ferricstore.Flow.SharedRefBackfill.completion_key(shard_index)
+    assert {:ok, certificate} = LMDB.get(lmdb_path, completion_key)
+
+    test_pid = self()
+
+    Application.put_env(:ferricstore, :flow_shared_ref_backfill_phase_hook, fn event ->
+      send(test_pid, {:shared_ref_backfill_phase, event})
+    end)
+
+    try do
+      :ok = restart_as_new_process(isolated, ctx.shard_count)
+    after
+      Application.delete_env(:ferricstore, :flow_shared_ref_backfill_phase_hook)
+    end
+
+    refute_received {:shared_ref_backfill_phase, {:read_batch, :scan_lmdb_states, _}},
+                    "restart must not rerun the shared-ref migration on a completed shard"
+
+    assert {:ok, ^certificate} = LMDB.get(lmdb_path, completion_key)
+    assert {:ok, %{id: ^id}} = FerricStore.flow_get(id, partition_key: partition)
+  end
+
   # A real process restart does not inherit VM-local LMDB writer generations,
   # so startup must not run the in-VM "writer restarted" dirty reconcile.
   defp restart_as_new_process(
