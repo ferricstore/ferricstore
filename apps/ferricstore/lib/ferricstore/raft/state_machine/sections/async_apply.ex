@@ -1176,6 +1176,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         end)
       end
 
+      defp apply_single(state, {:flow_restore, _key, attrs}) do
+        apply_flow_single_with_telemetry(state, :flow_restore, attrs, fn ->
+          do_flow_restore(state, attrs)
+        end)
+      end
+
       defp apply_single(state, {:flow_signal, _key, attrs}) do
         apply_flow_single_with_telemetry(state, :flow_signal, attrs, fn ->
           do_flow_signal(state, attrs)

@@ -200,6 +200,7 @@ defmodule Ferricstore.Test.ClusterHelper do
 
     - `opts` -- keyword options:
       - `:shards` -- number of shards (default: 4)
+      - `:app_env` -- `:ferricstore` settings to put before the app starts
 
   ## Returns
 
@@ -243,6 +244,10 @@ defmodule Ferricstore.Test.ClusterHelper do
     :persistent_term.put({__MODULE__, :solo_peer, node_name}, {peer_pid, data_dir})
 
     configure_remote_node(node_name, data_dir, shards)
+
+    for {key, value} <- Keyword.get(opts, :app_env, []) do
+      :ok = :rpc.call(node_name, Application, :put_env, [:ferricstore, key, value])
+    end
 
     cluster_nodes = Keyword.get(opts, :cluster_nodes, [])
 

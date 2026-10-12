@@ -278,6 +278,7 @@ defmodule Ferricstore.Raft.StateMachine do
   use Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites
   use Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads
   use Ferricstore.Raft.StateMachine.Sections.FlowValues
+  use Ferricstore.Raft.StateMachine.Sections.FlowRestore
   use Ferricstore.Raft.StateMachine.Sections.PendingWrites
   use Ferricstore.Raft.StateMachine.Sections.PendingLocations
   use Ferricstore.Raft.StateMachine.Sections.LmdbProjection

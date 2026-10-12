@@ -69,6 +69,55 @@ defmodule Ferricstore.Flow.HistoryRead do
   end
 
   @doc false
+  # A run's whole stored history as {event_id, stored value}, oldest first,
+  # from the hot and cold sources read/8 merges (Flow export).
+  def raw_entries(ctx, id, partition_key, history_key) do
+    count = max_history_max_events()
+
+    query = %{
+      count: count,
+      from_event: nil,
+      to_event: nil,
+      from_ms: nil,
+      to_ms: nil,
+      from_version: nil,
+      to_version: nil,
+      rev?: false,
+      event: nil,
+      worker: nil
+    }
+
+    with :ok <- maybe_flush_history_projector(ctx, history_key, true),
+         {:ok, hot} <- hot_refs(ctx, id, partition_key, history_key, count),
+         {:ok, cold} <- lmdb_refs(ctx, history_key, count, true, query) do
+      event_ids = candidate_event_ids(hot ++ cold, query)
+
+      compound_keys =
+        Enum.map(event_ids, &Ferricstore.Flow.Keys.stream_entry_key(id, &1, partition_key))
+
+      values = Router.compound_batch_get(ctx, history_key, compound_keys)
+
+      with {:ok, hot_values} <- hot_values_by_event(event_ids, values),
+           {:ok, cold_values} <- cold_values_by_event(ctx, history_key, event_ids, hot_values) do
+        raw_entries_in_order(event_ids, hot_values, cold_values)
+      end
+    end
+  end
+
+  defp raw_entries_in_order(event_ids, hot_values, cold_values) do
+    Enum.reduce_while(event_ids, {:ok, []}, fn event_id, {:ok, acc} ->
+      case Map.get(hot_values, event_id) || Map.get(cold_values, event_id) do
+        value when is_binary(value) -> {:cont, {:ok, [{event_id, value} | acc]}}
+        _missing -> {:halt, {:error, {:history_entry_missing, event_id}}}
+      end
+    end)
+    |> case do
+      {:ok, entries} -> {:ok, Enum.reverse(entries)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @doc false
   def read_page(
         ctx,
         id,

@@ -5,6 +5,7 @@ Code.require_file(
 
 Code.require_file("state_machine_test/sections/flow_blob_side_channel_apply.exs", __DIR__)
 Code.require_file("state_machine_test/sections/flow_command_time.exs", __DIR__)
+Code.require_file("state_machine_test/sections/flow_restore.exs", __DIR__)
 
 Code.require_file(
   "state_machine_test/sections/flow_shared_value_ref_persistence.exs",
@@ -2010,6 +2011,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
   use Ferricstore.Raft.StateMachineTest.Sections.FlowBlobSideChannelApply
 
   use Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime
+
+  use Ferricstore.Raft.StateMachineTest.Sections.FlowRestore
 
   use Ferricstore.Raft.StateMachineTest.Sections.FlowSharedValueRefPersistence
 

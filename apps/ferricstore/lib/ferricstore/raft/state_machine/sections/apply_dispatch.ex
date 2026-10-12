@@ -2724,6 +2724,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         )
       end
 
+      def apply(meta, {:flow_restore, _key, attrs}, state) when is_map(attrs) do
+        apply_flow_pending_with_time(meta, state, :flow_restore, attrs, fn ->
+          do_flow_restore(state, attrs)
+        end)
+      end
+
       def apply(meta, {:flow_signal, _key, attrs}, state) when is_map(attrs) do
         apply_flow_pending_with_time(meta, state, :flow_signal, attrs, fn ->
           do_flow_signal(state, attrs)

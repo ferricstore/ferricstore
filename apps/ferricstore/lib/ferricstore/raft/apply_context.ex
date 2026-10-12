@@ -70,6 +70,7 @@ defmodule Ferricstore.Raft.ApplyContext do
     :flow_policy_patch_allocate,
     :flow_policy_put,
     :flow_reschedule,
+    :flow_restore,
     :flow_retention_cleanup,
     :flow_retry,
     :flow_retry_many,
