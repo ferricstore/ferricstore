@@ -92,6 +92,10 @@ defmodule Ferricstore.FlowPolicyGenerationTest do
 
     value = RetryPolicy.encode_flow_policy(foreign_policy, 1)
 
+    # Startup recovery refuses a corrupt policy row, so a later restart of the
+    # default instance would fail while this row exists.
+    on_exit(fn -> :ok = Ferricstore.Raft.Backend.write(0, {:delete, key}) end)
+
     assert :ok =
              Ferricstore.Raft.Backend.write(
                0,
