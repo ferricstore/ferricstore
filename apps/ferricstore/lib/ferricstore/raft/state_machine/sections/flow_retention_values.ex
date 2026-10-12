@@ -186,7 +186,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
 
             entries =
               member_keys
-              |> Enum.zip(sm_store_batch_get(state, member_keys, &sm_file_path/2))
+              |> Enum.zip(keydir_spill_batch_get(state, member_keys))
               |> Enum.map(fn
                 {member_key, value} when is_binary(value) ->
                   case Ferricstore.Flow.RetentionCleanupMember.decode(value) do

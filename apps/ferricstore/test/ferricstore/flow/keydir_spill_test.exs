@@ -3,7 +3,15 @@ defmodule Ferricstore.Flow.KeydirSpillTest do
   @moduletag :flow
   @moduletag :global_state
 
-  alias Ferricstore.Flow.{Keys, KeydirSpill, LMDB, LMDBWriter, PolicyMigration}
+  alias Ferricstore.Flow.{
+    Keys,
+    KeydirSpill,
+    LMDB,
+    LMDBWriter,
+    PolicyMigration,
+    RetentionCleanupMember
+  }
+
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
@@ -262,6 +270,65 @@ defmodule Ferricstore.Flow.KeydirSpillTest do
            "an emptied shard has no spilled rows left to look up"
   end
 
+  test "a pruned terminal flow moves its retention cleanup members from the keydir to LMDB",
+       %{isolated: isolated} do
+    Application.put_env(:ferricstore, :flow_keydir_spill, true)
+    flow = finish_flow(isolated, ttl_ms: nil, payload: "spill-payload")
+
+    assert is_binary(flow.payload_ref)
+    assert_state_pruned(flow)
+    assert_spilled(flow, flow.member_key)
+
+    assert {:ok, spilled} = LMDB.get(flow.lmdb_path, KeydirSpill.key(flow.member_key))
+    assert {:ok, member} = LMDB.decode_value(spilled, 0)
+    assert {:ok, {_index_key, owned_key}} = RetentionCleanupMember.decode(member)
+    assert owned_key == flow.payload_ref
+  end
+
+  test "retention deletes the owned values of a spilled terminal flow", %{isolated: isolated} do
+    Application.put_env(:ferricstore, :flow_keydir_spill, true)
+    flow = finish_flow(isolated, ttl_ms: 1, payload: "spill-payload")
+
+    assert_state_pruned(flow)
+    assert_spilled(flow, flow.member_key)
+    expire_flow(flow)
+    assert {:ok, ["spill-payload"]} = payload(flow)
+
+    drain_retention(System.system_time(:millisecond) + 10_000)
+    assert :ok = LMDBWriter.flush_all(flow.ctx.name, flow.ctx.shard_count, 45_000)
+
+    assert {:ok, [nil]} = payload(flow),
+           "retention must delete the payload the spilled cleanup member points to"
+
+    assert :not_found = LMDB.get(flow.lmdb_path, KeydirSpill.key(flow.member_key))
+    assert [] = :ets.lookup(flow.keydir, flow.member_key)
+  end
+
+  test "after a restart, retention deletes the owned values of a spilled terminal flow",
+       %{isolated: isolated} do
+    Application.put_env(:ferricstore, :flow_keydir_spill, true)
+    # Restart inside the retention window: an expired value is not reloaded.
+    flow = finish_flow(isolated, ttl_ms: 60_000, payload: "spill-payload")
+
+    assert_state_pruned(flow)
+    assert_spilled(flow, flow.member_key)
+
+    flow = restart_as_new_process(isolated, flow)
+
+    assert [] = :ets.lookup(flow.keydir, flow.member_key),
+           "the spilled cleanup member should stay out of the keydir after a restart"
+
+    assert {:ok, ["spill-payload"]} = payload(flow)
+
+    drain_retention(System.system_time(:millisecond) + 120_000)
+    assert :ok = LMDBWriter.flush_all(flow.ctx.name, flow.ctx.shard_count, 45_000)
+
+    assert {:ok, [nil]} = payload(flow),
+           "retention after a restart must still delete the payload of a spilled member"
+
+    assert :not_found = LMDB.get(flow.lmdb_path, KeydirSpill.key(flow.member_key))
+  end
+
   test "policy migration still migrates a spilled terminal flow", %{isolated: isolated} do
     Application.put_env(:ferricstore, :flow_keydir_spill, true)
     flow = finish_flow(isolated, ttl_ms: nil, state_meta: %{"version" => 1})
@@ -321,8 +388,13 @@ defmodule Ferricstore.Flow.KeydirSpillTest do
                  partition_key: partition,
                  run_at_ms: now_ms,
                  now_ms: now_ms
-               ] ++ if(opts[:state_meta], do: [state_meta: opts[:state_meta]], else: [])
+               ] ++
+                 if(opts[:state_meta], do: [state_meta: opts[:state_meta]], else: []) ++
+                 if(opts[:payload], do: [payload: opts[:payload]], else: [])
              )
+
+    assert {:ok, %{payload_ref: payload_ref}} =
+             FerricStore.flow_get(id, partition_key: partition)
 
     assert {:ok, [%{id: ^id} = claimed]} =
              FerricStore.flow_claim_due(type,
@@ -363,6 +435,8 @@ defmodule Ferricstore.Flow.KeydirSpillTest do
       partition: partition,
       state_key: state_key,
       catalog_key: Keys.type_catalog_member_key(type, state_key),
+      payload_ref: payload_ref,
+      member_key: payload_ref && Keys.retention_cleanup_member_key(id, payload_ref, partition),
       shard_index: shard_index,
       keydir: elem(ctx.keydir_refs, shard_index),
       lmdb_path: lmdb_path
@@ -377,17 +451,58 @@ defmodule Ferricstore.Flow.KeydirSpillTest do
              )
   end
 
-  defp assert_catalog_spilled(flow) do
+  defp assert_catalog_spilled(flow), do: assert_spilled(flow, flow.catalog_key)
+
+  defp assert_spilled(flow, key) do
     assert :ok =
              ShardHelpers.eventually(
                fn ->
                  _ = LMDBWriter.flush_all(flow.ctx.name, flow.ctx.shard_count, 45_000)
-                 :ets.lookup(flow.keydir, flow.catalog_key) == []
+                 :ets.lookup(flow.keydir, key) == []
                end,
-               "the type catalog row should leave the keydir"
+               "#{inspect(key)} should leave the keydir"
              )
 
-    assert {:ok, _spilled} = LMDB.get(flow.lmdb_path, KeydirSpill.key(flow.catalog_key))
+    assert {:ok, _spilled} = LMDB.get(flow.lmdb_path, KeydirSpill.key(key))
+  end
+
+  defp payload(flow),
+    do: FerricStore.flow_value_mget([flow.payload_ref], partition_key: flow.partition)
+
+  defp expire_flow(flow) do
+    assert :ok =
+             ShardHelpers.eventually(
+               fn ->
+                 FerricStore.flow_get(flow.id, partition_key: flow.partition) == {:ok, nil}
+               end,
+               "the cancelled Flow should expire"
+             )
+  end
+
+  # A real process restart: no VM-local LMDB writer generations survive it.
+  defp restart_as_new_process(%{tmp_dir: data_dir, server_started?: server_started?}, flow) do
+    for app <- [:ferricstore_server, :ferricstore],
+        Enum.any?(Application.started_applications(), &(elem(&1, 0) == app)) do
+      _ = Application.stop(app)
+    end
+
+    Ferricstore.Raft.WARaftBackend.stop()
+
+    for shard_index <- 0..(flow.ctx.shard_count - 1) do
+      :persistent_term.erase(LMDBWriter.Registry.enqueue_seq_key(:default, shard_index))
+    end
+
+    Application.put_env(:ferricstore, :data_dir, data_dir)
+    {:ok, _} = Application.ensure_all_started(:ferricstore)
+    ShardHelpers.wait_shards_alive(30_000)
+
+    if server_started? do
+      {:ok, _} = Application.ensure_all_started(:ferricstore_server)
+    end
+
+    Ferricstore.Health.set_ready(true)
+    ctx = FerricStore.Instance.get(:default)
+    %{flow | ctx: ctx, keydir: elem(ctx.keydir_refs, flow.shard_index)}
   end
 
   defp catalog_value(flow) do

@@ -6,6 +6,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   alias Ferricstore.Flow
   alias Ferricstore.Flow.HistoryProjector
   alias Ferricstore.Flow.HistoryProjector.ValueProjection
+  alias Ferricstore.Flow.KeydirSpill
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.NativeOrderedIndex
@@ -1874,6 +1875,67 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
     with_fixed_keydir!(ctx.keydir, fn ->
       rebuild_cleanup_pages!(ctx, :ets.select(ctx.keydir, keydir_match_spec(), ctx.batch_size))
     end)
+
+    rebuild_spilled_cleanup_members!(ctx)
+  end
+
+  # Cleanup members spilled to LMDB (Ferricstore.Flow.KeydirSpill) are not in the
+  # keydir, but they must be in the cleanup index: retention lists a Flow's owned
+  # values from that index before it deletes the Flow.
+  defp rebuild_spilled_cleanup_members!(ctx) do
+    prefix = KeydirSpill.prefix(:retention_cleanup_member)
+
+    register_page = fn entries, :ok ->
+      with_rebuild_owner_cache(fn -> rebuild_spilled_cleanup_page!(ctx, prefix, entries) end)
+      {:ok, :ok}
+    end
+
+    case LMDB.reduce_prefix_entries(ctx.lmdb_path, prefix, ctx.batch_size, :ok, register_page) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, reason} ->
+        raise "shared-ref backfill could not read spilled cleanup members: #{inspect(reason)}"
+    end
+  end
+
+  defp rebuild_spilled_cleanup_page!(ctx, prefix, entries) do
+    now_ms = System.system_time(:millisecond)
+
+    inserts =
+      Enum.reduce(entries, [], fn {spill_key, encoded}, acc ->
+        key = binary_part(spill_key, byte_size(prefix), byte_size(spill_key) - byte_size(prefix))
+
+        # A keydir row (hot, or a tombstone of a pending delete) takes precedence.
+        if :ets.member(ctx.keydir, key) do
+          acc
+        else
+          case LMDB.decode_value(encoded, now_ms) do
+            {:ok, value} ->
+              case validate_cleanup_member!(ctx, key, value) do
+                {:ok, index_key, _owned_key} ->
+                  [{index_key, key, 0} | acc]
+
+                {:stale, index_key, _owned_key} ->
+                  lmdb_write_batch!(ctx, [{:delete, spill_key}])
+                  NativeOrderedIndex.delete_member(ctx.native, index_key, key)
+                  acc
+              end
+
+            :expired ->
+              lmdb_write_batch!(ctx, [{:delete, spill_key}])
+              acc
+
+            :error ->
+              raise "shared-ref backfill found a corrupt spilled cleanup member #{inspect(key)}"
+          end
+        end
+      end)
+
+    inserts
+    |> Enum.reverse()
+    |> Enum.chunk_every(128)
+    |> Enum.each(fn chunk -> :ok = NativeOrderedIndex.put_entries(ctx.native, chunk) end)
   end
 
   defp rebuild_cleanup_pages!(_ctx, :"$end_of_table"), do: :ok
@@ -1884,11 +1946,15 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   end
 
   defp rebuild_cleanup_page!(ctx, entries) do
+    with_rebuild_owner_cache(fn -> do_rebuild_cleanup_page!(ctx, entries) end)
+  end
+
+  defp with_rebuild_owner_cache(fun) do
     previous_cache = Process.get(@rebuild_owner_cache_key, :missing)
     Process.put(@rebuild_owner_cache_key, %{owners: %{}, bytes: 0})
 
     try do
-      do_rebuild_cleanup_page!(ctx, entries)
+      fun.()
     after
       case previous_cache do
         :missing -> Process.delete(@rebuild_owner_cache_key)

@@ -65,9 +65,15 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
            publication_ctx,
            cleanup
          ) do
-      :ok -> KeydirSpill.request(publication_ctx, shard_index, ets, type, state_key)
-      :stale -> :ok
-      {:error, _reason} = error -> error
+      :ok ->
+        spill_record = %{type: type, id: id, partition_key: partition_key}
+        KeydirSpill.request(publication_ctx, shard_index, ets, spill_record, state_key)
+
+      :stale ->
+        :ok
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -123,7 +129,7 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
                  cleanup,
                  source_row
                ) do
-            :ok -> KeydirSpill.request(publication_ctx, shard_index, ets, type, state_key)
+            :ok -> KeydirSpill.request(publication_ctx, shard_index, ets, record, state_key)
             :stale -> :ok
             {:error, _reason} = error -> error
           end

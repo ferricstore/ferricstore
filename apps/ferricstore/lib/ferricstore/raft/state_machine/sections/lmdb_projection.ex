@@ -1106,6 +1106,77 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
           Ferricstore.Flow.KeydirSpill.present?(Map.get(state, :instance_name), state.shard_index)
       end
 
+      # Reads a spillable key (see Ferricstore.Flow.KeydirSpill). On a shard with
+      # spilled rows, staged values, hot rows and delete tombstones still win;
+      # only a true keydir miss reads the LMDB copy.
+      defp keydir_spill_get(state, key) do
+        case keydir_spill_resolve(state, key) do
+          :keydir -> do_get(state, key)
+          {:value, value} -> value
+        end
+      end
+
+      defp keydir_spill_batch_get(state, keys) do
+        if Ferricstore.Flow.KeydirSpill.present?(
+             Map.get(state, :instance_name),
+             state.shard_index
+           ) do
+          resolved = Enum.map(keys, &keydir_spill_resolve(state, &1))
+          keydir_keys = for {key, :keydir} <- Enum.zip(keys, resolved), do: key
+          keydir_values = sm_store_batch_get(state, keydir_keys, &sm_file_path/2)
+          keydir_spill_merge(resolved, keydir_values, [])
+        else
+          sm_store_batch_get(state, keys, &sm_file_path/2)
+        end
+      end
+
+      defp keydir_spill_merge([], _keydir_values, acc), do: Enum.reverse(acc)
+
+      defp keydir_spill_merge([:keydir | rest], [value | keydir_values], acc),
+        do: keydir_spill_merge(rest, keydir_values, [value | acc])
+
+      defp keydir_spill_merge([{:value, value} | rest], keydir_values, acc),
+        do: keydir_spill_merge(rest, keydir_values, [value | acc])
+
+      defp keydir_spill_resolve(state, key) do
+        if keydir_spill_tracked?(state, key) and
+             not Map.has_key?(Process.get(:sm_pending_values) || %{}, key) do
+          case :ets.lookup(state.ets, key) do
+            [] -> {:value, keydir_spilled_value(state, key)}
+            [{^key, nil, 0, :flow_state_deleted, :deleted, _offset, _size}] -> {:value, nil}
+            _row -> :keydir
+          end
+        else
+          :keydir
+        end
+      end
+
+      defp keydir_spilled_value(state, key) do
+        spill_key = Ferricstore.Flow.KeydirSpill.key(key)
+
+        case Ferricstore.Flow.LMDB.get(flow_lmdb_record_path(state), spill_key) do
+          {:ok, encoded} ->
+            case Ferricstore.Flow.LMDB.decode_value(encoded, apply_now_ms()) do
+              {:ok, value} ->
+                value
+
+              :expired ->
+                nil
+
+              :error ->
+                record_state_read_failure({:flow_keydir_spill_corrupt, key})
+                nil
+            end
+
+          :not_found ->
+            nil
+
+          {:error, reason} ->
+            record_state_read_failure({:flow_keydir_spill_read_failed, reason})
+            nil
+        end
+      end
+
       # The deleted row may still have a spilled LMDB copy. The tombstone hides
       # it from apply reads until the LMDB writer has deleted that copy.
       defp queue_keydir_spill_delete(state, key) do
