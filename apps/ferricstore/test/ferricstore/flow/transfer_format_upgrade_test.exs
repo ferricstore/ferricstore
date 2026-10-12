@@ -40,7 +40,7 @@ defmodule Ferricstore.Flow.TransferFormatUpgradeTest do
     manifest = :erpc.call(ctx.node, FlowTransferFixture, :build!, [source, "xf", now_ms])
     before = :erpc.call(ctx.node, FlowTransferFixture, :snapshot, [source, manifest])
     assert {:ok, counts} = :erpc.call(ctx.node, Transfer, :export, [source, ctx.path])
-    assert counts.flows == length(manifest.flows)
+    assert counts.flows == length(manifest.flows) + length(manifest.schedules)
 
     assert {:ok, ^counts} = Transfer.restore(ctx.target, ctx.path)
 

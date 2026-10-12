@@ -38,6 +38,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRestore do
         end
       end
 
+      # Further values and history of a run restored by an earlier command. The
+      # run's record travels with each chunk: it may hibernate in between.
+      defp do_flow_restore(state, %{restore: :values, record: record, values: values})
+           when is_map(record) and is_list(values),
+           do: flow_restore_values(state, record, values)
+
+      defp do_flow_restore(state, %{restore: :history, record: record, history: entries})
+           when is_map(record) and is_list(entries),
+           do: flow_restore_history(state, record, entries)
+
       defp do_flow_restore(state, %{restore: :shared_value, key: key, value: value} = attrs)
            when is_binary(key) and is_binary(value) do
         with :ok <- flow_validate_key_size(key) do

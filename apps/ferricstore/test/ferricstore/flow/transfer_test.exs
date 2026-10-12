@@ -144,6 +144,74 @@ defmodule Ferricstore.Flow.TransferTest do
     assert Ferricstore.Flow.ValueStore.raw_mget_any(ctx.target, [link_key]) == [ref]
   end
 
+  test "long histories and many values restore in bounded chunks", ctx do
+    pk = "tx:tenant-long"
+
+    :ok =
+      Impl.flow_create(ctx.source, "tx:long",
+        type: "tx.order",
+        state: "waiting",
+        partition_key: pk,
+        payload: "v0",
+        run_at_ms: ctx.now_ms + 3_600_000,
+        now_ms: ctx.now_ms
+      )
+
+    for n <- 1..60 do
+      :ok =
+        Ferricstore.Flow.signal(ctx.source, "tx:long",
+          partition_key: pk,
+          signal: "tick-#{n}",
+          values: %{"step-#{n}" => "value #{n}"}
+        )
+    end
+
+    before = FlowTransferFixture.snapshot(ctx.source, %{ctx.manifest | flows: [{"tx:long", pk}]})
+    assert length(before.flows[{"tx:long", pk}].history) > 60
+
+    history_events = length(before.flows[{"tx:long", pk}].history)
+    {:ok, _} = Transfer.export(ctx.source, ctx.path)
+
+    test_pid = self()
+    handler = {:transfer_chunks, self(), make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:ferricstore, :flow, :apply],
+        fn
+          _event, _measurements, %{command_shape: :flow_restore}, pid ->
+            send(pid, :restore_command)
+
+          _event, _measurements, _metadata, _pid ->
+            :ok
+        end,
+        test_pid
+      )
+
+    try do
+      {:ok, counts} = Transfer.restore(ctx.target, ctx.path, chunk_events: 7, chunk_bytes: 2_048)
+
+      # One command per run and shared value, plus at least one more for every
+      # further 7 history events of the long run.
+      assert restore_commands() >=
+               counts.flows + counts.shared_values + div(history_events, 7) - 1
+    after
+      :telemetry.detach(handler)
+    end
+
+    assert FlowTransferFixture.snapshot(ctx.target, %{ctx.manifest | flows: [{"tx:long", pk}]}) ==
+             before
+  end
+
+  defp restore_commands(count \\ 0) do
+    receive do
+      :restore_command -> restore_commands(count + 1)
+    after
+      200 -> count
+    end
+  end
+
   test "export refuses Flow data it cannot carry and leaves no file", ctx do
     {:ok, _circuit} =
       Impl.flow_circuit_open(ctx.source, "tx-circuit",

@@ -37,6 +37,11 @@ defmodule Ferricstore.Flow.Transfer do
   @max_frame_bytes 1_073_741_824
   @unsupported_samples 5
   @flush_timeout_ms 120_000
+  # A run's values and history are restored in commands of at most this many
+  # entries and bytes (one entry always fits), so a long run stays a series of
+  # ordinary-sized Raft entries.
+  @chunk_events 1_000
+  @chunk_bytes 4 * 1_024 * 1_024
 
   # Run-scoped rows a restore rebuilds from the run's record.
   @derived_run_families ~w(s h rtg rtm tc svr i)
@@ -75,13 +80,18 @@ defmodule Ferricstore.Flow.Transfer do
 
   @spec restore(FerricStore.Instance.t(), Path.t(), keyword()) ::
           {:ok, counts()} | {:error, term()}
-  def restore(ctx, path, _opts \\ []) do
+  def restore(ctx, path, opts \\ []) do
     with {:ok, header} <- verify(path),
          from = header.data_format,
          to = DataFormat.current(),
          :ok <- restorable?(from, to),
          :ok <- require_empty(ctx) do
-      case File.open(path, [:read, :binary], &restore_frames(ctx, &1, from, to)) do
+      limits = %{
+        events: Keyword.get(opts, :chunk_events, @chunk_events),
+        bytes: Keyword.get(opts, :chunk_bytes, @chunk_bytes)
+      }
+
+      case File.open(path, [:read, :binary], &restore_frames(ctx, &1, {from, to, limits})) do
         {:ok, result} -> result
         {:error, reason} -> {:error, {:export_file, reason}}
       end
@@ -519,21 +529,21 @@ defmodule Ferricstore.Flow.Transfer do
     end
   end
 
-  defp restore_frames(ctx, io, from, to) do
+  defp restore_frames(ctx, io, conv) do
     with :ok <- read_magic(io),
          {:ok, {:header, _header}, _frame} <- read_frame(io) do
-      restore_frames(ctx, io, from, to, %{flows: 0, shared_values: 0, policies: 0})
+      restore_frames(ctx, io, conv, %{flows: 0, shared_values: 0, policies: 0})
     end
   end
 
-  defp restore_frames(ctx, io, from, to, counts) do
+  defp restore_frames(ctx, io, {from, to, _limits} = conv, counts) do
     case read_frame(io) do
       {:ok, {:trailer, _trailer}, _frame} ->
         {:ok, counts}
 
       {:ok, {:policy, type, policy}, _frame} ->
         with :ok <- restore_policy(ctx, type, policy),
-             do: restore_frames(ctx, io, from, to, Map.update!(counts, :policies, &(&1 + 1)))
+             do: restore_frames(ctx, io, conv, Map.update!(counts, :policies, &(&1 + 1)))
 
       {:ok, {:shared_value, key, value, expire_at_ms}, _frame} ->
         with {:ok, key} <- Retag.key(key, from, to),
@@ -544,11 +554,11 @@ defmodule Ferricstore.Flow.Transfer do
                  value: value,
                  expire_at_ms: expire_at_ms
                }),
-             do: restore_frames(ctx, io, from, to, Map.update!(counts, :shared_values, &(&1 + 1)))
+             do: restore_frames(ctx, io, conv, Map.update!(counts, :shared_values, &(&1 + 1)))
 
       {:ok, {:flow, bundle}, _frame} ->
-        with :ok <- restore_run(ctx, bundle, from, to),
-             do: restore_frames(ctx, io, from, to, Map.update!(counts, :flows, &(&1 + 1)))
+        with :ok <- restore_run(ctx, bundle, conv),
+             do: restore_frames(ctx, io, conv, Map.update!(counts, :flows, &(&1 + 1)))
 
       {:ok, other, _frame} ->
         {:error, {:unexpected_export_frame, other}}
@@ -567,27 +577,62 @@ defmodule Ferricstore.Flow.Transfer do
     end
   end
 
-  defp restore_run(ctx, %{state_key: source_key, record: record} = bundle, from, to) do
+  defp restore_run(ctx, %{state_key: source_key, record: record} = bundle, {from, to, limits}) do
     with {:ok, record} <- Retag.record(record, from, to),
          {:ok, state_key} <- Retag.key(source_key, from, to),
          :ok <- same_state_key(state_key, record),
          {:ok, values} <- retag_rows(bundle.values, from, to),
          {:ok, history} <- restore_history(bundle.history, from, to),
          {:ok, aux} <- retag_aux(bundle.aux, from, to) do
-      case Router.flow_restore(ctx, state_key, %{
-             restore: :flow,
-             type: Map.fetch!(record, :type),
-             partition_key: Map.get(record, :partition_key),
-             record: record,
-             values: values,
-             history: history,
-             aux: aux
-           }) do
-        :ok -> :ok
-        {:error, reason} -> {:error, {:run_restore_failed, source_key, reason}}
-        other -> {:error, {:run_restore_failed, source_key, other}}
-      end
+      base = %{
+        type: Map.fetch!(record, :type),
+        partition_key: Map.get(record, :partition_key),
+        record: record
+      }
+
+      [first_values | more_values] =
+        chunks(values, limits, fn {_key, value} -> byte_size(value) end)
+
+      [first_history | more_history] =
+        chunks(history, limits, fn {_id, _ms, _version, value} -> byte_size(value) end)
+
+      commands =
+        [
+          Map.merge(base, %{
+            restore: :flow,
+            values: first_values,
+            history: first_history,
+            aux: aux
+          })
+        ] ++
+          Enum.map(more_values, &Map.merge(base, %{restore: :values, values: &1})) ++
+          Enum.map(more_history, &Map.merge(base, %{restore: :history, history: &1}))
+
+      Enum.reduce_while(commands, :ok, fn attrs, :ok ->
+        case Router.flow_restore(ctx, state_key, attrs) do
+          :ok -> {:cont, :ok}
+          {:error, reason} -> {:halt, {:error, {:run_restore_failed, source_key, reason}}}
+          other -> {:halt, {:error, {:run_restore_failed, source_key, other}}}
+        end
+      end)
     end
+  end
+
+  # Consecutive runs of at most limits.events items and limits.bytes bytes
+  # (an item larger than the byte limit travels alone); never empty.
+  defp chunks(items, limits, size_of) do
+    {chunks, current, _count, _bytes} =
+      Enum.reduce(items, {[], [], 0, 0}, fn item, {chunks, current, count, bytes} ->
+        size = size_of.(item)
+
+        if current != [] and (count >= limits.events or bytes + size > limits.bytes) do
+          {[Enum.reverse(current) | chunks], [item], 1, size}
+        else
+          {chunks, [item | current], count + 1, bytes + size}
+        end
+      end)
+
+    Enum.reverse([Enum.reverse(current) | chunks])
   end
 
   defp same_state_key(state_key, %{id: id} = record) do
