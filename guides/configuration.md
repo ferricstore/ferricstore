@@ -908,6 +908,15 @@ invocation controls, and outbound-target restrictions.
 |----------|---------|-------------|
 | `FERRICSTORE_SOCKET_ACTIVE_MODE` | `true` | TCP active mode: `true`, `once`, or integer N |
 
+### Flow Storage
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRICSTORE_FLOW_LMDB_STARTUP_COMPACTION` | `true` | At startup, rewrites a shard's Flow LMDB file without its free pages when both thresholds below are met. LMDB never shrinks its file on its own, so this is how space freed by retention is returned to the filesystem. |
+| `FERRICSTORE_FLOW_LMDB_COMPACTION_MIN_FREE_RATIO` | `0.5` | Minimum fraction of the LMDB file that must be free pages before startup compaction runs. |
+| `FERRICSTORE_FLOW_LMDB_COMPACTION_MIN_FILE_BYTES` | `268435456` | Minimum LMDB file size (256 MiB) before startup compaction runs. |
+| `FERRICSTORE_FLOW_QUERY_BUILTIN_INDEXES` | `all` | Built-in composite query indexes to keep: `all`, `none`, or a comma-separated list of ids (`flow_runs_tenant_updated`, `flow_runs_tenant_state_updated`, `flow_runs_tenant_type_updated`, `flow_runs_tenant_type_state_updated`, `flow_runs_tenant_type_state_lease_deadline`). Each index costs LMDB space per Flow; deselected indexes are retired and FQL plans fall back to other access paths. |
+
 ### Flow Policy Migration
 
 | Variable | Default | Description |
