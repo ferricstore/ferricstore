@@ -16,6 +16,13 @@ defmodule Ferricstore.Store.Keydir do
     ArgumentError -> false
   end
 
+  @spec unchanged_source?(:ets.tid() | atom(), entry()) :: boolean()
+  def unchanged_source?(table, row) do
+    :ets.select_count(table, unchanged_source_match_spec(row)) == 1
+  rescue
+    ArgumentError -> false
+  end
+
   @spec delete_unchanged_source(:ets.tid() | atom(), entry()) :: boolean()
   # LFU's packed counter is mutable; tagged flow-state version and all other
   # source fields remain part of the identity checked by this delete.

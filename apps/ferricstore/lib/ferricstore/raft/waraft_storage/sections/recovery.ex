@@ -150,6 +150,13 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
         Ferricstore.FS.mkdir_p!(shard_data_path)
 
+        :ok =
+          Ferricstore.Flow.KeydirSpill.refresh_present(
+            ctx.name,
+            shard_index,
+            Ferricstore.Flow.LMDB.path(shard_data_path)
+          )
+
         # WARaft storage may be opened by snapshot/bootstrap paths after the
         # original setup caller exits, so the named ETS owner must exist here too.
         Ferricstore.Store.ActiveFile.init(ctx.shard_count)

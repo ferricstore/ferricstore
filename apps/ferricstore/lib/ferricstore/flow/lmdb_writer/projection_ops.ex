@@ -552,6 +552,27 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   def expand_op(_state, {:project_flow_query_state, _key, _value, _expire_at_ms}, _acc),
     do: {:error, :inline_flow_projection_unsupported}
 
+  # Copies a pruned Flow's keydir row into LMDB only if apply has not changed or
+  # deleted it since the spill was requested (see Ferricstore.Flow.KeydirSpill).
+  def expand_op(
+        %{path: path},
+        {:keydir_spill_from_source, ets,
+         {key, value, expire_at_ms, _lfu, _file_id, _offset, _size} = row},
+        acc
+      )
+      when is_binary(key) and is_binary(value) do
+    if Ferricstore.Store.Keydir.unchanged_source?(ets, row) do
+      expand_path_op(
+        path,
+        {:put, Ferricstore.Flow.KeydirSpill.key(key),
+         Ferricstore.Flow.LMDB.encode_value(value, expire_at_ms)},
+        acc
+      )
+    else
+      {:ok, acc}
+    end
+  end
+
   def expand_op(%{path: path}, {put_mode, key, value} = op, acc)
       when put_mode in [:put, :put_new] and is_binary(key) and is_binary(value) do
     if Keys.state_key?(key),

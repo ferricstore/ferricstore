@@ -235,6 +235,9 @@ if config_env() == :prod do
     # LMDB never shrinks its data file; at startup a shard whose file is at least
     # this large and mostly free pages is replaced by a compacted copy.
     flow_lmdb_startup_compaction: boolean_env.("FERRICSTORE_FLOW_LMDB_STARTUP_COMPACTION", true),
+    # Moves bookkeeping rows of pruned terminal Flows from the keydir to LMDB.
+    # Enable only when every node runs a version that reads spilled rows.
+    flow_keydir_spill: boolean_env.("FERRICSTORE_FLOW_KEYDIR_SPILL", false),
     flow_lmdb_compaction_min_free_ratio:
       String.to_float(System.get_env("FERRICSTORE_FLOW_LMDB_COMPACTION_MIN_FREE_RATIO", "0.5")),
     flow_lmdb_compaction_min_file_bytes:

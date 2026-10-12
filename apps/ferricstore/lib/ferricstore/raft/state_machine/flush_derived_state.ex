@@ -6,6 +6,7 @@ defmodule Ferricstore.Raft.StateMachine.FlushDerivedState do
 
   alias Ferricstore.Flow.{
     HistoryProjector,
+    KeydirSpill,
     LMDB,
     LMDBReplaySafeIndex,
     LMDBWriter,
@@ -75,6 +76,7 @@ defmodule Ferricstore.Raft.StateMachine.FlushDerivedState do
     result =
       with :ok <- do_quiesce(instance_name, history_ctx, shard_index),
            :ok <- clear_lmdb(flow_lmdb_path),
+           :ok <- clear_flow_delete_markers(state, instance_name, flow_lmdb_path),
            :ok <- clear_history(shard_data_path),
            :ok <- reset_projection_watermarks(state, history_ctx, ra_index),
            :ok <- invalidate_shared_ref_verification(instance_name, shard_index),
@@ -163,6 +165,13 @@ defmodule Ferricstore.Raft.StateMachine.FlushDerivedState do
       {:error, reason} -> {:error, {:lmdb_clear_failed, reason}}
       other -> {:error, {:lmdb_clear_failed, other}}
     end
+  end
+
+  # Delete markers hide LMDB copies that the cleared LMDB no longer holds. The
+  # flush deletes re-create markers for spillable rows, so drop them here.
+  defp clear_flow_delete_markers(state, instance_name, flow_lmdb_path) do
+    :ets.match_delete(state.ets, {:_, nil, 0, :flow_state_deleted, :deleted, :_, :_})
+    KeydirSpill.refresh_present(instance_name, state.shard_index, flow_lmdb_path)
   end
 
   defp clear_history(shard_data_path) do

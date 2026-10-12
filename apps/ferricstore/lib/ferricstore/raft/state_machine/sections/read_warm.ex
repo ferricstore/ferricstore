@@ -54,6 +54,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
             {:hit, value, 0}
 
+          [{^key, nil, 0, :flow_state_deleted, :deleted, _off, _vsize}] ->
+            # Flow delete tombstone: deleted in apply, LMDB copy not removed yet.
+            :miss
+
           [{^key, nil, 0, _lfu, _fid, _off, _vsize}] ->
             # Cold key -- try Bitcask
             warm_from_bitcask(state, key, expiry_context)

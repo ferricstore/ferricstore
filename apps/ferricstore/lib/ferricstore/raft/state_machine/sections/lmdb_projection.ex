@@ -1060,6 +1060,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
             :ets.insert(state.ets, {key, nil, 0, :flow_state_deleted, :deleted, 0, 0})
             queue_lmdb_state_delete_projection(state, key)
 
+          keydir_spill_tracked?(state, key) ->
+            queue_keydir_spill_delete(state, key)
+
           flow_owned_value_ref?(key) or FlowKeys.policy_key?(key) or
               FlowKeys.policy_indexed_attribute_catalog_key?(key) ->
             with_lmdb_mirror_shard(state, fn ->
@@ -1080,6 +1083,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
           flow_state_key?(key) ->
             queue_lmdb_state_delete_projection(state, key)
 
+          keydir_spill_tracked?(state, key) ->
+            queue_keydir_spill_delete(state, key)
+
           flow_owned_value_ref?(key) or FlowKeys.policy_key?(key) or
               FlowKeys.policy_indexed_attribute_catalog_key?(key) ->
             with_lmdb_mirror_shard(state, fn ->
@@ -1094,6 +1100,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
       end
 
       defp maybe_queue_lmdb_state_delete_after_publish(_state, _key), do: :ok
+
+      defp keydir_spill_tracked?(state, key) do
+        Ferricstore.Flow.KeydirSpill.spillable?(key) and
+          Ferricstore.Flow.KeydirSpill.present?(Map.get(state, :instance_name), state.shard_index)
+      end
+
+      # The deleted row may still have a spilled LMDB copy. The tombstone hides
+      # it from apply reads until the LMDB writer has deleted that copy.
+      defp queue_keydir_spill_delete(state, key) do
+        :ets.insert(state.ets, {key, nil, 0, :flow_state_deleted, :deleted, 0, 0})
+
+        with_lmdb_mirror_shard(state, fn ->
+          queue_pending_lmdb_mirror_delete(Ferricstore.Flow.KeydirSpill.key(key))
+          queue_pending_lmdb_mirror_after_flush({:delete_flow_tombstone, state.ets, key})
+        end)
+      end
 
       defp queue_lmdb_state_delete_projection(state, key) do
         with_lmdb_mirror_shard(state, fn ->

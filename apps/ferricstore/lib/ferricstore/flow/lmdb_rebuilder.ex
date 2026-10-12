@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   @moduledoc false
 
   alias Ferricstore.Flow
+  alias Ferricstore.Flow.KeydirSpill
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.LMDBFlushCoordinator
   alias Ferricstore.Flow.LMDBRebuilder.ActiveIndexes
@@ -2017,6 +2018,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
          :ok <- ensure_apply_projection_row_durable(instance_ctx, shard_index, row),
          true <- Ferricstore.Store.Keydir.delete_unchanged_source(keydir, row) do
       track_pruned_binary_remove(row, shard_index, instance_ctx)
+      KeydirSpill.request(instance_ctx, shard_index, keydir, Map.get(current, :type), key)
     end
 
     :ok
