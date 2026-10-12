@@ -650,7 +650,8 @@ defmodule Ferricstore.Flow.PolicyMirrorRecovery do
   defp policy_projection_key(catalog_key, generation)
        when is_binary(catalog_key) and is_integer(generation) and generation >= 0 do
     with {:ok, descriptor_key} <- Keys.type_catalog_descriptor_key_from_member(catalog_key),
-         <<@descriptor_prefix::binary, type_digest::binary-size(43)>> <- descriptor_key,
+         <<@descriptor_prefix::binary, type_digest::binary>> <- descriptor_key,
+         true <- valid_digest?(type_digest),
          projection_key <-
            Keys.policy_catalog_projection_global_prefix() <>
              type_digest <> ":" <> <<generation::unsigned-big-64, catalog_key::binary>>,
@@ -700,11 +701,11 @@ defmodule Ferricstore.Flow.PolicyMirrorRecovery do
            byte_size(@attribute_member_prefix),
            byte_size(key) - byte_size(@attribute_member_prefix)
          ) do
-      <<name_digest::binary-size(43), ?:, type_digest::binary-size(43)>> ->
-        valid_digest?(name_digest) and valid_digest?(type_digest)
-
-      _invalid ->
-        false
+      pair ->
+        case String.split(pair, ":") do
+          [name_digest, type_digest] -> valid_digest?(name_digest) and valid_digest?(type_digest)
+          _invalid -> false
+        end
     end
   rescue
     ArgumentError -> false

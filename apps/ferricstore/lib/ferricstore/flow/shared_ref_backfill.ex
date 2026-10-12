@@ -5,6 +5,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow
   alias Ferricstore.Flow.HistoryProjector
+  alias Ferricstore.Flow.Digest
   alias Ferricstore.Flow.HistoryProjector.ValueProjection
   alias Ferricstore.Flow.KeydirSpill
   alias Ferricstore.Flow.Keys
@@ -1782,9 +1783,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   defp valid_flow_tag?("{f:" <> digest_with_brace) do
     with true <- String.ends_with?(digest_with_brace, "}"),
          digest <- String.trim_trailing(digest_with_brace, "}"),
-         true <- byte_size(digest) == 43,
-         {:ok, decoded} <- Base.url_decode64(digest, padding: false),
-         true <- byte_size(decoded) == 32 do
+         true <- Digest.canonical?(digest) do
       true
     else
       _invalid -> false
@@ -2158,8 +2157,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   end
 
   defp cleanup_member_key(tag, owner_id, owned_key) do
-    digest = :crypto.hash(:sha256, owned_key) |> Base.url_encode64(padding: false)
-    "f:" <> tag <> ":rtm:" <> owner_id <> ":" <> digest
+    "f:" <> tag <> ":rtm:" <> owner_id <> ":" <> Digest.encode(owned_key)
   end
 
   defp cleanup_owned_key?(owned_key, record) do
@@ -2592,31 +2590,32 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   defp count_result_prefix(run_id), do: run_prefix(run_id) <> "count-results:"
 
   defp work_key(run_id, key) do
-    work_prefix(run_id) <> Base.url_encode64(:crypto.hash(:sha256, key), padding: false)
+    work_prefix(run_id) <> staging_digest(key)
   end
 
   defp contribution_key(run_id, ref, registry_key) do
     contribution_prefix(run_id) <>
       ref_digest(ref) <>
-      ":" <> Base.url_encode64(:crypto.hash(:sha256, registry_key), padding: false)
+      ":" <> staging_digest(registry_key)
   end
 
   defp registry_snapshot_key(run_id, registry_key) do
-    registry_snapshot_prefix(run_id) <>
-      Base.url_encode64(:crypto.hash(:sha256, registry_key), padding: false)
+    registry_snapshot_prefix(run_id) <> staging_digest(registry_key)
   end
 
   defp existing_count_key(run_id, count_key) do
-    existing_count_prefix(run_id) <>
-      Base.url_encode64(:crypto.hash(:sha256, count_key), padding: false)
+    existing_count_prefix(run_id) <> staging_digest(count_key)
   end
 
   defp count_result_key(run_id, count_key) do
-    count_result_prefix(run_id) <>
-      Base.url_encode64(:crypto.hash(:sha256, count_key), padding: false)
+    count_result_prefix(run_id) <> staging_digest(count_key)
   end
 
-  defp ref_digest(ref), do: Base.url_encode64(:crypto.hash(:sha256, ref), padding: false)
+  defp ref_digest(ref), do: staging_digest(ref)
+
+  # Run staging lives only until its run finishes, so it keeps full digests in
+  # either data format.
+  defp staging_digest(value), do: Base.url_encode64(:crypto.hash(:sha256, value), padding: false)
 
   defp key_present!(keydir, key) do
     :ets.member(keydir, key)

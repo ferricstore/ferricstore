@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- New data directories use 128-bit Flow key digests (22 characters instead of
+  43), about 1.7 KB less disk and 360 B less keydir memory per flow. Existing
+  data directories keep full digests (data format 1) and run unchanged; every
+  member of a cluster must use the same data format.
+
 ## 0.11.24 - 2026-10-06
 
 - Update Mint to 1.10.2 to address the newly published HTTP response-framing and

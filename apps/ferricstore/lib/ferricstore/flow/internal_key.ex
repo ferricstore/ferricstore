@@ -90,11 +90,9 @@ defmodule Ferricstore.Flow.InternalKey do
     end
   end
 
-  defp valid_flow_tag?(<<"f:", digest::binary>>) when byte_size(digest) == 43,
-    do: valid_digest?(digest)
+  defp valid_flow_tag?(<<"f:", digest::binary>>), do: valid_digest?(digest)
 
-  defp valid_flow_tag?(<<"fgc:", digest::binary>>) when byte_size(digest) == 43,
-    do: valid_digest?(digest)
+  defp valid_flow_tag?(<<"fgc:", digest::binary>>), do: valid_digest?(digest)
 
   defp valid_flow_tag?(_tag), do: false
 
