@@ -160,6 +160,14 @@ defmodule FerricStore.API.Flow do
   `:max_active_ms` is type-level and applies to newly created Flows. A create
   option overrides it for one Flow; `:infinity` disables the type default for
   that Flow. Command-local retry policy still wins over retry defaults.
+
+  A stored policy that is corrupt (unreadable, or stored under another type)
+  fails reads with `ERR flow policy is corrupt`. Once the cluster feature level
+  is at least 1 (`FerricStore.raise_cluster_feature_level/1`), `replace: true`
+  overwrites it with a policy built only from the given options, at a
+  generation above any the type used before, and also replaces corrupt copies
+  on other shards. Without `replace: true`, or before the level is raised, the
+  set fails with `ERR corrupt flow policy high-water` as before.
   """
   @spec flow_policy_set(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_policy_set(type, opts) when is_binary(type) and is_list(opts) do
