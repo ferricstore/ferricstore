@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A corrupt Flow policy row no longer stops a node from starting. Startup
+  recovery logs it, emits `[:ferricstore, :flow, :lmdb_rebuild,
+  :corrupt_policy_skipped]` and drops its LMDB copy; reads and commands for that
+  type still fail with `ERR flow policy is corrupt`.
+
 ## 0.11.24 - 2026-10-06
 
 - Update Mint to 1.10.2 to address the newly published HTTP response-framing and

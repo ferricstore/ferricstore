@@ -7,6 +7,8 @@ defmodule Ferricstore.Flow.PolicyMirrorRecovery do
   alias Ferricstore.Flow.LMDBWriter.ProjectionOps
   alias Ferricstore.Store.BlobValue
 
+  require Logger
+
   @batch_size 512
   @max_u64 18_446_744_073_709_551_615
   @max_lmdb_key_bytes 511
@@ -580,7 +582,7 @@ defmodule Ferricstore.Flow.PolicyMirrorRecovery do
          {:ok, {_generation, %{type: ^type}}} <- RetryPolicy.decode_flow_policy_entry(value) do
       {:ok, [{:put, key, LMDB.encode_value(value, expire_at_ms)}]}
     else
-      _invalid -> {:error, :corrupt_flow_policy_mirror}
+      _invalid -> skip_corrupt_policy(key)
     end
   end
 
@@ -646,6 +648,21 @@ defmodule Ferricstore.Flow.PolicyMirrorRecovery do
 
   defp primary_ops(_kind, key, _value, _expire_at_ms),
     do: {:error, {:unsupported_policy_mirror_key, key}}
+
+  # Policy readers decode the source row and fail closed for its type, so one
+  # corrupt row must not stop the shard from starting. Its mirror is deleted so
+  # a stale valid copy cannot outlive the corrupt source.
+  defp skip_corrupt_policy(key) do
+    Logger.error("Flow policy recovery skipped a corrupt policy row: #{inspect(key)}")
+
+    :telemetry.execute(
+      [:ferricstore, :flow, :lmdb_rebuild, :corrupt_policy_skipped],
+      %{count: 1},
+      %{key: key}
+    )
+
+    {:ok, [{:delete, key}]}
+  end
 
   defp policy_projection_key(catalog_key, generation)
        when is_binary(catalog_key) and is_integer(generation) and generation >= 0 do
