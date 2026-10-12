@@ -720,6 +720,8 @@ defmodule Ferricstore.Flow.Keys do
 
   def retention_guard_key_from_state_key(_state_key), do: :error
 
+  def retention_guard_key?(key), do: internal_key_with_remainder?(key, "}:rtg:")
+
   def registry_key?(key), do: internal_key_with_remainder?(key, "}:r:")
 
   def tag(nil), do: @global_tag

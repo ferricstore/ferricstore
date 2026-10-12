@@ -2,7 +2,8 @@ defmodule Ferricstore.Flow.KeydirSpill do
   @moduledoc false
 
   # Bookkeeping rows of pruned terminal Flows can leave the keydir: the type
-  # catalog member (`tc`) and the retention cleanup members (`rtm`). Their copy
+  # catalog member (`tc`), the retention guard (`rtg`) and the retention cleanup
+  # members (`rtm`). Their copy
   # lives in LMDB under prefix/1 and is written only by the LMDB writer, from a
   # keydir row whose apply-projection frame is durable, so the copy is never
   # newer than what crash recovery restores. Apply reads fall back to it on a
@@ -28,9 +29,10 @@ defmodule Ferricstore.Flow.KeydirSpill do
   @spec prefix() :: binary()
   def prefix, do: @prefix
 
-  @spec prefix(:type_catalog_member | :retention_cleanup_member) :: binary()
+  @spec prefix(:type_catalog_member | :retention_cleanup_member | :retention_guard) :: binary()
   def prefix(:type_catalog_member), do: @prefix <> "tc:"
   def prefix(:retention_cleanup_member), do: @prefix <> "rtm:"
+  def prefix(:retention_guard), do: @prefix <> "rtg:"
 
   @spec key(binary()) :: binary()
   def key(source_key) when is_binary(source_key), do: prefix(family!(source_key)) <> source_key
@@ -43,6 +45,7 @@ defmodule Ferricstore.Flow.KeydirSpill do
     cond do
       Keys.type_catalog_member_key?(key) -> :type_catalog_member
       Keys.retention_cleanup_member?(key) -> :retention_cleanup_member
+      Keys.retention_guard_key?(key) -> :retention_guard
       true -> nil
     end
   end
@@ -75,10 +78,14 @@ defmodule Ferricstore.Flow.KeydirSpill do
       # tombstone and remove the spilled copy, whichever order the writer sees.
       :ok = mark_present(instance_name, shard_index)
 
-      cleanup_index_key = Keys.retention_cleanup_index_key(id, Map.get(record, :partition_key))
+      partition_key = Map.get(record, :partition_key)
+      cleanup_index_key = Keys.retention_cleanup_index_key(id, partition_key)
 
       rows =
-        [Keys.type_catalog_member_key(type, state_key)]
+        [
+          Keys.type_catalog_member_key(type, state_key),
+          Keys.retention_guard_key(id, partition_key)
+        ]
         |> Enum.concat(cleanup_member_keys(instance_name, shard_index, cleanup_index_key))
         |> Enum.flat_map(&spillable_row(data_dir, shard_index, ets, &1))
 

@@ -728,7 +728,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
              {:ok, guard_key} <- FlowKeys.retention_guard_key_from_state_key(state_key) do
           expected_guard = Ferricstore.Flow.RetentionGuard.encode(record)
 
-          case do_get(state, guard_key) do
+          case keydir_spill_get(state, guard_key) do
             ^expected_guard -> {:ok, record}
             nil -> flow_policy_planned_unguarded_record(state, state_key, record)
             _changed -> {:error, "ERR stale flow policy catalog record plan"}

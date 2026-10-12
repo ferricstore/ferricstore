@@ -285,6 +285,76 @@ defmodule Ferricstore.Flow.KeydirSpillTest do
     assert owned_key == flow.payload_ref
   end
 
+  test "a pruned terminal flow moves its retention guard from the keydir to LMDB",
+       %{isolated: isolated} do
+    Application.put_env(:ferricstore, :flow_keydir_spill, true)
+    flow = finish_flow(isolated, ttl_ms: nil)
+
+    assert_state_pruned(flow)
+    assert_spilled(flow, flow.guard_key)
+
+    assert {:ok, spilled} = LMDB.get(flow.lmdb_path, KeydirSpill.key(flow.guard_key))
+    assert {:ok, guard} = LMDB.decode_value(spilled, 0)
+    assert {:ok, {version, {:state_enter_seq, _seq}}} = Ferricstore.TermCodec.decode(guard)
+
+    assert {:ok, %{version: ^version}} =
+             FerricStore.flow_get(flow.id, partition_key: flow.partition)
+  end
+
+  test "a policy catalog backfill planned before a flow finished is stale once its guard spilled",
+       %{isolated: isolated} do
+    Application.put_env(:ferricstore, :flow_keydir_spill, true)
+    flow = start_flow(isolated)
+    %{ctx: ctx, shard_index: shard_index} = flow
+
+    {:ok, source_token} = PolicyMigration.source_token(ctx, shard_index)
+    run_token = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
+    step = &Router.flow_policy_catalog_backfill_step(ctx, shard_index, &1)
+
+    base = %{run_token: run_token, source_token: source_token, candidates: [], done?: false}
+
+    assert {:ok, _} =
+             step.(
+               %{base | candidates: []}
+               |> Map.merge(%{expected_cursor: "", cursor: PolicyMigration.snapshot_cursor()})
+             )
+
+    :ok = PolicyMigration.snapshot_primary_keydir(ctx, shard_index, run_token, 256, 2_097_152)
+    work_cursor = PolicyMigration.work_cursor(run_token)
+
+    assert {:ok, _} =
+             step.(
+               Map.merge(base, %{
+                 expected_cursor: PolicyMigration.snapshot_cursor(),
+                 cursor: work_cursor
+               })
+             )
+
+    assert {:ok, page} =
+             PolicyMigration.backfill_page(ctx, shard_index, work_cursor, 256, 2_097_152)
+
+    assert [candidate] =
+             Enum.filter(
+               page.candidates,
+               &match?(%{kind: :state, state_key: state_key} when state_key == flow.state_key, &1)
+             )
+
+    # The planned record is the active Flow; it then finishes and its guard spills.
+    flow = cancel_flow(isolated, flow)
+    assert_state_pruned(flow)
+    assert_spilled(flow, flow.guard_key)
+
+    assert {:error, "ERR stale flow policy catalog record plan"} =
+             step.(
+               Map.merge(base, %{
+                 expected_cursor: work_cursor,
+                 cursor: page.cursor,
+                 candidates: [candidate],
+                 done?: page.done?
+               })
+             )
+  end
+
   test "retention deletes the owned values of a spilled terminal flow", %{isolated: isolated} do
     Application.put_env(:ferricstore, :flow_keydir_spill, true)
     flow = finish_flow(isolated, ttl_ms: 1, payload: "spill-payload")
@@ -374,6 +444,10 @@ defmodule Ferricstore.Flow.KeydirSpillTest do
   end
 
   defp finish_flow(isolated, opts) do
+    isolated |> start_flow(opts) |> then(&cancel_flow(isolated, &1, opts))
+  end
+
+  defp start_flow(isolated, opts \\ []) do
     id = unique("spill-flow")
     type = unique("spill-type")
     partition = unique("spill-partition")
@@ -396,25 +470,6 @@ defmodule Ferricstore.Flow.KeydirSpillTest do
     assert {:ok, %{payload_ref: payload_ref}} =
              FerricStore.flow_get(id, partition_key: partition)
 
-    assert {:ok, [%{id: ^id} = claimed]} =
-             FerricStore.flow_claim_due(type,
-               partition_key: partition,
-               states: ["queued"],
-               worker: "keydir-spill-test",
-               limit: 1,
-               now_ms: now_ms + 1
-             )
-
-    cancel_opts =
-      [
-        partition_key: partition,
-        lease_token: claimed.lease_token,
-        fencing_token: claimed.fencing_token,
-        now_ms: System.system_time(:millisecond)
-      ] ++ if(opts[:ttl_ms], do: [ttl_ms: opts[:ttl_ms]], else: [])
-
-    assert :ok = FerricStore.flow_cancel(id, cancel_opts)
-
     ctx = FerricStore.Instance.get(:default)
     state_key = Keys.state_key(id, partition)
     shard_index = Router.shard_for(ctx, state_key)
@@ -424,9 +479,7 @@ defmodule Ferricstore.Flow.KeydirSpillTest do
       |> Ferricstore.DataDir.shard_data_path(shard_index)
       |> LMDB.path()
 
-    if Keyword.get(opts, :flush, true) do
-      assert :ok = LMDBWriter.flush_all(ctx.name, ctx.shard_count, 45_000)
-    end
+    assert :ok = LMDBWriter.flush_all(ctx.name, ctx.shard_count, 45_000)
 
     %{
       ctx: ctx,
@@ -436,11 +489,43 @@ defmodule Ferricstore.Flow.KeydirSpillTest do
       state_key: state_key,
       catalog_key: Keys.type_catalog_member_key(type, state_key),
       payload_ref: payload_ref,
+      guard_key: Keys.retention_guard_key(id, partition),
       member_key: payload_ref && Keys.retention_cleanup_member_key(id, payload_ref, partition),
       shard_index: shard_index,
       keydir: elem(ctx.keydir_refs, shard_index),
       lmdb_path: lmdb_path
     }
+  end
+
+  defp cancel_flow(_isolated, flow, opts \\ []) do
+    now_ms = System.system_time(:millisecond)
+
+    assert {:ok, [%{id: id} = claimed]} =
+             FerricStore.flow_claim_due(flow.type,
+               partition_key: flow.partition,
+               states: ["queued"],
+               worker: "keydir-spill-test",
+               limit: 1,
+               now_ms: now_ms + 1
+             )
+
+    assert id == flow.id
+
+    cancel_opts =
+      [
+        partition_key: flow.partition,
+        lease_token: claimed.lease_token,
+        fencing_token: claimed.fencing_token,
+        now_ms: System.system_time(:millisecond)
+      ] ++ if(opts[:ttl_ms], do: [ttl_ms: opts[:ttl_ms]], else: [])
+
+    assert :ok = FerricStore.flow_cancel(flow.id, cancel_opts)
+
+    if Keyword.get(opts, :flush, true) do
+      assert :ok = LMDBWriter.flush_all(flow.ctx.name, flow.ctx.shard_count, 45_000)
+    end
+
+    flow
   end
 
   defp assert_state_pruned(flow) do

@@ -404,7 +404,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
         guard_key = FlowKeys.retention_guard_key(id, Map.get(record, :partition_key))
         expected_guard = Ferricstore.Flow.RetentionGuard.encode(record)
 
-        case sm_store_batch_get(state, [guard_key], &sm_file_path/2) do
+        case keydir_spill_batch_get(state, [guard_key]) do
           [^expected_guard] -> {:ok, guard_key, expected_guard}
           _missing_or_stale -> {:error, :flow_retention_guard_missing}
         end
