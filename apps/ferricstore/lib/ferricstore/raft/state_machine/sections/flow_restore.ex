@@ -48,8 +48,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRestore do
            when is_map(record) and is_list(entries),
            do: flow_restore_history(state, record, entries)
 
-      defp do_flow_restore(state, %{restore: :shared_value, key: key, value: value} = attrs)
-           when is_binary(key) and is_binary(value) do
+      # Standalone rows: shared values, and governance records of a scope,
+      # approval or limit.
+      defp do_flow_restore(state, %{restore: kind, key: key, value: value} = attrs)
+           when kind in [:shared_value, :governance] and is_binary(key) and is_binary(value) do
         with :ok <- flow_validate_key_size(key) do
           raw_put_cold(state, key, value, Map.get(attrs, :expire_at_ms, 0))
         end
@@ -117,16 +119,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRestore do
         end)
       end
 
-      # Signal idempotency and shared-value link rows, as stored. Links are
-      # owned keys that retention cleanup deletes with the run.
+      # Signal idempotency and shared-value link rows, as stored, and the run's
+      # governance effects and ledger with their own expiry. Links and
+      # governance rows are owned keys that retention cleanup deletes with the run.
       defp flow_restore_aux(state, record, rows) do
-        expire_at_ms = flow_record_expire_at(record)
+        record_expire_at_ms = flow_record_expire_at(record)
 
-        Enum.reduce_while(rows, :ok, fn {kind, key, value}, :ok ->
+        Enum.reduce_while(rows, :ok, fn row, :ok ->
+          {kind, key, value, expire_at_ms} =
+            case row do
+              {:owned, key, value, expire_at_ms} -> {:owned, key, value, expire_at_ms}
+              {kind, key, value} -> {kind, key, value, record_expire_at_ms}
+            end
+
           result =
             with :ok <- flow_validate_key_size(key),
                  :ok <- raw_put_cold(state, key, value, expire_at_ms) do
-              if kind == :link,
+              if kind in [:link, :owned],
                 do: flow_track_retention_cleanup_key(state, record, key),
                 else: :ok
             end

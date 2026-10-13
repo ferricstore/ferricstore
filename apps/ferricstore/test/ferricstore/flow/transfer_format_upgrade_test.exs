@@ -1,7 +1,8 @@
 defmodule Ferricstore.Flow.TransferFormatUpgradeTest do
   @moduledoc """
   Runs exported from a data format 1 node restore into a format 2 store: the
-  same runs, history, values and policies, with every key and ref in format 2.
+  same runs, history, values, policies and governance state, with every key and
+  ref in format 2.
   """
 
   use ExUnit.Case, async: false
@@ -39,9 +40,12 @@ defmodule Ferricstore.Flow.TransferFormatUpgradeTest do
     source = :erpc.call(ctx.node, FerricStore.Instance, :get, [:default])
     now_ms = System.system_time(:millisecond)
     manifest = :erpc.call(ctx.node, FlowTransferFixture, :build!, [source, "xf", now_ms])
+    gov = :erpc.call(ctx.node, FlowTransferFixture, :build_governance!, [source, "xg", now_ms])
     before = :erpc.call(ctx.node, FlowTransferFixture, :snapshot, [source, manifest])
+    gov_before = await_governance_snapshot(ctx.node, source, gov)
     assert {:ok, counts} = :erpc.call(ctx.node, Transfer, :export, [source, ctx.path])
-    assert counts.flows == length(manifest.flows) + length(manifest.schedules)
+    # The governance fixture adds a running and a finished run.
+    assert counts.flows == length(manifest.flows) + length(manifest.schedules) + 2
 
     target = :erpc.call(ctx.target, FerricStore.Instance, :get, [:default])
     assert {:ok, ^counts} = :erpc.call(ctx.target, Transfer, :restore, [target, ctx.path])
@@ -55,6 +59,62 @@ defmodule Ferricstore.Flow.TransferFormatUpgradeTest do
 
     refute inspect(restored, limit: :infinity, printable_limit: :infinity) =~
              ~r/\{f:[A-Za-z0-9_-]{43}\}/
+
+    # Limit storage keys hold digests beyond the partition tag; the restored
+    # limits' reservations must still be found by their ids.
+    gov_restored =
+      :erpc.call(ctx.target, FlowTransferFixture, :governance_snapshot, [target, gov])
+
+    assert gov_restored == gov_before |> reset_running_limit(gov) |> to_format_2()
+
+    assert {:ok, %{leases: %{0 => %{in_use: 0}}}} =
+             :erpc.call(ctx.target, FerricStore.Impl, :flow_limit_release, [
+               target,
+               gov.limit,
+               [shard_id: 0, reservation_ids: gov.limit_reservations]
+             ])
+  end
+
+  # The fixture's finished run gives its running-limit slot back through the
+  # release queue; snapshot once it has.
+  defp await_governance_snapshot(node, instance, gov) do
+    scope = FlowTransferFixture.running_limit_scope(gov.type)
+
+    :ok =
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          {:ok, %{leases: leases}} =
+            :erpc.call(node, FerricStore.Impl, :flow_limit_get, [
+              instance,
+              scope,
+              [now_ms: gov.now_ms + 10]
+            ])
+
+          leases |> Map.values() |> Enum.map(& &1.in_use) |> Enum.sum() == 1
+        end,
+        "the finished run should release its running-limit slot",
+        200,
+        50
+      )
+
+    :erpc.call(node, FlowTransferFixture, :governance_snapshot, [instance, gov])
+  end
+
+  defp reset_running_limit(snapshot, gov) do
+    scope = FlowTransferFixture.running_limit_scope(gov.type)
+
+    reset = fn
+      %{scope: ^scope} = owner -> %{owner | config_version: 0}
+      owner -> owner
+    end
+
+    {:ok, limit_list} = snapshot.limit_list
+
+    %{
+      snapshot
+      | limits: Map.new(snapshot.limits, fn {s, {:ok, owner}} -> {s, {:ok, reset.(owner)}} end),
+        limit_list: {:ok, Enum.map(limit_list, reset)}
+    }
   end
 
   # Every format 1 partition tag inside the term, rewritten as format 2 writes it.

@@ -252,6 +252,103 @@ defmodule Ferricstore.Flow.TransferTest do
     |> Enum.sum()
   end
 
+  test "governance state moves with the store and keeps working", ctx do
+    gov = FlowTransferFixture.build_governance!(ctx.source, "gx", ctx.now_ms)
+    running_scope = FlowTransferFixture.running_limit_scope(gov.type)
+    await_running_in_use!(ctx.source, gov, running_scope, 1)
+
+    before = FlowTransferFixture.governance_snapshot(ctx.source, gov)
+    assert {:ok, _counts} = Transfer.export(ctx.source, ctx.path)
+    assert {:ok, _counts} = Transfer.restore(ctx.target, ctx.path)
+
+    # Policy generations start over in the target, so a running limit takes its
+    # configuration from the target's policy again on the next claim.
+    restored = FlowTransferFixture.governance_snapshot(ctx.target, gov)
+    {:ok, running_owner} = restored.limits[running_scope]
+    assert running_owner.config_version == 0
+
+    reset = fn
+      %{scope: ^running_scope} = owner -> %{owner | config_version: 0}
+      owner -> owner
+    end
+
+    {:ok, limit_list} = before.limit_list
+
+    expected = %{
+      before
+      | limits:
+          Map.new(before.limits, fn {scope, {:ok, owner}} -> {scope, {:ok, reset.(owner)}} end),
+        limit_list: {:ok, Enum.map(limit_list, reset)}
+    }
+
+    assert restored == expected
+
+    # Effects and the ledger belong to their run: retention deletes them with it.
+    pk = gov.partition_key
+
+    for owned <- [
+          Ferricstore.Flow.Keys.governance_effect_key(gov.running.id, "send", pk),
+          Ferricstore.Flow.Keys.governance_ledger_index_key(gov.running.id, pk)
+        ] do
+      member = Ferricstore.Flow.Keys.retention_cleanup_member_key(gov.running.id, owned, pk)
+      assert Ferricstore.Store.Router.get(ctx.target, member), "#{owned} is not owned by its run"
+    end
+
+    run = gov.running
+
+    assert {:ok, %{status: :confirmed}} =
+             Impl.flow_effect_confirm(ctx.target, run.id, "send",
+               partition_key: pk,
+               lease_token: run.lease_token,
+               fencing_token: run.fencing_token,
+               now_ms: gov.now_ms + 20
+             )
+
+    assert :ok =
+             Impl.flow_complete(ctx.target, run.id, run.lease_token,
+               partition_key: pk,
+               fencing_token: run.fencing_token
+             )
+
+    # The restored run's slot goes back to the restored running limit.
+    await_running_in_use!(ctx.target, gov, running_scope, 0)
+
+    assert {:ok, %{status: :approved}} =
+             Impl.flow_approval_approve(ctx.target, gov.approval, approver: "operator")
+
+    assert {:ok, %{status: :committed}} =
+             Impl.flow_budget_commit(ctx.target, gov.budget, gov.budget_reservation, 1,
+               now_ms: gov.now_ms + 20
+             )
+
+    assert {:ok, %{leases: %{0 => %{in_use: 0}}}} =
+             Impl.flow_limit_release(ctx.target, gov.limit,
+               shard_id: 0,
+               reservation_ids: gov.limit_reservations
+             )
+  end
+
+  test "restore refuses limit leases on shards the target lacks before writing anything", ctx do
+    wide = IsolatedInstance.checkout(shard_count: 4)
+    on_exit(fn -> IsolatedInstance.checkin(wide) end)
+
+    {:ok, _lease} =
+      Impl.flow_limit_lease(wide, "tx-wide-limit",
+        shard_id: 3,
+        amount: 1,
+        limit: 2,
+        ttl_ms: 600_000,
+        now_ms: ctx.now_ms
+      )
+
+    assert {:ok, _counts} = Transfer.export(wide, ctx.path)
+
+    assert {:error, {:limit_lease_shard_out_of_range, "tx-wide-limit", 3, 2}} =
+             Transfer.restore(ctx.target, ctx.path)
+
+    assert {:ok, nil} = Impl.flow_limit_get(ctx.target, "tx-wide-limit")
+  end
+
   test "export repairs a shard whose LMDB projection is marked degraded", ctx do
     # A mirror enqueue the writer refused marks the shard degraded; history reads
     # then refuse it until the projection is reconciled.
@@ -297,17 +394,13 @@ defmodule Ferricstore.Flow.TransferTest do
   end
 
   test "export refuses Flow data it cannot carry and leaves no file", ctx do
-    {:ok, _circuit} =
-      Impl.flow_circuit_open(ctx.source, "tx-circuit",
-        failure_threshold: 1,
-        open_ms: 60_000,
-        now_ms: ctx.now_ms
-      )
+    # A Flow row of a kind the export does not know, as a newer release or a
+    # half-finished internal operation might leave behind.
+    unknown = "f:{f}:unknown-family:tx"
+    :ok = Ferricstore.Store.Router.put(ctx.source, unknown, "x", 0)
 
-    assert {:error, {:unsupported_flow_data, [key | _keys]}} =
-             Transfer.export(ctx.source, ctx.path)
+    assert {:error, {:unsupported_flow_data, [^unknown]}} = Transfer.export(ctx.source, ctx.path)
 
-    assert key =~ ":gov:"
     refute File.exists?(ctx.path)
     refute File.exists?(ctx.path <> ".partial")
   end
@@ -320,6 +413,24 @@ defmodule Ferricstore.Flow.TransferTest do
   test "the public API validates its arguments" do
     assert {:error, _reason} = FerricStore.flow_export(:not_a_path)
     assert {:error, _reason} = FerricStore.flow_restore("/tmp/x.ffx", :not_opts)
+  end
+
+  defp await_running_in_use!(instance, gov, scope, in_use) do
+    :ok =
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          case Impl.flow_limit_get(instance, scope, now_ms: gov.now_ms + 10) do
+            {:ok, %{leases: leases}} ->
+              leases |> Map.values() |> Enum.map(& &1.in_use) |> Enum.sum() == in_use
+
+            _other ->
+              false
+          end
+        end,
+        "running limit #{scope} should have #{in_use} slot(s) in use",
+        200,
+        50
+      )
   end
 
   defp in_keydir?(instance, id, partition_key) do

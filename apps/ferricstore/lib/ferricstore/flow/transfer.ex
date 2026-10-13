@@ -16,10 +16,18 @@ defmodule Ferricstore.Flow.Transfer do
   target shard; policy generations start over. Runs are restored oldest state
   entry first, so FIFO lanes keep their order.
 
+  Governance state travels too: circuits, budgets, limits (with their leases and
+  reservations), approvals, and each run's effects and ledger, which stay owned
+  by the run. The restore rebuilds the governance catalogs. A running limit
+  takes its configuration from the target's policy on its next claim, since
+  policy generations start over. Limit-cache sessions are per node and are not
+  carried; credit they had prefetched returns when its lease expires. An export
+  waits for pending limit releases to be applied first.
+
   Plain (non-Flow) keys are not exported. An export refuses a store holding Flow
-  data it cannot carry (for example governance state or a policy migration in
-  progress) instead of leaving it behind. Stop writers first: a run changed
-  while the export reads it can be captured mid-change.
+  data it cannot carry (for example a policy migration in progress) instead of
+  leaving it behind. Stop writers first: a run changed while the export reads it
+  can be captured mid-change.
   """
 
   alias Ferricstore.DataDir
@@ -34,6 +42,14 @@ defmodule Ferricstore.Flow.Transfer do
     LMDBRebuilder,
     Policy,
     ValueStore
+  }
+
+  alias Ferricstore.Flow.Governance.{
+    Approval,
+    Catalog,
+    LimitReconciler,
+    LimitRecord,
+    ReleaseOutbox
   }
 
   alias Ferricstore.Flow.HistoryProjector.KeyCodec
@@ -61,11 +77,16 @@ defmodule Ferricstore.Flow.Transfer do
   # Global rows rebuilt from policies and restored runs, or progress markers.
   @derived_global_families ~w(td svc svo svb svbp pcb policy-attribute policy-attribute-member
                               policy-attribute-revision policy-attribute-repair)
+  # Governance records of a scope, approval or limit (`f:{<tag>}:gov:<kind>:...`).
+  @governance_record_kinds ~w(a b c limit limit-storage scope)
+  # Running limits are named after their Flow type and configured by its policy.
+  @running_limit_prefix "flow-running:"
 
   @type counts :: %{
           flows: non_neg_integer(),
           shared_values: non_neg_integer(),
-          policies: non_neg_integer()
+          policies: non_neg_integer(),
+          governance: non_neg_integer()
         }
 
   @spec export(FerricStore.Instance.t(), Path.t(), keyword()) ::
@@ -74,7 +95,8 @@ defmodule Ferricstore.Flow.Transfer do
     with :ok <- flush_lmdb(ctx),
          :ok <- repair_degraded_shards(ctx),
          {:ok, scan} <- scan(ctx),
-         :ok <- refuse_unsupported(scan) do
+         :ok <- refuse_unsupported(scan),
+         :ok <- retry_transient(fn -> releases_applied(ctx, scan.release_metas) end) do
       partial = path <> ".partial"
 
       case File.open(partial, [:write, :binary], &write_export(ctx, &1, scan)) do
@@ -99,10 +121,11 @@ defmodule Ferricstore.Flow.Transfer do
   @spec restore(FerricStore.Instance.t(), Path.t(), keyword()) ::
           {:ok, counts()} | {:error, term()}
   def restore(ctx, path, opts \\ []) do
-    with {:ok, header} <- verify(path),
+    with {:ok, header, leases} <- verify(path),
          from = header.data_format,
          to = DataFormat.current(),
          :ok <- restorable?(from, to),
+         :ok <- leases_fit(leases, ctx.shard_count),
          :ok <- require_empty(ctx) do
       limits = %{
         events: Keyword.get(opts, :chunk_events, @chunk_events),
@@ -166,9 +189,16 @@ defmodule Ferricstore.Flow.Transfer do
          {:ok, hash} <- write_frame(io, :crypto.hash_init(:sha256), {:header, header}),
          {:ok, hash, policies} <- write_policies(ctx, io, hash, scan.policies),
          {:ok, hash, shared} <- write_shared_values(ctx, io, hash, scan.shared),
+         {:ok, hash, governance} <- write_governance(ctx, io, hash, governance_rows(scan)),
          {:ok, order} <- run_order(ctx, scan.flows),
          {:ok, hash, flows} <- write_runs(ctx, io, hash, order, scan) do
-      counts = %{flows: flows, shared_values: shared, policies: policies}
+      counts = %{
+        flows: flows,
+        shared_values: shared,
+        policies: policies,
+        governance: governance
+      }
+
       trailer = Map.put(counts, :sha256, :crypto.hash_final(hash))
 
       {:ok, _hash} = write_frame(io, nil, {:trailer, trailer})
@@ -221,6 +251,61 @@ defmodule Ferricstore.Flow.Transfer do
       |> case do
         {:ok, _hash, _count} = ok -> {:cont, ok}
         error -> {:halt, error}
+      end
+    end)
+  end
+
+  # Scope, approval and limit records, plus run-owned rows (effects, ledger) of
+  # runs that are no longer there.
+  defp governance_rows(scan) do
+    flows = MapSet.new(scan.flows)
+
+    orphans =
+      for {state_key, rows} <- scan.owned,
+          not MapSet.member?(flows, state_key),
+          row <- rows,
+          do: row
+
+    Enum.sort(Map.to_list(scan.governance) ++ orphans)
+  end
+
+  defp write_governance(ctx, io, hash, rows) do
+    rows
+    |> Enum.chunk_every(@record_batch)
+    |> Enum.reduce_while({:ok, hash, 0}, fn chunk, {:ok, hash, count} ->
+      values = ValueStore.raw_mget_any(ctx, Enum.map(chunk, &elem(&1, 0)))
+
+      {hash, count} =
+        chunk
+        |> Enum.zip(values)
+        |> Enum.reduce({hash, count}, fn
+          {{_key, _expire_at_ms}, nil}, acc ->
+            acc
+
+          {{key, expire_at_ms}, value}, {hash, count} when is_binary(value) ->
+            {:ok, hash} = write_frame(io, hash, {:governance, key, value, expire_at_ms})
+            {hash, count + 1}
+        end)
+
+      {:cont, {:ok, hash, count}}
+    end)
+  end
+
+  # Limit releases queued by finished runs are applied by the limit reconciler
+  # shortly after; the export carries limits once every queue is drained, and
+  # runs the reconciler itself while it waits.
+  defp releases_applied(ctx, meta_keys) do
+    Enum.reduce_while(meta_keys, :ok, fn {shard, key}, :ok ->
+      case ReleaseOutbox.decode_meta(Router.get(ctx, key)) do
+        {:ok, %{head: head, tail: tail}} when head > tail ->
+          {:cont, :ok}
+
+        {:ok, _pending} ->
+          _ = LimitReconciler.run_once(ctx)
+          {:halt, {:error, {:governance_releases_pending, shard}}}
+
+        {:error, reason} ->
+          {:halt, {:error, {:governance_release_outbox, shard, reason}}}
       end
     end)
   end
@@ -308,6 +393,8 @@ defmodule Ferricstore.Flow.Transfer do
          {:ok, history} <- decode_history(state_key, raw_history) do
       refs = owned_value_refs(record, history)
       aux = Map.get(scan.signals, state_key, []) ++ Map.get(scan.links, state_key, [])
+      owned = Map.get(scan.owned, state_key, [])
+      owned_values = ValueStore.raw_mget_any(ctx, Enum.map(owned, &elem(&1, 0)))
 
       {:ok,
        %{
@@ -321,7 +408,12 @@ defmodule Ferricstore.Flow.Transfer do
                Enum.zip(aux, ValueStore.raw_mget_any(ctx, Enum.map(aux, &elem(&1, 1)))),
              is_binary(value),
              do: {kind, key, value}
-           )
+           ) ++
+             for(
+               {{key, expire_at_ms}, value} <- Enum.zip(owned, owned_values),
+               is_binary(value),
+               do: {:owned, key, value, expire_at_ms}
+             )
        }}
     else
       {:error, reason} -> {:error, {:run_export_failed, state_key, reason}}
@@ -404,6 +496,7 @@ defmodule Ferricstore.Flow.Transfer do
 
   defp transient?("ERR flow LMDB projection unavailable" <> _key), do: true
   defp transient?({:run_read_failed, _state_key, :unavailable}), do: true
+  defp transient?({:governance_releases_pending, _shard}), do: true
   defp transient?(_reason), do: false
 
   ## Scan
@@ -415,6 +508,9 @@ defmodule Ferricstore.Flow.Transfer do
       links: %{},
       shared: %{},
       policies: MapSet.new(),
+      governance: %{},
+      owned: %{},
+      release_metas: [],
       unsupported: []
     }
 
@@ -527,6 +623,9 @@ defmodule Ferricstore.Flow.Transfer do
       family when family in @derived_run_families ->
         acc
 
+      "gov" ->
+        classify_governance(acc, tag, tail, key, expire_at_ms)
+
       _other ->
         unsupported(acc, key)
     end
@@ -546,12 +645,72 @@ defmodule Ferricstore.Flow.Transfer do
     end
   end
 
+  # Per-shard queues and progress markers: the restore rebuilds catalogs itself,
+  # and an export waits for queued limit releases to be applied.
+  defp classify(acc, :governance, _tag, tail, key, _expire_at_ms) do
+    case :binary.split(tail, ":", [:global]) do
+      ["gov", "release-outbox", shard, "meta"] ->
+        %{acc | release_metas: [{shard, key} | acc.release_metas]}
+
+      ["gov", "release-outbox", _shard, kind, _sequence] when kind in ["intent", "completed"] ->
+        acc
+
+      ["gov", "limit-catalog-outbox" | _rest] ->
+        acc
+
+      ["gov", "limit-storage-cleanup", "progress"] ->
+        acc
+
+      # Approval catalog repair cursors (the catalogs themselves are sorted sets).
+      ["gov", "catalog" | _rest] ->
+        acc
+
+      _other ->
+        unsupported(acc, key)
+    end
+  end
+
+  # A node's limit-cache session: meaningless on another cluster's nodes.
+  defp classify(acc, :cache_session, _tag, "gov:limit-cache-session:" <> _rest, _key, _expire),
+    do: acc
+
   defp classify(acc, :server, _tag, _tail, _key, _expire_at_ms), do: acc
-  defp classify(acc, :other, _tag, _tail, key, _expire_at_ms), do: unsupported(acc, key)
+  defp classify(acc, _kind, _tag, _tail, key, _expire_at_ms), do: unsupported(acc, key)
+
+  # Effects and the ledger belong to the run named in their key; retention
+  # deletes them with it.
+  defp classify_governance(acc, tag, "gov:" <> rest, key, expire_at_ms) do
+    case :binary.split(rest, ":") do
+      [kind, components] when kind in ["e", "l"] ->
+        with [encoded_id, _rest] <- :binary.split(components, ":"),
+             {:ok, id} when id != "" <- Base.url_decode64(encoded_id, padding: false) do
+          add_owned_governance(acc, tag, id, key, expire_at_ms)
+        else
+          _invalid -> unsupported(acc, key)
+        end
+
+      ["li", id] when id != "" ->
+        add_owned_governance(acc, tag, id, key, expire_at_ms)
+
+      [kind, _rest] when kind in @governance_record_kinds ->
+        %{acc | governance: Map.put(acc.governance, key, expire_at_ms)}
+
+      _other ->
+        unsupported(acc, key)
+    end
+  end
+
+  defp add_owned_governance(acc, tag, id, key, expire_at_ms) do
+    state_key = "f:{" <> tag <> "}:s:" <> id
+    row = {key, expire_at_ms}
+    %{acc | owned: Map.update(acc.owned, state_key, [row], &[row | &1])}
+  end
 
   defp tag_kind("f"), do: :global
   defp tag_kind("fa:" <> _bucket), do: :run
   defp tag_kind("f:" <> _digest), do: :run
+  defp tag_kind("flow-governance"), do: :governance
+  defp tag_kind("fgc:" <> _digest), do: :cache_session
   defp tag_kind("__server__"), do: :server
   defp tag_kind(_tag), do: :other
 
@@ -601,7 +760,10 @@ defmodule Ferricstore.Flow.Transfer do
       present =
         scan.flows ++
           Map.keys(scan.shared) ++
-          Enum.map(MapSet.to_list(scan.policies), &Keys.policy_key/1) ++ scan.unsupported
+          Enum.map(MapSet.to_list(scan.policies), &Keys.policy_key/1) ++
+          Map.keys(scan.governance) ++
+          Enum.flat_map(Map.values(scan.owned), fn rows -> Enum.map(rows, &elem(&1, 0)) end) ++
+          scan.unsupported
 
       case present do
         [] -> :ok
@@ -613,7 +775,7 @@ defmodule Ferricstore.Flow.Transfer do
   defp restore_frames(ctx, io, conv) do
     with :ok <- read_magic(io),
          {:ok, {:header, _header}, _frame} <- read_frame(io) do
-      restore_frames(ctx, io, conv, %{flows: 0, shared_values: 0, policies: 0})
+      restore_frames(ctx, io, conv, %{flows: 0, shared_values: 0, policies: 0, governance: 0})
     end
   end
 
@@ -637,6 +799,10 @@ defmodule Ferricstore.Flow.Transfer do
                }),
              do: restore_frames(ctx, io, conv, Map.update!(counts, :shared_values, &(&1 + 1)))
 
+      {:ok, {:governance, key, value, expire_at_ms}, _frame} ->
+        with :ok <- restore_governance(ctx, key, value, expire_at_ms, from, to),
+             do: restore_frames(ctx, io, conv, Map.update!(counts, :governance, &(&1 + 1)))
+
       {:ok, {:flow, bundle}, _frame} ->
         with :ok <- restore_run(ctx, bundle, conv),
              do: restore_frames(ctx, io, conv, Map.update!(counts, :flows, &(&1 + 1)))
@@ -655,6 +821,87 @@ defmodule Ferricstore.Flow.Transfer do
     case Policy.set(ctx, type, opts ++ [replace: true]) do
       {:ok, _policy} -> :ok
       {:error, reason} -> {:error, {:policy_restore_failed, type, reason}}
+    end
+  end
+
+  defp restore_governance(ctx, source_key, value, expire_at_ms, from, to) do
+    with {:ok, key} <- Retag.governance_key(source_key, from, to),
+         {:ok, value} <- governance_value(key, value),
+         :ok <-
+           Router.flow_restore(ctx, key, %{
+             restore: :governance,
+             key: key,
+             value: value,
+             expire_at_ms: expire_at_ms
+           }),
+         :ok <- register_governance(ctx, key, value) do
+      :ok
+    else
+      {:error, reason} -> {:error, {:governance_restore_failed, source_key, reason}}
+      other -> {:error, {:governance_restore_failed, source_key, other}}
+    end
+  end
+
+  # A running limit's config_version is the source's policy generation;
+  # generations start over in the target, so the next claim re-applies the
+  # target's policy instead of looking stale.
+  defp governance_value(key, value) do
+    if Keys.governance_limit_key?(key) do
+      with {:ok, owner} <- LimitRecord.decode_owner(value) do
+        if String.starts_with?(owner.scope, @running_limit_prefix),
+          do: LimitRecord.encode_owner(%{owner | config_version: 0}),
+          else: {:ok, value}
+      end
+    else
+      {:ok, value}
+    end
+  end
+
+  # A limit's leases are keyed by the logical shard their holder claimed on, so
+  # those shards must exist in the target.
+  defp leases_fit(leases, shard_count) do
+    case Enum.find(leases, fn {_scope, shard_id} -> shard_id >= shard_count end) do
+      nil ->
+        :ok
+
+      {scope, shard_id} ->
+        {:error, {:limit_lease_shard_out_of_range, scope, shard_id, shard_count}}
+    end
+  end
+
+  defp register_governance(ctx, key, value) do
+    cond do
+      Keys.governance_circuit_key?(key) ->
+        Catalog.register(ctx, :circuit, key)
+
+      Keys.governance_budget_key?(key) ->
+        Catalog.register(ctx, :budget, key)
+
+      Keys.governance_limit_key?(key) ->
+        Catalog.register(ctx, :limit, key)
+
+      Keys.governance_approval_key?(key) ->
+        with {:ok, {:flow_governance_approval_v1, %Approval{} = approval}} <-
+               TermCodec.decode(value),
+             :ok <- Catalog.register(ctx, :approval, key),
+             :ok <-
+               Catalog.register_key(
+                 ctx,
+                 Keys.governance_approval_scope_catalog_key(approval.scope),
+                 key
+               ) do
+          Catalog.register_key(
+            ctx,
+            Keys.governance_approval_flow_catalog_key(approval.flow_id),
+            key
+          )
+        else
+          {:error, _reason} = error -> error
+          _invalid -> {:error, :invalid_approval_record}
+        end
+
+      true ->
+        :ok
     end
   end
 
@@ -737,6 +984,10 @@ defmodule Ferricstore.Flow.Transfer do
 
       {kind, key, value} ->
         with {:ok, key} <- Retag.key(key, from, to), do: {:ok, {kind, key, value}}
+
+      {:owned, key, value, expire_at_ms} ->
+        with {:ok, key} <- Retag.key(key, from, to),
+             do: {:ok, {:owned, key, value, expire_at_ms}}
     end)
   end
 
@@ -805,7 +1056,8 @@ defmodule Ferricstore.Flow.Transfer do
     end
   end
 
-  # Checks the whole file before a restore writes anything.
+  # Checks the whole file before a restore writes anything, and lists the
+  # logical shards the file's limit leases are on.
   defp verify(path) do
     case File.open(path, [:read, :binary], &verify_frames/1) do
       {:ok, result} -> result
@@ -817,39 +1069,56 @@ defmodule Ferricstore.Flow.Transfer do
     with :ok <- read_magic(io),
          {:ok, {:header, %{version: @version, data_format: format} = header}, frame}
          when format in [1, 2] <- read_frame(io) do
-      verify_frames(io, header, :crypto.hash_update(:crypto.hash_init(:sha256), frame), %{})
+      verify_frames(io, header, :crypto.hash_update(:crypto.hash_init(:sha256), frame), %{}, [])
     else
       {:ok, _other, _frame} -> {:error, :unsupported_flow_export}
       {:error, _reason} = error -> error
     end
   end
 
-  defp verify_frames(io, header, hash, counts) do
+  defp verify_frames(io, header, hash, counts, leases) do
     case read_frame(io) do
       {:ok, {:trailer, %{sha256: sha256} = trailer}, _frame} ->
-        expected = Map.take(trailer, [:flows, :shared_values, :policies])
+        expected = Map.take(trailer, [:flows, :shared_values, :policies, :governance])
 
         cond do
           :crypto.hash_final(hash) != sha256 ->
             {:error, :corrupt_flow_export}
 
-          Map.merge(%{flows: 0, shared_values: 0, policies: 0}, counts) != expected ->
+          Map.merge(%{flows: 0, shared_values: 0, policies: 0, governance: 0}, counts) !=
+              expected ->
             {:error, :corrupt_flow_export}
 
           IO.binread(io, 1) != :eof ->
             {:error, :corrupt_flow_export}
 
           true ->
-            {:ok, header}
+            {:ok, header, leases}
         end
 
       {:ok, term, frame} ->
-        verify_frames(io, header, :crypto.hash_update(hash, frame), count_frame(counts, term))
+        with {:ok, leases} <- frame_leases(term, leases) do
+          hash = :crypto.hash_update(hash, frame)
+          verify_frames(io, header, hash, count_frame(counts, term), leases)
+        end
 
       error ->
         error
     end
   end
+
+  defp frame_leases({:governance, key, value, _expire_at_ms}, leases) do
+    if Keys.governance_limit_key?(key) do
+      case LimitRecord.decode_owner(value) do
+        {:ok, owner} -> {:ok, Enum.map(Map.keys(owner.leases), &{owner.scope, &1}) ++ leases}
+        {:error, _reason} -> {:error, {:corrupt_limit_record, key}}
+      end
+    else
+      {:ok, leases}
+    end
+  end
+
+  defp frame_leases(_term, leases), do: {:ok, leases}
 
   defp count_frame(counts, {:flow, _bundle}), do: Map.update(counts, :flows, 1, &(&1 + 1))
 
@@ -858,6 +1127,9 @@ defmodule Ferricstore.Flow.Transfer do
 
   defp count_frame(counts, {:policy, _type, _policy}),
     do: Map.update(counts, :policies, 1, &(&1 + 1))
+
+  defp count_frame(counts, {:governance, _key, _value, _expire_at_ms}),
+    do: Map.update(counts, :governance, 1, &(&1 + 1))
 
   defp count_frame(counts, _other), do: Map.update(counts, :unknown, 1, &(&1 + 1))
 end

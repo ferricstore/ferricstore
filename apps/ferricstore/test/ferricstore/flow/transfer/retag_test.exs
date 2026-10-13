@@ -36,6 +36,29 @@ defmodule Ferricstore.Flow.Transfer.RetagTest do
     end
   end
 
+  defp governance_keys do
+    [
+      Keys.governance_circuit_key("scope-1"),
+      Keys.governance_budget_key("scope-1"),
+      Keys.governance_limit_key("flow-running:abc"),
+      Keys.governance_approval_key("approval-1"),
+      Keys.governance_scope_key("scope-1"),
+      Keys.governance_limit_reservation_key("scope-1", 2, 7, "flr1:7:batch:1"),
+      Keys.governance_limit_reservation_page_key("scope-1", 2, 7, 3),
+      Keys.governance_limit_cleanup_key("scope-1", 9),
+      Keys.governance_effect_key("run-1", "send", "tenant-a"),
+      Keys.governance_ledger_index_key("run-1", "tenant-a")
+    ]
+  end
+
+  test "format 1 governance keys retag to the keys format 2 derives, digests inside included" do
+    legacy = in_format(1, &governance_keys/0)
+    expected = in_format(2, &governance_keys/0)
+
+    assert Enum.map(legacy, &Retag.governance_key(&1, 1, 2)) == Enum.map(expected, &{:ok, &1})
+    assert Enum.map(legacy, &Retag.governance_key(&1, 1, 1)) == Enum.map(legacy, &{:ok, &1})
+  end
+
   test "keys stay as they are within one format" do
     key = in_format(1, fn -> Keys.state_key("run-1", "tenant-a") end)
     assert Retag.key(key, 1, 1) == {:ok, key}

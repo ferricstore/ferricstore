@@ -9,10 +9,10 @@ All notable changes to FerricStore will be documented here.
   data directories keep full digests (data format 1) and run unchanged; every
   member of a cluster must use the same data format.
 - `FerricStore.flow_export/2` and `FerricStore.flow_restore/2` copy a store's
-  Flow runs (with values and history), shared values and policies through a
-  file into an empty store, writing the target's data format; this is how a
-  format 1 cluster moves to format 2. Plain keys and governance state are not
-  exported.
+  Flow runs (with values and history), shared values, policies and governance
+  state (circuits, budgets, limits, approvals, effects, ledgers) through a file
+  into an empty store, writing the target's data format; this is how a format 1
+  cluster moves to format 2. Plain keys are not exported.
 - A shard whose Flow LMDB flush failed leaves the degraded state on its own once
   a retry succeeds and a reconcile finds it healthy. Before, it stayed degraded
   (and refused Flow queries and history reads) until a doctor repair, restart

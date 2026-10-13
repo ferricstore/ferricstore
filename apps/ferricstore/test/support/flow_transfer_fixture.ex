@@ -169,6 +169,142 @@ defmodule Ferricstore.Test.FlowTransferFixture do
     :ok = fun.(job)
   end
 
+  # Governance state of every stored kind: a running limit held by a claimed
+  # run with an effect and ledger, a completed run that gave its slot back, a
+  # circuit, a budget reservation, a standalone limit with spent reservations
+  # and an approval.
+  @spec build_governance!(FerricStore.Instance.t(), binary(), integer()) :: map()
+  def build_governance!(ctx, prefix, now_ms) do
+    pk = prefix <> ":gov-tenant"
+    type = prefix <> ".governed"
+    id = &(prefix <> ":" <> &1)
+
+    {:ok, _} =
+      Impl.flow_policy_set(ctx, type,
+        governance: %{effects: %{allowed: ["email.send"]}, limits: %{"running" => %{limit: 3}}}
+      )
+
+    for name <- ["gov-running", "gov-done"] do
+      :ok =
+        Impl.flow_create(ctx, id.(name),
+          type: type,
+          state: "queued",
+          partition_key: pk,
+          payload: name,
+          now_ms: now_ms
+        )
+    end
+
+    {:ok, jobs} =
+      Impl.flow_claim_due(ctx, type,
+        state: "queued",
+        worker: "fixture-worker",
+        lease_ms: 600_000,
+        partition_key: pk,
+        limit: 2,
+        now_ms: now_ms + 1
+      )
+
+    running = Enum.find(jobs, &(&1.id == id.("gov-running"))) || raise "claim missed run"
+    done = Enum.find(jobs, &(&1.id == id.("gov-done"))) || raise "claim missed run"
+
+    {:ok, _effect} =
+      Impl.flow_effect_reserve(ctx, running.id, "send", "email.send",
+        partition_key: pk,
+        lease_token: running.lease_token,
+        fencing_token: running.fencing_token,
+        operation_digest: "digest-1",
+        idempotency_key: "idempotency-1",
+        now_ms: now_ms + 2
+      )
+
+    :ok =
+      Impl.flow_complete(ctx, done.id, done.lease_token,
+        partition_key: pk,
+        fencing_token: done.fencing_token,
+        result: "done"
+      )
+
+    {:ok, _circuit} =
+      Impl.flow_circuit_open(ctx, prefix <> "-circuit",
+        failure_threshold: 1,
+        open_ms: 3_600_000,
+        now_ms: now_ms
+      )
+
+    {:ok, budget} =
+      Impl.flow_budget_reserve(ctx, prefix <> "-budget", 2,
+        limit: 10,
+        window_ms: 3_600_000,
+        now_ms: now_ms
+      )
+
+    {:ok, _lease} =
+      Impl.flow_limit_lease(ctx, prefix <> "-limit",
+        shard_id: 0,
+        amount: 3,
+        limit: 5,
+        ttl_ms: 3_600_000,
+        now_ms: now_ms
+      )
+
+    {:ok, %{reservation_ids: spent}} =
+      Impl.flow_limit_spend(ctx, prefix <> "-limit", shard_id: 0, amount: 2, now_ms: now_ms + 1)
+
+    {:ok, _approval} =
+      Impl.flow_approval_request(ctx, prefix <> "-approval",
+        flow_id: running.id,
+        scope: prefix <> "-approval-scope",
+        now_ms: now_ms
+      )
+
+    %{
+      now_ms: now_ms,
+      partition_key: pk,
+      type: type,
+      running: running,
+      done: done,
+      circuit: prefix <> "-circuit",
+      budget: prefix <> "-budget",
+      budget_reservation: budget.reservation_id,
+      limit: prefix <> "-limit",
+      limit_reservations: spent,
+      approval: prefix <> "-approval",
+      approval_scope: prefix <> "-approval-scope"
+    }
+  end
+
+  @doc false
+  def running_limit_scope(type),
+    do: "flow-running:" <> Base.url_encode64(:crypto.hash(:sha256, type), padding: false)
+
+  @doc "Everything a client can observe about the governance fixture's state."
+  def governance_snapshot(ctx, gov) do
+    at = [now_ms: gov.now_ms + 10]
+    pk = [partition_key: gov.partition_key]
+    run_ids = [gov.running.id, gov.done.id]
+    scopes = [gov.limit, running_limit_scope(gov.type)]
+
+    %{
+      runs:
+        Map.new(run_ids, fn id ->
+          {:ok, record} = Impl.flow_get(ctx, id, pk)
+          {:ok, ledger} = Impl.flow_governance_ledger(ctx, id, pk)
+          {id, %{record: record, ledger: ledger}}
+        end),
+      effect: Impl.flow_effect_get(ctx, gov.running.id, "send", pk),
+      circuit: Impl.flow_circuit_get(ctx, gov.circuit),
+      circuits: Impl.flow_circuit_list(ctx),
+      budget: Impl.flow_budget_get(ctx, gov.budget, at),
+      budgets: Impl.flow_budget_list(ctx),
+      limits: Map.new(scopes, &{&1, Impl.flow_limit_get(ctx, &1, at)}),
+      limit_list: Impl.flow_limit_list(ctx, at),
+      approval: Impl.flow_approval_get(ctx, gov.approval),
+      approvals_by_scope: Impl.flow_approval_list(ctx, scope: gov.approval_scope),
+      approvals_by_flow: Impl.flow_approval_list(ctx, flow_id: gov.running.id)
+    }
+  end
+
   @doc "Everything a client can observe about the manifest's data."
   def snapshot(ctx, %{flows: flows, types: types, shared_refs: shared_refs} = manifest) do
     # History reads need the LMDB projection caught up with recent writes and

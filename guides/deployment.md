@@ -458,12 +458,15 @@ cluster:
 
 6. Point the applications at the new cluster.
 
-Both calls return `{:ok, %{flows: n, shared_values: n, policies: n}}`.
+Both calls return `{:ok, %{flows: n, shared_values: n, policies: n, governance: n}}`.
 
 What moves: every run, schedules included, with its id, type, state, version,
 attempts, lease, timestamps, values, history and signal idempotency keys; the
-standalone shared values; the type policies. A worker holding a lease from the
-old cluster can finish its run on the new one.
+standalone shared values; the type policies; governance state: circuits,
+budgets with their reservations, limits with their leases and reservations,
+approvals, and each run's effects and governance ledger. A worker holding a
+lease from the old cluster can finish its run on the new one, and its effects
+and its running-limit slot carry over with it.
 
 What to know:
 
@@ -472,10 +475,17 @@ What to know:
 - Value refs encode the key layout, so they change. Refs stored inside runs are
   rewritten; refs an application kept from `flow_get` or `flow_value_put`
   point at the old cluster.
-- Policy generations start over.
-- The export refuses Flow data it cannot carry yet (governance state such as
-  circuits, budgets, limits, effects and approvals; invocation catalogs; a
-  policy migration in progress) and names sample keys.
+- Policy generations start over. A running limit (`limits: %{"running" => ...}`
+  in a policy) picks up the new cluster's policy on its next claim.
+- Limit-cache sessions belong to the old cluster's nodes and are not carried.
+  Credit a node had prefetched but not used returns when its lease expires.
+- The export waits for limit releases that finished runs queued and refuses if
+  they are still pending after about 20 seconds; run it again once they drain.
+- The restore refuses, before writing anything, a file with a limit lease on a
+  logical shard the new cluster does not have (a new cluster with fewer
+  shards).
+- The export refuses Flow data it cannot carry (for example a policy migration
+  in progress) and names sample keys.
 - The restore checks the file's checksum before writing anything and refuses a
   cluster that already holds Flow data. If a restore stops partway, start the
   new cluster again on empty data directories and rerun it; the export file is

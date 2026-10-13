@@ -27,6 +27,41 @@ defmodule Ferricstore.Flow.Transfer.Retag do
   def key(key, 1, 2) when is_binary(key), do: {:ok, key}
   def key(key, 2, 1) when is_binary(key), do: {:error, {:cannot_restore_into_format_1, key}}
 
+  @doc false
+  # Governance keys carry the format's digest in their partition tag, and limit
+  # storage keys also in the scope digest after `limit-storage:` and, for a
+  # reservation, in the trailing digest of its id.
+  @spec governance_key(binary(), 1 | 2, 1 | 2) :: {:ok, binary()} | {:error, term()}
+  def governance_key(key, format, format) when is_binary(key), do: {:ok, key}
+
+  def governance_key(key, from, to) when is_binary(key) do
+    with {:ok, tagged} <- key(key, from, to) do
+      case :binary.split(tagged, "}:gov:limit-storage:") do
+        [tag, storage] -> limit_storage_key(tag <> "}:gov:limit-storage:", storage, key)
+        [_other] -> {:ok, tagged}
+      end
+    end
+  end
+
+  defp limit_storage_key(prefix, storage, source_key) do
+    with [scope_digest, rest] <- :binary.split(storage, ":"),
+         {:ok, scope_digest} <- Digest.convert_legacy(scope_digest),
+         {:ok, rest} <- limit_storage_rest(rest) do
+      {:ok, prefix <> scope_digest <> ":" <> rest}
+    else
+      _invalid -> {:error, {:not_a_format_1_key, source_key}}
+    end
+  end
+
+  defp limit_storage_rest("reservation:" <> rest) do
+    with [shard_id, epoch, id_digest] <- :binary.split(rest, ":", [:global]),
+         {:ok, id_digest} <- Digest.convert_legacy(id_digest) do
+      {:ok, "reservation:" <> shard_id <> ":" <> epoch <> ":" <> id_digest}
+    end
+  end
+
+  defp limit_storage_rest(rest), do: {:ok, rest}
+
   @spec record(map(), 1 | 2, 1 | 2) :: {:ok, map()} | {:error, term()}
   def record(record, format, format) when is_map(record), do: {:ok, record}
 
