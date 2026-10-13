@@ -438,6 +438,22 @@ bin/ferricstore rpc 'IO.inspect(FerricStore.raise_cluster_feature_level(1))'
 # {:ok, %{supported: 1, active: 1, shards: [1, 1, 1, 1]}}
 ```
 
+The same from a client (both commands need the `@admin` ACL category, and
+`CLUSTER.FEATURES.RAISE` also `@dangerous`):
+
+```text
+> CLUSTER.FEATURES
+supported: 1
+active: 0
+shard_0: 0
+...
+> CLUSTER.FEATURES.RAISE 1
+supported: 1
+active: 1
+shard_0: 1
+...
+```
+
 - The raise checks every member first. If a node still runs an older release it
   returns `{:error, {:members_below_feature_level, level, [{node, supported}]}}`;
   if a node is unreachable it returns `{:error, {:feature_level_probe_failed, ...}}`.

@@ -8,7 +8,9 @@ All notable changes to FerricStore will be documented here.
   `FerricStore.raise_cluster_feature_level/1` raises the level after a rolling
   upgrade; the raise requires every member to support the level, levels never
   go down, and nodes below the active level cannot join. Level 1 is the first
-  level; see the deployment guide.
+  level; see the deployment guide. `CLUSTER.FEATURES` and
+  `CLUSTER.FEATURES.RAISE <level>` (native opcodes 0x0311 and 0x0312) do the
+  same from a client.
 - At feature level 1, `flow_policy_set(type, replace: true, ...)` repairs a corrupt
   Flow policy row (unreadable or stored under another type) on every shard,
   at a generation above any the type used before.

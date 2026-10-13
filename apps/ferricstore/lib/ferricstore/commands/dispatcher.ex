@@ -69,7 +69,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   @tdigest_rmw_commands ~w(TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.MERGE)
   @native_raw_commands ~w(CAS LOCK UNLOCK EXTEND RATELIMIT.ADD KEY_INFO FERRICSTORE.KEY_INFO FETCH_OR_COMPUTE FETCH_OR_COMPUTE_RESULT FETCH_OR_COMPUTE_ERROR)
   @management_raw_commands ~w(ACL FERRICSTORE.CAPABILITIES FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FERRICSTORE.TELEMETRY)
-  @cluster_raw_commands ~w(CLUSTER.HEALTH CLUSTER.STATS CLUSTER.KEYSLOT CLUSTER.SLOTS CLUSTER.STATUS CLUSTER.JOIN CLUSTER.LEAVE CLUSTER.FAILOVER CLUSTER.PROMOTE CLUSTER.DEMOTE CLUSTER.ROLE FERRICSTORE.HOTNESS)
+  @cluster_raw_commands ~w(CLUSTER.HEALTH CLUSTER.STATS CLUSTER.KEYSLOT CLUSTER.SLOTS CLUSTER.STATUS CLUSTER.JOIN CLUSTER.LEAVE CLUSTER.FAILOVER CLUSTER.PROMOTE CLUSTER.DEMOTE CLUSTER.ROLE CLUSTER.FEATURES CLUSTER.FEATURES.RAISE FERRICSTORE.HOTNESS)
   @invocation_raw_commands ~w(
     INVOCATION.DEFINITION.PUT INVOCATION.DEFINITION.GET INVOCATION.DEFINITION.LIST
     INVOCATION.CREATE INVOCATION.GET INVOCATION.PARTITION.LIST
@@ -548,7 +548,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _args} = ast, store)
-      when tag in ~w(cluster_health cluster_stats cluster_keyslot cluster_slots cluster_status cluster_join cluster_leave cluster_failover cluster_promote cluster_demote cluster_role ferricstore_hotness)a,
+      when tag in ~w(cluster_health cluster_stats cluster_keyslot cluster_slots cluster_status cluster_join cluster_leave cluster_failover cluster_promote cluster_demote cluster_role cluster_features cluster_features_raise ferricstore_hotness)a,
       do: Cluster.handle(ast_command_name(tag), ast_args(ast), store)
 
   def dispatch_ast({:ferricstore_config, args}, store),
@@ -712,6 +712,8 @@ defmodule Ferricstore.Commands.Dispatcher do
   defp ast_command_name(:cluster_promote), do: "CLUSTER.PROMOTE"
   defp ast_command_name(:cluster_demote), do: "CLUSTER.DEMOTE"
   defp ast_command_name(:cluster_role), do: "CLUSTER.ROLE"
+  defp ast_command_name(:cluster_features), do: "CLUSTER.FEATURES"
+  defp ast_command_name(:cluster_features_raise), do: "CLUSTER.FEATURES.RAISE"
   defp ast_command_name(:ferricstore_hotness), do: "FERRICSTORE.HOTNESS"
   defp ast_command_name(:invocation_definition_put), do: "INVOCATION.DEFINITION.PUT"
   defp ast_command_name(:invocation_definition_get), do: "INVOCATION.DEFINITION.GET"

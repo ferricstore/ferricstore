@@ -3,6 +3,7 @@ defmodule Ferricstore.Cluster.FeatureLevelTest do
   @moduletag :global_state
 
   alias Ferricstore.Cluster.FeatureLevel
+  alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.Flow.InternalKey
   alias Ferricstore.Test.ShardHelpers
 
@@ -32,6 +33,40 @@ defmodule Ferricstore.Cluster.FeatureLevelTest do
   test "the public API raises the level" do
     assert {:ok, %{active: 1}} = FerricStore.raise_cluster_feature_level(1)
     assert {:ok, %{active: 1}} = FerricStore.cluster_feature_level()
+  end
+
+  test "CLUSTER.FEATURES reports the levels and CLUSTER.FEATURES.RAISE raises them", %{ctx: ctx} do
+    zeros = Enum.map_join(0..(ctx.shard_count - 1), fn i -> "\r\nshard_#{i}: 0" end)
+    ones = String.replace(zeros, ": 0", ": 1")
+    supported = "supported: #{FeatureLevel.supported()}\r\n"
+
+    assert Dispatcher.dispatch("CLUSTER.FEATURES", [], ctx) == supported <> "active: 0" <> zeros
+
+    assert Dispatcher.dispatch("CLUSTER.FEATURES.RAISE", ["1"], ctx) ==
+             supported <> "active: 1" <> ones
+
+    assert Dispatcher.dispatch("CLUSTER.FEATURES", [], ctx) == supported <> "active: 1" <> ones
+    assert {:ok, %{active: 1}} = FeatureLevel.status(ctx)
+  end
+
+  test "CLUSTER.FEATURES commands reject bad arguments", %{ctx: ctx} do
+    above = Integer.to_string(FeatureLevel.supported() + 1)
+
+    for {command, args} <- [
+          {"CLUSTER.FEATURES", ["extra"]},
+          {"CLUSTER.FEATURES.RAISE", []},
+          {"CLUSTER.FEATURES.RAISE", ["1", "extra"]},
+          {"CLUSTER.FEATURES.RAISE", ["one"]},
+          {"CLUSTER.FEATURES.RAISE", ["0"]},
+          {"CLUSTER.FEATURES.RAISE", [above]}
+        ] do
+      assert {:error, "ERR " <> _message} = Dispatcher.dispatch(command, args, ctx),
+             "#{command} #{inspect(args)} should fail"
+    end
+
+    assert {:error, message} = Dispatcher.dispatch("CLUSTER.FEATURES.RAISE", [above], ctx)
+    assert message =~ "supports up to #{FeatureLevel.supported()}"
+    assert {:ok, %{active: 0}} = FeatureLevel.status(ctx)
   end
 
   test "raising writes the level to every shard, is idempotent and bounded", %{ctx: ctx} do

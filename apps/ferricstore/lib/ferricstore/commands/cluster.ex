@@ -17,6 +17,8 @@ defmodule Ferricstore.Commands.Cluster do
     * `CLUSTER.STATUS` -- returns detailed cluster info: nodes, per-shard
       leader/follower info, roles
     * `CLUSTER.ROLE` -- returns this node's configured cluster role
+    * `CLUSTER.FEATURES` -- returns the highest feature level this release
+      supports, the active level and each shard's level
 
   ### Membership management
 
@@ -26,8 +28,11 @@ defmodule Ferricstore.Commands.Cluster do
       leadership to a specific node
     * `CLUSTER.PROMOTE <node>` -- promotes a replica to voter for all shards
     * `CLUSTER.DEMOTE <node>` -- demotes a voter to replica for all shards
+    * `CLUSTER.FEATURES.RAISE <level>` -- raises the cluster feature level once
+      every member supports it (see `Ferricstore.Cluster.FeatureLevel`)
   """
 
+  alias Ferricstore.Cluster.FeatureLevel
   alias Ferricstore.Cluster.Manager, as: ClusterManager
   alias Ferricstore.Raft.Cluster, as: RaftCluster
   alias Ferricstore.Store.{Router, SlotMap}
@@ -293,6 +298,35 @@ defmodule Ferricstore.Commands.Cluster do
     {:error, "ERR wrong number of arguments for 'cluster.role' command"}
   end
 
+  # -- CLUSTER.FEATURES -------------------------------------------------------
+
+  # Feature levels are cluster-wide state kept by the default instance's shards.
+  def handle("CLUSTER.FEATURES", [], _store) do
+    FerricStore.Instance.get(:default)
+    |> FeatureLevel.status()
+    |> feature_level_reply()
+  end
+
+  def handle("CLUSTER.FEATURES", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'cluster.features' command"}
+  end
+
+  def handle("CLUSTER.FEATURES.RAISE", [level], _store) do
+    case Integer.parse(level) do
+      {level, ""} when level > 0 ->
+        FerricStore.Instance.get(:default)
+        |> FeatureLevel.raise(level)
+        |> feature_level_reply()
+
+      _invalid ->
+        {:error, "ERR feature level must be a positive integer"}
+    end
+  end
+
+  def handle("CLUSTER.FEATURES.RAISE", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'cluster.features.raise' command"}
+  end
+
   # FERRICSTORE.HOTNESS — returns per-prefix hot/cold read statistics.
   # Accepts optional TOP n and WINDOW seconds arguments.
   # Response is a flat list of key-value string pairs:
@@ -527,4 +561,31 @@ defmodule Ferricstore.Commands.Cluster do
   catch
     _, _ -> "unknown"
   end
+
+  defp feature_level_reply({:ok, %{supported: supported, active: active, shards: shards}}) do
+    shard_lines =
+      shards
+      |> Enum.with_index()
+      |> Enum.map(fn {level, index} -> "shard_#{index}: #{level}" end)
+
+    Enum.join(["supported: #{supported}", "active: #{active}" | shard_lines], "\r\n")
+  end
+
+  defp feature_level_reply({:error, {:unsupported_feature_level, level, supported}}),
+    do:
+      {:error,
+       "ERR feature level #{level} is not supported; this release supports up to #{supported}"}
+
+  defp feature_level_reply({:error, {:members_below_feature_level, level, members}}) do
+    below = Enum.map_join(members, ", ", fn {node, supported} -> "#{node} (#{supported})" end)
+    {:error, "ERR members do not support feature level #{level}: #{below}"}
+  end
+
+  defp feature_level_reply({:error, {:feature_level_probe_failed, failures}}) do
+    nodes = Enum.map_join(failures, ", ", fn {node, reason} -> "#{node} (#{inspect(reason)})" end)
+    {:error, "ERR could not check the feature level of members: #{nodes}"}
+  end
+
+  defp feature_level_reply({:error, reason}),
+    do: {:error, "ERR cluster feature level: #{inspect(reason)}"}
 end
