@@ -18,6 +18,11 @@ All notable changes to FerricStore will be documented here.
   circuits, budgets, limits, approvals, effects, ledgers) through a file into an
   empty store, writing the target's data format; this is how a format 1 cluster
   moves to format 2.
+- Custom (embedded, non-Raft) instances now apply every write to a Bloom or
+  cuckoo filter, count-min sketch or top-k. Every write after the first on a key
+  reused the first one's mutation token and was answered from its receipt
+  without being applied, and alternating BF.ADD and BF.MADD paused the shard's
+  writes. The default (Raft) instance was not affected.
 - A shard whose Flow LMDB flush failed leaves the degraded state on its own once
   a retry succeeds and a reconcile finds it healthy. Before, it stayed degraded
   (and refused Flow queries and history reads) until a doctor repair, restart

@@ -952,8 +952,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       # Private: probabilistic data structure helpers
       # ---------------------------------------------------------------------------
 
+      # A sidecar skips a mutation whose token is not above its own, which makes
+      # a replayed Raft entry a no-op. Direct (non-Raft) applies have no log and
+      # nothing replays: they pass index 0, and the native code commits under
+      # the sidecar's token plus one (prob_txn::effective_token).
       defp next_prob_mutation_token(state) do
-        mutation_index = current_ra_index() || Map.get(state, :applied_count, 0) + 1
+        mutation_index =
+          cond do
+            is_integer(index = current_ra_index()) -> index
+            Map.get(state, :prob_local_mutations?, false) -> 0
+            true -> Map.get(state, :applied_count, 0) + 1
+          end
         mutation_ordinal = Process.get(:sm_prob_mutation_ordinal, 0) + 1
 
         if mutation_index in 0..18_446_744_073_709_551_615 and

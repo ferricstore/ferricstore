@@ -569,6 +569,8 @@ fn cuckoo_transactional_mutation(
         header.bucket_size,
         header.fingerprint_size,
     )?;
+    let token =
+        crate::prob_txn::effective_token(file, receipt_path, token, token_offset, file_size)?;
     match crate::prob_txn::begin(file, receipt_path, token, token_offset, file_size)? {
         crate::prob_txn::MutationDecision::Replay(result) => cuckoo_decode_mutation_result(&result),
         crate::prob_txn::MutationDecision::Stale => match mutation {

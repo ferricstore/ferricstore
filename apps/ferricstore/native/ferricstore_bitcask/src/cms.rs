@@ -290,6 +290,13 @@ fn cms_transactional_incrby(
 ) -> Result<Vec<i64>, String> {
     let token_offset = cms_mutation_token_offset(width, depth)?;
     let expected_file_size = cms_file_size(width, depth)?;
+    let token = crate::prob_txn::effective_token(
+        file,
+        receipt_path,
+        token,
+        token_offset,
+        expected_file_size,
+    )?;
 
     match crate::prob_txn::begin(file, receipt_path, token, token_offset, expected_file_size)? {
         crate::prob_txn::MutationDecision::Replay(result) => {
@@ -882,6 +889,16 @@ pub fn cms_file_merge_at(
             Ok(size) => size,
             Err(error) => return Ok((atoms::error(), error).encode(env)),
         };
+        let token = match crate::prob_txn::effective_token(
+            &destination,
+            receipt_path,
+            token,
+            token_offset,
+            file_size,
+        ) {
+            Ok(token) => token,
+            Err(error) => return Ok((atoms::error(), error).encode(env)),
+        };
         match crate::prob_txn::begin(&destination, receipt_path, token, token_offset, file_size) {
             Ok(
                 crate::prob_txn::MutationDecision::Replay(_)
@@ -911,6 +928,16 @@ pub fn cms_file_merge_at(
     };
     let file_size = match cms_file_size(width, depth) {
         Ok(size) => size,
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
+    };
+    let token = match crate::prob_txn::effective_token(
+        destination,
+        receipt_path,
+        token,
+        token_offset,
+        file_size,
+    ) {
+        Ok(token) => token,
         Err(error) => return Ok((atoms::error(), error).encode(env)),
     };
     match crate::prob_txn::begin(destination, receipt_path, token, token_offset, file_size) {

@@ -305,6 +305,8 @@ fn bloom_transactional_madd(
 ) -> Result<Vec<u32>, String> {
     let token_offset = bloom_mutation_token_offset(num_bits)?;
     let file_size = bloom_file_size(num_bits)?;
+    let token =
+        crate::prob_txn::effective_token(file, receipt_path, token, token_offset, file_size)?;
     match crate::prob_txn::begin(file, receipt_path, token, token_offset, file_size)? {
         crate::prob_txn::MutationDecision::Replay(result) => {
             bloom_decode_results(&result, elements.len())
