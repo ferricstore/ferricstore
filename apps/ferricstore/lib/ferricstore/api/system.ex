@@ -13,6 +13,34 @@ defmodule FerricStore.API.System do
   @type zrange_opts :: FerricStore.zrange_opts()
 
   @doc """
+  Writes this store's data to `path`: its keys (strings, hashes, lists, sets,
+  sorted sets and streams, with their expiry) and its Flow data (runs with their
+  values and history, schedules, shared values, policies and governance state).
+  Stop writers first. Refuses data the file cannot carry, such as probabilistic
+  structures, naming sample keys. See `Ferricstore.Flow.Transfer`.
+  """
+  @spec export(Path.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def export(path, opts \\ [])
+
+  def export(path, opts) when is_binary(path) and is_list(opts),
+    do: Ferricstore.Flow.Transfer.export(FerricStore.API.Store.default_ctx(), path, opts)
+
+  def export(_path, _opts), do: {:error, "ERR export needs a file path and a keyword list"}
+
+  @doc """
+  Loads an `export/2` file into this store, which must hold no keys and no Flow
+  data. Flow keys are written in this node's data format, so an export from a
+  data format 1 cluster restores into a format 2 cluster.
+  """
+  @spec restore(Path.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def restore(path, opts \\ [])
+
+  def restore(path, opts) when is_binary(path) and is_list(opts),
+    do: Ferricstore.Flow.Transfer.restore(FerricStore.API.Store.default_ctx(), path, opts)
+
+  def restore(_path, _opts), do: {:error, "ERR restore needs a file path and a keyword list"}
+
+  @doc """
   Executes a sequence of commands atomically as a transaction.
 
   The provided function receives a `FerricStore.Tx` accumulator and should

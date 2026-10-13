@@ -43,9 +43,11 @@ defmodule Ferricstore.Flow.TransferFormatUpgradeTest do
     gov = :erpc.call(ctx.node, FlowTransferFixture, :build_governance!, [source, "xg", now_ms])
     before = :erpc.call(ctx.node, FlowTransferFixture, :snapshot, [source, manifest])
     gov_before = await_governance_snapshot(ctx.node, source, gov)
+    keys_before = build_keys!(ctx.node, source)
     assert {:ok, counts} = :erpc.call(ctx.node, Transfer, :export, [source, ctx.path])
     # The governance fixture adds a running and a finished run.
     assert counts.flows == length(manifest.flows) + length(manifest.schedules) + 2
+    assert counts.keys == map_size(keys_before)
 
     target = :erpc.call(ctx.target, FerricStore.Instance, :get, [:default])
     assert {:ok, ^counts} = :erpc.call(ctx.target, Transfer, :restore, [target, ctx.path])
@@ -66,6 +68,7 @@ defmodule Ferricstore.Flow.TransferFormatUpgradeTest do
       :erpc.call(ctx.target, FlowTransferFixture, :governance_snapshot, [target, gov])
 
     assert gov_restored == gov_before |> reset_running_limit(gov) |> to_format_2()
+    assert read_keys(ctx.target, target) == keys_before
 
     assert {:ok, %{leases: %{0 => %{in_use: 0}}}} =
              :erpc.call(ctx.target, FerricStore.Impl, :flow_limit_release, [
@@ -74,6 +77,44 @@ defmodule Ferricstore.Flow.TransferFormatUpgradeTest do
                [shard_id: 0, reservation_ids: gov.limit_reservations]
              ])
   end
+
+  @key_reads [
+    {"x:string", ["GET", "PEXPIRETIME"]},
+    {"x:hash", ["HGETALL", "PEXPIRETIME"]},
+    {"x:stream", ["XRANGE", "XINFO"]}
+  ]
+
+  # Plain keys carry no format digests; they move as stored, through the target's
+  # replicated writes.
+  defp build_keys!(node, instance) do
+    expire_at = Integer.to_string(System.system_time(:millisecond) + 3_600_000)
+
+    for args <- [
+          ["SET", "x:string", "v", "PXAT", expire_at],
+          ["HSET", "x:hash", "f", "v"],
+          ["PEXPIREAT", "x:hash", expire_at],
+          ["XADD", "x:stream", "1-0", "f", "v"],
+          ["XGROUP", "CREATE", "x:stream", "g", "0"]
+        ] do
+      dispatch(node, instance, args)
+    end
+
+    read_keys(node, instance)
+  end
+
+  defp read_keys(node, instance) do
+    Map.new(@key_reads, fn {key, commands} ->
+      {key,
+       Enum.map(commands, fn
+         "XRANGE" -> dispatch(node, instance, ["XRANGE", key, "-", "+"])
+         "XINFO" -> dispatch(node, instance, ["XINFO", "STREAM", key])
+         command -> dispatch(node, instance, [command, key])
+       end)}
+    end)
+  end
+
+  defp dispatch(node, instance, [command | args]),
+    do: :erpc.call(node, Ferricstore.Commands.Dispatcher, :dispatch, [command, args, instance])
 
   # The fixture's finished run gives its running-limit slot back through the
   # release queue; snapshot once it has.

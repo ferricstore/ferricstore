@@ -436,31 +436,33 @@ A node runs in its data directory's format, and a node in a different format
 cannot join the cluster. The `:data_format` setting only chooses the format of
 a new data directory.
 
-### Moving Flow Data to Format 2
+### Moving Data to Format 2
 
-A format 1 cluster moves to format 2 by copying its Flow data into a new
-cluster:
+A format 1 cluster moves to format 2 by copying its data into a new cluster:
 
 1. Upgrade the old cluster to this release. It keeps running in format 1.
-2. Stop the applications that write Flow data.
+2. Stop the applications that write to it.
 3. Export from any node of the old cluster:
 
    ```bash
-   bin/ferricstore rpc 'IO.inspect(FerricStore.flow_export("/backup/flows.ffx"))'
+   bin/ferricstore rpc 'IO.inspect(FerricStore.export("/backup/store.ffx"))'
    ```
 
 4. Start a new cluster on empty data directories; they are created in format 2.
 5. Restore on any node of the new cluster:
 
    ```bash
-   bin/ferricstore rpc 'IO.inspect(FerricStore.flow_restore("/backup/flows.ffx"))'
+   bin/ferricstore rpc 'IO.inspect(FerricStore.restore("/backup/store.ffx"))'
    ```
 
 6. Point the applications at the new cluster.
 
-Both calls return `{:ok, %{flows: n, shared_values: n, policies: n, governance: n}}`.
+Both calls return
+`{:ok, %{keys: n, flows: n, shared_values: n, policies: n, governance: n}}`.
 
-What moves: every run, schedules included, with its id, type, state, version,
+What moves: every key (strings, bitmaps, HyperLogLogs, t-digests, hashes,
+lists, sets, sorted sets and streams with their consumer groups, pending
+entries and consumers) with its expiry; the invocation definitions; every run, schedules included, with its id, type, state, version,
 attempts, lease, timestamps, values, history and signal idempotency keys; the
 standalone shared values; the type policies; governance state: circuits,
 budgets with their reservations, limits with their leases and reservations,
@@ -470,8 +472,9 @@ and its running-limit slot carry over with it.
 
 What to know:
 
-- Plain keys (strings, hashes, lists, sets, sorted sets, streams and the
-  probabilistic structures) are not part of the export.
+- Probabilistic structures (Bloom and cuckoo filters, count-min sketches,
+  top-k) are not carried yet: the export refuses a store holding them and
+  names sample keys.
 - Value refs encode the key layout, so they change. Refs stored inside runs are
   rewritten; refs an application kept from `flow_get` or `flow_value_put`
   point at the old cluster.
@@ -487,7 +490,7 @@ What to know:
 - The export refuses Flow data it cannot carry (for example a policy migration
   in progress) and names sample keys.
 - The restore checks the file's checksum before writing anything and refuses a
-  cluster that already holds Flow data. If a restore stops partway, start the
+  cluster that already holds keys or Flow data. If a restore stops partway, start the
   new cluster again on empty data directories and rerun it; the export file is
   unchanged and can be restored any number of times.
 

@@ -1,11 +1,14 @@
 defmodule Ferricstore.Flow.Transfer do
   @moduledoc """
-  Copies a store's Flow data through a file.
+  Copies a store's data through a file (`FerricStore.export/2`,
+  `FerricStore.restore/2`).
 
   `export/3` writes every run of a store (its record, values, history, signal
-  idempotency and named-value link rows), its standalone shared values and its
-  type policies. `restore/3` loads such a file into a store that holds no Flow
-  data, writing keys in that store's data format (see `Ferricstore.DataFormat`).
+  idempotency and named-value link rows), its standalone shared values, its
+  type policies, its governance state and its plain keys
+  (`Ferricstore.Flow.Transfer.PlainKeys`). `restore/3` loads such a file into a
+  store that holds no keys and no Flow data, writing Flow keys in that store's
+  data format (see `Ferricstore.DataFormat`).
   A data format 1 cluster moves to format 2 this way: export from it, then
   restore into a new cluster.
 
@@ -24,9 +27,9 @@ defmodule Ferricstore.Flow.Transfer do
   carried; credit they had prefetched returns when its lease expires. An export
   waits for pending limit releases to be applied first.
 
-  Plain (non-Flow) keys are not exported. An export refuses a store holding Flow
-  data it cannot carry (for example a policy migration in progress) instead of
-  leaving it behind. Stop writers first: a run changed while the export reads it
+  An export refuses a store holding data it cannot carry (probabilistic
+  structures; Flow data such as a policy migration in progress) instead of
+  leaving it behind. Stop writers first: data changed while the export reads it
   can be captured mid-change.
   """
 
@@ -53,7 +56,7 @@ defmodule Ferricstore.Flow.Transfer do
   }
 
   alias Ferricstore.Flow.HistoryProjector.KeyCodec
-  alias Ferricstore.Flow.Transfer.Retag
+  alias Ferricstore.Flow.Transfer.{PlainKeys, Retag}
   alias Ferricstore.Store.Router
   alias Ferricstore.TermCodec
 
@@ -86,7 +89,8 @@ defmodule Ferricstore.Flow.Transfer do
           flows: non_neg_integer(),
           shared_values: non_neg_integer(),
           policies: non_neg_integer(),
-          governance: non_neg_integer()
+          governance: non_neg_integer(),
+          keys: non_neg_integer()
         }
 
   @spec export(FerricStore.Instance.t(), Path.t(), keyword()) ::
@@ -96,8 +100,11 @@ defmodule Ferricstore.Flow.Transfer do
          :ok <- repair_degraded_shards(ctx),
          {:ok, scan} <- scan(ctx),
          :ok <- refuse_unsupported(scan),
+         {:ok, key_scan} <- PlainKeys.scan(ctx),
+         :ok <- PlainKeys.refuse_unsupported(key_scan),
          :ok <- retry_transient(fn -> releases_applied(ctx, scan.release_metas) end) do
       partial = path <> ".partial"
+      scan = Map.put(scan, :keys, key_scan.keys)
 
       case File.open(partial, [:write, :binary], &write_export(ctx, &1, scan)) do
         {:ok, {:ok, counts}} ->
@@ -191,12 +198,15 @@ defmodule Ferricstore.Flow.Transfer do
          {:ok, hash, shared} <- write_shared_values(ctx, io, hash, scan.shared),
          {:ok, hash, governance} <- write_governance(ctx, io, hash, governance_rows(scan)),
          {:ok, order} <- run_order(ctx, scan.flows),
-         {:ok, hash, flows} <- write_runs(ctx, io, hash, order, scan) do
+         {:ok, hash, flows} <- write_runs(ctx, io, hash, order, scan),
+         {:ok, hash, keys} <-
+           PlainKeys.write(ctx, scan.keys, hash, &write_frame(io, &1, &2), &key_chunks/1) do
       counts = %{
         flows: flows,
         shared_values: shared,
         policies: policies,
-        governance: governance
+        governance: governance,
+        keys: keys
       }
 
       trailer = Map.put(counts, :sha256, :crypto.hash_final(hash))
@@ -252,6 +262,12 @@ defmodule Ferricstore.Flow.Transfer do
         {:ok, _hash, _count} = ok -> {:cont, ok}
         error -> {:halt, error}
       end
+    end)
+  end
+
+  defp key_chunks(entries) do
+    chunks(entries, %{events: @chunk_events, bytes: @chunk_bytes}, fn {key, value, _expire} ->
+      byte_size(key) + byte_size(value)
     end)
   end
 
@@ -766,16 +782,25 @@ defmodule Ferricstore.Flow.Transfer do
           scan.unsupported
 
       case present do
-        [] -> :ok
+        [] -> no_keys(ctx)
         [key | _rest] -> {:error, {:target_not_empty, key}}
       end
+    end
+  end
+
+  defp no_keys(ctx) do
+    case PlainKeys.first_key(ctx) do
+      {:ok, nil} -> :ok
+      {:ok, key} -> {:error, {:target_not_empty, key}}
+      {:error, _reason} = error -> error
     end
   end
 
   defp restore_frames(ctx, io, conv) do
     with :ok <- read_magic(io),
          {:ok, {:header, _header}, _frame} <- read_frame(io) do
-      restore_frames(ctx, io, conv, %{flows: 0, shared_values: 0, policies: 0, governance: 0})
+      counts = %{flows: 0, shared_values: 0, policies: 0, governance: 0, keys: 0}
+      restore_frames(ctx, io, conv, counts)
     end
   end
 
@@ -806,6 +831,17 @@ defmodule Ferricstore.Flow.Transfer do
       {:ok, {:flow, bundle}, _frame} ->
         with :ok <- restore_run(ctx, bundle, conv),
              do: restore_frames(ctx, io, conv, Map.update!(counts, :flows, &(&1 + 1)))
+
+      {:ok, {:key, _key, _type, _entries} = frame, _frame} ->
+        with :ok <- PlainKeys.restore(ctx, frame),
+             do: restore_frames(ctx, io, conv, Map.update!(counts, :keys, &(&1 + 1)))
+
+      {:ok, {:key, _key, _type, _value, _expire_at_ms} = frame, _frame} ->
+        with :ok <- PlainKeys.restore(ctx, frame),
+             do: restore_frames(ctx, io, conv, Map.update!(counts, :keys, &(&1 + 1)))
+
+      {:ok, {:key_more, _key, _type, _entries} = frame, _frame} ->
+        with :ok <- PlainKeys.restore(ctx, frame), do: restore_frames(ctx, io, conv, counts)
 
       {:ok, other, _frame} ->
         {:error, {:unexpected_export_frame, other}}
@@ -1079,13 +1115,13 @@ defmodule Ferricstore.Flow.Transfer do
   defp verify_frames(io, header, hash, counts, leases) do
     case read_frame(io) do
       {:ok, {:trailer, %{sha256: sha256} = trailer}, _frame} ->
-        expected = Map.take(trailer, [:flows, :shared_values, :policies, :governance])
+        expected = Map.take(trailer, [:flows, :shared_values, :policies, :governance, :keys])
 
         cond do
           :crypto.hash_final(hash) != sha256 ->
             {:error, :corrupt_flow_export}
 
-          Map.merge(%{flows: 0, shared_values: 0, policies: 0, governance: 0}, counts) !=
+          Map.merge(%{flows: 0, shared_values: 0, policies: 0, governance: 0, keys: 0}, counts) !=
               expected ->
             {:error, :corrupt_flow_export}
 
@@ -1130,6 +1166,14 @@ defmodule Ferricstore.Flow.Transfer do
 
   defp count_frame(counts, {:governance, _key, _value, _expire_at_ms}),
     do: Map.update(counts, :governance, 1, &(&1 + 1))
+
+  defp count_frame(counts, {:key, _key, "string", _value, _expire_at_ms}),
+    do: Map.update(counts, :keys, 1, &(&1 + 1))
+
+  defp count_frame(counts, {:key, _key, _type, _entries}),
+    do: Map.update(counts, :keys, 1, &(&1 + 1))
+
+  defp count_frame(counts, {:key_more, _key, _type, _entries}), do: counts
 
   defp count_frame(counts, _other), do: Map.update(counts, :unknown, 1, &(&1 + 1))
 end

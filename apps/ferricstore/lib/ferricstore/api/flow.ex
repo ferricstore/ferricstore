@@ -732,36 +732,6 @@ defmodule FerricStore.API.Flow do
 
   def flow_retention_cleanup(_opts), do: {:error, "ERR flow opts must be a keyword list"}
 
-  @doc """
-  Writes this store's Flow data to `path`: every run with its values and
-  history (schedules included), the standalone shared values and the type
-  policies. Stop Flow writers first. Refuses Flow data the file cannot carry
-  (governance state, invocation catalogs, a policy migration in progress).
-  See `Ferricstore.Flow.Transfer`.
-  """
-  @spec flow_export(Path.t(), keyword()) :: {:ok, map()} | {:error, term()}
-  def flow_export(path, opts \\ [])
-
-  def flow_export(path, opts) when is_binary(path) and is_list(opts),
-    do: Ferricstore.Flow.Transfer.export(default_ctx(), path, opts)
-
-  def flow_export(_path, _opts),
-    do: {:error, "ERR flow export needs a file path and a keyword list"}
-
-  @doc """
-  Loads a `flow_export/2` file into this store, which must hold no Flow data.
-  Keys are written in this node's data format, so an export from a data format
-  1 cluster restores into a format 2 cluster.
-  """
-  @spec flow_restore(Path.t(), keyword()) :: {:ok, map()} | {:error, term()}
-  def flow_restore(path, opts \\ [])
-
-  def flow_restore(path, opts) when is_binary(path) and is_list(opts),
-    do: Ferricstore.Flow.Transfer.restore(default_ctx(), path, opts)
-
-  def flow_restore(_path, _opts),
-    do: {:error, "ERR flow restore needs a file path and a keyword list"}
-
   @doc "Rewinds a Flow record to a previous history event without rewriting history."
   @spec flow_rewind(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_rewind(id, opts) when is_binary(id) and is_list(opts) do

@@ -486,6 +486,8 @@ defmodule FerricStore do
   defdelegate echo(message), to: SystemAPI
   @spec flushall() :: :ok | {:error, term()}
   defdelegate flushall(), to: SystemAPI
+  defdelegate export(path, opts \\ []), to: SystemAPI
+  defdelegate restore(path, opts \\ []), to: SystemAPI
   defdelegate pipeline(fun), to: SystemAPI
   defguardeddelegate(batch_get(keys), to: SystemAPI, keys: keys)
   defdelegate packed_batch_get(packed_keys), to: SystemAPI
@@ -539,8 +541,6 @@ defmodule FerricStore do
   defdelegate flow_cancel(id, opts \\ []), to: FlowAPI
   defdelegate flow_cancel_many(partition_key, items, opts \\ []), to: FlowAPI
   defdelegate flow_retention_cleanup(opts \\ []), to: FlowAPI
-  defdelegate flow_export(path, opts \\ []), to: FlowAPI
-  defdelegate flow_restore(path, opts \\ []), to: FlowAPI
   defdelegate flow_rewind(id, opts), to: FlowAPI
   defdelegate flow_list(type, opts \\ []), to: FlowAPI
   defdelegate flow_search(opts \\ []), to: FlowAPI

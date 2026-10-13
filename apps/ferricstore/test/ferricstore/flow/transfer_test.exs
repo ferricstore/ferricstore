@@ -411,8 +411,8 @@ defmodule Ferricstore.Flow.TransferTest do
   end
 
   test "the public API validates its arguments" do
-    assert {:error, _reason} = FerricStore.flow_export(:not_a_path)
-    assert {:error, _reason} = FerricStore.flow_restore("/tmp/x.ffx", :not_opts)
+    assert {:error, _reason} = FerricStore.export(:not_a_path)
+    assert {:error, _reason} = FerricStore.restore("/tmp/x.ffx", :not_opts)
   end
 
   defp await_running_in_use!(instance, gov, scope, in_use) do
