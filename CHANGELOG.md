@@ -13,6 +13,10 @@ All notable changes to FerricStore will be documented here.
   file into an empty store, writing the target's data format; this is how a
   format 1 cluster moves to format 2. Plain keys and governance state are not
   exported.
+- A shard whose Flow LMDB flush failed leaves the degraded state on its own once
+  a retry succeeds and a reconcile finds it healthy. Before, it stayed degraded
+  (and refused Flow queries and history reads) until a doctor repair, restart
+  or FLUSHDB.
 
 ## 0.11.24 - 2026-10-06
 

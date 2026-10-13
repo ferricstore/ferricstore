@@ -959,6 +959,11 @@ defmodule Ferricstore.Flow.LMDBWriter do
           "Flow LMDB writer shard #{state.shard_index} flush failed: #{inspect(reason)}"
         )
 
+        # The pending ops stay queued for the retry. Once a flush succeeds, the
+        # dirty-projection reconcile checks the shard and clears the degraded
+        # flag, which nothing else does while the shard sees no new work.
+        state = %{state | projection_dirty?: true}
+
         state =
           if instance_suspended?(state.instance_name) do
             %{state | timer_ref: nil, suspended?: true}
