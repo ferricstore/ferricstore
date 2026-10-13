@@ -9,17 +9,25 @@ defmodule Ferricstore.Flow.Transfer.PlainKeys do
   # compound batch puts), so the target maintains its own indexes. Keys hold no
   # data-format digests, so they travel unchanged.
   #
+  # Probabilistic structures (Bloom and cuckoo filters, count-min sketches,
+  # top-k) live in per-shard sidecar files: their metadata and sidecar bytes
+  # travel together and the target recreates the sidecar (a :prob_restore Raft
+  # command).
+  #
   # The invocation catalogs are hashes and sets under `f:{f}:invocation:`; the
   # governance catalogs are rebuilt by the Flow restore and are skipped. Any
-  # other key in the Flow keyspace is refused, as are probabilistic structures,
-  # which live in per-shard sidecar files.
+  # other key in the Flow keyspace is refused.
 
   alias Ferricstore.Commands.CompoundSnapshot
+  alias Ferricstore.{DataDir, ProbFile}
   alias Ferricstore.Store.{Ops, Router, TypeRegistry}
 
   @page 1_000
   @unsupported_samples 5
   @collections ~w(hash list set zset stream)
+  @probabilistic %{"bloom" => :bloom, "cms" => :cms, "cuckoo" => :cuckoo, "topk" => :topk}
+  # A sidecar travels in one Raft command; this is the hard value-size ceiling.
+  @max_sidecar_bytes 512 * 1_024 * 1_024
   @invocation_prefix "f:{f}:invocation:"
   @governance_catalog_prefix "f:{flow-governance}:gov:catalog:"
 
@@ -56,7 +64,9 @@ defmodule Ferricstore.Flow.Transfer.PlainKeys do
       "none" ->
         {:cont, {:ok, acc}}
 
-      type when not flow_keyspace? and (type == "string" or type in @collections) ->
+      type
+      when not flow_keyspace? and
+             (type == "string" or type in @collections or is_map_key(@probabilistic, type)) ->
         {:cont, {:ok, %{acc | keys: [{key, type} | acc.keys]}}}
 
       _unsupported ->
@@ -76,8 +86,9 @@ defmodule Ferricstore.Flow.Transfer.PlainKeys do
   # Writes each key as frames through `write_frame` ((hash, term) -> {:ok, hash}):
   # a string as {:key, key, "string", value, expire_at_ms}, a collection as
   # {:key, key, type, entries} followed by {:key_more, key, type, entries} for the
-  # rest of its rows, in the chunks `chunk` splits. Keys gone since the scan are
-  # skipped.
+  # rest of its rows, in the chunks `chunk` splits, and a probabilistic structure
+  # as {:prob, key, type, metadata, sidecar_bytes, expire_at_ms}. Keys gone since
+  # the scan are skipped.
   def write(ctx, keys, hash, write_frame, chunk) do
     Enum.reduce_while(keys, {:ok, hash, 0}, fn {key, type}, {:ok, hash, count} ->
       case write_key(ctx, key, type, hash, write_frame, chunk) do
@@ -94,6 +105,25 @@ defmodule Ferricstore.Flow.Transfer.PlainKeys do
 
       {value, expire_at_ms} when is_binary(value) ->
         with {:ok, hash} <- write_frame.(hash, {:key, key, "string", value, expire_at_ms}),
+             do: {:ok, hash, 1}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp write_key(ctx, key, type, hash, write_frame, _chunk)
+       when is_map_key(@probabilistic, type) do
+    prob_type = Map.fetch!(@probabilistic, type)
+
+    case Ops.get_meta(ctx, key) do
+      nil ->
+        {:ok, hash, 0}
+
+      {metadata, expire_at_ms} when is_binary(metadata) ->
+        with {:ok, bytes} <- read_sidecar(ctx, key, type),
+             {:ok, hash} <-
+               write_frame.(hash, {:prob, key, prob_type, metadata, bytes, expire_at_ms}),
              do: {:ok, hash, 1}
 
       {:error, _reason} = error ->
@@ -143,7 +173,28 @@ defmodule Ferricstore.Flow.Transfer.PlainKeys do
     end
   end
 
+  def restore(ctx, {:prob, key, type, metadata, bytes, expire_at_ms}) do
+    case Router.prob_write(ctx, {:prob_restore, key, type, metadata, bytes, expire_at_ms}) do
+      :ok -> :ok
+      error -> {:error, {:key_restore_failed, key, error}}
+    end
+  end
+
   def restore(_ctx, frame), do: {:error, {:invalid_key_frame, frame}}
+
+  # The sidecar of a quiesced store is complete on disk: mutations publish
+  # through a rename at the apply boundary.
+  defp read_sidecar(ctx, key, type) do
+    ctx.data_dir
+    |> DataDir.shard_data_path(Router.shard_for(ctx, key))
+    |> Path.join("prob")
+    |> ProbFile.path(key, type)
+    |> Ferricstore.FS.read_nofollow(@max_sidecar_bytes)
+    |> case do
+      {:ok, bytes} -> {:ok, bytes}
+      {:error, reason} -> {:error, {:prob_sidecar_read_failed, reason}}
+    end
+  end
 
   # A key the store holds, if any (pages of a scan may be empty).
   @spec first_key(FerricStore.Instance.t(), binary()) :: {:ok, binary() | nil} | {:error, term()}

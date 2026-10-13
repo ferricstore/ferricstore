@@ -27,9 +27,8 @@ defmodule Ferricstore.Flow.Transfer do
   carried; credit they had prefetched returns when its lease expires. An export
   waits for pending limit releases to be applied first.
 
-  An export refuses a store holding data it cannot carry (probabilistic
-  structures; Flow data such as a policy migration in progress) instead of
-  leaving it behind. Stop writers first: data changed while the export reads it
+  An export refuses a store holding data it cannot carry (for example a Flow
+  policy migration in progress) instead of leaving it behind. Stop writers first: data changed while the export reads it
   can be captured mid-change.
   """
 
@@ -843,6 +842,10 @@ defmodule Ferricstore.Flow.Transfer do
       {:ok, {:key_more, _key, _type, _entries} = frame, _frame} ->
         with :ok <- PlainKeys.restore(ctx, frame), do: restore_frames(ctx, io, conv, counts)
 
+      {:ok, {:prob, _key, _type, _metadata, _bytes, _expire_at_ms} = frame, _frame} ->
+        with :ok <- PlainKeys.restore(ctx, frame),
+             do: restore_frames(ctx, io, conv, Map.update!(counts, :keys, &(&1 + 1)))
+
       {:ok, other, _frame} ->
         {:error, {:unexpected_export_frame, other}}
 
@@ -1174,6 +1177,9 @@ defmodule Ferricstore.Flow.Transfer do
     do: Map.update(counts, :keys, 1, &(&1 + 1))
 
   defp count_frame(counts, {:key_more, _key, _type, _entries}), do: counts
+
+  defp count_frame(counts, {:prob, _key, _type, _metadata, _bytes, _expire_at_ms}),
+    do: Map.update(counts, :keys, 1, &(&1 + 1))
 
   defp count_frame(counts, _other), do: Map.update(counts, :unknown, 1, &(&1 + 1))
 end

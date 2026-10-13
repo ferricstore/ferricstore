@@ -2217,6 +2217,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
+      def apply(meta, {:prob_restore, key, type, metadata, bytes, expire_at_ms}, state) do
+        apply_prob_with_time(meta, state, fn ->
+          restore_prob(state, key, type, metadata, bytes, expire_at_ms)
+        end)
+      end
+
       def apply(meta, {:bloom_add, key, element, auto_create_params}, state) do
         apply_prob_with_time(meta, state, fn ->
           path = prob_path(state, key, "bloom")

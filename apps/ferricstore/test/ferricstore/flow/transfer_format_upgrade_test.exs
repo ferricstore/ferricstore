@@ -70,6 +70,10 @@ defmodule Ferricstore.Flow.TransferFormatUpgradeTest do
     assert gov_restored == gov_before |> reset_running_limit(gov) |> to_format_2()
     assert read_keys(ctx.target, target) == keys_before
 
+    # The restored sidecar takes the target's own writes.
+    assert 1 == dispatch(ctx.target, target, ["BF.ADD", "x:bloom", "c"])
+    assert [1, 1, 1] == dispatch(ctx.target, target, ["BF.MEXISTS", "x:bloom", "a", "b", "c"])
+
     assert {:ok, %{leases: %{0 => %{in_use: 0}}}} =
              :erpc.call(ctx.target, FerricStore.Impl, :flow_limit_release, [
                target,
@@ -81,7 +85,8 @@ defmodule Ferricstore.Flow.TransferFormatUpgradeTest do
   @key_reads [
     {"x:string", ["GET", "PEXPIRETIME"]},
     {"x:hash", ["HGETALL", "PEXPIRETIME"]},
-    {"x:stream", ["XRANGE", "XINFO"]}
+    {"x:stream", ["XRANGE", "XINFO"]},
+    {"x:bloom", ["BF.INFO", "BF.MEXISTS"]}
   ]
 
   # Plain keys carry no format digests; they move as stored, through the target's
@@ -94,7 +99,8 @@ defmodule Ferricstore.Flow.TransferFormatUpgradeTest do
           ["HSET", "x:hash", "f", "v"],
           ["PEXPIREAT", "x:hash", expire_at],
           ["XADD", "x:stream", "1-0", "f", "v"],
-          ["XGROUP", "CREATE", "x:stream", "g", "0"]
+          ["XGROUP", "CREATE", "x:stream", "g", "0"],
+          ["BF.MADD", "x:bloom", "a", "b"]
         ] do
       dispatch(node, instance, args)
     end
@@ -108,6 +114,7 @@ defmodule Ferricstore.Flow.TransferFormatUpgradeTest do
        Enum.map(commands, fn
          "XRANGE" -> dispatch(node, instance, ["XRANGE", key, "-", "+"])
          "XINFO" -> dispatch(node, instance, ["XINFO", "STREAM", key])
+         "BF.MEXISTS" -> dispatch(node, instance, ["BF.MEXISTS", key, "a", "b", "c"])
          command -> dispatch(node, instance, [command, key])
        end)}
     end)

@@ -8,8 +8,8 @@ All notable changes to FerricStore will be documented here.
   43), about 1.7 KB less disk and 360 B less keydir memory per flow. Existing
   data directories keep full digests (data format 1) and run unchanged; every
   member of a cluster must use the same data format.
-- `FerricStore.export/2` and `FerricStore.restore/2` copy a store's keys (all
-  types except probabilistic structures, with expiry) and its Flow data (runs
+- `FerricStore.export/2` and `FerricStore.restore/2` copy a store's keys (every
+  type, with expiry) and its Flow data (runs
   with values and history, shared values, policies and governance state:
   circuits, budgets, limits, approvals, effects, ledgers) through a file into an
   empty store, writing the target's data format; this is how a format 1 cluster

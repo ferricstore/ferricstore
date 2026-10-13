@@ -145,11 +145,48 @@ defmodule Ferricstore.Flow.TransferKeysTest do
              ])
   end
 
-  test "export names probabilistic keys it cannot carry yet", ctx do
-    run(ctx.source, "BF.ADD", ["k:bloom", "item"])
+  test "probabilistic structures move with their sidecar contents", ctx do
+    expire_at_ms = System.system_time(:millisecond) + 3_600_000
 
-    assert {:error, {:unsupported_keys, ["k:bloom"]}} = Transfer.export(ctx.source, ctx.path)
-    refute File.exists?(ctx.path)
+    run(ctx.source, "BF.RESERVE", ["k:bloom", "0.01", "1000"])
+    run(ctx.source, "BF.MADD", ["k:bloom", "a", "b", "c"])
+    run(ctx.source, "PEXPIREAT", ["k:bloom", Integer.to_string(expire_at_ms)])
+    run(ctx.source, "CMS.INITBYDIM", ["k:cms", "50", "4"])
+    run(ctx.source, "CMS.INCRBY", ["k:cms", "x", "3", "y", "7"])
+    run(ctx.source, "CF.RESERVE", ["k:cuckoo", "1000"])
+    run(ctx.source, "CF.ADD", ["k:cuckoo", "item"])
+    run(ctx.source, "TOPK.RESERVE", ["k:topk", "3"])
+    run(ctx.source, "TOPK.ADD", ["k:topk", "p", "p", "q", "r", "p"])
+
+    read = fn store ->
+      %{
+        bloom: run(store, "BF.MEXISTS", ["k:bloom", "a", "b", "c", "nope"]),
+        bloom_info: run(store, "BF.INFO", ["k:bloom"]),
+        bloom_expire: run(store, "PEXPIRETIME", ["k:bloom"]),
+        cms: run(store, "CMS.QUERY", ["k:cms", "x", "y", "z"]),
+        cms_info: run(store, "CMS.INFO", ["k:cms"]),
+        cuckoo: run(store, "CF.MEXISTS", ["k:cuckoo", "item", "other"]),
+        cuckoo_info: run(store, "CF.INFO", ["k:cuckoo"]),
+        topk: run(store, "TOPK.LIST", ["k:topk", "WITHCOUNT"]),
+        types: Enum.map(~w(k:bloom k:cms k:cuckoo k:topk), &type(store, &1))
+      }
+    end
+
+    before = read.(ctx.source)
+
+    assert {:ok, %{keys: 4}} = Transfer.export(ctx.source, ctx.path)
+    assert {:ok, %{keys: 4}} = Transfer.restore(ctx.target, ctx.path)
+    assert read.(ctx.target) == before
+
+    # A restored sidecar takes new writes. It must not keep the source's last
+    # mutation token, or this store's writes would look like stale replays.
+    assert 1 == run(ctx.target, "BF.ADD", ["k:bloom", "fresh-item"])
+    assert [1] == run(ctx.target, "BF.MEXISTS", ["k:bloom", "fresh-item"])
+    assert [4] == run(ctx.target, "CMS.INCRBY", ["k:cms", "x", "1"])
+    assert 1 == run(ctx.target, "CF.ADD", ["k:cuckoo", "fresh-item"])
+    assert [1] == run(ctx.target, "CF.MEXISTS", ["k:cuckoo", "fresh-item"])
+    run(ctx.target, "TOPK.ADD", ["k:topk", "q"])
+    assert ["p", 3, "q", 2 | _rest] = run(ctx.target, "TOPK.LIST", ["k:topk", "WITHCOUNT"])
   end
 
   test "restore refuses a store that already holds keys", ctx do

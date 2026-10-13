@@ -1584,6 +1584,59 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         end
       end
 
+      @prob_mutation_token_bytes 16
+
+      # A probabilistic structure copied from another store (FerricStore.restore/2):
+      # its sidecar is created from the exported bytes the way a create makes it
+      # (pending-create file, published at the apply boundary), and its metadata
+      # takes this shard's create token and sidecar path.
+      #
+      # Every sidecar ends with the token of its last applied mutation (16 bytes,
+      # prob_txn.rs), and a mutation whose token is not greater is skipped as a
+      # replay. The source's token would make this shard's writes look stale until
+      # its Raft index caught up, so the restored sidecar starts from token zero.
+      defp restore_prob(state, key, type, encoded_metadata, bytes, expire_at_ms)
+           when type in [:bloom, :cms, :cuckoo, :topk] and is_binary(encoded_metadata) and
+                  is_binary(bytes) and byte_size(bytes) > @prob_mutation_token_bytes and
+                  is_integer(expire_at_ms) and expire_at_ms >= 0 do
+        final_path = prob_canonical_path(state, key, prob_extension(type))
+        create_path = pending_prob_create_path(final_path)
+        body_size = byte_size(bytes) - @prob_mutation_token_bytes
+        <<body::binary-size(^body_size), _source_token::binary>> = bytes
+        bytes = body <> <<0::size(@prob_mutation_token_bytes)-unit(8)>>
+
+        with {:ok, metadata} <- restored_prob_metadata(encoded_metadata, type, final_path),
+             :ok <- ensure_prob_create_allowed(state, key, type, "ERR key exists", create_path),
+             :ok <- ensure_prob_dir(state),
+             :ok <-
+               prob_create_and_fsync(
+                 state,
+                 create_path,
+                 final_path,
+                 NIF.fs_atomic_replace_nofollow(create_path, bytes, byte_size(bytes))
+               ) do
+          put_prob_metadata(state, key, type, metadata, expire_at_ms)
+        end
+      end
+
+      defp restore_prob(_state, _key, _type, _metadata, _bytes, _expire_at_ms),
+        do: {:error, :invalid_prob_restore}
+
+      defp restored_prob_metadata(encoded_metadata, type, final_path) do
+        with {:ok, {tag, metadata} = decoded} when is_atom(tag) and is_map(metadata) <-
+               Ferricstore.TermCodec.decode(encoded_metadata),
+             ^type <- Ferricstore.Commands.ProbType.metadata_type(decoded) do
+          metadata =
+            metadata
+            |> Map.drop([:create_token, :lifecycle_id])
+            |> maybe_replace_prob_metadata_path(final_path)
+
+          {:ok, {tag, metadata}}
+        else
+          _invalid -> {:error, :invalid_prob_restore_metadata}
+        end
+      end
+
       defp bloom_meta_with_path({:bloom_meta, meta}, path) when is_map(meta) do
         {:bloom_meta, Map.put(meta, :path, path)}
       end

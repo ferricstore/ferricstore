@@ -461,8 +461,9 @@ Both calls return
 `{:ok, %{keys: n, flows: n, shared_values: n, policies: n, governance: n}}`.
 
 What moves: every key (strings, bitmaps, HyperLogLogs, t-digests, hashes,
-lists, sets, sorted sets and streams with their consumer groups, pending
-entries and consumers) with its expiry; the invocation definitions; every run, schedules included, with its id, type, state, version,
+lists, sets, sorted sets, streams with their consumer groups, pending entries
+and consumers, Bloom and cuckoo filters, count-min sketches and top-k) with its
+expiry; the invocation definitions; every run, schedules included, with its id, type, state, version,
 attempts, lease, timestamps, values, history and signal idempotency keys; the
 standalone shared values; the type policies; governance state: circuits,
 budgets with their reservations, limits with their leases and reservations,
@@ -472,9 +473,8 @@ and its running-limit slot carry over with it.
 
 What to know:
 
-- Probabilistic structures (Bloom and cuckoo filters, count-min sketches,
-  top-k) are not carried yet: the export refuses a store holding them and
-  names sample keys.
+- A probabilistic structure travels as one replicated command, so it must fit
+  the new cluster's command size limits.
 - Value refs encode the key layout, so they change. Refs stored inside runs are
   rewritten; refs an application kept from `flow_get` or `flow_value_put`
   point at the old cluster.

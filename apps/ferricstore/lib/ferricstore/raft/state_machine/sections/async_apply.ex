@@ -1329,6 +1329,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         end)
       end
 
+      defp apply_single(state, {:prob_restore, key, type, metadata, bytes, expire_at_ms}) do
+        do_prob_command(state, fn ->
+          restore_prob(state, key, type, metadata, bytes, expire_at_ms)
+        end)
+      end
+
       defp apply_single(state, {:bloom_add, key, element, auto_create_params}) do
         do_prob_command(state, fn ->
           path = prob_path(state, key, "bloom")
