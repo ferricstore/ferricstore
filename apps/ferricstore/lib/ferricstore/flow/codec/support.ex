@@ -269,16 +269,97 @@ defmodule Ferricstore.Flow.Codec.Support do
 
   def normalize_history_decoded_meta(_fields), do: []
 
+  # The record sidecar (child groups plus the reserved keys above) is JSON ("J")
+  # in data format 1, which older releases read. Data format 2, which only this
+  # and later releases write, stores it as an Erlang term ("T") with the
+  # reserved keys as small integers: about a third smaller and several times
+  # cheaper to decode. The term is built from what JSON would keep (string keys,
+  # atoms as strings), so both forms decode to the same map; a value JSON cannot
+  # encode takes the JSON path and fails as it always has. An empty sidecar stays
+  # "J{}", which native claims recognize.
+  @sidecar_key_codes %{
+    @record_value_refs_key => 1,
+    @record_attributes_key => 2,
+    @record_indexed_attributes_key => 3,
+    @record_state_meta_key => 4,
+    @record_indexed_state_meta_key => 5,
+    @record_incarnation_key => 6,
+    @record_state_enter_seq_key => 7,
+    @record_governance_limit_key => 8,
+    @record_system_metadata_key => 9,
+    @record_schedule_metadata_key => 10
+  }
+  @sidecar_code_keys Map.new(@sidecar_key_codes, fn {key, code} -> {code, key} end)
+
   def encode_child_groups(groups) when is_map(groups) and map_size(groups) == 0,
     do: Primitives.encode_bin("J{}")
 
   def encode_child_groups(groups) when is_map(groups) do
-    ["J", Jason.encode!(groups)]
+    encoded =
+      with 2 <- Ferricstore.Flow.Digest.format(),
+           {:ok, json_term} <- json_term(groups) do
+        ["T", :erlang.term_to_binary(compact_sidecar_keys(json_term), [:deterministic])]
+      else
+        _json -> ["J", Jason.encode!(groups)]
+      end
+
+    encoded
     |> IO.iodata_to_binary()
     |> Primitives.encode_bin()
   end
 
   def encode_child_groups(_groups), do: Primitives.encode_bin("J{}")
+
+  defp compact_sidecar_keys(groups) do
+    Map.new(groups, fn {key, value} -> {Map.get(@sidecar_key_codes, key, key), value} end)
+  end
+
+  defp expand_sidecar_keys(groups) do
+    Map.new(groups, fn {key, value} -> {Map.get(@sidecar_code_keys, key, key), value} end)
+  end
+
+  # The term Jason.decode!(Jason.encode!(term)) returns, or :error when Jason
+  # would not encode it the same way here (structs, tuples, invalid UTF-8).
+  defp json_term(map) when is_map(map) and not is_struct(map) do
+    Enum.reduce_while(map, {:ok, %{}}, fn {key, value}, {:ok, acc} ->
+      with {:ok, key} <- json_key(key),
+           false <- Map.has_key?(acc, key),
+           {:ok, value} <- json_term(value) do
+        {:cont, {:ok, Map.put(acc, key, value)}}
+      else
+        _invalid -> {:halt, :error}
+      end
+    end)
+  end
+
+  defp json_term(list) when is_list(list) do
+    Enum.reduce_while(list, {:ok, []}, fn value, {:ok, acc} ->
+      case json_term(value) do
+        {:ok, value} -> {:cont, {:ok, [value | acc]}}
+        :error -> {:halt, :error}
+      end
+    end)
+    |> case do
+      {:ok, values} -> {:ok, Enum.reverse(values)}
+      :error -> :error
+    end
+  end
+
+  defp json_term(value) when is_binary(value),
+    do: if(String.valid?(value), do: {:ok, value}, else: :error)
+
+  defp json_term(value) when is_integer(value) or is_float(value), do: {:ok, value}
+  defp json_term(value) when value in [nil, true, false], do: {:ok, value}
+  defp json_term(value) when is_atom(value), do: json_term(Atom.to_string(value))
+  defp json_term(_value), do: :error
+
+  defp json_key(key) when is_binary(key), do: json_term(key)
+
+  defp json_key(key) when is_atom(key) and key not in [nil, true, false],
+    do: json_term(Atom.to_string(key))
+
+  defp json_key(key) when is_integer(key), do: {:ok, Integer.to_string(key)}
+  defp json_key(_key), do: :error
 
   def encode_record_sidecar(record) when is_map(record) do
     child_groups =
@@ -654,6 +735,15 @@ defmodule Ferricstore.Flow.Codec.Support do
 
   def decode_child_groups_payload("J{}"), do: {:ok, %{}}
   def decode_child_groups_payload("J" <> json), do: Jason.decode(json)
+
+  def decode_child_groups_payload("T" <> term) do
+    case :erlang.binary_to_term(term, [:safe]) do
+      groups when is_map(groups) -> {:ok, expand_sidecar_keys(groups)}
+      _invalid -> :error
+    end
+  rescue
+    ArgumentError -> :error
+  end
 
   def decode_child_groups_payload(_unsupported), do: :error
 

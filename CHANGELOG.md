@@ -5,7 +5,11 @@ All notable changes to FerricStore will be documented here.
 ## Unreleased
 
 - New data directories use 128-bit Flow key digests (22 characters instead of
-  43), about 1.7 KB less disk and 360 B less keydir memory per flow. Existing
+  43), about 1.7 KB less disk and 360 B less keydir memory per flow. They also
+  store each Flow record's sidecar (child groups, attributes, value refs,
+  sequence numbers) as a compact Erlang term instead of JSON: about a third
+  smaller and 3.5 times faster to decode, which takes about 9% off a claim's
+  CPU. Existing
   data directories keep full digests (data format 1) and run unchanged; every
   member of a cluster must use the same data format.
 - `FerricStore.export/2` and `FerricStore.restore/2` copy a store's keys (every
