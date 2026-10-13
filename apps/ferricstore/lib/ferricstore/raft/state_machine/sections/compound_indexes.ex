@@ -963,6 +963,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
             Map.get(state, :prob_local_mutations?, false) -> 0
             true -> Map.get(state, :applied_count, 0) + 1
           end
+
         mutation_ordinal = Process.get(:sm_prob_mutation_ordinal, 0) + 1
 
         if mutation_index in 0..18_446_744_073_709_551_615 and
