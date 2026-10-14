@@ -427,7 +427,10 @@ Each data directory records its on-disk format in a `data_format` file.
 
 - **Format 2**, the default for new data directories, keys Flow runs with
   128-bit digests (22 characters). Measured on completed runs, that is about
-  1.7 KB less disk and 360 B less keydir memory per run than format 1.
+  1.7 KB less disk and 360 B less keydir memory per run than format 1. It also
+  stores record sidecars as compact terms and writes Raft log entries in a
+  compact form (Flow entries about 40% smaller), which only releases with
+  format 2 can read.
 - **Format 1** is what data directories created before format 2 use (full
   256-bit digests, 43 characters). They keep it: upgrading the release changes
   nothing on disk.

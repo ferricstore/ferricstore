@@ -73,6 +73,7 @@ pub mod log;
 mod path_open;
 mod prefix_merge;
 pub mod prob_txn;
+mod raft_command_codec;
 mod system_capacity;
 pub mod tdigest;
 pub mod topk;

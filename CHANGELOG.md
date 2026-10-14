@@ -9,7 +9,10 @@ All notable changes to FerricStore will be documented here.
   store each Flow record's sidecar (child groups, attributes, value refs,
   sequence numbers) as a compact Erlang term instead of JSON: about a third
   smaller and 3.5 times faster to decode, which takes about 9% off a claim's
-  CPU. Existing
+  CPU. Their Raft log entries replace repeated atoms and the default apply
+  context with short dictionary references: Flow log entries are about 40%
+  smaller, which shrinks the in-memory log window, replication traffic and log
+  disk. Existing
   data directories keep full digests (data format 1) and run unchanged; every
   member of a cluster must use the same data format.
 - `FerricStore.export/2` and `FerricStore.restore/2` copy a store's keys (every

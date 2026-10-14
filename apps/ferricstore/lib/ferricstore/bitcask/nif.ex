@@ -25,6 +25,13 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec io_uring_available() :: boolean()
   def io_uring_available, do: :erlang.nif_error(:nif_not_loaded)
 
+  # -- Raft log command codec (see Ferricstore.Raft.CommandCodec) --
+  @spec raft_command_compact(binary()) :: {:ok, binary()} | :error
+  def raft_command_compact(_external_term), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec raft_command_expand(binary()) :: {:ok, binary()} | :error
+  def raft_command_expand(_compact), do: :erlang.nif_error(:nif_not_loaded)
+
   # -- Flow native ordered index resource --
   @type flow_index_resource :: reference()
 

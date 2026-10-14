@@ -44,8 +44,8 @@ defmodule Ferricstore.Raft.CommandClockTest do
 
       assert {:ttb, binary} = CommandClock.to_ttb(command)
 
-      assert {^command, %{hlc_ts: {_physical_ms, _logical}, wall_time_ms: wall_time_ms}} =
-               :erlang.binary_to_term(binary)
+      assert {:ok, {^command, %{hlc_ts: {_physical_ms, _logical}, wall_time_ms: wall_time_ms}}} =
+               Ferricstore.Raft.CommandStamp.decode_ttb(binary)
 
       assert is_integer(wall_time_ms)
     end
