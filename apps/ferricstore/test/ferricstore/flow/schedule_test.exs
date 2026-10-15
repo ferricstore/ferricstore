@@ -269,7 +269,7 @@ defmodule Ferricstore.Flow.ScheduleTest do
              )
 
     for {schedule_id, target_id} <- schedule_targets do
-      assert {:ok, %{state: "completed"}} = FerricStore.flow_schedule_get(schedule_id)
+      assert_completed_schedule!(schedule_id)
       assert {:ok, %{id: ^target_id}} = FerricStore.flow_get(target_id)
     end
   end
@@ -1648,7 +1648,14 @@ defmodule Ferricstore.Flow.ScheduleTest do
                count: 10
              )
 
-    assert Enum.map(schedules, & &1.id) == [active_id, completed_id]
+    listed_ids = Enum.map(schedules, & &1.id)
+
+    if listed_ids != [active_id, completed_id] do
+      flunk("""
+      expected [#{active_id}, #{completed_id}], listed #{inspect(listed_ids)}
+      #{schedule_read_diagnostics([active_id, completed_id])}
+      """)
+    end
   end
 
   test "schedule list pages past more candidates than one catalog page" do
@@ -3334,5 +3341,27 @@ defmodule Ferricstore.Flow.ScheduleTest do
     :sys.resume(name)
   catch
     :exit, _reason -> :ok
+  end
+
+  # A just-completed schedule has twice read as missing on CI without a local
+  # repro; on failure, report every layer the read went through.
+  defp assert_completed_schedule!(schedule_id) do
+    case FerricStore.flow_schedule_get(schedule_id) do
+      {:ok, %{state: "completed"} = schedule} ->
+        schedule
+
+      other ->
+        flunk("""
+        expected completed schedule #{schedule_id}, got #{inspect(other)}
+        #{schedule_read_diagnostics([schedule_id])}
+        """)
+    end
+  end
+
+  defp schedule_read_diagnostics(schedule_ids) do
+    Enum.map_join(schedule_ids, "\n", fn schedule_id ->
+      report = Ferricstore.Test.FlowReadDiagnostics.schedule_report(schedule_id)
+      "read diagnostics for #{schedule_id}: #{inspect(report, pretty: true, limit: :infinity)}"
+    end)
   end
 end
