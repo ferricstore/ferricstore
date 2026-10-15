@@ -15,6 +15,13 @@ All notable changes to FerricStore will be documented here.
   at the default 1-in-100 read sampling) to rank above keys never read, so
   eviction could not tell moderately read keys from unread ones. `OBJECT FREQ`
   values grow faster as a result.
+- Fix a Flow LMDB writer stall. When a Flow due more than the hibernation hot
+  window ahead was parked and then changed state (completed, cancelled, fired)
+  before the writer flushed, the batch compared the Flow's active-index reverse
+  row against LMDB instead of the value the batch had just written. Every retry
+  failed with `compare_failed`, so that shard's Flow LMDB projection stopped
+  advancing (degraded mirror; schedule lists and Flow queries reported the
+  catalog unavailable) until restart.
 
 ## 0.11.24 - 2026-10-06
 
