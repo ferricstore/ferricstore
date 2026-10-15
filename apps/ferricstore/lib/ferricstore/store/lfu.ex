@@ -18,7 +18,8 @@ defmodule Ferricstore.Store.LFU do
   1. **Decay**: elapsed = `now_minutes - ldt`. Reduce counter by
      `elapsed / lfu_decay_time`.
   2. **Increment**: probabilistic log increment with probability
-     `1 / (counter * lfu_log_factor + 1)`.
+     `1 / (max(counter - 5, 0) * lfu_log_factor + 1)`, so the first hit on a
+     new key always counts.
   3. **Update ldt** to current minutes.
 
   ## Configuration
@@ -243,8 +244,12 @@ defmodule Ferricstore.Store.LFU do
         counter
       end
 
+    # Redis's LFULogIncr: the odds shrink with the counter above the initial
+    # value, so a new key's first hit always counts.
+    base = max(decayed_counter - @initial_counter, 0)
+
     new_counter =
-      if :rand.uniform() < 1.0 / (decayed_counter * log_factor + 1) do
+      if :rand.uniform() < 1.0 / (base * log_factor + 1) do
         min(decayed_counter + 1, 255)
       else
         decayed_counter

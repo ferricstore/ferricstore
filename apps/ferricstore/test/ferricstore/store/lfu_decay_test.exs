@@ -213,6 +213,26 @@ defmodule Ferricstore.Store.LFUDecayTest do
     end
   end
 
+  describe "LFU.touch increment" do
+    test "the first access of a key at the initial counter always counts, like Redis" do
+      # Redis's LFULogIncr scales the odds by the counter above the initial
+      # value, so a new key's first hit always moves it above unread keys.
+      table = :ets.new(:lfu_first_touch, [:set])
+      ctx = %{lfu_decay_time: 1, lfu_log_factor: 10}
+
+      counters =
+        for i <- 1..50 do
+          packed = LFU.pack(LFU.now_minutes(), LFU.initial_counter())
+          :ets.insert(table, {i, :value, 0, packed})
+          :ok = LFU.touch(ctx, table, i, packed)
+          [{^i, :value, 0, touched}] = :ets.lookup(table, i)
+          LFU.effective_counter(touched)
+        end
+
+      assert Enum.uniq(counters) == [LFU.initial_counter() + 1]
+    end
+  end
+
   # =========================================================================
   # Integration with keydir ETS
   # =========================================================================

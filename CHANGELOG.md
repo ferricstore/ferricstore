@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- LFU counters now increment like Redis's `LFULogIncr`: the odds shrink with the
+  counter above its initial value of 5, so the first read of a new key always
+  counts. Previously a new key needed about 51 counted reads (about 5,100 reads
+  at the default 1-in-100 read sampling) to rank above keys never read, so
+  eviction could not tell moderately read keys from unread ones. `OBJECT FREQ`
+  values grow faster as a result.
+
 ## 0.11.24 - 2026-10-06
 
 - Update Mint to 1.10.2 to address the newly published HTTP response-framing and
