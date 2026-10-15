@@ -120,7 +120,7 @@ defmodule Ferricstore.Raft.ReplaySafeIndex do
   defp with_marker_lock(marker_path, fun) when is_function(fun, 0) do
     lock = {{__MODULE__, marker_path}, self()}
 
-    case :global.trans(lock, fun, [node()]) do
+    case Ferricstore.LocalLock.trans(lock, fun) do
       :aborted -> {:error, :marker_lock_busy}
       result -> result
     end

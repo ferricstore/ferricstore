@@ -862,7 +862,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         # second caller as the same requester and allows reentrant acquisition.
         lock = {{__MODULE__, :segment_projection, root_dir}, self()}
 
-        case :global.trans(lock, fun, [node()]) do
+        case Ferricstore.LocalLock.trans(lock, fun) do
           :aborted -> {:error, :segment_projection_lock_busy}
           result -> result
         end

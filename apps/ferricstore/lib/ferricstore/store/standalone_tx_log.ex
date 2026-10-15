@@ -1177,7 +1177,7 @@ defmodule Ferricstore.Store.StandaloneTxLog do
   defp with_journal_lock(data_dir, fun) when is_function(fun, 0) do
     lock = {{__MODULE__, Path.expand(data_dir)}, self()}
 
-    case :global.trans(lock, fun, [node()]) do
+    case Ferricstore.LocalLock.trans(lock, fun) do
       {:aborted, reason} -> {:error, {:journal_lock_failed, reason}}
       result -> result
     end
