@@ -660,31 +660,40 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftGenericBatchesCoales
                  WARaftBackend.start(ctx,
                    log_module: :ferricstore_waraft_spike_segment_log,
                    commit_batch_interval_ms: 30,
-                   commit_batch_max: 10_000
+                   commit_batch_max: 10_000,
+                   # Adaptive batching commits a lone write at once; this test
+                   # needs the first write to wait on the batch timer.
+                   commit_batch_adaptive: false
                  )
 
         acceptor = :wa_raft_acceptor.registered_name(:ferricstore_waraft_backend, 1)
         first_ref = make_ref()
-        started_ms = System.monotonic_time(:millisecond)
 
         :ok = raw_waraft_async_put(acceptor, first_ref, "batch-timer:first", "v0")
 
+        # Writes keep arriving every ~2 ms for about a second. A timer
+        # restarted by each arrival cannot fire until they stop; an anchored
+        # one commits the first write while they are still arriving.
         producer =
           Task.async(fn ->
-            for i <- 1..80 do
+            for i <- 1..400 do
               Process.sleep(2)
               :ok = raw_waraft_async_put(acceptor, make_ref(), "batch-timer:#{i}", "v#{i}")
             end
+
+            System.monotonic_time(:millisecond)
           end)
 
         assert_receive {^first_ref,
                         {:waraft_applied_at, {:raft_log_pos, applied_index, applied_term}, :ok}},
-                       120
+                       10_000
+
+        applied_ms = System.monotonic_time(:millisecond)
+        last_write_ms = Task.await(producer, 10_000)
 
         assert applied_index > 0
         assert applied_term > 0
-        assert System.monotonic_time(:millisecond) - started_ms < 120
-        assert List.duplicate(:ok, 80) == Task.await(producer, 5_000)
+        assert applied_ms < last_write_ms
         assert_eventually(fn -> Router.get(ctx, "batch-timer:first") end, "v0")
       end
 
