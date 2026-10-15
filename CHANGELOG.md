@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Node-local locks (standalone cross-shard transaction journal, segment and
+  index markers, Flow promotion, segment projection) retry a busy lock within
+  1-8 ms instead of `:global`'s random 0.25-8 s backoff. 48 concurrent journal
+  operations took 1.1-2.3 s against 0.25 s run one by one; they now take about
+  0.26-0.29 s.
 - LFU counters now increment like Redis's `LFULogIncr`: the odds shrink with the
   counter above its initial value of 5, so the first read of a new key always
   counts. Previously a new key needed about 51 counted reads (about 5,100 reads
