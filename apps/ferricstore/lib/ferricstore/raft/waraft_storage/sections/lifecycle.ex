@@ -204,68 +204,341 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
 
       @spec prepare_segment_projection_for_trim(charlist() | binary(), non_neg_integer()) ::
               :ok | {:error, term()}
-      def prepare_segment_projection_for_trim(root_dir, trim_index)
+      def prepare_segment_projection_for_trim(root_dir, trim_index),
+        do: prepare_segment_projection_for_trim(root_dir, trim_index, :none)
+
+      # Called from the segment log's trim/3 inside the Raft commit path, with
+      # the durable log floor as first_index. A trim adopts the newest finished
+      # background checkpoint: up to trim_index when it covers it ({:ok}), or up
+      # to the checkpoint's own position when that still raises the floor
+      # ({:trimmed_to, index}; WARaft lets a trim remove less than asked). With
+      # no usable checkpoint, or one still running, the trim is deferred and
+      # the log keeps its entries. A trim that would run more than the
+      # configured number of entries past the floor, or that came with no
+      # floor, rebuilds the projection synchronously as before.
+      @spec prepare_segment_projection_for_trim(
+              charlist() | binary(),
+              non_neg_integer(),
+              non_neg_integer() | :none
+            ) :: :ok | {:trimmed_to, non_neg_integer()} | :deferred | {:error, term()}
+      def prepare_segment_projection_for_trim(root_dir, trim_index, first_index)
           when is_integer(trim_index) and trim_index >= 0 do
         root_dir = to_path(root_dir)
+        deferrable? = segment_projection_trim_deferrable?(trim_index, first_index)
 
-        with_segment_projection_lock(root_dir, fn ->
-          projection_root = segment_projection_root(root_dir)
+        prepare = fn ->
+          prepare_segment_projection_for_trim_locked(
+            root_dir,
+            trim_index,
+            first_index,
+            deferrable?
+          )
+        end
 
-          case lookup_segment_projection_context(root_dir) do
-            {:ok, context} ->
-              with :ok <- validate_segment_projection_trim_position(context.position, trim_index) do
-                WARaftSegmentReader.with_apply_projection_disk_lock(
-                  context.ctx.data_dir,
-                  context.shard_index,
-                  fn ->
-                    case prepare_segment_projection_from_checkpoint(
-                           root_dir,
-                           projection_root,
-                           context,
-                           trim_index
-                         ) do
-                      :ok ->
-                        :ok
-
-                      :not_available ->
-                        rebuild_segment_projection_for_trim(
-                          root_dir,
-                          projection_root,
-                          context,
-                          trim_index
-                        )
-
-                      {:error, _reason} = error ->
-                        error
-                    end
-                  end
-                )
-              end
-
-            {:error, reason}
-            when reason in [
-                   {:segment_projection_registry_missing, root_dir},
-                   {:segment_projection_context_missing, root_dir}
-                 ] ->
-              # The segment log provider is reused by small WARaft spike storage
-              # modules that do not project Bitcask/keydir data from the log. Only
-              # skip projection prep when no projection/checkpoint files exist.
-              # If any projection state is present, missing registry context is a
-              # production consistency error and trim must fail closed.
-              if segment_projection_files_present?(root_dir) do
-                {:error, reason}
-              else
-                :ok
-              end
-
-            {:error, _reason} = error ->
-              error
+        if deferrable? do
+          case try_segment_projection_lock(root_dir, prepare) do
+            {:ok, result} -> result
+            :busy -> defer_segment_projection_trim(root_dir, trim_index, :checkpoint_running)
           end
-        end)
+        else
+          with_segment_projection_lock(root_dir, prepare)
+        end
       end
 
-      def prepare_segment_projection_for_trim(_root_dir, trim_index),
+      def prepare_segment_projection_for_trim(_root_dir, trim_index, _first_index),
         do: {:error, {:bad_trim_index, trim_index}}
+
+      defp segment_projection_trim_deferrable?(trim_index, first_index)
+           when is_integer(first_index) do
+        max_deferred = segment_projection_trim_max_deferred_entries()
+        max_deferred > 0 and trim_index - first_index <= max_deferred
+      end
+
+      defp segment_projection_trim_deferrable?(_trim_index, _first_index), do: false
+
+      defp segment_projection_trim_max_deferred_entries do
+        case Application.get_env(
+               :ferricstore,
+               :waraft_segment_projection_trim_max_deferred_entries,
+               @default_segment_projection_trim_max_deferred_entries
+             ) do
+          value when is_integer(value) and value >= 0 -> value
+          _ -> @default_segment_projection_trim_max_deferred_entries
+        end
+      end
+
+      defp prepare_segment_projection_for_trim_locked(
+             root_dir,
+             trim_index,
+             first_index,
+             deferrable?
+           ) do
+        projection_root = segment_projection_root(root_dir)
+
+        case lookup_segment_projection_context(root_dir) do
+          {:ok, context} ->
+            with :ok <- validate_segment_projection_trim_position(context.position, trim_index) do
+              WARaftSegmentReader.with_apply_projection_disk_lock(
+                context.ctx.data_dir,
+                context.shard_index,
+                fn ->
+                  prepare_segment_projection_from_context(
+                    root_dir,
+                    projection_root,
+                    context,
+                    {trim_index, first_index},
+                    deferrable?
+                  )
+                end
+              )
+            end
+
+          {:error, reason}
+          when reason in [
+                 {:segment_projection_registry_missing, root_dir},
+                 {:segment_projection_context_missing, root_dir}
+               ] ->
+            # The segment log provider is reused by small WARaft spike storage
+            # modules that do not project Bitcask/keydir data from the log. Only
+            # skip projection prep when no projection/checkpoint files exist.
+            # If any projection state is present, missing registry context is a
+            # production consistency error and trim must fail closed.
+            if segment_projection_files_present?(root_dir) do
+              {:error, reason}
+            else
+              :ok
+            end
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp prepare_segment_projection_from_context(
+             root_dir,
+             projection_root,
+             context,
+             {trim_index, first_index},
+             deferrable?
+           ) do
+        case prepared_segment_projection_relocations(root_dir, context, trim_index, first_index) do
+          {:ok, prepared, adopt_index, relocations} ->
+            result =
+              changing_segment_projection(root_dir, fn ->
+                adopt_segment_projection_checkpoint(
+                  root_dir,
+                  projection_root,
+                  context,
+                  adopt_index,
+                  prepared,
+                  relocations
+                )
+              end)
+
+            cond do
+              result != :ok ->
+                result
+
+              adopt_index == trim_index ->
+                :ok
+
+              true ->
+                # The rest of this trim needs a newer checkpoint.
+                request_segment_projection_checkpoint(context, trim_index)
+                {:trimmed_to, adopt_index}
+            end
+
+          :not_available when deferrable? ->
+            request_segment_projection_checkpoint(context, trim_index)
+            defer_segment_projection_trim(root_dir, trim_index, :no_checkpoint)
+
+          :not_available ->
+            changing_segment_projection(root_dir, fn ->
+              rebuild_segment_projection_for_trim(root_dir, projection_root, context, trim_index)
+            end)
+        end
+      end
+
+      defp request_segment_projection_checkpoint(context, trim_index) do
+        send_storage_info(
+          context.storage_name,
+          {:ferricstore_waraft_segment_projection_checkpoint_wanted, trim_index}
+        )
+      end
+
+      defp changing_segment_projection(root_dir, fun) do
+        fun.()
+      after
+        bump_segment_projection_trim_generation(root_dir)
+      end
+
+      # A prepared checkpoint is adopted up to its own position (at most
+      # trim_index), and only if that raises the log floor and it was cut after
+      # the last trim. Every row the trim moves (in the Raft log or the apply
+      # projection below the adopted index, or in the current projection) then
+      # holds the value the checkpoint wrote for its key.
+      defp prepared_segment_projection_relocations(root_dir, context, trim_index, first_index) do
+        with {:ok, prepared} <- lookup_prepared_segment_projection_checkpoint(root_dir),
+             adopt_index = min(position_index(prepared.position), trim_index),
+             true <- adopt_index == trim_index or adopt_index > first_index,
+             true <- prepared.generation == segment_projection_trim_generation(root_dir),
+             {:ok, relocations} <-
+               collect_prepared_segment_projection_relocations(
+                 context,
+                 prepared.table,
+                 adopt_index
+               ) do
+          {:ok, prepared, adopt_index, relocations}
+        else
+          _unusable -> :not_available
+        end
+      end
+
+      defp collect_prepared_segment_projection_relocations(context, table, trim_index) do
+        keydir = elem(context.ctx.keydir_refs, context.shard_index)
+        now = storage_expiry_cutoff_ms()
+
+        reduce_keydir_rows_while(keydir, [], fn
+          {key, _value, expire_at_ms, _lfu, file_id, _offset, _value_size} = row, acc
+          when is_binary(key) ->
+            cond do
+              not live_expire_at?(expire_at_ms, now) ->
+                {:cont, acc}
+
+              not segment_projection_relocatable_file_id?(file_id, trim_index) ->
+                {:cont, acc}
+
+              true ->
+                case :ets.lookup(table, key) do
+                  [{^key, index, offset, ^expire_at_ms, projected_size}] ->
+                    {:cont, [{index, offset, projected_size, row} | acc]}
+
+                  _missing_or_changed ->
+                    {:halt, {:error, {:segment_projection_checkpoint_missing_key, key, file_id}}}
+                end
+            end
+
+          _row, acc ->
+            {:cont, acc}
+        end)
+        |> case do
+          {:ok, relocations} -> {:ok, relocations}
+          {:error, _reason} = error -> error
+          :unavailable -> {:error, {:segment_keydir_unavailable, context.shard_index}}
+        end
+      rescue
+        # The relocation table died with its storage process.
+        ArgumentError -> {:error, :segment_projection_relocation_table_unavailable}
+      end
+
+      defp adopt_segment_projection_checkpoint(
+             root_dir,
+             projection_root,
+             context,
+             trim_index,
+             prepared,
+             relocations
+           ) do
+        %{ctx: ctx, shard_index: shard_index} = context
+
+        with :ok <- promote_segment_projection_checkpoint(root_dir, projection_root),
+             {:ok, value_pin_relocation_count} <-
+               prepare_segment_value_pins_for_trim(root_dir, ctx, shard_index, trim_index),
+             :ok <-
+               relocate_prepared_segment_projection_rows(
+                 ctx,
+                 shard_index,
+                 projection_root,
+                 relocations
+               ),
+             :ok <- compact_apply_projection_log(root_dir, ctx, shard_index, trim_index),
+             :ok <-
+               prune_apply_projection_cache_after_segment_projection(
+                 ctx,
+                 shard_index,
+                 trim_index,
+                 Enum.map(relocations, fn {index, _offset, _size,
+                                           {key, _, expire_at_ms, _, _, _, _} = row} ->
+                   {index, {{key, nil, expire_at_ms}, row}}
+                 end)
+               ) do
+          forget_prepared_segment_projection_checkpoint(root_dir, prepared)
+
+          emit_segment_projection_trim_checkpoint_reuse(%{
+            shard_index: shard_index,
+            trim_index: trim_index,
+            checkpoint_index: position_index(prepared.position),
+            relocations: length(relocations),
+            value_pin_relocations: value_pin_relocation_count
+          })
+
+          :ok
+        end
+      end
+
+      defp promote_segment_projection_checkpoint(root_dir, projection_root) do
+        checkpoint_root = segment_projection_checkpoint_root(root_dir)
+
+        case :ferricstore_waraft_spike_segment_log.promote_projection(
+               to_charlist(checkpoint_root),
+               to_charlist(projection_root)
+             ) do
+          :ok ->
+            # Only the emptied checkpoint root is left behind.
+            _ = File.rmdir(checkpoint_root)
+            :ok
+
+          {:error, reason} ->
+            {:error, {:promote_segment_projection_checkpoint, reason}}
+        end
+      end
+
+      defp relocate_prepared_segment_projection_rows(_ctx, _shard_index, _projection_root, []),
+        do: :ok
+
+      defp relocate_prepared_segment_projection_rows(
+             ctx,
+             shard_index,
+             projection_root,
+             relocations
+           ) do
+        keydir = elem(ctx.keydir_refs, shard_index)
+
+        with :ok <-
+               maybe_run_segment_projection_before_relocate_hook(
+                 shard_index,
+                 projection_root,
+                 relocations
+               ) do
+          Enum.each(relocations, fn {index, offset, projected_size, row} ->
+            compare_and_relocate_segment_projection_row_sized(
+              keydir,
+              row,
+              index,
+              offset,
+              projected_size
+            )
+          end)
+        end
+      end
+
+      defp defer_segment_projection_trim(root_dir, trim_index, reason) do
+        shard_index =
+          case lookup_segment_projection_context(root_dir) do
+            {:ok, %{shard_index: shard_index}} -> shard_index
+            _missing -> nil
+          end
+
+        :telemetry.execute(
+          [:ferricstore, :waraft, :segment_projection_trim, :deferred],
+          %{},
+          %{shard_index: shard_index, trim_index: trim_index, reason: reason}
+        )
+
+        :deferred
+      catch
+        _, _ -> :deferred
+      end
 
       @doc false
       def __prepare_segment_value_pins_for_trim_for_test__(
@@ -283,70 +556,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
           trim_index,
           page_limit
         )
-      end
-
-      defp prepare_segment_projection_from_checkpoint(
-             root_dir,
-             projection_root,
-             context,
-             trim_index
-           ) do
-        checkpoint_root = segment_projection_checkpoint_root(root_dir)
-
-        with {:ok, projection} <- read_segment_projection_log(checkpoint_root),
-             true <- position_index(projection.position) >= trim_index,
-             {:ok, entries} <- validate_segment_projection_entries(projection),
-             {:ok, relocations} <-
-               segment_projection_checkpoint_relocations(
-                 context.ctx,
-                 context.shard_index,
-                 entries,
-                 trim_index
-               ),
-             :ok <- write_segment_projection(projection_root, projection.position, entries),
-             {:ok, value_pin_relocation_count} <-
-               prepare_segment_value_pins_for_trim(
-                 root_dir,
-                 context.ctx,
-                 context.shard_index,
-                 trim_index
-               ),
-             :ok <-
-               relocate_segment_projection_keydir_from_checkpoint(
-                 context.ctx,
-                 context.shard_index,
-                 projection_root,
-                 relocations
-               ),
-             :ok <-
-               compact_apply_projection_log(
-                 root_dir,
-                 context.ctx,
-                 context.shard_index,
-                 trim_index
-               ),
-             :ok <-
-               prune_apply_projection_cache_after_segment_projection(
-                 context.ctx,
-                 context.shard_index,
-                 trim_index,
-                 relocations
-               ) do
-          emit_segment_projection_trim_checkpoint_reuse(%{
-            shard_index: context.shard_index,
-            trim_index: trim_index,
-            checkpoint_index: position_index(projection.position),
-            relocations: length(relocations),
-            value_pin_relocations: value_pin_relocation_count
-          })
-
-          :ok
-        else
-          {:error, :enoent} -> :not_available
-          false -> :not_available
-          {:error, _reason} = error -> error
-          _other -> :not_available
-        end
       end
 
       defp rebuild_segment_projection_for_trim(root_dir, projection_root, context, trim_index) do
@@ -436,23 +645,53 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
       def read(_command, _position, _handle), do: :ok
 
       @spec info(term(), handle()) :: {:ok, handle()} | :ignore
-      def info(
-            {:ferricstore_waraft_segment_projection_checkpoint_cut, worker, ref, position},
-            handle
-          )
+      # The checkpoint cut: hand the task this position and apply nothing until
+      # it has copied the keydir, so the copy is exactly the state here.
+      def info({:ferricstore_waraft_segment_projection_checkpoint_cut, worker, ref}, handle)
           when is_pid(worker) and is_reference(ref) do
-        result =
-          case Map.get(handle, :segment_projection_checkpoint) do
-            %{ref: ^ref, position: ^position} ->
-              if handle.position == position, do: :ok, else: :stale
+        case Map.get(handle, :segment_projection_checkpoint) do
+          %{ref: ^ref} ->
+            # A task that dies mid-copy must not hold applies for the timeout.
+            monitor = Process.monitor(worker)
 
-            _other ->
-              :stale
-          end
+            send(
+              worker,
+              {:ferricstore_waraft_segment_projection_checkpoint_cut, ref,
+               {:cut, handle.position, self()}}
+            )
 
-        send(worker, {:ferricstore_waraft_segment_projection_checkpoint_cut, ref, result})
+            result =
+              receive do
+                {:ferricstore_waraft_segment_projection_checkpoint_cut_copied, ^ref} -> :confirmed
+                {:DOWN, ^monitor, :process, ^worker, _reason} -> :expired
+              after
+                @segment_projection_cut_timeout_ms -> :expired
+              end
+
+            Process.demonitor(monitor, [:flush])
+            send(worker, {:ferricstore_waraft_segment_projection_checkpoint_cut, ref, result})
+
+          _other ->
+            send(worker, {:ferricstore_waraft_segment_projection_checkpoint_cut, ref, :stale})
+        end
+
         {:ok, handle}
       end
+
+      # A copy that finished after storage stopped waiting for it.
+      def info({:ferricstore_waraft_segment_projection_checkpoint_cut_copied, _ref}, handle),
+        do: {:ok, handle}
+
+      # A trim deferred for lack of a usable checkpoint.
+      def info({:ferricstore_waraft_segment_projection_checkpoint_wanted, _trim_index}, handle) do
+        {:ok,
+         handle
+         |> Map.put(:segment_projection_checkpoint_wanted?, true)
+         |> maybe_start_segment_projection_checkpoint()}
+      end
+
+      def info({:ferricstore_waraft_segment_projection_relocation_table_consumed, table}, handle),
+        do: {:ok, drop_consumed_segment_projection_relocation_table(handle, table)}
 
       def info({:ferricstore_waraft_segment_projection_checkpoint_done, ref, result}, handle) do
         finish_segment_projection_checkpoint(ref, result, handle)

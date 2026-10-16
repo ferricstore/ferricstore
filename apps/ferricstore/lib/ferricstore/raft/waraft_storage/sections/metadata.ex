@@ -326,13 +326,17 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
         end
 
         @doc false
-        def __segment_projection_checkpoint_relocations_for_test__(
+        def __prepared_segment_projection_relocations_for_test__(
               ctx,
               shard_index,
-              entries,
+              relocation_table,
               trim_index
             ) do
-          segment_projection_checkpoint_relocations(ctx, shard_index, entries, trim_index)
+          collect_prepared_segment_projection_relocations(
+            %{ctx: ctx, shard_index: shard_index},
+            relocation_table,
+            trim_index
+          )
         end
 
         @doc false
@@ -423,70 +427,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
       defp segment_projection_entries_from_relocations(relocations) do
         Enum.map(relocations, fn {entry, _row} -> entry end)
       end
-
-      defp segment_projection_checkpoint_relocations(ctx, shard_index, entries, trim_index) do
-        keydir = elem(ctx.keydir_refs, shard_index)
-        now = storage_expiry_cutoff_ms()
-
-        entry_by_key =
-          entries
-          |> Enum.with_index(1)
-          |> Map.new(fn {{key, value, expire_at_ms}, projection_index} ->
-            {key, {projection_index, value, expire_at_ms}}
-          end)
-
-        case reduce_keydir_rows_while(keydir, [], fn row, acc ->
-               case segment_projection_checkpoint_relocation(row, entry_by_key, trim_index, now) do
-                 {:ok, relocation} -> {:cont, [relocation | acc]}
-                 :skip -> {:cont, acc}
-                 {:error, reason} -> {:halt, {:error, reason}}
-               end
-             end) do
-          :unavailable ->
-            {:error, {:segment_keydir_unavailable, shard_index}}
-
-          {:ok, relocations} ->
-            {:ok, Enum.reverse(relocations)}
-
-          {:error, _reason} = error ->
-            error
-        end
-      rescue
-        error -> {:error, {:segment_projection_checkpoint_relocations_failed, error}}
-      end
-
-      defp segment_projection_checkpoint_relocation(
-             {key, _value, expire_at_ms, _lfu, file_id, _offset, _value_size} = row,
-             entry_by_key,
-             trim_index,
-             now
-           )
-           when is_binary(key) do
-        cond do
-          not live_expire_at?(expire_at_ms, now) ->
-            :skip
-
-          not segment_projection_relocatable_file_id?(file_id, trim_index) ->
-            :skip
-
-          true ->
-            case Map.fetch(entry_by_key, key) do
-              {:ok, {projection_index, projected_value, ^expire_at_ms}} ->
-                {:ok, {projection_index, {{key, projected_value, expire_at_ms}, row}}}
-
-              {:ok, {_projection_index, _projected_value, projected_expire_at_ms}} ->
-                {:error,
-                 {:segment_projection_checkpoint_expire_mismatch, key, expire_at_ms,
-                  projected_expire_at_ms}}
-
-              :error ->
-                {:error, {:segment_projection_checkpoint_missing_key, key, file_id}}
-            end
-        end
-      end
-
-      defp segment_projection_checkpoint_relocation(_row, _entry_by_key, _trim_index, _now),
-        do: :skip
 
       defp segment_projection_relocatable_file_id?({:waraft_segment, index}, trim_index)
            when is_integer(index),
@@ -1243,44 +1183,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
         end
       rescue
         error -> {:error, {:relocate_segment_projection_keydir_failed, error}}
-      end
-
-      defp relocate_segment_projection_keydir_from_checkpoint(
-             _ctx,
-             _shard_index,
-             _projection_root,
-             []
-           ),
-           do: :ok
-
-      defp relocate_segment_projection_keydir_from_checkpoint(
-             ctx,
-             shard_index,
-             projection_root,
-             relocations
-           ) do
-        keydir = elem(ctx.keydir_refs, shard_index)
-
-        with :ok <-
-               maybe_run_segment_projection_before_relocate_hook(
-                 shard_index,
-                 projection_root,
-                 relocations
-               ) do
-          Enum.reduce_while(relocations, :ok, fn {projection_index, relocation}, :ok ->
-            case relocate_segment_projection_row(
-                   keydir,
-                   projection_root,
-                   projection_index,
-                   relocation
-                 ) do
-              :ok -> {:cont, :ok}
-              {:error, reason} -> {:halt, {:error, reason}}
-            end
-          end)
-        end
-      rescue
-        error -> {:error, {:relocate_segment_projection_keydir_from_checkpoint_failed, error}}
       end
 
       defp relocate_segment_value_pins(_ctx, _shard_index, [], _expiry_cutoff_ms), do: :ok

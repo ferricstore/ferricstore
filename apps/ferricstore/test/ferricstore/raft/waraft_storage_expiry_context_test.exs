@@ -55,11 +55,14 @@ defmodule Ferricstore.Raft.WARaftStorageExpiryContextTest do
     :ets.insert(keydir, row)
     :atomics.put(hlc_ref, 1, Bitwise.bsl(wall_ms + 60_000, 16))
 
-    assert {:ok, [{1, {{^key, ^value, ^expire_at_ms}, ^row}}]} =
-             WARaftStorage.__segment_projection_checkpoint_relocations_for_test__(
+    relocation_table = :ets.new(:checkpoint_relocations, [:set, :public])
+    :ets.insert(relocation_table, {key, 1, 64, expire_at_ms, byte_size(value)})
+
+    assert {:ok, [{1, 64, 5, ^row}]} =
+             WARaftStorage.__prepared_segment_projection_relocations_for_test__(
                %{keydir_refs: {keydir}},
                0,
-               [{key, value, expire_at_ms}],
+               relocation_table,
                2
              )
   end

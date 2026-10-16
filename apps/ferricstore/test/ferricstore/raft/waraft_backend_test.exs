@@ -101,6 +101,11 @@ Code.require_file(
   __DIR__
 )
 
+Code.require_file(
+  "waraft_backend_test/sections/segment_projection_trim_without_stall.exs",
+  __DIR__
+)
+
 for part <- 1..2 do
   Code.require_file(
     "waraft_backend_test/sections/helpers_part_#{part |> Integer.to_string() |> String.pad_leading(2, "0")}.exs",
@@ -269,6 +274,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
   use Ferricstore.Raft.WARaftBackendTest.Sections.ThreePeerBackendClusterRemovesMemberThroughBackendApi
 
   use Ferricstore.Raft.WARaftBackendTest.Sections.BackendAddMemberRetriesStagedParticipantAfterFailedTransfer
+
+  use Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWithoutStall
 
   use Ferricstore.Raft.WARaftBackendTest.Sections.HelpersPart01
   use Ferricstore.Raft.WARaftBackendTest.Sections.HelpersPart02

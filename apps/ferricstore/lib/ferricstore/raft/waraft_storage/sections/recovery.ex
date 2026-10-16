@@ -876,6 +876,15 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         end
       end
 
+      # One attempt at the projection lock: {:ok, result}, or :busy when a
+      # checkpoint or another trim holds it.
+      defp try_segment_projection_lock(root_dir, fun) when is_function(fun, 0) do
+        Ferricstore.LocalLock.try_trans(
+          {{__MODULE__, :segment_projection, root_dir}, self()},
+          fun
+        )
+      end
+
       defp initial_storage_metadata(apply_context) do
         %{
           version: @version,

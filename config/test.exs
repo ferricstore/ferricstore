@@ -32,6 +32,11 @@ config :ferricstore,
   data_dir: test_data_dir,
   test_data_dir_auto_cleanup: test_data_dir_auto_cleanup
 
+# A WARaft log trim rebuilds the segment projection synchronously in tests
+# unless a test opts into deferring trims to background checkpoints, so tests
+# that trim directly see the relocated keydir immediately.
+config :ferricstore, :waraft_segment_projection_trim_max_deferred_entries, 0
+
 # Use a fixed shard count in tests for deterministic behavior.
 # Production defaults to System.schedulers_online().
 config :ferricstore, :shard_count, 4
