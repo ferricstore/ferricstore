@@ -145,7 +145,9 @@ defmodule Ferricstore.Cluster.FeatureLevelTest do
   test "the cluster manager refuses a join it cannot verify once a level is active", %{ctx: ctx} do
     unreachable = :"unreachable-join-target@127.0.0.1"
 
-    assert {:error, {:target_data_probe_failed, ^unreachable, _reason}} =
+    # At level 0 nothing is gated, so the first check to refuse an unreachable
+    # target is the data format probe.
+    assert {:error, {:data_format_probe_failed, ^unreachable, _reason}} =
              Ferricstore.Cluster.Manager.add_node(unreachable)
 
     assert {:ok, %{active: 1}} = FeatureLevel.raise(ctx, 1)
