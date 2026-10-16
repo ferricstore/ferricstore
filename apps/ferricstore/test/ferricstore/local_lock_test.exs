@@ -8,8 +8,11 @@ defmodule Ferricstore.LocalLockTest do
 
   test "a waiter takes the lock soon after the holder releases it" do
     # :global.trans sleeps a random 0.25-8 s between attempts, so a waiter
-    # usually finds the lock long after it was freed. Judge the typical
-    # handoff: one scheduler stall on a loaded runner is not a regression.
+    # usually finds the lock long after it was freed. LocalLock retries within
+    # 8 ms. Judge the typical handoff: loaded macOS runners stall single
+    # handoffs past 100 ms and push the median near 30 ms, yet with :global's
+    # first sleep (up to 250 ms) a median of 15 stays under 50 ms well under 1%
+    # of the time.
     delays =
       for _trial <- 1..15 do
         resource = make_ref()
@@ -39,7 +42,7 @@ defmodule Ferricstore.LocalLockTest do
       end
 
     median = delays |> Enum.sort() |> Enum.at(div(length(delays), 2))
-    assert median < 25, "lock handoff delays (ms): #{inspect(delays)}"
+    assert median < 50, "lock handoff delays (ms): #{inspect(delays)}"
   end
 
   test "only one process holds a lock at a time" do
