@@ -25,6 +25,18 @@ All notable changes to FerricStore will be documented here.
 - A failed Flow LMDB clear (FLUSHDB) now names the step that failed (opening
   the environment, beginning the write transaction, clearing, or committing)
   instead of only the OS error, such as `Invalid argument (os error 22)`.
+- One Flow whose projection cannot be written because of its own data (an
+  undecodable record, a corrupt or conflicting LMDB row of its own) no longer
+  stops every later Flow LMDB write on its shard. The writer narrows the failed
+  batch down to that Flow, holds its projection and its hot-record cleanup, and
+  writes everything else. The held projection is retried with backoff and
+  released once it writes, for example after the record is repaired or
+  deleted. While anything is held the shard's mirror stays degraded (queries
+  that need a complete mirror still refuse), the replay-safe index does not
+  advance, and LMDB writer flushes return
+  `{:error, {:flow_projection_quarantined, count}}`. Failures that would hit
+  every Flow alike (I/O, a full or busy LMDB, a source not yet readable) still
+  hold the whole batch as before.
 
 ## 0.11.24 - 2026-10-06
 
