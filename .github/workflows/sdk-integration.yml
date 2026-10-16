@@ -62,7 +62,7 @@ jobs:
           - sdk: Elixir
             id: elixir
             repository: ferricstore/ferricstore-elixir
-            ref: b395fb20c239829355d71910a7265f4e7db898c8
+            ref: 035604100a812ddb3f38526735ba3da9e81d3a80
           - sdk: Java
             id: java
             repository: ferricstore/ferricstore-java
