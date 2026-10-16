@@ -14,6 +14,15 @@ defmodule Ferricstore.Flow.LMDBWriter do
   transition, terminal, retention, and history paths. Keep enqueue functions
   allocation-light and avoid extra processes/calls in request paths. Refactors
   here need DBOS/Flow benchmark comparison.
+
+  ## Failures
+
+  A failed batch stays pending and is retried. When the failure belongs to one
+  Flow's own data (see `Ferricstore.Flow.LMDBWriter.Quarantine`), the batch is
+  written in ordered halves until that Flow's projection is alone; it is held
+  and retried with backoff while the rest of the shard keeps projecting. The
+  mirror stays degraded and the replay-safe index stays put while anything is
+  held, and flushes reply `{:error, {:flow_projection_quarantined, count}}`.
   """
 
   alias Ferricstore.Flow.LMDBWriter.AfterFlush
@@ -21,6 +30,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
   alias Ferricstore.Flow.LMDBWriter.EnqueueControl
   alias Ferricstore.Flow.LMDBWriter.Outbox
   alias Ferricstore.Flow.LMDBWriter.ProjectionOps
+  alias Ferricstore.Flow.LMDBWriter.Quarantine
 
   use GenServer
 
@@ -678,6 +688,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
         flush_waiters: []
     }
 
+    state = Map.put(state, :quarantine, %{})
     publish_backlog(state, 0)
 
     {:reply, :ok, state}
@@ -710,6 +721,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
         flush_waiters: []
     }
 
+    state = Map.put(state, :quarantine, %{})
     publish_backlog(state, 0)
     state
   end
@@ -894,85 +906,308 @@ defmodule Ferricstore.Flow.LMDBWriter do
          } = state
        )
        when requested <= durable do
-    {%{
-       state
-       | count: 0,
-         pending_after_flush: [],
-         first_pending_at: nil,
-         last_enqueue_at: nil,
-         timer_ref: nil
-     }, :ok}
+    state = %{
+      state
+      | count: 0,
+        pending_after_flush: [],
+        first_pending_at: nil,
+        last_enqueue_at: nil,
+        timer_ref: nil
+    }
+
+    retry_quarantined(state, :ok)
   end
 
   defp do_flush_pending_with_reply(state) do
     if state.timer_ref, do: Process.cancel_timer(state.timer_ref)
 
-    ops = Enum.reverse(state.pending)
-    after_flush = Enum.reverse(state.pending_after_flush)
+    pending_ops = Enum.reverse(state.pending)
+
+    {state, ops, after_flush} =
+      Quarantine.divert(state, pending_ops, Enum.reverse(state.pending_after_flush))
+
+    # Diverted ops are source projections, which count as pending work.
+    state = %{
+      state
+      | pending: Enum.reverse(ops),
+        pending_after_flush: Enum.reverse(after_flush),
+        count: max(state.count - (length(pending_ops) - length(ops)), 0)
+    }
+
     started_at = System.monotonic_time()
     op_count = length(ops)
     pending_age_us = pending_age_us(state, started_at)
 
-    case flush_ops_and_marker(state, ops, started_at) do
-      {:ok, state, expanded_op_count} ->
-        case AfterFlush.apply_actions(after_flush, state.instance_ctx) do
+    {state, reply} =
+      case flush_ops_and_marker(state, ops, started_at, Quarantine.empty?(state)) do
+        {:ok, state, expanded_op_count} ->
+          finish_flush(
+            state,
+            after_flush,
+            started_at,
+            op_count,
+            expanded_op_count,
+            pending_age_us
+          )
+
+        {:error, reason, state} ->
+          if ops != [] and Quarantine.isolatable?(reason) do
+            flush_isolating_poisoned_projections(
+              state,
+              ops,
+              after_flush,
+              started_at,
+              pending_age_us
+            )
+          else
+            fail_flush(state, reason, started_at, op_count, pending_age_us)
+          end
+      end
+
+    retry_quarantined(state, reply)
+  end
+
+  defp finish_flush(state, after_flush, started_at, op_count, expanded_op_count, pending_age_us) do
+    case AfterFlush.apply_actions(after_flush, state.instance_ctx) do
+      :ok ->
+        emit_flush(:ok, state, started_at, op_count, expanded_op_count, pending_age_us)
+
+        state = clear_flushed_pending(state)
+        publish_backlog(state, 0)
+
+        {state, :ok}
+
+      {:error, reason} ->
+        error = {:after_flush_failed, reason}
+        record_flush_failure(state.instance_ctx, state.shard_index)
+        mark_mirror_degraded(state.instance_ctx, state.shard_index, error)
+
+        emit_flush(
+          {:error, error},
+          state,
+          started_at,
+          op_count,
+          expanded_op_count,
+          pending_age_us
+        )
+
+        state =
+          state
+          |> clear_flushed_pending()
+          |> Map.put(:projection_dirty?, true)
+
+        publish_backlog(state, 0)
+        {state, {:error, error}}
+    end
+  end
+
+  defp fail_flush(state, reason, started_at, op_count, pending_age_us) do
+    record_persist_failure(state.instance_ctx, state.shard_index)
+    record_flush_failure(state.instance_ctx, state.shard_index)
+    mark_mirror_degraded(state.instance_ctx, state.shard_index, reason)
+    publish_backlog(state, pending_age_us)
+    emit_persist({:error, reason}, state, state.requested_index, started_at)
+    emit_flush({:error, reason}, state, started_at, op_count, 0, pending_age_us)
+
+    Logger.warning("Flow LMDB writer shard #{state.shard_index} flush failed: #{inspect(reason)}")
+
+    # The pending ops stay queued for the retry. Once a flush succeeds, the
+    # dirty-projection reconcile checks the shard and clears the degraded
+    # flag, which nothing else does while the shard sees no new work.
+    state = %{state | projection_dirty?: true}
+
+    state =
+      if instance_suspended?(state.instance_name) do
+        %{state | timer_ref: nil, suspended?: true}
+      else
+        ensure_timer(%{state | timer_ref: nil})
+      end
+
+    {state, {:error, reason}}
+  end
+
+  # The batch failed on one Flow's own data. Write it in order in halves until
+  # the failing projection is alone, hold that projection, and write the rest.
+  # Every segment commits before the next is tried, so ops keep their order.
+  defp flush_isolating_poisoned_projections(state, ops, after_flush, started_at, pending_age_us) do
+    op_count = length(ops)
+
+    case isolate_poisoned_projections(state, [ops], started_at) do
+      {:ok, state} ->
+        {state, after_flush} = Quarantine.divert_after_flush(state, after_flush)
+
+        case persist_unless_quarantined(state, started_at) do
+          {:ok, state} ->
+            finish_flush(state, after_flush, started_at, op_count, 0, pending_age_us)
+
+          {:error, reason, state} ->
+            fail_flush(state, reason, started_at, op_count, pending_age_us)
+        end
+
+      {:error, reason, state, remaining_ops} ->
+        state = %{
+          state
+          | pending: Enum.reverse(remaining_ops),
+            count: Enum.count(remaining_ops, &counted_pending_op?/1)
+        }
+
+        fail_flush(state, reason, started_at, op_count, pending_age_us)
+    end
+  end
+
+  # Keydir spill copies ride along with flushes without counting as pending
+  # projection work (see the :keydir_spill handler).
+  defp counted_pending_op?({:keydir_spill_from_source, _ets, _row}), do: false
+  defp counted_pending_op?(_op), do: true
+
+  defp isolate_poisoned_projections(state, [], _started_at), do: {:ok, state}
+
+  defp isolate_poisoned_projections(state, [segment | rest], started_at) do
+    {state, segment, []} = Quarantine.divert(state, segment, [])
+
+    if segment == [] do
+      isolate_poisoned_projections(state, rest, started_at)
+    else
+      case flush_ops_and_marker(state, segment, started_at, false) do
+        {:ok, state, _expanded_op_count} ->
+          isolate_poisoned_projections(state, rest, started_at)
+
+        {:error, reason, state} ->
+          isolate_failed_segment(state, segment, rest, reason, started_at)
+
+        {:retry, reason} ->
+          {:error, {:retry, reason}, state, Enum.concat([segment | rest])}
+      end
+    end
+  end
+
+  defp isolate_failed_segment(state, [op] = segment, rest, reason, started_at) do
+    with true <- Quarantine.isolatable?(reason),
+         {:ok, state_key} <- Quarantine.op_state_key(op) do
+      state
+      |> quarantine_projection(state_key, op, reason)
+      |> isolate_poisoned_projections(rest, started_at)
+    else
+      _not_isolatable -> {:error, reason, state, Enum.concat([segment | rest])}
+    end
+  end
+
+  defp isolate_failed_segment(state, segment, rest, reason, started_at) do
+    if Quarantine.isolatable?(reason) do
+      {left, right} = Enum.split(segment, div(length(segment), 2))
+      isolate_poisoned_projections(state, [left, right | rest], started_at)
+    else
+      {:error, reason, state, Enum.concat([segment | rest])}
+    end
+  end
+
+  defp quarantine_projection(state, state_key, op, reason) do
+    {state, status} =
+      Quarantine.hold(state, state_key, op, reason, System.monotonic_time(:millisecond))
+
+    if status == :new do
+      record_flush_failure(state.instance_ctx, state.shard_index)
+
+      mark_mirror_degraded(
+        state.instance_ctx,
+        state.shard_index,
+        {:flow_projection_quarantined, reason}
+      )
+
+      emit_quarantine(state, :quarantined, reason)
+
+      Logger.warning(
+        "Flow LMDB writer shard #{state.shard_index} quarantined the projection of " <>
+          "#{inspect(state_key)} (#{inspect(reason)}); the rest of the shard keeps projecting"
+      )
+    end
+
+    # Flushes reply with the quarantine error while anything is held, so the
+    # dirty-projection reconcile (which clears the degraded flag) runs only
+    # after the last held projection is released.
+    Map.put(state, :projection_dirty?, true)
+  end
+
+  defp retry_quarantined(state, reply) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    state =
+      case Quarantine.due(state, now_ms) do
+        [] ->
+          state
+
+        due ->
+          state = Enum.reduce(due, state, &retry_quarantined_projection(&2, &1, now_ms))
+
+          # Releasing the last held projection lets the replay-safe index
+          # advance once nothing else is pending.
+          if Quarantine.empty?(state) and state.pending == [] do
+            case persist_unless_quarantined(state, System.monotonic_time()) do
+              {:ok, state} -> state
+              {:error, _reason, state} -> state
+            end
+          else
+            state
+          end
+      end
+
+    state =
+      case Quarantine.next_retry_in_ms(state, System.monotonic_time(:millisecond)) do
+        nil -> state
+        delay_ms -> ensure_timer_with_delay(state, max(delay_ms, 1))
+      end
+
+    {state, if(reply == :ok, do: Quarantine.reply(state), else: reply)}
+  end
+
+  defp retry_quarantined_projection(state, {state_key, entry}, now_ms) do
+    case flush_ops_and_marker(state, entry.ops, System.monotonic_time(), false) do
+      {:ok, state, _expanded_op_count} ->
+        state = Quarantine.release(state, state_key)
+        emit_quarantine(state, :released, entry.reason)
+
+        Logger.warning(
+          "Flow LMDB writer shard #{state.shard_index} released the quarantined projection of " <>
+            "#{inspect(state_key)}"
+        )
+
+        case AfterFlush.apply_actions(entry.after_flush, state.instance_ctx) do
           :ok ->
-            emit_flush(:ok, state, started_at, op_count, expanded_op_count, pending_age_us)
-
-            state = clear_flushed_pending(state)
-            publish_backlog(state, 0)
-
-            {state, :ok}
+            state
 
           {:error, reason} ->
             error = {:after_flush_failed, reason}
             record_flush_failure(state.instance_ctx, state.shard_index)
             mark_mirror_degraded(state.instance_ctx, state.shard_index, error)
-
-            emit_flush(
-              {:error, error},
-              state,
-              started_at,
-              op_count,
-              expanded_op_count,
-              pending_age_us
-            )
-
-            state =
-              state
-              |> clear_flushed_pending()
-              |> Map.put(:projection_dirty?, true)
-
-            publish_backlog(state, 0)
-            {state, {:error, error}}
+            Map.put(state, :projection_dirty?, true)
         end
 
       {:error, reason, state} ->
-        record_persist_failure(state.instance_ctx, state.shard_index)
-        record_flush_failure(state.instance_ctx, state.shard_index)
-        mark_mirror_degraded(state.instance_ctx, state.shard_index, reason)
-        publish_backlog(state, pending_age_us)
-        emit_persist({:error, reason}, state, state.requested_index, started_at)
-        emit_flush({:error, reason}, state, started_at, op_count, 0, pending_age_us)
+        Quarantine.back_off(state, state_key, reason, now_ms)
 
-        Logger.warning(
-          "Flow LMDB writer shard #{state.shard_index} flush failed: #{inspect(reason)}"
-        )
-
-        # The pending ops stay queued for the retry. Once a flush succeeds, the
-        # dirty-projection reconcile checks the shard and clears the degraded
-        # flag, which nothing else does while the shard sees no new work.
-        state = %{state | projection_dirty?: true}
-
-        state =
-          if instance_suspended?(state.instance_name) do
-            %{state | timer_ref: nil, suspended?: true}
-          else
-            ensure_timer(%{state | timer_ref: nil})
-          end
-
-        {state, {:error, reason}}
+      {:retry, reason} ->
+        Quarantine.back_off(state, state_key, {:retry, reason}, now_ms)
     end
+  end
+
+  defp persist_unless_quarantined(state, started_at) do
+    if Quarantine.empty?(state) do
+      case flush_ops_and_marker(state, [], started_at, true) do
+        {:ok, state, _expanded_op_count} -> {:ok, state}
+        {:error, reason, state} -> {:error, reason, state}
+        {:retry, reason} -> {:error, {:retry, reason}, state}
+      end
+    else
+      {:ok, state}
+    end
+  end
+
+  defp emit_quarantine(state, action, reason) do
+    :telemetry.execute(
+      [:ferricstore, :flow, :lmdb_writer, :quarantine],
+      %{count: Quarantine.count(state)},
+      %{shard_index: state.shard_index, action: action, reason: reason}
+    )
   end
 
   defp clear_flushed_pending(state) do
@@ -989,20 +1224,30 @@ defmodule Ferricstore.Flow.LMDBWriter do
     }
   end
 
-  defp flush_ops_and_marker(state, ops, started_at) do
+  # persist? is false while a quarantined projection is held: the replay-safe
+  # index must not claim LMDB is complete past an op it does not have.
+  defp flush_ops_and_marker(state, ops, started_at, persist?) do
     {source_retries, sleep_ms} = ProjectionOps.source_wait_config()
-    flush_ops_and_marker_attempt(state, ops, started_at, source_retries, sleep_ms)
+    flush_ops_and_marker_attempt(state, ops, started_at, persist?, source_retries, sleep_ms)
   end
 
-  defp flush_ops_and_marker_attempt(state, ops, started_at, source_retries, sleep_ms) do
+  defp flush_ops_and_marker_attempt(state, ops, started_at, persist?, source_retries, sleep_ms) do
     source_wait = if source_retries > 0, do: :probe, else: :final
 
     case LMDBFlushCoordinator.with_shard_permit(state.instance_name, state.shard_index, fn ->
-           flush_ops_and_marker_with_permit(state, ops, started_at, source_wait)
+           flush_ops_and_marker_with_permit(state, ops, started_at, persist?, source_wait)
          end) do
       {:retry, _reason} when source_retries > 0 ->
         if sleep_ms > 0, do: Process.sleep(sleep_ms)
-        flush_ops_and_marker_attempt(state, ops, started_at, source_retries - 1, sleep_ms)
+
+        flush_ops_and_marker_attempt(
+          state,
+          ops,
+          started_at,
+          persist?,
+          source_retries - 1,
+          sleep_ms
+        )
 
       {:error, :lmdb_flush_coordinator_unavailable} ->
         {:error, :lmdb_flush_coordinator_unavailable, state}
@@ -1012,12 +1257,13 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
-  defp flush_ops_and_marker_with_permit(state, ops, started_at, source_wait) do
+  defp flush_ops_and_marker_with_permit(state, ops, started_at, persist?, source_wait) do
     try do
       do_flush_ops_and_marker_with_permit(
         state,
         ops,
         started_at,
+        persist?,
         @max_compare_conflict_retries,
         source_wait
       )
@@ -1030,6 +1276,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
          state,
          source_ops,
          started_at,
+         persist?,
          retries_remaining,
          source_wait
        ) do
@@ -1044,7 +1291,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
              requested_index: projected_state.requested_index
            }),
          :ok <- write_ops_chunked(projected_state, expanded_ops),
-         {:ok, persisted_state} <- persist_requested(projected_state, started_at) do
+         {:ok, persisted_state} <- maybe_persist_requested(projected_state, started_at, persist?) do
       {:ok, persisted_state, length(expanded_ops)}
     else
       {:error, {:compare_failed, _key}}
@@ -1053,6 +1300,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
           state,
           source_ops,
           started_at,
+          persist?,
           retries_remaining - 1,
           source_wait
         )
@@ -1066,6 +1314,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
           state,
           source_ops,
           started_at,
+          persist?,
           retries_remaining - 1,
           source_wait
         )
@@ -1200,6 +1449,9 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp maybe_pause_between_flush_chunks(_state), do: :ok
+
+  defp maybe_persist_requested(state, started_at, true), do: persist_requested(state, started_at)
+  defp maybe_persist_requested(state, _started_at, false), do: {:ok, state}
 
   defp persist_requested(
          %{requested_index: requested, durable_index: durable} = state,

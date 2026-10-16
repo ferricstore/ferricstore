@@ -97,7 +97,7 @@ defmodule Ferricstore.Flow.HistoryProjectedIndex do
   defp with_marker_lock(marker_path, fun) when is_function(fun, 0) do
     lock = {{__MODULE__, :marker, marker_path}, self()}
 
-    case :global.trans(lock, fun, [node()]) do
+    case Ferricstore.LocalLock.trans(lock, fun) do
       :aborted -> {:error, :history_projected_index_lock_busy}
       result -> result
     end

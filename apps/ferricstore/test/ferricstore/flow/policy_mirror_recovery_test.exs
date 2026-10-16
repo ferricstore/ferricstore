@@ -33,10 +33,6 @@ defmodule Ferricstore.Flow.PolicyMirrorRecoveryTest do
       lmdb_path = LMDB.path(Ferricstore.DataDir.shard_data_path(data_dir, 0))
       _ = LMDB.release(lmdb_path)
 
-      if :ets.info(keydir) != :undefined do
-        :ets.delete(keydir)
-      end
-
       File.rm_rf!(data_dir)
     end)
 

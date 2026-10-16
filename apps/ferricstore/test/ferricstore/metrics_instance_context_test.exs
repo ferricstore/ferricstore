@@ -18,10 +18,6 @@ defmodule Ferricstore.MetricsInstanceContextTest do
     on_exit(fn ->
       :persistent_term.put(@default_key, original)
       Ferricstore.PrefixMetricsCache.reset()
-
-      if :ets.info(keydir) != :undefined do
-        :ets.delete(keydir)
-      end
     end)
 
     {:ok, keydir: keydir}

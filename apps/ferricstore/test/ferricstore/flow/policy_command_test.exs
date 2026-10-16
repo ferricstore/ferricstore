@@ -33,7 +33,6 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
 
   test "ordered batches stamp later commands against an earlier Flow target" do
     keydir = :ets.new(:ordered_batch_policy_stamp, [:set, :public])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
     ctx = %{
       keydir_refs: {keydir},
@@ -77,7 +76,6 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
 
   test "an explicit type overrides an earlier target for the same batch key" do
     keydir = :ets.new(:explicit_batch_policy_stamp, [:set, :public])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
     ctx = %{
       keydir_refs: {keydir},
@@ -111,7 +109,6 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
 
   test "mixed policy batches preserve zero-arity opaque commands" do
     keydir = :ets.new(:mixed_batch_policy_stamp, [:set, :public])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
     state_key = "mixed-policy-route"
 
@@ -151,7 +148,6 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
   test "existing-flow policy stamping fails closed while the state shard is unavailable" do
     keydir = :ets.new(:unavailable_policy_stamp, [:set, :public])
     data_dir = Path.join(System.tmp_dir!(), "policy-stamp-#{System.unique_integer([:positive])}")
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
     on_exit(fn -> File.rm_rf(data_dir) end)
 
     ctx = %{
@@ -173,7 +169,6 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
 
   test "existing hot flows are stamped without a shard process round trip" do
     keydir = :ets.new(:hot_policy_stamp, [:set, :public])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
     ctx = %{
       keydir_refs: {keydir},
@@ -227,7 +222,6 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
 
   test "single commands fence their compact reference with the exact coordinator policy" do
     keydir = :ets.new(:policy_fence_stamp, [:set, :public])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
     type = "fenced-policy"
     partition_key = "fenced-tenant"
@@ -265,7 +259,6 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
   @tag :compact_policy_ref
   test "policy-sensitive commands carry a fixed-size reference and one exact fence" do
     keydir = :ets.new(:compact_policy_ref, [:set, :public])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
     type = "compact-policy-ref"
     policy = %{type: type, version: String.duplicate("v", 128 * 1024)}
@@ -307,7 +300,6 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
   @tag :compact_policy_ref
   test "existing-flow stamps fence the observed type and incarnation" do
     keydir = :ets.new(:policy_target_guard, [:set, :public])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
     id = "policy-target-flow"
     type = "policy-target-type"
@@ -395,7 +387,6 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
 
   test "outer Flow batches replicate compact references instead of repeated policies" do
     keydir = :ets.new(:outer_batch_policy_stamp, [:set, :public])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
     type = "outer-batch-policy"
     policy = %{type: type, version: String.duplicate("p", 64 * 1024)}
@@ -450,7 +441,6 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
 
   test "nested batches store each policy reference once" do
     keydir = :ets.new(:deduplicated_policy_stamp, [:set, :public])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
     type = "deduplicated-policy"
     policy_key = Ferricstore.Flow.Keys.policy_key(type)
@@ -566,7 +556,6 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
 
   test "multi-type commands enforce one total snapshot bundle limit" do
     keydir = :ets.new(:multi_type_policy_stamp, [:set, :public])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
     max_bytes = Ferricstore.Flow.RetryPolicy.max_policy_snapshot_bytes()
     too_large_error = "ERR flow policy snapshot exceeds #{max_bytes} bytes"
@@ -644,7 +633,6 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
 
   test "hot policy stamping does not call the shard process" do
     keydir = :ets.new(:hot_policy_stamp, [:set, :public])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
     type = "hot-policy-stamp"
     policy_key = Ferricstore.Flow.Keys.policy_key(type)

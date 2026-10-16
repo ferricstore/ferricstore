@@ -418,11 +418,8 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       drain_all()
 
       counter = lfu_counter("lfu_read")
-      assert counter >= 5, "counter should not decrease from reads, got #{counter}"
-      # With 200 reads and starting at 5, probabilistic increment should
-      # have fired at least once
-      assert counter > 5 or true,
-             "counter should have incremented at least once with 200 reads (probabilistic, may rarely fail)"
+      # The first read of a key at the initial counter always increments it.
+      assert counter > 5, "counter should have incremented with 200 reads, got #{counter}"
     end
 
     # Test 18: Frequently read key has higher counter than rarely read key
@@ -692,8 +689,8 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
           end
         end)
 
-      assert length(surviving_hot) >= 9,
-             "at least 9 of 10 heavily-read keys should survive eviction, but #{length(surviving_hot)} survived"
+      assert surviving_hot == hot_keys,
+             "all 10 heavily-read keys should survive eviction, but #{length(surviving_hot)} survived"
     end
   end
 

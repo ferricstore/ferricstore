@@ -1151,7 +1151,7 @@ defmodule Ferricstore.Flow.Hibernation do
   defp with_promotion_lock(flow_id, fun) do
     lock = {{__MODULE__, :promotion, flow_id}, self()}
 
-    case :global.trans(lock, fun, [node()]) do
+    case Ferricstore.LocalLock.trans(lock, fun) do
       :aborted -> {:error, :promotion_lock_busy}
       {:aborted, reason} -> {:error, {:promotion_lock_failed, reason}}
       result -> result

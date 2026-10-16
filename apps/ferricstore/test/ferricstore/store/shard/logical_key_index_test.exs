@@ -13,11 +13,6 @@ defmodule Ferricstore.Store.Shard.LogicalKeyIndexTest do
     LogicalKeyIndex.ensure_tables!(ordered, slots)
     keydir = :ets.new(:logical_key_index_keydir, [:set, :public])
 
-    on_exit(fn ->
-      if :ets.whereis(ordered) != :undefined, do: :ets.delete(ordered)
-      if :ets.whereis(slots) != :undefined, do: :ets.delete(slots)
-    end)
-
     %{keydir: keydir, ordered: ordered, slots: slots}
   end
 

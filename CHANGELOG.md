@@ -44,6 +44,39 @@ All notable changes to FerricStore will be documented here.
 - At feature level 1, `flow_policy_set(type, replace: true, ...)` repairs a corrupt
   Flow policy row (unreadable or stored under another type) on every shard,
   at a generation above any the type used before.
+- Node-local locks (standalone cross-shard transaction journal, segment and
+  index markers, Flow promotion, segment projection) retry a busy lock within
+  1-8 ms instead of `:global`'s random 0.25-8 s backoff. 48 concurrent journal
+  operations took 1.1-2.3 s against 0.25 s run one by one; they now take about
+  0.26-0.29 s.
+- LFU counters now increment like Redis's `LFULogIncr`: the odds shrink with the
+  counter above its initial value of 5, so the first read of a new key always
+  counts. Previously a new key needed about 51 counted reads (about 5,100 reads
+  at the default 1-in-100 read sampling) to rank above keys never read, so
+  eviction could not tell moderately read keys from unread ones. `OBJECT FREQ`
+  values grow faster as a result.
+- Fix a Flow LMDB writer stall. When a Flow due more than the hibernation hot
+  window ahead was parked and then changed state (completed, cancelled, fired)
+  before the writer flushed, the batch compared the Flow's active-index reverse
+  row against LMDB instead of the value the batch had just written. Every retry
+  failed with `compare_failed`, so that shard's Flow LMDB projection stopped
+  advancing (degraded mirror; schedule lists and Flow queries reported the
+  catalog unavailable) until restart.
+- A failed Flow LMDB clear (FLUSHDB) now names the step that failed (opening
+  the environment, beginning the write transaction, clearing, or committing)
+  instead of only the OS error, such as `Invalid argument (os error 22)`.
+- One Flow whose projection cannot be written because of its own data (an
+  undecodable record, a corrupt or conflicting LMDB row of its own) no longer
+  stops every later Flow LMDB write on its shard. The writer narrows the failed
+  batch down to that Flow, holds its projection and its hot-record cleanup, and
+  writes everything else. The held projection is retried with backoff and
+  released once it writes, for example after the record is repaired or
+  deleted. While anything is held the shard's mirror stays degraded (queries
+  that need a complete mirror still refuse), the replay-safe index does not
+  advance, and LMDB writer flushes return
+  `{:error, {:flow_projection_quarantined, count}}`. Failures that would hit
+  every Flow alike (I/O, a full or busy LMDB, a source not yet readable) still
+  hold the whole batch as before.
 
 ## 0.11.24 - 2026-10-06
 

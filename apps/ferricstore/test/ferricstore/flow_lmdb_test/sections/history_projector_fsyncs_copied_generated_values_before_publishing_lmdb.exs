@@ -584,8 +584,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
 
         on_exit(fn ->
           Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
-          if :ets.info(zset_index) != :undefined, do: :ets.delete(zset_index)
-          if :ets.info(zset_lookup) != :undefined, do: :ets.delete(zset_lookup)
         end)
 
         assert :ok =

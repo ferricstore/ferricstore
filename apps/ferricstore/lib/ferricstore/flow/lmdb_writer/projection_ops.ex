@@ -698,7 +698,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
 
         acc =
           acc
-          |> put_in([:active_reverse_values, state_key], reverse_value)
+          |> put_active_reverse_value(state_key, reverse_value)
           |> prepend_ops(
             stale_fixed_query_ops ++
               active_ops ++
@@ -923,8 +923,14 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     end
   end
 
+  # Active reverse rows written earlier in the batch, keyed by reverse row key: the
+  # writer's own projections and raw writes such as hibernation parking. LMDB does
+  # not hold them until the batch commits, so cleanup must compare against these.
   def maybe_expand_stale_active_delete(path, state_key, acc) do
-    case Map.fetch(acc.active_reverse_values, state_key) do
+    case Map.fetch(
+           acc.active_reverse_values,
+           Ferricstore.Flow.LMDB.active_by_state_key_key(state_key)
+         ) do
       {:ok, nil} ->
         {:ok, acc}
 
@@ -936,7 +942,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
                ) do
           acc =
             acc
-            |> put_in([:active_reverse_values, state_key], nil)
+            |> put_active_reverse_value(state_key, nil)
             |> prepend_ops(ops)
 
           {:ok, acc}
@@ -950,12 +956,23 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
                Ferricstore.Flow.LMDB.active_index_delete_ops_result(path, state_key) do
           acc =
             acc
-            |> put_in([:active_reverse_values, state_key], nil)
+            |> put_active_reverse_value(state_key, nil)
             |> prepend_ops(ops)
 
           {:ok, acc}
         end
     end
+  end
+
+  defp put_active_reverse_value(acc, state_key, reverse_value) do
+    reverse_key = Ferricstore.Flow.LMDB.active_by_state_key_key(state_key)
+    put_in(acc, [:active_reverse_values, reverse_key], reverse_value)
+  end
+
+  defp track_raw_active_reverse_write(acc, key, value) do
+    if String.starts_with?(key, Ferricstore.Flow.LMDB.active_by_state_global_prefix()),
+      do: put_in(acc, [:active_reverse_values, key], value),
+      else: acc
   end
 
   def read_source_value(state, key) do
@@ -1721,8 +1738,13 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     end
   end
 
-  def expand_path_op(_path, {put_mode, key, value} = op, acc)
-      when put_mode in [:put, :put_new] and is_binary(key) and is_binary(value) do
+  def expand_path_op(_path, {:put, key, value} = op, acc)
+      when is_binary(key) and is_binary(value) do
+    {:ok, acc |> track_raw_active_reverse_write(key, value) |> prepend_ops([op])}
+  end
+
+  def expand_path_op(_path, {:put_new, key, value} = op, acc)
+      when is_binary(key) and is_binary(value) do
     {:ok, prepend_ops(acc, [op])}
   end
 
@@ -1841,6 +1863,9 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       {:ok, acc}
     end
   end
+
+  def expand_path_op(_path, {:delete, key} = op, acc) when is_binary(key),
+    do: {:ok, acc |> track_raw_active_reverse_write(key, nil) |> prepend_ops([op])}
 
   def expand_path_op(_path, op, acc), do: {:ok, prepend_ops(acc, [op])}
 

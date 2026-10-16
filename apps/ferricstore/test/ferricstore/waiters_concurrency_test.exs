@@ -118,7 +118,9 @@ defmodule Ferricstore.WaitersConcurrencyTest do
       Enum.each(waiters, &Waiters.cleanup/1)
     end)
 
-    for _ <- waiters, do: assert_receive(:waiter_registered)
+    # Generous windows: this test checks claim-once semantics, not latency, and
+    # 256 concurrent notifiers can take longer than 100ms on a loaded CI runner.
+    for _ <- waiters, do: assert_receive(:waiter_registered, 5_000)
 
     callers =
       for _ <- 1..256 do
@@ -130,9 +132,10 @@ defmodule Ferricstore.WaitersConcurrencyTest do
       end
 
     Enum.each(callers, &send(&1, :go))
-    for _ <- callers, do: assert_receive({:notify_done, _result})
+    for _ <- callers, do: assert_receive({:notify_done, _result}, 5_000)
 
-    notified = collect_notifications(key, [])
+    notified = collect_notifications(key, length(waiters), [])
+    refute_receive {:waiter_notified, _pid, ^key}, 100
 
     assert length(notified) == length(waiters)
     assert MapSet.new(notified) == MapSet.new(waiters)
@@ -147,11 +150,13 @@ defmodule Ferricstore.WaitersConcurrencyTest do
     end
   end
 
-  defp collect_notifications(key, acc) do
+  defp collect_notifications(_key, 0, acc), do: Enum.reverse(acc)
+
+  defp collect_notifications(key, remaining, acc) do
     receive do
-      {:waiter_notified, pid, ^key} -> collect_notifications(key, [pid | acc])
+      {:waiter_notified, pid, ^key} -> collect_notifications(key, remaining - 1, [pid | acc])
     after
-      50 -> Enum.reverse(acc)
+      5_000 -> Enum.reverse(acc)
     end
   end
 end

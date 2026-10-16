@@ -66,7 +66,6 @@ defmodule Ferricstore.Flow.HistoryProjector.RecoveryTest do
     {shard_data_path, state_key, record, locator} = query_row_fixture("waraft-keydir-row")
     on_exit(fn -> File.rm_rf!(shard_data_path) end)
     keydir = :ets.new(:history_recovery_waraft_keydir_row, [:set])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
     assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, locator, 0)
     assert :ok = LMDB.write_batch(LMDB.path(shard_data_path), [{:put, state_key, query_row}])
@@ -85,7 +84,6 @@ defmodule Ferricstore.Flow.HistoryProjector.RecoveryTest do
     {shard_data_path, state_key, record, locator} = query_row_fixture("blob-ref-keydir-row")
     on_exit(fn -> File.rm_rf!(shard_data_path) end)
     keydir = :ets.new(:history_recovery_blob_ref_keydir_row, [:set])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
     encoded_ref =
       BlobRef.encode!(%BlobRef{
@@ -113,7 +111,6 @@ defmodule Ferricstore.Flow.HistoryProjector.RecoveryTest do
     {shard_data_path, state_key, record, locator} = query_row_fixture("stale-query-row")
     on_exit(fn -> File.rm_rf!(shard_data_path) end)
     keydir = :ets.new(:history_recovery_stale_query_row, [:set])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
     assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, locator, 0)
     assert :ok = LMDB.write_batch(LMDB.path(shard_data_path), [{:put, state_key, query_row}])
@@ -134,7 +131,6 @@ defmodule Ferricstore.Flow.HistoryProjector.RecoveryTest do
 
     on_exit(fn -> File.rm_rf!(shard_data_path) end)
     keydir = :ets.new(:history_recovery_relocated_query_row, [:set])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
     relocated =
       Locator.relocate!(source_locator,
@@ -162,7 +158,6 @@ defmodule Ferricstore.Flow.HistoryProjector.RecoveryTest do
     {shard_data_path, state_key, record, locator} = query_row_fixture("malformed-inline-row")
     on_exit(fn -> File.rm_rf!(shard_data_path) end)
     keydir = :ets.new(:history_recovery_malformed_inline_row, [:set])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
     assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, locator, 0)
     assert :ok = LMDB.write_batch(LMDB.path(shard_data_path), [{:put, state_key, query_row}])
@@ -182,7 +177,6 @@ defmodule Ferricstore.Flow.HistoryProjector.RecoveryTest do
     shard_data_path = tmp_path("corrupt-query-row")
     on_exit(fn -> File.rm_rf!(shard_data_path) end)
     keydir = :ets.new(:history_recovery_corrupt_query_row, [:set])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
     id = "corrupt-query-row"
     state_key = Keys.state_key(id, "tenant-a")
@@ -205,7 +199,6 @@ defmodule Ferricstore.Flow.HistoryProjector.RecoveryTest do
     shard_data_path = tmp_path("forged-hot-state")
     on_exit(fn -> File.rm_rf!(shard_data_path) end)
     keydir = :ets.new(:history_recovery_forged_hot_state, [:set])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
     scope = <<42::unsigned-big-64>>
     assert {:ok, physical_partition} = StorageScope.physical_partition_key("tenant-a", scope)
@@ -249,7 +242,6 @@ defmodule Ferricstore.Flow.HistoryProjector.RecoveryTest do
     shard_data_path = tmp_path("missing-state")
     on_exit(fn -> File.rm_rf!(shard_data_path) end)
     keydir = :ets.new(:history_recovery_missing_state, [:set])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
     history_key = Keys.history_key("missing-state", "tenant-a")
 

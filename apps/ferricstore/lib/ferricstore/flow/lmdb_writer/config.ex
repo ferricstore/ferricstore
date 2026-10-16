@@ -63,6 +63,7 @@ defmodule Ferricstore.Flow.LMDBWriter.Config do
       processed_enqueue_seq: 0,
       processed_enqueue_gaps: MapSet.new(),
       flush_waiters: [],
+      quarantine: %{},
       flush_interval_ms:
         positive_config(
           :flow_lmdb_flush_interval_ms,
