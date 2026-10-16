@@ -100,16 +100,37 @@ defmodule Ferricstore.Flow.Query.IndexDefinition do
 
   def new(_attrs), do: {:error, :invalid_index_definition}
 
+  # Hot paths validate the same few definitions on every write. A definition
+  # that rebuilt to itself once always will, so the exact struct is remembered
+  # per fingerprint; anything else, including an altered copy that keeps the
+  # fingerprint, is rebuilt and checked in full. Entries are only ever created,
+  # never replaced, so persistent_term never triggers a global update.
   @spec validate(t()) :: :ok | {:error, atom()}
-  def validate(%__MODULE__{} = definition) do
-    case new(Map.from_struct(definition)) do
-      {:ok, ^definition} -> :ok
-      {:ok, _different} -> {:error, :invalid_index_definition}
-      {:error, _reason} = error -> error
+  def validate(%__MODULE__{fingerprint: fingerprint} = definition) do
+    case :persistent_term.get({__MODULE__, :validated, fingerprint}, nil) do
+      ^definition -> :ok
+      known -> validate_by_rebuild(definition, known)
     end
   end
 
   def validate(_definition), do: {:error, :invalid_index_definition}
+
+  defp validate_by_rebuild(definition, known) do
+    case new(Map.from_struct(definition)) do
+      {:ok, ^definition} ->
+        if is_nil(known) do
+          :persistent_term.put({__MODULE__, :validated, definition.fingerprint}, definition)
+        end
+
+        :ok
+
+      {:ok, _different} ->
+        {:error, :invalid_index_definition}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
 
   @spec new!(map() | keyword()) :: t()
   def new!(attrs) do

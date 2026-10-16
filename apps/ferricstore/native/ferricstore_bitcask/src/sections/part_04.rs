@@ -689,6 +689,68 @@ fn lmdb_last_txn_id<'a>(env: Env<'a>, path: String, map_size: u64) -> NifResult<
     }
 }
 
+/// Pages in the data file versus pages held by the B-trees (main and Flow
+/// databases plus the two meta pages); the difference is free space that LMDB
+/// reuses but never returns to the filesystem.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn lmdb_space<'a>(env: Env<'a>, path: String, map_size: u64) -> NifResult<Term<'a>> {
+    let store = match lmdb_store(&path, map_size) {
+        Ok(store) => store,
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
+    };
+
+    let rtxn = match store.env.read_txn() {
+        Ok(txn) => txn,
+        Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+    };
+
+    let db = match store.db.stat(&rtxn) {
+        Ok(stat) => stat,
+        Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+    };
+
+    let main = store.env.stat();
+    let file_pages = store.env.info().last_page_number as u64 + 1;
+    let used_pages = 2
+        + (main.branch_pages + main.leaf_pages + main.overflow_pages) as u64
+        + (db.branch_pages + db.leaf_pages + db.overflow_pages) as u64;
+
+    Ok((
+        atoms::ok(),
+        (file_pages, used_pages.min(file_pages), u64::from(main.page_size)),
+    )
+        .encode(env))
+}
+
+/// Writes a compacted copy of the environment to `destination` and fsyncs it.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn lmdb_compact_copy<'a>(
+    env: Env<'a>,
+    path: String,
+    destination: String,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    let store = match lmdb_store(&path, map_size) {
+        Ok(store) => store,
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
+    };
+
+    let file = match store
+        .env
+        .copy_to_path(&destination, heed::CompactionOption::Enabled)
+    {
+        Ok(file) => file,
+        Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+    };
+
+    match file.sync_all().and_then(|()| file.metadata()) {
+        Ok(metadata) => Ok((atoms::ok(), metadata.len()).encode(env)),
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
 #[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn lmdb_prefix_entries_after<'a>(
@@ -1281,7 +1343,7 @@ fn lmdb_prefix_merge_entries<'a>(
         }
     }
 
-    let mut selected: std::collections::BinaryHeap<(&[u8], usize, &[u8])> =
+    let mut selected: std::collections::BinaryHeap<prefix_merge::Candidate<'_>> =
         std::collections::BinaryHeap::with_capacity(cap);
     let mut scanned = 0usize;
 
@@ -1291,31 +1353,14 @@ fn lmdb_prefix_merge_entries<'a>(
             Err(error) => return Ok((atoms::error(), error.to_string()).encode(env)),
         };
 
-        for item in iter.take(cap) {
-            let (key, value) = match item {
-                Ok(entry) => entry,
-                Err(error) => return Ok((atoms::error(), error.to_string()).encode(env)),
-            };
-            scanned = scanned.saturating_add(1);
-            let candidate = (key, source, value);
-            if selected.len() < cap {
-                selected.push(candidate);
-            } else if selected.peek().is_some_and(|largest| &candidate < largest) {
-                selected.pop();
-                selected.push(candidate);
-            }
+        match prefix_merge::scan_source(&mut selected, source, cap, iter) {
+            Ok(source_scanned) => scanned = scanned.saturating_add(source_scanned),
+            Err(error) => return Ok((atoms::error(), error.to_string()).encode(env)),
         }
     }
 
     let selected = selected.into_sorted_vec();
-    let selected_bytes = selected.iter().try_fold(0usize, |bytes, (key, _, value)| {
-        bytes
-            .checked_add(key.len())
-            .and_then(|bytes| bytes.checked_add(value.len()))
-            .filter(|bytes| *bytes <= byte_cap)
-            .ok_or(())
-    });
-    if selected_bytes.is_err() {
+    if !prefix_merge::within_byte_cap(&selected, byte_cap) {
         return Ok(
             (atoms::error(), atoms::prefix_merge_byte_budget_exceeded()).encode(env)
         );
@@ -1528,6 +1573,7 @@ fn lmdb_write_batch_impl<'a>(
                     | LmdbBatchWrite::PutNew(key, _)
                     | LmdbBatchWrite::Delete(key)
                     | LmdbBatchWrite::Compare(key, _)
+                    | LmdbBatchWrite::CompareAny(key, _)
                     | LmdbBatchWrite::CompareMissing(key) => key.as_slice(),
                 };
 
@@ -1557,6 +1603,23 @@ fn lmdb_write_batch_impl<'a>(
                     LmdbBatchWrite::Compare(key, expected) => {
                         match store.db.get(&wtxn, key.as_slice()) {
                             Ok(Some(current)) if current == expected.as_slice() => Ok(()),
+                            Ok(_) => {
+                                let key_term = binary_term(env, key.as_slice())?;
+
+                                return Ok(
+                                    (atoms::error(), (atoms::compare_failed(), key_term)).encode(env)
+                                );
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    LmdbBatchWrite::CompareAny(key, expected) => {
+                        match store.db.get(&wtxn, key.as_slice()) {
+                            Ok(Some(current))
+                                if expected.iter().any(|value| current == value.as_slice()) =>
+                            {
+                                Ok(())
+                            }
                             Ok(_) => {
                                 let key_term = binary_term(env, key.as_slice())?;
 
@@ -1619,6 +1682,7 @@ fn lmdb_record_key<'a>(record: &'a LmdbBatchWrite<'_>) -> &'a [u8] {
         | LmdbBatchWrite::PutNew(key, _)
         | LmdbBatchWrite::Delete(key)
         | LmdbBatchWrite::Compare(key, _)
+        | LmdbBatchWrite::CompareAny(key, _)
         | LmdbBatchWrite::CompareMissing(key) => key.as_slice(),
     }
 }

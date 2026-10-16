@@ -25,6 +25,13 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec io_uring_available() :: boolean()
   def io_uring_available, do: :erlang.nif_error(:nif_not_loaded)
 
+  # -- Raft log command codec (see Ferricstore.Raft.CommandCodec) --
+  @spec raft_command_compact(binary()) :: {:ok, binary()} | :error
+  def raft_command_compact(_external_term), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec raft_command_expand(binary()) :: {:ok, binary()} | :error
+  def raft_command_expand(_compact), do: :erlang.nif_error(:nif_not_loaded)
+
   # -- Flow native ordered index resource --
   @type flow_index_resource :: reference()
 
@@ -696,6 +703,7 @@ defmodule Ferricstore.Bitcask.NIF do
           | {:put_new, binary(), binary()}
           | {:delete, binary()}
           | {:compare, binary(), binary()}
+          | {:compare_any, binary(), [binary()]}
           | {:compare_missing, binary()}
   @type lmdb_original :: {binary(), :missing | {:value, binary()}}
 
@@ -751,6 +759,15 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec lmdb_prefix_entries(binary(), binary(), non_neg_integer(), non_neg_integer()) ::
           {:ok, [{binary(), binary()}]} | {:error, term()}
   def lmdb_prefix_entries(_path, _prefix, _limit, _map_size),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec lmdb_space(binary(), non_neg_integer()) ::
+          {:ok, {non_neg_integer(), non_neg_integer(), pos_integer()}} | {:error, term()}
+  def lmdb_space(_path, _map_size), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec lmdb_compact_copy(binary(), binary(), non_neg_integer()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def lmdb_compact_copy(_path, _destination, _map_size),
     do: :erlang.nif_error(:nif_not_loaded)
 
   @spec lmdb_last_txn_id(binary(), non_neg_integer()) ::

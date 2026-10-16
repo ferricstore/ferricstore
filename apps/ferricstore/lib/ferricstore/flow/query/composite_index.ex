@@ -28,6 +28,11 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
   @max_covering_record_fields CoveringCodec.max_record_fields()
   @reverse_prefix "flow-composite-reverse:1:"
   @reverse_value_tag :flow_composite_reverse
+  # v2 reverse values: no shared global key prefix, no per-key identity suffix
+  # (derived from the state key), and each key body front-coded against the
+  # previous one. Distinct from v1, which is an external term (first byte 131).
+  @compact_reverse_version 0xC2
+  @reverse_definition_bytes 40
   @max_u64 0xFFFF_FFFF_FFFF_FFFF
   @max_exact_integer 9_007_199_254_740_991
   @max_reverse_entries 128
@@ -251,7 +256,10 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
              is_integer(expire_at_ms) and expire_at_ms >= 0 and expire_at_ms <= @max_u64 do
     with {:ok, id} <- Keys.run_id_from_state_key(state_key),
          true <- valid_reverse_keys?(keys, id) do
-      TermCodec.encode({@reverse_value_tag, 1, state_key, keys, expire_at_ms})
+      case encode_compact_reverse(state_key, keys, expire_at_ms) do
+        {:ok, blob} -> blob
+        :error -> TermCodec.encode({@reverse_value_tag, 1, state_key, keys, expire_at_ms})
+      end
     else
       _invalid -> raise ArgumentError, "composite reverse keys are invalid"
     end
@@ -267,8 +275,8 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
              is_binary(expected_state_key) and expected_state_key != "" and
              byte_size(expected_state_key) <= @max_state_key_bytes do
     with {:ok, id} <- Keys.run_id_from_state_key(expected_state_key) do
-      case TermCodec.decode(blob) do
-        {:ok, {@reverse_value_tag, 1, ^expected_state_key, keys, expire_at_ms}}
+      case decode_reverse_payload(blob) do
+        {:ok, {^expected_state_key, keys, expire_at_ms}}
         when is_list(keys) and is_integer(expire_at_ms) and expire_at_ms >= 0 and
                expire_at_ms <= @max_u64 ->
           if valid_reverse_keys?(keys, id),
@@ -303,8 +311,8 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
   def decode_reverse_row(key, blob)
       when is_binary(key) and is_binary(blob) and
              byte_size(blob) <= @max_reverse_value_bytes do
-    case TermCodec.decode(blob) do
-      {:ok, {@reverse_value_tag, 1, state_key, keys, expire_at_ms}}
+    case decode_reverse_payload(blob) do
+      {:ok, {state_key, keys, expire_at_ms}}
       when is_binary(state_key) and state_key != "" and
              byte_size(state_key) <= @max_state_key_bytes and is_list(keys) and
              is_integer(expire_at_ms) and expire_at_ms >= 0 and expire_at_ms <= @max_u64 ->
@@ -324,6 +332,125 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
   end
 
   def decode_reverse_row(_key, _blob), do: :error
+
+  defp decode_reverse_payload(<<@compact_reverse_version, _rest::binary>> = blob),
+    do: decode_compact_reverse(blob)
+
+  defp decode_reverse_payload(blob) do
+    case TermCodec.decode(blob) do
+      {:ok, {@reverse_value_tag, 1, state_key, keys, expire_at_ms}} ->
+        {:ok, {state_key, keys, expire_at_ms}}
+
+      _other ->
+        :error
+    end
+  end
+
+  # Keys were validated by valid_reverse_keys?/2, so each one starts with the
+  # global storage prefix and ends with the record's identity suffix.
+  defp encode_compact_reverse(state_key, keys, expire_at_ms)
+       when byte_size(state_key) <= 0xFFFF do
+    global_bytes = byte_size(IndexDefinition.global_storage_prefix())
+    fixed_bytes = global_bytes + @reverse_definition_bytes + @entry_identity_bytes
+
+    keys
+    |> Enum.reduce_while({[], <<>>}, fn key, {entries, previous_body} ->
+      body_bytes = byte_size(key) - fixed_bytes
+
+      if body_bytes >= 0 and body_bytes <= 0xFFFF do
+        <<_global::binary-size(^global_bytes), definition::binary-size(@reverse_definition_bytes),
+          body::binary-size(^body_bytes), _identity::binary>> = key
+
+        shared = :binary.longest_common_prefix([previous_body, body])
+        suffix = binary_part(body, shared, body_bytes - shared)
+
+        entry = [
+          definition,
+          <<shared::unsigned-big-16, byte_size(suffix)::unsigned-big-16>>,
+          suffix
+        ]
+
+        {:cont, {[entry | entries], body}}
+      else
+        {:halt, :error}
+      end
+    end)
+    |> case do
+      {entries, _last_body} ->
+        body =
+          IO.iodata_to_binary([
+            <<expire_at_ms::unsigned-big-64, byte_size(state_key)::unsigned-big-16>>,
+            state_key,
+            <<length(keys)::unsigned-big-16>>,
+            Enum.reverse(entries)
+          ])
+
+        {:ok, <<@compact_reverse_version, :erlang.crc32(body)::unsigned-big-32, body::binary>>}
+
+      :error ->
+        :error
+    end
+  end
+
+  defp encode_compact_reverse(_state_key, _keys, _expire_at_ms), do: :error
+
+  defp decode_compact_reverse(
+         <<@compact_reverse_version, checksum::unsigned-big-32, body::binary>>
+       ) do
+    with true <- :erlang.crc32(body) == checksum,
+         <<expire_at_ms::unsigned-big-64, state_key_bytes::unsigned-big-16, rest::binary>> <-
+           body,
+         true <- state_key_bytes > 0 and state_key_bytes <= @max_state_key_bytes,
+         <<state_key::binary-size(^state_key_bytes), count::unsigned-big-16, entries::binary>> <-
+           rest,
+         true <- count > 0 and count <= @max_reverse_entries,
+         {:ok, id} <- Keys.run_id_from_state_key(state_key),
+         identity = <<@entry_identity_tag, :crypto.hash(:sha256, id)::binary-size(32)>>,
+         {:ok, keys} <-
+           decode_compact_reverse_keys(
+             entries,
+             count,
+             IndexDefinition.global_storage_prefix(),
+             identity,
+             <<>>,
+             []
+           ) do
+      {:ok, {state_key, keys, expire_at_ms}}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp decode_compact_reverse(_blob), do: :error
+
+  defp decode_compact_reverse_keys(<<>>, 0, _global, _identity, _previous_body, keys),
+    do: {:ok, Enum.reverse(keys)}
+
+  defp decode_compact_reverse_keys(
+         <<definition::binary-size(@reverse_definition_bytes), shared::unsigned-big-16,
+           suffix_bytes::unsigned-big-16, rest::binary>>,
+         remaining,
+         global,
+         identity,
+         previous_body,
+         keys
+       )
+       when remaining > 0 and shared <= byte_size(previous_body) do
+    case rest do
+      <<suffix::binary-size(^suffix_bytes), rest::binary>> ->
+        body = binary_part(previous_body, 0, shared) <> suffix
+
+        decode_compact_reverse_keys(rest, remaining - 1, global, identity, body, [
+          global <> definition <> body <> identity | keys
+        ])
+
+      _truncated ->
+        :error
+    end
+  end
+
+  defp decode_compact_reverse_keys(_entries, _remaining, _global, _identity, _body, _keys),
+    do: :error
 
   @spec decode_entry_value(binary()) :: {:ok, map()} | :error
   def decode_entry_value(blob)

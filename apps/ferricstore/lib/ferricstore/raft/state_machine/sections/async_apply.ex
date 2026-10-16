@@ -1176,6 +1176,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         end)
       end
 
+      defp apply_single(state, {:flow_restore, _key, attrs}) do
+        apply_flow_single_with_telemetry(state, :flow_restore, attrs, fn ->
+          do_flow_restore(state, attrs)
+        end)
+      end
+
       defp apply_single(state, {:flow_signal, _key, attrs}) do
         apply_flow_single_with_telemetry(state, :flow_signal, attrs, fn ->
           do_flow_signal(state, attrs)
@@ -1320,6 +1326,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       defp apply_single(state, {:bloom_create, key, num_bits, num_hashes, prob_meta}) do
         do_prob_command(state, fn ->
           create_bloom_metadata(state, key, num_bits, num_hashes, prob_meta)
+        end)
+      end
+
+      defp apply_single(state, {:prob_restore, key, type, metadata, bytes, expire_at_ms}) do
+        do_prob_command(state, fn ->
+          restore_prob(state, key, type, metadata, bytes, expire_at_ms)
         end)
       end
 

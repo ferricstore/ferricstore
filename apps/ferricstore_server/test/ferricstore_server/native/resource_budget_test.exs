@@ -258,7 +258,7 @@ defmodule FerricstoreServer.Native.ResourceBudgetTest do
   end
 
   @tag :lock_free_resource_budget
-  test "normal scoped lease accounting does not use the coordinator mailbox" do
+  test "scoped lease accounting does not use the coordinator mailbox after caller registration" do
     name = :"native_resource_scoped_fast_path_#{System.unique_integer([:positive])}"
 
     pid =
@@ -272,6 +272,8 @@ defmodule FerricstoreServer.Native.ResourceBudgetTest do
       end
     end)
 
+    assert {:ok, warmup} = ResourceBudget.acquire_scoped(name, :executions, 1)
+    assert :ok = ResourceBudget.release_scoped(warmup)
     :ok = :sys.suspend(pid)
     assert {:ok, token} = ResourceBudget.acquire_scoped(name, :executions, 1)
     assert :ok = ResourceBudget.release_scoped(token)
@@ -469,6 +471,136 @@ defmodule FerricstoreServer.Native.ResourceBudgetTest do
 
     assert :atomics.get(active, 2) <= 4
     assert ResourceBudget.usage(name).executions == 0
+  end
+
+  @tag :interrupted_resource_accounting
+  test "killed scoped accounting cannot strand capacity or erase a live owner's charge" do
+    name = :"native_resource_interrupted_scoped_#{System.unique_integer([:positive])}"
+    start_supervised!({ResourceBudget, name: name, limits: %{executions: 2}})
+    assert {:ok, held} = ResourceBudget.acquire(name, :executions, self(), 1)
+
+    for _attempt <- 1..128 do
+      kill_accounting_worker(fn ->
+        case ResourceBudget.acquire_scoped(name, :executions, 1) do
+          {:ok, token} -> ResourceBudget.release_scoped(token)
+          {:error, {:limit, :executions}} -> :ok
+        end
+      end)
+
+      assert :ok = GenServer.call(name, {:reclaim_scoped, :all})
+      assert ResourceBudget.usage(name).executions == 1
+      assert {:ok, replacement} = ResourceBudget.acquire_scoped(name, :executions, 1)
+      assert :ok = ResourceBudget.release_scoped(replacement)
+    end
+
+    assert :ok = ResourceBudget.release(name, held)
+    assert ResourceBudget.usage(name).executions == 0
+  end
+
+  @tag :interrupted_resource_accounting
+  test "reclaim repairs a killed accounting worker whose DOWN is still queued" do
+    name = :"native_resource_interrupted_queued_down_#{System.unique_integer([:positive])}"
+    coordinator = start_supervised!({ResourceBudget, name: name, limits: %{executions: 2}})
+    assert {:ok, held} = ResourceBudget.acquire(name, :executions, self(), 1)
+
+    for _attempt <- 1..128 do
+      # A fresh scan, then the race: the worker's DOWN lands behind the reclaim.
+      assert :ok = GenServer.call(name, {:reclaim_scoped, :all})
+      :ok = :sys.suspend(coordinator)
+
+      kill_accounting_worker(fn ->
+        case ResourceBudget.acquire_scoped(name, :executions, 1) do
+          {:ok, token} -> ResourceBudget.release_scoped(token)
+          {:error, {:limit, :executions}} -> :ok
+        end
+      end)
+
+      reclaim = Task.async(fn -> GenServer.call(name, {:reclaim_scoped, :all}) end)
+      Process.sleep(1)
+      :ok = :sys.resume(coordinator)
+      assert :ok = Task.await(reclaim)
+      assert ResourceBudget.usage(name).executions == 1
+    end
+
+    assert :ok = ResourceBudget.release(name, held)
+  end
+
+  @tag :interrupted_resource_accounting
+  test "killed transferable lease accounting cannot strand byte reservations" do
+    name = :"native_resource_interrupted_bytes_#{System.unique_integer([:positive])}"
+
+    # No periodic sweep: only the owner's DOWN and the reclaim below repair counters.
+    coordinator =
+      start_supervised!(
+        {ResourceBudget,
+         name: name, limits: %{inbound_bytes: 8}, scoped_sweep_interval_ms: 60_000}
+      )
+
+    for _attempt <- 1..128 do
+      worker =
+        kill_accounting_worker(fn ->
+          case ResourceBudget.acquire(name, :inbound_bytes, self(), 2) do
+            {:ok, token} ->
+              ResourceBudget.resize(name, token, 8)
+              ResourceBudget.resize(name, token, 4)
+              ResourceBudget.release_many(name, [token])
+
+            {:error, {:limit, :inbound_bytes}} ->
+              :ok
+          end
+        end)
+
+      # A lease the worker held between calls is freed when the coordinator
+      # handles its DOWN, which can arrive after the test's own DOWN.
+      assert eventually(fn ->
+               not Map.has_key?(:sys.get_state(coordinator).owner_monitors, worker)
+             end)
+
+      assert :ok = GenServer.call(name, {:reclaim_scoped, :all})
+      assert ResourceBudget.usage(name).inbound_bytes == 0
+    end
+  end
+
+  test "idle accounting sweeps do not scan registered inactive callers" do
+    name = :"native_resource_idle_actors_#{System.unique_integer([:positive])}"
+
+    coordinator =
+      start_supervised!({ResourceBudget, name: name, scoped_sweep_interval_ms: 60_000})
+
+    parent = self()
+
+    actors =
+      for _ <- 1..1_000 do
+        spawn(fn ->
+          {:ok, token} = ResourceBudget.acquire_scoped(name, :executions, 0)
+          :ok = ResourceBudget.release_scoped(token)
+          send(parent, :registered_idle_actor)
+          receive do: (:stop -> :ok)
+        end)
+      end
+
+    on_exit(fn -> Enum.each(actors, &Process.exit(&1, :kill)) end)
+    Enum.each(actors, fn _ -> assert_receive :registered_idle_actor, 1_000 end)
+    :sys.get_state(coordinator)
+    {:reductions, before_reductions} = Process.info(coordinator, :reductions)
+    Enum.each(1..10, fn _ -> send(coordinator, :sweep_scoped_leases) end)
+    :sys.get_state(coordinator)
+    {:reductions, after_reductions} = Process.info(coordinator, :reductions)
+    assert after_reductions - before_reductions < 10_000
+    assert ResourceBudget.usage(name).executions == 0
+  end
+
+  defp kill_accounting_worker(operation) do
+    {worker, monitor} = spawn_monitor(fn -> repeat_accounting(operation) end)
+    Process.sleep(1)
+    Process.exit(worker, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}, 1_000
+    worker
+  end
+
+  defp repeat_accounting(operation) do
+    operation.()
+    repeat_accounting(operation)
   end
 
   defp eventually(fun, attempts \\ 50)

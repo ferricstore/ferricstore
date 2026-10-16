@@ -137,6 +137,40 @@ defmodule Ferricstore.Flow.LMDB.RetentionTest do
     assert {:ok, ^foreign_count_value} = LMDB.get(path, foreign_count_key)
   end
 
+  test "terminal sweep removes expiry rows in both the compact and the legacy encoding", %{
+    path: path
+  } do
+    for {flow_id, legacy?} <- [{"order-compact", false}, {"order-legacy", true}] do
+      index_key = Ferricstore.Flow.Keys.state_index_key("invoice", "completed", "tenant-a")
+      state_key = Ferricstore.Flow.Keys.state_key(flow_id, "tenant-a")
+      terminal_key = LMDB.terminal_index_key(index_key, flow_id, 5)
+      count_key = LMDB.terminal_count_key(index_key)
+      reverse_key = LMDB.terminal_by_state_key_key(state_key)
+      expire_key = LMDB.terminal_expire_key(10, terminal_key)
+
+      expire_value =
+        if legacy?,
+          do: Ferricstore.TermCodec.encode({terminal_key, state_key, count_key}),
+          else: LMDB.encode_terminal_expire_value(terminal_key, state_key, count_key)
+
+      unless legacy?, do: assert(byte_size(expire_value) == 1)
+
+      assert :ok =
+               LMDB.write_batch(path, [
+                 {:put, terminal_key,
+                  LMDB.encode_terminal_index_value(flow_id, 5, 10, state_key, count_key)},
+                 {:put, expire_key, expire_value},
+                 {:put, reverse_key, terminal_key},
+                 {:put, count_key, LMDB.encode_count(1)}
+               ])
+
+      assert {:ok, 1} = LMDB.sweep_expired_terminal(path, 20, 10)
+      assert :not_found = LMDB.get(path, terminal_key)
+      assert :not_found = LMDB.get(path, expire_key)
+      assert :not_found = LMDB.get(path, reverse_key)
+    end
+  end
+
   test "terminal sweep write plans abort when the counter changes after planning", %{path: path} do
     index_key = "state:completed"
     terminal_key = LMDB.terminal_index_key(index_key, "flow-1", 5)

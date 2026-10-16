@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
   @moduledoc false
 
   alias Ferricstore.Flow.{Keys, LMDB, RecordIdentity}
+  alias Ferricstore.Flow.LMDBWriter.ProjectionOps
 
   alias Ferricstore.Flow.Query.{
     CompositeProjection,
@@ -178,11 +179,13 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
          projection_definitions,
          cache
        ) do
+    # `expire_at_ms` is the source expiry, which verification compares against
+    # primary storage. Projection rows use the live writer's expiry for parity.
     CompositeProjection.reconcile_subset(
       path,
       state_key,
       record,
-      expire_at_ms,
+      ProjectionOps.flow_state_projection_expire_at(record, expire_at_ms),
       definitions,
       projection_definitions,
       cache

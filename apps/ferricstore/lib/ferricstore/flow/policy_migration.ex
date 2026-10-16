@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.PolicyMigration do
   @moduledoc false
 
   alias Ferricstore.Flow
+  alias Ferricstore.Flow.KeydirSpill
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.LMDBMirror
@@ -511,6 +512,13 @@ defmodule Ferricstore.Flow.PolicyMigration do
     end
   end
 
+  defp read_catalog_value(ctx, shard_index, catalog_key) do
+    case KeydirSpill.read_local(ctx, shard_index, catalog_key) do
+      :keydir -> Router.read_shard_value(ctx, shard_index, catalog_key)
+      result -> result
+    end
+  end
+
   defp hydrate_catalog_entries(ctx, shard_index, type, entries, max_bytes) do
     Enum.reduce_while(entries, {:ok, [], 0, false}, fn entry, {:ok, acc, bytes, false} ->
       case hydrate_catalog_entry(ctx, shard_index, type, entry) do
@@ -540,7 +548,7 @@ defmodule Ferricstore.Flow.PolicyMigration do
   end
 
   defp hydrate_catalog_entry(ctx, shard_index, type, %{catalog_key: catalog_key} = entry) do
-    case Router.read_shard_value(ctx, shard_index, catalog_key) do
+    case read_catalog_value(ctx, shard_index, catalog_key) do
       {:ok, nil} ->
         {:ok, Map.put(entry, :record_value, nil)}
 

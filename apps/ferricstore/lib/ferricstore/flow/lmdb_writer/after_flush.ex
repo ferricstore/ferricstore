@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
   @moduledoc false
 
   alias Ferricstore.Flow.Hibernation
+  alias Ferricstore.Flow.KeydirSpill
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.LMDBWriter.ProjectionOps
   alias Ferricstore.Flow.Locator
@@ -64,9 +65,15 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
            publication_ctx,
            cleanup
          ) do
-      :ok -> :ok
-      :stale -> :ok
-      {:error, _reason} = error -> error
+      :ok ->
+        spill_record = %{type: type, id: id, partition_key: partition_key}
+        KeydirSpill.request(publication_ctx, shard_index, ets, spill_record, state_key)
+
+      :stale ->
+        :ok
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -122,7 +129,7 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
                  cleanup,
                  source_row
                ) do
-            :ok -> :ok
+            :ok -> KeydirSpill.request(publication_ctx, shard_index, ets, record, state_key)
             :stale -> :ok
             {:error, _reason} = error -> error
           end
@@ -206,6 +213,21 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
     else
       apply_after_flush(action, publication_ctx)
     end
+  end
+
+  def apply_after_flush({:drop_spilled_keydir_rows, shard_index, ets, rows}, publication_ctx)
+      when is_integer(shard_index) and shard_index >= 0 and is_list(rows) do
+    Enum.each(rows, fn row ->
+      with_publication_write(publication_ctx, shard_index, fn ->
+        if Keydir.delete_unchanged_source(ets, row) do
+          track_spilled_binary_remove(publication_ctx, shard_index, row)
+        end
+
+        :ok
+      end)
+    end)
+  rescue
+    ArgumentError -> {:error, :source_keydir_unavailable}
   end
 
   def apply_after_flush({:delete_flow_tombstone, ets, key}, _publication_ctx) do
@@ -475,6 +497,22 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
        when is_function(fun, 0) do
     Ferricstore.Store.PublicationEpoch.with_write(publication_ctx, shard_index, fun)
   end
+
+  defp track_spilled_binary_remove(
+         %{keydir_binary_bytes: ref, shard_count: count},
+         shard_index,
+         {key, value, _expire_at_ms, _lfu, _file_id, _offset, _size}
+       )
+       when ref != nil and shard_index < count do
+    bytes = offheap_size(key) + offheap_size(value)
+    if bytes > 0, do: :atomics.sub(ref, shard_index + 1, bytes)
+    :ok
+  end
+
+  defp track_spilled_binary_remove(_publication_ctx, _shard_index, _row), do: :ok
+
+  defp offheap_size(value) when is_binary(value) and byte_size(value) > 64, do: byte_size(value)
+  defp offheap_size(_value), do: 0
 
   defp delete_pruned_keydir_entry(ets, row) do
     if Keydir.delete_unchanged_source(ets, row) do

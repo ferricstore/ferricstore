@@ -770,6 +770,16 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
+  # Spill copies ride along with the next flush but do not count as pending
+  # projection work: retention and idle checks wait for that count to drain, and
+  # a spilled row stays in the keydir until its copy is written.
+  def handle_info({:keydir_spill, shard_index, ets, rows}, %{shard_index: shard_index} = state) do
+    ops = Enum.map(rows, &{:keydir_spill_from_source, ets, &1})
+    after_flush = [{:drop_spilled_keydir_rows, shard_index, ets, rows}]
+    spilled = enqueue_ops(ops, after_flush, state, System.monotonic_time())
+    {:noreply, %{spilled | count: state.count}}
+  end
+
   def handle_info({:apply_after_flush, action}, state) do
     case apply_after_flush(action, state.instance_ctx) do
       :ok ->
@@ -949,6 +959,11 @@ defmodule Ferricstore.Flow.LMDBWriter do
           "Flow LMDB writer shard #{state.shard_index} flush failed: #{inspect(reason)}"
         )
 
+        # The pending ops stay queued for the retry. Once a flush succeeds, the
+        # dirty-projection reconcile checks the shard and clears the degraded
+        # flag, which nothing else does while the shard sees no new work.
+        state = %{state | projection_dirty?: true}
+
         state =
           if instance_suspended?(state.instance_name) do
             %{state | timer_ref: nil, suspended?: true}
@@ -1033,6 +1048,19 @@ defmodule Ferricstore.Flow.LMDBWriter do
       {:ok, persisted_state, length(expanded_ops)}
     else
       {:error, {:compare_failed, _key}}
+      when retries_remaining > 0 ->
+        do_flush_ops_and_marker_with_permit(
+          state,
+          source_ops,
+          started_at,
+          retries_remaining - 1,
+          source_wait
+        )
+
+      # Online backfill commits composite counters without the flush permit, so a
+      # counter cached earlier in this expansion can be older than a reverse row
+      # read later. Re-expanding starts from a fresh projection cache.
+      {:error, :invalid_composite_counter}
       when retries_remaining > 0 ->
         do_flush_ops_and_marker_with_permit(
           state,

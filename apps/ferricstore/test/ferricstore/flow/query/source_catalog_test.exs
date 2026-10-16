@@ -43,7 +43,7 @@ defmodule Ferricstore.Flow.Query.SourceCatalogTest do
     assert {:ok, %{catalog_key: ^catalog_key, migration_generation: 7, type_digest: type_digest}} =
              Keys.decode_policy_catalog_projection_key(projection_key)
 
-    assert byte_size(type_digest) == 43
+    assert byte_size(type_digest) == Ferricstore.Flow.Digest.length()
 
     malformed =
       Keys.policy_catalog_projection_global_prefix() <>

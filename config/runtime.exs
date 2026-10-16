@@ -232,6 +232,28 @@ if config_env() == :prod do
          configured -> String.to_integer(configured)
        end),
     flow_hibernation_enabled: boolean_env.("FERRICSTORE_FLOW_HIBERNATION_ENABLED", true),
+    # LMDB never shrinks its data file; at startup a shard whose file is at least
+    # this large and mostly free pages is replaced by a compacted copy.
+    flow_lmdb_startup_compaction: boolean_env.("FERRICSTORE_FLOW_LMDB_STARTUP_COMPACTION", true),
+    # Moves bookkeeping rows of pruned terminal Flows from the keydir to LMDB.
+    # Enable only when every node runs a version that reads spilled rows.
+    flow_keydir_spill: boolean_env.("FERRICSTORE_FLOW_KEYDIR_SPILL", false),
+    flow_lmdb_compaction_min_free_ratio:
+      String.to_float(System.get_env("FERRICSTORE_FLOW_LMDB_COMPACTION_MIN_FREE_RATIO", "0.5")),
+    flow_lmdb_compaction_min_file_bytes:
+      String.to_integer(
+        System.get_env("FERRICSTORE_FLOW_LMDB_COMPACTION_MIN_FILE_BYTES", "268435456")
+      ),
+    # Built-in composite query indexes to maintain: "all", "none" or a
+    # comma-separated list of index ids from priv/flow_query/index-catalog.json.
+    # Deselected indexes are retired and their rows deleted; selecting one again
+    # rebuilds it once any retirement still in progress has finished.
+    flow_query_builtin_indexes:
+      (case String.trim(System.get_env("FERRICSTORE_FLOW_QUERY_BUILTIN_INDEXES", "all")) do
+         "all" -> :all
+         "none" -> :none
+         ids -> ids |> String.split(",", trim: true) |> Enum.map(&String.trim/1)
+       end),
     flow_governance_limit_storage_cleanup_interval_ms:
       String.to_integer(
         System.get_env("FERRICSTORE_FLOW_LIMIT_STORAGE_CLEANUP_INTERVAL_MS", "1000")
@@ -519,6 +541,8 @@ if config_env() == :prod do
       ),
     native_frame_assembly_timeout_ms:
       String.to_integer(System.get_env("FERRICSTORE_NATIVE_FRAME_ASSEMBLY_TIMEOUT_MS", "15000")),
+    native_lane_barrier_timeout_ms:
+      positive_integer_env.("FERRICSTORE_NATIVE_LANE_BARRIER_TIMEOUT_MS", 15_000),
     native_send_timeout_ms: positive_integer_env.("FERRICSTORE_NATIVE_SEND_TIMEOUT_MS", 15_000),
     native_max_value_items:
       String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_VALUE_ITEMS", "100000")),

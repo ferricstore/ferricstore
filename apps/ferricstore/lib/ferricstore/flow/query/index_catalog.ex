@@ -54,6 +54,33 @@ defmodule Ferricstore.Flow.Query.IndexCatalog do
 
   def load(_path, _opts), do: {:error, :invalid_query_index_catalog_file}
 
+  @doc """
+  Keeps only the selected built-in indexes (`:all`, `:none` or a list of ids).
+  The catalog version and digest stay those of the shipped catalog, so the
+  registry treats deselected indexes as removed and retires their rows.
+  """
+  @spec select_builtin(t(), :all | :none | [binary()]) :: {:ok, t()} | {:error, term()}
+  def select_builtin(catalog, :all), do: {:ok, catalog}
+  def select_builtin(catalog, :none), do: {:ok, %{catalog | definitions: []}}
+
+  def select_builtin(%{definitions: definitions} = catalog, ids) when is_list(ids) do
+    known = MapSet.new(definitions, & &1.id)
+
+    case Enum.find(ids, &(not MapSet.member?(known, &1))) do
+      nil ->
+        selected = MapSet.new(ids)
+
+        {:ok,
+         %{catalog | definitions: Enum.filter(definitions, &MapSet.member?(selected, &1.id))}}
+
+      unknown ->
+        {:error, {:unknown_builtin_query_index, unknown}}
+    end
+  end
+
+  def select_builtin(_catalog, selection),
+    do: {:error, {:invalid_builtin_query_index_selection, selection}}
+
   defp decode_catalog(
          %{
            "catalog_version" => version,

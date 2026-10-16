@@ -11,6 +11,7 @@ defmodule Ferricstore.Flow.Query.LineageExecutor do
     MemoryBudget,
     Plan,
     Planner,
+    RecordOrder,
     RecordProjection
   }
 
@@ -192,7 +193,7 @@ defmodule Ferricstore.Flow.Query.LineageExecutor do
         memory_high_water_bytes >= memory and
         Enum.all?(records, &valid_record?(&1, descriptor)) and
         length(ids) == length(Enum.uniq(ids)) and
-        keys == Enum.sort(keys, direction) and
+        RecordOrder.ordered?(keys, direction) and
         valid_resume_boundary?(keys, boundary, direction) and
         valid_page_boundary?(records, has_more, continuation)
 

@@ -956,6 +956,50 @@ defmodule Ferricstore.Flow.Query.IndexRegistryTest do
     assert {:error, :query_index_not_found} = IndexRegistry.status(server_name, "removed", 1)
   end
 
+  test "built-in index selection drops disabled catalog indexes for cleanup", context do
+    %{ctx: ctx, server_name: server_name} = context
+    catalog_path = Path.join(ctx.data_dir, "selection-catalog.json")
+    write_catalog!(catalog_path, 1, [catalog_index("kept", 1), catalog_index("dropped", 1)])
+    pid = start_registry!(ctx, server_name, catalog_path)
+    assert {:ok, %{state: :building}} = IndexRegistry.status(server_name, "dropped", 1)
+    GenServer.stop(pid)
+
+    pid = start_registry!(ctx, server_name, catalog_path, builtin_indexes: ["kept"])
+    assert {:ok, %{state: :building}} = IndexRegistry.status(server_name, "kept", 1)
+
+    assert {:ok, %{state: :failed, validation: %{reason: :catalog_removed}}} =
+             IndexRegistry.status(server_name, "dropped", 1)
+
+    complete_retirement!(server_name, "dropped", 1, ctx.shard_count)
+    assert {:error, :query_index_not_found} = IndexRegistry.status(server_name, "dropped", 1)
+    GenServer.stop(pid)
+
+    # Selecting it again later builds it from scratch.
+    _pid = start_registry!(ctx, server_name, catalog_path)
+    assert {:ok, %{state: :building}} = IndexRegistry.status(server_name, "dropped", 1)
+  end
+
+  test "built-in index selection can disable every index and rejects unknown ids", context do
+    %{ctx: ctx, server_name: server_name} = context
+    catalog_path = Path.join(ctx.data_dir, "none-catalog.json")
+    write_catalog!(catalog_path, 1, [catalog_index("only", 1)])
+
+    pid = start_registry!(ctx, server_name, catalog_path, builtin_indexes: :none)
+    assert {:error, :query_index_not_found} = IndexRegistry.status(server_name, "only", 1)
+    assert {:ok, %RegistrySnapshot{indexes: []}} = IndexRegistry.snapshot(ctx, 0)
+    GenServer.stop(pid)
+
+    Process.flag(:trap_exit, true)
+
+    assert {:error, {:unknown_builtin_query_index, "missing"}} =
+             IndexRegistry.start_link(
+               instance_ctx: ctx,
+               name: server_name,
+               catalog_path: catalog_path,
+               builtin_indexes: ["only", "missing"]
+             )
+  end
+
   test "catalog reconciliation rejects aggregate validation counter overflow", context do
     %{ctx: ctx, server_name: server_name} = context
     catalog_path = Path.join(ctx.data_dir, "overflow-catalog.json")
@@ -1341,12 +1385,13 @@ defmodule Ferricstore.Flow.Query.IndexRegistryTest do
              )
   end
 
-  defp start_registry!(ctx, server_name, catalog_path \\ nil) do
+  defp start_registry!(ctx, server_name, catalog_path \\ nil, extra_opts \\ []) do
     opts =
       [instance_ctx: ctx, name: server_name]
       |> then(fn opts ->
         if catalog_path, do: Keyword.put(opts, :catalog_path, catalog_path), else: opts
       end)
+      |> Keyword.merge(extra_opts)
 
     {:ok, pid} =
       IndexRegistry.start_link(opts)

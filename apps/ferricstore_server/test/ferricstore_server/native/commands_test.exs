@@ -974,6 +974,30 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert setname_error =~ "valid UTF-8"
   end
 
+  test "HELLO, STARTUP, and CLIENT.SETNAME detach codec-backed client names" do
+    name = String.duplicate("n", 80)
+    padding = :binary.copy("x", 8 * 1_024 * 1_024)
+
+    requests = [
+      {@op_hello, %{"client_name" => name, "padding" => padding}, "client_name"},
+      {@op_startup, %{"client_name" => name, "padding" => padding}, "client_name"},
+      {@op_client_set_name, %{"name" => name, "padding" => padding}, "name"}
+    ]
+
+    for {opcode, request, name_field} <- requests do
+      body = Codec.encode_value(request)
+      assert {:ok, decoded} = Codec.decode_body(opcode, 0, body)
+      decoded_name = Map.fetch!(decoded, name_field)
+      assert decoded_name == name
+      assert :binary.referenced_byte_size(decoded_name) > byte_size(name)
+
+      assert {:ok, _response, %{client_name: ^name} = next_state} =
+               Commands.execute(opcode, decoded, state())
+
+      assert :binary.referenced_byte_size(next_state.client_name) <= byte_size(name)
+    end
+  end
+
   test "HELLO redacts native endpoints before authentication is complete" do
     {status, payload, _state} =
       Commands.execute(

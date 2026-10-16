@@ -486,6 +486,8 @@ defmodule FerricStore do
   defdelegate echo(message), to: SystemAPI
   @spec flushall() :: :ok | {:error, term()}
   defdelegate flushall(), to: SystemAPI
+  defdelegate export(path, opts \\ []), to: SystemAPI
+  defdelegate restore(path, opts \\ []), to: SystemAPI
   defdelegate pipeline(fun), to: SystemAPI
   defguardeddelegate(batch_get(keys), to: SystemAPI, keys: keys)
   defdelegate packed_batch_get(packed_keys), to: SystemAPI

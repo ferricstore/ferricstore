@@ -1057,6 +1057,8 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.WarmOpensEmptyShardEnvBeforeFirstUs
           FerricStore.Instance.cleanup(instance_name)
           restore_env(:flow_lmdb_mode, old_mode)
           File.rm_rf!(data_dir)
+          # The backend is a singleton: starting it below stopped the default instance's.
+          Ferricstore.Test.ShardHelpers.restore_default_waraft!()
         end)
 
         assert :ok =

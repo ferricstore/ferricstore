@@ -1139,6 +1139,34 @@ defmodule Ferricstore.Flow.LMDB do
           value_size
         )
 
+  def encode_history_index_row(
+        history_index_key,
+        event_id,
+        event_ms,
+        compound_key,
+        expire_at_ms,
+        location
+      ),
+      do:
+        Ferricstore.Flow.LMDB.IndexCodec.encode_history_index_row(
+          history_index_key,
+          event_id,
+          event_ms,
+          compound_key,
+          expire_at_ms,
+          location
+        )
+
+  def decode_history_index_row(history_index_key, blob),
+    do: Ferricstore.Flow.LMDB.IndexCodec.decode_history_index_row(history_index_key, blob)
+
+  def decode_history_index_location_row(history_index_key, blob),
+    do:
+      Ferricstore.Flow.LMDB.IndexCodec.decode_history_index_location_row(
+        history_index_key,
+        blob
+      )
+
   def encode_history_expire_value(history_index_key),
     do: Ferricstore.Flow.LMDB.IndexCodec.encode_history_expire_value(history_index_key)
 
@@ -1326,7 +1354,7 @@ defmodule Ferricstore.Flow.LMDB do
        )
        when is_binary(terminal_value) do
     with {:ok, {id, updated_at_ms, expire_at_ms, stored_state_key, count_key}} <-
-           decode_terminal_index_entry(terminal_value),
+           decode_terminal_index_entry_row(terminal_key, terminal_value),
          true <- terminal_index_entry_key?(terminal_key, id, updated_at_ms),
          :ok <- validate_terminal_delete_state_key(state_key, stored_state_key) do
       ops =
@@ -1379,7 +1407,7 @@ defmodule Ferricstore.Flow.LMDB do
        )
        when is_binary(terminal_value) do
     with {:ok, {id, updated_at_ms, expire_at_ms, stored_state_key, count_key}} <-
-           decode_terminal_index_entry(terminal_value),
+           decode_terminal_index_entry_row(terminal_key, terminal_value),
          true <- terminal_index_entry_key?(terminal_key, id, updated_at_ms),
          :ok <- validate_terminal_delete_state_key(state_key, stored_state_key),
          {:ok, count, count_value} <- terminal_count_from_read_result(count_reader.(count_key)) do
@@ -1463,8 +1491,8 @@ defmodule Ferricstore.Flow.LMDB do
        )
        when is_integer(expire_at_ms) and expire_at_ms > 0 do
     expire_key = terminal_expire_key(expire_at_ms, terminal_key)
-    expire_value = encode_terminal_expire_value(terminal_key, state_key, count_key)
-    [{:compare, expire_key, expire_value}, {:delete, expire_key} | ops]
+    expire_values = terminal_expire_values(terminal_key, state_key, count_key)
+    [{:compare_any, expire_key, expire_values}, {:delete, expire_key} | ops]
   end
 
   defp prepend_terminal_expire_delete(
@@ -1494,8 +1522,43 @@ defmodule Ferricstore.Flow.LMDB do
         count_key
       )
 
+  def terminal_expire_values(terminal_key, state_key, count_key),
+    do:
+      Ferricstore.Flow.LMDB.IndexCodec.terminal_expire_values(
+        terminal_key,
+        state_key,
+        count_key
+      )
+
   def decode_terminal_expire_value(blob),
     do: Ferricstore.Flow.LMDB.IndexCodec.decode_terminal_expire_value(blob)
+
+  def encode_terminal_index_row(
+        terminal_key,
+        id,
+        updated_at_ms,
+        expire_at_ms,
+        state_key,
+        count_key
+      ),
+      do:
+        Ferricstore.Flow.LMDB.IndexCodec.encode_terminal_index_row(
+          terminal_key,
+          id,
+          updated_at_ms,
+          expire_at_ms,
+          state_key,
+          count_key
+        )
+
+  def decode_terminal_index_row(terminal_key, blob),
+    do: Ferricstore.Flow.LMDB.IndexCodec.decode_terminal_index_row(terminal_key, blob)
+
+  def decode_terminal_index_entry_row(terminal_key, blob),
+    do: Ferricstore.Flow.LMDB.IndexCodec.decode_terminal_index_entry_row(terminal_key, blob)
+
+  def terminal_index_row_count_key(terminal_key, blob),
+    do: Ferricstore.Flow.LMDB.IndexCodec.terminal_index_row_count_key(terminal_key, blob)
 
   def encode_count(count), do: Ferricstore.Flow.LMDB.IndexCodec.encode_count(count)
 
@@ -1530,6 +1593,9 @@ defmodule Ferricstore.Flow.LMDB do
 
   def decode_query_index_value(blob),
     do: Ferricstore.Flow.LMDB.IndexCodec.decode_query_index_value(blob)
+
+  def decode_query_index_row(key, blob),
+    do: Ferricstore.Flow.LMDB.IndexCodec.decode_query_index_row(key, blob)
 
   def decode_history_index_value(blob),
     do: Ferricstore.Flow.LMDB.IndexCodec.decode_history_index_value(blob)
@@ -1671,7 +1737,7 @@ defmodule Ferricstore.Flow.LMDB do
 
   defp history_index_delete_ops_from_read_result({:ok, history_value}, history_index_key)
        when is_binary(history_value) do
-    case decode_history_index_value(history_value) do
+    case decode_history_index_row(history_index_key, history_value) do
       {:ok, {event_id, event_ms, expire_at_ms, _compound_key}} ->
         if history_index_entry_key?(history_index_key, event_id, event_ms) do
           ops = [{:delete, history_index_key}]

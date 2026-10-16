@@ -1,6 +1,8 @@
 defmodule Ferricstore.Flow.Keys do
   @moduledoc false
 
+  alias Ferricstore.Flow.Digest
+
   @global_tag "{f}"
   @policy_prefix "f:" <> @global_tag <> ":policy:"
   @policy_attribute_count_prefix "f:" <> @global_tag <> ":policy-attribute:1:"
@@ -143,13 +145,11 @@ defmodule Ferricstore.Flow.Keys do
 
   def shared_value_ref_count_key(ref, shard_index)
       when is_binary(ref) and is_integer(shard_index) and shard_index >= 0 do
-    digest = :crypto.hash(:sha256, ref) |> Base.url_encode64(padding: false)
-    "f:" <> @global_tag <> ":svc:" <> Integer.to_string(shard_index) <> ":" <> digest
+    "f:" <> @global_tag <> ":svc:" <> Integer.to_string(shard_index) <> ":" <> digest(ref)
   end
 
   def shared_value_orphan_key(ref) when is_binary(ref) do
-    digest = :crypto.hash(:sha256, ref) |> Base.url_encode64(padding: false)
-    "f:" <> @global_tag <> ":svo:" <> digest
+    "f:" <> @global_tag <> ":svo:" <> digest(ref)
   end
 
   def retention_guard_key(id, partition_key \\ nil) when is_binary(id) do
@@ -166,8 +166,7 @@ defmodule Ferricstore.Flow.Keys do
 
   def retention_cleanup_member_key(id, owned_key, partition_key \\ nil)
       when is_binary(id) and is_binary(owned_key) do
-    digest = :crypto.hash(:sha256, owned_key) |> Base.url_encode64(padding: false)
-    retention_cleanup_member_prefix(id, partition_key) <> digest
+    retention_cleanup_member_prefix(id, partition_key) <> digest(owned_key)
   end
 
   def shared_value_ref_backfill_key(shard_index)
@@ -272,8 +271,7 @@ defmodule Ferricstore.Flow.Keys do
   def type_catalog_member_owns_state_key?(key, state_key)
       when is_binary(key) and is_binary(state_key) do
     with {:ok, _tag_prefix, remainder} <- split_internal_flow_key(key, "}:tc:1:"),
-         <<_type_digest::binary-size(43), ?:, state_digest::binary-size(43)>> <- remainder,
-         true <- valid_digest?(state_digest) do
+         {:ok, _type_digest, state_digest} <- split_digest_pair(remainder) do
       state_digest == digest(state_key)
     else
       _invalid -> false
@@ -330,10 +328,9 @@ defmodule Ferricstore.Flow.Keys do
   def decode_policy_catalog_projection_key(key) when is_binary(key) do
     prefix = policy_catalog_projection_global_prefix()
 
-    with <<^prefix::binary, type_digest::binary-size(43), ?:, generation::unsigned-big-64,
-           catalog_key::binary>>
-         when catalog_key != "" <- key,
-         true <- valid_digest?(type_digest),
+    with <<^prefix::binary, rest::binary>> <- key,
+         {:ok, type_digest, <<generation::unsigned-big-64, catalog_key::binary>>}
+         when catalog_key != "" <- split_digest(rest),
          {:ok, ^type_digest} <- type_catalog_digest_from_member(catalog_key) do
       {:ok,
        %{
@@ -720,6 +717,8 @@ defmodule Ferricstore.Flow.Keys do
 
   def retention_guard_key_from_state_key(_state_key), do: :error
 
+  def retention_guard_key?(key), do: internal_key_with_remainder?(key, "}:rtg:")
+
   def registry_key?(key), do: internal_key_with_remainder?(key, "}:r:")
 
   def tag(nil), do: @global_tag
@@ -738,8 +737,7 @@ defmodule Ferricstore.Flow.Keys do
   def tag(partition_key) when is_binary(partition_key), do: hashed_partition_tag(partition_key)
 
   defp hashed_partition_tag(partition_key) do
-    @partition_tag_prefix <>
-      Base.url_encode64(:crypto.hash(:sha256, partition_key), padding: false) <> "}"
+    @partition_tag_prefix <> Digest.encode(partition_key) <> "}"
   end
 
   defp type_catalog_descriptor_key_from_digest(type_digest) do
@@ -748,28 +746,42 @@ defmodule Ferricstore.Flow.Keys do
 
   defp type_catalog_digest_from_member(key) do
     with {:ok, _tag_prefix, remainder} <- split_internal_flow_key(key, "}:tc:1:"),
-         <<type_digest::binary-size(43), ?:, state_digest::binary-size(43)>> <- remainder,
-         true <- valid_digest?(type_digest) and valid_digest?(state_digest) do
+         {:ok, type_digest, _state_digest} <- split_digest_pair(remainder) do
       {:ok, type_digest}
     else
       _invalid -> :error
     end
   end
 
-  defp digest(value),
-    do: value |> then(&:crypto.hash(:sha256, &1)) |> Base.url_encode64(padding: false)
+  defp digest(value), do: Digest.encode(value)
 
-  defp valid_digest?(digest) when is_binary(digest) and byte_size(digest) == 43 do
-    case Base.url_decode64(digest, padding: false) do
-      {:ok, decoded} when byte_size(decoded) == 32 ->
-        Base.url_encode64(decoded, padding: false) == digest
+  defp valid_digest?(digest), do: canonical_digest?(digest)
 
-      _invalid ->
-        false
+  @doc false
+  # Either data format's digest length; see Ferricstore.Flow.Digest.
+  def canonical_digest?(digest), do: Digest.canonical?(digest)
+
+  # Splits "<digest>:<rest>". Base64 has no ':', so the first one ends the
+  # digest whatever its length.
+  defp split_digest(binary) do
+    case :binary.match(binary, ":") do
+      {position, 1} ->
+        <<digest::binary-size(^position), ?:, rest::binary>> = binary
+        if valid_digest?(digest), do: {:ok, digest, rest}, else: :error
+
+      :nomatch ->
+        :error
     end
   end
 
-  defp valid_digest?(_digest), do: false
+  defp split_digest_pair(binary) do
+    with {:ok, first, second} <- split_digest(binary),
+         true <- valid_digest?(second) do
+      {:ok, first, second}
+    else
+      _invalid -> :error
+    end
+  end
 
   defp flow_key_tag_prefix(key, marker) do
     case split_internal_flow_key(key, marker) do

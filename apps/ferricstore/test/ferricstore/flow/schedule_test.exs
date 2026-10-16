@@ -99,7 +99,7 @@ defmodule Ferricstore.Flow.ScheduleTest do
                  type: target_type,
                  state: "queued",
                  partition_key: target_partition,
-                 payload: %{source: "schedule"}
+                 payload: %{"source" => "schedule"}
                ]
              )
 
@@ -120,7 +120,7 @@ defmodule Ferricstore.Flow.ScheduleTest do
 
     assert target.type == target_type
     assert target.state == "queued"
-    assert target.payload == %{source: "schedule"}
+    assert target.payload == %{"source" => "schedule"}
 
     assert {:ok, fired_schedule} = FerricStore.flow_schedule_get(schedule_id)
     assert fired_schedule.state == "completed"
@@ -1482,12 +1482,12 @@ defmodule Ferricstore.Flow.ScheduleTest do
     target_partition = unique_flow_id("schedule-value-ref-partition")
 
     assert {:ok, %{ref: payload_ref}} =
-             FerricStore.flow_value_put(%{large: String.duplicate("p", 512)},
+             FerricStore.flow_value_put(%{"large" => String.duplicate("p", 512)},
                partition_key: target_partition
              )
 
     assert {:ok, %{ref: doc_ref}} =
-             FerricStore.flow_value_put(%{doc: "reservation"},
+             FerricStore.flow_value_put(%{"doc" => "reservation"},
                partition_key: target_partition
              )
 
@@ -1515,8 +1515,8 @@ defmodule Ferricstore.Flow.ScheduleTest do
                values: true
              )
 
-    assert target.payload == %{large: String.duplicate("p", 512)}
-    assert target.values == %{"reservation" => %{doc: "reservation"}}
+    assert target.payload == %{"large" => String.duplicate("p", 512)}
+    assert target.values == %{"reservation" => %{"doc" => "reservation"}}
     assert target.payload_ref == payload_ref
     assert get_in(target.value_refs, ["reservation", :ref]) == doc_ref
   end

@@ -221,10 +221,12 @@ fn v2_pread_at_async(
                 fadvise_random(&file);
                 let record = log::pread_record_from_file(&file, offset);
                 if let Ok(Some(ref r)) = record {
-                    let size =
-                        (log::HEADER_SIZE + r.key.len() + r.value.as_ref().map_or(0, Vec::len))
-                            as i64;
-                    fadvise_dontneed(&file, offset as i64, size);
+                    fadvise_dontneed_cold_read(
+                        &file,
+                        offset,
+                        r.key.len(),
+                        r.value.as_ref().map_or(0, Vec::len),
+                    );
                 }
                 record
             })
@@ -301,11 +303,12 @@ fn v2_pread_at_key_async<'a>(
                 fadvise_random(&file);
                 let value = log::pread_value_for_key_from_file(&file, offset, &expected_key);
                 if let Ok(Some(ref value)) = value {
-                    let size = (log::HEADER_SIZE
-                        + expected_key.len()
-                        + value.as_ref().map_or(0, Vec::len))
-                        as i64;
-                    fadvise_dontneed(&file, offset as i64, size);
+                    fadvise_dontneed_cold_read(
+                        &file,
+                        offset,
+                        expected_key.len(),
+                        value.as_ref().map_or(0, Vec::len),
+                    );
                 }
                 value
             })
@@ -495,10 +498,12 @@ fn pread_batch_for_path(
     for (index, offset) in sort_reads_by_offset(reads) {
         let value = match log::pread_record_from_file(&file, offset) {
             Ok(Some(record)) => {
-                let size = (log::HEADER_SIZE
-                    + record.key.len()
-                    + record.value.as_ref().map_or(0, Vec::len)) as i64;
-                fadvise_dontneed(&file, offset as i64, size);
+                fadvise_dontneed_cold_read(
+                    &file,
+                    offset,
+                    record.key.len(),
+                    record.value.as_ref().map_or(0, Vec::len),
+                );
                 record
                     .value
                     .map(BatchReadValue::Value)
@@ -540,10 +545,12 @@ fn pread_batch_for_path_keyed(
     for (index, offset, expected_key) in sort_keyed_reads_by_offset(reads) {
         let value = match log::pread_value_for_key_from_file(&file, offset, &expected_key) {
             Ok(Some(value)) => {
-                let size = (log::HEADER_SIZE
-                    + expected_key.len()
-                    + value.as_ref().map_or(0, Vec::len)) as i64;
-                fadvise_dontneed(&file, offset as i64, size);
+                fadvise_dontneed_cold_read(
+                    &file,
+                    offset,
+                    expected_key.len(),
+                    value.as_ref().map_or(0, Vec::len),
+                );
 
                 value
                     .map(BatchReadValue::Value)

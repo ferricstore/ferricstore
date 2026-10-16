@@ -542,9 +542,19 @@ acquire_record_group_file_direct(Dir, Path) ->
     case writer_registry_lookup(Registry, Key) of
         [{Key, WriterDir, file_fd, Fd, CachedPosition}]
           when is_integer(CachedPosition), CachedPosition >= 0 ->
-            case current_record_group_position(Dir, Fd, CachedPosition) of
-                {ok, Position} -> {ok, Fd, Position, false};
-                {error, _Reason} = Error -> Error
+            case tracked_segment_fd_current(Key, Path, Fd) of
+                true ->
+                    case current_record_group_position(Dir, Fd, CachedPosition) of
+                        {ok, Position} -> {ok, Fd, Position, false};
+                        {error, _Reason} = Error -> Error
+                    end;
+                false ->
+                    %% The path no longer names the file this descriptor
+                    %% writes (deleted or replaced outside this module).
+                    case close_writer_entry(Key, file_fd, Fd) of
+                        ok -> open_record_group_file_fd(Registry, Key, WriterDir, Path);
+                        {error, _Reason} = Error -> Error
+                    end
             end;
         [{Key, _Dir, Kind, Handle, _Position}] ->
             case close_writer_entry(Key, Kind, Handle) of
@@ -568,7 +578,16 @@ current_record_group_position(Dir, Fd, CachedPosition) ->
                 {error, Reason} -> {error, {position_projection_eof, Reason}}
             end;
         raft_log ->
-            {ok, CachedPosition}
+            %% Long-lived writers reuse descriptors; read the real end of file
+            %% rather than trusting a cached position, so offsets and rollback
+            %% stay correct even if another owner appended in between.
+            case file:position(Fd, eof) of
+                {ok, Position} when is_integer(Position), Position >= 0 ->
+                    _ = CachedPosition,
+                    {ok, Position};
+                {error, Reason} ->
+                    {error, {position_raft_log_eof, Reason}}
+            end
     end.
 
 writer_registry_lookup(Registry, Key) ->
@@ -591,6 +610,7 @@ open_record_group_file_fd(Registry, Key, WriterDir, Path) ->
     end.
 
 open_record_group_file_fd_after_inactive_close(Registry, Key, WriterDir, Path) ->
+    ok = close_tracked_segment_fd(Key),
     case validate_segment_file_for_append(Path) of
         ok ->
             case file:open(Path, [append, raw, binary]) of
@@ -619,6 +639,7 @@ finish_open_record_group_file_fd(Registry, Key, WriterDir, Path, Fd) ->
                         ok ->
                             case put_writer_entry(Registry, {Key, WriterDir, file_fd_writing, Fd, OldSize}) of
                                 ok ->
+                                    ok = track_segment_fd(Key, Fd),
                                     {ok, Fd, OldSize, OldSize =:= 0};
                                 {error, _Reason} = Error ->
                                     _ = file:close(Fd),

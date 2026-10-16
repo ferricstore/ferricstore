@@ -69,6 +69,55 @@ defmodule Ferricstore.Flow.HistoryRead do
   end
 
   @doc false
+  # A run's whole stored history as {event_id, stored value}, oldest first,
+  # from the hot and cold sources read/8 merges (Flow export).
+  def raw_entries(ctx, id, partition_key, history_key) do
+    count = max_history_max_events()
+
+    query = %{
+      count: count,
+      from_event: nil,
+      to_event: nil,
+      from_ms: nil,
+      to_ms: nil,
+      from_version: nil,
+      to_version: nil,
+      rev?: false,
+      event: nil,
+      worker: nil
+    }
+
+    with :ok <- maybe_flush_history_projector(ctx, history_key, true),
+         {:ok, hot} <- hot_refs(ctx, id, partition_key, history_key, count),
+         {:ok, cold} <- lmdb_refs(ctx, history_key, count, true, query) do
+      event_ids = candidate_event_ids(hot ++ cold, query)
+
+      compound_keys =
+        Enum.map(event_ids, &Ferricstore.Flow.Keys.stream_entry_key(id, &1, partition_key))
+
+      values = Router.compound_batch_get(ctx, history_key, compound_keys)
+
+      with {:ok, hot_values} <- hot_values_by_event(event_ids, values),
+           {:ok, cold_values} <- cold_values_by_event(ctx, history_key, event_ids, hot_values) do
+        raw_entries_in_order(event_ids, hot_values, cold_values)
+      end
+    end
+  end
+
+  defp raw_entries_in_order(event_ids, hot_values, cold_values) do
+    Enum.reduce_while(event_ids, {:ok, []}, fn event_id, {:ok, acc} ->
+      case Map.get(hot_values, event_id) || Map.get(cold_values, event_id) do
+        value when is_binary(value) -> {:cont, {:ok, [{event_id, value} | acc]}}
+        _missing -> {:halt, {:error, {:history_entry_missing, event_id}}}
+      end
+    end)
+    |> case do
+      {:ok, entries} -> {:ok, Enum.reverse(entries)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @doc false
   def read_page(
         ctx,
         id,
@@ -392,7 +441,7 @@ defmodule Ferricstore.Flow.HistoryRead do
       case Ferricstore.Flow.LMDB.get_many(lmdb_path, lmdb_keys) do
         {:ok, lmdb_values} ->
           cold_values_by_event_results(missing_ids, lmdb_values, fn event_id, lmdb_value ->
-            cold_value_from_lmdb(shard_path, event_id, lmdb_value)
+            cold_value_from_lmdb(shard_path, history_key, event_id, lmdb_value)
           end)
 
         {:error, reason} ->
@@ -833,15 +882,23 @@ defmodule Ferricstore.Flow.HistoryRead do
     end
   end
 
-  defp cold_value_from_lmdb(shard_path, event_id, {:ok, lmdb_value}),
-    do: cold_value_from_lmdb(shard_path, event_id, lmdb_value)
+  defp cold_value_from_lmdb(shard_path, history_key, event_id, {:ok, lmdb_value}),
+    do: cold_value_from_lmdb(shard_path, history_key, event_id, lmdb_value)
 
-  defp cold_value_from_lmdb(_shard_path, _event_id, :not_found), do: :miss
+  defp cold_value_from_lmdb(_shard_path, _history_key, _event_id, :not_found), do: :miss
 
-  defp cold_value_from_lmdb(shard_path, event_id, lmdb_value) when is_binary(lmdb_value) do
+  defp cold_value_from_lmdb(shard_path, history_key, event_id, lmdb_value)
+       when is_binary(lmdb_value) do
     now = CommandTime.now_ms()
 
-    case Ferricstore.Flow.LMDB.decode_history_index_location(lmdb_value) do
+    history_index_key =
+      Ferricstore.Flow.LMDB.history_index_key(
+        history_key,
+        event_id,
+        Ferricstore.Flow.HistoryEvent.ms(event_id)
+      )
+
+    case Ferricstore.Flow.LMDB.decode_history_index_location_row(history_index_key, lmdb_value) do
       {:ok, {^event_id, _event_ms, expire_at_ms, _compound_key, file_ref, offset, _value_size}} ->
         cond do
           expire_at_ms > 0 and expire_at_ms <= now ->
@@ -859,7 +916,7 @@ defmodule Ferricstore.Flow.HistoryRead do
     end
   end
 
-  defp cold_value_from_lmdb(_shard_path, _event_id, _lmdb_value),
+  defp cold_value_from_lmdb(_shard_path, _history_key, _event_id, _lmdb_value),
     do: {:error, :invalid_history_index_result}
 
   def query_fetch_count(query) do

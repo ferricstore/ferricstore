@@ -466,6 +466,7 @@ defmodule Ferricstore.Store.Router.Part09 do
       end
 
       defp extract_prob_key({:bloom_create, key, _, _, _}), do: key
+      defp extract_prob_key({:prob_restore, key, _, _, _, _}), do: key
       defp extract_prob_key({:bloom_add, key, _, _}), do: key
       defp extract_prob_key({:bloom_madd, key, _, _}), do: key
       defp extract_prob_key({:cms_create, key, _, _}), do: key

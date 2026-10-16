@@ -340,6 +340,48 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.BlobGarbageSweepStreams
         assert payload == Router.get(ctx, key)
       end
 
+      test "queued PUT preserves the original direct blob payload and keydir entry" do
+        ctx =
+          IsolatedInstance.checkout(
+            shard_count: 1,
+            hot_cache_max_value_size: 4096,
+            blob_side_channel_threshold_bytes: 128
+          )
+
+        on_exit(fn -> IsolatedInstance.checkin(ctx) end)
+
+        shard = elem(ctx.shard_names, 0)
+        keydir = elem(ctx.keydir_refs, 0)
+        direct_key = "blob:auto:parity:direct"
+        queued_key = "blob:auto:parity:queued"
+        payload = :binary.copy("P", 1024)
+
+        assert :ok = GenServer.call(shard, {:put, direct_key, payload, 0})
+        assert :ok = Router.put(ctx, queued_key, payload, 0)
+
+        assert [{^direct_key, direct_value, 0, _direct_lfu, direct_fid, direct_off, direct_size}] =
+                 :ets.lookup(keydir, direct_key)
+
+        assert [{^queued_key, queued_value, 0, _queued_lfu, queued_fid, queued_off, queued_size}] =
+                 :ets.lookup(keydir, queued_key)
+
+        assert direct_value == payload
+        assert queued_value == direct_value
+        assert direct_size == BlobRef.encoded_size()
+        assert queued_size == BlobRef.encoded_size()
+        assert is_integer(direct_fid) and direct_fid >= 0
+        assert is_integer(direct_off) and direct_off >= 0
+        assert is_integer(queued_fid) and queued_fid >= 0
+        assert is_integer(queued_off) and queued_off >= 0
+
+        assert {:ok, _direct_encoded_ref, direct_ref} = raw_disk_blob_ref(ctx, keydir, direct_key)
+        assert {:ok, _queued_encoded_ref, queued_ref} = raw_disk_blob_ref(ctx, keydir, queued_key)
+        assert {:ok, ^payload} = BlobStore.get(ctx.data_dir, 0, direct_ref)
+        assert {:ok, ^payload} = BlobStore.get(ctx.data_dir, 0, queued_ref)
+        assert payload == Router.get(ctx, direct_key)
+        assert payload == Router.get(ctx, queued_key)
+      end
+
       test "small direct values stay inline in Bitcask", %{ctx: ctx, keydir: keydir} do
         key = "blob:auto:small"
         payload = "small-value"

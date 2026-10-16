@@ -4,6 +4,224 @@ defmodule Ferricstore.Flow.LMDB.IndexCodecTest do
   alias Ferricstore.Flow.LMDB.IndexCodec
   alias Ferricstore.TermCodec
 
+  test "terminal expiry rows derive their fields from the key and still read v1 values" do
+    alias Ferricstore.Flow.Keys
+
+    index_key = Keys.state_index_key("invoice.process", "completed", "tenant-a")
+    state_key = Keys.state_key("order-1", "tenant-a")
+    terminal_key = IndexCodec.terminal_index_key(index_key, "order-1", 1_791_750_926_967)
+    count_key = IndexCodec.terminal_count_key(index_key)
+    expire_key = IndexCodec.terminal_expire_key(1_792_355_726_967, terminal_key)
+
+    compact = IndexCodec.encode_terminal_expire_value(terminal_key, state_key, count_key)
+    legacy = TermCodec.encode({terminal_key, state_key, count_key})
+
+    assert byte_size(compact) == 1
+
+    for value <- [compact, legacy] do
+      assert {:ok, {^terminal_key, ^state_key, ^count_key}} =
+               IndexCodec.decode_terminal_expire_row(expire_key, value)
+    end
+
+    assert Enum.sort(IndexCodec.terminal_expire_values(terminal_key, state_key, count_key)) ==
+             Enum.sort([compact, legacy])
+
+    # Fields that the key cannot reproduce keep the self-describing v1 value.
+    for {row_state_key, row_count_key} <- [
+          {nil, count_key},
+          {Keys.state_key("order-2", "tenant-a"), count_key},
+          {state_key, IndexCodec.terminal_count_key(index_key <> "x")}
+        ] do
+      value = IndexCodec.encode_terminal_expire_value(terminal_key, row_state_key, row_count_key)
+      assert value == TermCodec.encode({terminal_key, row_state_key, row_count_key})
+
+      assert {:ok, {^terminal_key, ^row_state_key, ^row_count_key}} =
+               IndexCodec.decode_terminal_expire_row(expire_key, value)
+
+      assert IndexCodec.terminal_expire_values(terminal_key, row_state_key, row_count_key) == [
+               value
+             ]
+    end
+
+    long_id = String.duplicate("x", 300)
+    long_terminal_key = IndexCodec.terminal_index_key(index_key, long_id, 1)
+    long_state_key = Keys.state_key(long_id, "tenant-a")
+
+    assert IndexCodec.encode_terminal_expire_value(long_terminal_key, long_state_key, count_key) ==
+             TermCodec.encode({long_terminal_key, long_state_key, count_key})
+
+    assert :error = IndexCodec.decode_terminal_expire_row("flow-terminal-expire:bad", compact)
+    assert :error = IndexCodec.decode_terminal_expire_row(expire_key, <<0xC3, 0>>)
+  end
+
+  test "terminal index rows keep only the expiry when the key holds the other fields" do
+    alias Ferricstore.Flow.Keys
+
+    for partition_key <- ["tenant-a", nil] do
+      index_key = Keys.state_index_key("invoice.process", "completed", partition_key)
+      state_key = Keys.state_key("order-1", partition_key)
+      terminal_key = IndexCodec.terminal_index_key(index_key, "order-1", 1_791_750_926_967)
+      count_key = IndexCodec.terminal_count_key(index_key)
+
+      compact =
+        IndexCodec.encode_terminal_index_row(
+          terminal_key,
+          "order-1",
+          1_791_750_926_967,
+          1_792_355_726_967,
+          state_key,
+          count_key
+        )
+
+      legacy =
+        IndexCodec.encode_terminal_index_value(
+          "order-1",
+          1_791_750_926_967,
+          1_792_355_726_967,
+          state_key,
+          count_key
+        )
+
+      assert byte_size(compact) == 9
+
+      for value <- [compact, legacy] do
+        assert {:ok, {"order-1", 1_791_750_926_967, 1_792_355_726_967, ^state_key}} =
+                 IndexCodec.decode_terminal_index_row(terminal_key, value)
+
+        assert {:ok, {"order-1", 1_791_750_926_967, 1_792_355_726_967, ^state_key, ^count_key}} =
+                 IndexCodec.decode_terminal_index_entry_row(terminal_key, value)
+
+        assert {:ok, ^count_key} = IndexCodec.terminal_index_row_count_key(terminal_key, value)
+      end
+
+      # Fields the key cannot reproduce keep the self-describing v1 value.
+      for {id, state_key_value} <- [{"order-1", nil}, {"order-2", state_key}] do
+        assert IndexCodec.encode_terminal_index_row(
+                 terminal_key,
+                 id,
+                 1,
+                 2,
+                 state_key_value,
+                 count_key
+               ) ==
+                 IndexCodec.encode_terminal_index_value(id, 1, 2, state_key_value, count_key)
+      end
+
+      assert :error = IndexCodec.decode_terminal_index_row("flow-terminal-index:bad", compact)
+      assert :error = IndexCodec.decode_terminal_index_row(terminal_key, <<0xC4, 1>>)
+      assert :missing = IndexCodec.terminal_index_row_count_key(terminal_key, <<0xC4>>)
+    end
+  end
+
+  test "query index rows keep only what their key cannot hold and still read v1 values" do
+    alias Ferricstore.Flow.Keys
+
+    index_key = Keys.state_index_key("invoice.process", "queued", "tenant-a")
+
+    for {id, state_key} <- [
+          {"order-1", Keys.state_key("order-1", "tenant-a")},
+          {"order-2", nil},
+          {"order-3", "f:{elsewhere}:x:order-3"}
+        ] do
+      {key, compact} =
+        IndexCodec.query_index_entry(index_key, id, 1_791_750_926_967, 55, state_key)
+
+      legacy =
+        IndexCodec.encode_query_index_value(index_key, id, 1_791_750_926_967, 55, state_key)
+
+      assert {:ok, expected} = IndexCodec.decode_query_index_value(legacy)
+
+      assert byte_size(compact) < div(byte_size(legacy), 2),
+             "compact #{byte_size(compact)}B vs legacy #{byte_size(legacy)}B"
+
+      assert {:ok, ^expected} = IndexCodec.decode_query_index_row(key, compact)
+      assert {:ok, ^expected} = IndexCodec.decode_query_index_row(key, legacy)
+
+      other_key = elem(IndexCodec.query_index_entry(index_key, id <> "x", 1, 0, nil), 0)
+      assert {:ok, decoded_other} = IndexCodec.decode_query_index_row(other_key, compact)
+      refute decoded_other == expected
+
+      for offset <- [1, 6, byte_size(compact) - 1] do
+        <<head::binary-size(^offset), byte, tail::binary>> = compact
+        corrupted = head <> <<Bitwise.bxor(byte, 0xFF)>> <> tail
+        assert :error = IndexCodec.decode_query_index_row(key, corrupted)
+      end
+    end
+
+    long_id = String.duplicate("x", 300)
+    {long_key, long_value} = IndexCodec.query_index_entry(index_key, long_id, 1, 0, nil)
+    assert {:ok, _} = IndexCodec.decode_query_index_value(long_value)
+    assert {:ok, _} = IndexCodec.decode_query_index_row(long_key, long_value)
+    assert :error = IndexCodec.decode_query_index_row("flow-query-index:bad", <<0xC6>>)
+  end
+
+  test "history index rows keep only the expiry and log location when the key holds the rest" do
+    alias Ferricstore.Flow.Keys
+    alias Ferricstore.Store.CompoundKey
+
+    for partition_key <- ["tenant-a", nil] do
+      history_key = Keys.history_key("order-1", partition_key)
+      event_id = "1791750917227-1"
+      event_ms = 1_791_750_917_227
+      key = IndexCodec.history_index_key(history_key, event_id, event_ms)
+      compound_key = CompoundKey.stream_prefix(history_key) <> event_id
+
+      for {expire_at_ms, location} <- [{0, nil}, {9, {{:flow_history, 3}, 120, 77}}] do
+        legacy =
+          case location do
+            nil ->
+              IndexCodec.encode_history_index_value(
+                event_id,
+                event_ms,
+                compound_key,
+                expire_at_ms
+              )
+
+            {file_ref, offset, size} ->
+              IndexCodec.encode_history_index_value(
+                event_id,
+                event_ms,
+                compound_key,
+                expire_at_ms,
+                file_ref,
+                offset,
+                size
+              )
+          end
+
+        compact =
+          IndexCodec.encode_history_index_row(
+            key,
+            event_id,
+            event_ms,
+            compound_key,
+            expire_at_ms,
+            location
+          )
+
+        assert byte_size(compact) <= 34
+        assert byte_size(compact) * 2 < byte_size(legacy)
+
+        for value <- [compact, legacy] do
+          assert IndexCodec.decode_history_index_row(key, value) ==
+                   IndexCodec.decode_history_index_value(legacy)
+
+          assert IndexCodec.decode_history_index_location_row(key, value) ==
+                   IndexCodec.decode_history_index_location(legacy)
+        end
+      end
+
+      assert IndexCodec.encode_history_index_row(key, event_id, event_ms, "X:other", 0, nil) ==
+               IndexCodec.encode_history_index_value(event_id, event_ms, "X:other", 0)
+
+      assert :error =
+               IndexCodec.decode_history_index_row("flow-history-index:bad", <<0xC7, 0::64, 0>>)
+
+      assert :error = IndexCodec.decode_history_index_row(key, <<0xC7, 1>>)
+      assert :error = IndexCodec.decode_history_index_location_row(key, <<0xC7, 0::64, 2>>)
+    end
+  end
+
   test "all index value decoders reject trailing external-term bytes" do
     active_key = IndexCodec.active_index_key("index", "id", 10)
 

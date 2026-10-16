@@ -834,8 +834,8 @@ defmodule Ferricstore.FlowTest.Sections.FlowCreateStoresDebugLineageMetadataInde
                  flow_spawn_children_and_get(
                    parent,
                    [
-                     %{id: child_a, type: "child", payload: %{n: 1}},
-                     %{id: child_b, type: "child", payload: %{n: 2}}
+                     %{id: child_a, type: "child", payload: %{"n" => 1}},
+                     %{id: child_b, type: "child", payload: %{"n" => 2}}
                    ],
                    group_id: "fanout-1",
                    wait: :none,

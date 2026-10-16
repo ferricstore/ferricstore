@@ -368,8 +368,23 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
           :query_storage_inconsistent
         )
 
-      {:error, :hydrated_record_identity_mismatch} ->
-        {:error, :query_storage_inconsistent}
+      {:error, reason}
+      when attempt > 0 and
+             reason in [:hydrated_record_identity_mismatch, :query_storage_unavailable] ->
+        hydrate_without_expired_fallback_rows(
+          ctx,
+          shard_index,
+          path,
+          state_keys,
+          rows,
+          now_ms,
+          max_input_bytes,
+          query_row_read,
+          hydrate,
+          opts,
+          attempt,
+          reason
+        )
 
       {:error, :query_storage_unavailable} when attempt == 0 ->
         retry_repairable_hydration(
@@ -389,6 +404,75 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
       {:error, _reason} = error ->
         error
     end
+  end
+
+  # Expired rows that carry validated metadata are not repaired (see
+  # repair_requests/3), so their retired source location can still fail the
+  # whole retry batch, e.g. after a restart compaction rewrote the
+  # apply-projection log under them. Serve those rows from their metadata and
+  # hydrate only the rest, which still fail closed.
+  defp hydrate_without_expired_fallback_rows(
+         ctx,
+         shard_index,
+         path,
+         state_keys,
+         rows,
+         now_ms,
+         max_input_bytes,
+         query_row_read,
+         hydrate,
+         opts,
+         attempt,
+         reason
+       ) do
+    fallback_records = expired_fallback_records(rows, opts)
+
+    if fallback_records == %{} do
+      case reason do
+        :hydrated_record_identity_mismatch -> {:error, :query_storage_inconsistent}
+        reason -> {:error, reason}
+      end
+    else
+      remaining_rows =
+        rows
+        |> Enum.with_index()
+        |> Enum.map(fn {row, index} ->
+          if Map.has_key?(fallback_records, index), do: nil, else: row
+        end)
+
+      with {:ok, records} <-
+             hydrate_rows(
+               ctx,
+               shard_index,
+               path,
+               state_keys,
+               remaining_rows,
+               now_ms,
+               max_input_bytes,
+               query_row_read,
+               hydrate,
+               opts,
+               attempt
+             ) do
+        {:ok,
+         records
+         |> Enum.with_index()
+         |> Enum.map(fn {record, index} -> Map.get(fallback_records, index, record) end)}
+      end
+    end
+  end
+
+  defp expired_fallback_records(rows, opts) do
+    rows
+    |> Enum.with_index()
+    |> Enum.reduce(%{}, fn {row, index}, acc ->
+      with true <- expired_fallback_record_available?(row, opts),
+           {:ok, record} <- QueryRow.internal_record(row) do
+        Map.put(acc, index, record)
+      else
+        _not_available -> acc
+      end
+    end)
   end
 
   defp retry_repairable_hydration(
@@ -759,6 +843,16 @@ defmodule Ferricstore.Flow.Query.QueryRecordStore do
 
         {:error, :hydrated_record_identity_mismatch} = error ->
           error
+
+        # The bytes at the locator are not this record (e.g. the log was
+        # rewritten under it): repairable like an identity mismatch, and not a
+        # retryable storage outage if repair cannot move the locator.
+        {:error, reason}
+        when reason == :hydrated_record_size_mismatch or
+               (is_tuple(reason) and tuple_size(reason) == 4 and
+                  elem(reason, 0) == :record_size_mismatch) or
+               (is_tuple(reason) and tuple_size(reason) == 2 and elem(reason, 0) == :crc_mismatch) ->
+          {:error, :hydrated_record_identity_mismatch}
 
         {:error, :hydration_timeout} ->
           {:error, :query_deadline_exceeded}

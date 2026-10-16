@@ -63,16 +63,10 @@ defmodule Ferricstore.Flow.HistoryProjector.TombstoneRecoveryTest do
     assert :ok = Recovery.recover_history_log(ctx.instance, 0, ctx.root, ctx.keydir)
     assert {:ok, encoded} = LMDB.get(LMDB.path(ctx.root), index_key(event))
 
-    assert encoded ==
-             LMDB.encode_history_index_value(
-               event.event_id,
-               event.event_ms,
-               event.key,
-               0,
-               {:flow_history, 0},
-               new_offset,
-               byte_size("new-event")
-             )
+    assert LMDB.decode_history_index_location_row(index_key(event), encoded) ==
+             {:ok,
+              {event.event_id, event.event_ms, 0, event.key, {:flow_history, 0}, new_offset,
+               byte_size("new-event")}}
 
     assert {:ok, "new-event"} = NIF.v2_pread_at(ctx.log, new_offset)
   end

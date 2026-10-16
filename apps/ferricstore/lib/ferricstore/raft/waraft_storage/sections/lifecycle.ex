@@ -78,9 +78,13 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
               ensure_apply_projection_segment_log_ready!(root_dir)
             end)
 
+            # The keydir is incomplete until the segment projection is recovered; the
+            # shared-ref backfill runs once on the full keydir in rebuild_segment_indexes.
             sm_state =
               profile_startup_phase(shard_index, root_dir, :build_state, fn ->
-                build_sm_state(ctx, shard_index, Map.get(metadata, :apply_context))
+                build_sm_state(ctx, shard_index, Map.get(metadata, :apply_context),
+                  shared_ref_backfill?: false
+                )
               end)
 
             {sm_state, recovered_position, replay_dependencies, recovered_config} =
@@ -573,7 +577,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
             build_sm_state(
               handle.ctx,
               handle.shard_index,
-              Map.get(metadata, :apply_context)
+              Map.get(metadata, :apply_context),
+              shared_ref_backfill?: false
             )
             |> replace_with_segment_projection(
               segment_projection_locations,

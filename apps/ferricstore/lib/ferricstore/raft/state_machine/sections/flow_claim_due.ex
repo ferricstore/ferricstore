@@ -621,7 +621,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
           path = flow_lmdb_record_path(state)
           {start_ms, horizon_ms} = flow_hibernation_promotion_window(now_ms, state)
 
-          case recovery_empty_cold_due_cursor(state, path, start_ms, horizon_ms, remaining) do
+          case empty_cold_due_cursor(state, path, start_ms, horizon_ms) do
             {:ok, cursor, transaction_id} ->
               call_recovery_cold_due_proof_hook(path)
 
@@ -629,11 +629,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
                 apply_state_put(:flow_hibernation_promotion_cursor, cursor)
                 0
               else
-                :telemetry.execute(
-                  [:ferricstore, :flow, :replay_cold_due_proof, :stale],
-                  %{count: 1},
-                  %{shard_index: state.shard_index}
-                )
+                # Live writers commit often, so only a stale proof during
+                # replay is worth reporting.
+                if Map.has_key?(state, @sm_waraft_recovery_before_index_key) do
+                  :telemetry.execute(
+                    [:ferricstore, :flow, :replay_cold_due_proof, :stale],
+                    %{count: 1},
+                    %{shard_index: state.shard_index}
+                  )
+                end
 
                 scan_and_promote_cold_due(
                   state,
@@ -773,14 +777,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
         end
       end
 
-      defp recovery_empty_cold_due_cursor(
-             %{@sm_waraft_recovery_before_index_key => index} = state,
-             path,
-             start_ms,
-             horizon_ms,
-             _remaining
-           )
-           when is_integer(index) and index > 0 do
+      # Proves the promotion window holds no cold-due row, so a claim can set the
+      # cursor the empty bucket walk would leave (Hibernation.empty_promotion_scan_cursor,
+      # pinned against the walker in tests) without scanning every bucket. It reads
+      # the same committed LMDB rows as the walk and gives up on any row in the
+      # window or any commit during the check, falling back to the walk.
+      defp empty_cold_due_cursor(state, path, start_ms, horizon_ms) do
         first_bucket = LMDB.cold_due_bucket_ms(start_ms, @flow_hibernation_bucket_ms)
         last_bucket = LMDB.cold_due_bucket_ms(horizon_ms, @flow_hibernation_bucket_ms)
 
@@ -820,9 +822,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
         _ -> :not_proven
       end
 
-      defp recovery_empty_cold_due_cursor(_state, _path, _start_ms, _horizon_ms, _remaining),
-        do: :not_proven
-
       if Mix.env() == :test do
         defp call_recovery_cold_due_proof_hook(path) do
           case Application.get_env(:ferricstore, :flow_recovery_cold_due_proof_hook) do
@@ -836,8 +835,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
 
       if Mix.env() == :test do
         @doc false
-        def __recovery_empty_cold_due_cursor_for_test__(state, path, start_ms, horizon_ms),
-          do: recovery_empty_cold_due_cursor(state, path, start_ms, horizon_ms, 1)
+        def __empty_cold_due_cursor_for_test__(state, path, start_ms, horizon_ms),
+          do: empty_cold_due_cursor(state, path, start_ms, horizon_ms)
       end
 
       defp empty_cold_due_scan_cursor(state, start_ms, horizon_ms) do

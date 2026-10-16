@@ -300,6 +300,30 @@ defmodule Ferricstore.Flow.LMDBIndexReadTest do
              LMDB.prefix_merge_entries([path_0], prefix, 4, 0)
   end
 
+  test "native prefix merge stops clustered sources after the heap threshold" do
+    {_ctx, paths} = tmp_lmdb_paths(8)
+    prefix = "merge-stop:"
+
+    Enum.each(Enum.with_index(paths), fn {path, source} ->
+      assert :ok =
+               LMDB.write_batch(
+                 path,
+                 Enum.map(0..99, fn local ->
+                   row = source * 100 + local
+                   {:put, prefix <> String.pad_leading(Integer.to_string(row), 3, "0"), "v#{row}"}
+                 end)
+               )
+    end)
+
+    expected_rows =
+      Enum.map(0..99, fn row ->
+        {0, prefix <> String.pad_leading(Integer.to_string(row), 3, "0"), "v#{row}"}
+      end)
+
+    assert {:ok, ^expected_rows, 107} =
+             LMDB.prefix_merge_entries(paths, prefix, 100, @prefix_merge_max_bytes)
+  end
+
   test "prefix merge applies the byte cap to the globally selected rows" do
     {_ctx, [path_0, path_1]} = tmp_lmdb_paths(2)
     prefix = "merge-cap:"

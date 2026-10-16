@@ -928,7 +928,7 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert :ok =
              FerricStore.flow_create(queued_id,
                type: type_for.("queued"),
-               payload: %{step: "queued"},
+               payload: %{"step" => "queued"},
                run_at_ms: now_ms + 60_000
              )
 
@@ -939,7 +939,7 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert :ok =
              FerricStore.flow_create(cancel_id,
                type: type_for.("cancel"),
-               payload: %{step: "cancel"},
+               payload: %{"step" => "cancel"},
                run_at_ms: now_ms
              )
 
@@ -965,7 +965,7 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert :ok =
              FerricStore.flow_create(complete_id,
                type: type_for.("complete"),
-               payload: %{step: "complete"},
+               payload: %{"step" => "complete"},
                run_at_ms: now_ms
              )
 
@@ -982,7 +982,7 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert :ok =
              FerricStore.flow_complete(complete_claim.id, complete_claim.lease_token,
                fencing_token: complete_claim.fencing_token,
-               result: %{ok: true}
+               result: %{"ok" => true}
              )
 
     assert {:ok, completed} = FerricStore.flow_get(complete_id)
@@ -991,7 +991,7 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert :ok =
              FerricStore.flow_create(fail_id,
                type: type_for.("fail"),
-               payload: %{step: "fail"},
+               payload: %{"step" => "fail"},
                run_at_ms: now_ms
              )
 
@@ -1007,7 +1007,7 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert :ok =
              FerricStore.flow_fail(fail_claim.id, fail_claim.lease_token,
                fencing_token: fail_claim.fencing_token,
-               error: %{reason: "contract"}
+               error: %{"reason" => "contract"}
              )
 
     assert {:ok, failed} = FerricStore.flow_get(fail_id)
@@ -1016,7 +1016,7 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert :ok =
              FerricStore.flow_create(retry_id,
                type: type_for.("retry"),
-               payload: %{step: "retry"},
+               payload: %{"step" => "retry"},
                run_at_ms: now_ms
              )
 
@@ -1041,7 +1041,7 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert :ok =
              FerricStore.flow_create(transition_id,
                type: type_for.("transition"),
-               payload: %{step: "transition"},
+               payload: %{"step" => "transition"},
                run_at_ms: now_ms
              )
 
@@ -1067,7 +1067,7 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert :ok =
              FerricStore.flow_create(rewind_id,
                type: type_for.("rewind"),
-               payload: %{step: "rewind"},
+               payload: %{"step" => "rewind"},
                run_at_ms: now_ms
              )
 
@@ -1085,7 +1085,7 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert :ok =
              FerricStore.flow_complete(rewind_claim.id, rewind_claim.lease_token,
                fencing_token: rewind_claim.fencing_token,
-               result: %{ok: true}
+               result: %{"ok" => true}
              )
 
     assert :ok = FerricStore.flow_rewind(rewind_id, to_event: created_event_id)
@@ -1104,7 +1104,7 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert :ok =
              FerricStore.flow_create_many(partition, create_ids,
                type: type_for.("create"),
-               payload: %{step: "create"},
+               payload: %{"step" => "create"},
                run_at_ms: now_ms + 60_000
              )
 
@@ -1123,7 +1123,7 @@ defmodule Ferricstore.FlowWriteContractTest do
              FerricStore.flow_complete_many(
                partition,
                claim_items(complete_claims),
-               result: %{ok: true}
+               result: %{"ok" => true}
              )
 
     assert_all_states(complete_ids, partition, "completed")
@@ -1147,7 +1147,7 @@ defmodule Ferricstore.FlowWriteContractTest do
              FerricStore.flow_fail_many(
                partition,
                claim_items(fail_claims),
-               error: %{reason: "contract"}
+               error: %{"reason" => "contract"}
              )
 
     assert_all_states(fail_ids, partition, "failed")
@@ -1193,7 +1193,7 @@ defmodule Ferricstore.FlowWriteContractTest do
              FerricStore.flow_complete_many(
                partition,
                claim_items(claims),
-               result: %{ok: true},
+               result: %{"ok" => true},
                independent: true
              )
 
@@ -1265,7 +1265,7 @@ defmodule Ferricstore.FlowWriteContractTest do
              FerricStore.flow_create(id,
                type: type,
                partition_key: partition,
-               payload: %{step: "queued"},
+               payload: %{"step" => "queued"},
                run_at_ms: now_ms
              )
 
@@ -1286,7 +1286,7 @@ defmodule Ferricstore.FlowWriteContractTest do
                fencing_token: claimed.fencing_token,
                lease_ms: 5_000,
                now_ms: now_ms + 1,
-               payload: %{step: "charge_card"}
+               payload: %{"step" => "charge_card"}
              )
 
     assert continued.id == id
@@ -1307,7 +1307,7 @@ defmodule Ferricstore.FlowWriteContractTest do
                partition_key: partition,
                fencing_token: continued.fencing_token,
                run_at_ms: now_ms + 3_000,
-               error: %{reason: "try-again"}
+               error: %{"reason" => "try-again"}
              )
 
     assert {:ok, retried} = FerricStore.flow_get(id, partition_key: partition)
@@ -1329,7 +1329,7 @@ defmodule Ferricstore.FlowWriteContractTest do
                worker: "contract-start-worker",
                lease_ms: 7_000,
                now_ms: now_ms,
-               payload: %{order_id: suffix}
+               payload: %{"order_id" => suffix}
              )
 
     assert started.id == id
@@ -1355,7 +1355,7 @@ defmodule Ferricstore.FlowWriteContractTest do
                partition_key: partition,
                fencing_token: started.fencing_token,
                run_at_ms: now_ms + 1_000,
-               error: %{reason: "try-again"}
+               error: %{"reason" => "try-again"}
              )
 
     assert {:ok, retried} = FerricStore.flow_get(id, partition_key: partition)
@@ -1405,7 +1405,7 @@ defmodule Ferricstore.FlowWriteContractTest do
                worker: "contract-run-steps-worker",
                lease_ms: 7_000,
                now_ms: now_ms,
-               result: %{ok: true}
+               result: %{"ok" => true}
              )
 
     Enum.each(ids, fn id ->
@@ -1765,7 +1765,7 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert :ok =
              FerricStore.flow_create_many(partition, ids,
                type: type,
-               payload: %{step: type},
+               payload: %{"step" => type},
                run_at_ms: now_ms
              )
 

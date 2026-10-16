@@ -217,7 +217,7 @@ defmodule Ferricstore.FlowTest.Sections.FlushdbClearsFlowLmdbTerminalProjections
         assert {:ok, _created} =
                  flow_create_and_get(id,
                    type: "history-ttl",
-                   payload: %{input: 1},
+                   payload: %{"input" => 1},
                    run_at_ms: 1_000,
                    retention_ttl_ms: 100,
                    now_ms: 1_000

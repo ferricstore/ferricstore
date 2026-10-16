@@ -4,6 +4,33 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- New data directories use 128-bit Flow key digests (22 characters instead of
+  43), about 1.7 KB less disk and 360 B less keydir memory per flow. They also
+  store each Flow record's sidecar (child groups, attributes, value refs,
+  sequence numbers) as a compact Erlang term instead of JSON: about a third
+  smaller and 3.5 times faster to decode, which takes about 9% off a claim's
+  CPU. Their Raft log entries replace repeated atoms and the default apply
+  context with short dictionary references: Flow log entries are about 40%
+  smaller, which shrinks the in-memory log window, replication traffic and log
+  disk. Existing
+  data directories keep full digests (data format 1) and run unchanged; every
+  member of a cluster must use the same data format.
+- `FerricStore.export/2` and `FerricStore.restore/2` copy a store's keys (every
+  type, with expiry) and its Flow data (runs
+  with values and history, shared values, policies and governance state:
+  circuits, budgets, limits, approvals, effects, ledgers) through a file into an
+  empty store, writing the target's data format; this is how a format 1 cluster
+  moves to format 2.
+- Custom (embedded, non-Raft) instances now apply every write to a Bloom or
+  cuckoo filter, count-min sketch or top-k. Every write after the first on a key
+  reused the first one's mutation token and was answered from its receipt
+  without being applied, and alternating BF.ADD and BF.MADD paused the shard's
+  writes. The default (Raft) instance was not affected.
+- A shard whose Flow LMDB flush failed leaves the degraded state on its own once
+  a retry succeeds and a reconcile finds it healthy. Before, it stayed degraded
+  (and refused Flow queries and history reads) until a doctor repair, restart
+  or FLUSHDB.
+
 ## 0.11.24 - 2026-10-06
 
 - Update Mint to 1.10.2 to address the newly published HTTP response-framing and

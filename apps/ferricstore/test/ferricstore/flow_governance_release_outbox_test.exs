@@ -217,6 +217,10 @@ defmodule Ferricstore.FlowGovernanceReleaseOutboxTest do
     state_key = Keys.state_key(flow_id, @partition)
     state_shard = Router.shard_for(ctx, state_key)
 
+    # Startup recovery refuses a corrupt Flow record, so a later restart of the
+    # default instance would fail while this row exists.
+    on_exit(fn -> :ok = WARaftBackend.write(state_shard, {:delete, state_key}) end)
+
     assert :ok = WARaftBackend.write(state_shard, {:put, state_key, <<0, 1, 2, 3>>, 0})
 
     seed_outbox!(0, [release_intent(flow_id, scope, reservation_id)])

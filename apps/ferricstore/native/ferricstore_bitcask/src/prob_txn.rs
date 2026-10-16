@@ -118,6 +118,30 @@ pub fn prob_file_recover(env: Env<'_>, path: String, extension: String) -> NifRe
     }
 }
 
+/// The token a mutation commits under. Raft applies pass their log position,
+/// so a replayed entry is recognized. Instances without a log pass index 0:
+/// nothing replays there, so the mutation takes the next index after the
+/// sidecar's own token, read once any interrupted mutation is recovered.
+pub fn effective_token(
+    file: &File,
+    target: &Path,
+    token: MutationToken,
+    token_offset: u64,
+    expected_file_size: u64,
+) -> Result<MutationToken, String> {
+    if token.index != 0 {
+        return Ok(token);
+    }
+
+    recover(file, target, token_offset, expected_file_size)?;
+    let current = read_token(file, token_offset)?;
+    let index = current
+        .index
+        .checked_add(1)
+        .ok_or_else(|| "probabilistic mutation token overflow".to_string())?;
+    Ok(MutationToken::new(index, token.ordinal.max(1)))
+}
+
 pub fn begin(
     file: &File,
     target: &Path,
@@ -534,6 +558,52 @@ mod tests {
             .unwrap();
         file.set_len(64).unwrap();
         (path, file)
+    }
+
+    #[test]
+    fn local_tokens_follow_the_sidecar_token_after_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, file) = target_file(dir.path());
+        let local = MutationToken::new(0, 1);
+
+        // A fresh sidecar starts at token zero.
+        let first = effective_token(&file, &path, local, 48, 64).unwrap();
+        assert_eq!(first, MutationToken::new(1, 1));
+        assert_eq!(
+            begin(&file, &path, first, 48, 64).unwrap(),
+            MutationDecision::Apply
+        );
+        commit(&file, &path, first, 48, 64, vec![], vec![1]).unwrap();
+
+        let second = effective_token(&file, &path, local, 48, 64).unwrap();
+        assert_eq!(second, MutationToken::new(2, 1));
+        assert_eq!(
+            begin(&file, &path, second, 48, 64).unwrap(),
+            MutationDecision::Apply
+        );
+
+        // A receipt whose apply was interrupted is applied before the next token
+        // is chosen, so a new mutation never reuses its token.
+        let pending = MutationToken::new(9, 1);
+        write_transaction(
+            &path,
+            &Transaction {
+                token: pending,
+                token_offset: 48,
+                expected_file_size: 64,
+                images: vec![AfterImage::new(48, pending.encode().to_vec())],
+                result: vec![7],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            effective_token(&file, &path, local, 48, 64).unwrap(),
+            MutationToken::new(10, 1)
+        );
+
+        // Raft tokens are used as given.
+        let raft = MutationToken::new(4, 2);
+        assert_eq!(effective_token(&file, &path, raft, 48, 64).unwrap(), raft);
     }
 
     #[test]

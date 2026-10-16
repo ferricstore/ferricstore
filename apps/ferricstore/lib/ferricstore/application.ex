@@ -76,6 +76,13 @@ defmodule Ferricstore.Application do
       # tries to open shard directories or WARaft segment logs.
       Ferricstore.DataDir.ensure_layout!(data_dir, shard_count)
 
+      # Before anything derives a Flow key, and before the cluster_state marker
+      # is first written: its presence is how a pre-format data dir is detected.
+      :ok = Ferricstore.DataFormat.put_current(Ferricstore.DataFormat.resolve!(data_dir))
+
+      # Before any process opens a shard's Flow LMDB environment.
+      :ok = Ferricstore.Flow.LMDBCompaction.compact_shards_at_startup(data_dir, shard_count)
+
       replication_mode = Ferricstore.ReplicationMode.resolve!(data_dir, shard_count)
 
       Ferricstore.ReplicationMode.put_current(replication_mode)

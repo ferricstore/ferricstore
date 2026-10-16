@@ -51,7 +51,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
         captured_generation = flow_policy_catalog_generation(state, type)
         expire_at_ms = 0
 
-        case PolicyMigration.decode_catalog(do_get(state, catalog_key)) do
+        case PolicyMigration.decode_catalog(keydir_spill_get(state, catalog_key)) do
           {:ok, catalog} ->
             if flow_catalog_owned?(catalog, type, state_key) do
               generation = max(captured_generation, catalog.migration_generation)
@@ -74,7 +74,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
             end
 
           :error ->
-            if is_nil(do_get(state, catalog_key)) do
+            if is_nil(keydir_spill_get(state, catalog_key)) do
               generation = captured_generation
               value = PolicyMigration.encode_catalog(type, state_key, generation)
 
@@ -108,7 +108,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
         state_key = FlowKeys.state_key(id, Map.get(record, :partition_key))
         catalog_key = FlowKeys.type_catalog_member_key(type, state_key)
 
-        case PolicyMigration.decode_catalog(do_get(state, catalog_key)) do
+        case PolicyMigration.decode_catalog(keydir_spill_get(state, catalog_key)) do
           {:ok, catalog} ->
             if flow_catalog_owned?(catalog, type, state_key) do
               with {:ok, revision} <- flow_ensure_type_descriptor(state, type, true),
@@ -127,7 +127,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
             end
 
           :error ->
-            if is_nil(do_get(state, catalog_key)),
+            if is_nil(keydir_spill_get(state, catalog_key)),
               do: :ok,
               else: {:error, "ERR flow type catalog entry is corrupt"}
         end
@@ -140,7 +140,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
         state_key = FlowKeys.state_key(id, Map.get(record, :partition_key))
         catalog_key = FlowKeys.type_catalog_member_key(type, state_key)
 
-        case PolicyMigration.decode_catalog(do_get(state, catalog_key)) do
+        case PolicyMigration.decode_catalog(keydir_spill_get(state, catalog_key)) do
           {:ok, catalog} ->
             flow_catalog_owned?(catalog, type, state_key) and
               catalog.migration_generation > flow_read_policy_generation(state, type)
@@ -589,7 +589,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
              }
            )
            when is_binary(catalog_key) and is_binary(descriptor_key) do
-        case PolicyMigration.decode_catalog(do_get(state, catalog_key)) do
+        case PolicyMigration.decode_catalog(keydir_spill_get(state, catalog_key)) do
           {:ok, %{state_key: state_key, migration_generation: generation} = catalog} ->
             with {:ok, exact_type} <- flow_catalog_descriptor_type(state, descriptor_key),
                  true <- FlowKeys.type_catalog_member_owns_state_key?(catalog_key, state_key),
@@ -618,7 +618,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
             end
 
           :error ->
-            if is_nil(do_get(state, catalog_key)) do
+            if is_nil(keydir_spill_get(state, catalog_key)) do
               with_lmdb_mirror_shard(state, fn ->
                 queue_pending_lmdb_mirror_delete(catalog_key)
                 flow_delete_query_source_catalog_projection(catalog_key)
@@ -679,7 +679,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
       defp flow_policy_catalog_backfill_current_record(state, state_key, type, record) do
         catalog_key = FlowKeys.type_catalog_member_key(type, state_key)
 
-        case PolicyMigration.decode_catalog(do_get(state, catalog_key)) do
+        case PolicyMigration.decode_catalog(keydir_spill_get(state, catalog_key)) do
           {:ok, %{state_key: ^state_key, migration_generation: generation} = catalog} ->
             if flow_catalog_owned?(catalog, type, state_key) do
               with {:ok, _revision} <- flow_ensure_type_descriptor(state, type, false),
@@ -691,7 +691,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
             end
 
           :error ->
-            if is_nil(do_get(state, catalog_key)) do
+            if is_nil(keydir_spill_get(state, catalog_key)) do
               generation = flow_policy_catalog_generation(state, type)
               value = PolicyMigration.encode_catalog(type, state_key, generation)
 
@@ -728,7 +728,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
              {:ok, guard_key} <- FlowKeys.retention_guard_key_from_state_key(state_key) do
           expected_guard = Ferricstore.Flow.RetentionGuard.encode(record)
 
-          case do_get(state, guard_key) do
+          case keydir_spill_get(state, guard_key) do
             ^expected_guard -> {:ok, record}
             nil -> flow_policy_planned_unguarded_record(state, state_key, record)
             _changed -> {:error, "ERR stale flow policy catalog record plan"}
@@ -806,7 +806,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
              },
              job
            ) do
-        case PolicyMigration.decode_catalog(do_get(state, catalog_key)) do
+        case PolicyMigration.decode_catalog(keydir_spill_get(state, catalog_key)) do
           {:ok, catalog} ->
             flow_policy_migration_validate_catalog_member(catalog_key, catalog, job)
             |> case do
@@ -825,7 +825,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
             end
 
           :error ->
-            if is_nil(do_get(state, catalog_key)) do
+            if is_nil(keydir_spill_get(state, catalog_key)) do
               with :ok <-
                      flow_delete_policy_catalog_projection(
                        job.type,

@@ -145,10 +145,17 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
 
       defp apply_projection_cache_measurement(_infinity_or_invalid), do: 0
 
-      defp build_sm_state(ctx, shard_index, persisted_apply_context) do
+      defp build_sm_state(ctx, shard_index, persisted_apply_context, opts \\ []) do
         data_dir = ctx.data_dir
         shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
         Ferricstore.FS.mkdir_p!(shard_data_path)
+
+        :ok =
+          Ferricstore.Flow.KeydirSpill.refresh_present(
+            ctx.name,
+            shard_index,
+            Ferricstore.Flow.LMDB.path(shard_data_path)
+          )
 
         # WARaft storage may be opened by snapshot/bootstrap paths after the
         # original setup caller exits, so the named ETS owner must exist here too.
@@ -215,7 +222,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
             flow_index,
             flow_lookup,
             active_file_id: active_file_id,
-            active_file_path: active_file_path
+            active_file_path: active_file_path,
+            shared_ref_backfill?: Keyword.get(opts, :shared_ref_backfill?, true)
           )
 
         active_file_size = recovery_file_size(active_file_path)

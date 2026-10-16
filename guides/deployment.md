@@ -421,6 +421,82 @@ resources:
 
 With `static` CPU manager policy on the kubelet, this guarantees exclusive cores.
 
+## Data Formats
+
+Each data directory records its on-disk format in a `data_format` file.
+
+- **Format 2**, the default for new data directories, keys Flow runs with
+  128-bit digests (22 characters). Measured on completed runs, that is about
+  1.7 KB less disk and 360 B less keydir memory per run than format 1. It also
+  stores record sidecars as compact terms and writes Raft log entries in a
+  compact form (Flow entries about 40% smaller), which only releases with
+  format 2 can read.
+- **Format 1** is what data directories created before format 2 use (full
+  256-bit digests, 43 characters). They keep it: upgrading the release changes
+  nothing on disk.
+
+A node runs in its data directory's format, and a node in a different format
+cannot join the cluster. The `:data_format` setting only chooses the format of
+a new data directory.
+
+### Moving Data to Format 2
+
+A format 1 cluster moves to format 2 by copying its data into a new cluster:
+
+1. Upgrade the old cluster to this release. It keeps running in format 1.
+2. Stop the applications that write to it.
+3. Export from any node of the old cluster:
+
+   ```bash
+   bin/ferricstore rpc 'IO.inspect(FerricStore.export("/backup/store.ffx"))'
+   ```
+
+4. Start a new cluster on empty data directories; they are created in format 2.
+5. Restore on any node of the new cluster:
+
+   ```bash
+   bin/ferricstore rpc 'IO.inspect(FerricStore.restore("/backup/store.ffx"))'
+   ```
+
+6. Point the applications at the new cluster.
+
+Both calls return
+`{:ok, %{keys: n, flows: n, shared_values: n, policies: n, governance: n}}`.
+
+What moves: every key (strings, bitmaps, HyperLogLogs, t-digests, hashes,
+lists, sets, sorted sets, streams with their consumer groups, pending entries
+and consumers, Bloom and cuckoo filters, count-min sketches and top-k) with its
+expiry; the invocation definitions; every run, schedules included, with its id, type, state, version,
+attempts, lease, timestamps, values, history and signal idempotency keys; the
+standalone shared values; the type policies; governance state: circuits,
+budgets with their reservations, limits with their leases and reservations,
+approvals, and each run's effects and governance ledger. A worker holding a
+lease from the old cluster can finish its run on the new one, and its effects
+and its running-limit slot carry over with it.
+
+What to know:
+
+- A probabilistic structure travels as one replicated command, so it must fit
+  the new cluster's command size limits.
+- Value refs encode the key layout, so they change. Refs stored inside runs are
+  rewritten; refs an application kept from `flow_get` or `flow_value_put`
+  point at the old cluster.
+- Policy generations start over. A running limit (`limits: %{"running" => ...}`
+  in a policy) picks up the new cluster's policy on its next claim.
+- Limit-cache sessions belong to the old cluster's nodes and are not carried.
+  Credit a node had prefetched but not used returns when its lease expires.
+- The export waits for limit releases that finished runs queued and refuses if
+  they are still pending after about 20 seconds; run it again once they drain.
+- The restore refuses, before writing anything, a file with a limit lease on a
+  logical shard the new cluster does not have (a new cluster with fewer
+  shards).
+- The export refuses Flow data it cannot carry (for example a policy migration
+  in progress) and names sample keys.
+- The restore checks the file's checksum before writing anything and refuses a
+  cluster that already holds keys or Flow data. If a restore stops partway, start the
+  new cluster again on empty data directories and rerun it; the export file is
+  unchanged and can be restored any number of times.
+
 ## Performance Checklist
 
 Before benchmarking or going to production:

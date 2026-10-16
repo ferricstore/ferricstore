@@ -3029,7 +3029,8 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp maybe_set_client_name(state, name) when is_binary(name) do
-    state = %{state | client_name: name}
+    # Client metadata outlives the decoded request, so do not retain its parent binary.
+    state = %{state | client_name: :binary.copy(name)}
     ConnRegistry.update(state.client_id, self(), summary(state))
     state
   end

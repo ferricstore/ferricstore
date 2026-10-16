@@ -1,6 +1,6 @@
 use rustler::{Binary, Decoder, Encoder, Env, NifResult, OwnedBinary, ResourceArc, Term};
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, BinaryHeap, HashMap};
+use std::collections::{btree_set::Range as BTreeSetRange, BTreeSet, BinaryHeap, HashMap};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
@@ -183,13 +183,14 @@ struct OrderedEntry {
     member: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct DueCandidate {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DueCandidate<'a> {
     key_index: usize,
-    entry: OrderedEntry,
+    cursor_index: usize,
+    entry: &'a OrderedEntry,
 }
 
-impl Ord for DueCandidate {
+impl Ord for DueCandidate<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
         other
             .entry
@@ -198,12 +199,46 @@ impl Ord for DueCandidate {
             .then_with(|| other.entry.member.cmp(&self.entry.member))
             .then_with(|| other.entry.key.cmp(&self.entry.key))
             .then_with(|| other.key_index.cmp(&self.key_index))
+            .then_with(|| other.cursor_index.cmp(&self.cursor_index))
     }
 }
 
-impl PartialOrd for DueCandidate {
+impl PartialOrd for DueCandidate<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+struct DueCursor<'index, 'key> {
+    key: &'key [u8],
+    max_score: f64,
+    entries: BTreeSetRange<'index, OrderedEntry>,
+}
+
+impl<'index, 'key> DueCursor<'index, 'key> {
+    fn new(index: &'index FlowOrderedIndex, key: &'key [u8], max_score: f64) -> Self {
+        let lower = OrderedEntry {
+            key: key.to_vec(),
+            score: Score(f64::NEG_INFINITY),
+            member: Vec::new(),
+        };
+
+        Self {
+            key,
+            max_score,
+            entries: index.ordered.range(lower..),
+        }
+    }
+
+    fn next(&mut self) -> Option<&'index OrderedEntry> {
+        loop {
+            let entry = self.entries.next()?;
+            match due_entry_match(entry, self.key, self.max_score) {
+                DueEntryMatch::Match => return Some(entry),
+                DueEntryMatch::Continue => continue,
+                DueEntryMatch::Stop => return None,
+            }
+        }
     }
 }
 
@@ -2712,7 +2747,7 @@ impl FlowOrderedIndex {
         limit: usize,
         max_scan: usize,
     ) -> Vec<(Vec<u8>, Vec<u8>, f64)> {
-        if keys.is_empty() || limit == 0 || max_scan == 0 {
+        if keys.is_empty() || limit == 0 || max_scan == 0 || self.ordered.is_empty() {
             return Vec::new();
         }
 
@@ -2723,11 +2758,21 @@ impl FlowOrderedIndex {
         let result_capacity = limit.min(max_scan).min(self.ordered.len());
         let mut rows = Vec::with_capacity(result_capacity);
         let mut scanned = 0usize;
+        // Keep each active key's range alive so advancing a stream does not
+        // clone the previous entry and seek from the tree root again.
+        let mut cursors = Vec::new();
         let mut heap = BinaryHeap::with_capacity(keys.len().min(self.ordered.len()));
 
         for (key_index, key) in keys.iter().enumerate() {
-            if let Some(entry) = self.first_due_entry_for_key(key, max_score) {
-                heap.push(DueCandidate { key_index, entry });
+            let mut cursor = DueCursor::new(self, key, max_score);
+            if let Some(entry) = cursor.next() {
+                let cursor_index = cursors.len();
+                cursors.push(cursor);
+                heap.push(DueCandidate {
+                    key_index,
+                    cursor_index,
+                    entry,
+                });
             }
         }
 
@@ -2738,18 +2783,19 @@ impl FlowOrderedIndex {
 
             scanned += 1;
             rows.push((
-                candidate.entry.key.clone(),
-                candidate.entry.member.clone(),
+                candidate.entry.key.to_vec(),
+                candidate.entry.member.to_vec(),
                 candidate.entry.score.0,
             ));
 
-            if let Some(next) =
-                self.next_due_entry_for_key(keys[candidate.key_index], max_score, &candidate.entry)
-            {
-                heap.push(DueCandidate {
-                    key_index: candidate.key_index,
-                    entry: next,
-                });
+            if rows.len() < limit && scanned < max_scan {
+                if let Some(next) = cursors[candidate.cursor_index].next() {
+                    heap.push(DueCandidate {
+                        key_index: candidate.key_index,
+                        cursor_index: candidate.cursor_index,
+                        entry: next,
+                    });
+                }
             }
         }
 
@@ -2851,53 +2897,6 @@ impl FlowOrderedIndex {
         }
 
         rows
-    }
-
-    fn first_due_entry_for_key(&self, key: &[u8], max_score: f64) -> Option<OrderedEntry> {
-        let lower = OrderedEntry {
-            key: key.to_vec(),
-            score: Score(f64::NEG_INFINITY),
-            member: Vec::new(),
-        };
-
-        self.next_due_entry_from_range(key, max_score, lower, false)
-    }
-
-    fn next_due_entry_for_key(
-        &self,
-        key: &[u8],
-        max_score: f64,
-        previous: &OrderedEntry,
-    ) -> Option<OrderedEntry> {
-        self.next_due_entry_from_range(key, max_score, previous.clone(), true)
-    }
-
-    fn next_due_entry_from_range(
-        &self,
-        key: &[u8],
-        max_score: f64,
-        lower: OrderedEntry,
-        exclude_lower: bool,
-    ) -> Option<OrderedEntry> {
-        if exclude_lower {
-            for entry in self.ordered.range((Excluded(lower), Unbounded)) {
-                match due_entry_match(entry, key, max_score) {
-                    DueEntryMatch::Match => return Some(entry.clone()),
-                    DueEntryMatch::Stop => return None,
-                    DueEntryMatch::Continue => continue,
-                }
-            }
-        } else {
-            for entry in self.ordered.range(lower..) {
-                match due_entry_match(entry, key, max_score) {
-                    DueEntryMatch::Match => return Some(entry.clone()),
-                    DueEntryMatch::Stop => return None,
-                    DueEntryMatch::Continue => continue,
-                }
-            }
-        }
-
-        None
     }
 
     fn due_keys_present(&self, keys: &[&[u8]], max_score: f64) -> Vec<Vec<u8>> {
@@ -4754,6 +4753,10 @@ mod tests {
         assert_eq!(checked_history_field_capacity(u64::MAX, 0), None);
     }
 }
+
+#[cfg(test)]
+mod claim_tests;
+
 // This file is intentionally kept as a single fused Rust source unit even
 // though it is larger than the normal module-size target.
 //

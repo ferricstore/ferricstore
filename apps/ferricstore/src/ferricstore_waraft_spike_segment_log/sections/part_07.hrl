@@ -229,17 +229,9 @@ write_offset_index_group(Dir, Ordinal, Rows) ->
                            end, Rows) of
                 true ->
                     Path = offset_index_path(Dir, Ordinal),
-                    case open_offset_index_for_write(Path) of
-                        {ok, Fd} ->
-                            Result = write_offset_index_rows(Fd, RecordsPerSegment, Rows),
-                            CloseResult = file:close(Fd),
-                            case {Result, CloseResult} of
-                                {ok, ok} -> ok;
-                                {{error, _Reason} = Error, _} -> Error;
-                                {ok, {error, Reason}} -> {error, {close_offset_index, Reason}}
-                            end;
-                        {error, _Reason} = Error -> Error
-                    end;
+                    with_offset_index_fd(Path, fun(Fd) ->
+                        write_offset_index_rows(Fd, RecordsPerSegment, Rows)
+                    end);
                 false ->
                     {error, {offset_index_wrong_segment, Ordinal}}
             end;
@@ -385,4 +377,293 @@ offset_index_frame_matches(Dir, Index, Ordinal, Offset, Size) ->
                 _MissingOrDifferent -> false
             end;
         {error, _Reason} -> false
+    end.
+
+%% ---------------------------------------------------------------------------
+%% Long-lived per-directory segment writer.
+%%
+%% wa_raft runs every async append in a freshly spawned process. Raw file
+%% descriptors belong to the process that opened them, so a writer cache keyed
+%% by the caller always missed and each append re-validated and reopened the
+%% segment and its .idx sidecar. Appends now run inside one writer process per
+%% segment directory, which keeps its descriptors across appends. The caller
+%% waits for the result, so durability (datasync before reply) is unchanged.
+%% ---------------------------------------------------------------------------
+
+-define(SEGMENT_WRITER_IDLE_MS, 30000).
+
+run_in_segment_writer(Dir, Fun) ->
+    run_in_segment_writer(Dir, Fun, 2).
+
+run_in_segment_writer(_Dir, Fun, 0) ->
+    Fun();
+run_in_segment_writer(Dir, Fun, Attempts) ->
+    case segment_writer_pid(Dir) of
+        {ok, Pid} ->
+            MRef = erlang:monitor(process, Pid),
+            Pid ! {segment_writer_run, self(), MRef, Fun},
+            await_segment_writer(Dir, Fun, Attempts, Pid, MRef, false);
+        {error, _Reason} ->
+            Fun()
+    end.
+
+await_segment_writer(Dir, Fun, Attempts, Pid, MRef, Started) ->
+    receive
+        {MRef, started} ->
+            await_segment_writer(Dir, Fun, Attempts, Pid, MRef, true);
+        {MRef, result, Result} ->
+            erlang:demonitor(MRef, [flush]),
+            Result;
+        {'DOWN', MRef, process, Pid, Reason} when Started ->
+            %% The write may have been partially applied; never replay it.
+            {error, {segment_writer_down, Reason}};
+        {'DOWN', MRef, process, Pid, _Reason} ->
+            %% The writer exited (idle) before taking the request: safe to retry.
+            run_in_segment_writer(Dir, Fun, Attempts - 1)
+    end.
+
+segment_writer_pid(Dir) ->
+    Registry = ensure_writer_registry(),
+    Key = {segment_writer_proc, writer_dir_from_dir(Dir)},
+    case writer_registry_lookup(Registry, Key) of
+        [{Key, Pid}] when is_pid(Pid) ->
+            case is_process_alive(Pid) of
+                true ->
+                    {ok, Pid};
+                false ->
+                    ok = safe_delete_writer_object(Registry, {Key, Pid}),
+                    start_segment_writer(Registry, Key)
+            end;
+        _ ->
+            start_segment_writer(Registry, Key)
+    end.
+
+start_segment_writer(Registry, Key) ->
+    Pid = spawn(fun() -> segment_writer_loop(Registry, Key) end),
+    try ets:insert_new(Registry, {Key, Pid}) of
+        true ->
+            Pid ! segment_writer_registered,
+            {ok, Pid};
+        false ->
+            exit(Pid, kill),
+            case writer_registry_lookup(Registry, Key) of
+                [{Key, Winner}] when is_pid(Winner) -> {ok, Winner};
+                _ -> {error, segment_writer_unavailable}
+            end
+    catch
+        error:badarg ->
+            exit(Pid, kill),
+            {error, segment_writer_unavailable}
+    end.
+
+segment_writer_loop(Registry, Key) ->
+    _ = put({?MODULE, segment_writer}, true),
+    receive
+        segment_writer_registered -> segment_writer_serve(Registry, Key)
+    after 5000 ->
+        ok
+    end.
+
+segment_writer_serve(Registry, Key) ->
+    receive
+        {segment_writer_run, From, MRef, Fun} ->
+            case is_process_alive(From) of
+                true ->
+                    %% wa_raft cancels an async append by killing its caller;
+                    %% the guard makes that kill stop this write, as it did
+                    %% when the write ran in the caller itself.
+                    Guard = spawn_link(fun() -> segment_writer_guard(From) end),
+                    From ! {MRef, started},
+                    Result =
+                        try Fun() of
+                            Value -> Value
+                        catch
+                            Class:Reason:Stacktrace -> {error, {segment_writer_failed, Class, Reason, Stacktrace}}
+                        end,
+                    true = unlink(Guard),
+                    true = exit(Guard, kill),
+                    From ! {MRef, result, Result};
+                false ->
+                    %% The caller died before this request was taken: no write.
+                    ok
+            end,
+            segment_writer_serve(Registry, Key);
+        {segment_writer_sync, From, MRef} ->
+            From ! {MRef, synced},
+            segment_writer_serve(Registry, Key)
+    after ?SEGMENT_WRITER_IDLE_MS ->
+        %% Unregister first; a request racing this exit sees DOWN before
+        %% "started" and retries against a fresh writer.
+        ok = safe_delete_writer_object(Registry, {Key, self()}),
+        receive
+            {segment_writer_run, _From, _MRef, _Fun} = Late ->
+                self() ! Late,
+                segment_writer_serve(Registry, Key)
+        after 0 ->
+            ok
+        end
+    end.
+
+%% Ties one request's write to its caller, one way: the guard is linked to the
+%% writer and only monitors the caller, so a killed caller kills the writer,
+%% while a writer that dies for another reason leaves a live caller running
+%% (it gets {segment_writer_down, Reason}).
+segment_writer_guard(Caller) ->
+    MRef = erlang:monitor(process, Caller),
+    receive
+        {'DOWN', MRef, process, Caller, Reason} ->
+            exit({segment_writer_caller_down, Reason})
+    end.
+
+%% wa_raft rolls back a cancelled async append (close_process_writers, then
+%% truncate) as soon as its caller is dead, which can be before the guard has
+%% killed the writer. The write ran in this directory's segment writer, so wait
+%% until the writer has died with that caller or has finished the request
+%% before the rollback truncates.
+await_segment_writer_idle(Dir) ->
+    Registry = ensure_writer_registry(),
+    Key = {segment_writer_proc, writer_dir_from_dir(Dir)},
+    case writer_registry_lookup(Registry, Key) of
+        [{Key, Pid}] when is_pid(Pid) ->
+            MRef = erlang:monitor(process, Pid),
+            Pid ! {segment_writer_sync, self(), MRef},
+            Timeout = file_writer_call_timeout_ms(),
+            receive
+                {MRef, synced} ->
+                    erlang:demonitor(MRef, [flush]),
+                    ok;
+                {'DOWN', MRef, process, Pid, _Reason} ->
+                    ok
+            after Timeout ->
+                erlang:demonitor(MRef, [flush]),
+                {error, {segment_writer_busy, Pid, Timeout}}
+            end;
+        _None ->
+            ok
+    end.
+
+%% A writer keeps descriptors across appends. A destructive rewrite can only
+%% delete another owner's registry entry (raw descriptors cannot be closed from
+%% a different process), so the owner closes its stale descriptor before it
+%% opens a replacement.
+track_segment_fd(Key, Fd) ->
+    Identity =
+        case file:read_file_info(Fd, [raw]) of
+            {ok, Info} -> file_identity(Info);
+            {error, _Reason} -> unknown
+        end,
+    _ = put({?MODULE, segment_fd, Key}, {Fd, Identity}),
+    ok.
+
+untrack_segment_fd(Key, Fd) ->
+    case get({?MODULE, segment_fd, Key}) of
+        {Fd, _Identity} -> _ = erase({?MODULE, segment_fd, Key}), ok;
+        _Other -> ok
+    end.
+
+close_tracked_segment_fd(Key) ->
+    case erase({?MODULE, segment_fd, Key}) of
+        {Fd, _Identity} -> _ = file:close(Fd), ok;
+        undefined -> ok
+    end.
+
+%% A reused descriptor must still be the file its path names; a directory
+%% deleted and recreated outside this module would otherwise swallow
+%% acknowledged appends into an unlinked inode.
+tracked_segment_fd_current(Key, Path, Fd) ->
+    case get({?MODULE, segment_fd, Key}) of
+        {Fd, Identity} when Identity =/= unknown ->
+            case file:read_link_info(Path, [raw]) of
+                {ok, #file_info{type = regular} = Info} -> file_identity(Info) =:= Identity;
+                _Missing -> false
+            end;
+        {Fd, unknown} ->
+            false;
+        _NotTracked ->
+            true
+    end.
+
+%% The .idx sidecar is derived: readers verify every record it points at, so a
+%% stale index only costs a fallback scan. Short-lived callers open, write and
+%% close it. The segment writer keeps one descriptor with its inode and only
+%% checks that the path still names that inode (one lstat) before writing.
+with_offset_index_fd(Path, Fun) ->
+    case get({?MODULE, segment_writer}) of
+        true -> with_cached_offset_index_fd(Path, Fun);
+        _ -> with_transient_offset_index_fd(Path, Fun)
+    end.
+
+with_transient_offset_index_fd(Path, Fun) ->
+    case open_offset_index_for_write(Path) of
+        {ok, Fd} ->
+            Result = Fun(Fd),
+            CloseResult = file:close(Fd),
+            case {Result, CloseResult} of
+                {ok, ok} -> ok;
+                {{error, _Reason} = Error, _} -> Error;
+                {ok, {error, Reason}} -> {error, {close_offset_index, Reason}}
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+with_cached_offset_index_fd(Path, Fun) ->
+    case cached_offset_index_fd(Path) of
+        {ok, Fd} ->
+            case Fun(Fd) of
+                ok ->
+                    ok;
+                {error, _Reason} = Error ->
+                    ok = drop_cached_offset_index_fd(),
+                    Error
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+cached_offset_index_fd(Path) ->
+    case get({?MODULE, offset_index_fd}) of
+        {Path, Fd, Identity} ->
+            case file:read_link_info(Path, [raw]) of
+                {ok, #file_info{type = regular} = Info} ->
+                    case file_identity(Info) of
+                        Identity -> {ok, Fd};
+                        _Replaced -> reopen_cached_offset_index_fd(Path)
+                    end;
+                _Missing ->
+                    reopen_cached_offset_index_fd(Path)
+            end;
+        _NoneOrOtherSegment ->
+            reopen_cached_offset_index_fd(Path)
+    end.
+
+reopen_cached_offset_index_fd(Path) ->
+    ok = drop_cached_offset_index_fd(),
+    case open_offset_index_for_write(Path) of
+        {ok, Fd} ->
+            case file:read_file_info(Fd, [raw]) of
+                {ok, Info} ->
+                    _ = put({?MODULE, offset_index_fd}, {Path, Fd, file_identity(Info)}),
+                    {ok, Fd};
+                {error, Reason} ->
+                    _ = file:close(Fd),
+                    {error, {stat_offset_index, Reason}}
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+drop_cached_offset_index_fd() ->
+    case erase({?MODULE, offset_index_fd}) of
+        {_Path, Fd, _Identity} -> _ = file:close(Fd), ok;
+        undefined -> ok
+    end.
+
+file_identity(#file_info{major_device = Device, inode = Inode}) -> {Device, Inode}.
+
+safe_delete_writer_object(Registry, Object) ->
+    try ets:delete_object(Registry, Object) of
+        true -> ok
+    catch
+        error:badarg -> ok
     end.
