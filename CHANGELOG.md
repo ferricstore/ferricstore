@@ -22,6 +22,9 @@ All notable changes to FerricStore will be documented here.
   failed with `compare_failed`, so that shard's Flow LMDB projection stopped
   advancing (degraded mirror; schedule lists and Flow queries reported the
   catalog unavailable) until restart.
+- A failed Flow LMDB clear (FLUSHDB) now names the step that failed (opening
+  the environment, beginning the write transaction, clearing, or committing)
+  instead of only the OS error, such as `Invalid argument (os error 22)`.
 
 ## 0.11.24 - 2026-10-06
 

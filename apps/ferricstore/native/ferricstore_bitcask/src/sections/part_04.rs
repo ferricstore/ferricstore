@@ -619,23 +619,30 @@ fn lmdb_write_batch_with_originals<'a>(
 #[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn lmdb_clear<'a>(env: Env<'a>, path: String, map_size: u64) -> NifResult<Term<'a>> {
+    // Name the failing step: a bare OS error such as "Invalid argument (os
+    // error 22)" does not say whether the open, the transaction or the commit
+    // failed.
+    let clear_error = |step: &str, error: &dyn std::fmt::Display| {
+        Ok((atoms::error(), format!("lmdb clear: {step}: {error}")).encode(env))
+    };
+
     match lmdb_store(&path, map_size) {
         Ok(store) => {
             let mut wtxn = match store.env.write_txn() {
                 Ok(txn) => txn,
-                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                Err(e) => return clear_error("begin write transaction", &e),
             };
 
             if let Err(e) = store.db.clear(&mut wtxn) {
-                return Ok((atoms::error(), e.to_string()).encode(env));
+                return clear_error("clear database", &e);
             }
 
             match wtxn.commit() {
                 Ok(()) => Ok(atoms::ok().encode(env)),
-                Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+                Err(e) => clear_error("commit", &e),
             }
         }
-        Err(e) => Ok((atoms::error(), e).encode(env)),
+        Err(e) => clear_error("open environment", &e),
     }
 }
 
