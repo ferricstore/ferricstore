@@ -402,7 +402,7 @@ scan_raft_segment_record(Fd, Path, undefined, Offset, FileBytes, Ordinal, Record
                 Crc ->
                     case peek_record_index(Payload) of
                         {ok, Index} ->
-                            maybe_update_latest_config_from_payload(filename:dirname(Path), Index, Payload),
+                            maybe_update_latest_config_from_payload(cached_dirname(Path), Index, Payload),
                             scan_raft_segment_known_index(
                                 Fd,
                                 Path,
@@ -439,7 +439,7 @@ scan_raft_segment_record(Fd, Path, PreviousIndex, Offset, FileBytes, Ordinal, Re
                 Crc ->
                     case peek_record_index(Payload) of
                         {ok, Index} ->
-                            maybe_update_latest_config_from_payload(filename:dirname(Path), Index, Payload),
+                            maybe_update_latest_config_from_payload(cached_dirname(Path), Index, Payload),
                             scan_raft_segment_known_index(
                                 Fd,
                                 Path,
@@ -627,7 +627,7 @@ load_segment_payload(Fd, Path, Name, PreviousIndex, Offset, FileBytes, Ordinal, 
                 {ok, Index} ->
                     case validate_record_segment_ordinal(Path, Index, Ordinal, RecordsPerSegment) of
                         ok ->
-                            Dir = filename:dirname(Path),
+                            Dir = cached_dirname(Path),
                             case recovered_index_allowed(Path, PreviousIndex, Index) of
                                 ok ->
                                     load_segment_valid_payload(
@@ -762,7 +762,7 @@ maybe_store_recovered_record(Path, Name, Record) ->
             ok;
         not_folded ->
             true = ets:insert(Name, Record),
-            maybe_track_recovered_record(filename:dirname(Path), Name, Record)
+            maybe_track_recovered_record(cached_dirname(Path), Name, Record)
     end.
 
 maybe_fold_recovered_record({Index, Entry}) ->

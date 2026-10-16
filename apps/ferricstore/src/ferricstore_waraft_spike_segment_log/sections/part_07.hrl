@@ -193,7 +193,7 @@ index_scanned_offset(Path, Index, Ordinal, Offset, EncodedSize) ->
     case erlang:get(?OFFSET_INDEX_BUILD) of
         {_Dir, _, _, Floor} when Index < Floor -> ok;
         {Dir, _, _, _Floor} ->
-            case filename:dirname(Path) of
+            case cached_dirname(Path) of
                 Dir ->
                     write_offset_index_entries([
                         {{offset_dir_key(Dir), Index}, Ordinal, Offset, EncodedSize}
