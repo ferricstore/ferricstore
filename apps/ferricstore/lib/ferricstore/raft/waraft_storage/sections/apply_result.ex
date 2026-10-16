@@ -707,12 +707,12 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
         call_segment_projection_checkpoint_hook(:before_scan, metadata)
 
         case take_segment_projection_cut(job) do
-          {:ok, rows, cut_position, generation} ->
+          {:ok, cut, cut_position, generation} ->
             metadata = %{metadata | position: cut_position}
 
             job.root_dir
             |> with_segment_projection_lock(fn ->
-              write_segment_projection_checkpoint_from_cut(job, rows, generation, metadata)
+              write_segment_projection_checkpoint_from_cut(job, cut, generation, metadata)
             end)
             |> case do
               {%{} = metadata, result} ->
@@ -745,17 +745,20 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
         receive do
           {:ferricstore_waraft_segment_projection_checkpoint_cut, ^ref, {:cut, position, storage}} ->
             generation = segment_projection_trim_generation(job.root_dir)
-            rows = :ets.tab2list(job.keydir)
+            cut = copy_keydir_for_cut(job.keydir)
             send(storage, {:ferricstore_waraft_segment_projection_checkpoint_cut_copied, ref})
 
             receive do
               {:ferricstore_waraft_segment_projection_checkpoint_cut, ^ref, :confirmed} ->
-                {:ok, rows, position, generation}
+                {:ok, cut, position, generation}
 
               {:ferricstore_waraft_segment_projection_checkpoint_cut, ^ref, :expired} ->
+                :ets.delete(cut)
                 :stale
             after
-              @segment_projection_cut_timeout_ms -> :stale
+              @segment_projection_cut_timeout_ms ->
+                :ets.delete(cut)
+                :stale
             end
 
           {:ferricstore_waraft_segment_projection_checkpoint_cut, ^ref, :stale} ->
@@ -765,16 +768,39 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
         end
       end
 
+      # Copies the keydir in chunks into a table this task owns, so no single
+      # list of every row is built while storage waits. The keydir is fixed so
+      # the chunked traversal sees each row once.
+      defp copy_keydir_for_cut(keydir) do
+        cut = :ets.new(:segment_projection_cut, [:set, :private])
+        :ets.safe_fixtable(keydir, true)
+
+        try do
+          copy_keydir_chunks(:ets.select(keydir, [{:_, [], [:"$_"]}], 2_000), cut)
+        after
+          :ets.safe_fixtable(keydir, false)
+        end
+
+        cut
+      end
+
+      defp copy_keydir_chunks(:"$end_of_table", _cut), do: :ok
+
+      defp copy_keydir_chunks({rows, continuation}, cut) do
+        true = :ets.insert(cut, rows)
+        copy_keydir_chunks(:ets.select(continuation), cut)
+      end
+
       # Runs under the projection lock, so no trim relocates rows or replaces
       # projection files while cold values are read from the cut's locations.
-      defp write_segment_projection_checkpoint_from_cut(job, rows, generation, metadata) do
+      defp write_segment_projection_checkpoint_from_cut(job, cut, generation, metadata) do
         if segment_projection_trim_generation(job.root_dir) != generation do
           # A trim moved rows after the cut; the cut's locations may be stale.
           {metadata, {:ok, :stale_cut}}
         else
           now = storage_expiry_cutoff_ms()
 
-          case segment_projection_entries_from_rows(rows, job.ctx, job.shard_index, now) do
+          case segment_projection_entries_from_keydir(cut, job.ctx, job.shard_index, now) do
             {:ok, {entries, entry_count}} ->
               metadata = %{metadata | entries: entry_count}
               emit_segment_projection_checkpoint_start(metadata)
@@ -782,6 +808,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
 
               {metadata,
                write_prepared_segment_projection_checkpoint(job, metadata, entries, generation)}
+
+            :unavailable ->
+              {metadata, {:error, {:segment_keydir_unavailable, job.shard_index}}}
 
             {:error, reason} ->
               {metadata, {:error, reason}}
@@ -828,24 +857,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
              ) do
           {:ok, :ok} -> :ok
           {:error, reason} -> {:error, {:segment_projection_relocation_table, reason}}
-        end
-      end
-
-      defp segment_projection_entries_from_rows(rows, ctx, shard_index, now) do
-        rows
-        |> Enum.reduce_while({:ok, {[], 0}}, fn row, {:ok, {entries, count}} ->
-          case segment_projection_entry_from_keydir_row(row, ctx, shard_index, now) do
-            {:ok, entry} -> {:cont, {:ok, {[entry | entries], count + 1}}}
-            :skip -> {:cont, {:ok, {entries, count}}}
-            {:error, reason} -> {:halt, {:error, reason}}
-          end
-        end)
-        |> case do
-          {:ok, {entries, count}} ->
-            {:ok, {Enum.sort_by(entries, fn {key, _value, _expire_at_ms} -> key end), count}}
-
-          {:error, _reason} = error ->
-            error
         end
       end
 
