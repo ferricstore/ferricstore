@@ -150,8 +150,10 @@ Alert on sustained growth in:
 - active timeout backlog or repeated timeout catch-up sweeps.
 
 Alert on any `[:ferricstore, :flow, :lmdb_rebuild, :corrupt_policy_skipped]`
-event: Flows of that type keep failing, and there is no command yet to replace a
-corrupt policy row.
+event: Flows of that type keep failing until the policy is repaired. Once the
+cluster runs at feature level 1 or higher, `flow_policy_set(type, replace: true,
+...)` replaces the corrupt row on every shard (see the deployment guide for
+raising the feature level).
 
 ## Starting Points
 
