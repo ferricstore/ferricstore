@@ -34,6 +34,34 @@ defmodule Ferricstore.Raft.SegmentLogProjectionCostTest do
            "#{path_calls} filename split/dirname calls for #{records} records"
   end
 
+  test "rewriting a segment projection reads its files back in buffered chunks" do
+    # The rewrite re-scans what it wrote to rebuild offsets. Unbuffered, each
+    # record cost a header read and a payload read, each a system call.
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "segment_projection_reads_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(root) end)
+    File.mkdir_p!(root)
+
+    records = 5_000
+    entries = for i <- 1..records, do: {"key-#{i}", "value", 0}
+
+    file_reads =
+      count_calls([{:prim_file, :read_nif, 2}], fn ->
+        assert :ok =
+                 @log.write_projection(
+                   String.to_charlist(root),
+                   {:raft_log_pos, records, 1},
+                   entries
+                 )
+      end)
+
+    assert file_reads < div(records, 10), "#{file_reads} file reads for #{records} records"
+  end
+
   # Count only this process and what it spawns: the application's own
   # background work in the test VM would otherwise add noise.
   defp count_calls(mfas, fun) do

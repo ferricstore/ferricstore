@@ -1,9 +1,12 @@
 %% Included by ferricstore_waraft_spike_segment_log.erl; generated split section 4.
 
+%% Full-file scans read every record sequentially (header, then payload) and
+%% stop at the size taken before the scan, so buffering returns the same bytes
+%% with far fewer system calls. Log trims rescan a whole projection rewrite.
 segment_scan_modes() ->
     case 'Elixir.Ferricstore.Application':'starting?'() of
         true -> [read, raw, binary, {read_ahead, ?STARTUP_READ_AHEAD_BYTES}];
-        false -> [read, raw, binary]
+        false -> [read, raw, binary, {read_ahead, ?OFFSET_SCAN_READ_AHEAD_BYTES}]
     end.
 
 read_disk_record_at(Dir, Index, Offset, EncodedSize, RecordsPerSegment) ->
