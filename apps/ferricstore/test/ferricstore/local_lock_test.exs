@@ -8,9 +8,10 @@ defmodule Ferricstore.LocalLockTest do
 
   test "a waiter takes the lock soon after the holder releases it" do
     # :global.trans sleeps a random 0.25-8 s between attempts, so a waiter
-    # usually finds the lock long after it was freed.
+    # usually finds the lock long after it was freed. Judge the typical
+    # handoff: one scheduler stall on a loaded runner is not a regression.
     delays =
-      for _trial <- 1..12 do
+      for _trial <- 1..15 do
         resource = make_ref()
         parent = self()
 
@@ -37,7 +38,8 @@ defmodule Ferricstore.LocalLockTest do
         div(Task.await(waiter, 30_000) - released_at, 1_000)
       end
 
-    assert Enum.max(delays) < 100, "lock handoff delays (ms): #{inspect(delays)}"
+    median = delays |> Enum.sort() |> Enum.at(div(length(delays), 2))
+    assert median < 25, "lock handoff delays (ms): #{inspect(delays)}"
   end
 
   test "only one process holds a lock at a time" do
