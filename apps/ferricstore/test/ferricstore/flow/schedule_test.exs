@@ -2281,6 +2281,12 @@ defmodule Ferricstore.Flow.ScheduleTest do
 
     assert {:ok, %{id: ^second_target_id}} =
              FerricStore.flow_get(second_target_id, partition_key: target_partition)
+
+    # The corrupt row fails every Flow LMDB flush on its shard until it is gone,
+    # which would leave that writer failing into the next test.
+    ctx = FerricStore.Instance.get(:default)
+    assert :ok = Ferricstore.Store.Router.delete(ctx, first_target_key)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count, 30_000)
   end
 
   test "overlap policy queue_after_previous preserves queued due occurrence" do
