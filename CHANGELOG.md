@@ -34,6 +34,16 @@ All notable changes to FerricStore will be documented here.
   recovery logs it, emits `[:ferricstore, :flow, :lmdb_rebuild,
   :corrupt_policy_skipped]` and drops its LMDB copy; reads and commands for that
   type still fail with `ERR flow policy is corrupt`.
+- Add cluster feature levels. New replicated behavior stays off until
+  `FerricStore.raise_cluster_feature_level/1` raises the level after a rolling
+  upgrade; the raise requires every member to support the level, levels never
+  go down, and nodes below the active level cannot join. Level 1 is the first
+  level; see the deployment guide. `CLUSTER.FEATURES` and
+  `CLUSTER.FEATURES.RAISE <level>` (native opcodes 0x0311 and 0x0312) do the
+  same from a client.
+- At feature level 1, `flow_policy_set(type, replace: true, ...)` repairs a corrupt
+  Flow policy row (unreadable or stored under another type) on every shard,
+  at a generation above any the type used before.
 
 ## 0.11.24 - 2026-10-06
 

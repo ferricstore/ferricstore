@@ -468,6 +468,7 @@ defmodule Ferricstore.Cluster.Manager do
              target_node,
              Process.get(:ferricstore_cluster_manager_target_data_format_hook)
            ),
+         :ok <- Ferricstore.Cluster.FeatureLevel.validate_join_target(target_node, ctx),
          {:ok, target_has_data} <- Target.target_has_data?(target_node, state.shard_count),
          :ok <- Target.validate_target_data_identity(target_node, ctx, target_has_data, replace?),
          {:ok, preexisting_membership} <- Target.target_membership_by_shard(target_node, state),

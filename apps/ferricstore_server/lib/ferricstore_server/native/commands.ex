@@ -120,6 +120,8 @@ defmodule FerricstoreServer.Native.Commands do
   @op_ferricstore_hotness 0x030E
   @op_ferricstore_metrics 0x030F
   @op_ferricstore_blobgc 0x0310
+  @op_cluster_features 0x0311
+  @op_cluster_features_raise 0x0312
 
   @op_flow_create 0x0201
   @op_flow_get 0x0202
@@ -255,6 +257,8 @@ defmodule FerricstoreServer.Native.Commands do
     @op_cluster_promote => "CLUSTER.PROMOTE",
     @op_cluster_demote => "CLUSTER.DEMOTE",
     @op_cluster_role => "CLUSTER.ROLE",
+    @op_cluster_features => "CLUSTER.FEATURES",
+    @op_cluster_features_raise => "CLUSTER.FEATURES.RAISE",
     @op_ferricstore_key_info => "FERRICSTORE.KEY_INFO",
     @op_ferricstore_config => "FERRICSTORE.CONFIG",
     @op_ferricstore_hotness => "FERRICSTORE.HOTNESS",
@@ -1345,6 +1349,8 @@ defmodule FerricstoreServer.Native.Commands do
               @op_cluster_promote,
               @op_cluster_demote,
               @op_cluster_role,
+              @op_cluster_features,
+              @op_cluster_features_raise,
               @op_ferricstore_hotness
             ] do
     with {:ok, command} <- fetch_command(opcode),
@@ -3360,6 +3366,8 @@ defmodule FerricstoreServer.Native.Commands do
       "CLUSTER.PROMOTE" => %{"required" => ["args"], "fields" => ["args", "deadline_ms"]},
       "CLUSTER.DEMOTE" => %{"required" => ["args"], "fields" => ["args", "deadline_ms"]},
       "CLUSTER.ROLE" => %{"required" => [], "fields" => ["args", "deadline_ms"]},
+      "CLUSTER.FEATURES" => %{"required" => [], "fields" => ["args", "deadline_ms"]},
+      "CLUSTER.FEATURES.RAISE" => %{"required" => ["args"], "fields" => ["args", "deadline_ms"]},
       "FERRICSTORE.KEY_INFO" => %{
         "required" => ["key"],
         "fields" => ["key", "args", "deadline_ms"]

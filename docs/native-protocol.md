@@ -461,6 +461,8 @@ paths can be added for commands that show up as real bottlenecks.
 0x030E FERRICSTORE.HOTNESS
 0x030F FERRICSTORE.METRICS
 0x0310 FERRICSTORE.BLOBGC
+0x0311 CLUSTER.FEATURES
+0x0312 CLUSTER.FEATURES.RAISE
 ```
 
 Most admin bodies use an `args` list so the native protocol can delegate to the
@@ -469,6 +471,7 @@ existing command handlers:
 ```text
 CLUSTER.JOIN:       {"args": ["node@host", "REPLACE"]}
 CLUSTER.FAILOVER:   {"args": ["0", "node@host"]}
+CLUSTER.FEATURES.RAISE: {"args": ["1"]}
 FERRICSTORE.CONFIG: {"args": ["GET", "prefix"]}
 ```
 

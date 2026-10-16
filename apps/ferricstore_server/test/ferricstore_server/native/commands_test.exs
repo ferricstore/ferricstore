@@ -49,6 +49,8 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @op_zadd 0x0140
   @op_smembers 0x0132
   @op_ferricstore_metrics 0x030F
+  @op_cluster_features 0x0311
+  @op_cluster_features_raise 0x0312
   @op_flow_create 0x0201
   @op_flow_get 0x0202
   @op_flow_claim_due 0x0203
@@ -1694,6 +1696,25 @@ defmodule FerricstoreServer.Native.CommandsTest do
       end)
 
     assert log =~ "metrics_collector_unavailable"
+  end
+
+  test "cluster feature levels are readable and raisable through native opcodes" do
+    assert {:ok, status, _state} = Commands.execute(@op_cluster_features, %{}, state())
+    assert status =~ ~r/\Asupported: \d+\r\nactive: \d+\r\nshard_0: \d+/
+
+    assert {:error, "ERR feature level must be a positive integer", _state} =
+             Commands.execute(@op_cluster_features_raise, %{"args" => ["one"]}, state())
+
+    {:ok, options, _state} = Commands.execute(@op_options, %{}, state())
+    assert "CLUSTER.FEATURES" in opcode_names(options)
+    assert "CLUSTER.FEATURES.RAISE" in opcode_names(options)
+
+    # Reading levels is an admin command; raising one changes the cluster.
+    {:ok, admin} = FerricstoreServer.Acl.CommandCategories.category_commands("ADMIN")
+    {:ok, dangerous} = FerricstoreServer.Acl.CommandCategories.category_commands("DANGEROUS")
+    assert MapSet.subset?(MapSet.new(~w(CLUSTER.FEATURES CLUSTER.FEATURES.RAISE)), admin)
+    assert "CLUSTER.FEATURES.RAISE" in dangerous
+    refute "CLUSTER.FEATURES" in dangerous
   end
 
   test "native admin args reject structured values without raising" do

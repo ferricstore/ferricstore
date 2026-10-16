@@ -488,6 +488,8 @@ defmodule FerricStore do
   defdelegate flushall(), to: SystemAPI
   defdelegate export(path, opts \\ []), to: SystemAPI
   defdelegate restore(path, opts \\ []), to: SystemAPI
+  defdelegate cluster_feature_level(), to: SystemAPI
+  defdelegate raise_cluster_feature_level(level), to: SystemAPI
   defdelegate pipeline(fun), to: SystemAPI
   defguardeddelegate(batch_get(keys), to: SystemAPI, keys: keys)
   defdelegate packed_batch_get(packed_keys), to: SystemAPI
