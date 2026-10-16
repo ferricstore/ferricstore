@@ -1,19 +1,9 @@
 %% Included by ferricstore_waraft_spike_segment_log.erl; generated split section 4.
 
-%% Full-file scans read every record as a header read plus a payload read, so
-%% buffering saves two system calls per record. It is only safe when nothing
-%% appends during the scan: macOS can report a new file size before the
-%% appended bytes are readable, and an early read-ahead would hold them
-%% unwritten. Startup and offset rebuilds (see rebuild_offset_registry_stream/1)
-%% have no concurrent appender; other runtime scans read unbuffered.
 segment_scan_modes() ->
     case 'Elixir.Ferricstore.Application':'starting?'() of
         true -> [read, raw, binary, {read_ahead, ?STARTUP_READ_AHEAD_BYTES}];
-        false ->
-            case erlang:get(?OFFSET_REBUILD_SCAN) of
-                true -> [read, raw, binary, {read_ahead, ?OFFSET_SCAN_READ_AHEAD_BYTES}];
-                _NotRebuilding -> [read, raw, binary]
-            end
+        false -> [read, raw, binary]
     end.
 
 read_disk_record_at(Dir, Index, Offset, EncodedSize, RecordsPerSegment) ->

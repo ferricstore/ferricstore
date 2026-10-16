@@ -91,7 +91,6 @@
 %% filename:dirname/1 walk the whole charlist path on every call.
 -define(APPEND_KIND_CACHE, ferricstore_waraft_segment_append_kind_cache).
 -define(DIRNAME_CACHE, ferricstore_waraft_segment_dirname_cache).
--define(OFFSET_REBUILD_SCAN, ferricstore_waraft_segment_offset_rebuild_scan).
 -define(FOLD_LOCATION, ferricstore_waraft_segment_log_fold_location).
 -define(DEFAULT_MAX_ETS_BYTES, 536870912).
 -define(DEFAULT_MAX_ETS_ENTRIES, 65536).

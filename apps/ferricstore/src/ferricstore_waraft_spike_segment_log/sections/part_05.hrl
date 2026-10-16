@@ -442,21 +442,7 @@ rebuild_offset_registry(Dir) ->
             Error
     end.
 
-%% Offset rebuilds run in the log's own writer, after a truncate, or under the
-%% lock that serializes a rewrite of Dir. Nothing appends while they scan, so
-%% their scans may buffer (see segment_scan_modes/0).
 rebuild_offset_registry_stream(Dir) ->
-    Previous = erlang:put(?OFFSET_REBUILD_SCAN, true),
-    try
-        rebuild_offset_registry_stream_scan(Dir)
-    after
-        case Previous of
-            undefined -> erlang:erase(?OFFSET_REBUILD_SCAN);
-            _ -> erlang:put(?OFFSET_REBUILD_SCAN, Previous)
-        end
-    end.
-
-rebuild_offset_registry_stream_scan(Dir) ->
     case {existing_records_per_segment(Dir), segment_paths(Dir)} of
         {{ok, RecordsPerSegment}, {ok, Paths}} ->
             Result = case segment_append_kind(Dir) of
