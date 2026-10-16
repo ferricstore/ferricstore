@@ -74,6 +74,84 @@ rewrite_records_atomic(Dir, Records, RecordsPerSegment) ->
             Error
     end.
 
+%% Make the projection in SourceRoot (written earlier by write_projection/3)
+%% the projection in TargetRoot without rewriting it. The files move with
+%% rename_rewrite_dir/2, which carries the offset sidecars and their trust, and
+%% the swap reuses the rewrite marker protocol, so recover_rewrite/1 rolls an
+%% interrupted promotion back to the old projection (or, if there was none,
+%% forward to the moved one). The marker is written before anything moves.
+promote_projection(SourceRoot, TargetRoot) ->
+    Source = fold_disk_segment_dir(SourceRoot),
+    Target = fold_disk_segment_dir(TargetRoot),
+    case {validate_segment_log_dir(Source), validate_segment_log_dir(Target)} of
+        {ok, ok} ->
+            case path_exists(Source) of
+                true -> promote_projection_dir(Source, Target);
+                false -> {error, {missing_projection_source, Source}};
+                {error, _Reason} = Error -> Error
+            end;
+        {{error, _Reason} = Error, _} -> Error;
+        {_, {error, _Reason} = Error} -> Error
+    end.
+
+promote_projection_dir(Source, Target) ->
+    case {recover_rewrite(Target), promoted_projection_last_index(Source)} of
+        {ok, {ok, Last}} ->
+            case metadata_ensure_dir(Target) of
+                ok -> promote_projection_swap(Source, Target, Last);
+                {error, Reason} -> {error, {ensure_projection_parent, Reason}}
+            end;
+        {{error, _Reason} = Error, _} -> Error;
+        {_, {error, _Reason} = Error} -> Error
+    end.
+
+%% Only a source whose offset sidecars were built and trusted in this run can
+%% be adopted without a rescan.
+promoted_projection_last_index(Source) ->
+    Untrusted = persistent_term:get({?MODULE, offset_index_untrusted, offset_dir_key(Source)}, false),
+    case {Untrusted, lookup_offset_dir_last_index(Source)} of
+        {false, {ok, Last}} -> {ok, Last};
+        {true, _} -> {error, {projection_source_untrusted, Source}};
+        {_, not_found} -> {error, {projection_source_offsets_missing, Source}};
+        {_, {error, _Reason} = Error} -> Error
+    end.
+
+promote_projection_swap(Source, Target, Last) ->
+    Paths = rewrite_paths(Target),
+    Staging = maps:get(staging, Paths),
+    Backup = maps:get(backup, Paths),
+    case write_rewrite_marker(Target, Paths) of
+        ok ->
+            case rename_rewrite_dir(Source, Staging) of
+                ok ->
+                    case sync_dir(filename:dirname(Source)) of
+                        ok -> promote_projection_finish(Target, Paths, Staging, Backup, Last);
+                        {error, _Reason} = Error ->
+                            _ = rollback_rewrite(Target, Paths),
+                            Error
+                    end;
+                {error, _Reason} = Error ->
+                    _ = rollback_rewrite(Target, Paths),
+                    Error
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+promote_projection_finish(Target, Paths, Staging, Backup, Last) ->
+    case swap_rewrite_dirs(Target, Staging, Backup) of
+        ok ->
+            case finish_rewrite(Target, Backup) of
+                ok -> cache_rebuilt_offsets(Target, Last, []);
+                {error, _Reason} = Error ->
+                    _ = rollback_rewrite(Target, Paths),
+                    Error
+            end;
+        {error, _Reason} = Error ->
+            _ = rollback_rewrite(Target, Paths),
+            Error
+    end.
+
 rewrite_projection_upsert_records(Dir, Records) ->
     case validate_segment_log_dir(Dir) of
         ok ->
