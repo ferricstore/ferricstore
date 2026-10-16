@@ -4,6 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.0 - 2026-10-16
+
+- Upgrading from 0.11.x: upgrade nodes one at a time. Existing data
+  directories stay in data format 1 and keep working. A new, empty data
+  directory is created in format 2 unless `config :ferricstore, :data_format, 1`
+  is set, and a node in another format cannot join a cluster, so set it on
+  nodes you add to an existing format 1 cluster. To move a cluster to format 2,
+  export it and restore it into a new cluster (see "Moving Data to Format 2" in
+  the deployment guide). Once every node runs 0.12.0, raise the cluster feature
+  level to 1 to turn on feature-gated behavior.
 - Update the WARaft dependency (`ferricstore_waraft`) to 0.1.1. A replica now
   grants a vote only after its term and vote are durably on disk (fsynced
   before the rename, and the directory after it), so a crash cannot let it
