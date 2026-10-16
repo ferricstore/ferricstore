@@ -7,8 +7,8 @@ All notable changes to FerricStore will be documented here.
 - Make WARaft log trims about twice as fast. A trim rewrites the shard's
   segment projection inside the Raft commit path, then rescans it. That scan
   re-derived the same directory path several times per record and issued two
-  unbuffered reads per record. Both are gone: a 150k-entry projection rewrite
-  drops from 22 to 10 us per entry. Each trim still rewrites every live key, so
+  unbuffered reads per record. Both are gone from the rescan, and a 150k-entry
+  projection rewrite drops from 22 to 12 us per entry. Each trim still rewrites every live key, so
   write pauses during a trim still grow with the dataset.
 
 ## 0.12.0 - 2026-10-16
