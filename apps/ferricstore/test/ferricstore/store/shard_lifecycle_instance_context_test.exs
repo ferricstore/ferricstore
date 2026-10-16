@@ -414,6 +414,11 @@ defmodule Ferricstore.Store.ShardLifecycleInstanceContextTest do
   end
 
   test "recover_keydir during custom shard startup does not mutate default accounting" do
+    # Work an earlier test left on the default instance (a pending Flow LMDB
+    # flush and its hot-record prune) can land mid-test and move the default
+    # counter. FLUSHDB discards it, so only this test's shard start is measured.
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
+
     default_ctx = FerricStore.Instance.get(:default)
     default_before = keydir_binary_total(default_ctx)
 
