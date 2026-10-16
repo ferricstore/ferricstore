@@ -19,6 +19,21 @@ defmodule Ferricstore.LocalLock do
     end
   end
 
+  # A single attempt: {:ok, result} when the lock was free, :busy otherwise.
+  # For callers that must not block behind the holder.
+  @spec try_trans(:global.id(), (-> result)) :: {:ok, result} | :busy when result: term()
+  def try_trans(id, fun) when is_function(fun, 0) do
+    if :global.set_lock(id, [node()], 0) do
+      try do
+        {:ok, fun.()}
+      after
+        :global.del_lock(id, [node()])
+      end
+    else
+      :busy
+    end
+  end
+
   defp acquire(id, backoff_ms) do
     if :global.set_lock(id, [node()], 0) do
       :ok

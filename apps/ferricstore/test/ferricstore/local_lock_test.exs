@@ -45,6 +45,31 @@ defmodule Ferricstore.LocalLockTest do
     assert median < 50, "lock handoff delays (ms): #{inspect(delays)}"
   end
 
+  test "try_trans runs when the lock is free and never waits for a holder" do
+    resource = make_ref()
+    parent = self()
+
+    assert {:ok, :ran} = LocalLock.try_trans(lock_id(resource), fn -> :ran end)
+
+    holder =
+      spawn_link(fn ->
+        LocalLock.trans(lock_id(resource), fn ->
+          send(parent, :held)
+          receive do: (:release -> :ok)
+        end)
+      end)
+
+    assert_receive :held
+
+    {elapsed_us, result} =
+      :timer.tc(fn -> LocalLock.try_trans(lock_id(resource), fn -> :ran end) end)
+
+    assert result == :busy
+    assert elapsed_us < 50_000
+
+    send(holder, :release)
+  end
+
   test "only one process holds a lock at a time" do
     resource = make_ref()
     counter = :atomics.new(2, [])
