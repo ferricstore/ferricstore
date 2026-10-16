@@ -165,12 +165,59 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
       ops: [],
       counts: %{},
       terminal_values: %{},
-      active_reverse_values: %{state_key => "corrupt"},
+      active_reverse_values: %{LMDB.active_by_state_key_key(state_key) => "corrupt"},
       terminal_count_inits: MapSet.new()
     }
 
     assert {:error, :invalid_active_index_reverse} =
              ProjectionOps.maybe_expand_stale_active_delete("unused", state_key, acc)
+  end
+
+  test "stale active cleanup sees active reverse rows written earlier in the same batch" do
+    # Hibernation parks a far-future flow with raw active reverse writes. When the
+    # flow changes state before the writer flushes, both land in one batch, and the
+    # cleanup must compare against the batch's value, not the older LMDB one.
+    path = tmp_lmdb_path("active_reverse_same_batch")
+    state_key = "state-parked-then-terminal"
+    reverse_key = LMDB.active_by_state_key_key(state_key)
+    timeout_index = Keys.active_timeout_index_key()
+    active_key = LMDB.active_index_key(timeout_index, state_key, 253_402_300_740_000)
+
+    active_value =
+      LMDB.encode_active_index_value(timeout_index, state_key, 253_402_300_740_000, 0, state_key)
+
+    parked_reverse = LMDB.encode_active_index_reverse_value([active_key])
+
+    acc = %{
+      ops: [],
+      counts: %{},
+      terminal_values: %{},
+      active_reverse_values: %{},
+      terminal_count_inits: MapSet.new()
+    }
+
+    assert {:ok, acc} =
+             ProjectionOps.expand_path_op(path, {:put, reverse_key, parked_reverse}, acc)
+
+    assert {:ok, acc} = ProjectionOps.expand_path_op(path, {:put, active_key, active_value}, acc)
+    assert {:ok, acc} = ProjectionOps.maybe_expand_stale_active_delete(path, state_key, acc)
+    assert :ok = LMDB.write_batch(path, Enum.reverse(acc.ops))
+    assert :not_found = LMDB.get(path, reverse_key)
+    assert :not_found = LMDB.get(path, active_key)
+
+    # A raw delete in the batch hides an older persisted reverse row the same way.
+    assert :ok =
+             LMDB.write_batch(path, [
+               {:put, reverse_key, parked_reverse},
+               {:put, active_key, active_value}
+             ])
+
+    acc = %{acc | ops: [], active_reverse_values: %{}}
+    assert {:ok, acc} = ProjectionOps.expand_path_op(path, {:delete, reverse_key}, acc)
+    assert {:ok, acc} = ProjectionOps.expand_path_op(path, {:delete, active_key}, acc)
+    assert {:ok, acc} = ProjectionOps.maybe_expand_stale_active_delete(path, state_key, acc)
+    assert :ok = LMDB.write_batch(path, Enum.reverse(acc.ops))
+    assert :not_found = LMDB.get(path, reverse_key)
   end
 
   test "stale persisted active reverses cannot delete another state's active row" do

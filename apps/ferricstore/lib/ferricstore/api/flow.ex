@@ -18,6 +18,7 @@ defmodule FerricStore.API.Flow do
   """
   @spec flow_create(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_create(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
     Ferricstore.Flow.create(default_ctx(), id, opts)
   end
 
@@ -34,6 +35,7 @@ defmodule FerricStore.API.Flow do
   def flow_value_put(value, opts \\ [])
 
   def flow_value_put(value, opts) when is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_value!(value, :value)
     Ferricstore.Flow.value_put(default_ctx(), value, opts)
   end
 
@@ -60,6 +62,7 @@ defmodule FerricStore.API.Flow do
   """
   @spec flow_signal(binary(), keyword()) :: :ok | {:error, binary()}
   def flow_signal(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
     Ferricstore.Flow.signal(default_ctx(), id, opts)
   end
 
@@ -80,6 +83,8 @@ defmodule FerricStore.API.Flow do
   def flow_create_many(partition_key, items, opts \\ [])
 
   def flow_create_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
+    Ferricstore.Flow.UserValue.validate_items!(items)
     Ferricstore.Flow.create_many(default_ctx(), partition_key, items, opts)
   end
 
@@ -99,6 +104,8 @@ defmodule FerricStore.API.Flow do
 
   def flow_spawn_children(parent_id, children, opts)
       when is_binary(parent_id) and is_list(children) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
+    Ferricstore.Flow.UserValue.validate_items!(children)
     Ferricstore.Flow.spawn_children(default_ctx(), parent_id, children, opts)
   end
 
@@ -160,6 +167,14 @@ defmodule FerricStore.API.Flow do
   `:max_active_ms` is type-level and applies to newly created Flows. A create
   option overrides it for one Flow; `:infinity` disables the type default for
   that Flow. Command-local retry policy still wins over retry defaults.
+
+  A stored policy that is corrupt (unreadable, or stored under another type)
+  fails reads with `ERR flow policy is corrupt`. Once the cluster feature level
+  is at least 1 (`FerricStore.raise_cluster_feature_level/1`), `replace: true`
+  overwrites it with a policy built only from the given options, at a
+  generation above any the type used before, and also replaces corrupt copies
+  on other shards. Without `replace: true`, or before the level is raised, the
+  set fails with `ERR corrupt flow policy high-water` as before.
   """
   @spec flow_policy_set(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_policy_set(type, opts) when is_binary(type) and is_list(opts) do
@@ -248,6 +263,7 @@ defmodule FerricStore.API.Flow do
 
   def flow_complete(id, lease_token, opts)
       when is_binary(id) and is_binary(lease_token) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
     Ferricstore.Flow.complete(default_ctx(), id, lease_token, opts)
   end
 
@@ -273,6 +289,8 @@ defmodule FerricStore.API.Flow do
   def flow_complete_many(partition_key, items, opts \\ [])
 
   def flow_complete_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
+    Ferricstore.Flow.UserValue.validate_items!(items)
     Ferricstore.Flow.complete_many(default_ctx(), partition_key, items, opts)
   end
 
@@ -291,6 +309,8 @@ defmodule FerricStore.API.Flow do
   def flow_run_steps_many(items, opts \\ [])
 
   def flow_run_steps_many(items, opts) when is_list(items) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
+    Ferricstore.Flow.UserValue.validate_items!(items)
     Ferricstore.Flow.run_steps_many(default_ctx(), items, opts)
   end
 
@@ -304,6 +324,7 @@ defmodule FerricStore.API.Flow do
 
   def flow_transition(id, from_state, to_state, opts)
       when is_binary(id) and is_binary(from_state) and is_binary(to_state) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
     Ferricstore.Flow.transition(default_ctx(), id, from_state, to_state, opts)
   end
 
@@ -353,6 +374,8 @@ defmodule FerricStore.API.Flow do
   """
   @spec flow_schedule_create(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_schedule_create(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(Keyword.get(opts, :target, []))
+
     Ferricstore.Flow.Schedule.create(default_ctx(), id, opts)
   end
 
@@ -493,6 +516,7 @@ defmodule FerricStore.API.Flow do
 
   def flow_start_and_claim(id, type, initial_state, opts)
       when is_binary(id) and is_binary(type) and is_binary(initial_state) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
     Ferricstore.Flow.start_and_claim(default_ctx(), id, type, initial_state, opts)
   end
 
@@ -524,6 +548,7 @@ defmodule FerricStore.API.Flow do
   def flow_step_continue(id, lease_token, from_state, to_state, opts)
       when is_binary(id) and is_binary(lease_token) and is_binary(from_state) and
              is_binary(to_state) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
     Ferricstore.Flow.step_continue(default_ctx(), id, lease_token, from_state, to_state, opts)
   end
 
@@ -559,6 +584,9 @@ defmodule FerricStore.API.Flow do
 
   def flow_transition_many(partition_key, from_state, to_state, items, opts)
       when is_binary(from_state) and is_binary(to_state) and is_list(items) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
+    Ferricstore.Flow.UserValue.validate_items!(items)
+
     Ferricstore.Flow.transition_many(
       default_ctx(),
       partition_key,
@@ -590,6 +618,7 @@ defmodule FerricStore.API.Flow do
   @spec flow_retry(binary(), binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_retry(id, lease_token, opts)
       when is_binary(id) and is_binary(lease_token) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
     Ferricstore.Flow.retry(default_ctx(), id, lease_token, opts)
   end
 
@@ -613,6 +642,8 @@ defmodule FerricStore.API.Flow do
   def flow_retry_many(partition_key, items, opts \\ [])
 
   def flow_retry_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
+    Ferricstore.Flow.UserValue.validate_items!(items)
     Ferricstore.Flow.retry_many(default_ctx(), partition_key, items, opts)
   end
 
@@ -625,6 +656,7 @@ defmodule FerricStore.API.Flow do
 
   def flow_fail(id, lease_token, opts)
       when is_binary(id) and is_binary(lease_token) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
     Ferricstore.Flow.fail(default_ctx(), id, lease_token, opts)
   end
 
@@ -648,6 +680,8 @@ defmodule FerricStore.API.Flow do
   def flow_fail_many(partition_key, items, opts \\ [])
 
   def flow_fail_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
+    Ferricstore.Flow.UserValue.validate_items!(items)
     Ferricstore.Flow.fail_many(default_ctx(), partition_key, items, opts)
   end
 
@@ -659,6 +693,7 @@ defmodule FerricStore.API.Flow do
   def flow_cancel(id, opts \\ [])
 
   def flow_cancel(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
     Ferricstore.Flow.cancel(default_ctx(), id, opts)
   end
 
@@ -679,6 +714,8 @@ defmodule FerricStore.API.Flow do
   def flow_cancel_many(partition_key, items, opts \\ [])
 
   def flow_cancel_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
+    Ferricstore.Flow.UserValue.validate_opts!(opts)
+    Ferricstore.Flow.UserValue.validate_items!(items)
     Ferricstore.Flow.cancel_many(default_ctx(), partition_key, items, opts)
   end
 

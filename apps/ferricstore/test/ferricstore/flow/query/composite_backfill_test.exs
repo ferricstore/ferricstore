@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Flow.{Keys, LMDB, Locator, StorageScope}
+  alias Ferricstore.Flow.LMDBWriter.ProjectionOps
 
   alias Ferricstore.Flow.Query.{
     CompositeBackfill,
@@ -302,6 +303,77 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
              end)
 
     assert Enum.sort(reverse_keys) == Enum.sort(Enum.map(expected, & &1.key))
+  end
+
+  test "backfill projects a retained terminal record with the live writer's expiry" do
+    retention_until_ms = 9_000_000_000_000
+    # Flow state keys carry no keydir expiry; terminal retention lives in the record.
+    keydir_expire_at_ms = 0
+    state_key = Keys.state_key("retained-terminal", "tenant-a")
+
+    definition =
+      IndexDefinition.new!(%{
+        id: "by_updated_counted",
+        version: 1,
+        fields: [{:partition_key, :asc}, {:updated_at_ms, :desc}],
+        count_prefixes: [1]
+      })
+
+    encoded =
+      state_key
+      |> encoded_record(1)
+      |> Ferricstore.Flow.decode_record()
+      |> Map.merge(%{state: "completed", terminal_retention_until_ms: retention_until_ms})
+      |> Ferricstore.Flow.encode_record()
+
+    live_dir = tmp_data_dir("live-expiry")
+
+    instance_ctx =
+      install_writer_source(
+        %{query_index_provider: Provider, test_pid: self(), definitions: [definition]},
+        live_dir,
+        state_key,
+        encoded,
+        keydir_expire_at_ms
+      )
+
+    assert {:ok, live_ops, _state} =
+             ProjectionOps.expand_ops(
+               %{
+                 path: lmdb_path(live_dir),
+                 shard_index: 0,
+                 instance_ctx: instance_ctx,
+                 terminal_count_inits: MapSet.new()
+               },
+               [{:project_flow_query_state_from_source, state_key, 1}]
+             )
+
+    assert :ok = LMDB.write_batch(lmdb_path(live_dir), live_ops)
+
+    # The record exactly as BackfillSource hydrates it from a primary hit.
+    projected = %{
+      state_key: state_key,
+      record: Ferricstore.Flow.decode_record(encoded),
+      expire_at_ms: keydir_expire_at_ms
+    }
+
+    backfill_dir = tmp_data_dir("backfill-expiry")
+
+    assert {:ok, %{projected_records: 1}} =
+             CompositeBackfill.project_page(
+               %{data_dir: backfill_dir, shard_count: 1},
+               0,
+               [projected],
+               [definition],
+               projection_definitions: [],
+               read_entries_fun: fn _ctx, 0, [^state_key] ->
+                 {:ok, [{encoded, keydir_expire_at_ms}]}
+               end
+             )
+
+    live = composite_state(lmdb_path(live_dir), definition, state_key)
+    assert live.expire_at_ms == retention_until_ms
+    assert composite_state(lmdb_path(backfill_dir), definition, state_key) == live
   end
 
   test "rejects an oversized page before allocating projection state" do
@@ -637,6 +709,52 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
   end
 
   defp scope_metadata(value), do: %{0x8001 => {1, :uint64, :isolation_scope, value}}
+
+  defp install_writer_source(instance_ctx, data_dir, state_key, encoded, expire_at_ms) do
+    keydir = :ets.new(:composite_backfill_writer_source, [:set, :public])
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(data_dir, 0, 1, [
+               {state_key, encoded, expire_at_ms}
+             ])
+
+    :ets.insert(
+      keydir,
+      {state_key, nil, expire_at_ms, 0, {:waraft_apply_projection, 1}, 0, byte_size(encoded)}
+    )
+
+    on_exit(fn ->
+      Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(data_dir, 0)
+    end)
+
+    instance_ctx
+    |> Map.put(:data_dir, data_dir)
+    |> Map.put(:keydir_refs, {keydir})
+  end
+
+  defp composite_state(path, definition, state_key) do
+    assert {:ok, reverse} = LMDB.get(path, CompositeIndex.reverse_key(state_key))
+
+    assert {:ok, %{keys: keys, expire_at_ms: expire_at_ms}} =
+             CompositeIndex.decode_reverse_state(reverse, state_key)
+
+    assert {:ok, prefixes} = CompositeCounter.prefixes_for_keys([definition], keys)
+
+    counters =
+      prefixes
+      |> Enum.sort()
+      |> Enum.map(fn {^definition, prefix} ->
+        assert {:ok, blob} = LMDB.get(path, CompositeCounter.key(definition, prefix))
+        assert {:ok, counter} = CompositeCounter.decode_state(blob, prefix)
+        counter
+      end)
+
+    %{
+      expire_at_ms: expire_at_ms,
+      entries: Enum.map(keys, &{&1, LMDB.get(path, &1)}),
+      counters: counters
+    }
+  end
 
   defp tmp_data_dir(label) do
     data_dir =

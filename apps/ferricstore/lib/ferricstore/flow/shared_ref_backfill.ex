@@ -5,7 +5,9 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow
   alias Ferricstore.Flow.HistoryProjector
+  alias Ferricstore.Flow.Digest
   alias Ferricstore.Flow.HistoryProjector.ValueProjection
+  alias Ferricstore.Flow.KeydirSpill
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.NativeOrderedIndex
@@ -1781,9 +1783,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   defp valid_flow_tag?("{f:" <> digest_with_brace) do
     with true <- String.ends_with?(digest_with_brace, "}"),
          digest <- String.trim_trailing(digest_with_brace, "}"),
-         true <- byte_size(digest) == 43,
-         {:ok, decoded} <- Base.url_decode64(digest, padding: false),
-         true <- byte_size(decoded) == 32 do
+         true <- Digest.canonical?(digest) do
       true
     else
       _invalid -> false
@@ -1874,6 +1874,67 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
     with_fixed_keydir!(ctx.keydir, fn ->
       rebuild_cleanup_pages!(ctx, :ets.select(ctx.keydir, keydir_match_spec(), ctx.batch_size))
     end)
+
+    rebuild_spilled_cleanup_members!(ctx)
+  end
+
+  # Cleanup members spilled to LMDB (Ferricstore.Flow.KeydirSpill) are not in the
+  # keydir, but they must be in the cleanup index: retention lists a Flow's owned
+  # values from that index before it deletes the Flow.
+  defp rebuild_spilled_cleanup_members!(ctx) do
+    prefix = KeydirSpill.prefix(:retention_cleanup_member)
+
+    register_page = fn entries, :ok ->
+      with_rebuild_owner_cache(fn -> rebuild_spilled_cleanup_page!(ctx, prefix, entries) end)
+      {:ok, :ok}
+    end
+
+    case LMDB.reduce_prefix_entries(ctx.lmdb_path, prefix, ctx.batch_size, :ok, register_page) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, reason} ->
+        raise "shared-ref backfill could not read spilled cleanup members: #{inspect(reason)}"
+    end
+  end
+
+  defp rebuild_spilled_cleanup_page!(ctx, prefix, entries) do
+    now_ms = System.system_time(:millisecond)
+
+    inserts =
+      Enum.reduce(entries, [], fn {spill_key, encoded}, acc ->
+        key = binary_part(spill_key, byte_size(prefix), byte_size(spill_key) - byte_size(prefix))
+
+        # A keydir row (hot, or a tombstone of a pending delete) takes precedence.
+        if :ets.member(ctx.keydir, key) do
+          acc
+        else
+          case LMDB.decode_value(encoded, now_ms) do
+            {:ok, value} ->
+              case validate_cleanup_member!(ctx, key, value) do
+                {:ok, index_key, _owned_key} ->
+                  [{index_key, key, 0} | acc]
+
+                {:stale, index_key, _owned_key} ->
+                  lmdb_write_batch!(ctx, [{:delete, spill_key}])
+                  NativeOrderedIndex.delete_member(ctx.native, index_key, key)
+                  acc
+              end
+
+            :expired ->
+              lmdb_write_batch!(ctx, [{:delete, spill_key}])
+              acc
+
+            :error ->
+              raise "shared-ref backfill found a corrupt spilled cleanup member #{inspect(key)}"
+          end
+        end
+      end)
+
+    inserts
+    |> Enum.reverse()
+    |> Enum.chunk_every(128)
+    |> Enum.each(fn chunk -> :ok = NativeOrderedIndex.put_entries(ctx.native, chunk) end)
   end
 
   defp rebuild_cleanup_pages!(_ctx, :"$end_of_table"), do: :ok
@@ -1884,11 +1945,15 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   end
 
   defp rebuild_cleanup_page!(ctx, entries) do
+    with_rebuild_owner_cache(fn -> do_rebuild_cleanup_page!(ctx, entries) end)
+  end
+
+  defp with_rebuild_owner_cache(fun) do
     previous_cache = Process.get(@rebuild_owner_cache_key, :missing)
     Process.put(@rebuild_owner_cache_key, %{owners: %{}, bytes: 0})
 
     try do
-      do_rebuild_cleanup_page!(ctx, entries)
+      fun.()
     after
       case previous_cache do
         :missing -> Process.delete(@rebuild_owner_cache_key)
@@ -2092,8 +2157,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   end
 
   defp cleanup_member_key(tag, owner_id, owned_key) do
-    digest = :crypto.hash(:sha256, owned_key) |> Base.url_encode64(padding: false)
-    "f:" <> tag <> ":rtm:" <> owner_id <> ":" <> digest
+    "f:" <> tag <> ":rtm:" <> owner_id <> ":" <> Digest.encode(owned_key)
   end
 
   defp cleanup_owned_key?(owned_key, record) do
@@ -2526,31 +2590,32 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   defp count_result_prefix(run_id), do: run_prefix(run_id) <> "count-results:"
 
   defp work_key(run_id, key) do
-    work_prefix(run_id) <> Base.url_encode64(:crypto.hash(:sha256, key), padding: false)
+    work_prefix(run_id) <> staging_digest(key)
   end
 
   defp contribution_key(run_id, ref, registry_key) do
     contribution_prefix(run_id) <>
       ref_digest(ref) <>
-      ":" <> Base.url_encode64(:crypto.hash(:sha256, registry_key), padding: false)
+      ":" <> staging_digest(registry_key)
   end
 
   defp registry_snapshot_key(run_id, registry_key) do
-    registry_snapshot_prefix(run_id) <>
-      Base.url_encode64(:crypto.hash(:sha256, registry_key), padding: false)
+    registry_snapshot_prefix(run_id) <> staging_digest(registry_key)
   end
 
   defp existing_count_key(run_id, count_key) do
-    existing_count_prefix(run_id) <>
-      Base.url_encode64(:crypto.hash(:sha256, count_key), padding: false)
+    existing_count_prefix(run_id) <> staging_digest(count_key)
   end
 
   defp count_result_key(run_id, count_key) do
-    count_result_prefix(run_id) <>
-      Base.url_encode64(:crypto.hash(:sha256, count_key), padding: false)
+    count_result_prefix(run_id) <> staging_digest(count_key)
   end
 
-  defp ref_digest(ref), do: Base.url_encode64(:crypto.hash(:sha256, ref), padding: false)
+  defp ref_digest(ref), do: staging_digest(ref)
+
+  # Run staging lives only until its run finishes, so it keeps full digests in
+  # either data format.
+  defp staging_digest(value), do: Base.url_encode64(:crypto.hash(:sha256, value), padding: false)
 
   defp key_present!(keydir, key) do
     :ets.member(keydir, key)

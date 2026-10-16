@@ -33,10 +33,6 @@ defmodule Ferricstore.Flow.PolicyMirrorRecoveryTest do
       lmdb_path = LMDB.path(Ferricstore.DataDir.shard_data_path(data_dir, 0))
       _ = LMDB.release(lmdb_path)
 
-      if :ets.info(keydir) != :undefined do
-        :ets.delete(keydir)
-      end
-
       File.rm_rf!(data_dir)
     end)
 
@@ -133,6 +129,66 @@ defmodule Ferricstore.Flow.PolicyMirrorRecoveryTest do
              PolicyMirrorRecovery.reconcile_shard(lmdb_path, keydir, shard_path, 0, ctx)
 
     assert {:ok, ^old_value} = read_mirror(lmdb_path, job_key)
+  end
+
+  test "a corrupt policy source is skipped so the rest of the shard still recovers", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    healthy_key = Keys.policy_key("quarantine-healthy")
+    healthy_value = RetryPolicy.encode_flow_policy(%{type: "quarantine-healthy", version: 1}, 1)
+    foreign_key = Keys.policy_key("quarantine-foreign")
+    foreign_value = RetryPolicy.encode_flow_policy(%{type: "another-type", version: 1}, 3)
+    stale_mirror = RetryPolicy.encode_flow_policy(%{type: "quarantine-foreign", version: 1}, 2)
+    garbage_key = Keys.policy_key("quarantine-garbage")
+    garbage_value = <<"not-a-policy">>
+
+    for {key, value} <- [
+          {healthy_key, healthy_value},
+          {foreign_key, foreign_value},
+          {garbage_key, garbage_value}
+        ] do
+      true = :ets.insert(keydir, {key, value, 0, 0, :hot, 0, byte_size(value)})
+    end
+
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    lmdb_path = LMDB.path(shard_path)
+
+    assert :ok =
+             LMDB.write_batch(lmdb_path, [
+               {:put, foreign_key, LMDB.encode_value(stale_mirror, 0)}
+             ])
+
+    handler_id = {__MODULE__, :corrupt_policy_skipped, make_ref()}
+    parent = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :flow, :lmdb_rebuild, :corrupt_policy_skipped],
+        fn _event, measurements, metadata, _config ->
+          send(parent, {:corrupt_policy_skipped, measurements, metadata})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, _repaired} =
+                 PolicyMirrorRecovery.reconcile_shard(lmdb_path, keydir, shard_path, 0, ctx)
+      end)
+
+    assert {:ok, ^healthy_value} = read_mirror(lmdb_path, healthy_key)
+    # A stale valid copy must not outlive its corrupt source.
+    assert :not_found = LMDB.get(lmdb_path, foreign_key)
+    assert :not_found = LMDB.get(lmdb_path, garbage_key)
+
+    assert_received {:corrupt_policy_skipped, %{count: 1}, %{key: ^foreign_key}}
+    assert_received {:corrupt_policy_skipped, %{count: 1}, %{key: ^garbage_key}}
+    assert log =~ "quarantine-foreign"
+    assert log =~ "quarantine-garbage"
   end
 
   test "repairs a cold policy source from its physical locator without a shard process", %{

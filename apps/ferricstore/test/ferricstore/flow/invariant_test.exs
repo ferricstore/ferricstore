@@ -899,7 +899,7 @@ defmodule Ferricstore.Flow.InvariantTest do
                  fencing_token: continued.fencing_token,
                  run_at_ms: 2_200,
                  now_ms: 2_101,
-                 error: %{reason: "retry"}
+                 error: %{"reason" => "retry"}
                )
 
       put_fifo_policy!(type, ["charge"])

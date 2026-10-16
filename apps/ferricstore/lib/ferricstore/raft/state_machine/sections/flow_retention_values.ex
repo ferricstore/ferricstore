@@ -137,8 +137,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
       end
 
       defp flow_retention_decode_lmdb_history_entries(entries, acc) do
-        Enum.reduce(entries, acc, fn {_history_index_key, value}, acc ->
-          case Ferricstore.Flow.LMDB.decode_history_index_value(value) do
+        Enum.reduce(entries, acc, fn {history_index_key, value}, acc ->
+          case Ferricstore.Flow.LMDB.decode_history_index_row(history_index_key, value) do
             {:ok, {event_id, _event_ms, _expire_at_ms, compound_key}} ->
               [{compound_key, event_id, value} | acc]
 
@@ -186,7 +186,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
 
             entries =
               member_keys
-              |> Enum.zip(sm_store_batch_get(state, member_keys, &sm_file_path/2))
+              |> Enum.zip(keydir_spill_batch_get(state, member_keys))
               |> Enum.map(fn
                 {member_key, value} when is_binary(value) ->
                   case Ferricstore.Flow.RetentionCleanupMember.decode(value) do

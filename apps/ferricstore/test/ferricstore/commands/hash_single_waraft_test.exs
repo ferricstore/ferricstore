@@ -164,6 +164,24 @@ defmodule Ferricstore.Commands.HashSingleWARaftTest do
     assert_file_server_independent_hset(ctx, key, :hot)
   end
 
+  test "HSET persisting storage metadata does not wait for the shared file server", %{
+    ctx: ctx,
+    key: key
+  } do
+    # Persist storage metadata on every apply so the metadata journal append
+    # runs inside the suspension window deterministically.
+    previous = Application.get_env(:ferricstore, :waraft_storage_metadata_persist_every)
+    Application.put_env(:ferricstore, :waraft_storage_metadata_persist_every, 1)
+
+    on_exit(fn ->
+      if previous == nil,
+        do: Application.delete_env(:ferricstore, :waraft_storage_metadata_persist_every),
+        else: Application.put_env(:ferricstore, :waraft_storage_metadata_persist_every, previous)
+    end)
+
+    assert_file_server_independent_hset(ctx, key, :hot)
+  end
+
   test "durable cold promoted HSET does not wait for unrelated shared file-server work", %{
     ctx: ctx,
     key: key

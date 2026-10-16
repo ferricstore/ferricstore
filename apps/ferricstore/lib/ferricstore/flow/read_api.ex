@@ -1761,7 +1761,7 @@ defmodule Ferricstore.Flow.ReadAPI do
 
   defp live_query_index_value?(path, key, value, now_ms, delete_fun)
        when is_function(delete_fun, 2) do
-    case Ferricstore.Flow.LMDB.decode_query_index_value(value) do
+    case Ferricstore.Flow.LMDB.decode_query_index_row(key, value) do
       {:ok,
        {family_digest, index_digest, discovery_component, id, updated_at_ms, expire_at_ms,
         _state_key}} ->

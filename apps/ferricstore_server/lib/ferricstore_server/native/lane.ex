@@ -88,6 +88,14 @@ defmodule FerricstoreServer.Native.Lane do
   end
 
   @doc false
+  @spec barrier(pid()) :: reference()
+  def barrier(pid) when is_pid(pid) do
+    barrier_ref = make_ref()
+    send(pid, {:native_lane_barrier, self(), barrier_ref})
+    barrier_ref
+  end
+
+  @doc false
   def loop(owner, lane_id, command_state) do
     receive do
       {:native_lane_frame, frame} ->
@@ -100,6 +108,11 @@ defmodule FerricstoreServer.Native.Lane do
         loop(owner, lane_id, command_state)
 
       {:native_lane_command_state, command_state} ->
+        loop(owner, lane_id, command_state)
+
+      {:native_lane_barrier, barrier_owner, barrier_ref}
+      when is_pid(barrier_owner) and is_reference(barrier_ref) ->
+        send(barrier_owner, {:native_lane_barrier, lane_id, barrier_ref})
         loop(owner, lane_id, command_state)
 
       :shutdown ->

@@ -415,14 +415,13 @@ defmodule Ferricstore.Flow.HistoryProjector.Storage do
 
       [
         {:put, history_index_key,
-         Ferricstore.Flow.LMDB.encode_history_index_value(
+         Ferricstore.Flow.LMDB.encode_history_index_row(
+           history_index_key,
            entry.event_id,
            entry.event_ms,
            entry.key,
            entry.expire_at_ms,
-           {:flow_history, file_id},
-           offset,
-           value_size
+           {{:flow_history, file_id}, offset, value_size}
          )}
       ]
       |> maybe_history_expire_put(entry.expire_at_ms, history_index_key)

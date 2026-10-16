@@ -4,6 +4,96 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.0 - 2026-10-16
+
+- Upgrading from 0.11.x: upgrade nodes one at a time. Existing data
+  directories stay in data format 1 and keep working. A new, empty data
+  directory is created in format 2 unless `config :ferricstore, :data_format, 1`
+  is set, and a node in another format cannot join a cluster, so set it on
+  nodes you add to an existing format 1 cluster. To move a cluster to format 2,
+  export it and restore it into a new cluster (see "Moving Data to Format 2" in
+  the deployment guide). Once every node runs 0.12.0, raise the cluster feature
+  level to 1 to turn on feature-gated behavior.
+- Update the WARaft dependency (`ferricstore_waraft`) to 0.1.1. A replica now
+  grants a vote only after its term and vote are durably on disk (fsynced
+  before the rename, and the directory after it), so a crash cannot let it
+  vote twice in one term; a disabled replica keeps retrying to persist its
+  disable reason instead of coming back enabled after a restart; and a leader's
+  commit batch deadline survives heartbeat rescheduling.
+- New data directories use 128-bit Flow key digests (22 characters instead of
+  43), about 1.7 KB less disk and 360 B less keydir memory per flow. They also
+  store each Flow record's sidecar (child groups, attributes, value refs,
+  sequence numbers) as a compact Erlang term instead of JSON: about a third
+  smaller and 3.5 times faster to decode, which takes about 9% off a claim's
+  CPU. Their Raft log entries replace repeated atoms and the default apply
+  context with short dictionary references: Flow log entries are about 40%
+  smaller, which shrinks the in-memory log window, replication traffic and log
+  disk. Existing
+  data directories keep full digests (data format 1) and run unchanged; every
+  member of a cluster must use the same data format.
+- `FerricStore.export/2` and `FerricStore.restore/2` copy a store's keys (every
+  type, with expiry) and its Flow data (runs
+  with values and history, shared values, policies and governance state:
+  circuits, budgets, limits, approvals, effects, ledgers) through a file into an
+  empty store, writing the target's data format; this is how a format 1 cluster
+  moves to format 2.
+- Custom (embedded, non-Raft) instances now apply every write to a Bloom or
+  cuckoo filter, count-min sketch or top-k. Every write after the first on a key
+  reused the first one's mutation token and was answered from its receipt
+  without being applied, and alternating BF.ADD and BF.MADD paused the shard's
+  writes. The default (Raft) instance was not affected.
+- A shard whose Flow LMDB flush failed leaves the degraded state on its own once
+  a retry succeeds and a reconcile finds it healthy. Before, it stayed degraded
+  (and refused Flow queries and history reads) until a doctor repair, restart
+  or FLUSHDB.
+- A corrupt Flow policy row no longer stops a node from starting. Startup
+  recovery logs it, emits `[:ferricstore, :flow, :lmdb_rebuild,
+  :corrupt_policy_skipped]` and drops its LMDB copy; reads and commands for that
+  type still fail with `ERR flow policy is corrupt`.
+- Add cluster feature levels. New replicated behavior stays off until
+  `FerricStore.raise_cluster_feature_level/1` raises the level after a rolling
+  upgrade; the raise requires every member to support the level, levels never
+  go down, and nodes below the active level cannot join. Level 1 is the first
+  level; see the deployment guide. `CLUSTER.FEATURES` and
+  `CLUSTER.FEATURES.RAISE <level>` (native opcodes 0x0311 and 0x0312) do the
+  same from a client.
+- At feature level 1, `flow_policy_set(type, replace: true, ...)` repairs a corrupt
+  Flow policy row (unreadable or stored under another type) on every shard,
+  at a generation above any the type used before.
+- Node-local locks (standalone cross-shard transaction journal, segment and
+  index markers, Flow promotion, segment projection) retry a busy lock within
+  1-8 ms instead of `:global`'s random 0.25-8 s backoff. 48 concurrent journal
+  operations took 1.1-2.3 s against 0.25 s run one by one; they now take about
+  0.26-0.29 s.
+- LFU counters now increment like Redis's `LFULogIncr`: the odds shrink with the
+  counter above its initial value of 5, so the first read of a new key always
+  counts. Previously a new key needed about 51 counted reads (about 5,100 reads
+  at the default 1-in-100 read sampling) to rank above keys never read, so
+  eviction could not tell moderately read keys from unread ones. `OBJECT FREQ`
+  values grow faster as a result.
+- Fix a Flow LMDB writer stall. When a Flow due more than the hibernation hot
+  window ahead was parked and then changed state (completed, cancelled, fired)
+  before the writer flushed, the batch compared the Flow's active-index reverse
+  row against LMDB instead of the value the batch had just written. Every retry
+  failed with `compare_failed`, so that shard's Flow LMDB projection stopped
+  advancing (degraded mirror; schedule lists and Flow queries reported the
+  catalog unavailable) until restart.
+- A failed Flow LMDB clear (FLUSHDB) now names the step that failed (opening
+  the environment, beginning the write transaction, clearing, or committing)
+  instead of only the OS error, such as `Invalid argument (os error 22)`.
+- One Flow whose projection cannot be written because of its own data (an
+  undecodable record, a corrupt or conflicting LMDB row of its own) no longer
+  stops every later Flow LMDB write on its shard. The writer narrows the failed
+  batch down to that Flow, holds its projection and its hot-record cleanup, and
+  writes everything else. The held projection is retried with backoff and
+  released once it writes, for example after the record is repaired or
+  deleted. While anything is held the shard's mirror stays degraded (queries
+  that need a complete mirror still refuse), the replay-safe index does not
+  advance, and LMDB writer flushes return
+  `{:error, {:flow_projection_quarantined, count}}`. Failures that would hit
+  every Flow alike (I/O, a full or busy LMDB, a source not yet readable) still
+  hold the whole batch as before.
+
 ## 0.11.24 - 2026-10-06
 
 - Update Mint to 1.10.2 to address the newly published HTTP response-framing and

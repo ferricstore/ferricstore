@@ -60,6 +60,7 @@ config :ferricstore, :health_probe_port, 4001
 | Option | Type | Default | Applies to | Description |
 |--------|------|---------|------------|-------------|
 | `:data_dir` | `string` | `"data"` | Both | Root directory for Bitcask data files, WARaft segment logs, mmap structures, and hint files. Each shard gets a subdirectory. |
+| `:data_format` | `1` or `2` | `2` | Both | On-disk format for a **new** data directory; an existing directory keeps the format it records in its `data_format` file, and a contradicting setting stops the boot. See [Data Formats](deployment.md#data-formats). |
 | `:shard_count` | `integer` | `0` (auto) | Both | Number of shards. `0` = auto-detect via `System.schedulers_online()`. Each shard is a separate ETS table, Bitcask directory, and WARaft partition. More shards = more write parallelism but more file descriptors. Set at startup. |
 | `:hot_cache_max_value_size` | `integer` | `65_536` | Both | Maximum value size (bytes) stored in ETS hot cache. Values larger than this are stored as `nil` in ETS and read from Bitcask on access. Prevents large binaries from being copied on every ETS lookup. |
 | `:blob_side_channel_threshold_bytes` | `integer` | `262_144` | Both | Values at or above this size are stored in per-shard append blob segments with a small Bitcask reference. `0` disables the blob side channel. |
@@ -907,6 +908,16 @@ invocation controls, and outbound-target restrictions.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FERRICSTORE_SOCKET_ACTIVE_MODE` | `true` | TCP active mode: `true`, `once`, or integer N |
+
+### Flow Storage
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRICSTORE_FLOW_LMDB_STARTUP_COMPACTION` | `true` | At startup, rewrites a shard's Flow LMDB file without its free pages when both thresholds below are met. LMDB never shrinks its file on its own, so this is how space freed by retention is returned to the filesystem. |
+| `FERRICSTORE_FLOW_LMDB_COMPACTION_MIN_FREE_RATIO` | `0.5` | Minimum fraction of the LMDB file that must be free pages before startup compaction runs. |
+| `FERRICSTORE_FLOW_LMDB_COMPACTION_MIN_FILE_BYTES` | `268435456` | Minimum LMDB file size (256 MiB) before startup compaction runs. |
+| `FERRICSTORE_FLOW_QUERY_BUILTIN_INDEXES` | `all` | Built-in composite query indexes to keep: `all`, `none`, or a comma-separated list of ids (`flow_runs_tenant_updated`, `flow_runs_tenant_state_updated`, `flow_runs_tenant_type_updated`, `flow_runs_tenant_type_state_updated`, `flow_runs_tenant_type_state_lease_deadline`). Each index costs LMDB space per Flow; deselected indexes are retired and FQL plans fall back to other access paths. |
+| `FERRICSTORE_FLOW_KEYDIR_SPILL` | `false` | Moves bookkeeping rows of each completed (pruned) Flow out of the in-RAM keydir into LMDB: its type-catalog row (about 0.5 KB), its retention guard (about 0.2 KB) and one retention cleanup row per value it owns, such as its payload or result (about 0.55 KB each). LMDB grows by about 0.2-0.3 KB per moved row. Enable only after every node runs a version that reads spilled rows: an older node, or one that receives a snapshot from a spilling node, would read those rows as missing. Once spilled rows exist, keep running versions that read them even if this is turned off. |
 
 ### Flow Policy Migration
 

@@ -324,4 +324,55 @@ defmodule Ferricstore.Flow.Query.IndexDefinitionTest do
 
     refute IndexDefinition.storage_prefix(first) == IndexDefinition.storage_prefix(second)
   end
+
+  describe "validate/1 of an already-built definition" do
+    setup do
+      {:ok, definition} =
+        IndexDefinition.new(%{
+          id: "validate_cache_#{System.unique_integer([:positive])}",
+          version: 2,
+          workloads: ["WF-LIST-001"],
+          count_prefixes: [1, 2],
+          fields: [{:partition_key, :asc}, {:state, :asc}, {:updated_at_ms, :desc}]
+        })
+
+      {:ok, definition: definition}
+    end
+
+    test "keeps rejecting altered copies after the genuine definition validated", %{
+      definition: definition
+    } do
+      assert :ok = IndexDefinition.validate(definition)
+      assert :ok = IndexDefinition.validate(definition)
+
+      altered = [
+        %{definition | fields: Enum.reverse(definition.fields)},
+        %{definition | fingerprint: <<0::256>>},
+        %{definition | version: definition.version + 1},
+        %{definition | scope_bytes: 300},
+        %{definition | count_prefixes: [1, 2, 3]},
+        %{definition | id: ""}
+      ]
+
+      for copy <- altered do
+        assert {:error, _reason} = IndexDefinition.validate(copy), inspect(copy)
+      end
+
+      assert {:error, :invalid_index_definition} = IndexDefinition.validate(%{definition: 1})
+      assert :ok = IndexDefinition.validate(definition)
+    end
+
+    test "repeat validation of a known definition does not rebuild it", %{
+      definition: definition
+    } do
+      assert :ok = IndexDefinition.validate(definition)
+
+      {:reductions, before} = :erlang.process_info(self(), :reductions)
+      for _ <- 1..1_000, do: :ok = IndexDefinition.validate(definition)
+      {:reductions, after_calls} = :erlang.process_info(self(), :reductions)
+
+      # Rebuilding through new/1 costs ~480 reductions per call.
+      assert (after_calls - before) / 1_000 < 100
+    end
+  end
 end

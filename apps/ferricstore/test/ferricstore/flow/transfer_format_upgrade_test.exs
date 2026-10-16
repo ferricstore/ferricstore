@@ -1,0 +1,189 @@
+defmodule Ferricstore.Flow.TransferFormatUpgradeTest do
+  @moduledoc """
+  Runs exported from a data format 1 node restore into a format 2 store: the
+  same runs, history, values, policies and governance state, with every key and
+  ref in format 2.
+  """
+
+  use ExUnit.Case, async: false
+
+  alias Ferricstore.Flow.{Digest, Transfer}
+  alias Ferricstore.Test.{ClusterHelper, FlowTransferFixture}
+
+  @moduletag :cluster
+  @moduletag timeout: 300_000
+
+  setup do
+    node = ClusterHelper.start_node(shards: 2, app_env: [data_format: 1])
+    # A new cluster: fresh data dirs get the default format, 2.
+    target = ClusterHelper.start_node(shards: 2)
+
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "flow_format_upgrade_#{System.unique_integer([:positive])}.ffx"
+      )
+
+    on_exit(fn ->
+      ClusterHelper.stop_node(node)
+      ClusterHelper.stop_node(target)
+      File.rm(path)
+    end)
+
+    {:ok, node: node, target: target, path: path}
+  end
+
+  test "a format 1 export restores into format 2 with every ref rewritten", ctx do
+    assert :erpc.call(ctx.node, Ferricstore.DataFormat, :current, []) == 1
+    assert :erpc.call(ctx.target, Ferricstore.DataFormat, :current, []) == 2
+
+    source = :erpc.call(ctx.node, FerricStore.Instance, :get, [:default])
+    now_ms = System.system_time(:millisecond)
+    manifest = :erpc.call(ctx.node, FlowTransferFixture, :build!, [source, "xf", now_ms])
+    gov = :erpc.call(ctx.node, FlowTransferFixture, :build_governance!, [source, "xg", now_ms])
+    before = :erpc.call(ctx.node, FlowTransferFixture, :snapshot, [source, manifest])
+    gov_before = await_governance_snapshot(ctx.node, source, gov)
+    keys_before = build_keys!(ctx.node, source)
+    assert {:ok, counts} = :erpc.call(ctx.node, Transfer, :export, [source, ctx.path])
+    # The governance fixture adds a running and a finished run.
+    assert counts.flows == length(manifest.flows) + length(manifest.schedules) + 2
+    assert counts.keys == map_size(keys_before)
+
+    target = :erpc.call(ctx.target, FerricStore.Instance, :get, [:default])
+    assert {:ok, ^counts} = :erpc.call(ctx.target, Transfer, :restore, [target, ctx.path])
+
+    expected = to_format_2(before)
+
+    restored =
+      :erpc.call(ctx.target, FlowTransferFixture, :snapshot, [target, to_format_2(manifest)])
+
+    assert restored == expected
+
+    refute inspect(restored, limit: :infinity, printable_limit: :infinity) =~
+             ~r/\{f:[A-Za-z0-9_-]{43}\}/
+
+    # Limit storage keys hold digests beyond the partition tag; the restored
+    # limits' reservations must still be found by their ids.
+    gov_restored =
+      :erpc.call(ctx.target, FlowTransferFixture, :governance_snapshot, [target, gov])
+
+    assert gov_restored == gov_before |> reset_running_limit(gov) |> to_format_2()
+    assert read_keys(ctx.target, target) == keys_before
+
+    # The restored sidecar takes the target's own writes.
+    assert 1 == dispatch(ctx.target, target, ["BF.ADD", "x:bloom", "c"])
+    assert [1, 1, 1] == dispatch(ctx.target, target, ["BF.MEXISTS", "x:bloom", "a", "b", "c"])
+
+    assert {:ok, %{leases: %{0 => %{in_use: 0}}}} =
+             :erpc.call(ctx.target, FerricStore.Impl, :flow_limit_release, [
+               target,
+               gov.limit,
+               [shard_id: 0, reservation_ids: gov.limit_reservations]
+             ])
+  end
+
+  @key_reads [
+    {"x:string", ["GET", "PEXPIRETIME"]},
+    {"x:hash", ["HGETALL", "PEXPIRETIME"]},
+    {"x:stream", ["XRANGE", "XINFO"]},
+    {"x:bloom", ["BF.INFO", "BF.MEXISTS"]}
+  ]
+
+  # Plain keys carry no format digests; they move as stored, through the target's
+  # replicated writes.
+  defp build_keys!(node, instance) do
+    expire_at = Integer.to_string(System.system_time(:millisecond) + 3_600_000)
+
+    for args <- [
+          ["SET", "x:string", "v", "PXAT", expire_at],
+          ["HSET", "x:hash", "f", "v"],
+          ["PEXPIREAT", "x:hash", expire_at],
+          ["XADD", "x:stream", "1-0", "f", "v"],
+          ["XGROUP", "CREATE", "x:stream", "g", "0"],
+          ["BF.MADD", "x:bloom", "a", "b"]
+        ] do
+      dispatch(node, instance, args)
+    end
+
+    read_keys(node, instance)
+  end
+
+  defp read_keys(node, instance) do
+    Map.new(@key_reads, fn {key, commands} ->
+      {key,
+       Enum.map(commands, fn
+         "XRANGE" -> dispatch(node, instance, ["XRANGE", key, "-", "+"])
+         "XINFO" -> dispatch(node, instance, ["XINFO", "STREAM", key])
+         "BF.MEXISTS" -> dispatch(node, instance, ["BF.MEXISTS", key, "a", "b", "c"])
+         command -> dispatch(node, instance, [command, key])
+       end)}
+    end)
+  end
+
+  defp dispatch(node, instance, [command | args]),
+    do: :erpc.call(node, Ferricstore.Commands.Dispatcher, :dispatch, [command, args, instance])
+
+  # The fixture's finished run gives its running-limit slot back through the
+  # release queue; snapshot once it has.
+  defp await_governance_snapshot(node, instance, gov) do
+    scope = FlowTransferFixture.running_limit_scope(gov.type)
+
+    :ok =
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          {:ok, %{leases: leases}} =
+            :erpc.call(node, FerricStore.Impl, :flow_limit_get, [
+              instance,
+              scope,
+              [now_ms: gov.now_ms + 10]
+            ])
+
+          leases |> Map.values() |> Enum.map(& &1.in_use) |> Enum.sum() == 1
+        end,
+        "the finished run should release its running-limit slot",
+        200,
+        50
+      )
+
+    :erpc.call(node, FlowTransferFixture, :governance_snapshot, [instance, gov])
+  end
+
+  defp reset_running_limit(snapshot, gov) do
+    scope = FlowTransferFixture.running_limit_scope(gov.type)
+
+    reset = fn
+      %{scope: ^scope} = owner -> %{owner | config_version: 0}
+      owner -> owner
+    end
+
+    {:ok, limit_list} = snapshot.limit_list
+
+    %{
+      snapshot
+      | limits: Map.new(snapshot.limits, fn {s, {:ok, owner}} -> {s, {:ok, reset.(owner)}} end),
+        limit_list: {:ok, Enum.map(limit_list, reset)}
+    }
+  end
+
+  # Every format 1 partition tag inside the term, rewritten as format 2 writes it.
+  defp to_format_2(term) when is_binary(term) do
+    Regex.replace(~r/\{f:([A-Za-z0-9_-]{43})\}/, term, fn whole, digest ->
+      case Digest.convert_legacy(digest) do
+        {:ok, short} -> "{f:" <> short <> "}"
+        :error -> whole
+      end
+    end)
+  end
+
+  defp to_format_2(term) when is_list(term), do: Enum.map(term, &to_format_2/1)
+  defp to_format_2(%MapSet{} = set), do: MapSet.new(set, &to_format_2/1)
+  defp to_format_2(%_{} = struct), do: struct
+
+  defp to_format_2(term) when is_map(term),
+    do: Map.new(term, fn {k, v} -> {to_format_2(k), to_format_2(v)} end)
+
+  defp to_format_2(term) when is_tuple(term),
+    do: term |> Tuple.to_list() |> Enum.map(&to_format_2/1) |> List.to_tuple()
+
+  defp to_format_2(term), do: term
+end

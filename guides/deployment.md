@@ -84,13 +84,13 @@ The TCP acceptor uses the following socket options (hardcoded in `ferricstore_se
 docker run -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
-  quay.io/ferricstore/ferricstore:0.11.24
+  quay.io/ferricstore/ferricstore:0.12.0
 ```
 
 The official image is published publicly to Quay.io:
 
 ```bash
-docker pull quay.io/ferricstore/ferricstore:0.11.24
+docker pull quay.io/ferricstore/ferricstore:0.12.0
 ```
 
 Current release images are published as multi-arch images for `linux/amd64`
@@ -110,7 +110,7 @@ docker run --rm -p 6388:6388 -p 8080:8080 \
   -e FERRICSTORE_HTTP_TLS_KEY_FILE=/run/secrets/ferricstore/http-key.pem \
   -v "$PWD/certs:/run/secrets/ferricstore:ro" \
   -v ferricstore_data:/data \
-  quay.io/ferricstore/ferricstore:0.11.24
+  quay.io/ferricstore/ferricstore:0.12.0
 ```
 
 Create a least-privilege ACL identity before sending requests. Certificate
@@ -127,7 +127,7 @@ docker run -p 6388:6388 \
   --security-opt seccomp=unconfined \
   -e FERRICSTORE_PROTECTED_MODE=true \
   -v /mnt/nvme/ferricstore:/data \
-  quay.io/ferricstore/ferricstore:0.11.24
+  quay.io/ferricstore/ferricstore:0.12.0
 ```
 
 #### Why io_uring Matters
@@ -262,7 +262,7 @@ spec:
     spec:
       containers:
         - name: ferricstore
-           image: quay.io/ferricstore/ferricstore:0.11.24
+           image: quay.io/ferricstore/ferricstore:0.12.0
           ports:
             - name: native
               containerPort: 6388
@@ -420,6 +420,124 @@ resources:
 ```
 
 With `static` CPU manager policy on the kubelet, this guarantees exclusive cores.
+
+## Data Formats
+
+Each data directory records its on-disk format in a `data_format` file.
+
+- **Format 2**, the default for new data directories, keys Flow runs with
+  128-bit digests (22 characters). Measured on completed runs, that is about
+  1.7 KB less disk and 360 B less keydir memory per run than format 1. It also
+  stores record sidecars as compact terms and writes Raft log entries in a
+  compact form (Flow entries about 40% smaller), which only releases with
+  format 2 can read.
+- **Format 1** is what data directories created before format 2 use (full
+  256-bit digests, 43 characters). They keep it: upgrading the release changes
+  nothing on disk.
+
+A node runs in its data directory's format, and a node in a different format
+cannot join the cluster. The `:data_format` setting only chooses the format of
+a new data directory.
+
+### Moving Data to Format 2
+
+A format 1 cluster moves to format 2 by copying its data into a new cluster:
+
+1. Upgrade the old cluster to this release. It keeps running in format 1.
+2. Stop the applications that write to it.
+3. Export from any node of the old cluster:
+
+   ```bash
+   bin/ferricstore rpc 'IO.inspect(FerricStore.export("/backup/store.ffx"))'
+   ```
+
+4. Start a new cluster on empty data directories; they are created in format 2.
+5. Restore on any node of the new cluster:
+
+   ```bash
+   bin/ferricstore rpc 'IO.inspect(FerricStore.restore("/backup/store.ffx"))'
+   ```
+
+6. Point the applications at the new cluster.
+
+Both calls return
+`{:ok, %{keys: n, flows: n, shared_values: n, policies: n, governance: n}}`.
+
+What moves: every key (strings, bitmaps, HyperLogLogs, t-digests, hashes,
+lists, sets, sorted sets, streams with their consumer groups, pending entries
+and consumers, Bloom and cuckoo filters, count-min sketches and top-k) with its
+expiry; the invocation definitions; every run, schedules included, with its id, type, state, version,
+attempts, lease, timestamps, values, history and signal idempotency keys; the
+standalone shared values; the type policies; governance state: circuits,
+budgets with their reservations, limits with their leases and reservations,
+approvals, and each run's effects and governance ledger. A worker holding a
+lease from the old cluster can finish its run on the new one, and its effects
+and its running-limit slot carry over with it.
+
+What to know:
+
+- A probabilistic structure travels as one replicated command, so it must fit
+  the new cluster's command size limits.
+- Value refs encode the key layout, so they change. Refs stored inside runs are
+  rewritten; refs an application kept from `flow_get` or `flow_value_put`
+  point at the old cluster.
+- Policy generations start over. A running limit (`limits: %{"running" => ...}`
+  in a policy) picks up the new cluster's policy on its next claim.
+- Limit-cache sessions belong to the old cluster's nodes and are not carried.
+  Credit a node had prefetched but not used returns when its lease expires.
+- The export waits for limit releases that finished runs queued and refuses if
+  they are still pending after about 20 seconds; run it again once they drain.
+- The restore refuses, before writing anything, a file with a limit lease on a
+  logical shard the new cluster does not have (a new cluster with fewer
+  shards).
+- The export refuses Flow data it cannot carry (for example a policy migration
+  in progress) and names sample keys.
+- The restore checks the file's checksum before writing anything and refuses a
+  cluster that already holds keys or Flow data. If a restore stops partway, start the
+  new cluster again on empty data directories and rerun it; the export file is
+  unchanged and can be restored any number of times.
+
+## Upgrading a Cluster
+
+Upgrade nodes one at a time (rolling upgrade). New behavior that older releases
+would apply differently stays off until you raise the cluster's feature level,
+so a mixed-version cluster keeps applying every write the same way on every
+node.
+
+After every node runs the new release, check and raise the level:
+
+```bash
+bin/ferricstore rpc 'IO.inspect(FerricStore.cluster_feature_level())'
+# {:ok, %{supported: 1, active: 0, shards: [0, 0, 0, 0]}}
+
+bin/ferricstore rpc 'IO.inspect(FerricStore.raise_cluster_feature_level(1))'
+# {:ok, %{supported: 1, active: 1, shards: [1, 1, 1, 1]}}
+```
+
+The same from a client (both commands need the `@admin` ACL category, and
+`CLUSTER.FEATURES.RAISE` also `@dangerous`):
+
+```text
+> CLUSTER.FEATURES
+supported: 1
+active: 0
+shard_0: 0
+...
+> CLUSTER.FEATURES.RAISE 1
+supported: 1
+active: 1
+shard_0: 1
+...
+```
+
+- The raise checks every member first. If a node still runs an older release it
+  returns `{:error, {:members_below_feature_level, level, [{node, supported}]}}`;
+  if a node is unreachable it returns `{:error, {:feature_level_probe_failed, ...}}`.
+  Nothing changes in either case.
+- Raising is safe to repeat, including after a partial failure.
+- Levels never go down. Do not downgrade a node below the active level.
+- Once a level is active, a node whose release does not support it cannot join.
+- FLUSHDB keeps the feature level.
 
 ## Performance Checklist
 

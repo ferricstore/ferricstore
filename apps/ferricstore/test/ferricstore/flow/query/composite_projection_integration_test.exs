@@ -439,6 +439,231 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
     assert :not_found = LMDB.get(path, old_entry.key)
   end
 
+  test "writer re-expands after a backfill commit makes its cached counter stale" do
+    data_dir = tmp_data_dir()
+    instance_name = :"composite_counter_retry_writer_#{System.unique_integer([:positive])}"
+    retention_until_ms = 9_000_000_000_000
+    degraded = :atomics.new(1, [])
+
+    definition =
+      IndexDefinition.new!(%{
+        id: "runs_by_partition_updated",
+        version: 1,
+        fields: [{:partition_key, :asc}, {:updated_at_ms, :desc}],
+        count_prefixes: [1]
+      })
+
+    # More records than the reverse prefetch limit, so reverse rows are read
+    # lazily per record while the counter stays cached for the whole batch.
+    ids = Enum.map(1..65, &"run-counter-#{&1}")
+    state_keys = Enum.map(ids, &Ferricstore.Flow.Keys.state_key(&1, "tenant-a"))
+    [_first_key, raced_key | _rest] = state_keys
+    raced_id = Enum.at(ids, 1)
+
+    sources =
+      Enum.map(Enum.zip(ids, state_keys), fn {id, state_key} ->
+        {state_key, retained_terminal_record(id, 2, 200, retention_until_ms), 1}
+      end)
+
+    instance_ctx =
+      install_sources(
+        %{
+          name: instance_name,
+          data_dir: data_dir,
+          shard_count: 1,
+          query_index_provider: Provider,
+          test_pid: self(),
+          definitions: [definition],
+          flow_lmdb_mirror_degraded: degraded
+        },
+        data_dir,
+        sources
+      )
+
+    old_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+
+    on_exit(fn ->
+      Ferricstore.FaultInjection.clear_hook()
+      restore_env(:flow_lmdb_flush_interval_ms, old_interval)
+      File.rm_rf!(data_dir)
+    end)
+
+    File.mkdir_p!(Ferricstore.DataDir.shard_data_path(data_dir, 0))
+
+    assert {:ok, _pid} =
+             Ferricstore.Flow.LMDBWriter.start_link(
+               shard_index: 0,
+               data_dir: data_dir,
+               instance_ctx: instance_ctx
+             )
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(
+               instance_name,
+               0,
+               Enum.map(state_keys, &{:project_flow_query_state_from_source, &1, 2})
+             )
+
+    path =
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> LMDB.path()
+
+    parent = self()
+    writer_counter_reads = :atomics.new(1, signed: false)
+
+    Ferricstore.FaultInjection.put_hook(fn
+      :after_flow_composite_counter_read, %{path: ^path} ->
+        if self() != parent and :atomics.add_get(writer_counter_reads, 1, 1) == 1 do
+          send(parent, {:counter_read_paused, self()})
+
+          receive do
+            :continue_after_counter_read -> :ok
+          end
+        end
+
+        :ok
+
+      _point, _metadata ->
+        :ok
+    end)
+
+    spawn_link(fn ->
+      result = Ferricstore.Flow.LMDBWriter.flush(instance_name, 0, 30_000)
+      send(parent, {:counter_flush_result, result})
+    end)
+
+    assert_receive {:counter_read_paused, writer}, 5_000
+
+    # An online backfill commits an older, non-expiring version of a record the
+    # writer has not reached yet. It takes no flush permit.
+    raced_v1 = encoded_record("running", 1, 100, raced_id)
+
+    assert {:ok, %{projected_records: 1}} =
+             Ferricstore.Flow.Query.CompositeBackfill.project_page(
+               instance_ctx,
+               0,
+               [
+                 %{
+                   state_key: raced_key,
+                   record: Ferricstore.Flow.decode_record(raced_v1),
+                   expire_at_ms: 0
+                 }
+               ],
+               [definition],
+               read_entries_fun: fn _ctx, 0, [^raced_key] -> {:ok, [{raced_v1, 0}]} end
+             )
+
+    send(writer, :continue_after_counter_read)
+
+    assert_receive {:counter_flush_result, flush_result}, 10_000
+    assert flush_result == :ok
+    assert :atomics.get(writer_counter_reads, 1) == 2
+    assert :atomics.get(degraded, 1) == 0
+
+    assert {:ok, [entry]} =
+             CompositeIndex.entries(
+               definition,
+               Ferricstore.Flow.decode_record(raced_v1),
+               raced_key,
+               0
+             )
+
+    assert :not_found = LMDB.get(path, entry.key)
+
+    counter_key = counter_key(definition, entry.key)
+    assert {:ok, counter_blob} = LMDB.get(path, counter_key)
+
+    assert {:ok, %{count: 65, expiring_count: 65, physical_count: 65}} =
+             CompositeCounter.decode_state(counter_blob, counter_prefix(definition, entry.key))
+  end
+
+  test "writer does not retry an undecodable composite counter" do
+    data_dir = tmp_data_dir()
+    instance_name = :"composite_counter_decode_writer_#{System.unique_integer([:positive])}"
+    id = "run-counter-corrupt"
+    state_key = Ferricstore.Flow.Keys.state_key(id, "tenant-a")
+    encoded = retained_terminal_record(id, 1, 100, 9_000_000_000_000)
+
+    definition =
+      IndexDefinition.new!(%{
+        id: "runs_by_partition_updated",
+        version: 1,
+        fields: [{:partition_key, :asc}, {:updated_at_ms, :desc}],
+        count_prefixes: [1]
+      })
+
+    instance_ctx =
+      install_sources(
+        %{
+          name: instance_name,
+          data_dir: data_dir,
+          shard_count: 1,
+          query_index_provider: Provider,
+          test_pid: self(),
+          definitions: [definition]
+        },
+        data_dir,
+        [{state_key, encoded, 1}]
+      )
+
+    old_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+
+    on_exit(fn ->
+      Ferricstore.FaultInjection.clear_hook()
+      restore_env(:flow_lmdb_flush_interval_ms, old_interval)
+      File.rm_rf!(data_dir)
+    end)
+
+    File.mkdir_p!(Ferricstore.DataDir.shard_data_path(data_dir, 0))
+
+    assert {:ok, _pid} =
+             Ferricstore.Flow.LMDBWriter.start_link(
+               shard_index: 0,
+               data_dir: data_dir,
+               instance_ctx: instance_ctx
+             )
+
+    path =
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> LMDB.path()
+
+    assert {:ok, [entry]} =
+             CompositeIndex.entries(
+               definition,
+               Ferricstore.Flow.decode_record(encoded),
+               state_key,
+               0
+             )
+
+    assert :ok = LMDB.write_batch(path, [{:put, counter_key(definition, entry.key), "corrupt"}])
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, 0, [
+               {:project_flow_query_state_from_source, state_key, 1}
+             ])
+
+    parent = self()
+    writer_counter_reads = :atomics.new(1, signed: false)
+
+    Ferricstore.FaultInjection.put_hook(fn
+      :after_flow_composite_counter_read, %{path: ^path} ->
+        if self() != parent, do: :atomics.add(writer_counter_reads, 1, 1)
+        :ok
+
+      _point, _metadata ->
+        :ok
+    end)
+
+    assert {:error, :invalid_composite_counter_read} =
+             Ferricstore.Flow.LMDBWriter.flush(instance_name, 0)
+
+    assert :atomics.get(writer_counter_reads, 1) == 1
+  end
+
   test "deleted source atomically removes every projection derived from the old query row" do
     path = tmp_lmdb_path()
     id = "run-delete-all-projections"
@@ -590,6 +815,23 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
     }
     |> Ferricstore.Flow.encode_record()
   end
+
+  defp retained_terminal_record(id, version, updated_at_ms, retention_until_ms) do
+    "completed"
+    |> encoded_record(version, updated_at_ms, id)
+    |> Ferricstore.Flow.decode_record()
+    |> Map.put(:terminal_retention_until_ms, retention_until_ms)
+    |> Ferricstore.Flow.encode_record()
+  end
+
+  defp counter_prefix(definition, entry_key) do
+    assert {:ok, prefixes} = CompositeCounter.prefixes_for_keys([definition], [entry_key])
+    [{^definition, prefix}] = MapSet.to_list(prefixes)
+    prefix
+  end
+
+  defp counter_key(definition, entry_key),
+    do: CompositeCounter.key(definition, counter_prefix(definition, entry_key))
 
   defp tmp_lmdb_path do
     path =

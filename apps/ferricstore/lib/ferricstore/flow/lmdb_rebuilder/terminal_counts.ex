@@ -106,7 +106,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalCounts do
   defp entry_count_key({terminal_key, value})
        when is_binary(terminal_key) and is_binary(value) do
     with {:ok, {id, updated_at_ms, _expire_at_ms, _state_key, count_key}} <-
-           LMDB.decode_terminal_index_entry(value),
+           LMDB.decode_terminal_index_entry_row(terminal_key, value),
          true <- LMDB.terminal_index_entry_key?(terminal_key, id, updated_at_ms),
          true <- owns_count_key?(terminal_key, count_key) do
       {:ok, count_key}

@@ -92,6 +92,10 @@ defmodule Ferricstore.FlowPolicyGenerationTest do
 
     value = RetryPolicy.encode_flow_policy(foreign_policy, 1)
 
+    # Startup recovery refuses a corrupt policy row, so a later restart of the
+    # default instance would fail while this row exists.
+    on_exit(fn -> :ok = Ferricstore.Raft.Backend.write(0, {:delete, key}) end)
+
     assert :ok =
              Ferricstore.Raft.Backend.write(
                0,
@@ -99,6 +103,43 @@ defmodule Ferricstore.FlowPolicyGenerationTest do
              )
 
     assert {:error, "ERR flow policy is corrupt"} = FerricStore.flow_policy_get(type)
+  end
+
+  test "a corrupt policy row does not stop a restart and stays fail-closed for its type" do
+    isolated = ShardHelpers.setup_isolated_data_dir()
+    on_exit(fn -> ShardHelpers.teardown_isolated_data_dir(isolated) end)
+
+    suffix = System.unique_integer([:positive, :monotonic])
+    healthy_type = "restart-healthy-#{suffix}"
+    corrupt_type = "restart-corrupt-#{suffix}"
+
+    assert {:ok, %{generation: 1}} =
+             FerricStore.flow_policy_set(healthy_type, max_active_ms: 1_000)
+
+    {:ok, foreign_policy} =
+      RetryPolicy.normalize_flow_policy("foreign-policy-type", max_active_ms: 9_000)
+
+    corrupt_value = RetryPolicy.encode_flow_policy(foreign_policy, 1)
+
+    assert :ok =
+             Ferricstore.Raft.Backend.write(
+               0,
+               {:put, Keys.policy_key(corrupt_type), corrupt_value, 0}
+             )
+
+    assert :ok = ShardHelpers.restart_current_data_dir(isolated)
+
+    assert {:error, "ERR flow policy is corrupt"} = FerricStore.flow_policy_get(corrupt_type)
+
+    assert {:ok, %{generation: 1, max_active_ms: 1_000}} =
+             FerricStore.flow_policy_get(healthy_type)
+
+    assert :ok =
+             FerricStore.flow_create("restart-healthy-flow-#{suffix}",
+               type: healthy_type,
+               state: "queued",
+               partition_key: "restart-healthy-tenant"
+             )
   end
 
   test "missing existing-flow targets are stamped with an absence guard" do

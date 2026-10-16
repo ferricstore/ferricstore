@@ -552,6 +552,27 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   def expand_op(_state, {:project_flow_query_state, _key, _value, _expire_at_ms}, _acc),
     do: {:error, :inline_flow_projection_unsupported}
 
+  # Copies a pruned Flow's keydir row into LMDB only if apply has not changed or
+  # deleted it since the spill was requested (see Ferricstore.Flow.KeydirSpill).
+  def expand_op(
+        %{path: path},
+        {:keydir_spill_from_source, ets,
+         {key, value, expire_at_ms, _lfu, _file_id, _offset, _size} = row},
+        acc
+      )
+      when is_binary(key) and is_binary(value) do
+    if Ferricstore.Store.Keydir.unchanged_source?(ets, row) do
+      expand_path_op(
+        path,
+        {:put, Ferricstore.Flow.KeydirSpill.key(key),
+         Ferricstore.Flow.LMDB.encode_value(value, expire_at_ms)},
+        acc
+      )
+    else
+      {:ok, acc}
+    end
+  end
+
   def expand_op(%{path: path}, {put_mode, key, value} = op, acc)
       when put_mode in [:put, :put_new] and is_binary(key) and is_binary(value) do
     if Keys.state_key?(key),
@@ -677,7 +698,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
 
         acc =
           acc
-          |> put_in([:active_reverse_values, state_key], reverse_value)
+          |> put_active_reverse_value(state_key, reverse_value)
           |> prepend_ops(
             stale_fixed_query_ops ++
               active_ops ++
@@ -863,7 +884,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       {:ok, terminal_key} when is_binary(terminal_key) ->
         case get_fun.(terminal_key) do
           {:ok, terminal_value} when is_binary(terminal_value) ->
-            case Ferricstore.Flow.LMDB.terminal_index_count_key(terminal_value) do
+            case Ferricstore.Flow.LMDB.terminal_index_row_count_key(terminal_key, terminal_value) do
               {:ok, count_key} ->
                 acc = put_terminal_reverse_state(acc, state_key, terminal_key)
                 expand_path_op(path, {:terminal_delete, terminal_key, state_key, count_key}, acc)
@@ -902,8 +923,14 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     end
   end
 
+  # Active reverse rows written earlier in the batch, keyed by reverse row key: the
+  # writer's own projections and raw writes such as hibernation parking. LMDB does
+  # not hold them until the batch commits, so cleanup must compare against these.
   def maybe_expand_stale_active_delete(path, state_key, acc) do
-    case Map.fetch(acc.active_reverse_values, state_key) do
+    case Map.fetch(
+           acc.active_reverse_values,
+           Ferricstore.Flow.LMDB.active_by_state_key_key(state_key)
+         ) do
       {:ok, nil} ->
         {:ok, acc}
 
@@ -915,7 +942,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
                ) do
           acc =
             acc
-            |> put_in([:active_reverse_values, state_key], nil)
+            |> put_active_reverse_value(state_key, nil)
             |> prepend_ops(ops)
 
           {:ok, acc}
@@ -929,12 +956,23 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
                Ferricstore.Flow.LMDB.active_index_delete_ops_result(path, state_key) do
           acc =
             acc
-            |> put_in([:active_reverse_values, state_key], nil)
+            |> put_active_reverse_value(state_key, nil)
             |> prepend_ops(ops)
 
           {:ok, acc}
         end
     end
+  end
+
+  defp put_active_reverse_value(acc, state_key, reverse_value) do
+    reverse_key = Ferricstore.Flow.LMDB.active_by_state_key_key(state_key)
+    put_in(acc, [:active_reverse_values, reverse_key], reverse_value)
+  end
+
+  defp track_raw_active_reverse_write(acc, key, value) do
+    if String.starts_with?(key, Ferricstore.Flow.LMDB.active_by_state_global_prefix()),
+      do: put_in(acc, [:active_reverse_values, key], value),
+      else: acc
   end
 
   def read_source_value(state, key) do
@@ -1601,7 +1639,8 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
 
     value =
-      Ferricstore.Flow.LMDB.encode_terminal_index_value(
+      Ferricstore.Flow.LMDB.encode_terminal_index_row(
+        terminal_key,
         id,
         updated_at_ms,
         expire_at_ms,
@@ -1699,8 +1738,13 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     end
   end
 
-  def expand_path_op(_path, {put_mode, key, value} = op, acc)
-      when put_mode in [:put, :put_new] and is_binary(key) and is_binary(value) do
+  def expand_path_op(_path, {:put, key, value} = op, acc)
+      when is_binary(key) and is_binary(value) do
+    {:ok, acc |> track_raw_active_reverse_write(key, value) |> prepend_ops([op])}
+  end
+
+  def expand_path_op(_path, {:put_new, key, value} = op, acc)
+      when is_binary(key) and is_binary(value) do
     {:ok, prepend_ops(acc, [op])}
   end
 
@@ -1819,6 +1863,9 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       {:ok, acc}
     end
   end
+
+  def expand_path_op(_path, {:delete, key} = op, acc) when is_binary(key),
+    do: {:ok, acc |> track_raw_active_reverse_write(key, nil) |> prepend_ops([op])}
 
   def expand_path_op(_path, op, acc), do: {:ok, prepend_ops(acc, [op])}
 
@@ -2068,14 +2115,15 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
 
   defp validate_terminal_index_value(terminal_key, value, state_key, count_key) do
     with {:ok, {id, updated_at_ms, _expire_at_ms, ^state_key}} <-
-           Ferricstore.Flow.LMDB.decode_terminal_index_value(value),
+           Ferricstore.Flow.LMDB.decode_terminal_index_row(terminal_key, value),
          true <-
            Ferricstore.Flow.LMDB.terminal_index_entry_key?(
              terminal_key,
              id,
              updated_at_ms
            ),
-         {:ok, ^count_key} <- Ferricstore.Flow.LMDB.terminal_index_count_key(value) do
+         {:ok, ^count_key} <-
+           Ferricstore.Flow.LMDB.terminal_index_row_count_key(terminal_key, value) do
       :ok
     else
       _invalid -> {:error, :invalid_terminal_index_value}
@@ -2510,23 +2558,24 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     case existing_history_index_location(path, history_index_key) do
       {:ok, {{:flow_history, _file_id} = file_ref, offset, value_size}} ->
         {:ok,
-         Ferricstore.Flow.LMDB.encode_history_index_value(
+         Ferricstore.Flow.LMDB.encode_history_index_row(
+           history_index_key,
            event_id,
            event_ms,
            compound_key,
            expire_at_ms,
-           file_ref,
-           offset,
-           value_size
+           {file_ref, offset, value_size}
          )}
 
       {:ok, nil} ->
         {:ok,
-         Ferricstore.Flow.LMDB.encode_history_index_value(
+         Ferricstore.Flow.LMDB.encode_history_index_row(
+           history_index_key,
            event_id,
            event_ms,
            compound_key,
-           expire_at_ms
+           expire_at_ms,
+           nil
          )}
 
       {:error, _reason} = error ->
@@ -2535,20 +2584,24 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   def existing_history_index_location(path, history_index_key) do
-    path
-    |> Ferricstore.Flow.LMDB.get(history_index_key)
-    |> existing_history_index_location_result()
+    existing_history_index_location_result(
+      history_index_key,
+      Ferricstore.Flow.LMDB.get(path, history_index_key)
+    )
   end
 
   @doc false
   def __existing_history_index_location_result_for_test__(result),
-    do: existing_history_index_location_result(result)
+    do: existing_history_index_location_result(nil, result)
 
-  defp existing_history_index_location_result(:not_found), do: {:ok, nil}
-  defp existing_history_index_location_result({:error, _reason} = error), do: error
+  defp existing_history_index_location_result(_history_index_key, :not_found), do: {:ok, nil}
 
-  defp existing_history_index_location_result({:ok, value}) when is_binary(value) do
-    case Ferricstore.Flow.LMDB.decode_history_index_location(value) do
+  defp existing_history_index_location_result(_history_index_key, {:error, _reason} = error),
+    do: error
+
+  defp existing_history_index_location_result(history_index_key, {:ok, value})
+       when is_binary(value) do
+    case Ferricstore.Flow.LMDB.decode_history_index_location_row(history_index_key, value) do
       {:ok,
        {_event_id, _event_ms, _expire_at_ms, _compound_key, {:flow_history, _file_id} = file_ref,
         offset, value_size}}
@@ -2563,7 +2616,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     end
   end
 
-  defp existing_history_index_location_result(invalid),
+  defp existing_history_index_location_result(_history_index_key, invalid),
     do: {:error, {:invalid_history_index_read, invalid}}
 
   def maybe_history_expire_put(ops, expire_at_ms, history_index_key) do
@@ -2594,7 +2647,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   def maybe_put_expire_key(ops, terminal_key, value, state_key, count_key) do
-    case Ferricstore.Flow.LMDB.decode_terminal_index_value(value) do
+    case Ferricstore.Flow.LMDB.decode_terminal_index_row(terminal_key, value) do
       {:ok, {_id, _updated_at_ms, expire_at_ms, _state_key}} when expire_at_ms > 0 ->
         expire_key = Ferricstore.Flow.LMDB.terminal_expire_key(expire_at_ms, terminal_key)
 
@@ -2611,14 +2664,14 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   def maybe_delete_old_expire_key(ops, _terminal_key, nil, _state_key, _count_key), do: ops
 
   def maybe_delete_old_expire_key(ops, terminal_key, old_value, state_key, count_key) do
-    case Ferricstore.Flow.LMDB.decode_terminal_index_value(old_value) do
+    case Ferricstore.Flow.LMDB.decode_terminal_index_row(terminal_key, old_value) do
       {:ok, {_id, _updated_at_ms, expire_at_ms, _state_key}} when expire_at_ms > 0 ->
         expire_key = Ferricstore.Flow.LMDB.terminal_expire_key(expire_at_ms, terminal_key)
 
-        expire_value =
-          Ferricstore.Flow.LMDB.encode_terminal_expire_value(terminal_key, state_key, count_key)
+        expire_values =
+          Ferricstore.Flow.LMDB.terminal_expire_values(terminal_key, state_key, count_key)
 
-        [{:compare, expire_key, expire_value}, {:delete, expire_key} | ops]
+        [{:compare_any, expire_key, expire_values}, {:delete, expire_key} | ops]
 
       _ ->
         ops

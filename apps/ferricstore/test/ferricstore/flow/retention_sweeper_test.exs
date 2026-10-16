@@ -21,7 +21,7 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
         name: name,
         initial_delay_ms: 60_000,
         interval_ms: 60_000,
-        catchup_delay_ms: 1,
+        catchup_delay_ms: 60_000,
         limit: 5,
         pressure_detector_fun: fn -> false end,
         cleanup_fun: fn opts ->

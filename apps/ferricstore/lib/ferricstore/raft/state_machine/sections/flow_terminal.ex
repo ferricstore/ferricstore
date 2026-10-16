@@ -1152,7 +1152,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
       defp flow_retention_apply_candidate_record(_state, _candidate), do: nil
 
       defp flow_retention_current_guard(state, guard_key) do
-        case sm_store_batch_get(state, [guard_key], &sm_file_path/2) do
+        case keydir_spill_batch_get(state, [guard_key]) do
           [guard] when is_binary(guard) -> guard
           _missing -> nil
         end

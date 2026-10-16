@@ -5,6 +5,7 @@ Code.require_file(
 
 Code.require_file("state_machine_test/sections/flow_blob_side_channel_apply.exs", __DIR__)
 Code.require_file("state_machine_test/sections/flow_command_time.exs", __DIR__)
+Code.require_file("state_machine_test/sections/flow_restore.exs", __DIR__)
 
 Code.require_file(
   "state_machine_test/sections/flow_shared_value_ref_persistence.exs",
@@ -97,7 +98,7 @@ defmodule Ferricstore.Raft.StateMachineTest.CurrentStateMachine do
   defdelegate apply_standalone_command(command, meta, state), to: StateMachine
   defdelegate apply_standalone_cross_shard(execute_fn, state), to: StateMachine
 
-  defdelegate __recovery_empty_cold_due_cursor_for_test__(state, path, start_ms, horizon_ms),
+  defdelegate __empty_cold_due_cursor_for_test__(state, path, start_ms, horizon_ms),
     to: StateMachine
 
   defdelegate __apply_pending_locations_for_test__(state, file_id, batch, locations),
@@ -349,7 +350,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
     assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put, "unrelated", "value"}])
 
     assert {:ok, cursor, transaction_id} =
-             StateMachine.__recovery_empty_cold_due_cursor_for_test__(
+             StateMachine.__empty_cold_due_cursor_for_test__(
                recovery_state,
                path,
                start_ms,
@@ -365,7 +366,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
              ])
 
     assert :not_proven =
-             StateMachine.__recovery_empty_cold_due_cursor_for_test__(
+             StateMachine.__empty_cold_due_cursor_for_test__(
                recovery_state,
                path,
                start_ms,
@@ -381,7 +382,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
     assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put, malformed_key, "malformed"}])
 
     assert :not_proven =
-             StateMachine.__recovery_empty_cold_due_cursor_for_test__(
+             StateMachine.__empty_cold_due_cursor_for_test__(
                recovery_state,
                path,
                start_ms,
@@ -406,7 +407,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put, due_key, "park-key"}])
 
       assert :not_proven =
-               StateMachine.__recovery_empty_cold_due_cursor_for_test__(
+               StateMachine.__empty_cold_due_cursor_for_test__(
                  recovery_state,
                  path,
                  start_ms,
@@ -431,15 +432,17 @@ defmodule Ferricstore.Raft.StateMachineTest do
     assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put, outside_due, "park-key"}])
 
     assert {:ok, _cursor, _txn} =
-             StateMachine.__recovery_empty_cold_due_cursor_for_test__(
+             StateMachine.__empty_cold_due_cursor_for_test__(
                recovery_state,
                path,
                start_ms,
                horizon_ms
              )
 
-    assert :not_proven =
-             StateMachine.__recovery_empty_cold_due_cursor_for_test__(
+    # Live applies use the same proof: it reads the same committed LMDB rows the
+    # bucket walk reads and only accepts an unchanged, empty window.
+    assert {:ok, _cursor, _txn} =
+             StateMachine.__empty_cold_due_cursor_for_test__(
                state,
                path,
                start_ms,
@@ -470,6 +473,14 @@ defmodule Ferricstore.Raft.StateMachineTest do
     command = {:flow_claim_due, nil, attrs}
     meta = %{index: 43, system_time: 240_000}
 
+    previous_hook = Application.get_env(:ferricstore, :flow_recovery_cold_due_proof_hook)
+
+    on_exit(fn ->
+      if previous_hook == nil,
+        do: Application.delete_env(:ferricstore, :flow_recovery_cold_due_proof_hook),
+        else: Application.put_env(:ferricstore, :flow_recovery_cold_due_proof_hook, previous_hook)
+    end)
+
     for cursor <- [
           nil,
           %{bucket_ms: 180_000, after_key: nil},
@@ -480,6 +491,16 @@ defmodule Ferricstore.Raft.StateMachineTest do
         ] do
       initial = %{state | flow_hibernation_promotion_cursor: cursor}
 
+      # The authoritative bucket walk: a commit during the proof makes it stale.
+      Application.put_env(:ferricstore, :flow_recovery_cold_due_proof_hook, fn lmdb_path ->
+        :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:put, "changed", "value"}])
+      end)
+
+      {walked, {:applied_at, 43, walked_result}, _effects} =
+        StateMachine.apply(meta, command, initial)
+
+      Application.delete_env(:ferricstore, :flow_recovery_cold_due_proof_hook)
+
       {normal, {:applied_at, 43, normal_result}, _normal_effects} =
         StateMachine.apply(meta, command, initial)
 
@@ -488,13 +509,57 @@ defmodule Ferricstore.Raft.StateMachineTest do
       {replayed, {:applied_at, 43, replay_result}, _replay_effects} =
         StateMachine.apply(meta, command, recovery_state)
 
-      assert normal_result == {:ok, []}
-      assert replay_result == normal_result
-      assert is_map(normal.flow_hibernation_promotion_cursor)
+      assert walked_result == {:ok, []}
+      assert normal_result == walked_result
+      assert replay_result == walked_result
+      assert is_map(walked.flow_hibernation_promotion_cursor)
+      assert normal.flow_hibernation_promotion_cursor == walked.flow_hibernation_promotion_cursor
 
       assert replayed.flow_hibernation_promotion_cursor ==
-               normal.flow_hibernation_promotion_cursor
+               walked.flow_hibernation_promotion_cursor
     end
+  end
+
+  @tag :replay_empty_cold_due
+  test "a live claim proves an empty cold-due window instead of walking its buckets", %{
+    state: state,
+    dir: dir
+  } do
+    path = Ferricstore.Flow.LMDB.path(dir)
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put, "unrelated", "value"}])
+    previous_hook = Application.get_env(:ferricstore, :flow_recovery_cold_due_proof_hook)
+    parent = self()
+
+    Application.put_env(:ferricstore, :flow_recovery_cold_due_proof_hook, fn _lmdb_path ->
+      send(parent, :empty_window_proved)
+      :ok
+    end)
+
+    on_exit(fn ->
+      if previous_hook == nil,
+        do: Application.delete_env(:ferricstore, :flow_recovery_cold_due_proof_hook),
+        else: Application.put_env(:ferricstore, :flow_recovery_cold_due_proof_hook, previous_hook)
+    end)
+
+    attrs = %{
+      type: "job",
+      state: "queued",
+      worker: "live-proof-worker",
+      lease_ms: 30_000,
+      limit: 1,
+      priority: 0,
+      partition_key: "tenant",
+      now_ms: 240_000,
+      cold_due_mode: :allow
+    }
+
+    refute Map.has_key?(state, :waraft_recovery_before_index)
+
+    {applied, {:applied_at, 45, {:ok, []}}, _effects} =
+      StateMachine.apply(%{index: 45, system_time: 240_000}, {:flow_claim_due, nil, attrs}, state)
+
+    assert_received :empty_window_proved
+    assert is_map(applied.flow_hibernation_promotion_cursor)
   end
 
   @tag :replay_empty_cold_due
@@ -1143,6 +1208,43 @@ defmodule Ferricstore.Raft.StateMachineTest do
              StateMachine.apply(%{}, command, state)
 
     assert [] = :ets.lookup(ets, "local-key")
+  end
+
+  test "retention planning reports Flow storage it cannot read instead of planning nothing", %{
+    state: state
+  } do
+    unreadable_lmdb =
+      Path.join(System.tmp_dir!(), "sm_unreadable_lmdb_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(unreadable_lmdb)
+    File.write!(Path.join(unreadable_lmdb, "data.mdb"), :binary.copy(<<0xAB>>, 65_536))
+    on_exit(fn -> File.rm_rf!(unreadable_lmdb) end)
+
+    event = [:ferricstore, :flow, :retention, :state_read_failed]
+    telemetry_ref = :telemetry_test.attach_event_handlers(self(), [event])
+    on_exit(fn -> :telemetry.detach(telemetry_ref) end)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        send(
+          self(),
+          {:plan,
+           Ferricstore.Raft.StateMachine.flow_retention_plan(
+             %{state | flow_lmdb_path: unreadable_lmdb},
+             %{
+               now_ms: System.system_time(:millisecond),
+               limit: 10
+             }
+           )}
+        )
+      end)
+
+    assert_received {:plan, {:ok, %{active_candidates: [], state_read_failed: reason}}}
+    assert reason != nil
+
+    shard_index = state.shard_index
+    assert_received {^event, ^telemetry_ref, %{count: 1}, %{shard_index: ^shard_index}}
+    assert log =~ "Flow retention planning on shard #{shard_index} could not read"
   end
 
   @tag :flow_replay_visibility
@@ -1909,6 +2011,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
   use Ferricstore.Raft.StateMachineTest.Sections.FlowBlobSideChannelApply
 
   use Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime
+
+  use Ferricstore.Raft.StateMachineTest.Sections.FlowRestore
 
   use Ferricstore.Raft.StateMachineTest.Sections.FlowSharedValueRefPersistence
 

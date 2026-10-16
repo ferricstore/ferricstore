@@ -1384,7 +1384,7 @@ append(View, Entries, _Mode, _Priority) ->
     case append_decode(Last + 1, Entries) of
         {ok, Records} ->
             Dir = log_dir(Log),
-            case write_records(Dir, Records) of
+            case run_in_segment_writer(Dir, fun() -> write_records(Dir, Records) end) of
                 ok ->
                     true = ets:insert(Name, Records),
                     update_latest_config_from_records(Dir, Records),
@@ -1476,7 +1476,11 @@ close(Log, _State) ->
     ok.
 
 close_process_writers(#raft_log{} = Log) ->
-    close_writers_for_dir_owner(log_dir(Log), self()).
+    Dir = log_dir(Log),
+    case await_segment_writer_idle(Dir) of
+        ok -> close_writers_for_dir_owner(Dir, self());
+        {error, _Reason} = Error -> Error
+    end.
 
 reset(#raft_log{name = Name} = Log, #raft_log_pos{index = Index, term = Term}, State) ->
     Record = {Index, {Term, undefined}},

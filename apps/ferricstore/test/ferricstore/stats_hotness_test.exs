@@ -79,6 +79,18 @@ defmodule Ferricstore.Stats.HotnessTest do
       {_, hot, _, _} = root_entry
       assert hot >= 1
     end
+
+    test "detaches a long packet when storing a newly tracked prefix" do
+      prefix = :binary.copy("p", 80)
+      packet = prefix <> ":key" <> :binary.copy("x", 8 * 1024 * 1024)
+      key = binary_part(packet, 0, byte_size(prefix) + 4)
+
+      Stats.record_hot_read(key)
+
+      assert [{stored_prefix, 1, 0}] = :ets.lookup(:ferricstore_hotness, prefix)
+      assert byte_size(stored_prefix) == byte_size(prefix)
+      assert :binary.referenced_byte_size(stored_prefix) == byte_size(prefix)
+    end
   end
 
   describe "record_cold_read/1" do
@@ -181,6 +193,140 @@ defmodule Ferricstore.Stats.HotnessTest do
       assert Enum.any?(Stats.hotness_top(10), fn {prefix, _hot, _cold, _pct} ->
                prefix == "after-reset"
              end)
+    end
+
+    test "reset clears saturation and reopens named prefix slots" do
+      for index <- 1..999 do
+        Stats.record_hot_read("saturated-#{index}:key")
+      end
+
+      Stats.record_hot_read("overflow:key")
+      assert Stats.hotness_for_prefix("_other") == {1, 0}
+
+      Stats.reset_hotness()
+      Stats.record_hot_read("fresh:key")
+
+      assert Stats.hotness_for_prefix("fresh") == {1, 0}
+      assert Stats.hotness_for_prefix("_other") == nil
+    end
+
+    test "counts reads in the overflow bucket while the coordinator is unreachable" do
+      server = Process.whereis(Stats)
+      Process.unregister(Stats)
+
+      try do
+        Stats.record_hot_read("unreachable:key")
+        Stats.record_cold_read("unreachable:key")
+      after
+        Process.register(server, Stats)
+      end
+
+      assert Stats.hotness_for_prefix("_other") == {1, 1}
+    end
+
+    test "records known overflow prefixes while the coordinator is suspended" do
+      for index <- 1..999 do
+        Stats.record_hot_read("saturated-#{index}:key")
+      end
+
+      Stats.record_hot_read("overflow:key")
+      server = Process.whereis(Stats)
+      :ok = :sys.suspend(server)
+
+      task =
+        Task.async(fn ->
+          for _ <- 1..100, do: Stats.record_hot_read("overflow:another-key")
+          :done
+        end)
+
+      result =
+        try do
+          Task.yield(task, 100)
+        after
+          :ok = :sys.resume(server)
+        end
+
+      if result == nil, do: Task.await(task)
+      assert result == {:ok, :done}
+
+      assert Stats.hotness_for_prefix("_other") == {101, 0}
+    end
+
+    test "does not recreate named rows when reset races post-resolution updates" do
+      server = Process.whereis(Stats)
+      race_prefix = "reset-race-#{System.unique_integer([:positive])}"
+      post_reset_prefix = "post-reset-#{System.unique_integer([:positive])}"
+      workers_key = {__MODULE__, :stats_hotness_workers}
+      reset_task_key = {__MODULE__, :stats_hotness_reset_task}
+      Process.put(workers_key, [])
+      Process.put(reset_task_key, nil)
+
+      :ok = :sys.suspend(server)
+
+      try do
+        workers =
+          for index <- 1..100 do
+            Task.async(fn -> Stats.record_hot_read("#{race_prefix}-#{index}:key") end)
+          end
+
+        Process.put(workers_key, workers)
+
+        # Let every worker queue its resolve call while the coordinator is
+        # suspended, then queue reset behind those calls. Some replies will be
+        # applied after reset, which is the update-counter resurrection window.
+        assert Ferricstore.Test.Eventually.eventually(
+                 fn ->
+                   {:message_queue_len, queue_length} = Process.info(server, :message_queue_len)
+                   queue_length >= Kernel.length(workers)
+                 end,
+                 timeout: 1_000,
+                 interval: 1
+               )
+
+        Enum.each(workers, fn %Task{pid: pid} -> true = :erlang.suspend_process(pid) end)
+        reset_task = Task.async(fn -> Stats.reset_hotness() end)
+        Process.put(reset_task_key, reset_task.pid)
+        :ok = :sys.resume(server)
+
+        assert Task.await(reset_task) == :ok
+        Enum.each(workers, fn %Task{pid: pid} -> true = :erlang.resume_process(pid) end)
+        Task.await_many(workers)
+      after
+        if Process.alive?(server) do
+          case Process.info(server, :status) do
+            {:status, :suspended} -> :sys.resume(server)
+            _ -> :ok
+          end
+        end
+
+        cleanup_workers = Process.get(workers_key, [])
+
+        Enum.each(cleanup_workers, fn %Task{pid: pid} ->
+          if Process.alive?(pid) do
+            case Process.info(pid, :status) do
+              {:status, :suspended} -> :erlang.resume_process(pid)
+              _ -> :ok
+            end
+          end
+        end)
+
+        case Process.get(reset_task_key) do
+          pid when is_pid(pid) ->
+            if Process.alive?(pid), do: Process.exit(pid, :kill)
+
+          _ ->
+            :ok
+        end
+
+        Process.delete(workers_key)
+        Process.delete(reset_task_key)
+      end
+
+      for index <- 1..999 do
+        Stats.record_hot_read("#{post_reset_prefix}-#{index}:key")
+      end
+
+      assert :ets.info(:ferricstore_hotness, :size) <= 1_000
     end
 
     test "returns empty list when no reads recorded" do

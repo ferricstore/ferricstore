@@ -42,6 +42,7 @@ defmodule FerricStore.Instance.Supervisor do
 
     # Ensure data directory layout exists
     Ferricstore.DataDir.ensure_layout!(ctx.data_dir, ctx.shard_count)
+    :ok = Ferricstore.DataFormat.ensure_node_format!(ctx.data_dir)
 
     cleanup_children =
       if name == :default do

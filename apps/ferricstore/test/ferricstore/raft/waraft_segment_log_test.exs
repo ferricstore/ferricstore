@@ -134,6 +134,13 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
     end
   end
 
+  defp segment_writer_owner(registry) do
+    Enum.find_value(:ets.tab2list(registry), fn
+      {{:segment_writer_proc, _dir}, pid} when is_pid(pid) -> pid
+      _entry -> nil
+    end)
+  end
+
   defp writer_entries_for_owner(registry, owner) do
     registry
     |> :ets.tab2list()
@@ -951,4 +958,284 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
   end
 
   use Ferricstore.Raft.WARaftSegmentLogTest.Sections.DefaultSegmentSizeDoesNotRollOverDuringNormalHotBatches
+
+  test "disk-backed get reads an indexed record directly instead of scanning its segment" do
+    with_segment_log_memory_env(
+      max_bytes: 1_000,
+      max_entries: 1,
+      min_entries: 1,
+      records_per_segment: 64,
+      fun: fn _root, log, _log_name ->
+        provider = :ferricstore_waraft_spike_segment_log
+        assert :ok = provider.init(log)
+        assert {:ok, _state} = provider.open(log)
+
+        for index <- 1..60 do
+          assert :ok =
+                   provider.append(
+                     {:log_view, log, max(index - 1, 0), index - 1, :undefined},
+                     [{1, {:cmd, "entry-#{index}"}}],
+                     :strict,
+                     :low
+                   )
+        end
+
+        parent = self()
+
+        reader =
+          spawn(fn ->
+            receive do: (:go -> :ok)
+            send(parent, {:got, provider.get(log, 50)})
+          end)
+
+        :erlang.trace_pattern({provider, :read_disk_record_fd, 7}, true, [:local])
+        :erlang.trace(reader, true, [:call])
+
+        on_exit(fn ->
+          :erlang.trace_pattern({provider, :read_disk_record_fd, 7}, false, [:local])
+        end)
+
+        send(reader, :go)
+        assert_receive {:got, {:ok, {1, {:cmd, "entry-50"}}}}, 5_000
+
+        scans =
+          Stream.repeatedly(fn ->
+            receive do
+              {:trace, ^reader, :call, {^provider, :read_disk_record_fd, _args}} -> :scan
+            after
+              100 -> :done
+            end
+          end)
+          |> Enum.take_while(&(&1 == :scan))
+          |> length()
+
+        assert scans == 0, "get scanned the segment from offset 0 #{scans} time(s)"
+      end
+    )
+  end
+
+  test "appends from short-lived processes reuse one open segment file" do
+    with_segment_log_memory_env(
+      max_bytes: 1_000_000,
+      max_entries: 100_000,
+      min_entries: 1,
+      records_per_segment: 1_000_000,
+      fun: fn _root, log, _log_name ->
+        provider = :ferricstore_waraft_spike_segment_log
+        assert :ok = provider.init(log)
+        assert {:ok, _state} = provider.open(log)
+
+        append = fn index ->
+          provider.append(
+            {:log_view, log, max(index - 1, 0), index - 1, :undefined},
+            [{1, {:cmd, "entry-#{index}"}}],
+            :strict,
+            :low
+          )
+        end
+
+        # wa_raft runs each async append in a freshly spawned process.
+        assert :ok = Task.await(Task.async(fn -> append.(1) end))
+
+        :erlang.trace_pattern({:file, :open, 2}, true, [:global])
+        :erlang.trace(:all, true, [:call])
+
+        on_exit(fn ->
+          :erlang.trace(:all, false, [:call])
+          :erlang.trace_pattern({:file, :open, 2}, false, [:global])
+        end)
+
+        for index <- 2..31 do
+          assert :ok = Task.await(Task.async(fn -> append.(index) end))
+        end
+
+        :erlang.trace(:all, false, [:call])
+
+        segment_opens =
+          Stream.repeatedly(fn ->
+            receive do
+              {:trace, _pid, :call, {:file, :open, [path, _modes]}} -> {:open, to_string(path)}
+            after
+              100 -> :done
+            end
+          end)
+          |> Enum.take_while(&(&1 != :done))
+          |> Enum.count(fn {:open, path} ->
+            String.ends_with?(path, ".seg") or String.ends_with?(path, ".idx")
+          end)
+
+        assert segment_opens <= 2,
+               "30 appends reopened the segment and offset index #{segment_opens} times"
+
+        assert {:ok, {1, {:cmd, "entry-31"}}} = provider.get(log, 31)
+      end
+    )
+  end
+
+  test "a reused segment fd is not written after its file is replaced outside the log" do
+    with_segment_log_memory_env(
+      max_bytes: 1_000_000,
+      max_entries: 100_000,
+      min_entries: 1,
+      records_per_segment: 1_000_000,
+      fun: fn _root, log, _log_name ->
+        provider = :ferricstore_waraft_spike_segment_log
+        assert :ok = provider.init(log)
+        assert {:ok, _state} = provider.open(log)
+        dir = :wa_raft_part_sup.registered_partition_path(elem(log, 3), elem(log, 4))
+        segment = Path.join([to_string(dir), "segment_log", "0.seg"])
+
+        append = fn index ->
+          Task.await(
+            Task.async(fn ->
+              provider.append(
+                {:log_view, log, max(index - 1, 0), index - 1, :undefined},
+                [{1, {:cmd, "entry-#{index}"}}],
+                :strict,
+                :low
+              )
+            end)
+          )
+        end
+
+        assert :ok = append.(1)
+        # Replace the file the writer's cached descriptor points at.
+        File.rm!(segment)
+        File.touch!(segment)
+
+        assert :ok = append.(2)
+
+        assert File.stat!(segment).size > 0,
+               "the append went to the unlinked file instead of the file at the path"
+      end
+    )
+  end
+
+  test "killing an append's caller stops its in-flight segment write" do
+    previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_file_sync_hook)
+    handler_id = {__MODULE__, :killed_append_caller, make_ref()}
+
+    with_segment_log_memory_env(
+      max_bytes: 1_000_000,
+      max_entries: 100_000,
+      min_entries: 1,
+      records_per_segment: 1_000_000,
+      fun: fn _root, log, _log_name ->
+        provider = :ferricstore_waraft_spike_segment_log
+        assert :ok = provider.init(log)
+        assert {:ok, state} = provider.open(log)
+        dir = :wa_raft_part_sup.registered_partition_path(elem(log, 3), elem(log, 4))
+        segment = Path.join([to_string(dir), "segment_log", "0.seg"])
+
+        append = fn index, command ->
+          provider.append(
+            {:log_view, log, max(index - 1, 0), index - 1, :undefined},
+            [{1, {:cmd, command}}],
+            :strict,
+            :low
+          )
+        end
+
+        assert :ok = Task.await(Task.async(fn -> append.(1, "entry-1") end))
+
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :waraft, :segment_log, :append],
+          &__MODULE__.handle_append_telemetry/4,
+          self()
+        )
+
+        try do
+          Application.put_env(:ferricstore, :waraft_segment_log_file_sync_hook, {:block, self()})
+          # wa_raft cancels an async append by killing the process that called append/4.
+          caller = spawn(fn -> append.(2, "entry-2") end)
+
+          assert_receive {:waraft_segment_log_file_sync_blocked, _path, _method, waiter, ref},
+                         1_000
+
+          restore_env(:ferricstore, :waraft_segment_log_file_sync_hook, previous_hook)
+          waiter_ref = Process.monitor(waiter)
+          Process.exit(caller, :kill)
+
+          assert_receive {:DOWN, ^waiter_ref, :process, ^waiter, _reason},
+                         1_000,
+                         "the segment write outlived its killed caller"
+
+          send(waiter, {ref, :continue})
+
+          refute_receive {:segment_log_append, _event, _measurements,
+                          %{path: ^segment, result: :ok}},
+                         100,
+                         "the cancelled append was fsynced after its caller was killed"
+
+          # wa_raft's rollback of the cancelled append.
+          assert :ok = provider.close_process_writers(log)
+          assert {:ok, _state} = provider.truncate(log, 2, state)
+          assert :not_found = provider.get(log, 2)
+          assert {:ok, {1, {:cmd, "entry-1"}}} = provider.get(log, 1)
+
+          assert :ok = Task.await(Task.async(fn -> append.(2, "entry-2-retry") end))
+
+          assert_receive {:segment_log_append, _event, _measurements,
+                          %{path: ^segment, result: :ok}},
+                         1_000
+
+          assert {:ok, {1, {:cmd, "entry-2-retry"}}} = provider.get(log, 2)
+        after
+          :telemetry.detach(handler_id)
+          restore_env(:ferricstore, :waraft_segment_log_file_sync_hook, previous_hook)
+        end
+      end
+    )
+  end
+
+  test "close_process_writers waits for an append still running in the segment writer" do
+    previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_file_sync_hook)
+
+    with_segment_log_memory_env(
+      max_bytes: 1_000_000,
+      max_entries: 100_000,
+      min_entries: 1,
+      records_per_segment: 1_000_000,
+      fun: fn _root, log, _log_name ->
+        provider = :ferricstore_waraft_spike_segment_log
+        assert :ok = provider.init(log)
+        assert {:ok, _state} = provider.open(log)
+
+        append = fn index ->
+          provider.append(
+            {:log_view, log, max(index - 1, 0), index - 1, :undefined},
+            [{1, {:cmd, "entry-#{index}"}}],
+            :strict,
+            :low
+          )
+        end
+
+        assert :ok = Task.await(Task.async(fn -> append.(1) end))
+
+        try do
+          Application.put_env(:ferricstore, :waraft_segment_log_file_sync_hook, {:block, self()})
+          write = Task.async(fn -> append.(2) end)
+
+          assert_receive {:waraft_segment_log_file_sync_blocked, _path, _method, writer, ref},
+                         1_000
+
+          restore_env(:ferricstore, :waraft_segment_log_file_sync_hook, previous_hook)
+
+          # wa_raft starts its rollback as soon as it sees the caller die, which
+          # can be before the kill reaches the segment writer.
+          rollback = Task.async(fn -> provider.close_process_writers(log) end)
+
+          refute Task.yield(rollback, 100),
+                 "close_process_writers returned while an append was still being written"
+
+          send(writer, {ref, :continue})
+          assert :ok = Task.await(write)
+          assert :ok = Task.await(rollback)
+        after
+          restore_env(:ferricstore, :waraft_segment_log_file_sync_hook, previous_hook)
+        end
+      end
+    )
+  end
 end

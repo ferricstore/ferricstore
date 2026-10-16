@@ -43,6 +43,8 @@ defmodule Ferricstore.FlowGovernanceLimitCleanerCorrectnessTest do
   end
 
   test "an empty catalog does not issue an absent cursor delete", %{ctx: ctx} do
+    # Other suites share this instance's limit catalog; start from an empty one.
+    :ok = clear_limit_catalog!(ctx)
     progress_key = Keys.governance_limit_cleanup_progress_key()
     shard_index = Router.shard_for(ctx, progress_key)
 
@@ -99,5 +101,22 @@ defmodule Ferricstore.FlowGovernanceLimitCleanerCorrectnessTest do
   defp applied_index(shard_index) do
     assert {:ok, {:raft_log_pos, index, _term}} = WARaftBackend.storage_position(shard_index)
     index
+  end
+
+  defp clear_limit_catalog!(ctx) do
+    case Ferricstore.Flow.Governance.Catalog.page(ctx, :limit, nil, 100) do
+      {:ok, %{keys: []}} ->
+        :ok
+
+      {:ok, %{keys: keys}} ->
+        :ok =
+          Ferricstore.Flow.Governance.Catalog.unregister_keys(
+            ctx,
+            Keys.governance_catalog_key(:limit),
+            keys
+          )
+
+        clear_limit_catalog!(ctx)
+    end
   end
 end

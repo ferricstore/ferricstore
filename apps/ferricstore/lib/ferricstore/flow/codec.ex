@@ -1075,7 +1075,27 @@ defmodule Ferricstore.Flow.Codec do
 
   defp validate_decoded_record!(_record), do: raise(ArgumentError, "invalid flow record")
 
+  @doc false
+  # The stored parts of a history value in encode_history_snapshot/1 order.
+  # Fields the encoder omits (id, type, parent, root, correlation) come back
+  # nil, so the snapshot re-encodes to the stored bytes.
+  def decode_history_snapshot(@history_bin_magic <> rest) do
+    case decode_history_parts_bin(rest) do
+      {:ok, parts} -> {:ok, Tuple.delete_at(parts, 0)}
+      :error -> :error
+    end
+  end
+
+  def decode_history_snapshot(_value), do: :error
+
   defp decode_history_fields_bin(rest, context) do
+    case decode_history_parts_bin(rest) do
+      {:ok, parts} -> decode_history_fields_term(parts, context)
+      :error -> []
+    end
+  end
+
+  defp decode_history_parts_bin(rest) do
     with {:ok, flags, rest} <- decode_int(rest),
          flags when is_integer(flags) <- flags,
          {:ok, event, rest} <- decode_bin(rest),
@@ -1103,36 +1123,34 @@ defmodule Ferricstore.Flow.Codec do
          {:ok, rewound_to_event_id, rest} <-
            decode_flagged_bin(flags, @history_flag_rewound_to_event_id, rest, nil),
          {:ok, meta_fields, ""} <- Support.decode_history_meta_for_flags(flags, rest) do
-      decode_history_fields_term(
-        {
-          @history_tag,
-          event,
-          version,
-          at,
-          nil,
-          nil,
-          state,
-          priority,
-          attempts,
-          fencing_token,
-          created_at_ms,
-          updated_at_ms,
-          next_run_at_ms,
-          lease_deadline_ms,
-          lease_owner,
-          payload_ref,
-          nil,
-          nil,
-          nil,
-          result_ref,
-          error_ref,
-          rewound_to_event_id,
-          meta_fields
-        },
-        context
-      )
+      {:ok,
+       {
+         @history_tag,
+         event,
+         version,
+         at,
+         nil,
+         nil,
+         state,
+         priority,
+         attempts,
+         fencing_token,
+         created_at_ms,
+         updated_at_ms,
+         next_run_at_ms,
+         lease_deadline_ms,
+         lease_owner,
+         payload_ref,
+         nil,
+         nil,
+         nil,
+         result_ref,
+         error_ref,
+         rewound_to_event_id,
+         meta_fields
+       }}
     else
-      _ -> []
+      _ -> :error
     end
   end
 

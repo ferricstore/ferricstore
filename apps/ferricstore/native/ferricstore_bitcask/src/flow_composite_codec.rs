@@ -139,6 +139,13 @@ fn valid_flow_tag(tag: &[u8]) -> bool {
     let Some(digest) = tag.strip_prefix(b"f:") else {
         return false;
     };
+    // Data format 2 keeps 16 digest bytes (22 characters); format 1 keeps 32 (43).
+    if digest.len() == 22 {
+        return digest[..21]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_'))
+            && matches!(digest[21], b'A' | b'Q' | b'g' | b'w');
+    }
     digest.len() == 43
         && digest[..42]
             .iter()
@@ -237,6 +244,27 @@ mod composite_entry_codec_tests {
                 .into_iter()
                 .chain(invalid_final)
                 .collect::<Vec<_>>()
+        ));
+
+        // Data format 2: 16-byte digests, 22 characters, last one in A/Q/g/w.
+        for last in *b"AQgw" {
+            let mut short = [b'A'; 22];
+            short[21] = last;
+            assert!(valid_flow_tag(
+                &(*b"f:").into_iter().chain(short).collect::<Vec<_>>()
+            ));
+        }
+
+        for last in *b"BEx-" {
+            let mut short = [b'A'; 22];
+            short[21] = last;
+            assert!(!valid_flow_tag(
+                &(*b"f:").into_iter().chain(short).collect::<Vec<_>>()
+            ));
+        }
+
+        assert!(!valid_flow_tag(
+            &(*b"f:").into_iter().chain([b'A'; 23]).collect::<Vec<_>>()
         ));
     }
 

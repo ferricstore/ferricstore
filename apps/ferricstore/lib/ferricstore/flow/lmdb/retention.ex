@@ -345,7 +345,7 @@ defmodule Ferricstore.Flow.LMDB.Retention do
         |> Enum.reduce_while({:ok, base_ops, 0}, fn
           {history_index_key, history_value}, {:ok, ops_acc, swept_acc}
           when is_binary(history_index_key) and is_binary(history_value) ->
-            case IndexCodec.decode_history_index_value(history_value) do
+            case IndexCodec.decode_history_index_row(history_index_key, history_value) do
               {:ok, {event_id, event_ms, _expire_at_ms, _compound_key}} ->
                 cond do
                   not IndexCodec.history_index_entry_key?(
@@ -436,7 +436,7 @@ defmodule Ferricstore.Flow.LMDB.Retention do
   end
 
   defp expired_live_history_ops(expire_key, history_index_key, history_value, now_ms) do
-    case IndexCodec.decode_history_index_value(history_value) do
+    case IndexCodec.decode_history_index_row(history_index_key, history_value) do
       {:ok, {event_id, event_ms, expire_at_ms, _compound_key}} ->
         cond do
           not IndexCodec.history_index_entry_key?(history_index_key, event_id, event_ms) ->
@@ -467,7 +467,7 @@ defmodule Ferricstore.Flow.LMDB.Retention do
          counts,
          now_ms
        ) do
-    case IndexCodec.decode_terminal_expire_value(expire_value) do
+    case IndexCodec.decode_terminal_expire_row(expire_key, expire_value) do
       {:ok, {terminal_key, state_key, count_key}} ->
         if expire_key == IndexCodec.terminal_expire_key(marker_expire_at_ms, terminal_key) do
           case Access.get(path, terminal_key) do
@@ -520,19 +520,20 @@ defmodule Ferricstore.Flow.LMDB.Retention do
          expire_value,
          now_ms
        ) do
-    case IndexCodec.decode_terminal_expire_value(expire_value) do
+    case IndexCodec.decode_terminal_expire_row(expire_key, expire_value) do
       {:ok, {terminal_key, state_key, count_key}} ->
         if expire_key == IndexCodec.terminal_expire_key(marker_expire_at_ms, terminal_key) do
           case Access.get(path, terminal_key) do
             {:ok, terminal_value} ->
-              case IndexCodec.decode_terminal_index_value(terminal_value) do
+              case IndexCodec.decode_terminal_index_row(terminal_key, terminal_value) do
                 {:ok, {id, updated_at_ms, expire_at_ms, decoded_state_key}} ->
                   cond do
                     not IndexCodec.terminal_index_entry_key?(terminal_key, id, updated_at_ms) ->
                       {:error, {:invalid_terminal_index_value, terminal_key}}
 
                     decoded_state_key != state_key or
-                        IndexCodec.terminal_index_count_key(terminal_value) != {:ok, count_key} ->
+                        IndexCodec.terminal_index_row_count_key(terminal_key, terminal_value) !=
+                          {:ok, count_key} ->
                       {:error, :invalid_terminal_expire_value}
 
                     expire_at_ms > 0 and expire_at_ms <= now_ms ->
@@ -574,14 +575,15 @@ defmodule Ferricstore.Flow.LMDB.Retention do
          counts,
          now_ms
        ) do
-    case IndexCodec.decode_terminal_index_value(terminal_value) do
+    case IndexCodec.decode_terminal_index_row(terminal_key, terminal_value) do
       {:ok, {id, updated_at_ms, expire_at_ms, decoded_state_key}} ->
         cond do
           not IndexCodec.terminal_index_entry_key?(terminal_key, id, updated_at_ms) ->
             {:error, {:invalid_terminal_index_value, terminal_key}}
 
           decoded_state_key != state_key or
-              IndexCodec.terminal_index_count_key(terminal_value) != {:ok, count_key} ->
+              IndexCodec.terminal_index_row_count_key(terminal_key, terminal_value) !=
+                {:ok, count_key} ->
             {:error, {:invalid_terminal_expire_value, expire_key}}
 
           expire_at_ms > 0 and expire_at_ms <= now_ms ->
@@ -720,7 +722,7 @@ defmodule Ferricstore.Flow.LMDB.Retention do
   end
 
   defp maybe_delete_history_expire_key(ops, history_index_key, history_value) do
-    case IndexCodec.decode_history_index_value(history_value) do
+    case IndexCodec.decode_history_index_row(history_index_key, history_value) do
       {:ok, {_event_id, _event_ms, expire_at_ms, _compound_key}} when expire_at_ms > 0 ->
         expire_key = IndexCodec.history_expire_key(expire_at_ms, history_index_key)
         expire_value = IndexCodec.encode_history_expire_value(history_index_key)

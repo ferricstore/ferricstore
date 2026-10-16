@@ -285,6 +285,7 @@ defmodule Ferricstore.Flow.LMDB.Access do
   defp op_key({:put_new, key, _value}) when is_binary(key), do: {:ok, key}
   defp op_key({:delete, key}) when is_binary(key), do: {:ok, key}
   defp op_key({:compare, key, _value}) when is_binary(key), do: {:ok, key}
+  defp op_key({:compare_any, key, _values}) when is_binary(key), do: {:ok, key}
   defp op_key({:compare_missing, key}) when is_binary(key), do: {:ok, key}
   defp op_key(_invalid), do: :error
 
@@ -292,6 +293,7 @@ defmodule Ferricstore.Flow.LMDB.Access do
   defp replace_op_key({:put_new, _key, value}, key), do: {:put_new, key, value}
   defp replace_op_key({:delete, _key}, key), do: {:delete, key}
   defp replace_op_key({:compare, _key, value}, key), do: {:compare, key, value}
+  defp replace_op_key({:compare_any, _key, values}, key), do: {:compare_any, key, values}
   defp replace_op_key({:compare_missing, _key}, key), do: {:compare_missing, key}
 
   defp translate_compare_failure(

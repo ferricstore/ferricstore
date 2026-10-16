@@ -317,7 +317,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
   def history_cap_required?(_state, _max_events), do: false
 
   def decode_lmdb_history_trim_item({history_index_key, value}) do
-    case Ferricstore.Flow.LMDB.decode_history_index_value(value) do
+    case Ferricstore.Flow.LMDB.decode_history_index_row(history_index_key, value) do
       {:ok, {event_id, _event_ms, _expire_at_ms, compound_key}} ->
         {:ok, {event_id, compound_key, history_index_key}}
 

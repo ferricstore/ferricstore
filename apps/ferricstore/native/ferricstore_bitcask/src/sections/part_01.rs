@@ -60,6 +60,7 @@ enum LmdbBatchWrite<'a> {
     PutNew(Binary<'a>, Binary<'a>),
     Delete(Binary<'a>),
     Compare(Binary<'a>, Binary<'a>),
+    CompareAny(Binary<'a>, Vec<Binary<'a>>),
     CompareMissing(Binary<'a>),
 }
 
@@ -618,6 +619,24 @@ pub fn fadvise_dontneed(file: &std::fs::File, offset: i64, len: i64) {
 #[cfg(not(target_os = "linux"))]
 pub fn fadvise_dontneed(_file: &std::fs::File, _offset: i64, _len: i64) {}
 
+/// Largest value whose cold-read pages are dropped. Matches the default
+/// `hot_cache_max_value_size`: smaller values are promoted to ETS, so their page
+/// cache copy is redundant. Larger values are never cached in ETS, so dropping
+/// their pages would force a disk read on every access.
+pub const COLD_READ_DROP_MAX_VALUE_BYTES: usize = 65_536;
+
+#[inline]
+pub fn should_drop_cold_read_pages(value_len: usize) -> bool {
+    value_len <= COLD_READ_DROP_MAX_VALUE_BYTES
+}
+
+#[inline]
+pub fn fadvise_dontneed_cold_read(file: &std::fs::File, offset: u64, key_len: usize, value_len: usize) {
+    if should_drop_cold_read_pages(value_len) {
+        fadvise_dontneed(file, offset as i64, (log::HEADER_SIZE + key_len + value_len) as i64);
+    }
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn bounded_dontneed_range(offset: i64, len: i64) -> Option<(i64, i64)> {
     (offset >= 0 && len > 0).then_some((offset, len))
@@ -839,13 +858,12 @@ fn v2_pread_at(env: Env<'_>, path: String, offset: u64) -> NifResult<Term<'_>> {
             fadvise_random(&file);
             match log::pread_record_from_file(&file, offset) {
                 Ok(Some(record)) => {
-                    // Hint kernel to evict the pages — value is promoted to ETS,
-                    // the page cache copy is never needed again.
-                    let record_size = (log::HEADER_SIZE
-                        + record.key.len()
-                        + record.value.as_ref().map_or(0, Vec::len))
-                        as i64;
-                    fadvise_dontneed(&file, offset as i64, record_size);
+                    fadvise_dontneed_cold_read(
+                        &file,
+                        offset,
+                        record.key.len(),
+                        record.value.as_ref().map_or(0, Vec::len),
+                    );
 
                     match record.value {
                         Some(value) => {

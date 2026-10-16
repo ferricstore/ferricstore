@@ -47,6 +47,22 @@ defmodule Ferricstore.Flow.Query.RecordOrder do
 
   def sort_key(_record, _order_by), do: {:error, :unsupported_query_order_value}
 
+  @doc false
+  @spec ordered?([term()], :asc | :desc) :: boolean()
+  def ordered?(values, direction) when is_list(values) and direction in [:asc, :desc],
+    do: do_ordered?(values, direction)
+
+  def ordered?(_values, _direction), do: false
+
+  defp do_ordered?([], _direction), do: true
+  defp do_ordered?([_value], _direction), do: true
+
+  defp do_ordered?([first, second | rest], :asc),
+    do: first <= second and do_ordered?([second | rest], :asc)
+
+  defp do_ordered?([first, second | rest], :desc),
+    do: first >= second and do_ordered?([second | rest], :desc)
+
   @spec run_ref(binary()) :: <<_::256>>
   def run_ref(id) when is_binary(id) and id != "", do: :crypto.hash(:sha256, id)
 

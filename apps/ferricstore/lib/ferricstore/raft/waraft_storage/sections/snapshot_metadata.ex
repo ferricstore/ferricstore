@@ -107,7 +107,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
       end
 
       defp metadata_journal_size(journal_path) do
-        case File.lstat(journal_path) do
+        # Raw stat: this runs inside the Raft apply path, which must not queue
+        # behind unrelated work on the shared Erlang file server.
+        case raw_lstat(journal_path) do
           {:ok, %{type: :regular, size: size}} when size <= @max_metadata_journal_bytes ->
             {:ok, size}
 
@@ -123,6 +125,13 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
 
           {:error, reason} ->
             {:error, {:stat_metadata_journal, reason}}
+        end
+      end
+
+      defp raw_lstat(path) do
+        case :file.read_link_info(path, [:raw]) do
+          {:ok, info} -> {:ok, File.Stat.from_record(info)}
+          {:error, _reason} = error -> error
         end
       end
 

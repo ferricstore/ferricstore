@@ -351,7 +351,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.AsyncEnqueueRejectsAbov
           )
 
         on_exit(fn ->
-          if Process.alive?(pid), do: GenServer.stop(pid)
+          stop_if_alive(pid)
           File.rm_rf(dir)
         end)
 
@@ -496,7 +496,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.AsyncEnqueueRejectsAbov
 
         on_exit(fn ->
           if Process.alive?(owner), do: :sys.resume(owner)
-          if Process.alive?(pid), do: GenServer.stop(pid)
+          stop_if_alive(pid)
           File.rm_rf(dir)
         end)
 

@@ -749,11 +749,6 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
 
     on_exit(fn ->
       PolicyMigration.cleanup_snapshot(ctx, 0, run_token)
-
-      for table <- [first_keydir, Process.get(:rebuilt_policy_snapshot_keydir)],
-          is_reference(table) and :ets.info(table) != :undefined do
-        :ets.delete(table)
-      end
     end)
 
     true =

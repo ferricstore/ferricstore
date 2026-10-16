@@ -709,6 +709,75 @@ defmodule Ferricstore.Flow.Query.CompositeIndexTest do
              CompositeIndex.entries(definition, %{id: "run-1"}, Keys.state_key("run-1"), 0)
   end
 
+  test "reverse metadata for the built-in indexes is compact and v1 rows still decode" do
+    {:ok, catalog} =
+      Ferricstore.Flow.Query.IndexCatalog.load(Ferricstore.Flow.Query.IndexCatalog.default_path())
+
+    state_key = Keys.state_key("run-compact", "tenant-a")
+    record = Map.put(record("run-compact", "tenant-a", 100), :lease_deadline_ms, 200)
+    reverse_key = CompositeIndex.reverse_key(state_key)
+
+    keys =
+      Enum.flat_map(catalog.definitions, fn definition ->
+        {:ok, entries} = CompositeIndex.entries(definition, record, state_key, 0)
+        Enum.map(entries, & &1.key)
+      end)
+
+    assert length(keys) == length(catalog.definitions)
+    legacy = TermCodec.encode({:flow_composite_reverse, 1, state_key, keys, 5_000})
+    compact = CompositeIndex.encode_reverse_value(state_key, keys, 5_000)
+
+    assert byte_size(compact) * 2 <= byte_size(legacy),
+           "compact #{byte_size(compact)}B vs legacy #{byte_size(legacy)}B"
+
+    for blob <- [compact, legacy] do
+      assert {:ok, %{keys: ^keys, expire_at_ms: 5_000}} =
+               CompositeIndex.decode_reverse_state(blob, state_key)
+
+      assert {:ok, ^keys} = CompositeIndex.decode_reverse_value(blob, state_key)
+
+      assert {:ok, {^state_key, ^keys, 5_000}} =
+               CompositeIndex.decode_reverse_row(reverse_key, blob)
+    end
+
+    other_state_key = Keys.state_key("run-other", "tenant-a")
+    assert :error = CompositeIndex.decode_reverse_state(compact, other_state_key)
+
+    assert :error =
+             CompositeIndex.decode_reverse_row(
+               CompositeIndex.reverse_key(other_state_key),
+               compact
+             )
+
+    for offset <- [0, 5, 9, div(byte_size(compact), 2), byte_size(compact) - 1] do
+      <<head::binary-size(^offset), byte, tail::binary>> = compact
+      corrupted = head <> <<Bitwise.bxor(byte, 0xFF)>> <> tail
+      assert :error = CompositeIndex.decode_reverse_state(corrupted, state_key)
+      assert :error = CompositeIndex.decode_reverse_row(reverse_key, corrupted)
+    end
+
+    assert :error =
+             CompositeIndex.decode_reverse_state(
+               binary_part(compact, 0, byte_size(compact) - 1),
+               state_key
+             )
+  end
+
+  test "reverse keys outside the composite key layout keep the v1 encoding" do
+    state_key = Keys.state_key("run-short-key", "tenant-a")
+    {:ok, id} = Keys.run_id_from_state_key(state_key)
+
+    short_key =
+      IndexDefinition.global_storage_prefix() <> <<0x60, :crypto.hash(:sha256, id)::binary>>
+
+    blob = CompositeIndex.encode_reverse_value(state_key, [short_key], 7)
+
+    assert {:ok, {:flow_composite_reverse, 1, ^state_key, [^short_key], 7}} =
+             TermCodec.decode(blob)
+
+    assert {:ok, [^short_key]} = CompositeIndex.decode_reverse_value(blob, state_key)
+  end
+
   test "reverse metadata is bounded and validates ownership", %{definition: definition} do
     state_key = Keys.state_key("run-1", "tenant-a")
 

@@ -843,6 +843,16 @@ defmodule Ferricstore.Store.Router.Part06 do
       end
 
       @doc false
+      # One run (or shared value) of a Flow export; see Ferricstore.Flow.Transfer.
+      def flow_restore(ctx, key, attrs) when is_binary(key) and is_map(attrs) do
+        if byte_size(key) > @max_key_size do
+          {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+        else
+          raft_write(ctx, shard_for(ctx, key), key, {:flow_restore, key, attrs})
+        end
+      end
+
+      @doc false
       def flow_create_with_catalog(ctx, %{id: id} = attrs, catalog)
           when is_binary(id) and is_map(catalog) do
         partition_key =

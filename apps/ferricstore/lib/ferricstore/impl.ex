@@ -2,6 +2,7 @@ defmodule FerricStore.Impl do
   @moduledoc "Elixir-native implementation of all FerricStore data-type operations, delegating to Router and command handlers."
 
   alias Ferricstore.EmbeddedStringValidation
+  alias Ferricstore.Flow.UserValue
   alias Ferricstore.Store.{ReadResult, Router, TypeRegistry, ValueCodec}
 
   alias Ferricstore.Commands.{
@@ -477,13 +478,25 @@ defmodule FerricStore.Impl do
   # Flow
   # ---------------------------------------------------------------
 
-  def flow_create(ctx, id, opts), do: Ferricstore.Flow.create(ctx, id, opts)
+  # Embedded callers pass Elixir terms straight into replicated commands, so
+  # user values are checked here (see Ferricstore.Flow.UserValue). Native and
+  # HTTP clients cannot send atoms; internal callers use code atoms only.
+  def flow_create(ctx, id, opts) do
+    UserValue.validate_opts!(opts)
+    Ferricstore.Flow.create(ctx, id, opts)
+  end
 
-  def flow_create_many(ctx, partition_key, items, opts),
-    do: Ferricstore.Flow.create_many(ctx, partition_key, items, opts)
+  def flow_create_many(ctx, partition_key, items, opts) do
+    UserValue.validate_opts!(opts)
+    UserValue.validate_items!(items)
+    Ferricstore.Flow.create_many(ctx, partition_key, items, opts)
+  end
 
-  def flow_spawn_children(ctx, parent_id, children, opts \\ []),
-    do: Ferricstore.Flow.spawn_children(ctx, parent_id, children, opts)
+  def flow_spawn_children(ctx, parent_id, children, opts \\ []) do
+    UserValue.validate_opts!(opts)
+    UserValue.validate_items!(children)
+    Ferricstore.Flow.spawn_children(ctx, parent_id, children, opts)
+  end
 
   def flow_get(ctx, id, opts \\ []), do: Ferricstore.Flow.get(ctx, id, opts)
 
@@ -498,29 +511,47 @@ defmodule FerricStore.Impl do
   def flow_extend_lease(ctx, id, lease_token, opts \\ []),
     do: Ferricstore.Flow.extend_lease(ctx, id, lease_token, opts)
 
-  def flow_complete(ctx, id, lease_token, opts \\ []),
-    do: Ferricstore.Flow.complete(ctx, id, lease_token, opts)
+  def flow_complete(ctx, id, lease_token, opts \\ []) do
+    UserValue.validate_opts!(opts)
+    Ferricstore.Flow.complete(ctx, id, lease_token, opts)
+  end
 
-  def flow_run_steps_many(ctx, items, opts \\ []),
-    do: Ferricstore.Flow.run_steps_many(ctx, items, opts)
+  def flow_run_steps_many(ctx, items, opts \\ []) do
+    UserValue.validate_opts!(opts)
+    UserValue.validate_items!(items)
+    Ferricstore.Flow.run_steps_many(ctx, items, opts)
+  end
 
-  def flow_transition(ctx, id, from_state, to_state, opts \\ []),
-    do: Ferricstore.Flow.transition(ctx, id, from_state, to_state, opts)
+  def flow_transition(ctx, id, from_state, to_state, opts \\ []) do
+    UserValue.validate_opts!(opts)
+    Ferricstore.Flow.transition(ctx, id, from_state, to_state, opts)
+  end
 
-  def flow_start_and_claim(ctx, id, type, initial_state, opts \\ []),
-    do: Ferricstore.Flow.start_and_claim(ctx, id, type, initial_state, opts)
+  def flow_start_and_claim(ctx, id, type, initial_state, opts \\ []) do
+    UserValue.validate_opts!(opts)
+    Ferricstore.Flow.start_and_claim(ctx, id, type, initial_state, opts)
+  end
 
-  def flow_step_continue(ctx, id, lease_token, from_state, to_state, opts \\ []),
-    do: Ferricstore.Flow.step_continue(ctx, id, lease_token, from_state, to_state, opts)
+  def flow_step_continue(ctx, id, lease_token, from_state, to_state, opts \\ []) do
+    UserValue.validate_opts!(opts)
+    Ferricstore.Flow.step_continue(ctx, id, lease_token, from_state, to_state, opts)
+  end
 
-  def flow_transition_many(ctx, partition_key, from_state, to_state, items, opts \\ []),
-    do: Ferricstore.Flow.transition_many(ctx, partition_key, from_state, to_state, items, opts)
+  def flow_transition_many(ctx, partition_key, from_state, to_state, items, opts \\ []) do
+    UserValue.validate_opts!(opts)
+    UserValue.validate_items!(items)
+    Ferricstore.Flow.transition_many(ctx, partition_key, from_state, to_state, items, opts)
+  end
 
-  def flow_retry(ctx, id, lease_token, opts),
-    do: Ferricstore.Flow.retry(ctx, id, lease_token, opts)
+  def flow_retry(ctx, id, lease_token, opts) do
+    UserValue.validate_opts!(opts)
+    Ferricstore.Flow.retry(ctx, id, lease_token, opts)
+  end
 
-  def flow_schedule_create(ctx, id, opts),
-    do: Ferricstore.Flow.Schedule.create(ctx, id, opts)
+  def flow_schedule_create(ctx, id, opts) do
+    if is_list(opts), do: UserValue.validate_opts!(Keyword.get(opts, :target, []))
+    Ferricstore.Flow.Schedule.create(ctx, id, opts)
+  end
 
   def flow_schedule_get(ctx, id, opts \\ []),
     do: Ferricstore.Flow.Schedule.get(ctx, id, opts)
@@ -543,10 +574,16 @@ defmodule FerricStore.Impl do
   def flow_schedule_fire_due(ctx, opts \\ []),
     do: Ferricstore.Flow.Schedule.fire_due(ctx, opts)
 
-  def flow_fail(ctx, id, lease_token, opts \\ []),
-    do: Ferricstore.Flow.fail(ctx, id, lease_token, opts)
+  def flow_fail(ctx, id, lease_token, opts \\ []) do
+    UserValue.validate_opts!(opts)
+    Ferricstore.Flow.fail(ctx, id, lease_token, opts)
+  end
 
-  def flow_cancel(ctx, id, opts \\ []), do: Ferricstore.Flow.cancel(ctx, id, opts)
+  def flow_cancel(ctx, id, opts \\ []) do
+    UserValue.validate_opts!(opts)
+    Ferricstore.Flow.cancel(ctx, id, opts)
+  end
+
   def flow_retention_cleanup(ctx, opts \\ []), do: Ferricstore.Flow.retention_cleanup(ctx, opts)
   def flow_rewind(ctx, id, opts), do: Ferricstore.Flow.rewind(ctx, id, opts)
   def flow_list(ctx, type, opts \\ []), do: Ferricstore.Flow.list(ctx, type, opts)

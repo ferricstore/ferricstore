@@ -24,14 +24,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
 
         on_exit(fn ->
           restore_env(:flow_lmdb_state_rebuild_scan_limit, old_scan_limit)
-          if :ets.info(source_keydir) != :undefined, do: :ets.delete(source_keydir)
-
-          if :ets.info(empty_recovery_keydir) != :undefined,
-            do: :ets.delete(empty_recovery_keydir)
-
-          if :ets.info(zset_score_index) != :undefined, do: :ets.delete(zset_score_index)
-          if :ets.info(zset_score_lookup) != :undefined, do: :ets.delete(zset_score_lookup)
-
           File.rm_rf!(data_dir)
         end)
 
@@ -438,7 +430,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
         keydir = :ets.new(:flow_lmdb_empty_projection_repair, [:set])
 
         on_exit(fn ->
-          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
           File.rm_rf!(data_dir)
         end)
 
@@ -503,7 +494,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
         keydir = :ets.new(:flow_lmdb_corrupt_reverse_keydir, [:set])
 
         on_exit(fn ->
-          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
           File.rm_rf!(data_dir)
         end)
 
@@ -755,8 +745,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
 
         on_exit(fn ->
           restore_env(:flow_shared_ref_backfill_write_hook, old_hook)
-          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
-          if :ets.info(recovered) != :undefined, do: :ets.delete(recovered)
           File.rm_rf!(data_dir)
         end)
 
@@ -936,7 +924,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
         keydir = :ets.new(:shared_ref_lmdb_backfill_keydir, [:set, :public])
 
         on_exit(fn ->
-          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
           File.rm_rf!(data_dir)
         end)
 
@@ -1027,7 +1014,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
 
         on_exit(fn ->
           :telemetry.detach(handler_id)
-          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
           File.rm_rf!(data_dir)
         end)
 
@@ -1105,7 +1091,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
 
         on_exit(fn ->
           :telemetry.detach(handler_id)
-          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
           File.rm_rf!(data_dir)
         end)
 
@@ -1182,7 +1167,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
         keydir = :ets.new(:flow_lmdb_default_startup_no_env_keydir, [:set])
 
         on_exit(fn ->
-          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
           File.rm_rf!(data_dir)
         end)
 
@@ -1272,7 +1256,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
         keydir = :ets.new(:flow_lmdb_default_forced_blob_keydir, [:set])
 
         on_exit(fn ->
-          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
           File.rm_rf!(data_dir)
         end)
 
@@ -1376,7 +1359,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
 
         on_exit(fn ->
           :telemetry.detach(handler_id)
-          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
           File.rm_rf!(data_dir)
         end)
 
@@ -1729,7 +1711,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
         keydir = :ets.new(:flow_lmdb_reconcile_terminal_active_keydir, [:set])
 
         on_exit(fn ->
-          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
           File.rm_rf!(data_dir)
         end)
 

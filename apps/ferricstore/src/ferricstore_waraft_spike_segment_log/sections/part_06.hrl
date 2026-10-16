@@ -357,6 +357,7 @@ close_writer_entry(Key, file_fd_writing, Fd) ->
     close_writer_entry(Key, file_fd, Fd);
 close_writer_entry(Key, file_fd, Fd) ->
     Registry = ensure_writer_registry(),
+    ok = untrack_segment_fd(Key, Fd),
     Result =
         case file:close(Fd) of
             ok -> ok;
@@ -400,14 +401,61 @@ delete_writer_entry(Registry, Key) ->
 
 ensure_writer_registry() ->
     case ets:info(?WRITER_REGISTRY) of
-        undefined ->
-            try ets:new(?WRITER_REGISTRY, [named_table, public, set, {read_concurrency, true}]) of
-                Tid -> Tid
-            catch
-                error:badarg -> ?WRITER_REGISTRY
-            end;
-        _ ->
+        undefined -> ensure_writer_registry_owned();
+        _ -> ?WRITER_REGISTRY
+    end.
+
+%% The registry outlives any caller: wa_raft appends run in short-lived
+%% processes, and a table owned by one of them vanished with it, dropping every
+%% segment writer registration. A dedicated owner process (re)creates it.
+ensure_writer_registry_owned() ->
+    Owner =
+        case whereis(?WRITER_REGISTRY) of
+            undefined -> start_writer_registry_owner();
+            Pid -> Pid
+        end,
+    MRef = erlang:monitor(process, Owner),
+    Owner ! {ensure_writer_registry, self(), MRef},
+    receive
+        {MRef, ok} ->
+            erlang:demonitor(MRef, [flush]),
+            ?WRITER_REGISTRY;
+        {'DOWN', MRef, process, Owner, _Reason} ->
             ?WRITER_REGISTRY
+    after 5000 ->
+        erlang:demonitor(MRef, [flush]),
+        ?WRITER_REGISTRY
+    end.
+
+start_writer_registry_owner() ->
+    Pid = spawn(fun writer_registry_owner_loop/0),
+    try register(?WRITER_REGISTRY, Pid) of
+        true -> Pid
+    catch
+        error:badarg ->
+            exit(Pid, kill),
+            case whereis(?WRITER_REGISTRY) of
+                undefined -> start_writer_registry_owner();
+                Winner -> Winner
+            end
+    end.
+
+writer_registry_owner_loop() ->
+    receive
+        {ensure_writer_registry, From, Ref} ->
+            _ =
+                case ets:info(?WRITER_REGISTRY) of
+                    undefined ->
+                        try ets:new(?WRITER_REGISTRY, [named_table, public, set, {read_concurrency, true}])
+                        catch error:badarg -> ok
+                        end;
+                    _ ->
+                        ok
+                end,
+            From ! {Ref, ok},
+            writer_registry_owner_loop();
+        _Ignored ->
+            writer_registry_owner_loop()
     end.
 
 put_writer_entry(Registry, Entry) ->

@@ -172,12 +172,24 @@ defmodule Ferricstore.Flow.Query.QueryRowCodecTest do
   end
 
   test "keeps the persisted QueryRow bytes stable while optimizing construction" do
-    assert {:ok, encoded} = QueryRowCodec.encode(@state_key, record(), locator(), 0)
+    # The row binds its state key, whose digest length follows the data format.
+    previous = Ferricstore.Flow.Digest.format()
 
-    assert byte_size(encoded) == 268
+    try do
+      for {format, golden} <- [
+            {1, "3215d2c4b601a25ec373a07fa7a0aee0901533700cf5e4ec815d18db9f871a3b"},
+            {2, "25645853748400a832d37c4cf42d41d828f2dc1f2db95c339c3031719dccc451"}
+          ] do
+        :ok = Ferricstore.Flow.Digest.put_format(format)
+        state_key = Keys.state_key("run-1", "tenant-a")
+        assert {:ok, encoded} = QueryRowCodec.encode(state_key, record(), locator(), 0)
 
-    assert Base.encode16(:crypto.hash(:sha256, encoded), case: :lower) ==
-             "3215d2c4b601a25ec373a07fa7a0aee0901533700cf5e4ec815d18db9f871a3b"
+        assert byte_size(encoded) == 268
+        assert Base.encode16(:crypto.hash(:sha256, encoded), case: :lower) == golden
+      end
+    after
+      Ferricstore.Flow.Digest.put_format(previous)
+    end
   end
 
   test "supports every authoritative state locator source" do

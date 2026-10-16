@@ -362,6 +362,99 @@ defmodule Ferricstore.Flow.Query.QueryRecordStoreTest do
              )
   end
 
+  test "expired fallback uses validated metadata when the retired source location holds another frame" do
+    record = record("run-expired-overwritten", 2)
+    key = state_key(record)
+    expired_row = %{row(record, 0) | expire_at_ms: 500}
+
+    # After a restart compaction rewrites the apply-projection log, the stale
+    # location holds a different frame, so every authoritative read fails.
+    hydrate = fn _ctx, 0, [{^key, _locator}], _opts ->
+      {:error, {:record_size_mismatch, 0, 180, 653}}
+    end
+
+    assert {:ok, [^record], true} =
+             QueryRecordStore.read_many(context(), 0, "/lmdb", [key], 1_000, 10_000,
+               include_expired: true,
+               expired_query_row_fallback: true,
+               query_row_read: fn _path, [^key], 0, _max_bytes ->
+                 {:ok, [expired_row], 100, true}
+               end,
+               hydrate: hydrate,
+               repair_locators: fn _ctx, _shard, _path, _requests ->
+                 flunk("an expired row with validated metadata must not require source repair")
+               end
+             )
+  end
+
+  test "expired fallback still hydrates a repaired live row next to an overwritten expired row" do
+    expired = record("run-expired-overwritten-mixed", 2)
+    live = record("run-live-repaired-mixed", 3)
+    expired_key = state_key(expired)
+    live_key = state_key(live)
+    expired_row = %{row(expired, 0) | expire_at_ms: 500}
+    stale_live = row(live, 20)
+    repaired_live = row(live, 40)
+    repaired = :atomics.new(1, [])
+
+    row_read = fn _path, [^expired_key, ^live_key], 0, _max_bytes ->
+      live_row = if :atomics.get(repaired, 1) == 1, do: repaired_live, else: stale_live
+      {:ok, [expired_row, live_row], 200, true}
+    end
+
+    hydrate = fn _ctx, 0, requests, _opts ->
+      case requests do
+        [{^live_key, %Locator{offset: 40}}] -> {:ok, [live]}
+        _with_stale_location -> {:error, {:record_size_mismatch, 0, 180, 653}}
+      end
+    end
+
+    repair_locators = fn _ctx, 0, "/lmdb", [{^live_key, %Locator{offset: 20}}] ->
+      :atomics.put(repaired, 1, 1)
+      {:ok, 1}
+    end
+
+    assert {:ok, [^expired, ^live], true} =
+             QueryRecordStore.read_many(
+               context(),
+               0,
+               "/lmdb",
+               [expired_key, live_key],
+               1_000,
+               10_000,
+               include_expired: true,
+               expired_query_row_fallback: true,
+               query_row_read: row_read,
+               hydrate: hydrate,
+               repair_locators: repair_locators
+             )
+  end
+
+  test "expired fallback does not hide an unavailable live row" do
+    expired = record("run-expired-overwritten-live-down", 2)
+    live = record("run-live-unavailable", 3)
+    expired_key = state_key(expired)
+    live_key = state_key(live)
+    expired_row = %{row(expired, 0) | expire_at_ms: 500}
+
+    assert {:error, :query_storage_unavailable} =
+             QueryRecordStore.read_many(
+               context(),
+               0,
+               "/lmdb",
+               [expired_key, live_key],
+               1_000,
+               10_000,
+               include_expired: true,
+               expired_query_row_fallback: true,
+               query_row_read: fn _path, _keys, 0, _max_bytes ->
+                 {:ok, [expired_row, row(live, 20)], 200, true}
+               end,
+               hydrate: fn _ctx, 0, _requests, _opts -> {:error, :eio} end,
+               repair_locators: fn _ctx, 0, "/lmdb", [{^live_key, _locator}] -> {:ok, 0} end
+             )
+  end
+
   test "rejects a non-boolean include-expired mode before reading storage" do
     key = state_key(record("run-invalid-expiry-mode", 1))
 
@@ -674,6 +767,34 @@ defmodule Ferricstore.Flow.Query.QueryRecordStoreTest do
     assert :counters.get(calls, 1) == 3
     assert :counters.get(calls, 2) == 2
     assert :counters.get(calls, 3) == 1
+  end
+
+  test "a location holding another record is inconsistent, not retryable, when repair cannot move it" do
+    for stale_error <- [
+          {:record_size_mismatch, 10, 180, 653},
+          {:crc_mismatch, 10},
+          :hydrated_record_size_mismatch
+        ] do
+      record = record("run-stale-location", 1)
+      unchanged = row(record, 10)
+      key = state_key(record)
+      repairs = :counters.new(1, [])
+
+      assert {:error, :query_storage_inconsistent} =
+               QueryRecordStore.read_many(context(), 0, "/lmdb", [key], 1_000, 10_000,
+                 query_row_read: fn _path, [^key], 1_000, _max_bytes ->
+                   {:ok, [unchanged], 100, true}
+                 end,
+                 hydrate: fn _ctx, 0, [{^key, _locator}], _opts -> {:error, stale_error} end,
+                 repair_locators: fn _ctx, 0, "/lmdb", [{^key, _locator}] ->
+                   :counters.add(repairs, 1, 1)
+                   {:ok, 0}
+                 end
+               ),
+             "#{inspect(stale_error)} must not be reported as retryable storage unavailability"
+
+      assert :counters.get(repairs, 1) == 1
+    end
   end
 
   test "fails closed when identity-mismatch locator repair makes no progress" do

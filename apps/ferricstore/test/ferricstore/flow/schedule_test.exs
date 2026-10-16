@@ -99,7 +99,7 @@ defmodule Ferricstore.Flow.ScheduleTest do
                  type: target_type,
                  state: "queued",
                  partition_key: target_partition,
-                 payload: %{source: "schedule"}
+                 payload: %{"source" => "schedule"}
                ]
              )
 
@@ -120,7 +120,7 @@ defmodule Ferricstore.Flow.ScheduleTest do
 
     assert target.type == target_type
     assert target.state == "queued"
-    assert target.payload == %{source: "schedule"}
+    assert target.payload == %{"source" => "schedule"}
 
     assert {:ok, fired_schedule} = FerricStore.flow_schedule_get(schedule_id)
     assert fired_schedule.state == "completed"
@@ -269,7 +269,7 @@ defmodule Ferricstore.Flow.ScheduleTest do
              )
 
     for {schedule_id, target_id} <- schedule_targets do
-      assert {:ok, %{state: "completed"}} = FerricStore.flow_schedule_get(schedule_id)
+      assert_completed_schedule!(schedule_id)
       assert {:ok, %{id: ^target_id}} = FerricStore.flow_get(target_id)
     end
   end
@@ -1482,12 +1482,12 @@ defmodule Ferricstore.Flow.ScheduleTest do
     target_partition = unique_flow_id("schedule-value-ref-partition")
 
     assert {:ok, %{ref: payload_ref}} =
-             FerricStore.flow_value_put(%{large: String.duplicate("p", 512)},
+             FerricStore.flow_value_put(%{"large" => String.duplicate("p", 512)},
                partition_key: target_partition
              )
 
     assert {:ok, %{ref: doc_ref}} =
-             FerricStore.flow_value_put(%{doc: "reservation"},
+             FerricStore.flow_value_put(%{"doc" => "reservation"},
                partition_key: target_partition
              )
 
@@ -1515,8 +1515,8 @@ defmodule Ferricstore.Flow.ScheduleTest do
                values: true
              )
 
-    assert target.payload == %{large: String.duplicate("p", 512)}
-    assert target.values == %{"reservation" => %{doc: "reservation"}}
+    assert target.payload == %{"large" => String.duplicate("p", 512)}
+    assert target.values == %{"reservation" => %{"doc" => "reservation"}}
     assert target.payload_ref == payload_ref
     assert get_in(target.value_refs, ["reservation", :ref]) == doc_ref
   end
@@ -1648,7 +1648,14 @@ defmodule Ferricstore.Flow.ScheduleTest do
                count: 10
              )
 
-    assert Enum.map(schedules, & &1.id) == [active_id, completed_id]
+    listed_ids = Enum.map(schedules, & &1.id)
+
+    if listed_ids != [active_id, completed_id] do
+      flunk("""
+      expected [#{active_id}, #{completed_id}], listed #{inspect(listed_ids)}
+      #{schedule_read_diagnostics([active_id, completed_id])}
+      """)
+    end
   end
 
   test "schedule list pages past more candidates than one catalog page" do
@@ -2274,6 +2281,12 @@ defmodule Ferricstore.Flow.ScheduleTest do
 
     assert {:ok, %{id: ^second_target_id}} =
              FerricStore.flow_get(second_target_id, partition_key: target_partition)
+
+    # The corrupt row fails every Flow LMDB flush on its shard until it is gone,
+    # which would leave that writer failing into the next test.
+    ctx = FerricStore.Instance.get(:default)
+    assert :ok = Ferricstore.Store.Router.delete(ctx, first_target_key)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count, 30_000)
   end
 
   test "overlap policy queue_after_previous preserves queued due occurrence" do
@@ -3334,5 +3347,27 @@ defmodule Ferricstore.Flow.ScheduleTest do
     :sys.resume(name)
   catch
     :exit, _reason -> :ok
+  end
+
+  # A just-completed schedule has twice read as missing on CI without a local
+  # repro; on failure, report every layer the read went through.
+  defp assert_completed_schedule!(schedule_id) do
+    case FerricStore.flow_schedule_get(schedule_id) do
+      {:ok, %{state: "completed"} = schedule} ->
+        schedule
+
+      other ->
+        flunk("""
+        expected completed schedule #{schedule_id}, got #{inspect(other)}
+        #{schedule_read_diagnostics([schedule_id])}
+        """)
+    end
+  end
+
+  defp schedule_read_diagnostics(schedule_ids) do
+    Enum.map_join(schedule_ids, "\n", fn schedule_id ->
+      report = Ferricstore.Test.FlowReadDiagnostics.schedule_report(schedule_id)
+      "read diagnostics for #{schedule_id}: #{inspect(report, pretty: true, limit: :infinity)}"
+    end)
   end
 end

@@ -30,6 +30,7 @@ defmodule Ferricstore.Flow.PolicyCommand do
     :flow_fail,
     :flow_fail_many,
     :flow_reschedule,
+    :flow_restore,
     :flow_retry,
     :flow_retry_many,
     :flow_rewind,

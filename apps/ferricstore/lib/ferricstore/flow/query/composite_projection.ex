@@ -568,7 +568,7 @@ defmodule Ferricstore.Flow.Query.CompositeProjection do
         {:error, :composite_counter_collision}
 
       :error ->
-        case LMDB.get(path, counter_key) do
+        case read_counter(path, counter_key) do
           :not_found ->
             {:ok, nil, 0, 0, 0, put_counter_cache(cache, counter_key, prefix, nil, 0, 0, 0)}
 
@@ -591,8 +591,9 @@ defmodule Ferricstore.Flow.Query.CompositeProjection do
                    physical_count
                  )}
 
+              # Distinct from the retryable :invalid_composite_counter delta check.
               :error ->
-                {:error, :invalid_composite_counter}
+                {:error, :invalid_composite_counter_read}
             end
 
           {:error, _reason} = error ->
@@ -601,6 +602,20 @@ defmodule Ferricstore.Flow.Query.CompositeProjection do
           _invalid ->
             {:error, :invalid_composite_counter_read}
         end
+    end
+  end
+
+  # The value read here is cached for the rest of the batch, so this is where a
+  # concurrent counter commit can make the cache stale.
+  defp read_counter(path, counter_key) do
+    result = LMDB.get(path, counter_key)
+
+    case Ferricstore.FaultInjection.maybe_pause(:after_flow_composite_counter_read, %{
+           path: path,
+           counter_key: counter_key
+         }) do
+      :ok -> result
+      {:error, _reason} = error -> error
     end
   end
 

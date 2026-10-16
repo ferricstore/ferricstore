@@ -12,9 +12,11 @@ defmodule Ferricstore.FlowTest.Sections.FlowInternalKeysUseCompactPartitionTags 
         history_key = Ferricstore.Flow.Keys.history_key("flow-a", partition_key)
         due_key = Ferricstore.Flow.Keys.due_key("checkout", "queued", 0, partition_key)
 
-        assert state_key =~ ~r/^f:\{f:[A-Za-z0-9_-]{43}\}:s:flow-a$/
-        assert history_key =~ ~r/^f:\{f:[A-Za-z0-9_-]{43}\}:h:flow-a$/
-        assert due_key =~ ~r/^f:\{f:[A-Za-z0-9_-]{43}\}:d:Y2hlY2tvdXQ:cXVldWVk:p0$/
+        # The data format sets the digest length (22 characters in format 2).
+        n = Ferricstore.Flow.Digest.length()
+        assert state_key =~ ~r/^f:\{f:[A-Za-z0-9_-]{#{n}}\}:s:flow-a$/
+        assert history_key =~ ~r/^f:\{f:[A-Za-z0-9_-]{#{n}}\}:h:flow-a$/
+        assert due_key =~ ~r/^f:\{f:[A-Za-z0-9_-]{#{n}}\}:d:Y2hlY2tvdXQ:cXVldWVk:p0$/
         assert Ferricstore.Flow.Keys.state_key?(state_key)
         refute Ferricstore.Flow.Keys.state_key?(history_key)
 

@@ -297,6 +297,31 @@ defmodule Ferricstore.Store.Router.Part09 do
       end
 
       @doc false
+      # Writes one cluster feature-level marker through a specific shard's log;
+      # see Ferricstore.Cluster.FeatureLevel. A plain put, so every release
+      # applies it identically.
+      @spec cluster_feature_level_put(
+              FerricStore.Instance.t(),
+              non_neg_integer(),
+              binary(),
+              binary()
+            ) ::
+              :ok | {:error, term()}
+      def cluster_feature_level_put(ctx, shard_index, key, value)
+          when is_integer(shard_index) and shard_index >= 0 and shard_index < ctx.shard_count and
+                 is_binary(value) do
+        if Ferricstore.Cluster.FeatureLevel.key?(key) do
+          case raft_write(ctx, shard_index, key, {:put, key, value, 0}) do
+            :ok -> :ok
+            {:error, _reason} = error -> error
+            other -> {:error, {:feature_level_write_failed, shard_index, other}}
+          end
+        else
+          {:error, :invalid_feature_level_key}
+        end
+      end
+
+      @doc false
       @spec server_catalog_revision(FerricStore.Instance.t(), binary()) ::
               {:ok, binary() | nil} | :unavailable | {:error, atom()}
       def server_catalog_revision(ctx, namespace) do
@@ -466,6 +491,7 @@ defmodule Ferricstore.Store.Router.Part09 do
       end
 
       defp extract_prob_key({:bloom_create, key, _, _, _}), do: key
+      defp extract_prob_key({:prob_restore, key, _, _, _, _}), do: key
       defp extract_prob_key({:bloom_add, key, _, _}), do: key
       defp extract_prob_key({:bloom_madd, key, _, _}), do: key
       defp extract_prob_key({:cms_create, key, _, _}), do: key

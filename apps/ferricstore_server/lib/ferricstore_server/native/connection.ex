@@ -53,6 +53,15 @@ defmodule FerricstoreServer.Native.Connection do
                            )
   @cleanup_state_key :native_connection_cleanup_state
   @cleanup_done_key :native_connection_cleanup_done
+  @default_lane_barrier_timeout_ms 15_000
+  @deferred_frame_metadata_bytes 64
+  # Read-only and flow-control opcodes (PING, CLIENT.INFO, ROUTE, SHARDS,
+  # BACKPRESSURE, OPTIONS, WINDOW_UPDATE, ROUTE_BATCH) change no state that
+  # earlier frames depend on, so they answer without a cross-lane barrier.
+  @transaction_behind_blocked_lane "ERR native transaction command cannot follow a pending blocking command on its lane"
+  @queued_behind_parked_lane "ERR native command cannot join the transaction behind parked work on its lane; EXEC will abort"
+  @transaction_with_parked_work "ERR native MULTI cannot start while blocking commands or parked lane work are pending on this connection"
+  @unordered_control_opcodes [0x0003, 0x0005, 0x0006, 0x0007, 0x0008, 0x000B, 0x000D, 0x000F]
 
   defstruct [
     :socket,
@@ -84,6 +93,7 @@ defmodule FerricstoreServer.Native.Connection do
     :resource_budget,
     :preauth_max_frame_bytes,
     :frame_assembly_timeout_ms,
+    :lane_barrier_timeout_ms,
     :frame_assembly_deadline_ms,
     :chunk_assembly_deadline_ms,
     :inbound_buffer_token,
@@ -92,11 +102,17 @@ defmodule FerricstoreServer.Native.Connection do
     lanes: %{},
     chunk_buffers: %{},
     pending_chunk_bytes: 0,
+    pending_chunk_metadata_bytes: 0,
+    deferred_frame_metadata_bytes: 0,
     decoded_retained_bytes: 0,
     queued_request_bytes: 0,
     lane_queued_request_bytes: %{},
     inflight_total: 0,
     lane_inflight: %{},
+    deferred_inflight_total: 0,
+    deferred_lane_inflight: %{},
+    deferred_queued_request_bytes: 0,
+    deferred_lane_queued_request_bytes: %{},
     event_subscriptions: MapSet.new(),
     flow_wake_subscription: nil,
     multi_state: :none,
@@ -117,12 +133,18 @@ defmodule FerricstoreServer.Native.Connection do
     pubsub_subscription_token: nil,
     max_pubsub_subscription_bytes: 16 * 1024 * 1024,
     blocked_requests: %{},
+    blocked_lane_counts: %{},
+    deferred_frames: %{},
+    deferred_reply_total: 0,
+    deferred_release_due: false,
+    barrier_decode_continue: false,
     authenticated: false,
     require_auth: false,
     compact_flow_responses: false,
     compact_response_codecs: MapSet.new(),
     decode_paused: false,
     decode_pending: false,
+    input_active: false,
     username: "default",
     acl_cache: nil,
     close_after_reply: false
@@ -253,6 +275,7 @@ defmodule FerricstoreServer.Native.Connection do
               resource_budget: Map.get(opts, :resource_budget, ResourceBudget),
               preauth_max_frame_bytes: preauth_max_frame_bytes,
               frame_assembly_timeout_ms: frame_assembly_timeout_ms,
+              lane_barrier_timeout_ms: lane_barrier_timeout_ms(),
               multi_queue_byte_limit: min(max_frame_bytes * 2, 32 * 1024 * 1024),
               watch_key_byte_limit: min(max_frame_bytes, 16 * 1024 * 1024),
               max_pubsub_subscription_bytes:
@@ -333,9 +356,9 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   def loop(%__MODULE__{} = state) do
-    state = remember_connection_state(state)
+    state = state |> maybe_release_idle_lane_deferrals() |> remember_connection_state()
 
-    if connection_deadline_expired?(state) do
+    if state.close_after_reply or connection_deadline_expired?(state) do
       cleanup_connection(state)
       state.transport.close(state.socket)
     else
@@ -344,21 +367,38 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp receive_connection_messages(%__MODULE__{socket: socket, transport: transport} = state) do
-    if not state.decode_paused do
-      transport.setopts(socket, active: :once)
-    end
+    case arm_input(state) do
+      {:ok, state} ->
+        receive_timeout = connection_receive_timeout(state)
 
-    receive_timeout = connection_receive_timeout(state)
+        receive do
+          message ->
+            dispatch_connection_message(state, message)
+        after
+          receive_timeout ->
+            cleanup_connection(state)
+            transport.close(socket)
+        end
 
-    receive do
-      message ->
-        dispatch_connection_message(state, message)
-    after
-      receive_timeout ->
+      {:error, _reason, state} ->
         cleanup_connection(state)
         transport.close(socket)
     end
   end
+
+  defp arm_input(%__MODULE__{decode_paused: true} = state), do: {:ok, state}
+  defp arm_input(%__MODULE__{input_active: true} = state), do: {:ok, state}
+
+  defp arm_input(state), do: activate_input(state)
+
+  defp activate_input(%__MODULE__{socket: socket, transport: transport} = state) do
+    case transport.setopts(socket, active: :once) do
+      :ok -> {:ok, %{state | input_active: true}}
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp mark_input_consumed(state), do: %{state | input_active: false}
 
   defp dispatch_connection_message(
          %__MODULE__{socket: socket, transport: transport} = state,
@@ -366,19 +406,19 @@ defmodule FerricstoreServer.Native.Connection do
        ) do
     case message do
       {:tcp, ^socket, data} ->
-        handle_data(state, data)
+        handle_data(mark_input_consumed(state), data)
 
       {:ssl, ^socket, data} ->
-        handle_data(state, data)
+        handle_data(mark_input_consumed(state), data)
 
       :native_decode_continue ->
         decode_buffer(%{state | decode_pending: false})
 
       {:tcp_passive, ^socket} ->
-        loop(maybe_reactivate_input(state))
+        loop(mark_input_consumed(state))
 
       {:ssl_passive, ^socket} ->
-        loop(maybe_reactivate_input(state))
+        loop(mark_input_consumed(state))
 
       {:tcp_closed, ^socket} ->
         cleanup_connection(state)
@@ -438,126 +478,38 @@ defmodule FerricstoreServer.Native.Connection do
       {:pubsub_pmessage, _pattern, _channel, _message} = event ->
         send_pubsub_events(state, event)
 
-      {:native_blocking_done, _meta, pid} ->
-        case take_blocked_request(state, pid) do
-          {nil, state} ->
-            loop(state)
+      {:native_blocking_done, _meta, _pid} = message ->
+        dispatch_blocking_message(state, message)
 
-          {request, state} ->
-            Process.demonitor(request.monitor_ref, [:flush])
-            loop(finish_inflight(state, request.lane_id))
-        end
+      {:native_blocking_response_budgeted, _meta, _pid, _status, _value, %OutboundBudget{}} =
+          message ->
+        dispatch_blocking_message(state, message)
 
-      {:native_blocking_response_budgeted, _meta, pid, status, value, %OutboundBudget{} = lease} ->
-        case take_blocked_request(state, pid) do
-          {nil, state} ->
-            OutboundBudget.release(lease)
-            acknowledge_blocking_outbound_release(pid, lease)
-            loop(state)
+      {:native_blocking_outbound_overflow, _meta, _pid} = message ->
+        dispatch_blocking_message(state, message)
 
-          {request, state} ->
-            Process.demonitor(request.monitor_ref, [:flush])
-            state = finish_inflight(state, request.lane_id)
-            result = send_guarded_blocking_response(state, request, status, value, lease)
-            acknowledge_blocking_outbound_release(pid, lease)
+      {:native_blocking_response, _meta, _pid, _status, _value} = message ->
+        dispatch_blocking_message(state, message)
 
-            case result do
-              :ok -> loop(state)
-              {:error, _reason} -> close_for_outbound_failure(state)
-            end
-        end
-
-      {:native_blocking_outbound_overflow, _meta, pid} ->
-        case take_blocked_request(state, pid) do
-          {nil, state} ->
-            loop(state)
-
-          {request, state} ->
-            Process.demonitor(request.monitor_ref, [:flush])
-            state = finish_inflight(state, request.lane_id)
-            close_for_outbound_failure(state)
-        end
-
-      {:native_blocking_response, _meta, pid, status, value} ->
-        case take_blocked_request(state, pid) do
-          {nil, state} ->
-            loop(state)
-
-          {request, state} ->
-            Process.demonitor(request.monitor_ref, [:flush])
-            state = finish_inflight(state, request.lane_id)
-            maybe_send_blocking_response(state, request, status, value)
-            loop(state)
-        end
-
-      {:DOWN, monitor_ref, :process, pid, reason} ->
-        case Map.get(state.blocked_requests, pid) do
-          %{monitor_ref: ^monitor_ref} ->
-            {request, state} = take_blocked_request(state, pid)
-            state = finish_inflight(state, request.lane_id)
-
-            maybe_send_blocking_response(
-              state,
-              request,
-              :error,
-              "ERR native blocking command terminated: #{inspect(reason)}"
-            )
-
-            loop(state)
-
-          _missing_or_stale ->
-            loop(state)
-        end
+      {:DOWN, _monitor_ref, :process, _pid, _reason} = message ->
+        dispatch_blocking_message(state, message)
 
       {:acl_invalidate, username, _revision} ->
         handle_acl_invalidation(state, username)
 
-      {:native_lane_response, lane_id, iodata, request_bytes} ->
-        loop(send_lane_responses(state, lane_id, iodata, 1, request_bytes))
-
-      {:native_lane_response, lane_id, iodata} ->
-        loop(send_lane_responses(state, lane_id, iodata))
-
-      {:native_lane_response_budgeted, lane_id, iodata, request_bytes, lease} ->
-        loop(send_lane_response_budgeted(state, lane_id, iodata, request_bytes, lease))
-
-      {:native_lane_responses, lane_id, iodata_list, done_count, request_bytes} ->
-        loop(send_lane_responses(state, lane_id, iodata_list, done_count, request_bytes))
-
-      {:native_lane_responses, lane_id, iodata_list, done_count} ->
-        loop(send_lane_responses(state, lane_id, iodata_list, done_count))
-
-      {:native_lane_responses_budgeted, lane_id, iodata_list, done_count, request_bytes, lease} ->
-        loop(
-          send_lane_responses_budgeted(
-            state,
-            lane_id,
-            iodata_list,
-            done_count,
-            request_bytes,
-            lease
-          )
-        )
-
-      {:native_lane_outbound_overflow, lane_id, done_count, request_bytes} ->
-        state = finish_inflight(state, lane_id, done_count, request_bytes)
-        cleanup_connection(state)
-        transport.close(socket)
-
-      {:native_lane_done, lane_id, request_bytes} ->
-        loop(finish_inflight(state, lane_id, 1, request_bytes))
-
-      {:native_lane_done, lane_id} ->
-        loop(finish_inflight(state, lane_id))
-
-      {:native_lane_done_many, lane_id, done_count, request_bytes} ->
-        loop(finish_inflight(state, lane_id, done_count, request_bytes))
-
-      {:native_lane_done_many, lane_id, done_count} ->
-        loop(finish_inflight(state, lane_id, done_count))
-
       _other ->
-        loop(state)
+        case handle_lane_message(state, message) do
+          {:handled, state} ->
+            loop(state)
+
+          {:overflow, state, lane_id, done_count, request_bytes} ->
+            state = finish_inflight(state, lane_id, done_count, request_bytes)
+            cleanup_connection(state)
+            transport.close(socket)
+
+          :unhandled ->
+            loop(state)
+        end
     end
   end
 
@@ -607,23 +559,26 @@ defmodule FerricstoreServer.Native.Connection do
 
   defp handle_acl_invalidation(state, username) do
     if Responses.acl_invalidation_affects_session?(state, username) do
-      refreshed_state =
-        FerricstoreServer.Connection.Auth.maybe_refresh_acl_cache(state, username)
-
-      ConnRegistry.update(refreshed_state.client_id, self(), Commands.summary(refreshed_state))
-
-      maybe_send_event(refreshed_state, "AUTH_INVALIDATED", %{
-        username: Responses.invalidated_username(username),
-        session_username: refreshed_state.username,
-        authenticated: refreshed_state.authenticated,
-        reconnect: true
-      })
-
+      refreshed_state = notify_acl_invalidated(state, username)
       cleanup_connection(refreshed_state)
       state.transport.close(state.socket)
     else
       loop(state)
     end
+  end
+
+  defp notify_acl_invalidated(state, username) do
+    refreshed_state = FerricstoreServer.Connection.Auth.maybe_refresh_acl_cache(state, username)
+    ConnRegistry.update(refreshed_state.client_id, self(), Commands.summary(refreshed_state))
+
+    maybe_send_event(refreshed_state, "AUTH_INVALIDATED", %{
+      username: Responses.invalidated_username(username),
+      session_username: refreshed_state.username,
+      authenticated: refreshed_state.authenticated,
+      reconnect: true
+    })
+
+    refreshed_state
   end
 
   defp handle_data(state, data) do
@@ -716,14 +671,11 @@ defmodule FerricstoreServer.Native.Connection do
 
   defp pause_input(state) do
     state.transport.setopts(state.socket, active: false)
-    %{state | decode_paused: true}
+    %{state | decode_paused: true, input_active: false}
   end
 
   defp resume_input(%{decode_paused: false} = state), do: state
   defp resume_input(state), do: %{state | decode_paused: false}
-
-  defp maybe_reactivate_input(%{decode_paused: true} = state), do: state
-  defp maybe_reactivate_input(state), do: state
 
   defp inbound_buffer_limit(state),
     do:
@@ -764,8 +716,11 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp retained_inbound_bytes(state, buffer_stats) do
-    FrameBuffer.retained_bytes(buffer_stats) + state.decoded_retained_bytes +
-      state.queued_request_bytes
+    FrameBuffer.retained_bytes(buffer_stats) +
+      state.decoded_retained_bytes +
+      state.queued_request_bytes +
+      Chunks.retained_metadata_bytes(state) +
+      state.deferred_frame_metadata_bytes
   end
 
   defp discard_decoded_frame(state, decoded_bytes) do
@@ -811,13 +766,423 @@ defmodule FerricstoreServer.Native.Connection do
     {responses, state}
   end
 
+  # Deferred frames have already passed framing and chunk validation. Re-enter
+  # the prepared-frame dispatcher directly when their blocking dependency has
+  # completed; decoding them again could mutate chunk state twice.
+  defp dispatch_frames(
+         [{:native_deferred_frame, frame, decoded_bytes, request_bytes} | rest],
+         state,
+         responses,
+         decode_us,
+         lane_batches
+       ) do
+    case deferred_frame_key(state, frame) do
+      nil ->
+        state = release_deferred_admission(state, lane_id(frame), request_bytes)
+
+        dispatch_prepared_frame(
+          frame,
+          rest,
+          state,
+          responses,
+          decode_us,
+          decoded_bytes,
+          lane_batches
+        )
+
+      key ->
+        case defer_frame(
+               state,
+               key,
+               {:native_deferred_frame, frame, decoded_bytes, request_bytes},
+               decoded_bytes,
+               decoded_bytes,
+               request_bytes,
+               :already_reserved
+             ) do
+          {:ok, state} ->
+            dispatch_frames(rest, state, responses, decode_us, lane_batches)
+
+          {:error, state} ->
+            dispatch_deferred_budget_failure(state, responses, decode_us, lane_batches)
+        end
+    end
+  end
+
+  defp dispatch_frames(
+         [{:native_deferred_error, frame, reason, decoded_bytes, request_bytes} | rest],
+         state,
+         responses,
+         decode_us,
+         lane_batches
+       ) do
+    case deferred_frame_key(state, frame) do
+      nil ->
+        state = release_deferred_admission(state, lane_id(frame), request_bytes)
+
+        dispatch_prepared_error(
+          frame,
+          reason,
+          rest,
+          state,
+          responses,
+          decode_us,
+          decoded_bytes,
+          lane_batches
+        )
+
+      key ->
+        case defer_frame(
+               state,
+               key,
+               {:native_deferred_error, frame, reason, decoded_bytes, request_bytes},
+               decoded_bytes,
+               decoded_bytes,
+               request_bytes,
+               :already_reserved
+             ) do
+          {:ok, state} ->
+            dispatch_frames(rest, state, responses, decode_us, lane_batches)
+
+          {:error, state} ->
+            dispatch_deferred_budget_failure(state, responses, decode_us, lane_batches)
+        end
+    end
+  end
+
+  defp dispatch_frames(
+         [{:native_deferred_reply, frame, status, value} | rest],
+         state,
+         responses,
+         decode_us,
+         lane_batches
+       ) do
+    state = %{state | deferred_reply_total: max(state.deferred_reply_total - 1, 0)}
+
+    if deferred_frame_key(state, frame) != nil or lane_busy?(state, lane_id(frame)) do
+      case defer_reply(state, frame, status, value) do
+        {:ok, state} ->
+          dispatch_frames(rest, state, responses, decode_us, lane_batches)
+
+        {:error, state} ->
+          dispatch_deferred_budget_failure(state, responses, decode_us, lane_batches)
+      end
+    else
+      response = maybe_encode_response(frame, state, status, value)
+
+      dispatch_frames(
+        rest,
+        state,
+        maybe_prepend_response(frame, response, responses),
+        decode_us,
+        lane_batches
+      )
+    end
+  end
+
   defp dispatch_frames([raw_frame | rest], state, responses, decode_us, lane_batches) do
     decoded_bytes = frame_memory_bytes(raw_frame)
 
     case prepare_frame(raw_frame, state) do
       {:ok, frame, state} ->
-        cond do
-          state.multi_state == :queuing and opcode(frame) != @op_command_exec ->
+        case deferred_frame_key(state, frame) do
+          nil ->
+            dispatch_prepared_frame(
+              frame,
+              rest,
+              state,
+              responses,
+              decode_us,
+              decoded_bytes,
+              lane_batches
+            )
+
+          key when is_integer(key) ->
+            if state.multi_state == :queuing or transaction_frame?(frame) do
+              # Running it after the parked work would apply connection-wide
+              # transaction state out of stream order; refuse it in lane order.
+              # A command that cannot join an open transaction aborts it.
+              state = discard_decoded_frame(state, decoded_bytes)
+
+              {state, reason} =
+                if state.multi_state == :queuing,
+                  do: {%{state | multi_error: true}, @queued_behind_parked_lane},
+                  else: {state, @transaction_behind_blocked_lane}
+
+              defer_parked_reply(
+                frame,
+                rest,
+                state,
+                responses,
+                decode_us,
+                lane_batches,
+                :error,
+                reason
+              )
+            else
+              defer_parked_frame(
+                frame,
+                rest,
+                state,
+                responses,
+                decode_us,
+                decoded_bytes,
+                lane_batches,
+                key
+              )
+            end
+        end
+
+      {:error, reason, state} ->
+        case deferred_frame_key(state, raw_frame) do
+          nil ->
+            dispatch_prepared_error(
+              raw_frame,
+              reason,
+              rest,
+              state,
+              responses,
+              decode_us,
+              decoded_bytes,
+              lane_batches
+            )
+
+          _key ->
+            state = discard_decoded_frame(state, decoded_bytes)
+
+            defer_parked_reply(
+              raw_frame,
+              rest,
+              state,
+              responses,
+              decode_us,
+              lane_batches,
+              :bad_request,
+              reason
+            )
+        end
+
+      {:pending, state} ->
+        state = %{
+          state
+          | decoded_retained_bytes: max(state.decoded_retained_bytes - decoded_bytes, 0)
+        }
+
+        # Retaining many small chunks can grow metadata even as decoded bytes
+        # shrink. Admission failure must close now, not wait for another read.
+        case resize_inbound_accounting(state) do
+          {:ok, state} ->
+            dispatch_frames(rest, state, responses, decode_us, lane_batches)
+
+          {:error, _reason} ->
+            dispatch_frames(
+              [],
+              %{state | close_after_reply: true},
+              responses,
+              decode_us,
+              lane_batches
+            )
+        end
+    end
+  end
+
+  defp defer_parked_frame(
+         frame,
+         rest,
+         state,
+         responses,
+         decode_us,
+         decoded_bytes,
+         lane_batches,
+         key
+       ) do
+    retained_bytes = max(decoded_bytes, frame_memory_bytes(frame))
+    request_bytes = deferred_queue_request_bytes(state, frame)
+
+    case reserve_deferred_admission(state, key, request_bytes) do
+      {:ok, state} ->
+        case defer_frame(
+               state,
+               key,
+               {:native_deferred_frame, frame, retained_bytes, request_bytes},
+               decoded_bytes,
+               retained_bytes,
+               request_bytes,
+               :already_reserved
+             ) do
+          {:ok, state} ->
+            dispatch_frames(rest, state, responses, decode_us, lane_batches)
+
+          {:error, state} ->
+            dispatch_deferred_budget_failure(state, responses, decode_us, lane_batches)
+        end
+
+      {:error, state} ->
+        # Over the lane or connection queue limits: reject in lane order, as an
+        # unparked frame would be, instead of closing the connection.
+        state = discard_decoded_frame(state, decoded_bytes)
+
+        defer_parked_reply(
+          frame,
+          rest,
+          state,
+          responses,
+          decode_us,
+          lane_batches,
+          :busy,
+          parked_queue_full(key)
+        )
+    end
+  end
+
+  defp defer_parked_reply(frame, rest, state, responses, decode_us, lane_batches, status, value) do
+    case defer_reply(state, frame, status, value) do
+      {:ok, state} ->
+        dispatch_frames(rest, state, responses, decode_us, lane_batches)
+
+      {:error, state} ->
+        dispatch_deferred_budget_failure(state, responses, decode_us, lane_batches)
+    end
+  end
+
+  defp parked_queue_full(lane_id) do
+    %{
+      "code" => "lane_queue_full",
+      "message" => "ERR native lane queue is full behind pending lane work",
+      "scope" => "lane",
+      "lane_id" => lane_id,
+      "retry_after_ms" => 10
+    }
+  end
+
+  defp transaction_frame?(frame) do
+    opcode(frame) == @op_command_exec and
+      match?({:ok, _}, transaction_command_name(frame))
+  end
+
+  defp transaction_command_name(frame) do
+    with {:ok, command} <- Codec.peek_command_name(flags(frame), body(frame)),
+         command = String.upcase(command),
+         true <- Session.transaction_command?(command) do
+      {:ok, command}
+    else
+      _other -> :error
+    end
+  end
+
+  defp dispatch_prepared_frame(
+         frame,
+         rest,
+         state,
+         responses,
+         decode_us,
+         decoded_bytes,
+         lane_batches
+       ) do
+    # Classify once: peeking the command name is per-frame hot-path work.
+    session_kind = native_session_kind(frame, state)
+    session? = session_kind != nil
+
+    if lane_gated_synchronous_frame?(state, frame, session_kind) do
+      defer_lane_synchronous_frame(
+        frame,
+        rest,
+        state,
+        responses,
+        decode_us,
+        decoded_bytes,
+        lane_batches,
+        session?
+      )
+    else
+      dispatch_prepared_frame_now(
+        frame,
+        rest,
+        state,
+        responses,
+        decode_us,
+        decoded_bytes,
+        lane_batches,
+        session?
+      )
+    end
+  end
+
+  # Blocking commands on a busy data lane wait behind that lane's earlier work
+  # without blocking the connection; other lanes keep dispatching. Transaction
+  # and pubsub session commands change connection-wide state that later frames
+  # on every lane must observe in stream order, so they keep the synchronous
+  # lane barrier.
+  defp lane_gated_synchronous_frame?(state, frame, :blocking),
+    do: lane_id(frame) > @control_lane and lane_busy?(state, lane_id(frame))
+
+  defp lane_gated_synchronous_frame?(_state, _frame, _session_kind), do: false
+
+  defp lane_busy?(state, lane_id), do: is_map_key(state.lane_inflight, lane_id)
+
+  defp defer_lane_synchronous_frame(
+         frame,
+         rest,
+         state,
+         responses,
+         decode_us,
+         decoded_bytes,
+         lane_batches,
+         session?
+       ) do
+    lane_id = lane_id(frame)
+    retained_bytes = max(decoded_bytes, frame_memory_bytes(frame))
+    request_bytes = deferred_queue_request_bytes(state, frame)
+
+    case reserve_deferred_admission(state, lane_id, request_bytes) do
+      {:ok, state} ->
+        case defer_frame(
+               state,
+               lane_id,
+               {:native_deferred_frame, frame, retained_bytes, request_bytes},
+               decoded_bytes,
+               retained_bytes,
+               request_bytes,
+               :already_reserved
+             ) do
+          {:ok, state} ->
+            dispatch_frames(rest, state, responses, decode_us, lane_batches)
+
+          {:error, state} ->
+            dispatch_deferred_budget_failure(state, responses, decode_us, lane_batches)
+        end
+
+      {:error, state} ->
+        # Deferral admission is full: wait on the lane barrier instead.
+        dispatch_prepared_frame_now(
+          frame,
+          rest,
+          state,
+          responses,
+          decode_us,
+          decoded_bytes,
+          lane_batches,
+          session?
+        )
+    end
+  end
+
+  defp dispatch_prepared_frame_now(
+         frame,
+         rest,
+         state,
+         responses,
+         decode_us,
+         decoded_bytes,
+         lane_batches,
+         session?
+       ) do
+    cond do
+      state.multi_state == :queuing and opcode(frame) != @op_command_exec ->
+        state = discard_decoded_frame(state, decoded_bytes)
+
+        case synchronize_before_synchronous_frame(state, lane_batches, frame) do
+          {:ok, state} ->
             response =
               maybe_encode_response(
                 frame,
@@ -828,102 +1193,119 @@ defmodule FerricstoreServer.Native.Connection do
 
             dispatch_frames(
               rest,
-              discard_decoded_frame(state, decoded_bytes),
-              maybe_prepend_response(frame, response, responses),
-              decode_us,
-              lane_batches
-            )
-
-          Commands.control_opcode?(opcode(frame)) ->
-            flush_lane_batches(lane_batches)
-
-            dispatch_control_frame(
-              frame,
-              rest,
-              discard_decoded_frame(state, decoded_bytes),
-              responses,
-              decode_us
-            )
-
-          native_session_frame?(frame, state) ->
-            flush_lane_batches(lane_batches)
-
-            dispatch_native_session_frame(
-              frame,
-              rest,
-              discard_decoded_frame(state, decoded_bytes),
-              responses,
-              decode_us
-            )
-
-          lane_id(frame) == @control_lane ->
-            response =
-              maybe_encode_response(
-                frame,
-                state,
-                :bad_request,
-                "ERR native data commands cannot use control lane 0"
-              )
-
-            dispatch_frames(
-              rest,
-              discard_decoded_frame(state, decoded_bytes),
-              maybe_prepend_response(frame, response, responses),
-              decode_us,
-              lane_batches
-            )
-
-          true ->
-            dispatch_data_frame(
-              frame,
-              rest,
               state,
-              responses,
-              decode_us,
-              decoded_bytes,
-              lane_batches
+              maybe_prepend_response(frame, response, responses),
+              decode_us
             )
+
+          {:error, reason, state} ->
+            dispatch_barrier_failure(frame, state, responses, decode_us, reason)
         end
 
-      {:error, reason, state} ->
+      opcode(frame) in @unordered_control_opcodes ->
+        state = discard_decoded_frame(state, decoded_bytes)
+        dispatch_control_frame(frame, rest, state, responses, decode_us, lane_batches)
+
+      Commands.control_opcode?(opcode(frame)) ->
+        state = discard_decoded_frame(state, decoded_bytes)
+
+        case synchronize_before_synchronous_frame(state, lane_batches, frame) do
+          {:ok, state} ->
+            dispatch_control_frame(frame, rest, state, responses, decode_us)
+
+          {:error, reason, state} ->
+            dispatch_barrier_failure(frame, state, responses, decode_us, reason)
+        end
+
+      session? ->
+        state = discard_decoded_frame(state, decoded_bytes)
+
+        case synchronize_before_synchronous_frame(state, lane_batches, frame) do
+          {:ok, state} ->
+            dispatch_native_session_frame(frame, rest, state, responses, decode_us)
+
+          {:error, reason, state} ->
+            dispatch_barrier_failure(frame, state, responses, decode_us, reason)
+        end
+
+      lane_id(frame) == @control_lane ->
         response =
           maybe_encode_response(
-            raw_frame,
+            frame,
             state,
             :bad_request,
-            reason
+            "ERR native data commands cannot use control lane 0"
           )
 
         dispatch_frames(
           rest,
           discard_decoded_frame(state, decoded_bytes),
-          maybe_prepend_response(raw_frame, response, responses),
+          maybe_prepend_response(frame, response, responses),
           decode_us,
           lane_batches
         )
 
-      {:pending, state} ->
-        dispatch_frames(
+      true ->
+        {state, responses} = flush_pending_responses(state, responses)
+
+        dispatch_data_frame(
+          frame,
           rest,
-          discard_decoded_frame(state, decoded_bytes),
+          state,
           responses,
           decode_us,
+          decoded_bytes,
           lane_batches
         )
     end
   end
 
-  defp dispatch_control_frame(frame, rest, state, responses, decode_us) do
+  defp dispatch_prepared_error(
+         frame,
+         reason,
+         rest,
+         state,
+         responses,
+         decode_us,
+         decoded_bytes,
+         lane_batches
+       ) do
+    dispatch_ordered_error(
+      frame,
+      rest,
+      state,
+      responses,
+      decode_us,
+      decoded_bytes,
+      lane_batches,
+      :bad_request,
+      reason
+    )
+  end
+
+  defp dispatch_deferred_budget_failure(state, responses, decode_us, lane_batches) do
+    dispatch_frames(
+      [],
+      %{state | close_after_reply: true},
+      responses,
+      decode_us,
+      lane_batches
+    )
+  end
+
+  defp dispatch_control_frame(frame, rest, state, responses, decode_us, lane_batches \\ %{}) do
     case execute_control_frame(frame, state) do
       {:reply, response, state} ->
         if state.close_after_reply do
+          flush_lane_batches(lane_batches)
           {maybe_prepend_response(frame, response, responses), state}
         else
           dispatch_frames(
             rest,
             state,
             maybe_prepend_response(frame, response, responses),
-            decode_us
+            decode_us,
+            lane_batches
           )
         end
     end
@@ -986,6 +1368,9 @@ defmodule FerricstoreServer.Native.Connection do
 
           {:blocked, state} ->
             state = refresh_command_state_and_lanes(state)
+            # The worker may reply during a later barrier wait, so send earlier
+            # responses now rather than let its reply overtake them.
+            {state, responses} = flush_pending_responses(state, responses)
             dispatch_frames(rest, state, responses, decode_us)
         end
 
@@ -1008,6 +1393,12 @@ defmodule FerricstoreServer.Native.Connection do
           state.multi_state == :queuing ->
             {status, value, state} = execute_native_session_prepared(prepared, state)
             {:reply, status, value, state}
+
+          prepared.command == "MULTI" and
+              (map_size(state.blocked_requests) > 0 or map_size(state.deferred_frames) > 0) ->
+            # A transaction must not overlap parked lane work: frames sent before
+            # MULTI would replay inside it, and frames sent after could not join it.
+            {:reply, :error, @transaction_with_parked_work, state}
 
           Blocking.blocking_command?(prepared.command) ->
             case reserve_inflight(state, lane_id(frame)) do
@@ -1093,19 +1484,29 @@ defmodule FerricstoreServer.Native.Connection do
   defp maybe_prepend_response(_frame, nil, responses), do: responses
   defp maybe_prepend_response(_frame, response, responses), do: [response | responses]
 
-  defp native_session_frame?(frame, state) do
-    opcode(frame) == @op_command_exec and
-      (state.multi_state == :queuing or native_session_payload?(frame))
+  # nil for data frames; :session while MULTI is queuing or for transaction and
+  # pubsub commands; :blocking for lane-local blocking commands.
+  defp native_session_kind(frame, state) do
+    cond do
+      opcode(frame) != @op_command_exec -> nil
+      state.multi_state == :queuing -> :session
+      true -> native_session_payload_kind(frame)
+    end
   end
 
-  defp native_session_payload?(frame) do
+  defp native_session_payload_kind(frame) do
     case Codec.peek_command_name(flags(frame), body(frame)) do
       {:ok, command} ->
         command = String.upcase(command)
-        Blocking.blocking_command?(command) or Session.session_command?(command)
+
+        cond do
+          Blocking.blocking_command?(command) -> :blocking
+          Session.session_command?(command) -> :session
+          true -> nil
+        end
 
       _invalid_or_non_session ->
-        false
+        nil
     end
   end
 
@@ -1122,14 +1523,16 @@ defmodule FerricstoreServer.Native.Connection do
 
     case reserve_inflight(state, lane_id(frame)) do
       {:error, reason} ->
-        response = maybe_encode_response(frame, state, :busy, reason)
-
-        dispatch_frames(
+        dispatch_ordered_error(
+          frame,
           rest,
-          discard_decoded_frame(state, decoded_bytes),
-          maybe_prepend_response(frame, response, responses),
+          state,
+          responses,
           decode_us,
-          lane_batches
+          decoded_bytes,
+          lane_batches,
+          :busy,
+          reason
         )
 
       {:ok, state} ->
@@ -1159,28 +1562,23 @@ defmodule FerricstoreServer.Native.Connection do
     case ensure_lane(state, lane_id(frame)) do
       {:ok, lane_pid, state} ->
         if lane_backlog_full?(state, lane_id(frame)) do
-          response =
-            maybe_encode_response(
-              frame,
-              state,
-              :busy,
-              %{
-                "code" => "lane_queue_full",
-                "message" => "ERR native lane queue is full",
-                "scope" => "lane",
-                "lane_id" => lane_id(frame),
-                "retry_after_ms" => 10
-              }
-            )
-
-          dispatch_frames(
+          dispatch_ordered_error(
+            frame,
             rest,
-            state
-            |> discard_decoded_frame(decoded_bytes)
-            |> finish_inflight(lane_id(frame)),
-            maybe_prepend_response(frame, response, responses),
+            state,
+            responses,
             decode_us,
-            lane_batches
+            decoded_bytes,
+            lane_batches,
+            :busy,
+            %{
+              "code" => "lane_queue_full",
+              "message" => "ERR native lane queue is full",
+              "scope" => "lane",
+              "lane_id" => lane_id(frame),
+              "retry_after_ms" => 10
+            },
+            finish_inflight?: true
           )
         else
           case reserve_queued_request(state, frame, decoded_bytes) do
@@ -1201,30 +1599,109 @@ defmodule FerricstoreServer.Native.Connection do
               dispatch_frames(rest, state, responses, decode_us, lane_batches)
 
             {:error, reason, state} ->
-              response = maybe_encode_response(frame, state, :busy, reason)
-
-              dispatch_frames(
+              dispatch_ordered_error(
+                frame,
                 rest,
-                finish_inflight(state, lane_id(frame)),
-                maybe_prepend_response(frame, response, responses),
+                state,
+                responses,
                 decode_us,
-                lane_batches
+                0,
+                lane_batches,
+                :busy,
+                reason,
+                finish_inflight?: true
               )
           end
         end
 
       {:error, reason} ->
-        response = maybe_encode_response(frame, state, :busy, reason)
-
-        dispatch_frames(
+        dispatch_ordered_error(
+          frame,
           rest,
-          state
-          |> discard_decoded_frame(decoded_bytes)
-          |> finish_inflight(lane_id(frame)),
-          maybe_prepend_response(frame, response, responses),
+          state,
+          responses,
           decode_us,
-          lane_batches
+          decoded_bytes,
+          lane_batches,
+          :busy,
+          reason,
+          finish_inflight?: true
         )
+    end
+  end
+
+  defp dispatch_ordered_error(
+         frame,
+         rest,
+         state,
+         responses,
+         decode_us,
+         decoded_bytes,
+         lane_batches,
+         status,
+         value,
+         opts \\ []
+       ) do
+    state = discard_decoded_frame(state, decoded_bytes)
+
+    state =
+      if Keyword.get(opts, :finish_inflight?, false) do
+        finish_inflight(state, lane_id(frame))
+      else
+        state
+      end
+
+    if reply_deferrable?(state, frame) do
+      case defer_reply(state, frame, status, value) do
+        {:ok, state} ->
+          dispatch_frames(rest, state, responses, decode_us, lane_batches)
+
+        {:error, state} ->
+          dispatch_deferred_budget_failure(state, responses, decode_us, lane_batches)
+      end
+    else
+      case synchronize_before_synchronous_frame(state, lane_batches, frame) do
+        {:ok, state} ->
+          response = maybe_encode_response(frame, state, status, value)
+
+          dispatch_frames(
+            rest,
+            state,
+            maybe_prepend_response(frame, response, responses),
+            decode_us
+          )
+
+        {:error, reason, state} ->
+          dispatch_barrier_failure(frame, state, responses, decode_us, reason)
+      end
+    end
+  end
+
+  # A rejection on a busy data lane is queued behind that lane's earlier work.
+  # Pending replies are bounded; past the bound the barrier is the backpressure.
+  defp reply_deferrable?(state, frame) do
+    lane_id = lane_id(frame)
+
+    lane_id > @control_lane and lane_busy?(state, lane_id) and
+      not Commands.control_opcode?(opcode(frame)) and
+      state.deferred_reply_total < state.max_inflight_per_connection
+  end
+
+  defp defer_reply(state, frame, status, value) do
+    entry = {:native_deferred_reply, put_elem(frame, 4, ""), status, value}
+
+    state = %{
+      state
+      | deferred_frames:
+          Map.update(state.deferred_frames, lane_id(frame), [entry], &[entry | &1]),
+        deferred_reply_total: state.deferred_reply_total + 1,
+        deferred_frame_metadata_bytes:
+          state.deferred_frame_metadata_bytes + @deferred_frame_metadata_bytes
+    }
+
+    case resize_inbound_accounting(state) do
+      {:ok, state} -> {:ok, state}
+      {:error, _reason} -> {:error, state}
     end
   end
 
@@ -1240,13 +1717,770 @@ defmodule FerricstoreServer.Native.Connection do
     end)
   end
 
+  defp synchronize_before_synchronous_frame(state, lane_batches, frame) do
+    flush_lane_batches(lane_batches)
+
+    # One deadline bounds the whole synchronous frame, not each lane in turn.
+    deadline = lane_barrier_deadline(state)
+
+    result =
+      if lane_id(frame) == @control_lane or Commands.control_opcode?(opcode(frame)) do
+        synchronize_control_frame(state, deadline)
+      else
+        await_lane_barriers(state, [lane_id(frame)], deadline)
+      end
+
+    replay_barrier_decode_continue(result)
+  end
+
+  defp replay_barrier_decode_continue({:ok, %{barrier_decode_continue: true} = state}) do
+    send(self(), :native_decode_continue)
+    {:ok, %{state | barrier_decode_continue: false}}
+  end
+
+  defp replay_barrier_decode_continue({:error, reason, %{barrier_decode_continue: true} = state}) do
+    send(self(), :native_decode_continue)
+    {:error, reason, %{state | barrier_decode_continue: false}}
+  end
+
+  defp replay_barrier_decode_continue(result), do: result
+
+  # Control frames follow every earlier frame, including lane-local work deferred
+  # behind busy lanes. Work behind a blocking command stays deferred, as before.
+  defp synchronize_control_frame(state, deadline) do
+    case await_lane_barriers(state, Map.keys(state.lanes), deadline) do
+      {:ok, state} ->
+        if Enum.any?(
+             Map.keys(state.deferred_frames),
+             &(not deferred_dependency_active?(state, &1))
+           ) do
+          state = release_idle_lane_deferrals(state)
+
+          if state.close_after_reply do
+            {:error, "ERR native deferred lane work could not be admitted", state}
+          else
+            synchronize_control_frame(state, deadline)
+          end
+        else
+          {:ok, state}
+        end
+
+      {:error, _reason, _state} = error ->
+        error
+    end
+  end
+
+  defp await_lane_barriers(state, lane_ids, deadline) do
+    Enum.reduce_while(lane_ids, {:ok, state}, fn lane_id, {:ok, state} ->
+      case await_lane_barrier(state, lane_id, deadline) do
+        {:ok, state} ->
+          {:cont, {:ok, state}}
+
+        {:error, reason, state} ->
+          {:halt, {:error, reason, state}}
+      end
+    end)
+  end
+
+  defp await_lane_barrier(state, lane_id, deadline) do
+    # Inflight is reserved before lane dispatch and released only after the
+    # connection writes those responses, so an idle lane has nothing to order.
+    # Blocking workers hold no lane actor work; their dependent frames are
+    # deferred until completion, so barriers never wait on them.
+    case Map.get(state.lanes, lane_id) do
+      pid when is_pid(pid) and is_map_key(state.lane_inflight, lane_id) ->
+        monitor_ref = Process.monitor(pid)
+        barrier_ref = Lane.barrier(pid)
+
+        try do
+          case arm_input(state) do
+            {:ok, state} ->
+              wait_for_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline)
+
+            {:error, reason, state} ->
+              {:error,
+               "ERR native connection receive failed while waiting for lane #{lane_id}: #{inspect(reason)}",
+               state}
+          end
+        after
+          demonitor_lane(monitor_ref)
+        end
+
+      _idle_or_missing ->
+        {:ok, state}
+    end
+  end
+
+  # Take every message in arrival order instead of selectively receiving
+  # barrier messages: a selective receive rescans everything left behind
+  # (pubsub under load) on each wakeup and delays its delivery until the
+  # barrier ends.
+  defp wait_for_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline) do
+    timeout = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    if timeout == 0 do
+      {:error, lane_barrier_timeout_error(lane_id), state}
+    else
+      receive do
+        message ->
+          handle_barrier_message(state, lane_id, barrier_ref, monitor_ref, deadline, message)
+      after
+        timeout ->
+          {:error, lane_barrier_timeout_error(lane_id), state}
+      end
+    end
+  end
+
+  defp handle_barrier_message(state, lane_id, barrier_ref, monitor_ref, deadline, message) do
+    socket = state.socket
+
+    wait = fn state ->
+      wait_for_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline)
+    end
+
+    case message do
+      {:native_lane_barrier, ^lane_id, ^barrier_ref} ->
+        {:ok, state}
+
+      {:native_blocking_done, _meta, _pid} ->
+        continue_blocking_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
+
+      {:native_blocking_response_budgeted, _meta, _pid, _status, _value, %OutboundBudget{}} ->
+        continue_blocking_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
+
+      {:native_blocking_outbound_overflow, _meta, _pid} ->
+        continue_blocking_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
+
+      {:native_blocking_response, _meta, _pid, _status, _value} ->
+        continue_blocking_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
+
+      {tag, ^socket, data} when tag in [:tcp, :ssl] ->
+        continue_lane_barrier_data(state, lane_id, barrier_ref, monitor_ref, deadline, data)
+
+      {tag, ^socket} when tag in [:tcp_passive, :ssl_passive] ->
+        continue_lane_barrier_input(
+          mark_input_consumed(state),
+          lane_id,
+          barrier_ref,
+          monitor_ref,
+          deadline
+        )
+
+      {tag, ^socket} when tag in [:tcp_closed, :ssl_closed] ->
+        {:error, "ERR native connection closed while waiting for lane #{lane_id}", state}
+
+      {tag, ^socket, reason} when tag in [:tcp_error, :ssl_error] ->
+        {:error,
+         "ERR native connection failed while waiting for lane #{lane_id}: #{inspect(reason)}",
+         state}
+
+      :client_kill ->
+        {:error, "ERR native connection stopped while waiting for lane #{lane_id}", state}
+
+      {:acl_invalidate, username, _revision} ->
+        if Responses.acl_invalidation_affects_session?(state, username) do
+          {:error,
+           "ERR native connection authorization changed while waiting for lane #{lane_id}",
+           notify_acl_invalidated(state, username)}
+        else
+          wait.(state)
+        end
+
+      {:DOWN, ^monitor_ref, :process, _pid, reason} ->
+        {:error, lane_barrier_down_error(lane_id, reason), state}
+
+      {:DOWN, _monitor_ref, :process, _pid, _reason} ->
+        continue_blocking_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
+
+      :native_decode_continue ->
+        # Decoding resumes after the barrier; replay the trigger then.
+        wait.(%{state | barrier_decode_continue: true})
+
+      {:native_goaway, payload} ->
+        native_send(state, Responses.encode_event(state, @op_goaway, payload), :event)
+        wait.(state)
+
+      {:native_topology_changed, payload} ->
+        maybe_send_event(
+          state,
+          "TOPOLOGY_CHANGED",
+          Map.merge(Responses.topology_payload(), payload)
+        )
+
+        wait.(state)
+
+      {:flow_claim_due_wake, :ready} ->
+        state = Commands.refresh_flow_wake_subscription(state)
+        maybe_send_event(state, "FLOW_WAKE", Commands.flow_wake_event_payload(state))
+        wait.(state)
+
+      event when elem(event, 0) in [:pubsub_message, :pubsub_pmessage] ->
+        # Pubsub is not ordered with any lane; deliver it now, coalesced as in
+        # the main loop. A non-pubsub message ends the batch and is handled next.
+        case deliver_pubsub_events(state, event) do
+          {:ok, nil} ->
+            wait.(state)
+
+          {:ok, next} ->
+            handle_barrier_message(state, lane_id, barrier_ref, monitor_ref, deadline, next)
+
+          :error ->
+            {:error, "ERR native pubsub delivery failed while waiting for lane #{lane_id}", state}
+        end
+
+      {:pubsub_messages, _channel, _messages, _lease_or_prepared} = batch ->
+        barrier_pubsub_batch(state, lane_id, batch, wait)
+
+      {:pubsub_messages, _channel, _messages} = batch ->
+        barrier_pubsub_batch(state, lane_id, batch, wait)
+
+      {:pubsub_messages, _channel, _messages, %PreparedPubSubBatch{}, _lease} = batch ->
+        barrier_pubsub_batch(state, lane_id, batch, wait)
+
+      _lane_or_other ->
+        continue_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message)
+    end
+  end
+
+  defp barrier_pubsub_batch(state, lane_id, batch, wait) do
+    case deliver_pubsub_batch_message(state, batch) do
+      :ok ->
+        wait.(state)
+
+      :error ->
+        {:error, "ERR native pubsub delivery failed while waiting for lane #{lane_id}", state}
+    end
+  end
+
+  defp continue_lane_barrier_data(state, lane_id, barrier_ref, monitor_ref, deadline, data) do
+    state = mark_input_consumed(state)
+
+    case buffer_barrier_data(state, data) do
+      {:ok, state, true} ->
+        # A complete frame is buffered: leave further input in the socket until
+        # the barrier ends and the frame is decoded (backpressure).
+        state = schedule_barrier_decode(state)
+        wait_for_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline)
+
+      {:ok, state, false} ->
+        deadline = min_lane_deadline(deadline, state.frame_assembly_deadline_ms)
+        deadline = min_lane_deadline(deadline, state.chunk_assembly_deadline_ms)
+        continue_lane_barrier_input(state, lane_id, barrier_ref, monitor_ref, deadline)
+
+      {:error, reason, state} ->
+        {:error, reason, state}
+    end
+  end
+
+  defp continue_lane_barrier_input(state, lane_id, barrier_ref, monitor_ref, deadline) do
+    case arm_input(state) do
+      {:ok, state} ->
+        wait_for_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline)
+
+      {:error, reason, state} ->
+        {:error,
+         "ERR native connection receive failed while waiting for lane #{lane_id}: #{inspect(reason)}",
+         state}
+    end
+  end
+
+  defp buffer_barrier_data(state, data) do
+    frame_limit = Chunks.logical_frame_limit(state)
+
+    case FrameBuffer.append(
+           state.buffer,
+           data,
+           frame_limit,
+           inbound_buffer_limit(state)
+         ) do
+      {:incomplete, buffer} ->
+        put_barrier_inbound_buffer(state, buffer, false)
+
+      {:ready, buffer} ->
+        put_barrier_inbound_buffer(state, buffer, true)
+
+      {:error, :buffer_limit} ->
+        {:error, "ERR native client buffer exceeded limit", state}
+    end
+  end
+
+  defp put_barrier_inbound_buffer(state, buffer, ready?) do
+    case put_inbound_buffer(state, buffer) do
+      {:ok, state} -> {:ok, state, ready?}
+      {:error, _reason} -> {:error, "ERR native global inbound buffer limit exceeded", state}
+    end
+  end
+
+  defp schedule_barrier_decode(%{decode_pending: true} = state), do: state
+
+  defp schedule_barrier_decode(state) do
+    send(self(), :native_decode_continue)
+    %{state | decode_pending: true}
+  end
+
+  defp continue_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message) do
+    case handle_lane_message(state, message) do
+      {:handled, state} ->
+        wait_for_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline)
+
+      {:overflow, state, response_lane_id, _done_count, _request_bytes} ->
+        {:error, lane_barrier_outbound_error(response_lane_id), state}
+
+      :unhandled ->
+        wait_for_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline)
+    end
+  end
+
+  defp continue_blocking_barrier(state, lane_id, barrier_ref, monitor_ref, deadline, message) do
+    case handle_blocking_message(state, message) do
+      {:handled, state} ->
+        if state.close_after_reply do
+          {:error, "ERR native blocking response could not be delivered", state}
+        else
+          wait_for_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline)
+        end
+
+      {:close, state} ->
+        {:error, "ERR native blocking response could not be delivered", state}
+
+      :unhandled ->
+        wait_for_lane_barrier(state, lane_id, barrier_ref, monitor_ref, deadline)
+    end
+  end
+
+  defp blocked_request_for_lane?(%{blocked_requests: blocked_requests}, _lane_id)
+       when map_size(blocked_requests) == 0,
+       do: false
+
+  # Indexed by lane: this runs for every frame while any request is blocked.
+  defp blocked_request_for_lane?(state, lane_id) when is_integer(lane_id),
+    do: is_map_key(state.blocked_lane_counts, lane_id)
+
+  defp blocked_request_for_lane?(_state, _lane_id), do: false
+
+  defp deferred_frame_key(
+         %{blocked_requests: blocked_requests, deferred_frames: deferred_frames},
+         _frame
+       )
+       when map_size(blocked_requests) == 0 and map_size(deferred_frames) == 0,
+       do: nil
+
+  defp deferred_frame_key(state, frame) do
+    lane_id = lane_id(frame)
+
+    if lane_id > @control_lane and
+         (is_map_key(state.deferred_frames, lane_id) or
+            blocked_request_for_lane?(state, lane_id)),
+       do: lane_id
+  end
+
+  defp deferred_queue_request_bytes(_state, frame), do: frame_memory_bytes(frame)
+
+  defp defer_frame(
+         state,
+         key,
+         entry,
+         raw_bytes,
+         retained_bytes,
+         request_bytes,
+         admission
+       )
+       when is_integer(raw_bytes) and raw_bytes >= 0 and is_integer(retained_bytes) and
+              retained_bytes >= 0 and is_integer(request_bytes) and request_bytes >= 0 do
+    admission_result =
+      case admission do
+        :reserve -> reserve_deferred_admission(state, key, request_bytes)
+        :already_reserved -> {:ok, state}
+      end
+
+    case admission_result do
+      {:ok, state} ->
+        deferred_frames = Map.update(state.deferred_frames, key, [entry], &[entry | &1])
+
+        state = %{
+          state
+          | deferred_frames: deferred_frames,
+            deferred_frame_metadata_bytes:
+              state.deferred_frame_metadata_bytes + @deferred_frame_metadata_bytes,
+            decoded_retained_bytes:
+              state.decoded_retained_bytes + max(retained_bytes - raw_bytes, 0)
+        }
+
+        case resize_inbound_accounting(state) do
+          {:ok, state} -> {:ok, remember_connection_state(state)}
+          {:error, _reason} -> {:error, state}
+        end
+
+      {:error, state} ->
+        {:error, state}
+    end
+  end
+
+  defp reserve_deferred_admission(state, lane_id, request_bytes) do
+    deferred_lane_inflight = Map.get(state.deferred_lane_inflight, lane_id, 0)
+    deferred_lane_bytes = Map.get(state.deferred_lane_queued_request_bytes, lane_id, 0)
+    inflight_total = state.inflight_total + state.deferred_inflight_total
+    lane_inflight = Map.get(state.lane_inflight, lane_id, 0) + deferred_lane_inflight
+    queued_bytes = state.queued_request_bytes + state.deferred_queued_request_bytes
+    lane_bytes = Map.get(state.lane_queued_request_bytes, lane_id, 0) + deferred_lane_bytes
+
+    cond do
+      inflight_total >= state.max_inflight_per_connection ->
+        {:error, state}
+
+      lane_inflight >= state.max_inflight_per_lane ->
+        {:error, state}
+
+      queued_bytes + request_bytes > state.max_queued_request_bytes_per_connection ->
+        {:error, state}
+
+      lane_bytes + request_bytes > state.max_queued_request_bytes_per_lane ->
+        {:error, state}
+
+      true ->
+        {:ok,
+         %{
+           state
+           | deferred_inflight_total: state.deferred_inflight_total + 1,
+             deferred_lane_inflight:
+               Map.put(state.deferred_lane_inflight, lane_id, deferred_lane_inflight + 1),
+             deferred_queued_request_bytes: state.deferred_queued_request_bytes + request_bytes,
+             deferred_lane_queued_request_bytes:
+               put_deferred_lane_bytes(
+                 state.deferred_lane_queued_request_bytes,
+                 lane_id,
+                 deferred_lane_bytes + request_bytes
+               )
+         }}
+    end
+  end
+
+  defp put_deferred_lane_bytes(lane_bytes, _lane_id, 0), do: lane_bytes
+
+  defp put_deferred_lane_bytes(lane_bytes, lane_id, bytes),
+    do: Map.put(lane_bytes, lane_id, bytes)
+
+  defp release_deferred_admission(state, lane_id, request_bytes)
+       when is_integer(request_bytes) and request_bytes >= 0 do
+    deferred_lane_inflight = Map.get(state.deferred_lane_inflight, lane_id, 0)
+    deferred_lane_inflight = max(deferred_lane_inflight - 1, 0)
+
+    deferred_lane_inflight_map =
+      if deferred_lane_inflight == 0 do
+        Map.delete(state.deferred_lane_inflight, lane_id)
+      else
+        Map.put(state.deferred_lane_inflight, lane_id, deferred_lane_inflight)
+      end
+
+    deferred_lane_bytes = Map.get(state.deferred_lane_queued_request_bytes, lane_id, 0)
+    deferred_lane_bytes = max(deferred_lane_bytes - request_bytes, 0)
+
+    deferred_lane_bytes_map =
+      if deferred_lane_bytes == 0 do
+        Map.delete(state.deferred_lane_queued_request_bytes, lane_id)
+      else
+        Map.put(state.deferred_lane_queued_request_bytes, lane_id, deferred_lane_bytes)
+      end
+
+    %{
+      state
+      | deferred_inflight_total: max(state.deferred_inflight_total - 1, 0),
+        deferred_lane_inflight: deferred_lane_inflight_map,
+        deferred_queued_request_bytes:
+          max(state.deferred_queued_request_bytes - request_bytes, 0),
+        deferred_lane_queued_request_bytes: deferred_lane_bytes_map
+    }
+  end
+
+  defp release_deferred_frames(state, lane_id), do: drain_deferred_frames(state, lane_id)
+
+  defp drain_deferred_frames(state, key) do
+    case Map.pop(state.deferred_frames, key) do
+      {nil, _deferred_frames} ->
+        state
+
+      {entries, deferred_frames} ->
+        if deferred_dependency_active?(state, key) do
+          state
+        else
+          entry_count = length(entries)
+
+          state =
+            %{state | deferred_frames: deferred_frames}
+            |> Map.update!(
+              :deferred_frame_metadata_bytes,
+              &max(&1 - entry_count * @deferred_frame_metadata_bytes, 0)
+            )
+
+          case resize_inbound_accounting(state) do
+            {:ok, state} ->
+              {responses, state} =
+                dispatch_frames(Enum.reverse(entries), state, [], 0)
+
+              case responses do
+                [] ->
+                  remember_connection_state(state)
+
+                _ ->
+                  native_send(state, Enum.reverse(responses), :response)
+                  remember_connection_state(state)
+              end
+
+            {:error, _reason} ->
+              %{state | close_after_reply: true}
+          end
+        end
+    end
+  end
+
+  defp deferred_dependency_active?(state, lane_id),
+    do: lane_busy?(state, lane_id) or blocked_request_for_lane?(state, lane_id)
+
+  # Deferred lanes become runnable only when a lane goes idle or a blocking
+  # request finishes; skip the scan for unrelated traffic.
+  defp mark_deferred_release_due(%{deferred_frames: deferred_frames} = state, lane_id)
+       when is_map_key(deferred_frames, lane_id),
+       do: %{state | deferred_release_due: true}
+
+  defp mark_deferred_release_due(state, _lane_id), do: state
+
+  defp maybe_release_idle_lane_deferrals(%{deferred_release_due: true} = state),
+    do: release_idle_lane_deferrals(%{state | deferred_release_due: false})
+
+  defp maybe_release_idle_lane_deferrals(state), do: state
+
+  defp release_idle_lane_deferrals(%{deferred_frames: deferred_frames} = state)
+       when map_size(deferred_frames) == 0,
+       do: state
+
+  defp release_idle_lane_deferrals(state) do
+    state.deferred_frames
+    |> Map.keys()
+    |> Enum.sort()
+    |> Enum.reduce(state, fn lane_id, state ->
+      if state.close_after_reply, do: state, else: drain_deferred_frames(state, lane_id)
+    end)
+  end
+
+  defp handle_lane_message(state, message) do
+    case message do
+      {:native_lane_response, lane_id, iodata, request_bytes} ->
+        {:handled, send_lane_responses(state, lane_id, iodata, 1, request_bytes)}
+
+      {:native_lane_response, lane_id, iodata} ->
+        {:handled, send_lane_responses(state, lane_id, iodata)}
+
+      {:native_lane_response_budgeted, lane_id, iodata, request_bytes, lease} ->
+        {:handled, send_lane_response_budgeted(state, lane_id, iodata, request_bytes, lease)}
+
+      {:native_lane_responses, lane_id, iodata_list, done_count, request_bytes} ->
+        {:handled, send_lane_responses(state, lane_id, iodata_list, done_count, request_bytes)}
+
+      {:native_lane_responses, lane_id, iodata_list, done_count} ->
+        {:handled, send_lane_responses(state, lane_id, iodata_list, done_count)}
+
+      {:native_lane_responses_budgeted, lane_id, iodata_list, done_count, request_bytes, lease} ->
+        {:handled,
+         send_lane_responses_budgeted(
+           state,
+           lane_id,
+           iodata_list,
+           done_count,
+           request_bytes,
+           lease
+         )}
+
+      {:native_lane_outbound_overflow, lane_id, done_count, request_bytes} ->
+        {:overflow, state, lane_id, done_count, request_bytes}
+
+      {:native_lane_done, lane_id, request_bytes} ->
+        {:handled, finish_inflight(state, lane_id, 1, request_bytes)}
+
+      {:native_lane_done, lane_id} ->
+        {:handled, finish_inflight(state, lane_id)}
+
+      {:native_lane_done_many, lane_id, done_count, request_bytes} ->
+        {:handled, finish_inflight(state, lane_id, done_count, request_bytes)}
+
+      {:native_lane_done_many, lane_id, done_count} ->
+        {:handled, finish_inflight(state, lane_id, done_count)}
+
+      _other ->
+        :unhandled
+    end
+  end
+
+  defp dispatch_blocking_message(state, message) do
+    case handle_blocking_message(state, message) do
+      {:handled, state} ->
+        if state.close_after_reply do
+          cleanup_connection(state)
+          state.transport.close(state.socket)
+        else
+          loop(state)
+        end
+
+      {:close, state} ->
+        close_for_outbound_failure(state)
+
+      :unhandled ->
+        loop(state)
+    end
+  end
+
+  defp handle_blocking_message(state, message) do
+    case message do
+      {:native_blocking_done, _meta, pid} ->
+        case take_blocked_request(state, pid) do
+          {nil, _state} ->
+            :unhandled
+
+          {request, state} ->
+            Process.demonitor(request.monitor_ref, [:flush])
+            state = finish_inflight(state, request.lane_id)
+            {:handled, release_deferred_frames(state, request.lane_id)}
+        end
+
+      {:native_blocking_response_budgeted, _meta, pid, status, value, %OutboundBudget{} = lease} ->
+        case take_blocked_request(state, pid) do
+          {nil, _state} ->
+            OutboundBudget.release(lease)
+            acknowledge_blocking_outbound_release(pid, lease)
+            :unhandled
+
+          {request, state} ->
+            Process.demonitor(request.monitor_ref, [:flush])
+            state = finish_inflight(state, request.lane_id)
+            result = send_guarded_blocking_response(state, request, status, value, lease)
+            acknowledge_blocking_outbound_release(pid, lease)
+
+            case result do
+              :ok -> {:handled, release_deferred_frames(state, request.lane_id)}
+              {:error, _reason} -> {:close, state}
+            end
+        end
+
+      {:native_blocking_outbound_overflow, _meta, pid} ->
+        case take_blocked_request(state, pid) do
+          {nil, _state} ->
+            :unhandled
+
+          {request, state} ->
+            Process.demonitor(request.monitor_ref, [:flush])
+            {:close, finish_inflight(state, request.lane_id)}
+        end
+
+      {:native_blocking_response, _meta, pid, status, value} ->
+        case take_blocked_request(state, pid) do
+          {nil, _state} ->
+            :unhandled
+
+          {request, state} ->
+            Process.demonitor(request.monitor_ref, [:flush])
+            state = finish_inflight(state, request.lane_id)
+            maybe_send_blocking_response(state, request, status, value)
+            {:handled, release_deferred_frames(state, request.lane_id)}
+        end
+
+      {:DOWN, monitor_ref, :process, pid, reason} ->
+        case Map.get(state.blocked_requests, pid) do
+          %{monitor_ref: ^monitor_ref} ->
+            {request, state} = take_blocked_request(state, pid)
+            state = finish_inflight(state, request.lane_id)
+
+            maybe_send_blocking_response(
+              state,
+              request,
+              :error,
+              "ERR native blocking command terminated: #{inspect(reason)}"
+            )
+
+            {:handled, release_deferred_frames(state, request.lane_id)}
+
+          _missing_or_stale ->
+            :unhandled
+        end
+
+      _other ->
+        :unhandled
+    end
+  end
+
+  defp flush_pending_responses(state, []), do: {state, []}
+
+  defp flush_pending_responses(state, responses) do
+    native_send(state, Enum.reverse(responses), :response)
+    {state, []}
+  end
+
+  defp dispatch_barrier_failure(_frame, state, responses, decode_us, _reason) do
+    # The frame that failed to cross the barrier must not overtake unresolved
+    # work from the same lane. Close after any already-ordered responses.
+    dispatch_frames(
+      [],
+      %{state | close_after_reply: true},
+      responses,
+      decode_us
+    )
+  end
+
+  defp demonitor_lane(monitor_ref) do
+    Process.demonitor(monitor_ref)
+
+    receive do
+      {:DOWN, ^monitor_ref, :process, _pid, _reason} -> :ok
+    after
+      0 -> :ok
+    end
+  end
+
+  defp lane_barrier_timeout_ms do
+    case Application.get_env(
+           :ferricstore,
+           :native_lane_barrier_timeout_ms,
+           @default_lane_barrier_timeout_ms
+         ) do
+      timeout when is_integer(timeout) and timeout > 0 -> timeout
+      _invalid -> @default_lane_barrier_timeout_ms
+    end
+  end
+
+  defp lane_barrier_deadline(state) do
+    timeout_ms = state.lane_barrier_timeout_ms || @default_lane_barrier_timeout_ms
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    deadline = min_lane_deadline(deadline, state.frame_assembly_deadline_ms)
+    min_lane_deadline(deadline, state.chunk_assembly_deadline_ms)
+  end
+
+  defp min_lane_deadline(deadline, candidate) when is_integer(candidate),
+    do: min(deadline, candidate)
+
+  defp min_lane_deadline(deadline, _missing), do: deadline
+
+  defp lane_barrier_timeout_error(lane_id),
+    do: "ERR native lane #{lane_id} completion barrier timed out"
+
+  defp lane_barrier_down_error(lane_id, reason),
+    do: "ERR native lane #{lane_id} terminated before completion: #{inspect(reason)}"
+
+  defp lane_barrier_outbound_error(lane_id),
+    do: "ERR native lane #{lane_id} outbound response budget exceeded"
+
   defp reserve_queued_request(state, frame, decoded_bytes) do
     request_bytes = frame_memory_bytes(frame)
     lane_id = lane_id(frame)
-    lane_bytes = Map.get(state.lane_queued_request_bytes, lane_id, 0)
+    normal_lane_bytes = Map.get(state.lane_queued_request_bytes, lane_id, 0)
+
+    lane_bytes =
+      normal_lane_bytes +
+        if state.deferred_queued_request_bytes == 0 do
+          0
+        else
+          Map.get(state.deferred_lane_queued_request_bytes, lane_id, 0)
+        end
 
     cond do
-      state.queued_request_bytes + request_bytes >
+      state.queued_request_bytes + state.deferred_queued_request_bytes + request_bytes >
           state.max_queued_request_bytes_per_connection ->
         {:error, queued_request_limit_error(:connection, lane_id),
          discard_decoded_frame(state, decoded_bytes)}
@@ -1261,7 +2495,7 @@ defmodule FerricstoreServer.Native.Connection do
           | decoded_retained_bytes: max(state.decoded_retained_bytes - decoded_bytes, 0),
             queued_request_bytes: state.queued_request_bytes + request_bytes,
             lane_queued_request_bytes:
-              Map.put(state.lane_queued_request_bytes, lane_id, lane_bytes + request_bytes)
+              Map.put(state.lane_queued_request_bytes, lane_id, normal_lane_bytes + request_bytes)
         }
 
         case resize_inbound_accounting(next_state) do
@@ -1371,14 +2605,29 @@ defmodule FerricstoreServer.Native.Connection do
   defp put_blocked_request(state, pid, monitor_ref, meta) do
     request = meta |> Map.put(:pid, pid) |> Map.put(:monitor_ref, monitor_ref)
 
+    lane_counts = Map.update(state.blocked_lane_counts, meta.lane_id, 1, &(&1 + 1))
+
     state
     |> put_in([Access.key(:blocked_requests), pid], request)
+    |> Map.put(:blocked_lane_counts, lane_counts)
     |> remember_connection_state()
   end
 
   defp take_blocked_request(state, pid) do
-    {request, blocked_requests} = Map.pop(state.blocked_requests, pid)
-    {request, %{state | blocked_requests: blocked_requests}}
+    case Map.pop(state.blocked_requests, pid) do
+      {nil, _blocked_requests} ->
+        {nil, state}
+
+      {request, blocked_requests} ->
+        lane_counts =
+          case Map.fetch!(state.blocked_lane_counts, request.lane_id) do
+            1 -> Map.delete(state.blocked_lane_counts, request.lane_id)
+            count -> Map.put(state.blocked_lane_counts, request.lane_id, count - 1)
+          end
+
+        state = %{state | blocked_requests: blocked_requests, blocked_lane_counts: lane_counts}
+        {request, mark_deferred_release_due(state, request.lane_id)}
+    end
   end
 
   defp maybe_send_blocking_response(_state, %{no_reply: true}, _status, _value), do: :ok
@@ -1517,7 +2766,12 @@ defmodule FerricstoreServer.Native.Connection do
 
   defp lane_backlog_full?(state, lane_id) do
     is_integer(state.lane_max_queue) and state.lane_max_queue >= 0 and
-      Map.get(state.lane_inflight, lane_id, 0) > state.lane_max_queue
+      Map.get(state.lane_inflight, lane_id, 0) +
+        if state.deferred_inflight_total == 0 do
+          0
+        else
+          Map.get(state.deferred_lane_inflight, lane_id, 0)
+        end > state.lane_max_queue
   end
 
   defp refresh_command_state(state) do
@@ -1568,10 +2822,19 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp reserve_inflight(state, lane_id) do
-    lane_count = Map.get(state.lane_inflight, lane_id, 0)
+    regular_lane_count = Map.get(state.lane_inflight, lane_id, 0)
+
+    lane_count =
+      regular_lane_count +
+        if state.deferred_inflight_total == 0 do
+          0
+        else
+          Map.get(state.deferred_lane_inflight, lane_id, 0)
+        end
 
     cond do
-      state.inflight_total >= state.max_inflight_per_connection ->
+      state.inflight_total + state.deferred_inflight_total >=
+          state.max_inflight_per_connection ->
         {:error,
          %{
            "code" => "flow_control_window_exhausted",
@@ -1595,7 +2858,7 @@ defmodule FerricstoreServer.Native.Connection do
          %{
            state
            | inflight_total: state.inflight_total + 1,
-             lane_inflight: Map.put(state.lane_inflight, lane_id, lane_count + 1)
+             lane_inflight: Map.put(state.lane_inflight, lane_id, regular_lane_count + 1)
          }}
     end
   end
@@ -1616,6 +2879,8 @@ defmodule FerricstoreServer.Native.Connection do
       | inflight_total: max(state.inflight_total - count, 0),
         lane_inflight: lane_inflight
     }
+
+    state = if lane_count == 0, do: mark_deferred_release_due(state, lane_id), else: state
 
     release_queued_request_bytes(state, lane_id, request_bytes)
   end
@@ -1668,7 +2933,16 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp send_pubsub_events(state, first_event) do
-    {events, barrier} =
+    case deliver_pubsub_events(state, first_event) do
+      {:ok, next_message} -> continue_after_pubsub_events(state, next_message)
+      :error -> close_for_outbound_failure(state)
+    end
+  end
+
+  # Returns the first non-pubsub message the coalescer pulled, if any, so the
+  # caller handles it next in arrival order.
+  defp deliver_pubsub_events(state, first_event) do
+    {events, next_message} =
       PubSubCoalescer.collect(
         first_event,
         state.response_coalesce_max,
@@ -1685,13 +2959,13 @@ defmodule FerricstoreServer.Native.Connection do
           end
 
         case result do
-          :ok -> continue_after_pubsub_events(state, barrier)
-          {:error, _reason} -> close_for_outbound_failure(state)
+          :ok -> {:ok, next_message}
+          {:error, _reason} -> :error
         end
 
       {:error, leases} ->
         release_pubsub_leases(leases)
-        close_for_outbound_failure(state)
+        :error
     end
   end
 
@@ -1701,6 +2975,30 @@ defmodule FerricstoreServer.Native.Connection do
     do: dispatch_connection_message(state, barrier)
 
   defp send_pubsub_batch(state, channel, messages, lease, prepared) do
+    case deliver_pubsub_batch(state, channel, messages, lease, prepared) do
+      :ok -> loop(state)
+      :error -> close_for_outbound_failure(state)
+    end
+  end
+
+  defp deliver_pubsub_batch_message(state, {:pubsub_messages, channel, messages}),
+    do: deliver_pubsub_batch(state, channel, messages, nil, nil)
+
+  defp deliver_pubsub_batch_message(
+         state,
+         {:pubsub_messages, channel, messages, %OutboundBudget{} = lease}
+       ),
+       do: deliver_pubsub_batch(state, channel, messages, lease, nil)
+
+  defp deliver_pubsub_batch_message(
+         state,
+         {:pubsub_messages, channel, messages, %PreparedPubSubBatch{} = prepared, lease}
+       ),
+       do: deliver_pubsub_batch(state, channel, messages, lease, prepared)
+
+  defp deliver_pubsub_batch_message(_state, _unknown), do: :error
+
+  defp deliver_pubsub_batch(state, channel, messages, lease, prepared) do
     encoded =
       if pubsub_batch_codec_selected?(state) do
         safe_encode_guarded_pubsub_batch(state, channel, messages, prepared)
@@ -1721,18 +3019,18 @@ defmodule FerricstoreServer.Native.Connection do
               end
 
             case result do
-              :ok -> loop(state)
-              {:error, _reason} -> close_for_outbound_failure(state)
+              :ok -> :ok
+              {:error, _reason} -> :error
             end
 
           {:error, _reason} ->
             OutboundBudget.release(lease)
-            close_for_outbound_failure(state)
+            :error
         end
 
       {:error, _reason} ->
         OutboundBudget.release(lease)
-        close_for_outbound_failure(state)
+        :error
     end
   end
 

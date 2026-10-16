@@ -360,8 +360,19 @@ defmodule Ferricstore.Store.Router.Part01 do
 
       @spec quorum_write(FerricStore.Instance.t(), non_neg_integer(), tuple()) :: term()
       defp quorum_write(ctx, idx, command) do
-        do_quorum_write(ctx, idx, command)
+        case standalone_recovery_write_error(ctx) do
+          nil -> do_quorum_write(ctx, idx, command)
+          error -> error
+        end
       end
+
+      defp standalone_recovery_write_error(%{data_dir: data_dir}) when is_binary(data_dir) do
+        if Ferricstore.Store.StandaloneTxLog.recovery_fenced?(data_dir) do
+          {:error, "ERR shard writes paused for sync"}
+        end
+      end
+
+      defp standalone_recovery_write_error(_ctx), do: nil
 
       defp selected_waraft_ctx?(%{name: :default}), do: Ferricstore.Raft.Backend.running_waraft?()
 
@@ -561,7 +572,10 @@ defmodule Ferricstore.Store.Router.Part01 do
       defp validate_flow_owned_write_locality(_ctx, _idx, _key, _command), do: :ok
 
       defp forced_quorum_write(ctx, idx, command, origin_node) do
-        do_forced_quorum_write(ctx, idx, command, origin_node)
+        case standalone_recovery_write_error(ctx) do
+          nil -> do_forced_quorum_write(ctx, idx, command, origin_node)
+          error -> error
+        end
       end
 
       defp do_forced_quorum_write(ctx, idx, command, origin_node) do

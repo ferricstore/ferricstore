@@ -16,6 +16,18 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
   @query_index_value_tag :flow_query_index
   @query_index_markers ["}:i:a:", "}:i:at:", "}:i:as:", "}:i:ap:", "}:i:sm:"]
   @max_query_discovery_component_bytes 1_024
+  # v2 terminal expiry value: the terminal key, state key and count key are all
+  # derived from the expiry key. Distinct from v1, an external term (byte 131).
+  @compact_terminal_expire_value <<0xC3>>
+  # v2 terminal index value: only the expiry; id, update time, state key and
+  # count key are derived from the terminal index key.
+  @compact_terminal_index_version 0xC4
+  # v2 query index value (CRC32-checked): expiry, discovery component and the
+  # state key's tag; the digests, id and update time come from the key.
+  @compact_query_index_version 0xC6
+  # v2 history index value: expiry and optional history-log location; event
+  # id, event time and compound key come from the key.
+  @compact_history_index_version 0xC7
 
   def terminal_index_prefix(state_index_key) when is_binary(state_index_key) do
     "flow-terminal-index:" <>
@@ -140,13 +152,19 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
 
     {
       query_index_key_from_descriptor(descriptor, id, updated_at_ms),
-      encode_query_index_value_from_descriptor(
-        descriptor,
-        id,
-        updated_at_ms,
-        expire_at_ms,
-        state_key
-      )
+      case compact_query_index_value(descriptor, id, expire_at_ms, state_key) do
+        {:ok, value} ->
+          value
+
+        :error ->
+          encode_query_index_value_from_descriptor(
+            descriptor,
+            id,
+            updated_at_ms,
+            expire_at_ms,
+            state_key
+          )
+      end
     }
   end
 
@@ -425,14 +443,167 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
       ),
       do: raise(ArgumentError, "terminal index fields are invalid")
 
+  @doc """
+  Encodes the value stored under `terminal_key`: just the expiry when the key
+  reproduces every other field, otherwise the self-describing v1 value.
+  """
+  def encode_terminal_index_row(
+        terminal_key,
+        id,
+        updated_at_ms,
+        expire_at_ms,
+        state_key,
+        count_key
+      )
+      when is_binary(terminal_key) and is_integer(expire_at_ms) and expire_at_ms >= 0 and
+             expire_at_ms <= @max_u64 do
+    if derived_terminal_index_fields(terminal_key) ==
+         {:ok, {id, updated_at_ms, state_key, count_key}},
+       do: <<@compact_terminal_index_version, expire_at_ms::unsigned-big-64>>,
+       else: encode_terminal_index_value(id, updated_at_ms, expire_at_ms, state_key, count_key)
+  end
+
+  def encode_terminal_index_row(
+        _terminal_key,
+        id,
+        updated_at_ms,
+        expire_at_ms,
+        state_key,
+        count_key
+      ),
+      do: encode_terminal_index_value(id, updated_at_ms, expire_at_ms, state_key, count_key)
+
+  def decode_terminal_index_row(terminal_key, blob) do
+    case decode_terminal_index_entry_row(terminal_key, blob) do
+      {:ok, {id, updated_at_ms, expire_at_ms, state_key, _count_key}} ->
+        {:ok, {id, updated_at_ms, expire_at_ms, state_key}}
+
+      :error ->
+        :error
+    end
+  end
+
+  def decode_terminal_index_entry_row(
+        terminal_key,
+        <<@compact_terminal_index_version, expire_at_ms::unsigned-big-64>>
+      ) do
+    case derived_terminal_index_fields(terminal_key) do
+      {:ok, {id, updated_at_ms, state_key, count_key}} ->
+        {:ok, {id, updated_at_ms, expire_at_ms, state_key, count_key}}
+
+      :error ->
+        :error
+    end
+  end
+
+  def decode_terminal_index_entry_row(
+        _terminal_key,
+        <<@compact_terminal_index_version, _::binary>>
+      ),
+      do: :error
+
+  def decode_terminal_index_entry_row(_terminal_key, blob) when is_binary(blob),
+    do: decode_terminal_index_entry(blob)
+
+  def decode_terminal_index_entry_row(_terminal_key, _blob), do: :error
+
+  def terminal_index_row_count_key(terminal_key, blob) do
+    case decode_terminal_index_entry_row(terminal_key, blob) do
+      {:ok, {_id, _updated_at_ms, _expire_at_ms, _state_key, count_key}} -> {:ok, count_key}
+      :error -> :missing
+    end
+  end
+
   def encode_terminal_expire_value(terminal_key, state_key, count_key)
       when is_binary(terminal_key) and (is_binary(state_key) or is_nil(state_key)) and
              is_binary(count_key) do
-    TermCodec.encode({terminal_key, state_key, count_key})
+    if derived_terminal_expire_fields(terminal_key) == {:ok, {state_key, count_key}},
+      do: @compact_terminal_expire_value,
+      else: TermCodec.encode({terminal_key, state_key, count_key})
   end
 
   def encode_terminal_expire_value(_terminal_key, _state_key, _count_key),
     do: raise(ArgumentError, "terminal expiration fields are invalid")
+
+  @doc """
+  Every encoding a stored expiry row for these fields may have, for guarding
+  deletes of rows written before the compact layout.
+  """
+  def terminal_expire_values(terminal_key, state_key, count_key) do
+    Enum.uniq([
+      encode_terminal_expire_value(terminal_key, state_key, count_key),
+      TermCodec.encode({terminal_key, state_key, count_key})
+    ])
+  end
+
+  def decode_terminal_expire_row(expire_key, @compact_terminal_expire_value)
+      when is_binary(expire_key) do
+    with {:ok, terminal_key} <- terminal_key_from_expire_key(expire_key),
+         {:ok, {state_key, count_key}} <- derived_terminal_expire_fields(terminal_key) do
+      {:ok, {terminal_key, state_key, count_key}}
+    else
+      _invalid -> :error
+    end
+  end
+
+  def decode_terminal_expire_row(expire_key, blob) when is_binary(expire_key),
+    do: decode_terminal_expire_value(blob)
+
+  def decode_terminal_expire_row(_expire_key, _blob), do: :error
+
+  defp terminal_key_from_expire_key(expire_key) do
+    prefix_bytes = byte_size(terminal_expire_prefix())
+
+    with true <- String.starts_with?(expire_key, terminal_expire_prefix()),
+         <<_prefix::binary-size(^prefix_bytes), time::binary-size(20), 0, terminal_key::binary>> <-
+           expire_key,
+         true <- decimal_digits?(time) and terminal_key != "" do
+      {:ok, terminal_key}
+    else
+      _invalid -> :error
+    end
+  end
+
+  # The state key and count key that a raw (not digested) terminal index key
+  # implies; any digested component makes them underivable.
+  defp derived_terminal_expire_fields(terminal_key) do
+    case derived_terminal_index_fields(terminal_key) do
+      {:ok, {_id, _updated_at_ms, state_key, count_key}} -> {:ok, {state_key, count_key}}
+      :error -> :error
+    end
+  end
+
+  defp derived_terminal_index_fields(terminal_key) when is_binary(terminal_key) do
+    global = terminal_index_global_prefix()
+    global_bytes = byte_size(global)
+
+    with true <-
+           byte_size(terminal_key) <= @max_raw_identity_component_bytes and
+             not String.starts_with?(terminal_key, @digest_component_tag),
+         <<^global::binary-size(^global_bytes), rest::binary>> <- terminal_key,
+         [index_component, time_and_id] <- :binary.split(rest, <<0>>),
+         true <- not String.starts_with?(index_component, @digest_component_tag),
+         <<time::binary-size(20), 0, id::binary>> <- time_and_id,
+         true <- decimal_digits?(time),
+         updated_at_ms when updated_at_ms <= @max_u64 <- String.to_integer(time),
+         true <- id != "" and not String.starts_with?(id, @digest_component_tag),
+         ["f:{" <> _tag = tag_prefix, _index_suffix] <- :binary.split(index_component, "}:i:") do
+      {:ok,
+       {id, updated_at_ms, derived_state_key(tag_prefix, id),
+        terminal_count_prefix() <> index_component}}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp derived_terminal_index_fields(_terminal_key), do: :error
+
+  # Flows without a partition key are indexed under the global tag but stored
+  # under their auto-partition tag.
+  defp derived_state_key("f:{f", id), do: Ferricstore.Flow.Keys.state_key(id, nil)
+  defp derived_state_key(tag_prefix, id), do: tag_prefix <> "}:s:" <> id
+
+  defp decimal_digits?(digits), do: digits != "" and digits =~ ~r/\A[0-9]+\z/
 
   def decode_terminal_expire_value(blob) when is_binary(blob) do
     case TermCodec.decode(blob) do
@@ -513,6 +684,202 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
   rescue
     _ -> :error
   end
+
+  def decode_query_index_row(
+        key,
+        <<@compact_query_index_version, checksum::unsigned-big-32, body::binary>>
+      )
+      when is_binary(key) do
+    with true <- :erlang.crc32(body) == checksum,
+         {:ok, {family_digest, index_digest, id, updated_at_ms}} <- query_index_key_fields(key),
+         <<expire_at_ms::unsigned-big-64, rest::binary>> <- body,
+         {:ok, discovery_component, rest} <- decode_optional_component(rest),
+         true <-
+           is_nil(discovery_component) or
+             byte_size(discovery_component) <= @max_query_discovery_component_bytes,
+         {:ok, state_key} <- decode_query_index_state_key(rest, id) do
+      {:ok,
+       {family_digest, index_digest, discovery_component, id, updated_at_ms, expire_at_ms,
+        state_key}}
+    else
+      _invalid -> :error
+    end
+  end
+
+  def decode_query_index_row(_key, <<@compact_query_index_version, _rest::binary>>), do: :error
+  def decode_query_index_row(_key, blob), do: decode_query_index_value(blob)
+
+  defp compact_query_index_value(
+         {_family_digest, _index_digest, discovery_component},
+         id,
+         expire_at_ms,
+         state_key
+       ) do
+    with true <- bounded_component(id, @max_raw_identity_component_bytes) == id,
+         {:ok, discovery_part} <- encode_optional_component(discovery_component),
+         {:ok, state_part} <- encode_query_index_state_key(state_key, id) do
+      body = IO.iodata_to_binary([<<expire_at_ms::unsigned-big-64>>, discovery_part, state_part])
+      {:ok, <<@compact_query_index_version, :erlang.crc32(body)::unsigned-big-32, body::binary>>}
+    else
+      _not_compactable -> :error
+    end
+  end
+
+  defp encode_optional_component(nil), do: {:ok, <<0>>}
+
+  defp encode_optional_component(value) when is_binary(value) and byte_size(value) <= 0xFFFF,
+    do: {:ok, [<<1, byte_size(value)::unsigned-big-16>>, value]}
+
+  defp encode_optional_component(_value), do: :error
+
+  defp decode_optional_component(<<0, rest::binary>>), do: {:ok, nil, rest}
+
+  defp decode_optional_component(<<1, size::unsigned-big-16, rest::binary>>) do
+    case rest do
+      <<value::binary-size(^size), rest::binary>> -> {:ok, value, rest}
+      _truncated -> :error
+    end
+  end
+
+  defp decode_optional_component(_invalid), do: :error
+
+  # The state key of a Flow ends with ":s:" <> id, so usually only its tag
+  # prefix is stored.
+  defp encode_query_index_state_key(nil, _id), do: {:ok, <<0>>}
+
+  defp encode_query_index_state_key(state_key, id) when byte_size(state_key) <= 0xFFFF do
+    suffix = ":s:" <> id
+    prefix_bytes = byte_size(state_key) - byte_size(suffix)
+
+    if prefix_bytes > 0 and binary_part(state_key, prefix_bytes, byte_size(suffix)) == suffix,
+      do: {:ok, [<<1, prefix_bytes::unsigned-big-16>>, binary_part(state_key, 0, prefix_bytes)]},
+      else: {:ok, [<<2, byte_size(state_key)::unsigned-big-16>>, state_key]}
+  end
+
+  defp encode_query_index_state_key(_state_key, _id), do: :error
+
+  defp decode_query_index_state_key(<<0>>, _id), do: {:ok, nil}
+
+  defp decode_query_index_state_key(<<tag, size::unsigned-big-16, rest::binary>>, id)
+       when tag in [1, 2] and byte_size(rest) == size and size > 0 do
+    if tag == 1, do: {:ok, rest <> ":s:" <> id}, else: {:ok, rest}
+  end
+
+  defp decode_query_index_state_key(_invalid, _id), do: :error
+
+  defp query_index_key_fields(key) do
+    prefix = query_index_global_prefix() <> @query_index_key_tag
+    prefix_bytes = byte_size(prefix)
+
+    with <<^prefix::binary-size(^prefix_bytes), family_digest::binary-size(32),
+           index_digest::binary-size(32), 0, time::binary-size(20), 0, id::binary>> <- key,
+         true <- decimal_digits?(time),
+         updated_at_ms when updated_at_ms <= @max_u64 <- String.to_integer(time),
+         true <- id != "" and not String.starts_with?(id, @digest_component_tag) do
+      {:ok, {family_digest, index_digest, id, updated_at_ms}}
+    else
+      _invalid -> :error
+    end
+  end
+
+  @doc """
+  Encodes the value stored under `history_index_key`: just the expiry and the
+  history-log location when the key reproduces the other fields, otherwise the
+  self-describing v1 value.
+  """
+  def encode_history_index_row(
+        history_index_key,
+        event_id,
+        event_ms,
+        compound_key,
+        expire_at_ms,
+        location
+      ) do
+    case {derived_history_index_fields(history_index_key), location} do
+      {{:ok, {^event_id, ^event_ms, ^compound_key}}, nil}
+      when is_integer(expire_at_ms) and expire_at_ms >= 0 and expire_at_ms <= @max_u64 ->
+        <<@compact_history_index_version, expire_at_ms::unsigned-big-64, 0>>
+
+      {{:ok, {^event_id, ^event_ms, ^compound_key}},
+       {{:flow_history, file_id}, offset, value_size}}
+      when is_integer(expire_at_ms) and expire_at_ms >= 0 and expire_at_ms <= @max_u64 and
+             is_integer(file_id) and file_id >= 0 and file_id <= @max_u64 and
+             is_integer(offset) and offset >= 0 and offset <= @max_u64 and
+             is_integer(value_size) and value_size >= 0 and value_size <= @max_u64 ->
+        <<@compact_history_index_version, expire_at_ms::unsigned-big-64, 1,
+          file_id::unsigned-big-64, offset::unsigned-big-64, value_size::unsigned-big-64>>
+
+      {_not_derivable, nil} ->
+        encode_history_index_value(event_id, event_ms, compound_key, expire_at_ms)
+
+      {_not_derivable, {file_ref, offset, value_size}} ->
+        encode_history_index_value(
+          event_id,
+          event_ms,
+          compound_key,
+          expire_at_ms,
+          file_ref,
+          offset,
+          value_size
+        )
+    end
+  end
+
+  def decode_history_index_row(history_index_key, blob) do
+    case decode_history_index_location_row(history_index_key, blob) do
+      {:ok, {event_id, event_ms, expire_at_ms, compound_key, _file_ref, _offset, _value_size}} ->
+        {:ok, {event_id, event_ms, expire_at_ms, compound_key}}
+
+      :error ->
+        :error
+    end
+  end
+
+  def decode_history_index_location_row(
+        history_index_key,
+        <<@compact_history_index_version, expire_at_ms::unsigned-big-64, location::binary>>
+      ) do
+    with {:ok, {event_id, event_ms, compound_key}} <-
+           derived_history_index_fields(history_index_key) do
+      case location do
+        <<0>> ->
+          {:ok, {event_id, event_ms, expire_at_ms, compound_key, nil, nil, nil}}
+
+        <<1, file_id::unsigned-big-64, offset::unsigned-big-64, value_size::unsigned-big-64>> ->
+          {:ok,
+           {event_id, event_ms, expire_at_ms, compound_key, {:flow_history, file_id}, offset,
+            value_size}}
+
+        _invalid ->
+          :error
+      end
+    end
+  end
+
+  def decode_history_index_location_row(_key, <<@compact_history_index_version, _::binary>>),
+    do: :error
+
+  def decode_history_index_location_row(_key, blob), do: decode_history_index_location(blob)
+
+  defp derived_history_index_fields(history_index_key) when is_binary(history_index_key) do
+    global = "flow-history-index:"
+    global_bytes = byte_size(global)
+
+    with <<^global::binary-size(^global_bytes), rest::binary>> <- history_index_key,
+         [history_key, time_and_event] <- :binary.split(rest, <<0>>),
+         true <- history_key != "" and not String.starts_with?(history_key, @digest_component_tag),
+         <<time::binary-size(20), 0, event_id::binary>> <- time_and_event,
+         true <- decimal_digits?(time),
+         event_ms when event_ms <= @max_u64 <- String.to_integer(time),
+         true <- event_id != "" and not String.starts_with?(event_id, @digest_component_tag) do
+      {:ok,
+       {event_id, event_ms, Ferricstore.Store.CompoundKey.stream_prefix(history_key) <> event_id}}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp derived_history_index_fields(_history_index_key), do: :error
 
   def decode_history_index_value(blob) when is_binary(blob) do
     case TermCodec.decode(blob) do

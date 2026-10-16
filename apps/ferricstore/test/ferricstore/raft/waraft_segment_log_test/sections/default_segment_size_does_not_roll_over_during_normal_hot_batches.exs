@@ -188,7 +188,9 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest.Sections.DefaultSegmentSizeDoesN
                      :low
                    )
 
-          assert [first_entry] = writer_entries_for_owner(registry, self())
+          # Appends run in the directory's long-lived segment writer.
+          writer = segment_writer_owner(registry)
+          assert [first_entry] = writer_entries_for_owner(registry, writer)
           assert writer_entry_path(first_entry) |> to_string() |> String.ends_with?("0.seg")
 
           view1 = {:log_view, log, 0, 1, :undefined}
@@ -201,7 +203,8 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest.Sections.DefaultSegmentSizeDoesN
                      :low
                    )
 
-          assert [second_entry] = writer_entries_for_owner(registry, self())
+          assert ^writer = segment_writer_owner(registry)
+          assert [second_entry] = writer_entries_for_owner(registry, writer)
           assert writer_entry_path(second_entry) |> to_string() |> String.ends_with?("1.seg")
         after
           _ =
@@ -405,6 +408,13 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest.Sections.DefaultSegmentSizeDoesN
           ref = Process.monitor(owner)
           assert_receive {:dead_writer_append, ^owner, :ok}, 1_000
           assert_receive {:DOWN, ^ref, :process, ^owner, _reason}, 1_000
+
+          # The append ran in the directory's segment writer; kill it so its
+          # cached handle belongs to a dead owner.
+          owner = segment_writer_owner(registry)
+          writer_ref = Process.monitor(owner)
+          Process.exit(owner, :kill)
+          assert_receive {:DOWN, ^writer_ref, :process, ^owner, :killed}, 1_000
           assert [_stale] = writer_entries_for_owner(registry, owner)
 
           view1 = {:log_view, log, 0, 1, :undefined}
@@ -418,7 +428,9 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest.Sections.DefaultSegmentSizeDoesN
                    )
 
           assert [] = writer_entries_for_owner(registry, owner)
-          assert [current] = writer_entries_for_owner(registry, self())
+          new_writer = segment_writer_owner(registry)
+          assert new_writer != owner
+          assert [current] = writer_entries_for_owner(registry, new_writer)
           assert writer_entry_path(current) |> to_string() |> String.ends_with?("1.seg")
         after
           _ =

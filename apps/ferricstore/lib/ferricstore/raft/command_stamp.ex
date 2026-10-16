@@ -2,6 +2,7 @@ defmodule Ferricstore.Raft.CommandStamp do
   @moduledoc false
 
   alias Ferricstore.HLC
+  alias Ferricstore.Raft.CommandCodec
   alias Ferricstore.TermCodec
 
   @max_physical_ms Bitwise.bsl(1, 48) - 1
@@ -34,12 +35,13 @@ defmodule Ferricstore.Raft.CommandStamp do
 
   @spec to_ttb(term()) :: {:ttb, binary()}
   def to_ttb(command) do
-    {:ttb, TermCodec.encode(stamp(command))}
+    {:ttb, command |> stamp() |> TermCodec.encode() |> CommandCodec.encode()}
   end
 
   @spec decode_ttb(term()) :: {:ok, stamped_command()} | {:error, :invalid_preencoded_command}
   def decode_ttb(binary) when is_binary(binary) do
-    with {:ok, term} <- TermCodec.decode(binary) do
+    with {:ok, external_term} <- CommandCodec.decode(binary),
+         {:ok, term} <- TermCodec.decode(external_term) do
       case term do
         {command,
          %{
@@ -53,7 +55,7 @@ defmodule Ferricstore.Raft.CommandStamp do
           {:error, :invalid_preencoded_command}
       end
     else
-      {:error, :invalid_external_term} -> {:error, :invalid_preencoded_command}
+      _invalid -> {:error, :invalid_preencoded_command}
     end
   end
 

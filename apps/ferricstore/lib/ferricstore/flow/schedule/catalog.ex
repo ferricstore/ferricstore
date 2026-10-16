@@ -2,7 +2,7 @@ defmodule Ferricstore.Flow.Schedule.Catalog do
   @moduledoc false
 
   alias Ferricstore.Flow
-  alias Ferricstore.Flow.{Keys, LMDB, LMDBMirror, LMDBWriter, PolicyMigration}
+  alias Ferricstore.Flow.{KeydirSpill, Keys, LMDB, LMDBMirror, LMDBWriter, PolicyMigration}
   alias Ferricstore.Flow.Schedule.Metadata
   alias Ferricstore.Store.Router
 
@@ -225,7 +225,9 @@ defmodule Ferricstore.Flow.Schedule.Catalog do
   defp read_shard_values(_ctx, _shard_index, []), do: {:ok, []}
 
   defp read_shard_values(ctx, shard_index, keys) do
-    case Router.read_shard_values_chunked(ctx, shard_index, keys) do
+    keydir_read = &Router.read_shard_values_chunked(ctx, shard_index, &1)
+
+    case KeydirSpill.read_values(ctx, shard_index, keys, keydir_read) do
       {:ok, values} when is_list(values) and length(values) == length(keys) -> {:ok, values}
       :unavailable -> unavailable_catalog()
       {:error, _reason} -> unavailable_catalog()

@@ -1061,10 +1061,6 @@ defmodule Ferricstore.Store.ShardAccountingTest do
     CompoundMemberIndex.reset(table)
     CompoundMemberIndex.put(table, compound_key)
 
-    on_exit(fn ->
-      if :ets.info(table) != :undefined, do: :ets.delete(table)
-    end)
-
     table
   end
 end

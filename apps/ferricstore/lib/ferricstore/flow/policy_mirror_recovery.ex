@@ -7,6 +7,8 @@ defmodule Ferricstore.Flow.PolicyMirrorRecovery do
   alias Ferricstore.Flow.LMDBWriter.ProjectionOps
   alias Ferricstore.Store.BlobValue
 
+  require Logger
+
   @batch_size 512
   @max_u64 18_446_744_073_709_551_615
   @max_lmdb_key_bytes 511
@@ -580,7 +582,7 @@ defmodule Ferricstore.Flow.PolicyMirrorRecovery do
          {:ok, {_generation, %{type: ^type}}} <- RetryPolicy.decode_flow_policy_entry(value) do
       {:ok, [{:put, key, LMDB.encode_value(value, expire_at_ms)}]}
     else
-      _invalid -> {:error, :corrupt_flow_policy_mirror}
+      _invalid -> skip_corrupt_policy(key)
     end
   end
 
@@ -647,10 +649,26 @@ defmodule Ferricstore.Flow.PolicyMirrorRecovery do
   defp primary_ops(_kind, key, _value, _expire_at_ms),
     do: {:error, {:unsupported_policy_mirror_key, key}}
 
+  # Policy readers decode the source row and fail closed for its type, so one
+  # corrupt row must not stop the shard from starting. Its mirror is deleted so
+  # a stale valid copy cannot outlive the corrupt source.
+  defp skip_corrupt_policy(key) do
+    Logger.error("Flow policy recovery skipped a corrupt policy row: #{inspect(key)}")
+
+    :telemetry.execute(
+      [:ferricstore, :flow, :lmdb_rebuild, :corrupt_policy_skipped],
+      %{count: 1},
+      %{key: key}
+    )
+
+    {:ok, [{:delete, key}]}
+  end
+
   defp policy_projection_key(catalog_key, generation)
        when is_binary(catalog_key) and is_integer(generation) and generation >= 0 do
     with {:ok, descriptor_key} <- Keys.type_catalog_descriptor_key_from_member(catalog_key),
-         <<@descriptor_prefix::binary, type_digest::binary-size(43)>> <- descriptor_key,
+         <<@descriptor_prefix::binary, type_digest::binary>> <- descriptor_key,
+         true <- valid_digest?(type_digest),
          projection_key <-
            Keys.policy_catalog_projection_global_prefix() <>
              type_digest <> ":" <> <<generation::unsigned-big-64, catalog_key::binary>>,
@@ -700,11 +718,11 @@ defmodule Ferricstore.Flow.PolicyMirrorRecovery do
            byte_size(@attribute_member_prefix),
            byte_size(key) - byte_size(@attribute_member_prefix)
          ) do
-      <<name_digest::binary-size(43), ?:, type_digest::binary-size(43)>> ->
-        valid_digest?(name_digest) and valid_digest?(type_digest)
-
-      _invalid ->
-        false
+      pair ->
+        case String.split(pair, ":") do
+          [name_digest, type_digest] -> valid_digest?(name_digest) and valid_digest?(type_digest)
+          _invalid -> false
+        end
     end
   rescue
     ArgumentError -> false
@@ -717,17 +735,7 @@ defmodule Ferricstore.Flow.PolicyMirrorRecovery do
     ArgumentError -> false
   end
 
-  defp valid_digest?(digest) when is_binary(digest) and byte_size(digest) == 43 do
-    case Base.url_decode64(digest, padding: false) do
-      {:ok, decoded} when byte_size(decoded) == 32 ->
-        Base.url_encode64(decoded, padding: false) == digest
-
-      _invalid ->
-        false
-    end
-  end
-
-  defp valid_digest?(_digest), do: false
+  defp valid_digest?(digest), do: Keys.canonical_digest?(digest)
 
   defp valid_expiry?(expire_at_ms) do
     is_integer(expire_at_ms) and expire_at_ms >= 0 and expire_at_ms <= @max_u64

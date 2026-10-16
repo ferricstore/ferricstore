@@ -853,29 +853,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
            when is_map(patch) and is_boolean(replace?) do
         case FlowKeys.policy_type(key) do
           {:ok, type} ->
-            with {:ok, {stored_generation, stored_value}} <-
-                   flow_stored_policy_generation_strict(state, key),
-                 :ok <-
-                   flow_policy_expected_generation_matches(
-                     stored_generation,
-                     expected_generation
-                   ),
-                 {:ok, stored_policy} <- flow_decode_stored_policy(stored_value, type),
-                 policy_attrs <- PolicyPatch.policy_attrs(stored_policy, patch, replace?),
-                 {:ok, policy} <-
-                   RetryPolicy.normalize_flow_policy(
-                     type,
-                     policy_attrs,
-                     raft_apply_context(state)
-                   ),
-                 {:ok, migration_generation} <-
-                   flow_policy_strict_migration_high_water(state, type),
-                 high_water <- max(stored_generation, migration_generation),
-                 {:ok, generation} <-
-                   Ferricstore.Flow.PolicyMigration.next_generation(high_water),
-                 encoded <- RetryPolicy.encode_flow_policy(policy, generation),
-                 :ok <- do_flow_policy_put(state, key, encoded, 0) do
-              {:ok, encoded}
+            if replace? and flow_stored_policy_corrupt?(state, key, type) and
+                 flow_policy_repair_enabled?(state) do
+              flow_policy_repair_allocate(state, key, type, patch, expected_generation)
+            else
+              flow_policy_patch_allocate_stored(
+                state,
+                key,
+                type,
+                patch,
+                replace?,
+                expected_generation
+              )
             end
 
           :error ->
@@ -891,6 +880,117 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
              _expected_generation
            ),
            do: {:error, "ERR invalid flow policy patch"}
+
+      defp flow_policy_patch_allocate_stored(
+             state,
+             key,
+             type,
+             patch,
+             replace?,
+             expected_generation
+           ) do
+        with {:ok, {stored_generation, stored_value}} <-
+               flow_stored_policy_generation_strict(state, key),
+             :ok <-
+               flow_policy_expected_generation_matches(
+                 stored_generation,
+                 expected_generation
+               ),
+             {:ok, stored_policy} <- flow_decode_stored_policy(stored_value, type),
+             policy_attrs <- PolicyPatch.policy_attrs(stored_policy, patch, replace?),
+             {:ok, policy} <-
+               RetryPolicy.normalize_flow_policy(
+                 type,
+                 policy_attrs,
+                 raft_apply_context(state)
+               ),
+             {:ok, migration_generation} <-
+               flow_policy_strict_migration_high_water(state, type),
+             high_water <- max(stored_generation, migration_generation),
+             {:ok, generation} <-
+               Ferricstore.Flow.PolicyMigration.next_generation(high_water),
+             encoded <- RetryPolicy.encode_flow_policy(policy, generation),
+             :ok <- do_flow_policy_put(state, key, encoded, 0) do
+          {:ok, encoded}
+        end
+      end
+
+      # Feature level 1 (Ferricstore.Cluster.FeatureLevel): `replace` overwrites a
+      # stored row that is not a policy of its type. The new policy comes only from
+      # the patch. Its generation is above the corrupt row's own generation or, when
+      # that is unreadable, above this command's log index: every earlier generation
+      # of the type was allocated by an earlier command on this shard, one at a
+      # time, so none can reach the current index.
+      defp flow_policy_repair_allocate(state, key, type, patch, expected_generation) do
+        known_generation = flow_stored_policy_known_generation(state, key)
+
+        with {:ok, floor} <- flow_policy_repair_generation_floor(known_generation),
+             :ok <- flow_policy_repair_expected_generation(known_generation, expected_generation),
+             {:ok, policy} <-
+               RetryPolicy.normalize_flow_policy(
+                 type,
+                 PolicyPatch.policy_attrs(nil, patch, true),
+                 raft_apply_context(state)
+               ),
+             {:ok, migration_generation} <-
+               flow_policy_strict_migration_high_water(state, type),
+             {:ok, generation} <-
+               Ferricstore.Flow.PolicyMigration.next_generation(max(floor, migration_generation)),
+             encoded <- RetryPolicy.encode_flow_policy(policy, generation),
+             :ok <- do_flow_policy_put(state, key, encoded, 0) do
+          {:ok, encoded}
+        end
+      end
+
+      defp flow_policy_repair_generation_floor(generation) when is_integer(generation),
+        do: {:ok, generation}
+
+      defp flow_policy_repair_generation_floor(nil) do
+        case current_ra_index() do
+          index when is_integer(index) -> {:ok, index}
+          nil -> {:error, "ERR corrupt flow policy high-water"}
+        end
+      end
+
+      defp flow_policy_repair_expected_generation(_known_generation, nil), do: :ok
+
+      defp flow_policy_repair_expected_generation(known_generation, expected_generation)
+           when is_integer(known_generation),
+           do: flow_policy_expected_generation_matches(known_generation, expected_generation)
+
+      defp flow_policy_repair_expected_generation(nil, _expected_generation),
+        do: {:error, "ERR corrupt flow policy high-water"}
+
+      # Read through do_get so a hot or cold marker reads the same on every replica.
+      defp flow_policy_repair_enabled?(state),
+        do:
+          do_get(state, Ferricstore.Cluster.FeatureLevel.key(1)) ==
+            Ferricstore.Cluster.FeatureLevel.marker()
+
+      defp flow_stored_policy_corrupt?(state, key, type) do
+        case ets_lookup(state, key) do
+          {:hit, value, _expire_at_ms} when is_binary(value) ->
+            not match?(
+              {:ok, {_generation, %{type: ^type}}},
+              RetryPolicy.decode_flow_policy_entry(value)
+            )
+
+          {:hit, _invalid, _expire_at_ms} ->
+            true
+
+          _missing ->
+            false
+        end
+      end
+
+      defp flow_stored_policy_known_generation(state, key) do
+        with {:hit, value, _expire_at_ms} when is_binary(value) <- ets_lookup(state, key),
+             {:ok, {generation, _policy}} <- RetryPolicy.decode_flow_policy_entry(value) do
+          generation
+        else
+          _unreadable -> nil
+        end
+      end
 
       defp flow_decode_stored_policy(nil, _type), do: {:ok, nil}
 
@@ -932,6 +1032,69 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
              policy_generation,
              new_policy
            ) do
+        if flow_stored_policy_corrupt?(state, key, type) and flow_policy_repair_enabled?(state) do
+          flow_repair_versioned_policy_put(
+            state,
+            key,
+            value,
+            expire_at_ms,
+            type,
+            policy_generation,
+            new_policy
+          )
+        else
+          flow_apply_versioned_policy_put_stored(
+            state,
+            key,
+            value,
+            expire_at_ms,
+            type,
+            policy_generation,
+            new_policy
+          )
+        end
+      end
+
+      # Feature level 1: a stored copy that is not a policy of this type is
+      # replaced as if absent. Its contents are not trusted for attribute counts
+      # or migrations, and its generation is not a generation of this type.
+      defp flow_repair_versioned_policy_put(
+             state,
+             key,
+             value,
+             expire_at_ms,
+             type,
+             policy_generation,
+             new_policy
+           ) do
+        with {:ok, migration_generation} <-
+               flow_policy_strict_migration_high_water(state, type) do
+          if policy_generation > 0 and migration_generation > policy_generation do
+            :ok
+          else
+            flow_write_versioned_policy(
+              state,
+              key,
+              value,
+              expire_at_ms,
+              type,
+              policy_generation,
+              new_policy,
+              nil
+            )
+          end
+        end
+      end
+
+      defp flow_apply_versioned_policy_put_stored(
+             state,
+             key,
+             value,
+             expire_at_ms,
+             type,
+             policy_generation,
+             new_policy
+           ) do
         with {:ok, {stored_generation, stored_value}} <-
                flow_stored_policy_generation_strict(state, key),
              {:ok, migration_generation} <-
@@ -953,30 +1116,52 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
               {:error, "ERR conflicting flow policy generation"}
 
             true ->
-              old_indexed_key = flow_stored_policy_indexed_state_meta(stored_value)
-              new_indexed_key = RetryPolicy.indexed_state_meta(new_policy)
-              old_indexed_attributes = flow_stored_policy_indexed_attributes(stored_value)
-              new_indexed_attributes = RetryPolicy.indexed_attributes(new_policy)
+              flow_write_versioned_policy(
+                state,
+                key,
+                value,
+                expire_at_ms,
+                type,
+                policy_generation,
+                new_policy,
+                stored_value
+              )
+          end
+        end
+      end
 
-              with :ok <- do_put(state, key, value, expire_at_ms),
-                   :ok <-
-                     flow_update_policy_indexed_attribute_counts(
-                       state,
-                       type,
-                       old_indexed_attributes,
-                       new_indexed_attributes
-                     ) do
-                if old_indexed_key == new_indexed_key do
-                  :ok
-                else
-                  flow_enqueue_policy_migration(
-                    state,
-                    type,
-                    policy_generation,
-                    new_indexed_key
-                  )
-                end
-              end
+      defp flow_write_versioned_policy(
+             state,
+             key,
+             value,
+             expire_at_ms,
+             type,
+             policy_generation,
+             new_policy,
+             stored_value
+           ) do
+        old_indexed_key = flow_stored_policy_indexed_state_meta(stored_value)
+        new_indexed_key = RetryPolicy.indexed_state_meta(new_policy)
+        old_indexed_attributes = flow_stored_policy_indexed_attributes(stored_value)
+        new_indexed_attributes = RetryPolicy.indexed_attributes(new_policy)
+
+        with :ok <- do_put(state, key, value, expire_at_ms),
+             :ok <-
+               flow_update_policy_indexed_attribute_counts(
+                 state,
+                 type,
+                 old_indexed_attributes,
+                 new_indexed_attributes
+               ) do
+          if old_indexed_key == new_indexed_key do
+            :ok
+          else
+            flow_enqueue_policy_migration(
+              state,
+              type,
+              policy_generation,
+              new_indexed_key
+            )
           end
         end
       end

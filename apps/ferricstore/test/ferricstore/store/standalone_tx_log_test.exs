@@ -1379,6 +1379,76 @@ defmodule Ferricstore.Store.StandaloneTxLogTest do
     refute File.exists?(tx_log_path)
   end
 
+  test "abort reports recovery when neither the terminal nor the marker persist" do
+    data_dir = tmp_dir()
+    file_path = Path.join(data_dir, "shard_0/000000.data")
+    assert {:ok, txid} = StandaloneTxLog.prepare(data_dir, [{file_path, [{:put, "k", "v", 0}]}])
+
+    Application.put_env(:ferricstore, :standalone_tx_log_append_hook, fn _path, _payload, _max ->
+      {:error, :abort_append_eio}
+    end)
+
+    Application.put_env(:ferricstore, :standalone_tx_log_fsync_dir_hook, fn _path ->
+      {:error, :marker_fsync_eio}
+    end)
+
+    on_exit(fn ->
+      Application.delete_env(:ferricstore, :standalone_tx_log_append_hook)
+      Application.delete_env(:ferricstore, :standalone_tx_log_fsync_dir_hook)
+      :persistent_term.erase({StandaloneTxLog, :recovery_required, Path.expand(data_dir)})
+    end)
+
+    assert {:error, {:standalone_tx_abort_recovery_required, ^txid, _reason}} =
+             StandaloneTxLog.abort(data_dir, txid)
+
+    assert StandaloneTxLog.recovery_required?(data_dir)
+  end
+
+  test "the hot-path recovery fence does not re-expand a canonical data dir" do
+    data_dir = Path.expand(tmp_dir())
+
+    parent = self()
+
+    caller =
+      spawn(fn ->
+        receive do: (:go -> :ok)
+
+        send(
+          parent,
+          {:fenced, Enum.map(1..10, fn _ -> StandaloneTxLog.recovery_fenced?(data_dir) end)}
+        )
+      end)
+
+    :erlang.trace_pattern({Path, :expand, 1}, true, [:global])
+    :erlang.trace(caller, true, [:call])
+    on_exit(fn -> :erlang.trace_pattern({Path, :expand, 1}, false, [:global]) end)
+
+    send(caller, :go)
+    assert_receive {:fenced, fenced}
+    refute Enum.any?(fenced)
+
+    expansions =
+      Stream.repeatedly(fn ->
+        receive do
+          {:trace, _pid, :call, {Path, :expand, _args}} -> :expanded
+        after
+          50 -> :done
+        end
+      end)
+      |> Enum.take_while(&(&1 == :expanded))
+      |> length()
+
+    assert expansions == 0
+  end
+
+  test "the recovery fence key matches for equivalent data dir spellings" do
+    data_dir = Path.expand(tmp_dir())
+    on_exit(fn -> :persistent_term.erase({StandaloneTxLog, :recovery_required, data_dir}) end)
+    assert :ok = StandaloneTxLog.require_recovery(data_dir <> "/./", :spelling)
+    assert StandaloneTxLog.recovery_fenced?(data_dir)
+    assert StandaloneTxLog.recovery_fenced?(data_dir <> "/")
+  end
+
   test "prepare does not mutate persistent_term on the transaction hot path" do
     data_dir = tmp_dir()
     cache_key = {StandaloneTxLog, :recovery_required, Path.expand(data_dir)}

@@ -677,6 +677,13 @@ fn v2_transactional_mutation(
 ) -> Result<Vec<Option<Vec<u8>>>, String> {
     let (k, width, depth, _) = v2_read_header(file)?;
     let layout = topk_layout(k, width, depth)?;
+    let token = crate::prob_txn::effective_token(
+        file,
+        receipt_path,
+        token,
+        layout.token_offset,
+        layout.file_size,
+    )?;
     match crate::prob_txn::begin(
         file,
         receipt_path,

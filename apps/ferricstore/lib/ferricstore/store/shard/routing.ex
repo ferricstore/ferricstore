@@ -100,6 +100,9 @@ defmodule Ferricstore.Store.Shard.Routing do
           apply_context: state.apply_context,
           apply_context_encoded: state.apply_context_encoded,
           applied_count: 0,
+          # No Raft log here, so probabilistic mutations never replay and take
+          # the next token after the sidecar's own (see next_prob_mutation_token).
+          prob_local_mutations?: true,
           release_cursor_interval: state.release_cursor_interval,
           fetch_or_compute_locks: state.fetch_or_compute_locks,
           fetch_or_compute_lock_expiries: state.fetch_or_compute_lock_expiries,
@@ -764,7 +767,7 @@ defmodule Ferricstore.Store.Shard.Routing do
       defp clear_standalone_recovery_fence(state), do: state
 
       defp standalone_recovery_fenced?(%{data_dir: data_dir}) do
-        Ferricstore.Store.StandaloneTxLog.recovery_required?(data_dir)
+        Ferricstore.Store.StandaloneTxLog.recovery_fenced?(data_dir)
       end
 
       defp standalone_recovery_fenced?(_state), do: false

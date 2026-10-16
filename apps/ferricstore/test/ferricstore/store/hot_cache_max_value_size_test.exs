@@ -37,6 +37,33 @@ defmodule Ferricstore.Store.HotCacheMaxValueSizeTest do
   end
 
   describe "value above threshold" do
+    test "repeated large cold reads preserve LFU and disk metadata", %{
+      shard: shard,
+      keydir: keydir
+    } do
+      alias Ferricstore.Store.{LFU, Shard}
+      value = :binary.copy("x", @small_threshold + 100)
+      key = "large_lfu"
+      :ok = GenServer.call(shard, {:put, key, value, 0})
+      :ok = GenServer.call(shard, :flush)
+      [{^key, nil, exp, old_lfu, fid, off, vsize}] = :ets.lookup(keydir, key)
+      {minute, _counter} = LFU.unpack(old_lfu)
+      lfu = LFU.pack(minute, 200)
+      true = :ets.update_element(keydir, key, {4, lfu})
+      state = :sys.get_state(shard)
+
+      for _ <- 1..3 do
+        result = Shard.ETS.cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
+        assert [{^key, nil, ^exp, ^lfu, ^fid, ^off, ^vsize}] = :ets.lookup(keydir, key)
+        assert :ok = result
+      end
+
+      assert value == GenServer.call(shard, {:get, key})
+      [{^key, nil, ^exp, after_lfu, ^fid, ^off, ^vsize}] = :ets.lookup(keydir, key)
+      {_minute, counter} = LFU.unpack(after_lfu)
+      assert counter > 190
+    end
+
     test "large value is stored cold (nil) in ETS", %{shard: shard, keydir: keydir} do
       large_value = String.duplicate("x", @small_threshold + 1)
       :ok = GenServer.call(shard, {:put, "large", large_value, 0})

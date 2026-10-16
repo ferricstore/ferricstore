@@ -463,7 +463,15 @@ defmodule Ferricstore.Cluster.Manager do
   end
 
   defp do_join_node_remote_waraft(target_node, membership, state, ctx, replace?) do
-    with {:ok, target_has_data} <- Target.target_has_data?(target_node, state.shard_count),
+    # The feature level goes first: once a level is active, a target that cannot
+    # prove it supports it is refused for that reason before anything else.
+    with :ok <- Ferricstore.Cluster.FeatureLevel.validate_join_target(target_node, ctx),
+         :ok <-
+           Ferricstore.DataFormat.validate_join_target(
+             target_node,
+             Process.get(:ferricstore_cluster_manager_target_data_format_hook)
+           ),
+         {:ok, target_has_data} <- Target.target_has_data?(target_node, state.shard_count),
          :ok <- Target.validate_target_data_identity(target_node, ctx, target_has_data, replace?),
          {:ok, preexisting_membership} <- Target.target_membership_by_shard(target_node, state),
          :ok <-

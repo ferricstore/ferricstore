@@ -49,6 +49,9 @@ deadline and otherwise fails closed.
 - If a worker crashes, lease expiry or reclaim makes the Flow claimable again.
 - Handlers are normal application code and are not replayed by FerricFlow.
 - Side effects should be idempotent or guarded by application-level idempotency keys.
+- A corrupt Flow policy row does not stop a node from starting. Startup recovery
+  skips it and logs the key; reads and commands for that type keep failing with
+  `ERR flow policy is corrupt`, and other types are unaffected.
 
 ## Overload And Backpressure
 
@@ -145,6 +148,12 @@ Alert on sustained growth in:
 - Raft apply/release cursor gaps;
 - terminal retention backlog.
 - active timeout backlog or repeated timeout catch-up sweeps.
+
+Alert on any `[:ferricstore, :flow, :lmdb_rebuild, :corrupt_policy_skipped]`
+event: Flows of that type keep failing until the policy is repaired. Once the
+cluster runs at feature level 1 or higher, `flow_policy_set(type, replace: true,
+...)` replaces the corrupt row on every shard (see the deployment guide for
+raising the feature level).
 
 ## Starting Points
 
