@@ -470,6 +470,10 @@ defmodule Ferricstore.OperationalGuardTest do
        telemetry_fun: fn _event, _measurements, _metadata -> :ok end}
     )
 
+    # init only queues the first check; wait for it so the assertions see its
+    # result rather than the state before the guard looked at memory.
+    _ = :sys.get_state(name)
+
     assert Admission.reject_new_creates?()
     assert Admission.status().reason == :rss_pressure
     assert OperationalGuard.reject_flow_creates?()
