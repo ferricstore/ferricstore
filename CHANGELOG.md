@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Update the WARaft dependency (`ferricstore_waraft`) to 0.1.1. A replica now
+  grants a vote only after its term and vote are durably on disk (fsynced
+  before the rename, and the directory after it), so a crash cannot let it
+  vote twice in one term; a disabled replica keeps retrying to persist its
+  disable reason instead of coming back enabled after a restart; and a leader's
+  commit batch deadline survives heartbeat rescheduling.
 - New data directories use 128-bit Flow key digests (22 characters instead of
   43), about 1.7 KB less disk and 360 B less keydir memory per flow. They also
   store each Flow record's sidecar (child groups, attributes, value refs,
