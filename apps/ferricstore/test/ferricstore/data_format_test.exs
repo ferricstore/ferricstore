@@ -52,7 +52,8 @@ defmodule Ferricstore.DataFormatTest do
     assert DataFormat.resolve!(dir) == 1
 
     File.write!(DataFormat.marker_path(dir), "2\n")
-    assert_raise RuntimeError, ~r/data_format/, fn -> DataFormat.resolve!(dir) end
+    error = assert_raise RuntimeError, ~r/data_format/, fn -> DataFormat.resolve!(dir) end
+    assert_points_to_export_restore(error)
   end
 
   test "an unreadable marker stops the boot", %{dir: dir} do
@@ -65,7 +66,19 @@ defmodule Ferricstore.DataFormatTest do
     assert File.read!(DataFormat.marker_path(dir)) == "#{DataFormat.current()}\n"
 
     File.write!(DataFormat.marker_path(dir), "#{other_format()}\n")
-    assert_raise RuntimeError, ~r/data_format/, fn -> DataFormat.ensure_node_format!(dir) end
+
+    error =
+      assert_raise RuntimeError, ~r/data_format/, fn -> DataFormat.ensure_node_format!(dir) end
+
+    assert_points_to_export_restore(error)
+  end
+
+  # A mismatch error must name the migration path that exists: export from the
+  # old cluster and restore into a new one.
+  defp assert_points_to_export_restore(%RuntimeError{message: message}) do
+    assert message =~ "FerricStore.export/2"
+    assert message =~ "FerricStore.restore/2"
+    refute message =~ "FerricStore.Upgrade"
   end
 
   test "an embedded instance does not start on a data dir in another format", %{dir: dir} do

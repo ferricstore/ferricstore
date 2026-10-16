@@ -7,8 +7,10 @@ defmodule Ferricstore.DataFormat do
     * Format 2 - Flow keys carry the first 16 bytes (22 characters).
 
   A node runs in its data directory's format (see `Ferricstore.Flow.Digest`), so
-  format 1 directories keep working unchanged; `FerricStore.Upgrade` converts
-  one to format 2. Every member of a cluster must use the same format.
+  format 1 directories keep working unchanged. Data moves to format 2 by
+  exporting it with `FerricStore.export/2` and restoring it into a new cluster
+  with `FerricStore.restore/2` (see "Moving Data to Format 2" in the deployment
+  guide). Every member of a cluster must use the same format.
   """
 
   alias Ferricstore.Flow.Digest
@@ -55,7 +57,9 @@ defmodule Ferricstore.DataFormat do
         :ok
 
       other ->
-        raise "data dir #{data_dir} is data_format #{other} but this node runs data_format #{current}; use FerricStore.Upgrade to convert it"
+        raise "data dir #{data_dir} is data_format #{other} but this node runs data_format #{current}; " <>
+                "to move its data, export it with FerricStore.export/2 and restore it into a " <>
+                "data dir of this format with FerricStore.restore/2"
     end
   end
 
@@ -155,7 +159,9 @@ defmodule Ferricstore.DataFormat do
         :ok
 
       other ->
-        raise "data_format setting #{inspect(other)} does not match the data dir's format #{format}; use FerricStore.Upgrade to convert"
+        raise "data_format setting #{inspect(other)} does not match the data dir's format #{format}; " <>
+                "the setting only applies to new data dirs. To move the data, export it with " <>
+                "FerricStore.export/2 and restore it into a new data dir with FerricStore.restore/2"
     end
   end
 end
