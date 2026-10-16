@@ -12,7 +12,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StartupStorageDeadline do
         previous_budget = Application.get_env(:ferricstore, :waraft_start_wait_timeout_ms)
         previous_hook = Application.get_env(:ferricstore, :waraft_storage_fsync_dir_hook)
         Application.put_env(:wa_raft, :raft_storage_call_timeout, 50)
-        Application.put_env(:ferricstore, :waraft_start_wait_timeout_ms, 1_000)
+        # The budget only has to exceed the 250 ms stall below; startup itself
+        # (including the durable term/vote writes) can take most of a second on
+        # a slow CI disk, so leave it room.
+        Application.put_env(:ferricstore, :waraft_start_wait_timeout_ms, 5_000)
         once = :atomics.new(1, signed: false)
         parent = self()
 
@@ -33,7 +36,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StartupStorageDeadline do
 
         try do
           assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
-          assert_receive {:bootstrap_storage_timeout, 1_000}
+          assert_receive {:bootstrap_storage_timeout, 5_000}
           assert Application.get_env(:wa_raft, :raft_storage_call_timeout) == 50
           assert :ok = WARaftBackend.write(0, {:put, "startup:deadline", "value", 0})
         after
