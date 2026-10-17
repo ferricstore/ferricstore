@@ -4,6 +4,23 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Stop Flows that never finish, such as schedules, from growing the keydir
+  without bound. Every change to a Flow's payload, result or error writes the
+  value under a new version, with a retention cleanup member (a hot keydir row)
+  for it. Members were removed only when a finished Flow was pruned, so each
+  schedule fire added one for good, until the memory guard refused new Flows.
+  - At cluster feature level 2 (raise it with `CLUSTER.FEATURES.RAISE 2` once
+    every node runs this release), a background worker deletes the values that
+    a running Flow's remaining history and its record no longer refer to,
+    together with their members. Flows keeping more than 1,000 history events
+    keep their values.
+  - At level 2, a rewind to an event whose values were deleted fails with
+    `ERR flow rewind target event not found`, as for a trimmed event.
+  - A schedule's own Flow keeps 100 history events
+    (`:flow_schedule_history_max_events`). At level 2, a schedule created with
+    a longer history takes the shorter one on its next fire, and the worker
+    then deletes the values and members the trimmed history held.
+
 ## 0.12.1 - 2026-10-17
 
 - Stop WARaft log trims from stalling writes. Every 50k entries a trim rewrote

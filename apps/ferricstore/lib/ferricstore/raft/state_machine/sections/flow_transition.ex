@@ -91,12 +91,29 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                  run_at_ms,
                  now_ms
                ),
+             next = flow_reschedule_history_window(state, record, next, attrs),
              next = flow_stamp_state_enter_seq_on_change(state, record, next),
              next = flow_refresh_indexed_attributes(state, next),
              :ok <- flow_require_fifo_entry(state, attrs, next, true) do
           flow_apply_reschedule(state, record, next, partition_key, now_ms, attrs)
         end
       end
+
+      # Feature level 2: an internal reschedule may lower the Flow's history
+      # window, so a schedule created with a longer one takes the current one.
+      # It never raises the window or goes below the hot window.
+      defp flow_reschedule_history_window(state, record, next, %{history_max_events: max})
+           when is_integer(max) and max > 0 do
+        current = Map.get(record, :history_max_events)
+        hot = Map.get(record, :history_hot_max_events)
+
+        if (is_nil(current) or (is_integer(current) and max < current)) and
+             (not is_integer(hot) or max >= hot) and flow_history_release_active?(state),
+           do: Map.put(next, :history_max_events, max),
+           else: next
+      end
+
+      defp flow_reschedule_history_window(_state, _record, next, _attrs), do: next
 
       defp do_flow_schedule_replace(state, %{mode: :claim} = attrs) do
         id = Map.fetch!(attrs, :id)

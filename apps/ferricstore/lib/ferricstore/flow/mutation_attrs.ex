@@ -176,6 +176,16 @@ defmodule Ferricstore.Flow.MutationAttrs do
     end
   end
 
+  # A reschedule may lower the history window only for internal callers: a
+  # schedule moving to a shorter window (applied at feature level 2).
+  defp optional_internal_history_max_events(opts) do
+    cond do
+      not Keyword.has_key?(opts, :history_max_events) -> {:ok, nil}
+      Internal.allowed?(opts) -> optional_history_max_events(opts)
+      true -> {:error, "ERR flow history_max_events is set when the flow is created"}
+    end
+  end
+
   def start_and_claim_attrs(id, type, initial_state, opts) do
     with :ok <- validate_opts(opts, return: true),
          :ok <- reject_start_and_claim_create_opts(opts),
@@ -478,7 +488,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
          {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, nil),
          {:ok, priority} <- optional_priority_or_nil(opts),
          {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts),
-         {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
+         {:ok, state_meta} <- StateMeta.update_from_opts(opts),
+         {:ok, history_max_events} <- optional_internal_history_max_events(opts) do
       partition_key_explicit? = not is_nil(partition_key)
 
       attrs =
@@ -491,6 +502,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
           run_at_ms: run_at_ms
         }
         |> maybe_put_attr(:priority, priority)
+        |> maybe_put_attr(:history_max_events, history_max_events)
         |> maybe_put_default_attr(:partition_key_explicit, partition_key_explicit?, true)
         |> maybe_put_flow_value(opts, :payload)
         |> maybe_put_flow_value_ref(opts, :payload_ref)
