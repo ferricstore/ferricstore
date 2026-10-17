@@ -42,6 +42,14 @@ defmodule Ferricstore.Store.Shard.RotationFsyncTest do
       active_path = Path.join(tmp, "00000.log")
       File.touch!(active_path)
 
+      # Rotation hands the old file's hint to the shard's HintBuilder, which
+      # writes it into `tmp` later. Hold the builder, as a busy one would be, so
+      # the hint lands after the rotation checks below.
+      builder = Process.whereis(Ferricstore.Store.HintBuilder.process_name(0, nil))
+      assert is_pid(builder)
+      :ok = :sys.suspend(builder)
+      on_exit(fn -> :sys.resume(builder) end)
+
       state = %{
         index: 0,
         shard_data_path: tmp,
@@ -80,6 +88,13 @@ defmodule Ferricstore.Store.Shard.RotationFsyncTest do
 
       assert old_idx < new_idx,
              "old_file fsync must precede new_dir fsync; got events: #{inspect(events)}"
+
+      :ok = :sys.resume(builder)
+
+      # Wait for the builder to finish this test's hint (casts from this process
+      # are handled in order), so cleanup does not remove `tmp` while it writes.
+      _builder_state = :sys.get_state(builder)
+      assert File.exists?(Path.join(tmp, "00000.hint"))
     end
   end
 
