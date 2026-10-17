@@ -165,8 +165,13 @@ defmodule Ferricstore.Raft.CommandCodecTest do
 
   defp data_dir, do: FerricStore.Instance.get(:default).data_dir
 
-  defp log_commands(dir) do
-    {:ok, commands} =
+  # The default instance keeps appending in the background (expiry and
+  # schedules left by earlier tests), so this scan can reach a record whose
+  # append is still in flight. On macOS CI runners that shows up as a CRC
+  # mismatch at the log tail; the append lands within moments, so retry
+  # briefly. Lasting corruption still fails the match below.
+  defp log_commands(dir, attempts \\ 50) do
+    result =
       :ferricstore_waraft_spike_segment_log.fold_disk(
         String.to_charlist(dir),
         fn
@@ -176,7 +181,14 @@ defmodule Ferricstore.Raft.CommandCodecTest do
         []
       )
 
-    commands
+    case result do
+      {:error, {:crc_mismatch, _offset}} when attempts > 1 ->
+        Process.sleep(20)
+        log_commands(dir, attempts - 1)
+
+      {:ok, commands} ->
+        commands
+    end
   end
 
   defp random_term(depth) do

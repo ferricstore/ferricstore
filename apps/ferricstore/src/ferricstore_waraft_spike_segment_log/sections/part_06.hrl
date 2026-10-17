@@ -754,6 +754,26 @@ projection_overlap_result(_Other) ->
     unknown.
 
 segment_append_kind(Path) ->
+    case erlang:get(?APPEND_KIND_CACHE) of
+        {Path, Kind} ->
+            Kind;
+        _Other ->
+            Kind = segment_append_kind_uncached(Path),
+            erlang:put(?APPEND_KIND_CACHE, {Path, Kind}),
+            Kind
+    end.
+
+cached_dirname(Path) ->
+    case erlang:get(?DIRNAME_CACHE) of
+        {Path, Dir} ->
+            Dir;
+        _Other ->
+            Dir = filename:dirname(Path),
+            erlang:put(?DIRNAME_CACHE, {Path, Dir}),
+            Dir
+    end.
+
+segment_append_kind_uncached(Path) ->
     Parts = filename:split(Path),
     case {lists:member("apply_projection_log", Parts), lists:member("segment_projection_log", Parts)} of
         {true, _} -> apply_projection;

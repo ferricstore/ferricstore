@@ -33,6 +33,7 @@
     memory_status/1,
     ensure_segment_config/1,
     write_projection/3,
+    promote_projection/2,
     write_projection_batch/3,
     write_projection_batches/2,
     write_projection_batches_sync/2,
@@ -86,6 +87,11 @@
 -define(MEMORY_REGISTRY, ferricstore_waraft_segment_log_memory_registry).
 -define(LOAD_CONTEXT, ferricstore_waraft_segment_log_load_context).
 -define(FOLD_CONTEXT, ferricstore_waraft_segment_log_fold_context).
+%% Single-entry caches for pure path derivations. Scans and rewrites ask for
+%% them once per record with the same path, and filename:split/1 and
+%% filename:dirname/1 walk the whole charlist path on every call.
+-define(APPEND_KIND_CACHE, ferricstore_waraft_segment_append_kind_cache).
+-define(DIRNAME_CACHE, ferricstore_waraft_segment_dirname_cache).
 -define(FOLD_LOCATION, ferricstore_waraft_segment_log_fold_location).
 -define(DEFAULT_MAX_ETS_BYTES, 536870912).
 -define(DEFAULT_MAX_ETS_ENTRIES, 65536).

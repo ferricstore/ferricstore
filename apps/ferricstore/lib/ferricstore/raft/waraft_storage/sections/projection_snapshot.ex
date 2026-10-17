@@ -103,23 +103,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
         end
       end
 
-      defp relocate_segment_projection_row(
-             keydir,
-             projection_root,
-             projection_index,
-             relocation
-           ) do
-        with {:ok, projection_offset} <-
-               projection_record_location(projection_root, projection_index) do
-          relocate_segment_projection_row_at(
-            keydir,
-            projection_index,
-            projection_offset,
-            relocation
-          )
-        end
-      end
-
       defp relocate_segment_projection_row_at(
              keydir,
              projection_index,
@@ -142,10 +125,29 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
              key,
              projected_value,
              expire_at_ms,
+             {key, _original_value, expire_at_ms, _original_lfu, _original_file_id,
+              _original_offset, _original_value_size} = original_row,
+             projection_index,
+             projection_offset
+           ) do
+        compare_and_relocate_segment_projection_row_sized(
+          keydir,
+          original_row,
+          projection_index,
+          projection_offset,
+          segment_projected_value_size(projected_value)
+        )
+      end
+
+      # Points the row at its projection record only if nobody changed it since
+      # it was read, keeping a cached hot value.
+      defp compare_and_relocate_segment_projection_row_sized(
+             keydir,
              {key, original_value, expire_at_ms, _original_lfu, original_file_id, original_offset,
               original_value_size},
              projection_index,
-             projection_offset
+             projection_offset,
+             projected_value_size
            ) do
         case :ets.lookup(keydir, key) do
           [
@@ -156,8 +158,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
               :ets.insert(
                 keydir,
                 {key, current_value, expire_at_ms, current_lfu,
-                 {:waraft_projection, projection_index}, projection_offset,
-                 segment_projected_value_size(projected_value)}
+                 {:waraft_projection, projection_index}, projection_offset, projected_value_size}
               )
             end
 

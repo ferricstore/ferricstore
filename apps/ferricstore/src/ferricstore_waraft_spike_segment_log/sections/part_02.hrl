@@ -118,22 +118,38 @@ trim(#raft_log{name = Name} = Log, Index, State) ->
     %% The Raft segment is the Bitcask payload location. Before trimming those
     %% records, the storage layer must persist a projection checkpoint so cold
     %% keydir rows can still be rebuilt/read.
+    %% The storage layer may defer the trim while a background checkpoint is
+    %% prepared; WARaft allows trims to run behind, so keep the entries and
+    %% report success. The durable trim floor bounds how far a trim may run
+    %% behind (the in-memory view is a bounded cache, not the floor).
     Dir = log_dir(Log),
     {_FirstBefore, LastBefore} = memory_boundaries(Name, Dir),
-    case prepare_segment_projection_for_trim(Dir, Index) of
+    Floor = case logical_trim_floor_result(Dir) of
+        {ok, TrimFloor} -> TrimFloor;
+        {error, _FloorReason} -> none
+    end,
+    case prepare_segment_projection_for_trim(Dir, Index, Floor) of
+        deferred ->
+            {ok, State};
         ok ->
-            case check_append_failure_marker(Dir) of
+            trim_to(Log, Name, Dir, Index, LastBefore, State);
+        {trimmed_to, Adopted} ->
+            %% A checkpoint covered only part of the request; keep [Adopted, Index).
+            trim_to(Log, Name, Dir, Adopted, LastBefore, State);
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+trim_to(Log, Name, Dir, Index, LastBefore, State) ->
+    case check_append_failure_marker(Dir) of
+        ok ->
+            case write_logical_trim_floor(Dir, Index) of
                 ok ->
-                    case write_logical_trim_floor(Dir, Index) of
-                        ok ->
-                            delete_before(Name, Index),
-                            clear_offset_registry_before(Dir, Index),
-                            set_memory_boundaries_and_refresh(Name, Dir, Index, LastBefore),
-                            rebuild_latest_config_cache(Log, Name, Dir),
-                            {ok, State};
-                        {error, _Reason} = Error ->
-                            Error
-                    end;
+                    delete_before(Name, Index),
+                    clear_offset_registry_before(Dir, Index),
+                    set_memory_boundaries_and_refresh(Name, Dir, Index, LastBefore),
+                    rebuild_latest_config_cache(Log, Name, Dir),
+                    {ok, State};
                 {error, _Reason} = Error ->
                     Error
             end;
@@ -141,10 +157,17 @@ trim(#raft_log{name = Name} = Log, Index, State) ->
             Error
     end.
 
-prepare_segment_projection_for_trim(Dir, Index) ->
+prepare_segment_projection_for_trim(Dir, Index, FirstIndex) ->
     RootDir = unicode:characters_to_binary(filename:dirname(Dir)),
-    try 'Elixir.Ferricstore.Raft.WARaftStorage':prepare_segment_projection_for_trim(RootDir, Index) of
+    First = case FirstIndex of
+        N when is_integer(N), N >= 0 -> N;
+        _Unknown -> none
+    end,
+    try 'Elixir.Ferricstore.Raft.WARaftStorage':prepare_segment_projection_for_trim(RootDir, Index, First) of
         ok -> ok;
+        deferred -> deferred;
+        {trimmed_to, Adopted} when is_integer(Adopted), Adopted >= 0, Adopted < Index ->
+            {trimmed_to, Adopted};
         {error, _Reason} = Error -> Error;
         Other -> {error, {prepare_segment_projection_for_trim, Other}}
     catch

@@ -4,6 +4,26 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Stop WARaft log trims from stalling writes. Every 50k entries a trim rewrote
+  each live key into the segment projection inside the Raft commit path, so
+  write pauses grew with the dataset (several seconds at a few hundred thousand
+  keys per shard, past the 10 s write timeout around a million keys).
+  - Background checkpoints now cut a consistent snapshot by copying the keydir
+    while storage briefly holds its applies. Before, a checkpoint was discarded
+    whenever a write landed during its scan, so it never succeeded under
+    sustained writes.
+  - A trim adopts the finished checkpoint by renaming it into place and moving
+    keydir rows from an in-memory table. It no longer rewrites or rereads the
+    projection.
+  - Without a usable checkpoint a trim is deferred (the log keeps its entries)
+    and asks for one. A trim may also adopt a checkpoint that covers only part
+    of the request. Past
+    `:waraft_segment_projection_trim_max_deferred_entries` entries behind the
+    log floor (default 1,000,000; 0 never defers) a trim rebuilds the
+    projection synchronously as before.
+  - In a 256-writer unique-key run that reached 1.8M keys, the worst write
+    pause dropped from more than 10 s to under 0.6 s.
+
 ## 0.12.0 - 2026-10-16
 
 - Upgrading from 0.11.x: upgrade nodes one at a time. Existing data

@@ -515,27 +515,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
 
       defp segment_record_offset(_sm_state, _position), do: 0
 
-      defp projection_record_location(projection_root, projection_index)
-           when is_binary(projection_root) and is_integer(projection_index) and
-                  projection_index > 0 do
-        case :ferricstore_waraft_spike_segment_log.location_for_index(
-               to_charlist(projection_root),
-               projection_index
-             ) do
-          {:ok, {_ordinal, offset, _encoded_size}} when is_integer(offset) and offset >= 0 ->
-            {:ok, offset}
-
-          :not_found ->
-            {:error, {:missing_segment_projection_offset, projection_index}}
-
-          {:error, reason} ->
-            {:error, {:segment_projection_offset_failed, projection_index, reason}}
-        end
-      end
-
-      defp projection_record_location(_projection_root, projection_index),
-        do: {:error, {:bad_segment_projection_index, projection_index}}
-
       defp apply_state_machine_command(command, position, sm_state) do
         meta = meta_from_position(position)
 
