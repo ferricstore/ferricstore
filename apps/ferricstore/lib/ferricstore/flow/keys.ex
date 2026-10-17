@@ -169,6 +169,13 @@ defmodule Ferricstore.Flow.Keys do
     retention_cleanup_member_prefix(id, partition_key) <> digest(owned_key)
   end
 
+  @doc false
+  # The oldest history version any value release of the Flow kept (see
+  # Ferricstore.Flow.HistoryValueRelease).
+  def history_release_floor_key(id, partition_key \\ nil) when is_binary(id) do
+    "f:" <> tag(partition_key) <> ":hrf:" <> id
+  end
+
   def shared_value_ref_backfill_key(shard_index)
       when is_integer(shard_index) and shard_index >= 0 do
     "f:" <> @global_tag <> ":svb:1:" <> Integer.to_string(shard_index)

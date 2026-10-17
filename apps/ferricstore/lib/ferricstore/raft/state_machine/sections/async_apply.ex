@@ -1321,6 +1321,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         end)
       end
 
+      defp apply_single(state, {:flow_history_release_values, _key, attrs}) do
+        apply_flow_single_with_telemetry(state, :flow_history_release_values, attrs, fn ->
+          do_flow_history_release_values(state, attrs)
+        end)
+      end
+
       # -- Probabilistic data structure commands in batch/cross_shard_tx --
 
       defp apply_single(state, {:bloom_create, key, num_bits, num_hashes, prob_meta}) do

@@ -1028,6 +1028,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
                  :ok <- do_delete(state, state_key),
                  :ok <- flow_release_shared_value_refs(state, record),
                  :ok <- do_delete(state, guard_key),
+                 :ok <- flow_history_delete_release_floor(state, record),
                  :ok <-
                    flow_index_delete_members(
                      state,

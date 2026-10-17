@@ -138,7 +138,8 @@ defmodule FerricStore.Instance.Supervisor do
           Supervisor.child_spec(
             {Ferricstore.Flow.RetentionSweeper, sweeper_opts},
             id: :"#{name}.FlowRetentionSweeper"
-          )
+          ),
+          {Ferricstore.Flow.HistoryValueRelease.Worker, instance_ctx: ctx}
         ]
       end
 

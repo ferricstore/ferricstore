@@ -18,6 +18,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
       alias Ferricstore.Flow.HistoryProjector
+      alias Ferricstore.Flow.HistoryValueRelease
       alias Ferricstore.Flow.Locator
       alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
       alias Ferricstore.Flow.Keys, as: FlowKeys
@@ -50,6 +51,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
         with :ok <- flow_history_trim(state, record),
              :ok <- maybe_queue_terminal_lmdb_history_indexes(state, record) do
           Ferricstore.Flow.Scheduler.notify_target_terminal(state.instance_ctx, record)
+          HistoryValueRelease.notify(state.instance_ctx, state.shard_index, record)
           :ok
         end
       end

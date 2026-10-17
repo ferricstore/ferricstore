@@ -508,10 +508,10 @@ After every node runs the new release, check and raise the level:
 
 ```bash
 bin/ferricstore rpc 'IO.inspect(FerricStore.cluster_feature_level())'
-# {:ok, %{supported: 1, active: 0, shards: [0, 0, 0, 0]}}
+# {:ok, %{supported: 2, active: 0, shards: [0, 0, 0, 0]}}
 
-bin/ferricstore rpc 'IO.inspect(FerricStore.raise_cluster_feature_level(1))'
-# {:ok, %{supported: 1, active: 1, shards: [1, 1, 1, 1]}}
+bin/ferricstore rpc 'IO.inspect(FerricStore.raise_cluster_feature_level(2))'
+# {:ok, %{supported: 2, active: 2, shards: [2, 2, 2, 2]}}
 ```
 
 The same from a client (both commands need the `@admin` ACL category, and
@@ -519,14 +519,14 @@ The same from a client (both commands need the `@admin` ACL category, and
 
 ```text
 > CLUSTER.FEATURES
-supported: 1
+supported: 2
 active: 0
 shard_0: 0
 ...
-> CLUSTER.FEATURES.RAISE 1
-supported: 1
-active: 1
-shard_0: 1
+> CLUSTER.FEATURES.RAISE 2
+supported: 2
+active: 2
+shard_0: 2
 ...
 ```
 
@@ -534,6 +534,12 @@ shard_0: 1
   returns `{:error, {:members_below_feature_level, level, [{node, supported}]}}`;
   if a node is unreachable it returns `{:error, {:feature_level_probe_failed, ...}}`.
   Nothing changes in either case.
+- Each level turns on:
+  - 1: `flow_policy_set(type, replace: true, ...)` repairs a corrupt stored
+    policy.
+  - 2: running Flows, schedules included, release the values their trimmed
+    history no longer refers to (without it a schedule's keydir grows with every
+    fire), and rewinds refuse events whose values were released.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.

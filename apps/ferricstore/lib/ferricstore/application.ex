@@ -302,6 +302,7 @@ defmodule Ferricstore.Application do
             {Ferricstore.OperationalGuard, instance_ctx: default_ctx},
             {Ferricstore.Flow.Scheduler, ctx: default_ctx},
             {Ferricstore.Flow.RetentionSweeper, instance_ctx: default_ctx},
+            {Ferricstore.Flow.HistoryValueRelease.Worker, instance_ctx: default_ctx},
             {Ferricstore.Flow.PolicyMigrationWorker, instance_ctx: default_ctx},
             {Ferricstore.Store.BlobGCSweeper, instance_ctx: default_ctx},
             {Ferricstore.MemoryGuard, memory_guard_opts()},

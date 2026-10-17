@@ -2885,6 +2885,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
+      def apply(meta, {:flow_history_release_values, _key, attrs}, state) when is_map(attrs) do
+        apply_flow_pending_with_time(meta, state, :flow_history_release_values, attrs, fn ->
+          do_flow_history_release_values(state, attrs)
+        end)
+      end
+
       # ---------------------------------------------------------------------------
       # HLC-wrapped commands (spec 2G.6)
       #

@@ -46,6 +46,10 @@ defmodule Ferricstore.Flow.Schedule do
   @schedule_event_failed_planning "schedule_failed_planning"
   @schedule_event_deleted "schedule_deleted"
   @partition_buckets 256
+  # A schedule's own history records its fires; nothing reads far back in it. Each fire
+  # writes two or three events, so this keeps roughly the last forty fires, and with
+  # them the definition versions that history refers to.
+  @default_history_max_events 100
   @cron_search_minutes 8 * 366 * 24 * 60
   @default_definition_max_bytes 32 * 1024
   @default_inline_value_max_bytes 8 * 1024
@@ -96,6 +100,11 @@ defmodule Ferricstore.Flow.Schedule do
 
   @type schedule_id :: binary()
 
+  @doc "The history window of a schedule's own Flow."
+  @spec history_max_events() :: pos_integer()
+  def history_max_events,
+    do: env_pos_integer(:flow_schedule_history_max_events, @default_history_max_events)
+
   @spec create(FerricStore.Instance.t(), schedule_id(), keyword()) ::
           {:ok, map()} | {:error, binary()}
   def create(ctx, id, opts) when is_binary(id) and is_list(opts) do
@@ -114,6 +123,7 @@ defmodule Ferricstore.Flow.Schedule do
           type: @schedule_type,
           state: @active_state,
           partition_key: partition_key(id),
+          history_max_events: history_max_events(),
           schedule_metadata: Metadata.from_definition(definition),
           payload: definition,
           run_at_ms: Map.fetch!(definition, :next_run_at_ms),
@@ -734,6 +744,8 @@ defmodule Ferricstore.Flow.Schedule do
         fencing_token: Map.fetch!(record, :fencing_token),
         payload: Map.fetch!(plan, :definition),
         run_at_ms: Map.fetch!(plan, :run_at_ms),
+        # Schedules created with a longer history take this one (feature level 2).
+        history_max_events: history_max_events(),
         now_ms: now_ms
       )
     )
@@ -2115,7 +2127,8 @@ defmodule Ferricstore.Flow.Schedule do
     Cron.next_run_at_ms(expr, after_ms, timezone, @cron_search_minutes)
   end
 
-  defp partition_key(id) do
+  @doc false
+  def partition_key(id) do
     bucket = :erlang.phash2(id, @partition_buckets)
     "__ferricstore_schedule__:" <> Integer.to_string(bucket)
   end

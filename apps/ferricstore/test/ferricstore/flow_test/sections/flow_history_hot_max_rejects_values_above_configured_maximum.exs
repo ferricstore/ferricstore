@@ -298,6 +298,38 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfi
                  FerricStore.flow_rewind(id, to_event: "999999-0")
       end
 
+      # A claim event records the Flow running under a lease. Rewinding to it would
+      # make a running Flow without a lease owner, which only a claim can create.
+      test "flow_rewind refuses an event recorded while the Flow was claimed" do
+        id = uid("flow-rewind-claimed")
+        assert {:ok, _} = flow_create_and_get(id, type: "rewind-claimed", run_at_ms: 1_000)
+
+        assert {:ok, [claimed]} =
+                 FerricStore.flow_claim_due("rewind-claimed",
+                   worker: "worker-a",
+                   lease_ms: 30_000,
+                   limit: 1,
+                   now_ms: 1_000
+                 )
+
+        assert :ok =
+                 FerricStore.flow_transition(id, "running", "queued",
+                   lease_token: claimed.lease_token,
+                   fencing_token: claimed.fencing_token,
+                   run_at_ms: 5_000,
+                   now_ms: 1_001
+                 )
+
+        assert {:ok, events} = FerricStore.flow_history(id, count: 10)
+        claim_events = for {event_id, %{"event" => "claimed"}} <- events, do: event_id
+        assert [claimed_event_id] = claim_events
+
+        assert {:error, "ERR flow running state is only entered by FLOW.CLAIM_DUE"} =
+                 FerricStore.flow_rewind(id, to_event: claimed_event_id, now_ms: 1_002)
+
+        assert {:ok, %{state: "queued"}} = FerricStore.flow_get(id)
+      end
+
       test "flow_rewind rejects parent and child flows" do
         parent = uid("flow-rewind-parent")
         child = uid("flow-rewind-child")
