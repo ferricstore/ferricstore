@@ -266,6 +266,28 @@ defmodule Ferricstore.Store.ShardETSTest do
     end
   end
 
+  test "cold-read completion warms rows stored in the WARaft log and projections" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+
+    state = %{
+      keydir: keydir,
+      instance_ctx: %{hot_cache_max_value_size: 64}
+    }
+
+    try do
+      for kind <- [:waraft_segment, :waraft_projection, :waraft_apply_projection] do
+        key = "ets:cold:#{kind}"
+        location = {kind, 42}
+        :ets.insert(keydir, {key, nil, 0, LFU.initial(), location, 0, 3})
+
+        assert true == ShardETS.cold_read_warm_ets(state, key, "old", 0, location, 0, 3)
+        assert [{^key, "old", 0, _lfu, ^location, 0, 3}] = :ets.lookup(keydir, key)
+      end
+    after
+      :ets.delete(keydir)
+    end
+  end
+
   test "warm lookup reports malformed cold location without deleting the live row" do
     keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
     key = "ets:cold:bad-offset"
