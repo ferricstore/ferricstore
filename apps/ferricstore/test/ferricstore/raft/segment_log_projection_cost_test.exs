@@ -68,6 +68,55 @@ defmodule Ferricstore.Raft.SegmentLogProjectionCostTest do
     assert scan_reads >= records, "#{scan_reads} scan reads for #{records} records"
   end
 
+  test "a projection write reports every record's location from its verify pass" do
+    # A background checkpoint needs each entry's location for the trim that
+    # adopts it. write_projection already reads everything back once to verify
+    # it; reading it again for the locations doubled a checkpoint's disk work.
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "segment_projection_visit_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(root) end)
+    File.mkdir_p!(root)
+
+    records = 500
+    position = {:raft_log_pos, records, 1}
+    entries = for i <- 1..records, do: {"key-#{i}", "value", 0}
+    plain_dir = String.to_charlist(Path.join(root, "plain"))
+    visited_dir = String.to_charlist(Path.join(root, "visited"))
+    visited = :ets.new(:visited_projection_records, [:set, :public])
+
+    plain_reads =
+      count_calls([{:prim_file, :read_nif, 2}], fn ->
+        assert :ok = @log.write_projection(plain_dir, position, entries)
+      end)
+
+    visited_reads =
+      count_calls([{:prim_file, :read_nif, 2}], fn ->
+        assert :ok =
+                 @log.write_projection(visited_dir, position, entries, fn index,
+                                                                          entry,
+                                                                          location ->
+                   true = :ets.insert(visited, {index, entry, location})
+                 end)
+      end)
+
+    assert visited_reads <= plain_reads + div(plain_reads, 10),
+           "#{visited_reads} reads with locations, #{plain_reads} without"
+
+    assert :ets.info(visited, :size) == records + 1
+
+    for index <- 1..records do
+      assert [{^index, {0, {:ferricstore_segment_projection_entry, key, "value", 0}}, location}] =
+               :ets.lookup(visited, index)
+
+      assert key == "key-#{index}"
+      assert {:ok, ^location} = @log.location_for_index(visited_dir, index)
+    end
+  end
+
   # Count only this process and what it spawns: the application's own
   # background work in the test VM would otherwise add noise.
   defp count_calls(mfas, fun) do

@@ -431,18 +431,21 @@ locate_disk_record_offset_payload(
     end.
 
 rebuild_offset_registry(Dir) ->
+    rebuild_offset_registry(Dir, none).
+
+rebuild_offset_registry(Dir, Visit) ->
     case ensure_offset_registry() of
         ok ->
             case clear_offset_registry_for_dir(Dir) of
                 ok ->
-                    rebuild_offset_registry_stream(Dir);
+                    rebuild_offset_registry_stream(Dir, Visit);
                 {error, _Reason} = Error -> Error
             end;
         {error, _Reason} = Error ->
             Error
     end.
 
-rebuild_offset_registry_stream(Dir) ->
+rebuild_offset_registry_stream(Dir, Visit) ->
     case {existing_records_per_segment(Dir), segment_paths(Dir)} of
         {{ok, RecordsPerSegment}, {ok, Paths}} ->
             Result = case segment_append_kind(Dir) of
@@ -454,7 +457,7 @@ rebuild_offset_registry_stream(Dir) ->
                     %% The first pass seeds the bounded cache and derived index.
                     %% Retain the original full-decode corruption check without
                     %% retaining every decoded record in an ETS scratch table.
-                    case fold_disk(Dir, fun(_Index, _Entry, Acc) -> Acc end, ok) of
+                    case fold_disk(Dir, verify_offset_rebuild_fun(Visit), ok) of
                         {ok, ok} -> trust_offset_index_for_dir(Dir);
                         {error, _Reason} = Error -> Error
                     end;
@@ -464,6 +467,14 @@ rebuild_offset_registry_stream(Dir) ->
         {_, {error, enoent}} -> ok;
         {{error, _Reason} = Error, _} -> Error;
         {_, {error, _Reason} = Error} -> Error
+    end.
+
+verify_offset_rebuild_fun(none) ->
+    fun(_Index, _Entry, Acc) -> Acc end;
+verify_offset_rebuild_fun(Visit) ->
+    fun(Index, Entry, Location, Acc) ->
+        _ = Visit(Index, Entry, Location),
+        Acc
     end.
 
 rebuild_raft_offset_index(Dir, Paths, RecordsPerSegment) ->

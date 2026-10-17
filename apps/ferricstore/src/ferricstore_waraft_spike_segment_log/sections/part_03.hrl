@@ -24,6 +24,9 @@ write_append_failure_marker(Dir, Reason) ->
     end.
 
 rewrite_records(Dir, Records) ->
+    rewrite_records(Dir, Records, none).
+
+rewrite_records(Dir, Records, Visit) ->
     case validate_segment_log_dir(Dir) of
         ok ->
             case recover_rewrite(Dir) of
@@ -32,7 +35,7 @@ rewrite_records(Dir, Records) ->
                         ok ->
                             case records_per_segment(Dir) of
                                 {ok, RecordsPerSegment} ->
-                                    rewrite_records_atomic(Dir, Records, RecordsPerSegment);
+                                    rewrite_records_atomic(Dir, Records, RecordsPerSegment, Visit);
                                 {error, _Reason} = Error ->
                                     Error
                             end;
@@ -44,7 +47,7 @@ rewrite_records(Dir, Records) ->
         {error, _Reason} = Error -> Error
     end.
 
-rewrite_records_atomic(Dir, Records, RecordsPerSegment) ->
+rewrite_records_atomic(Dir, Records, RecordsPerSegment, Visit) ->
     Paths = rewrite_paths(Dir),
     Staging = maps:get(staging, Paths),
     Backup = maps:get(backup, Paths),
@@ -56,7 +59,7 @@ rewrite_records_atomic(Dir, Records, RecordsPerSegment) ->
                         ok ->
                             case finish_rewrite(Dir, Backup) of
                                 ok ->
-                                    rebuild_offset_registry(Dir);
+                                    rebuild_offset_registry(Dir, Visit);
                                 {error, _Reason} = Error ->
                                     _ = rollback_rewrite(Dir, Paths),
                                     Error

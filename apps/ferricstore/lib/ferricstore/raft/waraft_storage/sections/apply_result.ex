@@ -820,43 +820,43 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
 
       defp write_prepared_segment_projection_checkpoint(job, metadata, entries, generation) do
         checkpoint_root = segment_projection_checkpoint_root(job.root_dir)
+        table = job.relocation_table
 
-        with :ok <- write_segment_projection(checkpoint_root, metadata.position, entries),
-             :ok <-
-               fill_segment_projection_relocation_table(checkpoint_root, job.relocation_table) do
-          register_prepared_segment_projection_checkpoint(job.root_dir, %{
-            position: metadata.position,
-            generation: generation,
-            table: job.relocation_table,
-            storage_name: job.storage_name
-          })
+        # The write's own verify pass fills the relocation table.
+        record_location = fn
+          index, {0, {:ferricstore_segment_projection_entry, key, value, expire_at_ms}}, location
+          when index > 0 ->
+            {_ordinal, offset, _size} = location
+
+            true =
+              :ets.insert(
+                table,
+                {key, index, offset, expire_at_ms, segment_projected_value_size(value)}
+              )
+
+          _index, _entry, _location ->
+            true
         end
-      end
 
-      defp fill_segment_projection_relocation_table(checkpoint_root, table) do
-        case :ferricstore_waraft_spike_segment_log.fold_disk_with_locations(
+        case :ferricstore_waraft_spike_segment_log.write_projection(
                to_charlist(checkpoint_root),
-               fn
-                 index,
-                 {0, {:ferricstore_segment_projection_entry, key, value, expire_at_ms}},
-                 {_ordinal, offset, _size},
-                 :ok
-                 when index > 0 ->
-                   true =
-                     :ets.insert(
-                       table,
-                       {key, index, offset, expire_at_ms, segment_projected_value_size(value)}
-                     )
-
-                   :ok
-
-                 _index, _entry, _location, :ok ->
-                   :ok
-               end,
-               :ok
+               metadata.position,
+               entries,
+               record_location
              ) do
-          {:ok, :ok} -> :ok
-          {:error, reason} -> {:error, {:segment_projection_relocation_table, reason}}
+          :ok ->
+            register_prepared_segment_projection_checkpoint(job.root_dir, %{
+              position: metadata.position,
+              generation: generation,
+              table: table,
+              storage_name: job.storage_name
+            })
+
+          {:error, reason} ->
+            {:error, reason}
+
+          other ->
+            {:error, {:write_segment_projection_log, other}}
         end
       end
 
