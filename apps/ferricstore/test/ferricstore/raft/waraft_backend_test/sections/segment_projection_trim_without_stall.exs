@@ -1,10 +1,11 @@
 defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWithoutStall do
   @moduledoc false
 
-  # A WARaft log trim must not rewrite every live key inside the Raft commit
-  # path. Background checkpoints take a consistent cut, write the projection
-  # off the commit path, and a trim adopts the finished checkpoint. Without a
-  # usable checkpoint a trim defers (WARaft allows that) up to a bound.
+  # A WARaft log trim must not rewrite or repoint every live key inside the Raft
+  # commit path. Background checkpoints take a consistent cut, write the
+  # projection and adopt it off the commit path, and a trim then only drops the
+  # log behind it. Without a usable checkpoint a trim defers (WARaft allows
+  # that) up to a bound.
   defmacro __using__(_opts) do
     quote do
       alias Ferricstore.Raft.WARaftBackend
@@ -14,7 +15,9 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
         :waraft_segment_projection_checkpoint_every,
         :waraft_segment_projection_checkpoint_min_interval_ms,
         :waraft_segment_projection_checkpoint_hook,
-        :waraft_segment_projection_trim_max_deferred_entries
+        :waraft_segment_projection_before_relocate_hook,
+        :waraft_segment_projection_trim_max_deferred_entries,
+        :waraft_segment_projection_checkpoint_concurrency
       ]
 
       @tag :bounded_checkpoint
@@ -70,7 +73,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
             assert cut_index >= k2_index
             assert cut_index < k3_index
 
-            {cut_position, keys} = projection_keys(checkpoint_root(root))
+            # The checkpoint was adopted: it is the projection now.
+            {cut_position, keys} = projection_keys(projection_root(root))
             assert {:raft_log_pos, ^cut_index, _} = cut_position
             assert "consistent-cut:k1" in keys
             assert "consistent-cut:k2" in keys
@@ -80,64 +84,106 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
       end
 
       @tag :bounded_checkpoint
-      test "trim adopts the finished checkpoint instead of rewriting the projection", %{
+      test "a finished checkpoint becomes the projection and the trim only drops the log", %{
         ctx: ctx,
         root: root
       } do
-        with_checkpoint_env([every: :never, min_interval_ms: 0, max_deferred: 0], fn ->
-          assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+        parent = self()
 
-          assert :ok = WARaftBackend.write(0, {:put, "adopt:k1", "v1", 0})
-          assert :ok = WARaftBackend.write(0, {:put, "adopt:k2", "v2", 0})
-          checkpoint_index = run_checkpoint!(0, {:put, "adopt:k3", "v3", 0})
+        hook = fn
+          :before_adopt, _metadata ->
+            send(parent, {:checkpoint_files, file_inodes(checkpoint_root(root))})
 
-          checkpoint_files = file_inodes(checkpoint_root(root))
-          assert map_size(checkpoint_files) > 0
+          _phase, _metadata ->
+            :ok
+        end
 
-          log = waraft_segment_log_record(0)
+        relocate_hook = fn shard_index, _projection_root, relocations ->
+          send(parent, {:relocating, self(), shard_index, length(relocations)})
+          :ok
+        end
 
-          assert {:ok, _state} =
-                   :ferricstore_waraft_spike_segment_log.trim(log, checkpoint_index, %{})
+        with_checkpoint_env(
+          [
+            every: :never,
+            min_interval_ms: 0,
+            max_deferred: 0,
+            hook: hook,
+            relocate_hook: relocate_hook
+          ],
+          fn ->
+            assert :ok =
+                     WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
-          assert_receive {:waraft_segment_projection_trim,
-                          [:ferricstore, :waraft, :segment_projection_trim, :checkpoint_reuse],
-                          %{relocations: relocations}, %{checkpoint_index: ^checkpoint_index}},
-                         2_000
+            assert :ok = WARaftBackend.write(0, {:put, "adopt:k1", "v1", 0})
+            assert :ok = WARaftBackend.write(0, {:put, "adopt:k2", "v2", 0})
+            log = waraft_segment_log_record(0)
+            first_before = :ferricstore_waraft_spike_segment_log.first_index(log)
+            checkpoint_index = run_checkpoint!(0, {:put, "adopt:k3", "v3", 0})
 
-          # k1 and k2 sit below the trim index; k3 is the trim index itself.
-          assert relocations == 2
+            assert_receive {:checkpoint_files, checkpoint_files}
+            assert map_size(checkpoint_files) > 0
 
-          # The checkpoint's own files became the projection; nothing was rewritten.
-          refute File.exists?(checkpoint_root(root))
-          projection_files = file_inodes(projection_root(root))
+            # The checkpoint task adopted itself: k1 and k2 sit below its
+            # position, k3 is the position.
+            assert_receive {:relocating, adopter, 0, 2}
+            refute adopter == self()
 
-          for {name, inode} <- checkpoint_files do
-            assert Map.get(projection_files, name) == inode, "#{name} was rewritten"
+            assert_receive {:waraft_segment_projection_adopt, %{relocations: 2},
+                            %{shard_index: 0, checkpoint_index: ^checkpoint_index}}
+
+            # Its own files became the projection; nothing was rewritten.
+            refute File.exists?(checkpoint_root(root))
+            projection_files = file_inodes(projection_root(root))
+
+            for {name, inode} <- checkpoint_files do
+              assert Map.get(projection_files, name) == inode, "#{name} was rewritten"
+            end
+
+            projection_dir = to_charlist(projection_root(root))
+
+            for {key, value} <- [{"adopt:k1", "v1"}, {"adopt:k2", "v2"}] do
+              assert value == Router.get(ctx, key)
+
+              assert [{^key, _value, 0, _lfu, {:waraft_projection, index}, offset, _size}] =
+                       :ets.lookup(elem(ctx.keydir_refs, 0), key)
+
+              assert {:ok, {_ordinal, ^offset, _encoded_size}} =
+                       :ferricstore_waraft_spike_segment_log.location_for_index(
+                         projection_dir,
+                         index
+                       )
+            end
+
+            # Nothing was trimmed yet; the trim only drops the log.
+            assert first_before == :ferricstore_waraft_spike_segment_log.first_index(log)
+
+            assert {:ok, _state} =
+                     :ferricstore_waraft_spike_segment_log.trim(log, checkpoint_index, %{})
+
+            assert_receive {:waraft_segment_projection_trim,
+                            [:ferricstore, :waraft, :segment_projection_trim, :checkpoint_reuse],
+                            _measurements,
+                            %{trim_index: ^checkpoint_index, checkpoint_index: ^checkpoint_index}},
+                           2_000
+
+            refute_received {:relocating, _pid, _shard_index, _count}
+            assert checkpoint_index == :ferricstore_waraft_spike_segment_log.first_index(log)
+
+            for {key, value} <- [{"adopt:k1", "v1"}, {"adopt:k2", "v2"}, {"adopt:k3", "v3"}] do
+              assert value == Router.get(ctx, key)
+            end
+
+            # The adopted projection is what recovery replays from.
+            WARaftBackend.stop()
+
+            assert :ok =
+                     WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+            assert "v1" == Router.get(ctx, "adopt:k1")
+            assert "v3" == Router.get(ctx, "adopt:k3")
           end
-
-          projection_dir = to_charlist(projection_root(root))
-
-          assert "v3" == Router.get(ctx, "adopt:k3")
-
-          for {key, value} <- [{"adopt:k1", "v1"}, {"adopt:k2", "v2"}] do
-            assert value == Router.get(ctx, key)
-
-            assert [{^key, _value, 0, _lfu, {:waraft_projection, index}, offset, _size}] =
-                     :ets.lookup(elem(ctx.keydir_refs, 0), key)
-
-            assert {:ok, {_ordinal, ^offset, _encoded_size}} =
-                     :ferricstore_waraft_spike_segment_log.location_for_index(
-                       projection_dir,
-                       index
-                     )
-          end
-
-          # The adopted projection is what recovery replays from.
-          WARaftBackend.stop()
-          assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
-          assert "v1" == Router.get(ctx, "adopt:k1")
-          assert "v3" == Router.get(ctx, "adopt:k3")
-        end)
+        )
       end
 
       @tag :bounded_checkpoint
@@ -329,7 +375,13 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
 
         try do
           with_checkpoint_env(
-            [every: :never, min_interval_ms: 30_000, hook: hook, max_deferred: 0],
+            [
+              every: :never,
+              min_interval_ms: 30_000,
+              hook: hook,
+              max_deferred: 0,
+              concurrency: 1
+            ],
             fn ->
               assert :ok =
                        WARaftBackend.start(multi_ctx,
@@ -373,6 +425,89 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
       end
 
       @tag :bounded_checkpoint
+      test "checkpoints that lost the node slot take it in the order they asked", %{root: root} do
+        multi_ctx = multi_shard_ctx(root, "slot-order", 3)
+        hook = hold_checkpoint_writes_hook(self())
+
+        try do
+          with_checkpoint_env(
+            [every: :never, min_interval_ms: 0, hook: hook, max_deferred: 0, concurrency: 1],
+            fn ->
+              assert :ok =
+                       WARaftBackend.start(multi_ctx,
+                         log_module: :ferricstore_waraft_spike_segment_log
+                       )
+
+              [key0, key1, key2] =
+                for shard <- 0..2, do: key_for_shard(multi_ctx, shard, "slot-order:#{shard}")
+
+              Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, 1)
+              assert :ok = WARaftBackend.write(0, {:put, key0, "v", 0})
+              assert_receive {:checkpoint_writing, 0, holder}, 2_000
+
+              assert :ok = WARaftBackend.write(1, {:put, key1, "v", 0})
+              assert_checkpoint_result(1, :busy)
+              assert :ok = WARaftBackend.write(2, {:put, key2, "v", 0})
+              assert_checkpoint_result(2, :busy)
+
+              send(holder, :resume_checkpoint)
+              assert_checkpoint_result(0, :ok)
+
+              # Both retries are due now. Shard 2 asks first, but shard 1 has
+              # waited longer.
+              Process.sleep(1_100)
+              assert :ok = WARaftBackend.write(2, {:put, key2, "v2", 0})
+              assert_checkpoint_result(2, :busy)
+              assert :ok = WARaftBackend.write(1, {:put, key1, "v2", 0})
+              assert_receive {:checkpoint_writing, 1, next}, 2_000
+              refute_received {:checkpoint_writing, 2, _pid}
+
+              send(next, :resume_checkpoint)
+              assert_checkpoint_result(1, :ok)
+            end
+          )
+        after
+          FerricStore.Instance.cleanup(multi_ctx.name)
+        end
+      end
+
+      @tag :bounded_checkpoint
+      test "checkpoints on different shards run side by side up to the configured concurrency",
+           %{root: root} do
+        multi_ctx = multi_shard_ctx(root, "slot-concurrency", 2)
+        hook = hold_checkpoint_writes_hook(self())
+
+        try do
+          with_checkpoint_env(
+            [every: :never, min_interval_ms: 0, hook: hook, max_deferred: 0, concurrency: 2],
+            fn ->
+              assert :ok =
+                       WARaftBackend.start(multi_ctx,
+                         log_module: :ferricstore_waraft_spike_segment_log
+                       )
+
+              Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, 1)
+
+              for shard <- 0..1 do
+                key = key_for_shard(multi_ctx, shard, "slot-concurrency:#{shard}")
+                assert :ok = WARaftBackend.write(shard, {:put, key, "v", 0})
+              end
+
+              assert_receive {:checkpoint_writing, 0, first}, 2_000
+              assert_receive {:checkpoint_writing, 1, second}, 2_000
+
+              send(first, :resume_checkpoint)
+              send(second, :resume_checkpoint)
+              assert_checkpoint_result(0, :ok)
+              assert_checkpoint_result(1, :ok)
+            end
+          )
+        after
+          FerricStore.Instance.cleanup(multi_ctx.name)
+        end
+      end
+
+      @tag :bounded_checkpoint
       test "trim past the deferral bound rebuilds the projection synchronously", %{
         ctx: ctx,
         root: root
@@ -405,6 +540,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
           handler_id,
           [
             [:ferricstore, :waraft, :segment_projection_checkpoint, :stop],
+            [:ferricstore, :waraft, :segment_projection_checkpoint, :adopt],
             [:ferricstore, :waraft, :segment_projection_trim, :checkpoint_reuse],
             [:ferricstore, :waraft, :segment_projection_trim, :deferred]
           ],
@@ -440,6 +576,30 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
             Application.delete_env(:ferricstore, :waraft_segment_projection_checkpoint_hook)
         end
 
+        case Keyword.fetch(settings, :concurrency) do
+          {:ok, concurrency} ->
+            Application.put_env(
+              :ferricstore,
+              :waraft_segment_projection_checkpoint_concurrency,
+              concurrency
+            )
+
+          :error ->
+            :ok
+        end
+
+        case Keyword.fetch(settings, :relocate_hook) do
+          {:ok, hook} ->
+            Application.put_env(
+              :ferricstore,
+              :waraft_segment_projection_before_relocate_hook,
+              hook
+            )
+
+          :error ->
+            Application.delete_env(:ferricstore, :waraft_segment_projection_before_relocate_hook)
+        end
+
         try do
           fun.()
         after
@@ -458,8 +618,47 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
           ),
           do: send(parent, {:waraft_segment_projection_checkpoint, event, measurements, metadata})
 
+      def forward_trim_without_stall_telemetry(
+            [:ferricstore, :waraft, :segment_projection_checkpoint, :adopt],
+            measurements,
+            metadata,
+            parent
+          ),
+          do: send(parent, {:waraft_segment_projection_adopt, measurements, metadata})
+
       def forward_trim_without_stall_telemetry(event, measurements, metadata, parent),
         do: send(parent, {:waraft_segment_projection_trim, event, measurements, metadata})
+
+      defp multi_shard_ctx(root, name, shard_count) do
+        multi_root = Path.join(root, name)
+        Ferricstore.DataDir.ensure_layout!(multi_root, shard_count)
+        Ferricstore.Store.ActiveFile.init(shard_count)
+        build_ctx(multi_root, shard_count: shard_count)
+      end
+
+      # Holds every checkpoint after it took a slot, until told to resume.
+      defp hold_checkpoint_writes_hook(parent) do
+        fn
+          :before_write, %{shard_index: shard_index} ->
+            send(parent, {:checkpoint_writing, shard_index, self()})
+
+            receive do
+              :resume_checkpoint -> :ok
+            after
+              10_000 -> :ok
+            end
+
+          _phase, _metadata ->
+            :ok
+        end
+      end
+
+      defp assert_checkpoint_result(shard_index, result) do
+        assert_receive {:waraft_segment_projection_checkpoint,
+                        [:ferricstore, :waraft, :segment_projection_checkpoint, :stop], _,
+                        %{result: ^result, shard_index: ^shard_index}},
+                       5_000
+      end
 
       # Takes one background checkpoint with the given write and returns its index.
       defp run_checkpoint!(shard_index, command) do

@@ -326,16 +326,41 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
         end
 
         @doc false
-        def __prepared_segment_projection_relocations_for_test__(
-              ctx,
-              shard_index,
-              relocation_table,
-              trim_index
+        def __relocate_checkpoint_row_for_test__(
+              keydir,
+              collected_row,
+              projection_index,
+              projection_offset,
+              projected_value_size
             ) do
-          collect_prepared_segment_projection_relocations(
-            %{ctx: ctx, shard_index: shard_index},
-            relocation_table,
-            trim_index
+          relocate_segment_projection_row_at_location(
+            keydir,
+            collected_row,
+            projection_index,
+            projection_offset,
+            projected_value_size
+          )
+        end
+
+        @doc false
+        def __checkpoint_relocations_for_test__(ctx, shard_index, locations, checkpoint_index) do
+          collect_checkpoint_relocations(ctx, shard_index, locations, checkpoint_index)
+        end
+
+        @doc false
+        def __relocate_segment_projection_row_for_test__(
+              keydir,
+              original_row,
+              projection_index,
+              projection_offset,
+              projected_value_size
+            ) do
+          compare_and_relocate_segment_projection_row_sized(
+            keydir,
+            original_row,
+            projection_index,
+            projection_offset,
+            projected_value_size
           )
         end
 

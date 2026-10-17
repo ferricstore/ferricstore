@@ -140,7 +140,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
       end
 
       # Points the row at its projection record only if nobody changed it since
-      # it was read, keeping a cached hot value.
+      # it was read, keeping a cached hot value. Storage applies writes to the
+      # keydir while trims and checkpoints relocate rows, so the compare and the
+      # replace are one select_replace.
       defp compare_and_relocate_segment_projection_row_sized(
              keydir,
              {key, original_value, expire_at_ms, _original_lfu, original_file_id, original_offset,
@@ -149,24 +151,47 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
              projection_offset,
              projected_value_size
            ) do
-        case :ets.lookup(keydir, key) do
-          [
-            {^key, current_value, ^expire_at_ms, current_lfu, ^original_file_id, ^original_offset,
-             ^original_value_size}
-          ] ->
-            if original_value == nil or current_value == original_value do
-              :ets.insert(
-                keydir,
-                {key, current_value, expire_at_ms, current_lfu,
-                 {:waraft_projection, projection_index}, projection_offset, projected_value_size}
-              )
-            end
+        value_guards =
+          if original_value == nil,
+            do: [],
+            else: [{:"=:=", :"$1", {:const, original_value}}]
 
-            :ok
+        _relocated =
+          :ets.select_replace(keydir, [
+            {{key, :"$1", expire_at_ms, :"$2", original_file_id, original_offset,
+              original_value_size}, value_guards,
+             [
+               {{key, :"$1", expire_at_ms, :"$2",
+                 {:const, {:waraft_projection, projection_index}}, projection_offset,
+                 projected_value_size}}
+             ]}
+          ])
 
-          _changed_or_deleted ->
-            :ok
-        end
+        :ok
+      end
+
+      # Points the row at its checkpoint record if it is still at the location
+      # it had when the relocation was collected. Its cached value, expiry and
+      # LFU are kept: a cold read or eviction and an EXPIRE change those without
+      # moving the row, and the record holds the value at that location. A write
+      # or delete moves it, and then it is left alone.
+      defp relocate_segment_projection_row_at_location(
+             keydir,
+             {key, _value, _expire_at_ms, _lfu, file_id, offset, value_size},
+             projection_index,
+             projection_offset,
+             projected_value_size
+           ) do
+        _relocated =
+          :ets.select_replace(keydir, [
+            {{key, :"$1", :"$2", :"$3", file_id, offset, value_size}, [],
+             [
+               {{key, :"$1", :"$2", :"$3", {:const, {:waraft_projection, projection_index}},
+                 projection_offset, projected_value_size}}
+             ]}
+          ])
+
+        :ok
       end
 
       defp compare_and_relocate_segment_projection_row(

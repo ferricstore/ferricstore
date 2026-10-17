@@ -33,6 +33,7 @@
     memory_status/1,
     ensure_segment_config/1,
     write_projection/3,
+    write_projection/4,
     promote_projection/2,
     write_projection_batch/3,
     write_projection_batches/2,

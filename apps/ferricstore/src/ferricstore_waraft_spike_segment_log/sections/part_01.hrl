@@ -985,10 +985,20 @@ ensure_segment_config(RootDir) ->
     end.
 
 write_projection(RootDir, Position, Entries) when is_list(Entries) ->
+    write_projection_visiting(RootDir, Position, Entries, none).
+
+%% Like write_projection/3, and calls Visit(Index, Entry, Location) for every
+%% record from the pass that verifies what was written, so a caller that needs
+%% the locations does not read the projection back again.
+write_projection(RootDir, Position, Entries, Visit)
+  when is_list(Entries), is_function(Visit, 3) ->
+    write_projection_visiting(RootDir, Position, Entries, Visit).
+
+write_projection_visiting(RootDir, Position, Entries, Visit) ->
     Dir = fold_disk_segment_dir(RootDir),
     case metadata_ensure_dir(filename:join(Dir, "dummy")) of
         ok ->
-            rewrite_records(Dir, projection_records(Position, Entries));
+            rewrite_records(Dir, projection_records(Position, Entries), Visit);
         {error, Reason} ->
             {error, {ensure_projection_dir, Reason}}
     end.

@@ -750,11 +750,12 @@ defmodule Ferricstore.Store.Shard.ETS do
   defp warm_matching_cold_entry(keydir, key, value, exp, fid, off, vsize) do
     lfu = LFU.initial()
 
+    # WARaft locations are tuples, which a match-spec body would read as calls.
     :ets.select_replace(keydir, [
       {
         {key, nil, exp, :"$1", fid, off, vsize},
         [],
-        [{{key, value, exp, lfu, fid, off, vsize}}]
+        [{{key, value, exp, lfu, {:const, fid}, off, vsize}}]
       }
     ])
   rescue
