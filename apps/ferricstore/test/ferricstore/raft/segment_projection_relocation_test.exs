@@ -14,6 +14,25 @@ defmodule Ferricstore.Raft.SegmentProjectionRelocationTest do
     assert lost_writes(&WARaftStorage.__relocate_checkpoint_row_for_test__/5) == 0
   end
 
+  # Waiting shards take checkpoint slots in the order they first asked, even
+  # when two asked within the same millisecond.
+  test "a shard that asks for a checkpoint slot later waits behind an earlier one" do
+    for round <- 1..200 do
+      first = "/checkpoint-slot-order/#{System.unique_integer([:positive])}/first"
+      second = "/checkpoint-slot-order/#{System.unique_integer([:positive])}/second"
+
+      try do
+        ahead_of_first = WARaftStorage.__checkpoint_waiters_ahead_for_test__(first)
+        ahead_of_second = WARaftStorage.__checkpoint_waiters_ahead_for_test__(second)
+
+        assert ahead_of_second > ahead_of_first, "round #{round}"
+      after
+        WARaftStorage.__stop_waiting_for_checkpoint_for_test__(first)
+        WARaftStorage.__stop_waiting_for_checkpoint_for_test__(second)
+      end
+    end
+  end
+
   test "relocation repoints an unchanged row and keeps its cached value" do
     keydir = :ets.new(:relocation_keydir, [:set, :public])
     row = {"cached", nil, 0, 3, {:waraft_segment, 4}, 11, 8}

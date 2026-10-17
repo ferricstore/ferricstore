@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.1 - 2026-10-17
+
 - Stop WARaft log trims from stalling writes. Every 50k entries a trim rewrote
   each live key into the segment projection inside the Raft commit path, so
   write pauses grew with the dataset (several seconds at a few hundred thousand
