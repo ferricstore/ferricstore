@@ -640,19 +640,81 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
 
       defp restore_segment_projection_checkpoint_request(handle, _checkpoint), do: handle
 
+      # A shard has its own pending guard, but checkpoints on different shards
+      # must not all copy and write their keydirs at once: at most
+      # segment_projection_checkpoint_concurrency() run on a node. An attempt that
+      # finds no free slot is busy and retries a second later. Waiting shards get
+      # slots in the order they first asked, so one that keeps losing the race
+      # cannot fall behind until its trims reach the deferral bound.
       defp run_bounded_segment_projection_checkpoint(job) do
-        # A shard has its own pending guard, but checkpoints on different shards
-        # must not all scan and serialize their keydirs at the same time. A busy
-        # slot defers this attempt until a later write satisfies the cadence.
-        lock = {{__MODULE__, :background_segment_projection_checkpoint}, self()}
+        slots = segment_projection_checkpoint_concurrency()
 
-        case :global.trans(lock, fn -> run_segment_projection_checkpoint(job) end, [node()], 0) do
-          :aborted ->
-            {%{shard_index: job.shard_index, position: job.position, entries: 0}, {:ok, :busy}}
+        if segment_projection_checkpoint_turn?(job.root_dir, slots),
+          do: run_in_segment_projection_checkpoint_slot(job, 1, slots),
+          else: busy_segment_projection_checkpoint(job)
+      end
 
-          result ->
-            result
+      defp run_in_segment_projection_checkpoint_slot(job, slot, slots) when slot > slots,
+        do: busy_segment_projection_checkpoint(job)
+
+      defp run_in_segment_projection_checkpoint_slot(job, slot, slots) do
+        lock = {{__MODULE__, :background_segment_projection_checkpoint, slot}, self()}
+
+        run = fn ->
+          stop_waiting_for_segment_projection_checkpoint(job.root_dir)
+          run_segment_projection_checkpoint(job)
         end
+
+        case :global.trans(lock, run, [node()], 0) do
+          :aborted -> run_in_segment_projection_checkpoint_slot(job, slot + 1, slots)
+          result -> result
+        end
+      end
+
+      defp busy_segment_projection_checkpoint(job),
+        do: {%{shard_index: job.shard_index, position: job.position, entries: 0}, {:ok, :busy}}
+
+      defp segment_projection_checkpoint_concurrency do
+        case Application.get_env(:ferricstore, :waraft_segment_projection_checkpoint_concurrency) do
+          value when is_integer(value) and value > 0 -> value
+          _ -> max(1, div(System.schedulers_online(), 4))
+        end
+      end
+
+      # Records when this shard first asked for a slot (and that it is still
+      # asking), and whether fewer than `slots` shards that are still asking
+      # asked before it. A shard that stopped retrying drops out of the order.
+      defp segment_projection_checkpoint_turn?(root_dir, slots) do
+        ensure_segment_projection_registry!()
+        now = System.monotonic_time(:millisecond)
+        registry_key = segment_projection_registry_key(root_dir)
+        key = {registry_key, :checkpoint_waiting}
+
+        first_asked_at =
+          case :ets.lookup(@segment_projection_registry, key) do
+            [{^key, {asked_at, _last_asked_at}}] -> asked_at
+            [] -> now
+          end
+
+        true = :ets.insert(@segment_projection_registry, {key, {first_asked_at, now}})
+
+        ahead =
+          :ets.select_count(@segment_projection_registry, [
+            {{{:"$1", :checkpoint_waiting}, {:"$2", :"$3"}},
+             [
+               {:"/=", :"$1", registry_key},
+               {:<, :"$2", first_asked_at},
+               {:>=, :"$3", now - @segment_projection_checkpoint_waiter_ttl_ms}
+             ], [true]}
+          ])
+
+        ahead < slots
+      end
+
+      defp stop_waiting_for_segment_projection_checkpoint(root_dir) do
+        key = {segment_projection_registry_key(root_dir), :checkpoint_waiting}
+        :ets.delete(@segment_projection_registry, key)
+        :ok
       end
 
       # The checkpoint must be exactly the state at its position: recovery
@@ -1020,6 +1082,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
             :ets.delete(@segment_projection_registry, {key, :context})
             :ets.delete(@segment_projection_registry, {key, :position})
             :ets.delete(@segment_projection_registry, {key, :adopted_checkpoint})
+            :ets.delete(@segment_projection_registry, {key, :checkpoint_waiting})
         end
 
         :ok

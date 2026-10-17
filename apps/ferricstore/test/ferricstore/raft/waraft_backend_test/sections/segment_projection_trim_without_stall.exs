@@ -16,7 +16,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
         :waraft_segment_projection_checkpoint_min_interval_ms,
         :waraft_segment_projection_checkpoint_hook,
         :waraft_segment_projection_before_relocate_hook,
-        :waraft_segment_projection_trim_max_deferred_entries
+        :waraft_segment_projection_trim_max_deferred_entries,
+        :waraft_segment_projection_checkpoint_concurrency
       ]
 
       @tag :bounded_checkpoint
@@ -374,7 +375,13 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
 
         try do
           with_checkpoint_env(
-            [every: :never, min_interval_ms: 30_000, hook: hook, max_deferred: 0],
+            [
+              every: :never,
+              min_interval_ms: 30_000,
+              hook: hook,
+              max_deferred: 0,
+              concurrency: 1
+            ],
             fn ->
               assert :ok =
                        WARaftBackend.start(multi_ctx,
@@ -410,6 +417,89 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
                               [:ferricstore, :waraft, :segment_projection_checkpoint, :stop], _,
                               %{result: :ok, shard_index: 1}},
                              5_000
+            end
+          )
+        after
+          FerricStore.Instance.cleanup(multi_ctx.name)
+        end
+      end
+
+      @tag :bounded_checkpoint
+      test "checkpoints that lost the node slot take it in the order they asked", %{root: root} do
+        multi_ctx = multi_shard_ctx(root, "slot-order", 3)
+        hook = hold_checkpoint_writes_hook(self())
+
+        try do
+          with_checkpoint_env(
+            [every: :never, min_interval_ms: 0, hook: hook, max_deferred: 0, concurrency: 1],
+            fn ->
+              assert :ok =
+                       WARaftBackend.start(multi_ctx,
+                         log_module: :ferricstore_waraft_spike_segment_log
+                       )
+
+              [key0, key1, key2] =
+                for shard <- 0..2, do: key_for_shard(multi_ctx, shard, "slot-order:#{shard}")
+
+              Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, 1)
+              assert :ok = WARaftBackend.write(0, {:put, key0, "v", 0})
+              assert_receive {:checkpoint_writing, 0, holder}, 2_000
+
+              assert :ok = WARaftBackend.write(1, {:put, key1, "v", 0})
+              assert_checkpoint_result(1, :busy)
+              assert :ok = WARaftBackend.write(2, {:put, key2, "v", 0})
+              assert_checkpoint_result(2, :busy)
+
+              send(holder, :resume_checkpoint)
+              assert_checkpoint_result(0, :ok)
+
+              # Both retries are due now. Shard 2 asks first, but shard 1 has
+              # waited longer.
+              Process.sleep(1_100)
+              assert :ok = WARaftBackend.write(2, {:put, key2, "v2", 0})
+              assert_checkpoint_result(2, :busy)
+              assert :ok = WARaftBackend.write(1, {:put, key1, "v2", 0})
+              assert_receive {:checkpoint_writing, 1, next}, 2_000
+              refute_received {:checkpoint_writing, 2, _pid}
+
+              send(next, :resume_checkpoint)
+              assert_checkpoint_result(1, :ok)
+            end
+          )
+        after
+          FerricStore.Instance.cleanup(multi_ctx.name)
+        end
+      end
+
+      @tag :bounded_checkpoint
+      test "checkpoints on different shards run side by side up to the configured concurrency",
+           %{root: root} do
+        multi_ctx = multi_shard_ctx(root, "slot-concurrency", 2)
+        hook = hold_checkpoint_writes_hook(self())
+
+        try do
+          with_checkpoint_env(
+            [every: :never, min_interval_ms: 0, hook: hook, max_deferred: 0, concurrency: 2],
+            fn ->
+              assert :ok =
+                       WARaftBackend.start(multi_ctx,
+                         log_module: :ferricstore_waraft_spike_segment_log
+                       )
+
+              Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, 1)
+
+              for shard <- 0..1 do
+                key = key_for_shard(multi_ctx, shard, "slot-concurrency:#{shard}")
+                assert :ok = WARaftBackend.write(shard, {:put, key, "v", 0})
+              end
+
+              assert_receive {:checkpoint_writing, 0, first}, 2_000
+              assert_receive {:checkpoint_writing, 1, second}, 2_000
+
+              send(first, :resume_checkpoint)
+              send(second, :resume_checkpoint)
+              assert_checkpoint_result(0, :ok)
+              assert_checkpoint_result(1, :ok)
             end
           )
         after
@@ -486,6 +576,18 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
             Application.delete_env(:ferricstore, :waraft_segment_projection_checkpoint_hook)
         end
 
+        case Keyword.fetch(settings, :concurrency) do
+          {:ok, concurrency} ->
+            Application.put_env(
+              :ferricstore,
+              :waraft_segment_projection_checkpoint_concurrency,
+              concurrency
+            )
+
+          :error ->
+            :ok
+        end
+
         case Keyword.fetch(settings, :relocate_hook) do
           {:ok, hook} ->
             Application.put_env(
@@ -526,6 +628,37 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
 
       def forward_trim_without_stall_telemetry(event, measurements, metadata, parent),
         do: send(parent, {:waraft_segment_projection_trim, event, measurements, metadata})
+
+      defp multi_shard_ctx(root, name, shard_count) do
+        multi_root = Path.join(root, name)
+        Ferricstore.DataDir.ensure_layout!(multi_root, shard_count)
+        Ferricstore.Store.ActiveFile.init(shard_count)
+        build_ctx(multi_root, shard_count: shard_count)
+      end
+
+      # Holds every checkpoint after it took a slot, until told to resume.
+      defp hold_checkpoint_writes_hook(parent) do
+        fn
+          :before_write, %{shard_index: shard_index} ->
+            send(parent, {:checkpoint_writing, shard_index, self()})
+
+            receive do
+              :resume_checkpoint -> :ok
+            after
+              10_000 -> :ok
+            end
+
+          _phase, _metadata ->
+            :ok
+        end
+      end
+
+      defp assert_checkpoint_result(shard_index, result) do
+        assert_receive {:waraft_segment_projection_checkpoint,
+                        [:ferricstore, :waraft, :segment_projection_checkpoint, :stop], _,
+                        %{result: ^result, shard_index: ^shard_index}},
+                       5_000
+      end
 
       # Takes one background checkpoint with the given write and returns its index.
       defp run_checkpoint!(shard_index, command) do

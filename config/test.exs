@@ -37,6 +37,10 @@ config :ferricstore,
 # that trim directly see the relocated keydir immediately.
 config :ferricstore, :waraft_segment_projection_trim_max_deferred_entries, 0
 
+# One background checkpoint at a time per node whatever the core count, so
+# tests that race checkpoints on several shards see the same slot contention.
+config :ferricstore, :waraft_segment_projection_checkpoint_concurrency, 1
+
 # Use a fixed shard count in tests for deterministic behavior.
 # Production defaults to System.schedulers_online().
 config :ferricstore, :shard_count, 4

@@ -43,6 +43,9 @@ defmodule Ferricstore.Raft.WARaftStorage do
   # How long storage holds its applies for a checkpoint's keydir copy, and how
   # long the checkpoint task waits for storage.
   @segment_projection_cut_timeout_ms 30_000
+  # A shard waiting for a checkpoint slot retries about once a second while it
+  # still needs one; past this it no longer holds its place in line.
+  @segment_projection_checkpoint_waiter_ttl_ms 5_000
   @default_metadata_compact_every 1024
   @default_snapshot_compaction_drain_timeout_ms 30_000
   @cold_read_timeout_ms 10_000
