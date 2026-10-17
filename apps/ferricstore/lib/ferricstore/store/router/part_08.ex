@@ -1557,6 +1557,19 @@ defmodule Ferricstore.Store.Router.Part08 do
       end
 
       @doc false
+      # See Ferricstore.Flow.HistoryValueRelease.
+      def flow_history_release_values(ctx, %{id: id} = attrs) when is_binary(id) do
+        key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+        if byte_size(key) > @max_key_size do
+          {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+        else
+          idx = shard_for(ctx, key)
+          raft_write(ctx, idx, key, {:flow_history_release_values, key, attrs})
+        end
+      end
+
+      @doc false
       def pfadd(ctx, key, elements) when is_binary(key) and is_list(elements) do
         forced_single_key_quorum(ctx, key, {:pfadd, key, elements})
       end

@@ -61,6 +61,7 @@ defmodule Ferricstore.Raft.ApplyContext do
     :flow_fail,
     :flow_fail_many,
     :flow_governance_limit_mutate,
+    :flow_history_release_values,
     :flow_named_value_put,
     :flow_named_value_put_pipeline_batch,
     :flow_policy_catalog_backfill_step,

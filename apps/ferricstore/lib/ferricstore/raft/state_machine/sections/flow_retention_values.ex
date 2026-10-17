@@ -165,8 +165,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
         end
       end
 
-      defp flow_retention_cleanup_member_entries(state, %{id: id} = record, limit)
-           when is_binary(id) and is_integer(limit) and limit >= 0 do
+      defp flow_retention_cleanup_member_entries(state, record, limit),
+        do: flow_retention_cleanup_member_entries(state, record, 0, limit)
+
+      defp flow_retention_cleanup_member_entries(state, %{id: id} = record, offset, limit)
+           when is_binary(id) and is_integer(offset) and offset >= 0 and is_integer(limit) and
+                  limit >= 0 do
         index_key =
           FlowKeys.retention_cleanup_index_key(id, Map.get(record, :partition_key))
 
@@ -180,7 +184,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
                 []
               else
                 native
-                |> NativeFlowIndex.range_slice(index_key, :neg_inf, :inf, false, 0, limit)
+                |> NativeFlowIndex.range_slice(index_key, :neg_inf, :inf, false, offset, limit)
                 |> Enum.map(fn {member_key, _score} -> member_key end)
               end
 
@@ -203,11 +207,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
                   {member_key, nil}
               end)
 
-            {entries, NativeFlowIndex.count_all(native, index_key) <= length(member_keys)}
+            {entries,
+             NativeFlowIndex.count_all(native, index_key) <= offset + length(member_keys)}
         end
       end
 
-      defp flow_retention_cleanup_member_entries(_state, _record, _limit), do: {[], false}
+      defp flow_retention_cleanup_member_entries(_state, _record, _offset, _limit),
+        do: {[], false}
 
       defp flow_retention_cleanup_owned_key?(owned_key, %{id: id} = record)
            when is_binary(owned_key) and is_binary(id) do
@@ -254,6 +260,166 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
         with :ok <- flow_index_delete_members(state, index_key, member_keys),
              {:ok, _deleted} <- flow_retention_delete_keys(state, member_keys) do
           :ok
+        end
+      end
+
+      # Feature level 2 (Ferricstore.Cluster.FeatureLevel); see
+      # Ferricstore.Flow.HistoryValueRelease. Deletes the payload, result and error
+      # values this Flow wrote before `oldest_version` that neither `keep_refs` (the
+      # refs of the history the caller still has) nor the record refers to, with
+      # their retention cleanup members. A value written at or after
+      # `oldest_version` may be held by an event the caller has not seen, so it
+      # stays. One page of members per command, from `offset`; the result's
+      # `next_offset` continues after the members this page kept.
+      defp do_flow_history_release_values(
+             state,
+             %{id: id, oldest_version: oldest_version, keep_refs: keep_refs} = attrs
+           )
+           when is_binary(id) and is_integer(oldest_version) and oldest_version > 0 and
+                  is_list(keep_refs) do
+        partition_key = Map.get(attrs, :partition_key)
+        offset = flow_history_release_attr(attrs, :offset, 0, 0)
+        limit = flow_history_release_attr(attrs, :limit, 512, 1)
+
+        with :ok <- flow_history_release_require_level(state),
+             {:ok, record} <- flow_require_record(state, id, partition_key) do
+          index_key = FlowKeys.retention_cleanup_index_key(id, partition_key)
+          keep = MapSet.new(keep_refs ++ flow_record_shared_and_private_value_refs(record))
+
+          {entries, complete?} =
+            flow_retention_cleanup_member_entries(state, record, offset, limit)
+
+          released =
+            Enum.filter(entries, fn {_member_key, owned_key} ->
+              flow_history_releasable_value?(owned_key, record, oldest_version, keep)
+            end)
+
+          with :ok <- flow_history_raise_release_floor(state, record, oldest_version),
+               {:ok, _count} <-
+                 flow_retention_delete_keys(state, Enum.map(released, &elem(&1, 1))),
+               :ok <- flow_retention_delete_cleanup_members(state, index_key, released) do
+            {:ok,
+             %{
+               released: length(released),
+               next_offset: offset + length(entries) - length(released),
+               complete: complete?
+             }}
+          end
+        end
+      end
+
+      defp do_flow_history_release_values(_state, _attrs),
+        do: {:error, "ERR invalid flow history value release"}
+
+      defp flow_history_release_attr(attrs, key, default, min) do
+        case Map.get(attrs, key, default) do
+          value when is_integer(value) and value >= min -> value
+          _invalid -> default
+        end
+      end
+
+      # Read through do_get so a hot or cold marker reads the same on every replica.
+      defp flow_history_release_active?(state),
+        do:
+          do_get(state, Ferricstore.Cluster.FeatureLevel.key(2)) ==
+            Ferricstore.Cluster.FeatureLevel.marker()
+
+      defp flow_history_release_require_level(state) do
+        if flow_history_release_active?(state),
+          do: :ok,
+          else: {:error, "ERR flow history value release needs cluster feature level 2"}
+      end
+
+      defp flow_history_releasable_value?(owned_key, %{id: id} = record, oldest_version, keep)
+           when is_binary(owned_key) do
+        not MapSet.member?(keep, owned_key) and
+          case flow_private_value_version(owned_key, id, Map.get(record, :partition_key)) do
+            version when is_integer(version) -> version < oldest_version
+            nil -> false
+          end
+      end
+
+      defp flow_history_releasable_value?(_owned_key, _record, _oldest_version, _keep),
+        do: false
+
+      # The version of one of this Flow's own payload, result or error values.
+      defp flow_private_value_version(ref, id, partition_key) do
+        Enum.find_value([:payload, :result, :error], fn kind ->
+          prefix =
+            flow_retention_owned_value_ref_prefix(FlowKeys.value_key(id, kind, 0, partition_key))
+
+          with true <- String.starts_with?(ref, prefix),
+               suffix = binary_part(ref, byte_size(prefix), byte_size(ref) - byte_size(prefix)),
+               {version, ""} when version >= 0 <- Integer.parse(suffix) do
+            version
+          else
+            _other -> nil
+          end
+        end)
+      end
+
+      # The floor is the highest `oldest_version` any release of this Flow used.
+      # Every value it deleted lies below it and lost its cleanup member.
+      defp flow_history_raise_release_floor(state, %{id: id} = record, oldest_version) do
+        floor_key = FlowKeys.history_release_floor_key(id, Map.get(record, :partition_key))
+
+        case flow_history_release_floor(state, floor_key) do
+          floor when is_integer(floor) and floor >= oldest_version ->
+            :ok
+
+          _lower_or_missing ->
+            flow_put_hot_value(state, floor_key, Integer.to_string(oldest_version), 0)
+        end
+      end
+
+      defp flow_history_release_floor(state, floor_key) do
+        with value when is_binary(value) <- do_get(state, floor_key),
+             {floor, ""} <- Integer.parse(value) do
+          floor
+        else
+          _missing -> nil
+        end
+      end
+
+      # A pruned Flow's floor goes with it. Only a level 2 release writes one.
+      defp flow_history_delete_release_floor(state, %{id: id} = record) do
+        floor_key = FlowKeys.history_release_floor_key(id, Map.get(record, :partition_key))
+        if flow_history_release_active?(state), do: do_delete(state, floor_key), else: :ok
+      end
+
+      # Feature level 2: a ref below the Flow's release floor without its cleanup
+      # member was released, so an event holding one reads as trimmed. A Flow no
+      # release touched has no floor and rewinds as before.
+      defp flow_rewind_require_unreleased_values(state, %{id: id} = record, fields, attrs) do
+        partition_key = Map.get(record, :partition_key)
+        index_key = FlowKeys.retention_cleanup_index_key(id, partition_key)
+
+        with true <- flow_history_release_active?(state),
+             floor when is_integer(floor) <-
+               flow_history_release_floor(
+                 state,
+                 FlowKeys.history_release_floor_key(id, partition_key)
+               ) do
+          restored =
+            if Map.has_key?(attrs, :error),
+              do: ["payload_ref", "result_ref"],
+              else: ["payload_ref", "result_ref", "error_ref"]
+
+          released? =
+            Enum.any?(restored, fn field ->
+              with ref when is_binary(ref) <- flow_nilable_history_field(fields, field),
+                   version when is_integer(version) and version < floor <-
+                     flow_private_value_version(ref, id, partition_key) do
+                member_key = FlowKeys.retention_cleanup_member_key(id, ref, partition_key)
+                flow_index_score_of(state, index_key, member_key) == :miss
+              else
+                _kept -> false
+              end
+            end)
+
+          if released?, do: {:error, "ERR flow rewind target event not found"}, else: :ok
+        else
+          _inactive_or_never_released -> :ok
         end
       end
 
@@ -434,6 +600,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
              :ok <- flow_require_expected_state(record, Map.get(attrs, :expect_state)),
              {:ok, target_fields} <-
                flow_history_event_fields(state, record, to_event, partition_key),
+             :ok <- flow_rewind_require_unreleased_values(state, record, target_fields, attrs),
              {:ok, next} <- flow_rewind_record(record, target_fields, attrs, now_ms) do
           next = Map.put(next, :rewound_to_event_id, to_event)
 
