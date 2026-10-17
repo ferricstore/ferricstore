@@ -681,34 +681,36 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
         end
       end
 
-      # Records when this shard first asked for a slot (and that it is still
-      # asking), and whether fewer than `slots` shards that are still asking
-      # asked before it. A shard that stopped retrying drops out of the order.
-      defp segment_projection_checkpoint_turn?(root_dir, slots) do
+      defp segment_projection_checkpoint_turn?(root_dir, slots),
+        do: segment_projection_checkpoint_waiters_ahead(root_dir) < slots
+
+      # Records this shard's place in line (taken on its first ask) and that it
+      # is still asking, and counts the shards still asking that are ahead of
+      # it. A shard that stopped retrying drops out of the order. Places come
+      # from a strictly increasing counter, so shards that first asked within
+      # the same millisecond are still ordered.
+      defp segment_projection_checkpoint_waiters_ahead(root_dir) do
         ensure_segment_projection_registry!()
         now = System.monotonic_time(:millisecond)
         registry_key = segment_projection_registry_key(root_dir)
         key = {registry_key, :checkpoint_waiting}
 
-        first_asked_at =
+        place =
           case :ets.lookup(@segment_projection_registry, key) do
-            [{^key, {asked_at, _last_asked_at}}] -> asked_at
-            [] -> now
+            [{^key, {place, _last_asked_at}}] -> place
+            [] -> :erlang.unique_integer([:monotonic])
           end
 
-        true = :ets.insert(@segment_projection_registry, {key, {first_asked_at, now}})
+        true = :ets.insert(@segment_projection_registry, {key, {place, now}})
 
-        ahead =
-          :ets.select_count(@segment_projection_registry, [
-            {{{:"$1", :checkpoint_waiting}, {:"$2", :"$3"}},
-             [
-               {:"/=", :"$1", registry_key},
-               {:<, :"$2", first_asked_at},
-               {:>=, :"$3", now - @segment_projection_checkpoint_waiter_ttl_ms}
-             ], [true]}
-          ])
-
-        ahead < slots
+        :ets.select_count(@segment_projection_registry, [
+          {{{:"$1", :checkpoint_waiting}, {:"$2", :"$3"}},
+           [
+             {:"/=", :"$1", registry_key},
+             {:<, :"$2", place},
+             {:>=, :"$3", now - @segment_projection_checkpoint_waiter_ttl_ms}
+           ], [true]}
+        ])
       end
 
       defp stop_waiting_for_segment_projection_checkpoint(root_dir) do

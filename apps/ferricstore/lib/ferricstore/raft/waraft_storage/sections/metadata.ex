@@ -348,6 +348,14 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
         end
 
         @doc false
+        def __checkpoint_waiters_ahead_for_test__(root_dir),
+          do: segment_projection_checkpoint_waiters_ahead(root_dir)
+
+        @doc false
+        def __stop_waiting_for_checkpoint_for_test__(root_dir),
+          do: stop_waiting_for_segment_projection_checkpoint(root_dir)
+
+        @doc false
         def __relocate_segment_projection_row_for_test__(
               keydir,
               original_row,
