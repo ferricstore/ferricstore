@@ -373,6 +373,7 @@ jobs:
             3 \
             ${{ matrix.partition }} \
             apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs \
+            apps/ferricstore/test/ferricstore/raft/waraft_backend_part2_test.exs \
             > "$selection_file"
 
           files=()
@@ -451,6 +452,7 @@ jobs:
             3 \
             ${{ matrix.partition }} \
             apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs \
+            apps/ferricstore/test/ferricstore/raft/waraft_backend_part2_test.exs \
             > "$selection_file"
 
           files=()
@@ -498,7 +500,15 @@ jobs:
   # WARaft's backend suite is intentionally one async:false test module. ExUnit
   # partitions by file, so keeping it in the core matrix overloads one partition.
   test-waraft-ubuntu:
-    name: "WARaft backend tests (ubuntu)"
+    name: "WARaft backend tests (ubuntu ${{ matrix.part }}/2)"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - part: 1
+            file: apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs
+          - part: 2
+            file: apps/ferricstore/test/ferricstore/raft/waraft_backend_part2_test.exs
     needs: build-ubuntu
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -520,17 +530,25 @@ jobs:
         run: mix deps.get
       - name: Run WARaft backend tests
         timeout-minutes: 55
-        run: mix test apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs --timeout 30000
+        run: mix test ${{ matrix.file }} --timeout 30000
       - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
         with:
-          name: test-results-waraft-ubuntu
+          name: test-results-waraft-ubuntu-${{ matrix.part }}
           path: test-results/
           retention-days: 14
 
   test-waraft-macos:
-    name: "WARaft backend tests (macos)"
+    name: "WARaft backend tests (macos ${{ matrix.part }}/2)"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - part: 1
+            file: apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs
+          - part: 2
+            file: apps/ferricstore/test/ferricstore/raft/waraft_backend_part2_test.exs
     needs: build-macos
     runs-on: macos-latest
     timeout-minutes: 70
@@ -552,12 +570,12 @@ jobs:
         run: mix deps.get
       - name: Run WARaft backend tests
         timeout-minutes: 65
-        run: mix test apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs --timeout 30000
+        run: mix test ${{ matrix.file }} --timeout 30000
       - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
         with:
-          name: test-results-waraft-macos
+          name: test-results-waraft-macos-${{ matrix.part }}
           path: test-results/
           retention-days: 14
 
@@ -793,9 +811,13 @@ jobs:
   # Durability tests (ubuntu only — shard-kill, jepsen, large alloc)
   # ===========================================================================
   test-durability:
-    name: "Durability tests"
+    name: "Durability tests (${{ matrix.suite }})"
     needs: build-ubuntu
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [shard-kill, jepsen, server-and-large-alloc]
     steps:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
@@ -815,26 +837,27 @@ jobs:
         run: mix deps.get
 
       - name: Run ferricstore shard-kill tests
+        if: matrix.suite == 'shard-kill'
         run: |
           set -o pipefail
           epmd -daemon
           elixir --sname ci_shard_kill --cookie ferricstore_test -S mix test apps/ferricstore/test --only shard_kill --timeout 120000 2>&1 | tee /tmp/durability_shard_kill.log
 
       - name: Run ferricstore_server shard-kill tests
-        if: success() || failure()
+        if: matrix.suite == 'server-and-large-alloc'
         run: |
           set -o pipefail
           mix test apps/ferricstore_server/test --only shard_kill --timeout 120000 2>&1 | tee /tmp/durability_server_shard_kill.log
 
       - name: Run Jepsen tests
-        if: success() || failure()
+        if: matrix.suite == 'jepsen'
         run: |
           set -o pipefail
           epmd -daemon
           elixir --sname ci_jepsen --cookie ferricstore_test -S mix test apps/ferricstore/test --only jepsen --timeout 120000 2>&1 | tee /tmp/durability_jepsen.log
 
       - name: Run large-allocation tests
-        if: success() || failure()
+        if: matrix.suite == 'server-and-large-alloc' && (success() || failure())
         run: |
           set -o pipefail
           mix test apps/ferricstore/test --only large_alloc --timeout 120000 2>&1 | tee /tmp/durability_large_alloc.log
@@ -847,7 +870,7 @@ jobs:
         if: always()
         continue-on-error: true
         with:
-          name: test-results-durability
+          name: test-results-durability-${{ matrix.suite }}
           path: |
             test-results/
             /tmp/durability_*.log
@@ -893,9 +916,13 @@ jobs:
   # Cluster tests (ubuntu only — multi-node via :peer)
   # ===========================================================================
   test-cluster:
-    name: "Cluster tests"
+    name: "Cluster tests (${{ matrix.partition }}/2)"
     needs: build-ubuntu
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2]
     steps:
       - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
@@ -920,11 +947,11 @@ jobs:
           epmd -daemon
           data_dir=$(mktemp -d "/tmp/ferricstore-cluster-XXXXXX")
           echo "Running ferricstore cluster tests with data_dir=${data_dir}"
-          FERRICSTORE_DATA_DIR="$data_dir" \
-            elixir --sname ci_cluster_ferricstore --cookie ferricstore_test -S mix test apps/ferricstore/test --only cluster --timeout 180000 --seed 0 2>&1 | tee /tmp/cluster_ferricstore.log
+          FERRICSTORE_DATA_DIR="$data_dir" MIX_TEST_PARTITION=${{ matrix.partition }} \
+            elixir --sname ci_cluster_ferricstore --cookie ferricstore_test -S mix test apps/ferricstore/test --only cluster --partitions 2 --timeout 180000 --seed 0 2>&1 | tee /tmp/cluster_ferricstore.log
 
       - name: Run ferricstore_server cluster tests
-        if: success() || failure()
+        if: matrix.partition == 1 && (success() || failure())
         run: |
           set -o pipefail
           epmd -daemon
@@ -937,7 +964,7 @@ jobs:
         if: always()
         continue-on-error: true
         with:
-          name: test-results-cluster
+          name: test-results-cluster-${{ matrix.partition }}
           path: |
             test-results/
             /tmp/cluster_*.log
