@@ -398,9 +398,12 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageMetadataHotWritesFs
         checkpoint_handler_id = {__MODULE__, :segment_projection_trim_checkpoint, make_ref()}
         trim_handler_id = {__MODULE__, :segment_projection_trim_reuse, make_ref()}
 
-        :telemetry.attach(
+        :telemetry.attach_many(
           checkpoint_handler_id,
-          [:ferricstore, :waraft, :segment_projection_checkpoint, :stop],
+          [
+            [:ferricstore, :waraft, :segment_projection_checkpoint, :stop],
+            [:ferricstore, :waraft, :segment_projection_checkpoint, :adopt]
+          ],
           &__MODULE__.handle_segment_projection_checkpoint_telemetry/4,
           parent
         )
@@ -450,6 +453,14 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageMetadataHotWritesFs
           assert checkpoint_index >= 5
           assert entries >= 2
 
+          # The checkpoint repointed the rows below it when it was adopted.
+          assert_receive {:waraft_segment_projection_checkpoint,
+                          [:ferricstore, :waraft, :segment_projection_checkpoint, :adopt],
+                          %{relocations: relocations}, %{checkpoint_index: ^checkpoint_index}},
+                         1_000
+
+          assert relocations >= 1
+
           log = waraft_segment_log_record(0)
 
           assert {:ok, _state} =
@@ -457,14 +468,13 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageMetadataHotWritesFs
 
           assert_receive {:waraft_segment_projection_trim,
                           [:ferricstore, :waraft, :segment_projection_trim, :checkpoint_reuse],
-                          %{relocations: relocations},
+                          _measurements,
                           %{
                             trim_index: ^checkpoint_index,
                             checkpoint_index: ^checkpoint_index
                           }},
                          1_000
 
-          assert relocations >= 1
           assert "v1" == Router.get(ctx, "checkpoint-trim:k1")
 
           assert [
@@ -481,10 +491,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageMetadataHotWritesFs
       end
 
       @tag :bounded_checkpoint
-      test "background segment projection checkpoint does not clobber active projection rows", %{
-        root: root,
-        ctx: ctx
-      } do
+      test "background segment projection checkpoint repoints active projection rows it replaces",
+           %{
+             root: root,
+             ctx: ctx
+           } do
         assert {:ok, _apps} = Application.ensure_all_started(:telemetry)
 
         parent = self()
@@ -546,19 +557,25 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageMetadataHotWritesFs
 
           assert "z" == Router.get(ctx, z_key)
 
+          # The checkpoint replaced the projection files z was read from, so z
+          # must point at the checkpoint's own record for it now.
           assert [
-                   {^z_key, _value, 0, _lfu, {:waraft_projection, ^old_projection_index},
-                    ^old_projection_offset, 1}
+                   {^z_key, _value, 0, _lfu, {:waraft_projection, projection_index},
+                    projection_offset, 1}
                  ] = :ets.lookup(elem(ctx.keydir_refs, 0), z_key)
 
-          assert File.exists?(
-                   Path.join([
-                     root,
-                     "waraft",
-                     "ferricstore_waraft_backend.1",
-                     "segment_projection_checkpoint_log"
-                   ])
-                 )
+          shard_root = Path.join([root, "waraft", "ferricstore_waraft_backend.1"])
+
+          assert {:ok, {_ordinal, ^projection_offset, _size}} =
+                   :ferricstore_waraft_spike_segment_log.location_for_index(
+                     to_charlist(Path.join(shard_root, "segment_projection_log")),
+                     projection_index
+                   )
+
+          assert {old_projection_index, old_projection_offset} !=
+                   {projection_index, projection_offset}
+
+          refute File.exists?(Path.join(shard_root, "segment_projection_checkpoint_log"))
         after
           restore_env(:waraft_segment_projection_checkpoint_every, previous_every)
           restore_env(:waraft_segment_projection_checkpoint_min_interval_ms, previous_interval)

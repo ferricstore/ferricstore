@@ -59,7 +59,7 @@ defmodule Ferricstore.Raft.WARaftStorageExpiryContextTest do
     :ets.insert(relocation_table, {key, 1, 64, expire_at_ms, byte_size(value)})
 
     assert {:ok, [{1, 64, 5, ^row}]} =
-             WARaftStorage.__prepared_segment_projection_relocations_for_test__(
+             WARaftStorage.__checkpoint_relocations_for_test__(
                %{keydir_refs: {keydir}},
                0,
                relocation_table,

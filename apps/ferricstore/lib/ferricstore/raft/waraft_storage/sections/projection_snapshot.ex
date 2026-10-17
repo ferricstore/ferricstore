@@ -170,6 +170,30 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
         :ok
       end
 
+      # Points the row at its checkpoint record if it is still at the location
+      # it had when the relocation was collected. Its cached value, expiry and
+      # LFU are kept: a cold read or eviction and an EXPIRE change those without
+      # moving the row, and the record holds the value at that location. A write
+      # or delete moves it, and then it is left alone.
+      defp relocate_segment_projection_row_at_location(
+             keydir,
+             {key, _value, _expire_at_ms, _lfu, file_id, offset, value_size},
+             projection_index,
+             projection_offset,
+             projected_value_size
+           ) do
+        _relocated =
+          :ets.select_replace(keydir, [
+            {{key, :"$1", :"$2", :"$3", file_id, offset, value_size}, [],
+             [
+               {{key, :"$1", :"$2", :"$3", {:const, {:waraft_projection, projection_index}},
+                 projection_offset, projected_value_size}}
+             ]}
+          ])
+
+        :ok
+      end
+
       defp compare_and_relocate_segment_projection_row(
              _keydir,
              key,

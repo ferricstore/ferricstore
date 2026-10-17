@@ -208,14 +208,14 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
         do: prepare_segment_projection_for_trim(root_dir, trim_index, :none)
 
       # Called from the segment log's trim/3 inside the Raft commit path, with
-      # the durable log floor as first_index. A trim adopts the newest finished
-      # background checkpoint: up to trim_index when it covers it ({:ok}), or up
-      # to the checkpoint's own position when that still raises the floor
-      # ({:trimmed_to, index}; WARaft lets a trim remove less than asked). With
-      # no usable checkpoint, or one still running, the trim is deferred and
-      # the log keeps its entries. A trim that would run more than the
-      # configured number of entries past the floor, or that came with no
-      # floor, rebuilds the projection synchronously as before.
+      # the durable log floor as first_index. Background checkpoints adopt
+      # themselves, so a trim only drops the log behind the adopted position: up
+      # to trim_index when it covers it ({:ok}), or up to the position itself
+      # when that still raises the floor ({:trimmed_to, index}; WARaft lets a
+      # trim remove less than asked). With no usable checkpoint, or one still
+      # running, the trim is deferred and the log keeps its entries. A trim that
+      # would run more than the configured number of entries past the floor, or
+      # that came with no floor, rebuilds the projection synchronously as before.
       @spec prepare_segment_projection_for_trim(
               charlist() | binary(),
               non_neg_integer(),
@@ -321,18 +321,11 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
              {trim_index, first_index},
              deferrable?
            ) do
-        case prepared_segment_projection_relocations(root_dir, context, trim_index, first_index) do
-          {:ok, prepared, adopt_index, relocations} ->
+        case adopted_segment_projection_trim_index(root_dir, trim_index, first_index) do
+          {:ok, adopted, adopt_index} ->
             result =
               changing_segment_projection(root_dir, fn ->
-                adopt_segment_projection_checkpoint(
-                  root_dir,
-                  projection_root,
-                  context,
-                  adopt_index,
-                  prepared,
-                  relocations
-                )
+                trim_behind_adopted_segment_projection(root_dir, context, adopt_index, adopted)
               end)
 
             cond do
@@ -340,9 +333,11 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
                 result
 
               adopt_index == trim_index ->
+                keep_adopted_segment_projection_checkpoint(root_dir, adopted)
                 :ok
 
               true ->
+                keep_adopted_segment_projection_checkpoint(root_dir, adopted)
                 # The rest of this trim needs a newer checkpoint.
                 request_segment_projection_checkpoint(context, trim_index)
                 {:trimmed_to, adopt_index}
@@ -372,48 +367,127 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
         bump_segment_projection_trim_generation(root_dir)
       end
 
-      # A prepared checkpoint is adopted up to its own position (at most
-      # trim_index), and only if that raises the log floor and it was cut after
-      # the last trim. Every row the trim moves (in the Raft log or the apply
-      # projection below the adopted index, or in the current projection) then
-      # holds the value the checkpoint wrote for its key.
-      defp prepared_segment_projection_relocations(root_dir, context, trim_index, first_index) do
-        with {:ok, prepared} <- lookup_prepared_segment_projection_checkpoint(root_dir),
-             adopt_index = min(position_index(prepared.position), trim_index),
+      # An adopted checkpoint (see adopt_segment_projection_checkpoint/3) lets a
+      # trim drop the log up to its position, at most trim_index, if that raises
+      # the floor and no rebuild has replaced the projection since.
+      defp adopted_segment_projection_trim_index(root_dir, trim_index, first_index) do
+        with {:ok, adopted} <- lookup_adopted_segment_projection_checkpoint(root_dir),
+             adopt_index = min(position_index(adopted.position), trim_index),
              true <- adopt_index == trim_index or adopt_index > first_index,
-             true <- prepared.generation == segment_projection_trim_generation(root_dir),
-             {:ok, relocations} <-
-               collect_prepared_segment_projection_relocations(
-                 context,
-                 prepared.table,
-                 adopt_index
-               ) do
-          {:ok, prepared, adopt_index, relocations}
+             true <- adopted.generation == segment_projection_trim_generation(root_dir) do
+          {:ok, adopted, adopt_index}
         else
           _unusable -> :not_available
         end
       end
 
-      defp collect_prepared_segment_projection_relocations(context, table, trim_index) do
-        keydir = elem(context.ctx.keydir_refs, context.shard_index)
+      # The trim's own generation bump does not move rows below the adopted
+      # position, so later trims may still use it.
+      defp keep_adopted_segment_projection_checkpoint(root_dir, adopted) do
+        register_adopted_segment_projection_checkpoint(root_dir, %{
+          adopted
+          | generation: segment_projection_trim_generation(root_dir)
+        })
+      end
+
+      # Every row below the adopted position already points at the projection,
+      # so what is left is what still reads the log or the apply projection
+      # below trim_index: value pins, and the apply projection itself.
+      defp trim_behind_adopted_segment_projection(root_dir, context, trim_index, adopted) do
+        %{ctx: ctx, shard_index: shard_index} = context
+
+        with {:ok, value_pin_relocation_count} <-
+               prepare_segment_value_pins_for_trim(root_dir, ctx, shard_index, trim_index),
+             :ok <- compact_apply_projection_log(root_dir, ctx, shard_index, trim_index),
+             :ok <-
+               prune_apply_projection_cache_after_segment_projection(
+                 ctx,
+                 shard_index,
+                 trim_index,
+                 []
+               ) do
+          emit_segment_projection_trim_checkpoint_reuse(%{
+            shard_index: shard_index,
+            trim_index: trim_index,
+            checkpoint_index: position_index(adopted.position),
+            value_pin_relocations: value_pin_relocation_count
+          })
+
+          :ok
+        end
+      end
+
+      # Runs in the checkpoint task, under the projection lock, once the
+      # checkpoint is written: its files become the projection and every live row
+      # below its position (in the Raft log or the apply projection) or on the
+      # replaced projection is repointed at them. Off the Raft commit path, the
+      # log below the position stays readable throughout; only rows on the
+      # replaced projection files wait, so they are repointed first. A crash
+      # after the promotion leaves the projection ahead of the log floor, which
+      # recovery already handles. Nothing is promoted unless every such row has
+      # its record in the checkpoint.
+      defp adopt_segment_projection_checkpoint(job, position, locations) do
+        %{root_dir: root_dir, ctx: ctx, shard_index: shard_index} = job
+        checkpoint_index = position_index(position)
+        projection_root = segment_projection_root(root_dir)
+
+        with {:ok, relocations} <-
+               collect_checkpoint_relocations(ctx, shard_index, locations, checkpoint_index),
+             :ok <-
+               maybe_run_segment_projection_before_relocate_hook(
+                 shard_index,
+                 projection_root,
+                 relocations
+               ),
+             :ok <-
+               changing_segment_projection(root_dir, fn ->
+                 with :ok <- promote_segment_projection_checkpoint(root_dir, projection_root) do
+                   relocate_checkpoint_rows(ctx, shard_index, relocations)
+                 end
+               end) do
+          register_adopted_segment_projection_checkpoint(root_dir, %{
+            position: position,
+            generation: segment_projection_trim_generation(root_dir)
+          })
+
+          emit_segment_projection_checkpoint_adopt(%{
+            shard_index: shard_index,
+            checkpoint_index: checkpoint_index,
+            relocations: length(relocations)
+          })
+
+          :ok
+        end
+      end
+
+      # Rows on the projection come first. A row's checkpoint record holds the
+      # value at its current location whatever its cached value or expiry: those
+      # change without moving the row.
+      defp collect_checkpoint_relocations(ctx, shard_index, locations, checkpoint_index) do
+        keydir = elem(ctx.keydir_refs, shard_index)
         now = storage_expiry_cutoff_ms()
 
-        reduce_keydir_rows_while(keydir, [], fn
-          {key, _value, expire_at_ms, _lfu, file_id, _offset, _value_size} = row, acc
+        reduce_keydir_rows_while(keydir, {[], []}, fn
+          {key, _value, expire_at_ms, _lfu, file_id, _offset, _value_size} = row,
+          {on_projection, in_log} = acc
           when is_binary(key) ->
             cond do
               not live_expire_at?(expire_at_ms, now) ->
                 {:cont, acc}
 
-              not segment_projection_relocatable_file_id?(file_id, trim_index) ->
+              not segment_projection_relocatable_file_id?(file_id, checkpoint_index) ->
                 {:cont, acc}
 
               true ->
-                case :ets.lookup(table, key) do
-                  [{^key, index, offset, ^expire_at_ms, projected_size}] ->
-                    {:cont, [{index, offset, projected_size, row} | acc]}
+                case :ets.lookup(locations, key) do
+                  [{^key, index, offset, _expire_at_ms, projected_size}] ->
+                    relocation = {index, offset, projected_size, row}
 
-                  _missing_or_changed ->
+                    if elem(file_id, 0) == :waraft_projection,
+                      do: {:cont, {[relocation | on_projection], in_log}},
+                      else: {:cont, {on_projection, [relocation | in_log]}}
+
+                  [] ->
                     {:halt, {:error, {:segment_projection_checkpoint_missing_key, key, file_id}}}
                 end
             end
@@ -422,57 +496,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
             {:cont, acc}
         end)
         |> case do
-          {:ok, relocations} -> {:ok, relocations}
+          {:ok, {on_projection, in_log}} -> {:ok, on_projection ++ in_log}
           {:error, _reason} = error -> error
-          :unavailable -> {:error, {:segment_keydir_unavailable, context.shard_index}}
-        end
-      rescue
-        # The relocation table died with its storage process.
-        ArgumentError -> {:error, :segment_projection_relocation_table_unavailable}
-      end
-
-      defp adopt_segment_projection_checkpoint(
-             root_dir,
-             projection_root,
-             context,
-             trim_index,
-             prepared,
-             relocations
-           ) do
-        %{ctx: ctx, shard_index: shard_index} = context
-
-        with :ok <- promote_segment_projection_checkpoint(root_dir, projection_root),
-             {:ok, value_pin_relocation_count} <-
-               prepare_segment_value_pins_for_trim(root_dir, ctx, shard_index, trim_index),
-             :ok <-
-               relocate_prepared_segment_projection_rows(
-                 ctx,
-                 shard_index,
-                 projection_root,
-                 relocations
-               ),
-             :ok <- compact_apply_projection_log(root_dir, ctx, shard_index, trim_index),
-             :ok <-
-               prune_apply_projection_cache_after_segment_projection(
-                 ctx,
-                 shard_index,
-                 trim_index,
-                 Enum.map(relocations, fn {index, _offset, _size,
-                                           {key, _, expire_at_ms, _, _, _, _} = row} ->
-                   {index, {{key, nil, expire_at_ms}, row}}
-                 end)
-               ) do
-          forget_prepared_segment_projection_checkpoint(root_dir, prepared)
-
-          emit_segment_projection_trim_checkpoint_reuse(%{
-            shard_index: shard_index,
-            trim_index: trim_index,
-            checkpoint_index: position_index(prepared.position),
-            relocations: length(relocations),
-            value_pin_relocations: value_pin_relocation_count
-          })
-
-          :ok
+          :unavailable -> {:error, {:segment_keydir_unavailable, shard_index}}
         end
       end
 
@@ -493,33 +519,12 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
         end
       end
 
-      defp relocate_prepared_segment_projection_rows(_ctx, _shard_index, _projection_root, []),
-        do: :ok
-
-      defp relocate_prepared_segment_projection_rows(
-             ctx,
-             shard_index,
-             projection_root,
-             relocations
-           ) do
+      defp relocate_checkpoint_rows(ctx, shard_index, relocations) do
         keydir = elem(ctx.keydir_refs, shard_index)
 
-        with :ok <-
-               maybe_run_segment_projection_before_relocate_hook(
-                 shard_index,
-                 projection_root,
-                 relocations
-               ) do
-          Enum.each(relocations, fn {index, offset, projected_size, row} ->
-            compare_and_relocate_segment_projection_row_sized(
-              keydir,
-              row,
-              index,
-              offset,
-              projected_size
-            )
-          end)
-        end
+        Enum.each(relocations, fn {index, offset, projected_size, row} ->
+          relocate_segment_projection_row_at_location(keydir, row, index, offset, projected_size)
+        end)
       end
 
       defp defer_segment_projection_trim(root_dir, trim_index, reason) do
@@ -689,9 +694,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
          |> Map.put(:segment_projection_checkpoint_wanted?, true)
          |> maybe_start_segment_projection_checkpoint()}
       end
-
-      def info({:ferricstore_waraft_segment_projection_relocation_table_consumed, table}, handle),
-        do: {:ok, drop_consumed_segment_projection_relocation_table(handle, table)}
 
       def info({:ferricstore_waraft_segment_projection_checkpoint_done, ref, result}, handle) do
         finish_segment_projection_checkpoint(ref, result, handle)

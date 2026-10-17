@@ -531,16 +531,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
           started_at_ms = System.monotonic_time(:millisecond)
           storage_name = Map.fetch!(handle.options, :storage_name)
 
-          # Key -> projection location of every checkpoint entry, filled by the
-          # checkpoint task and read by the trim that adopts the checkpoint.
-          # Storage owns it so it outlives the task.
-          relocation_table =
-            :ets.new(:segment_projection_checkpoint_relocations, [
-              :set,
-              :public,
-              {:read_concurrency, true}
-            ])
-
           job = %{
             root_dir: handle.root_dir,
             ctx: handle.ctx,
@@ -548,8 +538,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
             position: position,
             keydir: keydir,
             ref: ref,
-            storage_name: storage_name,
-            relocation_table: relocation_table
+            storage_name: storage_name
           }
 
           {:ok, pid} =
@@ -569,7 +558,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
             pid: pid,
             position: position,
             started_at: started_at,
-            relocation_table: relocation_table,
             wanted?: Map.get(handle, :segment_projection_checkpoint_wanted?, false),
             previous_started_at_ms: Map.get(handle, :segment_projection_checkpoint_started_at_ms)
           })
@@ -599,7 +587,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
             Map.get(metadata, :position, position),
             result
           )
-          |> keep_segment_projection_relocation_table(checkpoint.relocation_table, result)
           |> requeue_unfinished_segment_projection_checkpoint(checkpoint, result)
 
         emit_segment_projection_checkpoint_stop(metadata, duration_us, result)
@@ -652,36 +639,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
         do: Map.put(handle, :segment_projection_checkpoint_wanted?, true)
 
       defp restore_segment_projection_checkpoint_request(handle, _checkpoint), do: handle
-
-      # A finished checkpoint's table replaces the previous one. No trim can still
-      # be reading the previous table: the new checkpoint was written and
-      # registered under the projection lock that trims hold while they read it.
-      defp keep_segment_projection_relocation_table(handle, table, :ok) do
-        previous = Map.get(handle, :segment_projection_relocation_table)
-        if previous not in [nil, table], do: delete_segment_projection_relocation_table(previous)
-        Map.put(handle, :segment_projection_relocation_table, table)
-      end
-
-      defp keep_segment_projection_relocation_table(handle, table, _result) do
-        delete_segment_projection_relocation_table(table)
-        handle
-      end
-
-      defp drop_consumed_segment_projection_relocation_table(handle, table) do
-        if Map.get(handle, :segment_projection_relocation_table) == table do
-          delete_segment_projection_relocation_table(table)
-          Map.delete(handle, :segment_projection_relocation_table)
-        else
-          handle
-        end
-      end
-
-      defp delete_segment_projection_relocation_table(table) do
-        :ets.delete(table)
-        :ok
-      rescue
-        ArgumentError -> :ok
-      end
 
       defp run_bounded_segment_projection_checkpoint(job) do
         # A shard has its own pending guard, but checkpoints on different shards
@@ -806,8 +763,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
               emit_segment_projection_checkpoint_start(metadata)
               call_segment_projection_checkpoint_hook(:before_write, metadata)
 
-              {metadata,
-               write_prepared_segment_projection_checkpoint(job, metadata, entries, generation)}
+              {metadata, write_and_adopt_segment_projection_checkpoint(job, metadata, entries)}
 
             :unavailable ->
               {metadata, {:error, {:segment_keydir_unavailable, job.shard_index}}}
@@ -818,11 +774,23 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
         end
       end
 
-      defp write_prepared_segment_projection_checkpoint(job, metadata, entries, generation) do
-        checkpoint_root = segment_projection_checkpoint_root(job.root_dir)
-        table = job.relocation_table
+      # Still under the projection lock: the checkpoint is written, then adopted
+      # (see adopt_segment_projection_checkpoint/3), off the Raft commit path.
+      defp write_and_adopt_segment_projection_checkpoint(job, metadata, entries) do
+        locations = :ets.new(:segment_projection_checkpoint_locations, [:set, :private])
 
-        # The write's own verify pass fills the relocation table.
+        try do
+          with :ok <- write_segment_projection_checkpoint(job, metadata, entries, locations) do
+            call_segment_projection_checkpoint_hook(:before_adopt, metadata)
+            adopt_segment_projection_checkpoint(job, metadata.position, locations)
+          end
+        after
+          :ets.delete(locations)
+        end
+      end
+
+      # The write's own verify pass records each entry's location.
+      defp write_segment_projection_checkpoint(job, metadata, entries, locations) do
         record_location = fn
           index, {0, {:ferricstore_segment_projection_entry, key, value, expire_at_ms}}, location
           when index > 0 ->
@@ -830,7 +798,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
 
             true =
               :ets.insert(
-                table,
+                locations,
                 {key, index, offset, expire_at_ms, segment_projected_value_size(value)}
               )
 
@@ -839,24 +807,14 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
         end
 
         case :ferricstore_waraft_spike_segment_log.write_projection(
-               to_charlist(checkpoint_root),
+               job.root_dir |> segment_projection_checkpoint_root() |> to_charlist(),
                metadata.position,
                entries,
                record_location
              ) do
-          :ok ->
-            register_prepared_segment_projection_checkpoint(job.root_dir, %{
-              position: metadata.position,
-              generation: generation,
-              table: table,
-              storage_name: job.storage_name
-            })
-
-          {:error, reason} ->
-            {:error, reason}
-
-          other ->
-            {:error, {:write_segment_projection_log, other}}
+          :ok -> :ok
+          {:error, reason} -> {:error, reason}
+          other -> {:error, {:write_segment_projection_log, other}}
         end
       end
 
@@ -947,6 +905,16 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
           metadata
           |> Map.put(:result, segment_projection_checkpoint_result(result))
           |> maybe_put_telemetry_reason(segment_projection_checkpoint_reason(result))
+        )
+      catch
+        _, _ -> :ok
+      end
+
+      defp emit_segment_projection_checkpoint_adopt(metadata) do
+        :telemetry.execute(
+          [:ferricstore, :waraft, :segment_projection_checkpoint, :adopt],
+          %{relocations: Map.get(metadata, :relocations, 0)},
+          Map.delete(metadata, :relocations)
         )
       catch
         _, _ -> :ok
@@ -1051,8 +1019,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
             key = segment_projection_registry_key(root_dir)
             :ets.delete(@segment_projection_registry, {key, :context})
             :ets.delete(@segment_projection_registry, {key, :position})
-            # The relocation table belongs to this storage process.
-            :ets.delete(@segment_projection_registry, {key, :prepared_checkpoint})
+            :ets.delete(@segment_projection_registry, {key, :adopted_checkpoint})
         end
 
         :ok
@@ -1082,36 +1049,21 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
         :ok
       end
 
-      defp register_prepared_segment_projection_checkpoint(root_dir, prepared) do
+      defp register_adopted_segment_projection_checkpoint(root_dir, adopted) do
         ensure_segment_projection_registry!()
-        key = {segment_projection_registry_key(root_dir), :prepared_checkpoint}
-        true = :ets.insert(@segment_projection_registry, {key, prepared})
+        key = {segment_projection_registry_key(root_dir), :adopted_checkpoint}
+        true = :ets.insert(@segment_projection_registry, {key, adopted})
         :ok
       end
 
-      defp lookup_prepared_segment_projection_checkpoint(root_dir) do
+      defp lookup_adopted_segment_projection_checkpoint(root_dir) do
         ensure_segment_projection_registry!()
-        key = {segment_projection_registry_key(root_dir), :prepared_checkpoint}
+        key = {segment_projection_registry_key(root_dir), :adopted_checkpoint}
 
         case :ets.lookup(@segment_projection_registry, key) do
-          [{^key, prepared}] -> {:ok, prepared}
+          [{^key, adopted}] -> {:ok, adopted}
           [] -> :none
         end
-      end
-
-      # The adopted checkpoint's files are now the projection; its table is spent.
-      defp forget_prepared_segment_projection_checkpoint(root_dir, %{table: table} = prepared) do
-        key = {segment_projection_registry_key(root_dir), :prepared_checkpoint}
-        :ets.delete_object(@segment_projection_registry, {key, prepared})
-
-        if prepared.storage_name do
-          send_storage_info(
-            prepared.storage_name,
-            {:ferricstore_waraft_segment_projection_relocation_table_consumed, table}
-          )
-        end
-
-        :ok
       end
 
       defp lookup_segment_projection_context(root_dir) do
