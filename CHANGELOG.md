@@ -12,17 +12,31 @@ All notable changes to FerricStore will be documented here.
     while storage briefly holds its applies. Before, a checkpoint was discarded
     whenever a write landed during its scan, so it never succeeded under
     sustained writes.
-  - A trim adopts the finished checkpoint by renaming it into place and moving
-    keydir rows from an in-memory table. It no longer rewrites or rereads the
-    projection.
+  - A finished checkpoint adopts itself in the background: it is renamed into
+    place as the projection and the keydir rows below its position are
+    repointed at it. A trim then only drops the log behind it, so the work left
+    in the Raft commit path (value pins and apply-projection compaction) no
+    longer grows with the number of keys.
   - Without a usable checkpoint a trim is deferred (the log keeps its entries)
     and asks for one. A trim may also adopt a checkpoint that covers only part
     of the request. Past
     `:waraft_segment_projection_trim_max_deferred_entries` entries behind the
     log floor (default 1,000,000; 0 never defers) a trim rebuilds the
     projection synchronously as before.
-  - In a 256-writer unique-key run that reached 1.8M keys, the worst write
-    pause dropped from more than 10 s to under 0.6 s.
+  - A checkpoint fills its location table from the verify pass of its own
+    write instead of reading its projection back a third time.
+  - Checkpoints that find every node-wide slot taken get one in the order they
+    asked, so no shard is starved. The number of slots is
+    `:waraft_segment_projection_checkpoint_concurrency` (default: a quarter of
+    the schedulers, at least 1).
+  - In a 256-writer unique-key run on 4 shards that reached 4.3M keys, the worst
+    write pause dropped from more than 10 s to under 0.4 s, with no timeouts.
+- Fix lost writes during WARaft log trims. Repointing a keydir row at the
+  projection read the row and wrote it back in two steps while storage kept
+  applying writes, so a write to the same key in between was overwritten until
+  restart. The compare and the replace are now one atomic step.
+- Warm cold reads of WARaft-backed keys. Warming built a match spec that ETS
+  rejects for WARaft locations, so these keys were read from disk every time.
 
 ## 0.12.0 - 2026-10-16
 
