@@ -361,6 +361,20 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorWriterProjectsTerminalHistory
         shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
         path = Ferricstore.Flow.LMDB.path(shard_data_path)
 
+        # The flush waits for 100 ms without enqueues. A slow runner can get past
+        # that window before a check, and then the flush is allowed, so each
+        # check only applies while its window is still open (the file is read
+        # before the clock).
+        refute_flushed_while_quiet = fn quiet_since ->
+          flushed? = File.exists?(Path.join(path, "data.mdb"))
+
+          if System.monotonic_time(:millisecond) - quiet_since < 100 do
+            refute flushed?
+          end
+        end
+
+        first_enqueued_at = System.monotonic_time(:millisecond)
+
         assert :ok =
                  Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [
                    {:put, key1, "v1"}
@@ -374,14 +388,16 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorWriterProjectsTerminalHistory
                    123
                  )
 
+        last_enqueued_at = System.monotonic_time(:millisecond)
+
         assert :ok =
                  Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [
                    {:put, key2, "v2"}
                  ])
 
+        refute_flushed_while_quiet.(first_enqueued_at)
         Process.sleep(80)
-
-        refute File.exists?(Path.join(path, "data.mdb"))
+        refute_flushed_while_quiet.(last_enqueued_at)
 
         Ferricstore.Test.ShardHelpers.eventually(fn ->
           Ferricstore.Flow.LMDB.get(path, key1) == {:ok, "v1"} and
