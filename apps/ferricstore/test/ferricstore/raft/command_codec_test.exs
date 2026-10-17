@@ -151,8 +151,8 @@ defmodule Ferricstore.Raft.CommandCodecTest do
              )
 
     entries =
-      for dir <- Path.wildcard(Path.join(data_dir(), "waraft/*/segment_log")),
-          {:ttb, bytes} <- log_commands(dir),
+      for shard_index <- 0..(FerricStore.Instance.get(:default).shard_count - 1),
+          {:ttb, bytes} <- log_commands(shard_index),
           {:ok, command} = CommandStamp.decode_ttb(bytes),
           :binary.match(:erlang.term_to_binary(command), id) != :nomatch,
           do: {bytes, command}
@@ -163,32 +163,23 @@ defmodule Ferricstore.Raft.CommandCodecTest do
     assert Enum.any?(entries, fn {_bytes, command} -> inspect(command) =~ ":flow_complete" end)
   end
 
-  defp data_dir, do: FerricStore.Instance.get(:default).data_dir
+  # Reads a shard's Raft log by index up to its last appended entry, as WARaft
+  # does. The default instance keeps appending in the background (expiry and
+  # schedules left by earlier tests), and a scan of the segment files can reach
+  # a record whose append is still in flight: on macOS CI runners that is a CRC
+  # mismatch at the tail.
+  defp log_commands(shard_index) do
+    log_module = :ferricstore_waraft_spike_segment_log
+    table = :ferricstore_waraft_backend
+    partition = shard_index + 1
 
-  # The default instance keeps appending in the background (expiry and
-  # schedules left by earlier tests), so this scan can reach a record whose
-  # append is still in flight. On macOS CI runners that shows up as a CRC
-  # mismatch at the log tail; the append lands within moments, so retry
-  # briefly. Lasting corruption still fails the match below.
-  defp log_commands(dir, attempts \\ 50) do
-    result =
-      :ferricstore_waraft_spike_segment_log.fold_disk(
-        String.to_charlist(dir),
-        fn
-          _index, {_term, {_ref, command}}, acc -> [command | acc]
-          _index, _other, acc -> acc
-        end,
-        []
-      )
+    log =
+      {:raft_log, :wa_raft_log.registered_name(table, partition), table, table, partition,
+       log_module}
 
-    case result do
-      {:error, {:crc_mismatch, _offset}} when attempts > 1 ->
-        Process.sleep(20)
-        log_commands(dir, attempts - 1)
-
-      {:ok, commands} ->
-        commands
-    end
+    for index <- log_module.first_index(log)..log_module.last_index(log)//1,
+        {:ok, {_term, {_ref, command}}} <- [log_module.get(log, index)],
+        do: command
   end
 
   defp random_term(depth) do
