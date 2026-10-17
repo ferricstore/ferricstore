@@ -340,6 +340,23 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
         end
 
         @doc false
+        def __relocate_segment_projection_row_for_test__(
+              keydir,
+              original_row,
+              projection_index,
+              projection_offset,
+              projected_value_size
+            ) do
+          compare_and_relocate_segment_projection_row_sized(
+            keydir,
+            original_row,
+            projection_index,
+            projection_offset,
+            projected_value_size
+          )
+        end
+
+        @doc false
         def __compact_apply_projection_log_for_test__(
               root_dir,
               ctx,
