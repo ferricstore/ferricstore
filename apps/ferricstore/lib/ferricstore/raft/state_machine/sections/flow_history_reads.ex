@@ -201,6 +201,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
 
       defp flow_rewind_record(record, fields, attrs, now_ms) do
         with {:ok, target_state} <- flow_history_required_field(fields, "state"),
+             # A claim event records the Flow running under a lease; rewinding to
+             # it would leave a running Flow with no lease owner.
+             :ok <- Ferricstore.Flow.MutationAttrs.reject_running_state_transition(target_state),
              {:ok, priority} <-
                flow_history_integer_field(fields, "priority", Map.get(record, :priority, 0)),
              {:ok, attempts} <-

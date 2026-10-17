@@ -20,6 +20,11 @@ All notable changes to FerricStore will be documented here.
     (`:flow_schedule_history_max_events`). At level 2, a schedule created with
     a longer history takes the shorter one on its next fire, and the worker
     then deletes the values and members the trimmed history held.
+- Fix a rewind to an event recorded while the Flow was claimed crashing the
+  shard's storage process. The rewound record was running with no lease owner,
+  and building its worker index key raised inside Raft apply. Such a rewind now
+  fails with `ERR flow running state is only entered by FLOW.CLAIM_DUE`, and a
+  running record without a lease owner fails validation instead of raising.
 
 ## 0.12.1 - 2026-10-17
 

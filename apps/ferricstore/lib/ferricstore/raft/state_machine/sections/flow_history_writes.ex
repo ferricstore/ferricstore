@@ -682,9 +682,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
 
       defp flow_validate_running_index_keys(%{state: "running"} = record, type, partition_key) do
         with :ok <- flow_validate_key_size(FlowKeys.inflight_index_key(type, partition_key)) do
-          flow_validate_key_size(
-            FlowKeys.worker_index_key(Map.get(record, :lease_owner, ""), partition_key)
-          )
+          case Map.get(record, :lease_owner, "") do
+            owner when is_binary(owner) ->
+              flow_validate_key_size(FlowKeys.worker_index_key(owner, partition_key))
+
+            _missing ->
+              {:error, "ERR flow running state is only entered by FLOW.CLAIM_DUE"}
+          end
         end
       end
 
