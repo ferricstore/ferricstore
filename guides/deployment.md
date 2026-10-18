@@ -539,7 +539,8 @@ shard_0: 2
     policy.
   - 2: running Flows, schedules included, release the values their trimmed
     history no longer refers to (without it a schedule's keydir grows with every
-    fire), and rewinds refuse events whose values were released.
+    fire and every overlap check), and rewinds refuse events whose values were
+    released.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.

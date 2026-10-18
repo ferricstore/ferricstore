@@ -4,6 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Give schedules held back by overlap the short history too. A schedule whose
+  previous target never finishes (`overlap_policy: :queue_after_previous` or
+  `:skip`) does not fire again: each due time it records the overlap and
+  rewrites its record, about every 30 seconds with the default retry. Only a
+  fire carried the 100-event history window, so a schedule created with a
+  longer one kept it and kept every version, and its keydir grew without bound
+  even at feature level 2. Overlap, skip and other rewrites of an active
+  schedule now carry the window as well, and the background worker then
+  releases the values and members the trimmed history held.
+
 ## 0.12.2 - 2026-10-18
 
 - Stop Flows that never finish, such as schedules, from growing the keydir
