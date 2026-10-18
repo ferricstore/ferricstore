@@ -1204,6 +1204,7 @@ defmodule Ferricstore.Flow.Schedule do
         fencing_token: Map.fetch!(record, :fencing_token),
         payload: definition,
         run_at_ms: run_at_ms,
+        history_max_events: history_max_events(),
         now_ms: now_ms
       )
     )
@@ -1376,6 +1377,9 @@ defmodule Ferricstore.Flow.Schedule do
        else: fallback
   end
 
+  # Overlap and skip rewrite the schedule without firing it; a schedule whose
+  # previous target never finishes does only this, so it takes the short history
+  # here too (feature level 2).
   defp reschedule_definition(ctx, record, definition, run_at_ms, now_ms) do
     Flow.reschedule(
       ctx,
@@ -1387,6 +1391,7 @@ defmodule Ferricstore.Flow.Schedule do
         fencing_token: Map.fetch!(record, :fencing_token),
         payload: definition,
         run_at_ms: run_at_ms,
+        history_max_events: history_max_events(),
         now_ms: now_ms
       )
     )
