@@ -24,6 +24,8 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
   alias Ferricstore.TermCodec
 
+  require Logger
+
   @version 2
   @default_batch_size 512
   @default_batch_bytes 4 * 1_024 * 1_024
@@ -1392,15 +1394,25 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
     end
   end
 
-  defp read_lmdb_records!([], _ctx), do: []
+  defp read_lmdb_records!(state_keys, ctx) do
+    case read_lmdb_records(state_keys, ctx) do
+      {:ok, records} ->
+        records
 
-  defp read_lmdb_records!(state_keys, ctx) when is_list(state_keys) do
+      {:error, reason} ->
+        raise "shared-ref backfill failed to decode or hydrate LMDB QueryRows: #{inspect(reason)}"
+    end
+  end
+
+  defp read_lmdb_records([], _ctx), do: {:ok, []}
+
+  defp read_lmdb_records(state_keys, ctx) when is_list(state_keys) do
     max_input_bytes =
       ctx.batch_bytes
       |> max(QueryRecordStore.max_input_bytes(ctx.instance_ctx))
       |> min(@maximum_hydration_bytes)
 
-    do_read_lmdb_records!(
+    do_read_lmdb_records(
       ctx,
       state_keys,
       CommandTime.now_ms(),
@@ -1409,10 +1421,10 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
     )
   end
 
-  defp do_read_lmdb_records!(_ctx, [], _visibility_ms, _max_input_bytes, acc),
-    do: Enum.reverse(acc)
+  defp do_read_lmdb_records(_ctx, [], _visibility_ms, _max_input_bytes, acc),
+    do: {:ok, Enum.reverse(acc)}
 
-  defp do_read_lmdb_records!(ctx, state_keys, visibility_ms, max_input_bytes, acc) do
+  defp do_read_lmdb_records(ctx, state_keys, visibility_ms, max_input_bytes, acc) do
     case QueryRecordStore.read_many(
            ctx.instance_ctx,
            ctx.shard_index,
@@ -1434,10 +1446,10 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
 
         cond do
           complete? and remaining == [] ->
-            Enum.reverse(next_acc)
+            {:ok, Enum.reverse(next_acc)}
 
           not complete? and remaining != [] ->
-            do_read_lmdb_records!(ctx, remaining, visibility_ms, max_input_bytes, next_acc)
+            do_read_lmdb_records(ctx, remaining, visibility_ms, max_input_bytes, next_acc)
 
           true ->
             raise "shared-ref backfill received an inconsistent LMDB QueryRow page"
@@ -1446,8 +1458,8 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
       {:ok, _records, _complete?} ->
         raise "shared-ref backfill received an empty LMDB QueryRow page"
 
-      {:error, reason} ->
-        raise "shared-ref backfill failed to decode or hydrate LMDB QueryRows: #{inspect(reason)}"
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -1919,6 +1931,9 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
                   lmdb_write_batch!(ctx, [{:delete, spill_key}])
                   NativeOrderedIndex.delete_member(ctx.native, index_key, key)
                   acc
+
+                {:unreadable, _index_key, _owned_key} ->
+                  acc
               end
 
             :expired ->
@@ -1980,6 +1995,9 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
                       do: NativeOrderedIndex.delete_member(ctx.native, index_key, key)
 
                     acc
+
+                  {:unreadable, _index_key, _owned_key} ->
+                    acc
                 end
 
               :not_found ->
@@ -2037,6 +2055,9 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
         if ctx.native do
           NativeOrderedIndex.delete_member(ctx.native, index_key, key)
         end
+
+      {:unreadable, _index_key, _owned_key} ->
+        :ok
     end
 
     :ok
@@ -2065,6 +2086,10 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
     case lookup_cleanup_owner_record!(ctx, state_key) do
       :not_found ->
         {:stale, index_key, owned_key}
+
+      :unreadable ->
+        report_unreadable_owner(ctx, member_key, state_key)
+        {:unreadable, index_key, owned_key}
 
       {:ok, %{id: ^owner_id} = record} ->
         expected_index =
@@ -2095,8 +2120,59 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
         cached_hot_owner_record!(ctx, state_key, cache)
 
       _not_rebuilding ->
-        lookup_record!(ctx, state_key)
+        lookup_owner_record!(ctx, state_key)
     end
+  end
+
+  # An owner whose LMDB row survives but whose record no longer reads back (a
+  # rewrite left the row on another key's frame) is reported, not fatal: its
+  # cleanup members are kept but not registered, so nothing is released for
+  # it, and every other read of it still fails closed.
+  defp lookup_owner_record!(ctx, state_key) do
+    case lookup_primary_value!(ctx, state_key) do
+      {:ok, encoded} ->
+        {:ok, decode_record!(state_key, encoded)}
+
+      :not_found ->
+        case lmdb_get!(ctx, state_key) do
+          {:ok, _query_row} ->
+            case read_lmdb_records([state_key], ctx) do
+              {:ok, [{^state_key, record}]} ->
+                {:ok, record}
+
+              {:ok, []} ->
+                :not_found
+
+              {:error, :query_storage_inconsistent} ->
+                :unreadable
+
+              {:error, reason} ->
+                raise "shared-ref backfill failed to decode or hydrate LMDB QueryRows: #{inspect(reason)}"
+
+              {:ok, _invalid} ->
+                raise "shared-ref backfill failed to resolve LMDB state"
+            end
+
+          :not_found ->
+            :not_found
+
+          {:error, reason} ->
+            raise "shared-ref backfill LMDB state read failed: #{inspect(reason)}"
+        end
+    end
+  end
+
+  defp report_unreadable_owner(ctx, member_key, state_key) do
+    Logger.warning(
+      "shared-ref backfill kept cleanup member #{inspect(member_key)} unregistered: " <>
+        "its owner #{inspect(state_key)} cannot be read back"
+    )
+
+    :telemetry.execute(
+      [:ferricstore, :flow, :shared_ref_backfill, :cleanup_owner_unreadable],
+      %{count: 1},
+      %{shard_index: ctx.shard_index, owner_state_key: state_key, member_key: member_key}
+    )
   end
 
   defp cached_hot_owner_record!(ctx, state_key, cache) do
@@ -2104,7 +2180,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
       [{^state_key, encoded, _expiry, _lfu, _file_id, _offset, _size}]
       when is_binary(encoded) ->
         if BlobRef.encoded_size?(byte_size(encoded)) do
-          lookup_record!(ctx, state_key)
+          lookup_owner_record!(ctx, state_key)
         else
           case Map.get(cache.owners, state_key) do
             {^encoded, record} ->
@@ -2121,10 +2197,10 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
         end
 
       _cold_or_missing ->
-        lookup_record!(ctx, state_key)
+        lookup_owner_record!(ctx, state_key)
     end
   rescue
-    ArgumentError -> lookup_record!(ctx, state_key)
+    ArgumentError -> lookup_owner_record!(ctx, state_key)
   end
 
   defp maybe_cache_hot_owner!(state_key, encoded, record, cache) do

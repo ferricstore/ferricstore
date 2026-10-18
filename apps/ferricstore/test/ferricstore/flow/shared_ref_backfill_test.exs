@@ -772,6 +772,48 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
              NativeOrderedIndex.range_slice(native, index_key, :neg_inf, :inf, false, 0, :all)
   end
 
+  # A projection rewrite can drop the record an LMDB-only owner row points at.
+  # Startup must not refuse the whole store for it, and must not release the
+  # owner's values either: the member stays, unregistered, and is reported.
+  test "final native rebuild keeps but does not register members of an unreadable owner",
+       test_ctx do
+    owned_ref = Keys.value_key("unreadable-owner", :result, 1, "tenant")
+    rec = record("unreadable-owner", result_ref: owned_ref)
+    state_key = insert_lmdb_record!(test_ctx, rec)
+    append_primary!(test_ctx, [{owned_ref, Flow.encode_value("result")}])
+    assert :ok = run!(test_ctx)
+
+    insert_mislocated_lmdb_record!(test_ctx, rec)
+    NativeOrderedIndex.reset(test_ctx.flow_index, test_ctx.flow_lookup)
+
+    parent = self()
+    handler = "unreadable-owner-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:ferricstore, :flow, :shared_ref_backfill, :cleanup_owner_unreadable],
+      fn _event, measurements, metadata, _config ->
+        send(parent, {:cleanup_owner_unreadable, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    assert :ok = run!(test_ctx)
+
+    member_key = Keys.retention_cleanup_member_key(rec.id, owned_ref, rec.partition_key)
+    index_key = Keys.retention_cleanup_index_key(rec.id, rec.partition_key)
+    native = NativeOrderedIndex.get(test_ctx.flow_index, test_ctx.flow_lookup)
+
+    assert :ets.member(test_ctx.keydir, member_key)
+    assert :ets.member(test_ctx.keydir, owned_ref)
+    assert 0 == NativeOrderedIndex.count_all(native, index_key)
+
+    assert_receive {:cleanup_owner_unreadable, %{count: 1},
+                    %{shard_index: 0, owner_state_key: ^state_key, member_key: ^member_key}}
+  end
+
   test "final native rebuild rejects forged cleanup member ownership for a live owner",
        test_ctx do
     rec = record("member-owner")
@@ -1184,6 +1226,56 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
                {:put, state_key, query_row}
              ])
 
+    state_key
+  end
+
+  # The row points at a durable frame that holds another key, as when a rewrite
+  # renumbered the frames under it.
+  defp insert_mislocated_lmdb_record!(test_ctx, record) do
+    state_key = Keys.state_key(record.id, record.partition_key)
+    encoded = Flow.encode_record(record)
+    other_key = Keys.state_key(record.id <> "-other", record.partition_key)
+    index = System.unique_integer([:positive, :monotonic])
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+               test_ctx.data_dir,
+               test_ctx.shard_index,
+               index,
+               [{other_key, Flow.encode_record(%{record | id: record.id <> "-other"}), 0}]
+             )
+
+    assert {:ok, 1} =
+             Ferricstore.Raft.WARaftSegmentReader.ensure_apply_projection_entries_durable(
+               test_ctx.data_dir,
+               test_ctx.shard_index,
+               [{index, other_key}]
+             )
+
+    assert {:ok, {segment_generation, frame_offset, frame_size}} =
+             Ferricstore.Raft.WARaftSegmentReader.physical_location(
+               %{data_dir: test_ctx.data_dir},
+               test_ctx.shard_index,
+               {:waraft_apply_projection, index}
+             )
+
+    locator =
+      Locator.new!(
+        flow_id: record.id,
+        kind: :state,
+        version: record.version,
+        raft_index: index,
+        file_id: {:waraft_apply_projection, index},
+        offset: frame_offset,
+        value_size: byte_size(encoded),
+        checksum: :crypto.hash(:sha256, encoded),
+        expire_at_ms: 0,
+        segment_generation: segment_generation,
+        frame_size: frame_size
+      )
+
+    assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, locator, 0)
+    assert :ok = LMDB.write_batch(LMDB.path(test_ctx.shard_path), [{:put, state_key, query_row}])
     state_key
   end
 
