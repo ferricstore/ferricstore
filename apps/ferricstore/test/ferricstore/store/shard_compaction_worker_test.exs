@@ -76,8 +76,8 @@ defmodule Ferricstore.Store.ShardCompactionWorkerTest do
         end)
       end)
 
-      caller =
-        spawn(fn ->
+      {caller, caller_ref} =
+        spawn_monitor(fn ->
           result = catch_exit(GenServer.call(pid, {:run_compaction, [0]}, :infinity))
           send(parent, {:compaction_caller_stopped, result})
         end)
@@ -95,8 +95,9 @@ defmodule Ferricstore.Store.ShardCompactionWorkerTest do
 
       assert_receive {:DOWN, ^worker_ref, :process, ^worker, _reason}, 1_000
       assert_receive {:compaction_caller_stopped, _reason}, 1_000
+      # The caller reports before it exits, so wait for it to go down.
+      assert_receive {:DOWN, ^caller_ref, :process, ^caller, _reason}, 1_000
       refute Process.alive?(worker)
-      refute Process.alive?(caller)
     after
       cleanup_shard(pid, ctx, dir)
     end
