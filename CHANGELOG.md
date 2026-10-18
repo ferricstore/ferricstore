@@ -4,6 +4,22 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.4 - 2026-10-18
+
+- Start when a Flow's stored state record can no longer be read back. A
+  segment-projection rewrite (checkpoint adoption, or the rebuild at a trim or
+  shutdown) keeps only keydir-backed values, so a finished Flow whose state
+  lived only in LMDB could lose its record, and the startup rebuild of the
+  retention cleanup index then refused to start the whole store with
+  `:query_storage_inconsistent`. Members of such an owner are now kept but not
+  registered, so nothing is released on its behalf, and reported with a
+  warning and `[:ferricstore, :flow, :shared_ref_backfill,
+  :cleanup_owner_unreadable]`. Reads of that Flow still fail closed.
+- Stop the QueryRow locator repair from moving a row onto another key's
+  record. Segment-projection frame numbers are positions in the current log
+  and every rewrite renumbers them; the repair now uses a projection frame
+  only after reading it and finding the row's key and checksum there.
+
 ## 0.12.3 - 2026-10-18
 
 - Give schedules held back by overlap the short history too. A schedule whose
