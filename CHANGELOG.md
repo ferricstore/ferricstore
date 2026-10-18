@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.2 - 2026-10-18
+
 - Stop Flows that never finish, such as schedules, from growing the keydir
   without bound. Every change to a Flow's payload, result or error writes the
   value under a new version, with a retention cleanup member (a hot keydir row)
