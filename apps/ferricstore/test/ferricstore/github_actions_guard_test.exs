@@ -35,34 +35,84 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     assert missing_paths == []
   end
 
+  @waraft_suites [
+    "apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs",
+    "apps/ferricstore/test/ferricstore/raft/waraft_backend_part2_test.exs"
+  ]
+
   test "serial WARaft backend tests do not overload a core partition" do
     workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
-
-    waraft_suite =
-      File.read!(
-        Path.join(
-          @repo_root,
-          "apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs"
-        )
-      )
-
-    assert waraft_suite =~ "@moduletag :waraft_backend_suite"
     refute workflow =~ "--exclude waraft_backend_suite"
 
-    assert count_occurrences(
-             workflow,
-             "apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs"
-           ) == 4
+    for suite <- @waraft_suites do
+      assert File.read!(Path.join(@repo_root, suite)) =~ "use Ferricstore.Test.WARaftBackendCase"
 
-    assert count_occurrences(
-             workflow,
-             "mix test apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs"
-           ) == 2
+      # Excluded from both core partition runs, and one WARaft job per OS.
+      assert count_occurrences(workflow, suite) == 4, "#{suite} is not wired into CI"
+    end
 
+    assert count_occurrences(workflow, "mix test ${{ matrix.file }} --timeout 30000") == 2
     assert workflow =~ "test-waraft-ubuntu:"
     assert workflow =~ "test-waraft-macos:"
-    assert workflow =~ "test-results-waraft-ubuntu"
-    assert workflow =~ "test-results-waraft-macos"
+    assert workflow =~ "test-results-waraft-ubuntu-${{ matrix.part }}"
+    assert workflow =~ "test-results-waraft-macos-${{ matrix.part }}"
+  end
+
+  test "the WARaft suites together run every WARaft section exactly once" do
+    sections_dir = "apps/ferricstore/test/ferricstore/raft/waraft_backend_test/sections"
+
+    sections =
+      @repo_root
+      |> Path.join(sections_dir)
+      |> File.ls!()
+      |> Enum.reject(&String.starts_with?(&1, "helpers_part_"))
+      |> Enum.sort()
+
+    used =
+      Enum.flat_map(@waraft_suites, fn suite ->
+        source = File.read!(Path.join(@repo_root, suite))
+        Regex.scan(~r/sections\/([a-z0-9_]+\.exs)/, source, capture: :all_but_first)
+      end)
+      |> List.flatten()
+      |> Enum.reject(&String.starts_with?(&1, "helpers_part_"))
+
+    assert Enum.sort(used) == sections
+  end
+
+  test "durability suites run side by side" do
+    workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
+    durability = workflow_section(workflow, "  test-durability:", "  test-perf-guard:")
+
+    assert durability =~ ~s|name: "Durability tests (${{ matrix.suite }})"|
+    assert durability =~ "suite: [shard-kill, jepsen, server-and-large-alloc]"
+
+    for {step, suite} <- [
+          {"Run ferricstore shard-kill tests", "shard-kill"},
+          {"Run Jepsen tests", "jepsen"},
+          {"Run ferricstore_server shard-kill tests", "server-and-large-alloc"},
+          {"Run large-allocation tests", "server-and-large-alloc"}
+        ] do
+      assert workflow_step(durability, step) =~ "matrix.suite == '#{suite}'",
+             "#{step} does not run in the #{suite} job"
+    end
+
+    assert durability =~ "test-results-durability-${{ matrix.suite }}"
+  end
+
+  test "cluster tests run in two partitions" do
+    workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
+    cluster = workflow_section(workflow, "  test-cluster:", "name: test-results-cluster")
+
+    assert cluster =~ ~s|name: "Cluster tests (${{ matrix.partition }}/2)"|
+    assert cluster =~ "partition: [1, 2]"
+
+    core = workflow_step(cluster, "Run ferricstore cluster tests")
+    assert core =~ "MIX_TEST_PARTITION=${{ matrix.partition }}"
+    assert core =~ "--only cluster --partitions 2 --timeout 180000 --seed 0"
+
+    server = workflow_step(cluster, "Run ferricstore_server cluster tests")
+    assert server =~ "matrix.partition == 1"
+    assert workflow =~ "test-results-cluster-${{ matrix.partition }}"
   end
 
   test "core shards always upload audit and BEAM crash diagnostics" do

@@ -149,7 +149,10 @@ defmodule Ferricstore.Flow.ClaimWaitersTest do
 
           receive do
             :register ->
-              result = ClaimWaiters.register([key], self(), now_ms() + 1_000)
+              # A deadline that cannot pass during the run: an expired waiter
+              # is pruned and frees its row, so a slow runner would let a
+              # second registration in legitimately.
+              result = ClaimWaiters.register([key], self(), now_ms() + 60_000)
               send(parent, {:registered, self(), result})
 
               receive do
@@ -161,12 +164,15 @@ defmodule Ferricstore.Flow.ClaimWaitersTest do
 
     on_exit(fn -> Enum.each(contenders, &Process.exit(&1, :kill)) end)
 
-    Enum.each(contenders, fn pid -> assert_receive {:ready, ^pid}, 1_000 end)
+    Enum.each(contenders, fn pid ->
+      assert_receive {:ready, ^pid}, @waiter_registration_timeout_ms
+    end)
+
     Enum.each(contenders, &send(&1, :register))
 
     results =
       Enum.map(contenders, fn pid ->
-        assert_receive {:registered, ^pid, result}, 1_000
+        assert_receive {:registered, ^pid, result}, @waiter_registration_timeout_ms
         result
       end)
 
