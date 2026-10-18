@@ -151,7 +151,65 @@ defmodule Ferricstore.Flow.Query.QueryRowRelocatorTest do
     refute_receive {:repair_ops, _ops}
   end
 
-  defp row_fixture(id, version, index, offset) do
+  # Projection-log frames are renumbered on every rewrite, so the frame now at a
+  # row's old number usually holds another key. The repair must not move the
+  # row there.
+  test "repair leaves a projection QueryRow alone when the frame now holds another key" do
+    row = row_fixture("run-projection", 7, 37_548, 17_670_794, {:waraft_projection, 37_548})
+    parent = self()
+
+    assert {:ok, 0} =
+             QueryRowRelocator.repair_many(
+               %{},
+               0,
+               "/lmdb",
+               [{row.state_key, row.locator}],
+               get_many: fn "/lmdb", [_key] -> {:ok, [{:ok, row.encoded}]} end,
+               physical_location: fn _ctx, 0, {:waraft_projection, 37_548} ->
+                 {:ok, {0, 17_634_744, 635}}
+               end,
+               verify_projection_frame: fn _ctx, 0, state_key, locator ->
+                 send(parent, {:verified, state_key, locator.offset})
+                 false
+               end,
+               write_batch: fn "/lmdb", ops -> send(parent, {:ops, ops}) end,
+               get: fn _path, _key -> flunk("no write, so no compare race") end
+             )
+
+    assert_receive {:verified, state_key, 17_634_744}
+    assert state_key == row.state_key
+    refute_receive {:ops, _ops}
+  end
+
+  test "repair moves a projection QueryRow when the frame holds its record" do
+    row = row_fixture("run-projection", 7, 37_548, 17_670_794, {:waraft_projection, 37_548})
+    parent = self()
+
+    assert {:ok, 1} =
+             QueryRowRelocator.repair_many(
+               %{},
+               0,
+               "/lmdb",
+               [{row.state_key, row.locator}],
+               get_many: fn "/lmdb", [_key] -> {:ok, [{:ok, row.encoded}]} end,
+               physical_location: fn _ctx, 0, {:waraft_projection, 37_548} ->
+                 {:ok, {0, 17_634_744, 2_074}}
+               end,
+               verify_projection_frame: fn _ctx, 0, _state_key, _locator -> true end,
+               write_batch: fn "/lmdb", ops ->
+                 send(parent, {:ops, ops})
+                 :ok
+               end,
+               get: fn _path, _key -> flunk("successful repair performed a scalar read") end
+             )
+
+    assert_receive {:ops, [{:compare, _key, _expected}, {:put, key, replacement}]}
+    assert {:ok, repaired} = QueryRowCodec.decode(replacement, key)
+    assert repaired.locator.offset == 17_634_744
+    assert repaired.locator.frame_size == 2_074
+  end
+
+  defp row_fixture(id, version, index, offset, file_id \\ nil) do
     record = %{
       id: id,
       version: version,
@@ -171,7 +229,7 @@ defmodule Ferricstore.Flow.Query.QueryRowRelocatorTest do
         kind: :state,
         version: version,
         raft_index: index,
-        file_id: {:waraft_apply_projection, index},
+        file_id: file_id || {:waraft_apply_projection, index},
         segment_generation: 1,
         offset: offset,
         frame_size: 180,
