@@ -12,6 +12,7 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
   alias Ferricstore.Commands.Native
   alias Ferricstore.FetchOrCompute
   alias Ferricstore.FetchOrCompute.Worker
+  alias Ferricstore.HLC
   alias Ferricstore.Store.Router
 
   defmodule ImmediateStorage do
@@ -413,6 +414,11 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
 
       ["compute", _, token] = Native.handle("FETCH_OR_COMPUTE", [key, "5000"], dummy_store())
 
+      # The expiry is HLC time. Raft apply merges each entry's stamp into the
+      # node's HLC, so a test that ran the clock ahead can leave it ahead of
+      # the wall clock; bound the expiry by the HLC around the publish.
+      before_ms = HLC.now_ms()
+
       assert :ok =
                Native.handle(
                  "FETCH_OR_COMPUTE_RESULT",
@@ -422,8 +428,8 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
 
       assert "ttl_val" == Router.get(FerricStore.Instance.get(:default), key)
       {_val, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), key)
-      assert expire_at_ms > System.os_time(:millisecond)
-      assert expire_at_ms <= System.os_time(:millisecond) + 6_000
+      assert expire_at_ms >= before_ms + 5_000
+      assert expire_at_ms <= HLC.now_ms() + 5_000
     end
 
     test "subsequent FETCH_OR_COMPUTE returns hit after result delivered" do

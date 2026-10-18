@@ -48,6 +48,21 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
     end
   end
 
+  # The offset registry is node-wide: other logs, such as the application's own
+  # shards, add rows while a test runs.
+  defp add_other_log_offset_rows do
+    :ets.insert(
+      :ferricstore_waraft_segment_offset_registry,
+      for(index <- 1..3, do: {{"/other-segment-log", index}, 0, index * 16, 16})
+    )
+  end
+
+  defp offset_registry_rows_under(root) do
+    :ferricstore_waraft_segment_offset_registry
+    |> :ets.select([{{{:"$1", :_}, :_, :_, :_}, [], [:"$1"]}])
+    |> Enum.count(&(&1 == root or String.starts_with?(&1, root <> "/")))
+  end
+
   defp with_segment_log_memory_env(opts) do
     previous_db = Application.get_env(:wa_raft, :raft_database)
     previous_records = Application.get_env(:ferricstore, :waraft_segment_log_records_per_segment)
@@ -389,7 +404,8 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
                )
              )
 
-    assert :ets.info(:ferricstore_waraft_segment_offset_registry, :size) <= 6
+    add_other_log_offset_rows()
+    assert offset_registry_rows_under(root) <= 6
     assert {:ok, {_ordinal, offset, size}} = provider.location_for_index(to_charlist(root), 1)
 
     assert {:ok,
@@ -409,7 +425,8 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
              provider.read_disk(to_charlist(root), 33)
 
     assert entries == [{"key-33", "new", 0}]
-    assert :ets.info(:ferricstore_waraft_segment_offset_registry, :size) <= 6
+    add_other_log_offset_rows()
+    assert offset_registry_rows_under(root) <= 6
   end
 
   test "disk projection fold supplies validated physical locations during one scan" do
@@ -479,7 +496,8 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
         %{dir: dir} = provider.memory_status(log)
         index_path = Path.join(dir, "0.idx")
         assert File.regular?(index_path)
-        assert :ets.info(:ferricstore_waraft_segment_offset_registry, :size) <= 6
+        add_other_log_offset_rows()
+        assert offset_registry_rows_under(dir) <= 6
 
         assert {:ok, {ordinal, offset, size}} =
                  provider.location_for_index(to_charlist(Path.dirname(dir)), 1)
