@@ -7,6 +7,7 @@ defmodule Ferricstore.Flow.Query.QueryRowRelocator do
 
   @maximum_rows 4_096
   @maximum_cas_retries 8
+  @verify_timeout_ms 10_000
 
   @type entry :: %{state_key: binary(), encoded: binary(), locator: Locator.t()}
 
@@ -18,20 +19,27 @@ defmodule Ferricstore.Flow.Query.QueryRowRelocator do
   def relocate_many(ctx, shard_index, lmdb_path, entries, opts)
       when is_map(ctx) and is_integer(shard_index) and shard_index >= 0 and
              is_binary(lmdb_path) and lmdb_path != "" and is_list(entries) and is_list(opts) do
+    case relocate_entries(ctx, shard_index, lmdb_path, entries, opts) do
+      {:ok, _relocated} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def relocate_many(_ctx, _shard_index, _lmdb_path, _entries, _opts),
+    do: {:error, :invalid_query_row_relocation_request}
+
+  defp relocate_entries(ctx, shard_index, lmdb_path, entries, opts) do
     with :ok <- validate_entries(entries),
          {:ok, dependencies} <- dependencies(opts, ctx, shard_index),
-         {:ok, updates} <- build_updates(entries, dependencies),
+         {:ok, updates, skipped} <- build_updates(entries, dependencies),
          :ok <- write_updates(lmdb_path, updates, dependencies) do
-      :ok
+      {:ok, length(entries) - skipped}
     end
   rescue
     error -> {:error, {:query_row_relocation_failed, error}}
   catch
     kind, reason -> {:error, {:query_row_relocation_failed, {kind, reason}}}
   end
-
-  def relocate_many(_ctx, _shard_index, _lmdb_path, _entries, _opts),
-    do: {:error, :invalid_query_row_relocation_request}
 
   @doc false
   @spec repair_many(
@@ -51,8 +59,8 @@ defmodule Ferricstore.Flow.Query.QueryRowRelocator do
     with :ok <- validate_repair_requests(requests),
          true <- is_function(get_many, 2),
          {:ok, entries} <- read_matching_entries(get_many, lmdb_path, requests),
-         :ok <- relocate_many(ctx, shard_index, lmdb_path, entries, opts) do
-      {:ok, length(entries)}
+         {:ok, relocated} <- relocate_entries(ctx, shard_index, lmdb_path, entries, opts) do
+      {:ok, relocated}
     else
       false -> {:error, :invalid_query_row_repair_dependencies}
       {:error, _reason} = error -> error
@@ -180,11 +188,11 @@ defmodule Ferricstore.Flow.Query.QueryRowRelocator do
   defp build_updates(entries, dependencies) do
     entries
     |> Enum.group_by(& &1.locator.file_id)
-    |> Enum.reduce_while({:ok, []}, fn {file_id, grouped_entries}, {:ok, acc} ->
+    |> Enum.reduce_while({:ok, [], 0}, fn {file_id, grouped_entries}, {:ok, acc, skipped} ->
       case locate(dependencies, file_id) do
         {:ok, location} ->
-          case build_group_updates(grouped_entries, location, acc) do
-            {:ok, next} -> {:cont, {:ok, next}}
+          case build_group_updates(grouped_entries, location, dependencies, acc, skipped) do
+            {:ok, next, next_skipped} -> {:cont, {:ok, next, next_skipped}}
             {:error, _reason} = error -> {:halt, error}
           end
 
@@ -193,33 +201,82 @@ defmodule Ferricstore.Flow.Query.QueryRowRelocator do
       end
     end)
     |> case do
-      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:ok, reversed, skipped} -> {:ok, Enum.reverse(reversed), skipped}
       {:error, _reason} = error -> error
     end
   end
 
-  defp build_group_updates([], _location, acc), do: {:ok, acc}
+  defp build_group_updates([], _location, _dependencies, acc, skipped), do: {:ok, acc, skipped}
 
   defp build_group_updates(
          [%{state_key: state_key, encoded: encoded, locator: current} | entries],
-         {ordinal, offset, frame_size},
-         acc
+         {ordinal, offset, frame_size} = location,
+         dependencies,
+         acc,
+         skipped
        ) do
     with {:ok, relocated} <- relocate_locator(current, ordinal, offset, frame_size) do
-      if Locator.same_physical_record?(current, relocated) do
-        build_group_updates(entries, {ordinal, offset, frame_size}, acc)
-      else
-        case QueryRowCodec.relocate(encoded, state_key, current, relocated) do
-          {:ok, replacement} ->
-            update = %{state_key: state_key, expected: encoded, replacement: replacement}
-            build_group_updates(entries, {ordinal, offset, frame_size}, [update | acc])
+      cond do
+        Locator.same_physical_record?(current, relocated) ->
+          build_group_updates(entries, location, dependencies, acc, skipped)
 
-          {:error, reason} ->
-            {:error, {:query_row_relocation_encode_failed, state_key, reason}}
-        end
+        not verified_target?(dependencies, state_key, relocated) ->
+          build_group_updates(entries, location, dependencies, acc, skipped + 1)
+
+        true ->
+          case QueryRowCodec.relocate(encoded, state_key, current, relocated) do
+            {:ok, replacement} ->
+              update = %{state_key: state_key, expected: encoded, replacement: replacement}
+              build_group_updates(entries, location, dependencies, [update | acc], skipped)
+
+            {:error, reason} ->
+              {:error, {:query_row_relocation_encode_failed, state_key, reason}}
+          end
       end
     else
       {:error, reason} -> {:error, {:invalid_query_row_relocation, state_key, reason}}
+    end
+  end
+
+  # A projection-log frame number is a position in the current log, which every
+  # rewrite renumbers, so the frame now at a row's number usually holds another
+  # key. Such a target is used only once it is shown to hold the row's record.
+  defp verified_target?(
+         dependencies,
+         state_key,
+         %Locator{file_id: {:waraft_projection, _}} = locator
+       ),
+       do:
+         dependencies.verify_projection_frame.(
+           dependencies.ctx,
+           dependencies.shard_index,
+           state_key,
+           locator
+         ) == true
+
+  defp verified_target?(_dependencies, _state_key, _locator), do: true
+
+  defp verify_projection_frame(ctx, shard_index, state_key, %Locator{} = locator) do
+    request = %{
+      file_id: locator.file_id,
+      ordinal: locator.segment_generation,
+      offset: locator.offset,
+      frame_size: locator.frame_size,
+      key: state_key
+    }
+
+    case WARaftSegmentReader.read_physical_values(
+           ctx,
+           shard_index,
+           [request],
+           @verify_timeout_ms,
+           :include_expired
+         ) do
+      {:ok, %{^state_key => value}} when is_binary(value) ->
+        is_nil(locator.checksum) or :crypto.hash(:sha256, value) == locator.checksum
+
+      _missing_or_failed ->
+        false
     end
   end
 
@@ -328,16 +385,21 @@ defmodule Ferricstore.Flow.Query.QueryRowRelocator do
     if waraft_locator?(locator) do
       with {:ok, {ordinal, offset, frame_size}} <- locate(dependencies, locator.file_id),
            {:ok, relocated} <- relocate_locator(locator, ordinal, offset, frame_size) do
-        if Locator.same_physical_record?(locator, relocated) do
-          {:ok, :current}
-        else
-          case QueryRowCodec.relocate(encoded, state_key, locator, relocated) do
-            {:ok, replacement} ->
-              {:ok, %{state_key: state_key, expected: encoded, replacement: replacement}}
+        cond do
+          Locator.same_physical_record?(locator, relocated) ->
+            {:ok, :current}
 
-            {:error, reason} ->
-              {:error, {:query_row_relocation_encode_failed, state_key, reason}}
-          end
+          not verified_target?(dependencies, state_key, relocated) ->
+            {:ok, :current}
+
+          true ->
+            case QueryRowCodec.relocate(encoded, state_key, locator, relocated) do
+              {:ok, replacement} ->
+                {:ok, %{state_key: state_key, expected: encoded, replacement: replacement}}
+
+              {:error, reason} ->
+                {:error, {:query_row_relocation_encode_failed, state_key, reason}}
+            end
         end
       end
     else
@@ -367,12 +429,15 @@ defmodule Ferricstore.Flow.Query.QueryRowRelocator do
         Keyword.get(opts, :physical_location, &WARaftSegmentReader.physical_location/3),
       write_batch: Keyword.get(opts, :write_batch, &LMDB.write_batch/2),
       get: Keyword.get(opts, :get, &LMDB.get/2),
+      verify_projection_frame:
+        Keyword.get(opts, :verify_projection_frame, &verify_projection_frame/4),
       ctx: ctx,
       shard_index: shard_index
     }
 
     if is_function(dependencies.physical_location, 3) and
-         is_function(dependencies.write_batch, 2) and is_function(dependencies.get, 2) do
+         is_function(dependencies.write_batch, 2) and is_function(dependencies.get, 2) and
+         is_function(dependencies.verify_projection_frame, 4) do
       {:ok, dependencies}
     else
       {:error, :invalid_query_row_relocation_dependencies}
