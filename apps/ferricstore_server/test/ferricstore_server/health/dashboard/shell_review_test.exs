@@ -36,7 +36,7 @@ defmodule FerricstoreServer.Health.Dashboard.ShellReviewTest do
     assert script =~ "data-dashboard-table-filter"
     assert script =~ "preserveWorkflowScope"
     assert script =~ "new URL(window.location.href)"
-    assert Layout.render_subpage_header("Doctor") =~ "data-dashboard-captured-at"
+    assert Layout.render_page_header("doctor") =~ "data-dashboard-captured-at"
   end
 
   test "Overview scope summary identifies type-only and combined predicates" do

@@ -5,9 +5,8 @@
 <div class="layout">
 <%= render_sidebar_static("clients") %>
 <main class="main-content" id="dashboard-main" tabindex="-1">
-<%= render_subpage_header("Client List") %>
+<%= render_page_header("clients", intro: "See active native protocol connections, authenticated user metadata, connection flags, and blocked client pressure.") %>
 <div class="content">
-<%= render_page_intro("Clients", "See active native protocol connections, authenticated user metadata, connection flags, and blocked client pressure.") %>
 <%= render_live_component("clients_summary", render_clients_summary(data.connections, data.clients)) %>
 <%= render_live_component("clients_table", render_clients_page_table(data)) %>
 </div>

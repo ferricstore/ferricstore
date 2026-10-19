@@ -12,10 +12,8 @@
 <div class="layout">
 <%= render_sidebar_static("keyspace") %>
 <main class="main-content" id="dashboard-main" tabindex="-1">
-<%= render_subpage_header("Keyspace") %>
+<%= render_page_header("keyspace", intro: "Find keys, inspect metadata, and confirm whether values are hot in memory, cold in Bitcask/WARaft segments, or represented by blob refs without loading large payloads.") %>
 <div class="content">
-<%= render_page_intro("Keyspace", "Find keys, inspect metadata, and confirm whether values are hot in memory, cold in Bitcask/WARaft segments, or represented by blob refs without loading large payloads.") %>
-<%= render_kv_subnav("keyspace") %>
 <%= render_keyspace_controls(data) %>
 <%= render_live_component("keyspace_inspector", render_keyspace_inspector(data.inspected)) %>
 <%= render_live_component("keyspace_table", render_keyspace_table(data)) %>

@@ -4,9 +4,8 @@
 <div class="layout">
 <%= render_sidebar_static("flow_workers") %>
 <main class="main-content" id="dashboard-main" tabindex="-1">
-<%= render_subpage_header("Flow Workers") %>
+<%= render_page_header("flow_workers", intro: "Track worker leases, running jobs, lease age, and stalled worker pressure.") %>
 <div class="content">
-<%= render_page_intro("Flow Workers", "Track worker leases, running jobs, lease age, and stalled worker pressure.") %>
 <%= render_flow_context_tools(data, "flow_workers") %>
 <%= render_live_component("flow_workers", render_flow_workers(data.workers, Map.get(data, :filters, %{}))) %>
 <%= render_live_component("flow_running_records", render_flow_running_records(data.running_records, data.total_sampled, data.sample_limit)) %>

@@ -4,7 +4,7 @@
 <div class="layout">
 <%= render_sidebar_static("flow") %>
 <main class="main-content" id="dashboard-main" tabindex="-1">
-<%= render_subpage_header("Workflows") %>
+<%= render_page_header("flow") %>
 <div class="content">
 <%= render_flow_context_tools(data, "flow") %>
 <%= render_flow_overview_filter(data) %>

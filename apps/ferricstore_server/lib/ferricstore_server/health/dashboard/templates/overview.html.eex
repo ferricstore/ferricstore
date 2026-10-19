@@ -5,9 +5,8 @@
 <div class="layout">
 <%= render_live_component("sidebar", render_sidebar(data, "overview")) %>
 <main class="main-content" id="dashboard-main" tabindex="-1">
-<h1 class="sr-only">Overview</h1>
+<%= render_page_header("overview", intro: "Fast health snapshot for uptime, memory, cache hit rate, cold-read pressure, storage, consensus, and recent slow commands.") %>
 <div class="content">
-<%= render_page_intro("Overview", "Fast health snapshot for uptime, memory, cache hit rate, cold-read pressure, storage, consensus, and recent slow commands.") %>
 <%= render_live_component("content", render_overview_content(data)) %>
 </div>
 </main>

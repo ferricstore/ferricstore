@@ -4,9 +4,8 @@
 <div class="layout">
 <%= render_sidebar_static("flow_policies") %>
 <main class="main-content" id="dashboard-main" tabindex="-1">
-<%= render_subpage_header("FerricFlow Policies") %>
+<%= render_page_header("flow_policies", intro: "Review and edit retry, exhausted-state, and retention policy defaults for Flow types and states.") %>
 <div class="content">
-<%= render_page_intro("FerricFlow Policies", "Review and edit retry, exhausted-state, and retention policy defaults for Flow types and states.") %>
 <%= render_flow_context_tools(data, "flow_policies") %>
 <%= render_flow_policy_editor(data) %>
 <%= if Map.get(data, :catalog_loaded, true) do %>

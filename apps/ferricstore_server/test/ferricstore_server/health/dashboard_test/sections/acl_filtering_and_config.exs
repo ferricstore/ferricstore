@@ -1261,14 +1261,14 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           NamespaceConfig.reset_all()
         end
 
-        test "config sidebar link appears after merge status in sidebar" do
+        test "config sidebar link sits in the Admin section" do
           data = Dashboard.collect()
           html = Dashboard.render(data)
 
-          merge_pos = :binary.match(html, "Merge Status") |> elem(0)
+          admin_pos = :binary.match(html, ~s(id="nav-section-admin")) |> elem(0)
           config_pos = :binary.match(html, ~s(<span class="nav-label">Config</span>)) |> elem(0)
 
-          assert config_pos > merge_pos
+          assert config_pos > admin_pos
         end
       end
     end

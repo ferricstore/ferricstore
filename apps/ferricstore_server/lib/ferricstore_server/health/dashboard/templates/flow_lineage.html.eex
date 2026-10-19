@@ -4,9 +4,8 @@
 <div class="layout">
 <%= render_sidebar_static("flow_lineage") %>
 <main class="main-content" id="dashboard-main" tabindex="-1">
-<%= render_subpage_header("Flow Lineage") %>
+<%= render_page_header("flow_lineage", intro: "Trace workflow relationships by parent, root, or correlation id for debugging fanout and dependency chains.") %>
 <div class="content">
-<%= render_page_intro("Flow Lineage", "Trace workflow relationships by parent, root, or correlation id for debugging fanout and dependency chains.") %>
 <%= render_flow_context_tools(data, "flow_lineage") %>
 <%= render_flow_lineage_controls(data) %>
 <%= render_flow_lineage_status(data) %>

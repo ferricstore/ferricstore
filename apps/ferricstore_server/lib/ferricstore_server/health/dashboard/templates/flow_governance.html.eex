@@ -9,10 +9,9 @@
   <div class="layout">
     <%= render_sidebar_static("flow_governance") %>
     <main class="main-content" id="dashboard-main" tabindex="-1">
-      <%= render_subpage_header("FerricFlow Governance") %>
+      <%= render_page_header("flow_governance", intro: "Inspect approval requests, durable budget counters, and distributed credit-limit leases used by governed workflows.") %>
       <div class="content">
-        <%= render_page_intro("FerricFlow Governance", "Inspect approval requests, durable budget counters, and distributed credit-limit leases used by governed workflows.") %>
-        <%= if Map.get(data, :governance_form_only?, false) do %>
+                <%= if Map.get(data, :governance_form_only?, false) do %>
         <%= render_flow_governance_form_recovery(data) %>
         <% else %>
         <%= render_flow_context_tools(data, "flow_governance") %>

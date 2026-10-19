@@ -4,10 +4,8 @@
 <div class="layout">
 <%= render_sidebar_static("storage") %>
 <main class="main-content" id="dashboard-main" tabindex="-1">
-<%= render_subpage_header("Storage") %>
+<%= render_page_header("storage", intro: "Inspect per-shard disk footprint, Bitcask/WARaft files, hint files, and storage skew.") %>
 <div class="content">
-<%= render_page_intro("Storage", "Inspect per-shard disk footprint, Bitcask/WARaft files, hint files, and storage skew.") %>
-<%= render_kv_subnav("storage") %>
 <%= render_live_component("storage_summary", render_storage_summary(data)) %>
 <%= render_live_component("storage_table", render_storage_table(data.shards)) %>
 </div>

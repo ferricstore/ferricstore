@@ -4,10 +4,9 @@
   <div class="layout">
     <%= render_sidebar_static("flow_schedules") %>
     <main class="main-content" id="dashboard-main" tabindex="-1">
-      <%= render_subpage_header("FerricFlow Schedules") %>
+      <%= render_page_header("flow_schedules", intro: "Inspect durable schedules, pause/resume active campaigns, manually fire a schedule, and delete schedules that should no longer run.") %>
       <div class="content">
-        <%= render_page_intro("FerricFlow Schedules", "Inspect durable schedules, pause/resume active campaigns, manually fire a schedule, and delete schedules that should no longer run.") %>
-        <%= render_flow_context_tools(data, "flow_schedules") %>
+                <%= render_flow_context_tools(data, "flow_schedules") %>
         <%= render_flow_schedules_flash(Map.get(data, :flash)) %>
         <%= if Map.get(data, :catalog_loaded, true), do: render_flow_schedules_summary(data) %>
         <%= render_flow_schedule_create_form(data) %>

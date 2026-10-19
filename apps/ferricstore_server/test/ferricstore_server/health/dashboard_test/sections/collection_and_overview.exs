@@ -210,48 +210,51 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.CollectionAndOverview 
 
         test "contains slow log nav link to sub-page", %{html: html} do
           assert String.contains?(html, ~s(href="/dashboard/slowlog"))
-          assert String.contains?(html, "Slow Log")
+          assert String.contains?(html, "Slow log")
         end
 
-        test "contains merge status nav link to sub-page", %{html: html} do
-          assert String.contains?(html, ~s(href="/dashboard/merge"))
-          assert String.contains?(html, "Merge Status")
+        test "reaches merge status through the Storage destination", %{html: html} do
+          assert String.contains?(html, ~s(href="/dashboard/storage"))
+
+          assert FerricstoreServer.Health.Dashboard.Layout.render_page_header("storage") =~
+                   ~s(href="/dashboard/merge">Merges</a>)
         end
 
-        test "groups workflow tools beneath the Workflows parent", %{html: html} do
-          assert html =~ ~s(<summary>Workflows</summary>)
+        test "groups workflow tools beneath the Workflows section", %{html: html} do
+          assert html =~
+                   ~s(<span class="nav-section-label" id="nav-section-workflows">Workflows</span>)
 
           assert html =~
                    ~r/href="\/dashboard\/flow"[^>]*><span class="nav-label">Overview<\/span>/
 
           workflows_position =
             html
-            |> :binary.match(~s(<summary>Workflows</summary>))
+            |> :binary.match(~s(id="nav-section-workflows"))
             |> elem(0)
 
-          states_position =
+          runs_position =
             html
             |> :binary.match(~s(href="/dashboard/flow/states"))
             |> elem(0)
 
-          messaging_position =
+          data_position =
             html
-            |> :binary.match(~s(<summary>Messaging</summary>))
+            |> :binary.match(~s(id="nav-section-data"))
             |> elem(0)
 
-          assert workflows_position < states_position
-          assert states_position < messaging_position
+          assert workflows_position < runs_position
+          assert runs_position < data_position
         end
 
         test "groups sidebar by dashboard subject", %{html: html} do
-          assert String.contains?(html, ~s(<summary>Workflows</summary>))
+          for section <- ["Workflows", "Data", "Cluster", "Admin"] do
+            assert html =~
+                     ~s(<span class="nav-section-label" id="nav-section-#{String.downcase(section)}">#{section}</span>)
+          end
+
           assert String.contains?(html, ~s(href="/dashboard/flow/states"))
-          assert String.contains?(html, "States / FIFO")
-          assert String.contains?(html, ~s(<summary>KV / Data</summary>))
-          assert String.contains?(html, ~s(<summary>Messaging</summary>))
+          assert String.contains?(html, ">Runs<")
           assert String.contains?(html, ~s(href="/dashboard/streams"))
-          assert String.contains?(html, ~s(href="/dashboard/pubsub"))
-          assert String.contains?(html, ~s(<summary>Control Plane</summary>))
           assert String.contains?(html, ~s(href="/dashboard/security"))
         end
 
@@ -320,8 +323,8 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.CollectionAndOverview 
           assert String.contains?(body, "Shards")
           assert String.contains?(body, "Connections")
           # Sidebar navigation links
-          assert String.contains?(body, "Slow Log")
-          assert String.contains?(body, "Merge Status")
+          assert String.contains?(body, "Slow log")
+          assert String.contains?(body, "Storage")
           assert String.contains?(body, "Config")
         end
 

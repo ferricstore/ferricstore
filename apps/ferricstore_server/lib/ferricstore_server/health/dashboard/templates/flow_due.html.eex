@@ -4,9 +4,8 @@
 <div class="layout">
 <%= render_sidebar_static("flow_due") %>
 <main class="main-content" id="dashboard-main" tabindex="-1">
-<%= render_subpage_header("Due / Scheduled") %>
+<%= render_page_header("flow_due", intro: "Inspect sampled work whose scheduled time has passed or is still in the future.") %>
 <div class="content">
-<%= render_page_intro("Due / Scheduled", "Inspect sampled work whose scheduled time has passed or is still in the future.") %>
 <%= render_flow_context_tools(data, "flow_due") %>
 <%= render_live_component("flow_due_chart", render_flow_due_chart(data.due_now, data.scheduled)) %>
 <%= render_live_component("flow_fifo_lanes", render_flow_fifo_lanes(Map.get(data, :fifo_lanes, []), data.total_sampled, data.sample_limit, Map.get(data, :fifo_coverage, %{}))) %>

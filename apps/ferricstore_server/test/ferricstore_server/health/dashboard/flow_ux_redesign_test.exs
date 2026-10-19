@@ -536,14 +536,12 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
 
     test "page purpose is compact and does not repeat its title" do
       html =
-        FerricstoreServer.Health.Dashboard.Layout.render_page_intro(
-          "Flow States",
-          "Inspect workflow state."
+        FerricstoreServer.Health.Dashboard.Layout.render_page_header("flow_states",
+          intro: "Inspect workflow state."
         )
 
-      assert html =~ "Inspect workflow state."
-      refute html =~ ~s(class="page-intro-title")
-      refute html =~ ">Flow States<"
+      assert html =~ ~s(<p class="page-intro">Inspect workflow state.</p>)
+      assert length(Regex.scan(~r/>Runs</, html)) == 1
     end
 
     test "empty operational sections use collapsed progressive disclosure" do
@@ -561,33 +559,6 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
                ~s(<summary><span>Blocked Readers</span><span class="badge badge-idle">0</span></summary>)
 
       refute html =~ ~s(<details class="dashboard-disclosure" open>)
-    end
-
-    test "sidebar uses collapsible subject groups and opens the active workflow group" do
-      html = FerricstoreServer.Health.Dashboard.Layout.render_sidebar_static("flow_states")
-
-      assert html =~ ~s(data-dashboard-nav-group="Workflows")
-      assert html =~ ~r/<details[^>]*data-dashboard-nav-group="Workflows"[^>]*open/
-      assert html =~ ~s(<summary>Workflows</summary>)
-      assert html =~ ~s(href="/dashboard/flow/states")
-
-      assert html =~
-               ~s(<div class="nav-subgroup" role="group" aria-labelledby="workflow-nav-operate">)
-
-      assert html =~ ~s(id="workflow-nav-operate">Operate</div>)
-      assert html =~ ~s(id="workflow-nav-investigate">Investigate</div>)
-      assert html =~ ~s(id="workflow-nav-configure">Configure</div>)
-      assert html =~ ~s(href="/dashboard/flow/query")
-      assert html =~ ">Query Studio<"
-
-      assert :binary.match(html, ~s(id="workflow-nav-operate")) <
-               :binary.match(html, ~s(href="/dashboard/flow/states"))
-
-      assert :binary.match(html, ~s(id="workflow-nav-investigate")) <
-               :binary.match(html, ~s(href="/dashboard/flow/failures"))
-
-      assert :binary.match(html, ~s(id="workflow-nav-configure")) <
-               :binary.match(html, ~s(href="/dashboard/flow/policies"))
     end
 
     test "workflow context links preserve only safe compatible filters" do
@@ -1052,7 +1023,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
       assert css =~ ".keyboard-modal"
       assert css =~ ".dashboard-disclosure"
       assert css =~ ".operator-attention"
-      assert css =~ ".nav-subgroup"
+      assert css =~ ".nav-section-label"
       assert css =~ ".flow-investigation-context"
       assert css =~ ".flow-detail-sections"
       assert css =~ ".flow-query-workspace"

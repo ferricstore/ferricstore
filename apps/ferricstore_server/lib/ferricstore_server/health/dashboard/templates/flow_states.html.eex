@@ -13,9 +13,8 @@ lane_scope? =
 <div class="layout">
 <%= render_sidebar_static("flow_states") %>
 <main class="main-content" id="dashboard-main" tabindex="-1">
-<%= render_subpage_header("Flow States") %>
+<%= render_page_header("flow_states", intro: "Filter sampled workflows by type, state, partition, time range, and name to find live workflow distribution.") %>
 <div class="content">
-<%= render_page_intro("Flow States", "Filter sampled workflows by type, state, partition, time range, and name to find live workflow distribution.") %>
 <%= render_flow_context_tools(data, "flow_states") %>
 <%= render_flow_type_filter(data) %>
 <%= if map_size(Map.get(filters, :errors, %{})) == 0 do %>
