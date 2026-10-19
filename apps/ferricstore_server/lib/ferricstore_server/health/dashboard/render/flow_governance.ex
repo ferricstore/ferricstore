@@ -1,7 +1,7 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
   alias FerricstoreServer.Health.Dashboard.Flow.Governance
   alias FerricstoreServer.Health.Dashboard.Render.FlowQueryResults
-  alias FerricstoreServer.Health.Dashboard.Render.{FlowNavigation, StateMetadata}
+  alias FerricstoreServer.Health.Dashboard.Render.{FlowNavigation, PageStatus, StateMetadata}
   alias Ferricstore.Flow.Governance.CircuitStore
 
   @metadata_fields ~w(meta_type meta_state meta_key meta_value meta_value_type meta_partition_key meta_cursor)
@@ -13,8 +13,6 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
 
   import FerricstoreServer.Health.Dashboard.Render.FlowHistory,
     only: [flow_state_class: 1, render_flow_id_link: 2]
-
-  import FerricstoreServer.Health.Dashboard.Render.FlowOverview, only: [render_flow_stat_card: 3]
 
   def render_flow_governance_form_recovery(data) do
     draft = Map.get(data, :action_draft, %{})
@@ -101,18 +99,81 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
     counts = Map.get(data, :counts, %{})
 
     """
-    <div class="flow-card-grid">
-      #{render_flow_stat_card("Approvals", Map.get(counts, :approvals, 0), "bounded approval records")}
-      #{render_flow_stat_card("Pending", Map.get(counts, :pending_approvals, 0), "approval requests waiting")}
-      #{render_flow_stat_card("Budgets", Map.get(counts, :budgets, 0), "durable budget counters")}
-      #{render_flow_stat_card("Limits", Map.get(counts, :limits, 0), "distributed credit owners")}
-      #{render_flow_stat_card("Circuits", Map.get(counts, :circuits, 0), "durable effect circuit scopes")}
-      #{render_flow_stat_card("Open", Map.get(counts, :open_circuits, 0), "currently rejecting effects")}
-    </div>
+    #{render_flow_governance_status(counts)}
+    <dl class="stat-strip" aria-label="Governance counts">
+      #{stat("Approvals", count(counts, :approvals))}
+      #{stat("Pending", count(counts, :pending_approvals), :warning)}
+      #{stat("Budgets", count(counts, :budgets))}
+      #{stat("Credit limits", count(counts, :limits))}
+      #{stat("Circuits", count(counts, :circuits))}
+      #{stat("Open circuits", count(counts, :open_circuits), :degraded)}
+    </dl>
     #{render_flow_governance_flash(Map.get(data, :flash))}
     #{render_flow_governance_error(Map.get(data, :error))}
     """
   end
+
+  defp count(counts, key) do
+    case Map.get(counts, key, 0) do
+      value when is_integer(value) -> value
+      _other -> 0
+    end
+  end
+
+  defp stat(label, value, alert \\ nil) do
+    class = if alert && value > 0, do: ~s( class="is-#{alert}"), else: ""
+    ~s(<div#{class}><dt>#{label}</dt><dd>#{format_grouped(value)}</dd></div>)
+  end
+
+  defp render_flow_governance_status(counts) do
+    open = count(counts, :open_circuits)
+    half_open = count(counts, :half_open_circuits)
+    pending = count(counts, :pending_approvals)
+    total = Enum.sum(Enum.map([:approvals, :budgets, :limits, :circuits], &count(counts, &1)))
+
+    waiting =
+      if pending > 0,
+        do: ["#{format_grouped(pending)} #{plural(pending, "approval")} waiting"],
+        else: []
+
+    half = if half_open > 0, do: ["#{format_grouped(half_open)} half-open"], else: []
+
+    cond do
+      open > 0 ->
+        PageStatus.render(
+          "governance",
+          :degraded,
+          "#{format_grouped(open)} #{plural(open, "circuit")} open",
+          ["rejecting effects"] ++ half ++ waiting
+        )
+
+      pending > 0 ->
+        PageStatus.render(
+          "governance",
+          :warning,
+          "#{format_grouped(pending)} #{plural(pending, "approval")} waiting",
+          half
+        )
+
+      total == 0 ->
+        PageStatus.render("governance", :idle, "Governance is not in use", [
+          "No approvals, budgets, limits or circuits are visible."
+        ])
+
+      true ->
+        PageStatus.render(
+          "governance",
+          :healthy,
+          "Nothing waiting",
+          [
+            "no pending approvals or open circuits"
+          ] ++ half
+        )
+    end
+  end
+
+  defp plural(1, word), do: word
+  defp plural(_count, word), do: word <> "s"
 
   def render_flow_governance_filters(data) do
     filters = Map.get(data, :filters, %{})

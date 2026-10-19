@@ -272,6 +272,13 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .worker-lease-bar { display: block; height: 6px; border-radius: 999px; background: var(--accent); overflow: hidden; }
       .worker-lease-bar .is-expired { display: block; height: 100%; background: var(--warn); }
       .flow-local-scope { margin-bottom: 20px; }
+      .stat-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); margin: 0 0 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); overflow: hidden; }
+      .stat-strip > div { padding: 12px 16px; border-right: 1px solid var(--line-subtle); }
+      .stat-strip > div:last-child { border-right: 0; }
+      .stat-strip dt { color: var(--text-muted); font-size: 0.75rem; }
+      .stat-strip dd { margin: 2px 0 0; color: var(--text-strong); font-family: var(--font-mono); font-size: 1.125rem; }
+      .stat-strip .is-warning dd { color: var(--warn); }
+      .stat-strip .is-degraded dd { color: var(--danger-text); }
       .section-empty p + p, .section-empty p + .flow-lineage-hint-links, .section-empty p + a { margin-top: 10px; }
       .flow-query-toolbar .flow-section-note { margin: 0; }
       .flow-query-console .flow-query-help { flex-direction: column; gap: 4px; }
