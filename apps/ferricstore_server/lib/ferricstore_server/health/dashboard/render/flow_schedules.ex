@@ -414,7 +414,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
     """
     <h2 class="section-title">Schedules</h2>
     <div class="table-scroll" role="region" aria-label="Workflow schedules" tabindex="0"><table class="flow-schedules-table">
-      <colgroup><col style="width: 22%"><col style="width: 9%"><col style="width: 14%"><col style="width: 13%"><col style="width: 13%"><col style="width: 6%"><col style="width: 11%"><col style="width: 12%"></colgroup>
+      <colgroup><col style="width: 220px"><col style="width: 84px"><col style="width: 130px"><col style="width: 140px"><col style="width: 150px"><col style="width: 56px"><col style="width: 110px"><col style="width: 280px"></colgroup>
       <thead>
         <tr>
           <th scope="col">Schedule</th>

@@ -57,7 +57,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-query-empty { padding-block: 16px; border-block: 1px solid var(--line); margin-block: 16px; }
       .flow-query-empty h3 { font-size: 0.9rem; margin-bottom: 8px; }
       .flow-query-empty p { font-size: 0.8rem; overflow-wrap: anywhere; }
-      .table-scroll .flow-schedules-table { table-layout: fixed; min-width: 1080px; }
+      .table-scroll .flow-schedules-table { table-layout: fixed; min-width: 1160px; }
       .flow-schedule-cadence code { padding: 1px 5px; border-radius: 4px; background: var(--surface-selected); font-family: var(--font-mono); font-size: 0.75rem; }
       .flow-schedule-actions > * { margin: 2px 4px 2px 0; vertical-align: middle; }
       .flow-row-menu { position: relative; display: inline-block; vertical-align: middle; }
@@ -69,7 +69,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-row-menu-item:hover { background: var(--surface-selected); }
       .table-scroll .flow-policy-table { min-width: 1480px; }
       :is(.flow-policy-table, .flow-schedules-table) tr > :first-child:not([colspan]) { position: sticky; left: 0; z-index: 2; background: var(--surface-raised); min-width: 180px; width: 180px; border-right: 1px solid var(--line); }
-      :is(.flow-policy-table, .flow-schedules-table) tr > :last-child:not([colspan]) { position: sticky; right: 0; z-index: 2; background: var(--surface-raised); min-width: 210px; width: 210px; border-left: 1px solid var(--line); white-space: normal; }
+      :is(.flow-policy-table, .flow-schedules-table) tr > :last-child:not([colspan]) { position: sticky; right: 0; z-index: 2; background: var(--surface-raised); min-width: 280px; width: 280px; border-left: 1px solid var(--line); white-space: normal; }
       :is(.flow-policy-table, .flow-schedules-table) thead tr > :is(:first-child, :last-child) { z-index: 3; background: var(--surface-selected); }
       .flow-schedule-definition-row > td { white-space: normal; }
       .flow-schedule-definition-row .dashboard-disclosure { margin: 0; }
@@ -125,7 +125,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .dashboard-table-value-full { margin-top: 8px; max-height: 240px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
       .kv-query-row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
       .kv-query-row .kv-query-input { flex: 1 1 220px; }
-      .kv-query-row .kv-query-limit { display: flex; flex-direction: column; gap: 4px; color: var(--text-muted); font-size: 0.75rem; }
+      .kv-query-row .kv-query-limit { display: flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 0.8125rem; }
       .kv-query-row > button { flex: none; }
       .kv-search-foot { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 16px; }
       .kv-empty { margin-top: 4px; padding: 16px 18px; border: 1px dashed var(--line-strong); border-radius: 12px; color: var(--text-muted); font-size: 0.875rem; }

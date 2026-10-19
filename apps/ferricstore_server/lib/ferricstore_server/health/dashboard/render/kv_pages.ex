@@ -188,7 +188,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
       end
 
     exclusions =
-      if not get_in(data, [:filters, :include_internal]),
+      if get_in(data, [:filters, :include_internal]) != true,
         do:
           "Compound metadata is excluded; enable Compound metadata to include it. Protected workflow and server records remain hidden.",
         else: ""
