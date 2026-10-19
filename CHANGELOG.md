@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer a typed native HSET whose field name or value is a map or a list
+  with a bad-request error. It raised while turning the field into a string,
+  so the client got an internal server error and the server logged a stack
+  trace for each such request.
 - Reject a Bloom or Cuckoo filter element that is not a string in
   `FerricStore.bf_add/2`, `bf_madd/2`, `cf_add/2`, `cf_addnx/2` and
   `cf_del/2` instead of crashing the shard. The element reached the

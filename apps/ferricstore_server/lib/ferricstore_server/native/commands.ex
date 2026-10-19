@@ -1202,7 +1202,8 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp do_execute(@op_hset, payload, state) do
     with {:ok, key} <- require_binary(payload, "key"),
-         {:ok, fields} <- require_nonempty_map(payload, "fields") do
+         {:ok, fields} <- require_nonempty_map(payload, "fields"),
+         :ok <- require_scalar_hash_fields(fields) do
       result_to_reply(FerricStore.Impl.hset(state.instance_ctx, key, fields), state)
     else
       {:error, reason} -> {:bad_request, reason, state}
@@ -4112,6 +4113,17 @@ defmodule FerricstoreServer.Native.Commands do
         {:error, "ERR native field params must be a map"}
     end
   end
+
+  # Field names and values are stringified for the hash; a map or a list that
+  # is not text cannot be, and raised while the command ran.
+  defp require_scalar_hash_fields(fields) do
+    if Enum.all?(fields, fn {name, value} -> hash_scalar?(name) and hash_scalar?(value) end),
+      do: :ok,
+      else: {:error, "ERR native field fields must map strings to strings or numbers"}
+  end
+
+  defp hash_scalar?(value) when is_map(value) or is_list(value), do: false
+  defp hash_scalar?(_value), do: true
 
   defp require_nonempty_map(payload, key) do
     with {:ok, value} <- require_map(payload, key) do

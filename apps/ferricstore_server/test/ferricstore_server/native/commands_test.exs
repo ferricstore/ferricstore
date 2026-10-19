@@ -4917,6 +4917,30 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert final_state.multi_state == :none
   end
 
+  test "typed HSET rejects a nested field name or value as a bad request" do
+    key = "native-hset-nested:#{System.unique_integer([:positive, :monotonic])}"
+
+    for fields <- [
+          %{"f" => %{"a" => 1}},
+          %{"f" => [-1]},
+          %{%{"a" => 1} => "v"}
+        ] do
+      log =
+        capture_log(fn ->
+          assert {:bad_request, "ERR native field fields must map strings to strings or numbers",
+                  _state} =
+                   Commands.execute(@op_hset, %{"key" => key, "fields" => fields}, state())
+        end)
+
+      refute log =~ "native command execution failed"
+    end
+
+    assert {:ok, 1, _state} =
+             Commands.execute(@op_hset, %{"key" => key, "fields" => %{"f" => 7}}, state())
+
+    assert {:ok, "7"} = FerricStore.hget(key, "f")
+  end
+
   test "native MULTI discards the transaction after a command is rejected while queueing" do
     username = "native-multi-denied"
     key = "native-multi-denied:#{System.unique_integer([:positive, :monotonic])}"
