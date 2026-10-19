@@ -66,7 +66,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
       <thead>
         <tr>
           <th>Type</th>
-          <th>State</th>
+          <th>Stored state</th>
           <th>Attention</th>
           <th>Oldest due</th>
           <th>Runs</th>
@@ -309,7 +309,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     table = """
     <table>
       <thead>
-        <tr><th>Type</th><th>Count Source</th><th>Total</th><th>Active</th><th>Queued</th><th>Running</th><th>Completed</th><th>Failed</th><th>Cancelled</th><th>Observed States</th></tr>
+        <tr><th>Type</th><th>Count source</th><th>Total</th><th>Active</th><th>Queued</th><th>Running</th><th>Completed</th><th>Failed</th><th>Cancelled</th><th>Observed states</th></tr>
       </thead>
       <tbody>
         #{rows}
@@ -318,7 +318,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     """
 
     """
-    <h2 class="section-title">State Breakdown</h2>
+    <h2 class="section-title">State breakdown</h2>
     #{accessible_table("Workflow state breakdown", table)}
     """
   end
@@ -484,7 +484,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     table = """
     <table class="flow-worker-records-table">
       <thead>
-        <tr><th>Workflow</th><th>Worker</th><th>Status</th><th>Lease Expires (UTC)</th></tr>
+        <tr><th>Workflow</th><th>Worker</th><th>Status</th><th>Lease expires (UTC)</th></tr>
       </thead>
       <tbody>
         #{rows}
@@ -792,7 +792,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
       end
 
     """
-    <h2 class="section-title" id="flow-recent-records">Recent Flow Records#{limit_badge}</h2>
+    <h2 class="section-title" id="flow-recent-records">Recent runs#{limit_badge}</h2>
     <div class="table-scroll" role="region" aria-label="Recent workflow records" tabindex="0"><table class="flow-runs-table">
       <thead>
         <tr><th>Workflow</th><th>State</th><th>Activity</th><th>Updated (UTC)</th><th>Values</th><th>Actions</th></tr>

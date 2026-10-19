@@ -23,7 +23,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Capabilities do
     """
     #{render_management_capability_summary(capabilities)}
     #{render_management_capability_table(capabilities)}
-    #{render_config_command_table("Management Command Contract", Map.get(data, :command_reference, []))}
+    #{render_config_command_table("Management command contract", Map.get(data, :command_reference, []))}
     """
   end
 
@@ -93,7 +93,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Capabilities do
       end)
 
     """
-    <h2 class="section-title">Capability Flags</h2>
+    <h2 class="section-title">Capability flags</h2>
     #{table_scroll("Capability flags", """
     <table>
     <thead>

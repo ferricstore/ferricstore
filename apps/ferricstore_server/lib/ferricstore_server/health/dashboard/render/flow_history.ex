@@ -120,12 +120,12 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
     <div class="flow-journal-card" data-flow-history-detail-byte-budget="#{@inline_detail_page_bytes}">
       <div class="flow-card-header">
         <div class="flow-card-header-title">
-          <span>Execution Journal</span>
+          <span>Execution journal</span>
           <span class="badge badge-idle">#{format_number(event_count)} #{event_label} on this page</span>
         </div>
         <div class="view-toggle" role="tablist" aria-label="Journal View Mode">
           <button type="button" role="tab" class="active" id="journal-tab-tree" aria-controls="journal-panel-tree" data-journal-view-toggle="tree" aria-selected="true" tabindex="0">Journal</button>
-          <button type="button" role="tab" id="journal-tab-table" aria-controls="journal-panel-table" data-journal-view-toggle="table" aria-selected="false" tabindex="-1">Raw Events</button>
+          <button type="button" role="tab" id="journal-tab-table" aria-controls="journal-panel-table" data-journal-view-toggle="table" aria-selected="false" tabindex="-1">Raw events</button>
         </div>
       </div>
       #{render_flow_history_controls(page, status)}
@@ -137,7 +137,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
         <h2 class="section-title sr-only">Timeline</h2>
         <div class="table-scroll" role="region" aria-label="Workflow history events" tabindex="0"><table>
           <thead>
-            <tr><th>Event</th><th>Time</th><th>Action</th><th>State Change</th><th>Version</th><th>Attempts</th><th>Worker</th><th>Values</th></tr>
+            <tr><th>Event</th><th>Time</th><th>Action</th><th>State change</th><th>Version</th><th>Attempts</th><th>Worker</th><th>Values</th></tr>
           </thead>
           <tbody>
             #{rows}

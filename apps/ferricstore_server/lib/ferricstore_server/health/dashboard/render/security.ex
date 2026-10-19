@@ -238,7 +238,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
         else: "acl-target-help"
 
     """
-    <h2 class="section-title">ACL Tester</h2>
+    <h2 class="section-title">ACL tester</h2>
     <div class="flow-filter-panel acl-tester-panel">
       <p class="flow-filter-note" id="acl-target-help">Check an enabled account against one or more command, key, channel, or route targets.</p>
       #{tester_field_error(errors, :targets, "acl-target-error")}
@@ -246,7 +246,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
         <label>User <input class="flow-search-input mono" type="search" name="user" value="#{escape_attr(Map.get(input, :user, ""))}" autocomplete="off" placeholder="default"#{tester_error_attributes(errors, :user, "acl-user-error")}>#{tester_field_error(errors, :user, "acl-user-error")}</label>
         <label>Command <input class="flow-search-input mono" type="search" name="command" value="#{escape_attr(Map.get(input, :command, ""))}" autocomplete="off" placeholder="GET"#{tester_error_attributes(errors, :command, "acl-command-error")}>#{tester_field_error(errors, :command, "acl-command-error")}</label>
         <label>Key <input class="flow-search-input mono" type="search" name="key" value="#{escape_attr(Map.get(input, :key, ""))}" autocomplete="off" placeholder="tenant:key"></label>
-        <label>Key Access #{render_key_access_select(Map.get(input, :key_access, :read))}</label>
+        <label>Key access #{render_key_access_select(Map.get(input, :key_access, :read))}</label>
         <label>Channel <input class="flow-search-input mono" type="search" name="channel" value="#{escape_attr(Map.get(input, :channel, ""))}" autocomplete="off" placeholder="tenant:events"></label>
         <label>HTTP method <select class="flow-search-input mono" name="route_method">#{Enum.map_join(["GET", "POST"], "", fn method -> ~s(<option value="#{method}"#{if Map.get(input, :route_method, "GET") == method, do: " selected", else: ""}>#{method}</option>) end)}</select></label>
         <label>Route <input class="flow-search-input mono" type="search" name="route_path" value="#{escape_attr(Map.get(input, :route_path, ""))}" autocomplete="off" placeholder="/dashboard/flow"></label>
@@ -474,7 +474,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
     <div class="dashboard-disclosure-body">
     #{table_scroll("Dashboard route requirements", """
     <table>
-      <thead><tr><th>Page</th><th>Method</th><th>Path</th><th>Required ACL Command</th><th>Key Scope</th></tr></thead>
+      <thead><tr><th>Page</th><th>Method</th><th>Path</th><th>Required ACL command</th><th>Key scope</th></tr></thead>
       <tbody>#{rows}</tbody>
     </table>
     """)}

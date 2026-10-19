@@ -253,7 +253,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
     """
     <details class="flow-operations-panel" data-flow-action-snapshot-version="#{escape_attr(to_string(version))}">
       <summary>
-        <span>Workflow Actions</span>
+        <span>Workflow actions</span>
         <span class="c-muted">Rewind or send an external signal</span>
       </summary>
       <div class="flow-operations-panel-body">
@@ -612,7 +612,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
 
   def render_flow_signal_action(%{action_capabilities: %{signal: false}}),
     do:
-      ~s(<p class="flow-section-note">Send Signal unavailable: requires +FLOW.SIGNAL and write access to this workflow partition.</p>)
+      ~s(<p class="flow-section-note">Send signal unavailable: requires +FLOW.SIGNAL and write access to this workflow partition.</p>)
 
   def render_flow_signal_action(%{record: %{} = record} = data) do
     id = flow_record_id(record)
@@ -631,7 +631,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
 
     """
     <div class="flow-policy-panel">
-      <h3 class="section-title">Send Signal #{info_icon("External signal records a signal payload event and can optionally transition the flow state.", "About signals")}</h3>
+      <h3 class="section-title">Send signal #{info_icon("External signal records a signal payload event and can optionally transition the flow state.", "About signals")}</h3>
       <form class="flow-policy-form" action="#{escape_attr(action)}" method="post" data-flow-signal-form data-dashboard-single-submit>
         <input type="hidden" name="id" value="#{escape_attr(id)}">
         #{partition_input}
@@ -639,29 +639,29 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
         #{render_flow_action_target(data)}
         <div class="flow-policy-grid">
           <label class="flow-policy-field">
-            <span>Signal Name</span>
+            <span>Signal name</span>
             <input class="flow-search-input mono" type="text" name="signal" value="#{escape_attr(ActionForm.value(data, "signal"))}" required placeholder="e.g. payment_received" title="Required signal name">
           </label>
           <label class="flow-policy-field">
-            <span>Transition To (optional)</span>
+            <span>Transition to (optional)</span>
             <input class="flow-search-input mono" type="text" name="transition_to" value="#{escape_attr(transition)}" placeholder="e.g. processing" title="Optional state to transition to upon receiving the signal">
           </label>
         </div>
         <div class="flow-policy-grid">
           <label class="flow-policy-field">
-            <span>Idempotency Key (optional)</span>
+            <span>Idempotency key (optional)</span>
             <input class="flow-search-input mono" type="text" name="idempotency_key" value="#{escape_attr(ActionForm.value(data, "idempotency_key"))}" placeholder="unique token" title="Optional unique signal deduplication key">
           </label>
           <label class="flow-policy-field">
-            <span>If State</span>
+            <span>If state</span>
             <input class="flow-search-input mono" type="text" name="if_state" value="#{escape_attr(if_state)}" placeholder="e.g. payment_pending" aria-describedby="flow-signal-state-help flow-signal-state-error"#{if needs_state?, do: " required", else: ""}#{if invalid_state?, do: ~s( aria-invalid="true"), else: ""}>
-            <span id="flow-signal-state-help" class="flow-field-help">Required when Transition To is set.</span>
+            <span id="flow-signal-state-help" class="flow-field-help">Required when Transition to is set.</span>
             <span id="flow-signal-state-error" class="flow-field-error" role="status"#{if invalid_state?, do: "", else: " hidden"}>Enter the state the workflow must currently be in.</span>
           </label>
         </div>
         <div class="flow-policy-actions">
           <p class="flow-action-review" data-flow-signal-review aria-live="polite">#{escape(flow_signal_review(data))}</p>
-          <button class="flow-search-button" type="submit">Send Signal</button>
+          <button class="flow-search-button" type="submit">Send signal</button>
         </div>
       </form>
       #{FerricstoreServer.Health.Dashboard.Render.FlowFormScripts.render_flow_signal_form_script()}
@@ -900,7 +900,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
       <div class="flow-value-modal-panel">
         <div class="flow-value-modal-header">
           <div>
-            <h2 id="flow-value-modal-title" class="section-title">Value Inspector</h2>
+            <h2 id="flow-value-modal-title" class="section-title">Value inspector</h2>
             <div id="flow-value-modal-ref" class="flow-value-modal-ref mono"></div>
           </div>
           <button class="flow-value-modal-close" type="button" data-flow-value-modal-close title="Close value inspector">Close</button>
@@ -920,7 +920,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
 
   def render_flow_debug(%{record: nil}) do
     """
-    <h2 class="section-title">Debug Inspector</h2>
+    <h2 class="section-title">Debug inspector</h2>
     <div class="pressure-alert level-warning">
       <div class="pressure-details">No current Flow record is available to inspect.</div>
     </div>
@@ -963,7 +963,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
       end)
 
     """
-    <h2 class="section-title">Debug Inspector</h2>
+    <h2 class="section-title">Debug inspector</h2>
     <div class="flow-card-grid">
       #{card_html}
     </div>

@@ -166,7 +166,7 @@ defmodule FerricstoreServer.Health.Dashboard.SystemSeventhReviewTest do
     assert missing.collection_status == :ok
   end
 
-  test "12 Slow Log failure stays distinct from successful empty and is bounded" do
+  test "12 Slow log failure stays distinct from successful empty and is bounded" do
     assert %{status: :unavailable, entries: [], error: error} =
              Operational.slowlog_snapshot(fn 128 -> exit(:timeout) end)
 
@@ -174,7 +174,7 @@ defmodule FerricstoreServer.Health.Dashboard.SystemSeventhReviewTest do
     assert %{status: :ok, entries: []} = Operational.slowlog_snapshot(fn 128 -> [] end)
     failure = %{status: :unavailable, entries: [], error: "<slow log unavailable>"}
     html = Admin.render_slowlog_summary(failure) <> Admin.render_slowlog_table(failure)
-    assert html =~ "Slow Log unavailable"
+    assert html =~ "Slow log unavailable"
     assert html =~ "&lt;slow log unavailable&gt;"
     refute html =~ "No slow commands"
     refute html =~ "No samples"

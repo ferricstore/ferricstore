@@ -7,10 +7,10 @@
 <%= render_page_header("streams", intro: "Inspect recent stream append and mutation activity without exposing stream payload fields or values.") %>
 <div class="content">
 <%= render_live_component("streams_summary", render_stream_activity_summary(data)) %>
-<%= render_dashboard_disclosure("Active Streams", length(Map.get(data, :top_streams, [])), render_live_component("streams_top", render_stream_top_streams(data)), open: Map.get(data, :top_streams, []) != [], live_count: "streams_top") %>
-<%= render_dashboard_disclosure("Recent Activity", length(Map.get(data, :entries, [])), render_live_component("streams_log", render_stream_activity_log(data)), open: Map.get(data, :entries, []) != [], live_count: "streams_log") %>
-<%= render_dashboard_disclosure("Consumer Groups", length(Map.get(data, :consumer_groups, [])), render_live_component("streams_consumers", render_stream_consumers(data)), open: Map.get(data, :consumer_groups, []) != [], live_count: "streams_consumers") %>
-<%= render_dashboard_disclosure("Blocked Readers", length(Map.get(data, :waiters, [])), render_live_component("streams_waiters", render_stream_waiters(data)), open: Map.get(data, :waiters, []) != [], live_count: "streams_waiters") %>
+<%= render_dashboard_disclosure("Active streams", length(Map.get(data, :top_streams, [])), render_live_component("streams_top", render_stream_top_streams(data)), open: Map.get(data, :top_streams, []) != [], live_count: "streams_top") %>
+<%= render_dashboard_disclosure("Recent activity", length(Map.get(data, :entries, [])), render_live_component("streams_log", render_stream_activity_log(data)), open: Map.get(data, :entries, []) != [], live_count: "streams_log") %>
+<%= render_dashboard_disclosure("Consumer groups", length(Map.get(data, :consumer_groups, [])), render_live_component("streams_consumers", render_stream_consumers(data)), open: Map.get(data, :consumer_groups, []) != [], live_count: "streams_consumers") %>
+<%= render_dashboard_disclosure("Blocked readers", length(Map.get(data, :waiters, [])), render_live_component("streams_waiters", render_stream_waiters(data)), open: Map.get(data, :waiters, []) != [], live_count: "streams_waiters") %>
 </div>
 </main>
 </div>

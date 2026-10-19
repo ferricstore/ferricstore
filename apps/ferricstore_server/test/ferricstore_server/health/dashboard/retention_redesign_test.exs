@@ -42,7 +42,7 @@ defmodule FerricstoreServer.Health.Dashboard.RetentionRedesignTest do
       })
 
     assert html =~ ~s(<p class="section-empty">No sampled run is past its max active runtime.</p>)
-    assert html =~ "Sampled Terminal Deletions"
+    assert html =~ "Sampled terminal deletions"
     assert length(Regex.scan(~r/<table/, html)) == 1
   end
 end

@@ -1153,7 +1153,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .pulse-dot-green { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); display: inline-block; animation: pulseLiveGreen 2s infinite; vertical-align: middle; }
       .pulse-dot-amber { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); display: inline-block; animation: pulseLiveAmber 2s infinite; vertical-align: middle; }
 
-      /* Keyboard Shortcuts Modal */
+      /* Keyboard shortcuts Modal */
       .keyboard-modal { color: var(--text-body); margin: auto; width: 480px; padding: 0; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-raised); max-width: calc(100vw - 48px); max-height: calc(100vh - 48px); }
       .keyboard-modal::backdrop { background: rgba(0,0,0,0.7); }
       .keyboard-modal:not([open]) { display: none; }

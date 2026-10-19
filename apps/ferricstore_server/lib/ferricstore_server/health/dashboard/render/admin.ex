@@ -15,7 +15,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
     PageStatus.render("slowlog", :warning, "Slow log unavailable", [
       "slow commands could not be collected"
     ]) <>
-      render_ops_summary("Slow Log unavailable", [
+      render_ops_summary("Slow log unavailable", [
         %{label: "Entries", value: "Unavailable", class: "c-muted"},
         %{label: "Worst", value: "Unavailable", class: "c-muted"},
         %{label: "Avg", value: "Unavailable", class: "c-muted"}
@@ -52,7 +52,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
 
     status <>
       render_ops_summary(
-        "Slow Log Summary",
+        "Slow log Summary",
         [
           %{label: "Entries", value: format_number(count)},
           %{
@@ -92,10 +92,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
 
   def render_slowlog_table(%{status: :unavailable} = snapshot) do
     """
-    <h2 class="section-title">Slow Log unavailable</h2>
+    <h2 class="section-title">Slow log unavailable</h2>
     <div class="flow-alert flow-alert-error" role="status">
       <p>#{escape(Map.get(snapshot, :error) || "Slow commands could not be collected.")}</p>
-      <a class="flow-link" href="/dashboard/slowlog">Retry Slow Log</a>
+      <a class="flow-link" href="/dashboard/slowlog">Retry Slow log</a>
     </div>
     """
   end
@@ -104,7 +104,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
 
   def render_slowlog_table([]),
     do: """
-    <h2 class="section-title">Slow Log <span class="badge badge-idle">none</span></h2>
+    <h2 class="section-title">Slow log <span class="badge badge-idle">none</span></h2>
     <p class="section-empty">No slow commands recorded.</p>
     """
 
@@ -129,7 +129,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
       end)
 
     """
-    <h2 class="section-title">Slow Log <span class="badge badge-idle">#{escape(count_label)}</span></h2>
+    <h2 class="section-title">Slow log <span class="badge badge-idle">#{escape(count_label)}</span></h2>
     #{TableFilter.controls("slowlog-table", "Filter loaded slow commands")}
     #{accessible_table("Slow log entries", """
     <table id="slowlog-table">
@@ -305,7 +305,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
           """
           <table>
             <thead>
-              <tr><th>Prefix</th><th>Window (ms)</th><th>Changed At</th><th>Changed By</th></tr>
+              <tr><th>Prefix</th><th>Window (ms)</th><th>Changed at</th><th>Changed by</th></tr>
             </thead>
             <tbody>
               #{rows}
@@ -315,7 +315,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
       end
 
     """
-    <h2 class="section-title">Namespace Config <span class="badge badge-idle">#{escape(count_label)}</span></h2>
+    <h2 class="section-title">Namespace config <span class="badge badge-idle">#{escape(count_label)}</span></h2>
     #{body}
     """
   end
@@ -430,7 +430,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
   end
 
   def render_config_commands(commands) do
-    render_config_command_table("Configuration Commands", commands)
+    render_config_command_table("Configuration commands", commands)
   end
 
   def render_config_command_table(title, commands) do
@@ -491,7 +491,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
 
     """
     #{status}
-    <h2 class="section-title">Runtime Parameters</h2>
+    <h2 class="section-title">Runtime parameters</h2>
     <p class="flow-section-note">Values come from CONFIG GET unless a row names another source.</p>
     #{TableFilter.controls("config-parameters", "Filter parameters")}
     <div class="table-scroll" role="region" aria-label="Runtime parameters" tabindex="0">
@@ -843,7 +843,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
     #{accessible_table("Per-shard consensus state", """
     <table>
       <thead>
-        <tr><th>Shard</th><th>Status</th><th>Leader</th><th>Term</th><th>Commit Idx</th><th>Storage Applied Idx</th><th>Members</th></tr>
+        <tr><th>Shard</th><th>Status</th><th>Leader</th><th>Term</th><th>Commit index</th><th>Storage applied index</th><th>Members</th></tr>
       </thead>
       <tbody>
         #{rows}
@@ -998,7 +998,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
 
   def render_clients_table([], empty_message),
     do: """
-    <h2 class="section-title">Active Connections <span class="badge badge-idle">0</span></h2>
+    <h2 class="section-title">Active connections <span class="badge badge-idle">0</span></h2>
     <p class="section-empty">#{escape(empty_message)}</p>
     """
 
@@ -1023,12 +1023,12 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
       end)
 
     """
-    <h2 class="section-title">Active Connections <span class="badge badge-idle">#{length(clients)}</span></h2>
+    <h2 class="section-title">Active connections <span class="badge badge-idle">#{length(clients)}</span></h2>
     #{TableFilter.controls("clients-table", "Filter loaded clients by user, name or address")}
     #{accessible_table("Active connections", """
     <table id="clients-table">
       <thead>
-        <tr><th>ID</th><th>Name</th><th>User</th><th>Client Address</th><th>Age</th><th>Flags</th></tr>
+        <tr><th>ID</th><th>Name</th><th>User</th><th>Client address</th><th>Age</th><th>Flags</th></tr>
       </thead>
       <tbody>
         #{rows}

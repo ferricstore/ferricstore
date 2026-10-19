@@ -11,7 +11,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowOverview do
     due_count = Map.get(summary, :due_now_sampled, 0)
 
     """
-    <h2 class="section-title">Flow Overview <span class="badge badge-idle">#{bounded_sample_label(total_sampled, total_sampled, sample_limit)}</span></h2>
+    <h2 class="section-title">Flow overview <span class="badge badge-idle">#{bounded_sample_label(total_sampled, total_sampled, sample_limit)}</span></h2>
     <dl class="flow-overview-ribbon" aria-label="Workflow overview metrics">
       #{render_flow_summary_metric("Types", types_count, "discovered workflow types", scope_path("/dashboard/flow/states", filters))}
       #{render_flow_summary_metric("Active", active_count, "all nonterminal states")}
@@ -433,7 +433,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowOverview do
                     "partition_key" => filters.partition_key
                   })
 
-              ~s(<p class="flow-section-note" role="status">More matching records exist. This recovery view is bounded. <a class="flow-link" href="#{escape_attr(href)}">Investigate in Query Studio</a></p>)
+              ~s(<p class="flow-section-note" role="status">More matching records exist. This recovery view is bounded. <a class="flow-link" href="#{escape_attr(href)}">Investigate in Query studio</a></p>)
             else
               ""
             end

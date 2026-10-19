@@ -298,7 +298,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
 
   def slowlog_payload(%{slowlog_status: :unavailable}) do
     {:error, :invalid_filters,
-     "Slow Log collection failed. Last successful samples retained; retry to refresh."}
+     "Slow log collection failed. Last successful samples retained; retry to refresh."}
   end
 
   def slowlog_payload(data) do

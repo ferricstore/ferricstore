@@ -1647,10 +1647,10 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
 
   def render_keyboard_shortcuts_modal do
     """
-    <dialog id="keyboard-shortcuts-modal" class="keyboard-modal" aria-label="Keyboard Shortcuts">
+    <dialog id="keyboard-shortcuts-modal" class="keyboard-modal" aria-label="Keyboard shortcuts">
       <div class="keyboard-card">
         <div class="keyboard-header">
-          <div class="keyboard-title">Keyboard Shortcuts</div>
+          <div class="keyboard-title">Keyboard shortcuts</div>
           <button type="button" class="dashboard-modal-close" data-keyboard-modal-close aria-label="Close shortcuts dialog">Close</button>
         </div>
         <label class="keyboard-shortcut-setting">
@@ -1662,11 +1662,11 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
           <div class="keyboard-keys"><kbd>/</kbd></div>
         </div>
         <div class="keyboard-row">
-          <span>Go to Query Studio</span>
+          <span>Go to Query studio</span>
           <div class="keyboard-keys"><kbd>G</kbd> <kbd>F</kbd></div>
         </div>
         <div class="keyboard-row">
-          <span>Go to Due Work</span>
+          <span>Go to Due</span>
           <div class="keyboard-keys"><kbd>G</kbd> <kbd>D</kbd></div>
         </div>
         <div class="keyboard-row">
@@ -1678,7 +1678,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
           <div class="keyboard-keys"><kbd>G</kbd> <kbd>L</kbd></div>
         </div>
         <div class="keyboard-row">
-          <span>Go to System Overview</span>
+          <span>Go to Overview</span>
           <div class="keyboard-keys"><kbd>G</kbd> <kbd>O</kbd></div>
         </div>
         <div class="keyboard-row">

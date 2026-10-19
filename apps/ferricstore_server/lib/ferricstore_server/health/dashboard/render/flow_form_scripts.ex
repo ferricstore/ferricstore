@@ -11,7 +11,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFormScripts do
       const validate = () => {
         state.required = transition.value !== '';
         const invalid = state.required && state.value === '';
-        state.setCustomValidity(invalid ? 'Enter If State when Transition To is set.' : '');
+        state.setCustomValidity(invalid ? 'Enter If state when Transition to is set.' : '');
         state.setAttribute('aria-invalid', String(invalid));
         error.hidden = !invalid;
       };

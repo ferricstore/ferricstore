@@ -99,7 +99,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
   def render_keyspace_inspector(%{found?: nil, key: key}) do
     """
     <div class="kv-inspector">
-      <h2 class="section-title">Key Inspector</h2>
+      <h2 class="section-title">Key inspector</h2>
       <div class="flow-alert flow-alert-error" role="status">Key metadata unavailable for <code>#{escape(key)}</code>. A shard could not be inspected; absence is unknown. Submit the exact key again to retry.</div>
     </div>
     """
@@ -108,7 +108,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
   def render_keyspace_inspector(%{found?: false, key: key}) do
     """
     <div class="kv-inspector">
-      <h2 class="section-title">Key Inspector</h2>
+      <h2 class="section-title">Key inspector</h2>
       <div class="flow-alert flow-alert-error">No live key metadata found for <code>#{escape(key)}</code>.</div>
       <div class="flow-filter-note">Requires +GET and read access to the selected key.</div>
     </div>
@@ -118,7 +118,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
   def render_keyspace_inspector(inspected) do
     """
     <div class="kv-inspector">
-      #{render_ops_summary("Key Inspector", [%{label: "Key", value: inspected.key}, %{label: "Type", value: inspected.type}, %{label: "Shard", value: "Shard #{inspected.shard}"}, %{label: "Location", value: inspected.location, detail: "TTL #{inspected.ttl} · #{inspected.size}"}])}
+      #{render_ops_summary("Key inspector", [%{label: "Key", value: inspected.key}, %{label: "Type", value: inspected.type}, %{label: "Shard", value: "Shard #{inspected.shard}"}, %{label: "Location", value: inspected.location, detail: "TTL #{inspected.ttl} · #{inspected.size}"}])}
       <div class="flow-filter-note">Requires +GET and read access to the selected key.</div>
     </div>
     """
@@ -206,14 +206,14 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
     #{availability}
     <table>
       <thead>
-        <tr><th>Logical Key</th><th>Physical kind</th><th>Shard</th><th>Location</th><th>Size</th><th>TTL</th><th>LFU</th><th>Physical Key (encoded)</th></tr>
+        <tr><th>Logical key</th><th>Physical kind</th><th>Shard</th><th>Location</th><th>Size</th><th>TTL</th><th>LFU</th><th>Physical key (encoded)</th></tr>
       </thead>
       <tbody>#{body}</tbody>
     </table>
     """
 
     """
-    <h2 class="section-title">Key Metadata <span class="badge badge-idle">#{badge}#{limited}</span></h2>
+    <h2 class="section-title">Key metadata <span class="badge badge-idle">#{badge}#{limited}</span></h2>
     #{if scanned != "" or exclusions != "", do: ~s(<p class="flow-filter-note">#{scanned}#{exclusions}</p>), else: ""}
     <p class="flow-filter-note">Physical keys use JSON string notation, including escaped control bytes. Base64 denotes invalid UTF-8.</p>
     #{accessible_table("Key metadata", table)}
@@ -304,7 +304,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
             value: if(unavailable?, do: "Unavailable", else: format_number(count || 0))
           },
           %{label: "Slowest", value: latency}
-        ], heading: :hidden)
+        ],
+        heading: :hidden
+      )
   end
 
   def render_command_slowlog_table(data) do
@@ -339,7 +341,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
           """
 
         get_in(data, [:summary, :slowlog_status]) == :unavailable ->
-          ~s(<p class="section-empty">Slow Log unavailable. Retry to collect command samples.</p>)
+          ~s(<p class="section-empty">Slow log unavailable. Retry to collect command samples.</p>)
 
         true ->
           ~s(<p class="section-empty">No slow commands recorded. <a href="/dashboard/slowlog">Open Slow log</a></p>)
@@ -456,12 +458,12 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
             value: if(lookups == 0, do: "No read samples", else: "#{hotcold.hit_ratio}%")
           },
           %{
-            label: "Hot Reads",
+            label: "Hot reads",
             value: format_number(hot_reads),
             detail_html: "sampled #{sampled_tag(Map.get(hotcold, :sample_rate, 1))}"
           },
           %{
-            label: "Cold Reads",
+            label: "Cold reads",
             value: format_number(cold_reads),
             detail: "#{Map.get(hotcold, :cold_reads_per_sec, 0.0)}/sec average since start"
           },
@@ -499,10 +501,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
       end
 
     """
-    <h2 class="section-title">Prefix Read Pressure</h2>
+    <h2 class="section-title">Prefix read pressure</h2>
     #{accessible_table("Prefix read pressure", """
     <table>
-      <thead><tr><th>Prefix</th><th>Hot Reads #{sampled_tag(:persistent_term.get(:ferricstore_read_sample_rate, 100))}</th><th>Cold Reads</th><th>Cold %</th></tr></thead>
+      <thead><tr><th>Prefix</th><th>Hot reads #{sampled_tag(:persistent_term.get(:ferricstore_read_sample_rate, 100))}</th><th>Cold reads</th><th>Cold %</th></tr></thead>
       <tbody>#{body}</tbody>
     </table>
     """)}
@@ -589,7 +591,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
       end)
 
     """
-    <h2 class="section-title">Per-Shard Storage</h2>
+    <h2 class="section-title">Per-shard storage</h2>
     <p class="flow-filter-note">Directory totals include every file beneath each shard data directory. Files outside those directories are counted in Other directories.</p>
     <table>
       <thead>

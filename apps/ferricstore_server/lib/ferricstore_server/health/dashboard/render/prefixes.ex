@@ -32,11 +32,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Prefixes do
     """
 
     """
-    <h2 class="section-title">Key Prefixes <span class="badge badge-idle">#{escape(count_label)}</span></h2>
+    <h2 class="section-title">Key prefixes <span class="badge badge-idle">#{escape(count_label)}</span></h2>
     #{accessible_table("Key prefixes", """
     <table>
       <thead>
-        <tr><th>Prefix</th><th>Sampled keys</th><th>% of sample</th><th>Hot Reads #{sampled_tag(:persistent_term.get(:ferricstore_read_sample_rate, 100))}</th><th>Cold Reads</th></tr>
+        <tr><th>Prefix</th><th>Sampled keys</th><th>% of sample</th><th>Hot reads #{sampled_tag(:persistent_term.get(:ferricstore_read_sample_rate, 100))}</th><th>Cold reads</th></tr>
       </thead>
       <tbody>
         #{rows}
@@ -66,7 +66,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Prefixes do
             "prefixes",
             :idle,
             "#{format_number(count)} #{if count == 1, do: "prefix", else: "prefixes"} in #{format_number(data.total_sampled)} sampled keys",
-            ["largest: #{PageStatus.short(largest.prefix)}, #{largest.pct}% of the sample"] ++ capped
+            ["largest: #{PageStatus.short(largest.prefix)}, #{largest.pct}% of the sample"] ++
+              capped
           )
       end
 

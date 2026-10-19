@@ -414,9 +414,9 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
           assert response =~ "text/html"
 
           body = extract_body(response)
-          assert String.contains?(body, "Namespace Config")
-          assert String.contains?(body, "Configuration Commands")
-          assert String.contains?(body, "Runtime Parameters")
+          assert String.contains?(body, "Namespace config")
+          assert String.contains?(body, "Configuration commands")
+          assert String.contains?(body, "Runtime parameters")
         end
 
         test "shows built-in defaults when no overrides exist" do
@@ -447,7 +447,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
           assert String.contains?(html, ~s(name="retention_ttl_ms"))
           refute String.contains?(html, ~s(name="history_hot_max_events"))
           refute String.contains?(html, "Hot history")
-          assert String.contains?(html, "Create / Update Policy")
+          assert String.contains?(html, "Create or update policy")
           assert String.contains?(html, "Policies affect new Flow work and retry scheduling")
           assert String.contains?(html, ~s(title="Save this Flow policy"))
 
@@ -744,7 +744,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
           assert String.contains?(html, ~s(action="/dashboard/flow/retention"))
           assert String.contains?(html, "Refresh sampled preview")
           assert String.contains?(html, "Review global cleanup")
-          refute String.contains?(html, ">Run Cleanup</button>")
+          refute String.contains?(html, ">Run cleanup</button>")
           assert String.contains?(html, "FLOW.RETENTION_CLEANUP")
           assert String.contains?(html, "retention-flow-1")
           assert String.contains?(html, "active-timeout-flow-1")

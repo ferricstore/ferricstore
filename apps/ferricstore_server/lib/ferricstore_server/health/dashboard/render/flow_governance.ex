@@ -222,7 +222,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
     filters = Map.get(data, :filters, %{})
 
     """
-    <h2 class="section-title">State Metadata</h2>
+    <h2 class="section-title">State metadata</h2>
     <form class="flow-governance-meta-form" action="/dashboard/flow/governance" method="get" aria-label="State metadata filters">
       #{governance_filter_inputs(filters, @metadata_fields ++ ["limit"])}
       <label class="flow-policy-field"><span>Workflow type</span><input class="flow-search-input mono" type="search" name="meta_type" value="#{escape_attr(Map.get(filters, :meta_type, "") || "")}" title="Required workflow type with an indexed state metadata policy" required></label>
@@ -264,11 +264,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
       end
 
     """
-    <h2 class="section-title">State Metadata Results <span class="badge badge-idle">#{escape(Map.get(result, :command, "FLOW.QUERY"))}</span></h2>
+    <h2 class="section-title">State metadata results <span class="badge badge-idle">#{escape(Map.get(result, :command, "FLOW.QUERY"))}</span></h2>
     #{state_meta_status(result)}
     #{FlowQueryResults.render_flow_query_metadata(Map.take(result, [:quality]))}
     <div class="table-scroll" role="region" aria-label="Workflow state metadata results" tabindex="0"><table>
-      <thead><tr><th>ID</th><th>Type</th><th>Current State</th><th>Metadata State</th><th>Indexed Key</th><th>Metadata</th><th>Updated</th></tr></thead>
+      <thead><tr><th>ID</th><th>Type</th><th>Current state</th><th>Metadata state</th><th>Indexed key</th><th>Metadata</th><th>Updated</th></tr></thead>
       <tbody>#{rendered_rows}</tbody>
     </table></div>
     #{metadata_pagination(result, filters)}
@@ -288,7 +288,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
     scope = if is_map(review), do: Map.get(review, :scope, ""), else: ""
 
     """
-    <h2 class="section-title">Circuit Actions</h2>
+    <h2 class="section-title">Circuit actions</h2>
     <form class="flow-search" action="/dashboard/flow/governance" method="get" aria-label="Review circuit scope">
       #{governance_filter_inputs(filters)}
       <label class="flow-policy-field"><span>Effect scope</span><input class="flow-search-input mono" type="search" name="circuit_review_scope" value="#{escape_attr(scope)}" placeholder="effect:payment.charge" required></label>
@@ -328,7 +328,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
     closed = Enum.count(circuits, &(Map.get(&1, :status) == :closed))
 
     """
-    <h2 class="section-title">Circuit Status Mix</h2>
+    <h2 class="section-title">Circuit status mix</h2>
     <div class="flow-bars" role="img" aria-label="Circuit status distribution">
       #{circuit_bar("open", open, total, "status-bad")}
       #{circuit_bar("half-open", half_open, total, "status-warn")}
@@ -348,7 +348,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
     """
     <h2 class="section-title">Circuits</h2>
     <div class="table-scroll" role="region" aria-label="Governance circuits" tabindex="0"><table>
-      <thead><tr><th>Scope</th><th>Status</th><th>Failures</th><th>Threshold</th><th>Retry After</th><th>Last Failure</th><th>Last Success</th><th>Updated</th><th>Actions</th></tr></thead>
+      <thead><tr><th>Scope</th><th>Status</th><th>Failures</th><th>Threshold</th><th>Retry after</th><th>Last failure</th><th>Last success</th><th>Updated</th><th>Actions</th></tr></thead>
       <tbody>#{rows}</tbody>
     </table></div>
     """
@@ -386,7 +386,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
     """
     <h2 class="section-title">Budgets</h2>
     <div class="table-scroll" role="region" aria-label="Governance budgets" tabindex="0"><table>
-      <thead><tr><th>Scope</th><th>Used</th><th>Remaining</th><th>Limit</th><th>Over</th><th>Reservations</th><th>Window</th><th>Window Start</th></tr></thead>
+      <thead><tr><th>Scope</th><th>Used</th><th>Remaining</th><th>Limit</th><th>Over</th><th>Reservations</th><th>Window</th><th>Window start</th></tr></thead>
       <tbody>#{rows}</tbody>
     </table></div>
     """
@@ -632,9 +632,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
       end
 
     """
-    <h2 class="section-title">Circuit Timeline</h2>
+    <h2 class="section-title">Circuit timeline</h2>
     <div class="table-scroll" role="region" aria-label="Governance circuit timeline" tabindex="0"><table>
-      <thead><tr><th>Time</th><th>Scope</th><th>Event</th><th>Status</th><th>Failures</th><th>Latency</th><th>Error Class</th></tr></thead>
+      <thead><tr><th>Time</th><th>Scope</th><th>Event</th><th>Status</th><th>Failures</th><th>Latency</th><th>Error class</th></tr></thead>
       <tbody>#{rows}</tbody>
     </table></div>
     """

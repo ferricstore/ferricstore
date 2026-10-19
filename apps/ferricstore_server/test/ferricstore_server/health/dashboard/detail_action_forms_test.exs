@@ -165,7 +165,7 @@ defmodule FerricstoreServer.Health.Dashboard.DetailActionFormsTest do
     assert html =~ ~s(name="run_at_ms" value="bad&quot;&lt;&amp;")
     assert html =~ ~s(type="text" name="run_at_ms")
     assert html =~ ~s(name="expected_version" value="#{record.version}")
-    refute html =~ "Execution Journal"
+    refute html =~ "Execution journal"
     refute html =~ "Event intervals"
   end
 
@@ -193,7 +193,7 @@ defmodule FerricstoreServer.Health.Dashboard.DetailActionFormsTest do
     html = extract_body(response)
     assert html =~ "&lt;script&gt;bad()&lt;/script&gt;"
     refute html =~ "<script>bad()</script>"
-    refute html =~ "Execution Journal"
+    refute html =~ "Execution journal"
     refute html =~ "Attempts"
   end
 

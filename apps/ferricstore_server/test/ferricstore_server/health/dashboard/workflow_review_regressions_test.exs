@@ -54,7 +54,7 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowReviewRegressionsTest do
 
     html = Records.render_flow_running_records([record], 1, 400)
     assert html =~ ~s(<table class="flow-worker-records-table">)
-    assert html =~ "<th>Workflow</th><th>Worker</th><th>Status</th><th>Lease Expires (UTC)</th>"
+    assert html =~ "<th>Workflow</th><th>Worker</th><th>Status</th><th>Lease expires (UTC)</th>"
     refute html =~ "<th>Lease Token</th>"
     refute html =~ "<th>Fencing</th>"
     assert html =~ "invoices&lt;&amp;"

@@ -120,8 +120,8 @@ defmodule FerricstoreServer.Health.Dashboard.OperationalReviewTest do
         config_commands: []
       })
 
-    {values_offset, _} = :binary.match(html, "Runtime Parameters")
-    {commands_offset, _} = :binary.match(html, "Configuration Commands")
+    {values_offset, _} = :binary.match(html, "Runtime parameters")
+    {commands_offset, _} = :binary.match(html, "Configuration commands")
     assert values_offset < commands_offset
   end
 

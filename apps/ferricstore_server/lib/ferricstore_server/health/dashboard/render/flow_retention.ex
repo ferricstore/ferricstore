@@ -135,7 +135,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
         <input type="hidden" name="reviewed_at_ms" value="#{escape_attr(to_string(Map.get(review, :reviewed_at_ms, "")))}">
         <label class="flow-check-label"><input type="checkbox" name="confirm_cleanup" value="true" required aria-describedby="retention-global-confirmation">Confirm global cleanup with a shared limit of #{limit} records.</label>
         <p class="flow-section-note" id="retention-global-confirmation">Overdue active records may be failed; expired terminal records and their retained data may be permanently deleted. This review expires after five minutes.</p>
-        <button class="flow-search-button flow-danger-button" type="submit">Run Cleanup</button>
+        <button class="flow-search-button flow-danger-button" type="submit">Run cleanup</button>
       </form>
     </section>
     """
@@ -164,7 +164,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
   def render_flow_retention_flash(_flash), do: ""
 
   def render_flow_retention_commands do
-    render_config_command_table("Flow Retention Commands", flow_retention_command_reference())
+    render_config_command_table("Flow retention commands", flow_retention_command_reference())
   end
 
   def flow_retention_command_reference do
@@ -210,7 +210,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
 
   defp render_flow_active_timeout_candidates([], _now_ms, 0),
     do: """
-    <h2 class="section-title">Sampled Active Timeouts <span class="badge badge-idle">0</span></h2>
+    <h2 class="section-title">Sampled active timeouts <span class="badge badge-idle">0</span></h2>
     <p class="section-empty">No sampled run is past its max active runtime.</p>
     """
 
@@ -229,7 +229,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
       end
 
     """
-    <h2 class="section-title">Sampled Active Timeouts <span class="badge badge-idle">#{format_number(length(candidates))}</span></h2>
+    <h2 class="section-title">Sampled active timeouts <span class="badge badge-idle">#{format_number(length(candidates))}</span></h2>
     #{candidate_coverage(candidates, total)}
     <div class="table-scroll" role="region" aria-label="Sampled active workflow timeouts" tabindex="0"><table>
       <thead>
@@ -238,9 +238,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
           <th>Type</th>
           <th>Runtime status</th>
           <th>Partition</th>
-          <th>Max Active</th>
-          <th>Timeout At</th>
-          <th>Overdue For</th>
+          <th>Max active</th>
+          <th>Timeout at</th>
+          <th>Overdue for</th>
           <th>Created</th>
         </tr>
       </thead>
@@ -253,7 +253,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
 
   defp render_flow_terminal_retention_candidates([], _now_ms, 0),
     do: """
-    <h2 class="section-title">Sampled Terminal Deletions <span class="badge badge-idle">0</span></h2>
+    <h2 class="section-title">Sampled terminal deletions <span class="badge badge-idle">0</span></h2>
     <p class="section-empty">No sampled run is past its retention.</p>
     """
 
@@ -272,7 +272,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
       end
 
     """
-    <h2 class="section-title">Sampled Terminal Deletions <span class="badge badge-idle">#{format_number(length(candidates))}</span></h2>
+    <h2 class="section-title">Sampled terminal deletions <span class="badge badge-idle">#{format_number(length(candidates))}</span></h2>
     #{candidate_coverage(candidates, total)}
     <div class="table-scroll" role="region" aria-label="Sampled terminal workflow deletions" tabindex="0"><table>
       <thead>
@@ -282,8 +282,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
           <th>Runtime status</th>
           <th>Partition</th>
           <th>Attempts</th>
-          <th>Retention Until</th>
-          <th>Expired For</th>
+          <th>Retention until</th>
+          <th>Expired for</th>
           <th>Updated</th>
         </tr>
       </thead>

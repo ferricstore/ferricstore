@@ -121,7 +121,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           assert String.contains?(html, ~s(name="limit"))
           assert String.contains?(html, "Showing #{flow_type} / queued / id contains keep")
           assert String.contains?(html, "recent limit 1")
-          assert String.contains?(html, "Recent Flow Records")
+          assert String.contains?(html, "Recent runs")
           assert String.contains?(html, "limit 1")
           assert String.contains?(html, keep_new_id)
           refute String.contains?(html, keep_old_id)
@@ -494,7 +494,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
                    &(&1.type == type and &1.partition_key == partition_key)
                  )
 
-          assert String.contains?(html, "FIFO Lanes")
+          assert String.contains?(html, "FIFO lanes")
           assert String.contains?(html, "blocked by active flow")
           assert String.contains?(html, first_id)
           assert String.contains?(html, second_id)
@@ -936,7 +936,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           data = Dashboard.collect_flow_page()
           html = Dashboard.render_flow_page(data)
 
-          assert String.contains?(html, "Projection Health")
+          assert String.contains?(html, "Projection health")
           assert String.contains?(html, "LMDB")
           assert String.contains?(html, "asynchronous")
           assert String.contains?(html, "Pending")

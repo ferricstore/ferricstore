@@ -16,7 +16,7 @@ defmodule FerricstoreServer.Health.Dashboard.AdminRedesignTest do
     assert html =~ "slowlog-status is-idle"
     assert html =~ "<strong>2 slow commands recorded</strong>"
     assert html =~ "worst 250.0 ms: KEYS"
-    assert html =~ ~s(<h2 class="section-title sr-only">Slow Log Summary</h2>)
+    assert html =~ ~s(<h2 class="section-title sr-only">Slow log Summary</h2>)
 
     assert Admin.render_slowlog_summary([]) =~ "<strong>No slow commands recorded</strong>"
 

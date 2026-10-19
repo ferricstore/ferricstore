@@ -165,7 +165,7 @@ defmodule FerricstoreServer.Health.Dashboard.LineageReviewTest do
     html = collect() |> Dashboard.render_flow_lineage_page()
     assert html =~ ~s(aria-label="Loaded lineage summary")
     refute html =~ ~s(class="flow-card-grid")
-    {table, _} = :binary.match(html, "Lineage Records")
+    {table, _} = :binary.match(html, "Lineage records")
     {preview, _} = :binary.match(html, "Relationship preview")
     assert table < preview
     assert html =~ ~s(class="flow-lineage-id-field")
@@ -198,7 +198,7 @@ defmodule FerricstoreServer.Health.Dashboard.LineageReviewTest do
     assert html =~ "More matching records exist"
     assert html =~ "partial"
     assert html =~ "lagging"
-    assert html =~ "Query Studio"
+    assert html =~ "Query studio"
   end
 
   test "manual signals scan shows its captured UTC time and stays unpolled" do

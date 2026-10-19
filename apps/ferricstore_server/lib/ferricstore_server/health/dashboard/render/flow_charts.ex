@@ -91,7 +91,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
       end
 
     """
-    <h2 class="section-title">State Pressure</h2>
+    <h2 class="section-title">State pressure</h2>
     #{chart_coverage(length(states), total)}
     <div class="table-scroll flow-state-pressure-region" role="region" aria-label="Workflow state pressure" tabindex="0">
       <table class="flow-state-pressure-matrix">

@@ -83,7 +83,7 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowSixthReviewTest do
     assert Dashboard.render_flow_states_page(data) =~ "No Flow states discovered"
   end
 
-  test "Recent Limit only bounds displayed records, not cold summary sampling", context do
+  test "Recent limit only bounds displayed records, not cold summary sampling", context do
     owner = self()
 
     Application.put_env(:ferricstore, :flow_dashboard_flow_query_fun, fn query, _ ->

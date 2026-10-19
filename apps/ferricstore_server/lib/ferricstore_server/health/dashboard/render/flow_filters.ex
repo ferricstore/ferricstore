@@ -157,7 +157,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
         <div class="flow-filter-actions">
         #{render_flow_summary_sort(Map.get(filters, :sort, "attention"), "flow-state-sort")}
         <label class="flow-filter-field" for="flow-state-limit-filter">
-        <span>Recent Limit</span>
+        <span>Recent limit</span>
         <input id="flow-state-limit-filter" class="flow-search-input mono flow-filter-limit" type="number" name="limit" min="1" max="#{@flow_dashboard_max_recent_limit}" value="#{limit}" title="Maximum recent records shown below">
         </label>
         <button class="flow-search-button" type="submit" title="Apply Flow state filters">Apply</button>
@@ -166,7 +166,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
       </form>
       <div class="flow-filter-note">
         #{if map_size(errors) > 0, do: ~s(<span role="alert">Query not run. Correct the time filters.</span>), else: "Showing #{escape(flow_filter_summary(filters))} · #{format_number(filtered_sampled)} matching of #{format_number(total_sampled)} sampled records"}
-        #{info_icon("Relative mode uses a sliding updated-time window. Custom mode uses UTC bounds. One explicit type and partition enable bounded cold terminal lookup. All-type views remain sampled. Limit applies to Recent Flow Records only.", "About state filters")}
+        #{info_icon("Relative mode uses a sliding updated-time window. Custom mode uses UTC bounds. One explicit type and partition enable bounded cold terminal lookup. All-type views remain sampled. Limit applies to Recent runs only.", "About state filters")}
       </div>
     </div>
     """ <> render_state_time_validation_script()

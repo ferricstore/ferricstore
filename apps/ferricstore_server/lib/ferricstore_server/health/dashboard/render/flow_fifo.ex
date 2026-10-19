@@ -36,7 +36,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFifo do
       end
 
     """
-    <h2 class="section-title">FIFO Lanes <span class="badge badge-idle">#{if unavailable?, do: "#{length(lanes)} verified lanes", else: length(lanes)}</span> <span class="badge badge-idle">#{sampled_scan_label(total_sampled, sample_limit)}</span></h2>
+    <h2 class="section-title">FIFO lanes <span class="badge badge-idle">#{if unavailable?, do: "#{length(lanes)} verified lanes", else: length(lanes)}</span> <span class="badge badge-idle">#{sampled_scan_label(total_sampled, sample_limit)}</span></h2>
     #{coverage_notice(coverage)}
     <p class="flow-section-note">Observed members, not the complete queue. Filters and sample bounds can omit an earlier member or blocker; due time alone does not establish claimability.</p>
     #{limit_note}

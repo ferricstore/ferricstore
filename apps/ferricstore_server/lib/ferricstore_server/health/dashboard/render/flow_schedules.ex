@@ -134,7 +134,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
           </label>
 
           <label class="flow-policy-field">
-            <span>Target Partition Key</span>
+            <span>Target partition key</span>
             <input class="flow-search-input mono" type="text" name="target_partition" value="#{draft_attr(draft, "target_partition")}" placeholder="e.g. tenant-stripe (optional)" autocomplete="off">
           </label>
         </div>
@@ -147,7 +147,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
         <fieldset class="flow-management-group" data-schedule-recurrence#{if kind in ["cron", "interval"], do: "", else: " hidden"}><legend>Recurrence</legend>
         <div class="flow-policy-grid">
           <label class="flow-policy-field">
-            <span>Overlap Policy</span>
+            <span>Overlap policy</span>
             <select class="flow-search-input mono" name="overlap_policy"#{disabled_unless(kind in ["cron", "interval"])}#{field_attributes(errors, "overlap_policy", "schedule-overlap-description")}>
               #{overlap_options(overlap)}
             </select>
@@ -161,7 +161,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
           </label>
 
           <label class="flow-policy-field">
-            <span>Max Fires</span>
+            <span>Max fires</span>
             <input class="flow-search-input mono" type="number" name="max_fires" value="#{draft_attr(draft, "max_fires")}"#{disabled_unless(kind in ["cron", "interval"])} min="1" placeholder="unlimited" autocomplete="off"#{field_attributes(errors, "max_fires")}>
             #{field_error(errors, "max_fires")}
           </label>
@@ -450,9 +450,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
       end)
 
     """
-    <h2 class="section-title">Failed Schedules</h2>
+    <h2 class="section-title">Failed schedules</h2>
     <div class="table-scroll" role="region" aria-label="Failed workflow schedules" tabindex="0"><table>
-      <thead><tr><th>ID</th><th>Reason</th><th>At</th><th>Previous Target</th></tr></thead>
+      <thead><tr><th>ID</th><th>Reason</th><th>At</th><th>Previous target</th></tr></thead>
       <tbody>#{rows}</tbody>
     </table></div>
     """

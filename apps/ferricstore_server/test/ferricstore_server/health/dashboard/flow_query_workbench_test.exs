@@ -751,12 +751,12 @@ defmodule FerricstoreServer.Health.Dashboard.FlowQueryWorkbenchTest do
     html = Dashboard.render_flow_query_page(data)
 
     assert data.result.explain.status == "planned"
-    assert html =~ "Chosen Plan"
+    assert html =~ "Chosen plan"
     assert html =~ "ordered filter"
     assert html =~ "covering index"
     assert html =~ "flow_runs_state_updated_v1"
     assert html =~ "Generation 3"
-    assert html =~ "Estimates and Bounds"
+    assert html =~ "Estimates and bounds"
     assert html =~ "10.0K"
     assert html =~ "2.0s"
     refute html =~ "2.0e3 ms"

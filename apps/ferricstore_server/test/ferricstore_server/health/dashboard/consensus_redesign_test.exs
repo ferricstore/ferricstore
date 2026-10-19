@@ -73,7 +73,7 @@ defmodule FerricstoreServer.Health.Dashboard.ConsensusRedesignTest do
     assert html =~
              ~r{<details class="dashboard-disclosure">\s*<summary>All shard details</summary>}
 
-    assert html =~ "<th>Storage Applied Idx</th>"
+    assert html =~ "<th>Storage applied index</th>"
 
     {:ok, payload} = Dashboard.live_payload("raft")
     assert Map.has_key?(payload.components, "consensus_status")

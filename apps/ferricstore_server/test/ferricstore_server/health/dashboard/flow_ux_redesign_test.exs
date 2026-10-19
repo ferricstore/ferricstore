@@ -215,7 +215,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
       assert html =~ "Retry"
       assert html =~ "Completed"
       assert html =~ "worker-1"
-      assert html =~ "Execution Journal"
+      assert html =~ "Execution journal"
       refute html =~ "📜"
     end
 
@@ -374,7 +374,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
         })
 
       {issues_position, _length} = :binary.match(html, ">Needs attention</h2>")
-      {overview_position, _length} = :binary.match(html, ">Flow Overview ")
+      {overview_position, _length} = :binary.match(html, ">Flow overview ")
 
       assert issues_position < overview_position
     end
@@ -438,7 +438,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
         })
 
       assert html =~ ~s(<dl class="flow-projection-ledger")
-      assert html =~ "Projection Health"
+      assert html =~ "Projection health"
       assert html =~ "requested index minus durable projected index"
       assert html =~ ">7<"
       refute html =~ ~s(class="flow-card-grid")
@@ -504,10 +504,10 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
       html = FlowDetail.render_flow_actions(data)
 
       assert html =~ ~s(class="flow-operations-panel")
-      assert html =~ "Workflow Actions"
+      assert html =~ "Workflow actions"
       assert html =~ ~s(data-dashboard-single-submit)
       assert html =~ "Rewind"
-      assert html =~ "Send Signal"
+      assert html =~ "Send signal"
     end
 
     test "initial Keyspace state asks for a query instead of reporting no matches" do
@@ -547,7 +547,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
     test "empty operational sections use collapsed progressive disclosure" do
       html =
         FerricstoreServer.Health.Dashboard.Layout.render_dashboard_disclosure(
-          "Blocked Readers",
+          "Blocked readers",
           "0",
           "<table><tbody></tbody></table>",
           open: false
@@ -556,7 +556,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
       assert html =~ ~s(<details class="dashboard-disclosure">)
 
       assert html =~
-               ~s(<summary><span>Blocked Readers</span><span class="badge badge-idle">0</span></summary>)
+               ~s(<summary><span>Blocked readers</span><span class="badge badge-idle">0</span></summary>)
 
       refute html =~ ~s(<details class="dashboard-disclosure" open>)
     end
@@ -741,7 +741,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
     end
   end
 
-  describe "Breadcrumb Navigation & Keyboard Shortcuts" do
+  describe "Breadcrumb Navigation & Keyboard shortcuts" do
     test "renders flow breadcrumb with copy buttons" do
       record = %{
         id: "order-step-999",
@@ -811,7 +811,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
       html = FerricstoreServer.Health.Dashboard.Layout.render_keyboard_shortcuts_modal()
 
       assert html =~ ~s(id="keyboard-shortcuts-modal")
-      assert html =~ "Keyboard Shortcuts"
+      assert html =~ "Keyboard shortcuts"
       assert html =~ "<kbd>/</kbd>"
       assert html =~ "<kbd>G</kbd> <kbd>F</kbd>"
     end

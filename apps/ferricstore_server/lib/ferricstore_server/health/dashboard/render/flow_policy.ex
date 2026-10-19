@@ -51,7 +51,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
 
     """
     <div class="flow-policy-panel">
-      <h2 class="section-title">Create / Update Policy #{info_icon("Policies affect new Flow work and retry scheduling. Existing Flow records keep their durable state.", "About policy changes")}</h2>
+      <h2 class="section-title">Create or update policy #{info_icon("Policies affect new Flow work and retry scheduling. Existing Flow records keep their durable state.", "About policy changes")}</h2>
       #{flash}
       #{render_policy_type_scope_note(editor)}
       <form class="flow-policy-form" action="/dashboard/flow/policies" method="post" data-policy-editor data-policy-draft="#{Map.get(editor, :dirty, false)}" data-dashboard-single-submit>
@@ -148,7 +148,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
         <p class="flow-field-error" data-policy-scope-status role="status" hidden>Selection changed. Load policy before saving.</p>
         <p class="flow-section-note" data-policy-dirty-status role="status" hidden>Unsaved changes</p>
         <div class="flow-policy-actions">
-          <button class="flow-search-button" type="submit" title="Save this Flow policy">Save Policy</button>
+          <button class="flow-search-button" type="submit" title="Save this Flow policy">Save policy</button>
           <a class="flow-link" data-discard-draft href="#{escape_attr(flow_policy_edit_url(editor.type, editor.state))}">Discard changes</a>
         </div>
       </form>
@@ -248,7 +248,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
   end
 
   def render_flow_policy_commands do
-    render_config_command_table("Flow Policy Commands", flow_policy_command_reference())
+    render_config_command_table("Flow policy commands", flow_policy_command_reference())
   end
 
   def flow_policy_command_reference do
@@ -314,7 +314,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
     scan_note = render_flow_policy_scan_note(policy_scan)
 
     """
-    <h2 class="section-title">Current Flow Policies <span class="badge badge-idle">#{format_number(length(policies))} loaded</span></h2>
+    <h2 class="section-title">Current policies <span class="badge badge-idle">#{format_number(length(policies))} loaded</span></h2>
     #{render_flow_policy_summary(policies)}
     #{scan_note}
     #{FerricstoreServer.Health.Dashboard.Render.TableFilter.controls("flow-policy-catalog", "Filter loaded policies")}

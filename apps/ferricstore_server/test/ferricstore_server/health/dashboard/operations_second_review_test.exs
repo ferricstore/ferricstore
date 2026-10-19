@@ -257,10 +257,10 @@ defmodule FerricstoreServer.Health.Dashboard.OperationsSecondReviewTest do
     refute Dashboard.render_flow_schedules_page(schedules) =~ "Create durable schedule"
     policies = PolicyRetention.collect_policies_page(opts)
     refute policies.action_capabilities.save
-    refute Dashboard.render_flow_policies_page(policies) =~ ">Save Policy</button>"
+    refute Dashboard.render_flow_policies_page(policies) =~ ">Save policy</button>"
     retention = PolicyRetention.collect_retention_page(opts)
     refute retention.action_capabilities.cleanup
-    refute FlowRetention.render_flow_retention_controls(retention) =~ ">Run Cleanup</button>"
+    refute FlowRetention.render_flow_retention_controls(retention) =~ ">Run cleanup</button>"
     governance = Governance.collect_page(opts)
     refute governance.action_capabilities.open_circuit
 

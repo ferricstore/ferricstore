@@ -68,7 +68,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
     """
     #{filtered_table(rows, "stream-top-table", "Filter loaded streams", "Active streams", """
     <table id="stream-top-table" data-dashboard-row-count="#{length(rows)}">
-      <thead><tr><th>Stream Key</th><th>Mutations</th><th>Appends</th><th>Last Entry</th><th>Last Seen</th></tr></thead>
+      <thead><tr><th>Stream key</th><th>Mutations</th><th>Appends</th><th>Last entry</th><th>Last seen</th></tr></thead>
       <tbody>#{body}</tbody>
     </table>
     """, "No visible stream mutations in the retained activity window.")}
@@ -100,7 +100,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
     """
     #{filtered_table(groups, "stream-consumers-table", "Filter loaded streams and consumer groups", "Stream consumers", """
     <table id="stream-consumers-table" data-dashboard-row-count="#{length(groups)}">
-      <thead><tr><th>Stream Key</th><th>Group</th><th>Consumers</th><th>Pending</th><th>Last Delivered</th></tr></thead>
+      <thead><tr><th>Stream key</th><th>Group</th><th>Consumers</th><th>Pending</th><th>Last delivered</th></tr></thead>
       <tbody>#{body}</tbody>
     </table>
     """, "No active stream consumer groups loaded.")}
@@ -131,7 +131,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
     """
     #{filtered_table(waiters, "stream-waiters-table", "Filter loaded blocked stream readers", "Blocked stream readers", """
     <table id="stream-waiters-table" data-dashboard-row-count="#{length(waiters)}">
-      <thead><tr><th>Stream Key</th><th>Waiters</th><th>Oldest Wait</th><th>Last Seen ID</th></tr></thead>
+      <thead><tr><th>Stream key</th><th>Waiters</th><th>Oldest wait</th><th>Last seen ID</th></tr></thead>
       <tbody>#{body}</tbody>
     </table>
     """, "No visible blocked readers in this bounded snapshot.")}
@@ -169,7 +169,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
     #{filtered_table(entries, "stream-activity-table", "Filter loaded stream activity", "Recent stream activity", """
     <table id="stream-activity-table" data-dashboard-row-count="#{length(entries)}">
       <thead>
-        <tr><th>ID</th><th>Time</th><th>Role</th><th>Command</th><th>Stream Key</th><th>Result</th><th>Entry ID</th><th>Shape</th><th>Consumer</th><th>Trim</th></tr>
+        <tr><th>ID</th><th>Time</th><th>Role</th><th>Command</th><th>Stream key</th><th>Result</th><th>Entry ID</th><th>Shape</th><th>Consumer</th><th>Trim</th></tr>
       </thead>
       <tbody>#{body}</tbody>
     </table>
@@ -226,7 +226,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
             label: "Subscribers",
             value: format_optional_number(Map.get(summary, :active_subscribers, 0))
           }
-        ], heading: :hidden) <> snapshot_scope_note(:pubsub)
+        ],
+        heading: :hidden
+      ) <> snapshot_scope_note(:pubsub)
   end
 
   defp format_optional_number(nil), do: "-"
@@ -318,10 +320,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
       end
 
     """
-    <h2 class="section-title">Recent Pub/Sub Activity <span class="badge badge-idle">#{escape(count_label)}</span></h2>
+    <h2 class="section-title">Recent Pub/Sub activity <span class="badge badge-idle">#{escape(count_label)}</span></h2>
     #{filtered_table(entries, "pubsub-activity-table", "Filter loaded Pub/Sub activity", "Recent Pub/Sub activity", """
     <table id="pubsub-activity-table">
-      <thead><tr><th>ID</th><th>Time</th><th>Command</th><th>Target Type</th><th>Target</th><th>Shape</th><th>Delivery</th></tr></thead>
+      <thead><tr><th>ID</th><th>Time</th><th>Command</th><th>Target type</th><th>Target</th><th>Shape</th><th>Delivery</th></tr></thead>
       <tbody>#{body}</tbody>
     </table>
     """, "No visible Pub/Sub activity in the last 128 retained events.")}

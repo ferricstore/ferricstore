@@ -18,7 +18,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
 
           body = extract_body(response)
           assert String.contains?(body, "FerricFlow")
-          assert String.contains?(body, "Flow Overview")
+          assert String.contains?(body, "Flow overview")
         end
 
         test "redirects removed Flow config page to global config" do
@@ -191,7 +191,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
           assert is_binary(decoded["components"]["flow_debug"])
           assert is_binary(decoded["components"]["flow_history"])
           assert decoded["components"]["flow_detail"] =~ id
-          assert decoded["components"]["flow_debug"] =~ "Debug Inspector"
+          assert decoded["components"]["flow_debug"] =~ "Debug inspector"
         end
 
         test "returns 200 for Flow states, workers, due, and policies pages" do

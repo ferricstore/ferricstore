@@ -10,7 +10,7 @@ defmodule FerricstoreServer.Health.Dashboard.RunsRedesignTest do
     headers =
       Regex.scan(~r/<th[^>]*>([^<]+)<\/th>/, html, capture: :all_but_first) |> List.flatten()
 
-    assert headers == ["Type", "State", "Attention", "Oldest due", "Runs", "Mode"]
+    assert headers == ["Type", "Stored state", "Attention", "Oldest due", "Runs", "Mode"]
     refute html =~ "info-icon"
     assert html =~ ~s(<span class="badge badge-warning">9 expired</span>)
     assert html =~ "does not establish claimability"

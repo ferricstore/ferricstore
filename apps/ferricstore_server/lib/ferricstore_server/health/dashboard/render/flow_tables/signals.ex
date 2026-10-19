@@ -136,13 +136,13 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Signals do
 
   def render_flow_signals_table_head(:detail) do
     """
-    <tr><th>Event</th><th>Time</th><th>Signal</th><th>State Change</th><th>Values</th><th>Jump</th></tr>
+    <tr><th>Event</th><th>Time</th><th>Signal</th><th>State change</th><th>Values</th><th>Jump</th></tr>
     """
   end
 
   def render_flow_signals_table_head(:page) do
     """
-    <tr><th>Flow</th><th>Type</th><th>Event</th><th>Time</th><th>Signal</th><th>State Change</th><th>Values</th><th>Open</th></tr>
+    <tr><th>Flow</th><th>Type</th><th>Event</th><th>Time</th><th>Signal</th><th>State change</th><th>Values</th><th>Open</th></tr>
     """
   end
 
@@ -152,7 +152,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Signals do
   def flow_signals_table_title(total_sampled, filtered_sampled, sample_limit, filters, :page)
       when is_integer(total_sampled) and is_integer(filtered_sampled) and
              is_integer(sample_limit) do
-    "Flow Signals <span class=\"badge badge-idle\">#{escape(flow_signals_filter_summary(filters))}</span>"
+    "Signals <span class=\"badge badge-idle\">#{escape(flow_signals_filter_summary(filters))}</span>"
   end
 
   def flow_signals_table_title(
