@@ -532,7 +532,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     """
   end
 
-  def render_flow_due_summary(due_now, scheduled) do
+  def render_flow_due_summary(due_now, scheduled, scheduled_total \\ nil) do
+    scheduled_count = scheduled_total || length(scheduled)
+
     {state, title} =
       case due_now do
         [] -> {:healthy, "Nothing is due now"}
@@ -555,15 +557,15 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     details =
       [
         oldest && "oldest #{format_duration_ms(oldest)} overdue",
-        case {scheduled, next} do
-          {[], _} ->
+        case {scheduled_count, next} do
+          {0, _} ->
             "Nothing scheduled in this sample"
 
-          {runs, nil} ->
-            "#{format_grouped(length(runs))} scheduled"
+          {count, nil} ->
+            "#{format_grouped(count)} scheduled"
 
-          {runs, next} ->
-            "#{format_grouped(length(runs))} scheduled, next in #{format_duration_ms(-next)}"
+          {count, next} ->
+            "#{format_grouped(count)} scheduled, next in #{format_duration_ms(-next)}"
         end
       ]
       |> Enum.reject(&is_nil/1)
@@ -581,19 +583,30 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     end
   end
 
-  def render_flow_due_records(title, records, total_sampled, sample_limit) do
-    {heading, ordering, empty} =
+  def render_flow_due_records(title, records, total_sampled, sample_limit, listed_total \\ nil) do
+    shown = length(records)
+    capped? = is_integer(listed_total) and listed_total > shown
+
+    {heading, ordering, shown_label, empty} =
       if title == "Due Now",
-        do: {"Due now", "Oldest due first", "Nothing is due now in this sample."},
+        do:
+          {"Due now", "Oldest due first", "Oldest #{format_grouped(shown)} shown",
+           "Nothing is due now in this sample."},
         else:
-          {"Scheduled", "Earliest scheduled first",
+          {"Scheduled", "Earliest scheduled first", "Earliest #{format_grouped(shown)} shown",
            "No runs are scheduled for later in this sample."}
+
+    # A capped list says how much of the sample it shows.
+    {count_label, ordering} =
+      if capped?,
+        do: {"#{format_grouped(shown)} of #{format_grouped(listed_total)}", shown_label},
+        else: {format_grouped(shown), ordering}
 
     note =
       ~s(<p class="flow-section-note">#{ordering} · #{sampled_scan_label(total_sampled, sample_limit)}</p>)
 
     title_html =
-      ~s(<h2 class="section-title">#{heading} <span class="badge badge-idle">#{format_grouped(length(records))}</span></h2>)
+      ~s(<h2 class="section-title">#{heading} <span class="badge badge-idle">#{count_label}</span></h2>)
 
     if records == [] do
       title_html <> ~s(\n<p class="section-empty">#{empty}</p>\n)

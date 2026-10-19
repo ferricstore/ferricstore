@@ -58,13 +58,15 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Prefixes do
           PageStatus.render("prefixes", :idle, "No User KV keys in this sample")
 
         largest ->
-          count = length(data.prefixes)
+          shown = length(data.prefixes)
+          count = max(Map.get(data, :prefix_count, shown), shown)
+          capped = if count > shown, do: ["largest #{format_number(shown)} shown"], else: []
 
           PageStatus.render(
             "prefixes",
             :idle,
             "#{format_number(count)} #{if count == 1, do: "prefix", else: "prefixes"} in #{format_number(data.total_sampled)} sampled keys",
-            ["largest: #{largest.prefix}, #{largest.pct}% of the sample"]
+            ["largest: #{largest.prefix}, #{largest.pct}% of the sample"] ++ capped
           )
       end
 

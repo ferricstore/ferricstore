@@ -372,7 +372,8 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
 
   defp live_flow_due_payload(data) do
     live_component_payload(%{
-      "flow_due_summary" => render_flow_due_summary(data.due_now, data.scheduled),
+      "flow_due_summary" =>
+        render_flow_due_summary(data.due_now, data.scheduled, Map.get(data, :scheduled_sampled)),
       "flow_fifo_lanes" =>
         render_flow_fifo_lanes(
           Map.get(data, :fifo_lanes, []),
@@ -387,7 +388,8 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
           "Scheduled Future",
           data.scheduled,
           data.total_sampled,
-          data.sample_limit
+          data.sample_limit,
+          Map.get(data, :scheduled_sampled)
         )
     })
   end

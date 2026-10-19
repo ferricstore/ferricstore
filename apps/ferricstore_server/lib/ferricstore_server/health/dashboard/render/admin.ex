@@ -41,7 +41,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
           PageStatus.render(
             "slowlog",
             :idle,
-            "#{format_number(count)} slow #{if count == 1, do: "command", else: "commands"} recorded",
+            slowlog_title(count),
             [
               "worst #{format_duration_us(worst_us)}#{if name == "", do: "", else: ": " <> name}",
               "average #{format_duration_us(avg_us)}"
@@ -72,6 +72,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
         ],
         heading: :hidden
       )
+  end
+
+  # The dashboard reads a bounded window; a full window means older entries exist.
+  defp slowlog_title(count) do
+    limit = FerricstoreServer.Health.Dashboard.Data.Operational.slowlog_limit()
+
+    cond do
+      count >= limit -> "#{format_number(limit)} most recent slow commands"
+      count == 1 -> "1 slow command recorded"
+      true -> "#{format_number(count)} slow commands recorded"
+    end
   end
 
   def slowlog_duration_class(duration_us) when duration_us >= 1_000_000, do: "c-red"

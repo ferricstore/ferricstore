@@ -35,6 +35,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.KV do
 
     %{
       prefixes: prefixes,
+      prefix_count: length(prefix_counts),
       total_sampled: total_sampled,
       scan_limited?: scanned >= @keyspace_dashboard_max_scan
     }

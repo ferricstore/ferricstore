@@ -276,14 +276,13 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
         |> Map.put(:dashboard_fifo_blocker, Map.get(blockers, key))
       end)
 
+    scheduled = records |> Enum.filter(&flow_scheduled_future?/1) |> sort_scheduled_records()
+
     %{
       filters: filters,
       due_now: records |> Enum.filter(&flow_due_now?/1) |> sort_scheduled_records(),
-      scheduled:
-        records
-        |> Enum.filter(&flow_scheduled_future?/1)
-        |> sort_scheduled_records()
-        |> Enum.take(80),
+      scheduled: Enum.take(scheduled, 80),
+      scheduled_sampled: length(scheduled),
       fifo_lanes: fifo_lanes,
       fifo_coverage: fifo.coverage,
       generated_at_ms: generated_at_ms,
