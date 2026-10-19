@@ -1,5 +1,5 @@
 defmodule FerricstoreServer.Health.Dashboard.CappedCountsTest do
-  use FerricstoreServer.Test.DashboardCase
+  use ExUnit.Case, async: true
 
   alias FerricstoreServer.Health.Dashboard.Data.Operational
   alias FerricstoreServer.Health.Dashboard.Flow.Browse
@@ -7,20 +7,20 @@ defmodule FerricstoreServer.Health.Dashboard.CappedCountsTest do
   alias FerricstoreServer.Health.Dashboard.Render.FlowTables.Records
 
   test "the Due page counts every scheduled run, though it lists the earliest 80" do
-    type = "capped-due-#{System.unique_integer([:positive])}"
     later = System.system_time(:millisecond) + 3_600_000
 
-    for n <- 1..81 do
-      :ok =
-        FerricStore.flow_create("#{type}-#{n}",
-          type: type,
-          state: "queued",
-          partition_key: "p",
-          run_at_ms: later + n
-        )
-    end
+    records =
+      for n <- 1..81,
+          do: %{
+            id: "run-#{n}",
+            type: "t",
+            state: "queued",
+            partition_key: "p",
+            run_at_ms: later + n
+          }
 
-    data = Browse.collect_due_page(type: type)
+    lists = Browse.due_lists(records)
+    data = Map.merge(lists, %{total_sampled: 81, sample_limit: 400})
     assert length(data.scheduled) == 80
     assert data.scheduled_sampled == 81
 

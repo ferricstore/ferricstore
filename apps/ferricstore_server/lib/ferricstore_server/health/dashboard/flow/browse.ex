@@ -276,18 +276,31 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
         |> Map.put(:dashboard_fifo_blocker, Map.get(blockers, key))
       end)
 
-    scheduled = records |> Enum.filter(&flow_scheduled_future?/1) |> sort_scheduled_records()
-
-    %{
+    records
+    |> due_lists()
+    |> Map.merge(%{
       filters: filters,
-      due_now: records |> Enum.filter(&flow_due_now?/1) |> sort_scheduled_records(),
-      scheduled: Enum.take(scheduled, 80),
-      scheduled_sampled: length(scheduled),
       fifo_lanes: fifo_lanes,
       fifo_coverage: fifo.coverage,
       generated_at_ms: generated_at_ms,
       total_sampled: length(records),
       sample_limit: @flow_dashboard_sample_limit
+    })
+  end
+
+  @scheduled_list_limit 80
+
+  @doc """
+  Splits sampled records into due-now and scheduled lists. The scheduled list
+  shows the earliest #{@scheduled_list_limit}; `scheduled_sampled` counts them all.
+  """
+  def due_lists(records) do
+    scheduled = records |> Enum.filter(&flow_scheduled_future?/1) |> sort_scheduled_records()
+
+    %{
+      due_now: records |> Enum.filter(&flow_due_now?/1) |> sort_scheduled_records(),
+      scheduled: Enum.take(scheduled, @scheduled_list_limit),
+      scheduled_sampled: length(scheduled)
     }
   end
 
