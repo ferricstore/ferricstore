@@ -2244,7 +2244,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         apply_prob_with_time(meta, state, fn ->
           path = prob_path(state, key, "bloom")
 
-          with {:ok, validated_params} <-
+          with :ok <- check_prob_elements([element], "bloom"),
+               {:ok, validated_params} <-
                  validate_bloom_auto_create_params(auto_create_params),
                {:ok, key_status} <- classify_prob_key(state, key, :bloom),
                :ok <- ensure_prob_dir(state) do
@@ -2274,7 +2275,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         apply_prob_with_time(meta, state, fn ->
           command = {:bloom_madd, key, elements, auto_create_params}
 
-          with :ok <- admit_apply_command_work(state, command),
+          with :ok <- check_prob_elements(elements, "bloom"),
+               :ok <- admit_apply_command_work(state, command),
                {:ok, validated_params} <-
                  validate_bloom_auto_create_params(auto_create_params),
                {:ok, key_status} <- classify_prob_key(state, key, :bloom),
@@ -2397,7 +2399,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         apply_prob_with_time(meta, state, fn ->
           path = prob_path(state, key, "cuckoo")
 
-          with {:ok, validated_params} <-
+          with :ok <- check_prob_elements([element], "cuckoo"),
+               {:ok, validated_params} <-
                  validate_cuckoo_auto_create_params(auto_create_params),
                {:ok, key_status} <- classify_prob_key(state, key, :cuckoo),
                :ok <- ensure_prob_dir(state) do
@@ -2427,7 +2430,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         apply_prob_with_time(meta, state, fn ->
           path = prob_path(state, key, "cuckoo")
 
-          with {:ok, validated_params} <-
+          with :ok <- check_prob_elements([element], "cuckoo"),
+               {:ok, validated_params} <-
                  validate_cuckoo_auto_create_params(auto_create_params),
                {:ok, key_status} <- classify_prob_key(state, key, :cuckoo),
                :ok <- ensure_prob_dir(state) do
@@ -2455,7 +2459,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
       def apply(meta, {:cuckoo_del, key, element}, state) do
         apply_prob_with_time(meta, state, fn ->
-          with :ok <- require_existing_prob_key(state, key, :cuckoo) do
+          with :ok <- check_prob_elements([element], "cuckoo"),
+               :ok <- require_existing_prob_key(state, key, :cuckoo) do
             path = prob_path(state, key, "cuckoo")
 
             with {:ok, mutation_index, mutation_ordinal} <- next_prob_mutation_token(state) do

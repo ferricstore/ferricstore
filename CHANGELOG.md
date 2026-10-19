@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Reject a Bloom or Cuckoo filter element that is not a string in
+  `FerricStore.bf_add/2`, `bf_madd/2`, `cf_add/2`, `cf_addnx/2` and
+  `cf_del/2` instead of crashing the shard. The element reached the
+  replicated log unchecked and the filter NIF raised while the entry was
+  applied, so the shard's storage process crash-looped. The state machine
+  now rejects those entries before touching the filter file.
 - Reject a sorted set member that is not a string in `FerricStore.zincrby/3`
   instead of crashing the shard. The member reached the replicated log
   unchecked and raised while the entry was applied, so the shard's storage

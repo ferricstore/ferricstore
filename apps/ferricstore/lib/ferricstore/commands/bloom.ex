@@ -27,6 +27,7 @@ defmodule Ferricstore.Commands.Bloom do
   @prob_read_timeout_ms 5_000
   @default_error_rate 0.01
   @default_capacity 100
+  @element_type_error {:error, "ERR bloom elements must be strings"}
   @max_bloom_bits 8_589_934_592
   @max_bloom_hashes 1_024
   @default_max_batch_items 10_000
@@ -113,6 +114,9 @@ defmodule Ferricstore.Commands.Bloom do
 
   def handle("BF.INFO", args, store), do: bf_info_args(args, store)
 
+  defp bf_add_args([_key, element], _store) when not is_binary(element),
+    do: @element_type_error
+
   defp bf_add_args([key, element], store) do
     with :ok <- ProbType.check_expected(key, :bloom, store) do
       auto_params = default_auto_create_params()
@@ -126,7 +130,8 @@ defmodule Ferricstore.Commands.Bloom do
   end
 
   defp bf_madd_args([key | elements], store) when elements != [] do
-    with :ok <- validate_bloom_batch_size(elements),
+    with :ok <- check_element_types(elements),
+         :ok <- validate_bloom_batch_size(elements),
          :ok <- ProbType.check_expected(key, :bloom, store) do
       auto_params = default_auto_create_params()
       result = do_prob_write(store, {:bloom_madd, key, elements, auto_params})
@@ -136,6 +141,12 @@ defmodule Ferricstore.Commands.Bloom do
 
   defp bf_madd_args(_args, _store) do
     {:error, "ERR wrong number of arguments for 'bf.madd' command"}
+  end
+
+  # The embedded API passes elements through as given; one that is not a
+  # binary raised in the NIF while the write was applied, crashing the shard.
+  defp check_element_types(elements) do
+    if Enum.all?(elements, &is_binary/1), do: :ok, else: @element_type_error
   end
 
   defp bf_exists_args([key, element], store) do

@@ -1071,6 +1071,26 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           assert [] == :ets.tab2list(ets)
         end
 
+        test "bloom and cuckoo writes reject an element that is not a string", %{
+          state: state
+        } do
+          bloom_params = %{num_bits: 1024, num_hashes: 3, capacity: 100, error_rate: 0.01}
+          cuckoo_params = %{capacity: 1024, bucket_size: 4}
+          bloom_error = {:error, "ERR bloom elements must be strings"}
+          cuckoo_error = {:error, "ERR cuckoo elements must be strings"}
+
+          for {command, error} <- [
+                {{:bloom_add, "apply_bad_bloom", :x, bloom_params}, bloom_error},
+                {{:bloom_madd, "apply_bad_bloom", ["a", 1], bloom_params}, bloom_error},
+                {{:cuckoo_add, "apply_bad_cuckoo", :x, cuckoo_params}, cuckoo_error},
+                {{:cuckoo_addnx, "apply_bad_cuckoo", 5, cuckoo_params}, cuckoo_error},
+                {{:cuckoo_del, "apply_bad_cuckoo", :x}, cuckoo_error}
+              ] do
+            {_new_state, result} = StateMachine.apply(%{}, command, state)
+            assert error == result, "#{inspect(command)} returned #{inspect(result)}"
+          end
+        end
+
         test "RATELIMIT.ADD rejects a malformed window, limit or count instead of raising", %{
           state: state,
           ets: ets

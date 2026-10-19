@@ -30,6 +30,23 @@ defmodule Ferricstore.EmbeddedExtendedDataStructuresTest do
       assert {:ok, true} = FerricStore.pfadd("hll:bad", ["a"])
     end
 
+    test "bloom and cuckoo writes reject an element that is not a string" do
+      bloom_error = {:error, "ERR bloom elements must be strings"}
+      cuckoo_error = {:error, "ERR cuckoo elements must be strings"}
+
+      assert bloom_error == FerricStore.bf_add("prob:bad-bloom", :x)
+      assert bloom_error == FerricStore.bf_madd("prob:bad-bloom", ["a", 1])
+      assert cuckoo_error == FerricStore.cf_add("prob:bad-cuckoo", :x)
+      assert cuckoo_error == FerricStore.cf_addnx("prob:bad-cuckoo", 5)
+
+      assert {:ok, 1} = FerricStore.cf_add("prob:bad-cuckoo", "a")
+      assert cuckoo_error == FerricStore.cf_del("prob:bad-cuckoo", :a)
+
+      assert {:ok, 1} = FerricStore.bf_add("prob:bad-bloom", "a")
+      assert {:ok, 1} = FerricStore.bf_exists("prob:bad-bloom", "a")
+      assert {:ok, 1} = FerricStore.cf_exists("prob:bad-cuckoo", "a")
+    end
+
     test "pfadd with duplicate elements" do
       FerricStore.pfadd("hll:dup", ["a", "b"])
       assert {:ok, false} = FerricStore.pfadd("hll:dup", ["a", "b"])
