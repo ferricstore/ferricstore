@@ -81,6 +81,13 @@ defmodule Ferricstore.Commands.HyperLogLog do
   # Private helpers
   # ---------------------------------------------------------------------------
 
+  # On the instance (the gateways' store) the sketch update is one replicated
+  # read-modify-write; reading the sketch here and writing it back lost
+  # concurrent clients' elements. In the state machine the clauses below run
+  # with its own store.
+  defp pfadd_args([key | elements], %FerricStore.Instance{} = ctx),
+    do: Ops.pfadd(ctx, key, elements)
+
   defp pfadd_args([key], store) do
     case ensure_not_compound_key(key, store) do
       :ok ->

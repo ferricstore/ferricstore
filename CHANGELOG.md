@@ -9,6 +9,15 @@ All notable changes to FerricStore will be documented here.
   failed read counted as a lost frame, so a purge on a busy node could delete
   a Flow that still reads back; the policy catalog backfill already told
   these apart.
+- Make HINCRBY, HINCRBYFLOAT, ZINCRBY and PFADD atomic through the TCP and HTTP
+  gateways. Their command handlers read the current value and wrote the new
+  one from the client's process, so concurrent clients lost updates: 200
+  concurrent HINCRBY increments of one field left 27 over HTTP, and PFADD lost
+  elements. On the instance they now use the state machine's atomic
+  operations, which the embedded API already used; inside MULTI/EXEC the
+  handlers still run in the state machine. HINCRBYFLOAT now stores and returns
+  the shortest form ("10.6", not "10.59999999999999968"), as the embedded API
+  did.
 - Write PFADD, SPOP, ZPOPMIN and ZPOPMAX for a custom embedded instance to that
   instance. `Router.pfadd/3`, `spop/3`, `zpopmin/3` and `zpopmax/3` sent every
   instance's command down the default instance's forced quorum path, so they

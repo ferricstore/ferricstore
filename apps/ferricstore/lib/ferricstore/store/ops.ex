@@ -470,6 +470,37 @@ defmodule Ferricstore.Store.Ops do
 
   def incr(store, key, delta) when is_map(store), do: store.incr.(key, delta)
 
+  @doc """
+  Atomically adds `delta` to a hash field: one replicated read-modify-write.
+  """
+  @spec hincrby(FerricStore.Instance.t(), binary(), binary(), integer()) ::
+          integer() | {:error, term()}
+  def hincrby(%FerricStore.Instance{} = ctx, key, field, delta),
+    do: Router.hincrby(ctx, key, field, delta)
+
+  @doc """
+  Atomically adds `increment` to a sorted set member's score; returns the new
+  score as stored.
+  """
+  @spec zincrby(FerricStore.Instance.t(), binary(), float(), binary()) ::
+          binary() | {:error, term()}
+  def zincrby(%FerricStore.Instance{} = ctx, key, increment, member),
+    do: Router.zincrby(ctx, key, increment, member)
+
+  @doc "Atomically adds elements to a HyperLogLog: one replicated sketch update."
+  @spec pfadd(FerricStore.Instance.t(), binary(), [binary()]) :: 0 | 1 | {:error, term()}
+  def pfadd(%FerricStore.Instance{} = ctx, key, elements),
+    do: Router.pfadd(ctx, key, elements)
+
+  @doc """
+  Atomically adds the float `delta` to a hash field; returns the new value as
+  stored.
+  """
+  @spec hincrbyfloat(FerricStore.Instance.t(), binary(), binary(), float()) ::
+          binary() | {:error, term()}
+  def hincrbyfloat(%FerricStore.Instance{} = ctx, key, field, delta),
+    do: Router.hincrbyfloat(ctx, key, field, delta)
+
   defp checked_integer_add(value, delta) do
     result = value + delta
 

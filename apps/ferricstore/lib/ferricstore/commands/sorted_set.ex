@@ -785,6 +785,17 @@ defmodule Ferricstore.Commands.SortedSet do
     end
   end
 
+  # On the instance (the gateways' store) the increment is one replicated
+  # read-modify-write; reading here and writing back lost concurrent
+  # increments. Inside a transaction the code below already runs in the state
+  # machine.
+  defp zincrby_member(key, increment, member, %FerricStore.Instance{} = ctx, type_status) do
+    case Ops.zincrby(ctx, key, increment, member) do
+      {:error, _reason} = error -> rollback_new_zset_type_marker(key, ctx, type_status, error)
+      new_score -> Helpers.format_score_str(new_score)
+    end
+  end
+
   defp zincrby_member(key, increment, member, store, type_status) do
     compound_key = CompoundKey.zset_member(key, member)
     existing = Ops.compound_get(store, key, compound_key)

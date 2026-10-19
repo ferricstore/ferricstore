@@ -939,6 +939,13 @@ defmodule Ferricstore.Commands.Hash do
     end
   end
 
+  # On the instance (the gateways' store) the increment is one replicated
+  # read-modify-write. Reading here and writing back lost concurrent clients'
+  # increments; inside a transaction the read and write below already run in
+  # the state machine.
+  defp do_hincrby(key, field, increment, %FerricStore.Instance{} = ctx, type_status),
+    do: atomic_field_increment(key, Ops.hincrby(ctx, key, field, increment), ctx, type_status)
+
   defp do_hincrby(key, field, increment, store, type_status) do
     compound_key = CompoundKey.hash_field(key, field)
 
@@ -970,6 +977,11 @@ defmodule Ferricstore.Commands.Hash do
     end
   end
 
+  defp hincrbyfloat_field(key, field, increment, %FerricStore.Instance{} = ctx, type_status) do
+    result = Ops.hincrbyfloat(ctx, key, field, increment)
+    atomic_field_increment(key, result, ctx, type_status)
+  end
+
   defp hincrbyfloat_field(key, field, increment, store, type_status) do
     compound_key = CompoundKey.hash_field(key, field)
 
@@ -994,6 +1006,11 @@ defmodule Ferricstore.Commands.Hash do
         FieldOps.rollback_new_type_marker(key, store, type_status, error)
     end
   end
+
+  defp atomic_field_increment(key, {:error, _reason} = error, store, type_status),
+    do: FieldOps.rollback_new_type_marker(key, store, type_status, error)
+
+  defp atomic_field_increment(_key, result, _store, _type_status), do: result
 
   defp write_hash_field(store, key, compound_key, value, success, type_status) do
     case Ops.compound_put(store, key, compound_key, value, 0) do
