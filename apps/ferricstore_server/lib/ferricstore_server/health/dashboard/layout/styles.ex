@@ -275,6 +275,10 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .worker-lease-bar { display: block; height: 6px; border-radius: 999px; background: var(--accent); overflow: hidden; }
       .worker-lease-bar .is-expired { display: block; height: 100%; background: var(--warn); }
       .flow-local-scope { margin-bottom: 20px; }
+      .size-cell { display: flex; align-items: center; gap: 12px; }
+      .size-value { min-width: 9ch; font-variant-numeric: tabular-nums; }
+      .size-track { flex: 1; max-width: 360px; height: 6px; border-radius: 999px; background: var(--line); overflow: hidden; }
+      .size-bar { display: block; height: 100%; border-radius: 999px; background: var(--info); }
       .stat-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); margin: 0 0 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); overflow: hidden; }
       .stat-strip > div { padding: 12px 16px; border-right: 1px solid var(--line-subtle); }
       .stat-strip > div:last-child { border-right: 0; }

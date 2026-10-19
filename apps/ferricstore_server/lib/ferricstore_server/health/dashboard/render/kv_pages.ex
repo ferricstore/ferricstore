@@ -2,7 +2,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
   import FerricstoreServer.Health.Dashboard.Format
   import FerricstoreServer.Health.Dashboard.Render.Overview
   alias Ferricstore.Commands.Catalog.Entries
-  alias FerricstoreServer.Health.Dashboard.Render.TableValue
+  alias FerricstoreServer.Health.Dashboard.Render.{PageStatus, TableValue}
 
   @keyspace_dashboard_default_limit 50
   @keyspace_dashboard_max_limit 500
@@ -452,47 +452,66 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
     largest =
       Enum.max_by(shards, & &1.disk_bytes, fn -> %{index: "-", disk_bytes: 0} end)
 
-    render_ops_summary("Storage Summary", [
-      %{
-        label: "Data directory",
-        value: format_bytes(data.total_disk_bytes),
-        detail: "All files, including shard and auxiliary directories"
-      },
-      %{
-        label: "Shard data directories",
-        value: format_bytes(shard_bytes),
-        detail: "Sum of the shard directories below"
-      },
-      %{
-        label: "Other directories",
-        value: format_bytes(max(data.total_disk_bytes - shard_bytes, 0)),
-        detail: "Data-directory files outside shard directories"
-      },
-      %{
-        label: "Data + hint files",
-        value: format_number(data.total_files),
-        detail: "Recognized data and hint files only"
-      },
-      %{
-        label: "Largest Shard",
-        value: "Shard #{largest.index}",
-        detail: format_bytes(largest.disk_bytes)
-      },
-      %{
-        label: "Data Files",
-        value: format_number(data_files),
-        detail: "#{format_number(hint_files)} Hint Files"
-      }
-    ])
+    other_bytes = max(data.total_disk_bytes - shard_bytes, 0)
+
+    largest_detail =
+      if shard_bytes > 0,
+        do: [
+          "largest: shard #{largest.index} at #{format_bytes(largest.disk_bytes)}, #{round(largest.disk_bytes * 100 / shard_bytes)}% of shard data"
+        ],
+        else: []
+
+    status =
+      PageStatus.render(
+        "storage",
+        :idle,
+        "#{format_bytes(data.total_disk_bytes)} on disk across #{length(shards)} #{if length(shards) == 1, do: "shard", else: "shards"}",
+        largest_detail ++ ["#{format_bytes(other_bytes)} outside shard directories"]
+      )
+
+    status <>
+      render_ops_summary(
+        "Storage Summary",
+        [
+          %{
+            label: "Data directory",
+            value: format_bytes(data.total_disk_bytes),
+            detail: "All files, including shard and auxiliary directories"
+          },
+          %{
+            label: "Shard data directories",
+            value: format_bytes(shard_bytes),
+            detail: "Sum of the shard directories below"
+          },
+          %{
+            label: "Other directories",
+            value: format_bytes(max(data.total_disk_bytes - shard_bytes, 0)),
+            detail: "Data-directory files outside shard directories"
+          },
+          %{
+            label: "Data + hint files",
+            value: format_number(data.total_files),
+            detail: "Recognized data and hint files only"
+          },
+          %{
+            label: "Data files",
+            value: format_number(data_files),
+            detail: "#{format_number(hint_files)} hint files"
+          }
+        ],
+        heading: :hidden
+      )
   end
 
   def render_storage_table(shards) do
+    largest = shards |> Enum.map(& &1.disk_bytes) |> Enum.max(fn -> 0 end) |> max(1)
+
     rows =
       Enum.map_join(shards, "\n", fn shard ->
         """
         <tr>
           <td>#{shard.index}</td>
-          <td>#{format_bytes(shard.disk_bytes)}</td>
+          <td class="size-cell"><span class="size-value">#{format_bytes(shard.disk_bytes)}</span><span class="size-track"><span class="size-bar" style="width: #{min(100, round(shard.disk_bytes * 100 / largest))}%"></span></span></td>
           <td>#{shard.data_file_count}</td>
           <td>#{shard.hint_file_count}</td>
         </tr>
@@ -504,7 +523,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
     <p class="flow-filter-note">Directory totals include every file beneath each shard data directory. Files outside those directories are counted in Other directories.</p>
     <table>
       <thead>
-        <tr><th>Shard</th><th>Shard directory size</th><th>Data Files</th><th>Hint Files</th></tr>
+        <tr><th>Shard</th><th>Shard directory size</th><th>Data files</th><th>Hint files</th></tr>
       </thead>
       <tbody>
         #{rows}
