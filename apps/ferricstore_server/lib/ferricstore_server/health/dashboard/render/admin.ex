@@ -451,46 +451,103 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
   defp config_value(_parameter, value), do: escape(to_string(value))
 
   def render_cluster_info(cluster) do
-    node_str = Atom.to_string(cluster.node_name)
-
-    cluster_badge =
+    mode =
       case cluster.cluster_mode do
-        :standalone ->
-          ~s(<span class="badge badge-idle">single-member WARaft</span>)
-
-        :cluster ->
-          ~s(<span class="badge badge-ok">#{cluster.cluster_size}-node cluster</span>)
+        :standalone -> ~s(<span class="badge badge-idle">single-member WARaft</span>)
+        :cluster -> ~s(<span class="badge badge-ok">#{cluster.cluster_size}-node cluster</span>)
       end
 
-    nodes_html =
-      if cluster.cluster_size > 1 do
-        node_items =
-          Enum.map_join(cluster.nodes, "", fn n ->
-            is_self = n == cluster.node_name
-            class = if is_self, do: "c-green", else: ""
-            label = if is_self, do: " (this node)", else: ""
+    nodes = if cluster.cluster_size > 1, do: cluster.nodes, else: [cluster.node_name]
 
-            ~s(<span class="#{class}" style="margin-right:16px;">#{escape(Atom.to_string(n))}#{label}</span>)
-          end)
+    items =
+      Enum.map_join(nodes, "", fn node_name ->
+        self? = node_name == cluster.node_name
+        label = if self?, do: ~s( <span class="c-muted">this node</span>), else: ""
+        ~s(<li><span class="mono">#{escape(Atom.to_string(node_name))}</span>#{label}</li>)
+      end)
 
-        """
-        <div style="margin-top:8px; font-size:0.82rem; color:var(--text-faint);">
-          Nodes: #{node_items}
-        </div>
-        """
-      else
-        ""
+    note =
+      if cluster.cluster_size > 1,
+        do: "",
+        else:
+          ~s(<p class="consensus-card-note">One member keeps one copy of each shard, so there is no failover.</p>)
+
+    """
+    <section class="consensus-card" aria-labelledby="consensus-members-title">
+      <div class="consensus-card-head"><h2 id="consensus-members-title">Members</h2>#{mode}</div>
+      <ul class="consensus-members">#{items}</ul>
+      #{note}
+    </section>
+    """
+  end
+
+  @doc """
+  One line on whether every shard has a leader and is applying what it
+  commits; anything else is named.
+  """
+  def render_consensus_status(raft_shards) do
+    total = length(raft_shards)
+    unreadable = Enum.count(raft_shards, &(&1.status != :ok))
+    unavailable = Enum.count(raft_shards, &(&1.status == :unavailable))
+    leaderless = Enum.count(raft_shards, &(&1.status == :ok and is_nil(&1.leader)))
+
+    behind =
+      raft_shards
+      |> Enum.map(&{&1.shard, consensus_lag(&1)})
+      |> Enum.filter(fn {_shard, lag} -> is_integer(lag) and lag > 100 end)
+      |> Enum.sort_by(fn {_shard, lag} -> -lag end)
+
+    largest = behind |> Enum.map(&elem(&1, 1)) |> Enum.max(fn -> 0 end)
+
+    issues =
+      [
+        unreadable > 0 &&
+          "#{unreadable} of #{total} #{plural(total, "shard")} could not be fully read",
+        leaderless > 0 &&
+          "#{leaderless} #{plural(leaderless, "shard")} #{if leaderless == 1, do: "has", else: "have"} no leader",
+        case behind do
+          [] ->
+            false
+
+          [{shard, lag}] ->
+            "Shard #{shard} is #{lag} entries behind"
+
+          many ->
+            "#{length(many)} shards are behind on applying, the largest by #{largest} entries"
+        end
+      ]
+      |> Enum.filter(&is_binary/1)
+
+    {state, title, detail} =
+      cond do
+        total == 0 ->
+          {"warning", "No shards reported", "The consensus snapshot is empty."}
+
+        issues == [] ->
+          lags = raft_shards |> Enum.map(&consensus_lag/1)
+
+          if Enum.all?(lags, &(&1 == 0)) do
+            {"healthy", "All #{total} #{plural(total, "shard")} have a leader and are caught up",
+             "Every committed entry is applied to storage."}
+          else
+            {"healthy", "All #{total} #{plural(total, "shard")} have a leader and are keeping up",
+             "The largest apply lag is #{Enum.max(lags)} entries."}
+          end
+
+        unavailable > 0 or leaderless > 0 or largest > 1_000 ->
+          {"degraded", Enum.join(issues, ". "),
+           "Open the shard details below, and run the Doctor checks if this persists."}
+
+        true ->
+          {"warning", Enum.join(issues, ". "),
+           "Shards normally catch up on their own; if a gap keeps growing, run the Doctor checks."}
       end
 
     """
-    <h2 class="section-title">Cluster #{cluster_badge}</h2>
-    <div class="conn-row" style="flex-direction:column; align-items:flex-start;">
-      <div style="font-size:0.85rem;">
-        <span class="conn-label">Node: </span>
-        <span class="conn-val mono">#{escape(node_str)}</span>
-      </div>
-      #{nodes_html}
-    </div>
+    <section class="consensus-status is-#{state}" aria-label="Consensus status">
+      <strong>#{escape(title)}</strong>
+      <span>#{escape(detail)}</span>
+    </section>
     """
   end
 
@@ -502,26 +559,89 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
     lags = raft_shards |> Enum.map(&consensus_lag/1) |> Enum.filter(&is_integer/1)
     complete? = total > 0 and length(lags) == total
     max_lag = Enum.max(lags, fn -> nil end)
+    terms = raft_shards |> Enum.map(& &1.current_term) |> Enum.filter(&is_integer/1)
 
-    render_ops_summary("WARaft Consensus Summary", [
-      %{
-        label: "Healthy Shards",
-        value: "#{format_number(healthy)} / #{format_number(total)}",
-        class: if(healthy == total, do: "c-green", else: "c-red")
-      },
-      %{
-        label: "Max Apply Lag",
-        value: if(complete?, do: Integer.to_string(max_lag), else: "Unavailable"),
-        class: if(complete?, do: consensus_lag_class(max_lag), else: "c-muted"),
-        detail:
-          if(complete?,
-            do: "commit minus storage-applied index",
-            else: "#{length(lags)} / #{total} shards measured"
-          )
-      },
-      %{label: "Leaders", value: "#{format_number(leaders)} / #{format_number(total)}"}
-    ])
+    {lag_value, lag_class, lag_note} =
+      if complete?,
+        do:
+          {Integer.to_string(max_lag), consensus_stat_class(max_lag),
+           "commit minus storage-applied index"},
+        else: {"Unavailable", " is-unknown", "#{length(lags)} / #{total} shards measured"}
+
+    cards = [
+      {"Shards with a leader", "#{leaders} / #{total}",
+       if(leaders == total, do: "", else: " is-degraded"), ""},
+      {"Largest apply lag", lag_value, lag_class, lag_note},
+      {"Highest term",
+       if(terms == [], do: "Unavailable", else: Integer.to_string(Enum.max(terms))),
+       if(terms == [], do: " is-unknown", else: ""), ""},
+      {"Readable shards", "#{healthy} / #{total}",
+       if(healthy == total, do: "", else: " is-warning"), ""}
+    ]
+
+    items =
+      Enum.map_join(cards, "", fn {label, value, class, note} ->
+        note_html =
+          if note == "",
+            do: "",
+            else: ~s(<span class="consensus-stat-note">#{escape(note)}</span>)
+
+        """
+        <div class="consensus-stat">
+          <span class="consensus-stat-label">#{escape(label)}</span>
+          <div class="consensus-stat-value#{class}">#{escape(value)}</div>
+          #{note_html}
+        </div>
+        """
+      end)
+
+    ~s(<section class="consensus-stats" aria-label="Consensus summary">#{items}</section>)
   end
+
+  defp consensus_stat_class(lag) when lag > 1_000, do: " is-degraded"
+  defp consensus_stat_class(lag) when lag > 100, do: " is-warning"
+  defp consensus_stat_class(_lag), do: ""
+
+  @doc """
+  One tile per shard: its commit index and whether storage keeps up with it.
+  """
+  def render_consensus_grid(raft_shards) do
+    tiles =
+      Enum.map_join(raft_shards, "", fn shard ->
+        lag = consensus_lag(shard)
+
+        {class, note} =
+          cond do
+            shard.status != :ok -> {"is-down", Atom.to_string(shard.status)}
+            is_nil(shard.leader) -> {"is-down", "no leader"}
+            lag == 0 -> {"is-ok", "caught up"}
+            is_integer(lag) and lag > 100 -> {"is-behind", "#{lag} behind"}
+            is_integer(lag) -> {"is-ok", "#{lag} behind"}
+            true -> {"is-down", "lag unknown"}
+          end
+
+        leader =
+          case shard.leader do
+            {name, leader_node} -> "#{name}@#{leader_node}"
+            nil -> "none"
+          end
+
+        title =
+          "Shard #{shard.shard} · leader #{leader} · term #{consensus_index(shard.current_term)} · committed #{consensus_index(shard.commit_index)} · applied #{consensus_index(shard.last_applied)}"
+
+        ~s(<li class="consensus-shard #{class}" title="#{escape_attr(title)}"><span class="consensus-shard-head">Shard #{shard.shard}</span><strong>#{consensus_index(shard.commit_index)}</strong><span class="consensus-shard-note">#{escape(note)}</span></li>)
+      end)
+
+    """
+    <section class="consensus-card consensus-grid-card" aria-labelledby="consensus-grid-title">
+      <div class="consensus-card-head"><h2 id="consensus-grid-title">Shards</h2><span class="consensus-card-note">Commit index per shard</span></div>
+      <ol class="consensus-grid">#{tiles}</ol>
+    </section>
+    """
+  end
+
+  defp plural(1, word), do: word
+  defp plural(_count, word), do: word <> "s"
 
   defp consensus_lag(%{commit_index: commit, last_applied: applied})
        when is_integer(commit) and is_integer(applied), do: max(commit - applied, 0)
@@ -594,7 +714,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
       end)
 
     """
-    <h2 class="section-title">Per-Shard WARaft State #{summary_badge}</h2>
+    <p class="flow-section-note">#{summary_badge}</p>
     #{accessible_table("Per-shard consensus state", """
     <table>
       <thead>

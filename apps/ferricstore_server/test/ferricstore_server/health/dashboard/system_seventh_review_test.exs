@@ -42,7 +42,7 @@ defmodule FerricstoreServer.Health.Dashboard.SystemSeventhReviewTest do
     assert shard.commit_index == 211
     html = Admin.render_consensus_summary([shard]) <> Admin.render_raft_table([shard])
     assert html =~ "Unavailable"
-    refute html =~ ~r/Max Apply Lag<\/div>\s*<div[^>]*c-green/
+    assert html =~ ~s(<div class="consensus-stat-value is-unknown">Unavailable</div>)
 
     missing =
       Operational.raft_snapshot(1, {:error, :timeout}, {:error, :noproc}, {:error, :timeout})
