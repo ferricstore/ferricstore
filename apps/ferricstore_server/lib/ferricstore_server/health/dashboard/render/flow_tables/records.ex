@@ -457,31 +457,90 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     """
   end
 
-  def render_flow_due_records(title, records, total_sampled, sample_limit) do
-    ordering =
-      if title == "Due Now",
-        do: "Oldest due first in current sample",
-        else: "Earliest scheduled first in current sample"
-
-    rows =
-      case records do
-        [] ->
-          ~s(<tr><td colspan="6" class="c-muted">No #{escape(String.downcase(title))} records discovered in sample</td></tr>)
-
-        _ ->
-          Enum.map_join(records, "\n", fn record ->
-            """
-            <tr>
-              <td class="flow-run-identity"><div class="mono">#{render_flow_id_link(flow_record_id(record), flow_record_partition_key(record))}</div>#{render_run_scope(record)}</td>
-              <td class="#{flow_state_class(flow_record_state(record))}">#{escape(flow_record_state(record))}</td>
-              <td>#{render_due_waiting_reason(record)}</td>
-              <td>#{render_clock(flow_record_run_at_ms(record))}#{render_due_relative_time(record)}</td>
-              <td>#{escape(to_string(flow_field(record, :priority, 0)))}</td>
-              <td>#{render_flow_value_ref_badges(record, :detail_link)}</td>
-            </tr>
-            """
-          end)
+  def render_flow_due_summary(due_now, scheduled) do
+    {state, title} =
+      case due_now do
+        [] -> {:healthy, "Nothing is due now"}
+        [_] -> {:idle, "1 run due now"}
+        runs -> {:idle, "#{format_grouped(length(runs))} runs due now"}
       end
+
+    oldest =
+      due_now
+      |> Enum.map(&due_delta_ms/1)
+      |> Enum.filter(&(is_integer(&1) and &1 >= 0))
+      |> Enum.max(fn -> nil end)
+
+    next =
+      scheduled
+      |> Enum.map(&due_delta_ms/1)
+      |> Enum.filter(&(is_integer(&1) and &1 < 0))
+      |> Enum.max(fn -> nil end)
+
+    details =
+      [
+        oldest && "oldest #{format_duration_ms(oldest)} overdue",
+        case {scheduled, next} do
+          {[], _} ->
+            "Nothing scheduled in this sample"
+
+          {runs, nil} ->
+            "#{format_grouped(length(runs))} scheduled"
+
+          {runs, next} ->
+            "#{format_grouped(length(runs))} scheduled, next in #{format_duration_ms(-next)}"
+        end
+      ]
+      |> Enum.reject(&is_nil/1)
+
+    PageStatus.render("due", state, title, details) <>
+      ~s(<p class="flow-section-note">Due time alone does not establish claimability; FIFO order, leases and policy limits can still hold a run back.</p>)
+  end
+
+  # Positive when the run is overdue, negative when it is still in the future.
+  defp due_delta_ms(record) do
+    case {flow_record_run_at_ms(record), Map.get(record, :dashboard_snapshot_ms)} do
+      {run_at, snapshot} when is_integer(run_at) and is_integer(snapshot) -> snapshot - run_at
+      {run_at, _} when is_integer(run_at) -> System.system_time(:millisecond) - run_at
+      _ -> nil
+    end
+  end
+
+  def render_flow_due_records(title, records, total_sampled, sample_limit) do
+    {heading, ordering, empty} =
+      if title == "Due Now",
+        do: {"Due now", "Oldest due first", "Nothing is due now in this sample."},
+        else:
+          {"Scheduled", "Earliest scheduled first",
+           "No runs are scheduled for later in this sample."}
+
+    note =
+      ~s(<p class="flow-section-note">#{ordering} · #{sampled_scan_label(total_sampled, sample_limit)}</p>)
+
+    title_html =
+      ~s(<h2 class="section-title">#{heading} <span class="badge badge-idle">#{format_grouped(length(records))}</span></h2>)
+
+    if records == [] do
+      title_html <> ~s(\n<p class="section-empty">#{empty}</p>\n)
+    else
+      title_html <> "\n" <> note <> "\n" <> render_flow_due_table(title, records)
+    end
+  end
+
+  defp render_flow_due_table(title, records) do
+    rows =
+      Enum.map_join(records, "\n", fn record ->
+        """
+        <tr>
+          <td class="flow-run-identity"><div class="mono">#{render_flow_id_link(flow_record_id(record), flow_record_partition_key(record))}</div>#{render_run_scope(record)}</td>
+          <td class="#{flow_state_class(flow_record_state(record))}">#{escape(flow_record_state(record))}</td>
+          <td>#{render_due_waiting_reason(record)}</td>
+          <td class="flow-due-cell">#{render_due_relative_time(record)}#{render_due_clock(flow_record_run_at_ms(record))}</td>
+          <td>#{escape(to_string(flow_field(record, :priority, 0)))}</td>
+          <td>#{render_flow_value_ref_badges(record, :detail_link)}</td>
+        </tr>
+        """
+      end)
 
     table = """
     <table>
@@ -494,12 +553,14 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     </table>
     """
 
-    """
-    <h2 class="section-title">#{escape(title)} <span class="badge badge-idle">#{sampled_scan_label(total_sampled, sample_limit)}</span></h2>
-    <p class="flow-section-note">#{ordering}</p>
-    #{accessible_table(title <> " workflow records", table)}
-    """
+    accessible_table(title <> " workflow records", table)
   end
+
+  defp render_due_clock(ms) when is_integer(ms),
+    do:
+      ~s(<span class="flow-run-secondary" title="#{escape_attr(format_timestamp_ms_or_dash(ms))}">#{format_clock_ms(ms)}</span>)
+
+  defp render_due_clock(_ms), do: ~s(<span class="flow-run-secondary">-</span>)
 
   defp render_due_waiting_reason(record) do
     case Map.get(record, :dashboard_fifo_blocker) do
@@ -517,16 +578,12 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
   end
 
   defp render_due_relative_time(record) do
-    case {flow_record_run_at_ms(record), Map.get(record, :dashboard_snapshot_ms)} do
-      {run_at, snapshot} when is_integer(run_at) and is_integer(snapshot) ->
-        delta = snapshot - run_at
+    case due_delta_ms(record) do
+      delta when is_integer(delta) and delta >= 0 ->
+        ~s(<span class="flow-due-when">#{format_duration_ms(delta)} overdue</span>)
 
-        label =
-          if delta >= 0,
-            do: "#{format_duration_ms(delta)} overdue",
-            else: "in #{format_duration_ms(-delta)}"
-
-        ~s(<span class="flow-run-secondary" title="Relative to captured snapshot at #{format_timestamp_ms_or_dash(snapshot)}">#{label}</span>)
+      delta when is_integer(delta) ->
+        ~s(<span class="flow-due-when">in #{format_duration_ms(-delta)}</span>)
 
       _ ->
         ""

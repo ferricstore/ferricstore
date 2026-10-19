@@ -13,20 +13,29 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowReviewRegressionsTest do
   alias FerricstoreServer.Health.Dashboard.Render.FlowTables.Records
   alias FerricstoreServer.Health.Dashboard.FlowRecord
 
-  test "Due Work uses a compact unframed comparison and keeps exact sampled counts" do
-    for {due, scheduled} <- [{[], []}, {[1, 2, 3], [4]}, {[], [1, 2]}] do
-      html = FlowCharts.render_flow_due_chart(due, scheduled)
+  test "Due Work summarizes the sample in one unframed line with exact counts" do
+    run = fn id ->
+      %{id: id, type: "t", state: "queued", run_at_ms: 1, dashboard_snapshot_ms: 2}
+    end
 
-      assert html =~
-               ~s(<section class="flow-due-summary" aria-label="Sampled due and scheduled work">)
+    for {due, scheduled} <- [
+          {[], []},
+          {[run.(1), run.(2), run.(3)], [run.(4)]},
+          {[], [run.(1), run.(2)]}
+        ] do
+      html = Records.render_flow_due_summary(due, scheduled)
 
       refute html =~ "chart-card"
       refute html =~ "chart-grid"
       refute html =~ "Due Charts"
-      assert html =~ "Current sample"
       assert html =~ "does not establish claimability"
-      assert html =~ ~s(<span class="chart-bar-value">#{length(due)}</span>)
-      assert html =~ ~s(<span class="chart-bar-value">#{length(scheduled)}</span>)
+
+      case length(due) do
+        0 -> assert html =~ "Nothing is due now"
+        n -> assert html =~ "#{n} runs due now"
+      end
+
+      if scheduled != [], do: assert(html =~ "#{length(scheduled)} scheduled")
     end
   end
 
@@ -170,9 +179,9 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowReviewRegressionsTest do
 
   test "due charts and record diagnostics do not infer claim eligibility from timestamps" do
     record = %{id: "waiting", type: "invoices", state: "queued", run_at_ms: 1}
-    html = FlowCharts.render_flow_due_chart([record], [])
+    html = Records.render_flow_due_summary([record], [])
     refute html =~ "Claim readiness"
-    refute html =~ "bar-yellow"
+    refute html =~ "is-warning"
     assert html =~ "does not establish claimability"
     refute FlowRecord.flow_waiting_reason(record) =~ "waiting for worker claim"
     assert FlowDetail.flow_execution_debug_summary(record) == "due time reached"

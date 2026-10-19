@@ -136,26 +136,6 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
 
   defp chart_coverage(_shown, _total), do: ""
 
-  def render_flow_due_chart(due_now, scheduled) do
-    rows = [
-      %{
-        label: "Current sample",
-        values: [
-          {"Due now", length(due_now), "bar-neutral"},
-          {"Scheduled", length(scheduled), "bar-blue"}
-        ]
-      }
-    ]
-
-    """
-    <section class="flow-due-summary" aria-label="Sampled due and scheduled work">
-      <h2 class="section-title">Due vs scheduled</h2>
-      <p class="flow-section-note">Due time alone does not establish claimability; FIFO ordering, leases, and policy limits may block a claim.</p>
-      #{render_bar_chart(rows)}
-    </section>
-    """
-  end
-
   def render_flow_timeline_chart(history) do
     timeline = flow_history_timeline_rows(history)
 

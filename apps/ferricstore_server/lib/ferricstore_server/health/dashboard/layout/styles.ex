@@ -258,6 +258,8 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .runs-split .overview-state-bar { margin-top: 0; }
       .overview-state.is-failed { background: var(--danger); }
       .flow-state-attention .badge + .badge { margin-left: 4px; }
+      .section-empty { margin: 4px 0 24px; padding: 16px 18px; border: 1px dashed var(--line-strong); border-radius: 12px; color: var(--text-muted); font-size: 0.875rem; }
+      .flow-due-cell .flow-due-when { display: block; color: var(--text-strong); }
       .flow-state-due { display: block; margin-top: 2px; color: var(--text-muted); font-size: 0.75rem; }
       .doctor-checks td strong { display: block; color: var(--text-strong); font-weight: 500; }
       .doctor-checks td strong + .mono { color: var(--text-faint); font-size: 0.75rem; }

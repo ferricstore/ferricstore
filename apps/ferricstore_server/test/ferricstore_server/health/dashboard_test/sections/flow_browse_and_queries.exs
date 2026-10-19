@@ -523,8 +523,9 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
                    ~s(href="/dashboard/flow/due" aria-current="page">Due</a>)
                  )
 
-          assert String.contains?(html, "Why waiting")
-          assert String.contains?(html, "Run at")
+          assert String.contains?(html, ~s(class="page-status due-status))
+          assert String.contains?(html, "<h2 class=\"section-title\">Due now")
+          assert String.contains?(html, "<h2 class=\"section-title\">Scheduled")
         end
       end
 

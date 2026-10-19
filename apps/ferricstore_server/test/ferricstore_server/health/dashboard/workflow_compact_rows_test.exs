@@ -66,7 +66,7 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowCompactRowsTest do
 
     refute html =~ "<th>Type</th>"
     assert html =~ "<th>Stored state</th>"
-    assert Records.render_flow_due_records("Due Now", [], 0, 400) =~ ~s(colspan="6")
+    assert Records.render_flow_due_records("Due Now", [], 0, 400) =~ ~s(class="section-empty")
   end
 
   defp record(opts) do
