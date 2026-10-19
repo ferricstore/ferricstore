@@ -2,7 +2,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
   @moduledoc false
 
   import FerricstoreServer.Health.Dashboard.Format
-  import FerricstoreServer.Health.Dashboard.Render.Overview, only: [render_ops_summary: 2]
+  import FerricstoreServer.Health.Dashboard.Render.Overview, only: [render_ops_summary: 3]
+
+  alias FerricstoreServer.Health.Dashboard.Render.PageStatus
 
   def render_acl_security(%{modifier_form_only?: true} = data) do
     draft = Map.get(data, :account_draft, %{})
@@ -28,8 +30,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
     """
     #{render_acl_security_summary(data)}
     #{render_security_flash(Map.get(data, :flash))}
-    #{render_account_management(data)}
     #{render_acl_users(data)}
+    #{render_account_creation(data)}
     #{render_acl_tester(data)}
     #{render_dashboard_route_requirements(data)}
     """
@@ -43,33 +45,81 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
     can_mutate =
       Map.get(data, :can_manage_users, false) or Map.get(data, :can_delete_users, false)
 
-    render_ops_summary("ACL Security", [
-      %{
-        label: "Protected Mode",
-        value: if(protected_mode, do: "on", else: "off"),
-        class: if(protected_mode, do: "c-green", else: "c-yellow")
-      },
-      %{
-        label: "Configured Users",
-        value: if(configured_users, do: "yes", else: "no"),
-        class: if(configured_users, do: "c-green", else: "c-yellow")
-      },
-      %{
-        label: "ACL Users",
-        value: format_number(Map.get(data, :acl_user_count, 0))
-      },
-      %{
-        label: "Principal",
-        value: current_user,
-        detail: "dashboard request identity"
-      },
-      %{
-        label: "Mutation Surface",
-        value: if(can_mutate, do: "enabled", else: "read only"),
-        class: if(can_mutate, do: "c-green", else: "c-muted"),
-        detail: "command-specific account permissions"
-      }
-    ])
+    users = Map.get(data, :acl_user_count, 0)
+
+    status =
+      cond do
+        not protected_mode ->
+          PageStatus.render("security", :warning, "Protected mode is off", [
+            "remote connections are accepted even when no password is set"
+          ])
+
+        not configured_users ->
+          PageStatus.render("security", :warning, "No configured users", [
+            "only localhost connections are accepted until a password is set"
+          ])
+
+        true ->
+          PageStatus.render(
+            "security",
+            :healthy,
+            "Protected: #{format_number(users)} ACL #{if users == 1, do: "user", else: "users"}",
+            [
+              "signed in as #{current_user}",
+              if(can_mutate, do: "account changes enabled", else: "read only")
+            ]
+          )
+      end
+
+    status <>
+      render_ops_summary(
+        "ACL Security",
+        [
+          %{
+            label: "Protected mode",
+            value: if(protected_mode, do: "on", else: "off"),
+            class: if(protected_mode, do: "c-green", else: "c-yellow")
+          },
+          %{
+            label: "Configured users",
+            value: if(configured_users, do: "yes", else: "no"),
+            class: if(configured_users, do: "c-green", else: "c-yellow")
+          },
+          %{
+            label: "ACL users",
+            value: format_number(Map.get(data, :acl_user_count, 0))
+          },
+          %{
+            label: "Principal",
+            value: current_user,
+            detail: "dashboard request identity"
+          },
+          %{
+            label: "Account changes",
+            value: if(can_mutate, do: "enabled", else: "read only"),
+            class: if(can_mutate, do: "c-green", else: "c-muted"),
+            detail: "command-specific account permissions"
+          }
+        ],
+        heading: :hidden
+      )
+  end
+
+  # The accounts list is the page's subject; creating an account folds below it,
+  # and opens again when a submitted draft comes back with an error.
+  defp render_account_creation(data) do
+    if Map.get(data, :can_manage_users, false) do
+      open =
+        case Map.get(data, :account_draft) do
+          draft when is_map(draft) and map_size(draft) > 0 -> " open"
+          _none -> ""
+        end
+
+      ~s(<details class="dashboard-disclosure acl-create"#{open}><summary>Create an account</summary>) <>
+        render_account_management(data) <> "</details>"
+    else
+      render_account_management(data)
+    end
   end
 
   def render_security_flash(%{status: status, message: message})

@@ -52,4 +52,55 @@ defmodule FerricstoreServer.Health.Dashboard.AdminRedesignTest do
     refute html =~ "<table"
     refute html =~ "Flags: M=in MULTI"
   end
+
+  alias FerricstoreServer.Health.Dashboard.Render.Security
+
+  test "Security opens with whether access is protected" do
+    protected =
+      Security.render_acl_security_summary(%{
+        protected_mode: true,
+        configured_users: true,
+        acl_user_count: 3,
+        current_user: "default",
+        can_manage_users: true
+      })
+
+    assert protected =~ "security-status is-healthy"
+    assert protected =~ "<strong>Protected: 3 ACL users</strong>"
+    assert protected =~ "signed in as default"
+    assert protected =~ "account changes enabled"
+
+    open = Security.render_acl_security_summary(%{protected_mode: false, configured_users: false})
+    assert open =~ "security-status is-warning"
+    assert open =~ "<strong>Protected mode is off</strong>"
+  end
+
+  test "the accounts list comes first and account creation folds below it" do
+    html =
+      Security.render_acl_security(%{
+        current_user: "default",
+        can_manage_users: true,
+        acl_users: [%{username: "default", state: "on"}]
+      })
+
+    assert html =~
+             ~s(<details class="dashboard-disclosure acl-create"><summary>Create an account</summary>)
+
+    assert position(html, "ACL.LIST") < position(html, "Create an account")
+
+    failed =
+      Security.render_acl_security(%{
+        current_user: "default",
+        can_manage_users: true,
+        acl_users: [],
+        account_draft: %{"username" => "ops", "role" => "observer"}
+      })
+
+    assert failed =~ ~s(<details class="dashboard-disclosure acl-create" open>)
+  end
+
+  defp position(html, needle) do
+    {index, _length} = :binary.match(html, needle)
+    index
+  end
 end
