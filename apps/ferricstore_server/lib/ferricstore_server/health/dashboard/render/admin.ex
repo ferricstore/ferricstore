@@ -635,10 +635,16 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
     """
     <section class="consensus-card consensus-grid-card" aria-labelledby="consensus-grid-title">
       <div class="consensus-card-head"><h2 id="consensus-grid-title">Shards</h2><span class="consensus-card-note">Commit index per shard</span></div>
-      <ol class="consensus-grid">#{tiles}</ol>
+      <ol class="consensus-grid"#{consensus_columns(length(raft_shards))}>#{tiles}</ol>
     </section>
     """
   end
+
+  # Even rows when the shard count allows them.
+  defp consensus_columns(total) when total > 8 and rem(total, 8) == 0,
+    do: ~s( style="--shard-columns: 8")
+
+  defp consensus_columns(_total), do: ""
 
   defp plural(1, word), do: word
   defp plural(_count, word), do: word <> "s"
