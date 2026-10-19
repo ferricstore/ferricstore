@@ -798,7 +798,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       td { padding: 9px 14px; border-bottom: 1px solid var(--line-subtle); }
       tr:last-child td { border-bottom: none; }
       tr:hover td { background: var(--surface-selected); }
-      .table-scroll { max-width: 100%; overflow-x: auto; border-radius: 8px; -webkit-overflow-scrolling: touch; scrollbar-width: thin; scrollbar-color: var(--line-strong) var(--surface-base); }
+      .table-scroll { position: relative; max-width: 100%; overflow-x: auto; border-radius: 12px; -webkit-overflow-scrolling: touch; scrollbar-width: thin; scrollbar-color: var(--line-strong) var(--surface-base); }
       .table-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
       .table-scroll::-webkit-scrollbar { height: 8px; }
       .table-scroll::-webkit-scrollbar-track { background: var(--surface-base); border-radius: 8px; }

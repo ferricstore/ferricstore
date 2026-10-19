@@ -19,4 +19,9 @@ defmodule FerricstoreServer.Health.Dashboard.SummaryCardsTest do
     assert html =~ ~s(<div class="ops-summary-value c-green is-text">on</div>)
     assert html =~ ~s(<div class="ops-summary-value is-text">Shard 11</div>)
   end
+
+  test "table scroll boxes contain absolutely positioned labels" do
+    css = FerricstoreServer.Health.Dashboard.Layout.Styles.stylesheet()
+    assert css =~ ~r/\.table-scroll \{ position: relative;/
+  end
 end
