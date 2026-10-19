@@ -269,6 +269,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .worker-leases .flow-link { min-width: 2ch; text-align: right; }
       .worker-lease-bar { display: block; height: 6px; border-radius: 999px; background: var(--accent); overflow: hidden; }
       .worker-lease-bar .is-expired { display: block; height: 100%; background: var(--warn); }
+      .flow-local-scope { margin-bottom: 20px; }
       .section-empty { margin: 4px 0 24px; padding: 16px 18px; border: 1px dashed var(--line-strong); border-radius: 12px; color: var(--text-muted); font-size: 0.875rem; }
       .flow-due-cell .flow-due-when { display: block; color: var(--text-strong); }
       .flow-state-due { display: block; margin-top: 2px; color: var(--text-muted); font-size: 0.75rem; }

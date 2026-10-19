@@ -67,6 +67,38 @@ defmodule FerricstoreServer.Health.Dashboard.RunsRedesignTest do
     assert Records.render_flow_states_overview([], 0, :unavailable, %{}) == ""
   end
 
+  test "rows without due work show no due age, and a fully due row says so once" do
+    html =
+      Records.render_flow_states_table(
+        [
+          state("running", count: 7, running: 7),
+          state("queued", count: 11, due_now: 11, oldest_due_ms: 5_400)
+        ],
+        18,
+        18,
+        400,
+        %{}
+      )
+
+    [running_row, queued_row] =
+      Regex.scan(~r{<tr>\s*<td class="mono">.*?</tr>}s, html) |> List.flatten()
+
+    assert running_row =~ ~s(<td class="flow-state-oldest">-</td>)
+    assert running_row =~ ~s(<span class="c-muted">None</span>)
+    assert queued_row =~ ~s(<span class="flow-state-due">all due now</span>)
+    refute queued_row =~ "11 due now"
+
+    partly =
+      Records.render_flow_states_table([state("queued", count: 11, due_now: 4)], 11, 11, 400, %{})
+
+    assert partly =~ ~s(<span class="flow-state-due">4 due now</span>)
+  end
+
+  test "terminal states without problems read as terminal" do
+    html = Records.render_flow_states_table([state("completed", count: 3)], 3, 3, 400, %{})
+    assert html =~ ~s(<span class="c-muted">Terminal</span>)
+  end
+
   defp state(name, overrides) do
     Map.merge(
       %{

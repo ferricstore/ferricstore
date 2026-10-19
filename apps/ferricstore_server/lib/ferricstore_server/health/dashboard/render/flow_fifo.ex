@@ -6,7 +6,14 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFifo do
   alias FerricstoreServer.Health.Dashboard.Render.FlowNavigation
   @lane_preview_limit 40
 
-  def render(lanes, total_sampled, sample_limit, coverage \\ %{}) do
+  def render(lanes, total_sampled, sample_limit, coverage \\ %{})
+
+  # Without FIFO lanes or a coverage problem there is nothing to show.
+  def render([], _total_sampled, _sample_limit, coverage)
+      when not is_map_key(coverage, :status) or :erlang.map_get(:status, coverage) == :ok,
+      do: ""
+
+  def render(lanes, total_sampled, sample_limit, coverage) do
     unavailable? = Map.get(coverage, :status, :ok) != :ok
 
     rows =

@@ -166,7 +166,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowOverview do
         else: ""
 
     """
-    <form class="flow-filter-form" action="#{route}" method="get" aria-label="Workflow scope">
+    <form class="flow-filter-form flow-local-scope" action="#{route}" method="get" aria-label="Workflow scope">
       <label class="flow-filter-field"><span>Type</span><input class="flow-search-input mono" type="search" name="type" value="#{escape_attr(Map.get(context, :type) || "")}" placeholder="all types"></label>
       <label class="flow-filter-field"><span>Partition</span><input class="flow-search-input mono" type="search" name="partition_key" value="#{escape_attr(Map.get(context, :partition_key) || "")}" placeholder="all partitions"></label>
       #{worker}

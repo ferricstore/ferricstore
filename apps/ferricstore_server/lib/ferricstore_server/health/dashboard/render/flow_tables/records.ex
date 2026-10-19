@@ -38,7 +38,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
               <td class="mono"><a class="flow-link" href="#{escape_attr(type_href)}">#{escape(state.type)}</a></td>
               <td class="#{flow_state_class(state.state)}"><a class="flow-link" href="#{escape_attr(href)}">#{escape(state.state)}</a></td>
               <td class="flow-state-attention">#{render_flow_state_attention(state)}</td>
-              <td>#{format_duration_ms(state.oldest_due_ms)}</td>
+              <td class="flow-state-oldest">#{if state.due_now > 0, do: format_duration_ms(state.oldest_due_ms), else: "-"}</td>
               <td class="flow-state-runs"><a class="flow-link" href="#{escape_attr(href)}" aria-label="Inspect #{escape_attr(state.type)} #{escape_attr(state.state)} records">#{format_number(state.count)}</a>#{render_flow_state_due(state)}</td>
               <td>#{render_flow_state_mode_badge(Map.get(state, :mode, :parallel))}</td>
             </tr>
@@ -98,7 +98,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     |> Enum.filter(fn {count, _class, _label} -> count > 0 end)
     |> case do
       [] ->
-        flow_state_operational_hint(state)
+        cond do
+          state.due_now > 0 -> flow_state_operational_hint(state)
+          state.state in @flow_terminal_states -> ~s(<span class="c-muted">Terminal</span>)
+          true -> ~s(<span class="c-muted">None</span>)
+        end
 
       badges ->
         Enum.map_join(badges, " ", fn {count, class, label} ->
@@ -106,6 +110,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
         end)
     end
   end
+
+  defp render_flow_state_due(%{due_now: due_now, count: due_now}) when due_now > 0,
+    do: ~s(<span class="flow-state-due">all due now</span>)
 
   defp render_flow_state_due(%{due_now: due_now}) when is_integer(due_now) and due_now > 0,
     do: ~s(<span class="flow-state-due">#{format_grouped(due_now)} due now</span>)
@@ -452,8 +459,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
               </td>
               <td class="mono">#{escape(worker || "-")}</td>
               <td#{if expired_class == "", do: "", else: ~s( class="#{expired_class}")}>#{escape(status)}</td>
-              <td>
-                #{render_clock(flow_record_lease_expires_at_ms(record))}
+              <td class="flow-due-cell">
+                #{render_lease_relative(flow_record_lease_expires_at_ms(record))}#{render_clock(flow_record_lease_expires_at_ms(record))}
                 #{render_worker_lease_details(record, id, partition)}
               </td>
             </tr>
@@ -483,6 +490,15 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
   defp render_run_scope(record) do
     ~s(<span class="flow-run-secondary">#{escape(flow_record_type(record))} · <span class="mono">#{escape(flow_record_partition_key(record) || "auto/global")}</span></span>)
   end
+
+  defp render_lease_relative(expires_at) when is_integer(expires_at) do
+    case expires_at - System.system_time(:millisecond) do
+      left when left >= 0 -> ~s(<span class="flow-due-when">in #{format_duration_ms(left)}</span>)
+      left -> ~s(<span class="flow-due-when">expired #{format_duration_ms(-left)} ago</span>)
+    end
+  end
+
+  defp render_lease_relative(_expires_at), do: ""
 
   # Time to the second, with the full timestamp in the tooltip.
   defp render_clock(nil), do: "-"

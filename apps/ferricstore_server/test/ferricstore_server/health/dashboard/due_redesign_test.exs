@@ -47,6 +47,30 @@ defmodule FerricstoreServer.Health.Dashboard.DueRedesignTest do
     refute html =~ "<table"
   end
 
+  test "FIFO lanes stay out of the way when the sample has none" do
+    assert Records.render_flow_fifo_lanes([], 10, 400, %{}) == ""
+
+    unavailable =
+      Records.render_flow_fifo_lanes([], 10, 400, %{
+        status: :unavailable,
+        unavailable_types: ["t"]
+      })
+
+    assert unavailable =~ "FIFO coverage unavailable"
+  end
+
+  test "the page's own scope form has room below it" do
+    html =
+      FerricstoreServer.Health.Dashboard.Render.FlowOverview.render_flow_context_tools(
+        %{filters: %{}},
+        "flow_due"
+      )
+
+    assert html =~ ~s(<form class="flow-filter-form flow-local-scope")
+    css = FerricstoreServer.Health.Dashboard.Layout.Styles.stylesheet()
+    assert css =~ ".flow-local-scope { margin-bottom: 20px; }"
+  end
+
   defp due(id, run_at_ms),
     do: %{
       id: id,

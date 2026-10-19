@@ -57,6 +57,21 @@ defmodule FerricstoreServer.Health.Dashboard.WorkersRedesignTest do
     refute html =~ "<table"
   end
 
+  test "leases say how long until, or since, they expire" do
+    now = System.system_time(:millisecond)
+
+    lease = fn expires ->
+      Records.render_flow_running_records(
+        [%{id: "r", type: "t", state: "running", worker: "w", lease_expires_at_ms: expires}],
+        1,
+        400
+      )
+    end
+
+    assert lease.(now + 25_500) =~ ~r{<span class="flow-due-when">in 2\d\.\ds</span>}
+    assert lease.(now - 18_500) =~ ~r{<span class="flow-due-when">expired 1\d\.\ds ago</span>}
+  end
+
   defp worker(name, running, expired),
     do: %{
       worker: name,
