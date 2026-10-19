@@ -56,4 +56,54 @@ defmodule FerricstoreServer.Health.Dashboard.DataRedesignTest do
     assert html =~ ~s(<span class="size-bar" style="width: 100%"></span>)
     assert html =~ "<th>Data files</th><th>Hint files</th>"
   end
+
+  alias FerricstoreServer.Health.Dashboard.Render.Admin
+
+  defp merge(index, overrides \\ []),
+    do:
+      Map.merge(
+        %{
+          shard_index: index,
+          mode: :hot,
+          merging: false,
+          last_merge_at: nil,
+          merge_count: 0,
+          total_bytes_reclaimed: 0
+        },
+        Map.new(overrides)
+      )
+
+  test "Merges says whether anything has merged or is merging" do
+    never = Admin.render_merge_summary([merge(0), merge(1)])
+    assert never =~ "merges-status is-idle"
+    assert never =~ "<strong>No merges since start</strong>"
+    assert never =~ "all 2 shards idle"
+
+    now = System.system_time(:millisecond)
+
+    done =
+      Admin.render_merge_summary([
+        merge(0, last_merge_at: now - 90_000, merge_count: 3, total_bytes_reclaimed: 2_048),
+        merge(1)
+      ])
+
+    assert done =~ "merges-status is-healthy"
+    assert done =~ "<strong>No merge running</strong>"
+    assert done =~ ~r/last merge 1\.\dm ago/
+    assert done =~ "3 merges reclaimed 2.0 KB"
+
+    running = Admin.render_merge_summary([merge(0, merging: true), merge(1)])
+    assert running =~ "<strong>1 of 2 shards merging now</strong>"
+  end
+
+  test "when no shard has merged, the per-shard table folds away" do
+    html = Admin.render_merge_table([merge(0), merge(1)])
+
+    assert html =~
+             ~s(<details class="dashboard-disclosure"><summary>Per-shard merge status</summary>)
+
+    merged = Admin.render_merge_table([merge(0, merge_count: 1), merge(1)])
+    refute merged =~ "<details"
+    assert merged =~ "<table"
+  end
 end

@@ -1,7 +1,7 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
   import FerricstoreServer.Health.Dashboard.Format
   import FerricstoreServer.Health.Dashboard.Render.Overview
-  alias FerricstoreServer.Health.Dashboard.Render.{TableFilter, TableValue}
+  alias FerricstoreServer.Health.Dashboard.Render.{PageStatus, TableFilter, TableValue}
 
   def slowlog_data(data) do
     %{
@@ -122,16 +122,55 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
         timestamp_ms -> format_timestamp_ms(timestamp_ms)
       end
 
-    render_ops_summary("Merge Summary", [
-      %{
-        label: "Active Shards",
-        value: "#{format_number(active)} / #{format_number(total)}",
-        class: if(active > 0, do: "c-yellow", else: "")
-      },
-      %{label: "Total Reclaimed", value: format_bytes(reclaimed)},
-      %{label: "Total Merges", value: format_number(total_merges)},
-      %{label: "Last Merge", value: latest_label}
-    ])
+    shards = "#{format_number(total)} #{if total == 1, do: "shard", else: "shards"}"
+
+    status =
+      cond do
+        active > 0 ->
+          PageStatus.render(
+            "merges",
+            :idle,
+            "#{format_number(active)} of #{shards} merging now",
+            [
+              "#{format_number(total_merges)} merges since start",
+              "#{format_bytes(reclaimed)} reclaimed"
+            ]
+          )
+
+        total_merges == 0 ->
+          PageStatus.render("merges", :idle, "No merges since start", ["all #{shards} idle"])
+
+        true ->
+          ago =
+            if is_integer(latest_merge),
+              do: [
+                "last merge #{format_duration_ms(max(System.system_time(:millisecond) - latest_merge, 0))} ago"
+              ],
+              else: []
+
+          PageStatus.render(
+            "merges",
+            :healthy,
+            "No merge running",
+            ago ++ ["#{format_number(total_merges)} merges reclaimed #{format_bytes(reclaimed)}"]
+          )
+      end
+
+    status <>
+      render_ops_summary(
+        "Merge Summary",
+        [
+          %{
+            label: "Active shards",
+            value: "#{format_number(active)} / #{format_number(total)}",
+            class: if(active > 0, do: "c-yellow", else: "")
+          },
+          %{label: "Total reclaimed", value: format_bytes(reclaimed)},
+          %{label: "Total merges", value: format_number(total_merges)},
+          %{label: "Last merge", value: latest_label}
+        ],
+        heading: :hidden
+      )
   end
 
   def render_merge_table(merges) do
@@ -165,17 +204,26 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
         """
       end)
 
-    """
-    <h2 class="section-title">Merge Status <span class="badge badge-idle">#{escape(summary_label)}</span></h2>
+    table = """
     <table>
       <thead>
-        <tr><th>Shard</th><th>Mode</th><th>Status</th><th>Last Merge</th><th>Merges</th><th>Reclaimed</th></tr>
+        <tr><th>Shard</th><th>Mode</th><th>Status</th><th>Last merge</th><th>Merges</th><th>Reclaimed</th></tr>
       </thead>
       <tbody>
         #{rows}
       </tbody>
     </table>
     """
+
+    # Sixteen identical "idle, never" rows say nothing the status line does not.
+    if active_count == 0 and Enum.all?(merges, &(&1.merge_count <= 0)) do
+      ~s(<details class="dashboard-disclosure"><summary>Per-shard merge status</summary><div class="dashboard-disclosure-body">#{table}</div></details>)
+    else
+      """
+      <h2 class="section-title">Merge status <span class="badge badge-idle">#{escape(summary_label)}</span></h2>
+      #{table}
+      """
+    end
   end
 
   def render_config_table(entries) do
