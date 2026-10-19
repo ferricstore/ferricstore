@@ -21,6 +21,21 @@ defmodule Ferricstore.Store.RateLimit do
   def validate_args(_window_ms, _max, _count),
     do: {:error, "ERR value is not an integer or out of range"}
 
+  @doc """
+  Checks RATELIMIT.ADD arguments before the state machine applies them.
+
+  Rejects only what raises while applying. An older release logged and
+  applied wider values (any positive window, any numeric limit and count),
+  so a replica replaying that entry must apply it the same way.
+  """
+  @spec validate_apply_args(term(), term(), term()) :: :ok | {:error, binary()}
+  def validate_apply_args(window_ms, max, count)
+      when is_integer(window_ms) and window_ms > 0 and is_number(max) and is_number(count),
+      do: :ok
+
+  def validate_apply_args(_window_ms, _max, _count),
+    do: {:error, "ERR value is not an integer or out of range"}
+
   @spec effective_count(
           non_neg_integer(),
           non_neg_integer(),

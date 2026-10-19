@@ -93,22 +93,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # A bad offset is an error, not a raise: a raise here crashes storage,
       # and again on every replay of the entry.
       defp do_setrange(state, key, offset, value) do
-        with :ok <- check_offset(offset, "ERR offset is out of range"),
-             :ok <- ensure_string_key(state, key) do
+        with :ok <- ensure_string_key(state, key) do
           {old_val, expire_at_ms} =
             case do_get_meta(state, key) do
               nil -> {"", 0}
               {v, exp} -> {to_disk_binary(v), exp}
             end
 
-          target_size =
-            Ferricstore.Raft.ApplyLimits.setrange_size(
-              byte_size(old_val),
-              offset,
-              byte_size(value)
-            )
-
-          with :ok <- Ferricstore.Raft.ApplyLimits.validate_value_size(state, target_size),
+          with :ok <- check_setrange_offset(offset, value, byte_size(old_val)),
+               target_size =
+                 Ferricstore.Raft.ApplyLimits.setrange_size(
+                   byte_size(old_val),
+                   offset,
+                   byte_size(value)
+                 ),
+               :ok <- Ferricstore.Raft.ApplyLimits.validate_value_size(state, target_size),
                new_val = sm_apply_setrange(old_val, offset, value),
                :ok <- do_put(state, key, new_val, expire_at_ms) do
             {:ok, target_size}
@@ -116,11 +115,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         end
       end
 
+      # Rejects exactly the offsets the apply raised on. An empty value at a
+      # numeric offset up to the string's end left it unchanged, and an older
+      # release logged such entries; replaying one must agree with it.
+      defp check_setrange_offset(offset, _value, _old_len)
+           when is_integer(offset) and offset >= 0,
+           do: :ok
+
+      defp check_setrange_offset(offset, "", old_len)
+           when is_number(offset) and offset <= old_len,
+           do: :ok
+
+      defp check_setrange_offset(_offset, _value, _old_len),
+        do: {:error, "ERR offset is out of range"}
+
       # Atomic SETBIT: read bitmap, extend with zeros to include byte_index if
       # needed, flip the single bit, write back. Preserves expire_at_ms.
       # Returns the OLD bit at that offset (Redis semantics).
       defp do_setbit(state, key, offset, bit_val) do
-        with :ok <- check_offset(offset, "ERR bit offset is not an integer or out of range"),
+        with :ok <- check_setbit_args(offset, bit_val),
              :ok <- ensure_string_key(state, key) do
           {old_val, expire_at_ms} =
             case do_get_meta(state, key) do
@@ -1108,8 +1121,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         end
       end
 
-      defp check_offset(offset, _error) when is_integer(offset) and offset >= 0, do: :ok
-      defp check_offset(_offset, error), do: {:error, error}
+      # Rejects exactly what the apply raised on (div/rem of a non-integer, a
+      # bit other than 0 or 1). A negative offset applied in older releases, so
+      # it still does here; the API and commands reject it before the log.
+      defp check_setbit_args(offset, bit_val) when is_integer(offset) and bit_val in [0, 1],
+        do: :ok
+
+      defp check_setbit_args(offset, _bit_val) when is_integer(offset),
+        do: {:error, "ERR bit is not an integer or out of range"}
+
+      defp check_setbit_args(_offset, _bit_val),
+        do: {:error, "ERR bit offset is not an integer or out of range"}
 
       # The logical key projection rejects a non-integer expiry after the value
       # is written, which crashes storage on every replay of the entry.
@@ -1597,7 +1619,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       #
       # Replicates the exact shard.ex handle_ratelimit_add_direct logic.
       defp do_ratelimit_add(state, key, window_ms, max, count) do
-        with :ok <- RateLimit.validate_args(window_ms, max, count),
+        with :ok <- RateLimit.validate_apply_args(window_ms, max, count),
              do: apply_ratelimit_add(state, key, window_ms, max, count)
       end
 

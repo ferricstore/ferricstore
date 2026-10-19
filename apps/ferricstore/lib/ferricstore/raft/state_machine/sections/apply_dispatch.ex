@@ -1674,7 +1674,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       end
 
       defp admit_list_operation_apply(state, operation) do
-        with :ok <- ListOps.validate_write(operation),
+        with :ok <- ListOps.validate_apply(operation),
              do: admit_list_operation_items(state, operation)
       end
 

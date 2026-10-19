@@ -988,8 +988,8 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           for {command, error} <- [
                 {{:setrange, key, -1, "x"}, "ERR offset is out of range"},
                 {{:setrange, key, 1.5, "x"}, "ERR offset is out of range"},
-                {{:setbit, key, -1, 1}, "ERR bit offset is not an integer or out of range"},
-                {{:setbit, key, 1.5, 1}, "ERR bit offset is not an integer or out of range"}
+                {{:setbit, key, 1.5, 1}, "ERR bit offset is not an integer or out of range"},
+                {{:setbit, key, 0, 2}, "ERR bit is not an integer or out of range"}
               ] do
             {_new_state, result} = StateMachine.apply(%{}, command, state)
             assert {:error, ^error} = result, "#{inspect(command)} returned #{inspect(result)}"
@@ -1058,6 +1058,50 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           end
 
           assert [] == :ets.lookup(ets, key)
+        end
+
+        test "LREM, RATELIMIT.ADD, SETRANGE and SETBIT entries an older release applied still apply the same way",
+             %{
+               state: state,
+               ets: ets
+             } do
+          # The router now rejects these before the log, but an older release
+          # logged and applied them; a replica replaying one must agree with it.
+          key = "lenient_apply_list"
+
+          {_state, 4} =
+            StateMachine.apply(%{}, {:list_op, key, {:rpush, ["a", "a", "a", "b"]}}, state)
+
+          {_state, removed} = StateMachine.apply(%{}, {:list_op, key, {:lrem, 1.5, "a"}}, state)
+          assert removed == 2
+
+          {_state, ["a", "b"]} = StateMachine.apply(%{}, {:list_op, key, {:lrange, 0, -1}}, state)
+
+          assert {_state, ["allowed", 1, 9, _reset_ms]} =
+                   StateMachine.apply(
+                     %{},
+                     {:ratelimit_add, "lenient_apply_window", 5_000_000_000_000_000_000, 10, 1},
+                     state
+                   )
+
+          assert {_state, ["allowed", 0, 10, _reset_ms]} =
+                   StateMachine.apply(
+                     %{},
+                     {:ratelimit_add, "lenient_apply_count", 1_000, 10, 0},
+                     state
+                   )
+
+          # An empty SETRANGE value at a negative offset left the string as it
+          # was, creating an empty one for a missing key.
+          assert {_state, {:ok, 0}} =
+                   StateMachine.apply(%{}, {:setrange, "lenient_apply_range", -1, ""}, state)
+
+          assert [{"lenient_apply_range", "", 0, _lfu, _fid, _off, _size}] =
+                   :ets.lookup(ets, "lenient_apply_range")
+
+          # A negative SETBIT offset addressed byte 0 with an out-of-range bit.
+          assert {_state, 0} =
+                   StateMachine.apply(%{}, {:setbit, "lenient_apply_bit", -1, 1}, state)
         end
 
         test "crafted direct writes cannot bypass the replicated size limit", %{

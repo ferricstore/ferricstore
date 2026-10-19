@@ -63,6 +63,20 @@ defmodule Ferricstore.Store.ListOps do
 
   def validate_write(_operation), do: :ok
 
+  @doc """
+  Checks a list write before the state machine applies it.
+
+  Rejects only what raises while applying. An older release logged and
+  applied a float LREM count (a budget: 1.5 removes two), so a replica
+  replaying that entry must apply it the same way.
+  """
+  @spec validate_apply(term()) :: :ok | {:error, binary()}
+  def validate_apply({:lrem, count, _element})
+      when is_integer(count) or (is_float(count) and count != 0.0),
+      do: :ok
+
+  def validate_apply(operation), do: validate_write(operation)
+
   @spec execute(binary(), map(), term()) :: term()
   def execute(key, store, operation) do
     case read_meta(key, store) do
