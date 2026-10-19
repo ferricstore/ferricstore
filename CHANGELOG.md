@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer the integer error for a non-integer index in `FerricStore.getrange/3`
+  and a non-integer or negative offset in `FerricStore.getbit/2`. They
+  answered "wrong number of arguments for 'set' command" and "unsupported
+  bitmap command AST".
 - Make single-member SADD, SREM, ZREM and plain ZADD report one winner under
   concurrency, through the TCP and HTTP gateways and `FerricStore.sadd/2`,
   `srem/2`, `zrem/2` and `zadd/2`. They read the member and wrote it in separate entries, so 20

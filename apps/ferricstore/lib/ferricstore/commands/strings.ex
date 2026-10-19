@@ -439,6 +439,11 @@ defmodule Ferricstore.Commands.Strings do
       when is_integer(start_idx) and is_integer(end_idx),
       do: getrange_parsed(key, start_idx, end_idx, store)
 
+  # The embedded API passes indexes through as given; the catch-all below
+  # named SET for a non-integer one.
+  def handle_ast({:getrange, _key, _start_idx, _end_idx}, _store),
+    do: {:error, "ERR value is not an integer or out of range"}
+
   def handle_ast({:setrange, key, offset, value}, store) when is_integer(offset) do
     cond do
       offset >= 0 and offset <= @max_setrange_offset ->

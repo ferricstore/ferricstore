@@ -327,6 +327,9 @@ defmodule Ferricstore.Commands.Bitmap do
     end
   end
 
+  def handle_ast({:getbit, _key, _offset}, _store),
+    do: {:error, "ERR bit offset is not an integer or out of range"}
+
   def handle_ast({:bitcount, key}, store) do
     with :ok <- Destination.ensure_string_key(key, store) do
       case bitcount_all_from_store(store, key) do

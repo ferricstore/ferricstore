@@ -430,6 +430,22 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
       assert {:error, "WRONGTYPE" <> _} = FerricStore.getrange("gr:hash", 0, 10)
       assert {:ok, "hash"} = FerricStore.type("gr:hash")
     end
+
+    test "names the bad index instead of another command" do
+      FerricStore.set("gr:bad-index", "Hello")
+
+      assert {:error, "ERR value is not an integer or out of range"} =
+               FerricStore.getrange("gr:bad-index", 0.5, 1)
+
+      assert {:error, "ERR value is not an integer or out of range"} =
+               FerricStore.getrange("gr:bad-index", 0, "1")
+
+      assert {:error, "ERR bit offset is not an integer or out of range"} =
+               FerricStore.getbit("gr:bad-index", 1.5)
+
+      assert {:error, "ERR bit offset is not an integer or out of range"} =
+               FerricStore.getbit("gr:bad-index", -1)
+    end
   end
 
   describe "setrange/3" do
