@@ -707,6 +707,42 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
   end
 
   @tag :resumable_policy_snapshot
+  # A run that never finished never cleans up its staging, and every new run
+  # (each source-token rotation) staged the whole keydir again beside it.
+  test "a fresh keydir snapshot removes the staging of earlier runs" do
+    ctx = FerricStore.Instance.get(:default)
+    id = unique_flow_id("staged-flow")
+    state_key = Keys.state_key(id, @partition)
+    shard_index = Router.shard_for(ctx, state_key)
+    path = flow_lmdb_path(ctx, shard_index)
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: unique_flow_id("staged-source"),
+               state: "accept",
+               partition_key: @partition,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    old_run = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
+    new_run = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
+
+    :ok = PolicyMigration.snapshot_primary_keydir(ctx, shard_index, old_run, 2, 1_048_576)
+    assert PolicyMigration.snapshot_complete?(ctx, shard_index, old_run)
+    assert {:ok, [_ | _]} = LMDB.prefix_entries(path, @staging_root <> old_run <> <<0>>, 1)
+
+    :ok = PolicyMigration.snapshot_primary_keydir(ctx, shard_index, new_run, 2, 1_048_576)
+
+    assert {:ok, []} = LMDB.prefix_entries(path, @staging_root <> old_run <> <<0>>, 1)
+    refute PolicyMigration.snapshot_complete?(ctx, shard_index, old_run)
+    assert :not_found = PolicyMigration.snapshot_progress(ctx, shard_index, old_run)
+    assert PolicyMigration.snapshot_complete?(ctx, shard_index, new_run)
+    assert {:ok, [_ | _]} = LMDB.prefix_entries(path, @staging_root <> new_run <> <<0>>, 1)
+
+    :ok = PolicyMigration.cleanup_snapshot(ctx, shard_index, new_run)
+  end
+
   test "keydir snapshot rejects a non-canonical durable continuation" do
     ctx = FerricStore.Instance.get(:default)
     shard_index = 0

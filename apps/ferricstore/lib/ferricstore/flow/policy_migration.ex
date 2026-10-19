@@ -316,7 +316,8 @@ defmodule Ferricstore.Flow.PolicyMigration do
     else
       keydir = elem(ctx.keydir_refs, shard_index)
 
-      with {:ok, cursor} <- load_snapshot_cursor(path, run_token, keydir) do
+      with {:ok, cursor} <- load_snapshot_cursor(path, run_token, keydir),
+           :ok <- maybe_remove_other_runs(path, run_token, cursor) do
         case snapshot_keydir_page(
                path,
                keydir,
@@ -852,6 +853,51 @@ defmodule Ferricstore.Flow.PolicyMigration do
 
   defp decode_snapshot_cursor(_encoded),
     do: {:error, :corrupt_policy_catalog_snapshot_progress}
+
+  # A run that never finishes never cleans up its staging, and each new run
+  # stages the whole keydir again, so a fresh snapshot first removes what
+  # earlier runs left. A shard has one active run: the one taking this snapshot.
+  defp maybe_remove_other_runs(path, run_token, :start) do
+    Enum.reduce_while(
+      [
+        {@staging_root, staging_prefix(run_token)},
+        {@staging_manifest_root, staging_manifest_key(run_token)},
+        {@staging_progress_root, staging_progress_key(run_token)}
+      ],
+      :ok,
+      fn {root, own}, :ok ->
+        case remove_other_runs(path, root, own, "") do
+          :ok -> {:cont, :ok}
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end
+    )
+  end
+
+  defp maybe_remove_other_runs(_path, _run_token, _cursor), do: :ok
+
+  defp remove_other_runs(path, root, own, after_key) do
+    case LMDB.prefix_entries_after_bounded(path, root, after_key, 256, 16 * 1_024 * 1_024) do
+      {:ok, []} ->
+        :ok
+
+      {:ok, entries} ->
+        {last_key, _value} = List.last(entries)
+
+        deletes =
+          for {key, _value} <- entries, not String.starts_with?(key, own), do: {:delete, key}
+
+        with :ok <- write_deletes(path, deletes) do
+          remove_other_runs(path, root, own, last_key)
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp write_deletes(_path, []), do: :ok
+  defp write_deletes(path, deletes), do: LMDB.write_batch(path, deletes)
 
   defp cleanup_snapshot_pages(path, prefix) do
     case LMDB.prefix_entries(path, prefix, 256) do
