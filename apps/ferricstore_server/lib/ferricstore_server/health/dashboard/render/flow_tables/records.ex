@@ -477,7 +477,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
             status_badge =
               cond do
                 status == "expired lease" ->
-                  ~s(<span class="badge badge-failed">expired lease</span>)
+                  ~s(<span class="badge badge-warning">expired lease</span>)
 
                 state == "running" ->
                   ~s(<span class="badge badge-running">leased</span>)

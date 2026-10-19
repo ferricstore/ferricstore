@@ -360,7 +360,7 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowWidgetsTest do
         ])
 
       assert html =~ "payment_review"
-      assert html =~ ~s(class="badge badge-failed">expired lease)
+      assert html =~ ~s(class="badge badge-warning">expired lease)
       refute html =~ "pulse-dot-green"
       assert html =~ ~s(class="flow-runs-table")
     end

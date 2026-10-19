@@ -722,12 +722,12 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .table-scroll::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 8px; }
       .table-scroll table { min-width: 100%; overflow: visible; }
       .flow-runs-table { table-layout: fixed; min-width: 960px !important; font-variant-numeric: tabular-nums; }
-      .flow-runs-table th:nth-child(1) { width: 26%; }
-      .flow-runs-table th:nth-child(2) { width: 17%; }
-      .flow-runs-table th:nth-child(3) { width: 20%; }
-      .flow-runs-table th:nth-child(4) { width: 20%; }
+      .flow-runs-table th:nth-child(1) { width: 27%; }
+      .flow-runs-table th:nth-child(2) { width: 18%; }
+      .flow-runs-table th:nth-child(3) { width: 24%; }
+      .flow-runs-table th:nth-child(4) { width: 11%; }
       .flow-runs-table th:nth-child(5) { width: 8%; }
-      .flow-runs-table th:nth-child(6) { width: 9%; }
+      .flow-runs-table th:nth-child(6) { width: 12%; }
       .flow-runs-table td { vertical-align: top; padding: 9px 12px; }
       .flow-run-state { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
       .flow-run-state .flow-run-step { margin: 0; }
@@ -767,6 +767,11 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .badge-warning { background: var(--warn-wash); color: var(--warn); border: 1px solid transparent; }
       .badge-pressure { background: rgba(242, 120, 92, 0.12); color: var(--danger); border: 1px solid rgba(242, 120, 92, 0.3); }
       .badge-reject { background: rgba(242, 120, 92, 0.2); color: var(--danger-text); border: 1px solid rgba(242, 120, 92, 0.4); }
+      .badge-running { background: var(--accent-wash); color: var(--accent); border: 1px solid transparent; }
+      .badge-due { background: var(--info-wash); color: var(--info); border: 1px solid transparent; }
+      .badge-retrying { background: var(--warn-wash); color: var(--warn); border: 1px solid transparent; }
+      .badge-failed { background: var(--danger-wash); color: var(--danger-text); border: 1px solid transparent; }
+      .badge-completed { background: var(--ok-wash); color: var(--ok-text); border: 1px solid transparent; }
       .badge-merging { background: var(--accent-wash); color: var(--accent); border: 1px solid rgba(95, 217, 191, 0.3); }
       .badge-idle { background: var(--surface-selected); color: var(--text-muted); border: 1px solid transparent; }
 
