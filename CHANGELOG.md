@@ -57,6 +57,12 @@ All notable changes to FerricStore will be documented here.
   approvals over a compact count strip. Retention says whether the sample
   has anything to clean up, with every cleanup safeguard unchanged. The
   shared row filter control is laid out as one aligned row.
+- Redesign the Data pages. Storage, Merges, Prefixes, Read path, Commands,
+  Streams and Pub/Sub each open with a status line, and summary counts
+  become one compact connected strip. Shard sizes, prefix shares and cold
+  read shares are drawn as bars. When nothing has merged, the per-shard
+  merge table folds away, as does the command reference. Empty bounded
+  tables are one-line prompts, and their row filter appears with their rows.
 
 ## 0.12.6 - 2026-10-19
 
