@@ -437,12 +437,11 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-index-services dt { color: var(--text-muted); font-size: 0.75rem; }
       .flow-index-services dd { margin: 0; font-family: var(--font-mono); font-size: 0.82rem; overflow-wrap: anywhere; }
       .config-parameters-table { width: 100%; table-layout: fixed; }
-      .config-parameters-table .config-name { width: 20%; }
-      .config-parameters-table .config-value { width: 24%; }
-      .config-parameters-table .config-source { width: 10%; }
-      .config-parameters-table .config-scope { width: 11%; }
+      .config-parameters-table .config-name { width: 26%; }
+      .config-parameters-table .config-value { width: 28%; }
       .config-parameters-table .config-mode { width: 12%; }
-      .config-parameters-table .config-notes { width: 23%; }
+      .config-parameters-table .config-notes { width: 34%; }
+      .config-parameters-table td:first-child .flow-run-secondary { display: block; margin-top: 2px; font-family: var(--font-sans); }
       .config-parameters-table td, .config-parameters-table th { overflow-wrap: anywhere; }
       .config-parameters-table pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; }
       #flow-policy-editor .flow-policy-panel { background: none; border: 0; border-top: 1px solid var(--line); border-radius: 0; box-shadow: none; padding: 16px 0; }

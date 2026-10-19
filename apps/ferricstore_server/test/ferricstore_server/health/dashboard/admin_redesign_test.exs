@@ -99,6 +99,81 @@ defmodule FerricstoreServer.Health.Dashboard.AdminRedesignTest do
     assert failed =~ ~s(<details class="dashboard-disclosure acl-create" open>)
   end
 
+  alias FerricstoreServer.Health.Dashboard.Render.Capabilities
+
+  @params [
+    %{
+      parameter: "hz",
+      scope: "runtime",
+      mutability: "read-write",
+      notes: "n",
+      value: "10",
+      source: "CONFIG GET"
+    },
+    %{
+      parameter: "maxmemory",
+      scope: "runtime",
+      mutability: "read-only",
+      notes: "n",
+      value: "0",
+      source: "CONFIG GET"
+    },
+    %{
+      parameter: "log_level",
+      scope: "current node",
+      mutability: "node-local",
+      notes: "n",
+      value: "info",
+      source: "Logger"
+    },
+    %{parameter: "missing", scope: "runtime", mutability: "read-only", notes: "n"}
+  ]
+
+  test "Config opens with what can be changed and what could not be read" do
+    html = Admin.render_config_parameters(@params)
+
+    assert html =~ "config-status is-idle"
+    assert html =~ "<strong>4 runtime parameters</strong>"
+    assert html =~ "1 read-write"
+    assert html =~ "1 node-local"
+    assert html =~ "1 unavailable"
+  end
+
+  test "the parameter table has four columns and names a source only when it differs" do
+    html = Admin.render_config_parameters(@params)
+
+    headers =
+      Regex.scan(~r/<th[^>]*>([^<]+)<\/th>/, html, capture: :all_but_first) |> List.flatten()
+
+    assert headers == ["Parameter", "Effective value", "Mode", "Notes"]
+    assert html =~ "Values come from CONFIG GET unless a row names another source."
+    assert html =~ ~s(<span class="flow-run-secondary">current node · Logger</span>)
+    assert html =~ "data-dashboard-table-filter"
+  end
+
+  test "namespace defaults are a prompt, not inline-styled text" do
+    html = Admin.render_config_table([])
+
+    assert html =~
+             ~s|<p class="section-empty">All namespaces use the built-in default window (1 ms).</p>|
+
+    refute html =~ "style="
+  end
+
+  test "Capabilities opens with what is supported and names what is not" do
+    html =
+      Capabilities.render_management_capability_summary(%{
+        sdk: true,
+        health: true,
+        namespace_management: false,
+        quota_management: false
+      })
+
+    assert html =~ "capabilities-status is-idle"
+    assert html =~ "<strong>2 of 4 capabilities supported</strong>"
+    assert html =~ "unsupported: namespace_management, quota_management"
+  end
+
   defp position(html, needle) do
     {index, _length} = :binary.match(html, needle)
     index

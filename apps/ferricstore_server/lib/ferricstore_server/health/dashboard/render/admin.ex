@@ -266,7 +266,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
     body =
       case entries do
         [] ->
-          ~s[<p style="color:var(--text-faint); margin: 8px 0; font-size:0.82rem;">All namespaces using built-in default window (1ms)</p>]
+          ~s[<p class="section-empty">All namespaces use the built-in default window (1 ms).</p>]
 
         _ ->
           rows =
@@ -454,14 +454,23 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
     read_only = Enum.count(parameters, &(&1.mutability == "read-only"))
     node_local = Enum.count(parameters, &(&1.mutability == "node-local"))
 
+    unavailable = Enum.count(parameters, &is_nil(Map.get(&1, :value)))
+
+    status =
+      PageStatus.render(
+        "config",
+        :idle,
+        "#{format_number(length(parameters))} runtime parameters",
+        ["#{read_write} read-write", "#{read_only} read-only", "#{node_local} node-local"] ++
+          if(unavailable > 0, do: ["#{unavailable} unavailable"], else: [])
+      )
+
     rows =
       Enum.map_join(parameters, "\n", fn entry ->
         """
         <tr>
-          <td class="mono">#{escape(entry.parameter)}</td>
+          <td class="mono">#{escape(entry.parameter)}#{config_origin(entry)}</td>
           <td class="mono">#{config_value(entry.parameter, Map.get(entry, :value))}</td>
-          <td>#{escape(Map.get(entry, :source) || "Unavailable")}</td>
-          <td>#{escape(entry.scope)}</td>
           <td><span class="badge badge-idle">#{escape(entry.mutability)}</span></td>
           <td>#{escape(entry.notes)}</td>
         </tr>
@@ -469,12 +478,15 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
       end)
 
     """
-    <h2 class="section-title">Runtime Parameters <span class="badge badge-idle">read-write #{read_write}</span> <span class="badge badge-idle">read-only #{read_only}</span> <span class="badge badge-idle">node-local #{node_local}</span></h2>
+    #{status}
+    <h2 class="section-title">Runtime Parameters</h2>
+    <p class="flow-section-note">Values come from CONFIG GET unless a row names another source.</p>
+    #{TableFilter.controls("config-parameters", "Filter parameters")}
     <div class="table-scroll" role="region" aria-label="Runtime parameters" tabindex="0">
-    <table class="config-parameters-table">
-      <colgroup><col class="config-name"><col class="config-value"><col class="config-source"><col class="config-scope"><col class="config-mode"><col class="config-notes"></colgroup>
+    <table class="config-parameters-table" id="config-parameters">
+      <colgroup><col class="config-name"><col class="config-value"><col class="config-mode"><col class="config-notes"></colgroup>
       <thead>
-        <tr><th>Parameter</th><th>Effective value</th><th>Source</th><th>Scope</th><th>Mode</th><th>Notes</th></tr>
+        <tr><th>Parameter</th><th>Effective value</th><th>Mode</th><th>Notes</th></tr>
       </thead>
       <tbody>
         #{rows}
@@ -482,6 +494,23 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
     </table>
     </div>
     """
+  end
+
+  # Most parameters are runtime values read with CONFIG GET; only the exceptions say so.
+  defp config_origin(entry) do
+    scope = Map.get(entry, :scope)
+    source = Map.get(entry, :source)
+
+    parts =
+      [
+        if(scope not in [nil, "runtime"], do: scope),
+        if(source not in [nil, "CONFIG GET"], do: source)
+      ]
+      |> Enum.reject(&is_nil/1)
+
+    if parts == [],
+      do: "",
+      else: ~s(<span class="flow-run-secondary">#{escape(Enum.join(parts, " · "))}</span>)
   end
 
   defp config_value("requirepass", _value), do: "Redacted"

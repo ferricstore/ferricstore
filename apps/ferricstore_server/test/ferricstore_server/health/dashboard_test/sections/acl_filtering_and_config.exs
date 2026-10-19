@@ -1171,7 +1171,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           data = Dashboard.collect_config_page()
           html = Dashboard.render_config_page(data)
 
-          assert String.contains?(html, "All namespaces using built-in default window (1ms)")
+          assert String.contains?(html, "All namespaces use the built-in default window (1 ms).")
         end
 
         test "shows table with prefix and window when namespaces configured" do
