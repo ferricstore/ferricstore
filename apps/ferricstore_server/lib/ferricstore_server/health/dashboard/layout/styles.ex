@@ -275,6 +275,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .worker-lease-bar { display: block; height: 6px; border-radius: 999px; background: var(--accent); overflow: hidden; }
       .worker-lease-bar .is-expired { display: block; height: 100%; background: var(--warn); }
       .flow-local-scope { margin-bottom: 20px; }
+      .section-empty a { color: var(--accent); }
       .size-cell { display: flex; align-items: center; gap: 12px; }
       .size-value { min-width: 9ch; font-variant-numeric: tabular-nums; }
       .size-track { flex: 1; max-width: 360px; height: 6px; border-radius: 999px; background: var(--line); overflow: hidden; }

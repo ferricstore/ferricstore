@@ -251,4 +251,8 @@ defmodule FerricstoreServer.Health.Dashboard.DataRedesignTest do
       refute html =~ "data-dashboard-table-filter"
     end
   end
+
+  test "links inside prompts use the accent colour" do
+    assert Styles.stylesheet() =~ ".section-empty a { color: var(--accent); }"
+  end
 end
