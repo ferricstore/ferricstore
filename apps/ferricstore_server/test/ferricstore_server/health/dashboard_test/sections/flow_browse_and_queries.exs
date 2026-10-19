@@ -524,8 +524,8 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
                    ~s(href="/dashboard/flow/due" aria-current="page">Due</a>)
                  )
 
-          assert String.contains?(html, "Why Waiting")
-          assert String.contains?(html, "Run At")
+          assert String.contains?(html, "Why waiting")
+          assert String.contains?(html, "Run at")
         end
       end
 

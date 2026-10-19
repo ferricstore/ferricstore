@@ -35,6 +35,40 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowCompactRowsTest do
     assert different =~ "inventory_<wbr>allocated"
   end
 
+  test "running rows name the run once and do not repeat the worker as status" do
+    leased =
+      Map.merge(record(state: "running", run_state: "running"), %{
+        worker: "worker-a",
+        lease_expires_at_ms: System.system_time(:millisecond) + 60_000
+      })
+
+    html = Records.render_flow_running_records([leased], 1, 400)
+
+    assert html =~
+             ~s(<span class="flow-run-secondary">payment · <span class="mono">tenant-a</span></span>)
+
+    assert html =~ ~s(<td>Leased</td>)
+    refute html =~ "leased by worker-a"
+    assert html =~ ~r{<span title="[^"]+ UTC">\d\d:\d\d:\d\d UTC</span>}
+  end
+
+  test "due rows fold the type into the run cell" do
+    html =
+      Records.render_flow_due_records(
+        "Due Now",
+        [record(state: "queued", run_state: "queued")],
+        1,
+        400
+      )
+
+    assert html =~
+             ~s(<span class="flow-run-secondary">payment · <span class="mono">tenant-a</span></span>)
+
+    refute html =~ "<th>Type</th>"
+    assert html =~ "<th>Stored state</th>"
+    assert Records.render_flow_due_records("Due Now", [], 0, 400) =~ ~s(colspan="6")
+  end
+
   defp record(opts) do
     %{
       id: "flow-1",

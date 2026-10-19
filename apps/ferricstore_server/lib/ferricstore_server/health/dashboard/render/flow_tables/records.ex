@@ -299,17 +299,25 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
             id = flow_record_id(record)
             partition = flow_record_partition_key(record)
 
+            worker = flow_record_worker(record)
+            reason = flow_waiting_reason(record)
+
+            # The worker column already says who holds the lease.
+            status =
+              if is_binary(worker) and reason == "leased by " <> worker,
+                do: "Leased",
+                else: reason
+
             """
             <tr>
               <td class="flow-worker-identity">
                 <div class="mono">#{render_flow_id_link(id, partition)}</div>
-                <span class="flow-run-secondary">#{escape(flow_record_type(record))}</span>
-                <span class="flow-run-secondary mono" title="Partition">#{escape(partition || "auto/global")}</span>
+                #{render_run_scope(record)}
               </td>
-              <td class="mono">#{escape(flow_record_worker(record) || "-")}</td>
-              <td class="#{expired_class}">#{escape(flow_waiting_reason(record))}</td>
+              <td class="mono">#{escape(worker || "-")}</td>
+              <td#{if expired_class == "", do: "", else: ~s( class="#{expired_class}")}>#{escape(status)}</td>
               <td>
-                #{format_timestamp_ms_or_dash(flow_record_lease_expires_at_ms(record))}
+                #{render_clock(flow_record_lease_expires_at_ms(record))}
                 #{render_worker_lease_details(record, id, partition)}
               </td>
             </tr>
@@ -333,6 +341,20 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     #{accessible_table("Running workflow records", table)}
     """
   end
+
+  # A run's type and partition on one line under its ID.
+  defp render_run_scope(record) do
+    ~s(<span class="flow-run-secondary">#{escape(flow_record_type(record))} · <span class="mono">#{escape(flow_record_partition_key(record) || "auto/global")}</span></span>)
+  end
+
+  # Time to the second, with the full timestamp in the tooltip.
+  defp render_clock(nil), do: "-"
+
+  defp render_clock(ms) when is_integer(ms),
+    do:
+      ~s(<span title="#{escape_attr(format_timestamp_ms_or_dash(ms))}">#{format_clock_ms(ms)}</span>)
+
+  defp render_clock(_ms), do: "-"
 
   defp render_worker_lease_details(record, id, partition) do
     key =
@@ -361,17 +383,16 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     rows =
       case records do
         [] ->
-          ~s(<tr><td colspan="7" class="c-muted">No #{escape(String.downcase(title))} records discovered in sample</td></tr>)
+          ~s(<tr><td colspan="6" class="c-muted">No #{escape(String.downcase(title))} records discovered in sample</td></tr>)
 
         _ ->
           Enum.map_join(records, "\n", fn record ->
             """
             <tr>
-              <td class="flow-run-identity mono">#{render_flow_id_link(flow_record_id(record), flow_record_partition_key(record))}<span class="flow-run-secondary mono" title="Partition">#{escape(flow_record_partition_key(record) || "auto/global")}</span></td>
-              <td class="mono">#{escape(flow_record_type(record))}</td>
+              <td class="flow-run-identity"><div class="mono">#{render_flow_id_link(flow_record_id(record), flow_record_partition_key(record))}</div>#{render_run_scope(record)}</td>
               <td class="#{flow_state_class(flow_record_state(record))}">#{escape(flow_record_state(record))}</td>
               <td>#{render_due_waiting_reason(record)}</td>
-              <td>#{format_timestamp_ms_or_dash(flow_record_run_at_ms(record))}#{render_due_relative_time(record)}</td>
+              <td>#{render_clock(flow_record_run_at_ms(record))}#{render_due_relative_time(record)}</td>
               <td>#{escape(to_string(flow_field(record, :priority, 0)))}</td>
               <td>#{render_flow_value_ref_badges(record, :detail_link)}</td>
             </tr>
@@ -382,7 +403,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     table = """
     <table>
       <thead>
-        <tr><th>Workflow / partition</th><th>Type</th><th>Stored state</th><th>Why Waiting</th><th>Run At (UTC)</th><th>Priority</th><th>Values</th></tr>
+        <tr><th>Workflow</th><th>Stored state</th><th>Why waiting</th><th>Run at (UTC)</th><th>Priority</th><th>Values</th></tr>
       </thead>
       <tbody>
         #{rows}
