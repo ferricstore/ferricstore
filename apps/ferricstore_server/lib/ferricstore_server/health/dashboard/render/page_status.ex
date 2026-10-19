@@ -23,4 +23,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.PageStatus do
     </section>
     """
   end
+
+  @doc "Shortens a stored name (a key prefix, a command) for a status line."
+  def short(name, max \\ 40) do
+    name = to_string(name)
+    if String.length(name) > max, do: String.slice(name, 0, max) <> "…", else: name
+  end
 end

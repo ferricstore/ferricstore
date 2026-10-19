@@ -255,6 +255,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .page-status.is-warning, .consensus-status.is-warning, .doctor-status.is-warning { border-color: #4a3818; background: #1a1710; }
       .consensus-status.is-degraded, .doctor-status.is-degraded { border-color: #5a2a1f; background: #1d1311; }
       .page-status.is-degraded { border-color: #5a2a1f; background: #1d1311; }
+      .page-status span { overflow-wrap: anywhere; min-width: 0; }
       .page-status span + span::before { content: "·"; margin-right: 12px; color: var(--text-faint); }
       .page-status .page-status-action { margin-left: auto; font-size: 0.875rem; }
       .page-status .page-status-action::before { content: none; }
@@ -282,8 +283,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .size-bar { display: block; height: 100%; border-radius: 999px; background: var(--info); }
       .size-bar.is-cold { background: var(--warn); }
       .stat-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); margin: 0 0 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); overflow: hidden; }
-      .stat-strip > div { padding: 12px 16px; border-right: 1px solid var(--line-subtle); }
-      .stat-strip > div:last-child { border-right: 0; }
+      .stat-strip > div { padding: 12px 16px; box-shadow: 1px 1px 0 var(--line-subtle); }
       .stat-strip dt { color: var(--text-muted); font-size: 0.75rem; }
       .stat-strip dd { margin: 2px 0 0; color: var(--text-strong); font-family: var(--font-mono); font-size: 1.125rem; }
       .stat-strip .is-warning dd { color: var(--warn); }

@@ -66,7 +66,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Prefixes do
             "prefixes",
             :idle,
             "#{format_number(count)} #{if count == 1, do: "prefix", else: "prefixes"} in #{format_number(data.total_sampled)} sampled keys",
-            ["largest: #{largest.prefix}, #{largest.pct}% of the sample"] ++ capped
+            ["largest: #{PageStatus.short(largest.prefix)}, #{largest.pct}% of the sample"] ++ capped
           )
       end
 

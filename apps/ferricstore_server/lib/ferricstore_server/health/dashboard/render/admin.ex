@@ -36,7 +36,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
           PageStatus.render("slowlog", :healthy, "No slow commands recorded")
 
         worst ->
-          name = worst |> Map.get(:command, []) |> List.wrap() |> List.first() |> to_string()
+          name =
+            worst |> Map.get(:command, []) |> List.wrap() |> List.first() |> PageStatus.short()
 
           PageStatus.render(
             "slowlog",
