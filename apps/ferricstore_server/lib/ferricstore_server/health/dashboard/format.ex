@@ -157,10 +157,13 @@ defmodule FerricstoreServer.Health.Dashboard.Format do
   def format_timeline_timestamp_ms(_timestamp_ms), do: "-"
 
   # Wall-clock time to the second, for compact rows.
+  # Run times come from clients and can lie past year 9999, where DateTime raises.
   def format_clock_ms(timestamp_ms) when is_integer(timestamp_ms) and timestamp_ms > 0 do
     timestamp_ms
     |> DateTime.from_unix!(:millisecond)
     |> Calendar.strftime("%H:%M:%S UTC")
+  rescue
+    ArgumentError -> "-"
   end
 
   def format_clock_ms(_timestamp_ms), do: "-"

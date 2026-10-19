@@ -569,6 +569,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
 
   defp short_time(at_ms) do
     at_ms |> DateTime.from_unix!(:millisecond) |> Calendar.strftime("%b %d, %H:%M:%S UTC")
+  rescue
+    ArgumentError -> "-"
   end
 
   defp schedule_definition(schedule) do
