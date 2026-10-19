@@ -750,7 +750,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
 
     # Pages that open with a status line keep the heading for screen readers only.
     heading_class =
-      if Keyword.get(opts, :heading) == :hidden, do: "section-title sr-only", else: "section-title"
+      if Keyword.get(opts, :heading) == :hidden,
+        do: "section-title sr-only",
+        else: "section-title"
 
     """
     <h2 class="#{heading_class}">#{escape(title)}</h2>
