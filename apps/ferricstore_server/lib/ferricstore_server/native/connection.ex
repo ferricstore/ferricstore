@@ -1431,10 +1431,10 @@ defmodule FerricstoreServer.Native.Connection do
         end
 
       {:error, status, reason} ->
-        {:reply, status, reason, state}
+        {:reply, status, reason, Session.flag_transaction(state)}
 
       {:error, reason} ->
-        {:reply, :bad_request, reason, state}
+        {:reply, :bad_request, reason, Session.flag_transaction(state)}
     end
   end
 

@@ -61,10 +61,21 @@ defmodule FerricstoreServer.Native.Session do
     with {:ok, prepared} <- prepare_authorized(payload, state) do
       execute_prepared(prepared, state)
     else
-      {:error, status, reason} -> {status, reason, state}
-      {:error, reason} -> {:bad_request, reason, state}
+      {:error, status, reason} -> {status, reason, flag_transaction(state)}
+      {:error, reason} -> {:bad_request, reason, flag_transaction(state)}
     end
   end
+
+  @doc """
+  Marks an open transaction failed after one of its commands was rejected.
+
+  As in Redis, a command refused while MULTI is queuing (unknown, malformed or
+  denied by ACL) makes EXEC discard the whole transaction instead of committing
+  the commands that were queued around it.
+  """
+  @spec flag_transaction(map()) :: map()
+  def flag_transaction(%{multi_state: :queuing} = state), do: %{state | multi_error: true}
+  def flag_transaction(state), do: state
 
   defp authorize_before_prepare(%{"command" => command}, state) when is_binary(command) do
     case ConnAuth.acl_command_preflight_alternatives(command) do
@@ -97,7 +108,7 @@ defmodule FerricstoreServer.Native.Session do
   def execute_prepared(%PreparedCommand{} = prepared, state) do
     case authorize_command(prepared, state) do
       :ok -> execute_prepared_command(prepared, state)
-      {:error, status, reason} -> {status, reason, state}
+      {:error, status, reason} -> {status, reason, flag_transaction(state)}
     end
   end
 

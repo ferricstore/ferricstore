@@ -4917,6 +4917,35 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert final_state.multi_state == :none
   end
 
+  test "native MULTI discards the transaction after a command is rejected while queueing" do
+    username = "native-multi-denied"
+    key = "native-multi-denied:#{System.unique_integer([:positive, :monotonic])}"
+
+    assert :ok =
+             Acl.set_user(username, ["on", "nopass", "+@all", "-incr", "~*"])
+
+    on_exit(fn -> Acl.del_user(username) end)
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as(username))
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(%{"command" => "SET", "args" => [key, "partial"]}, state)
+
+    assert {:noperm, _denied, state} =
+             Session.execute(%{"command" => "INCR", "args" => [key]}, state)
+
+    assert {:bad_request, _unknown, state} =
+             Session.execute(%{"command" => "NOSUCHCMD", "args" => []}, state)
+
+    assert {:error, abort_message, final_state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, state)
+
+    assert abort_message =~ "EXECABORT"
+    assert final_state.multi_state == :none
+    assert Router.get(FerricStore.Instance.get(:default), key) == nil
+  end
+
   test "native MULTI rejects request-scoped commands before queueing" do
     for {command, args} <- [
           {"PUBLISH", ["tx-channel", "must-not-publish"]},

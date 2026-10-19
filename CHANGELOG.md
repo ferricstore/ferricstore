@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Discard a native MULTI transaction when one of its commands is rejected
+  while queuing. An unknown command, a command that failed to parse, or one
+  the user's ACL denies answered with an error but left the transaction open,
+  so EXEC committed the commands queued around it; EXEC now answers EXECABORT
+  and applies none of them, as Redis does and as FerricStore already did for
+  commands not allowed inside a transaction.
 - Keep `FerricStore.flow_purge_orphans/1` from treating a Flow as orphaned when
   the read of its projection frame timed out or ran over its byte budget. Any
   failed read counted as a lost frame, so a purge on a busy node could delete
