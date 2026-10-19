@@ -170,9 +170,7 @@ defmodule FerricStore.API.SortedSets do
   """
   @spec zrem(key(), [binary()]) :: {:ok, non_neg_integer()}
   def zrem(key, members) when is_list(members) do
-    store = build_compound_store(key)
-
-    case SortedSet.handle_ast({:zrem, [key | members]}, store) do
+    case SortedSet.handle_ast({:zrem, [key | members]}, default_ctx()) do
       {:error, _} = err -> err
       result -> {:ok, result}
     end

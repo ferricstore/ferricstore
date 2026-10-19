@@ -358,17 +358,15 @@ defmodule FerricStore.Impl do
 
   @spec sadd(FerricStore.Instance.t(), binary(), [binary()]) :: {:ok, term()} | {:error, binary()}
   def sadd(ctx, key, members) when is_list(members) do
-    store = build_store(ctx)
     args = [key | Enum.map(members, &to_string/1)]
-    result = Set.handle_ast({:sadd, args}, store)
+    result = Set.handle_ast({:sadd, args}, ctx)
     wrap_result(result)
   end
 
   @spec srem(FerricStore.Instance.t(), binary(), [binary()]) :: {:ok, term()} | {:error, binary()}
   def srem(ctx, key, members) when is_list(members) do
-    store = build_store(ctx)
     args = [key | Enum.map(members, &to_string/1)]
-    result = Set.handle_ast({:srem, args}, store)
+    result = Set.handle_ast({:srem, args}, ctx)
     wrap_result(result)
   end
 
@@ -735,9 +733,8 @@ defmodule FerricStore.Impl do
 
   @spec zrem(FerricStore.Instance.t(), binary(), [binary()]) :: {:ok, term()} | {:error, binary()}
   def zrem(ctx, key, members) when is_list(members) do
-    store = build_store(ctx)
     args = [key | Enum.map(members, &to_string/1)]
-    result = SortedSet.handle_ast({:zrem, args}, store)
+    result = SortedSet.handle_ast({:zrem, args}, ctx)
     wrap_result(result)
   end
 

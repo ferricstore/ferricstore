@@ -818,6 +818,33 @@ defmodule Ferricstore.Store.Router.Part09 do
         raft_write(ctx, shard_for(ctx, key), key, {:zincrby, key, increment, member})
       end
 
+      @doc """
+      Adds one member to the set at `key` as one replicated entry. Returns 1 when
+      the member is new, 0 when it was already there, or `{:error, reason}`.
+      """
+      @spec sadd_single(FerricStore.Instance.t(), binary(), binary()) ::
+              0 | 1 | {:error, term()}
+      def sadd_single(ctx, key, member) when is_binary(key) and is_binary(member),
+        do: raft_write(ctx, shard_for(ctx, key), key, {:sadd_single, key, member})
+
+      @doc """
+      Removes one member from the set at `key` as one replicated entry. Returns 1
+      when it was removed, 0 when it was not there, or `{:error, reason}`.
+      """
+      @spec srem_single(FerricStore.Instance.t(), binary(), binary()) ::
+              0 | 1 | {:error, term()}
+      def srem_single(ctx, key, member) when is_binary(key) and is_binary(member),
+        do: raft_write(ctx, shard_for(ctx, key), key, {:srem_single, key, member})
+
+      @doc """
+      Removes one member from the sorted set at `key` as one replicated entry.
+      Returns 1 when it was removed, 0 when it was not there, or `{:error, reason}`.
+      """
+      @spec zrem_single(FerricStore.Instance.t(), binary(), binary()) ::
+              0 | 1 | {:error, term()}
+      def zrem_single(ctx, key, member) when is_binary(key) and is_binary(member),
+        do: raft_write(ctx, shard_for(ctx, key), key, {:zrem_single, key, member})
+
       @doc false
       @spec scan_keys_page(
               FerricStore.Instance.t(),

@@ -502,6 +502,21 @@ defmodule Ferricstore.Store.Ops do
           [binary()] | {:error, term()}
   def zpopmax(%FerricStore.Instance{} = ctx, key, count), do: Router.zpopmax(ctx, key, count)
 
+  @doc "Atomically adds one set member: one replicated entry that reports whether it was new."
+  @spec sadd_single(FerricStore.Instance.t(), binary(), binary()) :: 0 | 1 | {:error, term()}
+  def sadd_single(%FerricStore.Instance{} = ctx, key, member),
+    do: Router.sadd_single(ctx, key, member)
+
+  @doc "Atomically removes one set member: one replicated entry that reports whether it was there."
+  @spec srem_single(FerricStore.Instance.t(), binary(), binary()) :: 0 | 1 | {:error, term()}
+  def srem_single(%FerricStore.Instance{} = ctx, key, member),
+    do: Router.srem_single(ctx, key, member)
+
+  @doc "Atomically removes one sorted set member: one replicated entry that reports whether it was there."
+  @spec zrem_single(FerricStore.Instance.t(), binary(), binary()) :: 0 | 1 | {:error, term()}
+  def zrem_single(%FerricStore.Instance{} = ctx, key, member),
+    do: Router.zrem_single(ctx, key, member)
+
   @doc "Atomically adds elements to a HyperLogLog: one replicated sketch update."
   @spec pfadd(FerricStore.Instance.t(), binary(), [binary()]) :: 0 | 1 | {:error, term()}
   def pfadd(%FerricStore.Instance{} = ctx, key, elements),

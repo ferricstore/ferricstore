@@ -593,6 +593,11 @@ defmodule Ferricstore.Commands.SortedSet do
     end
   end
 
+  # One member on the instance is removed by the state machine's atomic
+  # single-member write, so concurrent ZREMs report one removal, as SREM does.
+  defp zrem_args([key, member], %FerricStore.Instance{} = ctx) when is_binary(member),
+    do: Ops.zrem_single(ctx, key, member)
+
   defp zrem_args([key | members], store) when members != [] do
     with :ok <- TypeRegistry.command_check_type(key, :zset, store) do
       compound_keys =

@@ -448,6 +448,14 @@ defmodule Ferricstore.Commands.Set do
 
   defp sadd_args(_args, _store), do: {:error, "ERR wrong number of arguments for 'sadd' command"}
 
+  # On the instance (the gateways' store) reading the member and then writing
+  # it are separate entries, so every concurrent client saw the member missing
+  # and answered 1, breaking SADD-based deduplication. One member is added by
+  # the state machine's atomic single-member write instead; in the state
+  # machine the clauses below run with its own store.
+  defp sadd_members(key, [member], %FerricStore.Instance{} = ctx) when is_binary(member),
+    do: Ops.sadd_single(ctx, key, member)
+
   defp sadd_members(key, members, store) do
     with type_status when type_status in [:ok, {:ok, :created}] <-
            TypeRegistry.command_check_or_set_status(key, :set, store) do
@@ -492,6 +500,9 @@ defmodule Ferricstore.Commands.Set do
   end
 
   defp rollback_new_set_type_marker(_key, _store, :ok, write_error), do: write_error
+
+  defp srem_args([key, member], %FerricStore.Instance{} = ctx) when is_binary(member),
+    do: Ops.srem_single(ctx, key, member)
 
   defp srem_args([key | members], store) when members != [] do
     with :ok <- TypeRegistry.command_check_type(key, :set, store) do

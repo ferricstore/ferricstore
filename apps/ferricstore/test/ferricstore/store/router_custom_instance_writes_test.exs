@@ -20,6 +20,21 @@ defmodule Ferricstore.Store.RouterCustomInstanceWritesTest do
     assert 2 == Dispatcher.dispatch("PFCOUNT", [key], ctx)
   end
 
+  test "single-member SADD, SREM and ZREM write to the instance", %{ctx: ctx, key: key} do
+    assert 1 == Dispatcher.dispatch("SADD", [key <> ":s", "m"], ctx)
+    assert 0 == Dispatcher.dispatch("SADD", [key <> ":s", "m"], ctx)
+    assert ["m"] == Dispatcher.dispatch("SMEMBERS", [key <> ":s"], ctx)
+    assert 1 == Dispatcher.dispatch("SREM", [key <> ":s", "m"], ctx)
+    assert 0 == Dispatcher.dispatch("SCARD", [key <> ":s"], ctx)
+
+    assert 1 == Dispatcher.dispatch("ZADD", [key <> ":z", "1", "m"], ctx)
+    assert 1 == Dispatcher.dispatch("ZREM", [key <> ":z", "m"], ctx)
+    assert 0 == Dispatcher.dispatch("ZCARD", [key <> ":z"], ctx)
+
+    default = FerricStore.Instance.get(:default)
+    assert 0 == Dispatcher.dispatch("EXISTS", [key <> ":s"], default)
+  end
+
   test "SPOP and ZPOP pop from the instance's keys", %{ctx: ctx, key: key} do
     assert 1 == Dispatcher.dispatch("SADD", [key <> ":set", "only"], ctx)
     assert "only" == Router.spop(ctx, key <> ":set", nil)
