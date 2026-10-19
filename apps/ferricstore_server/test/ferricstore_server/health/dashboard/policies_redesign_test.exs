@@ -55,6 +55,16 @@ defmodule FerricstoreServer.Health.Dashboard.PoliciesRedesignTest do
              ".flow-policy-table tr > :last-child:not([colspan]) { min-width: 96px; width: 96px; }"
   end
 
+  test "summaries stay on one line, index names fit, and the row filter is laid out" do
+    css = Styles.stylesheet()
+
+    assert css =~
+             ".flow-policy-table td:nth-child(4), .flow-policy-table td:nth-child(7) { white-space: nowrap; }"
+
+    assert css =~ ".flow-index-identity { width: 44ch;"
+    assert css =~ ".flow-filter-row { display: flex;"
+  end
+
   defp policy(type, overrides \\ []) do
     Map.merge(
       %{

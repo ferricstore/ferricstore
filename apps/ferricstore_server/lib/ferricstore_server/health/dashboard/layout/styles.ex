@@ -68,6 +68,9 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-row-menu-item { display: block; padding: 6px 8px; border-radius: 6px; color: var(--text-body); text-decoration: none; }
       .flow-row-menu-item:hover { background: var(--surface-selected); }
       .table-scroll .flow-policy-table { min-width: 1180px; }
+      .flow-policy-table td:nth-child(4), .flow-policy-table td:nth-child(7) { white-space: nowrap; }
+      .flow-filter-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 0 0 12px; }
+      .flow-filter-row .flow-search-input { width: 260px; max-width: 100%; }
       .flow-policy-table td:first-child .flow-run-secondary { display: block; margin-top: 2px; font-family: var(--font-sans); }
       :is(.flow-policy-table, .flow-schedules-table) tr > :first-child:not([colspan]) { position: sticky; left: 0; z-index: 2; background: var(--surface-raised); min-width: 180px; width: 180px; border-right: 1px solid var(--line); }
       :is(.flow-policy-table, .flow-schedules-table) tr > :last-child:not([colspan]) { position: sticky; right: 0; z-index: 2; background: var(--surface-raised); min-width: 280px; width: 280px; border-left: 1px solid var(--line); white-space: normal; }
@@ -386,7 +389,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-search { display: flex; align-items: center; gap: 6px; min-width: min(100%, 360px); }
       .flow-search-input { flex: 1; min-width: 0; height: 36px; background: var(--surface-base); color: var(--text-body); border: 1px solid var(--line-strong); border-radius: 8px; padding: 0 10px; font-size: 0.78rem; font-family: var(--font-mono); }
       textarea.flow-schedule-payload { height: auto; min-height: 8rem; padding: 10px; line-height: 1.5; resize: vertical; }
-      .flow-index-identity { max-width: 28ch; min-width: 16ch; overflow-wrap: anywhere; white-space: normal; }
+      .flow-index-identity { width: 44ch; min-width: 24ch; overflow-wrap: anywhere; white-space: normal; }
       .flow-index-build-identity { min-width: 14ch; max-width: 32ch; overflow-wrap: anywhere; white-space: normal; }
       .flow-index-validation { max-width: 30ch; overflow-wrap: anywhere; white-space: normal; }
       .flow-index-validation code { white-space: normal; overflow-wrap: anywhere; }
