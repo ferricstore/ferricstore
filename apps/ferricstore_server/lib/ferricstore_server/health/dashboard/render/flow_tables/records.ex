@@ -219,6 +219,14 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     end
   end
 
+  # Workers folds FIFO lanes into a disclosure, which needs a line when there are none.
+  def render_flow_workers_fifo(lanes, total_sampled, sample_limit, coverage) do
+    case render_flow_fifo_lanes(lanes, total_sampled, sample_limit, coverage) do
+      "" -> ~s(<p class="section-empty">No FIFO lanes in this sample.</p>)
+      html -> html
+    end
+  end
+
   def render_flow_fifo_lanes(lanes, total_sampled, sample_limit, coverage \\ %{}) do
     FerricstoreServer.Health.Dashboard.Render.FlowFifo.render(
       lanes,

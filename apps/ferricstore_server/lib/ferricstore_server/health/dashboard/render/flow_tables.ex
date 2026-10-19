@@ -36,6 +36,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables do
 
   defdelegate render_flow_workers(workers, filters \\ %{}), to: Records
   defdelegate render_flow_workers_status(workers, filters), to: Records
+
+  defdelegate render_flow_workers_fifo(lanes, total_sampled, sample_limit, coverage),
+    to: Records
+
   defdelegate render_flow_running_records(records, total_sampled, sample_limit), to: Records
 
   defdelegate render_flow_due_records(

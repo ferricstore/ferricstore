@@ -12,7 +12,7 @@
 <%= render_live_component("flow_running_records", render_flow_running_records(data.running_records, data.total_sampled, data.sample_limit)) %>
 <details class="dashboard-disclosure" id="flow-worker-breakdown">
 <summary>FIFO lanes</summary>
-<%= render_live_component("flow_fifo_lanes", render_flow_fifo_lanes(Map.get(data, :fifo_lanes, []), data.total_sampled, data.sample_limit, Map.get(data, :fifo_coverage, %{}))) %>
+<%= render_live_component("flow_fifo_lanes", render_flow_workers_fifo(Map.get(data, :fifo_lanes, []), data.total_sampled, data.sample_limit, Map.get(data, :fifo_coverage, %{}))) %>
 </details>
 </div>
 </main>

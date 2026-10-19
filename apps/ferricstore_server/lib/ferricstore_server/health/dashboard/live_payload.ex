@@ -359,7 +359,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
         render_flow_workers_status(data.workers, Map.get(data, :filters, %{})),
       "flow_workers" => render_flow_workers(data.workers, Map.get(data, :filters, %{})),
       "flow_fifo_lanes" =>
-        render_flow_fifo_lanes(
+        render_flow_workers_fifo(
           Map.get(data, :fifo_lanes, []),
           data.total_sampled,
           data.sample_limit,

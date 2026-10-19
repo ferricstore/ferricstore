@@ -72,6 +72,22 @@ defmodule FerricstoreServer.Health.Dashboard.WorkersRedesignTest do
     assert lease.(now - 18_500) =~ ~r{<span class="flow-due-when">expired 1\d\.\ds ago</span>}
   end
 
+  test "the FIFO lanes section says when the sample has none" do
+    assert Records.render_flow_workers_fifo([], 10, 400, %{}) ==
+             ~s(<p class="section-empty">No FIFO lanes in this sample.</p>)
+
+    html =
+      FerricstoreServer.Health.Dashboard.render_flow_workers_page(%{
+        workers: [],
+        running_records: [],
+        total_sampled: 0,
+        sample_limit: 400
+      })
+
+    [_, lanes] = Regex.run(~r{id="flow-worker-breakdown">(.*?)</details>}s, html)
+    assert lanes =~ "No FIFO lanes in this sample."
+  end
+
   defp worker(name, running, expired),
     do: %{
       worker: name,
