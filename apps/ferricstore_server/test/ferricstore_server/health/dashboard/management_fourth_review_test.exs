@@ -110,7 +110,7 @@ defmodule FerricstoreServer.Health.Dashboard.ManagementFourthReviewTest do
     [_, first_cell] = Regex.run(~r/<tbody>\s*<tr[^>]*>\s*<td[^>]*>(.*?)<\/td>/s, html)
     refute first_cell =~ "<details"
     assert html =~ ~s(<tr class="flow-schedule-definition-row">)
-    assert html =~ ~s(<td colspan="12">)
+    assert html =~ ~s(<td colspan="8">)
     assert html =~ ~s(class="flow-schedules-table")
     assert html =~ "Schedule definition"
   end

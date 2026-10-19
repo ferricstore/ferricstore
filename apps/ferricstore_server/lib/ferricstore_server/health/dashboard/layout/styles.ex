@@ -57,7 +57,16 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-query-empty { padding-block: 16px; border-block: 1px solid var(--line); margin-block: 16px; }
       .flow-query-empty h3 { font-size: 0.9rem; margin-bottom: 8px; }
       .flow-query-empty p { font-size: 0.8rem; overflow-wrap: anywhere; }
-      .table-scroll .flow-schedules-table { table-layout: fixed; min-width: 1650px; }
+      .table-scroll .flow-schedules-table { table-layout: fixed; min-width: 1080px; }
+      .flow-schedule-cadence code { padding: 1px 5px; border-radius: 4px; background: var(--surface-selected); font-family: var(--font-mono); font-size: 0.75rem; }
+      .flow-schedule-actions > * { margin: 2px 4px 2px 0; vertical-align: middle; }
+      .flow-row-menu { position: relative; display: inline-block; vertical-align: middle; }
+      .flow-row-menu > summary { display: inline-flex; align-items: center; height: 32px; padding: 0 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--text-muted); font-size: 0.8125rem; list-style: none; cursor: pointer; }
+      .flow-row-menu > summary::-webkit-details-marker { display: none; }
+      .flow-row-menu[open] > summary { border-color: var(--line-strong); color: var(--text-strong); }
+      .flow-row-menu-panel { display: grid; gap: 6px; min-width: 180px; margin-top: 6px; padding: 8px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface-raised); white-space: normal; }
+      .flow-row-menu-item { display: block; padding: 6px 8px; border-radius: 6px; color: var(--text-body); text-decoration: none; }
+      .flow-row-menu-item:hover { background: var(--surface-selected); }
       .table-scroll .flow-policy-table { min-width: 1480px; }
       :is(.flow-policy-table, .flow-schedules-table) tr > :first-child:not([colspan]) { position: sticky; left: 0; z-index: 2; background: var(--surface-raised); min-width: 180px; width: 180px; border-right: 1px solid var(--line); }
       :is(.flow-policy-table, .flow-schedules-table) tr > :last-child:not([colspan]) { position: sticky; right: 0; z-index: 2; background: var(--surface-raised); min-width: 210px; width: 210px; border-left: 1px solid var(--line); white-space: normal; }
