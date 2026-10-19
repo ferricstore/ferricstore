@@ -27,7 +27,7 @@ defmodule FerricstoreServer.Health.Dashboard.ShellReviewTest do
     assert css =~ ".flow-action-confirm-panel { position: static;"
     assert css =~ "max-height: min(65vh, 720px)"
     assert css =~ ".table-scroll table { min-width: 100%; overflow: visible; }"
-    assert css =~ ".flow-link { color: #38bdf8; text-decoration: underline;"
+    assert css =~ ".flow-link { color: var(--accent); text-decoration: underline;"
   end
 
   test "snapshot freshness, bounded filtering and scope retention are shared enhancements" do

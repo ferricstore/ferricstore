@@ -36,18 +36,17 @@ defmodule FerricstoreServer.Health.Dashboard.Format do
 
   def hit_rate_color(ratio) do
     cond do
-      ratio >= 90.0 -> "#3fb950"
-      ratio >= 70.0 -> "#d29922"
-      true -> "#f85149"
+      ratio >= 90.0 -> "var(--ok)"
+      ratio >= 70.0 -> "var(--warn)"
+      true -> "var(--danger)"
     end
   end
 
   def mem_bar_color(pct) do
     cond do
-      pct >= 95.0 -> "#f85149"
-      pct >= 85.0 -> "#da3633"
-      pct >= 70.0 -> "#d29922"
-      true -> "#3fb950"
+      pct >= 85.0 -> "var(--danger)"
+      pct >= 70.0 -> "var(--warn)"
+      true -> "var(--ok)"
     end
   end
 

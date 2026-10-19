@@ -188,7 +188,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
     body =
       case entries do
         [] ->
-          ~s[<p style="color:#8b949e; margin: 8px 0; font-size:0.82rem;">All namespaces using built-in default window (1ms)</p>]
+          ~s[<p style="color:var(--text-faint); margin: 8px 0; font-size:0.82rem;">All namespaces using built-in default window (1ms)</p>]
 
         _ ->
           rows =
@@ -474,7 +474,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
           end)
 
         """
-        <div style="margin-top:8px; font-size:0.82rem; color:#8b949e;">
+        <div style="margin-top:8px; font-size:0.82rem; color:var(--text-faint);">
           Nodes: #{node_items}
         </div>
         """
@@ -761,7 +761,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
       </tbody>
     </table>
     """)}
-    <div style="margin-top:8px; font-size:0.75rem; color:#8b949e;">
+    <div style="margin-top:8px; font-size:0.75rem; color:var(--text-faint);">
       Flags: M=in MULTI transaction, S=subscribed (pub/sub), T=tracking enabled
     </div>
     """

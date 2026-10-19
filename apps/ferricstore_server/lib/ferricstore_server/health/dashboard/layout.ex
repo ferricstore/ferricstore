@@ -23,7 +23,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
       <title>#{escape(title)}</title>
       <link rel="preconnect" href="https://fonts.googleapis.com">
       <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-      <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+      <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
       <link rel="stylesheet" href="#{FerricstoreServer.Health.Dashboard.Assets.path(:css)}">
       <script src="#{FerricstoreServer.Health.Dashboard.Assets.path(:js)}" defer></script>
     </head>

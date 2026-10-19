@@ -69,7 +69,7 @@ defmodule FerricstoreServer.Health.DashboardTest do
       assert css =~ "#{selector} { color: var(--text-muted);"
     end
 
-    assert css =~ "--text-muted: #a5b4b0;"
+    assert css =~ "--text-muted: #a6b0b8;"
   end
 
   test "Flow governance budget table renders remaining overage and reservation columns" do
