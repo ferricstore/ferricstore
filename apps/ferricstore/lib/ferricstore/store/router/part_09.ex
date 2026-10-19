@@ -837,6 +837,17 @@ defmodule Ferricstore.Store.Router.Part09 do
         do: raft_write(ctx, shard_for(ctx, key), key, {:srem_single, key, member})
 
       @doc """
+      Adds or updates one sorted set member as one replicated entry, as a ZADD
+      without options. Returns 1 when the member is new, 0 when it existed, or
+      `{:error, reason}`.
+      """
+      @spec zadd_single(FerricStore.Instance.t(), binary(), float(), binary()) ::
+              0 | 1 | {:error, term()}
+      def zadd_single(ctx, key, score, member)
+          when is_binary(key) and is_float(score) and is_binary(member),
+          do: raft_write(ctx, shard_for(ctx, key), key, {:zadd_single, key, score, member})
+
+      @doc """
       Removes one member from the sorted set at `key` as one replicated entry.
       Returns 1 when it was removed, 0 when it was not there, or `{:error, reason}`.
       """

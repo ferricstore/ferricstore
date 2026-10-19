@@ -512,6 +512,12 @@ defmodule Ferricstore.Store.Ops do
   def srem_single(%FerricStore.Instance{} = ctx, key, member),
     do: Router.srem_single(ctx, key, member)
 
+  @doc "Atomically adds one sorted set member: one replicated entry that reports whether it was new."
+  @spec zadd_single(FerricStore.Instance.t(), binary(), float(), binary()) ::
+          0 | 1 | {:error, term()}
+  def zadd_single(%FerricStore.Instance{} = ctx, key, score, member),
+    do: Router.zadd_single(ctx, key, score, member)
+
   @doc "Atomically removes one sorted set member: one replicated entry that reports whether it was there."
   @spec zrem_single(FerricStore.Instance.t(), binary(), binary()) :: 0 | 1 | {:error, term()}
   def zrem_single(%FerricStore.Instance{} = ctx, key, member),

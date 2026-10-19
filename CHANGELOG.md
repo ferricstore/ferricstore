@@ -4,13 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
-- Make single-member SADD, SREM and ZREM report one winner under concurrency,
-  through the TCP and HTTP gateways and `FerricStore.sadd/2`, `srem/2` and
-  `zrem/2`. They read the member and wrote it in separate entries, so 20
+- Make single-member SADD, SREM, ZREM and plain ZADD report one winner under
+  concurrency, through the TCP and HTTP gateways and `FerricStore.sadd/2`,
+  `srem/2`, `zrem/2` and `zadd/2`. They read the member and wrote it in separate entries, so 20
   concurrent `SADD key m` all answered 1, which breaks deduplication that
   processes an item only when SADD returns 1. One member now goes through the
   state machine's atomic single-member write, which every release since
-  2026-06 applies; calls with several members keep the previous path.
+  2026-06 applies; calls with several members or ZADD options keep the
+  previous path. The write also checks the key's type in that entry, so a
+  SET racing SADD or ZADD no longer leaves the member hidden under the
+  string, to come back when the key is later recreated.
 - Answer a typed native HSET whose field name or value is a map or a list
   with a bad-request error. It raised while turning the field into a string,
   so the client got an internal server error and the server logged a stack
