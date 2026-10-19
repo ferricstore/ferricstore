@@ -487,6 +487,21 @@ defmodule Ferricstore.Store.Ops do
   def zincrby(%FerricStore.Instance{} = ctx, key, increment, member),
     do: Router.zincrby(ctx, key, increment, member)
 
+  @doc "Atomically pops from a set: one replicated read-modify-write."
+  @spec spop(FerricStore.Instance.t(), binary(), non_neg_integer() | nil) ::
+          binary() | [binary()] | nil | {:error, term()}
+  def spop(%FerricStore.Instance{} = ctx, key, count), do: Router.spop(ctx, key, count)
+
+  @doc "Atomically pops the lowest-scored sorted set members."
+  @spec zpopmin(FerricStore.Instance.t(), binary(), non_neg_integer()) ::
+          [binary()] | {:error, term()}
+  def zpopmin(%FerricStore.Instance{} = ctx, key, count), do: Router.zpopmin(ctx, key, count)
+
+  @doc "Atomically pops the highest-scored sorted set members."
+  @spec zpopmax(FerricStore.Instance.t(), binary(), non_neg_integer()) ::
+          [binary()] | {:error, term()}
+  def zpopmax(%FerricStore.Instance{} = ctx, key, count), do: Router.zpopmax(ctx, key, count)
+
   @doc "Atomically adds elements to a HyperLogLog: one replicated sketch update."
   @spec pfadd(FerricStore.Instance.t(), binary(), [binary()]) :: 0 | 1 | {:error, term()}
   def pfadd(%FerricStore.Instance{} = ctx, key, elements),

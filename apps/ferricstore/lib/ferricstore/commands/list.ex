@@ -161,13 +161,7 @@ defmodule Ferricstore.Commands.List do
   def handle("LMOVE", [source, destination, from_str, to_str], store) do
     with {:ok, from_dir} <- parse_lr_direction(from_str),
          {:ok, to_dir} <- parse_lr_direction(to_str) do
-      CrossShardOp.execute(
-        [{source, :read_write}, {destination, :write}],
-        fn unified_store ->
-          checked_lmove(source, destination, unified_store, from_dir, to_dir)
-        end,
-        store: store
-      )
+      lmove(source, destination, from_dir, to_dir, store)
     else
       :error -> {:error, "ERR syntax error"}
     end
@@ -304,13 +298,7 @@ defmodule Ferricstore.Commands.List do
 
   def handle_ast({:lmove, source, destination, from_dir, to_dir}, store)
       when from_dir in [:left, :right] and to_dir in [:left, :right] do
-    CrossShardOp.execute(
-      [{source, :read_write}, {destination, :write}],
-      fn unified_store ->
-        checked_lmove(source, destination, unified_store, from_dir, to_dir)
-      end,
-      store: store
-    )
+    lmove(source, destination, from_dir, to_dir, store)
   end
 
   def handle_ast({:rpoplpush, source, destination}, store),
@@ -514,6 +502,23 @@ defmodule Ferricstore.Commands.List do
       "RIGHT" -> {:ok, :right}
       _ -> :error
     end
+  end
+
+  # On the instance the router moves within a shard in one replicated list
+  # operation. Moving through CrossShardOp's per-shard store read the source,
+  # popped it and pushed the destination in separate writes, so concurrent
+  # moves lost elements.
+  defp lmove(source, destination, from_dir, to_dir, %FerricStore.Instance{} = ctx),
+    do: Ops.list_op(ctx, source, {:lmove, destination, from_dir, to_dir})
+
+  defp lmove(source, destination, from_dir, to_dir, store) do
+    CrossShardOp.execute(
+      [{source, :read_write}, {destination, :write}],
+      fn unified_store ->
+        checked_lmove(source, destination, unified_store, from_dir, to_dir)
+      end,
+      store: store
+    )
   end
 
   defp checked_lmove(source, destination, store, from_dir, to_dir) do

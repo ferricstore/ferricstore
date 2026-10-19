@@ -909,6 +909,16 @@ defmodule Ferricstore.Commands.SortedSet do
     end
   end
 
+  # On the instance the pop is one replicated read-modify-write. Reading the
+  # lowest members here and deleting them in a later write let concurrent
+  # clients pop the same members.
+  defp zpop_parsed(key, count, reverse?, %FerricStore.Instance{} = ctx)
+       when is_integer(count) and count >= 0 do
+    with :ok <- TypeRegistry.command_check_type(key, :zset, ctx) do
+      if reverse?, do: Ops.zpopmax(ctx, key, count), else: Ops.zpopmin(ctx, key, count)
+    end
+  end
+
   defp zpop_parsed(key, count, reverse?, store) when is_integer(count) and count >= 0 do
     with :ok <- TypeRegistry.command_check_type(key, :zset, store),
          {:ok, to_pop} <- zpop_members(key, count, reverse?, store) do

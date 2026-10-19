@@ -18,6 +18,12 @@ All notable changes to FerricStore will be documented here.
   handlers still run in the state machine. HINCRBYFLOAT now stores and returns
   the shortest form ("10.6", not "10.59999999999999968"), as the embedded API
   did.
+- Make SPOP, ZPOPMIN, ZPOPMAX, LMOVE and RPOPLPUSH atomic through the TCP and
+  HTTP gateways. Their handlers read the members to take and removed them in
+  later writes, so concurrent clients popped the same members (40 concurrent
+  ZPOPMIN returned 2 distinct members) and concurrent LMOVE lost elements
+  (40 moves left 1 in the destination). On the instance they now use the
+  state machine's atomic pop and the router's single-entry list move.
 - Serialize HSETNX, and ZADD with NX, XX, GT or LT, per key through the TCP and
   HTTP gateways. They read the key and decided the write in the client's
   process, so every concurrent HSETNX or ZADD NX on one key reported a win

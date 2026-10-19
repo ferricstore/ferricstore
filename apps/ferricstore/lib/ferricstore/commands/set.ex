@@ -678,6 +678,11 @@ defmodule Ferricstore.Commands.Set do
     end
   end
 
+  # On the instance the pop is one replicated read-modify-write. Choosing a
+  # member here and deleting it in a later write let concurrent clients pop
+  # the same member.
+  defp spop_one(key, %FerricStore.Instance{} = ctx), do: atomic_spop(key, nil, ctx)
+
   defp spop_one(key, store) do
     with :ok <- TypeRegistry.command_check_type(key, :set, store),
          {:ok, members} <- get_members_list(key, store) do
@@ -695,6 +700,8 @@ defmodule Ferricstore.Commands.Set do
       end
     end
   end
+
+  defp spop_count(key, count, %FerricStore.Instance{} = ctx), do: atomic_spop(key, count, ctx)
 
   defp spop_count(key, count, store) do
     with :ok <- TypeRegistry.command_check_type(key, :set, store) do
@@ -1011,5 +1018,9 @@ defmodule Ferricstore.Commands.Set do
       {:error, _} = rollback_error ->
         {:error, {:set_delete_rollback_failed, write_error, rollback_error}}
     end
+  end
+
+  defp atomic_spop(key, count, ctx) do
+    with :ok <- TypeRegistry.command_check_type(key, :set, ctx), do: Ops.spop(ctx, key, count)
   end
 end
