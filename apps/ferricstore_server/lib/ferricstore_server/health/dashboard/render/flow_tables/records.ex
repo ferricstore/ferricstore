@@ -477,7 +477,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
             status_badge =
               cond do
                 status == "expired lease" ->
-                  ~s(<span class="badge badge-failed">expired lease</span>)
+                  ~s(<span class="badge badge-warning">expired lease</span>)
 
                 state == "running" ->
                   ~s(<span class="badge badge-running">leased</span>)
@@ -498,16 +498,23 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
                   ~s(<span class="badge badge-idle">#{escape(if status == "terminal", do: state, else: status)}</span>)
               end
 
+            stored =
+              if state == logical_state,
+                do: "",
+                else: ~s(<span class="flow-run-stored">stored #{escape(state)}</span>)
+
+            timing =
+              "Run #{format_timestamp_ms_or_dash(flow_record_run_at_ms(record))} · Updated #{format_timestamp_ms_or_dash(flow_record_updated_at_ms(record))}"
+
             """
             <tr>
               <td class="flow-run-identity">
                 <div class="mono">#{render_flow_id_link(id, partition)}</div>
-                <span class="flow-run-secondary" title="#{escape_attr(flow_record_type(record))}">#{escape(flow_record_type(record))}</span>
-                <span class="flow-run-secondary mono" title="Partition">#{escape(partition || "auto/global")}</span>
+                <span class="flow-run-secondary">#{escape(flow_record_type(record))} · <span class="mono">#{escape(partition || "auto/global")}</span></span>
               </td>
-              <td><span class="flow-run-step mono" title="Workflow state: #{escape_attr(logical_state)}">#{wrapped_state}</span><span class="flow-run-secondary" title="Stored state: #{escape_attr(state)}">Stored: #{escape(state)}</span>#{status_badge}</td>
-              <td><span class="flow-run-reason">#{escape(flow_waiting_reason(record))}</span><span class="flow-run-secondary">#{format_number(flow_record_attempts(record))} attempts</span></td>
-              <td class="flow-run-timing"><span><span class="c-muted">Run</span> #{format_timestamp_ms_or_dash(flow_record_run_at_ms(record))}</span><span><span class="c-muted">Updated</span> #{format_timestamp_ms_or_dash(flow_record_updated_at_ms(record))}</span></td>
+              <td><span class="flow-run-state" title="Workflow state: #{escape_attr(logical_state)} · Stored state: #{escape_attr(state)}"><span class="flow-run-step mono">#{wrapped_state}</span>#{status_badge}</span>#{stored}</td>
+              <td><span class="flow-run-reason">#{escape(flow_waiting_reason(record))}</span><span class="flow-run-attempts">#{format_number(flow_record_attempts(record))} attempts</span></td>
+              <td class="flow-run-updated" title="#{escape_attr(timing)}">#{format_clock_ms(flow_record_updated_at_ms(record))}</td>
               <td>#{render_flow_value_ref_badges(record, :detail_link)}</td>
               <td class="flow-row-actions">
                 <a class="flow-link" href="#{detail_path}" title="Inspect workflow">Inspect</a>
@@ -531,7 +538,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     <h2 class="section-title" id="flow-recent-records">Recent Flow Records#{limit_badge}</h2>
     <div class="table-scroll" role="region" aria-label="Recent workflow records" tabindex="0"><table class="flow-runs-table">
       <thead>
-        <tr><th>Workflow</th><th>Workflow / stored state</th><th>Activity</th><th>Timing (UTC)</th><th>Values</th><th>Actions</th></tr>
+        <tr><th>Workflow</th><th>State</th><th>Activity</th><th>Updated (UTC)</th><th>Values</th><th>Actions</th></tr>
       </thead>
       <tbody>
         #{rows}

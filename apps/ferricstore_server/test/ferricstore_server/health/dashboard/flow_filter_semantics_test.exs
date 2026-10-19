@@ -151,10 +151,10 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
         ]
       })
 
-    expired_position = position!(html, "Expired Running Leases")
+    expired_position = position!(html, "Expired leases")
     expired_row_position = position!(html, "expired-running-flow")
-    actions_position = position!(html, "Recovery Actions")
-    terminal_position = position!(html, "Failure and Retry-Exhaustion Records")
+    actions_position = position!(html, "Reclaim by type and partition")
+    terminal_position = position!(html, "Failed and out of retries")
     terminal_row_position = position!(html, "terminal-failed-flow")
 
     assert expired_position < expired_row_position
@@ -169,7 +169,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowFilterSemanticsTest do
     assert html =~ "Search text narrows this evidence only"
     assert html =~ "A blank Partition uses automatic partitions"
 
-    recovery_form = form_html(html, "/dashboard/flow/failures", "post")
+    [_, recovery_form] = Regex.run(~r/<form id="flow-reclaim-form"[^>]*>(.*?)<\/form>/s, html)
     assert required_input?(input_tag(recovery_form, "type"))
   end
 

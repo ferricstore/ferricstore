@@ -199,6 +199,33 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .overview-card-note { margin-top: 12px; color: var(--text-muted); font-size: 0.8125rem; }
       .overview-footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 24px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--text-faint); font-size: 0.75rem; }
 
+      /* Failures */
+      .failure-groups { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); overflow: hidden; }
+      .failure-group + .failure-group { border-top: 1px solid var(--line-subtle); }
+      .failure-group > summary { display: grid; grid-template-columns: minmax(200px, 1.6fr) 56px minmax(150px, 1fr) minmax(160px, 1.2fr) 16px; align-items: center; gap: 12px; padding: 10px 16px; list-style: none; cursor: pointer; }
+      .failure-group > summary::-webkit-details-marker { display: none; }
+      .failure-group > summary::after { content: ""; justify-self: end; width: 7px; height: 7px; border-right: 2px solid var(--text-faint); border-bottom: 2px solid var(--text-faint); transform: rotate(-45deg); transition: transform 0.15s; }
+      .failure-group[open] > summary::after { transform: rotate(45deg); }
+      .failure-group > summary:hover { background: var(--surface-selected); }
+      .failure-group-scope { display: grid; gap: 2px; min-width: 0; }
+      .failure-group-scope .mono { color: var(--text-strong); overflow-wrap: anywhere; }
+      .failure-group-scope .failure-group-partition { color: var(--text-faint); font-size: 0.75rem; }
+      .failure-group-count { justify-self: end; padding: 0 8px; border-radius: 999px; background: var(--warn-wash); color: var(--warn); font-family: var(--font-mono); font-size: 0.8125rem; }
+      .failure-group-since, .failure-group-worker { min-width: 0; overflow: hidden; color: var(--text-muted); font-size: 0.8125rem; text-overflow: ellipsis; white-space: nowrap; }
+      .failure-group-body { display: grid; gap: 14px; padding: 4px 16px 16px; }
+      .failure-reclaim { display: grid; gap: 10px; padding: 12px 14px; border: 1px solid var(--accent-solid); border-radius: 10px; background: var(--surface-base); }
+      .failure-reclaim-scope { color: var(--text-muted); font-size: 0.8125rem; }
+      .failure-reclaim-options > summary { width: fit-content; color: var(--text-muted); font-size: 0.8125rem; cursor: pointer; }
+      .failure-reclaim-options .flow-policy-grid { margin-top: 10px; }
+      .failure-reclaim-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; }
+      .failure-empty { padding: 14px 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); color: var(--text-muted); font-size: 0.875rem; }
+      #flow-failures-terminal { margin-top: 28px; }
+      #flow-failures-terminal .flow-section-note { margin-top: 10px; }
+      .flow-reclaim-advanced { margin-top: 14px; }
+      .flow-reclaim-advanced > summary { width: fit-content; color: var(--text-muted); font-size: 0.875rem; cursor: pointer; }
+      .flow-reclaim-advanced > summary:hover { color: var(--text-strong); }
+      .flow-reclaim-advanced[open] > summary { margin-bottom: 10px; }
+
       /* Operational summary cards */
       .ops-summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 20px; }
       .ops-summary-card { background: var(--surface-raised); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; min-width: 0; }
@@ -695,13 +722,18 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .table-scroll::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 8px; }
       .table-scroll table { min-width: 100%; overflow: visible; }
       .flow-runs-table { table-layout: fixed; min-width: 960px !important; font-variant-numeric: tabular-nums; }
-      .flow-runs-table th:nth-child(1) { width: 26%; }
-      .flow-runs-table th:nth-child(2) { width: 17%; }
-      .flow-runs-table th:nth-child(3) { width: 20%; }
-      .flow-runs-table th:nth-child(4) { width: 20%; }
+      .flow-runs-table th:nth-child(1) { width: 27%; }
+      .flow-runs-table th:nth-child(2) { width: 18%; }
+      .flow-runs-table th:nth-child(3) { width: 24%; }
+      .flow-runs-table th:nth-child(4) { width: 11%; }
       .flow-runs-table th:nth-child(5) { width: 8%; }
-      .flow-runs-table th:nth-child(6) { width: 9%; }
-      .flow-runs-table td { vertical-align: top; padding: 12px; }
+      .flow-runs-table th:nth-child(6) { width: 12%; }
+      .flow-runs-table td { vertical-align: top; padding: 9px 12px; }
+      .flow-run-state { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+      .flow-run-state .flow-run-step { margin: 0; }
+      .flow-run-stored { display: block; margin-top: 4px; color: var(--text-faint); font-size: 0.75rem; }
+      .flow-run-attempts { display: block; margin-top: 4px; color: var(--text-faint); font-size: 0.75rem; }
+      .flow-run-updated { color: var(--text-muted); white-space: nowrap; }
       .flow-worker-records-table { table-layout: fixed; font-variant-numeric: tabular-nums; }
       .flow-worker-records-table th:nth-child(1) { width: 36%; }
       .flow-worker-records-table th:nth-child(2) { width: 24%; }
@@ -719,7 +751,8 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-run-reason { display: block; overflow-wrap: anywhere; line-height: 1.45; }
       .flow-run-timing > span { display: block; white-space: nowrap; font-size: 0.75rem; margin-bottom: 6px; }
       .flow-run-timing .c-muted { display: block; font-size: 0.75rem; }
-      .flow-row-actions > * { display: block; margin-bottom: 8px; }
+      .flow-row-actions { white-space: nowrap; }
+      .flow-row-actions > * + * { margin-left: 10px; }
       .table-scroll th { position: sticky; top: 0; z-index: 1; }
 
       /* Status colors */
@@ -734,6 +767,11 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .badge-warning { background: var(--warn-wash); color: var(--warn); border: 1px solid transparent; }
       .badge-pressure { background: rgba(242, 120, 92, 0.12); color: var(--danger); border: 1px solid rgba(242, 120, 92, 0.3); }
       .badge-reject { background: rgba(242, 120, 92, 0.2); color: var(--danger-text); border: 1px solid rgba(242, 120, 92, 0.4); }
+      .badge-running { background: var(--accent-wash); color: var(--accent); border: 1px solid transparent; }
+      .badge-due { background: var(--info-wash); color: var(--info); border: 1px solid transparent; }
+      .badge-retrying { background: var(--warn-wash); color: var(--warn); border: 1px solid transparent; }
+      .badge-failed { background: var(--danger-wash); color: var(--danger-text); border: 1px solid transparent; }
+      .badge-completed { background: var(--ok-wash); color: var(--ok-text); border: 1px solid transparent; }
       .badge-merging { background: var(--accent-wash); color: var(--accent); border: 1px solid rgba(95, 217, 191, 0.3); }
       .badge-idle { background: var(--surface-selected); color: var(--text-muted); border: 1px solid transparent; }
 
@@ -1036,6 +1074,8 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
         .page-header { padding: 14px 16px 0; }
         .page-header-status { justify-content: flex-start; }
         .overview-shard-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+        .failure-group > summary { grid-template-columns: minmax(0, 1fr) auto 16px; }
+        .failure-group-since, .failure-group-worker { display: none; }
         .content { padding: 16px; }
         .flow-card-wide { grid-column: span 1; }
         .flow-nav-row { align-items: stretch; }
