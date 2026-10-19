@@ -470,8 +470,9 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp make_ast(_cmd, tag, [key, ttl]) when tag in ~w(expire pexpire expireat pexpireat)a,
     do: {tag, key, parse_int(ttl)}
 
-  defp make_ast(_cmd, tag, [key, ttl, flag]) when tag in ~w(expire pexpire expireat pexpireat)a,
-    do: {tag, key, parse_int(ttl), parse_expiry_flag(flag)}
+  defp make_ast(_cmd, tag, [key, ttl | flags])
+       when flags != [] and tag in ~w(expire pexpire expireat pexpireat)a,
+       do: {tag, key, parse_int(ttl), parse_expiry_flags(flags)}
 
   defp make_ast(_cmd, tag, [key]) when tag in ~w(lpop rpop)a, do: {tag, key}
 
@@ -1378,13 +1379,10 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp parse_getex_opts(_), do: {:error, "ERR syntax error"}
 
-  defp parse_expiry_flag(flag) do
-    case String.upcase(flag) do
-      "NX" -> :nx
-      "XX" -> :xx
-      "GT" -> :gt
-      "LT" -> :lt
-      _ -> {:error, "ERR syntax error"}
+  defp parse_expiry_flags(flags) do
+    case Ferricstore.Commands.Expiry.parse_flags(flags) do
+      {:ok, flag} -> flag
+      {:error, _reason} = error -> error
     end
   end
 

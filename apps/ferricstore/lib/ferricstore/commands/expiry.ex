@@ -42,11 +42,8 @@ defmodule Ferricstore.Commands.Expiry do
   def handle("EXPIRE", [key, secs_str], store),
     do: set_expiry_seconds(key, secs_str, :none, store)
 
-  def handle("EXPIRE", [key, secs_str, flag], store) do
-    case parse_flag(flag) do
-      {:ok, f} -> set_expiry_seconds(key, secs_str, f, store)
-      :error -> {:error, "ERR Unsupported option #{flag}"}
-    end
+  def handle("EXPIRE", [key, secs_str | flags], store) when flags != [] do
+    with {:ok, f} <- parse_flags(flags), do: set_expiry_seconds(key, secs_str, f, store)
   end
 
   def handle("EXPIRE", _args, _store),
@@ -54,11 +51,8 @@ defmodule Ferricstore.Commands.Expiry do
 
   def handle("PEXPIRE", [key, ms_str], store), do: set_expiry_ms(key, ms_str, :none, store)
 
-  def handle("PEXPIRE", [key, ms_str, flag], store) do
-    case parse_flag(flag) do
-      {:ok, f} -> set_expiry_ms(key, ms_str, f, store)
-      :error -> {:error, "ERR Unsupported option #{flag}"}
-    end
+  def handle("PEXPIRE", [key, ms_str | flags], store) when flags != [] do
+    with {:ok, f} <- parse_flags(flags), do: set_expiry_ms(key, ms_str, f, store)
   end
 
   def handle("PEXPIRE", _args, _store),
@@ -67,11 +61,8 @@ defmodule Ferricstore.Commands.Expiry do
   def handle("EXPIREAT", [key, ts_str], store),
     do: set_expiry_at_seconds(key, ts_str, :none, store)
 
-  def handle("EXPIREAT", [key, ts_str, flag], store) do
-    case parse_flag(flag) do
-      {:ok, f} -> set_expiry_at_seconds(key, ts_str, f, store)
-      :error -> {:error, "ERR Unsupported option #{flag}"}
-    end
+  def handle("EXPIREAT", [key, ts_str | flags], store) when flags != [] do
+    with {:ok, f} <- parse_flags(flags), do: set_expiry_at_seconds(key, ts_str, f, store)
   end
 
   def handle("EXPIREAT", _args, _store),
@@ -79,11 +70,8 @@ defmodule Ferricstore.Commands.Expiry do
 
   def handle("PEXPIREAT", [key, ts_str], store), do: set_expiry_at_ms(key, ts_str, :none, store)
 
-  def handle("PEXPIREAT", [key, ts_str, flag], store) do
-    case parse_flag(flag) do
-      {:ok, f} -> set_expiry_at_ms(key, ts_str, f, store)
-      :error -> {:error, "ERR Unsupported option #{flag}"}
-    end
+  def handle("PEXPIREAT", [key, ts_str | flags], store) when flags != [] do
+    with {:ok, f} <- parse_flags(flags), do: set_expiry_at_ms(key, ts_str, f, store)
   end
 
   def handle("PEXPIREAT", _args, _store),
@@ -131,6 +119,10 @@ defmodule Ferricstore.Commands.Expiry do
   def handle_ast({:pexpire, _key, _ms, {:error, reason}}, _store), do: {:error, reason}
   def handle_ast({:expireat, _key, _ts, {:error, reason}}, _store), do: {:error, reason}
   def handle_ast({:pexpireat, _key, _ts, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({tag, _key, {:error, reason}, _flag}, _store)
+      when tag in [:expire, :pexpire, :expireat, :pexpireat],
+      do: {:error, reason}
 
   def handle_ast({:expire, key, secs, flag}, store) when is_integer(secs),
     do: set_expiry_seconds_parsed(key, secs, flag, store)
@@ -287,7 +279,11 @@ defmodule Ferricstore.Commands.Expiry do
   end
 
   # Flag checks: NX (only if no expiry), XX (only if has expiry),
-  # GT (only if new > current), LT (only if new < current).
+  # GT (only if new > current), LT (only if new < current). XX can join GT or
+  # LT, and then both must allow the new expiry.
+  defp flag_allows?(flags, old, new) when is_list(flags),
+    do: Enum.all?(flags, &flag_allows?(&1, old, new))
+
   defp flag_allows?(:none, _old, _new), do: true
   defp flag_allows?(:nx, 0, _new), do: true
   defp flag_allows?(:nx, _old, _new), do: false
@@ -298,6 +294,43 @@ defmodule Ferricstore.Commands.Expiry do
   defp flag_allows?(:gt, old, new), do: new > old
   defp flag_allows?(:lt, 0, _new), do: true
   defp flag_allows?(:lt, old, new), do: new < old
+
+  @doc """
+  Parses EXPIRE's option flags as Redis 7 does: NX, GT and LT are mutually
+  exclusive, XX joins GT or LT, and a repeated flag counts once.
+  """
+  @spec parse_flags([binary()]) :: {:ok, atom() | [atom()]} | {:error, binary()}
+  def parse_flags([_ | _] = flags) do
+    with {:ok, parsed} <- parse_each_flag(flags, []) do
+      parsed = Enum.uniq(parsed)
+
+      cond do
+        :nx in parsed and length(parsed) > 1 ->
+          {:error, "ERR NX and XX, GT or LT options at the same time are not compatible"}
+
+        :gt in parsed and :lt in parsed ->
+          {:error, "ERR GT and LT options at the same time are not compatible"}
+
+        match?([_flag], parsed) ->
+          {:ok, hd(parsed)}
+
+        true ->
+          {:ok, parsed}
+      end
+    end
+  end
+
+  defp parse_each_flag([], acc), do: {:ok, Enum.reverse(acc)}
+
+  defp parse_each_flag([flag | rest], acc) when is_binary(flag) do
+    case parse_flag(flag) do
+      {:ok, parsed} -> parse_each_flag(rest, [parsed | acc])
+      :error -> {:error, "ERR Unsupported option #{flag}"}
+    end
+  end
+
+  defp parse_each_flag([flag | _rest], _acc),
+    do: {:error, "ERR Unsupported option #{inspect(flag)}"}
 
   defp parse_flag(str) do
     case String.upcase(str) do

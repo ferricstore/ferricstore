@@ -23,6 +23,33 @@ defmodule Ferricstore.Commands.RedisCompatExpiryTest do
   # - PERSIST on key without expiry
   # ===========================================================================
 
+  describe "combined EXPIRE flags" do
+    test "XX combines with GT or LT, and NX with another flag or GT with LT is an error" do
+      # Redis 7: GT, LT and NX are mutually exclusive; XX joins GT or LT.
+      for run <- [&Expiry.handle/3, &Ferricstore.Commands.Dispatcher.dispatch/3] do
+        store = MockStore.make()
+        Strings.handle("SET", ["volatile", "v", "EX", "100"], store)
+        Strings.handle("SET", ["persistent", "v"], store)
+
+        assert 1 == run.("EXPIRE", ["volatile", "500", "XX", "GT"], store)
+        assert 0 == run.("EXPIRE", ["volatile", "50", "XX", "GT"], store)
+        assert 1 == run.("PEXPIRE", ["volatile", "60000", "LT", "XX"], store)
+        assert 0 == run.("EXPIRE", ["persistent", "50", "XX", "LT"], store)
+        assert -1 == Expiry.handle("TTL", ["persistent"], store)
+        assert 1 == run.("EXPIRE", ["persistent", "50", "LT", "LT"], store)
+
+        assert {:error, "ERR NX and XX, GT or LT options at the same time are not compatible"} ==
+                 run.("EXPIRE", ["volatile", "100", "NX", "XX"], store)
+
+        assert {:error, "ERR GT and LT options at the same time are not compatible"} ==
+                 run.("PEXPIREAT", ["volatile", "100", "GT", "LT"], store)
+
+        assert {:error, "ERR value is not an integer or out of range"} ==
+                 run.("EXPIRE", ["volatile", "abc", "XX"], store)
+      end
+    end
+  end
+
   describe "key expiry edge cases" do
     test "EXPIRE 0 on a key should succeed (key expires immediately)" do
       store = MockStore.make()

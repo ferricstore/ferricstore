@@ -9,6 +9,11 @@ All notable changes to FerricStore will be documented here.
   failed read counted as a lost frame, so a purge on a busy node could delete
   a Flow that still reads back; the policy catalog backfill already told
   these apart.
+- Accept combined EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT flags as Redis 7
+  does: XX joins GT or LT, while NX with another flag, or GT with LT, answers
+  Redis's incompatibility error. A second flag answered "wrong number of
+  arguments". A non-integer time with a flag now answers the integer error
+  on the TCP and HTTP path instead of "unsupported expiry command AST".
 - Fix BITCOUNT and BITPOS ranges through the TCP and HTTP gateways. The native
   command parser built a BITCOUNT range shape no handler accepted, so
   `BITCOUNT key 0 -1` answered "ERR unsupported command AST", the BIT form and
