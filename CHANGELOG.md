@@ -51,6 +51,12 @@ All notable changes to FerricStore will be documented here.
   empty tables.
 - Show signed-in users the query prompt (for example "Enter a partition
   key") instead of "0 visible row(s)" before a query has run.
+- Redesign the Settings pages. Policies states a shared policy once and
+  trims its table to nine columns, with an Edit column that no longer
+  clips Max active. Governance leads with open circuits and waiting
+  approvals over a compact count strip. Retention says whether the sample
+  has anything to clean up, with every cleanup safeguard unchanged. The
+  shared row filter control is laid out as one aligned row.
 
 ## 0.12.6 - 2026-10-19
 
