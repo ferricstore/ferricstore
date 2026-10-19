@@ -156,7 +156,7 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowReviewRegressionsTest do
 
     html = Dashboard.render_flow_retention_page(%{})
 
-    assert position(html, "Sampled Active Timeouts") <
+    assert position(html, "Cleanup candidates") <
              position(html, ~s(id="flow-retention-reference"))
 
     assert html =~ ~s(<details class="dashboard-disclosure" id="flow-retention-reference">)

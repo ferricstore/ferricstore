@@ -1,5 +1,7 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
   import FerricstoreServer.Health.Dashboard.Format
+
+  alias FerricstoreServer.Health.Dashboard.Render.PageStatus
   import FerricstoreServer.Health.Dashboard.FlowRecord
   import FerricstoreServer.Health.Dashboard.Render.Admin, only: [render_config_command_table: 2]
   import FerricstoreServer.Health.Dashboard.Render.FlowHistory, only: [flow_detail_path: 2]
@@ -41,7 +43,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
       end
 
     """
-    <h2 class="section-title">Sample Preview <span class="badge badge-idle">#{sampled_scan_label(Map.get(data, :total_sampled, 0), Map.get(data, :sample_limit, @flow_dashboard_sample_limit))}</span></h2>
+    #{render_flow_retention_status(data)}
     <dl class="flow-overview-ribbon" aria-label="Retention sample metrics">
       #{render_flow_summary_metric("Active Timeouts", Map.get(data, :active_timeout_eligible_sampled, 0), "sampled candidates for runtime enforcement")}
       #{render_flow_summary_metric("Terminal Deletes", Map.get(data, :terminal_eligible_sampled, 0), "sampled candidates for terminal deletion")}
@@ -49,6 +51,40 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
       #{global_metrics}
     </dl>
     """
+  end
+
+  defp render_flow_retention_status(data) do
+    active = sampled_count(data, :active_timeout_eligible_sampled)
+    terminal = sampled_count(data, :terminal_eligible_sampled)
+
+    sample =
+      sampled_scan_label(
+        Map.get(data, :total_sampled, 0),
+        Map.get(data, :sample_limit, @flow_dashboard_sample_limit)
+      )
+
+    # Active and terminal candidates are disjoint, so their sum counts runs once.
+    if active + terminal == 0 do
+      PageStatus.render("retention", :healthy, "Nothing to clean up in this sample", [sample])
+    else
+      PageStatus.render(
+        "retention",
+        :idle,
+        "#{format_grouped(active + terminal)} runs ready for cleanup in this sample",
+        [
+          "#{format_grouped(active)} past their max active runtime",
+          "#{format_grouped(terminal)} past their retention",
+          sample
+        ]
+      )
+    end
+  end
+
+  defp sampled_count(data, key) do
+    case Map.get(data, key, 0) do
+      value when is_integer(value) and value > 0 -> value
+      _other -> 0
+    end
   end
 
   def render_flow_retention_controls(data) do
@@ -63,7 +99,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
 
     """
     <div id="flow-retention-maintenance" class="flow-retention-controls">
-      <h2 class="section-title">Retention Cleanup #{info_icon("Fails overdue active Flow records whose max active runtime expired, then deletes terminal Flow data whose retention TTL expired, under one shared global record limit.", "About retention cleanup")}</h2>
+      <h2 class="section-title">Retention cleanup #{info_icon("Fails overdue active Flow records whose max active runtime expired, then deletes terminal Flow data whose retention TTL expired, under one shared global record limit.", "About retention cleanup")}</h2>
       #{flash}
       <p class="flow-section-note">The bounded sample does not simulate global cleanup. Active timeouts consume the shared limit before terminal deletions. A sampled count of zero is not proof that global cleanup will change zero records.</p>
       <form class="flow-policy-form" action="/dashboard/flow/retention" method="post" data-dashboard-single-submit>
@@ -155,17 +191,28 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
     active_timeout_candidates = Map.get(data, :active_timeout_candidates, [])
     now_ms = Map.get(data, :now_ms, System.system_time(:millisecond))
 
-    render_flow_active_timeout_candidates(
-      active_timeout_candidates,
-      now_ms,
+    active_total =
       Map.get(data, :active_timeout_eligible_sampled, length(active_timeout_candidates))
-    ) <>
-      render_flow_terminal_retention_candidates(
-        candidates,
-        now_ms,
-        Map.get(data, :terminal_eligible_sampled, length(candidates))
-      )
+
+    terminal_total = Map.get(data, :terminal_eligible_sampled, length(candidates))
+
+    if active_timeout_candidates == [] and candidates == [] and active_total == 0 and
+         terminal_total == 0 do
+      """
+      <h2 class="section-title">Cleanup candidates</h2>
+      <p class="section-empty">No sampled run is past its max active runtime or its retention.</p>
+      """
+    else
+      render_flow_active_timeout_candidates(active_timeout_candidates, now_ms, active_total) <>
+        render_flow_terminal_retention_candidates(candidates, now_ms, terminal_total)
+    end
   end
+
+  defp render_flow_active_timeout_candidates([], _now_ms, 0),
+    do: """
+    <h2 class="section-title">Sampled Active Timeouts <span class="badge badge-idle">0</span></h2>
+    <p class="section-empty">No sampled run is past its max active runtime.</p>
+    """
 
   defp render_flow_active_timeout_candidates(candidates, now_ms, total) do
     rows =
@@ -203,6 +250,12 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
     </table></div>
     """
   end
+
+  defp render_flow_terminal_retention_candidates([], _now_ms, 0),
+    do: """
+    <h2 class="section-title">Sampled Terminal Deletions <span class="badge badge-idle">0</span></h2>
+    <p class="section-empty">No sampled run is past its retention.</p>
+    """
 
   defp render_flow_terminal_retention_candidates(candidates, now_ms, total) do
     rows =
