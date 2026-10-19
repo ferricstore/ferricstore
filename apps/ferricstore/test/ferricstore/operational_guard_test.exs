@@ -574,10 +574,13 @@ defmodule Ferricstore.OperationalGuardTest do
        end}
     )
 
-    assert_receive :lmdb_reclaimed
+    # The first check runs asynchronously after start, and gathers memory and
+    # admission state before reclaiming; a loaded runner can take over 100 ms.
+    assert_receive :lmdb_reclaimed, 5_000
 
     assert_receive {:telemetry, [:ferricstore, :flow, :lmdb, :mmap_reclaim],
-                    %{released: 2, busy: 0}, %{status: :ok}}
+                    %{released: 2, busy: 0}, %{status: :ok}},
+                   5_000
   end
 
   test "default rss pressure reclaims idle LMDB mmap before Flow create pause zone" do
