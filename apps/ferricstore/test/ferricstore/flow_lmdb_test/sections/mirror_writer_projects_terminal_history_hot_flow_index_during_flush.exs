@@ -536,12 +536,13 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorWriterProjectsTerminalHistory
         assert :ok = Ferricstore.Flow.LMDBWriter.suspend(instance_name, shard_index)
         true = :ets.delete(keydir)
 
+        # Every LMDB writer in the VM emits this event; only this test's writer counts.
         assert_receive {:flow_lmdb_writer_suspend, [:ferricstore, :flow, :lmdb_writer, :flush],
-                        %{op_count: 1}, %{status: :ok}},
+                        %{op_count: 1}, %{status: :ok, instance_name: ^instance_name}},
                        500
 
         refute_receive {:flow_lmdb_writer_suspend, [:ferricstore, :flow, :lmdb_writer, :flush],
-                        _measurements, _metadata},
+                        _measurements, %{instance_name: ^instance_name}},
                        80
 
         assert :atomics.get(instance_ctx.flow_lmdb_writer_flush_failures, 1) == 0
