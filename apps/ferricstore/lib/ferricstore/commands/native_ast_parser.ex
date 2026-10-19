@@ -603,18 +603,9 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp make_ast(_cmd, :setbit, [key, offset, bit]),
     do: {:setbit, key, parse_int(offset), parse_int(bit)}
 
+  # A BITCOUNT range and every BITPOS form stay as argument lists, which the
+  # dispatcher hands to the bitmap command handler's full argument checks.
   defp make_ast(_cmd, :bitcount, [key]), do: {:bitcount, key}
-
-  defp make_ast(_cmd, :bitcount, [key, start, stop]),
-    do: {:bitcount, key, parse_int(start), parse_int(stop)}
-
-  defp make_ast(_cmd, :bitpos, [key, bit]), do: {:bitpos, key, parse_int(bit), :all}
-
-  defp make_ast(_cmd, :bitpos, [key, bit, start]),
-    do: {:bitpos, key, parse_int(bit), {:start, parse_int(start)}}
-
-  defp make_ast(_cmd, :bitpos, [key, bit, start, stop]),
-    do: {:bitpos, key, parse_int(bit), {parse_int(start), parse_int(stop), :byte}}
 
   defp make_ast(_cmd, :bitop, [operation, destination | sources]),
     do: parse_bitop(operation, destination, sources)

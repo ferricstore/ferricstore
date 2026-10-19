@@ -4,6 +4,14 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Fix BITCOUNT and BITPOS ranges through the TCP and HTTP gateways. The native
+  command parser built a BITCOUNT range shape no handler accepted, so
+  `BITCOUNT key 0 -1` answered "ERR unsupported command AST", the BIT form and
+  `BITCOUNT key start` answered "ERR internal server error", and BITPOS with
+  a BIT or BYTE mode answered "wrong number of arguments". Both commands now
+  use the bitmap handler's argument checks. ZRANGE and ZREVRANGE with a
+  non-integer start or stop now answer "ERR value is not an integer or out
+  of range" instead of an empty list or an internal error.
 - Keep the dashboard's run pages working when a run or schedule time is past
   year 9999. The store accepts any integer run time, and the new compact rows
   and schedule times raised on such a value, so one such run broke the Due

@@ -478,6 +478,14 @@ defmodule Ferricstore.Commands.SortedSet do
   def handle_ast({:zrevrange, _key, _start, _stop, {:error, reason}}, _store),
     do: {:error, reason}
 
+  def handle_ast({tag, _key, {:error, reason}, _stop, _with_scores}, _store)
+      when tag in [:zrange, :zrevrange],
+      do: {:error, reason}
+
+  def handle_ast({tag, _key, _start, {:error, reason}, _with_scores}, _store)
+      when tag in [:zrange, :zrevrange],
+      do: {:error, reason}
+
   def handle_ast({:zrange, key, start, stop, with_scores}, store),
     do: zrange_rank_parsed(key, start, stop, with_scores, false, store)
 
