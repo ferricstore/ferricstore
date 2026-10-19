@@ -732,10 +732,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
               ""
           end
 
+        value = Map.fetch!(card, :value)
+
+        classes =
+          ["ops-summary-value", value_class, if(summary_text?(value), do: "is-text")]
+          |> Enum.reject(&(&1 in [nil, ""]))
+          |> Enum.join(" ")
+
         """
         <div class="ops-summary-card">
           <div class="ops-summary-label">#{escape(Map.fetch!(card, :label))}</div>
-          <div class="ops-summary-value #{escape_attr(value_class)}">#{escape(Map.fetch!(card, :value))}</div>
+          <div class="#{escape_attr(classes)}">#{escape(value)}</div>
           #{detail_html}
         </div>
         """
@@ -748,4 +755,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
     </div>
     """
   end
+
+  # A measured figure starts with a digit; anything else (Unavailable, on,
+  # Shard 11) is a word and reads smaller.
+  defp summary_text?(value) when is_binary(value), do: not Regex.match?(~r/^-?\d/, value)
+  defp summary_text?(_value), do: false
 end
