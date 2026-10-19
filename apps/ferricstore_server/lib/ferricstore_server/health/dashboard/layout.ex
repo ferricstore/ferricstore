@@ -1639,7 +1639,8 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
   end
 
   defp render_nav_badge({value, :warn}),
-    do: ~s(<span class="nav-badge nav-badge-warn">#{escape(to_string(value))}</span>)
+    do:
+      ~s(<span class="nav-badge nav-badge-warn" title="Expired leases and failed runs in the overview's sample">#{escape(to_string(value))}</span>)
 
   defp render_nav_badge(value) when value in ["", nil], do: ""
   defp render_nav_badge(value), do: ~s(<span class="nav-badge">#{escape(to_string(value))}</span>)

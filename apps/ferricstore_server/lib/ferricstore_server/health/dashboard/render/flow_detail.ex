@@ -107,6 +107,113 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
     """
   end
 
+  @lifecycle_steps 8
+
+  @doc """
+  The states a run entered, in order, each linked to the journal entry that
+  moved it there. A running lease past its deadline is the current step.
+  """
+  def render_flow_lifecycle(%{record: nil}), do: ""
+
+  def render_flow_lifecycle(%{record: record} = data) do
+    steps =
+      data
+      |> Map.get(:history, [])
+      |> flow_history_timeline_rows()
+      |> Enum.sort_by(&{&1.time_ms || 0, to_string(&1.event_id)})
+      |> Enum.reject(&(&1.to_state in [nil, ""]))
+      |> Enum.chunk_by(& &1.to_state)
+      |> Enum.map(fn [first | _] ->
+        %{
+          state: first.to_state,
+          kind: lifecycle_kind(first.to_state),
+          href: "#journal-" <> flow_history_event_anchor(first.event_id),
+          meta: "#{flow_history_event_label(first.fields)} · #{format_clock_ms(first.time_ms)}"
+        }
+      end)
+
+    lease = flow_record_lease_expires_at_ms(record)
+
+    expired? =
+      flow_record_state(record) == "running" and is_integer(lease) and
+        lease < System.system_time(:millisecond)
+
+    steps =
+      if expired?,
+        do:
+          steps ++
+            [
+              %{
+                state: "lease expired",
+                kind: "expired",
+                href: nil,
+                meta: "lease ended #{format_clock_ms(lease)}"
+              }
+            ],
+        else: steps
+
+    earlier = max(length(steps) - @lifecycle_steps, 0)
+    shown = Enum.drop(steps, earlier)
+    last = length(shown) - 1
+
+    path =
+      shown
+      |> Enum.with_index()
+      |> Enum.map_join("", fn {step, index} ->
+        current = if index == last, do: " is-current", else: ""
+
+        body =
+          ~s(<strong class="flow-lifecycle-state">#{escape(step.state)}</strong><span class="flow-lifecycle-meta">#{escape(step.meta)}</span>)
+
+        inner =
+          if step.href,
+            do: ~s(<a href="#{escape_attr(step.href)}">#{body}</a>),
+            else: ~s(<span>#{body}</span>)
+
+        ~s(<li class="flow-lifecycle-step is-#{step.kind}#{current}" style="--step: #{index}">#{inner}</li>)
+      end)
+
+    more =
+      if earlier > 0, do: ~s(<li class="flow-lifecycle-more">+#{earlier} earlier</li>), else: ""
+
+    recovery =
+      if expired? do
+        query =
+          URI.encode_query(%{
+            "type" => flow_record_type(record),
+            "partition_key" => flow_record_partition_key(record) || ""
+          })
+
+        ~s(<a class="flow-search-button flow-lifecycle-recover" href="#{escape_attr("/dashboard/flow/failures?" <> query)}">Reclaim in Failures</a>)
+      else
+        ""
+      end
+
+    body =
+      if shown == [],
+        do: ~s(<p class="flow-lifecycle-empty">No state changes recorded yet.</p>),
+        else: ~s(<ol class="flow-lifecycle-path">#{more}#{path}</ol>)
+
+    """
+    <section class="flow-lifecycle" aria-labelledby="flow-lifecycle-title">
+      <div class="flow-lifecycle-head">
+        <h2 id="flow-lifecycle-title">Lifecycle</h2>
+        <span>Select a state to open its journal entry</span>
+        #{recovery}
+      </div>
+      #{body}
+    </section>
+    """
+  end
+
+  defp lifecycle_kind(state) when state in ["queued", "scheduled", "ready", "waiting"],
+    do: "queued"
+
+  defp lifecycle_kind(state) when state in ["running", "completed", "failed", "cancelled"],
+    do: state
+
+  defp lifecycle_kind(_state), do: "custom"
+
   def render_flow_detail_metadata(%{record: nil}), do: ""
 
   def render_flow_detail_metadata(data) do
@@ -172,17 +279,13 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
     """
     <header class="flow-entity-header">
       <div class="flow-breadcrumb">
-        <a href="/dashboard">Dashboard</a>
-        <span class="flow-breadcrumb-sep">/</span>
-        <a href="/dashboard/flow">Flows</a>
-        <span class="flow-breadcrumb-sep">/</span>
         <span class="flow-entity-identity">
+          <span class="c-muted">Type</span>
           <a href="/dashboard/flow/states?#{escape_attr(type_query)}">#{escape(type)}</a>
-          <span class="flow-breadcrumb-sep">/</span>
-          <span class="flow-breadcrumb-current">#{escape(id)}</span>
+          <span class="c-muted">Partition</span>
         </span>
-        <button type="button" class="copy-btn-inline" data-copy-text="#{escape_attr(id)}" aria-label="Copy workflow ID" title="Copy workflow ID">Copy ID</button>
         <button type="button" class="copy-btn-inline flow-entity-scope" data-copy-text="#{escape_attr(partition_key)}" aria-label="Copy partition key" title="Copy partition key">#{escape(partition_key)}</button>
+        <button type="button" class="copy-btn-inline" data-copy-text="#{escape_attr(id)}" aria-label="Copy workflow ID" title="Copy workflow ID">Copy ID</button>
       </div>
     </header>
     """

@@ -406,7 +406,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
       when is_list(schedules) and is_map(filters) do
     rows =
       if schedules == [] do
-        ~s(<tr><td colspan="12" class="c-muted">No schedules matched in this retained catalog sample. Use exact ID lookup to check a known schedule.</td></tr>)
+        ~s(<tr><td colspan="8" class="c-muted">No schedules matched in this retained catalog sample. Use exact ID lookup to check a known schedule.</td></tr>)
       else
         Enum.map_join(schedules, "\n", &render_flow_schedule_row(&1, filters))
       end
@@ -414,21 +414,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
     """
     <h2 class="section-title">Schedules</h2>
     <div class="table-scroll" role="region" aria-label="Workflow schedules" tabindex="0"><table class="flow-schedules-table">
-      <colgroup><col style="width: 180px"><col style="width: 100px"><col style="width: 100px"><col style="width: 140px"><col style="width: 140px"><col style="width: 60px"><col style="width: 140px"><col style="width: 120px"><col style="width: 100px"><col style="width: 120px"><col style="width: 180px"><col style="width: 170px"></colgroup>
+      <colgroup><col style="width: 220px"><col style="width: 84px"><col style="width: 130px"><col style="width: 140px"><col style="width: 150px"><col style="width: 56px"><col style="width: 110px"><col style="width: 280px"></colgroup>
       <thead>
         <tr>
-          <th>ID</th>
-          <th>State</th>
-          <th>Kind</th>
-          <th>Next Due</th>
-          <th>Last Fire</th>
-          <th>Fires</th>
-          <th>Target</th>
-          <th>Overlap</th>
-          <th>Catch-up</th>
-          <th>End</th>
-          <th>Last Target</th>
-          <th>Actions</th>
+          <th scope="col">Schedule</th>
+          <th scope="col">Status</th>
+          <th scope="col">Runs</th>
+          <th scope="col">Next run</th>
+          <th scope="col">Last run</th>
+          <th scope="col">Fires</th>
+          <th scope="col">If still running</th>
+          <th scope="col">Actions</th>
         </tr>
       </thead>
       <tbody>
@@ -463,32 +459,116 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
   end
 
   defp render_flow_schedule_row(%{error: reason}, _filters) do
-    ~s(<tr><td colspan="12" class="flow-alert-error">#{escape(reason)}</td></tr>)
+    ~s(<tr><td colspan="8" class="flow-alert-error">#{escape(reason)}</td></tr>)
   end
 
   defp render_flow_schedule_row(schedule, filters) do
     id = Map.get(schedule, :id, "")
-    target = Map.get(schedule, :target, %{})
+    target = Map.get(schedule, :target) || %{}
+    now = System.system_time(:millisecond)
+    next_at = Map.get(schedule, :next_run_at_ms)
+    last_at = Map.get(schedule, :last_fire_at_ms)
 
     """
     <tr>
-      <td class="mono">#{escape(id)}</td>
+      <td><span class="mono">#{escape(id)}</span><span class="flow-run-secondary">creates <span class="mono">#{escape(Map.get(target, :type) || "-")}</span></span></td>
       <td><span class="#{schedule_state_class(Map.get(schedule, :state))}">#{escape(Map.get(schedule, :state, "-"))}</span></td>
-      <td class="mono">#{escape(schedule_kind(schedule))}</td>
-      <td>#{format_timestamp_ms_or_dash(Map.get(schedule, :next_run_at_ms))}</td>
-      <td>#{format_timestamp_ms_or_dash(Map.get(schedule, :last_fire_at_ms))}</td>
+      <td class="flow-schedule-cadence">#{schedule_cadence(schedule)}</td>
+      <td>#{schedule_when(next_at, now, Map.get(schedule, :state) == "paused")}</td>
+      <td>#{schedule_when(last_at, now, false)}<span class="flow-run-secondary mono">#{last_target_link(schedule)}</span></td>
       <td class="mono">#{format_number(Map.get(schedule, :fire_count, 0))}</td>
-      <td class="mono">#{escape(Map.get(target, :type, "-"))}</td>
       <td>#{schedule_overlap_summary(schedule)}</td>
-      <td>#{schedule_catchup_summary(schedule)}</td>
-      <td>#{schedule_end_summary(schedule)}</td>
-      <td class="mono">#{last_target_link(schedule)}</td>
-      <td>#{render_flow_schedule_actions(schedule, filters)}</td>
+      <td class="flow-schedule-actions">#{render_flow_schedule_actions(schedule, filters)}</td>
     </tr>
     <tr class="flow-schedule-definition-row">
-      <td colspan="12">#{schedule_definition(schedule)}</td>
+      <td colspan="8">#{schedule_definition(schedule)}</td>
     </tr>
     """
+  end
+
+  # How often the schedule fires, in words.
+  defp schedule_cadence(schedule) do
+    case schedule_kind(schedule) do
+      "interval" ->
+        case Map.get(schedule, :every_ms) do
+          ms when is_integer(ms) and ms > 0 -> "Every " <> every_label(ms)
+          _ -> "Interval"
+        end
+
+      "cron" ->
+        zone =
+          case Map.get(schedule, :timezone) do
+            zone when is_binary(zone) and zone not in ["", "Etc/UTC", "UTC"] ->
+              " · " <> escape(zone)
+
+            _ ->
+              ""
+          end
+
+        "Cron <code>#{escape(Map.get(schedule, :cron) || "-")}</code>#{zone}"
+
+      _ ->
+        case Map.get(schedule, :delay_ms) do
+          ms when is_integer(ms) and ms > 0 -> "Once, #{duration_words(ms)} after creation"
+          _ -> "Once"
+        end
+    end
+  end
+
+  defp every_label(ms) do
+    case duration_words(ms) do
+      "1 day" -> "day"
+      "1 h" -> "hour"
+      "1 min" -> "minute"
+      "1 s" -> "second"
+      words -> words
+    end
+  end
+
+  defp duration_words(ms) do
+    seconds = div(ms, 1_000)
+
+    [
+      {div(seconds, 86_400), fn n -> if n == 1, do: "1 day", else: "#{n} days" end},
+      {div(rem(seconds, 86_400), 3_600), &"#{&1} h"},
+      {div(rem(seconds, 3_600), 60), &"#{&1} min"},
+      {rem(seconds, 60), &"#{&1} s"}
+    ]
+    |> Enum.reject(fn {value, _label} -> value == 0 end)
+    |> Enum.map_join(" ", fn {value, label} -> label.(value) end)
+    |> case do
+      "" -> "#{ms} ms"
+      words -> words
+    end
+  end
+
+  # A time relative to now, with the exact time underneath.
+  defp schedule_when(nil, _now, _paused?), do: "-"
+
+  defp schedule_when(at_ms, now, paused?) when is_integer(at_ms) do
+    relative =
+      cond do
+        paused? -> "paused"
+        abs(at_ms - now) < 1_000 -> "now"
+        at_ms > now -> "in " <> coarse_duration(at_ms - now)
+        true -> coarse_duration(now - at_ms) <> " ago"
+      end
+
+    ~s(<span title="#{escape_attr(format_timestamp_ms_or_dash(at_ms))}">#{relative}</span><span class="flow-run-secondary">#{escape(short_time(at_ms))}</span>)
+  end
+
+  defp schedule_when(_at_ms, _now, _paused?), do: "-"
+
+  defp coarse_duration(ms) when ms < 60_000, do: "#{div(ms, 1_000)} s"
+  defp coarse_duration(ms) when ms < 3_600_000, do: "#{div(ms, 60_000)} min"
+
+  defp coarse_duration(ms) when ms < 172_800_000,
+    do: "#{div(ms, 3_600_000)} h #{div(rem(ms, 3_600_000), 60_000)} min"
+
+  defp coarse_duration(ms), do: "#{div(ms, 86_400_000)} days"
+
+  defp short_time(at_ms) do
+    at_ms |> DateTime.from_unix!(:millisecond) |> Calendar.strftime("%b %d, %H:%M:%S UTC")
   end
 
   defp schedule_definition(schedule) do
@@ -507,6 +587,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
       {"Target partition", Map.get(target, :partition_key) || "Unpartitioned"}
     ]
 
+    # Already-escaped summaries.
+    policy_rows =
+      [{"Catch-up", schedule_catchup_summary(schedule)}, {"Ends", schedule_end_summary(schedule)}]
+      |> Enum.map_join("", fn {label, html} -> "<div><dt>#{label}</dt><dd>#{html}</dd></div>" end)
+
     rows =
       timing
       |> Enum.reject(fn {_label, value} -> is_nil(value) end)
@@ -514,7 +599,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
         "<div><dt>#{escape(label)}</dt><dd>#{escape(to_string(value))}</dd></div>"
       end)
 
-    ~s(<details class="dashboard-disclosure"><summary aria-label="Schedule definition for #{escape_attr(Map.get(schedule, :id, ""))}">Schedule definition</summary><dl>#{rows}</dl><p class="flow-section-note">Target payloads are not displayed. This view does not fetch target workflow payloads. Missing original timing is shown as a dash.</p></details>)
+    ~s(<details class="dashboard-disclosure"><summary aria-label="Schedule definition for #{escape_attr(Map.get(schedule, :id, ""))}">Schedule definition</summary><dl>#{rows}#{policy_rows}</dl><p class="flow-section-note">Target payloads are not displayed. This view does not fetch target workflow payloads. Missing original timing is shown as a dash.</p></details>)
   end
 
   defp last_target_link(schedule) do
@@ -536,6 +621,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
   end
 
   defp render_flow_schedule_actions(schedule, filters) do
+    id = Map.get(schedule, :id, "")
     state = Map.get(schedule, :state)
 
     caps =
@@ -546,24 +632,44 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
         delete: true
       })
 
-    [
-      if(Map.get(caps, :edit, Map.get(caps, :create, false)),
-        do:
-          ~s(<a class="flow-search-button" href="#{escape_attr(schedule_edit_path(schedule, filters))}">Edit</a>)
-      ),
-      if(state == "active" and caps.fire,
-        do: schedule_confirmation(schedule, "fire", "Fire", filters)
-      ),
-      if(state == "active" and caps.pause,
-        do: schedule_action_button(schedule, "pause", "Pause", filters)
-      ),
-      if(state == "paused" and caps.resume,
-        do: schedule_action_button(schedule, "resume", "Resume", filters)
-      ),
-      if(state in ["active", "paused", "failed"] and caps.delete,
-        do: schedule_confirmation(schedule, "delete", "Delete", filters, true)
-      )
-    ]
+    row =
+      [
+        if(state == "active" and caps.fire,
+          do: schedule_confirmation(schedule, "fire", "Run now", filters)
+        ),
+        if(state == "active" and caps.pause,
+          do: schedule_action_button(schedule, "pause", "Pause", filters)
+        ),
+        if(state == "paused" and caps.resume,
+          do: schedule_action_button(schedule, "resume", "Resume", filters)
+        )
+      ]
+
+    menu_items =
+      [
+        if(Map.get(caps, :edit, Map.get(caps, :create, false)),
+          do:
+            ~s(<a class="flow-row-menu-item" href="#{escape_attr(schedule_edit_path(schedule, filters))}">Edit</a>)
+        ),
+        if(state in ["active", "paused", "failed"] and caps.delete,
+          do: schedule_confirmation(schedule, "delete", "Delete", filters, true)
+        )
+      ]
+      |> Enum.reject(&is_nil/1)
+
+    menu =
+      if menu_items == [] do
+        nil
+      else
+        """
+        <details class="flow-row-menu">
+          <summary aria-label="More actions for #{escape_attr(id)}">More</summary>
+          <div class="flow-row-menu-panel">#{Enum.join(menu_items, "")}</div>
+        </details>
+        """
+      end
+
+    (row ++ [menu])
     |> Enum.reject(&is_nil/1)
     |> Enum.join(" ")
   end
@@ -656,12 +762,18 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
 
   defp schedule_overlap_summary(schedule) do
     policy = schedule |> Map.get(:overlap_policy, :allow) |> to_string()
+
+    label =
+      Enum.find_value(@overlap_options, policy, fn {value, label, _help} ->
+        if value == policy, do: label
+      end)
+
     reason = Map.get(schedule, :last_overlap_reason)
 
     if is_binary(reason) and reason != "" do
-      "#{escape(policy)}<br><span class=\"c-muted\">#{escape(reason)}</span>"
+      ~s(<span title="#{escape_attr(policy)}">#{escape(label)}</span><span class="flow-run-secondary">#{escape(reason)}</span>)
     else
-      escape(policy)
+      ~s(<span title="#{escape_attr(policy)}">#{escape(label)}</span>)
     end
   end
 

@@ -426,12 +426,12 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
         types =
           case count(summary, :types) do
             0 -> ""
-            1 -> " across 1 type"
-            n -> " across #{n} types"
+            1 -> ", across 1 type"
+            n -> ", across #{n} types"
           end
 
         """
-        <p class="overview-workflows-total"><strong>#{format_grouped(active)}</strong> active runs#{types}</p>
+        <p class="overview-workflows-total"><strong>#{format_grouped(active)}</strong> active of #{format_grouped(count(summary, :sampled_records))} sampled runs#{types}</p>
         <div class="overview-state-bar" role="img" aria-label="#{label}">#{bar}</div>
         <ul class="overview-legend">#{legend}</ul>
         #{render_top_types(Map.get(summary, :top_types, []))}
@@ -445,7 +445,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
         <a href="/dashboard/flow">Open workflows</a>
       </div>
       #{body}
-      <p class="overview-panel-note">Sample of #{format_grouped(count(summary, :sampled_records))} records.</p>
+      <p class="overview-panel-note">The overview reads a small sample across shards; open Workflows for counts over a wider scan.</p>
     </section>
     """
   end

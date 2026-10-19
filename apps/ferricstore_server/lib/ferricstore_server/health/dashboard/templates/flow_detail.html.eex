@@ -4,12 +4,13 @@
 <div class="layout">
 <%= render_sidebar_static("flow_detail") %>
 <main class="main-content" id="dashboard-main" tabindex="-1">
-<%= render_page_header("flow_detail", title: "Run detail") %>
+<%= render_page_header("flow_detail", title: data.id) %>
 <div class="content">
 <%= render_flow_detail_flash(data) %>
 <%= render_live_component("flow_detail", render_flow_detail(data)) %>
 <%= if is_map(data.record) do %>
 <section id="workflow-timeline" class="workflow-detail-section" aria-label="Execution history">
+<%= render_live_component("flow_lifecycle", render_flow_lifecycle(data)) %>
 <%= render_live_component("flow_timeline_chart", render_flow_timeline_chart(data.history)) %>
 <%= render_live_component("flow_history", render_flow_history_timeline(data.history, Map.get(data, :history_status, :ok), Map.get(data, :history_page))) %>
 </section>

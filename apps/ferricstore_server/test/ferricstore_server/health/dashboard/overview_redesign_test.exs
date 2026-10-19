@@ -101,7 +101,8 @@ defmodule FerricstoreServer.Health.Dashboard.OverviewRedesignTest do
 
     assert html =~ ~s(href="/dashboard/flow")
     assert html =~ ">102<"
-    assert html =~ "active runs across 8 types"
+    assert html =~ "active of 102 sampled runs, across 8 types"
+    assert html =~ "open Workflows for counts over a wider scan"
     assert html =~ ~s(style="flex: 70")
     assert html =~ ~s(style="flex: 31")
     refute html =~ ~s(style="flex: 0")

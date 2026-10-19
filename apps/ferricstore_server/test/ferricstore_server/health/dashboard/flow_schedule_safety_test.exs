@@ -16,7 +16,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowScheduleSafetyTest do
         %{state: "active", kind: :interval, q: "day", limit: 25}
       )
 
-    assert html =~ "Confirm Fire"
+    assert html =~ "Confirm Run now"
     assert html =~ "Confirm Delete"
     assert html =~ ~s(name="confirm_action" value="true")
     assert html =~ ~s(name="expected_state" value="active")

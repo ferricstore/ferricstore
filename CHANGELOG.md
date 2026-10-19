@@ -27,6 +27,14 @@ All notable changes to FerricStore will be documented here.
   behind are named), summary cards and a tile per shard, with the full table
   folded away. Doctor leads with one status line and named check rows, and
   folds the CLI reference away.
+- Redesign the dashboard's workflow detail, Schedules and Keys pages. A run's
+  page is titled by its ID and shows a Lifecycle strip of the states it
+  entered, each linking to its journal entry, with an expired lease as the
+  current step. Schedules read as cadence and relative next and last runs,
+  with Run now and Pause on the row and Edit and Delete under More. The two
+  key searches are one row each, with a prompt instead of an empty table.
+- Say that the overview's workflow numbers and the Failures badge come from
+  the overview's small sample.
 
 ## 0.12.6 - 2026-10-19
 

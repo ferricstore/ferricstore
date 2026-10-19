@@ -325,6 +325,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
           "flow_detail_metadata" => "",
           "flow_debug" => "",
           "flow_history" => "",
+          "flow_lifecycle" => "",
           "flow_timeline_chart" => ""
         })
 
@@ -344,6 +345,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
               data.history_status,
               Map.get(data, :history_page)
             ),
+          "flow_lifecycle" => render_flow_lifecycle(data),
           "flow_timeline_chart" => render_flow_timeline_chart(data.history)
         })
 
