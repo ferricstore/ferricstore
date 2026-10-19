@@ -467,13 +467,16 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
       end)
 
     """
-    <h2 class="section-title">Dashboard Route Requirements</h2>
+    <details class="dashboard-disclosure" id="security-route-requirements"><summary>Dashboard route requirements</summary>
+    <div class="dashboard-disclosure-body">
     #{table_scroll("Dashboard route requirements", """
     <table>
       <thead><tr><th>Page</th><th>Method</th><th>Path</th><th>Required ACL Command</th><th>Key Scope</th></tr></thead>
       <tbody>#{rows}</tbody>
     </table>
     """)}
+    </div>
+    </details>
     """
   end
 

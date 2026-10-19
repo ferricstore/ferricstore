@@ -174,6 +174,13 @@ defmodule FerricstoreServer.Health.Dashboard.AdminRedesignTest do
     assert html =~ "unsupported: namespace_management, quota_management"
   end
 
+  test "the route requirement table is reference material and folds away" do
+    html = Security.render_dashboard_route_requirements(%{})
+
+    assert html =~
+             ~s(<details class="dashboard-disclosure" id="security-route-requirements"><summary>Dashboard route requirements</summary>)
+  end
+
   defp position(html, needle) do
     {index, _length} = :binary.match(html, needle)
     index
