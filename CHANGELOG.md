@@ -24,11 +24,13 @@ All notable changes to FerricStore will be documented here.
   ZPOPMIN returned 2 distinct members) and concurrent LMOVE lost elements
   (40 moves left 1 in the destination). On the instance they now use the
   state machine's atomic pop and the router's single-entry list move.
-- Serialize HSETNX, and ZADD with NX, XX, GT or LT, per key through the TCP and
+- Serialize HSETNX, HGETDEL, SMOVE, ZADD with NX, XX, GT or LT, and
+  EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT with a flag, per key through the TCP and
   HTTP gateways. They read the key and decided the write in the client's
-  process, so every concurrent HSETNX or ZADD NX on one key reported a win
-  (20 of 20) and concurrent ZADD GT could leave a lower score; they now run
-  under the node's key latch, as the TDIGEST read-modify-writes already do.
+  process, so every concurrent HSETNX, ZADD NX, SMOVE or EXPIRE NX on one key
+  reported a win (20 of 20), HGETDEL handed one field to every client, and
+  concurrent ZADD GT could leave a lower score; they now run under the node's
+  key latch, as the TDIGEST read-modify-writes already do.
 - Write PFADD, SPOP, ZPOPMIN and ZPOPMAX for a custom embedded instance to that
   instance. `Router.pfadd/3`, `spop/3`, `zpopmin/3` and `zpopmax/3` sent every
   instance's command down the default instance's forced quorum path, so they
