@@ -101,7 +101,10 @@ defmodule FerricstoreServer.Health.Dashboard.QueryTriageThirdReviewTest do
 
     assert filters.sort == "distribution"
     assert FlowFilters.render_flow_type_filter(%{filters: filters}) =~ "Attention first"
-    assert Records.render_flow_workers([], %{sort: "distribution"}) =~ "Distribution"
+
+    assert Records.render_flow_workers([%{worker: "w", running: 1, expired: 0}], %{
+             sort: "distribution"
+           }) =~ ~s(<option value="distribution" selected>Distribution</option>)
   end
 
   test "States puts exception columns before routine counts" do

@@ -310,40 +310,86 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
 
   def render_flow_custom_states(_states), do: ""
 
-  def render_flow_workers(workers, filters \\ %{}) do
+  def render_flow_workers_status([], _filters),
+    do: PageStatus.render("workers", :idle, "No leases held in this sample")
+
+  def render_flow_workers_status(workers, filters) do
+    leases = sum_states(workers, :running)
+    expired = sum_states(workers, :expired)
+    with_expired = Enum.count(workers, &((&1.expired || 0) > 0))
+
+    if expired > 0 do
+      failures = FlowOverview.flow_failure_investigation_path(%{filters: filters})
+
+      PageStatus.render(
+        "workers",
+        :warning,
+        "#{format_grouped(expired)} expired #{plural(expired, "lease", "leases")}",
+        [
+          "on #{format_grouped(with_expired)} of #{format_grouped(length(workers))} workers",
+          "#{format_grouped(leases)} leases held"
+        ],
+        ~s(<a href="#{escape_attr(failures)}">Open Failures</a>)
+      )
+    else
+      PageStatus.render(
+        "workers",
+        :healthy,
+        "#{format_grouped(length(workers))} #{plural(length(workers), "worker", "workers")} holding #{format_grouped(leases)} #{plural(leases, "lease", "leases")}",
+        ["No expired leases"]
+      )
+    end
+  end
+
+  defp plural(1, one, _many), do: one
+  defp plural(_count, _one, many), do: many
+
+  def render_flow_workers(workers, filters \\ %{})
+
+  def render_flow_workers([], _filters),
+    do: """
+    <h2 class="section-title">Workers</h2>
+    <p class="section-empty">No worker holds a lease in this sample.</p>
+    """
+
+  def render_flow_workers(workers, filters) do
+    widest = workers |> Enum.map(&(&1.running || 0)) |> Enum.max(fn -> 0 end) |> max(1)
+
     rows =
-      case workers do
-        [] ->
-          ~s(<tr><td colspan="4" class="c-muted">No running Flow leases discovered in sample</td></tr>)
+      Enum.map_join(workers, "\n", fn worker ->
+        running = worker.running || 0
+        expired = worker.expired || 0
 
-        _ ->
-          Enum.map_join(workers, "\n", fn worker ->
-            expired_class = if worker.expired > 0, do: "c-red", else: ""
+        query =
+          filters
+          |> Map.take([:type, :partition_key, :sort])
+          |> Map.put(:worker, worker.worker)
+          |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
+          |> URI.encode_query()
 
-            query =
-              filters
-              |> Map.take([:type, :partition_key, :sort])
-              |> Map.put(:worker, worker.worker)
-              |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
-              |> URI.encode_query()
+        href = "/dashboard/flow/workers?" <> query <> "#flow-running-records"
 
-            href = "/dashboard/flow/workers?" <> query <> "#flow-running-records"
+        status =
+          if expired > 0,
+            do: ~s(<span class="badge badge-warning">#{format_grouped(expired)} expired</span>),
+            else: ~s(<span class="badge badge-ok">Current</span>)
 
-            """
-            <tr>
-              <td class="mono"><a class="flow-link" href="#{escape_attr(href)}" title="Inspect this worker's sampled running records">#{escape(worker.worker)}</a></td>
-              <td><a class="flow-link" href="#{escape_attr(href)}">#{format_number(worker.running)}</a></td>
-              <td class="#{expired_class}">#{format_number(worker.expired)}</td>
-              <td>#{format_duration_ms(worker.oldest_lease_ms)}</td>
-            </tr>
-            """
-          end)
-      end
+        oldest = if expired > 0, do: format_duration_ms(worker.oldest_lease_ms), else: "-"
+
+        """
+        <tr>
+          <td class="mono"><a class="flow-link" href="#{escape_attr(href)}" title="Inspect this worker's sampled running records">#{escape(worker.worker)}</a></td>
+          <td class="worker-leases"><a class="flow-link" href="#{escape_attr(href)}">#{format_number(running)}</a><span class="worker-lease-bar" style="width: #{percent(running, widest)}%"><span class="is-expired" style="width: #{percent(expired, max(running, 1))}%"></span></span></td>
+          <td>#{status}</td>
+          <td>#{oldest}</td>
+        </tr>
+        """
+      end)
 
     table = """
-    <table>
+    <table class="flow-workers-table">
       <thead>
-        <tr><th>Worker</th><th>Running</th><th>Expired</th><th>Oldest Expired By</th></tr>
+        <tr><th>Worker</th><th>Leases</th><th>Status</th><th>Oldest expired by</th></tr>
       </thead>
       <tbody>
         #{rows}
@@ -352,11 +398,15 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     """
 
     """
-    <h2 class="section-title">Workers / Leases</h2>
-    #{render_worker_sort(filters)}
+    <div class="section-head"><h2 class="section-title">Workers <span class="badge badge-idle">#{format_grouped(length(workers))}</span></h2>#{render_worker_sort(filters)}</div>
     #{accessible_table("Workflow workers and leases", table)}
     """
   end
+
+  defp percent(part, whole) when is_integer(part) and is_integer(whole) and whole > 0,
+    do: min(100, round(part * 100 / whole))
+
+  defp percent(_part, _whole), do: 0
 
   defp render_worker_sort(filters) do
     scope =
@@ -367,15 +417,18 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
         ~s(<input type="hidden" name="#{key}" value="#{escape_attr(value)}">)
       end)
 
-    ~s(<form class="flow-filter-form" action="/dashboard/flow/workers" method="get">#{scope}#{render_flow_summary_sort(Map.get(filters, :sort, "attention"), "flow-worker-sort")}<button class="flow-search-button" type="submit">Apply order</button></form>)
+    ~s(<form class="section-head-form" action="/dashboard/flow/workers" method="get">#{scope}#{render_flow_summary_sort(Map.get(filters, :sort, "attention"), "flow-worker-sort")}<button class="flow-search-button" type="submit">Apply order</button></form>)
   end
+
+  def render_flow_running_records([], _total_sampled, _sample_limit),
+    do: """
+    <h2 class="section-title" id="flow-running-records">Leases</h2>
+    <p class="section-empty">No run is leased in this sample.</p>
+    """
 
   def render_flow_running_records(records, total_sampled, sample_limit) do
     rows =
       case records do
-        [] ->
-          ~s(<tr><td colspan="4" class="c-muted">No running Flow records discovered in sample</td></tr>)
-
         _ ->
           Enum.map_join(records, "\n", fn record ->
             expired_class = if flow_expired_lease?(record), do: "c-red", else: ""
@@ -420,7 +473,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     """
 
     """
-    <h2 class="section-title" id="flow-running-records">Running Records <span class="badge badge-idle">#{sampled_scan_label(total_sampled, sample_limit)}</span></h2>
+    <h2 class="section-title" id="flow-running-records">Leases <span class="badge badge-idle">#{format_grouped(length(records))}</span></h2>
+    <p class="flow-section-note">#{sampled_scan_label(total_sampled, sample_limit)}</p>
     #{accessible_table("Running workflow records", table)}
     """
   end

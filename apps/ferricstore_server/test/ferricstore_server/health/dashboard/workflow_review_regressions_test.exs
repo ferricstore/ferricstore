@@ -98,7 +98,7 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowReviewRegressionsTest do
     assert key.(render.(nil)) == key.(render.(""))
     assert render.(nil) =~ "<dt>Lease token</dt><dd>-</dd>"
     assert render.(nil) =~ "<dt>Fencing token</dt><dd>-</dd>"
-    assert Records.render_flow_running_records([], 0, 400) =~ ~s(colspan="4")
+    assert Records.render_flow_running_records([], 0, 400) =~ ~s(class="section-empty")
   end
 
   test "Workers leads with workers and leased records while secondary charts stay disclosed" do
@@ -118,7 +118,10 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowReviewRegressionsTest do
     assert position(html, ~s(data-live-component="flow_running_records")) <
              position(html, ~s(id="flow-worker-breakdown"))
 
-    for component <- ~w(flow_workers flow_running_records flow_workers_chart flow_fifo_lanes) do
+    assert position(html, ~s(data-live-component="flow_workers_status")) <
+             position(html, ~s(data-live-component="flow_workers"))
+
+    for component <- ~w(flow_workers_status flow_workers flow_running_records flow_fifo_lanes) do
       assert length(Regex.scan(Regex.compile!(~s(data-live-component="#{component}")), html)) == 1
     end
   end

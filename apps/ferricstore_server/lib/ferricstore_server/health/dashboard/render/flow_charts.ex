@@ -104,32 +104,6 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
     """
   end
 
-  def render_flow_workers_chart(workers) do
-    rows =
-      workers
-      |> Enum.take(20)
-      |> Enum.map(fn worker ->
-        %{
-          label: worker.worker,
-          values: [
-            {"Running", worker.running, "bar-green"},
-            {"Expired", worker.expired, "bar-red"}
-          ]
-        }
-      end)
-
-    """
-    <h2 class="section-title">Worker Charts</h2>
-    #{chart_coverage(length(rows), length(workers))}
-    <div class="chart-grid">
-      <div class="chart-card">
-        <div class="chart-title">Lease health by worker</div>
-        #{render_bar_chart(rows)}
-      </div>
-    </div>
-    """
-  end
-
   defp chart_coverage(shown, total) when shown < total do
     ~s(<p class="flow-section-note">#{shown} of #{total} groups in table order; #{total - shown} omitted. The corresponding table retains the full loaded sample.</p>)
   end

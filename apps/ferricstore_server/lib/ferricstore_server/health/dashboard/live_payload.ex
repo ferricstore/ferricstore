@@ -355,7 +355,8 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
 
   defp live_flow_workers_payload(data) do
     live_component_payload(%{
-      "flow_workers_chart" => render_flow_workers_chart(data.workers),
+      "flow_workers_status" =>
+        render_flow_workers_status(data.workers, Map.get(data, :filters, %{})),
       "flow_workers" => render_flow_workers(data.workers, Map.get(data, :filters, %{})),
       "flow_fifo_lanes" =>
         render_flow_fifo_lanes(

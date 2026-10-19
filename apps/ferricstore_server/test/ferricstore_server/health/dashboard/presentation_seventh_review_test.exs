@@ -40,16 +40,6 @@ defmodule FerricstoreServer.Health.Dashboard.PresentationSeventhReviewTest do
     refute html =~ "orders:step-17"
   end
 
-  test "worker charts disclose their independent cap without expanding work" do
-    workers = for n <- 1..23, do: %{worker: "worker-#{n}", running: n, expired: 0}
-    html = FlowCharts.render_flow_workers_chart(workers)
-    assert html =~ "20 of 23"
-    assert html =~ "table order"
-    assert html =~ "3 omitted"
-    refute html =~ ">worker-21<"
-    refute FlowCharts.render_flow_workers_chart(Enum.take(workers, 2)) =~ "omitted"
-  end
-
   test "raw reference describes supported bounded syntax and all examples prepare" do
     html = FlowQueryHelp.render_reference()
     assert html =~ "FQL1 reference"

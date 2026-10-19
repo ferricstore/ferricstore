@@ -258,6 +258,17 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .runs-split .overview-state-bar { margin-top: 0; }
       .overview-state.is-failed { background: var(--danger); }
       .flow-state-attention .badge + .badge { margin-left: 4px; }
+      .section-head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 8px 16px; margin-bottom: 12px; }
+      .section-head .section-title { margin-bottom: 0; }
+      .section-head-form { display: flex; align-items: flex-end; gap: 8px; }
+      .section-head-form .flow-filter-field { display: flex; align-items: center; gap: 8px; margin: 0; }
+      .section-head-form .flow-filter-field span { color: var(--text-muted); font-size: 0.8125rem; }
+      .section-head-form .flow-search-input { width: auto; min-width: 160px; }
+      .flow-workers-table th:nth-child(2) { width: 34%; }
+      .worker-leases { display: flex; align-items: center; gap: 10px; }
+      .worker-leases .flow-link { min-width: 2ch; text-align: right; }
+      .worker-lease-bar { display: block; height: 6px; border-radius: 999px; background: var(--accent); overflow: hidden; }
+      .worker-lease-bar .is-expired { display: block; height: 100%; background: var(--warn); }
       .section-empty { margin: 4px 0 24px; padding: 16px 18px; border: 1px dashed var(--line-strong); border-radius: 12px; color: var(--text-muted); font-size: 0.875rem; }
       .flow-due-cell .flow-due-when { display: block; color: var(--text-strong); }
       .flow-state-due { display: block; margin-top: 2px; color: var(--text-muted); font-size: 0.75rem; }

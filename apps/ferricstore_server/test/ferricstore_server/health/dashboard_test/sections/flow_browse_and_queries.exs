@@ -508,8 +508,8 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           html = Dashboard.render_flow_workers_page(data)
 
           assert String.contains?(html, "Flow Workers")
-          assert String.contains?(html, "Running")
-          assert String.contains?(html, "Expired")
+          assert String.contains?(html, ~s(class="page-status workers-status))
+          assert String.contains?(html, ~s(id="flow-running-records">Leases))
         end
       end
 
