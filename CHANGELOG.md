@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Keep `FerricStore.flow_purge_orphans/1` from treating a Flow as orphaned when
+  the read of its projection frame timed out or ran over its byte budget. Any
+  failed read counted as a lost frame, so a purge on a busy node could delete
+  a Flow that still reads back; the policy catalog backfill already told
+  these apart.
 - Fix BITCOUNT and BITPOS ranges through the TCP and HTTP gateways. The native
   command parser built a BITCOUNT range shape no handler accepted, so
   `BITCOUNT key 0 -1` answered "ERR unsupported command AST", the BIT form and

@@ -142,6 +142,16 @@ defmodule Ferricstore.Flow.OrphanPurgeTest do
     assert :not_found == LMDB.get(path, flow.state_key)
   end
 
+  test "a projection-frame read that timed out or hit its budget does not mark the record lost" do
+    # Only a read that found the frame unreadable shows the record is gone;
+    # purging on a timeout would delete a Flow that still reads back.
+    refute OrphanPurge.__record_lost_for_test__({:error, :query_deadline_exceeded})
+    refute OrphanPurge.__record_lost_for_test__({:error, :query_hydration_batch_too_large})
+    refute OrphanPurge.__record_lost_for_test__({:ok, [%{}], true})
+    assert OrphanPurge.__record_lost_for_test__({:error, :query_storage_unavailable})
+    assert OrphanPurge.__record_lost_for_test__({:error, :query_storage_inconsistent})
+  end
+
   test "the purge command leaves a flow whose retention guard changed", %{ctx: ctx} do
     orphan = orphaned_flow!(ctx, "guard")
     assert {:ok, %{active: 3}} = FerricStore.raise_cluster_feature_level(3)
