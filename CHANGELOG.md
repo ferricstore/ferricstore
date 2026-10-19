@@ -19,6 +19,11 @@ All notable changes to FerricStore will be documented here.
   until the node shut down, and replaying the entry crashed it again. The
   state machine now also returns an error for a bad SETRANGE or SETBIT offset
   instead of raising.
+- Reject a TTL in the embedded `FerricStore.setex/3` and `FerricStore.psetex/3`
+  that puts the expiry past the int64 range, with "ERR value is not an integer
+  or out of range", as the SETEX and PSETEX commands and `FerricStore.pexpire/2`
+  already do. They stored the expiry unbounded, so TTL then reported values no
+  int64 client can read.
 
 - Redesign the dashboard shell. The sidebar has 18 destinations in
   always-open sections instead of about 30 links in collapsible groups; lower-use

@@ -377,6 +377,15 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
       assert {:ok, ms} = FerricStore.ttl("sex:key")
       assert is_integer(ms) and ms > 0 and ms <= 60_000
     end
+
+    test "rejects a TTL that puts the expiry past int64, like SETEX" do
+      max_int64 = 9_223_372_036_854_775_807
+
+      assert {:error, "ERR value is not an integer or out of range"} =
+               FerricStore.setex("sex:huge", max_int64, "value")
+
+      assert {:ok, nil} = FerricStore.get("sex:huge")
+    end
   end
 
   describe "psetex/3" do
@@ -385,6 +394,15 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
       assert {:ok, "value"} = FerricStore.get("psx:key")
       assert {:ok, ms} = FerricStore.ttl("psx:key")
       assert is_integer(ms) and ms > 0 and ms <= 60_000
+    end
+
+    test "rejects a TTL that puts the expiry past int64, like PSETEX" do
+      max_int64 = 9_223_372_036_854_775_807
+
+      assert {:error, "ERR value is not an integer or out of range"} =
+               FerricStore.psetex("psx:huge", max_int64, "value")
+
+      assert {:ok, nil} = FerricStore.get("psx:huge")
     end
   end
 

@@ -2,6 +2,7 @@ defmodule Ferricstore.EmbeddedStringValidation do
   @moduledoc false
 
   alias Ferricstore.CommandTime
+  alias Ferricstore.Commands.ExpiryTime
   alias Ferricstore.Commands.Strings.SetOptions
 
   @set_options_default %{
@@ -49,7 +50,11 @@ defmodule Ferricstore.EmbeddedStringValidation do
   def relative_expiry(value, multiplier, command)
       when is_integer(multiplier) and multiplier > 0 and is_binary(command) do
     with :ok <- validate_positive_expiry(value, command) do
-      {:ok, CommandTime.now_ms() + value * multiplier}
+      # The same int64 bound as the SETEX and PSETEX commands.
+      case ExpiryTime.relative(value, multiplier) do
+        {:ok, expire_at_ms} -> {:ok, expire_at_ms}
+        :error -> {:error, "ERR value is not an integer or out of range"}
+      end
     end
   end
 
