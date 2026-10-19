@@ -335,6 +335,62 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushTest do
     assert Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(data_dir, 0) == 1
   end
 
+  # Segment-projection frame numbers are log positions that every projection
+  # rewrite renumbers, and a rewrite keeps only keydir rows. A Flow whose record
+  # sits there must stay in the keydir, or the next rewrite drops its record.
+  test "hibernation keeps a hot source that sits on the segment projection" do
+    state_key = "flow:{flow:hibernate-projection}:state:a"
+    encoded = "authoritative-state-record"
+    index = 12
+    ets = :ets.new(:after_flush_hibernation_projection, [:set])
+    row = {state_key, nil, 0, 0, {:waraft_projection, index}, 40, byte_size(encoded)}
+    true = :ets.insert(ets, row)
+
+    locator =
+      Locator.new!(
+        flow_id: "hibernate-projection",
+        kind: :state,
+        version: 1,
+        raft_index: index,
+        file_id: {:waraft_projection, index},
+        offset: 40,
+        value_size: byte_size(encoded),
+        expire_at_ms: 0
+      )
+
+    assert {:ok, false} =
+             AfterFlush.hibernate_delete_hot_state_key("/data", 0, ets, state_key, locator)
+
+    assert [^row] = :ets.lookup(ets, state_key)
+  end
+
+  test "terminal prune keeps a hot source that sits on the segment projection" do
+    ets = :ets.new(:after_flush_terminal_projection, [:set])
+    state_key = "flow:{flow:terminal-projection}:state:a"
+
+    encoded =
+      Ferricstore.Flow.encode_record(%{
+        id: "flow-1",
+        type: "type",
+        state: "completed",
+        version: 1,
+        attempts: 0,
+        fencing_token: 0,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        next_run_at_ms: 0,
+        priority: 0,
+        partition_key: nil,
+        root_flow_id: "flow-1"
+      })
+
+    row = {state_key, encoded, 0, 0, {:waraft_projection, 12}, 40, byte_size(encoded)}
+    true = :ets.insert(ets, row)
+
+    assert :stale = AfterFlush.prune_terminal_state_key("/data", 0, ets, state_key, 1)
+    assert [^row] = :ets.lookup(ets, state_key)
+  end
+
   test "deferred cleanup delay is bounded by the runtime timer limit" do
     assert AfterFlush.normalize_delay_ms(9_999_999_999) == 4_294_967_295
     assert AfterFlush.normalize_delay_ms(250) == 250

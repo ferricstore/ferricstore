@@ -32,6 +32,18 @@ defmodule Ferricstore.Store.Keydir do
     ArgumentError -> false
   end
 
+  @spec outlives_keydir?(entry()) :: boolean()
+  # Whether the value a row points at stays at that address once the row leaves
+  # the keydir and only LMDB points at it. A segment-projection frame number is a
+  # position in that log, which every rewrite renumbers, and a rewrite keeps only
+  # keydir rows, so such a row must stay in the keydir.
+  def outlives_keydir?(
+        {_key, _value, _expire_at_ms, _lfu, {:waraft_projection, _index}, _offset, _value_size}
+      ),
+      do: false
+
+  def outlives_keydir?(_row), do: true
+
   @spec replace_exact(:ets.tid() | atom(), entry(), entry()) :: boolean()
   def replace_exact(
         table,

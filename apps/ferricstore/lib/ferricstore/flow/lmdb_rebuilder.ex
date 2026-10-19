@@ -2010,6 +2010,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     incarnation = Map.get(record, :incarnation)
 
     with [row] <- :ets.lookup(keydir, key),
+         true <- Ferricstore.Store.Keydir.outlives_keydir?(row),
          {:ok, current} <-
            prune_terminal_keydir_record(row, shard_path, shard_index, key, instance_ctx),
          ^version <- Map.get(current, :version),
