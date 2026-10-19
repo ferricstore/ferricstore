@@ -90,6 +90,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
 
       # Atomic SETRANGE: reads current value, pads with zero bytes if needed,
       # replaces bytes at offset, writes back. Preserves expire_at_ms.
+      # A bad offset is an error, not a raise: a raise here crashes storage,
+      # and again on every replay of the entry.
+      defp do_setrange(_state, _key, offset, _value) when not is_integer(offset) or offset < 0,
+        do: {:error, "ERR offset is out of range"}
+
       defp do_setrange(state, key, offset, value) do
         with :ok <- ensure_string_key(state, key) do
           {old_val, expire_at_ms} =
@@ -116,6 +121,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # Atomic SETBIT: read bitmap, extend with zeros to include byte_index if
       # needed, flip the single bit, write back. Preserves expire_at_ms.
       # Returns the OLD bit at that offset (Redis semantics).
+      defp do_setbit(_state, _key, offset, _bit_val) when not is_integer(offset) or offset < 0,
+        do: {:error, "ERR bit offset is not an integer or out of range"}
+
       defp do_setbit(state, key, offset, bit_val) do
         with :ok <- ensure_string_key(state, key) do
           {old_val, expire_at_ms} =

@@ -434,6 +434,15 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
       assert {:ok, "hash"} = FerricStore.type("sr:hash")
       assert {:ok, "old"} = FerricStore.hget("sr:hash", "field")
     end
+
+    test "rejects an invalid offset and the shard keeps applying writes" do
+      assert :ok = FerricStore.set("sr:bad", "Hello")
+      assert {:error, "ERR offset is out of range"} = FerricStore.setrange("sr:bad", -1, "x")
+      assert {:error, "ERR offset is out of range"} = FerricStore.setrange("sr:bad", 1.5, "x")
+      assert {:ok, "Hello"} = FerricStore.get("sr:bad")
+      assert {:ok, 6} = FerricStore.setrange("sr:bad", 5, "!")
+      assert {:ok, "Hello!"} = FerricStore.get("sr:bad")
+    end
   end
 
   # ===========================================================================

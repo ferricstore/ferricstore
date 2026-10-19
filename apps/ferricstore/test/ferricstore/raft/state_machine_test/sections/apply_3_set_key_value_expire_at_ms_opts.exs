@@ -979,6 +979,25 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           assert [] == :ets.lookup(ets, key)
         end
 
+        test "SETRANGE and SETBIT reject an invalid offset instead of raising in apply", %{
+          state: state,
+          ets: ets
+        } do
+          key = "invalid_offset_apply"
+
+          for {command, error} <- [
+                {{:setrange, key, -1, "x"}, "ERR offset is out of range"},
+                {{:setrange, key, 1.5, "x"}, "ERR offset is out of range"},
+                {{:setbit, key, -1, 1}, "ERR bit offset is not an integer or out of range"},
+                {{:setbit, key, 1.5, 1}, "ERR bit offset is not an integer or out of range"}
+              ] do
+            {_new_state, result} = StateMachine.apply(%{}, command, state)
+            assert {:error, ^error} = result, "#{inspect(command)} returned #{inspect(result)}"
+          end
+
+          assert [] == :ets.lookup(ets, key)
+        end
+
         test "crafted direct writes cannot bypass the replicated size limit", %{
           state: state,
           ets: ets

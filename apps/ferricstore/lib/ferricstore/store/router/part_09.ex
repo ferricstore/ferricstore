@@ -730,6 +730,9 @@ defmodule Ferricstore.Store.Router.Part09 do
       """
       @spec setrange(FerricStore.Instance.t(), binary(), non_neg_integer(), binary()) ::
               {:ok, non_neg_integer()} | {:error, binary()}
+      def setrange(_ctx, _key, offset, _value) when not is_integer(offset) or offset < 0,
+        do: {:error, "ERR offset is out of range"}
+
       def setrange(ctx, key, offset, value) do
         minimum_size =
           Ferricstore.Raft.ApplyLimits.setrange_size(0, offset, byte_size(value))

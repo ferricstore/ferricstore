@@ -2072,26 +2072,30 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           value
         end
 
-        local_setrange = fn key, offset, value ->
-          {old, expire_at_ms} =
-            case local_get_meta.(key) do
-              nil -> {"", 0}
-              {v, exp} when is_integer(v) -> {Integer.to_string(v), exp}
-              {v, exp} when is_float(v) -> {Float.to_string(v), exp}
-              {v, exp} -> {v, exp}
-            end
+        local_setrange = fn
+          _key, offset, _value when not is_integer(offset) or offset < 0 ->
+            {:error, "ERR offset is out of range"}
 
-          new_size =
-            Ferricstore.Raft.ApplyLimits.setrange_size(
-              byte_size(old),
-              offset,
-              byte_size(value)
-            )
+          key, offset, value ->
+            {old, expire_at_ms} =
+              case local_get_meta.(key) do
+                nil -> {"", 0}
+                {v, exp} when is_integer(v) -> {Integer.to_string(v), exp}
+                {v, exp} when is_float(v) -> {Float.to_string(v), exp}
+                {v, exp} -> {v, exp}
+              end
 
-          :ok = validate_value_size!.(new_size)
-          new_val = sm_apply_setrange(old, offset, value)
-          local_put.(key, new_val, expire_at_ms)
-          {:ok, new_size}
+            new_size =
+              Ferricstore.Raft.ApplyLimits.setrange_size(
+                byte_size(old),
+                offset,
+                byte_size(value)
+              )
+
+            :ok = validate_value_size!.(new_size)
+            new_val = sm_apply_setrange(old, offset, value)
+            local_put.(key, new_val, expire_at_ms)
+            {:ok, new_size}
         end
 
         local_cas = fn key, expected, new_value, ttl_ms ->

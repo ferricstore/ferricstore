@@ -12,6 +12,13 @@ All notable changes to FerricStore will be documented here.
   IDs were compared as text, so with ten or more events in one millisecond
   the journal listed them out of order with wrong "from" states, and the
   Lifecycle strip could repeat a state.
+- Reject a negative or non-integer offset in the embedded `FerricStore.setrange/3`
+  with "ERR offset is out of range". The call skipped the offset check that
+  the SETRANGE command has, so the bad offset reached the replicated log and
+  raised while the shard applied it; the shard's storage process crashed
+  until the node shut down, and replaying the entry crashed it again. The
+  state machine now also returns an error for a bad SETRANGE or SETBIT offset
+  instead of raising.
 
 - Redesign the dashboard shell. The sidebar has 18 destinations in
   always-open sections instead of about 30 links in collapsible groups; lower-use
