@@ -63,6 +63,12 @@ All notable changes to FerricStore will be documented here.
   read shares are drawn as bars. When nothing has merged, the per-shard
   merge table folds away, as does the command reference. Empty bounded
   tables are one-line prompts, and their row filter appears with their rows.
+- Redesign the Cluster and Admin pages. Clients warns about blocked
+  connections, Slow log names its worst command, and Security says whether
+  access is protected, with the accounts list first, account creation
+  folded below it and the route reference folded away. Config states how
+  many parameters there are and trims its table to four columns with a row
+  filter, and Capabilities names what is unsupported.
 
 ## 0.12.6 - 2026-10-19
 
