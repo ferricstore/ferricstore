@@ -1399,7 +1399,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
     {nil, [{"overview", "/dashboard", "Overview", []}]},
     {"Workflows",
      [
-       {"flow", "/dashboard/flow", "Overview", []},
+       {"flow", "/dashboard/flow", "Summary", []},
        {"flow_states", "/dashboard/flow/states", "Runs",
         [
           {"flow_states", "/dashboard/flow/states", "By state"},

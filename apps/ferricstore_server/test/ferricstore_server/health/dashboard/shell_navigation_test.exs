@@ -43,7 +43,7 @@ defmodule FerricstoreServer.Health.Dashboard.ShellNavigationTest do
 
     assert links(nav) == [
              {"/dashboard", "Overview"},
-             {"/dashboard/flow", "Overview"},
+             {"/dashboard/flow", "Summary"},
              {"/dashboard/flow/states", "Runs"},
              {"/dashboard/flow/failures", "Failures"},
              {"/dashboard/flow/schedules", "Schedules"},

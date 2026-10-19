@@ -213,7 +213,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.CollectionAndOverview 
                    ~s(<span class="nav-section-label" id="nav-section-workflows">Workflows</span>)
 
           assert html =~
-                   ~r/href="\/dashboard\/flow"[^>]*><span class="nav-label">Overview<\/span>/
+                   ~r/href="\/dashboard\/flow"[^>]*><span class="nav-label">Summary<\/span>/
 
           workflows_position =
             html
