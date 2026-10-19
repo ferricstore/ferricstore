@@ -522,6 +522,13 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   defp live_valid_flow_states_payload(data) do
     live_component_payload(%{
       "flow_states_sources" => render_flow_states_sources(data),
+      "flow_states_overview" =>
+        render_flow_states_overview(
+          data.states,
+          data.filtered_sampled,
+          Map.get(data, :source_status, :ok),
+          data.filters
+        ),
       "flow_states_chart" =>
         if(Map.get(data, :source_status) == :unavailable,
           do: "",

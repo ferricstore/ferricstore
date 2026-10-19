@@ -6,6 +6,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
   import FerricstoreServer.Health.Dashboard.Render.FlowHistory
   import FerricstoreServer.Health.Dashboard.Render.FlowFilters
 
+  alias FerricstoreServer.Health.Dashboard.Render.{FlowOverview, PageStatus}
+
   @flow_terminal_states ~w(completed failed cancelled)
 
   def render_flow_states_table(
@@ -24,14 +26,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
               do: "No Flow states discovered for this type filter",
               else: "State results could not be established from the available sources."
 
-          ~s(<tr><td colspan="12" class="c-muted">#{message}</td></tr>)
+          ~s(<tr><td colspan="6" class="c-muted">#{message}</td></tr>)
 
         _ ->
           Enum.map_join(states, "\n", fn state ->
-            expired_class = if state.expired_leases > 0, do: "c-red", else: ""
-            retry_class = if Map.get(state, :retrying, 0) > 0, do: "c-yellow", else: ""
-            failed_class = if Map.get(state, :failed, 0) > 0, do: "c-red", else: ""
-            maxed_class = if Map.get(state, :max_attempts_reached, 0) > 0, do: "c-red", else: ""
             href = state_records_path(filters, state.type, state.state)
             type_href = state_records_path(filters, state.type, nil)
 
@@ -39,15 +37,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
             <tr>
               <td class="mono"><a class="flow-link" href="#{escape_attr(type_href)}">#{escape(state.type)}</a></td>
               <td class="#{flow_state_class(state.state)}"><a class="flow-link" href="#{escape_attr(href)}">#{escape(state.state)}</a></td>
-              <td class="#{failed_class}">#{format_number(Map.get(state, :failed, 0))}</td>
-              <td class="#{expired_class}">#{format_number(state.expired_leases)}</td>
-              <td class="#{maxed_class}">#{format_number(Map.get(state, :max_attempts_reached, 0))}</td>
-              <td>#{flow_state_operational_hint(state)}</td>
+              <td class="flow-state-attention">#{render_flow_state_attention(state)}</td>
               <td>#{format_duration_ms(state.oldest_due_ms)}</td>
-              <td class="#{retry_class}">#{format_number(Map.get(state, :retrying, 0))}</td>
-              <td><a class="flow-link" href="#{escape_attr(href)}" aria-label="Inspect #{escape_attr(state.type)} #{escape_attr(state.state)} records">#{format_number(state.count)}</a></td>
-              <td>#{format_number(state.due_now)}</td>
-              <td>#{format_number(state.running)}</td>
+              <td class="flow-state-runs"><a class="flow-link" href="#{escape_attr(href)}" aria-label="Inspect #{escape_attr(state.type)} #{escape_attr(state.state)} records">#{format_number(state.count)}</a>#{render_flow_state_due(state)}</td>
               <td>#{render_flow_state_mode_badge(Map.get(state, :mode, :parallel))}</td>
             </tr>
             """
@@ -74,17 +66,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
       <thead>
         <tr>
           <th>Type</th>
-          <th>Stored state</th>
-          <th>Failed #{info_icon("Terminal failed flows. They are not claimable unless user logic rewinds or creates new work.")}</th>
-          <th>Expired #{info_icon("Running flows whose lease deadline passed. Recovery eligibility depends on state policy and claim limits; expiry is not a terminal failure.")}</th>
-          <th>Maxed #{info_icon("Flows whose attempts reached max_attempts/max_retries in the sampled records.")}</th>
-          <th>Hint</th>
-          <th>Oldest Due</th>
-          <th>Retrying #{info_icon("Non-terminal flows with attempts > 0. They were retried and may be waiting for their next run time.")}</th>
-          <th>Sample Count</th>
-          <th>Due Now #{info_icon("Non-terminal flows whose scheduled time has passed. Due time alone does not establish claimability; FIFO ordering, leases, and policy limits may still block a claim.")}</th>
-          <th>Running #{info_icon("Flows currently leased to workers through FLOW.CLAIM_DUE.")}</th>
-          <th>Mode #{info_icon("FIFO states preserve per-partition order and let at most one active Flow block each partition lane. Parallel is the default.")}</th>
+          <th>State</th>
+          <th>Attention</th>
+          <th>Oldest due</th>
+          <th>Runs</th>
+          <th>Mode</th>
         </tr>
       </thead>
       <tbody>
@@ -94,11 +80,108 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     """
 
     """
-    <h2 class="section-title">Flow States <span class="badge badge-idle">#{escape(filter_label)}</span> <span class="badge badge-idle">#{sample_label}</span></h2>
-    <p class="flow-section-note">Exception columns first. Scroll for distribution columns.</p>
+    <h2 class="section-title">Runs by state <span class="badge badge-idle">#{escape(filter_label)}</span> <span class="badge badge-idle">#{sample_label}</span></h2>
     #{accessible_table("Flow states", table)}
+    <p class="flow-section-note">Expired leases are not failures: whether a run can be reclaimed depends on its state's policy and claim limits. Due time alone does not establish claimability; FIFO order, leases and policy limits can still hold a run back. FIFO states keep one active run per partition.</p>
     """
   end
+
+  # Each kind of problem gets its own badge. The kinds overlap (a failed run can also
+  # be out of retries), so they are never added up.
+  defp render_flow_state_attention(state) do
+    [
+      {state.expired_leases, "badge-warning", "expired"},
+      {Map.get(state, :failed, 0), "badge-failed", "failed"},
+      {Map.get(state, :max_attempts_reached, 0), "badge-failed", "out of retries"},
+      {Map.get(state, :retrying, 0), "badge-retrying", "retrying"}
+    ]
+    |> Enum.filter(fn {count, _class, _label} -> count > 0 end)
+    |> case do
+      [] ->
+        flow_state_operational_hint(state)
+
+      badges ->
+        Enum.map_join(badges, " ", fn {count, class, label} ->
+          ~s(<span class="badge #{class}">#{format_grouped(count)} #{label}</span>)
+        end)
+    end
+  end
+
+  defp render_flow_state_due(%{due_now: due_now}) when is_integer(due_now) and due_now > 0,
+    do: ~s(<span class="flow-state-due">#{format_grouped(due_now)} due now</span>)
+
+  defp render_flow_state_due(_state), do: ""
+
+  def render_flow_states_overview(_states, _sampled, :unavailable, _filters), do: ""
+  def render_flow_states_overview([], _sampled, _source_status, _filters), do: ""
+
+  def render_flow_states_overview(states, sampled, _source_status, filters) do
+    attention =
+      [
+        {sum_states(states, :expired_leases), "with expired leases"},
+        {sum_states(states, :failed), "failed"},
+        {sum_states(states, :max_attempts_reached), "out of retries"}
+      ]
+      |> Enum.filter(fn {count, _label} -> count > 0 end)
+
+    status =
+      case attention do
+        [] ->
+          PageStatus.render(
+            "runs",
+            :healthy,
+            "No runs need attention in this sample of #{format_grouped(sampled)}"
+          )
+
+        items ->
+          failures = FlowOverview.flow_failure_investigation_path(%{filters: filters})
+
+          PageStatus.render(
+            "runs",
+            :warning,
+            "Needs attention",
+            Enum.map(items, fn {count, label} -> "#{format_grouped(count)} #{label}" end),
+            ~s(<a href="#{escape_attr(failures)}">Open Failures</a>)
+          )
+      end
+
+    status <> render_flow_state_split(states)
+  end
+
+  defp sum_states(states, key), do: states |> Enum.map(&(Map.get(&1, key) || 0)) |> Enum.sum()
+
+  defp render_flow_state_split(states) do
+    totals =
+      states
+      |> Enum.group_by(& &1.state, & &1.count)
+      |> Enum.map(fn {state, counts} -> {state, Enum.sum(counts)} end)
+      |> Enum.sort_by(fn {state, count} -> {-count, state} end)
+
+    label =
+      Enum.map_join(totals, ", ", fn {state, count} -> "#{format_grouped(count)} #{state}" end)
+
+    bar =
+      Enum.map_join(totals, "", fn {state, count} ->
+        ~s(<span class="overview-state is-#{state_split_class(state)}" style="flex: #{count}"></span>)
+      end)
+
+    legend =
+      Enum.map_join(totals, "", fn {state, count} ->
+        ~s(<li><span class="overview-swatch is-#{state_split_class(state)}" aria-hidden="true"></span>#{escape(state)} <strong>#{format_grouped(count)}</strong></li>)
+      end)
+
+    """
+    <div class="runs-split">
+      <div class="overview-state-bar" role="img" aria-label="#{escape_attr(label)}">#{bar}</div>
+      <ul class="overview-legend">#{legend}</ul>
+    </div>
+    """
+  end
+
+  defp state_split_class(state) when state in ~w(queued running failed completed cancelled),
+    do: state
+
+  defp state_split_class(_state), do: "other"
 
   def render_flow_states_sources(data) do
     if Map.get(data, :terminal_source_status) in [:error, :timeout] do

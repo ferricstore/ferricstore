@@ -19,6 +19,7 @@ lane_scope? =
 <%= render_flow_type_filter(data) %>
 <%= if map_size(Map.get(filters, :errors, %{})) == 0 do %>
 <%= render_live_component("flow_states_sources", render_flow_states_sources(data)) %>
+<%= render_live_component("flow_states_overview", render_flow_states_overview(data.states, data.filtered_sampled, Map.get(data, :source_status, :ok), filters)) %>
 <%= if lane_scope? do %>
 <%= render_live_component("flow_fifo_lanes", render_flow_fifo_lanes(Map.get(data, :fifo_lanes, []), data.total_sampled, data.sample_limit, Map.get(data, :fifo_coverage, %{}))) %>
 <details class="dashboard-disclosure" id="flow-state-summaries">

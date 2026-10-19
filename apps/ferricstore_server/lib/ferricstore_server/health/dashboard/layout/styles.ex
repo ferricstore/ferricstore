@@ -243,12 +243,22 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-reclaim-advanced[open] > summary { margin-bottom: 10px; }
 
       /* Consensus */
-      .consensus-status, .doctor-status { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-bottom: 16px; padding: 14px 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); }
-      .consensus-status strong, .doctor-status strong { color: var(--text-strong); font-weight: 500; }
-      .consensus-status span, .doctor-status span { color: var(--text-muted); font-size: 0.8125rem; }
-      .consensus-status.is-healthy, .doctor-status.is-healthy { border-color: #1e5a47; background: #10241d; }
-      .consensus-status.is-warning, .doctor-status.is-warning { border-color: #4a3818; background: #1a1710; }
+      .page-status, .consensus-status, .doctor-status { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-bottom: 16px; padding: 14px 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); }
+      .page-status strong, .consensus-status strong, .doctor-status strong { color: var(--text-strong); font-weight: 500; }
+      .page-status span, .consensus-status span, .doctor-status span { color: var(--text-muted); font-size: 0.8125rem; }
+      .page-status.is-healthy, .consensus-status.is-healthy, .doctor-status.is-healthy { border-color: #1e5a47; background: #10241d; }
+      .page-status.is-warning, .consensus-status.is-warning, .doctor-status.is-warning { border-color: #4a3818; background: #1a1710; }
       .consensus-status.is-degraded, .doctor-status.is-degraded { border-color: #5a2a1f; background: #1d1311; }
+      .page-status.is-degraded { border-color: #5a2a1f; background: #1d1311; }
+      .page-status span + span::before { content: "·"; margin-right: 12px; color: var(--text-faint); }
+      .page-status .page-status-action { margin-left: auto; font-size: 0.875rem; }
+      .page-status .page-status-action::before { content: none; }
+      .page-status-action a { color: var(--accent); }
+      .runs-split { margin: -4px 0 20px; }
+      .runs-split .overview-state-bar { margin-top: 0; }
+      .overview-state.is-failed { background: var(--danger); }
+      .flow-state-attention .badge + .badge { margin-left: 4px; }
+      .flow-state-due { display: block; margin-top: 2px; color: var(--text-muted); font-size: 0.75rem; }
       .doctor-checks td strong { display: block; color: var(--text-strong); font-weight: 500; }
       .doctor-checks td strong + .mono { color: var(--text-faint); font-size: 0.75rem; }
       .consensus-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr)); gap: 12px; margin-bottom: 16px; }
@@ -415,13 +425,14 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-filter-actions { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
       .flow-filter-actions .flow-filter-clear { padding-block: 8px; }
       .flow-state-filter-form .flow-filter-actions { grid-column: span 2; align-self: end; }
-      .table-scroll .flow-states-table { table-layout: fixed; min-width: 1560px; }
-      .flow-states-table th:first-child { width: 190px; }
-      .flow-states-table th:nth-child(2) { width: 240px; }
-      .flow-states-table th:nth-child(6) { width: 145px; }
-      .flow-states-table th:nth-child(7) { width: 105px; }
+      .table-scroll .flow-states-table { table-layout: fixed; min-width: 820px; }
+      .flow-states-table th:first-child { width: 200px; }
+      .flow-states-table th:nth-child(2) { width: 160px; }
+      .flow-states-table th:nth-child(4) { width: 110px; }
+      .flow-states-table th:nth-child(5) { width: 120px; }
+      .flow-states-table th:nth-child(6) { width: 100px; }
       .flow-states-table th:first-child, .flow-states-table td:first-child { position: sticky; left: 0; z-index: 1; background: var(--surface-raised); }
-      .flow-states-table th:nth-child(2), .flow-states-table td:nth-child(2) { position: sticky; left: 190px; z-index: 1; background: var(--surface-raised); border-right: 1px solid var(--line-strong); }
+      .flow-states-table th:nth-child(2), .flow-states-table td:nth-child(2) { position: sticky; left: 200px; z-index: 1; background: var(--surface-raised); border-right: 1px solid var(--line-strong); }
       .flow-states-table thead th:nth-child(-n+2) { background: var(--surface-selected); z-index: 3; }
       .flow-states-table td:nth-child(-n+2) { white-space: normal; overflow-wrap: anywhere; }
       .flow-action-target, dl.flow-action-review, .flow-value-modal-provenance { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px 18px; margin-block: 12px; min-width: 0; }

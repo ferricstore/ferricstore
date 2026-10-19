@@ -13,9 +13,9 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           data = Dashboard.collect_flow_states_page()
           html = Dashboard.render_flow_states_page(data)
 
-          assert String.contains?(html, "Flow States")
-          assert String.contains?(html, "Oldest Due")
-          assert String.contains?(html, "Due Now")
+          assert String.contains?(html, "Runs by state")
+          assert String.contains?(html, "Oldest due")
+          assert String.contains?(html, "<th>Attention</th>")
         end
 
         test "filters state-centric Flow page by workflow type" do
@@ -419,21 +419,20 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
 
           html = Dashboard.render_flow_states_page(data)
 
-          assert String.contains?(html, "Retrying")
-          assert String.contains?(html, "Failed")
-          assert String.contains?(html, "Maxed")
-          assert String.contains?(html, "Mode")
-          assert String.contains?(html, "FIFO")
-          assert String.contains?(html, "lease deadline passed")
-          assert String.contains?(html, "terminal failed")
-          assert String.contains?(html, "attempts")
-          assert String.contains?(html, ~s(<button type="button" class="info-icon"))
-          assert String.contains?(html, ~s(aria-label="Metric help"))
+          assert String.contains?(html, ~s(<span class="badge badge-retrying">1 retrying</span>))
+          assert String.contains?(html, ~s(<span class="badge badge-warning">1 expired</span>))
+          assert String.contains?(html, ~s(<span class="badge badge-failed">1 failed</span>))
 
           assert String.contains?(
                    html,
-                   ~s(data-tooltip="Running flows whose lease deadline passed)
+                   ~s(<span class="badge badge-failed">1 out of retries</span>)
                  )
+
+          assert String.contains?(html, "Mode")
+          assert String.contains?(html, "FIFO")
+          assert String.contains?(html, "Expired leases are not failures")
+          assert String.contains?(html, "<strong>Needs attention</strong>")
+          assert String.contains?(html, ~s(<button type="button" class="info-icon"))
 
           assert String.contains?(
                    html,

@@ -107,10 +107,9 @@ defmodule FerricstoreServer.Health.Dashboard.QueryTriageThirdReviewTest do
   test "States puts exception columns before routine counts" do
     html = Records.render_flow_states_table([], 0, 0, 400, %{})
     assert html =~ ~s(class="flow-states-table")
-    assert html =~ "Scroll for distribution columns"
-    {failed, _} = :binary.match(html, "<th>Failed")
-    {count, _} = :binary.match(html, "<th>Sample Count")
-    assert failed < count
+    {attention, _} = :binary.match(html, "<th>Attention")
+    {count, _} = :binary.match(html, "<th>Runs")
+    assert attention < count
   end
 
   test "time fields work without JavaScript and enhancement hides inactive modes" do

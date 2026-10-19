@@ -313,9 +313,9 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowSecondReviewTest do
 
   test "state urgency leads secondary counts and sections have semantic headings" do
     html = Records.render_flow_states_table([], 0, 0, 400, %{})
-    assert html =~ ~s(<h2 class="section-title">Flow States)
-    assert position(html, "<th>Hint</th>") < position(html, "<th>Sample Count</th>")
-    assert position(html, "<th>Oldest Due</th>") < position(html, "<th>Sample Count</th>")
+    assert html =~ ~s(<h2 class="section-title">Runs by state)
+    assert position(html, "<th>Attention</th>") < position(html, "<th>Runs</th>")
+    assert position(html, "<th>Oldest due</th>") < position(html, "<th>Runs</th>")
 
     assert Records.render_flow_recent_records([]) =~
              ~s(<h2 class="section-title" id="flow-recent-records")
