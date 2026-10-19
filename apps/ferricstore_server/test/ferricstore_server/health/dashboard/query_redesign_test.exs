@@ -10,6 +10,28 @@ defmodule FerricstoreServer.Health.Dashboard.QueryRedesignTest do
     assert Access.flow_query_filter_result_for_acl(idle, "default", "*") == idle
   end
 
+  test "only a plain prompt skips the access filter" do
+    user = "idle-guard-#{System.unique_integer([:positive])}"
+
+    :ok =
+      FerricstoreServer.Acl.set_user(user, [
+        "on",
+        ">secret",
+        "%R~tenant-a:*",
+        "-@all",
+        "+FLOW.STATS"
+      ])
+
+    on_exit(fn -> FerricstoreServer.Acl.del_user(user) end)
+
+    idle = %{status: :idle, command: "FLOW.QUERY", rows: [], message: "Enter a partition key"}
+    assert Access.flow_query_filter_result_for_acl(idle, user, "tenant-b:p") == idle
+
+    carrying = Map.put(idle, :explain, %{plan: "index scan"})
+    filtered = Access.flow_query_filter_result_for_acl(carrying, user, "tenant-b:p")
+    refute Map.has_key?(filtered, :explain)
+  end
+
   alias FerricstoreServer.Health.Dashboard.Render.FlowQueryResults
   alias FerricstoreServer.Health.Dashboard.Render.FlowTables.{Lineage, Signals}
 
