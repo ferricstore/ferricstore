@@ -343,10 +343,10 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       @media (prefers-reduced-motion: reduce) { .flow-lifecycle-step, .flow-lifecycle-step > * { animation: none !important; } }
 
       /* Operational summary cards */
-      .ops-summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 20px; }
-      .ops-summary-card { background: var(--surface-raised); border: 1px solid var(--line); border-radius: 12px; padding: 14px 18px; min-width: 0; }
-      .ops-summary-label { font-size: 0.75rem; color: var(--text-muted); text-transform: none; letter-spacing: 0; margin-bottom: 8px; }
-      .ops-summary-value { font-size: 1.5rem; font-weight: 500; color: var(--text-strong); overflow-wrap: anywhere; font-family: var(--font-mono); letter-spacing: -0.01em; }
+      .ops-summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0; margin-bottom: 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); overflow: hidden; }
+      .ops-summary-card { box-shadow: 1px 1px 0 var(--line-subtle); padding: 12px 16px; min-width: 0; }
+      .ops-summary-label { font-size: 0.75rem; color: var(--text-muted); text-transform: none; letter-spacing: 0; margin-bottom: 4px; }
+      .ops-summary-value { font-size: 1.25rem; font-weight: 500; color: var(--text-strong); overflow-wrap: anywhere; font-family: var(--font-mono); letter-spacing: -0.01em; }
       .ops-summary-value.is-text { padding-block: 4px; font-family: var(--font-sans); font-size: 1.0625rem; font-weight: 500; letter-spacing: 0; }
       .ops-summary-detail { color: var(--text-muted); font-size: 0.75rem; margin-top: 6px; overflow-wrap: anywhere; }
 
