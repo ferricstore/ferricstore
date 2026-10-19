@@ -31,9 +31,16 @@ defmodule Ferricstore.Store.Router.Part09 do
 
       @max_logical_scan_cursor_bytes 88_000
 
+      # The forced quorum path is the default instance's Raft. A custom
+      # embedded instance applies through its own shards, as raft_write/4 does;
+      # sending its command down the forced path wrote to the default
+      # instance's shard of the same index.
       defp forced_single_key_quorum(ctx, key, command) do
         idx = shard_for(ctx, key)
-        forced_quorum_write(ctx, idx, command, node())
+
+        if durable_raft_ctx?(ctx),
+          do: forced_quorum_write(ctx, idx, command, node()),
+          else: GenServer.call(elem(ctx.shard_names, idx), {:standalone_barrier_write, command})
       end
 
       @hll_wrongtype_error {:error,

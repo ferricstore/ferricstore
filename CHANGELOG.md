@@ -9,6 +9,10 @@ All notable changes to FerricStore will be documented here.
   failed read counted as a lost frame, so a purge on a busy node could delete
   a Flow that still reads back; the policy catalog backfill already told
   these apart.
+- Write PFADD, SPOP, ZPOPMIN and ZPOPMAX for a custom embedded instance to that
+  instance. `Router.pfadd/3`, `spop/3`, `zpopmin/3` and `zpopmax/3` sent every
+  instance's command down the default instance's forced quorum path, so they
+  read and wrote the default instance's shard of the same index.
 - Accept combined EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT flags as Redis 7
   does: XX joins GT or LT, while NX with another flag, or GT with LT, answers
   Redis's incompatibility error. A second flag answered "wrong number of
