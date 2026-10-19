@@ -7,7 +7,7 @@ defmodule Ferricstore.Flow.PolicyMigration do
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.LMDBMirror
   alias Ferricstore.Flow.LMDBWriter
-  alias Ferricstore.Flow.Query.QueryRecordStore
+  alias Ferricstore.Flow.Query.{QueryRecordStore, QueryRowCodec}
   alias Ferricstore.Flow.RecordIdentity
   alias Ferricstore.Store.Router
   alias Ferricstore.TermCodec
@@ -637,11 +637,11 @@ defmodule Ferricstore.Flow.PolicyMigration do
       {:error, :query_hydration_batch_too_large} ->
         {:error, :policy_catalog_state_record_too_large}
 
-      {:error, :query_storage_inconsistent} ->
-        {:error, :corrupt_policy_catalog_state_projection}
-
-      {:error, :query_storage_unavailable} ->
-        {:error, :policy_catalog_primary_unavailable}
+      {:error, reason}
+      when reason in [:query_storage_inconsistent, :query_storage_unavailable] ->
+        if lost_projection_row?(path, state_key),
+          do: missing_state_record_value(ctx, shard_index, state_key, attempt),
+          else: {:error, lmdb_read_error(reason)}
 
       _invalid ->
         {:error, :corrupt_policy_catalog_state_projection}
@@ -667,6 +667,18 @@ defmodule Ferricstore.Flow.PolicyMigration do
       :error -> {:error, :invalid_policy_catalog_state_key}
     end
   end
+
+  # The keydir does not hold the Flow (this is its LMDB fallback), and its row
+  # names a segment-projection frame that does not read back.
+  defp lost_projection_row?(path, state_key) do
+    case LMDB.get(path, state_key) do
+      {:ok, encoded} -> QueryRowCodec.segment_projection_row?(encoded, state_key)
+      _missing_or_failed -> false
+    end
+  end
+
+  defp lmdb_read_error(:query_storage_inconsistent), do: :corrupt_policy_catalog_state_projection
+  defp lmdb_read_error(:query_storage_unavailable), do: :policy_catalog_primary_unavailable
 
   # A registered Flow keeps its state in the keydir or, once pruned or
   # hibernated, in LMDB, which has it before the keydir lets it go. Once the

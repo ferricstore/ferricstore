@@ -2,7 +2,15 @@ defmodule Ferricstore.Flow.OrphanPurgeTest do
   use ExUnit.Case, async: false
   @moduletag :global_state
 
-  alias Ferricstore.Flow.{Keys, LMDB, LMDBWriter, OrphanPurge, PolicyMigration}
+  alias Ferricstore.Flow.{
+    Keys,
+    LMDB,
+    LMDBWriter,
+    NativeOrderedIndex,
+    OrphanPurge,
+    PolicyMigration
+  }
+
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
@@ -87,6 +95,51 @@ defmodule Ferricstore.Flow.OrphanPurgeTest do
 
     assert {:ok, %{dry_run?: false, purged: 0, orphans: []}} =
              FerricStore.flow_purge_orphans(dry_run: false)
+  end
+
+  # Like resume:16 on Inspeactor: an LMDB row survives on a projection frame a
+  # rewrite renumbered, and startup left the Flow's cleanup members unregistered.
+  test "a purge removes a flow left on a lost projection frame, unregistered members included",
+       %{ctx: ctx} do
+    flow = completed_flow!(ctx, "stale-frame")
+    path = lmdb_path(ctx, flow.shard_index)
+    keydir = elem(ctx.keydir_refs, flow.shard_index)
+    index_key = Keys.retention_cleanup_index_key(flow.id, @partition)
+    member_prefix = Keys.retention_cleanup_member_prefix(flow.id, @partition)
+
+    member_keys =
+      :ets.foldl(
+        fn row, acc ->
+          key = elem(row, 0)
+
+          if is_binary(key) and String.starts_with?(key, member_prefix),
+            do: [key | acc],
+            else: acc
+        end,
+        [],
+        keydir
+      )
+
+    assert member_keys != []
+    {index_table, lookup_table} = NativeOrderedIndex.table_names(ctx.name, flow.shard_index)
+    native = NativeOrderedIndex.get(index_table, lookup_table)
+    :ok = NativeOrderedIndex.delete_members(native, index_key, member_keys)
+
+    :ets.delete(keydir, flow.state_key)
+    stale_projection_row!(path, flow)
+    assert {:ok, %{active: 3}} = FerricStore.raise_cluster_feature_level(3)
+
+    assert {:ok, %{purged: purged}} = FerricStore.flow_purge_orphans(dry_run: false)
+    assert purged >= 1
+    assert :ok = LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+    for key <-
+          [flow.registry_key, flow.guard_key, flow.record.payload_ref, flow.record.result_ref] ++
+            member_keys do
+      assert [] == :ets.lookup(keydir, key), "#{inspect(key)} is still in the keydir"
+    end
+
+    assert :not_found == LMDB.get(path, flow.state_key)
   end
 
   test "the purge command leaves a flow whose retention guard changed", %{ctx: ctx} do
@@ -211,6 +264,29 @@ defmodule Ferricstore.Flow.OrphanPurgeTest do
       value_keys: value_keys,
       legacy_value_key: legacy_value_key
     })
+  end
+
+  defp stale_projection_row!(path, flow) do
+    encoded = Ferricstore.Flow.encode_record(flow.record)
+
+    locator =
+      Ferricstore.Flow.Locator.new!(
+        flow_id: flow.id,
+        kind: :state,
+        version: flow.record.version,
+        raft_index: 999_999,
+        file_id: {:waraft_projection, 999_999},
+        segment_generation: 0,
+        offset: 123_456,
+        frame_size: 512,
+        value_size: byte_size(encoded),
+        checksum: :crypto.hash(:sha256, encoded)
+      )
+
+    assert {:ok, query_row} =
+             Ferricstore.Flow.Query.QueryRowCodec.encode(flow.state_key, flow.record, locator, 0)
+
+    :ok = LMDB.write_batch(path, [{:put, flow.state_key, query_row}])
   end
 
   defp query_index_rows(path, id) do

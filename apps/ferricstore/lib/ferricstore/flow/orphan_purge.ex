@@ -12,6 +12,7 @@ defmodule Ferricstore.Flow.OrphanPurge do
   alias Ferricstore.Cluster.FeatureLevel
   alias Ferricstore.Flow.{Digest, KeydirSpill, Keys, LMDB, LMDBMirror, LMDBWriter}
   alias Ferricstore.Flow.LMDB.IndexCodec
+  alias Ferricstore.Flow.Query.{QueryRecordStore, QueryRowCodec}
   alias Ferricstore.Store.Router
 
   @flush_timeout_ms 30_000
@@ -24,6 +25,7 @@ defmodule Ferricstore.Flow.OrphanPurge do
           state_key: binary(),
           guard: binary() | nil,
           catalog_key: binary() | nil,
+          member_keys: [binary()],
           value_keys: [binary()],
           query_index_keys: [binary()]
         }
@@ -69,12 +71,12 @@ defmodule Ferricstore.Flow.OrphanPurge do
       true ->
         path = lmdb_path(ctx, shard_index)
         keydir = elem(ctx.keydir_refs, shard_index)
-        {state_keys, catalog_keys} = scan_keydir(keydir)
+        {state_keys, catalog_keys, member_keys} = scan_keydir(keydir)
         orphaned = Enum.filter(state_keys, &orphaned?(ctx, shard_index, keydir, path, &1))
 
         with {:ok, index_keys} <- query_index_keys(path, orphaned) do
-          {:ok,
-           Enum.map(orphaned, &describe(ctx, shard_index, path, &1, catalog_keys, index_keys))}
+          keys = %{catalog: catalog_keys, members: member_keys, index: index_keys}
+          {:ok, Enum.map(orphaned, &describe(ctx, shard_index, path, &1, keys))}
         end
     end
   end
@@ -106,23 +108,30 @@ defmodule Ferricstore.Flow.OrphanPurge do
     end)
   end
 
-  # Registry markers, and type catalog entries by the digest of the state key
-  # they own.
+  # Registry markers; type catalog entries by the digest of the state key they
+  # own; retention cleanup members by their Flow's member prefix, registered or
+  # not (startup leaves those of an unreadable owner unregistered).
   defp scan_keydir(keydir) do
     :ets.foldl(
-      fn row, {state_keys, catalog_keys} = acc ->
+      fn row, {state_keys, catalog_keys, member_keys} = acc ->
         case elem(row, 0) do
           key when is_binary(key) ->
             cond do
               Keys.registry_key?(key) ->
                 case Keys.state_key_from_registry_key(key) do
-                  {:ok, state_key} -> {[state_key | state_keys], catalog_keys}
+                  {:ok, state_key} -> {[state_key | state_keys], catalog_keys, member_keys}
                   :error -> acc
                 end
 
               Keys.type_catalog_member_key?(key) ->
                 state_digest = key |> String.split(":") |> List.last()
-                {state_keys, Map.update(catalog_keys, state_digest, [key], &[key | &1])}
+
+                {state_keys, Map.update(catalog_keys, state_digest, [key], &[key | &1]),
+                 member_keys}
+
+              Keys.retention_cleanup_member?(key) ->
+                {prefix, _digest} = split_last(key, ":")
+                {state_keys, catalog_keys, Map.update(member_keys, prefix, [key], &[key | &1])}
 
               true ->
                 acc
@@ -132,16 +141,21 @@ defmodule Ferricstore.Flow.OrphanPurge do
             acc
         end
       end,
-      {[], %{}},
+      {[], %{}, %{}},
       keydir
     )
+  end
+
+  defp split_last(key, separator) do
+    [last | rest] = key |> String.split(separator) |> Enum.reverse()
+    {(rest |> Enum.reverse() |> Enum.join(separator)) <> separator, last}
   end
 
   # Read in the order a live Flow could move: keydir first, then LMDB, which has
   # the state before the keydir lets it go.
   defp orphaned?(ctx, shard_index, keydir, path, state_key) do
     with [] <- :ets.lookup(keydir, state_key),
-         :not_found <- LMDB.get(path, state_key),
+         true <- state_gone_from_lmdb?(ctx, shard_index, path, state_key),
          :not_found <- LMDB.get(path, LMDB.cold_park_key_for_state_key(state_key)),
          {:ok, registry_key} <- Keys.registry_key_from_state_key(state_key),
          {:ok, registry} when is_binary(registry) <-
@@ -152,18 +166,47 @@ defmodule Ferricstore.Flow.OrphanPurge do
     end
   end
 
-  defp describe(ctx, shard_index, path, state_key, catalog_keys, index_keys) do
+  # No row, or a row left on a segment-projection frame that no longer holds
+  # the record (QueryRowCodec.segment_projection_row?/2).
+  defp state_gone_from_lmdb?(ctx, shard_index, path, state_key) do
+    case LMDB.get(path, state_key) do
+      :not_found ->
+        true
+
+      {:ok, encoded} ->
+        QueryRowCodec.segment_projection_row?(encoded, state_key) and
+          match?(
+            {:error, _reason},
+            QueryRecordStore.read_encoded_many(
+              ctx,
+              shard_index,
+              path,
+              [state_key],
+              System.system_time(:millisecond),
+              QueryRecordStore.max_input_bytes(ctx),
+              include_expired: true
+            )
+          )
+
+      {:error, _reason} ->
+        false
+    end
+  end
+
+  defp describe(ctx, shard_index, path, state_key, keys) do
     {:ok, partition_key, id} = Keys.flow_tag_from_state_key(state_key)
 
     %{
       state_key: state_key,
       guard: read_guard(ctx, shard_index, Keys.retention_guard_key(id, partition_key)),
       catalog_key:
-        catalog_keys
+        keys.catalog
         |> Map.get(Digest.encode(state_key), [])
         |> Enum.find(&Keys.type_catalog_member_owns_state_key?(&1, state_key)),
+      member_keys:
+        Map.get(keys.members, Keys.retention_cleanup_member_prefix(id, partition_key), []),
       value_keys: Enum.flat_map(@value_kinds, &value_keys(path, id, partition_key, &1)),
-      query_index_keys: Map.get(index_keys, state_key, [])
+      query_index_keys: Map.get(keys.index, state_key, [])
     }
   end
 

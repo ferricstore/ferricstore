@@ -1123,7 +1123,23 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
   # and the backfill must not wait for it forever.
   test "backfill skips and counts a registered flow whose state record is gone" do
     ctx = FerricStore.Instance.get(:default)
-    {state_key, shard_index, run_token} = orphaned_state_fixture(ctx, "orphan")
+    {state_key, shard_index, run_token, _record} = orphaned_state_fixture(ctx, "orphan")
+
+    {candidates, orphaned} = staged_backfill_pages(ctx, shard_index, run_token)
+
+    assert %{kind: :state, state_key: ^state_key, record_value: nil} =
+             Enum.find(candidates, &match?(%{kind: :state, state_key: ^state_key}, &1))
+
+    assert orphaned >= 1
+  end
+
+  # A Flow whose record sits on the segment projection stays in the keydir, so
+  # an LMDB row naming a projection frame for a Flow missing from it was left by
+  # an earlier rewrite, and its record is gone however the read fails.
+  test "backfill skips a registered flow whose LMDB row names a lost projection frame" do
+    ctx = FerricStore.Instance.get(:default)
+    {state_key, shard_index, run_token, record} = orphaned_state_fixture(ctx, "stale-frame")
+    stale_projection_row!(ctx, shard_index, state_key, record)
 
     {candidates, orphaned} = staged_backfill_pages(ctx, shard_index, run_token)
 
@@ -1135,7 +1151,10 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
 
   test "worker reports registered flows without a state record once a backfill finishes" do
     ctx = FerricStore.Instance.get(:default)
-    {_state_key, shard_index, _run_token} = orphaned_state_fixture(ctx, "orphan-worker")
+
+    {_state_key, shard_index, _run_token, _record} =
+      orphaned_state_fixture(ctx, "orphan-worker")
+
     :ok = PolicyMigration.rotate_source_token(flow_lmdb_path(ctx, shard_index))
     {:ok, source_token} = PolicyMigration.source_token(ctx, shard_index)
 
@@ -1173,7 +1192,10 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
 
   test "backfill keeps waiting for a registered flow while the LMDB mirror is degraded" do
     ctx = FerricStore.Instance.get(:default)
-    {_state_key, shard_index, run_token} = orphaned_state_fixture(ctx, "orphan-degraded")
+
+    {_state_key, shard_index, run_token, _record} =
+      orphaned_state_fixture(ctx, "orphan-degraded")
+
     :atomics.put(ctx.flow_lmdb_mirror_degraded, shard_index + 1, 1)
 
     try do
@@ -2191,6 +2213,7 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
              )
 
     assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, shard_index, 30_000)
+    assert {:ok, record} = FerricStore.flow_get(id, partition_key: @partition)
     run_token = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
     :ok = PolicyMigration.snapshot_primary_keydir(ctx, shard_index, run_token, 256, 1_048_576)
 
@@ -2198,7 +2221,30 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
     :ok = LMDB.write_batch(lmdb_path, [{:delete, state_key}])
     assert :ets.member(keydir, Keys.registry_key(id, @partition))
 
-    {state_key, shard_index, run_token}
+    {state_key, shard_index, run_token, record}
+  end
+
+  # Leaves an LMDB row for the lost state that names a projection frame by
+  # number, as a rewrite that renumbered the log leaves it.
+  defp stale_projection_row!(ctx, shard_index, state_key, record) do
+    encoded = Ferricstore.Flow.encode_record(record)
+
+    locator =
+      Ferricstore.Flow.Locator.new!(
+        flow_id: record.id,
+        kind: :state,
+        version: record.version,
+        raft_index: 999_999,
+        file_id: {:waraft_projection, 999_999},
+        segment_generation: 0,
+        offset: 123_456,
+        frame_size: 512,
+        value_size: byte_size(encoded),
+        checksum: :crypto.hash(:sha256, encoded)
+      )
+
+    assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, locator, 0)
+    :ok = LMDB.write_batch(flow_lmdb_path(ctx, shard_index), [{:put, state_key, query_row}])
   end
 
   defp staged_backfill_pages(ctx, shard_index, run_token) do

@@ -272,6 +272,19 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
 
   def decode_reference(_encoded, _state_key, _now_ms), do: :error
 
+  @doc false
+  # Whether the row's locator names a segment-projection frame. Since 0.12.5 a
+  # Flow whose record sits there stays in the keydir, so such a row for a Flow
+  # missing from the keydir was left by an earlier rewrite, which renumbers and
+  # repacks that log: if it does not read back, the record is gone.
+  @spec segment_projection_row?(binary(), binary()) :: boolean()
+  def segment_projection_row?(encoded, state_key) do
+    match?(
+      {:ok, %QueryRowReference{locator: %Locator{file_id: {:waraft_projection, _index}}}},
+      decode_reference(encoded, state_key, 0)
+    )
+  end
+
   @spec relocate(binary(), binary(), Locator.t(), Locator.t()) ::
           {:ok, binary()}
           | {:error, :logical_generation_mismatch | :locator_compare_failed | :invalid_query_row}

@@ -1322,8 +1322,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
                state_enter_seq: sequence
              },
              {:ok, value_keys, index_keys} <- flow_purge_orphan_leftovers(record, entry),
+             {:ok, members} <- flow_purge_orphan_members(state, record, entry),
+             {:ok, member_values} <- flow_purge_orphan_delete_members(state, record, members),
              {:ok, plan} <- flow_retention_build_cleanup_plan(state, state_key, record),
              {:ok, counts} <- flow_retention_cleanup_record(state, state_key, record, plan) do
+          counts = Map.update(counts, :values, member_values, &(&1 + member_values))
+
           if Map.get(counts, :flows) == 1 do
             with {:ok, deleted} <- flow_retention_delete_keys(state, value_keys) do
               with_lmdb_mirror_shard(state, fn ->
@@ -1361,6 +1365,61 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
       end
 
       defp flow_purge_orphan_type(_state, _state_key, _catalog_key), do: :invalid_catalog_key
+
+      # Retention reaches a Flow's cleanup members through the native index, and
+      # startup leaves those of an unreadable owner out of it; the finder lists
+      # them all. Each must bind this Flow's cleanup index to a key it owns.
+      defp flow_purge_orphan_members(
+             state,
+             %{id: id, partition_key: partition_key} = record,
+             entry
+           ) do
+        index_key = FlowKeys.retention_cleanup_index_key(id, partition_key)
+
+        case Map.get(entry, :member_keys, []) do
+          member_keys when is_list(member_keys) and length(member_keys) <= 1_024 ->
+            member_keys
+            |> Enum.uniq()
+            |> Enum.reduce_while({:ok, []}, fn member_key, {:ok, acc} ->
+              with value when is_binary(value) <- keydir_spill_get(state, member_key),
+                   {:ok, {^index_key, owned_key}} <-
+                     Ferricstore.Flow.RetentionCleanupMember.decode(value),
+                   ^member_key <-
+                     FlowKeys.retention_cleanup_member_key(id, owned_key, partition_key),
+                   true <- flow_retention_cleanup_owned_key?(owned_key, record) do
+                {:cont, {:ok, [{member_key, owned_key} | acc]}}
+              else
+                nil -> {:cont, {:ok, acc}}
+                _unowned -> {:halt, :unowned_member}
+              end
+            end)
+
+          _invalid ->
+            :invalid_members
+        end
+      end
+
+      # As retention deletes what members own: private values and auxiliary keys
+      # go, shareable values go only once nothing else refers to them.
+      defp flow_purge_orphan_delete_members(_state, _record, []), do: {:ok, 0}
+
+      defp flow_purge_orphan_delete_members(state, %{id: id} = record, members) do
+        index_key = FlowKeys.retention_cleanup_index_key(id, record.partition_key)
+
+        {value_refs, auxiliary_keys} =
+          members |> Enum.map(&elem(&1, 1)) |> Enum.split_with(&FlowKeys.value_key?/1)
+
+        {private_value_refs, shareable_value_refs} =
+          flow_retention_split_owned_value_refs(value_refs, record)
+
+        flow_retention_enqueue_shared_value_orphans(state, shareable_value_refs, record)
+
+        with {:ok, deleted} <- flow_retention_delete_keys(state, private_value_refs),
+             {:ok, _auxiliary} <- flow_retention_delete_keys(state, auxiliary_keys),
+             :ok <- flow_retention_delete_cleanup_members(state, index_key, members) do
+          {:ok, deleted}
+        end
+      end
 
       # Flows from before retention cleanup members kept their values in LMDB
       # alone, and query index rows outlive the state record they came from.

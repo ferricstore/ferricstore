@@ -10,7 +10,6 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   alias Ferricstore.Flow.KeydirSpill
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.LMDB
-  alias Ferricstore.Flow.Locator
   alias Ferricstore.Flow.NativeOrderedIndex
   alias Ferricstore.Flow.Query.{QueryRecordStore, QueryRow, QueryRowCodec, QueryRowStore}
   alias Ferricstore.Flow.RecordIdentity
@@ -2152,7 +2151,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
                 :unreadable
 
               {:error, reason} ->
-                if projection_row?(query_row, state_key),
+                if QueryRowCodec.segment_projection_row?(query_row, state_key),
                   do: :unreadable,
                   else: raise_unreadable_owner!(reason, state_key)
 
@@ -2167,13 +2166,6 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
             raise "shared-ref backfill LMDB state read failed: #{inspect(reason)}"
         end
     end
-  end
-
-  defp projection_row?(query_row, state_key) do
-    match?(
-      {:ok, %{locator: %Locator{file_id: {:waraft_projection, _index}}}},
-      QueryRowCodec.decode_reference(query_row, state_key, 0)
-    )
   end
 
   defp raise_unreadable_owner!(reason, state_key) do
