@@ -92,11 +92,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # replaces bytes at offset, writes back. Preserves expire_at_ms.
       # A bad offset is an error, not a raise: a raise here crashes storage,
       # and again on every replay of the entry.
-      defp do_setrange(_state, _key, offset, _value) when not is_integer(offset) or offset < 0,
-        do: {:error, "ERR offset is out of range"}
-
       defp do_setrange(state, key, offset, value) do
-        with :ok <- ensure_string_key(state, key) do
+        with :ok <- check_offset(offset, "ERR offset is out of range"),
+             :ok <- ensure_string_key(state, key) do
           {old_val, expire_at_ms} =
             case do_get_meta(state, key) do
               nil -> {"", 0}
@@ -121,11 +119,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # Atomic SETBIT: read bitmap, extend with zeros to include byte_index if
       # needed, flip the single bit, write back. Preserves expire_at_ms.
       # Returns the OLD bit at that offset (Redis semantics).
-      defp do_setbit(_state, _key, offset, _bit_val) when not is_integer(offset) or offset < 0,
-        do: {:error, "ERR bit offset is not an integer or out of range"}
-
       defp do_setbit(state, key, offset, bit_val) do
-        with :ok <- ensure_string_key(state, key) do
+        with :ok <- check_offset(offset, "ERR bit offset is not an integer or out of range"),
+             :ok <- ensure_string_key(state, key) do
           {old_val, expire_at_ms} =
             case do_get_meta(state, key) do
               nil -> {<<>>, 0}
@@ -1111,6 +1107,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             end
         end
       end
+
+      defp check_offset(offset, _error) when is_integer(offset) and offset >= 0, do: :ok
+      defp check_offset(_offset, error), do: {:error, error}
 
       # Overwrites bytes at `offset` with `value`, zero-padding if the original
       # string is shorter than offset. Mirrors shard.ex apply_setrange/3.
