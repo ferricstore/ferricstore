@@ -45,6 +45,40 @@ defmodule Ferricstore.Commands.ZsetHllAtomicTest do
            "PFCOUNT #{count} for #{expected} elements"
   end
 
+  test "concurrent HSETNX has one winner", %{ctx: ctx, key: key} do
+    wins =
+      concurrent_results(fn client ->
+        Dispatcher.dispatch("HSETNX", [key, "f", "v#{client}"], ctx)
+      end)
+
+    assert 1 == Enum.count(wins, &(&1 == 1))
+  end
+
+  test "concurrent ZADD NX has one winner and ZADD GT keeps the highest score", %{
+    ctx: ctx,
+    key: key
+  } do
+    wins =
+      concurrent_results(fn client ->
+        Dispatcher.dispatch("ZADD", [key, "NX", "#{client}", "m"], ctx)
+      end)
+
+    assert 1 == Enum.count(wins, &(&1 == 1))
+
+    run_concurrently(fn client, n ->
+      Dispatcher.dispatch("ZADD", [key <> ":gt", "GT", "#{client * 100 + n}", "m"], ctx)
+    end)
+
+    assert "#{@clients * 100 + @increments}.0" ==
+             Dispatcher.dispatch("ZSCORE", [key <> ":gt", "m"], ctx)
+  end
+
+  defp concurrent_results(fun) do
+    1..(@clients * 2)
+    |> Task.async_stream(fun, max_concurrency: @clients * 2, timeout: 60_000)
+    |> Enum.map(fn {:ok, result} -> result end)
+  end
+
   defp run_concurrently(fun) do
     1..@clients
     |> Task.async_stream(fn client -> for n <- 1..@increments, do: fun.(client, n) end,

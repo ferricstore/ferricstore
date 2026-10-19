@@ -18,6 +18,11 @@ All notable changes to FerricStore will be documented here.
   handlers still run in the state machine. HINCRBYFLOAT now stores and returns
   the shortest form ("10.6", not "10.59999999999999968"), as the embedded API
   did.
+- Serialize HSETNX, and ZADD with NX, XX, GT or LT, per key through the TCP and
+  HTTP gateways. They read the key and decided the write in the client's
+  process, so every concurrent HSETNX or ZADD NX on one key reported a win
+  (20 of 20) and concurrent ZADD GT could leave a lower score; they now run
+  under the node's key latch, as the TDIGEST read-modify-writes already do.
 - Write PFADD, SPOP, ZPOPMIN and ZPOPMAX for a custom embedded instance to that
   instance. `Router.pfadd/3`, `spop/3`, `zpopmin/3` and `zpopmax/3` sent every
   instance's command down the default instance's forced quorum path, so they
