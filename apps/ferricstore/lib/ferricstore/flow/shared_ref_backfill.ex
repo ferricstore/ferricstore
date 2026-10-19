@@ -10,8 +10,9 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   alias Ferricstore.Flow.KeydirSpill
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.LMDB
+  alias Ferricstore.Flow.Locator
   alias Ferricstore.Flow.NativeOrderedIndex
-  alias Ferricstore.Flow.Query.{QueryRecordStore, QueryRow, QueryRowStore}
+  alias Ferricstore.Flow.Query.{QueryRecordStore, QueryRow, QueryRowCodec, QueryRowStore}
   alias Ferricstore.Flow.RecordIdentity
   alias Ferricstore.Flow.RetentionCleanupMember
   alias Ferricstore.Flow.RetentionGuard
@@ -2127,7 +2128,11 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   # An owner whose LMDB row survives but whose record no longer reads back (a
   # rewrite left the row on another key's frame) is reported, not fatal: its
   # cleanup members are kept but not registered, so nothing is released for
-  # it, and every other read of it still fails closed.
+  # it, and every other read of it still fails closed. A Flow whose record sits
+  # on the segment projection stays in the keydir, so a row naming a projection
+  # frame for an owner missing from it was left by an earlier rewrite, which
+  # renumbers and repacks that log: whatever its read fails with, the record is
+  # not there.
   defp lookup_owner_record!(ctx, state_key) do
     case lookup_primary_value!(ctx, state_key) do
       {:ok, encoded} ->
@@ -2135,7 +2140,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
 
       :not_found ->
         case lmdb_get!(ctx, state_key) do
-          {:ok, _query_row} ->
+          {:ok, query_row} ->
             case read_lmdb_records([state_key], ctx) do
               {:ok, [{^state_key, record}]} ->
                 {:ok, record}
@@ -2147,7 +2152,9 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
                 :unreadable
 
               {:error, reason} ->
-                raise "shared-ref backfill failed to decode or hydrate LMDB QueryRows: #{inspect(reason)}"
+                if projection_row?(query_row, state_key),
+                  do: :unreadable,
+                  else: raise_unreadable_owner!(reason, state_key)
 
               {:ok, _invalid} ->
                 raise "shared-ref backfill failed to resolve LMDB state"
@@ -2160,6 +2167,18 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
             raise "shared-ref backfill LMDB state read failed: #{inspect(reason)}"
         end
     end
+  end
+
+  defp projection_row?(query_row, state_key) do
+    match?(
+      {:ok, %{locator: %Locator{file_id: {:waraft_projection, _index}}}},
+      QueryRowCodec.decode_reference(query_row, state_key, 0)
+    )
+  end
+
+  defp raise_unreadable_owner!(reason, state_key) do
+    raise "shared-ref backfill failed to decode or hydrate LMDB QueryRows: " <>
+            "#{inspect(reason)} (owner #{inspect(state_key)})"
   end
 
   defp report_unreadable_owner(ctx, member_key, state_key) do
