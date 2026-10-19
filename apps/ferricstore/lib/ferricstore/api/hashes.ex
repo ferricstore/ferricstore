@@ -352,7 +352,14 @@ defmodule FerricStore.API.Hashes do
   def hsetnx(key, field, value) do
     store = build_compound_store(key)
 
-    case Hash.handle_ast({:hsetnx, key, to_string(field), to_string(value)}, store) do
+    # HSETNX reads the field and then writes it; the key latch keeps two
+    # callers from both seeing it missing, as the command path does.
+    result =
+      Ferricstore.Store.Router.with_key_latch(default_ctx(), key, fn ->
+        Hash.handle_ast({:hsetnx, key, to_string(field), to_string(value)}, store)
+      end)
+
+    case result do
       {:error, _} = err -> err
       1 -> {:ok, true}
       0 -> {:ok, false}

@@ -53,6 +53,20 @@ defmodule Ferricstore.Commands.PopMoveAtomicTest do
              Enum.sort(@members)
   end
 
+  test "the embedded lmove and hsetnx are atomic too", %{key: key} do
+    source = key <> ":api-source"
+    destination = key <> ":api-destination"
+    assert {:ok, 40} = FerricStore.rpush(source, @members)
+
+    moved = concurrently(fn -> FerricStore.lmove(source, destination, :left, :right) end)
+
+    assert Enum.sort(moved) == Enum.sort(Enum.map(@members, &{:ok, &1}))
+    assert {:ok, 40} = FerricStore.llen(destination)
+
+    wins = concurrently(fn -> FerricStore.hsetnx(key <> ":api-hash", "f", "v") end)
+    assert 1 == Enum.count(wins, &(&1 == {:ok, true}))
+  end
+
   defp concurrently(fun) do
     1..40
     |> Task.async_stream(fn _ -> fun.() end, max_concurrency: 40, timeout: 60_000)

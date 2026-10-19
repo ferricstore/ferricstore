@@ -24,6 +24,10 @@ All notable changes to FerricStore will be documented here.
   ZPOPMIN returned 2 distinct members) and concurrent LMOVE lost elements
   (40 moves left 1 in the destination). On the instance they now use the
   state machine's atomic pop and the router's single-entry list move.
+- Make the embedded `FerricStore.lmove/4` atomic and serialize
+  `FerricStore.hsetnx/3`. `lmove/4` moved through separate reads and writes,
+  so 40 concurrent moves left 1 element in the destination and lost the rest,
+  and every concurrent `hsetnx/3` on one field reported a win.
 - Serialize HSETNX, HGETDEL, SMOVE, ZADD with NX, XX, GT or LT, and
   EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT with a flag, per key through the TCP and
   HTTP gateways. They read the key and decided the write in the client's
