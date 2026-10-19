@@ -22,6 +22,11 @@ All notable changes to FerricStore will be documented here.
   use compact rows.
 - Compact the dashboard's recent run rows to two short lines, and style the run
   status badges, which rendered as plain text.
+- Redesign the dashboard Consensus and Doctor pages. Consensus leads with one
+  status line (shards without a leader, unreadable or more than 100 entries
+  behind are named), summary cards and a tile per shard, with the full table
+  folded away. Doctor leads with one status line and named check rows, and
+  folds the CLI reference away.
 
 ## 0.12.6 - 2026-10-19
 

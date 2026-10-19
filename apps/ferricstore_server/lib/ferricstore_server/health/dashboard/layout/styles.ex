@@ -226,6 +226,40 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-reclaim-advanced > summary:hover { color: var(--text-strong); }
       .flow-reclaim-advanced[open] > summary { margin-bottom: 10px; }
 
+      /* Consensus */
+      .consensus-status, .doctor-status { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-bottom: 16px; padding: 14px 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); }
+      .consensus-status strong, .doctor-status strong { color: var(--text-strong); font-weight: 500; }
+      .consensus-status span, .doctor-status span { color: var(--text-muted); font-size: 0.8125rem; }
+      .consensus-status.is-healthy, .doctor-status.is-healthy { border-color: #1e5a47; background: #10241d; }
+      .consensus-status.is-warning, .doctor-status.is-warning { border-color: #4a3818; background: #1a1710; }
+      .consensus-status.is-degraded, .doctor-status.is-degraded { border-color: #5a2a1f; background: #1d1311; }
+      .doctor-checks td strong { display: block; color: var(--text-strong); font-weight: 500; }
+      .doctor-checks td strong + .mono { color: var(--text-faint); font-size: 0.75rem; }
+      .consensus-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr)); gap: 12px; margin-bottom: 16px; }
+      .consensus-stat { display: flex; flex-direction: column; gap: 4px; padding: 14px 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); }
+      .consensus-stat-label { color: var(--text-muted); font-size: 0.8125rem; }
+      .consensus-stat-value { color: var(--text-strong); font-family: var(--font-mono); font-size: 1.5rem; font-weight: 500; overflow-wrap: anywhere; }
+      .consensus-stat-value.is-warning { color: var(--warn); }
+      .consensus-stat-value.is-degraded { color: var(--danger-text); }
+      .consensus-stat-value.is-unknown { color: var(--text-muted); font-family: var(--font-sans); font-size: 1.125rem; }
+      .consensus-stat-note { color: var(--text-faint); font-size: 0.75rem; }
+      .consensus-layout { display: grid; grid-template-columns: minmax(0, 2fr) minmax(min(280px, 100%), 1fr); gap: 16px; align-items: start; }
+      .consensus-card { min-width: 0; padding: 18px 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); }
+      .consensus-card-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; }
+      .consensus-card-head h2 { color: var(--text-strong); font-size: 0.95rem; font-weight: 600; }
+      .consensus-card-note { color: var(--text-faint); font-size: 0.8125rem; }
+      p.consensus-card-note { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+      .consensus-members { display: grid; gap: 8px; margin-top: 12px; list-style: none; font-size: 0.8125rem; }
+      .consensus-grid { display: grid; grid-template-columns: repeat(var(--shard-columns, auto-fill), minmax(76px, 1fr)); gap: 8px; margin-top: 14px; list-style: none; }
+      .consensus-shard { display: flex; flex-direction: column; gap: 2px; min-height: 72px; padding: 9px 10px; border: 1px solid #1e3a2e; border-radius: 9px; background: #121a17; }
+      .consensus-shard-head { color: var(--text-muted); font-size: 0.75rem; }
+      .consensus-shard strong { color: var(--text-strong); font-family: var(--font-mono); font-size: 0.95rem; font-weight: 500; overflow-wrap: anywhere; }
+      .consensus-shard-note { color: var(--text-faint); font-size: 0.75rem; }
+      .consensus-shard.is-behind { border-color: #4a3818; background: #2a2112; }
+      .consensus-shard.is-behind .consensus-shard-note { color: var(--warn); }
+      .consensus-shard.is-down { border-color: #5a2a1f; background: var(--danger-wash); }
+      .consensus-shard.is-down .consensus-shard-note { color: var(--danger-text); }
+
       /* Operational summary cards */
       .ops-summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 20px; }
       .ops-summary-card { background: var(--surface-raised); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; min-width: 0; }
@@ -412,6 +446,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-query-field .flow-search-input { width: 100%; height: 36px; background: var(--surface-base); border: 1px solid var(--line-strong); border-radius: 6px; padding: 0 10px; color: var(--text-strong); font-size: 0.8rem; font-family: var(--font-mono); }
       .flow-query-field .flow-search-input:focus { outline: 2px solid var(--accent); outline-offset: 2px; border-color: var(--accent); box-shadow: none; }
       .flow-field-help { color: var(--text-muted); font-size: 0.75rem; text-transform: none; letter-spacing: 0; line-height: 1.3; }
+      .flow-field { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; color: var(--text-muted); font-size: 0.8125rem; }
       .flow-query-predicate-group { display: flex; align-items: flex-end; align-self: stretch; flex: 1 1 360px; gap: 8px; flex-wrap: wrap; min-width: 0; margin: 0; padding: 6px 0 0; border: 0; }
       .flow-query-predicate-group legend { width: 100%; padding: 0; color: var(--text-muted); font-size: 0.75rem; font-weight: 600; text-transform: none; letter-spacing: 0; }
       .flow-query-scalar-input { display: grid; grid-template-columns: minmax(96px, 0.45fr) minmax(120px, 1fr); gap: 6px; min-width: 0; }
@@ -1074,6 +1109,8 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
         .page-header { padding: 14px 16px 0; }
         .page-header-status { justify-content: flex-start; }
         .overview-shard-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+        .consensus-layout { grid-template-columns: minmax(0, 1fr); }
+        .consensus-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
         .failure-group > summary { grid-template-columns: minmax(0, 1fr) auto 16px; }
         .failure-group-since, .failure-group-worker { display: none; }
         .content { padding: 16px; }

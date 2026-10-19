@@ -154,6 +154,8 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
     data = Operational.collect_raft_page()
 
     live_component_payload(%{
+      "consensus_status" => render_consensus_status(data.raft_shards),
+      "consensus_grid" => render_consensus_grid(data.raft_shards),
       "cluster_info" => render_cluster_info(data.cluster),
       "consensus_summary" => render_consensus_summary(data.raft_shards),
       "raft_table" => render_raft_table(data.raft_shards)

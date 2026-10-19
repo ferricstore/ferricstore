@@ -1,6 +1,5 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.DoctorPages do
   import FerricstoreServer.Health.Dashboard.Format
-  import FerricstoreServer.Health.Dashboard.Render.Overview
   import FerricstoreServer.Health.Dashboard.DoctorSupport
 
   def render_doctor_flash(%{status: status, message: message})
@@ -17,48 +16,46 @@ defmodule FerricstoreServer.Health.Dashboard.Render.DoctorPages do
 
   def render_doctor_flash(_flash), do: ""
 
-  def render_doctor_summary(%{"error" => _} = check) do
-    render_doctor_collection_error("Doctor CHECK unavailable", check) <>
-      render_ops_summary("Doctor Summary", [
-        %{label: "Status", value: "Unavailable", class: "c-red"},
-        %{label: "Checks", value: "Unavailable"},
-        %{label: "Warnings", value: "Unavailable"},
-        %{label: "Errors", value: "Unavailable"},
-        %{label: "Duration", value: "Unavailable"}
-      ])
-  end
+  def render_doctor_summary(%{"error" => _} = check),
+    do: render_doctor_collection_error("Doctor CHECK unavailable", check)
 
   def render_doctor_summary(check) do
-    status = Map.get(check, "status", "error")
     checks = Map.get(check, "checks", [])
+    total = length(checks)
     failed = Enum.count(checks, &(Map.get(&1, "status") == "error"))
     warnings = Enum.count(checks, &(Map.get(&1, "status") == "warning"))
+    took = "Checked in #{format_duration_ms(Map.get(check, "duration_ms", 0))}."
 
-    render_ops_summary("Doctor Summary", [
-      %{
-        label: "Status",
-        value: status,
-        class: doctor_status_class(status),
-        detail: "aggregated check result"
-      },
-      %{label: "Checks", value: format_number(length(checks)), detail: "bounded metadata probes"},
-      %{
-        label: "Warnings",
-        value: format_number(warnings),
-        class: if(warnings > 0, do: "c-yellow", else: "c-green")
-      },
-      %{
-        label: "Errors",
-        value: format_number(failed),
-        class: if(failed > 0, do: "c-red", else: "c-green")
-      },
-      %{
-        label: "Duration",
-        value: format_duration_ms(Map.get(check, "duration_ms", 0)),
-        detail: "inline CHECK time"
-      }
-    ])
+    {state, title, detail} =
+      cond do
+        total == 0 ->
+          {"warning", "No checks returned", "The doctor answered without any check results."}
+
+        failed > 0 ->
+          {"degraded", "#{failed} of #{total} checks failed", took}
+
+        warnings > 0 or Map.get(check, "status") != "ok" ->
+          {"warning",
+           "#{max(warnings, 1)} of #{total} checks #{if max(warnings, 1) == 1, do: "needs", else: "need"} attention",
+           took}
+
+        true ->
+          {"healthy", "All #{total} checks pass", took}
+      end
+
+    """
+    <section class="doctor-status is-#{state}" aria-label="Doctor result">
+      <strong>#{escape(title)}</strong>
+      <span>#{escape(detail)}</span>
+    </section>
+    """
   end
+
+  @check_names %{
+    "bitcask" => "Bitcask storage",
+    "blob_refs" => "Blob references",
+    "flow_lmdb" => "Flow LMDB projection"
+  }
 
   def render_doctor_checks(check) do
     rows =
@@ -69,19 +66,19 @@ defmodule FerricstoreServer.Health.Dashboard.Render.DoctorPages do
               do: "Checks unavailable; retry diagnostics.",
               else: "No doctor checks returned"
 
-          ~s(<tr><td colspan="5" class="c-muted">#{message}</td></tr>)
+          ~s(<tr><td colspan="4" class="c-muted">#{message}</td></tr>)
 
         checks ->
           Enum.map_join(checks, "\n", fn item ->
-            metrics = Map.get(item, "metrics", %{})
+            scope = Map.get(item, "scope", "")
+            status = Map.get(item, "status", "")
 
             """
             <tr>
-              <td class="mono">#{escape(Map.get(item, "scope", ""))}</td>
-              <td class="#{doctor_status_class(Map.get(item, "status", ""))}">#{escape(Map.get(item, "status", ""))}</td>
+              <td><strong>#{escape(Map.get(@check_names, scope, scope))}</strong><span class="mono">#{escape(scope)}</span></td>
+              <td><span class="badge #{doctor_badge_class(status)}">#{escape(status)}</span></td>
               <td>#{escape(Map.get(item, "message", ""))}</td>
-              <td>#{escape(doctor_metric_summary(Map.get(item, "scope"), metrics))}</td>
-              <td class="mono">FERRICSTORE.DOCTOR CHECK SCOPE #{escape(String.upcase(Map.get(item, "scope", "")))}</td>
+              <td class="mono">#{escape(doctor_metric_summary(Map.get(item, "scope"), Map.get(item, "metrics", %{})))}</td>
             </tr>
             """
           end)
@@ -89,9 +86,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.DoctorPages do
 
     """
     <h2 class="section-title">Checks</h2>
-    <div class="table-scroll" role="region" aria-label="Doctor checks" tabindex="0"><table>
+    <div class="table-scroll" role="region" aria-label="Doctor checks" tabindex="0"><table class="doctor-checks">
       <thead>
-        <tr><th>Scope</th><th>Status</th><th>Meaning</th><th>Key metrics</th><th>Command</th></tr>
+        <tr><th>Check</th><th>Status</th><th>Meaning</th><th>Key metrics</th></tr>
       </thead>
       <tbody>
         #{rows}
@@ -99,6 +96,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.DoctorPages do
     </table></div>
     """
   end
+
+  defp doctor_badge_class("ok"), do: "badge-ok"
+  defp doctor_badge_class("warning"), do: "badge-warning"
+  defp doctor_badge_class("error"), do: "badge-failed"
+  defp doctor_badge_class(_status), do: "badge-idle"
 
   def render_doctor_actions do
     """
@@ -229,13 +231,18 @@ defmodule FerricstoreServer.Health.Dashboard.Render.DoctorPages do
       end)
 
     """
-    <h2 class="section-title">Command Reference</h2>
-    <div class="table-scroll" role="region" aria-label="Doctor command reference" tabindex="0">
-    <table>
-      <thead><tr><th>Command</th><th>Purpose</th><th>Permission</th></tr></thead>
-      <tbody>#{rows}</tbody>
-    </table>
-    </div>
+    <details class="dashboard-disclosure">
+      <summary>Run from the CLI</summary>
+      <div class="dashboard-disclosure-body">
+        <p class="flow-section-note">The same checks and repairs over the native protocol.</p>
+        <div class="table-scroll" role="region" aria-label="Doctor command reference" tabindex="0">
+        <table>
+          <thead><tr><th>Command</th><th>Purpose</th><th>Permission</th></tr></thead>
+          <tbody>#{rows}</tbody>
+        </table>
+        </div>
+      </div>
+    </details>
     """
   end
 
