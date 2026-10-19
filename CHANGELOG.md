@@ -4,6 +4,23 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Finish the Flow policy catalog backfill when a registered Flow has lost its
+  state record. The backfill read "registry present, state in neither the
+  keydir nor LMDB" as a projection still on its way and retried it every minute
+  for good, so a shard holding such a Flow never finished; it now flushes the
+  shard's LMDB writer, reads again, and skips the Flow, counting it in
+  `[:ferricstore, :flow, :policy_migration, :orphaned_states]` and in one warning
+  per finished run.
+- Remove the policy backfill staging of earlier runs when a new run starts. A run
+  that never finished kept its staged copy of the keydir in LMDB, and each new run
+  staged another.
+- `FerricStore.flow_purge_orphans/1` lists Flows whose state record is gone and,
+  with `dry_run: false`, removes what they left (registry marker, retention guard,
+  catalog entry, values, history, query index rows), releasing their shared value
+  references. Retention starts from the state record, so it never reached them.
+  Purging needs cluster feature level 3 (new; raise it with
+  `CLUSTER.FEATURES.RAISE 3` once every node runs this release).
+
 ## 0.12.5 - 2026-10-19
 
 - Stop losing the record of a Flow whose state sits on the segment projection.

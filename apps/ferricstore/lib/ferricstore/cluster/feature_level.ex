@@ -25,7 +25,9 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   # 2: running Flows release values trimmed history no longer refers to
   #    (`Ferricstore.Flow.HistoryValueRelease`), and rewinds refuse events whose
   #    values were released.
-  @supported 2
+  # 3: `:flow_purge_orphans` cleans up after Flows whose state record is gone
+  #    (`Ferricstore.Flow.OrphanPurge`).
+  @supported 3
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"
   @probe_timeout_ms 5_000

@@ -767,6 +767,17 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
 
   defp decode_query_index_state_key(_invalid, _id), do: :error
 
+  @doc false
+  # The Flow id a query index row names, read from its key alone.
+  def query_index_key_id(key) when is_binary(key) do
+    case query_index_key_fields(key) do
+      {:ok, {_family_digest, _index_digest, id, _updated_at_ms}} -> {:ok, id}
+      :error -> :error
+    end
+  end
+
+  def query_index_key_id(_key), do: :error
+
   defp query_index_key_fields(key) do
     prefix = query_index_global_prefix() <> @query_index_key_tag
     prefix_bytes = byte_size(prefix)

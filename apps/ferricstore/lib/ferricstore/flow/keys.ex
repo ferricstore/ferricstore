@@ -724,12 +724,33 @@ defmodule Ferricstore.Flow.Keys do
 
   def retention_guard_key_from_state_key(_state_key), do: :error
 
+  @doc """
+  The Flow id of a state key and a stand-in for its partition key, `{:flow_tag,
+  tag}`, which every Flow key builder accepts and turns into the same hash tag.
+  """
+  @spec flow_tag_from_state_key(binary()) :: {:ok, {:flow_tag, binary()}, binary()} | :error
+  def flow_tag_from_state_key(state_key) when is_binary(state_key) do
+    with {:ok, <<"f:", tag::binary>>, id} <- split_internal_flow_key(state_key, "}:s:"),
+         true <- id != "" do
+      {:ok, {:flow_tag, tag}, id}
+    else
+      _invalid -> :error
+    end
+  end
+
+  def flow_tag_from_state_key(_state_key), do: :error
+
   def retention_guard_key?(key), do: internal_key_with_remainder?(key, "}:rtg:")
 
   def registry_key?(key), do: internal_key_with_remainder?(key, "}:r:")
 
   def tag(nil), do: @global_tag
   def tag(:global), do: @global_tag
+
+  # A Flow's hash tag itself, for code that holds a Flow's state key but not the
+  # partition key it was built from (see flow_tag_from_state_key/1). The key
+  # builders retention cleanup uses take their partition key only through tag/1.
+  def tag({:flow_tag, <<"{", _rest::binary>> = tag}), do: tag
 
   def tag(<<@auto_partition_prefix, bucket::binary>> = partition_key) do
     case auto_partition_bucket(bucket) do

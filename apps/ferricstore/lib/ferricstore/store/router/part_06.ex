@@ -323,6 +323,17 @@ defmodule Ferricstore.Store.Router.Part06 do
       def flow_policy_catalog_backfill_step(_ctx, _shard_index, _request),
         do: {:error, "ERR invalid flow policy catalog backfill step"}
 
+      @doc false
+      def flow_purge_orphans(ctx, shard_index, request)
+          when is_integer(shard_index) and shard_index >= 0 and
+                 shard_index < ctx.shard_count and is_map(request) do
+        key = "f:{f}:flow-purge-orphans:" <> Integer.to_string(shard_index)
+        raft_write(ctx, shard_index, key, {:flow_purge_orphans, request})
+      end
+
+      def flow_purge_orphans(_ctx, _shard_index, _request),
+        do: {:error, "ERR invalid flow orphan purge request"}
+
       defp flow_policy_migration_plan(ctx, shard_index, limit) do
         with :ok <- flow_policy_migration_flush_projection(ctx, shard_index),
              {:ok, backfill_proof} <-

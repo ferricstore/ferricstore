@@ -303,6 +303,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
+      def apply(meta, {:flow_purge_orphans, request}, state) when is_map(request) do
+        item_count = telemetry_list_size(Map.get(request, :orphans, []))
+
+        apply_flow_pending_with_time(
+          meta,
+          state,
+          :flow_purge_orphans,
+          %{items: item_count},
+          fn -> do_flow_purge_orphans(state, request) end
+        )
+      end
+
       def apply(meta, {:flow_policy_catalog_backfill_step, request}, state)
           when is_map(request) do
         item_count = telemetry_list_size(Map.get(request, :candidates, []))

@@ -543,6 +543,7 @@ defmodule FerricStore do
   defdelegate flow_cancel(id, opts \\ []), to: FlowAPI
   defdelegate flow_cancel_many(partition_key, items, opts \\ []), to: FlowAPI
   defdelegate flow_retention_cleanup(opts \\ []), to: FlowAPI
+  defdelegate flow_purge_orphans(opts \\ []), to: FlowAPI
   defdelegate flow_rewind(id, opts), to: FlowAPI
   defdelegate flow_list(type, opts \\ []), to: FlowAPI
   defdelegate flow_search(opts \\ []), to: FlowAPI
