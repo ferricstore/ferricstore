@@ -131,7 +131,7 @@ defmodule FerricstoreServer.Health.Dashboard.ShellNavigationTest do
     quiet = %{flow_summary: %{expired_leases_sampled: 0, failed: 0}, slowlog: []}
 
     assert Layout.render_sidebar(busy, "overview") =~
-             ~r{href="/dashboard/flow/failures"[^>]*><span class="nav-label">Failures</span><span class="nav-badge nav-badge-warn">5</span>}
+             ~r{href="/dashboard/flow/failures"[^>]*><span class="nav-label">Failures</span><span class="nav-badge nav-badge-warn" title="Expired leases and failed runs in the overview's sample">5</span>}
 
     refute Layout.render_sidebar(quiet, "overview") =~ "nav-badge"
   end
