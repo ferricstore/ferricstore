@@ -1,7 +1,7 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.Prefixes do
   import FerricstoreServer.Health.Dashboard.Format
   import FerricstoreServer.Health.Dashboard.Render.Overview
-  alias FerricstoreServer.Health.Dashboard.Render.TableValue
+  alias FerricstoreServer.Health.Dashboard.Render.{PageStatus, TableValue}
 
   def render_prefixes_table(data) do
     prefix_count = length(data.prefixes)
@@ -18,9 +18,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Prefixes do
             <tr>
               <td class="mono">#{TableValue.render(p.prefix, "prefix")}</td>
               <td>#{format_number(p.keys)}</td>
-              <td>#{p.pct}%</td>
-              <td>#{observed_number(p.hot_reads)}</td>
-              <td>#{observed_number(p.cold_reads)}</td>
+              <td class="size-cell"><span class="size-value">#{p.pct}%</span><span class="size-track"><span class="size-bar" style="width: #{bar_width(p.pct)}%"></span></span></td>
+              <td>#{observed_cell(p.hot_reads)}</td>
+              <td>#{observed_cell(p.cold_reads)}</td>
             </tr>
             """
           end)
@@ -52,16 +52,43 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Prefixes do
     hot_reads = observed_total(data.prefixes, :hot_reads)
     cold_reads = observed_total(data.prefixes, :cold_reads)
 
-    render_ops_summary("Prefix Summary", [
-      %{label: "Sampled User KV keys", value: format_number(data.total_sampled)},
-      %{label: "Displayed keys", value: format_number(total_indexed)},
-      %{label: "Displayed hot reads", value: observed_number(hot_reads)},
-      %{label: "Displayed cold reads", value: observed_number(cold_reads)}
-    ])
+    status =
+      case Enum.max_by(data.prefixes, & &1.keys, fn -> nil end) do
+        nil ->
+          PageStatus.render("prefixes", :idle, "No User KV keys in this sample")
+
+        largest ->
+          count = length(data.prefixes)
+
+          PageStatus.render(
+            "prefixes",
+            :idle,
+            "#{format_number(count)} #{if count == 1, do: "prefix", else: "prefixes"} in #{format_number(data.total_sampled)} sampled keys",
+            ["largest: #{largest.prefix}, #{largest.pct}% of the sample"]
+          )
+      end
+
+    status <>
+      render_ops_summary(
+        "Prefix Summary",
+        [
+          %{label: "Sampled User KV keys", value: format_number(data.total_sampled)},
+          %{label: "Displayed keys", value: format_number(total_indexed)},
+          %{label: "Displayed hot reads", value: observed_number(hot_reads)},
+          %{label: "Displayed cold reads", value: observed_number(cold_reads)}
+        ],
+        heading: :hidden
+      )
   end
 
   defp observed_number(nil), do: "Unavailable"
   defp observed_number(value), do: format_number(value)
+
+  defp observed_cell(nil), do: ~s(<span class="c-muted">Unavailable</span>)
+  defp observed_cell(value), do: format_number(value)
+
+  defp bar_width(pct) when is_number(pct), do: pct |> max(0) |> min(100) |> round()
+  defp bar_width(_pct), do: 0
 
   defp observed_total(rows, field) do
     if Enum.any?(rows, &is_nil(Map.get(&1, field))),

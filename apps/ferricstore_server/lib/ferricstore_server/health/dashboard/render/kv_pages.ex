@@ -388,23 +388,39 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
         hot_reads + cold_reads + Map.get(hotcold, :total_misses, 0)
       )
 
-    render_ops_summary("Read Path Summary", [
-      %{
-        label: "Hit Rate",
-        value: if(lookups == 0, do: "No read samples", else: "#{hotcold.hit_ratio}%")
-      },
-      %{
-        label: "Hot Reads",
-        value: format_number(hot_reads),
-        detail_html: "sampled #{sampled_tag(Map.get(hotcold, :sample_rate, 1))}"
-      },
-      %{
-        label: "Cold Reads",
-        value: format_number(cold_reads),
-        detail: "#{Map.get(hotcold, :cold_reads_per_sec, 0.0)}/sec average since start"
-      },
-      %{label: "Misses", value: format_number(Map.get(hotcold, :total_misses, 0))}
-    ])
+    status =
+      if lookups == 0 do
+        PageStatus.render("reads", :idle, "No read samples yet")
+      else
+        PageStatus.render("reads", :idle, "#{hotcold.hit_ratio}% hit rate", [
+          "#{format_number(hot_reads)} hot reads",
+          "#{format_number(cold_reads)} cold reads from disk",
+          "#{format_number(Map.get(hotcold, :total_misses, 0))} misses"
+        ])
+      end
+
+    status <>
+      render_ops_summary(
+        "Read Path Summary",
+        [
+          %{
+            label: "Hit rate",
+            value: if(lookups == 0, do: "No read samples", else: "#{hotcold.hit_ratio}%")
+          },
+          %{
+            label: "Hot Reads",
+            value: format_number(hot_reads),
+            detail_html: "sampled #{sampled_tag(Map.get(hotcold, :sample_rate, 1))}"
+          },
+          %{
+            label: "Cold Reads",
+            value: format_number(cold_reads),
+            detail: "#{Map.get(hotcold, :cold_reads_per_sec, 0.0)}/sec average since start"
+          },
+          %{label: "Misses", value: format_number(Map.get(hotcold, :total_misses, 0))}
+        ],
+        heading: :hidden
+      )
   end
 
   def render_read_prefix_table(data) do
@@ -422,7 +438,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
               <td class="mono">#{TableValue.render(row.prefix, "read prefix")}</td>
               <td>#{format_number(row.hot_reads)}</td>
               <td>#{format_number(row.cold_reads)}</td>
-              <td>#{Float.round(row.cold_pct, 1)}%</td>
+              <td class="size-cell"><span class="size-value">#{Float.round(row.cold_pct, 1)}%</span><span class="size-track"><span class="size-bar is-cold" style="width: #{row.cold_pct |> max(0.0) |> min(100.0) |> round()}%"></span></span></td>
             </tr>
             """
           end)

@@ -106,4 +106,57 @@ defmodule FerricstoreServer.Health.Dashboard.DataRedesignTest do
     refute merged =~ "<details"
     assert merged =~ "<table"
   end
+
+  alias FerricstoreServer.Health.Dashboard.Render.Prefixes
+
+  @prefix_data %{
+    total_sampled: 2_601,
+    prefixes: [
+      %{prefix: "cache", keys: 900, pct: 34.6, hot_reads: nil, cold_reads: nil},
+      %{prefix: "user", keys: 800, pct: 30.8, hot_reads: 18, cold_reads: 0}
+    ]
+  }
+
+  test "Prefixes opens with the largest prefix's share" do
+    html = Prefixes.render_prefixes_summary(@prefix_data)
+
+    assert html =~ "prefixes-status is-idle"
+    assert html =~ "<strong>2 prefixes in 2.6K sampled keys</strong>"
+    assert html =~ "largest: cache, 34.6% of the sample"
+    assert html =~ ~s(<h2 class="section-title sr-only">Prefix Summary</h2>)
+  end
+
+  test "each prefix's share of the sample is a bar, and missing counters read quietly" do
+    html = Prefixes.render_prefixes_table(@prefix_data)
+
+    assert html =~ ~s(<span class="size-bar" style="width: 35%"></span>)
+    assert html =~ ~s(<span class="c-muted">Unavailable</span>)
+  end
+
+  test "Read path opens with the hit rate, or says there are no samples" do
+    html =
+      KVPages.render_reads_summary(%{
+        hotcold: %{hit_ratio: 90.0, hot_reads: 1_800, cold_reads: 0, total_misses: 200}
+      })
+
+    assert html =~ "reads-status is-idle"
+    assert html =~ "<strong>90.0% hit rate</strong>"
+    assert html =~ "1.8K hot reads"
+    assert html =~ "0 cold reads from disk"
+    assert html =~ "200 misses"
+
+    assert KVPages.render_reads_summary(%{
+             hotcold: %{hit_ratio: 0.0, hot_reads: 0, cold_reads: 0}
+           }) =~
+             "<strong>No read samples yet</strong>"
+  end
+
+  test "each prefix's cold share is a bar" do
+    html =
+      KVPages.render_read_prefix_table(%{
+        prefixes: [%{prefix: "user", hot_reads: 15, cold_reads: 5, cold_pct: 25.0}]
+      })
+
+    assert html =~ ~s(<span class="size-bar is-cold" style="width: 25%"></span>)
+  end
 end
