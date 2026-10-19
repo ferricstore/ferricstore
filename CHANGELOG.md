@@ -35,6 +35,49 @@ All notable changes to FerricStore will be documented here.
   key searches are one row each, with a prompt instead of an empty table.
 - Say that the overview's workflow numbers and the Failures badge come from
   the overview's small sample.
+- Finish the dashboard pass: workflow pages share one scope row (run lookup and
+  scope, with the repeated route links removed and the header tabs carrying the
+  scope), running and due rows are compact, and every page gets 14 px body
+  text, smaller disclosure titles and summary cards that show words such as
+  Unavailable as words. Table scroll boxes now contain positioned labels, which
+  made Workers scroll sideways on phones.
+- Redesign the remaining workflow pages. Runs, Due and Workers open with a
+  status line saying what needs attention (each kind of problem counted
+  separately, never summed) with a link to Failures. Runs gets a state split
+  bar and a six-column states table. Due rows lead with how overdue a run is.
+  Worker rows show leases as bars with the expired share. Signals offers its
+  opt-in history scan as one click, Lineage offers recent runs to start
+  from, and empty sections across these pages are short prompts instead of
+  empty tables.
+- Show signed-in users the query prompt (for example "Enter a partition
+  key") instead of "0 visible row(s)" before a query has run.
+- Redesign the Settings pages. Policies states a shared policy once and
+  trims its table to nine columns, with an Edit column that no longer
+  clips Max active. Governance leads with open circuits and waiting
+  approvals over a compact count strip. Retention says whether the sample
+  has anything to clean up, with every cleanup safeguard unchanged. The
+  shared row filter control is laid out as one aligned row.
+- Redesign the Data pages. Storage, Merges, Prefixes, Read path, Commands,
+  Streams and Pub/Sub each open with a status line, and summary counts
+  become one compact connected strip. Shard sizes, prefix shares and cold
+  read shares are drawn as bars. When nothing has merged, the per-shard
+  merge table folds away, as does the command reference. Empty bounded
+  tables are one-line prompts, and their row filter appears with their rows.
+- Redesign the Cluster and Admin pages. Clients warns about blocked
+  connections, Slow log names its worst command, and Security says whether
+  access is protected, with the accounts list first, account creation
+  folded below it and the route reference folded away. Config states how
+  many parameters there are and trims its table to four columns with a row
+  filter, and Capabilities names what is unsupported.
+- Make the dashboard's status lines say no more than their data supports.
+  - A failed Governance load reads as unavailable, not as unused.
+  - Partial Runs results never show a healthy line.
+  - Lists capped when collected (Due's scheduled runs, Prefixes, Slow log)
+    report their full counts or say what they show.
+  - Clients counts blocked clients instead of the keys they wait on.
+  - Policies compares state overrides before calling a policy shared.
+  - Access-filtered empty states say "visible".
+  - Sampled hot reads are labelled estimates.
 
 ## 0.12.6 - 2026-10-19
 

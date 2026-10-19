@@ -2,7 +2,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
   @moduledoc false
 
   import FerricstoreServer.Health.Dashboard.Format
-  import FerricstoreServer.Health.Dashboard.Render.Overview, only: [render_ops_summary: 2]
+  import FerricstoreServer.Health.Dashboard.Render.Overview, only: [render_ops_summary: 3]
+
+  alias FerricstoreServer.Health.Dashboard.Render.PageStatus
 
   def render_acl_security(%{modifier_form_only?: true} = data) do
     draft = Map.get(data, :account_draft, %{})
@@ -28,8 +30,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
     """
     #{render_acl_security_summary(data)}
     #{render_security_flash(Map.get(data, :flash))}
-    #{render_account_management(data)}
     #{render_acl_users(data)}
+    #{render_account_creation(data)}
     #{render_acl_tester(data)}
     #{render_dashboard_route_requirements(data)}
     """
@@ -43,33 +45,84 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
     can_mutate =
       Map.get(data, :can_manage_users, false) or Map.get(data, :can_delete_users, false)
 
-    render_ops_summary("ACL Security", [
-      %{
-        label: "Protected Mode",
-        value: if(protected_mode, do: "on", else: "off"),
-        class: if(protected_mode, do: "c-green", else: "c-yellow")
-      },
-      %{
-        label: "Configured Users",
-        value: if(configured_users, do: "yes", else: "no"),
-        class: if(configured_users, do: "c-green", else: "c-yellow")
-      },
-      %{
-        label: "ACL Users",
-        value: format_number(Map.get(data, :acl_user_count, 0))
-      },
-      %{
-        label: "Principal",
-        value: current_user,
-        detail: "dashboard request identity"
-      },
-      %{
-        label: "Mutation Surface",
-        value: if(can_mutate, do: "enabled", else: "read only"),
-        class: if(can_mutate, do: "c-green", else: "c-muted"),
-        detail: "command-specific account permissions"
-      }
-    ])
+    users = Map.get(data, :acl_user_count, 0)
+
+    status =
+      cond do
+        not protected_mode ->
+          PageStatus.render("security", :warning, "Protected mode is off", [
+            "the dashboard needs no sign-in, and with no password set remote clients connect without one"
+          ])
+
+        not configured_users ->
+          PageStatus.render("security", :warning, "No configured users", [
+            "only localhost connections are accepted until a password is set"
+          ])
+
+        true ->
+          PageStatus.render(
+            "security",
+            :healthy,
+            "Protected: #{format_number(users)} ACL #{if users == 1, do: "user", else: "users"}",
+            [
+              if(Map.get(data, :current_user),
+                do: "signed in as #{current_user}",
+                else: "not signed in"
+              ),
+              if(can_mutate, do: "account changes enabled", else: "read only")
+            ]
+          )
+      end
+
+    status <>
+      render_ops_summary(
+        "ACL Security",
+        [
+          %{
+            label: "Protected mode",
+            value: if(protected_mode, do: "on", else: "off"),
+            class: if(protected_mode, do: "c-green", else: "c-yellow")
+          },
+          %{
+            label: "Configured users",
+            value: if(configured_users, do: "yes", else: "no"),
+            class: if(configured_users, do: "c-green", else: "c-yellow")
+          },
+          %{
+            label: "ACL users",
+            value: format_number(Map.get(data, :acl_user_count, 0))
+          },
+          %{
+            label: "Principal",
+            value: current_user,
+            detail: "dashboard request identity"
+          },
+          %{
+            label: "Account changes",
+            value: if(can_mutate, do: "enabled", else: "read only"),
+            class: if(can_mutate, do: "c-green", else: "c-muted"),
+            detail: "command-specific account permissions"
+          }
+        ],
+        heading: :hidden
+      )
+  end
+
+  # The accounts list is the page's subject; creating an account folds below it,
+  # and opens again when a submitted draft comes back with an error.
+  defp render_account_creation(data) do
+    if Map.get(data, :can_manage_users, false) do
+      open =
+        case Map.get(data, :account_draft) do
+          draft when is_map(draft) and map_size(draft) > 0 -> " open"
+          _none -> ""
+        end
+
+      ~s(<details class="dashboard-disclosure acl-create"#{open}><summary>Create an account</summary>) <>
+        render_account_management(data) <> "</details>"
+    else
+      render_account_management(data)
+    end
   end
 
   def render_security_flash(%{status: status, message: message})
@@ -185,7 +238,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
         else: "acl-target-help"
 
     """
-    <h2 class="section-title">ACL Tester</h2>
+    <h2 class="section-title">ACL tester</h2>
     <div class="flow-filter-panel acl-tester-panel">
       <p class="flow-filter-note" id="acl-target-help">Check an enabled account against one or more command, key, channel, or route targets.</p>
       #{tester_field_error(errors, :targets, "acl-target-error")}
@@ -193,7 +246,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
         <label>User <input class="flow-search-input mono" type="search" name="user" value="#{escape_attr(Map.get(input, :user, ""))}" autocomplete="off" placeholder="default"#{tester_error_attributes(errors, :user, "acl-user-error")}>#{tester_field_error(errors, :user, "acl-user-error")}</label>
         <label>Command <input class="flow-search-input mono" type="search" name="command" value="#{escape_attr(Map.get(input, :command, ""))}" autocomplete="off" placeholder="GET"#{tester_error_attributes(errors, :command, "acl-command-error")}>#{tester_field_error(errors, :command, "acl-command-error")}</label>
         <label>Key <input class="flow-search-input mono" type="search" name="key" value="#{escape_attr(Map.get(input, :key, ""))}" autocomplete="off" placeholder="tenant:key"></label>
-        <label>Key Access #{render_key_access_select(Map.get(input, :key_access, :read))}</label>
+        <label>Key access #{render_key_access_select(Map.get(input, :key_access, :read))}</label>
         <label>Channel <input class="flow-search-input mono" type="search" name="channel" value="#{escape_attr(Map.get(input, :channel, ""))}" autocomplete="off" placeholder="tenant:events"></label>
         <label>HTTP method <select class="flow-search-input mono" name="route_method">#{Enum.map_join(["GET", "POST"], "", fn method -> ~s(<option value="#{method}"#{if Map.get(input, :route_method, "GET") == method, do: " selected", else: ""}>#{method}</option>) end)}</select></label>
         <label>Route <input class="flow-search-input mono" type="search" name="route_path" value="#{escape_attr(Map.get(input, :route_path, ""))}" autocomplete="off" placeholder="/dashboard/flow"></label>
@@ -417,13 +470,16 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
       end)
 
     """
-    <h2 class="section-title">Dashboard Route Requirements</h2>
+    <details class="dashboard-disclosure" id="security-route-requirements"><summary>Dashboard route requirements</summary>
+    <div class="dashboard-disclosure-body">
     #{table_scroll("Dashboard route requirements", """
     <table>
-      <thead><tr><th>Page</th><th>Method</th><th>Path</th><th>Required ACL Command</th><th>Key Scope</th></tr></thead>
+      <thead><tr><th>Page</th><th>Method</th><th>Path</th><th>Required ACL command</th><th>Key scope</th></tr></thead>
       <tbody>#{rows}</tbody>
     </table>
     """)}
+    </div>
+    </details>
     """
   end
 

@@ -85,7 +85,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
   def apply_signal_form(_params), do: {:error, "ERR signal form must be a map"}
 
   defp validate_signal_transition(transition, nil) when is_binary(transition),
-    do: {:error, "ERR If State is required when Transition To is set"}
+    do: {:error, "ERR If state is required when Transition to is set"}
 
   defp validate_signal_transition(_transition, _state), do: :ok
 

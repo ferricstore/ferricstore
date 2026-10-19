@@ -4,7 +4,7 @@
 <div class="layout">
 <%= render_sidebar_static("flow_query") %>
 <main class="main-content" id="dashboard-main" tabindex="-1">
-<%= render_page_header("flow_query") %>
+<%= render_page_header("flow_query", intro: "Run bounded queries over workflow records: list, search, count, histories and failures.") %>
 <div class="content">
 <%= FerricstoreServer.Health.Dashboard.Render.FlowOverview.render_flow_scope_contract(data) %>
 <div class="flow-query-workspace">

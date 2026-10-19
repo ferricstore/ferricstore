@@ -47,7 +47,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     do: ~s(<div class="flow-alert flow-alert-ok">#{escape(message)}</div>)
 
   def render_flow_query_status(%{status: :idle, message: message}),
-    do: ~s(<div class="flow-section-note">#{escape(message)}</div>)
+    do: ~s(<p class="section-empty">#{escape(message)}</p>)
 
   def render_flow_query_status(%{status: _status, message: message}),
     do: ~s(<div class="flow-alert flow-alert-error">#{escape(message)}</div>)
@@ -177,7 +177,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
       <table class="flow-query-table">
         <caption class="sr-only">Query result records</caption>
         <thead>
-          <tr><th scope="col">ID / Event</th><th scope="col">Type</th><th scope="col">State / Action</th><th scope="col">Time</th><th scope="col">Worker</th><th scope="col">Values</th></tr>
+          <tr><th scope="col">ID / event</th><th scope="col">Type</th><th scope="col">State / action</th><th scope="col">Time</th><th scope="col">Worker</th><th scope="col">Values</th></tr>
         </thead>
         <tbody>#{render_flow_query_rows(result)}</tbody>
       </table>
@@ -717,7 +717,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
 
     """
     <section class="flow-query-plan-section">
-      <div class="flow-query-plan-title">Chosen Plan</div>
+      <div class="flow-query-plan-title">Chosen plan</div>
       <dl class="flow-query-plan-grid">
         #{plan_item("Status", Map.get(explain, :status))}
         #{plan_item("Path", Map.get(plan, :path))}
@@ -800,7 +800,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     else
       """
       <section class="flow-query-plan-section">
-        <div class="flow-query-plan-title">Estimates and Bounds</div>
+        <div class="flow-query-plan-title">Estimates and bounds</div>
         <div class="flow-query-table-wrap" role="region" aria-label="Query plan estimates and bounds" tabindex="0">
           <table class="flow-query-plan-metrics">
             <caption class="sr-only">Query plan estimates and bounds</caption>
@@ -854,7 +854,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     else
       """
       <section class="flow-query-plan-section">
-        <div class="flow-query-plan-title">Planner Decision</div>
+        <div class="flow-query-plan-title">Planner decision</div>
         <dl class="flow-query-plan-grid">
           #{plan_item("Reason", Map.get(decision, :reason))}
           #{plan_item("Bounded candidates", Map.get(decision, :bounded_candidate_count))}

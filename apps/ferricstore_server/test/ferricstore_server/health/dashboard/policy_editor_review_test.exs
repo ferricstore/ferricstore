@@ -169,7 +169,7 @@ defmodule FerricstoreServer.Health.Dashboard.PolicyEditorReviewTest do
     response = post_policy(params, cookie)
     assert extract_status_code(response) == 422
     assert extract_body(response) =~ ~s(name="type" value="#{type}")
-    refute extract_body(response) =~ "Current Flow Policies"
+    refute extract_body(response) =~ "Current policies"
   end
 
   test "invalid enums and numeric text remain editable instead of reverting to defaults" do

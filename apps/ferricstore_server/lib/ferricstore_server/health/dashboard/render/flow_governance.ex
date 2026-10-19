@@ -1,7 +1,7 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
   alias FerricstoreServer.Health.Dashboard.Flow.Governance
   alias FerricstoreServer.Health.Dashboard.Render.FlowQueryResults
-  alias FerricstoreServer.Health.Dashboard.Render.{FlowNavigation, StateMetadata}
+  alias FerricstoreServer.Health.Dashboard.Render.{FlowNavigation, PageStatus, StateMetadata}
   alias Ferricstore.Flow.Governance.CircuitStore
 
   @metadata_fields ~w(meta_type meta_state meta_key meta_value meta_value_type meta_partition_key meta_cursor)
@@ -13,8 +13,6 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
 
   import FerricstoreServer.Health.Dashboard.Render.FlowHistory,
     only: [flow_state_class: 1, render_flow_id_link: 2]
-
-  import FerricstoreServer.Health.Dashboard.Render.FlowOverview, only: [render_flow_stat_card: 3]
 
   def render_flow_governance_form_recovery(data) do
     draft = Map.get(data, :action_draft, %{})
@@ -100,19 +98,95 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
   def render_flow_governance_summary(data) do
     counts = Map.get(data, :counts, %{})
 
+    if Map.get(data, :error) do
+      # The overview failed, so every count is unmeasured rather than zero.
+      PageStatus.render("governance", :warning, "Governance records unavailable", [
+        "the overview could not be loaded, so nothing is counted"
+      ]) <>
+        render_flow_governance_flash(Map.get(data, :flash)) <>
+        render_flow_governance_error(Map.get(data, :error))
+    else
+      render_flow_governance_counts(data, counts)
+    end
+  end
+
+  defp render_flow_governance_counts(data, counts) do
     """
-    <div class="flow-card-grid">
-      #{render_flow_stat_card("Approvals", Map.get(counts, :approvals, 0), "bounded approval records")}
-      #{render_flow_stat_card("Pending", Map.get(counts, :pending_approvals, 0), "approval requests waiting")}
-      #{render_flow_stat_card("Budgets", Map.get(counts, :budgets, 0), "durable budget counters")}
-      #{render_flow_stat_card("Limits", Map.get(counts, :limits, 0), "distributed credit owners")}
-      #{render_flow_stat_card("Circuits", Map.get(counts, :circuits, 0), "durable effect circuit scopes")}
-      #{render_flow_stat_card("Open", Map.get(counts, :open_circuits, 0), "currently rejecting effects")}
-    </div>
+    #{render_flow_governance_status(counts)}
+    <dl class="stat-strip" aria-label="Governance counts">
+      #{stat("Approvals", count(counts, :approvals))}
+      #{stat("Pending", count(counts, :pending_approvals), :warning)}
+      #{stat("Budgets", count(counts, :budgets))}
+      #{stat("Credit limits", count(counts, :limits))}
+      #{stat("Circuits", count(counts, :circuits))}
+      #{stat("Open circuits", count(counts, :open_circuits), :degraded)}
+    </dl>
     #{render_flow_governance_flash(Map.get(data, :flash))}
     #{render_flow_governance_error(Map.get(data, :error))}
     """
   end
+
+  defp count(counts, key) do
+    case Map.get(counts, key, 0) do
+      value when is_integer(value) -> value
+      _other -> 0
+    end
+  end
+
+  defp stat(label, value, alert \\ nil) do
+    class = if alert && value > 0, do: ~s( class="is-#{alert}"), else: ""
+    ~s(<div#{class}><dt>#{label}</dt><dd>#{format_grouped(value)}</dd></div>)
+  end
+
+  defp render_flow_governance_status(counts) do
+    open = count(counts, :open_circuits)
+    half_open = count(counts, :half_open_circuits)
+    pending = count(counts, :pending_approvals)
+    total = Enum.sum(Enum.map([:approvals, :budgets, :limits, :circuits], &count(counts, &1)))
+
+    waiting =
+      if pending > 0,
+        do: ["#{format_grouped(pending)} #{plural(pending, "approval")} waiting"],
+        else: []
+
+    half = if half_open > 0, do: ["#{format_grouped(half_open)} half-open"], else: []
+
+    cond do
+      open > 0 ->
+        PageStatus.render(
+          "governance",
+          :degraded,
+          "#{format_grouped(open)} #{plural(open, "circuit")} open",
+          ["rejecting effects"] ++ half ++ waiting
+        )
+
+      pending > 0 ->
+        PageStatus.render(
+          "governance",
+          :warning,
+          "#{format_grouped(pending)} #{plural(pending, "approval")} waiting",
+          half
+        )
+
+      total == 0 ->
+        PageStatus.render("governance", :idle, "No governance records visible", [
+          "no approvals, budgets, limits or circuits in the scopes you can see"
+        ])
+
+      true ->
+        PageStatus.render(
+          "governance",
+          :healthy,
+          "Nothing waiting",
+          [
+            "no pending approvals or open circuits in visible scopes"
+          ] ++ half
+        )
+    end
+  end
+
+  defp plural(1, word), do: word
+  defp plural(_count, word), do: word <> "s"
 
   def render_flow_governance_filters(data) do
     filters = Map.get(data, :filters, %{})
@@ -148,7 +222,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
     filters = Map.get(data, :filters, %{})
 
     """
-    <h2 class="section-title">State Metadata</h2>
+    <h2 class="section-title">State metadata</h2>
     <form class="flow-governance-meta-form" action="/dashboard/flow/governance" method="get" aria-label="State metadata filters">
       #{governance_filter_inputs(filters, @metadata_fields ++ ["limit"])}
       <label class="flow-policy-field"><span>Workflow type</span><input class="flow-search-input mono" type="search" name="meta_type" value="#{escape_attr(Map.get(filters, :meta_type, "") || "")}" title="Required workflow type with an indexed state metadata policy" required></label>
@@ -190,11 +264,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
       end
 
     """
-    <h2 class="section-title">State Metadata Results <span class="badge badge-idle">#{escape(Map.get(result, :command, "FLOW.QUERY"))}</span></h2>
+    <h2 class="section-title">State metadata results <span class="badge badge-idle">#{escape(Map.get(result, :command, "FLOW.QUERY"))}</span></h2>
     #{state_meta_status(result)}
     #{FlowQueryResults.render_flow_query_metadata(Map.take(result, [:quality]))}
     <div class="table-scroll" role="region" aria-label="Workflow state metadata results" tabindex="0"><table>
-      <thead><tr><th>ID</th><th>Type</th><th>Current State</th><th>Metadata State</th><th>Indexed Key</th><th>Metadata</th><th>Updated</th></tr></thead>
+      <thead><tr><th>ID</th><th>Type</th><th>Current state</th><th>Metadata state</th><th>Indexed key</th><th>Metadata</th><th>Updated</th></tr></thead>
       <tbody>#{rendered_rows}</tbody>
     </table></div>
     #{metadata_pagination(result, filters)}
@@ -214,7 +288,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
     scope = if is_map(review), do: Map.get(review, :scope, ""), else: ""
 
     """
-    <h2 class="section-title">Circuit Actions</h2>
+    <h2 class="section-title">Circuit actions</h2>
     <form class="flow-search" action="/dashboard/flow/governance" method="get" aria-label="Review circuit scope">
       #{governance_filter_inputs(filters)}
       <label class="flow-policy-field"><span>Effect scope</span><input class="flow-search-input mono" type="search" name="circuit_review_scope" value="#{escape_attr(scope)}" placeholder="effect:payment.charge" required></label>
@@ -254,7 +328,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
     closed = Enum.count(circuits, &(Map.get(&1, :status) == :closed))
 
     """
-    <h2 class="section-title">Circuit Status Mix</h2>
+    <h2 class="section-title">Circuit status mix</h2>
     <div class="flow-bars" role="img" aria-label="Circuit status distribution">
       #{circuit_bar("open", open, total, "status-bad")}
       #{circuit_bar("half-open", half_open, total, "status-warn")}
@@ -274,7 +348,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
     """
     <h2 class="section-title">Circuits</h2>
     <div class="table-scroll" role="region" aria-label="Governance circuits" tabindex="0"><table>
-      <thead><tr><th>Scope</th><th>Status</th><th>Failures</th><th>Threshold</th><th>Retry After</th><th>Last Failure</th><th>Last Success</th><th>Updated</th><th>Actions</th></tr></thead>
+      <thead><tr><th>Scope</th><th>Status</th><th>Failures</th><th>Threshold</th><th>Retry after</th><th>Last failure</th><th>Last success</th><th>Updated</th><th>Actions</th></tr></thead>
       <tbody>#{rows}</tbody>
     </table></div>
     """
@@ -312,7 +386,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
     """
     <h2 class="section-title">Budgets</h2>
     <div class="table-scroll" role="region" aria-label="Governance budgets" tabindex="0"><table>
-      <thead><tr><th>Scope</th><th>Used</th><th>Remaining</th><th>Limit</th><th>Over</th><th>Reservations</th><th>Window</th><th>Window Start</th></tr></thead>
+      <thead><tr><th>Scope</th><th>Used</th><th>Remaining</th><th>Limit</th><th>Over</th><th>Reservations</th><th>Window</th><th>Window start</th></tr></thead>
       <tbody>#{rows}</tbody>
     </table></div>
     """
@@ -558,9 +632,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
       end
 
     """
-    <h2 class="section-title">Circuit Timeline</h2>
+    <h2 class="section-title">Circuit timeline</h2>
     <div class="table-scroll" role="region" aria-label="Governance circuit timeline" tabindex="0"><table>
-      <thead><tr><th>Time</th><th>Scope</th><th>Event</th><th>Status</th><th>Failures</th><th>Latency</th><th>Error Class</th></tr></thead>
+      <thead><tr><th>Time</th><th>Scope</th><th>Event</th><th>Status</th><th>Failures</th><th>Latency</th><th>Error class</th></tr></thead>
       <tbody>#{rows}</tbody>
     </table></div>
     """

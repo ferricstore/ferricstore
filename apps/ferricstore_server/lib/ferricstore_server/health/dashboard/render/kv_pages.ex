@@ -2,7 +2,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
   import FerricstoreServer.Health.Dashboard.Format
   import FerricstoreServer.Health.Dashboard.Render.Overview
   alias Ferricstore.Commands.Catalog.Entries
-  alias FerricstoreServer.Health.Dashboard.Render.TableValue
+  alias FerricstoreServer.Health.Dashboard.Render.{PageStatus, TableValue}
 
   @keyspace_dashboard_default_limit 50
   @keyspace_dashboard_max_limit 500
@@ -99,7 +99,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
   def render_keyspace_inspector(%{found?: nil, key: key}) do
     """
     <div class="kv-inspector">
-      <h2 class="section-title">Key Inspector</h2>
+      <h2 class="section-title">Key inspector</h2>
       <div class="flow-alert flow-alert-error" role="status">Key metadata unavailable for <code>#{escape(key)}</code>. A shard could not be inspected; absence is unknown. Submit the exact key again to retry.</div>
     </div>
     """
@@ -108,7 +108,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
   def render_keyspace_inspector(%{found?: false, key: key}) do
     """
     <div class="kv-inspector">
-      <h2 class="section-title">Key Inspector</h2>
+      <h2 class="section-title">Key inspector</h2>
       <div class="flow-alert flow-alert-error">No live key metadata found for <code>#{escape(key)}</code>.</div>
       <div class="flow-filter-note">Requires +GET and read access to the selected key.</div>
     </div>
@@ -118,7 +118,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
   def render_keyspace_inspector(inspected) do
     """
     <div class="kv-inspector">
-      #{render_ops_summary("Key Inspector", [%{label: "Key", value: inspected.key}, %{label: "Type", value: inspected.type}, %{label: "Shard", value: "Shard #{inspected.shard}"}, %{label: "Location", value: inspected.location, detail: "TTL #{inspected.ttl} · #{inspected.size}"}])}
+      #{render_ops_summary("Key inspector", [%{label: "Key", value: inspected.key}, %{label: "Type", value: inspected.type}, %{label: "Shard", value: "Shard #{inspected.shard}"}, %{label: "Location", value: inspected.location, detail: "TTL #{inspected.ttl} · #{inspected.size}"}])}
       <div class="flow-filter-note">Requires +GET and read access to the selected key.</div>
     </div>
     """
@@ -206,14 +206,14 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
     #{availability}
     <table>
       <thead>
-        <tr><th>Logical Key</th><th>Physical kind</th><th>Shard</th><th>Location</th><th>Size</th><th>TTL</th><th>LFU</th><th>Physical Key (encoded)</th></tr>
+        <tr><th>Logical key</th><th>Physical kind</th><th>Shard</th><th>Location</th><th>Size</th><th>TTL</th><th>LFU</th><th>Physical key (encoded)</th></tr>
       </thead>
       <tbody>#{body}</tbody>
     </table>
     """
 
     """
-    <h2 class="section-title">Key Metadata <span class="badge badge-idle">#{badge}#{limited}</span></h2>
+    <h2 class="section-title">Key metadata <span class="badge badge-idle">#{badge}#{limited}</span></h2>
     #{if scanned != "" or exclusions != "", do: ~s(<p class="flow-filter-note">#{scanned}#{exclusions}</p>), else: ""}
     <p class="flow-filter-note">Physical keys use JSON string notation, including escaped control bytes. Base64 denotes invalid UTF-8.</p>
     #{accessible_table("Key metadata", table)}
@@ -254,19 +254,59 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
         true -> format_duration_us(slowest)
       end
 
-    render_ops_summary("Command Summary", [
-      %{label: "Commands", value: format_number(Map.get(summary, :total_commands, 0))},
-      %{
-        label: "Avg commands/sec",
-        value: to_string(Map.get(summary, :ops_per_sec, 0.0)),
-        detail: "since start"
-      },
-      %{
-        label: "Slowlog",
-        value: if(unavailable?, do: "Unavailable", else: format_number(count || 0))
-      },
-      %{label: "Slowest", value: latency}
-    ])
+    total = Map.get(summary, :total_commands, 0)
+
+    slow =
+      cond do
+        unavailable? ->
+          []
+
+        is_integer(count) and count > 0 and is_number(slowest) ->
+          [
+            "#{format_number(count)} slow log #{if count == 1, do: "entry", else: "entries"}, slowest #{format_duration_us(slowest)}"
+          ]
+
+        true ->
+          ["no slow commands"]
+      end
+
+    status =
+      cond do
+        unavailable? ->
+          PageStatus.render("commands", :warning, "Slow log unavailable", [
+            "#{format_number(total)} commands since start"
+          ])
+
+        total in [0, nil] ->
+          PageStatus.render("commands", :idle, "No commands since start")
+
+        true ->
+          PageStatus.render(
+            "commands",
+            :idle,
+            "#{format_number(total)} commands since start",
+            ["#{Map.get(summary, :ops_per_sec, 0.0)}/s on average"] ++ slow
+          )
+      end
+
+    status <>
+      render_ops_summary(
+        "Command Summary",
+        [
+          %{label: "Commands", value: format_number(Map.get(summary, :total_commands, 0))},
+          %{
+            label: "Avg commands/sec",
+            value: to_string(Map.get(summary, :ops_per_sec, 0.0)),
+            detail: "since start"
+          },
+          %{
+            label: "Slowlog",
+            value: if(unavailable?, do: "Unavailable", else: format_number(count || 0))
+          },
+          %{label: "Slowest", value: latency}
+        ],
+        heading: :hidden
+      )
   end
 
   def render_command_slowlog_table(data) do
@@ -275,12 +315,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
     body =
       case rows do
         [] ->
-          message =
-            if get_in(data, [:summary, :slowlog_status]) == :unavailable,
-              do: "Slow Log unavailable. Retry to collect command samples.",
-              else: "No slow commands recorded."
-
-          ~s(<tr><td colspan="4" class="c-muted">#{message}</td></tr>)
+          ""
 
         _ ->
           Enum.map_join(rows, "\n", fn row ->
@@ -295,12 +330,26 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
           end)
       end
 
+    content =
+      cond do
+        rows != [] ->
+          """
+          <table>
+            <thead><tr><th>Command</th><th>Entries</th><th>Worst</th><th>Average</th></tr></thead>
+            <tbody>#{body}</tbody>
+          </table>
+          """
+
+        get_in(data, [:summary, :slowlog_status]) == :unavailable ->
+          ~s(<p class="section-empty">Slow log unavailable. Retry to collect command samples.</p>)
+
+        true ->
+          ~s(<p class="section-empty">No slow commands recorded. <a href="/dashboard/slowlog">Open Slow log</a></p>)
+      end
+
     """
-    <h2 class="section-title">Slow Log By Command</h2>
-    <table>
-      <thead><tr><th>Command</th><th>Entries</th><th>Worst</th><th>Average</th></tr></thead>
-      <tbody>#{body}</tbody>
-    </table>
+    <h2 class="section-title">Slow log by command</h2>
+    #{content}
     """
   end
 
@@ -323,8 +372,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
       end)
 
     """
-    <h2 class="section-title">Command Groups</h2>
-    <div class="kv-command-grid">#{body}</div>
+    <details class="dashboard-disclosure" id="command-reference"><summary>Command reference</summary>
+    <div class="dashboard-disclosure-body"><div class="kv-command-grid">#{body}</div></div>
+    </details>
     """
   end
 
@@ -388,24 +438,46 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
         hot_reads + cold_reads + Map.get(hotcold, :total_misses, 0)
       )
 
-    render_ops_summary("Read Path Summary", [
-      %{
-        label: "Hit Rate",
-        value: if(lookups == 0, do: "No read samples", else: "#{hotcold.hit_ratio}%")
-      },
-      %{
-        label: "Hot Reads",
-        value: format_number(hot_reads),
-        detail_html: "sampled #{sampled_tag(Map.get(hotcold, :sample_rate, 1))}"
-      },
-      %{
-        label: "Cold Reads",
-        value: format_number(cold_reads),
-        detail: "#{Map.get(hotcold, :cold_reads_per_sec, 0.0)}/sec average since start"
-      },
-      %{label: "Misses", value: format_number(Map.get(hotcold, :total_misses, 0))}
-    ])
+    status =
+      if lookups == 0 do
+        PageStatus.render("reads", :idle, "No read samples yet")
+      else
+        PageStatus.render("reads", :idle, "#{hotcold.hit_ratio}% hit rate", [
+          hot_reads_label(hot_reads, Map.get(hotcold, :sample_rate, 1)),
+          "#{format_number(cold_reads)} cold reads from disk",
+          "#{format_number(Map.get(hotcold, :total_misses, 0))} misses"
+        ])
+      end
+
+    status <>
+      render_ops_summary(
+        "Read Path Summary",
+        [
+          %{
+            label: "Hit rate",
+            value: if(lookups == 0, do: "No read samples", else: "#{hotcold.hit_ratio}%")
+          },
+          %{
+            label: "Hot reads",
+            value: format_number(hot_reads),
+            detail_html: "sampled #{sampled_tag(Map.get(hotcold, :sample_rate, 1))}"
+          },
+          %{
+            label: "Cold reads",
+            value: format_number(cold_reads),
+            detail: "#{Map.get(hotcold, :cold_reads_per_sec, 0.0)}/sec average since start"
+          },
+          %{label: "Misses", value: format_number(Map.get(hotcold, :total_misses, 0))}
+        ],
+        heading: :hidden
+      )
   end
+
+  # Hot reads are counted 1 in N; the figure is an estimate, unlike cold reads and misses.
+  defp hot_reads_label(count, rate) when is_integer(rate) and rate > 1,
+    do: "about #{format_number(count)} hot reads, estimated from 1-in-#{rate} sampling"
+
+  defp hot_reads_label(count, _rate), do: "#{format_number(count)} hot reads"
 
   def render_read_prefix_table(data) do
     rows = Map.get(data, :prefixes, [])
@@ -422,17 +494,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
               <td class="mono">#{TableValue.render(row.prefix, "read prefix")}</td>
               <td>#{format_number(row.hot_reads)}</td>
               <td>#{format_number(row.cold_reads)}</td>
-              <td>#{Float.round(row.cold_pct, 1)}%</td>
+              <td class="size-cell"><span class="size-value">#{Float.round(row.cold_pct, 1)}%</span><span class="size-track"><span class="size-bar is-cold" style="width: #{row.cold_pct |> max(0.0) |> min(100.0) |> round()}%"></span></span></td>
             </tr>
             """
           end)
       end
 
     """
-    <h2 class="section-title">Prefix Read Pressure</h2>
+    <h2 class="section-title">Prefix read pressure</h2>
     #{accessible_table("Prefix read pressure", """
     <table>
-      <thead><tr><th>Prefix</th><th>Hot Reads #{sampled_tag(:persistent_term.get(:ferricstore_read_sample_rate, 100))}</th><th>Cold Reads</th><th>Cold %</th></tr></thead>
+      <thead><tr><th>Prefix</th><th>Hot reads #{sampled_tag(:persistent_term.get(:ferricstore_read_sample_rate, 100))}</th><th>Cold reads</th><th>Cold %</th></tr></thead>
       <tbody>#{body}</tbody>
     </table>
     """)}
@@ -452,47 +524,66 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
     largest =
       Enum.max_by(shards, & &1.disk_bytes, fn -> %{index: "-", disk_bytes: 0} end)
 
-    render_ops_summary("Storage Summary", [
-      %{
-        label: "Data directory",
-        value: format_bytes(data.total_disk_bytes),
-        detail: "All files, including shard and auxiliary directories"
-      },
-      %{
-        label: "Shard data directories",
-        value: format_bytes(shard_bytes),
-        detail: "Sum of the shard directories below"
-      },
-      %{
-        label: "Other directories",
-        value: format_bytes(max(data.total_disk_bytes - shard_bytes, 0)),
-        detail: "Data-directory files outside shard directories"
-      },
-      %{
-        label: "Data + hint files",
-        value: format_number(data.total_files),
-        detail: "Recognized data and hint files only"
-      },
-      %{
-        label: "Largest Shard",
-        value: "Shard #{largest.index}",
-        detail: format_bytes(largest.disk_bytes)
-      },
-      %{
-        label: "Data Files",
-        value: format_number(data_files),
-        detail: "#{format_number(hint_files)} Hint Files"
-      }
-    ])
+    other_bytes = max(data.total_disk_bytes - shard_bytes, 0)
+
+    largest_detail =
+      if shard_bytes > 0,
+        do: [
+          "largest: shard #{largest.index} at #{format_bytes(largest.disk_bytes)}, #{round(largest.disk_bytes * 100 / shard_bytes)}% of shard data"
+        ],
+        else: []
+
+    status =
+      PageStatus.render(
+        "storage",
+        :idle,
+        "#{format_bytes(data.total_disk_bytes)} on disk across #{length(shards)} #{if length(shards) == 1, do: "shard", else: "shards"}",
+        largest_detail ++ ["#{format_bytes(other_bytes)} outside shard directories"]
+      )
+
+    status <>
+      render_ops_summary(
+        "Storage Summary",
+        [
+          %{
+            label: "Data directory",
+            value: format_bytes(data.total_disk_bytes),
+            detail: "All files, including shard and auxiliary directories"
+          },
+          %{
+            label: "Shard data directories",
+            value: format_bytes(shard_bytes),
+            detail: "Sum of the shard directories below"
+          },
+          %{
+            label: "Other directories",
+            value: format_bytes(max(data.total_disk_bytes - shard_bytes, 0)),
+            detail: "Data-directory files outside shard directories"
+          },
+          %{
+            label: "Data + hint files",
+            value: format_number(data.total_files),
+            detail: "Recognized data and hint files only"
+          },
+          %{
+            label: "Data files",
+            value: format_number(data_files),
+            detail: "#{format_number(hint_files)} hint files"
+          }
+        ],
+        heading: :hidden
+      )
   end
 
   def render_storage_table(shards) do
+    largest = shards |> Enum.map(& &1.disk_bytes) |> Enum.max(fn -> 0 end) |> max(1)
+
     rows =
       Enum.map_join(shards, "\n", fn shard ->
         """
         <tr>
           <td>#{shard.index}</td>
-          <td>#{format_bytes(shard.disk_bytes)}</td>
+          <td class="size-cell"><span class="size-value">#{format_bytes(shard.disk_bytes)}</span><span class="size-track"><span class="size-bar" style="width: #{min(100, round(shard.disk_bytes * 100 / largest))}%"></span></span></td>
           <td>#{shard.data_file_count}</td>
           <td>#{shard.hint_file_count}</td>
         </tr>
@@ -500,11 +591,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
       end)
 
     """
-    <h2 class="section-title">Per-Shard Storage</h2>
+    <h2 class="section-title">Per-shard storage</h2>
     <p class="flow-filter-note">Directory totals include every file beneath each shard data directory. Files outside those directories are counted in Other directories.</p>
     <table>
       <thead>
-        <tr><th>Shard</th><th>Shard directory size</th><th>Data Files</th><th>Hint Files</th></tr>
+        <tr><th>Shard</th><th>Shard directory size</th><th>Data files</th><th>Hint files</th></tr>
       </thead>
       <tbody>
         #{rows}

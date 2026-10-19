@@ -67,9 +67,14 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-row-menu-panel { display: grid; gap: 6px; min-width: 180px; margin-top: 6px; padding: 8px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface-raised); white-space: normal; }
       .flow-row-menu-item { display: block; padding: 6px 8px; border-radius: 6px; color: var(--text-body); text-decoration: none; }
       .flow-row-menu-item:hover { background: var(--surface-selected); }
-      .table-scroll .flow-policy-table { min-width: 1480px; }
+      .table-scroll .flow-policy-table { min-width: 1180px; }
+      .flow-policy-table td:nth-child(4), .flow-policy-table td:nth-child(7) { white-space: nowrap; }
+      .flow-filter-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 0 0 12px; }
+      .flow-filter-row .flow-search-input { width: 260px; max-width: 100%; }
+      .flow-policy-table td:first-child .flow-run-secondary { display: block; margin-top: 2px; font-family: var(--font-sans); }
       :is(.flow-policy-table, .flow-schedules-table) tr > :first-child:not([colspan]) { position: sticky; left: 0; z-index: 2; background: var(--surface-raised); min-width: 180px; width: 180px; border-right: 1px solid var(--line); }
       :is(.flow-policy-table, .flow-schedules-table) tr > :last-child:not([colspan]) { position: sticky; right: 0; z-index: 2; background: var(--surface-raised); min-width: 280px; width: 280px; border-left: 1px solid var(--line); white-space: normal; }
+      .flow-policy-table tr > :last-child:not([colspan]) { min-width: 96px; width: 96px; }
       :is(.flow-policy-table, .flow-schedules-table) thead tr > :is(:first-child, :last-child) { z-index: 3; background: var(--surface-selected); }
       .flow-schedule-definition-row > td { white-space: normal; }
       .flow-schedule-definition-row .dashboard-disclosure { margin: 0; }
@@ -89,7 +94,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-duration-control .flow-search-input { width: 100%; min-width: 0; }
       .flow-policy-override-list { display: grid; gap: 6px; margin-top: 10px; max-height: 260px; overflow: auto; }
       .flow-policy-override-list .flow-pill { width: fit-content; max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
-      body { font-family: var(--font-sans); background: var(--surface-base); color: var(--text-body); padding: 0; min-height: 100vh; }
+      body { font-family: var(--font-sans); font-size: 0.875rem; line-height: 1.5; background: var(--surface-base); color: var(--text-body); padding: 0; min-height: 100vh; }
       [data-live-component] { display: contents; }
 
 
@@ -243,12 +248,52 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-reclaim-advanced[open] > summary { margin-bottom: 10px; }
 
       /* Consensus */
-      .consensus-status, .doctor-status { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-bottom: 16px; padding: 14px 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); }
-      .consensus-status strong, .doctor-status strong { color: var(--text-strong); font-weight: 500; }
-      .consensus-status span, .doctor-status span { color: var(--text-muted); font-size: 0.8125rem; }
-      .consensus-status.is-healthy, .doctor-status.is-healthy { border-color: #1e5a47; background: #10241d; }
-      .consensus-status.is-warning, .doctor-status.is-warning { border-color: #4a3818; background: #1a1710; }
+      .page-status, .consensus-status, .doctor-status { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-bottom: 16px; padding: 14px 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); }
+      .page-status strong, .consensus-status strong, .doctor-status strong { color: var(--text-strong); font-weight: 500; }
+      .page-status span, .consensus-status span, .doctor-status span { color: var(--text-muted); font-size: 0.8125rem; }
+      .page-status.is-healthy, .consensus-status.is-healthy, .doctor-status.is-healthy { border-color: #1e5a47; background: #10241d; }
+      .page-status.is-warning, .consensus-status.is-warning, .doctor-status.is-warning { border-color: #4a3818; background: #1a1710; }
       .consensus-status.is-degraded, .doctor-status.is-degraded { border-color: #5a2a1f; background: #1d1311; }
+      .page-status.is-degraded { border-color: #5a2a1f; background: #1d1311; }
+      .page-status span { overflow-wrap: anywhere; min-width: 0; }
+      .page-status span + span::before { content: "·"; margin-right: 12px; color: var(--text-faint); }
+      .page-status .page-status-action { margin-left: auto; font-size: 0.875rem; }
+      .page-status .page-status-action::before { content: none; }
+      .page-status-action a { color: var(--accent); }
+      .runs-split { margin: -4px 0 20px; }
+      .runs-split .overview-state-bar { margin-top: 0; }
+      .overview-state.is-failed { background: var(--danger); }
+      .flow-state-attention .badge + .badge { margin-left: 4px; }
+      .section-head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 8px 16px; margin-bottom: 12px; }
+      .section-head .section-title { margin-bottom: 0; }
+      .section-head-form { display: flex; align-items: flex-end; gap: 8px; }
+      .section-head-form .flow-filter-field { display: flex; align-items: center; gap: 8px; margin: 0; }
+      .section-head-form .flow-filter-field span { color: var(--text-muted); font-size: 0.8125rem; }
+      .section-head-form .flow-search-input { width: auto; min-width: 160px; }
+      .flow-workers-table th:nth-child(2) { width: 34%; }
+      .worker-leases { display: flex; align-items: center; gap: 10px; }
+      .worker-leases .flow-link { min-width: 2ch; text-align: right; }
+      .worker-lease-bar { display: block; height: 6px; border-radius: 999px; background: var(--accent); overflow: hidden; }
+      .worker-lease-bar .is-expired { display: block; height: 100%; background: var(--warn); }
+      .flow-local-scope { margin-bottom: 20px; }
+      .section-empty a { color: var(--accent); }
+      .size-cell { display: flex; align-items: center; gap: 12px; }
+      .size-value { min-width: 9ch; font-variant-numeric: tabular-nums; }
+      .size-track { flex: 1; max-width: 360px; height: 6px; border-radius: 999px; background: var(--line); overflow: hidden; }
+      .size-bar { display: block; height: 100%; border-radius: 999px; background: var(--info); }
+      .size-bar.is-cold { background: var(--warn); }
+      .stat-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); margin: 0 0 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); overflow: hidden; }
+      .stat-strip > div { padding: 12px 16px; box-shadow: 1px 1px 0 var(--line-subtle); }
+      .stat-strip dt { color: var(--text-muted); font-size: 0.75rem; }
+      .stat-strip dd { margin: 2px 0 0; color: var(--text-strong); font-family: var(--font-mono); font-size: 1.125rem; }
+      .stat-strip .is-warning dd { color: var(--warn); }
+      .stat-strip .is-degraded dd { color: var(--danger-text); }
+      .section-empty p + p, .section-empty p + .flow-lineage-hint-links, .section-empty p + a { margin-top: 10px; }
+      .flow-query-toolbar .flow-section-note { margin: 0; }
+      .flow-query-console .flow-query-help { flex-direction: column; gap: 4px; }
+      .section-empty { margin: 4px 0 24px; padding: 16px 18px; border: 1px dashed var(--line-strong); border-radius: 12px; color: var(--text-muted); font-size: 0.875rem; }
+      .flow-due-cell .flow-due-when { display: block; color: var(--text-strong); }
+      .flow-state-due { display: block; margin-top: 2px; color: var(--text-muted); font-size: 0.75rem; }
       .doctor-checks td strong { display: block; color: var(--text-strong); font-weight: 500; }
       .doctor-checks td strong + .mono { color: var(--text-faint); font-size: 0.75rem; }
       .consensus-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr)); gap: 12px; margin-bottom: 16px; }
@@ -304,10 +349,11 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       @media (prefers-reduced-motion: reduce) { .flow-lifecycle-step, .flow-lifecycle-step > * { animation: none !important; } }
 
       /* Operational summary cards */
-      .ops-summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 20px; }
-      .ops-summary-card { background: var(--surface-raised); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; min-width: 0; }
-      .ops-summary-label { font-size: 0.75rem; color: var(--text-muted); text-transform: none; letter-spacing: 0; margin-bottom: 8px; }
-      .ops-summary-value { font-size: 1.45rem; font-weight: 800; color: var(--text-strong); overflow-wrap: anywhere; font-family: var(--font-mono); }
+      .ops-summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0; margin-bottom: 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); overflow: hidden; }
+      .ops-summary-card { box-shadow: 1px 1px 0 var(--line-subtle); padding: 12px 16px; min-width: 0; }
+      .ops-summary-label { font-size: 0.75rem; color: var(--text-muted); text-transform: none; letter-spacing: 0; margin-bottom: 4px; }
+      .ops-summary-value { font-size: 1.25rem; font-weight: 500; color: var(--text-strong); overflow-wrap: anywhere; font-family: var(--font-mono); letter-spacing: -0.01em; }
+      .ops-summary-value.is-text { padding-block: 4px; font-family: var(--font-sans); font-size: 1.0625rem; font-weight: 500; letter-spacing: 0; }
       .ops-summary-detail { color: var(--text-muted); font-size: 0.75rem; margin-top: 6px; overflow-wrap: anywhere; }
 
       /* FerricFlow */
@@ -334,6 +380,10 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-execution-summary dt { color: var(--text-muted); font-size: 0.75rem; margin-bottom: 6px; }
       .flow-execution-summary dd { margin: 0; font-size: 0.875rem; color: var(--text-strong); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
       .flow-nav-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 4px 0 18px; }
+      .flow-scope-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 20px; margin: 0 0 16px; }
+      .flow-scope-bar .flow-search { flex: 0 1 560px; }
+      .flow-scope-bar-scope { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+      .flow-scope-bar-label { color: var(--text-faint); font-size: 0.8125rem; }
       .flow-tabs { display: flex; gap: 10px; flex-wrap: wrap; margin: 4px 0 18px; }
       .flow-nav-row .flow-tabs { margin: 0; }
       .flow-tab-group { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 5px 6px; border: 1px solid var(--line); border-radius: 8px; background: rgba(18, 19, 26, 0.55); }
@@ -345,7 +395,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-search { display: flex; align-items: center; gap: 6px; min-width: min(100%, 360px); }
       .flow-search-input { flex: 1; min-width: 0; height: 36px; background: var(--surface-base); color: var(--text-body); border: 1px solid var(--line-strong); border-radius: 8px; padding: 0 10px; font-size: 0.78rem; font-family: var(--font-mono); }
       textarea.flow-schedule-payload { height: auto; min-height: 8rem; padding: 10px; line-height: 1.5; resize: vertical; }
-      .flow-index-identity { max-width: 28ch; min-width: 16ch; overflow-wrap: anywhere; white-space: normal; }
+      .flow-index-identity { width: 44ch; min-width: 24ch; overflow-wrap: anywhere; white-space: normal; }
       .flow-index-build-identity { min-width: 14ch; max-width: 32ch; overflow-wrap: anywhere; white-space: normal; }
       .flow-index-validation { max-width: 30ch; overflow-wrap: anywhere; white-space: normal; }
       .flow-index-validation code { white-space: normal; overflow-wrap: anywhere; }
@@ -387,12 +437,11 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-index-services dt { color: var(--text-muted); font-size: 0.75rem; }
       .flow-index-services dd { margin: 0; font-family: var(--font-mono); font-size: 0.82rem; overflow-wrap: anywhere; }
       .config-parameters-table { width: 100%; table-layout: fixed; }
-      .config-parameters-table .config-name { width: 20%; }
-      .config-parameters-table .config-value { width: 24%; }
-      .config-parameters-table .config-source { width: 10%; }
-      .config-parameters-table .config-scope { width: 11%; }
+      .config-parameters-table .config-name { width: 26%; }
+      .config-parameters-table .config-value { width: 28%; }
       .config-parameters-table .config-mode { width: 12%; }
-      .config-parameters-table .config-notes { width: 23%; }
+      .config-parameters-table .config-notes { width: 34%; }
+      .config-parameters-table td:first-child .flow-run-secondary { display: block; margin-top: 2px; font-family: var(--font-sans); }
       .config-parameters-table td, .config-parameters-table th { overflow-wrap: anywhere; }
       .config-parameters-table pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; }
       #flow-policy-editor .flow-policy-panel { background: none; border: 0; border-top: 1px solid var(--line); border-radius: 0; box-shadow: none; padding: 16px 0; }
@@ -403,20 +452,21 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-filter-form .flow-filter-field .flow-filter-limit { width: 80px; }
       .flow-filter-form.flow-state-filter-form { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: end; gap: 12px; width: 100%; flex: 1 0 100%; }
       .flow-state-filter-form .flow-search-input { min-width: 0; max-width: none; }
-      .flow-filter-time-group { grid-column: span 3; display: grid; grid-template-columns: minmax(130px, 0.8fr) repeat(2, minmax(220px, 1fr)); gap: 12px; border: 0; padding: 0; min-width: 0; }
+      .flow-filter-time-group { grid-column: span 2; display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; border: 0; padding: 0; min-width: 0; }
       .flow-filter-time-group legend { color: var(--text-muted); font-size: 0.75rem; padding-bottom: 6px; }
       .flow-state-filter-form:has(noscript p) .flow-filter-time-group { grid-column: 1 / -1; grid-template-columns: minmax(140px, 0.7fr) minmax(160px, 0.9fr) repeat(2, minmax(260px, 1fr)); }
       .flow-state-filter-form noscript { grid-column: 1 / -1; }
       .flow-filter-actions { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
       .flow-filter-actions .flow-filter-clear { padding-block: 8px; }
-      .flow-state-filter-form .flow-filter-actions { grid-column: 1 / -1; }
-      .table-scroll .flow-states-table { table-layout: fixed; min-width: 1560px; }
-      .flow-states-table th:first-child { width: 190px; }
-      .flow-states-table th:nth-child(2) { width: 240px; }
-      .flow-states-table th:nth-child(6) { width: 145px; }
-      .flow-states-table th:nth-child(7) { width: 105px; }
+      .flow-state-filter-form .flow-filter-actions { grid-column: span 2; align-self: end; }
+      .table-scroll .flow-states-table { table-layout: fixed; min-width: 820px; }
+      .flow-states-table th:first-child { width: 200px; }
+      .flow-states-table th:nth-child(2) { width: 160px; }
+      .flow-states-table th:nth-child(4) { width: 110px; }
+      .flow-states-table th:nth-child(5) { width: 120px; }
+      .flow-states-table th:nth-child(6) { width: 100px; }
       .flow-states-table th:first-child, .flow-states-table td:first-child { position: sticky; left: 0; z-index: 1; background: var(--surface-raised); }
-      .flow-states-table th:nth-child(2), .flow-states-table td:nth-child(2) { position: sticky; left: 190px; z-index: 1; background: var(--surface-raised); border-right: 1px solid var(--line-strong); }
+      .flow-states-table th:nth-child(2), .flow-states-table td:nth-child(2) { position: sticky; left: 200px; z-index: 1; background: var(--surface-raised); border-right: 1px solid var(--line-strong); }
       .flow-states-table thead th:nth-child(-n+2) { background: var(--surface-selected); z-index: 3; }
       .flow-states-table td:nth-child(-n+2) { white-space: normal; overflow-wrap: anywhere; }
       .flow-action-target, dl.flow-action-review, .flow-value-modal-provenance { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px 18px; margin-block: 12px; min-width: 0; }
@@ -793,7 +843,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       td { padding: 9px 14px; border-bottom: 1px solid var(--line-subtle); }
       tr:last-child td { border-bottom: none; }
       tr:hover td { background: var(--surface-selected); }
-      .table-scroll { max-width: 100%; overflow-x: auto; border-radius: 8px; -webkit-overflow-scrolling: touch; scrollbar-width: thin; scrollbar-color: var(--line-strong) var(--surface-base); }
+      .table-scroll { position: relative; max-width: 100%; overflow-x: auto; border-radius: 12px; -webkit-overflow-scrolling: touch; scrollbar-width: thin; scrollbar-color: var(--line-strong) var(--surface-base); }
       .table-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
       .table-scroll::-webkit-scrollbar { height: 8px; }
       .table-scroll::-webkit-scrollbar-track { background: var(--surface-base); border-radius: 8px; }
@@ -929,7 +979,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-action-confirm-panel .flow-check-label { align-items: start; overflow-wrap: anywhere; }
       .flow-action-confirm-panel .flow-check-label input { flex-shrink: 0; margin-top: 2px; }
       .flow-operations-panel, .dashboard-disclosure { margin: 18px 0; border-block: 1px solid var(--line); background: transparent; }
-      .flow-operations-panel > summary, .dashboard-disclosure > summary { display: list-item; list-style-position: inside; cursor: pointer; padding: 12px 16px; color: var(--text-strong); font-weight: 600; }
+      .flow-operations-panel > summary, .dashboard-disclosure > summary { display: list-item; list-style-position: inside; cursor: pointer; padding: 12px 16px; color: var(--text-strong); font-size: 0.9375rem; font-weight: 600; }
       .flow-operations-panel > summary > .c-muted { float: right; margin-left: 16px; }
       .flow-operations-panel > summary > [data-flow-action-stale-summary] { margin-left: 12px; }
       .flow-operations-panel > summary::after, .dashboard-disclosure > summary::after, .flow-query-visualization > summary::after { content: ""; display: block; clear: both; }
@@ -1103,7 +1153,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .pulse-dot-green { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); display: inline-block; animation: pulseLiveGreen 2s infinite; vertical-align: middle; }
       .pulse-dot-amber { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); display: inline-block; animation: pulseLiveAmber 2s infinite; vertical-align: middle; }
 
-      /* Keyboard Shortcuts Modal */
+      /* Keyboard shortcuts Modal */
       .keyboard-modal { color: var(--text-body); margin: auto; width: 480px; padding: 0; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-raised); max-width: calc(100vw - 48px); max-height: calc(100vh - 48px); }
       .keyboard-modal::backdrop { background: rgba(0,0,0,0.7); }
       .keyboard-modal:not([open]) { display: none; }

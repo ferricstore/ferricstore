@@ -400,7 +400,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailActions do
           assert get_opts[:payload] == false
 
           assert_receive {:dashboard_value_refs, ["flow-value:payload", "flow-value:invoice"]}
-          assert String.contains?(html, "Value Inspector")
+          assert String.contains?(html, "Value inspector")
           refute String.contains?(html, ~s(data-live-component="flow_values"))
           assert String.contains?(html, ~s(data-live-component="flow_value_store"))
           assert String.contains?(html, ~s(href="#flow-value-))
@@ -596,7 +596,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailActions do
 
           html = Dashboard.render_flow_detail_page(data)
 
-          assert String.contains?(html, "Debug Inspector")
+          assert String.contains?(html, "Debug inspector")
           assert String.contains?(html, "Lease")
           assert String.contains?(html, "running until")
           assert String.contains?(html, "Storage")

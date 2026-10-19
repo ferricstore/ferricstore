@@ -195,7 +195,7 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowWidgetsTest do
       assert html =~ "1 event on this page"
       refute html =~ "1 events"
       refute html =~ "flow-history-controls"
-      assert html =~ "Raw Events"
+      assert html =~ "Raw events"
     end
 
     test "paging controls remain for partial, cursor, custom-size, and failed history views" do

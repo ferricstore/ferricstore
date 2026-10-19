@@ -155,7 +155,7 @@ defmodule FerricstoreServer.Health.Dashboard.SystemFifthReviewTest do
       })
 
     assert html =~ "Physical kind"
-    assert html =~ "Physical Key (encoded)"
+    assert html =~ "Physical key (encoded)"
 
     assert html =~
              "JSON " <> FerricstoreServer.Health.Dashboard.Format.escape(Jason.encode!(utf8))
@@ -388,11 +388,12 @@ defmodule FerricstoreServer.Health.Dashboard.SystemFifthReviewTest do
 
   test "28 Streams disclosures own their headings without repeated nested titles" do
     html = Dashboard.render_streams_page(%{})
-    assert length(Regex.scan(~r/<summary><span>Active Streams<\/span>/, html)) == 1
+    assert length(Regex.scan(~r/<summary><span>Active streams<\/span>/, html)) == 1
     refute html =~ ~r/<h2[^>]*>Active Streams/
     refute html =~ ~r/<h2[^>]*>Blocked Readers/
     refute html =~ "Stream Consumers"
-    assert html =~ "Filter loaded streams and consumer groups"
+    # Empty, the consumer groups disclosure is a prompt; its filter appears with rows.
+    assert html =~ "No active stream consumer groups loaded."
   end
 
   defp insert_keys(keys) do

@@ -24,6 +24,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables do
 
   defdelegate flow_state_operational_hint(state), to: Records
   defdelegate render_flow_states_sources(data), to: Records
+
+  defdelegate render_flow_states_overview(states, sampled, source_status, filters),
+    to: Records
+
   defdelegate render_flow_state_breakdown(types), to: Records
   defdelegate render_flow_custom_states(states), to: Records
 
@@ -31,8 +35,23 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables do
     to: Records
 
   defdelegate render_flow_workers(workers, filters \\ %{}), to: Records
+  defdelegate render_flow_workers_status(workers, filters), to: Records
+
+  defdelegate render_flow_workers_fifo(lanes, total_sampled, sample_limit, coverage),
+    to: Records
+
   defdelegate render_flow_running_records(records, total_sampled, sample_limit), to: Records
-  defdelegate render_flow_due_records(title, records, total_sampled, sample_limit), to: Records
+
+  defdelegate render_flow_due_records(
+                title,
+                records,
+                total_sampled,
+                sample_limit,
+                listed_total \\ nil
+              ),
+              to: Records
+
+  defdelegate render_flow_due_summary(due_now, scheduled, scheduled_total \\ nil), to: Records
   defdelegate render_flow_failures_rows(records), to: Records
   defdelegate render_flow_recent_records(records, limit \\ nil, source_status \\ :ok), to: Records
 

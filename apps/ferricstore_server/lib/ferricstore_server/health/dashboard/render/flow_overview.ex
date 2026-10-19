@@ -11,7 +11,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowOverview do
     due_count = Map.get(summary, :due_now_sampled, 0)
 
     """
-    <h2 class="section-title">Flow Overview <span class="badge badge-idle">#{bounded_sample_label(total_sampled, total_sampled, sample_limit)}</span></h2>
+    <h2 class="section-title">Flow overview <span class="badge badge-idle">#{bounded_sample_label(total_sampled, total_sampled, sample_limit)}</span></h2>
     <dl class="flow-overview-ribbon" aria-label="Workflow overview metrics">
       #{render_flow_summary_metric("Types", types_count, "discovered workflow types", scope_path("/dashboard/flow/states", filters))}
       #{render_flow_summary_metric("Active", active_count, "all nonterminal states")}
@@ -73,15 +73,22 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowOverview do
     context = flow_investigation_context(data)
     partition_key = Map.get(context, :partition_key) || ""
 
+    # List pages reach the other workflow pages through the sidebar and tabs,
+    # which carry the scope contract; a run's page keeps its lineage links.
+    investigation =
+      if Keyword.get(opts, :show_scope, true),
+        do: render_flow_scope_summary(context, active),
+        else: render_flow_investigation_context(context, active, opts)
+
     """
     #{render_flow_scope_contract(data)}
-    <div class="flow-nav-row flow-context-tools">
+    <div class="flow-scope-bar">
       <form class="flow-search" action="/dashboard/flow/lookup" method="get" aria-label="Flow lookup">
         <input class="flow-search-input mono" type="search" name="id" placeholder="Flow ID" required autocomplete="off" aria-label="Flow ID" title="Open a flow by ID.">
         <input class="flow-search-input mono" type="search" name="partition_key" value="#{escape_attr(partition_key)}" placeholder="Partition key" autocomplete="off" aria-label="Partition key" title="Partition of the workflow to open">
         <button class="flow-search-button" type="submit">Open workflow</button>
       </form>
-      #{render_flow_investigation_context(context, active, opts)}
+      #{investigation}
     </div>
     #{render_flow_local_scope(context, active)}
     """
@@ -159,7 +166,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowOverview do
         else: ""
 
     """
-    <form class="flow-filter-form" action="#{route}" method="get" aria-label="Workflow scope">
+    <form class="flow-filter-form flow-local-scope" action="#{route}" method="get" aria-label="Workflow scope">
       <label class="flow-filter-field"><span>Type</span><input class="flow-search-input mono" type="search" name="type" value="#{escape_attr(Map.get(context, :type) || "")}" placeholder="all types"></label>
       <label class="flow-filter-field"><span>Partition</span><input class="flow-search-input mono" type="search" name="partition_key" value="#{escape_attr(Map.get(context, :partition_key) || "")}" placeholder="all partitions"></label>
       #{worker}
@@ -170,6 +177,22 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowOverview do
   end
 
   defp render_flow_local_scope(_context, _active), do: ""
+
+  # Pages with their own scope form already show it.
+  defp render_flow_scope_summary(_context, active)
+       when active in ["flow", "flow_due", "flow_workers"],
+       do: ""
+
+  defp render_flow_scope_summary(context, _active) do
+    if Enum.any?(
+         [:type, :partition_key, :state, :range],
+         &present_context_value?(Map.get(context, &1))
+       ) do
+      ~s(<span class="flow-scope-bar-scope"><span class="flow-scope-bar-label">Scope</span><span class="flow-investigation-scope">#{render_flow_context_chips(context)}</span></span>)
+    else
+      ""
+    end
+  end
 
   defp render_flow_investigation_context(context, active, opts) do
     links = [
@@ -410,7 +433,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowOverview do
                     "partition_key" => filters.partition_key
                   })
 
-              ~s(<p class="flow-section-note" role="status">More matching records exist. This recovery view is bounded. <a class="flow-link" href="#{escape_attr(href)}">Investigate in Query Studio</a></p>)
+              ~s(<p class="flow-section-note" role="status">More matching records exist. This recovery view is bounded. <a class="flow-link" href="#{escape_attr(href)}">Investigate in Query studio</a></p>)
             else
               ""
             end

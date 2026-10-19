@@ -3,6 +3,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
   import FerricstoreServer.Health.Dashboard.Render.Admin, only: [render_config_command_table: 2]
   alias FerricstoreServer.Health.Dashboard.Flow.PolicyEditor
   alias FerricstoreServer.Health.Dashboard.Render.DurationInput
+  alias FerricstoreServer.Health.Dashboard.Render.PageStatus
 
   @flow_dashboard_policy_state_preview_limit 6
 
@@ -34,7 +35,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
     """
     <section id="flow-policy-editor" aria-label="Policy editor">
       <form class="flow-search flow-policy-scope" method="get" action="/dashboard/flow/policies#flow-policy-editor" aria-label="Policy scope">
-        <label class="flow-policy-field"><span>Workflow type</span><input class="flow-search-input mono" type="text" name="edit" value="#{escape_attr(editor.type)}" required autocomplete="off"></label>
+        <label class="flow-policy-field"><span>Workflow type</span><input class="flow-search-input mono" type="text" name="edit" value="#{escape_attr(editor.type)}" placeholder="e.g. email.send" required autocomplete="off"></label>
         <label class="flow-policy-field"><span>State</span><input class="flow-search-input mono" type="text" name="edit_state" value="#{escape_attr(editor.state)}" placeholder="Type defaults" autocomplete="off"></label>
         <button class="flow-search-button" type="submit">Load policy</button>
       </form>
@@ -50,7 +51,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
 
     """
     <div class="flow-policy-panel">
-      <h2 class="section-title">Create / Update Policy #{info_icon("Policies affect new Flow work and retry scheduling. Existing Flow records keep their durable state.", "About policy changes")}</h2>
+      <h2 class="section-title">Create or update policy #{info_icon("Policies affect new Flow work and retry scheduling. Existing Flow records keep their durable state.", "About policy changes")}</h2>
       #{flash}
       #{render_policy_type_scope_note(editor)}
       <form class="flow-policy-form" action="/dashboard/flow/policies" method="post" data-policy-editor data-policy-draft="#{Map.get(editor, :dirty, false)}" data-dashboard-single-submit>
@@ -147,7 +148,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
         <p class="flow-field-error" data-policy-scope-status role="status" hidden>Selection changed. Load policy before saving.</p>
         <p class="flow-section-note" data-policy-dirty-status role="status" hidden>Unsaved changes</p>
         <div class="flow-policy-actions">
-          <button class="flow-search-button" type="submit" title="Save this Flow policy">Save Policy</button>
+          <button class="flow-search-button" type="submit" title="Save this Flow policy">Save policy</button>
           <a class="flow-link" data-discard-draft href="#{escape_attr(flow_policy_edit_url(editor.type, editor.state))}">Discard changes</a>
         </div>
       </form>
@@ -247,7 +248,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
   end
 
   def render_flow_policy_commands do
-    render_config_command_table("Flow Policy Commands", flow_policy_command_reference())
+    render_config_command_table("Flow policy commands", flow_policy_command_reference())
   end
 
   def flow_policy_command_reference do
@@ -302,7 +303,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
         [] ->
           """
           <tr>
-            <td colspan="11" class="c-muted">No Flow types or policy overrides found in the current sample.</td>
+            <td colspan="9" class="c-muted">No Flow types or policy overrides found in the current sample.</td>
           </tr>
           """
 
@@ -313,7 +314,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
     scan_note = render_flow_policy_scan_note(policy_scan)
 
     """
-    <h2 class="section-title">Current Flow Policies <span class="badge badge-idle">#{format_number(length(policies))} loaded</span></h2>
+    <h2 class="section-title">Current policies <span class="badge badge-idle">#{format_number(length(policies))} loaded</span></h2>
+    #{render_flow_policy_summary(policies)}
     #{scan_note}
     #{FerricstoreServer.Health.Dashboard.Render.TableFilter.controls("flow-policy-catalog", "Filter loaded policies")}
     <div class="table-scroll" role="region" aria-label="Current workflow policies" tabindex="0"><table id="flow-policy-catalog" class="flow-policy-table">
@@ -321,14 +323,12 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
         <tr>
           <th>Type</th>
           <th>Source</th>
-          <th>Generation</th>
-          <th>Indexes</th>
           <th>Retries</th>
           <th>Backoff</th>
-          <th>Exhausted To</th>
-          <th>Max Active</th>
+          <th>When exhausted</th>
+          <th>Max active</th>
           <th>Retention</th>
-          <th>State Overrides</th>
+          <th>State overrides</th>
           <th>Actions</th>
         </tr>
       </thead>
@@ -371,7 +371,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
     <tr>
       <td class="mono">#{escape(row.type)}</td>
       <td><span class="badge badge-pressure">error</span></td>
-      <td colspan="9" class="c-red">#{escape(error)}</td>
+      <td colspan="7" class="c-red">#{escape(error)}</td>
     </tr>
     """
   end
@@ -382,10 +382,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
 
     """
     <tr>
-      <td class="mono"><a class="flow-link" href="#{escape_attr(flow_policy_edit_url(row.type))}" title="Edit policy for #{escape_attr(row.type)}">#{escape(row.type)}</a></td>
+      <td class="mono"><a class="flow-link" href="#{escape_attr(flow_policy_edit_url(row.type))}" title="Edit policy for #{escape_attr(row.type)}">#{escape(row.type)}</a><span class="flow-run-secondary">generation #{escape(to_string(Map.get(row, :generation, "unavailable")))} · #{render_flow_policy_indexes(row)}</span></td>
       <td><span class="badge #{flow_policy_source_class(row.source)}">#{escape(row.source)}</span></td>
-      <td class="mono">#{escape(to_string(Map.get(row, :generation, "unavailable")))}</td>
-      <td>#{render_flow_policy_indexes(row)}</td>
       <td>#{format_number(flow_policy_field(retry, :max_retries, 0))}</td>
       <td>#{escape(flow_policy_backoff_summary(flow_policy_field(retry, :backoff, %{})))}</td>
       <td class="mono">#{escape(to_string(flow_policy_field(retry, :exhausted_to, "failed")))}</td>
@@ -395,6 +393,74 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
       <td><a class="flow-search-button flow-policy-action" href="#{flow_policy_edit_url(row.type)}">Edit</a></td>
     </tr>
     """
+  end
+
+  # When every loaded type shares one policy, say it once instead of per row.
+  def render_flow_policy_summary([]), do: ""
+
+  def render_flow_policy_summary(policies) do
+    {failed, loaded} = Enum.split_with(policies, &is_binary(Map.get(&1, :error)))
+    types = length(loaded)
+
+    unavailable =
+      case length(failed) do
+        0 -> []
+        1 -> ["1 type could not be loaded"]
+        n -> ["#{format_number(n)} types could not be loaded"]
+      end
+
+    case Enum.uniq_by(loaded, &policy_fingerprint/1) do
+      [] ->
+        PageStatus.render("policies", :warning, "Policies unavailable", unavailable)
+
+      [only] ->
+        {retries, backoff, exhausted, max_active, retention} = policy_shape(only)
+
+        title =
+          if types == 1, do: "1 type", else: "#{format_number(types)} types share one policy"
+
+        PageStatus.render(
+          "policies",
+          :idle,
+          title,
+          [
+            "#{retries} retries, #{backoff}, then #{exhausted}",
+            "max active #{max_active}",
+            "retention #{retention}"
+          ] ++ unavailable
+        )
+
+      distinct ->
+        PageStatus.render(
+          "policies",
+          :idle,
+          "#{format_number(types)} #{if types == 1, do: "type", else: "types"}, #{length(distinct)} different #{if length(distinct) == 1, do: "policy", else: "policies"}",
+          unavailable
+        )
+    end
+  end
+
+  # Two types share a policy only when their defaults and every state override match.
+  defp policy_fingerprint(row) do
+    states =
+      row
+      |> Map.get(:states, [])
+      |> Enum.map(
+        &{Map.get(&1, :state), Map.get(&1, :mode), Map.get(&1, :retry), Map.get(&1, :retention)}
+      )
+      |> Enum.sort()
+
+    {policy_shape(row), states}
+  end
+
+  defp policy_shape(row) do
+    retry = Map.get(row, :retry, %{})
+
+    {format_number(flow_policy_field(retry, :max_retries, 0)),
+     flow_policy_backoff_summary(flow_policy_field(retry, :backoff, %{})),
+     to_string(flow_policy_field(retry, :exhausted_to, "failed")),
+     flow_policy_max_active_summary(Map.get(row, :max_active_ms)),
+     flow_policy_retention_summary(Map.get(row, :retention, %{}))}
   end
 
   def flow_policy_edit_url(type, state \\ "") do
@@ -479,18 +545,25 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
       "none" ->
         "none"
 
+      kind when kind in [:fixed, "fixed"] ->
+        "fixed #{format_duration_ms(base_ms)}" <> jitter_suffix(jitter)
+
       _ ->
-        "#{kind} #{format_duration_ms(base_ms)} (max #{format_duration_ms(max_ms)}, jitter #{jitter}%)"
+        "#{kind} #{format_duration_ms(base_ms)} → #{format_duration_ms(max_ms)}" <>
+          jitter_suffix(jitter)
     end
   end
 
   def flow_policy_backoff_summary(_backoff), do: "-"
 
+  defp jitter_suffix(jitter) when is_integer(jitter) and jitter > 0, do: " ±#{jitter}%"
+  defp jitter_suffix(_jitter), do: ""
+
   def flow_policy_retention_summary(retention) when is_map(retention) do
     ttl_ms = flow_policy_field(retention, :ttl_ms, 0)
     max = flow_policy_field(retention, :history_max_events, 0)
 
-    "#{format_duration_ms(ttl_ms)} retention, history max #{format_number(max)}"
+    "#{format_duration_ms(ttl_ms)} · #{format_grouped(max)} events"
   end
 
   def flow_policy_retention_summary(_retention), do: "-"
@@ -517,13 +590,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
       |> Enum.reverse()
 
     case parts do
-      [] ->
-        ~s(<span class="c-muted">-</span>)
-
-      parts ->
-        Enum.map_join(parts, " ", fn part ->
-          ~s(<span class="flow-pill">#{escape(part)}</span>)
-        end)
+      [] -> "no indexes"
+      parts -> "indexes " <> Enum.map_join(parts, ", ", &escape/1)
     end
   end
 

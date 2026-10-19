@@ -52,7 +52,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowSchedules do
           assert String.contains?(html, "campaign-failed")
           assert String.contains?(html, "Pause")
           assert String.contains?(html, "Delete")
-          assert String.contains?(html, "Failed Schedules")
+          assert String.contains?(html, "Failed schedules")
           assert String.contains?(html, "previous target still active")
           assert String.contains?(html, "Catch-up")
           assert String.contains?(html, "fire_once")

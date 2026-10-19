@@ -132,7 +132,7 @@ defmodule FerricstoreServer.Health.DashboardTest do
         circuits
       )
 
-    assert String.contains?(timeline_html, "Circuit Timeline")
+    assert String.contains?(timeline_html, "Circuit timeline")
     assert String.contains?(timeline_html, "slow_call")
     assert String.contains?(timeline_html, "TimeoutError")
     assert String.contains?(timeline_html, "2.5K ms")
@@ -182,7 +182,7 @@ defmodule FerricstoreServer.Health.DashboardTest do
     html = Dashboard.render_flow_governance_page(data)
 
     assert data.state_meta_result.status == :idle
-    assert String.contains?(html, "State Metadata")
+    assert String.contains?(html, "State metadata")
 
     assert String.contains?(
              html,

@@ -91,7 +91,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
       end
 
     """
-    <h2 class="section-title">State Pressure</h2>
+    <h2 class="section-title">State pressure</h2>
     #{chart_coverage(length(states), total)}
     <div class="table-scroll flow-state-pressure-region" role="region" aria-label="Workflow state pressure" tabindex="0">
       <table class="flow-state-pressure-matrix">
@@ -104,57 +104,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
     """
   end
 
-  def render_flow_workers_chart(workers) do
-    rows =
-      workers
-      |> Enum.take(20)
-      |> Enum.map(fn worker ->
-        %{
-          label: worker.worker,
-          values: [
-            {"Running", worker.running, "bar-green"},
-            {"Expired", worker.expired, "bar-red"}
-          ]
-        }
-      end)
-
-    """
-    <h2 class="section-title">Worker Charts</h2>
-    #{chart_coverage(length(rows), length(workers))}
-    <div class="chart-grid">
-      <div class="chart-card">
-        <div class="chart-title">Lease health by worker</div>
-        #{render_bar_chart(rows)}
-      </div>
-    </div>
-    """
-  end
-
   defp chart_coverage(shown, total) when shown < total do
     ~s(<p class="flow-section-note">#{shown} of #{total} groups in table order; #{total - shown} omitted. The corresponding table retains the full loaded sample.</p>)
   end
 
   defp chart_coverage(_shown, _total), do: ""
-
-  def render_flow_due_chart(due_now, scheduled) do
-    rows = [
-      %{
-        label: "Current sample",
-        values: [
-          {"Due now", length(due_now), "bar-neutral"},
-          {"Scheduled", length(scheduled), "bar-blue"}
-        ]
-      }
-    ]
-
-    """
-    <section class="flow-due-summary" aria-label="Sampled due and scheduled work">
-      <h2 class="section-title">Due vs scheduled</h2>
-      <p class="flow-section-note">Due time alone does not establish claimability; FIFO ordering, leases, and policy limits may block a claim.</p>
-      #{render_bar_chart(rows)}
-    </section>
-    """
-  end
 
   def render_flow_timeline_chart(history) do
     timeline = flow_history_timeline_rows(history)

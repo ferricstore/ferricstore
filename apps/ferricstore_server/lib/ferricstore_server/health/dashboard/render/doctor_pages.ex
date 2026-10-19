@@ -132,7 +132,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.DoctorPages do
               <input type="hidden" name="action" value="repair_flow_lmdb">
               <input type="hidden" name="confirm_action" value="true">
               <input type="hidden" name="expected_action" value="repair_flow_lmdb">
-              <button type="submit" class="flow-search-button">Confirm Repair Flow LMDB</button>
+              <button type="submit" class="flow-search-button">Confirm Flow LMDB repair</button>
             </form>
           </div>
         </details>
@@ -194,7 +194,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.DoctorPages do
       end
 
     """
-    <h2 class="section-title">Background Jobs</h2>
+    <h2 class="section-title">Background jobs</h2>
     <div class="table-scroll" role="region" aria-label="Doctor jobs" tabindex="0">
     <table>
       <thead>

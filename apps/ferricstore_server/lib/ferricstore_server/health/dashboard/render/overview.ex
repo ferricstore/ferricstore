@@ -715,7 +715,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
   # HTML rendering -- Sub-page content sections
   # ---------------------------------------------------------------------------
 
-  def render_ops_summary(title, cards) do
+  def render_ops_summary(title, cards, opts \\ []) do
     card_html =
       Enum.map_join(cards, "\n", fn card ->
         value_class = Map.get(card, :class, "")
@@ -732,20 +732,38 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
               ""
           end
 
+        value = Map.fetch!(card, :value)
+
+        classes =
+          ["ops-summary-value", value_class, if(summary_text?(value), do: "is-text")]
+          |> Enum.reject(&(&1 in [nil, ""]))
+          |> Enum.join(" ")
+
         """
         <div class="ops-summary-card">
           <div class="ops-summary-label">#{escape(Map.fetch!(card, :label))}</div>
-          <div class="ops-summary-value #{escape_attr(value_class)}">#{escape(Map.fetch!(card, :value))}</div>
+          <div class="#{escape_attr(classes)}">#{escape(value)}</div>
           #{detail_html}
         </div>
         """
       end)
 
+    # Pages that open with a status line keep the heading for screen readers only.
+    heading_class =
+      if Keyword.get(opts, :heading) == :hidden,
+        do: "section-title sr-only",
+        else: "section-title"
+
     """
-    <h2 class="section-title">#{escape(title)}</h2>
+    <h2 class="#{heading_class}">#{escape(title)}</h2>
     <div class="ops-summary-grid">
       #{card_html}
     </div>
     """
   end
+
+  # A measured figure starts with a digit; anything else (Unavailable, on,
+  # Shard 11) is a word and reads smaller.
+  defp summary_text?(value) when is_binary(value), do: not Regex.match?(~r/^-?\d/, value)
+  defp summary_text?(_value), do: false
 end

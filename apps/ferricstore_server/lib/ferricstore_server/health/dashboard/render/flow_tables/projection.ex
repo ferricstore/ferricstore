@@ -156,7 +156,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Projection do
          else: "Unavailable"
 
     """
-    <h2 class="section-title">Projection Health</h2>
+    <h2 class="section-title">Projection health</h2>
     <dl class="flow-projection-ledger" aria-label="Projection health metrics">
       #{render_projection_metric("LMDB", "asynchronous", "consistency model; current lag is measured separately")}
       #{render_projection_metric("Health", rollup.health, "#{format_number(rollup.shards)} shard projection row(s)", health_class)}

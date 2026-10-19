@@ -6,6 +6,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
   import FerricstoreServer.Health.Dashboard.Render.FlowHistory
   import FerricstoreServer.Health.Dashboard.Render.FlowFilters
 
+  alias FerricstoreServer.Health.Dashboard.Render.{FlowOverview, PageStatus}
+
   @flow_terminal_states ~w(completed failed cancelled)
 
   def render_flow_states_table(
@@ -24,14 +26,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
               do: "No Flow states discovered for this type filter",
               else: "State results could not be established from the available sources."
 
-          ~s(<tr><td colspan="12" class="c-muted">#{message}</td></tr>)
+          ~s(<tr><td colspan="6" class="c-muted">#{message}</td></tr>)
 
         _ ->
           Enum.map_join(states, "\n", fn state ->
-            expired_class = if state.expired_leases > 0, do: "c-red", else: ""
-            retry_class = if Map.get(state, :retrying, 0) > 0, do: "c-yellow", else: ""
-            failed_class = if Map.get(state, :failed, 0) > 0, do: "c-red", else: ""
-            maxed_class = if Map.get(state, :max_attempts_reached, 0) > 0, do: "c-red", else: ""
             href = state_records_path(filters, state.type, state.state)
             type_href = state_records_path(filters, state.type, nil)
 
@@ -39,15 +37,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
             <tr>
               <td class="mono"><a class="flow-link" href="#{escape_attr(type_href)}">#{escape(state.type)}</a></td>
               <td class="#{flow_state_class(state.state)}"><a class="flow-link" href="#{escape_attr(href)}">#{escape(state.state)}</a></td>
-              <td class="#{failed_class}">#{format_number(Map.get(state, :failed, 0))}</td>
-              <td class="#{expired_class}">#{format_number(state.expired_leases)}</td>
-              <td class="#{maxed_class}">#{format_number(Map.get(state, :max_attempts_reached, 0))}</td>
-              <td>#{flow_state_operational_hint(state)}</td>
-              <td>#{format_duration_ms(state.oldest_due_ms)}</td>
-              <td class="#{retry_class}">#{format_number(Map.get(state, :retrying, 0))}</td>
-              <td><a class="flow-link" href="#{escape_attr(href)}" aria-label="Inspect #{escape_attr(state.type)} #{escape_attr(state.state)} records">#{format_number(state.count)}</a></td>
-              <td>#{format_number(state.due_now)}</td>
-              <td>#{format_number(state.running)}</td>
+              <td class="flow-state-attention">#{render_flow_state_attention(state)}</td>
+              <td class="flow-state-oldest">#{if state.due_now > 0, do: format_duration_ms(state.oldest_due_ms), else: "-"}</td>
+              <td class="flow-state-runs"><a class="flow-link" href="#{escape_attr(href)}" aria-label="Inspect #{escape_attr(state.type)} #{escape_attr(state.state)} records">#{format_number(state.count)}</a>#{render_flow_state_due(state)}</td>
               <td>#{render_flow_state_mode_badge(Map.get(state, :mode, :parallel))}</td>
             </tr>
             """
@@ -75,16 +67,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
         <tr>
           <th>Type</th>
           <th>Stored state</th>
-          <th>Failed #{info_icon("Terminal failed flows. They are not claimable unless user logic rewinds or creates new work.")}</th>
-          <th>Expired #{info_icon("Running flows whose lease deadline passed. Recovery eligibility depends on state policy and claim limits; expiry is not a terminal failure.")}</th>
-          <th>Maxed #{info_icon("Flows whose attempts reached max_attempts/max_retries in the sampled records.")}</th>
-          <th>Hint</th>
-          <th>Oldest Due</th>
-          <th>Retrying #{info_icon("Non-terminal flows with attempts > 0. They were retried and may be waiting for their next run time.")}</th>
-          <th>Sample Count</th>
-          <th>Due Now #{info_icon("Non-terminal flows whose scheduled time has passed. Due time alone does not establish claimability; FIFO ordering, leases, and policy limits may still block a claim.")}</th>
-          <th>Running #{info_icon("Flows currently leased to workers through FLOW.CLAIM_DUE.")}</th>
-          <th>Mode #{info_icon("FIFO states preserve per-partition order and let at most one active Flow block each partition lane. Parallel is the default.")}</th>
+          <th>Attention</th>
+          <th>Oldest due</th>
+          <th>Runs</th>
+          <th>Mode</th>
         </tr>
       </thead>
       <tbody>
@@ -94,11 +80,123 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     """
 
     """
-    <h2 class="section-title">Flow States <span class="badge badge-idle">#{escape(filter_label)}</span> <span class="badge badge-idle">#{sample_label}</span></h2>
-    <p class="flow-section-note">Exception columns first. Scroll for distribution columns.</p>
+    <h2 class="section-title">Runs by state <span class="badge badge-idle">#{escape(filter_label)}</span> <span class="badge badge-idle">#{sample_label}</span></h2>
     #{accessible_table("Flow states", table)}
+    <p class="flow-section-note">Expired leases are not failures: whether a run can be reclaimed depends on its state's policy and claim limits. Due time alone does not establish claimability; FIFO order, leases and policy limits can still hold a run back. FIFO states keep one active run per partition.</p>
     """
   end
+
+  # Each kind of problem gets its own badge. The kinds overlap (a failed run can also
+  # be out of retries), so they are never added up.
+  defp render_flow_state_attention(state) do
+    [
+      {state.expired_leases, "badge-warning", "expired"},
+      {Map.get(state, :failed, 0), "badge-failed", "failed"},
+      {Map.get(state, :max_attempts_reached, 0), "badge-failed", "out of retries"},
+      {Map.get(state, :retrying, 0), "badge-retrying", "retrying"}
+    ]
+    |> Enum.filter(fn {count, _class, _label} -> count > 0 end)
+    |> case do
+      [] ->
+        cond do
+          state.due_now > 0 -> flow_state_operational_hint(state)
+          state.state in @flow_terminal_states -> ~s(<span class="c-muted">Terminal</span>)
+          true -> ~s(<span class="c-muted">None</span>)
+        end
+
+      badges ->
+        Enum.map_join(badges, " ", fn {count, class, label} ->
+          ~s(<span class="badge #{class}">#{format_grouped(count)} #{label}</span>)
+        end)
+    end
+  end
+
+  defp render_flow_state_due(%{due_now: due_now, count: due_now}) when due_now > 0,
+    do: ~s(<span class="flow-state-due">all due now</span>)
+
+  defp render_flow_state_due(%{due_now: due_now}) when is_integer(due_now) and due_now > 0,
+    do: ~s(<span class="flow-state-due">#{format_grouped(due_now)} due now</span>)
+
+  defp render_flow_state_due(_state), do: ""
+
+  def render_flow_states_overview(_states, _sampled, :unavailable, _filters), do: ""
+  def render_flow_states_overview([], _sampled, _source_status, _filters), do: ""
+
+  def render_flow_states_overview(states, sampled, source_status, filters) do
+    attention =
+      [
+        {sum_states(states, :expired_leases), "with expired leases"},
+        {sum_states(states, :failed), "failed"},
+        {sum_states(states, :max_attempts_reached), "out of retries"}
+      ]
+      |> Enum.filter(fn {count, _label} -> count > 0 end)
+
+    status =
+      case {attention, source_status} do
+        {[], :partial} ->
+          # Terminal records did not load, and failed runs live there.
+          PageStatus.render("runs", :idle, "No problems in the records that loaded", [
+            "terminal records are unavailable, so failed runs may be missing"
+          ])
+
+        {[], _ok} ->
+          PageStatus.render(
+            "runs",
+            :healthy,
+            "No runs need attention in this sample of #{format_grouped(sampled)}"
+          )
+
+        {items, _status} ->
+          failures = FlowOverview.flow_failure_investigation_path(%{filters: filters})
+          partial = if source_status == :partial, do: ["partial results"], else: []
+
+          PageStatus.render(
+            "runs",
+            :warning,
+            "Needs attention",
+            Enum.map(items, fn {count, label} -> "#{format_grouped(count)} #{label}" end) ++
+              partial,
+            ~s(<a href="#{escape_attr(failures)}">Open Failures</a>)
+          )
+      end
+
+    status <> render_flow_state_split(states)
+  end
+
+  defp sum_states(states, key), do: states |> Enum.map(&(Map.get(&1, key) || 0)) |> Enum.sum()
+
+  defp render_flow_state_split(states) do
+    totals =
+      states
+      |> Enum.group_by(& &1.state, & &1.count)
+      |> Enum.map(fn {state, counts} -> {state, Enum.sum(counts)} end)
+      |> Enum.sort_by(fn {state, count} -> {-count, state} end)
+
+    label =
+      Enum.map_join(totals, ", ", fn {state, count} -> "#{format_grouped(count)} #{state}" end)
+
+    bar =
+      Enum.map_join(totals, "", fn {state, count} ->
+        ~s(<span class="overview-state is-#{state_split_class(state)}" style="flex: #{count}"></span>)
+      end)
+
+    legend =
+      Enum.map_join(totals, "", fn {state, count} ->
+        ~s(<li><span class="overview-swatch is-#{state_split_class(state)}" aria-hidden="true"></span>#{escape(state)} <strong>#{format_grouped(count)}</strong></li>)
+      end)
+
+    """
+    <div class="runs-split">
+      <div class="overview-state-bar" role="img" aria-label="#{escape_attr(label)}">#{bar}</div>
+      <ul class="overview-legend">#{legend}</ul>
+    </div>
+    """
+  end
+
+  defp state_split_class(state) when state in ~w(queued running failed completed cancelled),
+    do: state
+
+  defp state_split_class(_state), do: "other"
 
   def render_flow_states_sources(data) do
     if Map.get(data, :terminal_source_status) in [:error, :timeout] do
@@ -118,6 +216,14 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
       """
     else
       ""
+    end
+  end
+
+  # Workers folds FIFO lanes into a disclosure, which needs a line when there are none.
+  def render_flow_workers_fifo(lanes, total_sampled, sample_limit, coverage) do
+    case render_flow_fifo_lanes(lanes, total_sampled, sample_limit, coverage) do
+      "" -> ~s(<p class="section-empty">No FIFO lanes in this sample.</p>)
+      html -> html
     end
   end
 
@@ -203,7 +309,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     table = """
     <table>
       <thead>
-        <tr><th>Type</th><th>Count Source</th><th>Total</th><th>Active</th><th>Queued</th><th>Running</th><th>Completed</th><th>Failed</th><th>Cancelled</th><th>Observed States</th></tr>
+        <tr><th>Type</th><th>Count source</th><th>Total</th><th>Active</th><th>Queued</th><th>Running</th><th>Completed</th><th>Failed</th><th>Cancelled</th><th>Observed states</th></tr>
       </thead>
       <tbody>
         #{rows}
@@ -212,7 +318,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     """
 
     """
-    <h2 class="section-title">State Breakdown</h2>
+    <h2 class="section-title">State breakdown</h2>
     #{accessible_table("Workflow state breakdown", table)}
     """
   end
@@ -227,40 +333,86 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
 
   def render_flow_custom_states(_states), do: ""
 
-  def render_flow_workers(workers, filters \\ %{}) do
+  def render_flow_workers_status([], _filters),
+    do: PageStatus.render("workers", :idle, "No leases held in this sample")
+
+  def render_flow_workers_status(workers, filters) do
+    leases = sum_states(workers, :running)
+    expired = sum_states(workers, :expired)
+    with_expired = Enum.count(workers, &((&1.expired || 0) > 0))
+
+    if expired > 0 do
+      failures = FlowOverview.flow_failure_investigation_path(%{filters: filters})
+
+      PageStatus.render(
+        "workers",
+        :warning,
+        "#{format_grouped(expired)} expired #{plural(expired, "lease", "leases")}",
+        [
+          "on #{format_grouped(with_expired)} of #{format_grouped(length(workers))} workers",
+          "#{format_grouped(leases)} leases held"
+        ],
+        ~s(<a href="#{escape_attr(failures)}">Open Failures</a>)
+      )
+    else
+      PageStatus.render(
+        "workers",
+        :healthy,
+        "#{format_grouped(length(workers))} #{plural(length(workers), "worker", "workers")} holding #{format_grouped(leases)} #{plural(leases, "lease", "leases")}",
+        ["No expired leases"]
+      )
+    end
+  end
+
+  defp plural(1, one, _many), do: one
+  defp plural(_count, _one, many), do: many
+
+  def render_flow_workers(workers, filters \\ %{})
+
+  def render_flow_workers([], _filters),
+    do: """
+    <h2 class="section-title">Workers</h2>
+    <p class="section-empty">No worker holds a lease in this sample.</p>
+    """
+
+  def render_flow_workers(workers, filters) do
+    widest = workers |> Enum.map(&(&1.running || 0)) |> Enum.max(fn -> 0 end) |> max(1)
+
     rows =
-      case workers do
-        [] ->
-          ~s(<tr><td colspan="4" class="c-muted">No running Flow leases discovered in sample</td></tr>)
+      Enum.map_join(workers, "\n", fn worker ->
+        running = worker.running || 0
+        expired = worker.expired || 0
 
-        _ ->
-          Enum.map_join(workers, "\n", fn worker ->
-            expired_class = if worker.expired > 0, do: "c-red", else: ""
+        query =
+          filters
+          |> Map.take([:type, :partition_key, :sort])
+          |> Map.put(:worker, worker.worker)
+          |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
+          |> URI.encode_query()
 
-            query =
-              filters
-              |> Map.take([:type, :partition_key, :sort])
-              |> Map.put(:worker, worker.worker)
-              |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
-              |> URI.encode_query()
+        href = "/dashboard/flow/workers?" <> query <> "#flow-running-records"
 
-            href = "/dashboard/flow/workers?" <> query <> "#flow-running-records"
+        status =
+          if expired > 0,
+            do: ~s(<span class="badge badge-warning">#{format_grouped(expired)} expired</span>),
+            else: ~s(<span class="badge badge-ok">Current</span>)
 
-            """
-            <tr>
-              <td class="mono"><a class="flow-link" href="#{escape_attr(href)}" title="Inspect this worker's sampled running records">#{escape(worker.worker)}</a></td>
-              <td><a class="flow-link" href="#{escape_attr(href)}">#{format_number(worker.running)}</a></td>
-              <td class="#{expired_class}">#{format_number(worker.expired)}</td>
-              <td>#{format_duration_ms(worker.oldest_lease_ms)}</td>
-            </tr>
-            """
-          end)
-      end
+        oldest = if expired > 0, do: format_duration_ms(worker.oldest_lease_ms), else: "-"
+
+        """
+        <tr>
+          <td class="mono"><a class="flow-link" href="#{escape_attr(href)}" title="Inspect this worker's sampled running records">#{escape(worker.worker)}</a></td>
+          <td class="worker-leases"><a class="flow-link" href="#{escape_attr(href)}">#{format_number(running)}</a><span class="worker-lease-bar" style="width: #{percent(running, widest)}%"><span class="is-expired" style="width: #{percent(expired, max(running, 1))}%"></span></span></td>
+          <td>#{status}</td>
+          <td>#{oldest}</td>
+        </tr>
+        """
+      end)
 
     table = """
-    <table>
+    <table class="flow-workers-table">
       <thead>
-        <tr><th>Worker</th><th>Running</th><th>Expired</th><th>Oldest Expired By</th></tr>
+        <tr><th>Worker</th><th>Leases</th><th>Status</th><th>Oldest expired by</th></tr>
       </thead>
       <tbody>
         #{rows}
@@ -269,11 +421,15 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     """
 
     """
-    <h2 class="section-title">Workers / Leases</h2>
-    #{render_worker_sort(filters)}
+    <div class="section-head"><h2 class="section-title">Workers <span class="badge badge-idle">#{format_grouped(length(workers))}</span></h2>#{render_worker_sort(filters)}</div>
     #{accessible_table("Workflow workers and leases", table)}
     """
   end
+
+  defp percent(part, whole) when is_integer(part) and is_integer(whole) and whole > 0,
+    do: min(100, round(part * 100 / whole))
+
+  defp percent(_part, _whole), do: 0
 
   defp render_worker_sort(filters) do
     scope =
@@ -284,43 +440,51 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
         ~s(<input type="hidden" name="#{key}" value="#{escape_attr(value)}">)
       end)
 
-    ~s(<form class="flow-filter-form" action="/dashboard/flow/workers" method="get">#{scope}#{render_flow_summary_sort(Map.get(filters, :sort, "attention"), "flow-worker-sort")}<button class="flow-search-button" type="submit">Apply order</button></form>)
+    ~s(<form class="section-head-form" action="/dashboard/flow/workers" method="get">#{scope}#{render_flow_summary_sort(Map.get(filters, :sort, "attention"), "flow-worker-sort")}<button class="flow-search-button" type="submit">Apply order</button></form>)
   end
+
+  def render_flow_running_records([], _total_sampled, _sample_limit),
+    do: """
+    <h2 class="section-title" id="flow-running-records">Leases</h2>
+    <p class="section-empty">No run is leased in this sample.</p>
+    """
 
   def render_flow_running_records(records, total_sampled, sample_limit) do
     rows =
-      case records do
-        [] ->
-          ~s(<tr><td colspan="4" class="c-muted">No running Flow records discovered in sample</td></tr>)
+      Enum.map_join(records, "\n", fn record ->
+        expired_class = if flow_expired_lease?(record), do: "c-red", else: ""
+        id = flow_record_id(record)
+        partition = flow_record_partition_key(record)
 
-        _ ->
-          Enum.map_join(records, "\n", fn record ->
-            expired_class = if flow_expired_lease?(record), do: "c-red", else: ""
-            id = flow_record_id(record)
-            partition = flow_record_partition_key(record)
+        worker = flow_record_worker(record)
+        reason = flow_waiting_reason(record)
 
-            """
-            <tr>
-              <td class="flow-worker-identity">
-                <div class="mono">#{render_flow_id_link(id, partition)}</div>
-                <span class="flow-run-secondary">#{escape(flow_record_type(record))}</span>
-                <span class="flow-run-secondary mono" title="Partition">#{escape(partition || "auto/global")}</span>
-              </td>
-              <td class="mono">#{escape(flow_record_worker(record) || "-")}</td>
-              <td class="#{expired_class}">#{escape(flow_waiting_reason(record))}</td>
-              <td>
-                #{format_timestamp_ms_or_dash(flow_record_lease_expires_at_ms(record))}
-                #{render_worker_lease_details(record, id, partition)}
-              </td>
-            </tr>
-            """
-          end)
-      end
+        # The worker column already says who holds the lease.
+        status =
+          if is_binary(worker) and reason == "leased by " <> worker,
+            do: "Leased",
+            else: reason
+
+        """
+        <tr>
+          <td class="flow-worker-identity">
+            <div class="mono">#{render_flow_id_link(id, partition)}</div>
+            #{render_run_scope(record)}
+          </td>
+          <td class="mono">#{escape(worker || "-")}</td>
+          <td#{if expired_class == "", do: "", else: ~s( class="#{expired_class}")}>#{escape(status)}</td>
+          <td class="flow-due-cell">
+            #{render_lease_relative(flow_record_lease_expires_at_ms(record))}#{render_clock(flow_record_lease_expires_at_ms(record))}
+            #{render_worker_lease_details(record, id, partition)}
+          </td>
+        </tr>
+        """
+      end)
 
     table = """
     <table class="flow-worker-records-table">
       <thead>
-        <tr><th>Workflow</th><th>Worker</th><th>Status</th><th>Lease Expires (UTC)</th></tr>
+        <tr><th>Workflow</th><th>Worker</th><th>Status</th><th>Lease expires (UTC)</th></tr>
       </thead>
       <tbody>
         #{rows}
@@ -329,10 +493,34 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     """
 
     """
-    <h2 class="section-title" id="flow-running-records">Running Records <span class="badge badge-idle">#{sampled_scan_label(total_sampled, sample_limit)}</span></h2>
+    <h2 class="section-title" id="flow-running-records">Leases <span class="badge badge-idle">#{format_grouped(length(records))}</span></h2>
+    <p class="flow-section-note">#{sampled_scan_label(total_sampled, sample_limit)}</p>
     #{accessible_table("Running workflow records", table)}
     """
   end
+
+  # A run's type and partition on one line under its ID.
+  defp render_run_scope(record) do
+    ~s(<span class="flow-run-secondary">#{escape(flow_record_type(record))} · <span class="mono">#{escape(flow_record_partition_key(record) || "auto/global")}</span></span>)
+  end
+
+  defp render_lease_relative(expires_at) when is_integer(expires_at) do
+    case expires_at - System.system_time(:millisecond) do
+      left when left >= 0 -> ~s(<span class="flow-due-when">in #{format_duration_ms(left)}</span>)
+      left -> ~s(<span class="flow-due-when">expired #{format_duration_ms(-left)} ago</span>)
+    end
+  end
+
+  defp render_lease_relative(_expires_at), do: ""
+
+  # Time to the second, with the full timestamp in the tooltip.
+  defp render_clock(nil), do: "-"
+
+  defp render_clock(ms) when is_integer(ms),
+    do:
+      ~s(<span title="#{escape_attr(format_timestamp_ms_or_dash(ms))}">#{format_clock_ms(ms)}</span>)
+
+  defp render_clock(_ms), do: "-"
 
   defp render_worker_lease_details(record, id, partition) do
     key =
@@ -352,37 +540,108 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     """
   end
 
-  def render_flow_due_records(title, records, total_sampled, sample_limit) do
-    ordering =
-      if title == "Due Now",
-        do: "Oldest due first in current sample",
-        else: "Earliest scheduled first in current sample"
+  def render_flow_due_summary(due_now, scheduled, scheduled_total \\ nil) do
+    scheduled_count = scheduled_total || length(scheduled)
 
-    rows =
-      case records do
-        [] ->
-          ~s(<tr><td colspan="7" class="c-muted">No #{escape(String.downcase(title))} records discovered in sample</td></tr>)
-
-        _ ->
-          Enum.map_join(records, "\n", fn record ->
-            """
-            <tr>
-              <td class="flow-run-identity mono">#{render_flow_id_link(flow_record_id(record), flow_record_partition_key(record))}<span class="flow-run-secondary mono" title="Partition">#{escape(flow_record_partition_key(record) || "auto/global")}</span></td>
-              <td class="mono">#{escape(flow_record_type(record))}</td>
-              <td class="#{flow_state_class(flow_record_state(record))}">#{escape(flow_record_state(record))}</td>
-              <td>#{render_due_waiting_reason(record)}</td>
-              <td>#{format_timestamp_ms_or_dash(flow_record_run_at_ms(record))}#{render_due_relative_time(record)}</td>
-              <td>#{escape(to_string(flow_field(record, :priority, 0)))}</td>
-              <td>#{render_flow_value_ref_badges(record, :detail_link)}</td>
-            </tr>
-            """
-          end)
+    {state, title} =
+      case due_now do
+        [] -> {:healthy, "Nothing is due now"}
+        [_] -> {:idle, "1 run due now"}
+        runs -> {:idle, "#{format_grouped(length(runs))} runs due now"}
       end
+
+    oldest =
+      due_now
+      |> Enum.map(&due_delta_ms/1)
+      |> Enum.filter(&(is_integer(&1) and &1 >= 0))
+      |> Enum.max(fn -> nil end)
+
+    next =
+      scheduled
+      |> Enum.map(&due_delta_ms/1)
+      |> Enum.filter(&(is_integer(&1) and &1 < 0))
+      |> Enum.max(fn -> nil end)
+
+    details =
+      [
+        oldest && "oldest #{format_duration_ms(oldest)} overdue",
+        case {scheduled_count, next} do
+          {0, _} ->
+            "Nothing scheduled in this sample"
+
+          {count, nil} ->
+            "#{format_grouped(count)} scheduled"
+
+          {count, next} ->
+            "#{format_grouped(count)} scheduled, next in #{format_duration_ms(-next)}"
+        end
+      ]
+      |> Enum.reject(&is_nil/1)
+
+    PageStatus.render("due", state, title, details) <>
+      ~s(<p class="flow-section-note">Due time alone does not establish claimability; FIFO order, leases and policy limits can still hold a run back.</p>)
+  end
+
+  # Positive when the run is overdue, negative when it is still in the future.
+  defp due_delta_ms(record) do
+    case {flow_record_run_at_ms(record), Map.get(record, :dashboard_snapshot_ms)} do
+      {run_at, snapshot} when is_integer(run_at) and is_integer(snapshot) -> snapshot - run_at
+      {run_at, _} when is_integer(run_at) -> System.system_time(:millisecond) - run_at
+      _ -> nil
+    end
+  end
+
+  def render_flow_due_records(title, records, total_sampled, sample_limit, listed_total \\ nil) do
+    shown = length(records)
+    capped? = is_integer(listed_total) and listed_total > shown
+
+    {heading, ordering, shown_label, empty} =
+      if title == "Due Now",
+        do:
+          {"Due now", "Oldest due first", "Oldest #{format_grouped(shown)} shown",
+           "Nothing is due now in this sample."},
+        else:
+          {"Scheduled", "Earliest scheduled first", "Earliest #{format_grouped(shown)} shown",
+           "No runs are scheduled for later in this sample."}
+
+    # A capped list says how much of the sample it shows.
+    {count_label, ordering} =
+      if capped?,
+        do: {"#{format_grouped(shown)} of #{format_grouped(listed_total)}", shown_label},
+        else: {format_grouped(shown), ordering}
+
+    note =
+      ~s(<p class="flow-section-note">#{ordering} · #{sampled_scan_label(total_sampled, sample_limit)}</p>)
+
+    title_html =
+      ~s(<h2 class="section-title">#{heading} <span class="badge badge-idle">#{count_label}</span></h2>)
+
+    if records == [] do
+      title_html <> ~s(\n<p class="section-empty">#{empty}</p>\n)
+    else
+      title_html <> "\n" <> note <> "\n" <> render_flow_due_table(title, records)
+    end
+  end
+
+  defp render_flow_due_table(title, records) do
+    rows =
+      Enum.map_join(records, "\n", fn record ->
+        """
+        <tr>
+          <td class="flow-run-identity"><div class="mono">#{render_flow_id_link(flow_record_id(record), flow_record_partition_key(record))}</div>#{render_run_scope(record)}</td>
+          <td class="#{flow_state_class(flow_record_state(record))}">#{escape(flow_record_state(record))}</td>
+          <td>#{render_due_waiting_reason(record)}</td>
+          <td class="flow-due-cell">#{render_due_relative_time(record)}#{render_due_clock(flow_record_run_at_ms(record))}</td>
+          <td>#{escape(to_string(flow_field(record, :priority, 0)))}</td>
+          <td>#{render_flow_value_ref_badges(record, :detail_link)}</td>
+        </tr>
+        """
+      end)
 
     table = """
     <table>
       <thead>
-        <tr><th>Workflow / partition</th><th>Type</th><th>Stored state</th><th>Why Waiting</th><th>Run At (UTC)</th><th>Priority</th><th>Values</th></tr>
+        <tr><th>Workflow</th><th>Stored state</th><th>Why waiting</th><th>Run at (UTC)</th><th>Priority</th><th>Values</th></tr>
       </thead>
       <tbody>
         #{rows}
@@ -390,12 +649,14 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     </table>
     """
 
-    """
-    <h2 class="section-title">#{escape(title)} <span class="badge badge-idle">#{sampled_scan_label(total_sampled, sample_limit)}</span></h2>
-    <p class="flow-section-note">#{ordering}</p>
-    #{accessible_table(title <> " workflow records", table)}
-    """
+    accessible_table(title <> " workflow records", table)
   end
+
+  defp render_due_clock(ms) when is_integer(ms),
+    do:
+      ~s(<span class="flow-run-secondary" title="#{escape_attr(format_timestamp_ms_or_dash(ms))}">#{format_clock_ms(ms)}</span>)
+
+  defp render_due_clock(_ms), do: ~s(<span class="flow-run-secondary">-</span>)
 
   defp render_due_waiting_reason(record) do
     case Map.get(record, :dashboard_fifo_blocker) do
@@ -413,16 +674,12 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
   end
 
   defp render_due_relative_time(record) do
-    case {flow_record_run_at_ms(record), Map.get(record, :dashboard_snapshot_ms)} do
-      {run_at, snapshot} when is_integer(run_at) and is_integer(snapshot) ->
-        delta = snapshot - run_at
+    case due_delta_ms(record) do
+      delta when is_integer(delta) and delta >= 0 ->
+        ~s(<span class="flow-due-when">#{format_duration_ms(delta)} overdue</span>)
 
-        label =
-          if delta >= 0,
-            do: "#{format_duration_ms(delta)} overdue",
-            else: "in #{format_duration_ms(-delta)}"
-
-        ~s(<span class="flow-run-secondary" title="Relative to captured snapshot at #{format_timestamp_ms_or_dash(snapshot)}">#{label}</span>)
+      delta when is_integer(delta) ->
+        ~s(<span class="flow-due-when">in #{format_duration_ms(-delta)}</span>)
 
       _ ->
         ""
@@ -535,7 +792,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
       end
 
     """
-    <h2 class="section-title" id="flow-recent-records">Recent Flow Records#{limit_badge}</h2>
+    <h2 class="section-title" id="flow-recent-records">Recent runs#{limit_badge}</h2>
     <div class="table-scroll" role="region" aria-label="Recent workflow records" tabindex="0"><table class="flow-runs-table">
       <thead>
         <tr><th>Workflow</th><th>State</th><th>Activity</th><th>Updated (UTC)</th><th>Values</th><th>Actions</th></tr>

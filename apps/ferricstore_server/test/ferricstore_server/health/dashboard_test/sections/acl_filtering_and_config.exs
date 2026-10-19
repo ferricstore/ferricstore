@@ -1055,7 +1055,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
       end
 
       # ---------------------------------------------------------------------------
-      # Namespace Config section (Dashboard Page 9)
+      # Namespace config section (Dashboard Page 9)
       # ---------------------------------------------------------------------------
 
       describe "collect/0 namespace_config" do
@@ -1105,18 +1105,18 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
       end
 
       describe "render_config_page/1 namespace config sub-page" do
-        test "config sub-page contains Namespace Config heading" do
+        test "config sub-page contains Namespace config heading" do
           data = Dashboard.collect_config_page()
           html = Dashboard.render_config_page(data)
 
-          assert String.contains?(html, "Namespace Config")
+          assert String.contains?(html, "Namespace config")
         end
 
         test "config sub-page shows supported configuration commands" do
           data = Dashboard.collect_config_page()
           html = Dashboard.render_config_page(data)
 
-          assert String.contains?(html, "Configuration Commands")
+          assert String.contains?(html, "Configuration commands")
           assert String.contains?(html, "CONFIG GET &lt;pattern&gt;")
           assert String.contains?(html, "CONFIG SET &lt;key&gt; &lt;value&gt;")
           assert String.contains?(html, "CONFIG SET LOCAL log_level &lt;level&gt;")
@@ -1135,7 +1135,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           data = Dashboard.collect_config_page()
           html = Dashboard.render_config_page(data)
 
-          assert String.contains?(html, "Runtime Parameters")
+          assert String.contains?(html, "Runtime parameters")
           assert String.contains?(html, "maxmemory-policy")
           assert String.contains?(html, "keydir-max-ram")
           assert String.contains?(html, "hot-cache-max-value-size")
@@ -1171,7 +1171,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           data = Dashboard.collect_config_page()
           html = Dashboard.render_config_page(data)
 
-          assert String.contains?(html, "All namespaces using built-in default window (1ms)")
+          assert String.contains?(html, "All namespaces use the built-in default window (1 ms).")
         end
 
         test "shows table with prefix and window when namespaces configured" do
@@ -1188,8 +1188,8 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           assert String.contains?(html, "Prefix")
           assert String.contains?(html, "Window (ms)")
           refute String.contains?(html, "Durability")
-          assert String.contains?(html, "Changed At")
-          assert String.contains?(html, "Changed By")
+          assert String.contains?(html, "Changed at")
+          assert String.contains?(html, "Changed by")
 
           NamespaceConfig.reset_all()
         end
@@ -1201,7 +1201,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           data = Dashboard.collect_config_page()
           html = Dashboard.render_config_page(data)
 
-          [_before, ns_section] = String.split(html, "Namespace Config", parts: 2)
+          [_before, ns_section] = String.split(html, "Namespace config", parts: 2)
 
           ns_html =
             case String.split(ns_section, "section-title", parts: 2) do
@@ -1223,7 +1223,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           html = Dashboard.render_config_page(data)
 
           # Extract the config table area to check
-          [_before, ns_section] = String.split(html, "Namespace Config", parts: 2)
+          [_before, ns_section] = String.split(html, "Namespace config", parts: 2)
           # Take until the next section or end of body
           ns_html =
             case String.split(ns_section, "section-title", parts: 2) do

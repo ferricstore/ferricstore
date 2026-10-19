@@ -11,7 +11,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.OperationalPages do
           port = HealthEndpoint.port()
 
           for {path, title} <- [
-                {"/dashboard/slowlog", "Slow Log"},
+                {"/dashboard/slowlog", "Slow log"},
                 {"/dashboard/merge", "Merge Status"},
                 {"/dashboard/config", "Config"},
                 {"/dashboard/clients", "Clients"},
@@ -47,7 +47,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.OperationalPages do
             |> Dashboard.render_clients_page()
 
           assert String.contains?(html, "Clients")
-          assert String.contains?(html, "Connections")
+          assert String.contains?(html, "Active connections")
           refute String.contains?(html, "RE" <> "SP")
         end
 
@@ -133,7 +133,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.OperationalPages do
             Dashboard.collect_streams_page()
             |> Dashboard.render_streams_page()
 
-          assert String.contains?(html, "Consumer Groups")
+          assert String.contains?(html, "Consumer groups")
           assert String.contains?(html, "XREADGROUP")
           assert String.contains?(html, "XACK")
           assert String.contains?(html, "g1 / c1")

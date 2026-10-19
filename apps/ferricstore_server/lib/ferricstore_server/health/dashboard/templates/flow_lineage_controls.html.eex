@@ -1,7 +1,7 @@
 <% data = assigns.data %>
 <% filters = data.filters %>
 <section class="flow-lineage-lookup" aria-label="Lineage lookup">
-  <h2 class="section-title">Lineage Lookup <%= info_icon("Uses a partition-bound FLOW.QUERY lineage plan. Payload bytes are not read.") %></h2>
+  <h2 class="section-title">Trace lineage <%= info_icon("Uses a partition-bound FLOW.QUERY lineage plan. Payload bytes are not read.") %></h2>
   <form class="flow-filter-form flow-lineage-filter-form" action="/dashboard/flow/lineage" method="get">
     <label>
       Query
@@ -24,4 +24,4 @@
     <button class="flow-search-button" type="submit">Search</button>
   </form>
 </section>
-<%= render_flow_lineage_hints(data.hints) %>
+<%= if data.result.status == :idle and filters.target in [nil, ""], do: "", else: render_flow_lineage_hints(data.hints) %>

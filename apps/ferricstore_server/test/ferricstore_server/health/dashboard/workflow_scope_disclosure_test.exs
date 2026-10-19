@@ -28,19 +28,15 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowScopeDisclosureTest do
              "type, runtime status and updated time are not carried"
   end
 
-  test "visible contextual links disclose their compatible scope" do
+  test "list pages disclose the scope each route carries through the sidebar contract" do
     html =
       FlowOverview.render_flow_context_tools(
         %{filters: %{state: "queued", range: "1h"}},
         "flow_states"
       )
 
-    [anchor] =
-      Regex.run(
-        ~r/<a class="flow-context-link"[^>]*href="\/dashboard\/flow\/failures[^>]*>/,
-        html
-      )
-
+    refute html =~ ~s(class="flow-context-link")
+    anchor = route_anchor(html, "failures")
     assert anchor =~ "title=\"Carries type and partition only"
     assert anchor =~ "aria-description="
   end

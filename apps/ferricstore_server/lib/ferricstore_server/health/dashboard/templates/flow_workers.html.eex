@@ -7,12 +7,12 @@
 <%= render_page_header("flow_workers", intro: "Track worker leases, running jobs, lease age, and stalled worker pressure.") %>
 <div class="content">
 <%= render_flow_context_tools(data, "flow_workers") %>
+<%= render_live_component("flow_workers_status", render_flow_workers_status(data.workers, Map.get(data, :filters, %{}))) %>
 <%= render_live_component("flow_workers", render_flow_workers(data.workers, Map.get(data, :filters, %{}))) %>
 <%= render_live_component("flow_running_records", render_flow_running_records(data.running_records, data.total_sampled, data.sample_limit)) %>
 <details class="dashboard-disclosure" id="flow-worker-breakdown">
-<summary>Lease distribution and FIFO lanes</summary>
-<%= render_live_component("flow_workers_chart", render_flow_workers_chart(data.workers)) %>
-<%= render_live_component("flow_fifo_lanes", render_flow_fifo_lanes(Map.get(data, :fifo_lanes, []), data.total_sampled, data.sample_limit, Map.get(data, :fifo_coverage, %{}))) %>
+<summary>FIFO lanes</summary>
+<%= render_live_component("flow_fifo_lanes", render_flow_workers_fifo(Map.get(data, :fifo_lanes, []), data.total_sampled, data.sample_limit, Map.get(data, :fifo_coverage, %{}))) %>
 </details>
 </div>
 </main>

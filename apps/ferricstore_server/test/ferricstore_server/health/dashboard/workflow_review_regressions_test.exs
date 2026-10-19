@@ -13,20 +13,29 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowReviewRegressionsTest do
   alias FerricstoreServer.Health.Dashboard.Render.FlowTables.Records
   alias FerricstoreServer.Health.Dashboard.FlowRecord
 
-  test "Due Work uses a compact unframed comparison and keeps exact sampled counts" do
-    for {due, scheduled} <- [{[], []}, {[1, 2, 3], [4]}, {[], [1, 2]}] do
-      html = FlowCharts.render_flow_due_chart(due, scheduled)
+  test "Due Work summarizes the sample in one unframed line with exact counts" do
+    run = fn id ->
+      %{id: id, type: "t", state: "queued", run_at_ms: 1, dashboard_snapshot_ms: 2}
+    end
 
-      assert html =~
-               ~s(<section class="flow-due-summary" aria-label="Sampled due and scheduled work">)
+    for {due, scheduled} <- [
+          {[], []},
+          {[run.(1), run.(2), run.(3)], [run.(4)]},
+          {[], [run.(1), run.(2)]}
+        ] do
+      html = Records.render_flow_due_summary(due, scheduled)
 
       refute html =~ "chart-card"
       refute html =~ "chart-grid"
       refute html =~ "Due Charts"
-      assert html =~ "Current sample"
       assert html =~ "does not establish claimability"
-      assert html =~ ~s(<span class="chart-bar-value">#{length(due)}</span>)
-      assert html =~ ~s(<span class="chart-bar-value">#{length(scheduled)}</span>)
+
+      case length(due) do
+        0 -> assert html =~ "Nothing is due now"
+        n -> assert html =~ "#{n} runs due now"
+      end
+
+      if scheduled != [], do: assert(html =~ "#{length(scheduled)} scheduled")
     end
   end
 
@@ -45,7 +54,7 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowReviewRegressionsTest do
 
     html = Records.render_flow_running_records([record], 1, 400)
     assert html =~ ~s(<table class="flow-worker-records-table">)
-    assert html =~ "<th>Workflow</th><th>Worker</th><th>Status</th><th>Lease Expires (UTC)</th>"
+    assert html =~ "<th>Workflow</th><th>Worker</th><th>Status</th><th>Lease expires (UTC)</th>"
     refute html =~ "<th>Lease Token</th>"
     refute html =~ "<th>Fencing</th>"
     assert html =~ "invoices&lt;&amp;"
@@ -89,7 +98,7 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowReviewRegressionsTest do
     assert key.(render.(nil)) == key.(render.(""))
     assert render.(nil) =~ "<dt>Lease token</dt><dd>-</dd>"
     assert render.(nil) =~ "<dt>Fencing token</dt><dd>-</dd>"
-    assert Records.render_flow_running_records([], 0, 400) =~ ~s(colspan="4")
+    assert Records.render_flow_running_records([], 0, 400) =~ ~s(class="section-empty")
   end
 
   test "Workers leads with workers and leased records while secondary charts stay disclosed" do
@@ -109,7 +118,10 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowReviewRegressionsTest do
     assert position(html, ~s(data-live-component="flow_running_records")) <
              position(html, ~s(id="flow-worker-breakdown"))
 
-    for component <- ~w(flow_workers flow_running_records flow_workers_chart flow_fifo_lanes) do
+    assert position(html, ~s(data-live-component="flow_workers_status")) <
+             position(html, ~s(data-live-component="flow_workers"))
+
+    for component <- ~w(flow_workers_status flow_workers flow_running_records flow_fifo_lanes) do
       assert length(Regex.scan(Regex.compile!(~s(data-live-component="#{component}")), html)) == 1
     end
   end
@@ -144,7 +156,7 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowReviewRegressionsTest do
 
     html = Dashboard.render_flow_retention_page(%{})
 
-    assert position(html, "Sampled Active Timeouts") <
+    assert position(html, "Cleanup candidates") <
              position(html, ~s(id="flow-retention-reference"))
 
     assert html =~ ~s(<details class="dashboard-disclosure" id="flow-retention-reference">)
@@ -170,9 +182,9 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowReviewRegressionsTest do
 
   test "due charts and record diagnostics do not infer claim eligibility from timestamps" do
     record = %{id: "waiting", type: "invoices", state: "queued", run_at_ms: 1}
-    html = FlowCharts.render_flow_due_chart([record], [])
+    html = Records.render_flow_due_summary([record], [])
     refute html =~ "Claim readiness"
-    refute html =~ "bar-yellow"
+    refute html =~ "is-warning"
     assert html =~ "does not establish claimability"
     refute FlowRecord.flow_waiting_reason(record) =~ "waiting for worker claim"
     assert FlowDetail.flow_execution_debug_summary(record) == "due time reached"

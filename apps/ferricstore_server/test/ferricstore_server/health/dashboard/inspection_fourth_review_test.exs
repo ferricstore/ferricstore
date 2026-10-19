@@ -130,7 +130,7 @@ defmodule FerricstoreServer.Health.Dashboard.InspectionFourthReviewTest do
 
   test "states identities and keyboard table focus use readable shared styling" do
     css = Styles.stylesheet()
-    assert css =~ ".flow-states-table th:nth-child(2) { width: 240px; }"
+    assert css =~ ".flow-states-table th:nth-child(2) { width: 160px; }"
     assert css =~ ".table-scroll:focus-visible { outline: 2px solid var(--accent)"
     refute css =~ ".table-scroll:focus { outline: 2px solid rgba"
     assert css =~ ".flow-alert code { overflow-wrap: anywhere;"

@@ -1,5 +1,5 @@
 <% data = assigns.data %>
-<h2 class="section-title" id="flow-lineage-records" tabindex="-1">Lineage Records</h2>
+<h2 class="section-title" id="flow-lineage-records" tabindex="-1">Lineage records</h2>
 <div class="table-scroll" role="region" aria-label="Workflow lineage records" tabindex="0"><table>
   <thead>
     <tr><th>ID</th><th>Type</th><th>Runtime status</th><th>Parent</th><th>Root</th><th>Correlation</th><th>Updated (UTC)</th><th>Values</th></tr>

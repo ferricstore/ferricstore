@@ -74,7 +74,7 @@ defmodule FerricstoreServer.Health.Dashboard.ManagementFourthReviewTest do
     assert html =~ "does not simulate global cleanup"
     refute html =~ ~s(name="confirm_cleanup")
     assert html =~ ~s(value="review_cleanup")
-    refute html =~ ">Run Cleanup</button>"
+    refute html =~ ">Run cleanup</button>"
     flash = FlowRetention.render_flow_retention_flash(%{kind: :dry_run, limit: 200})
     assert flash =~ "Sampled preview refreshed"
     assert flash =~ "does not apply the global cleanup limit"

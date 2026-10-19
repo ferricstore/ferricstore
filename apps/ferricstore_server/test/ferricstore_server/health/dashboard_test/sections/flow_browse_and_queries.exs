@@ -13,9 +13,9 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           data = Dashboard.collect_flow_states_page()
           html = Dashboard.render_flow_states_page(data)
 
-          assert String.contains?(html, "Flow States")
-          assert String.contains?(html, "Oldest Due")
-          assert String.contains?(html, "Due Now")
+          assert String.contains?(html, "Runs by state")
+          assert String.contains?(html, "Oldest due")
+          assert String.contains?(html, "<th>Attention</th>")
         end
 
         test "filters state-centric Flow page by workflow type" do
@@ -121,7 +121,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           assert String.contains?(html, ~s(name="limit"))
           assert String.contains?(html, "Showing #{flow_type} / queued / id contains keep")
           assert String.contains?(html, "recent limit 1")
-          assert String.contains?(html, "Recent Flow Records")
+          assert String.contains?(html, "Recent runs")
           assert String.contains?(html, "limit 1")
           assert String.contains?(html, keep_new_id)
           refute String.contains?(html, keep_old_id)
@@ -419,21 +419,20 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
 
           html = Dashboard.render_flow_states_page(data)
 
-          assert String.contains?(html, "Retrying")
-          assert String.contains?(html, "Failed")
-          assert String.contains?(html, "Maxed")
-          assert String.contains?(html, "Mode")
-          assert String.contains?(html, "FIFO")
-          assert String.contains?(html, "lease deadline passed")
-          assert String.contains?(html, "terminal failed")
-          assert String.contains?(html, "attempts")
-          assert String.contains?(html, ~s(<button type="button" class="info-icon"))
-          assert String.contains?(html, ~s(aria-label="Metric help"))
+          assert String.contains?(html, ~s(<span class="badge badge-retrying">1 retrying</span>))
+          assert String.contains?(html, ~s(<span class="badge badge-warning">1 expired</span>))
+          assert String.contains?(html, ~s(<span class="badge badge-failed">1 failed</span>))
 
           assert String.contains?(
                    html,
-                   ~s(data-tooltip="Running flows whose lease deadline passed)
+                   ~s(<span class="badge badge-failed">1 out of retries</span>)
                  )
+
+          assert String.contains?(html, "Mode")
+          assert String.contains?(html, "FIFO")
+          assert String.contains?(html, "Expired leases are not failures")
+          assert String.contains?(html, "<strong>Needs attention</strong>")
+          assert String.contains?(html, ~s(<button type="button" class="info-icon"))
 
           assert String.contains?(
                    html,
@@ -495,7 +494,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
                    &(&1.type == type and &1.partition_key == partition_key)
                  )
 
-          assert String.contains?(html, "FIFO Lanes")
+          assert String.contains?(html, "FIFO lanes")
           assert String.contains?(html, "blocked by active flow")
           assert String.contains?(html, first_id)
           assert String.contains?(html, second_id)
@@ -509,8 +508,8 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           html = Dashboard.render_flow_workers_page(data)
 
           assert String.contains?(html, "Flow Workers")
-          assert String.contains?(html, "Running")
-          assert String.contains?(html, "Expired")
+          assert String.contains?(html, ~s(class="page-status workers-status))
+          assert String.contains?(html, ~s(id="flow-running-records">Leases))
         end
       end
 
@@ -524,8 +523,9 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
                    ~s(href="/dashboard/flow/due" aria-current="page">Due</a>)
                  )
 
-          assert String.contains?(html, "Why Waiting")
-          assert String.contains?(html, "Run At")
+          assert String.contains?(html, ~s(class="page-status due-status))
+          assert String.contains?(html, "<h2 class=\"section-title\">Due now")
+          assert String.contains?(html, "<h2 class=\"section-title\">Scheduled")
         end
       end
 
@@ -936,7 +936,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           data = Dashboard.collect_flow_page()
           html = Dashboard.render_flow_page(data)
 
-          assert String.contains?(html, "Projection Health")
+          assert String.contains?(html, "Projection health")
           assert String.contains?(html, "LMDB")
           assert String.contains?(html, "asynchronous")
           assert String.contains?(html, "Pending")

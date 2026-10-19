@@ -298,7 +298,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
 
   def slowlog_payload(%{slowlog_status: :unavailable}) do
     {:error, :invalid_filters,
-     "Slow Log collection failed. Last successful samples retained; retry to refresh."}
+     "Slow log collection failed. Last successful samples retained; retry to refresh."}
   end
 
   def slowlog_payload(data) do
@@ -355,10 +355,11 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
 
   defp live_flow_workers_payload(data) do
     live_component_payload(%{
-      "flow_workers_chart" => render_flow_workers_chart(data.workers),
+      "flow_workers_status" =>
+        render_flow_workers_status(data.workers, Map.get(data, :filters, %{})),
       "flow_workers" => render_flow_workers(data.workers, Map.get(data, :filters, %{})),
       "flow_fifo_lanes" =>
-        render_flow_fifo_lanes(
+        render_flow_workers_fifo(
           Map.get(data, :fifo_lanes, []),
           data.total_sampled,
           data.sample_limit,
@@ -371,7 +372,8 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
 
   defp live_flow_due_payload(data) do
     live_component_payload(%{
-      "flow_due_chart" => render_flow_due_chart(data.due_now, data.scheduled),
+      "flow_due_summary" =>
+        render_flow_due_summary(data.due_now, data.scheduled, Map.get(data, :scheduled_sampled)),
       "flow_fifo_lanes" =>
         render_flow_fifo_lanes(
           Map.get(data, :fifo_lanes, []),
@@ -386,7 +388,8 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
           "Scheduled Future",
           data.scheduled,
           data.total_sampled,
-          data.sample_limit
+          data.sample_limit,
+          Map.get(data, :scheduled_sampled)
         )
     })
   end
@@ -522,6 +525,13 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   defp live_valid_flow_states_payload(data) do
     live_component_payload(%{
       "flow_states_sources" => render_flow_states_sources(data),
+      "flow_states_overview" =>
+        render_flow_states_overview(
+          data.states,
+          data.filtered_sampled,
+          Map.get(data, :source_status, :ok),
+          data.filters
+        ),
       "flow_states_chart" =>
         if(Map.get(data, :source_status) == :unavailable,
           do: "",

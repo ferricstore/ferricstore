@@ -53,7 +53,7 @@ defmodule FerricstoreServer.Health.Dashboard.QueryTriageThirdReviewTest do
     assert html =~ ">Guided draft</button>"
     assert html =~ ">Raw FQL draft</button>"
     assert html =~ "Independent drafts"
-    assert html =~ "Switching drafts does not transfer changes"
+    assert html =~ "switching does not carry changes over"
   end
 
   test "expired lease hint states evidence without prescribing reclaim" do
@@ -101,16 +101,18 @@ defmodule FerricstoreServer.Health.Dashboard.QueryTriageThirdReviewTest do
 
     assert filters.sort == "distribution"
     assert FlowFilters.render_flow_type_filter(%{filters: filters}) =~ "Attention first"
-    assert Records.render_flow_workers([], %{sort: "distribution"}) =~ "Distribution"
+
+    assert Records.render_flow_workers([%{worker: "w", running: 1, expired: 0}], %{
+             sort: "distribution"
+           }) =~ ~s(<option value="distribution" selected>Distribution</option>)
   end
 
   test "States puts exception columns before routine counts" do
     html = Records.render_flow_states_table([], 0, 0, 400, %{})
     assert html =~ ~s(class="flow-states-table")
-    assert html =~ "Scroll for distribution columns"
-    {failed, _} = :binary.match(html, "<th>Failed")
-    {count, _} = :binary.match(html, "<th>Sample Count")
-    assert failed < count
+    {attention, _} = :binary.match(html, "<th>Attention")
+    {count, _} = :binary.match(html, "<th>Runs")
+    assert attention < count
   end
 
   test "time fields work without JavaScript and enhancement hides inactive modes" do

@@ -3,7 +3,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Capabilities do
 
   import FerricstoreServer.Health.Dashboard.Format
   import FerricstoreServer.Health.Dashboard.Render.Admin, only: [render_config_command_table: 2]
-  import FerricstoreServer.Health.Dashboard.Render.Overview, only: [render_ops_summary: 2]
+  import FerricstoreServer.Health.Dashboard.Render.Overview, only: [render_ops_summary: 3]
+
+  alias FerricstoreServer.Health.Dashboard.Render.PageStatus
 
   @capability_order [
     :sdk,
@@ -21,7 +23,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Capabilities do
     """
     #{render_management_capability_summary(capabilities)}
     #{render_management_capability_table(capabilities)}
-    #{render_config_command_table("Management Command Contract", Map.get(data, :command_reference, []))}
+    #{render_config_command_table("Management command contract", Map.get(data, :command_reference, []))}
     """
   end
 
@@ -29,24 +31,49 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Capabilities do
     supported = Enum.count(capabilities, fn {_key, value} -> value == true end)
     unsupported = Enum.count(capabilities, fn {_key, value} -> value == false end)
 
-    render_ops_summary("Management Capabilities", [
-      %{
-        label: "Supported",
-        value: format_number(supported),
-        class: if(supported > 0, do: "c-green", else: "")
-      },
-      %{
-        label: "Unsupported",
-        value: format_number(unsupported),
-        class: if(unsupported > 0, do: "c-yellow", else: "")
-      },
-      %{
-        label: "Probe",
-        value: "FERRICSTORE.CAPABILITIES",
-        class: "ops-summary-code",
-        detail: "stable read-only SDK/native contract"
-      }
-    ])
+    unsupported_names =
+      capabilities
+      |> ordered_capability_entries()
+      |> Enum.filter(fn {_name, value} -> value == false end)
+      |> Enum.map_join(", ", fn {name, _value} -> to_string(name) end)
+
+    status =
+      if map_size(capabilities) == 0 do
+        PageStatus.render("capabilities", :warning, "Capabilities unavailable", [
+          "FERRICSTORE.CAPABILITIES returned nothing to show"
+        ])
+      else
+        PageStatus.render(
+          "capabilities",
+          :idle,
+          "#{format_number(supported)} of #{format_number(length(ordered_capability_entries(capabilities)))} capabilities supported",
+          if(unsupported_names == "", do: [], else: ["unsupported: #{unsupported_names}"])
+        )
+      end
+
+    status <>
+      render_ops_summary(
+        "Management Capabilities",
+        [
+          %{
+            label: "Supported",
+            value: format_number(supported),
+            class: if(supported > 0, do: "c-green", else: "")
+          },
+          %{
+            label: "Unsupported",
+            value: format_number(unsupported),
+            class: if(unsupported > 0, do: "c-yellow", else: "")
+          },
+          %{
+            label: "Probe",
+            value: "FERRICSTORE.CAPABILITIES",
+            class: "ops-summary-code",
+            detail: "stable read-only SDK/native contract"
+          }
+        ],
+        heading: :hidden
+      )
   end
 
   def render_management_capability_table(capabilities) when is_map(capabilities) do
@@ -66,7 +93,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Capabilities do
       end)
 
     """
-    <h2 class="section-title">Capability Flags</h2>
+    <h2 class="section-title">Capability flags</h2>
     #{table_scroll("Capability flags", """
     <table>
     <thead>

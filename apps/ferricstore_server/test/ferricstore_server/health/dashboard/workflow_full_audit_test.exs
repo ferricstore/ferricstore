@@ -326,7 +326,9 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowFullAuditTest do
     assert html =~ "Filter loaded policies"
     assert html =~ "data-dashboard-table-filter"
     assert html =~ ~s(id="flow-policy-catalog")
-    assert html =~ "Generation"
+
+    row = FlowPolicy.render_flow_policy_row(%{type: "t", source: "configured", generation: 7})
+    assert row =~ "generation 7"
   end
 
   test "index lifecycle shows actual build validation retirement and statistic metadata" do
