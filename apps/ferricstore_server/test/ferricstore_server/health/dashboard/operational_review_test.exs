@@ -156,13 +156,40 @@ defmodule FerricstoreServer.Health.Dashboard.OperationalReviewTest do
     htmls = [
       Admin.render_clients_table([]),
       Admin.render_slowlog_table([]),
-      MessagingPages.render_stream_top_streams(%{}),
-      MessagingPages.render_stream_consumers(%{}),
-      MessagingPages.render_stream_waiters(%{}),
-      MessagingPages.render_stream_activity_log(%{}),
-      MessagingPages.render_pubsub_channels(%{}),
-      MessagingPages.render_pubsub_patterns(%{}),
-      MessagingPages.render_pubsub_activity(%{})
+      # Messaging tables show their filter once they have rows; empty, they are prompts.
+      MessagingPages.render_stream_top_streams(%{
+        top_streams: [%{key: "s", mutations: 1, appends: 1, last_entry_id: "1-0", last_at_us: 1}]
+      }),
+      MessagingPages.render_stream_consumers(%{
+        consumer_groups: [
+          %{key: "s", group: "g", consumers: 1, pending: 0, last_delivered: "1-0"}
+        ]
+      }),
+      MessagingPages.render_stream_waiters(%{
+        waiters: [%{key: "s", waiters: 1, oldest_wait_us: 1, last_seen_id: "1-0"}]
+      }),
+      MessagingPages.render_stream_activity_log(%{
+        entries: [
+          %{
+            id: 1,
+            timestamp_us: 1,
+            role: :producer,
+            command: "XADD",
+            key: "s",
+            result: "ok",
+            entry_id: "1-0",
+            field_pairs: 1,
+            trim: nil
+          }
+        ]
+      }),
+      MessagingPages.render_pubsub_channels(%{channels: [%{channel: "c", subscribers: 1}]}),
+      MessagingPages.render_pubsub_patterns(%{patterns: [%{pattern: "p*", subscribers: 1}]}),
+      MessagingPages.render_pubsub_activity(%{
+        activity: [
+          %{id: 1, timestamp_us: 1, command: "PUBLISH", target_type: :channel, target: "c"}
+        ]
+      })
     ]
 
     for html <- htmls do

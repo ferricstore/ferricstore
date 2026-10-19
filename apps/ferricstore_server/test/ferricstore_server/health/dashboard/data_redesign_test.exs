@@ -199,4 +199,56 @@ defmodule FerricstoreServer.Health.Dashboard.DataRedesignTest do
     assert html =~
              ~s(<details class="dashboard-disclosure" id="command-reference"><summary>Command reference</summary>)
   end
+
+  alias FerricstoreServer.Health.Dashboard.Render.MessagingPages
+
+  test "Streams opens with activity in the retained window" do
+    idle = MessagingPages.render_stream_activity_summary(%{})
+    assert idle =~ "streams-status is-idle"
+    assert idle =~ "<strong>No stream activity in the retained window</strong>"
+
+    busy =
+      MessagingPages.render_stream_activity_summary(%{
+        summary: %{mutations: 40, appends: 30, consumer_events: 6, unique_streams: 3}
+      })
+
+    assert busy =~ "<strong>40 mutations across 3 streams</strong>"
+    assert busy =~ "30 appends"
+    assert busy =~ "6 consumer events"
+  end
+
+  test "Pub/Sub opens with active subscriptions" do
+    assert MessagingPages.render_pubsub_summary(%{}) =~ "<strong>No active subscriptions</strong>"
+
+    html =
+      MessagingPages.render_pubsub_summary(%{
+        summary: %{
+          channels: 2,
+          patterns: 1,
+          exact_subscriptions: 3,
+          pattern_subscriptions: 1,
+          active_subscribers: 2
+        }
+      })
+
+    assert html =~ "pubsub-status is-idle"
+    assert html =~ "<strong>4 subscriptions on 2 channels and 1 pattern</strong>"
+    assert html =~ "2 subscribers"
+  end
+
+  test "empty messaging tables are prompts without filter controls" do
+    for html <- [
+          MessagingPages.render_stream_top_streams(%{}),
+          MessagingPages.render_stream_consumers(%{}),
+          MessagingPages.render_stream_waiters(%{}),
+          MessagingPages.render_stream_activity_log(%{}),
+          MessagingPages.render_pubsub_channels(%{}),
+          MessagingPages.render_pubsub_patterns(%{}),
+          MessagingPages.render_pubsub_activity(%{})
+        ] do
+      assert html =~ ~s(<p class="section-empty">)
+      refute html =~ "<table"
+      refute html =~ "data-dashboard-table-filter"
+    end
+  end
 end

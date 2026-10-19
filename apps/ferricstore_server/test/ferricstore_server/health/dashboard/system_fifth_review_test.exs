@@ -392,7 +392,8 @@ defmodule FerricstoreServer.Health.Dashboard.SystemFifthReviewTest do
     refute html =~ ~r/<h2[^>]*>Active Streams/
     refute html =~ ~r/<h2[^>]*>Blocked Readers/
     refute html =~ "Stream Consumers"
-    assert html =~ "Filter loaded streams and consumer groups"
+    # Empty, the consumer groups disclosure is a prompt; its filter appears with rows.
+    assert html =~ "No active stream consumer groups loaded."
   end
 
   defp insert_keys(keys) do
