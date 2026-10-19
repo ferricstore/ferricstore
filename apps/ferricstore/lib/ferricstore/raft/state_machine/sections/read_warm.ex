@@ -645,7 +645,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         }
       end
 
+      # The HyperLogLog handlers' own type check needs a compound store, which
+      # the string store does not have: on a hash, set, zset, list or stream
+      # key it raised in apply and crash-looped the shard. The state machine's
+      # check answers WRONGTYPE first.
+      defp do_pfadd(state, key, elements) do
+        with :ok <- ensure_string_key(state, key) do
+          HyperLogLog.handle_ast({:pfadd, [key | elements]}, build_string_value_store(state))
+        end
+      end
+
       defp do_pfmerge(state, dest_key, source_sketches) when is_list(source_sketches) do
+        with :ok <- ensure_string_key(state, dest_key) do
+          do_checked_pfmerge(state, dest_key, source_sketches)
+        end
+      end
+
+      defp do_checked_pfmerge(state, dest_key, source_sketches) do
         source_keys =
           source_sketches
           |> Enum.with_index()

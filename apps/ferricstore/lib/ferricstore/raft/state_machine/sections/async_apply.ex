@@ -994,9 +994,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         end
       end
 
-      defp apply_single(state, {:pfadd, key, elements}) do
-        HyperLogLog.handle_ast({:pfadd, [key | elements]}, build_string_value_store(state))
-      end
+      defp apply_single(state, {:pfadd, key, elements}), do: do_pfadd(state, key, elements)
 
       defp apply_single(state, {:pfmerge, dest_key, source_sketches}) do
         do_pfmerge(state, dest_key, source_sketches)

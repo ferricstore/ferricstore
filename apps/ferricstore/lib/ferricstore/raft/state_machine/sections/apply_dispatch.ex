@@ -2034,7 +2034,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           command = {:pfadd, key, elements}
 
           with :ok <- admit_apply_command_work(state, command) do
-            HyperLogLog.handle_ast({:pfadd, [key | elements]}, build_string_value_store(state))
+            do_pfadd(state, key, elements)
           end
         end)
       end

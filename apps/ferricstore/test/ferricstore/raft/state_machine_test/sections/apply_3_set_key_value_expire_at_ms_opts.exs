@@ -1023,6 +1023,30 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           assert values == ["a", "b"]
         end
 
+        test "PFADD and PFMERGE on a hash answer WRONGTYPE instead of raising in apply", %{
+          state: state,
+          ets: ets
+        } do
+          key = "hll_apply_on_hash"
+          type_key = Ferricstore.Store.CompoundKey.type_key(key)
+          {state, :ok} = StateMachine.apply(%{}, {:put, type_key, "hash", 0}, state)
+          {state, 1} = StateMachine.apply(%{}, {:hincrby, key, "f", 1}, state)
+          sketch = Ferricstore.HyperLogLog.new()
+
+          wrongtype =
+            {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+
+          for command <- [{:pfadd, key, ["x"]}, {:pfmerge, key, [sketch]}] do
+            {_new_state, result} = StateMachine.apply(%{}, command, state)
+            assert wrongtype == result, "#{inspect(command)} returned #{inspect(result)}"
+          end
+
+          assert [{^type_key, "hash", 0, _lfu, _file_id, _offset, _size}] =
+                   :ets.lookup(ets, type_key)
+
+          assert [] == :ets.lookup(ets, key)
+        end
+
         test "RATELIMIT.ADD rejects a malformed window, limit or count instead of raising", %{
           state: state,
           ets: ets

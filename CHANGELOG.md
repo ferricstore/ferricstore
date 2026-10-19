@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer WRONGTYPE for PFADD on a hash, set, sorted set or list key instead
+  of crashing the shard. The write's type check ran in the state machine with
+  a store it could not use there and raised, so the shard's storage process
+  crash-looped and stopped serving. `FerricStore.pfadd/2` already hit this,
+  and the gateway PFADD reached it after it moved to the atomic write in this
+  release. PFMERGE gets the same check in the state machine, for a
+  destination that changes type between the caller's read and the write.
 - Discard a native MULTI transaction when one of its commands is rejected
   while queuing. An unknown command, a command that failed to parse, or one
   the user's ACL denies answered with an error but left the transaction open,

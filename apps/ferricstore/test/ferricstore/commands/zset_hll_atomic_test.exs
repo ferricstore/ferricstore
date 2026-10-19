@@ -45,6 +45,25 @@ defmodule Ferricstore.Commands.ZsetHllAtomicTest do
            "PFCOUNT #{count} for #{expected} elements"
   end
 
+  test "PFADD and PFMERGE on another type answer WRONGTYPE and the shard keeps serving", %{
+    ctx: ctx,
+    key: key
+  } do
+    wrongtype = {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+    hash = key <> ":hash"
+    sketch = key <> ":hll"
+    assert 1 == Dispatcher.dispatch("HSET", [hash, "f", "v"], ctx)
+    assert 1 == Dispatcher.dispatch("PFADD", [sketch, "a"], ctx)
+
+    assert wrongtype == Dispatcher.dispatch("PFADD", [hash, "x"], ctx)
+    assert wrongtype == FerricStore.pfadd(hash, ["x"])
+    assert wrongtype == Dispatcher.dispatch("PFMERGE", [hash, sketch], ctx)
+
+    assert "v" == Dispatcher.dispatch("HGET", [hash, "f"], ctx)
+    assert :ok = Dispatcher.dispatch("SET", [key <> ":after", "served"], ctx)
+    assert "served" == Dispatcher.dispatch("GET", [key <> ":after"], ctx)
+  end
+
   test "concurrent HSETNX has one winner", %{ctx: ctx, key: key} do
     wins =
       concurrent_results(fn client ->
