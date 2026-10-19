@@ -25,6 +25,11 @@ All notable changes to FerricStore will be documented here.
   while the shard applied them, crashing it until the node shut down. The
   state machine now also rejects malformed list writes and PFADD elements
   instead of raising.
+- Reject a malformed window, limit or count in the embedded
+  `FerricStore.ratelimit_add/4` with the RATELIMIT.ADD command's bounds. A
+  float or string window reached the replicated log and raised while the
+  shard applied it, with the same node shutdown; the state machine now also
+  rejects such an entry instead of raising.
 - Reject a TTL in the embedded `FerricStore.setex/3` and `FerricStore.psetex/3`
   that puts the expiry past the int64 range, with "ERR value is not an integer
   or out of range", as the SETEX and PSETEX commands and `FerricStore.pexpire/2`

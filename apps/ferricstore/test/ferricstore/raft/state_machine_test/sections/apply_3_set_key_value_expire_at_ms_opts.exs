@@ -1023,6 +1023,23 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           assert values == ["a", "b"]
         end
 
+        test "RATELIMIT.ADD rejects a malformed window, limit or count instead of raising", %{
+          state: state,
+          ets: ets
+        } do
+          key = "invalid_ratelimit_apply"
+
+          for {window_ms, max, count} <- [{1.5, 10, 1}, {1000, "10", 1}, {1000, 10, nil}] do
+            command = {:ratelimit_add, key, window_ms, max, count}
+            {_new_state, result} = StateMachine.apply(%{}, command, state)
+
+            assert {:error, "ERR value is not an integer or out of range"} = result,
+                   "#{inspect(command)} returned #{inspect(result)}"
+          end
+
+          assert [] == :ets.lookup(ets, key)
+        end
+
         test "crafted direct writes cannot bypass the replicated size limit", %{
           state: state,
           ets: ets

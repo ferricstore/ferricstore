@@ -1419,12 +1419,14 @@ defmodule Ferricstore.Store.Router.Part09 do
               pos_integer()
             ) :: [term()]
       def ratelimit_add(ctx, key, window_ms, max, count) do
-        raft_write(
-          ctx,
-          shard_for(ctx, key),
-          key,
-          {:ratelimit_add, key, window_ms, max, count}
-        )
+        with :ok <- Ferricstore.Store.RateLimit.validate_args(window_ms, max, count) do
+          raft_write(
+            ctx,
+            shard_for(ctx, key),
+            key,
+            {:ratelimit_add, key, window_ms, max, count}
+          )
+        end
       end
 
       # -------------------------------------------------------------------

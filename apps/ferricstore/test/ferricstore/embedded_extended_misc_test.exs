@@ -554,6 +554,17 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
   # ===========================================================================
 
   describe "ratelimit_add/4" do
+    test "rejects a malformed window, limit or count and the shard keeps applying writes" do
+      key = "rl:bad-args"
+
+      for {window_ms, max, count} <- [{1.5, 10, 1}, {"1000", 10, 1}, {1000, 0, 1}, {1000, 10, -1}] do
+        assert {:error, "ERR value is not an integer or out of range"} =
+                 FerricStore.ratelimit_add(key, window_ms, max, count)
+      end
+
+      assert {:ok, ["allowed" | _]} = FerricStore.ratelimit_add(key, 1000, 10)
+    end
+
     test "allows requests within limit" do
       assert {:ok, result} = FerricStore.ratelimit_add("rl:key", 60_000, 10)
       assert is_list(result)

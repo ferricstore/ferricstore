@@ -1576,6 +1576,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       #
       # Replicates the exact shard.ex handle_ratelimit_add_direct logic.
       defp do_ratelimit_add(state, key, window_ms, max, count) do
+        with :ok <- RateLimit.validate_args(window_ms, max, count),
+             do: apply_ratelimit_add(state, key, window_ms, max, count)
+      end
+
+      defp apply_ratelimit_add(state, key, window_ms, max, count) do
         now = apply_now_ms()
 
         {{cur_count, cur_start, prv_count}, original} =
