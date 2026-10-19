@@ -1,6 +1,5 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.DoctorPages do
   import FerricstoreServer.Health.Dashboard.Format
-  import FerricstoreServer.Health.Dashboard.Render.Overview
   import FerricstoreServer.Health.Dashboard.DoctorSupport
 
   def render_doctor_flash(%{status: status, message: message})
