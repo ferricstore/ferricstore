@@ -1081,6 +1081,73 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
     assert {:ok, %{state_key: ^state_key}} = PolicyMigration.decode_catalog(catalog_value)
   end
 
+  # A registered Flow keeps its state in the keydir or, once pruned or
+  # hibernated, in LMDB, which has it before the keydir lets it go. One found in
+  # neither once the shard's LMDB writer has caught up has lost its state record,
+  # and the backfill must not wait for it forever.
+  test "backfill skips and counts a registered flow whose state record is gone" do
+    ctx = FerricStore.Instance.get(:default)
+    {state_key, shard_index, run_token} = orphaned_state_fixture(ctx, "orphan")
+
+    {candidates, orphaned} = staged_backfill_pages(ctx, shard_index, run_token)
+
+    assert %{kind: :state, state_key: ^state_key, record_value: nil} =
+             Enum.find(candidates, &match?(%{kind: :state, state_key: ^state_key}, &1))
+
+    assert orphaned >= 1
+  end
+
+  test "worker reports registered flows without a state record once a backfill finishes" do
+    ctx = FerricStore.Instance.get(:default)
+    {_state_key, shard_index, _run_token} = orphaned_state_fixture(ctx, "orphan-worker")
+    :ok = PolicyMigration.rotate_source_token(flow_lmdb_path(ctx, shard_index))
+    {:ok, source_token} = PolicyMigration.source_token(ctx, shard_index)
+
+    assert {:ok, pid} =
+             PolicyMigrationWorker.start_link(
+               instance_ctx: ctx,
+               name: :"orphan_report_worker_#{System.unique_integer([:positive])}",
+               enabled: true,
+               initial_delay_ms: 60_000,
+               interval_ms: 60_000,
+               catchup_delay_ms: 60_000
+             )
+
+    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+
+    logs =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert_eventually(
+          fn ->
+            send(pid, :run)
+            :sys.get_state(pid)
+            progress_key = Keys.policy_catalog_backfill_key(shard_index)
+            {:ok, value} = Router.read_shard_value(ctx, shard_index, progress_key)
+
+            assert {:ok, %{source_token: ^source_token, status: :done}} =
+                     PolicyMigration.decode_backfill_progress(value)
+          end,
+          timeout: 30_000
+        )
+      end)
+
+    assert logs =~
+             ~r/policy catalog backfill on shard #{shard_index} skipped [1-9]\d* registered flows? whose state record is gone/
+  end
+
+  test "backfill keeps waiting for a registered flow while the LMDB mirror is degraded" do
+    ctx = FerricStore.Instance.get(:default)
+    {_state_key, shard_index, run_token} = orphaned_state_fixture(ctx, "orphan-degraded")
+    :atomics.put(ctx.flow_lmdb_mirror_degraded, shard_index + 1, 1)
+
+    try do
+      assert {:error, :policy_catalog_state_projection_pending} =
+               backfill_until_error(ctx, shard_index, PolicyMigration.work_cursor(run_token))
+    after
+      :atomics.put(ctx.flow_lmdb_mirror_degraded, shard_index + 1, 0)
+    end
+  end
+
   test "backfill derives a cold LMDB state candidate from its primary registry" do
     ctx = FerricStore.Instance.get(:default)
     type = unique_flow_id("registry-cold-source")
@@ -2066,6 +2133,60 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
           [{:cursor, page.cursor} | candidates],
           attempts_left - 1
         )
+  end
+
+  # Stages a shard snapshot holding a Flow, then loses that Flow's state record
+  # from both the keydir and LMDB while its registry marker stays.
+  defp orphaned_state_fixture(ctx, prefix) do
+    type = unique_flow_id(prefix <> "-source")
+    id = unique_flow_id(prefix <> "-flow")
+    state_key = Keys.state_key(id, @partition)
+    shard_index = Router.shard_for(ctx, state_key)
+    keydir = elem(ctx.keydir_refs, shard_index)
+    lmdb_path = flow_lmdb_path(ctx, shard_index)
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: type,
+               state: "accept",
+               partition_key: @partition,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, shard_index, 30_000)
+    run_token = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
+    :ok = PolicyMigration.snapshot_primary_keydir(ctx, shard_index, run_token, 256, 1_048_576)
+
+    :ets.delete(keydir, state_key)
+    :ok = LMDB.write_batch(lmdb_path, [{:delete, state_key}])
+    assert :ets.member(keydir, Keys.registry_key(id, @partition))
+
+    {state_key, shard_index, run_token}
+  end
+
+  defp staged_backfill_pages(ctx, shard_index, run_token) do
+    Stream.unfold(PolicyMigration.work_cursor(run_token), fn
+      nil ->
+        nil
+
+      cursor ->
+        assert {:ok, page} =
+                 PolicyMigration.backfill_page(ctx, shard_index, cursor, 256, 2 * 1_024 * 1_024)
+
+        {page, if(page.done?, do: nil, else: page.cursor)}
+    end)
+    |> Enum.reduce({[], 0}, fn page, {candidates, orphaned} ->
+      {candidates ++ page.candidates, orphaned + Map.get(page, :orphaned, 0)}
+    end)
+  end
+
+  defp backfill_until_error(ctx, shard_index, cursor) do
+    case PolicyMigration.backfill_page(ctx, shard_index, cursor, 256, 2 * 1_024 * 1_024) do
+      {:ok, %{done?: true}} -> :done
+      {:ok, page} -> backfill_until_error(ctx, shard_index, page.cursor)
+      {:error, _reason} = error -> error
+    end
   end
 
   defp flow_lmdb_path(ctx, shard_index) do

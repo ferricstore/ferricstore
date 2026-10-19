@@ -641,12 +641,16 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
     case state.backfill_step_fun.(state.instance_ctx, shard_index, request)
          |> normalize_transient_failure() do
       {:ok, %{cursor: cursor, done?: done?} = result} ->
-        next_run = %{run | cursor: cursor, done?: done?}
+        orphaned = Map.get(run, :orphaned, 0) + Map.get(page, :orphaned, 0)
+        next_run = Map.put(%{run | cursor: cursor, done?: done?}, :orphaned, orphaned)
 
         next_state =
-          if done?,
-            do: ensure_cleanup_task(state, shard_index, next_run),
-            else: put_backfill_run(state, shard_index, next_run)
+          if done? do
+            report_orphaned_states(shard_index, orphaned)
+            ensure_cleanup_task(state, shard_index, next_run)
+          else
+            put_backfill_run(state, shard_index, next_run)
+          end
 
         {next_state, {:ok, Map.put(result, :idle?, false)}}
 
@@ -672,7 +676,8 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
       cursor: "",
       done?: false,
       snapshot_pid: nil,
-      cleanup_pid: nil
+      cleanup_pid: nil,
+      orphaned: 0
     }
   end
 
@@ -681,12 +686,26 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
     run
     |> Map.put(:snapshot_pid, live_pid(Map.get(local_run, :snapshot_pid)))
     |> Map.put(:cleanup_pid, live_pid(Map.get(local_run, :cleanup_pid)))
+    |> Map.put(:orphaned, Map.get(local_run, :orphaned, 0))
   end
 
   defp restore_local_tasks(run, _local_run) do
     run
     |> Map.put(:snapshot_pid, nil)
     |> Map.put(:cleanup_pid, nil)
+    |> Map.put(:orphaned, 0)
+  end
+
+  # Counted since this worker took the run over; each page also emits
+  # [:ferricstore, :flow, :policy_migration, :orphaned_states].
+  defp report_orphaned_states(_shard_index, 0), do: :ok
+
+  defp report_orphaned_states(shard_index, count) do
+    Logger.warning(
+      "Flow policy catalog backfill on shard #{shard_index} skipped #{count} registered " <>
+        "#{if count == 1, do: "flow", else: "flows"} whose state record is gone " <>
+        "(in neither the keydir nor LMDB)"
+    )
   end
 
   defp live_pid(pid) when is_pid(pid), do: if(Process.alive?(pid), do: pid, else: nil)

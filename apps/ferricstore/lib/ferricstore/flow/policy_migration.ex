@@ -6,6 +6,7 @@ defmodule Ferricstore.Flow.PolicyMigration do
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.LMDBMirror
+  alias Ferricstore.Flow.LMDBWriter
   alias Ferricstore.Flow.Query.QueryRecordStore
   alias Ferricstore.Flow.RecordIdentity
   alias Ferricstore.Store.Router
@@ -16,6 +17,7 @@ defmodule Ferricstore.Flow.PolicyMigration do
   @job_magic <<"FPM", 1>>
   @backfill_magic <<"FCB", 1>>
   @max_exact_score 9_007_199_254_740_991
+  @orphan_flush_timeout_ms 30_000
   @source_token_key "flow-policy-catalog-source-token-v1"
   @snapshot_cursor <<0>>
   @work_cursor <<1>>
@@ -236,12 +238,15 @@ defmodule Ferricstore.Flow.PolicyMigration do
           {:ok, %{cursor: @done_cursor, candidates: [], done?: true}}
 
         {:ok, entries} ->
-          with {:ok, scanned_to, candidates} <-
+          with {:ok, scanned_to, candidates, orphaned} <-
                  hydrate_backfill_entries(ctx, shard_index, entries, prefix, max_bytes) do
+            emit_orphaned_states(shard_index, orphaned)
+
             {:ok,
              %{
                cursor: encode_work_cursor(run_token, scanned_to),
                candidates: candidates,
+               orphaned: orphaned,
                done?: false
              }}
           end
@@ -450,24 +455,31 @@ defmodule Ferricstore.Flow.PolicyMigration do
   defp backfill_candidate(ctx, shard_index, key) do
     cond do
       Keys.policy_migration_job_key?(key) ->
-        {:ok, [%{kind: :job, job_key: key}]}
+        {:ok, [%{kind: :job, job_key: key}], 0}
 
       Keys.type_catalog_member_key?(key) ->
         case Keys.type_catalog_descriptor_key_from_member(key) do
           {:ok, descriptor_key} ->
-            {:ok, [%{kind: :catalog, catalog_key: key, descriptor_key: descriptor_key}]}
+            {:ok, [%{kind: :catalog, catalog_key: key, descriptor_key: descriptor_key}], 0}
 
           :error ->
-            {:ok, []}
+            {:ok, [], 0}
         end
 
       Keys.state_key?(key) ->
-        with {:ok, record_value} <- state_record_value(ctx, shard_index, key) do
-          {:ok, [%{kind: :state, state_key: key, record_value: record_value}]}
+        case state_record_value(ctx, shard_index, key) do
+          {:ok, :orphaned} ->
+            {:ok, [%{kind: :state, state_key: key, record_value: nil}], 1}
+
+          {:ok, record_value} ->
+            {:ok, [%{kind: :state, state_key: key, record_value: record_value}], 0}
+
+          {:error, _reason} = error ->
+            error
         end
 
       true ->
-        {:ok, []}
+        {:ok, [], 0}
     end
   end
 
@@ -482,30 +494,32 @@ defmodule Ferricstore.Flow.PolicyMigration do
   end
 
   defp hydrate_backfill_entries(ctx, shard_index, entries, prefix, max_bytes) do
-    Enum.reduce_while(entries, {:ok, [], nil, 0}, fn {stage_key, _value},
-                                                     {:ok, acc, scanned_to, bytes} ->
+    Enum.reduce_while(entries, {:ok, [], nil, 0, 0}, fn {stage_key, _value},
+                                                        {:ok, acc, scanned_to, bytes, orphaned} ->
       with {:ok, primary_key} <- staged_backfill_primary_key(stage_key, prefix),
-           {:ok, candidates} <- backfill_candidate(ctx, shard_index, primary_key) do
+           {:ok, candidates, entry_orphaned} <- backfill_candidate(ctx, shard_index, primary_key) do
         candidate_bytes = :erlang.external_size(candidates)
         next_bytes = bytes + candidate_bytes
 
         cond do
           next_bytes <= max_bytes ->
-            {:cont, {:ok, Enum.reverse(candidates, acc), stage_key, next_bytes}}
+            {:cont,
+             {:ok, Enum.reverse(candidates, acc), stage_key, next_bytes,
+              orphaned + entry_orphaned}}
 
           scanned_to == nil ->
             {:halt, {:error, {:policy_migration_entry_too_large, candidate_bytes, max_bytes}}}
 
           true ->
-            {:halt, {:ok, acc, scanned_to, bytes}}
+            {:halt, {:ok, acc, scanned_to, bytes, orphaned}}
         end
       else
         {:error, _reason} = error -> {:halt, error}
       end
     end)
     |> case do
-      {:ok, candidates, scanned_to, _bytes} when is_binary(scanned_to) ->
-        {:ok, scanned_to, Enum.reverse(candidates)}
+      {:ok, candidates, scanned_to, _bytes, orphaned} when is_binary(scanned_to) ->
+        {:ok, scanned_to, Enum.reverse(candidates), orphaned}
 
       {:error, _reason} = error ->
         error
@@ -558,8 +572,10 @@ defmodule Ferricstore.Flow.PolicyMigration do
           if catalog.migration_generation > entry.migration_generation do
             {:ok, Map.put(entry, :record_value, nil)}
           else
-            with {:ok, record_value} <- state_record_value(ctx, shard_index, catalog.state_key) do
-              {:ok, Map.put(entry, :record_value, record_value)}
+            case state_record_value(ctx, shard_index, catalog.state_key) do
+              {:ok, :orphaned} -> {:ok, Map.put(entry, :record_value, nil)}
+              {:ok, record_value} -> {:ok, Map.put(entry, :record_value, record_value)}
+              {:error, _reason} = error -> error
             end
           end
         else
@@ -580,13 +596,16 @@ defmodule Ferricstore.Flow.PolicyMigration do
       Keys.type_catalog_member_key(type, catalog.state_key) == catalog_key
   end
 
-  defp state_record_value(ctx, shard_index, state_key) do
+  defp state_record_value(ctx, shard_index, state_key),
+    do: state_record_value(ctx, shard_index, state_key, :first_read)
+
+  defp state_record_value(ctx, shard_index, state_key, attempt) do
     case Router.read_shard_value(ctx, shard_index, state_key) do
       {:ok, value} when is_binary(value) ->
         validate_state_record_value(value, state_key)
 
       {:ok, nil} ->
-        state_record_value_from_lmdb(ctx, shard_index, state_key)
+        state_record_value_from_lmdb(ctx, shard_index, state_key, attempt)
 
       :unavailable ->
         {:error, :policy_catalog_primary_unavailable}
@@ -596,7 +615,7 @@ defmodule Ferricstore.Flow.PolicyMigration do
     end
   end
 
-  defp state_record_value_from_lmdb(ctx, shard_index, state_key) do
+  defp state_record_value_from_lmdb(ctx, shard_index, state_key, attempt) do
     path = lmdb_path(ctx, shard_index)
 
     case QueryRecordStore.read_encoded_many(
@@ -612,7 +631,7 @@ defmodule Ferricstore.Flow.PolicyMigration do
         validate_state_record_value(value, state_key)
 
       {:ok, [nil], true} ->
-        missing_state_record_value(ctx, shard_index, state_key)
+        missing_state_record_value(ctx, shard_index, state_key, attempt)
 
       {:error, :query_hydration_batch_too_large} ->
         {:error, :policy_catalog_state_record_too_large}
@@ -628,16 +647,47 @@ defmodule Ferricstore.Flow.PolicyMigration do
     end
   end
 
-  defp missing_state_record_value(ctx, shard_index, state_key) do
+  defp missing_state_record_value(ctx, shard_index, state_key, attempt) do
     with {:ok, registry_key} <- Keys.registry_key_from_state_key(state_key) do
       case Router.read_shard_value(ctx, shard_index, registry_key) do
-        {:ok, nil} -> {:ok, nil}
-        {:ok, _registry} -> {:error, :policy_catalog_state_projection_pending}
-        :unavailable -> {:error, :policy_catalog_primary_unavailable}
+        {:ok, nil} ->
+          {:ok, nil}
+
+        {:ok, _registry} when attempt == :first_read ->
+          recheck_after_lmdb_flush(ctx, shard_index, state_key)
+
+        {:ok, _registry} ->
+          {:ok, :orphaned}
+
+        :unavailable ->
+          {:error, :policy_catalog_primary_unavailable}
       end
     else
       :error -> {:error, :invalid_policy_catalog_state_key}
     end
+  end
+
+  # A registered Flow keeps its state in the keydir or, once pruned or
+  # hibernated, in LMDB, which has it before the keydir lets it go. Once the
+  # shard's LMDB writer has flushed cleanly, a registered Flow found in neither
+  # has lost its state record, and there is nothing left to wait for.
+  defp recheck_after_lmdb_flush(ctx, shard_index, state_key) do
+    with false <- LMDBMirror.degraded_shard?(ctx, shard_index),
+         :ok <- LMDBWriter.flush(ctx.name, shard_index, @orphan_flush_timeout_ms) do
+      state_record_value(ctx, shard_index, state_key, :after_flush)
+    else
+      _degraded_or_unflushed -> {:error, :policy_catalog_state_projection_pending}
+    end
+  end
+
+  defp emit_orphaned_states(_shard_index, 0), do: :ok
+
+  defp emit_orphaned_states(shard_index, count) do
+    :telemetry.execute(
+      [:ferricstore, :flow, :policy_migration, :orphaned_states],
+      %{count: count},
+      %{shard_index: shard_index}
+    )
   end
 
   defp validate_state_record_value(value, state_key) do
