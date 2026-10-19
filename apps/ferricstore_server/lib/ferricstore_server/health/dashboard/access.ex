@@ -77,6 +77,10 @@ defmodule FerricstoreServer.Health.Dashboard.Access do
 
   def flow_query_filter_result_for_acl(result, nil, _request_scope), do: result
 
+  # A query that has not run carries no rows, only the dashboard's own prompt.
+  def flow_query_filter_result_for_acl(%{status: :idle, rows: []} = result, _username, _scope),
+    do: result
+
   def flow_query_filter_result_for_acl(result, username, request_scope) when is_map(result) do
     scope_allowed? = flow_acl_key_allowed?(username, request_scope)
 
