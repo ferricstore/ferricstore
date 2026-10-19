@@ -478,7 +478,8 @@ defmodule Ferricstore.Store.Router.Part11 do
             end
           end
         else
-          raft_write(ctx, idx, key, {:list_op, key, operation})
+          with :ok <- ListOps.validate_write(operation),
+               do: raft_write(ctx, idx, key, {:list_op, key, operation})
         end
       end
 

@@ -19,6 +19,12 @@ All notable changes to FerricStore will be documented here.
   until the node shut down, and replaying the entry crashed it again. The
   state machine now also returns an error for a bad SETRANGE or SETBIT offset
   instead of raising.
+- Reject a non-integer index or count in the embedded `FerricStore.lset/3` and
+  `FerricStore.lrem/3`, and a non-string element in `FerricStore.pfadd/2`. Like
+  the SETRANGE offset, these reached the replicated log unchecked and raised
+  while the shard applied them, crashing it until the node shut down. The
+  state machine now also rejects malformed list writes and PFADD elements
+  instead of raising.
 - Reject a TTL in the embedded `FerricStore.setex/3` and `FerricStore.psetex/3`
   that puts the expiry past the int64 range, with "ERR value is not an integer
   or out of range", as the SETEX and PSETEX commands and `FerricStore.pexpire/2`

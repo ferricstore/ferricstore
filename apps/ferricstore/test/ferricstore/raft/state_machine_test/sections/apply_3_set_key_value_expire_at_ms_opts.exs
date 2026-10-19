@@ -998,6 +998,31 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           assert [] == :ets.lookup(ets, key)
         end
 
+        test "list writes and PFADD reject bad arguments instead of raising in apply", %{
+          state: state
+        } do
+          key = "invalid_list_and_hll_apply"
+          {_state, 2} = StateMachine.apply(%{}, {:list_op, key, {:rpush, ["a", "b"]}}, state)
+
+          for {command, error} <- [
+                {{:list_op, key, {:lset, 0.0, "x"}},
+                 "ERR value is not an integer or out of range"},
+                {{:list_op, key, {:lrem, "1", "a"}},
+                 "ERR value is not an integer or out of range"},
+                {{:list_op, key, {:ltrim, 0, 1.5}},
+                 "ERR value is not an integer or out of range"},
+                {{:list_op, key, {:lpop, 1.5}}, "ERR value is not an integer or out of range"},
+                {{:list_op, key, {:linsert, :middle, "a", "x"}}, "ERR syntax error"},
+                {{:pfadd, key <> ":hll", [5]}, "ERR pfadd elements must be strings"}
+              ] do
+            {_new_state, result} = StateMachine.apply(%{}, command, state)
+            assert {:error, ^error} = result, "#{inspect(command)} returned #{inspect(result)}"
+          end
+
+          {_state, values} = StateMachine.apply(%{}, {:list_op, key, {:lrange, 0, -1}}, state)
+          assert values == ["a", "b"]
+        end
+
         test "crafted direct writes cannot bypass the replicated size limit", %{
           state: state,
           ets: ets

@@ -107,6 +107,18 @@ defmodule Ferricstore.Commands.HyperLogLog do
   end
 
   defp pfadd_args([key | elements], store) when elements != [] do
+    # A non-string element raises while the write is applied, crashing the
+    # shard's storage process on every replay of the entry.
+    if Enum.all?(elements, &is_binary/1),
+      do: pfadd_elements(key, elements, store),
+      else: {:error, "ERR pfadd elements must be strings"}
+  end
+
+  defp pfadd_args(_args, _store) do
+    {:error, "ERR wrong number of arguments for 'pfadd' command"}
+  end
+
+  defp pfadd_elements(key, elements, store) do
     sketch = get_or_new(key, store)
 
     case validate_sketch(sketch) do
@@ -126,10 +138,6 @@ defmodule Ferricstore.Commands.HyperLogLog do
       {:error, _} = err ->
         err
     end
-  end
-
-  defp pfadd_args(_args, _store) do
-    {:error, "ERR wrong number of arguments for 'pfadd' command"}
   end
 
   defp pfadd_no_elements_from_value(key, store) do

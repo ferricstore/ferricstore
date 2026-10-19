@@ -1673,7 +1673,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
-      defp admit_list_operation_apply(state, {tag, elements})
+      defp admit_list_operation_apply(state, operation) do
+        with :ok <- ListOps.validate_write(operation),
+             do: admit_list_operation_items(state, operation)
+      end
+
+      defp admit_list_operation_items(state, {tag, elements})
            when tag in [:lpush, :lpushx, :rpush, :rpushx] do
         with {:ok, count} <- admit_batch_command_items(state, elements),
              {:ok, ^count} <- admit_compound_member_batch(state, elements) do
@@ -1681,7 +1686,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end
       end
 
-      defp admit_list_operation_apply(_state, _operation), do: :ok
+      defp admit_list_operation_items(_state, _operation), do: :ok
 
       def apply(meta, {:list_op_lmove, src_key, dst_key, from_dir, to_dir}, state) do
         apply_pending_with_time(meta, state, fn ->

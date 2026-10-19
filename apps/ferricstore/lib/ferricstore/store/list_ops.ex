@@ -21,6 +21,7 @@ defmodule Ferricstore.Store.ListOps do
   # rebalance redistributes all positions with even spacing.
   @initial_position 0
   @position_step 1_000_000_000
+  @integer_error "ERR value is not an integer or out of range"
   @max_encoded_meta_bytes 128
 
   @doc false
@@ -34,6 +35,33 @@ defmodule Ferricstore.Store.ListOps do
   def read_operation?({:lindex, _index}), do: true
   def read_operation?({:lpos, _element, _rank, _count, _maxlen}), do: true
   def read_operation?(_operation), do: false
+
+  @doc """
+  Checks the arguments of a list write.
+
+  A malformed argument raises while the write is applied, which crashes the
+  shard's storage process, and again on every replay of the entry. The router
+  checks before replicating a write and the state machine before applying it.
+  """
+  @spec validate_write(term()) :: :ok | {:error, binary()}
+  def validate_write({:lset, index, _element}) when not is_integer(index),
+    do: {:error, @integer_error}
+
+  def validate_write({:lrem, count, _element}) when not is_integer(count),
+    do: {:error, @integer_error}
+
+  def validate_write({:ltrim, start, stop}) when not is_integer(start) or not is_integer(stop),
+    do: {:error, @integer_error}
+
+  def validate_write({tag, count})
+      when tag in [:lpop, :rpop] and not (is_integer(count) and count >= 0),
+      do: {:error, @integer_error}
+
+  def validate_write({:linsert, direction, _pivot, _element})
+      when direction not in [:before, :after],
+      do: {:error, "ERR syntax error"}
+
+  def validate_write(_operation), do: :ok
 
   @spec execute(binary(), map(), term()) :: term()
   def execute(key, store, operation) do

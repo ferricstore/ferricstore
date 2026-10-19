@@ -25,6 +25,11 @@ defmodule Ferricstore.EmbeddedExtendedDataStructuresTest do
       assert is_integer(count) and count >= 3
     end
 
+    test "pfadd rejects an element that is not a string and the shard keeps applying writes" do
+      assert {:error, "ERR pfadd elements must be strings"} = FerricStore.pfadd("hll:bad", [5])
+      assert {:ok, true} = FerricStore.pfadd("hll:bad", ["a"])
+    end
+
     test "pfadd with duplicate elements" do
       FerricStore.pfadd("hll:dup", ["a", "b"])
       assert {:ok, false} = FerricStore.pfadd("hll:dup", ["a", "b"])
