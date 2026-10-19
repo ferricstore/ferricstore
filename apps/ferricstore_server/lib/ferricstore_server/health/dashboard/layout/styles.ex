@@ -728,7 +728,12 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-runs-table th:nth-child(4) { width: 20%; }
       .flow-runs-table th:nth-child(5) { width: 8%; }
       .flow-runs-table th:nth-child(6) { width: 9%; }
-      .flow-runs-table td { vertical-align: top; padding: 12px; }
+      .flow-runs-table td { vertical-align: top; padding: 9px 12px; }
+      .flow-run-state { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+      .flow-run-state .flow-run-step { margin: 0; }
+      .flow-run-stored { display: block; margin-top: 4px; color: var(--text-faint); font-size: 0.75rem; }
+      .flow-run-attempts { display: block; margin-top: 4px; color: var(--text-faint); font-size: 0.75rem; }
+      .flow-run-updated { color: var(--text-muted); white-space: nowrap; }
       .flow-worker-records-table { table-layout: fixed; font-variant-numeric: tabular-nums; }
       .flow-worker-records-table th:nth-child(1) { width: 36%; }
       .flow-worker-records-table th:nth-child(2) { width: 24%; }
@@ -746,7 +751,8 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-run-reason { display: block; overflow-wrap: anywhere; line-height: 1.45; }
       .flow-run-timing > span { display: block; white-space: nowrap; font-size: 0.75rem; margin-bottom: 6px; }
       .flow-run-timing .c-muted { display: block; font-size: 0.75rem; }
-      .flow-row-actions > * { display: block; margin-bottom: 8px; }
+      .flow-row-actions { white-space: nowrap; }
+      .flow-row-actions > * + * { margin-left: 10px; }
       .table-scroll th { position: sticky; top: 0; z-index: 1; }
 
       /* Status colors */

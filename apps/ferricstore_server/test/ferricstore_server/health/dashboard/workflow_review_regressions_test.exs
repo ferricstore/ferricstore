@@ -281,7 +281,7 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowReviewRegressionsTest do
       ])
 
     assert html =~ "inventory_<wbr>&lt;img&gt;"
-    assert html =~ ~s(title="Workflow state: inventory_&lt;img&gt;")
+    assert html =~ ~s(title="Workflow state: inventory_&lt;img&gt; · Stored state:)
     refute html =~ "<img>"
   end
 

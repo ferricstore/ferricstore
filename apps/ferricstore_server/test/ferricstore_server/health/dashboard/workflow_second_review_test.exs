@@ -203,9 +203,10 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowSecondReviewTest do
         record(state: "running", run_state: "inventory_allocated")
       ])
 
-    assert html =~ "Workflow / stored state"
+    assert html =~ "<th>State</th>"
     assert html =~ "inventory_<wbr>allocated"
     assert html =~ "Stored state: running"
+    assert html =~ ~s(<span class="flow-run-stored">stored running</span>)
   end
 
   test "state and worker aggregates link to bounded affected-record views" do
