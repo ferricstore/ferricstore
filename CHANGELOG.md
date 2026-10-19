@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Keep the dashboard's run pages working when a run or schedule time is past
+  year 9999. The store accepts any integer run time, and the new compact rows
+  and schedule times raised on such a value, so one such run broke the Due
+  and Runs pages for every viewer; they now show "-".
+- Order journal events from the same millisecond by sequence number. Event
+  IDs were compared as text, so with ten or more events in one millisecond
+  the journal listed them out of order with wrong "from" states, and the
+  Lifecycle strip could repeat a state.
+
 - Redesign the dashboard shell. The sidebar has 18 destinations in
   always-open sections instead of about 30 links in collapsible groups; lower-use
   pages are tabs of their destination. Every page shares one header with its
