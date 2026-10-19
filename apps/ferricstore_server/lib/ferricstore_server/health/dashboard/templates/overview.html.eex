@@ -1,16 +1,15 @@
 <% data = assigns.data %>
 <%= page_head("FerricStore Dashboard", 2) %>
 <body data-dashboard-live-page="overview" data-dashboard-live-url="/dashboard/api/overview" data-dashboard-live-interval-ms="2000">
-<header aria-label="System health"><%= render_live_component("top_bar", render_top_bar(data)) %></header>
 <div class="layout">
 <%= render_live_component("sidebar", render_sidebar(data, "overview")) %>
 <main class="main-content" id="dashboard-main" tabindex="-1">
 <%= render_page_header("overview", intro: "Fast health snapshot for uptime, memory, cache hit rate, cold-read pressure, storage, consensus, and recent slow commands.") %>
-<div class="content">
+<div class="content overview-content">
 <%= render_live_component("content", render_overview_content(data)) %>
+<%= render_live_component("footer", render_footer(data)) %>
 </div>
 </main>
 </div>
-<footer><%= render_live_component("footer", render_footer(data)) %></footer>
 </body>
 </html>

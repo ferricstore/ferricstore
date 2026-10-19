@@ -171,39 +171,27 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.CollectionAndOverview 
                  )
         end
 
-        test "contains top bar with key metrics", %{html: html} do
-          assert String.contains?(html, "top-bar")
+        test "contains headline metrics", %{html: html} do
           assert String.contains?(html, "FerricStore")
-          assert String.contains?(html, "Node")
-          assert String.contains?(html, "Status")
+          assert String.contains?(html, "Commands / s")
+          assert String.contains?(html, "Cache hit rate")
           assert String.contains?(html, "Memory")
           assert String.contains?(html, "Keys")
         end
 
         test "contains shards section", %{html: html} do
           assert String.contains?(html, "Shards")
-          assert String.contains?(html, "<th>Shard</th>")
-          assert String.contains?(html, "<th>Status</th>")
-          assert String.contains?(html, "<th>Memory</th>")
+          assert String.contains?(html, ~s(class="overview-shard-grid"))
+          assert String.contains?(html, "healthy</span>")
         end
 
-        test "contains cache performance section", %{html: html} do
-          assert String.contains?(html, "Cache Performance")
-          assert String.contains?(html, "Hit Rate")
-          assert String.contains?(html, "RAM")
-          assert String.contains?(html, "Disk")
+        test "contains workflows section", %{html: html} do
+          assert String.contains?(html, ~s(id="overview-workflows-title">Workflows</h2>))
         end
 
-        test "contains memory info in top bar", %{html: html} do
-          # Memory is shown in the top bar; the full pressure section only appears
-          # when pressure != :ok. Verify the top bar memory metric is present.
-          assert String.contains?(html, "Memory")
-          assert String.contains?(html, "mem-bar-wrap")
-        end
-
-        test "contains connections section", %{html: html} do
-          assert String.contains?(html, "Connections")
-          assert String.contains?(html, "Active")
+        test "contains clients summary", %{html: html} do
+          assert String.contains?(html, "Clients")
+          assert String.contains?(html, "Connected")
           assert String.contains?(html, "Blocked")
           assert String.contains?(html, "Tracking")
         end
@@ -315,13 +303,11 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.CollectionAndOverview 
           response = http_get(port, "/dashboard")
           body = extract_body(response)
 
-          # Top bar with key metrics
-          assert String.contains?(body, "top-bar")
           assert String.contains?(body, "FerricStore")
           # Main content sections
-          assert String.contains?(body, "Cache Performance")
+          assert String.contains?(body, "Cache hit rate")
           assert String.contains?(body, "Shards")
-          assert String.contains?(body, "Connections")
+          assert String.contains?(body, "Clients")
           # Sidebar navigation links
           assert String.contains?(body, "Slow log")
           assert String.contains?(body, "Storage")

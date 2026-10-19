@@ -1,158 +1,102 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
   import FerricstoreServer.Health.Dashboard.Format
 
-  def render_top_bar(data) do
-    overview = data.overview
-    hotcold = data.hotcold
-    memory = data.memory
-    conns = data.connections
-    cluster = data.cluster
-    subsystem_status = dashboard_subsystem_status(Map.get(data, :subsystem_health, %{}))
+  alias FerricstoreServer.Health.Dashboard.Render.RecentRates
 
-    # Status dot color
-    {dot_class, status_text} =
-      cond do
-        overview.status != :ok -> {"dot-red", "degraded"}
-        subsystem_status in [:degraded, :unavailable] -> {"dot-red", "degraded"}
-        memory.pressure_level == :reject -> {"dot-red", "rejecting"}
-        memory.pressure_level == :unavailable -> {"dot-yellow", "memory unavailable"}
-        subsystem_status == :warning -> {"dot-yellow", "warning"}
-        memory.pressure_level == :pressure -> {"dot-yellow", "pressure"}
-        memory.pressure_level == :warning -> {"dot-yellow", "warning"}
-        true -> {"dot-green", "healthy"}
-      end
-
-    # Hit rate is neutral until there are actual read samples.
-    hit_color =
-      if hotcold_has_samples?(hotcold), do: hit_rate_color(hotcold.hit_ratio), else: "#8b949e"
-
-    hit_value =
-      if hotcold_has_samples?(hotcold), do: "#{hotcold.hit_ratio}%", else: "No read samples"
-
-    # Cluster info
-    cluster_label =
-      case cluster.cluster_mode do
-        :standalone -> "single-member WARaft"
-        :cluster -> "#{cluster.cluster_size}-node cluster"
-      end
-
-    node_short = cluster.node_name |> Atom.to_string()
-
+  @doc """
+  The overview page body: what needs attention, the headline numbers,
+  workflows and shards, and small summaries that link to their pages.
+  """
+  def render_overview_content(data) do
     """
-    <div class="top-bar">
-      <div class="top-bar-identity">
-      <div class="logo"><span class="status-dot #{dot_class}"></span>FerricStore</div>
-      <div class="sep"></div>
-      <div class="metric">
-        <span class="label">Node</span>
-        <span class="val" title="#{escape_attr(node_short)}" style="font-size:0.75rem;">#{escape(node_short)}</span>
-      </div>
-      <div class="sep"></div>
-      <div class="metric">
-        <span class="label">Cluster</span>
-        <span class="val" title="#{escape_attr(cluster_label)}" style="font-size:0.85rem;">#{escape(cluster_label)}</span>
-      </div>
-      <div class="sep"></div>
-      <div class="metric">
-        <span class="label">Status</span>
-        <span class="val" style="font-size:0.85rem;">#{escape(status_text)}</span>
-      </div>
-      </div>
-      <div class="top-bar-metrics">
-      <div class="sep"></div>
-      <div class="metric">
-        <span class="label" title="Average commands per second since start">Avg ops/sec</span>
-        <span class="val" title="Average since start">#{format_rate(hotcold.ops_per_sec)}</span>
-      </div>
-      <div class="sep"></div>
-      <div class="metric">
-        <span class="label">Hit Rate #{sampled_tag(hotcold.sample_rate)}</span>
-        <span class="val" title="#{escape_attr(hit_value)}" style="color:#{hit_color};">#{escape(hit_value)}</span>
-      </div>
-      <div class="sep"></div>
-      #{render_memory_metrics(memory)}
-      <div class="sep"></div>
-      <div class="metric">
-        <span class="label">Connections</span>
-        <span class="val">#{format_number(conns.active)}</span>
-      </div>
-      <div class="sep"></div>
-      <div class="metric">
-        <span class="label">Keys</span>
-        <span class="val">#{format_number(overview.total_keys)}</span>
-      </div>
-      </div>
+    #{render_operator_attention(data)}
+    #{render_overview_metrics(data)}
+    <div class="overview-panels">
+      #{render_overview_workflows(Map.get(data, :flow_summary, %{}))}
+      #{render_overview_shards(Map.get(data, :shards, []), Map.get(data, :cluster, %{}))}
     </div>
+    #{render_overview_cards(data)}
+    #{render_memory_alert(Map.get(data, :memory, %{}))}
     """
   end
 
-  defp render_memory_metrics(memory) do
-    rss = Map.get(memory, :rss_bytes, 0)
-    rss_limit = if memory.max_bytes > 0, do: Map.get(memory, :memory_limit, 0), else: 0
-
-    rss_html =
-      if rss > 0 do
-        render_memory_metric("Process RSS", rss, rss_limit, Map.get(memory, :rss_ratio, 0.0))
-      else
-        ~s(<div class="metric"><span class="label">Process RSS</span><span class="val" title="Process RSS unavailable">Unavailable</span></div>)
-      end
-
-    tracked =
-      render_memory_metric(
-        "Tracked allocations",
-        memory.total_bytes,
-        memory.max_bytes,
-        memory.ratio
-      )
-
-    rss_html <> ~s(<div class="sep"></div>) <> tracked
-  end
-
-  defp render_memory_metric(label, bytes, limit, ratio) do
-    pct = if limit > 0, do: Float.round(ratio * 100, 1), else: 0.0
-    value = "#{format_bytes(bytes)} / #{if limit > 0, do: format_bytes(limit), else: "unlimited"}"
-
-    """
-    <div class="metric">
-      <span class="label">#{escape(label)}</span>
-      <span class="val" title="#{escape_attr(value)}" style="font-size:0.85rem;">#{escape(value)}</span>
-      <div class="mem-bar-wrap"><div class="mem-bar-fill" style="width:#{min(pct, 100)}%;background:#{mem_bar_color(pct)};"></div></div>
-    </div>
-    """
-  end
+  # ---------------------------------------------------------------------------
+  # Needs attention
+  # ---------------------------------------------------------------------------
 
   def render_operator_attention(data) do
-    items = operator_attention_items(data)
+    case operator_attention_items(data) do
+      [] ->
+        """
+        <section class="overview-attention is-healthy" aria-label="Health">
+          #{icon(:check)}
+          <strong>Healthy</strong>
+          <span>No warnings in this snapshot.</span>
+        </section>
+        """
 
-    body =
-      case items do
-        [] ->
-          """
-          <div class="operator-attention-clear">
-            <span class="status-dot dot-green" aria-hidden="true"></span>
-            <span>No active warnings in the bounded operational snapshot.</span>
+      items ->
+        severity =
+          if Enum.any?(items, &(&1.severity == :degraded)), do: "degraded", else: "warning"
+
+        """
+        <section class="overview-attention is-#{severity}" aria-labelledby="overview-attention-title">
+          <div class="overview-attention-head">
+            #{icon(:warning)}
+            <h2 id="overview-attention-title">Needs attention</h2>
+            <span class="overview-attention-count">#{length(items)}</span>
           </div>
-          """
-
-        _ ->
-          Enum.map_join(items, "\n", &render_operator_attention_item/1)
-      end
-
-    """
-    <section class="operator-attention" aria-labelledby="operator-attention-title">
-      <h2 class="section-title" id="operator-attention-title">Operator Attention <span class="badge badge-idle">#{length(items)}</span></h2>
-      <div class="operator-attention-list">#{body}</div>
-    </section>
-    """
+          <ul class="overview-attention-list">#{Enum.map_join(items, "", &render_operator_attention_item/1)}</ul>
+        </section>
+        """
+    end
   end
 
   defp operator_attention_items(data) do
     []
+    |> add_status_attention(Map.get(data, :overview, %{}))
     |> add_policy_migration_attention(Map.get(data, :subsystem_health, %{}))
     |> add_shard_attention(Map.get(data, :shards, []))
     |> add_memory_attention(Map.get(data, :memory, %{}))
+    |> add_keydir_attention(Map.get(data, :lifecycle, %{}))
     |> add_flow_attention(Map.get(data, :flow_summary, %{}))
     |> Enum.reverse()
+  end
+
+  defp add_status_attention(items, overview) do
+    case Map.get(overview, :status, :ok) do
+      :ok ->
+        items
+
+      _starting ->
+        [
+          %{
+            severity: :warning,
+            title: "The node is still starting",
+            detail: "Numbers on this page may be incomplete until startup finishes.",
+            href: nil,
+            action: nil
+          }
+          | items
+        ]
+    end
+  end
+
+  defp add_keydir_attention(items, lifecycle) do
+    if Map.get(lifecycle, :keydir_full, false) do
+      [
+        %{
+          severity: :degraded,
+          title: "The keydir is full",
+          detail: "New writes are rejected until keys expire or the memory budget is raised.",
+          href: "/dashboard/config",
+          action: "Review config"
+        }
+        | items
+      ]
+    else
+      items
+    end
   end
 
   defp add_policy_migration_attention(items, subsystem_health) do
@@ -225,6 +169,18 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
 
   defp add_memory_attention(items, memory) do
     case Map.get(memory, :pressure_level, :normal) do
+      :unavailable ->
+        [
+          %{
+            severity: :warning,
+            title: "Memory telemetry is unavailable",
+            detail: "Memory pressure cannot be checked until the memory guard reports again.",
+            href: nil,
+            action: nil
+          }
+          | items
+        ]
+
       level when level in [:warning, :pressure, :reject] ->
         [
           %{
@@ -284,26 +240,21 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
   defp render_operator_attention_item(item) do
     severity = if item.severity == :degraded, do: "degraded", else: "warning"
 
-    """
-    <article class="operator-attention-item operator-attention-#{severity}">
-      <div>
-        <strong>#{escape(item.title)}</strong>
-        <span>#{escape(item.detail)}</span>
-      </div>
-      <a href="#{item.href}">#{escape(item.action)}</a>
-    </article>
-    """
-  end
+    action =
+      case item do
+        %{href: href, action: action} when is_binary(href) and is_binary(action) ->
+          ~s(<a class="flow-search-button" href="#{href}">#{escape(action)}</a>)
 
-  defp dashboard_subsystem_status(subsystem_health) do
-    subsystem_health
-    |> Map.values()
-    |> Enum.map(&Map.get(&1, :status, :healthy))
-    |> Enum.reduce(:healthy, fn
-      status, _acc when status in [:degraded, :unavailable] -> :degraded
-      :warning, :healthy -> :warning
-      _status, acc -> acc
-    end)
+        _ ->
+          ""
+      end
+
+    """
+    <li class="overview-attention-item is-#{severity}">
+      <div><strong>#{escape(item.title)}</strong><span>#{escape(item.detail)}</span></div>
+      #{action}
+    </li>
+    """
   end
 
   defp format_health_reason(reason) when is_atom(reason),
@@ -312,251 +263,391 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
   defp format_health_reason(reason) when is_binary(reason), do: reason
   defp format_health_reason(_reason), do: "an operational error"
 
-  def render_cache_performance(data) do
-    has_samples = hotcold_has_samples?(data)
-    hit_color = if has_samples, do: hit_rate_color(data.hit_ratio), else: "#8b949e"
-    hit_value = if has_samples, do: "#{data.hit_ratio}%", else: "No read samples"
-    hit_class = if has_samples, do: "", else: " hit-rate-empty"
+  # ---------------------------------------------------------------------------
+  # Headline numbers
+  # ---------------------------------------------------------------------------
 
-    source_hits =
-      case Map.get(data, :total_hits) do
+  @doc """
+  Traffic measured in this tab, cache hit rate, memory and keys. Traffic is
+  computed in the browser from the exact counters the page ships, so the
+  cards sit inside the recent-rates root.
+  """
+  def render_overview_metrics(data) do
+    RecentRates.render(data, [
+      render_hit_rate_card(Map.get(data, :hotcold, %{})),
+      render_memory_card(Map.get(data, :memory, %{})),
+      render_keys_card(data)
+    ])
+  end
+
+  defp render_hit_rate_card(hotcold) do
+    sample_rate = Map.get(hotcold, :sample_rate, 1)
+
+    if hotcold_has_samples?(hotcold) do
+      ratio = Map.get(hotcold, :hit_ratio, 0.0)
+
+      """
+      <div class="overview-metric">
+        <span class="overview-metric-label">Cache hit rate</span>
+        <span class="overview-metric-value">#{ratio}%</span>
+        <span class="overview-metric-note">#{escape(hit_source_note(hotcold))}#{sample_note(sample_rate)}</span>
+        <div class="overview-meter" aria-hidden="true"><div style="width:#{min(ratio, 100)}%;background:#{hit_rate_color(ratio)};"></div></div>
+      </div>
+      """
+    else
+      """
+      <div class="overview-metric">
+        <span class="overview-metric-label">Cache hit rate</span>
+        <span class="overview-metric-value is-empty">No read samples</span>
+        <span class="overview-metric-note">Reads are sampled#{sample_note(sample_rate)}</span>
+      </div>
+      """
+    end
+  end
+
+  # Where hits came from, only when there are hits to attribute.
+  defp hit_source_note(hotcold) do
+    hits =
+      case Map.get(hotcold, :total_hits) do
         hits when is_number(hits) ->
           hits
 
         _ ->
-          case {Map.get(data, :total_hot), Map.get(data, :total_cold)} do
+          case {Map.get(hotcold, :total_hot), Map.get(hotcold, :total_cold)} do
             {hot, cold} when is_number(hot) and is_number(cold) -> hot + cold
-            _ -> nil
+            _ -> 0
           end
       end
 
-    has_source_samples = is_number(source_hits) and source_hits > 0
-    empty_source = if has_samples, do: "No hit samples", else: "No read samples"
+    if hits > 0 do
+      "#{Map.get(hotcold, :ram_ratio, 0.0)}% of hits from RAM, #{Map.get(hotcold, :disk_ratio, 0.0)}% from disk"
+    else
+      "No hits sampled yet"
+    end
+  end
 
-    # RAM bar color -- always green (fast path)
-    # Disk bar color -- orange (slow path)
-    ram_bar_width = if has_source_samples, do: min(data.ram_ratio, 100), else: 0
-    disk_bar_width = if has_source_samples, do: min(data.disk_ratio, 100), else: 0
+  defp sample_note(rate) when is_integer(rate) and rate > 1, do: " · sampled 1:#{rate}"
+  defp sample_note(_rate), do: ""
+
+  defp render_memory_card(memory) do
+    rss = Map.get(memory, :rss_bytes, 0)
+    max_bytes = Map.get(memory, :max_bytes, 0)
+
+    tracked =
+      "Tracked allocations #{format_bytes(Map.get(memory, :total_bytes, 0))} of #{if max_bytes > 0, do: format_bytes(max_bytes), else: "no limit"}"
+
+    if is_integer(rss) and rss > 0 do
+      limit = if max_bytes > 0, do: Map.get(memory, :memory_limit, 0), else: 0
+      pct = if limit > 0, do: Float.round(Map.get(memory, :rss_ratio, 0.0) * 100, 1), else: 0.0
+      of_limit = if limit > 0, do: " of #{format_bytes(limit)}", else: " · no limit"
+
+      """
+      <div class="overview-metric">
+        <span class="overview-metric-label">Memory</span>
+        <span class="overview-metric-value">#{format_bytes(rss)}</span>
+        <span class="overview-metric-note">Process RSS#{of_limit}</span>
+        <div class="overview-meter" aria-hidden="true"><div style="width:#{min(pct, 100)}%;background:#{mem_bar_color(pct)};"></div></div>
+        <span class="overview-metric-note">#{tracked}</span>
+      </div>
+      """
+    else
+      """
+      <div class="overview-metric">
+        <span class="overview-metric-label">Memory</span>
+        <span class="overview-metric-value is-empty" title="Process RSS unavailable">Unavailable</span>
+        <span class="overview-metric-note">Process RSS unavailable</span>
+        <span class="overview-metric-note">#{tracked}</span>
+      </div>
+      """
+    end
+  end
+
+  defp render_keys_card(data) do
+    overview = Map.get(data, :overview, %{})
+    lifecycle = Map.get(data, :lifecycle, %{})
+    disk = get_in(data, [:storage_summary, :total_disk_bytes])
+    on_disk = if is_integer(disk), do: "#{format_bytes(disk)} on disk · ", else: ""
 
     """
-    <h2 class="section-title">Cache Performance</h2>
-    <div class="cache-hero">
-      <div class="hit-rate-card">
-        <div class="hit-rate-num#{hit_class}" style="color:#{hit_color};">#{escape(hit_value)}</div>
-        <div class="hit-rate-label">Hit Rate #{sampled_tag(data.sample_rate)}</div>
-        <div class="hit-rate-sub">
-          <span>#{format_rate(data.hits_per_sec)}</span> hits/sec #{sampled_tag(data.sample_rate)} &middot;
-          <span>#{format_rate(data.misses_per_sec)}</span> misses/sec &middot; averages since start
-        </div>
-      </div>
-      <div class="source-card">
-        <div style="font-size:0.75rem; color:#8b949e; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">Where hits come from</div>
-        <div class="source-row">
-          <div>
-            <div class="source-name">RAM #{sampled_tag(data.sample_rate)} #{info_icon("Served from ETS in-memory cache. Estimated from 1:#{data.sample_rate} sampling. These counters do not measure latency.", "About RAM reads")}</div>
-            <div class="source-detail">in-memory reads &middot; latency not measured</div>
-          </div>
-          <div class="source-pct #{if has_source_samples, do: "c-green", else: "c-muted source-pct-empty"}">#{if has_source_samples, do: "#{data.ram_ratio}%", else: empty_source}</div>
-        </div>
-        <div class="source-bar-wrap"><div class="source-bar-fill" style="width:#{ram_bar_width}%;background:#3fb950;"></div></div>
-        <div class="source-row">
-          <div>
-            <div class="source-name">Disk #{info_icon("Required a Bitcask disk read. This is an exact count, not sampled. These counters do not measure latency or identify why a value was absent from RAM.", "About disk reads")}</div>
-            <div class="source-detail">disk reads &middot; exact count</div>
-          </div>
-          <div class="source-pct #{if has_source_samples, do: "c-yellow", else: "c-muted source-pct-empty"}">#{if has_source_samples, do: "#{data.disk_ratio}%", else: empty_source}</div>
-        </div>
-        <div class="source-bar-wrap"><div class="source-bar-fill" style="width:#{disk_bar_width}%;background:#d29922;"></div></div>
-      </div>
+    <div class="overview-metric">
+      <span class="overview-metric-label">Keys</span>
+      <span class="overview-metric-value">#{format_grouped(Map.get(overview, :total_keys, 0))}</span>
+      <span class="overview-metric-note">#{on_disk}#{format_grouped(Map.get(lifecycle, :expired_total, 0))} expired · #{format_grouped(Map.get(lifecycle, :evicted_total, 0))} evicted</span>
     </div>
     """
   end
 
-  def render_lifecycle(data) do
-    # Evicted card color
-    evicted_color =
-      cond do
-        data.evicted_per_sec > 100 -> "c-red"
-        data.evicted_total > 0 -> "c-yellow"
-        true -> ""
-      end
+  # ---------------------------------------------------------------------------
+  # Workflows and shards
+  # ---------------------------------------------------------------------------
 
-    # Keydir capacity bar color and percentage
-    keydir_pct =
-      if data.keydir_max_ram > 0, do: Float.round(data.keydir_ratio * 100, 1), else: 0.0
+  @doc """
+  Active sampled runs as one bar: queued, running with a live lease, running
+  with an expired lease, and any other active state.
+  """
+  def render_overview_workflows(summary) do
+    active = count(summary, :active)
 
-    keydir_bar_width = min(keydir_pct, 100)
-
-    keydir_bar_color =
-      cond do
-        keydir_pct > 90 -> "#f85149"
-        keydir_pct > 70 -> "#d29922"
-        true -> "#3fb950"
-      end
-
-    keydir_pct_class =
-      cond do
-        keydir_pct > 90 -> "c-red"
-        keydir_pct > 70 -> "c-yellow"
-        true -> "c-green"
-      end
-
-    keydir_full_alert =
-      if data.keydir_full do
-        """
-        <div style="background:#8b1a1a; border:2px solid #f85149; border-radius:8px; padding:12px 16px; margin-bottom:16px; color:#f85149; font-weight:700; font-size:0.85rem;">
-          KEYDIR FULL &mdash; new writes are being rejected. Increase max_memory or evict keys.
-        </div>
-        """
+    body =
+      if active == 0 do
+        ~s(<p class="overview-empty">No active workflow runs in the sample.</p>)
       else
-        ""
+        queued = count(summary, :queued)
+        expired = count(summary, :expired_leases_sampled)
+        running = max(count(summary, :running) - expired, 0)
+        failed = count(summary, :failed)
+        other = max(active - queued - count(summary, :running), 0)
+
+        segments = [
+          {"queued", "Queued", queued},
+          {"running", "Running", running},
+          {"expired", "Lease expired", expired},
+          {"other", "Other active", other}
+        ]
+
+        label =
+          "#{queued} queued, #{running} running, #{expired} with expired leases, #{failed} failed" <>
+            if(other > 0, do: ", #{other} other", else: "")
+
+        bar =
+          segments
+          |> Enum.filter(fn {_key, _label, value} -> value > 0 end)
+          |> Enum.map_join("", fn {key, _label, value} ->
+            ~s(<span class="overview-state is-#{key}" style="flex: #{value}"></span>)
+          end)
+
+        legend =
+          (segments ++ [{"failed", "Failed", failed}])
+          |> Enum.filter(fn {key, _label, value} -> value > 0 or key in ["queued", "running"] end)
+          |> Enum.map_join("", fn {key, name, value} ->
+            ~s(<li><span class="overview-swatch is-#{key}" aria-hidden="true"></span>#{name} <strong>#{format_grouped(value)}</strong></li>)
+          end)
+
+        types =
+          case count(summary, :types) do
+            0 -> ""
+            1 -> " across 1 type"
+            n -> " across #{n} types"
+          end
+
+        """
+        <p class="overview-workflows-total"><strong>#{format_grouped(active)}</strong> active runs#{types}</p>
+        <div class="overview-state-bar" role="img" aria-label="#{label}">#{bar}</div>
+        <ul class="overview-legend">#{legend}</ul>
+        #{render_top_types(Map.get(summary, :top_types, []))}
+        """
       end
 
     """
-    <h2 class="section-title">Key Lifecycle</h2>
-    #{keydir_full_alert}<div class="cache-hero">
-      <div class="source-card">
-        <div style="font-size:0.75rem; color:#8b949e; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">Expired</div>
-        <div class="source-row">
-          <div>
-            <div class="source-name">Total</div>
-          </div>
-          <div class="source-pct">#{format_number(data.expired_total)}</div>
-        </div>
-        <div class="source-row">
-          <div>
-            <div class="source-name">Average rate since start</div>
-          </div>
-          <div class="source-pct">#{format_rate(data.expired_per_sec)}/sec</div>
-        </div>
+    <section class="overview-panel" aria-labelledby="overview-workflows-title">
+      <div class="overview-panel-head">
+        <h2 id="overview-workflows-title">Workflows</h2>
+        <a href="/dashboard/flow">Open workflows</a>
       </div>
-      <div class="source-card">
-        <div style="font-size:0.75rem; color:#8b949e; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">Evicted</div>
-        <div class="source-row">
-          <div>
-            <div class="source-name">Total</div>
-          </div>
-          <div class="source-pct #{evicted_color}">#{format_number(data.evicted_total)}</div>
-        </div>
-        <div class="source-row">
-          <div>
-            <div class="source-name">Average rate since start</div>
-          </div>
-          <div class="source-pct #{evicted_color}">#{format_rate(data.evicted_per_sec)}/sec</div>
-        </div>
-      </div>
-      <div class="source-card">
-        <div style="font-size:0.75rem; color:#8b949e; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">Keydir Capacity</div>
-        <div class="source-row">
-          <div>
-            <div class="source-name">#{format_bytes(data.keydir_bytes)} / #{format_bytes(data.keydir_max_ram)}</div>
-          </div>
-          <div class="source-pct #{keydir_pct_class}">#{keydir_pct}%</div>
-        </div>
-        <div class="source-bar-wrap"><div class="source-bar-fill" style="width:#{keydir_bar_width}%;background:#{keydir_bar_color};"></div></div>
-      </div>
-    </div>
+      #{body}
+      <p class="overview-panel-note">Sample of #{format_grouped(count(summary, :sampled_records))} records.</p>
+    </section>
     """
   end
 
-  def render_shards(shards) do
-    all_ok = Enum.all?(shards, fn s -> s.status == "ok" end)
+  defp render_top_types([]), do: ""
 
+  defp render_top_types(types) do
     rows =
-      Enum.map_join(shards, "\n", fn shard ->
-        status_html =
-          case shard.status do
-            "ok" -> ~s(<span class="c-green">ok</span>)
-            _ -> ~s(<span class="c-red">#{escape(shard.status)}</span>)
-          end
+      Enum.map_join(types, "", fn type ->
+        name = to_string(Map.get(type, :type, ""))
+        href = "/dashboard/flow/states?" <> URI.encode_query(%{"type" => name})
 
-        disk_bytes = Map.get(shard, :disk_bytes, 0)
-
-        """
-        <tr>
-          <td>#{shard.index}</td>
-          <td>#{status_html}</td>
-          <td>#{format_number(shard.keys)}</td>
-          <td>#{format_bytes(shard.ets_memory_bytes)}</td>
-          <td>#{format_bytes(disk_bytes)}</td>
-        </tr>
-        """
+        ~s(<tr><td><a href="#{escape_attr(href)}">#{escape(name)}</a></td><td>#{format_grouped(count(type, :queued))}</td><td>#{format_grouped(count(type, :running))}</td><td>#{format_grouped(count(type, :failed))}</td></tr>)
       end)
 
-    summary_badge =
-      if all_ok do
-        ~s(<span class="badge badge-ok">all ok</span>)
-      else
-        down_count = Enum.count(shards, fn s -> s.status != "ok" end)
-        ~s(<span class="badge badge-pressure">#{down_count} down</span>)
-      end
-
     """
-    <h2 class="section-title">Shards #{summary_badge}</h2>
-    <table>
-      <thead>
-        <tr><th>Shard</th><th>Status</th><th>Keys</th><th>Memory</th><th>Disk</th></tr>
-      </thead>
-      <tbody>
-        #{rows}
-      </tbody>
+    <table class="overview-types">
+      <thead><tr><th scope="col">Type</th><th scope="col">Queued</th><th scope="col">Running</th><th scope="col">Failed</th></tr></thead>
+      <tbody>#{rows}</tbody>
     </table>
     """
   end
 
+  defp count(map, key) do
+    case Map.get(map, key, 0) do
+      value when is_integer(value) and value > 0 -> value
+      _ -> 0
+    end
+  end
+
+  @doc """
+  One cell per shard, shaded by its share of keys, with the down ones marked.
+  """
+  def render_overview_shards(shards, cluster) do
+    total = length(shards)
+    healthy = Enum.count(shards, &(Map.get(&1, :status) == "ok"))
+    most_keys = shards |> Enum.map(&Map.get(&1, :keys, 0)) |> Enum.max(fn -> 0 end)
+
+    cells =
+      Enum.map_join(shards, "", fn shard ->
+        index = Map.get(shard, :index, "-")
+        keys = Map.get(shard, :keys, 0)
+        down? = Map.get(shard, :status) != "ok"
+        status = if down?, do: Map.get(shard, :status, "unknown"), else: "ok"
+        share = if most_keys > 0, do: keys / most_keys, else: 0.0
+
+        fill =
+          if down?,
+            do: "",
+            else: ~s( style="--shard-load: #{Float.round(0.08 + share * 0.32, 2)}")
+
+        title =
+          "Shard #{index}: #{status} · #{format_grouped(keys)} keys · #{format_bytes(Map.get(shard, :ets_memory_bytes, 0))} memory · #{format_bytes(Map.get(shard, :disk_bytes, 0))} disk"
+
+        ~s(<li class="overview-shard#{if down?, do: " is-down", else: ""}" title="#{escape_attr(title)}"#{fill}><span>#{index}</span><strong>#{format_number(keys)}</strong></li>)
+      end)
+
+    badge =
+      if healthy == total,
+        do: ~s(<span class="badge badge-ok">#{healthy} of #{total} healthy</span>),
+        else: ~s(<span class="badge badge-warning">#{healthy} of #{total} healthy</span>)
+
+    """
+    <section class="overview-panel" aria-labelledby="overview-shards-title">
+      <div class="overview-panel-head">
+        <h2 id="overview-shards-title">Shards</h2>
+        #{badge}
+        <a href="/dashboard/raft">Consensus</a>
+      </div>
+      <p class="overview-panel-note">#{escape(cluster_label(cluster))}. Cells show keys per shard.</p>
+      <ol class="overview-shard-grid"#{shard_columns(total)}>#{cells}</ol>
+    </section>
+    """
+  end
+
+  # Even rows when the shard count allows them.
+  defp shard_columns(total) when total > 8 and rem(total, 8) == 0,
+    do: ~s( style="--shard-columns: 8")
+
+  defp shard_columns(_total), do: ""
+
+  defp cluster_label(cluster) do
+    node = cluster |> Map.get(:node_name, "") |> to_string()
+
+    mode =
+      case Map.get(cluster, :cluster_mode) do
+        :cluster -> "#{Map.get(cluster, :cluster_size, "?")}-node cluster"
+        _ -> "single-member WARaft"
+      end
+
+    if node == "", do: String.capitalize(mode), else: "#{node} · #{mode}"
+  end
+
+  # ---------------------------------------------------------------------------
+  # Small cards
+  # ---------------------------------------------------------------------------
+
+  def render_overview_cards(data) do
+    lifecycle = Map.get(data, :lifecycle, %{})
+    connections = Map.get(data, :connections, %{})
+    merging = data |> Map.get(:merge, []) |> Enum.count(&Map.get(&1, :merging, false))
+    disk = get_in(data, [:storage_summary, :total_disk_bytes])
+    keydir_max = Map.get(lifecycle, :keydir_max_ram, 0)
+
+    keydir_used =
+      "#{format_bytes(Map.get(lifecycle, :keydir_bytes, 0))} of #{if keydir_max > 0, do: format_bytes(keydir_max), else: "no limit"}"
+
+    """
+    <div class="overview-cards">
+      #{render_card("Storage", "/dashboard/storage", "Details", [{"On disk", if(is_integer(disk), do: format_bytes(disk), else: "Unavailable")}, {"Merges", if(merging > 0, do: "#{merging} running", else: "idle")}])}
+      #{render_card("Keydir", nil, nil, [{"Used", keydir_used}, {"Expired", format_grouped(Map.get(lifecycle, :expired_total, 0))}, {"Evicted", format_grouped(Map.get(lifecycle, :evicted_total, 0))}])}
+      #{render_card("Clients", "/dashboard/clients", "List", [{"Connected", format_grouped(Map.get(connections, :active, 0))}, {"Blocked", format_grouped(Map.get(connections, :blocked, 0))}, {"Tracking", format_grouped(Map.get(connections, :tracking, 0))}])}
+      #{render_slow_card(data)}
+    </div>
+    """
+  end
+
+  defp render_card(title, href, link, rows) do
+    link_html = if href, do: ~s(<a href="#{href}">#{escape(link)}</a>), else: ""
+
+    rows_html =
+      Enum.map_join(rows, "", fn {label, value} ->
+        ~s(<dt>#{escape(label)}</dt><dd>#{escape(value)}</dd>)
+      end)
+
+    """
+    <section class="overview-card" aria-label="#{escape_attr(title)}">
+      <div class="overview-card-head"><h2>#{escape(title)}</h2>#{link_html}</div>
+      <dl>#{rows_html}</dl>
+    </section>
+    """
+  end
+
+  defp render_slow_card(data) do
+    entries = Map.get(data, :slowlog, [])
+
+    body =
+      cond do
+        Map.get(data, :slowlog_status, :ok) not in [:ok, nil] ->
+          ~s(<p class="overview-card-note">Slow log unavailable.</p>)
+
+        entries == [] ->
+          ~s(<p class="overview-card-note">None logged since start.</p>)
+
+        true ->
+          slowest = entries |> Enum.map(&Map.get(&1, :duration_us, 0)) |> Enum.max()
+
+          ~s(<dl><dt>Logged</dt><dd>#{format_grouped(length(entries))}</dd><dt>Slowest</dt><dd>#{format_duration_us(slowest)}</dd></dl>)
+      end
+
+    """
+    <section class="overview-card" aria-label="Slow commands">
+      <div class="overview-card-head"><h2>Slow commands</h2><a href="/dashboard/slowlog">Slow log</a></div>
+      #{body}
+    </section>
+    """
+  end
+
+  # ---------------------------------------------------------------------------
+  # Memory pressure detail
+  # ---------------------------------------------------------------------------
+
   def render_memory_alert(data) do
-    # Only show the memory section when there is pressure
-    if data.pressure_level == :ok do
-      ""
-    else
-      level_str = Atom.to_string(data.pressure_level)
-      tracked_ratio = if data.max_bytes > 0, do: data.ratio, else: 0.0
+    level = Map.get(data, :pressure_level, :ok)
+
+    if level in [:warning, :pressure, :reject] do
+      tracked_ratio =
+        if Map.get(data, :max_bytes, 0) > 0, do: Map.get(data, :ratio, 0.0), else: 0.0
+
       rss_ratio = Map.get(data, :rss_ratio, 0.0)
       basis = if rss_ratio > tracked_ratio, do: "Process RSS", else: "Tracked allocations"
       pct = Float.round(max(tracked_ratio, rss_ratio) * 100, 1)
-      bar_color = mem_bar_color(pct)
-      bar_width = min(pct, 100)
+      policy = data |> Map.get(:eviction_policy, :unknown) |> Atom.to_string()
 
       badge_class =
-        case data.pressure_level do
+        case level do
           :warning -> "badge-warning"
           :pressure -> "badge-pressure"
           :reject -> "badge-reject"
-          _ -> "badge-idle"
-        end
-
-      level_class =
-        case data.pressure_level do
-          :warning -> "level-warning"
-          :pressure -> "level-pressure"
-          :reject -> "level-reject"
-          _ -> ""
         end
 
       action_text =
-        case data.pressure_level do
+        case level do
           :warning ->
             "Inspect process RSS and tracked allocations against their separate budgets."
 
           :pressure ->
-            "Eviction active. Keys are being removed under #{escape(Atom.to_string(data.eviction_policy))} policy."
+            "Eviction active. Keys are being removed under #{policy} policy."
 
           :reject ->
             "Writes are being rejected. Inspect the limiting memory budget before adjusting capacity."
-
-          _ ->
-            ""
         end
 
       shard_rows =
-        data.shards
+        data
+        |> Map.get(:shards, %{})
         |> Enum.sort_by(fn {index, _} -> index end)
         |> Enum.map_join("\n", fn {index, shard} ->
           shard_pct = Float.round(shard.ratio * 100, 1)
 
           shard_class =
             cond do
-              shard.ratio >= 0.95 -> "c-red"
               shard.ratio >= 0.85 -> "c-red"
               shard.ratio >= 0.70 -> "c-yellow"
               true -> ""
@@ -572,63 +663,53 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
         end)
 
       """
-      <h2 class="section-title">Memory Pressure <span class="badge #{badge_class}">#{escape(level_str)}</span></h2>
-      <div class="pressure-alert #{level_class}">
-        <div class="pressure-details">
-          <span>#{basis}</span> (#{pct}%)
-          &middot; Policy: <span>#{escape(Atom.to_string(data.eviction_policy))}</span>
+      <section class="overview-panel" aria-labelledby="overview-memory-title">
+        <div class="overview-panel-head">
+          <h2 id="overview-memory-title">Memory pressure</h2>
+          <span class="badge #{badge_class}">#{escape(Atom.to_string(level))}</span>
         </div>
-        <div class="pressure-bar-wrap"><div class="pressure-bar-fill" style="width:#{bar_width}%;background:#{bar_color};"></div></div>
-        <div class="conn-row">#{render_memory_metrics(data)}</div>
-        <div class="pressure-action">#{action_text}</div>
-      </div>
-      <table>
-        <thead>
-          <tr><th>Shard</th><th>Bytes</th><th>Usage</th></tr>
-        </thead>
-        <tbody>
-          #{shard_rows}
-        </tbody>
-      </table>
+        <p class="overview-panel-note">#{basis} at #{pct}% · eviction policy #{escape(policy)}. #{escape(action_text)}</p>
+        <div class="overview-meter" aria-hidden="true"><div style="width:#{min(pct, 100)}%;background:#{mem_bar_color(pct)};"></div></div>
+        <table>
+          <thead>
+            <tr><th>Shard</th><th>Bytes</th><th>Usage</th></tr>
+          </thead>
+          <tbody>
+            #{shard_rows}
+          </tbody>
+        </table>
+      </section>
       """
+    else
+      ""
     end
   end
 
-  def render_connections(data) do
-    blocked_class = if data.blocked > 0, do: "c-yellow", else: ""
-
-    """
-    <h2 class="section-title">Connections</h2>
-    <div class="conn-row">
-      <div class="conn-item">
-        <span class="conn-label">Active </span>
-        <span class="conn-val">#{format_number(data.active)}</span>
-      </div>
-      <div class="conn-item">
-        <span class="conn-label">Blocked </span>
-        <span class="conn-val #{blocked_class}">#{format_number(data.blocked)}</span>
-      </div>
-      <div class="conn-item">
-        <span class="conn-label">Tracking </span>
-        <span class="conn-val">#{format_number(data.tracking)}</span>
-      </div>
-    </div>
-    """
-  end
-
-  # render_nav_links removed — replaced by sidebar navigation
-
   def render_footer(data) do
-    sample_rate = data.hotcold.sample_rate
+    sample_rate = get_in(data, [:hotcold, :sample_rate]) || 1
     version = Map.get(data.overview, :version, "unknown")
+    run_id = data.overview |> Map.get(:run_id, "") |> String.slice(0, 8)
+    uptime = data.overview |> Map.get(:uptime_seconds)
+    up = if is_integer(uptime), do: "Up #{format_uptime(uptime)} · ", else: ""
+
+    sampling =
+      if sample_rate > 1, do: "Hit and miss counts are sampled 1:#{sample_rate}", else: ""
 
     """
-    <div class="footer">
-      <span>Uptime: #{format_uptime(data.overview.uptime_seconds)} &middot; v#{escape(version)} &middot; Run #{escape(String.slice(data.overview.run_id, 0, 8))}</span>
-      <span>Hit/miss stats estimated from 1:#{sample_rate} sampling &middot; Live updates patch changed components</span>
-    </div>
+    <footer class="overview-footer">
+      <span>#{up}v#{escape(version)} · run #{escape(run_id)}</span>
+      <span>#{sampling}</span>
+    </footer>
     """
   end
+
+  defp icon(:check),
+    do:
+      ~s(<svg class="overview-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="m8 12.5 2.8 2.8L16 10"></path></svg>)
+
+  defp icon(:warning),
+    do:
+      ~s(<svg class="overview-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 2.5 20h19Z"></path><path d="M12 10v4.5M12 17.5v.01"></path></svg>)
 
   # ---------------------------------------------------------------------------
   # HTML rendering -- Sub-page content sections

@@ -85,7 +85,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
   def collect_summary do
     records = collect_records_sample(160)
     types = type_summaries(records)
-    page_summary(types, records)
+
+    types
+    |> page_summary(records)
+    |> Map.put(:top_types, Enum.take(types, 5))
   end
 
   def collect_records_sample(limit) when is_integer(limit) and limit > 0 do

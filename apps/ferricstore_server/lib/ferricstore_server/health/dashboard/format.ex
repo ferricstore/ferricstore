@@ -104,6 +104,17 @@ defmodule FerricstoreServer.Health.Dashboard.Format do
 
   def format_number(n), do: Integer.to_string(n)
 
+  # Exact count with thousands separators, for headline numbers.
+  def format_grouped(n) when is_integer(n) do
+    n
+    |> Integer.to_string()
+    |> String.reverse()
+    |> String.replace(~r/(\d{3})(?=\d)/, "\\1,")
+    |> String.reverse()
+  end
+
+  def format_grouped(_n), do: "-"
+
   def format_timestamp_us(timestamp_us) do
     timestamp_us
     |> DateTime.from_unix!(:microsecond)

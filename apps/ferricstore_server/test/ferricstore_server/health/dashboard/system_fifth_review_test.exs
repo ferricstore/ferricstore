@@ -324,11 +324,12 @@ defmodule FerricstoreServer.Health.Dashboard.SystemFifthReviewTest do
       misses_per_sec: 0.0
     }
 
-    html = Overview.render_cache_performance(data)
-    assert length(Regex.scan(~r/>No read samples</, html)) == 3
-    refute html =~ ">0.0%</div>"
-    observed = Overview.render_cache_performance(%{data | total_lookups: 1})
-    assert observed =~ ">0.0%</div>"
+    html = Overview.render_overview_metrics(%{hotcold: data})
+    assert html =~ ">No read samples<"
+    refute html =~ "of hits from RAM"
+    refute html =~ ">0.0%<"
+    observed = Overview.render_overview_metrics(%{hotcold: %{data | total_lookups: 1}})
+    assert observed =~ ">0.0%<"
   end
 
   test "25 every catalog command links to a verified local command guide section" do
@@ -365,23 +366,24 @@ defmodule FerricstoreServer.Health.Dashboard.SystemFifthReviewTest do
           Map.merge(data, %{total_hot: nil, total_cold: nil}),
           Map.merge(data, %{total_hits: nil, total_hot: nil, total_cold: nil})
         ] do
-      html = Overview.render_cache_performance(sample)
-      assert length(Regex.scan(~r/>No hit samples</, html)) == 2
-      assert html =~ ">0.0%</div>"
-      assert length(Regex.scan(~r/width:0%;background:/, html)) == 2
-      refute html =~ ">40.0%</div>"
+      html = Overview.render_overview_metrics(%{hotcold: sample})
+      assert html =~ "No hits sampled yet"
+      assert html =~ ">0.0%<"
+      refute html =~ "40.0%"
     end
 
     observed =
-      Overview.render_cache_performance(%{
-        data
-        | total_hits: 5,
-          ram_ratio: 0.0,
-          disk_ratio: 100.0
+      Overview.render_overview_metrics(%{
+        hotcold: %{
+          data
+          | total_hits: 5,
+            ram_ratio: 0.0,
+            disk_ratio: 100.0
+        }
       })
 
-    assert observed =~ ">100.0%</div>"
-    refute observed =~ "No hit samples"
+    assert observed =~ "0.0% of hits from RAM, 100.0% from disk"
+    refute observed =~ "No hits sampled yet"
   end
 
   test "28 Streams disclosures own their headings without repeated nested titles" do

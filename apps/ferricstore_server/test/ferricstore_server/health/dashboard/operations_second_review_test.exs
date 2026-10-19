@@ -317,7 +317,10 @@ defmodule FerricstoreServer.Health.Dashboard.OperationsSecondReviewTest do
 
   test "static latency estimates are not presented as measured cache performance" do
     data = FerricstoreServer.Health.Dashboard.Data.Operational.collect_hotcold()
-    html = FerricstoreServer.Health.Dashboard.Render.Overview.render_cache_performance(data)
+
+    html =
+      FerricstoreServer.Health.Dashboard.Render.Overview.render_overview_metrics(%{hotcold: data})
+
     refute html =~ "~1-5us"
     refute html =~ "~50-200us"
     refute html =~ "Latency is usually"

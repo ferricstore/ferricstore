@@ -83,16 +83,6 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       body { font-family: var(--font-sans); background: var(--surface-base); color: var(--text-body); padding: 0; min-height: 100vh; }
       [data-live-component] { display: contents; }
 
-      /* Top bar */
-      .top-bar { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px 20px; padding: 12px 18px; background: var(--surface-raised); border-bottom: 1px solid var(--line); }
-      .top-bar-identity { display: grid; grid-template-columns: auto minmax(100px, 220px) minmax(120px, 180px) minmax(70px, 100px); align-items: center; gap: 18px; min-width: 0; }
-      .top-bar-metrics { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px 20px; grid-column: 1 / -1; min-width: 0; padding-top: 10px; border-top: 1px solid var(--line); }
-      .top-bar > .dashboard-live-status { grid-column: 2; grid-row: 1; }
-      .top-bar .logo { font-size: 1.15rem; font-weight: 700; color: var(--accent); white-space: nowrap; letter-spacing: 0; }
-      .top-bar .metric { display: flex; flex-direction: column; align-items: flex-start; min-width: 0; }
-      .top-bar .metric .label { font-size: 0.75rem; color: var(--text-muted); text-transform: none; letter-spacing: 0; }
-      .top-bar .metric .val { max-width: 100%; min-width: 0; overflow-wrap: anywhere; font-size: 1.1rem; font-weight: 700; color: var(--text-strong); font-family: var(--font-mono); }
-      .top-bar .sep { display: none; }
 
       /* Status badge */
       .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; vertical-align: middle; background: var(--text-muted); }
@@ -100,9 +90,6 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .dot-yellow { background: var(--warn); }
       .dot-red { background: var(--danger); }
 
-      /* Memory bar in top bar */
-      .mem-bar-wrap { width: 80px; height: 6px; background: var(--surface-selected); border-radius: 3px; margin-top: 4px; overflow: hidden; }
-      .mem-bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
 
       /* Main content */
       .content { padding: 20px 28px 32px; max-width: 1600px; margin: 0 auto; }
@@ -129,25 +116,88 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .dashboard-table-value-full { margin-top: 8px; max-height: 240px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
       .kv-command-purpose { color: var(--text-muted); font-size: 0.78rem; margin-bottom: 10px; }
 
-      /* Hero hit rate */
-      .cache-hero { display: flex; gap: 24px; margin-bottom: 20px; flex-wrap: wrap; }
-      .hit-rate-card { background: var(--surface-raised); border: 1px solid var(--line); border-radius: 8px; padding: 22px 30px; text-align: center; min-width: 180px; flex: 0 0 auto; }
-      .hit-rate-num { font-size: 3.2rem; font-weight: 800; line-height: 1.1; font-family: var(--font-mono); }
-      .hit-rate-num.hit-rate-empty { font-size: 1rem; font-weight: 600; padding: 12px 0; }
-      .hit-rate-label { font-size: 0.75rem; color: var(--text-muted); text-transform: none; letter-spacing: 0; margin-top: 4px; }
-      .hit-rate-sub { font-size: 0.8rem; color: var(--text-muted); margin-top: 10px; }
-      .hit-rate-sub span { color: var(--text-strong); font-weight: 600; font-family: var(--font-mono); }
 
-      /* Source breakdown */
-      .source-card { background: var(--surface-raised); border: 1px solid var(--line); border-radius: 8px; padding: 22px 26px; flex: 1; min-width: 200px; }
-      .source-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; }
-      .source-row + .source-row { border-top: 1px solid var(--surface-selected); }
-      .source-name { font-size: 0.85rem; color: var(--text-body); }
-      .source-detail { font-size: 0.75rem; color: var(--text-muted); }
-      .source-pct { font-size: 1.15rem; font-weight: 700; font-family: var(--font-mono); }
-      .source-pct.source-pct-empty { font-size: 0.875rem; font-weight: 400; max-width: 12ch; white-space: normal; }
-      .source-bar-wrap { width: 100%; height: 4px; background: var(--surface-selected); border-radius: 2px; margin-top: 6px; }
-      .source-bar-fill { height: 100%; border-radius: 2px; }
+
+      /* Overview */
+      .overview-content { display: flex; flex-direction: column; gap: 20px; }
+      .overview-attention { padding: 14px 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); }
+      .overview-attention.is-healthy { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+      .overview-attention.is-healthy .overview-icon { color: var(--ok); }
+      .overview-attention.is-healthy strong { color: var(--text-strong); font-weight: 500; }
+      .overview-attention.is-healthy span { color: var(--text-muted); }
+      .overview-attention.is-warning { border-color: #4a3818; }
+      .overview-attention.is-degraded { border-color: #5a2a1f; }
+      .overview-attention-head { display: flex; align-items: center; gap: 10px; }
+      .overview-attention.is-warning .overview-attention-head .overview-icon { color: var(--warn); }
+      .overview-attention.is-degraded .overview-attention-head .overview-icon { color: var(--danger); }
+      .overview-attention-head h2 { color: var(--text-strong); font-size: 0.95rem; font-weight: 600; }
+      .overview-attention-count { padding: 0 8px; border-radius: 999px; background: var(--warn-wash); color: var(--warn); font-family: var(--font-mono); font-size: 0.75rem; }
+      .overview-attention.is-degraded .overview-attention-count { background: var(--danger-wash); color: var(--danger-text); }
+      .overview-attention-list { margin-top: 12px; list-style: none; }
+      .overview-attention-item { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 24px; padding: 12px 0; border-top: 1px solid var(--line); }
+      .overview-attention-item:last-child { padding-bottom: 0; }
+      .overview-attention-item > div { display: grid; flex: 1 1 360px; gap: 2px; min-width: 0; }
+      .overview-attention-item strong { color: var(--text-strong); font-weight: 500; }
+      .overview-attention-item.is-degraded strong { color: var(--danger-text); }
+      .overview-attention-item span { color: var(--text-muted); font-size: 0.8125rem; }
+      .overview-metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 16px; }
+      .overview-metric { display: flex; flex-direction: column; gap: 6px; min-width: 0; padding: 16px 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); }
+      .overview-metric-label { color: var(--text-muted); font-size: 0.8125rem; }
+      .overview-metric-value { color: var(--text-strong); font-family: var(--font-mono); font-size: 1.75rem; font-weight: 500; line-height: 1.2; letter-spacing: -0.02em; overflow-wrap: anywhere; }
+      .overview-metric-value.c-muted, .overview-metric-value.is-empty { padding-block: 6px; color: var(--text-muted); font-family: var(--font-sans); font-size: 1.125rem; letter-spacing: 0; }
+      .overview-metric-note { color: var(--text-faint); font-size: 0.8125rem; }
+      .overview-metric-note [data-recent-rate] { color: var(--text-body); font-family: var(--font-mono); }
+      .overview-meter { height: 6px; margin-top: 6px; border-radius: 999px; background: var(--line); overflow: hidden; }
+      .overview-meter > div { height: 100%; border-radius: 999px; }
+      .overview-spark { width: 100%; height: 32px; }
+      .overview-spark polyline { fill: none; stroke: var(--accent); stroke-width: 1.6; vector-effect: non-scaling-stroke; }
+      .overview-observations { margin-top: 10px; }
+      .overview-observations > summary { width: fit-content; color: var(--text-muted); font-size: 0.8125rem; cursor: pointer; }
+      .overview-observations > summary:hover { color: var(--text-strong); }
+      .overview-observations .table-scroll { margin-top: 10px; }
+      .overview-panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 16px; }
+      .overview-panel { min-width: 0; padding: 18px 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); }
+      .overview-panel-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+      .overview-panel-head h2 { color: var(--text-strong); font-size: 0.95rem; font-weight: 600; }
+      .overview-panel-head a { margin-left: auto; font-size: 0.8125rem; text-decoration: none; }
+      .overview-panel-note { margin-top: 10px; color: var(--text-faint); font-size: 0.8125rem; }
+      .overview-panel table { margin-top: 14px; }
+      .overview-empty { margin-top: 14px; color: var(--text-muted); }
+      .overview-workflows-total { margin-top: 12px; color: var(--text-muted); }
+      .overview-workflows-total strong { margin-right: 6px; color: var(--text-strong); font-family: var(--font-mono); font-size: 1.5rem; font-weight: 500; }
+      .overview-state-bar { display: flex; gap: 2px; height: 10px; margin-top: 14px; border-radius: 999px; background: var(--line); overflow: hidden; }
+      .overview-state, .overview-swatch { background: var(--text-faint); }
+      .overview-state.is-queued, .overview-swatch.is-queued { background: var(--info); }
+      .overview-state.is-running, .overview-swatch.is-running { background: var(--accent); }
+      .overview-state.is-expired, .overview-swatch.is-expired { background: var(--warn); }
+      .overview-swatch.is-failed { background: var(--danger); }
+      .overview-legend { display: flex; flex-wrap: wrap; gap: 8px 20px; margin-top: 10px; list-style: none; color: var(--text-muted); font-size: 0.8125rem; }
+      .overview-legend li { display: inline-flex; align-items: center; gap: 6px; }
+      .overview-legend strong { color: var(--text-strong); font-family: var(--font-mono); font-weight: 500; }
+      .overview-swatch { width: 8px; height: 8px; border-radius: 2px; }
+      .overview-shard-grid { display: grid; grid-template-columns: repeat(var(--shard-columns, auto-fill), minmax(52px, 1fr)); gap: 6px; margin-top: 14px; list-style: none; font-family: var(--font-mono); }
+      .overview-types { margin-top: 16px; border: 0; border-radius: 0; background: transparent; }
+      .overview-types th, .overview-types td { padding: 7px 0; background: transparent; }
+      .overview-types th + th, .overview-types td + td { text-align: right; }
+      .overview-types td { font-family: var(--font-mono); }
+      .overview-types a { color: var(--text-strong); text-decoration: none; }
+      .overview-types a:hover { color: var(--accent); }
+      .overview-types tr:hover td { background: transparent; }
+      .overview-shard { display: flex; flex-direction: column; gap: 2px; padding: 8px 8px 7px; border: 1px solid #1e3a2e; border-radius: 8px; background: rgba(70, 201, 139, var(--shard-load, 0.1)); }
+      .overview-shard span { color: var(--text-muted); font-size: 0.75rem; }
+      .overview-shard strong { color: var(--text-strong); font-size: 0.8125rem; font-weight: 500; }
+      .overview-shard.is-down { border-color: #5a2a1f; background: var(--danger-wash); }
+      .overview-shard.is-down strong { color: var(--danger-text); }
+      .overview-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 16px; }
+      .overview-card { min-width: 0; padding: 16px 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); }
+      .overview-card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+      .overview-card-head h2 { color: var(--text-strong); font-size: 0.875rem; font-weight: 600; }
+      .overview-card-head a { font-size: 0.8125rem; text-decoration: none; }
+      .overview-card dl { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; margin-top: 12px; font-size: 0.8125rem; }
+      .overview-card dt { color: var(--text-muted); }
+      .overview-card dd { margin: 0; color: var(--text-strong); font-family: var(--font-mono); text-align: right; }
+      .overview-card-note { margin-top: 12px; color: var(--text-muted); font-size: 0.8125rem; }
+      .overview-footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 24px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--text-faint); font-size: 0.75rem; }
 
       /* Operational summary cards */
       .ops-summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 20px; }
@@ -707,7 +757,6 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       /* Sidebar */
       .layout { display: flex; min-height: 100vh; }
       .sidebar { width: 232px; flex-shrink: 0; display: flex; flex-direction: column; gap: 18px; padding: 18px 12px 14px; background: var(--surface-sunken); border-right: 1px solid var(--line); position: sticky; top: 0; height: 100vh; overflow-y: auto; }
-      body:has(> header .top-bar) .sidebar { height: calc(100vh - 54px); }
       .sidebar-brand { display: flex; align-items: center; gap: 10px; padding: 2px 10px 0; }
       .sidebar-brand-name { color: var(--text-strong); font-size: 0.95rem; font-weight: 600; }
       .sidebar-version { margin-left: auto; padding: 1px 7px; border: 1px solid var(--line-strong); border-radius: 999px; color: var(--text-muted); font-size: 0.75rem; }
@@ -770,18 +819,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-operations-panel > summary::after, .dashboard-disclosure > summary::after, .flow-query-visualization > summary::after { content: ""; display: block; clear: both; }
       .flow-operations-panel > summary::marker, .dashboard-disclosure > summary::marker, .flow-query-visualization > summary::marker { color: var(--accent); }
       .flow-operations-panel-body, .dashboard-disclosure-body { padding: 0 16px 16px; border-top: 1px solid var(--line); }
-      .operator-attention { margin-bottom: 20px; }
-      .operator-attention-list { display: grid; gap: 8px; }
-      .operator-attention-item, .operator-attention-clear { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-raised); }
-      .operator-attention-clear { justify-content: flex-start; }
-      .operator-attention-item > div { display: grid; gap: 3px; min-width: 0; }
-      .operator-attention-item span, .operator-attention-clear { color: var(--text-muted); font-size: 0.78rem; }
-      .operator-attention-item a { white-space: nowrap; color: var(--accent); font-size: 0.78rem; }
-      .operator-attention-warning { border-left: 3px solid var(--warn); }
-      .operator-attention-degraded { border-left: 3px solid var(--danger); }
 
-      /* Footer */
-      .footer { position: static; background: var(--surface-base); border-top: 1px solid var(--line); padding: 8px 24px; font-size: 0.75rem; color: var(--text-muted); display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
 
       /* Tooltip */
       .info-icon { position: relative; display: inline-block; width: 18px; height: 18px; padding: 0; border: 1px solid var(--line-strong); border-radius: 50%; background: var(--surface-selected); color: var(--text-body); font-size: 11px; text-align: center; line-height: 16px; cursor: help; margin-left: 4px; vertical-align: middle; }
@@ -959,7 +997,6 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .table-scroll { max-height: min(65vh, 720px); overflow-y: auto; }
       .flow-failure-summary-ribbon dd > span { font-weight: 400; }
       .flow-overview-ribbon dd > span, .flow-projection-ledger dd > span { font-weight: 400; font-family: var(--font-sans); margin-top: 4px; }
-      .top-bar .metric .val { white-space: normal; }
       .keyboard-card { padding: 22px 24px; width: 100%; }
       .keyboard-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; border-bottom: 1px solid var(--line); padding-bottom: 12px; }
       .dashboard-modal-close { flex: 0 0 auto; border: 1px solid var(--line-strong); border-radius: 4px; padding: 5px 9px; background: var(--surface-selected); color: var(--text-strong); cursor: pointer; }
@@ -973,7 +1010,6 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       /* Responsive */
       @media (max-width: 1100px) {
         .flow-management-group .flow-policy-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-        .top-bar-identity { grid-template-columns: auto minmax(0, 1fr); }
         .flow-state-filter-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .acl-tester-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .flow-state-filter-form .flow-filter-time-group { grid-column: 1 / -1; }
@@ -988,9 +1024,6 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
         .flow-definition-list dd { margin-bottom: 8px; }
         .flow-query-reference-terms { grid-template-columns: minmax(0, 1fr); gap: 6px; }
         .flow-management-group .flow-policy-grid { grid-template-columns: minmax(0, 1fr); }
-        .top-bar { grid-template-columns: minmax(0, 1fr); }
-        .top-bar > .dashboard-live-status { grid-row: auto; grid-column: 1; justify-self: start; margin-left: 0; }
-        .top-bar-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
         .acl-tester-form, .kv-query-modes { grid-template-columns: minmax(0, 1fr); }
         html, body { max-width: 100%; overflow-x: hidden; }
         .layout { flex-direction: column; }
@@ -1002,13 +1035,8 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
         .sidebar-footer { width: 100%; margin-top: 4px; flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: space-between; }
         .page-header { padding: 14px 16px 0; }
         .page-header-status { justify-content: flex-start; }
-        .top-bar { gap: 12px; padding: 10px 16px; }
-        .top-bar .metric .val { font-size: 0.9rem; }
-        .top-bar .sep { display: none; }
+        .overview-shard-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
         .content { padding: 16px; }
-        .hit-rate-num { font-size: 2.2rem; }
-        .cache-hero { flex-direction: column; }
-        .hit-rate-card { min-width: unset; }
         .flow-card-wide { grid-column: span 1; }
         .flow-nav-row { align-items: stretch; }
         .flow-tabs, .flow-search, .flow-filter-form, .flow-policy-actions { width: 100%; }

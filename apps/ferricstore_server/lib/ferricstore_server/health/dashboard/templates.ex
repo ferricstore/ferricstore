@@ -201,18 +201,6 @@ defmodule FerricstoreServer.Health.Dashboard.Templates do
     [:assigns]
   )
 
-  defp render_overview_content(data) do
-    """
-    #{render_operator_attention(data)}
-    #{FerricstoreServer.Health.Dashboard.Render.RecentRates.render(data)}
-    #{render_cache_performance(data.hotcold)}
-    #{render_lifecycle(data.lifecycle)}
-    #{render_shards(data.shards)}
-    #{render_memory_alert(data.memory)}
-    #{render_connections(data.connections)}
-    """
-  end
-
   defp default_flow_projection_health, do: Projection.default_health()
 
   defp flow_page_filters(data), do: Browse.overview_page_filters(data)

@@ -35,7 +35,7 @@ defmodule FerricstoreServer.Health.Dashboard.OperationalReviewTest do
     assert html =~ ~r{<dt>Historical failures</dt>\s*<dd[^>]*>Unavailable}
   end
 
-  test "memory snapshot retains RSS pressure and uses the governing budget in the top bar" do
+  test "memory snapshot retains RSS pressure and uses the governing budget in the memory card" do
     stats = %{
       total_bytes: 100,
       max_bytes: 1_000,
@@ -54,19 +54,17 @@ defmodule FerricstoreServer.Health.Dashboard.OperationalReviewTest do
     memory = Operational.memory_snapshot(stats)
     assert memory.rss_bytes == 1_800
     assert memory.memory_limit == 2_000
-    html = Overview.render_top_bar(top_data(memory))
-    assert html =~ "Process RSS"
-    assert html =~ "1.76 KB / 1.95 KB"
+    html = Overview.render_overview_metrics(top_data(memory))
+    assert html =~ "Process RSS of 1.95 KB"
+    assert html =~ ">1.76 KB<"
     assert html =~ "width:90.0%"
-    assert html =~ "Tracked allocations"
-    assert html =~ "100 B / 1000 B"
-    assert html =~ "Avg ops/sec"
-    assert html =~ "since start"
+    assert html =~ "Tracked allocations 100 B of 1000 B"
+    assert html =~ "average since start"
   end
 
   test "missing RSS telemetry is explicitly unavailable instead of zero process memory" do
     html =
-      Overview.render_top_bar(
+      Overview.render_overview_metrics(
         top_data(%{total_bytes: 100, max_bytes: 1_000, ratio: 0.1, pressure_level: :ok})
       )
 

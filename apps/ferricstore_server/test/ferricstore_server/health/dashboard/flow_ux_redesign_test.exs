@@ -638,7 +638,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
       html =
         FerricstoreServer.Health.Dashboard.Render.Overview.render_operator_attention(data)
 
-      assert html =~ "Operator Attention"
+      assert html =~ "Needs attention"
       assert html =~ "Policy migration waiting on its state projection"
       assert html =~ "2 sampled failed workflows"
       assert html =~ "1 sampled expired lease"
@@ -660,11 +660,11 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
         subsystem_health: %{policy_migration: %{status: :warning, issues: []}}
       }
 
-      html = FerricstoreServer.Health.Dashboard.Render.Overview.render_top_bar(data)
+      html = FerricstoreServer.Health.Dashboard.Render.Overview.render_operator_attention(data)
 
-      assert html =~ "dot-yellow"
-      assert html =~ ">warning<"
-      refute html =~ ">healthy<"
+      assert html =~ "Needs attention"
+      assert html =~ "Policy migration health unavailable"
+      refute html =~ "Healthy"
     end
   end
 
@@ -1022,7 +1022,7 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
       assert css =~ ".pulse-dot-amber"
       assert css =~ ".keyboard-modal"
       assert css =~ ".dashboard-disclosure"
-      assert css =~ ".operator-attention"
+      assert css =~ ".overview-attention"
       assert css =~ ".nav-section-label"
       assert css =~ ".flow-investigation-context"
       assert css =~ ".flow-detail-sections"
