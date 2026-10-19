@@ -90,17 +90,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       defp async_key_present?(state, {:setrange, key, _off, _v}), do: ets_has?(state.ets, key)
       defp async_key_present?(state, {:setbit, key, _off, _bit}), do: ets_has?(state.ets, key)
 
-      defp async_key_present?(state, {:hincrby, key, field, _delta}) do
+      defp async_key_present?(state, {:hincrby, key, field, _delta}) when is_binary(field) do
         ets_has?(state.ets, Ferricstore.Store.CompoundKey.hash_field(key, field))
       end
 
-      defp async_key_present?(state, {:hincrbyfloat, key, field, _delta}) do
+      defp async_key_present?(state, {:hincrbyfloat, key, field, _delta})
+           when is_binary(field) do
         ets_has?(state.ets, Ferricstore.Store.CompoundKey.hash_field(key, field))
       end
 
-      defp async_key_present?(state, {:zincrby, key, _incr, member}) do
+      defp async_key_present?(state, {:zincrby, key, _incr, member}) when is_binary(member) do
         ets_has?(state.ets, Ferricstore.Store.CompoundKey.zset_member(key, member))
       end
+
+      # A malformed field or member was never written; apply_single rejects it.
+      defp async_key_present?(_state, {command, _key, _field, _delta})
+           when command in [:hincrby, :hincrbyfloat],
+           do: false
+
+      defp async_key_present?(_state, {:zincrby, _key, _incr, _member}), do: false
 
       # List ops check the canonical type marker written by the origin before
       # submit. On replicas the marker is absent, so they apply the inner op.

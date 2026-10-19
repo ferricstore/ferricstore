@@ -576,6 +576,18 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
   # RATE LIMITING
   # ===========================================================================
 
+  describe "zincrby/3 arguments" do
+    test "rejects a member that is not a string and the shard keeps applying writes" do
+      for member <- [:m, 5, {:m}] do
+        assert {:error, "ERR zincrby member must be a string"} =
+                 FerricStore.zincrby("zi:bad-member", 1.0, member)
+      end
+
+      assert {:ok, "1.0"} = FerricStore.zincrby("zi:bad-member", 1.0, "m")
+      assert {:ok, 1.0} = FerricStore.zscore("zi:bad-member", "m")
+    end
+  end
+
   describe "ratelimit_add/4" do
     test "rejects a malformed window, limit or count and the shard keeps applying writes" do
       key = "rl:bad-args"

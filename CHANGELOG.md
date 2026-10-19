@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Reject a sorted set member that is not a string in `FerricStore.zincrby/3`
+  instead of crashing the shard. The member reached the replicated log
+  unchecked and raised while the entry was applied, so the shard's storage
+  process crash-looped and stopped serving. The router now checks the
+  member, field and increment of ZINCRBY, HINCRBY and HINCRBYFLOAT, and the
+  state machine rejects the entries that used to raise.
 - Check the key's type in `FerricStore.hincrby/3` and
   `FerricStore.hincrbyfloat/3`. They wrote the field without recording or
   checking the type: on a new key TYPE answered "none" and EXISTS false while

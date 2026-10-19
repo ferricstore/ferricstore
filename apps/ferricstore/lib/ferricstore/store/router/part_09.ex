@@ -776,6 +776,12 @@ defmodule Ferricstore.Store.Router.Part09 do
       """
       @spec hincrby(FerricStore.Instance.t(), binary(), binary(), integer()) ::
               integer() | {:error, binary()}
+      def hincrby(_ctx, _key, field, _delta) when not is_binary(field),
+        do: {:error, "ERR hash field must be a string"}
+
+      def hincrby(_ctx, _key, _field, delta) when not is_integer(delta),
+        do: {:error, "ERR value is not an integer or out of range"}
+
       def hincrby(ctx, key, field, delta) do
         raft_write(ctx, shard_for(ctx, key), key, {:hincrby, key, field, delta})
       end
@@ -786,6 +792,12 @@ defmodule Ferricstore.Store.Router.Part09 do
       """
       @spec hincrbyfloat(FerricStore.Instance.t(), binary(), binary(), float()) ::
               binary() | {:error, binary()}
+      def hincrbyfloat(_ctx, _key, field, _delta) when not is_binary(field),
+        do: {:error, "ERR hash field must be a string"}
+
+      def hincrbyfloat(_ctx, _key, _field, delta) when not is_float(delta),
+        do: {:error, "ERR value is not a valid float"}
+
       def hincrbyfloat(ctx, key, field, delta) do
         raft_write(ctx, shard_for(ctx, key), key, {:hincrbyfloat, key, field, delta})
       end
@@ -796,6 +808,12 @@ defmodule Ferricstore.Store.Router.Part09 do
       """
       @spec zincrby(FerricStore.Instance.t(), binary(), number(), binary()) ::
               binary() | {:error, binary()}
+      def zincrby(_ctx, _key, _increment, member) when not is_binary(member),
+        do: {:error, "ERR zincrby member must be a string"}
+
+      def zincrby(_ctx, _key, increment, _member) when not is_float(increment),
+        do: {:error, "ERR value is not a valid float"}
+
       def zincrby(ctx, key, increment, member) do
         raft_write(ctx, shard_for(ctx, key), key, {:zincrby, key, increment, member})
       end

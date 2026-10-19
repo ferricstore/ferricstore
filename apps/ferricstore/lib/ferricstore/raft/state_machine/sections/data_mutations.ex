@@ -173,6 +173,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         end
       end
 
+      # A field, member or HINCRBY delta of the wrong type raised while the
+      # entry was applied, crash-looping the shard; the router rejects them,
+      # and these clauses keep an entry that reached the log from raising.
+      defp do_hincrby(_state, _redis_key, field, _delta) when not is_binary(field),
+        do: {:error, "ERR hash field must be a string"}
+
+      defp do_hincrby(_state, _redis_key, _field, delta) when not is_integer(delta),
+        do: {:error, "ERR value is not an integer or out of range"}
+
       # Atomic HINCRBY: read compound key (H:<redis_key>\0<field>), parse integer,
       # add delta, write back. Returns new integer value, or {:error, reason}.
       defp do_hincrby(state, redis_key, field, delta) do
@@ -217,6 +226,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             end
         end
       end
+
+      defp do_hincrbyfloat(_state, _redis_key, field, _delta) when not is_binary(field),
+        do: {:error, "ERR hash field must be a string"}
 
       # Atomic HINCRBYFLOAT: same as HINCRBY but for floats.
       defp do_hincrbyfloat(state, redis_key, field, delta) do
@@ -275,6 +287,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # Atomic ZINCRBY: check/set type metadata, read member score, add delta,
       # write back. Returns the new score as a string. Returns {:error, ...} on
       # wrong type.
+      defp do_zincrby(_state, _redis_key, _increment, member) when not is_binary(member),
+        do: {:error, "ERR zincrby member must be a string"}
+
       defp do_zincrby(state, redis_key, increment, member) do
         type_key = Ferricstore.Store.CompoundKey.type_key(redis_key)
         expected_type = Ferricstore.Store.CompoundKey.encode_type(:zset)

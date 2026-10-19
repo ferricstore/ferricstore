@@ -1047,6 +1047,30 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           assert [] == :ets.lookup(ets, key)
         end
 
+        test "HINCRBY, HINCRBYFLOAT and ZINCRBY reject a malformed field, member or delta", %{
+          state: state,
+          ets: ets
+        } do
+          key = "invalid_increment_apply"
+
+          for {command, error} <- [
+                {{:hincrby, key, :f, 1}, "ERR hash field must be a string"},
+                {{:hincrby, key, "f", 1.5}, "ERR value is not an integer or out of range"},
+                {{:hincrbyfloat, key, :f, 1.0}, "ERR hash field must be a string"},
+                {{:zincrby, key, 1.0, :m}, "ERR zincrby member must be a string"},
+                {{:async, node(), {:zincrby, key, 1.0, :m}},
+                 "ERR zincrby member must be a string"},
+                {{:async, node(), {:hincrby, key, :f, 1}}, "ERR hash field must be a string"},
+                {{:async, node(), {:hincrbyfloat, key, :f, 1.0}},
+                 "ERR hash field must be a string"}
+              ] do
+            {_new_state, result} = StateMachine.apply(%{}, command, state)
+            assert {:error, ^error} = result, "#{inspect(command)} returned #{inspect(result)}"
+          end
+
+          assert [] == :ets.tab2list(ets)
+        end
+
         test "RATELIMIT.ADD rejects a malformed window, limit or count instead of raising", %{
           state: state,
           ets: ets
