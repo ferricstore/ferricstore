@@ -218,7 +218,8 @@ defmodule FerricstoreServer.Health.Dashboard.DataRedesignTest do
   end
 
   test "Pub/Sub opens with active subscriptions" do
-    assert MessagingPages.render_pubsub_summary(%{}) =~ "<strong>No visible subscriptions</strong>"
+    assert MessagingPages.render_pubsub_summary(%{}) =~
+             "<strong>No visible subscriptions</strong>"
 
     html =
       MessagingPages.render_pubsub_summary(%{
@@ -254,5 +255,28 @@ defmodule FerricstoreServer.Health.Dashboard.DataRedesignTest do
 
   test "links inside prompts use the accent colour" do
     assert Styles.stylesheet() =~ ".section-empty a { color: var(--accent); }"
+  end
+
+  test "sampled hot reads say they are estimates" do
+    html =
+      KVPages.render_reads_summary(%{
+        hotcold: %{
+          hit_ratio: 90.0,
+          hot_reads: 1_800,
+          cold_reads: 0,
+          total_misses: 200,
+          sample_rate: 100
+        }
+      })
+
+    assert html =~ "about 1.8K hot reads, estimated from 1-in-100 sampling"
+
+    exact =
+      KVPages.render_reads_summary(%{
+        hotcold: %{hit_ratio: 90.0, hot_reads: 18, cold_reads: 0, total_misses: 2, sample_rate: 1}
+      })
+
+    assert exact =~ "18 hot reads"
+    refute exact =~ "estimated"
   end
 end

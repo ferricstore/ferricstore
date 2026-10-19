@@ -441,7 +441,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
         PageStatus.render("reads", :idle, "No read samples yet")
       else
         PageStatus.render("reads", :idle, "#{hotcold.hit_ratio}% hit rate", [
-          "#{format_number(hot_reads)} hot reads",
+          hot_reads_label(hot_reads, Map.get(hotcold, :sample_rate, 1)),
           "#{format_number(cold_reads)} cold reads from disk",
           "#{format_number(Map.get(hotcold, :total_misses, 0))} misses"
         ])
@@ -470,6 +470,12 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
         heading: :hidden
       )
   end
+
+  # Hot reads are counted 1 in N; the figure is an estimate, unlike cold reads and misses.
+  defp hot_reads_label(count, rate) when is_integer(rate) and rate > 1,
+    do: "about #{format_number(count)} hot reads, estimated from 1-in-#{rate} sampling"
+
+  defp hot_reads_label(count, _rate), do: "#{format_number(count)} hot reads"
 
   def render_read_prefix_table(data) do
     rows = Map.get(data, :prefixes, [])
