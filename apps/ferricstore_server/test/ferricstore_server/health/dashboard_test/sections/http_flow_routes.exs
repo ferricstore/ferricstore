@@ -198,24 +198,27 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
           port = HealthEndpoint.port()
 
           for {path, title} <- [
-                {"/dashboard/flow/states", "Flow States"},
-                {"/dashboard/flow/workers", "Flow Workers"},
-                {"/dashboard/flow/workers?refresh=1", "Flow Workers"},
-                {"/dashboard/flow/due", "Due / Scheduled"},
-                {"/dashboard/flow/due?refresh=1", "Due / Scheduled"},
-                {"/dashboard/flow/failures", "Flow Failures"},
-                {"/dashboard/flow/lineage", "Flow Lineage"},
-                {"/dashboard/flow/query", "Flow Query Studio"},
-                {"/dashboard/flow/signals", "Flow Signals"},
-                {"/dashboard/flow/policies", "FerricFlow Policies"},
-                {"/dashboard/flow/governance", "FerricFlow Governance"},
-                {"/dashboard/flow/retention", "FerricFlow Retention"}
+                {"/dashboard/flow/states", "Runs"},
+                {"/dashboard/flow/workers", "Workers"},
+                {"/dashboard/flow/workers?refresh=1", "Workers"},
+                {"/dashboard/flow/due", "Runs"},
+                {"/dashboard/flow/due?refresh=1", "Runs"},
+                {"/dashboard/flow/failures", "Failures"},
+                {"/dashboard/flow/lineage", "Query"},
+                {"/dashboard/flow/query", "Query"},
+                {"/dashboard/flow/signals", "Query"},
+                {"/dashboard/flow/policies", "Settings"},
+                {"/dashboard/flow/governance", "Settings"},
+                {"/dashboard/flow/retention", "Settings"}
               ] do
             response = http_get(port, path)
 
             assert response =~ "HTTP/1.1 200 OK"
             assert response =~ "text/html"
-            assert response |> extract_body() |> String.contains?(title)
+
+            assert response
+                   |> extract_body()
+                   |> String.contains?(~s(<h1 class="page-title">#{title}</h1>))
           end
         end
 

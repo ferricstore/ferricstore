@@ -4,10 +4,8 @@
 <div class="layout">
 <%= render_sidebar_static("pubsub") %>
 <main class="main-content" id="dashboard-main" tabindex="-1">
-<%= render_subpage_header("Pub/Sub") %>
+<%= render_page_header("pubsub", intro: "Inspect active Pub/Sub subscriptions and publish activity without exposing message bodies.") %>
 <div class="content">
-<%= render_page_intro("Pub/Sub", "Inspect active Pub/Sub subscriptions and publish activity without exposing message bodies.") %>
-<%= render_messaging_subnav("pubsub") %>
 <%= render_live_component("pubsub_summary", render_pubsub_summary(data)) %>
 <%= render_live_component("pubsub_channels", render_pubsub_channels(data)) %>
 <%= render_live_component("pubsub_patterns", render_pubsub_patterns(data)) %>

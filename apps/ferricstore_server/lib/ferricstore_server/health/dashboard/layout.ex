@@ -23,7 +23,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
       <title>#{escape(title)}</title>
       <link rel="preconnect" href="https://fonts.googleapis.com">
       <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-      <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+      <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
       <link rel="stylesheet" href="#{FerricstoreServer.Health.Dashboard.Assets.path(:css)}">
       <script src="#{FerricstoreServer.Health.Dashboard.Assets.path(:js)}" defer></script>
     </head>
@@ -168,7 +168,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
                 var retainedState = captureComponentState(target);
                 target.innerHTML = nextHtml;
                 if (liveStatus) {
-                  (target.querySelector('.subpage-header, .top-bar') || target).appendChild(liveStatus);
+                  (document.querySelector("[data-dashboard-status-host]") || target).appendChild(liveStatus);
                   if (statusFocused) { active.focus({ preventScroll: true }); }
                 }
                 componentHtml.set(target, nextHtml);
@@ -948,39 +948,6 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
             document.addEventListener('reset', function (event) { setTimeout(function () { update(event); }, 0); });
           }
 
-          function setupSidebarPreferences() {
-            var key = 'ferricstore.sidebar.groups.v1';
-            var groups = Array.from(document.querySelectorAll('.sidebar [data-dashboard-nav-group]'));
-            var saved = {};
-            try {
-              var raw = sessionStorage.getItem(key);
-              var parsed = raw && raw.length <= 4096 ? JSON.parse(raw) : null;
-              if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) { saved = parsed; }
-            } catch (_error) {}
-            function saveGroups() {
-              var current = {};
-              document.querySelectorAll('.sidebar [data-dashboard-nav-group]').forEach(function (item) { current[item.dataset.dashboardNavGroup] = item.open; });
-              try { sessionStorage.setItem(key, JSON.stringify(current)); } catch (_error) {}
-            }
-            groups.forEach(function (group) {
-              var name = group.dataset.dashboardNavGroup;
-              if (typeof saved[name] === 'boolean') { group.open = saved[name]; }
-              if (group.querySelector('[aria-current="page"]')) { group.open = true; }
-            });
-            document.addEventListener('toggle', function (event) {
-              if (event.target.matches('.sidebar [data-dashboard-nav-group]')) { saveGroups(); }
-            }, true);
-            window.addEventListener('pagehide', saveGroups);
-            var active = document.querySelector('.sidebar [aria-current="page"]');
-            if (active) {
-              var sidebar = active.closest('.sidebar');
-              var itemBounds = active.getBoundingClientRect();
-              var bounds = sidebar.getBoundingClientRect();
-              if (itemBounds.bottom > bounds.bottom) { sidebar.scrollTop += itemBounds.bottom - bounds.bottom + 8; }
-              else if (itemBounds.top < bounds.top) { sidebar.scrollTop -= bounds.top - itemBounds.top + 8; }
-            }
-          }
-
           var characterShortcuts = true;
           function syncShortcutPreferences() {
             document.querySelectorAll('[data-dashboard-character-shortcuts]').forEach(function (preference) {
@@ -1150,7 +1117,6 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
             setupFlowValueInspector();
             setupWorkflowActionNavigation();
             setupFlowJournalInteractions();
-            setupSidebarPreferences();
             setupGlobalShortcutsAndCopy();
             setupMetricHelp();
             preserveWorkflowScope();
@@ -1236,7 +1202,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
 
             function ensureLiveStatusMounted() {
               if (status.isConnected) { return; }
-              var statusHost = document.querySelector(".subpage-header") || document.querySelector(".top-bar") || root;
+              var statusHost = document.querySelector("[data-dashboard-status-host]") || root;
               statusHost.appendChild(status);
             }
 
@@ -1426,24 +1392,139 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
     """
   end
 
-  def render_subpage_header(title) do
+  # Sidebar destinations by section. A destination's tabs are the pages it
+  # covers; a page that is a tab has no sidebar link of its own and marks its
+  # destination instead.
+  @navigation [
+    {nil, [{"overview", "/dashboard", "Overview", []}]},
+    {"Workflows",
+     [
+       {"flow", "/dashboard/flow", "Overview", []},
+       {"flow_states", "/dashboard/flow/states", "Runs",
+        [
+          {"flow_states", "/dashboard/flow/states", "By state"},
+          {"flow_due", "/dashboard/flow/due", "Due"}
+        ]},
+       {"flow_failures", "/dashboard/flow/failures", "Failures", []},
+       {"flow_schedules", "/dashboard/flow/schedules", "Schedules", []},
+       {"flow_workers", "/dashboard/flow/workers", "Workers", []},
+       {"flow_query", "/dashboard/flow/query", "Query",
+        [
+          {"flow_query", "/dashboard/flow/query", "Query studio"},
+          {"flow_lineage", "/dashboard/flow/lineage", "Lineage"},
+          {"flow_signals", "/dashboard/flow/signals", "Signals"}
+        ]},
+       {"flow_policies", "/dashboard/flow/policies", "Settings",
+        [
+          {"flow_policies", "/dashboard/flow/policies", "Policies"},
+          {"flow_governance", "/dashboard/flow/governance", "Governance"},
+          {"flow_retention", "/dashboard/flow/retention", "Retention"}
+        ]}
+     ]},
+    {"Data",
+     [
+       {"keyspace", "/dashboard/keyspace", "Keys",
+        [
+          {"keyspace", "/dashboard/keyspace", "Browse"},
+          {"prefixes", "/dashboard/prefixes", "Prefixes"},
+          {"reads", "/dashboard/reads", "Read path"}
+        ]},
+       {"storage", "/dashboard/storage", "Storage",
+        [
+          {"storage", "/dashboard/storage", "Disk"},
+          {"merge", "/dashboard/merge", "Merges"}
+        ]},
+       {"commands", "/dashboard/commands", "Commands", []},
+       {"streams", "/dashboard/streams", "Streams & Pub/Sub",
+        [
+          {"streams", "/dashboard/streams", "Streams"},
+          {"pubsub", "/dashboard/pubsub", "Pub/Sub"}
+        ]}
+     ]},
+    {"Cluster",
+     [
+       {"raft", "/dashboard/raft", "Consensus", []},
+       {"clients", "/dashboard/clients", "Clients", []},
+       {"slowlog", "/dashboard/slowlog", "Slow log", []},
+       {"doctor", "/dashboard/doctor", "Doctor", []}
+     ]},
+    {"Admin",
+     [
+       {"security", "/dashboard/security", "Security", []},
+       {"config", "/dashboard/config", "Config",
+        [
+          {"config", "/dashboard/config", "Settings"},
+          {"capabilities", "/dashboard/capabilities", "Capabilities"}
+        ]}
+     ]}
+  ]
+
+  @doc """
+  The page header: the page's section, its destination as the title, the open
+  view among the destination's tabs, and the snapshot or live status.
+
+  Options: `:intro` adds one line saying what the page is for; `:title`
+  replaces the destination name for a page outside the navigation.
+  """
+  def render_page_header(active, opts \\ []) when is_binary(active) and is_list(opts) do
+    {section, label, tabs} =
+      case destination(active) do
+        {section, {_key, _href, label, tabs}} -> {section, label, tabs}
+        nil -> {nil, active, []}
+      end
+
+    eyebrow = if section, do: ~s(<p class="page-eyebrow">#{escape(section)}</p>), else: ""
+
+    intro =
+      case Keyword.get(opts, :intro) do
+        nil -> ""
+        text -> ~s(<p class="page-intro">#{escape(text)}</p>)
+      end
+
     """
-    <div class="subpage-header">
-      <a class="dashboard-brand" href="/dashboard">FerricStore</a>
-      <h1 class="subpage-title">#{escape(title)}</h1>
-      <span class="dashboard-instance mono" data-dashboard-instance aria-label="Connected instance"></span>
-      #{render_snapshot()}
-    </div>
+    <header class="page-header">
+      <div class="page-header-row">
+        <div class="page-heading">
+          #{eyebrow}
+          <h1 class="page-title">#{escape(Keyword.get(opts, :title, label))}</h1>
+          #{intro}
+        </div>
+        <div class="page-header-status" data-dashboard-status-host>
+          <span class="dashboard-instance mono" data-dashboard-instance aria-label="Connected instance"></span>
+          #{render_snapshot()}
+        </div>
+      </div>
+      #{render_page_tabs(label, tabs, active)}
+    </header>
     """
   end
 
-  def render_page_intro(title, body) do
-    """
-    <section class="page-intro" aria-label="#{escape_attr(title)} page purpose">
-      <p>#{escape(body)}</p>
-    </section>
-    """
+  defp render_page_tabs(_label, [], _active), do: ""
+
+  defp render_page_tabs(label, tabs, active) do
+    links =
+      Enum.map_join(tabs, "", fn {key, href, tab_label} ->
+        current = if key == active, do: ~s( aria-current="page"), else: ""
+        ~s(<a class="page-tab" href="#{href}"#{current}>#{escape(tab_label)}</a>)
+      end)
+
+    ~s(<nav class="page-tabs" aria-label="#{escape_attr(label)} views">#{links}</nav>)
   end
+
+  defp destination(active) do
+    key = page_key(active)
+
+    Enum.find_value(@navigation, fn {section, destinations} ->
+      Enum.find_value(destinations, fn {destination_key, _href, _label, tabs} = destination ->
+        if destination_key == key or Enum.any?(tabs, &(elem(&1, 0) == key)),
+          do: {section, destination}
+      end)
+    end)
+  end
+
+  # A workflow run belongs to the Workflows overview.
+  defp page_key("flow_detail"), do: "flow"
+  defp page_key(active), do: active
 
   def render_dashboard_disclosure(title, badge, content, opts \\ [])
       when is_binary(title) and is_binary(content) and is_list(opts) do
@@ -1463,113 +1544,49 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
     """
   end
 
-  def render_kv_subnav(active) do
-    links =
-      Enum.map_join(kv_sections(), "\n", fn {key, href, label, title} ->
-        active_class = if key == active, do: " active", else: ""
-        current = if key == active, do: ~s( aria-current="page"), else: ""
-
-        ~s(<a class="flow-tab#{active_class}" href="#{href}"#{current} title="#{escape_attr(title)}">#{escape(label)}</a>)
-      end)
-
-    ~s(<nav class="flow-tabs" aria-label="KV dashboard sections">#{links}</nav>)
-  end
-
-  defp kv_sections do
-    [
-      {"keyspace", "/dashboard/keyspace", "Keyspace", "Find keys and inspect metadata"},
-      {"prefixes", "/dashboard/prefixes", "Prefixes", "Sampled prefix distribution"},
-      {"reads", "/dashboard/reads", "Read Path", "Hot-cache and cold-read health"},
-      {"storage", "/dashboard/storage", "Storage", "Disk files, segments, and shard usage"},
-      {"commands", "/dashboard/commands", "Command Catalog",
-       "Traffic, slowlog, and command groups"}
-    ]
-  end
-
-  def render_messaging_subnav(active) do
-    items = [
-      {"streams", "/dashboard/streams", "Streams", "Append and stream mutation activity"},
-      {"pubsub", "/dashboard/pubsub", "Pub/Sub", "Active subscriptions and publish activity"}
-    ]
-
-    links =
-      Enum.map_join(items, "\n", fn {key, href, label, title} ->
-        active_class = if key == active, do: " active", else: ""
-        current = if key == active, do: ~s( aria-current="page"), else: ""
-
-        ~s(<a class="flow-tab#{active_class}" href="#{href}"#{current} title="#{escape_attr(title)}">#{escape(label)}</a>)
-      end)
-
-    ~s(<nav class="flow-tabs" aria-label="Messaging dashboard sections">#{links}</nav>)
-  end
-
   # Sidebar with live badge data (used on main dashboard)
   def render_sidebar(data, active) do
-    slowlog_count = length(data.slowlog)
-    slowlog_badge = if slowlog_count == 0, do: "", else: "#{slowlog_count}"
-
-    active_merges = Enum.count(data.merge, & &1.merging)
-    merge_badge = if active_merges > 0, do: "#{active_merges}", else: ""
-
-    config_count = length(data.namespace_config)
-    config_badge = if config_count == 0, do: "", else: "#{config_count}"
-
-    conns = data.connections
-    conns_badge = if conns.active > 0, do: "#{conns.active}", else: ""
-
-    storage_badge = format_bytes(data.storage_summary.total_disk_bytes)
-    flow_active = Map.get(data.flow_summary, :active, 0)
-    flow_badge = if flow_active > 0, do: "#{flow_active}", else: ""
+    summary = Map.get(data, :flow_summary, %{})
+    triage = count_value(summary, :expired_leases_sampled) + count_value(summary, :failed)
 
     sidebar_html(active, %{
-      "slowlog" => slowlog_badge,
-      "merge" => merge_badge,
-      "flow" => flow_badge,
-      "config" => config_badge,
-      "clients" => conns_badge,
-      "storage" => storage_badge,
-      "streams" => "",
-      "keyspace" => "",
-      "reads" => "",
-      "commands" => "",
-      "capabilities" => "",
-      "security" => "",
-      "doctor" => ""
+      "flow_failures" => if(triage > 0, do: {format_number(triage), :warn}, else: "")
     })
+  end
+
+  defp count_value(map, key) do
+    case Map.get(map, key, 0) do
+      count when is_integer(count) and count > 0 -> count
+      _ -> 0
+    end
   end
 
   # Sidebar without live data (used on sub-pages to avoid expensive data collection)
-  def render_sidebar_static(active) do
-    sidebar_html(active, %{
-      "slowlog" => "",
-      "merge" => "",
-      "flow" => "",
-      "config" => "",
-      "clients" => "",
-      "storage" => "",
-      "streams" => "",
-      "keyspace" => "",
-      "reads" => "",
-      "commands" => "",
-      "capabilities" => "",
-      "security" => "",
-      "doctor" => ""
-    })
-  end
+  def render_sidebar_static(active), do: sidebar_html(active, %{})
 
   def sidebar_html(active, badges) do
-    links = Enum.map_join(sidebar_sections(), "\n", &render_sidebar_section(&1, active, badges))
-    session = render_sidebar_session()
+    current = page_key(active)
+    sections = Enum.map_join(@navigation, "\n", &render_sidebar_section(&1, current, badges))
 
     """
     #{render_skip_link()}
     <nav class="sidebar" aria-label="Dashboard sections">
-      #{links}
-      #{session}
-      <button type="button" class="dashboard-help-button" data-dashboard-shortcuts-open>Keyboard help</button>
+      <div class="sidebar-brand"><span class="sidebar-brand-name">FerricStore</span>#{render_version_badge()}</div>
+      #{sections}
+      <div class="sidebar-footer">
+        #{render_sidebar_session()}
+        <button type="button" class="dashboard-help-button" data-dashboard-shortcuts-open>Keyboard help</button>
+      </div>
     </nav>
     #{render_keyboard_shortcuts_modal()}
     """
+  end
+
+  defp render_version_badge do
+    case Application.spec(:ferricstore_server, :vsn) do
+      nil -> ""
+      version -> ~s(<span class="sidebar-version mono">#{escape(to_string(version))}</span>)
+    end
   end
 
   def render_skip_link do
@@ -1589,7 +1606,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
     if Acl.protected_mode?() do
       """
       <div class="sidebar-session">
-        <span>Protected session</span>
+        <span>Signed in as</span>
         <strong class="mono">#{escape(FerricstoreServer.Health.Endpoint.Session.current_username() || "Not signed in")}</strong>
         <form action="/dashboard/logout" method="post">
           <button type="submit">Sign out</button>
@@ -1601,110 +1618,31 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
     end
   end
 
-  defp sidebar_sections do
-    [
-      {"System", [{"overview", "/dashboard", "Overview", :primary}]},
-      {"Workflows",
-       [
-         {:subgroup, "workflow-nav-operate", "Operate",
-          [
-            {"flow", "/dashboard/flow", "Overview", :primary},
-            {"flow_states", "/dashboard/flow/states", "States / FIFO", :sub},
-            {"flow_due", "/dashboard/flow/due", "Due Work", :sub},
-            {"flow_workers", "/dashboard/flow/workers", "Workers", :sub},
-            {"flow_schedules", "/dashboard/flow/schedules", "Schedules", :sub}
-          ]},
-         {:subgroup, "workflow-nav-investigate", "Investigate",
-          [
-            {"flow_failures", "/dashboard/flow/failures", "Failures", :sub},
-            {"flow_query", "/dashboard/flow/query", "Query Studio", :sub},
-            {"flow_lineage", "/dashboard/flow/lineage", "Lineage", :sub},
-            {"flow_signals", "/dashboard/flow/signals", "Signals", :sub}
-          ]},
-         {:subgroup, "workflow-nav-configure", "Configure",
-          [
-            {"flow_policies", "/dashboard/flow/policies", "Policies", :sub},
-            {"flow_governance", "/dashboard/flow/governance", "Governance", :sub},
-            {"flow_retention", "/dashboard/flow/retention", "Retention", :sub}
-          ]}
-       ]},
-      {"KV / Data",
-       Enum.map(kv_sections(), fn {key, href, label, _title} ->
-         {key, href, label, if(key == "keyspace", do: :primary, else: :sub)}
-       end)},
-      {"Messaging",
-       [
-         {"streams", "/dashboard/streams", "Streams", :primary},
-         {"pubsub", "/dashboard/pubsub", "Pub/Sub", :primary}
-       ]},
-      {"Operations",
-       [
-         {"slowlog", "/dashboard/slowlog", "Slow Log", :primary},
-         {"merge", "/dashboard/merge", "Merge Status", :primary},
-         {"clients", "/dashboard/clients", "Clients", :primary},
-         {"raft", "/dashboard/raft", "Consensus", :primary}
-       ]},
-      {"Control Plane",
-       [
-         {"security", "/dashboard/security", "Security", :primary},
-         {"capabilities", "/dashboard/capabilities", "Capabilities", :primary},
-         {"config", "/dashboard/config", "Config", :primary},
-         {"doctor", "/dashboard/doctor", "Doctor", :primary}
-       ]}
-    ]
+  defp render_sidebar_section({nil, destinations}, current, badges) do
+    links = Enum.map_join(destinations, "\n", &render_sidebar_link(&1, current, badges))
+    ~s(<div class="nav-section">#{links}</div>)
   end
 
-  defp render_sidebar_section({section, items}, active, badges) do
-    open? = Enum.any?(items, &sidebar_entry_active?(&1, active))
+  defp render_sidebar_section({section, destinations}, current, badges) do
+    id = "nav-section-" <> String.downcase(section)
+    links = Enum.map_join(destinations, "\n", &render_sidebar_link(&1, current, badges))
 
-    open_attr = if open?, do: " open", else: ""
-
-    rendered_items = Enum.map_join(items, "\n", &render_sidebar_entry(&1, active, badges))
-
-    """
-    <details class="nav-group" data-dashboard-nav-group="#{escape_attr(section)}"#{open_attr}>
-      <summary>#{escape(section)}</summary>
-      <div class="nav-group-links">#{rendered_items}</div>
-    </details>
-    """
+    ~s(<div class="nav-section" role="group" aria-labelledby="#{id}"><span class="nav-section-label" id="#{id}">#{escape(section)}</span>#{links}</div>)
   end
 
-  defp sidebar_entry_active?({:subgroup, _id, _label, items}, active),
-    do: Enum.any?(items, &sidebar_entry_active?(&1, active))
-
-  defp sidebar_entry_active?({key, _href, _label, _depth}, active),
-    do: sidebar_item_active?(key, active)
-
-  defp render_sidebar_entry({:subgroup, id, label, items}, active, badges) do
-    links = Enum.map_join(items, "\n", &render_sidebar_entry(&1, active, badges))
-
-    """
-    <div class="nav-subgroup" role="group" aria-labelledby="#{escape_attr(id)}">
-      <div class="nav-subgroup-label" id="#{escape_attr(id)}">#{escape(label)}</div>
-      #{links}
-    </div>
-    """
-  end
-
-  defp render_sidebar_entry({key, href, label, depth}, active, badges),
-    do: render_sidebar_link(key, href, label, depth, active, badges)
-
-  defp render_sidebar_link(key, href, label, depth, active, badges) do
-    active? = sidebar_item_active?(key, active)
+  defp render_sidebar_link({key, href, label, tabs}, current, badges) do
+    active? = key == current or Enum.any?(tabs, &(elem(&1, 0) == current))
     active_class = if active?, do: " active", else: ""
-    depth_class = if depth == :sub, do: " nav-subitem", else: ""
     current_attr = if active?, do: ~s( aria-current="page"), else: ""
-    badge_val = Map.get(badges, key, "")
 
-    badge_html =
-      if badge_val != "" and badge_val != nil do
-        ~s(<span class="nav-badge">#{escape(to_string(badge_val))}</span>)
-      else
-        ""
-      end
-
-    ~s(<a class="#{active_class}#{depth_class}" href="#{href}"#{current_attr}><span class="nav-label">#{escape(label)}</span>#{badge_html}</a>)
+    ~s(<a class="nav-link#{active_class}" href="#{href}"#{current_attr}><span class="nav-label">#{escape(label)}</span>#{render_nav_badge(Map.get(badges, key, ""))}</a>)
   end
+
+  defp render_nav_badge({value, :warn}),
+    do: ~s(<span class="nav-badge nav-badge-warn">#{escape(to_string(value))}</span>)
+
+  defp render_nav_badge(value) when value in ["", nil], do: ""
+  defp render_nav_badge(value), do: ~s(<span class="nav-badge">#{escape(to_string(value))}</span>)
 
   def render_keyboard_shortcuts_modal do
     """
@@ -1750,7 +1688,4 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
     </dialog>
     """
   end
-
-  defp sidebar_item_active?("flow", "flow_detail"), do: true
-  defp sidebar_item_active?(key, active), do: key == active
 end

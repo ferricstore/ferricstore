@@ -519,7 +519,11 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           data = Dashboard.collect_flow_due_page()
           html = Dashboard.render_flow_due_page(data)
 
-          assert String.contains?(html, "Due / Scheduled")
+          assert String.contains?(
+                   html,
+                   ~s(href="/dashboard/flow/due" aria-current="page">Due</a>)
+                 )
+
           assert String.contains?(html, "Why Waiting")
           assert String.contains?(html, "Run At")
         end
@@ -939,7 +943,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           refute String.contains?(html, "LMDB Mode")
           refute String.contains?(String.downcase(html), "mirror")
           refute String.contains?(html, ~s(href="/dashboard/flow/projections"))
-          assert String.contains?(html, ~s(href="/dashboard/flow/governance"))
+          assert String.contains?(html, ~s(href="/dashboard/flow/policies"))
         end
 
         test "renders grouped projection health instead of raw metric names" do

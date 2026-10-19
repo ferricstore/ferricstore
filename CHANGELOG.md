@@ -4,6 +4,18 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Redesign the dashboard shell. The sidebar has 18 destinations in
+  always-open sections instead of about 30 links in collapsible groups; lower-use
+  pages are tabs of their destination. Every page shares one header with its
+  section, title, purpose, instance and live status. A single palette, Geist
+  type, sentence-case labels and calmer tables, buttons and links replace the
+  older mixed styles.
+- Redesign the dashboard overview: what needs attention (or one Healthy line),
+  four headline cards with live commands per second, workflow states as one bar
+  with the busiest types, shards as a grid, and small storage, keydir, client
+  and slow-command cards. The live overview payload no longer has a `top_bar`
+  component.
+
 ## 0.12.6 - 2026-10-19
 
 - Start when a Flow's LMDB row points at a segment-projection frame a rewrite

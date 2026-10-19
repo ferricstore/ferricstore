@@ -15,7 +15,7 @@ defmodule FerricstoreServer.Health.Dashboard.ManagementThirdReviewTest do
   test "static snapshot belongs to the header without JavaScript layout repair" do
     layout = FerricstoreServer.Health.Dashboard.Layout
     refute layout.sidebar_html("flow_schedules", %{}) =~ ~s(data-dashboard-snapshot)
-    header = layout.render_subpage_header("Schedules")
+    header = layout.render_page_header("flow_schedules")
     assert header =~ ~s(data-dashboard-snapshot)
     assert header =~ ~s(<a href="" class="flow-search-button" data-dashboard-refresh)
   end

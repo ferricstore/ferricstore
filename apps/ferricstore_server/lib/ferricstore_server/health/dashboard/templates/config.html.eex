@@ -4,9 +4,8 @@
 <div class="layout">
 <%= render_sidebar_static("config") %>
 <main class="main-content" id="dashboard-main" tabindex="-1">
-<%= render_subpage_header("Config") %>
+<%= render_page_header("config", intro: "Inspect runtime configuration commands, current namespace overrides, and tunable server parameters.") %>
 <div class="content">
-<%= render_page_intro("Config", "Inspect runtime configuration commands, current namespace overrides, and tunable server parameters.") %>
 <%= render_config_parameters(Map.get(data, :config_parameters, runtime_config_parameter_reference())) %>
 <%= render_config_table(data.namespace_config) %>
 <details class="flow-section-disclosure">

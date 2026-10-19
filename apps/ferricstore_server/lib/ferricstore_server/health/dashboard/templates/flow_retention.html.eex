@@ -4,10 +4,9 @@
   <div class="layout">
     <%= render_sidebar_static("flow_retention") %>
     <main class="main-content" id="dashboard-main" tabindex="-1">
-      <%= render_subpage_header("FerricFlow Retention") %>
+      <%= render_page_header("flow_retention", intro: "Preview and run guarded active-runtime enforcement and terminal workflow cleanup so stuck work and retained data do not grow forever.") %>
       <div class="content">
-        <%= render_page_intro("FerricFlow Retention", "Preview and run guarded active-runtime enforcement and terminal workflow cleanup so stuck work and retained data do not grow forever.") %>
-        <%= render_flow_context_tools(data, "flow_retention") %>
+                <%= render_flow_context_tools(data, "flow_retention") %>
         <%= render_flow_retention_summary(data) %>
         <%= render_flow_retention_controls(data) %>
         <%= render_flow_retention_candidates(data) %>

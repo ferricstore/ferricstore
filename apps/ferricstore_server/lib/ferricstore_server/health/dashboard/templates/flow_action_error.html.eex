@@ -4,7 +4,7 @@
 <div class="layout">
 <%= render_sidebar_static("flow_detail") %>
 <main class="main-content" id="dashboard-main" tabindex="-1">
-<%= render_subpage_header("Workflow Action") %>
+<%= render_page_header("flow_detail", title: "Workflow action") %>
 <div class="content">
   <div class="flow-alert flow-alert-error" role="alert" id="flow-action-error"><%= escape(data.error) %></div>
   <p class="page-intro">Draft retained for <strong class="mono"><%= escape(data.id) %></strong>. <a href="<%= escape_attr(data.review_url) %>">Review workflow</a></p>

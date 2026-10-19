@@ -4,9 +4,8 @@
 <div class="layout">
 <%= render_sidebar_static("flow_failures") %>
 <main class="main-content" id="dashboard-main" tabindex="-1">
-<%= render_subpage_header("Flow Failures") %>
+<%= render_page_header("flow_failures", intro: "Review failed or stuck workflows and run guarded recovery actions when operators intentionally reclaim work.") %>
 <div class="content">
-<%= render_page_intro("Flow Failures", "Review failed or stuck workflows and run guarded recovery actions when operators intentionally reclaim work.") %>
 <%= render_flow_context_tools(data, "flow_failures") %>
 <%= render_flow_failures_flash(data) %>
 <section class="flow-failure-triage" aria-label="Failure triage">

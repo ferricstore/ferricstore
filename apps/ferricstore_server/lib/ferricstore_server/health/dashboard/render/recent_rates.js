@@ -43,6 +43,18 @@
     row.appendChild(td);
   }
 
+  // Commands per second for each measured interval, scaled into a 120 x 32 box.
+  function spark(line, samples) {
+    if (!line) return;
+    var values = [];
+    for (var i = 1; i < samples.length; i++) values.push(rates(samples[i - 1], samples[i]).commands);
+    if (values.length < 2) { line.setAttribute('points', ''); return; }
+    var max = Math.max.apply(null, values.concat([1]));
+    line.setAttribute('points', values.map(function (value, index) {
+      return (index / (values.length - 1) * 120).toFixed(1) + ',' + (30 - value / max * 28).toFixed(1);
+    }).join(' '));
+  }
+
   function update() {
     var root = document.querySelector('[data-dashboard-recent-rates]');
     if (!root) { state = null; return; }
@@ -53,13 +65,15 @@
     if (!last || last.at !== sample.at || last.run !== sample.run) state = reduce(state, sample);
     var ready = state && state.status === 'ready';
     root.querySelector('[data-recent-status]').textContent = ready ?
-      'Observed ' + (state.elapsedMs / 1000).toFixed(1) + ' seconds of the last 60 seconds in this tab. Gaps over 15 seconds reset the window.' :
+      'Measured over the last ' + (state.elapsedMs / 1000).toFixed(0) + ' s in this tab.' :
       state && state.status === 'unavailable' ? 'Recent rates unavailable. Waiting for valid counters.' :
       'Waiting for a second sample. Recent window: up to 60 seconds in this tab.';
     root.querySelectorAll('[data-recent-rate]').forEach(function (node) {
-      node.textContent = ready ? state.rates[node.dataset.recentRate].toFixed(1) : 'Pending';
+      var key = node.dataset.recentRate;
+      node.textContent = ready ? state.rates[key].toFixed(1) : (key === 'commands' ? 'Pending' : '\u2013');
       node.classList.toggle('c-muted', !ready);
     });
+    spark(root.querySelector('[data-recent-spark] polyline'), ready ? state.samples : []);
     var body = root.querySelector('[data-recent-history]');
     if (!ready) return;
     var fragment = document.createDocumentFragment();

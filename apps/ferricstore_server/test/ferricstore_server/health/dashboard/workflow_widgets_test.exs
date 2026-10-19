@@ -230,9 +230,9 @@ defmodule FerricstoreServer.Health.Dashboard.WorkflowWidgetsTest do
     end
 
     test "the subpage shell retains product and connection identity" do
-      html = Layout.render_subpage_header("Workflow runs")
-      assert html =~ "FerricStore"
-      assert html =~ "Workflow runs"
+      html = Layout.render_page_header("flow_states")
+      assert Layout.render_sidebar_static("flow_states") =~ "FerricStore"
+      assert html =~ ~s(<h1 class="page-title">Runs</h1>)
       assert html =~ "data-dashboard-instance"
       assert Layout.dashboard_live_script() =~ "window.location.host"
     end

@@ -36,18 +36,17 @@ defmodule FerricstoreServer.Health.Dashboard.Format do
 
   def hit_rate_color(ratio) do
     cond do
-      ratio >= 90.0 -> "#3fb950"
-      ratio >= 70.0 -> "#d29922"
-      true -> "#f85149"
+      ratio >= 90.0 -> "var(--ok)"
+      ratio >= 70.0 -> "var(--warn)"
+      true -> "var(--danger)"
     end
   end
 
   def mem_bar_color(pct) do
     cond do
-      pct >= 95.0 -> "#f85149"
-      pct >= 85.0 -> "#da3633"
-      pct >= 70.0 -> "#d29922"
-      true -> "#3fb950"
+      pct >= 85.0 -> "var(--danger)"
+      pct >= 70.0 -> "var(--warn)"
+      true -> "var(--ok)"
     end
   end
 
@@ -104,6 +103,17 @@ defmodule FerricstoreServer.Health.Dashboard.Format do
   end
 
   def format_number(n), do: Integer.to_string(n)
+
+  # Exact count with thousands separators, for headline numbers.
+  def format_grouped(n) when is_integer(n) do
+    n
+    |> Integer.to_string()
+    |> String.reverse()
+    |> String.replace(~r/(\d{3})(?=\d)/, "\\1,")
+    |> String.reverse()
+  end
+
+  def format_grouped(_n), do: "-"
 
   def format_timestamp_us(timestamp_us) do
     timestamp_us

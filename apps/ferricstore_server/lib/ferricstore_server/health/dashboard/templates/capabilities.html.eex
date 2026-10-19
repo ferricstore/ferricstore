@@ -4,9 +4,8 @@
 <div class="layout">
 <%= render_sidebar_static("capabilities") %>
 <main class="main-content" id="dashboard-main" tabindex="-1">
-<%= render_subpage_header("Capabilities") %>
+<%= render_page_header("capabilities", intro: "Read-only capability flags and stable management command shapes exposed by this server.") %>
 <div class="content">
-<%= render_page_intro("Management Capabilities", "Read-only capability flags and stable management command shapes exposed by this server.") %>
 <%= render_management_capabilities(data) %>
 </div>
 </main>

@@ -30,7 +30,6 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
     %{
       generated_at_ms: Map.get(data, :generated_at_ms, System.system_time(:millisecond)),
       components: %{
-        "top_bar" => render_top_bar(data),
         "sidebar" => render_sidebar(data, "overview"),
         "content" => render_overview_content(data),
         "footer" => render_footer(data)
@@ -551,18 +550,6 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
 
   defp live_component_payload(components) do
     {:ok, %{generated_at_ms: System.system_time(:millisecond), components: components}}
-  end
-
-  defp render_overview_content(data) do
-    """
-    #{render_operator_attention(data)}
-    #{FerricstoreServer.Health.Dashboard.Render.RecentRates.render(data)}
-    #{render_cache_performance(data.hotcold)}
-    #{render_lifecycle(data.lifecycle)}
-    #{render_shards(data.shards)}
-    #{render_memory_alert(data.memory)}
-    #{render_connections(data.connections)}
-    """
   end
 
   defp render_flow_live_components(data) do

@@ -341,7 +341,8 @@ defmodule FerricstoreServer.Spec.HttpEndpointsTest do
       {:ok, decoded} = Jason.decode(extract_body(response))
       assert is_integer(decoded["generated_at_ms"])
       assert is_map(decoded["components"])
-      assert is_binary(decoded["components"]["top_bar"])
+      refute Map.has_key?(decoded["components"], "top_bar")
+      assert is_binary(decoded["components"]["sidebar"])
       assert is_binary(decoded["components"]["content"])
       assert is_binary(decoded["components"]["footer"])
     end
