@@ -123,6 +123,13 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .dashboard-table-value { display: block; width: 36ch; max-width: 36ch; white-space: normal; }
       .dashboard-table-value > summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
       .dashboard-table-value-full { margin-top: 8px; max-height: 240px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+      .kv-query-row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
+      .kv-query-row .kv-query-input { flex: 1 1 220px; }
+      .kv-query-row .kv-query-limit { display: flex; flex-direction: column; gap: 4px; color: var(--text-muted); font-size: 0.75rem; }
+      .kv-query-row > button { flex: none; }
+      .kv-search-foot { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 16px; }
+      .kv-empty { margin-top: 4px; padding: 16px 18px; border: 1px dashed var(--line-strong); border-radius: 12px; color: var(--text-muted); font-size: 0.875rem; }
+      .kv-empty .section-title { margin: 0 0 6px; }
       .kv-command-purpose { color: var(--text-muted); font-size: 0.78rem; margin-bottom: 10px; }
 
 

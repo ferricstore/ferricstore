@@ -56,34 +56,40 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
         <fieldset class="kv-query-mode">
         <legend>Inspect an exact key</legend>
         <input type="hidden" name="mode" value="exact">
-        <label>Exact key
-          <input class="flow-search-input mono" type="search" name="key" value="#{escape_attr(key)}" placeholder="user:123" required>
-        </label>
+        <div class="kv-query-row">
+          <label class="kv-query-input"><span class="sr-only">Exact key</span>
+            <input class="flow-search-input mono" type="search" name="key" value="#{escape_attr(key)}" placeholder="user:123" required>
+          </label>
+          <button class="flow-search-button" type="submit">Inspect key</button>
+        </div>
         <label class="flow-check-label" title="Include compound metadata for readable logical keys. Protected workflow and server records remain hidden.">
           <input type="checkbox" name="include_internal" value="true"#{checked}><span>Compound metadata</span>
         </label>
-        <button class="flow-search-button" type="submit">Inspect key</button>
         </fieldset>
       </form>
       <form class="flow-filter-form" action="/dashboard/keyspace" method="get" aria-label="Prefix sample">
         <fieldset class="kv-query-mode">
         <legend>Sample by prefix</legend>
         <input type="hidden" name="mode" value="prefix">
-        <label>Prefix
-          <input class="flow-search-input mono" type="search" name="prefix" value="#{escape_attr(prefix)}" placeholder="tenant:">
-        </label>
-        <label>Limit
-          <input class="flow-search-input flow-filter-limit" type="number" min="1" max="#{@keyspace_dashboard_max_limit}" name="limit" value="#{limit}">
-        </label>
+        <div class="kv-query-row">
+          <label class="kv-query-input"><span class="sr-only">Prefix</span>
+            <input class="flow-search-input mono" type="search" name="prefix" value="#{escape_attr(prefix)}" placeholder="tenant:">
+          </label>
+          <label class="kv-query-limit"><span>Limit</span>
+            <input class="flow-search-input flow-filter-limit" type="number" min="1" max="#{@keyspace_dashboard_max_limit}" name="limit" value="#{limit}">
+          </label>
+          <button class="flow-search-button" type="submit">Sample keys</button>
+        </div>
         <label class="flow-check-label" title="Include compound metadata for readable logical keys. Protected workflow and server records remain hidden.">
           <input type="checkbox" name="include_internal" value="true"#{checked}><span>Compound metadata</span>
         </label>
-        <button class="flow-search-button" type="submit">Sample keys</button>
         </fieldset>
       </form>
       </div>
-      <a class="flow-filter-clear" href="/dashboard/keyspace">Clear both searches</a>
-      <div class="flow-filter-note">Requires +SCAN for samples. Exact key inspection requires +GET and key read access.</div>
+      <div class="kv-search-foot">
+        <a class="flow-filter-clear" href="/dashboard/keyspace">Clear both searches</a>
+        <span class="flow-filter-note">Requires +SCAN for samples. Exact key inspection requires +GET and key read access.</span>
+      </div>
     </div>
     """
   end
@@ -118,16 +124,21 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
     """
   end
 
+  def render_keyspace_table(%{searched?: false}) do
+    """
+    <div class="kv-empty">
+      <h2 class="section-title">Key metadata</h2>
+      <p>Enter an exact key or prefix above. Leave the prefix empty only when you want a bounded sample of any keys.</p>
+    </div>
+    """
+  end
+
   def render_keyspace_table(data) do
     rows = Map.get(data, :rows, [])
-    searched? = Map.get(data, :searched?, true)
 
     body =
-      case {searched?, rows} do
-        {false, _rows} ->
-          ~s(<tr><td colspan="8" class="c-muted">Enter an exact key or prefix to inspect key metadata. Submit an empty search only when you intentionally want a bounded sample.</td></tr>)
-
-        {true, []} ->
+      case rows do
+        [] ->
           message =
             cond do
               Map.get(data, :collection_status) in [:partial, :unavailable] ->
@@ -142,7 +153,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
 
           ~s(<tr><td colspan="8" class="c-muted">#{message}</td></tr>)
 
-        {true, _rows} ->
+        _rows ->
           Enum.map_join(rows, "\n", fn row ->
             internal =
               if Map.get(row, :internal?, false) do
@@ -166,19 +177,18 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
           end)
       end
 
-    badge =
-      if searched?, do: "#{format_number(length(rows))} keys returned", else: "awaiting query"
+    badge = "#{format_number(length(rows))} keys returned"
 
     limited = if Map.get(data, :scan_limited?, false), do: " · scan budget reached", else: ""
 
     scanned =
       case Map.get(data, :scanned_count) do
-        count when is_integer(count) and searched? -> "#{format_number(count)} entries scanned. "
+        count when is_integer(count) -> "#{format_number(count)} entries scanned. "
         _ -> ""
       end
 
     exclusions =
-      if searched? and not get_in(data, [:filters, :include_internal]),
+      if not get_in(data, [:filters, :include_internal]),
         do:
           "Compound metadata is excluded; enable Compound metadata to include it. Protected workflow and server records remain hidden.",
         else: ""
