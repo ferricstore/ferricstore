@@ -145,6 +145,41 @@ defmodule Ferricstore.EmbeddedExtendedHashTest do
     end
   end
 
+  describe "hincrby/3 and hincrbyfloat/3 key types" do
+    test "a new key becomes a hash" do
+      assert {:ok, 1} = FerricStore.hincrby("hi-type:new", "count", 1)
+      assert {:ok, "1.5"} = FerricStore.hincrbyfloat("hi-type:newf", "val", 1.5)
+
+      assert {:ok, "hash"} = FerricStore.type("hi-type:new")
+      assert {:ok, "hash"} = FerricStore.type("hi-type:newf")
+      assert FerricStore.exists("hi-type:new")
+    end
+
+    test "a key of another type is rejected without writing a field" do
+      wrongtype = {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+      assert :ok = FerricStore.set("hi-type:string", "v")
+      assert {:ok, 1} = FerricStore.sadd("hi-type:set", ["m"])
+
+      assert wrongtype == FerricStore.hincrby("hi-type:string", "count", 1)
+      assert wrongtype == FerricStore.hincrbyfloat("hi-type:string", "val", 1.5)
+      assert wrongtype == FerricStore.hincrby("hi-type:set", "count", 1)
+
+      assert {:ok, "v"} = FerricStore.get("hi-type:string")
+      assert {:ok, "string"} = FerricStore.type("hi-type:string")
+
+      FerricStore.del("hi-type:string")
+      assert :ok = FerricStore.hset("hi-type:string", %{"other" => "x"})
+      assert {:ok, %{"other" => "x"}} == FerricStore.hgetall("hi-type:string")
+    end
+
+    test "a rejected increment on a new key leaves no hash behind" do
+      assert {:error, "ERR increment or decrement would overflow"} =
+               FerricStore.hincrby("hi-type:overflow", "count", 9_223_372_036_854_775_808)
+
+      assert {:ok, "none"} = FerricStore.type("hi-type:overflow")
+    end
+  end
+
   describe "hsetnx/3" do
     test "sets field when it does not exist" do
       FerricStore.hset("hsn:key", %{"a" => "1"})

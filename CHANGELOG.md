@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Check the key's type in `FerricStore.hincrby/3` and
+  `FerricStore.hincrbyfloat/3`. They wrote the field without recording or
+  checking the type: on a new key TYPE answered "none" and EXISTS false while
+  HGETALL returned the field, and on a string or set key they hid a field
+  that a later hash on the key brought back after DEL. They now answer
+  WRONGTYPE for another type and make a new key a hash, as HINCRBY and
+  HINCRBYFLOAT do.
 - Answer WRONGTYPE for PFADD on a hash, set, sorted set or list key instead
   of crashing the shard. The write's type check ran in the state machine with
   a store it could not use there and raised, so the shard's storage process
