@@ -48,6 +48,27 @@ defmodule FerricstoreServer.Health.Dashboard.PoliciesRedesignTest do
     assert FlowPolicy.render_flow_policy_summary([]) == ""
   end
 
+  test "types with different state overrides do not share one policy" do
+    override = %{state: "review", mode: :fifo, retry: %{max_retries: 1}, retention: %{}}
+
+    html =
+      FlowPolicy.render_flow_policy_summary([policy("a"), policy("b", states: [override])])
+
+    assert html =~ "<strong>2 types, 2 different policies</strong>"
+  end
+
+  test "types whose policy failed to load are counted apart" do
+    failed = %{type: "c", source: "configured", error: "timeout"}
+    html = FlowPolicy.render_flow_policy_summary([policy("a"), policy("b"), failed])
+
+    assert html =~ "<strong>2 types share one policy</strong>"
+    assert html =~ "1 type could not be loaded"
+
+    none = FlowPolicy.render_flow_policy_summary([failed])
+    assert none =~ "policies-status is-warning"
+    assert none =~ "<strong>Policies unavailable</strong>"
+  end
+
   test "the actions column fits its button instead of the schedule column width" do
     css = Styles.stylesheet()
 

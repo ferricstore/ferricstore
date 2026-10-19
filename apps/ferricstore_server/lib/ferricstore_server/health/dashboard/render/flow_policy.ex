@@ -399,27 +399,58 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
   def render_flow_policy_summary([]), do: ""
 
   def render_flow_policy_summary(policies) do
-    shapes = policies |> Enum.reject(&is_binary(Map.get(&1, :error))) |> Enum.map(&policy_shape/1)
-    types = length(policies)
+    {failed, loaded} = Enum.split_with(policies, &is_binary(Map.get(&1, :error)))
+    types = length(loaded)
 
-    case Enum.uniq(shapes) do
-      [{retries, backoff, exhausted, max_active, retention}] ->
+    unavailable =
+      case length(failed) do
+        0 -> []
+        1 -> ["1 type could not be loaded"]
+        n -> ["#{format_number(n)} types could not be loaded"]
+      end
+
+    case Enum.uniq_by(loaded, &policy_fingerprint/1) do
+      [] ->
+        PageStatus.render("policies", :warning, "Policies unavailable", unavailable)
+
+      [only] ->
+        {retries, backoff, exhausted, max_active, retention} = policy_shape(only)
+
         title =
           if types == 1, do: "1 type", else: "#{format_number(types)} types share one policy"
 
-        PageStatus.render("policies", :idle, title, [
-          "#{retries} retries, #{backoff}, then #{exhausted}",
-          "max active #{max_active}",
-          "retention #{retention}"
-        ])
+        PageStatus.render(
+          "policies",
+          :idle,
+          title,
+          [
+            "#{retries} retries, #{backoff}, then #{exhausted}",
+            "max active #{max_active}",
+            "retention #{retention}"
+          ] ++ unavailable
+        )
 
       distinct ->
         PageStatus.render(
           "policies",
           :idle,
-          "#{format_number(types)} #{if types == 1, do: "type", else: "types"}, #{length(distinct)} different #{if length(distinct) == 1, do: "policy", else: "policies"}"
+          "#{format_number(types)} #{if types == 1, do: "type", else: "types"}, #{length(distinct)} different #{if length(distinct) == 1, do: "policy", else: "policies"}",
+          unavailable
         )
     end
+  end
+
+  # Two types share a policy only when their defaults and every state override match.
+  defp policy_fingerprint(row) do
+    states =
+      row
+      |> Map.get(:states, [])
+      |> Enum.map(
+        &{Map.get(&1, :state), Map.get(&1, :mode), Map.get(&1, :retry), Map.get(&1, :retention)}
+      )
+      |> Enum.sort()
+
+    {policy_shape(row), states}
   end
 
   defp policy_shape(row) do
