@@ -8,20 +8,21 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Lineage do
   def render_flow_lineage_hints([]), do: ""
 
   def render_flow_lineage_hints(hints) do
-    links =
-      Enum.map_join(hints, " ", fn hint ->
-        params = [
-          {"id", hint.id},
-          {"mode", hint.mode},
-          {"partition_key", hint.partition_key}
-        ]
+    ~s(<details class="dashboard-disclosure flow-lineage-hints"><summary>Recent lineage hints</summary><div class="flow-lineage-hint-links">#{lineage_hint_links(hints)}</div></details>)
+  end
 
-        href = "/dashboard/flow/lineage?" <> URI.encode_query(params)
+  defp lineage_hint_links(hints) do
+    Enum.map_join(hints, " ", fn hint ->
+      params = [
+        {"id", hint.id},
+        {"mode", hint.mode},
+        {"partition_key", hint.partition_key}
+      ]
 
-        ~s(<a class="flow-pill flow-link" href="#{escape_attr(href)}">#{escape(hint.partition_key)} · #{escape(hint.label)} #{escape(hint.id)}</a>)
-      end)
+      href = "/dashboard/flow/lineage?" <> URI.encode_query(params)
 
-    ~s(<details class="dashboard-disclosure flow-lineage-hints"><summary>Recent lineage hints</summary><div class="flow-lineage-hint-links">#{links}</div></details>)
+      ~s(<a class="flow-pill flow-link" href="#{escape_attr(href)}">#{escape(hint.partition_key)} · #{escape(hint.label)} #{escape(hint.id)}</a>)
+    end)
   end
 
   def flow_lineage_result_label(%{status: :idle, message: message}), do: message
@@ -51,8 +52,20 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Lineage do
     empty <> quality
   end
 
-  def render_flow_lineage_status(%{result: %{status: :idle}, filters: filters}) do
-    render_flow_lineage_nodes([], filters)
+  def render_flow_lineage_status(%{result: %{status: :idle}, filters: filters} = data) do
+    hints = Map.get(data, :hints, [])
+
+    if Map.get(filters, :target) in [nil, ""] do
+      starts =
+        if hints == [],
+          do: "",
+          else:
+            ~s(<p>Or start from a recent run:</p><div class="flow-lineage-hint-links">#{lineage_hint_links(hints)}</div>)
+
+      ~s(<div class="section-empty"><p>Choose parent, root, or correlation and enter an id.</p>#{starts}</div>)
+    else
+      render_flow_lineage_nodes([], filters)
+    end
   end
 
   def render_flow_lineage_status(%{result: result, filters: filters}) do

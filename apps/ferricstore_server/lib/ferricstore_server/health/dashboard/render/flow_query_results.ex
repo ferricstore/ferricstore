@@ -47,7 +47,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryResults do
     do: ~s(<div class="flow-alert flow-alert-ok">#{escape(message)}</div>)
 
   def render_flow_query_status(%{status: :idle, message: message}),
-    do: ~s(<div class="flow-section-note">#{escape(message)}</div>)
+    do: ~s(<p class="section-empty">#{escape(message)}</p>)
 
   def render_flow_query_status(%{status: _status, message: message}),
     do: ~s(<div class="flow-alert flow-alert-error">#{escape(message)}</div>)

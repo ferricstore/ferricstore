@@ -27,6 +27,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Signals do
       ) do
     rows =
       case signals do
+        [] when mode == :page ->
+          ""
+
         [] ->
           colspan = if mode == :detail, do: 6, else: 8
 
@@ -67,10 +70,37 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Signals do
 
     label = if mode == :detail, do: "Workflow signal history", else: "Workflow signals"
 
+    body =
+      if mode == :page and signals == [],
+        do: render_flow_signals_empty(filters, filtered_sampled),
+        else: accessible_table(label, table)
+
     """
     <h2 class="section-title">#{title}</h2>
-    #{accessible_table(label, table)}
+    #{body}
     """
+  end
+
+  # Reading signals means reading each sampled run's history, so the scan stays
+  # opt-in; the prompt makes it one click and keeps the current filters.
+  defp render_flow_signals_empty(filters, candidates) do
+    if Map.get(filters, :scan_history, false) do
+      ~s(<p class="section-empty">No signal events in the scanned histories.</p>)
+    else
+      query =
+        filters
+        |> Map.put(:scan_history, true)
+        |> FerricstoreServer.Health.Dashboard.Render.FlowQueryControls.flow_signals_filter_query()
+
+      count = if is_integer(candidates), do: format_grouped(candidates) <> " ", else: ""
+
+      """
+      <div class="section-empty">
+        <p>Signals are read from run histories, one read per run, so scans are opt-in.</p>
+        <a class="flow-search-button" href="/dashboard/flow/signals?#{escape_attr(query)}">Scan #{count}run histories</a>
+      </div>
+      """
+    end
   end
 
   def render_flow_signal_row(row, :detail) do

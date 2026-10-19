@@ -53,7 +53,7 @@ defmodule FerricstoreServer.Health.Dashboard.QueryTriageThirdReviewTest do
     assert html =~ ">Guided draft</button>"
     assert html =~ ">Raw FQL draft</button>"
     assert html =~ "Independent drafts"
-    assert html =~ "Switching drafts does not transfer changes"
+    assert html =~ "switching does not carry changes over"
   end
 
   test "expired lease hint states evidence without prescribing reclaim" do

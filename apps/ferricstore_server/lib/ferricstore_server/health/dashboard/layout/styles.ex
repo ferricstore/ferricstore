@@ -270,6 +270,9 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .worker-lease-bar { display: block; height: 6px; border-radius: 999px; background: var(--accent); overflow: hidden; }
       .worker-lease-bar .is-expired { display: block; height: 100%; background: var(--warn); }
       .flow-local-scope { margin-bottom: 20px; }
+      .section-empty p + p, .section-empty p + .flow-lineage-hint-links, .section-empty p + a { margin-top: 10px; }
+      .flow-query-toolbar .flow-section-note { margin: 0; }
+      .flow-query-console .flow-query-help { flex-direction: column; gap: 4px; }
       .section-empty { margin: 4px 0 24px; padding: 16px 18px; border: 1px dashed var(--line-strong); border-radius: 12px; color: var(--text-muted); font-size: 0.875rem; }
       .flow-due-cell .flow-due-when { display: block; color: var(--text-strong); }
       .flow-state-due { display: block; margin-top: 2px; color: var(--text-muted); font-size: 0.75rem; }
