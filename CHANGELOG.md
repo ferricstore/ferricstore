@@ -28,6 +28,9 @@ All notable changes to FerricStore will be documented here.
   UTF-8 with a `binary_reply` error for that command. JSON encoding raised
   instead, so the client got HTTP 500 for a batch that had already run,
   inviting a retry of every command in it, and the bytes were logged.
+- Store an HTTP invocation target's response that is neither JSON nor UTF-8
+  as `{"status": ..., "bytes_base64": ...}`. It was stored as raw bytes, and
+  reading that invocation or its result then failed with HTTP 500.
 
 - Redesign the dashboard shell. The sidebar has 18 destinations in
   always-open sections instead of about 30 links in collapsible groups; lower-use

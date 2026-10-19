@@ -128,6 +128,9 @@ the created invocation id and initial state. An idempotency key may be supplied 
 /v1/invocations/:id/result` returns HTTP `202` while the record is pending and HTTP `200` after it
 reaches a terminal state.
 
+An HTTP endpoint target's JSON response becomes the result. A response that is not JSON is kept as
+a string when it is UTF-8 text, and otherwise as `{"status": <HTTP status>, "bytes_base64": "..."}`.
+
 Invocation-scoped values use these routes:
 
 | Endpoint | Purpose |
