@@ -4,20 +4,35 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.6 - 2026-10-19
+
+- Start when a Flow's LMDB row points at a segment-projection frame a rewrite
+  has since repacked. 0.12.4 let startup go on when such an owner read back as
+  `:query_storage_inconsistent` (its old frame now holds another key); the old
+  offset can also land inside a frame or past its end, which read as
+  `:query_storage_unavailable` and still refused to start. A graceful restart
+  of the Inspeactor data could do this. Since 0.12.5 a Flow whose record sits
+  on the projection stays in the keydir, so an owner missing from it whose row
+  names a projection frame has lost its record whatever its read fails with:
+  its cleanup members are kept but not registered. Rows pointing anywhere else
+  still fail closed, and the startup error now names the owner.
 - Finish the Flow policy catalog backfill when a registered Flow has lost its
   state record. The backfill read "registry present, state in neither the
   keydir nor LMDB" as a projection still on its way and retried it every minute
   for good, so a shard holding such a Flow never finished; it now flushes the
   shard's LMDB writer, reads again, and skips the Flow, counting it in
   `[:ferricstore, :flow, :policy_migration, :orphaned_states]` and in one warning
-  per finished run.
+  per finished run. A Flow missing from the keydir whose LMDB row names a
+  segment-projection frame that no longer reads back counts as having lost its
+  record too.
 - Remove the policy backfill staging of earlier runs when a new run starts. A run
   that never finished kept its staged copy of the keydir in LMDB, and each new run
   staged another.
 - `FerricStore.flow_purge_orphans/1` lists Flows whose state record is gone and,
   with `dry_run: false`, removes what they left (registry marker, retention guard,
-  catalog entry, values, history, query index rows), releasing their shared value
-  references. Retention starts from the state record, so it never reached them.
+  catalog entry, values, history, query index rows, and retention cleanup members
+  startup left unregistered), releasing their shared value references. Retention
+  starts from the state record, so it never reached them.
   Purging needs cluster feature level 3 (new; raise it with
   `CLUSTER.FEATURES.RAISE 3` once every node runs this release).
 
