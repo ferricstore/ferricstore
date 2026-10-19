@@ -740,6 +740,26 @@ defmodule FerricStore.API.Flow do
 
   def flow_retention_cleanup(_opts), do: {:error, "ERR flow opts must be a keyword list"}
 
+  @doc """
+  Finds Flows whose state record is gone while their registry marker stays,
+  and with `dry_run: false` removes what they left behind.
+
+  Retention starts from a Flow's state record, so a Flow that lost it keeps its
+  registry marker, retention guard, type catalog entry and values for good.
+  Such a Flow cannot be read back. The default dry run only lists them
+  (`:orphans`, with the keys each one left). Purging needs cluster feature level
+  3 (`raise_cluster_feature_level/1`), goes through Raft, and checks each Flow
+  again on apply: one whose retention guard changed since it was found is left
+  (`:skipped`). Pass `shards: [index]` to limit the pass.
+  """
+  @spec flow_purge_orphans(keyword()) :: {:ok, map()} | {:error, term()}
+  def flow_purge_orphans(opts \\ [])
+
+  def flow_purge_orphans(opts) when is_list(opts),
+    do: Ferricstore.Flow.OrphanPurge.purge(default_ctx(), opts)
+
+  def flow_purge_orphans(_opts), do: {:error, "ERR flow opts must be a keyword list"}
+
   @doc "Rewinds a Flow record to a previous history event without rewriting history."
   @spec flow_rewind(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_rewind(id, opts) when is_binary(id) and is_list(opts) do

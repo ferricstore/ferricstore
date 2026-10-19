@@ -814,6 +814,33 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
                     %{shard_index: 0, owner_state_key: ^state_key, member_key: ^member_key}}
   end
 
+  # A Flow whose record sits on the segment projection stays in the keydir, so
+  # an LMDB-only row naming a projection frame was left by an earlier rewrite,
+  # which renumbers and repacks that log: the old frame may now hold another key,
+  # part of one, or nothing. Startup goes on however the read fails.
+  test "final native rebuild keeps but does not register members of an owner on a rewritten projection",
+       test_ctx do
+    owned_ref = Keys.value_key("rewritten-owner", :result, 1, "tenant")
+    rec = record("rewritten-owner", result_ref: owned_ref)
+    state_key = insert_lmdb_record!(test_ctx, rec)
+    append_primary!(test_ctx, [{owned_ref, Flow.encode_value("result")}])
+    assert :ok = run!(test_ctx)
+
+    insert_stale_projection_lmdb_record!(test_ctx, rec)
+    NativeOrderedIndex.reset(test_ctx.flow_index, test_ctx.flow_lookup)
+
+    assert :ok = run!(test_ctx)
+
+    member_key = Keys.retention_cleanup_member_key(rec.id, owned_ref, rec.partition_key)
+    index_key = Keys.retention_cleanup_index_key(rec.id, rec.partition_key)
+    native = NativeOrderedIndex.get(test_ctx.flow_index, test_ctx.flow_lookup)
+
+    assert :ets.member(test_ctx.keydir, member_key)
+    assert :ets.member(test_ctx.keydir, owned_ref)
+    assert 0 == NativeOrderedIndex.count_all(native, index_key)
+    assert {:ok, _query_row} = LMDB.get(LMDB.path(test_ctx.shard_path), state_key)
+  end
+
   test "final native rebuild rejects forged cleanup member ownership for a live owner",
        test_ctx do
     rec = record("member-owner")
@@ -1271,6 +1298,64 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
         checksum: :crypto.hash(:sha256, encoded),
         expire_at_ms: 0,
         segment_generation: segment_generation,
+        frame_size: frame_size
+      )
+
+    assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, locator, 0)
+    assert :ok = LMDB.write_batch(LMDB.path(test_ctx.shard_path), [{:put, state_key, query_row}])
+    state_key
+  end
+
+  # The row names a projection frame by number but points into the middle of
+  # it, as a rewrite that repacked the log leaves it.
+  defp insert_stale_projection_lmdb_record!(test_ctx, record) do
+    state_key = Keys.state_key(record.id, record.partition_key)
+    encoded = Flow.encode_record(record)
+    other_key = Keys.state_key(record.id <> "-other", record.partition_key)
+
+    projection_root =
+      Path.join([
+        test_ctx.data_dir,
+        "waraft",
+        "ferricstore_waraft_backend.#{test_ctx.shard_index + 1}",
+        "segment_projection_log"
+      ])
+
+    assert :ok =
+             :ferricstore_waraft_spike_segment_log.write_projection(
+               to_charlist(projection_root),
+               {:raft_log_pos, 10, 1},
+               [{other_key, :binary.copy("x", 4_096), 0}]
+             )
+
+    assert {:ok, {index, {ordinal, offset, frame_size}}} =
+             :ferricstore_waraft_spike_segment_log.fold_disk(
+               to_charlist(projection_root),
+               fn
+                 index,
+                 {_term, {:ferricstore_segment_projection_entry, ^other_key, _, _}},
+                 location,
+                 _acc ->
+                   {index, location}
+
+                 _index, _entry, _location, acc ->
+                   acc
+               end,
+               nil
+             )
+
+    locator =
+      Locator.new!(
+        flow_id: record.id,
+        kind: :state,
+        version: record.version,
+        raft_index: index,
+        file_id: {:waraft_projection, index},
+        offset: offset + div(frame_size, 2),
+        value_size: byte_size(encoded),
+        checksum: :crypto.hash(:sha256, encoded),
+        expire_at_ms: 0,
+        segment_generation: ordinal,
         frame_size: frame_size
       )
 

@@ -84,13 +84,13 @@ The TCP acceptor uses the following socket options (hardcoded in `ferricstore_se
 docker run -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
-  quay.io/ferricstore/ferricstore:0.12.5
+  quay.io/ferricstore/ferricstore:0.12.6
 ```
 
 The official image is published publicly to Quay.io:
 
 ```bash
-docker pull quay.io/ferricstore/ferricstore:0.12.5
+docker pull quay.io/ferricstore/ferricstore:0.12.6
 ```
 
 Current release images are published as multi-arch images for `linux/amd64`
@@ -110,7 +110,7 @@ docker run --rm -p 6388:6388 -p 8080:8080 \
   -e FERRICSTORE_HTTP_TLS_KEY_FILE=/run/secrets/ferricstore/http-key.pem \
   -v "$PWD/certs:/run/secrets/ferricstore:ro" \
   -v ferricstore_data:/data \
-  quay.io/ferricstore/ferricstore:0.12.5
+  quay.io/ferricstore/ferricstore:0.12.6
 ```
 
 Create a least-privilege ACL identity before sending requests. Certificate
@@ -127,7 +127,7 @@ docker run -p 6388:6388 \
   --security-opt seccomp=unconfined \
   -e FERRICSTORE_PROTECTED_MODE=true \
   -v /mnt/nvme/ferricstore:/data \
-  quay.io/ferricstore/ferricstore:0.12.5
+  quay.io/ferricstore/ferricstore:0.12.6
 ```
 
 #### Why io_uring Matters
@@ -262,7 +262,7 @@ spec:
     spec:
       containers:
         - name: ferricstore
-           image: quay.io/ferricstore/ferricstore:0.12.5
+           image: quay.io/ferricstore/ferricstore:0.12.6
           ports:
             - name: native
               containerPort: 6388
@@ -497,6 +497,27 @@ What to know:
   new cluster again on empty data directories and rerun it; the export file is
   unchanged and can be restored any number of times.
 
+## Flows Without a State Record
+
+A Flow keeps its state record in memory or, once finished or hibernated, in the
+Flow LMDB mirror. Older releases could lose that record while the Flow's
+registry marker, retention guard, catalog entry and values stayed. Such a Flow
+cannot be read back, and retention, which starts from the state record, never
+removes what it left. The policy catalog backfill skips them and logs how many it
+skipped per shard.
+
+List them, then remove what they left (the purge needs feature level 3 and goes
+through Raft; a Flow whose retention guard changed since it was found is left
+alone):
+
+```bash
+bin/ferricstore rpc 'IO.inspect(FerricStore.flow_purge_orphans(), limit: 5)'
+# {:ok, %{dry_run?: true, orphans: [%{shard_index: 4, state_key: ..., ...}, ...], purged: 0, skipped: 0}}
+
+bin/ferricstore rpc 'IO.inspect(FerricStore.flow_purge_orphans(dry_run: false), limit: 5)'
+# {:ok, %{dry_run?: false, orphans: [...], purged: 982, skipped: 0}}
+```
+
 ## Upgrading a Cluster
 
 Upgrade nodes one at a time (rolling upgrade). New behavior that older releases
@@ -541,6 +562,8 @@ shard_0: 2
     history no longer refers to (without it a schedule's keydir grows with every
     fire and every overlap check), and rewinds refuse events whose values were
     released.
+  - 3: `FerricStore.flow_purge_orphans(dry_run: false)` removes what a Flow left
+    behind once its state record is gone (see "Flows Without a State Record").
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.

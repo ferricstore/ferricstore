@@ -1237,6 +1237,214 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
           keys != []
         end)
       end
+
+      # Feature level 3 (Ferricstore.Cluster.FeatureLevel). A Flow whose state
+      # record is gone from the keydir and LMDB keeps its registry marker,
+      # retention guard, catalog entry and values for good, because retention
+      # starts from the state record; Ferricstore.Flow.OrphanPurge finds them.
+      # Each is cleaned the way retention cleans a record, rebuilt from what the
+      # replicated keys still hold: id and hash tag from the state key, version
+      # and state sequence from the guard, type from the catalog entry's type
+      # descriptor. An entry whose guard changed since it was found is left.
+      defp do_flow_purge_orphans(state, %{orphans: orphans})
+           when is_list(orphans) and length(orphans) <= 64 do
+        if do_get(state, Ferricstore.Cluster.FeatureLevel.key(3)) ==
+             Ferricstore.Cluster.FeatureLevel.marker() do
+          previous_orphans = Process.get(:flow_retention_shared_value_orphans)
+          previous_released = Process.get(:flow_retention_released_shared_refs)
+          previous_counts = Process.get(:flow_retention_shared_value_ref_counts)
+          Process.put(:flow_retention_shared_value_orphans, %{})
+          Process.put(:flow_retention_released_shared_refs, MapSet.new())
+          Process.put(:flow_retention_shared_value_ref_counts, %{})
+
+          try do
+            result =
+              Enum.reduce_while(
+                orphans,
+                {:ok, %{purged: 0, skipped: 0, history: 0, values: 0}},
+                fn entry, {:ok, acc} ->
+                  case flow_purge_orphan(state, entry) do
+                    {:ok, %{flows: 1} = counts} ->
+                      {:cont, {:ok, flow_purge_orphan_counts(acc, :purged, counts)}}
+
+                    {:ok, counts} ->
+                      {:cont, {:ok, flow_purge_orphan_counts(acc, :skipped, counts)}}
+
+                    :skip ->
+                      {:cont, {:ok, %{acc | skipped: acc.skipped + 1}}}
+
+                    {:error, _reason} = error ->
+                      {:halt, error}
+                  end
+                end
+              )
+
+            with {:ok, counts} <- result,
+                 {:ok, deleted_values} <- flow_retention_finalize_shared_value_orphans(state) do
+              {:ok, %{counts | values: counts.values + deleted_values}}
+            end
+          after
+            flow_restore_process_value(:flow_retention_shared_value_orphans, previous_orphans)
+            flow_restore_process_value(:flow_retention_released_shared_refs, previous_released)
+            flow_restore_process_value(:flow_retention_shared_value_ref_counts, previous_counts)
+          end
+        else
+          {:error, "ERR flow orphan purge requires cluster feature level 3"}
+        end
+      end
+
+      defp do_flow_purge_orphans(_state, _request),
+        do: {:error, "ERR invalid flow orphan purge request"}
+
+      defp flow_purge_orphan_counts(acc, outcome, counts) do
+        acc
+        |> Map.update!(outcome, &(&1 + 1))
+        |> Map.update!(:history, &(&1 + Map.get(counts, :history, 0)))
+        |> Map.update!(:values, &(&1 + Map.get(counts, :values, 0)))
+      end
+
+      # A cleanup that ran out of key budget (long history) keeps the registry
+      # marker and guard, so the next purge finds the Flow again and goes on.
+      defp flow_purge_orphan(state, %{state_key: state_key, guard: guard} = entry)
+           when is_binary(state_key) and is_binary(guard) do
+        with {:ok, partition_key, id} <- FlowKeys.flow_tag_from_state_key(state_key),
+             true <- is_binary(do_get(state, FlowKeys.registry_key(id, partition_key))),
+             ^guard <- keydir_spill_get(state, FlowKeys.retention_guard_key(id, partition_key)),
+             {:ok, {version, {:state_enter_seq, sequence}}} <-
+               Ferricstore.TermCodec.decode(guard),
+             {:ok, type} <-
+               flow_purge_orphan_type(state, state_key, Map.get(entry, :catalog_key)),
+             record = %{
+               id: id,
+               partition_key: partition_key,
+               type: type,
+               version: version,
+               state_enter_seq: sequence
+             },
+             {:ok, value_keys, index_keys} <- flow_purge_orphan_leftovers(record, entry),
+             {:ok, members} <- flow_purge_orphan_members(state, record, entry),
+             {:ok, member_values} <- flow_purge_orphan_delete_members(state, record, members),
+             {:ok, plan} <- flow_retention_build_cleanup_plan(state, state_key, record),
+             {:ok, counts} <- flow_retention_cleanup_record(state, state_key, record, plan) do
+          counts = Map.update(counts, :values, member_values, &(&1 + member_values))
+
+          if Map.get(counts, :flows) == 1 do
+            with {:ok, deleted} <- flow_retention_delete_keys(state, value_keys) do
+              with_lmdb_mirror_shard(state, fn ->
+                Enum.each(index_keys, &queue_pending_lmdb_mirror_delete/1)
+              end)
+
+              {:ok, Map.update(counts, :values, deleted, &(&1 + deleted))}
+            end
+          else
+            {:ok, counts}
+          end
+        else
+          {:error, _reason} = error -> error
+          _changed_or_unowned -> :skip
+        end
+      end
+
+      defp flow_purge_orphan(_state, _entry), do: :skip
+
+      defp flow_purge_orphan_type(_state, _state_key, nil), do: {:ok, nil}
+
+      defp flow_purge_orphan_type(state, state_key, catalog_key) when is_binary(catalog_key) do
+        with true <- FlowKeys.type_catalog_member_owns_state_key?(catalog_key, state_key),
+             {:ok, descriptor_key} <-
+               FlowKeys.type_catalog_descriptor_key_from_member(catalog_key),
+             {:ok, %{type: type}} <-
+               Ferricstore.Flow.PolicyMigration.decode_type_descriptor(
+                 do_get(state, descriptor_key)
+               ),
+             ^catalog_key <- FlowKeys.type_catalog_member_key(type, state_key) do
+          {:ok, type}
+        else
+          _unknown_type -> :catalog_type_unknown
+        end
+      end
+
+      defp flow_purge_orphan_type(_state, _state_key, _catalog_key), do: :invalid_catalog_key
+
+      # Retention reaches a Flow's cleanup members through the native index, and
+      # startup leaves those of an unreadable owner out of it; the finder lists
+      # them all. Each must bind this Flow's cleanup index to a key it owns.
+      defp flow_purge_orphan_members(
+             state,
+             %{id: id, partition_key: partition_key} = record,
+             entry
+           ) do
+        index_key = FlowKeys.retention_cleanup_index_key(id, partition_key)
+
+        case Map.get(entry, :member_keys, []) do
+          member_keys when is_list(member_keys) and length(member_keys) <= 1_024 ->
+            member_keys
+            |> Enum.uniq()
+            |> Enum.reduce_while({:ok, []}, fn member_key, {:ok, acc} ->
+              with value when is_binary(value) <- keydir_spill_get(state, member_key),
+                   {:ok, {^index_key, owned_key}} <-
+                     Ferricstore.Flow.RetentionCleanupMember.decode(value),
+                   ^member_key <-
+                     FlowKeys.retention_cleanup_member_key(id, owned_key, partition_key),
+                   true <- flow_retention_cleanup_owned_key?(owned_key, record) do
+                {:cont, {:ok, [{member_key, owned_key} | acc]}}
+              else
+                nil -> {:cont, {:ok, acc}}
+                _unowned -> {:halt, :unowned_member}
+              end
+            end)
+
+          _invalid ->
+            :invalid_members
+        end
+      end
+
+      # As retention deletes what members own: private values and auxiliary keys
+      # go, shareable values go only once nothing else refers to them.
+      defp flow_purge_orphan_delete_members(_state, _record, []), do: {:ok, 0}
+
+      defp flow_purge_orphan_delete_members(state, %{id: id} = record, members) do
+        index_key = FlowKeys.retention_cleanup_index_key(id, record.partition_key)
+
+        {value_refs, auxiliary_keys} =
+          members |> Enum.map(&elem(&1, 1)) |> Enum.split_with(&FlowKeys.value_key?/1)
+
+        {private_value_refs, shareable_value_refs} =
+          flow_retention_split_owned_value_refs(value_refs, record)
+
+        flow_retention_enqueue_shared_value_orphans(state, shareable_value_refs, record)
+
+        with {:ok, deleted} <- flow_retention_delete_keys(state, private_value_refs),
+             {:ok, _auxiliary} <- flow_retention_delete_keys(state, auxiliary_keys),
+             :ok <- flow_retention_delete_cleanup_members(state, index_key, members) do
+          {:ok, deleted}
+        end
+      end
+
+      # Flows from before retention cleanup members kept their values in LMDB
+      # alone, and query index rows outlive the state record they came from.
+      # Only the Flow's own private values and rows that name it are taken.
+      defp flow_purge_orphan_leftovers(%{id: id} = record, entry) do
+        value_keys = Map.get(entry, :value_keys, [])
+        index_keys = Map.get(entry, :query_index_keys, [])
+
+        own_value? = fn key ->
+          is_binary(key) and flow_retention_owned_value_ref?(key, record) and
+            not flow_retention_shareable_owned_value_ref?(key, record)
+        end
+
+        own_index_row? = fn key ->
+          Ferricstore.Flow.LMDB.IndexCodec.query_index_key_id(key) == {:ok, id}
+        end
+
+        if is_list(value_keys) and is_list(index_keys) and length(value_keys) <= 256 and
+             length(index_keys) <= 256 and Enum.all?(value_keys, own_value?) and
+             Enum.all?(index_keys, own_index_row?) do
+          {:ok, value_keys, index_keys}
+        else
+          :unowned_leftovers
+        end
+      end
     end
   end
 end
