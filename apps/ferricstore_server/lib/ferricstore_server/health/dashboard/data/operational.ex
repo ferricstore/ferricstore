@@ -245,9 +245,23 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
   def collect_connections do
     %{
       active: Stats.active_connections(),
-      blocked: safe_ets_size(:ferricstore_waiters),
+      blocked: blocked_clients(),
       tracking: safe_ets_size(:ferricstore_tracking_connections)
     }
+  end
+
+  # The waiters table holds one entry per key a client waits on, so a client
+  # blocked on several keys is counted once.
+  defp blocked_clients do
+    case :ets.whereis(:ferricstore_waiters) do
+      :undefined ->
+        0
+
+      table ->
+        fn entry, pids -> MapSet.put(pids, elem(entry, 1)) end
+        |> :ets.foldl(MapSet.new(), table)
+        |> MapSet.size()
+    end
   end
 
   def collect_slowlog, do: slowlog_snapshot().entries
