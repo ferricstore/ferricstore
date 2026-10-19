@@ -20,6 +20,8 @@ All notable changes to FerricStore will be documented here.
   reclaim limited to its own type and partition. The general reclaim form is
   folded under "Reclaim by type and partition", and failed or out-of-retry runs
   use compact rows.
+- Compact the dashboard's recent run rows to two short lines, and style the run
+  status badges, which rendered as plain text.
 
 ## 0.12.6 - 2026-10-19
 
