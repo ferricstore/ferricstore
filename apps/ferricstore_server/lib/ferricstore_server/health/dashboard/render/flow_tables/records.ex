@@ -435,38 +435,35 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
 
   def render_flow_running_records(records, total_sampled, sample_limit) do
     rows =
-      case records do
-        _ ->
-          Enum.map_join(records, "\n", fn record ->
-            expired_class = if flow_expired_lease?(record), do: "c-red", else: ""
-            id = flow_record_id(record)
-            partition = flow_record_partition_key(record)
+      Enum.map_join(records, "\n", fn record ->
+        expired_class = if flow_expired_lease?(record), do: "c-red", else: ""
+        id = flow_record_id(record)
+        partition = flow_record_partition_key(record)
 
-            worker = flow_record_worker(record)
-            reason = flow_waiting_reason(record)
+        worker = flow_record_worker(record)
+        reason = flow_waiting_reason(record)
 
-            # The worker column already says who holds the lease.
-            status =
-              if is_binary(worker) and reason == "leased by " <> worker,
-                do: "Leased",
-                else: reason
+        # The worker column already says who holds the lease.
+        status =
+          if is_binary(worker) and reason == "leased by " <> worker,
+            do: "Leased",
+            else: reason
 
-            """
-            <tr>
-              <td class="flow-worker-identity">
-                <div class="mono">#{render_flow_id_link(id, partition)}</div>
-                #{render_run_scope(record)}
-              </td>
-              <td class="mono">#{escape(worker || "-")}</td>
-              <td#{if expired_class == "", do: "", else: ~s( class="#{expired_class}")}>#{escape(status)}</td>
-              <td class="flow-due-cell">
-                #{render_lease_relative(flow_record_lease_expires_at_ms(record))}#{render_clock(flow_record_lease_expires_at_ms(record))}
-                #{render_worker_lease_details(record, id, partition)}
-              </td>
-            </tr>
-            """
-          end)
-      end
+        """
+        <tr>
+          <td class="flow-worker-identity">
+            <div class="mono">#{render_flow_id_link(id, partition)}</div>
+            #{render_run_scope(record)}
+          </td>
+          <td class="mono">#{escape(worker || "-")}</td>
+          <td#{if expired_class == "", do: "", else: ~s( class="#{expired_class}")}>#{escape(status)}</td>
+          <td class="flow-due-cell">
+            #{render_lease_relative(flow_record_lease_expires_at_ms(record))}#{render_clock(flow_record_lease_expires_at_ms(record))}
+            #{render_worker_lease_details(record, id, partition)}
+          </td>
+        </tr>
+        """
+      end)
 
     table = """
     <table class="flow-worker-records-table">

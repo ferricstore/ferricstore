@@ -154,8 +154,20 @@ defmodule FerricstoreServer.Health.Dashboard.OperationalReviewTest do
 
   test "bounded operational tables advertise local filter targets and accessible status" do
     htmls = [
-      Admin.render_clients_table([]),
-      Admin.render_slowlog_table([]),
+      # Bounded tables show their filter once they have rows; empty, they are prompts.
+      Admin.render_clients_table([
+        %{
+          client_id: 1,
+          client_name: "c",
+          username: "u",
+          peer: "127.0.0.1:1",
+          age_seconds: 1,
+          flags: ""
+        }
+      ]),
+      Admin.render_slowlog_table([
+        %{id: 1, timestamp_us: 1_000_000, duration_us: 12_000, command: ["GET", "k"]}
+      ]),
       # Messaging tables show their filter once they have rows; empty, they are prompts.
       MessagingPages.render_stream_top_streams(%{
         top_streams: [%{key: "s", mutations: 1, appends: 1, last_entry_id: "1-0", last_at_us: 1}]

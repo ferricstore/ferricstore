@@ -12,11 +12,14 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
   end
 
   def render_slowlog_summary(%{status: :unavailable}) do
-    render_ops_summary("Slow Log unavailable", [
-      %{label: "Entries", value: "Unavailable", class: "c-muted"},
-      %{label: "Worst", value: "Unavailable", class: "c-muted"},
-      %{label: "Avg", value: "Unavailable", class: "c-muted"}
-    ])
+    PageStatus.render("slowlog", :warning, "Slow log unavailable", [
+      "slow commands could not be collected"
+    ]) <>
+      render_ops_summary("Slow Log unavailable", [
+        %{label: "Entries", value: "Unavailable", class: "c-muted"},
+        %{label: "Worst", value: "Unavailable", class: "c-muted"},
+        %{label: "Avg", value: "Unavailable", class: "c-muted"}
+      ])
   end
 
   def render_slowlog_summary(%{entries: entries}), do: render_slowlog_summary(entries)
@@ -27,21 +30,48 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
     worst_us = Enum.reduce(entries, 0, fn entry, acc -> max(acc, max(entry.duration_us, 0)) end)
     avg_us = if count > 0, do: div(total_us, count), else: 0
 
-    render_ops_summary("Slow Log Summary", [
-      %{label: "Entries", value: format_number(count)},
-      %{
-        label: "Worst",
-        value: if(count > 0, do: format_duration_us(worst_us), else: "No samples"),
-        class:
-          if(count > 0, do: slowlog_duration_class(worst_us), else: "ops-summary-code c-muted")
-      },
-      %{
-        label: "Avg",
-        value: if(count > 0, do: format_duration_us(avg_us), else: "No samples"),
-        class: if(count > 0, do: "", else: "ops-summary-code c-muted")
-      },
-      %{label: "Total Time", value: format_duration_us(total_us)}
-    ])
+    status =
+      case Enum.max_by(entries, &max(&1.duration_us, 0), fn -> nil end) do
+        nil ->
+          PageStatus.render("slowlog", :healthy, "No slow commands recorded")
+
+        worst ->
+          name = worst |> Map.get(:command, []) |> List.wrap() |> List.first() |> to_string()
+
+          PageStatus.render(
+            "slowlog",
+            :idle,
+            "#{format_number(count)} slow #{if count == 1, do: "command", else: "commands"} recorded",
+            [
+              "worst #{format_duration_us(worst_us)}#{if name == "", do: "", else: ": " <> name}",
+              "average #{format_duration_us(avg_us)}"
+            ]
+          )
+      end
+
+    status <>
+      render_ops_summary(
+        "Slow Log Summary",
+        [
+          %{label: "Entries", value: format_number(count)},
+          %{
+            label: "Worst",
+            value: if(count > 0, do: format_duration_us(worst_us), else: "No samples"),
+            class:
+              if(count > 0,
+                do: slowlog_duration_class(worst_us),
+                else: "ops-summary-code c-muted"
+              )
+          },
+          %{
+            label: "Avg",
+            value: if(count > 0, do: format_duration_us(avg_us), else: "No samples"),
+            class: if(count > 0, do: "", else: "ops-summary-code c-muted")
+          },
+          %{label: "Total time", value: format_duration_us(total_us)}
+        ],
+        heading: :hidden
+      )
   end
 
   def slowlog_duration_class(duration_us) when duration_us >= 1_000_000, do: "c-red"
@@ -60,31 +90,31 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
 
   def render_slowlog_table(%{entries: entries}), do: render_slowlog_table(entries)
 
+  def render_slowlog_table([]),
+    do: """
+    <h2 class="section-title">Slow Log <span class="badge badge-idle">none</span></h2>
+    <p class="section-empty">No slow commands recorded.</p>
+    """
+
   def render_slowlog_table(entries) do
     count = length(entries)
     count_label = if count == 0, do: "none", else: "#{count} entries"
 
     rows =
-      case entries do
-        [] ->
-          ~s(<tr><td colspan="4" class="c-muted">No slow commands recorded</td></tr>)
+      Enum.map_join(entries, "\n", fn entry ->
+        cmd_str = Enum.join(entry.command, " ")
+        duration_ms = Float.round(entry.duration_us / 1000.0, 2)
+        time_str = format_timestamp_us(entry.timestamp_us)
 
-        _ ->
-          Enum.map_join(entries, "\n", fn entry ->
-            cmd_str = Enum.join(entry.command, " ")
-            duration_ms = Float.round(entry.duration_us / 1000.0, 2)
-            time_str = format_timestamp_us(entry.timestamp_us)
-
-            """
-            <tr>
-              <td>#{entry.id}</td>
-              <td class="mono">#{escape(time_str)}</td>
-              <td>#{duration_ms} ms</td>
-              <td class="mono">#{TableValue.render(cmd_str, "command", nil, entry.id)}</td>
-            </tr>
-            """
-          end)
-      end
+        """
+        <tr>
+          <td>#{entry.id}</td>
+          <td class="mono">#{escape(time_str)}</td>
+          <td>#{duration_ms} ms</td>
+          <td class="mono">#{TableValue.render(cmd_str, "command", nil, entry.id)}</td>
+        </tr>
+        """
+      end)
 
     """
     <h2 class="section-title">Slow Log <span class="badge badge-idle">#{escape(count_label)}</span></h2>
@@ -813,24 +843,51 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
         Enum.count(clients, &String.contains?(&1.flags, "M"))
       end)
 
-    render_ops_summary("Client Summary", [
-      %{label: "Active", value: format_number(conns.active)},
-      %{
-        label: "Blocked",
-        value: format_number(conns.blocked),
-        class: if(conns.blocked > 0, do: "c-yellow", else: "")
-      },
-      %{
-        label: "Tracking",
-        value: format_number(conns.tracking),
-        detail: "#{pubsub} #{if shown?, do: "shown ", else: ""}Pub/Sub"
-      },
-      %{
-        label: if(shown?, do: "Shown transactions", else: "Transactions"),
-        value: format_number(transactions),
-        detail: "Oldest #{if shown?, do: "shown ", else: ""}#{format_uptime(oldest_age)}"
-      }
-    ])
+    status =
+      cond do
+        conns.active == 0 ->
+          PageStatus.render("clients", :idle, "No native connections")
+
+        conns.blocked > 0 ->
+          PageStatus.render(
+            "clients",
+            :warning,
+            "#{format_number(conns.blocked)} blocked of #{format_number(conns.active)} connections",
+            ["blocked clients wait on a blocking command such as XREAD or BLPOP"]
+          )
+
+        true ->
+          PageStatus.render(
+            "clients",
+            :healthy,
+            "#{format_number(conns.active)} native #{if conns.active == 1, do: "connection", else: "connections"}",
+            ["none blocked"]
+          )
+      end
+
+    status <>
+      render_ops_summary(
+        "Client Summary",
+        [
+          %{label: "Active", value: format_number(conns.active)},
+          %{
+            label: "Blocked",
+            value: format_number(conns.blocked),
+            class: if(conns.blocked > 0, do: "c-yellow", else: "")
+          },
+          %{
+            label: "Tracking",
+            value: format_number(conns.tracking),
+            detail: "#{pubsub} #{if shown?, do: "shown ", else: ""}Pub/Sub"
+          },
+          %{
+            label: if(shown?, do: "Shown transactions", else: "Transactions"),
+            value: format_number(transactions),
+            detail: "Oldest #{if shown?, do: "shown ", else: ""}#{format_uptime(oldest_age)}"
+          }
+        ],
+        heading: :hidden
+      )
   end
 
   def render_clients_page_table(data) do
@@ -896,31 +953,33 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
     "/dashboard/api/clients" <> if(query == "", do: "", else: "?" <> query)
   end
 
-  def render_clients_table(clients, empty_message \\ "No active connections") do
+  def render_clients_table(clients, empty_message \\ "No active connections")
+
+  def render_clients_table([], empty_message),
+    do: """
+    <h2 class="section-title">Active Connections <span class="badge badge-idle">0</span></h2>
+    <p class="section-empty">#{escape(empty_message)}</p>
+    """
+
+  def render_clients_table(clients, _empty_message) do
     rows =
-      case clients do
-        [] ->
-          ~s(<tr><td colspan="6" class="c-muted">#{escape(empty_message)}</td></tr>)
+      Enum.map_join(clients, "\n", fn c ->
+        id = Map.get(c, :client_id)
+        id_str = if is_integer(id), do: Integer.to_string(id), else: inspect(c.pid)
+        name = Map.get(c, :client_name) || "-"
+        user = Map.get(c, :username) || "default"
 
-        _ ->
-          Enum.map_join(clients, "\n", fn c ->
-            id = Map.get(c, :client_id)
-            id_str = if is_integer(id), do: Integer.to_string(id), else: inspect(c.pid)
-            name = Map.get(c, :client_name) || "-"
-            user = Map.get(c, :username) || "default"
-
-            """
-            <tr>
-              <td class="mono">#{TableValue.render(id_str, "client ID", nil, id_str)}</td>
-              <td>#{TableValue.render(name, "client name", nil, id_str)}</td>
-              <td class="mono">#{TableValue.render(user, "username", nil, id_str)}</td>
-              <td class="mono">#{TableValue.render(c.peer, "client address", nil, id_str)}</td>
-              <td>#{format_uptime(c.age_seconds)}</td>
-              <td>#{TableValue.render(c.flags, "client flags", nil, id_str)}</td>
-            </tr>
-            """
-          end)
-      end
+        """
+        <tr>
+          <td class="mono">#{TableValue.render(id_str, "client ID", nil, id_str)}</td>
+          <td>#{TableValue.render(name, "client name", nil, id_str)}</td>
+          <td class="mono">#{TableValue.render(user, "username", nil, id_str)}</td>
+          <td class="mono">#{TableValue.render(c.peer, "client address", nil, id_str)}</td>
+          <td>#{format_uptime(c.age_seconds)}</td>
+          <td>#{TableValue.render(c.flags, "client flags", nil, id_str)}</td>
+        </tr>
+        """
+      end)
 
     """
     <h2 class="section-title">Active Connections <span class="badge badge-idle">#{length(clients)}</span></h2>
@@ -935,9 +994,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
       </tbody>
     </table>
     """)}
-    <div style="margin-top:8px; font-size:0.75rem; color:var(--text-faint);">
-      Flags: M=in MULTI transaction, S=subscribed (pub/sub), T=tracking enabled
-    </div>
+    <p class="flow-section-note">Flags: M=in MULTI transaction, S=subscribed (pub/sub), T=tracking enabled</p>
     """
   end
 
