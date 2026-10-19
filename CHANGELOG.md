@@ -35,6 +35,12 @@ All notable changes to FerricStore will be documented here.
   key searches are one row each, with a prompt instead of an empty table.
 - Say that the overview's workflow numbers and the Failures badge come from
   the overview's small sample.
+- Finish the dashboard pass: workflow pages share one scope row (run lookup and
+  scope, with the repeated route links removed and the header tabs carrying the
+  scope), running and due rows are compact, and every page gets 14 px body
+  text, smaller disclosure titles and summary cards that show words such as
+  Unavailable as words. Table scroll boxes now contain positioned labels, which
+  made Workers scroll sideways on phones.
 
 ## 0.12.6 - 2026-10-19
 
