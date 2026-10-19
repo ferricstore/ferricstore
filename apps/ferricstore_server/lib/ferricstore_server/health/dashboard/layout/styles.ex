@@ -334,6 +334,10 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-execution-summary dt { color: var(--text-muted); font-size: 0.75rem; margin-bottom: 6px; }
       .flow-execution-summary dd { margin: 0; font-size: 0.875rem; color: var(--text-strong); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
       .flow-nav-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 4px 0 18px; }
+      .flow-scope-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 20px; margin: 0 0 16px; }
+      .flow-scope-bar .flow-search { flex: 0 1 560px; }
+      .flow-scope-bar-scope { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+      .flow-scope-bar-label { color: var(--text-faint); font-size: 0.8125rem; }
       .flow-tabs { display: flex; gap: 10px; flex-wrap: wrap; margin: 4px 0 18px; }
       .flow-nav-row .flow-tabs { margin: 0; }
       .flow-tab-group { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 5px 6px; border: 1px solid var(--line); border-radius: 8px; background: rgba(18, 19, 26, 0.55); }
@@ -403,13 +407,13 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-filter-form .flow-filter-field .flow-filter-limit { width: 80px; }
       .flow-filter-form.flow-state-filter-form { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: end; gap: 12px; width: 100%; flex: 1 0 100%; }
       .flow-state-filter-form .flow-search-input { min-width: 0; max-width: none; }
-      .flow-filter-time-group { grid-column: span 3; display: grid; grid-template-columns: minmax(130px, 0.8fr) repeat(2, minmax(220px, 1fr)); gap: 12px; border: 0; padding: 0; min-width: 0; }
+      .flow-filter-time-group { grid-column: span 2; display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; border: 0; padding: 0; min-width: 0; }
       .flow-filter-time-group legend { color: var(--text-muted); font-size: 0.75rem; padding-bottom: 6px; }
       .flow-state-filter-form:has(noscript p) .flow-filter-time-group { grid-column: 1 / -1; grid-template-columns: minmax(140px, 0.7fr) minmax(160px, 0.9fr) repeat(2, minmax(260px, 1fr)); }
       .flow-state-filter-form noscript { grid-column: 1 / -1; }
       .flow-filter-actions { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
       .flow-filter-actions .flow-filter-clear { padding-block: 8px; }
-      .flow-state-filter-form .flow-filter-actions { grid-column: 1 / -1; }
+      .flow-state-filter-form .flow-filter-actions { grid-column: span 2; align-self: end; }
       .table-scroll .flow-states-table { table-layout: fixed; min-width: 1560px; }
       .flow-states-table th:first-child { width: 190px; }
       .flow-states-table th:nth-child(2) { width: 240px; }

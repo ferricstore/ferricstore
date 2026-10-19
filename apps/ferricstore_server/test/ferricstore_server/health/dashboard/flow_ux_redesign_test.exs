@@ -578,12 +578,11 @@ defmodule FerricstoreServer.Health.Dashboard.FlowUxRedesignTest do
           "flow_states"
         )
 
-      assert html =~ ~s(aria-label="Workflow investigation context")
+      assert html =~ "data-dashboard-workflow-scope"
       assert html =~ "payment%2Fretry"
       assert html =~ "customer+north"
       assert html =~ "awaiting+review"
       assert html =~ "range=1h"
-      assert html =~ ~s(aria-current="page")
       refute html =~ "secret_key"
       refute html =~ "do-not-leak"
       refute html =~ "private-flow-id"

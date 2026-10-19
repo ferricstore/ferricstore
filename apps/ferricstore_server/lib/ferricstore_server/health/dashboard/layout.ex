@@ -210,7 +210,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
               renderedScope.querySelectorAll("a[data-dashboard-route][href]").forEach(function (sourceLink) {
                 var destination = new URL(sourceLink.href, window.location.origin);
                 if (destination.origin !== window.location.origin || !destination.pathname.startsWith('/dashboard/')) { return; }
-                document.querySelectorAll('.sidebar a[href]').forEach(function (link) {
+                document.querySelectorAll('.sidebar a[href], .page-tabs a[href]').forEach(function (link) {
                   if (new URL(link.href).pathname !== sourceLink.dataset.dashboardRoute) { return; }
                   link.setAttribute('href', sourceLink.getAttribute('href'));
                   ['title', 'aria-description'].forEach(function (attribute) {
@@ -226,7 +226,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
             var routes = ['/dashboard/flow', '/dashboard/flow/states', '/dashboard/flow/workers',
               '/dashboard/flow/due', '/dashboard/flow/failures', '/dashboard/flow/query',
               '/dashboard/flow/signals', '/dashboard/flow/lineage'];
-            document.querySelectorAll('.sidebar a[href]').forEach(function (link) {
+            document.querySelectorAll('.sidebar a[href], .page-tabs a[href]').forEach(function (link) {
               var target = new URL(link.href, window.location.origin);
               if (!routes.includes(target.pathname)) { return; }
               ['type', 'partition_key'].forEach(function (name) {

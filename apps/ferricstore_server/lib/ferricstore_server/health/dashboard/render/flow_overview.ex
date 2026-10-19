@@ -73,15 +73,22 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowOverview do
     context = flow_investigation_context(data)
     partition_key = Map.get(context, :partition_key) || ""
 
+    # List pages reach the other workflow pages through the sidebar and tabs,
+    # which carry the scope contract; a run's page keeps its lineage links.
+    investigation =
+      if Keyword.get(opts, :show_scope, true),
+        do: render_flow_scope_summary(context, active),
+        else: render_flow_investigation_context(context, active, opts)
+
     """
     #{render_flow_scope_contract(data)}
-    <div class="flow-nav-row flow-context-tools">
+    <div class="flow-scope-bar">
       <form class="flow-search" action="/dashboard/flow/lookup" method="get" aria-label="Flow lookup">
         <input class="flow-search-input mono" type="search" name="id" placeholder="Flow ID" required autocomplete="off" aria-label="Flow ID" title="Open a flow by ID.">
         <input class="flow-search-input mono" type="search" name="partition_key" value="#{escape_attr(partition_key)}" placeholder="Partition key" autocomplete="off" aria-label="Partition key" title="Partition of the workflow to open">
         <button class="flow-search-button" type="submit">Open workflow</button>
       </form>
-      #{render_flow_investigation_context(context, active, opts)}
+      #{investigation}
     </div>
     #{render_flow_local_scope(context, active)}
     """
@@ -170,6 +177,22 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowOverview do
   end
 
   defp render_flow_local_scope(_context, _active), do: ""
+
+  # Pages with their own scope form already show it.
+  defp render_flow_scope_summary(_context, active)
+       when active in ["flow", "flow_due", "flow_workers"],
+       do: ""
+
+  defp render_flow_scope_summary(context, _active) do
+    if Enum.any?(
+         [:type, :partition_key, :state, :range],
+         &present_context_value?(Map.get(context, &1))
+       ) do
+      ~s(<span class="flow-scope-bar-scope"><span class="flow-scope-bar-label">Scope</span><span class="flow-investigation-scope">#{render_flow_context_chips(context)}</span></span>)
+    else
+      ""
+    end
+  end
 
   defp render_flow_investigation_context(context, active, opts) do
     links = [
