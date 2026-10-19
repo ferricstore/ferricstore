@@ -220,20 +220,8 @@ defmodule FerricstoreHttp.Targets.HttpEndpointTest.Handler do
             do: {200, %{}, Jason.encode!(%{"ok" => true})},
             else: {401, %{}, Jason.encode!(%{"error" => "unauthorized"})}
 
-        "/unavailable" ->
-          {503, %{}, Jason.encode!(%{"error" => "temporary"})}
-
-        "/bad-request" ->
-          {400, %{}, Jason.encode!(%{"error" => "bad request"})}
-
-        "/large" ->
-          {200, %{}, String.duplicate("x", 64)}
-
-        "/text" ->
-          {200, %{}, "plain text"}
-
-        "/binary" ->
-          {200, %{}, <<0, 255, 1>>}
+        path when path in ["/unavailable", "/bad-request", "/large", "/text", "/binary"] ->
+          fixed_response(path)
 
         "/redirect" ->
           {302, %{"location" => "/redirect-target"}, ""}
@@ -251,4 +239,10 @@ defmodule FerricstoreHttp.Targets.HttpEndpointTest.Handler do
     req = :cowboy_req.reply(status, headers, response, req)
     {:ok, req, state}
   end
+
+  defp fixed_response("/unavailable"), do: {503, %{}, Jason.encode!(%{"error" => "temporary"})}
+  defp fixed_response("/bad-request"), do: {400, %{}, Jason.encode!(%{"error" => "bad request"})}
+  defp fixed_response("/large"), do: {200, %{}, String.duplicate("x", 64)}
+  defp fixed_response("/text"), do: {200, %{}, "plain text"}
+  defp fixed_response("/binary"), do: {200, %{}, <<0, 255, 1>>}
 end
