@@ -232,7 +232,7 @@ defmodule FerricstoreServer.Health.Dashboard.AccessRecoverySeventhReviewTest do
     refute extract_body(response) =~ ~s(name="expected_requested_at_ms")
   end
 
-  test "expired evidence groups offer scoped prepare links preserving literal type and partition" do
+  test "expired evidence groups reclaim their own literal type and partition" do
     type = " all <type> "
     partition = " ALL &partition "
     filters = %{type: nil, partition_key: nil, q: nil, limit: 40, scan_exact: false}
@@ -248,39 +248,25 @@ defmodule FerricstoreServer.Health.Dashboard.AccessRecoverySeventhReviewTest do
     failed = %{id: "terminal", type: "not-reclaimable", partition_key: "other", state: "failed"}
 
     html =
-      FlowComponents.render_flow_recovery_actions(%{
+      FlowComponents.render_flow_failures_table(%{
         filters: filters,
+        total_sampled: 3,
+        sample_limit: 400,
         candidates: [expired, Map.put(expired, :id, "two"), failed]
       })
 
-    assert html =~ "Prepare reclaim"
-    assert html =~ "2 expired leases"
-    assert html =~ URI.encode_www_form(type)
-    assert html =~ URI.encode_www_form(partition)
-    refute html =~ "not-reclaimable"
-    assert length(Regex.scan(~r/>Prepare reclaim</, html)) == 1
+    assert length(Regex.scan(~r/<details class="failure-group"/, html)) == 1
+    assert html =~ ~s(<span class="failure-group-count">2</span>)
+    assert html =~ ~s(<input type="hidden" name="type" value=" all &lt;type&gt; ">)
+    assert html =~ ~s(<input type="hidden" name="partition_key" value=" ALL &amp;partition ">)
+    # One reclaim in the group, one in the general by-type form.
+    assert length(Regex.scan(~r/name="confirm_reclaim"/, html)) == 2
 
     opts =
       Recovery.opts_from_query(URI.encode_query(%{"type" => type, "partition_key" => partition}))
 
     assert opts[:type] == type
     assert opts[:partition_key] == partition
-
-    prepared =
-      Recovery.prepare_reclaim_path(%{type: type, partition_key: partition}, %{
-        filters
-        | scan_exact: true,
-          q: "invoice",
-          limit: 80
-      })
-
-    assert URI.decode_query(URI.parse(prepared).query) == %{
-             "type" => type,
-             "partition_key" => partition,
-             "exact" => "true",
-             "q" => "invoice",
-             "limit" => "80"
-           }
   end
 
   test "prepared reclaim submits literal identifiers including native partition selector words" do

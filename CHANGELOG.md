@@ -15,6 +15,11 @@ All notable changes to FerricStore will be documented here.
   with the busiest types, shards as a grid, and small storage, keydir, client
   and slow-command cards. The live overview payload no longer has a `top_bar`
   component.
+- Redesign the dashboard Failures page. Expired leases are grouped by type and
+  partition, largest first; each group opens to its runs and a confirmed
+  reclaim limited to its own type and partition. The general reclaim form is
+  folded under "Reclaim by type and partition", and failed or out-of-retry runs
+  use compact rows.
 
 ## 0.12.6 - 2026-10-19
 

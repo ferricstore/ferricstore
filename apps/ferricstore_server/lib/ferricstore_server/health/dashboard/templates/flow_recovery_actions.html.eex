@@ -1,23 +1,9 @@
 <% data = assigns.data %>
 <% filters = flow_failures_page_filters(data) %>
-<% groups = Recovery.reclaim_groups(data) %>
-<%= if groups != [] do %>
-<div class="table-scroll" role="region" aria-label="Reclaim candidate groups" tabindex="0"><table>
-  <thead><tr><th>Type</th><th>Partition</th><th>Evidence</th><th>Action</th></tr></thead>
-  <tbody>
-  <%= for group <- groups do %>
-    <tr>
-      <td class="mono"><%= escape(group.type) %></td>
-      <td class="mono"><%= escape(group.partition_key || "No literal partition in evidence") %></td>
-      <td><%= group.count %> expired <%= if group.count == 1, do: "lease", else: "leases" %> shown</td>
-      <td><%= if group.can_prepare? do %><a class="flow-link" href="<%= escape_attr(Recovery.prepare_reclaim_path(group, filters)) %>">Prepare reclaim</a><% else %><span class="c-muted"><%= if group.partition_key, do: "Reclaim not authorized", else: "Exact partition required" %></span><% end %></td>
-    </tr>
-  <% end %>
-  </tbody>
-</table></div>
-<% end %>
+<details class="flow-reclaim-advanced"<%= if filters.type, do: " open", else: "" %>>
+  <summary>Reclaim by type and partition</summary>
 <div class="flow-policy-panel">
-  <h2 class="section-title">Recovery Actions <%= info_icon("Reclaim only takes expired running leases through FLOW.RECLAIM. Failed terminal flows are listed for triage; rewind stays on the Flow detail page.") %></h2>
+  <p class="flow-section-note">For leases outside the groups above, or across automatic partitions. Reclaim only takes expired running leases, through FLOW.RECLAIM.</p>
   <form id="flow-reclaim-form" class="flow-policy-form" action="/dashboard/flow/failures" method="post" data-dashboard-single-submit aria-describedby="flow-reclaim-scope-note">
     <input type="hidden" name="action" value="reclaim">
     <input type="hidden" name="return_q" value="<%= escape_attr(filters.q || "") %>">
@@ -57,3 +43,4 @@
     </div>
   </form>
 </div>
+</details>

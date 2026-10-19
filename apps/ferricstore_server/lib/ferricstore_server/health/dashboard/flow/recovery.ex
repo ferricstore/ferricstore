@@ -113,19 +113,6 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
     end)
   end
 
-  def prepare_reclaim_path(group, filters) do
-    params = %{
-      "type" => group.type,
-      "partition_key" => group.partition_key,
-      "limit" => Map.get(filters, :limit, @flow_dashboard_recent_limit),
-      "exact" => if(Map.get(filters, :scan_exact, false), do: "true", else: "false")
-    }
-
-    params = maybe_put_return_param(params, "q", Map.get(filters, :q))
-
-    "/dashboard/flow/failures?" <> URI.encode_query(params) <> "#flow-reclaim-form"
-  end
-
   defp reclaim_scopes(records, username) do
     records
     |> Enum.filter(&flow_expired_lease?/1)

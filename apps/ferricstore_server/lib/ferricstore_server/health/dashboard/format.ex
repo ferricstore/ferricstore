@@ -156,6 +156,15 @@ defmodule FerricstoreServer.Health.Dashboard.Format do
 
   def format_timeline_timestamp_ms(_timestamp_ms), do: "-"
 
+  # Wall-clock time to the second, for compact rows.
+  def format_clock_ms(timestamp_ms) when is_integer(timestamp_ms) and timestamp_ms > 0 do
+    timestamp_ms
+    |> DateTime.from_unix!(:millisecond)
+    |> Calendar.strftime("%H:%M:%S UTC")
+  end
+
+  def format_clock_ms(_timestamp_ms), do: "-"
+
   def format_duration_ms(ms) when ms >= 86_400_000 do
     "#{Float.round(ms / 86_400_000, 1)}d"
   end

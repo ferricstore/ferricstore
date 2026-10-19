@@ -555,7 +555,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
             })
 
           assert String.contains?(html, "Flow Failures")
-          assert String.contains?(html, "Recovery Actions")
+          assert String.contains?(html, "Reclaim by type and partition")
           assert String.contains?(html, "FLOW.RECLAIM")
           assert String.contains?(html, ~s(name="confirm_reclaim" value="true" required))
           assert String.contains?(html, "failed-flow")

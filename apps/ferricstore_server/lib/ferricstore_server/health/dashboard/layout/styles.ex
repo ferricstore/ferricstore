@@ -199,6 +199,33 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .overview-card-note { margin-top: 12px; color: var(--text-muted); font-size: 0.8125rem; }
       .overview-footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 24px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--text-faint); font-size: 0.75rem; }
 
+      /* Failures */
+      .failure-groups { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); overflow: hidden; }
+      .failure-group + .failure-group { border-top: 1px solid var(--line-subtle); }
+      .failure-group > summary { display: grid; grid-template-columns: minmax(200px, 1.6fr) 56px minmax(150px, 1fr) minmax(160px, 1.2fr) 16px; align-items: center; gap: 12px; padding: 10px 16px; list-style: none; cursor: pointer; }
+      .failure-group > summary::-webkit-details-marker { display: none; }
+      .failure-group > summary::after { content: ""; justify-self: end; width: 7px; height: 7px; border-right: 2px solid var(--text-faint); border-bottom: 2px solid var(--text-faint); transform: rotate(-45deg); transition: transform 0.15s; }
+      .failure-group[open] > summary::after { transform: rotate(45deg); }
+      .failure-group > summary:hover { background: var(--surface-selected); }
+      .failure-group-scope { display: grid; gap: 2px; min-width: 0; }
+      .failure-group-scope .mono { color: var(--text-strong); overflow-wrap: anywhere; }
+      .failure-group-scope .failure-group-partition { color: var(--text-faint); font-size: 0.75rem; }
+      .failure-group-count { justify-self: end; padding: 0 8px; border-radius: 999px; background: var(--warn-wash); color: var(--warn); font-family: var(--font-mono); font-size: 0.8125rem; }
+      .failure-group-since, .failure-group-worker { min-width: 0; overflow: hidden; color: var(--text-muted); font-size: 0.8125rem; text-overflow: ellipsis; white-space: nowrap; }
+      .failure-group-body { display: grid; gap: 14px; padding: 4px 16px 16px; }
+      .failure-reclaim { display: grid; gap: 10px; padding: 12px 14px; border: 1px solid var(--accent-solid); border-radius: 10px; background: var(--surface-base); }
+      .failure-reclaim-scope { color: var(--text-muted); font-size: 0.8125rem; }
+      .failure-reclaim-options > summary { width: fit-content; color: var(--text-muted); font-size: 0.8125rem; cursor: pointer; }
+      .failure-reclaim-options .flow-policy-grid { margin-top: 10px; }
+      .failure-reclaim-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; }
+      .failure-empty { padding: 14px 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); color: var(--text-muted); font-size: 0.875rem; }
+      #flow-failures-terminal { margin-top: 28px; }
+      #flow-failures-terminal .flow-section-note { margin-top: 10px; }
+      .flow-reclaim-advanced { margin-top: 14px; }
+      .flow-reclaim-advanced > summary { width: fit-content; color: var(--text-muted); font-size: 0.875rem; cursor: pointer; }
+      .flow-reclaim-advanced > summary:hover { color: var(--text-strong); }
+      .flow-reclaim-advanced[open] > summary { margin-bottom: 10px; }
+
       /* Operational summary cards */
       .ops-summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 20px; }
       .ops-summary-card { background: var(--surface-raised); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; min-width: 0; }
@@ -1036,6 +1063,8 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
         .page-header { padding: 14px 16px 0; }
         .page-header-status { justify-content: flex-start; }
         .overview-shard-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+        .failure-group > summary { grid-template-columns: minmax(0, 1fr) auto 16px; }
+        .failure-group-since, .failure-group-worker { display: none; }
         .content { padding: 16px; }
         .flow-card-wide { grid-column: span 1; }
         .flow-nav-row { align-items: stretch; }
