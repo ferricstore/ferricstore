@@ -209,6 +209,57 @@ defmodule Ferricstore.Flow.Query.QueryRowRelocatorTest do
     assert repaired.locator.frame_size == 2_074
   end
 
+  # A Flow whose record sits on the projection log stays in the keydir, and the
+  # keydir row follows the record when a rewrite renumbers the frames. The repair
+  # moves the row there, and the frame number is the locator's raft_index too.
+  test "repair follows the keydir to a projection QueryRow's renumbered frame" do
+    row = row_fixture("run-projection", 7, 37_548, 17_670_794, {:waraft_projection, 37_548})
+    keydir = :ets.new(:relocator_projection_keydir, [:set])
+
+    true =
+      :ets.insert(
+        keydir,
+        {row.state_key, nil, 0, 0, {:waraft_projection, 41_002}, 17_700_000,
+         row.locator.value_size}
+      )
+
+    parent = self()
+
+    assert {:ok, 1} =
+             QueryRowRelocator.repair_many(
+               %{keydir_refs: {keydir}},
+               0,
+               "/lmdb",
+               [{row.state_key, row.locator}],
+               get_many: fn "/lmdb", [_key] -> {:ok, [{:ok, row.encoded}]} end,
+               physical_location: fn
+                 _ctx, 0, {:waraft_projection, 41_002} -> {:ok, {2, 17_700_000, 2_074}}
+                 _ctx, 0, {:waraft_projection, 37_548} -> {:ok, {0, 17_634_744, 635}}
+               end,
+               verify_projection_frame: fn _ctx, 0, _state_key, locator ->
+                 locator.file_id == {:waraft_projection, 41_002}
+               end,
+               write_batch: fn "/lmdb", ops ->
+                 send(parent, {:ops, ops})
+                 :ok
+               end,
+               get: fn _path, _key -> flunk("successful repair performed a scalar read") end
+             )
+
+    assert_receive {:ops, [{:compare, key, expected}, {:put, key, replacement}]}
+    assert expected == row.encoded
+    assert {:ok, repaired} = QueryRowCodec.decode(replacement, key)
+    assert repaired.locator.file_id == {:waraft_projection, 41_002}
+    assert repaired.locator.raft_index == 41_002
+    assert repaired.locator.segment_generation == 2
+    assert repaired.locator.offset == 17_700_000
+    assert repaired.locator.frame_size == 2_074
+    assert repaired.locator.version == row.locator.version
+    assert repaired.locator.checksum == row.locator.checksum
+    assert {:ok, original} = QueryRowCodec.decode(row.encoded, key)
+    assert repaired.record == original.record
+  end
+
   defp row_fixture(id, version, index, offset, file_id \\ nil) do
     record = %{
       id: id,
