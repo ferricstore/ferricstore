@@ -1111,6 +1111,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       defp check_offset(offset, _error) when is_integer(offset) and offset >= 0, do: :ok
       defp check_offset(_offset, error), do: {:error, error}
 
+      # The logical key projection rejects a non-integer expiry after the value
+      # is written, which crashes storage on every replay of the entry.
+      defp check_expire_at(expire_at_ms) when is_integer(expire_at_ms) and expire_at_ms >= 0,
+        do: :ok
+
+      defp check_expire_at(_expire_at_ms),
+        do: {:error, "ERR value is not an integer or out of range"}
+
+      defp check_optional_expire_at(nil), do: :ok
+      defp check_optional_expire_at(expire_at_ms), do: check_expire_at(expire_at_ms)
+
       # Overwrites bytes at `offset` with `value`, zero-padding if the original
       # string is shorter than offset. Mirrors shard.ex apply_setrange/3.
       defp sm_apply_setrange(old, offset, value) do
@@ -1152,20 +1163,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # timestamp before entering Raft to keep the state machine deterministic
       # (no System.os_time calls). So the 5th arg is already absolute, not relative.
       defp do_cas(state, key, expected, new_value, expire_at_ms) do
-        case ets_lookup(state, key) do
-          {:hit, ^expected, old_exp} ->
-            expire = if expire_at_ms, do: expire_at_ms, else: old_exp
-            do_put(state, key, new_value, expire)
-            1
+        with :ok <- check_optional_expire_at(expire_at_ms) do
+          case ets_lookup(state, key) do
+            {:hit, ^expected, old_exp} ->
+              expire = if expire_at_ms, do: expire_at_ms, else: old_exp
+              do_put(state, key, new_value, expire)
+              1
 
-          {:hit, _other, _exp} ->
-            0
+            {:hit, _other, _exp} ->
+              0
 
-          :expired ->
-            nil
+            :expired ->
+              nil
 
-          :miss ->
-            nil
+            :miss ->
+              nil
+          end
         end
       end
 
@@ -1180,6 +1193,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # NOTE: The caller (shard.ex) pre-computes expire_at_ms as an absolute
       # timestamp before entering Raft to keep the state machine deterministic.
       defp do_lock(state, key, owner, expire_at_ms) do
+        with :ok <- check_expire_at(expire_at_ms), do: apply_lock(state, key, owner, expire_at_ms)
+      end
+
+      defp apply_lock(state, key, owner, expire_at_ms) do
         case ets_lookup(state, key) do
           {:hit, ^owner, _exp} ->
             # Same owner -- re-acquire (idempotent)
@@ -1222,6 +1239,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # NOTE: The caller (shard.ex) pre-computes expire_at_ms as an absolute
       # timestamp before entering Raft to keep the state machine deterministic.
       defp do_extend(state, key, owner, expire_at_ms) do
+        with :ok <- check_expire_at(expire_at_ms),
+             do: apply_extend(state, key, owner, expire_at_ms)
+      end
+
+      defp apply_extend(state, key, owner, expire_at_ms) do
         case ets_lookup(state, key) do
           {:hit, ^owner, _exp} ->
             do_put(state, key, owner, expire_at_ms)

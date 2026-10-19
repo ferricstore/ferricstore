@@ -1209,6 +1209,11 @@ defmodule Ferricstore.Store.Router.Part09 do
       @spec cas(FerricStore.Instance.t(), binary(), binary(), binary(), non_neg_integer() | nil) ::
               1 | 0 | nil
       def cas(ctx, key, expected, new_value, ttl_ms) do
+        with :ok <- check_optional_ttl_ms(ttl_ms),
+             do: checked_cas(ctx, key, expected, new_value, ttl_ms)
+      end
+
+      defp checked_cas(ctx, key, expected, new_value, ttl_ms) do
         expire_at_ms = if ttl_ms, do: HLC.now_ms() + ttl_ms, else: nil
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
@@ -1286,8 +1291,10 @@ defmodule Ferricstore.Store.Router.Part09 do
       @spec lock(FerricStore.Instance.t(), binary(), binary(), pos_integer()) ::
               :ok | {:error, binary()}
       def lock(ctx, key, owner, ttl_ms) do
-        expire_at_ms = HLC.now_ms() + ttl_ms
-        raft_write(ctx, shard_for(ctx, key), key, {:lock, key, owner, expire_at_ms})
+        with :ok <- check_ttl_ms(ttl_ms) do
+          expire_at_ms = HLC.now_ms() + ttl_ms
+          raft_write(ctx, shard_for(ctx, key), key, {:lock, key, owner, expire_at_ms})
+        end
       end
 
       @spec unlock(FerricStore.Instance.t(), binary(), binary()) :: 1 | {:error, binary()}
@@ -1298,9 +1305,23 @@ defmodule Ferricstore.Store.Router.Part09 do
       @spec extend(FerricStore.Instance.t(), binary(), binary(), pos_integer()) ::
               1 | {:error, binary()}
       def extend(ctx, key, owner, ttl_ms) do
-        expire_at_ms = HLC.now_ms() + ttl_ms
-        raft_write(ctx, shard_for(ctx, key), key, {:extend, key, owner, expire_at_ms})
+        with :ok <- check_ttl_ms(ttl_ms) do
+          expire_at_ms = HLC.now_ms() + ttl_ms
+          raft_write(ctx, shard_for(ctx, key), key, {:extend, key, owner, expire_at_ms})
+        end
       end
+
+      # The LOCK, EXTEND and CAS commands' TTL bound. A float TTL made a float
+      # expiry, which raised while the shard applied it, on every replay too.
+      defp check_ttl_ms(ttl_ms)
+           when is_integer(ttl_ms) and ttl_ms > 0 and
+                  ttl_ms <= 9_223_372_036_854_775_807 - 281_474_976_710_656 + 1,
+           do: :ok
+
+      defp check_ttl_ms(_ttl_ms), do: {:error, "ERR value is not an integer or out of range"}
+
+      defp check_optional_ttl_ms(nil), do: :ok
+      defp check_optional_ttl_ms(ttl_ms), do: check_ttl_ms(ttl_ms)
 
       @spec fetch_or_compute_lock(FerricStore.Instance.t(), binary(), binary(), pos_integer()) ::
               :ok | {:error, term()}

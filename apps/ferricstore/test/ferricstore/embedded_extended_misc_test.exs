@@ -522,6 +522,29 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
   # ===========================================================================
 
   describe "lock/3, unlock/2, extend/3" do
+    test "reject a TTL that is not a positive integer and the shard keeps applying writes" do
+      key = "lock:bad-ttl"
+
+      for ttl_ms <- [100.5, 0, -1, "100", 9_223_372_036_854_775_807] do
+        assert {:error, "ERR value is not an integer or out of range"} =
+                 FerricStore.lock(key, "owner", ttl_ms)
+      end
+
+      assert :ok = FerricStore.lock(key, "owner", 10_000)
+
+      assert {:error, "ERR value is not an integer or out of range"} =
+               FerricStore.extend(key, "owner", 100.5)
+
+      assert {:ok, 1} = FerricStore.extend(key, "owner", 20_000)
+
+      assert :ok = FerricStore.set("cas:bad-ttl", "a")
+
+      assert {:error, "ERR value is not an integer or out of range"} =
+               FerricStore.cas("cas:bad-ttl", "a", "b", ttl: 100.5)
+
+      assert {:ok, true} = FerricStore.cas("cas:bad-ttl", "a", "b", ttl: 10_000)
+    end
+
     test "acquire, extend, and release a lock" do
       assert :ok = FerricStore.lock("lk:key", "owner1", 30_000)
 

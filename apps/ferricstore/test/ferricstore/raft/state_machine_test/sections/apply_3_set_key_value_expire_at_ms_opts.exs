@@ -1040,6 +1040,26 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           assert [] == :ets.lookup(ets, key)
         end
 
+        test "LOCK, EXTEND and CAS reject an expiry that is not an integer", %{
+          state: state,
+          ets: ets
+        } do
+          key = "invalid_lock_expiry_apply"
+
+          for command <- [
+                {:lock, key, "owner", 1_000.5},
+                {:extend, key, "owner", 1_000.5},
+                {:cas, key, "a", "b", 1_000.5}
+              ] do
+            {_new_state, result} = StateMachine.apply(%{}, command, state)
+
+            assert {:error, "ERR value is not an integer or out of range"} = result,
+                   "#{inspect(command)} returned #{inspect(result)}"
+          end
+
+          assert [] == :ets.lookup(ets, key)
+        end
+
         test "crafted direct writes cannot bypass the replicated size limit", %{
           state: state,
           ets: ets

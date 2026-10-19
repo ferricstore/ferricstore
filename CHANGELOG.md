@@ -38,6 +38,12 @@ All notable changes to FerricStore will be documented here.
   float or string window reached the replicated log and raised while the
   shard applied it, with the same node shutdown; the state machine now also
   rejects such an entry instead of raising.
+- Reject a TTL that is not a positive integer in the embedded
+  `FerricStore.lock/3`, `FerricStore.extend/3` and `FerricStore.cas/4`, with
+  the LOCK, EXTEND and CAS commands' bound. A float TTL became a float expiry
+  that the shard's logical key index rejected while applying the write, with
+  the same storage crash and node shutdown; the state machine now also
+  rejects a non-integer lock or CAS expiry before writing.
 - Reject a TTL in the embedded `FerricStore.setex/3` and `FerricStore.psetex/3`
   that puts the expiry past the int64 range, with "ERR value is not an integer
   or out of range", as the SETEX and PSETEX commands and `FerricStore.pexpire/2`
