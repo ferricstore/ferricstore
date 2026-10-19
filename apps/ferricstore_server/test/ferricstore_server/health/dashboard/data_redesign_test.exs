@@ -159,4 +159,44 @@ defmodule FerricstoreServer.Health.Dashboard.DataRedesignTest do
 
     assert html =~ ~s(<span class="size-bar is-cold" style="width: 25%"></span>)
   end
+
+  test "Commands opens with traffic and slow log, never a measured zero for missing samples" do
+    busy =
+      KVPages.render_commands_summary(%{
+        summary: %{
+          total_commands: 12_000,
+          ops_per_sec: 4.2,
+          slowlog_entries: 3,
+          slowest_us: 12_500
+        }
+      })
+
+    assert busy =~ "commands-status is-idle"
+    assert busy =~ "<strong>12.0K commands since start</strong>"
+    assert busy =~ "4.2/s on average"
+    assert busy =~ "3 slow log entries, slowest 12.5 ms"
+
+    assert KVPages.render_commands_summary(%{summary: %{total_commands: 0}}) =~
+             "<strong>No commands since start</strong>"
+
+    unavailable = KVPages.render_commands_summary(%{summary: %{slowlog_status: :unavailable}})
+    assert unavailable =~ "commands-status is-warning"
+    assert unavailable =~ "Slow log unavailable"
+  end
+
+  test "an empty slow log is a prompt that links to the Slow log page" do
+    html = KVPages.render_command_slowlog_table(%{slow_by_command: []})
+
+    refute html =~ "<table"
+
+    assert html =~
+             ~s(<p class="section-empty">No slow commands recorded. <a href="/dashboard/slowlog">Open Slow log</a></p>)
+  end
+
+  test "the command groups are reference material and fold away" do
+    html = KVPages.render_kv_command_reference(%{})
+
+    assert html =~
+             ~s(<details class="dashboard-disclosure" id="command-reference"><summary>Command reference</summary>)
+  end
 end

@@ -254,19 +254,57 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
         true -> format_duration_us(slowest)
       end
 
-    render_ops_summary("Command Summary", [
-      %{label: "Commands", value: format_number(Map.get(summary, :total_commands, 0))},
-      %{
-        label: "Avg commands/sec",
-        value: to_string(Map.get(summary, :ops_per_sec, 0.0)),
-        detail: "since start"
-      },
-      %{
-        label: "Slowlog",
-        value: if(unavailable?, do: "Unavailable", else: format_number(count || 0))
-      },
-      %{label: "Slowest", value: latency}
-    ])
+    total = Map.get(summary, :total_commands, 0)
+
+    slow =
+      cond do
+        unavailable? ->
+          []
+
+        is_integer(count) and count > 0 and is_number(slowest) ->
+          [
+            "#{format_number(count)} slow log #{if count == 1, do: "entry", else: "entries"}, slowest #{format_duration_us(slowest)}"
+          ]
+
+        true ->
+          ["no slow commands"]
+      end
+
+    status =
+      cond do
+        unavailable? ->
+          PageStatus.render("commands", :warning, "Slow log unavailable", [
+            "#{format_number(total)} commands since start"
+          ])
+
+        total in [0, nil] ->
+          PageStatus.render("commands", :idle, "No commands since start")
+
+        true ->
+          PageStatus.render(
+            "commands",
+            :idle,
+            "#{format_number(total)} commands since start",
+            ["#{Map.get(summary, :ops_per_sec, 0.0)}/s on average"] ++ slow
+          )
+      end
+
+    status <>
+      render_ops_summary(
+        "Command Summary",
+        [
+          %{label: "Commands", value: format_number(Map.get(summary, :total_commands, 0))},
+          %{
+            label: "Avg commands/sec",
+            value: to_string(Map.get(summary, :ops_per_sec, 0.0)),
+            detail: "since start"
+          },
+          %{
+            label: "Slowlog",
+            value: if(unavailable?, do: "Unavailable", else: format_number(count || 0))
+          },
+          %{label: "Slowest", value: latency}
+        ], heading: :hidden)
   end
 
   def render_command_slowlog_table(data) do
@@ -275,12 +313,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
     body =
       case rows do
         [] ->
-          message =
-            if get_in(data, [:summary, :slowlog_status]) == :unavailable,
-              do: "Slow Log unavailable. Retry to collect command samples.",
-              else: "No slow commands recorded."
-
-          ~s(<tr><td colspan="4" class="c-muted">#{message}</td></tr>)
+          ""
 
         _ ->
           Enum.map_join(rows, "\n", fn row ->
@@ -295,12 +328,26 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
           end)
       end
 
+    content =
+      cond do
+        rows != [] ->
+          """
+          <table>
+            <thead><tr><th>Command</th><th>Entries</th><th>Worst</th><th>Average</th></tr></thead>
+            <tbody>#{body}</tbody>
+          </table>
+          """
+
+        get_in(data, [:summary, :slowlog_status]) == :unavailable ->
+          ~s(<p class="section-empty">Slow Log unavailable. Retry to collect command samples.</p>)
+
+        true ->
+          ~s(<p class="section-empty">No slow commands recorded. <a href="/dashboard/slowlog">Open Slow log</a></p>)
+      end
+
     """
-    <h2 class="section-title">Slow Log By Command</h2>
-    <table>
-      <thead><tr><th>Command</th><th>Entries</th><th>Worst</th><th>Average</th></tr></thead>
-      <tbody>#{body}</tbody>
-    </table>
+    <h2 class="section-title">Slow log by command</h2>
+    #{content}
     """
   end
 
@@ -323,8 +370,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
       end)
 
     """
-    <h2 class="section-title">Command Groups</h2>
-    <div class="kv-command-grid">#{body}</div>
+    <details class="dashboard-disclosure" id="command-reference"><summary>Command reference</summary>
+    <div class="dashboard-disclosure-body"><div class="kv-command-grid">#{body}</div></div>
+    </details>
     """
   end
 
