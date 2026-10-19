@@ -41,6 +41,16 @@ All notable changes to FerricStore will be documented here.
   text, smaller disclosure titles and summary cards that show words such as
   Unavailable as words. Table scroll boxes now contain positioned labels, which
   made Workers scroll sideways on phones.
+- Redesign the remaining workflow pages. Runs, Due and Workers open with a
+  status line saying what needs attention (each kind of problem counted
+  separately, never summed) with a link to Failures. Runs gets a state split
+  bar and a six-column states table. Due rows lead with how overdue a run is.
+  Worker rows show leases as bars with the expired share. Signals offers its
+  opt-in history scan as one click, Lineage offers recent runs to start
+  from, and empty sections across these pages are short prompts instead of
+  empty tables.
+- Show signed-in users the query prompt (for example "Enter a partition
+  key") instead of "0 visible row(s)" before a query has run.
 
 ## 0.12.6 - 2026-10-19
 
