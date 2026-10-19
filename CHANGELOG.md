@@ -24,6 +24,10 @@ All notable changes to FerricStore will be documented here.
   or out of range", as the SETEX and PSETEX commands and `FerricStore.pexpire/2`
   already do. They stored the expiry unbounded, so TTL then reported values no
   int64 client can read.
+- Answer an HTTP command batch whose JSON reply holds bytes that are not
+  UTF-8 with a `binary_reply` error for that command. JSON encoding raised
+  instead, so the client got HTTP 500 for a batch that had already run,
+  inviting a retry of every command in it, and the bytes were logged.
 
 - Redesign the dashboard shell. The sidebar has 18 destinations in
   always-open sections instead of about 30 links in collapsible groups; lower-use

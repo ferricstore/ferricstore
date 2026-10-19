@@ -485,6 +485,46 @@ defmodule FerricstoreHttp.OssIntegrationTest do
              ])
   end
 
+  test "a JSON reply that is not valid UTF-8 is that command's error, not a failed batch" do
+    :ok = CatalogProjector.mark_ready()
+    unique = System.unique_integer([:positive, :monotonic])
+    username = "http-utf8-#{unique}"
+    password = "integration-secret"
+    key = "http:utf8:#{unique}"
+
+    assert :ok =
+             FerricstoreServer.Acl.set_user(username, [
+               "on",
+               ">#{password}",
+               "+SET",
+               "+GET",
+               "+GETRANGE",
+               "~http:utf8:*"
+             ])
+
+    HttpHelpers.start_server(backend: FerricstoreHttp.Backends.Ferricstore)
+
+    # The first byte of a two-byte character is not valid UTF-8 on its own.
+    commands = [["SET", key, "é"], ["GETRANGE", key, "0", "0"], ["GET", key]]
+
+    assert {200, _headers, body} =
+             HttpHelpers.request(
+               :post,
+               "/v1/commands",
+               "application/json",
+               [HttpHelpers.basic(username, password)],
+               Jason.encode!(%{"commands" => commands})
+             )
+
+    assert %{
+             "results" => [
+               %{"status" => "ok", "value" => "OK"},
+               %{"status" => "error", "error" => %{"code" => "binary_reply"}},
+               %{"status" => "ok", "value" => "é"}
+             ]
+           } = Jason.decode!(body)
+  end
+
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 end

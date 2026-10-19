@@ -51,6 +51,10 @@ MessagePack binary values use the MessagePack binary type and do not incur base6
 For compatibility, `{"commands":[["PING"]]}` is accepted. It is suitable only for JSON/UTF-8-safe
 commands and values. New SDK integrations should use binary-safe JSON or MessagePack.
 
+A JSON response cannot carry bytes that are not UTF-8, so a command whose reply holds such bytes
+returns a `binary_reply` command error in its position; the rest of the batch is unaffected. Use
+the binary-safe JSON or MessagePack encoding to read binary values.
+
 ## Success response
 
 HTTP `200` means the batch was accepted and executed in order. Individual command failures remain
