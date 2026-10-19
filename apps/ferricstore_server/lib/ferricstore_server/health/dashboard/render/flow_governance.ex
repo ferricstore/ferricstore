@@ -98,6 +98,19 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
   def render_flow_governance_summary(data) do
     counts = Map.get(data, :counts, %{})
 
+    if Map.get(data, :error) do
+      # The overview failed, so every count is unmeasured rather than zero.
+      PageStatus.render("governance", :warning, "Governance records unavailable", [
+        "the overview could not be loaded, so nothing is counted"
+      ]) <>
+        render_flow_governance_flash(Map.get(data, :flash)) <>
+        render_flow_governance_error(Map.get(data, :error))
+    else
+      render_flow_governance_counts(data, counts)
+    end
+  end
+
+  defp render_flow_governance_counts(data, counts) do
     """
     #{render_flow_governance_status(counts)}
     <dl class="stat-strip" aria-label="Governance counts">
@@ -156,8 +169,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
         )
 
       total == 0 ->
-        PageStatus.render("governance", :idle, "Governance is not in use", [
-          "No approvals, budgets, limits or circuits are visible."
+        PageStatus.render("governance", :idle, "No governance records visible", [
+          "no approvals, budgets, limits or circuits in the scopes you can see"
         ])
 
       true ->
@@ -166,7 +179,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
           :healthy,
           "Nothing waiting",
           [
-            "no pending approvals or open circuits"
+            "no pending approvals or open circuits in visible scopes"
           ] ++ half
         )
     end

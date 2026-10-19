@@ -51,7 +51,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
       cond do
         not protected_mode ->
           PageStatus.render("security", :warning, "Protected mode is off", [
-            "remote connections are accepted even when no password is set"
+            "the dashboard needs no sign-in, and with no password set remote clients connect without one"
           ])
 
         not configured_users ->
@@ -65,7 +65,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Security do
             :healthy,
             "Protected: #{format_number(users)} ACL #{if users == 1, do: "user", else: "users"}",
             [
-              "signed in as #{current_user}",
+              if(Map.get(data, :current_user),
+                do: "signed in as #{current_user}",
+                else: "not signed in"
+              ),
               if(can_mutate, do: "account changes enabled", else: "read only")
             ]
           )

@@ -205,7 +205,7 @@ defmodule FerricstoreServer.Health.Dashboard.DataRedesignTest do
   test "Streams opens with activity in the retained window" do
     idle = MessagingPages.render_stream_activity_summary(%{})
     assert idle =~ "streams-status is-idle"
-    assert idle =~ "<strong>No stream activity in the retained window</strong>"
+    assert idle =~ "<strong>No visible stream activity in the retained window</strong>"
 
     busy =
       MessagingPages.render_stream_activity_summary(%{
@@ -218,7 +218,7 @@ defmodule FerricstoreServer.Health.Dashboard.DataRedesignTest do
   end
 
   test "Pub/Sub opens with active subscriptions" do
-    assert MessagingPages.render_pubsub_summary(%{}) =~ "<strong>No active subscriptions</strong>"
+    assert MessagingPages.render_pubsub_summary(%{}) =~ "<strong>No visible subscriptions</strong>"
 
     html =
       MessagingPages.render_pubsub_summary(%{

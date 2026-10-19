@@ -38,12 +38,18 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Capabilities do
       |> Enum.map_join(", ", fn {name, _value} -> to_string(name) end)
 
     status =
-      PageStatus.render(
-        "capabilities",
-        :idle,
-        "#{format_number(supported)} of #{format_number(length(ordered_capability_entries(capabilities)))} capabilities supported",
-        if(unsupported_names == "", do: [], else: ["unsupported: #{unsupported_names}"])
-      )
+      if map_size(capabilities) == 0 do
+        PageStatus.render("capabilities", :warning, "Capabilities unavailable", [
+          "FERRICSTORE.CAPABILITIES returned nothing to show"
+        ])
+      else
+        PageStatus.render(
+          "capabilities",
+          :idle,
+          "#{format_number(supported)} of #{format_number(length(ordered_capability_entries(capabilities)))} capabilities supported",
+          if(unsupported_names == "", do: [], else: ["unsupported: #{unsupported_names}"])
+        )
+      end
 
     status <>
       render_ops_summary(
@@ -65,7 +71,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Capabilities do
             class: "ops-summary-code",
             detail: "stable read-only SDK/native contract"
           }
-        ], heading: :hidden)
+        ],
+        heading: :hidden
+      )
   end
 
   def render_management_capability_table(capabilities) when is_map(capabilities) do

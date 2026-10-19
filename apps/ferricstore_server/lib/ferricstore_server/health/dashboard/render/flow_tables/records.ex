@@ -122,7 +122,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
   def render_flow_states_overview(_states, _sampled, :unavailable, _filters), do: ""
   def render_flow_states_overview([], _sampled, _source_status, _filters), do: ""
 
-  def render_flow_states_overview(states, sampled, _source_status, filters) do
+  def render_flow_states_overview(states, sampled, source_status, filters) do
     attention =
       [
         {sum_states(states, :expired_leases), "with expired leases"},
@@ -132,22 +132,30 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
       |> Enum.filter(fn {count, _label} -> count > 0 end)
 
     status =
-      case attention do
-        [] ->
+      case {attention, source_status} do
+        {[], :partial} ->
+          # Terminal records did not load, and failed runs live there.
+          PageStatus.render("runs", :idle, "No problems in the records that loaded", [
+            "terminal records are unavailable, so failed runs may be missing"
+          ])
+
+        {[], _ok} ->
           PageStatus.render(
             "runs",
             :healthy,
             "No runs need attention in this sample of #{format_grouped(sampled)}"
           )
 
-        items ->
+        {items, _status} ->
           failures = FlowOverview.flow_failure_investigation_path(%{filters: filters})
+          partial = if source_status == :partial, do: ["partial results"], else: []
 
           PageStatus.render(
             "runs",
             :warning,
             "Needs attention",
-            Enum.map(items, fn {count, label} -> "#{format_grouped(count)} #{label}" end),
+            Enum.map(items, fn {count, label} -> "#{format_grouped(count)} #{label}" end) ++
+              partial,
             ~s(<a href="#{escape_attr(failures)}">Open Failures</a>)
           )
       end

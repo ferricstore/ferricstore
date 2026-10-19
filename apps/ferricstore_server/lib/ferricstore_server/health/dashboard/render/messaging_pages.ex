@@ -13,7 +13,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
 
     status =
       if mutations in [0, nil] do
-        PageStatus.render("streams", :idle, "No stream activity in the retained window")
+        PageStatus.render("streams", :idle, "No visible stream activity in the retained window")
       else
         PageStatus.render(
           "streams",
@@ -189,7 +189,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
 
     status =
       if subscriptions == 0 do
-        PageStatus.render("pubsub", :idle, "No active subscriptions")
+        PageStatus.render("pubsub", :idle, "No visible subscriptions")
       else
         subscribers =
           case Map.get(summary, :active_subscribers) do

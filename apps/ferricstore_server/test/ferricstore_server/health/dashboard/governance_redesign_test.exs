@@ -27,13 +27,13 @@ defmodule FerricstoreServer.Health.Dashboard.GovernanceRedesignTest do
     assert html =~ "<strong>2 approvals waiting</strong>"
   end
 
-  test "records with nothing waiting read as healthy, and no records as not in use" do
+  test "records with nothing waiting read as healthy, and no records as none visible" do
     assert summary(approvals: 3, budgets: 1, circuits: 2) =~ "<strong>Nothing waiting</strong>"
 
     unused = summary([])
     assert unused =~ "governance-status is-idle"
-    assert unused =~ "<strong>Governance is not in use</strong>"
-    assert unused =~ "No approvals, budgets, limits or circuits are visible."
+    assert unused =~ "<strong>No governance records visible</strong>"
+    assert unused =~ "no approvals, budgets, limits or circuits in the scopes you can see"
   end
 
   test "the six counts are one compact strip instead of cards" do
