@@ -591,7 +591,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
 
           assert String.contains?(html, ~s(name="max_active_ms"))
           assert String.contains?(html, ~s(value="90000"))
-          assert String.contains?(html, "Max Active")
+          assert String.contains?(html, "Max active")
         end
 
         test "policy form writes state-level FIFO mode without dropping existing overrides" do

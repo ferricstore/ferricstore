@@ -67,9 +67,11 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-row-menu-panel { display: grid; gap: 6px; min-width: 180px; margin-top: 6px; padding: 8px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface-raised); white-space: normal; }
       .flow-row-menu-item { display: block; padding: 6px 8px; border-radius: 6px; color: var(--text-body); text-decoration: none; }
       .flow-row-menu-item:hover { background: var(--surface-selected); }
-      .table-scroll .flow-policy-table { min-width: 1480px; }
+      .table-scroll .flow-policy-table { min-width: 1180px; }
+      .flow-policy-table td:first-child .flow-run-secondary { display: block; margin-top: 2px; font-family: var(--font-sans); }
       :is(.flow-policy-table, .flow-schedules-table) tr > :first-child:not([colspan]) { position: sticky; left: 0; z-index: 2; background: var(--surface-raised); min-width: 180px; width: 180px; border-right: 1px solid var(--line); }
       :is(.flow-policy-table, .flow-schedules-table) tr > :last-child:not([colspan]) { position: sticky; right: 0; z-index: 2; background: var(--surface-raised); min-width: 280px; width: 280px; border-left: 1px solid var(--line); white-space: normal; }
+      .flow-policy-table tr > :last-child:not([colspan]) { min-width: 96px; width: 96px; }
       :is(.flow-policy-table, .flow-schedules-table) thead tr > :is(:first-child, :last-child) { z-index: 3; background: var(--surface-selected); }
       .flow-schedule-definition-row > td { white-space: normal; }
       .flow-schedule-definition-row .dashboard-disclosure { margin: 0; }
