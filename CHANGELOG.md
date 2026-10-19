@@ -69,6 +69,15 @@ All notable changes to FerricStore will be documented here.
   folded below it and the route reference folded away. Config states how
   many parameters there are and trims its table to four columns with a row
   filter, and Capabilities names what is unsupported.
+- Make the dashboard's status lines say no more than their data supports.
+  - A failed Governance load reads as unavailable, not as unused.
+  - Partial Runs results never show a healthy line.
+  - Lists capped when collected (Due's scheduled runs, Prefixes, Slow log)
+    report their full counts or say what they show.
+  - Clients counts blocked clients instead of the keys they wait on.
+  - Policies compares state overrides before calling a policy shared.
+  - Access-filtered empty states say "visible".
+  - Sampled hot reads are labelled estimates.
 
 ## 0.12.6 - 2026-10-19
 
