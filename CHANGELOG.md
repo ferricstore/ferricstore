@@ -44,6 +44,10 @@ All notable changes to FerricStore will be documented here.
   that the shard's logical key index rejected while applying the write, with
   the same storage crash and node shutdown; the state machine now also
   rejects a non-integer lock or CAS expiry before writing.
+- Answer a failed typed RATELIMIT.ADD request on the native protocol with an
+  error. The opcode wrapped every result as a success, so an error such as an
+  out-of-range window reached the client as a successful reply carrying the
+  error tuple.
 - Reject a TTL in the embedded `FerricStore.setex/3` and `FerricStore.psetex/3`
   that puts the expiry past the int64 range, with "ERR value is not an integer
   or out of range", as the SETEX and PSETEX commands and `FerricStore.pexpire/2`

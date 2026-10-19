@@ -5109,6 +5109,24 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert payload =~ "CLIENT TRACKING is not supported"
   end
 
+  test "typed RATELIMIT.ADD answers a rejected request as an error, not a successful reply" do
+    key = "native:ratelimit:#{System.unique_integer([:positive])}"
+
+    assert {:error, "ERR value is not an integer or out of range", _state} =
+             Commands.execute(
+               @op_ratelimit_add,
+               %{"key" => key, "window_ms" => 9_223_372_036_854_775_807, "max" => 5},
+               state()
+             )
+
+    assert {:ok, ["allowed", 1, 4, _reset_ms], _state} =
+             Commands.execute(
+               @op_ratelimit_add,
+               %{"key" => key, "window_ms" => 1_000, "max" => 5},
+               state()
+             )
+  end
+
   defp state(overrides \\ %{}) do
     %{
       client_id: System.unique_integer([:positive, :monotonic]),

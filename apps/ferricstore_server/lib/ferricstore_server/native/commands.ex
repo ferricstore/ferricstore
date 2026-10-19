@@ -1138,10 +1138,10 @@ defmodule FerricstoreServer.Native.Commands do
          {:ok, window_ms} <- require_pos_integer(payload, "window_ms"),
          {:ok, max} <- require_pos_integer(payload, "max"),
          {:ok, count} <- optional_pos_integer(payload, "count", 1) do
-      result_to_reply(
-        {:ok, Ops.ratelimit_add(state.instance_ctx, key, window_ms, max, count)},
-        state
-      )
+      case Ops.ratelimit_add(state.instance_ctx, key, window_ms, max, count) do
+        {:error, _reason} = error -> result_to_reply(error, state)
+        result -> result_to_reply({:ok, result}, state)
+      end
     else
       {:error, reason} -> {:bad_request, reason, state}
     end
