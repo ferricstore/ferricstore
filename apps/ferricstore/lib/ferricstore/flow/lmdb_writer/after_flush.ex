@@ -292,7 +292,7 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
     case :ets.lookup(ets, state_key) do
       [{^state_key, _value, _expire_at_ms, _lfu, file_id, offset, value_size} = row] ->
         if file_id == locator.file_id and offset == locator.offset and
-             value_size == locator.value_size do
+             value_size == locator.value_size and Keydir.outlives_keydir?(row) do
           with :ok <- ensure_apply_projection_row_durable(data_dir, shard_index, row) do
             with_publication_write(publication_ctx, shard_index, fn ->
               if Keydir.delete_unchanged_source(ets, row) do
@@ -469,7 +469,8 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
 
     case rows do
       [row] ->
-        with :ok <- ensure_apply_projection_row_durable(data_dir, shard_index, row),
+        with :ok <- prunable_source(row),
+             :ok <- ensure_apply_projection_row_durable(data_dir, shard_index, row),
              :ok <- terminal_prune_row_matches?(data_dir, shard_index, state_key, row, identity) do
           with_publication_write(publication_ctx, shard_index, fn ->
             case delete_pruned_keydir_entry(ets, row) do
@@ -513,6 +514,10 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
 
   defp offheap_size(value) when is_binary(value) and byte_size(value) > 64, do: byte_size(value)
   defp offheap_size(_value), do: 0
+
+  defp prunable_source(row) do
+    if Keydir.outlives_keydir?(row), do: :ok, else: :stale
+  end
 
   defp delete_pruned_keydir_entry(ets, row) do
     if Keydir.delete_unchanged_source(ets, row) do

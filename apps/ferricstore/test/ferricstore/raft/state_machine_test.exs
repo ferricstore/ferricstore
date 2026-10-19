@@ -1527,6 +1527,33 @@ defmodule Ferricstore.Raft.StateMachineTest do
              )
   end
 
+  # Segment-projection frame numbers are log positions that every projection
+  # rewrite renumbers, and a rewrite keeps only keydir rows, so a cold park
+  # pointing at one would lose its record at the next rewrite.
+  test "a hot Flow on the segment projection is not a hibernation candidate", %{
+    state: state,
+    ets: ets
+  } do
+    id = "hibernation-projection-hot"
+    partition_key = "hibernation-projection-tenant"
+    key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+    record = replay_flow_record(id, partition_key)
+    value = Ferricstore.Flow.encode_record(record)
+
+    :ets.insert(
+      ets,
+      {key, value, 0, LFU.initial(), {:waraft_projection, 7}, 40, byte_size(value)}
+    )
+
+    assert :skip =
+             StateMachine.__flow_hibernation_locator_from_hot_for_test__(
+               state,
+               key,
+               record,
+               value
+             )
+  end
+
   @tag :flow_replay_visibility
   test "WARaft recovery does not clean future hibernation metadata", %{state: state} do
     id = "replay-future-hibernated-timeout"

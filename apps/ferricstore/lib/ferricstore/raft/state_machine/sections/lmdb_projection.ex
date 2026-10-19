@@ -528,10 +528,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
         ra_index = current_ra_index() || version
 
         case :ets.lookup(state.ets, key) do
-          [{^key, current_value, expire_at_ms, _lfu, file_id, offset, value_size}]
+          [{^key, current_value, expire_at_ms, _lfu, file_id, offset, value_size} = row]
           when valid_cold_location(file_id, offset, value_size) or
                  valid_waraft_segment_location(file_id, offset, value_size) ->
-            if flow_keydir_file_visible_during_recovery?(state, file_id) and
+            if Ferricstore.Store.Keydir.outlives_keydir?(row) and
+                 flow_keydir_file_visible_during_recovery?(state, file_id) and
                  flow_hibernation_candidate_current?(current_value, state_value, record) do
               Locator.new(
                 flow_id: Map.fetch!(record, :id),

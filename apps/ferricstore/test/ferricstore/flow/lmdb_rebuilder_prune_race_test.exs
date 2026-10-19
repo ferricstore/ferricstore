@@ -124,6 +124,84 @@ defmodule Ferricstore.Flow.LMDBRebuilderPruneRaceTest do
     end
   end
 
+  # Segment-projection frame numbers are log positions that every projection
+  # rewrite renumbers, and a rewrite keeps only keydir rows. A Flow whose record
+  # sits there must stay in the keydir, or the next rewrite drops its record.
+  test "terminal rebuild pruning keeps a row that sits on the segment projection" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "rebuild-prune-projection-#{System.unique_integer([:positive])}"
+      )
+
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+    keydir = :ets.new(:rebuild_prune_projection_keydir, [:set])
+    bytes = :atomics.new(1, signed: true)
+    id = "prune-projection"
+    key = Keys.state_key(id)
+
+    encoded =
+      Ferricstore.Flow.encode_record(%{
+        id: id,
+        type: "prune",
+        state: "completed",
+        version: 1,
+        incarnation: 1,
+        attempts: 0,
+        fencing_token: 0,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        next_run_at_ms: nil,
+        priority: 0,
+        partition_key: nil,
+        root_flow_id: id
+      })
+
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+
+    projection_root =
+      Path.join([data_dir, "waraft", "ferricstore_waraft_backend.1", "segment_projection_log"])
+
+    assert :ok =
+             :ferricstore_waraft_spike_segment_log.write_projection(
+               to_charlist(projection_root),
+               {:raft_log_pos, 10, 1},
+               [{key, encoded, 0}]
+             )
+
+    assert {:ok, {index, offset}} =
+             :ferricstore_waraft_spike_segment_log.fold_disk(
+               to_charlist(projection_root),
+               fn
+                 index, {_term, {:ferricstore_segment_projection_entry, ^key, _, _}}, loc, _acc ->
+                   {index, elem(loc, 1)}
+
+                 _index, _entry, _location, acc ->
+                   acc
+               end,
+               nil
+             )
+
+    row = {key, encoded, 0, 0, {:waraft_projection, index}, offset, byte_size(encoded)}
+    true = :ets.insert(keydir, row)
+    ctx = %{data_dir: data_dir, shard_count: 1, keydir_binary_bytes: bytes}
+
+    assert :ok =
+             LMDBRebuilder.reconcile_shard(
+               shard_path,
+               keydir,
+               0,
+               ctx,
+               nil,
+               nil,
+               nil,
+               nil,
+               prune_terminal_keydir?: true
+             )
+
+    assert :ets.lookup(keydir, key) == [row]
+  end
+
   defp offheap(binary) when byte_size(binary) > 64, do: byte_size(binary)
   defp offheap(_), do: 0
 end

@@ -321,6 +321,58 @@ defmodule Ferricstore.Flow.Query.QueryRowCodecTest do
              QueryRowCodec.relocate(encoded, @state_key, old_locator, newer)
   end
 
+  # A projection-log frame number is also the locator's raft_index, and every
+  # rewrite of that log renumbers its frames.
+  test "moving a projection locator changes only its frame and keeps the rest of the row" do
+    old_locator =
+      locator(
+        file_id: {:waraft_projection, 37_548},
+        raft_index: 37_548,
+        segment_generation: 0,
+        offset: 17_670_794,
+        frame_size: 2_074,
+        expire_at_ms: 9_000
+      )
+
+    moved = %{
+      old_locator
+      | file_id: {:waraft_projection, 41_002},
+        raft_index: 41_002,
+        segment_generation: 2,
+        offset: 17_700_000
+    }
+
+    assert {:ok, encoded} = QueryRowCodec.encode(@state_key, record(), old_locator, 9_000)
+
+    assert {:ok, moved_row} =
+             QueryRowCodec.move_projection_locator(encoded, @state_key, old_locator, moved)
+
+    assert {:ok, %{record: decoded, locator: ^moved, expire_at_ms: 9_000}} =
+             QueryRowCodec.decode(moved_row, @state_key)
+
+    assert decoded == record()
+
+    stale = %{old_locator | offset: old_locator.offset + 1}
+
+    assert {:error, :locator_compare_failed} =
+             QueryRowCodec.move_projection_locator(encoded, @state_key, stale, moved)
+
+    other_record = %{moved | checksum: :crypto.hash(:sha256, "another record")}
+
+    assert {:error, :locator_compare_failed} =
+             QueryRowCodec.move_projection_locator(encoded, @state_key, old_locator, other_record)
+
+    off_projection = %{moved | file_id: {:waraft_apply_projection, 41_002}}
+
+    assert {:error, :invalid_query_row} =
+             QueryRowCodec.move_projection_locator(
+               encoded,
+               @state_key,
+               old_locator,
+               off_projection
+             )
+  end
+
   test "applies expiry without decoding expired metadata" do
     assert {:ok, encoded} =
              QueryRowCodec.encode(@state_key, record(), locator(expire_at_ms: 2_000), 2_000)

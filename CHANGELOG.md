@@ -4,6 +4,22 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.5 - 2026-10-19
+
+- Stop losing the record of a Flow whose state sits on the segment projection.
+  The projection's frame numbers are positions that every rewrite renumbers,
+  and a rewrite keeps only keydir rows. Terminal prune, hibernation eviction
+  and the LMDB rebuilder's terminal prune could drop such a Flow's keydir row
+  and leave LMDB pointing at a frame number, so the next rewrite (a checkpoint,
+  or the rebuild at a trim or shutdown) discarded the record. This happened
+  after a restart, when the LMDB writer replays Flows whose rows were loaded
+  from the projection; it is how the 0.12.4 startup failure came about. Such a
+  Flow now stays in the keydir and is not hibernated.
+- Repair a QueryRow left on a renumbered projection frame. A read of such a
+  Flow returned `:query_storage_inconsistent`; the repair now takes the
+  record's current frame from the keydir, checks that the frame holds it, and
+  moves the row there.
+
 ## 0.12.4 - 2026-10-18
 
 - Start when a Flow's stored state record can no longer be read back. A

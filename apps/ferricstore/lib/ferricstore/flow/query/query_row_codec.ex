@@ -308,6 +308,54 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
   def relocate(_encoded, _state_key, _expected, _relocated),
     do: {:error, :invalid_query_row}
 
+  @doc false
+  # Every rewrite of the projection log renumbers its frames, and a projection
+  # locator's raft_index is its frame number, so moving a row to the frame its
+  # record now has changes that index too. The rest of the row is kept as is.
+  @spec move_projection_locator(binary(), binary(), Locator.t(), Locator.t()) ::
+          {:ok, binary()} | {:error, :locator_compare_failed | :invalid_query_row}
+  def move_projection_locator(
+        encoded,
+        state_key,
+        %Locator{file_id: {:waraft_projection, _}} = expected,
+        %Locator{file_id: {:waraft_projection, _}} = moved
+      )
+      when is_binary(encoded) and is_binary(state_key) do
+    with true <- same_projection_record?(expected, moved),
+         {:ok, id, version, expire_at_ms, encoded_scope, encoded_locator, encoded_metadata} <-
+           split_row(encoded, state_key),
+         {:ok, ^expected} <- decode_locator(encoded_locator, id, version, expire_at_ms),
+         {:ok, moved_row} <-
+           encode_components(
+             state_key,
+             id,
+             version,
+             encoded_scope,
+             encoded_metadata,
+             moved,
+             expire_at_ms
+           ) do
+      {:ok, moved_row}
+    else
+      false -> {:error, :locator_compare_failed}
+      {:ok, %Locator{}} -> {:error, :locator_compare_failed}
+      _invalid -> {:error, :invalid_query_row}
+    end
+  rescue
+    _error -> {:error, :invalid_query_row}
+  catch
+    _kind, _reason -> {:error, :invalid_query_row}
+  end
+
+  def move_projection_locator(_encoded, _state_key, _expected, _moved),
+    do: {:error, :invalid_query_row}
+
+  defp same_projection_record?(%Locator{} = expected, %Locator{} = moved) do
+    expected.flow_id == moved.flow_id and expected.kind == moved.kind and
+      expected.version == moved.version and expected.value_size == moved.value_size and
+      expected.checksum == moved.checksum and expected.expire_at_ms == moved.expire_at_ms
+  end
+
   defp decode_row(encoded, state_key), do: decode_row(encoded, state_key, :full)
 
   defp decode_row(encoded, state_key, decode_plan)
@@ -351,24 +399,9 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
 
   defp decode_row(_encoded, _state_key, _decode_plan), do: :error
 
-  defp decode_reference_row(encoded, state_key)
-       when byte_size(encoded) <= @maximum_encoded_bytes and
-              byte_size(state_key) <= @maximum_state_key_bytes do
-    with {:ok, id} <- decode_state_key(state_key),
-         <<@magic::binary, expected_checksum::unsigned-big-32, row_body::binary>> <- encoded,
-         true <- :erlang.crc32([state_key, row_body]) == expected_checksum,
-         {:ok, version, rest} <- QueryRowPrimitives.decode_u64(row_body),
-         {:ok, expire_at_ms, rest} <- QueryRowPrimitives.decode_u64(rest),
-         <<scope_bytes::unsigned-big-16, locator_bytes::unsigned-big-16,
-           metadata_bytes::unsigned-big-16, payload::binary>> <- rest,
-         true <- scope_bytes <= @maximum_scope_bytes,
-         true <- locator_bytes > 0 and locator_bytes <= @maximum_locator_bytes,
-         true <- metadata_bytes <= @maximum_metadata_bytes,
-         true <- scope_bytes + metadata_bytes <= @maximum_metadata_bytes,
-         true <- byte_size(payload) == scope_bytes + locator_bytes + metadata_bytes,
-         <<_encoded_scope::binary-size(^scope_bytes),
-           encoded_locator::binary-size(^locator_bytes),
-           _encoded_metadata::binary-size(^metadata_bytes)>> <- payload,
+  defp decode_reference_row(encoded, state_key) do
+    with {:ok, id, version, expire_at_ms, _encoded_scope, encoded_locator, _encoded_metadata} <-
+           split_row(encoded, state_key),
          {:ok, locator} <- decode_locator(encoded_locator, id, version, expire_at_ms) do
       {:ok,
        %QueryRowReference{
@@ -387,7 +420,31 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
     _kind, _reason -> :error
   end
 
-  defp decode_reference_row(_encoded, _state_key), do: :error
+  # The row's fields, with its scope, locator and metadata still encoded.
+  defp split_row(encoded, state_key)
+       when is_binary(encoded) and byte_size(encoded) <= @maximum_encoded_bytes and
+              is_binary(state_key) and byte_size(state_key) <= @maximum_state_key_bytes do
+    with {:ok, id} <- decode_state_key(state_key),
+         <<@magic::binary, expected_checksum::unsigned-big-32, row_body::binary>> <- encoded,
+         true <- :erlang.crc32([state_key, row_body]) == expected_checksum,
+         {:ok, version, rest} <- QueryRowPrimitives.decode_u64(row_body),
+         {:ok, expire_at_ms, rest} <- QueryRowPrimitives.decode_u64(rest),
+         <<scope_bytes::unsigned-big-16, locator_bytes::unsigned-big-16,
+           metadata_bytes::unsigned-big-16, payload::binary>> <- rest,
+         true <- scope_bytes <= @maximum_scope_bytes,
+         true <- locator_bytes > 0 and locator_bytes <= @maximum_locator_bytes,
+         true <- metadata_bytes <= @maximum_metadata_bytes,
+         true <- scope_bytes + metadata_bytes <= @maximum_metadata_bytes,
+         true <- byte_size(payload) == scope_bytes + locator_bytes + metadata_bytes,
+         <<encoded_scope::binary-size(^scope_bytes), encoded_locator::binary-size(^locator_bytes),
+           encoded_metadata::binary-size(^metadata_bytes)>> <- payload do
+      {:ok, id, version, expire_at_ms, encoded_scope, encoded_locator, encoded_metadata}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp split_row(_encoded, _state_key), do: :error
 
   defp public_record(record) do
     public =

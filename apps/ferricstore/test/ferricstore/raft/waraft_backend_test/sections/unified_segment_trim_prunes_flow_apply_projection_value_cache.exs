@@ -937,6 +937,105 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
                  )
       end
 
+      # A projection rewrite renumbers its frames, so a QueryRow that names a
+      # projection frame goes stale. The Flow stays in the keydir, whose row
+      # follows the record, and a read repairs the QueryRow from it.
+      test "a QueryRow on a renumbered projection frame is repaired on read", %{
+        root: root,
+        ctx: ctx
+      } do
+        assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+        record = %{
+          id: "projection-renumber-run",
+          type: "job",
+          state: "completed",
+          version: 3,
+          priority: 0,
+          partition_key: "tenant-a",
+          created_at_ms: 100,
+          updated_at_ms: 200,
+          next_run_at_ms: 0,
+          lease_deadline_ms: nil,
+          attempts: 1,
+          run_state: "terminal",
+          max_active_ms: 10_000,
+          state_enter_seq: 3,
+          history_max_events: 100,
+          history_hot_max_events: 10,
+          parent_flow_id: nil,
+          root_flow_id: nil,
+          correlation_id: nil
+        }
+
+        state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+        encoded_record = Ferricstore.Flow.encode_record(record)
+        keydir = elem(ctx.keydir_refs, 0)
+
+        assert :ok = WARaftBackend.write(0, {:put, state_key, encoded_record, 0})
+        {log, trim_index} = append_waraft_fence!("projection-renumber:fence-1", "v")
+        assert {:ok, _state} = :ferricstore_waraft_spike_segment_log.trim(log, trim_index, %{})
+
+        assert [{^state_key, _value, 0, _lfu, {:waraft_projection, old_index}, _offset, _size}] =
+                 :ets.lookup(keydir, state_key)
+
+        assert {:ok, {ordinal, offset, frame_size}} =
+                 Ferricstore.Raft.WARaftSegmentReader.physical_location(
+                   ctx,
+                   0,
+                   {:waraft_projection, old_index}
+                 )
+
+        old_locator =
+          Ferricstore.Flow.Locator.new!(
+            flow_id: record.id,
+            kind: :state,
+            version: record.version,
+            raft_index: old_index,
+            file_id: {:waraft_projection, old_index},
+            segment_generation: ordinal,
+            offset: offset,
+            frame_size: frame_size,
+            value_size: byte_size(encoded_record),
+            checksum: :crypto.hash(:sha256, encoded_record)
+          )
+
+        assert {:ok, query_row} =
+                 Ferricstore.Flow.Query.QueryRowCodec.encode(state_key, record, old_locator, 0)
+
+        lmdb_path =
+          root
+          |> Ferricstore.DataDir.shard_data_path(0)
+          |> Ferricstore.Flow.LMDB.path()
+
+        assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:put, state_key, query_row}])
+
+        # A key that sorts first shifts every later frame on the next rewrite.
+        assert :ok = WARaftBackend.write(0, {:put, "a:projection-renumber", "v", 0})
+        {log, trim_index} = append_waraft_fence!("projection-renumber:fence-2", "v")
+        assert {:ok, _state} = :ferricstore_waraft_spike_segment_log.trim(log, trim_index, %{})
+
+        assert [{^state_key, _value, 0, _lfu, {:waraft_projection, new_index}, _offset, _size}] =
+                 :ets.lookup(keydir, state_key)
+
+        assert new_index != old_index
+
+        assert {:ok, [%{id: "projection-renumber-run", version: 3}], true} =
+                 Ferricstore.Flow.Query.QueryRecordStore.read_many(
+                   ctx,
+                   0,
+                   lmdb_path,
+                   [state_key],
+                   System.system_time(:millisecond),
+                   1_000_000
+                 )
+
+        assert {:ok, repaired_row} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+
+        assert {:ok, %{locator: %{file_id: {:waraft_projection, ^new_index}}}} =
+                 Ferricstore.Flow.Query.QueryRowCodec.decode(repaired_row, state_key)
+      end
+
       @tag :apply_projection_log_compaction
       test "unified segment trim serializes disk rewrite with an in-flight cache spill", %{
         root: root,

@@ -187,11 +187,18 @@ defmodule Ferricstore.Flow.Query.QueryRowRelocator do
 
   defp build_updates(entries, dependencies) do
     entries
-    |> Enum.group_by(& &1.locator.file_id)
+    |> Enum.group_by(&target_file_id(dependencies, &1.state_key, &1.locator))
     |> Enum.reduce_while({:ok, [], 0}, fn {file_id, grouped_entries}, {:ok, acc, skipped} ->
       case locate(dependencies, file_id) do
         {:ok, location} ->
-          case build_group_updates(grouped_entries, location, dependencies, acc, skipped) do
+          case build_group_updates(
+                 grouped_entries,
+                 file_id,
+                 location,
+                 dependencies,
+                 acc,
+                 skipped
+               ) do
             {:ok, next, next_skipped} -> {:cont, {:ok, next, next_skipped}}
             {:error, _reason} = error -> {:halt, error}
           end
@@ -206,28 +213,38 @@ defmodule Ferricstore.Flow.Query.QueryRowRelocator do
     end
   end
 
-  defp build_group_updates([], _location, _dependencies, acc, skipped), do: {:ok, acc, skipped}
+  defp build_group_updates([], _file_id, _location, _dependencies, acc, skipped),
+    do: {:ok, acc, skipped}
 
   defp build_group_updates(
          [%{state_key: state_key, encoded: encoded, locator: current} | entries],
+         file_id,
          {ordinal, offset, frame_size} = location,
          dependencies,
          acc,
          skipped
        ) do
-    with {:ok, relocated} <- relocate_locator(current, ordinal, offset, frame_size) do
+    with {:ok, relocated} <- relocate_locator(current, file_id, ordinal, offset, frame_size) do
       cond do
         Locator.same_physical_record?(current, relocated) ->
-          build_group_updates(entries, location, dependencies, acc, skipped)
+          build_group_updates(entries, file_id, location, dependencies, acc, skipped)
 
         not verified_target?(dependencies, state_key, relocated) ->
-          build_group_updates(entries, location, dependencies, acc, skipped + 1)
+          build_group_updates(entries, file_id, location, dependencies, acc, skipped + 1)
 
         true ->
-          case QueryRowCodec.relocate(encoded, state_key, current, relocated) do
+          case encode_relocation(encoded, state_key, current, relocated) do
             {:ok, replacement} ->
               update = %{state_key: state_key, expected: encoded, replacement: replacement}
-              build_group_updates(entries, location, dependencies, [update | acc], skipped)
+
+              build_group_updates(
+                entries,
+                file_id,
+                location,
+                dependencies,
+                [update | acc],
+                skipped
+              )
 
             {:error, reason} ->
               {:error, {:query_row_relocation_encode_failed, state_key, reason}}
@@ -280,13 +297,78 @@ defmodule Ferricstore.Flow.Query.QueryRowRelocator do
     end
   end
 
-  defp relocate_locator(locator, ordinal, offset, frame_size) do
+  # Every rewrite of the projection log renumbers its frames. A Flow whose record
+  # sits there stays in the keydir (see Keydir.outlives_keydir?/1), and its keydir
+  # row follows the record to its new frame.
+  defp target_file_id(
+         dependencies,
+         state_key,
+         %Locator{file_id: {:waraft_projection, _index}} = locator
+       ) do
+    case dependencies.keydir_file_id.(dependencies.ctx, dependencies.shard_index, state_key) do
+      {:waraft_projection, index} = file_id when is_integer(index) and index > 0 -> file_id
+      _other -> locator.file_id
+    end
+  end
+
+  defp target_file_id(_dependencies, _state_key, %Locator{file_id: file_id}), do: file_id
+
+  defp keydir_file_id(%{keydir_refs: keydir_refs}, shard_index, state_key)
+       when is_tuple(keydir_refs) and shard_index < tuple_size(keydir_refs) do
+    case :ets.lookup(elem(keydir_refs, shard_index), state_key) do
+      [{^state_key, _value, _expire_at_ms, _lfu, file_id, _offset, _value_size}] -> file_id
+      _missing -> nil
+    end
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp keydir_file_id(_ctx, _shard_index, _state_key), do: nil
+
+  defp relocate_locator(
+         %Locator{file_id: file_id} = locator,
+         file_id,
+         ordinal,
+         offset,
+         frame_size
+       ) do
     Locator.relocate(locator,
       segment_generation: ordinal,
       offset: offset,
       frame_size: frame_size
     )
   end
+
+  # A projection locator's raft_index is its frame number.
+  defp relocate_locator(
+         %Locator{file_id: {:waraft_projection, _}} = locator,
+         {:waraft_projection, index} = file_id,
+         ordinal,
+         offset,
+         frame_size
+       ) do
+    moved = %{
+      locator
+      | file_id: file_id,
+        raft_index: index,
+        segment_generation: ordinal,
+        offset: offset,
+        frame_size: frame_size
+    }
+
+    if Locator.hydration_ready?(moved), do: {:ok, moved}, else: {:error, :bad_locator}
+  end
+
+  defp encode_relocation(
+         encoded,
+         state_key,
+         %Locator{file_id: file_id} = current,
+         %Locator{file_id: file_id} = relocated
+       ),
+       do: QueryRowCodec.relocate(encoded, state_key, current, relocated)
+
+  defp encode_relocation(encoded, state_key, current, relocated),
+    do: QueryRowCodec.move_projection_locator(encoded, state_key, current, relocated)
 
   defp locate(dependencies, file_id) do
     case dependencies.physical_location.(dependencies.ctx, dependencies.shard_index, file_id) do
@@ -383,8 +465,10 @@ defmodule Ferricstore.Flow.Query.QueryRowRelocator do
 
   defp rebuild_raced_update(state_key, encoded, locator, dependencies) do
     if waraft_locator?(locator) do
-      with {:ok, {ordinal, offset, frame_size}} <- locate(dependencies, locator.file_id),
-           {:ok, relocated} <- relocate_locator(locator, ordinal, offset, frame_size) do
+      file_id = target_file_id(dependencies, state_key, locator)
+
+      with {:ok, {ordinal, offset, frame_size}} <- locate(dependencies, file_id),
+           {:ok, relocated} <- relocate_locator(locator, file_id, ordinal, offset, frame_size) do
         cond do
           Locator.same_physical_record?(locator, relocated) ->
             {:ok, :current}
@@ -393,7 +477,7 @@ defmodule Ferricstore.Flow.Query.QueryRowRelocator do
             {:ok, :current}
 
           true ->
-            case QueryRowCodec.relocate(encoded, state_key, locator, relocated) do
+            case encode_relocation(encoded, state_key, locator, relocated) do
               {:ok, replacement} ->
                 {:ok, %{state_key: state_key, expected: encoded, replacement: replacement}}
 
@@ -431,13 +515,15 @@ defmodule Ferricstore.Flow.Query.QueryRowRelocator do
       get: Keyword.get(opts, :get, &LMDB.get/2),
       verify_projection_frame:
         Keyword.get(opts, :verify_projection_frame, &verify_projection_frame/4),
+      keydir_file_id: Keyword.get(opts, :keydir_file_id, &keydir_file_id/3),
       ctx: ctx,
       shard_index: shard_index
     }
 
     if is_function(dependencies.physical_location, 3) and
          is_function(dependencies.write_batch, 2) and is_function(dependencies.get, 2) and
-         is_function(dependencies.verify_projection_frame, 4) do
+         is_function(dependencies.verify_projection_frame, 4) and
+         is_function(dependencies.keydir_file_id, 3) do
       {:ok, dependencies}
     else
       {:error, :invalid_query_row_relocation_dependencies}
