@@ -28,7 +28,7 @@ All notable changes to FerricStore will be documented here.
   `FerricStore.hsetnx/3`. `lmove/4` moved through separate reads and writes,
   so 40 concurrent moves left 1 element in the destination and lost the rest,
   and every concurrent `hsetnx/3` on one field reported a win.
-- Serialize HSETNX, HGETDEL, SMOVE, ZADD with NX, XX, GT or LT, and
+- Serialize HSETNX, HGETDEL, SMOVE, ZADD or GEOADD with NX, XX, GT or LT, and
   EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT with a flag, per key through the TCP and
   HTTP gateways. They read the key and decided the write in the client's
   process, so every concurrent HSETNX, ZADD NX, SMOVE or EXPIRE NX on one key

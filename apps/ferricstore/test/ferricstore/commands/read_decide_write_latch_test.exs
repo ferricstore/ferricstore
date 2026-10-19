@@ -44,6 +44,15 @@ defmodule Ferricstore.Commands.ReadDecideWriteLatchTest do
     assert 1 == Enum.count(results, &(&1 == 1))
   end
 
+  test "concurrent GEOADD NX has one winner", %{ctx: ctx, key: key} do
+    results =
+      concurrently(fn client ->
+        Dispatcher.dispatch("GEOADD", [key, "NX", "13.#{client}", "38.1", "m"], ctx)
+      end)
+
+    assert 1 == Enum.count(results, &(&1 == 1))
+  end
+
   defp concurrently(fun) do
     1..20
     |> Task.async_stream(fun, max_concurrency: 20, timeout: 60_000)

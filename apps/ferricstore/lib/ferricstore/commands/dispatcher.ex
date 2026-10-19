@@ -68,7 +68,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   @prob_raw_commands ~w(BF.RESERVE BF.ADD BF.MADD BF.EXISTS BF.MEXISTS BF.CARD BF.INFO CF.RESERVE CF.ADD CF.ADDNX CF.DEL CF.EXISTS CF.MEXISTS CF.COUNT CF.INFO CMS.INITBYDIM CMS.INITBYPROB CMS.INCRBY CMS.QUERY CMS.MERGE CMS.INFO TOPK.RESERVE TOPK.ADD TOPK.INCRBY TOPK.QUERY TOPK.LIST TOPK.COUNT TOPK.INFO TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.QUANTILE TDIGEST.CDF TDIGEST.RANK TDIGEST.REVRANK TDIGEST.BYRANK TDIGEST.BYREVRANK TDIGEST.TRIMMED_MEAN TDIGEST.MIN TDIGEST.MAX TDIGEST.INFO TDIGEST.MERGE)
   @tdigest_rmw_commands ~w(TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.MERGE)
   @conditional_zadd_flags ~w(NX XX GT LT)
-  @latched_commands ~w(HSETNX ZADD HGETDEL SMOVE EXPIRE PEXPIRE EXPIREAT PEXPIREAT)
+  @latched_commands ~w(HSETNX ZADD GEOADD HGETDEL SMOVE EXPIRE PEXPIRE EXPIREAT PEXPIREAT)
   @native_raw_commands ~w(CAS LOCK UNLOCK EXTEND RATELIMIT.ADD KEY_INFO FERRICSTORE.KEY_INFO FETCH_OR_COMPUTE FETCH_OR_COMPUTE_RESULT FETCH_OR_COMPUTE_ERROR)
   @management_raw_commands ~w(ACL FERRICSTORE.CAPABILITIES FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FERRICSTORE.TELEMETRY)
   @cluster_raw_commands ~w(CLUSTER.HEALTH CLUSTER.STATS CLUSTER.KEYSLOT CLUSTER.SLOTS CLUSTER.STATUS CLUSTER.JOIN CLUSTER.LEAVE CLUSTER.FAILOVER CLUSTER.PROMOTE CLUSTER.DEMOTE CLUSTER.ROLE CLUSTER.FEATURES CLUSTER.FEATURES.RAISE FERRICSTORE.HOTNESS)
@@ -852,7 +852,7 @@ defmodule Ferricstore.Commands.Dispatcher do
 
   # These read the key and decide the write from what they read. Without the
   # key latch two clients both read the old value: every concurrent HSETNX,
-  # ZADD NX, SMOVE or EXPIRE NX reported a win, ZADD GT could land a lower
+  # ZADD NX, GEOADD NX, SMOVE or EXPIRE NX reported a win, ZADD GT could land a lower
   # score last, and HGETDEL handed one field to every client. SMOVE latches
   # its source key.
   defp dispatch_prepared_ast(
@@ -867,8 +867,9 @@ defmodule Ferricstore.Commands.Dispatcher do
 
   defp dispatch_prepared_ast(%PreparedCommand{ast: ast}, store), do: dispatch_ast(ast, store)
 
-  # Plain ZADD and an EXPIRE without flags do not depend on what they read.
-  defp latched_command?("ZADD", [_key | options]),
+  # Plain ZADD/GEOADD and an EXPIRE without flags do not depend on what they
+  # read.
+  defp latched_command?(command, [_key | options]) when command in ["ZADD", "GEOADD"],
     do: Enum.any?(options, &(is_binary(&1) and String.upcase(&1) in @conditional_zadd_flags))
 
   defp latched_command?(command, [_key, _time | flags])
