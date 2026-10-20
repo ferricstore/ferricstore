@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Refuse a CLUSTER.PROMOTE, CLUSTER.DEMOTE, CLUSTER.JOIN or CLUSTER.FAILOVER
+  target, and a Raft membership change, whose name is not a distributed node
+  (`name@host`). `CLUSTER.PROMOTE k` committed `k` into every shard's Raft
+  membership; each shard's storage then failed to persist the config, on
+  every replay as well, so all shards stopped serving and stayed down. The
+  name is now checked before any change is proposed.
 - Answer the integer error for a non-integer index in `FerricStore.getrange/3`
   and a non-integer or negative offset in `FerricStore.getbit/2`. They
   answered "wrong number of arguments for 'set' command" and "unsupported

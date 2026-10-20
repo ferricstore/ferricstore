@@ -27,6 +27,13 @@ defmodule Ferricstore.Raft.WARaftStorage.PersistedConfig do
 
   def decode(other), do: {:error, {:invalid_persisted_config, other}}
 
+  @doc false
+  @spec valid_runtime_node?(term()) :: boolean()
+  def valid_runtime_node?(node) when is_atom(node) and not is_nil(node),
+    do: valid_node_name?(Atom.to_string(node))
+
+  def valid_runtime_node?(_node), do: false
+
   @spec encode!(map()) :: map()
   def encode!(config), do: unwrap!(encode(config))
 
