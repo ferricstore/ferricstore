@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Publish keyspace notifications again. `CONFIG SET notify-keyspace-events`
+  was accepted, but nothing published since the RESP protocol was removed.
+  Commands from native and HTTP clients, typed native operations, MULTI and
+  pipelines now publish `__keyspace@0__:<key>` and `__keyevent@0__:<event>`
+  messages as Redis does, skipping commands that failed or changed nothing
+  (including a SET that NX or XX kept from writing). While notifications are
+  on, the native batched write paths stand aside so every write notifies.
 - Refuse a command with the wrong number of arguments while native MULTI
   queues it, as Redis does, so EXEC then answers EXECABORT and runs nothing.
   `MULTI`, `SET k v`, `GET` (no key), `EXEC` ran the SET and failed the GET;

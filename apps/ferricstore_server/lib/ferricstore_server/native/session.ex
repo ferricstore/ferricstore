@@ -275,8 +275,12 @@ defmodule FerricstoreServer.Native.Session do
              state.watched_keys,
              Map.get(state, :sandbox_namespace)
            ) do
-        {:error, reason} -> {:error, reason, clear_transaction(state)}
-        result -> {:ok, native_tx_result(result), clear_transaction(state)}
+        {:error, reason} ->
+          {:error, reason, clear_transaction(state)}
+
+        result ->
+          notify_transaction_keyspace(ordered, result)
+          {:ok, native_tx_result(result), clear_transaction(state)}
       end
     else
       {:error, reason} -> {:noperm, reason, clear_transaction(state)}
@@ -427,6 +431,21 @@ defmodule FerricstoreServer.Native.Session do
       end
     end
   end
+
+  defp notify_transaction_keyspace(queue, results) when is_list(results) do
+    if Ferricstore.KeyspaceNotifications.enabled?() do
+      queue
+      |> Enum.zip(results)
+      |> Enum.each(fn {%PreparedCommand{command: command, args: args}, result} ->
+        Ferricstore.KeyspaceNotifications.after_command(command, args, result)
+      end)
+    end
+
+    :ok
+  end
+
+  # A WATCH that changed returns nil: nothing ran.
+  defp notify_transaction_keyspace(_queue, _results), do: :ok
 
   defp clear_transaction(state) do
     state = release_retained_session_bytes(state)

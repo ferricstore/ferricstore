@@ -1079,13 +1079,17 @@ defmodule FerricstoreServer.Native.Lane do
     _ -> :fallback
   end
 
+  # The batched paths write without the per-command keyspace notifications,
+  # so they stand aside while notify-keyspace-events is on.
   defp plain_set_batch_allowed?(%{
          acl_cache: :full_access,
          require_auth: false,
          instance_ctx: ctx
        })
        when not is_nil(ctx),
-       do: FerricStore.ResourceLimits.default_implementation?()
+       do:
+         FerricStore.ResourceLimits.default_implementation?() and
+           not Ferricstore.KeyspaceNotifications.enabled?()
 
   defp plain_set_batch_allowed?(_command_state), do: false
 

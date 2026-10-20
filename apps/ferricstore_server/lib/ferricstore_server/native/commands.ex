@@ -643,11 +643,53 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp execute_with_native_resource_lease(resource_lease, opcode, payload, state) do
     try do
-      execute_prepared_native(opcode, payload, state) |> record_native_activity(opcode, payload)
+      opcode
+      |> execute_prepared_native(payload, state)
+      |> record_native_activity(opcode, payload)
+      |> notify_native_keyspace(opcode, payload)
     after
       release_native_resource_lease(resource_lease, state)
     end
   end
+
+  # Typed data operations call FerricStore.Impl, not the command dispatcher,
+  # so they fire their keyspace notifications here. COMMAND_EXEC and PIPELINE
+  # commands notify in the dispatcher.
+  @notifying_typed_ops [
+    @op_set,
+    @op_del,
+    @op_mset,
+    @op_hset,
+    @op_lpush,
+    @op_rpush,
+    @op_lpop,
+    @op_rpop,
+    @op_sadd,
+    @op_srem,
+    @op_zadd,
+    @op_zrem
+  ]
+
+  defp notify_native_keyspace({:ok, value, _state} = result, opcode, payload)
+       when opcode in @notifying_typed_ops do
+    if Ferricstore.KeyspaceNotifications.enabled?() do
+      Ferricstore.KeyspaceNotifications.after_command(
+        Map.fetch!(@commands, opcode),
+        native_notification_args(opcode, payload),
+        value
+      )
+    end
+
+    result
+  end
+
+  defp notify_native_keyspace(result, _opcode, _payload), do: result
+
+  defp native_notification_args(opcode, payload)
+       when opcode in [@op_set, @op_mset, @op_hset, @op_lpush, @op_rpush, @op_sadd, @op_zadd],
+       do: native_resource_limit_args(opcode, payload)
+
+  defp native_notification_args(opcode, payload), do: keys(opcode, payload)
 
   defp release_native_resource_lease(nil, _state), do: :ok
 
@@ -4561,8 +4603,10 @@ defmodule FerricstoreServer.Native.Commands do
         )
       end
 
+    # The fast path writes without the per-command keyspace notifications.
     fast_path_result =
-      if FerricStore.ResourceLimits.default_implementation?() do
+      if FerricStore.ResourceLimits.default_implementation?() and
+           not Ferricstore.KeyspaceNotifications.enabled?() do
         execute_pipeline_fast_path(commands, fast_path_state)
       else
         :fallback

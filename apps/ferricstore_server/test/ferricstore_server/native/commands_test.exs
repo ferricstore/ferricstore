@@ -4970,6 +4970,93 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert Router.get(FerricStore.Instance.get(:default), key) == nil
   end
 
+  describe "keyspace notifications" do
+    setup do
+      :ok = Ferricstore.Config.set("notify-keyspace-events", "KEA")
+
+      on_exit(fn ->
+        Ferricstore.Config.set("notify-keyspace-events", "")
+        PubSub.cleanup(self())
+      end)
+
+      %{key: "{notify:#{System.unique_integer([:positive, :monotonic])}}"}
+    end
+
+    test "commands and typed operations notify the key and the event", %{key: key} do
+      hash = key <> ":h"
+      :ok = PubSub.subscribe("__keyspace@0__:" <> key, self())
+      :ok = PubSub.subscribe("__keyevent@0__:hset", self())
+
+      assert {:ok, _reply, _state} =
+               Commands.execute(
+                 @op_command_exec,
+                 %{"command" => "SET", "args" => [key, "v"]},
+                 state()
+               )
+
+      assert_receive {:pubsub_message, "__keyspace@0__:" <> ^key, "set"}
+
+      assert {:ok, _reply, _state} =
+               Commands.execute(@op_set, %{"key" => key, "value" => "w"}, state())
+
+      assert_receive {:pubsub_message, "__keyspace@0__:" <> ^key, "set"}
+
+      assert {:ok, 1, _state} =
+               Commands.execute(@op_hset, %{"key" => hash, "fields" => %{"f" => "v"}}, state())
+
+      assert_receive {:pubsub_message, "__keyevent@0__:hset", ^hash}
+
+      Commands.execute(
+        @op_command_exec,
+        %{"command" => "SET", "args" => [key, "x", "NX"]},
+        state()
+      )
+
+      refute_receive {:pubsub_message, "__keyspace@0__:" <> ^key, "set"}, 200
+
+      Commands.execute(@op_command_exec, %{"command" => "DEL", "args" => [key]}, state())
+      assert_receive {:pubsub_message, "__keyspace@0__:" <> ^key, "del"}
+    end
+
+    test "commands in MULTI and pipelines notify", %{key: key} do
+      :ok = PubSub.subscribe("__keyspace@0__:" <> key, self())
+
+      assert {:ok, "OK", session} =
+               Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+      assert {:ok, "QUEUED", session} =
+               Session.execute(%{"command" => "SET", "args" => [key, "v"]}, session)
+
+      assert {:ok, "QUEUED", session} =
+               Session.execute(%{"command" => "EXPIRE", "args" => [key, "100"]}, session)
+
+      assert {:ok, _results, _session} =
+               Session.execute(%{"command" => "EXEC", "args" => []}, session)
+
+      assert_receive {:pubsub_message, "__keyspace@0__:" <> ^key, "set"}
+      assert_receive {:pubsub_message, "__keyspace@0__:" <> ^key, "expire"}
+
+      commands =
+        Enum.map([1, 2], fn request_id ->
+          %{
+            "opcode" => @op_command_exec,
+            "request_id" => request_id,
+            "lane_id" => 1,
+            "body" => %{"command" => "INCR", "args" => [key <> ":n"]}
+          }
+        end)
+
+      :ok = PubSub.subscribe("__keyevent@0__:incr", self())
+
+      assert {:ok, [_first, _second], _state} =
+               Commands.execute(@op_pipeline, %{"commands" => commands}, state())
+
+      counter = key <> ":n"
+      assert_receive {:pubsub_message, "__keyevent@0__:incr", ^counter}
+      assert_receive {:pubsub_message, "__keyevent@0__:incr", ^counter}
+    end
+  end
+
   test "native MULTI discards the transaction after a command with the wrong arity" do
     key = "native-multi-arity:#{System.unique_integer([:positive, :monotonic])}"
 

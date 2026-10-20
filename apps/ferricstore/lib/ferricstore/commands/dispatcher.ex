@@ -981,6 +981,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       end
 
     log_raw_dispatch(prepared.command, prepared.args, start)
+    Ferricstore.KeyspaceNotifications.after_command(prepared.command, prepared.args, result)
     result
   end
 
