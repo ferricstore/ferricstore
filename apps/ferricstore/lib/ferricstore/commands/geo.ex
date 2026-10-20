@@ -59,7 +59,7 @@ defmodule Ferricstore.Commands.Geo do
 
   def handle_ast({:geoadd, key, flags, pairs}, store) do
     with :ok <- Parsing.validate_geoadd_ast(flags, pairs) do
-      do_geoadd(store, key, pairs, flags)
+      geoadd_validated(store, key, pairs, flags)
     end
   end
 
@@ -142,7 +142,7 @@ defmodule Ferricstore.Commands.Geo do
   def handle("GEOADD", [key | rest], store) when rest != [] do
     with {:ok, flags, coord_args} <- Parsing.parse_geoadd_flags(rest),
          {:ok, pairs} <- Parsing.parse_lng_lat_members(coord_args) do
-      do_geoadd(store, key, pairs, flags)
+      geoadd_validated(store, key, pairs, flags)
     end
   end
 
@@ -603,6 +603,26 @@ defmodule Ferricstore.Commands.Geo do
   # ===========================================================================
   # Private -- GEOADD implementation
   # ===========================================================================
+
+  # A GEOADD without options on the instance is a ZADD without options of the
+  # members' geohash scores, through the state machine's single-member
+  # entries: racing clients count each member once and a SET between the type
+  # check and the write can no longer leave members under the string.
+  defp geoadd_validated(%FerricStore.Instance{} = ctx, key, pairs, []) do
+    if Enum.all?(pairs, fn {_lng, _lat, member} -> is_binary(member) end) do
+      Ops.single_member_writes(
+        ctx,
+        key,
+        Enum.map(pairs, fn {lng, lat, member} ->
+          {:zadd_single, key, geohash_encode(lng, lat), member}
+        end)
+      )
+    else
+      do_geoadd(ctx, key, pairs, [])
+    end
+  end
+
+  defp geoadd_validated(store, key, pairs, flags), do: do_geoadd(store, key, pairs, flags)
 
   defp do_geoadd(store, key, pairs, flags) do
     members = unique_geoadd_members(pairs)

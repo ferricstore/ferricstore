@@ -456,7 +456,18 @@ defmodule Ferricstore.Commands.Set do
   defp sadd_members(key, [member], %FerricStore.Instance{} = ctx) when is_binary(member),
     do: Ops.sadd_single(ctx, key, member)
 
-  defp sadd_members(key, members, store) do
+  # Several members go to the same single-member entries in replicated
+  # batches, so racing clients count each member once and a SET between the
+  # type check and the write can no longer leave members under the string.
+  defp sadd_members(key, members, %FerricStore.Instance{} = ctx) do
+    if Enum.all?(members, &is_binary/1),
+      do: single_member_writes(ctx, key, members, &{:sadd_single, key, &1}),
+      else: sadd_members_generic(key, members, ctx)
+  end
+
+  defp sadd_members(key, members, store), do: sadd_members_generic(key, members, store)
+
+  defp sadd_members_generic(key, members, store) do
     with type_status when type_status in [:ok, {:ok, :created}] <-
            TypeRegistry.command_check_or_set_status(key, :set, store) do
       compound_keys =
@@ -504,7 +515,19 @@ defmodule Ferricstore.Commands.Set do
   defp srem_args([key, member], %FerricStore.Instance{} = ctx) when is_binary(member),
     do: Ops.srem_single(ctx, key, member)
 
-  defp srem_args([key | members], store) when members != [] do
+  defp srem_args([key | members], %FerricStore.Instance{} = ctx) when members != [] do
+    if Enum.all?(members, &is_binary/1),
+      do: single_member_writes(ctx, key, members, &{:srem_single, key, &1}),
+      else: srem_args_generic([key | members], ctx)
+  end
+
+  defp srem_args(args, store), do: srem_args_generic(args, store)
+
+  defp single_member_writes(ctx, key, members, command) do
+    Ops.single_member_writes(ctx, key, members |> Enum.uniq() |> Enum.map(command))
+  end
+
+  defp srem_args_generic([key | members], store) when members != [] do
     with :ok <- TypeRegistry.command_check_type(key, :set, store) do
       compound_keys =
         members
@@ -528,7 +551,8 @@ defmodule Ferricstore.Commands.Set do
     end
   end
 
-  defp srem_args(_args, _store), do: {:error, "ERR wrong number of arguments for 'srem' command"}
+  defp srem_args_generic(_args, _store),
+    do: {:error, "ERR wrong number of arguments for 'srem' command"}
 
   defp set_member_entries_for_missing([compound_key | compound_keys], [nil | values], acc) do
     set_member_entries_for_missing(compound_keys, values, [

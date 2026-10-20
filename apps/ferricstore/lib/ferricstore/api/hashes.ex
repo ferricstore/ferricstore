@@ -33,12 +33,10 @@ defmodule FerricStore.API.Hashes do
   """
   @spec hset(key(), %{binary() => binary()}) :: :ok
   def hset(key, fields) when is_map(fields) do
-    store = build_compound_store(key)
-
     args =
       Enum.flat_map(fields, fn {k, v} -> [to_string(k), to_string(v)] end)
 
-    case Hash.handle_ast({:hset, [key | args]}, store) do
+    case Hash.handle_ast({:hset, [key | args]}, default_ctx()) do
       {:error, _} = err -> err
       _count -> :ok
     end

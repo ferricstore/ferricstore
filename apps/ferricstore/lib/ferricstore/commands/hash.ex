@@ -676,8 +676,22 @@ defmodule Ferricstore.Commands.Hash do
     end
   end
 
-  defp hset_fields(key, field_value_pairs, store),
-    do: hset_fields_generic(key, field_value_pairs, store)
+  # Several fields go to the same single-field entries in replicated batches:
+  # each checks the key's type and reports whether its field is new, so racing
+  # clients count each field once and a SET between the type check and the
+  # write can no longer leave fields under the string.
+  defp hset_fields(key, field_value_pairs, store) do
+    pairs = field_value_pairs |> Enum.chunk_every(2) |> Enum.map(fn [f, v] -> {f, v} end)
+
+    if Enum.all?(pairs, fn {field, value} -> is_binary(field) and is_binary(value) end) do
+      case Ops.hset_many(store, key, pairs) do
+        :unsupported -> hset_fields_generic(key, field_value_pairs, store)
+        result -> result
+      end
+    else
+      hset_fields_generic(key, field_value_pairs, store)
+    end
+  end
 
   defp hset_fields_generic(key, field_value_pairs, store) do
     with type_status when type_status in [:ok, {:ok, :created}] <-

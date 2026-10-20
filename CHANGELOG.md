@@ -43,16 +43,20 @@ All notable changes to FerricStore will be documented here.
   and a non-integer or negative offset in `FerricStore.getbit/2`. They
   answered "wrong number of arguments for 'set' command" and "unsupported
   bitmap command AST".
-- Make single-member SADD, SREM and ZREM report one winner under concurrency,
-  through the TCP and HTTP gateways and `FerricStore.sadd/2`, `srem/2` and
-  `zrem/2`. They read the member and wrote it in separate entries, so 20
-  concurrent `SADD key m` all answered 1, which breaks deduplication that
-  processes an item only when SADD returns 1. One member now goes through the
-  state machine's atomic single-member write, which every release since
-  2026-06 applies; calls with several members keep the previous path. The
-  write also checks the key's type in that entry, so a SET racing a
-  single-member SADD no longer leaves the member hidden under the string, to
-  come back when the key is later recreated.
+- Make SADD, SREM, ZREM and HSET, and ZADD and GEOADD without options, count
+  each member once under concurrency, through the TCP and HTTP gateways and
+  `FerricStore.sadd/2`, `srem/2`, `zadd/2`, `zrem/2` and `hset/2`. They read
+  the members and wrote them in separate entries, so 20 concurrent
+  `SADD key m` all answered 1, which breaks deduplication that processes an
+  item only when SADD returns 1, and a SET landing between the type check and
+  the write left the members hidden under the string, to come back when the
+  key was recreated (29 of 30 races for multi-member SADD, HSET and ZADD).
+  Each member now goes through the state machine's single-member entries,
+  which every release since v0.12.0 applies: they check the key's type and
+  report whether their member changed, in replicated batches of up to 128.
+  A run of them on a collection with its own file (over 100 members) is
+  appended in one batch, as before. Options (NX, XX, GT, LT, CH), HINCRBY,
+  HSETNX, HSETEX and SMOVE keep the previous path.
 - Answer a typed native HSET whose field name or value is a map or a list
   with a bad-request error. It raised while turning the field into a string,
   so the client got an internal server error and the server logged a stack

@@ -1412,6 +1412,28 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end
       end
 
+      # A run of single-member SADDs or ZADDs on one promoted collection would
+      # append each new member to the collection's file with its own sync. The
+      # run is applied as one batch append instead, with the members, score
+      # index and replies the single-member entries give one after another.
+      defp do_apply_generic_batch_commands(
+             state,
+             [{:sadd_single, key, _}, {:sadd_single, key, _} | _] = commands,
+             results,
+             count,
+             stream_store
+           ),
+           do: apply_promoted_member_run(state, key, commands, results, count, stream_store)
+
+      defp do_apply_generic_batch_commands(
+             state,
+             [{:zadd_single, key, _, _}, {:zadd_single, key, _, _} | _] = commands,
+             results,
+             count,
+             stream_store
+           ),
+           do: apply_promoted_member_run(state, key, commands, results, count, stream_store)
+
       defp do_apply_generic_batch_commands(
              state,
              [{:stream_append, key, :auto, fields, nil, false} | rest],
@@ -1500,6 +1522,139 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
               stream_store
             )
         end
+      end
+
+      defp apply_promoted_member_run(state, key, commands, results, count, stream_store) do
+        {run, remaining} = take_promoted_member_run(commands, key, [], 0)
+        materialize_pending_fast_deletes(state)
+
+        case promoted_member_run(state, key, run) do
+          {:ok, replies} ->
+            do_apply_generic_batch_commands(
+              state,
+              remaining,
+              Enum.reverse(replies, results),
+              count + length(run),
+              stream_store
+            )
+
+          {:error, _reason} = error ->
+            error
+
+          :fallback ->
+            [command | rest] = commands
+            do_apply_generic_single(state, command, rest, results, count, stream_store)
+        end
+      end
+
+      # One kind of entry per run: SADDs after SADDs, ZADDs after ZADDs.
+      defp take_promoted_member_run([{:sadd_single, key, member} = command | rest], key, acc, n)
+           when is_binary(member) and n < 128 and
+                  (acc == [] or elem(hd(acc), 0) == :sadd_single),
+           do: take_promoted_member_run(rest, key, [command | acc], n + 1)
+
+      defp take_promoted_member_run(
+             [{:zadd_single, key, score, member} = command | rest],
+             key,
+             acc,
+             n
+           )
+           when is_float(score) and is_binary(member) and n < 128 and
+                  (acc == [] or elem(hd(acc), 0) == :zadd_single),
+           do: take_promoted_member_run(rest, key, [command | acc], n + 1)
+
+      defp take_promoted_member_run(commands, _key, acc, _n), do: {Enum.reverse(acc), commands}
+
+      defp promoted_member_run(_state, _key, [_single]), do: :fallback
+
+      defp promoted_member_run(state, key, [first | _] = run) do
+        {type, first_member_key} =
+          case first do
+            {:sadd_single, _, member} -> {"set", CompoundKey.set_member(key, member)}
+            {:zadd_single, _, _, member} -> {"zset", CompoundKey.zset_member(key, member)}
+          end
+
+        with :ok <- check_fetch_or_compute_lock(state, key, nil),
+             ^type <- sm_store_compound_get(state, key, CompoundKey.type_key(key)),
+             path when is_binary(path) <- promoted_compound_path(state, key, first_member_key) do
+          apply_promoted_member_run(state, key, type, run)
+        else
+          _ -> :fallback
+        end
+      end
+
+      # sadd_single is the SADD handler on the state machine's store, so the
+      # run is one SADD of its members; an entry replies 1 for a member absent
+      # before it.
+      defp apply_promoted_member_run(state, key, "set", run) do
+        members = Enum.map(run, fn {:sadd_single, _, member} -> member end)
+        store = build_compound_store(state)
+
+        with {:ok, present} <- present_run_members(state, key, members, &CompoundKey.set_member/2) do
+          case Ferricstore.Commands.Set.handle_ast({:sadd, [key | members]}, store) do
+            added when is_integer(added) -> {:ok, run_member_replies(members, present)}
+            {:error, _reason} = error -> run_error(error, run)
+          end
+        end
+      end
+
+      # As zadd_single entries one after another: a member ends at its last
+      # entry's score string and is written when that differs from what it
+      # held; an entry replies 1 for a member absent before it.
+      defp apply_promoted_member_run(state, key, "zset", run) do
+        members = Enum.map(run, fn {:zadd_single, _, _, member} -> member end)
+
+        with {:ok, present} <- present_run_members(state, key, members, &CompoundKey.zset_member/2) do
+          final =
+            Enum.reduce(run, %{}, fn {:zadd_single, _, score, member}, acc ->
+              Map.put(acc, member, Float.to_string(score))
+            end)
+
+          entries =
+            members
+            |> Enum.uniq()
+            |> Enum.flat_map(fn member ->
+              score_str = Map.fetch!(final, member)
+
+              if Map.get(present, member) == score_str,
+                do: [],
+                else: [{CompoundKey.zset_member(key, member), score_str, 0}]
+            end)
+
+          case do_compound_batch_put(state, key, entries) do
+            :ok -> {:ok, run_member_replies(members, present)}
+            {:error, _reason} = error -> run_error(error, run)
+          end
+        end
+      end
+
+      # The current value of each distinct member, for members that exist.
+      defp present_run_members(state, key, members, member_key) do
+        members
+        |> Enum.uniq()
+        |> Enum.reduce_while({:ok, %{}}, fn member, {:ok, acc} ->
+          case sm_store_compound_get(state, key, member_key.(key, member)) do
+            nil -> {:cont, {:ok, acc}}
+            value when is_binary(value) -> {:cont, {:ok, Map.put(acc, member, value)}}
+            _error_or_other -> {:halt, :fallback}
+          end
+        end)
+      end
+
+      defp run_member_replies(members, present) do
+        {replies, _seen} =
+          Enum.map_reduce(members, MapSet.new(), fn member, seen ->
+            new? = not Map.has_key?(present, member) and not MapSet.member?(seen, member)
+            {if(new?, do: 1, else: 0), MapSet.put(seen, member)}
+          end)
+
+        replies
+      end
+
+      defp run_error({:error, reason} = error, run) do
+        if Ferricstore.Raft.ApplyFailure.storage_reason?(reason),
+          do: error,
+          else: {:ok, List.duplicate(error, length(run))}
       end
 
       defp take_promoted_hset_group(

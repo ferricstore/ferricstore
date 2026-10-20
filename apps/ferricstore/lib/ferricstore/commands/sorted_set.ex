@@ -598,7 +598,23 @@ defmodule Ferricstore.Commands.SortedSet do
   defp zrem_args([key, member], %FerricStore.Instance{} = ctx) when is_binary(member),
     do: Ops.zrem_single(ctx, key, member)
 
-  defp zrem_args([key | members], store) when members != [] do
+  # Several members go to the same single-member entries in replicated
+  # batches, so racing clients count each removal once.
+  defp zrem_args([key | members], %FerricStore.Instance{} = ctx) when members != [] do
+    if Enum.all?(members, &is_binary/1) do
+      Ops.single_member_writes(
+        ctx,
+        key,
+        members |> Enum.uniq() |> Enum.map(&{:zrem_single, key, &1})
+      )
+    else
+      zrem_args_generic([key | members], ctx)
+    end
+  end
+
+  defp zrem_args(args, store), do: zrem_args_generic(args, store)
+
+  defp zrem_args_generic([key | members], store) when members != [] do
     with :ok <- TypeRegistry.command_check_type(key, :zset, store) do
       compound_keys =
         members
@@ -628,15 +644,37 @@ defmodule Ferricstore.Commands.SortedSet do
     end
   end
 
-  defp zrem_args(_args, _store) do
+  defp zrem_args_generic(_args, _store) do
     {:error, "ERR wrong number of arguments for 'zrem' command"}
   end
 
   defp zadd_parsed(key, opts, score_member_pairs, store) do
     with :ok <- validate_zadd_ast(opts, score_member_pairs) do
-      do_zadd_parsed(key, opts, score_member_pairs, store)
+      zadd_validated(key, opts, score_member_pairs, store)
     end
   end
+
+  # A ZADD without options on the instance writes through the state machine's
+  # single-member entries in replicated batches: each checks the key's type
+  # and reports whether its member is new, so racing clients count each
+  # member once and a SET between the type check and the write can no longer
+  # leave members under the string. Options keep the read-decide-write path.
+  defp zadd_validated(key, [], score_member_pairs, %FerricStore.Instance{} = ctx) do
+    if Enum.all?(score_member_pairs, fn {score, member} ->
+         is_float(score) and is_binary(member)
+       end) do
+      Ops.single_member_writes(
+        ctx,
+        key,
+        Enum.map(score_member_pairs, fn {score, member} -> {:zadd_single, key, score, member} end)
+      )
+    else
+      do_zadd_parsed(key, [], score_member_pairs, ctx)
+    end
+  end
+
+  defp zadd_validated(key, opts, score_member_pairs, store),
+    do: do_zadd_parsed(key, opts, score_member_pairs, store)
 
   defp do_zadd_parsed(key, opts, score_member_pairs, store) do
     opts = %{

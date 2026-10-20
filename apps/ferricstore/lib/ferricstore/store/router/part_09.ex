@@ -30,6 +30,7 @@ defmodule Ferricstore.Store.Router.Part09 do
       alias Ferricstore.TermCodec
 
       @max_logical_scan_cursor_bytes 88_000
+      @single_member_write_chunk 128
 
       # The forced quorum path is the default instance's Raft. A custom
       # embedded instance applies through its own shards, as raft_write/4 does;
@@ -844,6 +845,70 @@ defmodule Ferricstore.Store.Router.Part09 do
               0 | 1 | {:error, term()}
       def zrem_single(ctx, key, member) when is_binary(key) and is_binary(member),
         do: raft_write(ctx, shard_for(ctx, key), key, {:zrem_single, key, member})
+
+      @doc """
+      Applies single-member entries of one key (`{:sadd_single, ...}`,
+      `{:srem_single, ...}`, `{:zadd_single, ...}`, `{:zrem_single, ...}` or
+      `{:hset_single, ...}`) in replicated batches of up to 128 entries. Each
+      entry checks the key's type and reports whether it changed its member, so
+      the replies of racing clients add up to the members actually changed, and
+      a SET applied between batches makes the rest fail with WRONGTYPE instead
+      of writing under the string. Returns the members changed or the first
+      error.
+      """
+      @spec single_member_writes(FerricStore.Instance.t(), binary(), [tuple()]) ::
+              non_neg_integer() | {:error, term()}
+      def single_member_writes(ctx, key, [command]) when is_binary(key),
+        do: sum_single_member_results([raft_write(ctx, shard_for(ctx, key), key, command)], 0)
+
+      def single_member_writes(ctx, key, commands) when is_binary(key) and is_list(commands) do
+        commands
+        |> Enum.chunk_every(@single_member_write_chunk)
+        |> Enum.reduce_while(0, fn chunk, changed ->
+          # The generic batch path: pipeline_write_batch/2 would turn a chunk of
+          # ZADDs into one {:zadd_many_single, ...} entry, which costs about
+          # twice as much to apply on a new key.
+          results = batch_quorum_commands(ctx, Enum.map(chunk, &{key, &1}))
+
+          case sum_single_member_results(results, changed) do
+            {:error, _reason} = error -> {:halt, error}
+            total -> {:cont, total}
+          end
+        end)
+      end
+
+      @doc """
+      Sets several hash fields through `single_member_writes/3`. Returns
+      `:unsupported` where `hset_single/4` would: outside WARaft and for values
+      that go to the blob side channel.
+      """
+      @spec hset_many(FerricStore.Instance.t(), binary(), [{binary(), binary()}]) ::
+              non_neg_integer() | :unsupported | {:error, term()}
+      def hset_many(ctx, key, field_value_pairs) do
+        if selected_waraft_ctx?(ctx) and
+             not Enum.any?(field_value_pairs, fn {_field, value} ->
+               Ferricstore.Raft.BlobCommand.side_channel_candidate?(ctx, {:put, key, value, 0})
+             end) do
+          single_member_writes(
+            ctx,
+            key,
+            Enum.map(field_value_pairs, fn {field, value} -> {:hset_single, key, field, value} end)
+          )
+        else
+          :unsupported
+        end
+      end
+
+      defp sum_single_member_results([], total), do: total
+
+      defp sum_single_member_results([count | rest], total) when is_integer(count),
+        do: sum_single_member_results(rest, total + count)
+
+      defp sum_single_member_results([{:error, _reason} = error | _rest], _total), do: error
+      defp sum_single_member_results({:error, _reason} = error, _total), do: error
+
+      defp sum_single_member_results(_invalid, _total),
+        do: ErrorReasons.write_timeout_unknown()
 
       @doc false
       @spec scan_keys_page(

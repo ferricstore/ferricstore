@@ -517,6 +517,15 @@ defmodule Ferricstore.Store.Ops do
   def zrem_single(%FerricStore.Instance{} = ctx, key, member),
     do: Router.zrem_single(ctx, key, member)
 
+  @doc """
+  Applies single-member entries of one key in replicated batches; returns the
+  members changed. See `Ferricstore.Store.Router.single_member_writes/3`.
+  """
+  @spec single_member_writes(FerricStore.Instance.t(), binary(), [tuple()]) ::
+          non_neg_integer() | {:error, term()}
+  def single_member_writes(%FerricStore.Instance{} = ctx, key, commands),
+    do: Router.single_member_writes(ctx, key, commands)
+
   @doc "Atomically adds elements to a HyperLogLog: one replicated sketch update."
   @spec pfadd(FerricStore.Instance.t(), binary(), [binary()]) :: 0 | 1 | {:error, term()}
   def pfadd(%FerricStore.Instance{} = ctx, key, elements),
@@ -860,6 +869,13 @@ defmodule Ferricstore.Store.Ops do
     do: fun.(key, field, value)
 
   def hset_single(_store, _key, _field, _value), do: :unsupported
+
+  @spec hset_many(store(), binary(), [{binary(), binary()}]) ::
+          non_neg_integer() | :unsupported | {:error, term()}
+  def hset_many(%FerricStore.Instance{} = ctx, key, field_value_pairs),
+    do: Router.hset_many(ctx, key, field_value_pairs)
+
+  def hset_many(_store, _key, _field_value_pairs), do: :unsupported
 
   def compound_get(store, redis_key, compound_key),
     do: CompoundOps.compound_get(store, redis_key, compound_key)
