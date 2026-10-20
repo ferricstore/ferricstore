@@ -2552,6 +2552,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
+      # The transaction store's per-command state (member work budget, pending
+      # keys) is scoped by the execution context, as for MULTI. Without it the
+      # member budget carried over between COPY/RENAME entries until one threw
+      # past apply and stopped the shard's storage process.
+      defp dispatch_key_lifecycle(command, store) do
+        ShardTransaction.with_execution_context(store, fn ->
+          Dispatcher.dispatch_ast(command, store)
+        end)
+      catch
+        {:transaction_store_failure, reason} ->
+          {:error, "ERR command exceeded the apply budget: #{inspect(reason)}"}
+      end
+
       defp apply_key_lifecycle(meta, state, command) do
         with_apply_time(meta, fn ->
           with_current_ra_index(meta, fn ->
@@ -2560,9 +2573,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
             write_result =
               with :ok <- admit_apply_command_work(state, {:key_lifecycle, command}) do
                 with_cross_shard_pending_writes(state, fn ->
-                  state
-                  |> build_local_raft_tx_store()
-                  |> then(&Dispatcher.dispatch_ast(command, &1))
+                  dispatch_key_lifecycle(command, build_local_raft_tx_store(state))
                 end)
               end
 

@@ -4,6 +4,14 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Keep COPY and RENAME of large collections from stopping a shard. The
+  transaction store's member budget was never reset between key-lifecycle
+  entries, so after a few COPY/RENAME pairs of 300-member collections one
+  threw past apply; the shard's storage process exited, writes to the shard
+  timed out for several seconds, and the command reported an unknown outcome
+  before applying on replay. Each entry now gets its own budget, as MULTI
+  transactions do, and a command that exceeds it alone answers an error
+  instead of stopping the shard.
 - Make SETRANGE with an empty value change nothing and answer the current
   length, as Redis does, through the TCP and HTTP gateways and
   `FerricStore.setrange/3`. It zero-padded the string out to the offset, or
