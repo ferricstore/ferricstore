@@ -793,7 +793,8 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp make_ast("TOPK.RESERVE", :topk_reserve, [key, k]),
     do:
       with_parsed_numbers(:topk_reserve, [parse_pos_int(k)], fn [parsed_k] ->
-        {:topk_reserve, key, parsed_k, 8, 7}
+        {:topk_reserve, key, parsed_k, Ferricstore.Commands.TopK.default_width(parsed_k),
+         Ferricstore.Commands.TopK.default_depth()}
       end)
 
   defp make_ast("TOPK.RESERVE", :topk_reserve, [key, k, width, depth]),

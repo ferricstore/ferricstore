@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Size TOPK.RESERVE's sketch for k when no width is given: 64 counters a row
+  per tracked item (256 to 16,384) instead of 8. Redis's default width suits
+  its HeavyKeeper sketch; FerricStore's Count-Min sketch that narrow put
+  light items ahead of the real heavy hitters (a 10-item list of a skewed
+  stream held 2 of the 10) and overstated counts several times (an item seen
+  4 times reported 104). `FerricStore.topk_reserve/2` uses the same width.
+  Explicit `width depth` are kept; existing trackers keep their size.
 - Publish keyspace notifications again. `CONFIG SET notify-keyspace-events`
   was accepted, but nothing published since the RESP protocol was removed.
   Commands from native and HTTP clients, typed native operations, MULTI and
