@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Keep a promoted sorted set's ranges and count current. Writes to a sorted
+  set with more than 100 members go to its own file, so an entry that wrote
+  only there left no shared-log rows, and the score index updates it queued
+  were dropped instead of applied. Once the index was ready (for a set created
+  by the native protocol's pipelined ZADD), ZRANGE and ZCARD missed members
+  added in batches and kept members removed in batches.
 - Keep a sorted set's ranges and count right after writes from different
   paths. A sorted set created by the native protocol's pipelined ZADD, which
   writes through the state machine's single-member entry, gets a ready score
