@@ -27,7 +27,10 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    values were released.
   # 3: `:flow_purge_orphans` cleans up after Flows whose state record is gone
   #    (`Ferricstore.Flow.OrphanPurge`).
-  @supported 3
+  # 4: writes of hash, set and sorted set members (`:compound_put`,
+  #    `:compound_batch_put` and their blob forms, `:hincrby`, `:hincrbyfloat`)
+  #    check the key's type in the same entry, as `:zincrby` always has.
+  @supported 4
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"
   @probe_timeout_ms 5_000

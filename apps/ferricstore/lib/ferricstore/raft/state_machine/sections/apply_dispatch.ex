@@ -1604,7 +1604,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       defp apply_promoted_member_run(state, key, "zset", run) do
         members = Enum.map(run, fn {:zadd_single, _, _, member} -> member end)
 
-        with {:ok, present} <- present_run_members(state, key, members, &CompoundKey.zset_member/2) do
+        with {:ok, present} <-
+               present_run_members(state, key, members, &CompoundKey.zset_member/2) do
           final =
             Enum.reduce(run, %{}, fn {:zadd_single, _, score, member}, acc ->
               Map.put(acc, member, Float.to_string(score))
@@ -1980,7 +1981,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
             case check_fetch_or_compute_lock(state, redis_key, nil) do
               :ok ->
                 with_pending_writes(state, fn ->
-                  do_compound_put(state, redis_key, compound_key, value, expire_at_ms)
+                  with :ok <- check_member_write_type(state, redis_key, [compound_key]) do
+                    do_compound_put(state, redis_key, compound_key, value, expire_at_ms)
+                  end
                 end)
 
               {:error, _reason} = error ->
@@ -2009,7 +2012,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
               {:ok, count} ->
                 result =
                   with_pending_writes(state, fn ->
-                    apply_compound_batch_put_entries_admitted(state, redis_key, entries)
+                    with :ok <-
+                           check_member_write_type(state, redis_key, compound_entry_keys(entries)) do
+                      apply_compound_batch_put_entries_admitted(state, redis_key, entries)
+                    end
                   end)
 
                 {max(count, 1), result}
@@ -2032,11 +2038,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
               {:ok, count} ->
                 result =
                   with_pending_writes(state, fn ->
-                    apply_compound_blob_batch_put_entries_admitted(
-                      state,
-                      redis_key,
-                      entries
-                    )
+                    with :ok <-
+                           check_member_write_type(state, redis_key, compound_entry_keys(entries)) do
+                      apply_compound_blob_batch_put_entries_admitted(
+                        state,
+                        redis_key,
+                        entries
+                      )
+                    end
                   end)
 
                 {max(count, 1), result}

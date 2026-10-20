@@ -187,6 +187,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       defp do_hincrby(state, redis_key, field, delta) do
         compound_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, field)
 
+        with :ok <- check_member_write_type(state, redis_key, [compound_key]) do
+          do_checked_hincrby(state, redis_key, compound_key, delta)
+        end
+      end
+
+      defp do_checked_hincrby(state, redis_key, compound_key, delta) do
         case sm_store_compound_get_meta(state, redis_key, compound_key) do
           {:error, _reason} = error ->
             error
@@ -234,6 +240,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       defp do_hincrbyfloat(state, redis_key, field, delta) do
         compound_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, field)
 
+        with :ok <- check_member_write_type(state, redis_key, [compound_key]) do
+          do_checked_hincrbyfloat(state, redis_key, compound_key, delta)
+        end
+      end
+
+      defp do_checked_hincrbyfloat(state, redis_key, compound_key, delta) do
         case sm_store_compound_get_meta(state, redis_key, compound_key) do
           {:error, _reason} = error ->
             error
@@ -1104,6 +1116,41 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
 
       # Mirror of TypeRegistry.check_or_set but operates on state machine state.
       # Writes type metadata on first use, returns :ok or wrongtype error.
+      # Feature level 4 (Ferricstore.Cluster.FeatureLevel): a write of hash, set
+      # or sorted set members checks the key's type in its own entry, as ZINCRBY
+      # always has. Callers check the type before they write, so a SET or DEL
+      # applied in between left the members under a string or without a type,
+      # to come back when the key was recreated. Read through do_get so a hot
+      # or cold marker reads the same on every replica.
+      defp check_member_write_type(state, redis_key, compound_keys) do
+        with type when is_binary(type) <-
+               Ferricstore.Store.CompoundKey.member_write_type(redis_key, compound_keys),
+             true <- member_write_types_checked?(state) do
+          check_or_set_type(
+            state,
+            redis_key,
+            Ferricstore.Store.CompoundKey.type_key(redis_key),
+            type
+          )
+        else
+          _unchecked -> :ok
+        end
+      end
+
+      defp member_write_types_checked?(state),
+        do:
+          do_get(state, Ferricstore.Cluster.FeatureLevel.key(4)) ==
+            Ferricstore.Cluster.FeatureLevel.marker()
+
+      defp compound_entry_keys(entries) when is_list(entries) do
+        Enum.map(entries, fn
+          {compound_key, _value, _expire_at_ms} -> compound_key
+          _invalid -> nil
+        end)
+      end
+
+      defp compound_entry_keys(_entries), do: []
+
       defp check_or_set_type(state, redis_key, type_key, expected_type) do
         case sm_store_compound_get(state, redis_key, type_key) do
           {:error, _reason} = error ->

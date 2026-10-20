@@ -414,6 +414,37 @@ defmodule Ferricstore.Store.CompoundKey do
     compound_prefix("Z:", redis_key)
   end
 
+  @doc false
+  # The collection type that a write of these member keys of `redis_key`
+  # needs: "hash", "set" or "zset" when every key is a member of that type,
+  # nil otherwise (other compound keys, mixed or no keys).
+  @spec member_write_type(binary(), [binary()]) :: binary() | nil
+  def member_write_type(redis_key, [first | _rest] = compound_keys) when is_binary(redis_key) do
+    type = member_type(redis_key, first)
+
+    if type != nil and Enum.all?(compound_keys, &(member_type(redis_key, &1) == type)),
+      do: type,
+      else: nil
+  end
+
+  def member_write_type(_redis_key, _compound_keys), do: nil
+
+  defp member_type(redis_key, compound_key) when is_binary(compound_key) do
+    cond do
+      member_of_prefix?(compound_key, hash_prefix(redis_key)) -> "hash"
+      member_of_prefix?(compound_key, set_prefix(redis_key)) -> "set"
+      member_of_prefix?(compound_key, zset_prefix(redis_key)) -> "zset"
+      true -> nil
+    end
+  end
+
+  defp member_type(_redis_key, _compound_key), do: nil
+
+  defp member_of_prefix?(compound_key, prefix),
+    do:
+      byte_size(compound_key) >= byte_size(prefix) and
+        binary_part(compound_key, 0, byte_size(prefix)) == prefix
+
   @doc """
   Returns the scan prefix for all entries of a stream.
   """

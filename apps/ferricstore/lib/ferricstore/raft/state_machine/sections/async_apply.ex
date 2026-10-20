@@ -462,9 +462,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       defp apply_single(state, {:compound_put, compound_key, value, expire_at_ms}) do
         redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
 
-        case check_fetch_or_compute_lock(state, redis_key, nil) do
-          :ok -> do_compound_put(state, redis_key, compound_key, value, expire_at_ms)
-          {:error, _reason} = error -> error
+        with :ok <- check_fetch_or_compute_lock(state, redis_key, nil),
+             :ok <- check_member_write_type(state, redis_key, [compound_key]) do
+          do_compound_put(state, redis_key, compound_key, value, expire_at_ms)
         end
       end
 
@@ -473,9 +473,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       end
 
       defp apply_single(state, {:compound_batch_put, redis_key, entries}) do
-        case apply_compound_batch_put_entries(state, redis_key, entries) do
-          results when is_list(results) -> :ok
-          {:error, _reason} = error -> error
+        with :ok <- check_member_write_type(state, redis_key, compound_entry_keys(entries)) do
+          case apply_compound_batch_put_entries(state, redis_key, entries) do
+            results when is_list(results) -> :ok
+            {:error, _reason} = error -> error
+          end
         end
       end
 
@@ -971,9 +973,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       end
 
       defp apply_single(state, {:compound_blob_batch_put, redis_key, entries}) do
-        case apply_compound_blob_batch_put_entries(state, redis_key, entries) do
-          results when is_list(results) -> :ok
-          {:error, _reason} = error -> error
+        with :ok <- check_member_write_type(state, redis_key, compound_entry_keys(entries)) do
+          case apply_compound_blob_batch_put_entries(state, redis_key, entries) do
+            results when is_list(results) -> :ok
+            {:error, _reason} = error -> error
+          end
         end
       end
 

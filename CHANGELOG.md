@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Add cluster feature level 4: the state machine checks the key's type when
+  it writes hash, set or sorted set members, as ZINCRBY always has, creating
+  the type for a missing key and refusing a string with WRONGTYPE. HINCRBY,
+  HINCRBYFLOAT, HSETNX, HSETEX, ZADD and GEOADD with options and SMOVE check
+  the type before they write, so a SET landing in between left the members
+  hidden under the string, to come back when the key was recreated (30 of 30
+  races). Raise it with `CLUSTER.FEATURES.RAISE 4` once every node runs this
+  release; until then these commands behave as before, so a mixed-version
+  cluster applies every write the same way on every node.
 - Keep a promoted sorted set's ranges and count current. Writes to a sorted
   set with more than 100 members go to its own file, so an entry that wrote
   only there left no shared-log rows, and the score index updates it queued
