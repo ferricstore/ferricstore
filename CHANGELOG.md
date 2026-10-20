@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Over HTTP, answer `deadline_exceeded` (with a message, not safe to retry)
+  for a blocking command (BLPOP, XREAD BLOCK) that the request deadline cut
+  off. It answered `{"code": "error", "message": "FerricStore command
+  failed"}`.
 - Answer Redis's arity error for a data command with too few or too many
   arguments through the TCP and HTTP gateways. SETEX and PSETEX with two
   arguments answered "unsupported command AST", BITOP and UNLINK with too

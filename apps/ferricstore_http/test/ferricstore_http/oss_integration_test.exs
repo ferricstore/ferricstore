@@ -114,6 +114,33 @@ defmodule FerricstoreHttp.OssIntegrationTest do
     assert {:ok, "PONG"} = BinaryEnvelope.decode(encoded_ping_after)
   end
 
+  test "a blocking command cut off by the request deadline answers deadline_exceeded" do
+    :ok = CatalogProjector.mark_ready()
+    unique = System.unique_integer([:positive, :monotonic])
+    username = "http-blocking-deadline-#{unique}"
+    password = "integration-secret"
+    key = "http:blocking:deadline:#{unique}"
+    configure_all_command_user(username, password, "~http:blocking:*")
+
+    HttpHelpers.start_server(
+      backend: FerricstoreHttp.Backends.Ferricstore,
+      request_timeout_ms: 300
+    )
+
+    assert {200, _headers, body} = command_request(username, password, [["BLPOP", key, "0"]])
+
+    assert %{
+             "results" => [
+               %{
+                 "status" => "error",
+                 "error" => %{"code" => "deadline_exceeded", "message" => message}
+               }
+             ]
+           } = Jason.decode!(body)
+
+    assert message =~ "deadline exceeded"
+  end
+
   test "rejects an invalid stateless batch before executing any command" do
     :ok = CatalogProjector.mark_ready()
     unique = System.unique_integer([:positive, :monotonic])

@@ -614,8 +614,21 @@ defmodule FerricstoreServer.CommandGateway do
   defp deadline_expired?(0), do: false
   defp deadline_expired?(deadline_ms), do: deadline_ms <= System.system_time(:millisecond)
 
-  defp deadline_exceeded_result,
-    do: %{status: :error, value: %{"code" => "deadline_exceeded"}}
+  # The structured error the native protocol answers for an expired deadline;
+  # without a message the HTTP gateway reported "FerricStore command failed".
+  # A blocking command cut off here may already have taken its element, so it
+  # is not safe to retry.
+  defp deadline_exceeded_result do
+    %{
+      status: :error,
+      value: %{
+        "code" => "deadline_exceeded",
+        "message" => "ERR request deadline exceeded",
+        "retryable" => false,
+        "safe_to_retry" => false
+      }
+    }
+  end
 
   defp blocking_worker_exit_result(:normal),
     do: %{status: :error, value: "ERR blocking worker exited without a response"}
