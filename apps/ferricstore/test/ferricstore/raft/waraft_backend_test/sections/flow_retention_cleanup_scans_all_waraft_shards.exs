@@ -757,7 +757,9 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.FlowRetentionCleanupScansA
 
           assert 4 = Ferricstore.Commands.Hash.handle_ast({:hincrby, key, "int", 3}, ctx)
 
-          assert "2.0" =
+          # Replies are plain decimals; below feature level 4 the field keeps
+          # the stored form every release writes ("2.0", read back below).
+          assert "2" =
                    Ferricstore.Commands.Hash.handle_ast({:hincrbyfloat, key, "float", 0.5}, ctx)
 
           assert 1 =
