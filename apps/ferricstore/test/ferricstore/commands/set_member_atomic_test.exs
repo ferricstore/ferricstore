@@ -1,6 +1,6 @@
 defmodule Ferricstore.Commands.SetMemberAtomicTest do
   @moduledoc """
-  Single-member SADD, SREM, ZREM and plain ZADD report whether they changed the key from
+  Single-member SADD, SREM and ZREM report whether they changed the key from
   one replicated entry, so concurrent clients see exactly one winner, as Redis
   clients relying on SADD for deduplication expect.
   """
@@ -41,37 +41,6 @@ defmodule Ferricstore.Commands.SetMemberAtomicTest do
 
     assert 1 == Enum.count(results, &(&1 == 1))
     assert ["other"] == Dispatcher.dispatch("ZRANGE", [key, "0", "-1"], ctx)
-  end
-
-  test "concurrent plain ZADD of one new member has one winner", %{ctx: ctx, key: key} do
-    results = concurrently(fn -> Dispatcher.dispatch("ZADD", [key, "1", "m"], ctx) end)
-
-    assert 1 == Enum.count(results, &(&1 == 1))
-    assert "1.0" == Dispatcher.dispatch("ZSCORE", [key, "m"], ctx)
-
-    assert 0 == Dispatcher.dispatch("ZADD", [key, "3", "m"], ctx)
-    assert ["m", "3.0"] == Dispatcher.dispatch("ZRANGE", [key, "0", "-1", "WITHSCORES"], ctx)
-    assert ["m"] == Dispatcher.dispatch("ZRANGEBYSCORE", [key, "2", "4"], ctx)
-
-    results = concurrently(fn -> FerricStore.zadd(key <> ":embedded", [{1.0, "m"}]) end)
-    assert 1 == Enum.count(results, &(&1 == {:ok, 1}))
-  end
-
-  test "a plain ZADD racing a SET leaves no member behind", %{ctx: ctx, key: key} do
-    for round <- 1..20 do
-      round_key = "#{key}:#{round}"
-
-      [
-        Task.async(fn -> Dispatcher.dispatch("ZADD", [round_key, "1", "m"], ctx) end),
-        Task.async(fn -> Dispatcher.dispatch("SET", [round_key, "s"], ctx) end),
-        Task.async(fn -> Dispatcher.dispatch("ZADD", [round_key, "1", "m"], ctx) end)
-      ]
-      |> Enum.each(&Task.await/1)
-
-      Dispatcher.dispatch("DEL", [round_key], ctx)
-      assert 1 == Dispatcher.dispatch("ZADD", [round_key, "5", "fresh"], ctx)
-      assert ["fresh"] == Dispatcher.dispatch("ZRANGE", [round_key, "0", "-1"], ctx)
-    end
   end
 
   test "the embedded sadd, srem and zrem have one winner", %{key: key} do

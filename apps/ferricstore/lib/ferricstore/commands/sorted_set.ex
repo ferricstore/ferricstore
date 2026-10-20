@@ -632,14 +632,6 @@ defmodule Ferricstore.Commands.SortedSet do
     {:error, "ERR wrong number of arguments for 'zrem' command"}
   end
 
-  # A plain ZADD of one member on the instance is the state machine's atomic
-  # single-member write: reading the member and writing it as separate entries
-  # let every concurrent client report it new, and a SET between them left the
-  # member behind under the string.
-  defp zadd_parsed(key, [], [{score, member}], %FerricStore.Instance{} = ctx)
-       when is_float(score) and is_binary(member),
-       do: Ops.zadd_single(ctx, key, score, member)
-
   defp zadd_parsed(key, opts, score_member_pairs, store) do
     with :ok <- validate_zadd_ast(opts, score_member_pairs) do
       do_zadd_parsed(key, opts, score_member_pairs, store)
