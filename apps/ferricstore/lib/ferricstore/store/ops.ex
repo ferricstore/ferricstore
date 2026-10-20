@@ -877,6 +877,16 @@ defmodule Ferricstore.Store.Ops do
 
   def hset_many(_store, _key, _field_value_pairs), do: :unsupported
 
+  @doc """
+  Runs a read-decide-write hash or sorted set command in one replicated entry
+  at cluster feature level 4. See `Ferricstore.Store.Router.compound_command/3`.
+  """
+  @spec compound_command(store(), binary(), tuple()) :: term()
+  def compound_command(%FerricStore.Instance{} = ctx, key, ast),
+    do: Router.compound_command(ctx, key, ast)
+
+  def compound_command(_store, _key, _ast), do: :unsupported
+
   def compound_get(store, redis_key, compound_key),
     do: CompoundOps.compound_get(store, redis_key, compound_key)
 

@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- At cluster feature level 4, run HDEL, HSETNX, HGETDEL, and ZADD and GEOADD
+  with options, as one replicated entry each, in which the state machine
+  reads, decides and writes. Concurrent clients then see one outcome: 20
+  concurrent `HDEL key f` answered 1 to all 20, and ZADD CH counted one
+  change for every client; the per-node latch these commands used did not
+  cover clients on other nodes. Below level 4 they keep their previous paths.
 - Answer INCRBYFLOAT and HINCRBYFLOAT in plain decimals, as Redis does:
   "5200" instead of "5.2e3", "0.00000015" instead of "1.5e-7", and "3" from
   HINCRBYFLOAT instead of "3.0". At cluster feature level 4 the stored value

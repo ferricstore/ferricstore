@@ -2179,6 +2179,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       # Atomic HINCRBY / HINCRBYFLOAT — read compound field, add delta, write back.
       # Previously ran in caller process and lost updates under concurrent hincrby
       # on the same field.
+      def apply(meta, {:compound_command, redis_key, ast}, state) do
+        apply_pending_with_time(meta, state, fn ->
+          do_compound_command(state, redis_key, ast)
+        end)
+      end
+
       def apply(meta, {:hincrby, key, field, delta}, state) do
         apply_pending_with_time(meta, state, fn -> do_hincrby(state, key, field, delta) end)
       end

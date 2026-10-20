@@ -622,6 +622,15 @@ defmodule Ferricstore.Commands.Geo do
     end
   end
 
+  # With options it reads the members and decides; at cluster feature level 4
+  # that runs as one replicated entry.
+  defp geoadd_validated(%FerricStore.Instance{} = ctx, key, pairs, flags) do
+    case Ops.compound_command(ctx, key, {:geoadd, key, flags, pairs}) do
+      :unsupported -> do_geoadd(ctx, key, pairs, flags)
+      result -> result
+    end
+  end
+
   defp geoadd_validated(store, key, pairs, flags), do: do_geoadd(store, key, pairs, flags)
 
   defp do_geoadd(store, key, pairs, flags) do

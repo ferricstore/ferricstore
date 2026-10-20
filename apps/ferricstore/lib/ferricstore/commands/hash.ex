@@ -346,7 +346,7 @@ defmodule Ferricstore.Commands.Hash do
   def handle("HGETDEL", [key, "FIELDS", count_str | fields], store) do
     with {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
          :ok <- Helpers.validate_field_count(count, fields) do
-      FieldOps.getdel_fields(key, fields, store)
+      getdel_fields(key, fields, store)
     end
   end
 
@@ -604,7 +604,7 @@ defmodule Ferricstore.Commands.Hash do
     do: FieldOps.expiretime_fields(key, fields, store)
 
   def handle_ast({:hgetdel, key, fields}, store) when is_list(fields),
-    do: FieldOps.getdel_fields(key, fields, store)
+    do: getdel_fields(key, fields, store)
 
   def handle_ast({:hgetex, key, :none, fields}, store) when is_list(fields),
     do: hmget_args([key | fields], store)
@@ -714,7 +714,32 @@ defmodule Ferricstore.Commands.Hash do
     end
   end
 
-  defp hdel_args([key | fields], store) when fields != [] do
+  # On the instance, at cluster feature level 4, the commands below that read
+  # the hash, decide and write run as one replicated entry, so concurrent
+  # clients each see one outcome: one HDEL removes a field, one HSETNX sets it,
+  # one HGETDEL takes its value. Below the level they keep the paths every
+  # release applies.
+  defp hdel_args([key | fields] = args, %FerricStore.Instance{} = ctx) when fields != [] do
+    case Ops.compound_command(ctx, key, {:hdel, args}) do
+      :unsupported -> hdel_fields(key, fields, ctx)
+      result -> result
+    end
+  end
+
+  defp hdel_args([key | fields], store) when fields != [], do: hdel_fields(key, fields, store)
+
+  defp hdel_args(_args, _store), do: {:error, "ERR wrong number of arguments for 'hdel' command"}
+
+  defp getdel_fields(key, fields, %FerricStore.Instance{} = ctx) do
+    case Ops.compound_command(ctx, key, {:hgetdel, key, fields}) do
+      :unsupported -> FieldOps.getdel_fields(key, fields, ctx)
+      result -> result
+    end
+  end
+
+  defp getdel_fields(key, fields, store), do: FieldOps.getdel_fields(key, fields, store)
+
+  defp hdel_fields(key, fields, store) do
     with :ok <- TypeRegistry.command_check_type(key, :hash, store) do
       compound_keys =
         fields
@@ -731,8 +756,6 @@ defmodule Ferricstore.Commands.Hash do
       end
     end
   end
-
-  defp hdel_args(_args, _store), do: {:error, "ERR wrong number of arguments for 'hdel' command"}
 
   defp hash_deleted_entries([_compound_key | compound_keys], [nil | metas], acc) do
     hash_deleted_entries(compound_keys, metas, acc)
@@ -793,7 +816,17 @@ defmodule Ferricstore.Commands.Hash do
     end
   end
 
-  defp hsetnx_field(key, field, value, store) do
+  defp hsetnx_field(key, field, value, %FerricStore.Instance{} = ctx)
+       when is_binary(field) and is_binary(value) do
+    case Ops.compound_command(ctx, key, {:hsetnx, key, field, value}) do
+      :unsupported -> hsetnx_field_generic(key, field, value, ctx)
+      result -> result
+    end
+  end
+
+  defp hsetnx_field(key, field, value, store), do: hsetnx_field_generic(key, field, value, store)
+
+  defp hsetnx_field_generic(key, field, value, store) do
     with type_status when type_status in [:ok, {:ok, :created}] <-
            TypeRegistry.command_check_or_set_status(key, :hash, store) do
       compound_key = CompoundKey.hash_field(key, field)

@@ -1140,6 +1140,68 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         end
       end
 
+      # Feature level 4: a command that reads one hash or sorted set, decides
+      # and writes it runs its handler here, on the state machine's store, so
+      # concurrent clients each see one outcome (one HDEL removes a field, one
+      # ZADD NX adds a member). Older releases do not apply the entry, so it
+      # is refused below the level on every release that knows it.
+      defp do_compound_command(state, redis_key, ast) do
+        with {:ok, handler} <- compound_command_handler(redis_key, ast),
+             :ok <- require_feature_level_4(state),
+             :ok <- check_fetch_or_compute_lock(state, redis_key, nil) do
+          run_compound_command(handler, ast, build_compound_store(state))
+        end
+      end
+
+      # A handler that raised would stop the shard's storage on every replay.
+      # Every replica runs the same code on the same entry, so each answers the
+      # same error instead, and the entry's pending writes roll back.
+      defp run_compound_command(handler, ast, store) do
+        handler.handle_ast(ast, store)
+      rescue
+        error ->
+          Logger.error(
+            "compound command #{inspect(elem(ast, 0))} raised in apply: " <>
+              Exception.format(:error, error, __STACKTRACE__)
+          )
+
+          {:error, "ERR internal error applying #{elem(ast, 0)}"}
+      end
+
+      defp compound_command_handler(key, {:hdel, [key | fields]})
+           when is_binary(key) and fields != [],
+           do: binaries_handler(fields, Ferricstore.Commands.Hash)
+
+      defp compound_command_handler(key, {:hsetnx, key, field, value})
+           when is_binary(key) and is_binary(field) and is_binary(value),
+           do: {:ok, Ferricstore.Commands.Hash}
+
+      defp compound_command_handler(key, {:hgetdel, key, fields})
+           when is_binary(key) and is_list(fields) and fields != [],
+           do: binaries_handler(fields, Ferricstore.Commands.Hash)
+
+      defp compound_command_handler(key, {:zadd, key, opts, pairs})
+           when is_binary(key) and is_list(opts) and opts != [] and is_list(pairs),
+           do: {:ok, Ferricstore.Commands.SortedSet}
+
+      defp compound_command_handler(key, {:geoadd, key, flags, pairs})
+           when is_binary(key) and is_list(flags) and flags != [] and is_list(pairs),
+           do: {:ok, Ferricstore.Commands.Geo}
+
+      defp compound_command_handler(_key, _ast), do: {:error, "ERR invalid compound command"}
+
+      defp binaries_handler(values, handler) do
+        if Enum.all?(values, &is_binary/1),
+          do: {:ok, handler},
+          else: {:error, "ERR invalid compound command"}
+      end
+
+      defp require_feature_level_4(state) do
+        if feature_level_4?(state),
+          do: :ok,
+          else: {:error, "ERR this command requires cluster feature level 4"}
+      end
+
       defp feature_level_4?(state),
         do:
           do_get(state, Ferricstore.Cluster.FeatureLevel.key(4)) ==

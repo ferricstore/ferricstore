@@ -709,6 +709,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           compound_get: fn redis_key, compound_key ->
             sm_store_compound_get(state, redis_key, compound_key)
           end,
+          compound_get_meta: fn redis_key, compound_key ->
+            sm_store_compound_get_meta(state, redis_key, compound_key)
+          end,
           compound_put: fn redis_key, compound_key, value, expire_at_ms ->
             do_compound_put(state, redis_key, compound_key, value, expire_at_ms)
           end,

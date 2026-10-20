@@ -468,6 +468,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         end
       end
 
+      defp apply_single(state, {:compound_command, redis_key, ast}),
+        do: do_compound_command(state, redis_key, ast)
+
       defp apply_single(state, {:compound_put_blob_ref, compound_key, encoded_ref, expire_at_ms}) do
         do_checked_compound_put_blob_ref(state, compound_key, encoded_ref, expire_at_ms)
       end

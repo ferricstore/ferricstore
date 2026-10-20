@@ -155,6 +155,53 @@ defmodule Ferricstore.Cluster.FeatureLevelMemberTypesTest do
     assert {:ok, "3"} = FerricStore.get(key <> ":e")
   end
 
+  test "read-decide-write commands have one winner under concurrency", %{ctx: ctx, key: key} do
+    d = fn command, args -> Dispatcher.dispatch(command, args, ctx) end
+
+    assert 2 == d.("HSET", [key <> ":h", "f", "v", "g", "w"])
+    assert 1 == winners(fn -> d.("HDEL", [key <> ":h", "f"]) end, &(&1 == 1))
+
+    assert 1 ==
+             winners(fn -> d.("HGETDEL", [key <> ":h", "FIELDS", "1", "g"]) end, &(&1 == ["w"]))
+
+    assert 0 == d.("EXISTS", [key <> ":h"])
+
+    assert 1 == winners(fn -> d.("HSETNX", [key <> ":nx", "f", "v"]) end, &(&1 == 1))
+    assert 1 == winners(fn -> d.("ZADD", [key <> ":z", "NX", "1", "m"]) end, &(&1 == 1))
+    assert 1 == winners(fn -> d.("ZADD", [key <> ":z", "CH", "2", "m"]) end, &(&1 == 1))
+    assert 1 == winners(fn -> d.("ZADD", [key <> ":z", "GT", "CH", "3", "m"]) end, &(&1 == 1))
+    assert "3.0" == d.("ZSCORE", [key <> ":z", "m"])
+
+    assert 1 ==
+             winners(
+               fn -> d.("GEOADD", [key <> ":g", "NX", "13.36", "38.11", "m"]) end,
+               &(&1 == 1)
+             )
+  end
+
+  test "read-decide-write commands keep their replies", %{ctx: ctx, key: key} do
+    d = fn command, args -> Dispatcher.dispatch(command, args, ctx) end
+
+    assert 0 == d.("HDEL", [key <> ":missing", "f"])
+    assert 3 == d.("HSET", [key <> ":h", "a", "1", "b", "2", "c", "3"])
+    assert 2 == d.("HDEL", [key <> ":h", "a", "b", "a", "x"])
+    assert [nil, "3"] == d.("HGETDEL", [key <> ":h", "FIELDS", "2", "a", "c"])
+    assert 0 == d.("EXISTS", [key <> ":h"])
+    assert 2 == d.("ZADD", [key <> ":z", "NX", "1", "a", "2", "b"])
+    assert 1 == d.("ZADD", [key <> ":z", "XX", "CH", "5", "a", "1", "new"])
+    assert ["b", "a"] == d.("ZRANGE", [key <> ":z", "0", "-1"])
+    assert :ok = d.("SET", [key <> ":str", "v"])
+    assert @wrongtype == d.("HDEL", [key <> ":str", "f"])
+    assert @wrongtype == d.("ZADD", [key <> ":str", "NX", "1", "a"])
+    assert @wrongtype == d.("HGETDEL", [key <> ":str", "FIELDS", "1", "f"])
+  end
+
+  defp winners(fun, winner?) do
+    1..20
+    |> Task.async_stream(fn _client -> fun.() end, max_concurrency: 20, timeout: 30_000)
+    |> Enum.count(fn {:ok, result} -> winner?.(result) end)
+  end
+
   test "a hash keeps its members through the level-4 write paths", %{ctx: ctx, key: key} do
     fields = Enum.flat_map(1..150, &["f#{&1}", "v"])
     assert 150 == Dispatcher.dispatch("HSET", [key | fields], ctx)

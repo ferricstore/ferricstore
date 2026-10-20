@@ -31,6 +31,8 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    `:compound_batch_put` and their blob forms, `:hincrby`, `:hincrbyfloat`)
   #    check the key's type in the same entry, as `:zincrby` always has, and
   #    INCRBYFLOAT/HINCRBYFLOAT store plain decimals ("3", not "3.0").
+  #    `:compound_command` runs HDEL, HSETNX, HGETDEL and ZADD/GEOADD with
+  #    options in one entry.
   @supported 4
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

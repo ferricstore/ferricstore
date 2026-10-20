@@ -899,6 +899,27 @@ defmodule Ferricstore.Store.Router.Part09 do
         end
       end
 
+      @doc """
+      Runs a command that reads one hash or sorted set, decides and writes it
+      (HDEL, HSETNX, HGETDEL, ZADD or GEOADD with options) as one replicated
+      entry, in which the state machine runs the command's handler on its own
+      store, so concurrent clients each see one outcome. Needs cluster feature
+      level 4 on the key's shard, since older releases do not apply the entry;
+      returns `:unsupported` below it and for custom instances.
+      """
+      @spec compound_command(FerricStore.Instance.t(), binary(), tuple()) :: term()
+      def compound_command(ctx, key, ast) when is_binary(key) and is_tuple(ast) do
+        idx = shard_for(ctx, key)
+
+        if durable_raft_ctx?(ctx) and
+             read_shard_value(ctx, idx, Ferricstore.Cluster.FeatureLevel.key(4)) ==
+               {:ok, Ferricstore.Cluster.FeatureLevel.marker()} do
+          raft_write(ctx, idx, key, {:compound_command, key, ast})
+        else
+          :unsupported
+        end
+      end
+
       defp sum_single_member_results([], total), do: total
 
       defp sum_single_member_results([count | rest], total) when is_integer(count),

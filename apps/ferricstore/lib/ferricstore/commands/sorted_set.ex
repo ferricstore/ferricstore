@@ -673,6 +673,16 @@ defmodule Ferricstore.Commands.SortedSet do
     end
   end
 
+  # With options it reads the members and decides; at cluster feature level 4
+  # that runs as one replicated entry, so concurrent clients each see one
+  # outcome (one ZADD NX adds the member, one ZADD CH reports the change).
+  defp zadd_validated(key, opts, score_member_pairs, %FerricStore.Instance{} = ctx) do
+    case Ops.compound_command(ctx, key, {:zadd, key, opts, score_member_pairs}) do
+      :unsupported -> do_zadd_parsed(key, opts, score_member_pairs, ctx)
+      result -> result
+    end
+  end
+
   defp zadd_validated(key, opts, score_member_pairs, store),
     do: do_zadd_parsed(key, opts, score_member_pairs, store)
 
