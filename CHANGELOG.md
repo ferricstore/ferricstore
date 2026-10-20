@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Keep MULTI transactions applying alike on old and new nodes during an
+  upgrade. Inside MULTI, EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT with several
+  flags, BITCOUNT ranges and BITPOS run in the state machine on every
+  replica, and releases before this one raise on or answer them differently:
+  a v0.12.6 replica aborted the whole transaction (so it skipped the
+  transaction's writes) where this release applied it. MULTI now refuses
+  these forms while queueing until cluster feature level 4 is active.
 - Size TOPK.RESERVE's sketch for k when no width is given: 64 counters a row
   per tracked item (256 to 16,384) instead of 8. Redis's default width suits
   its HeavyKeeper sketch; FerricStore's Count-Min sketch that narrow put

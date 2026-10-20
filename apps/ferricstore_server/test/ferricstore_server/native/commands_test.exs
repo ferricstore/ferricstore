@@ -5096,6 +5096,39 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert Router.get(FerricStore.Instance.get(:default), key) == nil
   end
 
+  test "native MULTI refuses forms older releases apply differently below level 4" do
+    key = "{native-multi-compat:#{System.unique_integer([:positive, :monotonic])}}"
+    assert :ok = FerricStore.set(key, "v")
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(%{"command" => "EXPIRE", "args" => [key, "100", "GT"]}, state)
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(%{"command" => "BITCOUNT", "args" => [key]}, state)
+
+    state =
+      Enum.reduce(
+        [{"EXPIRE", [key, "100", "XX", "GT"]}, {"BITCOUNT", [key, "0", "-1"]}],
+        state,
+        fn {command, args}, state ->
+          assert {:error, message, state} =
+                   Session.execute(%{"command" => command, "args" => args}, state)
+
+          assert message =~ "needs cluster feature level 4"
+          state
+        end
+      )
+
+    assert {:error, abort_message, _state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, state)
+
+    assert abort_message =~ "EXECABORT"
+    assert {:ok, nil} == FerricStore.ttl(key)
+  end
+
   test "native MULTI queues commands with optional arguments" do
     key = "{native-multi-optional:#{System.unique_integer([:positive, :monotonic])}}"
 

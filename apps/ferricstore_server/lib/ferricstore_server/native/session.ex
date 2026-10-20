@@ -393,6 +393,9 @@ defmodule FerricstoreServer.Native.Session do
       transaction_ast_error(prepared.ast) != nil ->
         {:error, transaction_ast_error(prepared.ast), %{state | multi_error: true}}
 
+      replica_compat_error(prepared, state) != nil ->
+        {:error, replica_compat_error(prepared, state), %{state | multi_error: true}}
+
       true ->
         queue_transaction_command_within_byte_limit(prepared, state)
     end
@@ -901,6 +904,15 @@ defmodule FerricstoreServer.Native.Session do
   defp native_value({:error, reason}), do: %{"error" => reason}
   defp native_value(:ok), do: "OK"
   defp native_value(value), do: value
+
+  defp replica_compat_error(%PreparedCommand{} = prepared, state) do
+    Ferricstore.Transaction.ReplicaCompat.queue_error(
+      prepared.command,
+      prepared.ast,
+      prepared.command_keys,
+      state.instance_ctx
+    )
+  end
 
   defp transaction_ast_error({:unknown, cmd, _args}) when is_binary(cmd),
     do: "ERR unknown command '#{String.downcase(cmd)}', with args beginning with: "

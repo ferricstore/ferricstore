@@ -573,7 +573,9 @@ shard_0: 2
     "5200"), so INCR and HINCRBY work on them afterwards, and runs HDEL,
     HSETNX, HGETDEL and ZADD and GEOADD with options as one replicated entry
     each, so concurrent clients see one outcome (one HDEL removes the field)
-    across the whole cluster.
+    across the whole cluster. Inside MULTI, EXPIRE with several flags
+    (`EXPIRE key 100 XX GT`), BITCOUNT ranges and BITPOS are queued only at
+    level 4: older releases abort or answer such a transaction differently.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.

@@ -202,6 +202,16 @@ defmodule Ferricstore.Cluster.FeatureLevelMemberTypesTest do
     |> Enum.count(fn {:ok, result} -> winner?.(result) end)
   end
 
+  test "MULTI queues the forms older releases apply differently", %{ctx: ctx, key: key} do
+    alias Ferricstore.Transaction.ReplicaCompat
+
+    assert ReplicaCompat.level_4_form?({:expire, key, 100, [:xx, :gt]})
+    assert ReplicaCompat.level_4_form?({:bitcount, [key, "0", "-1"]})
+    refute ReplicaCompat.level_4_form?({:expire, key, 100, :gt})
+    assert nil == ReplicaCompat.queue_error("EXPIRE", {:expire, key, 100, [:xx, :gt]}, [key], ctx)
+    assert nil == ReplicaCompat.queue_error("BITPOS", {:bitpos, [key, "1"]}, [key], ctx)
+  end
+
   test "a hash keeps its members through the level-4 write paths", %{ctx: ctx, key: key} do
     fields = Enum.flat_map(1..150, &["f#{&1}", "v"])
     assert 150 == Dispatcher.dispatch("HSET", [key | fields], ctx)
