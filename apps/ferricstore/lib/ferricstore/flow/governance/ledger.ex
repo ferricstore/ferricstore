@@ -1,6 +1,8 @@
 defmodule Ferricstore.Flow.Governance.Ledger do
   @moduledoc false
 
+  alias Ferricstore.Flow.Governance.Args
+
   alias Ferricstore.Flow.Governance.AtomicRecord
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.RetentionGuard
@@ -88,8 +90,7 @@ defmodule Ferricstore.Flow.Governance.Ledger do
     end
   end
 
-  def list(_ctx, _id, _opts),
-    do: {:error, "ERR flow governance ledger opts must be a keyword list"}
+  def list(_ctx, id, _opts), do: Args.error("governance ledger", [{:id, id, :string}])
 
   @doc false
   def resolve_index_key(id, opts) when is_binary(id) and is_list(opts) do
@@ -106,8 +107,7 @@ defmodule Ferricstore.Flow.Governance.Ledger do
     end
   end
 
-  def resolve_index_key(_id, _opts),
-    do: {:error, "ERR flow governance ledger opts must be a keyword list"}
+  def resolve_index_key(id, _opts), do: Args.error("governance ledger", [{:id, id, :string}])
 
   defp load_index(ctx, index_key) do
     case Router.get(ctx, index_key) do

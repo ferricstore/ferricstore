@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Name the bad argument when a governance call (`FerricStore.flow_effect_*`,
+  `flow_approval_*`, `flow_circuit_*`, `flow_budget_*`, `flow_limit_*`,
+  `flow_governance_ledger`) gets a wrong id, scope, effect key, reservation
+  id or amount; every such call answered that its opts must be a keyword
+  list. LPOS RANK 0 also answers Redis's wording ("use negative", not "use
+  NEGATIVE").
 - Keep MULTI transactions applying alike on old and new nodes during an
   upgrade. Inside MULTI, EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT with several
   flags, BITCOUNT ranges and BITPOS run in the state machine on every

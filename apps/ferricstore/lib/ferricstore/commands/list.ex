@@ -459,7 +459,7 @@ defmodule Ferricstore.Commands.List do
         case Integer.parse(val) do
           {0, ""} ->
             {:error,
-             "ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use NEGATIVE to start from the end of the list"}
+             "ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list"}
 
           {r, ""} ->
             parse_lpos_opts(rest, r, count, maxlen)
