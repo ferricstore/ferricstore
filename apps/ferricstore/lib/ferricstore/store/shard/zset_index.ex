@@ -916,5 +916,4 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
        do: true
 
   defp ready_tables?(_state), do: false
-
 end

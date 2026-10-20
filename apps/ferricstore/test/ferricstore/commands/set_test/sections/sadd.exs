@@ -212,7 +212,8 @@ defmodule Ferricstore.Commands.SetTest.Sections.Sadd do
         test "SREM builds removed member entries directly from batch reads" do
           source = File.read!(Path.expand("../../../lib/ferricstore/commands/set.ex", __DIR__))
 
-          [srem_source] = Regex.run(~r/defp srem_args_generic\(\[key \| members\].*?^  end/ms, source)
+          [srem_source] =
+            Regex.run(~r/defp srem_args_generic\(\[key \| members\].*?^  end/ms, source)
 
           assert srem_source =~
                    "removed_entries = set_member_entries_for_present(compound_keys, values, [])"

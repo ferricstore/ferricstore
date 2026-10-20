@@ -13,7 +13,10 @@ defmodule Ferricstore.Commands.ZSetScoreIndexProjectionTest do
   alias Ferricstore.Test.ShardHelpers
 
   setup do
-    %{ctx: FerricStore.Instance.get(:default), key: "{zidx:#{System.unique_integer([:positive])}}"}
+    %{
+      ctx: FerricStore.Instance.get(:default),
+      key: "{zidx:#{System.unique_integer([:positive])}}"
+    }
   end
 
   test "members added by a multi-member ZADD are ranged and counted", %{ctx: ctx, key: key} do

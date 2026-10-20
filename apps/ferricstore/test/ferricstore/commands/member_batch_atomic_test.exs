@@ -17,7 +17,10 @@ defmodule Ferricstore.Commands.MemberBatchAtomicTest do
   @wrongtype {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
 
   setup do
-    %{ctx: FerricStore.Instance.get(:default), key: "{batch:#{System.unique_integer([:positive])}}"}
+    %{
+      ctx: FerricStore.Instance.get(:default),
+      key: "{batch:#{System.unique_integer([:positive])}}"
+    }
   end
 
   test "concurrent multi-member writes count each member once", %{ctx: ctx, key: key} do
@@ -25,7 +28,9 @@ defmodule Ferricstore.Commands.MemberBatchAtomicTest do
     assert 2 == replies_sum(fn -> Dispatcher.dispatch("SREM", [key <> ":s", "a", "b"], ctx) end)
 
     assert 2 ==
-             replies_sum(fn -> Dispatcher.dispatch("ZADD", [key <> ":z", "1", "a", "2", "b"], ctx) end)
+             replies_sum(fn ->
+               Dispatcher.dispatch("ZADD", [key <> ":z", "1", "a", "2", "b"], ctx)
+             end)
 
     assert 1 == replies_sum(fn -> Dispatcher.dispatch("ZADD", [key <> ":z", "3", "c"], ctx) end)
     assert 2 == replies_sum(fn -> Dispatcher.dispatch("ZREM", [key <> ":z", "a", "b"], ctx) end)
@@ -158,7 +163,10 @@ defmodule Ferricstore.Commands.MemberBatchAtomicTest do
 
     for target <- [key <> ":a", key <> ":b"] do
       assert 150 == Dispatcher.dispatch("ZADD", [target <> ":z", "CH" | seed_scores], ctx)
-      assert "1.0e20" == Dispatcher.dispatch("ZINCRBY", [target <> ":z", "1e20", "big"], ctx) |> canonical()
+
+      assert "1.0e20" ==
+               Dispatcher.dispatch("ZINCRBY", [target <> ":z", "1e20", "big"], ctx) |> canonical()
+
       assert 150 == Dispatcher.dispatch("SADD", [target <> ":s" | seed], ctx)
     end
 
@@ -212,6 +220,7 @@ defmodule Ferricstore.Commands.MemberBatchAtomicTest do
       end)
 
     assert grouped == 2 and Enum.sum(one_by_one) == 2
+
     assert Enum.sort(Dispatcher.dispatch("SMEMBERS", [key <> ":a:s"], ctx)) ==
              Enum.sort(Dispatcher.dispatch("SMEMBERS", [key <> ":b:s"], ctx))
   end
