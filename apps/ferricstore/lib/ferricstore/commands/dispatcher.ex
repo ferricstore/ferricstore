@@ -70,8 +70,10 @@ defmodule Ferricstore.Commands.Dispatcher do
   @conditional_zadd_flags ~w(NX XX GT LT)
   @latched_commands ~w(HSETNX ZADD GEOADD HGETDEL SMOVE EXPIRE PEXPIRE EXPIREAT PEXPIREAT)
   # Redis arities (COMMAND INFO: the name counts, a negative arity is a
-  # minimum). Redis refuses a command with another argument count while MULTI
-  # queues it, so EXEC then runs nothing; see queue_arity_error/2.
+  # minimum) of the data commands, checked before a gateway runs a command
+  # and while MULTI queues one (so EXEC then runs nothing); see
+  # arity_error/2. HSETEX is left out: FerricStore's form is shorter than
+  # Redis 8's.
   @redis_arities %{
     "GET" => 2,
     "SET" => -3,
@@ -139,6 +141,15 @@ defmodule Ferricstore.Commands.Dispatcher do
     "HSETNX" => 4,
     "HSTRLEN" => 3,
     "HRANDFIELD" => -2,
+    "HSCAN" => -3,
+    "HEXPIRE" => -6,
+    "HPEXPIRE" => -6,
+    "HTTL" => -5,
+    "HPTTL" => -5,
+    "HPERSIST" => -5,
+    "HEXPIRETIME" => -5,
+    "HGETDEL" => -5,
+    "HGETEX" => -5,
     "SADD" => -3,
     "SREM" => -3,
     "SMEMBERS" => 2,
@@ -927,11 +938,12 @@ defmodule Ferricstore.Commands.Dispatcher do
 
   @doc """
   The error Redis answers for `command` called with `args`, when their count
-  does not match the command's arity, or nil. MULTI checks it while queueing
-  so a malformed command discards the transaction, as in Redis.
+  does not match the command's arity, or nil. Gateways check it before they
+  run a command, and MULTI while it queues one, so a malformed command
+  discards the transaction, as in Redis.
   """
-  @spec queue_arity_error(binary(), list()) :: binary() | nil
-  def queue_arity_error(command, args) when is_binary(command) and is_list(args) do
+  @spec arity_error(binary(), list()) :: binary() | nil
+  def arity_error(command, args) when is_binary(command) and is_list(args) do
     count = length(args) + 1
 
     case Map.fetch(@redis_arities, command) do
@@ -941,7 +953,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     end
   end
 
-  def queue_arity_error(_command, _args), do: nil
+  def arity_error(_command, _args), do: nil
 
   defp wrong_arity_message(command),
     do: "ERR wrong number of arguments for '#{String.downcase(command)}' command"
@@ -966,18 +978,18 @@ defmodule Ferricstore.Commands.Dispatcher do
     start = Keyword.get_lazy(opts, :started_at_us, fn -> System.monotonic_time(:microsecond) end)
 
     result =
-      case authorize_public_keys(prepared.command, prepared.acl_keys) do
-        :ok ->
-          case acquire_raw_resource_lease(prepared, store) do
-            {:ok, lease} ->
-              execute_with_resource_lease(lease, prepared, store, executor)
+      with nil <- arity_error(prepared.command, prepared.args),
+           :ok <- authorize_public_keys(prepared.command, prepared.acl_keys) do
+        case acquire_raw_resource_lease(prepared, store) do
+          {:ok, lease} ->
+            execute_with_resource_lease(lease, prepared, store, executor)
 
-            {:error, reason} ->
-              {:error, FerricStore.ResourceLimits.error_message(reason)}
-          end
-
-        {:error, reason} ->
-          {:error, reason}
+          {:error, reason} ->
+            {:error, FerricStore.ResourceLimits.error_message(reason)}
+        end
+      else
+        message when is_binary(message) -> {:error, message}
+        {:error, reason} -> {:error, reason}
       end
 
     log_raw_dispatch(prepared.command, prepared.args, start)

@@ -378,8 +378,8 @@ defmodule FerricstoreServer.Native.Session do
       MapSet.member?(@blocked_in_transaction, prepared.command) ->
         {:error, "ERR Command not allowed inside a transaction", %{state | multi_error: true}}
 
-      Dispatcher.queue_arity_error(prepared.command, prepared.args) != nil ->
-        {:error, Dispatcher.queue_arity_error(prepared.command, prepared.args),
+      Dispatcher.arity_error(prepared.command, prepared.args) != nil ->
+        {:error, Dispatcher.arity_error(prepared.command, prepared.args),
          %{state | multi_error: true}}
 
       prepared.routing_scope == :coordinated ->

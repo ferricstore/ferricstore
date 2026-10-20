@@ -4,6 +4,27 @@ defmodule Ferricstore.Commands.RedisErrorMessagesTest do
 
   alias Ferricstore.Commands.Dispatcher
 
+  test "too few arguments answer the arity error, not an internal message" do
+    ctx = FerricStore.Instance.get(:default)
+
+    for {command, args} <- [
+          {"SETEX", ["k", "10"]},
+          {"PSETEX", ["k", "10"]},
+          {"BITOP", ["AND"]},
+          {"UNLINK", []},
+          {"HSCAN", ["k"]},
+          {"HTTL", ["k", "FIELDS"]},
+          {"HPERSIST", ["k"]},
+          {"HPTTL", ["k", "FIELDS", "1"]},
+          {"HEXPIRETIME", []},
+          {"HGETDEL", ["k", "FIELDS"]}
+        ] do
+      assert {:error, "ERR wrong number of arguments for '#{String.downcase(command)}' command"} ==
+               Dispatcher.dispatch(command, args, ctx),
+             "#{command} #{inspect(args)}"
+    end
+  end
+
   test "LPOS RANK 0 answers Redis's message" do
     ctx = FerricStore.Instance.get(:default)
     key = "{lpos:#{System.unique_integer([:positive])}}"

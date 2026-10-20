@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer Redis's arity error for a data command with too few or too many
+  arguments through the TCP and HTTP gateways. SETEX and PSETEX with two
+  arguments answered "unsupported command AST", BITOP and UNLINK with too
+  few "unsupported bitmap/generic command AST", and HSCAN, HTTL, HPERSIST,
+  HPTTL, HEXPIRETIME and HGETDEL "unsupported hash command AST".
 - Name the bad argument when a governance call (`FerricStore.flow_effect_*`,
   `flow_approval_*`, `flow_circuit_*`, `flow_budget_*`, `flow_limit_*`,
   `flow_governance_ledger`) gets a wrong id, scope, effect key, reservation
