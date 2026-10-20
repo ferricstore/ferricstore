@@ -4,6 +4,9 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Refuse keys over the 65,535-byte key size limit for hash, set, sorted set,
+  list and stream writes through the TCP and HTTP gateways, as SET already
+  did ("ERR key too large"); HSET, SADD, ZADD, RPUSH and XADD accepted them.
 - Over HTTP, answer `deadline_exceeded` (with a message, not safe to retry)
   for a blocking command (BLPOP, XREAD BLOCK) that the request deadline cut
   off. It answered `{"code": "error", "message": "FerricStore command

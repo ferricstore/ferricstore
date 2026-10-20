@@ -25,6 +25,25 @@ defmodule Ferricstore.Commands.RedisErrorMessagesTest do
     end
   end
 
+  test "writes refuse keys over the key size limit, as SET does" do
+    ctx = FerricStore.Instance.get(:default)
+    too_large = "{big}" <> String.duplicate("k", Ferricstore.Store.Router.max_key_size())
+
+    for {command, args} <- [
+          {"SET", [too_large, "v"]},
+          {"HSET", [too_large, "f", "v"]},
+          {"SADD", [too_large, "m"]},
+          {"ZADD", [too_large, "1", "m"]},
+          {"RPUSH", [too_large, "a"]},
+          {"XADD", [too_large, "*", "f", "v"]}
+        ] do
+      assert {:error, "ERR key too large"} == Dispatcher.dispatch(command, args, ctx),
+             command
+    end
+
+    assert 0 == Dispatcher.dispatch("EXISTS", [too_large], ctx)
+  end
+
   test "LPOS RANK 0 answers Redis's message" do
     ctx = FerricStore.Instance.get(:default)
     key = "{lpos:#{System.unique_integer([:positive])}}"

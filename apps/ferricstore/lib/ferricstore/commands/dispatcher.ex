@@ -979,6 +979,7 @@ defmodule Ferricstore.Commands.Dispatcher do
 
     result =
       with nil <- arity_error(prepared.command, prepared.args),
+           :ok <- check_write_key_sizes(prepared),
            :ok <- authorize_public_keys(prepared.command, prepared.acl_keys) do
         case acquire_raw_resource_lease(prepared, store) do
           {:ok, lease} ->
@@ -1042,6 +1043,20 @@ defmodule Ferricstore.Commands.Dispatcher do
     """
     @spec dispatch(binary(), [binary()], map()) :: term()
     def dispatch(name, args, store), do: dispatch_raw(name, args, store)
+  end
+
+  # SET refuses keys over the key size limit; hash, set, sorted set, list and
+  # stream writes took them. Flow and invocation commands check their own
+  # keys with their own messages.
+  defp check_write_key_sizes(%PreparedCommand{command: "FLOW." <> _rest}), do: :ok
+  defp check_write_key_sizes(%PreparedCommand{command: "INVOCATION." <> _rest}), do: :ok
+
+  defp check_write_key_sizes(%PreparedCommand{write_keys: write_keys}) do
+    max_key_size = Router.max_key_size()
+
+    if Enum.any?(write_keys, &(is_binary(&1) and byte_size(&1) > max_key_size)),
+      do: {:error, "ERR key too large"},
+      else: :ok
   end
 
   defp log_raw_dispatch(cmd, args, start) do
