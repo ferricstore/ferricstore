@@ -444,6 +444,14 @@ defmodule Ferricstore.Commands.Strings do
   def handle_ast({:getrange, _key, _start_idx, _end_idx}, _store),
     do: {:error, "ERR value is not an integer or out of range"}
 
+  # Redis answers the current length and writes nothing for an empty value;
+  # this zero-padded or created the key instead. Only the instance takes this
+  # path: inside MULTI the handler runs in the state machine, where every
+  # release must keep applying the same thing.
+  def handle_ast({:setrange, key, offset, ""}, %FerricStore.Instance{} = ctx)
+      when is_integer(offset) and offset >= 0,
+      do: strlen_key(key, ctx)
+
   def handle_ast({:setrange, key, offset, value}, store) when is_integer(offset) do
     cond do
       offset >= 0 and offset <= @max_setrange_offset ->

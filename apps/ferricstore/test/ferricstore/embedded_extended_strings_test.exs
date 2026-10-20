@@ -449,6 +449,32 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
   end
 
   describe "setrange/3" do
+    test "an empty value changes nothing and answers the current length" do
+      assert {:ok, 0} = FerricStore.setrange("sr:empty-missing", 5, "")
+      refute FerricStore.exists("sr:empty-missing")
+
+      FerricStore.set("sr:empty-existing", "abc")
+      assert {:ok, 3} = FerricStore.setrange("sr:empty-existing", 10, "")
+      assert {:ok, "abc"} = FerricStore.get("sr:empty-existing")
+
+      assert :ok = FerricStore.hset("sr:empty-hash", %{"f" => "v"})
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.setrange("sr:empty-hash", 0, "")
+
+      ctx = FerricStore.Instance.get(:default)
+
+      assert 0 ==
+               Ferricstore.Commands.Dispatcher.dispatch("SETRANGE", ["sr:empty-gw", "4", ""], ctx)
+
+      assert 0 == Ferricstore.Commands.Dispatcher.dispatch("EXISTS", ["sr:empty-gw"], ctx)
+
+      assert {:error, "ERR offset is out of range"} =
+               Ferricstore.Commands.Dispatcher.dispatch(
+                 "SETRANGE",
+                 ["sr:empty-gw", "-1", ""],
+                 ctx
+               )
+    end
+
     test "overwrites part of a string" do
       FerricStore.set("sr:key", "Hello World")
       assert {:ok, 11} = FerricStore.setrange("sr:key", 6, "Redis")

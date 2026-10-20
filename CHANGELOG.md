@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Make SETRANGE with an empty value change nothing and answer the current
+  length, as Redis does, through the TCP and HTTP gateways and
+  `FerricStore.setrange/3`. It zero-padded the string out to the offset, or
+  created a key of zero bytes when the key was missing. Inside MULTI/EXEC the
+  command keeps its previous behavior, because the state machine applies it
+  there and every release must apply a transaction the same way.
 - Refuse a CLUSTER.PROMOTE, CLUSTER.DEMOTE, CLUSTER.JOIN or CLUSTER.FAILOVER
   target, and a Raft membership change, whose name is not a distributed node
   (`name@host`). `CLUSTER.PROMOTE k` committed `k` into every shard's Raft
