@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Keep a sorted set's ranges and count right after writes from different
+  paths. A sorted set created by the native protocol's pipelined ZADD, which
+  writes through the state machine's single-member entry, gets a ready score
+  index; ZADD with several members, ZREM with several members, DEL and SET
+  then applied through the WARaft segment projection, which passed the state
+  machine's table names and so never updated that index. ZRANGE and ZCARD
+  missed the added members, kept the removed ones, and after DEL or SET
+  returned the old members under a recreated key. The projection now updates
+  the same index.
 - Keep COPY and RENAME of large collections from stopping a shard. The
   transaction store's member budget was never reset between key-lifecycle
   entries, so after a few COPY/RENAME pairs of 300-member collections one
