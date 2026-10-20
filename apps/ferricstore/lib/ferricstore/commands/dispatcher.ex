@@ -69,6 +69,127 @@ defmodule Ferricstore.Commands.Dispatcher do
   @tdigest_rmw_commands ~w(TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.MERGE)
   @conditional_zadd_flags ~w(NX XX GT LT)
   @latched_commands ~w(HSETNX ZADD GEOADD HGETDEL SMOVE EXPIRE PEXPIRE EXPIREAT PEXPIREAT)
+  # Redis arities (COMMAND INFO: the name counts, a negative arity is a
+  # minimum). Redis refuses a command with another argument count while MULTI
+  # queues it, so EXEC then runs nothing; see queue_arity_error/2.
+  @redis_arities %{
+    "GET" => 2,
+    "SET" => -3,
+    "DEL" => -2,
+    "EXISTS" => -2,
+    "MGET" => -2,
+    "MSET" => -3,
+    "MSETNX" => -3,
+    "INCR" => 2,
+    "DECR" => 2,
+    "INCRBY" => 3,
+    "DECRBY" => 3,
+    "INCRBYFLOAT" => 3,
+    "APPEND" => 3,
+    "STRLEN" => 2,
+    "GETSET" => 3,
+    "GETDEL" => 2,
+    "GETEX" => -2,
+    "SETNX" => 3,
+    "SETEX" => 4,
+    "PSETEX" => 4,
+    "GETRANGE" => 4,
+    "SETRANGE" => 4,
+    "EXPIRE" => -3,
+    "PEXPIRE" => -3,
+    "EXPIREAT" => -3,
+    "PEXPIREAT" => -3,
+    "TTL" => 2,
+    "PTTL" => 2,
+    "PERSIST" => 2,
+    "EXPIRETIME" => 2,
+    "PEXPIRETIME" => 2,
+    "TYPE" => 2,
+    "UNLINK" => -2,
+    "RENAME" => 3,
+    "RENAMENX" => 3,
+    "COPY" => -3,
+    "LPUSH" => -3,
+    "RPUSH" => -3,
+    "LPUSHX" => -3,
+    "RPUSHX" => -3,
+    "LPOP" => -2,
+    "RPOP" => -2,
+    "LRANGE" => 4,
+    "LLEN" => 2,
+    "LINDEX" => 3,
+    "LSET" => 4,
+    "LREM" => 4,
+    "LTRIM" => 4,
+    "LPOS" => -3,
+    "LINSERT" => 5,
+    "LMOVE" => 5,
+    "RPOPLPUSH" => 3,
+    "HSET" => -4,
+    "HGET" => 3,
+    "HDEL" => -3,
+    "HMGET" => -3,
+    "HGETALL" => 2,
+    "HEXISTS" => 3,
+    "HKEYS" => 2,
+    "HVALS" => 2,
+    "HLEN" => 2,
+    "HINCRBY" => 4,
+    "HINCRBYFLOAT" => 4,
+    "HSETNX" => 4,
+    "HSTRLEN" => 3,
+    "HRANDFIELD" => -2,
+    "SADD" => -3,
+    "SREM" => -3,
+    "SMEMBERS" => 2,
+    "SISMEMBER" => 3,
+    "SMISMEMBER" => -3,
+    "SCARD" => 2,
+    "SINTER" => -2,
+    "SUNION" => -2,
+    "SDIFF" => -2,
+    "SINTERSTORE" => -3,
+    "SUNIONSTORE" => -3,
+    "SDIFFSTORE" => -3,
+    "SINTERCARD" => -3,
+    "SRANDMEMBER" => -2,
+    "SPOP" => -2,
+    "SMOVE" => 4,
+    "ZADD" => -4,
+    "ZREM" => -3,
+    "ZSCORE" => 3,
+    "ZRANK" => -3,
+    "ZREVRANK" => -3,
+    "ZRANGE" => -4,
+    "ZREVRANGE" => -4,
+    "ZCARD" => 2,
+    "ZINCRBY" => 4,
+    "ZCOUNT" => 4,
+    "ZPOPMIN" => -2,
+    "ZPOPMAX" => -2,
+    "ZRANDMEMBER" => -2,
+    "ZMSCORE" => -3,
+    "ZRANGEBYSCORE" => -4,
+    "ZREVRANGEBYSCORE" => -4,
+    "SETBIT" => 4,
+    "GETBIT" => 3,
+    "BITCOUNT" => -2,
+    "BITPOS" => -3,
+    "BITOP" => -4,
+    "PFADD" => -2,
+    "PFCOUNT" => -2,
+    "PFMERGE" => -2,
+    "XADD" => -5,
+    "XLEN" => 2,
+    "XRANGE" => -4,
+    "XREVRANGE" => -4,
+    "XDEL" => -3,
+    "XTRIM" => -4,
+    "GEOADD" => -5,
+    "GEOPOS" => -2,
+    "GEODIST" => -4,
+    "GEOHASH" => -2
+  }
   @native_raw_commands ~w(CAS LOCK UNLOCK EXTEND RATELIMIT.ADD KEY_INFO FERRICSTORE.KEY_INFO FETCH_OR_COMPUTE FETCH_OR_COMPUTE_RESULT FETCH_OR_COMPUTE_ERROR)
   @management_raw_commands ~w(ACL FERRICSTORE.CAPABILITIES FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FERRICSTORE.TELEMETRY)
   @cluster_raw_commands ~w(CLUSTER.HEALTH CLUSTER.STATS CLUSTER.KEYSLOT CLUSTER.SLOTS CLUSTER.STATUS CLUSTER.JOIN CLUSTER.LEAVE CLUSTER.FAILOVER CLUSTER.PROMOTE CLUSTER.DEMOTE CLUSTER.ROLE CLUSTER.FEATURES CLUSTER.FEATURES.RAISE FERRICSTORE.HOTNESS)
@@ -803,6 +924,27 @@ defmodule Ferricstore.Commands.Dispatcher do
         {:error, reason}
     end
   end
+
+  @doc """
+  The error Redis answers for `command` called with `args`, when their count
+  does not match the command's arity, or nil. MULTI checks it while queueing
+  so a malformed command discards the transaction, as in Redis.
+  """
+  @spec queue_arity_error(binary(), list()) :: binary() | nil
+  def queue_arity_error(command, args) when is_binary(command) and is_list(args) do
+    count = length(args) + 1
+
+    case Map.fetch(@redis_arities, command) do
+      {:ok, arity} when arity > 0 and count != arity -> wrong_arity_message(command)
+      {:ok, arity} when arity < 0 and count < -arity -> wrong_arity_message(command)
+      _matching_or_unknown -> nil
+    end
+  end
+
+  def queue_arity_error(_command, _args), do: nil
+
+  defp wrong_arity_message(command),
+    do: "ERR wrong number of arguments for '#{String.downcase(command)}' command"
 
   @doc """
   Dispatches an already prepared command without repeating parsing or key discovery.

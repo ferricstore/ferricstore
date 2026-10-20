@@ -2,7 +2,7 @@ defmodule FerricstoreServer.Native.Session do
   @moduledoc false
 
   alias Ferricstore.PubSub, as: PS
-  alias Ferricstore.Commands.{PreparedCommand, TransactionPolicy}
+  alias Ferricstore.Commands.{Dispatcher, PreparedCommand, TransactionPolicy}
   alias FerricstoreServer.Native.FQLParser
   alias Ferricstore.Flow.InternalKey
   alias Ferricstore.Store.Router
@@ -373,6 +373,10 @@ defmodule FerricstoreServer.Native.Session do
 
       MapSet.member?(@blocked_in_transaction, prepared.command) ->
         {:error, "ERR Command not allowed inside a transaction", %{state | multi_error: true}}
+
+      Dispatcher.queue_arity_error(prepared.command, prepared.args) != nil ->
+        {:error, Dispatcher.queue_arity_error(prepared.command, prepared.args),
+         %{state | multi_error: true}}
 
       prepared.routing_scope == :coordinated ->
         {:error, "ERR coordinated command is not supported inside a transaction",

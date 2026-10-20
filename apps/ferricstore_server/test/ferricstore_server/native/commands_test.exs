@@ -4970,6 +4970,75 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert Router.get(FerricStore.Instance.get(:default), key) == nil
   end
 
+  test "native MULTI discards the transaction after a command with the wrong arity" do
+    key = "native-multi-arity:#{System.unique_integer([:positive, :monotonic])}"
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(%{"command" => "SET", "args" => [key, "partial"]}, state)
+
+    state =
+      Enum.reduce(
+        [
+          {"GET", []},
+          {"HSET", [key <> ":h", "f"]},
+          {"EXPIRE", [key]},
+          {"ZADD", [key <> ":z", "1"]},
+          {"GETRANGE", [key, "0"]}
+        ],
+        state,
+        fn {command, args}, state ->
+          assert {:error, message, state} =
+                   Session.execute(%{"command" => command, "args" => args}, state)
+
+          assert message ==
+                   "ERR wrong number of arguments for '#{String.downcase(command)}' command"
+
+          assert state.multi_error
+          state
+        end
+      )
+
+    assert {:error, abort_message, final_state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, state)
+
+    assert abort_message =~ "EXECABORT"
+    assert final_state.multi_state == :none
+    assert Router.get(FerricStore.Instance.get(:default), key) == nil
+  end
+
+  test "native MULTI queues commands with optional arguments" do
+    key = "{native-multi-optional:#{System.unique_integer([:positive, :monotonic])}}"
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    state =
+      Enum.reduce(
+        [
+          {"SET", [key, "v", "EX", "100"]},
+          {"EXPIRE", [key, "200", "GT"]},
+          {"HSET", [key <> ":h", "f", "1", "g", "2"]},
+          {"ZADD", [key <> ":z", "NX", "CH", "1", "m"]},
+          {"GETEX", [key]},
+          {"PING", []}
+        ],
+        state,
+        fn {command, args}, state ->
+          assert {:ok, "QUEUED", state} =
+                   Session.execute(%{"command" => command, "args" => args}, state)
+
+          state
+        end
+      )
+
+    assert {:ok, results, _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
+    assert length(results) == 6
+    assert "v" == Router.get(FerricStore.Instance.get(:default), key)
+  end
+
   test "native MULTI rejects request-scoped commands before queueing" do
     for {command, args} <- [
           {"PUBLISH", ["tx-channel", "must-not-publish"]},

@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Refuse a command with the wrong number of arguments while native MULTI
+  queues it, as Redis does, so EXEC then answers EXECABORT and runs nothing.
+  `MULTI`, `SET k v`, `GET` (no key), `EXEC` ran the SET and failed the GET;
+  a GET without a key was also reported as not supported inside
+  transactions. Errors Redis reports while running a command, such as an odd
+  number of HSET field/value arguments, still come back from EXEC.
 - At cluster feature level 4, run HDEL, HSETNX, HGETDEL, and ZADD and GEOADD
   with options, as one replicated entry each, in which the state machine
   reads, decides and writes. Concurrent clients then see one outcome: 20
