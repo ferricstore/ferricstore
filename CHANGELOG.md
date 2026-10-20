@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer INCRBYFLOAT and HINCRBYFLOAT in plain decimals, as Redis does:
+  "5200" instead of "5.2e3", "0.00000015" instead of "1.5e-7", and "3" from
+  HINCRBYFLOAT instead of "3.0". At cluster feature level 4 the stored value
+  takes the same form; before it, values keep the form every release stores
+  ("3.0", "5.2e3"), which INCR and HINCRBY refuse.
 - Add cluster feature level 4: the state machine checks the key's type when
   it writes hash, set or sorted set members, as ZINCRBY always has, creating
   the type for a missing key and refusing a string with WRONGTYPE. HINCRBY,

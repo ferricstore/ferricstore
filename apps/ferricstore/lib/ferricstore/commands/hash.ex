@@ -29,7 +29,7 @@ defmodule Ferricstore.Commands.Hash do
   alias Ferricstore.Commands.Hash.FieldOps
   alias Ferricstore.Commands.Hash.Helpers
   alias Ferricstore.Store.CompoundKey
-  alias Ferricstore.Store.{Ops, ReadResult, TypeRegistry}
+  alias Ferricstore.Store.{Ops, ReadResult, TypeRegistry, ValueCodec}
 
   @max_int64 9_223_372_036_854_775_807
   @min_int64 -9_223_372_036_854_775_808
@@ -993,7 +993,7 @@ defmodule Ferricstore.Commands.Hash do
 
   defp hincrbyfloat_field(key, field, increment, %FerricStore.Instance{} = ctx, type_status) do
     result = Ops.hincrbyfloat(ctx, key, field, increment)
-    atomic_field_increment(key, result, ctx, type_status)
+    key |> atomic_field_increment(result, ctx, type_status) |> plain_float_reply()
   end
 
   defp hincrbyfloat_field(key, field, increment, store, type_status) do
@@ -1005,8 +1005,15 @@ defmodule Ferricstore.Commands.Hash do
           {:ok, current_float} ->
             case Helpers.checked_float_add(current_float, increment) do
               {:ok, new_val} ->
-                result_str = Helpers.format_float(new_val)
-                write_hash_field(store, key, compound_key, result_str, result_str, type_status)
+                # The state machine runs this in MULTI; its store says whether
+                # cluster feature level 4 stores the Redis form.
+                stored =
+                  if Map.get(store, :float_format) == :plain,
+                    do: ValueCodec.format_float_plain(new_val),
+                    else: Helpers.format_float(new_val)
+
+                reply = ValueCodec.format_float_plain(new_val)
+                write_hash_field(store, key, compound_key, stored, reply, type_status)
 
               :overflow ->
                 {:error, "ERR increment would produce NaN or Infinity"}
@@ -1025,6 +1032,17 @@ defmodule Ferricstore.Commands.Hash do
     do: FieldOps.rollback_new_type_marker(key, store, type_status, error)
 
   defp atomic_field_increment(_key, result, _store, _type_status), do: result
+
+  # The stored form depends on the cluster feature level ("3.0" or "3"); the
+  # reply is the Redis form either way.
+  defp plain_float_reply(stored) when is_binary(stored) do
+    case Helpers.parse_float_value(stored) do
+      {:ok, value} -> ValueCodec.format_float_plain(value)
+      :error -> stored
+    end
+  end
+
+  defp plain_float_reply(other), do: other
 
   defp write_hash_field(store, key, compound_key, value, success, type_status) do
     case Ops.compound_put(store, key, compound_key, value, 0) do

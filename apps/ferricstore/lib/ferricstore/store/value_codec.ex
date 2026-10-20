@@ -106,6 +106,52 @@ defmodule Ferricstore.Store.ValueCodec do
     end
   end
 
+  @doc """
+  Formats a float as Redis formats INCRBYFLOAT and HINCRBYFLOAT results: the
+  shortest digits that read back as the same float, in plain decimal notation
+  without an exponent or a trailing ".0" ("3", "5200", "0.00000015").
+  """
+  @spec format_float_plain(float()) :: binary()
+  def format_float_plain(val) when is_float(val) do
+    {sign, short} =
+      case :erlang.float_to_binary(val, [:short]) do
+        "-" <> rest -> {"-", rest}
+        short -> {"", short}
+      end
+
+    {mantissa, exponent} =
+      case :binary.split(short, "e") do
+        [mantissa, exponent] -> {mantissa, String.to_integer(exponent)}
+        [mantissa] -> {mantissa, 0}
+      end
+
+    {integer_digits, fraction_digits} =
+      case :binary.split(mantissa, ".") do
+        [integer_digits, fraction_digits] -> {integer_digits, fraction_digits}
+        [integer_digits] -> {integer_digits, ""}
+      end
+
+    case plain_decimal(integer_digits <> fraction_digits, byte_size(integer_digits) + exponent) do
+      "0" -> "0"
+      plain -> sign <> plain
+    end
+  end
+
+  # `digits` with the decimal point after `point` of them.
+  defp plain_decimal(digits, point) do
+    trimmed = String.trim_leading(digits, "0")
+    point = point - (byte_size(digits) - byte_size(trimmed))
+    digits = String.trim_trailing(trimmed, "0")
+    count = byte_size(digits)
+
+    cond do
+      digits == "" -> "0"
+      point <= 0 -> "0." <> String.duplicate("0", -point) <> digits
+      point >= count -> digits <> String.duplicate("0", point - count)
+      true -> binary_part(digits, 0, point) <> "." <> binary_part(digits, point, count - point)
+    end
+  end
+
   defp trim_float_mantissa(mantissa) do
     case :binary.match(mantissa, ".") do
       :nomatch ->

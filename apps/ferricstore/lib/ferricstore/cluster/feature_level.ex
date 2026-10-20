@@ -29,7 +29,8 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    (`Ferricstore.Flow.OrphanPurge`).
   # 4: writes of hash, set and sorted set members (`:compound_put`,
   #    `:compound_batch_put` and their blob forms, `:hincrby`, `:hincrbyfloat`)
-  #    check the key's type in the same entry, as `:zincrby` always has.
+  #    check the key's type in the same entry, as `:zincrby` always has, and
+  #    INCRBYFLOAT/HINCRBYFLOAT store plain decimals ("3", not "3.0").
   @supported 4
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

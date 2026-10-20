@@ -568,7 +568,9 @@ shard_0: 2
     same replicated entry. HINCRBY, HINCRBYFLOAT, HSETNX, HSETEX, ZADD and
     GEOADD with options and SMOVE check the type before they write; without
     level 4 a SET landing between the check and the write leaves the members
-    hidden under the string, to come back when the key is recreated.
+    hidden under the string, to come back when the key is recreated. Level 4
+    also stores INCRBYFLOAT and HINCRBYFLOAT results as Redis does ("3",
+    "5200"), so INCR and HINCRBY work on them afterwards.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.

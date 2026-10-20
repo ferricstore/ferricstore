@@ -281,7 +281,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
            ) do
         case ValueCodec.checked_float_add(current, delta) do
           {:ok, new_val} ->
-            new_str = Float.to_string(new_val)
+            new_str =
+              if feature_level_4?(state),
+                do: ValueCodec.format_float_plain(new_val),
+                else: Float.to_string(new_val)
 
             case do_compound_put(state, redis_key, compound_key, new_str, expire_at_ms) do
               :ok -> new_str
@@ -1125,7 +1128,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       defp check_member_write_type(state, redis_key, compound_keys) do
         with type when is_binary(type) <-
                Ferricstore.Store.CompoundKey.member_write_type(redis_key, compound_keys),
-             true <- member_write_types_checked?(state) do
+             true <- feature_level_4?(state) do
           check_or_set_type(
             state,
             redis_key,
@@ -1137,10 +1140,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         end
       end
 
-      defp member_write_types_checked?(state),
+      defp feature_level_4?(state),
         do:
           do_get(state, Ferricstore.Cluster.FeatureLevel.key(4)) ==
             Ferricstore.Cluster.FeatureLevel.marker()
+
+      # Feature level 4 also stores INCRBYFLOAT and HINCRBYFLOAT results as
+      # Redis does ("3", "5200"); older releases store Float.to_string/1
+      # ("3.0", "5.2e3"), which INCR and HINCRBY then refuse.
+      defp stored_float_increment(state, value) when is_float(value) do
+        if feature_level_4?(state),
+          do: ValueCodec.format_float_plain(value),
+          else: value
+      end
 
       defp compound_entry_keys(entries) when is_list(entries) do
         Enum.map(entries, fn

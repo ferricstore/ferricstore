@@ -115,6 +115,46 @@ defmodule Ferricstore.Cluster.FeatureLevelMemberTypesTest do
     assert "v" == Dispatcher.dispatch("GET", [key <> ":str"], ctx)
   end
 
+  test "float increments store and answer plain decimals, as Redis does", %{ctx: ctx, key: key} do
+    d = fn command, args -> Dispatcher.dispatch(command, args, ctx) end
+
+    assert "2.5" == d.("INCRBYFLOAT", [key <> ":f", "2.5"])
+    assert "3" == d.("INCRBYFLOAT", [key <> ":f", "0.5"])
+    assert "3" == d.("GET", [key <> ":f"])
+    assert {:ok, 4} == d.("INCR", [key <> ":f"])
+    assert "5200" == d.("INCRBYFLOAT", [key <> ":big", "5200"])
+    assert "5200" == d.("GET", [key <> ":big"])
+    assert "0.00000015" == d.("INCRBYFLOAT", [key <> ":tiny", "0.00000015"])
+    assert "0.00000015" == d.("GET", [key <> ":tiny"])
+    assert "-2.5" == d.("INCRBYFLOAT", [key <> ":neg", "-2.5"])
+
+    assert "2.5" == d.("HINCRBYFLOAT", [key <> ":h", "f", "2.5"])
+    assert "3" == d.("HINCRBYFLOAT", [key <> ":h", "f", "0.5"])
+    assert "3" == d.("HGET", [key <> ":h", "f"])
+    assert 4 == d.("HINCRBY", [key <> ":h", "f", "1"])
+    assert "5200" == d.("HINCRBYFLOAT", [key <> ":h", "g", "5200"])
+    assert "5200" == d.("HGET", [key <> ":h", "g"])
+
+    queue =
+      for args <- [
+            ["INCRBYFLOAT", key <> ":m", "2.5"],
+            ["INCRBYFLOAT", key <> ":m", "0.5"],
+            ["HINCRBYFLOAT", key <> ":mh", "f", "5200"]
+          ] do
+        [command | rest] = args
+        {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare(command, rest)
+        prepared
+      end
+
+    assert ["2.5", "3", "5200"] == Ferricstore.Transaction.Coordinator.execute(queue, %{}, nil)
+    assert "3" == d.("GET", [key <> ":m"])
+    assert "5200" == d.("HGET", [key <> ":mh", "f"])
+
+    assert {:ok, 2.5} = FerricStore.incr_by_float(key <> ":e", 2.5)
+    assert {:ok, 3.0} = FerricStore.incr_by_float(key <> ":e", 0.5)
+    assert {:ok, "3"} = FerricStore.get(key <> ":e")
+  end
+
   test "a hash keeps its members through the level-4 write paths", %{ctx: ctx, key: key} do
     fields = Enum.flat_map(1..150, &["f#{&1}", "v"])
     assert 150 == Dispatcher.dispatch("HSET", [key | fields], ctx)

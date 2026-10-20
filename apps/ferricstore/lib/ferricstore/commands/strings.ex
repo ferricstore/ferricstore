@@ -704,7 +704,7 @@ defmodule Ferricstore.Commands.Strings do
 
     case incr_result do
       {:ok, new_val} when is_float(new_val) ->
-        Ferricstore.Store.ValueCodec.format_float(new_val)
+        Ferricstore.Store.ValueCodec.format_float_plain(new_val)
 
       {:ok, new_str} when is_binary(new_str) ->
         new_str

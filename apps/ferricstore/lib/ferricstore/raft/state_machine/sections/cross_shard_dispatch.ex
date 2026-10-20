@@ -2023,7 +2023,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
 
           with {:ok, float_val} <- coerce_float(current),
                {:ok, new_val} <- ValueCodec.checked_float_add(float_val, delta) do
-            case local_put.(key, new_val, expire_at_ms) do
+            case local_put.(key, stored_float_increment(anchor_state, new_val), expire_at_ms) do
               :ok -> {:ok, new_val}
               {:error, _reason} = error -> error
             end
@@ -2336,6 +2336,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         %{
           get: local_get,
           cache_scope: cache_scope,
+          float_format: if(feature_level_4?(anchor_state), do: :plain, else: :legacy),
           stream_index_dirty?: &pending_stream_index_dirty?/1,
           stream_current_ids: fn redis_key ->
             ctx = ctx_for_key.(redis_key)
