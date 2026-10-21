@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Check the key's type before INCRBYFLOAT's increment, as Redis does: a bad
+  increment on a key of another type answers WRONGTYPE.
 - Support `ZADD ... INCR`, alone or with NX, XX, GT and LT, as Redis does:
   it answers the new score, or nil when a condition refuses it. With a
   condition it runs as one replicated entry at cluster feature level 5, and

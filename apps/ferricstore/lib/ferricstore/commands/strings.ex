@@ -185,7 +185,7 @@ defmodule Ferricstore.Commands.Strings do
         incr_string_key_float(key, delta, store)
 
       :error ->
-        {:error, "ERR value is not a valid float"}
+        float_arg_error(key, store)
     end
   end
 
@@ -375,7 +375,7 @@ defmodule Ferricstore.Commands.Strings do
 
   def handle_ast({:incrby, _key, {:error, reason}}, _store), do: {:error, reason}
   def handle_ast({:decrby, _key, {:error, reason}}, _store), do: {:error, reason}
-  def handle_ast({:incrbyfloat, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:incrbyfloat, key, {:error, _reason}}, store), do: float_arg_error(key, store)
   def handle_ast({:getex, _key, {:error, "ERR syntax error"} = error}, _store), do: error
 
   def handle_ast({:getex, key, {:error, _reason} = error}, store),
@@ -703,6 +703,12 @@ defmodule Ferricstore.Commands.Strings do
       @wrongtype_error -> @wrongtype_error
       {:error, _reason} = error -> error
     end
+  end
+
+  # Unlike INCRBY, Redis's INCRBYFLOAT checks the key's type before the
+  # increment.
+  defp float_arg_error(key, store) do
+    with :ok <- ensure_string_key(key, store), do: {:error, "ERR value is not a valid float"}
   end
 
   defp incr_string_key_float(key, delta, store) do

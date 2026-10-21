@@ -469,6 +469,14 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
         assert "v" == run(ctx, "GETEX", [key, "persist"])
       end
 
+      test "INCRBYFLOAT checks the key's type before the increment", %{ctx: ctx, key: key} do
+        assert 1 == run(ctx, "RPUSH", [key <> ":l", "a"])
+        assert @wrongtype == run(ctx, "INCRBYFLOAT", [key <> ":l", "abc"])
+
+        assert {:error, "ERR value is not a valid float"} ==
+                 run(ctx, "INCRBYFLOAT", [key <> ":missing", "abc"])
+      end
+
       test "SETRANGE checks the key's type before the resulting size", %{ctx: ctx, key: key} do
         assert 1 == run(ctx, "RPUSH", [key <> ":l", "a"])
         assert @wrongtype == run(ctx, "SETRANGE", [key <> ":l", "536870912", "x"])
