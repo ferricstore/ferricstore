@@ -961,6 +961,10 @@ defmodule Ferricstore.Commands.Generic do
           {n, ""} when n > 0 and n <= @max_scan_count ->
             parse_scan_opts(rest, match, n, type)
 
+          # As in Redis, a COUNT below 1 is a syntax error.
+          {n, ""} when n < 1 ->
+            {:error, "ERR syntax error"}
+
           _ ->
             {:error, "ERR value is not an integer or out of range"}
         end

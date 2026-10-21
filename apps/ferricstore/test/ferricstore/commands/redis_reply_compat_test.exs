@@ -690,6 +690,42 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
 
         assert {:error, "ERR syntax error"} == run(ctx, "SET", [key, "v", "NX", "XX"])
 
+        assert 0 == run(ctx, "SETBIT", [key <> ":b", "0", "1"])
+
+        assert {:error, "ERR The bit argument must be 1 or 0."} ==
+                 run(ctx, "BITPOS", [key <> ":b", "2"])
+
+        assert {:error, "ERR value is not an integer or out of range"} ==
+                 run(ctx, "BITPOS", [key <> ":b", "x"])
+
+        for bit <- ["2", "x"] do
+          assert {:error, "ERR bit is not an integer or out of range"} ==
+                   run(ctx, "SETBIT", [key <> ":b", "0", bit])
+        end
+
+        for offset <- ["-1", "x"] do
+          assert {:error, "ERR bit offset is not an integer or out of range"} ==
+                   run(ctx, "SETBIT", [key <> ":b", offset, "1"])
+
+          assert {:error, "ERR bit offset is not an integer or out of range"} ==
+                   run(ctx, "GETBIT", [key <> ":b", offset])
+        end
+
+        assert 1 == run(ctx, "HSET", [key <> ":h", "f", "v"])
+        assert 1 == run(ctx, "SADD", [key <> ":set", "m"])
+        assert 1 == run(ctx, "ZADD", [key <> ":z", "1", "m"])
+
+        for {command, args} <- [
+              {"SCAN", ["0"]},
+              {"HSCAN", [key <> ":h", "0"]},
+              {"SSCAN", [key <> ":set", "0"]},
+              {"ZSCAN", [key <> ":z", "0"]}
+            ],
+            count <- ["0", "-1"] do
+          assert {:error, "ERR syntax error"} == run(ctx, command, args ++ ["COUNT", count]),
+                 "#{command} COUNT #{count}"
+        end
+
         for command <- ["LPOP", "RPOP"] do
           assert {:error, "ERR value is out of range, must be positive"} ==
                    run(ctx, command, [key, "-1"]),

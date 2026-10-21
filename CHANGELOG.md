@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer Redis's errors for BITPOS with a bit other than 0 or 1 ("The bit
+  argument must be 1 or 0."), SETBIT and GETBIT with a bad offset or bit
+  ("bit offset is not an integer or out of range", "bit is not an integer
+  or out of range"; the native protocol answered an internal "unsupported
+  bitmap command AST"), and a SCAN, HSCAN, SSCAN or ZSCAN COUNT below 1
+  ("syntax error").
 - Support SET's IFEQ and IFNE options (Redis 8.4): set only when the
   current value equals, or differs from, the given one (a missing key
   counts as different), with NX, XX, GET and the expiry options. On the

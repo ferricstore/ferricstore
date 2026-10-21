@@ -411,6 +411,8 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
       "COUNT" ->
         case Integer.parse(value) do
           {n, ""} when n > 0 -> do_parse_zscan_opts(rest, match, n)
+          # As in Redis, a COUNT below 1 is a syntax error.
+          {_n, ""} -> {:error, "ERR syntax error"}
           _ -> {:error, "ERR value is not an integer or out of range"}
         end
 

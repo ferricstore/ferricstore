@@ -1482,6 +1482,10 @@ defmodule Ferricstore.Commands.NativeAstParser do
           count when is_integer(count) and count > 0 and count <= 10_000 ->
             parse_scan_opts(rest, allow_type?, Keyword.put(acc, :count, count))
 
+          # As in Redis, a COUNT below 1 is a syntax error.
+          count when is_integer(count) and count < 1 ->
+            {:error, "ERR syntax error"}
+
           _invalid ->
             {:error, "ERR value is not an integer or out of range"}
         end

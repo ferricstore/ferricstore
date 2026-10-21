@@ -323,13 +323,13 @@ defmodule Ferricstore.Commands.BitmapTest.Sections.BitopXor do
         test "BITPOS with invalid bit value returns error" do
           store = MockStore.make(%{"k" => {<<0xFF>>, 0}})
           assert {:error, msg} = Bitmap.handle("BITPOS", ["k", "2"], store)
-          assert msg =~ "bit is not an integer"
+          assert msg == "ERR The bit argument must be 1 or 0."
         end
 
         test "BITPOS with non-integer bit value returns error" do
           store = MockStore.make(%{"k" => {<<0xFF>>, 0}})
           assert {:error, msg} = Bitmap.handle("BITPOS", ["k", "abc"], store)
-          assert msg =~ "bit is not an integer"
+          assert msg == "ERR value is not an integer or out of range"
         end
 
         test "BITPOS with non-integer start returns error" do

@@ -36,6 +36,17 @@ defmodule Ferricstore.Commands.Bitmap.Args do
     {:error, "ERR bit is not an integer or out of range"}
   end
 
+  @doc "BITPOS's bit, with Redis's errors (SETBIT's differ)."
+  @spec parse_bitpos_bit(binary()) :: {:ok, 0 | 1} | {:error, binary()}
+  def parse_bitpos_bit(bit) when bit in ["0", "1"], do: parse_bit_value(bit)
+
+  def parse_bitpos_bit(bit) do
+    case Integer.parse(bit) do
+      {_integer, ""} -> {:error, "ERR The bit argument must be 1 or 0."}
+      _invalid -> {:error, "ERR value is not an integer or out of range"}
+    end
+  end
+
   @spec parse_bitcount_mode([binary()]) :: {:ok, :byte | :bit} | {:error, binary()}
   def parse_bitcount_mode([]), do: {:ok, :byte}
 

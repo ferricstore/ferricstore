@@ -156,7 +156,7 @@ defmodule Ferricstore.Commands.Bitmap do
 
   def handle("BITPOS", [key, bit_str], store) do
     with :ok <- Destination.ensure_string_key(key, store),
-         {:ok, bit_val} <- Args.parse_bit_value(bit_str) do
+         {:ok, bit_val} <- Args.parse_bitpos_bit(bit_str) do
       case bitpos_all_from_store(store, key, bit_val) do
         {:ok, pos} ->
           pos
@@ -174,7 +174,7 @@ defmodule Ferricstore.Commands.Bitmap do
 
   def handle("BITPOS", [key, bit_str, start_str], store) do
     with :ok <- Destination.ensure_string_key(key, store),
-         {:ok, bit_val} <- Args.parse_bit_value(bit_str),
+         {:ok, bit_val} <- Args.parse_bitpos_bit(bit_str),
          {:ok, start_idx} <- Args.parse_integer(start_str) do
       case bitpos_byte_range_from_size(store, key, bit_val, start_idx, nil, false) do
         {:ok, result} ->
@@ -207,7 +207,7 @@ defmodule Ferricstore.Commands.Bitmap do
 
     with :ok <- Destination.ensure_string_key(key, store),
          {:ok, mode} <- mode,
-         {:ok, bit_val} <- Args.parse_bit_value(bit_str),
+         {:ok, bit_val} <- Args.parse_bitpos_bit(bit_str),
          {:ok, start_idx} <- Args.parse_integer(start_str),
          {:ok, end_idx} <- Args.parse_integer(end_str) do
       case mode do
@@ -288,9 +288,18 @@ defmodule Ferricstore.Commands.Bitmap do
   @spec handle_ast(term(), map()) :: term()
   def handle_ast(ast, store)
 
-  def handle_ast({:setbit, _key, {:error, reason}, _bit}, _store), do: {:error, reason}
-  def handle_ast({:setbit, _key, _offset, {:error, reason}}, _store), do: {:error, reason}
-  def handle_ast({:getbit, _key, {:error, reason}}, _store), do: {:error, reason}
+  # Redis's errors for a SETBIT or GETBIT offset or bit it cannot use (the
+  # parsed form reached an internal "unsupported AST" error for them).
+  def handle_ast({:setbit, _key, offset, _bit}, _store)
+      when not (is_integer(offset) and offset >= 0),
+      do: {:error, "ERR bit offset is not an integer or out of range"}
+
+  def handle_ast({:setbit, _key, _offset, bit}, _store) when bit not in [0, 1],
+    do: {:error, "ERR bit is not an integer or out of range"}
+
+  def handle_ast({:getbit, _key, offset}, _store) when not (is_integer(offset) and offset >= 0),
+    do: {:error, "ERR bit offset is not an integer or out of range"}
+
   def handle_ast({:bitcount, _key, {:error, reason}}, _store), do: {:error, reason}
   def handle_ast({:bitpos, _key, {:error, reason}}, _store), do: {:error, reason}
   def handle_ast({:bitpos, _key, _bit, {:error, reason}}, _store), do: {:error, reason}
