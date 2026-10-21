@@ -129,7 +129,10 @@ defmodule Ferricstore.Commands.Stream.Args do
       [ms_str, seq_str] ->
         with {:ok, ms} <- parse_id_component(ms_str),
              {:ok, seq} <- parse_id_component(seq_str) do
-          {:explicit, ms, seq}
+          # Redis refuses 0-0 while parsing, before it looks at the key.
+          if {ms, seq} == {0, 0},
+            do: {:error, "ERR The ID specified in XADD must be greater than 0-0"},
+            else: {:explicit, ms, seq}
         end
 
       [ms_str] ->

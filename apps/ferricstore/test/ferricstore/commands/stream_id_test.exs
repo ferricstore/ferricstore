@@ -215,8 +215,8 @@ defmodule Ferricstore.Commands.StreamIdTest do
       Stream.handle("XADD", [key, "1-1", "a", "1"], store)
       result = Stream.handle("XADD", [key, "0-0", "b", "2"], store)
 
-      assert {:error, msg} = result
-      assert msg =~ "equal or smaller"
+      # As in Redis, 0-0 is refused before the stream's last ID is compared.
+      assert {:error, "ERR The ID specified in XADD must be greater than 0-0"} = result
     end
 
     test "explicit ID below last after XDEL is rejected (monotonicity preserved)" do

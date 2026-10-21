@@ -117,7 +117,7 @@ defmodule Ferricstore.Commands.Stream do
     with {:ok, count} <- Args.parse_count_opt(rest),
          {:ok, range_start} <- ID.parse_range_id(start_str, :min),
          {:ok, range_end} <- ID.parse_range_id(end_str, :max) do
-      do_xrange(key, range_start, range_end, count, store)
+      if count == 0, do: zero_count_range(key, store), else: do_xrange(key, range_start, range_end, count, store)
     end
   end
 
@@ -133,7 +133,9 @@ defmodule Ferricstore.Commands.Stream do
     with {:ok, count} <- Args.parse_count_opt(rest),
          {:ok, range_start} <- ID.parse_range_id(start_str, :min),
          {:ok, range_end} <- ID.parse_range_id(end_str, :max) do
-      do_xrevrange(key, range_start, range_end, count, store)
+      if count == 0,
+        do: zero_count_range(key, store),
+        else: do_xrevrange(key, range_start, range_end, count, store)
     end
   end
 
@@ -381,7 +383,7 @@ defmodule Ferricstore.Commands.Stream do
     with {:ok, count} <- Args.parse_count_opt(rest),
          {:ok, range_start} <- ID.parse_range_id(start_str, :min),
          {:ok, range_end} <- ID.parse_range_id(end_str, :max) do
-      raw_xrange(key, range_start, range_end, count, store)
+      if count == 0, do: :fallback, else: raw_xrange(key, range_start, range_end, count, store)
     end
   end
 
@@ -392,7 +394,7 @@ defmodule Ferricstore.Commands.Stream do
     with {:ok, count} <- Args.parse_count_opt(rest),
          {:ok, range_start} <- ID.parse_range_id(start_str, :min),
          {:ok, range_end} <- ID.parse_range_id(end_str, :max) do
-      raw_xrevrange(key, range_start, range_end, count, store)
+      if count == 0, do: :fallback, else: raw_xrevrange(key, range_start, range_end, count, store)
     end
   end
 
@@ -403,7 +405,7 @@ defmodule Ferricstore.Commands.Stream do
     with {:ok, range_start} <- ID.normalize_ast_range_id(range_start, :min),
          {:ok, range_end} <- ID.normalize_ast_range_id(range_end, :max),
          {:ok, count} <- normalize_ast_count(count) do
-      raw_xrange(key, range_start, range_end, count, store)
+      if count == 0, do: :fallback, else: raw_xrange(key, range_start, range_end, count, store)
     end
   end
 
@@ -414,11 +416,22 @@ defmodule Ferricstore.Commands.Stream do
     with {:ok, range_start} <- ID.normalize_ast_range_id(range_start, :min),
          {:ok, range_end} <- ID.normalize_ast_range_id(range_end, :max),
          {:ok, count} <- normalize_ast_count(count) do
-      raw_xrevrange(key, range_start, range_end, count, store)
+      if count == 0, do: :fallback, else: raw_xrevrange(key, range_start, range_end, count, store)
     end
   end
 
   def handle_raw_range_ast(_ast, _store), do: :fallback
+
+  # Redis looks the key up first and then answers COUNT 0 with a null reply:
+  # an empty array for a missing key, nil for a stream.
+  defp zero_count_range(key, store) do
+    case TypeRegistry.get_type(key, store) do
+      "none" -> []
+      "stream" -> nil
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      _other -> {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+    end
+  end
 
   defp xlen_key(key, store) do
     # The metadata cache is local-only (not Raft-replicated), so on a follower we

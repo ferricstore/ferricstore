@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Read XRANGE and XREVRANGE bounds as Redis does: `-` and `+` in either
+  position, `(` for an exclusive bound, and an end without a sequence
+  spanning its whole millisecond (`XRANGE key 1 1` includes `1-1`). These
+  answered "Invalid stream ID" or missed entries. `COUNT 0` answers nil for
+  a stream, and `XADD key 0-0` is refused before the key is looked at.
 - Report a bad score bound or option of ZRANGEBYSCORE, ZREVRANGEBYSCORE,
   ZCOUNT and ZRANGE BYSCORE before a wrong key type, as Redis does ("ERR min
   or max is not a float" rather than WRONGTYPE).

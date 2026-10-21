@@ -109,11 +109,52 @@ defmodule Ferricstore.Commands.Stream.ID do
 
   defp parse_component_digits(_invalid, _value), do: :error
 
+  @doc """
+  Parses an XRANGE/XREVRANGE bound as Redis does. `side` is `:min` for the
+  start of the interval and `:max` for its end. "-" and "+" are the smallest
+  and largest IDs wherever they appear; an ID without a sequence spans its
+  whole millisecond (sequence 0 as a start, the largest as an end); and a
+  leading "(" excludes the ID itself.
+  """
   @spec parse_range_id(binary(), :min | :max) ::
           {:ok, :min | :max | stream_id()} | {:error, binary()}
-  def parse_range_id("-", :min), do: {:ok, :min}
-  def parse_range_id("+", :max), do: {:ok, :max}
-  def parse_range_id(id_str, _default), do: parse_full_id(id_str)
+  def parse_range_id(<<"(", id_str::binary>>, side) when id_str != "" do
+    with {:ok, id} <- plain_range_id(id_str, side), do: exclude_range_id(id, side)
+  end
+
+  def parse_range_id(id_str, side), do: plain_range_id(id_str, side)
+
+  defp plain_range_id("-", :min), do: {:ok, :min}
+  defp plain_range_id("+", :max), do: {:ok, :max}
+  defp plain_range_id("-", :max), do: {:ok, {0, 0}}
+  defp plain_range_id("+", :min), do: {:ok, {@max_u64, @max_u64}}
+
+  defp plain_range_id(id_str, side) do
+    case :binary.split(id_str, "-") do
+      [ms_str] ->
+        case parse_component(ms_str) do
+          {:ok, ms} -> {:ok, {ms, if(side == :max, do: @max_u64, else: 0)}}
+          _ -> {:error, @invalid_id}
+        end
+
+      _ ->
+        parse_full_id(id_str)
+    end
+  end
+
+  defp exclude_range_id(:min, :min), do: exclude_range_id({0, 0}, :min)
+  defp exclude_range_id(:max, :max), do: exclude_range_id({@max_u64, @max_u64}, :max)
+
+  defp exclude_range_id({@max_u64, @max_u64}, :min),
+    do: {:error, "ERR invalid start ID for the interval"}
+
+  defp exclude_range_id({ms, @max_u64}, :min), do: {:ok, {ms + 1, 0}}
+  defp exclude_range_id({ms, seq}, :min), do: {:ok, {ms, seq + 1}}
+  defp exclude_range_id({0, 0}, :max), do: {:error, "ERR invalid end ID for the interval"}
+  defp exclude_range_id({ms, 0}, :max), do: {:ok, {ms - 1, @max_u64}}
+  defp exclude_range_id({ms, seq}, :max), do: {:ok, {ms, seq - 1}}
+  defp exclude_range_id(:max, :min), do: exclude_range_id({@max_u64, @max_u64}, :min)
+  defp exclude_range_id(:min, :max), do: exclude_range_id({0, 0}, :max)
 
   @spec normalize_ast_range_id(:min | :max | stream_id() | binary(), :min | :max) ::
           {:ok, :min | :max | stream_id()} | {:error, binary()}

@@ -172,6 +172,57 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
       end
     end
 
+    # Entries keep FerricStore's documented flat form, [id, field, value, ...].
+    describe "#{@path}: stream ranges" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      setup %{ctx: ctx, key: key} do
+        for {id, value} <- [{"1-1", "a"}, {"2-0", "b"}, {"3-5", "c"}],
+            do: ^id = run(ctx, "XADD", [key, id, "f", value])
+
+        :ok
+      end
+
+      test "take - and + in either position and ( for exclusive bounds", %{ctx: ctx, key: key} do
+        assert [] == run(ctx, "XRANGE", [key, "3-5", "-"])
+        assert [] == run(ctx, "XRANGE", [key, "+", "-"])
+        assert [] == run(ctx, "XREVRANGE", [key, "-", "+"])
+        assert [["2-0", "f", "b"], ["3-5", "f", "c"]] == run(ctx, "XRANGE", [key, "(1-1", "+"])
+        assert [["1-1", "f", "a"], ["2-0", "f", "b"]] == run(ctx, "XRANGE", [key, "-", "(3-5"])
+        assert [["2-0", "f", "b"], ["1-1", "f", "a"]] == run(ctx, "XREVRANGE", [key, "(3-5", "-"])
+        assert [] == run(ctx, "XRANGE", [key, "(2-0", "(2-0"])
+      end
+
+      test "an end without a sequence spans its millisecond", %{ctx: ctx, key: key} do
+        assert [["1-1", "f", "a"]] == run(ctx, "XRANGE", [key, "1", "1"])
+        assert [["1-1", "f", "a"]] == run(ctx, "XREVRANGE", [key, "1", "1"])
+      end
+
+      test "an exclusive bound past the last ID is refused", %{ctx: ctx, key: key} do
+        assert {:error, "ERR invalid start ID for the interval"} ==
+                 run(ctx, "XRANGE", [key, "(18446744073709551615-18446744073709551615", "+"])
+
+        assert {:error, "ERR invalid end ID for the interval"} ==
+                 run(ctx, "XRANGE", [key, "0-0", "(0-0"])
+      end
+
+      test "COUNT 0 answers nil for a stream and an empty array for a missing key", %{
+        ctx: ctx,
+        key: key
+      } do
+        assert nil == run(ctx, "XRANGE", [key, "-", "+", "COUNT", "0"])
+        assert nil == run(ctx, "XREVRANGE", [key, "+", "-", "COUNT", "0"])
+        assert [] == run(ctx, "XRANGE", [key <> ":missing", "-", "+", "COUNT", "0"])
+      end
+
+      test "XADD refuses the ID 0-0 before looking at the key", %{ctx: ctx, key: key} do
+        refused = {:error, "ERR The ID specified in XADD must be greater than 0-0"}
+        assert refused == run(ctx, "XADD", [key <> ":missing", "NOMKSTREAM", "0-0", "f", "x"])
+        :ok = run(ctx, "SET", [key <> ":s", "v"])
+        assert refused == run(ctx, "XADD", [key <> ":s", "0-0", "f", "x"])
+      end
+    end
+
     describe "#{@path}: key moves" do
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 
