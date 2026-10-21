@@ -117,7 +117,9 @@ defmodule Ferricstore.Commands.Stream do
     with {:ok, count} <- Args.parse_count_opt(rest),
          {:ok, range_start} <- ID.parse_range_id(start_str, :min),
          {:ok, range_end} <- ID.parse_range_id(end_str, :max) do
-      if count == 0, do: zero_count_range(key, store), else: do_xrange(key, range_start, range_end, count, store)
+      if count == 0,
+        do: zero_count_range(key, store),
+        else: do_xrange(key, range_start, range_end, count, store)
     end
   end
 

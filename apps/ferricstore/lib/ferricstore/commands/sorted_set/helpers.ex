@@ -85,12 +85,23 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
 
   defp parse_zrange_options([option | rest], parsed) when is_binary(option) do
     case {String.upcase(option), rest} do
-      {"WITHSCORES", rest} -> parse_zrange_options(rest, %{parsed | with_scores: true})
-      {"BYSCORE", rest} -> parse_zrange_options(rest, %{parsed | by: :score})
-      {"BYLEX", rest} -> parse_zrange_options(rest, %{parsed | by: :lex})
-      {"REV", rest} -> parse_zrange_options(rest, %{parsed | rev: true})
-      {"LIMIT", [offset, count | rest]} -> parse_zrange_options(rest, %{parsed | limit: {offset, count}})
-      _other -> {:error, "ERR syntax error"}
+      {"WITHSCORES", rest} ->
+        parse_zrange_options(rest, %{parsed | with_scores: true})
+
+      {"BYSCORE", rest} ->
+        parse_zrange_options(rest, %{parsed | by: :score})
+
+      {"BYLEX", rest} ->
+        parse_zrange_options(rest, %{parsed | by: :lex})
+
+      {"REV", rest} ->
+        parse_zrange_options(rest, %{parsed | rev: true})
+
+      {"LIMIT", [offset, count | rest]} ->
+        parse_zrange_options(rest, %{parsed | limit: {offset, count}})
+
+      _other ->
+        {:error, "ERR syntax error"}
     end
   end
 
