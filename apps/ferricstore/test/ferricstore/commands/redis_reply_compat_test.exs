@@ -95,6 +95,15 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
         assert [] == run(ctx, "ZREVRANGE", [key <> ":one", "-1", "-2", "WITHSCORES"])
       end
 
+      test "ZRANK and ZREVRANK WITHSCORE answer the rank and the score", %{ctx: ctx, key: key} do
+        assert [1, "2"] == run(ctx, "ZRANK", [key, "b", "WITHSCORE"])
+        assert [0, "3"] == run(ctx, "ZREVRANK", [key, "c", "withscore"])
+        assert nil == run(ctx, "ZRANK", [key, "missing", "WITHSCORE"])
+        assert nil == run(ctx, "ZRANK", [key <> ":missing", "a", "WITHSCORE"])
+        assert {:error, "ERR syntax error"} == run(ctx, "ZRANK", [key, "b", "WITHSCORES"])
+        assert 1 == run(ctx, "ZRANK", [key, "b"])
+      end
+
       test "LIMIT needs BYSCORE", %{ctx: ctx, key: key} do
         assert {:error,
                 "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX"} ==

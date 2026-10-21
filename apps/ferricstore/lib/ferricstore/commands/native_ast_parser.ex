@@ -559,6 +559,12 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp make_ast(_cmd, :zincrby, [key, amount, member]),
     do: {:zincrby, key, parse_float(amount), member}
 
+  defp make_ast(_cmd, tag, [key, member, option]) when tag in ~w(zrank zrevrank)a do
+    if String.upcase(option) == "WITHSCORE",
+      do: {tag, key, member, :withscore},
+      else: {tag, key, member, {:error, "ERR syntax error"}}
+  end
+
   defp make_ast(_cmd, tag, [key, member]) when tag in ~w(zscore zrank zrevrank)a,
     do: {tag, key, member}
 

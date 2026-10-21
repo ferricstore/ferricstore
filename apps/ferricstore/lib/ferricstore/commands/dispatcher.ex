@@ -554,7 +554,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       do: SortedSet.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _, _} = ast, store)
-      when tag in ~w(zadd zincrby zrange zrevrange zrandmember zscan)a,
+      when tag in ~w(zadd zincrby zrange zrevrange zrandmember zscan zrank zrevrank)a,
       do: SortedSet.handle_ast(ast, store)
 
   def dispatch_ast({tag, key, min, max, opts}, store)

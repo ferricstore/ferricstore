@@ -126,6 +126,9 @@ defmodule Ferricstore.Commands.SortedSet do
 
   def handle("ZRANK", [key, member], store), do: Reads.zrank_member(key, member, false, store)
 
+  def handle("ZRANK", [key, member, option], store),
+    do: rank_with_score(key, member, option, false, store)
+
   def handle("ZRANK", _args, _store) do
     {:error, "ERR wrong number of arguments for 'zrank' command"}
   end
@@ -456,6 +459,9 @@ defmodule Ferricstore.Commands.SortedSet do
 
   def handle("ZREVRANK", [key, member], store), do: Reads.zrank_member(key, member, true, store)
 
+  def handle("ZREVRANK", [key, member, option], store),
+    do: rank_with_score(key, member, option, true, store)
+
   def handle("ZREVRANK", _args, _store) do
     {:error, "ERR wrong number of arguments for 'zrevrank' command"}
   end
@@ -473,6 +479,15 @@ defmodule Ferricstore.Commands.SortedSet do
   def handle_ast({:zmscore, args}, store), do: Reads.zmscore_args(args, store)
   def handle_ast({:zscore, key, member}, store), do: Reads.zscore_member(key, member, store)
   def handle_ast({:zrank, key, member}, store), do: Reads.zrank_member(key, member, false, store)
+
+  def handle_ast({tag, _key, _member, {:error, reason}}, _store) when tag in [:zrank, :zrevrank],
+    do: {:error, reason}
+
+  def handle_ast({:zrank, key, member, :withscore}, store),
+    do: Reads.zrank_member_with_score(key, member, false, store)
+
+  def handle_ast({:zrevrank, key, member, :withscore}, store),
+    do: Reads.zrank_member_with_score(key, member, true, store)
 
   def handle_ast({:zrevrank, key, member}, store),
     do: Reads.zrank_member(key, member, true, store)
@@ -562,6 +577,12 @@ defmodule Ferricstore.Commands.SortedSet do
     else
       _not_a_float -> {:error, "ERR min or max is not a float"}
     end
+  end
+
+  defp rank_with_score(key, member, option, reverse?, store) do
+    if String.upcase(option) == "WITHSCORE",
+      do: Reads.zrank_member_with_score(key, member, reverse?, store),
+      else: {:error, "ERR syntax error"}
   end
 
   defp parse_rank_range_opts([]), do: {:ok, false}

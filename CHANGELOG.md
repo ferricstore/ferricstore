@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Support `ZRANK` and `ZREVRANK` with `WITHSCORE` (Redis 7.2), which answer
+  the rank and the score; they answered an arity error. Inside MULTI they
+  are queued only at cluster feature level 5, new in this release
+  (`CLUSTER.FEATURES.RAISE 5` once every node runs it), as older releases do
+  not parse them.
 - Read XRANGE and XREVRANGE bounds as Redis does: `-` and `+` in either
   position, `(` for an exclusive bound, and an end without a sequence
   spanning its whole millisecond (`XRANGE key 1 1` includes `1-1`). These

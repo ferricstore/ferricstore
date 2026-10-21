@@ -5160,6 +5160,21 @@ defmodule FerricstoreServer.Native.CommandsTest do
              Session.execute(%{"command" => "EXEC", "args" => []}, state)
   end
 
+  test "native MULTI refuses ZRANK WITHSCORE below feature level 5" do
+    key = "{multi-zrank:#{System.unique_integer([:positive])}}"
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    assert {:error, message, _state} =
+             Session.execute(%{"command" => "ZRANK", "args" => [key, "m", "WITHSCORE"]}, state)
+
+    assert message =~ "needs cluster feature level 5"
+
+    assert {:ok, "QUEUED", _state} =
+             Session.execute(%{"command" => "ZRANK", "args" => [key, "m"]}, state)
+  end
+
   test "native MULTI refuses forms older releases apply differently below level 4" do
     key = "{native-multi-compat:#{System.unique_integer([:positive, :monotonic])}}"
     assert :ok = FerricStore.set(key, "v")

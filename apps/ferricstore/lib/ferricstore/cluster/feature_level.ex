@@ -33,7 +33,9 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    INCRBYFLOAT/HINCRBYFLOAT store plain decimals ("3", not "3.0").
   #    `:compound_command` runs HDEL, HSETNX, HGETDEL and ZADD/GEOADD with
   #    options in one entry.
-  @supported 4
+  # 5: MULTI queues the command forms older releases do not parse
+  #    (`Ferricstore.Transaction.ReplicaCompat`): ZRANK/ZREVRANK WITHSCORE.
+  @supported 5
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"
   @probe_timeout_ms 5_000
