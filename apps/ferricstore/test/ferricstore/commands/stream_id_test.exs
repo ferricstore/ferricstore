@@ -95,10 +95,10 @@ defmodule Ferricstore.Commands.StreamIdTest do
       store = MockStore.make()
       key = ustream()
 
-      # Force entries to the same millisecond using explicit partial IDs.
-      id1 = Stream.handle("XADD", [key, "5000", "a", "1"], store)
-      id2 = Stream.handle("XADD", [key, "5000", "b", "2"], store)
-      id3 = Stream.handle("XADD", [key, "5000", "c", "3"], store)
+      # Force entries to the same millisecond with Redis's ms-* IDs.
+      id1 = Stream.handle("XADD", [key, "5000-*", "a", "1"], store)
+      id2 = Stream.handle("XADD", [key, "5000-*", "b", "2"], store)
+      id3 = Stream.handle("XADD", [key, "5000-*", "c", "3"], store)
 
       assert id1 == "5000-0"
       assert id2 == "5000-1"
@@ -305,8 +305,12 @@ defmodule Ferricstore.Commands.StreamIdTest do
 
       Stream.handle("XADD", [key, "500-3", "a", "1"], store)
 
-      id = Stream.handle("XADD", [key, "500", "b", "2"], store)
+      id = Stream.handle("XADD", [key, "500-*", "b", "2"], store)
       assert id == "500-4"
+
+      # As in Redis, a bare millisecond is sequence 0.
+      assert {:error, "ERR The ID specified in XADD is equal or smaller" <> _} =
+               Stream.handle("XADD", [key, "500", "c", "3"], store)
     end
 
     test "partial ID at lower ms than last is rejected" do

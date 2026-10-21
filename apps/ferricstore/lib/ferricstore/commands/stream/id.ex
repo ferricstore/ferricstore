@@ -72,6 +72,20 @@ defmodule Ferricstore.Commands.Stream.ID do
     end
   end
 
+  @doc """
+  An XDEL ID as the text of the entry Redis means: `5` is "5-0", and
+  "05-01" is "5-1". Text that is no ID is returned unchanged.
+  """
+  @spec canonical(binary()) :: binary()
+  def canonical(id_str) when is_binary(id_str) do
+    full = if String.contains?(id_str, "-"), do: id_str, else: id_str <> "-0"
+
+    case parse_full_id(full) do
+      {:ok, {ms, seq}} -> "#{ms}-#{seq}"
+      {:error, _reason} -> id_str
+    end
+  end
+
   @spec parse_full_id(binary()) :: {:ok, stream_id()} | {:error, binary()}
   def parse_full_id(id_str) do
     case :binary.split(id_str, "-") do

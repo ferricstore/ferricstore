@@ -190,8 +190,11 @@ defmodule Ferricstore.Commands.StreamTest.Sections.Xadd do
           id = Stream.handle("XADD", [key, "200", "f", "v"], store)
           assert id == "200-0"
 
-          # Same ms -> seq increments.
-          id2 = Stream.handle("XADD", [key, "200", "g", "w"], store)
+          # As in Redis, a bare millisecond is sequence 0; 200-* takes the next.
+          assert {:error, "ERR The ID specified in XADD is equal or smaller" <> _} =
+                   Stream.handle("XADD", [key, "200", "g", "w"], store)
+
+          id2 = Stream.handle("XADD", [key, "200-*", "g", "w"], store)
           assert id2 == "200-1"
         end
 

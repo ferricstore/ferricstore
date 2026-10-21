@@ -228,6 +228,38 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
     end
 
     # Entries keep FerricStore's documented flat form, [id, field, value, ...].
+    describe "#{@path}: stream IDs" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      test "a bare millisecond ID means sequence 0, and ms-* picks the next", %{
+        ctx: ctx,
+        key: key
+      } do
+        smaller =
+          {:error,
+           "ERR The ID specified in XADD is equal or smaller than the target stream top item"}
+
+        assert "5-0" == run(ctx, "XADD", [key, "5", "f", "a"])
+        assert smaller == run(ctx, "XADD", [key, "5", "f", "b"])
+        assert "5-1" == run(ctx, "XADD", [key, "5-*", "f", "c"])
+        assert "7-0" == run(ctx, "XADD", [key, "007", "f", "d"])
+        assert "8-1" == run(ctx, "XADD", [key, "8-01", "f", "e"])
+        assert 1 == run(ctx, "XDEL", [key, "5"])
+        assert 1 == run(ctx, "XDEL", [key, "05-01"])
+        assert 2 == run(ctx, "XLEN", [key])
+
+        assert {:error, "ERR The ID specified in XADD must be greater than 0-0"} ==
+                 run(ctx, "XADD", [key <> ":fresh", "0", "f", "z"])
+      end
+
+      test "XADD NOMKSTREAM checks the key's type", %{ctx: ctx, key: key} do
+        :ok = run(ctx, "SET", [key, "v"])
+        assert @wrongtype == run(ctx, "XADD", [key, "NOMKSTREAM", "0-1", "f", "b"])
+        assert nil == run(ctx, "XADD", [key <> ":missing", "NOMKSTREAM", "5", "f", "b"])
+        assert 0 == run(ctx, "EXISTS", [key <> ":missing"])
+      end
+    end
+
     describe "#{@path}: stream ranges" do
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 

@@ -956,7 +956,7 @@ Adds an entry to a stream with optional trimming and NOMKSTREAM.
 | **Return** | Bulk string -- the generated entry ID |
 | **Elixir return** | `{:ok, binary()}` |
 
-**ID generation:** `*` auto-generates using HLC. Explicit IDs must be strictly greater than the last entry. Partial IDs (just milliseconds) auto-assign the sequence.
+**ID generation:** `*` auto-generates using HLC. Explicit IDs must be strictly greater than the last entry. As in Redis, `ms` alone means `ms-0`, and `ms-*` auto-assigns the sequence within that millisecond.
 
 **Status:** Supported, including NOMKSTREAM and trim options.
 

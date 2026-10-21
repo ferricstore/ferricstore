@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Read stream IDs as Redis does. In XADD, `5` means 5-0 (it took the next
+  sequence, as `5-*` does in Redis, which FerricStore refused) and `5-*`
+  takes the next sequence; XDEL matches `5` and `05-01` to 5-0 and 5-1 (it
+  matched only the exact text). `XADD key NOMKSTREAM ...` on a key of
+  another type answers WRONGTYPE instead of nil.
 - Measure GEO distances with Redis's Earth radius (6372797.560856 m, not
   6371000 m), so GEODIST and GEOSEARCH's WITHDIST and radius agree with
   Redis (Palermo to Catania was 47 m short). Distances keep four decimals

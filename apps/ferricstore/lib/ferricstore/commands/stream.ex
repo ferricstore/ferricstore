@@ -721,6 +721,11 @@ defmodule Ferricstore.Commands.Stream do
   end
 
   defp execute_xdel(key, ids, store) do
+    # The IDs reach the stored entries as text, so "5" and "05-01" must read
+    # as the 5-0 and 5-1 Redis means. The leader rewrites them before they
+    # are replicated (stream commands are refused inside MULTI).
+    ids = Enum.map(ids, &ID.canonical/1)
+
     result =
       case Ops.stream_mutate(store, key, {:delete, ids}) do
         :unsupported when is_map(store) ->

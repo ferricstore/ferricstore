@@ -3,6 +3,12 @@ defmodule Ferricstore.Commands.Stream.Args do
 
   @max_timeout_ms 0xFFFFFFFF
 
+  @doc """
+  Parses XADD's arguments, reading the ID as Redis does: `5` is 5-0 and
+  `5-*` takes the next sequence of millisecond 5. The leader parses, and the
+  replicated entry carries the parsed ID, so every replica appends the same
+  one.
+  """
   @spec parse_xadd_args([binary()]) ::
           {:ok, binary(), :auto | {:explicit, integer(), integer()} | {:partial, integer()},
            [
@@ -126,6 +132,12 @@ defmodule Ferricstore.Commands.Stream.Args do
 
   defp parse_id_spec(id_str) do
     case String.split(id_str, "-", parts: 2) do
+      [ms_str, "*"] ->
+        with {:ok, ms} <- parse_id_component(ms_str), do: {:partial, ms}
+
+      [ms_str] ->
+        parse_id_spec(ms_str <> "-0")
+
       [ms_str, seq_str] ->
         with {:ok, ms} <- parse_id_component(ms_str),
              {:ok, seq} <- parse_id_component(seq_str) do
@@ -133,11 +145,6 @@ defmodule Ferricstore.Commands.Stream.Args do
           if {ms, seq} == {0, 0},
             do: {:error, "ERR The ID specified in XADD must be greater than 0-0"},
             else: {:explicit, ms, seq}
-        end
-
-      [ms_str] ->
-        with {:ok, ms} <- parse_id_component(ms_str) do
-          {:partial, ms}
         end
     end
   end
