@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer Redis's "NOGROUP No such key '<key>' or consumer group '<group>'
+  in XREADGROUP with GROUP option" from XREADGROUP without the group.
 - Answer Redis's errors for BITPOS with a bit other than 0 or 1 ("The bit
   argument must be 1 or 0."), SETBIT and GETBIT with a bad offset or bit
   ("bit offset is not an integer or out of range", "bit is not an integer

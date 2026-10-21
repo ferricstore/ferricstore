@@ -1235,7 +1235,8 @@ defmodule Ferricstore.Commands.Stream do
     Groups.with_lock(store, key, group, fn ->
       case Groups.lookup(store, key, group) do
         :missing ->
-          {:error, "NOGROUP No such consumer group '#{group}' for key name '#{key}'"}
+          {:error,
+           "NOGROUP No such key '#{key}' or consumer group '#{group}' in XREADGROUP with GROUP option"}
 
         {:error, _reason} = error ->
           error

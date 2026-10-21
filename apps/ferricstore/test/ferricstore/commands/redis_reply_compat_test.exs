@@ -339,6 +339,16 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
                  run(ctx, "XADD", [key <> ":fresh", "0", "f", "z"])
       end
 
+      test "XREADGROUP without the group answers Redis's NOGROUP", %{ctx: ctx, key: key} do
+        assert "1-1" == run(ctx, "XADD", [key, "1-1", "f", "v"])
+
+        for stream <- [key, key <> ":missing"] do
+          assert {:error,
+                  "NOGROUP No such key '#{stream}' or consumer group 'nog' in XREADGROUP with GROUP option"} ==
+                   run(ctx, "XREADGROUP", ["GROUP", "nog", "c", "STREAMS", stream, ">"])
+        end
+      end
+
       test "XADD NOMKSTREAM checks the key's type", %{ctx: ctx, key: key} do
         :ok = run(ctx, "SET", [key, "v"])
         assert @wrongtype == run(ctx, "XADD", [key, "NOMKSTREAM", "0-1", "f", "b"])
