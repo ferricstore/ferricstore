@@ -475,12 +475,14 @@ defmodule Ferricstore.Commands.List do
       "COUNT" ->
         case Integer.parse(val) do
           {c, ""} when c >= 0 -> parse_lpos_opts(rest, rank, c, maxlen)
+          {_c, ""} -> {:error, "ERR COUNT can't be negative"}
           _ -> {:error, "ERR value is not an integer or out of range"}
         end
 
       "MAXLEN" ->
         case Integer.parse(val) do
           {m, ""} when m >= 0 -> parse_lpos_opts(rest, rank, count, m)
+          {_m, ""} -> {:error, "ERR MAXLEN can't be negative"}
           _ -> {:error, "ERR value is not an integer or out of range"}
         end
 

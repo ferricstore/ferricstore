@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- LPOS COUNT/MAXLEN and SINTERCARD LIMIT below zero answer Redis's
+  "ERR <option> can't be negative".
 - Answer Redis's texts "ERR decrement would overflow" (DECRBY of
   -9223372036854775808, refused before reading the key; inside MULTI only at
   feature level 5, since older releases apply it) and "ERR hash value is not a

@@ -680,6 +680,21 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
     end
 
     describe "#{@path}: argument error texts" do
+      test "negative LPOS and SINTERCARD options name the option", %{ctx: ctx, key: key} do
+        assert 1 == run(ctx, "LPUSH", [key <> ":l", "a"])
+
+        assert {:error, "ERR COUNT can't be negative"} ==
+                 run(ctx, "LPOS", [key <> ":l", "a", "COUNT", "-1"])
+
+        assert {:error, "ERR MAXLEN can't be negative"} ==
+                 run(ctx, "LPOS", [key <> ":l", "a", "MAXLEN", "-1"])
+
+        assert 1 == run(ctx, "SADD", [key <> ":s", "a"])
+
+        assert {:error, "ERR LIMIT can't be negative"} ==
+                 run(ctx, "SINTERCARD", ["1", key <> ":s", "LIMIT", "-1"])
+      end
+
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 
       test "match Redis's", %{ctx: ctx, key: key} do

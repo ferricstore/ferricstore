@@ -940,6 +940,7 @@ defmodule Ferricstore.Commands.Set do
           if String.upcase(opt) == "LIMIT" do
             case Integer.parse(limit_str) do
               {limit, ""} when limit >= 0 -> {:ok, key_args, limit}
+              {_limit, ""} -> {:error, "ERR LIMIT can't be negative"}
               _ -> {:error, "ERR value is not an integer or out of range"}
             end
           else

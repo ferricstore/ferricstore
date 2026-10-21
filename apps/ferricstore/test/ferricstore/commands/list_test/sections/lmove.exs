@@ -449,8 +449,9 @@ defmodule Ferricstore.Commands.ListTest.Sections.Lmove do
         test "LPOS with negative COUNT returns error" do
           store = MockStore.make()
           List.handle("RPUSH", ["mylist", "a"], store)
-          assert {:error, msg} = List.handle("LPOS", ["mylist", "a", "COUNT", "-1"], store)
-          assert msg =~ "not an integer"
+
+          assert {:error, "ERR COUNT can't be negative"} =
+                   List.handle("LPOS", ["mylist", "a", "COUNT", "-1"], store)
         end
       end
 

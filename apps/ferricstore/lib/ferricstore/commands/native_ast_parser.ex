@@ -1533,6 +1533,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
     if String.upcase(option) == "LIMIT" do
       case parse_int(value) do
         limit when is_integer(limit) and limit >= 0 -> {:sintercard, keys, limit}
+        limit when is_integer(limit) -> {:sintercard, {:error, "ERR LIMIT can't be negative"}}
         _ -> {:sintercard, {:error, "ERR value is not an integer or out of range"}}
       end
     else

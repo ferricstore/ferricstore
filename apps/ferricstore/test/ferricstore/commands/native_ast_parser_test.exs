@@ -336,7 +336,7 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
           {["0", "set:one"], "ERR numkeys should be greater than 0"},
           {["2", "set:one"], "ERR Number of keys can't be greater than number of args"},
           {["invalid", "set:one"], "ERR numkeys should be greater than 0"},
-          {["1", "set:one", "LIMIT", "-1"], "ERR value is not an integer or out of range"},
+          {["1", "set:one", "LIMIT", "-1"], "ERR LIMIT can't be negative"},
           {["1", "set:one", "unexpected"], "ERR syntax error"}
         ] do
       assert {:ok, "SINTERCARD", _parsed_args, {:sintercard, {:error, ^reason}}, _keys} =
