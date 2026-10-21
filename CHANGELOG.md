@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Stamp the dashboard's circuit open/close and approval decisions with the
+  store's clock. They used the wall clock, which the cluster's hybrid clock
+  can run ahead of, so closing a circuit or deciding an approval right after
+  it changed could be refused with "now_ms cannot precede updated_at_ms".
 - Answer `[]` from GEOSEARCH FROMMEMBER on a missing key, and empty
   GEOSEARCHSTORE's destination (answering 0) for a missing source, as Redis
   does; both answered "could not decode requested zset member". Inside MULTI
