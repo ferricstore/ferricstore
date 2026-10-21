@@ -110,6 +110,11 @@ defmodule Ferricstore.Commands.Strings.SetOptions do
     parse_ast_expiry(rest, acc, default, ms, 1, :absolute)
   end
 
+  # The parser's own error for an expiry value, such as "invalid expire time".
+  defp from_ast([{tag, {:error, reason}} | _rest], _acc, _default)
+       when tag in [:ex, :px, :exat, :pxat] and is_binary(reason),
+       do: {:error, reason}
+
   defp from_ast(_opts, _acc, _default), do: {:error, "ERR syntax error"}
 
   defp parse_ast_expiry(_rest, _acc, _default, value, _multiplier, _mode)

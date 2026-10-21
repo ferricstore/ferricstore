@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer SET's "ERR invalid expire time in 'set' command" for EX 0, PX -1 or
+  EXAT 0, as Redis does; it answered "syntax error".
 - Support HSCAN's NOVALUES option (Redis 7.4), which answers the fields
   without their values; it answered a syntax error.
 - Answer Redis's errors for an EXPIRE, PEXPIRE, EXPIREAT or PEXPIREAT time

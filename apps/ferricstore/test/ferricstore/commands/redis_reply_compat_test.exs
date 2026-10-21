@@ -634,6 +634,12 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
                  run(ctx, "SPOP", [key <> ":s", "-1"])
 
         assert {:error, "ERR syntax error"} == run(ctx, "SET", [key, "v", "NX", "XX"])
+
+        for expiry <- [["EX", "0"], ["PX", "-1"], ["EXAT", "0"]] do
+          assert {:error, "ERR invalid expire time in 'set' command"} ==
+                   run(ctx, "SET", [key, "v" | expiry]),
+                 inspect(expiry)
+        end
       end
     end
 
