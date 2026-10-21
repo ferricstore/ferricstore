@@ -5,10 +5,14 @@ defmodule Ferricstore.Commands.Strings.GetEx do
   alias Ferricstore.Commands.Strings.Compound
   alias Ferricstore.Store.Ops
 
+  @syntax_error {:error, "ERR syntax error"}
+  @invalid_expire_time {:error, "ERR invalid expire time in 'getex' command"}
+
   def do_getex(key, opts, store) do
     case parse_getex_opts(opts) do
       {:ok, expire_at_ms} -> getex_parsed(key, expire_at_ms, store)
-      {:error, _} = err -> err
+      @syntax_error -> @syntax_error
+      {:error, _reason} = value_error -> after_lookup(key, value_error, store)
     end
   end
 
@@ -19,7 +23,18 @@ defmodule Ferricstore.Commands.Strings.GetEx do
         {:error, _} = error -> error
       end
     else
-      integer_range_error()
+      after_lookup(key, @invalid_expire_time, store)
+    end
+  end
+
+  @doc """
+  Redis checks GETEX's option syntax, then looks the key up, then checks
+  the expiry value: a missing key answers nil and another type WRONGTYPE
+  before a bad value's error.
+  """
+  def after_lookup(key, {:error, _reason} = value_error, store) do
+    with :ok <- Compound.ensure_string_key(key, store) do
+      if Ops.exists?(store, key) == true, do: value_error, else: nil
     end
   end
 
@@ -53,12 +68,12 @@ defmodule Ferricstore.Commands.Strings.GetEx do
   defp parse_expiry(raw, multiplier, mode) do
     case ExpiryTime.parse_integer(raw) do
       {:ok, value} when value <= 0 ->
-        {:error, "ERR invalid expire time in 'getex' command"}
+        @invalid_expire_time
 
       {:ok, value} ->
         case expiry_time(value, multiplier, mode) do
           {:ok, expire_at_ms} -> {:ok, expire_at_ms}
-          :error -> integer_range_error()
+          :error -> @invalid_expire_time
         end
 
       :error ->

@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Look GETEX's key up before checking its expiry value, as Redis does: a
+  missing key answers nil and another type WRONGTYPE (`GETEX missing EX 0`
+  answered "invalid expire time"), and an expiry out of range answers "ERR
+  invalid expire time in 'getex' command". SETRANGE checks the key's type
+  before the resulting size, with Redis's "(proto-max-bulk-len)" text.
 - Answer Redis's argument errors from HTTL, HPTTL, HPERSIST, HEXPIRETIME,
   HPEXPIRETIME and HGETDEL, after the type check, and accept a lowercase
   `fields` in every command path (the command handlers refused it).

@@ -403,6 +403,43 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
       end
     end
 
+    describe "#{@path}: GETEX and SETRANGE error order" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      test "GETEX looks the key up before it checks the expiry value", %{ctx: ctx, key: key} do
+        missing = key <> ":missing"
+        invalid = {:error, "ERR invalid expire time in 'getex' command"}
+
+        for option <- [["EX", "0"], ["EX", "x"], ["PX", "-5"]] do
+          assert nil == run(ctx, "GETEX", [missing | option]), inspect(option)
+        end
+
+        assert {:error, "ERR syntax error"} == run(ctx, "GETEX", [missing, "FOO"])
+        assert 1 == run(ctx, "RPUSH", [key <> ":l", "a"])
+        assert @wrongtype == run(ctx, "GETEX", [key <> ":l", "EX", "0"])
+        :ok = run(ctx, "SET", [key, "v"])
+        assert invalid == run(ctx, "GETEX", [key, "EX", "0"])
+        assert invalid == run(ctx, "GETEX", [key, "PXAT", "-1"])
+        assert invalid == run(ctx, "GETEX", [key, "EX", "9223372036854775807"])
+
+        assert {:error, "ERR value is not an integer or out of range"} ==
+                 run(ctx, "GETEX", [key, "EX", "x"])
+
+        assert "v" == run(ctx, "GETEX", [key, "persist"])
+      end
+
+      test "SETRANGE checks the key's type before the resulting size", %{ctx: ctx, key: key} do
+        assert 1 == run(ctx, "RPUSH", [key <> ":l", "a"])
+        assert @wrongtype == run(ctx, "SETRANGE", [key <> ":l", "536870912", "x"])
+
+        assert {:error, "ERR offset is out of range"} ==
+                 run(ctx, "SETRANGE", [key <> ":l", "-1", "x"])
+
+        assert {:error, "ERR string exceeds maximum allowed size (proto-max-bulk-len)"} ==
+                 run(ctx, "SETRANGE", [key, "536870912", "x"])
+      end
+    end
+
     describe "#{@path}: hash field lists" do
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 

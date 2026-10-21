@@ -324,7 +324,7 @@ defmodule Ferricstore.Commands.Strings do
         setrange_parsed(key, offset, value, store)
 
       {offset, ""} when offset > @max_setrange_offset ->
-        {:error, "ERR string exceeds maximum allowed size (512MB)"}
+        setrange_too_large(key, store)
 
       {_offset, ""} ->
         {:error, "ERR offset is out of range"}
@@ -376,7 +376,15 @@ defmodule Ferricstore.Commands.Strings do
   def handle_ast({:incrby, _key, {:error, reason}}, _store), do: {:error, reason}
   def handle_ast({:decrby, _key, {:error, reason}}, _store), do: {:error, reason}
   def handle_ast({:incrbyfloat, _key, {:error, reason}}, _store), do: {:error, reason}
-  def handle_ast({:getex, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:getex, _key, {:error, "ERR syntax error"} = error}, _store), do: error
+
+  def handle_ast({:getex, key, {:error, _reason} = error}, store),
+    do: GetEx.after_lookup(key, error, store)
+
+  def handle_ast({:getex, key, {mode, {:error, _reason} = error}}, store)
+      when mode in [:ex, :px, :exat, :pxat],
+      do: GetEx.after_lookup(key, error, store)
+
   def handle_ast({:setex, _key, {:error, reason}, _value}, _store), do: {:error, reason}
   def handle_ast({:psetex, _key, {:error, reason}, _value}, _store), do: {:error, reason}
   def handle_ast({:getrange, _key, {:error, reason}, _stop}, _store), do: {:error, reason}
@@ -415,9 +423,9 @@ defmodule Ferricstore.Commands.Strings do
   def handle_ast({:getex, key, {:pxat, ts}}, store) when is_integer(ts) and ts > 0,
     do: getex_with_expiry(key, ts, 1, :absolute, store)
 
-  def handle_ast({:getex, _key, {mode, value}}, _store)
+  def handle_ast({:getex, key, {mode, value}}, store)
       when mode in [:ex, :px, :exat, :pxat] and is_integer(value),
-      do: {:error, "ERR invalid expire time in 'getex' command"}
+      do: GetEx.after_lookup(key, {:error, "ERR invalid expire time in 'getex' command"}, store)
 
   def handle_ast({:setex, key, seconds, value}, store) when is_integer(seconds) do
     if seconds > 0 do
@@ -458,7 +466,7 @@ defmodule Ferricstore.Commands.Strings do
         setrange_parsed(key, offset, value, store)
 
       offset > @max_setrange_offset ->
-        {:error, "ERR string exceeds maximum allowed size (512MB)"}
+        setrange_too_large(key, store)
 
       true ->
         {:error, "ERR offset is out of range"}
@@ -681,8 +689,11 @@ defmodule Ferricstore.Commands.Strings do
 
   defp getex_with_expiry(key, value, multiplier, mode, store) do
     case expiry_time(value, multiplier, mode) do
-      {:ok, expire_at_ms} -> GetEx.getex_parsed(key, expire_at_ms, store)
-      :error -> integer_range_error()
+      {:ok, expire_at_ms} ->
+        GetEx.getex_parsed(key, expire_at_ms, store)
+
+      :error ->
+        GetEx.after_lookup(key, {:error, "ERR invalid expire time in 'getex' command"}, store)
     end
   end
 
@@ -764,6 +775,12 @@ defmodule Ferricstore.Commands.Strings do
   defp expiry_time(value, multiplier, :absolute), do: ExpiryTime.absolute(value, multiplier)
 
   defp integer_range_error, do: {:error, "ERR value is not an integer or out of range"}
+
+  # Redis checks the key's type before the resulting size.
+  defp setrange_too_large(key, store) do
+    with :ok <- ensure_string_key(key, store),
+         do: {:error, "ERR string exceeds maximum allowed size (proto-max-bulk-len)"}
+  end
 
   defp setrange_parsed(key, offset, value, store) do
     case ensure_string_key(key, store) do
