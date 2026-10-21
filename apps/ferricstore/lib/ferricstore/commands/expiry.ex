@@ -146,73 +146,47 @@ defmodule Ferricstore.Commands.Expiry do
   # Private — EXPIRE / PEXPIRE (relative)
   # ---------------------------------------------------------------------------
 
-  defp set_expiry_seconds(key, secs_str, flag, store) do
-    with {:ok, secs} <- ExpiryTime.parse_integer(secs_str),
-         {:ok, expire_at_ms} <- ExpiryTime.relative(secs, 1_000) do
-      apply_expiry(key, expire_at_ms, flag, store)
-    else
-      _invalid -> integer_range_error()
-    end
-  end
+  defp set_expiry_seconds(key, secs_str, flag, store),
+    do: with_integer(secs_str, &set_expiry_seconds_parsed(key, &1, flag, store))
 
-  defp set_expiry_ms(key, ms_str, flag, store) do
-    with {:ok, ms} <- ExpiryTime.parse_integer(ms_str),
-         {:ok, expire_at_ms} <- ExpiryTime.relative(ms, 1) do
-      apply_expiry(key, expire_at_ms, flag, store)
-    else
-      _invalid -> integer_range_error()
-    end
-  end
+  defp set_expiry_ms(key, ms_str, flag, store),
+    do: with_integer(ms_str, &set_expiry_ms_parsed(key, &1, flag, store))
 
-  defp set_expiry_seconds_parsed(key, secs, flag, store) do
-    case ExpiryTime.relative(secs, 1_000) do
-      {:ok, expire_at_ms} -> apply_expiry(key, expire_at_ms, flag, store)
-      :error -> integer_range_error()
-    end
-  end
+  defp set_expiry_seconds_parsed(key, secs, flag, store),
+    do: apply_expiry_at(key, ExpiryTime.relative(secs, 1_000), "expire", flag, store)
 
-  defp set_expiry_ms_parsed(key, ms, flag, store) do
-    case ExpiryTime.relative(ms, 1) do
-      {:ok, expire_at_ms} -> apply_expiry(key, expire_at_ms, flag, store)
-      :error -> integer_range_error()
-    end
-  end
+  defp set_expiry_ms_parsed(key, ms, flag, store),
+    do: apply_expiry_at(key, ExpiryTime.relative(ms, 1), "pexpire", flag, store)
 
   # ---------------------------------------------------------------------------
   # Private — EXPIREAT / PEXPIREAT (absolute)
   # ---------------------------------------------------------------------------
 
-  defp set_expiry_at_seconds(key, ts_str, flag, store) do
-    with {:ok, ts} <- ExpiryTime.parse_integer(ts_str),
-         {:ok, expire_at_ms} <- ExpiryTime.absolute(ts, 1_000) do
-      apply_expiry(key, expire_at_ms, flag, store)
-    else
-      _invalid -> integer_range_error()
-    end
-  end
+  defp set_expiry_at_seconds(key, ts_str, flag, store),
+    do: with_integer(ts_str, &set_expiry_at_seconds_parsed(key, &1, flag, store))
 
-  defp set_expiry_at_ms(key, ts_str, flag, store) do
-    with {:ok, ts} <- ExpiryTime.parse_integer(ts_str),
-         {:ok, expire_at_ms} <- ExpiryTime.absolute(ts, 1) do
-      apply_expiry(key, expire_at_ms, flag, store)
-    else
-      _invalid -> integer_range_error()
-    end
-  end
+  defp set_expiry_at_ms(key, ts_str, flag, store),
+    do: with_integer(ts_str, &set_expiry_at_ms_parsed(key, &1, flag, store))
 
-  defp set_expiry_at_seconds_parsed(key, ts, flag, store) do
-    case ExpiryTime.absolute(ts, 1_000) do
-      {:ok, expire_at_ms} -> apply_expiry(key, expire_at_ms, flag, store)
+  defp set_expiry_at_seconds_parsed(key, ts, flag, store),
+    do: apply_expiry_at(key, ExpiryTime.absolute(ts, 1_000), "expireat", flag, store)
+
+  defp set_expiry_at_ms_parsed(key, ts, flag, store),
+    do: apply_expiry_at(key, ExpiryTime.absolute(ts, 1), "pexpireat", flag, store)
+
+  defp with_integer(raw, fun) do
+    case ExpiryTime.parse_integer(raw) do
+      {:ok, value} -> fun.(value)
       :error -> integer_range_error()
     end
   end
 
-  defp set_expiry_at_ms_parsed(key, ts, flag, store) do
-    case ExpiryTime.absolute(ts, 1) do
-      {:ok, expire_at_ms} -> apply_expiry(key, expire_at_ms, flag, store)
-      :error -> integer_range_error()
-    end
-  end
+  # A time that does not fit answers Redis's "invalid expire time" error.
+  defp apply_expiry_at(key, {:ok, expire_at_ms}, _command, flag, store),
+    do: apply_expiry(key, expire_at_ms, flag, store)
+
+  defp apply_expiry_at(_key, :error, command, _flag, _store),
+    do: {:error, "ERR invalid expire time in '#{command}' command"}
 
   defp integer_range_error, do: {:error, "ERR value is not an integer or out of range"}
 

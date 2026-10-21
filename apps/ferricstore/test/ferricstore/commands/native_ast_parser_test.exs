@@ -225,9 +225,7 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
     assert {:ok, "SET", ["k", "v", "nx", "ex", "5"], {:set, "k", "v", [:nx, {:ex, 5}]}, ["k"]} =
              NativeAstParser.parse("set", ["k", "v", "nx", "ex", "5"])
 
-    assert {:ok, "SET", _args,
-            {:set, "k", "v",
-             {:error, "ERR XX and NX options at the same time are not compatible"}}, ["k"]} =
+    assert {:ok, "SET", _args, {:set, "k", "v", {:error, "ERR syntax error"}}, ["k"]} =
              NativeAstParser.parse("set", ["k", "v", "NX", "XX"])
   end
 
@@ -335,9 +333,9 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
              NativeAstParser.parse("SINTERCARD", ["1", "set:one", "limit", "1"])
 
     for {args, reason} <- [
-          {["0", "set:one"], "ERR numkeys can't be non-positive value"},
+          {["0", "set:one"], "ERR numkeys should be greater than 0"},
           {["2", "set:one"], "ERR Number of keys can't be greater than number of args"},
-          {["invalid", "set:one"], "ERR numkeys can't be non-positive value"},
+          {["invalid", "set:one"], "ERR numkeys should be greater than 0"},
           {["1", "set:one", "LIMIT", "-1"], "ERR value is not an integer or out of range"},
           {["1", "set:one", "unexpected"], "ERR syntax error"}
         ] do

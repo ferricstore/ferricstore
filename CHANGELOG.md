@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer Redis's errors for an EXPIRE, PEXPIRE, EXPIREAT or PEXPIREAT time
+  that does not fit ("invalid expire time in 'expire' command"), SINTERCARD
+  0 ("numkeys should be greater than 0"), SPOP with a negative count ("value
+  is out of range, must be positive"; it answered an internal "unsupported
+  set command AST" over the native protocol) and SET NX XX ("syntax error").
 - Check the key's type before INCRBYFLOAT's increment, as Redis does: a bad
   increment on a key of another type answers WRONGTYPE.
 - Support `ZADD ... INCR`, alone or with NX, XX, GT and LT, as Redis does:

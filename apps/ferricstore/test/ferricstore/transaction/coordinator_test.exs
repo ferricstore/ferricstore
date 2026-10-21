@@ -217,7 +217,7 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
     } do
       result = Coordinator.execute([{"SET", [s1, "value", "NX", "XX"]}], %{}, nil)
 
-      assert result == [{:error, "ERR XX and NX options at the same time are not compatible"}]
+      assert result == [{:error, "ERR syntax error"}]
       assert Router.get(FerricStore.Instance.get(:default), s1) == nil
     end
 

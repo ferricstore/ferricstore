@@ -23,9 +23,11 @@ defmodule Ferricstore.Commands.ExpiryTimestampBoundsTest do
     too_large = Integer.to_string(@too_large_relative_ms)
     store = MockStore.make(%{"expiry" => {"v", 0}, "getex" => {"v", 0}})
 
-    assert integer_range_error() == Expiry.handle("PEXPIRE", ["expiry", too_large], store)
+    # Redis's own error for an expiry that does not fit.
+    pexpire_error = {:error, "ERR invalid expire time in 'pexpire' command"}
+    assert pexpire_error == Expiry.handle("PEXPIRE", ["expiry", too_large], store)
 
-    assert integer_range_error() ==
+    assert pexpire_error ==
              Expiry.handle_ast({:pexpire, "expiry", @too_large_relative_ms}, store)
 
     assert integer_range_error() ==

@@ -614,6 +614,29 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
       end
     end
 
+    describe "#{@path}: argument error texts" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      test "match Redis's", %{ctx: ctx, key: key} do
+        :ok = run(ctx, "SET", [key, "1"])
+
+        for command <- ["EXPIRE", "PEXPIRE"] do
+          assert {:error, "ERR invalid expire time in '#{String.downcase(command)}' command"} ==
+                   run(ctx, command, [key, "9223372036854775807"])
+        end
+
+        assert 1 == run(ctx, "SADD", [key <> ":s", "a"])
+
+        assert {:error, "ERR numkeys should be greater than 0"} ==
+                 run(ctx, "SINTERCARD", ["0", key <> ":s"])
+
+        assert {:error, "ERR value is out of range, must be positive"} ==
+                 run(ctx, "SPOP", [key <> ":s", "-1"])
+
+        assert {:error, "ERR syntax error"} == run(ctx, "SET", [key, "v", "NX", "XX"])
+      end
+    end
+
     describe "#{@path}: hyperloglog" do
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 

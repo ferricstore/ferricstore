@@ -1370,7 +1370,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp parse_set_opts([], acc) do
     if :nx in acc and :xx in acc do
-      {:error, "ERR XX and NX options at the same time are not compatible"}
+      {:error, "ERR syntax error"}
     else
       Enum.reverse(acc)
     end
@@ -1483,7 +1483,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp parse_sintercard([count | rest]) do
     case parse_int(count) do
       count when is_integer(count) and count > 0 -> parse_sintercard_keys(count, rest)
-      _ -> {:sintercard, {:error, "ERR numkeys can't be non-positive value"}}
+      _ -> {:sintercard, {:error, "ERR numkeys should be greater than 0"}}
     end
   end
 

@@ -6,8 +6,9 @@ defmodule Ferricstore.Commands.Strings.SetOptions do
   def parse(opts, default), do: parse(opts, default, default)
 
   defp parse([], acc, _default) do
+    # Redis answers SET NX XX with a plain syntax error.
     if acc.nx and acc.xx do
-      {:error, "ERR XX and NX options at the same time are not compatible"}
+      {:error, "ERR syntax error"}
     else
       {:ok, acc}
     end
