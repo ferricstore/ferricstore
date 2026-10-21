@@ -71,7 +71,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.SpopRemovesTypeMarkerFinalS
 
         result = apply_result_value(StateMachine.apply(%{index: 1}, {:zpop, key, 1, :min}, state))
 
-        assert result == ["only", "1.0"]
+        assert result == ["only", "1"]
         assert [] == :ets.lookup(ets, member_key)
         assert [] == :ets.lookup(ets, type_key)
       end
@@ -215,7 +215,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.SpopRemovesTypeMarkerFinalS
 
         result = apply_result_value(StateMachine.apply(%{index: 9}, {:zpop, key, 1, :min}, state))
 
-        assert ["cold", "2.0"] = result
+        assert ["cold", "2"] = result
         assert [] = :ets.lookup(ets, member_key)
         assert [] = :ets.lookup(ets, type_key)
       end

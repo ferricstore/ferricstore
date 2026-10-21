@@ -62,7 +62,10 @@ defmodule FerricstoreServer.Health.Dashboard.CircuitReviewTest do
   # ahead of the wall clock after it sees a later timestamp from a peer; a
   # dashboard change stamped with the wall clock was then refused as earlier.
   test "a dashboard close right after an open holds while the cluster clock runs ahead" do
-    Ferricstore.HLC.update({System.system_time(:millisecond) + 400, 0})
+    ahead_ms = System.system_time(:millisecond) + 400
+    Ferricstore.HLC.update({ahead_ms, 0})
+    # The clock never goes back: let the wall clock catch up for later tests.
+    on_exit(fn -> Process.sleep(max(ahead_ms - System.system_time(:millisecond), 0) + 10) end)
     scope = unique_scope()
     {:ok, circuit} = FerricStore.flow_circuit_open(scope)
 
@@ -127,7 +130,8 @@ defmodule FerricstoreServer.Health.Dashboard.CircuitReviewTest do
     scope = unique_scope()
     {:ok, circuit} = FerricStore.flow_circuit_open(scope)
     fingerprint = CircuitStore.review_fingerprint(circuit)
-    now = System.system_time(:millisecond)
+    # The store's clock, which stamped the open.
+    now = Ferricstore.CommandTime.now_ms()
 
     results =
       1..8

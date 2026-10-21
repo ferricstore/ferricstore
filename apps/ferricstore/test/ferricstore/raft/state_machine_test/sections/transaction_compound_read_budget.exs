@@ -566,7 +566,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.TransactionCompoundReadBudg
             &CompoundKey.zset_member/2,
             ["a", "b"],
             ["1", "2"],
-            ["1.0"]
+            ["1"]
           }
         ]
 

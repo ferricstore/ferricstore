@@ -39,7 +39,7 @@ defmodule Ferricstore.Commands.CompoundScanPageTest do
     assert ["~bWVtYmVyLWI", ["member-a", "member-b"]] =
              Set.handle("SSCAN", ["set", "0", "COUNT", "2"], store)
 
-    assert ["~bWVtYmVyLWI", ["member-a", "1.0", "member-b", "2.0"]] =
+    assert ["~bWVtYmVyLWI", ["member-a", "1", "member-b", "2"]] =
              SortedSet.handle("ZSCAN", ["zset", "0", "COUNT", "2"], store)
   end
 

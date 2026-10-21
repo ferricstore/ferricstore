@@ -600,15 +600,15 @@ defmodule Ferricstore.Commands.GenericTest.Sections.Type do
           assert nil == store.compound_get.("dst", CompoundKey.type_key("dst"))
         end
 
-        test "COPY source to itself without REPLACE returns 0" do
+        # As in Redis, with or without REPLACE.
+        test "COPY source to itself answers Redis's error" do
           store = MockStore.make(%{"k" => {"v", 0}})
-          assert 0 == Generic.handle("COPY", ["k", "k"], store)
-          assert "v" == store.get.("k")
-        end
 
-        test "COPY source to itself with REPLACE succeeds" do
-          store = MockStore.make(%{"k" => {"v", 0}})
-          assert 1 == Generic.handle("COPY", ["k", "k", "REPLACE"], store)
+          for args <- [["k", "k"], ["k", "k", "REPLACE"]] do
+            assert {:error, "ERR source and destination objects are the same"} ==
+                     Generic.handle("COPY", args, store)
+          end
+
           assert "v" == store.get.("k")
         end
 
@@ -772,7 +772,8 @@ defmodule Ferricstore.Commands.GenericTest.Sections.Type do
           expire_at_ms = System.os_time(:millisecond) + 60_000
           store = MockStore.make(%{"k" => {"v", expire_at_ms}})
           result = Generic.handle("EXPIRETIME", ["k"], store)
-          expected = div(expire_at_ms, 1_000)
+          # Rounded to the nearest second, as Redis does.
+          expected = div(expire_at_ms + 500, 1_000)
           assert result == expected
         end
 

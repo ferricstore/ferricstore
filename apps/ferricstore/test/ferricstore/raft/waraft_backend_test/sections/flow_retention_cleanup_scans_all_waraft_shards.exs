@@ -903,7 +903,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.FlowRetentionCleanupScansA
           assert nil == Ferricstore.Commands.SortedSet.handle("ZSCORE", [key, "a"], restarted_ctx)
           assert nil == Ferricstore.Commands.SortedSet.handle("ZSCORE", [key, "b"], restarted_ctx)
 
-          assert ["c", "3.0"] =
+          assert ["c", "3"] =
                    Ferricstore.Commands.SortedSet.handle(
                      "ZRANGE",
                      [key, "0", "-1", "WITHSCORES"],

@@ -28,10 +28,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AdvancedZsetRangePopMutati
                      ctx
                    )
 
-          assert ["a", "1.0"] =
+          assert ["a", "1"] =
                    Ferricstore.Commands.SortedSet.handle_ast({:zpopmin, key}, ctx)
 
-          assert ["d", "4.0"] =
+          assert ["d", "4"] =
                    Ferricstore.Commands.SortedSet.handle_ast({:zpopmax, key}, ctx)
 
           assert :ok = WARaftBackend.stop()
@@ -44,21 +44,21 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AdvancedZsetRangePopMutati
                      log_module: :ferricstore_waraft_spike_segment_log
                    )
 
-          assert ["b", "2.0", "c", "3.0"] =
+          assert ["b", "2", "c", "3"] =
                    Ferricstore.Commands.SortedSet.handle(
                      "ZRANGEBYSCORE",
                      [key, "2", "3", "WITHSCORES"],
                      restarted_ctx
                    )
 
-          assert ["c", "3.0", "b", "2.0"] =
+          assert ["c", "3", "b", "2"] =
                    Ferricstore.Commands.SortedSet.handle(
                      "ZREVRANGEBYSCORE",
                      [key, "3", "2", "WITHSCORES"],
                      restarted_ctx
                    )
 
-          assert ["2.0", nil] =
+          assert ["2", nil] =
                    Ferricstore.Commands.SortedSet.handle_ast(
                      {:zmscore, [key, "b", "missing"]},
                      restarted_ctx
@@ -72,9 +72,9 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AdvancedZsetRangePopMutati
 
           assert cursor in ["0", 0]
           assert "b" in scanned
-          assert "2.0" in scanned
+          assert "2" in scanned
           assert "c" in scanned
-          assert "3.0" in scanned
+          assert "3" in scanned
           refute "a" in scanned
           refute "d" in scanned
         after
