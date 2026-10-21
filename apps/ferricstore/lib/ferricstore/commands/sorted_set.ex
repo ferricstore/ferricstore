@@ -905,10 +905,13 @@ defmodule Ferricstore.Commands.SortedSet do
     end
   end
 
+  # As in Redis, a negative start before the first member clamps to it, while
+  # a negative stop before the first member leaves the range empty.
   defp normalize_rank_bounds(key, start, stop, store) when start < 0 or stop < 0 do
     case zcard_count(key, store) do
       len when is_integer(len) ->
-        {:ok, {Helpers.normalize_index(start, len), Helpers.normalize_index(stop, len)}}
+        stop_idx = if stop < 0, do: len + stop, else: stop
+        {:ok, {Helpers.normalize_index(start, len), stop_idx}}
 
       {:error, _reason} = error ->
         error

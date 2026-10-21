@@ -87,6 +87,14 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
                  run(ctx, "ZRANGE", [key, "+inf", "-inf", "BYSCORE", "REV", "LIMIT", "0", "2"])
       end
 
+      test "a negative stop before the first member is an empty range", %{ctx: ctx, key: key} do
+        assert [] == run(ctx, "ZRANGE", [key, "-5", "-4"])
+        assert [] == run(ctx, "ZREVRANGE", [key, "-5", "-4", "WITHSCORES"])
+        assert ["a"] == run(ctx, "ZRANGE", [key, "-5", "-3"])
+        assert 1 == run(ctx, "ZADD", [key <> ":one", "2.5", "b"])
+        assert [] == run(ctx, "ZREVRANGE", [key <> ":one", "-1", "-2", "WITHSCORES"])
+      end
+
       test "LIMIT needs BYSCORE", %{ctx: ctx, key: key} do
         assert {:error,
                 "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX"} ==

@@ -4,6 +4,9 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer an empty array for a ZRANGE or ZREVRANGE rank range whose negative
+  stop falls before the first member (`ZRANGE key -5 -4` on three members),
+  as Redis does; it answered the first member.
 - Check SMOVE's destination type whenever the source set exists: SMOVE of a
   member the source lacks answered 0 even when the destination held a
   string or hash, where Redis answers WRONGTYPE. A missing source still
