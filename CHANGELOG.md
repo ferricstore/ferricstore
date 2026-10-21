@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Native EXEC answered INCR, INCRBY, DECR and DECRBY inside MULTI with
+  `["ok", n]` instead of `n`; it now answers the integer, as Redis does.
 - RANDOMKEY with arguments (and other generic commands parsed with the wrong
   argument count) answered "ERR unsupported generic command AST"; they now
   answer Redis's "ERR wrong number of arguments for '<command>' command".

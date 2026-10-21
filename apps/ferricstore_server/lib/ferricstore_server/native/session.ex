@@ -903,6 +903,8 @@ defmodule FerricstoreServer.Native.Session do
   defp native_value({:push, value}), do: value
   defp native_value({:error, reason}), do: %{"error" => reason}
   defp native_value(:ok), do: "OK"
+  # Counter commands (INCR, INCRBY, DECR, DECRBY) return {:ok, integer}.
+  defp native_value({:ok, value}), do: native_value(value)
   defp native_value(value), do: value
 
   defp replica_compat_error(%PreparedCommand{} = prepared, state) do
