@@ -947,6 +947,8 @@ defmodule FerricstoreServer.Native.Commands do
 
           if match?({:ok, _response, _state}, result) do
             :ok = AuthRateLimiter.release_success(reservation)
+          else
+            :ok = AuthRateLimiter.release_failure(reservation)
           end
 
           result

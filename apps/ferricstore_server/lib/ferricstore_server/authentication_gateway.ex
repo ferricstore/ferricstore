@@ -74,6 +74,7 @@ defmodule FerricstoreServer.AuthenticationGateway do
           authenticated
 
         {:error, _reason} = error ->
+          :ok = AuthRateLimiter.release_failure(reservation)
           audit(:auth_failure, username, peer, false)
           error
       end

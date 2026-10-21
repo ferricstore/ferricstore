@@ -1101,6 +1101,37 @@ defmodule FerricstoreServer.Native.CommandsTest do
     end
   end
 
+  test "a native connection pool authenticating at once is not rate limited" do
+    previous_max_attempts = Application.get_env(:ferricstore, :auth_rate_limit_max_attempts)
+    username = "native_auth_pool_user"
+
+    Application.put_env(:ferricstore, :auth_rate_limit_max_attempts, 2)
+    :ok = AuthRateLimiter.reset()
+    assert :ok = Acl.set_user(username, ["on", ">secret", "~*", "+@all"])
+
+    on_exit(fn ->
+      Acl.del_user(username)
+      restore_env(:auth_rate_limit_max_attempts, previous_max_attempts)
+      AuthRateLimiter.reset()
+    end)
+
+    results =
+      1..8
+      |> Enum.map(fn port ->
+        Task.async(fn ->
+          Commands.execute(
+            @op_auth,
+            %{"username" => username, "password" => "secret"},
+            state(%{peer: {{10, 20, 32, 40}, 40_000 + port}})
+          )
+        end)
+      end)
+      |> Task.await_many(15_000)
+
+    assert Enum.all?(results, &match?({:ok, "OK", _state}, &1)),
+           inspect(Enum.map(results, &Tuple.delete_at(&1, 2)))
+  end
+
   test "native AUTH rejects oversized credentials before authentication" do
     assert {:auth, username_error, _state} =
              Commands.execute(

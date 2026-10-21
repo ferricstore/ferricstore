@@ -4,6 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Stop refusing logins that arrive together. The authentication limiter
+  counted a login still checking its password as a failed attempt, so a
+  connection pool opening more than 10 connections at once from one address
+  (or for one user from anywhere) had the extra logins refused for a minute:
+  native AUTH answered "too many authentication attempts; retry after 60000
+  ms" and HTTP answered 429 with `Retry-After: 60`. Such a login now waits
+  (up to 5 seconds) for the checks ahead of it and is refused only if they
+  fail and use up the budget. Ten failed attempts a minute per address and
+  per user are still the limit, and an attempt waiting its turn never checks
+  a password early.
 - Refuse keys over the 65,535-byte key size limit for hash, set, sorted set,
   list and stream writes through the TCP and HTTP gateways, as SET already
   did ("ERR key too large"); HSET, SADD, ZADD, RPUSH and XADD accepted them.
