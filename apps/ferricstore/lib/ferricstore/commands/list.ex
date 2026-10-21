@@ -451,13 +451,13 @@ defmodule Ferricstore.Commands.List do
          do: key |> do_pop(store, direction, count) |> counted_pop_reply()
   end
 
+  defp pop_parsed(_key, _store, _direction, _count),
+    do: {:error, "ERR value is not an integer or out of range"}
+
   # With a count, LPOP and RPOP answer an array even for one element; the
   # list operation answers one popped element by itself.
   defp counted_pop_reply(element) when is_binary(element), do: [element]
   defp counted_pop_reply(reply), do: reply
-
-  defp pop_parsed(_key, _store, _direction, _count),
-    do: {:error, "ERR value is not an integer or out of range"}
 
   # With COUNT, LPOS answers an array, empty when the key does not exist.
   defp lpos_reply(nil, count) when is_integer(count), do: []
