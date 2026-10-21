@@ -165,9 +165,9 @@ defmodule Ferricstore.Commands.Bitmap do
           error
 
         :unknown ->
-          with {:ok, current} <- read_string_or_empty(store, key) do
+          bitpos_read(store, key, bit_val, fn current ->
             Bits.bitpos_byte_range(current, bit_val, 0, byte_size(current) - 1, false)
-          end
+          end)
       end
     end
   end
@@ -192,11 +192,11 @@ defmodule Ferricstore.Commands.Bitmap do
               error
 
             :unknown ->
-              with {:ok, current} <- read_string_or_empty(store, key) do
+              bitpos_read(store, key, bit_val, fn current ->
                 len = byte_size(current)
                 start_resolved = Bits.resolve_index(start_idx, len)
                 Bits.bitpos_byte_range(current, bit_val, start_resolved, len - 1, false)
-              end
+              end)
           end
       end
     end
@@ -228,12 +228,12 @@ defmodule Ferricstore.Commands.Bitmap do
                   error
 
                 :unknown ->
-                  with {:ok, current} <- read_string_or_empty(store, key) do
+                  bitpos_read(store, key, bit_val, fn current ->
                     len = byte_size(current)
                     s = Bits.resolve_index(start_idx, len)
                     e = Bits.resolve_index(end_idx, len)
                     Bits.bitpos_byte_range(current, bit_val, s, e, true)
-                  end
+                  end)
               end
           end
 
@@ -377,9 +377,9 @@ defmodule Ferricstore.Commands.Bitmap do
           error
 
         :unknown ->
-          with {:ok, current} <- read_string_or_empty(store, key) do
+          bitpos_read(store, key, bit_val, fn current ->
             Bits.bitpos_byte_range(current, bit_val, 0, byte_size(current) - 1, false)
-          end
+          end)
       end
     end
   end
@@ -403,11 +403,11 @@ defmodule Ferricstore.Commands.Bitmap do
               error
 
             :unknown ->
-              with {:ok, current} <- read_string_or_empty(store, key) do
+              bitpos_read(store, key, bit_val, fn current ->
                 len = byte_size(current)
                 start_resolved = Bits.resolve_index(start_idx, len)
                 Bits.bitpos_byte_range(current, bit_val, start_resolved, len - 1, false)
-              end
+              end)
           end
       end
     end
@@ -435,12 +435,12 @@ defmodule Ferricstore.Commands.Bitmap do
                   error
 
                 :unknown ->
-                  with {:ok, current} <- read_string_or_empty(store, key) do
+                  bitpos_read(store, key, bit_val, fn current ->
                     len = byte_size(current)
                     s = Bits.resolve_index(start_idx, len)
                     e = Bits.resolve_index(end_idx, len)
                     Bits.bitpos_byte_range(current, bit_val, s, e, true)
-                  end
+                  end)
               end
           end
 
@@ -733,9 +733,8 @@ defmodule Ferricstore.Commands.Bitmap do
       {:error, {:storage_read_failed, _reason}} = failure ->
         ReadResult.command_error(failure)
 
-      0 when bit_val == 0 ->
-        {:ok, 0}
-
+      # An existing empty string has no bit; a missing key (nil) reads as
+      # clear bits below.
       0 ->
         {:ok, -1}
 
@@ -1200,21 +1199,23 @@ defmodule Ferricstore.Commands.Bitmap do
     end
   end
 
-  # Redis reads a missing key as endless clear bits: the first 0 is at 0 and
-  # there is no 1.
   defp bitpos_bit_range_value(store, key, bit_val, start_idx, end_idx) do
+    bitpos_read(store, key, bit_val, fn current ->
+      total_bits = byte_size(current) * 8
+      s = Bits.resolve_index(start_idx, total_bits)
+      e = Bits.resolve_index(end_idx, total_bits)
+      Bits.bitpos_bit_range(current, bit_val, s, e)
+    end)
+  end
+
+  # Redis reads a missing key as endless clear bits (the first 0 is at 0, and
+  # there is no 1) and finds no bit in an empty string.
+  defp bitpos_read(store, key, bit_val, search) do
     case Ops.get(store, key) do
-      {:error, {:storage_read_failed, _reason}} = failure ->
-        ReadResult.command_error(failure)
-
-      nil ->
-        if bit_val == 0, do: 0, else: -1
-
-      current ->
-        total_bits = byte_size(current) * 8
-        s = Bits.resolve_index(start_idx, total_bits)
-        e = Bits.resolve_index(end_idx, total_bits)
-        Bits.bitpos_bit_range(current, bit_val, s, e)
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      nil -> if bit_val == 0, do: 0, else: -1
+      "" -> -1
+      current -> search.(current)
     end
   end
 

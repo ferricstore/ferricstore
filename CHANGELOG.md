@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer -1 from BITPOS on an existing empty string in every form, as Redis
+  does; `BITPOS key 0` answered 0, as for a missing key.
 - Look GETEX's key up before checking its expiry value, as Redis does: a
   missing key answers nil and another type WRONGTYPE (`GETEX missing EX 0`
   answered "invalid expire time"), and an expiry out of range answers "ERR

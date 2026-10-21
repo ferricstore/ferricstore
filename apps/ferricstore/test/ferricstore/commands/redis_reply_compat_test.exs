@@ -209,6 +209,14 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
         assert -1 == run(ctx, "BITPOS", [key, "0", "8", "100", "BIT"])
       end
 
+      test "BITPOS finds no bit in an empty string", %{ctx: ctx, key: key} do
+        :ok = run(ctx, "SET", [key, ""])
+
+        for range <- [[], ["0"], ["0", "-1"], ["0", "5", "BIT"]], bit <- ["0", "1"] do
+          assert -1 == run(ctx, "BITPOS", [key, bit | range]), inspect([bit | range])
+        end
+      end
+
       test "BITPOS reads a missing key as clear bits in every form", %{ctx: ctx, key: key} do
         missing = key <> ":missing"
 
