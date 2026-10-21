@@ -887,11 +887,10 @@ defmodule Ferricstore.Commands.GenericTest.Sections.Type do
           assert "raw" == Generic.handle("OBJECT", ["ENCODING", "cold_large"], store)
         end
 
-        test "OBJECT ENCODING returns error for missing key" do
+        test "OBJECT ENCODING answers nil for a missing key, as in Redis" do
           store = MockStore.make()
 
-          assert {:error, "ERR no such key"} =
-                   Generic.handle("OBJECT", ["ENCODING", "missing"], store)
+          assert nil == Generic.handle("OBJECT", ["ENCODING", "missing"], store)
         end
 
         test "OBJECT encoding is case-insensitive" do
@@ -955,11 +954,10 @@ defmodule Ferricstore.Commands.GenericTest.Sections.Type do
           assert 37 == Generic.handle("OBJECT", ["FREQ", "custom_cold"], store)
         end
 
-        test "OBJECT FREQ returns error for missing key" do
+        test "OBJECT FREQ answers nil for a missing key, as in Redis" do
           store = MockStore.make()
 
-          assert {:error, "ERR no such key"} =
-                   Generic.handle("OBJECT", ["FREQ", "missing"], store)
+          assert nil == Generic.handle("OBJECT", ["FREQ", "missing"], store)
         end
       end
     end
