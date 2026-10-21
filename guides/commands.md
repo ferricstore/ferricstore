@@ -1073,9 +1073,9 @@ Cursor-based key iteration with optional MATCH pattern, COUNT hint, and TYPE fil
 | `PEXPIRETIME` | `PEXPIRETIME key` | Absolute Unix timestamp (ms), `-1`, `-2` |
 
 All native TCP mode. Expiry uses HLC timestamps internally. TTL and
-EXPIRETIME round to the nearest second, as Redis does. EXPIRE and its
-variants answer an error on a Bloom, Cuckoo, Count-Min or Top-K key (their
-expiry cannot change in place yet).
+EXPIRETIME round to the nearest second, as Redis does. On the durable Raft
+path, EXPIRE and its variants answer an error on a Bloom, Cuckoo,
+Count-Min or Top-K key (their expiry cannot change in place there yet).
 
 ### OBJECT
 
