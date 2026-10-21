@@ -110,7 +110,7 @@ defmodule Ferricstore.Cluster.FeatureLevelMemberTypesTest do
 
     assert 1 == Dispatcher.dispatch("ZADD", [key <> ":z", "NX", "1", "a"], ctx)
     assert 1 == Dispatcher.dispatch("ZADD", [key <> ":z", "XX", "CH", "2", "a"], ctx)
-    assert "2.0" == Dispatcher.dispatch("ZSCORE", [key <> ":z", "a"], ctx)
+    assert "2" == Dispatcher.dispatch("ZSCORE", [key <> ":z", "a"], ctx)
 
     assert 1 == Dispatcher.dispatch("SADD", [key <> ":s", "m"], ctx)
     assert 1 == Dispatcher.dispatch("SMOVE", [key <> ":s", key <> ":t", "m"], ctx)
@@ -189,7 +189,7 @@ defmodule Ferricstore.Cluster.FeatureLevelMemberTypesTest do
     assert 1 == winners(fn -> d.("ZADD", [key <> ":z", "NX", "1", "m"]) end, &(&1 == 1))
     assert 1 == winners(fn -> d.("ZADD", [key <> ":z", "CH", "2", "m"]) end, &(&1 == 1))
     assert 1 == winners(fn -> d.("ZADD", [key <> ":z", "GT", "CH", "3", "m"]) end, &(&1 == 1))
-    assert "3.0" == d.("ZSCORE", [key <> ":z", "m"])
+    assert "3" == d.("ZSCORE", [key <> ":z", "m"])
 
     assert 1 ==
              winners(

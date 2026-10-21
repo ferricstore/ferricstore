@@ -17,6 +17,6 @@ defmodule Ferricstore.Commands.ZsetCleanupFailureTest do
     assert {:error, "ERR storage read failed"} =
              SortedSet.handle("ZREM", ["zset", "member"], store)
 
-    assert "1.0" == SortedSet.handle("ZSCORE", ["zset", "member"], base)
+    assert "1" == SortedSet.handle("ZSCORE", ["zset", "member"], base)
   end
 end

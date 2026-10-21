@@ -31,10 +31,10 @@ defmodule Ferricstore.Commands.SortedSetPreparedValidationTest do
 
     assert 1 == parse_and_dispatch("ZADD", ["zset", "nx", "1", "member"], store)
 
-    assert ["member", "1.0"] ==
+    assert ["member", "1"] ==
              parse_and_dispatch("ZRANGE", ["zset", "0", "-1", "withscores"], store)
 
-    assert ["member", "1.0"] ==
+    assert ["member", "1"] ==
              parse_and_dispatch("ZRANDMEMBER", ["zset", "1", "withscores"], store)
   end
 

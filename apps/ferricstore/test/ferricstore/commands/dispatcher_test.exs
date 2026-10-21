@@ -241,7 +241,7 @@ defmodule Ferricstore.Commands.DispatcherTest do
 
     assert 2 == Dispatcher.dispatch_ast({:zadd, "z", [:nx], [{1.0, "a"}, {2.0, "b"}]}, store)
     assert "3.5" == Dispatcher.dispatch_ast({:zincrby, "z", 2.5, "a"}, store)
-    assert ["b", "2.0", "a", "3.5"] == Dispatcher.dispatch_ast({:zrange, "z", 0, -1, true}, store)
+    assert ["b", "2", "a", "3.5"] == Dispatcher.dispatch_ast({:zrange, "z", 0, -1, true}, store)
     assert 2 == Dispatcher.dispatch_ast({:zcount, "z", {:inclusive, 1.0}, :inf}, store)
 
     assert ["a"] ==

@@ -2,6 +2,7 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
   @moduledoc false
 
   alias Ferricstore.Commands.CollectionScan
+  alias Ferricstore.Store.ValueCodec
 
   @max_random_replacement_count 10_000
 
@@ -22,9 +23,8 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
   def normalize_index(index, len) when index < 0, do: max(0, len + index)
   def normalize_index(index, _len), do: index
 
-  def format_score(score) when is_float(score) do
-    :erlang.float_to_binary(score, [:compact, decimals: 17])
-  end
+  # Replies only; stored scores keep Float.to_string's form.
+  def format_score(score) when is_float(score), do: ValueCodec.format_double(score)
 
   def format_score_str(score_str) do
     case Float.parse(score_str) do

@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer sorted set scores as Redis does: "1" instead of "1.0", "3.14"
+  instead of "3.14000000000000012", "1e+20" and "1.5e-7" for very large and
+  small ones. ZSCORE, ZMSCORE, ZINCRBY, ZPOPMIN, ZPOPMAX, ZSCAN and
+  WITHSCORES replies (also over the native protocol) disagreed with each
+  other and with Redis. Stored scores are unchanged.
 - Stop syncing a large collection's file on every write. A hash, set or
   sorted set over 100 members lives in its own file, and WARaft fsynced that
   file once per write, so writes to it ran at a fraction of the speed of small

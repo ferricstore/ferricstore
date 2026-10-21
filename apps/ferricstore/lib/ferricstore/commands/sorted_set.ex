@@ -983,7 +983,7 @@ defmodule Ferricstore.Commands.SortedSet do
       removed_entries =
         Enum.zip(compound_keys, to_pop)
         |> Enum.map(fn {compound_key, {_member, score}} ->
-          {compound_key, Helpers.format_score(score), 0}
+          {compound_key, Float.to_string(score), 0}
         end)
 
       with :ok <- delete_zset_members_and_cleanup(key, removed_entries, length(to_pop), store) do

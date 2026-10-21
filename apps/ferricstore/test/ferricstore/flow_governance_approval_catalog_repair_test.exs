@@ -51,8 +51,8 @@ defmodule Ferricstore.FlowGovernanceApprovalCatalogRepairTest do
                source_targets
              )
 
-    assert {:ok, "0.0"} = Impl.zscore(ctx, source_catalog, record_key)
-    assert {:ok, "0.0"} = Impl.zscore(ctx, target_catalog, record_key)
+    assert {:ok, "0"} = Impl.zscore(ctx, source_catalog, record_key)
+    assert {:ok, "0"} = Impl.zscore(ctx, target_catalog, record_key)
     assert :atomics.get(calls, 1) == 2
   end
 
@@ -74,7 +74,7 @@ defmodule Ferricstore.FlowGovernanceApprovalCatalogRepairTest do
                fn _key -> :skip end
              )
 
-    assert {:ok, "0.0"} = Impl.zscore(ctx, target_catalog, record_key)
+    assert {:ok, "0"} = Impl.zscore(ctx, target_catalog, record_key)
     assert :atomics.get(calls, 1) == 2
   end
 
@@ -103,7 +103,7 @@ defmodule Ferricstore.FlowGovernanceApprovalCatalogRepairTest do
                source_targets
              )
 
-    assert {:ok, "0.0"} = Impl.zscore(ctx, source_catalog, record_key)
+    assert {:ok, "0"} = Impl.zscore(ctx, source_catalog, record_key)
   end
 
   test "target repair restores uncertain membership when post-delete validation fails" do
@@ -130,7 +130,7 @@ defmodule Ferricstore.FlowGovernanceApprovalCatalogRepairTest do
                fn _key -> :skip end
              )
 
-    assert {:ok, "0.0"} = Impl.zscore(ctx, target_catalog, record_key)
+    assert {:ok, "0"} = Impl.zscore(ctx, target_catalog, record_key)
   end
 
   defp assert_single_zrem(ctx, catalog_key, members) do

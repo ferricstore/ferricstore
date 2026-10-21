@@ -501,9 +501,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         {:error, {:state_read_failed, reason}}
       end
 
-      defp format_zset_score(score) when is_float(score) do
-        :erlang.float_to_binary(score, [:compact, decimals: 17])
-      end
+      # The reply only: popped members leave nothing stored.
+      defp format_zset_score(score) when is_float(score),
+        do: Ferricstore.Store.ValueCodec.format_double(score)
 
       defp sm_store_compound_get_meta(state, redis_key, compound_key) do
         result =

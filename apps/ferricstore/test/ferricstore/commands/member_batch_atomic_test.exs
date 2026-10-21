@@ -101,7 +101,7 @@ defmodule Ferricstore.Commands.MemberBatchAtomicTest do
     assert ["b"] == Dispatcher.dispatch("SMEMBERS", [key <> ":s"], ctx)
 
     assert 1 == Dispatcher.dispatch("ZADD", [key <> ":z", "1", "a", "2", "a"], ctx)
-    assert "2.0" == Dispatcher.dispatch("ZSCORE", [key <> ":z", "a"], ctx)
+    assert "2" == Dispatcher.dispatch("ZSCORE", [key <> ":z", "a"], ctx)
     assert 1 == Dispatcher.dispatch("ZADD", [key <> ":z", "5", "a", "1", "b"], ctx)
     assert ["b", "a"] == Dispatcher.dispatch("ZRANGE", [key <> ":z", "0", "-1"], ctx)
     assert 1 == Dispatcher.dispatch("ZREM", [key <> ":z", "a", "x"], ctx)
@@ -227,7 +227,10 @@ defmodule Ferricstore.Commands.MemberBatchAtomicTest do
 
   defp zrange(ctx, key), do: Dispatcher.dispatch("ZRANGE", [key, "0", "-1", "WITHSCORES"], ctx)
 
-  defp canonical(score), do: score |> String.to_float() |> Float.to_string()
+  defp canonical(score) do
+    {value, ""} = Float.parse(score)
+    Float.to_string(value)
+  end
 
   defp wait_promoted(ctx, key) do
     ShardHelpers.eventually(

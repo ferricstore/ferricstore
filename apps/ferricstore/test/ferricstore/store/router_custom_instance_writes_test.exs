@@ -41,8 +41,8 @@ defmodule Ferricstore.Store.RouterCustomInstanceWritesTest do
     assert 0 == Dispatcher.dispatch("SCARD", [key <> ":set"], ctx)
 
     assert 2 == Dispatcher.dispatch("ZADD", [key <> ":zset", "1", "a", "2", "b"], ctx)
-    assert ["a", "1.0"] == Router.zpopmin(ctx, key <> ":zset", 1)
-    assert ["b", "2.0"] == Router.zpopmax(ctx, key <> ":zset", 1)
+    assert ["a", "1"] == Router.zpopmin(ctx, key <> ":zset", 1)
+    assert ["b", "2"] == Router.zpopmax(ctx, key <> ":zset", 1)
     assert 0 == Dispatcher.dispatch("ZCARD", [key <> ":zset"], ctx)
   end
 end

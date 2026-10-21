@@ -114,7 +114,7 @@ defmodule Ferricstore.Commands.RedisCompatHashTest do
       assert result == 0
 
       # Score should still be 1.0
-      assert "1.0" = SortedSet.handle("ZSCORE", ["z", "a"], store)
+      assert "1" = SortedSet.handle("ZSCORE", ["z", "a"], store)
     end
 
     test "ZADD XX does not add new members" do
@@ -134,11 +134,11 @@ defmodule Ferricstore.Commands.RedisCompatHashTest do
 
       # Try to set lower score with GT
       SortedSet.handle("ZADD", ["z", "GT", "3.0", "a"], store)
-      assert "5.0" = SortedSet.handle("ZSCORE", ["z", "a"], store)
+      assert "5" = SortedSet.handle("ZSCORE", ["z", "a"], store)
 
       # Try to set higher score with GT
       SortedSet.handle("ZADD", ["z", "GT", "10.0", "a"], store)
-      assert "10.0" = SortedSet.handle("ZSCORE", ["z", "a"], store)
+      assert "10" = SortedSet.handle("ZSCORE", ["z", "a"], store)
     end
 
     test "ZADD LT only updates if new score is lower" do
@@ -148,11 +148,11 @@ defmodule Ferricstore.Commands.RedisCompatHashTest do
 
       # Try to set higher score with LT
       SortedSet.handle("ZADD", ["z", "LT", "10.0", "a"], store)
-      assert "5.0" = SortedSet.handle("ZSCORE", ["z", "a"], store)
+      assert "5" = SortedSet.handle("ZSCORE", ["z", "a"], store)
 
       # Try to set lower score with LT
       SortedSet.handle("ZADD", ["z", "LT", "1.0", "a"], store)
-      assert "1.0" = SortedSet.handle("ZSCORE", ["z", "a"], store)
+      assert "1" = SortedSet.handle("ZSCORE", ["z", "a"], store)
     end
 
     test "ZADD CH flag changes return value to count of changed elements" do
