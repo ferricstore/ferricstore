@@ -261,6 +261,22 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
       end
     end
 
+    describe "#{@path}: hyperloglog" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      test "PFMERGE takes a destination without sources", %{ctx: ctx, key: key} do
+        assert :ok == run(ctx, "PFMERGE", [key])
+        assert 0 == run(ctx, "PFCOUNT", [key])
+        assert 1 == run(ctx, "PFADD", [key, "a"])
+        assert :ok == run(ctx, "PFMERGE", [key])
+        assert 1 == run(ctx, "PFCOUNT", [key])
+        :ok = run(ctx, "SET", [key <> ":s", "not a sketch"])
+
+        assert {:error, "WRONGTYPE Key is not a valid HyperLogLog string value."} ==
+                 run(ctx, "PFMERGE", [key <> ":s"])
+      end
+    end
+
     describe "#{@path}: key moves" do
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 

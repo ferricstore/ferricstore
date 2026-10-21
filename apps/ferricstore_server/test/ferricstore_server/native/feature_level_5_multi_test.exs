@@ -50,6 +50,12 @@ defmodule FerricstoreServer.Native.FeatureLevel5MultiTest do
     assert 0 == Dispatcher.dispatch("DEL", [destination], ctx)
   end
 
+  test "MULTI queues PFMERGE with only a destination", %{ctx: ctx, key: key} do
+    state = queue(multi(), "PFMERGE", [key])
+    assert {:ok, ["OK"], _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
+    assert 0 == Dispatcher.dispatch("PFCOUNT", [key], ctx)
+  end
+
   defp multi do
     {:ok, "OK", state} = Session.execute(%{"command" => "MULTI", "args" => []}, session_state())
     state

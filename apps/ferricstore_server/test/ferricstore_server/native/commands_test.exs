@@ -5179,7 +5179,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert "" == Router.get(ctx, key)
   end
 
-  test "native MULTI refuses ZRANK WITHSCORE below feature level 5" do
+  test "native MULTI refuses ZRANK WITHSCORE and a sourceless PFMERGE below feature level 5" do
     key = "{multi-zrank:#{System.unique_integer([:positive])}}"
 
     assert {:ok, "OK", state} =
@@ -5189,6 +5189,11 @@ defmodule FerricstoreServer.Native.CommandsTest do
              Session.execute(%{"command" => "ZRANK", "args" => [key, "m", "WITHSCORE"]}, state)
 
     assert message =~ "needs cluster feature level 5"
+
+    assert {:error, pfmerge_message, _state} =
+             Session.execute(%{"command" => "PFMERGE", "args" => [key <> ":hll"]}, state)
+
+    assert pfmerge_message =~ "needs cluster feature level 5"
 
     assert {:ok, "QUEUED", _state} =
              Session.execute(%{"command" => "ZRANK", "args" => [key, "m"]}, state)

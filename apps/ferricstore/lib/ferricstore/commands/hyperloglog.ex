@@ -31,7 +31,8 @@ defmodule Ferricstore.Commands.HyperLogLog do
 
   alias Ferricstore.HyperLogLog, as: HLL
 
-  @wrongtype_error {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+  # A string that is not a sketch; other types answer the usual WRONGTYPE.
+  @wrongtype_error {:error, "WRONGTYPE Key is not a valid HyperLogLog string value."}
   @sketch_size HLL.num_registers()
 
   @doc """
@@ -182,7 +183,9 @@ defmodule Ferricstore.Commands.HyperLogLog do
     {:error, "ERR wrong number of arguments for 'pfcount' command"}
   end
 
-  defp pfmerge_args([destkey | source_keys], store) when source_keys != [] do
+  # As in Redis, PFMERGE dest alone merges nothing into dest, creating an
+  # empty sketch when it is missing.
+  defp pfmerge_args([destkey | source_keys], store) when is_binary(destkey) do
     case read_sketches([destkey | source_keys], store) do
       {:ok, sketches} ->
         merged = Enum.reduce(sketches, &HLL.merge/2)

@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Accept `PFMERGE dest` with no source, as Redis does (it creates an empty
+  sketch when dest is missing); it answered an arity error. Inside MULTI it
+  is queued only at cluster feature level 5. A string that is not a sketch
+  now answers Redis's "WRONGTYPE Key is not a valid HyperLogLog string
+  value." from PFADD, PFCOUNT and PFMERGE.
 - Delete BITOP's destination when the result is empty (every source missing
   or empty), as Redis does; it stored an empty string, so `GET` answered ""
   and `DEL` 1. Inside MULTI this applies at cluster feature level 5.
