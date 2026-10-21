@@ -30,6 +30,25 @@ defmodule Ferricstore.Cluster.FeatureLevelMemberTypesTest do
     }
   end
 
+  for {name, emptying} <- [
+        {"HDEL", [["HDEL", "f"]]},
+        {"HDEL of several fields", [["HSET", "g", "2"], ["HDEL", "f", "g", "missing"]]},
+        {"HGETDEL", [["HGETDEL", "FIELDS", "1", "f"]]}
+      ] do
+    @emptying emptying
+
+    test "a hash emptied by #{name} leaves no type behind", %{ctx: ctx, key: key} do
+      assert 1 == Dispatcher.dispatch("HSET", [key, "f", "1"], ctx)
+
+      for [command | args] <- @emptying, do: Dispatcher.dispatch(command, [key | args], ctx)
+
+      # Nothing that reads the key's type runs first: TYPE and EXISTS drop a
+      # marker whose collection is empty, and would hide one left behind.
+      assert 1 == Dispatcher.dispatch("RPUSH", [key, "x"], ctx)
+      assert ["x"] == Dispatcher.dispatch("LRANGE", [key, "0", "-1"], ctx)
+    end
+  end
+
   for {name, setup, write, recreate, check} <- [
         {"HINCRBY", nil, ["HINCRBY", "m", "1"], ["HSET", "o", "1"], ["HEXISTS", "m"]},
         {"HINCRBYFLOAT", nil, ["HINCRBYFLOAT", "m", "1.5"], ["HSET", "o", "1"], ["HEXISTS", "m"]},
