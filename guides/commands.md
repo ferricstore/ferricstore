@@ -1072,7 +1072,10 @@ Cursor-based key iteration with optional MATCH pattern, COUNT hint, and TYPE fil
 | `EXPIRETIME` | `EXPIRETIME key` | Absolute Unix timestamp (seconds), `-1`, `-2` |
 | `PEXPIRETIME` | `PEXPIRETIME key` | Absolute Unix timestamp (ms), `-1`, `-2` |
 
-All native TCP mode. Expiry uses HLC timestamps internally.
+All native TCP mode. Expiry uses HLC timestamps internally. TTL and
+EXPIRETIME round to the nearest second, as Redis does. EXPIRE and its
+variants answer an error on a Bloom, Cuckoo, Count-Min or Top-K key (their
+expiry cannot change in place yet).
 
 ### OBJECT
 
@@ -1083,6 +1086,8 @@ All native TCP mode. Expiry uses HLC timestamps internally.
 | `OBJECT FREQ key` | Integer (LFU counter) | Uses keydir LFU, not FerricStore logarithmic frequency |
 | `OBJECT IDLETIME key` | Integer (idle seconds) | Derived from LFU last-decrement-time. Returns elapsed seconds since last access. |
 | `OBJECT REFCOUNT key` | `1` | Always 1 |
+
+On a missing key, every subcommand answers null, as Redis does.
 
 ### WAIT
 
