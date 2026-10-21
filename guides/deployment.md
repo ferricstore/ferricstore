@@ -576,10 +576,11 @@ shard_0: 2
     across the whole cluster. Inside MULTI, EXPIRE with several flags
     (`EXPIRE key 100 XX GT`), BITCOUNT ranges and BITPOS are queued only at
     level 4: older releases abort or answer such a transaction differently.
-  - 5: MULTI queues the command forms releases before it do not parse:
-    `ZRANK`/`ZREVRANK ... WITHSCORE` and `PFMERGE` with no source. BITOP
-    inside MULTI deletes its
-    destination for an empty result, as it does outside MULTI.
+  - 5: MULTI queues the command forms releases before it do not parse or
+    refuse: `ZRANK`/`ZREVRANK ... WITHSCORE` and `PFMERGE` with no source.
+    Inside MULTI, BITOP deletes its destination for an empty result and
+    GEOSEARCHSTORE empties its destination for a missing source, as both do
+    outside MULTI.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.

@@ -162,6 +162,19 @@ defmodule Ferricstore.Store.Ops do
   end
 
   @spec value_size(store(), binary()) :: non_neg_integer() | nil | ReadResult.failure()
+  @doc """
+  Whether a command may write as feature level 5 does where older releases
+  write differently (BITOP's empty result, GEOSEARCHSTORE of a missing
+  source). The instance and the embedded API write through the cluster as
+  plain puts and deletes, which every replica applies alike; a MULTI
+  transaction runs on every replica, so its store allows it only once level
+  5 is active.
+  """
+  @spec level_5_writes?(term()) :: boolean()
+  def level_5_writes?(%FerricStore.Instance{}), do: true
+  def level_5_writes?(store) when is_map(store), do: Map.get(store, :level_5_writes?) == true
+  def level_5_writes?(_store), do: false
+
   def value_size(%FerricStore.Instance{} = ctx, key), do: Router.value_size(ctx, key)
 
   def value_size(%LocalTxStore{} = tx, key) do

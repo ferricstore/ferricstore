@@ -36,7 +36,9 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   # 5: MULTI queues the command forms older releases do not parse
   #    (`Ferricstore.Transaction.ReplicaCompat`): ZRANK/ZREVRANK WITHSCORE,
   #    PFMERGE with no source.
-  #    BITOP inside MULTI deletes its destination for an empty result.
+  #    Inside MULTI, BITOP deletes its destination for an empty result and
+  #    GEOSEARCHSTORE of a missing source empties its destination
+  #    (`Ferricstore.Store.Ops.level_5_writes?/1`).
   @supported 5
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

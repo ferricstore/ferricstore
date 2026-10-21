@@ -2337,7 +2337,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           get: local_get,
           cache_scope: cache_scope,
           float_format: if(feature_level_4?(anchor_state), do: :plain, else: :legacy),
-          bitop_empty_deletes?: feature_level_5?(anchor_state),
+          level_5_writes?: feature_level_5?(anchor_state),
           stream_index_dirty?: &pending_stream_index_dirty?/1,
           stream_current_ids: fn redis_key ->
             ctx = ctx_for_key.(redis_key)

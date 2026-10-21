@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer `[]` from GEOSEARCH FROMMEMBER on a missing key, and empty
+  GEOSEARCHSTORE's destination (answering 0) for a missing source, as Redis
+  does; both answered "could not decode requested zset member". Inside MULTI
+  the GEOSEARCHSTORE change applies at cluster feature level 5.
 - Accept `PFMERGE dest` with no source, as Redis does (it creates an empty
   sketch when dest is missing); it answered an arity error. Inside MULTI it
   is queued only at cluster feature level 5. A string that is not a sketch

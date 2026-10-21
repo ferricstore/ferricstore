@@ -277,6 +277,41 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
       end
     end
 
+    describe "#{@path}: geo searches" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      test "a missing key answers [] and empties GEOSEARCHSTORE's destination", %{
+        ctx: ctx,
+        key: key
+      } do
+        missing = key <> ":missing"
+        destination = key <> ":dst"
+
+        assert [] ==
+                 run(ctx, "GEOSEARCH", [missing, "FROMMEMBER", "m", "BYRADIUS", "10", "km"])
+
+        assert 1 == run(ctx, "GEOADD", [destination, "13.36", "38.11", "palermo"])
+
+        assert 0 ==
+                 run(ctx, "GEOSEARCHSTORE", [
+                   destination,
+                   missing,
+                   "FROMMEMBER",
+                   "m",
+                   "BYRADIUS",
+                   "10",
+                   "km"
+                 ])
+
+        assert 0 == run(ctx, "EXISTS", [destination])
+
+        assert 1 == run(ctx, "GEOADD", [key, "13.36", "38.11", "palermo"])
+
+        assert {:error, "ERR could not decode requested zset member"} ==
+                 run(ctx, "GEOSEARCH", [key, "FROMMEMBER", "nope", "BYRADIUS", "10", "km"])
+      end
+    end
+
     describe "#{@path}: key moves" do
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 

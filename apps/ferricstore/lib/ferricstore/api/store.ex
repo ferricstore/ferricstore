@@ -75,8 +75,8 @@ defmodule FerricStore.API.Store do
 
     %{
       instance_ctx: ctx,
-      # Its writes go to the cluster as plain puts and deletes.
-      bitop_empty_deletes?: true,
+      # Its writes reach the cluster as plain puts and deletes.
+      level_5_writes?: true,
       get: fn k -> Router.get(ctx, k) end,
       get_meta: fn k -> Router.get_meta(ctx, k) end,
       batch_get: fn keys -> Router.batch_get(ctx, keys) end,

@@ -98,10 +98,7 @@ defmodule Ferricstore.Commands.Geo do
 
   def handle_ast({:geosearch, key, opts}, store) do
     with {:ok, opts} <- Parsing.validate_geosearch_ast_opts(opts),
-         {:ok, center_lng, center_lat} <- resolve_center(opts, store, key),
-         {:ok, zset} <- read_zset(store, key) do
-      do_geosearch(zset, center_lng, center_lat, opts)
-    end
+         do: geosearch(store, key, opts)
   end
 
   def handle_ast({:geosearchstore, _destination, _source, {:error, msg}}, _store),
@@ -109,14 +106,7 @@ defmodule Ferricstore.Commands.Geo do
 
   def handle_ast({:geosearchstore, destination, source, opts}, store) do
     with {:ok, opts} <- Parsing.validate_geosearch_ast_opts(opts),
-         {:ok, center_lng, center_lat} <- resolve_center(opts, store, source),
-         {:ok, zset} <- read_zset(store, source) do
-      matches = find_matching_members(zset, center_lng, center_lat, opts)
-      sorted = sort_matches(matches, opts)
-      limited = apply_count(sorted, opts)
-
-      store_geosearch_results(store, destination, limited)
-    end
+         do: geosearchstore(store, destination, source, opts)
   end
 
   @doc """
@@ -207,11 +197,7 @@ defmodule Ferricstore.Commands.Geo do
   # ---------------------------------------------------------------------------
 
   def handle("GEOSEARCH", [key | rest], store) do
-    with {:ok, opts} <- Parsing.parse_geosearch_opts(rest),
-         {:ok, center_lng, center_lat} <- resolve_center(opts, store, key),
-         {:ok, zset} <- read_zset(store, key) do
-      do_geosearch(zset, center_lng, center_lat, opts)
-    end
+    with {:ok, opts} <- Parsing.parse_geosearch_opts(rest), do: geosearch(store, key, opts)
   end
 
   def handle("GEOSEARCH", _args, _store) do
@@ -224,14 +210,7 @@ defmodule Ferricstore.Commands.Geo do
 
   def handle("GEOSEARCHSTORE", [destination, source | rest], store) do
     with {:ok, opts} <- Parsing.parse_geosearch_opts(rest),
-         {:ok, center_lng, center_lat} <- resolve_center(opts, store, source),
-         {:ok, zset} <- read_zset(store, source) do
-      matches = find_matching_members(zset, center_lng, center_lat, opts)
-      sorted = sort_matches(matches, opts)
-      limited = apply_count(sorted, opts)
-
-      store_geosearch_results(store, destination, limited)
-    end
+         do: geosearchstore(store, destination, source, opts)
   end
 
   def handle("GEOSEARCHSTORE", _args, _store) do
@@ -429,6 +408,50 @@ defmodule Ferricstore.Commands.Geo do
     end
   rescue
     ArgumentError -> 0.0
+  end
+
+  # Redis answers [] for a missing key before it looks for FROMMEMBER's member.
+  defp geosearch(store, key, opts) do
+    case read_compound_zset(store, key) do
+      :missing ->
+        []
+
+      {:error, _reason} = error ->
+        error
+
+      {:ok, zset} ->
+        with {:ok, center_lng, center_lat} <- resolve_center(opts, store, key),
+             do: do_geosearch(zset, center_lng, center_lat, opts)
+    end
+  end
+
+  # For a missing source Redis empties the destination and answers 0. Older
+  # releases answer FROMMEMBER's error instead, so a MULTI transaction does so
+  # only at feature level 5.
+  defp geosearchstore(store, destination, source, opts) do
+    case read_compound_zset(store, source) do
+      :missing ->
+        if Ops.level_5_writes?(store),
+          do: store_geosearch_results(store, destination, []),
+          else: legacy_geosearchstore(store, destination, source, opts)
+
+      {:error, _reason} = error ->
+        error
+
+      {:ok, _zset} ->
+        legacy_geosearchstore(store, destination, source, opts)
+    end
+  end
+
+  defp legacy_geosearchstore(store, destination, source, opts) do
+    with {:ok, center_lng, center_lat} <- resolve_center(opts, store, source),
+         {:ok, zset} <- read_zset(store, source) do
+      matches = find_matching_members(zset, center_lng, center_lat, opts)
+      sorted = sort_matches(matches, opts)
+      limited = apply_count(sorted, opts)
+
+      store_geosearch_results(store, destination, limited)
+    end
   end
 
   defp store_geosearch_results(store, destination, limited) do

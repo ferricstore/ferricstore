@@ -623,17 +623,12 @@ defmodule Ferricstore.Commands.Bitmap do
   # A MULTI transaction does so only at feature level 5: older releases store
   # an empty string there, and every replica runs the transaction.
   defp write_bitop_result(store, destkey, <<>>) do
-    if empty_bitop_deletes?(store),
+    if Ops.level_5_writes?(store),
       do: delete_bitop_destination(store, destkey),
       else: write_bitop_value(store, destkey, <<>>)
   end
 
   defp write_bitop_result(store, destkey, result), do: write_bitop_value(store, destkey, result)
-
-  defp empty_bitop_deletes?(%FerricStore.Instance{}), do: true
-
-  defp empty_bitop_deletes?(store) when is_map(store),
-    do: Map.get(store, :bitop_empty_deletes?) == true
 
   defp delete_bitop_destination(store, destkey) do
     case Destination.bitop_compound_destination_type(destkey, store) do
