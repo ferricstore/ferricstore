@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer nil from OBJECT ENCODING, FREQ, IDLETIME and REFCOUNT on a missing
+  key, as Redis does; they answered "ERR no such key".
 - Answer SET's "ERR invalid expire time in 'set' command" for EX 0, PX -1 or
   EXAT 0, as Redis does; it answered "syntax error".
 - Support HSCAN's NOVALUES option (Redis 7.4), which answers the fields

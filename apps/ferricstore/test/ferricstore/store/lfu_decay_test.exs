@@ -563,13 +563,13 @@ defmodule Ferricstore.Store.LFUDecayTest do
       end
     end
 
-    test "returns error for non-existent key" do
+    test "answers nil for a non-existent key, as in Redis" do
       store = %{
         get: fn k -> Router.get(FerricStore.Instance.get(:default), k) end,
         exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end
       }
 
-      assert {:error, "ERR no such key"} ==
+      assert nil ==
                Ferricstore.Commands.Generic.handle("OBJECT", ["FREQ", "nonexistent_key"], store)
     end
   end

@@ -640,6 +640,10 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
                    run(ctx, "SET", [key, "v" | expiry]),
                  inspect(expiry)
         end
+
+        for subcommand <- ~w(ENCODING FREQ IDLETIME REFCOUNT) do
+          assert nil == run(ctx, "OBJECT", [subcommand, key <> ":missing"]), subcommand
+        end
       end
     end
 

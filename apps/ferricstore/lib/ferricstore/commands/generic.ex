@@ -460,7 +460,7 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   # ---------------------------------------------------------------------------
-  # Private -- OBJECT subcommands
+  # Private -- OBJECT subcommands (a missing key answers nil, as in Redis)
   # ---------------------------------------------------------------------------
 
   defp do_object("ENCODING", [key], store) do
@@ -469,7 +469,7 @@ defmodule Ferricstore.Commands.Generic do
         ReadResult.command_error(failure)
 
       "none" ->
-        {:error, "ERR no such key"}
+        nil
 
       "hash" ->
         "hashtable"
@@ -525,7 +525,7 @@ defmodule Ferricstore.Commands.Generic do
         end
 
       {:ok, false} ->
-        {:error, "ERR no such key"}
+        nil
 
       {:error, {:storage_read_failed, _reason}} = failure ->
         ReadResult.command_error(failure)
@@ -550,7 +550,7 @@ defmodule Ferricstore.Commands.Generic do
         end
 
       {:ok, false} ->
-        {:error, "ERR no such key"}
+        nil
 
       {:error, {:storage_read_failed, _reason}} = failure ->
         ReadResult.command_error(failure)
@@ -560,7 +560,7 @@ defmodule Ferricstore.Commands.Generic do
   defp do_object("REFCOUNT", [key], store) do
     case object_exists?(store, key) do
       {:ok, true} -> 1
-      {:ok, false} -> {:error, "ERR no such key"}
+      {:ok, false} -> nil
       {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
     end
   end

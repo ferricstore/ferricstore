@@ -101,11 +101,10 @@ defmodule Ferricstore.ObjectHashtagTest do
       assert Generic.handle("OBJECT", ["ENCODING", "myzset"], store) == "skiplist"
     end
 
-    test "nonexistent key returns error" do
+    test "nonexistent key answers nil, as in Redis" do
       store = mock_store()
 
-      assert Generic.handle("OBJECT", ["ENCODING", "nonexistent"], store) ==
-               {:error, "ERR no such key"}
+      assert Generic.handle("OBJECT", ["ENCODING", "nonexistent"], store) == nil
     end
 
     test "subcommand is case-insensitive" do
@@ -120,11 +119,10 @@ defmodule Ferricstore.ObjectHashtagTest do
   # ---------------------------------------------------------------------------
 
   describe "OBJECT IDLETIME" do
-    test "nonexistent key returns error" do
+    test "nonexistent key answers nil, as in Redis" do
       store = mock_store()
 
-      assert Generic.handle("OBJECT", ["IDLETIME", "nonexistent"], store) ==
-               {:error, "ERR no such key"}
+      assert Generic.handle("OBJECT", ["IDLETIME", "nonexistent"], store) == nil
     end
 
     # Note: testing the actual LFU-derived idletime requires a running shard
