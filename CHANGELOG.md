@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Check SMOVE's destination type whenever the source set exists: SMOVE of a
+  member the source lacks answered 0 even when the destination held a
+  string or hash, where Redis answers WRONGTYPE. A missing source still
+  answers 0.
 - Refuse `COPY key key` with Redis's "ERR source and destination objects are
   the same", whether or not the key exists; it answered 0, or 1 and rewrote
   the key with `REPLACE`.

@@ -786,8 +786,18 @@ defmodule Ferricstore.Commands.Set do
     with :ok <- TypeRegistry.command_check_type(source, :set, store),
          {:ok, source_has_member?} <- member_present?(source, member, store) do
       cond do
+        # Redis checks the destination's type whenever the source exists.
         not source_has_member? ->
-          0
+          case TypeRegistry.get_type(source, store) do
+            "none" ->
+              0
+
+            {:error, {:storage_read_failed, _reason}} = failure ->
+              ReadResult.command_error(failure)
+
+            _set ->
+              with :ok <- TypeRegistry.command_check_type(destination, :set, store), do: 0
+          end
 
         source == destination ->
           1

@@ -273,13 +273,18 @@ defmodule Ferricstore.Commands.SetTest.Sections.Srandmember do
           assert 0 == Set.handle("SMOVE", ["src", "dst", "missing"], store)
         end
 
-        test "SMOVE missing source member ignores wrong-type destination" do
+        # Redis checks both keys' types once the source exists, and answers 0
+        # for a missing source before looking at the destination.
+        test "SMOVE of a missing member still checks the destination's type" do
           store = MockStore.make()
           Set.handle("SADD", ["src", "a"], store)
           Hash.handle("HSET", ["dst", "field", "value"], store)
 
-          assert 0 == Set.handle("SMOVE", ["src", "dst", "missing"], store)
+          assert {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"} ==
+                   Set.handle("SMOVE", ["src", "dst", "missing"], store)
+
           assert "value" == Hash.handle("HGET", ["dst", "field"], store)
+          assert 0 == Set.handle("SMOVE", ["no-such-source", "dst", "missing"], store)
         end
 
         test "SMOVE to nonexistent destination creates it" do
