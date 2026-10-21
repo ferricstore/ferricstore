@@ -740,6 +740,40 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
       end
     end
 
+    describe "#{@path}: probabilistic keys and expiry" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      # Rewriting a probabilistic key's metadata as a string deleted its
+      # data; EXPIRE and PERSIST refuse until they can keep it.
+      test "EXPIRE and PERSIST leave the structure intact", %{ctx: ctx, key: key} do
+        for {name, create, check} <- [
+              {"bf", ["BF.ADD", "a"], ["BF.EXISTS", "a"]},
+              {"cf", ["CF.ADD", "a"], ["CF.EXISTS", "a"]},
+              {"cms", ["CMS.INITBYDIM", "10", "5"], ["CMS.QUERY", "a"]},
+              {"topk", ["TOPK.RESERVE", "3"], ["TOPK.LIST"]}
+            ] do
+          k = key <> name
+          [create_cmd | create_args] = create
+          [check_cmd | check_args] = check
+          assert {:ok, _} = {:ok, run(ctx, create_cmd, [k | create_args])}
+          expected = run(ctx, check_cmd, [k | check_args])
+
+          for {command, args} <- [
+                {"EXPIRE", ["100"]},
+                {"PEXPIRE", ["100000"]},
+                {"EXPIREAT", ["4000000000"]}
+              ] do
+            assert {:error, "ERR " <> _} = run(ctx, command, [k | args]), "#{name} #{command}"
+          end
+
+          assert 0 == run(ctx, "PERSIST", [k])
+
+          assert expected == run(ctx, check_cmd, [k | check_args]), name
+          assert -1 == run(ctx, "TTL", [k])
+        end
+      end
+    end
+
     describe "#{@path}: hyperloglog" do
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 

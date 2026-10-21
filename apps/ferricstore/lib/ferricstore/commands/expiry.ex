@@ -3,7 +3,9 @@ defmodule Ferricstore.Commands.Expiry do
   alias Ferricstore.Commands.CompoundSnapshot
   alias Ferricstore.Commands.ExpiryTime
   alias Ferricstore.Store.CompoundKey
-  alias Ferricstore.Store.{Ops, ReadResult}
+  alias Ferricstore.Store.{Ops, ReadResult, TypeRegistry}
+
+  @probabilistic_types ["bloom", "cms", "cuckoo", "topk"]
 
   @moduledoc """
   Handles Redis expiry commands: EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT, TTL, PTTL, PERSIST.
@@ -190,6 +192,37 @@ defmodule Ferricstore.Commands.Expiry do
 
   defp integer_range_error, do: {:error, "ERR value is not an integer or out of range"}
 
+  defp rewrite_plain(key, value, expire_at_ms, store) do
+    with :ok <- refuse_probabilistic(key, store) do
+      case Ops.put(store, key, value, expire_at_ms) do
+        :ok -> 1
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  # A Bloom, Cuckoo, Count-Min or Top-K key holds the structure's metadata;
+  # rewriting it as a string with a new expiry deleted the structure. Until
+  # the expiry can change in place, refuse wherever writes may differ from
+  # older releases (the instance, and MULTI at cluster feature level 5); a
+  # transaction below that level writes as older releases do.
+  defp refuse_probabilistic(key, store) do
+    if Ops.level_5_writes?(store) do
+      case TypeRegistry.get_type(key, store) do
+        type when type in @probabilistic_types ->
+          {:error, "ERR expiry is not supported on #{type} keys"}
+
+        {:error, {:storage_read_failed, _reason}} = failure ->
+          ReadResult.command_error(failure)
+
+        _type ->
+          :ok
+      end
+    else
+      :ok
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Private — apply expiry to existing key
   # ---------------------------------------------------------------------------
@@ -239,10 +272,7 @@ defmodule Ferricstore.Commands.Expiry do
         0
 
       {:plain, value, _old_exp} ->
-        case Ops.put(store, key, value, expire_at_ms) do
-          :ok -> 1
-          {:error, _} = error -> error
-        end
+        rewrite_plain(key, value, expire_at_ms, store)
 
       {:compound, type, _old_exp} ->
         case expire_compound_key(key, type, expire_at_ms, store) do
@@ -371,10 +401,7 @@ defmodule Ferricstore.Commands.Expiry do
         0
 
       {:plain, value, _exp} ->
-        case Ops.put(store, key, value, 0) do
-          :ok -> 1
-          {:error, _} = error -> error
-        end
+        rewrite_plain(key, value, 0, store)
 
       {:compound, type, _exp} ->
         case expire_compound_key(key, type, 0, store) do

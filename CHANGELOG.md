@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Refuse EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT (and PERSIST of one with a
+  TTL) on a Bloom, Cuckoo, Count-Min or Top-K key: they rewrote its
+  metadata as a plain string, which deleted the structure's data and left
+  a string behind. They answer an error until the expiry can change in
+  place. A MULTI transaction below cluster feature level 5 keeps the old
+  behavior, as older replicas do.
 - Keep a t-digest's TTL through TDIGEST.ADD, TDIGEST.RESET and TDIGEST.MERGE;
   they rewrote it without one, so the key no longer expired.
 - Support `ZRANGE ... BYLEX` (with REV and LIMIT), as Redis does: it
