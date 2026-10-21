@@ -347,6 +347,53 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
       end
     end
 
+    describe "#{@path}: hash field expiry at a time" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      test "HEXPIREAT, HPEXPIREAT and HPEXPIRETIME", %{ctx: ctx, key: key} do
+        assert 3 == run(ctx, "HSET", [key, "a", "1", "b", "2", "c", "3"])
+        assert [2] == run(ctx, "HEXPIREAT", [key, "0", "FIELDS", "1", "a"])
+        assert [2] == run(ctx, "HEXPIREAT", [key, "1", "NX", "FIELDS", "1", "b"])
+        assert ["c", "3"] == run(ctx, "HGETALL", [key])
+        assert [1, -2] == run(ctx, "HPEXPIREAT", [key, "1800000001400", "FIELDS", "2", "c", "zz"])
+
+        assert [1_800_000_001_400, -2] ==
+                 run(ctx, "HPEXPIRETIME", [key, "FIELDS", "2", "c", "zz"])
+
+        assert [1_800_000_002] == run(ctx, "HEXPIRETIME", [key, "FIELDS", "1", "c"])
+        assert [0] == run(ctx, "HEXPIREAT", [key, "1800000000", "GT", "FIELDS", "1", "c"])
+        assert [1] == run(ctx, "HEXPIREAT", [key, "1800000002", "gt", "FIELDS", "1", "c"])
+        assert [1_800_000_002_000] == run(ctx, "HPEXPIRETIME", [key, "FIELDS", "1", "c"])
+        assert 1 == run(ctx, "HSET", [key, "d", "4"])
+        assert [-1] == run(ctx, "HPEXPIRETIME", [key, "FIELDS", "1", "d"])
+        assert [-2, -2] == run(ctx, "HPEXPIRETIME", [key <> ":missing", "FIELDS", "2", "a", "b"])
+        assert [1] == run(ctx, "HEXPIREAT", [key, "70368744177", "FIELDS", "1", "d"])
+        :ok = run(ctx, "SET", [key <> ":s", "v"])
+        assert @wrongtype == run(ctx, "HPEXPIRETIME", [key <> ":s", "FIELDS", "1", "a"])
+        assert @wrongtype == run(ctx, "HEXPIREAT", [key <> ":s", "-1", "FIELDS", "1", "a"])
+      end
+
+      test "the latest expiry is Redis's", %{ctx: ctx, key: key} do
+        assert 1 == run(ctx, "HSET", [key, "a", "1"])
+
+        for {command, time} <- [
+              {"HPEXPIREAT", "70368744177664"},
+              {"HEXPIREAT", "70368744178"},
+              {"HEXPIRE", "69000000000"},
+              {"HPEXPIRE", "69000000000000"}
+            ] do
+          assert {:error, "ERR invalid expire time in '#{String.downcase(command)}' command"} ==
+                   run(ctx, command, [key, time, "FIELDS", "1", "a"])
+        end
+
+        assert {:error, "ERR invalid expire time, must be >= 0"} ==
+                 run(ctx, "HEXPIREAT", [key, "-1", "FIELDS", "1", "a"])
+
+        assert [1] == run(ctx, "HPEXPIREAT", [key, "70368744177663", "FIELDS", "1", "a"])
+        assert [1] == run(ctx, "HEXPIRE", [key, "68000000000", "FIELDS", "1", "a"])
+      end
+    end
+
     describe "#{@path}: hyperloglog" do
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 

@@ -94,6 +94,18 @@ defmodule FerricstoreServer.Native.FeatureLevel5MultiTest do
     assert ["a", "1"] == Dispatcher.dispatch("HGETALL", [key], ctx)
   end
 
+  test "MULTI queues HEXPIREAT, HPEXPIREAT and HPEXPIRETIME", %{ctx: ctx, key: key} do
+    assert 2 == Dispatcher.dispatch("HSET", [key, "a", "1", "b", "2"], ctx)
+
+    state = multi()
+    state = queue(state, "HEXPIREAT", [key, "1", "FIELDS", "1", "a"])
+    state = queue(state, "HPEXPIREAT", [key, "1800000001400", "NX", "FIELDS", "1", "b"])
+    state = queue(state, "HPEXPIRETIME", [key, "FIELDS", "2", "a", "b"])
+
+    assert {:ok, [[2], [1], [-2, 1_800_000_001_400]], _state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, state)
+  end
+
   defp multi do
     {:ok, "OK", state} = Session.execute(%{"command" => "MULTI", "args" => []}, session_state())
     state

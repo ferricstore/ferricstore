@@ -21,6 +21,7 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
 
   @expiry_tags [:expire, :pexpire, :expireat, :pexpireat]
   @field_expiry_tags [:hexpire, :hpexpire]
+  @level_5_commands [:hexpireat, :hpexpireat, :hpexpiretime]
 
   @doc "Whether a parsed command needs cluster feature level 4 inside MULTI."
   @spec level_4_form?(term()) :: boolean()
@@ -45,6 +46,11 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
 
   def required_level({tag, _key, _ttl, _condition, fields})
       when tag in @field_expiry_tags and is_list(fields),
+      do: 5
+
+  # Commands releases before level 5 do not have.
+  def required_level(ast)
+      when is_tuple(ast) and tuple_size(ast) > 1 and elem(ast, 0) in @level_5_commands,
       do: 5
 
   def required_level(_ast), do: nil

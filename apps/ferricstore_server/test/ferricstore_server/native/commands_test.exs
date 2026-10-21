@@ -5223,9 +5223,15 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert pfmerge_message =~ "needs cluster feature level 5"
 
-    for args <- [[key, "0", "FIELDS", "1", "f"], [key, "10", "NX", "FIELDS", "1", "f"]] do
+    for {command, args} <- [
+          {"HEXPIRE", [key, "0", "FIELDS", "1", "f"]},
+          {"HEXPIRE", [key, "10", "NX", "FIELDS", "1", "f"]},
+          {"HEXPIREAT", [key, "1800000000", "FIELDS", "1", "f"]},
+          {"HPEXPIREAT", [key, "1800000000000", "FIELDS", "1", "f"]},
+          {"HPEXPIRETIME", [key, "FIELDS", "1", "f"]}
+        ] do
       assert {:error, hexpire_message, _state} =
-               Session.execute(%{"command" => "HEXPIRE", "args" => args}, state)
+               Session.execute(%{"command" => command, "args" => args}, state)
 
       assert hexpire_message =~ "needs cluster feature level 5"
     end

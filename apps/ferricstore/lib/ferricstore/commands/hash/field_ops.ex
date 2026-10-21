@@ -137,8 +137,9 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
     end
   end
 
-  @spec expiretime_fields(binary(), [binary()], map()) :: [integer()] | {:error, term()}
-  def expiretime_fields(key, fields, store) do
+  @spec expiretime_fields(binary(), [binary()], :seconds | :milliseconds, map()) ::
+          [integer()] | {:error, term()}
+  def expiretime_fields(key, fields, unit, store) do
     with :ok <- TypeRegistry.command_check_type(key, :hash, store),
          {:ok, {_unique_fields, _compound_keys, metas_by_field}} <-
            batch_field_metas(fields, key, store) do
@@ -146,6 +147,8 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
         case Map.fetch!(metas_by_field, field) do
           nil -> -2
           {_value, 0} -> -1
+          {_value, expire_at_ms} when unit == :milliseconds -> expire_at_ms
+          # Rounded up, as Redis does for fields.
           {_value, expire_at_ms} -> div(expire_at_ms + 999, 1000)
         end
       end)

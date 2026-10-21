@@ -56,7 +56,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   @string_raw_commands ~w(GET SET DEL EXISTS MGET MSET INCR DECR INCRBY DECRBY INCRBYFLOAT APPEND STRLEN GETSET GETDEL GETEX SETNX SETEX PSETEX GETRANGE SETRANGE MSETNX)
   @expiry_raw_commands ~w(EXPIRE PEXPIRE EXPIREAT PEXPIREAT TTL PTTL PERSIST)
   @list_raw_commands ~w(LPUSH RPUSH LPOP RPOP LRANGE LLEN LINDEX LSET LREM LTRIM LPOS LINSERT LMOVE RPOPLPUSH LPUSHX RPUSHX)
-  @hash_raw_commands ~w(HSET HDEL HMGET HGET HGETALL HEXISTS HKEYS HVALS HLEN HSETNX HSTRLEN HSCAN HINCRBY HINCRBYFLOAT HRANDFIELD HEXPIRE HPEXPIRE HGETEX HSETEX HTTL HPTTL HPERSIST HEXPIRETIME HGETDEL)
+  @hash_raw_commands ~w(HSET HDEL HMGET HGET HGETALL HEXISTS HKEYS HVALS HLEN HSETNX HSTRLEN HSCAN HINCRBY HINCRBYFLOAT HRANDFIELD HEXPIRE HPEXPIRE HEXPIREAT HPEXPIREAT HGETEX HSETEX HTTL HPTTL HPERSIST HEXPIRETIME HPEXPIRETIME HGETDEL)
   @set_raw_commands ~w(SADD SREM SMISMEMBER SINTER SUNION SDIFF SDIFFSTORE SINTERSTORE SUNIONSTORE SMEMBERS SCARD SISMEMBER SRANDMEMBER SPOP SMOVE SSCAN SINTERCARD)
   @zset_raw_commands ~w(ZADD ZREM ZSCORE ZRANK ZREVRANK ZCARD ZINCRBY ZCOUNT ZPOPMIN ZPOPMAX ZRANDMEMBER ZMSCORE ZRANGE ZREVRANGE ZSCAN ZRANGEBYSCORE ZREVRANGEBYSCORE)
   @bitmap_raw_commands ~w(GETBIT SETBIT BITCOUNT BITPOS BITOP)
@@ -144,10 +144,13 @@ defmodule Ferricstore.Commands.Dispatcher do
     "HSCAN" => -3,
     "HEXPIRE" => -6,
     "HPEXPIRE" => -6,
+    "HEXPIREAT" => -6,
+    "HPEXPIREAT" => -6,
     "HTTL" => -5,
     "HPTTL" => -5,
     "HPERSIST" => -5,
     "HEXPIRETIME" => -5,
+    "HPEXPIRETIME" => -5,
     "HGETDEL" => -5,
     "HGETEX" => -5,
     "SADD" => -3,
@@ -278,6 +281,9 @@ defmodule Ferricstore.Commands.Dispatcher do
     hpexpire: "hpexpire",
     hpttl: "hpttl",
     hexpiretime: "hexpiretime",
+    hexpireat: "hexpireat",
+    hpexpireat: "hpexpireat",
+    hpexpiretime: "hpexpiretime",
     hgetdel: "hgetdel",
     hgetex: "hgetex",
     hsetex: "hsetex",
@@ -509,19 +515,20 @@ defmodule Ferricstore.Commands.Dispatcher do
     do: List.handle_ast(ast, store)
 
   def dispatch_ast({tag, _} = ast, store)
-      when tag in ~w(hset hdel hmget hgetall hkeys hvals hlen hrandfield hscan httl hpersist hpttl hexpiretime hgetdel)a,
+      when tag in ~w(hset hdel hmget hgetall hkeys hvals hlen hrandfield hscan httl hpersist hpttl hexpiretime hpexpiretime hgetdel)a,
       do: Hash.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _} = ast, store)
-      when tag in ~w(hget hexists hstrlen hrandfield hscan hexpire hpexpire httl hpersist hpttl hexpiretime hgetdel hgetex)a,
+      when tag in ~w(hget hexists hstrlen hrandfield hscan hexpire hpexpire hexpireat hpexpireat httl hpersist hpttl hexpiretime hpexpiretime hgetdel hgetex)a,
       do: Hash.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _, _} = ast, store)
-      when tag in ~w(hincrby hincrbyfloat hsetnx hrandfield hscan hexpire hpexpire hgetex hsetex)a,
+      when tag in ~w(hincrby hincrbyfloat hsetnx hrandfield hscan hexpire hpexpire hexpireat hpexpireat hgetex hsetex)a,
       do: Hash.handle_ast(ast, store)
 
-  def dispatch_ast({tag, _, _, _, _} = ast, store) when tag in ~w(hexpire hpexpire)a,
-    do: Hash.handle_ast(ast, store)
+  def dispatch_ast({tag, _, _, _, _} = ast, store)
+      when tag in ~w(hexpire hpexpire hexpireat hpexpireat)a,
+      do: Hash.handle_ast(ast, store)
 
   def dispatch_ast({tag, _} = ast, store)
       when tag in ~w(sadd srem smembers smismember scard sinter sunion sdiff sdiffstore sinterstore sunionstore sintercard srandmember spop)a,

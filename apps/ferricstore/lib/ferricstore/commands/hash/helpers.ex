@@ -7,8 +7,8 @@ defmodule Ferricstore.Commands.Hash.Helpers do
 
   @max_int64 9_223_372_036_854_775_807
   @min_int64 -9_223_372_036_854_775_808
-  # Redis's latest field expiry, in Unix milliseconds (2^48 - 1).
-  @max_field_expire_ms 281_474_976_710_655
+  # Redis's latest field expiry, in Unix milliseconds (2^46 - 1, in 4199).
+  @max_field_expire_ms 70_368_744_177_663
   @field_expire_conditions %{"NX" => :nx, "XX" => :xx, "GT" => :gt, "LT" => :lt}
 
   @spec even_length?(list()) :: boolean()
@@ -94,8 +94,9 @@ defmodule Ferricstore.Commands.Hash.Helpers do
   @type field_expire_condition :: nil | :nx | :xx | :gt | :lt
 
   @doc """
-  Parses HEXPIRE's and HPEXPIRE's arguments after the key, as Redis 8 does:
-  the TTL, then NX, XX, GT or LT and the FIELDS block in any order.
+  Parses the arguments after the key of HEXPIRE, HPEXPIRE, HEXPIREAT and
+  HPEXPIREAT (`command`, lowercase), as Redis 8 does: the TTL or Unix time,
+  then NX, XX, GT or LT and the FIELDS block in any order.
   """
   @spec parse_field_expire(binary(), binary(), [binary()]) ::
           {:ok, non_neg_integer(), field_expire_condition(), [binary()]} | {:error, binary()}
@@ -106,30 +107,39 @@ defmodule Ferricstore.Commands.Hash.Helpers do
     end
   end
 
-  @doc "Milliseconds per unit of HEXPIRE's (seconds) or HPEXPIRE's TTL."
-  @spec field_ttl_multiplier(binary()) :: 1 | 1_000
-  def field_ttl_multiplier("hpexpire"), do: 1
-  def field_ttl_multiplier("hexpire"), do: 1_000
+  @doc """
+  Where a parsed field expiry `time` of `command` (lowercase) expires, in Unix
+  milliseconds; a time at or before now deletes the field.
+  """
+  @spec field_expire_at(binary(), non_neg_integer()) :: {:ok, integer()} | {:error, binary()}
+  def field_expire_at(command, time) when command in ["hexpireat", "hpexpireat"],
+    do: {:ok, time * field_time_multiplier(command)}
 
-  @doc "Where a field TTL of `ttl` (0 meaning now) in `multiplier` ms units expires."
-  @spec field_expire_at(non_neg_integer(), pos_integer()) :: {:ok, integer()} | {:error, binary()}
-  def field_expire_at(0, _multiplier), do: {:ok, CommandTime.now_ms()}
-  def field_expire_at(ttl, multiplier), do: relative_expire_at(ttl, multiplier)
+  def field_expire_at(_command, 0), do: {:ok, CommandTime.now_ms()}
+  def field_expire_at(command, ttl), do: relative_expire_at(ttl, field_time_multiplier(command))
+
+  defp field_time_multiplier(command) when command in ["hpexpire", "hpexpireat"], do: 1
+  defp field_time_multiplier(command) when command in ["hexpire", "hexpireat"], do: 1_000
 
   defp parse_field_ttl(command, raw) do
     case ExpiryTime.parse_integer(raw) do
-      {:ok, ttl} when ttl < 0 ->
+      {:ok, time} when time < 0 ->
         {:error, "ERR invalid expire time, must be >= 0"}
 
-      {:ok, ttl} ->
-        if ttl * field_ttl_multiplier(command) > @max_field_expire_ms - CommandTime.now_ms(),
+      {:ok, time} ->
+        if time * field_time_multiplier(command) > latest_field_time_ms(command),
           do: {:error, "ERR invalid expire time in '#{command}' command"},
-          else: {:ok, ttl}
+          else: {:ok, time}
 
       :error ->
         integer_range_error()
     end
   end
+
+  defp latest_field_time_ms(command) when command in ["hexpireat", "hpexpireat"],
+    do: @max_field_expire_ms
+
+  defp latest_field_time_ms(_command), do: @max_field_expire_ms - CommandTime.now_ms()
 
   defp parse_field_expire_args([], _condition, nil), do: {:error, "ERR missing FIELDS argument"}
   defp parse_field_expire_args([], condition, fields), do: {:ok, condition, fields}

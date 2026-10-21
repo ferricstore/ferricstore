@@ -24,7 +24,7 @@ mode and the embedded API:
 GET, SET (EX/PX/EXAT/PXAT/NX/XX/GET/KEEPTTL), DEL, EXISTS, MGET, MSET, MSETNX, INCR, DECR, INCRBY, DECRBY, INCRBYFLOAT,
 APPEND, STRLEN, GETSET, GETDEL, GETEX, SETNX, SETEX, PSETEX, GETRANGE, SETRANGE,
 HSET, HGET, HDEL, HMGET, HGETALL, HEXISTS, HKEYS, HVALS, HLEN, HINCRBY, HINCRBYFLOAT,
-HSETNX, HSTRLEN, HRANDFIELD, HSCAN, HEXPIRE, HTTL, HPERSIST, HPEXPIRE, HPTTL, HEXPIRETIME, HGETDEL, HGETEX, HSETEX,
+HSETNX, HSTRLEN, HRANDFIELD, HSCAN, HEXPIRE, HTTL, HPERSIST, HPEXPIRE, HPTTL, HEXPIRETIME, HEXPIREAT, HPEXPIREAT, HPEXPIRETIME, HGETDEL, HGETEX, HSETEX,
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, LINDEX, LSET, LREM, LTRIM, LPOS, LINSERT, LMOVE, RPOPLPUSH, LPUSHX, RPUSHX,
 SADD, SREM, SMEMBERS, SISMEMBER, SMISMEMBER, SCARD, SRANDMEMBER, SPOP, SDIFF, SINTER, SUNION,
 SDIFFSTORE, SINTERSTORE, SUNIONSTORE, SINTERCARD, SMOVE, SSCAN,
@@ -659,6 +659,9 @@ FerricStore supports per-field expiry on hash fields:
 | `HPEXPIRE` | `HPEXPIRE key ms [NX\|XX\|GT\|LT] FIELDS count field [field ...]` | Same as HEXPIRE but milliseconds |
 | `HPTTL` | `HPTTL key FIELDS count field [field ...]` | Same as HTTL but milliseconds |
 | `HEXPIRETIME` | `HEXPIRETIME key FIELDS count field [field ...]` | Absolute Unix timestamp (seconds) |
+| `HPEXPIRETIME` | `HPEXPIRETIME key FIELDS count field [field ...]` | Absolute Unix timestamp (milliseconds) |
+| `HEXPIREAT` | `HEXPIREAT key unix-seconds [NX\|XX\|GT\|LT] FIELDS count field [field ...]` | Same as HEXPIRE, at a Unix time; a time not after now deletes the field (`2`) |
+| `HPEXPIREAT` | `HPEXPIREAT key unix-ms [NX\|XX\|GT\|LT] FIELDS count field [field ...]` | Same as HEXPIREAT but milliseconds |
 | `HGETDEL` | `HGETDEL key FIELDS count field [field ...]` | List of values (nil for missing) |
 | `HGETEX` | `HGETEX key [EX sec\|PX ms\|EXAT ts\|PXAT ms\|PERSIST] FIELDS count field [...]` | List of values |
 | `HSETEX` | `HSETEX key seconds field value [field value ...]` | Count of new fields |
