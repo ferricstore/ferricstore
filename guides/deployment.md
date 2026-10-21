@@ -578,9 +578,8 @@ shard_0: 2
     level 4: older releases abort or answer such a transaction differently.
   - 5: MULTI queues the command forms releases before it do not parse or
     refuse: `ZRANK`/`ZREVRANK ... WITHSCORE`, `PFMERGE` with no source, and
-    `HEXPIRE`/`HPEXPIRE` with NX, XX, GT or LT or a TTL of 0, and the
-    commands `HEXPIREAT`, `HPEXPIREAT` and `HPEXPIRETIME`, `HSETEX`'s Redis 8
-    form and `HGETEX` with a TTL of 0. Outside MULTI, HSETEX's Redis form runs
+    `HEXPIRE`/`HPEXPIRE` with NX, XX, GT or LT or a TTL of 0, `HSETEX`'s
+    Redis 8 form and `HGETEX` with a TTL of 0. Outside MULTI, HSETEX's Redis form runs
     as one replicated entry.
     Inside MULTI, BITOP deletes its destination for an empty result and
     GEOSEARCHSTORE empties its destination for a missing source, as both do

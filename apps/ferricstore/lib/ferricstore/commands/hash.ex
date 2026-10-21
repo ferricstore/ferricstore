@@ -15,8 +15,8 @@ defmodule Ferricstore.Commands.Hash do
   ## Hash Field TTL (Redis 7.4+)
 
   Individual hash fields can have per-field expiry via `HEXPIRE`,
-  `HPEXPIRE`, `HEXPIREAT`, `HPEXPIREAT`, `HTTL` and `HPERSIST`. The expiry is
-  stored as the `expire_at_ms` timestamp on each compound key entry.
+  `HPEXPIRE`, `HTTL` and `HPERSIST`. The expiry is stored as the
+  `expire_at_ms` timestamp on each compound key entry.
 
   ## Type Enforcement
 
@@ -32,8 +32,8 @@ defmodule Ferricstore.Commands.Hash do
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.{Ops, ReadResult, TypeRegistry, ValueCodec}
 
-  @field_expire_commands ~w(HEXPIRE HPEXPIRE HEXPIREAT HPEXPIREAT)
-  @field_expire_tags [:hexpire, :hpexpire, :hexpireat, :hpexpireat]
+  @field_expire_commands ~w(HEXPIRE HPEXPIRE)
+  @field_expire_tags [:hexpire, :hpexpire]
 
   @max_int64 9_223_372_036_854_775_807
   @min_int64 -9_223_372_036_854_775_808
@@ -238,12 +238,10 @@ defmodule Ferricstore.Commands.Hash do
   # ---------------------------------------------------------------------------
   # HEXPIRE key seconds [NX | XX | GT | LT] FIELDS count field [field ...]
   # HPEXPIRE key milliseconds [NX | XX | GT | LT] FIELDS count field [field ...]
-  # HEXPIREAT / HPEXPIREAT key unix-time-seconds / -milliseconds [...]
   # ---------------------------------------------------------------------------
 
-  # Sets an expiry on individual hash fields. Per field: 1 = expiry set,
-  # 2 = deleted (a TTL of 0 or a time not after now), 0 = condition not met,
-  # -2 = no such field.
+  # Sets a TTL on individual hash fields. Per field: 1 = expiry set,
+  # 2 = deleted (a TTL of 0), 0 = condition not met, -2 = no such field.
   def handle(command, [key, ttl | args], store)
       when command in @field_expire_commands and length(args) >= 3 do
     command = String.downcase(command)
@@ -311,15 +309,6 @@ defmodule Ferricstore.Commands.Hash do
   def handle("HEXPIRETIME", [key | args], store) when length(args) >= 3 do
     with {:ok, fields} <- field_list(key, args, store),
          do: FieldOps.expiretime_fields(key, fields, :seconds, store)
-  end
-
-  def handle("HPEXPIRETIME", [key | args], store) when length(args) >= 3 do
-    with {:ok, fields} <- field_list(key, args, store),
-         do: FieldOps.expiretime_fields(key, fields, :milliseconds, store)
-  end
-
-  def handle("HPEXPIRETIME", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'hpexpiretime' command"}
   end
 
   def handle("HEXPIRETIME", _args, _store) do
@@ -540,7 +529,7 @@ defmodule Ferricstore.Commands.Hash do
     do: type_checked_args(key, error, store)
 
   def handle_ast({tag, key, {:error, _reason} = error}, store)
-      when tag in [:httl, :hpersist, :hpttl, :hexpiretime, :hpexpiretime, :hgetdel],
+      when tag in [:httl, :hpersist, :hpttl, :hexpiretime, :hgetdel],
       do: type_checked_args(key, error, store)
 
   def handle_ast({tag, key, ttl, fields}, store)
@@ -563,9 +552,6 @@ defmodule Ferricstore.Commands.Hash do
 
   def handle_ast({:hexpiretime, key, fields}, store) when is_list(fields),
     do: FieldOps.expiretime_fields(key, fields, :seconds, store)
-
-  def handle_ast({:hpexpiretime, key, fields}, store) when is_list(fields),
-    do: FieldOps.expiretime_fields(key, fields, :milliseconds, store)
 
   def handle_ast({:hgetdel, key, fields}, store) when is_list(fields),
     do: getdel_fields(key, fields, store)

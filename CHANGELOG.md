@@ -9,8 +9,8 @@ All notable changes to FerricStore will be documented here.
   answered "invalid expire time"), and an expiry out of range answers "ERR
   invalid expire time in 'getex' command". SETRANGE checks the key's type
   before the resulting size, with Redis's "(proto-max-bulk-len)" text.
-- Answer Redis's argument errors from HTTL, HPTTL, HPERSIST, HEXPIRETIME,
-  HPEXPIRETIME and HGETDEL, after the type check, and accept a lowercase
+- Answer Redis's argument errors from HTTL, HPTTL, HPERSIST, HEXPIRETIME and
+  HGETDEL, after the type check, and accept a lowercase
   `fields` in every command path (the command handlers refused it).
 - Support HSETEX's Redis 8 form, `HSETEX key [FNX|FXX] [EX|PX|EXAT|PXAT|
   KEEPTTL] FIELDS n field value...`, next to FerricStore's own
@@ -23,16 +23,14 @@ All notable changes to FerricStore will be documented here.
   queued only at level 5.
 - Answer `BITPOS missing 0 start end BIT` with 0, as every other BITPOS form
   of a missing key already did; it answered -1.
-- Add HEXPIREAT, HPEXPIREAT and HPEXPIRETIME (Redis 7.4). Inside MULTI they
-  are queued only at cluster feature level 5. Field expiry times now stop at
-  Redis's latest, 70368744177663 ms (in 4199), not 2^48 ms.
 - Round TTL and EXPIRETIME to the nearest second, and HTTL and HEXPIRETIME
   up, as Redis does. They truncated, so `SET k v EX 10` followed by `TTL k`
   answered 9 where Redis answers 10.
 - Support HEXPIRE and HPEXPIRE as Redis 8 does: NX, XX, GT and LT (anywhere
   after the TTL), a TTL of 0 deleting the field (answering 2, and deleting
   the hash once empty), repeated fields applied in order, WRONGTYPE before
-  argument errors, and Redis's error texts and expiry limit. A TTL of
+  argument errors, and Redis's error texts and latest expiry (70368744177663
+  ms, in 4199). A TTL of
   0 answered an error and the conditions a syntax error. Inside MULTI the new
   forms are queued only at cluster feature level 5.
 - Stamp the dashboard's circuit open/close and approval decisions with the

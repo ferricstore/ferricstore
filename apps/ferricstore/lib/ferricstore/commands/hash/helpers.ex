@@ -99,16 +99,14 @@ defmodule Ferricstore.Commands.Hash.Helpers do
 
   @field_expire_units %{
     "hexpire" => :ex,
-    "hpexpire" => :px,
-    "hexpireat" => :exat,
-    "hpexpireat" => :pxat
+    "hpexpire" => :px
   }
   @time_options %{"EX" => :ex, "PX" => :px, "EXAT" => :exat, "PXAT" => :pxat}
 
   @doc """
-  Parses the arguments after the key of HEXPIRE, HPEXPIRE, HEXPIREAT and
-  HPEXPIREAT (`command`, lowercase), as Redis 8 does: the TTL or Unix time,
-  then NX, XX, GT or LT and the FIELDS block in any order.
+  Parses the arguments after the key of HEXPIRE and HPEXPIRE (`command`,
+  lowercase), as Redis 8 does: the TTL, then NX, XX, GT or LT and the FIELDS
+  block in any order.
   """
   @spec parse_field_expire(binary(), binary(), [binary()]) ::
           {:ok, non_neg_integer(), field_expire_condition(), [binary()]} | {:error, binary()}
@@ -119,7 +117,7 @@ defmodule Ferricstore.Commands.Hash.Helpers do
     end
   end
 
-  @doc "The time unit of HEXPIRE, HPEXPIRE, HEXPIREAT or HPEXPIREAT (lowercase)."
+  @doc "The time unit of HEXPIRE or HPEXPIRE (lowercase)."
   @spec field_expire_unit(binary()) :: field_time_unit()
   def field_expire_unit(command), do: Map.fetch!(@field_expire_units, command)
 
@@ -155,7 +153,7 @@ defmodule Ferricstore.Commands.Hash.Helpers do
 
   @doc """
   Parses `FIELDS count field [field ...]` for HTTL, HPTTL, HPERSIST,
-  HEXPIRETIME, HPEXPIRETIME and HGETDEL, with Redis's errors.
+  HEXPIRETIME and HGETDEL, with Redis's errors.
   """
   @spec parse_field_list([binary()]) :: {:ok, [binary()]} | {:error, binary()}
   def parse_field_list([keyword, count | fields]) do

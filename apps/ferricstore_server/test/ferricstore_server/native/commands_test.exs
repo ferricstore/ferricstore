@@ -5226,9 +5226,6 @@ defmodule FerricstoreServer.Native.CommandsTest do
     for {command, args} <- [
           {"HEXPIRE", [key, "0", "FIELDS", "1", "f"]},
           {"HEXPIRE", [key, "10", "NX", "FIELDS", "1", "f"]},
-          {"HEXPIREAT", [key, "1800000000", "FIELDS", "1", "f"]},
-          {"HPEXPIREAT", [key, "1800000000000", "FIELDS", "1", "f"]},
-          {"HPEXPIRETIME", [key, "FIELDS", "1", "f"]},
           {"HSETEX", [key, "FNX", "FIELDS", "1", "f", "v"]},
           {"HGETEX", [key, "EX", "0", "FIELDS", "1", "f"]}
         ] do

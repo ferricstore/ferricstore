@@ -2,8 +2,8 @@ defmodule FerricstoreServer.Native.FeatureLevel5MultiTest do
   @moduledoc """
   Cluster feature level 5 inside MULTI: a transaction may queue ZRANK and
   ZREVRANK WITHSCORE, a sourceless PFMERGE, HEXPIRE/HPEXPIRE with NX, XX, GT
-  or LT or a TTL of 0, HEXPIREAT, HPEXPIREAT, HPEXPIRETIME, HSETEX's Redis 8
-  form and HGETEX with a TTL of 0, BITOP with an empty result
+  or LT or a TTL of 0, HSETEX's Redis 8 form and HGETEX with a TTL of 0, BITOP
+  with an empty result
   deletes its destination, and GEOSEARCHSTORE of a missing source empties its
   destination.
   """
@@ -93,18 +93,6 @@ defmodule FerricstoreServer.Native.FeatureLevel5MultiTest do
              Session.execute(%{"command" => "EXEC", "args" => []}, state)
 
     assert ["a", "1"] == Dispatcher.dispatch("HGETALL", [key], ctx)
-  end
-
-  test "MULTI queues HEXPIREAT, HPEXPIREAT and HPEXPIRETIME", %{ctx: ctx, key: key} do
-    assert 2 == Dispatcher.dispatch("HSET", [key, "a", "1", "b", "2"], ctx)
-
-    state = multi()
-    state = queue(state, "HEXPIREAT", [key, "1", "FIELDS", "1", "a"])
-    state = queue(state, "HPEXPIREAT", [key, "1800000001400", "NX", "FIELDS", "1", "b"])
-    state = queue(state, "HPEXPIRETIME", [key, "FIELDS", "2", "a", "b"])
-
-    assert {:ok, [[2], [1], [-2, 1_800_000_001_400]], _state} =
-             Session.execute(%{"command" => "EXEC", "args" => []}, state)
   end
 
   test "MULTI queues HSETEX's Redis 8 form and HGETEX with a TTL of 0", %{ctx: ctx, key: key} do
