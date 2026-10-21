@@ -1571,7 +1571,9 @@ defmodule Ferricstore.Store.Router.Part08 do
 
       @doc false
       def pfadd(ctx, key, elements) when is_binary(key) and is_list(elements) do
-        forced_single_key_quorum(ctx, key, {:pfadd, key, elements})
+        if Enum.all?(elements, &is_binary/1),
+          do: forced_single_key_quorum(ctx, key, {:pfadd, key, elements}),
+          else: {:error, "ERR pfadd elements must be strings"}
       end
 
       @doc false

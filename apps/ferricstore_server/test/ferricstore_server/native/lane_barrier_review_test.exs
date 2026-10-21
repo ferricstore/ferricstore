@@ -402,6 +402,26 @@ defmodule FerricstoreServer.Native.LaneBarrierReviewTest do
     assert {:ok, "concurrent"} = FerricStore.get(key)
   end
 
+  test "a command rejected while MULTI is queuing makes EXEC discard the transaction", %{
+    keys: [key, _, _]
+  } do
+    socket = connect()
+
+    send_frames(socket, [
+      command(1, 140, "MULTI", []),
+      command(1, 141, "SET", [key, "partial"]),
+      command(1, 142, "NOSUCHCMD", []),
+      command(1, 143, "EXEC", [])
+    ])
+
+    replies = Map.new(1..4, fn _ -> response_value(socket) end)
+    assert {0, "QUEUED"} = replies[141]
+    assert {status, %{"message" => "ERR unknown command" <> _}} = replies[142]
+    assert status != 0
+    assert {_status, %{"message" => "EXECABORT" <> _}} = replies[143]
+    assert {:ok, nil} = FerricStore.get(key)
+  end
+
   test "MULTI is refused while a blocking command is pending on the connection", %{
     keys: [list, key, _]
   } do

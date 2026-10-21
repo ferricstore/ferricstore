@@ -1364,7 +1364,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
       defp do_increment_float_value(state, key, current, delta, expire_at_ms) do
         case ValueCodec.checked_float_add(current, delta) do
           {:ok, new_val} ->
-            case do_put(state, key, new_val, expire_at_ms) do
+            case do_put(state, key, stored_float_increment(state, new_val), expire_at_ms) do
               :ok -> {:ok, new_val}
               {:error, _reason} = error -> error
             end

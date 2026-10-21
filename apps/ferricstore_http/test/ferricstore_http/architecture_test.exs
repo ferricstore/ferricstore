@@ -69,7 +69,7 @@ defmodule FerricstoreHttp.ArchitectureTest do
     assert %Auth.Context{session: :session}
            |> Map.from_struct()
            |> Map.keys()
-           |> Enum.sort() == [:cache_key, :scopes, :session, :subject]
+           |> Enum.sort() == [:cache_key, :cached_session, :scopes, :session, :subject]
 
     assert %Auth.Identity{session: :session}
            |> Map.from_struct()

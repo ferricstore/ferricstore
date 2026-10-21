@@ -1466,6 +1466,7 @@ defmodule FerricstoreServer.Health.Endpoint do
       ])
     else
       {:error, reason} ->
+        :ok = AuthRateLimiter.release_failure(reservation)
         audit_dashboard_setup(:auth_failure, peer, headers, false)
 
         send_html_response(
@@ -1507,6 +1508,7 @@ defmodule FerricstoreServer.Health.Endpoint do
         ])
 
       {:error, reason} ->
+        :ok = AuthRateLimiter.release_failure(reservation)
         audit_dashboard_login(:auth_failure, peer, username, false)
 
         send_html_response(

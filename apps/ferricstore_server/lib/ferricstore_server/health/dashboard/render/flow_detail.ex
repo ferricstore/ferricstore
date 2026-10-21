@@ -120,7 +120,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
       data
       |> Map.get(:history, [])
       |> flow_history_timeline_rows()
-      |> Enum.sort_by(&{&1.time_ms || 0, to_string(&1.event_id)})
+      |> Enum.sort_by(&{&1.time_ms || 0, flow_history_event_order(&1.event_id)})
       |> Enum.reject(&(&1.to_state in [nil, ""]))
       |> Enum.chunk_by(& &1.to_state)
       |> Enum.map(fn [first | _] ->

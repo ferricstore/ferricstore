@@ -425,7 +425,7 @@ defmodule Ferricstore.Commands.TopKTest do
       :ok = TopK.handle("TOPK.RESERVE", ["hot_keys", "10"], store)
 
       result = TopK.handle("TOPK.INFO", ["hot_keys"], store)
-      assert ["k", 10, "width", 8, "depth", 7] = result
+      assert ["k", 10, "width", 640, "depth", 7] = result
     end
 
     test "returns error when key does not exist" do

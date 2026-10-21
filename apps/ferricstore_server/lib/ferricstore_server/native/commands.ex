@@ -643,11 +643,53 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp execute_with_native_resource_lease(resource_lease, opcode, payload, state) do
     try do
-      execute_prepared_native(opcode, payload, state) |> record_native_activity(opcode, payload)
+      opcode
+      |> execute_prepared_native(payload, state)
+      |> record_native_activity(opcode, payload)
+      |> notify_native_keyspace(opcode, payload)
     after
       release_native_resource_lease(resource_lease, state)
     end
   end
+
+  # Typed data operations call FerricStore.Impl, not the command dispatcher,
+  # so they fire their keyspace notifications here. COMMAND_EXEC and PIPELINE
+  # commands notify in the dispatcher.
+  @notifying_typed_ops [
+    @op_set,
+    @op_del,
+    @op_mset,
+    @op_hset,
+    @op_lpush,
+    @op_rpush,
+    @op_lpop,
+    @op_rpop,
+    @op_sadd,
+    @op_srem,
+    @op_zadd,
+    @op_zrem
+  ]
+
+  defp notify_native_keyspace({:ok, value, _state} = result, opcode, payload)
+       when opcode in @notifying_typed_ops do
+    if Ferricstore.KeyspaceNotifications.enabled?() do
+      Ferricstore.KeyspaceNotifications.after_command(
+        Map.fetch!(@commands, opcode),
+        native_notification_args(opcode, payload),
+        value
+      )
+    end
+
+    result
+  end
+
+  defp notify_native_keyspace(result, _opcode, _payload), do: result
+
+  defp native_notification_args(opcode, payload)
+       when opcode in [@op_set, @op_mset, @op_hset, @op_lpush, @op_rpush, @op_sadd, @op_zadd],
+       do: native_resource_limit_args(opcode, payload)
+
+  defp native_notification_args(opcode, payload), do: keys(opcode, payload)
 
   defp release_native_resource_lease(nil, _state), do: :ok
 
@@ -905,6 +947,8 @@ defmodule FerricstoreServer.Native.Commands do
 
           if match?({:ok, _response, _state}, result) do
             :ok = AuthRateLimiter.release_success(reservation)
+          else
+            :ok = AuthRateLimiter.release_failure(reservation)
           end
 
           result
@@ -1138,10 +1182,10 @@ defmodule FerricstoreServer.Native.Commands do
          {:ok, window_ms} <- require_pos_integer(payload, "window_ms"),
          {:ok, max} <- require_pos_integer(payload, "max"),
          {:ok, count} <- optional_pos_integer(payload, "count", 1) do
-      result_to_reply(
-        {:ok, Ops.ratelimit_add(state.instance_ctx, key, window_ms, max, count)},
-        state
-      )
+      case Ops.ratelimit_add(state.instance_ctx, key, window_ms, max, count) do
+        {:error, _reason} = error -> result_to_reply(error, state)
+        result -> result_to_reply({:ok, result}, state)
+      end
     else
       {:error, reason} -> {:bad_request, reason, state}
     end
@@ -1202,7 +1246,8 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp do_execute(@op_hset, payload, state) do
     with {:ok, key} <- require_binary(payload, "key"),
-         {:ok, fields} <- require_nonempty_map(payload, "fields") do
+         {:ok, fields} <- require_nonempty_map(payload, "fields"),
+         :ok <- require_scalar_hash_fields(fields) do
       result_to_reply(FerricStore.Impl.hset(state.instance_ctx, key, fields), state)
     else
       {:error, reason} -> {:bad_request, reason, state}
@@ -4113,6 +4158,17 @@ defmodule FerricstoreServer.Native.Commands do
     end
   end
 
+  # Field names and values are stringified for the hash; a map or a list that
+  # is not text cannot be, and raised while the command ran.
+  defp require_scalar_hash_fields(fields) do
+    if Enum.all?(fields, fn {name, value} -> hash_scalar?(name) and hash_scalar?(value) end),
+      do: :ok,
+      else: {:error, "ERR native field fields must map strings to strings or numbers"}
+  end
+
+  defp hash_scalar?(value) when is_map(value) or is_list(value), do: false
+  defp hash_scalar?(_value), do: true
+
   defp require_nonempty_map(payload, key) do
     with {:ok, value} <- require_map(payload, key) do
       if map_size(value) > 0 do
@@ -4549,8 +4605,10 @@ defmodule FerricstoreServer.Native.Commands do
         )
       end
 
+    # The fast path writes without the per-command keyspace notifications.
     fast_path_result =
-      if FerricStore.ResourceLimits.default_implementation?() do
+      if FerricStore.ResourceLimits.default_implementation?() and
+           not Ferricstore.KeyspaceNotifications.enabled?() do
         execute_pipeline_fast_path(commands, fast_path_state)
       else
         :fallback

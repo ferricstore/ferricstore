@@ -30,10 +30,18 @@ defmodule Ferricstore.Store.Router.Part09 do
       alias Ferricstore.TermCodec
 
       @max_logical_scan_cursor_bytes 88_000
+      @single_member_write_chunk 128
 
+      # The forced quorum path is the default instance's Raft. A custom
+      # embedded instance applies through its own shards, as raft_write/4 does;
+      # sending its command down the forced path wrote to the default
+      # instance's shard of the same index.
       defp forced_single_key_quorum(ctx, key, command) do
         idx = shard_for(ctx, key)
-        forced_quorum_write(ctx, idx, command, node())
+
+        if durable_raft_ctx?(ctx),
+          do: forced_quorum_write(ctx, idx, command, node()),
+          else: GenServer.call(elem(ctx.shard_names, idx), {:standalone_barrier_write, command})
       end
 
       @hll_wrongtype_error {:error,
@@ -730,6 +738,9 @@ defmodule Ferricstore.Store.Router.Part09 do
       """
       @spec setrange(FerricStore.Instance.t(), binary(), non_neg_integer(), binary()) ::
               {:ok, non_neg_integer()} | {:error, binary()}
+      def setrange(_ctx, _key, offset, _value) when not is_integer(offset) or offset < 0,
+        do: {:error, "ERR offset is out of range"}
+
       def setrange(ctx, key, offset, value) do
         minimum_size =
           Ferricstore.Raft.ApplyLimits.setrange_size(0, offset, byte_size(value))
@@ -766,6 +777,12 @@ defmodule Ferricstore.Store.Router.Part09 do
       """
       @spec hincrby(FerricStore.Instance.t(), binary(), binary(), integer()) ::
               integer() | {:error, binary()}
+      def hincrby(_ctx, _key, field, _delta) when not is_binary(field),
+        do: {:error, "ERR hash field must be a string"}
+
+      def hincrby(_ctx, _key, _field, delta) when not is_integer(delta),
+        do: {:error, "ERR value is not an integer or out of range"}
+
       def hincrby(ctx, key, field, delta) do
         raft_write(ctx, shard_for(ctx, key), key, {:hincrby, key, field, delta})
       end
@@ -776,6 +793,12 @@ defmodule Ferricstore.Store.Router.Part09 do
       """
       @spec hincrbyfloat(FerricStore.Instance.t(), binary(), binary(), float()) ::
               binary() | {:error, binary()}
+      def hincrbyfloat(_ctx, _key, field, _delta) when not is_binary(field),
+        do: {:error, "ERR hash field must be a string"}
+
+      def hincrbyfloat(_ctx, _key, _field, delta) when not is_float(delta),
+        do: {:error, "ERR value is not a valid float"}
+
       def hincrbyfloat(ctx, key, field, delta) do
         raft_write(ctx, shard_for(ctx, key), key, {:hincrbyfloat, key, field, delta})
       end
@@ -786,9 +809,127 @@ defmodule Ferricstore.Store.Router.Part09 do
       """
       @spec zincrby(FerricStore.Instance.t(), binary(), number(), binary()) ::
               binary() | {:error, binary()}
+      def zincrby(_ctx, _key, _increment, member) when not is_binary(member),
+        do: {:error, "ERR zincrby member must be a string"}
+
+      def zincrby(_ctx, _key, increment, _member) when not is_float(increment),
+        do: {:error, "ERR value is not a valid float"}
+
       def zincrby(ctx, key, increment, member) do
         raft_write(ctx, shard_for(ctx, key), key, {:zincrby, key, increment, member})
       end
+
+      @doc """
+      Adds one member to the set at `key` as one replicated entry. Returns 1 when
+      the member is new, 0 when it was already there, or `{:error, reason}`.
+      """
+      @spec sadd_single(FerricStore.Instance.t(), binary(), binary()) ::
+              0 | 1 | {:error, term()}
+      def sadd_single(ctx, key, member) when is_binary(key) and is_binary(member),
+        do: raft_write(ctx, shard_for(ctx, key), key, {:sadd_single, key, member})
+
+      @doc """
+      Removes one member from the set at `key` as one replicated entry. Returns 1
+      when it was removed, 0 when it was not there, or `{:error, reason}`.
+      """
+      @spec srem_single(FerricStore.Instance.t(), binary(), binary()) ::
+              0 | 1 | {:error, term()}
+      def srem_single(ctx, key, member) when is_binary(key) and is_binary(member),
+        do: raft_write(ctx, shard_for(ctx, key), key, {:srem_single, key, member})
+
+      @doc """
+      Removes one member from the sorted set at `key` as one replicated entry.
+      Returns 1 when it was removed, 0 when it was not there, or `{:error, reason}`.
+      """
+      @spec zrem_single(FerricStore.Instance.t(), binary(), binary()) ::
+              0 | 1 | {:error, term()}
+      def zrem_single(ctx, key, member) when is_binary(key) and is_binary(member),
+        do: raft_write(ctx, shard_for(ctx, key), key, {:zrem_single, key, member})
+
+      @doc """
+      Applies single-member entries of one key (`{:sadd_single, ...}`,
+      `{:srem_single, ...}`, `{:zadd_single, ...}`, `{:zrem_single, ...}` or
+      `{:hset_single, ...}`) in replicated batches of up to 128 entries. Each
+      entry checks the key's type and reports whether it changed its member, so
+      the replies of racing clients add up to the members actually changed, and
+      a SET applied between batches makes the rest fail with WRONGTYPE instead
+      of writing under the string. Returns the members changed or the first
+      error.
+      """
+      @spec single_member_writes(FerricStore.Instance.t(), binary(), [tuple()]) ::
+              non_neg_integer() | {:error, term()}
+      def single_member_writes(ctx, key, [command]) when is_binary(key),
+        do: sum_single_member_results([raft_write(ctx, shard_for(ctx, key), key, command)], 0)
+
+      def single_member_writes(ctx, key, commands) when is_binary(key) and is_list(commands) do
+        commands
+        |> Enum.chunk_every(@single_member_write_chunk)
+        |> Enum.reduce_while(0, fn chunk, changed ->
+          # The generic batch path: pipeline_write_batch/2 would turn a chunk of
+          # ZADDs into one {:zadd_many_single, ...} entry, which costs about
+          # twice as much to apply on a new key.
+          results = batch_quorum_commands(ctx, Enum.map(chunk, &{key, &1}))
+
+          case sum_single_member_results(results, changed) do
+            {:error, _reason} = error -> {:halt, error}
+            total -> {:cont, total}
+          end
+        end)
+      end
+
+      @doc """
+      Sets several hash fields through `single_member_writes/3`. Returns
+      `:unsupported` where `hset_single/4` would: outside WARaft and for values
+      that go to the blob side channel.
+      """
+      @spec hset_many(FerricStore.Instance.t(), binary(), [{binary(), binary()}]) ::
+              non_neg_integer() | :unsupported | {:error, term()}
+      def hset_many(ctx, key, field_value_pairs) do
+        if selected_waraft_ctx?(ctx) and
+             not Enum.any?(field_value_pairs, fn {_field, value} ->
+               Ferricstore.Raft.BlobCommand.side_channel_candidate?(ctx, {:put, key, value, 0})
+             end) do
+          single_member_writes(
+            ctx,
+            key,
+            Enum.map(field_value_pairs, fn {field, value} -> {:hset_single, key, field, value} end)
+          )
+        else
+          :unsupported
+        end
+      end
+
+      @doc """
+      Runs a command that reads one hash or sorted set, decides and writes it
+      (HDEL, HSETNX, HGETDEL, ZADD or GEOADD with options) as one replicated
+      entry, in which the state machine runs the command's handler on its own
+      store, so concurrent clients each see one outcome. Needs cluster feature
+      level 4 on the key's shard, since older releases do not apply the entry;
+      returns `:unsupported` below it and for custom instances.
+      """
+      @spec compound_command(FerricStore.Instance.t(), binary(), tuple()) :: term()
+      def compound_command(ctx, key, ast) when is_binary(key) and is_tuple(ast) do
+        idx = shard_for(ctx, key)
+
+        if durable_raft_ctx?(ctx) and
+             read_shard_value(ctx, idx, Ferricstore.Cluster.FeatureLevel.key(4)) ==
+               {:ok, Ferricstore.Cluster.FeatureLevel.marker()} do
+          raft_write(ctx, idx, key, {:compound_command, key, ast})
+        else
+          :unsupported
+        end
+      end
+
+      defp sum_single_member_results([], total), do: total
+
+      defp sum_single_member_results([count | rest], total) when is_integer(count),
+        do: sum_single_member_results(rest, total + count)
+
+      defp sum_single_member_results([{:error, _reason} = error | _rest], _total), do: error
+      defp sum_single_member_results({:error, _reason} = error, _total), do: error
+
+      defp sum_single_member_results(_invalid, _total),
+        do: ErrorReasons.write_timeout_unknown()
 
       @doc false
       @spec scan_keys_page(
@@ -1206,6 +1347,11 @@ defmodule Ferricstore.Store.Router.Part09 do
       @spec cas(FerricStore.Instance.t(), binary(), binary(), binary(), non_neg_integer() | nil) ::
               1 | 0 | nil
       def cas(ctx, key, expected, new_value, ttl_ms) do
+        with :ok <- check_optional_ttl_ms(ttl_ms),
+             do: checked_cas(ctx, key, expected, new_value, ttl_ms)
+      end
+
+      defp checked_cas(ctx, key, expected, new_value, ttl_ms) do
         expire_at_ms = if ttl_ms, do: HLC.now_ms() + ttl_ms, else: nil
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
@@ -1283,8 +1429,10 @@ defmodule Ferricstore.Store.Router.Part09 do
       @spec lock(FerricStore.Instance.t(), binary(), binary(), pos_integer()) ::
               :ok | {:error, binary()}
       def lock(ctx, key, owner, ttl_ms) do
-        expire_at_ms = HLC.now_ms() + ttl_ms
-        raft_write(ctx, shard_for(ctx, key), key, {:lock, key, owner, expire_at_ms})
+        with :ok <- check_ttl_ms(ttl_ms) do
+          expire_at_ms = HLC.now_ms() + ttl_ms
+          raft_write(ctx, shard_for(ctx, key), key, {:lock, key, owner, expire_at_ms})
+        end
       end
 
       @spec unlock(FerricStore.Instance.t(), binary(), binary()) :: 1 | {:error, binary()}
@@ -1295,9 +1443,23 @@ defmodule Ferricstore.Store.Router.Part09 do
       @spec extend(FerricStore.Instance.t(), binary(), binary(), pos_integer()) ::
               1 | {:error, binary()}
       def extend(ctx, key, owner, ttl_ms) do
-        expire_at_ms = HLC.now_ms() + ttl_ms
-        raft_write(ctx, shard_for(ctx, key), key, {:extend, key, owner, expire_at_ms})
+        with :ok <- check_ttl_ms(ttl_ms) do
+          expire_at_ms = HLC.now_ms() + ttl_ms
+          raft_write(ctx, shard_for(ctx, key), key, {:extend, key, owner, expire_at_ms})
+        end
       end
+
+      # The LOCK, EXTEND and CAS commands' TTL bound. A float TTL made a float
+      # expiry, which raised while the shard applied it, on every replay too.
+      defp check_ttl_ms(ttl_ms)
+           when is_integer(ttl_ms) and ttl_ms > 0 and
+                  ttl_ms <= 9_223_372_036_854_775_807 - 281_474_976_710_656 + 1,
+           do: :ok
+
+      defp check_ttl_ms(_ttl_ms), do: {:error, "ERR value is not an integer or out of range"}
+
+      defp check_optional_ttl_ms(nil), do: :ok
+      defp check_optional_ttl_ms(ttl_ms), do: check_ttl_ms(ttl_ms)
 
       @spec fetch_or_compute_lock(FerricStore.Instance.t(), binary(), binary(), pos_integer()) ::
               :ok | {:error, term()}
@@ -1416,12 +1578,14 @@ defmodule Ferricstore.Store.Router.Part09 do
               pos_integer()
             ) :: [term()]
       def ratelimit_add(ctx, key, window_ms, max, count) do
-        raft_write(
-          ctx,
-          shard_for(ctx, key),
-          key,
-          {:ratelimit_add, key, window_ms, max, count}
-        )
+        with :ok <- Ferricstore.Store.RateLimit.validate_args(window_ms, max, count) do
+          raft_write(
+            ctx,
+            shard_for(ctx, key),
+            key,
+            {:ratelimit_add, key, window_ms, max, count}
+          )
+        end
       end
 
       # -------------------------------------------------------------------

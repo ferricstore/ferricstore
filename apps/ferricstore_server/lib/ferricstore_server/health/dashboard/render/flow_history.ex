@@ -565,11 +565,26 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
 
   def normalize_flow_history_entry(entry), do: {"-", %{raw: inspect(entry, limit: 5)}}
 
+  @doc """
+  Sort key for a journal event ID. IDs are "<ms>-<seq>"; the parts compare as
+  numbers so "1000-10" follows "1000-9". Anything else sorts after, by its text.
+  """
+  def flow_history_event_order(event_id) do
+    with id when is_binary(id) <- event_id,
+         [ms, seq] <- String.split(id, "-", parts: 2),
+         {ms, ""} <- Integer.parse(ms),
+         {seq, ""} <- Integer.parse(seq) do
+      {0, ms, seq, ""}
+    else
+      _other -> {1, 0, 0, to_string(event_id)}
+    end
+  end
+
   def flow_history_timeline_rows(history) do
     history
     |> Enum.map(&normalize_flow_history_entry/1)
     |> Enum.sort_by(fn {event_id, fields} ->
-      {flow_history_event_time_ms(event_id, fields), to_string(event_id)}
+      {flow_history_event_time_ms(event_id, fields), flow_history_event_order(event_id)}
     end)
     |> Enum.map_reduce(nil, fn {event_id, fields}, previous_state ->
       current_state = flow_history_current_state(fields)

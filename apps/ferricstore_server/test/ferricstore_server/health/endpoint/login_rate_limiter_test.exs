@@ -222,7 +222,7 @@ defmodule FerricstoreServer.AuthRateLimiterTest do
     assert {:ok, _other_reservation} =
              AuthRateLimiter.permit({10, 2, 3, 2}, "evicting-user", "password")
 
-    assert {:ok, _current_reservation} =
+    assert {:ok, current_reservation} =
              AuthRateLimiter.permit(peer, username, "password")
 
     :sys.replace_state(AuthRateLimiter, fn state ->
@@ -235,6 +235,7 @@ defmodule FerricstoreServer.AuthRateLimiterTest do
     end)
 
     assert :ok = AuthRateLimiter.release_success(stale_reservation)
+    assert :ok = AuthRateLimiter.release_failure(current_reservation)
     assert :ok = AuthRateLimiter.check(peer, username)
     assert {:error, retry_after_ms} = AuthRateLimiter.check(peer, username)
     assert retry_after_ms > 0
@@ -291,6 +292,90 @@ defmodule FerricstoreServer.AuthRateLimiterTest do
              {{:user, digest}, _entry} -> byte_size(digest) == 32
              _other -> false
            end)
+  end
+
+  test "a burst of successful logins waits for in-flight checks instead of being refused" do
+    username = "rate-limit-pool"
+    assert :ok = Acl.set_user(username, ["on", ">stored"])
+    on_exit(fn -> Acl.del_user(username) end)
+
+    verifier = fn password, _stored_hash ->
+      Process.sleep(100)
+      password == "valid"
+    end
+
+    results =
+      1..6
+      |> Enum.map(fn port ->
+        Task.async(fn ->
+          AuthRateLimiter.authenticate(
+            {{10, 5, 0, 1}, 50_000 + port},
+            username,
+            "valid",
+            verifier
+          )
+        end)
+      end)
+      |> Task.await_many(10_000)
+
+    assert Enum.all?(results, &(&1 == {:ok, username})), inspect(results)
+  end
+
+  test "an attempt waiting on in-flight checks is refused once they fail" do
+    username = "rate-limit-pool-failure"
+    test_pid = self()
+    assert :ok = Acl.set_user(username, ["on", ">stored"])
+    on_exit(fn -> Acl.del_user(username) end)
+
+    verifier = fn password, _stored_hash ->
+      send(test_pid, {:password_verified, password})
+      Process.sleep(150)
+      password == "valid"
+    end
+
+    failing =
+      for port <- 1..2 do
+        Task.async(fn ->
+          AuthRateLimiter.authenticate({{10, 5, 1, 1}, port}, username, "wrong", verifier)
+        end)
+      end
+
+    assert_receive {:password_verified, "wrong"}
+    assert_receive {:password_verified, "wrong"}
+
+    assert {:error, {:rate_limited, retry_after_ms}} =
+             AuthRateLimiter.authenticate({{10, 5, 1, 1}, 3}, username, "valid", verifier)
+
+    assert retry_after_ms > 1_000
+
+    assert Enum.all?(
+             Task.await_many(failing),
+             &match?({:error, reason} when is_binary(reason), &1)
+           )
+
+    refute_received {:password_verified, "valid"}
+  end
+
+  test "a reservation whose caller exits counts as a failed attempt" do
+    peer = {10, 5, 2, 1}
+    test_pid = self()
+
+    holder =
+      spawn(fn ->
+        {:ok, _reservation} = AuthRateLimiter.permit(peer, "abandoned-user", "password")
+        send(test_pid, :reserved)
+      end)
+
+    assert_receive :reserved
+    ref = Process.monitor(holder)
+    assert_receive {:DOWN, ^ref, :process, ^holder, _reason}
+
+    %{entries: entries} = :sys.get_state(AuthRateLimiter)
+    assert %{count: 1, in_flight: 0} = Map.fetch!(entries, {:ip, "10.5.2.1"})
+
+    assert :ok = AuthRateLimiter.check(peer, "abandoned-user")
+    assert {:error, retry_after_ms} = AuthRateLimiter.check(peer, "abandoned-user")
+    assert retry_after_ms > 1_000
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)

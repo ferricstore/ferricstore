@@ -51,6 +51,10 @@ MessagePack binary values use the MessagePack binary type and do not incur base6
 For compatibility, `{"commands":[["PING"]]}` is accepted. It is suitable only for JSON/UTF-8-safe
 commands and values. New SDK integrations should use binary-safe JSON or MessagePack.
 
+A JSON response cannot carry bytes that are not UTF-8, so a command whose reply holds such bytes
+returns a `binary_reply` command error in its position; the rest of the batch is unaffected. Use
+the binary-safe JSON or MessagePack encoding to read binary values.
+
 ## Success response
 
 HTTP `200` means the batch was accepted and executed in order. Individual command failures remain
@@ -123,6 +127,9 @@ the created invocation id and initial state. An idempotency key may be supplied 
 `GET /v1/invocations/:id` returns the underlying Flow record. `GET
 /v1/invocations/:id/result` returns HTTP `202` while the record is pending and HTTP `200` after it
 reaches a terminal state.
+
+An HTTP endpoint target's JSON response becomes the result. A response that is not JSON is kept as
+a string when it is UTF-8 text, and otherwise as `{"status": <HTTP status>, "bytes_base64": "..."}`.
 
 Invocation-scoped values use these routes:
 

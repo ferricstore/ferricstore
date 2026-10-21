@@ -467,7 +467,8 @@ defmodule FerricStore.API.Probabilistic do
   @spec topk_reserve(key(), pos_integer()) :: :ok | {:error, binary()}
   def topk_reserve(key, k) do
     store = build_topk_store(key)
-    TopK.handle_ast({:topk_reserve, key, k, 8, 7}, store)
+    width = if is_integer(k) and k > 0, do: TopK.default_width(k), else: 8
+    TopK.handle_ast({:topk_reserve, key, k, width, TopK.default_depth()}, store)
   end
 
   @doc """

@@ -90,17 +90,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       defp async_key_present?(state, {:setrange, key, _off, _v}), do: ets_has?(state.ets, key)
       defp async_key_present?(state, {:setbit, key, _off, _bit}), do: ets_has?(state.ets, key)
 
-      defp async_key_present?(state, {:hincrby, key, field, _delta}) do
+      defp async_key_present?(state, {:hincrby, key, field, _delta}) when is_binary(field) do
         ets_has?(state.ets, Ferricstore.Store.CompoundKey.hash_field(key, field))
       end
 
-      defp async_key_present?(state, {:hincrbyfloat, key, field, _delta}) do
+      defp async_key_present?(state, {:hincrbyfloat, key, field, _delta})
+           when is_binary(field) do
         ets_has?(state.ets, Ferricstore.Store.CompoundKey.hash_field(key, field))
       end
 
-      defp async_key_present?(state, {:zincrby, key, _incr, member}) do
+      defp async_key_present?(state, {:zincrby, key, _incr, member}) when is_binary(member) do
         ets_has?(state.ets, Ferricstore.Store.CompoundKey.zset_member(key, member))
       end
+
+      # A malformed field or member was never written; apply_single rejects it.
+      defp async_key_present?(_state, {command, _key, _field, _delta})
+           when command in [:hincrby, :hincrbyfloat],
+           do: false
+
+      defp async_key_present?(_state, {:zincrby, _key, _incr, _member}), do: false
 
       # List ops check the canonical type marker written by the origin before
       # submit. On replicas the marker is absent, so they apply the inner op.
@@ -454,20 +462,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       defp apply_single(state, {:compound_put, compound_key, value, expire_at_ms}) do
         redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
 
-        case check_fetch_or_compute_lock(state, redis_key, nil) do
-          :ok -> do_compound_put(state, redis_key, compound_key, value, expire_at_ms)
-          {:error, _reason} = error -> error
+        with :ok <- check_fetch_or_compute_lock(state, redis_key, nil),
+             :ok <- check_member_write_type(state, redis_key, [compound_key]) do
+          do_compound_put(state, redis_key, compound_key, value, expire_at_ms)
         end
       end
+
+      defp apply_single(state, {:compound_command, redis_key, ast}),
+        do: do_compound_command(state, redis_key, ast)
 
       defp apply_single(state, {:compound_put_blob_ref, compound_key, encoded_ref, expire_at_ms}) do
         do_checked_compound_put_blob_ref(state, compound_key, encoded_ref, expire_at_ms)
       end
 
       defp apply_single(state, {:compound_batch_put, redis_key, entries}) do
-        case apply_compound_batch_put_entries(state, redis_key, entries) do
-          results when is_list(results) -> :ok
-          {:error, _reason} = error -> error
+        with :ok <- check_member_write_type(state, redis_key, compound_entry_keys(entries)) do
+          case apply_compound_batch_put_entries(state, redis_key, entries) do
+            results when is_list(results) -> :ok
+            {:error, _reason} = error -> error
+          end
         end
       end
 
@@ -963,9 +976,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       end
 
       defp apply_single(state, {:compound_blob_batch_put, redis_key, entries}) do
-        case apply_compound_blob_batch_put_entries(state, redis_key, entries) do
-          results when is_list(results) -> :ok
-          {:error, _reason} = error -> error
+        with :ok <- check_member_write_type(state, redis_key, compound_entry_keys(entries)) do
+          case apply_compound_blob_batch_put_entries(state, redis_key, entries) do
+            results when is_list(results) -> :ok
+            {:error, _reason} = error -> error
+          end
         end
       end
 
@@ -994,9 +1009,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         end
       end
 
-      defp apply_single(state, {:pfadd, key, elements}) do
-        HyperLogLog.handle_ast({:pfadd, [key | elements]}, build_string_value_store(state))
-      end
+      defp apply_single(state, {:pfadd, key, elements}), do: do_pfadd(state, key, elements)
 
       defp apply_single(state, {:pfmerge, dest_key, source_sketches}) do
         do_pfmerge(state, dest_key, source_sketches)

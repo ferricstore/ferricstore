@@ -470,6 +470,76 @@ defmodule Ferricstore.Store.Ops do
 
   def incr(store, key, delta) when is_map(store), do: store.incr.(key, delta)
 
+  @doc """
+  Atomically adds `delta` to a hash field: one replicated read-modify-write.
+  """
+  @spec hincrby(FerricStore.Instance.t(), binary(), binary(), integer()) ::
+          integer() | {:error, term()}
+  def hincrby(%FerricStore.Instance{} = ctx, key, field, delta),
+    do: Router.hincrby(ctx, key, field, delta)
+
+  @doc """
+  Atomically adds `increment` to a sorted set member's score; returns the new
+  score as stored.
+  """
+  @spec zincrby(FerricStore.Instance.t(), binary(), float(), binary()) ::
+          binary() | {:error, term()}
+  def zincrby(%FerricStore.Instance{} = ctx, key, increment, member),
+    do: Router.zincrby(ctx, key, increment, member)
+
+  @doc "Atomically pops from a set: one replicated read-modify-write."
+  @spec spop(FerricStore.Instance.t(), binary(), non_neg_integer() | nil) ::
+          binary() | [binary()] | nil | {:error, term()}
+  def spop(%FerricStore.Instance{} = ctx, key, count), do: Router.spop(ctx, key, count)
+
+  @doc "Atomically pops the lowest-scored sorted set members."
+  @spec zpopmin(FerricStore.Instance.t(), binary(), non_neg_integer()) ::
+          [binary()] | {:error, term()}
+  def zpopmin(%FerricStore.Instance{} = ctx, key, count), do: Router.zpopmin(ctx, key, count)
+
+  @doc "Atomically pops the highest-scored sorted set members."
+  @spec zpopmax(FerricStore.Instance.t(), binary(), non_neg_integer()) ::
+          [binary()] | {:error, term()}
+  def zpopmax(%FerricStore.Instance{} = ctx, key, count), do: Router.zpopmax(ctx, key, count)
+
+  @doc "Atomically adds one set member: one replicated entry that reports whether it was new."
+  @spec sadd_single(FerricStore.Instance.t(), binary(), binary()) :: 0 | 1 | {:error, term()}
+  def sadd_single(%FerricStore.Instance{} = ctx, key, member),
+    do: Router.sadd_single(ctx, key, member)
+
+  @doc "Atomically removes one set member: one replicated entry that reports whether it was there."
+  @spec srem_single(FerricStore.Instance.t(), binary(), binary()) :: 0 | 1 | {:error, term()}
+  def srem_single(%FerricStore.Instance{} = ctx, key, member),
+    do: Router.srem_single(ctx, key, member)
+
+  @doc "Atomically removes one sorted set member: one replicated entry that reports whether it was there."
+  @spec zrem_single(FerricStore.Instance.t(), binary(), binary()) :: 0 | 1 | {:error, term()}
+  def zrem_single(%FerricStore.Instance{} = ctx, key, member),
+    do: Router.zrem_single(ctx, key, member)
+
+  @doc """
+  Applies single-member entries of one key in replicated batches; returns the
+  members changed. See `Ferricstore.Store.Router.single_member_writes/3`.
+  """
+  @spec single_member_writes(FerricStore.Instance.t(), binary(), [tuple()]) ::
+          non_neg_integer() | {:error, term()}
+  def single_member_writes(%FerricStore.Instance{} = ctx, key, commands),
+    do: Router.single_member_writes(ctx, key, commands)
+
+  @doc "Atomically adds elements to a HyperLogLog: one replicated sketch update."
+  @spec pfadd(FerricStore.Instance.t(), binary(), [binary()]) :: 0 | 1 | {:error, term()}
+  def pfadd(%FerricStore.Instance{} = ctx, key, elements),
+    do: Router.pfadd(ctx, key, elements)
+
+  @doc """
+  Atomically adds the float `delta` to a hash field; returns the new value as
+  stored.
+  """
+  @spec hincrbyfloat(FerricStore.Instance.t(), binary(), binary(), float()) ::
+          binary() | {:error, term()}
+  def hincrbyfloat(%FerricStore.Instance{} = ctx, key, field, delta),
+    do: Router.hincrbyfloat(ctx, key, field, delta)
+
   defp checked_integer_add(value, delta) do
     result = value + delta
 
@@ -799,6 +869,23 @@ defmodule Ferricstore.Store.Ops do
     do: fun.(key, field, value)
 
   def hset_single(_store, _key, _field, _value), do: :unsupported
+
+  @spec hset_many(store(), binary(), [{binary(), binary()}]) ::
+          non_neg_integer() | :unsupported | {:error, term()}
+  def hset_many(%FerricStore.Instance{} = ctx, key, field_value_pairs),
+    do: Router.hset_many(ctx, key, field_value_pairs)
+
+  def hset_many(_store, _key, _field_value_pairs), do: :unsupported
+
+  @doc """
+  Runs a read-decide-write hash or sorted set command in one replicated entry
+  at cluster feature level 4. See `Ferricstore.Store.Router.compound_command/3`.
+  """
+  @spec compound_command(store(), binary(), tuple()) :: term()
+  def compound_command(%FerricStore.Instance{} = ctx, key, ast),
+    do: Router.compound_command(ctx, key, ast)
+
+  def compound_command(_store, _key, _ast), do: :unsupported
 
   def compound_get(store, redis_key, compound_key),
     do: CompoundOps.compound_get(store, redis_key, compound_key)

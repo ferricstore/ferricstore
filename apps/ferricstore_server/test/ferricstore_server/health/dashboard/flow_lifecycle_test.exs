@@ -23,6 +23,33 @@ defmodule FerricstoreServer.Health.Dashboard.FlowLifecycleTest do
     assert length(Regex.scan(~r/is-current/, html)) == 1
   end
 
+  test "events in the same millisecond keep their sequence order past nine" do
+    events =
+      for seq <- 1..11 do
+        state = if seq < 11, do: "queued", else: "running"
+        {"1000-#{seq}", %{"event" => "step", "state" => state}}
+      end
+
+    html = FlowDetail.render_flow_lifecycle(data("running", Enum.reverse(events)))
+
+    assert states(html) == ["queued", "running"]
+  end
+
+  test "the journal orders same-millisecond events by sequence number" do
+    history =
+      for seq <- [10, 2, 1],
+          do: {"1000-#{seq}", %{"event" => "step", "state" => "s#{seq}"}}
+
+    rows = FlowHistory.flow_history_timeline_rows(history)
+
+    # Newest first: 10 after 2 after 1, each moving from the one before it.
+    assert Enum.map(rows, &{&1.event_id, &1.from_state, &1.to_state}) == [
+             {"1000-10", "s2", "s10"},
+             {"1000-2", "s1", "s2"},
+             {"1000-1", "", "s1"}
+           ]
+  end
+
   test "an expired lease is the current step, with a way to recovery" do
     now = System.system_time(:millisecond)
 

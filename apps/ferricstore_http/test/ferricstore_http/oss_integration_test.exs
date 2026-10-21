@@ -114,6 +114,33 @@ defmodule FerricstoreHttp.OssIntegrationTest do
     assert {:ok, "PONG"} = BinaryEnvelope.decode(encoded_ping_after)
   end
 
+  test "a blocking command cut off by the request deadline answers deadline_exceeded" do
+    :ok = CatalogProjector.mark_ready()
+    unique = System.unique_integer([:positive, :monotonic])
+    username = "http-blocking-deadline-#{unique}"
+    password = "integration-secret"
+    key = "http:blocking:deadline:#{unique}"
+    configure_all_command_user(username, password, "~http:blocking:*")
+
+    HttpHelpers.start_server(
+      backend: FerricstoreHttp.Backends.Ferricstore,
+      request_timeout_ms: 300
+    )
+
+    assert {200, _headers, body} = command_request(username, password, [["BLPOP", key, "0"]])
+
+    assert %{
+             "results" => [
+               %{
+                 "status" => "error",
+                 "error" => %{"code" => "deadline_exceeded", "message" => message}
+               }
+             ]
+           } = Jason.decode!(body)
+
+    assert message =~ "deadline exceeded"
+  end
+
   test "rejects an invalid stateless batch before executing any command" do
     :ok = CatalogProjector.mark_ready()
     unique = System.unique_integer([:positive, :monotonic])
@@ -458,6 +485,60 @@ defmodule FerricstoreHttp.OssIntegrationTest do
     assert %{"error" => %{"code" => "rate_limited"}} = Jason.decode!(body)
   end
 
+  test "a pool of connections opening at once all authenticate" do
+    previous_max_attempts = Application.get_env(:ferricstore, :auth_rate_limit_max_attempts)
+
+    Application.put_env(:ferricstore, :auth_rate_limit_max_attempts, 2)
+    :ok = AuthRateLimiter.reset()
+
+    on_exit(fn ->
+      restore_env(:auth_rate_limit_max_attempts, previous_max_attempts)
+      AuthRateLimiter.reset()
+    end)
+
+    :ok = CatalogProjector.mark_ready()
+    unique = System.unique_integer([:positive, :monotonic])
+    username = "http-pool-#{unique}"
+    password = "integration-secret"
+    configure_all_command_user(username, password, "~*")
+    HttpHelpers.start_server(backend: FerricstoreHttp.Backends.Ferricstore)
+
+    body =
+      Jason.encode!(%{
+        "encoding" => BinaryEnvelope.encoding(),
+        "commands" => BinaryEnvelope.encode([["PING"]])
+      })
+
+    {"authorization", authorization} = HttpHelpers.basic(username, password)
+
+    request = [
+      "POST /v1/commands HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: ",
+      authorization,
+      "\r\ncontent-type: application/json\r\ncontent-length: ",
+      Integer.to_string(byte_size(body)),
+      "\r\n\r\n",
+      body
+    ]
+
+    statuses =
+      1..20
+      |> Enum.map(fn _connection ->
+        Task.async(fn ->
+          {:ok, socket} = HttpHelpers.connect()
+
+          try do
+            {:ok, status, _headers, _body} = HttpHelpers.raw_request(socket, request, 10_000)
+            status
+          after
+            :gen_tcp.close(socket)
+          end
+        end)
+      end)
+      |> Task.await_many(15_000)
+
+    assert Enum.frequencies(statuses) == %{200 => 20}
+  end
+
   defp command_request(username, password, commands) do
     envelope = %{
       "encoding" => BinaryEnvelope.encoding(),
@@ -483,6 +564,46 @@ defmodule FerricstoreHttp.OssIntegrationTest do
                "+@all",
                key_pattern
              ])
+  end
+
+  test "a JSON reply that is not valid UTF-8 is that command's error, not a failed batch" do
+    :ok = CatalogProjector.mark_ready()
+    unique = System.unique_integer([:positive, :monotonic])
+    username = "http-utf8-#{unique}"
+    password = "integration-secret"
+    key = "http:utf8:#{unique}"
+
+    assert :ok =
+             FerricstoreServer.Acl.set_user(username, [
+               "on",
+               ">#{password}",
+               "+SET",
+               "+GET",
+               "+GETRANGE",
+               "~http:utf8:*"
+             ])
+
+    HttpHelpers.start_server(backend: FerricstoreHttp.Backends.Ferricstore)
+
+    # The first byte of a two-byte character is not valid UTF-8 on its own.
+    commands = [["SET", key, "é"], ["GETRANGE", key, "0", "0"], ["GET", key]]
+
+    assert {200, _headers, body} =
+             HttpHelpers.request(
+               :post,
+               "/v1/commands",
+               "application/json",
+               [HttpHelpers.basic(username, password)],
+               Jason.encode!(%{"commands" => commands})
+             )
+
+    assert %{
+             "results" => [
+               %{"status" => "ok", "value" => "OK"},
+               %{"status" => "error", "error" => %{"code" => "binary_reply"}},
+               %{"status" => "ok", "value" => "é"}
+             ]
+           } = Jason.decode!(body)
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)

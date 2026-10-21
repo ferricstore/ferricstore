@@ -630,6 +630,14 @@ defmodule FerricStore.API.Strings do
 
   """
   @spec setrange(key(), non_neg_integer(), binary()) :: {:ok, non_neg_integer()}
+  # An empty value writes nothing and answers the current length, as Redis does.
+  def setrange(key, offset, "") when is_integer(offset) and offset >= 0 do
+    case Strings.handle_ast({:setrange, key, offset, ""}, default_ctx()) do
+      {:error, _} = err -> err
+      len -> {:ok, len}
+    end
+  end
+
   def setrange(key, offset, value) do
     ctx = default_ctx()
 

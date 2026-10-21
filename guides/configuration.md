@@ -1008,7 +1008,7 @@ telemetry event is emitted on every successful `CONFIG SET`.
 | Parameter | Description | Applies to |
 |-----------|-------------|------------|
 | `maxmemory-policy` | Eviction policy (`volatile-lru`, `allkeys-lru`, `volatile-ttl`, `noeviction`) | Both |
-| `notify-keyspace-events` | Keyspace notification flag string | Standalone only |
+| `notify-keyspace-events` | Keyspace notification flags (Redis's `K`, `E`, `g`, `$`, `h`, `l`, `s`, `z`, `t`, `A`). Commands from native and HTTP clients, including MULTI and pipelines, publish `__keyspace@0__:<key>` and `__keyevent@0__:<event>` messages on the node that ran them; embedded API calls and expirations do not | Standalone only |
 | `slowlog-log-slower-than` | Slowlog threshold in microseconds | Both |
 | `slowlog-max-len` | Maximum slowlog entries | Both |
 | `hz` | Server tick frequency (1-500) | Standalone only |

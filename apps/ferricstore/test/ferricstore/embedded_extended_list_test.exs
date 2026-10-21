@@ -95,9 +95,35 @@ defmodule Ferricstore.EmbeddedExtendedListTest do
       assert {:error, _} = FerricStore.lset(key, -4, "X")
       assert {:ok, ["a", "b", "c"]} = FerricStore.lrange(key, 0, -1)
     end
+
+    test "rejects a non-integer index and the shard keeps applying writes" do
+      key = "ls:bad-index"
+      assert {:ok, 2} = FerricStore.rpush(key, ["a", "b"])
+
+      for index <- [0.0, "0"] do
+        assert {:error, "ERR value is not an integer or out of range"} =
+                 FerricStore.lset(key, index, "X")
+      end
+
+      assert :ok = FerricStore.lset(key, 0, "X")
+      assert {:ok, ["X", "b"]} = FerricStore.lrange(key, 0, -1)
+    end
   end
 
   describe "lrem/3" do
+    test "rejects a non-integer count and the shard keeps applying writes" do
+      key = "lr:bad-count"
+      assert {:ok, 2} = FerricStore.rpush(key, ["a", "a"])
+
+      for count <- [1.0, "1"] do
+        assert {:error, "ERR value is not an integer or out of range"} =
+                 FerricStore.lrem(key, count, "a")
+      end
+
+      assert {:ok, 1} = FerricStore.lrem(key, 1, "a")
+      assert {:ok, ["a"]} = FerricStore.lrange(key, 0, -1)
+    end
+
     test "removes all occurrences with count 0" do
       FerricStore.rpush("lr:key", ["a", "b", "a", "c", "a"])
       assert {:ok, 3} = FerricStore.lrem("lr:key", 0, "a")

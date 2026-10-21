@@ -8,6 +8,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       alias Ferricstore.Flow.HistoryProjector
       alias Ferricstore.Flow.Keys, as: FlowKeys
       alias Ferricstore.Flow.LMDB, as: FlowLMDB
+      alias Ferricstore.Raft.PromotedFileSync
       alias Ferricstore.Raft.StateMachine
       alias Ferricstore.Raft.CommandStamp
       alias Ferricstore.Raft.ApplyFailure
@@ -455,7 +456,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       end
 
       defp maybe_mark_clean_position(%{bitcask_dirty?: false, position: position} = handle) do
-        if replay_dependencies_ready?(handle) do
+        if replay_dependencies_ready?(handle) and
+             PromotedFileSync.synced?(Map.get(handle, :promoted_sync)) do
           handle
           |> Map.put(:last_clean_position, position)
           |> clear_replay_dependencies()
@@ -538,7 +540,12 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
             position: position,
             keydir: keydir,
             ref: ref,
-            storage_name: storage_name
+            storage_name: storage_name,
+            promoted_sync_table:
+              case Map.get(handle, :promoted_sync) do
+                %{table: table} -> table
+                nil -> nil
+              end
           }
 
           {:ok, pid} =
@@ -827,7 +834,16 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
               emit_segment_projection_checkpoint_start(metadata)
               call_segment_projection_checkpoint_hook(:before_write, metadata)
 
-              {metadata, write_and_adopt_segment_projection_checkpoint(job, metadata, entries)}
+              # Recovery may start from this checkpoint, so the dedicated-file
+              # writes up to its cut must be on disk first.
+              case PromotedFileSync.sync_tracked(Map.get(job, :promoted_sync_table)) do
+                :ok ->
+                  {metadata,
+                   write_and_adopt_segment_projection_checkpoint(job, metadata, entries)}
+
+                {:error, reason} ->
+                  {metadata, {:error, reason}}
+              end
 
             :unavailable ->
               {metadata, {:error, {:segment_keydir_unavailable, job.shard_index}}}

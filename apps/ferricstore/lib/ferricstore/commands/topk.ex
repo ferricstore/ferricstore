@@ -13,7 +13,6 @@ defmodule Ferricstore.Commands.TopK do
   alias Ferricstore.Store.Ops
 
   @prob_read_timeout_ms 5_000
-  @default_width 8
   @default_depth 7
   @max_topk_k 100_000
   @max_topk_cms_counters 1_048_576
@@ -54,6 +53,21 @@ defmodule Ferricstore.Commands.TopK do
   def handle_ast({:topk_list, key, true}, store), do: do_list_with_count(key, store)
 
   @spec handle(binary(), [binary()], map()) :: term()
+  @doc """
+  The Count-Min width TOPK.RESERVE uses when it is given only k: 64 counters
+  a row per tracked item, between 256 and 16,384. Redis's default width (8)
+  suits its HeavyKeeper sketch; a Count-Min sketch that narrow folds every
+  item into eight counters a row, so light items outranked the real heavy
+  hitters and counts came out several times too high.
+  """
+  @spec default_width(pos_integer()) :: pos_integer()
+  def default_width(k) when is_integer(k) and k > 0,
+    do: (k * 64) |> max(256) |> min(16_384)
+
+  @doc false
+  @spec default_depth() :: pos_integer()
+  def default_depth, do: @default_depth
+
   def handle(cmd, args, store)
 
   # ---------------------------------------------------------------------------
@@ -61,7 +75,9 @@ defmodule Ferricstore.Commands.TopK do
   # ---------------------------------------------------------------------------
 
   def handle("TOPK.RESERVE", [key, k_str], store) do
-    do_reserve(key, k_str, @default_width, @default_depth, store)
+    with {:ok, k} <- parse_pos_integer(k_str, "k") do
+      do_reserve(key, k_str, default_width(k), @default_depth, store)
+    end
   end
 
   def handle("TOPK.RESERVE", [key, k_str, width_str, depth_str], store) do

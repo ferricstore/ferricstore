@@ -1282,6 +1282,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       end
 
       defp do_cas_blob_ref(state, key, expected, encoded_ref, expire_at_ms) do
+        with :ok <- check_optional_expire_at(expire_at_ms),
+             do: apply_cas_blob_ref(state, key, expected, encoded_ref, expire_at_ms)
+      end
+
+      defp apply_cas_blob_ref(state, key, expected, encoded_ref, expire_at_ms) do
         case ets_lookup(state, key) do
           {:hit, ^expected, old_exp} ->
             with {:ok, materialized} <- materialize_blob_ref(state, encoded_ref) do
@@ -1324,12 +1329,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       defp do_checked_compound_put_blob_ref(state, compound_key, encoded_ref, expire_at_ms) do
         redis_key = CompoundKey.extract_redis_key(compound_key)
 
-        case check_fetch_or_compute_lock(state, redis_key, nil) do
-          :ok ->
-            do_compound_put_blob_ref(state, redis_key, compound_key, encoded_ref, expire_at_ms)
-
-          {:error, _reason} = error ->
-            error
+        with :ok <- check_fetch_or_compute_lock(state, redis_key, nil),
+             :ok <- check_member_write_type(state, redis_key, [compound_key]) do
+          do_compound_put_blob_ref(state, redis_key, compound_key, encoded_ref, expire_at_ms)
         end
       end
     end

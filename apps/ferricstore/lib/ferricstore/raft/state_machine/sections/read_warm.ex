@@ -16,6 +16,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       alias Ferricstore.Commands.HyperLogLog
       alias Ferricstore.ExpiryContext
       alias Ferricstore.Raft.BlobCommand
+      alias Ferricstore.Raft.PromotedFileSync
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
       alias Ferricstore.Flow.HistoryProjector
@@ -645,7 +646,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         }
       end
 
+      # The HyperLogLog handlers' own type check needs a compound store, which
+      # the string store does not have: on a hash, set, zset, list or stream
+      # key it raised in apply and crash-looped the shard. The state machine's
+      # check answers WRONGTYPE first.
+      defp do_pfadd(state, key, elements) do
+        with :ok <- ensure_string_key(state, key) do
+          HyperLogLog.handle_ast({:pfadd, [key | elements]}, build_string_value_store(state))
+        end
+      end
+
       defp do_pfmerge(state, dest_key, source_sketches) when is_list(source_sketches) do
+        with :ok <- ensure_string_key(state, dest_key) do
+          do_checked_pfmerge(state, dest_key, source_sketches)
+        end
+      end
+
+      defp do_checked_pfmerge(state, dest_key, source_sketches) do
         source_keys =
           source_sketches
           |> Enum.with_index()
@@ -692,6 +709,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           end,
           compound_get: fn redis_key, compound_key ->
             sm_store_compound_get(state, redis_key, compound_key)
+          end,
+          compound_get_meta: fn redis_key, compound_key ->
+            sm_store_compound_get_meta(state, redis_key, compound_key)
           end,
           compound_put: fn redis_key, compound_key, value, expire_at_ms ->
             do_compound_put(state, redis_key, compound_key, value, expire_at_ms)
@@ -1955,21 +1975,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       if Mix.env() == :test do
         defp append_promoted_record(path, key, value, expire_at_ms) do
           case promoted_append_test_hook(:record, path, {key, value, expire_at_ms}) do
-            :passthrough -> NIF.v2_append_record(path, key, value, expire_at_ms)
+            :passthrough -> PromotedFileSync.append_record(path, key, value, expire_at_ms)
             result -> result
           end
         end
 
         defp append_promoted_tombstone(path, key) do
           case promoted_append_test_hook(:tombstone, path, key) do
-            :passthrough -> NIF.v2_append_tombstone(path, key)
+            :passthrough -> PromotedFileSync.append_tombstone(path, key)
             result -> result
           end
         end
 
         defp append_promoted_batch(path, entries) do
           case promoted_append_test_hook(:batch, path, entries) do
-            :passthrough -> NIF.v2_append_batch(path, entries)
+            :passthrough -> PromotedFileSync.append_batch(path, entries)
             result -> result
           end
         end
@@ -1981,14 +2001,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           end
         end
       else
+        # The WARaft storage process skips the fsync and syncs before it
+        # persists past the write; any other caller appends with an fsync.
         defp append_promoted_record(path, key, value, expire_at_ms),
-          do: NIF.v2_append_record(path, key, value, expire_at_ms)
+          do: PromotedFileSync.append_record(path, key, value, expire_at_ms)
 
         defp append_promoted_tombstone(path, key),
-          do: NIF.v2_append_tombstone(path, key)
+          do: PromotedFileSync.append_tombstone(path, key)
 
         defp append_promoted_batch(path, entries),
-          do: NIF.v2_append_batch(path, entries)
+          do: PromotedFileSync.append_batch(path, entries)
       end
     end
   end

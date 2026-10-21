@@ -1,6 +1,8 @@
 defmodule Ferricstore.Flow.Governance.Effect do
   @moduledoc false
 
+  alias Ferricstore.Flow.Governance.Args
+
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.Codec
   alias Ferricstore.Flow.Governance.AtomicRecord
@@ -60,8 +62,13 @@ defmodule Ferricstore.Flow.Governance.Effect do
     })
   end
 
-  def reserve(_ctx, _id, _effect_key, _effect_type, _opts),
-    do: {:error, "ERR flow effect opts must be a keyword list"}
+  def reserve(_ctx, id, effect_key, effect_type, _opts),
+    do:
+      Args.error("effect", [
+        {:id, id, :string},
+        {:effect_key, effect_key, :string},
+        {:effect_type, effect_type, :string}
+      ])
 
   def confirm(ctx, id, effect_key, opts \\ []) do
     update_status(ctx, id, effect_key, :confirmed, opts)
@@ -102,8 +109,8 @@ defmodule Ferricstore.Flow.Governance.Effect do
     end
   end
 
-  def get(_ctx, _id, _effect_key, _opts),
-    do: {:error, "ERR flow effect opts must be a keyword list"}
+  def get(_ctx, id, effect_key, _opts),
+    do: Args.error("effect", [{:id, id, :string}, {:effect_key, effect_key, :string}])
 
   defp update_status(ctx, id, effect_key, status, opts)
        when is_binary(id) and is_binary(effect_key) and status in @terminal_statuses and
@@ -143,8 +150,8 @@ defmodule Ferricstore.Flow.Governance.Effect do
     Telemetry.emit(:"effect_#{status}", result, %{flow_id: id, effect_key: effect_key})
   end
 
-  defp update_status(_ctx, _id, _effect_key, _status, _opts),
-    do: {:error, "ERR flow effect opts must be a keyword list"}
+  defp update_status(_ctx, id, effect_key, _status, _opts),
+    do: Args.error("effect", [{:id, id, :string}, {:effect_key, effect_key, :string}])
 
   defp existing_effect_decision(ctx, key, operation_digest) do
     with {:ok, existing} <- get_existing_effect(ctx, key) do

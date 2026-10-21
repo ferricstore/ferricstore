@@ -32,7 +32,7 @@ defmodule FerricstoreHttp.Handlers.Commands do
 
     case result do
       {:ok, req, response} ->
-        req = HTTP.reply_command(req, 200, response, format)
+        req = HTTP.reply_command(req, 200, reply_body(response, format), format)
         {:ok, req, config}
 
       {:error, reason, req} ->
@@ -42,6 +42,9 @@ defmodule FerricstoreHttp.Handlers.Commands do
         reply_error(req, config, format, reason)
     end
   end
+
+  defp reply_body(response, :json), do: CommandService.json_reply(response)
+  defp reply_body(response, :msgpack), do: response
 
   defp execute(prepared, authenticated, config, deadline) do
     case CommandBatcher.execute(authenticated, prepared, config, deadline) do

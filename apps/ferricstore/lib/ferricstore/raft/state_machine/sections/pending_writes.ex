@@ -215,9 +215,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
 
         case Process.put(:sm_pending_writes, []) do
           [] ->
-            Ferricstore.LatencyTrace.maybe_span "server_flow_index_update_us" do
-              flush_pending_flow_native_indexes(state)
-            end
+            result =
+              Ferricstore.LatencyTrace.maybe_span "server_flow_index_update_us" do
+                flush_pending_flow_native_indexes(state)
+              end
+
+            :ok = flush_promoted_only_zset_indexes(state)
+            result
 
           pending when is_list(pending) ->
             batch =
@@ -362,6 +366,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
             publish_terminal_stream_cache(publication)
           end
         end)
+      end
+
+      # Promoted collections write their own files, so an entry can queue score
+      # index updates for a promoted sorted set without leaving shared-log rows
+      # for publish_pending_batch/5 to publish them with.
+      defp flush_promoted_only_zset_indexes(state) do
+        case Process.get(:sm_pending_zset_index_ops, []) do
+          [] ->
+            :ok
+
+          _pending ->
+            Ferricstore.Store.PromotedPublication.publish_existing(state, fn ->
+              flush_pending_zset_indexes(state)
+            end)
+        end
       end
 
       defp flush_pending_flow_native_indexes(state) do

@@ -90,6 +90,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
 
       # Atomic SETRANGE: reads current value, pads with zero bytes if needed,
       # replaces bytes at offset, writes back. Preserves expire_at_ms.
+      # A bad offset is an error, not a raise: a raise here crashes storage,
+      # and again on every replay of the entry.
       defp do_setrange(state, key, offset, value) do
         with :ok <- ensure_string_key(state, key) do
           {old_val, expire_at_ms} =
@@ -98,14 +100,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
               {v, exp} -> {to_disk_binary(v), exp}
             end
 
-          target_size =
-            Ferricstore.Raft.ApplyLimits.setrange_size(
-              byte_size(old_val),
-              offset,
-              byte_size(value)
-            )
-
-          with :ok <- Ferricstore.Raft.ApplyLimits.validate_value_size(state, target_size),
+          with :ok <- check_setrange_offset(offset, value, byte_size(old_val)),
+               target_size =
+                 Ferricstore.Raft.ApplyLimits.setrange_size(
+                   byte_size(old_val),
+                   offset,
+                   byte_size(value)
+                 ),
+               :ok <- Ferricstore.Raft.ApplyLimits.validate_value_size(state, target_size),
                new_val = sm_apply_setrange(old_val, offset, value),
                :ok <- do_put(state, key, new_val, expire_at_ms) do
             {:ok, target_size}
@@ -113,11 +115,26 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         end
       end
 
+      # Rejects exactly the offsets the apply raised on. An empty value at a
+      # numeric offset up to the string's end left it unchanged, and an older
+      # release logged such entries; replaying one must agree with it.
+      defp check_setrange_offset(offset, _value, _old_len)
+           when is_integer(offset) and offset >= 0,
+           do: :ok
+
+      defp check_setrange_offset(offset, "", old_len)
+           when is_number(offset) and offset <= old_len,
+           do: :ok
+
+      defp check_setrange_offset(_offset, _value, _old_len),
+        do: {:error, "ERR offset is out of range"}
+
       # Atomic SETBIT: read bitmap, extend with zeros to include byte_index if
       # needed, flip the single bit, write back. Preserves expire_at_ms.
       # Returns the OLD bit at that offset (Redis semantics).
       defp do_setbit(state, key, offset, bit_val) do
-        with :ok <- ensure_string_key(state, key) do
+        with :ok <- check_setbit_args(offset, bit_val),
+             :ok <- ensure_string_key(state, key) do
           {old_val, expire_at_ms} =
             case do_get_meta(state, key) do
               nil -> {<<>>, 0}
@@ -156,11 +173,26 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         end
       end
 
+      # A field, member or HINCRBY delta of the wrong type raised while the
+      # entry was applied, crash-looping the shard; the router rejects them,
+      # and these clauses keep an entry that reached the log from raising.
+      defp do_hincrby(_state, _redis_key, field, _delta) when not is_binary(field),
+        do: {:error, "ERR hash field must be a string"}
+
+      defp do_hincrby(_state, _redis_key, _field, delta) when not is_integer(delta),
+        do: {:error, "ERR value is not an integer or out of range"}
+
       # Atomic HINCRBY: read compound key (H:<redis_key>\0<field>), parse integer,
       # add delta, write back. Returns new integer value, or {:error, reason}.
       defp do_hincrby(state, redis_key, field, delta) do
         compound_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, field)
 
+        with :ok <- check_member_write_type(state, redis_key, [compound_key]) do
+          do_checked_hincrby(state, redis_key, compound_key, delta)
+        end
+      end
+
+      defp do_checked_hincrby(state, redis_key, compound_key, delta) do
         case sm_store_compound_get_meta(state, redis_key, compound_key) do
           {:error, _reason} = error ->
             error
@@ -201,10 +233,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         end
       end
 
+      defp do_hincrbyfloat(_state, _redis_key, field, _delta) when not is_binary(field),
+        do: {:error, "ERR hash field must be a string"}
+
       # Atomic HINCRBYFLOAT: same as HINCRBY but for floats.
       defp do_hincrbyfloat(state, redis_key, field, delta) do
         compound_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, field)
 
+        with :ok <- check_member_write_type(state, redis_key, [compound_key]) do
+          do_checked_hincrbyfloat(state, redis_key, compound_key, delta)
+        end
+      end
+
+      defp do_checked_hincrbyfloat(state, redis_key, compound_key, delta) do
         case sm_store_compound_get_meta(state, redis_key, compound_key) do
           {:error, _reason} = error ->
             error
@@ -240,7 +281,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
            ) do
         case ValueCodec.checked_float_add(current, delta) do
           {:ok, new_val} ->
-            new_str = Float.to_string(new_val)
+            new_str =
+              if feature_level_4?(state),
+                do: ValueCodec.format_float_plain(new_val),
+                else: Float.to_string(new_val)
 
             case do_compound_put(state, redis_key, compound_key, new_str, expire_at_ms) do
               :ok -> new_str
@@ -258,6 +302,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # Atomic ZINCRBY: check/set type metadata, read member score, add delta,
       # write back. Returns the new score as a string. Returns {:error, ...} on
       # wrong type.
+      defp do_zincrby(_state, _redis_key, _increment, member) when not is_binary(member),
+        do: {:error, "ERR zincrby member must be a string"}
+
       defp do_zincrby(state, redis_key, increment, member) do
         type_key = Ferricstore.Store.CompoundKey.type_key(redis_key)
         expected_type = Ferricstore.Store.CompoundKey.encode_type(:zset)
@@ -1072,6 +1119,112 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
 
       # Mirror of TypeRegistry.check_or_set but operates on state machine state.
       # Writes type metadata on first use, returns :ok or wrongtype error.
+      # Feature level 4 (Ferricstore.Cluster.FeatureLevel): a write of hash, set
+      # or sorted set members checks the key's type in its own entry, as ZINCRBY
+      # always has. Callers check the type before they write, so a SET or DEL
+      # applied in between left the members under a string or without a type,
+      # to come back when the key was recreated. Read through do_get so a hot
+      # or cold marker reads the same on every replica.
+      defp check_member_write_type(state, redis_key, compound_keys) do
+        with type when is_binary(type) <-
+               Ferricstore.Store.CompoundKey.member_write_type(redis_key, compound_keys),
+             true <- feature_level_4?(state) do
+          check_or_set_type(
+            state,
+            redis_key,
+            Ferricstore.Store.CompoundKey.type_key(redis_key),
+            type
+          )
+        else
+          _unchecked -> :ok
+        end
+      end
+
+      # Feature level 4: a command that reads one hash or sorted set, decides
+      # and writes it runs its handler here, on the state machine's store, so
+      # concurrent clients each see one outcome (one HDEL removes a field, one
+      # ZADD NX adds a member). Older releases do not apply the entry, so it
+      # is refused below the level on every release that knows it.
+      defp do_compound_command(state, redis_key, ast) do
+        with {:ok, handler} <- compound_command_handler(redis_key, ast),
+             :ok <- require_feature_level_4(state),
+             :ok <- check_fetch_or_compute_lock(state, redis_key, nil) do
+          run_compound_command(handler, ast, build_compound_store(state))
+        end
+      end
+
+      # A handler that raised would stop the shard's storage on every replay.
+      # Every replica runs the same code on the same entry, so each answers the
+      # same error instead, and the entry's pending writes roll back.
+      defp run_compound_command(handler, ast, store) do
+        handler.handle_ast(ast, store)
+      rescue
+        error ->
+          Logger.error(
+            "compound command #{inspect(elem(ast, 0))} raised in apply: " <>
+              Exception.format(:error, error, __STACKTRACE__)
+          )
+
+          {:error, "ERR internal error applying #{elem(ast, 0)}"}
+      end
+
+      defp compound_command_handler(key, {:hdel, [key | fields]})
+           when is_binary(key) and fields != [],
+           do: binaries_handler(fields, Ferricstore.Commands.Hash)
+
+      defp compound_command_handler(key, {:hsetnx, key, field, value})
+           when is_binary(key) and is_binary(field) and is_binary(value),
+           do: {:ok, Ferricstore.Commands.Hash}
+
+      defp compound_command_handler(key, {:hgetdel, key, fields})
+           when is_binary(key) and is_list(fields) and fields != [],
+           do: binaries_handler(fields, Ferricstore.Commands.Hash)
+
+      defp compound_command_handler(key, {:zadd, key, opts, pairs})
+           when is_binary(key) and is_list(opts) and opts != [] and is_list(pairs),
+           do: {:ok, Ferricstore.Commands.SortedSet}
+
+      defp compound_command_handler(key, {:geoadd, key, flags, pairs})
+           when is_binary(key) and is_list(flags) and flags != [] and is_list(pairs),
+           do: {:ok, Ferricstore.Commands.Geo}
+
+      defp compound_command_handler(_key, _ast), do: {:error, "ERR invalid compound command"}
+
+      defp binaries_handler(values, handler) do
+        if Enum.all?(values, &is_binary/1),
+          do: {:ok, handler},
+          else: {:error, "ERR invalid compound command"}
+      end
+
+      defp require_feature_level_4(state) do
+        if feature_level_4?(state),
+          do: :ok,
+          else: {:error, "ERR this command requires cluster feature level 4"}
+      end
+
+      defp feature_level_4?(state),
+        do:
+          do_get(state, Ferricstore.Cluster.FeatureLevel.key(4)) ==
+            Ferricstore.Cluster.FeatureLevel.marker()
+
+      # Feature level 4 also stores INCRBYFLOAT and HINCRBYFLOAT results as
+      # Redis does ("3", "5200"); older releases store Float.to_string/1
+      # ("3.0", "5.2e3"), which INCR and HINCRBY then refuse.
+      defp stored_float_increment(state, value) when is_float(value) do
+        if feature_level_4?(state),
+          do: ValueCodec.format_float_plain(value),
+          else: value
+      end
+
+      defp compound_entry_keys(entries) when is_list(entries) do
+        Enum.map(entries, fn
+          {compound_key, _value, _expire_at_ms} -> compound_key
+          _invalid -> nil
+        end)
+      end
+
+      defp compound_entry_keys(_entries), do: []
+
       defp check_or_set_type(state, redis_key, type_key, expected_type) do
         case sm_store_compound_get(state, redis_key, type_key) do
           {:error, _reason} = error ->
@@ -1103,6 +1256,29 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             end
         end
       end
+
+      # Rejects exactly what the apply raised on (div/rem of a non-integer, a
+      # bit other than 0 or 1). A negative offset applied in older releases, so
+      # it still does here; the API and commands reject it before the log.
+      defp check_setbit_args(offset, bit_val) when is_integer(offset) and bit_val in [0, 1],
+        do: :ok
+
+      defp check_setbit_args(offset, _bit_val) when is_integer(offset),
+        do: {:error, "ERR bit is not an integer or out of range"}
+
+      defp check_setbit_args(_offset, _bit_val),
+        do: {:error, "ERR bit offset is not an integer or out of range"}
+
+      # The logical key projection rejects a non-integer expiry after the value
+      # is written, which crashes storage on every replay of the entry.
+      defp check_expire_at(expire_at_ms) when is_integer(expire_at_ms) and expire_at_ms >= 0,
+        do: :ok
+
+      defp check_expire_at(_expire_at_ms),
+        do: {:error, "ERR value is not an integer or out of range"}
+
+      defp check_optional_expire_at(nil), do: :ok
+      defp check_optional_expire_at(expire_at_ms), do: check_expire_at(expire_at_ms)
 
       # Overwrites bytes at `offset` with `value`, zero-padding if the original
       # string is shorter than offset. Mirrors shard.ex apply_setrange/3.
@@ -1145,20 +1321,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # timestamp before entering Raft to keep the state machine deterministic
       # (no System.os_time calls). So the 5th arg is already absolute, not relative.
       defp do_cas(state, key, expected, new_value, expire_at_ms) do
-        case ets_lookup(state, key) do
-          {:hit, ^expected, old_exp} ->
-            expire = if expire_at_ms, do: expire_at_ms, else: old_exp
-            do_put(state, key, new_value, expire)
-            1
+        with :ok <- check_optional_expire_at(expire_at_ms) do
+          case ets_lookup(state, key) do
+            {:hit, ^expected, old_exp} ->
+              expire = if expire_at_ms, do: expire_at_ms, else: old_exp
+              do_put(state, key, new_value, expire)
+              1
 
-          {:hit, _other, _exp} ->
-            0
+            {:hit, _other, _exp} ->
+              0
 
-          :expired ->
-            nil
+            :expired ->
+              nil
 
-          :miss ->
-            nil
+            :miss ->
+              nil
+          end
         end
       end
 
@@ -1173,6 +1351,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # NOTE: The caller (shard.ex) pre-computes expire_at_ms as an absolute
       # timestamp before entering Raft to keep the state machine deterministic.
       defp do_lock(state, key, owner, expire_at_ms) do
+        with :ok <- check_expire_at(expire_at_ms), do: apply_lock(state, key, owner, expire_at_ms)
+      end
+
+      defp apply_lock(state, key, owner, expire_at_ms) do
         case ets_lookup(state, key) do
           {:hit, ^owner, _exp} ->
             # Same owner -- re-acquire (idempotent)
@@ -1215,6 +1397,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # NOTE: The caller (shard.ex) pre-computes expire_at_ms as an absolute
       # timestamp before entering Raft to keep the state machine deterministic.
       defp do_extend(state, key, owner, expire_at_ms) do
+        with :ok <- check_expire_at(expire_at_ms),
+             do: apply_extend(state, key, owner, expire_at_ms)
+      end
+
+      defp apply_extend(state, key, owner, expire_at_ms) do
         case ets_lookup(state, key) do
           {:hit, ^owner, _exp} ->
             do_put(state, key, owner, expire_at_ms)
@@ -1568,6 +1755,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       #
       # Replicates the exact shard.ex handle_ratelimit_add_direct logic.
       defp do_ratelimit_add(state, key, window_ms, max, count) do
+        with :ok <- RateLimit.validate_apply_args(window_ms, max, count),
+             do: apply_ratelimit_add(state, key, window_ms, max, count)
+      end
+
+      defp apply_ratelimit_add(state, key, window_ms, max, count) do
         now = apply_now_ms()
 
         {{cur_count, cur_start, prv_count}, original} =

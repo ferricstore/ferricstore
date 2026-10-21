@@ -74,6 +74,7 @@ defmodule FerricstoreServer.AuthenticationGateway do
           authenticated
 
         {:error, _reason} = error ->
+          :ok = AuthRateLimiter.release_failure(reservation)
           audit(:auth_failure, username, peer, false)
           error
       end
@@ -114,6 +115,17 @@ defmodule FerricstoreServer.AuthenticationGateway do
   end
 
   def validate(_invalid), do: {:error, :reauthentication_required}
+
+  @doc """
+  Attributes an authenticated session to another connection, such as a new
+  connection presenting the same credentials from the same address.
+
+  The credential generation is unchanged, so `validate/1` and the command
+  gateway still reject the session once its user or password changes.
+  """
+  @spec bind_peer(Session.t(), term()) :: Session.t()
+  def bind_peer(%Session{} = session, peer), do: %Session{session | peer: peer}
+  def bind_peer(session, _peer), do: session
 
   defp verify_and_open_session(username, password, peer) do
     user = Acl.get_user(username)

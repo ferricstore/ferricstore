@@ -67,6 +67,140 @@ defmodule Ferricstore.Commands.Dispatcher do
   @hll_raw_commands ~w(PFADD PFCOUNT PFMERGE)
   @prob_raw_commands ~w(BF.RESERVE BF.ADD BF.MADD BF.EXISTS BF.MEXISTS BF.CARD BF.INFO CF.RESERVE CF.ADD CF.ADDNX CF.DEL CF.EXISTS CF.MEXISTS CF.COUNT CF.INFO CMS.INITBYDIM CMS.INITBYPROB CMS.INCRBY CMS.QUERY CMS.MERGE CMS.INFO TOPK.RESERVE TOPK.ADD TOPK.INCRBY TOPK.QUERY TOPK.LIST TOPK.COUNT TOPK.INFO TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.QUANTILE TDIGEST.CDF TDIGEST.RANK TDIGEST.REVRANK TDIGEST.BYRANK TDIGEST.BYREVRANK TDIGEST.TRIMMED_MEAN TDIGEST.MIN TDIGEST.MAX TDIGEST.INFO TDIGEST.MERGE)
   @tdigest_rmw_commands ~w(TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.MERGE)
+  @conditional_zadd_flags ~w(NX XX GT LT)
+  @latched_commands ~w(HSETNX ZADD GEOADD HGETDEL SMOVE EXPIRE PEXPIRE EXPIREAT PEXPIREAT)
+  # Redis arities (COMMAND INFO: the name counts, a negative arity is a
+  # minimum) of the data commands, checked before a gateway runs a command
+  # and while MULTI queues one (so EXEC then runs nothing); see
+  # arity_error/2. HSETEX is left out: FerricStore's form is shorter than
+  # Redis 8's.
+  @redis_arities %{
+    "GET" => 2,
+    "SET" => -3,
+    "DEL" => -2,
+    "EXISTS" => -2,
+    "MGET" => -2,
+    "MSET" => -3,
+    "MSETNX" => -3,
+    "INCR" => 2,
+    "DECR" => 2,
+    "INCRBY" => 3,
+    "DECRBY" => 3,
+    "INCRBYFLOAT" => 3,
+    "APPEND" => 3,
+    "STRLEN" => 2,
+    "GETSET" => 3,
+    "GETDEL" => 2,
+    "GETEX" => -2,
+    "SETNX" => 3,
+    "SETEX" => 4,
+    "PSETEX" => 4,
+    "GETRANGE" => 4,
+    "SETRANGE" => 4,
+    "EXPIRE" => -3,
+    "PEXPIRE" => -3,
+    "EXPIREAT" => -3,
+    "PEXPIREAT" => -3,
+    "TTL" => 2,
+    "PTTL" => 2,
+    "PERSIST" => 2,
+    "EXPIRETIME" => 2,
+    "PEXPIRETIME" => 2,
+    "TYPE" => 2,
+    "UNLINK" => -2,
+    "RENAME" => 3,
+    "RENAMENX" => 3,
+    "COPY" => -3,
+    "LPUSH" => -3,
+    "RPUSH" => -3,
+    "LPUSHX" => -3,
+    "RPUSHX" => -3,
+    "LPOP" => -2,
+    "RPOP" => -2,
+    "LRANGE" => 4,
+    "LLEN" => 2,
+    "LINDEX" => 3,
+    "LSET" => 4,
+    "LREM" => 4,
+    "LTRIM" => 4,
+    "LPOS" => -3,
+    "LINSERT" => 5,
+    "LMOVE" => 5,
+    "RPOPLPUSH" => 3,
+    "HSET" => -4,
+    "HGET" => 3,
+    "HDEL" => -3,
+    "HMGET" => -3,
+    "HGETALL" => 2,
+    "HEXISTS" => 3,
+    "HKEYS" => 2,
+    "HVALS" => 2,
+    "HLEN" => 2,
+    "HINCRBY" => 4,
+    "HINCRBYFLOAT" => 4,
+    "HSETNX" => 4,
+    "HSTRLEN" => 3,
+    "HRANDFIELD" => -2,
+    "HSCAN" => -3,
+    "HEXPIRE" => -6,
+    "HPEXPIRE" => -6,
+    "HTTL" => -5,
+    "HPTTL" => -5,
+    "HPERSIST" => -5,
+    "HEXPIRETIME" => -5,
+    "HGETDEL" => -5,
+    "HGETEX" => -5,
+    "SADD" => -3,
+    "SREM" => -3,
+    "SMEMBERS" => 2,
+    "SISMEMBER" => 3,
+    "SMISMEMBER" => -3,
+    "SCARD" => 2,
+    "SINTER" => -2,
+    "SUNION" => -2,
+    "SDIFF" => -2,
+    "SINTERSTORE" => -3,
+    "SUNIONSTORE" => -3,
+    "SDIFFSTORE" => -3,
+    "SINTERCARD" => -3,
+    "SRANDMEMBER" => -2,
+    "SPOP" => -2,
+    "SMOVE" => 4,
+    "ZADD" => -4,
+    "ZREM" => -3,
+    "ZSCORE" => 3,
+    "ZRANK" => -3,
+    "ZREVRANK" => -3,
+    "ZRANGE" => -4,
+    "ZREVRANGE" => -4,
+    "ZCARD" => 2,
+    "ZINCRBY" => 4,
+    "ZCOUNT" => 4,
+    "ZPOPMIN" => -2,
+    "ZPOPMAX" => -2,
+    "ZRANDMEMBER" => -2,
+    "ZMSCORE" => -3,
+    "ZRANGEBYSCORE" => -4,
+    "ZREVRANGEBYSCORE" => -4,
+    "SETBIT" => 4,
+    "GETBIT" => 3,
+    "BITCOUNT" => -2,
+    "BITPOS" => -3,
+    "BITOP" => -4,
+    "PFADD" => -2,
+    "PFCOUNT" => -2,
+    "PFMERGE" => -2,
+    "XADD" => -5,
+    "XLEN" => 2,
+    "XRANGE" => -4,
+    "XREVRANGE" => -4,
+    "XDEL" => -3,
+    "XTRIM" => -4,
+    "GEOADD" => -5,
+    "GEOPOS" => -2,
+    "GEODIST" => -4,
+    "GEOHASH" => -2
+  }
   @native_raw_commands ~w(CAS LOCK UNLOCK EXTEND RATELIMIT.ADD KEY_INFO FERRICSTORE.KEY_INFO FETCH_OR_COMPUTE FETCH_OR_COMPUTE_RESULT FETCH_OR_COMPUTE_ERROR)
   @management_raw_commands ~w(ACL FERRICSTORE.CAPABILITIES FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FERRICSTORE.TELEMETRY)
   @cluster_raw_commands ~w(CLUSTER.HEALTH CLUSTER.STATS CLUSTER.KEYSLOT CLUSTER.SLOTS CLUSTER.STATUS CLUSTER.JOIN CLUSTER.LEAVE CLUSTER.FAILOVER CLUSTER.PROMOTE CLUSTER.DEMOTE CLUSTER.ROLE CLUSTER.FEATURES CLUSTER.FEATURES.RAISE FERRICSTORE.HOTNESS)
@@ -74,7 +208,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     INVOCATION.DEFINITION.PUT INVOCATION.DEFINITION.GET INVOCATION.DEFINITION.LIST
     INVOCATION.CREATE INVOCATION.GET INVOCATION.PARTITION.LIST
   )
-  @raw_fallback_ast_tags ~w(xadd xlen xrange xrevrange xread xtrim xdel xinfo xgroup xreadgroup xack geoadd geopos geodist geohash geosearch geosearchstore cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error)a
+  @raw_fallback_ast_tags ~w(bitcount bitpos xadd xlen xrange xrevrange xread xtrim xdel xinfo xgroup xreadgroup xack geoadd geopos geodist geohash geosearch geosearchstore cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error)a
   @wrong_arity_list_ast_tags ~w(get incr decr strlen getdel getex ttl pttl persist lpop rpop llen hgetall hkeys hvals hlen hrandfield smembers scard srandmember spop zcard zpopmin zpopmax zrandmember type expiretime pexpiretime)a
 
   @ast_command_names %{
@@ -803,6 +937,28 @@ defmodule Ferricstore.Commands.Dispatcher do
   end
 
   @doc """
+  The error Redis answers for `command` called with `args`, when their count
+  does not match the command's arity, or nil. Gateways check it before they
+  run a command, and MULTI while it queues one, so a malformed command
+  discards the transaction, as in Redis.
+  """
+  @spec arity_error(binary(), list()) :: binary() | nil
+  def arity_error(command, args) when is_binary(command) and is_list(args) do
+    count = length(args) + 1
+
+    case Map.fetch(@redis_arities, command) do
+      {:ok, arity} when arity > 0 and count != arity -> wrong_arity_message(command)
+      {:ok, arity} when arity < 0 and count < -arity -> wrong_arity_message(command)
+      _matching_or_unknown -> nil
+    end
+  end
+
+  def arity_error(_command, _args), do: nil
+
+  defp wrong_arity_message(command),
+    do: "ERR wrong number of arguments for '#{String.downcase(command)}' command"
+
+  @doc """
   Dispatches an already prepared command without repeating parsing or key discovery.
   """
   @spec dispatch_prepared(PreparedCommand.t(), map(), keyword()) :: term()
@@ -822,21 +978,23 @@ defmodule Ferricstore.Commands.Dispatcher do
     start = Keyword.get_lazy(opts, :started_at_us, fn -> System.monotonic_time(:microsecond) end)
 
     result =
-      case authorize_public_keys(prepared.command, prepared.acl_keys) do
-        :ok ->
-          case acquire_raw_resource_lease(prepared, store) do
-            {:ok, lease} ->
-              execute_with_resource_lease(lease, prepared, store, executor)
+      with nil <- arity_error(prepared.command, prepared.args),
+           :ok <- check_write_key_sizes(prepared),
+           :ok <- authorize_public_keys(prepared.command, prepared.acl_keys) do
+        case acquire_raw_resource_lease(prepared, store) do
+          {:ok, lease} ->
+            execute_with_resource_lease(lease, prepared, store, executor)
 
-            {:error, reason} ->
-              {:error, FerricStore.ResourceLimits.error_message(reason)}
-          end
-
-        {:error, reason} ->
-          {:error, reason}
+          {:error, reason} ->
+            {:error, FerricStore.ResourceLimits.error_message(reason)}
+        end
+      else
+        message when is_binary(message) -> {:error, message}
+        {:error, reason} -> {:error, reason}
       end
 
     log_raw_dispatch(prepared.command, prepared.args, start)
+    Ferricstore.KeyspaceNotifications.after_command(prepared.command, prepared.args, result)
     result
   end
 
@@ -848,7 +1006,36 @@ defmodule Ferricstore.Commands.Dispatcher do
     Router.with_key_latch(store, key, fn -> dispatch_ast(ast, store) end)
   end
 
+  # These read the key and decide the write from what they read. Without the
+  # key latch two clients both read the old value: every concurrent HSETNX,
+  # ZADD NX, GEOADD NX, SMOVE or EXPIRE NX reported a win, ZADD GT could land a lower
+  # score last, and HGETDEL handed one field to every client. SMOVE latches
+  # its source key.
+  defp dispatch_prepared_ast(
+         %PreparedCommand{command: command, ast: ast, write_keys: [key | _rest]} = prepared,
+         %FerricStore.Instance{} = store
+       )
+       when command in @latched_commands do
+    if latched_command?(command, prepared.args),
+      do: Router.with_key_latch(store, key, fn -> dispatch_ast(ast, store) end),
+      else: dispatch_ast(ast, store)
+  end
+
   defp dispatch_prepared_ast(%PreparedCommand{ast: ast}, store), do: dispatch_ast(ast, store)
+
+  # Plain ZADD/GEOADD and an EXPIRE without flags do not depend on what they
+  # read.
+  defp latched_command?(command, [_key | options]) when command in ["ZADD", "GEOADD"],
+    do: Enum.any?(options, &(is_binary(&1) and String.upcase(&1) in @conditional_zadd_flags))
+
+  defp latched_command?(command, [_key, _time | flags])
+       when command in ~w(EXPIRE PEXPIRE EXPIREAT PEXPIREAT),
+       do: flags != []
+
+  defp latched_command?(command, _args) when command in ~w(EXPIRE PEXPIRE EXPIREAT PEXPIREAT),
+    do: false
+
+  defp latched_command?(_command, _args), do: true
 
   if Mix.env() == :test do
     @doc """
@@ -856,6 +1043,20 @@ defmodule Ferricstore.Commands.Dispatcher do
     """
     @spec dispatch(binary(), [binary()], map()) :: term()
     def dispatch(name, args, store), do: dispatch_raw(name, args, store)
+  end
+
+  # SET refuses keys over the key size limit; hash, set, sorted set, list and
+  # stream writes took them. Flow and invocation commands check their own
+  # keys with their own messages.
+  defp check_write_key_sizes(%PreparedCommand{command: "FLOW." <> _rest}), do: :ok
+  defp check_write_key_sizes(%PreparedCommand{command: "INVOCATION." <> _rest}), do: :ok
+
+  defp check_write_key_sizes(%PreparedCommand{write_keys: write_keys}) do
+    max_key_size = Router.max_key_size()
+
+    if Enum.any?(write_keys, &(is_binary(&1) and byte_size(&1) > max_key_size)),
+      do: {:error, "ERR key too large"},
+      else: :ok
   end
 
   defp log_raw_dispatch(cmd, args, start) do

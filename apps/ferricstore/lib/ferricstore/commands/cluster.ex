@@ -35,6 +35,7 @@ defmodule Ferricstore.Commands.Cluster do
   alias Ferricstore.Cluster.FeatureLevel
   alias Ferricstore.Cluster.Manager, as: ClusterManager
   alias Ferricstore.Raft.Cluster, as: RaftCluster
+  alias Ferricstore.Raft.WARaftStorage.PersistedConfig
   alias Ferricstore.Store.{Router, SlotMap}
 
   @doc """
@@ -505,7 +506,11 @@ defmodule Ferricstore.Commands.Cluster do
   end
 
   defp parse_existing_node(node_str) when is_binary(node_str) do
-    {:ok, String.to_existing_atom(node_str)}
+    node = String.to_existing_atom(node_str)
+
+    if PersistedConfig.valid_runtime_node?(node),
+      do: {:ok, node},
+      else: {:error, "ERR invalid node name; expected name@host"}
   rescue
     ArgumentError ->
       {:error, "ERR unknown node; connect the distributed node before using CLUSTER commands"}

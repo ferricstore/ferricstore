@@ -554,6 +554,21 @@ Small collections store each field as a compound key in the shared shard:
 5. Writes a marker entry `PM:user_key` to the shared Bitcask (value = type string).
 6. Entries **stay** in ETS so compound operations continue to work immediately.
 
+### Writes and Durability
+
+Under WARaft, writes to a promoted collection's dedicated log are applied
+without an fsync each (`Ferricstore.Raft.PromotedFileSync`); the Raft log
+already holds every acknowledged write. The storage process tracks the files
+it wrote and syncs them before it persists its replay position, and a segment
+projection checkpoint or log trim syncs them before it writes past those
+writes, so recovery always replays the log from before any write that may not
+have reached disk. Before its first unsynced write, the storage makes a
+`dedicated_unsynced` marker durable in its WARaft directory and removes it once
+everything is synced; a storage that opens with the marker present syncs every
+dedicated file before it replays. A cross-shard transaction's writes are
+tracked by the storage that applies it, whose log holds the transaction;
+writes applied outside a WARaft storage process still fsync each append.
+
 ### Recovery
 
 On shard startup, `Promotion.recover_promoted/4` scans ETS for `PM:` marker keys (populated by `recover_keydir`), re-opens dedicated Bitcask directories, and scans their log files to recover entries into ETS.

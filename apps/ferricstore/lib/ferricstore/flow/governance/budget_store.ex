@@ -1,6 +1,8 @@
 defmodule Ferricstore.Flow.Governance.BudgetStore do
   @moduledoc false
 
+  alias Ferricstore.Flow.Governance.Args
+
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.Governance.AtomicRecord
   alias Ferricstore.Flow.Governance.Budget
@@ -52,8 +54,12 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
     Telemetry.emit(:budget_reserve, result, %{scope: scope, amount: amount})
   end
 
-  def reserve(_ctx, _scope, _amount, _opts),
-    do: {:error, "ERR flow budget opts must be a keyword list"}
+  def reserve(_ctx, scope, amount, _opts),
+    do:
+      Args.error("budget", [
+        {:scope, scope, :non_empty_string},
+        {:amount, amount, :positive_integer}
+      ])
 
   def commit(ctx, scope, reservation_id, actual_amount, opts \\ [])
 
@@ -95,8 +101,13 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
     })
   end
 
-  def commit(_ctx, _scope, _reservation_id, _actual_amount, _opts),
-    do: {:error, "ERR flow budget commit opts must be a keyword list"}
+  def commit(_ctx, scope, reservation_id, actual_amount, _opts),
+    do:
+      Args.error("budget commit", [
+        {:scope, scope, :non_empty_string},
+        {:reservation_id, reservation_id, :non_empty_string},
+        {:actual_amount, actual_amount, :non_negative_integer}
+      ])
 
   def release(ctx, scope, reservation_id, opts \\ [])
 
@@ -129,8 +140,12 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
     Telemetry.emit(:budget_release, result, %{scope: scope, reservation_id: reservation_id})
   end
 
-  def release(_ctx, _scope, _reservation_id, _opts),
-    do: {:error, "ERR flow budget release opts must be a keyword list"}
+  def release(_ctx, scope, reservation_id, _opts),
+    do:
+      Args.error("budget release", [
+        {:scope, scope, :non_empty_string},
+        {:reservation_id, reservation_id, :non_empty_string}
+      ])
 
   def get(ctx, scope, opts \\ [])
 
@@ -153,7 +168,7 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
     end
   end
 
-  def get(_ctx, _scope, _opts), do: {:error, "ERR flow budget opts must be a keyword list"}
+  def get(_ctx, scope, _opts), do: Args.error("budget", [{:scope, scope, :non_empty_string}])
 
   def list(ctx, opts \\ [])
 

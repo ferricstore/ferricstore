@@ -2284,9 +2284,14 @@ defmodule Ferricstore.Flow.ScheduleTest do
 
     # The corrupt row fails every Flow LMDB flush on its shard until it is gone,
     # which would leave that writer failing into the next test.
+    # Once quarantined, the projection is retried on a timer, so the first flush
+    # after the delete can still report it; wait for the retry to release it.
     ctx = FerricStore.Instance.get(:default)
     assert :ok = Ferricstore.Store.Router.delete(ctx, first_target_key)
-    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count, 30_000)
+
+    assert eventually(fn ->
+             Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count, 30_000) == :ok
+           end)
   end
 
   test "overlap policy queue_after_previous preserves queued due occurrence" do

@@ -979,6 +979,199 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           assert [] == :ets.lookup(ets, key)
         end
 
+        test "SETRANGE and SETBIT reject an invalid offset instead of raising in apply", %{
+          state: state,
+          ets: ets
+        } do
+          key = "invalid_offset_apply"
+
+          for {command, error} <- [
+                {{:setrange, key, -1, "x"}, "ERR offset is out of range"},
+                {{:setrange, key, 1.5, "x"}, "ERR offset is out of range"},
+                {{:setbit, key, 1.5, 1}, "ERR bit offset is not an integer or out of range"},
+                {{:setbit, key, 0, 2}, "ERR bit is not an integer or out of range"}
+              ] do
+            {_new_state, result} = StateMachine.apply(%{}, command, state)
+            assert {:error, ^error} = result, "#{inspect(command)} returned #{inspect(result)}"
+          end
+
+          assert [] == :ets.lookup(ets, key)
+        end
+
+        test "list writes and PFADD reject bad arguments instead of raising in apply", %{
+          state: state
+        } do
+          key = "invalid_list_and_hll_apply"
+          {_state, 2} = StateMachine.apply(%{}, {:list_op, key, {:rpush, ["a", "b"]}}, state)
+
+          for {command, error} <- [
+                {{:list_op, key, {:lset, 0.0, "x"}},
+                 "ERR value is not an integer or out of range"},
+                {{:list_op, key, {:lrem, "1", "a"}},
+                 "ERR value is not an integer or out of range"},
+                {{:list_op, key, {:ltrim, 0, 1.5}},
+                 "ERR value is not an integer or out of range"},
+                {{:list_op, key, {:lpop, 1.5}}, "ERR value is not an integer or out of range"},
+                {{:list_op, key, {:linsert, :middle, "a", "x"}}, "ERR syntax error"},
+                {{:pfadd, key <> ":hll", [5]}, "ERR pfadd elements must be strings"}
+              ] do
+            {_new_state, result} = StateMachine.apply(%{}, command, state)
+            assert {:error, ^error} = result, "#{inspect(command)} returned #{inspect(result)}"
+          end
+
+          {_state, values} = StateMachine.apply(%{}, {:list_op, key, {:lrange, 0, -1}}, state)
+          assert values == ["a", "b"]
+        end
+
+        test "PFADD and PFMERGE on a hash answer WRONGTYPE instead of raising in apply", %{
+          state: state,
+          ets: ets
+        } do
+          key = "hll_apply_on_hash"
+          type_key = Ferricstore.Store.CompoundKey.type_key(key)
+          {state, :ok} = StateMachine.apply(%{}, {:put, type_key, "hash", 0}, state)
+          {state, 1} = StateMachine.apply(%{}, {:hincrby, key, "f", 1}, state)
+          sketch = Ferricstore.HyperLogLog.new()
+
+          wrongtype =
+            {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+
+          for command <- [{:pfadd, key, ["x"]}, {:pfmerge, key, [sketch]}] do
+            {_new_state, result} = StateMachine.apply(%{}, command, state)
+            assert wrongtype == result, "#{inspect(command)} returned #{inspect(result)}"
+          end
+
+          assert [{^type_key, "hash", 0, _lfu, _file_id, _offset, _size}] =
+                   :ets.lookup(ets, type_key)
+
+          assert [] == :ets.lookup(ets, key)
+        end
+
+        test "HINCRBY, HINCRBYFLOAT and ZINCRBY reject a malformed field, member or delta", %{
+          state: state,
+          ets: ets
+        } do
+          key = "invalid_increment_apply"
+
+          for {command, error} <- [
+                {{:hincrby, key, :f, 1}, "ERR hash field must be a string"},
+                {{:hincrby, key, "f", 1.5}, "ERR value is not an integer or out of range"},
+                {{:hincrbyfloat, key, :f, 1.0}, "ERR hash field must be a string"},
+                {{:zincrby, key, 1.0, :m}, "ERR zincrby member must be a string"},
+                {{:async, node(), {:zincrby, key, 1.0, :m}},
+                 "ERR zincrby member must be a string"},
+                {{:async, node(), {:hincrby, key, :f, 1}}, "ERR hash field must be a string"},
+                {{:async, node(), {:hincrbyfloat, key, :f, 1.0}},
+                 "ERR hash field must be a string"}
+              ] do
+            {_new_state, result} = StateMachine.apply(%{}, command, state)
+            assert {:error, ^error} = result, "#{inspect(command)} returned #{inspect(result)}"
+          end
+
+          assert [] == :ets.tab2list(ets)
+        end
+
+        test "bloom and cuckoo writes reject an element that is not a string", %{
+          state: state
+        } do
+          bloom_params = %{num_bits: 1024, num_hashes: 3, capacity: 100, error_rate: 0.01}
+          cuckoo_params = %{capacity: 1024, bucket_size: 4}
+          bloom_error = {:error, "ERR bloom elements must be strings"}
+          cuckoo_error = {:error, "ERR cuckoo elements must be strings"}
+
+          for {command, error} <- [
+                {{:bloom_add, "apply_bad_bloom", :x, bloom_params}, bloom_error},
+                {{:bloom_madd, "apply_bad_bloom", ["a", 1], bloom_params}, bloom_error},
+                {{:cuckoo_add, "apply_bad_cuckoo", :x, cuckoo_params}, cuckoo_error},
+                {{:cuckoo_addnx, "apply_bad_cuckoo", 5, cuckoo_params}, cuckoo_error},
+                {{:cuckoo_del, "apply_bad_cuckoo", :x}, cuckoo_error}
+              ] do
+            {_new_state, result} = StateMachine.apply(%{}, command, state)
+            assert error == result, "#{inspect(command)} returned #{inspect(result)}"
+          end
+        end
+
+        test "RATELIMIT.ADD rejects a malformed window, limit or count instead of raising", %{
+          state: state,
+          ets: ets
+        } do
+          key = "invalid_ratelimit_apply"
+
+          for {window_ms, max, count} <- [{1.5, 10, 1}, {1000, "10", 1}, {1000, 10, nil}] do
+            command = {:ratelimit_add, key, window_ms, max, count}
+            {_new_state, result} = StateMachine.apply(%{}, command, state)
+
+            assert {:error, "ERR value is not an integer or out of range"} = result,
+                   "#{inspect(command)} returned #{inspect(result)}"
+          end
+
+          assert [] == :ets.lookup(ets, key)
+        end
+
+        test "LOCK, EXTEND and CAS reject an expiry that is not an integer", %{
+          state: state,
+          ets: ets
+        } do
+          key = "invalid_lock_expiry_apply"
+
+          for command <- [
+                {:lock, key, "owner", 1_000.5},
+                {:extend, key, "owner", 1_000.5},
+                {:cas, key, "a", "b", 1_000.5}
+              ] do
+            {_new_state, result} = StateMachine.apply(%{}, command, state)
+
+            assert {:error, "ERR value is not an integer or out of range"} = result,
+                   "#{inspect(command)} returned #{inspect(result)}"
+          end
+
+          assert [] == :ets.lookup(ets, key)
+        end
+
+        test "LREM, RATELIMIT.ADD, SETRANGE and SETBIT entries an older release applied still apply the same way",
+             %{
+               state: state,
+               ets: ets
+             } do
+          # The router now rejects these before the log, but an older release
+          # logged and applied them; a replica replaying one must agree with it.
+          key = "lenient_apply_list"
+
+          {_state, 4} =
+            StateMachine.apply(%{}, {:list_op, key, {:rpush, ["a", "a", "a", "b"]}}, state)
+
+          {_state, removed} = StateMachine.apply(%{}, {:list_op, key, {:lrem, 1.5, "a"}}, state)
+          assert removed == 2
+
+          {_state, ["a", "b"]} = StateMachine.apply(%{}, {:list_op, key, {:lrange, 0, -1}}, state)
+
+          assert {_state, ["allowed", 1, 9, _reset_ms]} =
+                   StateMachine.apply(
+                     %{},
+                     {:ratelimit_add, "lenient_apply_window", 5_000_000_000_000_000_000, 10, 1},
+                     state
+                   )
+
+          assert {_state, ["allowed", 0, 10, _reset_ms]} =
+                   StateMachine.apply(
+                     %{},
+                     {:ratelimit_add, "lenient_apply_count", 1_000, 10, 0},
+                     state
+                   )
+
+          # An empty SETRANGE value at a negative offset left the string as it
+          # was, creating an empty one for a missing key.
+          assert {_state, {:ok, 0}} =
+                   StateMachine.apply(%{}, {:setrange, "lenient_apply_range", -1, ""}, state)
+
+          assert [{"lenient_apply_range", "", 0, _lfu, _fid, _off, _size}] =
+                   :ets.lookup(ets, "lenient_apply_range")
+
+          # A negative SETBIT offset addressed byte 0 with an out-of-range bit.
+          assert {_state, 0} =
+                   StateMachine.apply(%{}, {:setbit, "lenient_apply_bit", -1, 1}, state)
+        end
+
         test "crafted direct writes cannot bypass the replicated size limit", %{
           state: state,
           ets: ets

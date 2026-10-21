@@ -313,7 +313,13 @@ defmodule FerricStore.API.Lists do
   @spec lmove(key(), key(), :left | :right, :left | :right) :: {:ok, binary() | nil}
   def lmove(source, destination, from_dir, to_dir)
       when from_dir in [:left, :right] and to_dir in [:left, :right] do
-    Ferricstore.Commands.List.handle_ast({:lmove, source, destination, from_dir, to_dir}, %{})
+    # The instance makes the move one replicated list operation; an empty
+    # store moved through separate reads and writes and lost elements under
+    # concurrent moves.
+    Ferricstore.Commands.List.handle_ast(
+      {:lmove, source, destination, from_dir, to_dir},
+      default_ctx()
+    )
     |> wrap_result()
   end
 

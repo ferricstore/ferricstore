@@ -470,8 +470,9 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp make_ast(_cmd, tag, [key, ttl]) when tag in ~w(expire pexpire expireat pexpireat)a,
     do: {tag, key, parse_int(ttl)}
 
-  defp make_ast(_cmd, tag, [key, ttl, flag]) when tag in ~w(expire pexpire expireat pexpireat)a,
-    do: {tag, key, parse_int(ttl), parse_expiry_flag(flag)}
+  defp make_ast(_cmd, tag, [key, ttl | flags])
+       when flags != [] and tag in ~w(expire pexpire expireat pexpireat)a,
+       do: {tag, key, parse_int(ttl), parse_expiry_flags(flags)}
 
   defp make_ast(_cmd, tag, [key]) when tag in ~w(lpop rpop)a, do: {tag, key}
 
@@ -603,18 +604,9 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp make_ast(_cmd, :setbit, [key, offset, bit]),
     do: {:setbit, key, parse_int(offset), parse_int(bit)}
 
+  # A BITCOUNT range and every BITPOS form stay as argument lists, which the
+  # dispatcher hands to the bitmap command handler's full argument checks.
   defp make_ast(_cmd, :bitcount, [key]), do: {:bitcount, key}
-
-  defp make_ast(_cmd, :bitcount, [key, start, stop]),
-    do: {:bitcount, key, parse_int(start), parse_int(stop)}
-
-  defp make_ast(_cmd, :bitpos, [key, bit]), do: {:bitpos, key, parse_int(bit), :all}
-
-  defp make_ast(_cmd, :bitpos, [key, bit, start]),
-    do: {:bitpos, key, parse_int(bit), {:start, parse_int(start)}}
-
-  defp make_ast(_cmd, :bitpos, [key, bit, start, stop]),
-    do: {:bitpos, key, parse_int(bit), {parse_int(start), parse_int(stop), :byte}}
 
   defp make_ast(_cmd, :bitop, [operation, destination | sources]),
     do: parse_bitop(operation, destination, sources)
@@ -801,7 +793,8 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp make_ast("TOPK.RESERVE", :topk_reserve, [key, k]),
     do:
       with_parsed_numbers(:topk_reserve, [parse_pos_int(k)], fn [parsed_k] ->
-        {:topk_reserve, key, parsed_k, 8, 7}
+        {:topk_reserve, key, parsed_k, Ferricstore.Commands.TopK.default_width(parsed_k),
+         Ferricstore.Commands.TopK.default_depth()}
       end)
 
   defp make_ast("TOPK.RESERVE", :topk_reserve, [key, k, width, depth]),
@@ -1387,13 +1380,10 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp parse_getex_opts(_), do: {:error, "ERR syntax error"}
 
-  defp parse_expiry_flag(flag) do
-    case String.upcase(flag) do
-      "NX" -> :nx
-      "XX" -> :xx
-      "GT" -> :gt
-      "LT" -> :lt
-      _ -> {:error, "ERR syntax error"}
+  defp parse_expiry_flags(flags) do
+    case Ferricstore.Commands.Expiry.parse_flags(flags) do
+      {:ok, flag} -> flag
+      {:error, _reason} = error -> error
     end
   end
 
