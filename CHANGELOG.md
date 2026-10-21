@@ -66,8 +66,8 @@ All notable changes to FerricStore will be documented here.
   invalid expire time in 'getex' command". SETRANGE checks the key's type
   before the resulting size, with Redis's "(proto-max-bulk-len)" text.
 - Answer Redis's argument errors from HTTL, HPTTL, HPERSIST, HEXPIRETIME and
-  HGETDEL, after the type check, and accept a lowercase
-  `fields` in every command path (the command handlers refused it).
+  HGETDEL, after the type check, and accept a lowercase `fields` in every
+  command path (the command handlers refused it).
 - Support HSETEX's Redis 8 form, `HSETEX key [FNX|FXX] [EX|PX|EXAT|PXAT|
   KEEPTTL] FIELDS n field value...`, next to FerricStore's own
   `HSETEX key seconds field value...`. At cluster feature level 5 it reads,
@@ -86,9 +86,9 @@ All notable changes to FerricStore will be documented here.
   after the TTL), a TTL of 0 deleting the field (answering 2, and deleting
   the hash once empty), repeated fields applied in order, WRONGTYPE before
   argument errors, and Redis's error texts and latest expiry (70368744177663
-  ms, in 4199). A TTL of
-  0 answered an error and the conditions a syntax error. Inside MULTI the new
-  forms are queued only at cluster feature level 5.
+  ms, in 4199). A TTL of 0 answered an error and the conditions a syntax
+  error. Inside MULTI the new forms are queued only at cluster feature
+  level 5.
 - Stamp the dashboard's circuit open/close and approval decisions with the
   store's clock. They used the wall clock, which the cluster's hybrid clock
   can run ahead of, so closing a circuit or deciding an approval right after
@@ -144,9 +144,9 @@ All notable changes to FerricStore will be documented here.
 - Accept ZRANGE's Redis 6.2 forms: `BYSCORE` (with `(` exclusive bounds and
   `LIMIT offset count`), `REV` for ranks and scores, in any order with
   `WITHSCORES`. They answered a syntax or arity error; only the rank form
-  worked. `LIMIT` without `BYSCORE` answers Redis's error, and `BYLEX` is not
-  supported yet. Inside MULTI the new forms are refused (EXEC answers an
-  error and runs nothing); use ZRANGEBYSCORE or ZREVRANGE there.
+  worked. `LIMIT` without `BYSCORE` or `BYLEX` answers Redis's error. Inside
+  MULTI the BYSCORE and REV forms are refused (EXEC answers an error and
+  runs nothing); use ZRANGEBYSCORE or ZREVRANGE there.
 - Answer sorted set scores as Redis does: "1" instead of "1.0", "3.14"
   instead of "3.14000000000000012", "1e+20" and "1.5e-7" for very large and
   small ones. ZSCORE, ZMSCORE, ZINCRBY, ZPOPMIN, ZPOPMAX, ZSCAN and
