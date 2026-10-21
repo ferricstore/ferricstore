@@ -169,6 +169,16 @@ defmodule FerricstoreServer.Native.FeatureLevel5MultiTest do
     assert Enum.count(results, &is_nil/1) == 19
   end
 
+  test "DECRBY of the smallest integer in MULTI answers Redis's error", %{ctx: ctx, key: key} do
+    :ok = Dispatcher.dispatch("SET", [key, "-1"], ctx)
+    state = queue(multi(), "DECRBY", [key, "-9223372036854775808"])
+
+    assert {:ok, [%{"error" => "ERR decrement would overflow"}], _state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, state)
+
+    assert "-1" == Dispatcher.dispatch("GET", [key], ctx)
+  end
+
   test "MULTI queues ZRANGE BYLEX", %{ctx: ctx, key: key} do
     assert 3 == Dispatcher.dispatch("ZADD", [key, "0", "a", "0", "b", "0", "c"], ctx)
     state = queue(multi(), "ZRANGE", [key, "[b", "+", "BYLEX"])

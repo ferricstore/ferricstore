@@ -5179,6 +5179,27 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert "" == Router.get(ctx, key)
   end
 
+  test "native MULTI DECRBY of the smallest integer keeps the old write below level 5" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "{multi-decrby:#{System.unique_integer([:positive])}}"
+    :ok = Ferricstore.Commands.Dispatcher.dispatch("SET", [key, "-1"], ctx)
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(
+               %{"command" => "DECRBY", "args" => [key, "-9223372036854775808"]},
+               state
+             )
+
+    # The data outcome is what replicas must agree on.
+    assert {:ok, [reply], _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
+    refute match?(%{"error" => _}, reply)
+
+    assert "9223372036854775807" == Ferricstore.Commands.Dispatcher.dispatch("GET", [key], ctx)
+  end
+
   test "native MULTI GEOSEARCHSTORE keeps the old answer for a missing source below level 5" do
     key = "{multi-geo:#{System.unique_integer([:positive])}}"
     destination = key <> ":dst"
