@@ -643,8 +643,8 @@ Cursor-based iteration over hash fields with optional pattern matching.
 
 | | |
 |---|---|
-| **Protocol command** | `HSCAN key cursor [MATCH pattern] [COUNT count]` |
-| **Return** | `[next_cursor, [field, value, ...]]` |
+| **Protocol command** | `HSCAN key cursor [MATCH pattern] [COUNT count] [NOVALUES]` |
+| **Return** | `[next_cursor, [field, value, ...]]`, or `[next_cursor, [field, ...]]` with NOVALUES |
 | **Status** | Cursor is an integer offset into the scanned field list. Default COUNT is 10. |
 
 ### Hash Field TTL

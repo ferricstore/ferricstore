@@ -515,7 +515,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
     do: {:hrandfield, key, parse_int(count), parse_withvalues(withvalues)}
 
   defp make_ast(_cmd, :hscan, [key, cursor | opts]),
-    do: {:hscan, key, parse_scan_cursor(cursor), parse_collection_scan_opts(opts)}
+    do: {:hscan, key, parse_scan_cursor(cursor), parse_hscan_opts(opts)}
 
   # Without a condition the form older releases parse; NX, XX, GT or LT adds
   # one (cluster feature level 5 inside MULTI, as does a TTL of 0).
@@ -1446,6 +1446,16 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp parse_scan_opts(opts), do: parse_scan_opts(opts, true, [])
   defp parse_collection_scan_opts(opts), do: parse_scan_opts(opts, false, [])
+
+  # HSCAN also takes NOVALUES (Redis 7.4), a flag without a value.
+  defp parse_hscan_opts(opts) do
+    {novalues, opts} = Enum.split_with(opts, &(String.upcase(&1) == "NOVALUES"))
+
+    case parse_collection_scan_opts(opts) do
+      parsed when is_list(parsed) and novalues != [] -> parsed ++ [novalues: true]
+      parsed -> parsed
+    end
+  end
 
   defp parse_scan_opts([], _allow_type?, acc), do: Enum.reverse(acc)
 

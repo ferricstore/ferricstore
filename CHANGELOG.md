@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Support HSCAN's NOVALUES option (Redis 7.4), which answers the fields
+  without their values; it answered a syntax error.
 - Answer Redis's errors for an EXPIRE, PEXPIRE, EXPIREAT or PEXPIREAT time
   that does not fit ("invalid expire time in 'expire' command"), SINTERCARD
   0 ("numkeys should be greater than 0"), SPOP with a negative count ("value

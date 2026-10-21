@@ -637,6 +637,22 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
       end
     end
 
+    describe "#{@path}: HSCAN NOVALUES" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      test "answers the fields only", %{ctx: ctx, key: key} do
+        assert 2 == run(ctx, "HSET", [key, "a", "1", "b", "2"])
+        assert ["0", fields] = run(ctx, "HSCAN", [key, "0", "NOVALUES"])
+        assert Enum.sort(fields) == ["a", "b"]
+
+        assert ["0", ["a"]] ==
+                 run(ctx, "HSCAN", [key, "0", "MATCH", "a", "novalues", "COUNT", "10"])
+
+        assert ["0", pairs] = run(ctx, "HSCAN", [key, "0"])
+        assert length(pairs) == 4
+      end
+    end
+
     describe "#{@path}: hyperloglog" do
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 

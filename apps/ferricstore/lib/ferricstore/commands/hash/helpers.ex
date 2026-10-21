@@ -343,8 +343,15 @@ defmodule Ferricstore.Commands.Hash.Helpers do
           {:ok, CollectionScan.cursor()} | {:error, binary()}
   def parse_cursor(cursor_str), do: CollectionScan.parse_cursor(cursor_str)
 
-  @spec parse_hscan_opts([binary()]) :: {:ok, binary() | nil, pos_integer()} | {:error, binary()}
-  def parse_hscan_opts(opts), do: do_parse_hscan_opts(opts, nil, 10)
+  @doc "Parses HSCAN's MATCH, COUNT and NOVALUES (Redis 7.4) options."
+  @spec parse_hscan_opts([binary()]) ::
+          {:ok, binary() | nil, pos_integer(), boolean()} | {:error, binary()}
+  def parse_hscan_opts(opts) do
+    {novalues, opts} = Enum.split_with(opts, &(String.upcase(&1) == "NOVALUES"))
+
+    with {:ok, match, count} <- do_parse_hscan_opts(opts, nil, 10),
+         do: {:ok, match, count, novalues != []}
+  end
 
   @spec hash_pairs_to_flat_list([{binary(), binary()}]) :: [binary()]
   def hash_pairs_to_flat_list(pairs), do: hash_pairs_to_flat_list(pairs, [])

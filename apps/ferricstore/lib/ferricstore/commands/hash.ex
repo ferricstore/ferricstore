@@ -391,7 +391,7 @@ defmodule Ferricstore.Commands.Hash do
   def handle("HSCAN", [key, cursor_str | opts], store) do
     with :ok <- TypeRegistry.command_check_type(key, :hash, store),
          {:ok, cursor} <- Helpers.parse_cursor(cursor_str),
-         {:ok, match_pattern, count} <- Helpers.parse_hscan_opts(opts),
+         {:ok, match_pattern, count, novalues?} <- Helpers.parse_hscan_opts(opts),
          {:ok, {next_cursor, pairs}} <-
            CollectionScan.page(
              store,
@@ -402,8 +402,7 @@ defmodule Ferricstore.Commands.Hash do
              match_pattern,
              false
            ) do
-      elements = Helpers.hash_pairs_to_flat_list(pairs)
-      [next_cursor, elements]
+      [next_cursor, hscan_elements(pairs, novalues?)]
     end
   end
 
@@ -794,7 +793,7 @@ defmodule Ferricstore.Commands.Hash do
   defp hscan_typed(key, cursor, opts, store) do
     if CollectionScan.valid_cursor?(cursor) do
       with :ok <- TypeRegistry.command_check_type(key, :hash, store),
-           {:ok, match_pattern, count} <- typed_scan_opts(opts),
+           {:ok, match_pattern, count} <- typed_scan_opts(Keyword.delete(opts, :novalues)),
            {:ok, {next_cursor, pairs}} <-
              CollectionScan.page(
                store,
@@ -805,8 +804,7 @@ defmodule Ferricstore.Commands.Hash do
                match_pattern,
                false
              ) do
-        elements = Helpers.hash_pairs_to_flat_list(pairs)
-        [next_cursor, elements]
+        [next_cursor, hscan_elements(pairs, Keyword.get(opts, :novalues, false))]
       end
     else
       {:error, "ERR invalid cursor"}
@@ -875,6 +873,10 @@ defmodule Ferricstore.Commands.Hash do
     do: ReadResult.command_error(failure)
 
   defp checked_batch_values(_invalid, _expected_count), do: {:error, "ERR storage read failed"}
+
+  # NOVALUES (Redis 7.4) answers the fields without their values.
+  defp hscan_elements(pairs, true), do: Enum.map(pairs, fn {field, _value} -> field end)
+  defp hscan_elements(pairs, false), do: Helpers.hash_pairs_to_flat_list(pairs)
 
   defp typed_scan_opts(opts), do: typed_scan_opts(opts, nil, 10)
 
