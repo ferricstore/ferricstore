@@ -9,7 +9,9 @@ All notable changes to FerricStore will be documented here.
   metadata as a plain string, which deleted the structure's data and left
   a string behind. They answer an error until the expiry can change in
   place. A MULTI transaction below cluster feature level 5 keeps the old
-  behavior, as older replicas do.
+  behavior, as older replicas do. The embedded `FerricStore.expire/2` and
+  `FerricStore.persist/1` refuse too (they went through a store without the
+  level-5 write flag, as did the other embedded compound commands).
 - Keep a t-digest's TTL through TDIGEST.ADD, TDIGEST.RESET and TDIGEST.MERGE;
   they rewrote it without one, so the key no longer expired.
 - Support `ZRANGE ... BYLEX` (with REV and LIMIT), as Redis does: it

@@ -5236,6 +5236,14 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert -1 == Ferricstore.Commands.Dispatcher.dispatch("TTL", [key], ctx)
   end
 
+  test "the embedded expire leaves a Bloom filter intact" do
+    key = "{embedded-bf-expire:#{System.unique_integer([:positive])}}"
+    ctx = FerricStore.Instance.get(:default)
+    assert 1 == Ferricstore.Commands.Dispatcher.dispatch("BF.ADD", [key, "a"], ctx)
+    assert {:error, "ERR " <> _} = FerricStore.expire(key, 100_000)
+    assert 1 == Ferricstore.Commands.Dispatcher.dispatch("BF.EXISTS", [key, "a"], ctx)
+  end
+
   defp geoadd(ctx, key) do
     Ferricstore.Commands.Dispatcher.dispatch("GEOADD", [key, "13.36", "38.11", "palermo"], ctx)
   end
