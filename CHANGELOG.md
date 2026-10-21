@@ -4,6 +4,9 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer `LPOP key 1` and `RPOP key 1` with a one-element array, as Redis
+  does for any count; they answered the element by itself. `LPOS` with
+  `COUNT` answers an empty array for a missing key instead of nil.
 - Accept ZRANGE's Redis 6.2 forms: `BYSCORE` (with `(` exclusive bounds and
   `LIMIT offset count`), `REV` for ranks and scores, in any order with
   `WITHSCORES`. They answered a syntax or arity error; only the rank form

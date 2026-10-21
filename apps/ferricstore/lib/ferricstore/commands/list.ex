@@ -30,7 +30,7 @@ defmodule Ferricstore.Commands.List do
     with :ok <- TypeRegistry.command_check_type(key, :list, store) do
       case Integer.parse(count_str) do
         {count, ""} when count >= 0 ->
-          do_pop(key, store, :lpop, count)
+          key |> do_pop(store, :lpop, count) |> counted_pop_reply()
 
         _ ->
           {:error, "ERR value is not an integer or out of range"}
@@ -49,7 +49,7 @@ defmodule Ferricstore.Commands.List do
     with :ok <- TypeRegistry.command_check_type(key, :list, store) do
       case Integer.parse(count_str) do
         {count, ""} when count >= 0 ->
-          do_pop(key, store, :rpop, count)
+          key |> do_pop(store, :rpop, count) |> counted_pop_reply()
 
         _ ->
           {:error, "ERR value is not an integer or out of range"}
@@ -137,7 +137,9 @@ defmodule Ferricstore.Commands.List do
     with :ok <- TypeRegistry.command_check_type(key, :list, store) do
       case parse_lpos_opts(opts) do
         {:ok, rank, count, maxlen} ->
-          execute_list_op(key, store, {:lpos, element, rank, count, maxlen})
+          key
+          |> execute_list_op(store, {:lpos, element, rank, count, maxlen})
+          |> lpos_reply(count)
 
         {:error, _} = error ->
           error
@@ -270,7 +272,9 @@ defmodule Ferricstore.Commands.List do
     with :ok <- TypeRegistry.command_check_type(key, :list, store) do
       case parse_lpos_opts(opts) do
         {:ok, rank, count, maxlen} ->
-          execute_list_op(key, store, {:lpos, element, rank, count, maxlen})
+          key
+          |> execute_list_op(store, {:lpos, element, rank, count, maxlen})
+          |> lpos_reply(count)
 
         {:error, _} = error ->
           error
@@ -444,11 +448,20 @@ defmodule Ferricstore.Commands.List do
 
   defp pop_parsed(key, store, direction, count) when count >= 0 do
     with :ok <- TypeRegistry.command_check_type(key, :list, store),
-         do: do_pop(key, store, direction, count)
+         do: key |> do_pop(store, direction, count) |> counted_pop_reply()
   end
+
+  # With a count, LPOP and RPOP answer an array even for one element; the
+  # list operation answers one popped element by itself.
+  defp counted_pop_reply(element) when is_binary(element), do: [element]
+  defp counted_pop_reply(reply), do: reply
 
   defp pop_parsed(_key, _store, _direction, _count),
     do: {:error, "ERR value is not an integer or out of range"}
+
+  # With COUNT, LPOS answers an array, empty when the key does not exist.
+  defp lpos_reply(nil, count) when is_integer(count), do: []
+  defp lpos_reply(reply, _count), do: reply
 
   defp parse_lpos_opts(opts), do: parse_lpos_opts(opts, 1, nil, 0)
   defp parse_lpos_opts([], rank, count, maxlen), do: {:ok, rank, count, maxlen}
