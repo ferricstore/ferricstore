@@ -245,13 +245,8 @@ defmodule Ferricstore.Raft.PromotedFileSyncTest do
       key: key,
       table: table
     } do
-      partition = Router.shard_for(ctx, key) + 1
-
-      trim_root =
-        :ferricstore_waraft_backend
-        |> :wa_raft_part_sup.registered_partition_path(partition)
-        |> Path.join("segment_log")
-        |> Path.dirname()
+      # The segment log lives in <partition>/segment_log; trim passes its parent.
+      trim_root = ctx |> partition_root(key) |> Path.join("segment_log") |> Path.dirname()
 
       assert table == PromotedFileSync.registered_table(trim_root)
 
@@ -316,16 +311,18 @@ defmodule Ferricstore.Raft.PromotedFileSyncTest do
   defp sismember(ctx, key, member),
     do: Dispatcher.dispatch("SISMEMBER", [key, member], ctx) |> to_string()
 
+  # The tracking of the default backend's storage for `key`'s shard, found the
+  # way a log trim finds it (other instances in the same VM register too).
   defp storage_table(ctx, key) do
-    partition = Router.shard_for(ctx, key) + 1
-
-    {_key, table} =
-      Enum.find(:persistent_term.get(), fn
-        {{PromotedFileSync, root}, _table} -> String.ends_with?(root, ".#{partition}")
-        _other -> false
-      end) || flunk("no promoted file tracking registered for partition #{partition}")
-
+    table = ctx |> partition_root(key) |> PromotedFileSync.registered_table()
+    assert table != nil and :ets.info(table, :owner) != :undefined
     table
+  end
+
+  defp partition_root(ctx, key) do
+    :ferricstore_waraft_backend
+    |> :wa_raft_part_sup.registered_partition_path(Router.shard_for(ctx, key) + 1)
+    |> to_string()
   end
 
   defp wait_promoted(ctx, key, tries \\ 200) do
