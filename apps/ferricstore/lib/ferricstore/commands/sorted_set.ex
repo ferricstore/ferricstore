@@ -221,7 +221,7 @@ defmodule Ferricstore.Commands.SortedSet do
   def handle("ZPOPMIN", [key, count_str], store) do
     case Integer.parse(count_str) do
       {count, ""} when count >= 0 -> zpop_parsed(key, count, false, store)
-      _ -> {:error, "ERR value is not an integer or out of range"}
+      _ -> zpop_count_error()
     end
   end
 
@@ -240,7 +240,7 @@ defmodule Ferricstore.Commands.SortedSet do
   def handle("ZPOPMAX", [key, count_str], store) do
     case Integer.parse(count_str) do
       {count, ""} when count >= 0 -> zpop_parsed(key, count, true, store)
-      _ -> {:error, "ERR value is not an integer or out of range"}
+      _ -> zpop_count_error()
     end
   end
 
@@ -483,8 +483,10 @@ defmodule Ferricstore.Commands.SortedSet do
 
   def handle_ast({:zpopmin, key}, store), do: zpop_parsed(key, 1, false, store)
   def handle_ast({:zpopmax, key}, store), do: zpop_parsed(key, 1, true, store)
-  def handle_ast({:zpopmin, _key, {:error, reason}}, _store), do: {:error, reason}
-  def handle_ast({:zpopmax, _key, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({tag, _key, {:error, _reason}}, _store) when tag in [:zpopmin, :zpopmax],
+    do: zpop_count_error()
+
   def handle_ast({:zpopmin, key, count}, store), do: zpop_parsed(key, count, false, store)
   def handle_ast({:zpopmax, key, count}, store), do: zpop_parsed(key, count, true, store)
 
@@ -1114,8 +1116,10 @@ defmodule Ferricstore.Commands.SortedSet do
     end
   end
 
-  defp zpop_parsed(_key, _count, _reverse?, _store),
-    do: {:error, "ERR value is not an integer or out of range"}
+  defp zpop_parsed(_key, _count, _reverse?, _store), do: zpop_count_error()
+
+  # Redis's error for a ZPOPMIN or ZPOPMAX count that is negative or no integer.
+  defp zpop_count_error, do: {:error, "ERR value is out of range, must be positive"}
 
   defp zpop_members(_key, 0, _reverse?, _store), do: {:ok, []}
 

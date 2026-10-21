@@ -759,26 +759,26 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zpopmin do
           store = MockStore.make()
           SortedSet.handle("ZADD", ["zs", "1.0", "a"], store)
           assert {:error, msg} = SortedSet.handle("ZPOPMIN", ["zs", "-1"], store)
-          assert msg =~ "not an integer"
+          assert msg == "ERR value is out of range, must be positive"
         end
 
         test "ZPOPMAX with negative count returns error" do
           store = MockStore.make()
           SortedSet.handle("ZADD", ["zs", "1.0", "a"], store)
           assert {:error, msg} = SortedSet.handle("ZPOPMAX", ["zs", "-1"], store)
-          assert msg =~ "not an integer"
+          assert msg == "ERR value is out of range, must be positive"
         end
 
         test "ZPOPMIN with non-integer count returns error" do
           store = MockStore.make()
           assert {:error, msg} = SortedSet.handle("ZPOPMIN", ["zs", "abc"], store)
-          assert msg =~ "not an integer"
+          assert msg == "ERR value is out of range, must be positive"
         end
 
         test "ZPOPMAX with non-integer count returns error" do
           store = MockStore.make()
           assert {:error, msg} = SortedSet.handle("ZPOPMAX", ["zs", "abc"], store)
-          assert msg =~ "not an integer"
+          assert msg == "ERR value is out of range, must be positive"
         end
       end
 

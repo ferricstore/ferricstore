@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer no members for a negative LIMIT offset in ZRANGEBYSCORE,
+  ZREVRANGEBYSCORE and ZRANGE BYSCORE, as Redis does (it answered "syntax
+  error"), and Redis's "value is out of range, must be positive" for a
+  ZPOPMIN or ZPOPMAX count that is negative or no integer.
 - Keep a HyperLogLog's TTL through PFADD and PFMERGE, as Redis does; they
   rewrote the sketch without it, so the key no longer expired. The state
   machine applies them, so the TTL is kept once cluster feature level 5 is

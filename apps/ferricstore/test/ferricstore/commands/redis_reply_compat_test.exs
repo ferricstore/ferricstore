@@ -88,6 +88,28 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
       end
     end
 
+    describe "#{@path}: score range LIMIT and pop counts" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      test "a negative LIMIT offset answers no members", %{ctx: ctx, key: key} do
+        assert 3 == run(ctx, "ZADD", [key, "1", "a", "2", "b", "3", "c"])
+        assert [] == run(ctx, "ZRANGEBYSCORE", [key, "-inf", "+inf", "LIMIT", "-1", "2"])
+        assert [] == run(ctx, "ZREVRANGEBYSCORE", [key, "+inf", "-inf", "LIMIT", "-5", "-1"])
+        assert [] == run(ctx, "ZRANGE", [key, "-inf", "+inf", "BYSCORE", "LIMIT", "-1", "2"])
+
+        assert ["b", "c"] ==
+                 run(ctx, "ZRANGE", [key, "-inf", "+inf", "BYSCORE", "LIMIT", "1", "-5"])
+      end
+
+      test "ZPOPMIN and ZPOPMAX answer Redis's error for a bad count", %{ctx: ctx, key: key} do
+        for command <- ["ZPOPMIN", "ZPOPMAX"], count <- ["-1", "x"] do
+          assert {:error, "ERR value is out of range, must be positive"} ==
+                   run(ctx, command, [key, count]),
+                 "#{command} #{count}"
+        end
+      end
+    end
+
     describe "#{@path}: ZRANGE with Redis 6.2 options" do
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 

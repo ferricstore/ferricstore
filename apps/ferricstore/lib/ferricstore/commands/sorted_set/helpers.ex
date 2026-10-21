@@ -291,8 +291,10 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
           [offset_str, count_str | remaining] ->
             with {off, ""} <- Integer.parse(offset_str),
                  {cnt, ""} <- Integer.parse(count_str) do
+              # As in Redis, a negative offset answers no members and a
+              # negative count all of them.
               if off < 0 do
-                {:error, "ERR syntax error"}
+                do_parse_range_by_score_opts(remaining, ws, 0, 0)
               else
                 real_count = if cnt < 0, do: :all, else: cnt
                 do_parse_range_by_score_opts(remaining, ws, off, real_count)
@@ -322,8 +324,16 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
          _offset,
          _count
        )
-       when is_integer(offset) and offset >= 0 and is_integer(count) do
-    do_typed_range_by_score_opts(rest, with_scores, offset, if(count < 0, do: :all, else: count))
+       when is_integer(offset) and is_integer(count) do
+    if offset < 0,
+      do: do_typed_range_by_score_opts(rest, with_scores, 0, 0),
+      else:
+        do_typed_range_by_score_opts(
+          rest,
+          with_scores,
+          offset,
+          if(count < 0, do: :all, else: count)
+        )
   end
 
   defp do_typed_range_by_score_opts(_opts, _with_scores, _offset, _count),
