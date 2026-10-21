@@ -631,8 +631,9 @@ defmodule Ferricstore.Commands.NativeAstParser do
         tag = if reverse?, do: :zrevrangebyscore, else: :zrangebyscore
         make_ast(cmd, tag, [key, start, stop | SortedSetHelpers.zrange_score_options(parsed)])
 
-      {:ok, %{by: :lex}} ->
-        {:zrange, key, {:error, "ERR ZRANGE BYLEX is not supported"}, nil}
+      # Checked when it runs, as the command handler checks it.
+      {:ok, %{by: :lex, rev: rev, limit: limit}} ->
+        {:zrange, key, {:lex, start, stop}, %{rev: rev, limit: limit}}
 
       {:error, reason} ->
         {:zrange, key, {:error, reason}, nil}

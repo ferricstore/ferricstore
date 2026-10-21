@@ -4,6 +4,9 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Support `ZRANGE ... BYLEX` (with REV and LIMIT), as Redis does: it
+  answered "ERR ZRANGE BYLEX is not supported". It reads every member of
+  the set. Inside MULTI it is queued only at cluster feature level 5.
 - Answer no members for a negative LIMIT offset in ZRANGEBYSCORE,
   ZREVRANGEBYSCORE and ZRANGE BYSCORE, as Redis does (it answered "syntax
   error"), and Redis's "value is out of range, must be positive" for a

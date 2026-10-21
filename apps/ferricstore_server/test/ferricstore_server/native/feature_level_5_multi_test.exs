@@ -140,6 +140,14 @@ defmodule FerricstoreServer.Native.FeatureLevel5MultiTest do
     assert {:ok, [1], _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
   end
 
+  test "MULTI queues ZRANGE BYLEX", %{ctx: ctx, key: key} do
+    assert 3 == Dispatcher.dispatch("ZADD", [key, "0", "a", "0", "b", "0", "c"], ctx)
+    state = queue(multi(), "ZRANGE", [key, "[b", "+", "BYLEX"])
+
+    assert {:ok, [["b", "c"]], _state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, state)
+  end
+
   test "MULTI queues ZADD INCR", %{ctx: ctx, key: key} do
     state = multi()
     state = queue(state, "ZADD", [key, "INCR", "2", "m"])

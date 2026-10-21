@@ -55,6 +55,9 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
       when unit in [:ex, :px] and is_list(fields),
       do: 5
 
+  # ZRANGE ... BYLEX (older releases have no clause for its form).
+  def required_level({:zrange, _key, {:lex, _start, _stop}, opts}) when is_map(opts), do: 5
+
   # ZADD INCR (older releases refuse the option).
   def required_level({:zadd, _key, opts, pairs}) when is_list(opts) and is_list(pairs),
     do: if(:incr in opts, do: 5)

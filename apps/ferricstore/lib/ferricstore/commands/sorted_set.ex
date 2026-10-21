@@ -107,8 +107,8 @@ defmodule Ferricstore.Commands.SortedSet do
         command = if reverse?, do: "ZREVRANGEBYSCORE", else: "ZRANGEBYSCORE"
         handle(command, [key, start_str, stop_str | Helpers.zrange_score_options(parsed)], store)
 
-      {:ok, %{by: :lex}} ->
-        {:error, "ERR ZRANGE BYLEX is not supported"}
+      {:ok, %{by: :lex} = parsed} ->
+        zrange_lex(key, start_str, stop_str, parsed, store)
 
       {:error, _reason} = error ->
         error
@@ -454,6 +454,13 @@ defmodule Ferricstore.Commands.SortedSet do
     do: zincrby_parsed(key, increment, member, store)
 
   def handle_ast({:zrange, _key, {:error, reason}, _tail}, _store), do: {:error, reason}
+
+  def handle_ast(
+        {:zrange, key, {:lex, start, stop}, %{rev: _rev, limit: _limit} = parsed},
+        store
+      ),
+      do: zrange_lex(key, start, stop, parsed, store)
+
   def handle_ast({:zrevrange, _key, {:error, reason}, _tail}, _store), do: {:error, reason}
 
   def handle_ast({:zrange, _key, _start, _stop, {:error, reason}}, _store),
@@ -1004,6 +1011,27 @@ defmodule Ferricstore.Commands.SortedSet do
       true -> Helpers.format_score(new_score)
       {:error, _reason} = error -> rollback_new_zset_type_marker(key, store, type_status, error)
       other -> {:error, other}
+    end
+  end
+
+  # ZRANGE ... BYLEX walks the members in order, as Redis does: from the first
+  # at or after min while they lie at or before max (with REV, the bounds
+  # come max first and the walk runs backwards). It reads every member.
+  defp zrange_lex(key, start, stop, %{rev: rev?, limit: limit}, store) do
+    {min, max} = if rev?, do: {stop, start}, else: {start, stop}
+
+    with {:ok, min, max} <- Helpers.parse_lex_range(min, max),
+         {:ok, offset, count} <- Helpers.parse_range_limit(limit),
+         members when is_list(members) <- zrange_rank_parsed(key, 0, -1, false, rev?, store) do
+      {from, to} =
+        if rev?,
+          do: {&Helpers.lex_before_max?(&1, max), &Helpers.lex_after_min?(&1, min)},
+          else: {&Helpers.lex_after_min?(&1, min), &Helpers.lex_before_max?(&1, max)}
+
+      members
+      |> Enum.drop_while(&(not from.(&1)))
+      |> Enum.take_while(to)
+      |> Helpers.apply_limit(offset, count)
     end
   end
 

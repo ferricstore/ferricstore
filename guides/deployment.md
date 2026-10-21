@@ -580,7 +580,8 @@ shard_0: 2
     until every node runs this release:
     - MULTI queues `ZRANK`/`ZREVRANK ... WITHSCORE`, `PFMERGE` with no
       source, `HEXPIRE`/`HPEXPIRE` with NX, XX, GT or LT or a TTL of 0,
-      `HSETEX`'s Redis 8 form, `HGETEX` with a TTL of 0 and `ZADD ... INCR`.
+      `HSETEX`'s Redis 8 form, `HGETEX` with a TTL of 0, `ZADD ... INCR` and
+      `ZRANGE ... BYLEX`.
     - Inside MULTI, BITOP deletes its destination for an empty result,
       GEOSEARCHSTORE empties its destination for a missing source and
       measures with Redis's Earth radius, and HGETEX with a past time deletes

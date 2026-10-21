@@ -107,6 +107,55 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
 
   defp parse_zrange_options(_options, _parsed), do: {:error, "ERR syntax error"}
 
+  @doc """
+  Parses BYLEX bounds as Redis does: `-` and `+` for the ends, `[` before an
+  inclusive member and `(` before an exclusive one.
+  """
+  @spec parse_lex_range(binary(), binary()) :: {:ok, term(), term()} | {:error, binary()}
+  def parse_lex_range(min, max) do
+    with {:ok, min} <- parse_lex_bound(min),
+         {:ok, max} <- parse_lex_bound(max) do
+      {:ok, min, max}
+    else
+      :error -> {:error, "ERR min or max not valid string range item"}
+    end
+  end
+
+  defp parse_lex_bound("-"), do: {:ok, :neg_inf}
+  defp parse_lex_bound("+"), do: {:ok, :pos_inf}
+  defp parse_lex_bound("[" <> member), do: {:ok, {:incl, member}}
+  defp parse_lex_bound("(" <> member), do: {:ok, {:excl, member}}
+  defp parse_lex_bound(_bound), do: :error
+
+  @doc "Whether `member` lies at or after a parsed lex `min`."
+  def lex_after_min?(_member, :neg_inf), do: true
+  def lex_after_min?(_member, :pos_inf), do: false
+  def lex_after_min?(member, {:incl, min}), do: member >= min
+  def lex_after_min?(member, {:excl, min}), do: member > min
+
+  @doc "Whether `member` lies at or before a parsed lex `max`."
+  def lex_before_max?(_member, :pos_inf), do: true
+  def lex_before_max?(_member, :neg_inf), do: false
+  def lex_before_max?(member, {:incl, max}), do: member <= max
+  def lex_before_max?(member, {:excl, max}), do: member < max
+
+  @doc """
+  A parsed ZRANGE LIMIT as `{offset, count}`, Redis's way: a negative offset
+  answers no members and a negative count all of them.
+  """
+  @spec parse_range_limit(nil | {binary(), binary()}) ::
+          {:ok, non_neg_integer(), non_neg_integer() | :all} | {:error, binary()}
+  def parse_range_limit(nil), do: {:ok, 0, :all}
+
+  def parse_range_limit({offset, count}) do
+    case {Integer.parse(offset), Integer.parse(count)} do
+      {{offset, ""}, {_count, ""}} when offset < 0 -> {:ok, 0, 0}
+      {{offset, ""}, {count, ""}} when count < 0 -> {:ok, offset, :all}
+      {{offset, ""}, {count, ""}} -> {:ok, offset, count}
+      _invalid -> {:error, "ERR value is not an integer or out of range"}
+    end
+  end
+
   @doc "The ZRANGEBYSCORE options that carry a parsed ZRANGE's LIMIT and WITHSCORES."
   def zrange_score_options(%{limit: limit, with_scores: with_scores}) do
     limit_options =

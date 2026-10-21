@@ -88,6 +88,39 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
       end
     end
 
+    describe "#{@path}: ZRANGE BYLEX" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      test "ranges members lexically as Redis does", %{ctx: ctx, key: key} do
+        assert 5 == run(ctx, "ZADD", [key, "0", "a", "0", "b", "0", "c", "0", "d", "0", "e"])
+        lex = fn args -> run(ctx, "ZRANGE", [key | args]) end
+        assert ["b", "c", "d"] == lex.(["[b", "[d", "BYLEX"])
+        assert ["c"] == lex.(["(b", "(d", "bylex"])
+        assert ["a", "b", "c", "d", "e"] == lex.(["-", "+", "BYLEX"])
+        assert ["e", "d", "c", "b", "a"] == lex.(["+", "-", "BYLEX", "REV"])
+        assert ["d", "c", "b"] == lex.(["[d", "[b", "BYLEX", "REV"])
+        assert ["b", "c"] == lex.(["-", "+", "BYLEX", "LIMIT", "1", "2"])
+        assert [] == lex.(["-", "+", "BYLEX", "LIMIT", "-1", "2"])
+        assert ["b", "c", "d", "e"] == lex.(["-", "+", "BYLEX", "LIMIT", "1", "-1"])
+        assert [] == lex.(["[z", "[a", "BYLEX"])
+        assert ["c"] == lex.(["[c", "[c", "BYLEX"])
+
+        assert {:error, "ERR min or max not valid string range item"} ==
+                 lex.(["b", "d", "BYLEX"])
+
+        assert {:error, "ERR syntax error, WITHSCORES not supported in combination with BYLEX"} ==
+                 lex.(["[b", "[d", "BYLEX", "WITHSCORES"])
+
+        assert [] == run(ctx, "ZRANGE", [key <> ":missing", "-", "+", "BYLEX"])
+        :ok = run(ctx, "SET", [key <> ":s", "v"])
+        assert @wrongtype == run(ctx, "ZRANGE", [key <> ":s", "-", "+", "BYLEX"])
+        mixed = key <> ":mixed"
+        assert 3 == run(ctx, "ZADD", [mixed, "1", "b", "2", "a", "3", "c"])
+        assert ["b", "a", "c"] == run(ctx, "ZRANGE", [mixed, "[b", "[c", "BYLEX"])
+        assert ["b", "a"] == run(ctx, "ZRANGE", [mixed, "[a", "[b", "BYLEX"])
+      end
+    end
+
     describe "#{@path}: score range LIMIT and pop counts" do
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 

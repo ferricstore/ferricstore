@@ -236,7 +236,7 @@ documented in `guides/flow-elixir-sdk.md`.
 
 | Command | Difference |
 |---------|-----------|
-| `ZRANGE` | Unified `BYSCORE`/`BYLEX`/`REV`/`LIMIT` syntax is not yet supported -- use `ZRANGEBYSCORE`/`ZREVRANGEBYSCORE` instead |
+| `ZRANGE` | `BYLEX` reads every member of the set to answer the range |
 | `SCAN` | Cursor is key-based (alphabetic position), not an opaque integer |
 | `HSCAN`/`SSCAN`/`ZSCAN` | Cursor is an integer offset into the scanned list |
 | `FLUSHDB`/`FLUSHALL` | `ASYNC`/`SYNC` accepted but both execute synchronously; true async reclaim happens during Bitcask merge |
@@ -883,14 +883,14 @@ Returns zero-based rank of a member.
 
 ### ZRANGE / ZREVRANGE
 
-Range query by index with optional WITHSCORES.
+Range query by index, score or member, with optional WITHSCORES.
 
 | | |
 |---|---|
-| **Protocol command** | `ZRANGE key start stop [WITHSCORES]`, `ZREVRANGE key start stop [WITHSCORES]` |
+| **Protocol command** | `ZRANGE key start stop [BYSCORE \| BYLEX] [REV] [LIMIT offset count] [WITHSCORES]`, `ZREVRANGE key start stop [WITHSCORES]` |
 | **Embedded API** | `FerricStore.zrange(key, start, stop, withscores: bool)` |
 | **Return** | Array of members, or interleaved `[member, score, ...]` with WITHSCORES |
-| **Status** | Index-based syntax is supported. Unified `ZRANGE` syntax (`BYSCORE`/`BYLEX`/`REV`/`LIMIT`) is not yet supported. Use `ZRANGEBYSCORE`/`ZREVRANGEBYSCORE` for score ranges. |
+| **Status** | Supported as in Redis 6.2+, including `(` exclusive score bounds and BYLEX's `[`/`(`/`-`/`+` bounds (WITHSCORES is refused with BYLEX). BYLEX reads every member. Inside MULTI, BYLEX needs cluster feature level 5, and the BYSCORE and REV forms are refused (use `ZRANGEBYSCORE`/`ZREVRANGEBYSCORE`/`ZREVRANGE`). |
 
 ### ZRANGEBYSCORE / ZREVRANGEBYSCORE
 
