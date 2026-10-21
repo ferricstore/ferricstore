@@ -162,7 +162,7 @@ defmodule Ferricstore.Commands.Strings do
   def handle("DECRBY", [key, delta_str], store) do
     case Integer.parse(delta_str) do
       {delta, ""} when delta >= @min_int64 and delta <= @max_int64 ->
-        incr_string_key(key, -delta, store)
+        decrby(key, delta, store)
 
       {_delta, ""} ->
         {:error, "ERR value is not an integer or out of range"}
@@ -395,7 +395,7 @@ defmodule Ferricstore.Commands.Strings do
     do: incr_string_key(key, delta, store)
 
   def handle_ast({:decrby, key, delta}, store) when is_integer(delta),
-    do: incr_string_key(key, -delta, store)
+    do: decrby(key, delta, store)
 
   def handle_ast({:incrbyfloat, key, delta}, store) when is_float(delta),
     do: incr_string_key_float(key, delta, store)
@@ -696,6 +696,16 @@ defmodule Ferricstore.Commands.Strings do
         GetEx.after_lookup(key, {:error, "ERR invalid expire time in 'getex' command"}, store)
     end
   end
+
+  # Redis refuses to negate the smallest integer before it reads the key.
+  # Older releases apply it inside MULTI, so the refusal waits for level 5.
+  defp decrby(key, @min_int64 = delta, store) do
+    if Ops.level_5_writes?(store),
+      do: {:error, "ERR decrement would overflow"},
+      else: incr_string_key(key, -delta, store)
+  end
+
+  defp decrby(key, delta, store), do: incr_string_key(key, -delta, store)
 
   defp incr_string_key(key, delta, store) do
     case ensure_string_key(key, store) do

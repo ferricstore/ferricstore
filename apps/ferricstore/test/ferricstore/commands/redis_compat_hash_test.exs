@@ -283,7 +283,7 @@ defmodule Ferricstore.Commands.RedisCompatHashTest do
       Hash.handle("HSET", ["h", "name", "alice"], store)
 
       result = Hash.handle("HINCRBYFLOAT", ["h", "name", "1.5"], store)
-      assert {:error, "ERR hash value is not a valid float"} = result
+      assert {:error, "ERR hash value is not a float"} = result
     end
 
     test "HINCRBY initializes missing field to 0 before incrementing" do

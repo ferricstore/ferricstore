@@ -736,6 +736,16 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
                  "#{command} COUNT #{count}"
         end
 
+        :ok = run(ctx, "SET", [key <> ":n", "1"])
+
+        assert {:error, "ERR decrement would overflow"} ==
+                 run(ctx, "DECRBY", [key <> ":n", "-9223372036854775808"])
+
+        assert 1 == run(ctx, "HSET", [key <> ":hf", "z", "abc"])
+
+        assert {:error, "ERR hash value is not a float"} ==
+                 run(ctx, "HINCRBYFLOAT", [key <> ":hf", "z", "1"])
+
         for command <- ["LPOP", "RPOP"] do
           assert {:error, "ERR value is out of range, must be positive"} ==
                    run(ctx, command, [key, "-1"]),

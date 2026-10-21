@@ -266,7 +266,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
                 )
 
               :error ->
-                {:error, "ERR hash value is not a valid float"}
+                {:error, "ERR hash value is not a float"}
             end
         end
       end
@@ -295,7 +295,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             {:error, "ERR increment would produce NaN or Infinity"}
 
           :error ->
-            {:error, "ERR hash value is not a valid float"}
+            {:error, "ERR hash value is not a float"}
         end
       end
 

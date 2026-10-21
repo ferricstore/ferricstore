@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer Redis's texts "ERR decrement would overflow" (DECRBY of
+  -9223372036854775808, refused before reading the key; inside MULTI only at
+  feature level 5, since older releases apply it) and "ERR hash value is not a
+  float" (HINCRBYFLOAT on a non-float field).
 - Answer Redis's "NOGROUP No such key '<key>' or consumer group '<group>'
   in XREADGROUP with GROUP option" from XREADGROUP without the group.
 - Answer Redis's errors for BITPOS with a bit other than 0 or 1 ("The bit

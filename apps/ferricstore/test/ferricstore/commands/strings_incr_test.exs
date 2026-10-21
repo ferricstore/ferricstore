@@ -252,6 +252,25 @@ defmodule Ferricstore.Commands.StringsIncrTest do
 
       assert "0" == store.get.("k")
     end
+
+    test "DECRBY of the smallest integer answers Redis's error at level 5" do
+      store = Map.put(MockStore.make(%{"k" => {"-1", 0}}), :level_5_writes?, true)
+
+      assert {:error, "ERR decrement would overflow"} =
+               Strings.handle("DECRBY", ["k", "-9223372036854775808"], store)
+
+      assert {:error, "ERR decrement would overflow"} =
+               Strings.handle_ast({:decrby, "k", -9_223_372_036_854_775_808}, store)
+
+      assert "-1" == store.get.("k")
+    end
+
+    test "DECRBY of the smallest integer keeps the older write below level 5" do
+      store = MockStore.make(%{"k" => {"-1", 0}})
+
+      assert {:ok, 9_223_372_036_854_775_807} =
+               Strings.handle("DECRBY", ["k", "-9223372036854775808"], store)
+    end
   end
 
   # ===========================================================================

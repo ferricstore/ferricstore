@@ -979,7 +979,7 @@ defmodule Ferricstore.Commands.Hash do
             end
 
           :error ->
-            {:error, "ERR hash value is not a valid float"}
+            {:error, "ERR hash value is not a float"}
         end
 
       {:error, _reason} = error ->
