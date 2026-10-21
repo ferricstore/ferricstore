@@ -144,7 +144,8 @@ defmodule Ferricstore.Commands.DispatcherTest do
     assert ["a", "B", "c"] == Dispatcher.dispatch_ast({:lrange, "l", 0, -1}, store)
     assert 4 == Dispatcher.dispatch_ast({:linsert, "l", :before, "B", "x"}, store)
     assert 1 == Dispatcher.dispatch_ast({:lrem, "l", 1, "x"}, store)
-    assert "a" == Dispatcher.dispatch_ast({:lpop, "l", 1}, store)
+    # An explicit count answers an array, as LPOP key 1 does in Redis.
+    assert ["a"] == Dispatcher.dispatch_ast({:lpop, "l", 1}, store)
     assert "c" == Dispatcher.dispatch_ast({:rpop, "l"}, store)
   end
 
