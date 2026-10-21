@@ -941,6 +941,46 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           assert [old_entry] == :ets.lookup(ets, key)
         end
 
+        test "GETSET and GETEX report a write the size limit refuses", %{
+          state: state,
+          ets: ets
+        } do
+          context = Ferricstore.Raft.ApplyContext.new(max_value_size: 4)
+
+          state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          getset_key = "getset_replicated_size_limit"
+
+          getset_entry =
+            {getset_key, "old", 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size("old")}
+
+          :ets.insert(ets, getset_entry)
+
+          {_new_state, result} = StateMachine.apply(%{}, {:getset, getset_key, "toolong"}, state)
+
+          assert {:error, "ERR value too large (7 bytes, max 4 bytes)"} = result
+          assert [getset_entry] == :ets.lookup(ets, getset_key)
+
+          # A value written under a larger limit cannot be rewritten with a TTL.
+          getex_key = "getex_replicated_size_limit"
+
+          getex_entry =
+            {getex_key, "longer", 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size("longer")}
+
+          :ets.insert(ets, getex_entry)
+          expire_at_ms = Ferricstore.HLC.now_ms() + 60_000
+
+          {_new_state, result} =
+            StateMachine.apply(%{}, {:getex, getex_key, expire_at_ms}, state)
+
+          assert {:error, "ERR value too large (6 bytes, max 4 bytes)"} = result
+          assert [getex_entry] == :ets.lookup(ets, getex_key)
+        end
+
         test "SETRANGE rejects padding above the replicated size limit", %{
           state: state,
           ets: ets
