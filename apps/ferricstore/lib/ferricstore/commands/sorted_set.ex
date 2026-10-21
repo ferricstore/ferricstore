@@ -219,7 +219,8 @@ defmodule Ferricstore.Commands.SortedSet do
   # ---------------------------------------------------------------------------
 
   def handle("ZCOUNT", [key, min_str, max_str], store) do
-    with :ok <- TypeRegistry.command_check_type(key, :zset, store) do
+    with :ok <- score_range_arguments(min_str, max_str, []),
+         :ok <- TypeRegistry.command_check_type(key, :zset, store) do
       case {Helpers.parse_score_bound(min_str), Helpers.parse_score_bound(max_str)} do
         {{:ok, min_val, min_excl}, {:ok, max_val, max_excl}} ->
           min_bound = Helpers.raw_score_bound(min_val, min_excl)
@@ -380,7 +381,8 @@ defmodule Ferricstore.Commands.SortedSet do
   # ---------------------------------------------------------------------------
 
   def handle("ZRANGEBYSCORE", [key, min_str, max_str | opts], store) do
-    with :ok <- TypeRegistry.command_check_type(key, :zset, store) do
+    with :ok <- score_range_arguments(min_str, max_str, opts),
+         :ok <- TypeRegistry.command_check_type(key, :zset, store) do
       case {Helpers.parse_score_bound(min_str), Helpers.parse_score_bound(max_str)} do
         {{:ok, min_val, min_excl}, {:ok, max_val, max_excl}} ->
           case Helpers.parse_range_by_score_opts(opts) do
@@ -416,7 +418,8 @@ defmodule Ferricstore.Commands.SortedSet do
   # ---------------------------------------------------------------------------
 
   def handle("ZREVRANGEBYSCORE", [key, max_str, min_str | opts], store) do
-    with :ok <- TypeRegistry.command_check_type(key, :zset, store) do
+    with :ok <- score_range_arguments(min_str, max_str, opts),
+         :ok <- TypeRegistry.command_check_type(key, :zset, store) do
       case {Helpers.parse_score_bound(min_str), Helpers.parse_score_bound(max_str)} do
         {{:ok, min_val, min_excl}, {:ok, max_val, max_excl}} ->
           case Helpers.parse_range_by_score_opts(opts) do
@@ -546,6 +549,20 @@ defmodule Ferricstore.Commands.SortedSet do
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
+
+  # Redis parses a score range's bounds and options before it looks up the
+  # key, so their errors come before a wrong type.
+  defp score_range_arguments(min_str, max_str, opts) do
+    with {:ok, _min, _min_exclusive} <- Helpers.parse_score_bound(min_str),
+         {:ok, _max, _max_exclusive} <- Helpers.parse_score_bound(max_str) do
+      case Helpers.parse_range_by_score_opts(opts) do
+        {:error, _reason} = error -> error
+        _parsed -> :ok
+      end
+    else
+      _not_a_float -> {:error, "ERR min or max is not a float"}
+    end
+  end
 
   defp parse_rank_range_opts([]), do: {:ok, false}
 

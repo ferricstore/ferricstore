@@ -101,6 +101,15 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
                  run(ctx, "ZRANGE", [key, "0", "-1", "LIMIT", "0", "1"])
       end
 
+      test "bad score bounds are reported before a wrong type", %{ctx: ctx, key: key} do
+        :ok = run(ctx, "SET", [key <> ":s", "v"])
+        not_float = {:error, "ERR min or max is not a float"}
+        assert not_float == run(ctx, "ZRANGE", [key <> ":s", "abc", "+inf", "BYSCORE"])
+        assert not_float == run(ctx, "ZRANGEBYSCORE", [key <> ":s", "abc", "+inf"])
+        assert not_float == run(ctx, "ZREVRANGEBYSCORE", [key <> ":s", "+inf", "(x"])
+        assert not_float == run(ctx, "ZCOUNT", [key <> ":s", "-inf", "nope"])
+      end
+
       test "a wrong type is reported for every form", %{ctx: ctx, key: key} do
         :ok = run(ctx, "SET", [key <> ":s", "v"])
         assert @wrongtype == run(ctx, "ZRANGE", [key <> ":s", "0", "-1", "REV"])

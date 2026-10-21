@@ -4,6 +4,9 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Report a bad score bound or option of ZRANGEBYSCORE, ZREVRANGEBYSCORE,
+  ZCOUNT and ZRANGE BYSCORE before a wrong key type, as Redis does ("ERR min
+  or max is not a float" rather than WRONGTYPE).
 - Answer an empty array for a ZRANGE or ZREVRANGE rank range whose negative
   stop falls before the first member (`ZRANGE key -5 -4` on three members),
   as Redis does; it answered the first member.
