@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Support HSETEX's Redis 8 form, `HSETEX key [FNX|FXX] [EX|PX|EXAT|PXAT|
+  KEEPTTL] FIELDS n field value...`, next to FerricStore's own
+  `HSETEX key seconds field value...`. At cluster feature level 5 it reads,
+  decides and writes as one replicated entry, so concurrent FNX or FXX
+  writers see one outcome. HGETEX now takes its options in any order, deletes
+  the fields for a TTL of 0 or a past time (answering their values, as Redis
+  does; it refused 0), and answers Redis's argument errors after the type
+  check. Inside MULTI, HSETEX's Redis form and HGETEX with a TTL of 0 are
+  queued only at level 5.
 - Answer `BITPOS missing 0 start end BIT` with 0, as every other BITPOS form
   of a missing key already did; it answered -1.
 - Add HEXPIREAT, HPEXPIREAT and HPEXPIRETIME (Redis 7.4). Inside MULTI they

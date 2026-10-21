@@ -539,8 +539,19 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp make_ast(_cmd, :hgetex, [key | opts]), do: parse_hgetex(key, opts)
 
-  defp make_ast(_cmd, :hsetex, [key, seconds | field_value_pairs]),
-    do: {:hsetex, key, parse_pos_int(seconds), field_value_pairs}
+  # Redis 8's form parses to {condition, expiry} (cluster feature level 5
+  # inside MULTI); FerricStore's `HSETEX key seconds field value...` to the
+  # TTL older releases parse.
+  defp make_ast(_cmd, :hsetex, [key, option | args]) do
+    if HashHelpers.setex_option?(option) do
+      case HashHelpers.parse_setex([option | args]) do
+        {:ok, condition, expiry, pairs} -> {:hsetex, key, {condition, expiry}, pairs}
+        {:error, _reason} = error -> {:hsetex, key, error, []}
+      end
+    else
+      {:hsetex, key, parse_pos_int(option), args}
+    end
+  end
 
   defp make_ast(_cmd, :sismember, [key, member]), do: {:sismember, key, member}
 
@@ -1470,48 +1481,12 @@ defmodule Ferricstore.Commands.NativeAstParser do
     end
   end
 
-  defp parse_hgetex(key, [option | rest]) do
-    case {String.upcase(option), rest} do
-      {"FIELDS", [count | fields]} ->
-        parse_hgetex_fields(key, :none, count, fields)
-
-      {"PERSIST", [fields_option, count | fields]} ->
-        if String.upcase(fields_option) == "FIELDS",
-          do: parse_hgetex_fields(key, :persist, count, fields),
-          else: {:hgetex, key, {:error, "ERR syntax error"}}
-
-      {mode, [value, fields_option, count | fields]} when mode in ~w(EX PX EXAT PXAT) ->
-        if String.upcase(fields_option) == "FIELDS" do
-          case parse_hgetex_expiry(mode, value) do
-            {:error, _} = error -> {:hgetex, key, error}
-            expiry when is_tuple(expiry) -> parse_hgetex_fields(key, expiry, count, fields)
-          end
-        else
-          {:hgetex, key, {:error, "ERR syntax error"}}
-        end
-
-      _invalid ->
-        {:hgetex, key, {:error, "ERR syntax error"}}
+  defp parse_hgetex(key, opts) do
+    case HashHelpers.parse_getex(opts) do
+      {:ok, mode, fields} -> {:hgetex, key, mode, fields}
+      {:error, _reason} = error -> {:hgetex, key, error}
     end
   end
-
-  defp parse_hgetex(key, _opts),
-    do: {:hgetex, key, {:error, "ERR wrong number of arguments for 'hgetex' command"}}
-
-  defp parse_hgetex_fields(key, expiry, count, fields) do
-    case parse_hash_fields(count, fields) do
-      parsed_fields when is_list(parsed_fields) -> {:hgetex, key, expiry, parsed_fields}
-      {:error, _} = error -> {:hgetex, key, error}
-    end
-  end
-
-  defp parse_hgetex_expiry("EX", value), do: wrap_expiry(:ex, parse_pos_int(value))
-  defp parse_hgetex_expiry("PX", value), do: wrap_expiry(:px, parse_pos_int(value))
-  defp parse_hgetex_expiry("EXAT", value), do: wrap_expiry(:exat, parse_pos_int(value))
-  defp parse_hgetex_expiry("PXAT", value), do: wrap_expiry(:pxat, parse_pos_int(value))
-
-  defp wrap_expiry(kind, value) when is_integer(value), do: {kind, value}
-  defp wrap_expiry(_kind, {:error, _} = error), do: error
 
   defp parse_hash_fields(count, fields) do
     case parse_pos_int(count) do

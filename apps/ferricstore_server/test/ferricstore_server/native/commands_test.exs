@@ -5228,7 +5228,9 @@ defmodule FerricstoreServer.Native.CommandsTest do
           {"HEXPIRE", [key, "10", "NX", "FIELDS", "1", "f"]},
           {"HEXPIREAT", [key, "1800000000", "FIELDS", "1", "f"]},
           {"HPEXPIREAT", [key, "1800000000000", "FIELDS", "1", "f"]},
-          {"HPEXPIRETIME", [key, "FIELDS", "1", "f"]}
+          {"HPEXPIRETIME", [key, "FIELDS", "1", "f"]},
+          {"HSETEX", [key, "FNX", "FIELDS", "1", "f", "v"]},
+          {"HGETEX", [key, "EX", "0", "FIELDS", "1", "f"]}
         ] do
       assert {:error, hexpire_message, _state} =
                Session.execute(%{"command" => command, "args" => args}, state)
@@ -5236,11 +5238,14 @@ defmodule FerricstoreServer.Native.CommandsTest do
       assert hexpire_message =~ "needs cluster feature level 5"
     end
 
-    assert {:ok, "QUEUED", _state} =
-             Session.execute(
-               %{"command" => "HEXPIRE", "args" => [key, "10", "FIELDS", "1", "f"]},
-               state
-             )
+    for {command, args} <- [
+          {"HEXPIRE", [key, "10", "FIELDS", "1", "f"]},
+          {"HSETEX", [key, "10", "f", "v"]},
+          {"HGETEX", [key, "EX", "10", "FIELDS", "1", "f"]}
+        ] do
+      assert {:ok, "QUEUED", _state} =
+               Session.execute(%{"command" => command, "args" => args}, state)
+    end
 
     assert {:ok, "QUEUED", _state} =
              Session.execute(%{"command" => "ZRANK", "args" => [key, "m"]}, state)

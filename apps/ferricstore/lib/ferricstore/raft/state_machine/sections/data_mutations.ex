@@ -1147,7 +1147,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # is refused below the level on every release that knows it.
       defp do_compound_command(state, redis_key, ast) do
         with {:ok, handler} <- compound_command_handler(redis_key, ast),
-             :ok <- require_feature_level_4(state),
+             :ok <- require_compound_command_level(state, ast),
              :ok <- check_fetch_or_compute_lock(state, redis_key, nil) do
           run_compound_command(handler, ast, compound_command_store(state))
         end
@@ -1271,6 +1271,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
            when is_binary(key) and is_list(flags) and flags != [] and is_list(pairs),
            do: {:ok, Ferricstore.Commands.Geo}
 
+      defp compound_command_handler(key, {:hsetex, key, {condition, _expiry}, pairs})
+           when is_binary(key) and condition in [nil, :fnx, :fxx] and is_list(pairs) and
+                  pairs != [],
+           do: binaries_handler(pairs, Ferricstore.Commands.Hash)
+
       defp compound_command_handler(_key, _ast), do: {:error, "ERR invalid compound command"}
 
       defp binaries_handler(values, handler) do
@@ -1278,6 +1283,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
           do: {:ok, handler},
           else: {:error, "ERR invalid compound command"}
       end
+
+      # HSETEX joined the entry at level 5; releases before it refuse it.
+      defp require_compound_command_level(state, {:hsetex, _key, _options, _pairs}) do
+        if feature_level_5?(state),
+          do: :ok,
+          else: {:error, "ERR this command requires cluster feature level 5"}
+      end
+
+      defp require_compound_command_level(state, _ast), do: require_feature_level_4(state)
 
       defp require_feature_level_4(state) do
         if feature_level_4?(state),

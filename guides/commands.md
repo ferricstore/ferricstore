@@ -663,8 +663,9 @@ FerricStore supports per-field expiry on hash fields:
 | `HEXPIREAT` | `HEXPIREAT key unix-seconds [NX\|XX\|GT\|LT] FIELDS count field [field ...]` | Same as HEXPIRE, at a Unix time; a time not after now deletes the field (`2`) |
 | `HPEXPIREAT` | `HPEXPIREAT key unix-ms [NX\|XX\|GT\|LT] FIELDS count field [field ...]` | Same as HEXPIREAT but milliseconds |
 | `HGETDEL` | `HGETDEL key FIELDS count field [field ...]` | List of values (nil for missing) |
-| `HGETEX` | `HGETEX key [EX sec\|PX ms\|EXAT ts\|PXAT ms\|PERSIST] FIELDS count field [...]` | List of values |
-| `HSETEX` | `HSETEX key seconds field value [field value ...]` | Count of new fields |
+| `HGETEX` | `HGETEX key [EX sec\|PX ms\|EXAT ts\|PXAT ms\|PERSIST] FIELDS count field [...]` | List of values; a TTL of 0 or a past time deletes the fields |
+| `HSETEX` | `HSETEX key [FNX\|FXX] [EX sec\|PX ms\|EXAT ts\|PXAT ms\|KEEPTTL] FIELDS count field value [...]` | `1` when set, `0` when FNX/FXX refused; without an expiry option it clears the fields' TTL |
+| `HSETEX` (FerricStore form) | `HSETEX key seconds field value [field value ...]` | Count of new fields |
 
 **Status:** Supported for native TCP and embedded command handlers.
 

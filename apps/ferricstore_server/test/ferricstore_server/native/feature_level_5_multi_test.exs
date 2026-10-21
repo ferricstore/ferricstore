@@ -1,8 +1,9 @@
 defmodule FerricstoreServer.Native.FeatureLevel5MultiTest do
   @moduledoc """
   Cluster feature level 5 inside MULTI: a transaction may queue ZRANK and
-  ZREVRANK WITHSCORE, a sourceless PFMERGE and HEXPIRE/HPEXPIRE with NX, XX,
-  GT or LT or a TTL of 0, BITOP with an empty result
+  ZREVRANK WITHSCORE, a sourceless PFMERGE, HEXPIRE/HPEXPIRE with NX, XX, GT
+  or LT or a TTL of 0, HEXPIREAT, HPEXPIREAT, HPEXPIRETIME, HSETEX's Redis 8
+  form and HGETEX with a TTL of 0, BITOP with an empty result
   deletes its destination, and GEOSEARCHSTORE of a missing source empties its
   destination.
   """
@@ -104,6 +105,32 @@ defmodule FerricstoreServer.Native.FeatureLevel5MultiTest do
 
     assert {:ok, [[2], [1], [-2, 1_800_000_001_400]], _state} =
              Session.execute(%{"command" => "EXEC", "args" => []}, state)
+  end
+
+  test "MULTI queues HSETEX's Redis 8 form and HGETEX with a TTL of 0", %{ctx: ctx, key: key} do
+    state = multi()
+    state = queue(state, "HSETEX", [key, "FNX", "EX", "100", "FIELDS", "2", "a", "1", "b", "2"])
+    state = queue(state, "HSETEX", [key, "FNX", "FIELDS", "1", "a", "9"])
+    state = queue(state, "HGETEX", [key, "EX", "0", "FIELDS", "2", "a", "a"])
+
+    assert {:ok, [1, 0, ["1", nil]], _state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, state)
+
+    assert ["b", "2"] == Dispatcher.dispatch("HGETALL", [key], ctx)
+  end
+
+  # At level 5 HSETEX reads, decides and writes as one replicated entry.
+  test "concurrent HSETEX FNX on one field sets it once", %{ctx: ctx, key: key} do
+    results =
+      1..20
+      |> Task.async_stream(
+        fn i -> Dispatcher.dispatch("HSETEX", [key, "FNX", "FIELDS", "1", "f", "#{i}"], ctx) end,
+        max_concurrency: 20,
+        ordered: false
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.sort(results) == List.duplicate(0, 19) ++ [1]
   end
 
   defp multi do

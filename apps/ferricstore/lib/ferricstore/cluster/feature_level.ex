@@ -36,10 +36,12 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   # 5: MULTI queues the command forms older releases do not parse
   #    (`Ferricstore.Transaction.ReplicaCompat`): ZRANK/ZREVRANK WITHSCORE,
   #    PFMERGE with no source, HEXPIRE/HPEXPIRE with a condition or TTL 0,
-  #    HEXPIREAT, HPEXPIREAT and HPEXPIRETIME.
-  #    Inside MULTI, BITOP deletes its destination for an empty result and
-  #    GEOSEARCHSTORE of a missing source empties its destination
-  #    (`Ferricstore.Store.Ops.level_5_writes?/1`).
+  #    HEXPIREAT, HPEXPIREAT and HPEXPIRETIME, HSETEX's Redis 8 form and
+  #    HGETEX with a TTL of 0. HSETEX's Redis form also runs as one
+  #    replicated compound entry (`Router.compound_command/4`).
+  #    Inside MULTI, BITOP deletes its destination for an empty result,
+  #    GEOSEARCHSTORE of a missing source empties its destination and HGETEX
+  #    of a past time deletes the fields (`Ferricstore.Store.Ops.level_5_writes?/1`).
   @supported 5
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

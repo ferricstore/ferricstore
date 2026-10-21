@@ -48,6 +48,14 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
       when tag in @field_expiry_tags and is_list(fields),
       do: 5
 
+  # HSETEX's Redis 8 form, and HGETEX with a TTL of 0 (older releases parse
+  # neither: they refuse the TTL, and answer the form an unsupported command).
+  def required_level({:hsetex, _key, {_condition, _expiry}, pairs}) when is_list(pairs), do: 5
+
+  def required_level({:hgetex, _key, {unit, 0}, fields})
+      when unit in [:ex, :px] and is_list(fields),
+      do: 5
+
   # Commands releases before level 5 do not have.
   def required_level(ast)
       when is_tuple(ast) and tuple_size(ast) > 1 and elem(ast, 0) in @level_5_commands,

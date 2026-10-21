@@ -165,7 +165,7 @@ defmodule Ferricstore.Store.Ops do
   @doc """
   Whether a command may write as feature level 5 does where older releases
   write differently (BITOP's empty result, GEOSEARCHSTORE of a missing
-  source). The instance and the embedded API write through the cluster as
+  source, HGETEX of a past time). The instance and the embedded API write through the cluster as
   plain puts and deletes, which every replica applies alike; a MULTI
   transaction runs on every replica, so its store allows it only once level
   5 is active.
@@ -895,10 +895,12 @@ defmodule Ferricstore.Store.Ops do
   at cluster feature level 4. See `Ferricstore.Store.Router.compound_command/3`.
   """
   @spec compound_command(store(), binary(), tuple()) :: term()
-  def compound_command(%FerricStore.Instance{} = ctx, key, ast),
-    do: Router.compound_command(ctx, key, ast)
+  def compound_command(store, key, ast, level \\ 4)
 
-  def compound_command(_store, _key, _ast), do: :unsupported
+  def compound_command(%FerricStore.Instance{} = ctx, key, ast, level),
+    do: Router.compound_command(ctx, key, ast, level)
+
+  def compound_command(_store, _key, _ast, _level), do: :unsupported
 
   def compound_get(store, redis_key, compound_key),
     do: CompoundOps.compound_get(store, redis_key, compound_key)
