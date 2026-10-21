@@ -40,8 +40,9 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    HGETEX with a TTL of 0. HSETEX's Redis form also runs as one
   #    replicated compound entry (`Router.compound_command/4`).
   #    Inside MULTI, BITOP deletes its destination for an empty result,
-  #    GEOSEARCHSTORE of a missing source empties its destination and HGETEX
-  #    of a past time deletes the fields (`Ferricstore.Store.Ops.level_5_writes?/1`).
+  #    GEOSEARCHSTORE of a missing source empties its destination and
+  #    measures with Redis's Earth radius, and HGETEX of a past time deletes
+  #    the fields (`Ferricstore.Store.Ops.level_5_writes?/1`).
   @supported 5
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

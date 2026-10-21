@@ -121,6 +121,25 @@ defmodule FerricstoreServer.Native.FeatureLevel5MultiTest do
     assert Enum.sort(results) == List.duplicate(0, 19) ++ [1]
   end
 
+  test "GEOSEARCHSTORE in MULTI uses Redis's Earth radius", %{ctx: ctx, key: key} do
+    # b is 200.04 km from (0, 0) with Redis's radius (199.98 km with the old).
+    assert 2 == Dispatcher.dispatch("GEOADD", [key, "0", "0", "a", "1.79846", "0", "b"], ctx)
+
+    state =
+      queue(multi(), "GEOSEARCHSTORE", [
+        key <> ":dst",
+        key,
+        "FROMLONLAT",
+        "0",
+        "0",
+        "BYRADIUS",
+        "200",
+        "km"
+      ])
+
+    assert {:ok, [1], _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
+  end
+
   defp multi do
     {:ok, "OK", state} = Session.execute(%{"command" => "MULTI", "args" => []}, session_state())
     state

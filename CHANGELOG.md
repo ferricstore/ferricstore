@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Measure GEO distances with Redis's Earth radius (6372797.560856 m, not
+  6371000 m), so GEODIST and GEOSEARCH's WITHDIST and radius agree with
+  Redis (Palermo to Catania was 47 m short). Distances keep four decimals
+  ("0.0000", not "0.0"), and GEOPOS and WITHCOORD answer coordinates at full
+  precision instead of rounded to four decimals (about 11 m). Inside MULTI,
+  GEOSEARCHSTORE keeps the old radius below cluster feature level 5.
 - Answer -1 from BITPOS on an existing empty string in every form, as Redis
   does; `BITPOS key 0` answered 0, as for a missing key.
 - Look GETEX's key up before checking its expiry value, as Redis does: a

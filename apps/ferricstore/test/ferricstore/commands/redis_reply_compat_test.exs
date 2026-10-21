@@ -399,6 +399,43 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
     describe "#{@path}: geo searches" do
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 
+      test "distances use Redis's Earth radius and format", %{ctx: ctx, key: key} do
+        assert 2 ==
+                 run(ctx, "GEOADD", [
+                   key,
+                   "13.361389",
+                   "38.115556",
+                   "Palermo",
+                   "15.087269",
+                   "37.502669",
+                   "Catania"
+                 ])
+
+        meters = run(ctx, "GEODIST", [key, "Palermo", "Catania"])
+        assert meters =~ ~r/^\d+\.\d{4}$/
+        assert_in_delta 166_274.1516, String.to_float(meters), 1.0
+        assert "0.0000" == run(ctx, "GEODIST", [key, "Palermo", "Palermo", "km"])
+
+        assert [["Palermo", "0.0000"], ["Catania", km]] =
+                 run(ctx, "GEOSEARCH", [
+                   key,
+                   "FROMMEMBER",
+                   "Palermo",
+                   "BYRADIUS",
+                   "200",
+                   "km",
+                   "WITHDIST",
+                   "ASC"
+                 ])
+
+        assert_in_delta 166.2742, String.to_float(km), 0.001
+        # Coordinates at full precision, not rounded to 4 decimals.
+        assert [[lng, lat]] = run(ctx, "GEOPOS", [key, "Palermo"])
+        assert byte_size(lng) > 10 and byte_size(lat) > 10
+        assert_in_delta 13.361389, String.to_float(lng), 0.00001
+        assert_in_delta 38.115556, String.to_float(lat), 0.00001
+      end
+
       test "a missing key answers [] and empties GEOSEARCHSTORE's destination", %{
         ctx: ctx,
         key: key

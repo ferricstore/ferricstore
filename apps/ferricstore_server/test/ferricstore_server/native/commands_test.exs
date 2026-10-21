@@ -5203,6 +5203,28 @@ defmodule FerricstoreServer.Native.CommandsTest do
              )
   end
 
+  # b is 199.98 km from (0, 0) with the radius releases before level 5 use,
+  # and 200.04 km with Redis's: a transaction below level 5 keeps the old one.
+  test "native MULTI GEOSEARCHSTORE keeps the old Earth radius below level 5" do
+    key = "{multi-geo-radius:#{System.unique_integer([:positive])}}"
+    ctx = FerricStore.Instance.get(:default)
+    args = [key, "0", "0", "a", "1.79846", "0", "b"]
+    assert 2 == Ferricstore.Commands.Dispatcher.dispatch("GEOADD", args, ctx)
+    search = ["FROMLONLAT", "0", "0", "BYRADIUS", "200", "km"]
+    assert ["a"] == Ferricstore.Commands.Dispatcher.dispatch("GEOSEARCH", [key | search], ctx)
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(
+               %{"command" => "GEOSEARCHSTORE", "args" => [key <> ":dst", key | search]},
+               state
+             )
+
+    assert {:ok, [2], _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
+  end
+
   defp geoadd(ctx, key) do
     Ferricstore.Commands.Dispatcher.dispatch("GEOADD", [key, "13.36", "38.11", "palermo"], ctx)
   end

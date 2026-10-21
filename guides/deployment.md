@@ -581,9 +581,9 @@ shard_0: 2
     `HEXPIRE`/`HPEXPIRE` with NX, XX, GT or LT or a TTL of 0, `HSETEX`'s
     Redis 8 form and `HGETEX` with a TTL of 0. Outside MULTI, HSETEX's Redis form runs
     as one replicated entry.
-    Inside MULTI, BITOP deletes its destination for an empty result and
-    GEOSEARCHSTORE empties its destination for a missing source, as both do
-    outside MULTI.
+    Inside MULTI, BITOP deletes its destination for an empty result, and
+    GEOSEARCHSTORE empties its destination for a missing source and measures
+    with Redis's Earth radius, as both do outside MULTI.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.
