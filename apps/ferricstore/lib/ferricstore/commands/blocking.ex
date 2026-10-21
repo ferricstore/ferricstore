@@ -104,8 +104,8 @@ defmodule Ferricstore.Commands.Blocking do
           | {:error, binary()}
   def parse_blmpop_args([timeout_str, numkeys_str | rest]) when rest != [] do
     with {:ok, timeout_ms} <- parse_timeout(timeout_str),
-         {numkeys, ""} <- Integer.parse(numkeys_str),
-         true <- numkeys > 0 and length(rest) >= numkeys + 1 do
+         {:ok, numkeys} <- positive_count(numkeys_str, "numkeys"),
+         true <- length(rest) >= numkeys + 1 do
       {keys, dir_and_opts} = Enum.split(rest, numkeys)
 
       case dir_and_opts do
@@ -119,7 +119,6 @@ defmodule Ferricstore.Commands.Blocking do
           {:error, "ERR syntax error"}
       end
     else
-      :error -> {:error, "ERR value is not an integer or out of range"}
       false -> {:error, "ERR syntax error"}
       {:error, _} = err -> err
     end
@@ -175,14 +174,19 @@ defmodule Ferricstore.Commands.Blocking do
     if String.upcase(keyword) != "COUNT" do
       {:error, "ERR syntax error"}
     else
-      case Integer.parse(count_str) do
-        {count, ""} when count > 0 -> {:ok, count}
-        _ -> {:error, "ERR value is not an integer or out of range"}
-      end
+      positive_count(count_str, "count")
     end
   end
 
   defp parse_blmpop_count(_), do: {:error, "ERR syntax error"}
+
+  # Redis's error for numkeys or COUNT below 1 or not an integer.
+  defp positive_count(value, name) do
+    case Integer.parse(value) do
+      {count, ""} when count > 0 -> {:ok, count}
+      _invalid -> {:error, "ERR #{name} should be greater than 0"}
+    end
+  end
 
   alias Ferricstore.Commands.List
 

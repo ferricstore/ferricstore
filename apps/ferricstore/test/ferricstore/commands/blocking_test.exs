@@ -142,6 +142,21 @@ defmodule Ferricstore.Commands.BlockingTest do
       assert {:error, _} = Blocking.parse_blmpop_args([])
     end
 
+    test "answers Redis's errors for a bad numkeys or count" do
+      for numkeys <- ["0", "-1", "x"] do
+        assert {:error, "ERR numkeys should be greater than 0"} =
+                 Blocking.parse_blmpop_args(["5", numkeys, "mylist", "LEFT"])
+      end
+
+      for count <- ["0", "-1", "x"] do
+        assert {:error, "ERR count should be greater than 0"} =
+                 Blocking.parse_blmpop_args(["5", "1", "mylist", "LEFT", "COUNT", count])
+      end
+
+      assert {:error, "ERR syntax error"} =
+               Blocking.parse_blmpop_args(["5", "2", "mylist", "LEFT"])
+    end
+
     test "rejects invalid direction" do
       assert {:error, _} = Blocking.parse_blmpop_args(["5", "1", "mylist", "UP"])
     end

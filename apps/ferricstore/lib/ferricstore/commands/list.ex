@@ -27,14 +27,9 @@ defmodule Ferricstore.Commands.List do
   end
 
   def handle("LPOP", [key, count_str], store) do
-    with :ok <- TypeRegistry.command_check_type(key, :list, store) do
-      case Integer.parse(count_str) do
-        {count, ""} when count >= 0 ->
-          key |> do_pop(store, :lpop, count) |> counted_pop_reply()
-
-        _ ->
-          {:error, "ERR value is not an integer or out of range"}
-      end
+    case Integer.parse(count_str) do
+      {count, ""} -> pop_parsed(key, store, :lpop, count)
+      _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
 
@@ -46,14 +41,9 @@ defmodule Ferricstore.Commands.List do
   end
 
   def handle("RPOP", [key, count_str], store) do
-    with :ok <- TypeRegistry.command_check_type(key, :list, store) do
-      case Integer.parse(count_str) do
-        {count, ""} when count >= 0 ->
-          key |> do_pop(store, :rpop, count) |> counted_pop_reply()
-
-        _ ->
-          {:error, "ERR value is not an integer or out of range"}
-      end
+    case Integer.parse(count_str) do
+      {count, ""} -> pop_parsed(key, store, :rpop, count)
+      _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
 
@@ -451,8 +441,9 @@ defmodule Ferricstore.Commands.List do
          do: key |> do_pop(store, direction, count) |> counted_pop_reply()
   end
 
+  # Redis checks the count before it looks the key up.
   defp pop_parsed(_key, _store, _direction, _count),
-    do: {:error, "ERR value is not an integer or out of range"}
+    do: {:error, "ERR value is out of range, must be positive"}
 
   # With a count, LPOP and RPOP answer an array even for one element; the
   # list operation answers one popped element by itself.

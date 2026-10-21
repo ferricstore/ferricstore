@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer Redis's errors for LPOP or RPOP with a negative count ("value is
+  out of range, must be positive", checked before the key's type) and
+  BLMPOP with a numkeys or COUNT below 1 ("numkeys should be greater than
+  0", "count should be greater than 0").
 - Answer nil from OBJECT ENCODING, FREQ, IDLETIME and REFCOUNT on a missing
   key, as Redis does; they answered "ERR no such key".
 - Answer SET's "ERR invalid expire time in 'set' command" for EX 0, PX -1 or

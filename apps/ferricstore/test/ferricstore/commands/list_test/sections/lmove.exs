@@ -392,14 +392,14 @@ defmodule Ferricstore.Commands.ListTest.Sections.Lmove do
           store = MockStore.make()
           List.handle("RPUSH", ["mylist", "a", "b"], store)
           assert {:error, msg} = List.handle("LPOP", ["mylist", "-1"], store)
-          assert msg =~ "not an integer or out of range"
+          assert msg =~ "out of range, must be positive"
         end
 
         test "RPOP with negative count returns error" do
           store = MockStore.make()
           List.handle("RPUSH", ["mylist", "a", "b"], store)
           assert {:error, msg} = List.handle("RPOP", ["mylist", "-1"], store)
-          assert msg =~ "not an integer or out of range"
+          assert msg =~ "out of range, must be positive"
         end
 
         test "LPOP with three args returns arity error" do
