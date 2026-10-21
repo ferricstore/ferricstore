@@ -9,6 +9,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
       alias Ferricstore.Flow.Keys, as: FlowKeys
       alias Ferricstore.Flow.LMDB, as: FlowLMDB
       alias Ferricstore.Raft.CommandStamp
+      alias Ferricstore.Raft.PromotedFileSync
       alias Ferricstore.Raft.StateMachine
       alias Ferricstore.Raft.WARaftSegmentReader
       alias Ferricstore.Store.BlobRef
@@ -816,14 +817,19 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         :ok
       end
 
+      # Recovery replays from the persisted position, so the dedicated-file
+      # writes before it must be on disk first.
       defp persist_metadata(%{root_dir: root_dir} = handle, mode) do
-        with :ok <- maybe_persist_segment_projection(handle) do
+        with :ok <- PromotedFileSync.sync(Map.get(handle, :promoted_sync)),
+             :ok <- maybe_persist_segment_projection(handle) do
           persist_storage_metadata(root_dir, storage_metadata(handle), mode)
         end
       end
 
       defp persist_hot_metadata(%{root_dir: root_dir} = handle) do
-        persist_storage_metadata(root_dir, storage_metadata(handle), :normal)
+        with :ok <- PromotedFileSync.sync(Map.get(handle, :promoted_sync)) do
+          persist_storage_metadata(root_dir, storage_metadata(handle), :normal)
+        end
       end
 
       defp storage_metadata(handle) do

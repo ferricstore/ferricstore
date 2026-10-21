@@ -4,6 +4,18 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Stop syncing a large collection's file on every write. A hash, set or
+  sorted set over 100 members lives in its own file, and WARaft fsynced that
+  file once per write, so writes to it ran at a fraction of the speed of small
+  collections: on macOS, 181 sequential SADDs a second instead of 582, 204
+  instead of about 5,000 with 20 clients, and 21 ten-member SREMs a second
+  instead of 371. They now run at 695, 1,797 and 208. The Raft log already
+  holds every acknowledged write, so the storage now syncs the files it wrote
+  before it persists its replay position, and a projection checkpoint or log
+  trim syncs them first too; recovery therefore always replays the log from
+  before any write that may not have reached disk. A marker made durable
+  before the first unsynced write makes a node that stopped before syncing
+  sync every dedicated file before it replays.
 - Stop refusing logins that arrive together. The authentication limiter
   counted a login still checking its password as a failed attempt, so a
   connection pool opening more than 10 connections at once from one address

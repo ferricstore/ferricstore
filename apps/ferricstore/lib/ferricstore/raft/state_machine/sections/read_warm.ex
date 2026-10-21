@@ -16,6 +16,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       alias Ferricstore.Commands.HyperLogLog
       alias Ferricstore.ExpiryContext
       alias Ferricstore.Raft.BlobCommand
+      alias Ferricstore.Raft.PromotedFileSync
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
       alias Ferricstore.Flow.HistoryProjector
@@ -1974,21 +1975,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       if Mix.env() == :test do
         defp append_promoted_record(path, key, value, expire_at_ms) do
           case promoted_append_test_hook(:record, path, {key, value, expire_at_ms}) do
-            :passthrough -> NIF.v2_append_record(path, key, value, expire_at_ms)
+            :passthrough -> PromotedFileSync.append_record(path, key, value, expire_at_ms)
             result -> result
           end
         end
 
         defp append_promoted_tombstone(path, key) do
           case promoted_append_test_hook(:tombstone, path, key) do
-            :passthrough -> NIF.v2_append_tombstone(path, key)
+            :passthrough -> PromotedFileSync.append_tombstone(path, key)
             result -> result
           end
         end
 
         defp append_promoted_batch(path, entries) do
           case promoted_append_test_hook(:batch, path, entries) do
-            :passthrough -> NIF.v2_append_batch(path, entries)
+            :passthrough -> PromotedFileSync.append_batch(path, entries)
             result -> result
           end
         end
@@ -2000,14 +2001,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           end
         end
       else
+        # The WARaft storage process skips the fsync and syncs before it
+        # persists past the write; any other caller appends with an fsync.
         defp append_promoted_record(path, key, value, expire_at_ms),
-          do: NIF.v2_append_record(path, key, value, expire_at_ms)
+          do: PromotedFileSync.append_record(path, key, value, expire_at_ms)
 
         defp append_promoted_tombstone(path, key),
-          do: NIF.v2_append_tombstone(path, key)
+          do: PromotedFileSync.append_tombstone(path, key)
 
         defp append_promoted_batch(path, entries),
-          do: NIF.v2_append_batch(path, entries)
+          do: PromotedFileSync.append_batch(path, entries)
       end
     end
   end
