@@ -910,6 +910,22 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
     end
 
     describe "#{@path}: geo searches" do
+      test "GEO argument errors use Redis's texts", %{ctx: ctx, key: key} do
+        assert {:error, "ERR invalid longitude,latitude pair 200.000000,0.000000"} ==
+                 run(ctx, "GEOADD", [key, "200", "0", "a"])
+
+        assert {:error, "ERR syntax error"} ==
+                 run(ctx, "GEOADD", [key, "XX", "NX", "0", "0", "a"])
+
+        search = [key, "FROMLONLAT", "0", "0", "BYRADIUS"]
+
+        assert {:error, "ERR COUNT must be > 0"} ==
+                 run(ctx, "GEOSEARCH", search ++ ["10", "km", "COUNT", "0"])
+
+        assert {:error, "ERR radius cannot be negative"} ==
+                 run(ctx, "GEOSEARCH", search ++ ["-1", "km"])
+      end
+
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 
       test "distances use Redis's Earth radius and format", %{ctx: ctx, key: key} do

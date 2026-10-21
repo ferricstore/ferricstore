@@ -7,13 +7,12 @@ defmodule Ferricstore.Commands.GeoPreparedValidationTest do
   test "prepared GEOADD rejects conflicting flags and invalid coordinates" do
     store = MockStore.make()
 
-    assert {:error, "ERR XX and NX options at the same time are not compatible"} =
+    assert {:error, "ERR syntax error"} =
              Geo.handle_ast({:geoadd, "geo", [:nx, :xx], [{0.0, 0.0, "member"}]}, store)
 
-    assert {:error, message} =
+    assert {:error, "ERR invalid longitude,latitude pair 181.000000,0.000000"} =
              Geo.handle_ast({:geoadd, "geo", [], [{181.0, 0.0, "member"}]}, store)
 
-    assert message =~ "invalid longitude,latitude"
     assert 0 == SortedSet.handle("ZCARD", ["geo"], store)
   end
 

@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- GEO argument errors use Redis's texts: GEOADD prints an invalid pair with
+  six decimals and answers "ERR syntax error" for XX with NX; GEOSEARCH
+  answers "ERR COUNT must be > 0" and "ERR radius cannot be negative". A zero
+  radius is still refused (Redis accepts it).
 - LPOS COUNT/MAXLEN and SINTERCARD LIMIT below zero answer Redis's
   "ERR <option> can't be negative".
 - Answer Redis's texts "ERR decrement would overflow" (DECRBY of
