@@ -1149,8 +1149,91 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         with {:ok, handler} <- compound_command_handler(redis_key, ast),
              :ok <- require_feature_level_4(state),
              :ok <- check_fetch_or_compute_lock(state, redis_key, nil) do
-          run_compound_command(handler, ast, build_compound_store(state))
+          run_compound_command(handler, ast, compound_command_store(state))
         end
+      end
+
+      # The member index learns an entry's own deletes when the entry flushes,
+      # and a delete that is the entry's first write only queues its keydir
+      # rows' removal. So a read later in the same entry saw the deleted
+      # members: HDEL of a hash's last field counted one left and kept the
+      # type, and the key then refused a list or string as the wrong type.
+      # The handler's reads apply the queued removals first, and a count under
+      # a prefix this entry deleted from counts the members still in the
+      # keydir. (Only collections in the shared file queue deletes; those of a
+      # promoted collection reach the index as they are written.)
+      @compound_command_reads [
+        :compound_get,
+        :compound_get_meta,
+        :compound_batch_get,
+        :compound_scan,
+        :compound_scan_page,
+        :compound_scan_slice,
+        :exists?
+      ]
+
+      defp compound_command_store(state) do
+        store = build_compound_store(state)
+
+        store =
+          Enum.reduce(@compound_command_reads, store, fn name, store ->
+            case Map.fetch(store, name) do
+              {:ok, read} -> Map.put(store, name, materializing_read(state, read))
+              :error -> store
+            end
+          end)
+
+        case Map.fetch(store, :compound_count) do
+          {:ok, count} -> Map.put(store, :compound_count, entry_aware_count(state, count))
+          :error -> store
+        end
+      end
+
+      defp entry_aware_count(state, count) do
+        fn redis_key, prefix ->
+          :ok = materialize_pending_fast_deletes(state)
+
+          with true <- pending_delete_under?(prefix),
+               {:ok, live} <-
+                 CompoundMemberIndex.count_live(
+                   Map.get(state, :compound_member_index_name),
+                   shard_ets_state(state),
+                   prefix
+                 ) do
+            live
+          else
+            _indexed_count_is_current -> count.(redis_key, prefix)
+          end
+        end
+      end
+
+      defp pending_delete_under?(prefix) do
+        Enum.any?(Process.get(:sm_pending_writes, []), fn
+          {:delete, key, _prob_path} when is_binary(key) -> String.starts_with?(key, prefix)
+          _write -> false
+        end)
+      end
+
+      defp materializing_read(state, read) when is_function(read, 1),
+        do: fn a -> materialize_then(state, fn -> read.(a) end) end
+
+      defp materializing_read(state, read) when is_function(read, 2),
+        do: fn a, b -> materialize_then(state, fn -> read.(a, b) end) end
+
+      defp materializing_read(state, read) when is_function(read, 3),
+        do: fn a, b, c -> materialize_then(state, fn -> read.(a, b, c) end) end
+
+      defp materializing_read(state, read) when is_function(read, 5),
+        do: fn a, b, c, d, e -> materialize_then(state, fn -> read.(a, b, c, d, e) end) end
+
+      defp materializing_read(state, read) when is_function(read, 6),
+        do: fn a, b, c, d, e, f -> materialize_then(state, fn -> read.(a, b, c, d, e, f) end) end
+
+      defp materializing_read(_state, read), do: read
+
+      defp materialize_then(state, read) do
+        :ok = materialize_pending_fast_deletes(state)
+        read.()
       end
 
       # A handler that raised would stop the shard's storage on every replay.
