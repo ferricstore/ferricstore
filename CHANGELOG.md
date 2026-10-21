@@ -17,6 +17,7 @@ All notable changes to FerricStore will be documented here.
   still counts the value as padded with zeros.
 - Clamp a GETRANGE end that falls before the start of the value to its first
   byte, as Redis does: `GETRANGE` of "hello" `0 -10` answers "h", not "".
+  Two negative indexes with the start after the end (`-10 -20`) answer "".
 - Answer `LPOP key 1` and `RPOP key 1` with a one-element array, as Redis
   does for any count; they answered the element by itself. `LPOS` with
   `COUNT` answers an empty array for a missing key instead of nil.

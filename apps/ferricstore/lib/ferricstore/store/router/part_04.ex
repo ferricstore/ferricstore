@@ -1121,6 +1121,12 @@ defmodule Ferricstore.Store.Router.Part04 do
 
       defp normalize_byte_range(0, _start_idx, _end_idx), do: :empty
 
+      # Two negative indexes with the start after the end are empty before
+      # any clamping, as in Redis.
+      defp normalize_byte_range(_size, start_idx, end_idx)
+           when start_idx < 0 and end_idx < 0 and start_idx > end_idx,
+           do: :empty
+
       defp normalize_byte_range(size, start_idx, end_idx) when size > 0 do
         start_norm = if start_idx < 0, do: max(size + start_idx, 0), else: start_idx
         # Redis clamps a negative end before the start to the first byte.

@@ -50,6 +50,12 @@ defmodule Ferricstore.Commands.Strings.Range do
     end
   end
 
+  # Two negative indexes with the start after the end are empty before any
+  # clamping, as in Redis.
+  defp getrange_empty_for_size?(_size, start_idx, end_idx)
+       when start_idx < 0 and end_idx < 0 and start_idx > end_idx,
+       do: true
+
   defp getrange_empty_for_size?(size, start_idx, end_idx) do
     start_norm = if start_idx < 0, do: max(size + start_idx, 0), else: start_idx
     # Redis clamps a negative end before the start to the first byte.

@@ -133,6 +133,11 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
         assert "" == run(ctx, "GETRANGE", [key, "-1", "-5"])
         assert "" == run(ctx, "GETRANGE", [key, "10", "20"])
         assert "hello" == run(ctx, "GETRANGE", [key, "-100", "100"])
+        # Two negative indexes with the start after the end are empty before
+        # any clamping.
+        assert "" == run(ctx, "GETRANGE", [key, "-10", "-20"])
+        assert "" == run(ctx, "GETRANGE", [key, "-5", "-6"])
+        assert "h" == run(ctx, "GETRANGE", [key, "-100", "-100"])
       end
 
       test "BITPOS answers -1 for a start byte past the value", %{ctx: ctx, key: key} do
