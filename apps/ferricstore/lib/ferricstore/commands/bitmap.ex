@@ -855,7 +855,7 @@ defmodule Ferricstore.Commands.Bitmap do
     end
   end
 
-  defp bitpos_byte_range_from_size(store, key, bit_val, start_idx, end_idx, explicit_end) do
+  defp bitpos_byte_range_from_size(store, key, _bit_val, start_idx, end_idx, _explicit_end) do
     case Destination.metadata_value_size(store, key) do
       {:error, {:storage_read_failed, _reason}} = failure ->
         ReadResult.command_error(failure)
@@ -868,7 +868,7 @@ defmodule Ferricstore.Commands.Bitmap do
 
         cond do
           start_byte > end_byte or start_byte >= size ->
-            {:ok, bitpos_empty_byte_range_result(bit_val, size, explicit_end)}
+            {:ok, -1}
 
           true ->
             :unknown
@@ -878,9 +878,6 @@ defmodule Ferricstore.Commands.Bitmap do
         :unknown
     end
   end
-
-  defp bitpos_empty_byte_range_result(0, size, false), do: size * 8
-  defp bitpos_empty_byte_range_result(_bit_val, _size, _explicit_end), do: -1
 
   defp bitpos_bit_range_from_size(store, key, start_idx, end_idx) do
     case Destination.metadata_value_size(store, key) do
@@ -922,8 +919,9 @@ defmodule Ferricstore.Commands.Bitmap do
           {:error, {:storage_read_failed, _reason}} = failure ->
             ReadResult.command_error(failure)
 
+          # A range that holds no byte answers -1 whatever the bit, as in Redis.
           size when is_integer(size) ->
-            {:ok, bitpos_empty_byte_range_result(bit_val, size, explicit_end)}
+            {:ok, -1}
 
           _ ->
             :unknown
@@ -934,10 +932,13 @@ defmodule Ferricstore.Commands.Bitmap do
     end
   end
 
+  # The search ran past the range without a match: looking for a clear bit
+  # with no explicit end, the value counts as padded with zeros.
   defp bitpos_byte_range_chunks(_store, _key, bit_val, offset, end_byte, size, explicit_end)
        when offset > end_byte do
-    {:ok, bitpos_empty_byte_range_result(bit_val, size, explicit_end)}
+    {:ok, bitpos_not_found_result(bit_val, size, explicit_end)}
   end
+
 
   defp bitpos_byte_range_chunks(store, key, bit_val, offset, end_byte, size, explicit_end) do
     last = min(offset + @bitcount_chunk_bytes - 1, end_byte)
@@ -968,6 +969,10 @@ defmodule Ferricstore.Commands.Bitmap do
         :unknown
     end
   end
+
+
+  defp bitpos_not_found_result(0, size, false), do: size * 8
+  defp bitpos_not_found_result(_bit_val, _size, _explicit_end), do: -1
 
   defp bitpos_bit_range_from_store(store, key, bit_val, start_idx, end_idx) do
     with size when is_integer(size) <- Destination.metadata_value_size(store, key),

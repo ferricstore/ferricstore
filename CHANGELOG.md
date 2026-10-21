@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer -1 from `BITPOS key 0 start` when the start lies past the value, as
+  Redis does; it answered the value's length in bits, as if the search had
+  run off the end. A search that starts inside the value without an end
+  still counts the value as padded with zeros.
 - Clamp a GETRANGE end that falls before the start of the value to its first
   byte, as Redis does: `GETRANGE` of "hello" `0 -10` answers "h", not "".
 - Answer `LPOP key 1` and `RPOP key 1` with a one-element array, as Redis

@@ -77,8 +77,10 @@ defmodule Ferricstore.Commands.Bitmap.Bits do
     s = max(start_byte, 0)
     e = min(end_byte, len - 1)
 
+    # Redis answers -1 for a range that holds no byte, whatever bit it looks
+    # for; only a search that ends without an explicit end pads with zeros.
     if s > e or s >= len do
-      if bit_val == 0 and not explicit_end, do: len * 8, else: -1
+      -1
     else
       bin
       |> scan_bytes_for_bit(bit_val, s, e)
