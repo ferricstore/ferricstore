@@ -653,10 +653,10 @@ FerricStore supports per-field expiry on hash fields:
 
 | Command | Syntax | Return |
 |---------|--------|--------|
-| `HEXPIRE` | `HEXPIRE key seconds FIELDS count field [field ...]` | List of `1` (set) / `-2` (field missing) |
+| `HEXPIRE` | `HEXPIRE key seconds [NX\|XX\|GT\|LT] FIELDS count field [field ...]` | List of `1` (set) / `2` (deleted: TTL 0) / `0` (condition not met) / `-2` (field missing) |
 | `HTTL` | `HTTL key FIELDS count field [field ...]` | List of TTL seconds / `-1` (no expiry) / `-2` (missing) |
 | `HPERSIST` | `HPERSIST key FIELDS count field [field ...]` | List of `1` (removed) / `-1` (no expiry) / `-2` (missing) |
-| `HPEXPIRE` | `HPEXPIRE key ms FIELDS count field [field ...]` | Same as HEXPIRE but milliseconds |
+| `HPEXPIRE` | `HPEXPIRE key ms [NX\|XX\|GT\|LT] FIELDS count field [field ...]` | Same as HEXPIRE but milliseconds |
 | `HPTTL` | `HPTTL key FIELDS count field [field ...]` | Same as HTTL but milliseconds |
 | `HEXPIRETIME` | `HEXPIRETIME key FIELDS count field [field ...]` | Absolute Unix timestamp (seconds) |
 | `HGETDEL` | `HGETDEL key FIELDS count field [field ...]` | List of values (nil for missing) |

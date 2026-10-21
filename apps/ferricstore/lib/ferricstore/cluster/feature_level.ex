@@ -35,7 +35,7 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    options in one entry.
   # 5: MULTI queues the command forms older releases do not parse
   #    (`Ferricstore.Transaction.ReplicaCompat`): ZRANK/ZREVRANK WITHSCORE,
-  #    PFMERGE with no source.
+  #    PFMERGE with no source, HEXPIRE/HPEXPIRE with a condition or TTL 0.
   #    Inside MULTI, BITOP deletes its destination for an empty result and
   #    GEOSEARCHSTORE of a missing source empties its destination
   #    (`Ferricstore.Store.Ops.level_5_writes?/1`).

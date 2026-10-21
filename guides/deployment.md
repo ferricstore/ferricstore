@@ -577,7 +577,8 @@ shard_0: 2
     (`EXPIRE key 100 XX GT`), BITCOUNT ranges and BITPOS are queued only at
     level 4: older releases abort or answer such a transaction differently.
   - 5: MULTI queues the command forms releases before it do not parse or
-    refuse: `ZRANK`/`ZREVRANK ... WITHSCORE` and `PFMERGE` with no source.
+    refuse: `ZRANK`/`ZREVRANK ... WITHSCORE`, `PFMERGE` with no source, and
+    `HEXPIRE`/`HPEXPIRE` with NX, XX, GT or LT or a TTL of 0.
     Inside MULTI, BITOP deletes its destination for an empty result and
     GEOSEARCHSTORE empties its destination for a missing source, as both do
     outside MULTI.

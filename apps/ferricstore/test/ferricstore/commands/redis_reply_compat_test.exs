@@ -261,6 +261,65 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
       end
     end
 
+    describe "#{@path}: hash field expiry" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      test "a TTL of 0 deletes the field and answers 2", %{ctx: ctx, key: key} do
+        assert 2 == run(ctx, "HSET", [key, "a", "1", "b", "2"])
+        assert [2, -2] == run(ctx, "HEXPIRE", [key, "0", "FIELDS", "2", "a", "a"])
+        assert ["b", "2"] == run(ctx, "HGETALL", [key])
+        assert [2] == run(ctx, "HPEXPIRE", [key, "0", "FIELDS", "1", "b"])
+        assert 0 == run(ctx, "EXISTS", [key])
+        assert [-2, -2] == run(ctx, "HEXPIRE", [key, "0", "NX", "FIELDS", "2", "a", "b"])
+      end
+
+      test "NX, XX, GT and LT go anywhere after the TTL", %{ctx: ctx, key: key} do
+        assert 2 == run(ctx, "HSET", [key, "a", "1", "b", "2"])
+        assert [1, -2] == run(ctx, "HEXPIRE", [key, "100", "NX", "FIELDS", "2", "a", "zz"])
+        assert [0] == run(ctx, "HEXPIRE", [key, "100", "NX", "FIELDS", "1", "a"])
+        assert [0] == run(ctx, "HEXPIRE", [key, "50", "GT", "FIELDS", "1", "a"])
+        assert [1] == run(ctx, "HEXPIRE", [key, "200", "gt", "FIELDS", "1", "a"])
+        assert [1] == run(ctx, "HEXPIRE", [key, "10", "FIELDS", "1", "a", "lt"])
+        assert [0] == run(ctx, "HEXPIRE", [key, "10", "XX", "FIELDS", "1", "b"])
+        assert [0] == run(ctx, "HEXPIRE", [key, "10", "GT", "FIELDS", "1", "b"])
+        assert [1] == run(ctx, "HEXPIRE", [key, "20", "LT", "FIELDS", "1", "b"])
+        assert [1, 0, 0] == run(ctx, "HEXPIRE", [key, "5", "LT", "FIELDS", "3", "a", "a", "a"])
+        assert [a_ms, b_ms] = run(ctx, "HPTTL", [key, "FIELDS", "2", "a", "b"])
+        assert a_ms in 4_000..5_000 and b_ms in 19_000..20_000
+        assert [-2, 0] == run(ctx, "HPEXPIRE", [key, "8000", "NX", "NX", "FIELDS", "2", "c", "a"])
+        assert [0] == run(ctx, "HEXPIRE", [key, "0", "NX", "FIELDS", "1", "a"])
+        assert [2] == run(ctx, "HPEXPIRE", [key, "0", "XX", "FIELDS", "1", "a"])
+        assert ["b", "2"] == run(ctx, "HGETALL", [key])
+      end
+
+      test "argument errors follow the type check", %{ctx: ctx, key: key} do
+        :ok = run(ctx, "SET", [key <> ":s", "v"])
+        assert @wrongtype == run(ctx, "HEXPIRE", [key <> ":s", "-1", "FIELDS", "1", "a"])
+        assert 1 == run(ctx, "HSET", [key, "a", "1"])
+
+        for {args, message} <- [
+              {["-1", "FIELDS", "1", "a"], "ERR invalid expire time, must be >= 0"},
+              {["x", "FIELDS", "1", "a"], "ERR value is not an integer or out of range"},
+              {["9999999999999", "FIELDS", "1", "a"],
+               "ERR invalid expire time in 'hexpire' command"},
+              {["10", "NX", "GT", "FIELDS", "1", "a"], "ERR Multiple condition flags specified"},
+              {["10", "FIELDS", "1", "a", "FIELDS", "1", "b"],
+               "ERR FIELDS keyword specified multiple times"},
+              {["10", "NX", "NX", "NX"], "ERR missing FIELDS argument"},
+              {["10", "FOO", "FIELDS", "1", "a"], "ERR unknown argument: FOO"},
+              {["10", "FIELDS", "1", "a", "b"], "ERR unknown argument: b"},
+              {["10", "FIELDS", "0", "a"], "ERR Parameter `numFields` should be greater than 0"},
+              {["10", "FIELDS", "5", "a", "b"], "ERR wrong number of arguments"},
+              {["10", "NX", "FIELDS", "x"],
+               "ERR FIELDS requires at least numfields and one field argument"}
+            ] do
+          assert {:error, message} == run(ctx, "HEXPIRE", [key | args]), inspect(args)
+        end
+
+        assert [-1] == run(ctx, "HTTL", [key, "FIELDS", "1", "a"])
+      end
+    end
+
     describe "#{@path}: hyperloglog" do
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 

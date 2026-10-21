@@ -143,6 +143,10 @@ defmodule Ferricstore.Transaction.Ast do
       when tag in [:hexpire, :hpexpire] and is_list(fields),
       do: count_items_up_to(fields, limit, 0)
 
+  def compound_member_work_up_to({tag, _key, _ttl, _condition, fields}, limit)
+      when tag in [:hexpire, :hpexpire] and is_list(fields),
+      do: count_items_up_to(fields, limit, 0)
+
   def compound_member_work_up_to({:hgetex, _key, _mode, fields}, limit)
       when is_list(fields),
       do: count_items_up_to(fields, limit, 0)

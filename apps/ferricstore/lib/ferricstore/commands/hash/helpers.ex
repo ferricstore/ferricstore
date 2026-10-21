@@ -1,11 +1,15 @@
 defmodule Ferricstore.Commands.Hash.Helpers do
   @moduledoc false
 
+  alias Ferricstore.CommandTime
   alias Ferricstore.Commands.CollectionScan
   alias Ferricstore.Commands.ExpiryTime
 
   @max_int64 9_223_372_036_854_775_807
   @min_int64 -9_223_372_036_854_775_808
+  # Redis's latest field expiry, in Unix milliseconds (2^48 - 1).
+  @max_field_expire_ms 281_474_976_710_655
+  @field_expire_conditions %{"NX" => :nx, "XX" => :xx, "GT" => :gt, "LT" => :lt}
 
   @spec even_length?(list()) :: boolean()
   def even_length?([]), do: true
@@ -86,6 +90,99 @@ defmodule Ferricstore.Commands.Hash.Helpers do
   end
 
   def absolute_expire_at(_value, _multiplier), do: integer_range_error()
+
+  @type field_expire_condition :: nil | :nx | :xx | :gt | :lt
+
+  @doc """
+  Parses HEXPIRE's and HPEXPIRE's arguments after the key, as Redis 8 does:
+  the TTL, then NX, XX, GT or LT and the FIELDS block in any order.
+  """
+  @spec parse_field_expire(binary(), binary(), [binary()]) ::
+          {:ok, non_neg_integer(), field_expire_condition(), [binary()]} | {:error, binary()}
+  def parse_field_expire(command, ttl, args) do
+    with {:ok, ttl} <- parse_field_ttl(command, ttl),
+         {:ok, condition, fields} <- parse_field_expire_args(args, nil, nil) do
+      {:ok, ttl, condition, fields}
+    end
+  end
+
+  @doc "Milliseconds per unit of HEXPIRE's (seconds) or HPEXPIRE's TTL."
+  @spec field_ttl_multiplier(binary()) :: 1 | 1_000
+  def field_ttl_multiplier("hpexpire"), do: 1
+  def field_ttl_multiplier("hexpire"), do: 1_000
+
+  @doc "Where a field TTL of `ttl` (0 meaning now) in `multiplier` ms units expires."
+  @spec field_expire_at(non_neg_integer(), pos_integer()) :: {:ok, integer()} | {:error, binary()}
+  def field_expire_at(0, _multiplier), do: {:ok, CommandTime.now_ms()}
+  def field_expire_at(ttl, multiplier), do: relative_expire_at(ttl, multiplier)
+
+  defp parse_field_ttl(command, raw) do
+    case ExpiryTime.parse_integer(raw) do
+      {:ok, ttl} when ttl < 0 ->
+        {:error, "ERR invalid expire time, must be >= 0"}
+
+      {:ok, ttl} ->
+        if ttl * field_ttl_multiplier(command) > @max_field_expire_ms - CommandTime.now_ms(),
+          do: {:error, "ERR invalid expire time in '#{command}' command"},
+          else: {:ok, ttl}
+
+      :error ->
+        integer_range_error()
+    end
+  end
+
+  defp parse_field_expire_args([], _condition, nil), do: {:error, "ERR missing FIELDS argument"}
+  defp parse_field_expire_args([], condition, fields), do: {:ok, condition, fields}
+
+  defp parse_field_expire_args([arg | rest], condition, fields) do
+    case String.upcase(arg) do
+      "FIELDS" when fields != nil ->
+        {:error, "ERR FIELDS keyword specified multiple times"}
+
+      "FIELDS" ->
+        with {:ok, fields, rest} <- take_counted_fields(rest),
+             do: parse_field_expire_args(rest, condition, fields)
+
+      option ->
+        case Map.fetch(@field_expire_conditions, option) do
+          {:ok, flag} when condition in [nil, flag] ->
+            parse_field_expire_args(rest, flag, fields)
+
+          {:ok, _other_flag} ->
+            {:error, "ERR Multiple condition flags specified"}
+
+          :error ->
+            {:error, "ERR unknown argument: #{arg}"}
+        end
+    end
+  end
+
+  defp take_counted_fields([count, _field | _rest] = args) do
+    case strict_positive_integer(count) do
+      {:ok, count} ->
+        {fields, rest} = Enum.split(tl(args), count)
+
+        if length(fields) == count,
+          do: {:ok, fields, rest},
+          else: {:error, "ERR wrong number of arguments"}
+
+      :error ->
+        {:error, "ERR Parameter `numFields` should be greater than 0"}
+    end
+  end
+
+  defp take_counted_fields(_args),
+    do: {:error, "ERR FIELDS requires at least numfields and one field argument"}
+
+  # Redis's integer syntax: no sign, no leading zero.
+  defp strict_positive_integer(<<digit, _rest::binary>> = value) when digit in ?1..?9 do
+    case Integer.parse(value) do
+      {int, ""} when int <= @max_int64 -> {:ok, int}
+      _invalid -> :error
+    end
+  end
+
+  defp strict_positive_integer(_value), do: :error
 
   @spec validate_field_count(non_neg_integer(), [term()]) :: :ok | {:error, binary()}
   def validate_field_count(0, []), do: :ok

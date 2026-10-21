@@ -520,6 +520,9 @@ defmodule Ferricstore.Commands.Dispatcher do
       when tag in ~w(hincrby hincrbyfloat hsetnx hrandfield hscan hexpire hpexpire hgetex hsetex)a,
       do: Hash.handle_ast(ast, store)
 
+  def dispatch_ast({tag, _, _, _, _} = ast, store) when tag in ~w(hexpire hpexpire)a,
+    do: Hash.handle_ast(ast, store)
+
   def dispatch_ast({tag, _} = ast, store)
       when tag in ~w(sadd srem smembers smismember scard sinter sunion sdiff sdiffstore sinterstore sunionstore sintercard srandmember spop)a,
       do: Set.handle_ast(ast, store)

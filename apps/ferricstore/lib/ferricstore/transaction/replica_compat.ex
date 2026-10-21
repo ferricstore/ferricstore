@@ -11,14 +11,16 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
   one would leave old and new replicas in different states, so MULTI refuses
   these forms while queueing until every member runs a release that applies
   them (`Ferricstore.Cluster.FeatureLevel`, level 4). Level 5 adds forms that
-  releases before it do not parse at all, such as ZRANK ... WITHSCORE, or
-  refuse, such as PFMERGE with no source.
+  releases before it do not parse at all, such as ZRANK ... WITHSCORE and
+  HEXPIRE ... NX, or refuse, such as PFMERGE with no source and HEXPIRE with
+  a TTL of 0.
   """
 
   alias Ferricstore.Cluster.FeatureLevel
   alias Ferricstore.Store.Router
 
   @expiry_tags [:expire, :pexpire, :expireat, :pexpireat]
+  @field_expiry_tags [:hexpire, :hpexpire]
 
   @doc "Whether a parsed command needs cluster feature level 4 inside MULTI."
   @spec level_4_form?(term()) :: boolean()
@@ -37,6 +39,13 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
   # Level 5: forms releases before it do not parse or refuse.
   def required_level({tag, _key, _member, :withscore}) when tag in [:zrank, :zrevrank], do: 5
   def required_level({:pfmerge, [_destination]}), do: 5
+
+  def required_level({tag, _key, 0, fields}) when tag in @field_expiry_tags and is_list(fields),
+    do: 5
+
+  def required_level({tag, _key, _ttl, _condition, fields})
+      when tag in @field_expiry_tags and is_list(fields),
+      do: 5
 
   def required_level(_ast), do: nil
 

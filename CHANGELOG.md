@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Support HEXPIRE and HPEXPIRE as Redis 8 does: NX, XX, GT and LT (anywhere
+  after the TTL), a TTL of 0 deleting the field (answering 2, and deleting
+  the hash once empty), repeated fields applied in order, WRONGTYPE before
+  argument errors, and Redis's error texts and 2^48 ms expiry limit. A TTL of
+  0 answered an error and the conditions a syntax error. Inside MULTI the new
+  forms are queued only at cluster feature level 5.
 - Stamp the dashboard's circuit open/close and approval decisions with the
   store's clock. They used the wall clock, which the cluster's hybrid clock
   can run ahead of, so closing a circuit or deciding an approval right after

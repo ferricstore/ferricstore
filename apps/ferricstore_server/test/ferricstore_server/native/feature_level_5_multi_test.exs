@@ -1,7 +1,8 @@
 defmodule FerricstoreServer.Native.FeatureLevel5MultiTest do
   @moduledoc """
   Cluster feature level 5 inside MULTI: a transaction may queue ZRANK and
-  ZREVRANK WITHSCORE and a sourceless PFMERGE, BITOP with an empty result
+  ZREVRANK WITHSCORE, a sourceless PFMERGE and HEXPIRE/HPEXPIRE with NX, XX,
+  GT or LT or a TTL of 0, BITOP with an empty result
   deletes its destination, and GEOSEARCHSTORE of a missing source empties its
   destination.
   """
@@ -78,6 +79,19 @@ defmodule FerricstoreServer.Native.FeatureLevel5MultiTest do
 
     assert {:ok, [0], _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
     assert 0 == Dispatcher.dispatch("EXISTS", [destination], ctx)
+  end
+
+  test "MULTI queues HEXPIRE with a condition or a TTL of 0", %{ctx: ctx, key: key} do
+    assert 2 == Dispatcher.dispatch("HSET", [key, "a", "1", "b", "2"], ctx)
+
+    state = multi()
+    state = queue(state, "HEXPIRE", [key, "100", "NX", "FIELDS", "2", "a", "a"])
+    state = queue(state, "HPEXPIRE", [key, "0", "FIELDS", "1", "b"])
+
+    assert {:ok, [[1, 0], [2]], _state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, state)
+
+    assert ["a", "1"] == Dispatcher.dispatch("HGETALL", [key], ctx)
   end
 
   defp multi do

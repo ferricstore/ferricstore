@@ -10,6 +10,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   alias Ferricstore.Commands.{Catalog, CollectionScan, Extension}
   alias Ferricstore.Commands.Catalog.Entries
+  alias Ferricstore.Commands.Hash.Helpers, as: HashHelpers
   alias Ferricstore.Commands.SortedSet.Helpers, as: SortedSetHelpers
   alias Ferricstore.Flow.Query.Limits
 
@@ -516,12 +517,13 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp make_ast(_cmd, :hscan, [key, cursor | opts]),
     do: {:hscan, key, parse_scan_cursor(cursor), parse_collection_scan_opts(opts)}
 
-  defp make_ast(_cmd, tag, [key, ttl, option, count | fields])
-       when tag in ~w(hexpire hpexpire)a do
-    if String.upcase(option) == "FIELDS" do
-      parse_hash_expire(tag, key, ttl, count, fields)
-    else
-      {tag, key, {:error, "ERR syntax error"}, []}
+  # Without a condition the form older releases parse; NX, XX, GT or LT adds
+  # one (cluster feature level 5 inside MULTI, as does a TTL of 0).
+  defp make_ast(_cmd, tag, [key, ttl | args]) when tag in ~w(hexpire hpexpire)a do
+    case HashHelpers.parse_field_expire(Atom.to_string(tag), ttl, args) do
+      {:ok, ttl, nil, fields} -> {tag, key, ttl, fields}
+      {:ok, ttl, condition, fields} -> {tag, key, ttl, condition, fields}
+      {:error, _reason} = error -> {tag, key, error, []}
     end
   end
 
@@ -1459,15 +1461,6 @@ defmodule Ferricstore.Commands.NativeAstParser do
   end
 
   defp parse_scan_opts(_invalid, _allow_type?, _acc), do: {:error, "ERR syntax error"}
-
-  defp parse_hash_expire(tag, key, ttl, count, fields) do
-    with ttl when is_integer(ttl) <- parse_pos_int(ttl),
-         parsed_fields when is_list(parsed_fields) <- parse_hash_fields(count, fields) do
-      {tag, key, ttl, parsed_fields}
-    else
-      {:error, _} = error -> {tag, key, error, []}
-    end
-  end
 
   defp parse_hash_field_list(tag, key, count, fields) do
     case parse_hash_fields(count, fields) do

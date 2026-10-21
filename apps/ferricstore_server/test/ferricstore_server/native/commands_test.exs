@@ -5207,7 +5207,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
     Ferricstore.Commands.Dispatcher.dispatch("GEOADD", [key, "13.36", "38.11", "palermo"], ctx)
   end
 
-  test "native MULTI refuses ZRANK WITHSCORE and a sourceless PFMERGE below feature level 5" do
+  test "native MULTI refuses level-5 forms (ZRANK WITHSCORE, PFMERGE, HEXPIRE) below level 5" do
     key = "{multi-zrank:#{System.unique_integer([:positive])}}"
 
     assert {:ok, "OK", state} =
@@ -5222,6 +5222,19 @@ defmodule FerricstoreServer.Native.CommandsTest do
              Session.execute(%{"command" => "PFMERGE", "args" => [key <> ":hll"]}, state)
 
     assert pfmerge_message =~ "needs cluster feature level 5"
+
+    for args <- [[key, "0", "FIELDS", "1", "f"], [key, "10", "NX", "FIELDS", "1", "f"]] do
+      assert {:error, hexpire_message, _state} =
+               Session.execute(%{"command" => "HEXPIRE", "args" => args}, state)
+
+      assert hexpire_message =~ "needs cluster feature level 5"
+    end
+
+    assert {:ok, "QUEUED", _state} =
+             Session.execute(
+               %{"command" => "HEXPIRE", "args" => [key, "10", "FIELDS", "1", "f"]},
+               state
+             )
 
     assert {:ok, "QUEUED", _state} =
              Session.execute(%{"command" => "ZRANK", "args" => [key, "m"]}, state)

@@ -20,26 +20,68 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
     rollback_new_hash_type_marker(key, store, type_status, write_error)
   end
 
-  @spec expire_fields(binary(), [binary()], integer(), map()) :: [integer()] | {:error, term()}
-  def expire_fields(key, fields, expire_at_ms, store) do
+  @spec expire_fields(binary(), [binary()], integer(), nil | :nx | :xx | :gt | :lt, map()) ::
+          [integer()] | {:error, term()}
+  def expire_fields(key, fields, expire_at_ms, condition, store) do
     with :ok <- TypeRegistry.command_check_type(key, :hash, store),
-         {:ok, {unique_fields, compound_keys, metas_by_field}} <-
+         {:ok, {_unique_fields, _compound_keys, metas_by_field}} <-
            batch_field_metas(fields, key, store) do
-      entries = existing_field_entries(unique_fields, compound_keys, metas_by_field, expire_at_ms)
+      delete? = expire_at_ms <= CommandTime.now_ms()
 
-      case Ops.compound_batch_put(store, key, entries) do
-        :ok ->
-          Enum.map(fields, fn field ->
-            case Map.fetch!(metas_by_field, field) do
-              nil -> -2
-              {_value, _old_expire} -> 1
-            end
-          end)
+      # Redis applies the fields in order, so a repeated field sees the
+      # expiry its earlier occurrence set, or that it deleted it.
+      {results, current} =
+        Enum.map_reduce(fields, metas_by_field, fn field, current ->
+          case Map.fetch!(current, field) do
+            nil ->
+              {-2, current}
 
-        {:error, _} = err ->
-          err
-      end
+            {value, old_expire_at_ms} ->
+              cond do
+                not expire_condition_met?(condition, old_expire_at_ms, expire_at_ms) ->
+                  {0, current}
+
+                delete? ->
+                  {2, Map.put(current, field, nil)}
+
+                true ->
+                  {1, Map.put(current, field, {value, expire_at_ms})}
+              end
+          end
+        end)
+
+      changed =
+        Enum.reject(metas_by_field, fn {field, meta} -> Map.fetch!(current, field) == meta end)
+
+      with :ok <- write_expired_fields(key, changed, delete?, expire_at_ms, store), do: results
     end
+  end
+
+  # A field without an expiry counts as never expiring.
+  defp expire_condition_met?(nil, _old, _new), do: true
+  defp expire_condition_met?(:nx, old, _new), do: old == 0
+  defp expire_condition_met?(:xx, old, _new), do: old != 0
+  defp expire_condition_met?(:gt, old, new), do: old != 0 and new > old
+  defp expire_condition_met?(:lt, old, new), do: old == 0 or new < old
+
+  defp write_expired_fields(_key, [], _delete?, _expire_at_ms, _store), do: :ok
+
+  defp write_expired_fields(key, changed, true, _expire_at_ms, store) do
+    deleted_entries =
+      Enum.map(changed, fn {field, {value, old_expire_at_ms}} ->
+        {CompoundKey.hash_field(key, field), value, old_expire_at_ms}
+      end)
+
+    delete_and_cleanup(key, deleted_entries, length(deleted_entries), store)
+  end
+
+  defp write_expired_fields(key, changed, false, expire_at_ms, store) do
+    entries =
+      Enum.map(changed, fn {field, {value, _old_expire_at_ms}} ->
+        {CompoundKey.hash_field(key, field), value, expire_at_ms}
+      end)
+
+    Ops.compound_batch_put(store, key, entries)
   end
 
   @spec ttl_fields(binary(), [binary()], :seconds | :milliseconds, map()) ::
