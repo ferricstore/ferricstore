@@ -254,12 +254,7 @@ defmodule Ferricstore.Commands.Bitmap do
                   error
 
                 :unknown ->
-                  with {:ok, current} <- read_string_or_empty(store, key) do
-                    total_bits = byte_size(current) * 8
-                    s = Bits.resolve_index(start_idx, total_bits)
-                    e = Bits.resolve_index(end_idx, total_bits)
-                    Bits.bitpos_bit_range(current, bit_val, s, e)
-                  end
+                  bitpos_bit_range_value(store, key, bit_val, start_idx, end_idx)
               end
           end
       end
@@ -466,12 +461,7 @@ defmodule Ferricstore.Commands.Bitmap do
                   error
 
                 :unknown ->
-                  with {:ok, current} <- read_string_or_empty(store, key) do
-                    total_bits = byte_size(current) * 8
-                    s = Bits.resolve_index(start_idx, total_bits)
-                    e = Bits.resolve_index(end_idx, total_bits)
-                    Bits.bitpos_bit_range(current, bit_val, s, e)
-                  end
+                  bitpos_bit_range_value(store, key, bit_val, start_idx, end_idx)
               end
           end
       end
@@ -1207,6 +1197,24 @@ defmodule Ferricstore.Commands.Bitmap do
     case Destination.ensure_string_key(key, store) do
       :ok -> read_string_or_empty(store, key)
       {:error, _reason} = error -> error
+    end
+  end
+
+  # Redis reads a missing key as endless clear bits: the first 0 is at 0 and
+  # there is no 1.
+  defp bitpos_bit_range_value(store, key, bit_val, start_idx, end_idx) do
+    case Ops.get(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      nil ->
+        if bit_val == 0, do: 0, else: -1
+
+      current ->
+        total_bits = byte_size(current) * 8
+        s = Bits.resolve_index(start_idx, total_bits)
+        e = Bits.resolve_index(end_idx, total_bits)
+        Bits.bitpos_bit_range(current, bit_val, s, e)
     end
   end
 

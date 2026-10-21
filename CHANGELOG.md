@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer `BITPOS missing 0 start end BIT` with 0, as every other BITPOS form
+  of a missing key already did; it answered -1.
 - Add HEXPIREAT, HPEXPIREAT and HPEXPIRETIME (Redis 7.4). Inside MULTI they
   are queued only at cluster feature level 5. Field expiry times now stop at
   Redis's latest, 70368744177663 ms (in 4199), not 2^48 ms.
