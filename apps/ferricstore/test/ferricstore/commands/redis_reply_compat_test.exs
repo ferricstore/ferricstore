@@ -721,6 +721,10 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
 
         assert ["0", pairs] = run(ctx, "HSCAN", [key, "0"])
         assert length(pairs) == 4
+
+        # A bad option answers its error (the parsed form raised on it).
+        assert {:error, "ERR value is not an integer or out of range"} ==
+                 run(ctx, "HSCAN", [key, "0", "COUNT", "x"])
       end
     end
 

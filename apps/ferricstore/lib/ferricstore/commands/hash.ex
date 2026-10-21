@@ -483,6 +483,7 @@ defmodule Ferricstore.Commands.Hash do
 
   def handle_ast({:hstrlen, key, field}, store), do: hstrlen_field(key, field, store)
   def handle_ast({:hscan, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:hscan, _key, _cursor, {:error, _reason} = error}, _store), do: error
   def handle_ast({:hscan, key, cursor, opts}, store), do: hscan_typed(key, cursor, opts, store)
 
   def handle_ast({:hincrby, _key, _field, {:error, reason}}, _store), do: {:error, reason}
