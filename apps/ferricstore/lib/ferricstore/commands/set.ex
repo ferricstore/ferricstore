@@ -237,6 +237,9 @@ defmodule Ferricstore.Commands.Set do
     end
   end
 
+  # Redis takes any number of arguments after the key and refuses extras.
+  def handle("SRANDMEMBER", [_key, _count | _extra], _store), do: {:error, "ERR syntax error"}
+
   def handle("SRANDMEMBER", _args, _store) do
     {:error, "ERR wrong number of arguments for 'srandmember' command"}
   end
@@ -261,6 +264,8 @@ defmodule Ferricstore.Commands.Set do
         {:error, "ERR value is not an integer or out of range"}
     end
   end
+
+  def handle("SPOP", [_key, _count | _extra], _store), do: {:error, "ERR syntax error"}
 
   def handle("SPOP", _args, _store) do
     {:error, "ERR wrong number of arguments for 'spop' command"}

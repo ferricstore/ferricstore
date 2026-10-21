@@ -680,6 +680,19 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
     end
 
     describe "#{@path}: argument error texts" do
+      test "SRANDMEMBER and SPOP with extra arguments answer a syntax error", %{
+        ctx: ctx,
+        key: key
+      } do
+        assert 1 == run(ctx, "SADD", [key, "a"])
+
+        for command <- ["SRANDMEMBER", "SPOP"] do
+          assert {:error, "ERR syntax error"} == run(ctx, command, [key, "1", "2"]), command
+        end
+
+        assert ["a"] == run(ctx, "SMEMBERS", [key])
+      end
+
       test "malformed generic commands answer the arity error", %{ctx: ctx, key: key} do
         for {command, args} <- [
               {"RANDOMKEY", ["x"]},

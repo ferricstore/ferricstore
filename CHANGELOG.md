@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- SRANDMEMBER and SPOP with arguments after the count answer Redis's
+  "ERR syntax error" instead of the arity error.
 - Native EXEC answered INCR, INCRBY, DECR and DECRBY inside MULTI with
   `["ok", n]` instead of `n`; it now answers the integer, as Redis does.
 - RANDOMKEY with arguments (and other generic commands parsed with the wrong

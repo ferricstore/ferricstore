@@ -528,14 +528,14 @@ defmodule Ferricstore.Commands.SetTest.Sections.Srandmember do
 
         test "SPOP with extra args returns error" do
           store = MockStore.make()
-          assert {:error, msg} = Set.handle("SPOP", ["set", "1", "extra"], store)
-          assert msg =~ "wrong number of arguments"
+          assert {:error, "ERR syntax error"} = Set.handle("SPOP", ["set", "1", "extra"], store)
         end
 
         test "SRANDMEMBER with extra args returns error" do
           store = MockStore.make()
-          assert {:error, msg} = Set.handle("SRANDMEMBER", ["set", "1", "extra"], store)
-          assert msg =~ "wrong number of arguments"
+
+          assert {:error, "ERR syntax error"} =
+                   Set.handle("SRANDMEMBER", ["set", "1", "extra"], store)
         end
 
         test "SISMEMBER with no args returns error" do

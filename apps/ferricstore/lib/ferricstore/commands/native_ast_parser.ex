@@ -556,6 +556,9 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp make_ast(_cmd, tag, [key]) when tag in ~w(srandmember spop)a, do: {tag, key}
 
+  defp make_ast(_cmd, tag, [key, _count, _extra | _rest]) when tag in ~w(srandmember spop)a,
+    do: {tag, key, {:error, "ERR syntax error"}}
+
   defp make_ast(_cmd, tag, [key, count]) when tag in ~w(srandmember spop)a,
     do: {tag, key, parse_int(count)}
 
