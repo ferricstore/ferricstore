@@ -5225,6 +5225,17 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert {:ok, [2], _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
   end
 
+  # Releases before level 5 drop a sketch's TTL in apply; below it every
+  # replica still does.
+  test "PFADD drops the sketch's TTL below level 5" do
+    key = "{pf-ttl:#{System.unique_integer([:positive])}}"
+    ctx = FerricStore.Instance.get(:default)
+    assert 1 == Ferricstore.Commands.Dispatcher.dispatch("PFADD", [key, "a"], ctx)
+    assert 1 == Ferricstore.Commands.Dispatcher.dispatch("EXPIRE", [key, "100"], ctx)
+    assert 1 == Ferricstore.Commands.Dispatcher.dispatch("PFADD", [key, "b"], ctx)
+    assert -1 == Ferricstore.Commands.Dispatcher.dispatch("TTL", [key], ctx)
+  end
+
   defp geoadd(ctx, key) do
     Ferricstore.Commands.Dispatcher.dispatch("GEOADD", [key, "13.36", "38.11", "palermo"], ctx)
   end

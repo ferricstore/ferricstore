@@ -576,14 +576,18 @@ shard_0: 2
     across the whole cluster. Inside MULTI, EXPIRE with several flags
     (`EXPIRE key 100 XX GT`), BITCOUNT ranges and BITPOS are queued only at
     level 4: older releases abort or answer such a transaction differently.
-  - 5: MULTI queues the command forms releases before it do not parse or
-    refuse: `ZRANK`/`ZREVRANK ... WITHSCORE`, `PFMERGE` with no source, and
-    `HEXPIRE`/`HPEXPIRE` with NX, XX, GT or LT or a TTL of 0, `HSETEX`'s
-    Redis 8 form, `HGETEX` with a TTL of 0 and `ZADD ... INCR`. Outside MULTI, HSETEX's Redis form runs
-    as one replicated entry.
-    Inside MULTI, BITOP deletes its destination for an empty result, and
-    GEOSEARCHSTORE empties its destination for a missing source and measures
-    with Redis's Earth radius, as both do outside MULTI.
+  - 5: Redis 8 behavior that older releases apply differently, so it waits
+    until every node runs this release:
+    - MULTI queues `ZRANK`/`ZREVRANK ... WITHSCORE`, `PFMERGE` with no
+      source, `HEXPIRE`/`HPEXPIRE` with NX, XX, GT or LT or a TTL of 0,
+      `HSETEX`'s Redis 8 form, `HGETEX` with a TTL of 0 and `ZADD ... INCR`.
+    - Inside MULTI, BITOP deletes its destination for an empty result,
+      GEOSEARCHSTORE empties its destination for a missing source and
+      measures with Redis's Earth radius, and HGETEX with a past time deletes
+      the fields, as they do outside MULTI.
+    - HSETEX's Redis form and a conditional `ZADD ... INCR` run as one
+      replicated entry, so concurrent clients see one outcome.
+    - PFADD and PFMERGE keep the sketch's TTL.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.

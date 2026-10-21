@@ -201,9 +201,26 @@ defmodule Ferricstore.Commands.HyperLogLog do
   end
 
   defp write_sketch(store, key, sketch, success_result) do
-    case Ops.put(store, key, sketch, 0) do
-      :ok -> success_result
-      {:error, _} = error -> error
+    with {:ok, expire_at_ms} <- sketch_expire_at(store, key) do
+      case Ops.put(store, key, sketch, expire_at_ms) do
+        :ok -> success_result
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  # PFADD and PFMERGE change the sketch in place, as Redis does, so it keeps
+  # its TTL. Releases before cluster feature level 5 drop it, and the state
+  # machine and a MULTI transaction write as they do below that level.
+  defp sketch_expire_at(store, key) do
+    if Ops.level_5_writes?(store) do
+      case Ops.expire_at_ms(store, key) do
+        expire_at_ms when is_integer(expire_at_ms) -> {:ok, expire_at_ms}
+        nil -> {:ok, 0}
+        {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      end
+    else
+      {:ok, 0}
     end
   end
 

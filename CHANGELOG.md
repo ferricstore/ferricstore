@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Keep a HyperLogLog's TTL through PFADD and PFMERGE, as Redis does; they
+  rewrote the sketch without it, so the key no longer expired. The state
+  machine applies them, so the TTL is kept once cluster feature level 5 is
+  active.
 - Answer Redis's errors for LPOP or RPOP with a negative count ("value is
   out of range, must be positive", checked before the key's type) and
   BLMPOP with a numkeys or COUNT below 1 ("numkeys should be greater than

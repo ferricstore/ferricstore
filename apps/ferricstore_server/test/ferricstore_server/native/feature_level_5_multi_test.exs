@@ -168,6 +168,22 @@ defmodule FerricstoreServer.Native.FeatureLevel5MultiTest do
     assert Enum.count(results, &is_nil/1) == 19
   end
 
+  # PFADD and PFMERGE change a sketch in place, as Redis does, so it keeps its
+  # TTL; the state machine applies them, keeping it only at level 5.
+  test "PFADD and PFMERGE keep the sketch's TTL", %{ctx: ctx, key: key} do
+    assert 1 == Dispatcher.dispatch("PFADD", [key, "a"], ctx)
+    assert 1 == Dispatcher.dispatch("EXPIRE", [key, "100"], ctx)
+    assert 1 == Dispatcher.dispatch("PFADD", [key, "b"], ctx)
+    assert Dispatcher.dispatch("TTL", [key], ctx) in 99..100
+    assert 1 == Dispatcher.dispatch("PFADD", [key <> ":src", "x"], ctx)
+    assert :ok = Dispatcher.dispatch("PFMERGE", [key, key <> ":src"], ctx)
+    assert Dispatcher.dispatch("TTL", [key], ctx) in 99..100
+
+    state = queue(multi(), "PFADD", [key, "c"])
+    assert {:ok, [1], _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
+    assert Dispatcher.dispatch("TTL", [key], ctx) in 99..100
+  end
+
   defp multi do
     {:ok, "OK", state} = Session.execute(%{"command" => "MULTI", "args" => []}, session_state())
     state

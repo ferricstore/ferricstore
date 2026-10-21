@@ -652,9 +652,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       # check answers WRONGTYPE first.
       defp do_pfadd(state, key, elements) do
         with :ok <- ensure_string_key(state, key) do
-          HyperLogLog.handle_ast({:pfadd, [key | elements]}, build_string_value_store(state))
+          HyperLogLog.handle_ast({:pfadd, [key | elements]}, hll_store(state))
         end
       end
+
+      # Feature level 5 keeps a sketch's TTL through PFADD and PFMERGE, as
+      # Redis does; releases before it drop the TTL.
+      defp hll_store(state),
+        do: Map.put(build_string_value_store(state), :level_5_writes?, feature_level_5?(state))
 
       defp do_pfmerge(state, dest_key, source_sketches) when is_list(source_sketches) do
         with :ok <- ensure_string_key(state, dest_key) do
@@ -669,7 +674,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           |> Enum.map(fn {_sketch, idx} -> "\0__pfmerge_source__:" <> Integer.to_string(idx) end)
 
         source_values = Map.new(Enum.zip(source_keys, source_sketches))
-        base_store = build_string_value_store(state)
+        base_store = hll_store(state)
 
         store = %{
           base_store
