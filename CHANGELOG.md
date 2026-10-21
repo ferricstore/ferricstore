@@ -76,6 +76,9 @@ All notable changes to FerricStore will be documented here.
   small ones. ZSCORE, ZMSCORE, ZINCRBY, ZPOPMIN, ZPOPMAX, ZSCAN and
   WITHSCORES replies (also over the native protocol) disagreed with each
   other and with Redis. Stored scores are unchanged.
+
+## 0.12.7 - 2026-10-21
+
 - Stop syncing a large collection's file on every write. A hash, set or
   sorted set over 100 members lives in its own file, and WARaft fsynced that
   file once per write, so writes to it ran at a fraction of the speed of small
@@ -354,7 +357,6 @@ All notable changes to FerricStore will be documented here.
 - Store an HTTP invocation target's response that is neither JSON nor UTF-8
   as `{"status": ..., "bytes_base64": ...}`. It was stored as raw bytes, and
   reading that invocation or its result then failed with HTTP 500.
-
 - Redesign the dashboard shell. The sidebar has 18 destinations in
   always-open sections instead of about 30 links in collapsible groups; lower-use
   pages are tabs of their destination. Every page shares one header with its
