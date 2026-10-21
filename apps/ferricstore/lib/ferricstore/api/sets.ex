@@ -31,9 +31,7 @@ defmodule FerricStore.API.Sets do
   """
   @spec sadd(key(), [binary()]) :: {:ok, non_neg_integer()}
   def sadd(key, members) when is_list(members) do
-    store = build_compound_store(key)
-
-    case Set.handle_ast({:sadd, [key | members]}, store) do
+    case Set.handle_ast({:sadd, [key | members]}, default_ctx()) do
       {:error, _} = err -> err
       result -> {:ok, result}
     end
@@ -57,9 +55,7 @@ defmodule FerricStore.API.Sets do
   """
   @spec srem(key(), [binary()]) :: {:ok, non_neg_integer()}
   def srem(key, members) when is_list(members) do
-    store = build_compound_store(key)
-
-    case Set.handle_ast({:srem, [key | members]}, store) do
+    case Set.handle_ast({:srem, [key | members]}, default_ctx()) do
       {:error, _} = err -> err
       result -> {:ok, result}
     end

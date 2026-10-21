@@ -4,6 +4,285 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Stop syncing a large collection's file on every write. A hash, set or
+  sorted set over 100 members lives in its own file, and WARaft fsynced that
+  file once per write, so writes to it ran at a fraction of the speed of small
+  collections: on macOS, 181 sequential SADDs a second instead of 582, 204
+  instead of about 5,000 with 20 clients, and 21 ten-member SREMs a second
+  instead of 371. They now run at 695, 1,797 and 208. The Raft log already
+  holds every acknowledged write, so the storage now syncs the files it wrote
+  before it persists its replay position, and a projection checkpoint or log
+  trim syncs them first too; recovery therefore always replays the log from
+  before any write that may not have reached disk. A marker made durable
+  before the first unsynced write makes a node that stopped before syncing
+  sync every dedicated file before it replays.
+- Stop refusing logins that arrive together. The authentication limiter
+  counted a login still checking its password as a failed attempt, so a
+  connection pool opening more than 10 connections at once from one address
+  (or for one user from anywhere) had the extra logins refused for a minute:
+  native AUTH answered "too many authentication attempts; retry after 60000
+  ms" and HTTP answered 429 with `Retry-After: 60`. Such a login now waits
+  (up to 5 seconds) for the checks ahead of it and is refused only if they
+  fail and use up the budget. Ten failed attempts a minute per address and
+  per user are still the limit, and an attempt waiting its turn never checks
+  a password early.
+- Check an HTTP client's password once per address. Each new HTTP connection
+  ran its own password check (PBKDF2, about 50 ms), even when the same
+  credentials had just been checked for another connection from the same
+  address. Connections presenting the same credentials from one address now
+  share one check and each still gets a session carrying its own peer; a
+  password or ACL change still forces every connection to authenticate again.
+- Refuse keys over the 65,535-byte key size limit for hash, set, sorted set,
+  list and stream writes through the TCP and HTTP gateways, as SET already
+  did ("ERR key too large"); HSET, SADD, ZADD, RPUSH and XADD accepted them.
+- Over HTTP, answer `deadline_exceeded` (with a message, not safe to retry)
+  for a blocking command (BLPOP, XREAD BLOCK) that the request deadline cut
+  off. It answered `{"code": "error", "message": "FerricStore command
+  failed"}`.
+- Answer Redis's arity error for a data command with too few or too many
+  arguments through the TCP and HTTP gateways. SETEX and PSETEX with two
+  arguments answered "unsupported command AST", BITOP and UNLINK with too
+  few "unsupported bitmap/generic command AST", and HSCAN, HTTL, HPERSIST,
+  HPTTL, HEXPIRETIME and HGETDEL "unsupported hash command AST".
+- Name the bad argument when a governance call (`FerricStore.flow_effect_*`,
+  `flow_approval_*`, `flow_circuit_*`, `flow_budget_*`, `flow_limit_*`,
+  `flow_governance_ledger`) gets a wrong id, scope, effect key, reservation
+  id or amount; every such call answered that its opts must be a keyword
+  list. LPOS RANK 0 also answers Redis's wording ("use negative", not "use
+  NEGATIVE").
+- Keep MULTI transactions applying alike on old and new nodes during an
+  upgrade. Inside MULTI, EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT with several
+  flags, BITCOUNT ranges and BITPOS run in the state machine on every
+  replica, and releases before this one raise on or answer them differently:
+  a v0.12.6 replica aborted the whole transaction (so it skipped the
+  transaction's writes) where this release applied it. MULTI now refuses
+  these forms while queueing until cluster feature level 4 is active.
+- Size TOPK.RESERVE's sketch for k when no width is given: 64 counters a row
+  per tracked item (256 to 16,384) instead of 8. Redis's default width suits
+  its HeavyKeeper sketch; FerricStore's Count-Min sketch that narrow put
+  light items ahead of the real heavy hitters (a 10-item list of a skewed
+  stream held 2 of the 10) and overstated counts several times (an item seen
+  4 times reported 104). `FerricStore.topk_reserve/2` uses the same width.
+  Explicit `width depth` are kept; existing trackers keep their size.
+- Publish keyspace notifications again. `CONFIG SET notify-keyspace-events`
+  was accepted, but nothing published since the RESP protocol was removed.
+  Commands from native and HTTP clients, typed native operations, MULTI and
+  pipelines now publish `__keyspace@0__:<key>` and `__keyevent@0__:<event>`
+  messages as Redis does, skipping commands that failed or changed nothing
+  (including a SET that NX or XX kept from writing). While notifications are
+  on, the native batched write paths stand aside so every write notifies.
+- Refuse a command with the wrong number of arguments while native MULTI
+  queues it, as Redis does, so EXEC then answers EXECABORT and runs nothing.
+  `MULTI`, `SET k v`, `GET` (no key), `EXEC` ran the SET and failed the GET;
+  a GET without a key was also reported as not supported inside
+  transactions. Errors Redis reports while running a command, such as an odd
+  number of HSET field/value arguments, still come back from EXEC.
+- At cluster feature level 4, run HDEL, HSETNX, HGETDEL, and ZADD and GEOADD
+  with options, as one replicated entry each, in which the state machine
+  reads, decides and writes. Concurrent clients then see one outcome: 20
+  concurrent `HDEL key f` answered 1 to all 20, and ZADD CH counted one
+  change for every client; the per-node latch these commands used did not
+  cover clients on other nodes. Below level 4 they keep their previous paths.
+- Answer INCRBYFLOAT and HINCRBYFLOAT in plain decimals, as Redis does:
+  "5200" instead of "5.2e3", "0.00000015" instead of "1.5e-7", and "3" from
+  HINCRBYFLOAT instead of "3.0". At cluster feature level 4 the stored value
+  takes the same form; before it, values keep the form every release stores
+  ("3.0", "5.2e3"), which INCR and HINCRBY refuse.
+- Add cluster feature level 4: the state machine checks the key's type when
+  it writes hash, set or sorted set members, as ZINCRBY always has, creating
+  the type for a missing key and refusing a string with WRONGTYPE. HINCRBY,
+  HINCRBYFLOAT, HSETNX, HSETEX, ZADD and GEOADD with options and SMOVE check
+  the type before they write, so a SET landing in between left the members
+  hidden under the string, to come back when the key was recreated (30 of 30
+  races). Raise it with `CLUSTER.FEATURES.RAISE 4` once every node runs this
+  release; until then these commands behave as before, so a mixed-version
+  cluster applies every write the same way on every node.
+- Keep a promoted sorted set's ranges and count current. Writes to a sorted
+  set with more than 100 members go to its own file, so an entry that wrote
+  only there left no shared-log rows, and the score index updates it queued
+  were dropped instead of applied. Once the index was ready (for a set created
+  by the native protocol's pipelined ZADD), ZRANGE and ZCARD missed members
+  added in batches and kept members removed in batches.
+- Keep a sorted set's ranges and count right after writes from different
+  paths. A sorted set created by the native protocol's pipelined ZADD, which
+  writes through the state machine's single-member entry, gets a ready score
+  index; ZADD with several members, ZREM with several members, DEL and SET
+  then applied through the WARaft segment projection, which passed the state
+  machine's table names and so never updated that index. ZRANGE and ZCARD
+  missed the added members, kept the removed ones, and after DEL or SET
+  returned the old members under a recreated key. The projection now updates
+  the same index.
+- Keep COPY and RENAME of large collections from stopping a shard. The
+  transaction store's member budget was never reset between key-lifecycle
+  entries, so after a few COPY/RENAME pairs of 300-member collections one
+  threw past apply; the shard's storage process exited, writes to the shard
+  timed out for several seconds, and the command reported an unknown outcome
+  before applying on replay. Each entry now gets its own budget, as MULTI
+  transactions do, and a command that exceeds it alone answers an error
+  instead of stopping the shard.
+- Make SETRANGE with an empty value change nothing and answer the current
+  length, as Redis does, through the TCP and HTTP gateways and
+  `FerricStore.setrange/3`. It zero-padded the string out to the offset, or
+  created a key of zero bytes when the key was missing. Inside MULTI/EXEC the
+  command keeps its previous behavior, because the state machine applies it
+  there and every release must apply a transaction the same way.
+- Refuse a CLUSTER.PROMOTE, CLUSTER.DEMOTE, CLUSTER.JOIN or CLUSTER.FAILOVER
+  target, and a Raft membership change, whose name is not a distributed node
+  (`name@host`). `CLUSTER.PROMOTE k` committed `k` into every shard's Raft
+  membership; each shard's storage then failed to persist the config, on
+  every replay as well, so all shards stopped serving and stayed down. The
+  name is now checked before any change is proposed.
+- Answer the integer error for a non-integer index in `FerricStore.getrange/3`
+  and a non-integer or negative offset in `FerricStore.getbit/2`. They
+  answered "wrong number of arguments for 'set' command" and "unsupported
+  bitmap command AST".
+- Make SADD, SREM, ZREM and HSET, and ZADD and GEOADD without options, count
+  each member once under concurrency, through the TCP and HTTP gateways and
+  `FerricStore.sadd/2`, `srem/2`, `zadd/2`, `zrem/2` and `hset/2`. They read
+  the members and wrote them in separate entries, so 20 concurrent
+  `SADD key m` all answered 1, which breaks deduplication that processes an
+  item only when SADD returns 1, and a SET landing between the type check and
+  the write left the members hidden under the string, to come back when the
+  key was recreated (29 of 30 races for multi-member SADD, HSET and ZADD).
+  Each member now goes through the state machine's single-member entries,
+  which every release since v0.12.0 applies: they check the key's type and
+  report whether their member changed, in replicated batches of up to 128.
+  A run of them on a collection with its own file (over 100 members) is
+  appended in one batch, as before. Options (NX, XX, GT, LT, CH), HINCRBY,
+  HSETNX, HSETEX and SMOVE keep the previous path.
+- Answer a typed native HSET whose field name or value is a map or a list
+  with a bad-request error. It raised while turning the field into a string,
+  so the client got an internal server error and the server logged a stack
+  trace for each such request.
+- Reject a Bloom or Cuckoo filter element that is not a string in
+  `FerricStore.bf_add/2`, `bf_madd/2`, `cf_add/2`, `cf_addnx/2` and
+  `cf_del/2` instead of crashing the shard. The element reached the
+  replicated log unchecked and the filter NIF raised while the entry was
+  applied, so the shard's storage process crash-looped. The state machine
+  now rejects those entries before touching the filter file.
+- Reject a sorted set member that is not a string in `FerricStore.zincrby/3`
+  instead of crashing the shard. The member reached the replicated log
+  unchecked and raised while the entry was applied, so the shard's storage
+  process crash-looped and stopped serving. The router now checks the
+  member, field and increment of ZINCRBY, HINCRBY and HINCRBYFLOAT, and the
+  state machine rejects the entries that used to raise.
+- Check the key's type in `FerricStore.hincrby/3` and
+  `FerricStore.hincrbyfloat/3`. They wrote the field without recording or
+  checking the type: on a new key TYPE answered "none" and EXISTS false while
+  HGETALL returned the field, and on a string or set key they hid a field
+  that a later hash on the key brought back after DEL. They now answer
+  WRONGTYPE for another type and make a new key a hash, as HINCRBY and
+  HINCRBYFLOAT do.
+- Answer WRONGTYPE for PFADD on a hash, set, sorted set or list key instead
+  of crashing the shard. The write's type check ran in the state machine with
+  a store it could not use there and raised, so the shard's storage process
+  crash-looped and stopped serving. `FerricStore.pfadd/2` already hit this,
+  and the gateway PFADD reached it after it moved to the atomic write in this
+  release. PFMERGE gets the same check in the state machine, for a
+  destination that changes type between the caller's read and the write.
+- Discard a native MULTI transaction when one of its commands is rejected
+  while queuing. An unknown command, a command that failed to parse, or one
+  the user's ACL denies answered with an error but left the transaction open,
+  so EXEC committed the commands queued around it; EXEC now answers EXECABORT
+  and applies none of them, as Redis does and as FerricStore already did for
+  commands not allowed inside a transaction.
+- Keep `FerricStore.flow_purge_orphans/1` from treating a Flow as orphaned when
+  the read of its projection frame timed out or ran over its byte budget. Any
+  failed read counted as a lost frame, so a purge on a busy node could delete
+  a Flow that still reads back; the policy catalog backfill already told
+  these apart.
+- Make HINCRBY, HINCRBYFLOAT, ZINCRBY and PFADD atomic through the TCP and HTTP
+  gateways. Their command handlers read the current value and wrote the new
+  one from the client's process, so concurrent clients lost updates: 200
+  concurrent HINCRBY increments of one field left 27 over HTTP, and PFADD lost
+  elements. On the instance they now use the state machine's atomic
+  operations, which the embedded API already used; inside MULTI/EXEC the
+  handlers still run in the state machine. HINCRBYFLOAT now stores and returns
+  the shortest form ("10.6", not "10.59999999999999968"), as the embedded API
+  did.
+- Make SPOP, ZPOPMIN, ZPOPMAX, LMOVE and RPOPLPUSH atomic through the TCP and
+  HTTP gateways. Their handlers read the members to take and removed them in
+  later writes, so concurrent clients popped the same members (40 concurrent
+  ZPOPMIN returned 2 distinct members) and concurrent LMOVE lost elements
+  (40 moves left 1 in the destination). On the instance they now use the
+  state machine's atomic pop and the router's single-entry list move.
+- Make the embedded `FerricStore.lmove/4` atomic and serialize
+  `FerricStore.hsetnx/3`. `lmove/4` moved through separate reads and writes,
+  so 40 concurrent moves left 1 element in the destination and lost the rest,
+  and every concurrent `hsetnx/3` on one field reported a win.
+- Serialize HSETNX, HGETDEL, SMOVE, ZADD or GEOADD with NX, XX, GT or LT, and
+  EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT with a flag, per key through the TCP and
+  HTTP gateways. They read the key and decided the write in the client's
+  process, so every concurrent HSETNX, ZADD NX, SMOVE or EXPIRE NX on one key
+  reported a win (20 of 20), HGETDEL handed one field to every client, and
+  concurrent ZADD GT could leave a lower score; they now run under the node's
+  key latch, as the TDIGEST read-modify-writes already do.
+- Write PFADD, SPOP, ZPOPMIN and ZPOPMAX for a custom embedded instance to that
+  instance. `Router.pfadd/3`, `spop/3`, `zpopmin/3` and `zpopmax/3` sent every
+  instance's command down the default instance's forced quorum path, so they
+  read and wrote the default instance's shard of the same index.
+- Accept combined EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT flags as Redis 7
+  does: XX joins GT or LT, while NX with another flag, or GT with LT, answers
+  Redis's incompatibility error. A second flag answered "wrong number of
+  arguments". A non-integer time with a flag now answers the integer error
+  on the TCP and HTTP path instead of "unsupported expiry command AST".
+- Fix BITCOUNT and BITPOS ranges through the TCP and HTTP gateways. The native
+  command parser built a BITCOUNT range shape no handler accepted, so
+  `BITCOUNT key 0 -1` answered "ERR unsupported command AST", the BIT form and
+  `BITCOUNT key start` answered "ERR internal server error", and BITPOS with
+  a BIT or BYTE mode answered "wrong number of arguments". Both commands now
+  use the bitmap handler's argument checks. ZRANGE and ZREVRANGE with a
+  non-integer start or stop now answer "ERR value is not an integer or out
+  of range" instead of an empty list or an internal error.
+- Keep the dashboard's run pages working when a run or schedule time is past
+  year 9999. The store accepts any integer run time, and the new compact rows
+  and schedule times raised on such a value, so one such run broke the Due
+  and Runs pages for every viewer; they now show "-".
+- Order journal events from the same millisecond by sequence number. Event
+  IDs were compared as text, so with ten or more events in one millisecond
+  the journal listed them out of order with wrong "from" states, and the
+  Lifecycle strip could repeat a state.
+- Reject a negative or non-integer offset in the embedded `FerricStore.setrange/3`
+  with "ERR offset is out of range". The call skipped the offset check that
+  the SETRANGE command has, so the bad offset reached the replicated log and
+  raised while the shard applied it; the shard's storage process crashed
+  until the node shut down, and replaying the entry crashed it again. The
+  state machine now also returns an error for a bad SETRANGE or SETBIT offset
+  instead of raising.
+- Reject a non-integer index or count in the embedded `FerricStore.lset/3` and
+  `FerricStore.lrem/3`, and a non-string element in `FerricStore.pfadd/2`. Like
+  the SETRANGE offset, these reached the replicated log unchecked and raised
+  while the shard applied them, crashing it until the node shut down. The
+  state machine now also rejects malformed list writes and PFADD elements
+  instead of raising.
+- Reject a malformed window, limit or count in the embedded
+  `FerricStore.ratelimit_add/4` with the RATELIMIT.ADD command's bounds. A
+  float or string window reached the replicated log and raised while the
+  shard applied it, with the same node shutdown; the state machine now also
+  rejects such an entry instead of raising.
+- Reject a TTL that is not a positive integer in the embedded
+  `FerricStore.lock/3`, `FerricStore.extend/3` and `FerricStore.cas/4`, with
+  the LOCK, EXTEND and CAS commands' bound. A float TTL became a float expiry
+  that the shard's logical key index rejected while applying the write, with
+  the same storage crash and node shutdown; the state machine now also
+  rejects a non-integer lock or CAS expiry before writing.
+- Answer a failed typed RATELIMIT.ADD request on the native protocol with an
+  error. The opcode wrapped every result as a success, so an error such as an
+  out-of-range window reached the client as a successful reply carrying the
+  error tuple.
+- Reject a TTL in the embedded `FerricStore.setex/3` and `FerricStore.psetex/3`
+  that puts the expiry past the int64 range, with "ERR value is not an integer
+  or out of range", as the SETEX and PSETEX commands and `FerricStore.pexpire/2`
+  already do. They stored the expiry unbounded, so TTL then reported values no
+  int64 client can read.
+- Answer an HTTP command batch whose JSON reply holds bytes that are not
+  UTF-8 with a `binary_reply` error for that command. JSON encoding raised
+  instead, so the client got HTTP 500 for a batch that had already run,
+  inviting a retry of every command in it, and the bytes were logged.
+- Store an HTTP invocation target's response that is neither JSON nor UTF-8
+  as `{"status": ..., "bytes_base64": ...}`. It was stored as raw bytes, and
+  reading that invocation or its result then failed with HTTP 500.
+
 - Redesign the dashboard shell. The sidebar has 18 destinations in
   always-open sections instead of about 30 links in collapsible groups; lower-use
   pages are tabs of their destination. Every page shares one header with its

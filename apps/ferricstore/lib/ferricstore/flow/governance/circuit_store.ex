@@ -1,6 +1,8 @@
 defmodule Ferricstore.Flow.Governance.CircuitStore do
   @moduledoc false
 
+  alias Ferricstore.Flow.Governance.Args
+
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.Governance.AtomicRecord
   alias Ferricstore.Flow.Governance.Catalog
@@ -67,7 +69,7 @@ defmodule Ferricstore.Flow.Governance.CircuitStore do
     Telemetry.emit(:circuit_open, result, circuit_telemetry_metadata(scope, result))
   end
 
-  def open(_ctx, _scope, _opts), do: {:error, "ERR flow circuit opts must be a keyword list"}
+  def open(_ctx, scope, _opts), do: Args.error("circuit", [{:scope, scope, :non_empty_string}])
 
   def close(ctx, scope, opts \\ [])
 
@@ -99,7 +101,7 @@ defmodule Ferricstore.Flow.Governance.CircuitStore do
     Telemetry.emit(:circuit_close, result, circuit_telemetry_metadata(scope, result))
   end
 
-  def close(_ctx, _scope, _opts), do: {:error, "ERR flow circuit opts must be a keyword list"}
+  def close(_ctx, scope, _opts), do: Args.error("circuit", [{:scope, scope, :non_empty_string}])
 
   def record_failure(ctx, scope, opts \\ [])
 
@@ -140,8 +142,8 @@ defmodule Ferricstore.Flow.Governance.CircuitStore do
     Telemetry.emit(:circuit_failure, result, circuit_telemetry_metadata(scope, result))
   end
 
-  def record_failure(_ctx, _scope, _opts),
-    do: {:error, "ERR flow circuit opts must be a keyword list"}
+  def record_failure(_ctx, scope, _opts),
+    do: Args.error("circuit", [{:scope, scope, :non_empty_string}])
 
   def record_success(ctx, scope, opts \\ [])
 
@@ -194,8 +196,8 @@ defmodule Ferricstore.Flow.Governance.CircuitStore do
     Telemetry.emit(:circuit_success, result, circuit_telemetry_metadata(scope, result))
   end
 
-  def record_success(_ctx, _scope, _opts),
-    do: {:error, "ERR flow circuit opts must be a keyword list"}
+  def record_success(_ctx, scope, _opts),
+    do: Args.error("circuit", [{:scope, scope, :non_empty_string}])
 
   def get(ctx, scope, opts \\ [])
 
@@ -210,7 +212,7 @@ defmodule Ferricstore.Flow.Governance.CircuitStore do
     end
   end
 
-  def get(_ctx, _scope, _opts), do: {:error, "ERR flow circuit opts must be a keyword list"}
+  def get(_ctx, scope, _opts), do: Args.error("circuit", [{:scope, scope, :non_empty_string}])
 
   def list(ctx, opts \\ [])
 

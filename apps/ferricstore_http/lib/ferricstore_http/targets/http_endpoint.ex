@@ -337,10 +337,16 @@ defmodule FerricstoreHttp.Targets.HttpEndpoint do
 
   defp decode_body("", status), do: %{"status" => status}
 
-  defp decode_body(body, _status) do
+  defp decode_body(body, status) do
     case Jason.decode(body) do
-      {:ok, decoded} -> decoded
-      {:error, _reason} -> body
+      {:ok, decoded} ->
+        decoded
+
+      {:error, _reason} ->
+        # The result is stored and served as JSON, which needs UTF-8 text.
+        if String.valid?(body),
+          do: body,
+          else: %{"status" => status, "bytes_base64" => Base.encode64(body)}
     end
   end
 end

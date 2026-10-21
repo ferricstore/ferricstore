@@ -14,6 +14,7 @@ defmodule Ferricstore.Commands.Cuckoo do
   @prob_read_timeout_ms 5_000
   @default_capacity 1024
   @bucket_size 4
+  @element_type_error {:error, "ERR cuckoo elements must be strings"}
   @max_capacity 1_073_741_824
   @max_batch_items 10_000
 
@@ -74,6 +75,11 @@ defmodule Ferricstore.Commands.Cuckoo do
   def handle("CF.COUNT", args, store), do: cf_count_args(args, store)
   def handle("CF.INFO", args, store), do: cf_info_args(args, store)
 
+  # The embedded API passes the element through as given; one that is not a
+  # binary raised in the NIF while the write was applied, crashing the shard.
+  defp cf_add_args([_key, element], _store) when not is_binary(element),
+    do: @element_type_error
+
   defp cf_add_args([key, element], store) do
     with :ok <- ProbType.check_expected(key, :cuckoo, store) do
       auto_params = %{capacity: @default_capacity, bucket_size: @bucket_size}
@@ -92,6 +98,9 @@ defmodule Ferricstore.Commands.Cuckoo do
   defp cf_add_args(_args, _store),
     do: {:error, "ERR wrong number of arguments for 'cf.add' command"}
 
+  defp cf_addnx_args([_key, element], _store) when not is_binary(element),
+    do: @element_type_error
+
   defp cf_addnx_args([key, element], store) do
     with :ok <- ProbType.check_expected(key, :cuckoo, store) do
       auto_params = %{capacity: @default_capacity, bucket_size: @bucket_size}
@@ -107,6 +116,9 @@ defmodule Ferricstore.Commands.Cuckoo do
 
   defp cf_addnx_args(_args, _store),
     do: {:error, "ERR wrong number of arguments for 'cf.addnx' command"}
+
+  defp cf_del_args([_key, element], _store) when not is_binary(element),
+    do: @element_type_error
 
   defp cf_del_args([key, element], store) do
     case ProbType.check_create(key, :cuckoo, store) do

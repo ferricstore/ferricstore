@@ -54,6 +54,19 @@ defmodule FerricstoreHttp.Targets.HttpEndpointTest do
              )
   end
 
+  test "keeps a non-JSON text body and base64-encodes one that is not UTF-8", %{
+    base_url: base_url
+  } do
+    assert {:ok, "plain text"} =
+             HttpEndpoint.invoke(%{"kind" => "http_endpoint", "url" => "#{base_url}/text"}, %{})
+
+    # A result is stored and served as JSON, which cannot hold these bytes.
+    assert {:ok, %{"status" => 200, "bytes_base64" => encoded}} =
+             HttpEndpoint.invoke(%{"kind" => "http_endpoint", "url" => "#{base_url}/binary"}, %{})
+
+    assert Base.decode64!(encoded) == <<0, 255, 1>>
+  end
+
   test "does not follow redirects or retry Retry-After responses", %{base_url: base_url} do
     assert {:error, %{"code" => "http_endpoint_failed", "status" => 302}} =
              HttpEndpoint.invoke(
@@ -207,14 +220,8 @@ defmodule FerricstoreHttp.Targets.HttpEndpointTest.Handler do
             do: {200, %{}, Jason.encode!(%{"ok" => true})},
             else: {401, %{}, Jason.encode!(%{"error" => "unauthorized"})}
 
-        "/unavailable" ->
-          {503, %{}, Jason.encode!(%{"error" => "temporary"})}
-
-        "/bad-request" ->
-          {400, %{}, Jason.encode!(%{"error" => "bad request"})}
-
-        "/large" ->
-          {200, %{}, String.duplicate("x", 64)}
+        path when path in ["/unavailable", "/bad-request", "/large", "/text", "/binary"] ->
+          fixed_response(path)
 
         "/redirect" ->
           {302, %{"location" => "/redirect-target"}, ""}
@@ -232,4 +239,10 @@ defmodule FerricstoreHttp.Targets.HttpEndpointTest.Handler do
     req = :cowboy_req.reply(status, headers, response, req)
     {:ok, req, state}
   end
+
+  defp fixed_response("/unavailable"), do: {503, %{}, Jason.encode!(%{"error" => "temporary"})}
+  defp fixed_response("/bad-request"), do: {400, %{}, Jason.encode!(%{"error" => "bad request"})}
+  defp fixed_response("/large"), do: {200, %{}, String.duplicate("x", 64)}
+  defp fixed_response("/text"), do: {200, %{}, "plain text"}
+  defp fixed_response("/binary"), do: {200, %{}, <<0, 255, 1>>}
 end

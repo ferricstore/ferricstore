@@ -8,6 +8,10 @@ defmodule FerricstoreHttp.TestBackend do
   def authenticate(_username, _password, _opts), do: {:error, :unauthenticated}
 
   @impl FerricstoreHttp.Backend
+  def bind_peer({:session, _peer}, peer), do: {:session, peer}
+  def bind_peer(session, _peer), do: session
+
+  @impl FerricstoreHttp.Backend
   def execute_batch({:session, _peer}, commands, _opts) do
     results =
       Enum.map(commands, fn

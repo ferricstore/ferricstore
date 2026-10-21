@@ -297,7 +297,7 @@ defmodule Ferricstore.Commands.HashTest.Sections.Hset do
         test "HDEL builds deleted entries directly from batch metadata" do
           source = File.read!(Path.expand("../../../lib/ferricstore/commands/hash.ex", __DIR__))
 
-          [hdel_source] = Regex.run(~r/defp hdel_args\(\[key \| fields\].*?^  end/ms, source)
+          [hdel_source] = Regex.run(~r/defp hdel_fields\(key, fields, store\).*?^  end/ms, source)
 
           assert hdel_source =~ "hash_deleted_entries(compound_keys, metas, [])"
           refute hdel_source =~ "metas_by_key"

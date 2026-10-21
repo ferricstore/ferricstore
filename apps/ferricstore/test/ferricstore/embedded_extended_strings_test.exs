@@ -377,6 +377,15 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
       assert {:ok, ms} = FerricStore.ttl("sex:key")
       assert is_integer(ms) and ms > 0 and ms <= 60_000
     end
+
+    test "rejects a TTL that puts the expiry past int64, like SETEX" do
+      max_int64 = 9_223_372_036_854_775_807
+
+      assert {:error, "ERR value is not an integer or out of range"} =
+               FerricStore.setex("sex:huge", max_int64, "value")
+
+      assert {:ok, nil} = FerricStore.get("sex:huge")
+    end
   end
 
   describe "psetex/3" do
@@ -385,6 +394,15 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
       assert {:ok, "value"} = FerricStore.get("psx:key")
       assert {:ok, ms} = FerricStore.ttl("psx:key")
       assert is_integer(ms) and ms > 0 and ms <= 60_000
+    end
+
+    test "rejects a TTL that puts the expiry past int64, like PSETEX" do
+      max_int64 = 9_223_372_036_854_775_807
+
+      assert {:error, "ERR value is not an integer or out of range"} =
+               FerricStore.psetex("psx:huge", max_int64, "value")
+
+      assert {:ok, nil} = FerricStore.get("psx:huge")
     end
   end
 
@@ -412,9 +430,51 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
       assert {:error, "WRONGTYPE" <> _} = FerricStore.getrange("gr:hash", 0, 10)
       assert {:ok, "hash"} = FerricStore.type("gr:hash")
     end
+
+    test "names the bad index instead of another command" do
+      FerricStore.set("gr:bad-index", "Hello")
+
+      assert {:error, "ERR value is not an integer or out of range"} =
+               FerricStore.getrange("gr:bad-index", 0.5, 1)
+
+      assert {:error, "ERR value is not an integer or out of range"} =
+               FerricStore.getrange("gr:bad-index", 0, "1")
+
+      assert {:error, "ERR bit offset is not an integer or out of range"} =
+               FerricStore.getbit("gr:bad-index", 1.5)
+
+      assert {:error, "ERR bit offset is not an integer or out of range"} =
+               FerricStore.getbit("gr:bad-index", -1)
+    end
   end
 
   describe "setrange/3" do
+    test "an empty value changes nothing and answers the current length" do
+      assert {:ok, 0} = FerricStore.setrange("sr:empty-missing", 5, "")
+      refute FerricStore.exists("sr:empty-missing")
+
+      FerricStore.set("sr:empty-existing", "abc")
+      assert {:ok, 3} = FerricStore.setrange("sr:empty-existing", 10, "")
+      assert {:ok, "abc"} = FerricStore.get("sr:empty-existing")
+
+      assert :ok = FerricStore.hset("sr:empty-hash", %{"f" => "v"})
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.setrange("sr:empty-hash", 0, "")
+
+      ctx = FerricStore.Instance.get(:default)
+
+      assert 0 ==
+               Ferricstore.Commands.Dispatcher.dispatch("SETRANGE", ["sr:empty-gw", "4", ""], ctx)
+
+      assert 0 == Ferricstore.Commands.Dispatcher.dispatch("EXISTS", ["sr:empty-gw"], ctx)
+
+      assert {:error, "ERR offset is out of range"} =
+               Ferricstore.Commands.Dispatcher.dispatch(
+                 "SETRANGE",
+                 ["sr:empty-gw", "-1", ""],
+                 ctx
+               )
+    end
+
     test "overwrites part of a string" do
       FerricStore.set("sr:key", "Hello World")
       assert {:ok, 11} = FerricStore.setrange("sr:key", 6, "Redis")
@@ -433,6 +493,15 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
       assert {:error, "WRONGTYPE" <> _} = FerricStore.setrange("sr:hash", 0, "new")
       assert {:ok, "hash"} = FerricStore.type("sr:hash")
       assert {:ok, "old"} = FerricStore.hget("sr:hash", "field")
+    end
+
+    test "rejects an invalid offset and the shard keeps applying writes" do
+      assert :ok = FerricStore.set("sr:bad", "Hello")
+      assert {:error, "ERR offset is out of range"} = FerricStore.setrange("sr:bad", -1, "x")
+      assert {:error, "ERR offset is out of range"} = FerricStore.setrange("sr:bad", 1.5, "x")
+      assert {:ok, "Hello"} = FerricStore.get("sr:bad")
+      assert {:ok, 6} = FerricStore.setrange("sr:bad", 5, "!")
+      assert {:ok, "Hello!"} = FerricStore.get("sr:bad")
     end
   end
 

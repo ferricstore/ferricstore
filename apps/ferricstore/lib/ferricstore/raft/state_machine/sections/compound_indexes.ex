@@ -1747,6 +1747,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         end
       end
 
+      # The NIFs take binary elements only; anything else raised while the entry
+      # was applied and crash-looped the shard, so reject it before any file work.
+      defp check_prob_elements(elements, family) do
+        if Enum.all?(elements, &is_binary/1),
+          do: :ok,
+          else: {:error, "ERR #{family} elements must be strings"}
+      end
+
       defp require_existing_prob_key(state, key, expected_type) do
         case classify_prob_key(state, key, expected_type) do
           {:ok, status} when status in [:existing, :replay] -> :ok

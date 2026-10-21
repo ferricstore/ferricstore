@@ -811,6 +811,9 @@ defmodule Ferricstore.Raft.ApplyWork do
   defp consume_compound_work({:zadd_many_single, entries}, remaining),
     do: consume_compound_items(entries, remaining)
 
+  defp consume_compound_work({:compound_command, _key, ast}, remaining),
+    do: consume_compound_items(compound_command_members(ast), remaining)
+
   defp consume_compound_work(
          {:stream_append, _key, _id_spec, _fields, _trim_opts, _nomkstream},
          remaining
@@ -874,6 +877,12 @@ defmodule Ferricstore.Raft.ApplyWork do
        do: consume_compound_unit(remaining)
 
   defp consume_compound_work(_command, remaining), do: {:ok, remaining}
+
+  defp compound_command_members({:hdel, [_key | fields]}), do: fields
+  defp compound_command_members({:hgetdel, _key, fields}), do: fields
+  defp compound_command_members({:zadd, _key, _opts, pairs}), do: pairs
+  defp compound_command_members({:geoadd, _key, _flags, pairs}), do: pairs
+  defp compound_command_members(_ast), do: [:member]
 
   defp consume_compound_items(items, remaining) do
     case count_items_up_to(

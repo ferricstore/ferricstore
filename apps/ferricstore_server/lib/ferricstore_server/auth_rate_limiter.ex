@@ -10,17 +10,22 @@ defmodule FerricstoreServer.AuthRateLimiter do
   @default_window_ms 60_000
   @default_max_entries 10_000
   @minimum_max_entries 2
+  # An attempt over the limit only because other checks are still running
+  # waits for them instead of being refused for the whole window.
+  @max_wait_ms 5_000
+  @reserve_timeout_ms @max_wait_ms + 5_000
   @max_username_bytes Rules.max_username_bytes()
   @max_password_bytes Password.max_password_bytes()
 
   @type limiter_key :: {:ip | :user, binary()}
   @type entry :: %{
           count: pos_integer(),
+          in_flight: non_neg_integer(),
           generation: pos_integer(),
           started_at_ms: integer(),
           touched: non_neg_integer()
         }
-  @opaque reservation :: {:reservation, [{limiter_key(), integer()}]}
+  @opaque reservation :: {:reservation, reference()}
   @type rate_limit_error :: {:error, {:rate_limited, pos_integer()}}
 
   def start_link(opts \\ []) do
@@ -43,6 +48,8 @@ defmodule FerricstoreServer.AuthRateLimiter do
 
         if match?({:ok, _username}, result) do
           :ok = release_success(reservation)
+        else
+          :ok = release_failure(reservation)
         end
 
         result
@@ -69,11 +76,15 @@ defmodule FerricstoreServer.AuthRateLimiter do
     end
   end
 
+  @doc """
+  Records one failed attempt for `peer` and `username`, or returns how long the
+  caller must wait.
+  """
   @spec check(term(), binary()) :: :ok | {:error, pos_integer() | binary()}
   def check(peer, username) when is_binary(username) do
     if byte_size(username) <= @max_username_bytes do
       case reserve(peer, username) do
-        {:ok, _reservation} -> :ok
+        {:ok, reservation} -> release_failure(reservation)
         {:error, _reason} = error -> error
       end
     else
@@ -81,9 +92,23 @@ defmodule FerricstoreServer.AuthRateLimiter do
     end
   end
 
+  @doc """
+  Ends a permitted attempt that authenticated; it no longer counts against
+  the budget.
+  """
   @spec release_success(reservation()) :: :ok
-  def release_success({:reservation, entries}) when is_list(entries) do
-    GenServer.call(__MODULE__, {:release_success, entries})
+  def release_success({:reservation, ref}) when is_reference(ref) do
+    GenServer.call(__MODULE__, {:release, ref, :success})
+  end
+
+  @doc """
+  Ends a permitted attempt that failed; it keeps counting against the budget
+  for the rest of the window. A reservation whose caller exits ends the same
+  way.
+  """
+  @spec release_failure(reservation()) :: :ok
+  def release_failure({:reservation, ref}) when is_reference(ref) do
+    GenServer.call(__MODULE__, {:release, ref, :failure})
   end
 
   @spec reset() :: :ok
@@ -100,70 +125,158 @@ defmodule FerricstoreServer.AuthRateLimiter do
   def init(_opts), do: {:ok, initial_state()}
 
   @impl true
-  def handle_call({:reserve, peer, username}, _from, state) do
-    now_ms = System.monotonic_time(:millisecond)
-    window_ms = positive_env(:auth_rate_limit_window_ms, @default_window_ms)
-    max_attempts = positive_env(:auth_rate_limit_max_attempts, @default_max_attempts)
-
-    max_entries =
-      positive_env(
-        :auth_rate_limit_max_entries,
-        @default_max_entries,
-        @minimum_max_entries
-      )
-
-    state = maybe_discard_expired(state, now_ms, window_ms)
+  def handle_call({:reserve, peer, username}, from, state) do
     keys = [{:ip, peer}, {:user, username}]
 
-    case retry_after(state.entries, keys, now_ms, window_ms, max_attempts) do
-      nil ->
-        case capacity_retry_after(
-               state.entries,
-               keys,
-               now_ms,
-               window_ms,
-               max_attempts,
-               max_entries
-             ) do
-          nil ->
-            state =
-              state
-              |> increment(keys, now_ms, window_ms)
-              |> evict_oldest(
-                max_entries,
-                max_attempts,
-                now_ms,
-                window_ms,
-                length(keys)
-              )
+    case decide(state, keys, from) do
+      {:reply, reply, state} ->
+        {:reply, reply, state}
 
-            reservation = reservation(state.entries, keys)
-            {:reply, {:ok, reservation}, state}
-
-          retry_after_ms ->
-            {:reply, {:error, retry_after_ms}, state}
+      {:wait, state} ->
+        if map_size(state.waiters) >= max_entries() do
+          {:reply, {:error, blocked_retry_after(state, keys)}, state}
+        else
+          {:noreply, add_waiter(state, keys, from)}
         end
-
-      retry_after_ms ->
-        {:reply, {:error, retry_after_ms}, state}
     end
   end
 
-  def handle_call({:release_success, reservation_entries}, _from, state) do
-    entries =
-      Enum.reduce(reservation_entries, state.entries, fn {key, generation}, entries ->
-        release_reserved_entry(entries, key, generation)
-      end)
+  def handle_call({:release, ref, outcome}, _from, state) do
+    state =
+      case Map.pop(state.reservations, ref) do
+        {nil, _reservations} ->
+          state
 
-    {:reply, :ok, %{state | entries: entries}}
+        {versions, reservations} ->
+          Process.demonitor(ref, [:flush])
+          finish(%{state | reservations: reservations}, versions, outcome)
+      end
+
+    {:reply, :ok, state}
   end
 
-  def handle_call(:reset, _from, _state) do
-    {:reply, :ok, initial_state()}
+  def handle_call(:reset, _from, state) do
+    Enum.each(Map.keys(state.reservations), &Process.demonitor(&1, [:flush]))
+    fresh = initial_state()
+    {:reply, :ok, serve_waiters(%{fresh | waiters: state.waiters, waiter_seq: state.waiter_seq})}
   end
 
   def handle_call(:info, _from, state) do
     {:reply, %{entries: map_size(state.entries)}, state}
+  end
+
+  @impl true
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, state)
+      when is_map_key(state.reservations, ref) do
+    {versions, reservations} = Map.pop!(state.reservations, ref)
+    {:noreply, finish(%{state | reservations: reservations}, versions, :failure)}
+  end
+
+  def handle_info({:waiter_timeout, id}, state) do
+    case Map.pop(state.waiters, id) do
+      {nil, _waiters} ->
+        {:noreply, state}
+
+      {%{from: from, keys: keys}, waiters} ->
+        state = %{state | waiters: waiters}
+        GenServer.reply(from, {:error, blocked_retry_after(state, keys)})
+        {:noreply, state}
+    end
+  end
+
+  def handle_info(_message, state), do: {:noreply, state}
+
+  defp decide(state, keys, {caller, _tag}) do
+    now_ms = System.monotonic_time(:millisecond)
+    window_ms = window_ms()
+    max_attempts = max_attempts()
+    max_entries = max_entries()
+
+    state = maybe_discard_expired(state, now_ms, window_ms)
+
+    cond do
+      retry_after_ms = failure_retry_after(state.entries, keys, now_ms, window_ms, max_attempts) ->
+        {:reply, {:error, retry_after_ms}, state}
+
+      retry_after(state.entries, keys, now_ms, window_ms, max_attempts) ->
+        {:wait, state}
+
+      retry_after_ms =
+          capacity_retry_after(
+            state.entries,
+            keys,
+            now_ms,
+            window_ms,
+            max_attempts,
+            max_entries
+          ) ->
+        {:reply, {:error, retry_after_ms}, state}
+
+      true ->
+        state =
+          state
+          |> increment(keys, now_ms, window_ms)
+          |> evict_oldest(
+            max_entries,
+            max_attempts,
+            now_ms,
+            window_ms,
+            length(keys)
+          )
+
+        ref = Process.monitor(caller)
+        versions = reservation_versions(state.entries, keys)
+        state = %{state | reservations: Map.put(state.reservations, ref, versions)}
+        {:reply, {:ok, {:reservation, ref}}, state}
+    end
+  end
+
+  defp add_waiter(state, keys, from) do
+    id = state.waiter_seq + 1
+    timer = Process.send_after(self(), {:waiter_timeout, id}, @max_wait_ms)
+    waiter = %{from: from, keys: keys, timer: timer}
+    %{state | waiters: Map.put(state.waiters, id, waiter), waiter_seq: id}
+  end
+
+  defp finish(state, versions, outcome) do
+    entries =
+      Enum.reduce(versions, state.entries, fn {key, generation}, entries ->
+        release_reserved_entry(entries, key, generation, outcome)
+      end)
+
+    serve_waiters(%{state | entries: entries})
+  end
+
+  # Waiters are served in arrival order; each one either gets its reservation,
+  # is refused because the attempts it waited on failed, or keeps waiting.
+  defp serve_waiters(state) when map_size(state.waiters) == 0, do: state
+
+  defp serve_waiters(state) do
+    state.waiters
+    |> Enum.sort_by(fn {id, _waiter} -> id end)
+    |> Enum.reduce(state, fn {id, %{from: {caller, _tag} = from, keys: keys} = waiter}, state ->
+      if Process.alive?(caller) do
+        case decide(state, keys, from) do
+          {:wait, state} ->
+            state
+
+          {:reply, reply, state} ->
+            Process.cancel_timer(waiter.timer)
+            GenServer.reply(from, reply)
+            %{state | waiters: Map.delete(state.waiters, id)}
+        end
+      else
+        Process.cancel_timer(waiter.timer)
+        %{state | waiters: Map.delete(state.waiters, id)}
+      end
+    end)
+  end
+
+  defp blocked_retry_after(state, keys) do
+    now_ms = System.monotonic_time(:millisecond)
+    window_ms = window_ms()
+
+    retry_after(state.entries, keys, now_ms, window_ms, max_attempts()) || @max_wait_ms
   end
 
   defp maybe_discard_expired(%{last_cleanup_ms: nil} = state, now_ms, _window_ms) do
@@ -195,6 +308,21 @@ defmodule FerricstoreServer.AuthRateLimiter do
       case Map.get(entries, key) do
         %{count: count, started_at_ms: started_at_ms}
         when count >= max_attempts and now_ms - started_at_ms < window_ms ->
+          [max(window_ms - (now_ms - started_at_ms), 1)]
+
+        _other ->
+          []
+      end
+    end)
+    |> Enum.max(fn -> nil end)
+  end
+
+  defp failure_retry_after(entries, keys, now_ms, window_ms, max_attempts) do
+    keys
+    |> Enum.flat_map(fn key ->
+      case Map.get(entries, key) do
+        %{count: count, in_flight: in_flight, started_at_ms: started_at_ms}
+        when count - in_flight >= max_attempts and now_ms - started_at_ms < window_ms ->
           [max(window_ms - (now_ms - started_at_ms), 1)]
 
         _other ->
@@ -241,36 +369,45 @@ defmodule FerricstoreServer.AuthRateLimiter do
 
       entry =
         case Map.get(state.entries, key) do
-          nil ->
-            %{count: 1, generation: touch, started_at_ms: now_ms, touched: touch}
+          existing when is_map(existing) and now_ms - existing.started_at_ms < window_ms ->
+            %{
+              existing
+              | count: existing.count + 1,
+                in_flight: existing.in_flight + 1,
+                touched: touch
+            }
 
-          existing when now_ms - existing.started_at_ms < window_ms ->
-            %{existing | count: existing.count + 1, touched: touch}
-
-          _expired ->
-            %{count: 1, generation: touch, started_at_ms: now_ms, touched: touch}
+          _missing_or_expired ->
+            %{count: 1, in_flight: 1, generation: touch, started_at_ms: now_ms, touched: touch}
         end
 
       %{state | entries: Map.put(state.entries, key, entry), touch: touch}
     end)
   end
 
-  defp reservation(entries, keys) do
-    versions =
-      Enum.map(keys, fn key ->
-        {key, Map.fetch!(entries, key).generation}
-      end)
-
-    {:reservation, versions}
+  defp reservation_versions(entries, keys) do
+    Enum.map(keys, fn key ->
+      {key, Map.fetch!(entries, key).generation}
+    end)
   end
 
-  defp release_reserved_entry(entries, key, generation) do
+  defp release_reserved_entry(entries, key, generation, :success) do
     case Map.get(entries, key) do
       %{generation: ^generation, count: 1} ->
         Map.delete(entries, key)
 
-      %{generation: ^generation, count: count} = entry when count > 1 ->
-        Map.put(entries, key, %{entry | count: count - 1})
+      %{generation: ^generation, count: count, in_flight: in_flight} = entry when count > 1 ->
+        Map.put(entries, key, %{entry | count: count - 1, in_flight: max(in_flight - 1, 0)})
+
+      _expired_or_replaced ->
+        entries
+    end
+  end
+
+  defp release_reserved_entry(entries, key, generation, :failure) do
+    case Map.get(entries, key) do
+      %{generation: ^generation, in_flight: in_flight} = entry ->
+        Map.put(entries, key, %{entry | in_flight: max(in_flight - 1, 0)})
 
       _expired_or_replaced ->
         entries
@@ -339,7 +476,11 @@ defmodule FerricstoreServer.AuthRateLimiter do
   defp normalize_peer(peer), do: inspect(peer)
 
   defp reserve(peer, username) do
-    GenServer.call(__MODULE__, {:reserve, normalize_peer(peer), username_digest(username)})
+    GenServer.call(
+      __MODULE__,
+      {:reserve, normalize_peer(peer), username_digest(username)},
+      @reserve_timeout_ms
+    )
   end
 
   defp username_digest(username), do: :crypto.hash(:sha256, username)
@@ -361,6 +502,13 @@ defmodule FerricstoreServer.AuthRateLimiter do
 
   defp validate_credentials(_username, _password), do: :ok
 
+  defp window_ms, do: positive_env(:auth_rate_limit_window_ms, @default_window_ms)
+
+  defp max_attempts, do: positive_env(:auth_rate_limit_max_attempts, @default_max_attempts)
+
+  defp max_entries,
+    do: positive_env(:auth_rate_limit_max_entries, @default_max_entries, @minimum_max_entries)
+
   defp positive_env(key, default, minimum \\ 1) do
     case Application.get_env(:ferricstore, key, default) do
       value when is_integer(value) and value >= minimum -> value
@@ -369,6 +517,13 @@ defmodule FerricstoreServer.AuthRateLimiter do
   end
 
   defp initial_state do
-    %{entries: %{}, touch: 0, last_cleanup_ms: nil}
+    %{
+      entries: %{},
+      touch: 0,
+      last_cleanup_ms: nil,
+      reservations: %{},
+      waiters: %{},
+      waiter_seq: 0
+    }
   end
 end

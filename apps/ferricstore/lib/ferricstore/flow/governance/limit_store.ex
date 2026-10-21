@@ -1,6 +1,8 @@
 defmodule Ferricstore.Flow.Governance.LimitStore do
   @moduledoc false
 
+  alias Ferricstore.Flow.Governance.Args
+
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.Governance.Catalog
   alias Ferricstore.Flow.Governance.CreditLease
@@ -50,7 +52,7 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
     Telemetry.emit(:limit_lease, result, limit_metadata(scope, opts))
   end
 
-  def lease(_ctx, _scope, _opts), do: {:error, "ERR flow limit opts must be a keyword list"}
+  def lease(_ctx, scope, _opts), do: Args.error("limit", [{:scope, scope, :non_empty_string}])
 
   def spend(ctx, scope, opts \\ [])
 
@@ -89,7 +91,7 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
     Telemetry.emit(:limit_spend, result, limit_metadata(scope, opts))
   end
 
-  def spend(_ctx, _scope, _opts), do: {:error, "ERR flow limit opts must be a keyword list"}
+  def spend(_ctx, scope, _opts), do: Args.error("limit", [{:scope, scope, :non_empty_string}])
 
   @doc false
   def spend_reserved(ctx, scope, opts, reservation_ids)
@@ -193,7 +195,7 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
     Telemetry.emit(:limit_renew, result, limit_metadata(scope, opts))
   end
 
-  def renew(_ctx, _scope, _opts), do: {:error, "ERR flow limit opts must be a keyword list"}
+  def renew(_ctx, scope, _opts), do: Args.error("limit", [{:scope, scope, :non_empty_string}])
 
   def release(ctx, scope, opts \\ [])
 
@@ -223,7 +225,7 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
     Telemetry.emit(:limit_release, result, limit_metadata(scope, opts))
   end
 
-  def release(_ctx, _scope, _opts), do: {:error, "ERR flow limit opts must be a keyword list"}
+  def release(_ctx, scope, _opts), do: Args.error("limit", [{:scope, scope, :non_empty_string}])
 
   def get(ctx, scope, opts \\ [])
 
@@ -253,7 +255,7 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
     Telemetry.emit(:limit_reclaim, result, %{scope: scope})
   end
 
-  def get(_ctx, _scope, _opts), do: {:error, "ERR flow limit opts must be a keyword list"}
+  def get(_ctx, scope, _opts), do: Args.error("limit", [{:scope, scope, :non_empty_string}])
 
   @doc false
   def cleanup(ctx, scope, opts \\ [])
@@ -280,8 +282,8 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
     end
   end
 
-  def cleanup(_ctx, _scope, _opts),
-    do: {:error, "ERR flow limit cleanup opts must be a keyword list"}
+  def cleanup(_ctx, scope, _opts),
+    do: Args.error("limit cleanup", [{:scope, scope, :non_empty_string}])
 
   def list(ctx, opts \\ [])
 

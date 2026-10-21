@@ -564,6 +564,18 @@ shard_0: 2
     released.
   - 3: `FerricStore.flow_purge_orphans(dry_run: false)` removes what a Flow left
     behind once its state record is gone (see "Flows Without a State Record").
+  - 4: a write of hash, set or sorted set members checks the key's type in the
+    same replicated entry. HINCRBY, HINCRBYFLOAT, HSETNX, HSETEX, ZADD and
+    GEOADD with options and SMOVE check the type before they write; without
+    level 4 a SET landing between the check and the write leaves the members
+    hidden under the string, to come back when the key is recreated. Level 4
+    also stores INCRBYFLOAT and HINCRBYFLOAT results as Redis does ("3",
+    "5200"), so INCR and HINCRBY work on them afterwards, and runs HDEL,
+    HSETNX, HGETDEL and ZADD and GEOADD with options as one replicated entry
+    each, so concurrent clients see one outcome (one HDEL removes the field)
+    across the whole cluster. Inside MULTI, EXPIRE with several flags
+    (`EXPIRE key 100 XX GT`), BITCOUNT ranges and BITPOS are queued only at
+    level 4: older releases abort or answer such a transaction differently.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.

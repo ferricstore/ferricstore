@@ -3,7 +3,8 @@ defmodule FerricStore.API.Hashes do
 
   import FerricStore.API.Store
   alias Ferricstore.Commands.Hash
-  alias Ferricstore.Store.{Router, ValueCodec}
+  alias Ferricstore.Commands.Hash.FieldOps
+  alias Ferricstore.Store.{Router, TypeRegistry, ValueCodec}
 
   @type key :: FerricStore.key()
   @type value :: FerricStore.value()
@@ -32,12 +33,10 @@ defmodule FerricStore.API.Hashes do
   """
   @spec hset(key(), %{binary() => binary()}) :: :ok
   def hset(key, fields) when is_map(fields) do
-    store = build_compound_store(key)
-
     args =
       Enum.flat_map(fields, fn {k, v} -> [to_string(k), to_string(v)] end)
 
-    case Hash.handle_ast({:hset, [key | args]}, store) do
+    case Hash.handle_ast({:hset, [key | args]}, default_ctx()) do
       {:error, _} = err -> err
       _count -> :ok
     end
@@ -296,10 +295,9 @@ defmodule FerricStore.API.Hashes do
   """
   @spec hincrby(key(), binary(), integer()) :: {:ok, integer()} | {:error, binary()}
   def hincrby(key, field, amount) when is_integer(amount) do
-    case Router.hincrby(default_ctx(), key, to_string(field), amount) do
-      {:error, _} = err -> err
-      new_val -> {:ok, new_val}
-    end
+    ctx = default_ctx()
+
+    with_hash_type(key, ctx, fn -> Router.hincrby(ctx, key, to_string(field), amount) end)
   end
 
   @doc """
@@ -323,13 +321,36 @@ defmodule FerricStore.API.Hashes do
   def hincrbyfloat(key, field, amount) when is_number(amount) do
     case ValueCodec.number_to_float(amount) do
       {:ok, increment} ->
-        case Router.hincrbyfloat(default_ctx(), key, to_string(field), increment) do
-          {:error, _} = err -> err
-          result_str -> {:ok, result_str}
-        end
+        ctx = default_ctx()
+
+        with_hash_type(key, ctx, fn ->
+          Router.hincrbyfloat(ctx, key, to_string(field), increment)
+        end)
 
       :error ->
         {:error, "ERR value is not a valid float"}
+    end
+  end
+
+  # The state machine's increments write the field without checking or
+  # recording the key's type, so on their own they left a field that TYPE and
+  # EXISTS did not see, or hid one under a string or set that a later hash on
+  # the key brought back. Check or set the type first, as the HINCRBY and
+  # HINCRBYFLOAT commands do, and drop a marker this call created if the
+  # increment fails.
+  defp with_hash_type(key, ctx, increment) do
+    case TypeRegistry.command_check_or_set_status(key, :hash, ctx) do
+      type_status when type_status in [:ok, {:ok, :created}] ->
+        case increment.() do
+          {:error, _reason} = error ->
+            FieldOps.rollback_new_type_marker(key, ctx, type_status, error)
+
+          result ->
+            {:ok, result}
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -352,7 +373,14 @@ defmodule FerricStore.API.Hashes do
   def hsetnx(key, field, value) do
     store = build_compound_store(key)
 
-    case Hash.handle_ast({:hsetnx, key, to_string(field), to_string(value)}, store) do
+    # HSETNX reads the field and then writes it; the key latch keeps two
+    # callers from both seeing it missing, as the command path does.
+    result =
+      Ferricstore.Store.Router.with_key_latch(default_ctx(), key, fn ->
+        Hash.handle_ast({:hsetnx, key, to_string(field), to_string(value)}, store)
+      end)
+
+    case result do
       {:error, _} = err -> err
       1 -> {:ok, true}
       0 -> {:ok, false}

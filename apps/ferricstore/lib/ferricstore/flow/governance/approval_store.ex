@@ -1,6 +1,8 @@
 defmodule Ferricstore.Flow.Governance.ApprovalStore do
   @moduledoc false
 
+  alias Ferricstore.Flow.Governance.Args
+
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.Governance.AtomicRecord
   alias Ferricstore.Flow.Governance.Approval
@@ -80,8 +82,7 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
     })
   end
 
-  def request(_ctx, _id, _opts),
-    do: {:error, "ERR flow approval opts must be a keyword list"}
+  def request(_ctx, id, _opts), do: Args.error("approval", [{:id, id, :non_empty_string}])
 
   defp register_committed_approval(ctx, key, scope, flow_id) do
     [
@@ -122,8 +123,7 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
     end
   end
 
-  def get(_ctx, _id, _opts),
-    do: {:error, "ERR flow approval opts must be a keyword list"}
+  def get(_ctx, id, _opts), do: Args.error("approval", [{:id, id, :non_empty_string}])
 
   def list(ctx, opts \\ [])
 
@@ -333,8 +333,8 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
     Telemetry.emit(approval_action_name(action), result, approval_metadata(id, result))
   end
 
-  defp decide(_ctx, _id, _action, _opts),
-    do: {:error, "ERR flow approval opts must be a keyword list"}
+  defp decide(_ctx, id, _action, _opts),
+    do: Args.error("approval", [{:id, id, :non_empty_string}])
 
   defp apply_decision(approval, :approve, opts), do: Approval.approve(approval, opts)
   defp apply_decision(approval, :reject, opts), do: Approval.reject(approval, opts)

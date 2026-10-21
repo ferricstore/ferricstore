@@ -32,6 +32,20 @@ defmodule FerricstoreHttp.CommandService do
   @spec command_count(prepared()) :: non_neg_integer()
   def command_count(%Prepared{count: count}), do: count
 
+  @doc """
+  Makes a command response encodable as JSON.
+
+  Only the binary-safe JSON encoding wraps values, so a plain JSON reply
+  can hold bytes that are not UTF-8. Each such result becomes that
+  command's error; the batch has already run, so a failed response would
+  invite a retry of every command in it.
+  """
+  @spec json_reply(map()) :: map()
+  def json_reply(%{"results" => results} = response) when is_list(results),
+    do: %{response | "results" => Enum.map(results, &json_result/1)}
+
+  def json_reply(response), do: response
+
   @spec execute(map(), term(), Config.t(), Deadline.t()) ::
           {:ok, map()} | {:error, term()}
   def execute(envelope, session, %Config{} = config, deadline) do
@@ -214,4 +228,31 @@ defmodule FerricstoreHttp.CommandService do
       "error" => CommandError.normalize(status, value)
     }
   end
+
+  defp json_result(%{"status" => "ok", "value" => value} = result) do
+    if json_value?(value) do
+      result
+    else
+      %{
+        "status" => "error",
+        "error" =>
+          CommandError.normalize(:error, %{
+            "code" => "binary_reply",
+            "message" =>
+              "ERR reply is not valid UTF-8; use the #{@binary_encoding} or #{@compact_encoding} encoding"
+          })
+      }
+    end
+  end
+
+  defp json_result(result), do: result
+
+  defp json_value?(value) when is_binary(value), do: String.valid?(value)
+  defp json_value?(value) when is_list(value), do: Enum.all?(value, &json_value?/1)
+
+  defp json_value?(value) when is_map(value),
+    do: Enum.all?(value, fn {key, item} -> json_value?(key) and json_value?(item) end)
+
+  defp json_value?(value) when is_tuple(value), do: false
+  defp json_value?(_value), do: true
 end

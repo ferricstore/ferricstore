@@ -172,14 +172,8 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
 
   @spec apply_put(map(), binary(), binary(), binary()) :: map()
   def apply_put(state, redis_key, compound_key, score_str) do
-    if ready_for_key?(state, redis_key) do
-      apply_put_to_tables(
-        state.zset_score_index,
-        state.zset_score_lookup,
-        redis_key,
-        compound_key,
-        score_str
-      )
+    with {index, lookup} <- state_tables(state) do
+      apply_put_to_tables(index, lookup, redis_key, compound_key, score_str)
     end
 
     state
@@ -201,9 +195,9 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
 
   @spec apply_puts(map(), binary(), [{binary(), binary(), non_neg_integer()}]) :: map()
   def apply_puts(state, redis_key, entries) do
-    if ready_for_key?(state, redis_key) do
+    with {index, lookup} <- state_tables(state) do
       Enum.each(entries, fn {compound_key, score_str, _expire_at_ms} ->
-        apply_put(state, redis_key, compound_key, score_str)
+        apply_put_to_tables(index, lookup, redis_key, compound_key, score_str)
       end)
     end
 
@@ -212,13 +206,8 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
 
   @spec apply_delete(map(), binary(), binary()) :: map()
   def apply_delete(state, redis_key, compound_key) do
-    if ready_for_key?(state, redis_key) do
-      apply_delete_to_tables(
-        state.zset_score_index,
-        state.zset_score_lookup,
-        redis_key,
-        compound_key
-      )
+    with {index, lookup} <- state_tables(state) do
+      apply_delete_to_tables(index, lookup, redis_key, compound_key)
     end
 
     state
@@ -251,8 +240,8 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
 
   @spec clear_ready_key(map(), binary()) :: map()
   def clear_ready_key(state, redis_key) do
-    if ready_tables?(state) do
-      clear_key(state.zset_score_index, state.zset_score_lookup, redis_key)
+    with {index, lookup} <- state_tables(state) do
+      clear_key(index, lookup, redis_key)
     end
 
     state
@@ -638,16 +627,23 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
     end
   end
 
+  # Shard states name the tables `zset_score_index`/`zset_score_lookup`; the
+  # state machine state the WARaft segment projection passes names them
+  # `zset_score_index_name`/`zset_score_lookup_name`. Both must update the same
+  # tables, or a ready index goes stale.
   defp state_tables(state) do
     index_table = Map.get(state, :zset_score_index) || Map.get(state, :zset_score_index_name)
     lookup_table = Map.get(state, :zset_score_lookup) || Map.get(state, :zset_score_lookup_name)
 
-    if index_table != nil and lookup_table != nil do
+    if table_available?(index_table) and table_available?(lookup_table) do
       {index_table, lookup_table}
     else
       :unavailable
     end
   end
+
+  defp table_available?(nil), do: false
+  defp table_available?(table), do: :ets.info(table) != :undefined
 
   defp delete_index_entries(
          _index_table,
@@ -909,10 +905,6 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
       {score, ""} -> {:ok, score}
       _ -> :error
     end
-  end
-
-  defp ready_for_key?(state, redis_key) do
-    ready_tables?(state) and ready_key?(state.zset_score_lookup, redis_key)
   end
 
   defp ready_key?(lookup_table, redis_key) do

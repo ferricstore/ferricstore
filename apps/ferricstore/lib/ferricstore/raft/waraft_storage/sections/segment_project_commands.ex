@@ -1267,12 +1267,66 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
              write_count
            ) do
         segment_shared_compound_projection_safe?(sm_state, redis_key) and
+          segment_member_write_type_safe?(sm_state, redis_key, compound_key) and
           not segment_compound_promotion_candidate?(
             sm_state,
             redis_key,
             compound_key,
             write_count
           )
+      end
+
+      # At feature level 4 the state machine checks the key's type when it
+      # writes hash, set or sorted set members, creating the type or refusing
+      # the write. Project such a write only when the key already has that
+      # type; otherwise the state machine applies it and decides.
+      defp segment_member_write_type_safe?(sm_state, redis_key, compound_key) do
+        case CompoundKey.member_write_type(redis_key, [compound_key]) do
+          nil ->
+            true
+
+          type ->
+            marker = Ferricstore.Cluster.FeatureLevel.marker()
+
+            case segment_cached_live_value(sm_state, Ferricstore.Cluster.FeatureLevel.key(4)) do
+              {:ok, ^marker} ->
+                segment_cached_live_value(sm_state, CompoundKey.type_key(redis_key)) ==
+                  {:ok, type}
+
+              {:ok, _not_a_marker} ->
+                true
+
+              nil ->
+                true
+
+              :unknown ->
+                false
+            end
+        end
+      end
+
+      # A key's cached value: nil when the key is absent or expired, :unknown when
+      # its value is not cached.
+      defp segment_cached_live_value(sm_state, key) do
+        now = storage_expiry_cutoff_ms()
+
+        case :ets.lookup(Map.fetch!(sm_state, :ets), key) do
+          [] ->
+            nil
+
+          [{^key, _value, expire_at_ms, _lfu, _fid, _offset, _value_size}]
+          when is_integer(expire_at_ms) and expire_at_ms != 0 and expire_at_ms <= now ->
+            nil
+
+          [{^key, value, _expire_at_ms, _lfu, _fid, _offset, _value_size}]
+          when is_binary(value) ->
+            {:ok, value}
+
+          _uncached_or_invalid ->
+            :unknown
+        end
+      rescue
+        ArgumentError -> :unknown
       end
 
       defp segment_compound_promoted?(sm_state, redis_key) do

@@ -692,7 +692,31 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.InvalidWaraftInFlightBytes
                          1_000
 
           send(worker, {ref, :continue})
-          assert [:ok, :ok] = Enum.map(tasks, &Task.await(&1, 5_000))
+
+          # The deletes usually share one window, but on a slow run the second
+          # lands in the next one, whose commit blocks on the hook as well.
+          results =
+            for task <- tasks do
+              task_ref = task.ref
+
+              Stream.repeatedly(fn ->
+                receive do
+                  {:waraft_backend_batcher_call, :__commit_delete_batch_direct__, next_ref,
+                   next_worker} ->
+                    send(next_worker, {next_ref, :continue})
+                    nil
+
+                  {^task_ref, reply} ->
+                    Process.demonitor(task_ref, [:flush])
+                    {:ok, reply}
+                after
+                  5_000 -> flunk("a namespace DEL window never committed")
+                end
+              end)
+              |> Enum.find_value(& &1)
+            end
+
+          assert [{:ok, :ok}, {:ok, :ok}] = results
           assert nil == Router.get(ctx, "waraftdel:key1")
           assert nil == Router.get(ctx, "waraftdel:key2")
         after

@@ -2,7 +2,7 @@ defmodule FerricstoreServer.Native.Session do
   @moduledoc false
 
   alias Ferricstore.PubSub, as: PS
-  alias Ferricstore.Commands.{PreparedCommand, TransactionPolicy}
+  alias Ferricstore.Commands.{Dispatcher, PreparedCommand, TransactionPolicy}
   alias FerricstoreServer.Native.FQLParser
   alias Ferricstore.Flow.InternalKey
   alias Ferricstore.Store.Router
@@ -61,10 +61,21 @@ defmodule FerricstoreServer.Native.Session do
     with {:ok, prepared} <- prepare_authorized(payload, state) do
       execute_prepared(prepared, state)
     else
-      {:error, status, reason} -> {status, reason, state}
-      {:error, reason} -> {:bad_request, reason, state}
+      {:error, status, reason} -> {status, reason, flag_transaction(state)}
+      {:error, reason} -> {:bad_request, reason, flag_transaction(state)}
     end
   end
+
+  @doc """
+  Marks an open transaction failed after one of its commands was rejected.
+
+  As in Redis, a command refused while MULTI is queuing (unknown, malformed or
+  denied by ACL) makes EXEC discard the whole transaction instead of committing
+  the commands that were queued around it.
+  """
+  @spec flag_transaction(map()) :: map()
+  def flag_transaction(%{multi_state: :queuing} = state), do: %{state | multi_error: true}
+  def flag_transaction(state), do: state
 
   defp authorize_before_prepare(%{"command" => command}, state) when is_binary(command) do
     case ConnAuth.acl_command_preflight_alternatives(command) do
@@ -97,7 +108,7 @@ defmodule FerricstoreServer.Native.Session do
   def execute_prepared(%PreparedCommand{} = prepared, state) do
     case authorize_command(prepared, state) do
       :ok -> execute_prepared_command(prepared, state)
-      {:error, status, reason} -> {status, reason, state}
+      {:error, status, reason} -> {status, reason, flag_transaction(state)}
     end
   end
 
@@ -264,8 +275,12 @@ defmodule FerricstoreServer.Native.Session do
              state.watched_keys,
              Map.get(state, :sandbox_namespace)
            ) do
-        {:error, reason} -> {:error, reason, clear_transaction(state)}
-        result -> {:ok, native_tx_result(result), clear_transaction(state)}
+        {:error, reason} ->
+          {:error, reason, clear_transaction(state)}
+
+        result ->
+          notify_transaction_keyspace(ordered, result)
+          {:ok, native_tx_result(result), clear_transaction(state)}
       end
     else
       {:error, reason} -> {:noperm, reason, clear_transaction(state)}
@@ -363,6 +378,10 @@ defmodule FerricstoreServer.Native.Session do
       MapSet.member?(@blocked_in_transaction, prepared.command) ->
         {:error, "ERR Command not allowed inside a transaction", %{state | multi_error: true}}
 
+      Dispatcher.arity_error(prepared.command, prepared.args) != nil ->
+        {:error, Dispatcher.arity_error(prepared.command, prepared.args),
+         %{state | multi_error: true}}
+
       prepared.routing_scope == :coordinated ->
         {:error, "ERR coordinated command is not supported inside a transaction",
          %{state | multi_error: true}}
@@ -373,6 +392,9 @@ defmodule FerricstoreServer.Native.Session do
 
       transaction_ast_error(prepared.ast) != nil ->
         {:error, transaction_ast_error(prepared.ast), %{state | multi_error: true}}
+
+      replica_compat_error(prepared, state) != nil ->
+        {:error, replica_compat_error(prepared, state), %{state | multi_error: true}}
 
       true ->
         queue_transaction_command_within_byte_limit(prepared, state)
@@ -412,6 +434,21 @@ defmodule FerricstoreServer.Native.Session do
       end
     end
   end
+
+  defp notify_transaction_keyspace(queue, results) when is_list(results) do
+    if Ferricstore.KeyspaceNotifications.enabled?() do
+      queue
+      |> Enum.zip(results)
+      |> Enum.each(fn {%PreparedCommand{command: command, args: args}, result} ->
+        Ferricstore.KeyspaceNotifications.after_command(command, args, result)
+      end)
+    end
+
+    :ok
+  end
+
+  # A WATCH that changed returns nil: nothing ran.
+  defp notify_transaction_keyspace(_queue, _results), do: :ok
 
   defp clear_transaction(state) do
     state = release_retained_session_bytes(state)
@@ -867,6 +904,15 @@ defmodule FerricstoreServer.Native.Session do
   defp native_value({:error, reason}), do: %{"error" => reason}
   defp native_value(:ok), do: "OK"
   defp native_value(value), do: value
+
+  defp replica_compat_error(%PreparedCommand{} = prepared, state) do
+    Ferricstore.Transaction.ReplicaCompat.queue_error(
+      prepared.command,
+      prepared.ast,
+      prepared.command_keys,
+      state.instance_ctx
+    )
+  end
 
   defp transaction_ast_error({:unknown, cmd, _args}) when is_binary(cmd),
     do: "ERR unknown command '#{String.downcase(cmd)}', with args beginning with: "

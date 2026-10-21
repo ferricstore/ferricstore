@@ -1177,7 +1177,7 @@ Backed by mmap NIF resources at `prob/shard_N/KEY.topk`. Uses Count-Min Sketch i
 
 | Command | Syntax | Return | Notes |
 |---------|--------|--------|-------|
-| `TOPK.RESERVE` | `TOPK.RESERVE key k [width depth]` | `+OK` | Defaults: width=8, depth=7 |
+| `TOPK.RESERVE` | `TOPK.RESERVE key k [width depth]` | `+OK` | Defaults: width=64·k (256 to 16,384), depth=7. A Count-Min sketch; Redis's HeavyKeeper `decay` is not accepted |
 | `TOPK.ADD` | `TOPK.ADD key element [element ...]` | Array (evicted items or nil) | |
 | `TOPK.INCRBY` | `TOPK.INCRBY key element count [element count ...]` | Array (evicted items or nil) | |
 | `TOPK.QUERY` | `TOPK.QUERY key element [element ...]` | Array of 1/0 | |

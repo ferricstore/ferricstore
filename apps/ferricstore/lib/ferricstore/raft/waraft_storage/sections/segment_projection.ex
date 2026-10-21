@@ -9,6 +9,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
       alias Ferricstore.Flow.Keys, as: FlowKeys
       alias Ferricstore.Flow.LMDB, as: FlowLMDB
       alias Ferricstore.Flow.SharedRefBackfill
+      alias Ferricstore.Raft.PromotedFileSync
       alias Ferricstore.Raft.StateMachine
       alias Ferricstore.Raft.WARaftSegmentReader
       alias Ferricstore.ServerCatalog
@@ -893,7 +894,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
       end
 
       defp durable_position(handle) do
-        if replay_dependencies_ready?(handle) do
+        if replay_dependencies_ready?(handle) and
+             PromotedFileSync.synced?(Map.get(handle, :promoted_sync)) do
           Map.get(handle, :position)
         else
           last_clean_position(handle)

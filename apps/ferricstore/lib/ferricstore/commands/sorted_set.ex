@@ -478,6 +478,14 @@ defmodule Ferricstore.Commands.SortedSet do
   def handle_ast({:zrevrange, _key, _start, _stop, {:error, reason}}, _store),
     do: {:error, reason}
 
+  def handle_ast({tag, _key, {:error, reason}, _stop, _with_scores}, _store)
+      when tag in [:zrange, :zrevrange],
+      do: {:error, reason}
+
+  def handle_ast({tag, _key, _start, {:error, reason}, _with_scores}, _store)
+      when tag in [:zrange, :zrevrange],
+      do: {:error, reason}
+
   def handle_ast({:zrange, key, start, stop, with_scores}, store),
     do: zrange_rank_parsed(key, start, stop, with_scores, false, store)
 
@@ -585,7 +593,28 @@ defmodule Ferricstore.Commands.SortedSet do
     end
   end
 
-  defp zrem_args([key | members], store) when members != [] do
+  # One member on the instance is removed by the state machine's atomic
+  # single-member write, so concurrent ZREMs report one removal, as SREM does.
+  defp zrem_args([key, member], %FerricStore.Instance{} = ctx) when is_binary(member),
+    do: Ops.zrem_single(ctx, key, member)
+
+  # Several members go to the same single-member entries in replicated
+  # batches, so racing clients count each removal once.
+  defp zrem_args([key | members], %FerricStore.Instance{} = ctx) when members != [] do
+    if Enum.all?(members, &is_binary/1) do
+      Ops.single_member_writes(
+        ctx,
+        key,
+        members |> Enum.uniq() |> Enum.map(&{:zrem_single, key, &1})
+      )
+    else
+      zrem_args_generic([key | members], ctx)
+    end
+  end
+
+  defp zrem_args(args, store), do: zrem_args_generic(args, store)
+
+  defp zrem_args_generic([key | members], store) when members != [] do
     with :ok <- TypeRegistry.command_check_type(key, :zset, store) do
       compound_keys =
         members
@@ -615,15 +644,47 @@ defmodule Ferricstore.Commands.SortedSet do
     end
   end
 
-  defp zrem_args(_args, _store) do
+  defp zrem_args_generic(_args, _store) do
     {:error, "ERR wrong number of arguments for 'zrem' command"}
   end
 
   defp zadd_parsed(key, opts, score_member_pairs, store) do
     with :ok <- validate_zadd_ast(opts, score_member_pairs) do
-      do_zadd_parsed(key, opts, score_member_pairs, store)
+      zadd_validated(key, opts, score_member_pairs, store)
     end
   end
+
+  # A ZADD without options on the instance writes through the state machine's
+  # single-member entries in replicated batches: each checks the key's type
+  # and reports whether its member is new, so racing clients count each
+  # member once and a SET between the type check and the write can no longer
+  # leave members under the string. Options keep the read-decide-write path.
+  defp zadd_validated(key, [], score_member_pairs, %FerricStore.Instance{} = ctx) do
+    if Enum.all?(score_member_pairs, fn {score, member} ->
+         is_float(score) and is_binary(member)
+       end) do
+      Ops.single_member_writes(
+        ctx,
+        key,
+        Enum.map(score_member_pairs, fn {score, member} -> {:zadd_single, key, score, member} end)
+      )
+    else
+      do_zadd_parsed(key, [], score_member_pairs, ctx)
+    end
+  end
+
+  # With options it reads the members and decides; at cluster feature level 4
+  # that runs as one replicated entry, so concurrent clients each see one
+  # outcome (one ZADD NX adds the member, one ZADD CH reports the change).
+  defp zadd_validated(key, opts, score_member_pairs, %FerricStore.Instance{} = ctx) do
+    case Ops.compound_command(ctx, key, {:zadd, key, opts, score_member_pairs}) do
+      :unsupported -> do_zadd_parsed(key, opts, score_member_pairs, ctx)
+      result -> result
+    end
+  end
+
+  defp zadd_validated(key, opts, score_member_pairs, store),
+    do: do_zadd_parsed(key, opts, score_member_pairs, store)
 
   defp do_zadd_parsed(key, opts, score_member_pairs, store) do
     opts = %{
@@ -777,6 +838,17 @@ defmodule Ferricstore.Commands.SortedSet do
     end
   end
 
+  # On the instance (the gateways' store) the increment is one replicated
+  # read-modify-write; reading here and writing back lost concurrent
+  # increments. Inside a transaction the code below already runs in the state
+  # machine.
+  defp zincrby_member(key, increment, member, %FerricStore.Instance{} = ctx, type_status) do
+    case Ops.zincrby(ctx, key, increment, member) do
+      {:error, _reason} = error -> rollback_new_zset_type_marker(key, ctx, type_status, error)
+      new_score -> Helpers.format_score_str(new_score)
+    end
+  end
+
   defp zincrby_member(key, increment, member, store, type_status) do
     compound_key = CompoundKey.zset_member(key, member)
     existing = Ops.compound_get(store, key, compound_key)
@@ -887,6 +959,16 @@ defmodule Ferricstore.Commands.SortedSet do
             end)
           end
       end
+    end
+  end
+
+  # On the instance the pop is one replicated read-modify-write. Reading the
+  # lowest members here and deleting them in a later write let concurrent
+  # clients pop the same members.
+  defp zpop_parsed(key, count, reverse?, %FerricStore.Instance{} = ctx)
+       when is_integer(count) and count >= 0 do
+    with :ok <- TypeRegistry.command_check_type(key, :zset, ctx) do
+      if reverse?, do: Ops.zpopmax(ctx, key, count), else: Ops.zpopmin(ctx, key, count)
     end
   end
 

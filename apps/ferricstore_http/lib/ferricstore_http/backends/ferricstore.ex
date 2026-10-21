@@ -14,6 +14,9 @@ defmodule FerricstoreHttp.Backends.Ferricstore do
   end
 
   @impl FerricstoreHttp.Backend
+  def bind_peer(session, peer), do: AuthenticationGateway.bind_peer(session, peer)
+
+  @impl FerricstoreHttp.Backend
   def execute_batch(session, commands, opts) do
     with {:ok, commands} <- normalize_commands(commands) do
       CommandGateway.execute_batch(session, commands, execution_opts(opts))

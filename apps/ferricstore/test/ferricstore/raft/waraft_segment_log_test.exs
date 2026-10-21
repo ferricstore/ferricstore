@@ -1042,6 +1042,9 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
         provider = :ferricstore_waraft_spike_segment_log
         assert :ok = provider.init(log)
         assert {:ok, _state} = provider.open(log)
+        # This log's files live under a directory named after its table and partition.
+        {:raft_log, _name, _app, table, partition, _provider} = log
+        log_dir = "/#{table}.#{partition}/"
 
         append = fn index ->
           provider.append(
@@ -1078,8 +1081,10 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
             end
           end)
           |> Enum.take_while(&(&1 != :done))
+          # The trace sees every process in the VM; count only this log's files.
           |> Enum.count(fn {:open, path} ->
-            String.ends_with?(path, ".seg") or String.ends_with?(path, ".idx")
+            String.contains?(path, log_dir) and
+              (String.ends_with?(path, ".seg") or String.ends_with?(path, ".idx"))
           end)
 
         assert segment_opens <= 2,

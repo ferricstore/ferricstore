@@ -1101,6 +1101,37 @@ defmodule FerricstoreServer.Native.CommandsTest do
     end
   end
 
+  test "a native connection pool authenticating at once is not rate limited" do
+    previous_max_attempts = Application.get_env(:ferricstore, :auth_rate_limit_max_attempts)
+    username = "native_auth_pool_user"
+
+    Application.put_env(:ferricstore, :auth_rate_limit_max_attempts, 2)
+    :ok = AuthRateLimiter.reset()
+    assert :ok = Acl.set_user(username, ["on", ">secret", "~*", "+@all"])
+
+    on_exit(fn ->
+      Acl.del_user(username)
+      restore_env(:auth_rate_limit_max_attempts, previous_max_attempts)
+      AuthRateLimiter.reset()
+    end)
+
+    results =
+      1..8
+      |> Enum.map(fn port ->
+        Task.async(fn ->
+          Commands.execute(
+            @op_auth,
+            %{"username" => username, "password" => "secret"},
+            state(%{peer: {{10, 20, 32, 40}, 40_000 + port}})
+          )
+        end)
+      end)
+      |> Task.await_many(15_000)
+
+    assert Enum.all?(results, &match?({:ok, "OK", _state}, &1)),
+           inspect(Enum.map(results, &Tuple.delete_at(&1, 2)))
+  end
+
   test "native AUTH rejects oversized credentials before authentication" do
     assert {:auth, username_error, _state} =
              Commands.execute(
@@ -4917,6 +4948,248 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert final_state.multi_state == :none
   end
 
+  test "typed HSET rejects a nested field name or value as a bad request" do
+    key = "native-hset-nested:#{System.unique_integer([:positive, :monotonic])}"
+
+    for fields <- [
+          %{"f" => %{"a" => 1}},
+          %{"f" => [-1]},
+          %{%{"a" => 1} => "v"}
+        ] do
+      log =
+        capture_log(fn ->
+          assert {:bad_request, "ERR native field fields must map strings to strings or numbers",
+                  _state} =
+                   Commands.execute(@op_hset, %{"key" => key, "fields" => fields}, state())
+        end)
+
+      refute log =~ "native command execution failed"
+    end
+
+    assert {:ok, 1, _state} =
+             Commands.execute(@op_hset, %{"key" => key, "fields" => %{"f" => 7}}, state())
+
+    assert {:ok, "7"} = FerricStore.hget(key, "f")
+  end
+
+  test "native MULTI discards the transaction after a command is rejected while queueing" do
+    username = "native-multi-denied"
+    key = "native-multi-denied:#{System.unique_integer([:positive, :monotonic])}"
+
+    assert :ok =
+             Acl.set_user(username, ["on", "nopass", "+@all", "-incr", "~*"])
+
+    on_exit(fn -> Acl.del_user(username) end)
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as(username))
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(%{"command" => "SET", "args" => [key, "partial"]}, state)
+
+    assert {:noperm, _denied, state} =
+             Session.execute(%{"command" => "INCR", "args" => [key]}, state)
+
+    assert {:bad_request, _unknown, state} =
+             Session.execute(%{"command" => "NOSUCHCMD", "args" => []}, state)
+
+    assert {:error, abort_message, final_state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, state)
+
+    assert abort_message =~ "EXECABORT"
+    assert final_state.multi_state == :none
+    assert Router.get(FerricStore.Instance.get(:default), key) == nil
+  end
+
+  describe "keyspace notifications" do
+    setup do
+      :ok = Ferricstore.Config.set("notify-keyspace-events", "KEA")
+
+      on_exit(fn ->
+        Ferricstore.Config.set("notify-keyspace-events", "")
+        PubSub.cleanup(self())
+      end)
+
+      %{key: "{notify:#{System.unique_integer([:positive, :monotonic])}}"}
+    end
+
+    test "commands and typed operations notify the key and the event", %{key: key} do
+      hash = key <> ":h"
+      :ok = PubSub.subscribe("__keyspace@0__:" <> key, self())
+      :ok = PubSub.subscribe("__keyevent@0__:hset", self())
+
+      assert {:ok, _reply, _state} =
+               Commands.execute(
+                 @op_command_exec,
+                 %{"command" => "SET", "args" => [key, "v"]},
+                 state()
+               )
+
+      assert_receive {:pubsub_message, "__keyspace@0__:" <> ^key, "set"}
+
+      assert {:ok, _reply, _state} =
+               Commands.execute(@op_set, %{"key" => key, "value" => "w"}, state())
+
+      assert_receive {:pubsub_message, "__keyspace@0__:" <> ^key, "set"}
+
+      assert {:ok, 1, _state} =
+               Commands.execute(@op_hset, %{"key" => hash, "fields" => %{"f" => "v"}}, state())
+
+      assert_receive {:pubsub_message, "__keyevent@0__:hset", ^hash}
+
+      Commands.execute(
+        @op_command_exec,
+        %{"command" => "SET", "args" => [key, "x", "NX"]},
+        state()
+      )
+
+      refute_receive {:pubsub_message, "__keyspace@0__:" <> ^key, "set"}, 200
+
+      Commands.execute(@op_command_exec, %{"command" => "DEL", "args" => [key]}, state())
+      assert_receive {:pubsub_message, "__keyspace@0__:" <> ^key, "del"}
+    end
+
+    test "commands in MULTI and pipelines notify", %{key: key} do
+      :ok = PubSub.subscribe("__keyspace@0__:" <> key, self())
+
+      assert {:ok, "OK", session} =
+               Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+      assert {:ok, "QUEUED", session} =
+               Session.execute(%{"command" => "SET", "args" => [key, "v"]}, session)
+
+      assert {:ok, "QUEUED", session} =
+               Session.execute(%{"command" => "EXPIRE", "args" => [key, "100"]}, session)
+
+      assert {:ok, _results, _session} =
+               Session.execute(%{"command" => "EXEC", "args" => []}, session)
+
+      assert_receive {:pubsub_message, "__keyspace@0__:" <> ^key, "set"}
+      assert_receive {:pubsub_message, "__keyspace@0__:" <> ^key, "expire"}
+
+      commands =
+        Enum.map([1, 2], fn request_id ->
+          %{
+            "opcode" => @op_command_exec,
+            "request_id" => request_id,
+            "lane_id" => 1,
+            "body" => %{"command" => "INCR", "args" => [key <> ":n"]}
+          }
+        end)
+
+      :ok = PubSub.subscribe("__keyevent@0__:incr", self())
+
+      assert {:ok, [_first, _second], _state} =
+               Commands.execute(@op_pipeline, %{"commands" => commands}, state())
+
+      counter = key <> ":n"
+      assert_receive {:pubsub_message, "__keyevent@0__:incr", ^counter}
+      assert_receive {:pubsub_message, "__keyevent@0__:incr", ^counter}
+    end
+  end
+
+  test "native MULTI discards the transaction after a command with the wrong arity" do
+    key = "native-multi-arity:#{System.unique_integer([:positive, :monotonic])}"
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(%{"command" => "SET", "args" => [key, "partial"]}, state)
+
+    state =
+      Enum.reduce(
+        [
+          {"GET", []},
+          {"HSET", [key <> ":h", "f"]},
+          {"EXPIRE", [key]},
+          {"ZADD", [key <> ":z", "1"]},
+          {"GETRANGE", [key, "0"]}
+        ],
+        state,
+        fn {command, args}, state ->
+          assert {:error, message, state} =
+                   Session.execute(%{"command" => command, "args" => args}, state)
+
+          assert message ==
+                   "ERR wrong number of arguments for '#{String.downcase(command)}' command"
+
+          assert state.multi_error
+          state
+        end
+      )
+
+    assert {:error, abort_message, final_state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, state)
+
+    assert abort_message =~ "EXECABORT"
+    assert final_state.multi_state == :none
+    assert Router.get(FerricStore.Instance.get(:default), key) == nil
+  end
+
+  test "native MULTI refuses forms older releases apply differently below level 4" do
+    key = "{native-multi-compat:#{System.unique_integer([:positive, :monotonic])}}"
+    assert :ok = FerricStore.set(key, "v")
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(%{"command" => "EXPIRE", "args" => [key, "100", "GT"]}, state)
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(%{"command" => "BITCOUNT", "args" => [key]}, state)
+
+    state =
+      Enum.reduce(
+        [{"EXPIRE", [key, "100", "XX", "GT"]}, {"BITCOUNT", [key, "0", "-1"]}],
+        state,
+        fn {command, args}, state ->
+          assert {:error, message, state} =
+                   Session.execute(%{"command" => command, "args" => args}, state)
+
+          assert message =~ "needs cluster feature level 4"
+          state
+        end
+      )
+
+    assert {:error, abort_message, _state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, state)
+
+    assert abort_message =~ "EXECABORT"
+    assert {:ok, nil} == FerricStore.ttl(key)
+  end
+
+  test "native MULTI queues commands with optional arguments" do
+    key = "{native-multi-optional:#{System.unique_integer([:positive, :monotonic])}}"
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    state =
+      Enum.reduce(
+        [
+          {"SET", [key, "v", "EX", "100"]},
+          {"EXPIRE", [key, "200", "GT"]},
+          {"HSET", [key <> ":h", "f", "1", "g", "2"]},
+          {"ZADD", [key <> ":z", "NX", "CH", "1", "m"]},
+          {"GETEX", [key]},
+          {"PING", []}
+        ],
+        state,
+        fn {command, args}, state ->
+          assert {:ok, "QUEUED", state} =
+                   Session.execute(%{"command" => command, "args" => args}, state)
+
+          state
+        end
+      )
+
+    assert {:ok, results, _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
+    assert length(results) == 6
+    assert "v" == Router.get(FerricStore.Instance.get(:default), key)
+  end
+
   test "native MULTI rejects request-scoped commands before queueing" do
     for {command, args} <- [
           {"PUBLISH", ["tx-channel", "must-not-publish"]},
@@ -5107,6 +5380,24 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert status == :error
     assert payload =~ "CLIENT TRACKING is not supported"
+  end
+
+  test "typed RATELIMIT.ADD answers a rejected request as an error, not a successful reply" do
+    key = "native:ratelimit:#{System.unique_integer([:positive])}"
+
+    assert {:error, "ERR value is not an integer or out of range", _state} =
+             Commands.execute(
+               @op_ratelimit_add,
+               %{"key" => key, "window_ms" => 9_223_372_036_854_775_807, "max" => 5},
+               state()
+             )
+
+    assert {:ok, ["allowed", 1, 4, _reset_ms], _state} =
+             Commands.execute(
+               @op_ratelimit_add,
+               %{"key" => key, "window_ms" => 1_000, "max" => 5},
+               state()
+             )
   end
 
   defp state(overrides \\ %{}) do

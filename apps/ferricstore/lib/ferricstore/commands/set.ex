@@ -448,7 +448,26 @@ defmodule Ferricstore.Commands.Set do
 
   defp sadd_args(_args, _store), do: {:error, "ERR wrong number of arguments for 'sadd' command"}
 
-  defp sadd_members(key, members, store) do
+  # On the instance (the gateways' store) reading the member and then writing
+  # it are separate entries, so every concurrent client saw the member missing
+  # and answered 1, breaking SADD-based deduplication. One member is added by
+  # the state machine's atomic single-member write instead; in the state
+  # machine the clauses below run with its own store.
+  defp sadd_members(key, [member], %FerricStore.Instance{} = ctx) when is_binary(member),
+    do: Ops.sadd_single(ctx, key, member)
+
+  # Several members go to the same single-member entries in replicated
+  # batches, so racing clients count each member once and a SET between the
+  # type check and the write can no longer leave members under the string.
+  defp sadd_members(key, members, %FerricStore.Instance{} = ctx) do
+    if Enum.all?(members, &is_binary/1),
+      do: single_member_writes(ctx, key, members, &{:sadd_single, key, &1}),
+      else: sadd_members_generic(key, members, ctx)
+  end
+
+  defp sadd_members(key, members, store), do: sadd_members_generic(key, members, store)
+
+  defp sadd_members_generic(key, members, store) do
     with type_status when type_status in [:ok, {:ok, :created}] <-
            TypeRegistry.command_check_or_set_status(key, :set, store) do
       compound_keys =
@@ -493,7 +512,22 @@ defmodule Ferricstore.Commands.Set do
 
   defp rollback_new_set_type_marker(_key, _store, :ok, write_error), do: write_error
 
-  defp srem_args([key | members], store) when members != [] do
+  defp srem_args([key, member], %FerricStore.Instance{} = ctx) when is_binary(member),
+    do: Ops.srem_single(ctx, key, member)
+
+  defp srem_args([key | members], %FerricStore.Instance{} = ctx) when members != [] do
+    if Enum.all?(members, &is_binary/1),
+      do: single_member_writes(ctx, key, members, &{:srem_single, key, &1}),
+      else: srem_args_generic([key | members], ctx)
+  end
+
+  defp srem_args(args, store), do: srem_args_generic(args, store)
+
+  defp single_member_writes(ctx, key, members, command) do
+    Ops.single_member_writes(ctx, key, members |> Enum.uniq() |> Enum.map(command))
+  end
+
+  defp srem_args_generic([key | members], store) when members != [] do
     with :ok <- TypeRegistry.command_check_type(key, :set, store) do
       compound_keys =
         members
@@ -517,7 +551,8 @@ defmodule Ferricstore.Commands.Set do
     end
   end
 
-  defp srem_args(_args, _store), do: {:error, "ERR wrong number of arguments for 'srem' command"}
+  defp srem_args_generic(_args, _store),
+    do: {:error, "ERR wrong number of arguments for 'srem' command"}
 
   defp set_member_entries_for_missing([compound_key | compound_keys], [nil | values], acc) do
     set_member_entries_for_missing(compound_keys, values, [
@@ -678,6 +713,11 @@ defmodule Ferricstore.Commands.Set do
     end
   end
 
+  # On the instance the pop is one replicated read-modify-write. Choosing a
+  # member here and deleting it in a later write let concurrent clients pop
+  # the same member.
+  defp spop_one(key, %FerricStore.Instance{} = ctx), do: atomic_spop(key, nil, ctx)
+
   defp spop_one(key, store) do
     with :ok <- TypeRegistry.command_check_type(key, :set, store),
          {:ok, members} <- get_members_list(key, store) do
@@ -695,6 +735,8 @@ defmodule Ferricstore.Commands.Set do
       end
     end
   end
+
+  defp spop_count(key, count, %FerricStore.Instance{} = ctx), do: atomic_spop(key, count, ctx)
 
   defp spop_count(key, count, store) do
     with :ok <- TypeRegistry.command_check_type(key, :set, store) do
@@ -1011,5 +1053,9 @@ defmodule Ferricstore.Commands.Set do
       {:error, _} = rollback_error ->
         {:error, {:set_delete_rollback_failed, write_error, rollback_error}}
     end
+  end
+
+  defp atomic_spop(key, count, ctx) do
+    with :ok <- TypeRegistry.command_check_type(key, :set, ctx), do: Ops.spop(ctx, key, count)
   end
 end

@@ -7,6 +7,7 @@ defmodule Ferricstore.Raft.Cluster do
   """
 
   alias Ferricstore.Raft.WARaftBackend
+  alias Ferricstore.Raft.WARaftStorage.PersistedConfig
 
   @system :ferricstore_waraft_backend
 
@@ -85,6 +86,31 @@ defmodule Ferricstore.Raft.Cluster do
 
   @spec add_member(non_neg_integer(), node(), atom(), keyword()) :: :ok | {:error, term()}
   def add_member(shard_index, node, :voter, opts) do
+    with :ok <- check_node_name(node) do
+      add_voter(shard_index, node, opts)
+    end
+  end
+
+  def add_member(shard_index, node, membership, opts)
+      when membership in [:promotable, :non_voter] do
+    with :ok <- check_node_name(node) do
+      add_non_voter(shard_index, node, opts)
+    end
+  end
+
+  def add_member(_shard_index, _node, membership, _opts),
+    do: {:error, {:unsupported_membership, membership}}
+
+  # The shard's storage validates every peer when it persists a committed
+  # config; a name that is not `name@host` failed there on every replay and
+  # stopped the shard. Refuse it before proposing the change.
+  defp check_node_name(node) do
+    if PersistedConfig.valid_runtime_node?(node),
+      do: :ok,
+      else: {:error, {:invalid_node_name, node}}
+  end
+
+  defp add_voter(shard_index, node, opts) do
     case WARaftBackend.add_member(shard_index, node, opts) do
       {:ok, _position} -> :ok
       :already_member -> :ok
@@ -94,8 +120,7 @@ defmodule Ferricstore.Raft.Cluster do
     end
   end
 
-  def add_member(shard_index, node, membership, opts)
-      when membership in [:promotable, :non_voter] do
+  defp add_non_voter(shard_index, node, opts) do
     case WARaftBackend.adjust_membership(shard_index, :remove_membership, node) do
       {:ok, _position} -> :ok
       {:error, :not_a_member} -> add_participant(shard_index, node, opts)
@@ -104,9 +129,6 @@ defmodule Ferricstore.Raft.Cluster do
       other -> {:error, other}
     end
   end
-
-  def add_member(_shard_index, _node, membership, _opts),
-    do: {:error, {:unsupported_membership, membership}}
 
   defp add_participant(shard_index, node, opts) do
     case WARaftBackend.add_participant(shard_index, node, opts) do
@@ -118,12 +140,14 @@ defmodule Ferricstore.Raft.Cluster do
 
   @spec remove_member(non_neg_integer(), node()) :: :ok | {:error, term()}
   def remove_member(shard_index, node) do
-    case WARaftBackend.adjust_membership(shard_index, :remove_membership, node) do
-      {:ok, _position} -> :ok
-      {:error, :not_member} -> :ok
-      {:error, :not_a_member} -> :ok
-      {:error, _reason} = error -> error
-      other -> {:error, other}
+    with :ok <- check_node_name(node) do
+      case WARaftBackend.adjust_membership(shard_index, :remove_membership, node) do
+        {:ok, _position} -> :ok
+        {:error, :not_member} -> :ok
+        {:error, :not_a_member} -> :ok
+        {:error, _reason} = error -> error
+        other -> {:error, other}
+      end
     end
   end
 

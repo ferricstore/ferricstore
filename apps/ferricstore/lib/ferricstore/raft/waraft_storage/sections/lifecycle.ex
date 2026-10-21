@@ -8,6 +8,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
       alias Ferricstore.Flow.HistoryProjector
       alias Ferricstore.Flow.Keys, as: FlowKeys
       alias Ferricstore.Flow.LMDB, as: FlowLMDB
+      alias Ferricstore.Raft.PromotedFileSync
       alias Ferricstore.Raft.StateMachine
       alias Ferricstore.Raft.WARaftSegmentReader
       alias Ferricstore.Store.BlobRef
@@ -36,9 +37,16 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
       @spec open(map(), charlist() | binary()) :: handle()
       def open(options, root_dir) do
         case Ferricstore.Raft.WARaftBackend.StartupPreopen.take(to_path(root_dir), options) do
-          {:ok, handle} -> handle
-          :not_preopened -> open_unprepared(options, root_dir)
-          {:error, reason} -> raise "failed to adopt preopened WARaft storage: #{inspect(reason)}"
+          {:ok, handle} ->
+            # The preopen worker gave this process its tables, tracking included.
+            :ok = PromotedFileSync.bind(Map.get(handle, :promoted_sync))
+            handle
+
+          :not_preopened ->
+            open_unprepared(options, root_dir)
+
+          {:error, reason} ->
+            raise "failed to adopt preopened WARaft storage: #{inspect(reason)}"
         end
       end
 
@@ -65,6 +73,13 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
               {:error, reason} ->
                 raise "failed to recover WARaft snapshot install: #{inspect(reason)}"
             end
+
+            # Before recovery replays the log, which writes dedicated files.
+            promoted_sync =
+              case PromotedFileSync.open(root_dir, ctx.data_dir) do
+                {:ok, tracker} -> tracker
+                {:error, reason} -> raise "failed to sync dedicated files: #{inspect(reason)}"
+              end
 
             metadata =
               profile_startup_phase(shard_index, root_dir, :read_metadata, fn ->
@@ -129,13 +144,15 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
               replay_dependencies: replay_dependencies,
               label: Map.get(metadata, :label),
               config: recovered_config,
-              bitcask_dirty?: false
+              bitcask_dirty?: false,
+              promoted_sync: promoted_sync
             }
 
             last_clean_position =
-              if replay_dependencies_ready?(handle),
-                do: recovered_position,
-                else: metadata_position
+              if replay_dependencies_ready?(handle) and
+                   PromotedFileSync.synced?(promoted_sync),
+                 do: recovered_position,
+                 else: metadata_position
 
             handle
             |> Map.put(:last_clean_position, last_clean_position)
@@ -173,6 +190,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
           end
         after
           unregister_segment_projection_context(handle)
+          # Best effort: a file left unsynced keeps the marker, so the next
+          # open syncs every dedicated file instead.
+          _ = PromotedFileSync.sync(Map.get(handle, :promoted_sync))
+          PromotedFileSync.close(handle.root_dir, Map.get(handle, :promoted_sync))
         end
       end
 
@@ -277,7 +298,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
 
         case lookup_segment_projection_context(root_dir) do
           {:ok, context} ->
-            with :ok <- validate_segment_projection_trim_position(context.position, trim_index) do
+            # The trimmed entries' dedicated-file writes must be on disk first.
+            with :ok <- validate_segment_projection_trim_position(context.position, trim_index),
+                 :ok <- PromotedFileSync.sync_tracked(PromotedFileSync.registered_table(root_dir)) do
               WARaftSegmentReader.with_apply_projection_disk_lock(
                 context.ctx.data_dir,
                 context.shard_index,

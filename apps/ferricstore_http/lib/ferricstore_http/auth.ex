@@ -8,11 +8,12 @@ defmodule FerricstoreHttp.Auth do
     @moduledoc "Authenticated context passed through the HTTP backend boundary."
 
     @enforce_keys [:session]
-    defstruct [:session, :cache_key, :subject, scopes: []]
+    defstruct [:session, :cache_key, :cached_session, :subject, scopes: []]
 
     @type t :: %__MODULE__{
             session: term(),
             cache_key: binary() | nil,
+            cached_session: term(),
             subject: binary() | nil,
             scopes: [binary()]
           }
@@ -74,21 +75,22 @@ defmodule FerricstoreHttp.Auth do
   @spec invalidate(Context.t()) :: :ok
   def invalidate(%Context{cache_key: nil}), do: :ok
 
-  def invalidate(%Context{cache_key: cache_key, session: session}) do
-    Cache.invalidate(cache_key, session)
+  def invalidate(%Context{cache_key: cache_key, cached_session: cached_session}) do
+    Cache.invalidate(cache_key, cached_session)
   end
 
   defp resolve_cached(request, peer, headers, config) do
     case config.auth_provider.cache_key(request, config.auth_options) do
       {:ok, material} ->
-        cache_key = Cache.reference(config.auth_provider, config.backend, {material, peer})
+        scope = cache_scope(peer, config)
+        cache_key = Cache.reference(config.auth_provider, config.backend, {material, scope})
 
         authenticate = fn -> authenticate_provider(request, config) end
 
-        case Cache.fetch(cache_key, peer, authenticate, config.request_timeout_ms) do
+        case Cache.fetch(cache_key, scope, authenticate, config.request_timeout_ms) do
           {:ok, identity, source} ->
             observe_cache(source, config)
-            {:ok, context(identity, cache_key, headers, config)}
+            {:ok, cached_context(identity, peer, cache_key, headers, config)}
 
           {:error, reason, source} ->
             observe_cache(source, config)
@@ -149,9 +151,34 @@ defmodule FerricstoreHttp.Auth do
     %Context{
       session: identity.session,
       cache_key: cache_key,
+      cached_session: if(cache_key, do: identity.session),
       subject: identity.subject,
       scopes: identity.scopes
     }
+  end
+
+  defp cached_context(%Identity{} = identity, peer, cache_key, headers, config) do
+    context = context(identity, cache_key, headers, config)
+
+    if binds_peer?(config) do
+      %Context{context | session: config.backend.bind_peer(identity.session, peer)}
+    else
+      context
+    end
+  end
+
+  # Connections presenting the same credentials from one address share one
+  # credential check when the backend can give each its own session; the
+  # cached session is then rebound to every connection's peer.
+  defp cache_scope(peer, config) do
+    if binds_peer?(config), do: peer_address(peer), else: peer
+  end
+
+  defp peer_address({address, _port}) when is_tuple(address), do: address
+  defp peer_address(peer), do: peer
+
+  defp binds_peer?(%Config{backend: backend}) do
+    Code.ensure_loaded?(backend) and function_exported?(backend, :bind_peer, 2)
   end
 
   defp apply_trusted_headers(identity, _headers, %Config{trust_context_headers: false}),

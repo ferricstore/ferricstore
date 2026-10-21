@@ -1,5 +1,29 @@
+defmodule FerricstoreHttp.Auth.CacheTest.CountingBackend do
+  @moduledoc false
+
+  @behaviour FerricstoreHttp.Backend
+
+  @impl FerricstoreHttp.Backend
+  def authenticate(username, password, opts) do
+    send(:persistent_term.get({__MODULE__, :test_pid}), {:verified, Keyword.get(opts, :peer)})
+    Process.sleep(50)
+    FerricstoreHttp.TestBackend.authenticate(username, password, opts)
+  end
+
+  @impl FerricstoreHttp.Backend
+  defdelegate execute_batch(session, commands, opts), to: FerricstoreHttp.TestBackend
+
+  @impl FerricstoreHttp.Backend
+  defdelegate ready?(), to: FerricstoreHttp.TestBackend
+
+  @impl FerricstoreHttp.Backend
+  defdelegate bind_peer(session, peer), to: FerricstoreHttp.TestBackend
+end
+
 defmodule FerricstoreHttp.Auth.CacheTest do
   use ExUnit.Case, async: false
+
+  alias FerricstoreHttp.Auth.CacheTest.CountingBackend
 
   alias FerricstoreHttp.{Auth, Config}
   alias FerricstoreHttp.Auth.Cache
@@ -330,7 +354,48 @@ defmodule FerricstoreHttp.Auth.CacheTest do
     assert {:ok, %Auth.Context{session: {:session, ^second_peer}}} =
              Auth.resolve(authorization, second_peer, config)
 
-    assert Cache.stats().entries == 2
+    assert Cache.stats().entries == 1
+  end
+
+  test "connections from one address share one credential check and keep their own peer" do
+    :persistent_term.put({CountingBackend, :test_pid}, self())
+    on_exit(fn -> :persistent_term.erase({CountingBackend, :test_pid}) end)
+
+    authorization = "Basic " <> Base.encode64("worker:secret")
+    {:ok, config} = Config.new(backend: CountingBackend)
+    peers = for port <- 1..20, do: {{10, 0, 0, 7}, 40_000 + port}
+
+    contexts =
+      peers
+      |> Enum.map(&Task.async(fn -> Auth.resolve(authorization, &1, config) end))
+      |> Task.await_many()
+
+    for {peer, context} <- Enum.zip(peers, contexts) do
+      assert {:ok, %Auth.Context{session: {:session, ^peer}}} = context
+    end
+
+    assert_received {:verified, {{10, 0, 0, 7}, _port}}
+    refute_received {:verified, _peer}
+
+    other_address = {{10, 0, 0, 8}, 40_001}
+
+    assert {:ok, %Auth.Context{session: {:session, ^other_address}}} =
+             Auth.resolve(authorization, other_address, config)
+
+    assert_received {:verified, ^other_address}
+  end
+
+  test "a stale session bound to a new connection still invalidates the shared entry" do
+    authorization = "Basic " <> Base.encode64("worker:secret")
+    {:ok, config} = Config.new(backend: FerricstoreHttp.TestBackend)
+
+    assert {:ok, first} = Auth.resolve(authorization, {{127, 0, 0, 1}, 40_001}, config)
+    assert {:ok, second} = Auth.resolve(authorization, {{127, 0, 0, 1}, 40_002}, config)
+    assert Cache.stats().entries == 1
+
+    assert :ok = Auth.invalidate(second)
+    assert Cache.stats().entries == 0
+    assert first.cache_key == second.cache_key
   end
 
   test "applies trusted request context after the session cache lookup" do

@@ -33,11 +33,9 @@ defmodule FerricStore.API.SortedSets do
   """
   @spec zadd(key(), [{number(), binary()}]) :: {:ok, non_neg_integer()}
   def zadd(key, score_member_pairs) when is_list(score_member_pairs) do
-    store = build_compound_store(key)
-
     pairs = Enum.map(score_member_pairs, fn {score, member} -> {score * 1.0, member} end)
 
-    case SortedSet.handle_ast({:zadd, key, [], pairs}, store) do
+    case SortedSet.handle_ast({:zadd, key, [], pairs}, default_ctx()) do
       {:error, _} = err -> err
       result -> {:ok, result}
     end
@@ -170,9 +168,7 @@ defmodule FerricStore.API.SortedSets do
   """
   @spec zrem(key(), [binary()]) :: {:ok, non_neg_integer()}
   def zrem(key, members) when is_list(members) do
-    store = build_compound_store(key)
-
-    case SortedSet.handle_ast({:zrem, [key | members]}, store) do
+    case SortedSet.handle_ast({:zrem, [key | members]}, default_ctx()) do
       {:error, _} = err -> err
       result -> {:ok, result}
     end

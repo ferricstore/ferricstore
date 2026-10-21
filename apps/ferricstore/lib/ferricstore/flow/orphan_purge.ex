@@ -175,8 +175,7 @@ defmodule Ferricstore.Flow.OrphanPurge do
 
       {:ok, encoded} ->
         QueryRowCodec.segment_projection_row?(encoded, state_key) and
-          match?(
-            {:error, _reason},
+          record_lost?(
             QueryRecordStore.read_encoded_many(
               ctx,
               shard_index,
@@ -192,6 +191,18 @@ defmodule Ferricstore.Flow.OrphanPurge do
         false
     end
   end
+
+  @doc false
+  def __record_lost_for_test__(result), do: record_lost?(result)
+
+  # A read that timed out or ran over its byte budget says nothing about the
+  # frame, and a purge on it would delete a Flow that still reads back.
+  defp record_lost?({:error, reason})
+       when reason in [:query_deadline_exceeded, :query_hydration_batch_too_large],
+       do: false
+
+  defp record_lost?({:error, _reason}), do: true
+  defp record_lost?(_result), do: false
 
   defp describe(ctx, shard_index, path, state_key, keys) do
     {:ok, partition_key, id} = Keys.flow_tag_from_state_key(state_key)
