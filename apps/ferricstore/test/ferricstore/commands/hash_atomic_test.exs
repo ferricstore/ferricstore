@@ -749,7 +749,7 @@ defmodule Ferricstore.Commands.HashAtomicTest do
         end
       }
 
-      assert [div(expire_at_ms, 1000), div(expire_at_ms, 1000), -1, -2] ==
+      assert [div(expire_at_ms + 999, 1000), div(expire_at_ms + 999, 1000), -1, -2] ==
                Hash.handle(
                  "HEXPIRETIME",
                  ["hash", "FIELDS", "4", "expiring", "expiring", "persistent", "missing"],

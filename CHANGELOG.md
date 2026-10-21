@@ -4,6 +4,9 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Round TTL and EXPIRETIME to the nearest second, and HTTL and HEXPIRETIME
+  up, as Redis does. They truncated, so `SET k v EX 10` followed by `TTL k`
+  answered 9 where Redis answers 10.
 - Support HEXPIRE and HPEXPIRE as Redis 8 does: NX, XX, GT and LT (anywhere
   after the TTL), a TTL of 0 deleting the field (answering 2, and deleting
   the hash once empty), repeated fields applied in order, WRONGTYPE before

@@ -261,6 +261,33 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
       end
     end
 
+    describe "#{@path}: TTLs in seconds" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      test "TTL and EXPIRETIME round to the nearest second", %{ctx: ctx, key: key} do
+        :ok = run(ctx, "SET", [key, "v", "PX", "1400"])
+        assert 1 == run(ctx, "TTL", [key])
+        assert 1 == run(ctx, "PEXPIRE", [key, "1600"])
+        assert 2 == run(ctx, "TTL", [key])
+        assert 1 == run(ctx, "PEXPIREAT", [key, "1800000001400"])
+        assert 1_800_000_001 == run(ctx, "EXPIRETIME", [key])
+        assert 1 == run(ctx, "PEXPIREAT", [key, "1800000001600"])
+        assert 1_800_000_002 == run(ctx, "EXPIRETIME", [key])
+      end
+
+      test "HTTL and HEXPIRETIME round up", %{ctx: ctx, key: key} do
+        assert 2 == run(ctx, "HSET", [key, "a", "1", "b", "2"])
+        assert [1] == run(ctx, "HPEXPIRE", [key, "1400", "FIELDS", "1", "a"])
+        before_ms = Ferricstore.CommandTime.now_ms()
+        assert [1] == run(ctx, "HPEXPIRE", [key, "100400", "FIELDS", "1", "b"])
+        after_ms = Ferricstore.CommandTime.now_ms()
+        assert [2] == run(ctx, "HTTL", [key, "FIELDS", "1", "a"])
+        assert [expire_at_s] = run(ctx, "HEXPIRETIME", [key, "FIELDS", "1", "b"])
+        assert expire_at_s * 1_000 >= before_ms + 100_400
+        assert expire_at_s * 1_000 < after_ms + 101_400
+      end
+    end
+
     describe "#{@path}: hash field expiry" do
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 

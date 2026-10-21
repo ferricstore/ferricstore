@@ -105,7 +105,8 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
 
             cond do
               remaining_ms <= 0 -> -2
-              unit == :seconds -> div(remaining_ms, 1000)
+              # Rounded up, as Redis does for fields.
+              unit == :seconds -> div(remaining_ms + 999, 1000)
               true -> remaining_ms
             end
         end
@@ -145,7 +146,7 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
         case Map.fetch!(metas_by_field, field) do
           nil -> -2
           {_value, 0} -> -1
-          {_value, expire_at_ms} -> div(expire_at_ms, 1000)
+          {_value, expire_at_ms} -> div(expire_at_ms + 999, 1000)
         end
       end)
     end

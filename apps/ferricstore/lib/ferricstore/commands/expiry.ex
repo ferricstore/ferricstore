@@ -351,7 +351,8 @@ defmodule Ferricstore.Commands.Expiry do
       {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
       nil -> -2
       0 -> -1
-      exp -> max(0, div(exp - CommandTime.now_ms(), 1_000))
+      # Rounded to the nearest second, as Redis does.
+      exp -> div(max(0, exp - CommandTime.now_ms()) + 500, 1_000)
     end
   end
 

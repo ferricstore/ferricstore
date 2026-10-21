@@ -445,7 +445,8 @@ defmodule Ferricstore.Commands.Generic do
       {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
       nil -> -2
       0 -> -1
-      expire_at_ms -> div(expire_at_ms, 1_000)
+      # Rounded to the nearest second, as Redis does.
+      expire_at_ms -> div(expire_at_ms + 500, 1_000)
     end
   end
 
