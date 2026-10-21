@@ -1,7 +1,9 @@
 defmodule FerricstoreServer.Native.FeatureLevel5MultiTest do
   @moduledoc """
   Cluster feature level 5 inside MULTI: a transaction may queue ZRANK and
-  ZREVRANK WITHSCORE, and BITOP with an empty result deletes its destination.
+  ZREVRANK WITHSCORE and a sourceless PFMERGE, BITOP with an empty result
+  deletes its destination, and GEOSEARCHSTORE of a missing source empties its
+  destination.
   """
   use ExUnit.Case, async: false
   @moduletag :global_state
@@ -54,6 +56,28 @@ defmodule FerricstoreServer.Native.FeatureLevel5MultiTest do
     state = queue(multi(), "PFMERGE", [key])
     assert {:ok, ["OK"], _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
     assert 0 == Dispatcher.dispatch("PFCOUNT", [key], ctx)
+  end
+
+  test "GEOSEARCHSTORE in MULTI empties the destination for a missing source", %{
+    ctx: ctx,
+    key: key
+  } do
+    destination = key <> ":dst"
+    assert 1 == Dispatcher.dispatch("GEOADD", [destination, "13.36", "38.11", "palermo"], ctx)
+
+    state =
+      queue(multi(), "GEOSEARCHSTORE", [
+        destination,
+        key,
+        "FROMMEMBER",
+        "m",
+        "BYRADIUS",
+        "10",
+        "km"
+      ])
+
+    assert {:ok, [0], _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
+    assert 0 == Dispatcher.dispatch("EXISTS", [destination], ctx)
   end
 
   defp multi do

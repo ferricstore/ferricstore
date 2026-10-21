@@ -5179,6 +5179,34 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert "" == Router.get(ctx, key)
   end
 
+  test "native MULTI GEOSEARCHSTORE keeps the old answer for a missing source below level 5" do
+    key = "{multi-geo:#{System.unique_integer([:positive])}}"
+    destination = key <> ":dst"
+    assert 1 == FerricStore.Instance.get(:default) |> geoadd(destination)
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    args = [destination, key, "FROMMEMBER", "m", "BYRADIUS", "10", "km"]
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(%{"command" => "GEOSEARCHSTORE", "args" => args}, state)
+
+    assert {:ok, [%{"error" => "ERR could not decode requested zset member"}], _state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, state)
+
+    assert 1 ==
+             Ferricstore.Commands.Dispatcher.dispatch(
+               "EXISTS",
+               [destination],
+               FerricStore.Instance.get(:default)
+             )
+  end
+
+  defp geoadd(ctx, key) do
+    Ferricstore.Commands.Dispatcher.dispatch("GEOADD", [key, "13.36", "38.11", "palermo"], ctx)
+  end
+
   test "native MULTI refuses ZRANK WITHSCORE and a sourceless PFMERGE below feature level 5" do
     key = "{multi-zrank:#{System.unique_integer([:positive])}}"
 
