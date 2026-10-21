@@ -521,8 +521,17 @@ defmodule Ferricstore.Commands.List do
   # operation. Moving through CrossShardOp's per-shard store read the source,
   # popped it and pushed the destination in separate writes, so concurrent
   # moves lost elements.
-  defp lmove(source, destination, from_dir, to_dir, %FerricStore.Instance{} = ctx),
-    do: Ops.list_op(ctx, source, {:lmove, destination, from_dir, to_dir})
+  # As after LPOP, a source the move emptied loses its type, so the key is
+  # gone (it was left for DEL and KEYS to find).
+  defp lmove(source, destination, from_dir, to_dir, %FerricStore.Instance{} = ctx) do
+    case Ops.list_op(ctx, source, {:lmove, destination, from_dir, to_dir}) do
+      moved when is_binary(moved) and source != destination ->
+        with :ok <- maybe_cleanup_empty_list(source, ctx), do: moved
+
+      result ->
+        result
+    end
+  end
 
   defp lmove(source, destination, from_dir, to_dir, store) do
     CrossShardOp.execute(

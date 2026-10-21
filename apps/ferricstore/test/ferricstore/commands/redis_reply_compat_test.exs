@@ -140,6 +140,20 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
         assert nil == run(ctx, "LPOP", [key, "1"])
       end
 
+      test "a list emptied by RPOPLPUSH or LMOVE is gone", %{ctx: ctx, key: key} do
+        for {move, args} <- [
+              {"RPOPLPUSH", []},
+              {"LMOVE", ["LEFT", "RIGHT"]}
+            ] do
+          source = "#{key}:#{move}:src"
+          assert 1 == run(ctx, "RPUSH", [source, "a"])
+          assert "a" == run(ctx, move, [source, "#{key}:#{move}:dst" | args])
+          # HSET and DEL, unlike TYPE or EXISTS, trip over a type left behind.
+          assert 1 == run(ctx, "HSET", [source, "f", "v"])
+          assert 1 == run(ctx, "DEL", [source])
+        end
+      end
+
       test "LPOS with COUNT answers an empty array for a missing key", %{ctx: ctx, key: key} do
         assert [] == run(ctx, "LPOS", [key, "x", "COUNT", "1"])
         assert [] == run(ctx, "LPOS", [key, "x", "COUNT", "0"])

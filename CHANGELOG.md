@@ -4,6 +4,9 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Remove a list that RPOPLPUSH, LMOVE or their blocking forms emptied. Its
+  type stayed behind, so `DEL key` answered 1, KEYS listed it, and a later
+  write of another type could be refused until TYPE or EXISTS cleared it.
 - Support `ZRANK` and `ZREVRANK` with `WITHSCORE` (Redis 7.2), which answer
   the rank and the score; they answered an arity error. Inside MULTI they
   are queued only at cluster feature level 5, new in this release
