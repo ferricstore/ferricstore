@@ -4,6 +4,9 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Refuse `COPY key key` with Redis's "ERR source and destination objects are
+  the same", whether or not the key exists; it answered 0, or 1 and rewrote
+  the key with `REPLACE`.
 - Answer -1 from `BITPOS key 0 start` when the start lies past the value, as
   Redis does; it answered the value's length in bits, as if the search had
   run off the end. A search that starts inside the value without an end

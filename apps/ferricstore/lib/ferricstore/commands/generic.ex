@@ -113,6 +113,9 @@ defmodule Ferricstore.Commands.Generic do
 
   def handle("COPY", [source, destination | opts], store) do
     case parse_copy_opts(opts) do
+      {:ok, _replace?} when source == destination ->
+        copy_same_key_error()
+
       {:ok, replace?} ->
         CrossShardOp.execute(
           [{source, :read}, {destination, :write}],
@@ -215,6 +218,9 @@ defmodule Ferricstore.Commands.Generic do
   def handle_ast({:rename, key, newkey}, store), do: rename_key(key, newkey, store)
   def handle_ast({:renamenx, key, newkey}, store), do: renamenx_key(key, newkey, store)
   def handle_ast({:copy, _source, _destination, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:copy, key, key, replace?}, _store) when is_boolean(replace?),
+    do: copy_same_key_error()
 
   def handle_ast({:copy, source, destination, replace?}, store) when is_boolean(replace?) do
     CrossShardOp.execute(
@@ -630,6 +636,9 @@ defmodule Ferricstore.Commands.Generic do
   defp parse_copy_opts(_) do
     {:error, "ERR syntax error"}
   end
+
+  # Redis refuses a copy onto its own key, whether or not the key exists.
+  defp copy_same_key_error, do: {:error, "ERR source and destination objects are the same"}
 
   defp do_copy(source, destination, replace?, store) do
     case maybe_key_lifecycle(store, {:copy, source, destination, replace?}) do
