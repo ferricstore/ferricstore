@@ -140,6 +140,35 @@ defmodule FerricstoreServer.Native.FeatureLevel5MultiTest do
     assert {:ok, [1], _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
   end
 
+  test "MULTI queues SET IFEQ and IFNE", %{ctx: ctx, key: key} do
+    :ok = Dispatcher.dispatch("SET", [key, "a"], ctx)
+    state = multi()
+    state = queue(state, "SET", [key, "b", "IFEQ", "a"])
+    state = queue(state, "SET", [key, "c", "IFEQ", "a"])
+    state = queue(state, "SET", [key, "d", "IFNE", "zz", "GET"])
+
+    assert {:ok, ["OK", nil, "b"], _state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, state)
+
+    assert "d" == Dispatcher.dispatch("GET", [key], ctx)
+  end
+
+  test "concurrent SET IFEQ against one value lets one writer win", %{ctx: ctx, key: key} do
+    :ok = Dispatcher.dispatch("SET", [key, "v0"], ctx)
+
+    results =
+      1..20
+      |> Task.async_stream(
+        fn i -> Dispatcher.dispatch("SET", [key, "v#{i}", "IFEQ", "v0"], ctx) end,
+        max_concurrency: 20,
+        ordered: false
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.count(results, &(&1 == :ok)) == 1
+    assert Enum.count(results, &is_nil/1) == 19
+  end
+
   test "MULTI queues ZRANGE BYLEX", %{ctx: ctx, key: key} do
     assert 3 == Dispatcher.dispatch("ZADD", [key, "0", "a", "0", "b", "0", "c"], ctx)
     state = queue(multi(), "ZRANGE", [key, "[b", "+", "BYLEX"])

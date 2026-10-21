@@ -774,6 +774,50 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
       end
     end
 
+    describe "#{@path}: SET IFEQ and IFNE" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      test "compare the current value as Redis 8.4 does", %{ctx: ctx, key: key} do
+        :ok = run(ctx, "SET", [key, "a"])
+        assert :ok == run(ctx, "SET", [key, "b", "IFEQ", "a"])
+        assert nil == run(ctx, "SET", [key, "c", "ifeq", "a"])
+        assert "b" == run(ctx, "GET", [key])
+        assert nil == run(ctx, "SET", [key <> ":missing", "x", "IFEQ", "a"])
+        assert 0 == run(ctx, "EXISTS", [key <> ":missing"])
+        assert "b" == run(ctx, "SET", [key, "c", "IFEQ", "b", "GET"])
+        assert "c" == run(ctx, "SET", [key, "d", "IFEQ", "zz", "GET"])
+        assert nil == run(ctx, "SET", [key, "e", "IFNE", "c"])
+        assert :ok == run(ctx, "SET", [key, "f", "IFNE", "e"])
+        assert "f" == run(ctx, "GET", [key])
+        assert :ok == run(ctx, "SET", [key <> ":new", "x", "IFNE", "a"])
+        assert "x" == run(ctx, "GET", [key <> ":new"])
+        assert nil == run(ctx, "SET", [key, "g", "IFEQ", "f", "NX"])
+        assert :ok == run(ctx, "SET", [key, "g", "IFEQ", "f", "XX"])
+
+        assert {:error, "ERR syntax error"} ==
+                 run(ctx, "SET", [key, "h", "IFEQ", "g", "IFNE", "g"])
+
+        assert {:error, "ERR syntax error"} == run(ctx, "SET", [key, "h", "IFEQ"])
+      end
+
+      test "clear the TTL unless KEEPTTL or a new one", %{ctx: ctx, key: key} do
+        :ok = run(ctx, "SET", [key, "v", "EX", "100"])
+        assert :ok == run(ctx, "SET", [key, "w", "IFEQ", "v"])
+        assert -1 == run(ctx, "TTL", [key])
+        assert 1 == run(ctx, "EXPIRE", [key, "100"])
+        assert :ok == run(ctx, "SET", [key, "x", "IFEQ", "w", "KEEPTTL"])
+        assert run(ctx, "TTL", [key]) in 99..100
+        assert :ok == run(ctx, "SET", [key, "y", "IFNE", "zz", "EX", "50"])
+        assert run(ctx, "TTL", [key]) in 49..50
+      end
+
+      test "refuse other types", %{ctx: ctx, key: key} do
+        assert 1 == run(ctx, "HSET", [key, "f", "v"])
+        assert @wrongtype == run(ctx, "SET", [key, "x", "IFEQ", "a"])
+        assert @wrongtype == run(ctx, "SET", [key, "x", "IFNE", "a"])
+      end
+    end
+
     describe "#{@path}: hyperloglog" do
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 

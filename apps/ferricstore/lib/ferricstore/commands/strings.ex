@@ -805,9 +805,17 @@ defmodule Ferricstore.Commands.Strings do
   end
 
   defp do_set_parsed(key, value, parsed, store) do
+    compare = Map.get(parsed, :compare)
+
     case Compound.data_structure_status(key, store) do
       {:error, {:storage_read_failed, _reason}} = failure ->
         ReadResult.command_error(failure)
+
+      :compound when compare != nil ->
+        @wrongtype_error
+
+      :plain when compare != nil ->
+        set_compared(key, value, parsed, compare, store)
 
       :compound when parsed.get ->
         @wrongtype_error
@@ -825,6 +833,80 @@ defmodule Ferricstore.Commands.Strings do
         replace_string_key(key, value, parsed.expire_at_ms, store)
     end
   end
+
+  # SET ... IFEQ / IFNE (Redis 8.4): set only when the current value equals
+  # (or differs from) `expected`, with NX and XX applying too. The reply is
+  # OK or nil, or with GET the previous value.
+  defp set_compared(key, value, parsed, {kind, expected}, store) do
+    case Ops.get_meta(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      meta ->
+        current = if meta, do: elem(meta, 0)
+
+        if compare_allows?(kind, expected, current, parsed),
+          do: compared_reply(write_compared(key, value, parsed, meta, store), current, parsed),
+          else: compared_reply(:refused, current, parsed)
+    end
+  end
+
+  defp compare_allows?(kind, expected, current, parsed) do
+    cond do
+      parsed.nx and current != nil -> false
+      parsed.xx and current == nil -> false
+      kind == :eq -> current == expected
+      kind == :ne -> current != expected
+    end
+  end
+
+  defp compared_reply(:ok, current, %{get: true}), do: current
+  defp compared_reply(:ok, _current, _parsed), do: :ok
+  defp compared_reply({:error, _reason} = error, _current, _parsed), do: error
+  defp compared_reply(_refused, current, %{get: true}), do: current
+  defp compared_reply(_refused, _current, _parsed), do: nil
+
+  # A new key is set only if still missing (SET NX). On the instance an
+  # existing one changes through CAS against the value just read, so a
+  # concurrent write in between leaves it alone, as Redis's atomic compare
+  # would; every release applies the CAS entry alike. Elsewhere (a MULTI
+  # transaction, applied in order on every replica) the write is direct.
+  defp write_compared(key, value, parsed, nil, store) do
+    opts = %{parsed | nx: true, xx: false, get: false} |> Map.delete(:compare)
+
+    case Ops.set(store, key, value, opts) do
+      :ok -> :ok
+      {:error, _reason} = error -> error
+      _not_set -> :refused
+    end
+  end
+
+  defp write_compared(
+         key,
+         value,
+         parsed,
+         {current, old_expire_at_ms},
+         %FerricStore.Instance{} = ctx
+       ) do
+    case Ops.cas_at(ctx, key, current, value, compared_expire_at(parsed, old_expire_at_ms)) do
+      1 -> :ok
+      {:error, _reason} = error -> error
+      _changed -> :refused
+    end
+  end
+
+  defp write_compared(key, value, parsed, {_current, old_expire_at_ms}, store) do
+    case Ops.put(store, key, value, compared_expire_at(parsed, old_expire_at_ms)) do
+      :ok -> :ok
+      {:error, _reason} = error -> error
+      other -> {:error, {:unexpected_put_result, other}}
+    end
+  end
+
+  # As SET does: KEEPTTL keeps the expiry, EX/PX/EXAT/PXAT set one, and
+  # otherwise the key loses its TTL.
+  defp compared_expire_at(%{keepttl: true}, old_expire_at_ms), do: old_expire_at_ms
+  defp compared_expire_at(%{expire_at_ms: expire_at_ms}, _old), do: expire_at_ms || 0
 
   # ---------------------------------------------------------------------------
   # Private — MSET/MSETNX helpers (direct recursion, no chunked enumeration)

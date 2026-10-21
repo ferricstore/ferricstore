@@ -14,6 +14,11 @@ defmodule Ferricstore.Commands.Strings.SetOptions do
     end
   end
 
+  # IFEQ and IFNE (Redis 8.4) compare the current value; `:compare` holds
+  # {:eq | :ne, value}.
+  defp parse([compare, expected | rest], acc, default) when compare in ["IFEQ", "IFNE"],
+    do: with_compare(acc, compare, expected, &parse(rest, &1, default))
+
   defp parse(["NX" | rest], acc, default), do: parse(rest, %{acc | nx: true}, default)
   defp parse(["XX" | rest], acc, default), do: parse(rest, %{acc | xx: true}, default)
   defp parse(["GET" | rest], acc, default), do: parse(rest, %{acc | get: true}, default)
@@ -42,12 +47,24 @@ defmodule Ferricstore.Commands.Strings.SetOptions do
     parse_expiry(rest, acc, default, ts_str, 1, "set", :absolute)
   end
 
+  defp parse([compare], _acc, _default) when compare in ["IFEQ", "IFNE"],
+    do: {:error, "ERR syntax error"}
+
   defp parse([unknown | rest], acc, default) when is_binary(unknown) do
     case String.upcase(unknown) do
       ^unknown -> {:error, "ERR syntax error, option '#{unknown}' not recognized"}
       normalized -> parse([normalized | rest], acc, default)
     end
   end
+
+  defp with_compare(acc, compare, expected, continue) do
+    if Map.get(acc, :compare),
+      do: {:error, "ERR syntax error"},
+      else: continue.(Map.put(acc, :compare, {compare_kind(compare), expected}))
+  end
+
+  defp compare_kind(compare) when compare in ["IFEQ", :ifeq], do: :eq
+  defp compare_kind(compare) when compare in ["IFNE", :ifne], do: :ne
 
   defp parse_expiry(rest, acc, default, raw, multiplier, command, mode \\ :relative) do
     if acc.has_expiry do
@@ -81,6 +98,10 @@ defmodule Ferricstore.Commands.Strings.SetOptions do
       {:ok, acc}
     end
   end
+
+  defp from_ast([{compare, expected} | rest], acc, default)
+       when compare in [:ifeq, :ifne] and is_binary(expected),
+       do: with_compare(acc, compare, expected, &from_ast(rest, &1, default))
 
   defp from_ast([:nx | rest], acc, default), do: from_ast(rest, %{acc | nx: true}, default)
   defp from_ast([:xx | rest], acc, default), do: from_ast(rest, %{acc | xx: true}, default)

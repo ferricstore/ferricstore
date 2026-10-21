@@ -58,6 +58,11 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
   # ZRANGE ... BYLEX (older releases have no clause for its form).
   def required_level({:zrange, _key, {:lex, _start, _stop}, opts}) when is_map(opts), do: 5
 
+  # SET ... IFEQ / IFNE (older releases refuse the options).
+  def required_level({:set, _key, _value, opts}) when is_list(opts) do
+    if Enum.any?(opts, &match?({tag, _expected} when tag in [:ifeq, :ifne], &1)), do: 5
+  end
+
   # ZADD INCR (older releases refuse the option).
   def required_level({:zadd, _key, opts, pairs}) when is_list(opts) and is_list(pairs),
     do: if(:incr in opts, do: 5)

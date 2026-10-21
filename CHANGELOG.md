@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Support SET's IFEQ and IFNE options (Redis 8.4): set only when the
+  current value equals, or differs from, the given one (a missing key
+  counts as different), with NX, XX, GET and the expiry options. On the
+  instance an existing key changes through CAS against the value just read,
+  so concurrent writers see one outcome. Inside MULTI they are queued only
+  at cluster feature level 5.
 - Refuse EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT (and PERSIST of one with a
   TTL) on a Bloom, Cuckoo, Count-Min or Top-K key: they rewrote its
   metadata as a plain string, which deleted the structure's data and left

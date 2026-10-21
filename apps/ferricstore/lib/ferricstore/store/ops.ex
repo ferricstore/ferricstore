@@ -773,6 +773,15 @@ defmodule Ferricstore.Store.Ops do
   def cas(store, key, expected, new_val, ttl) when is_map(store),
     do: store.cas.(key, expected, new_val, ttl)
 
+  @doc """
+  CAS with an absolute expiry (0 clears the TTL), for SET IFEQ/IFNE on the
+  instance: the replicated `{:cas, ...}` entry every release applies alike.
+  """
+  @spec cas_at(FerricStore.Instance.t(), binary(), binary(), binary(), non_neg_integer()) ::
+          1 | 0 | nil | {:error, term()}
+  def cas_at(%FerricStore.Instance{} = ctx, key, expected, new_val, expire_at_ms),
+    do: Router.cas_at(ctx, key, expected, new_val, expire_at_ms)
+
   @spec lock(store(), binary(), binary(), pos_integer()) :: :ok | {:error, binary()}
   def lock(%FerricStore.Instance{} = ctx, key, owner, ttl), do: Router.lock(ctx, key, owner, ttl)
 

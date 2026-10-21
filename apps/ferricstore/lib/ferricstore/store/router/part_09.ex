@@ -1353,8 +1353,20 @@ defmodule Ferricstore.Store.Router.Part09 do
              do: checked_cas(ctx, key, expected, new_value, ttl_ms)
       end
 
+      @doc false
+      # CAS with an absolute expiry (0 clears the TTL), as SET IFEQ/IFNE needs.
+      def cas_at(ctx, key, expected, new_value, expire_at_ms)
+          when is_integer(expire_at_ms) and expire_at_ms >= 0 do
+        with :ok <- validate_string_write(ctx, key, new_value),
+             do: cas_with_expire_at(ctx, key, expected, new_value, expire_at_ms)
+      end
+
       defp checked_cas(ctx, key, expected, new_value, ttl_ms) do
         expire_at_ms = if ttl_ms, do: HLC.now_ms() + ttl_ms, else: nil
+        cas_with_expire_at(ctx, key, expected, new_value, expire_at_ms)
+      end
+
+      defp cas_with_expire_at(ctx, key, expected, new_value, expire_at_ms) do
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
         existing_expire_at_ms = existing_keydir_expire_at_ms(keydir, key)

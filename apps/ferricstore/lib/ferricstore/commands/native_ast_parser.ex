@@ -1387,11 +1387,23 @@ defmodule Ferricstore.Commands.NativeAstParser do
       "PX" -> parse_set_expiry(rest, :px, acc)
       "EXAT" -> parse_set_expiry(rest, :exat, acc)
       "PXAT" -> parse_set_expiry(rest, :pxat, acc)
+      compare when compare in ["IFEQ", "IFNE"] -> parse_set_compare(rest, compare, acc)
       _ -> {:error, "ERR syntax error"}
     end
   end
 
   defp parse_set_opts(_opts, _acc), do: {:error, "ERR syntax error"}
+
+  # IFEQ and IFNE (Redis 8.4) take the value to compare with.
+  defp parse_set_compare([expected | rest], compare, acc) do
+    tag = if compare == "IFEQ", do: :ifeq, else: :ifne
+
+    if Enum.any?(acc, &match?({tag, _value} when tag in [:ifeq, :ifne], &1)),
+      do: {:error, "ERR syntax error"},
+      else: parse_set_opts(rest, [{tag, expected} | acc])
+  end
+
+  defp parse_set_compare([], _compare, _acc), do: {:error, "ERR syntax error"}
 
   defp parse_set_expiry([value | rest], tag, acc) do
     case parse_int(value) do

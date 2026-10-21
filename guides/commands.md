@@ -296,7 +296,7 @@ Sets a string value with optional expiry and conditional flags.
 
 | | |
 |---|---|
-| **Protocol command** | `SET key value [EX seconds \| PX milliseconds \| EXAT unix-sec \| PXAT unix-ms] [NX\|XX] [GET] [KEEPTTL]` |
+| **Protocol command** | `SET key value [EX seconds \| PX milliseconds \| EXAT unix-sec \| PXAT unix-ms] [NX\|XX] [IFEQ value \| IFNE value] [GET] [KEEPTTL]` |
 | **Embedded API** | `FerricStore.set(key, value, ttl: ms)` |
 | **Return** | `+OK` on success, `_` (null) when NX/XX condition fails. With `GET`: returns old value or null. |
 | **Elixir return** | `:ok` on success, `{:ok, nil}` when condition fails |
@@ -308,6 +308,7 @@ Sets a string value with optional expiry and conditional flags.
 - `PXAT unix-ms` -- set absolute expiry as Unix timestamp in milliseconds
 - `NX` -- only set if key does not exist
 - `XX` -- only set if key already exists
+- `IFEQ value` / `IFNE value` -- only set if the current string equals / differs from `value` (Redis 8.4; a missing key counts as different); inside MULTI they need cluster feature level 5
 - `GET` -- return the old value stored at key (or null if key didn't exist)
 - `KEEPTTL` -- retain the existing TTL on the key (cannot combine with EX/PX/EXAT/PXAT)
 

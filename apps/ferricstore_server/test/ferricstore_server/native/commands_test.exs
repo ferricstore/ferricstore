@@ -5270,6 +5270,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
           {"HSETEX", [key, "FNX", "FIELDS", "1", "f", "v"]},
           {"ZADD", [key <> ":z", "INCR", "1", "m"]},
           {"ZRANGE", [key <> ":z", "-", "+", "BYLEX"]},
+          {"SET", [key <> ":s", "v", "IFEQ", "a"]},
           {"ZADD", [key <> ":z", "NX", "INCR", "1", "m"]},
           {"HGETEX", [key, "EX", "0", "FIELDS", "1", "f"]}
         ] do
