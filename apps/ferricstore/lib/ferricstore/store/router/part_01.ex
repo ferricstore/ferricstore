@@ -396,6 +396,11 @@ defmodule Ferricstore.Store.Router.Part01 do
 
       defp durable_raft_ctx?(ctx), do: default_instance?(ctx) or selected_waraft_ctx?(ctx)
 
+      @doc false
+      # Whether the instance writes through the durable Raft apply path.
+      @spec durable_raft?(FerricStore.Instance.t()) :: boolean()
+      def durable_raft?(ctx), do: durable_raft_ctx?(ctx)
+
       defp do_quorum_write(ctx, idx, command) do
         if selected_waraft_ctx?(ctx) do
           result = Ferricstore.Raft.Backend.write(idx, command)

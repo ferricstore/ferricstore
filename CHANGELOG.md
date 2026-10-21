@@ -17,9 +17,10 @@ All notable changes to FerricStore will be documented here.
   so concurrent writers see one outcome. Inside MULTI they are queued only
   at cluster feature level 5.
 - Refuse EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT (and PERSIST of one with a
-  TTL) on a Bloom, Cuckoo, Count-Min or Top-K key: they rewrote its
-  metadata as a plain string, which deleted the structure's data and left
-  a string behind. They answer an error until the expiry can change in
+  TTL) on a Bloom, Cuckoo, Count-Min or Top-K key on the durable Raft path
+  (the default instance): they rewrote its metadata as a plain string,
+  which deleted the structure's data and left a string behind. A
+  standalone instance kept the structure and still takes the expiry. They answer an error until the expiry can change in
   place. A MULTI transaction below cluster feature level 5 keeps the old
   behavior, as older replicas do. The embedded `FerricStore.expire/2` and
   `FerricStore.persist/1` refuse too (they went through a store without the

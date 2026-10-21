@@ -192,6 +192,11 @@ defmodule Ferricstore.Commands.Expiry do
 
   defp integer_range_error, do: {:error, "ERR value is not an integer or out of range"}
 
+  defp durable_raft_store?(%FerricStore.Instance{} = ctx),
+    do: Ferricstore.Store.Router.durable_raft?(ctx)
+
+  defp durable_raft_store?(_store), do: true
+
   defp rewrite_plain(key, value, expire_at_ms, store) do
     with :ok <- refuse_probabilistic(key, store) do
       case Ops.put(store, key, value, expire_at_ms) do
@@ -202,12 +207,14 @@ defmodule Ferricstore.Commands.Expiry do
   end
 
   # A Bloom, Cuckoo, Count-Min or Top-K key holds the structure's metadata;
-  # rewriting it as a string with a new expiry deleted the structure. Until
-  # the expiry can change in place, refuse wherever writes may differ from
-  # older releases (the instance, and MULTI at cluster feature level 5); a
-  # transaction below that level writes as older releases do.
+  # on the durable Raft path, rewriting it as a string with a new expiry
+  # deleted the structure. Until the expiry can change in place there, refuse
+  # wherever writes may differ from older releases (the instance, and MULTI
+  # at cluster feature level 5); a transaction below that level writes as
+  # older releases do. A standalone instance keeps the structure, so it
+  # still takes the expiry.
   defp refuse_probabilistic(key, store) do
-    if Ops.level_5_writes?(store) do
+    if Ops.level_5_writes?(store) and durable_raft_store?(store) do
       case TypeRegistry.get_type(key, store) do
         type when type in @probabilistic_types ->
           {:error, "ERR expiry is not supported on #{type} keys"}
