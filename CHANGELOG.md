@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Keep a t-digest's TTL through TDIGEST.ADD, TDIGEST.RESET and TDIGEST.MERGE;
+  they rewrote it without one, so the key no longer expired.
 - Support `ZRANGE ... BYLEX` (with REV and LIMIT), as Redis does: it
   answered "ERR ZRANGE BYLEX is not supported". It reads every member of
   the set. Inside MULTI it is queued only at cluster feature level 5.

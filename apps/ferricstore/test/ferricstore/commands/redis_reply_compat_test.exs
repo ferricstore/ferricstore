@@ -724,6 +724,22 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
       end
     end
 
+    describe "#{@path}: t-digest TTL" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      test "ADD, RESET and MERGE keep the digest's TTL", %{ctx: ctx, key: key} do
+        assert :ok = run(ctx, "TDIGEST.CREATE", [key])
+        assert 1 == run(ctx, "EXPIRE", [key, "100"])
+        assert :ok = run(ctx, "TDIGEST.ADD", [key, "1.5", "2.5"])
+        assert run(ctx, "TTL", [key]) in 99..100
+        assert :ok = run(ctx, "TDIGEST.RESET", [key])
+        assert run(ctx, "TTL", [key]) in 99..100
+        assert :ok = run(ctx, "TDIGEST.CREATE", [key <> ":src"])
+        assert :ok = run(ctx, "TDIGEST.MERGE", [key, "1", key <> ":src"])
+        assert run(ctx, "TTL", [key]) in 99..100
+      end
+    end
+
     describe "#{@path}: hyperloglog" do
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 
