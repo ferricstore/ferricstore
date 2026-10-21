@@ -403,6 +403,34 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
       end
     end
 
+    describe "#{@path}: hash field lists" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      test "HTTL and its family answer Redis's argument errors", %{ctx: ctx, key: key} do
+        :ok = run(ctx, "SET", [key <> ":s", "v"])
+        assert 1 == run(ctx, "HSET", [key, "a", "1"])
+
+        for command <- ~w(HTTL HPTTL HPERSIST HEXPIRETIME HPEXPIRETIME HGETDEL) do
+          assert @wrongtype == run(ctx, command, [key <> ":s", "FIELDS", "0", "a"]), command
+
+          for {args, message} <- [
+                {["FIELDS", "0", "a"], "ERR Number of fields must be a positive integer"},
+                {["FIELDS", "01", "a"], "ERR Number of fields must be a positive integer"},
+                {["FIELDS", "2", "a"],
+                 "ERR The `numfields` parameter must match the number of arguments"},
+                {["FOO", "1", "a"],
+                 "ERR Mandatory argument FIELDS is missing or not at the right position"}
+              ] do
+            assert {:error, message} == run(ctx, command, [key | args]),
+                   "#{command} #{inspect(args)}"
+          end
+        end
+
+        assert [-1] == run(ctx, "HTTL", [key, "fields", "1", "a"])
+        assert ["1"] == run(ctx, "HGETDEL", [key, "fields", "1", "a"])
+      end
+    end
+
     describe "#{@path}: HGETEX and HSETEX" do
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 

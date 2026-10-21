@@ -528,12 +528,11 @@ defmodule Ferricstore.Commands.NativeAstParser do
     end
   end
 
-  defp make_ast(_cmd, tag, [key, option, count | fields])
+  defp make_ast(_cmd, tag, [key | args])
        when tag in ~w(httl hpttl hpersist hexpiretime hpexpiretime hgetdel)a do
-    if String.upcase(option) == "FIELDS" do
-      parse_hash_field_list(tag, key, count, fields)
-    else
-      {tag, key, {:error, "ERR syntax error"}}
+    case HashHelpers.parse_field_list(args) do
+      {:ok, fields} -> {tag, key, fields}
+      {:error, _reason} = error -> {tag, key, error}
     end
   end
 
@@ -1474,30 +1473,10 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp parse_scan_opts(_invalid, _allow_type?, _acc), do: {:error, "ERR syntax error"}
 
-  defp parse_hash_field_list(tag, key, count, fields) do
-    case parse_hash_fields(count, fields) do
-      parsed_fields when is_list(parsed_fields) -> {tag, key, parsed_fields}
-      {:error, _} = error -> {tag, key, error}
-    end
-  end
-
   defp parse_hgetex(key, opts) do
     case HashHelpers.parse_getex(opts) do
       {:ok, mode, fields} -> {:hgetex, key, mode, fields}
       {:error, _reason} = error -> {:hgetex, key, error}
-    end
-  end
-
-  defp parse_hash_fields(count, fields) do
-    case parse_pos_int(count) do
-      count when is_integer(count) and length(fields) == count ->
-        fields
-
-      count when is_integer(count) ->
-        {:error, "ERR wrong number of arguments for hash field command"}
-
-      {:error, _} = error ->
-        error
     end
   end
 

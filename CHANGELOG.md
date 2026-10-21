@@ -4,6 +4,9 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Answer Redis's argument errors from HTTL, HPTTL, HPERSIST, HEXPIRETIME,
+  HPEXPIRETIME and HGETDEL, after the type check, and accept a lowercase
+  `fields` in every command path (the command handlers refused it).
 - Support HSETEX's Redis 8 form, `HSETEX key [FNX|FXX] [EX|PX|EXAT|PXAT|
   KEEPTTL] FIELDS n field value...`, next to FerricStore's own
   `HSETEX key seconds field value...`. At cluster feature level 5 it reads,

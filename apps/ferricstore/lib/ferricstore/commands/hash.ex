@@ -248,10 +248,9 @@ defmodule Ferricstore.Commands.Hash do
       when command in @field_expire_commands and length(args) >= 3 do
     command = String.downcase(command)
 
-    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
-         {:ok, ttl, condition, fields} <- Helpers.parse_field_expire(command, ttl, args) do
-      expire_fields(key, command, ttl, condition, fields, store)
-    end
+    with {:ok, ttl, condition, fields} <-
+           type_checked_args(key, Helpers.parse_field_expire(command, ttl, args), store),
+         do: expire_fields(key, command, ttl, condition, fields, store)
   end
 
   def handle(command, _args, _store) when command in @field_expire_commands do
@@ -264,11 +263,9 @@ defmodule Ferricstore.Commands.Hash do
 
   # Returns remaining TTL (seconds) for individual hash fields.
   # Returns: TTL >= 0, -1 = no expiry, -2 = field/key does not exist.
-  def handle("HTTL", [key, "FIELDS", count_str | fields], store) do
-    with {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
-         :ok <- Helpers.validate_field_count(count, fields) do
-      FieldOps.ttl_fields(key, fields, :seconds, store)
-    end
+  def handle("HTTL", [key | args], store) when length(args) >= 3 do
+    with {:ok, fields} <- field_list(key, args, store),
+         do: FieldOps.ttl_fields(key, fields, :seconds, store)
   end
 
   def handle("HTTL", _args, _store) do
@@ -281,11 +278,9 @@ defmodule Ferricstore.Commands.Hash do
 
   # Removes expiry from individual hash fields, making them persistent.
   # Returns: 1 = expiry removed, -1 = no expiry set, -2 = field/key does not exist.
-  def handle("HPERSIST", [key, "FIELDS", count_str | fields], store) do
-    with {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
-         :ok <- Helpers.validate_field_count(count, fields) do
-      FieldOps.persist_fields(key, fields, store)
-    end
+  def handle("HPERSIST", [key | args], store) when length(args) >= 3 do
+    with {:ok, fields} <- field_list(key, args, store),
+         do: FieldOps.persist_fields(key, fields, store)
   end
 
   def handle("HPERSIST", _args, _store) do
@@ -298,11 +293,9 @@ defmodule Ferricstore.Commands.Hash do
 
   # Returns remaining TTL (milliseconds) for individual hash fields.
   # Returns: TTL >= 0, -1 = no expiry, -2 = field/key does not exist.
-  def handle("HPTTL", [key, "FIELDS", count_str | fields], store) do
-    with {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
-         :ok <- Helpers.validate_field_count(count, fields) do
-      FieldOps.ttl_fields(key, fields, :milliseconds, store)
-    end
+  def handle("HPTTL", [key | args], store) when length(args) >= 3 do
+    with {:ok, fields} <- field_list(key, args, store),
+         do: FieldOps.ttl_fields(key, fields, :milliseconds, store)
   end
 
   def handle("HPTTL", _args, _store) do
@@ -315,18 +308,14 @@ defmodule Ferricstore.Commands.Hash do
 
   # Returns the absolute Unix timestamp (seconds) at which each field expires.
   # Returns: timestamp >= 0, -1 = no expiry, -2 = field/key does not exist.
-  def handle("HEXPIRETIME", [key, "FIELDS", count_str | fields], store) do
-    with {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
-         :ok <- Helpers.validate_field_count(count, fields) do
-      FieldOps.expiretime_fields(key, fields, :seconds, store)
-    end
+  def handle("HEXPIRETIME", [key | args], store) when length(args) >= 3 do
+    with {:ok, fields} <- field_list(key, args, store),
+         do: FieldOps.expiretime_fields(key, fields, :seconds, store)
   end
 
-  def handle("HPEXPIRETIME", [key, "FIELDS", count_str | fields], store) do
-    with {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
-         :ok <- Helpers.validate_field_count(count, fields) do
-      FieldOps.expiretime_fields(key, fields, :milliseconds, store)
-    end
+  def handle("HPEXPIRETIME", [key | args], store) when length(args) >= 3 do
+    with {:ok, fields} <- field_list(key, args, store),
+         do: FieldOps.expiretime_fields(key, fields, :milliseconds, store)
   end
 
   def handle("HPEXPIRETIME", _args, _store) do
@@ -343,11 +332,8 @@ defmodule Ferricstore.Commands.Hash do
 
   # Atomically gets the values of the specified fields and deletes them.
   # Returns a list of values (nil for missing fields).
-  def handle("HGETDEL", [key, "FIELDS", count_str | fields], store) do
-    with {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
-         :ok <- Helpers.validate_field_count(count, fields) do
-      getdel_fields(key, fields, store)
-    end
+  def handle("HGETDEL", [key | args], store) when length(args) >= 3 do
+    with {:ok, fields} <- field_list(key, args, store), do: getdel_fields(key, fields, store)
   end
 
   def handle("HGETDEL", _args, _store) do
@@ -362,9 +348,8 @@ defmodule Ferricstore.Commands.Hash do
   # expiry; a TTL of 0 or a time not after now deletes them, as HGETDEL does.
   # The options and the FIELDS block go in any order, as in Redis 8.
   def handle("HGETEX", [key | args], store) when length(args) >= 3 do
-    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
-         {:ok, mode, fields} <- Helpers.parse_getex(args),
-         do: getex(key, mode, fields, store)
+    with {:ok, mode, fields} <- type_checked_args(key, Helpers.parse_getex(args), store),
+         do: getex_checked(key, mode, fields, store)
   end
 
   def handle("HGETEX", _args, _store) do
@@ -542,25 +527,21 @@ defmodule Ferricstore.Commands.Hash do
     do: hrandfield_parsed(key, count, true, store)
 
   # Redis answers WRONGTYPE before an argument error.
-  def handle_ast({tag, key, {:error, reason}, _fields}, store)
-      when tag in @field_expire_tags do
-    with :ok <- TypeRegistry.command_check_type(key, :hash, store), do: {:error, reason}
-  end
+  def handle_ast({tag, key, {:error, _reason} = error, _fields}, store)
+      when tag in @field_expire_tags,
+      do: type_checked_args(key, error, store)
 
   def handle_ast({:hsetex, _key, {:error, reason}, _pairs}, _store), do: {:error, reason}
   # Redis answers WRONGTYPE before HGETEX's argument errors.
-  def handle_ast({:hgetex, key, {:error, reason}}, store),
-    do: with(:ok <- TypeRegistry.command_check_type(key, :hash, store), do: {:error, reason})
+  def handle_ast({:hgetex, key, {:error, _reason} = error}, store),
+    do: type_checked_args(key, error, store)
 
-  def handle_ast({:hgetex, key, {:error, reason}, _fields}, store),
-    do: with(:ok <- TypeRegistry.command_check_type(key, :hash, store), do: {:error, reason})
+  def handle_ast({:hgetex, key, {:error, _reason} = error, _fields}, store),
+    do: type_checked_args(key, error, store)
 
-  def handle_ast({:httl, _key, {:error, reason}}, _store), do: {:error, reason}
-  def handle_ast({:hpersist, _key, {:error, reason}}, _store), do: {:error, reason}
-  def handle_ast({:hpttl, _key, {:error, reason}}, _store), do: {:error, reason}
-  def handle_ast({:hexpiretime, _key, {:error, reason}}, _store), do: {:error, reason}
-  def handle_ast({:hpexpiretime, _key, {:error, reason}}, _store), do: {:error, reason}
-  def handle_ast({:hgetdel, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({tag, key, {:error, _reason} = error}, store)
+      when tag in [:httl, :hpersist, :hpttl, :hexpiretime, :hpexpiretime, :hgetdel],
+      do: type_checked_args(key, error, store)
 
   def handle_ast({tag, key, ttl, fields}, store)
       when tag in @field_expire_tags and is_integer(ttl) and ttl >= 0 and is_list(fields),
@@ -589,10 +570,8 @@ defmodule Ferricstore.Commands.Hash do
   def handle_ast({:hgetdel, key, fields}, store) when is_list(fields),
     do: getdel_fields(key, fields, store)
 
-  def handle_ast({:hgetex, key, mode, fields}, store) when is_list(fields) do
-    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
-         do: getex(key, mode, fields, store)
-  end
+  def handle_ast({:hgetex, key, mode, fields}, store) when is_list(fields),
+    do: getex_checked(key, mode, fields, store)
 
   def handle_ast({:hsetex, key, {condition, expiry}, pairs}, store)
       when condition in [nil, :fnx, :fxx] and is_list(pairs),
@@ -1072,6 +1051,25 @@ defmodule Ferricstore.Commands.Hash do
 
   defp legacy_setex(_key, _args, _store),
     do: {:error, "ERR wrong number of arguments for 'hsetex' command"}
+
+  # Redis checks the key's type before the arguments: an argument error
+  # becomes WRONGTYPE on a key of another type. (Parsed arguments go on to a
+  # command that checks the type itself.)
+  defp type_checked_args(key, {:error, _reason} = error, store),
+    do: with(:ok <- TypeRegistry.command_check_type(key, :hash, store), do: error)
+
+  defp type_checked_args(_key, parsed, _store), do: parsed
+
+  defp field_list(key, args, store),
+    do: type_checked_args(key, Helpers.parse_field_list(args), store)
+
+  # HMGET checks the type itself; the other modes check it here.
+  defp getex_checked(key, :none, fields, store), do: getex(key, :none, fields, store)
+
+  defp getex_checked(key, mode, fields, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         do: getex(key, mode, fields, store)
+  end
 
   defp getex(key, :none, fields, store), do: hmget_args([key | fields], store)
   defp getex(key, :persist, fields, store), do: FieldOps.getex_fields(fields, key, store, 0)

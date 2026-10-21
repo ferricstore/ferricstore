@@ -153,6 +153,34 @@ defmodule Ferricstore.Commands.Hash.Helpers do
   @spec setex_option?(binary()) :: boolean()
   def setex_option?(arg), do: String.upcase(arg) in ~w(FNX FXX EX PX EXAT PXAT KEEPTTL FIELDS)
 
+  @doc """
+  Parses `FIELDS count field [field ...]` for HTTL, HPTTL, HPERSIST,
+  HEXPIRETIME, HPEXPIRETIME and HGETDEL, with Redis's errors.
+  """
+  @spec parse_field_list([binary()]) :: {:ok, [binary()]} | {:error, binary()}
+  def parse_field_list([keyword, count | fields]) do
+    with :ok <- fields_keyword(keyword),
+         {:ok, count} <- field_list_count(count) do
+      if length(fields) == count,
+        do: {:ok, fields},
+        else: {:error, "ERR The `numfields` parameter must match the number of arguments"}
+    end
+  end
+
+  def parse_field_list(_args), do: fields_keyword(nil)
+
+  defp fields_keyword(keyword) when is_binary(keyword) do
+    if String.upcase(keyword) == "FIELDS", do: :ok, else: fields_keyword(nil)
+  end
+
+  defp fields_keyword(_keyword),
+    do: {:error, "ERR Mandatory argument FIELDS is missing or not at the right position"}
+
+  defp field_list_count(count) do
+    with :error <- strict_positive_integer(count),
+         do: {:error, "ERR Number of fields must be a positive integer"}
+  end
+
   defp unit_ms(unit) when unit in [:ex, :exat], do: 1_000
   defp unit_ms(unit) when unit in [:px, :pxat], do: 1
 
@@ -312,13 +340,6 @@ defmodule Ferricstore.Commands.Hash.Helpers do
   end
 
   defp strict_positive_integer(_value), do: :error
-
-  @spec validate_field_count(non_neg_integer(), [term()]) :: :ok | {:error, binary()}
-  def validate_field_count(0, []), do: :ok
-  def validate_field_count(n, [_ | rest]) when n > 0, do: validate_field_count(n - 1, rest)
-
-  def validate_field_count(_, _),
-    do: {:error, "ERR number of fields does not match the count argument"}
 
   @spec parse_cursor(binary()) ::
           {:ok, CollectionScan.cursor()} | {:error, binary()}
