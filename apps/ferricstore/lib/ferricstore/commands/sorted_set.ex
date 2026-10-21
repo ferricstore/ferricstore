@@ -131,18 +131,30 @@ defmodule Ferricstore.Commands.SortedSet do
   end
 
   # ---------------------------------------------------------------------------
-  # ZRANGE key start stop [WITHSCORES]
+  # ZRANGE key start stop [BYSCORE | BYLEX] [REV] [LIMIT offset count] [WITHSCORES]
   # ---------------------------------------------------------------------------
 
   def handle("ZRANGE", [key, start_str, stop_str | opts], store) do
-    case {Integer.parse(start_str), Integer.parse(stop_str)} do
-      {{start, ""}, {stop, ""}} ->
-        with {:ok, with_scores} <- parse_rank_range_opts(opts) do
-          zrange_rank_parsed(key, start, stop, with_scores, false, store)
+    case Helpers.parse_zrange_options(opts) do
+      {:ok, %{by: :rank, rev: reverse?, with_scores: with_scores}} ->
+        case {Integer.parse(start_str), Integer.parse(stop_str)} do
+          {{start, ""}, {stop, ""}} ->
+            zrange_rank_parsed(key, start, stop, with_scores, reverse?, store)
+
+          _ ->
+            {:error, "ERR value is not an integer or out of range"}
         end
 
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
+      # With REV the bounds come max first, as ZREVRANGEBYSCORE takes them.
+      {:ok, %{by: :score, rev: reverse?} = parsed} ->
+        command = if reverse?, do: "ZREVRANGEBYSCORE", else: "ZRANGEBYSCORE"
+        handle(command, [key, start_str, stop_str | Helpers.zrange_score_options(parsed)], store)
+
+      {:ok, %{by: :lex}} ->
+        {:error, "ERR ZRANGE BYLEX is not supported"}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 

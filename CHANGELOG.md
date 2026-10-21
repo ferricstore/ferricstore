@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Accept ZRANGE's Redis 6.2 forms: `BYSCORE` (with `(` exclusive bounds and
+  `LIMIT offset count`), `REV` for ranks and scores, in any order with
+  `WITHSCORES`. They answered a syntax or arity error; only the rank form
+  worked. `LIMIT` without `BYSCORE` answers Redis's error, and `BYLEX` is not
+  supported yet. Inside MULTI the new forms are refused (EXEC answers an
+  error and runs nothing); use ZRANGEBYSCORE or ZREVRANGE there.
 - Answer sorted set scores as Redis does: "1" instead of "1.0", "3.14"
   instead of "3.14000000000000012", "1e+20" and "1.5e-7" for very large and
   small ones. ZSCORE, ZMSCORE, ZINCRBY, ZPOPMIN, ZPOPMAX, ZSCAN and

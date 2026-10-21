@@ -10,6 +10,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   alias Ferricstore.Commands.{Catalog, CollectionScan, Extension}
   alias Ferricstore.Commands.Catalog.Entries
+  alias Ferricstore.Commands.SortedSet.Helpers, as: SortedSetHelpers
   alias Ferricstore.Flow.Query.Limits
 
   @max_flow_ref_size 4096
@@ -587,13 +588,36 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp make_ast(_cmd, tag, [key, start, stop]) when tag in ~w(zrange zrevrange)a,
     do: {tag, key, parse_int(start), parse_int(stop), false}
 
-  defp make_ast(_cmd, tag, [key, start, stop, option]) when tag in ~w(zrange zrevrange)a do
+  defp make_ast(_cmd, :zrevrange, [key, start, stop, option]) do
     with_scores =
       if String.upcase(option) == "WITHSCORES",
         do: true,
         else: {:error, "ERR syntax error"}
 
-    {tag, key, parse_int(start), parse_int(stop), with_scores}
+    {:zrevrange, key, parse_int(start), parse_int(stop), with_scores}
+  end
+
+  # ZRANGE's REV, BYSCORE and LIMIT forms parse to the ZREVRANGE and
+  # ZRANGEBYSCORE forms every release executes. (MULTI refuses them, as their
+  # form does not match ZRANGE's.)
+  defp make_ast(cmd, :zrange, [key, start, stop | options]) do
+    case SortedSetHelpers.parse_zrange_options(options) do
+      {:ok, %{by: :rank, rev: false, with_scores: with_scores}} ->
+        {:zrange, key, parse_int(start), parse_int(stop), with_scores}
+
+      {:ok, %{by: :rank, rev: true, with_scores: with_scores}} ->
+        {:zrevrange, key, parse_int(start), parse_int(stop), with_scores}
+
+      {:ok, %{by: :score, rev: reverse?} = parsed} ->
+        tag = if reverse?, do: :zrevrangebyscore, else: :zrangebyscore
+        make_ast(cmd, tag, [key, start, stop | SortedSetHelpers.zrange_score_options(parsed)])
+
+      {:ok, %{by: :lex}} ->
+        {:zrange, key, {:error, "ERR ZRANGE BYLEX is not supported"}, nil}
+
+      {:error, reason} ->
+        {:zrange, key, {:error, reason}, nil}
+    end
   end
 
   defp make_ast("MEMORY", :memory, [subcmd | rest]), do: {:memory, [String.upcase(subcmd) | rest]}

@@ -5127,6 +5127,39 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert Router.get(FerricStore.Instance.get(:default), key) == nil
   end
 
+  # These forms parse to ZREVRANGE and ZRANGEBYSCORE, which a transaction
+  # entry for ZRANGE may not carry; EXEC refuses before anything is applied.
+  test "native MULTI refuses ZRANGE's REV and BYSCORE forms whole and runs the plain one" do
+    key = "{multi-zrange:#{System.unique_integer([:positive])}}"
+    ctx = FerricStore.Instance.get(:default)
+    assert 2 == Ferricstore.Commands.Dispatcher.dispatch("ZADD", [key, "1", "a", "2", "b"], ctx)
+
+    for args <- [[key, "0", "-1", "REV"], [key, "0", "5", "BYSCORE"]] do
+      assert {:ok, "OK", state} =
+               Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+      assert {:ok, "QUEUED", state} =
+               Session.execute(%{"command" => "SET", "args" => [key <> ":w", "v"]}, state)
+
+      assert {:ok, "QUEUED", state} =
+               Session.execute(%{"command" => "ZRANGE", "args" => args}, state)
+
+      assert {:error, "ERR command 'zrange' is not supported inside transactions", _state} =
+               Session.execute(%{"command" => "EXEC", "args" => []}, state)
+
+      assert nil == Router.get(ctx, key <> ":w")
+    end
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(%{"command" => "ZRANGE", "args" => [key, "0", "-1"]}, state)
+
+    assert {:ok, [["a", "b"]], _state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, state)
+  end
+
   test "native MULTI refuses forms older releases apply differently below level 4" do
     key = "{native-multi-compat:#{System.unique_integer([:positive, :monotonic])}}"
     assert :ok = FerricStore.set(key, "v")

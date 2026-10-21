@@ -64,6 +64,49 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
     ArithmeticError -> :overflow
   end
 
+  @doc """
+  Parses ZRANGE's options after `start stop`, as Redis does:
+  `[BYSCORE | BYLEX] [REV] [LIMIT offset count] [WITHSCORES]` in any order.
+  LIMIT needs BYSCORE or BYLEX; the offset and count are checked by the
+  range they run with.
+  """
+  def parse_zrange_options(options),
+    do: parse_zrange_options(options, %{by: :rank, rev: false, limit: nil, with_scores: false})
+
+  defp parse_zrange_options([], %{limit: limit, by: :rank}) when limit != nil,
+    do:
+      {:error,
+       "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX"}
+
+  defp parse_zrange_options([], %{with_scores: true, by: :lex}),
+    do: {:error, "ERR syntax error, WITHSCORES not supported in combination with BYLEX"}
+
+  defp parse_zrange_options([], parsed), do: {:ok, parsed}
+
+  defp parse_zrange_options([option | rest], parsed) when is_binary(option) do
+    case {String.upcase(option), rest} do
+      {"WITHSCORES", rest} -> parse_zrange_options(rest, %{parsed | with_scores: true})
+      {"BYSCORE", rest} -> parse_zrange_options(rest, %{parsed | by: :score})
+      {"BYLEX", rest} -> parse_zrange_options(rest, %{parsed | by: :lex})
+      {"REV", rest} -> parse_zrange_options(rest, %{parsed | rev: true})
+      {"LIMIT", [offset, count | rest]} -> parse_zrange_options(rest, %{parsed | limit: {offset, count}})
+      _other -> {:error, "ERR syntax error"}
+    end
+  end
+
+  defp parse_zrange_options(_options, _parsed), do: {:error, "ERR syntax error"}
+
+  @doc "The ZRANGEBYSCORE options that carry a parsed ZRANGE's LIMIT and WITHSCORES."
+  def zrange_score_options(%{limit: limit, with_scores: with_scores}) do
+    limit_options =
+      case limit do
+        {offset, count} -> ["LIMIT", offset, count]
+        nil -> []
+      end
+
+    if with_scores, do: ["WITHSCORES" | limit_options], else: limit_options
+  end
+
   def parse_score_bound("-inf"), do: {:ok, :neg_infinity, false}
   def parse_score_bound("+inf"), do: {:ok, :infinity, false}
   def parse_score_bound("inf"), do: {:ok, :infinity, false}
