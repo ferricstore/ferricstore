@@ -206,8 +206,7 @@ defmodule Ferricstore.Raft.PromotedFileSyncTest do
       Application.put_env(:ferricstore, :waraft_storage_metadata_persist_every, 1)
       assert 1 == Dispatcher.dispatch("SADD", [key, "second"], ctx)
 
-      # The storage persists its position after the write's reply goes out.
-      assert_receive {:fsync, :file, ^path, _storage_pid}, 10_000
+      assert :ok == await_file_sync(ctx, key, path)
       assert :ok == wait_untracked(table)
       assert ["1", "1"] == Enum.map(["first", "second"], &sismember(ctx, key, &1))
     end
@@ -324,6 +323,24 @@ defmodule Ferricstore.Raft.PromotedFileSyncTest do
     :ferricstore_waraft_backend
     |> :wa_raft_part_sup.registered_partition_path(Router.shard_for(ctx, key) + 1)
     |> to_string()
+  end
+
+  # The storage persists its position, syncing the file first, once the
+  # entry's replay dependencies are durable; until then it waits for a later
+  # write to carry the persist. Small writes on the same shard supply them
+  # without touching the large set's file.
+  defp await_file_sync(ctx, key, path, tries \\ 50) do
+    receive do
+      {:fsync, :file, ^path, _storage_pid} -> :ok
+    after
+      200 ->
+        if tries == 0 do
+          :timeout
+        else
+          :ok = Dispatcher.dispatch("SET", [key <> ":nudge", Integer.to_string(tries)], ctx)
+          await_file_sync(ctx, key, path, tries - 1)
+        end
+    end
   end
 
   defp wait_untracked(table, tries \\ 200) do
