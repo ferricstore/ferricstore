@@ -680,6 +680,24 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
     end
 
     describe "#{@path}: argument error texts" do
+      test "malformed generic commands answer the arity error", %{ctx: ctx, key: key} do
+        for {command, args} <- [
+              {"RANDOMKEY", ["x"]},
+              {"RENAME", [key]},
+              {"RENAMENX", [key]},
+              {"COPY", [key]},
+              {"SCAN", []},
+              {"WAIT", ["0"]},
+              {"EXPIRETIME", []},
+              {"PEXPIRETIME", [key, key]}
+            ] do
+          assert {:error,
+                  "ERR wrong number of arguments for '#{String.downcase(command)}' command"} ==
+                   run(ctx, command, args),
+                 command
+        end
+      end
+
       test "negative LPOS and SINTERCARD options name the option", %{ctx: ctx, key: key} do
         assert 1 == run(ctx, "LPUSH", [key <> ":l", "a"])
 

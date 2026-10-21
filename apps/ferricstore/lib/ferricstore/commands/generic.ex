@@ -260,6 +260,10 @@ defmodule Ferricstore.Commands.Generic do
   def handle_ast({:wait, _numreplicas, _timeout}, _store),
     do: {:error, "ERR value is not an integer or out of range"}
 
+  # The parser keeps a call with the wrong argument count as {tag, args}.
+  def handle_ast({tag, args}, _store) when is_atom(tag) and is_list(args),
+    do: {:error, "ERR wrong number of arguments for '#{tag}' command"}
+
   def handle_ast(_ast, _store), do: {:error, "ERR unsupported generic command AST"}
 
   defp type_key(key, store) do

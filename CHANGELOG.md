@@ -4,6 +4,9 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- RANDOMKEY with arguments (and other generic commands parsed with the wrong
+  argument count) answered "ERR unsupported generic command AST"; they now
+  answer Redis's "ERR wrong number of arguments for '<command>' command".
 - GEO argument errors use Redis's texts: GEOADD prints an invalid pair with
   six decimals and answers "ERR syntax error" for XX with NX; GEOSEARCH
   answers "ERR COUNT must be > 0" and "ERR radius cannot be negative". A zero
