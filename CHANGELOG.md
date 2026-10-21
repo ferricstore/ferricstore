@@ -14,6 +14,12 @@ All notable changes to FerricStore will be documented here.
   fail and use up the budget. Ten failed attempts a minute per address and
   per user are still the limit, and an attempt waiting its turn never checks
   a password early.
+- Check an HTTP client's password once per address. Each new HTTP connection
+  ran its own password check (PBKDF2, about 50 ms), even when the same
+  credentials had just been checked for another connection from the same
+  address. Connections presenting the same credentials from one address now
+  share one check and each still gets a session carrying its own peer; a
+  password or ACL change still forces every connection to authenticate again.
 - Refuse keys over the 65,535-byte key size limit for hash, set, sorted set,
   list and stream writes through the TCP and HTTP gateways, as SET already
   did ("ERR key too large"); HSET, SADD, ZADD, RPUSH and XADD accepted them.

@@ -485,6 +485,60 @@ defmodule FerricstoreHttp.OssIntegrationTest do
     assert %{"error" => %{"code" => "rate_limited"}} = Jason.decode!(body)
   end
 
+  test "a pool of connections opening at once all authenticate" do
+    previous_max_attempts = Application.get_env(:ferricstore, :auth_rate_limit_max_attempts)
+
+    Application.put_env(:ferricstore, :auth_rate_limit_max_attempts, 2)
+    :ok = AuthRateLimiter.reset()
+
+    on_exit(fn ->
+      restore_env(:auth_rate_limit_max_attempts, previous_max_attempts)
+      AuthRateLimiter.reset()
+    end)
+
+    :ok = CatalogProjector.mark_ready()
+    unique = System.unique_integer([:positive, :monotonic])
+    username = "http-pool-#{unique}"
+    password = "integration-secret"
+    configure_all_command_user(username, password, "~*")
+    HttpHelpers.start_server(backend: FerricstoreHttp.Backends.Ferricstore)
+
+    body =
+      Jason.encode!(%{
+        "encoding" => BinaryEnvelope.encoding(),
+        "commands" => BinaryEnvelope.encode([["PING"]])
+      })
+
+    {"authorization", authorization} = HttpHelpers.basic(username, password)
+
+    request = [
+      "POST /v1/commands HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: ",
+      authorization,
+      "\r\ncontent-type: application/json\r\ncontent-length: ",
+      Integer.to_string(byte_size(body)),
+      "\r\n\r\n",
+      body
+    ]
+
+    statuses =
+      1..20
+      |> Enum.map(fn _connection ->
+        Task.async(fn ->
+          {:ok, socket} = HttpHelpers.connect()
+
+          try do
+            {:ok, status, _headers, _body} = HttpHelpers.raw_request(socket, request, 10_000)
+            status
+          after
+            :gen_tcp.close(socket)
+          end
+        end)
+      end)
+      |> Task.await_many(15_000)
+
+    assert Enum.frequencies(statuses) == %{200 => 20}
+  end
+
   defp command_request(username, password, commands) do
     envelope = %{
       "encoding" => BinaryEnvelope.encoding(),

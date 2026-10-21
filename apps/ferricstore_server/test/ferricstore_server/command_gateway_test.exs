@@ -973,6 +973,26 @@ defmodule FerricstoreServer.CommandGatewayTest do
              CommandGateway.execute_batch(session, [["PING"]])
   end
 
+  test "a session bound to another connection keeps its credential generation" do
+    put_http_user("pooled", "old-secret", ["+@all"])
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("pooled", "old-secret", peer: peer())
+
+    other_peer = {{127, 0, 0, 1}, 50_123}
+    bound = AuthenticationGateway.bind_peer(session, other_peer)
+
+    assert {:ok, [%{status: :ok, value: "PONG"}]} =
+             CommandGateway.execute_batch(bound, [["PING"]])
+
+    assert %AuthenticationGateway.Session{peer: ^other_peer} = bound
+
+    assert :ok = FerricstoreServer.Acl.set_user("pooled", [">new-secret"])
+
+    assert {:error, :reauthentication_required} =
+             CommandGateway.execute_batch(bound, [["PING"]])
+  end
+
   test "reuses the immutable ACL snapshot while the credential epoch is unchanged" do
     put_http_user("stable", "secret")
     assert {:ok, session} = AuthenticationGateway.authenticate("stable", "secret", peer: peer())
