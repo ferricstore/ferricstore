@@ -140,6 +140,34 @@ defmodule FerricstoreServer.Native.FeatureLevel5MultiTest do
     assert {:ok, [1], _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
   end
 
+  test "MULTI queues ZADD INCR", %{ctx: ctx, key: key} do
+    state = multi()
+    state = queue(state, "ZADD", [key, "INCR", "2", "m"])
+    state = queue(state, "ZADD", [key, "NX", "INCR", "1", "m"])
+    state = queue(state, "ZADD", [key, "GT", "INCR", "1.5", "m"])
+
+    assert {:ok, ["2", nil, "3.5"], _state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, state)
+
+    assert "3.5" == Dispatcher.dispatch("ZSCORE", [key, "m"], ctx)
+  end
+
+  # At level 5 a conditional ZADD INCR reads, decides and writes as one
+  # replicated entry; concurrent NX writers must see one winner.
+  test "concurrent ZADD NX INCR on one member adds it once", %{ctx: ctx, key: key} do
+    results =
+      1..20
+      |> Task.async_stream(
+        fn _i -> Dispatcher.dispatch("ZADD", [key, "NX", "INCR", "1", "m"], ctx) end,
+        max_concurrency: 20,
+        ordered: false
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.count(results, &(&1 == "1")) == 1
+    assert Enum.count(results, &is_nil/1) == 19
+  end
+
   defp multi do
     {:ok, "OK", state} = Session.execute(%{"command" => "MULTI", "args" => []}, session_state())
     state

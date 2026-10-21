@@ -28,7 +28,7 @@ HSETNX, HSTRLEN, HRANDFIELD, HSCAN, HEXPIRE, HTTL, HPERSIST, HPEXPIRE, HPTTL, HE
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, LINDEX, LSET, LREM, LTRIM, LPOS, LINSERT, LMOVE, RPOPLPUSH, LPUSHX, RPUSHX,
 SADD, SREM, SMEMBERS, SISMEMBER, SMISMEMBER, SCARD, SRANDMEMBER, SPOP, SDIFF, SINTER, SUNION,
 SDIFFSTORE, SINTERSTORE, SUNIONSTORE, SINTERCARD, SMOVE, SSCAN,
-ZADD (NX/XX/GT/LT/CH), ZSCORE, ZRANK, ZREVRANK, ZRANGE, ZREVRANGE, ZCARD, ZREM, ZINCRBY,
+ZADD (NX/XX/GT/LT/CH/INCR), ZSCORE, ZRANK, ZREVRANK, ZRANGE, ZREVRANGE, ZCARD, ZREM, ZINCRBY,
 ZCOUNT, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZMSCORE, ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZSCAN,
 XADD, XLEN, XRANGE, XREVRANGE, XREAD (including BLOCK), XTRIM, XDEL, XINFO STREAM,
 XGROUP CREATE, XREADGROUP, XACK,
@@ -848,7 +848,7 @@ Adds members with scores. Supports all FerricStore modifier flags.
 
 | | |
 |---|---|
-| **Protocol command** | `ZADD key [NX\|XX] [GT\|LT] [CH] score member [score member ...]` |
+| **Protocol command** | `ZADD key [NX\|XX] [GT\|LT] [CH] [INCR] score member [score member ...]` |
 | **Embedded API** | `FerricStore.zadd(key, [{score, member}, ...])` |
 | **Return** | Integer -- count of elements added (or added+changed with CH) |
 | **Elixir return** | `{:ok, integer()}` |
@@ -859,6 +859,7 @@ Adds members with scores. Supports all FerricStore modifier flags.
 - `GT` -- only update when new score > current score
 - `LT` -- only update when new score < current score
 - `CH` -- return count of added + changed (instead of just added)
+- `INCR` -- add the score to the member's, as ZINCRBY does (one pair only); answers the new score, or nil when NX, XX, GT or LT refuses it
 
 **Status:** Supported.
 

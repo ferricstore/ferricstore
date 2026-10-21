@@ -56,6 +56,38 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
       end
     end
 
+    describe "#{@path}: ZADD INCR" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      test "increments like ZINCRBY, under NX, XX, GT and LT", %{ctx: ctx, key: key} do
+        assert "5" == run(ctx, "ZADD", [key, "INCR", "5", "a"])
+        assert "7.5" == run(ctx, "ZADD", [key, "incr", "2.5", "a"])
+
+        assert {:error, "ERR INCR option supports a single increment-element pair"} ==
+                 run(ctx, "ZADD", [key, "INCR", "1", "a", "2", "b"])
+
+        assert nil == run(ctx, "ZADD", [key, "NX", "INCR", "1", "a"])
+        assert "1" == run(ctx, "ZADD", [key, "NX", "INCR", "1", "c"])
+        assert "8.5" == run(ctx, "ZADD", [key, "XX", "INCR", "1", "a"])
+        assert nil == run(ctx, "ZADD", [key, "XX", "INCR", "1", "d"])
+        assert nil == run(ctx, "ZADD", [key, "GT", "INCR", "-1", "a"])
+        assert "9.5" == run(ctx, "ZADD", [key, "GT", "INCR", "1", "a"])
+        assert nil == run(ctx, "ZADD", [key, "LT", "INCR", "1", "a"])
+        assert "-90.5" == run(ctx, "ZADD", [key, "LT", "INCR", "-100", "a"])
+        assert "-89.5" == run(ctx, "ZADD", [key, "CH", "INCR", "1", "a"])
+        assert ["a", "-89.5", "c", "1"] == run(ctx, "ZRANGE", [key, "0", "-1", "WITHSCORES"])
+
+        assert {:error, "ERR value is not a valid float"} ==
+                 run(ctx, "ZADD", [key, "INCR", "x", "a"])
+
+        fresh = key <> ":fresh"
+        assert nil == run(ctx, "ZADD", [fresh, "XX", "INCR", "1", "a"])
+        assert 0 == run(ctx, "EXISTS", [fresh])
+        :ok = run(ctx, "SET", [key <> ":s", "v"])
+        assert @wrongtype == run(ctx, "ZADD", [key <> ":s", "INCR", "1", "a"])
+      end
+    end
+
     describe "#{@path}: ZRANGE with Redis 6.2 options" do
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 

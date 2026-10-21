@@ -1284,14 +1284,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
           else: {:error, "ERR invalid compound command"}
       end
 
-      # HSETEX joined the entry at level 5; releases before it refuse it.
-      defp require_compound_command_level(state, {:hsetex, _key, _options, _pairs}) do
+      # HSETEX and ZADD INCR joined the entry at level 5; releases before it
+      # refuse them.
+      defp require_compound_command_level(state, {:hsetex, _key, _options, _pairs}),
+        do: require_feature_level_5(state)
+
+      defp require_compound_command_level(state, {:zadd, _key, opts, _pairs})
+           when is_list(opts) do
+        if :incr in opts,
+          do: require_feature_level_5(state),
+          else: require_feature_level_4(state)
+      end
+
+      defp require_compound_command_level(state, _ast), do: require_feature_level_4(state)
+
+      defp require_feature_level_5(state) do
         if feature_level_5?(state),
           do: :ok,
           else: {:error, "ERR this command requires cluster feature level 5"}
       end
-
-      defp require_compound_command_level(state, _ast), do: require_feature_level_4(state)
 
       defp require_feature_level_4(state) do
         if feature_level_4?(state),

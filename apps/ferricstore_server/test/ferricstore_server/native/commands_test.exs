@@ -5249,6 +5249,8 @@ defmodule FerricstoreServer.Native.CommandsTest do
           {"HEXPIRE", [key, "0", "FIELDS", "1", "f"]},
           {"HEXPIRE", [key, "10", "NX", "FIELDS", "1", "f"]},
           {"HSETEX", [key, "FNX", "FIELDS", "1", "f", "v"]},
+          {"ZADD", [key <> ":z", "INCR", "1", "m"]},
+          {"ZADD", [key <> ":z", "NX", "INCR", "1", "m"]},
           {"HGETEX", [key, "EX", "0", "FIELDS", "1", "f"]}
         ] do
       assert {:error, hexpire_message, _state} =

@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Support `ZADD ... INCR`, alone or with NX, XX, GT and LT, as Redis does:
+  it answers the new score, or nil when a condition refuses it. With a
+  condition it runs as one replicated entry at cluster feature level 5, and
+  inside MULTI it is queued only at that level. ZADD's option errors now use
+  Redis's texts ("GT, LT, and/or NX ...", "syntax error" for an odd count).
 - Read stream IDs as Redis does. In XADD, `5` means 5-0 (it took the next
   sequence, as `5-*` does in Redis, which FerricStore refused) and `5-*`
   takes the next sequence; XDEL matches `5` and `05-01` to 5-0 and 5-1 (it

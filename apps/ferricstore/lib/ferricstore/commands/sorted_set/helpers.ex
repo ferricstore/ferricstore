@@ -39,7 +39,7 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
   def score_string_pairs_to_flat_list(pairs), do: score_string_pairs_to_flat_list(pairs, [])
 
   def parse_zadd_opts(args) do
-    parse_zadd_opts(args, %{nx: false, xx: false, gt: false, lt: false, ch: false})
+    parse_zadd_opts(args, %{nx: false, xx: false, gt: false, lt: false, ch: false, incr: false})
   end
 
   def parse_score(str) do
@@ -223,10 +223,11 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
   defp parse_zadd_opts(["GT" | rest], opts), do: parse_zadd_opts(rest, %{opts | gt: true})
   defp parse_zadd_opts(["LT" | rest], opts), do: parse_zadd_opts(rest, %{opts | lt: true})
   defp parse_zadd_opts(["CH" | rest], opts), do: parse_zadd_opts(rest, %{opts | ch: true})
+  defp parse_zadd_opts(["INCR" | rest], opts), do: parse_zadd_opts(rest, %{opts | incr: true})
 
   defp parse_zadd_opts([opt | rest], opts) when is_binary(opt) do
     case String.upcase(opt) do
-      normalized when normalized in ["NX", "XX", "GT", "LT", "CH"] ->
+      normalized when normalized in ["NX", "XX", "GT", "LT", "CH", "INCR"] ->
         parse_zadd_opts([normalized | rest], opts)
 
       _not_option ->
@@ -243,16 +244,22 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
         {:error, "ERR XX and NX options at the same time are not compatible"}
 
       opts.gt and opts.lt ->
-        {:error, "ERR GT, LT, and NX options at the same time are not compatible"}
+        {:error, "ERR GT, LT, and/or NX options at the same time are not compatible"}
 
       opts.gt and opts.nx ->
-        {:error, "ERR GT, LT, and NX options at the same time are not compatible"}
+        {:error, "ERR GT, LT, and/or NX options at the same time are not compatible"}
 
       opts.lt and opts.nx ->
-        {:error, "ERR GT, LT, and NX options at the same time are not compatible"}
+        {:error, "ERR GT, LT, and/or NX options at the same time are not compatible"}
 
-      rem(length(score_member_args), 2) != 0 or score_member_args == [] ->
+      score_member_args == [] ->
         {:error, "ERR wrong number of arguments for 'zadd' command"}
+
+      rem(length(score_member_args), 2) != 0 ->
+        {:error, "ERR syntax error"}
+
+      opts.incr and length(score_member_args) > 2 ->
+        {:error, "ERR INCR option supports a single increment-element pair"}
 
       true ->
         pairs =

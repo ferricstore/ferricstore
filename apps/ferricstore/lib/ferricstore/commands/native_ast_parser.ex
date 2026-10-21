@@ -1523,7 +1523,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp split_zadd_opts([opt | rest] = args, acc) do
     case String.upcase(opt) do
-      normalized when normalized in ["NX", "XX", "GT", "LT", "CH"] ->
+      normalized when normalized in ["NX", "XX", "GT", "LT", "CH", "INCR"] ->
         split_zadd_opts(rest, [normalized |> String.downcase() |> String.to_atom() | acc])
 
       _not_option ->

@@ -47,62 +47,16 @@ defmodule Ferricstore.Commands.SortedSet do
   # ---------------------------------------------------------------------------
 
   def handle("ZADD", [key | rest], store) when rest != [] do
-    with {:ok, opts, score_member_pairs} <- Helpers.parse_zadd_opts(rest),
-         type_status when type_status in [:ok, {:ok, :created}] <-
-           TypeRegistry.command_check_or_set_status(key, :zset, store) do
-      unique_members =
-        score_member_pairs |> Enum.map(fn {_score, member} -> member end) |> Enum.uniq()
+    case Helpers.parse_zadd_opts(rest) do
+      {:ok, %{incr: true} = opts, pairs} ->
+        flags = for flag <- [:nx, :xx, :gt, :lt, :ch, :incr], Map.fetch!(opts, flag), do: flag
+        zadd_incr(key, flags, pairs, store)
 
-      compound_keys = Enum.map(unique_members, &CompoundKey.zset_member(key, &1))
+      {:ok, opts, score_member_pairs} ->
+        zadd_args(key, opts, score_member_pairs, store)
 
-      with {:ok, current_values} <-
-             read_zadd_current_values(key, compound_keys, store, type_status) do
-        current_by_member = zset_current_by_member(unique_members, current_values, %{})
-
-        {added, changed, _current_by_member, writes_by_member} =
-          Enum.reduce(score_member_pairs, {0, 0, current_by_member, %{}}, fn {score, member},
-                                                                             {add_acc, ch_acc,
-                                                                              current_acc,
-                                                                              writes_acc} ->
-            existing = Map.get(current_acc, member)
-            score_str = Float.to_string(score)
-
-            cond do
-              # NX: only add new elements, don't update existing
-              opts.nx and existing != nil ->
-                {add_acc, ch_acc, current_acc, writes_acc}
-
-              # XX: only update existing elements, don't add new
-              opts.xx and existing == nil ->
-                {add_acc, ch_acc, current_acc, writes_acc}
-
-              existing == nil ->
-                {add_acc + 1, ch_acc, Map.put(current_acc, member, score_str),
-                 Map.put(writes_acc, member, score_str)}
-
-              true ->
-                existing_score = Helpers.parse_stored_score(existing)
-
-                should_update =
-                  cond do
-                    opts.gt -> score > existing_score
-                    opts.lt -> score < existing_score
-                    true -> true
-                  end
-
-                if should_update and score != existing_score do
-                  {add_acc, ch_acc + 1, Map.put(current_acc, member, score_str),
-                   Map.put(writes_acc, member, score_str)}
-                else
-                  {add_acc, ch_acc, current_acc, writes_acc}
-                end
-            end
-          end)
-
-        write_entries = zset_write_entries(unique_members, compound_keys, writes_by_member, [])
-        result = if opts.ch, do: added + changed, else: added
-        persist_zadd_entries(key, write_entries, result, store, type_status)
-      end
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -698,9 +652,124 @@ defmodule Ferricstore.Commands.SortedSet do
     {:error, "ERR wrong number of arguments for 'zrem' command"}
   end
 
+  defp zadd_args(key, opts, score_member_pairs, store) do
+    with type_status when type_status in [:ok, {:ok, :created}] <-
+           TypeRegistry.command_check_or_set_status(key, :zset, store) do
+      unique_members =
+        score_member_pairs |> Enum.map(fn {_score, member} -> member end) |> Enum.uniq()
+
+      compound_keys = Enum.map(unique_members, &CompoundKey.zset_member(key, &1))
+
+      with {:ok, current_values} <-
+             read_zadd_current_values(key, compound_keys, store, type_status) do
+        current_by_member = zset_current_by_member(unique_members, current_values, %{})
+
+        {added, changed, _current_by_member, writes_by_member} =
+          Enum.reduce(score_member_pairs, {0, 0, current_by_member, %{}}, fn {score, member},
+                                                                             {add_acc, ch_acc,
+                                                                              current_acc,
+                                                                              writes_acc} ->
+            existing = Map.get(current_acc, member)
+            score_str = Float.to_string(score)
+
+            cond do
+              # NX: only add new elements, don't update existing
+              opts.nx and existing != nil ->
+                {add_acc, ch_acc, current_acc, writes_acc}
+
+              # XX: only update existing elements, don't add new
+              opts.xx and existing == nil ->
+                {add_acc, ch_acc, current_acc, writes_acc}
+
+              existing == nil ->
+                {add_acc + 1, ch_acc, Map.put(current_acc, member, score_str),
+                 Map.put(writes_acc, member, score_str)}
+
+              true ->
+                existing_score = Helpers.parse_stored_score(existing)
+
+                should_update =
+                  cond do
+                    opts.gt -> score > existing_score
+                    opts.lt -> score < existing_score
+                    true -> true
+                  end
+
+                if should_update and score != existing_score do
+                  {add_acc, ch_acc + 1, Map.put(current_acc, member, score_str),
+                   Map.put(writes_acc, member, score_str)}
+                else
+                  {add_acc, ch_acc, current_acc, writes_acc}
+                end
+            end
+          end)
+
+        write_entries = zset_write_entries(unique_members, compound_keys, writes_by_member, [])
+        result = if opts.ch, do: added + changed, else: added
+        persist_zadd_entries(key, write_entries, result, store, type_status)
+      end
+    end
+  end
+
+  # ZADD ... INCR adds the increment to the member's score as ZINCRBY does,
+  # answering the new score, or nil when NX, XX, GT or LT refuses it.
+  defp zadd_incr(key, opts, [{increment, member}], store) do
+    if Enum.any?(opts, &(&1 in [:nx, :xx, :gt, :lt])),
+      do: conditional_zadd_incr(key, opts, increment, member, store),
+      else: zincrby_key(key, increment, member, store)
+  end
+
+  # At cluster feature level 5 the condition and the increment run as one
+  # replicated entry, so concurrent clients each see one outcome; older
+  # releases do not apply ZADD INCR there.
+  defp conditional_zadd_incr(key, opts, increment, member, %FerricStore.Instance{} = ctx) do
+    case Ops.compound_command(ctx, key, {:zadd, key, opts, [{increment, member}]}, 5) do
+      :unsupported -> checked_zadd_incr(key, opts, increment, member, ctx)
+      result -> result
+    end
+  end
+
+  defp conditional_zadd_incr(key, opts, increment, member, store),
+    do: checked_zadd_incr(key, opts, increment, member, store)
+
+  defp checked_zadd_incr(key, opts, increment, member, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :zset, store) do
+      case Ops.compound_get(store, key, CompoundKey.zset_member(key, member)) do
+        {:error, {:storage_read_failed, _reason}} = failure ->
+          ReadResult.command_error(failure)
+
+        stored ->
+          current = if stored, do: Helpers.parse_stored_score(stored)
+
+          if zadd_incr_allowed?(opts, current, increment),
+            do: zincrby_key(key, increment, member, store),
+            else: nil
+      end
+    end
+  end
+
+  defp zadd_incr_allowed?(opts, nil, _increment), do: :xx not in opts
+
+  defp zadd_incr_allowed?(opts, current, increment) do
+    cond do
+      :nx in opts -> false
+      :gt in opts -> current + increment > current
+      :lt in opts -> current + increment < current
+      true -> true
+    end
+  end
+
+  defp zincrby_key(key, increment, member, store) do
+    with type_status when type_status in [:ok, {:ok, :created}] <-
+           TypeRegistry.command_check_or_set_status(key, :zset, store),
+         do: zincrby_member(key, increment, member, store, type_status)
+  end
+
   defp zadd_parsed(key, opts, score_member_pairs, store) do
     with :ok <- validate_zadd_ast(opts, score_member_pairs) do
-      zadd_validated(key, opts, score_member_pairs, store)
+      if :incr in opts,
+        do: zadd_incr(key, opts, score_member_pairs, store),
+        else: zadd_validated(key, opts, score_member_pairs, store)
     end
   end
 
@@ -1174,17 +1243,20 @@ defmodule Ferricstore.Commands.SortedSet do
   defp validate_zadd_ast(opts, score_member_pairs)
        when is_list(opts) and is_list(score_member_pairs) do
     cond do
-      Enum.any?(opts, &(&1 not in [:nx, :xx, :gt, :lt, :ch])) ->
+      Enum.any?(opts, &(&1 not in [:nx, :xx, :gt, :lt, :ch, :incr])) ->
         {:error, "ERR syntax error"}
 
       :nx in opts and :xx in opts ->
         {:error, "ERR XX and NX options at the same time are not compatible"}
 
       (:gt in opts and :lt in opts) or (:nx in opts and (:gt in opts or :lt in opts)) ->
-        {:error, "ERR GT, LT, and NX options at the same time are not compatible"}
+        {:error, "ERR GT, LT, and/or NX options at the same time are not compatible"}
 
       score_member_pairs == [] ->
         {:error, "ERR wrong number of arguments for 'zadd' command"}
+
+      :incr in opts and length(score_member_pairs) > 1 ->
+        {:error, "ERR INCR option supports a single increment-element pair"}
 
       true ->
         validate_zadd_pairs(score_member_pairs)

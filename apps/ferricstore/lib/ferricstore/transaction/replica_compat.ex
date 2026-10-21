@@ -55,6 +55,10 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
       when unit in [:ex, :px] and is_list(fields),
       do: 5
 
+  # ZADD INCR (older releases refuse the option).
+  def required_level({:zadd, _key, opts, pairs}) when is_list(opts) and is_list(pairs),
+    do: if(:incr in opts, do: 5)
+
   def required_level(_ast), do: nil
 
   @doc """
