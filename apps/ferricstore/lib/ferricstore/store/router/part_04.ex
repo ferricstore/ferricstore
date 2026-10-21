@@ -1123,7 +1123,8 @@ defmodule Ferricstore.Store.Router.Part04 do
 
       defp normalize_byte_range(size, start_idx, end_idx) when size > 0 do
         start_norm = if start_idx < 0, do: max(size + start_idx, 0), else: start_idx
-        end_norm = if end_idx < 0, do: size + end_idx, else: end_idx
+        # Redis clamps a negative end before the start to the first byte.
+        end_norm = if end_idx < 0, do: max(size + end_idx, 0), else: end_idx
 
         start_clamped = min(start_norm, size)
         end_clamped = min(end_norm, size - 1)
