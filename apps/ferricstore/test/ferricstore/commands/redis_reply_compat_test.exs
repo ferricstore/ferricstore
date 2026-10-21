@@ -444,6 +444,168 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
       end
     end
 
+    describe "#{@path}: GETEX and SETRANGE error order" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      test "GETEX looks the key up before it checks the expiry value", %{ctx: ctx, key: key} do
+        missing = key <> ":missing"
+        invalid = {:error, "ERR invalid expire time in 'getex' command"}
+
+        for option <- [["EX", "0"], ["EX", "x"], ["PX", "-5"]] do
+          assert nil == run(ctx, "GETEX", [missing | option]), inspect(option)
+        end
+
+        assert {:error, "ERR syntax error"} == run(ctx, "GETEX", [missing, "FOO"])
+        assert 1 == run(ctx, "RPUSH", [key <> ":l", "a"])
+        assert @wrongtype == run(ctx, "GETEX", [key <> ":l", "EX", "0"])
+        :ok = run(ctx, "SET", [key, "v"])
+        assert invalid == run(ctx, "GETEX", [key, "EX", "0"])
+        assert invalid == run(ctx, "GETEX", [key, "PXAT", "-1"])
+        assert invalid == run(ctx, "GETEX", [key, "EX", "9223372036854775807"])
+
+        assert {:error, "ERR value is not an integer or out of range"} ==
+                 run(ctx, "GETEX", [key, "EX", "x"])
+
+        assert "v" == run(ctx, "GETEX", [key, "persist"])
+      end
+
+      test "SETRANGE checks the key's type before the resulting size", %{ctx: ctx, key: key} do
+        assert 1 == run(ctx, "RPUSH", [key <> ":l", "a"])
+        assert @wrongtype == run(ctx, "SETRANGE", [key <> ":l", "536870912", "x"])
+
+        assert {:error, "ERR offset is out of range"} ==
+                 run(ctx, "SETRANGE", [key <> ":l", "-1", "x"])
+
+        assert {:error, "ERR string exceeds maximum allowed size (proto-max-bulk-len)"} ==
+                 run(ctx, "SETRANGE", [key, "536870912", "x"])
+      end
+    end
+
+    describe "#{@path}: hash field lists" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      test "HTTL and its family answer Redis's argument errors", %{ctx: ctx, key: key} do
+        :ok = run(ctx, "SET", [key <> ":s", "v"])
+        assert 1 == run(ctx, "HSET", [key, "a", "1"])
+
+        for command <- ~w(HTTL HPTTL HPERSIST HEXPIRETIME HGETDEL) do
+          assert @wrongtype == run(ctx, command, [key <> ":s", "FIELDS", "0", "a"]), command
+
+          for {args, message} <- [
+                {["FIELDS", "0", "a"], "ERR Number of fields must be a positive integer"},
+                {["FIELDS", "01", "a"], "ERR Number of fields must be a positive integer"},
+                {["FIELDS", "2", "a"],
+                 "ERR The `numfields` parameter must match the number of arguments"},
+                {["FOO", "1", "a"],
+                 "ERR Mandatory argument FIELDS is missing or not at the right position"}
+              ] do
+            assert {:error, message} == run(ctx, command, [key | args]),
+                   "#{command} #{inspect(args)}"
+          end
+        end
+
+        assert [-1] == run(ctx, "HTTL", [key, "fields", "1", "a"])
+        assert ["1"] == run(ctx, "HGETDEL", [key, "fields", "1", "a"])
+      end
+    end
+
+    describe "#{@path}: HGETEX and HSETEX" do
+      setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
+
+      test "HGETEX with a TTL of 0 or a past time deletes the fields", %{ctx: ctx, key: key} do
+        assert 3 == run(ctx, "HSET", [key, "a", "1", "b", "2", "c", "3"])
+        assert ["1", nil] == run(ctx, "HGETEX", [key, "EX", "0", "FIELDS", "2", "a", "a"])
+        assert ["b", "2", "c", "3"] == run(ctx, "HGETALL", [key])
+        assert ["2"] == run(ctx, "HGETEX", [key, "PX", "0", "FIELDS", "1", "b"])
+        assert ["3"] == run(ctx, "HGETEX", [key, "EXAT", "1", "FIELDS", "1", "c"])
+        assert 0 == run(ctx, "EXISTS", [key])
+        assert 1 == run(ctx, "HSET", [key, "a", "1"])
+        assert ["1"] == run(ctx, "HGETEX", [key, "FIELDS", "1", "a", "EX", "100"])
+        assert [100] == run(ctx, "HTTL", [key, "FIELDS", "1", "a"])
+        assert ["1"] == run(ctx, "HGETEX", [key, "fields", "1", "a", "persist"])
+        assert [-1] == run(ctx, "HTTL", [key, "FIELDS", "1", "a"])
+
+        assert [nil, nil] ==
+                 run(ctx, "HGETEX", [key <> ":missing", "EX", "1", "FIELDS", "2", "a", "b"])
+      end
+
+      test "HGETEX argument errors follow the type check", %{ctx: ctx, key: key} do
+        :ok = run(ctx, "SET", [key <> ":s", "v"])
+        assert @wrongtype == run(ctx, "HGETEX", [key <> ":s", "EX", "-1", "FIELDS", "1", "a"])
+        assert 1 == run(ctx, "HSET", [key, "a", "1"])
+        only_one = "ERR Only one of EX, PX, EXAT, PXAT or PERSIST arguments can be specified"
+
+        for {args, message} <- [
+              {["EX", "10", "PX", "10", "FIELDS", "1", "a"], only_one},
+              {["PERSIST", "PERSIST", "FIELDS", "1", "a"], only_one},
+              {["FIELDS", "1", "a", "b"], "ERR unknown argument: b"},
+              {["FIELDS", "0", "a"], "ERR invalid number of fields"},
+              {["FIELDS", "2", "a"], "ERR wrong number of arguments"},
+              {["FIELDS", "1", "a", "FIELDS", "1", "a"],
+               "ERR FIELDS keyword specified multiple times"},
+              {["EX", "-1", "FIELDS", "1", "a"], "ERR invalid expire time, must be >= 0"},
+              {["EX", "x", "FIELDS", "1", "a"], "ERR value is not an integer or out of range"},
+              {["PXAT", "70368744177664", "FIELDS", "1", "a"],
+               "ERR invalid expire time in 'hgetex' command"}
+            ] do
+          assert {:error, message} == run(ctx, "HGETEX", [key | args]), inspect(args)
+        end
+      end
+
+      test "HSETEX takes Redis 8's FNX, FXX, KEEPTTL and expiry options", %{ctx: ctx, key: key} do
+        assert 1 == run(ctx, "HSETEX", [key, "EX", "100", "FIELDS", "2", "a", "1", "b", "2"])
+        assert [100, 100] == run(ctx, "HTTL", [key, "FIELDS", "2", "a", "b"])
+        assert 1 == run(ctx, "HSETEX", [key, "FIELDS", "1", "a", "9"])
+        assert [-1, 100] == run(ctx, "HTTL", [key, "FIELDS", "2", "a", "b"])
+        assert 1 == run(ctx, "HSETEX", [key, "KEEPTTL", "FIELDS", "1", "b", "9"])
+        assert [100] == run(ctx, "HTTL", [key, "FIELDS", "1", "b"])
+        assert 0 == run(ctx, "HSETEX", [key, "FNX", "FIELDS", "2", "a", "1", "c", "3"])
+        assert 1 == run(ctx, "HSETEX", [key, "FNX", "FIELDS", "1", "c", "3"])
+        assert 0 == run(ctx, "HSETEX", [key, "FXX", "FIELDS", "2", "c", "4", "d", "4"])
+
+        assert 1 ==
+                 run(ctx, "HSETEX", [key, "fxx", "px", "5000", "fields", "2", "c", "5", "a", "5"])
+
+        assert [c_ms, a_ms] = run(ctx, "HPTTL", [key, "FIELDS", "2", "c", "a"])
+        assert c_ms in 4_000..5_000 and a_ms in 4_000..5_000
+        assert ["5", "9", "5"] == run(ctx, "HMGET", [key, "a", "b", "c"])
+        assert 1 == run(ctx, "HSETEX", [key, "EX", "0", "FIELDS", "2", "a", "1", "zz", "1"])
+        assert [nil, nil] == run(ctx, "HMGET", [key, "a", "zz"])
+        assert 1 == run(ctx, "HSETEX", [key, "FIELDS", "2", "q", "1", "q", "2"])
+        assert "2" == run(ctx, "HGET", [key, "q"])
+
+        fresh = key <> ":fresh"
+        assert 0 == run(ctx, "HSETEX", [fresh, "FXX", "FIELDS", "1", "a", "1"])
+        assert 0 == run(ctx, "EXISTS", [fresh])
+        assert 1 == run(ctx, "HSETEX", [fresh, "EX", "0", "FNX", "FIELDS", "1", "a", "1"])
+        assert 0 == run(ctx, "EXISTS", [fresh])
+        # FerricStore's own form: HSETEX key seconds field value [...]
+        assert 1 == run(ctx, "HSETEX", [fresh, "10", "z", "1"])
+        assert [10] == run(ctx, "HTTL", [fresh, "FIELDS", "1", "z"])
+      end
+
+      test "HSETEX checks its arguments before the key's type", %{ctx: ctx, key: key} do
+        :ok = run(ctx, "SET", [key <> ":s", "v"])
+        assert @wrongtype == run(ctx, "HSETEX", [key <> ":s", "FIELDS", "1", "a", "1"])
+        expiry_once = "ERR Only one of EX, PX, EXAT, PXAT or KEEPTTL arguments can be specified"
+
+        for {args, message} <- [
+              {["EX", "-1", "FIELDS", "1", "a", "1"], "ERR invalid expire time, must be >= 0"},
+              {["FNX", "FXX", "FIELDS", "1", "a", "1"],
+               "ERR Only one of FXX or FNX arguments can be specified"},
+              {["EX", "10", "KEEPTTL", "FIELDS", "1", "a", "1"], expiry_once},
+              {["KEEPTTL", "KEEPTTL", "FIELDS", "1", "a", "1"], expiry_once},
+              {["FIELDS", "1", "a", "1", "b", "2"], "ERR unknown argument: b"},
+              {["FIELDS", "0", "a", "1"], "ERR invalid number of fields"},
+              {["FIELDS", "2", "a", "1", "b"], "ERR wrong number of arguments"},
+              {["FIELDS", "1", "a", "1", "FIELDS", "1", "b", "1"],
+               "ERR FIELDS keyword specified multiple times"}
+            ] do
+          assert {:error, message} == run(ctx, "HSETEX", [key <> ":s" | args]), inspect(args)
+        end
+      end
+    end
+
     describe "#{@path}: hyperloglog" do
       setup do: Process.put(:compat_path, @path) |> then(fn _previous -> :ok end)
 
