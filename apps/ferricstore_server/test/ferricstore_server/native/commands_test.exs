@@ -5160,6 +5160,25 @@ defmodule FerricstoreServer.Native.CommandsTest do
              Session.execute(%{"command" => "EXEC", "args" => []}, state)
   end
 
+  # Every replica runs the transaction, and releases before level 5 store an
+  # empty string, so below it a transaction keeps doing so.
+  test "native MULTI BITOP keeps an empty destination below feature level 5" do
+    key = "{multi-bitop:#{System.unique_integer([:positive])}}"
+    ctx = FerricStore.Instance.get(:default)
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(
+               %{"command" => "BITOP", "args" => ["AND", key, key <> ":a", key <> ":b"]},
+               state
+             )
+
+    assert {:ok, [0], _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
+    assert "" == Router.get(ctx, key)
+  end
+
   test "native MULTI refuses ZRANK WITHSCORE below feature level 5" do
     key = "{multi-zrank:#{System.unique_integer([:positive])}}"
 

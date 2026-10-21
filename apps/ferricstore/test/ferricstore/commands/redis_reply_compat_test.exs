@@ -180,6 +180,21 @@ defmodule Ferricstore.Commands.RedisReplyCompatTest do
         assert "h" == run(ctx, "GETRANGE", [key, "-100", "-100"])
       end
 
+      test "BITOP with an empty result deletes the destination", %{ctx: ctx, key: key} do
+        destination = key <> ":dst"
+        :ok = run(ctx, "SET", [destination, "x"])
+        assert 0 == run(ctx, "BITOP", ["AND", destination, key <> ":m1", key <> ":m2"])
+        assert nil == run(ctx, "GET", [destination])
+        assert 0 == run(ctx, "DEL", [destination])
+
+        assert 1 == run(ctx, "SADD", [destination, "member"])
+        assert 0 == run(ctx, "BITOP", ["NOT", destination, key <> ":m3"])
+        assert 0 == run(ctx, "EXISTS", [destination])
+
+        assert 0 == run(ctx, "BITOP", ["OR", destination, key <> ":m4"])
+        assert 0 == run(ctx, "DEL", [destination])
+      end
+
       test "BITPOS answers -1 for a start byte past the value", %{ctx: ctx, key: key} do
         :ok = run(ctx, "SET", [key, "c"])
         assert -1 == run(ctx, "BITPOS", [key, "0", "2"])

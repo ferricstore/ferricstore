@@ -577,7 +577,8 @@ shard_0: 2
     (`EXPIRE key 100 XX GT`), BITCOUNT ranges and BITPOS are queued only at
     level 4: older releases abort or answer such a transaction differently.
   - 5: MULTI queues the command forms releases before it do not parse:
-    `ZRANK`/`ZREVRANK ... WITHSCORE`.
+    `ZRANK`/`ZREVRANK ... WITHSCORE`. BITOP inside MULTI deletes its
+    destination for an empty result, as it does outside MULTI.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.

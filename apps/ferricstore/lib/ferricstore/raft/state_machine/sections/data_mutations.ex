@@ -1290,6 +1290,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
           do_get(state, Ferricstore.Cluster.FeatureLevel.key(4)) ==
             Ferricstore.Cluster.FeatureLevel.marker()
 
+      defp feature_level_5?(state),
+        do:
+          do_get(state, Ferricstore.Cluster.FeatureLevel.key(5)) ==
+            Ferricstore.Cluster.FeatureLevel.marker()
+
       # Feature level 4 also stores INCRBYFLOAT and HINCRBYFLOAT results as
       # Redis does ("3", "5200"); older releases store Float.to_string/1
       # ("3.0", "5.2e3"), which INCR and HINCRBY then refuse.

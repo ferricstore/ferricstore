@@ -619,7 +619,39 @@ defmodule Ferricstore.Commands.Bitmap do
     end
   end
 
-  defp write_bitop_result(store, destkey, result) do
+  # As in Redis, an empty result deletes the destination, whatever it held.
+  # A MULTI transaction does so only at feature level 5: older releases store
+  # an empty string there, and every replica runs the transaction.
+  defp write_bitop_result(store, destkey, <<>>) do
+    if empty_bitop_deletes?(store),
+      do: delete_bitop_destination(store, destkey),
+      else: write_bitop_value(store, destkey, <<>>)
+  end
+
+  defp write_bitop_result(store, destkey, result), do: write_bitop_value(store, destkey, result)
+
+  defp empty_bitop_deletes?(%FerricStore.Instance{}), do: true
+
+  defp empty_bitop_deletes?(store) when is_map(store),
+    do: Map.get(store, :bitop_empty_deletes?) == true
+
+  defp delete_bitop_destination(store, destkey) do
+    case Destination.bitop_compound_destination_type(destkey, store) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      nil ->
+        case Ops.delete(store, destkey) do
+          {:error, _} = error -> error
+          _deleted -> 0
+        end
+
+      _type ->
+        with :ok <- Destination.clear_compound_data_structure(destkey, store), do: 0
+    end
+  end
+
+  defp write_bitop_value(store, destkey, result) do
     case Destination.bitop_compound_destination_type(destkey, store) do
       {:error, {:storage_read_failed, _reason}} = failure ->
         ReadResult.command_error(failure)
@@ -939,7 +971,6 @@ defmodule Ferricstore.Commands.Bitmap do
     {:ok, bitpos_not_found_result(bit_val, size, explicit_end)}
   end
 
-
   defp bitpos_byte_range_chunks(store, key, bit_val, offset, end_byte, size, explicit_end) do
     last = min(offset + @bitcount_chunk_bytes - 1, end_byte)
     expected_size = last - offset + 1
@@ -969,7 +1000,6 @@ defmodule Ferricstore.Commands.Bitmap do
         :unknown
     end
   end
-
 
   defp bitpos_not_found_result(0, size, false), do: size * 8
   defp bitpos_not_found_result(_bit_val, _size, _explicit_end), do: -1

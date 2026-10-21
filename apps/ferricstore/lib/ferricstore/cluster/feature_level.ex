@@ -35,6 +35,7 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    options in one entry.
   # 5: MULTI queues the command forms older releases do not parse
   #    (`Ferricstore.Transaction.ReplicaCompat`): ZRANK/ZREVRANK WITHSCORE.
+  #    BITOP inside MULTI deletes its destination for an empty result.
   @supported 5
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

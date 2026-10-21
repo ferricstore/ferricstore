@@ -4,6 +4,9 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Delete BITOP's destination when the result is empty (every source missing
+  or empty), as Redis does; it stored an empty string, so `GET` answered ""
+  and `DEL` 1. Inside MULTI this applies at cluster feature level 5.
 - Remove a list that RPOPLPUSH, LMOVE or their blocking forms emptied. Its
   type stayed behind, so `DEL key` answered 1, KEYS listed it, and a later
   write of another type could be refused until TYPE or EXISTS cleared it.
