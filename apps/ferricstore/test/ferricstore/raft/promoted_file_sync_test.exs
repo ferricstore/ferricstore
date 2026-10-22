@@ -206,7 +206,7 @@ defmodule Ferricstore.Raft.PromotedFileSyncTest do
       Application.put_env(:ferricstore, :waraft_storage_metadata_persist_every, 1)
       assert 1 == Dispatcher.dispatch("SADD", [key, "second"], ctx)
 
-      assert :ok == await_file_sync(ctx, key, path)
+      assert :ok == await_file_sync(ctx, key, path, table)
       assert :ok == wait_untracked(table)
       assert ["1", "1"] == Enum.map(["first", "second"], &sismember(ctx, key, &1))
     end
@@ -289,7 +289,7 @@ defmodule Ferricstore.Raft.PromotedFileSyncTest do
       Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_min_interval_ms, 0)
       assert 1 == Dispatcher.dispatch("SADD", [key, "starts-checkpoint"], ctx)
 
-      assert_receive {:checkpoint_started, checkpoint}, 10_000
+      assert {:ok, checkpoint} = await_checkpoint_start(ctx, key)
       assert_receive {:fsync, :file, ^path, ^checkpoint}, 10_000
       refute checkpoint == storage
     end
@@ -329,19 +329,73 @@ defmodule Ferricstore.Raft.PromotedFileSyncTest do
   # entry's replay dependencies are durable; until then it waits for a later
   # write to carry the persist. Small writes on the same shard supply them
   # without touching the large set's file.
-  defp await_file_sync(ctx, key, path, tries \\ 50) do
+  defp await_file_sync(ctx, key, path, table, tries \\ 50) do
     receive do
       {:fsync, :file, ^path, _storage_pid} -> :ok
     after
       200 ->
         if tries == 0 do
-          :timeout
+          {:timeout, storage_progress(table)}
         else
-          :ok = Dispatcher.dispatch("SET", [key <> ":nudge", Integer.to_string(tries)], ctx)
-          await_file_sync(ctx, key, path, tries - 1)
+          nudge(ctx, key, tries)
+          await_file_sync(ctx, key, path, table, tries - 1)
         end
     end
   end
+
+  # A checkpoint starts on an apply. One that finds every node-wide checkpoint
+  # slot taken retries on an apply a second later, so keep writing until one
+  # starts.
+  defp await_checkpoint_start(ctx, key, tries \\ 50) do
+    receive do
+      {:checkpoint_started, checkpoint} -> {:ok, checkpoint}
+    after
+      200 ->
+        if tries == 0 do
+          {:timeout, storage_progress(storage_table(ctx, key))}
+        else
+          nudge(ctx, key, tries)
+          await_checkpoint_start(ctx, key, tries - 1)
+        end
+    end
+  end
+
+  defp nudge(ctx, key, n),
+    do: :ok = Dispatcher.dispatch("SET", [key <> ":nudge", Integer.to_string(n)], ctx)
+
+  # What a timed-out wait reports: how far the storage has persisted and
+  # checkpointed, and what it is still waiting on.
+  defp storage_progress(table) do
+    state = table |> :ets.info(:owner) |> :sys.get_state()
+
+    case find_storage_handle(state) do
+      nil ->
+        :storage_handle_not_found
+
+      handle ->
+        Map.take(handle, [
+          :position,
+          :persisted_position,
+          :last_clean_position,
+          :segment_projection_position,
+          :bitcask_dirty?,
+          :replay_dependencies,
+          :apply_projection_cache_compaction,
+          :apply_projection_cache_last_error,
+          :segment_projection_checkpoint_retry_after_ms
+        ])
+    end
+  end
+
+  defp find_storage_handle(%{position: _, sm_state: _} = handle), do: handle
+
+  defp find_storage_handle(term) when is_tuple(term),
+    do: term |> Tuple.to_list() |> Enum.find_value(&find_storage_handle/1)
+
+  defp find_storage_handle(term) when is_map(term) and not is_struct(term),
+    do: term |> Map.values() |> Enum.find_value(&find_storage_handle/1)
+
+  defp find_storage_handle(_term), do: nil
 
   defp wait_untracked(table, tries \\ 200) do
     cond do
