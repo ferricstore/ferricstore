@@ -7,8 +7,9 @@ All notable changes to FerricStore will be documented here.
 - With keyspace notifications enabled (`notify-keyspace-events`), a batch of
   two or more SETs on one shard sent through the HTTP API wrote the keys but
   published no `__keyspace@0__`/`__keyevent@0__` notifications: the batch
-  took a combined put that skips them. Such batches now run command by
-  command while notifications are on, as native pipelines already do.
+  took a combined put that skips them. Native compact pipelines (the SDKs'
+  batched SET, stream append and other compact forms) skipped them the same
+  way. Both now run command by command while notifications are on.
 
 - Security: `-@dangerous` did not remove ACL SETUSER, DELUSER, GETUSER, LIST,
   LOAD, SAVE and LOG, nor SAVE, BGSAVE, LASTSAVE, SLOWLOG, INFO or CLIENT

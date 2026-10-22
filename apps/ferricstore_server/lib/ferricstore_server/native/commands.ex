@@ -4564,8 +4564,10 @@ defmodule FerricstoreServer.Native.Commands do
       scoped_state =
         Map.put(state, :instance_ctx, attach_request_context(state.instance_ctx, request_context))
 
+      # The fast paths write without the per-command keyspace notifications.
       fast_path_result =
-        if FerricStore.ResourceLimits.default_implementation?() do
+        if FerricStore.ResourceLimits.default_implementation?() and
+             not Ferricstore.KeyspaceNotifications.enabled?() do
           execute_compact_pipeline_fast_path(mode, items, return_format, scoped_state)
         else
           :fallback

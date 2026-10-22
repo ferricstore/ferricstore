@@ -5013,6 +5013,28 @@ defmodule FerricstoreServer.Native.CommandsTest do
       %{key: "{notify:#{System.unique_integer([:positive, :monotonic])}}"}
     end
 
+    test "a compact SET pipeline notifies every key", %{key: key} do
+      first = key <> ":compact-a"
+      second = key <> ":compact-b"
+      :ok = PubSub.subscribe("__keyspace@0__:" <> first, self())
+      :ok = PubSub.subscribe("__keyspace@0__:" <> second, self())
+
+      for return <- ["pairs", "values"] do
+        assert {:ok, _payload, _state} =
+                 Commands.execute(
+                   @op_pipeline,
+                   %{
+                     "return" => return,
+                     "compact_pipeline" => {1, [{first, "1"}, {second, "2"}]}
+                   },
+                   state()
+                 )
+
+        assert_receive {:pubsub_message, "__keyspace@0__:" <> ^first, "set"}
+        assert_receive {:pubsub_message, "__keyspace@0__:" <> ^second, "set"}
+      end
+    end
+
     test "commands and typed operations notify the key and the event", %{key: key} do
       hash = key <> ":h"
       :ok = PubSub.subscribe("__keyspace@0__:" <> key, self())
