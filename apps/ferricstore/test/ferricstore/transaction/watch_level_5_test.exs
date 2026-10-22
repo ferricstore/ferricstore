@@ -19,7 +19,7 @@ defmodule Ferricstore.Transaction.WatchLevel5Test do
     isolated = ShardHelpers.setup_isolated_data_dir()
     on_exit(fn -> ShardHelpers.teardown_isolated_data_dir(isolated) end)
     {:ok, %{active: 5}} = FeatureLevel.raise(FerricStore.Instance.get(:default), 5)
-    :ok
+    {:ok, isolated: isolated}
   end
 
   setup do
@@ -167,6 +167,41 @@ defmodule Ferricstore.Transaction.WatchLevel5Test do
     assert :ok = dispatch(ctx, "FLUSHDB", [])
 
     assert_aborted(ctx, watched, target)
+  end
+
+  # A replica that restarts alone must read the versions its log wrote, or it
+  # would decide a watched EXEC differently from the others.
+  test "write versions survive a restart", %{key: key, target: target, isolated: isolated} do
+    ctx = FerricStore.Instance.get(:default)
+    assert :ok = dispatch(ctx, "SET", [key, "v"])
+    clean = watch(ctx, [key])
+    changed = watch(ctx, [key])
+    assert :ok = dispatch(ctx, "SET", [key, "after-watch"])
+
+    ShardHelpers.restart_current_data_dir(isolated)
+    ctx = FerricStore.Instance.get(:default)
+
+    assert Router.watch_tokens(ctx, [key]) != clean
+    assert_aborted(ctx, changed, target)
+
+    rewatched = watch(ctx, [key])
+    assert [:ok] = Coordinator.execute([{"SET", [target, "applied"]}], rewatched, nil)
+  end
+
+  test "an unwritten key's version survives a restart", %{
+    key: key,
+    target: target,
+    isolated: isolated
+  } do
+    ctx = FerricStore.Instance.get(:default)
+    assert :ok = dispatch(ctx, "SET", [key, "v"])
+    watched = watch(ctx, [key])
+
+    ShardHelpers.restart_current_data_dir(isolated)
+    ctx = FerricStore.Instance.get(:default)
+
+    assert Router.watch_tokens(ctx, [key]) == watched
+    assert [:ok] = Coordinator.execute([{"SET", [target, "applied"]}], watched, nil)
   end
 
   defp watch(ctx, keys) do
