@@ -54,7 +54,10 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    collection count inside an entry with more due member expiries than
   #    one cleanup pass counts the keydir instead of failing. Apply's Flow
   #    history trim and its duplicate retry check order one millisecond's
-  #    events by version ("1000-9" before "1000-10"), not by id bytes.
+  #    events by version ("1000-9" before "1000-10"), not by id bytes. WATCH
+  #    records replicated write versions for the watched keys and a watched
+  #    EXEC compares them (`Ferricstore.Transaction.WatchIndex`), instead of
+  #    node-local storage tokens.
   @supported 5
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

@@ -790,14 +790,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         watched_keys
         |> Enum.sort_by(&elem(&1, 0))
         |> Enum.reduce_while(@transaction_watch_max_entries, fn {key, saved_token}, remaining ->
-          if match?({:error, _reason}, saved_token) do
-            {:halt, :changed}
-          else
-            case transaction_watch_token_with_budget(state, key, remaining) do
-              {:ok, ^saved_token, cost} -> {:cont, remaining - cost}
-              {:ok, _changed_token, _cost} -> {:halt, :changed}
-              {:error, reason} -> {:halt, {:error, reason}}
-            end
+          case saved_token do
+            {:error, _reason} ->
+              {:halt, :changed}
+
+            {:watch_index, version, live?} when is_integer(version) and is_boolean(live?) ->
+              case watch_index_token_clean?(state, key, version, live?) do
+                :clean -> {:cont, remaining}
+                :changed -> {:halt, :changed}
+                {:error, reason} -> {:halt, {:error, reason}}
+              end
+
+            _storage_token ->
+              case transaction_watch_token_with_budget(state, key, remaining) do
+                {:ok, ^saved_token, cost} -> {:cont, remaining - cost}
+                {:ok, _changed_token, _cost} -> {:halt, :changed}
+                {:error, reason} -> {:halt, {:error, reason}}
+              end
           end
         end)
         |> case do
@@ -807,11 +816,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
       end
 
       defp transaction_watch_token(state, key) when is_binary(key) do
-        case transaction_watch_token_with_budget(state, key, @transaction_watch_max_entries) do
-          {:ok, token, _cost} -> token
-          {:error, _reason} = error -> error
+        if watch_index_registration?(state) do
+          case transaction_watch_index_tokens(state, [key]) do
+            %{^key => token} -> token
+            {:error, _reason} = error -> error
+          end
+        else
+          case transaction_watch_token_with_budget(state, key, @transaction_watch_max_entries) do
+            {:ok, token, _cost} -> token
+            {:error, _reason} = error -> error
+          end
         end
       end
+
+      # From feature level 5 a replicated WATCH registers the keys' write
+      # versions (`Ferricstore.Transaction.WatchIndex`).
+      defp watch_index_registration?(state),
+        do: watch_index_registering?() and feature_level_5?(state)
 
       defp transaction_watch_token_with_budget(state, key, remaining)
            when is_binary(key) and is_integer(remaining) and remaining >= 0 do
@@ -830,6 +851,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
       end
 
       defp transaction_watch_tokens(state, keys) when is_list(keys) do
+        if watch_index_registration?(state) and Enum.all?(keys, &is_binary/1),
+          do: transaction_watch_index_tokens(state, Enum.uniq(keys)),
+          else: transaction_storage_watch_tokens(state, keys)
+      end
+
+      defp transaction_storage_watch_tokens(state, keys) do
         Enum.reduce_while(keys, {:ok, %{}, @transaction_watch_max_entries}, fn
           key, {:ok, tokens, remaining} when is_binary(key) ->
             case transaction_watch_token_with_budget(state, key, remaining) do

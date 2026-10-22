@@ -652,12 +652,17 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         {projection_command, promotion_keys} =
           prepare_segment_projection_command(decoded_command)
 
+        # The projection writes no WATCH index rows (see lifecycle).
         projection_result =
-          with_segment_projection_promotion_latches(sm_state, promotion_keys, fn ->
-            with_segment_projection_command_time(state_machine_command, fn ->
-              segment_project_command(projection_command, position, sm_state)
+          if StateMachine.watch_index_requires_apply?(decoded_command, sm_state) do
+            :unsupported
+          else
+            with_segment_projection_promotion_latches(sm_state, promotion_keys, fn ->
+              with_segment_projection_command_time(state_machine_command, fn ->
+                segment_project_command(projection_command, position, sm_state)
+              end)
             end)
-          end)
+          end
 
         case projection_result do
           {:ok, next_sm_state, _result, applied_increment} ->

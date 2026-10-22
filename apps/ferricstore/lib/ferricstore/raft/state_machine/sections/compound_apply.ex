@@ -1088,10 +1088,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
               error
 
             nil ->
-              case prepare_pending_flow_native_batches(state) do
-                :ok ->
-                  flush_prepared_cross_shard_pending_writes(state, result)
-
+              with :ok <- stage_watch_index_writes(state),
+                   :ok <- prepare_pending_flow_native_batches(state) do
+                flush_prepared_cross_shard_pending_writes(state, result)
+              else
                 {:error, _reason} = error ->
                   rollback_cross_shard_pending_writes(state)
                   rollback_pending_writes(state)

@@ -428,7 +428,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
               emit_raft_apply_telemetry(state, started_at, result, :rolled_back)
               result
             else
-              flush_result = flush_pending_writes(state, publication)
+              flush_result =
+                case stage_watch_index_writes(state) do
+                  :ok ->
+                    flush_pending_writes(state, publication)
+
+                  {:error, _reason} = error ->
+                    rollback_pending_writes(state)
+                    error
+                end
+
               emit_raft_apply_telemetry(state, started_at, result, flush_result)
 
               case flush_result do

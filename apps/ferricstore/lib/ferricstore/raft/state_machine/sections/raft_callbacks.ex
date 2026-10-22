@@ -324,14 +324,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
 
       @doc false
       def apply_waraft_storage_command(command, meta, state) when is_map(meta) do
-        apply(meta, command, state)
+        with_watch_index_entry(command, meta, fn -> apply(meta, command, state) end)
       end
 
       @doc false
       def apply_waraft_segment_command(command, meta, state, projection_writer)
           when is_map(meta) and is_function(projection_writer, 1) do
         with_waraft_projection_writer(projection_writer, fn ->
-          apply_standalone(fn -> apply(meta, command, state) end)
+          apply_standalone(fn ->
+            with_watch_index_entry(command, meta, fn -> apply(meta, command, state) end)
+          end)
         end)
       end
 

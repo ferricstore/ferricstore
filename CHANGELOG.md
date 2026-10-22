@@ -4,6 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- In a cluster, a watched transaction (WATCH ... MULTI ... EXEC) could commit
+  on the leader while the other replicas skipped it, leaving them permanently
+  different. Every replica checks the WATCH tokens against its own storage,
+  and the tokens came from node-local details: a promoted hash, set or sorted
+  set's per-node revision counter, and the storage location a node changes
+  when it trims its log. From feature level 5, WATCH records a write version
+  for each watched key in replicated state, every write to the key raises it,
+  and EXEC compares the versions, so every replica reaches the same decision.
+  A WATCH older than an hour now aborts its EXEC. Below level 5 WATCH behaves
+  as before.
 - Flow history ordered the events a Flow wrote in one millisecond by their
   ids' text, so `1000-10` came before `1000-9`. Whenever a Flow's version
   crossed 9 to 10, 99 to 100 and so on within one millisecond, history

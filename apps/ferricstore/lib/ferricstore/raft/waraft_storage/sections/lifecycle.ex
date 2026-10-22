@@ -1035,6 +1035,14 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
            ) do
         decoded_command = decoded_replay_command(command)
 
+        if StateMachine.watch_index_requires_apply?(decoded_command, handle.sm_state) do
+          :unsupported
+        else
+          apply_projectable_command(command, decoded_command, position, handle, label_update)
+        end
+      end
+
+      defp apply_projectable_command(command, decoded_command, position, handle, label_update) do
         {projection_command, promotion_keys} =
           prepare_segment_projection_command(decoded_command)
 
