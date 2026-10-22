@@ -61,19 +61,21 @@ defmodule Ferricstore.Flow.HistoryOrderTest do
                [type: "history-order", partition_key: @partition, now_ms: 1_000] ++ create_opts
              )
 
-    Enum.reduce(0..11, "queued", fn step, from ->
-      to = "step-#{step}"
+    last_state =
+      Enum.reduce(0..11, "queued", fn step, from ->
+        to = "step-#{step}"
 
-      assert :ok =
-               Flow.transition(ctx, id, from, to,
-                 partition_key: @partition,
-                 fencing_token: 0,
-                 now_ms: 1_000
-               )
+        assert :ok =
+                 Flow.transition(ctx, id, from, to,
+                   partition_key: @partition,
+                   fencing_token: 0,
+                   now_ms: 1_000
+                 )
 
-      to
-    end)
+        to
+      end)
 
+    assert last_state == "step-11"
     assert :ok = HistoryProjector.flush(ctx, 0, 30_000)
     id
   end
