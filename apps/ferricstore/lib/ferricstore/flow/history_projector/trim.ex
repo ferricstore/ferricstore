@@ -3,6 +3,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Flow.HistoryProjector.KeyCodec
+  alias Ferricstore.Flow.LMDB.HistoryScan
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
 
   @trim_batch_size 4_096
@@ -203,9 +204,8 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
 
   defp lmdb_history_trim_batch(history_key, shard_data_path, trim_count) do
     lmdb_path = Ferricstore.Flow.LMDB.path(shard_data_path)
-    prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
 
-    case Ferricstore.Flow.LMDB.prefix_entries(lmdb_path, prefix, trim_count) do
+    case HistoryScan.first(lmdb_path, history_key, trim_count) do
       {:ok, entries} -> decode_lmdb_history_trim_items(entries, trim_count)
       {:error, _reason} = error -> error
       invalid -> {:error, {:invalid_history_trim_entries_result, invalid}}
