@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- FLOW.LIST of a terminal state (completed, failed, cancelled) without
+  `include_cold`, and the by-parent, by-root and by-correlation lineage
+  lists, dropped a terminal flow that had attributes or indexed state
+  metadata once the LMDB writer had projected it, while the same flow without
+  attributes stayed listed. FLOW.GET and FLOW.STATS still found it. Terminal
+  flows stay in the hot indexes after an LMDB flush, as the release that kept
+  them hot intended; the prune that took such flows out of them now leaves
+  their entries in place and only drops their keydir row.
+
 - A Flow LMDB mirror reconcile reported the mirror unhealthy
   (`flow_lmdb_reconcile_unhealthy`, one cold read error) when a terminal flow's
   state was evicted from memory while its newest copy was still in the WARaft

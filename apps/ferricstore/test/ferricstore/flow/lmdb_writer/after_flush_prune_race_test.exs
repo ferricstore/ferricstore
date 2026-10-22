@@ -311,10 +311,12 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushPruneRaceTest do
       :lfu_only ->
         assert [] = :ets.lookup(ets, state_key)
 
-        assert [] = :ets.lookup(zset_lookup, {state_index_key, id})
+        # The pruned flow stays listed from the hot indexes.
+        assert [{{^state_index_key, ^id}, 1.0}] =
+                 :ets.lookup(zset_lookup, {state_index_key, id})
 
         Enum.each(metadata_index_keys, fn index_key ->
-          assert :miss = NativeOrderedIndex.score_of(native, index_key, id)
+          assert {:ok, 1.0} = NativeOrderedIndex.score_of(native, index_key, id)
         end)
     end
 
