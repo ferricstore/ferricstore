@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- ACL SETUSER and ACL files refused the `reset` modifier, and ACL SETUSER
+  refused `nocommands` (ACL files accepted it), both of which Redis accepts:
+  `ACL SETUSER alice reset on >pw ~app:* +@read` answered a syntax error.
+  `reset` now returns the user to its state right after creation before the
+  rules after it apply, and `nocommands` is `-@all`.
+
 - A MULTI that deleted a promoted hash, set or sorted set and then wrote the
   key again (`DEL h` then `HSET h f v`) stored the new type and members in
   the collection's dedicated file, which the transaction's cleanup deleted

@@ -278,4 +278,19 @@ defmodule FerricstoreServer.AclFileParserTest do
     assert Enum.map(decoded.keys, fn {glob, mode, _compiled} -> {glob, mode} end) == key_patterns
     assert Enum.map(decoded.channels, fn {glob, _compiled} -> glob end) == channel_patterns
   end
+
+  # Redis loads ACL file lines through SETUSER, where "reset" undoes the rules
+  # before it.
+  test "an ACL line may reset the user part way through" do
+    assert {:ok, [{"alice", user}]} =
+             FileParser.parse(
+               "user alice on #2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881 ~a:* &* +get reset on nopass ~b:* +set\n"
+             )
+
+    assert user.enabled
+    assert user.password == nil
+    assert [{"b:*", :rw, _regex}] = user.keys
+    assert user.channels == []
+    assert user.commands == MapSet.new(["SET"])
+  end
 end

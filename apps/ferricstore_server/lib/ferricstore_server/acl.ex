@@ -164,6 +164,10 @@ defmodule FerricstoreServer.Acl do
     * `"allkeys"`      -- shorthand for `"~*"`
     * `"allcommands"`  -- shorthand for `"+@all"`
     * `"resetpass"`    -- clear the password
+    * `"nocommands"`   -- shorthand for `"-@all"`
+    * `"reset"`        -- return the user to its state right after creation
+      (no password, keys, channels or commands, and disabled); later rules
+      apply on top
 
   When creating a new user with no rules, the user is created in a disabled
   state with no password and no permissions (safe default).
