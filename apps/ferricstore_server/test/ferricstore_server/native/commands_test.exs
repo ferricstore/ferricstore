@@ -5013,6 +5013,58 @@ defmodule FerricstoreServer.Native.CommandsTest do
       %{key: "{notify:#{System.unique_integer([:positive, :monotonic])}}"}
     end
 
+    test "hash field TTL commands notify only the changes they made", %{key: key} do
+      hash = key <> ":fields"
+      channel = "__keyspace@0__:" <> hash
+      :ok = PubSub.subscribe(channel, self())
+
+      exec = fn command, args ->
+        {:ok, reply, _state} =
+          Commands.execute(
+            @op_command_exec,
+            %{"command" => command, "args" => [hash | args]},
+            state()
+          )
+
+        reply
+      end
+
+      assert 1 == exec.("HSET", ["f", "v"])
+      assert_receive {:pubsub_message, ^channel, "hset"}
+
+      steps = [
+        {"HEXPIRE", ["100", "FIELDS", "1", "f"], "hexpire"},
+        {"HEXPIRE", ["100", "NX", "FIELDS", "1", "f"], nil},
+        {"HPEXPIRE", ["100000", "FIELDS", "1", "f"], "hexpire"},
+        {"HPERSIST", ["FIELDS", "1", "f"], "hpersist"},
+        {"HPERSIST", ["FIELDS", "1", "f"], nil},
+        {"HSETEX", ["FNX", "EX", "100", "FIELDS", "1", "f", "w"], nil},
+        {"HSETEX", ["EX", "100", "FIELDS", "1", "g", "w"], "hset"},
+        {"HSETEX", ["100", "g", "x"], "hset"},
+        {"HGETDEL", ["FIELDS", "1", "missing"], nil},
+        {"HGETDEL", ["FIELDS", "1", "g"], "hdel"},
+        {"HEXPIRE", ["0", "FIELDS", "1", "f"], "hdel"}
+      ]
+
+      for {command, args, event} <- steps do
+        exec.(command, args)
+
+        if event,
+          do:
+            assert_receive(
+              {:pubsub_message, ^channel, ^event},
+              500,
+              "#{command} #{inspect(args)}"
+            ),
+          else:
+            refute_receive(
+              {:pubsub_message, ^channel, _event},
+              100,
+              "#{command} #{inspect(args)}"
+            )
+      end
+    end
+
     test "RPOPLPUSH notifies like LMOVE, and neither notifies an empty source", %{key: key} do
       source = key <> ":source"
       destination = key <> ":destination"

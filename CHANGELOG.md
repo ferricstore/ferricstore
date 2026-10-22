@@ -14,6 +14,10 @@ All notable changes to FerricStore will be documented here.
   on the key they served), BLMOVE and RPOPLPUSH (`lmove`, as LMOVE). These
   commands published nothing before. LMOVE from an empty source no longer
   publishes `lmove` for keys it did not change.
+- Keyspace notifications now fire for the hash field commands HSETEX (`hset`),
+  HGETDEL (`hdel`), HEXPIRE and HPEXPIRE (`hexpire`, or `hdel` when a TTL of
+  0 deleted a field) and HPERSIST (`hpersist`), each only when it changed a
+  field. They published nothing before. HGETEX still publishes nothing.
 
 - Security: `-@dangerous` did not remove ACL SETUSER, DELUSER, GETUSER, LIST,
   LOAD, SAVE and LOG, nor SAVE, BGSAVE, LASTSAVE, SLOWLOG, INFO or CLIENT

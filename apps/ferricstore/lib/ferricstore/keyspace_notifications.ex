@@ -152,6 +152,11 @@ defmodule Ferricstore.KeyspaceNotifications do
     "HDEL" => "hdel",
     "HINCRBY" => "hincrby",
     "HINCRBYFLOAT" => "hincrbyfloat",
+    "HSETEX" => "hset",
+    "HGETDEL" => "hdel",
+    "HEXPIRE" => "hexpire",
+    "HPEXPIRE" => "hexpire",
+    "HPERSIST" => "hpersist",
     "ZADD" => "zadd",
     "ZREM" => "zrem",
     "ZINCRBY" => "zincrby",
@@ -264,6 +269,29 @@ defmodule Ferricstore.KeyspaceNotifications do
 
   defp notify_event(command, _event, _args, _result) when command in ~w(BLPOP BRPOP BLMPOP),
     do: :ok
+
+  # The field TTL commands answer one code per field: 1 when they changed
+  # its expiry, and for HEXPIRE 2 when a TTL of 0 deleted it.
+  defp notify_event(command, event, [key | _rest], codes)
+       when command in ~w(HEXPIRE HPEXPIRE) and is_list(codes) do
+    if 1 in codes, do: notify_key(key, event)
+    if 2 in codes, do: notify_key(key, "hdel")
+    :ok
+  end
+
+  defp notify_event("HPERSIST", event, [key | _rest], codes) when is_list(codes),
+    do: if(1 in codes, do: notify_key(key, event), else: :ok)
+
+  defp notify_event("HGETDEL", event, [key | _rest], values) when is_list(values),
+    do: if(Enum.any?(values, &(&1 != nil)), do: notify_key(key, event), else: :ok)
+
+  # Redis 8's HSETEX answers 0 when FNX or FXX refused the fields; the older
+  # `HSETEX key seconds field value` form counts new fields, like HSET.
+  defp notify_event("HSETEX", event, [key, option | _rest], result) do
+    if result == 0 and Ferricstore.Commands.Hash.Helpers.setex_option?(option),
+      do: :ok,
+      else: notify_key(key, event)
+  end
 
   defp notify_event(_command, event, [key | _rest], _result), do: notify_key(key, event)
   defp notify_event(_command, _event, _args, _result), do: :ok
