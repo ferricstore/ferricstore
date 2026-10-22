@@ -49,7 +49,8 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    range; SET NX/XX see a write staged earlier in the same entry whose
   #    value is not cached; and Flows closed by batch, pipelined or
   #    cross-shard commands are indexed under the type's current policy, as
-  #    the single-Flow commands index them.
+  #    the single-Flow commands index them; a Flow state record write apply
+  #    refuses fails a claim or batch entry instead of being skipped.
   @supported 5
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

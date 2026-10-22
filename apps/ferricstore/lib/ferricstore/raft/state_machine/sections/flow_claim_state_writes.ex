@@ -97,10 +97,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
               :ok ->
                 :ok
 
+              # Older releases raised here.
+              {:error, _reason} = error ->
+                error
+
               :fallback ->
-                flow_claim_put_state_records_loop(state, plans, nil)
-                :ok
+                flow_claim_put_state_records_fallback(state, plans)
             end
+        end
+      end
+
+      # A state record write apply refuses fails the entry from feature level 5,
+      # as it fails the single-Flow commands. Older releases went on to write the
+      # entry's history and indexes, so a claim or batch could answer for Flows
+      # whose state records were not written; below the level that stays.
+      defp flow_claim_put_state_records_fallback(state, plans) do
+        case flow_claim_put_state_records_loop(state, plans, nil) do
+          {:error, _reason} = error -> if feature_level_5?(state), do: error, else: :ok
+          :ok -> :ok
         end
       end
 

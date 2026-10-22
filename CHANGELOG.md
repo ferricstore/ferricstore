@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- FLOW.CLAIM_DUE and the batch Flow writes (COMPLETE_MANY, FAIL_MANY,
+  CANCEL_MANY, RETRY_MANY, TRANSITION_MANY and pipelined batches) went on
+  past a state record write apply refused, for instance over a corrupt type
+  catalog row: they wrote the entry's history and moved its indexes, so a
+  Flow after the refused one kept its old state record, and answered OK. At
+  feature level 5 the entry fails with the error, as the single-Flow commands
+  do; below it the older result is kept. Outside a WARaft apply (shards
+  without Raft) the write raised CaseClauseError instead; it now answers the
+  error.
 - A Flow closed by COMPLETE_MANY, FAIL_MANY, CANCEL_MANY, an independent
   (pipelined) batch or a cross-shard terminal kept the indexed attribute names
   it had, while FLOW.COMPLETE, FLOW.FAIL and FLOW.CANCEL index it under the
