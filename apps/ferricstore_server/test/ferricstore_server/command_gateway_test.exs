@@ -696,6 +696,28 @@ defmodule FerricstoreServer.CommandGatewayTest do
              CommandGateway.native_command("FLOW.QUERY", 0x0230, payload)
   end
 
+  test "a batch of SETs notifies keyspace subscribers like single SETs do" do
+    put_http_user("notify-user", "secret")
+    :ok = Ferricstore.Config.set("notify-keyspace-events", "KEA")
+    on_exit(fn -> Ferricstore.Config.set("notify-keyspace-events", "") end)
+
+    # One hash tag keeps both keys on one shard, where SET batches run as one put.
+    tag = System.unique_integer([:positive])
+    first = "tenant:a:{notify-#{tag}}:a"
+    second = "tenant:a:{notify-#{tag}}:b"
+    :ok = Ferricstore.PubSub.subscribe("__keyspace@0__:" <> first, self())
+    :ok = Ferricstore.PubSub.subscribe("__keyspace@0__:" <> second, self())
+
+    assert {:ok, session} =
+             AuthenticationGateway.authenticate("notify-user", "secret", peer: peer())
+
+    assert {:ok, [%{status: :ok}, %{status: :ok}]} =
+             CommandGateway.execute_batch(session, [["SET", first, "1"], ["SET", second, "2"]])
+
+    assert_receive {:pubsub_message, "__keyspace@0__:" <> ^first, "set"}
+    assert_receive {:pubsub_message, "__keyspace@0__:" <> ^second, "set"}
+  end
+
   test "returns command and key ACL failures in their original batch positions" do
     put_http_user("reader", "secret", ["+GET"])
     assert {:ok, session} = AuthenticationGateway.authenticate("reader", "secret", peer: peer())

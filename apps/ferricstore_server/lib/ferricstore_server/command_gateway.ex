@@ -364,6 +364,7 @@ defmodule FerricstoreServer.CommandGateway do
          true <- FerricStore.ResourceLimits.default_implementation?(),
          true <- valid_batch_keys?(keys),
          true <- homogeneous_batch_order_safe?(command, state.instance_ctx, keys),
+         true <- homogeneous_batch_notifications_safe?(command),
          :ok <- authorize_homogeneous_batch(state.acl_cache, command, keys),
          false <- deadline_expired?(deadline_ms) do
       execute_homogeneous_kv_batch(command, items, keys, state)
@@ -457,6 +458,13 @@ defmodule FerricstoreServer.CommandGateway do
   end
 
   defp homogeneous_batch_order_safe?(_command, _ctx, _keys), do: false
+
+  # The batched put skips the dispatcher's keyspace notifications, as the
+  # native pipeline fast paths do; keep them when notifications are on.
+  defp homogeneous_batch_notifications_safe?("SET"),
+    do: not Ferricstore.KeyspaceNotifications.enabled?()
+
+  defp homogeneous_batch_notifications_safe?(_command), do: true
 
   defp authorize_homogeneous_batch(acl_cache, command, keys) do
     with :ok <- ConnectionAuth.check_command_cached(acl_cache, command),
