@@ -57,7 +57,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       end
 
       defp flow_history_trim_oldest(state, record, id, partition_key, history_key, delete_count) do
-        events = flow_index_rank_range(state, history_key, 0, delete_count - 1, false)
+        events = flow_history_end_range(state, history_key, delete_count, false)
 
         with :ok <-
                flow_history_delete_oldest_events(

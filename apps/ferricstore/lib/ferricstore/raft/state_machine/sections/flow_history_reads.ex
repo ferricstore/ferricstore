@@ -681,6 +681,51 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
         end
       end
 
+      @doc false
+      def __flow_history_end_range_for_test__(state, history_key, count, reverse?),
+        do: flow_history_end_range(state, history_key, count, reverse?)
+
+      # A Flow's `count` oldest (or newest) history events, for apply. The
+      # native index orders one millisecond's events by version; below feature
+      # level 5 apply keeps the id byte order older releases apply with
+      # ("1000-10" before "1000-9"), rebuilt from the boundary millisecond.
+      defp flow_history_end_range(state, history_key, count, reverse?) do
+        events = flow_index_rank_range(state, history_key, 0, count - 1, reverse?)
+
+        if feature_level_5?(state),
+          do: events,
+          else: flow_history_byte_order_end_range(state, history_key, events, count, reverse?)
+      end
+
+      defp flow_history_byte_order_end_range(_state, _history_key, [], _count, _reverse?),
+        do: []
+
+      defp flow_history_byte_order_end_range(state, history_key, events, count, reverse?) do
+        {_event_id, boundary_ms} = List.last(events)
+        bound = {:inclusive, boundary_ms}
+
+        boundary_events =
+          case flow_native_index(state) do
+            nil ->
+              []
+
+            native ->
+              NativeFlowIndex.range_slice(native, history_key, bound, bound, false, 0, :all)
+          end
+
+        events
+        |> Enum.reject(fn {_event_id, event_ms} -> event_ms == boundary_ms end)
+        |> Kernel.++(boundary_events)
+        |> Enum.sort_by(
+          fn {event_id, event_ms} -> {event_ms, event_id} end,
+          flow_history_sort_direction(reverse?)
+        )
+        |> Enum.take(count)
+      end
+
+      defp flow_history_sort_direction(true), do: :desc
+      defp flow_history_sort_direction(false), do: :asc
+
       defp flow_index_count_all(state, key) do
         case flow_native_index(state) do
           nil -> 0

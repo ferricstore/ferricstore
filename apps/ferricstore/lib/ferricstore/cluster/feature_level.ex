@@ -52,7 +52,9 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    the single-Flow commands index them; a Flow state record write apply
   #    refuses fails a claim or batch entry instead of being skipped. A
   #    collection count inside an entry with more due member expiries than
-  #    one cleanup pass counts the keydir instead of failing.
+  #    one cleanup pass counts the keydir instead of failing. Apply's Flow
+  #    history trim and its duplicate retry check order one millisecond's
+  #    events by version ("1000-9" before "1000-10"), not by id bytes.
   @supported 5
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

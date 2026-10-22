@@ -4,6 +4,18 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Flow history ordered the events a Flow wrote in one millisecond by their
+  ids' text, so `1000-10` came before `1000-9`. Whenever a Flow's version
+  crossed 9 to 10, 99 to 100 and so on within one millisecond, history
+  listings put events out of order; `from_event`/`to_event` ranges, the
+  latest-N read and history pages, FQL's included, returned the wrong events
+  (a range such as `1000-9`..`1000-10` was refused); and `history_max_events`
+  trimming, including a rebuilt LMDB projection, deleted that millisecond's
+  newest events instead of its oldest. History is now ordered by millisecond,
+  then version, in memory, in LMDB reads and in every trim, with no change to
+  stored data. The history trim and duplicate retry check that run as a
+  replica applies a command switch to this order once the cluster is raised
+  to feature level 5.
 - With keyspace notifications enabled (`notify-keyspace-events`), a batch of
   two or more SETs on one shard sent through the HTTP API wrote the keys but
   published no `__keyspace@0__`/`__keyevent@0__` notifications: the batch
