@@ -559,7 +559,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
               {:error, _reason} = error -> error
             end
 
-          {:error, :key_locked} = error ->
+          # :key_locked, or :hlc_drift_exceeded for a lease the clocks disagree
+          # on; matching only the first raised in apply.
+          {:error, _reason} = error ->
             List.duplicate(error, length(items))
         end
       end

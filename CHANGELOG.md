@@ -4,8 +4,9 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
-- MSET and MSETNX on a key whose FETCH_OR_COMPUTE lease the cluster clock and
-  wall clock disagree on raised in apply (stopping the shard, and again on
+- MSET, MSETNX and compound batch writes (hash, set and sorted set members) on
+  a key whose FETCH_OR_COMPUTE lease the cluster clock and wall clock disagree
+  on raised in apply (stopping the shard, and again on
   every replay of the entry); they now answer the drift error as other writes
   do.
 - SRANDMEMBER and SPOP with arguments after the count answer Redis's

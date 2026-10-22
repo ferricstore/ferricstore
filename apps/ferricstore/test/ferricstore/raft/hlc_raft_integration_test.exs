@@ -801,6 +801,37 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       end
     end
 
+    test "compound batch writes answer an ambiguous lease instead of raising in apply", %{
+      state: state,
+      ets: ets
+    } do
+      key = "drift_guarded_fetch_hash"
+      owner = "lease-owner"
+      expire_at_ms = 31_000
+      field_key = Ferricstore.Store.CompoundKey.hash_field(key, "f")
+
+      state =
+        state
+        |> Map.put(:fetch_or_compute_locks, %{key => {owner, expire_at_ms}})
+        |> Map.put(
+          :fetch_or_compute_lock_expiries,
+          :gb_trees.enter({expire_at_ms, key}, owner, :gb_trees.empty())
+        )
+
+      for command <- [
+            {:compound_batch_put, key, [{field_key, "v", 0}]},
+            {:compound_batch_delete, key, [field_key]}
+          ] do
+        wrapped = {command, %{hlc_ts: {61_000, 0}, wall_time_ms: 1_000}}
+        {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+        assert inspect(result) =~ "hlc_drift_exceeded",
+               "#{elem(command, 0)} returned #{inspect(result)}"
+
+        assert :ets.lookup(ets, field_key) == []
+      end
+    end
+
     test "does not bypass a wall-live fetch-or-compute lease for ordinary writes", %{
       state: state,
       ets: ets
