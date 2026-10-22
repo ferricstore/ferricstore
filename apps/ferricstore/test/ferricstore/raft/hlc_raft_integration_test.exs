@@ -774,6 +774,33 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
              }
     end
 
+    test "MSET and MSETNX answer an ambiguous lease instead of raising in apply", %{
+      state: state,
+      ets: ets
+    } do
+      key = "drift_guarded_fetch_mset"
+      owner = "lease-owner"
+      expire_at_ms = 31_000
+
+      state =
+        state
+        |> Map.put(:fetch_or_compute_locks, %{key => {owner, expire_at_ms}})
+        |> Map.put(
+          :fetch_or_compute_lock_expiries,
+          :gb_trees.enter({expire_at_ms, key}, owner, :gb_trees.empty())
+        )
+
+      for command <- [:mset, :msetnx] do
+        wrapped =
+          {{command, [{key, "new-value", 0}]}, %{hlc_ts: {61_000, 0}, wall_time_ms: 1_000}}
+
+        {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+        assert result == {:error, :hlc_drift_exceeded}, "#{command} returned #{inspect(result)}"
+        assert :ets.lookup(ets, key) == []
+      end
+    end
+
     test "does not bypass a wall-live fetch-or-compute lease for ordinary writes", %{
       state: state,
       ets: ets
