@@ -172,7 +172,13 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
            {:ok, stats} <-
              reduce_state_entries(
                keydir,
-               initial_reconcile_stats(lmdb_path, keydir, shard_path),
+               initial_reconcile_stats(
+                 lmdb_path,
+                 keydir,
+                 shard_path,
+                 shard_index,
+                 instance_ctx
+               ),
                fn entries, acc ->
                  reconcile_batch(
                    entries,
@@ -1124,9 +1130,15 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   defp increment_projection_read_errors({ops, prunes, active, projected, read_errors}),
     do: {ops, prunes, active, projected, read_errors + 1}
 
-  defp initial_reconcile_stats(lmdb_path, keydir, shard_path) do
+  defp initial_reconcile_stats(lmdb_path, keydir, shard_path, shard_index, instance_ctx) do
     {cleanup_op_count, scan_errors} =
-      case cleanup_stale_terminal_reverse(lmdb_path, keydir, shard_path) do
+      case cleanup_stale_terminal_reverse(
+             lmdb_path,
+             keydir,
+             shard_path,
+             shard_index,
+             instance_ctx
+           ) do
         {:ok, cleanup_op_count} -> {cleanup_op_count, 0}
         {:error, _reason} -> {0, 1}
       end
@@ -1163,9 +1175,11 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   defp reconcile_policy_mirrors(_lmdb_path, _keydir, _shard_path, _shard_index, _instance_ctx),
     do: {:ok, 0}
 
-  defp cleanup_stale_terminal_reverse(lmdb_path, keydir, shard_path) do
+  # A cold source may sit in a WARaft segment, which only the shard's
+  # instance context can read.
+  defp cleanup_stale_terminal_reverse(lmdb_path, keydir, shard_path, shard_index, instance_ctx) do
     TerminalProjection.cleanup_stale_terminal_reverse(lmdb_path, keydir, fn entry ->
-      ColdState.read_and_decode([entry], shard_path)
+      ColdState.read_and_decode([entry], shard_path, shard_index, instance_ctx)
     end)
   end
 

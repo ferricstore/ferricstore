@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A Flow LMDB mirror reconcile reported the mirror unhealthy
+  (`flow_lmdb_reconcile_unhealthy`, one cold read error) when a terminal flow's
+  state was evicted from memory while its newest copy was still in the WARaft
+  apply projection: the stale-terminal cleanup read the state without the
+  shard's context, which such a read needs. FLOW.HISTORY calls that waited on
+  the reconcile failed, and the callers that require a healthy reconcile
+  (flow transfer, and the full reconcile at startup after an interrupted LMDB
+  flush) could fail too. The cleanup now reads with the shard's context.
+
 - Every command on a promoted hash, set or sorted set (HGET, HLEN, SISMEMBER,
   ZRANGE, DEL and the rest) answered "ERR storage read failed" once memory
   pressure had evicted both the collection's promotion marker and the member
