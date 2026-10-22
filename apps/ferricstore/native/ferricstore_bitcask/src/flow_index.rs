@@ -180,7 +180,71 @@ impl Ord for Score {
 struct OrderedEntry {
     key: Vec<u8>,
     score: Score,
+    // Orders members of one score before their bytes do (`member_rank`).
+    rank: u64,
     member: Vec<u8>,
+}
+
+impl OrderedEntry {
+    fn new(key: Vec<u8>, score: f64, member: Vec<u8>) -> Self {
+        let rank = member_rank(&key, &member);
+        Self {
+            key,
+            score: Score(score),
+            rank,
+            member,
+        }
+    }
+}
+
+// The events a Flow writes in one millisecond share their ids' "<ms>-" prefix,
+// so their bytes would put "1000-10" before "1000-9". A history entry ranks by
+// its id's version instead; every other index keeps its members' byte order.
+fn member_rank(key: &[u8], member: &[u8]) -> u64 {
+    if history_index_key(key) {
+        history_event_version(member)
+    } else {
+        0
+    }
+}
+
+// `Ferricstore.Flow.Keys.history_key/2`: "f:{<tag>}:h:<id>", and no tag holds
+// a '}'.
+fn history_index_key(key: &[u8]) -> bool {
+    let Some(rest) = key.strip_prefix(b"f:{") else {
+        return false;
+    };
+
+    match rest.iter().position(|&byte| byte == b'}') {
+        Some(tag_end) if tag_end > 0 => {
+            let family = &rest[tag_end + 1..];
+            family.len() > 3 && family.starts_with(b":h:")
+        }
+        _ => false,
+    }
+}
+
+// The version of a "<ms>-<version>" event id, or 0 for any other member.
+fn history_event_version(member: &[u8]) -> u64 {
+    let Some(dash) = member.iter().position(|&byte| byte == b'-') else {
+        return 0;
+    };
+    let (ms, version) = (&member[..dash], &member[dash + 1..]);
+
+    if ms.is_empty() || version.is_empty() || !ms.iter().all(u8::is_ascii_digit) {
+        return 0;
+    }
+
+    version
+        .iter()
+        .try_fold(0u64, |acc, &digit| {
+            if digit.is_ascii_digit() {
+                acc.checked_mul(10)?.checked_add(u64::from(digit - b'0'))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -217,11 +281,7 @@ struct DueCursor<'index, 'key> {
 
 impl<'index, 'key> DueCursor<'index, 'key> {
     fn new(index: &'index FlowOrderedIndex, key: &'key [u8], max_score: f64) -> Self {
-        let lower = OrderedEntry {
-            key: key.to_vec(),
-            score: Score(f64::NEG_INFINITY),
-            member: Vec::new(),
-        };
+        let lower = OrderedEntry::new(key.to_vec(), f64::NEG_INFINITY, Vec::new());
 
         Self {
             key,
@@ -2378,31 +2438,22 @@ impl FlowOrderedIndex {
                 return;
             }
 
-            self.ordered.remove(&OrderedEntry {
-                key: key.to_vec(),
-                score: Score(old_score),
-                member: member.to_vec(),
-            });
+            self.ordered
+                .remove(&OrderedEntry::new(key.to_vec(), old_score, member.to_vec()));
         } else {
             self.increment_count(key, 1);
         }
 
-        self.ordered.insert(OrderedEntry {
-            key: key.to_vec(),
-            score: Score(score),
-            member: member.to_vec(),
-        });
+        self.ordered
+            .insert(OrderedEntry::new(key.to_vec(), score, member.to_vec()));
         self.insert_lookup(key, member, score);
     }
 
     fn delete(&mut self, key: &[u8], member: &[u8]) -> Option<f64> {
         let old_score = self.remove_lookup(key, member)?;
 
-        self.ordered.remove(&OrderedEntry {
-            key: key.to_vec(),
-            score: Score(old_score),
-            member: member.to_vec(),
-        });
+        self.ordered
+            .remove(&OrderedEntry::new(key.to_vec(), old_score, member.to_vec()));
         self.increment_count(key, -1);
         Some(old_score)
     }
@@ -2412,11 +2463,8 @@ impl FlowOrderedIndex {
             return false;
         }
 
-        self.ordered.insert(OrderedEntry {
-            key: key.to_vec(),
-            score: Score(score),
-            member: member.to_vec(),
-        });
+        self.ordered
+            .insert(OrderedEntry::new(key.to_vec(), score, member.to_vec()));
         self.insert_lookup(key, member, score);
         true
     }
@@ -2426,22 +2474,19 @@ impl FlowOrderedIndex {
             return false;
         };
 
-        self.ordered.remove(&OrderedEntry {
-            key: key.to_vec(),
-            score: Score(old_score),
-            member: member.to_vec(),
-        });
+        self.ordered
+            .remove(&OrderedEntry::new(key.to_vec(), old_score, member.to_vec()));
         true
     }
 
     fn move_member(&mut self, from_key: &[u8], to_key: &[u8], member: &[u8], score: f64) {
         if from_key == to_key {
             if let Some(old_score) = self.lookup_score(from_key, member).copied() {
-                self.ordered.remove(&OrderedEntry {
-                    key: from_key.to_vec(),
-                    score: Score(old_score),
-                    member: member.to_vec(),
-                });
+                self.ordered.remove(&OrderedEntry::new(
+                    from_key.to_vec(),
+                    old_score,
+                    member.to_vec(),
+                ));
             }
 
             self.put(to_key, member, score, false);
@@ -2451,11 +2496,8 @@ impl FlowOrderedIndex {
         let _source_exists = self.delete(from_key, member).is_some();
         let _destination_exists = self.delete(to_key, member).is_some();
 
-        self.ordered.insert(OrderedEntry {
-            key: to_key.to_vec(),
-            score: Score(score),
-            member: member.to_vec(),
-        });
+        self.ordered
+            .insert(OrderedEntry::new(to_key.to_vec(), score, member.to_vec()));
         self.insert_lookup(to_key, member, score);
 
         self.increment_count(to_key, 1);
@@ -2622,11 +2664,7 @@ impl FlowOrderedIndex {
             return Vec::new();
         }
 
-        let cursor_upper = OrderedEntry {
-            key: key.to_vec(),
-            score: Score(cursor_score),
-            member: cursor_member.to_vec(),
-        };
+        let cursor_upper = OrderedEntry::new(key.to_vec(), cursor_score, cursor_member.to_vec());
         let Some((lower, score_upper)) = exact_key_range_bounds(key, min, max) else {
             return Vec::new();
         };
@@ -2669,11 +2707,7 @@ impl FlowOrderedIndex {
             return Vec::new();
         }
 
-        let cursor_lower = OrderedEntry {
-            key: key.to_vec(),
-            score: Score(cursor_score),
-            member: cursor_member.to_vec(),
-        };
+        let cursor_lower = OrderedEntry::new(key.to_vec(), cursor_score, cursor_member.to_vec());
         let Some((score_lower, upper)) = exact_key_range_bounds(key, min, max) else {
             return Vec::new();
         };
@@ -2711,11 +2745,7 @@ impl FlowOrderedIndex {
         }
 
         let mut rows = Vec::with_capacity(count.min(self.ordered.len()));
-        let lower = OrderedEntry {
-            key: key.to_vec(),
-            score: Score(f64::NEG_INFINITY),
-            member: Vec::new(),
-        };
+        let lower = OrderedEntry::new(key.to_vec(), f64::NEG_INFINITY, Vec::new());
 
         for entry in self.ordered.range(lower..) {
             if entry.key.as_slice() != key {
@@ -2810,11 +2840,7 @@ impl FlowOrderedIndex {
         let mut rows = Vec::with_capacity(lane_keys.len());
 
         for lane_key in lane_keys {
-            let lower = OrderedEntry {
-                key: (*lane_key).to_vec(),
-                score: Score(f64::NEG_INFINITY),
-                member: Vec::new(),
-            };
+            let lower = OrderedEntry::new((*lane_key).to_vec(), f64::NEG_INFINITY, Vec::new());
 
             let Some(entry) = self.ordered.range(lower..).next() else {
                 continue;
@@ -2838,11 +2864,7 @@ impl FlowOrderedIndex {
         let mut rows = Vec::with_capacity(due_lane_keys.len());
 
         for (due_key, lane_key) in due_lane_keys {
-            let lower = OrderedEntry {
-                key: (*lane_key).to_vec(),
-                score: Score(f64::NEG_INFINITY),
-                member: Vec::new(),
-            };
+            let lower = OrderedEntry::new((*lane_key).to_vec(), f64::NEG_INFINITY, Vec::new());
 
             let Some(entry) = self.ordered.range(lower..).next() else {
                 continue;
@@ -2873,11 +2895,7 @@ impl FlowOrderedIndex {
     ) -> Vec<(Vec<u8>, Vec<u8>, f64)> {
         let mut rows = Vec::with_capacity(limit.min(max_scan).min(self.ordered.len()));
         let mut scanned = 0usize;
-        let lower = OrderedEntry {
-            key: key.to_vec(),
-            score: Score(f64::NEG_INFINITY),
-            member: Vec::new(),
-        };
+        let lower = OrderedEntry::new(key.to_vec(), f64::NEG_INFINITY, Vec::new());
 
         for entry in self.ordered.range(lower..) {
             if entry.key.as_slice() != key {
@@ -2907,11 +2925,7 @@ impl FlowOrderedIndex {
         let mut rows = Vec::with_capacity(keys.len());
 
         for key in keys {
-            let lower = OrderedEntry {
-                key: key.to_vec(),
-                score: Score(f64::NEG_INFINITY),
-                member: Vec::new(),
-            };
+            let lower = OrderedEntry::new(key.to_vec(), f64::NEG_INFINITY, Vec::new());
 
             if let Some(entry) = self.ordered.range(lower..).next() {
                 if entry.key.as_slice() == *key && entry.score.0 <= max_score {
@@ -2952,11 +2966,7 @@ impl FlowOrderedIndex {
     }
 
     fn first_score_for_key(&self, key: &[u8]) -> Option<f64> {
-        let lower = OrderedEntry {
-            key: key.to_vec(),
-            score: Score(f64::NEG_INFINITY),
-            member: Vec::new(),
-        };
+        let lower = OrderedEntry::new(key.to_vec(), f64::NEG_INFINITY, Vec::new());
 
         self.ordered
             .range(lower..)
@@ -3175,42 +3185,34 @@ fn lower_entry_for_exact_key(key: &[u8], min: Bound) -> Option<OrderedEntry> {
         Bound::PosInf | Bound::Impossible => return None,
     };
 
-    Some(OrderedEntry {
-        key: key.to_vec(),
-        score: Score(score),
-        member: Vec::new(),
-    })
+    Some(OrderedEntry::new(key.to_vec(), score, Vec::new()))
 }
 
 fn upper_entry_for_exact_key(key: &[u8], max: Bound) -> Option<OrderedEntry> {
     let score = match max {
         Bound::PosInf => {
-            return Some(OrderedEntry {
-                key: upper_key_for_exact_key(key),
-                score: Score(f64::NEG_INFINITY),
-                member: Vec::new(),
-            });
+            return Some(OrderedEntry::new(
+                upper_key_for_exact_key(key),
+                f64::NEG_INFINITY,
+                Vec::new(),
+            ));
         }
         Bound::Exclusive(score) => score,
         Bound::Inclusive(score) => match next_score(score) {
             Some(next) => next,
             None if score == f64::INFINITY => {
-                return Some(OrderedEntry {
-                    key: upper_key_for_exact_key(key),
-                    score: Score(f64::NEG_INFINITY),
-                    member: Vec::new(),
-                });
+                return Some(OrderedEntry::new(
+                    upper_key_for_exact_key(key),
+                    f64::NEG_INFINITY,
+                    Vec::new(),
+                ));
             }
             None => return None,
         },
         Bound::NegInf | Bound::Impossible => return None,
     };
 
-    Some(OrderedEntry {
-        key: key.to_vec(),
-        score: Score(score),
-        member: Vec::new(),
-    })
+    Some(OrderedEntry::new(key.to_vec(), score, Vec::new()))
 }
 
 fn exact_key_range_bounds(
@@ -4085,6 +4087,82 @@ mod tests {
             ),
             vec![(b"b".to_vec(), 10.0), (b"a".to_vec(), 10.0)]
         );
+    }
+
+    #[test]
+    fn history_events_of_one_millisecond_order_by_version() {
+        let history_key = b"f:{f:YWJj}:h:flow-1".as_slice();
+        let mut index = FlowOrderedIndex::default();
+        for member in ["1000-10", "1000-9", "1000-2", "1000-11", "1000-1", "999-12"] {
+            let score = if member.starts_with("999-") {
+                999.0
+            } else {
+                1000.0
+            };
+            index.put(history_key, member.as_bytes(), score, false);
+        }
+
+        let members = |rows: Vec<(Vec<u8>, f64)>| {
+            rows.into_iter()
+                .map(|(member, _score)| String::from_utf8(member).unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            members(index.range_slice(history_key, Bound::NegInf, Bound::PosInf, false, 0, 8)),
+            ["999-12", "1000-1", "1000-2", "1000-9", "1000-10", "1000-11"]
+        );
+        assert_eq!(
+            members(index.range_forward_after(
+                history_key,
+                Bound::NegInf,
+                Bound::PosInf,
+                1000.0,
+                b"1000-9",
+                0,
+                8,
+            )),
+            ["1000-10", "1000-11"]
+        );
+        assert_eq!(
+            members(index.range_reverse_before(
+                history_key,
+                Bound::NegInf,
+                Bound::PosInf,
+                1000.0,
+                b"1000-10",
+                0,
+                8,
+            )),
+            ["1000-9", "1000-2", "1000-1", "999-12"]
+        );
+
+        assert_eq!(index.delete(history_key, b"1000-10"), Some(1000.0));
+        index.put(history_key, b"1000-9", 1001.0, false);
+        assert_eq!(
+            members(index.range_slice(history_key, Bound::NegInf, Bound::PosInf, true, 0, 8)),
+            ["1000-9", "1000-11", "1000-2", "1000-1", "999-12"]
+        );
+        assert_eq!(index.ordered.len(), index.lookup[history_key].len());
+    }
+
+    #[test]
+    fn indexes_other_than_history_keep_member_byte_order() {
+        let mut index = FlowOrderedIndex::default();
+        for key in [
+            b"f:{f:YWJj}:d:type".as_slice(),
+            b"f:{f:YWJj}:hrf:flow-1".as_slice(),
+            b"f:{f:YWJj}:h:".as_slice(),
+            b"history:1000".as_slice(),
+        ] {
+            index.put(key, b"1000-10", 5.0, false);
+            index.put(key, b"1000-9", 5.0, false);
+
+            assert_eq!(
+                index.range_slice(key, Bound::NegInf, Bound::PosInf, false, 0, 4),
+                vec![(b"1000-10".to_vec(), 5.0), (b"1000-9".to_vec(), 5.0)]
+            );
+        }
     }
 
     #[test]
