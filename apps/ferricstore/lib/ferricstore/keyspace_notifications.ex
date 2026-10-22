@@ -135,6 +135,11 @@ defmodule Ferricstore.KeyspaceNotifications do
     "LTRIM" => "ltrim",
     "LREM" => "lrem",
     "LMOVE" => "lmove",
+    "RPOPLPUSH" => "lmove",
+    "BLMOVE" => "lmove",
+    "BLPOP" => "lpop",
+    "BRPOP" => "rpop",
+    "BLMPOP" => "lpop",
     "SADD" => "sadd",
     "SREM" => "srem",
     "SPOP" => "spop",
@@ -167,7 +172,7 @@ defmodule Ferricstore.KeyspaceNotifications do
   @zero_result_noop ~w(SETNX MSETNX DEL UNLINK EXPIRE PEXPIRE EXPIREAT PEXPIREAT
     PERSIST RENAMENX COPY HSETNX HDEL LPUSHX RPUSHX SADD SREM SMOVE ZREM LREM PFADD
     XDEL XTRIM)
-  @nil_result_noop ~w(GETDEL LPOP RPOP SPOP SET)
+  @nil_result_noop ~w(GETDEL LPOP RPOP SPOP SET LMOVE RPOPLPUSH BLMOVE BLPOP BRPOP BLMPOP)
   @empty_list_result_noop ~w(LPOP RPOP SPOP ZPOPMIN ZPOPMAX)
 
   @doc "Whether `notify-keyspace-events` turns any notifications on."
@@ -233,7 +238,7 @@ defmodule Ferricstore.KeyspaceNotifications do
     do: notify_key(destination, event)
 
   defp notify_event(command, event, [source, destination | _rest], _result)
-       when command in ~w(RENAME RENAMENX LMOVE SMOVE) do
+       when command in ~w(RENAME RENAMENX LMOVE RPOPLPUSH BLMOVE SMOVE) do
     notify_key(source, event)
     notify_key(destination, event)
   end
@@ -244,6 +249,21 @@ defmodule Ferricstore.KeyspaceNotifications do
 
   defp notify_event("BITOP", event, [_operation, destination | _rest], _result),
     do: notify_key(destination, event)
+
+  # A blocking pop names the key it served in its reply.
+  defp notify_event(command, event, _args, [key, _popped]) when command in ~w(BLPOP BRPOP),
+    do: notify_key(key, event)
+
+  defp notify_event("BLMPOP", _event, args, [key, _popped]) do
+    case Ferricstore.Commands.Blocking.parse_blmpop_args(args) do
+      {:ok, _keys, :right, _count, _timeout_ms} -> notify_key(key, "rpop")
+      {:ok, _keys, :left, _count, _timeout_ms} -> notify_key(key, "lpop")
+      _invalid -> :ok
+    end
+  end
+
+  defp notify_event(command, _event, _args, _result) when command in ~w(BLPOP BRPOP BLMPOP),
+    do: :ok
 
   defp notify_event(_command, event, [key | _rest], _result), do: notify_key(key, event)
   defp notify_event(_command, _event, _args, _result), do: :ok

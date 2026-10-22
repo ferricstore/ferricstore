@@ -5013,6 +5013,26 @@ defmodule FerricstoreServer.Native.CommandsTest do
       %{key: "{notify:#{System.unique_integer([:positive, :monotonic])}}"}
     end
 
+    test "RPOPLPUSH notifies like LMOVE, and neither notifies an empty source", %{key: key} do
+      source = key <> ":source"
+      destination = key <> ":destination"
+      :ok = PubSub.subscribe("__keyevent@0__:lmove", self())
+
+      exec = fn command, args ->
+        Commands.execute(@op_command_exec, %{"command" => command, "args" => args}, state())
+      end
+
+      assert {:ok, 1, _state} = exec.("RPUSH", [source, "v"])
+      assert {:ok, "v", _state} = exec.("RPOPLPUSH", [source, destination])
+
+      assert_receive {:pubsub_message, "__keyevent@0__:lmove", ^source}
+      assert_receive {:pubsub_message, "__keyevent@0__:lmove", ^destination}
+
+      assert {:ok, nil, _state} = exec.("RPOPLPUSH", [source, destination])
+      assert {:ok, nil, _state} = exec.("LMOVE", [source, destination, "LEFT", "LEFT"])
+      refute_receive {:pubsub_message, "__keyevent@0__:lmove", _key}, 100
+    end
+
     test "a compact SET pipeline notifies every key", %{key: key} do
       first = key <> ":compact-a"
       second = key <> ":compact-b"

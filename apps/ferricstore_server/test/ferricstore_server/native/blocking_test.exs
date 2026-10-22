@@ -549,5 +549,64 @@ defmodule FerricstoreServer.Native.BlockingTest do
     end
   end
 
+  describe "keyspace notifications" do
+    setup do
+      :ok = Ferricstore.Config.set("notify-keyspace-events", "KEA")
+
+      on_exit(fn ->
+        Ferricstore.Config.set("notify-keyspace-events", "")
+        Ferricstore.PubSub.cleanup(self())
+      end)
+
+      :ok
+    end
+
+    test "a served blocking pop notifies the key it popped" do
+      ctx = FerricStore.Instance.get(:default)
+
+      state = %{
+        instance_ctx: ctx,
+        acl_cache: :full_access,
+        require_auth: false,
+        authenticated: true
+      }
+
+      for event <- ["lpop", "rpop", "lmove"],
+          do: :ok = Ferricstore.PubSub.subscribe("__keyevent@0__:" <> event, self())
+
+      for {command, events} <- [
+            {"BLPOP", ["lpop"]},
+            {"BRPOP", ["rpop"]},
+            {"BLMPOP", ["rpop"]},
+            {"BLMOVE", ["lmove", "lmove"]}
+          ] do
+        key = "native:blocking:{notify-#{System.unique_integer([:positive])}}"
+        empty = key <> ":empty"
+        destination = key <> ":destination"
+        assert 2 = Ferricstore.Commands.List.handle_ast({:rpush, [key, "a", "b"]}, ctx)
+
+        args =
+          case command do
+            "BLMPOP" -> ["1", "2", empty, key, "RIGHT"]
+            "BLMOVE" -> [key, destination, "LEFT", "RIGHT", "1"]
+            _pop -> [empty, key, "1"]
+          end
+
+        assert {:ok, prepared} = Session.prepare_command(%{"command" => command, "args" => args})
+        meta = %{request_id: make_ref()}
+        assert {:ok, worker, _monitor} = Blocking.start_prepared(prepared, state, meta)
+        assert_receive {:native_blocking_response, ^meta, ^worker, :ok, result}, 1_000
+        refute is_nil(result)
+
+        notified_keys = if command == "BLMOVE", do: [key, destination], else: [key]
+
+        for {event, notified} <- Enum.zip(events, notified_keys) do
+          channel = "__keyevent@0__:" <> event
+          assert_receive {:pubsub_message, ^channel, ^notified}, 1_000
+        end
+      end
+    end
+  end
+
   defp wait_until(_fun, 0), do: flunk("condition was not met before timeout")
 end

@@ -10,6 +10,10 @@ All notable changes to FerricStore will be documented here.
   took a combined put that skips them. Native compact pipelines (the SDKs'
   batched SET, stream append and other compact forms) skipped them the same
   way. Both now run command by command while notifications are on.
+- Keyspace notifications now fire for BLPOP, BRPOP and BLMPOP (`lpop`/`rpop`
+  on the key they served), BLMOVE and RPOPLPUSH (`lmove`, as LMOVE). These
+  commands published nothing before. LMOVE from an empty source no longer
+  publishes `lmove` for keys it did not change.
 
 - Security: `-@dangerous` did not remove ACL SETUSER, DELUSER, GETUSER, LIST,
   LOAD, SAVE and LOG, nor SAVE, BGSAVE, LASTSAVE, SLOWLOG, INFO or CLIENT
