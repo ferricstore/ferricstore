@@ -1343,6 +1343,12 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
           when is_binary(value) and (expire_at_ms == 0 or expire_at_ms > now) ->
             match?({:ok, _type, :promoted, _generation}, Promotion.decode_marker(value))
 
+          # Memory pressure may have evicted the marker's value; the state
+          # machine reads it back and routes the collection.
+          [{^marker_key, nil, expire_at_ms, _lfu, _fid, _offset, _value_size}]
+          when expire_at_ms == 0 or expire_at_ms > now ->
+            true
+
           _missing_or_invalid ->
             false
         end

@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- In a cluster, deleting a promoted hash, set or sorted set could leave a
+  replica holding its promotion marker and dedicated file when memory
+  pressure had evicted that replica's copy of the marker: the replica took
+  the fast segment-projection path, which saw no live marker, and deleted the
+  members as an ordinary collection's. That replica then routed the key
+  differently from the others. An evicted marker now sends the write to the
+  state machine, which reads the marker back and cleans up as the other
+  replicas do.
+
 - FLOW.LIST of a terminal state (completed, failed, cancelled) without
   `include_cold`, and the by-parent, by-root and by-correlation lineage
   lists, dropped a terminal flow that had attributes or indexed state
