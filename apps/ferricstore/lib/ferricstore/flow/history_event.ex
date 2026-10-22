@@ -39,5 +39,6 @@ defmodule Ferricstore.Flow.HistoryEvent do
   # millisecond.
   def ref_sort_key({event_id, score}), do: {score, version(event_id), event_id}
 
-  defp digits?(value), do: value =~ ~r/\A[0-9]+\z/
+  defp digits?(<<digit, rest::binary>>) when digit in ?0..?9, do: rest == "" or digits?(rest)
+  defp digits?(_value), do: false
 end

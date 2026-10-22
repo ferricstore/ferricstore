@@ -10,6 +10,7 @@ defmodule Ferricstore.Flow.LMDB.HistoryScan do
   alias Ferricstore.Flow.{HistoryEvent, LMDB, LMDBQueryWindow}
 
   @ms_page 256
+  @ms_page_bytes 1_048_576
 
   def first(path, history_key, limit),
     do: scan(path, LMDB.history_index_prefix(history_key), nil, limit, :asc)
@@ -49,7 +50,7 @@ defmodule Ferricstore.Flow.LMDB.HistoryScan do
         :desc -> {seek, &(&1 < cursor)}
       end
 
-    with {:ok, same_ms} <- rest_of_ms(path, prefix, seek, :asc, []),
+    with {:ok, same_ms} <- rest_of_ms(path, prefix, seek, :asc),
          {:ok, beyond} <- scan(path, prefix, beyond_seek, limit, direction) do
       same_ms
       |> Enum.filter(&beyond?.(sort_key(prefix, &1)))
@@ -69,7 +70,7 @@ defmodule Ferricstore.Flow.LMDB.HistoryScan do
       else
         {last_key, _value} = List.last(entries)
 
-        with {:ok, rest} <- rest_of_ms(path, prefix, last_key, direction, []) do
+        with {:ok, rest} <- rest_of_ms(path, prefix, last_key, direction) do
           {:ok, (entries ++ rest) |> sort(prefix, direction) |> Enum.take(limit)}
         end
       end
@@ -85,27 +86,48 @@ defmodule Ferricstore.Flow.LMDB.HistoryScan do
   defp read(path, prefix, seek, limit, :desc),
     do: LMDB.prefix_entries_reverse_before(path, prefix, seek, limit)
 
-  # The entries past `key`, in `direction`, that share its millisecond.
-  defp rest_of_ms(path, prefix, key, direction, acc) do
-    ms = key_ms(prefix, key)
+  # The entries past `key`, in `direction`, that share its millisecond: a read
+  # bounded to that millisecond, so it is empty unless events share it.
+  defp rest_of_ms(path, prefix, key, direction) do
+    case key_ms(prefix, key) do
+      nil ->
+        {:ok, []}
 
-    with {:ok, page} <- read(path, prefix, key, @ms_page, direction) do
-      same_ms =
-        Enum.take_while(page, fn {entry_key, _value} -> key_ms(prefix, entry_key) == ms end)
+      ms ->
+        ms_start = prefix <> ms
 
-      acc = [same_ms | acc]
-
-      if length(same_ms) == @ms_page do
-        {next_key, _value} = List.last(same_ms)
-        rest_of_ms(path, prefix, next_key, direction, acc)
-      else
-        {:ok, acc |> Enum.reverse() |> Enum.concat()}
-      end
+        case direction do
+          :asc -> ms_range(path, prefix, key, ms_start <> <<255>>, [])
+          :desc -> ms_range(path, prefix, ms_start, key, [])
+        end
     end
   end
 
-  defp sort(entries, prefix, direction),
-    do: Enum.sort_by(entries, &sort_key(prefix, &1), direction)
+  defp ms_range(path, prefix, after_key, before_key, acc) do
+    case LMDB.range_entries_bounded(path, prefix, after_key, before_key, @ms_page, @ms_page_bytes) do
+      {:ok, entries, false, _bytes} when entries != [] ->
+        {next_key, _value} = List.last(entries)
+        ms_range(path, prefix, next_key, before_key, [entries | acc])
+
+      {:ok, entries, _complete?, _bytes} ->
+        {:ok, [entries | acc] |> Enum.reverse() |> Enum.concat()}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  # Byte order is history order unless two neighbours share a millisecond.
+  defp sort(entries, prefix, direction) do
+    if shared_ms?(entries, prefix),
+      do: Enum.sort_by(entries, &sort_key(prefix, &1), direction),
+      else: entries
+  end
+
+  defp shared_ms?([{key, _value} | [{next_key, _next_value} | _] = rest], prefix),
+    do: key_ms(prefix, key) == key_ms(prefix, next_key) or shared_ms?(rest, prefix)
+
+  defp shared_ms?(_entries, _prefix), do: false
 
   defp sort_key(prefix, {key, _value}), do: sort_key(prefix, key)
 
