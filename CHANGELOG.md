@@ -8,6 +8,9 @@ All notable changes to FerricStore will be documented here.
   proposed the same release of values its trimmed history no longer referred
   to, so each release ran once per node and was applied on every node once
   per proposal. Only the shard's leader releases now.
+- In a cluster, every node woke a schedule queued behind a target that just
+  finished: each read the target's state through the log and proposed the
+  same schedule update. Only the leader of the target's shard wakes it now.
 - In a cluster, a watched transaction (WATCH ... MULTI ... EXEC) could commit
   on the leader while the other replicas skipped it, leaving them permanently
   different. Every replica checks the WATCH tokens against its own storage,

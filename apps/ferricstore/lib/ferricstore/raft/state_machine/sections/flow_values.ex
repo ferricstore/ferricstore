@@ -50,7 +50,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       defp flow_after_history_put(state, record) do
         with :ok <- flow_history_trim(state, record),
              :ok <- maybe_queue_terminal_lmdb_history_indexes(state, record) do
-          Ferricstore.Flow.Scheduler.notify_target_terminal(state.instance_ctx, record)
+          Ferricstore.Flow.Scheduler.notify_target_terminal(
+            state.instance_ctx,
+            state.shard_index,
+            record
+          )
+
           HistoryValueRelease.notify(state.instance_ctx, state.shard_index, record)
           :ok
         end
