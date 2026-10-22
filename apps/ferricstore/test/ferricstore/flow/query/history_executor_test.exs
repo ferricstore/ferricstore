@@ -309,6 +309,52 @@ defmodule Ferricstore.Flow.Query.HistoryExecutorTest do
     end
   end
 
+  test "accepts pages of one millisecond in version order" do
+    scope = MandatoryScope.dedicated()
+
+    for {direction, page_events, boundary} <- [
+          {:asc, ["1000-9", "1000-10"], "1000-8"},
+          {:desc, ["1000-10", "1000-9"], "1000-11"}
+        ] do
+      request = %{history_request("history-same-ms", 2) | order_by: [{:event_id, direction}]}
+      {:ok, plan} = Planner.plan(request, [], mandatory_scope: scope, now_ms: @now_ms)
+
+      claim = %Cursor.Claim{
+        request_digest: :binary.copy(<<0>>, 32),
+        index_id: plan.index_id,
+        index_version: plan.index_version,
+        index_build_id: plan.index_build_id,
+        continuation: TermCodec.encode({:ferric_flow_history_seek, 1, boundary}),
+        token_digest: :binary.copy(<<1>>, 32)
+      }
+
+      page_read = fn _ctx, _request, _scope, ^boundary ->
+        {:ok,
+         %{
+           records: Enum.map(page_events, &event/1),
+           has_more: false,
+           continuation: nil,
+           scanned_entries: 2,
+           hydrated_records: 2,
+           duplicate_entries: 0,
+           memory_high_water_bytes: 1_000
+         }}
+      end
+
+      assert {:ok, %ExecutionResult{records: records}} =
+               HistoryExecutor.execute(
+                 context(),
+                 %{request | cursor: {:literal, :keyword, String.duplicate("x", 16)}},
+                 plan,
+                 %{claim: claim, key: @cursor_key},
+                 page_read: page_read,
+                 now_ms: @now_ms
+               )
+
+      assert Enum.map(records, & &1.event_id) == page_events
+    end
+  end
+
   defp history_request(id, limit) do
     Request.history(
       :execute,

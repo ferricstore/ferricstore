@@ -1,6 +1,8 @@
 defmodule Ferricstore.Flow.HistoryQuery do
   @moduledoc false
 
+  alias Ferricstore.Flow.HistoryEvent
+
   @filter_keys [
     :from_event,
     :to_event,
@@ -82,7 +84,7 @@ defmodule Ferricstore.Flow.HistoryQuery do
 
   defp event_matches?({event_id, fields}, query, event_ms_fun) do
     event_ms = event_ms_fun.(event_id)
-    event_key = {event_ms, event_id}
+    event_key = event_key(event_id, event_ms_fun)
     version = field_int(fields, "version")
 
     event_after?(event_key, query.from_event, event_ms_fun) and
@@ -105,7 +107,8 @@ defmodule Ferricstore.Flow.HistoryQuery do
   defp event_before?(event_key, to_event, event_ms_fun),
     do: event_key <= event_key(to_event, event_ms_fun)
 
-  defp event_key(event_id, event_ms_fun), do: {event_ms_fun.(event_id), event_id}
+  defp event_key(event_id, event_ms_fun),
+    do: {event_ms_fun.(event_id), HistoryEvent.version(event_id), event_id}
 
   defp ms_after?(_event_ms, nil), do: true
   defp ms_after?(event_ms, from_ms), do: event_ms >= from_ms

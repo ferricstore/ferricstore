@@ -4,6 +4,7 @@ defmodule Ferricstore.Flow.HistoryRead do
   alias Ferricstore.BatchResult
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.Codec
+  alias Ferricstore.Flow.HistoryEvent
   alias Ferricstore.Flow.ScopeBinding
   alias Ferricstore.Store.ReadResult
   alias Ferricstore.Store.Router
@@ -308,7 +309,7 @@ defmodule Ferricstore.Flow.HistoryRead do
 
     unique_refs =
       refs
-      |> Enum.sort_by(fn {event_id, score} -> {score, event_id} end, direction)
+      |> Enum.sort_by(&HistoryEvent.ref_sort_key/1, direction)
       |> Enum.uniq_by(&elem(&1, 0))
 
     {:ok,
@@ -520,7 +521,7 @@ defmodule Ferricstore.Flow.HistoryRead do
 
   defp candidate_event_ids(refs, query) do
     refs
-    |> Enum.sort_by(fn {event_id, score} -> {score, event_id} end)
+    |> Enum.sort_by(&HistoryEvent.ref_sort_key/1)
     |> Enum.uniq_by(fn {event_id, _score} -> event_id end)
     |> limit_candidate_refs(query)
     |> Enum.map(fn {event_id, _score} -> event_id end)
@@ -867,9 +868,7 @@ defmodule Ferricstore.Flow.HistoryRead do
               _other ->
                 []
             end)
-            |> Enum.sort_by(fn {event_id, _fields} ->
-              {Ferricstore.Flow.HistoryEvent.ms(event_id), event_id}
-            end)
+            |> Enum.sort_by(fn {event_id, _fields} -> HistoryEvent.sort_key(event_id) end)
             |> Enum.take(-fetch_count)
 
           events =
