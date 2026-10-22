@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A node that stopped while saving its Flow query index registry could fail
+  to start ("invalid_query_index_registry_journal: non_monotonic_checkpoint")
+  or silently undo a validation restart. Saving writes the registry snapshot
+  before it empties the progress journal, and a restart in between replayed
+  journal events the snapshot already held. Each journal event now names the
+  snapshot it follows, and replay skips events of an older one.
 - In a cluster, every node read a running Flow's remaining history and
   proposed the same release of values its trimmed history no longer referred
   to, so each release ran once per node and was applied on every node once

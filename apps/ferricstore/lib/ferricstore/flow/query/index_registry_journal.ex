@@ -3,8 +3,13 @@ defmodule Ferricstore.Flow.Query.IndexRegistryJournal do
 
   alias Ferricstore.TermCodec
 
+  # Version 2 events name the registry snapshot they follow (the SHA-256 of
+  # its bytes). Saving a snapshot empties the journal only after the snapshot
+  # is in place, so a node stopped in between restarts with events the
+  # snapshot already holds; they name the older snapshot and are skipped.
   @tag :flow_query_index_registry_progress
-  @version 1
+  @legacy_version 1
+  @version 2
   @relative_path "flow_query/index-registry-progress.journal"
   @digest_bytes 32
   @header_bytes 4 + @digest_bytes
@@ -16,7 +21,11 @@ defmodule Ferricstore.Flow.Query.IndexRegistryJournal do
   def path(%{data_dir: data_dir}) when is_binary(data_dir) and data_dir != "",
     do: Path.join(data_dir, @relative_path)
 
-  @spec read(map()) :: {:ok, [term()]} | {:error, term()}
+  @doc """
+  The journal's events as `{snapshot_digest, event}`, with `:legacy` for events
+  older releases wrote, which name no snapshot.
+  """
+  @spec read(map()) :: {:ok, [{binary() | :legacy, term()}]} | {:error, term()}
   def read(ctx) do
     journal_path = path(ctx)
 
@@ -35,9 +44,10 @@ defmodule Ferricstore.Flow.Query.IndexRegistryJournal do
     end
   end
 
-  @spec append(map(), term()) :: :ok | {:error, term()}
-  def append(ctx, event) do
-    payload = TermCodec.encode({@tag, @version, event})
+  @spec append(map(), binary(), term()) :: :ok | {:error, term()}
+  def append(ctx, snapshot_digest, event)
+      when is_binary(snapshot_digest) and byte_size(snapshot_digest) == @digest_bytes do
+    payload = TermCodec.encode({@tag, @version, snapshot_digest, event})
 
     if byte_size(payload) <= @max_event_bytes do
       digest = :crypto.hash(:sha256, payload)
@@ -92,7 +102,8 @@ defmodule Ferricstore.Flow.Query.IndexRegistryJournal do
         <<payload::binary-size(^size), tail::binary>> = rest
 
         with true <- :crypto.hash(:sha256, payload) == digest,
-             {:ok, {@tag, @version, event}} <- TermCodec.decode(payload) do
+             {:ok, decoded} <- TermCodec.decode(payload),
+             {:ok, event} <- decoded_event(decoded) do
           frame_bytes = @header_bytes + size
           decode_frames(tail, [event | events], valid_bytes + frame_bytes, count + 1)
         else
@@ -101,6 +112,13 @@ defmodule Ferricstore.Flow.Query.IndexRegistryJournal do
         end
     end
   end
+
+  defp decoded_event({@tag, @version, snapshot_digest, event})
+       when is_binary(snapshot_digest) and byte_size(snapshot_digest) == @digest_bytes,
+       do: {:ok, {snapshot_digest, event}}
+
+  defp decoded_event({@tag, @legacy_version, event}), do: {:ok, {:legacy, event}}
+  defp decoded_event(_decoded), do: :invalid
 
   defp repair(_ctx, contents, valid_bytes) when valid_bytes == byte_size(contents), do: :ok
 

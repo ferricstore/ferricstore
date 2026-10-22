@@ -183,7 +183,7 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
          {:ok, loaded, persist?} <- load_registry(ctx, catalog, metadata_contract),
          {:ok, table} <- create_cache(ctx),
          state = Map.merge(loaded, %{instance_ctx: ctx, cache_table: table}),
-         :ok <- maybe_persist(state, persist?),
+         {:ok, state} <- maybe_persist(state, persist?),
          :ok <- publish(state) do
       {:ok, state}
     else
@@ -507,7 +507,9 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
     with {:ok, encoded} <- Ferricstore.FS.read_nofollow(path, @max_snapshot_bytes),
          {:ok, persisted} <- decode_snapshot(encoded),
          :ok <- validate_metadata_contract(persisted.metadata_contract, metadata_contract),
-         {:ok, persisted} <- replay_journal(Map.put(persisted, :instance_ctx, ctx)),
+         persisted =
+           Map.merge(persisted, %{instance_ctx: ctx, snapshot_digest: snapshot_digest(encoded)}),
+         {:ok, persisted} <- replay_journal(persisted),
          {:ok, reconciled, changed?} <-
            reconcile_catalog(persisted, catalog, ctx.shard_count, metadata_contract) do
       {:ok, Map.put(reconciled, :catalog_keys, catalog_keys(catalog)), changed?}
@@ -602,7 +604,8 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
                metadata_contract: metadata_contract,
                catalog_version: catalog.version,
                catalog_digest: catalog.digest,
-               entries: entries
+               entries: entries,
+               snapshot_digest: persisted.snapshot_digest
              }, changed?}
           end
         else
@@ -807,9 +810,17 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
     end
   end
 
+  # Events that name another snapshot came before the one on disk, which
+  # already holds them (see IndexRegistryJournal).
   defp replay_journal(state) do
     with {:ok, events} <- IndexRegistryJournal.read(state.instance_ctx) do
-      replay_journal_events(events, state)
+      events
+      |> Enum.flat_map(fn
+        {:legacy, event} -> [event]
+        {digest, event} when digest == state.snapshot_digest -> [event]
+        {_older_snapshot, _event} -> []
+      end)
+      |> replay_journal_events(state)
     end
   end
 
@@ -1778,8 +1789,8 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
 
   defp commit(next_state, reply, old_state) do
     case persist(next_state) do
-      :ok ->
-        publish_commit(next_state, reply)
+      {:ok, persisted_state} ->
+        publish_commit(persisted_state, reply)
 
       {:error, reason} ->
         {:reply, {:error, {:query_index_registry_persist_failed, reason}}, old_state}
@@ -1868,7 +1879,7 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
     }
   end
 
-  defp maybe_persist(_state, false), do: :ok
+  defp maybe_persist(state, false), do: {:ok, state}
   defp maybe_persist(state, true), do: persist(state)
 
   defp persist(state) do
@@ -1882,8 +1893,10 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
          :ok <- write_synced(tmp_path, encoded),
          :ok <- FS.rename(tmp_path, path),
          :ok <- fsync_dir(directory) do
+      # Events journaled from here on name this snapshot, so ones the reset
+      # leaves behind are skipped on replay.
       _ = reset_journal(state)
-      :ok
+      {:ok, Map.put(state, :snapshot_digest, snapshot_digest(encoded))}
     else
       false ->
         {:error, :query_index_registry_snapshot_too_large}
@@ -1913,8 +1926,10 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
   end
 
   defp append_journal_event(state, event) do
-    IndexRegistryJournal.append(state.instance_ctx, event)
+    IndexRegistryJournal.append(state.instance_ctx, state.snapshot_digest, event)
   end
+
+  defp snapshot_digest(encoded), do: :crypto.hash(:sha256, encoded)
 
   defp reset_journal(state) do
     IndexRegistryJournal.reset(state.instance_ctx)
