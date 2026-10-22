@@ -169,6 +169,18 @@ defmodule FerricstoreServer.Native.FeatureLevel5MultiTest do
     assert Enum.count(results, &is_nil/1) == 19
   end
 
+  test "INCR in MULTI refuses a result outside the integer range", %{ctx: ctx, key: key} do
+    :ok = Dispatcher.dispatch("SET", [key, "9223372036854775807"], ctx)
+    :ok = Dispatcher.dispatch("SET", [key <> ":n", "5"], ctx)
+    state = queue(multi(), "INCR", [key])
+    state = queue(state, "INCRBY", [key <> ":n", "-7"])
+
+    assert {:ok, [%{"error" => "ERR increment or decrement would overflow"}, -2], _state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, state)
+
+    assert "9223372036854775807" == Dispatcher.dispatch("GET", [key], ctx)
+  end
+
   test "DECRBY of the smallest integer in MULTI answers Redis's error", %{ctx: ctx, key: key} do
     :ok = Dispatcher.dispatch("SET", [key, "-1"], ctx)
     state = queue(multi(), "DECRBY", [key, "-9223372036854775808"])

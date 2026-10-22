@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- INCR, INCRBY, DECR and DECRBY inside MULTI stored a result outside the
+  64-bit range (9223372036854775807 + 1 answered 9223372036854775808). At
+  feature level 5 they answer "ERR increment or decrement would overflow" and
+  leave the value, as outside a transaction; below it the older write is kept.
 - MSET, MSETNX and compound batch writes (hash, set and sorted set members) on
   a key whose FETCH_OR_COMPUTE lease the cluster clock and wall clock disagree
   on raised in apply (stopping the shard, and again on

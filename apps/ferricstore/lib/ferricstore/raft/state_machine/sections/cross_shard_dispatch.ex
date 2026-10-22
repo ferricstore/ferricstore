@@ -1995,18 +1995,34 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           end
         end
 
+        # Level 5 refuses a result outside the integer range, as INCR outside
+        # a transaction does; older releases store it.
+        incr_overflow? = fn value ->
+          (value > 9_223_372_036_854_775_807 or value < -9_223_372_036_854_775_808) and
+            feature_level_5?(anchor_state)
+        end
+
         local_incr = fn key, delta ->
           case local_get_meta.(key) do
             nil ->
-              local_put.(key, delta, 0)
-              {:ok, delta}
+              if incr_overflow?.(delta) do
+                {:error, "ERR increment or decrement would overflow"}
+              else
+                local_put.(key, delta, 0)
+                {:ok, delta}
+              end
 
             {value, expire_at_ms} ->
               case coerce_integer(value) do
                 {:ok, int_val} ->
                   new_val = int_val + delta
-                  local_put.(key, new_val, expire_at_ms)
-                  {:ok, new_val}
+
+                  if incr_overflow?.(new_val) do
+                    {:error, "ERR increment or decrement would overflow"}
+                  else
+                    local_put.(key, new_val, expire_at_ms)
+                    {:ok, new_val}
+                  end
 
                 :error ->
                   {:error, "ERR value is not an integer or out of range"}

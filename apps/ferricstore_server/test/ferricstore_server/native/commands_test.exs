@@ -5179,6 +5179,24 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert "" == Router.get(ctx, key)
   end
 
+  test "native MULTI INCR past the integer range keeps the old write below level 5" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "{multi-incr:#{System.unique_integer([:positive])}}"
+    :ok = Ferricstore.Commands.Dispatcher.dispatch("SET", [key, "9223372036854775807"], ctx)
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(%{"command" => "INCR", "args" => [key]}, state)
+
+    # The data outcome is what replicas on older releases apply.
+    assert {:ok, [reply], _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
+    refute match?(%{"error" => _}, reply)
+
+    assert "9223372036854775808" == Ferricstore.Commands.Dispatcher.dispatch("GET", [key], ctx)
+  end
+
   test "native MULTI DECRBY of the smallest integer keeps the old write below level 5" do
     ctx = FerricStore.Instance.get(:default)
     key = "{multi-decrby:#{System.unique_integer([:positive])}}"
