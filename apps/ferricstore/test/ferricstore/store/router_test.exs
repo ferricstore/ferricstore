@@ -374,6 +374,27 @@ defmodule Ferricstore.Store.RouterTest do
       refute Router.get_with_file_ref(ctx, key) == {:cold_ref, path, value_offset, size}
       refute Router.get(ctx, key) == value
     end
+
+    test "batched file-ref reads report a corrupted cold value instead of a missing one", %{
+      ctx: ctx
+    } do
+      key = "sendfile_batch_crc_" <> Integer.to_string(System.unique_integer([:positive]))
+      value = :binary.copy("d", ctx.hot_cache_max_value_size + 1024)
+
+      assert :ok = Router.put(ctx, key, value, 0)
+      assert {:cold_ref, path, value_offset, _size} = Router.get_with_file_ref(ctx, key)
+
+      assert {:ok, file} = :file.open(path, [:read, :write, :raw, :binary])
+
+      try do
+        assert :ok = :file.pwrite(file, value_offset + 16, "X")
+      after
+        :file.close(file)
+      end
+
+      assert [{:error, {:storage_read_failed, _reason}}] =
+               Router.batch_get_with_file_refs(ctx, [key], 0)
+    end
   end
 
   describe "HLC drift guard" do

@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Batched reads of large cold values (Flow value hydration through
+  `Router.batch_get_with_file_refs`) answered `nil`, as for a missing key, when
+  a value's on-disk record failed validation where it lay (a corrupted
+  record). They now answer the storage read failure, as GET does; a record
+  moved by compaction is still followed to its new place.
 - FLOW.CLAIM_DUE and the batch Flow writes (COMPLETE_MANY, FAIL_MANY,
   CANCEL_MANY, RETRY_MANY, TRANSITION_MANY and pipelined batches) went on
   past a state record write apply refused, for instance over a corrupt type
