@@ -1368,7 +1368,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
               prefix ->
                 shard_state = shard_ets_state_from_sm(sm_state)
 
-                case ShardETS.prefix_count_entries(shard_state, prefix) do
+                # The bounded count fails where the state machine's count may
+                # differ by feature level; the state machine applies and decides.
+                case ShardETS.bounded_prefix_count_entries(shard_state, prefix) do
                   count when is_integer(count) ->
                     count + write_count > threshold
 
