@@ -25,16 +25,8 @@ defmodule FerricstoreServer.Acl.Patterns do
 
   @spec compile_glob(binary()) :: Regex.t()
   def compile_glob(pattern) do
-    source =
-      pattern
-      |> String.graphemes()
-      |> compile_glob_chars([])
-      |> IO.iodata_to_binary()
-
-    case Regex.compile("^" <> source <> "$") do
-      {:ok, regex} -> regex
-      {:error, _} -> Regex.compile!("^" <> Regex.escape(pattern) <> "$")
-    end
+    source = pattern |> glob_source(0, []) |> IO.iodata_to_binary()
+    Regex.compile!("\\A" <> source <> "\\z", "s")
   end
 
   defp access_permitted?(:rw, _access_type), do: true
@@ -42,33 +34,69 @@ defmodule FerricstoreServer.Acl.Patterns do
   defp access_permitted?(:write, :write), do: true
   defp access_permitted?(_, _), do: false
 
-  defp compile_glob_chars([], acc), do: Enum.reverse(acc)
+  # Patterns match keys and channels byte for byte as Redis's stringmatchlen
+  # does: `*` any run of bytes, `?` any one byte, a backslash makes the next
+  # byte literal, and a character class is the byte set
+  # `Ferricstore.GlobMatcher` gives it.
+  defp glob_source(pattern, position, acc) when position >= byte_size(pattern),
+    do: Enum.reverse(acc)
 
-  defp compile_glob_chars(["*", "*" | rest], acc),
-    do: compile_glob_chars(["*" | rest], acc)
+  defp glob_source(pattern, position, acc) do
+    case :binary.at(pattern, position) do
+      ?* ->
+        glob_source(pattern, skip_stars(pattern, position), [".*" | acc])
 
-  defp compile_glob_chars(["*" | rest], acc), do: compile_glob_chars(rest, [".*" | acc])
-  defp compile_glob_chars(["?" | rest], acc), do: compile_glob_chars(rest, ["." | acc])
+      ?? ->
+        glob_source(pattern, position + 1, ["." | acc])
 
-  defp compile_glob_chars(["[" | rest], acc) do
-    case collect_char_class(rest, []) do
-      {:ok, [], remaining} ->
-        compile_glob_chars(remaining, [Regex.escape("[]") | acc])
+      ?\\ when position + 1 < byte_size(pattern) ->
+        glob_source(pattern, position + 2, [byte_source(:binary.at(pattern, position + 1)) | acc])
 
-      {:ok, class_chars, remaining} ->
-        compile_glob_chars(remaining, [["[", class_chars, "]"] | acc])
+      ?[ ->
+        class_end = Ferricstore.GlobMatcher.class_end(pattern, position)
+        class = binary_part(pattern, position, class_end - position)
+        glob_source(pattern, class_end, [class_source(class) | acc])
 
-      {:unterminated, class_chars} ->
-        literal = Regex.escape("[" <> IO.iodata_to_binary(class_chars))
-        compile_glob_chars([], [literal | acc])
+      byte ->
+        glob_source(pattern, position + 1, [byte_source(byte) | acc])
     end
   end
 
-  defp compile_glob_chars([ch | rest], acc) do
-    compile_glob_chars(rest, [Regex.escape(ch) | acc])
+  defp skip_stars(pattern, position) do
+    if position < byte_size(pattern) and :binary.at(pattern, position) == ?*,
+      do: skip_stars(pattern, position + 1),
+      else: position
   end
 
-  defp collect_char_class([], acc), do: {:unterminated, Enum.reverse(acc)}
-  defp collect_char_class(["]" | rest], acc), do: {:ok, Enum.reverse(acc), rest}
-  defp collect_char_class([ch | rest], acc), do: collect_char_class(rest, [ch | acc])
+  defp class_source(class) do
+    case Enum.filter(0..255, &Ferricstore.GlobMatcher.match?(<<&1>>, class)) do
+      [] -> "(?!)"
+      bytes -> ["[", bytes |> byte_ranges() |> Enum.map(&range_source/1), "]"]
+    end
+  end
+
+  defp byte_ranges([first | rest]) do
+    {ranges, {low, high}} =
+      Enum.reduce(rest, {[], {first, first}}, fn
+        byte, {ranges, {low, high}} when byte == high + 1 -> {ranges, {low, byte}}
+        byte, {ranges, range} -> {[range | ranges], {byte, byte}}
+      end)
+
+    Enum.reverse([{low, high} | ranges])
+  end
+
+  defp range_source({byte, byte}), do: hex_byte(byte)
+  defp range_source({low, high}), do: [hex_byte(low), "-", hex_byte(high)]
+
+  defp byte_source(byte) when byte in ?a..?z or byte in ?A..?Z or byte in ?0..?9,
+    do: <<byte>>
+
+  defp byte_source(byte)
+       when byte in [?:, ?_, ?-, ?/, ?@, ?#, ?=, ?,, ?%, ?!, ?~, ?', ?", ?;, ?<, ?>, ?&, ?`],
+       do: <<byte>>
+
+  defp byte_source(byte), do: hex_byte(byte)
+
+  defp hex_byte(byte),
+    do: "\\x" <> String.pad_leading(Integer.to_string(byte, 16), 2, "0")
 end

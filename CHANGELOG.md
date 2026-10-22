@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- ACL key (`~`, `%R~`, `%W~`) and channel (`&`) patterns matched differently
+  from Redis, which matches them as it matches KEYS: a backslash stood for
+  itself instead of making the next byte literal (`~foo\*` allowed `foo\x`
+  and not `foo*`), a backslash inside a class kept its regular-expression
+  meaning (`~key[\d]` allowed `key1` to `key9`), `*` and `?` did not match a
+  newline, a pattern also matched its key followed by a newline, and classes
+  differed as KEYS's did. Patterns are now compiled from Redis's rules.
 - KEYS, SCAN MATCH, the collection SCANs, PSUBSCRIBE and CONFIG GET matched
   character classes differently from Redis: a range written high to low
   (`[z-a]`) matched only its three bytes, `[!a]` was negated (Redis negates
