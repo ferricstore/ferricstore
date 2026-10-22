@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A cluster replica running in interactive mode (as under `mix run` or
+  `iex -S mix`; releases load every module at boot) could stop applying a
+  shard ("storage blocked: invalid_preencoded_command") on the first
+  replicated command carrying an atom it had not seen, such as
+  FLOW.SPAWN_CHILDREN with `on_parent_closed: :abandon_children`. The startup
+  atom preload read each module's atom table but not its literal table,
+  where the compiler keeps atoms used only inside literal terms. It now reads
+  both.
+
 - In a cluster, deleting a promoted hash, set or sorted set could leave a
   replica holding its promotion marker and dedicated file when memory
   pressure had evicted that replica's copy of the marker: the replica took

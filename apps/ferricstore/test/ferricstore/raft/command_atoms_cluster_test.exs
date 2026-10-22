@@ -42,4 +42,33 @@ defmodule Ferricstore.Raft.CommandAtomsClusterTest do
     assert {:ok, {^command, %{hlc_ts: {_physical, _logical}, wall_time_ms: _wall}}} =
              :erpc.call(replica, CommandStamp, :decode_ttb, [encoded])
   end
+
+  # The compiler keeps an atom used only inside a literal term, such as the
+  # policy list FLOW.SPAWN_CHILDREN accepts, in the literal table instead of
+  # the atom table.
+  test "a fresh replica safely decodes atoms that appear only inside code literals" do
+    ShardHelpers.ensure_distribution_started!(:command_atoms_runner)
+    code_paths = Enum.flat_map(:code.get_path(), fn path -> [~c"-pa", path] end)
+    cookie = Atom.to_charlist(Node.get_cookie())
+
+    {:ok, peer, replica} =
+      :peer.start(%{
+        name: :"command_atoms_literal_#{System.unique_integer([:positive])}",
+        args: code_paths ++ [~c"-connect_all", ~c"false", ~c"-setcookie", cookie],
+        wait_boot: 120_000
+      })
+
+    on_exit(fn -> :peer.stop(peer) end)
+
+    command = {:flow_spawn_children, %{on_parent_closed: :abandon_children}}
+    {:ttb, encoded} = CommandStamp.to_ttb(command)
+
+    assert {:error, :invalid_preencoded_command} =
+             :erpc.call(replica, CommandStamp, :decode_ttb, [encoded])
+
+    assert :ok = :erpc.call(replica, CommandAtoms, :preload!, [])
+
+    assert {:ok, {^command, _metadata}} =
+             :erpc.call(replica, CommandStamp, :decode_ttb, [encoded])
+  end
 end
