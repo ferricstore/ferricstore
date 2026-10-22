@@ -69,6 +69,51 @@ defmodule Ferricstore.Cluster.WatchExecClusterTest do
     end
   end
 
+  test "a follower restarted between WATCH and EXEC applies a clean EXEC", %{nodes: nodes} do
+    {leader, follower} = leader_and_follower(nodes)
+    watched = watch_tokens(leader, [@hash, @plain])
+
+    {stopped, _remaining} = ClusterHelper.kill_node(nodes, follower)
+    restarted = ClusterHelper.restart_node(nodes, stopped, shards: 1)
+    nodes = replace_node(nodes, restarted)
+
+    assert [0, :ok] =
+             exec(leader, watched, [{"HSET", [@hash, "f1", "new"]}, {"SET", [@plain, "v1"]}])
+
+    for node <- nodes do
+      assert eventually(fn -> applied?(node, "new", "v1") end),
+             "#{node.name} skipped the transaction"
+    end
+  end
+
+  test "a write while a follower is down aborts the EXEC on every replica", %{nodes: nodes} do
+    {leader, follower} = leader_and_follower(nodes)
+    watched = watch_tokens(leader, [@hash, @plain])
+
+    {stopped, _remaining} = ClusterHelper.kill_node(nodes, follower)
+    assert :ok == dispatch(leader, "SET", [@plain, "while-down"])
+    restarted = ClusterHelper.restart_node(nodes, stopped, shards: 1)
+    nodes = replace_node(nodes, restarted)
+
+    assert nil == exec(leader, watched, [{"HSET", [@hash, "f1", "new"]}, {"SET", [@plain, "v1"]}])
+    assert :ok == dispatch(leader, "SET", ["{watch-exec}after", "x"])
+
+    for node <- nodes do
+      assert eventually(fn -> get(node, "{watch-exec}after") == "x" end)
+      refute applied?(node, "new", "v1"), "#{node.name} applied an aborted transaction"
+    end
+  end
+
+  defp leader_and_follower(nodes) do
+    leader_name = ClusterHelper.find_leader(nodes, 0)
+    leader = Enum.find(nodes, &(&1.name == leader_name))
+    follower = Enum.find(nodes, &(&1.name != leader_name))
+    {leader, follower}
+  end
+
+  defp replace_node(nodes, restarted),
+    do: Enum.map(nodes, &if(&1.index == restarted.index, do: restarted, else: &1))
+
   defp watch_tokens(node, keys) do
     tokens = ClusterHelper.run(node.name, Router, :watch_tokens, [ctx(node), keys])
     assert map_size(tokens) == length(keys)
