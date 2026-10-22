@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- HLEN, SCARD, ZCARD and other member counts answered "ERR storage read
+  failed" when more than 4,096 members of the collection had expired by
+  their own TTL (HEXPIRE and the like) since the last count: the member index
+  cleans up a bounded number of them per count and failed past it. The count
+  now counts the keydir rows instead, as it does before the index is ready.
+  Inside a replicated entry this applies from feature level 5.
 - A shard could fail to start ("validate_prob_files failed ...
   invalid_prob_type_catalog_entry") when a hash, list, set, sorted set or
   probabilistic key had expired and its type marker was recovered from a

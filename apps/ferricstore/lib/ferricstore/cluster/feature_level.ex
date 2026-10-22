@@ -50,7 +50,9 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    value is not cached; and Flows closed by batch, pipelined or
   #    cross-shard commands are indexed under the type's current policy, as
   #    the single-Flow commands index them; a Flow state record write apply
-  #    refuses fails a claim or batch entry instead of being skipped.
+  #    refuses fails a claim or batch entry instead of being skipped. A
+  #    collection count inside an entry with more due member expiries than
+  #    one cleanup pass counts the keydir instead of failing.
   @supported 5
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

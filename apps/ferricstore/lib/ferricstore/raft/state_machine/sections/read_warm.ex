@@ -835,8 +835,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
               total
             )
           end,
+          # Below feature level 5 a count with more due member expiries than
+          # one cleanup pass fails, as releases before it applied.
           compound_count: fn _redis_key, prefix ->
-            Ferricstore.Store.Shard.ETS.prefix_count_entries(shard_ets_state(state), prefix)
+            if feature_level_5?(state),
+              do:
+                Ferricstore.Store.Shard.ETS.prefix_count_entries(shard_ets_state(state), prefix),
+              else:
+                Ferricstore.Store.Shard.ETS.bounded_prefix_count_entries(
+                  shard_ets_state(state),
+                  prefix
+                )
           end,
           exists?: fn key ->
             live_key?(state, key)
