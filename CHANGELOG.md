@@ -4,7 +4,7 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
-- A write to a promoted hash, set, sorted set or list stopped a shard's
+- A write to a promoted hash, set or sorted set stopped a shard's
   writes (the client saw a timeout and the shard's storage process
   restarted) after memory pressure had evicted the collection's promotion
   marker from memory: the write read the evicted marker back from disk with
