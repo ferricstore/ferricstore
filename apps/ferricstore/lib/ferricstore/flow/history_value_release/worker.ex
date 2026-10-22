@@ -10,6 +10,7 @@ defmodule Ferricstore.Flow.HistoryValueRelease.Worker do
   require Logger
 
   alias Ferricstore.Flow.HistoryValueRelease
+  alias Ferricstore.Raft.LocalLeadership
 
   @tick_ms 1_000
   @batch 64
@@ -27,11 +28,21 @@ defmodule Ferricstore.Flow.HistoryValueRelease.Worker do
 
   def start_link(opts) do
     ctx = Keyword.fetch!(opts, :instance_ctx)
-    GenServer.start_link(__MODULE__, ctx, name: name(ctx.name))
+    GenServer.start_link(__MODULE__, opts, name: name(ctx.name))
   end
 
   @impl true
-  def init(ctx), do: {:ok, %{ctx: ctx, pending: MapSet.new(), queue: :queue.new(), timer: nil}}
+  def init(opts) do
+    {:ok,
+     %{
+       ctx: Keyword.fetch!(opts, :instance_ctx),
+       leads_shard?: Keyword.get(opts, :leads_shard?, &LocalLeadership.leads?/2),
+       release: Keyword.get(opts, :release, &HistoryValueRelease.release_shard/3),
+       pending: MapSet.new(),
+       queue: :queue.new(),
+       timer: nil
+     }}
+  end
 
   @impl true
   def handle_cast({:trimmed, shard_index, id, partition_key}, state) do
@@ -57,7 +68,10 @@ defmodule Ferricstore.Flow.HistoryValueRelease.Worker do
 
     batch
     |> Enum.group_by(&elem(&1, 0), fn {_shard_index, id, partition_key} -> {id, partition_key} end)
-    |> Enum.each(fn {shard_index, flows} -> release(state.ctx, shard_index, flows) end)
+    |> Enum.each(fn {shard_index, flows} ->
+      if state.leads_shard?.(state.ctx, shard_index),
+        do: release(state, shard_index, flows)
+    end)
 
     state = %{state | timer: nil}
     {:noreply, if(:queue.is_empty(state.queue), do: state, else: schedule_tick(state))}
@@ -65,8 +79,8 @@ defmodule Ferricstore.Flow.HistoryValueRelease.Worker do
 
   def handle_info(_message, state), do: {:noreply, state}
 
-  defp release(ctx, shard_index, flows) do
-    case HistoryValueRelease.release_shard(ctx, shard_index, flows) do
+  defp release(state, shard_index, flows) do
+    case state.release.(state.ctx, shard_index, flows) do
       :ok ->
         :ok
 

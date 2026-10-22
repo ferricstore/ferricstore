@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- In a cluster, every node read a running Flow's remaining history and
+  proposed the same release of values its trimmed history no longer referred
+  to, so each release ran once per node and was applied on every node once
+  per proposal. Only the shard's leader releases now.
 - In a cluster, a watched transaction (WATCH ... MULTI ... EXEC) could commit
   on the leader while the other replicas skipped it, leaving them permanently
   different. Every replica checks the WATCH tokens against its own storage,

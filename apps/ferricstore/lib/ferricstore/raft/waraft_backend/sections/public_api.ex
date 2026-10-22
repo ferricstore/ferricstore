@@ -1172,6 +1172,26 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
         backend_call(fn -> :wa_raft_server.status(server) end)
       end
 
+      @doc """
+      This node's Raft role for the shard (`:leader`, `:follower`, ...), or
+      `:unknown` when the local server does not answer.
+      """
+      @spec local_role(non_neg_integer()) :: atom()
+      def local_role(shard_index) do
+        case status(shard_index) do
+          status when is_list(status) ->
+            case Keyword.get(status, :state) do
+              role when is_atom(role) and not is_nil(role) -> role
+              _missing -> :unknown
+            end
+
+          _unavailable ->
+            :unknown
+        end
+      catch
+        _kind, _reason -> :unknown
+      end
+
       defp maybe_status_hook(shard_index) do
         case Process.get(:ferricstore_waraft_backend_status_hook) do
           fun when is_function(fun, 1) -> fun.(shard_index)
