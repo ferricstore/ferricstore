@@ -4,6 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Security: `-@dangerous` did not remove ACL SETUSER, DELUSER, GETUSER, LIST,
+  LOAD, SAVE and LOG, nor SAVE, BGSAVE, LASTSAVE, SLOWLOG, INFO or CLIENT
+  LIST/PAUSE/UNPAUSE/NO-EVICT, all of which Redis puts in `@dangerous`. A user
+  set up as `+@all -@dangerous` could run ACL SETUSER and create or upgrade a
+  user to full access, and read password hashes with ACL GETUSER. These
+  commands are now in `@dangerous`. SETUSER expands a category when it runs,
+  so a user created with `-@dangerous` before this release keeps its old
+  command set: apply `ACL SETUSER <user> -@dangerous` again (or recreate the
+  user) to drop them.
+
 - ACL SETUSER and ACL files refused the `reset` modifier, and ACL SETUSER
   refused `nocommands` (ACL files accepted it), both of which Redis accepts:
   `ACL SETUSER alice reset on >pw ~app:* +@read` answered a syntax error.

@@ -52,6 +52,23 @@ defmodule FerricstoreServer.AclSecurityTest do
   # Fix 1: Password hashing (PBKDF2-SHA256)
   # ---------------------------------------------------------------------------
 
+  # Redis puts ACL administration, SAVE, SLOWLOG, INFO and the client admin
+  # subcommands in @dangerous, so "+@all -@dangerous" cannot grant itself or
+  # anyone else more access.
+  test "-@dangerous removes ACL administration and the other Redis dangerous commands" do
+    :ok = Acl.set_user("app", ["on", ">pw", "~*", "&*", "+@all", "-@dangerous"])
+
+    for command <-
+          ~w(ACL.SETUSER ACL.DELUSER ACL.GETUSER ACL.LIST ACL.LOAD ACL.SAVE ACL.LOG SAVE BGSAVE
+             LASTSAVE SLOWLOG INFO CLIENT.LIST CLIENT.PAUSE CLIENT.UNPAUSE CLIENT.NO-EVICT) do
+      assert {:error, "NOPERM" <> _} = Acl.check_command("app", command), command
+    end
+
+    for command <- ~w(ACL.WHOAMI ACL.CAT CLIENT.SETNAME CLIENT.ID GET SET PING) do
+      assert :ok = Acl.check_command("app", command), command
+    end
+  end
+
   describe "password hashing" do
     test "password stored as hash, not plaintext" do
       assert :ok = Acl.set_user("alice", ["on", ">s3cret"])
