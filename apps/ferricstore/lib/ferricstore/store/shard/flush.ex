@@ -732,7 +732,15 @@ defmodule Ferricstore.Store.Shard.Flush do
     sp = state.shard_data_path
     hint_path = Path.join(sp, "#{String.pad_leading(Integer.to_string(target_fid), 5, "0")}.hint")
 
-    Ferricstore.Store.HintFile.write_from_keydir(hint_path, state.keydir, target_fid)
+    # Built from the log, as rotation builds hints, not from the keydir: expiry
+    # drops a key's keydir row without a tombstone, and its expired record has
+    # to stay in the hint to keep masking an older value in a lower file.
+    Ferricstore.Store.HintBuilder.build_now(
+      ShardETS.file_path(sp, target_fid),
+      hint_path,
+      target_fid,
+      sp
+    )
   end
 
   # -------------------------------------------------------------------

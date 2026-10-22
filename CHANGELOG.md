@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A key whose newest value expired and was then read or swept could come back
+  with an older value after a restart. Expiry drops the key's keydir row
+  without a tombstone, and the hint file written for the active segment at
+  shutdown was built from the keydir, so it left out the expired record that
+  masked the older value in a lower segment. The shutdown hint is now built
+  from the segment's log, as rotation builds hints.
 - Batched reads of large cold values (Flow value hydration through
   `Router.batch_get_with_file_refs`) answered `nil`, as for a missing key, when
   a value's on-disk record failed validation where it lay (a corrupted
