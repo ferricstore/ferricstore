@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A shard could fail to start ("validate_prob_files failed ...
+  invalid_prob_type_catalog_entry") when a hash, list, set, sorted set or
+  probabilistic key had expired and its type marker was recovered from a
+  sealed segment's hint file: hint recovery leaves values on disk, only live
+  type markers are read back, and the sidecar check took the unread marker for
+  a corrupt one. An expired unread marker is now skipped, and a live one keeps
+  any sidecar its key has.
 - ZRANGEBYSCORE, ZREVRANGEBYSCORE and ZRANGE BYSCORE answered too few
   members, often none, when a member was scored -0.0 and a bound was 0
   (`(0` going up, or `0` going down): the ranged score index took -0.0 for a

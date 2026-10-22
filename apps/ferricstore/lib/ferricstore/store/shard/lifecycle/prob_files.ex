@@ -302,6 +302,14 @@ defmodule Ferricstore.Store.Shard.Lifecycle.ProbFiles do
         _row, {:error, _reason} = error ->
           error
 
+        # Hint recovery leaves a type marker's value on disk, and only live
+        # markers are read back. An expired one is no sidecar's owner; a live
+        # one of unknown type keeps whichever sidecar its key has.
+        {<<"T:", _rest::binary>> = storage_key, nil, expire_at_ms, _lfu, _file_id, _offset,
+         _value_size},
+        {:ok, orphan_files} ->
+          cold_catalog_sidecars(orphan_files, storage_key, expire_at_ms, expiry_cutoff_ms)
+
         {<<"T:", _rest::binary>> = storage_key, value, expire_at_ms, _lfu, _file_id, _offset,
          _value_size},
         {:ok, orphan_files} ->
@@ -363,6 +371,23 @@ defmodule Ferricstore.Store.Shard.Lifecycle.ProbFiles do
          _expiry_cutoff_ms
        ),
        do: {:error, {:invalid_prob_type_catalog_expiry, storage_key, expire_at_ms}}
+
+  defp cold_catalog_sidecars(orphan_files, storage_key, expire_at_ms, expiry_cutoff_ms)
+       when is_integer(expire_at_ms) and expire_at_ms >= 0 do
+    if expire_at_ms != 0 and expire_at_ms <= expiry_cutoff_ms do
+      {:ok, orphan_files}
+    else
+      redis_key = CompoundKey.extract_redis_key(storage_key)
+
+      {:ok,
+       Enum.reduce(~w(bloom cms cuckoo topk), orphan_files, fn type, files ->
+         MapSet.delete(files, ProbFile.filename(redis_key, type))
+       end)}
+    end
+  end
+
+  defp cold_catalog_sidecars(_orphan_files, storage_key, expire_at_ms, _expiry_cutoff_ms),
+    do: {:error, {:invalid_prob_type_catalog_expiry, storage_key, expire_at_ms}}
 
   defp validate_regular_file(prob_dir, filename) do
     case File.lstat(Path.join(prob_dir, filename)) do
