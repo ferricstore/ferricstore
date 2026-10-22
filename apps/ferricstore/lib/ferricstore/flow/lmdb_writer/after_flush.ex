@@ -32,9 +32,9 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
   # state, parent, root and correlation index entries stay hot, so lists without
   # include_cold keep listing it, as they do a terminal flow without attributes.
   def apply_after_flush(
-        {:prune_terminal_flow, data_dir, shard_index, ets, _zset_index, _zset_lookup,
-         _flow_index, _flow_lookup, state_key, type, terminal_state, partition_key,
-         _parent_flow_id, _root_flow_id, _correlation_id, id, version, incarnation},
+        {:prune_terminal_flow, data_dir, shard_index, ets, _zset_index, _zset_lookup, _flow_index,
+         _flow_lookup, state_key, type, terminal_state, partition_key, _parent_flow_id,
+         _root_flow_id, _correlation_id, id, version, incarnation},
         publication_ctx
       ) do
     identity = %{version: version, state: terminal_state, incarnation: incarnation}
@@ -61,8 +61,8 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
   end
 
   def apply_after_flush(
-        {:prune_terminal_flow_from_source, data_dir, shard_index, ets, _zset_index,
-         _zset_lookup, _flow_index, _flow_lookup, state_key, version},
+        {:prune_terminal_flow_from_source, data_dir, shard_index, ets, _zset_index, _zset_lookup,
+         _flow_index, _flow_lookup, state_key, version},
         publication_ctx
       ) do
     case flow_record_with_keydir_row(data_dir, shard_index, ets, state_key) do

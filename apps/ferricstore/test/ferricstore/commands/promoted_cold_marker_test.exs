@@ -63,7 +63,11 @@ defmodule Ferricstore.Commands.PromotedColdMarkerTest do
     assert 150 == Dispatcher.dispatch("SADD", [set | Enum.map(1..150, &"m#{&1}")], ctx)
 
     assert 150 ==
-             Dispatcher.dispatch("ZADD", [zset | Enum.flat_map(1..150, &["#{&1}", "m#{&1}"])], ctx)
+             Dispatcher.dispatch(
+               "ZADD",
+               [zset | Enum.flat_map(1..150, &["#{&1}", "m#{&1}"])],
+               ctx
+             )
 
     await_promoted!(ctx, set)
     await_promoted!(ctx, zset)
