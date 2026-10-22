@@ -35,38 +35,28 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
   end
 
   defp promotion_marker_live?(state, redis_key) do
-    marker_key = Promotion.marker_key(redis_key)
-    now = HLC.now_ms()
-
-    case :ets.lookup(Map.get(state, :ets), marker_key) do
-      [{^marker_key, type_str, expire_at_ms, _lfu, _fid, _offset, _value_size}]
-      when expire_at_ms == 0 or expire_at_ms > now ->
-        decode_promoted_marker_type(type_str) != nil
-
-      _other ->
-        false
-    end
+    state
+    |> promotion_marker_value(redis_key)
+    |> decode_promoted_marker_type() != nil
   end
 
   defp marker_promoted_store(state, redis_key) do
-    marker_key = Promotion.marker_key(redis_key)
-    now = HLC.now_ms()
-
-    case :ets.lookup(Map.get(state, :ets), marker_key) do
-      [{^marker_key, type_str, expire_at_ms, _lfu, _fid, _offset, _value_size}]
-      when expire_at_ms == 0 or expire_at_ms > now ->
-        case decode_promoted_marker_type(type_str) do
-          nil ->
-            nil
-
-          type ->
-            path = Promotion.dedicated_path(state.data_dir, state.index, type, redis_key)
-            if Ferricstore.FS.dir?(path), do: path, else: nil
-        end
-
-      _other ->
+    case decode_promoted_marker_type(promotion_marker_value(state, redis_key)) do
+      nil ->
         nil
+
+      type ->
+        path = Promotion.dedicated_path(state.data_dir, state.index, type, redis_key)
+        if Ferricstore.FS.dir?(path), do: path, else: nil
     end
+  end
+
+  # Memory pressure may evict the marker's value; a cold marker is read back
+  # from the shard log like any other value.
+  defp promotion_marker_value(state, redis_key) do
+    state
+    |> Map.put_new(:keydir, Map.get(state, :ets))
+    |> Ferricstore.Store.Shard.Reads.do_get(Promotion.marker_key(redis_key))
   end
 
   defp decode_promoted_marker_type(type_str) do

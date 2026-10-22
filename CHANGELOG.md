@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Every command on a promoted hash, set or sorted set (HGET, HLEN, SISMEMBER,
+  ZRANGE, DEL and the rest) answered "ERR storage read failed" once memory
+  pressure had evicted both the collection's promotion marker and the member
+  rows it read: an evicted marker read as "not promoted", so the member was
+  read from the shard's shared log at its dedicated file's offset. An evicted
+  marker is now read back from disk before the collection is routed.
+
 - A write to a promoted hash, set or sorted set stopped a shard's
   writes (the client saw a timeout and the shard's storage process
   restarted) after memory pressure had evicted the collection's promotion

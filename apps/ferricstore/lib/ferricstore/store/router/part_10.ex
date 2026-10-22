@@ -474,6 +474,9 @@ defmodule Ferricstore.Store.Router.Part10 do
         )
       end
 
+      # Memory pressure may have evicted the marker's value; the shard reads it
+      # back and routes the collection.
+      defp promoted_marker_value?(nil), do: true
       defp promoted_marker_value?(_value), do: false
 
       # Type metadata already contains the escaped logical key. Reuse it
