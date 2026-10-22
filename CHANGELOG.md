@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Compaction dropped an expired record that was still its key's newest, so an
+  older value of the key in a lower segment came back after a restart (expiry
+  drops the keydir row without a tombstone and relies on that record). Such a
+  record is now resolved as a tombstone is: compaction keeps it while a lower
+  segment holds a live value of the key.
 - A key whose newest value expired and was then read or swept could come back
   with an older value after a restart. Expiry drops the key's keydir row
   without a tombstone, and the hint file written for the active segment at

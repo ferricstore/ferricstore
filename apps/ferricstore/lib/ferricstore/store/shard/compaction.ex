@@ -168,7 +168,7 @@ defmodule Ferricstore.Store.Shard.Compaction do
              expiry_cutoff_ms
            ) do
         with {:ok, tombstone_keys} <-
-               catalog_source_tombstones(state, source, catalog, 0, 0),
+               catalog_source_tombstones(state, fid, source, catalog, 0, 0, expiry_cutoff_ms),
              :ok <-
                resolve_tombstone_dependencies(
                  state,
@@ -213,7 +213,15 @@ defmodule Ferricstore.Store.Shard.Compaction do
         end
       end
 
-      defp catalog_source_tombstones(state, source, catalog, start_offset, candidate_count) do
+      defp catalog_source_tombstones(
+             state,
+             fid,
+             source,
+             catalog,
+             start_offset,
+             candidate_count,
+             expiry_cutoff_ms
+           ) do
         case compaction_scan_source_page(state, source, start_offset) do
           {:ok, records, next_offset, done?}
           when is_list(records) and is_integer(next_offset) and next_offset >= start_offset and
@@ -221,7 +229,10 @@ defmodule Ferricstore.Store.Shard.Compaction do
             with :ok <-
                    validate_advancing_compaction_scan(records, start_offset, next_offset, done?),
                  {:ok, new_candidates} <-
-                   CompactionTombstoneCatalog.record_source_page_count(catalog, records) do
+                   CompactionTombstoneCatalog.record_source_page_count(
+                     catalog,
+                     compaction_masking_records(state, fid, records, expiry_cutoff_ms)
+                   ) do
               next_count = candidate_count + new_candidates
 
               if done? do
@@ -230,7 +241,15 @@ defmodule Ferricstore.Store.Shard.Compaction do
                   {:error, reason} -> {:error, {:copy_failed, reason}}
                 end
               else
-                catalog_source_tombstones(state, source, catalog, next_offset, next_count)
+                catalog_source_tombstones(
+                  state,
+                  fid,
+                  source,
+                  catalog,
+                  next_offset,
+                  next_count,
+                  expiry_cutoff_ms
+                )
               end
             end
 
@@ -515,11 +534,13 @@ defmodule Ferricstore.Store.Shard.Compaction do
       end
 
       defp resolve_compaction_page(state, fid, catalog, records, expiry_cutoff_ms) do
+        masking_records = compaction_masking_records(state, fid, records, expiry_cutoff_ms)
+
         with {:ok, markers, _all_tombstones, cold_candidates} <-
                classify_compaction_records(state, fid, records, expiry_cutoff_ms),
              {:ok, cold_entries} <- resolve_compaction_cold_entries(state, fid, cold_candidates),
-             {:ok, tombstone_offsets} <-
-               CompactionTombstoneCatalog.needed_offsets(catalog, records) do
+             {:ok, needed_offsets} <-
+               CompactionTombstoneCatalog.needed_offsets(catalog, masking_records) do
           live_entries =
             markers
             |> Enum.flat_map(fn
@@ -536,8 +557,68 @@ defmodule Ferricstore.Store.Shard.Compaction do
                 []
             end)
 
-          {:ok, live_entries, tombstone_offsets}
+          {tombstone_offsets, masking_entries} =
+            split_needed_masking_offsets(records, needed_offsets, live_entries)
+
+          {:ok, live_entries ++ masking_entries, tombstone_offsets}
         end
+      end
+
+      # Expiry drops a key's keydir row without writing a tombstone (a lazy read
+      # past the TTL, a direct-mode sweep), so an expired record that is still
+      # its key's newest keeps masking older values in lower segments when the
+      # keydir is recovered. The tombstone catalog resolves such a record as it
+      # resolves a tombstone: it is kept while a lower segment holds a live value
+      # of the key. Flow state rows hibernate out of the keydir and are resolved
+      # by their cold catalog instead.
+      defp compaction_masking_records(state, fid, records, expiry_cutoff_ms) do
+        Enum.map(records, fn record ->
+          if compaction_expired_newest?(state, fid, record, expiry_cutoff_ms),
+            do: put_elem(record, 4, true),
+            else: record
+        end)
+      end
+
+      defp compaction_expired_newest?(
+             state,
+             fid,
+             {key, offset, _value_size, expire_at_ms, false},
+             expiry_cutoff_ms
+           )
+           when is_binary(key) and is_integer(expire_at_ms) and expire_at_ms > 0 and
+                  expire_at_ms <= expiry_cutoff_ms do
+        not FlowKeys.state_key?(key) and
+          case :ets.lookup(state.keydir, key) do
+            [] -> true
+            [{^key, _value, _expire_at_ms, _lfu, ^fid, ^offset, _size}] -> true
+            _newer -> false
+          end
+      end
+
+      defp compaction_expired_newest?(_state, _fid, _record, _expiry_cutoff_ms), do: false
+
+      # Needed tombstones are copied as tombstones; needed expired records are
+      # copied as they are, like live records.
+      defp split_needed_masking_offsets(_records, [], _live_entries), do: {[], []}
+
+      defp split_needed_masking_offsets(records, needed_offsets, live_entries) do
+        needed = MapSet.new(needed_offsets)
+        live_offsets = MapSet.new(live_entries, &compaction_live_offset/1)
+
+        {tombstones, masking} =
+          Enum.reduce(records, {[], []}, fn
+            {_key, offset, _value_size, _expire_at_ms, true}, {tombstones, masking} ->
+              if MapSet.member?(needed, offset),
+                do: {[offset | tombstones], masking},
+                else: {tombstones, masking}
+
+            {key, offset, value_size, _expire_at_ms, false}, {tombstones, masking} ->
+              if MapSet.member?(needed, offset) and not MapSet.member?(live_offsets, offset),
+                do: {tombstones, [{:masking, key, offset, value_size} | masking]},
+                else: {tombstones, masking}
+          end)
+
+        {Enum.reverse(tombstones), Enum.reverse(masking)}
       end
 
       defp classify_compaction_records(state, fid, records, now_ms) do
@@ -687,6 +768,7 @@ defmodule Ferricstore.Store.Shard.Compaction do
 
       defp compaction_live_offset({:hot, _key, offset, _value_size}), do: offset
       defp compaction_live_offset({:cold, _key, offset, _park_key, _park}), do: offset
+      defp compaction_live_offset({:masking, _key, offset, _value_size}), do: offset
 
       defp build_compaction_plan_entries(_fid, [], [], acc),
         do: {:ok, Enum.reverse(acc)}
@@ -712,6 +794,7 @@ defmodule Ferricstore.Store.Shard.Compaction do
         do: {:error, :invalid_copy_result}
 
       defp compaction_live_size({:hot, _key, _offset, value_size}), do: value_size
+      defp compaction_live_size({:masking, _key, _offset, value_size}), do: value_size
 
       defp compaction_live_size(
              {:cold, _key, _offset, _park_key, %{locator: %Locator{value_size: value_size}}}
@@ -734,6 +817,14 @@ defmodule Ferricstore.Store.Shard.Compaction do
              {new_offset, new_size}
            ),
            do: {:cold, key, old_offset, new_offset, new_size, park_key, park}
+
+      # A kept expired record moves a keydir row only when one still points at it.
+      defp compaction_plan_entry(
+             _fid,
+             {:masking, key, old_offset, _old_size},
+             {new_offset, new_size}
+           ),
+           do: {:hot, key, old_offset, new_offset, new_size}
 
       defp shared_compaction_entry?(state, key, fid, target_fid) do
         fid == target_fid and not promoted_data_compound_entry?(state, key)
