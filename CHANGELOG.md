@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A Flow closed by COMPLETE_MANY, FAIL_MANY, CANCEL_MANY, an independent
+  (pipelined) batch or a cross-shard terminal kept the indexed attribute names
+  it had, while FLOW.COMPLETE, FLOW.FAIL and FLOW.CANCEL index it under the
+  type's current policy. An indexed attribute such a batch merged into a Flow
+  created without attributes was not found by broad attribute search. At
+  feature level 5 batches index as the single-Flow commands do; below it the
+  older record is written.
 - SET NX and SET XX applied in the same Raft entry as an earlier write to the
   key missed that write when its value was not cached (over the 64 KiB hot
   cache, a blob or a cold write): NX wrote over it and XX skipped. Concurrent

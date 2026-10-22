@@ -636,6 +636,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
               record ->
                 case flow_prepare_complete_existing_record(record, attrs, lease_token, now_ms) do
                   {:ok, record, next} ->
+                    next = flow_refresh_batch_indexed_attributes(state, state, next)
+
                     {:cont,
                      {:ok, [{record, next, attrs} | acc],
                       has_values? or flow_attrs_have_record_values?(attrs),
@@ -933,16 +935,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
       defp flow_terminal_pipeline_prepare_one(_state, _op, nil, _attrs, _now_ms),
         do: {:error, "ERR flow not found"}
 
-      defp flow_terminal_pipeline_prepare_one(_state, :complete, record, attrs, now_ms) do
+      defp flow_terminal_pipeline_prepare_one(state, :complete, record, attrs, now_ms) do
         case flow_prepare_complete_existing_record(
                record,
                attrs,
                Map.get(attrs, :lease_token),
                now_ms
              ) do
-          {:ok, record, next} -> {:ok, next, {record, next, attrs}}
-          {:ok, :noop} -> {:ok, :noop}
-          {:error, _reason} = error -> error
+          {:ok, record, next} ->
+            next = flow_refresh_batch_indexed_attributes(state, state, next)
+            {:ok, next, {record, next, attrs}}
+
+          {:ok, :noop} ->
+            {:ok, :noop}
+
+          {:error, _reason} = error ->
+            error
         end
       end
 
@@ -960,23 +968,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
         end
       end
 
-      defp flow_terminal_pipeline_prepare_one(_state, :fail, record, attrs, now_ms) do
+      defp flow_terminal_pipeline_prepare_one(state, :fail, record, attrs, now_ms) do
         case flow_prepare_fail_existing_record(
                record,
                attrs,
                Map.get(attrs, :lease_token),
                now_ms
              ) do
-          {:ok, record, next} -> {:ok, next, {record, next, attrs}}
-          {:ok, :noop} -> {:ok, :noop}
-          {:error, _reason} = error -> error
+          {:ok, record, next} ->
+            next = flow_refresh_batch_indexed_attributes(state, state, next)
+            {:ok, next, {record, next, attrs}}
+
+          {:ok, :noop} ->
+            {:ok, :noop}
+
+          {:error, _reason} = error ->
+            error
         end
       end
 
-      defp flow_terminal_pipeline_prepare_one(_state, :cancel, record, attrs, now_ms) do
+      defp flow_terminal_pipeline_prepare_one(state, :cancel, record, attrs, now_ms) do
         case flow_prepare_cancel_existing_record(record, attrs, now_ms) do
-          {:ok, record, next} -> {:ok, next, {record, next, attrs}}
-          {:error, _reason} = error -> error
+          {:ok, record, next} ->
+            next = flow_refresh_batch_indexed_attributes(state, state, next)
+            {:ok, next, {record, next, attrs}}
+
+          {:error, _reason} = error ->
+            error
         end
       end
 

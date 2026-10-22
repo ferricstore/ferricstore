@@ -795,6 +795,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
             )
       end
 
+      # Level 5 indexes a Flow that a batch, pipelined or cross-shard command
+      # closes under its type's current policy, as the single-Flow commands do.
+      # Older releases keep the indexed names the record had, so an attribute
+      # such a command merged was not broad-searchable. `level_state` is the
+      # shard applying the entry and `state` the shard holding the Flow.
+      defp flow_refresh_batch_indexed_attributes(level_state, state, record) do
+        if feature_level_5?(level_state),
+          do: flow_refresh_indexed_attributes(state, record),
+          else: record
+      end
+
       defp flow_indexed_attributes_for_record(state, record) do
         case Map.get(record, :attributes) do
           attrs when is_map(attrs) and map_size(attrs) > 0 ->

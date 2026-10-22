@@ -42,9 +42,14 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    compound entry (`Router.compound_command/4`). Inside MULTI, BITOP
   #    deletes its destination for an empty result, GEOSEARCHSTORE of a
   #    missing source empties its destination and measures with Redis's Earth
-  #    radius, and HGETEX of a past time deletes the fields
-  #    (`Ferricstore.Store.Ops.level_5_writes?/1`). The state machine's PFADD
-  #    and PFMERGE keep the sketch's TTL.
+  #    radius, HGETEX of a past time deletes the fields and DECRBY of the
+  #    smallest integer is refused (`Ferricstore.Store.Ops.level_5_writes?/1`).
+  #    The state machine's PFADD and PFMERGE keep the sketch's TTL; INCR,
+  #    INCRBY, DECR and DECRBY in MULTI refuse a result outside the 64-bit
+  #    range; SET NX/XX see a write staged earlier in the same entry whose
+  #    value is not cached; and Flows closed by batch, pipelined or
+  #    cross-shard commands are indexed under the type's current policy, as
+  #    the single-Flow commands index them.
   @supported 5
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

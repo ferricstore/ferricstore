@@ -57,6 +57,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
                   :ok
 
                 {:ok, record, next} ->
+                  next = flow_refresh_batch_indexed_attributes(state, child_state, next)
+
                   with :ok <-
                          flow_apply_complete_local(
                            child_state,
@@ -95,6 +97,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
               :ok
 
             {:ok, record, next} ->
+              next = flow_refresh_batch_indexed_attributes(state, child_state, next)
+
               with :ok <-
                      flow_apply_fail_local(
                        child_state,
@@ -154,6 +158,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
 
         with {:ok, record} <- flow_require_record(child_state, id, partition_key),
              {:ok, record, next} <- flow_prepare_cancel_existing_record(record, attrs, now_ms),
+             next = flow_refresh_batch_indexed_attributes(state, child_state, next),
              :ok <-
                flow_apply_cancel_local(child_state, record, next, attrs, partition_key, now_ms),
              :ok <- flow_apply_child_terminal_chain(state, next, "cancelled", now_ms) do
@@ -210,6 +215,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
         with {:ok, record} <- flow_require_record(child_state, id, partition_key),
              {:ok, record, next} <-
                flow_prepare_complete_existing_record(record, attrs, lease_token, now_ms) do
+          next = flow_refresh_batch_indexed_attributes(state, child_state, next)
           {:ok, {child_state, record, next, attrs, partition_key, now_ms}}
         else
           {:ok, :noop} -> {:ok, :noop}
@@ -226,6 +232,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
         with {:ok, record} <- flow_require_record(child_state, id, partition_key),
              {:ok, record, next} <-
                flow_prepare_fail_existing_record(record, attrs, lease_token, now_ms) do
+          next = flow_refresh_batch_indexed_attributes(state, child_state, next)
           {:ok, {child_state, record, next, attrs, partition_key, now_ms}}
         else
           {:ok, :noop} -> {:ok, :noop}
@@ -257,6 +264,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
 
         with {:ok, record} <- flow_require_record(child_state, id, partition_key),
              {:ok, record, next} <- flow_prepare_cancel_existing_record(record, attrs, now_ms) do
+          next = flow_refresh_batch_indexed_attributes(state, child_state, next)
           {:ok, {child_state, record, next, attrs, partition_key, now_ms}}
         end
       end
@@ -875,6 +883,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
               record ->
                 case flow_prepare_cancel_existing_record(record, attrs, now_ms) do
                   {:ok, record, next} ->
+                    next = flow_refresh_batch_indexed_attributes(state, state, next)
+
                     {:cont,
                      {:ok, [{record, next, attrs} | acc],
                       has_values? or flow_attrs_have_record_values?(attrs),
