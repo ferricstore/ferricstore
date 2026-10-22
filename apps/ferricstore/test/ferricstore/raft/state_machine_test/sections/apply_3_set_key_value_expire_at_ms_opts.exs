@@ -30,6 +30,51 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           assert [] = :ets.lookup(ets, key)
         end
 
+        test "SET NX and XX in a batch see an earlier uncached write at level 5", %{
+          state: state,
+          ets: ets
+        } do
+          marker = Ferricstore.Cluster.FeatureLevel.marker()
+
+          :ets.insert(
+            ets,
+            {Ferricstore.Cluster.FeatureLevel.key(5), marker, 0, Ferricstore.Store.LFU.initial(),
+             0, 0, byte_size(marker)}
+          )
+
+          # Above the 64 KiB hot-cache limit, so the staged keydir row holds no value.
+          big = :binary.copy("v", 70_000)
+          nx_key = "set_nx_after_uncached_batch_write"
+          xx_key = "set_xx_after_uncached_batch_write"
+
+          commands = [
+            {:set, nx_key, big, 0, set_opts(%{})},
+            {:set, nx_key, "second", 0, set_opts(%{nx: true})},
+            {:set, xx_key, big, 0, set_opts(%{})},
+            {:set, xx_key, "second", 0, set_opts(%{xx: true})}
+          ]
+
+          {_new_state, result} = StateMachine.apply(%{}, {:batch, commands}, state)
+
+          assert {:ok, [:ok, nil, :ok, :ok]} = result
+          assert [{^nx_key, nil, 0, _lfu, _file_id, _offset, 70_000}] = :ets.lookup(ets, nx_key)
+          assert [{^xx_key, "second", 0, _lfu, _file_id, _offset, 6}] = :ets.lookup(ets, xx_key)
+        end
+
+        test "SET NX in a batch keeps the older answer below level 5", %{state: state} do
+          key = "set_nx_after_uncached_batch_write_legacy"
+          big = :binary.copy("v", 70_000)
+
+          commands = [
+            {:set, key, big, 0, set_opts(%{})},
+            {:set, key, "second", 0, set_opts(%{nx: true})}
+          ]
+
+          # What replicas on older releases apply.
+          assert {_new_state, {:ok, [:ok, :ok]}} =
+                   StateMachine.apply(%{}, {:batch, commands}, state)
+        end
+
         test "SET NX treats a cold keydir entry as existing without warming it", %{
           state: state,
           ets: ets,

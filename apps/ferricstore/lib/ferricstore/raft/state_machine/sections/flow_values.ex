@@ -1118,9 +1118,32 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       defp set_current_meta(state, key, true), do: do_get_meta(state, key)
 
       defp set_current_meta(state, key, false) do
-        case plain_expire_at_ms(state, key) do
-          nil -> nil
-          expire_at_ms -> {nil, expire_at_ms}
+        case staged_set_meta(state, key) do
+          {:staged, meta} ->
+            meta
+
+          :keydir ->
+            case plain_expire_at_ms(state, key) do
+              nil -> nil
+              expire_at_ms -> {nil, expire_at_ms}
+            end
+        end
+      end
+
+      # A write staged earlier in the same entry is the key's current state.
+      # Its keydir row is :pending and holds no value when the value is not
+      # cached (over the hot-cache size, a blob or a cold write), and the
+      # keydir read below took that row for an expired one: SET NX then wrote
+      # over it and SET XX skipped. Releases before level 5 apply it that way.
+      defp staged_set_meta(state, key) do
+        with %{^key => _staged} <- Process.get(:sm_pending_values),
+             true <- feature_level_5?(state) do
+          case sm_pending_value_meta(key) do
+            {:hit, _value, expire_at_ms} -> {:staged, {nil, expire_at_ms}}
+            :miss -> {:staged, nil}
+          end
+        else
+          _not_staged_or_below_level_5 -> :keydir
         end
       end
 

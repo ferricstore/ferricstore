@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- SET NX and SET XX applied in the same Raft entry as an earlier write to the
+  key missed that write when its value was not cached (over the 64 KiB hot
+  cache, a blob or a cold write): NX wrote over it and XX skipped. Concurrent
+  clients' commands share an entry, so two `SET k <large value> NX` could both
+  succeed. At feature level 5 the staged write counts; below it the older
+  result is kept.
 - INCR, INCRBY, DECR and DECRBY inside MULTI stored a result outside the
   64-bit range (9223372036854775807 + 1 answered 9223372036854775808). At
   feature level 5 they answer "ERR increment or decrement would overflow" and
