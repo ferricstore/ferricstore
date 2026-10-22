@@ -2128,13 +2128,12 @@ defmodule Ferricstore.PubSub do
         glob_literal_suffix(pattern, position + 1, size, [])
 
       ?[ ->
-        case glob_character_class_end(pattern, position + 1, size) do
-          {:ok, next_position} ->
-            glob_literal_suffix(pattern, next_position, size, [])
-
-          :error ->
-            ""
-        end
+        glob_literal_suffix(
+          pattern,
+          Ferricstore.GlobMatcher.class_end(pattern, position),
+          size,
+          []
+        )
 
       literal ->
         glob_literal_suffix(pattern, position + 1, size, [literal | acc])
@@ -2143,21 +2142,6 @@ defmodule Ferricstore.PubSub do
 
   defp glob_literal_suffix(_pattern, _position, _size, acc),
     do: acc |> Enum.reverse() |> :erlang.list_to_binary()
-
-  defp glob_character_class_end(pattern, position, size) when position < size do
-    case :binary.at(pattern, position) do
-      ?\\ when position + 1 < size ->
-        glob_character_class_end(pattern, position + 2, size)
-
-      ?] ->
-        {:ok, position + 1}
-
-      _class_byte ->
-        glob_character_class_end(pattern, position + 1, size)
-    end
-  end
-
-  defp glob_character_class_end(_pattern, _position, _size), do: :error
 
   defp pattern_matches?(_channel, :all), do: true
   defp pattern_matches?(_channel, :never), do: false

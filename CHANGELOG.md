@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- KEYS, SCAN MATCH, the collection SCANs, PSUBSCRIBE and CONFIG GET matched
+  character classes differently from Redis: a range written high to low
+  (`[z-a]`) matched only its three bytes, `[!a]` was negated (Redis negates
+  only with `^`), `[a-]` matched `-` instead of ranging to `]`, and a class
+  with no closing `]` matched nothing. Classes now match as Redis's do, and
+  PubSub indexes such patterns by the same rule.
 - HLEN, SCARD, ZCARD and other member counts answered "ERR storage read
   failed" when more than 4,096 members of the collection had expired by
   their own TTL (HEXPIRE and the like) since the last count: the member index

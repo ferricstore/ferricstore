@@ -10,7 +10,7 @@ defmodule Ferricstore.GlobMatcher do
     * `?` -- matches exactly one byte
     * `[abc]` -- character class (matches any single listed byte)
     * `[a-z]` -- character range
-    * `[^abc]` / `[!abc]` -- negated character class
+    * `[^abc]` -- negated character class (only `^` negates, as in Redis)
     * `\\` -- escape next character (treat literally)
     * All other bytes match literally
 
@@ -93,14 +93,8 @@ defmodule Ferricstore.GlobMatcher do
   end
 
   defp match_char(?[, sc, pattern, pi) do
-    case parse_char_class_at(pattern, pi + 1) do
-      {:ok, chars, negated, _end_pi} ->
-        in_class = sc in chars
-        (negated and not in_class) or (not negated and in_class)
-
-      :error ->
-        ?[ == sc
-    end
+    {matched, _end_pi} = class_match(pattern, pi, sc)
+    matched
   end
 
   defp match_char(pc, sc, _pattern, _pi), do: pc == sc
@@ -114,10 +108,7 @@ defmodule Ferricstore.GlobMatcher do
         2
 
       pc == ?[ ->
-        case parse_char_class_at(pattern, pi + 1) do
-          {:ok, _chars, _neg, end_pi} -> end_pi - pi
-          :error -> 1
-        end
+        class_end(pattern, pi) - pi
 
       true ->
         1
@@ -125,57 +116,52 @@ defmodule Ferricstore.GlobMatcher do
   end
 
   # Parse [chars] or [^chars] starting at position `pos` (after the `[`)
-  defp parse_char_class_at(pattern, pos) do
+  @doc """
+  Returns the index just past the character class that starts at `pi` (the
+  index of its `[`): past its closing `]`, or the end of the pattern when it
+  has none.
+  """
+  @spec class_end(binary(), non_neg_integer()) :: non_neg_integer()
+  def class_end(pattern, pi) when is_binary(pattern) and is_integer(pi) do
+    {_matched, end_pi} = class_match(pattern, pi, -1)
+    end_pi
+  end
+
+  # A class matches as in Redis's stringmatchlen: only `^` negates, `\x` is
+  # the byte x, `x-y` matches the bytes between x and y whichever is larger
+  # (so `[a-]` ranges from `]` to `a`), and a class with no closing `]` runs
+  # to the end of the pattern.
+  defp class_match(pattern, pi, sc) do
     plen = byte_size(pattern)
+    start = pi + 1
 
     {negated, start} =
-      cond do
-        pos < plen and :binary.at(pattern, pos) in [?^, ?!] -> {true, pos + 1}
-        true -> {false, pos}
-      end
+      if start < plen and :binary.at(pattern, start) == ?^,
+        do: {true, start + 1},
+        else: {false, start}
 
-    collect_class_chars_at(pattern, start, plen, [], negated)
+    {matched, end_pi} = scan_class(pattern, start, plen, sc, false)
+    {matched != negated, end_pi}
   end
 
-  defp collect_class_chars_at(_pattern, pos, plen, _acc, _negated) when pos >= plen, do: :error
+  defp scan_class(_pattern, pos, plen, _sc, matched) when pos >= plen, do: {matched, plen}
 
-  defp collect_class_chars_at(pattern, pos, plen, acc, negated) do
-    c = :binary.at(pattern, pos)
+  defp scan_class(pattern, pos, plen, sc, matched) do
+    byte = :binary.at(pattern, pos)
 
     cond do
-      c == ?] ->
-        {:ok, expand_class_tokens(Enum.reverse(acc)), negated, pos + 1}
+      byte == ?\\ and plen - pos >= 2 ->
+        scan_class(pattern, pos + 2, plen, sc, matched or :binary.at(pattern, pos + 1) == sc)
 
-      c == ?\\ and pos + 1 < plen ->
-        collect_class_chars_at(
-          pattern,
-          pos + 2,
-          plen,
-          [{:escaped, :binary.at(pattern, pos + 1)} | acc],
-          negated
-        )
+      byte == ?] ->
+        {matched, pos + 1}
+
+      plen - pos >= 3 and :binary.at(pattern, pos + 1) == ?- ->
+        {low, high} = Enum.min_max([byte, :binary.at(pattern, pos + 2)])
+        scan_class(pattern, pos + 3, plen, sc, matched or (sc >= low and sc <= high))
 
       true ->
-        collect_class_chars_at(pattern, pos + 1, plen, [{:lit, c} | acc], negated)
+        scan_class(pattern, pos + 1, plen, sc, matched or byte == sc)
     end
   end
-
-  defp expand_class_tokens(tokens), do: do_expand_class_tokens(tokens, [])
-
-  defp do_expand_class_tokens([{:lit, first}, {:lit, ?-}, {:lit, last} | rest], acc)
-       when first <= last do
-    do_expand_class_tokens(rest, add_class_range(first, last, acc))
-  end
-
-  defp do_expand_class_tokens([{:lit, c} | rest], acc),
-    do: do_expand_class_tokens(rest, [c | acc])
-
-  defp do_expand_class_tokens([{:escaped, c} | rest], acc),
-    do: do_expand_class_tokens(rest, [c | acc])
-
-  defp do_expand_class_tokens([], acc), do: acc
-
-  defp add_class_range(first, last, acc) when first > last, do: acc
-
-  defp add_class_range(first, last, acc), do: add_class_range(first + 1, last, [first | acc])
 end
