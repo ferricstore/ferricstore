@@ -1018,6 +1018,17 @@ defmodule Ferricstore.Flow.LMDBRebuilderTest do
     refute source =~ "history_entries_by_key"
   end
 
+  test "history rebuild staging retains a millisecond's latest versions" do
+    history_key = "f:{f}:h:flow-1"
+    entries = Enum.map(1..13, &{history_key, "1000-#{&1}", 1_000, "compound-#{&1}"})
+
+    assert LMDBRebuilder.__retained_staged_history_entries_for_test__(
+             entries,
+             history_key,
+             4
+           ) == Enum.map(10..13, &{"1000-#{&1}", 1_000, "compound-#{&1}"})
+  end
+
   defp active_record(id, partition_key, sequence) do
     %{
       id: id,

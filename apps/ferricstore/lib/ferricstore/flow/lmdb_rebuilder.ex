@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   @moduledoc false
 
   alias Ferricstore.Flow
+  alias Ferricstore.Flow.HistoryEvent
   alias Ferricstore.Flow.KeydirSpill
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.LMDBFlushCoordinator
@@ -1382,9 +1383,10 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
          event_ms,
          compound_key
        ) do
+    # Ordered by millisecond, then version (HistoryEvent.sort_key/1).
     :ets.insert(
       history_events,
-      {{history_key, event_ms, event_id, compound_key}}
+      {{history_key, event_ms, HistoryEvent.version(event_id), event_id, compound_key}}
     )
 
     :ets.update_counter(history_keys, history_key, {2, 1}, {history_key, 0})
@@ -1524,7 +1526,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   end
 
   defp first_staged_history_event(history_events, history_key),
-    do: :ets.next(history_events, {history_key, -1, <<>>, <<>>})
+    do: :ets.next(history_events, {history_key, -1, -1, <<>>, <<>>})
 
   defp stream_staged_history_projection(
          :"$end_of_table",
@@ -1539,7 +1541,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
        do: flush_staged_history_projection_ops(lmdb_path, reversed_ops)
 
   defp stream_staged_history_projection(
-         {history_key, _event_ms, _event_id, _compound_key} = staged_key,
+         {history_key, _event_ms, _version, _event_id, _compound_key} = staged_key,
          history_events,
          history_key,
          skip_count,
@@ -1563,7 +1565,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   end
 
   defp stream_staged_history_projection(
-         {history_key, event_ms, event_id, compound_key} = staged_key,
+         {history_key, event_ms, _version, event_id, compound_key} = staged_key,
          history_events,
          history_key,
          0,
@@ -1774,7 +1776,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
        do: Enum.reverse(acc)
 
   defp collect_staged_history_entries(
-         {history_key, _event_ms, _event_id, _compound_key} = staged_key,
+         {history_key, _event_ms, _version, _event_id, _compound_key} = staged_key,
          history_events,
          history_key,
          skip_count,
@@ -1791,7 +1793,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   end
 
   defp collect_staged_history_entries(
-         {history_key, event_ms, event_id, compound_key} = staged_key,
+         {history_key, event_ms, _version, event_id, compound_key} = staged_key,
          history_events,
          history_key,
          0,
