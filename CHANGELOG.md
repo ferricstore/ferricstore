@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- ZRANGEBYSCORE, ZREVRANGEBYSCORE and ZRANGE BYSCORE answered too few
+  members, often none, when a member was scored -0.0 and a bound was 0
+  (`(0` going up, or `0` going down): the ranged score index took -0.0 for a
+  score other than 0, so the range stopped at that member. -0.0 now ties with
+  0, as in Redis.
 - Compaction dropped an expired record that was still its key's newest, so an
   older value of the key in a lower segment came back after a restart (expiry
   drops the keydir row without a tombstone and relies on that record). Such a
