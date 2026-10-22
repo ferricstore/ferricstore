@@ -4,6 +4,14 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A MULTI that deleted a promoted hash, set or sorted set and then wrote the
+  key again (`DEL h` then `HSET h f v`) stored the new type and members in
+  the collection's dedicated file, which the transaction's cleanup deleted
+  right after. The values stayed readable from memory, but once memory
+  pressure evicted them every command on the key answered "ERR storage read
+  failed" until a restart replayed the log. Writes after the delete now go
+  to the shard's shared log.
+
 - A cluster replica running in interactive mode (as under `mix run` or
   `iex -S mix`; releases load every module at boot) could stop applying a
   shard ("storage blocked: invalid_preencoded_command") on the first

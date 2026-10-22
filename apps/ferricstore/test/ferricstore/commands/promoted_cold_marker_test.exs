@@ -9,6 +9,7 @@ defmodule Ferricstore.Commands.PromotedColdMarkerTest do
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.MemoryGuard
   alias Ferricstore.Store.{CompoundKey, Router}
+  alias Ferricstore.Test.PreparedTransactionCoordinator, as: Coordinator
   alias Ferricstore.Test.ShardHelpers
 
   setup do
@@ -81,6 +82,27 @@ defmodule Ferricstore.Commands.PromotedColdMarkerTest do
     assert "2" == Dispatcher.dispatch("ZSCORE", [zset, "m2"], ctx)
     assert ["m1", "m2"] == Dispatcher.dispatch("ZRANGE", [zset, "0", "1"], ctx)
     assert 1 == Dispatcher.dispatch("ZREM", [zset, "m1"], ctx)
+  end
+
+  test "a hash recreated by the transaction that deleted it reads back after eviction", %{
+    ctx: ctx,
+    key: key
+  } do
+    fields = Enum.flat_map(1..150, &["f#{&1}", "v#{&1}"])
+    assert 150 == Dispatcher.dispatch("HSET", [key | fields], ctx)
+    await_promoted!(ctx, key)
+
+    assert [1, 1] = Coordinator.execute([{"DEL", [key]}, {"HSET", [key, "fresh", "1"]}], %{}, nil)
+
+    keydir = elem(ctx.keydir_refs, Router.shard_for(ctx, key))
+
+    for row_key <- [CompoundKey.type_key(key), CompoundKey.hash_field(key, "fresh")] do
+      [row] = :ets.lookup(keydir, row_key)
+      assert {:evicted, _bytes, _size} = MemoryGuard.coldify_candidate(keydir, row)
+    end
+
+    assert {:simple, "hash"} == Dispatcher.dispatch("TYPE", [key], ctx)
+    assert ["fresh", "1"] == Dispatcher.dispatch("HGETALL", [key], ctx)
   end
 
   defp await_promoted!(ctx, key) do

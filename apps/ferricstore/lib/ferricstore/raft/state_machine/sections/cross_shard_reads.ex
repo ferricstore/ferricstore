@@ -1740,7 +1740,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
               nil
 
             type ->
-              promoted_catalog_path(ctx, redis_key) || promoted_marker_path(ctx, redis_key, type)
+              # An earlier command of this apply deleted the promoted
+              # collection; its dedicated storage goes after commit, so later
+              # writes to the key belong in the shared log even though the
+              # marker still reads as promoted.
+              if promoted_instance_removal_pending?(redis_key) do
+                nil
+              else
+                promoted_catalog_path(ctx, redis_key) ||
+                  promoted_marker_path(ctx, redis_key, type)
+              end
           end
 
         run_promoted_route_test_hook(redis_key, compound_key_or_prefix, path)
