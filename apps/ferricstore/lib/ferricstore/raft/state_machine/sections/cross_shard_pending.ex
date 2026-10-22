@@ -429,7 +429,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
               result
             else
               flush_result =
-                case stage_watch_index_writes(state) do
+                case stage_watch_index_writes(state, result) do
                   :ok ->
                     flush_pending_writes(state, publication)
 

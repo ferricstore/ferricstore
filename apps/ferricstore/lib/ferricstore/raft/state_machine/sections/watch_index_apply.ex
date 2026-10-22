@@ -22,12 +22,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.WatchIndexApply do
            when is_integer(index) and index > 0 and is_function(fun, 0) do
         previous = Process.get(@sm_watch_index_entry_key, :undefined)
 
-        Process.put(@sm_watch_index_entry_key, %{
-          index: index,
-          command: command,
-          written: :unclassified,
-          registered: %{}
-        })
+        Process.put(@sm_watch_index_entry_key, %{index: index, command: command, registered: %{}})
 
         try do
           fun.()
@@ -168,12 +163,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.WatchIndexApply do
       # flush of the entry, so the rows land in the same flush as the writes.
       # A read failure here is this node's storage, not the command's outcome:
       # it fails as storage so the entry is retried instead of answered.
-      defp stage_watch_index_writes(state) do
+      defp stage_watch_index_writes(state, result) do
         case Process.get(@sm_watch_index_entry_key) do
-          %{registered: registered} = entry ->
+          %{registered: registered, command: command} = entry ->
             if map_size(registered) > 0 or watch_index_in_use?(state) do
-              entry
-              |> watch_index_entry_written()
+              command
+              |> WatchIndex.written(result)
               |> stage_watch_index_written(state, entry)
               |> case do
                 :ok -> state_storage_failure_result(:ok)
@@ -187,14 +182,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.WatchIndexApply do
             :ok
         end
       end
-
-      defp watch_index_entry_written(%{written: :unclassified, command: command} = entry) do
-        written = WatchIndex.written(command)
-        Process.put(@sm_watch_index_entry_key, %{entry | written: written})
-        written
-      end
-
-      defp watch_index_entry_written(%{written: written}), do: written
 
       defp stage_watch_index_written(:none, _state, _entry), do: :ok
 

@@ -59,6 +59,42 @@ defmodule Ferricstore.Transaction.WatchLevel5Test do
     assert [:ok] = Coordinator.execute([{"SET", [target, "applied"]}], watched, nil)
   end
 
+  # Redis leaves watchers alone when a command changes nothing.
+  noop_writes = [
+    {"SET NX of an existing key", {"SET", ["$key", "v"]}, {"SET", ["$key", "other", "NX"]}},
+    {"SET XX of a missing key", nil, {"SET", ["$key", "other", "XX"]}},
+    {"SET XX GET of a missing key", nil, {"SET", ["$key", "other", "XX", "GET"]}},
+    {"SADD of an existing member", {"SADD", ["$key", "a"]}, {"SADD", ["$key", "a"]}},
+    {"SREM of a missing member", {"SADD", ["$key", "a"]}, {"SREM", ["$key", "zz"]}},
+    {"ZREM of a missing member", {"ZADD", ["$key", "1", "a"]}, {"ZREM", ["$key", "zz"]}},
+    {"GETDEL of a missing key", nil, {"GETDEL", ["$key"]}}
+  ]
+
+  for {name, create, noop} <- noop_writes do
+    test "#{name} leaves the EXEC clean", %{ctx: ctx, key: key, other: other, target: target} do
+      with {command, args} <- unquote(Macro.escape(create)) do
+        dispatch(ctx, command, Enum.map(args, &bind(&1, key, other)))
+      end
+
+      watched = watch(ctx, [key])
+      {command, args} = unquote(Macro.escape(noop))
+      dispatch(ctx, command, Enum.map(args, &bind(&1, key, other)))
+
+      assert [:ok] = Coordinator.execute([{"SET", [target, "applied"]}], watched, nil)
+    end
+  end
+
+  test "SET NX GET of a missing key aborts the EXEC: it writes the key", %{
+    ctx: ctx,
+    key: key,
+    target: target
+  } do
+    watched = watch(ctx, [key])
+    assert nil == dispatch(ctx, "SET", [key, "created", "NX", "GET"])
+
+    assert_aborted(ctx, watched, target)
+  end
+
   string_writes = [
     {"SET of the same value", [{"SET", ["$key", "v"]}]},
     {"SET", [{"SET", ["$key", "changed"]}]},

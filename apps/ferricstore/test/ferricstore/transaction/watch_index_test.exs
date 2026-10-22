@@ -54,6 +54,42 @@ defmodule Ferricstore.Transaction.WatchIndexTest do
     assert WatchIndex.written({:mset, [:not_an_entry]}) == :all
   end
 
+  test "a command whose result shows it changed nothing writes no key" do
+    for {opts, result} <- [
+          {%{nx: true}, nil},
+          {%{xx: true}, nil},
+          {%{nx: true, get: true}, "old"},
+          {%{xx: true, get: true}, nil}
+        ] do
+      assert WatchIndex.written({:set, "k", "v", 0, opts}, result) == :none
+    end
+
+    for {opts, result} <- [
+          {%{}, :ok},
+          {%{nx: true}, :ok},
+          {%{nx: true, get: true}, nil},
+          {%{xx: true, get: true}, "old"}
+        ] do
+      assert WatchIndex.written({:set, "k", "v", 0, opts}, result) == {:keys, ["k"]}
+    end
+
+    assert WatchIndex.written({:cas, "k", "a", "b", nil}, nil) == :none
+    assert WatchIndex.written({:cas, "k", "a", "b", nil}, 1) == {:keys, ["k"]}
+    assert WatchIndex.written({:sadd_single, "s", "m"}, 0) == :none
+    assert WatchIndex.written({:sadd_single, "s", "m"}, 1) == {:keys, ["s"]}
+    assert WatchIndex.written({:getdel, "k"}, nil) == :none
+    assert WatchIndex.written({:put, "k", "v", 0}, {:error, :failed}) == {:keys, ["k"]}
+  end
+
+  test "a batch writes the keys of the commands that changed something" do
+    batch = {:batch, [{:set, "a", "v", 0, %{nx: true}}, {:put, "b", "v", 0}]}
+
+    assert WatchIndex.written(batch, {[nil, :ok], 2}) == {:keys, ["b"]}
+    assert WatchIndex.written(batch, {:ok, [nil, :ok]}) == {:keys, ["b"]}
+    assert {:keys, keys} = WatchIndex.written(batch, :unaligned)
+    assert Enum.sort(keys) == ["a", "b"]
+  end
+
   test "every state machine command is classified" do
     sections = Path.expand("../../../lib/ferricstore/raft/state_machine/sections", __DIR__)
 

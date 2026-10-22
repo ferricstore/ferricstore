@@ -103,6 +103,69 @@ defmodule Ferricstore.Transaction.WatchIndex do
   """
   def written(command), do: command |> CommandValues.decode_replay_command() |> classify()
 
+  @doc """
+  `written/1` for a command that applied with `result`: a command whose
+  result shows it changed nothing (SET NX of an existing key, SADD of an
+  existing member, a failed CAS) writes no key, as Redis leaves watchers
+  alone then. Results that do not tell count as writes.
+  """
+  def written(command, result) do
+    command
+    |> CommandValues.decode_replay_command()
+    |> classify_applied(result)
+  end
+
+  defp classify_applied({:batch, commands} = batch, result) when is_list(commands) do
+    case batch_results(result) do
+      results when is_list(results) and length(results) == length(commands) ->
+        commands
+        |> Enum.zip(results)
+        |> Enum.reduce_while({:keys, []}, fn {command, result}, {:keys, acc} ->
+          case written(command, result) do
+            :none -> {:cont, {:keys, acc}}
+            {:keys, keys} -> {:cont, {:keys, keys ++ acc}}
+            :all -> {:halt, :all}
+          end
+        end)
+        |> unique()
+
+      _unaligned ->
+        classify(batch)
+    end
+  end
+
+  defp classify_applied(command, result) do
+    if unchanged?(command, result), do: :none, else: classify(command)
+  end
+
+  defp batch_results({:ok, results}) when is_list(results), do: results
+  defp batch_results({results, count}) when is_list(results) and is_integer(count), do: results
+  defp batch_results(_result), do: nil
+
+  # SET with NX or XX answers nil when it skipped the write, and with GET the
+  # old value instead: present for a skipped NX, missing for a skipped XX.
+  defp unchanged?({tag, _key, _value, _expire_at_ms, opts}, result)
+       when tag in [:set, :set_blob_ref] and is_map(opts) do
+    case {Map.get(opts, :nx, false), Map.get(opts, :xx, false), Map.get(opts, :get, false)} do
+      {true, _xx, false} -> is_nil(result)
+      {_nx, true, false} -> is_nil(result)
+      {true, _xx, true} -> is_binary(result)
+      {_nx, true, true} -> is_nil(result)
+      _unconditional -> false
+    end
+  end
+
+  defp unchanged?({tag, _key, _expected, _value, _ttl_ms}, result)
+       when tag in [:cas, :cas_blob_ref],
+       do: result in [0, nil]
+
+  defp unchanged?({:getdel, _key}, nil), do: true
+
+  defp unchanged?({tag, _key, _member}, 0) when tag in [:sadd_single, :srem_single, :zrem_single],
+    do: true
+
+  defp unchanged?(_command, _result), do: false
+
   defp classify(command) when is_tuple(command) and tuple_size(command) >= 1 do
     tag = elem(command, 0)
 

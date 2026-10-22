@@ -19,8 +19,9 @@ All notable changes to FerricStore will be documented here.
   when it trims its log. From feature level 5, WATCH records a write version
   for each watched key in replicated state, every write to the key raises it,
   and EXEC compares the versions, so every replica reaches the same decision.
-  A WATCH older than an hour now aborts its EXEC. Below level 5 WATCH behaves
-  as before.
+  As in Redis, a command that changes nothing (SET NX of an existing key, SADD
+  of an existing member, a failed CAS) leaves watchers alone. A WATCH older
+  than an hour now aborts its EXEC. Below level 5 WATCH behaves as before.
 - Flow history ordered the events a Flow wrote in one millisecond by their
   ids' text, so `1000-10` came before `1000-9`. Whenever a Flow's version
   crossed 9 to 10, 99 to 100 and so on within one millisecond, history

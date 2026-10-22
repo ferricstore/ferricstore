@@ -1088,7 +1088,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
               error
 
             nil ->
-              with :ok <- stage_watch_index_writes(state),
+              with :ok <- stage_watch_index_writes(state, result),
                    :ok <- prepare_pending_flow_native_batches(state) do
                 flush_prepared_cross_shard_pending_writes(state, result)
               else
