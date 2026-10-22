@@ -237,6 +237,7 @@ documented in `guides/flow-elixir-sdk.md`.
 | Command | Difference |
 |---------|-----------|
 | `ZRANGE` | `BYLEX` reads every member of the set to answer the range |
+| `ZADD`/`ZINCRBY` | Scores must be finite: `+inf`, `-inf` and `inf` answer `ERR value is not a valid float` (Redis stores them). They remain valid as range bounds |
 | `SCAN` | Cursor is key-based (alphabetic position), not an opaque integer |
 | `HSCAN`/`SSCAN`/`ZSCAN` | Cursor is an integer offset into the scanned list |
 | `FLUSHDB`/`FLUSHALL` | `ASYNC`/`SYNC` accepted but both execute synchronously; true async reclaim happens during Bitcask merge |
