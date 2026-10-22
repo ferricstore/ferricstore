@@ -1820,6 +1820,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
 
       defp promoted_marker_type(_value), do: nil
 
+      # A state machine state names its shard `shard_index`; the cold read of an
+      # evicted marker needs the cross-shard ctx shape (`index`, `instance_ctx`).
+      defp promoted_marker_ctx(%{shard_index: index, data_dir: data_dir} = state),
+        do: cross_shard_ctx(state, index, data_dir, cross_shard_instance_ctx(state))
+
       defp promoted_marker_ctx(%{keydir: _keydir} = ctx), do: ctx
       defp promoted_marker_ctx(%{ets: keydir} = ctx), do: Map.put(ctx, :keydir, keydir)
 

@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A write to a promoted hash, set, sorted set or list stopped a shard's
+  writes (the client saw a timeout and the shard's storage process
+  restarted) after memory pressure had evicted the collection's promotion
+  marker from memory: the write read the evicted marker back from disk with
+  the wrong shard context and crashed. Each node evicts on its own, so this
+  hit nodes independently. The marker is now read back as any evicted value.
+
 - ACL key (`~`, `%R~`, `%W~`) and channel (`&`) patterns matched differently
   from Redis, which matches them as it matches KEYS: a backslash stood for
   itself instead of making the next byte literal (`~foo\*` allowed `foo\x`
