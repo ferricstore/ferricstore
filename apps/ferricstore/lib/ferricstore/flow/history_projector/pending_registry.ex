@@ -163,6 +163,47 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
     error -> {:error, {:overflow_commit_failed, error}}
   end
 
+  # Overflow drains oldest first, and the queue may take a newer entry while
+  # older ones still wait here; a projected index past the oldest waiting
+  # entry would claim history that is not written. :infinity when none waits.
+  def overflow_publish_limit(projector) when is_atom(projector) do
+    table = ensure_overflow_registry()
+    overflow_publish_limit(table, projector, {projector, 0})
+  rescue
+    _ -> 0
+  end
+
+  defp overflow_publish_limit(table, projector, key) do
+    case :ets.next(table, key) do
+      {^projector, _sequence} = next_key ->
+        case :ets.lookup(table, next_key) do
+          # Drained meanwhile: the next row is now the oldest.
+          [] -> overflow_publish_limit(table, projector, next_key)
+          row -> oldest_overflow_limit(row)
+        end
+
+      _end_or_other_projector ->
+        :infinity
+    end
+  end
+
+  # Entries without a Raft index come from a projector outside WARaft, which
+  # has no replay cursor to hold back.
+  defp oldest_overflow_limit([{_key, {state, entries}}])
+       when state in [:pending, :ready] and is_list(entries) do
+    entries
+    |> Enum.flat_map(fn
+      %{ra_index: index} when is_integer(index) -> [index]
+      _entry -> []
+    end)
+    |> case do
+      [] -> :infinity
+      indexes -> max(Enum.min(indexes) - 1, 0)
+    end
+  end
+
+  defp oldest_overflow_limit(_invalid), do: 0
+
   def delete_overflow(projector, sequence)
       when is_atom(projector) and is_integer(sequence) and sequence > 0 do
     table = ensure_overflow_registry()

@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- With more Flow history waiting than the history projector's queue holds,
+  a request to make a write's history durable could be answered while that
+  history still sat in the overflow queue. The shard's replay position, and
+  with it a checkpoint or a membership change, could then pass history that
+  was never written, and a crash lost it. The projector now never reports
+  history past the oldest entry still waiting, and keeps such a request
+  open until the waiting entries are written.
 - After a crash, a node could permanently lose Flow history events while the
   Flow's state survived. A restart replays the log only after the shard's
   latest projection checkpoint, and a checkpoint was taken at the newest

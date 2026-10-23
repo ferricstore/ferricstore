@@ -84,6 +84,88 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.AsyncEnqueueRejectsAbov
         end
       end
 
+      # WARaft storage trusts durable?/4 to move its replay cursor past an
+      # entry, so an entry still waiting in overflow must hold it back.
+      test "a replay request does not publish past history waiting in overflow" do
+        unique = System.unique_integer([:positive])
+
+        old_max_pending =
+          Application.get_env(:ferricstore, :flow_history_projector_max_pending_entries)
+
+        old_flush_interval =
+          Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms)
+
+        instance_name = :"history_projector_overflow_floor_#{unique}"
+
+        dir =
+          Path.join(System.tmp_dir!(), "ferricstore_history_projector_overflow_floor_#{unique}")
+
+        File.mkdir_p!(dir)
+
+        keydir = :ets.new(:"history_projector_overflow_floor_keydir_#{unique}", [:set, :public])
+        {flow_index, flow_lookup} = OrderedIndex.table_names(instance_name, 0)
+        NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+        ctx = %{
+          name: instance_name,
+          keydir_refs: {keydir},
+          checkpoint_flags: :atomics.new(1, signed: false),
+          disk_pressure: :atomics.new(1, signed: false),
+          write_version: :counters.new(1, [:write_concurrency]),
+          keydir_binary_bytes: :atomics.new(1, signed: true),
+          flow_history_projected_index: :atomics.new(1, signed: false),
+          flow_history_projector_flush_failures: :atomics.new(1, signed: false)
+        }
+
+        entry = fn version ->
+          event_ms = 1_000 + version
+          event_id = "#{event_ms}-#{version}"
+
+          %{
+            key: Ferricstore.Flow.Keys.stream_entry_key("flow-floor", event_id, nil),
+            expire_at_ms: 0,
+            history_key: Ferricstore.Flow.Keys.history_key("flow-floor"),
+            event_id: event_id,
+            event_ms: event_ms,
+            version: version,
+            value: "history-#{version}",
+            ra_index: version
+          }
+        end
+
+        try do
+          Application.put_env(:ferricstore, :flow_history_projector_max_pending_entries, 1)
+          Application.put_env(:ferricstore, :flow_history_projector_flush_interval_ms, 60_000)
+
+          {:ok, pid} =
+            HistoryProjector.start_link(
+              shard_index: 0,
+              shard_data_path: dir,
+              instance_ctx: ctx,
+              recover_on_init: false
+            )
+
+          assert :ok = HistoryProjector.enqueue_async(ctx, 0, [entry.(1)], 1)
+          # The queue is full: the second entry waits in overflow.
+          assert :ok = HistoryProjector.enqueue_async(ctx, 0, [entry.(2)], 2)
+          assert :requested = HistoryProjector.request(ctx, 0, dir, 2)
+
+          assert eventually(fn -> HistoryProjector.durable?(ctx, 0, dir, 2) end)
+
+          assert {:ok, "history-2"} =
+                   Ferricstore.Flow.HistoryProjector.Log.scan_event_value(dir, entry.(2).key)
+
+          assert Process.alive?(pid)
+        after
+          if Process.whereis(HistoryProjector.name(ctx, 0)),
+            do: GenServer.stop(HistoryProjector.name(ctx, 0))
+
+          File.rm_rf(dir)
+          restore_env(:flow_history_projector_max_pending_entries, old_max_pending)
+          restore_env(:flow_history_projector_flush_interval_ms, old_flush_interval)
+        end
+      end
+
       test "fire-and-forget enqueue does not wait behind projector work" do
         unique = System.unique_integer([:positive])
         instance_name = :"history_projector_async_enqueue_#{unique}"
