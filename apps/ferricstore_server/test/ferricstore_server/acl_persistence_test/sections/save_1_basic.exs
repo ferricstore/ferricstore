@@ -731,11 +731,10 @@ defmodule FerricstoreServer.AclPersistenceTest.Sections.Save1Basic do
 
           assert :ok = Acl.set_user("alice", ["on"])
 
-          # Wait for debounce timer (1 second + buffer)
-          Process.sleep(1_500)
-
+          # The save runs a debounce interval after the mutation; a slow runner
+          # can take longer than any fixed sleep to write and sync it.
           path = Acl.acl_file_path(dir)
-          assert File.exists?(path)
+          eventually(fn -> File.exists?(path) end, "ACL auto-save to write #{path}")
           contents = File.read!(path)
           assert contents =~ "user alice"
         end
@@ -759,11 +758,8 @@ defmodule FerricstoreServer.AclPersistenceTest.Sections.Save1Basic do
             Acl.set_user("user_#{i}", ["on"])
           end
 
-          # Wait for debounce
-          Process.sleep(1_500)
-
           path = Acl.acl_file_path(dir)
-          assert File.exists?(path)
+          eventually(fn -> File.exists?(path) end, "ACL auto-save to write #{path}")
           contents = File.read!(path)
           # All 10 users should be in the file (saved after debounce)
           for i <- 1..10 do
