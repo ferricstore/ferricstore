@@ -31,6 +31,11 @@ defmodule Ferricstore.Review.H7DedicatedCompactCleanupTest do
 
   defp ukey(base), do: "h7_#{base}_#{:rand.uniform(9_999_999)}"
 
+  defp promoted?(key) do
+    ctx = FerricStore.Instance.get(:default)
+    GenServer.call(Router.shard_name(ctx, Router.shard_for(ctx, key)), {:promoted?, key})
+  end
+
   defp dedicated_dir(key) do
     shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
@@ -45,12 +50,12 @@ defmodule Ferricstore.Review.H7DedicatedCompactCleanupTest do
     pairs = Enum.flat_map(1..(@test_threshold + 1), fn i -> ["f_#{i}", "v_#{i}"] end)
     Hash.handle("HSET", [key | pairs], store)
 
+    # Every write to a promoted hash lists its directory and removes leftover
+    # compact_*.log files, so the fake one is written only once promotion has
+    # finished writing (the call waits for a scheduled promotion).
+    assert promoted?(key)
     dir = dedicated_dir(key)
-
-    ShardHelpers.eventually(
-      fn -> File.exists?(dir) end,
-      "hash should be promoted before compact cleanup setup"
-    )
+    assert File.dir?(dir)
 
     # Create a fake leftover compact file
     compact_file = Path.join(dir, "compact_0.log")

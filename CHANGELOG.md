@@ -9,12 +9,18 @@ All notable changes to FerricStore will be documented here.
   signal that had already moved the Flow (`transition_to`) answered "ERR flow
   state mismatch". From feature level 5 such a retry answers OK and changes
   nothing; a reused key with different content is still refused.
-- New setting `:waraft_election_pre_vote` (default `false`; also the
-  `election_pre_vote` start option) turns on wa_raft's pre-vote: a node that
-  lost contact asks whether it could win before raising its term, so on its
-  return it cannot unseat a leader the others still follow. With it and
-  1,500/3,000 ms election timeouts, a 3-node test resumed writes about 2 s
-  after its shard leader was killed (5.6-6.1 s with the defaults).
+- A shard whose leader dies takes writes again about 2 s later instead of
+  5.6-6.1 s (3-node test): elections now default to 1,500-3,000 ms timeouts
+  (`:waraft_election_timeout_ms` and `:waraft_election_timeout_ms_max`, were
+  5,000 and 7,500) with wa_raft's pre-vote on (new setting
+  `:waraft_election_pre_vote`, also the `election_pre_vote` start option). A
+  node that lost contact asks whether it could win before it raises its term,
+  and a follower agrees only once it has itself missed the leader for the
+  minimum timeout, so a node that stalled or was cut off cannot unseat a
+  leader the others follow. Clusters with slow shared disks or replicas across
+  regions can raise both timeouts. This needs `ferricstore_waraft` 0.1.2:
+  with 0.1.1 and pre-vote on, a single-node shard whose Raft server restarted
+  never elected itself again.
 - A WARaft shard whose storage blocked itself after a failed apply (it then
   refuses every apply until restarted) only emitted telemetry; it now also
   logs an error naming the shard, the position, the operation and the cause.

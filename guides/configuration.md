@@ -385,6 +385,29 @@ intervention needed.
 **Single-node mode** (the common case): the leader is its own quorum. Writes
 are committed as soon as they're fsynced locally. No network round-trips.
 
+### Leader elections
+
+A follower that hears nothing from its shard's leader for a random 1.5-3 s
+starts an election; the leader heartbeats every 120 ms, so that is a dozen
+heartbeats missed in a row. In a 3-node test a shard whose leader was killed
+took writes again about 2 s later. Before it raises its term a node asks its
+peers whether it could win (pre-vote), and a peer agrees only once it has
+itself missed the leader for 1.5 s. A node that stalled or was cut off
+therefore cannot unseat a leader the others still follow.
+
+An election only decides who leads: a spurious one pauses that shard's writes
+for about as long as a failover and loses nothing. Raise both timeouts where
+heartbeats can stall for longer, such as replicas across regions or shared
+disks with multi-second fsync stalls. wa_raft counts failed pre-votes
+(`candidate.pre_vote.failed`); a rising count means followers miss the leader
+too often for the timeouts.
+
+| Option | Type | Default | Applies to | Description |
+|--------|------|---------|------------|-------------|
+| `:waraft_election_timeout_ms` | `pos_integer` | `1500` | Both | Shortest wait for the leader before an election. Set at startup. |
+| `:waraft_election_timeout_ms_max` | `pos_integer` | `3000` | Both | Longest wait; each wait is random between the two. Set at startup. |
+| `:waraft_election_pre_vote` | `boolean` | `true` | Both | Ask peers whether the node could win before raising its term. Set at startup. |
+
 Configure per-namespace at runtime:
 
 ```bash

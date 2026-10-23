@@ -1885,8 +1885,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
         end
       end
 
-      # Pre-vote keeps a node that lost contact from disrupting a healthy leader
-      # when it returns; it is off unless configured.
       test "WARaft pre-vote follows the election_pre_vote option", %{ctx: ctx} do
         previous = Application.get_env(:ferricstore_waraft_backend, :raft_election_pre_vote)
 
@@ -1894,11 +1892,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
           assert :ok =
                    WARaftBackend.start(ctx,
                      log_module: :ferricstore_waraft_spike_segment_log,
-                     election_pre_vote: true
+                     election_pre_vote: false
                    )
 
           assert Application.get_env(:ferricstore_waraft_backend, :raft_election_pre_vote) ==
-                   true
+                   false
         after
           if previous == nil,
             do: Application.delete_env(:ferricstore_waraft_backend, :raft_election_pre_vote),
@@ -1907,17 +1905,33 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
         end
       end
 
-      test "WARaft pre-vote is off by default", %{ctx: ctx} do
-        previous = Application.get_env(:ferricstore, :waraft_election_pre_vote)
+      # A follower grants a pre-vote only once it has itself gone the minimum
+      # election timeout without hearing from the leader, so a follower that
+      # stalls cannot unseat a leader the others still follow. That keeps the
+      # short timeouts from turning one slow node into an election.
+      test "WARaft elections default to pre-vote and 1,500-3,000 ms timeouts", %{ctx: ctx} do
+        keys = [
+          :waraft_election_pre_vote,
+          :waraft_election_timeout_ms,
+          :waraft_election_timeout_ms_max
+        ]
+
+        previous = Map.new(keys, &{&1, Application.get_env(:ferricstore, &1)})
 
         try do
-          Application.delete_env(:ferricstore, :waraft_election_pre_vote)
+          Enum.each(keys, &Application.delete_env(:ferricstore, &1))
           assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
           assert Application.get_env(:ferricstore_waraft_backend, :raft_election_pre_vote) ==
-                   false
+                   true
+
+          assert Application.get_env(:ferricstore_waraft_backend, :raft_election_timeout_ms) ==
+                   1_500
+
+          assert Application.get_env(:ferricstore_waraft_backend, :raft_election_timeout_ms_max) ==
+                   3_000
         after
-          restore_env(:waraft_election_pre_vote, previous)
+          Enum.each(previous, fn {key, value} -> restore_env(key, value) end)
         end
       end
 

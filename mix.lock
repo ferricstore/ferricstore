@@ -36,7 +36,7 @@
   "statistex": {:hex, :statistex, "1.1.1", "73612aa7f79e53c30569be065fd121e380f1cf57bc4c2da5b41be9246da18df9", [:mix], [], "hexpm", "310c4b49b34adf683de3103639006bed233ab54c08a4add65a531448e653857c"},
   "telemetry": {:hex, :telemetry, "1.4.2", "a0cb522801dffb1c49fe6e30561badffc7b6d0e180db1300df759faa22062855", [:rebar3], [], "hexpm", "928f6495066506077862c0d1646609eed891a4326bee3126ba54b60af61febb1"},
   "tz": {:hex, :tz, "0.28.2", "6c47f3d1a8ee5c33a1d8f0ba49e5a851b0a30c408a587d907aff6e71228b3b32", [:mix], [{:castore, "~> 0.1 or ~> 1.0", [hex: :castore, repo: "hexpm", optional: true]}, {:mint, "~> 1.6", [hex: :mint, repo: "hexpm", optional: true]}], "hexpm", "a6bf7355a33f0a7511602ab4566432ac0901d8abff81e94e455bca19708a0c87"},
-  "wa_raft": {:hex, :ferricstore_waraft, "0.1.1", "62c74b7d19a0b8d6409a3672d148ce36df7cc65859779f46c3e72d32288d91bb", [:rebar3], [], "hexpm", "bb817a3cfa11478a01e69edc57e4141814e18ae401b7b08c08103af6dd499523"},
+  "wa_raft": {:hex, :ferricstore_waraft, "0.1.2", "870ed1ce3769f80328533caeab89b122bb878a7f184b46b3c7b32eb0c6efed7e", [:rebar3], [], "hexpm", "747e51e6d0674538999a48e1401561055ed2b984bf788a1e37e43cc858078083"},
   "yamerl": {:hex, :yamerl, "0.10.0", "4ff81fee2f1f6a46f1700c0d880b24d193ddb74bd14ef42cb0bcf46e81ef2f8e", [:rebar3], [], "hexpm", "346adb2963f1051dc837a2364e4acf6eb7d80097c0f53cbdc3046ec8ec4b4e6e"},
   "yaml_elixir": {:hex, :yaml_elixir, "2.12.2", "9dd1330fb4cd9a36a7b0f502e5b12486eff632792ee4a5f0eba52a4d4ec32c9c", [:mix], [{:yamerl, "~> 0.10", [hex: :yamerl, repo: "hexpm", optional: false]}], "hexpm", "e7c1b10122f973e6558462d51c39026ba0e14afbc6745318e990ea82cfe9e159"},
 }
