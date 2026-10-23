@@ -353,7 +353,7 @@ defmodule Ferricstore.Flow.ValueStore do
     else
       lmdb_values =
         ctx
-        |> flow_value_lmdb_mget(Enum.map(missing, fn {_idx, ref} -> ref end))
+        |> lmdb_mget(Enum.map(missing, fn {_idx, ref} -> ref end), now_ms())
         |> List.to_tuple()
 
       replacements =
@@ -361,10 +361,11 @@ defmodule Ferricstore.Flow.ValueStore do
         |> Enum.with_index()
         |> Map.new(fn {{idx, _ref}, lmdb_idx} -> {idx, elem(lmdb_values, lmdb_idx)} end)
 
+      # Public reads keep reporting an unreadable mirrored value as absent.
       values
       |> Enum.with_index()
       |> Enum.map(fn
-        {nil, idx} -> Map.get(replacements, idx)
+        {nil, idx} -> replacements |> Map.get(idx) |> unless_read_failure()
         {value, _idx} -> value
       end)
     end
@@ -372,11 +373,18 @@ defmodule Ferricstore.Flow.ValueStore do
 
   defp fill_lmdb_missing(values, _ctx, _refs, _lmdb_backed?), do: values
 
-  defp flow_value_lmdb_mget(_ctx, []), do: []
+  defp unless_read_failure(value), do: if(ReadResult.failure?(value), do: nil, else: value)
 
-  defp flow_value_lmdb_mget(ctx, refs) do
-    now = now_ms()
+  @doc false
+  # Values of `refs` that the history projector moved out of the keydir, read
+  # through the LMDB mirror of each ref's shard: nil where it holds none, a
+  # ReadResult failure where it cannot be read. Apply passes its own clock, so
+  # expiry is judged as the rest of the apply judges it.
+  @spec lmdb_mget(FerricStore.Instance.t(), [binary()], non_neg_integer()) ::
+          [binary() | nil | ReadResult.failure()]
+  def lmdb_mget(_ctx, [], _now), do: []
 
+  def lmdb_mget(ctx, refs, now) do
     results =
       refs
       |> Enum.with_index()
@@ -384,13 +392,15 @@ defmodule Ferricstore.Flow.ValueStore do
       |> Enum.reduce(%{}, fn {path, group}, acc ->
         group_refs = Enum.map(group, fn {ref, _idx} -> ref end)
 
-        lmdb_values =
-          case Ferricstore.Flow.LMDB.get_many(path, group_refs) do
-            {:ok, values} -> values
-            {:error, _reason} -> Enum.map(group_refs, fn _ref -> :not_found end)
-          end
+        case Ferricstore.Flow.LMDB.get_many(path, group_refs) do
+          {:ok, lmdb_values} ->
+            flow_value_lmdb_decode_group(ctx, group, lmdb_values, now, acc)
 
-        flow_value_lmdb_decode_group(ctx, group, lmdb_values, now, acc)
+          {:error, reason} ->
+            Enum.reduce(group, acc, fn {_ref, idx}, inner_acc ->
+              Map.put(inner_acc, idx, ReadResult.failure(reason))
+            end)
+        end
       end)
 
     for idx <- 0..(length(refs) - 1)//1, do: Map.get(results, idx)
@@ -474,8 +484,10 @@ defmodule Ferricstore.Flow.ValueStore do
         {:ok, values} ->
           flow_value_lmdb_put_waraft_locator_values(ctx, shard_index, entries, values, inner_acc)
 
-        _missing_or_error ->
-          inner_acc
+        {:error, reason} ->
+          Enum.reduce(entries, inner_acc, fn {idx, _ref, _locator}, entries_acc ->
+            Map.put(entries_acc, idx, ReadResult.failure(reason))
+          end)
       end
     end)
   end
@@ -503,8 +515,8 @@ defmodule Ferricstore.Flow.ValueStore do
       {{idx, _value}, {:ok, materialized_value}}, inner_acc ->
         Map.put(inner_acc, idx, materialized_value)
 
-      {_entry, {:error, _reason}}, inner_acc ->
-        inner_acc
+      {{idx, _value}, {:error, reason}}, inner_acc ->
+        Map.put(inner_acc, idx, ReadResult.failure(reason))
     end)
   end
 
@@ -525,14 +537,15 @@ defmodule Ferricstore.Flow.ValueStore do
            value
          ) do
       {:ok, materialized} -> materialized
-      {:error, _reason} -> nil
+      {:error, reason} -> ReadResult.failure(reason)
     end
   end
 
   defp flow_value_read_lmdb_locator(ctx, key, {file_id, offset, _value_size}) do
     shard_index = Router.shard_for(ctx, key)
 
-    with {:ok, value} <- flow_value_read_locator_bytes(ctx, shard_index, key, file_id, offset),
+    with {:ok, value} when is_binary(value) <-
+           flow_value_read_locator_bytes(ctx, shard_index, key, file_id, offset),
          {:ok, materialized} <-
            BlobValue.maybe_materialize(
              ctx.data_dir,
@@ -542,7 +555,8 @@ defmodule Ferricstore.Flow.ValueStore do
            ) do
       materialized
     else
-      _error -> nil
+      {:error, reason} -> ReadResult.failure(reason)
+      _absent -> nil
     end
   end
 

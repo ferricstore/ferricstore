@@ -4,6 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- An idempotent Flow create retried with a payload could be refused as an
+  idempotency conflict. Once a node's history projector has projected a
+  Flow value it removes the value's keydir row and the shard's LMDB mirror
+  locates it, and the retry's payload check read only the keydir. A single
+  create returned a false conflict; a batch (create_many, spawn) holding such
+  a retry was refused whole on nodes whose projector had caught up and
+  applied on nodes whose projector lagged. A rewind that restarted a
+  record's retention also skipped such values, so they could expire before
+  their record. Apply now reads a record's values through the mirror too, as
+  Flow reads do.
 - A Flow signal's idempotency digest and a child group's request hash are
   stored and compared on every replica, and were computed with
   `term_to_binary`, whose output changes between OTP releases (OTP 26

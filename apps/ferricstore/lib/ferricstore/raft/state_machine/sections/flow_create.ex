@@ -1629,7 +1629,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       defp flow_create_idempotent_payload_match?(state, existing, %{payload: payload}) do
         with ref when is_binary(ref) and ref != "" <- Map.get(existing, :payload_ref),
              {:ok, expected} <- flow_idempotent_expected_encoded_value(state, payload),
-             [stored] when is_binary(stored) <- sm_store_batch_get(state, [ref], &sm_file_path/2) do
+             [stored] when is_binary(stored) <- flow_record_value_batch_get(state, [ref]) do
           stored == expected
         else
           _ -> false

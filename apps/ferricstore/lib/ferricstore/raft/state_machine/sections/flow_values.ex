@@ -433,6 +433,59 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
         :ok
       end
 
+      # Values a record refers to. Once this node's history projector has
+      # projected a value it deletes the value's keydir row, and the shard's
+      # LMDB mirror locates the value instead. Projection progress is local to
+      # each node, so apply reads both, as Flow reads do, and every replica
+      # decides alike.
+      defp flow_record_value_batch_get(state, refs) do
+        values = sm_store_batch_get(state, refs, &sm_file_path/2)
+
+        case {flow_projected_value_refs(state, refs, values), instance_ctx_for_state(state)} do
+          {[_ | _] = projected, %FerricStore.Instance{} = ctx} ->
+            now_ms = Ferricstore.ExpiryContext.now_ms(Ferricstore.ExpiryContext.capture())
+
+            found =
+              projected
+              |> Enum.zip(Ferricstore.Flow.ValueStore.lmdb_mget(ctx, projected, now_ms))
+              |> Map.new()
+
+            Enum.zip_with(refs, values, fn
+              ref, nil -> flow_projected_value(Map.get(found, ref))
+              _ref, value -> value
+            end)
+
+          _nothing_projected_or_no_instance ->
+            values
+        end
+      end
+
+      # Value refs found neither among this apply's pending writes nor in the keydir.
+      defp flow_projected_value_refs(state, refs, values) do
+        pending = Process.get(:sm_pending_values) || %{}
+
+        for {ref, nil} <- Enum.zip(refs, values),
+            FlowKeys.value_key?(ref),
+            not Map.has_key?(pending, ref),
+            not flow_keydir_member?(state, ref),
+            uniq: true,
+            do: ref
+      end
+
+      defp flow_keydir_member?(state, key) do
+        :ets.member(state.ets, key)
+      rescue
+        # sm_store_batch_get has already recorded the missing keydir.
+        ArgumentError -> true
+      end
+
+      defp flow_projected_value({:error, {:storage_read_failed, reason}}) do
+        record_state_read_failure({:projected_flow_value_unavailable, reason})
+        nil
+      end
+
+      defp flow_projected_value(value), do: value
+
       defp flow_refresh_record_value_expirations(state, record, attrs) do
         refs =
           [:payload, :result, :error]
@@ -440,7 +493,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
           |> Enum.map(fn kind -> Map.get(record, flow_value_ref_field(kind)) end)
           |> Enum.filter(&flow_owned_value_ref?/1)
 
-        values = sm_store_batch_get(state, refs, &sm_file_path/2)
+        values = flow_record_value_batch_get(state, refs)
         expire_at_ms = flow_record_expire_at(record)
 
         refs
