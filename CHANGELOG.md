@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- After a crash, a node could permanently lose Flow history events while the
+  Flow's state survived. A restart replays the log only after the shard's
+  latest projection checkpoint, and a checkpoint was taken at the newest
+  applied write even when the background projector had not written that
+  write's history yet. A checkpoint now waits for that history before it
+  counts, and a log trim that has to rebuild the projection itself defers
+  until the history is written.
 - A membership change (any WARaft config entry) saved the shard's replay
   position at once, past earlier writes whose Flow history was still being
   projected in the background. A crash before that projection finished lost

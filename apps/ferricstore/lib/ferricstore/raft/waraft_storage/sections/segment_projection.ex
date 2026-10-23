@@ -795,31 +795,38 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
 
       defp apply_projection_replay_dependencies_ready?(_handle), do: true
 
-      defp history_replay_dependencies_ready?(handle) do
+      defp history_replay_dependencies(handle) do
         handle
         |> Map.get(:replay_dependencies, replay_dependency_defaults())
         |> Map.get(:history, %{})
         |> normalize_replay_dependency_map()
-        |> Enum.all?(fn {shard_index, index} ->
+      end
+
+      defp history_replay_dependencies_ready?(handle),
+        do: history_dependencies_durable?(handle, history_replay_dependencies(handle))
+
+      defp request_history_replay_dependencies(handle),
+        do: request_history_dependencies(handle, history_replay_dependencies(handle))
+
+      # `source` is the storage handle, or anything else carrying its ctx (a
+      # checkpoint job, the trim's projection context).
+      defp history_dependencies_durable?(source, dependencies) do
+        Enum.all?(dependencies, fn {shard_index, index} ->
           HistoryProjector.durable?(
-            Map.get(handle, :ctx),
+            Map.get(source, :ctx),
             shard_index,
-            replay_dependency_shard_data_path(handle, shard_index),
+            replay_dependency_shard_data_path(source, shard_index),
             index
           )
         end)
       end
 
-      defp request_history_replay_dependencies(handle) do
-        handle
-        |> Map.get(:replay_dependencies, replay_dependency_defaults())
-        |> Map.get(:history, %{})
-        |> normalize_replay_dependency_map()
-        |> Enum.each(fn {shard_index, index} ->
+      defp request_history_dependencies(source, dependencies) do
+        Enum.each(dependencies, fn {shard_index, index} ->
           HistoryProjector.request(
-            Map.get(handle, :ctx),
+            Map.get(source, :ctx),
             shard_index,
-            replay_dependency_shard_data_path(handle, shard_index),
+            replay_dependency_shard_data_path(source, shard_index),
             index
           )
         end)

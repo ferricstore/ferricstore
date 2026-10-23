@@ -17,7 +17,14 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
         :waraft_segment_projection_checkpoint_hook,
         :waraft_segment_projection_before_relocate_hook,
         :waraft_segment_projection_trim_max_deferred_entries,
-        :waraft_segment_projection_checkpoint_concurrency
+        :waraft_segment_projection_checkpoint_concurrency,
+        :waraft_segment_projection_checkpoint_history_timeout_ms
+      ]
+
+      @history_envs [
+        :flow_async_history,
+        :flow_history_projector_flush_interval_ms,
+        :flow_history_projector_lmdb_publish_hook
       ]
 
       @tag :bounded_checkpoint
@@ -532,6 +539,78 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
         end)
       end
 
+      # Flow history lives outside the keydir, so recovery, which replays only
+      # the entries after the projection, could not rebuild history the
+      # projector had not written yet.
+      @tag :bounded_checkpoint
+      test "a checkpoint is not adopted before the Flow history it covers is durable", %{
+        ctx: ctx
+      } do
+        with_history_publish_failing(fn ->
+          with_checkpoint_env(
+            [every: :never, min_interval_ms: 0, max_deferred: 0, history_timeout_ms: 100],
+            fn ->
+              flow_index = start_with_undurable_flow_history!(ctx)
+
+              Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, 1)
+              assert :ok = WARaftBackend.write(0, {:put, "history-floor:k1", "v1", 0})
+              assert_checkpoint_result(0, :history_pending)
+
+              Application.put_env(
+                :ferricstore,
+                :waraft_segment_projection_checkpoint_every,
+                :never
+              )
+
+              assert segment_projection_index(0) < flow_index
+
+              Application.delete_env(:ferricstore, :flow_history_projector_lmdb_publish_hook)
+              # Past the short retry delay, the next write runs it.
+              Process.sleep(1_100)
+              assert run_checkpoint!(0, {:put, "history-floor:k2", "v2", 0}) > flow_index
+              assert segment_projection_index(0) > flow_index
+            end
+          )
+        end)
+      end
+
+      test "a trim past the deferral bound defers while Flow history is not durable", %{
+        ctx: ctx,
+        root: root
+      } do
+        with_history_publish_failing(fn ->
+          with_checkpoint_env([every: :never, min_interval_ms: 0, max_deferred: 1], fn ->
+            flow_index = start_with_undurable_flow_history!(ctx)
+
+            for i <- 1..3 do
+              assert :ok = WARaftBackend.write(0, {:put, "history-bound:k#{i}", "v#{i}", 0})
+            end
+
+            log = waraft_segment_log_record(0)
+            trim_index = :ferricstore_waraft_spike_segment_log.last_index(log)
+
+            assert {:ok, _state} =
+                     :ferricstore_waraft_spike_segment_log.trim(log, trim_index, %{})
+
+            assert_receive {:waraft_segment_projection_trim,
+                            [:ferricstore, :waraft, :segment_projection_trim, :deferred], _,
+                            %{reason: :history_not_durable}},
+                           1_000
+
+            assert projection_index_on_disk(root) < flow_index
+            assert :ferricstore_waraft_spike_segment_log.first_index(log) <= flow_index
+
+            Application.delete_env(:ferricstore, :flow_history_projector_lmdb_publish_hook)
+            assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 5_000)
+
+            assert {:ok, _state} =
+                     :ferricstore_waraft_spike_segment_log.trim(log, trim_index, %{})
+
+            assert projection_index_on_disk(root) >= trim_index
+          end)
+        end)
+      end
+
       defp with_checkpoint_env(settings, fun) do
         parent = self()
         handler_id = {__MODULE__, :trim_without_stall, make_ref()}
@@ -582,6 +661,18 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
               :ferricstore,
               :waraft_segment_projection_checkpoint_concurrency,
               concurrency
+            )
+
+          :error ->
+            :ok
+        end
+
+        case Keyword.fetch(settings, :history_timeout_ms) do
+          {:ok, timeout_ms} ->
+            Application.put_env(
+              :ferricstore,
+              :waraft_segment_projection_checkpoint_history_timeout_ms,
+              timeout_ms
             )
 
           :error ->
@@ -658,6 +749,71 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
                         [:ferricstore, :waraft, :segment_projection_checkpoint, :stop], _,
                         %{result: ^result, shard_index: ^shard_index}},
                        5_000
+      end
+
+      defp with_history_publish_failing(fun) do
+        previous = Map.new(@history_envs, &{&1, Application.get_env(:ferricstore, &1)})
+        Application.put_env(:ferricstore, :flow_async_history, true)
+        Application.put_env(:ferricstore, :flow_history_projector_flush_interval_ms, 60_000)
+
+        Application.put_env(:ferricstore, :flow_history_projector_lmdb_publish_hook, fn
+          _shard_data_path, _file_id, _entries -> {:error, :forced_history_publish_failure}
+        end)
+
+        try do
+          fun.()
+        after
+          Enum.each(previous, fn {key, value} -> restore_env(key, value) end)
+        end
+      end
+
+      # Starts shard 0 with one Flow write whose history cannot be projected
+      # and returns the write's index.
+      defp start_with_undurable_flow_history!(ctx) do
+        assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+        start_supervised!(
+          {Ferricstore.Flow.HistoryProjector,
+           [
+             shard_index: 0,
+             shard_data_path: Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0),
+             instance_ctx: ctx,
+             recover_on_init: false
+           ]}
+        )
+
+        flow_id = "history-floor-#{System.unique_integer([:positive])}"
+
+        assert :ok =
+                 Ferricstore.Flow.create(ctx, flow_id,
+                   type: "history-floor",
+                   partition_key: "history-floor",
+                   run_at_ms: 1_000,
+                   now_ms: 900
+                 )
+
+        {:raft_log_pos, flow_index, _term} = applied_position(0)
+
+        assert Router.shard_for(ctx, Ferricstore.Flow.Keys.state_key(flow_id, "history-floor")) ==
+                 0
+
+        flow_index
+      end
+
+      defp projection_index_on_disk(root) do
+        if File.exists?(Path.join(projection_root(root), "segment_log")) do
+          {position, _keys} = projection_keys(projection_root(root))
+          position_index(position)
+        else
+          0
+        end
+      end
+
+      defp segment_projection_index(shard_index) do
+        shard_index
+        |> waraft_storage_status()
+        |> Keyword.fetch!(:segment_projection_position)
+        |> position_index()
       end
 
       # Takes one background checkpoint with the given write and returns its index.

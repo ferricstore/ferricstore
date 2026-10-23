@@ -236,7 +236,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
       # trim remove less than asked). With no usable checkpoint, or one still
       # running, the trim is deferred and the log keeps its entries. A trim that
       # would run more than the configured number of entries past the floor, or
-      # that came with no floor, rebuilds the projection synchronously as before.
+      # that came with no floor, rebuilds the projection synchronously as before,
+      # unless Flow history up to the projection is not durable yet: then it
+      # defers too.
       @spec prepare_segment_projection_for_trim(
               charlist() | binary(),
               non_neg_integer(),
@@ -371,9 +373,21 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
             defer_segment_projection_trim(root_dir, trim_index, :no_checkpoint)
 
           :not_available ->
-            changing_segment_projection(root_dir, fn ->
-              rebuild_segment_projection_for_trim(root_dir, projection_root, context, trim_index)
-            end)
+            # The rebuilt projection becomes the replay floor at the context's
+            # position, so the history up to there must be durable first.
+            if history_dependencies_durable?(context, context.history_dependencies) do
+              changing_segment_projection(root_dir, fn ->
+                rebuild_segment_projection_for_trim(
+                  root_dir,
+                  projection_root,
+                  context,
+                  trim_index
+                )
+              end)
+            else
+              request_history_dependencies(context, context.history_dependencies)
+              defer_segment_projection_trim(root_dir, trim_index, :history_not_durable)
+            end
         end
       end
 
@@ -697,7 +711,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
             send(
               worker,
               {:ferricstore_waraft_segment_projection_checkpoint_cut, ref,
-               {:cut, handle.position, self()}}
+               {:cut, handle.position, self(), history_replay_dependencies(handle)}}
             )
 
             result =

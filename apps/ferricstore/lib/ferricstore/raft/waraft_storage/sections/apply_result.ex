@@ -626,7 +626,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       defp requeue_unfinished_segment_projection_checkpoint(handle, _checkpoint, :ok), do: handle
 
       defp requeue_unfinished_segment_projection_checkpoint(handle, checkpoint, {:ok, unfinished})
-           when unfinished in [:busy, :stale_cut] do
+           when unfinished in [:busy, :stale_cut, :history_pending] do
         handle
         |> restore_segment_projection_checkpoint_request(checkpoint)
         |> Map.put(
@@ -735,19 +735,24 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
         call_segment_projection_checkpoint_hook(:before_scan, metadata)
 
         case take_segment_projection_cut(job) do
-          {:ok, cut, cut_position, generation} ->
+          {:ok, cut, cut_position, generation, history_dependencies} ->
             metadata = %{metadata | position: cut_position}
 
-            job.root_dir
-            |> with_segment_projection_lock(fn ->
-              write_segment_projection_checkpoint_from_cut(job, cut, generation, metadata)
-            end)
-            |> case do
-              {%{} = metadata, result} ->
-                {metadata, result}
+            if await_cut_history(job, history_dependencies) do
+              job.root_dir
+              |> with_segment_projection_lock(fn ->
+                write_segment_projection_checkpoint_from_cut(job, cut, generation, metadata)
+              end)
+              |> case do
+                {%{} = metadata, result} ->
+                  {metadata, result}
 
-              {:error, reason} ->
-                {metadata, {:error, {:segment_projection_checkpoint_failed, reason}}}
+                {:error, reason} ->
+                  {metadata, {:error, {:segment_projection_checkpoint_failed, reason}}}
+              end
+            else
+              :ets.delete(cut)
+              {metadata, {:ok, :history_pending}}
             end
 
           :stale ->
@@ -757,6 +762,44 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
         error ->
           {%{shard_index: job.shard_index, position: job.position, entries: 0},
            {:error, {:segment_projection_checkpoint_failed, error}}}
+      end
+
+      # Recovery replays only the entries after a projection, and Flow history
+      # is not in the keydir: the projector must have written the history of
+      # every entry the cut covers before the cut may become that floor.
+      defp await_cut_history(job, history_dependencies) do
+        request_history_dependencies(job, history_dependencies)
+
+        deadline =
+          System.monotonic_time(:millisecond) +
+            segment_projection_checkpoint_history_timeout_ms()
+
+        do_await_cut_history(job, history_dependencies, deadline)
+      end
+
+      defp do_await_cut_history(job, history_dependencies, deadline) do
+        cond do
+          history_dependencies_durable?(job, history_dependencies) ->
+            true
+
+          System.monotonic_time(:millisecond) >= deadline ->
+            false
+
+          true ->
+            Process.sleep(10)
+            do_await_cut_history(job, history_dependencies, deadline)
+        end
+      end
+
+      defp segment_projection_checkpoint_history_timeout_ms do
+        case Application.get_env(
+               :ferricstore,
+               :waraft_segment_projection_checkpoint_history_timeout_ms,
+               @default_segment_projection_checkpoint_history_timeout_ms
+             ) do
+          value when is_integer(value) and value >= 0 -> value
+          _ -> @default_segment_projection_checkpoint_history_timeout_ms
+        end
       end
 
       # Storage answers with its position and then waits for this copy before it
@@ -771,14 +814,15 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
         )
 
         receive do
-          {:ferricstore_waraft_segment_projection_checkpoint_cut, ^ref, {:cut, position, storage}} ->
+          {:ferricstore_waraft_segment_projection_checkpoint_cut, ^ref,
+           {:cut, position, storage, history_dependencies}} ->
             generation = segment_projection_trim_generation(job.root_dir)
             cut = copy_keydir_for_cut(job.keydir)
             send(storage, {:ferricstore_waraft_segment_projection_checkpoint_cut_copied, ref})
 
             receive do
               {:ferricstore_waraft_segment_projection_checkpoint_cut, ^ref, :confirmed} ->
-                {:ok, cut, position, generation}
+                {:ok, cut, position, generation, history_dependencies}
 
               {:ferricstore_waraft_segment_projection_checkpoint_cut, ^ref, :expired} ->
                 :ets.delete(cut)
@@ -1017,13 +1061,20 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       defp segment_projection_checkpoint_result({:ok, :stale}), do: :stale
       defp segment_projection_checkpoint_result({:ok, :busy}), do: :busy
       defp segment_projection_checkpoint_result({:ok, :stale_cut}), do: :stale_cut
+      defp segment_projection_checkpoint_result({:ok, :history_pending}), do: :history_pending
       defp segment_projection_checkpoint_result({:error, _reason}), do: :error
       defp segment_projection_checkpoint_result(_other), do: :error
 
       defp segment_projection_checkpoint_reason({:error, reason}), do: reason
 
       defp segment_projection_checkpoint_reason(other)
-           when other not in [:ok, {:ok, :stale}, {:ok, :busy}, {:ok, :stale_cut}],
+           when other not in [
+                  :ok,
+                  {:ok, :stale},
+                  {:ok, :busy},
+                  {:ok, :stale_cut},
+                  {:ok, :history_pending}
+                ],
            do: other
 
       defp segment_projection_checkpoint_reason(_result), do: nil
@@ -1079,10 +1130,12 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
             :ok
         end
 
+        # A trim that rebuilds the projection at this position needs the Flow
+        # history of the entries up to it durable first.
         true =
           :ets.insert(
             @segment_projection_registry,
-            {{key, :position}, Map.fetch!(handle, :position)}
+            {{key, :position}, Map.fetch!(handle, :position), history_replay_dependencies(handle)}
           )
 
         handle
@@ -1159,8 +1212,11 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
               :ets.lookup(@segment_projection_registry, {key, :context}),
               :ets.lookup(@segment_projection_registry, {key, :position})
             } do
-              {[{_context_key, context}], [{_position_key, position}]} ->
-                {:ok, Map.put(context, :position, position)}
+              {[{_context_key, context}], [{_position_key, position, history_dependencies}]} ->
+                {:ok,
+                 context
+                 |> Map.put(:position, position)
+                 |> Map.put(:history_dependencies, history_dependencies)}
 
               {[], _position} ->
                 {:error, {:segment_projection_context_missing, root_dir}}
