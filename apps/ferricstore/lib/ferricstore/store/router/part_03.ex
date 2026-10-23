@@ -88,13 +88,19 @@ defmodule Ferricstore.Store.Router.Part03 do
                  {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
 
               nil ->
-                case retry_changed_file_ref(
+                # A ref that stays invalid where the record was is a failed
+                # read, not a missing key.
+                exhausted_failure =
+                  storage_read_failure(:cold_file_ref_unavailable, :invalid_value_ref)
+
+                case retry_changed_file_ref_result(
                        ctx,
                        idx,
                        keydir,
                        key,
                        {file_id, offset, value_size},
-                       now
+                       now,
+                       exhausted_failure
                      ) do
                   {:cold_ref, retry_path, value_offset, retry_size} ->
                     Stats.record_cold_read(ctx, key)

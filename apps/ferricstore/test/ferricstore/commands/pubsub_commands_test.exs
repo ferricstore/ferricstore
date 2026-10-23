@@ -150,6 +150,16 @@ defmodule Ferricstore.Commands.PubSubTest do
       assert PubSubCmd.handle("PUBLISH", ["empty", "hello"]) == 0
     end
 
+    test "a pattern whose class takes its first bracket as a range end reaches its channels" do
+      # As in Redis, `[a-]x` is one class (`]`..`a` and `x`) with no closing
+      # bracket, so it matches "_" and has no literal suffix to index by. Enough
+      # other patterns put PUBLISH on its pattern indexes.
+      PubSub.psubscribe_many(Enum.map(1..100, &"filler-#{&1}.*"), self())
+      PubSub.psubscribe("[a-]x", self())
+      assert PubSubCmd.handle("PUBLISH", ["_", "data"]) == 1
+      assert_receive {:pubsub_pmessage, "[a-]x", "_", "data"}
+    end
+
     test "to channel with one subscriber returns 1" do
       PubSub.subscribe("ch", self())
       assert PubSubCmd.handle("PUBLISH", ["ch", "data"]) == 1

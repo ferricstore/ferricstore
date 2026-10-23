@@ -101,7 +101,8 @@ defmodule Ferricstore.Commands.Stream.AtomicGroup do
   defp read_new(key, group, consumer, count, store) do
     case Groups.serialized_state(store, key, group) do
       :missing ->
-        {:error, "NOGROUP No such consumer group '#{group}' for key name '#{key}'"}
+        {:error,
+         "NOGROUP No such key '#{key}' or consumer group '#{group}' in XREADGROUP with GROUP option"}
 
       {:error, {:storage_read_failed, _reason}} = failure ->
         ReadResult.command_error(failure)

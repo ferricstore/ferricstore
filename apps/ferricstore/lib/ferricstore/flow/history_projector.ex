@@ -746,11 +746,13 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
           %{
             state
-            | requested_index: nil,
+            | requested_index: outstanding_request(state),
               flushed_index: max(state.flushed_index, requested_index)
           }
           |> reset_retry_backoff()
           |> publish_backlog_state()
+          |> drain_overflow()
+          |> flush_outstanding_request()
 
         {:error, reason} ->
           mark_flush_failure(state.instance_ctx, state.shard_index)
@@ -763,6 +765,8 @@ defmodule Ferricstore.Flow.HistoryProjector do
       end
     else
       state
+      |> drain_overflow()
+      |> flush_outstanding_request()
     end
   end
 
@@ -789,12 +793,13 @@ defmodule Ferricstore.Flow.HistoryProjector do
           | pending: [],
             pending_count: 0,
             first_pending_at: nil,
-            requested_index: nil,
+            requested_index: outstanding_request(state),
             flushed_index: max_index(state.flushed_index, projected_index)
         }
         |> reset_retry_backoff()
         |> publish_backlog_state()
         |> drain_overflow()
+        |> flush_outstanding_request()
 
       {:error, reason} ->
         mark_flush_failure(state.instance_ctx, state.shard_index)
@@ -806,6 +811,21 @@ defmodule Ferricstore.Flow.HistoryProjector do
         schedule_retry(state)
     end
   end
+
+  # A request the publish could not reach (older history still waits in
+  # overflow) stays open, so the drained entries are projected next.
+  defp outstanding_request(%{requested_index: nil}), do: nil
+
+  defp outstanding_request(state) do
+    published = projected_index(state.instance_ctx, state.shard_index, state.shard_data_path)
+    if published >= state.requested_index, do: nil, else: state.requested_index
+  end
+
+  defp flush_outstanding_request(%{requested_index: index, pending_count: count} = state)
+       when is_integer(index) and count > 0,
+       do: schedule_flush_soon(state)
+
+  defp flush_outstanding_request(state), do: state
 
   defp do_project(
          instance_ctx,
@@ -917,6 +937,9 @@ defmodule Ferricstore.Flow.HistoryProjector do
   defdelegate history_file_path(shard_data_path, file_id), to: Storage
 
   defdelegate read_value(shard_data_path, file_id, offset),
+    to: Ferricstore.Flow.HistoryProjector.Log
+
+  defdelegate read_values(shard_data_path, file_id, offsets),
     to: Ferricstore.Flow.HistoryProjector.Log
 
   defdelegate scan_event_value(shard_data_path, target_key),
@@ -1106,7 +1129,10 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   def publish_projected_index(instance_ctx, shard_index, shard_data_path, index)
       when is_integer(index) and index >= 0 do
-    index = max(index, projected_index(instance_ctx, shard_index, shard_data_path))
+    index =
+      index
+      |> min(Pending.overflow_publish_limit(name(instance_ctx, shard_index)))
+      |> max(projected_index(instance_ctx, shard_index, shard_data_path))
 
     with :ok <- HistoryProjectedIndex.persist(shard_data_path, index) do
       case instance_ctx do

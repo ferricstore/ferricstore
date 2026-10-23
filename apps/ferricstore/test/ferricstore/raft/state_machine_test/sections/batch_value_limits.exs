@@ -1684,6 +1684,48 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.BatchValueLimits do
         end
 
         @tag :segment_batch_preparation
+        test "segment projection leaves a collection whose promotion marker was evicted to the state machine",
+             %{state: state, ets: ets} do
+          redis_key = "segment-evicted-marker"
+          prefix = CompoundKey.hash_prefix(redis_key)
+          position = {:raft_log_pos, 45, 1}
+          index = state.compound_member_index_name
+
+          CompoundMemberIndex.ensure_table!(index)
+          CompoundMemberIndex.reset(index)
+          on_exit(fn -> safe_delete_ets(index) end)
+
+          assert {:ok, _projected, :ok, 1} =
+                   WARaftStorage.__segment_project_command_for_test__(
+                     {:compound_delete_prefix, prefix},
+                     position,
+                     state
+                   )
+
+          # Memory pressure evicted the marker's value; only its location is left.
+          true =
+            :ets.insert(
+              ets,
+              {Promotion.marker_key(redis_key), nil, 0, LFU.initial(), {:waraft_segment, 3}, 0,
+               16}
+            )
+
+          assert :unsupported =
+                   WARaftStorage.__segment_project_command_for_test__(
+                     {:compound_delete_prefix, prefix},
+                     position,
+                     state
+                   )
+
+          assert :unsupported =
+                   WARaftStorage.__segment_project_command_for_test__(
+                     {:compound_put, CompoundKey.hash_field(redis_key, "f"), "v", 0},
+                     position,
+                     state
+                   )
+        end
+
+        @tag :segment_batch_preparation
         test "segment recovery holds promotion latches while projecting compound commands", %{
           state: state
         } do

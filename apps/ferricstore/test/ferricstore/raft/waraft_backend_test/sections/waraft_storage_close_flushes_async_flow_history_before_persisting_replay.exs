@@ -814,6 +814,431 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
         end
       end
 
+      test "a config entry does not persist the replay cursor past undurable Flow history", %{
+        root: root,
+        ctx: ctx
+      } do
+        previous_async_history = Application.get_env(:ferricstore, :flow_async_history)
+
+        previous_publish_hook =
+          Application.get_env(:ferricstore, :flow_history_projector_lmdb_publish_hook)
+
+        previous_history_flush =
+          Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms)
+
+        previous_close_flush =
+          Application.get_env(:ferricstore, :waraft_replay_dependency_close_flush_timeout_ms)
+
+        flow_id = "router-flow-history-config-id-#{System.unique_integer([:positive])}"
+        partition = "tenant-history-config-#{System.unique_integer([:positive])}"
+        shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+
+        try do
+          Application.put_env(:ferricstore, :flow_async_history, true)
+          Application.put_env(:ferricstore, :flow_history_projector_flush_interval_ms, 60_000)
+          Application.put_env(:ferricstore, :waraft_replay_dependency_close_flush_timeout_ms, 100)
+
+          Application.put_env(:ferricstore, :flow_history_projector_lmdb_publish_hook, fn
+            _shard_data_path, _file_id, _entries -> {:error, :forced_history_publish_failure}
+          end)
+
+          assert :ok =
+                   WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          start_supervised!(
+            {Ferricstore.Flow.HistoryProjector,
+             [
+               shard_index: 0,
+               shard_data_path: shard_data_path,
+               instance_ctx: ctx,
+               recover_on_init: false
+             ]}
+          )
+
+          assert :ok =
+                   Ferricstore.Flow.create(ctx, flow_id,
+                     type: "router-flow-history-config",
+                     partition_key: partition,
+                     run_at_ms: 1_000,
+                     now_ms: 900
+                   )
+
+          assert {:ok, {:raft_log_pos, flow_index, _term}} = WARaftBackend.storage_position(0)
+
+          # The config entry commits, but cannot be durable before the history.
+          assert {:error, {:timeout, :unknown_outcome}} =
+                   WARaftBackend.adjust_membership_redirected(
+                     0,
+                     :add_participant,
+                     :"ghost@127.0.0.1",
+                     200,
+                     0
+                   )
+
+          assert {:ok, {:raft_log_pos, config_index, _term} = config_position} =
+                   WARaftBackend.storage_position(0)
+
+          assert config_index > flow_index
+
+          # A crash now must replay the Flow write, whose history is not durable.
+          assert %{position: {:raft_log_pos, persisted_index, _persisted_term}} =
+                   waraft_latest_storage_metadata(root, 0)
+
+          assert persisted_index < flow_index
+
+          assert position_index(Keyword.fetch!(waraft_storage_status(0), :durable_position)) <
+                   flow_index
+
+          Application.delete_env(:ferricstore, :flow_history_projector_lmdb_publish_hook)
+          assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 5_000)
+
+          assert eventually(fn ->
+                   Keyword.fetch!(waraft_storage_status(0), :durable_position) ==
+                     config_position
+                 end)
+        after
+          restore_env(:flow_async_history, previous_async_history)
+          restore_env(:flow_history_projector_lmdb_publish_hook, previous_publish_hook)
+          restore_env(:flow_history_projector_flush_interval_ms, previous_history_flush)
+          restore_env(:waraft_replay_dependency_close_flush_timeout_ms, previous_close_flush)
+        end
+      end
+
+      # The Flow LMDB mirror is written by the same entries a restart replays
+      # when the node stopped before their history was projected. The replay
+      # must still write that history.
+      test "a restart replay writes the Flow history the LMDB mirror got ahead of", %{
+        root: root,
+        ctx: ctx
+      } do
+        previous_async_history = Application.get_env(:ferricstore, :flow_async_history)
+
+        previous_close_flush =
+          Application.get_env(:ferricstore, :waraft_replay_dependency_close_flush_timeout_ms)
+
+        flow_id = "router-flow-history-replay-id-#{System.unique_integer([:positive])}"
+        partition = "tenant-history-replay-#{System.unique_integer([:positive])}"
+
+        try do
+          Application.put_env(:ferricstore, :flow_async_history, true)
+          Application.put_env(:ferricstore, :waraft_replay_dependency_close_flush_timeout_ms, 100)
+
+          assert :ok =
+                   WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          {:ok, projector} =
+            Ferricstore.Flow.HistoryProjector.start_link(
+              shard_index: 0,
+              shard_data_path: Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0),
+              instance_ctx: ctx,
+              recover_on_init: false
+            )
+
+          Process.unlink(projector)
+
+          start_supervised!(
+            {Ferricstore.Flow.LMDBWriter,
+             shard_index: 0, data_dir: ctx.data_dir, instance_ctx: ctx}
+          )
+
+          # The projector never gets to the Flow's history.
+          :ok = :sys.suspend(projector)
+
+          assert :ok =
+                   Ferricstore.Flow.create(ctx, flow_id,
+                     type: "router-flow-history-replay",
+                     partition_key: partition,
+                     run_at_ms: 1_000,
+                     now_ms: 900
+                   )
+
+          assert :ok =
+                   Ferricstore.Flow.transition(ctx, flow_id, "queued", "reviewed",
+                     partition_key: partition,
+                     fencing_token: 0
+                   )
+
+          assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, 0)
+          assert {:ok, {:raft_log_pos, flow_index, _term}} = WARaftBackend.storage_position(0)
+
+          monitor = Process.monitor(projector)
+          Process.exit(projector, :kill)
+          assert_receive {:DOWN, ^monitor, :process, ^projector, :killed}
+          stop_supervised!(Ferricstore.Flow.LMDBWriter)
+          assert :ok = WARaftBackend.stop()
+
+          # As after a crash: the replay cursor is behind the Flow writes.
+          assert %{position: {:raft_log_pos, persisted_index, _persisted_term}} =
+                   waraft_latest_storage_metadata(root, 0)
+
+          assert persisted_index < flow_index
+          FerricStore.Instance.cleanup(ctx.name)
+
+          restarted_ctx = build_ctx(root)
+
+          try do
+            assert :ok =
+                     WARaftBackend.start(restarted_ctx,
+                       log_module: :ferricstore_waraft_spike_segment_log
+                     )
+
+            start_supervised!(
+              {Ferricstore.Flow.HistoryProjector,
+               [
+                 shard_index: 0,
+                 shard_data_path: Ferricstore.DataDir.shard_data_path(restarted_ctx.data_dir, 0),
+                 instance_ctx: restarted_ctx
+               ]}
+            )
+
+            start_supervised!(
+              {Ferricstore.Flow.LMDBWriter,
+               shard_index: 0, data_dir: restarted_ctx.data_dir, instance_ctx: restarted_ctx}
+            )
+
+            assert {:ok, %{state: "reviewed", version: 2}} =
+                     Ferricstore.Flow.get(restarted_ctx, flow_id, partition_key: partition)
+
+            assert eventually(fn ->
+                     :ok = Ferricstore.Flow.HistoryProjector.flush(restarted_ctx, 0, 5_000)
+
+                     match?(
+                       {:ok, [_, _]},
+                       Ferricstore.Flow.history(restarted_ctx, flow_id, partition_key: partition)
+                     )
+                   end),
+                   inspect(
+                     Ferricstore.Flow.history(restarted_ctx, flow_id, partition_key: partition)
+                   )
+          after
+            FerricStore.Instance.cleanup(restarted_ctx.name)
+          end
+        after
+          restore_env(:flow_async_history, previous_async_history)
+          restore_env(:waraft_replay_dependency_close_flush_timeout_ms, previous_close_flush)
+        end
+      end
+
+      # Every Flow write adds history the projector writes a little later, so
+      # under a steady stream of them the newest position is never durable.
+      # The replay cursor must still advance to the positions that are.
+      test "the replay cursor advances under Flow writes whose history trails", %{
+        root: root,
+        ctx: ctx
+      } do
+        previous_async_history = Application.get_env(:ferricstore, :flow_async_history)
+        previous_every = Application.get_env(:ferricstore, :waraft_storage_metadata_persist_every)
+
+        previous_history_flush =
+          Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms)
+
+        partition = "tenant-history-trail-#{System.unique_integer([:positive])}"
+        shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+
+        try do
+          Application.put_env(:ferricstore, :flow_async_history, true)
+          Application.put_env(:ferricstore, :flow_history_projector_flush_interval_ms, 60_000)
+          Application.put_env(:ferricstore, :waraft_storage_metadata_persist_every, 1)
+
+          assert :ok =
+                   WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          projector =
+            start_supervised!(
+              {Ferricstore.Flow.HistoryProjector,
+               [
+                 shard_index: 0,
+                 shard_data_path: shard_data_path,
+                 instance_ctx: ctx,
+                 recover_on_init: false
+               ]}
+            )
+
+          create = fn id ->
+            assert :ok =
+                     Ferricstore.Flow.create(ctx, id,
+                       type: "router-flow-history-trail",
+                       partition_key: partition,
+                       run_at_ms: 1_000,
+                       now_ms: 900
+                     )
+
+            {:ok, {:raft_log_pos, index, _term}} = WARaftBackend.storage_position(0)
+            index
+          end
+
+          first_index = create.("trail-first-#{System.unique_integer([:positive])}")
+
+          assert eventually(fn ->
+                   Ferricstore.Flow.HistoryProjector.durable?(
+                     ctx,
+                     0,
+                     shard_data_path,
+                     first_index
+                   )
+                 end)
+
+          # The next write's history stays queued.
+          :ok = :sys.suspend(projector)
+          later_index = create.("trail-later-#{System.unique_integer([:positive])}")
+          assert later_index > first_index
+
+          assert %{position: {:raft_log_pos, persisted_index, _term}} =
+                   waraft_latest_storage_metadata(root, 0)
+
+          assert persisted_index >= first_index
+
+          assert position_index(Keyword.fetch!(waraft_storage_status(0), :durable_position)) >=
+                   first_index
+
+          :ok = :sys.resume(projector)
+        after
+          restore_env(:flow_async_history, previous_async_history)
+          restore_env(:waraft_storage_metadata_persist_every, previous_every)
+          restore_env(:flow_history_projector_flush_interval_ms, previous_history_flush)
+        end
+      end
+
+      # A membership change waits for the durable position, which must follow
+      # the history the projector writes, not the metadata persist cadence.
+      test "the durable position follows trailing Flow history between persists", %{
+        ctx: ctx
+      } do
+        previous_async_history = Application.get_env(:ferricstore, :flow_async_history)
+        previous_every = Application.get_env(:ferricstore, :waraft_storage_metadata_persist_every)
+
+        previous_history_flush =
+          Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms)
+
+        partition = "tenant-history-durable-#{System.unique_integer([:positive])}"
+        shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+
+        try do
+          Application.put_env(:ferricstore, :flow_async_history, true)
+          Application.put_env(:ferricstore, :flow_history_projector_flush_interval_ms, 60_000)
+          Application.put_env(:ferricstore, :waraft_storage_metadata_persist_every, :never)
+
+          assert :ok =
+                   WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          projector =
+            start_supervised!(
+              {Ferricstore.Flow.HistoryProjector,
+               [
+                 shard_index: 0,
+                 shard_data_path: shard_data_path,
+                 instance_ctx: ctx,
+                 recover_on_init: false
+               ]}
+            )
+
+          create = fn id ->
+            assert :ok =
+                     Ferricstore.Flow.create(ctx, id,
+                       type: "router-flow-history-durable",
+                       partition_key: partition,
+                       run_at_ms: 1_000,
+                       now_ms: 900
+                     )
+
+            {:ok, {:raft_log_pos, index, _term}} = WARaftBackend.storage_position(0)
+            index
+          end
+
+          first_index = create.("durable-first-#{System.unique_integer([:positive])}")
+          Ferricstore.Flow.HistoryProjector.request(ctx, 0, shard_data_path, first_index)
+
+          assert eventually(fn ->
+                   Ferricstore.Flow.HistoryProjector.durable?(
+                     ctx,
+                     0,
+                     shard_data_path,
+                     first_index
+                   )
+                 end)
+
+          # The next write's history stays queued.
+          :ok = :sys.suspend(projector)
+          later_index = create.("durable-later-#{System.unique_integer([:positive])}")
+          assert later_index > first_index
+
+          assert position_index(Keyword.fetch!(waraft_storage_status(0), :durable_position)) >=
+                   first_index
+
+          :ok = :sys.resume(projector)
+        after
+          restore_env(:flow_async_history, previous_async_history)
+          restore_env(:waraft_storage_metadata_persist_every, previous_every)
+          restore_env(:flow_history_projector_flush_interval_ms, previous_history_flush)
+        end
+      end
+
+      # A membership change reports success once its entry is durable, and
+      # under a steady stream of Flow writes the durable position only moves
+      # in steps behind the newest one.
+      test "a membership change completes under a steady stream of Flow writes", %{ctx: ctx} do
+        previous_async_history = Application.get_env(:ferricstore, :flow_async_history)
+        previous_every = Application.get_env(:ferricstore, :waraft_storage_metadata_persist_every)
+        partition = "tenant-history-membership-#{System.unique_integer([:positive])}"
+
+        try do
+          Application.put_env(:ferricstore, :flow_async_history, true)
+          Application.put_env(:ferricstore, :waraft_storage_metadata_persist_every, 16)
+
+          assert :ok =
+                   WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          start_supervised!(
+            {Ferricstore.Flow.HistoryProjector,
+             [
+               shard_index: 0,
+               shard_data_path: Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0),
+               instance_ctx: ctx,
+               recover_on_init: false
+             ]}
+          )
+
+          stop = :atomics.new(1, [])
+
+          writers =
+            for writer <- 1..4 do
+              Task.async(fn ->
+                Enum.reduce_while(Stream.iterate(0, &(&1 + 1)), 0, fn i, count ->
+                  if :atomics.get(stop, 1) == 1 do
+                    {:halt, count}
+                  else
+                    case Ferricstore.Flow.create(ctx, "membership-#{writer}-#{i}",
+                           type: "router-flow-history-membership",
+                           partition_key: partition
+                         ) do
+                      :ok -> {:cont, count + 1}
+                      _error -> {:cont, count}
+                    end
+                  end
+                end)
+              end)
+            end
+
+          Process.sleep(300)
+
+          result =
+            WARaftBackend.adjust_membership_redirected(
+              0,
+              :add_participant,
+              :"ghost@127.0.0.1",
+              10_000,
+              0
+            )
+
+          :atomics.put(stop, 1, 1)
+          assert Enum.sum(Task.await_many(writers, 30_000)) > 0
+          assert {:ok, _config_position} = result
+        after
+          restore_env(:flow_async_history, previous_async_history)
+          restore_env(:waraft_storage_metadata_persist_every, previous_every)
+        end
+      end
+
       test "flow due indexes survive WARaft restart without shard process reads", %{
         root: root,
         ctx: ctx

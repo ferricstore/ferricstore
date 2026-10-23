@@ -576,6 +576,36 @@ shard_0: 2
     across the whole cluster. Inside MULTI, EXPIRE with several flags
     (`EXPIRE key 100 XX GT`), BITCOUNT ranges and BITPOS are queued only at
     level 4: older releases abort or answer such a transaction differently.
+  - 5: Redis 8 behavior that older releases apply differently, so it waits
+    until every node runs this release:
+    - MULTI queues `ZRANK`/`ZREVRANK ... WITHSCORE`, `PFMERGE` with no
+      source, `HEXPIRE`/`HPEXPIRE` with NX, XX, GT or LT or a TTL of 0,
+      `HSETEX`'s Redis 8 form, `HGETEX` with a TTL of 0, `ZADD ... INCR`,
+      `ZRANGE ... BYLEX` and `SET ... IFEQ/IFNE`.
+    - Inside MULTI, BITOP deletes its destination for an empty result,
+      GEOSEARCHSTORE empties its destination for a missing source and
+      measures with Redis's Earth radius, and HGETEX with a past time deletes
+      the fields, as they do outside MULTI.
+    - HSETEX's Redis form and a conditional `ZADD ... INCR` run as one
+      replicated entry, so concurrent clients see one outcome.
+    - PFADD and PFMERGE keep the sketch's TTL.
+    - WATCH records a replicated write version for each watched key and EXEC
+      compares them, so every replica reaches the same decision. Below level
+      5 a watched EXEC on a promoted hash, set or sorted set, or on a key a
+      node had relocated, could apply on some replicas and not others.
+    - Apply's Flow history trim and duplicate-retry check order one
+      millisecond's events by version (`1000-9` before `1000-10`).
+    - Flow signal idempotency digests and child group request hashes no
+      longer depend on the OTP release, so a rolling OTP upgrade cannot make
+      replicas disagree on a retried signal or spawn.
+    - A Flow rewind carries its target event, so every replica restores the
+      same event or refuses it alike; only events within the Flow's history
+      cap can be restored.
+    - A Flow create batch holding an idempotent retry, and a rewind's value
+      refresh, find values the history projector has moved to the LMDB
+      mirror, so replicas agree however far their projectors have got.
+    - A Flow signal retried with its idempotency key and the same content is
+      applied once.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.

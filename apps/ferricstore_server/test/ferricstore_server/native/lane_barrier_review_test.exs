@@ -376,6 +376,21 @@ defmodule FerricstoreServer.Native.LaneBarrierReviewTest do
     assert {:ok, "in-transaction"} = FerricStore.get(key)
   end
 
+  test "EXEC answers counter commands with their integers", %{keys: [_, key, _]} do
+    socket = connect()
+
+    send_frames(socket, [
+      command(1, 210, "MULTI", []),
+      command(1, 211, "INCR", [key]),
+      command(1, 212, "INCRBY", [key, "4"]),
+      command(1, 213, "DECRBY", [key, "2"]),
+      command(1, 214, "EXEC", [])
+    ])
+
+    replies = Map.new(1..5, fn _ -> response_value(socket) end)
+    assert {0, [1, 5, 3]} = replies[214]
+  end
+
   test "a WATCH behind a busy lane still sees later writes from other lanes", %{
     keys: [_, key, _]
   } do

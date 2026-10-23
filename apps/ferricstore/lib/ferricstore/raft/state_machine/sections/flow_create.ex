@@ -83,9 +83,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
                    :ok <- flow_require_active_parent(parent),
                    :ok <- flow_require_spawn_wait_state(parent, attrs),
                    {:ok, _child_records, child_plans} <-
-                     flow_create_many_prepare(state, child_attrs),
+                     flow_create_many_prepare(state, child_attrs, :spawn),
                    {:ok, next_parent} <-
-                     flow_prepare_spawn_parent(parent, attrs, child_attrs, now_ms),
+                     flow_prepare_spawn_parent(
+                       parent,
+                       flow_put_child_group_request_hash(state, attrs, child_attrs),
+                       child_attrs,
+                       now_ms
+                     ),
                    :ok <- flow_validate_record_keys(next_parent),
                    :ok <-
                      flow_apply_parent_update(
@@ -132,7 +137,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
                    :ok <- flow_require_spawn_wait_state(parent, attrs),
                    {:ok, child_apply_groups} <- flow_cross_create_many_prepare(state, child_attrs),
                    {:ok, next_parent} <-
-                     flow_prepare_spawn_parent(parent, attrs, child_attrs, now_ms),
+                     flow_prepare_spawn_parent(
+                       parent,
+                       flow_put_child_group_request_hash(state, attrs, child_attrs),
+                       child_attrs,
+                       now_ms
+                     ),
                    :ok <- flow_validate_record_keys(next_parent),
                    :ok <-
                      flow_apply_parent_update(
@@ -160,7 +170,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
         end)
         |> Enum.reduce_while({:ok, []}, fn {child_state, shard_attrs}, {:ok, acc} ->
           with :ok <- flow_many_partitions_valid?(child_state, shard_attrs),
-               {:ok, _records, plans} <- flow_create_many_prepare(child_state, shard_attrs) do
+               {:ok, _records, plans} <-
+                 flow_create_many_prepare(child_state, shard_attrs, :spawn) do
             {:cont, {:ok, [{child_state, plans} | acc]}}
           else
             {:error, _reason} = error -> {:halt, error}
@@ -409,14 +420,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
 
       defp flow_child_group_spawn_state(parent, attrs, child_attrs) do
         group_id = Map.fetch!(attrs, :group_id)
-        requested_hash = flow_child_group_request_hash(attrs, child_attrs)
 
         case Map.get(flow_child_groups(parent), group_id) do
           nil ->
             {:ok, :new}
 
-          %{"request_hash" => ^requested_hash} ->
-            {:ok, :idempotent}
+          %{"request_hash" => stored_hash} ->
+            if stored_hash in flow_child_group_request_hashes(attrs, child_attrs),
+              do: {:ok, :idempotent},
+              else: {:error, "ERR flow child group idempotency conflict"}
 
           _existing ->
             {:error, "ERR flow child group idempotency conflict"}
@@ -492,7 +504,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           "on_child_failed" => Atom.to_string(Map.fetch!(attrs, :on_child_failed)),
           "on_parent_closed" => Atom.to_string(Map.fetch!(attrs, :on_parent_closed)),
           "exhaust_to" => Map.fetch!(attrs, :exhaust_to),
-          "request_hash" => flow_child_group_request_hash(attrs, child_attrs),
+          "request_hash" => Map.fetch!(attrs, :child_group_request_hash),
           "children" => children,
           "child_partitions" => child_partitions,
           "summary" => %{
@@ -506,8 +518,70 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
         }
       end
 
-      defp flow_child_group_request_hash(attrs, child_attrs) do
-        request = %{
+      @flow_child_group_child_fields [
+        :id,
+        :type,
+        :state,
+        :partition_key,
+        :run_at_ms,
+        :priority,
+        :retention_ttl_ms,
+        :max_active_ms,
+        :history_hot_max_events,
+        :history_max_events,
+        :correlation_id,
+        :payload_ref
+      ]
+
+      # The request hash is stored in the parent and compared on every
+      # replica, so from level 5 it does not depend on the OTP release
+      # (Ferricstore.CanonicalTerm); "c1:" tells it from the term_to_binary
+      # hashes stored before, which a retry still matches.
+      defp flow_put_child_group_request_hash(state, attrs, child_attrs) do
+        hash =
+          if feature_level_5?(state),
+            do: flow_child_group_canonical_hash(attrs, child_attrs),
+            else: flow_child_group_legacy_hash(attrs, child_attrs)
+
+        Map.put(attrs, :child_group_request_hash, hash)
+      end
+
+      defp flow_child_group_request_hashes(attrs, child_attrs),
+        do: [
+          flow_child_group_canonical_hash(attrs, child_attrs),
+          flow_child_group_legacy_hash(attrs, child_attrs)
+        ]
+
+      defp flow_child_group_canonical_hash(attrs, child_attrs) do
+        request =
+          flow_child_group_request(attrs, child_attrs, &flow_child_group_canonical_child/1)
+
+        "c1:" <> Base.encode16(Ferricstore.CanonicalTerm.digest(request), case: :lower)
+      end
+
+      defp flow_child_group_legacy_hash(attrs, child_attrs) do
+        request = flow_child_group_request(attrs, child_attrs, &flow_child_group_request_child/1)
+
+        :crypto.hash(:sha256, :erlang.term_to_binary(request))
+        |> Base.encode16(case: :lower)
+      end
+
+      defp flow_child_group_canonical_child(attrs) do
+        @flow_child_group_child_fields
+        |> Map.new(&{&1, Map.get(attrs, &1)})
+        |> Map.put(
+          :payload_hash,
+          flow_child_group_canonical_payload_hash(Map.get(attrs, :payload))
+        )
+      end
+
+      defp flow_child_group_canonical_payload_hash(nil), do: nil
+
+      defp flow_child_group_canonical_payload_hash(payload),
+        do: Base.encode16(Ferricstore.CanonicalTerm.digest(payload), case: :lower)
+
+      defp flow_child_group_request(attrs, child_attrs, child_fun) do
+        %{
           wait: Map.fetch!(attrs, :wait),
           wait_state: Map.get(attrs, :wait_state),
           on_child_failed: Map.fetch!(attrs, :on_child_failed),
@@ -515,14 +589,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           exhaust_to: Map.fetch!(attrs, :exhaust_to),
           children:
             child_attrs
-            |> Enum.map(&flow_child_group_request_child/1)
+            |> Enum.map(child_fun)
             |> Enum.sort_by(fn child ->
               {Map.fetch!(child, :id), Map.fetch!(child, :partition_key)}
             end)
         }
-
-        :crypto.hash(:sha256, :erlang.term_to_binary(request))
-        |> Base.encode16(case: :lower)
       end
 
       defp flow_child_group_request_child(attrs) do
@@ -638,16 +709,32 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
         end
       end
 
-      defp flow_create_duplicate_result(state, existing, %{idempotent: true} = attrs) do
-        if flow_create_idempotent_match?(state, existing, attrs) do
+      # `value_reads` is where a retry's stored payload is looked up: :projected
+      # also reads values this node's history projector has moved to the LMDB
+      # mirror (see flow_record_value_batch_get); :keydir reads only the keydir,
+      # as releases before feature level 5 do.
+      defp flow_create_duplicate_result(state, existing, attrs, value_reads)
+
+      defp flow_create_duplicate_result(state, existing, %{idempotent: true} = attrs, value_reads) do
+        if flow_create_idempotent_match?(state, existing, attrs, value_reads) do
           {:ok, existing}
         else
           {:error, "ERR flow idempotency conflict"}
         end
       end
 
-      defp flow_create_duplicate_result(_state, _existing, _attrs),
+      defp flow_create_duplicate_result(_state, _existing, _attrs, _value_reads),
         do: {:error, "ERR flow already exists"}
+
+      # The answer to a retry alone changes nothing stored, so it may read the
+      # mirror at any level. Where it decides what else is written (new records of
+      # a batch, or a cross-shard transaction), older releases' keydir-only answer
+      # is kept below level 5.
+      defp flow_create_value_reads(state, writes_depend_on_answer?) do
+        if writes_depend_on_answer? and not feature_level_5?(state),
+          do: :keydir,
+          else: :projected
+      end
 
       defp flow_value_ref(attrs, kind, id, version, partition_key, existing_ref \\ nil) do
         cond do
@@ -793,6 +880,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
               record,
               flow_indexed_state_meta_for_record(state, record)
             )
+      end
+
+      # Level 5 indexes a Flow that a batch, pipelined or cross-shard command
+      # closes under its type's current policy, as the single-Flow commands do.
+      # Older releases keep the indexed names the record had, so an attribute
+      # such a command merged was not broad-searchable. `level_state` is the
+      # shard applying the entry and `state` the shard holding the Flow.
+      defp flow_refresh_batch_indexed_attributes(level_state, state, record) do
+        if feature_level_5?(level_state),
+          do: flow_refresh_indexed_attributes(state, record),
+          else: record
       end
 
       defp flow_indexed_attributes_for_record(state, record) do
@@ -1518,7 +1616,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
         |> Base.encode16(case: :lower)
       end
 
-      defp flow_create_idempotent_match?(state, existing, attrs) do
+      defp flow_create_idempotent_match?(state, existing, attrs, value_reads) do
         id = Map.fetch!(attrs, :id)
         partition_key = Map.get(attrs, :partition_key)
         lifecycle = flow_lifecycle_for_create(state, attrs)
@@ -1542,20 +1640,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
         }
 
         Enum.all?(comparable_attrs, fn {key, value} -> Map.get(existing, key) == value end) and
-          flow_create_idempotent_payload_match?(state, existing, attrs)
+          flow_create_idempotent_payload_match?(state, existing, attrs, value_reads)
       end
 
-      defp flow_create_idempotent_payload_match?(state, existing, %{payload: payload}) do
+      defp flow_create_idempotent_payload_match?(
+             state,
+             existing,
+             %{payload: payload},
+             value_reads
+           ) do
         with ref when is_binary(ref) and ref != "" <- Map.get(existing, :payload_ref),
              {:ok, expected} <- flow_idempotent_expected_encoded_value(state, payload),
-             [stored] when is_binary(stored) <- sm_store_batch_get(state, [ref], &sm_file_path/2) do
+             [stored] when is_binary(stored) <-
+               flow_create_stored_values(state, [ref], value_reads) do
           stored == expected
         else
           _ -> false
         end
       end
 
-      defp flow_create_idempotent_payload_match?(_state, _existing, _attrs), do: true
+      defp flow_create_idempotent_payload_match?(_state, _existing, _attrs, _value_reads),
+        do: true
+
+      defp flow_create_stored_values(state, refs, :projected),
+        do: flow_record_value_batch_get(state, refs)
+
+      defp flow_create_stored_values(state, refs, :keydir),
+        do: sm_store_batch_get(state, refs, &sm_file_path/2)
 
       defp flow_idempotent_expected_encoded_value(state, payload) do
         case BlobCommand.flow_blob_value_ref(payload) do
@@ -1720,9 +1831,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
 
       defp flow_non_empty_binary?(value), do: is_binary(value) and value != ""
 
-      defp flow_create_many_prepare(state, attrs_list) do
+      defp flow_create_many_prepare(state, attrs_list),
+        do: flow_create_many_prepare(state, attrs_list, :batch)
+
+      # `caller` is :spawn when a parent update follows, so the answer decides
+      # writes even when every child already exists.
+      defp flow_create_many_prepare(state, attrs_list, caller) do
         with :ok <- flow_validate_create_attrs_list(attrs_list) do
           existing_records = flow_create_many_existing_states(state, attrs_list)
+
+          value_reads =
+            flow_create_value_reads(state, caller == :spawn or nil in existing_records)
 
           attrs_list
           |> Enum.zip(existing_records)
@@ -1745,7 +1864,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
                   {:halt, {:error, "ERR flow already exists"}}
 
                 existing ->
-                  case flow_create_duplicate_result(state, existing, attrs) do
+                  case flow_create_duplicate_result(state, existing, attrs, value_reads) do
                     {:ok, existing} -> {:cont, {:ok, [existing | acc], new_acc, retention_cache}}
                     {:error, _reason} = error -> {:halt, error}
                   end

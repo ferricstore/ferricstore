@@ -33,7 +33,40 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    INCRBYFLOAT/HINCRBYFLOAT store plain decimals ("3", not "3.0").
   #    `:compound_command` runs HDEL, HSETNX, HGETDEL and ZADD/GEOADD with
   #    options in one entry.
-  @supported 4
+  # 5: MULTI queues the command forms older releases do not parse
+  #    (`Ferricstore.Transaction.ReplicaCompat`): ZRANK/ZREVRANK WITHSCORE,
+  #    PFMERGE with no source, HEXPIRE/HPEXPIRE with a condition or TTL 0,
+  #    HSETEX's Redis 8 form, HGETEX with a TTL of 0, ZADD INCR, ZRANGE BYLEX
+  #    and SET IFEQ/IFNE.
+  #    HSETEX's Redis form and a conditional ZADD INCR run as one replicated
+  #    compound entry (`Router.compound_command/4`). Inside MULTI, BITOP
+  #    deletes its destination for an empty result, GEOSEARCHSTORE of a
+  #    missing source empties its destination and measures with Redis's Earth
+  #    radius, HGETEX of a past time deletes the fields and DECRBY of the
+  #    smallest integer is refused (`Ferricstore.Store.Ops.level_5_writes?/1`).
+  #    The state machine's PFADD and PFMERGE keep the sketch's TTL; INCR,
+  #    INCRBY, DECR and DECRBY in MULTI refuse a result outside the 64-bit
+  #    range; SET NX/XX see a write staged earlier in the same entry whose
+  #    value is not cached; and Flows closed by batch, pipelined or
+  #    cross-shard commands are indexed under the type's current policy, as
+  #    the single-Flow commands index them; a Flow state record write apply
+  #    refuses fails a claim or batch entry instead of being skipped. A
+  #    collection count inside an entry with more due member expiries than
+  #    one cleanup pass counts the keydir instead of failing. Apply's Flow
+  #    history trim and its duplicate retry check order one millisecond's
+  #    events by version ("1000-9" before "1000-10"), not by id bytes. WATCH
+  #    records replicated write versions for the watched keys and a watched
+  #    EXEC compares them (`Ferricstore.Transaction.WatchIndex`), instead of
+  #    node-local storage tokens. Flow signal idempotency digests and child
+  #    group request hashes are stored as `Ferricstore.CanonicalTerm` digests,
+  #    which no OTP release changes (older ones still match their retries).
+  #    A rewind carries its target event's stored entry
+  #    (`Ferricstore.Flow.RewindTarget`) instead of apply reading the
+  #    node-local history. A create batch holding an idempotent retry and a
+  #    rewind's value refresh read values the history projector moved to the
+  #    LMDB mirror. A signal retried with its idempotency key and the same
+  #    content changes nothing.
+  @supported 5
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"
   @probe_timeout_ms 5_000

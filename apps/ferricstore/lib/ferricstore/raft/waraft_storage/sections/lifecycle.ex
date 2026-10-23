@@ -145,7 +145,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
               label: Map.get(metadata, :label),
               config: recovered_config,
               bitcask_dirty?: false,
-              promoted_sync: promoted_sync
+              promoted_sync: promoted_sync,
+              replay_horizon: :unresolved
             }
 
             last_clean_position =
@@ -236,7 +237,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
       # trim remove less than asked). With no usable checkpoint, or one still
       # running, the trim is deferred and the log keeps its entries. A trim that
       # would run more than the configured number of entries past the floor, or
-      # that came with no floor, rebuilds the projection synchronously as before.
+      # that came with no floor, rebuilds the projection synchronously as before,
+      # unless Flow history up to the projection is not durable yet: then it
+      # defers too.
       @spec prepare_segment_projection_for_trim(
               charlist() | binary(),
               non_neg_integer(),
@@ -371,9 +374,21 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
             defer_segment_projection_trim(root_dir, trim_index, :no_checkpoint)
 
           :not_available ->
-            changing_segment_projection(root_dir, fn ->
-              rebuild_segment_projection_for_trim(root_dir, projection_root, context, trim_index)
-            end)
+            # The rebuilt projection becomes the replay floor at the context's
+            # position, so the history up to there must be durable first.
+            if history_dependencies_durable?(context, context.history_dependencies) do
+              changing_segment_projection(root_dir, fn ->
+                rebuild_segment_projection_for_trim(
+                  root_dir,
+                  projection_root,
+                  context,
+                  trim_index
+                )
+              end)
+            else
+              request_history_dependencies(context, context.history_dependencies)
+              defer_segment_projection_trim(root_dir, trim_index, :history_not_durable)
+            end
         end
       end
 
@@ -649,14 +664,26 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
 
         with :ok <- maybe_fsync_payload_before_metadata(new_handle),
              clean_handle = Map.put(new_handle, :bitcask_dirty?, false),
-             :ok <- persist_metadata(clean_handle, :compact) do
+             {:ok, applied_handle} <- persist_config_metadata(clean_handle) do
           Ferricstore.Raft.WARaftBackend.cache_config(handle.shard_index, config)
 
-          {:ok,
-           clean_handle |> mark_metadata_persisted() |> register_segment_projection_context()}
+          {:ok, register_segment_projection_context(applied_handle)}
         else
           {:error, reason} ->
             {{:error, reason}, block_storage(handle, reason, position, :metadata_failure)}
+        end
+      end
+
+      # A config entry moves the replay cursor like any other entry, so it
+      # waits for the projections of the entries before it. Until then the
+      # log, whose config WARaft prefers over an older stored one, carries it.
+      defp persist_config_metadata(handle) do
+        if replay_dependencies_ready?(handle) do
+          with :ok <- persist_metadata(handle, :compact) do
+            {:ok, mark_metadata_persisted(handle)}
+          end
+        else
+          {:ok, request_replay_dependencies_async(handle)}
         end
       end
 
@@ -685,7 +712,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
             send(
               worker,
               {:ferricstore_waraft_segment_projection_checkpoint_cut, ref,
-               {:cut, handle.position, self()}}
+               {:cut, handle.position, self(), history_replay_dependencies(handle)}}
             )
 
             result =
@@ -981,9 +1008,11 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
              label_update
            ) do
         clear_apply_projection_replay_dependencies()
+        handle = resolve_replay_horizon(handle, position)
 
         try do
-          apply_result = apply_state_machine_command(command, position, sm_state)
+          apply_result =
+            apply_state_machine_command(command, position, sm_state, replayed?(handle, position))
 
           replay_dependencies =
             StateMachine.consume_waraft_replay_dependencies()
@@ -1035,6 +1064,14 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
            ) do
         decoded_command = decoded_replay_command(command)
 
+        if StateMachine.watch_index_requires_apply?(decoded_command, handle.sm_state) do
+          :unsupported
+        else
+          apply_projectable_command(command, decoded_command, position, handle, label_update)
+        end
+      end
+
+      defp apply_projectable_command(command, decoded_command, position, handle, label_update) do
         {projection_command, promotion_keys} =
           prepare_segment_projection_command(decoded_command)
 

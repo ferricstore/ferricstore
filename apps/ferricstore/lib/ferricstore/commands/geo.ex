@@ -24,10 +24,13 @@ defmodule Ferricstore.Commands.Geo do
   """
 
   alias Ferricstore.Commands.{CompoundSnapshot, Geo.Parsing, Strings.Delete}
-  alias Ferricstore.Store.{CompoundKey, Ops, ReadResult, TypeRegistry}
+  alias Ferricstore.Store.{CompoundKey, Ops, ReadResult, TypeRegistry, ValueCodec}
 
   # Earth radius in meters (WGS-84 mean radius)
-  @earth_radius_m 6_371_000.0
+  # Redis's Earth radius. Releases before cluster feature level 5 used the
+  # mean radius, which a MULTI transaction's GEOSEARCHSTORE keeps below it.
+  @earth_radius_m 6_372_797.560856
+  @legacy_earth_radius_m 6_371_000.0
 
   # Geohash precision: 52 bits (26 per axis)
   @geohash_bits 52
@@ -98,10 +101,7 @@ defmodule Ferricstore.Commands.Geo do
 
   def handle_ast({:geosearch, key, opts}, store) do
     with {:ok, opts} <- Parsing.validate_geosearch_ast_opts(opts),
-         {:ok, center_lng, center_lat} <- resolve_center(opts, store, key),
-         {:ok, zset} <- read_zset(store, key) do
-      do_geosearch(zset, center_lng, center_lat, opts)
-    end
+         do: geosearch(store, key, opts)
   end
 
   def handle_ast({:geosearchstore, _destination, _source, {:error, msg}}, _store),
@@ -109,14 +109,7 @@ defmodule Ferricstore.Commands.Geo do
 
   def handle_ast({:geosearchstore, destination, source, opts}, store) do
     with {:ok, opts} <- Parsing.validate_geosearch_ast_opts(opts),
-         {:ok, center_lng, center_lat} <- resolve_center(opts, store, source),
-         {:ok, zset} <- read_zset(store, source) do
-      matches = find_matching_members(zset, center_lng, center_lat, opts)
-      sorted = sort_matches(matches, opts)
-      limited = apply_count(sorted, opts)
-
-      store_geosearch_results(store, destination, limited)
-    end
+         do: geosearchstore(store, destination, source, opts)
   end
 
   @doc """
@@ -207,11 +200,7 @@ defmodule Ferricstore.Commands.Geo do
   # ---------------------------------------------------------------------------
 
   def handle("GEOSEARCH", [key | rest], store) do
-    with {:ok, opts} <- Parsing.parse_geosearch_opts(rest),
-         {:ok, center_lng, center_lat} <- resolve_center(opts, store, key),
-         {:ok, zset} <- read_zset(store, key) do
-      do_geosearch(zset, center_lng, center_lat, opts)
-    end
+    with {:ok, opts} <- Parsing.parse_geosearch_opts(rest), do: geosearch(store, key, opts)
   end
 
   def handle("GEOSEARCH", _args, _store) do
@@ -224,14 +213,7 @@ defmodule Ferricstore.Commands.Geo do
 
   def handle("GEOSEARCHSTORE", [destination, source | rest], store) do
     with {:ok, opts} <- Parsing.parse_geosearch_opts(rest),
-         {:ok, center_lng, center_lat} <- resolve_center(opts, store, source),
-         {:ok, zset} <- read_zset(store, source) do
-      matches = find_matching_members(zset, center_lng, center_lat, opts)
-      sorted = sort_matches(matches, opts)
-      limited = apply_count(sorted, opts)
-
-      store_geosearch_results(store, destination, limited)
-    end
+         do: geosearchstore(store, destination, source, opts)
   end
 
   def handle("GEOSEARCHSTORE", _args, _store) do
@@ -356,8 +338,8 @@ defmodule Ferricstore.Commands.Geo do
 
   Distance in meters as a float.
   """
-  @spec haversine(float(), float(), float(), float()) :: float()
-  def haversine(lat1, lng1, lat2, lng2) do
+  @spec haversine(float(), float(), float(), float(), float()) :: float()
+  def haversine(lat1, lng1, lat2, lng2, earth_radius_m \\ @earth_radius_m) do
     dlat = deg_to_rad(lat2 - lat1)
     dlng = deg_to_rad(lng2 - lng1)
 
@@ -366,7 +348,7 @@ defmodule Ferricstore.Commands.Geo do
         :math.cos(deg_to_rad(lat1)) * :math.cos(deg_to_rad(lat2)) *
           :math.sin(dlng / 2) ** 2
 
-    2 * @earth_radius_m * :math.asin(:math.sqrt(a))
+    2 * earth_radius_m * :math.asin(:math.sqrt(a))
   end
 
   # ===========================================================================
@@ -429,6 +411,55 @@ defmodule Ferricstore.Commands.Geo do
     end
   rescue
     ArgumentError -> 0.0
+  end
+
+  # Redis answers [] for a missing key before it looks for FROMMEMBER's member.
+  defp geosearch(store, key, opts) do
+    case read_compound_zset(store, key) do
+      :missing ->
+        []
+
+      {:error, _reason} = error ->
+        error
+
+      {:ok, zset} ->
+        with {:ok, center_lng, center_lat} <- resolve_center(opts, store, key),
+             do: do_geosearch(zset, center_lng, center_lat, opts)
+    end
+  end
+
+  # For a missing source Redis empties the destination and answers 0. Older
+  # releases answer FROMMEMBER's error instead, so a MULTI transaction does so
+  # only at feature level 5.
+  defp geosearchstore(store, destination, source, opts) do
+    case read_compound_zset(store, source) do
+      :missing ->
+        if Ops.level_5_writes?(store),
+          do: store_geosearch_results(store, destination, []),
+          else: legacy_geosearchstore(store, destination, source, opts)
+
+      {:error, _reason} = error ->
+        error
+
+      {:ok, _zset} ->
+        legacy_geosearchstore(store, destination, source, opts)
+    end
+  end
+
+  defp legacy_geosearchstore(store, destination, source, opts) do
+    opts =
+      if Ops.level_5_writes?(store),
+        do: opts,
+        else: Map.put(opts, :earth_radius_m, @legacy_earth_radius_m)
+
+    with {:ok, center_lng, center_lat} <- resolve_center(opts, store, source),
+         {:ok, zset} <- read_zset(store, source) do
+      matches = find_matching_members(zset, center_lng, center_lat, opts)
+      sorted = sort_matches(matches, opts)
+      limited = apply_count(sorted, opts)
+
+      store_geosearch_results(store, destination, limited)
+    end
   end
 
   defp store_geosearch_results(store, destination, limited) do
@@ -830,7 +861,7 @@ defmodule Ferricstore.Commands.Geo do
     zset
     |> Enum.reduce([], fn {score, member}, acc ->
       {lng, lat} = geohash_decode(score)
-      dist_m = haversine(center_lat, center_lng, lat, lng)
+      dist_m = haversine(center_lat, center_lng, lat, lng, earth_radius(opts))
 
       if in_shape?(dist_m, lng, lat, center_lng, center_lat, opts) do
         [{score, member, dist_m} | acc]
@@ -924,11 +955,10 @@ defmodule Ferricstore.Commands.Geo do
   # Private -- formatting helpers
   # ===========================================================================
 
-  defp format_coord(val) do
-    :erlang.float_to_binary(val * 1.0, [:compact, decimals: 4])
-  end
+  defp earth_radius(opts), do: Map.get(opts, :earth_radius_m, @earth_radius_m)
 
-  defp format_distance(dist) do
-    :erlang.float_to_binary(dist * 1.0, [:compact, decimals: 4])
-  end
+  # As Redis answers them: coordinates at full precision, distances with
+  # four decimals.
+  defp format_coord(val), do: ValueCodec.format_double(val * 1.0)
+  defp format_distance(dist), do: :erlang.float_to_binary(dist * 1.0, decimals: 4)
 end

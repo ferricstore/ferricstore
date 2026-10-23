@@ -20,24 +20,139 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
     rollback_new_hash_type_marker(key, store, type_status, write_error)
   end
 
-  @spec expire_fields(binary(), [binary()], integer(), map()) :: [integer()] | {:error, term()}
-  def expire_fields(key, fields, expire_at_ms, store) do
+  @spec expire_fields(binary(), [binary()], integer(), nil | :nx | :xx | :gt | :lt, map()) ::
+          [integer()] | {:error, term()}
+  def expire_fields(key, fields, expire_at_ms, condition, store) do
     with :ok <- TypeRegistry.command_check_type(key, :hash, store),
-         {:ok, {unique_fields, compound_keys, metas_by_field}} <-
+         {:ok, {_unique_fields, _compound_keys, metas_by_field}} <-
            batch_field_metas(fields, key, store) do
-      entries = existing_field_entries(unique_fields, compound_keys, metas_by_field, expire_at_ms)
+      delete? = expire_at_ms <= CommandTime.now_ms()
 
+      # Redis applies the fields in order, so a repeated field sees the
+      # expiry its earlier occurrence set, or that it deleted it.
+      {results, current} =
+        Enum.map_reduce(fields, metas_by_field, fn field, current ->
+          case Map.fetch!(current, field) do
+            nil ->
+              {-2, current}
+
+            {value, old_expire_at_ms} ->
+              cond do
+                not expire_condition_met?(condition, old_expire_at_ms, expire_at_ms) ->
+                  {0, current}
+
+                delete? ->
+                  {2, Map.put(current, field, nil)}
+
+                true ->
+                  {1, Map.put(current, field, {value, expire_at_ms})}
+              end
+          end
+        end)
+
+      changed =
+        Enum.reject(metas_by_field, fn {field, meta} -> Map.fetch!(current, field) == meta end)
+
+      with :ok <- write_expired_fields(key, changed, delete?, expire_at_ms, store), do: results
+    end
+  end
+
+  # A field without an expiry counts as never expiring.
+  defp expire_condition_met?(nil, _old, _new), do: true
+  defp expire_condition_met?(:nx, old, _new), do: old == 0
+  defp expire_condition_met?(:xx, old, _new), do: old != 0
+  defp expire_condition_met?(:gt, old, new), do: old != 0 and new > old
+  defp expire_condition_met?(:lt, old, new), do: old == 0 or new < old
+
+  defp write_expired_fields(_key, [], _delete?, _expire_at_ms, _store), do: :ok
+
+  defp write_expired_fields(key, changed, true, _expire_at_ms, store) do
+    deleted_entries =
+      Enum.map(changed, fn {field, {value, old_expire_at_ms}} ->
+        {CompoundKey.hash_field(key, field), value, old_expire_at_ms}
+      end)
+
+    delete_and_cleanup(key, deleted_entries, length(deleted_entries), store)
+  end
+
+  defp write_expired_fields(key, changed, false, expire_at_ms, store) do
+    entries =
+      Enum.map(changed, fn {field, {value, _old_expire_at_ms}} ->
+        {CompoundKey.hash_field(key, field), value, expire_at_ms}
+      end)
+
+    Ops.compound_batch_put(store, key, entries)
+  end
+
+  @doc """
+  HSETEX's Redis 8 form: sets the field-value pairs (a repeated field takes
+  its last value) and answers 1, or answers 0 and writes nothing when FNX
+  finds a field or FXX misses one. `expiry` clears the fields' TTL, keeps
+  it, or sets an expiry, deleting them for a time not after now.
+  """
+  @spec setex_fields(
+          binary(),
+          [binary()],
+          nil | :fnx | :fxx,
+          :clear | :keep | {:at, integer()},
+          map()
+        ) :: 0 | 1 | {:error, term()}
+  def setex_fields(key, pairs, condition, expiry, store) do
+    {fields, values_by_field} = collapse_field_values(pairs, [], %{})
+
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, {_unique_fields, _compound_keys, metas_by_field}} <-
+           batch_field_metas(fields, key, store) do
+      present = Enum.count(fields, &(Map.fetch!(metas_by_field, &1) != nil))
+
+      cond do
+        condition == :fnx and present > 0 -> 0
+        condition == :fxx and present < length(fields) -> 0
+        true -> write_setex_fields(key, fields, values_by_field, metas_by_field, expiry, store)
+      end
+    end
+  end
+
+  defp write_setex_fields(key, fields, values_by_field, metas_by_field, expiry, store) do
+    case expiry do
+      {:at, expire_at_ms} when is_integer(expire_at_ms) ->
+        if expire_at_ms <= CommandTime.now_ms(),
+          do: delete_setex_fields(key, fields, metas_by_field, store),
+          else: put_setex_fields(key, fields, metas_by_field, store, values_by_field, expiry)
+
+      _clear_or_keep ->
+        put_setex_fields(key, fields, metas_by_field, store, values_by_field, expiry)
+    end
+  end
+
+  # A time not after now leaves none of the fields.
+  defp delete_setex_fields(key, fields, metas_by_field, store) do
+    deleted_entries =
+      for field <- fields,
+          {value, old_expire_at_ms} <- [Map.fetch!(metas_by_field, field)],
+          do: {CompoundKey.hash_field(key, field), value, old_expire_at_ms}
+
+    with :ok <- delete_and_cleanup(key, deleted_entries, length(deleted_entries), store), do: 1
+  end
+
+  defp put_setex_fields(key, fields, metas_by_field, store, values_by_field, expiry) do
+    entries =
+      Enum.map(fields, fn field ->
+        expire_at_ms =
+          case {expiry, Map.fetch!(metas_by_field, field)} do
+            {:keep, {_value, old_expire_at_ms}} -> old_expire_at_ms
+            {{:at, expire_at_ms}, _meta} -> expire_at_ms
+            {_clear_or_new, _meta} -> 0
+          end
+
+        {CompoundKey.hash_field(key, field), Map.fetch!(values_by_field, field), expire_at_ms}
+      end)
+
+    with type_status when type_status in [:ok, {:ok, :created}] <-
+           TypeRegistry.command_check_or_set_status(key, :hash, store) do
       case Ops.compound_batch_put(store, key, entries) do
-        :ok ->
-          Enum.map(fields, fn field ->
-            case Map.fetch!(metas_by_field, field) do
-              nil -> -2
-              {_value, _old_expire} -> 1
-            end
-          end)
-
-        {:error, _} = err ->
-          err
+        :ok -> 1
+        {:error, _reason} = error -> rollback_new_hash_type_marker(key, store, type_status, error)
       end
     end
   end
@@ -63,7 +178,8 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
 
             cond do
               remaining_ms <= 0 -> -2
-              unit == :seconds -> div(remaining_ms, 1000)
+              # Rounded up, as Redis does for fields.
+              unit == :seconds -> div(remaining_ms + 999, 1000)
               true -> remaining_ms
             end
         end
@@ -94,8 +210,9 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
     end
   end
 
-  @spec expiretime_fields(binary(), [binary()], map()) :: [integer()] | {:error, term()}
-  def expiretime_fields(key, fields, store) do
+  @spec expiretime_fields(binary(), [binary()], :seconds | :milliseconds, map()) ::
+          [integer()] | {:error, term()}
+  def expiretime_fields(key, fields, unit, store) do
     with :ok <- TypeRegistry.command_check_type(key, :hash, store),
          {:ok, {_unique_fields, _compound_keys, metas_by_field}} <-
            batch_field_metas(fields, key, store) do
@@ -103,7 +220,9 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
         case Map.fetch!(metas_by_field, field) do
           nil -> -2
           {_value, 0} -> -1
-          {_value, expire_at_ms} -> div(expire_at_ms, 1000)
+          {_value, expire_at_ms} when unit == :milliseconds -> expire_at_ms
+          # Rounded up, as Redis does for fields.
+          {_value, expire_at_ms} -> div(expire_at_ms + 999, 1000)
         end
       end)
     end

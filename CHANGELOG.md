@@ -4,6 +4,518 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A Flow signal retried with the same idempotency key and the same content
+  was applied again: it added a version and a history event, and a retried
+  signal that had already moved the Flow (`transition_to`) answered "ERR flow
+  state mismatch". From feature level 5 such a retry answers OK and changes
+  nothing; a reused key with different content is still refused.
+- New setting `:waraft_election_pre_vote` (default `false`; also the
+  `election_pre_vote` start option) turns on wa_raft's pre-vote: a node that
+  lost contact asks whether it could win before raising its term, so on its
+  return it cannot unseat a leader the others still follow. With it and
+  1,500/3,000 ms election timeouts, a 3-node test resumed writes about 2 s
+  after its shard leader was killed (5.6-6.1 s with the defaults).
+- A WARaft shard whose storage blocked itself after a failed apply (it then
+  refuses every apply until restarted) only emitted telemetry; it now also
+  logs an error naming the shard, the position, the operation and the cause.
+- A capped Flow value read (FLOW.GET with a payload cap, history listings)
+  loaded a large blob-backed payload in full once the history projector had
+  moved it, only to report its size; it now takes the size from the blob's
+  file ref, as it does for a payload still in the keydir.
+- A Flow value that the history projector had moved to its history log and
+  that could not be read there was answered as missing: no payload on
+  FLOW.GET, nil from FLOW.VALUE.MGET. It is now reported as a storage read
+  failure (`payload_error`, "ERR storage read failed"), as an unreadable
+  value still in the keydir is.
+- Flow values the history projector has moved to its history log are read in
+  one call per log for a batch (value MGET, claim and history hydration,
+  export) instead of opening the log once per value: 2,000 such payloads
+  read in batches of 100 took 83 µs each, now 7 µs.
+- A Flow export left out any value, signal row or owned row it could not
+  read, and still reported success, so the restored run came back without
+  it (a shared value or governance row that could not be read crashed the
+  export instead). The export now fails, naming the run and the read error.
+- A Flow rewind looked its target event up in the node's own history, which
+  the history projector writes and trims outside Raft. A rewind to an event
+  just written failed where the projector had not caught up yet, and a
+  rewind to an event past the history cap still applied where the projector
+  had not trimmed it, so replicas could disagree. From feature level 5 the
+  rewind reads its target before it is proposed and carries it; apply
+  restores only events within the record's history cap.
+- An idempotent Flow create retried with a payload could be refused as an
+  idempotency conflict. Once a node's history projector has projected a
+  Flow value it removes the value's keydir row and the shard's LMDB mirror
+  locates it, and the retry's payload check read only the keydir. A single
+  create returned a false conflict; a batch (create_many, spawn) holding such
+  a retry was refused whole on nodes whose projector had caught up and
+  applied on nodes whose projector lagged. A rewind that restarted a
+  record's retention also skipped such values, so they could expire before
+  their record. Apply now reads a record's values through the mirror too, as
+  Flow reads do: for a retry alone at any level, and from feature level 5
+  where the answer decides what else is written (a batch with new records, a
+  cross-shard transaction, a rewind's value refresh).
+- A Flow signal's idempotency digest and a child group's request hash are
+  stored and compared on every replica, and were computed with
+  `term_to_binary`, whose output changes between OTP releases (OTP 26
+  changed how atoms encode; maps of more than 32 keys follow an internal
+  hash). During a rolling OTP upgrade, a retried signal or spawn could be
+  accepted on some replicas and refused as a conflict on others. From
+  feature level 5 they use FerricStore's own encoding, which no release
+  changes; digests stored before still match their retries.
+- A Flow schedule whose fire failed part-way, as when the shard's leader
+  changed or a write timed out, stayed claimed for the whole 30 s lease, so
+  it did not fire again until the lease expired. It is now handed back at
+  once and the next scheduler poll fires it (under the same target id, so
+  nothing is created twice). Refusals with an error message keep the lease
+  as their backoff. In a 3-node test with leadership moving every 300 ms, an
+  every-400 ms schedule fired 12 times in 14 s instead of 2.
+- A read of a hash field, set member or sorted-set member whose cold value
+  could not be read where the keydir pointed retried the row, and when that
+  retry met the clock-drift guard (the node's clock ahead of wall time and
+  the row now carrying a TTL) the read raised CaseClauseError instead of
+  answering the drift failure. It now answers it.
+- A single command past the per-command apply bound (4,096 members by
+  default), such as RPUSH, HDEL, HEXPIRE, HPEXPIRE, HGETDEL, HGETEX or HSETEX
+  with more elements or fields than that, answered the internal reason
+  `:compound_member_apply_budget_exceeded`. It now answers
+  `ERR too many members in one command (the limit is 4096)`, over the native
+  protocol and HTTP alike.
+- On Linux with the io_uring writer, a failed `io_uring_enter` (any error
+  but EINTR, including the transient EAGAIN and EBUSY) returned with the
+  write still queued in the ring, or still in flight when the call returned
+  early. The next write submitted the queued one after its buffer was freed,
+  and a rollback could truncate under a write still landing, so stale or
+  garbage bytes could reach the log. Transient errors are now retried, a
+  write is never left in flight, and writes the kernel never took are
+  dropped with the ring.
+- An apply that stopped (its process killed) after staging Flow history in
+  the history projector's overflow queue, but before committing it, left a
+  row that every later overflow entry waited behind until the node
+  restarted: that history was not written, and the shard's durable position
+  stopped at it. The apply runs again and stages the history anew, so a row
+  whose writer is gone is now dropped.
+- Under a steady stream of Flow writes the shard's replay position never
+  advanced: it waited until the history of the newest write was projected,
+  and every write added newer history. A crash then replayed everything since
+  the stream began, a membership change waited for it until it timed out,
+  and every write asked the projector to catch up. The position now advances
+  in steps to the last one whose history is written, asking the projector
+  at most every 100 ms instead of on every write; in a single-node test,
+  Flow create throughput rose about 3.5 times. Between those steps, the
+  durable position a membership change waits for follows the projector
+  within about 100 ms instead of the persist cadence (1,024 entries).
+- In a cluster, a node restarted after a crash could permanently lose the
+  history of the Flow writes it applied just before stopping, and keep those
+  Flows only in its cold LMDB mirror. On restart a node re-applies the log
+  after its saved replay position, and the mirror already held what those
+  writes produced, so each replayed create and transition took the Flow for
+  an existing one, was refused and wrote no history. Entries the node may
+  have applied before the restart now see only what came before them, as
+  single-node recovery already did.
+- With more Flow history waiting than the history projector's queue holds,
+  a request to make a write's history durable could be answered while that
+  history still sat in the overflow queue. The shard's replay position, and
+  with it a checkpoint or a membership change, could then pass history that
+  was never written, and a crash lost it. The projector now never reports
+  history past the oldest entry still waiting, and keeps such a request
+  open until the waiting entries are written.
+- After a crash, a node could permanently lose Flow history events while the
+  Flow's state survived. A restart replays the log only after the shard's
+  latest projection checkpoint, and a checkpoint was taken at the newest
+  applied write even when the background projector had not written that
+  write's history yet. A checkpoint now waits for that history before it
+  counts, and a log trim that has to rebuild the projection itself defers
+  until the history is written.
+- A membership change (any WARaft config entry) saved the shard's replay
+  position at once, past earlier writes whose Flow history was still being
+  projected in the background. A crash before that projection finished lost
+  those events: on restart the node replayed only what came after the config
+  entry. The config entry now waits for those projections like any other
+  write, so a membership change reports success only once they are durable.
+- A node that stopped while saving its Flow query index registry could fail
+  to start ("invalid_query_index_registry_journal: non_monotonic_checkpoint")
+  or silently undo a validation restart. Saving writes the registry snapshot
+  before it empties the progress journal, and a restart in between replayed
+  journal events the snapshot already held. Each journal event now names the
+  snapshot it follows, and replay skips events of an older one.
+- In a cluster, every node read a running Flow's remaining history and
+  proposed the same release of values its trimmed history no longer referred
+  to, so each release ran once per node and was applied on every node once
+  per proposal. Only the shard's leader releases now.
+- In a cluster, every node woke a schedule queued behind a target that just
+  finished: each read the target's state through the log and proposed the
+  same schedule update. Only the leader of the target's shard wakes it now.
+- In a cluster, a watched transaction (WATCH ... MULTI ... EXEC) could commit
+  on the leader while the other replicas skipped it, leaving them permanently
+  different. Every replica checks the WATCH tokens against its own storage,
+  and the tokens came from node-local details: a promoted hash, set or sorted
+  set's per-node revision counter, and the storage location a node changes
+  when it trims its log. From feature level 5, WATCH records a write version
+  for each watched key in replicated state, every write to the key raises it,
+  and EXEC compares the versions, so every replica reaches the same decision.
+  As in Redis, a command that changes nothing (SET NX of an existing key, SADD
+  of an existing member, a failed CAS) leaves watchers alone. A WATCH older
+  than an hour now aborts its EXEC. Below level 5 WATCH behaves as before.
+- Flow history ordered the events a Flow wrote in one millisecond by their
+  ids' text, so `1000-10` came before `1000-9`. Whenever a Flow's version
+  crossed 9 to 10, 99 to 100 and so on within one millisecond, history
+  listings put events out of order; `from_event`/`to_event` ranges, the
+  latest-N read and history pages, FQL's included, returned the wrong events
+  (a range such as `1000-9`..`1000-10` was refused); and `history_max_events`
+  trimming, including a rebuilt LMDB projection, deleted that millisecond's
+  newest events instead of its oldest. History is now ordered by millisecond,
+  then version, in memory, in LMDB reads and in every trim, with no change to
+  stored data. The history trim and duplicate retry check that run as a
+  replica applies a command switch to this order once the cluster is raised
+  to feature level 5.
+- With keyspace notifications enabled (`notify-keyspace-events`), a batch of
+  two or more SETs on one shard sent through the HTTP API wrote the keys but
+  published no `__keyspace@0__`/`__keyevent@0__` notifications: the batch
+  took a combined put that skips them. Native compact pipelines (the SDKs'
+  batched SET, stream append and other compact forms) skipped them the same
+  way. Both now run command by command while notifications are on.
+- Keyspace notifications now fire for BLPOP, BRPOP and BLMPOP (`lpop`/`rpop`
+  on the key they served), BLMOVE and RPOPLPUSH (`lmove`, as LMOVE). These
+  commands published nothing before. LMOVE from an empty source no longer
+  publishes `lmove` for keys it did not change.
+- Keyspace notifications now fire for the hash field commands HSETEX (`hset`),
+  HGETDEL (`hdel`), HEXPIRE and HPEXPIRE (`hexpire`, or `hdel` when a TTL of
+  0 deleted a field) and HPERSIST (`hpersist`), each only when it changed a
+  field. They published nothing before. HGETEX still publishes nothing.
+
+- Security: `-@dangerous` did not remove ACL SETUSER, DELUSER, GETUSER, LIST,
+  LOAD, SAVE and LOG, nor SAVE, BGSAVE, LASTSAVE, SLOWLOG, INFO or CLIENT
+  LIST/PAUSE/UNPAUSE/NO-EVICT, all of which Redis puts in `@dangerous`. A user
+  set up as `+@all -@dangerous` could run ACL SETUSER and create or upgrade a
+  user to full access, and read password hashes with ACL GETUSER. These
+  commands are now in `@dangerous`. SETUSER expands a category when it runs,
+  so a user created with `-@dangerous` before this release keeps its old
+  command set: apply `ACL SETUSER <user> -@dangerous` again (or recreate the
+  user) to drop them.
+
+- ACL SETUSER and ACL files refused the `reset` modifier, and ACL SETUSER
+  refused `nocommands` (ACL files accepted it), both of which Redis accepts:
+  `ACL SETUSER alice reset on >pw ~app:* +@read` answered a syntax error.
+  `reset` now returns the user to its state right after creation before the
+  rules after it apply, and `nocommands` is `-@all`.
+
+- A MULTI that deleted a promoted hash, set or sorted set and then wrote the
+  key again (`DEL h` then `HSET h f v`) stored the new type and members in
+  the collection's dedicated file, which the transaction's cleanup deleted
+  right after. The values stayed readable from memory, but once memory
+  pressure evicted them every command on the key answered "ERR storage read
+  failed" until a restart replayed the log. Writes after the delete now go
+  to the shard's shared log.
+
+- A cluster replica running in interactive mode (as under `mix run` or
+  `iex -S mix`; releases load every module at boot) could stop applying a
+  shard ("storage blocked: invalid_preencoded_command") on the first
+  replicated command carrying an atom it had not seen, such as
+  FLOW.SPAWN_CHILDREN with `on_parent_closed: :abandon_children`. The startup
+  atom preload read each module's atom table but not its literal table,
+  where the compiler keeps atoms used only inside literal terms. It now loads
+  each module, as a release does at boot.
+
+- In a cluster, deleting a promoted hash, set or sorted set could leave a
+  replica holding its promotion marker and dedicated file when memory
+  pressure had evicted that replica's copy of the marker: the replica took
+  the fast segment-projection path, which saw no live marker, and deleted the
+  members as an ordinary collection's. That replica then routed the key
+  differently from the others. An evicted marker now sends the write to the
+  state machine, which reads the marker back and cleans up as the other
+  replicas do.
+
+- FLOW.LIST of a terminal state (completed, failed, cancelled) without
+  `include_cold`, and the by-parent, by-root and by-correlation lineage
+  lists, dropped a terminal flow that had attributes or indexed state
+  metadata once the LMDB writer had projected it, while the same flow without
+  attributes stayed listed. FLOW.GET and FLOW.STATS still found it. Terminal
+  flows stay in the hot indexes after an LMDB flush, as the release that kept
+  them hot intended; the prune that took such flows out of them now leaves
+  their entries in place and only drops their keydir row.
+
+- A Flow LMDB mirror reconcile reported the mirror unhealthy
+  (`flow_lmdb_reconcile_unhealthy`, one cold read error) when a terminal flow's
+  state was evicted from memory while its newest copy was still in the WARaft
+  apply projection: the stale-terminal cleanup read the state without the
+  shard's context, which such a read needs. FLOW.HISTORY calls that waited on
+  the reconcile failed, and the callers that require a healthy reconcile
+  (flow transfer, and the full reconcile at startup after an interrupted LMDB
+  flush) could fail too. The cleanup now reads with the shard's context.
+
+- Every command on a promoted hash, set or sorted set (HGET, HLEN, SISMEMBER,
+  ZRANGE, DEL and the rest) answered "ERR storage read failed" once memory
+  pressure had evicted both the collection's promotion marker and the member
+  rows it read: an evicted marker read as "not promoted", so the member was
+  read from the shard's shared log at its dedicated file's offset. An evicted
+  marker is now read back from disk before the collection is routed.
+
+- A write to a promoted hash, set or sorted set stopped a shard's
+  writes (the client saw a timeout and the shard's storage process
+  restarted) after memory pressure had evicted the collection's promotion
+  marker from memory: the write read the evicted marker back from disk with
+  the wrong shard context and crashed. Each node evicts on its own, so this
+  hit nodes independently. The marker is now read back as any evicted value.
+
+- ACL key (`~`, `%R~`, `%W~`) and channel (`&`) patterns matched differently
+  from Redis, which matches them as it matches KEYS: a backslash stood for
+  itself instead of making the next byte literal (`~foo\*` allowed `foo\x`
+  and not `foo*`), a backslash inside a class kept its regular-expression
+  meaning (`~key[\d]` allowed `key1` to `key9`), `*` and `?` did not match a
+  newline, a pattern also matched its key followed by a newline, and classes
+  differed as KEYS's did. Patterns are now compiled from Redis's rules.
+- KEYS, SCAN MATCH, the collection SCANs, PSUBSCRIBE and CONFIG GET matched
+  character classes differently from Redis: a range written high to low
+  (`[z-a]`) matched only its three bytes, `[!a]` was negated (Redis negates
+  only with `^`), `[a-]` matched `-` instead of ranging to `]`, and a class
+  with no closing `]` matched nothing. Classes now match as Redis's do, and
+  PubSub indexes such patterns by the same rule.
+- HLEN, SCARD, ZCARD and other member counts answered "ERR storage read
+  failed" when more than 4,096 members of the collection had expired by
+  their own TTL (HEXPIRE and the like) since the last count: the member index
+  cleans up a bounded number of them per count and failed past it. The count
+  now counts the keydir rows instead, as it does before the index is ready.
+  Inside a replicated entry this applies from feature level 5.
+- A shard could fail to start ("validate_prob_files failed ...
+  invalid_prob_type_catalog_entry") when a hash, list, set, sorted set or
+  probabilistic key had expired and its type marker was recovered from a
+  sealed segment's hint file: hint recovery leaves values on disk, only live
+  type markers are read back, and the sidecar check took the unread marker for
+  a corrupt one. An expired unread marker is now skipped, and a live one keeps
+  any sidecar its key has.
+- ZRANGEBYSCORE, ZREVRANGEBYSCORE and ZRANGE BYSCORE answered too few
+  members, often none, when a member was scored -0.0 and a bound was 0
+  (`(0` going up, or `0` going down): the ranged score index took -0.0 for a
+  score other than 0, so the range stopped at that member. -0.0 now ties with
+  0, as in Redis.
+- Compaction dropped an expired record that was still its key's newest, so an
+  older value of the key in a lower segment came back after a restart (expiry
+  drops the keydir row without a tombstone and relies on that record). Such a
+  record is now resolved as a tombstone is: compaction keeps it while a lower
+  segment holds a live value of the key.
+- A key whose newest value expired and was then read or swept could come back
+  with an older value after a restart. Expiry drops the key's keydir row
+  without a tombstone, and the hint file written for the active segment at
+  shutdown was built from the keydir, so it left out the expired record that
+  masked the older value in a lower segment. The shutdown hint is now built
+  from the segment's log, as rotation builds hints.
+- Batched reads of large cold values (Flow value hydration through
+  `Router.batch_get_with_file_refs`) answered `nil`, as for a missing key, when
+  a value's on-disk record failed validation where it lay (a corrupted
+  record). They now answer the storage read failure, as GET does; a record
+  moved by compaction is still followed to its new place.
+- FLOW.CLAIM_DUE and the batch Flow writes (COMPLETE_MANY, FAIL_MANY,
+  CANCEL_MANY, RETRY_MANY, TRANSITION_MANY and pipelined batches) went on
+  past a state record write apply refused, for instance over a corrupt type
+  catalog row: they wrote the entry's history and moved its indexes, so a
+  Flow after the refused one kept its old state record, and answered OK. At
+  feature level 5 the entry fails with the error, as the single-Flow commands
+  do; below it the older result is kept. Outside a WARaft apply (shards
+  without Raft) the write raised CaseClauseError instead; it now answers the
+  error.
+- A Flow closed by COMPLETE_MANY, FAIL_MANY, CANCEL_MANY, an independent
+  (pipelined) batch or a cross-shard terminal kept the indexed attribute names
+  it had, while FLOW.COMPLETE, FLOW.FAIL and FLOW.CANCEL index it under the
+  type's current policy. An indexed attribute such a batch merged into a Flow
+  created without attributes was not found by broad attribute search. At
+  feature level 5 batches index as the single-Flow commands do; below it the
+  older record is written.
+- SET NX and SET XX applied in the same Raft entry as an earlier write to the
+  key missed that write when its value was not cached (over the 64 KiB hot
+  cache, a blob or a cold write): NX wrote over it and XX skipped. Concurrent
+  clients' commands share an entry, so two `SET k <large value> NX` could both
+  succeed. At feature level 5 the staged write counts; below it the older
+  result is kept.
+- INCR, INCRBY, DECR and DECRBY inside MULTI stored a result outside the
+  64-bit range (9223372036854775807 + 1 answered 9223372036854775808). At
+  feature level 5 they answer "ERR increment or decrement would overflow" and
+  leave the value, as outside a transaction; below it the older write is kept.
+- MSET, MSETNX and compound batch writes (hash, set and sorted set members) on
+  a key whose FETCH_OR_COMPUTE lease the cluster clock and wall clock disagree
+  on raised in apply (stopping the shard, and again on
+  every replay of the entry); they now answer the drift error as other writes
+  do.
+- SRANDMEMBER and SPOP with arguments after the count answer Redis's
+  "ERR syntax error" instead of the arity error.
+- Native EXEC answered INCR, INCRBY, DECR and DECRBY inside MULTI with
+  `["ok", n]` instead of `n`; it now answers the integer, as Redis does.
+- RANDOMKEY with arguments (and other generic commands parsed with the wrong
+  argument count) answered "ERR unsupported generic command AST"; they now
+  answer Redis's "ERR wrong number of arguments for '<command>' command".
+- GEO argument errors use Redis's texts: GEOADD prints an invalid pair with
+  six decimals and answers "ERR syntax error" for XX with NX; GEOSEARCH
+  answers "ERR COUNT must be > 0" and "ERR radius cannot be negative". A zero
+  radius is still refused (Redis accepts it).
+- LPOS COUNT/MAXLEN and SINTERCARD LIMIT below zero answer Redis's
+  "ERR <option> can't be negative".
+- Answer Redis's texts "ERR decrement would overflow" (DECRBY of
+  -9223372036854775808, refused before reading the key; inside MULTI only at
+  feature level 5, since older releases apply it) and "ERR hash value is not a
+  float" (HINCRBYFLOAT on a non-float field).
+- Answer Redis's "NOGROUP No such key '<key>' or consumer group '<group>'
+  in XREADGROUP with GROUP option" from XREADGROUP without the group.
+- Answer Redis's errors for BITPOS with a bit other than 0 or 1 ("The bit
+  argument must be 1 or 0."), SETBIT and GETBIT with a bad offset or bit
+  ("bit offset is not an integer or out of range", "bit is not an integer
+  or out of range"; the native protocol answered an internal "unsupported
+  bitmap command AST"), and a SCAN, HSCAN, SSCAN or ZSCAN COUNT below 1
+  ("syntax error").
+- Support SET's IFEQ and IFNE options (Redis 8.4): set only when the
+  current value equals, or differs from, the given one (a missing key
+  counts as different), with NX, XX, GET and the expiry options. On the
+  instance an existing key changes through CAS against the value just read,
+  so concurrent writers see one outcome. Inside MULTI they are queued only
+  at cluster feature level 5.
+- Refuse EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT (and PERSIST of one with a
+  TTL) on a Bloom, Cuckoo, Count-Min or Top-K key on the durable Raft path
+  (the default instance): they rewrote its metadata as a plain string,
+  which deleted the structure's data and left a string behind. A
+  standalone instance kept the structure and still takes the expiry. They answer an error until the expiry can change in
+  place. A MULTI transaction below cluster feature level 5 keeps the old
+  behavior, as older replicas do. The embedded `FerricStore.expire/2` and
+  `FerricStore.persist/1` refuse too (they went through a store without the
+  level-5 write flag, as did the other embedded compound commands).
+- Keep a t-digest's TTL through TDIGEST.ADD, TDIGEST.RESET and TDIGEST.MERGE;
+  they rewrote it without one, so the key no longer expired.
+- Support `ZRANGE ... BYLEX` (with REV and LIMIT), as Redis does: it
+  answered "ERR ZRANGE BYLEX is not supported". It reads every member of
+  the set. Inside MULTI it is queued only at cluster feature level 5.
+- Answer no members for a negative LIMIT offset in ZRANGEBYSCORE,
+  ZREVRANGEBYSCORE and ZRANGE BYSCORE, as Redis does (it answered "syntax
+  error"), and Redis's "value is out of range, must be positive" for a
+  ZPOPMIN or ZPOPMAX count that is negative or no integer.
+- Keep a HyperLogLog's TTL through PFADD and PFMERGE, as Redis does; they
+  rewrote the sketch without it, so the key no longer expired. The state
+  machine applies them, so the TTL is kept once cluster feature level 5 is
+  active.
+- Answer Redis's errors for LPOP or RPOP with a negative count ("value is
+  out of range, must be positive", checked before the key's type) and
+  BLMPOP with a numkeys or COUNT below 1 ("numkeys should be greater than
+  0", "count should be greater than 0").
+- Answer nil from OBJECT ENCODING, FREQ, IDLETIME and REFCOUNT on a missing
+  key, as Redis does; they answered "ERR no such key".
+- Answer SET's "ERR invalid expire time in 'set' command" for EX 0, PX -1 or
+  EXAT 0, as Redis does; it answered "syntax error".
+- Support HSCAN's NOVALUES option (Redis 7.4), which answers the fields
+  without their values; it answered a syntax error.
+- Answer Redis's errors for an EXPIRE, PEXPIRE, EXPIREAT or PEXPIREAT time
+  that does not fit ("invalid expire time in 'expire' command"), SINTERCARD
+  0 ("numkeys should be greater than 0"), SPOP with a negative count ("value
+  is out of range, must be positive"; it answered an internal "unsupported
+  set command AST" over the native protocol) and SET NX XX ("syntax error").
+- Check the key's type before INCRBYFLOAT's increment, as Redis does: a bad
+  increment on a key of another type answers WRONGTYPE.
+- Support `ZADD ... INCR`, alone or with NX, XX, GT and LT, as Redis does:
+  it answers the new score, or nil when a condition refuses it. With a
+  condition it runs as one replicated entry at cluster feature level 5, and
+  inside MULTI it is queued only at that level. ZADD's option errors now use
+  Redis's texts ("GT, LT, and/or NX ...", "syntax error" for an odd count).
+- Read stream IDs as Redis does. In XADD, `5` means 5-0 (it took the next
+  sequence, as `5-*` does in Redis, which FerricStore refused) and `5-*`
+  takes the next sequence; XDEL matches `5` and `05-01` to 5-0 and 5-1 (it
+  matched only the exact text). `XADD key NOMKSTREAM ...` on a key of
+  another type answers WRONGTYPE instead of nil.
+- Measure GEO distances with Redis's Earth radius (6372797.560856 m, not
+  6371000 m), so GEODIST and GEOSEARCH's WITHDIST and radius agree with
+  Redis (Palermo to Catania was 47 m short). Distances keep four decimals
+  ("0.0000", not "0.0"), and GEOPOS and WITHCOORD answer coordinates at full
+  precision instead of rounded to four decimals (about 11 m). Inside MULTI,
+  GEOSEARCHSTORE keeps the old radius below cluster feature level 5.
+- Answer -1 from BITPOS on an existing empty string in every form, as Redis
+  does; `BITPOS key 0` answered 0, as for a missing key.
+- Look GETEX's key up before checking its expiry value, as Redis does: a
+  missing key answers nil and another type WRONGTYPE (`GETEX missing EX 0`
+  answered "invalid expire time"), and an expiry out of range answers "ERR
+  invalid expire time in 'getex' command". SETRANGE checks the key's type
+  before the resulting size, with Redis's "(proto-max-bulk-len)" text.
+- Answer Redis's argument errors from HTTL, HPTTL, HPERSIST, HEXPIRETIME and
+  HGETDEL, after the type check, and accept a lowercase `fields` in every
+  command path (the command handlers refused it).
+- Support HSETEX's Redis 8 form, `HSETEX key [FNX|FXX] [EX|PX|EXAT|PXAT|
+  KEEPTTL] FIELDS n field value...`, next to FerricStore's own
+  `HSETEX key seconds field value...`. At cluster feature level 5 it reads,
+  decides and writes as one replicated entry, so concurrent FNX or FXX
+  writers see one outcome. HGETEX now takes its options in any order, deletes
+  the fields for a TTL of 0 or a past time (answering their values, as Redis
+  does; it refused 0), and answers Redis's argument errors after the type
+  check. Inside MULTI, HSETEX's Redis form and HGETEX with a TTL of 0 are
+  queued only at level 5.
+- Answer `BITPOS missing 0 start end BIT` with 0, as every other BITPOS form
+  of a missing key already did; it answered -1.
+- Round TTL and EXPIRETIME to the nearest second, and HTTL and HEXPIRETIME
+  up, as Redis does. They truncated, so `SET k v EX 10` followed by `TTL k`
+  answered 9 where Redis answers 10.
+- Support HEXPIRE and HPEXPIRE as Redis 8 does: NX, XX, GT and LT (anywhere
+  after the TTL), a TTL of 0 deleting the field (answering 2, and deleting
+  the hash once empty), repeated fields applied in order, WRONGTYPE before
+  argument errors, and Redis's error texts and latest expiry (70368744177663
+  ms, in 4199). A TTL of 0 answered an error and the conditions a syntax
+  error. Inside MULTI the new forms are queued only at cluster feature
+  level 5.
+- Stamp the dashboard's circuit open/close and approval decisions with the
+  store's clock. They used the wall clock, which the cluster's hybrid clock
+  can run ahead of, so closing a circuit or deciding an approval right after
+  it changed could be refused with "now_ms cannot precede updated_at_ms".
+- Answer `[]` from GEOSEARCH FROMMEMBER on a missing key, and empty
+  GEOSEARCHSTORE's destination (answering 0) for a missing source, as Redis
+  does; both answered "could not decode requested zset member". Inside MULTI
+  the GEOSEARCHSTORE change applies at cluster feature level 5.
+- Accept `PFMERGE dest` with no source, as Redis does (it creates an empty
+  sketch when dest is missing); it answered an arity error. Inside MULTI it
+  is queued only at cluster feature level 5. A string that is not a sketch
+  now answers Redis's "WRONGTYPE Key is not a valid HyperLogLog string
+  value." from PFADD, PFCOUNT and PFMERGE.
+- Delete BITOP's destination when the result is empty (every source missing
+  or empty), as Redis does; it stored an empty string, so `GET` answered ""
+  and `DEL` 1. Inside MULTI this applies at cluster feature level 5.
+- Remove a list that RPOPLPUSH, LMOVE or their blocking forms emptied. Its
+  type stayed behind, so `DEL key` answered 1, KEYS listed it, and a later
+  write of another type could be refused until TYPE or EXISTS cleared it.
+- Support `ZRANK` and `ZREVRANK` with `WITHSCORE` (Redis 7.2), which answer
+  the rank and the score; they answered an arity error. Inside MULTI they
+  are queued only at cluster feature level 5, new in this release
+  (`CLUSTER.FEATURES.RAISE 5` once every node runs it), as older releases do
+  not parse them.
+- Read XRANGE and XREVRANGE bounds as Redis does: `-` and `+` in either
+  position, `(` for an exclusive bound, and an end without a sequence
+  spanning its whole millisecond (`XRANGE key 1 1` includes `1-1`). These
+  answered "Invalid stream ID" or missed entries. `COUNT 0` answers nil for
+  a stream, and `XADD key 0-0` is refused before the key is looked at.
+- Report a bad score bound or option of ZRANGEBYSCORE, ZREVRANGEBYSCORE,
+  ZCOUNT and ZRANGE BYSCORE before a wrong key type, as Redis does ("ERR min
+  or max is not a float" rather than WRONGTYPE).
+- Answer an empty array for a ZRANGE or ZREVRANGE rank range whose negative
+  stop falls before the first member (`ZRANGE key -5 -4` on three members),
+  as Redis does; it answered the first member.
+- Check SMOVE's destination type whenever the source set exists: SMOVE of a
+  member the source lacks answered 0 even when the destination held a
+  string or hash, where Redis answers WRONGTYPE. A missing source still
+  answers 0.
+- Refuse `COPY key key` with Redis's "ERR source and destination objects are
+  the same", whether or not the key exists; it answered 0, or 1 and rewrote
+  the key with `REPLACE`.
+- Answer -1 from `BITPOS key 0 start` when the start lies past the value, as
+  Redis does; it answered the value's length in bits, as if the search had
+  run off the end. A search that starts inside the value without an end
+  still counts the value as padded with zeros.
+- Clamp a GETRANGE end that falls before the start of the value to its first
+  byte, as Redis does: `GETRANGE` of "hello" `0 -10` answers "h", not "".
+  Two negative indexes with the start after the end (`-10 -20`) answer "".
+- Answer `LPOP key 1` and `RPOP key 1` with a one-element array, as Redis
+  does for any count; they answered the element by itself. `LPOS` with
+  `COUNT` answers an empty array for a missing key instead of nil.
+- Accept ZRANGE's Redis 6.2 forms: `BYSCORE` (with `(` exclusive bounds and
+  `LIMIT offset count`), `REV` for ranks and scores, in any order with
+  `WITHSCORES`. They answered a syntax or arity error; only the rank form
+  worked. `LIMIT` without `BYSCORE` or `BYLEX` answers Redis's error. Inside
+  MULTI the BYSCORE and REV forms are refused (EXEC answers an error and
+  runs nothing); use ZRANGEBYSCORE or ZREVRANGE there.
+- Answer sorted set scores as Redis does: "1" instead of "1.0", "3.14"
+  instead of "3.14000000000000012", "1e+20" and "1.5e-7" for very large and
+  small ones. ZSCORE, ZMSCORE, ZINCRBY, ZPOPMIN, ZPOPMAX, ZSCAN and
+  WITHSCORES replies (also over the native protocol) disagreed with each
+  other and with Redis. Stored scores are unchanged.
+
 ## 0.12.7 - 2026-10-21
 
 - Stop syncing a large collection's file on every write. A hash, set or

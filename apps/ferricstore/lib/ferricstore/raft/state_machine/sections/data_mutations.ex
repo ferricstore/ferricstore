@@ -266,7 +266,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
                 )
 
               :error ->
-                {:error, "ERR hash value is not a valid float"}
+                {:error, "ERR hash value is not a float"}
             end
         end
       end
@@ -295,7 +295,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             {:error, "ERR increment would produce NaN or Infinity"}
 
           :error ->
-            {:error, "ERR hash value is not a valid float"}
+            {:error, "ERR hash value is not a float"}
         end
       end
 
@@ -501,9 +501,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         {:error, {:state_read_failed, reason}}
       end
 
-      defp format_zset_score(score) when is_float(score) do
-        :erlang.float_to_binary(score, [:compact, decimals: 17])
-      end
+      # The reply only: popped members leave nothing stored.
+      defp format_zset_score(score) when is_float(score),
+        do: Ferricstore.Store.ValueCodec.format_double(score)
 
       defp sm_store_compound_get_meta(state, redis_key, compound_key) do
         result =
@@ -1147,7 +1147,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # is refused below the level on every release that knows it.
       defp do_compound_command(state, redis_key, ast) do
         with {:ok, handler} <- compound_command_handler(redis_key, ast),
-             :ok <- require_feature_level_4(state),
+             :ok <- require_compound_command_level(state, ast),
              :ok <- check_fetch_or_compute_lock(state, redis_key, nil) do
           run_compound_command(handler, ast, compound_command_store(state))
         end
@@ -1271,12 +1271,37 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
            when is_binary(key) and is_list(flags) and flags != [] and is_list(pairs),
            do: {:ok, Ferricstore.Commands.Geo}
 
+      defp compound_command_handler(key, {:hsetex, key, {condition, _expiry}, pairs})
+           when is_binary(key) and condition in [nil, :fnx, :fxx] and is_list(pairs) and
+                  pairs != [],
+           do: binaries_handler(pairs, Ferricstore.Commands.Hash)
+
       defp compound_command_handler(_key, _ast), do: {:error, "ERR invalid compound command"}
 
       defp binaries_handler(values, handler) do
         if Enum.all?(values, &is_binary/1),
           do: {:ok, handler},
           else: {:error, "ERR invalid compound command"}
+      end
+
+      # HSETEX and ZADD INCR joined the entry at level 5; releases before it
+      # refuse them.
+      defp require_compound_command_level(state, {:hsetex, _key, _options, _pairs}),
+        do: require_feature_level_5(state)
+
+      defp require_compound_command_level(state, {:zadd, _key, opts, _pairs})
+           when is_list(opts) do
+        if :incr in opts,
+          do: require_feature_level_5(state),
+          else: require_feature_level_4(state)
+      end
+
+      defp require_compound_command_level(state, _ast), do: require_feature_level_4(state)
+
+      defp require_feature_level_5(state) do
+        if feature_level_5?(state),
+          do: :ok,
+          else: {:error, "ERR this command requires cluster feature level 5"}
       end
 
       defp require_feature_level_4(state) do
@@ -1288,6 +1313,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       defp feature_level_4?(state),
         do:
           do_get(state, Ferricstore.Cluster.FeatureLevel.key(4)) ==
+            Ferricstore.Cluster.FeatureLevel.marker()
+
+      defp feature_level_5?(state),
+        do:
+          do_get(state, Ferricstore.Cluster.FeatureLevel.key(5)) ==
             Ferricstore.Cluster.FeatureLevel.marker()
 
       # Feature level 4 also stores INCRBYFLOAT and HINCRBYFLOAT results as

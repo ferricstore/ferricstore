@@ -61,7 +61,7 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zpopmin do
             compound_count: fn "zs", _prefix -> 1 end
           }
 
-          assert ["a", "1.0", "b", "2.0"] == SortedSet.handle("ZPOPMIN", ["zs", "2"], store)
+          assert ["a", "1", "b", "2"] == SortedSet.handle("ZPOPMIN", ["zs", "2"], store)
           assert_received {:compound_batch_delete, ^member_keys}
           refute_received {:compound_batch_delete, _}
         end
@@ -81,7 +81,7 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zpopmin do
               flunk("ZPOPMIN should not scan the full zset when rank index exists")
             end)
 
-          assert ["a", "1.0", "b", "2.0"] == SortedSet.handle("ZPOPMIN", ["zs", "2"], store)
+          assert ["a", "1", "b", "2"] == SortedSet.handle("ZPOPMIN", ["zs", "2"], store)
           assert_receive {:zset_rank_range, "zs", 0, 1, false}
         end
 
@@ -108,7 +108,7 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zpopmin do
             end)
 
           assert {:error, :disk_full} == SortedSet.handle("ZPOPMIN", ["zs"], store)
-          assert "1.0" == SortedSet.handle("ZSCORE", ["zs", "only"], base)
+          assert "1" == SortedSet.handle("ZSCORE", ["zs", "only"], base)
         end
       end
 
@@ -156,7 +156,7 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zpopmin do
             compound_count: fn "zs", _prefix -> 1 end
           }
 
-          assert ["c", "3.0", "b", "2.0"] == SortedSet.handle("ZPOPMAX", ["zs", "2"], store)
+          assert ["c", "3", "b", "2"] == SortedSet.handle("ZPOPMAX", ["zs", "2"], store)
           assert_received {:compound_batch_delete, ^member_keys}
           refute_received {:compound_batch_delete, _}
         end
@@ -176,7 +176,7 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zpopmin do
               flunk("ZPOPMAX should not scan the full zset when rank index exists")
             end)
 
-          assert ["c", "3.0", "b", "2.0"] == SortedSet.handle("ZPOPMAX", ["zs", "2"], store)
+          assert ["c", "3", "b", "2"] == SortedSet.handle("ZPOPMAX", ["zs", "2"], store)
           assert_receive {:zset_rank_range, "zs", 0, 1, true}
         end
       end
@@ -194,9 +194,9 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zpopmin do
           # Elements is flat [member, score, member, score, ...]
           assert length(elements) == 6
           pairs = elements |> Enum.chunk_every(2) |> Map.new(fn [m, s] -> {m, s} end)
-          assert pairs["a"] == "1.0"
-          assert pairs["b"] == "2.0"
-          assert pairs["c"] == "3.0"
+          assert pairs["a"] == "1"
+          assert pairs["b"] == "2"
+          assert pairs["c"] == "3"
         end
 
         test "ZSCAN with COUNT limits batch size" do
@@ -222,7 +222,7 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zpopmin do
           expected =
             for i <- 1..12,
                 into: %{},
-                do: {"m#{String.pad_leading(Integer.to_string(i), 2, "0")}", "#{i}.0"}
+                do: {"m#{String.pad_leading(Integer.to_string(i), 2, "0")}", "#{i}"}
 
           for {m, s} <- expected do
             SortedSet.handle("ZADD", ["zs", s, m], store)
@@ -409,7 +409,7 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zpopmin do
           store = MockStore.make()
           SortedSet.handle("ZADD", ["zs", "1.0", "a", "3.0", "c"], store)
           result = SortedSet.handle("ZMSCORE", ["zs", "a", "b", "c"], store)
-          assert result == ["1.0", nil, "3.0"]
+          assert result == ["1", nil, "3"]
         end
 
         test "ZMSCORE uses compound_batch_get when the store provides it" do
@@ -434,7 +434,7 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zpopmin do
             compound_batch_get: fn "zs", ^member_keys -> ["1.0", nil, "3.0"] end
           }
 
-          assert ["1.0", nil, "3.0"] ==
+          assert ["1", nil, "3"] ==
                    SortedSet.handle("ZMSCORE", ["zs", "a", "missing", "c"], store)
         end
 
@@ -448,7 +448,7 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zpopmin do
           store = MockStore.make()
           SortedSet.handle("ZADD", ["zs", "5.0", "only"], store)
           result = SortedSet.handle("ZMSCORE", ["zs", "only"], store)
-          assert result == ["5.0"]
+          assert result == ["5"]
         end
 
         test "ZMSCORE with wrong number of arguments returns error" do
@@ -663,7 +663,7 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zpopmin do
         test "ZADD with negative score" do
           store = MockStore.make()
           assert 1 == SortedSet.handle("ZADD", ["zs", "-5.0", "a"], store)
-          assert "-5.0" == SortedSet.handle("ZSCORE", ["zs", "a"], store)
+          assert "-5" == SortedSet.handle("ZSCORE", ["zs", "a"], store)
         end
 
         test "ZADD with zero score" do
@@ -759,26 +759,26 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zpopmin do
           store = MockStore.make()
           SortedSet.handle("ZADD", ["zs", "1.0", "a"], store)
           assert {:error, msg} = SortedSet.handle("ZPOPMIN", ["zs", "-1"], store)
-          assert msg =~ "not an integer"
+          assert msg == "ERR value is out of range, must be positive"
         end
 
         test "ZPOPMAX with negative count returns error" do
           store = MockStore.make()
           SortedSet.handle("ZADD", ["zs", "1.0", "a"], store)
           assert {:error, msg} = SortedSet.handle("ZPOPMAX", ["zs", "-1"], store)
-          assert msg =~ "not an integer"
+          assert msg == "ERR value is out of range, must be positive"
         end
 
         test "ZPOPMIN with non-integer count returns error" do
           store = MockStore.make()
           assert {:error, msg} = SortedSet.handle("ZPOPMIN", ["zs", "abc"], store)
-          assert msg =~ "not an integer"
+          assert msg == "ERR value is out of range, must be positive"
         end
 
         test "ZPOPMAX with non-integer count returns error" do
           store = MockStore.make()
           assert {:error, msg} = SortedSet.handle("ZPOPMAX", ["zs", "abc"], store)
-          assert msg =~ "not an integer"
+          assert msg == "ERR value is out of range, must be positive"
         end
       end
 

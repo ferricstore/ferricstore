@@ -360,10 +360,10 @@ defmodule Ferricstore.Commands.RedisCompatTest do
       assert "embstr" = Generic.handle("OBJECT", ["ENCODING", "k"], store)
     end
 
-    test "OBJECT ENCODING on missing key returns error" do
+    test "OBJECT ENCODING on missing key answers nil, as in Redis" do
       store = MockStore.make()
       result = Generic.handle("OBJECT", ["ENCODING", "nosuchkey"], store)
-      assert {:error, "ERR no such key"} = result
+      assert nil == result
     end
 
     test "OBJECT HELP returns list" do

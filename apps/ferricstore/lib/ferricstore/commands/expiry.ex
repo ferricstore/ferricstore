@@ -3,7 +3,9 @@ defmodule Ferricstore.Commands.Expiry do
   alias Ferricstore.Commands.CompoundSnapshot
   alias Ferricstore.Commands.ExpiryTime
   alias Ferricstore.Store.CompoundKey
-  alias Ferricstore.Store.{Ops, ReadResult}
+  alias Ferricstore.Store.{Ops, ReadResult, TypeRegistry}
+
+  @probabilistic_types ["bloom", "cms", "cuckoo", "topk"]
 
   @moduledoc """
   Handles Redis expiry commands: EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT, TTL, PTTL, PERSIST.
@@ -146,75 +148,87 @@ defmodule Ferricstore.Commands.Expiry do
   # Private — EXPIRE / PEXPIRE (relative)
   # ---------------------------------------------------------------------------
 
-  defp set_expiry_seconds(key, secs_str, flag, store) do
-    with {:ok, secs} <- ExpiryTime.parse_integer(secs_str),
-         {:ok, expire_at_ms} <- ExpiryTime.relative(secs, 1_000) do
-      apply_expiry(key, expire_at_ms, flag, store)
-    else
-      _invalid -> integer_range_error()
-    end
-  end
+  defp set_expiry_seconds(key, secs_str, flag, store),
+    do: with_integer(secs_str, &set_expiry_seconds_parsed(key, &1, flag, store))
 
-  defp set_expiry_ms(key, ms_str, flag, store) do
-    with {:ok, ms} <- ExpiryTime.parse_integer(ms_str),
-         {:ok, expire_at_ms} <- ExpiryTime.relative(ms, 1) do
-      apply_expiry(key, expire_at_ms, flag, store)
-    else
-      _invalid -> integer_range_error()
-    end
-  end
+  defp set_expiry_ms(key, ms_str, flag, store),
+    do: with_integer(ms_str, &set_expiry_ms_parsed(key, &1, flag, store))
 
-  defp set_expiry_seconds_parsed(key, secs, flag, store) do
-    case ExpiryTime.relative(secs, 1_000) do
-      {:ok, expire_at_ms} -> apply_expiry(key, expire_at_ms, flag, store)
-      :error -> integer_range_error()
-    end
-  end
+  defp set_expiry_seconds_parsed(key, secs, flag, store),
+    do: apply_expiry_at(key, ExpiryTime.relative(secs, 1_000), "expire", flag, store)
 
-  defp set_expiry_ms_parsed(key, ms, flag, store) do
-    case ExpiryTime.relative(ms, 1) do
-      {:ok, expire_at_ms} -> apply_expiry(key, expire_at_ms, flag, store)
-      :error -> integer_range_error()
-    end
-  end
+  defp set_expiry_ms_parsed(key, ms, flag, store),
+    do: apply_expiry_at(key, ExpiryTime.relative(ms, 1), "pexpire", flag, store)
 
   # ---------------------------------------------------------------------------
   # Private — EXPIREAT / PEXPIREAT (absolute)
   # ---------------------------------------------------------------------------
 
-  defp set_expiry_at_seconds(key, ts_str, flag, store) do
-    with {:ok, ts} <- ExpiryTime.parse_integer(ts_str),
-         {:ok, expire_at_ms} <- ExpiryTime.absolute(ts, 1_000) do
-      apply_expiry(key, expire_at_ms, flag, store)
-    else
-      _invalid -> integer_range_error()
-    end
-  end
+  defp set_expiry_at_seconds(key, ts_str, flag, store),
+    do: with_integer(ts_str, &set_expiry_at_seconds_parsed(key, &1, flag, store))
 
-  defp set_expiry_at_ms(key, ts_str, flag, store) do
-    with {:ok, ts} <- ExpiryTime.parse_integer(ts_str),
-         {:ok, expire_at_ms} <- ExpiryTime.absolute(ts, 1) do
-      apply_expiry(key, expire_at_ms, flag, store)
-    else
-      _invalid -> integer_range_error()
-    end
-  end
+  defp set_expiry_at_ms(key, ts_str, flag, store),
+    do: with_integer(ts_str, &set_expiry_at_ms_parsed(key, &1, flag, store))
 
-  defp set_expiry_at_seconds_parsed(key, ts, flag, store) do
-    case ExpiryTime.absolute(ts, 1_000) do
-      {:ok, expire_at_ms} -> apply_expiry(key, expire_at_ms, flag, store)
+  defp set_expiry_at_seconds_parsed(key, ts, flag, store),
+    do: apply_expiry_at(key, ExpiryTime.absolute(ts, 1_000), "expireat", flag, store)
+
+  defp set_expiry_at_ms_parsed(key, ts, flag, store),
+    do: apply_expiry_at(key, ExpiryTime.absolute(ts, 1), "pexpireat", flag, store)
+
+  defp with_integer(raw, fun) do
+    case ExpiryTime.parse_integer(raw) do
+      {:ok, value} -> fun.(value)
       :error -> integer_range_error()
     end
   end
 
-  defp set_expiry_at_ms_parsed(key, ts, flag, store) do
-    case ExpiryTime.absolute(ts, 1) do
-      {:ok, expire_at_ms} -> apply_expiry(key, expire_at_ms, flag, store)
-      :error -> integer_range_error()
-    end
-  end
+  # A time that does not fit answers Redis's "invalid expire time" error.
+  defp apply_expiry_at(key, {:ok, expire_at_ms}, _command, flag, store),
+    do: apply_expiry(key, expire_at_ms, flag, store)
+
+  defp apply_expiry_at(_key, :error, command, _flag, _store),
+    do: {:error, "ERR invalid expire time in '#{command}' command"}
 
   defp integer_range_error, do: {:error, "ERR value is not an integer or out of range"}
+
+  defp durable_raft_store?(%FerricStore.Instance{} = ctx),
+    do: Ferricstore.Store.Router.durable_raft?(ctx)
+
+  defp durable_raft_store?(_store), do: true
+
+  defp rewrite_plain(key, value, expire_at_ms, store) do
+    with :ok <- refuse_probabilistic(key, store) do
+      case Ops.put(store, key, value, expire_at_ms) do
+        :ok -> 1
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  # A Bloom, Cuckoo, Count-Min or Top-K key holds the structure's metadata;
+  # on the durable Raft path, rewriting it as a string with a new expiry
+  # deleted the structure. Until the expiry can change in place there, refuse
+  # wherever writes may differ from older releases (the instance, and MULTI
+  # at cluster feature level 5); a transaction below that level writes as
+  # older releases do. A standalone instance keeps the structure, so it
+  # still takes the expiry.
+  defp refuse_probabilistic(key, store) do
+    if Ops.level_5_writes?(store) and durable_raft_store?(store) do
+      case TypeRegistry.get_type(key, store) do
+        type when type in @probabilistic_types ->
+          {:error, "ERR expiry is not supported on #{type} keys"}
+
+        {:error, {:storage_read_failed, _reason}} = failure ->
+          ReadResult.command_error(failure)
+
+        _type ->
+          :ok
+      end
+    else
+      :ok
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # Private — apply expiry to existing key
@@ -265,10 +279,7 @@ defmodule Ferricstore.Commands.Expiry do
         0
 
       {:plain, value, _old_exp} ->
-        case Ops.put(store, key, value, expire_at_ms) do
-          :ok -> 1
-          {:error, _} = error -> error
-        end
+        rewrite_plain(key, value, expire_at_ms, store)
 
       {:compound, type, _old_exp} ->
         case expire_compound_key(key, type, expire_at_ms, store) do
@@ -351,7 +362,8 @@ defmodule Ferricstore.Commands.Expiry do
       {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
       nil -> -2
       0 -> -1
-      exp -> max(0, div(exp - CommandTime.now_ms(), 1_000))
+      # Rounded to the nearest second, as Redis does.
+      exp -> div(max(0, exp - CommandTime.now_ms()) + 500, 1_000)
     end
   end
 
@@ -396,10 +408,7 @@ defmodule Ferricstore.Commands.Expiry do
         0
 
       {:plain, value, _exp} ->
-        case Ops.put(store, key, value, 0) do
-          :ok -> 1
-          {:error, _} = error -> error
-        end
+        rewrite_plain(key, value, 0, store)
 
       {:compound, type, _exp} ->
         case expire_compound_key(key, type, 0, store) do

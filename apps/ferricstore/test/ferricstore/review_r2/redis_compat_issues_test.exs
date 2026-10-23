@@ -35,7 +35,7 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
   #
   # Redis rejects these mutually exclusive flag combinations with:
   #   ERR XX and NX options at the same time are not compatible
-  #   ERR GT, LT, and NX options at the same time are not compatible
+  #   ERR GT, LT, and/or NX options at the same time are not compatible
   #
   # Currently FerricStore silently accepts them and applies both flags,
   # leading to undefined/wrong behavior.
@@ -60,7 +60,7 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
 
       result = SortedSet.handle("ZADD", [key, "GT", "LT", "1.0", "member"], store)
 
-      # Redis: {:error, "ERR GT, LT, and NX options at the same time are not compatible"}
+      # Redis: {:error, "ERR GT, LT, and/or NX options at the same time are not compatible"}
       # BUG: Currently returns 0 or 1 (silently applies both flags)
       assert {:error, _msg} = result,
              "R2-H5: ZADD GT LT should be rejected, got: #{inspect(result)}"
@@ -72,7 +72,7 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
 
       result = SortedSet.handle("ZADD", [key, "GT", "NX", "1.0", "member"], store)
 
-      # Redis: {:error, "ERR GT, LT, and NX options at the same time are not compatible"}
+      # Redis: {:error, "ERR GT, LT, and/or NX options at the same time are not compatible"}
       # BUG: Currently returns 0 or 1 (silently applies both flags)
       assert {:error, _msg} = result,
              "R2-H5: ZADD GT NX should be rejected, got: #{inspect(result)}"
@@ -84,7 +84,7 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
 
       result = SortedSet.handle("ZADD", [key, "LT", "NX", "1.0", "member"], store)
 
-      # Redis: {:error, "ERR GT, LT, and NX options at the same time are not compatible"}
+      # Redis: {:error, "ERR GT, LT, and/or NX options at the same time are not compatible"}
       # BUG: Currently returns 0 or 1
       assert {:error, _msg} = result,
              "R2-H5: ZADD LT NX should be rejected, got: #{inspect(result)}"

@@ -47,6 +47,20 @@ defmodule Ferricstore.Commands.SortedSet.Reads do
     end
   end
 
+  # ZRANK/ZREVRANK ... WITHSCORE (Redis 7.2): the rank and the score.
+  def zrank_member_with_score(key, member, reverse?, store) do
+    case zrank_member(key, member, reverse?, store) do
+      rank when is_integer(rank) ->
+        case zscore_member(key, member, store) do
+          score when is_binary(score) -> [rank, score]
+          other -> other
+        end
+
+      other ->
+        other
+    end
+  end
+
   def zcard_key(key, store) do
     with :ok <- TypeRegistry.command_check_type(key, :zset, store) do
       zset_member_count(key, store)

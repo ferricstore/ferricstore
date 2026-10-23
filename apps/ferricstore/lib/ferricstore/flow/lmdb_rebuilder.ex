@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   @moduledoc false
 
   alias Ferricstore.Flow
+  alias Ferricstore.Flow.HistoryEvent
   alias Ferricstore.Flow.KeydirSpill
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.LMDBFlushCoordinator
@@ -172,7 +173,13 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
            {:ok, stats} <-
              reduce_state_entries(
                keydir,
-               initial_reconcile_stats(lmdb_path, keydir, shard_path),
+               initial_reconcile_stats(
+                 lmdb_path,
+                 keydir,
+                 shard_path,
+                 shard_index,
+                 instance_ctx
+               ),
                fn entries, acc ->
                  reconcile_batch(
                    entries,
@@ -1124,9 +1131,15 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   defp increment_projection_read_errors({ops, prunes, active, projected, read_errors}),
     do: {ops, prunes, active, projected, read_errors + 1}
 
-  defp initial_reconcile_stats(lmdb_path, keydir, shard_path) do
+  defp initial_reconcile_stats(lmdb_path, keydir, shard_path, shard_index, instance_ctx) do
     {cleanup_op_count, scan_errors} =
-      case cleanup_stale_terminal_reverse(lmdb_path, keydir, shard_path) do
+      case cleanup_stale_terminal_reverse(
+             lmdb_path,
+             keydir,
+             shard_path,
+             shard_index,
+             instance_ctx
+           ) do
         {:ok, cleanup_op_count} -> {cleanup_op_count, 0}
         {:error, _reason} -> {0, 1}
       end
@@ -1163,9 +1176,11 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   defp reconcile_policy_mirrors(_lmdb_path, _keydir, _shard_path, _shard_index, _instance_ctx),
     do: {:ok, 0}
 
-  defp cleanup_stale_terminal_reverse(lmdb_path, keydir, shard_path) do
+  # A cold source may sit in a WARaft segment, which only the shard's
+  # instance context can read.
+  defp cleanup_stale_terminal_reverse(lmdb_path, keydir, shard_path, shard_index, instance_ctx) do
     TerminalProjection.cleanup_stale_terminal_reverse(lmdb_path, keydir, fn entry ->
-      ColdState.read_and_decode([entry], shard_path)
+      ColdState.read_and_decode([entry], shard_path, shard_index, instance_ctx)
     end)
   end
 
@@ -1368,9 +1383,10 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
          event_ms,
          compound_key
        ) do
+    # Ordered by millisecond, then version (HistoryEvent.sort_key/1).
     :ets.insert(
       history_events,
-      {{history_key, event_ms, event_id, compound_key}}
+      {{history_key, event_ms, HistoryEvent.version(event_id), event_id, compound_key}}
     )
 
     :ets.update_counter(history_keys, history_key, {2, 1}, {history_key, 0})
@@ -1510,7 +1526,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   end
 
   defp first_staged_history_event(history_events, history_key),
-    do: :ets.next(history_events, {history_key, -1, <<>>, <<>>})
+    do: :ets.next(history_events, {history_key, -1, -1, <<>>, <<>>})
 
   defp stream_staged_history_projection(
          :"$end_of_table",
@@ -1525,7 +1541,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
        do: flush_staged_history_projection_ops(lmdb_path, reversed_ops)
 
   defp stream_staged_history_projection(
-         {history_key, _event_ms, _event_id, _compound_key} = staged_key,
+         {history_key, _event_ms, _version, _event_id, _compound_key} = staged_key,
          history_events,
          history_key,
          skip_count,
@@ -1549,7 +1565,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   end
 
   defp stream_staged_history_projection(
-         {history_key, event_ms, event_id, compound_key} = staged_key,
+         {history_key, event_ms, _version, event_id, compound_key} = staged_key,
          history_events,
          history_key,
          0,
@@ -1760,7 +1776,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
        do: Enum.reverse(acc)
 
   defp collect_staged_history_entries(
-         {history_key, _event_ms, _event_id, _compound_key} = staged_key,
+         {history_key, _event_ms, _version, _event_id, _compound_key} = staged_key,
          history_events,
          history_key,
          skip_count,
@@ -1777,7 +1793,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   end
 
   defp collect_staged_history_entries(
-         {history_key, event_ms, event_id, compound_key} = staged_key,
+         {history_key, event_ms, _version, event_id, compound_key} = staged_key,
          history_events,
          history_key,
          0,

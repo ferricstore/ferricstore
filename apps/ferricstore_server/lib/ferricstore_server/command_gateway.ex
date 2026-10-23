@@ -364,6 +364,7 @@ defmodule FerricstoreServer.CommandGateway do
          true <- FerricStore.ResourceLimits.default_implementation?(),
          true <- valid_batch_keys?(keys),
          true <- homogeneous_batch_order_safe?(command, state.instance_ctx, keys),
+         true <- homogeneous_batch_notifications_safe?(command),
          :ok <- authorize_homogeneous_batch(state.acl_cache, command, keys),
          false <- deadline_expired?(deadline_ms) do
       execute_homogeneous_kv_batch(command, items, keys, state)
@@ -380,7 +381,7 @@ defmodule FerricstoreServer.CommandGateway do
         results =
           state.instance_ctx
           |> StringRead.batch_results(keys, values)
-          |> Enum.map(&gateway_result/1)
+          |> Enum.map(&gateway_result(&1, state.instance_ctx))
 
         {:ok, results}
 
@@ -393,7 +394,7 @@ defmodule FerricstoreServer.CommandGateway do
     results =
       state.instance_ctx
       |> Router.batch_quorum_put(pairs)
-      |> Enum.map(&gateway_result/1)
+      |> Enum.map(&gateway_result(&1, state.instance_ctx))
 
     {:ok, results}
   end
@@ -458,6 +459,13 @@ defmodule FerricstoreServer.CommandGateway do
 
   defp homogeneous_batch_order_safe?(_command, _ctx, _keys), do: false
 
+  # The batched put skips the dispatcher's keyspace notifications, as the
+  # native pipeline fast paths do; keep them when notifications are on.
+  defp homogeneous_batch_notifications_safe?("SET"),
+    do: not Ferricstore.KeyspaceNotifications.enabled?()
+
+  defp homogeneous_batch_notifications_safe?(_command), do: true
+
   defp authorize_homogeneous_batch(acl_cache, command, keys) do
     with :ok <- ConnectionAuth.check_command_cached(acl_cache, command),
          :ok <- ConnectionAuth.check_keys_cached(acl_cache, command, keys) do
@@ -472,19 +480,22 @@ defmodule FerricstoreServer.CommandGateway do
     end
   end
 
-  defp gateway_result(:ok), do: %{status: :ok, value: "OK"}
-  defp gateway_result({:ok, :ok}), do: %{status: :ok, value: "OK"}
-  defp gateway_result({:ok, value}), do: %{status: :ok, value: value}
+  defp gateway_result(:ok, _ctx), do: %{status: :ok, value: "OK"}
+  defp gateway_result({:ok, :ok}, _ctx), do: %{status: :ok, value: "OK"}
+  defp gateway_result({:ok, value}, _ctx), do: %{status: :ok, value: value}
 
-  defp gateway_result({:error, reason}) when is_binary(reason) do
+  defp gateway_result({:error, reason}, _ctx) when is_binary(reason) do
     status = if String.starts_with?(reason, ["BUSY", "OOM"]), do: :busy, else: :error
     %{status: status, value: reason}
   end
 
-  defp gateway_result({:error, reason}),
-    do: %{status: :error, value: inspect(reason)}
+  defp gateway_result({:error, reason}, ctx),
+    do: %{
+      status: :error,
+      value: Ferricstore.ErrorReasons.client_message(reason, ctx) || inspect(reason)
+    }
 
-  defp gateway_result(value), do: %{status: :ok, value: value}
+  defp gateway_result(value, _ctx), do: %{status: :ok, value: value}
 
   defp add_deadline(payload, deadline_ms) do
     payload =

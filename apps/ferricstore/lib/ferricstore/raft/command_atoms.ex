@@ -28,7 +28,7 @@ defmodule Ferricstore.Raft.CommandAtoms do
       path when is_list(path) ->
         case :beam_lib.chunks(path, [:atoms]) do
           {:ok, {^module, [atoms: atoms]}} when is_list(atoms) ->
-            :ok
+            preload_literal_atoms!(module)
 
           {:error, _module, reason} ->
             raise "cannot read #{inspect(module)} atoms: #{inspect(reason)}"
@@ -39,6 +39,16 @@ defmodule Ferricstore.Raft.CommandAtoms do
 
       location ->
         raise "cannot locate #{inspect(module)} bytecode: #{inspect(location)}"
+    end
+  end
+
+  # The compiler keeps an atom used only inside a literal term (a list of
+  # accepted options, say) in the literal table, not the atom table. Loading
+  # the module creates those atoms too, as a release does at boot.
+  defp preload_literal_atoms!(module) do
+    case :code.ensure_loaded(module) do
+      {:module, ^module} -> :ok
+      {:error, reason} -> raise "cannot load #{inspect(module)} literals: #{inspect(reason)}"
     end
   end
 end

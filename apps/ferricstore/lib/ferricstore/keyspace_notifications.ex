@@ -135,6 +135,11 @@ defmodule Ferricstore.KeyspaceNotifications do
     "LTRIM" => "ltrim",
     "LREM" => "lrem",
     "LMOVE" => "lmove",
+    "RPOPLPUSH" => "lmove",
+    "BLMOVE" => "lmove",
+    "BLPOP" => "lpop",
+    "BRPOP" => "rpop",
+    "BLMPOP" => "lpop",
     "SADD" => "sadd",
     "SREM" => "srem",
     "SPOP" => "spop",
@@ -147,6 +152,11 @@ defmodule Ferricstore.KeyspaceNotifications do
     "HDEL" => "hdel",
     "HINCRBY" => "hincrby",
     "HINCRBYFLOAT" => "hincrbyfloat",
+    "HSETEX" => "hset",
+    "HGETDEL" => "hdel",
+    "HEXPIRE" => "hexpire",
+    "HPEXPIRE" => "hexpire",
+    "HPERSIST" => "hpersist",
     "ZADD" => "zadd",
     "ZREM" => "zrem",
     "ZINCRBY" => "zincrby",
@@ -167,7 +177,7 @@ defmodule Ferricstore.KeyspaceNotifications do
   @zero_result_noop ~w(SETNX MSETNX DEL UNLINK EXPIRE PEXPIRE EXPIREAT PEXPIREAT
     PERSIST RENAMENX COPY HSETNX HDEL LPUSHX RPUSHX SADD SREM SMOVE ZREM LREM PFADD
     XDEL XTRIM)
-  @nil_result_noop ~w(GETDEL LPOP RPOP SPOP SET)
+  @nil_result_noop ~w(GETDEL LPOP RPOP SPOP SET LMOVE RPOPLPUSH BLMOVE BLPOP BRPOP BLMPOP)
   @empty_list_result_noop ~w(LPOP RPOP SPOP ZPOPMIN ZPOPMAX)
 
   @doc "Whether `notify-keyspace-events` turns any notifications on."
@@ -233,7 +243,7 @@ defmodule Ferricstore.KeyspaceNotifications do
     do: notify_key(destination, event)
 
   defp notify_event(command, event, [source, destination | _rest], _result)
-       when command in ~w(RENAME RENAMENX LMOVE SMOVE) do
+       when command in ~w(RENAME RENAMENX LMOVE RPOPLPUSH BLMOVE SMOVE) do
     notify_key(source, event)
     notify_key(destination, event)
   end
@@ -244,6 +254,44 @@ defmodule Ferricstore.KeyspaceNotifications do
 
   defp notify_event("BITOP", event, [_operation, destination | _rest], _result),
     do: notify_key(destination, event)
+
+  # A blocking pop names the key it served in its reply.
+  defp notify_event(command, event, _args, [key, _popped]) when command in ~w(BLPOP BRPOP),
+    do: notify_key(key, event)
+
+  defp notify_event("BLMPOP", _event, args, [key, _popped]) do
+    case Ferricstore.Commands.Blocking.parse_blmpop_args(args) do
+      {:ok, _keys, :right, _count, _timeout_ms} -> notify_key(key, "rpop")
+      {:ok, _keys, :left, _count, _timeout_ms} -> notify_key(key, "lpop")
+      _invalid -> :ok
+    end
+  end
+
+  defp notify_event(command, _event, _args, _result) when command in ~w(BLPOP BRPOP BLMPOP),
+    do: :ok
+
+  # The field TTL commands answer one code per field: 1 when they changed
+  # its expiry, and for HEXPIRE 2 when a TTL of 0 deleted it.
+  defp notify_event(command, event, [key | _rest], codes)
+       when command in ~w(HEXPIRE HPEXPIRE) and is_list(codes) do
+    if 1 in codes, do: notify_key(key, event)
+    if 2 in codes, do: notify_key(key, "hdel")
+    :ok
+  end
+
+  defp notify_event("HPERSIST", event, [key | _rest], codes) when is_list(codes),
+    do: if(1 in codes, do: notify_key(key, event), else: :ok)
+
+  defp notify_event("HGETDEL", event, [key | _rest], values) when is_list(values),
+    do: if(Enum.any?(values, &(&1 != nil)), do: notify_key(key, event), else: :ok)
+
+  # Redis 8's HSETEX answers 0 when FNX or FXX refused the fields; the older
+  # `HSETEX key seconds field value` form counts new fields, like HSET.
+  defp notify_event("HSETEX", event, [key, option | _rest], result) do
+    if result == 0 and Ferricstore.Commands.Hash.Helpers.setex_option?(option),
+      do: :ok,
+      else: notify_key(key, event)
+  end
 
   defp notify_event(_command, event, [key | _rest], _result), do: notify_key(key, event)
   defp notify_event(_command, _event, _args, _result), do: :ok

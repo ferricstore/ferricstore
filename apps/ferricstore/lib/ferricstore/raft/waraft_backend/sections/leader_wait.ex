@@ -370,6 +370,8 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.LeaderWait do
             config.timeout_ms_max
           )
 
+        :ok = Application.put_env(@app, :raft_election_pre_vote, config.pre_vote)
+
         :ok =
           Application.put_env(
             @app,
@@ -518,7 +520,12 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.LeaderWait do
                 "#{inspect(timeout_max_source)} must be >= #{inspect(timeout_source)}, got: #{inspect(timeout_ms_max)} < #{inspect(timeout_ms)}"
         end
 
-        %{timeout_ms: timeout_ms, timeout_ms_max: timeout_ms_max}
+        # Pre-vote (Raft thesis 9.6): a node that lost contact asks whether it
+        # could win before it raises its term, so on its return it cannot unseat
+        # a leader the others still follow.
+        pre_vote = boolean_option(opts, :election_pre_vote, :waraft_election_pre_vote, false)
+
+        %{timeout_ms: timeout_ms, timeout_ms_max: timeout_ms_max, pre_vote: pre_vote}
       end
 
       defp throughput_options!(opts) do

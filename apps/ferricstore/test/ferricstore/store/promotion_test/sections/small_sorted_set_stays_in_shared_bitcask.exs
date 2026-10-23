@@ -166,7 +166,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
 
           pairs = Enum.chunk_every(result, 2)
           first_pair = hd(pairs)
-          assert first_pair == ["member_1", "1.0"]
+          assert first_pair == ["member_1", "1"]
         end
       end
 
@@ -183,7 +183,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
           assert_promoted(key)
 
           score = SortedSet.handle("ZSCORE", [key, "member_3"], store)
-          assert score == "3.0"
+          assert score == "3"
         end
 
         test "ZSCORE returns nil for missing member in promoted zset" do
@@ -417,7 +417,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
 
           assert_promoted(key)
           assert 2 == SortedSet.handle("ZCARD", [key], store)
-          assert "1.0" == SortedSet.handle("ZSCORE", [key, "member_1"], store)
+          assert "1" == SortedSet.handle("ZSCORE", [key, "member_1"], store)
         end
       end
 

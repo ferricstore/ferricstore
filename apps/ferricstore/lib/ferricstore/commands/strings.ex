@@ -162,7 +162,7 @@ defmodule Ferricstore.Commands.Strings do
   def handle("DECRBY", [key, delta_str], store) do
     case Integer.parse(delta_str) do
       {delta, ""} when delta >= @min_int64 and delta <= @max_int64 ->
-        incr_string_key(key, -delta, store)
+        decrby(key, delta, store)
 
       {_delta, ""} ->
         {:error, "ERR value is not an integer or out of range"}
@@ -185,7 +185,7 @@ defmodule Ferricstore.Commands.Strings do
         incr_string_key_float(key, delta, store)
 
       :error ->
-        {:error, "ERR value is not a valid float"}
+        float_arg_error(key, store)
     end
   end
 
@@ -324,7 +324,7 @@ defmodule Ferricstore.Commands.Strings do
         setrange_parsed(key, offset, value, store)
 
       {offset, ""} when offset > @max_setrange_offset ->
-        {:error, "ERR string exceeds maximum allowed size (512MB)"}
+        setrange_too_large(key, store)
 
       {_offset, ""} ->
         {:error, "ERR offset is out of range"}
@@ -375,8 +375,16 @@ defmodule Ferricstore.Commands.Strings do
 
   def handle_ast({:incrby, _key, {:error, reason}}, _store), do: {:error, reason}
   def handle_ast({:decrby, _key, {:error, reason}}, _store), do: {:error, reason}
-  def handle_ast({:incrbyfloat, _key, {:error, reason}}, _store), do: {:error, reason}
-  def handle_ast({:getex, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:incrbyfloat, key, {:error, _reason}}, store), do: float_arg_error(key, store)
+  def handle_ast({:getex, _key, {:error, "ERR syntax error"} = error}, _store), do: error
+
+  def handle_ast({:getex, key, {:error, _reason} = error}, store),
+    do: GetEx.after_lookup(key, error, store)
+
+  def handle_ast({:getex, key, {mode, {:error, _reason} = error}}, store)
+      when mode in [:ex, :px, :exat, :pxat],
+      do: GetEx.after_lookup(key, error, store)
+
   def handle_ast({:setex, _key, {:error, reason}, _value}, _store), do: {:error, reason}
   def handle_ast({:psetex, _key, {:error, reason}, _value}, _store), do: {:error, reason}
   def handle_ast({:getrange, _key, {:error, reason}, _stop}, _store), do: {:error, reason}
@@ -387,7 +395,7 @@ defmodule Ferricstore.Commands.Strings do
     do: incr_string_key(key, delta, store)
 
   def handle_ast({:decrby, key, delta}, store) when is_integer(delta),
-    do: incr_string_key(key, -delta, store)
+    do: decrby(key, delta, store)
 
   def handle_ast({:incrbyfloat, key, delta}, store) when is_float(delta),
     do: incr_string_key_float(key, delta, store)
@@ -415,9 +423,9 @@ defmodule Ferricstore.Commands.Strings do
   def handle_ast({:getex, key, {:pxat, ts}}, store) when is_integer(ts) and ts > 0,
     do: getex_with_expiry(key, ts, 1, :absolute, store)
 
-  def handle_ast({:getex, _key, {mode, value}}, _store)
+  def handle_ast({:getex, key, {mode, value}}, store)
       when mode in [:ex, :px, :exat, :pxat] and is_integer(value),
-      do: {:error, "ERR invalid expire time in 'getex' command"}
+      do: GetEx.after_lookup(key, {:error, "ERR invalid expire time in 'getex' command"}, store)
 
   def handle_ast({:setex, key, seconds, value}, store) when is_integer(seconds) do
     if seconds > 0 do
@@ -458,7 +466,7 @@ defmodule Ferricstore.Commands.Strings do
         setrange_parsed(key, offset, value, store)
 
       offset > @max_setrange_offset ->
-        {:error, "ERR string exceeds maximum allowed size (512MB)"}
+        setrange_too_large(key, store)
 
       true ->
         {:error, "ERR offset is out of range"}
@@ -681,10 +689,23 @@ defmodule Ferricstore.Commands.Strings do
 
   defp getex_with_expiry(key, value, multiplier, mode, store) do
     case expiry_time(value, multiplier, mode) do
-      {:ok, expire_at_ms} -> GetEx.getex_parsed(key, expire_at_ms, store)
-      :error -> integer_range_error()
+      {:ok, expire_at_ms} ->
+        GetEx.getex_parsed(key, expire_at_ms, store)
+
+      :error ->
+        GetEx.after_lookup(key, {:error, "ERR invalid expire time in 'getex' command"}, store)
     end
   end
+
+  # Redis refuses to negate the smallest integer before it reads the key.
+  # Older releases apply it inside MULTI, so the refusal waits for level 5.
+  defp decrby(key, @min_int64 = delta, store) do
+    if Ops.level_5_writes?(store),
+      do: {:error, "ERR decrement would overflow"},
+      else: incr_string_key(key, -delta, store)
+  end
+
+  defp decrby(key, delta, store), do: incr_string_key(key, -delta, store)
 
   defp incr_string_key(key, delta, store) do
     case ensure_string_key(key, store) do
@@ -692,6 +713,12 @@ defmodule Ferricstore.Commands.Strings do
       @wrongtype_error -> @wrongtype_error
       {:error, _reason} = error -> error
     end
+  end
+
+  # Unlike INCRBY, Redis's INCRBYFLOAT checks the key's type before the
+  # increment.
+  defp float_arg_error(key, store) do
+    with :ok <- ensure_string_key(key, store), do: {:error, "ERR value is not a valid float"}
   end
 
   defp incr_string_key_float(key, delta, store) do
@@ -765,6 +792,12 @@ defmodule Ferricstore.Commands.Strings do
 
   defp integer_range_error, do: {:error, "ERR value is not an integer or out of range"}
 
+  # Redis checks the key's type before the resulting size.
+  defp setrange_too_large(key, store) do
+    with :ok <- ensure_string_key(key, store),
+         do: {:error, "ERR string exceeds maximum allowed size (proto-max-bulk-len)"}
+  end
+
   defp setrange_parsed(key, offset, value, store) do
     case ensure_string_key(key, store) do
       :ok ->
@@ -782,9 +815,17 @@ defmodule Ferricstore.Commands.Strings do
   end
 
   defp do_set_parsed(key, value, parsed, store) do
+    compare = Map.get(parsed, :compare)
+
     case Compound.data_structure_status(key, store) do
       {:error, {:storage_read_failed, _reason}} = failure ->
         ReadResult.command_error(failure)
+
+      :compound when compare != nil ->
+        @wrongtype_error
+
+      :plain when compare != nil ->
+        set_compared(key, value, parsed, compare, store)
 
       :compound when parsed.get ->
         @wrongtype_error
@@ -802,6 +843,80 @@ defmodule Ferricstore.Commands.Strings do
         replace_string_key(key, value, parsed.expire_at_ms, store)
     end
   end
+
+  # SET ... IFEQ / IFNE (Redis 8.4): set only when the current value equals
+  # (or differs from) `expected`, with NX and XX applying too. The reply is
+  # OK or nil, or with GET the previous value.
+  defp set_compared(key, value, parsed, {kind, expected}, store) do
+    case Ops.get_meta(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      meta ->
+        current = if meta, do: elem(meta, 0)
+
+        if compare_allows?(kind, expected, current, parsed),
+          do: compared_reply(write_compared(key, value, parsed, meta, store), current, parsed),
+          else: compared_reply(:refused, current, parsed)
+    end
+  end
+
+  defp compare_allows?(kind, expected, current, parsed) do
+    cond do
+      parsed.nx and current != nil -> false
+      parsed.xx and current == nil -> false
+      kind == :eq -> current == expected
+      kind == :ne -> current != expected
+    end
+  end
+
+  defp compared_reply(:ok, current, %{get: true}), do: current
+  defp compared_reply(:ok, _current, _parsed), do: :ok
+  defp compared_reply({:error, _reason} = error, _current, _parsed), do: error
+  defp compared_reply(_refused, current, %{get: true}), do: current
+  defp compared_reply(_refused, _current, _parsed), do: nil
+
+  # A new key is set only if still missing (SET NX). On the instance an
+  # existing one changes through CAS against the value just read, so a
+  # concurrent write in between leaves it alone, as Redis's atomic compare
+  # would; every release applies the CAS entry alike. Elsewhere (a MULTI
+  # transaction, applied in order on every replica) the write is direct.
+  defp write_compared(key, value, parsed, nil, store) do
+    opts = %{parsed | nx: true, xx: false, get: false} |> Map.delete(:compare)
+
+    case Ops.set(store, key, value, opts) do
+      :ok -> :ok
+      {:error, _reason} = error -> error
+      _not_set -> :refused
+    end
+  end
+
+  defp write_compared(
+         key,
+         value,
+         parsed,
+         {current, old_expire_at_ms},
+         %FerricStore.Instance{} = ctx
+       ) do
+    case Ops.cas_at(ctx, key, current, value, compared_expire_at(parsed, old_expire_at_ms)) do
+      1 -> :ok
+      {:error, _reason} = error -> error
+      _changed -> :refused
+    end
+  end
+
+  defp write_compared(key, value, parsed, {_current, old_expire_at_ms}, store) do
+    case Ops.put(store, key, value, compared_expire_at(parsed, old_expire_at_ms)) do
+      :ok -> :ok
+      {:error, _reason} = error -> error
+      other -> {:error, {:unexpected_put_result, other}}
+    end
+  end
+
+  # As SET does: KEEPTTL keeps the expiry, EX/PX/EXAT/PXAT set one, and
+  # otherwise the key loses its TTL.
+  defp compared_expire_at(%{keepttl: true}, old_expire_at_ms), do: old_expire_at_ms
+  defp compared_expire_at(%{expire_at_ms: expire_at_ms}, _old), do: expire_at_ms || 0
 
   # ---------------------------------------------------------------------------
   # Private — MSET/MSETNX helpers (direct recursion, no chunked enumeration)

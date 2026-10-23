@@ -285,4 +285,5 @@ defmodule Ferricstore.Raft.StateMachine do
   use Ferricstore.Raft.StateMachine.Sections.DataMutations
   use Ferricstore.Raft.StateMachine.Sections.ReadWarm
   use Ferricstore.Raft.StateMachine.Sections.CompoundIndexes
+  use Ferricstore.Raft.StateMachine.Sections.WatchIndexApply
 end

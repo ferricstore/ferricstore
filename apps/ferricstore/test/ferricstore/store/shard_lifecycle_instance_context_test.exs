@@ -381,6 +381,29 @@ defmodule Ferricstore.Store.ShardLifecycleInstanceContextTest do
     end
   end
 
+  # Hint recovery leaves a type marker's value on disk; the logical key index
+  # reads back only live markers, so an expired one keeps a nil value.
+  test "sidecar validation passes an expired type marker whose value is still on disk" do
+    {shard_path, keydir} = prob_validation_fixture("expired_cold_marker")
+    expired_at = System.os_time(:millisecond) - 60_000
+    :ets.insert(keydir, {"T:gone", nil, expired_at, 0, 0, 0, 4})
+    sidecar = Path.join([shard_path, "prob", Ferricstore.ProbFile.filename("gone", "bloom")])
+    File.write!(sidecar, "stale")
+
+    assert :ok = ShardLifecycle.validate_prob_files(shard_path, 0, keydir)
+    refute File.exists?(sidecar)
+  end
+
+  test "sidecar validation keeps a live type marker's sidecar when the marker is not read back" do
+    {shard_path, keydir} = prob_validation_fixture("live_cold_marker")
+    :ets.insert(keydir, {"T:kept", nil, 0, 0, 0, 0, 5})
+    sidecar = Path.join([shard_path, "prob", Ferricstore.ProbFile.filename("kept", "bloom")])
+    File.write!(sidecar, "live")
+
+    assert :ok = ShardLifecycle.validate_prob_files(shard_path, 0, keydir)
+    assert File.exists?(sidecar)
+  end
+
   test "probabilistic sidecar validation fails closed when its directory cannot be listed" do
     tmp =
       Path.join(
@@ -632,6 +655,30 @@ defmodule Ferricstore.Store.ShardLifecycleInstanceContextTest do
 
     expected_shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
     assert_received {:startup_fsync_dir, ^expected_shard_path}
+  end
+
+  defp prob_validation_fixture(label) do
+    tmp =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lifecycle_prob_#{label}_#{System.unique_integer([:positive])}"
+      )
+
+    shard_path = Path.join(tmp, "shard_0")
+    File.mkdir_p!(Path.join(shard_path, "prob"))
+    keydir = :ets.new(:"lifecycle_prob_#{label}", [:set, :public])
+
+    on_exit(fn ->
+      try do
+        :ets.delete(keydir)
+      rescue
+        _ -> :ok
+      end
+
+      File.rm_rf!(tmp)
+    end)
+
+    {shard_path, keydir}
   end
 
   defp build_instance(opts \\ []) do

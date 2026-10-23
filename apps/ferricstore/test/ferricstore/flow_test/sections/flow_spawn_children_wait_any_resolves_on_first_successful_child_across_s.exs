@@ -467,6 +467,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstS
                    reclaim_expired: false
                  )
 
+        flush_history_projection(ctx)
         before_empty_claim = :counters.get(ctx.write_version, shard_index + 1)
 
         assert {:ok, []} =
@@ -532,6 +533,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstS
                    now_ms: 1_000
                  )
 
+        flush_history_projection(ctx)
         before_empty = versions.()
 
         opts = [
@@ -585,6 +587,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstS
           reclaim_expired: false
         ]
 
+        flush_history_projection(ctx)
         before_empty = for i <- 1..ctx.shard_count, do: :counters.get(ctx.write_version, i)
         assert {:ok, []} = FerricStore.flow_claim_due(type, Keyword.put(opts, :now_ms, 1_000))
 
@@ -688,6 +691,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstS
         ctx = FerricStore.Instance.get(:default)
         type = uid("flow-empty-claim-many")
         partitions = for idx <- 1..8, do: uid("tenant-empty-claim-many-#{idx}")
+        flush_history_projection(ctx)
 
         before_empty_claim =
           for shard_index <- 0..(ctx.shard_count - 1) do

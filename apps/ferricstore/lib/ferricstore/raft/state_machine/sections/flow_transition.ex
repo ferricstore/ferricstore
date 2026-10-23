@@ -1427,6 +1427,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
               record ->
                 case flow_prepare_fail_existing_record(record, attrs, lease_token, now_ms) do
                   {:ok, record, next} ->
+                    next = flow_refresh_batch_indexed_attributes(state, state, next)
+
                     {:cont,
                      {:ok, [{record, next, attrs} | acc],
                       has_values? or flow_attrs_have_record_values?(attrs),

@@ -343,8 +343,8 @@ defmodule Ferricstore.FlowGovernanceCatalogTest do
     assert {:ok, []} = FerricStore.flow_approval_list(scope: stale_scope)
     assert {:ok, []} = FerricStore.flow_approval_list(flow_id: stale_flow)
 
-    assert {:ok, "0.0"} = FerricStore.Impl.zscore(ctx, scope_catalog, approval_key)
-    assert {:ok, "0.0"} = FerricStore.Impl.zscore(ctx, flow_catalog, approval_key)
+    assert {:ok, "0"} = FerricStore.Impl.zscore(ctx, scope_catalog, approval_key)
+    assert {:ok, "0"} = FerricStore.Impl.zscore(ctx, flow_catalog, approval_key)
     assert {:ok, nil} = FerricStore.Impl.zscore(ctx, stale_scope_catalog, approval_key)
     assert {:ok, nil} = FerricStore.Impl.zscore(ctx, stale_flow_catalog, approval_key)
   end
@@ -400,7 +400,7 @@ defmodule Ferricstore.FlowGovernanceCatalogTest do
     assert {:ok, 1} = FerricStore.Impl.zcard(ctx, target_catalog)
 
     assert {:ok, [%{id: ^approval_id}]} = FerricStore.flow_approval_list(scope: scope)
-    assert {:ok, "0.0"} = FerricStore.Impl.zscore(ctx, target_catalog, approval_key)
+    assert {:ok, "0"} = FerricStore.Impl.zscore(ctx, target_catalog, approval_key)
     assert {:ok, 1} = FerricStore.Impl.zcard(ctx, target_catalog)
 
     repair_source =

@@ -323,13 +323,13 @@ defmodule Ferricstore.Commands.BitmapTest.Sections.BitopXor do
         test "BITPOS with invalid bit value returns error" do
           store = MockStore.make(%{"k" => {<<0xFF>>, 0}})
           assert {:error, msg} = Bitmap.handle("BITPOS", ["k", "2"], store)
-          assert msg =~ "bit is not an integer"
+          assert msg == "ERR The bit argument must be 1 or 0."
         end
 
         test "BITPOS with non-integer bit value returns error" do
           store = MockStore.make(%{"k" => {<<0xFF>>, 0}})
           assert {:error, msg} = Bitmap.handle("BITPOS", ["k", "abc"], store)
-          assert msg =~ "bit is not an integer"
+          assert msg == "ERR value is not an integer or out of range"
         end
 
         test "BITPOS with non-integer start returns error" do
@@ -459,13 +459,14 @@ defmodule Ferricstore.Commands.BitmapTest.Sections.BitopXor do
           assert 10 == Bitmap.handle("BITPOS", ["mykey", "1"], store)
         end
 
-        test "BITPOS 0 with start beyond string length returns length*8 (virtual zero)" do
-          # Redis compat: virtual bits past the string are all zeros
+        test "BITPOS 0 with start beyond string length returns -1" do
+          # Redis answers -1 for a range that holds no byte; the value counts
+          # as padded with zeros only when the search starts inside it.
           store = MockStore.make(%{"allones" => {<<0xFF, 0xFF>>, 0}})
 
-          # 2 bytes = 16 bits, all 1s. Searching for 0 starting at byte 5.
-          # Start is past the string, so the first virtual 0 is at bit 16.
-          assert 16 == Bitmap.handle("BITPOS", ["allones", "0", "5"], store)
+          assert -1 == Bitmap.handle("BITPOS", ["allones", "0", "5"], store)
+          assert -1 == Bitmap.handle("BITPOS", ["allones", "0", "2"], store)
+          assert 16 == Bitmap.handle("BITPOS", ["allones", "0", "1"], store)
         end
 
         test "BITPOS 0 with start beyond known cold size avoids loading value" do
@@ -477,7 +478,7 @@ defmodule Ferricstore.Commands.BitmapTest.Sections.BitopXor do
             end
           }
 
-          assert 16 == Bitmap.handle("BITPOS", ["cold", "0", "5"], store)
+          assert -1 == Bitmap.handle("BITPOS", ["cold", "0", "5"], store)
         end
 
         test "BITPOS 1 with start beyond string length returns -1" do

@@ -3,6 +3,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
 
   defmacro __using__(_opts) do
     quote do
+      require Logger
+
       alias Ferricstore.CommandTime
       alias Ferricstore.HLC
       alias Ferricstore.Flow.HistoryProjector
@@ -76,8 +78,17 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
       defp payload_fsync_reason({:error, reason}), do: reason
       defp payload_fsync_reason(other), do: other
 
+      # A blocked shard applies nothing more until it restarts, so the block is
+      # logged here, where it starts; the applies it refuses only emit telemetry.
       defp block_storage(handle, reason, attempted_position, operation) do
         emit_storage_blocked(handle, reason, attempted_position, operation)
+
+        Logger.error(
+          "WARaft storage for shard #{inspect(Map.get(handle, :shard_index))} is blocked " <>
+            "at #{inspect(attempted_position)} (#{operation}): #{inspect(reason)}; it applies " <>
+            "nothing more until it restarts"
+        )
+
         Map.put(handle, :blocked_error, reason)
       end
 
@@ -652,12 +663,17 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         {projection_command, promotion_keys} =
           prepare_segment_projection_command(decoded_command)
 
+        # The projection writes no WATCH index rows (see lifecycle).
         projection_result =
-          with_segment_projection_promotion_latches(sm_state, promotion_keys, fn ->
-            with_segment_projection_command_time(state_machine_command, fn ->
-              segment_project_command(projection_command, position, sm_state)
+          if StateMachine.watch_index_requires_apply?(decoded_command, sm_state) do
+            :unsupported
+          else
+            with_segment_projection_promotion_latches(sm_state, promotion_keys, fn ->
+              with_segment_projection_command_time(state_machine_command, fn ->
+                segment_project_command(projection_command, position, sm_state)
+              end)
             end)
-          end)
+          end
 
         case projection_result do
           {:ok, next_sm_state, _result, applied_increment} ->

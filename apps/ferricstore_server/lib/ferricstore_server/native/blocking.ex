@@ -49,6 +49,8 @@ defmodule FerricstoreServer.Native.Blocking do
                   {status, value} =
                     run_blocking(prepared.command, prepared.args, prepared.ast, ctx)
 
+                  notify_keyspace(prepared, status, value)
+
                   deliver_result(parent, meta, status, value, state)
                 end)
               after
@@ -122,6 +124,14 @@ defmodule FerricstoreServer.Native.Blocking do
       {:native_blocking_outbound_released, ^token} -> :ok
     end
   end
+
+  # The list pops here bypass the dispatcher, which fires these for other
+  # commands; stream reads already run through it.
+  defp notify_keyspace(%PreparedCommand{command: command, args: args}, :ok, value)
+       when command in ~w(BLPOP BRPOP BLMPOP BLMOVE),
+       do: Ferricstore.KeyspaceNotifications.after_command(command, args, value)
+
+  defp notify_keyspace(_prepared, _status, _value), do: :ok
 
   defp run_with_owner_guard(owner, fun) do
     worker = self()

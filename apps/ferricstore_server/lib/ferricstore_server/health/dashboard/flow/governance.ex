@@ -1,6 +1,7 @@
 defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
   @moduledoc false
 
+  alias Ferricstore.CommandTime
   alias Ferricstore.Flow.Query.Builder
   alias Ferricstore.Flow.Governance.CircuitStore
   alias FerricstoreServer.Health.QueryDecoder
@@ -182,7 +183,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
              {:ok, circuit} <-
                FerricStore.flow_circuit_open(scope,
                  expected_review: review,
-                 now_ms: System.system_time(:millisecond),
+                 # The store's clock: it can run ahead of the wall clock, and a
+                 # change stamped earlier than the record is refused.
+                 now_ms: CommandTime.now_ms(),
                  open_ms: open_ms,
                  failure_threshold: threshold
                ) do
@@ -197,7 +200,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
              {:ok, circuit} <-
                FerricStore.flow_circuit_close(scope,
                  expected_review: review,
-                 now_ms: System.system_time(:millisecond)
+                 now_ms: CommandTime.now_ms()
                ) do
           {:ok, "closed circuit #{Map.get(circuit, :scope, scope)}"}
         end
@@ -378,7 +381,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
          :ok <- validate_approval_confirmation(params),
          {:ok, approval} <- validate_expected_approval(id, params),
          decision_opts =
-           [approver: approver, now_ms: System.system_time(:millisecond)]
+           [approver: approver, now_ms: CommandTime.now_ms()]
            |> maybe_put_opt(:reason, normalize_text(Map.get(params, "decision_reason"))),
          result <- apply_approval_api(action, id, decision_opts) do
       case result do

@@ -20,7 +20,7 @@ defmodule Ferricstore.Commands.SortedSetPreparedValidationTest do
     store = MockStore.make()
     assert 1 == SortedSet.handle("ZADD", ["zset", "1", "member"], store)
 
-    assert {:error, "ERR value is not an integer or out of range"} =
+    assert {:error, "ERR value is out of range, must be positive"} =
              parse_and_dispatch("ZPOPMIN", ["zset", "-1"], store)
 
     assert 1 == SortedSet.handle("ZCARD", ["zset"], store)
@@ -31,10 +31,10 @@ defmodule Ferricstore.Commands.SortedSetPreparedValidationTest do
 
     assert 1 == parse_and_dispatch("ZADD", ["zset", "nx", "1", "member"], store)
 
-    assert ["member", "1.0"] ==
+    assert ["member", "1"] ==
              parse_and_dispatch("ZRANGE", ["zset", "0", "-1", "withscores"], store)
 
-    assert ["member", "1.0"] ==
+    assert ["member", "1"] ==
              parse_and_dispatch("ZRANDMEMBER", ["zset", "1", "withscores"], store)
   end
 

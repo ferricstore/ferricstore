@@ -621,15 +621,15 @@ defmodule Ferricstore.Commands.StringsTest do
     end
 
     test "SET with both NX and XX returns error (mutually exclusive flags)" do
-      # Redis rejects NX+XX regardless of key state
+      # Redis rejects NX+XX regardless of key state, with a syntax error
       store_empty = MockStore.make()
 
-      assert {:error, "ERR XX and NX options at the same time are not compatible"} =
+      assert {:error, "ERR syntax error"} =
                Strings.handle("SET", ["key", "val", "NX", "XX"], store_empty)
 
       store_present = MockStore.make(%{"key" => {"old", 0}})
 
-      assert {:error, "ERR XX and NX options at the same time are not compatible"} =
+      assert {:error, "ERR syntax error"} =
                Strings.handle("SET", ["key", "val", "NX", "XX"], store_present)
     end
 

@@ -58,6 +58,30 @@ defmodule Ferricstore.Flow.HistoryProjectorPendingTest do
     assert Pending.take_overflow(projector, 10) == {:ok, entries}
   end
 
+  # A writer that dies between staging and committing never finished its
+  # apply, which will run again and enqueue the same history; its staged row
+  # must not hold back the rows behind it for good.
+  test "a staged row whose writer died no longer holds back later overflow" do
+    projector = unique_projector()
+    parent = self()
+
+    {pid, monitor} =
+      spawn_monitor(fn ->
+        {:ok, _token} = Pending.append_overflow(projector, [%{entry("abandoned") | ra_index: 5}])
+        send(parent, :staged)
+      end)
+
+    assert_receive :staged
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}
+
+    later = [%{entry("later") | ra_index: 6}]
+    assert {:ok, _token} = append_ready(projector, later)
+
+    assert Pending.overflow_publish_limit(projector) == 5
+    assert Pending.take_overflow(projector, 10) == {:ok, later}
+    assert Pending.overflow_publish_limit(projector) == :infinity
+  end
+
   test "a tracked overflow append can be rolled back without touching later rows" do
     projector = unique_projector()
     first = [entry("rollback")]

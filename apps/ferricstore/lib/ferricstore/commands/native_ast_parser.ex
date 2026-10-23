@@ -10,6 +10,8 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   alias Ferricstore.Commands.{Catalog, CollectionScan, Extension}
   alias Ferricstore.Commands.Catalog.Entries
+  alias Ferricstore.Commands.Hash.Helpers, as: HashHelpers
+  alias Ferricstore.Commands.SortedSet.Helpers, as: SortedSetHelpers
   alias Ferricstore.Flow.Query.Limits
 
   @max_flow_ref_size 4096
@@ -513,34 +515,49 @@ defmodule Ferricstore.Commands.NativeAstParser do
     do: {:hrandfield, key, parse_int(count), parse_withvalues(withvalues)}
 
   defp make_ast(_cmd, :hscan, [key, cursor | opts]),
-    do: {:hscan, key, parse_scan_cursor(cursor), parse_collection_scan_opts(opts)}
+    do: {:hscan, key, parse_scan_cursor(cursor), parse_hscan_opts(opts)}
 
-  defp make_ast(_cmd, tag, [key, ttl, option, count | fields])
+  # Without a condition the form older releases parse; NX, XX, GT or LT adds
+  # one (cluster feature level 5 inside MULTI, as does a TTL of 0).
+  defp make_ast(_cmd, tag, [key, ttl | args])
        when tag in ~w(hexpire hpexpire)a do
-    if String.upcase(option) == "FIELDS" do
-      parse_hash_expire(tag, key, ttl, count, fields)
-    else
-      {tag, key, {:error, "ERR syntax error"}, []}
+    case HashHelpers.parse_field_expire(Atom.to_string(tag), ttl, args) do
+      {:ok, ttl, nil, fields} -> {tag, key, ttl, fields}
+      {:ok, ttl, condition, fields} -> {tag, key, ttl, condition, fields}
+      {:error, _reason} = error -> {tag, key, error, []}
     end
   end
 
-  defp make_ast(_cmd, tag, [key, option, count | fields])
+  defp make_ast(_cmd, tag, [key | args])
        when tag in ~w(httl hpttl hpersist hexpiretime hgetdel)a do
-    if String.upcase(option) == "FIELDS" do
-      parse_hash_field_list(tag, key, count, fields)
-    else
-      {tag, key, {:error, "ERR syntax error"}}
+    case HashHelpers.parse_field_list(args) do
+      {:ok, fields} -> {tag, key, fields}
+      {:error, _reason} = error -> {tag, key, error}
     end
   end
 
   defp make_ast(_cmd, :hgetex, [key | opts]), do: parse_hgetex(key, opts)
 
-  defp make_ast(_cmd, :hsetex, [key, seconds | field_value_pairs]),
-    do: {:hsetex, key, parse_pos_int(seconds), field_value_pairs}
+  # Redis 8's form parses to {condition, expiry} (cluster feature level 5
+  # inside MULTI); FerricStore's `HSETEX key seconds field value...` to the
+  # TTL older releases parse.
+  defp make_ast(_cmd, :hsetex, [key, option | args]) do
+    if HashHelpers.setex_option?(option) do
+      case HashHelpers.parse_setex([option | args]) do
+        {:ok, condition, expiry, pairs} -> {:hsetex, key, {condition, expiry}, pairs}
+        {:error, _reason} = error -> {:hsetex, key, error, []}
+      end
+    else
+      {:hsetex, key, parse_pos_int(option), args}
+    end
+  end
 
   defp make_ast(_cmd, :sismember, [key, member]), do: {:sismember, key, member}
 
   defp make_ast(_cmd, tag, [key]) when tag in ~w(srandmember spop)a, do: {tag, key}
+
+  defp make_ast(_cmd, tag, [key, _count, _extra | _rest]) when tag in ~w(srandmember spop)a,
+    do: {tag, key, {:error, "ERR syntax error"}}
 
   defp make_ast(_cmd, tag, [key, count]) when tag in ~w(srandmember spop)a,
     do: {tag, key, parse_int(count)}
@@ -557,6 +574,12 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp make_ast(_cmd, :zincrby, [key, amount, member]),
     do: {:zincrby, key, parse_float(amount), member}
+
+  defp make_ast(_cmd, tag, [key, member, option]) when tag in ~w(zrank zrevrank)a do
+    if String.upcase(option) == "WITHSCORE",
+      do: {tag, key, member, :withscore},
+      else: {tag, key, member, {:error, "ERR syntax error"}}
+  end
 
   defp make_ast(_cmd, tag, [key, member]) when tag in ~w(zscore zrank zrevrank)a,
     do: {tag, key, member}
@@ -587,13 +610,37 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp make_ast(_cmd, tag, [key, start, stop]) when tag in ~w(zrange zrevrange)a,
     do: {tag, key, parse_int(start), parse_int(stop), false}
 
-  defp make_ast(_cmd, tag, [key, start, stop, option]) when tag in ~w(zrange zrevrange)a do
+  defp make_ast(_cmd, :zrevrange, [key, start, stop, option]) do
     with_scores =
       if String.upcase(option) == "WITHSCORES",
         do: true,
         else: {:error, "ERR syntax error"}
 
-    {tag, key, parse_int(start), parse_int(stop), with_scores}
+    {:zrevrange, key, parse_int(start), parse_int(stop), with_scores}
+  end
+
+  # ZRANGE's REV, BYSCORE and LIMIT forms parse to the ZREVRANGE and
+  # ZRANGEBYSCORE forms every release executes. (MULTI refuses them, as their
+  # form does not match ZRANGE's.)
+  defp make_ast(cmd, :zrange, [key, start, stop | options]) do
+    case SortedSetHelpers.parse_zrange_options(options) do
+      {:ok, %{by: :rank, rev: false, with_scores: with_scores}} ->
+        {:zrange, key, parse_int(start), parse_int(stop), with_scores}
+
+      {:ok, %{by: :rank, rev: true, with_scores: with_scores}} ->
+        {:zrevrange, key, parse_int(start), parse_int(stop), with_scores}
+
+      {:ok, %{by: :score, rev: reverse?} = parsed} ->
+        tag = if reverse?, do: :zrevrangebyscore, else: :zrangebyscore
+        make_ast(cmd, tag, [key, start, stop | SortedSetHelpers.zrange_score_options(parsed)])
+
+      # Checked when it runs, as the command handler checks it.
+      {:ok, %{by: :lex, rev: rev, limit: limit}} ->
+        {:zrange, key, {:lex, start, stop}, %{rev: rev, limit: limit}}
+
+      {:error, reason} ->
+        {:zrange, key, {:error, reason}, nil}
+    end
   end
 
   defp make_ast("MEMORY", :memory, [subcmd | rest]), do: {:memory, [String.upcase(subcmd) | rest]}
@@ -1327,7 +1374,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp parse_set_opts([], acc) do
     if :nx in acc and :xx in acc do
-      {:error, "ERR XX and NX options at the same time are not compatible"}
+      {:error, "ERR syntax error"}
     else
       Enum.reverse(acc)
     end
@@ -1343,11 +1390,23 @@ defmodule Ferricstore.Commands.NativeAstParser do
       "PX" -> parse_set_expiry(rest, :px, acc)
       "EXAT" -> parse_set_expiry(rest, :exat, acc)
       "PXAT" -> parse_set_expiry(rest, :pxat, acc)
+      compare when compare in ["IFEQ", "IFNE"] -> parse_set_compare(rest, compare, acc)
       _ -> {:error, "ERR syntax error"}
     end
   end
 
   defp parse_set_opts(_opts, _acc), do: {:error, "ERR syntax error"}
+
+  # IFEQ and IFNE (Redis 8.4) take the value to compare with.
+  defp parse_set_compare([expected | rest], compare, acc) do
+    tag = if compare == "IFEQ", do: :ifeq, else: :ifne
+
+    if Enum.any?(acc, &match?({tag, _value} when tag in [:ifeq, :ifne], &1)),
+      do: {:error, "ERR syntax error"},
+      else: parse_set_opts(rest, [{tag, expected} | acc])
+  end
+
+  defp parse_set_compare([], _compare, _acc), do: {:error, "ERR syntax error"}
 
   defp parse_set_expiry([value | rest], tag, acc) do
     case parse_int(value) do
@@ -1404,6 +1463,16 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp parse_scan_opts(opts), do: parse_scan_opts(opts, true, [])
   defp parse_collection_scan_opts(opts), do: parse_scan_opts(opts, false, [])
 
+  # HSCAN also takes NOVALUES (Redis 7.4), a flag without a value.
+  defp parse_hscan_opts(opts) do
+    {novalues, opts} = Enum.split_with(opts, &(String.upcase(&1) == "NOVALUES"))
+
+    case parse_collection_scan_opts(opts) do
+      parsed when is_list(parsed) and novalues != [] -> parsed ++ [novalues: true]
+      parsed -> parsed
+    end
+  end
+
   defp parse_scan_opts([], _allow_type?, acc), do: Enum.reverse(acc)
 
   defp parse_scan_opts([option, value | rest], allow_type?, acc) do
@@ -1415,6 +1484,10 @@ defmodule Ferricstore.Commands.NativeAstParser do
         case parse_int(value) do
           count when is_integer(count) and count > 0 and count <= 10_000 ->
             parse_scan_opts(rest, allow_type?, Keyword.put(acc, :count, count))
+
+          # As in Redis, a COUNT below 1 is a syntax error.
+          count when is_integer(count) and count < 1 ->
+            {:error, "ERR syntax error"}
 
           _invalid ->
             {:error, "ERR value is not an integer or out of range"}
@@ -1430,82 +1503,17 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp parse_scan_opts(_invalid, _allow_type?, _acc), do: {:error, "ERR syntax error"}
 
-  defp parse_hash_expire(tag, key, ttl, count, fields) do
-    with ttl when is_integer(ttl) <- parse_pos_int(ttl),
-         parsed_fields when is_list(parsed_fields) <- parse_hash_fields(count, fields) do
-      {tag, key, ttl, parsed_fields}
-    else
-      {:error, _} = error -> {tag, key, error, []}
-    end
-  end
-
-  defp parse_hash_field_list(tag, key, count, fields) do
-    case parse_hash_fields(count, fields) do
-      parsed_fields when is_list(parsed_fields) -> {tag, key, parsed_fields}
-      {:error, _} = error -> {tag, key, error}
-    end
-  end
-
-  defp parse_hgetex(key, [option | rest]) do
-    case {String.upcase(option), rest} do
-      {"FIELDS", [count | fields]} ->
-        parse_hgetex_fields(key, :none, count, fields)
-
-      {"PERSIST", [fields_option, count | fields]} ->
-        if String.upcase(fields_option) == "FIELDS",
-          do: parse_hgetex_fields(key, :persist, count, fields),
-          else: {:hgetex, key, {:error, "ERR syntax error"}}
-
-      {mode, [value, fields_option, count | fields]} when mode in ~w(EX PX EXAT PXAT) ->
-        if String.upcase(fields_option) == "FIELDS" do
-          case parse_hgetex_expiry(mode, value) do
-            {:error, _} = error -> {:hgetex, key, error}
-            expiry when is_tuple(expiry) -> parse_hgetex_fields(key, expiry, count, fields)
-          end
-        else
-          {:hgetex, key, {:error, "ERR syntax error"}}
-        end
-
-      _invalid ->
-        {:hgetex, key, {:error, "ERR syntax error"}}
-    end
-  end
-
-  defp parse_hgetex(key, _opts),
-    do: {:hgetex, key, {:error, "ERR wrong number of arguments for 'hgetex' command"}}
-
-  defp parse_hgetex_fields(key, expiry, count, fields) do
-    case parse_hash_fields(count, fields) do
-      parsed_fields when is_list(parsed_fields) -> {:hgetex, key, expiry, parsed_fields}
-      {:error, _} = error -> {:hgetex, key, error}
-    end
-  end
-
-  defp parse_hgetex_expiry("EX", value), do: wrap_expiry(:ex, parse_pos_int(value))
-  defp parse_hgetex_expiry("PX", value), do: wrap_expiry(:px, parse_pos_int(value))
-  defp parse_hgetex_expiry("EXAT", value), do: wrap_expiry(:exat, parse_pos_int(value))
-  defp parse_hgetex_expiry("PXAT", value), do: wrap_expiry(:pxat, parse_pos_int(value))
-
-  defp wrap_expiry(kind, value) when is_integer(value), do: {kind, value}
-  defp wrap_expiry(_kind, {:error, _} = error), do: error
-
-  defp parse_hash_fields(count, fields) do
-    case parse_pos_int(count) do
-      count when is_integer(count) and length(fields) == count ->
-        fields
-
-      count when is_integer(count) ->
-        {:error, "ERR wrong number of arguments for hash field command"}
-
-      {:error, _} = error ->
-        error
+  defp parse_hgetex(key, opts) do
+    case HashHelpers.parse_getex(opts) do
+      {:ok, mode, fields} -> {:hgetex, key, mode, fields}
+      {:error, _reason} = error -> {:hgetex, key, error}
     end
   end
 
   defp parse_sintercard([count | rest]) do
     case parse_int(count) do
       count when is_integer(count) and count > 0 -> parse_sintercard_keys(count, rest)
-      _ -> {:sintercard, {:error, "ERR numkeys can't be non-positive value"}}
+      _ -> {:sintercard, {:error, "ERR numkeys should be greater than 0"}}
     end
   end
 
@@ -1528,6 +1536,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
     if String.upcase(option) == "LIMIT" do
       case parse_int(value) do
         limit when is_integer(limit) and limit >= 0 -> {:sintercard, keys, limit}
+        limit when is_integer(limit) -> {:sintercard, {:error, "ERR LIMIT can't be negative"}}
         _ -> {:sintercard, {:error, "ERR value is not an integer or out of range"}}
       end
     else
@@ -1545,7 +1554,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp split_zadd_opts([opt | rest] = args, acc) do
     case String.upcase(opt) do
-      normalized when normalized in ["NX", "XX", "GT", "LT", "CH"] ->
+      normalized when normalized in ["NX", "XX", "GT", "LT", "CH", "INCR"] ->
         split_zadd_opts(rest, [normalized |> String.downcase() |> String.to_atom() | acc])
 
       _not_option ->

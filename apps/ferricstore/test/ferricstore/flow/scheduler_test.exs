@@ -6,6 +6,29 @@ defmodule Ferricstore.Flow.SchedulerTest do
 
   @claim_waiter_table :ferricstore_flow_claim_waiters
 
+  test "a target's terminal wakes its queued schedule from the shard leader only" do
+    parent = self()
+
+    {:ok, scheduler} =
+      Scheduler.start_link(
+        name: nil,
+        ctx: %{name: :"scheduler_wake_#{System.unique_integer([:positive])}"},
+        enabled: true,
+        initial_delay_ms: 60_000,
+        leads_shard?: fn _ctx, shard_index -> shard_index == 0 end,
+        wake_queued: fn _ctx, schedule_id, target_id, _now_ms ->
+          send(parent, {:woke, schedule_id, target_id})
+          :ignored
+        end
+      )
+
+    GenServer.cast(scheduler, {:target_terminal, 1, "followed-schedule", "followed-target"})
+    GenServer.cast(scheduler, {:target_terminal, 0, "led-schedule", "led-target"})
+
+    assert_receive {:woke, "led-schedule", "led-target"}
+    refute_receive {:woke, "followed-schedule", _target_id}, 200
+  end
+
   test "configuration validates the batch limit and is a stable snapshot" do
     previous_limit = Application.get_env(:ferricstore, :flow_scheduler_limit)
 

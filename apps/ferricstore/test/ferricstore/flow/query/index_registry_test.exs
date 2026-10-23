@@ -225,6 +225,36 @@ defmodule Ferricstore.Flow.Query.IndexRegistryTest do
              IndexRegistry.status(server_name, index.definition.id, index.definition.version)
   end
 
+  # Persisting writes the snapshot before it empties the journal, so a node that
+  # stops in between restarts with journal progress the snapshot superseded.
+  test "a validation restart survives stopping before the journal is emptied", context do
+    %{ctx: ctx, server_name: server_name} = context
+    pid = start_registry!(ctx, server_name)
+    assert {:ok, %RegistrySnapshot{indexes: [index | _]}} = IndexRegistry.snapshot(ctx, 0)
+    complete_build!(server_name, index.build_id, ctx.shard_count)
+
+    for progress <- [
+          [phase: :source, definition_position: 0],
+          [phase: :source, definition_position: 0, cursor: "source-page", checked_records: 7],
+          [phase: :index, definition_position: 0, checked_records: 7]
+        ] do
+      assert :ok = checkpoint_validation(server_name, index.build_id, 0, progress)
+    end
+
+    journal_path = IndexRegistry.journal_path(ctx)
+    superseded_journal = File.read!(journal_path)
+    assert :ok = IndexRegistry.restart_validation_shard(server_name, index.build_id, 0)
+    GenServer.stop(pid)
+    File.write!(journal_path, superseded_journal)
+
+    _pid = start_registry!(ctx, server_name)
+
+    assert {:ok, %{validation_checkpoints: %{0 => checkpoint}}} =
+             IndexRegistry.build_status(server_name, index.build_id)
+
+    assert %{phase: :source, cursor: "", fenced: false, checked_records: 0} = checkpoint
+  end
+
   test "repairs an incomplete final journal frame after replaying durable progress", context do
     %{ctx: ctx, server_name: server_name} = context
     pid = start_registry!(ctx, server_name)

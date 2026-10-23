@@ -425,10 +425,17 @@ defmodule Ferricstore.Store.Ops.LocalRead do
       MapSet.size(Process.get(:tx_deleted_keys, MapSet.new())) == 0
   end
 
+  # Two negative indexes with the start after the end are empty before any
+  # clamping, as in Redis.
+  defp slice_binary_range(_value, start_idx, end_idx)
+       when start_idx < 0 and end_idx < 0 and start_idx > end_idx,
+       do: ""
+
   defp slice_binary_range(value, start_idx, end_idx) do
     size = byte_size(value)
     start_norm = if start_idx < 0, do: max(size + start_idx, 0), else: start_idx
-    end_norm = if end_idx < 0, do: size + end_idx, else: end_idx
+    # Redis clamps a negative end before the start to the first byte.
+    end_norm = if end_idx < 0, do: max(size + end_idx, 0), else: end_idx
 
     start_clamped = min(start_norm, size)
     end_clamped = min(end_norm, size - 1)

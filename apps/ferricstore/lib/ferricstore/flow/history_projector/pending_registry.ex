@@ -149,7 +149,9 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
   def append_overflow(projector, entries) when is_atom(projector) and is_list(entries) do
     table = ensure_overflow_registry()
     sequence = :erlang.unique_integer([:monotonic, :positive])
-    :ets.insert(table, {{projector, sequence}, {:pending, entries}})
+    # The writer is kept so a row it never committed (it died mid-apply, and
+    # the apply will run again) can be told from one still being staged.
+    :ets.insert(table, {{projector, sequence}, {:pending, entries, self()}})
     {:ok, sequence}
   rescue
     error -> {:error, {:overflow_append_failed, error}}
@@ -162,6 +164,67 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
   rescue
     error -> {:error, {:overflow_commit_failed, error}}
   end
+
+  # Overflow drains oldest first, and the queue may take a newer entry while
+  # older ones still wait here; a projected index past the oldest waiting
+  # entry would claim history that is not written. :infinity when none waits.
+  def overflow_publish_limit(projector) when is_atom(projector) do
+    case :ets.whereis(@overflow_registry) do
+      # Without the table nothing can wait in overflow.
+      :undefined -> :infinity
+      table -> overflow_publish_limit(table, projector, {projector, 0})
+    end
+  rescue
+    ArgumentError -> :infinity
+  end
+
+  defp overflow_publish_limit(table, projector, key) do
+    case :ets.next(table, key) do
+      {^projector, _sequence} = next_key ->
+        case :ets.lookup(table, next_key) do
+          # Drained meanwhile: the next row is now the oldest.
+          [] ->
+            overflow_publish_limit(table, projector, next_key)
+
+          [{_key, {:pending, _entries, writer}}] = row ->
+            if abandoned_writer?(writer),
+              do: overflow_publish_limit(table, projector, next_key),
+              else: oldest_overflow_limit(row)
+
+          row ->
+            oldest_overflow_limit(row)
+        end
+
+      _end_or_other_projector ->
+        :infinity
+    end
+  end
+
+  # Entries without a Raft index come from a projector outside WARaft, which
+  # has no replay cursor to hold back.
+  defp oldest_overflow_limit([{_key, {:pending, entries, _writer}}]) when is_list(entries),
+    do: oldest_entries_limit(entries)
+
+  defp oldest_overflow_limit([{_key, {:ready, entries}}]) when is_list(entries),
+    do: oldest_entries_limit(entries)
+
+  defp oldest_overflow_limit(_invalid), do: 0
+
+  defp oldest_entries_limit(entries) do
+    entries
+    |> Enum.flat_map(fn
+      %{ra_index: index} when is_integer(index) -> [index]
+      _entry -> []
+    end)
+    |> case do
+      [] -> :infinity
+      indexes -> max(Enum.min(indexes) - 1, 0)
+    end
+  end
+
+  # Rows are staged and committed by the applying process on this node.
+  defp abandoned_writer?(writer) when is_pid(writer), do: not Process.alive?(writer)
+  defp abandoned_writer?(_writer), do: false
 
   def delete_overflow(projector, sequence)
       when is_atom(projector) and is_integer(sequence) and sequence > 0 do
@@ -291,8 +354,13 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
                 {:ok, Enum.reverse(next_acc)}
             end
 
-          [{^next_key, {:pending, entries}}] when is_list(entries) ->
-            {:ok, Enum.reverse(acc)}
+          [{^next_key, {:pending, entries, writer}} = row] when is_list(entries) ->
+            if abandoned_writer?(writer) do
+              :ets.delete_object(table, row)
+              take_overflow_entries(table, projector, next_key, remaining, acc)
+            else
+              {:ok, Enum.reverse(acc)}
+            end
 
           invalid ->
             {:error, {:invalid_overflow_row, next_key, invalid}}
@@ -332,7 +400,7 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
 
   defp commit_overflow_cas(table, key) do
     case :ets.lookup(table, key) do
-      [{^key, {:pending, entries}}] when is_list(entries) ->
+      [{^key, {:pending, entries, _writer}}] when is_list(entries) ->
         case :ets.update_element(table, key, {2, {:ready, entries}}) do
           true -> :ok
           false -> commit_overflow_cas(table, key)

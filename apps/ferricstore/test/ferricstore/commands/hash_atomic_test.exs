@@ -538,10 +538,21 @@ defmodule Ferricstore.Commands.HashAtomicTest do
       assert {:error, _} = Hash.handle("HPEXPIRE", ["hash", "-1", "FIELDS", "1", "f1"], store)
     end
 
-    test "with zero ms returns error" do
+    # As in Redis, a TTL of 0 deletes the field (2).
+    test "with zero ms deletes the field" do
+      store = MockStore.make()
+      Hash.handle("HSET", ["hash", "f1", "v1", "f2", "v2"], store)
+      assert [2] = Hash.handle("HPEXPIRE", ["hash", "0", "FIELDS", "1", "f1"], store)
+      assert nil == Hash.handle("HGET", ["hash", "f1"], store)
+      assert "v2" == Hash.handle("HGET", ["hash", "f2"], store)
+    end
+
+    test "with a negative TTL returns error" do
       store = MockStore.make()
       Hash.handle("HSET", ["hash", "f1", "v1"], store)
-      assert {:error, _} = Hash.handle("HPEXPIRE", ["hash", "0", "FIELDS", "1", "f1"], store)
+
+      assert {:error, "ERR invalid expire time, must be >= 0"} =
+               Hash.handle("HPEXPIRE", ["hash", "-1", "FIELDS", "1", "f1"], store)
     end
 
     test "with mismatched field count returns error" do
@@ -738,7 +749,7 @@ defmodule Ferricstore.Commands.HashAtomicTest do
         end
       }
 
-      assert [div(expire_at_ms, 1000), div(expire_at_ms, 1000), -1, -2] ==
+      assert [div(expire_at_ms + 999, 1000), div(expire_at_ms + 999, 1000), -1, -2] ==
                Hash.handle(
                  "HEXPIRETIME",
                  ["hash", "FIELDS", "4", "expiring", "expiring", "persistent", "missing"],

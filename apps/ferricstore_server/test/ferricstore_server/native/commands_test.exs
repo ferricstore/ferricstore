@@ -5013,6 +5013,100 @@ defmodule FerricstoreServer.Native.CommandsTest do
       %{key: "{notify:#{System.unique_integer([:positive, :monotonic])}}"}
     end
 
+    test "hash field TTL commands notify only the changes they made", %{key: key} do
+      hash = key <> ":fields"
+      channel = "__keyspace@0__:" <> hash
+      :ok = PubSub.subscribe(channel, self())
+
+      exec = fn command, args ->
+        {:ok, reply, _state} =
+          Commands.execute(
+            @op_command_exec,
+            %{"command" => command, "args" => [hash | args]},
+            state()
+          )
+
+        reply
+      end
+
+      assert 1 == exec.("HSET", ["f", "v"])
+      assert_receive {:pubsub_message, ^channel, "hset"}
+
+      steps = [
+        {"HEXPIRE", ["100", "FIELDS", "1", "f"], "hexpire"},
+        {"HEXPIRE", ["100", "NX", "FIELDS", "1", "f"], nil},
+        {"HPEXPIRE", ["100000", "FIELDS", "1", "f"], "hexpire"},
+        {"HPERSIST", ["FIELDS", "1", "f"], "hpersist"},
+        {"HPERSIST", ["FIELDS", "1", "f"], nil},
+        {"HSETEX", ["FNX", "EX", "100", "FIELDS", "1", "f", "w"], nil},
+        {"HSETEX", ["EX", "100", "FIELDS", "1", "g", "w"], "hset"},
+        {"HSETEX", ["100", "g", "x"], "hset"},
+        {"HGETDEL", ["FIELDS", "1", "missing"], nil},
+        {"HGETDEL", ["FIELDS", "1", "g"], "hdel"},
+        {"HEXPIRE", ["0", "FIELDS", "1", "f"], "hdel"}
+      ]
+
+      for {command, args, event} <- steps do
+        exec.(command, args)
+
+        if event,
+          do:
+            assert_receive(
+              {:pubsub_message, ^channel, ^event},
+              500,
+              "#{command} #{inspect(args)}"
+            ),
+          else:
+            refute_receive(
+              {:pubsub_message, ^channel, _event},
+              100,
+              "#{command} #{inspect(args)}"
+            )
+      end
+    end
+
+    test "RPOPLPUSH notifies like LMOVE, and neither notifies an empty source", %{key: key} do
+      source = key <> ":source"
+      destination = key <> ":destination"
+      :ok = PubSub.subscribe("__keyevent@0__:lmove", self())
+
+      exec = fn command, args ->
+        Commands.execute(@op_command_exec, %{"command" => command, "args" => args}, state())
+      end
+
+      assert {:ok, 1, _state} = exec.("RPUSH", [source, "v"])
+      assert {:ok, "v", _state} = exec.("RPOPLPUSH", [source, destination])
+
+      assert_receive {:pubsub_message, "__keyevent@0__:lmove", ^source}
+      assert_receive {:pubsub_message, "__keyevent@0__:lmove", ^destination}
+
+      assert {:ok, nil, _state} = exec.("RPOPLPUSH", [source, destination])
+      assert {:ok, nil, _state} = exec.("LMOVE", [source, destination, "LEFT", "LEFT"])
+      refute_receive {:pubsub_message, "__keyevent@0__:lmove", _key}, 100
+    end
+
+    test "a compact SET pipeline notifies every key", %{key: key} do
+      first = key <> ":compact-a"
+      second = key <> ":compact-b"
+      :ok = PubSub.subscribe("__keyspace@0__:" <> first, self())
+      :ok = PubSub.subscribe("__keyspace@0__:" <> second, self())
+
+      for return <- ["pairs", "values"] do
+        assert {:ok, _payload, _state} =
+                 Commands.execute(
+                   @op_pipeline,
+                   %{
+                     "return" => return,
+                     "compact_pipeline" => {1, [{first, "1"}, {second, "2"}]}
+                   },
+                   state()
+                 )
+
+        assert_receive {:pubsub_message, "__keyspace@0__:" <> ^first, "set"}
+        assert_receive {:pubsub_message, "__keyspace@0__:" <> ^second, "set"}
+      end
+    end
+
     test "commands and typed operations notify the key and the event", %{key: key} do
       hash = key <> ":h"
       :ok = PubSub.subscribe("__keyspace@0__:" <> key, self())
@@ -5125,6 +5219,211 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert abort_message =~ "EXECABORT"
     assert final_state.multi_state == :none
     assert Router.get(FerricStore.Instance.get(:default), key) == nil
+  end
+
+  # These forms parse to ZREVRANGE and ZRANGEBYSCORE, which a transaction
+  # entry for ZRANGE may not carry; EXEC refuses before anything is applied.
+  test "native MULTI refuses ZRANGE's REV and BYSCORE forms whole and runs the plain one" do
+    key = "{multi-zrange:#{System.unique_integer([:positive])}}"
+    ctx = FerricStore.Instance.get(:default)
+    assert 2 == Ferricstore.Commands.Dispatcher.dispatch("ZADD", [key, "1", "a", "2", "b"], ctx)
+
+    for args <- [[key, "0", "-1", "REV"], [key, "0", "5", "BYSCORE"]] do
+      assert {:ok, "OK", state} =
+               Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+      assert {:ok, "QUEUED", state} =
+               Session.execute(%{"command" => "SET", "args" => [key <> ":w", "v"]}, state)
+
+      assert {:ok, "QUEUED", state} =
+               Session.execute(%{"command" => "ZRANGE", "args" => args}, state)
+
+      assert {:error, "ERR command 'zrange' is not supported inside transactions", _state} =
+               Session.execute(%{"command" => "EXEC", "args" => []}, state)
+
+      assert nil == Router.get(ctx, key <> ":w")
+    end
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(%{"command" => "ZRANGE", "args" => [key, "0", "-1"]}, state)
+
+    assert {:ok, [["a", "b"]], _state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, state)
+  end
+
+  # Every replica runs the transaction, and releases before level 5 store an
+  # empty string, so below it a transaction keeps doing so.
+  test "native MULTI BITOP keeps an empty destination below feature level 5" do
+    key = "{multi-bitop:#{System.unique_integer([:positive])}}"
+    ctx = FerricStore.Instance.get(:default)
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(
+               %{"command" => "BITOP", "args" => ["AND", key, key <> ":a", key <> ":b"]},
+               state
+             )
+
+    assert {:ok, [0], _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
+    assert "" == Router.get(ctx, key)
+  end
+
+  test "native MULTI INCR past the integer range keeps the old write below level 5" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "{multi-incr:#{System.unique_integer([:positive])}}"
+    :ok = Ferricstore.Commands.Dispatcher.dispatch("SET", [key, "9223372036854775807"], ctx)
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(%{"command" => "INCR", "args" => [key]}, state)
+
+    # The data outcome is what replicas on older releases apply.
+    assert {:ok, [reply], _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
+    refute match?(%{"error" => _}, reply)
+
+    assert "9223372036854775808" == Ferricstore.Commands.Dispatcher.dispatch("GET", [key], ctx)
+  end
+
+  test "native MULTI DECRBY of the smallest integer keeps the old write below level 5" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "{multi-decrby:#{System.unique_integer([:positive])}}"
+    :ok = Ferricstore.Commands.Dispatcher.dispatch("SET", [key, "-1"], ctx)
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(
+               %{"command" => "DECRBY", "args" => [key, "-9223372036854775808"]},
+               state
+             )
+
+    # The data outcome is what replicas must agree on.
+    assert {:ok, [reply], _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
+    refute match?(%{"error" => _}, reply)
+
+    assert "9223372036854775807" == Ferricstore.Commands.Dispatcher.dispatch("GET", [key], ctx)
+  end
+
+  test "native MULTI GEOSEARCHSTORE keeps the old answer for a missing source below level 5" do
+    key = "{multi-geo:#{System.unique_integer([:positive])}}"
+    destination = key <> ":dst"
+    assert 1 == FerricStore.Instance.get(:default) |> geoadd(destination)
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    args = [destination, key, "FROMMEMBER", "m", "BYRADIUS", "10", "km"]
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(%{"command" => "GEOSEARCHSTORE", "args" => args}, state)
+
+    assert {:ok, [%{"error" => "ERR could not decode requested zset member"}], _state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, state)
+
+    assert 1 ==
+             Ferricstore.Commands.Dispatcher.dispatch(
+               "EXISTS",
+               [destination],
+               FerricStore.Instance.get(:default)
+             )
+  end
+
+  # b is 199.98 km from (0, 0) with the radius releases before level 5 use,
+  # and 200.04 km with Redis's: a transaction below level 5 keeps the old one.
+  test "native MULTI GEOSEARCHSTORE keeps the old Earth radius below level 5" do
+    key = "{multi-geo-radius:#{System.unique_integer([:positive])}}"
+    ctx = FerricStore.Instance.get(:default)
+    args = [key, "0", "0", "a", "1.79846", "0", "b"]
+    assert 2 == Ferricstore.Commands.Dispatcher.dispatch("GEOADD", args, ctx)
+    search = ["FROMLONLAT", "0", "0", "BYRADIUS", "200", "km"]
+    assert ["a"] == Ferricstore.Commands.Dispatcher.dispatch("GEOSEARCH", [key | search], ctx)
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    assert {:ok, "QUEUED", state} =
+             Session.execute(
+               %{"command" => "GEOSEARCHSTORE", "args" => [key <> ":dst", key | search]},
+               state
+             )
+
+    assert {:ok, [2], _state} = Session.execute(%{"command" => "EXEC", "args" => []}, state)
+  end
+
+  # Releases before level 5 drop a sketch's TTL in apply; below it every
+  # replica still does.
+  test "PFADD drops the sketch's TTL below level 5" do
+    key = "{pf-ttl:#{System.unique_integer([:positive])}}"
+    ctx = FerricStore.Instance.get(:default)
+    assert 1 == Ferricstore.Commands.Dispatcher.dispatch("PFADD", [key, "a"], ctx)
+    assert 1 == Ferricstore.Commands.Dispatcher.dispatch("EXPIRE", [key, "100"], ctx)
+    assert 1 == Ferricstore.Commands.Dispatcher.dispatch("PFADD", [key, "b"], ctx)
+    assert -1 == Ferricstore.Commands.Dispatcher.dispatch("TTL", [key], ctx)
+  end
+
+  test "the embedded expire leaves a Bloom filter intact" do
+    key = "{embedded-bf-expire:#{System.unique_integer([:positive])}}"
+    ctx = FerricStore.Instance.get(:default)
+    assert 1 == Ferricstore.Commands.Dispatcher.dispatch("BF.ADD", [key, "a"], ctx)
+    assert {:error, "ERR " <> _} = FerricStore.expire(key, 100_000)
+    assert 1 == Ferricstore.Commands.Dispatcher.dispatch("BF.EXISTS", [key, "a"], ctx)
+  end
+
+  defp geoadd(ctx, key) do
+    Ferricstore.Commands.Dispatcher.dispatch("GEOADD", [key, "13.36", "38.11", "palermo"], ctx)
+  end
+
+  test "native MULTI refuses level-5 forms (ZRANK WITHSCORE, PFMERGE, HEXPIRE) below level 5" do
+    key = "{multi-zrank:#{System.unique_integer([:positive])}}"
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    assert {:error, message, _state} =
+             Session.execute(%{"command" => "ZRANK", "args" => [key, "m", "WITHSCORE"]}, state)
+
+    assert message =~ "needs cluster feature level 5"
+
+    assert {:error, pfmerge_message, _state} =
+             Session.execute(%{"command" => "PFMERGE", "args" => [key <> ":hll"]}, state)
+
+    assert pfmerge_message =~ "needs cluster feature level 5"
+
+    for {command, args} <- [
+          {"HEXPIRE", [key, "0", "FIELDS", "1", "f"]},
+          {"HEXPIRE", [key, "10", "NX", "FIELDS", "1", "f"]},
+          {"HSETEX", [key, "FNX", "FIELDS", "1", "f", "v"]},
+          {"ZADD", [key <> ":z", "INCR", "1", "m"]},
+          {"ZRANGE", [key <> ":z", "-", "+", "BYLEX"]},
+          {"SET", [key <> ":s", "v", "IFEQ", "a"]},
+          {"ZADD", [key <> ":z", "NX", "INCR", "1", "m"]},
+          {"HGETEX", [key, "EX", "0", "FIELDS", "1", "f"]}
+        ] do
+      assert {:error, hexpire_message, _state} =
+               Session.execute(%{"command" => command, "args" => args}, state)
+
+      assert hexpire_message =~ "needs cluster feature level 5"
+    end
+
+    for {command, args} <- [
+          {"HEXPIRE", [key, "10", "FIELDS", "1", "f"]},
+          {"HSETEX", [key, "10", "f", "v"]},
+          {"HGETEX", [key, "EX", "10", "FIELDS", "1", "f"]}
+        ] do
+      assert {:ok, "QUEUED", _state} =
+               Session.execute(%{"command" => command, "args" => args}, state)
+    end
+
+    assert {:ok, "QUEUED", _state} =
+             Session.execute(%{"command" => "ZRANK", "args" => [key, "m"]}, state)
   end
 
   test "native MULTI refuses forms older releases apply differently below level 4" do

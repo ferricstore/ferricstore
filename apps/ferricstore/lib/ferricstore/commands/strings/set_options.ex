@@ -6,12 +6,18 @@ defmodule Ferricstore.Commands.Strings.SetOptions do
   def parse(opts, default), do: parse(opts, default, default)
 
   defp parse([], acc, _default) do
+    # Redis answers SET NX XX with a plain syntax error.
     if acc.nx and acc.xx do
-      {:error, "ERR XX and NX options at the same time are not compatible"}
+      {:error, "ERR syntax error"}
     else
       {:ok, acc}
     end
   end
+
+  # IFEQ and IFNE (Redis 8.4) compare the current value; `:compare` holds
+  # {:eq | :ne, value}.
+  defp parse([compare, expected | rest], acc, default) when compare in ["IFEQ", "IFNE"],
+    do: with_compare(acc, compare, expected, &parse(rest, &1, default))
 
   defp parse(["NX" | rest], acc, default), do: parse(rest, %{acc | nx: true}, default)
   defp parse(["XX" | rest], acc, default), do: parse(rest, %{acc | xx: true}, default)
@@ -41,12 +47,24 @@ defmodule Ferricstore.Commands.Strings.SetOptions do
     parse_expiry(rest, acc, default, ts_str, 1, "set", :absolute)
   end
 
+  defp parse([compare], _acc, _default) when compare in ["IFEQ", "IFNE"],
+    do: {:error, "ERR syntax error"}
+
   defp parse([unknown | rest], acc, default) when is_binary(unknown) do
     case String.upcase(unknown) do
       ^unknown -> {:error, "ERR syntax error, option '#{unknown}' not recognized"}
       normalized -> parse([normalized | rest], acc, default)
     end
   end
+
+  defp with_compare(acc, compare, expected, continue) do
+    if Map.get(acc, :compare),
+      do: {:error, "ERR syntax error"},
+      else: continue.(Map.put(acc, :compare, {compare_kind(compare), expected}))
+  end
+
+  defp compare_kind(compare) when compare in ["IFEQ", :ifeq], do: :eq
+  defp compare_kind(compare) when compare in ["IFNE", :ifne], do: :ne
 
   defp parse_expiry(rest, acc, default, raw, multiplier, command, mode \\ :relative) do
     if acc.has_expiry do
@@ -81,6 +99,10 @@ defmodule Ferricstore.Commands.Strings.SetOptions do
     end
   end
 
+  defp from_ast([{compare, expected} | rest], acc, default)
+       when compare in [:ifeq, :ifne] and is_binary(expected),
+       do: with_compare(acc, compare, expected, &from_ast(rest, &1, default))
+
   defp from_ast([:nx | rest], acc, default), do: from_ast(rest, %{acc | nx: true}, default)
   defp from_ast([:xx | rest], acc, default), do: from_ast(rest, %{acc | xx: true}, default)
   defp from_ast([:get | rest], acc, default), do: from_ast(rest, %{acc | get: true}, default)
@@ -108,6 +130,11 @@ defmodule Ferricstore.Commands.Strings.SetOptions do
   defp from_ast([{:pxat, ms} | rest], acc, default) when is_integer(ms) do
     parse_ast_expiry(rest, acc, default, ms, 1, :absolute)
   end
+
+  # The parser's own error for an expiry value, such as "invalid expire time".
+  defp from_ast([{tag, {:error, reason}} | _rest], _acc, _default)
+       when tag in [:ex, :px, :exat, :pxat] and is_binary(reason),
+       do: {:error, reason}
 
   defp from_ast(_opts, _acc, _default), do: {:error, "ERR syntax error"}
 

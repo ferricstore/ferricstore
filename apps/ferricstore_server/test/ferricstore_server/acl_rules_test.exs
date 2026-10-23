@@ -101,6 +101,42 @@ defmodule FerricstoreServer.Acl.RulesTest do
     refute_receive {:hashed_password, _password}
   end
 
+  # Redis: "reset" returns the user to its state right after creation
+  # (resetpass, resetkeys, resetchannels, off, -@all); "nocommands" is -@all.
+  test "reset clears every earlier permission and nocommands removes commands" do
+    hasher = &("hashed:" <> &1)
+
+    user = %{
+      base_user()
+      | password: "hashed:old",
+        commands: :all,
+        keys: :all,
+        channels: :all
+    }
+
+    assert {:ok, reset} = Rules.apply_rules(user, [">pass", "~app:*", "+get", "reset"], hasher)
+
+    assert %{
+             enabled: false,
+             password: nil,
+             commands: commands,
+             denied_commands: denied,
+             keys: [],
+             channels: []
+           } = reset
+
+    assert MapSet.size(commands) == 0 and MapSet.size(denied) == 0
+
+    assert {:ok, rebuilt} =
+             Rules.apply_rules(user, ["reset", "on", ">new", "~x:*", "+set"], hasher)
+
+    assert %{enabled: true, password: "hashed:new", keys: [{"x:*", :rw, _regex}]} = rebuilt
+    assert rebuilt.commands == MapSet.new(["SET"])
+
+    assert {:ok, %{commands: none}} = Rules.apply_rules(user, ["nocommands"], hasher)
+    assert none == MapSet.new()
+  end
+
   defp base_user do
     %{
       enabled: true,

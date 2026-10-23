@@ -28,7 +28,7 @@ HSETNX, HSTRLEN, HRANDFIELD, HSCAN, HEXPIRE, HTTL, HPERSIST, HPEXPIRE, HPTTL, HE
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, LINDEX, LSET, LREM, LTRIM, LPOS, LINSERT, LMOVE, RPOPLPUSH, LPUSHX, RPUSHX,
 SADD, SREM, SMEMBERS, SISMEMBER, SMISMEMBER, SCARD, SRANDMEMBER, SPOP, SDIFF, SINTER, SUNION,
 SDIFFSTORE, SINTERSTORE, SUNIONSTORE, SINTERCARD, SMOVE, SSCAN,
-ZADD (NX/XX/GT/LT/CH), ZSCORE, ZRANK, ZREVRANK, ZRANGE, ZREVRANGE, ZCARD, ZREM, ZINCRBY,
+ZADD (NX/XX/GT/LT/CH/INCR), ZSCORE, ZRANK, ZREVRANK, ZRANGE, ZREVRANGE, ZCARD, ZREM, ZINCRBY,
 ZCOUNT, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZMSCORE, ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZSCAN,
 XADD, XLEN, XRANGE, XREVRANGE, XREAD (including BLOCK), XTRIM, XDEL, XINFO STREAM,
 XGROUP CREATE, XREADGROUP, XACK,
@@ -236,7 +236,8 @@ documented in `guides/flow-elixir-sdk.md`.
 
 | Command | Difference |
 |---------|-----------|
-| `ZRANGE` | Unified `BYSCORE`/`BYLEX`/`REV`/`LIMIT` syntax is not yet supported -- use `ZRANGEBYSCORE`/`ZREVRANGEBYSCORE` instead |
+| `ZRANGE` | `BYLEX` reads every member of the set to answer the range |
+| `ZADD`/`ZINCRBY` | Scores must be finite: `+inf`, `-inf` and `inf` answer `ERR value is not a valid float` (Redis stores them). They remain valid as range bounds |
 | `SCAN` | Cursor is key-based (alphabetic position), not an opaque integer |
 | `HSCAN`/`SSCAN`/`ZSCAN` | Cursor is an integer offset into the scanned list |
 | `FLUSHDB`/`FLUSHALL` | `ASYNC`/`SYNC` accepted but both execute synchronously; true async reclaim happens during Bitcask merge |
@@ -296,7 +297,7 @@ Sets a string value with optional expiry and conditional flags.
 
 | | |
 |---|---|
-| **Protocol command** | `SET key value [EX seconds \| PX milliseconds \| EXAT unix-sec \| PXAT unix-ms] [NX\|XX] [GET] [KEEPTTL]` |
+| **Protocol command** | `SET key value [EX seconds \| PX milliseconds \| EXAT unix-sec \| PXAT unix-ms] [NX\|XX] [IFEQ value \| IFNE value] [GET] [KEEPTTL]` |
 | **Embedded API** | `FerricStore.set(key, value, ttl: ms)` |
 | **Return** | `+OK` on success, `_` (null) when NX/XX condition fails. With `GET`: returns old value or null. |
 | **Elixir return** | `:ok` on success, `{:ok, nil}` when condition fails |
@@ -308,6 +309,7 @@ Sets a string value with optional expiry and conditional flags.
 - `PXAT unix-ms` -- set absolute expiry as Unix timestamp in milliseconds
 - `NX` -- only set if key does not exist
 - `XX` -- only set if key already exists
+- `IFEQ value` / `IFNE value` -- only set if the current string equals / differs from `value` (Redis 8.4; a missing key counts as different); inside MULTI they need cluster feature level 5
 - `GET` -- return the old value stored at key (or null if key didn't exist)
 - `KEEPTTL` -- retain the existing TTL on the key (cannot combine with EX/PX/EXAT/PXAT)
 
@@ -643,8 +645,8 @@ Cursor-based iteration over hash fields with optional pattern matching.
 
 | | |
 |---|---|
-| **Protocol command** | `HSCAN key cursor [MATCH pattern] [COUNT count]` |
-| **Return** | `[next_cursor, [field, value, ...]]` |
+| **Protocol command** | `HSCAN key cursor [MATCH pattern] [COUNT count] [NOVALUES]` |
+| **Return** | `[next_cursor, [field, value, ...]]`, or `[next_cursor, [field, ...]]` with NOVALUES |
 | **Status** | Cursor is an integer offset into the scanned field list. Default COUNT is 10. |
 
 ### Hash Field TTL
@@ -653,15 +655,16 @@ FerricStore supports per-field expiry on hash fields:
 
 | Command | Syntax | Return |
 |---------|--------|--------|
-| `HEXPIRE` | `HEXPIRE key seconds FIELDS count field [field ...]` | List of `1` (set) / `-2` (field missing) |
+| `HEXPIRE` | `HEXPIRE key seconds [NX\|XX\|GT\|LT] FIELDS count field [field ...]` | List of `1` (set) / `2` (deleted: TTL 0) / `0` (condition not met) / `-2` (field missing) |
 | `HTTL` | `HTTL key FIELDS count field [field ...]` | List of TTL seconds / `-1` (no expiry) / `-2` (missing) |
 | `HPERSIST` | `HPERSIST key FIELDS count field [field ...]` | List of `1` (removed) / `-1` (no expiry) / `-2` (missing) |
-| `HPEXPIRE` | `HPEXPIRE key ms FIELDS count field [field ...]` | Same as HEXPIRE but milliseconds |
+| `HPEXPIRE` | `HPEXPIRE key ms [NX\|XX\|GT\|LT] FIELDS count field [field ...]` | Same as HEXPIRE but milliseconds |
 | `HPTTL` | `HPTTL key FIELDS count field [field ...]` | Same as HTTL but milliseconds |
 | `HEXPIRETIME` | `HEXPIRETIME key FIELDS count field [field ...]` | Absolute Unix timestamp (seconds) |
 | `HGETDEL` | `HGETDEL key FIELDS count field [field ...]` | List of values (nil for missing) |
-| `HGETEX` | `HGETEX key [EX sec\|PX ms\|EXAT ts\|PXAT ms\|PERSIST] FIELDS count field [...]` | List of values |
-| `HSETEX` | `HSETEX key seconds field value [field value ...]` | Count of new fields |
+| `HGETEX` | `HGETEX key [EX sec\|PX ms\|EXAT ts\|PXAT ms\|PERSIST] FIELDS count field [...]` | List of values; a TTL of 0 or a past time deletes the fields |
+| `HSETEX` | `HSETEX key [FNX\|FXX] [EX sec\|PX ms\|EXAT ts\|PXAT ms\|KEEPTTL] FIELDS count field value [...]` | `1` when set, `0` when FNX/FXX refused; without an expiry option it clears the fields' TTL |
+| `HSETEX` (FerricStore form) | `HSETEX key seconds field value [field value ...]` | Count of new fields |
 
 **Status:** Supported for native TCP and embedded command handlers.
 
@@ -847,7 +850,7 @@ Adds members with scores. Supports all FerricStore modifier flags.
 
 | | |
 |---|---|
-| **Protocol command** | `ZADD key [NX\|XX] [GT\|LT] [CH] score member [score member ...]` |
+| **Protocol command** | `ZADD key [NX\|XX] [GT\|LT] [CH] [INCR] score member [score member ...]` |
 | **Embedded API** | `FerricStore.zadd(key, [{score, member}, ...])` |
 | **Return** | Integer -- count of elements added (or added+changed with CH) |
 | **Elixir return** | `{:ok, integer()}` |
@@ -858,6 +861,7 @@ Adds members with scores. Supports all FerricStore modifier flags.
 - `GT` -- only update when new score > current score
 - `LT` -- only update when new score < current score
 - `CH` -- return count of added + changed (instead of just added)
+- `INCR` -- add the score to the member's, as ZINCRBY does (one pair only); answers the new score, or nil when NX, XX, GT or LT refuses it
 
 **Status:** Supported.
 
@@ -881,14 +885,14 @@ Returns zero-based rank of a member.
 
 ### ZRANGE / ZREVRANGE
 
-Range query by index with optional WITHSCORES.
+Range query by index, score or member, with optional WITHSCORES.
 
 | | |
 |---|---|
-| **Protocol command** | `ZRANGE key start stop [WITHSCORES]`, `ZREVRANGE key start stop [WITHSCORES]` |
+| **Protocol command** | `ZRANGE key start stop [BYSCORE \| BYLEX] [REV] [LIMIT offset count] [WITHSCORES]`, `ZREVRANGE key start stop [WITHSCORES]` |
 | **Embedded API** | `FerricStore.zrange(key, start, stop, withscores: bool)` |
 | **Return** | Array of members, or interleaved `[member, score, ...]` with WITHSCORES |
-| **Status** | Index-based syntax is supported. Unified `ZRANGE` syntax (`BYSCORE`/`BYLEX`/`REV`/`LIMIT`) is not yet supported. Use `ZRANGEBYSCORE`/`ZREVRANGEBYSCORE` for score ranges. |
+| **Status** | Supported as in Redis 6.2+, including `(` exclusive score bounds and BYLEX's `[`/`(`/`-`/`+` bounds (WITHSCORES is refused with BYLEX). BYLEX reads every member. Inside MULTI, BYLEX needs cluster feature level 5, and the BYSCORE and REV forms are refused (use `ZRANGEBYSCORE`/`ZREVRANGEBYSCORE`/`ZREVRANGE`). |
 
 ### ZRANGEBYSCORE / ZREVRANGEBYSCORE
 
@@ -955,7 +959,7 @@ Adds an entry to a stream with optional trimming and NOMKSTREAM.
 | **Return** | Bulk string -- the generated entry ID |
 | **Elixir return** | `{:ok, binary()}` |
 
-**ID generation:** `*` auto-generates using HLC. Explicit IDs must be strictly greater than the last entry. Partial IDs (just milliseconds) auto-assign the sequence.
+**ID generation:** `*` auto-generates using HLC. Explicit IDs must be strictly greater than the last entry. As in Redis, `ms` alone means `ms-0`, and `ms-*` auto-assigns the sequence within that millisecond.
 
 **Status:** Supported, including NOMKSTREAM and trim options.
 
@@ -1069,7 +1073,10 @@ Cursor-based key iteration with optional MATCH pattern, COUNT hint, and TYPE fil
 | `EXPIRETIME` | `EXPIRETIME key` | Absolute Unix timestamp (seconds), `-1`, `-2` |
 | `PEXPIRETIME` | `PEXPIRETIME key` | Absolute Unix timestamp (ms), `-1`, `-2` |
 
-All native TCP mode. Expiry uses HLC timestamps internally.
+All native TCP mode. Expiry uses HLC timestamps internally. TTL and
+EXPIRETIME round to the nearest second, as Redis does. On the durable Raft
+path, EXPIRE and its variants answer an error on a Bloom, Cuckoo,
+Count-Min or Top-K key (their expiry cannot change in place there yet).
 
 ### OBJECT
 
@@ -1080,6 +1087,8 @@ All native TCP mode. Expiry uses HLC timestamps internally.
 | `OBJECT FREQ key` | Integer (LFU counter) | Uses keydir LFU, not FerricStore logarithmic frequency |
 | `OBJECT IDLETIME key` | Integer (idle seconds) | Derived from LFU last-decrement-time. Returns elapsed seconds since last access. |
 | `OBJECT REFCOUNT key` | `1` | Always 1 |
+
+On a missing key, every subcommand answers null, as Redis does.
 
 ### WAIT
 

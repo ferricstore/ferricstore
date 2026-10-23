@@ -1779,6 +1779,70 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
           end
         end
 
+        test "a terminal batch answers a refused state write instead of raising", %{
+          state: state
+        } do
+          setup_flow_indexes(state)
+
+          type = "terminal-batch-write-error"
+          partition_key = "tenant-terminal-batch-write-error"
+          id = "flow-terminal-batch-write-error"
+          state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+          record = %{
+            id: id,
+            type: type,
+            state: "queued",
+            partition_key: partition_key,
+            now_ms: 1_000,
+            run_at_ms: 1_000
+          }
+
+          {state, :ok} =
+            StateMachine.apply(
+              %{system_time: 1_000},
+              {:flow_create_many, nil, %{records: [record]}},
+              state
+            )
+
+          {state, {:ok, [claimed]}} =
+            StateMachine.apply(
+              %{system_time: 2_000},
+              {:flow_claim_due, Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition_key),
+               %{
+                 type: type,
+                 state: "queued",
+                 worker: "worker-batch-write-error",
+                 lease_ms: 30_000,
+                 limit: 1,
+                 priority: nil,
+                 partition_key: partition_key
+               }},
+              state
+            )
+
+          # A corrupt type catalog row makes the state record write refuse.
+          catalog_key = Ferricstore.Flow.Keys.type_catalog_member_key(type, state_key)
+          :ets.insert(state.ets, {catalog_key, "corrupt", 0, LFU.initial(), 0, 0, 7})
+
+          complete = %{
+            id: id,
+            lease_token: claimed.lease_token,
+            fencing_token: claimed.fencing_token,
+            partition_key: partition_key,
+            now_ms: 3_000
+          }
+
+          assert {_state, {:error, "ERR flow type catalog entry is corrupt"}} =
+                   StateMachine.apply(
+                     %{system_time: 3_000},
+                     {:flow_complete_many, state_key, %{records: [complete]}},
+                     state
+                   )
+
+          assert flow_record!(state, state_key).state == "running"
+        end
+
         test "claim_due apply uses a claim-specific bulk index plan" do
           source = Ferricstore.Test.SourceFiles.state_machine_source()
 

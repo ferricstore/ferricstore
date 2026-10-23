@@ -527,7 +527,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
         if is_binary(id) and is_binary(event) do
           history_key = FlowKeys.history_key(id, Map.get(record, :partition_key))
 
-          case flow_index_rank_range(state, history_key, 0, 0, true) do
+          case flow_history_end_range(state, history_key, 1, true) do
             [{event_id, _event_ms} | _] when is_binary(event_id) ->
               flow_history_event_matches?(
                 state,

@@ -2,6 +2,7 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
   @moduledoc false
 
   alias Ferricstore.Commands.CollectionScan
+  alias Ferricstore.Store.ValueCodec
 
   @max_random_replacement_count 10_000
 
@@ -22,9 +23,8 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
   def normalize_index(index, len) when index < 0, do: max(0, len + index)
   def normalize_index(index, _len), do: index
 
-  def format_score(score) when is_float(score) do
-    :erlang.float_to_binary(score, [:compact, decimals: 17])
-  end
+  # Replies only; stored scores keep Float.to_string's form.
+  def format_score(score) when is_float(score), do: ValueCodec.format_double(score)
 
   def format_score_str(score_str) do
     case Float.parse(score_str) do
@@ -39,7 +39,7 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
   def score_string_pairs_to_flat_list(pairs), do: score_string_pairs_to_flat_list(pairs, [])
 
   def parse_zadd_opts(args) do
-    parse_zadd_opts(args, %{nx: false, xx: false, gt: false, lt: false, ch: false})
+    parse_zadd_opts(args, %{nx: false, xx: false, gt: false, lt: false, ch: false, incr: false})
   end
 
   def parse_score(str) do
@@ -62,6 +62,109 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
     {:ok, left + right}
   rescue
     ArithmeticError -> :overflow
+  end
+
+  @doc """
+  Parses ZRANGE's options after `start stop`, as Redis does:
+  `[BYSCORE | BYLEX] [REV] [LIMIT offset count] [WITHSCORES]` in any order.
+  LIMIT needs BYSCORE or BYLEX; the offset and count are checked by the
+  range they run with.
+  """
+  def parse_zrange_options(options),
+    do: parse_zrange_options(options, %{by: :rank, rev: false, limit: nil, with_scores: false})
+
+  defp parse_zrange_options([], %{limit: limit, by: :rank}) when limit != nil,
+    do:
+      {:error,
+       "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX"}
+
+  defp parse_zrange_options([], %{with_scores: true, by: :lex}),
+    do: {:error, "ERR syntax error, WITHSCORES not supported in combination with BYLEX"}
+
+  defp parse_zrange_options([], parsed), do: {:ok, parsed}
+
+  defp parse_zrange_options([option | rest], parsed) when is_binary(option) do
+    case {String.upcase(option), rest} do
+      {"WITHSCORES", rest} ->
+        parse_zrange_options(rest, %{parsed | with_scores: true})
+
+      {"BYSCORE", rest} ->
+        parse_zrange_options(rest, %{parsed | by: :score})
+
+      {"BYLEX", rest} ->
+        parse_zrange_options(rest, %{parsed | by: :lex})
+
+      {"REV", rest} ->
+        parse_zrange_options(rest, %{parsed | rev: true})
+
+      {"LIMIT", [offset, count | rest]} ->
+        parse_zrange_options(rest, %{parsed | limit: {offset, count}})
+
+      _other ->
+        {:error, "ERR syntax error"}
+    end
+  end
+
+  defp parse_zrange_options(_options, _parsed), do: {:error, "ERR syntax error"}
+
+  @doc """
+  Parses BYLEX bounds as Redis does: `-` and `+` for the ends, `[` before an
+  inclusive member and `(` before an exclusive one.
+  """
+  @spec parse_lex_range(binary(), binary()) :: {:ok, term(), term()} | {:error, binary()}
+  def parse_lex_range(min, max) do
+    with {:ok, min} <- parse_lex_bound(min),
+         {:ok, max} <- parse_lex_bound(max) do
+      {:ok, min, max}
+    else
+      :error -> {:error, "ERR min or max not valid string range item"}
+    end
+  end
+
+  defp parse_lex_bound("-"), do: {:ok, :neg_inf}
+  defp parse_lex_bound("+"), do: {:ok, :pos_inf}
+  defp parse_lex_bound("[" <> member), do: {:ok, {:incl, member}}
+  defp parse_lex_bound("(" <> member), do: {:ok, {:excl, member}}
+  defp parse_lex_bound(_bound), do: :error
+
+  @doc "Whether `member` lies at or after a parsed lex `min`."
+  def lex_after_min?(_member, :neg_inf), do: true
+  def lex_after_min?(_member, :pos_inf), do: false
+  def lex_after_min?(member, {:incl, min}), do: member >= min
+  def lex_after_min?(member, {:excl, min}), do: member > min
+
+  @doc "Whether `member` lies at or before a parsed lex `max`."
+  def lex_before_max?(_member, :pos_inf), do: true
+  def lex_before_max?(_member, :neg_inf), do: false
+  def lex_before_max?(member, {:incl, max}), do: member <= max
+  def lex_before_max?(member, {:excl, max}), do: member < max
+
+  @doc """
+  A parsed ZRANGE LIMIT as `{offset, count}`, Redis's way: a negative offset
+  answers no members and a negative count all of them.
+  """
+  @spec parse_range_limit(nil | {binary(), binary()}) ::
+          {:ok, non_neg_integer(), non_neg_integer() | :all} | {:error, binary()}
+  def parse_range_limit(nil), do: {:ok, 0, :all}
+
+  def parse_range_limit({offset, count}) do
+    case {Integer.parse(offset), Integer.parse(count)} do
+      {{offset, ""}, {_count, ""}} when offset < 0 -> {:ok, 0, 0}
+      {{offset, ""}, {count, ""}} when count < 0 -> {:ok, offset, :all}
+      {{offset, ""}, {count, ""}} -> {:ok, offset, count}
+      _invalid -> {:error, "ERR value is not an integer or out of range"}
+    end
+  end
+
+  @doc "The ZRANGEBYSCORE options that carry a parsed ZRANGE's LIMIT and WITHSCORES."
+  def zrange_score_options(%{limit: limit, with_scores: with_scores}) do
+    limit_options =
+      case limit do
+        {offset, count} -> ["LIMIT", offset, count]
+        nil -> []
+      end
+
+    if with_scores, do: ["WITHSCORES" | limit_options], else: limit_options
   end
 
   def parse_score_bound("-inf"), do: {:ok, :neg_infinity, false}
@@ -169,10 +272,11 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
   defp parse_zadd_opts(["GT" | rest], opts), do: parse_zadd_opts(rest, %{opts | gt: true})
   defp parse_zadd_opts(["LT" | rest], opts), do: parse_zadd_opts(rest, %{opts | lt: true})
   defp parse_zadd_opts(["CH" | rest], opts), do: parse_zadd_opts(rest, %{opts | ch: true})
+  defp parse_zadd_opts(["INCR" | rest], opts), do: parse_zadd_opts(rest, %{opts | incr: true})
 
   defp parse_zadd_opts([opt | rest], opts) when is_binary(opt) do
     case String.upcase(opt) do
-      normalized when normalized in ["NX", "XX", "GT", "LT", "CH"] ->
+      normalized when normalized in ["NX", "XX", "GT", "LT", "CH", "INCR"] ->
         parse_zadd_opts([normalized | rest], opts)
 
       _not_option ->
@@ -189,16 +293,22 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
         {:error, "ERR XX and NX options at the same time are not compatible"}
 
       opts.gt and opts.lt ->
-        {:error, "ERR GT, LT, and NX options at the same time are not compatible"}
+        {:error, "ERR GT, LT, and/or NX options at the same time are not compatible"}
 
       opts.gt and opts.nx ->
-        {:error, "ERR GT, LT, and NX options at the same time are not compatible"}
+        {:error, "ERR GT, LT, and/or NX options at the same time are not compatible"}
 
       opts.lt and opts.nx ->
-        {:error, "ERR GT, LT, and NX options at the same time are not compatible"}
+        {:error, "ERR GT, LT, and/or NX options at the same time are not compatible"}
 
-      rem(length(score_member_args), 2) != 0 or score_member_args == [] ->
+      score_member_args == [] ->
         {:error, "ERR wrong number of arguments for 'zadd' command"}
+
+      rem(length(score_member_args), 2) != 0 ->
+        {:error, "ERR syntax error"}
+
+      opts.incr and length(score_member_args) > 2 ->
+        {:error, "ERR INCR option supports a single increment-element pair"}
 
       true ->
         pairs =
@@ -230,8 +340,10 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
           [offset_str, count_str | remaining] ->
             with {off, ""} <- Integer.parse(offset_str),
                  {cnt, ""} <- Integer.parse(count_str) do
+              # As in Redis, a negative offset answers no members and a
+              # negative count all of them.
               if off < 0 do
-                {:error, "ERR syntax error"}
+                do_parse_range_by_score_opts(remaining, ws, 0, 0)
               else
                 real_count = if cnt < 0, do: :all, else: cnt
                 do_parse_range_by_score_opts(remaining, ws, off, real_count)
@@ -261,8 +373,16 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
          _offset,
          _count
        )
-       when is_integer(offset) and offset >= 0 and is_integer(count) do
-    do_typed_range_by_score_opts(rest, with_scores, offset, if(count < 0, do: :all, else: count))
+       when is_integer(offset) and is_integer(count) do
+    if offset < 0,
+      do: do_typed_range_by_score_opts(rest, with_scores, 0, 0),
+      else:
+        do_typed_range_by_score_opts(
+          rest,
+          with_scores,
+          offset,
+          if(count < 0, do: :all, else: count)
+        )
   end
 
   defp do_typed_range_by_score_opts(_opts, _with_scores, _offset, _count),
@@ -291,6 +411,8 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
       "COUNT" ->
         case Integer.parse(value) do
           {n, ""} when n > 0 -> do_parse_zscan_opts(rest, match, n)
+          # As in Redis, a COUNT below 1 is a syntax error.
+          {_n, ""} -> {:error, "ERR syntax error"}
           _ -> {:error, "ERR value is not an integer or out of range"}
         end
 

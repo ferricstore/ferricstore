@@ -31,7 +31,8 @@ defmodule Ferricstore.Commands.HyperLogLog do
 
   alias Ferricstore.HyperLogLog, as: HLL
 
-  @wrongtype_error {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+  # A string that is not a sketch; other types answer the usual WRONGTYPE.
+  @wrongtype_error {:error, "WRONGTYPE Key is not a valid HyperLogLog string value."}
   @sketch_size HLL.num_registers()
 
   @doc """
@@ -182,7 +183,9 @@ defmodule Ferricstore.Commands.HyperLogLog do
     {:error, "ERR wrong number of arguments for 'pfcount' command"}
   end
 
-  defp pfmerge_args([destkey | source_keys], store) when source_keys != [] do
+  # As in Redis, PFMERGE dest alone merges nothing into dest, creating an
+  # empty sketch when it is missing.
+  defp pfmerge_args([destkey | source_keys], store) when is_binary(destkey) do
     case read_sketches([destkey | source_keys], store) do
       {:ok, sketches} ->
         merged = Enum.reduce(sketches, &HLL.merge/2)
@@ -198,9 +201,26 @@ defmodule Ferricstore.Commands.HyperLogLog do
   end
 
   defp write_sketch(store, key, sketch, success_result) do
-    case Ops.put(store, key, sketch, 0) do
-      :ok -> success_result
-      {:error, _} = error -> error
+    with {:ok, expire_at_ms} <- sketch_expire_at(store, key) do
+      case Ops.put(store, key, sketch, expire_at_ms) do
+        :ok -> success_result
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  # PFADD and PFMERGE change the sketch in place, as Redis does, so it keeps
+  # its TTL. Releases before cluster feature level 5 drop it, and the state
+  # machine and a MULTI transaction write as they do below that level.
+  defp sketch_expire_at(store, key) do
+    if Ops.level_5_writes?(store) do
+      case Ops.expire_at_ms(store, key) do
+        expire_at_ms when is_integer(expire_at_ms) -> {:ok, expire_at_ms}
+        nil -> {:ok, 0}
+        {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      end
+    else
+      {:ok, 0}
     end
   end
 

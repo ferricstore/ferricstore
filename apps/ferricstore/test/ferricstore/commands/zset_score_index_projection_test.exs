@@ -28,6 +28,15 @@ defmodule Ferricstore.Commands.ZSetScoreIndexProjectionTest do
     assert 4 == Dispatcher.dispatch("ZCARD", [key], ctx)
   end
 
+  test "a member scored -0.0 counts as a tie at a bound of 0", %{ctx: ctx, key: key} do
+    assert 3 == Dispatcher.dispatch("ZADD", [key, "-0.0", "zero", "1", "b", "-1", "neg"], ctx)
+
+    assert ["b"] == Dispatcher.dispatch("ZRANGEBYSCORE", [key, "(0", "+inf"], ctx)
+    assert ["zero", "neg"] == Dispatcher.dispatch("ZREVRANGEBYSCORE", [key, "0", "-inf"], ctx)
+    assert ["zero", "b"] == Dispatcher.dispatch("ZRANGEBYSCORE", [key, "0", "+inf"], ctx)
+    assert ["neg"] == Dispatcher.dispatch("ZREVRANGEBYSCORE", [key, "(0", "-inf"], ctx)
+  end
+
   test "members removed by a multi-member ZREM leave the range", %{ctx: ctx, key: key} do
     assert [1] = zadd_single(ctx, key, 0.0, "a")
     assert [1] = zadd_single(ctx, key, 1.0, "b")

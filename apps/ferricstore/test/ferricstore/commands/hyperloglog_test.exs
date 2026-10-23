@@ -370,8 +370,12 @@ defmodule Ferricstore.Commands.HyperLogLogTest do
       assert msg =~ "wrong number of arguments"
     end
 
-    test "PFMERGE wrong number of args — error (only destkey)" do
-      assert {:error, msg} = HLLCmd.handle("PFMERGE", ["dest"], MockStore.make())
+    # Redis's PFMERGE arity is -2: a destination alone merges nothing into it.
+    test "PFMERGE with only destkey creates an empty sketch" do
+      store = MockStore.make()
+      assert :ok = HLLCmd.handle("PFMERGE", ["dest"], store)
+      assert 0 == HLLCmd.handle("PFCOUNT", ["dest"], store)
+      assert {:error, msg} = HLLCmd.handle("PFMERGE", [], store)
       assert msg =~ "wrong number of arguments"
     end
 

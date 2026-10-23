@@ -529,9 +529,24 @@ defmodule Ferricstore.Commands.TDigest do
     end
   end
 
+  # ADD, RESET and MERGE change the digest in place and keep its TTL; a MULTI
+  # transaction below cluster feature level 5 drops it, as older releases do.
   defp persist!(key, %Core{} = digest, store) do
-    encoded = serialize(digest)
-    Ops.put(store, key, TermCodec.encode(encoded), 0)
+    with {:ok, expire_at_ms} <- kept_expire_at(key, store) do
+      Ops.put(store, key, TermCodec.encode(serialize(digest)), expire_at_ms)
+    end
+  end
+
+  defp kept_expire_at(key, store) do
+    if Ops.level_5_writes?(store) do
+      case Ops.expire_at_ms(store, key) do
+        expire_at_ms when is_integer(expire_at_ms) -> {:ok, expire_at_ms}
+        nil -> {:ok, 0}
+        {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      end
+    else
+      {:ok, 0}
+    end
   end
 
   defp serialize(%Core{} = digest) do

@@ -136,10 +136,15 @@ defmodule Ferricstore.Transaction.Ast do
       do: count_pairs_up_to(pairs, limit, 0)
 
   def compound_member_work_up_to({tag, _key, fields}, limit)
-      when tag in [:hexpiretime, :hgetdel, :hpersist, :hpttl, :httl] and is_list(fields),
+      when tag in [:hexpiretime, :hgetdel, :hpersist, :hpttl, :httl] and
+             is_list(fields),
       do: count_items_up_to(fields, limit, 0)
 
   def compound_member_work_up_to({tag, _key, _ttl, fields}, limit)
+      when tag in [:hexpire, :hpexpire] and is_list(fields),
+      do: count_items_up_to(fields, limit, 0)
+
+  def compound_member_work_up_to({tag, _key, _ttl, _condition, fields}, limit)
       when tag in [:hexpire, :hpexpire] and is_list(fields),
       do: count_items_up_to(fields, limit, 0)
 

@@ -80,6 +80,7 @@ defmodule Ferricstore.Store.Router.Part10 do
                        ) do
                     {:ok, value} -> {{:value, value}, {fallback_keys, hot_hits}}
                     :fallback -> {:fallback, {[compound_key | fallback_keys], hot_hits}}
+                    {:error, _reason} = failure -> {{:value, failure}, {fallback_keys, hot_hits}}
                   end
 
                 terminal when waraft? and terminal in [:miss, :expired] ->
@@ -195,6 +196,9 @@ defmodule Ferricstore.Store.Router.Part10 do
 
           :miss ->
             fallback_compound_get(ctx, idx, redis_key, compound_key)
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            failure
         end
       end
 
@@ -250,6 +254,9 @@ defmodule Ferricstore.Store.Router.Part10 do
 
               :miss ->
                 :fallback
+
+              {:error, {:storage_read_failed, _reason}} = failure ->
+                failure
             end
         end
       end
@@ -388,6 +395,7 @@ defmodule Ferricstore.Store.Router.Part10 do
                        ) do
                     {:ok, meta} -> {{:value, meta}, {fallback_keys, hot_hits}}
                     :fallback -> {:fallback, {[compound_key | fallback_keys], hot_hits}}
+                    {:error, _reason} = failure -> {{:value, failure}, {fallback_keys, hot_hits}}
                   end
 
                 terminal when waraft? and terminal in [:miss, :expired] ->
@@ -474,6 +482,9 @@ defmodule Ferricstore.Store.Router.Part10 do
         )
       end
 
+      # Memory pressure may have evicted the marker's value; the shard reads it
+      # back and routes the collection.
+      defp promoted_marker_value?(nil), do: true
       defp promoted_marker_value?(_value), do: false
 
       # Type metadata already contains the escaped logical key. Reuse it
@@ -556,6 +567,9 @@ defmodule Ferricstore.Store.Router.Part10 do
 
               :miss ->
                 :fallback
+
+              {:error, {:storage_read_failed, _reason}} = failure ->
+                failure
             end
         end
       end
@@ -590,6 +604,9 @@ defmodule Ferricstore.Store.Router.Part10 do
 
           :miss ->
             fallback_compound_get_meta(ctx, idx, redis_key, compound_key)
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            failure
         end
       end
 

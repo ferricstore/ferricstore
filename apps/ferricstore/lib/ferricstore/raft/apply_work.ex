@@ -882,6 +882,7 @@ defmodule Ferricstore.Raft.ApplyWork do
   defp compound_command_members({:hgetdel, _key, fields}), do: fields
   defp compound_command_members({:zadd, _key, _opts, pairs}), do: pairs
   defp compound_command_members({:geoadd, _key, _flags, pairs}), do: pairs
+  defp compound_command_members({:hsetex, _key, _options, pairs}), do: pairs
   defp compound_command_members(_ast), do: [:member]
 
   defp consume_compound_items(items, remaining) do

@@ -1035,8 +1035,36 @@ defmodule FerricstoreServer.AclTest do
     test "consecutive wildcards compile to one greedy fragment" do
       regex = Acl.compile_glob("***cache:**")
 
-      assert Regex.source(regex) == "^.*cache:.*$"
+      assert Regex.source(regex) == "\\A.*cache:.*\\z"
       assert Regex.match?(regex, "tenant:cache:key")
+    end
+
+    # Redis matches ACL key and channel patterns with stringmatchlen: a
+    # backslash makes the next byte literal, character classes are byte sets,
+    # and every byte, a newline included, is an ordinary byte.
+    test "a backslash makes the next byte literal, inside and outside classes" do
+      regex = Acl.compile_glob("foo\\*")
+      assert Regex.match?(regex, "foo*")
+      refute Regex.match?(regex, "foo\\x")
+      refute Regex.match?(regex, "fooabc")
+
+      digit = Acl.compile_glob("key[\\d]")
+      assert Regex.match?(digit, "keyd")
+      refute Regex.match?(digit, "key1")
+    end
+
+    test "wildcards and classes cover newlines, and the pattern covers the whole key" do
+      assert Regex.match?(Acl.compile_glob("*"), "a\nb")
+      assert Regex.match?(Acl.compile_glob("a?b"), "a\nb")
+      refute Regex.match?(Acl.compile_glob("user"), "user\n")
+    end
+
+    test "classes match as Redis's: reversed ranges and unclosed classes" do
+      assert Regex.match?(Acl.compile_glob("[z-a]"), "m")
+      assert Regex.match?(Acl.compile_glob("a[bc"), "ac")
+      refute Regex.match?(Acl.compile_glob("a[bc"), "a[bc")
+      assert Regex.match?(Acl.compile_glob("[!a]"), "!")
+      refute Regex.match?(Acl.compile_glob("[!a]"), "b")
     end
 
     test "exact key match (no wildcards)" do

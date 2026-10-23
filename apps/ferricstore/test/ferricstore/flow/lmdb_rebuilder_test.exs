@@ -681,6 +681,57 @@ defmodule Ferricstore.Flow.LMDBRebuilderTest do
              )
   end
 
+  test "online reconciliation reads a cold terminal source in the apply projection" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lmdb_reconcile_cold_terminal_#{System.unique_integer([:positive])}"
+      )
+
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+    keydir = :ets.new(:lmdb_rebuilder_cold_terminal_keydir, [:set])
+    record = terminal_record("cold-terminal-flow", "partition-cold-terminal", 14)
+    projection = terminal_projection(record)
+    encoded = Ferricstore.Flow.encode_record(record)
+    index = 37
+
+    on_exit(fn ->
+      Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(data_dir, 0)
+      File.rm_rf!(data_dir)
+    end)
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(data_dir, 0, index, [
+               {projection.state_key, encoded, 0}
+             ])
+
+    true =
+      :ets.insert(
+        keydir,
+        {projection.state_key, nil, 0, 0, {:waraft_apply_projection, index}, 0,
+         byte_size(encoded)}
+      )
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, projection.ops)
+
+    assert :ok =
+             LMDBRebuilder.reconcile_shard(
+               shard_path,
+               keydir,
+               0,
+               %{data_dir: data_dir},
+               nil,
+               nil,
+               nil,
+               nil
+             )
+
+    assert {:ok, _terminal} = Ferricstore.Flow.LMDB.get(lmdb_path, projection.terminal_key)
+    state_index_key = Keys.state_index_key(record.type, record.state, record.partition_key)
+    assert {:ok, 1} = Ferricstore.Flow.LMDB.terminal_count(lmdb_path, state_index_key)
+  end
+
   test "reconciliation locates every key in a repeated apply projection index" do
     data_dir =
       Path.join(
@@ -965,6 +1016,17 @@ defmodule Ferricstore.Flow.LMDBRebuilderTest do
       File.read!(Path.expand("../../../lib/ferricstore/flow/lmdb_rebuilder.ex", __DIR__))
 
     refute source =~ "history_entries_by_key"
+  end
+
+  test "history rebuild staging retains a millisecond's latest versions" do
+    history_key = "f:{f}:h:flow-1"
+    entries = Enum.map(1..13, &{history_key, "1000-#{&1}", 1_000, "compound-#{&1}"})
+
+    assert LMDBRebuilder.__retained_staged_history_entries_for_test__(
+             entries,
+             history_key,
+             4
+           ) == Enum.map(10..13, &{"1000-#{&1}", 1_000, "compound-#{&1}"})
   end
 
   defp active_record(id, partition_key, sequence) do

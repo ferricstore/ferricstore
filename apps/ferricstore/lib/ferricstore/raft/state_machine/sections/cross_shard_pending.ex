@@ -428,7 +428,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
               emit_raft_apply_telemetry(state, started_at, result, :rolled_back)
               result
             else
-              flush_result = flush_pending_writes(state, publication)
+              flush_result =
+                case stage_watch_index_writes(state, result) do
+                  :ok ->
+                    flush_pending_writes(state, publication)
+
+                  {:error, _reason} = error ->
+                    rollback_pending_writes(state)
+                    error
+                end
+
               emit_raft_apply_telemetry(state, started_at, result, flush_result)
 
               case flush_result do
@@ -667,7 +676,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
             flow_create_apply_new_record(state, attrs, state_key)
 
           existing ->
-            case flow_create_duplicate_result(state, existing, attrs) do
+            value_reads = flow_create_value_reads(state, cross_shard_pending_active?())
+
+            case flow_create_duplicate_result(state, existing, attrs, value_reads) do
               {:ok, _existing} -> :ok
               {:error, _reason} = error -> error
             end
@@ -864,13 +875,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
       defp do_flow_named_value_put_pipeline_batch(_state, _attrs),
         do: {:error, "ERR flow items must be a non-empty list"}
 
-      defp do_flow_signal(state, %{id: id, signal: signal} = attrs) do
-        now_ms = flow_attrs_now_ms(attrs)
+      defp do_flow_signal(state, %{id: id, signal: _signal} = attrs) do
         partition_key = Map.get(attrs, :partition_key)
 
         with {:ok, record} <- flow_require_record(state, id, partition_key),
-             :ok <- flow_signal_idempotency_check(state, record, attrs),
-             :ok <- flow_signal_transition_allowed?(record, attrs),
+             {:ok, seen} <- flow_signal_idempotency_check(state, record, attrs) do
+          # From feature level 5 a retry of a signal already applied (same key,
+          # same content) changes nothing; older releases apply it again.
+          if seen == :applied and feature_level_5?(state),
+            do: :ok,
+            else: do_flow_signal_apply(state, record, attrs)
+        end
+      end
+
+      defp do_flow_signal_apply(state, record, %{id: id, signal: signal} = attrs) do
+        now_ms = flow_attrs_now_ms(attrs)
+        partition_key = Map.get(attrs, :partition_key)
+
+        with :ok <- flow_signal_transition_allowed?(record, attrs),
              {:ok, next} <- flow_signal_next_record(record, attrs, now_ms),
              next = flow_stamp_state_enter_seq_on_change(state, record, next),
              next = flow_refresh_indexed_attributes(state, next),
@@ -973,16 +995,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
                 Map.get(record, :partition_key)
               )
 
-            digest = flow_signal_digest(attrs)
-
             case sm_store_batch_get(state, [idem_key], &sm_file_path/2) do
-              [^digest] -> :ok
-              [nil] -> :ok
-              [_other] -> {:error, "ERR flow signal idempotency conflict"}
+              [nil] ->
+                {:ok, :new}
+
+              [stored] ->
+                if stored in flow_signal_stored_digests(attrs),
+                  do: {:ok, :applied},
+                  else: {:error, "ERR flow signal idempotency conflict"}
             end
 
           _ ->
-            :ok
+            {:ok, :new}
         end
       end
 
@@ -999,7 +1023,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
             raw_put_cold(
               state,
               idem_key,
-              flow_signal_digest(attrs),
+              flow_signal_digest(state, attrs),
               flow_record_expire_at(record)
             )
 
@@ -1008,18 +1032,38 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
         end
       end
 
-      defp flow_signal_digest(attrs) do
+      @flow_signal_digest_fields [
+        :signal,
+        :if_state,
+        :transition_to,
+        :run_at_ms,
+        :values,
+        :value_refs,
+        :drop_values,
+        :override_values
+      ]
+
+      # The digest is stored and compared on every replica, so from level 5 it
+      # does not depend on the OTP release (Ferricstore.CanonicalTerm); "c1:"
+      # tells it from the term_to_binary digests stored before, which a retry
+      # still matches.
+      defp flow_signal_digest(state, attrs) do
+        if feature_level_5?(state),
+          do: flow_signal_canonical_digest(attrs),
+          else: flow_signal_legacy_digest(attrs)
+      end
+
+      defp flow_signal_stored_digests(attrs),
+        do: [flow_signal_canonical_digest(attrs), flow_signal_legacy_digest(attrs)]
+
+      defp flow_signal_canonical_digest(attrs) do
+        fields = Map.new(@flow_signal_digest_fields, &{&1, Map.get(attrs, &1)})
+        "c1:" <> Base.encode16(Ferricstore.CanonicalTerm.digest(fields), case: :lower)
+      end
+
+      defp flow_signal_legacy_digest(attrs) do
         attrs
-        |> Map.take([
-          :signal,
-          :if_state,
-          :transition_to,
-          :run_at_ms,
-          :values,
-          :value_refs,
-          :drop_values,
-          :override_values
-        ])
+        |> Map.take(@flow_signal_digest_fields)
         |> :erlang.term_to_binary()
         |> then(&:crypto.hash(:sha256, &1))
         |> Base.encode16(case: :lower)

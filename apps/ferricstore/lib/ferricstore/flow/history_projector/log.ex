@@ -16,6 +16,19 @@ defmodule Ferricstore.Flow.HistoryProjector.Log do
 
   def read_value(_shard_data_path, _file_id, _offset), do: {:error, :not_flow_history}
 
+  @doc false
+  # The values at `offsets` of one history log, in order, with the log opened
+  # once; the whole read fails if any record does.
+  @spec read_values(binary(), {:flow_history, non_neg_integer()}, [non_neg_integer()]) ::
+          {:ok, [binary() | nil]} | {:error, term()}
+  def read_values(shard_data_path, {:flow_history, file_id}, offsets) when is_list(offsets) do
+    shard_data_path
+    |> history_file_path(file_id)
+    |> NIF.v2_pread_batch(offsets)
+  end
+
+  def read_values(_shard_data_path, _file_id, _offsets), do: {:error, :not_flow_history}
+
   @spec scan_event_value(binary(), binary()) :: {:ok, binary()} | :miss | {:error, term()}
   def scan_event_value(shard_data_path, target_key) do
     file_path = history_file_path(shard_data_path, 0)

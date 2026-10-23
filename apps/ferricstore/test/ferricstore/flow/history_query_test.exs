@@ -92,4 +92,20 @@ defmodule Ferricstore.Flow.HistoryQueryTest do
     assert HistoryQuery.validate_event_range("2000-b", "1000-a") ==
              {:error, "ERR flow from_event must be <= to_event"}
   end
+
+  test "event id ranges compare versions within a millisecond as numbers" do
+    events = Enum.map([1, 2, 9, 10, 11], &{"1000-#{&1}", %{"version" => &1}})
+    ids = &Enum.map(&1, fn {event_id, _fields} -> event_id end)
+
+    assert ids.(HistoryQuery.apply(events, %{@base_query | from_event: "1000-9"})) ==
+             ["1000-9", "1000-10", "1000-11"]
+
+    assert ids.(HistoryQuery.apply(events, %{@base_query | to_event: "1000-10"})) ==
+             ["1000-1", "1000-2", "1000-9", "1000-10"]
+
+    assert HistoryQuery.validate_event_range("1000-9", "1000-10") == :ok
+
+    assert HistoryQuery.validate_event_range("1000-10", "1000-9") ==
+             {:error, "ERR flow from_event must be <= to_event"}
+  end
 end

@@ -21,7 +21,7 @@ defmodule Ferricstore.Commands.HashFloatSafetyTest do
         flunk("an invalid stored float must not be replaced")
       end)
 
-    assert {:error, "ERR hash value is not a valid float"} =
+    assert {:error, "ERR hash value is not a float"} =
              Hash.handle("HINCRBYFLOAT", ["hash", "field", "1"], store)
   end
 

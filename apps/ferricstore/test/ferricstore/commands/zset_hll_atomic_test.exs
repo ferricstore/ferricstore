@@ -20,7 +20,7 @@ defmodule Ferricstore.Commands.ZsetHllAtomicTest do
   test "concurrent ZINCRBY increments are all applied", %{ctx: ctx, key: key} do
     run_concurrently(fn _client, _n -> Dispatcher.dispatch("ZINCRBY", [key, "1", "m"], ctx) end)
 
-    assert "#{@clients * @increments}.0" == Dispatcher.dispatch("ZSCORE", [key, "m"], ctx)
+    assert "#{@clients * @increments}" == Dispatcher.dispatch("ZSCORE", [key, "m"], ctx)
     assert ["m"] == Dispatcher.dispatch("ZRANGE", [key, "0", "-1"], ctx)
   end
 
@@ -88,7 +88,7 @@ defmodule Ferricstore.Commands.ZsetHllAtomicTest do
       Dispatcher.dispatch("ZADD", [key <> ":gt", "GT", "#{client * 100 + n}", "m"], ctx)
     end)
 
-    assert "#{@clients * 100 + @increments}.0" ==
+    assert "#{@clients * 100 + @increments}" ==
              Dispatcher.dispatch("ZSCORE", [key <> ":gt", "m"], ctx)
   end
 

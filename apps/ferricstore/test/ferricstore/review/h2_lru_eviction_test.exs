@@ -14,10 +14,19 @@ defmodule Ferricstore.Review.H2LruEvictionTest do
 
   alias Ferricstore.MemoryGuard
   alias Ferricstore.Store.LFU
+  alias Ferricstore.Test.ShardHelpers
 
   @keydir :keydir_0
 
+  # Each test key claims more bytes than any eviction deficit, so the guard
+  # stops after one eviction and that one shows which key it picks. (With small
+  # sizes it evicts every key it samples, and with other keys in the keydir it
+  # samples only some of these.)
+  @claimed_value_size 1 <<< 50
+
   setup do
+    ShardHelpers.flush_all_keys()
+
     on_exit(fn ->
       for i <- 0..9 do
         :ets.delete(@keydir, "lru_test_#{i}")
@@ -39,13 +48,21 @@ defmodule Ferricstore.Review.H2LruEvictionTest do
       old_lfu = LFU.pack(old_ldt, 5)
 
       for i <- 0..4 do
-        :ets.insert(@keydir, {"lru_test_#{i}", "val", far_future, old_lfu, 1, 0, 3})
+        :ets.insert(
+          @keydir,
+          {"lru_test_#{i}", "val", far_future, old_lfu, 1, 0, @claimed_value_size}
+        )
       end
 
       # Fresh keys: ldt = now, touched.
       for i <- 5..9 do
         fresh_lfu = LFU.pack(LFU.now_minutes(), 5)
-        :ets.insert(@keydir, {"lru_test_#{i}", "val", far_future, fresh_lfu, 1, 0, 3})
+
+        :ets.insert(
+          @keydir,
+          {"lru_test_#{i}", "val", far_future, fresh_lfu, 1, 0, @claimed_value_size}
+        )
+
         LFU.touch(@keydir, "lru_test_#{i}", fresh_lfu)
       end
 
@@ -63,22 +80,9 @@ defmodule Ferricstore.Review.H2LruEvictionTest do
 
       {evicted, survived} = partition_keys()
 
-      assert evicted != [], "expected eviction to occur"
-
-      evicted_ldts = ldts_for(evicted)
-      survived_ldts = ldts_for(survived)
-
-      # Correct LRU: all evicted keys have older ldt than all survived keys.
-      # max(evicted_ldts) <= min(survived_ldts)
-      if survived_ldts != [] and evicted_ldts != [] do
-        oldest_survivor = Enum.min(survived_ldts)
-        newest_evicted = Enum.max(evicted_ldts)
-
-        assert newest_evicted <= oldest_survivor,
-               "LRU violated: evicted key (ldt=#{newest_evicted}) is newer than " <>
-                 "surviving key (ldt=#{oldest_survivor}). " <>
-                 "evicted_ldts=#{inspect(evicted_ldts)}, survived_ldts=#{inspect(survived_ldts)}"
-      end
+      assert [evicted_key] = evicted
+      assert ldts_for([evicted_key]) == [old_ldt]
+      assert length(survived) == 9
     end
   end
 
@@ -90,12 +94,20 @@ defmodule Ferricstore.Review.H2LruEvictionTest do
       old_lfu = LFU.pack(old_ldt, 5)
 
       for i <- 0..4 do
-        :ets.insert(@keydir, {"lru_test_#{i}", "val", far_future, old_lfu, 1, 0, 3})
+        :ets.insert(
+          @keydir,
+          {"lru_test_#{i}", "val", far_future, old_lfu, 1, 0, @claimed_value_size}
+        )
       end
 
       for i <- 5..9 do
         fresh_lfu = LFU.pack(LFU.now_minutes(), 5)
-        :ets.insert(@keydir, {"lru_test_#{i}", "val", far_future, fresh_lfu, 1, 0, 3})
+
+        :ets.insert(
+          @keydir,
+          {"lru_test_#{i}", "val", far_future, fresh_lfu, 1, 0, @claimed_value_size}
+        )
+
         LFU.touch(@keydir, "lru_test_#{i}", fresh_lfu)
       end
 
@@ -113,20 +125,9 @@ defmodule Ferricstore.Review.H2LruEvictionTest do
 
       {evicted, survived} = partition_keys()
 
-      assert evicted != [], "expected eviction to occur"
-
-      evicted_ldts = ldts_for(evicted)
-      survived_ldts = ldts_for(survived)
-
-      if survived_ldts != [] and evicted_ldts != [] do
-        oldest_survivor = Enum.min(survived_ldts)
-        newest_evicted = Enum.max(evicted_ldts)
-
-        assert newest_evicted <= oldest_survivor,
-               "LRU violated: evicted key (ldt=#{newest_evicted}) is newer than " <>
-                 "surviving key (ldt=#{oldest_survivor}). " <>
-                 "evicted_ldts=#{inspect(evicted_ldts)}, survived_ldts=#{inspect(survived_ldts)}"
-      end
+      assert [evicted_key] = evicted
+      assert ldts_for([evicted_key]) == [old_ldt]
+      assert length(survived) == 9
     end
   end
 

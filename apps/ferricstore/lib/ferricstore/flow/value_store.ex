@@ -7,7 +7,7 @@ defmodule Ferricstore.Flow.ValueStore do
   alias Ferricstore.Flow.{Keys, ScopeBinding}
   alias Ferricstore.Flow.Telemetry, as: FlowTelemetry
   alias Ferricstore.Stats
-  alias Ferricstore.Store.{BlobValue, ColdRead, ReadResult, Router}
+  alias Ferricstore.Store.{BlobRef, BlobStore, BlobValue, ColdRead, ReadResult, Router}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
   @max_ref_size 4_096
@@ -274,24 +274,31 @@ defmodule Ferricstore.Flow.ValueStore do
   def raw_mget_with_file_refs(_ctx, [], _min_file_ref_size), do: []
 
   def raw_mget_with_file_refs(ctx, refs, min_file_ref_size) do
-    fetch_flow_value_refs(ctx, refs, fn flow_refs ->
-      Stats.with_cache_tracking_disabled(fn ->
-        Router.batch_get_with_file_refs(ctx, flow_refs, min_file_ref_size)
-      end)
-    end)
+    fetch_flow_value_refs(
+      ctx,
+      refs,
+      fn flow_refs ->
+        Stats.with_cache_tracking_disabled(fn ->
+          Router.batch_get_with_file_refs(ctx, flow_refs, min_file_ref_size)
+        end)
+      end,
+      min_file_ref_size
+    )
   end
 
-  defp fetch_flow_value_refs(ctx, refs, fetch) do
+  # `file_ref_min`: a blob-backed value at least this large comes back as a
+  # {:file_ref, path, offset, size} instead of being loaded (nil: always loaded).
+  defp fetch_flow_value_refs(ctx, refs, fetch, file_ref_min \\ nil) do
     if Enum.all?(refs, &Keys.value_key?/1) do
       refs
       |> fetch.()
-      |> flow_value_fill_lmdb_missing(ctx, refs)
+      |> flow_value_fill_lmdb_missing(ctx, refs, file_ref_min)
     else
-      fetch_filtered_flow_value_refs(ctx, refs, fetch)
+      fetch_filtered_flow_value_refs(ctx, refs, fetch, file_ref_min)
     end
   end
 
-  defp fetch_filtered_flow_value_refs(ctx, refs, fetch) do
+  defp fetch_filtered_flow_value_refs(ctx, refs, fetch, file_ref_min) do
     {mask, flow_refs} =
       refs
       |> Enum.reduce({[], []}, fn ref, {mask, flow_refs} ->
@@ -310,7 +317,7 @@ defmodule Ferricstore.Flow.ValueStore do
       flow_refs ->
         flow_refs
         |> fetch.()
-        |> flow_value_fill_lmdb_missing(ctx, flow_refs)
+        |> flow_value_fill_lmdb_missing(ctx, flow_refs, file_ref_min)
         |> restore_filtered_value_results(mask)
     end
   end
@@ -331,10 +338,14 @@ defmodule Ferricstore.Flow.ValueStore do
 
   defp restore_filtered_value_results(other, _mask), do: other
 
-  defp flow_value_fill_lmdb_missing(values, ctx, refs),
-    do: fill_lmdb_missing(values, ctx, refs, &flow_generated_payload_value_ref?/1)
+  defp flow_value_fill_lmdb_missing(values, ctx, refs, file_ref_min),
+    do: fill_lmdb_missing(values, ctx, refs, &flow_generated_payload_value_ref?/1, file_ref_min)
 
-  defp fill_lmdb_missing(values, ctx, refs, lmdb_backed?)
+  # A row the mirror locates but cannot read comes back as a ReadResult failure,
+  # as a keydir row that cannot be read does, never as a row that is gone.
+  defp fill_lmdb_missing(values, ctx, refs, lmdb_backed?, file_ref_min \\ nil)
+
+  defp fill_lmdb_missing(values, ctx, refs, lmdb_backed?, file_ref_min)
        when is_list(values) and is_list(refs) and length(values) == length(refs) do
     missing =
       refs
@@ -353,7 +364,10 @@ defmodule Ferricstore.Flow.ValueStore do
     else
       lmdb_values =
         ctx
-        |> flow_value_lmdb_mget(Enum.map(missing, fn {_idx, ref} -> ref end))
+        |> lmdb_read(Enum.map(missing, fn {_idx, ref} -> ref end), %{
+          now: now_ms(),
+          file_ref_min: file_ref_min
+        })
         |> List.to_tuple()
 
       replacements =
@@ -370,13 +384,20 @@ defmodule Ferricstore.Flow.ValueStore do
     end
   end
 
-  defp fill_lmdb_missing(values, _ctx, _refs, _lmdb_backed?), do: values
+  defp fill_lmdb_missing(values, _ctx, _refs, _lmdb_backed?, _file_ref_min), do: values
 
-  defp flow_value_lmdb_mget(_ctx, []), do: []
+  @doc false
+  # Values of `refs` that the history projector moved out of the keydir, read
+  # through the LMDB mirror of each ref's shard: nil where it holds none, a
+  # ReadResult failure where it cannot be read. Apply passes its own clock, so
+  # expiry is judged as the rest of the apply judges it.
+  @spec lmdb_mget(FerricStore.Instance.t(), [binary()], non_neg_integer()) ::
+          [binary() | nil | ReadResult.failure()]
+  def lmdb_mget(ctx, refs, now), do: lmdb_read(ctx, refs, %{now: now, file_ref_min: nil})
 
-  defp flow_value_lmdb_mget(ctx, refs) do
-    now = now_ms()
+  defp lmdb_read(_ctx, [], _read), do: []
 
+  defp lmdb_read(ctx, refs, read) do
     results =
       refs
       |> Enum.with_index()
@@ -384,13 +405,15 @@ defmodule Ferricstore.Flow.ValueStore do
       |> Enum.reduce(%{}, fn {path, group}, acc ->
         group_refs = Enum.map(group, fn {ref, _idx} -> ref end)
 
-        lmdb_values =
-          case Ferricstore.Flow.LMDB.get_many(path, group_refs) do
-            {:ok, values} -> values
-            {:error, _reason} -> Enum.map(group_refs, fn _ref -> :not_found end)
-          end
+        case Ferricstore.Flow.LMDB.get_many(path, group_refs) do
+          {:ok, lmdb_values} ->
+            flow_value_lmdb_decode_group(ctx, group, lmdb_values, read, acc)
 
-        flow_value_lmdb_decode_group(ctx, group, lmdb_values, now, acc)
+          {:error, reason} ->
+            Enum.reduce(group, acc, fn {_ref, idx}, inner_acc ->
+              Map.put(inner_acc, idx, ReadResult.failure(reason))
+            end)
+        end
       end)
 
     for idx <- 0..(length(refs) - 1)//1, do: Map.get(results, idx)
@@ -404,12 +427,12 @@ defmodule Ferricstore.Flow.ValueStore do
     |> Ferricstore.Flow.LMDB.path()
   end
 
-  defp flow_value_lmdb_decode_group(ctx, group, lmdb_values, now, acc) do
+  defp flow_value_lmdb_decode_group(ctx, group, lmdb_values, read, acc) do
     {acc, locators} =
       group
       |> Enum.zip(lmdb_values)
       |> Enum.reduce({acc, []}, fn {{ref, idx}, lmdb_value}, {inner_acc, locators} ->
-        case flow_value_lmdb_classify(ctx, ref, lmdb_value, now) do
+        case flow_value_lmdb_classify(ctx, ref, lmdb_value, read) do
           {:value, value} ->
             {Map.put(inner_acc, idx, value), locators}
 
@@ -421,18 +444,23 @@ defmodule Ferricstore.Flow.ValueStore do
         end
       end)
 
-    flow_value_lmdb_read_locators(ctx, locators, acc)
+    flow_value_lmdb_read_locators(ctx, locators, acc, read.file_ref_min)
   end
 
-  defp flow_value_lmdb_classify(ctx, ref, {:ok, blob}, now) when is_binary(blob) do
+  defp flow_value_lmdb_classify(ctx, ref, {:ok, blob}, %{now: now} = read)
+       when is_binary(blob) do
     case Ferricstore.Flow.LMDB.decode_value_locator(blob, now) do
       {:ok, locator} ->
         {:locator, locator}
 
       :not_locator ->
         case Ferricstore.Flow.LMDB.decode_value(blob, now) do
-          {:ok, value} -> {:value, flow_value_maybe_materialize_lmdb_value(ctx, ref, value)}
-          _other -> :missing
+          {:ok, value} ->
+            {:value,
+             flow_value_materialize(ctx, Router.shard_for(ctx, ref), value, read.file_ref_min)}
+
+          _other ->
+            :missing
         end
 
       _other ->
@@ -440,23 +468,38 @@ defmodule Ferricstore.Flow.ValueStore do
     end
   end
 
-  defp flow_value_lmdb_classify(_ctx, _ref, _result, _now), do: :missing
+  defp flow_value_lmdb_classify(_ctx, _ref, _result, _read), do: :missing
 
-  defp flow_value_lmdb_read_locators(_ctx, [], acc), do: acc
+  defp flow_value_lmdb_read_locators(_ctx, [], acc, _file_ref_min), do: acc
 
-  defp flow_value_lmdb_read_locators(ctx, locators, acc) do
+  defp flow_value_lmdb_read_locators(ctx, locators, acc, file_ref_min) do
     {waraft_locators, other_locators} =
       Enum.split_with(locators, fn {_idx, _ref, {file_id, _offset, _value_size}} ->
         waraft_segment_file_id?(file_id)
       end)
 
-    acc =
-      Enum.reduce(other_locators, acc, fn {idx, ref, locator}, inner_acc ->
-        case flow_value_read_lmdb_locator(ctx, ref, locator) do
-          nil -> inner_acc
-          value -> Map.put(inner_acc, idx, value)
-        end
+    {history_locators, file_locators} =
+      Enum.split_with(other_locators, fn {_idx, _ref, {file_id, _offset, _value_size}} ->
+        match?({:flow_history, _file_id}, file_id)
       end)
+
+    acc =
+      history_locators
+      |> Enum.group_by(fn {_idx, ref, {file_id, _offset, _value_size}} ->
+        {Router.shard_for(ctx, ref), file_id}
+      end)
+      |> Enum.reduce(acc, fn {{shard_index, file_id}, entries}, inner_acc ->
+        flow_value_read_history_locators(
+          ctx,
+          shard_index,
+          file_id,
+          entries,
+          inner_acc,
+          file_ref_min
+        )
+      end)
+
+    acc = flow_value_read_lmdb_locators_one_by_one(ctx, file_locators, acc, file_ref_min)
 
     waraft_locators
     |> Enum.group_by(fn {_idx, ref, {file_id, _offset, _value_size}} ->
@@ -472,15 +515,113 @@ defmodule Ferricstore.Flow.ValueStore do
              refs
            ) do
         {:ok, values} ->
-          flow_value_lmdb_put_waraft_locator_values(ctx, shard_index, entries, values, inner_acc)
+          flow_value_lmdb_put_waraft_locator_values(
+            ctx,
+            shard_index,
+            entries,
+            values,
+            inner_acc,
+            file_ref_min
+          )
 
-        _missing_or_error ->
+        {:error, reason} ->
+          Enum.reduce(entries, inner_acc, fn {idx, _ref, _locator}, entries_acc ->
+            Map.put(entries_acc, idx, ReadResult.failure(reason))
+          end)
+      end
+    end)
+  end
+
+  # One read of each history log for all its values in the batch. The batch
+  # read fails as a whole on one bad record, so then each value is read alone
+  # to tell which.
+  defp flow_value_read_history_locators(ctx, shard_index, file_id, entries, acc, file_ref_min) do
+    offsets = Enum.map(entries, fn {_idx, _ref, {_file_id, offset, _size}} -> offset end)
+
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, shard_index)
+
+    case Ferricstore.Flow.HistoryProjector.read_values(shard_path, file_id, offsets) do
+      {:ok, values} when length(values) == length(entries) ->
+        entries
+        |> Enum.zip(values)
+        |> Enum.reduce(acc, fn
+          {{idx, _ref, _locator}, value}, inner_acc when is_binary(value) ->
+            Map.put(inner_acc, idx, flow_value_materialize(ctx, shard_index, value, file_ref_min))
+
+          {_entry, _absent}, inner_acc ->
+            inner_acc
+        end)
+
+      _failed ->
+        flow_value_read_lmdb_locators_one_by_one(ctx, entries, acc, file_ref_min)
+    end
+  end
+
+  defp flow_value_read_lmdb_locators_one_by_one(ctx, locators, acc, file_ref_min) do
+    Enum.reduce(locators, acc, fn {idx, ref, locator}, inner_acc ->
+      case flow_value_read_lmdb_locator(ctx, ref, locator, file_ref_min) do
+        nil -> inner_acc
+        value -> Map.put(inner_acc, idx, value)
+      end
+    end)
+  end
+
+  defp flow_value_materialize(ctx, shard_index, value, file_ref_min) do
+    case flow_value_blob_file_ref(ctx, shard_index, value, file_ref_min) do
+      :load ->
+        case BlobValue.maybe_materialize(
+               ctx.data_dir,
+               shard_index,
+               BlobValue.threshold(ctx),
+               value
+             ) do
+          {:ok, materialized} -> materialized
+          {:error, reason} -> ReadResult.failure(reason)
+        end
+
+      file_ref_or_failure ->
+        file_ref_or_failure
+    end
+  end
+
+  # A caller that only needs a large value's size gets a blob-backed one as a
+  # file ref, as Router.batch_get_with_file_refs gives one still in the keydir.
+  defp flow_value_blob_file_ref(ctx, shard_index, value, file_ref_min)
+       when is_integer(file_ref_min) and is_binary(value) do
+    with true <- BlobRef.encoded_size?(byte_size(value)),
+         {:ok, %BlobRef{size: size} = ref} when size >= file_ref_min <- BlobRef.decode(value) do
+      case BlobStore.file_ref(ctx.data_dir, shard_index, ref) do
+        {:ok, {path, offset, file_size}} -> {:file_ref, path, offset, file_size}
+        {:error, reason} -> ReadResult.failure(reason)
+      end
+    else
+      _small_or_not_blob -> :load
+    end
+  end
+
+  defp flow_value_blob_file_ref(_ctx, _shard_index, _value, _file_ref_min), do: :load
+
+  defp flow_value_lmdb_put_waraft_locator_values(
+         ctx,
+         shard_index,
+         entries,
+         values,
+         acc,
+         file_ref_min
+       )
+       when is_integer(file_ref_min) do
+    Enum.reduce(entries, acc, fn {idx, ref, _locator}, inner_acc ->
+      case Map.fetch(values, ref) do
+        {:ok, value} ->
+          Map.put(inner_acc, idx, flow_value_materialize(ctx, shard_index, value, file_ref_min))
+
+        :error ->
           inner_acc
       end
     end)
   end
 
-  defp flow_value_lmdb_put_waraft_locator_values(ctx, shard_index, entries, values, acc) do
+  defp flow_value_lmdb_put_waraft_locator_values(ctx, shard_index, entries, values, acc, nil) do
     found =
       Enum.flat_map(entries, fn {idx, ref, _locator} ->
         case Map.fetch(values, ref) do
@@ -503,8 +644,8 @@ defmodule Ferricstore.Flow.ValueStore do
       {{idx, _value}, {:ok, materialized_value}}, inner_acc ->
         Map.put(inner_acc, idx, materialized_value)
 
-      {_entry, {:error, _reason}}, inner_acc ->
-        inner_acc
+      {{idx, _value}, {:error, reason}}, inner_acc ->
+        Map.put(inner_acc, idx, ReadResult.failure(reason))
     end)
   end
 
@@ -515,34 +656,18 @@ defmodule Ferricstore.Flow.ValueStore do
 
   defp waraft_segment_file_id?(_file_id), do: false
 
-  defp flow_value_maybe_materialize_lmdb_value(ctx, ref, value) do
-    shard_index = Router.shard_for(ctx, ref)
-
-    case BlobValue.maybe_materialize(
-           ctx.data_dir,
-           shard_index,
-           BlobValue.threshold(ctx),
-           value
-         ) do
-      {:ok, materialized} -> materialized
-      {:error, _reason} -> nil
-    end
-  end
-
-  defp flow_value_read_lmdb_locator(ctx, key, {file_id, offset, _value_size}) do
+  defp flow_value_read_lmdb_locator(ctx, key, {file_id, offset, _value_size}, file_ref_min) do
     shard_index = Router.shard_for(ctx, key)
 
-    with {:ok, value} <- flow_value_read_locator_bytes(ctx, shard_index, key, file_id, offset),
-         {:ok, materialized} <-
-           BlobValue.maybe_materialize(
-             ctx.data_dir,
-             shard_index,
-             BlobValue.threshold(ctx),
-             value
-           ) do
-      materialized
-    else
-      _error -> nil
+    case flow_value_read_locator_bytes(ctx, shard_index, key, file_id, offset) do
+      {:ok, value} when is_binary(value) ->
+        flow_value_materialize(ctx, shard_index, value, file_ref_min)
+
+      {:error, reason} ->
+        ReadResult.failure(reason)
+
+      _absent ->
+        nil
     end
   end
 

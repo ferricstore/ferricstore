@@ -56,7 +56,7 @@ defmodule Ferricstore.Flow.Transfer do
 
   alias Ferricstore.Flow.HistoryProjector.KeyCodec
   alias Ferricstore.Flow.Transfer.{PlainKeys, Retag}
-  alias Ferricstore.Store.Router
+  alias Ferricstore.Store.{ReadResult, Router}
   alias Ferricstore.TermCodec
 
   @magic "FERRICSTORE FLOW EXPORT\n"
@@ -245,18 +245,20 @@ defmodule Ferricstore.Flow.Transfer do
     keys
     |> Enum.chunk_every(@record_batch)
     |> Enum.reduce_while({:ok, hash, 0}, fn chunk, {:ok, hash, count} ->
-      chunk
-      |> Enum.zip(ValueStore.raw_mget_any(ctx, chunk))
-      |> Enum.reduce_while({:ok, hash, count}, fn
-        {_key, nil}, acc ->
-          {:cont, acc}
+      with {:ok, values} <- read_values(ctx, chunk) do
+        chunk
+        |> Enum.zip(values)
+        |> Enum.reduce_while({:ok, hash, count}, fn
+          {_key, nil}, acc ->
+            {:cont, acc}
 
-        {key, value}, {:ok, hash, count} when is_binary(value) ->
-          {:ok, hash} =
-            write_frame(io, hash, {:shared_value, key, value, Map.fetch!(shared, key)})
+          {key, value}, {:ok, hash, count} when is_binary(value) ->
+            {:ok, hash} =
+              write_frame(io, hash, {:shared_value, key, value, Map.fetch!(shared, key)})
 
-          {:cont, {:ok, hash, count + 1}}
-      end)
+            {:cont, {:ok, hash, count + 1}}
+        end)
+      end
       |> case do
         {:ok, _hash, _count} = ok -> {:cont, ok}
         error -> {:halt, error}
@@ -288,21 +290,25 @@ defmodule Ferricstore.Flow.Transfer do
     rows
     |> Enum.chunk_every(@record_batch)
     |> Enum.reduce_while({:ok, hash, 0}, fn chunk, {:ok, hash, count} ->
-      values = ValueStore.raw_mget_any(ctx, Enum.map(chunk, &elem(&1, 0)))
+      case read_values(ctx, Enum.map(chunk, &elem(&1, 0))) do
+        {:ok, values} ->
+          {hash, count} =
+            chunk
+            |> Enum.zip(values)
+            |> Enum.reduce({hash, count}, fn
+              {{_key, _expire_at_ms}, nil}, acc ->
+                acc
 
-      {hash, count} =
-        chunk
-        |> Enum.zip(values)
-        |> Enum.reduce({hash, count}, fn
-          {{_key, _expire_at_ms}, nil}, acc ->
-            acc
+              {{key, expire_at_ms}, value}, {hash, count} when is_binary(value) ->
+                {:ok, hash} = write_frame(io, hash, {:governance, key, value, expire_at_ms})
+                {hash, count + 1}
+            end)
 
-          {{key, expire_at_ms}, value}, {hash, count} when is_binary(value) ->
-            {:ok, hash} = write_frame(io, hash, {:governance, key, value, expire_at_ms})
-            {hash, count + 1}
-        end)
+          {:cont, {:ok, hash, count}}
 
-      {:cont, {:ok, hash, count}}
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
     end)
   end
 
@@ -403,24 +409,25 @@ defmodule Ferricstore.Flow.Transfer do
 
     history_key = Keys.history_key(id, partition_key)
 
+    aux = Map.get(scan.signals, state_key, []) ++ Map.get(scan.links, state_key, [])
+    owned = Map.get(scan.owned, state_key, [])
+
     with {:ok, raw_history} <-
            retry_transient(fn -> HistoryRead.raw_entries(ctx, id, partition_key, history_key) end),
-         {:ok, history} <- decode_history(state_key, raw_history) do
-      refs = owned_value_refs(record, history)
-      aux = Map.get(scan.signals, state_key, []) ++ Map.get(scan.links, state_key, [])
-      owned = Map.get(scan.owned, state_key, [])
-      owned_values = ValueStore.raw_mget_any(ctx, Enum.map(owned, &elem(&1, 0)))
-
+         {:ok, history} <- decode_history(state_key, raw_history),
+         refs = owned_value_refs(record, history),
+         {:ok, values} <- read_values(ctx, refs),
+         {:ok, aux_values} <- read_values(ctx, Enum.map(aux, &elem(&1, 1))),
+         {:ok, owned_values} <- read_values(ctx, Enum.map(owned, &elem(&1, 0))) do
       {:ok,
        %{
          state_key: state_key,
          record: record,
-         values: present_rows(refs, ValueStore.raw_mget(ctx, refs)),
+         values: present_rows(refs, values),
          history: history,
          aux:
            for(
-             {{kind, key}, value} <-
-               Enum.zip(aux, ValueStore.raw_mget_any(ctx, Enum.map(aux, &elem(&1, 1)))),
+             {{kind, key}, value} <- Enum.zip(aux, aux_values),
              is_binary(value),
              do: {kind, key, value}
            ) ++
@@ -485,6 +492,17 @@ defmodule Ferricstore.Flow.Transfer do
   end
 
   defp owned_value_ref?(_ref), do: false
+
+  # Stored rows of `keys`, nil where a row is gone. A row that cannot be read
+  # fails the export: leaving it behind would restore its owner without it.
+  defp read_values(ctx, keys) do
+    values = ValueStore.raw_mget_any(ctx, keys)
+
+    case ReadResult.first_failure(values) do
+      nil -> {:ok, values}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   defp present_rows(keys, values) do
     for {key, value} <- Enum.zip(keys, values), is_binary(value), do: {key, value}

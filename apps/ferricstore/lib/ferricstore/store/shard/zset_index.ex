@@ -874,7 +874,9 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
 
   defp after_score_ties(:"$end_of_table", _table, redis_key, _score), do: first_after(redis_key)
 
-  defp after_score_ties({redis_key, @index_tag, score, _member} = key, table, redis_key, score) do
+  # Scores tie as numbers: -0.0 ties with 0.0, though the two floats differ.
+  defp after_score_ties({redis_key, @index_tag, tie, _member} = key, table, redis_key, score)
+       when tie == score do
     table
     |> :ets.next(key)
     |> after_score_ties(table, redis_key, score)

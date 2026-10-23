@@ -53,6 +53,10 @@ defmodule Ferricstore.Raft.Backend do
   @spec waraft?() :: boolean()
   def waraft?, do: true
 
+  @doc "This node's Raft role for the shard, or `:unknown`."
+  @spec local_role(non_neg_integer()) :: atom()
+  def local_role(shard_index), do: WARaftBackend.local_role(shard_index)
+
   @spec write(non_neg_integer(), tuple()) :: term()
   def write(shard_index, command) do
     trace_ra_wait(fn ->

@@ -50,14 +50,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       defp flow_after_history_put(state, record) do
         with :ok <- flow_history_trim(state, record),
              :ok <- maybe_queue_terminal_lmdb_history_indexes(state, record) do
-          Ferricstore.Flow.Scheduler.notify_target_terminal(state.instance_ctx, record)
+          Ferricstore.Flow.Scheduler.notify_target_terminal(
+            state.instance_ctx,
+            state.shard_index,
+            record
+          )
+
           HistoryValueRelease.notify(state.instance_ctx, state.shard_index, record)
           :ok
         end
       end
 
       defp flow_history_trim_oldest(state, record, id, partition_key, history_key, delete_count) do
-        events = flow_index_rank_range(state, history_key, 0, delete_count - 1, false)
+        events = flow_history_end_range(state, history_key, delete_count, false)
 
         with :ok <-
                flow_history_delete_oldest_events(
@@ -428,6 +433,66 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
         :ok
       end
 
+      # Values a record refers to. Once this node's history projector has
+      # projected a value it deletes the value's keydir row, and the shard's
+      # LMDB mirror locates the value instead. Projection progress is local to
+      # each node, so apply reads both, as Flow reads do, and every replica
+      # decides alike.
+      defp flow_record_value_batch_get(state, refs) do
+        values = sm_store_batch_get(state, refs, &sm_file_path/2)
+
+        case {flow_projected_value_refs(state, refs, values), instance_ctx_for_state(state)} do
+          {[_ | _] = projected, %FerricStore.Instance{} = ctx} ->
+            now_ms = Ferricstore.ExpiryContext.now_ms(Ferricstore.ExpiryContext.capture())
+
+            found =
+              projected
+              |> Enum.zip(Ferricstore.Flow.ValueStore.lmdb_mget(ctx, projected, now_ms))
+              |> Map.new()
+
+            Enum.zip_with(refs, values, fn
+              ref, nil -> flow_projected_value(state, ref, Map.get(found, ref))
+              _ref, value -> value
+            end)
+
+          _nothing_projected_or_no_instance ->
+            values
+        end
+      end
+
+      # Value refs found neither among this apply's pending writes nor in the keydir.
+      defp flow_projected_value_refs(state, refs, values) do
+        pending = Process.get(:sm_pending_values) || %{}
+
+        for {ref, nil} <- Enum.zip(refs, values),
+            FlowKeys.value_key?(ref),
+            not Map.has_key?(pending, ref),
+            not flow_keydir_member?(state, ref),
+            uniq: true,
+            do: ref
+      end
+
+      defp flow_keydir_member?(state, key) do
+        :ets.member(state.ets, key)
+      rescue
+        # sm_store_batch_get has already recorded the missing keydir.
+        ArgumentError -> true
+      end
+
+      # The mirror is this node's own, derived view of where a value went. A value
+      # it cannot read stays absent, as it was before apply read the mirror:
+      # failing the command would block the shard's apply until it restarts.
+      defp flow_projected_value(state, ref, {:error, {:storage_read_failed, reason}}) do
+        Logger.warning(
+          "Shard #{state.shard_index}: apply cannot read Flow value #{inspect(ref)} " <>
+            "from the LMDB mirror: #{inspect(reason)}"
+        )
+
+        nil
+      end
+
+      defp flow_projected_value(_state, _ref, value), do: value
+
       defp flow_refresh_record_value_expirations(state, record, attrs) do
         refs =
           [:payload, :result, :error]
@@ -435,7 +500,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
           |> Enum.map(fn kind -> Map.get(record, flow_value_ref_field(kind)) end)
           |> Enum.filter(&flow_owned_value_ref?/1)
 
-        values = sm_store_batch_get(state, refs, &sm_file_path/2)
+        # Older releases refresh only values still in the keydir.
+        values =
+          if feature_level_5?(state),
+            do: flow_record_value_batch_get(state, refs),
+            else: sm_store_batch_get(state, refs, &sm_file_path/2)
+
         expire_at_ms = flow_record_expire_at(record)
 
         refs
@@ -1118,9 +1188,32 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       defp set_current_meta(state, key, true), do: do_get_meta(state, key)
 
       defp set_current_meta(state, key, false) do
-        case plain_expire_at_ms(state, key) do
-          nil -> nil
-          expire_at_ms -> {nil, expire_at_ms}
+        case staged_set_meta(state, key) do
+          {:staged, meta} ->
+            meta
+
+          :keydir ->
+            case plain_expire_at_ms(state, key) do
+              nil -> nil
+              expire_at_ms -> {nil, expire_at_ms}
+            end
+        end
+      end
+
+      # A write staged earlier in the same entry is the key's current state.
+      # Its keydir row is :pending and holds no value when the value is not
+      # cached (over the hot-cache size, a blob or a cold write), and the
+      # keydir read below took that row for an expired one: SET NX then wrote
+      # over it and SET XX skipped. Releases before level 5 apply it that way.
+      defp staged_set_meta(state, key) do
+        with %{^key => _staged} <- Process.get(:sm_pending_values),
+             true <- feature_level_5?(state) do
+          case sm_pending_value_meta(key) do
+            {:hit, _value, expire_at_ms} -> {:staged, {nil, expire_at_ms}}
+            :miss -> {:staged, nil}
+          end
+        else
+          _not_staged_or_below_level_5 -> :keydir
         end
       end
 

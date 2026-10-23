@@ -124,6 +124,14 @@ defmodule Ferricstore.FlowTest do
 
   defp uid(prefix), do: "#{prefix}:#{System.unique_integer([:positive])}"
 
+  # A shard's history projector bumps its write version when it publishes
+  # projected history. A test reading write versions as a count of Raft writes
+  # lets projection of its setup writes finish first.
+  defp flush_history_projection(ctx) do
+    for shard_index <- 0..(ctx.shard_count - 1),
+        do: assert(:ok = Ferricstore.Flow.HistoryProjector.flush(ctx, shard_index))
+  end
+
   defp yield_non_empty_claim(task) do
     case Task.yield(task, 0) do
       {:ok, {:ok, [_ | _] = claimed}} -> claimed

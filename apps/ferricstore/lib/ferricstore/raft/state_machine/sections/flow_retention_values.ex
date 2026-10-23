@@ -598,8 +598,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
              :ok <- flow_require_expected_version(record, Map.get(attrs, :expected_version)),
              :ok <- flow_require_rewindable(record),
              :ok <- flow_require_expected_state(record, Map.get(attrs, :expect_state)),
-             {:ok, target_fields} <-
-               flow_history_event_fields(state, record, to_event, partition_key),
+             {:ok, target_fields} <- flow_rewind_target_fields(state, record, attrs),
              :ok <- flow_rewind_require_unreleased_values(state, record, target_fields, attrs),
              {:ok, next} <- flow_rewind_record(record, target_fields, attrs, now_ms) do
           next = Map.put(next, :rewound_to_event_id, to_event)
@@ -617,6 +616,48 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
             :ok
           end
         end
+      end
+
+      # History is per node, so from feature level 5 apply does not read it: the
+      # rewind carries its target's stored entry (Ferricstore.Flow.RewindTarget),
+      # and only an event within the record's history cap, which no projector
+      # trims, may be restored.
+      defp flow_rewind_target_fields(state, record, %{to_event: to_event} = attrs) do
+        entry = Map.get(attrs, :target_entry)
+
+        cond do
+          not feature_level_5?(state) ->
+            flow_history_event_fields(state, record, to_event, Map.get(attrs, :partition_key))
+
+          is_binary(entry) and flow_history_event_retained?(record, to_event) ->
+            fields = flow_rewind_entry_fields(entry, record)
+
+            if to_string(Map.get(fields, "version")) ==
+                 Integer.to_string(Ferricstore.Flow.HistoryEvent.version(to_event)),
+               do: {:ok, fields},
+               else: {:error, "ERR flow rewind target event not found"}
+
+          true ->
+            {:error, "ERR flow rewind target event not found"}
+        end
+      end
+
+      # The entry came through Raft, so every replica decodes it: one that does not
+      # decode is refused everywhere rather than raising in every apply.
+      defp flow_rewind_entry_fields(entry, record) do
+        entry |> flow_decode_history_fields(record) |> flow_history_fields_to_map()
+      rescue
+        _invalid -> %{}
+      end
+
+      # A Flow's events carry consecutive versions, and the history projectors
+      # keep its newest history_max_events of them.
+      defp flow_history_event_retained?(%{version: version} = record, event_id) do
+        target = Ferricstore.Flow.HistoryEvent.version(event_id)
+        max_events = Map.get(record, :history_max_events)
+
+        target > 0 and target <= version and
+          (not (is_integer(max_events) and max_events > 0) or version - target < max_events)
       end
 
       defp flow_queue_lmdb_reactivated_state_projection(_state, state_key, record)

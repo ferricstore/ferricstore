@@ -58,6 +58,28 @@ defmodule FerricstoreServer.Health.Dashboard.CircuitReviewTest do
     assert {:ok, ^before} = FerricStore.flow_circuit_get(scope)
   end
 
+  # The store stamps circuits with the cluster's hybrid clock, which runs
+  # ahead of the wall clock after it sees a later timestamp from a peer; a
+  # dashboard change stamped with the wall clock was then refused as earlier.
+  test "a dashboard close right after an open holds while the cluster clock runs ahead" do
+    ahead_ms = System.system_time(:millisecond) + 400
+    Ferricstore.HLC.update({ahead_ms, 0})
+    # The clock never goes back: let the wall clock catch up for later tests.
+    on_exit(fn -> Process.sleep(max(ahead_ms - System.system_time(:millisecond), 0) + 10) end)
+    scope = unique_scope()
+    {:ok, circuit} = FerricStore.flow_circuit_open(scope)
+
+    params = %{
+      "action" => "close_circuit",
+      "scope" => scope,
+      "expected_review" => CircuitStore.review_fingerprint(circuit),
+      "confirm_action" => "true"
+    }
+
+    assert {:ok, _} = Governance.apply_form(params)
+    assert {:ok, %{status: :closed}} = FerricStore.flow_circuit_get(scope)
+  end
+
   test "unchanged close ignores irrelevant Open fields and repeat rejects stale review" do
     scope = unique_scope()
     {:ok, circuit} = FerricStore.flow_circuit_open(scope)
@@ -108,7 +130,8 @@ defmodule FerricstoreServer.Health.Dashboard.CircuitReviewTest do
     scope = unique_scope()
     {:ok, circuit} = FerricStore.flow_circuit_open(scope)
     fingerprint = CircuitStore.review_fingerprint(circuit)
-    now = System.system_time(:millisecond)
+    # The store's clock, which stamped the open.
+    now = Ferricstore.CommandTime.now_ms()
 
     results =
       1..8

@@ -24,14 +24,14 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zadd do
           SortedSet.handle("ZADD", ["zs", "1.0", "a"], store)
           assert 1 == SortedSet.handle("ZADD", ["zs", "NX", "5.0", "a", "2.0", "b"], store)
           # a should still have score 1.0
-          assert "1.0" == SortedSet.handle("ZSCORE", ["zs", "a"], store)
+          assert "1" == SortedSet.handle("ZSCORE", ["zs", "a"], store)
         end
 
         test "ZADD options are case-insensitive" do
           store = MockStore.make()
           assert 1 == SortedSet.handle("ZADD", ["zs", "nx", "1.0", "a"], store)
           assert 0 == SortedSet.handle("ZADD", ["zs", "xx", "2.0", "b"], store)
-          assert "1.0" == SortedSet.handle("ZSCORE", ["zs", "a"], store)
+          assert "1" == SortedSet.handle("ZSCORE", ["zs", "a"], store)
           assert nil == SortedSet.handle("ZSCORE", ["zs", "b"], store)
         end
 
@@ -40,7 +40,7 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zadd do
           SortedSet.handle("ZADD", ["zs", "1.0", "a"], store)
           assert 0 == SortedSet.handle("ZADD", ["zs", "XX", "5.0", "a", "2.0", "b"], store)
           # a should be updated to 5.0
-          assert "5.0" == SortedSet.handle("ZSCORE", ["zs", "a"], store)
+          assert "5" == SortedSet.handle("ZSCORE", ["zs", "a"], store)
           # b should not exist
           assert nil == SortedSet.handle("ZSCORE", ["zs", "b"], store)
         end
@@ -57,9 +57,9 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zadd do
           SortedSet.handle("ZADD", ["zs", "5.0", "a"], store)
           SortedSet.handle("ZADD", ["zs", "GT", "3.0", "a"], store)
           # Should stay at 5.0 since 3.0 < 5.0
-          assert "5.0" == SortedSet.handle("ZSCORE", ["zs", "a"], store)
+          assert "5" == SortedSet.handle("ZSCORE", ["zs", "a"], store)
           SortedSet.handle("ZADD", ["zs", "GT", "10.0", "a"], store)
-          assert "10.0" == SortedSet.handle("ZSCORE", ["zs", "a"], store)
+          assert "10" == SortedSet.handle("ZSCORE", ["zs", "a"], store)
         end
 
         test "ZADD with integer scores" do
@@ -250,7 +250,7 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zadd do
           store = MockStore.make()
           SortedSet.handle("ZADD", ["zs", "3.14", "pi"], store)
           # ZSCORE now formats scores consistently with ZRANGE WITHSCORES
-          assert "3.14000000000000012" == SortedSet.handle("ZSCORE", ["zs", "pi"], store)
+          assert "3.14" == SortedSet.handle("ZSCORE", ["zs", "pi"], store)
         end
 
         test "ZSCORE returns nil for missing member" do
@@ -346,7 +346,7 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zadd do
               {:ok, [{"b", 2.0}, {"c", 3.0}]}
             end)
 
-          assert ["b", "2.0", "c", "3.0"] ==
+          assert ["b", "2", "c", "3"] ==
                    SortedSet.handle("ZRANGE", ["zs", "1", "2", "WITHSCORES"], store)
 
           assert_receive {:zset_rank_range, "zs", 1, 2, false}
@@ -522,7 +522,7 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zadd do
             end)
 
           assert {:error, :disk_full} == SortedSet.handle("ZREM", ["zs", "only"], store)
-          assert "1.0" == SortedSet.handle("ZSCORE", ["zs", "only"], base)
+          assert "1" == SortedSet.handle("ZSCORE", ["zs", "only"], base)
         end
       end
 
@@ -721,7 +721,7 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zadd do
               {:ok, [{"a", 1.0}, {"b", 2.0}, {"c", 3.0}]}
             end)
 
-          assert ["b", "2.0"] ==
+          assert ["b", "2"] ==
                    SortedSet.handle(
                      "ZRANGEBYSCORE",
                      ["zs", "1", "3", "WITHSCORES", "LIMIT", "1", "1"],
@@ -752,7 +752,7 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zadd do
               {:ok, [{"b", 2.0}]}
             end)
 
-          assert ["b", "2.0"] ==
+          assert ["b", "2"] ==
                    SortedSet.handle(
                      "ZRANGEBYSCORE",
                      ["zs", "1", "3", "WITHSCORES", "LIMIT", "1", "1"],

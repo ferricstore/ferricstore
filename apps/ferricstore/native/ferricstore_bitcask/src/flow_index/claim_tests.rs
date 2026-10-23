@@ -266,11 +266,7 @@ fn baseline_claim_due_candidates(
 
     if keys.len() == 1 {
         let mut rows = Vec::with_capacity(limit.min(max_scan).min(index.ordered.len()));
-        let lower = OrderedEntry {
-            key: keys[0].to_vec(),
-            score: Score(f64::NEG_INFINITY),
-            member: Vec::new(),
-        };
+        let lower = OrderedEntry::new(keys[0].to_vec(), f64::NEG_INFINITY, Vec::new());
 
         let mut scanned = 0;
         for entry in index.ordered.range(lower..) {
@@ -333,11 +329,7 @@ fn baseline_first_due_entry_for_key(
     key: &[u8],
     max_score: f64,
 ) -> Option<OrderedEntry> {
-    let lower = OrderedEntry {
-        key: key.to_vec(),
-        score: Score(f64::NEG_INFINITY),
-        member: Vec::new(),
-    };
+    let lower = OrderedEntry::new(key.to_vec(), f64::NEG_INFINITY, Vec::new());
 
     for entry in index.ordered.range(lower..) {
         match due_entry_match(entry, key, max_score) {

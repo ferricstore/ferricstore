@@ -18,6 +18,7 @@ defmodule Ferricstore.Flow.Scheduler do
 
   alias Ferricstore.Flow.Schedule
   alias Ferricstore.Flow.Schedule.TargetOwnership
+  alias Ferricstore.Raft.LocalLeadership
 
   @max_wake_tasks 32
 
@@ -31,13 +32,19 @@ defmodule Ferricstore.Flow.Scheduler do
   def name(instance_name) when is_atom(instance_name), do: :"#{instance_name}.Flow.Scheduler"
 
   @doc false
-  def notify_target_terminal(%{name: instance_name}, %{id: target_id, state: state} = record)
-      when is_binary(target_id) and is_binary(state) do
+  # Called from apply on every replica; the wake runs on the leader of the
+  # applying shard only (`Ferricstore.Raft.LocalLeadership`).
+  def notify_target_terminal(
+        %{name: instance_name},
+        shard_index,
+        %{id: target_id, state: state} = record
+      )
+      when is_integer(shard_index) and is_binary(target_id) and is_binary(state) do
     if Ferricstore.Flow.LMDB.terminal_state?(state) do
       case TargetOwnership.schedule_id(record) do
         id when is_binary(id) ->
           if pid = Process.whereis(name(instance_name)) do
-            GenServer.cast(pid, {:target_terminal, id, target_id})
+            GenServer.cast(pid, {:target_terminal, shard_index, id, target_id})
           end
 
         _other ->
@@ -48,7 +55,7 @@ defmodule Ferricstore.Flow.Scheduler do
     :ok
   end
 
-  def notify_target_terminal(_ctx, _record), do: :ok
+  def notify_target_terminal(_ctx, _shard_index, _record), do: :ok
 
   def start_link(opts \\ []) do
     case Keyword.get(opts, :name, __MODULE__) do
@@ -69,6 +76,8 @@ defmodule Ferricstore.Flow.Scheduler do
     {:ok,
      %{
        ctx: Keyword.get(opts, :ctx, FerricStore.Instance.get(:default)),
+       leads_shard?: Keyword.get(opts, :leads_shard?, &LocalLeadership.leads?/2),
+       wake_queued: Keyword.get(opts, :wake_queued, &Schedule.wake_queued/4),
        task: nil,
        wake_tasks: MapSet.new(),
        config: config
@@ -108,14 +117,16 @@ defmodule Ferricstore.Flow.Scheduler do
   end
 
   @impl true
-  def handle_cast({:target_terminal, schedule_id, target_id}, state) do
-    if state.config.enabled? and MapSet.size(state.wake_tasks) < @max_wake_tasks do
+  def handle_cast({:target_terminal, shard_index, schedule_id, target_id}, state) do
+    if state.config.enabled? and MapSet.size(state.wake_tasks) < @max_wake_tasks and
+         state.leads_shard?.(state.ctx, shard_index) do
       parent = self()
+      wake_queued = state.wake_queued
 
       {:ok, task} =
         Task.start_link(fn ->
           result =
-            Schedule.wake_queued(
+            wake_queued.(
               state.ctx,
               schedule_id,
               target_id,

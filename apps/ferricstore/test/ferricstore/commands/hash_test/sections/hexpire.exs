@@ -130,10 +130,11 @@ defmodule Ferricstore.Commands.HashTest.Sections.Hexpire do
           assert {:error, _} = Hash.handle("HEXPIRE", ["hash", "-1", "FIELDS", "1", "f1"], store)
         end
 
-        test "HEXPIRE with zero seconds returns error" do
+        test "HEXPIRE with zero seconds deletes the field and the emptied hash" do
           store = MockStore.make()
           Hash.handle("HSET", ["hash", "f1", "v1"], store)
-          assert {:error, _} = Hash.handle("HEXPIRE", ["hash", "0", "FIELDS", "1", "f1"], store)
+          assert [2] = Hash.handle("HEXPIRE", ["hash", "0", "FIELDS", "1", "f1"], store)
+          assert [] == Hash.handle("HGETALL", ["hash"], store)
         end
 
         test "HEXPIRE on wrong type returns WRONGTYPE" do

@@ -439,9 +439,9 @@ defmodule Ferricstore.Raft.DataStructureWritePathTest do
       assert SortedSet.handle("ZADD", [key, "NX", "99.0", "a", "3.0", "c"], store) == 1
 
       # "a" should still have score 1.0 (not updated to 99.0)
-      assert SortedSet.handle("ZSCORE", [key, "a"], store) == "1.0"
+      assert SortedSet.handle("ZSCORE", [key, "a"], store) == "1"
       # "c" should have been added with score 3.0
-      assert SortedSet.handle("ZSCORE", [key, "c"], store) == "3.0"
+      assert SortedSet.handle("ZSCORE", [key, "c"], store) == "3"
     end
 
     test "NX with all existing members returns 0" do
@@ -454,8 +454,8 @@ defmodule Ferricstore.Raft.DataStructureWritePathTest do
       assert SortedSet.handle("ZADD", [key, "NX", "10.0", "a", "20.0", "b"], store) == 0
 
       # Scores unchanged
-      assert SortedSet.handle("ZSCORE", [key, "a"], store) == "1.0"
-      assert SortedSet.handle("ZSCORE", [key, "b"], store) == "2.0"
+      assert SortedSet.handle("ZSCORE", [key, "a"], store) == "1"
+      assert SortedSet.handle("ZSCORE", [key, "b"], store) == "2"
     end
   end
 
@@ -471,7 +471,7 @@ defmodule Ferricstore.Raft.DataStructureWritePathTest do
       assert SortedSet.handle("ZADD", [key, "XX", "10.0", "a", "3.0", "c"], store) == 0
 
       # "a" score should be updated
-      assert SortedSet.handle("ZSCORE", [key, "a"], store) == "10.0"
+      assert SortedSet.handle("ZSCORE", [key, "a"], store) == "10"
       # "c" should NOT exist
       assert SortedSet.handle("ZSCORE", [key, "c"], store) == nil
       # Only 2 members total
@@ -495,9 +495,9 @@ defmodule Ferricstore.Raft.DataStructureWritePathTest do
       store = build_store(key)
 
       result = SortedSet.handle("ZINCRBY", [key, "5", "player1"], store)
-      assert result == "5.0"
+      assert result == "5"
 
-      assert SortedSet.handle("ZSCORE", [key, "player1"], store) == "5.0"
+      assert SortedSet.handle("ZSCORE", [key, "player1"], store) == "5"
     end
 
     test "ZINCRBY on existing member increments score" do
@@ -517,7 +517,7 @@ defmodule Ferricstore.Raft.DataStructureWritePathTest do
       SortedSet.handle("ZADD", [key, "100.0", "player1"], store)
 
       result = SortedSet.handle("ZINCRBY", [key, "-25", "player1"], store)
-      assert result == "75.0"
+      assert result == "75"
     end
 
     test "sequential ZINCRBY calls produce correct total" do
@@ -528,7 +528,7 @@ defmodule Ferricstore.Raft.DataStructureWritePathTest do
         SortedSet.handle("ZINCRBY", [key, "2", "player1"], store)
       end
 
-      assert SortedSet.handle("ZSCORE", [key, "player1"], store) == "10.0"
+      assert SortedSet.handle("ZSCORE", [key, "player1"], store) == "10"
     end
   end
 

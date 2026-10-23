@@ -632,7 +632,23 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
 
   def indexed_prefix_count_entries(_state, _prefix), do: :unavailable
 
+  # A count whose due member expiries exceed one cleanup pass counts the keydir
+  # rows instead, as it does before the member index is ready.
   def do_prefix_count_entries(state, keydir, prefix) do
+    case indexed_prefix_count(state, prefix) do
+      {:ok, count} -> count
+      {:error, :limit_exceeded} -> select_prefix_count_entries(state, keydir, prefix)
+      {:error, reason} -> ReadResult.failure({:compound_count_failed, reason})
+      :unavailable -> select_prefix_count_entries(state, keydir, prefix)
+    end
+  end
+
+  @doc false
+  # The count releases before feature level 5 applied: more due member
+  # expiries than one cleanup pass fail the count.
+  @spec bounded_prefix_count_entries(map(), binary()) ::
+          non_neg_integer() | ReadResult.failure()
+  def bounded_prefix_count_entries(%{keydir: keydir} = state, prefix) do
     case indexed_prefix_count(state, prefix) do
       {:ok, count} -> count
       {:error, reason} -> ReadResult.failure({:compound_count_failed, reason})

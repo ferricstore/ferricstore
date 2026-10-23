@@ -652,9 +652,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       # check answers WRONGTYPE first.
       defp do_pfadd(state, key, elements) do
         with :ok <- ensure_string_key(state, key) do
-          HyperLogLog.handle_ast({:pfadd, [key | elements]}, build_string_value_store(state))
+          HyperLogLog.handle_ast({:pfadd, [key | elements]}, hll_store(state))
         end
       end
+
+      # Feature level 5 keeps a sketch's TTL through PFADD and PFMERGE, as
+      # Redis does; releases before it drop the TTL.
+      defp hll_store(state),
+        do: Map.put(build_string_value_store(state), :level_5_writes?, feature_level_5?(state))
 
       defp do_pfmerge(state, dest_key, source_sketches) when is_list(source_sketches) do
         with :ok <- ensure_string_key(state, dest_key) do
@@ -669,7 +674,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           |> Enum.map(fn {_sketch, idx} -> "\0__pfmerge_source__:" <> Integer.to_string(idx) end)
 
         source_values = Map.new(Enum.zip(source_keys, source_sketches))
-        base_store = build_string_value_store(state)
+        base_store = hll_store(state)
 
         store = %{
           base_store
@@ -830,8 +835,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
               total
             )
           end,
+          # Below feature level 5 a count with more due member expiries than
+          # one cleanup pass fails, as releases before it applied.
           compound_count: fn _redis_key, prefix ->
-            Ferricstore.Store.Shard.ETS.prefix_count_entries(shard_ets_state(state), prefix)
+            if feature_level_5?(state),
+              do:
+                Ferricstore.Store.Shard.ETS.prefix_count_entries(shard_ets_state(state), prefix),
+              else:
+                Ferricstore.Store.Shard.ETS.bounded_prefix_count_entries(
+                  shard_ets_state(state),
+                  prefix
+                )
           end,
           exists?: fn key ->
             live_key?(state, key)

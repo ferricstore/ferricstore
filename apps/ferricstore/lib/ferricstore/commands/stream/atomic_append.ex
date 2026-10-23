@@ -225,7 +225,8 @@ defmodule Ferricstore.Commands.Stream.AtomicAppend do
   defp run_payload(key, id_spec, payload, trim_opts, nomkstream, store) do
     with {:ok, marker_present?} <- Meta.type_marker_status(key, store) do
       if nomkstream and not marker_present? do
-        nil
+        # Nothing to append to, but a key of another type is WRONGTYPE.
+        with :ok <- command_check_type(key, false, store), do: nil
       else
         append(key, id_spec, payload, trim_opts, marker_present?, store)
       end

@@ -374,6 +374,27 @@ defmodule Ferricstore.Store.RouterTest do
       refute Router.get_with_file_ref(ctx, key) == {:cold_ref, path, value_offset, size}
       refute Router.get(ctx, key) == value
     end
+
+    test "batched file-ref reads report a corrupted cold value instead of a missing one", %{
+      ctx: ctx
+    } do
+      key = "sendfile_batch_crc_" <> Integer.to_string(System.unique_integer([:positive]))
+      value = :binary.copy("d", ctx.hot_cache_max_value_size + 1024)
+
+      assert :ok = Router.put(ctx, key, value, 0)
+      assert {:cold_ref, path, value_offset, _size} = Router.get_with_file_ref(ctx, key)
+
+      assert {:ok, file} = :file.open(path, [:read, :write, :raw, :binary])
+
+      try do
+        assert :ok = :file.pwrite(file, value_offset + 16, "X")
+      after
+        :file.close(file)
+      end
+
+      assert [{:error, {:storage_read_failed, _reason}}] =
+               Router.batch_get_with_file_refs(ctx, [key], 0)
+    end
   end
 
   describe "HLC drift guard" do
@@ -381,6 +402,52 @@ defmodule Ferricstore.Store.RouterTest do
       ctx = IsolatedInstance.checkout(shard_count: 1)
       on_exit(fn -> IsolatedInstance.checkin(ctx) end)
       {:ok, ctx: ctx}
+    end
+
+    # A cold read that misses its file retries the row. With the clock ahead
+    # of wall time, a row that gained a TTL meanwhile (here through a hook)
+    # meets the drift guard on the retry.
+    test "compound reads fail closed when drift appears during a cold retry", %{ctx: ctx} do
+      redis_key = "hlc-drift:hash:#{System.unique_integer([:positive])}"
+      compound_key = CompoundKey.hash_field(redis_key, "field")
+      keydir = elem(ctx.keydir_refs, 0)
+      wall_ms = System.system_time(:millisecond)
+      ref = :persistent_term.get(:ferricstore_hlc_ref)
+      previous = :atomics.get(ref, 1)
+
+      on_exit(fn ->
+        :atomics.put(:persistent_term.get(:ferricstore_hlc_ref), 1, previous)
+      end)
+
+      reads = [
+        compound_get: fn -> Router.compound_get(ctx, redis_key, compound_key) end,
+        compound_get_meta: fn -> Router.compound_get_meta(ctx, redis_key, compound_key) end,
+        compound_batch_get: fn -> Router.compound_batch_get(ctx, redis_key, [compound_key]) end
+      ]
+
+      :atomics.put(ref, 1, Bitwise.bsl(wall_ms + 60_000, 16))
+      assert Ferricstore.HLC.drift_exceeded?()
+
+      for {name, read} <- reads do
+        # The file this cold row points at does not exist.
+        :ets.insert(keydir, {compound_key, nil, 0, LFU.initial(), 9_999, 0, 5})
+
+        Process.put(:ferricstore_router_cold_location_miss_hook, fn ->
+          :ets.insert(keydir, {compound_key, "value", wall_ms + 30_000, LFU.initial(), 0, 0, 5})
+        end)
+
+        try do
+          result = read.()
+
+          assert result in [
+                   {:error, {:storage_read_failed, :hlc_drift_exceeded}},
+                   [{:error, {:storage_read_failed, :hlc_drift_exceeded}}]
+                 ],
+                 "#{name} answered #{inspect(result)}"
+        after
+          Process.delete(:ferricstore_router_cold_location_miss_hook)
+        end
+      end
     end
 
     test "GET fails closed without deleting a TTL row that is only HLC-expired", %{ctx: ctx} do

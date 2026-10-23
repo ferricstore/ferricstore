@@ -1761,9 +1761,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         Enum.reduce_while(keys, :ok, fn key, :ok ->
           redis_key = CompoundKey.extract_redis_key(key)
 
+          # A lease whose expiry the clocks disagree on answers
+          # {:error, :hlc_drift_exceeded}; matching only :key_locked raised here.
           case check_fetch_or_compute_lock(state, redis_key, nil) do
             :ok -> {:cont, :ok}
-            {:error, :key_locked} = error -> {:halt, error}
+            {:error, _reason} = error -> {:halt, error}
           end
         end)
       end

@@ -901,18 +901,20 @@ defmodule Ferricstore.Store.Router.Part09 do
 
       @doc """
       Runs a command that reads one hash or sorted set, decides and writes it
-      (HDEL, HSETNX, HGETDEL, ZADD or GEOADD with options) as one replicated
-      entry, in which the state machine runs the command's handler on its own
-      store, so concurrent clients each see one outcome. Needs cluster feature
-      level 4 on the key's shard, since older releases do not apply the entry;
-      returns `:unsupported` below it and for custom instances.
+      (HDEL, HSETNX, HGETDEL, ZADD or GEOADD with options; HSETEX at level 5)
+      as one replicated entry, in which the state machine runs the command's
+      handler on its own store, so concurrent clients each see one outcome.
+      Needs cluster feature `level` (4 by default) on the key's shard, since
+      older releases do not apply the entry; returns `:unsupported` below it
+      and for custom instances.
       """
-      @spec compound_command(FerricStore.Instance.t(), binary(), tuple()) :: term()
-      def compound_command(ctx, key, ast) when is_binary(key) and is_tuple(ast) do
+      @spec compound_command(FerricStore.Instance.t(), binary(), tuple(), 4 | 5) :: term()
+      def compound_command(ctx, key, ast, level \\ 4)
+          when is_binary(key) and is_tuple(ast) and level in [4, 5] do
         idx = shard_for(ctx, key)
 
         if durable_raft_ctx?(ctx) and
-             read_shard_value(ctx, idx, Ferricstore.Cluster.FeatureLevel.key(4)) ==
+             read_shard_value(ctx, idx, Ferricstore.Cluster.FeatureLevel.key(level)) ==
                {:ok, Ferricstore.Cluster.FeatureLevel.marker()} do
           raft_write(ctx, idx, key, {:compound_command, key, ast})
         else
@@ -1351,8 +1353,20 @@ defmodule Ferricstore.Store.Router.Part09 do
              do: checked_cas(ctx, key, expected, new_value, ttl_ms)
       end
 
+      @doc false
+      # CAS with an absolute expiry (0 clears the TTL), as SET IFEQ/IFNE needs.
+      def cas_at(ctx, key, expected, new_value, expire_at_ms)
+          when is_integer(expire_at_ms) and expire_at_ms >= 0 do
+        with :ok <- validate_string_write(ctx, key, new_value),
+             do: cas_with_expire_at(ctx, key, expected, new_value, expire_at_ms)
+      end
+
       defp checked_cas(ctx, key, expected, new_value, ttl_ms) do
         expire_at_ms = if ttl_ms, do: HLC.now_ms() + ttl_ms, else: nil
+        cas_with_expire_at(ctx, key, expected, new_value, expire_at_ms)
+      end
+
+      defp cas_with_expire_at(ctx, key, expected, new_value, expire_at_ms) do
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
         existing_expire_at_ms = existing_keydir_expire_at_ms(keydir, key)

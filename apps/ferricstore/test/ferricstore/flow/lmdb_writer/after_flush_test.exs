@@ -145,7 +145,7 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushTest do
              )
   end
 
-  test "terminal prune reports a vanished hot zset index" do
+  test "terminal prune leaves the hot index for lists without include_cold" do
     ets = :ets.new(:after_flush_terminal_source, [:set])
     zset_index = :ets.new(:after_flush_terminal_zset, [:ordered_set])
     zset_lookup = :ets.new(:after_flush_terminal_lookup, [:set])
@@ -179,7 +179,8 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushTest do
       {:prune_terminal_flow, "/data", 0, ets, zset_index, zset_lookup, nil, nil, state_key,
        "type", "completed", nil, nil, nil, nil, "flow-1", 1, nil}
 
-    assert {:error, :zset_index_unavailable} = AfterFlush.apply_after_flush(action)
+    assert :ok = AfterFlush.apply_after_flush(action)
+    assert [] = :ets.lookup(ets, state_key)
   end
 
   test "terminal prune reports a corrupt untagged source record" do

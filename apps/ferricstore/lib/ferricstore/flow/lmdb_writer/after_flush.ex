@@ -3,7 +3,6 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
 
   alias Ferricstore.Flow.Hibernation
   alias Ferricstore.Flow.KeydirSpill
-  alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.LMDBWriter.ProjectionOps
   alias Ferricstore.Flow.Locator
   alias Ferricstore.Store.{BlobRef, BlobStore, ColdRead, Keydir}
@@ -29,31 +28,15 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
 
   def apply_after_flush(action), do: apply_after_flush(action, %{})
 
+  # A projected terminal flow leaves the keydir; LMDB serves its record. Its
+  # state, parent, root and correlation index entries stay hot, so lists without
+  # include_cold keep listing it, as they do a terminal flow without attributes.
   def apply_after_flush(
-        {:prune_terminal_flow, data_dir, shard_index, ets, zset_index, zset_lookup, flow_index,
-         flow_lookup, state_key, type, terminal_state, partition_key, parent_flow_id,
-         root_flow_id, correlation_id, id, version, incarnation},
+        {:prune_terminal_flow, data_dir, shard_index, ets, _zset_index, _zset_lookup, _flow_index,
+         _flow_lookup, state_key, type, terminal_state, partition_key, _parent_flow_id,
+         _root_flow_id, _correlation_id, id, version, incarnation},
         publication_ctx
       ) do
-    state_index_key = Keys.state_index_key(type, terminal_state, partition_key)
-
-    metadata_index_keys =
-      ProjectionOps.terminal_project_metadata_index_keys(
-        id,
-        partition_key,
-        parent_flow_id,
-        root_flow_id,
-        correlation_id
-      )
-
-    cleanup = fn ->
-      with :ok <- safe_zset_delete_member(zset_index, zset_lookup, state_index_key, id),
-           :ok <- safe_flow_index_delete_member(flow_index, flow_lookup, state_index_key, id),
-           :ok <- delete_flow_index_members(flow_index, flow_lookup, metadata_index_keys, id) do
-        :ok
-      end
-    end
-
     identity = %{version: version, state: terminal_state, incarnation: incarnation}
 
     case prune_terminal_state_key(
@@ -63,7 +46,7 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
            state_key,
            identity,
            publication_ctx,
-           cleanup
+           fn -> :ok end
          ) do
       :ok ->
         spill_record = %{type: type, id: id, partition_key: partition_key}
@@ -78,8 +61,8 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
   end
 
   def apply_after_flush(
-        {:prune_terminal_flow_from_source, data_dir, shard_index, ets, zset_index, zset_lookup,
-         flow_index, flow_lookup, state_key, version},
+        {:prune_terminal_flow_from_source, data_dir, shard_index, ets, _zset_index, _zset_lookup,
+         _flow_index, _flow_lookup, state_key, version},
         publication_ctx
       ) do
     case flow_record_with_keydir_row(data_dir, shard_index, ets, state_key) do
@@ -90,28 +73,6 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
              type when is_binary(type) <- Map.get(record, :type),
              id when is_binary(id) <- Map.get(record, :id),
              :ok <- terminal_source_projected(data_dir, shard_index, state_key, record) do
-          partition_key = Map.get(record, :partition_key)
-          state_index_key = Keys.state_index_key(type, terminal_state, partition_key)
-
-          metadata_index_keys =
-            ProjectionOps.terminal_project_metadata_index_keys(
-              id,
-              partition_key,
-              Map.get(record, :parent_flow_id),
-              Map.get(record, :root_flow_id),
-              Map.get(record, :correlation_id)
-            )
-
-          cleanup = fn ->
-            with :ok <- safe_zset_delete_member(zset_index, zset_lookup, state_index_key, id),
-                 :ok <-
-                   safe_flow_index_delete_member(flow_index, flow_lookup, state_index_key, id),
-                 :ok <-
-                   delete_flow_index_members(flow_index, flow_lookup, metadata_index_keys, id) do
-              :ok
-            end
-          end
-
           identity = %{
             version: version,
             state: terminal_state,
@@ -126,7 +87,7 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
                  state_key,
                  identity,
                  publication_ctx,
-                 cleanup,
+                 fn -> :ok end,
                  source_row
                ) do
             :ok -> KeydirSpill.request(publication_ctx, shard_index, ets, record, state_key)
@@ -382,15 +343,6 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
   rescue
     ArgumentError -> {:error, :flow_index_unavailable}
     _ -> {:error, :flow_index_delete_failed}
-  end
-
-  defp delete_flow_index_members(flow_index, flow_lookup, index_keys, id) do
-    Enum.reduce_while(index_keys, :ok, fn index_key, :ok ->
-      case safe_flow_index_delete_member(flow_index, flow_lookup, index_key, id) do
-        :ok -> {:cont, :ok}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
   end
 
   defp delete_hot_index_members(

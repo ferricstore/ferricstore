@@ -27,11 +27,10 @@ defmodule Ferricstore.Commands.GenericTest.Sections.ObjectIdletime do
           assert Generic.handle("OBJECT", ["IDLETIME", "custom_idle"], store) in 120..180
         end
 
-        test "OBJECT IDLETIME returns error for missing key" do
+        test "OBJECT IDLETIME answers nil for a missing key, as in Redis" do
           store = MockStore.make()
 
-          assert {:error, "ERR no such key"} =
-                   Generic.handle("OBJECT", ["IDLETIME", "missing"], store)
+          assert nil == Generic.handle("OBJECT", ["IDLETIME", "missing"], store)
         end
       end
 
@@ -41,11 +40,10 @@ defmodule Ferricstore.Commands.GenericTest.Sections.ObjectIdletime do
           assert 1 == Generic.handle("OBJECT", ["REFCOUNT", "k"], store)
         end
 
-        test "OBJECT REFCOUNT returns error for missing key" do
+        test "OBJECT REFCOUNT answers nil for a missing key, as in Redis" do
           store = MockStore.make()
 
-          assert {:error, "ERR no such key"} =
-                   Generic.handle("OBJECT", ["REFCOUNT", "missing"], store)
+          assert nil == Generic.handle("OBJECT", ["REFCOUNT", "missing"], store)
         end
       end
 

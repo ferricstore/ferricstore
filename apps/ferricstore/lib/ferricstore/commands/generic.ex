@@ -113,6 +113,9 @@ defmodule Ferricstore.Commands.Generic do
 
   def handle("COPY", [source, destination | opts], store) do
     case parse_copy_opts(opts) do
+      {:ok, _replace?} when source == destination ->
+        copy_same_key_error()
+
       {:ok, replace?} ->
         CrossShardOp.execute(
           [{source, :read}, {destination, :write}],
@@ -216,6 +219,9 @@ defmodule Ferricstore.Commands.Generic do
   def handle_ast({:renamenx, key, newkey}, store), do: renamenx_key(key, newkey, store)
   def handle_ast({:copy, _source, _destination, {:error, reason}}, _store), do: {:error, reason}
 
+  def handle_ast({:copy, key, key, replace?}, _store) when is_boolean(replace?),
+    do: copy_same_key_error()
+
   def handle_ast({:copy, source, destination, replace?}, store) when is_boolean(replace?) do
     CrossShardOp.execute(
       [{source, :read}, {destination, :write}],
@@ -253,6 +259,10 @@ defmodule Ferricstore.Commands.Generic do
 
   def handle_ast({:wait, _numreplicas, _timeout}, _store),
     do: {:error, "ERR value is not an integer or out of range"}
+
+  # The parser keeps a call with the wrong argument count as {tag, args}.
+  def handle_ast({tag, args}, _store) when is_atom(tag) and is_list(args),
+    do: {:error, "ERR wrong number of arguments for '#{tag}' command"}
 
   def handle_ast(_ast, _store), do: {:error, "ERR unsupported generic command AST"}
 
@@ -439,7 +449,8 @@ defmodule Ferricstore.Commands.Generic do
       {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
       nil -> -2
       0 -> -1
-      expire_at_ms -> div(expire_at_ms, 1_000)
+      # Rounded to the nearest second, as Redis does.
+      expire_at_ms -> div(expire_at_ms + 500, 1_000)
     end
   end
 
@@ -453,7 +464,7 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   # ---------------------------------------------------------------------------
-  # Private -- OBJECT subcommands
+  # Private -- OBJECT subcommands (a missing key answers nil, as in Redis)
   # ---------------------------------------------------------------------------
 
   defp do_object("ENCODING", [key], store) do
@@ -462,7 +473,7 @@ defmodule Ferricstore.Commands.Generic do
         ReadResult.command_error(failure)
 
       "none" ->
-        {:error, "ERR no such key"}
+        nil
 
       "hash" ->
         "hashtable"
@@ -518,7 +529,7 @@ defmodule Ferricstore.Commands.Generic do
         end
 
       {:ok, false} ->
-        {:error, "ERR no such key"}
+        nil
 
       {:error, {:storage_read_failed, _reason}} = failure ->
         ReadResult.command_error(failure)
@@ -543,7 +554,7 @@ defmodule Ferricstore.Commands.Generic do
         end
 
       {:ok, false} ->
-        {:error, "ERR no such key"}
+        nil
 
       {:error, {:storage_read_failed, _reason}} = failure ->
         ReadResult.command_error(failure)
@@ -553,7 +564,7 @@ defmodule Ferricstore.Commands.Generic do
   defp do_object("REFCOUNT", [key], store) do
     case object_exists?(store, key) do
       {:ok, true} -> 1
-      {:ok, false} -> {:error, "ERR no such key"}
+      {:ok, false} -> nil
       {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
     end
   end
@@ -630,6 +641,9 @@ defmodule Ferricstore.Commands.Generic do
   defp parse_copy_opts(_) do
     {:error, "ERR syntax error"}
   end
+
+  # Redis refuses a copy onto its own key, whether or not the key exists.
+  defp copy_same_key_error, do: {:error, "ERR source and destination objects are the same"}
 
   defp do_copy(source, destination, replace?, store) do
     case maybe_key_lifecycle(store, {:copy, source, destination, replace?}) do
@@ -950,6 +964,10 @@ defmodule Ferricstore.Commands.Generic do
         case Integer.parse(value) do
           {n, ""} when n > 0 and n <= @max_scan_count ->
             parse_scan_opts(rest, match, n, type)
+
+          # As in Redis, a COUNT below 1 is a syntax error.
+          {n, ""} when n < 1 ->
+            {:error, "ERR syntax error"}
 
           _ ->
             {:error, "ERR value is not an integer or out of range"}

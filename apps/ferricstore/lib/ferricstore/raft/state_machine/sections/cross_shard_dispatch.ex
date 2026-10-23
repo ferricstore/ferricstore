@@ -790,14 +790,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         watched_keys
         |> Enum.sort_by(&elem(&1, 0))
         |> Enum.reduce_while(@transaction_watch_max_entries, fn {key, saved_token}, remaining ->
-          if match?({:error, _reason}, saved_token) do
-            {:halt, :changed}
-          else
-            case transaction_watch_token_with_budget(state, key, remaining) do
-              {:ok, ^saved_token, cost} -> {:cont, remaining - cost}
-              {:ok, _changed_token, _cost} -> {:halt, :changed}
-              {:error, reason} -> {:halt, {:error, reason}}
-            end
+          case saved_token do
+            {:error, _reason} ->
+              {:halt, :changed}
+
+            {:watch_index, version, live?} when is_integer(version) and is_boolean(live?) ->
+              case watch_index_token_clean?(state, key, version, live?) do
+                :clean -> {:cont, remaining}
+                :changed -> {:halt, :changed}
+                {:error, reason} -> {:halt, {:error, reason}}
+              end
+
+            _storage_token ->
+              case transaction_watch_token_with_budget(state, key, remaining) do
+                {:ok, ^saved_token, cost} -> {:cont, remaining - cost}
+                {:ok, _changed_token, _cost} -> {:halt, :changed}
+                {:error, reason} -> {:halt, {:error, reason}}
+              end
           end
         end)
         |> case do
@@ -807,11 +816,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
       end
 
       defp transaction_watch_token(state, key) when is_binary(key) do
-        case transaction_watch_token_with_budget(state, key, @transaction_watch_max_entries) do
-          {:ok, token, _cost} -> token
-          {:error, _reason} = error -> error
+        if watch_index_registration?(state) do
+          case transaction_watch_index_tokens(state, [key]) do
+            %{^key => token} -> token
+            {:error, _reason} = error -> error
+          end
+        else
+          case transaction_watch_token_with_budget(state, key, @transaction_watch_max_entries) do
+            {:ok, token, _cost} -> token
+            {:error, _reason} = error -> error
+          end
         end
       end
+
+      # From feature level 5 a replicated WATCH registers the keys' write
+      # versions (`Ferricstore.Transaction.WatchIndex`).
+      defp watch_index_registration?(state),
+        do: watch_index_registering?() and feature_level_5?(state)
 
       defp transaction_watch_token_with_budget(state, key, remaining)
            when is_binary(key) and is_integer(remaining) and remaining >= 0 do
@@ -830,6 +851,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
       end
 
       defp transaction_watch_tokens(state, keys) when is_list(keys) do
+        if watch_index_registration?(state) and Enum.all?(keys, &is_binary/1),
+          do: transaction_watch_index_tokens(state, Enum.uniq(keys)),
+          else: transaction_storage_watch_tokens(state, keys)
+      end
+
+      defp transaction_storage_watch_tokens(state, keys) do
         Enum.reduce_while(keys, {:ok, %{}, @transaction_watch_max_entries}, fn
           key, {:ok, tokens, remaining} when is_binary(key) ->
             case transaction_watch_token_with_budget(state, key, remaining) do
@@ -1995,18 +2022,34 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           end
         end
 
+        # Level 5 refuses a result outside the integer range, as INCR outside
+        # a transaction does; older releases store it.
+        incr_overflow? = fn value ->
+          (value > 9_223_372_036_854_775_807 or value < -9_223_372_036_854_775_808) and
+            feature_level_5?(anchor_state)
+        end
+
         local_incr = fn key, delta ->
           case local_get_meta.(key) do
             nil ->
-              local_put.(key, delta, 0)
-              {:ok, delta}
+              if incr_overflow?.(delta) do
+                {:error, "ERR increment or decrement would overflow"}
+              else
+                local_put.(key, delta, 0)
+                {:ok, delta}
+              end
 
             {value, expire_at_ms} ->
               case coerce_integer(value) do
                 {:ok, int_val} ->
                   new_val = int_val + delta
-                  local_put.(key, new_val, expire_at_ms)
-                  {:ok, new_val}
+
+                  if incr_overflow?.(new_val) do
+                    {:error, "ERR increment or decrement would overflow"}
+                  else
+                    local_put.(key, new_val, expire_at_ms)
+                    {:ok, new_val}
+                  end
 
                 :error ->
                   {:error, "ERR value is not an integer or out of range"}
@@ -2337,6 +2380,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           get: local_get,
           cache_scope: cache_scope,
           float_format: if(feature_level_4?(anchor_state), do: :plain, else: :legacy),
+          level_5_writes?: feature_level_5?(anchor_state),
           stream_index_dirty?: &pending_stream_index_dirty?/1,
           stream_current_ids: fn redis_key ->
             ctx = ctx_for_key.(redis_key)

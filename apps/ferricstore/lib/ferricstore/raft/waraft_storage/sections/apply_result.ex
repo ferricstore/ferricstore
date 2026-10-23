@@ -429,8 +429,96 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
           true ->
             # Keep the release/persist boundary behind undurable projection data,
             # but do not spill that data synchronously from the WARaft apply path.
-            {:ok, request_replay_dependencies_async(new_handle)}
+            persist_durable_candidate(new_handle)
         end
+      end
+
+      # Under a steady stream of Flow writes the newest position always waits
+      # for history the projector writes a little later, so it is never ready.
+      # A candidate remembers one position with the metadata and dependencies
+      # it had then; once those are durable that position is persisted and a
+      # new candidate is taken, so the replay cursor advances in steps.
+      defp persist_durable_candidate(%{durable_candidate: candidate} = handle)
+           when is_map(candidate) do
+        cond do
+          position_index(candidate.position) <=
+              position_index(Map.get(handle, :persisted_position, @zero_pos)) ->
+            {:ok, take_durable_candidate(handle)}
+
+          durable_candidate_ready?(handle, candidate) ->
+            with :ok <- PromotedFileSync.sync(Map.get(handle, :promoted_sync)),
+                 :ok <- persist_storage_metadata(handle.root_dir, candidate.metadata, :normal) do
+              {:ok,
+               handle
+               |> Map.put(:persisted_position, candidate.position)
+               |> Map.update(
+                 :last_clean_position,
+                 candidate.position,
+                 &max_raft_position(&1, candidate.position)
+               )
+               |> take_durable_candidate()}
+            end
+
+          true ->
+            {:ok, maybe_rerequest_durable_candidate(handle, candidate)}
+        end
+      end
+
+      defp persist_durable_candidate(handle), do: {:ok, take_durable_candidate(handle)}
+
+      defp take_durable_candidate(handle) do
+        now_ms = System.monotonic_time(:millisecond)
+
+        candidate = %{
+          position: handle.position,
+          replay_dependencies:
+            Map.get(handle, :replay_dependencies, replay_dependency_defaults()),
+          metadata: storage_metadata(handle),
+          requested_at_ms: now_ms
+        }
+
+        handle
+        |> Map.put(:durable_candidate, candidate)
+        |> Map.put(:durable_candidate_taken_at_ms, now_ms)
+        |> request_candidate_dependencies(candidate)
+      end
+
+      defp maybe_take_durable_candidate(handle) do
+        now_ms = System.monotonic_time(:millisecond)
+        taken_at_ms = Map.get(handle, :durable_candidate_taken_at_ms)
+
+        if is_nil(taken_at_ms) or now_ms - taken_at_ms >= @durable_candidate_interval_ms,
+          do: take_durable_candidate(handle),
+          else: handle
+      end
+
+      defp durable_candidate_ready?(handle, candidate),
+        do:
+          replay_dependencies_ready?(%{
+            handle
+            | replay_dependencies: candidate.replay_dependencies
+          })
+
+      # A request can be lost (a projector restarting, say), so a waiting
+      # candidate asks again, but not on every apply.
+      defp maybe_rerequest_durable_candidate(handle, candidate) do
+        now_ms = System.monotonic_time(:millisecond)
+
+        if now_ms - candidate.requested_at_ms >= @durable_candidate_interval_ms do
+          candidate = %{candidate | requested_at_ms: now_ms}
+
+          handle
+          |> Map.put(:durable_candidate, candidate)
+          |> request_candidate_dependencies(candidate)
+        else
+          handle
+        end
+      end
+
+      defp request_candidate_dependencies(handle, candidate) do
+        %{handle | replay_dependencies: candidate.replay_dependencies}
+        |> request_replay_dependencies_async()
+        |> Map.put(:replay_dependencies, handle.replay_dependencies)
       end
 
       defp persist_ready_hot_metadata(new_handle) do
@@ -446,6 +534,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
         handle
         |> Map.put(:persisted_position, position)
         |> Map.put(:last_clean_position, position)
+        |> Map.delete(:durable_candidate)
         |> clear_replay_dependencies()
       end
 
@@ -456,17 +545,40 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       end
 
       defp maybe_mark_clean_position(%{bitcask_dirty?: false, position: position} = handle) do
-        if replay_dependencies_ready?(handle) and
-             PromotedFileSync.synced?(Map.get(handle, :promoted_sync)) do
+        synced? = PromotedFileSync.synced?(Map.get(handle, :promoted_sync))
+
+        if synced? and replay_dependencies_ready?(handle) do
           handle
           |> Map.put(:last_clean_position, position)
+          |> Map.delete(:durable_candidate)
           |> clear_replay_dependencies()
         else
-          handle
+          follow_durable_candidate(handle, synced?)
         end
       end
 
       defp maybe_mark_clean_position(handle), do: handle
+
+      # Between metadata persists the clean (durable) position follows a
+      # candidate as well, so what waits on it, a membership change for one,
+      # waits for the projector rather than for the persist cadence.
+      defp follow_durable_candidate(%{durable_candidate: candidate} = handle, synced?)
+           when is_map(candidate) do
+        if synced? and durable_candidate_ready?(handle, candidate) do
+          handle
+          |> Map.update(
+            :last_clean_position,
+            candidate.position,
+            &max_raft_position(&1, candidate.position)
+          )
+          |> Map.delete(:durable_candidate)
+          |> maybe_take_durable_candidate()
+        else
+          maybe_rerequest_durable_candidate(handle, candidate)
+        end
+      end
+
+      defp follow_durable_candidate(handle, _synced?), do: maybe_take_durable_candidate(handle)
 
       defp storage_metadata_persist_due?(new_handle) do
         position_gap_due?(
@@ -626,7 +738,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       defp requeue_unfinished_segment_projection_checkpoint(handle, _checkpoint, :ok), do: handle
 
       defp requeue_unfinished_segment_projection_checkpoint(handle, checkpoint, {:ok, unfinished})
-           when unfinished in [:busy, :stale_cut] do
+           when unfinished in [:busy, :stale_cut, :history_pending] do
         handle
         |> restore_segment_projection_checkpoint_request(checkpoint)
         |> Map.put(
@@ -735,19 +847,24 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
         call_segment_projection_checkpoint_hook(:before_scan, metadata)
 
         case take_segment_projection_cut(job) do
-          {:ok, cut, cut_position, generation} ->
+          {:ok, cut, cut_position, generation, history_dependencies} ->
             metadata = %{metadata | position: cut_position}
 
-            job.root_dir
-            |> with_segment_projection_lock(fn ->
-              write_segment_projection_checkpoint_from_cut(job, cut, generation, metadata)
-            end)
-            |> case do
-              {%{} = metadata, result} ->
-                {metadata, result}
+            if await_cut_history(job, history_dependencies) do
+              job.root_dir
+              |> with_segment_projection_lock(fn ->
+                write_segment_projection_checkpoint_from_cut(job, cut, generation, metadata)
+              end)
+              |> case do
+                {%{} = metadata, result} ->
+                  {metadata, result}
 
-              {:error, reason} ->
-                {metadata, {:error, {:segment_projection_checkpoint_failed, reason}}}
+                {:error, reason} ->
+                  {metadata, {:error, {:segment_projection_checkpoint_failed, reason}}}
+              end
+            else
+              :ets.delete(cut)
+              {metadata, {:ok, :history_pending}}
             end
 
           :stale ->
@@ -757,6 +874,44 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
         error ->
           {%{shard_index: job.shard_index, position: job.position, entries: 0},
            {:error, {:segment_projection_checkpoint_failed, error}}}
+      end
+
+      # Recovery replays only the entries after a projection, and Flow history
+      # is not in the keydir: the projector must have written the history of
+      # every entry the cut covers before the cut may become that floor.
+      defp await_cut_history(job, history_dependencies) do
+        request_history_dependencies(job, history_dependencies)
+
+        deadline =
+          System.monotonic_time(:millisecond) +
+            segment_projection_checkpoint_history_timeout_ms()
+
+        do_await_cut_history(job, history_dependencies, deadline)
+      end
+
+      defp do_await_cut_history(job, history_dependencies, deadline) do
+        cond do
+          history_dependencies_durable?(job, history_dependencies) ->
+            true
+
+          System.monotonic_time(:millisecond) >= deadline ->
+            false
+
+          true ->
+            Process.sleep(10)
+            do_await_cut_history(job, history_dependencies, deadline)
+        end
+      end
+
+      defp segment_projection_checkpoint_history_timeout_ms do
+        case Application.get_env(
+               :ferricstore,
+               :waraft_segment_projection_checkpoint_history_timeout_ms,
+               @default_segment_projection_checkpoint_history_timeout_ms
+             ) do
+          value when is_integer(value) and value >= 0 -> value
+          _ -> @default_segment_projection_checkpoint_history_timeout_ms
+        end
       end
 
       # Storage answers with its position and then waits for this copy before it
@@ -771,14 +926,15 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
         )
 
         receive do
-          {:ferricstore_waraft_segment_projection_checkpoint_cut, ^ref, {:cut, position, storage}} ->
+          {:ferricstore_waraft_segment_projection_checkpoint_cut, ^ref,
+           {:cut, position, storage, history_dependencies}} ->
             generation = segment_projection_trim_generation(job.root_dir)
             cut = copy_keydir_for_cut(job.keydir)
             send(storage, {:ferricstore_waraft_segment_projection_checkpoint_cut_copied, ref})
 
             receive do
               {:ferricstore_waraft_segment_projection_checkpoint_cut, ^ref, :confirmed} ->
-                {:ok, cut, position, generation}
+                {:ok, cut, position, generation, history_dependencies}
 
               {:ferricstore_waraft_segment_projection_checkpoint_cut, ^ref, :expired} ->
                 :ets.delete(cut)
@@ -1017,13 +1173,20 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       defp segment_projection_checkpoint_result({:ok, :stale}), do: :stale
       defp segment_projection_checkpoint_result({:ok, :busy}), do: :busy
       defp segment_projection_checkpoint_result({:ok, :stale_cut}), do: :stale_cut
+      defp segment_projection_checkpoint_result({:ok, :history_pending}), do: :history_pending
       defp segment_projection_checkpoint_result({:error, _reason}), do: :error
       defp segment_projection_checkpoint_result(_other), do: :error
 
       defp segment_projection_checkpoint_reason({:error, reason}), do: reason
 
       defp segment_projection_checkpoint_reason(other)
-           when other not in [:ok, {:ok, :stale}, {:ok, :busy}, {:ok, :stale_cut}],
+           when other not in [
+                  :ok,
+                  {:ok, :stale},
+                  {:ok, :busy},
+                  {:ok, :stale_cut},
+                  {:ok, :history_pending}
+                ],
            do: other
 
       defp segment_projection_checkpoint_reason(_result), do: nil
@@ -1079,10 +1242,12 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
             :ok
         end
 
+        # A trim that rebuilds the projection at this position needs the Flow
+        # history of the entries up to it durable first.
         true =
           :ets.insert(
             @segment_projection_registry,
-            {{key, :position}, Map.fetch!(handle, :position)}
+            {{key, :position}, Map.fetch!(handle, :position), history_replay_dependencies(handle)}
           )
 
         handle
@@ -1159,8 +1324,11 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
               :ets.lookup(@segment_projection_registry, {key, :context}),
               :ets.lookup(@segment_projection_registry, {key, :position})
             } do
-              {[{_context_key, context}], [{_position_key, position}]} ->
-                {:ok, Map.put(context, :position, position)}
+              {[{_context_key, context}], [{_position_key, position, history_dependencies}]} ->
+                {:ok,
+                 context
+                 |> Map.put(:position, position)
+                 |> Map.put(:history_dependencies, history_dependencies)}
 
               {[], _position} ->
                 {:error, {:segment_projection_context_missing, root_dir}}

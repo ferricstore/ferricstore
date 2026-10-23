@@ -333,7 +333,7 @@ defmodule Ferricstore.Flow.Query.HistoryExecutor do
     end
   end
 
-  defp event_key(event_id), do: {HistoryEvent.ms(event_id), event_id}
+  defp event_key(event_id), do: HistoryEvent.sort_key(event_id)
 
   defp minimum_hydrated(records, true), do: length(records) + 1
   defp minimum_hydrated(records, false), do: length(records)

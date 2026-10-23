@@ -164,6 +164,21 @@ defmodule FerricstoreServer.Acl.Rules do
     {:ok, flush_pending_key_patterns(user, pending_key_patterns), password_action}
   end
 
+  # Redis: the user returns to its state right after creation (resetpass,
+  # resetkeys, resetchannels, off, -@all). Earlier rules in the list are undone.
+  defp apply_rules_deferred(user, ["reset" | rest], _pending_key_patterns, _password_action) do
+    reset = %{
+      user
+      | enabled: false,
+        commands: MapSet.new(),
+        denied_commands: MapSet.new(),
+        keys: [],
+        channels: []
+    }
+
+    apply_rules_deferred(Map.put(reset, :expires_at_ms, nil), rest, [], :clear)
+  end
+
   defp apply_rules_deferred(user, [rule | rest], pending_key_patterns, password_action) do
     case deferred_password_action(rule) do
       {:ok, next_password_action} ->
@@ -235,7 +250,7 @@ defmodule FerricstoreServer.Acl.Rules do
     {:ok, %{user | commands: :all, denied_commands: MapSet.new()}}
   end
 
-  def parse_rule(user, "-@all"),
+  def parse_rule(user, rule) when rule in ["-@all", "nocommands"],
     do: {:ok, %{user | commands: MapSet.new(), denied_commands: MapSet.new()}}
 
   def parse_rule(user, "+@" <> category) do

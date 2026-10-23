@@ -162,6 +162,19 @@ defmodule Ferricstore.Store.Ops do
   end
 
   @spec value_size(store(), binary()) :: non_neg_integer() | nil | ReadResult.failure()
+  @doc """
+  Whether a command may write as feature level 5 does where older releases
+  write differently (BITOP's empty result, GEOSEARCHSTORE of a missing
+  source, HGETEX of a past time). The instance and the embedded API write through the cluster as
+  plain puts and deletes, which every replica applies alike; a MULTI
+  transaction runs on every replica, so its store allows it only once level
+  5 is active.
+  """
+  @spec level_5_writes?(term()) :: boolean()
+  def level_5_writes?(%FerricStore.Instance{}), do: true
+  def level_5_writes?(store) when is_map(store), do: Map.get(store, :level_5_writes?) == true
+  def level_5_writes?(_store), do: false
+
   def value_size(%FerricStore.Instance{} = ctx, key), do: Router.value_size(ctx, key)
 
   def value_size(%LocalTxStore{} = tx, key) do
@@ -760,6 +773,15 @@ defmodule Ferricstore.Store.Ops do
   def cas(store, key, expected, new_val, ttl) when is_map(store),
     do: store.cas.(key, expected, new_val, ttl)
 
+  @doc """
+  CAS with an absolute expiry (0 clears the TTL), for SET IFEQ/IFNE on the
+  instance: the replicated `{:cas, ...}` entry every release applies alike.
+  """
+  @spec cas_at(FerricStore.Instance.t(), binary(), binary(), binary(), non_neg_integer()) ::
+          1 | 0 | nil | {:error, term()}
+  def cas_at(%FerricStore.Instance{} = ctx, key, expected, new_val, expire_at_ms),
+    do: Router.cas_at(ctx, key, expected, new_val, expire_at_ms)
+
   @spec lock(store(), binary(), binary(), pos_integer()) :: :ok | {:error, binary()}
   def lock(%FerricStore.Instance{} = ctx, key, owner, ttl), do: Router.lock(ctx, key, owner, ttl)
 
@@ -882,10 +904,12 @@ defmodule Ferricstore.Store.Ops do
   at cluster feature level 4. See `Ferricstore.Store.Router.compound_command/3`.
   """
   @spec compound_command(store(), binary(), tuple()) :: term()
-  def compound_command(%FerricStore.Instance{} = ctx, key, ast),
-    do: Router.compound_command(ctx, key, ast)
+  def compound_command(store, key, ast, level \\ 4)
 
-  def compound_command(_store, _key, _ast), do: :unsupported
+  def compound_command(%FerricStore.Instance{} = ctx, key, ast, level),
+    do: Router.compound_command(ctx, key, ast, level)
+
+  def compound_command(_store, _key, _ast, _level), do: :unsupported
 
   def compound_get(store, redis_key, compound_key),
     do: CompoundOps.compound_get(store, redis_key, compound_key)

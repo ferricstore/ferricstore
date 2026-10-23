@@ -3022,6 +3022,54 @@ defmodule Ferricstore.Flow.ScheduleTest do
     assert schedule.next_run_at_ms == expected_ms
   end
 
+  # A fire that fails part-way (a leader change, a timeout) used to keep the
+  # schedule claimed for the whole 30 s lease, so nothing fired it meanwhile.
+  test "a schedule fire that fails transiently is released for the next poll" do
+    schedule_id = unique_flow_id("schedule-transient-fire")
+    now_ms = System.system_time(:millisecond)
+
+    assert {:ok, schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :interval,
+               every_ms: 60_000,
+               start_at_ms: now_ms,
+               now_ms: now_ms,
+               target: [
+                 id_prefix: unique_flow_id("schedule-transient-fire-target"),
+                 type: unique_flow_id("schedule-transient-fire-type")
+               ]
+             )
+
+    due_ms = schedule.next_run_at_ms
+    failures = :atomics.new(1, [])
+
+    Ferricstore.FaultInjection.put_hook(fn
+      :schedule_fire_after_target, %{schedule_id: ^schedule_id} ->
+        if :atomics.add_get(failures, 1, 1) == 1,
+          do: {:error, {:timeout, :unknown_outcome}},
+          else: :ok
+
+      _point, _metadata ->
+        :ok
+    end)
+
+    try do
+      assert {:ok, _summary} =
+               FerricStore.flow_schedule_fire_due(now_ms: due_ms, worker: "schedule-test")
+    after
+      Ferricstore.FaultInjection.clear_hook()
+    end
+
+    assert {:ok, %{fire_count: 0}} = FerricStore.flow_schedule_get(schedule_id)
+
+    assert {:ok, _summary} =
+             FerricStore.flow_schedule_fire_due(now_ms: due_ms, worker: "schedule-test")
+
+    assert {:ok, fired} = FerricStore.flow_schedule_get(schedule_id)
+    assert fired.fire_count == 1
+    assert fired.next_run_at_ms == due_ms + 60_000
+  end
+
   test "cron schedule handles repeated DST wall-clock minute as distinct due times" do
     schedule_id = unique_flow_id("schedule-cron-dst-repeat")
     first_due_ms = DateTime.to_unix(~U[2026-11-01 05:30:00Z], :millisecond)

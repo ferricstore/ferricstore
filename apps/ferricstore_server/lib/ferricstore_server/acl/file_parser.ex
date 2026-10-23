@@ -281,6 +281,21 @@ defmodule FerricstoreServer.Acl.FileParser do
     {:ok, Rules.flush_pending_key_patterns(user, pending_key_patterns)}
   end
 
+  # As SETUSER: the user returns to its state right after creation.
+  defp parse_file_rules(["reset" | rest], line_num, user, _pending_key_patterns) do
+    reset = %{
+      user
+      | enabled: false,
+        password: nil,
+        commands: MapSet.new(),
+        denied_commands: MapSet.new(),
+        keys: [],
+        channels: []
+    }
+
+    parse_file_rules(rest, line_num, Map.put(reset, :expires_at_ms, nil), [])
+  end
+
   defp parse_file_rules([token | rest], line_num, user, pending_key_patterns) do
     case parse_file_key_token(user, token, pending_key_patterns) do
       {:ok, updated, next_pending} ->

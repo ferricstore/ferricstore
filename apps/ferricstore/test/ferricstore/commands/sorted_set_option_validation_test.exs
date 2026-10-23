@@ -13,7 +13,7 @@ defmodule Ferricstore.Commands.SortedSetOptionValidationTest do
   end
 
   test "rank ranges accept lowercase WITHSCORES and reject every other tail", %{store: store} do
-    assert ["one", "1.0", "two", "2.0"] ==
+    assert ["one", "1", "two", "2"] ==
              SortedSet.handle("ZRANGE", ["zset", "0", "-1", "withscores"], store)
 
     assert @syntax_error == SortedSet.handle("ZRANGE", ["zset", "0", "-1", "bogus"], store)

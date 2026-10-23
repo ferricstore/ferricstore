@@ -14,7 +14,7 @@ defmodule Ferricstore.Commands.Geo.Parsing do
     {flags, rest} = take_geoadd_flags(args, [])
 
     if :nx in flags and :xx in flags do
-      {:error, "ERR XX and NX options at the same time are not compatible"}
+      {:error, "ERR syntax error"}
     else
       {:ok, flags, rest}
     end
@@ -32,7 +32,7 @@ defmodule Ferricstore.Commands.Geo.Parsing do
         {:error, "ERR syntax error"}
 
       :nx in flags and :xx in flags ->
-        {:error, "ERR XX and NX options at the same time are not compatible"}
+        {:error, "ERR syntax error"}
 
       pairs == [] ->
         {:error, "ERR wrong number of arguments for 'geoadd' command"}
@@ -97,7 +97,7 @@ defmodule Ferricstore.Commands.Geo.Parsing do
       if valid_coordinates?(lng, lat) do
         parse_lng_lat_members(rest, [{lng, lat, member} | acc])
       else
-        {:error, "ERR invalid longitude,latitude pair #{lng_str},#{lat_str}"}
+        pair_error(lng, lat)
       end
     end
   end
@@ -110,6 +110,14 @@ defmodule Ferricstore.Commands.Geo.Parsing do
     {:error, "ERR wrong number of arguments for 'geoadd' command"}
   end
 
+  # Redis prints the parsed pair with C's "%f".
+  defp pair_error(lng, lat) do
+    {:error,
+     "ERR invalid longitude,latitude pair " <>
+       :erlang.float_to_binary(lng, decimals: 6) <>
+       "," <> :erlang.float_to_binary(lat, decimals: 6)}
+  end
+
   defp valid_coordinates?(lng, lat) do
     lng >= -180.0 and lng <= 180.0 and lat >= -85.05112878 and lat <= 85.05112878
   end
@@ -119,7 +127,7 @@ defmodule Ferricstore.Commands.Geo.Parsing do
       {lng, lat, member}, :ok when is_float(lng) and is_float(lat) and is_binary(member) ->
         if valid_coordinates?(lng, lat),
           do: {:cont, :ok},
-          else: {:halt, {:error, "ERR invalid longitude,latitude pair #{lng},#{lat}"}}
+          else: {:halt, pair_error(lng, lat)}
 
       _invalid, :ok ->
         {:halt, {:error, "ERR syntax error"}}
@@ -140,7 +148,7 @@ defmodule Ferricstore.Commands.Geo.Parsing do
   defp validate_typed_center({:lonlat, lng, lat}) when is_float(lng) and is_float(lat) do
     if valid_coordinates?(lng, lat),
       do: :ok,
-      else: {:error, "ERR invalid longitude,latitude pair #{lng},#{lat}"}
+      else: pair_error(lng, lat)
   end
 
   defp validate_typed_center({:member, member}) when is_binary(member), do: :ok
@@ -170,6 +178,9 @@ defmodule Ferricstore.Commands.Geo.Parsing do
 
   defp validate_optional_count(nil), do: :ok
   defp validate_optional_count(count) when is_integer(count) and count > 0, do: :ok
+
+  defp validate_optional_count(count) when is_integer(count),
+    do: {:error, "ERR COUNT must be > 0"}
 
   defp validate_optional_count(_count),
     do: {:error, "ERR value is not an integer or out of range"}
@@ -264,7 +275,7 @@ defmodule Ferricstore.Commands.Geo.Parsing do
             if valid_coordinates?(lng, lat) do
               parse_geosearch_opts(rest, Map.put(opts, :center, {:lonlat, lng, lat}))
             else
-              {:error, "ERR invalid longitude,latitude pair #{lng_str},#{lat_str}"}
+              pair_error(lng, lat)
             end
           end
         end
@@ -296,15 +307,22 @@ defmodule Ferricstore.Commands.Geo.Parsing do
 
       with {:ok, radius} <- parse_float(radius_str),
            true <- unit in Map.keys(@unit_conversions) do
-        if radius > 0 do
-          radius_m = radius * @unit_conversions[unit]
+        cond do
+          radius > 0 ->
+            radius_m = radius * @unit_conversions[unit]
 
-          opts =
-            Map.merge(opts, %{shape: {:radius, radius_m}, unit: unit, raw_radius: radius})
+            opts =
+              Map.merge(opts, %{shape: {:radius, radius_m}, unit: unit, raw_radius: radius})
 
-          parse_geosearch_opts(rest, opts)
-        else
-          {:error, "ERR radius must be greater than 0"}
+            parse_geosearch_opts(rest, opts)
+
+          # Redis accepts a zero radius; older releases refuse it, and
+          # GEOSEARCHSTORE runs inside MULTI apply, so zero stays refused.
+          radius == 0 ->
+            {:error, "ERR radius must be greater than 0"}
+
+          true ->
+            {:error, "ERR radius cannot be negative"}
         end
       else
         false -> {:error, "ERR unsupported unit provided. please use M, KM, FT, MI"}
@@ -354,6 +372,9 @@ defmodule Ferricstore.Commands.Geo.Parsing do
           _ ->
             parse_geosearch_opts(rest, Map.merge(opts, %{count: count, any: false}))
         end
+
+      {_count, ""} ->
+        {:error, "ERR COUNT must be > 0"}
 
       _ ->
         {:error, "ERR value is not an integer or out of range"}

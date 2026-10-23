@@ -4,6 +4,8 @@ defmodule Ferricstore.Flow.HistoryRead do
   alias Ferricstore.BatchResult
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.Codec
+  alias Ferricstore.Flow.HistoryEvent
+  alias Ferricstore.Flow.LMDB.HistoryScan
   alias Ferricstore.Flow.ScopeBinding
   alias Ferricstore.Store.ReadResult
   alias Ferricstore.Store.Router
@@ -253,18 +255,10 @@ defmodule Ferricstore.Flow.HistoryRead do
         |> Ferricstore.DataDir.shard_data_path(shard_index)
         |> Ferricstore.Flow.LMDB.path()
 
-      prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
       now_ms = CommandTime.now_ms()
 
       with {:ok, entries} <-
-             cold_page_entries(
-               path,
-               prefix,
-               history_key,
-               boundary_event,
-               direction,
-               count
-             ),
+             cold_page_entries(path, history_key, boundary_event, direction, count),
            {:ok, decoded} <-
              Ferricstore.Flow.LMDBIndexDecode.history_query_entries(entries, now_ms),
            {:ok, decoded} <- normalize_page_refs(decoded) do
@@ -278,37 +272,24 @@ defmodule Ferricstore.Flow.HistoryRead do
     end
   end
 
-  defp cold_page_entries(path, prefix, _history_key, nil, direction, count),
-    do: Ferricstore.Flow.LMDB.prefix_entries(path, prefix, count, direction == :desc)
+  defp cold_page_entries(path, history_key, nil, :asc, count),
+    do: HistoryScan.first(path, history_key, count)
 
-  defp cold_page_entries(path, prefix, history_key, boundary_event, direction, count) do
-    boundary_key =
-      Ferricstore.Flow.LMDB.history_index_key(
-        history_key,
-        boundary_event,
-        Ferricstore.Flow.HistoryEvent.ms(boundary_event)
-      )
+  defp cold_page_entries(path, history_key, nil, :desc, count),
+    do: HistoryScan.last(path, history_key, count)
 
-    case direction do
-      :asc ->
-        Ferricstore.Flow.LMDB.prefix_entries_after(path, prefix, boundary_key, count)
+  defp cold_page_entries(path, history_key, boundary_event, :asc, count),
+    do: HistoryScan.after_event(path, history_key, boundary_event, count)
 
-      :desc ->
-        Ferricstore.Flow.LMDB.prefix_entries_reverse_before(
-          path,
-          prefix,
-          boundary_key,
-          count
-        )
-    end
-  end
+  defp cold_page_entries(path, history_key, boundary_event, :desc, count),
+    do: HistoryScan.before_event(path, history_key, boundary_event, count)
 
   defp select_page_refs(hot_refs, cold_refs, count, direction) do
     refs = hot_refs ++ cold_refs
 
     unique_refs =
       refs
-      |> Enum.sort_by(fn {event_id, score} -> {score, event_id} end, direction)
+      |> Enum.sort_by(&HistoryEvent.ref_sort_key/1, direction)
       |> Enum.uniq_by(&elem(&1, 0))
 
     {:ok,
@@ -520,7 +501,7 @@ defmodule Ferricstore.Flow.HistoryRead do
 
   defp candidate_event_ids(refs, query) do
     refs
-    |> Enum.sort_by(fn {event_id, score} -> {score, event_id} end)
+    |> Enum.sort_by(&HistoryEvent.ref_sort_key/1)
     |> Enum.uniq_by(fn {event_id, _score} -> event_id end)
     |> limit_candidate_refs(query)
     |> Enum.map(fn {event_id, _score} -> event_id end)
@@ -597,13 +578,12 @@ defmodule Ferricstore.Flow.HistoryRead do
         |> Ferricstore.DataDir.shard_data_path(shard_index)
         |> Ferricstore.Flow.LMDB.path()
 
-      prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
       now_ms = CommandTime.now_ms()
       sweep_limit = history_lmdb_sweep_limit()
       scan_count = history_lmdb_scan_count(count, query)
 
       with {:ok, _swept} <- Ferricstore.Flow.LMDB.sweep_expired_history(path, now_ms, sweep_limit),
-           {:ok, entries} <- lmdb_prefix_entries(path, prefix, scan_count, query),
+           {:ok, entries} <- lmdb_history_entries(path, history_key, scan_count, query),
            {:ok, decoded_entries} <-
              Ferricstore.Flow.LMDBIndexDecode.history_entries(entries, path, now_ms) do
         {:ok, decoded_entries}
@@ -624,12 +604,12 @@ defmodule Ferricstore.Flow.HistoryRead do
     end
   end
 
-  defp lmdb_prefix_entries(path, prefix, limit, query) do
+  defp lmdb_history_entries(path, history_key, limit, query) do
     result =
       query
       |> lmdb_scan_directions()
       |> Enum.reduce_while({:ok, []}, fn reverse?, {:ok, acc} ->
-        case lmdb_prefix_entries(path, prefix, limit, query, reverse?) do
+        case lmdb_history_entries(path, history_key, limit, query, reverse?) do
           {:ok, entries} -> {:cont, {:ok, acc ++ entries}}
           {:error, _reason} = error -> {:halt, error}
         end
@@ -661,33 +641,19 @@ defmodule Ferricstore.Flow.HistoryRead do
 
   defp requires_full_lmdb_scan?(_query), do: true
 
-  defp lmdb_prefix_entries(path, prefix, limit, %{to_ms: to_ms}, true)
-       when is_integer(to_ms) and to_ms >= 0 do
-    Ferricstore.Flow.LMDB.prefix_entries_reverse_before(
-      path,
-      prefix,
-      Ferricstore.Flow.LMDBQueryWindow.time_upper_seek_key(prefix, to_ms),
-      limit
-    )
-  end
+  defp lmdb_history_entries(path, history_key, limit, %{to_ms: to_ms}, true)
+       when is_integer(to_ms) and to_ms >= 0,
+       do: HistoryScan.to_ms(path, history_key, to_ms, limit)
 
-  defp lmdb_prefix_entries(path, prefix, limit, _query, true) do
-    Ferricstore.Flow.LMDB.prefix_entries(path, prefix, limit, true)
-  end
+  defp lmdb_history_entries(path, history_key, limit, _query, true),
+    do: HistoryScan.last(path, history_key, limit)
 
-  defp lmdb_prefix_entries(path, prefix, limit, %{from_ms: from_ms}, false)
-       when is_integer(from_ms) and from_ms >= 0 do
-    Ferricstore.Flow.LMDB.prefix_entries_after(
-      path,
-      prefix,
-      Ferricstore.Flow.LMDBQueryWindow.time_seek_key(prefix, from_ms),
-      limit
-    )
-  end
+  defp lmdb_history_entries(path, history_key, limit, %{from_ms: from_ms}, false)
+       when is_integer(from_ms) and from_ms >= 0,
+       do: HistoryScan.from_ms(path, history_key, from_ms, limit)
 
-  defp lmdb_prefix_entries(path, prefix, limit, _query, false) do
-    Ferricstore.Flow.LMDB.prefix_entries(path, prefix, limit, false)
-  end
+  defp lmdb_history_entries(path, history_key, limit, _query, false),
+    do: HistoryScan.first(path, history_key, limit)
 
   defp maybe_flush_lmdb_shard(_ctx, _shard_index, false), do: :ok
 
@@ -867,9 +833,7 @@ defmodule Ferricstore.Flow.HistoryRead do
               _other ->
                 []
             end)
-            |> Enum.sort_by(fn {event_id, _fields} ->
-              {Ferricstore.Flow.HistoryEvent.ms(event_id), event_id}
-            end)
+            |> Enum.sort_by(fn {event_id, _fields} -> HistoryEvent.sort_key(event_id) end)
             |> Enum.take(-fetch_count)
 
           events =

@@ -137,6 +137,74 @@ defmodule Ferricstore.Store.ValueCodec do
     end
   end
 
+  @doc """
+  Formats a float as Redis replies with a double, such as a sorted set score:
+  an integral value within +/-2^62 as an integer ("3", "100000000000000000"),
+  any other with the shortest digits that read back as the same float, in
+  plain notation for moderate exponents ("2.5", "0.00001",
+  "12345678901234567000") and in exponent form otherwise ("1.5e-7", "1e+20").
+  """
+  @spec format_double(float()) :: binary()
+  def format_double(val) when is_float(val) do
+    cond do
+      val == 0.0 ->
+        "0"
+
+      abs(val) <= 4.611686018427388e18 and val == Float.round(val) ->
+        Integer.to_string(trunc(val))
+
+      val < 0 ->
+        "-" <> format_shortest(-val)
+
+      true ->
+        format_shortest(val)
+    end
+  end
+
+  # Redis's fpconv layout of the shortest digits of a positive float.
+  defp format_shortest(val) do
+    {digits, k} = shortest_digits(val)
+    count = byte_size(digits)
+    exponent = abs(k + count - 1)
+
+    cond do
+      k >= 0 and exponent < count + 7 ->
+        digits <> String.duplicate("0", k)
+
+      k < 0 and (k > -7 or exponent < 4) ->
+        plain_decimal(digits, count + k)
+
+      true ->
+        mantissa =
+          if count > 1,
+            do: binary_part(digits, 0, 1) <> "." <> binary_part(digits, 1, count - 1),
+            else: digits
+
+        sign = if k + count - 1 < 0, do: "-", else: "+"
+        mantissa <> "e" <> sign <> Integer.to_string(exponent)
+    end
+  end
+
+  # The shortest significant digits of a positive float, without leading or
+  # trailing zeros, and the power of ten of the last one.
+  defp shortest_digits(val) do
+    {mantissa, exponent} =
+      case :binary.split(:erlang.float_to_binary(val, [:short]), "e") do
+        [mantissa, exponent] -> {mantissa, String.to_integer(exponent)}
+        [mantissa] -> {mantissa, 0}
+      end
+
+    {integer_digits, fraction_digits} =
+      case :binary.split(mantissa, ".") do
+        [integer_digits, fraction_digits] -> {integer_digits, fraction_digits}
+        [integer_digits] -> {integer_digits, ""}
+      end
+
+    digits = String.trim_leading(integer_digits <> fraction_digits, "0")
+    trimmed = String.trim_trailing(digits, "0")
+    {trimmed, exponent - byte_size(fraction_digits) + byte_size(digits) - byte_size(trimmed)}
+  end
+
   # `digits` with the decimal point after `point` of them.
   defp plain_decimal(digits, point) do
     trimmed = String.trim_leading(digits, "0")

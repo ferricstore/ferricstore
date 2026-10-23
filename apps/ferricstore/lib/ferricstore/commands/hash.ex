@@ -14,9 +14,9 @@ defmodule Ferricstore.Commands.Hash do
 
   ## Hash Field TTL (Redis 7.4+)
 
-  Individual hash fields can have per-field expiry via `HEXPIRE`, `HTTL`,
-  and `HPERSIST`. The expiry is stored as the `expire_at_ms` timestamp on
-  each compound key entry.
+  Individual hash fields can have per-field expiry via `HEXPIRE`,
+  `HPEXPIRE`, `HTTL` and `HPERSIST`. The expiry is stored as the
+  `expire_at_ms` timestamp on each compound key entry.
 
   ## Type Enforcement
 
@@ -25,11 +25,15 @@ defmodule Ferricstore.Commands.Hash do
   WRONGTYPE error is returned.
   """
 
+  alias Ferricstore.CommandTime
   alias Ferricstore.Commands.CollectionScan
   alias Ferricstore.Commands.Hash.FieldOps
   alias Ferricstore.Commands.Hash.Helpers
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.{Ops, ReadResult, TypeRegistry, ValueCodec}
+
+  @field_expire_commands ~w(HEXPIRE HPEXPIRE)
+  @field_expire_tags [:hexpire, :hpexpire]
 
   @max_int64 9_223_372_036_854_775_807
   @min_int64 -9_223_372_036_854_775_808
@@ -232,22 +236,23 @@ defmodule Ferricstore.Commands.Hash do
   end
 
   # ---------------------------------------------------------------------------
-  # HEXPIRE key seconds FIELDS count field [field ...]
+  # HEXPIRE key seconds [NX | XX | GT | LT] FIELDS count field [field ...]
+  # HPEXPIRE key milliseconds [NX | XX | GT | LT] FIELDS count field [field ...]
   # ---------------------------------------------------------------------------
 
-  # Sets a TTL (in seconds) on individual hash fields.
-  # Returns: 1 = expiry set, -2 = field/key does not exist.
-  def handle("HEXPIRE", [key, seconds_str, "FIELDS", count_str | fields], store) do
-    with {:ok, seconds} <- Helpers.parse_positive_integer(seconds_str, "seconds"),
-         {:ok, expire_at_ms} <- Helpers.relative_expire_at(seconds, 1_000),
-         {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
-         :ok <- Helpers.validate_field_count(count, fields) do
-      FieldOps.expire_fields(key, fields, expire_at_ms, store)
-    end
+  # Sets a TTL on individual hash fields. Per field: 1 = expiry set,
+  # 2 = deleted (a TTL of 0), 0 = condition not met, -2 = no such field.
+  def handle(command, [key, ttl | args], store)
+      when command in @field_expire_commands and length(args) >= 3 do
+    command = String.downcase(command)
+
+    with {:ok, ttl, condition, fields} <-
+           type_checked_args(key, Helpers.parse_field_expire(command, ttl, args), store),
+         do: expire_fields(key, command, ttl, condition, fields, store)
   end
 
-  def handle("HEXPIRE", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'hexpire' command"}
+  def handle(command, _args, _store) when command in @field_expire_commands do
+    {:error, "ERR wrong number of arguments for '#{String.downcase(command)}' command"}
   end
 
   # ---------------------------------------------------------------------------
@@ -256,11 +261,9 @@ defmodule Ferricstore.Commands.Hash do
 
   # Returns remaining TTL (seconds) for individual hash fields.
   # Returns: TTL >= 0, -1 = no expiry, -2 = field/key does not exist.
-  def handle("HTTL", [key, "FIELDS", count_str | fields], store) do
-    with {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
-         :ok <- Helpers.validate_field_count(count, fields) do
-      FieldOps.ttl_fields(key, fields, :seconds, store)
-    end
+  def handle("HTTL", [key | args], store) when length(args) >= 3 do
+    with {:ok, fields} <- field_list(key, args, store),
+         do: FieldOps.ttl_fields(key, fields, :seconds, store)
   end
 
   def handle("HTTL", _args, _store) do
@@ -273,34 +276,13 @@ defmodule Ferricstore.Commands.Hash do
 
   # Removes expiry from individual hash fields, making them persistent.
   # Returns: 1 = expiry removed, -1 = no expiry set, -2 = field/key does not exist.
-  def handle("HPERSIST", [key, "FIELDS", count_str | fields], store) do
-    with {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
-         :ok <- Helpers.validate_field_count(count, fields) do
-      FieldOps.persist_fields(key, fields, store)
-    end
+  def handle("HPERSIST", [key | args], store) when length(args) >= 3 do
+    with {:ok, fields} <- field_list(key, args, store),
+         do: FieldOps.persist_fields(key, fields, store)
   end
 
   def handle("HPERSIST", _args, _store) do
     {:error, "ERR wrong number of arguments for 'hpersist' command"}
-  end
-
-  # ---------------------------------------------------------------------------
-  # HPEXPIRE key milliseconds FIELDS count field [field ...]
-  # ---------------------------------------------------------------------------
-
-  # Sets a TTL (in milliseconds) on individual hash fields.
-  # Returns: 1 = expiry set, -2 = field/key does not exist.
-  def handle("HPEXPIRE", [key, ms_str, "FIELDS", count_str | fields], store) do
-    with {:ok, ms} <- Helpers.parse_positive_integer(ms_str, "milliseconds"),
-         {:ok, expire_at_ms} <- Helpers.relative_expire_at(ms, 1),
-         {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
-         :ok <- Helpers.validate_field_count(count, fields) do
-      FieldOps.expire_fields(key, fields, expire_at_ms, store)
-    end
-  end
-
-  def handle("HPEXPIRE", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'hpexpire' command"}
   end
 
   # ---------------------------------------------------------------------------
@@ -309,11 +291,9 @@ defmodule Ferricstore.Commands.Hash do
 
   # Returns remaining TTL (milliseconds) for individual hash fields.
   # Returns: TTL >= 0, -1 = no expiry, -2 = field/key does not exist.
-  def handle("HPTTL", [key, "FIELDS", count_str | fields], store) do
-    with {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
-         :ok <- Helpers.validate_field_count(count, fields) do
-      FieldOps.ttl_fields(key, fields, :milliseconds, store)
-    end
+  def handle("HPTTL", [key | args], store) when length(args) >= 3 do
+    with {:ok, fields} <- field_list(key, args, store),
+         do: FieldOps.ttl_fields(key, fields, :milliseconds, store)
   end
 
   def handle("HPTTL", _args, _store) do
@@ -326,11 +306,9 @@ defmodule Ferricstore.Commands.Hash do
 
   # Returns the absolute Unix timestamp (seconds) at which each field expires.
   # Returns: timestamp >= 0, -1 = no expiry, -2 = field/key does not exist.
-  def handle("HEXPIRETIME", [key, "FIELDS", count_str | fields], store) do
-    with {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
-         :ok <- Helpers.validate_field_count(count, fields) do
-      FieldOps.expiretime_fields(key, fields, store)
-    end
+  def handle("HEXPIRETIME", [key | args], store) when length(args) >= 3 do
+    with {:ok, fields} <- field_list(key, args, store),
+         do: FieldOps.expiretime_fields(key, fields, :seconds, store)
   end
 
   def handle("HEXPIRETIME", _args, _store) do
@@ -343,11 +321,8 @@ defmodule Ferricstore.Commands.Hash do
 
   # Atomically gets the values of the specified fields and deletes them.
   # Returns a list of values (nil for missing fields).
-  def handle("HGETDEL", [key, "FIELDS", count_str | fields], store) do
-    with {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
-         :ok <- Helpers.validate_field_count(count, fields) do
-      getdel_fields(key, fields, store)
-    end
+  def handle("HGETDEL", [key | args], store) when length(args) >= 3 do
+    with {:ok, fields} <- field_list(key, args, store), do: getdel_fields(key, fields, store)
   end
 
   def handle("HGETDEL", _args, _store) do
@@ -358,37 +333,12 @@ defmodule Ferricstore.Commands.Hash do
   # HGETEX key [PERSIST|EX sec|PX ms|EXAT ts|PXAT ms_ts] FIELDS count field [field ...]
   # ---------------------------------------------------------------------------
 
-  # Gets the values of the specified fields and optionally modifies their expiry.
-  def handle("HGETEX", [key, "FIELDS", count_str | fields], store) do
-    with {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
-         :ok <- Helpers.validate_field_count(count, fields) do
-      hmget_args([key | fields], store)
-    end
-  end
-
-  def handle("HGETEX", [key, mode | rest], store) when mode in ~w(EX PX EXAT PXAT) do
-    case rest do
-      [value_str, "FIELDS", count_str | fields] ->
-        with {:ok, expire_at_ms} <- Helpers.parse_expiry_mode(mode, value_str),
-             {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
-             :ok <- Helpers.validate_field_count(count, fields) do
-          with :ok <- TypeRegistry.command_check_type(key, :hash, store) do
-            FieldOps.getex_fields(fields, key, store, expire_at_ms)
-          end
-        end
-
-      _ ->
-        {:error, "ERR wrong number of arguments for 'hgetex' command"}
-    end
-  end
-
-  def handle("HGETEX", [key, "PERSIST", "FIELDS", count_str | fields], store) do
-    with {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
-         :ok <- Helpers.validate_field_count(count, fields) do
-      with :ok <- TypeRegistry.command_check_type(key, :hash, store) do
-        FieldOps.getex_fields(fields, key, store, 0)
-      end
-    end
+  # Gets the values of the specified fields and optionally modifies their
+  # expiry; a TTL of 0 or a time not after now deletes them, as HGETDEL does.
+  # The options and the FIELDS block go in any order, as in Redis 8.
+  def handle("HGETEX", [key | args], store) when length(args) >= 3 do
+    with {:ok, mode, fields} <- type_checked_args(key, Helpers.parse_getex(args), store),
+         do: getex_checked(key, mode, fields, store)
   end
 
   def handle("HGETEX", _args, _store) do
@@ -396,21 +346,19 @@ defmodule Ferricstore.Commands.Hash do
   end
 
   # ---------------------------------------------------------------------------
-  # HSETEX key seconds field value [field value ...]
+  # HSETEX key [FNX | FXX] [EX s | PX ms | EXAT ts | PXAT ms-ts | KEEPTTL]
+  #   FIELDS count field value [field value ...]            (Redis 8)
+  # HSETEX key seconds field value [field value ...]         (FerricStore)
   # ---------------------------------------------------------------------------
 
-  # Sets field-value pairs in a hash with a per-field TTL in seconds.
-  # Returns the number of NEW fields added (not updated).
-  def handle("HSETEX", [key, seconds_str, _f, _v | _] = args, store) do
-    [_, _ | field_value_pairs] = args
-
-    with {:ok, seconds} <- Helpers.parse_positive_integer(seconds_str, "seconds"),
-         {:ok, expire_at_ms} <- Helpers.relative_expire_at(seconds, 1_000) do
-      if Helpers.even_length?(field_value_pairs) do
-        hset_fields_with_ttl(key, field_value_pairs, store, expire_at_ms)
-      else
-        {:error, "ERR wrong number of arguments for 'hsetex' command"}
-      end
+  # Redis 8's form answers 1 when it set the fields and 0 when FNX or FXX
+  # refused them; it removes their TTL unless given one or KEEPTTL.
+  def handle("HSETEX", [key, option | rest], store) when rest != [] do
+    if Helpers.setex_option?(option) do
+      with {:ok, condition, expiry, pairs} <- Helpers.parse_setex([option | rest]),
+           do: setex(key, {condition, expiry}, pairs, store)
+    else
+      legacy_setex(key, [option | rest], store)
     end
   end
 
@@ -443,7 +391,7 @@ defmodule Ferricstore.Commands.Hash do
   def handle("HSCAN", [key, cursor_str | opts], store) do
     with :ok <- TypeRegistry.command_check_type(key, :hash, store),
          {:ok, cursor} <- Helpers.parse_cursor(cursor_str),
-         {:ok, match_pattern, count} <- Helpers.parse_hscan_opts(opts),
+         {:ok, match_pattern, count, novalues?} <- Helpers.parse_hscan_opts(opts),
          {:ok, {next_cursor, pairs}} <-
            CollectionScan.page(
              store,
@@ -454,8 +402,7 @@ defmodule Ferricstore.Commands.Hash do
              match_pattern,
              false
            ) do
-      elements = Helpers.hash_pairs_to_flat_list(pairs)
-      [next_cursor, elements]
+      [next_cursor, hscan_elements(pairs, novalues?)]
     end
   end
 
@@ -536,6 +483,7 @@ defmodule Ferricstore.Commands.Hash do
 
   def handle_ast({:hstrlen, key, field}, store), do: hstrlen_field(key, field, store)
   def handle_ast({:hscan, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:hscan, _key, _cursor, {:error, _reason} = error}, _store), do: error
   def handle_ast({:hscan, key, cursor, opts}, store), do: hscan_typed(key, cursor, opts, store)
 
   def handle_ast({:hincrby, _key, _field, {:error, reason}}, _store), do: {:error, reason}
@@ -567,29 +515,31 @@ defmodule Ferricstore.Commands.Hash do
   def handle_ast({:hrandfield, key, count, :withvalues}, store) when is_integer(count),
     do: hrandfield_parsed(key, count, true, store)
 
-  def handle_ast({:hexpire, _key, {:error, reason}, _fields}, _store), do: {:error, reason}
-  def handle_ast({:hpexpire, _key, {:error, reason}, _fields}, _store), do: {:error, reason}
+  # Redis answers WRONGTYPE before an argument error.
+  def handle_ast({tag, key, {:error, _reason} = error, _fields}, store)
+      when tag in @field_expire_tags,
+      do: type_checked_args(key, error, store)
+
   def handle_ast({:hsetex, _key, {:error, reason}, _pairs}, _store), do: {:error, reason}
-  def handle_ast({:hgetex, _key, {:error, reason}}, _store), do: {:error, reason}
-  def handle_ast({:hgetex, _key, {:error, reason}, _fields}, _store), do: {:error, reason}
-  def handle_ast({:httl, _key, {:error, reason}}, _store), do: {:error, reason}
-  def handle_ast({:hpersist, _key, {:error, reason}}, _store), do: {:error, reason}
-  def handle_ast({:hpttl, _key, {:error, reason}}, _store), do: {:error, reason}
-  def handle_ast({:hexpiretime, _key, {:error, reason}}, _store), do: {:error, reason}
-  def handle_ast({:hgetdel, _key, {:error, reason}}, _store), do: {:error, reason}
+  # Redis answers WRONGTYPE before HGETEX's argument errors.
+  def handle_ast({:hgetex, key, {:error, _reason} = error}, store),
+    do: type_checked_args(key, error, store)
 
-  def handle_ast({:hexpire, key, seconds, fields}, store)
-      when is_integer(seconds) and is_list(fields) do
-    with {:ok, expire_at_ms} <- Helpers.relative_expire_at(seconds, 1_000) do
-      FieldOps.expire_fields(key, fields, expire_at_ms, store)
-    end
-  end
+  def handle_ast({:hgetex, key, {:error, _reason} = error, _fields}, store),
+    do: type_checked_args(key, error, store)
 
-  def handle_ast({:hpexpire, key, ms, fields}, store) when is_integer(ms) and is_list(fields) do
-    with {:ok, expire_at_ms} <- Helpers.relative_expire_at(ms, 1) do
-      FieldOps.expire_fields(key, fields, expire_at_ms, store)
-    end
-  end
+  def handle_ast({tag, key, {:error, _reason} = error}, store)
+      when tag in [:httl, :hpersist, :hpttl, :hexpiretime, :hgetdel],
+      do: type_checked_args(key, error, store)
+
+  def handle_ast({tag, key, ttl, fields}, store)
+      when tag in @field_expire_tags and is_integer(ttl) and ttl >= 0 and is_list(fields),
+      do: expire_fields(key, Atom.to_string(tag), ttl, nil, fields, store)
+
+  def handle_ast({tag, key, ttl, condition, fields}, store)
+      when tag in @field_expire_tags and is_integer(ttl) and ttl >= 0 and
+             condition in [:nx, :xx, :gt, :lt] and is_list(fields),
+      do: expire_fields(key, Atom.to_string(tag), ttl, condition, fields, store)
 
   def handle_ast({:httl, key, fields}, store) when is_list(fields),
     do: FieldOps.ttl_fields(key, fields, :seconds, store)
@@ -601,44 +551,17 @@ defmodule Ferricstore.Commands.Hash do
     do: FieldOps.persist_fields(key, fields, store)
 
   def handle_ast({:hexpiretime, key, fields}, store) when is_list(fields),
-    do: FieldOps.expiretime_fields(key, fields, store)
+    do: FieldOps.expiretime_fields(key, fields, :seconds, store)
 
   def handle_ast({:hgetdel, key, fields}, store) when is_list(fields),
     do: getdel_fields(key, fields, store)
 
-  def handle_ast({:hgetex, key, :none, fields}, store) when is_list(fields),
-    do: hmget_args([key | fields], store)
+  def handle_ast({:hgetex, key, mode, fields}, store) when is_list(fields),
+    do: getex_checked(key, mode, fields, store)
 
-  def handle_ast({:hgetex, key, :persist, fields}, store) when is_list(fields),
-    do: FieldOps.getex_parsed(key, fields, 0, store)
-
-  def handle_ast({:hgetex, key, {:ex, seconds}, fields}, store)
-      when is_integer(seconds) and is_list(fields) do
-    with {:ok, expire_at_ms} <- Helpers.relative_expire_at(seconds, 1_000) do
-      FieldOps.getex_parsed(key, fields, expire_at_ms, store)
-    end
-  end
-
-  def handle_ast({:hgetex, key, {:px, ms}, fields}, store)
-      when is_integer(ms) and is_list(fields) do
-    with {:ok, expire_at_ms} <- Helpers.relative_expire_at(ms, 1) do
-      FieldOps.getex_parsed(key, fields, expire_at_ms, store)
-    end
-  end
-
-  def handle_ast({:hgetex, key, {:exat, ts}, fields}, store)
-      when is_integer(ts) and is_list(fields) do
-    with {:ok, expire_at_ms} <- Helpers.absolute_expire_at(ts, 1_000) do
-      FieldOps.getex_parsed(key, fields, expire_at_ms, store)
-    end
-  end
-
-  def handle_ast({:hgetex, key, {:pxat, ts}, fields}, store)
-      when is_integer(ts) and is_list(fields) do
-    with {:ok, expire_at_ms} <- Helpers.absolute_expire_at(ts, 1) do
-      FieldOps.getex_parsed(key, fields, expire_at_ms, store)
-    end
-  end
+  def handle_ast({:hsetex, key, {condition, expiry}, pairs}, store)
+      when condition in [nil, :fnx, :fxx] and is_list(pairs),
+      do: setex(key, {condition, expiry}, pairs, store)
 
   def handle_ast({:hsetex, key, seconds, field_value_pairs}, store)
       when is_integer(seconds) and is_list(field_value_pairs) do
@@ -871,7 +794,7 @@ defmodule Ferricstore.Commands.Hash do
   defp hscan_typed(key, cursor, opts, store) do
     if CollectionScan.valid_cursor?(cursor) do
       with :ok <- TypeRegistry.command_check_type(key, :hash, store),
-           {:ok, match_pattern, count} <- typed_scan_opts(opts),
+           {:ok, match_pattern, count} <- typed_scan_opts(Keyword.delete(opts, :novalues)),
            {:ok, {next_cursor, pairs}} <-
              CollectionScan.page(
                store,
@@ -882,8 +805,7 @@ defmodule Ferricstore.Commands.Hash do
                match_pattern,
                false
              ) do
-        elements = Helpers.hash_pairs_to_flat_list(pairs)
-        [next_cursor, elements]
+        [next_cursor, hscan_elements(pairs, Keyword.get(opts, :novalues, false))]
       end
     else
       {:error, "ERR invalid cursor"}
@@ -952,6 +874,10 @@ defmodule Ferricstore.Commands.Hash do
     do: ReadResult.command_error(failure)
 
   defp checked_batch_values(_invalid, _expected_count), do: {:error, "ERR storage read failed"}
+
+  # NOVALUES (Redis 7.4) answers the fields without their values.
+  defp hscan_elements(pairs, true), do: Enum.map(pairs, fn {field, _value} -> field end)
+  defp hscan_elements(pairs, false), do: Helpers.hash_pairs_to_flat_list(pairs)
 
   defp typed_scan_opts(opts), do: typed_scan_opts(opts, nil, 10)
 
@@ -1053,7 +979,7 @@ defmodule Ferricstore.Commands.Hash do
             end
 
           :error ->
-            {:error, "ERR hash value is not a valid float"}
+            {:error, "ERR hash value is not a float"}
         end
 
       {:error, _reason} = error ->
@@ -1097,5 +1023,87 @@ defmodule Ferricstore.Commands.Hash do
     with :ok <- TypeRegistry.command_check_type(key, :hash, store) do
       select_random_hash_fields(key, count, with_values, store)
     end
+  end
+
+  # FerricStore's form sets field-value pairs with a TTL in seconds and
+  # answers the number of NEW fields added (not updated).
+  defp legacy_setex(key, [seconds_str | [_f, _v | _] = field_value_pairs], store) do
+    with {:ok, seconds} <- Helpers.parse_positive_integer(seconds_str, "seconds"),
+         {:ok, expire_at_ms} <- Helpers.relative_expire_at(seconds, 1_000) do
+      if Helpers.even_length?(field_value_pairs) do
+        hset_fields_with_ttl(key, field_value_pairs, store, expire_at_ms)
+      else
+        {:error, "ERR wrong number of arguments for 'hsetex' command"}
+      end
+    end
+  end
+
+  defp legacy_setex(_key, _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'hsetex' command"}
+
+  # Redis checks the key's type before the arguments: an argument error
+  # becomes WRONGTYPE on a key of another type. (Parsed arguments go on to a
+  # command that checks the type itself.)
+  defp type_checked_args(key, {:error, _reason} = error, store),
+    do: with(:ok <- TypeRegistry.command_check_type(key, :hash, store), do: error)
+
+  defp type_checked_args(_key, parsed, _store), do: parsed
+
+  defp field_list(key, args, store),
+    do: type_checked_args(key, Helpers.parse_field_list(args), store)
+
+  # HMGET checks the type itself; the other modes check it here.
+  defp getex_checked(key, :none, fields, store), do: getex(key, :none, fields, store)
+
+  defp getex_checked(key, mode, fields, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         do: getex(key, mode, fields, store)
+  end
+
+  defp getex(key, :none, fields, store), do: hmget_args([key | fields], store)
+  defp getex(key, :persist, fields, store), do: FieldOps.getex_fields(fields, key, store, 0)
+
+  defp getex(key, {unit, time}, fields, store)
+       when unit in [:ex, :px, :exat, :pxat] and is_integer(time) and time >= 0 do
+    with {:ok, expire_at_ms} <- Helpers.field_expire_at(unit, time) do
+      # Older releases keep a field given a past time with that time, and
+      # refuse a TTL of 0; a transaction below level 5 does the same.
+      if expire_at_ms <= CommandTime.now_ms() and Ops.level_5_writes?(store),
+        do: getdel_fields(key, fields, store),
+        else: FieldOps.getex_fields(fields, key, store, expire_at_ms)
+    end
+  end
+
+  defp getex(_key, _mode, _fields, _store), do: {:error, "ERR unsupported hash command AST"}
+
+  # At cluster feature level 5 the read, the condition and the write run as
+  # one replicated entry, so concurrent FNX or FXX writers each see one
+  # outcome; below it they run here.
+  defp setex(key, options, pairs, %FerricStore.Instance{} = ctx) do
+    case Ops.compound_command(ctx, key, {:hsetex, key, options, pairs}, 5) do
+      :unsupported -> setex_fields(key, options, pairs, ctx)
+      result -> result
+    end
+  end
+
+  defp setex(key, options, pairs, store), do: setex_fields(key, options, pairs, store)
+
+  defp setex_fields(key, {condition, expiry}, pairs, store) do
+    with {:ok, expiry} <- setex_expiry(expiry),
+         do: FieldOps.setex_fields(key, pairs, condition, expiry, store)
+  end
+
+  defp setex_expiry(nil), do: {:ok, :clear}
+  defp setex_expiry(:keepttl), do: {:ok, :keep}
+
+  defp setex_expiry({unit, time}) do
+    with {:ok, expire_at_ms} <- Helpers.field_expire_at(unit, time),
+         do: {:ok, {:at, expire_at_ms}}
+  end
+
+  defp expire_fields(key, command, time, condition, fields, store) do
+    with {:ok, expire_at_ms} <-
+           Helpers.field_expire_at(Helpers.field_expire_unit(command), time),
+         do: FieldOps.expire_fields(key, fields, expire_at_ms, condition, store)
   end
 end

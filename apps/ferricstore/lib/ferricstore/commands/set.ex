@@ -237,6 +237,9 @@ defmodule Ferricstore.Commands.Set do
     end
   end
 
+  # Redis takes any number of arguments after the key and refuses extras.
+  def handle("SRANDMEMBER", [_key, _count | _extra], _store), do: {:error, "ERR syntax error"}
+
   def handle("SRANDMEMBER", _args, _store) do
     {:error, "ERR wrong number of arguments for 'srandmember' command"}
   end
@@ -247,23 +250,22 @@ defmodule Ferricstore.Commands.Set do
 
   def handle("SPOP", [key], store), do: spop_one(key, store)
 
+  # Redis parses the count before it looks the key up.
   def handle("SPOP", [key, count_str], store) do
-    with :ok <- TypeRegistry.command_check_type(key, :set, store) do
-      case Integer.parse(count_str) do
-        {0, ""} ->
-          []
+    case Integer.parse(count_str) do
+      {count, ""} when count >= 0 ->
+        with :ok <- TypeRegistry.command_check_type(key, :set, store),
+             do: if(count == 0, do: [], else: spop_count(key, count, store))
 
-        {count, ""} when count >= 0 ->
-          spop_count(key, count, store)
+      {_count, ""} ->
+        spop_negative_count_error()
 
-        {_count, ""} ->
-          {:error, "ERR value is not an integer or out of range"}
-
-        _ ->
-          {:error, "ERR value is not an integer or out of range"}
-      end
+      _ ->
+        {:error, "ERR value is not an integer or out of range"}
     end
   end
+
+  def handle("SPOP", [_key, _count | _extra], _store), do: {:error, "ERR syntax error"}
 
   def handle("SPOP", _args, _store) do
     {:error, "ERR wrong number of arguments for 'spop' command"}
@@ -418,6 +420,9 @@ defmodule Ferricstore.Commands.Set do
 
   def handle_ast({:spop, key}, store), do: spop_one(key, store)
   def handle_ast({:spop, _key, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:spop, _key, count}, _store) when is_integer(count) and count < 0,
+    do: spop_negative_count_error()
 
   def handle_ast({:spop, key, count}, store) when is_integer(count) and count >= 0,
     do: spop_count(key, count, store)
@@ -786,8 +791,18 @@ defmodule Ferricstore.Commands.Set do
     with :ok <- TypeRegistry.command_check_type(source, :set, store),
          {:ok, source_has_member?} <- member_present?(source, member, store) do
       cond do
+        # Redis checks the destination's type whenever the source exists.
         not source_has_member? ->
-          0
+          case TypeRegistry.get_type(source, store) do
+            "none" ->
+              0
+
+            {:error, {:storage_read_failed, _reason}} = failure ->
+              ReadResult.command_error(failure)
+
+            _set ->
+              with :ok <- TypeRegistry.command_check_type(destination, :set, store), do: 0
+          end
 
         source == destination ->
           1
@@ -912,7 +927,7 @@ defmodule Ferricstore.Commands.Set do
   defp parse_numkeys(str) do
     case Integer.parse(str) do
       {n, ""} when n > 0 -> {:ok, n}
-      _ -> {:error, "ERR numkeys can't be non-positive value"}
+      _ -> {:error, "ERR numkeys should be greater than 0"}
     end
   end
 
@@ -930,6 +945,7 @@ defmodule Ferricstore.Commands.Set do
           if String.upcase(opt) == "LIMIT" do
             case Integer.parse(limit_str) do
               {limit, ""} when limit >= 0 -> {:ok, key_args, limit}
+              {_limit, ""} -> {:error, "ERR LIMIT can't be negative"}
               _ -> {:error, "ERR value is not an integer or out of range"}
             end
           else
@@ -1058,4 +1074,6 @@ defmodule Ferricstore.Commands.Set do
   defp atomic_spop(key, count, ctx) do
     with :ok <- TypeRegistry.command_check_type(key, :set, ctx), do: Ops.spop(ctx, key, count)
   end
+
+  defp spop_negative_count_error, do: {:error, "ERR value is out of range, must be positive"}
 end

@@ -27,14 +27,9 @@ defmodule Ferricstore.Commands.List do
   end
 
   def handle("LPOP", [key, count_str], store) do
-    with :ok <- TypeRegistry.command_check_type(key, :list, store) do
-      case Integer.parse(count_str) do
-        {count, ""} when count >= 0 ->
-          do_pop(key, store, :lpop, count)
-
-        _ ->
-          {:error, "ERR value is not an integer or out of range"}
-      end
+    case Integer.parse(count_str) do
+      {count, ""} -> pop_parsed(key, store, :lpop, count)
+      _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
 
@@ -46,14 +41,9 @@ defmodule Ferricstore.Commands.List do
   end
 
   def handle("RPOP", [key, count_str], store) do
-    with :ok <- TypeRegistry.command_check_type(key, :list, store) do
-      case Integer.parse(count_str) do
-        {count, ""} when count >= 0 ->
-          do_pop(key, store, :rpop, count)
-
-        _ ->
-          {:error, "ERR value is not an integer or out of range"}
-      end
+    case Integer.parse(count_str) do
+      {count, ""} -> pop_parsed(key, store, :rpop, count)
+      _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
 
@@ -137,7 +127,9 @@ defmodule Ferricstore.Commands.List do
     with :ok <- TypeRegistry.command_check_type(key, :list, store) do
       case parse_lpos_opts(opts) do
         {:ok, rank, count, maxlen} ->
-          execute_list_op(key, store, {:lpos, element, rank, count, maxlen})
+          key
+          |> execute_list_op(store, {:lpos, element, rank, count, maxlen})
+          |> lpos_reply(count)
 
         {:error, _} = error ->
           error
@@ -270,7 +262,9 @@ defmodule Ferricstore.Commands.List do
     with :ok <- TypeRegistry.command_check_type(key, :list, store) do
       case parse_lpos_opts(opts) do
         {:ok, rank, count, maxlen} ->
-          execute_list_op(key, store, {:lpos, element, rank, count, maxlen})
+          key
+          |> execute_list_op(store, {:lpos, element, rank, count, maxlen})
+          |> lpos_reply(count)
 
         {:error, _} = error ->
           error
@@ -444,11 +438,21 @@ defmodule Ferricstore.Commands.List do
 
   defp pop_parsed(key, store, direction, count) when count >= 0 do
     with :ok <- TypeRegistry.command_check_type(key, :list, store),
-         do: do_pop(key, store, direction, count)
+         do: key |> do_pop(store, direction, count) |> counted_pop_reply()
   end
 
+  # Redis checks the count before it looks the key up.
   defp pop_parsed(_key, _store, _direction, _count),
-    do: {:error, "ERR value is not an integer or out of range"}
+    do: {:error, "ERR value is out of range, must be positive"}
+
+  # With a count, LPOP and RPOP answer an array even for one element; the
+  # list operation answers one popped element by itself.
+  defp counted_pop_reply(element) when is_binary(element), do: [element]
+  defp counted_pop_reply(reply), do: reply
+
+  # With COUNT, LPOS answers an array, empty when the key does not exist.
+  defp lpos_reply(nil, count) when is_integer(count), do: []
+  defp lpos_reply(reply, _count), do: reply
 
   defp parse_lpos_opts(opts), do: parse_lpos_opts(opts, 1, nil, 0)
   defp parse_lpos_opts([], rank, count, maxlen), do: {:ok, rank, count, maxlen}
@@ -471,12 +475,14 @@ defmodule Ferricstore.Commands.List do
       "COUNT" ->
         case Integer.parse(val) do
           {c, ""} when c >= 0 -> parse_lpos_opts(rest, rank, c, maxlen)
+          {_c, ""} -> {:error, "ERR COUNT can't be negative"}
           _ -> {:error, "ERR value is not an integer or out of range"}
         end
 
       "MAXLEN" ->
         case Integer.parse(val) do
           {m, ""} when m >= 0 -> parse_lpos_opts(rest, rank, count, m)
+          {_m, ""} -> {:error, "ERR MAXLEN can't be negative"}
           _ -> {:error, "ERR value is not an integer or out of range"}
         end
 
@@ -508,8 +514,17 @@ defmodule Ferricstore.Commands.List do
   # operation. Moving through CrossShardOp's per-shard store read the source,
   # popped it and pushed the destination in separate writes, so concurrent
   # moves lost elements.
-  defp lmove(source, destination, from_dir, to_dir, %FerricStore.Instance{} = ctx),
-    do: Ops.list_op(ctx, source, {:lmove, destination, from_dir, to_dir})
+  # As after LPOP, a source the move emptied loses its type, so the key is
+  # gone (it was left for DEL and KEYS to find).
+  defp lmove(source, destination, from_dir, to_dir, %FerricStore.Instance{} = ctx) do
+    case Ops.list_op(ctx, source, {:lmove, destination, from_dir, to_dir}) do
+      moved when is_binary(moved) and source != destination ->
+        with :ok <- maybe_cleanup_empty_list(source, ctx), do: moved
+
+      result ->
+        result
+    end
+  end
 
   defp lmove(source, destination, from_dir, to_dir, store) do
     CrossShardOp.execute(
