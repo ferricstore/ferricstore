@@ -145,7 +145,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
               label: Map.get(metadata, :label),
               config: recovered_config,
               bitcask_dirty?: false,
-              promoted_sync: promoted_sync
+              promoted_sync: promoted_sync,
+              replay_horizon: :unresolved
             }
 
             last_clean_position =
@@ -1007,9 +1008,11 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
              label_update
            ) do
         clear_apply_projection_replay_dependencies()
+        handle = resolve_replay_horizon(handle, position)
 
         try do
-          apply_result = apply_state_machine_command(command, position, sm_state)
+          apply_result =
+            apply_state_machine_command(command, position, sm_state, replayed?(handle, position))
 
           replay_dependencies =
             StateMachine.consume_waraft_replay_dependencies()

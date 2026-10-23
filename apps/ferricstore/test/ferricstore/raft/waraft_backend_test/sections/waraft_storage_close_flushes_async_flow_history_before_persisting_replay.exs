@@ -904,6 +904,121 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
         end
       end
 
+      # The Flow LMDB mirror is written by the same entries a restart replays
+      # when the node stopped before their history was projected. The replay
+      # must still write that history.
+      test "a restart replay writes the Flow history the LMDB mirror got ahead of", %{
+        root: root,
+        ctx: ctx
+      } do
+        previous_async_history = Application.get_env(:ferricstore, :flow_async_history)
+
+        previous_close_flush =
+          Application.get_env(:ferricstore, :waraft_replay_dependency_close_flush_timeout_ms)
+
+        flow_id = "router-flow-history-replay-id-#{System.unique_integer([:positive])}"
+        partition = "tenant-history-replay-#{System.unique_integer([:positive])}"
+
+        try do
+          Application.put_env(:ferricstore, :flow_async_history, true)
+          Application.put_env(:ferricstore, :waraft_replay_dependency_close_flush_timeout_ms, 100)
+
+          assert :ok =
+                   WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          {:ok, projector} =
+            Ferricstore.Flow.HistoryProjector.start_link(
+              shard_index: 0,
+              shard_data_path: Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0),
+              instance_ctx: ctx,
+              recover_on_init: false
+            )
+
+          Process.unlink(projector)
+
+          start_supervised!(
+            {Ferricstore.Flow.LMDBWriter,
+             shard_index: 0, data_dir: ctx.data_dir, instance_ctx: ctx}
+          )
+
+          # The projector never gets to the Flow's history.
+          :ok = :sys.suspend(projector)
+
+          assert :ok =
+                   Ferricstore.Flow.create(ctx, flow_id,
+                     type: "router-flow-history-replay",
+                     partition_key: partition,
+                     run_at_ms: 1_000,
+                     now_ms: 900
+                   )
+
+          assert :ok =
+                   Ferricstore.Flow.transition(ctx, flow_id, "queued", "reviewed",
+                     partition_key: partition,
+                     fencing_token: 0
+                   )
+
+          assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, 0)
+          assert {:ok, {:raft_log_pos, flow_index, _term}} = WARaftBackend.storage_position(0)
+
+          monitor = Process.monitor(projector)
+          Process.exit(projector, :kill)
+          assert_receive {:DOWN, ^monitor, :process, ^projector, :killed}
+          stop_supervised!(Ferricstore.Flow.LMDBWriter)
+          assert :ok = WARaftBackend.stop()
+
+          # As after a crash: the replay cursor is behind the Flow writes.
+          assert %{position: {:raft_log_pos, persisted_index, _persisted_term}} =
+                   waraft_latest_storage_metadata(root, 0)
+
+          assert persisted_index < flow_index
+          FerricStore.Instance.cleanup(ctx.name)
+
+          restarted_ctx = build_ctx(root)
+
+          try do
+            assert :ok =
+                     WARaftBackend.start(restarted_ctx,
+                       log_module: :ferricstore_waraft_spike_segment_log
+                     )
+
+            start_supervised!(
+              {Ferricstore.Flow.HistoryProjector,
+               [
+                 shard_index: 0,
+                 shard_data_path: Ferricstore.DataDir.shard_data_path(restarted_ctx.data_dir, 0),
+                 instance_ctx: restarted_ctx
+               ]}
+            )
+
+            start_supervised!(
+              {Ferricstore.Flow.LMDBWriter,
+               shard_index: 0, data_dir: restarted_ctx.data_dir, instance_ctx: restarted_ctx}
+            )
+
+            assert {:ok, %{state: "reviewed", version: 2}} =
+                     Ferricstore.Flow.get(restarted_ctx, flow_id, partition_key: partition)
+
+            assert eventually(fn ->
+                     :ok = Ferricstore.Flow.HistoryProjector.flush(restarted_ctx, 0, 5_000)
+
+                     match?(
+                       {:ok, [_, _]},
+                       Ferricstore.Flow.history(restarted_ctx, flow_id, partition_key: partition)
+                     )
+                   end),
+                   inspect(
+                     Ferricstore.Flow.history(restarted_ctx, flow_id, partition_key: partition)
+                   )
+          after
+            FerricStore.Instance.cleanup(restarted_ctx.name)
+          end
+        after
+          restore_env(:flow_async_history, previous_async_history)
+          restore_env(:waraft_replay_dependency_close_flush_timeout_ms, previous_close_flush)
+        end
+      end
+
       test "flow due indexes survive WARaft restart without shard process reads", %{
         root: root,
         ctx: ctx

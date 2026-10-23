@@ -516,13 +516,64 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
 
       defp segment_record_offset(_sm_state, _position), do: 0
 
-      defp apply_state_machine_command(command, position, sm_state) do
+      defp apply_state_machine_command(command, position, sm_state, replayed?) do
         meta = meta_from_position(position)
+        writer = fn batch -> write_apply_projection_batch(sm_state, position, batch) end
 
-        StateMachine.apply_waraft_segment_command(command, meta, sm_state, fn batch ->
-          write_apply_projection_batch(sm_state, position, batch)
-        end)
+        if replayed? do
+          StateMachine.apply_waraft_segment_recovery_command(command, meta, sm_state, writer)
+        else
+          StateMachine.apply_waraft_segment_command(command, meta, sm_state, writer)
+        end
       end
+
+      # A restarted replica re-applies the entries after its replay cursor,
+      # and before stopping it may have applied any of them already: the Flow
+      # LMDB mirror and apply-projection locators then hold what they wrote,
+      # tagged with their Raft index. Such an entry reads only what came
+      # before it, as recovery does. The log's last index at the first apply
+      # bounds every entry applied before the restart (committed entries are
+      # never truncated); entries past it run as usual.
+      defp resolve_replay_horizon(
+             %{replay_horizon: :unresolved, options: options} = handle,
+             _position
+           ),
+           do: Map.put(handle, :replay_horizon, log_last_index(options))
+
+      defp resolve_replay_horizon(
+             %{replay_horizon: horizon} = handle,
+             {:raft_log_pos, index, _term}
+           )
+           when is_integer(horizon) and index > horizon,
+           do: Map.put(handle, :replay_horizon, nil)
+
+      defp resolve_replay_horizon(handle, _position), do: handle
+
+      defp replayed?(%{replay_horizon: horizon}, {:raft_log_pos, index, _term})
+           when is_integer(horizon) and is_integer(index) and index > 0,
+           do: index <= horizon
+
+      defp replayed?(_handle, _position), do: false
+
+      defp log_last_index(%{
+             log_name: name,
+             log_module: module,
+             application: application,
+             table: table,
+             partition: partition
+           })
+           when is_atom(name) and is_atom(module) do
+        case module.last_index({:raft_log, name, application, table, partition, module}) do
+          index when is_integer(index) and index > 0 -> index
+          _empty -> nil
+        end
+      rescue
+        _ -> nil
+      catch
+        _, _ -> nil
+      end
+
+      defp log_last_index(_options), do: nil
 
       defp write_apply_projection_batch(sm_state, position, batch) do
         index = position_index(position)

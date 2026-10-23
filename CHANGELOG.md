@@ -4,6 +4,14 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- In a cluster, a node restarted after a crash could permanently lose the
+  history of the Flow writes it applied just before stopping, and keep those
+  Flows only in its cold LMDB mirror. On restart a node re-applies the log
+  after its saved replay position, and the mirror already held what those
+  writes produced, so each replayed create and transition took the Flow for
+  an existing one, was refused and wrote no history. Entries the node may
+  have applied before the restart now see only what came before them, as
+  single-node recovery already did.
 - With more Flow history waiting than the history projector's queue holds,
   a request to make a write's history durable could be answered while that
   history still sat in the overflow queue. The shard's replay position, and

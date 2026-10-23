@@ -37,7 +37,9 @@ storage_open(#raft_options{} = Options, RootDir) ->
             partition => Options#raft_options.partition,
             self => Options#raft_options.self,
             database => Options#raft_options.database,
-            storage_name => Options#raft_options.storage_name
+            storage_name => Options#raft_options.storage_name,
+            log_name => Options#raft_options.log_name,
+            log_module => Options#raft_options.log_module
         },
         RootDir
     ).
