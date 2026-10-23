@@ -81,6 +81,7 @@
 %% Options for every stat in this module. Nothing reads file times, and the
 %% default local times cost three time-zone conversions per stat.
 -define(STAT_OPTS, [raw, {time, posix}]).
+-define(STAT_PREFETCH, ferricstore_waraft_segment_stat_prefetch).
 -define(WRITER_REGISTRY, ferricstore_waraft_segment_writer_registry).
 -define(OFFSET_REGISTRY, ferricstore_waraft_segment_offset_registry).
 -define(OFFSET_INDEX_MAGIC, 16#F00D2026).

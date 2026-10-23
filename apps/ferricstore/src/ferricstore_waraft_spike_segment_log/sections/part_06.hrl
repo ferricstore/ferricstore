@@ -128,6 +128,64 @@ delete_file_if_exists(Path) ->
         {error, Reason} -> {error, {delete_file, Path, Reason}}
     end.
 
+%% An append checks its directory, poison marker, segment and offset index
+%% before it writes, and every stat is a dirty-scheduler round trip. The append
+%% stats all four in one call; each check takes its path's answer once, and a
+%% check without one (another segment, a second look) stats the path itself.
+%% The identity check after opening a segment always stats afresh.
+with_append_stat_prefetch(Dir, Records, Fun) ->
+    erlang:put(?STAT_PREFETCH, prefetch_lstats(append_stat_paths(Dir, Records))),
+    try
+        Fun()
+    after
+        erlang:erase(?STAT_PREFETCH)
+    end.
+
+append_stat_paths(Dir, Records) ->
+    Paths = [Dir, append_failure_marker_path(Dir)],
+    case {Records, persistent_term:get(segment_config_cache_key(Dir), undefined)} of
+        {[{Index, _Entry} | _], RecordsPerSegment}
+          when is_integer(Index), is_integer(RecordsPerSegment), RecordsPerSegment > 0 ->
+            Ordinal = segment_ordinal(Index, RecordsPerSegment),
+            IndexDir = binary_to_list(offset_dir_key(Dir)),
+            Paths ++ [filename:join(Dir, segment_file_from_ordinal(Ordinal)),
+                      offset_index_path(IndexDir, Ordinal)];
+        _Unknown ->
+            Paths
+    end.
+
+prefetch_lstats(Paths) ->
+    Keys = [unicode:characters_to_binary(Path) || Path <- Paths],
+    try 'Elixir.Ferricstore.Bitcask.NIF':fs_lstat_many(Keys) of
+        Results when length(Results) =:= length(Keys) ->
+            maps:from_list(lists:zip(Keys, [prefetched_lstat(Result) || Result <- Results]));
+        _Unexpected ->
+            #{}
+    catch
+        error:_Reason ->
+            #{}
+    end.
+
+prefetched_lstat({ok, Type, Device, Inode, Size}) ->
+    {ok, #file_info{type = Type, size = Size, major_device = Device, inode = Inode}};
+prefetched_lstat({error, Reason}) ->
+    {error, Reason}.
+
+lstat_path(Path) ->
+    case erlang:get(?STAT_PREFETCH) of
+        Prefetched when is_map(Prefetched), map_size(Prefetched) > 0 ->
+            Key = unicode:characters_to_binary(Path),
+            case maps:take(Key, Prefetched) of
+                {Result, Rest} ->
+                    erlang:put(?STAT_PREFETCH, Rest),
+                    Result;
+                error ->
+                    file:read_link_info(Path, ?STAT_OPTS)
+            end;
+        _None ->
+            file:read_link_info(Path, ?STAT_OPTS)
+    end.
+
 %% Existing local metadata must not queue behind the shared file_server_2.
 %% Keep the same file_info/type checks; directory creation retains filelib's
 %% ordinary error handling when the parent is not already present.

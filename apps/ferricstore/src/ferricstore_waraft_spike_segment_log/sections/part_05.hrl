@@ -21,7 +21,7 @@ ensure_segment_log_dir_for_append(Dir) ->
     end.
 
 segment_log_dir_state(Dir) ->
-    case file:read_link_info(Dir, ?STAT_OPTS) of
+    case lstat_path(Dir) of
         {ok, #file_info{type = directory}} ->
             ok;
         {ok, #file_info{type = Type}} ->

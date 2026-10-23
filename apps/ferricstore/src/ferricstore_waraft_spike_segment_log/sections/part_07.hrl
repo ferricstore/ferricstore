@@ -573,7 +573,7 @@ close_tracked_segment_fd(Key) ->
 tracked_segment_fd_current(Key, Path, Fd) ->
     case get({?MODULE, segment_fd, Key}) of
         {Fd, Identity} when Identity =/= unknown ->
-            case file:read_link_info(Path, ?STAT_OPTS) of
+            case lstat_path(Path) of
                 {ok, #file_info{type = regular} = Info} -> file_identity(Info) =:= Identity;
                 _Missing -> false
             end;
@@ -624,7 +624,7 @@ with_cached_offset_index_fd(Path, Fun) ->
 cached_offset_index_fd(Path) ->
     case get({?MODULE, offset_index_fd}) of
         {Path, Fd, Identity} ->
-            case file:read_link_info(Path, ?STAT_OPTS) of
+            case lstat_path(Path) of
                 {ok, #file_info{type = regular} = Info} ->
                     case file_identity(Info) of
                         Identity -> {ok, Fd};

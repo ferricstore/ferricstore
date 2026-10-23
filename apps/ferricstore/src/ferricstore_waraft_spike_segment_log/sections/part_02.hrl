@@ -398,6 +398,9 @@ clear_logical_trim_floor_cache(Dir) ->
 write_records(_Dir, []) ->
     ok;
 write_records(Dir, Records) ->
+    with_append_stat_prefetch(Dir, Records, fun() -> write_records_checked(Dir, Records) end).
+
+write_records_checked(Dir, Records) ->
     case ensure_segment_log_dir_for_append(Dir) of
         ok ->
             case check_append_failure_marker(Dir) of
@@ -426,6 +429,9 @@ write_records_with_segment_size(Dir, Records, RecordsPerSegment) ->
 write_records_nosync(_Dir, []) ->
     ok;
 write_records_nosync(Dir, Records) ->
+    with_append_stat_prefetch(Dir, Records, fun() -> write_records_nosync_checked(Dir, Records) end).
+
+write_records_nosync_checked(Dir, Records) ->
     case ensure_segment_log_dir_for_append(Dir) of
         ok ->
             case check_append_failure_marker(Dir) of
@@ -486,6 +492,10 @@ write_record_group_list(Dir, Groups, Rollbacks) ->
     write_record_group_list(Dir, Groups, Rollbacks, []).
 
 write_record_group_list(_Dir, [], _Rollbacks, OffsetAcc) ->
+    %% The derived index rows go out after the records are durable. Written
+    %% before the segment's datasync they made that sync slower, while here
+    %% they cost one pwrite: the append's batched stat already checked the
+    %% index file.
     register_offset_entries(lists:append(lists:reverse(OffsetAcc)));
 write_record_group_list(Dir, [{{_Ordinal, Segment}, RecordsRev} | Rest], Rollbacks, OffsetAcc) ->
     case write_record_group_once(Dir, Segment, RecordsRev) of
@@ -747,7 +757,7 @@ preallocate_keep_size_unavailable(_BinaryPath) ->
     end.
 
 validate_segment_file_for_append(Path) ->
-    case file:read_link_info(Path, ?STAT_OPTS) of
+    case lstat_path(Path) of
         {ok, #file_info{type = regular}} ->
             ok;
         {ok, #file_info{type = Type}} ->
@@ -939,7 +949,7 @@ append_failure_marker_path(Dir) ->
 
 check_append_failure_marker(Dir) ->
     Path = append_failure_marker_path(Dir),
-    case file:read_link_info(Path, ?STAT_OPTS) of
+    case lstat_path(Path) of
         {ok, #file_info{type = regular, size = Size}} when Size =< ?MAX_SEGMENT_METADATA_BYTES ->
             read_append_failure_marker(Path);
         {ok, #file_info{type = regular, size = Size}} ->
