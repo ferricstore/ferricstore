@@ -64,7 +64,8 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    (`Ferricstore.Flow.RewindTarget`) instead of apply reading the
   #    node-local history. A create batch holding an idempotent retry and a
   #    rewind's value refresh read values the history projector moved to the
-  #    LMDB mirror.
+  #    LMDB mirror. A signal retried with its idempotency key and the same
+  #    content changes nothing.
   @supported 5
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

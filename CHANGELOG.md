@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A Flow signal retried with the same idempotency key and the same content
+  was applied again: it added a version and a history event, and a retried
+  signal that had already moved the Flow (`transition_to`) answered "ERR flow
+  state mismatch". From feature level 5 such a retry answers OK and changes
+  nothing; a reused key with different content is still refused.
 - New setting `:waraft_election_pre_vote` (default `false`; also the
   `election_pre_vote` start option) turns on wa_raft's pre-vote: a node that
   lost contact asks whether it could win before raising its term, so on its

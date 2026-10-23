@@ -875,13 +875,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
       defp do_flow_named_value_put_pipeline_batch(_state, _attrs),
         do: {:error, "ERR flow items must be a non-empty list"}
 
-      defp do_flow_signal(state, %{id: id, signal: signal} = attrs) do
-        now_ms = flow_attrs_now_ms(attrs)
+      defp do_flow_signal(state, %{id: id, signal: _signal} = attrs) do
         partition_key = Map.get(attrs, :partition_key)
 
         with {:ok, record} <- flow_require_record(state, id, partition_key),
-             :ok <- flow_signal_idempotency_check(state, record, attrs),
-             :ok <- flow_signal_transition_allowed?(record, attrs),
+             {:ok, seen} <- flow_signal_idempotency_check(state, record, attrs) do
+          # From feature level 5 a retry of a signal already applied (same key,
+          # same content) changes nothing; older releases apply it again.
+          if seen == :applied and feature_level_5?(state),
+            do: :ok,
+            else: do_flow_signal_apply(state, record, attrs)
+        end
+      end
+
+      defp do_flow_signal_apply(state, record, %{id: id, signal: signal} = attrs) do
+        now_ms = flow_attrs_now_ms(attrs)
+        partition_key = Map.get(attrs, :partition_key)
+
+        with :ok <- flow_signal_transition_allowed?(record, attrs),
              {:ok, next} <- flow_signal_next_record(record, attrs, now_ms),
              next = flow_stamp_state_enter_seq_on_change(state, record, next),
              next = flow_refresh_indexed_attributes(state, next),
@@ -986,16 +997,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
 
             case sm_store_batch_get(state, [idem_key], &sm_file_path/2) do
               [nil] ->
-                :ok
+                {:ok, :new}
 
               [stored] ->
                 if stored in flow_signal_stored_digests(attrs),
-                  do: :ok,
+                  do: {:ok, :applied},
                   else: {:error, "ERR flow signal idempotency conflict"}
             end
 
           _ ->
-            :ok
+            {:ok, :new}
         end
       end
 

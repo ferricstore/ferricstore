@@ -604,6 +604,8 @@ shard_0: 2
     - A Flow create batch holding an idempotent retry, and a rewind's value
       refresh, find values the history projector has moved to the LMDB
       mirror, so replicas agree however far their projectors have got.
+    - A Flow signal retried with its idempotency key and the same content is
+      applied once.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.
