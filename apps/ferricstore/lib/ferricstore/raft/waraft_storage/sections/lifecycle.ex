@@ -649,14 +649,26 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
 
         with :ok <- maybe_fsync_payload_before_metadata(new_handle),
              clean_handle = Map.put(new_handle, :bitcask_dirty?, false),
-             :ok <- persist_metadata(clean_handle, :compact) do
+             {:ok, applied_handle} <- persist_config_metadata(clean_handle) do
           Ferricstore.Raft.WARaftBackend.cache_config(handle.shard_index, config)
 
-          {:ok,
-           clean_handle |> mark_metadata_persisted() |> register_segment_projection_context()}
+          {:ok, register_segment_projection_context(applied_handle)}
         else
           {:error, reason} ->
             {{:error, reason}, block_storage(handle, reason, position, :metadata_failure)}
+        end
+      end
+
+      # A config entry moves the replay cursor like any other entry, so it
+      # waits for the projections of the entries before it. Until then the
+      # log, whose config WARaft prefers over an older stored one, carries it.
+      defp persist_config_metadata(handle) do
+        if replay_dependencies_ready?(handle) do
+          with :ok <- persist_metadata(handle, :compact) do
+            {:ok, mark_metadata_persisted(handle)}
+          end
+        else
+          {:ok, request_replay_dependencies_async(handle)}
         end
       end
 

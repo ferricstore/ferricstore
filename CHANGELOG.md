@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A membership change (any WARaft config entry) saved the shard's replay
+  position at once, past earlier writes whose Flow history was still being
+  projected in the background. A crash before that projection finished lost
+  those events: on restart the node replayed only what came after the config
+  entry. The config entry now waits for those projections like any other
+  write, so a membership change reports success only once they are durable.
 - A node that stopped while saving its Flow query index registry could fail
   to start ("invalid_query_index_registry_journal: non_monotonic_checkpoint")
   or silently undo a validation restart. Saving writes the registry snapshot

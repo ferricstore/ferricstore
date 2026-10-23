@@ -814,6 +814,96 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
         end
       end
 
+      test "a config entry does not persist the replay cursor past undurable Flow history", %{
+        root: root,
+        ctx: ctx
+      } do
+        previous_async_history = Application.get_env(:ferricstore, :flow_async_history)
+
+        previous_publish_hook =
+          Application.get_env(:ferricstore, :flow_history_projector_lmdb_publish_hook)
+
+        previous_history_flush =
+          Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms)
+
+        previous_close_flush =
+          Application.get_env(:ferricstore, :waraft_replay_dependency_close_flush_timeout_ms)
+
+        flow_id = "router-flow-history-config-id-#{System.unique_integer([:positive])}"
+        partition = "tenant-history-config-#{System.unique_integer([:positive])}"
+        shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+
+        try do
+          Application.put_env(:ferricstore, :flow_async_history, true)
+          Application.put_env(:ferricstore, :flow_history_projector_flush_interval_ms, 60_000)
+          Application.put_env(:ferricstore, :waraft_replay_dependency_close_flush_timeout_ms, 100)
+
+          Application.put_env(:ferricstore, :flow_history_projector_lmdb_publish_hook, fn
+            _shard_data_path, _file_id, _entries -> {:error, :forced_history_publish_failure}
+          end)
+
+          assert :ok =
+                   WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          start_supervised!(
+            {Ferricstore.Flow.HistoryProjector,
+             [
+               shard_index: 0,
+               shard_data_path: shard_data_path,
+               instance_ctx: ctx,
+               recover_on_init: false
+             ]}
+          )
+
+          assert :ok =
+                   Ferricstore.Flow.create(ctx, flow_id,
+                     type: "router-flow-history-config",
+                     partition_key: partition,
+                     run_at_ms: 1_000,
+                     now_ms: 900
+                   )
+
+          assert {:ok, {:raft_log_pos, flow_index, _term}} = WARaftBackend.storage_position(0)
+
+          # The config entry commits, but cannot be durable before the history.
+          assert {:error, {:timeout, :unknown_outcome}} =
+                   WARaftBackend.adjust_membership_redirected(
+                     0,
+                     :add_participant,
+                     :"ghost@127.0.0.1",
+                     200,
+                     0
+                   )
+
+          assert {:ok, {:raft_log_pos, config_index, _term} = config_position} =
+                   WARaftBackend.storage_position(0)
+
+          assert config_index > flow_index
+
+          # A crash now must replay the Flow write, whose history is not durable.
+          assert %{position: {:raft_log_pos, persisted_index, _persisted_term}} =
+                   waraft_latest_storage_metadata(root, 0)
+
+          assert persisted_index < flow_index
+
+          assert position_index(Keyword.fetch!(waraft_storage_status(0), :durable_position)) <
+                   flow_index
+
+          Application.delete_env(:ferricstore, :flow_history_projector_lmdb_publish_hook)
+          assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 5_000)
+
+          assert eventually(fn ->
+                   Keyword.fetch!(waraft_storage_status(0), :durable_position) ==
+                     config_position
+                 end)
+        after
+          restore_env(:flow_async_history, previous_async_history)
+          restore_env(:flow_history_projector_lmdb_publish_hook, previous_publish_hook)
+          restore_env(:flow_history_projector_flush_interval_ms, previous_history_flush)
+          restore_env(:waraft_replay_dependency_close_flush_timeout_ms, previous_close_flush)
+        end
+      end
+
       test "flow due indexes survive WARaft restart without shard process reads", %{
         root: root,
         ctx: ctx
