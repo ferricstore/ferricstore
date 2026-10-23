@@ -47,6 +47,47 @@ defmodule Ferricstore.Flow.TransferTest do
     assert FlowTransferFixture.snapshot(ctx.target, ctx.manifest) == before
   end
 
+  # A run whose payload cannot be read must not leave the export without it.
+  test "an export fails when a value it carries cannot be read", ctx do
+    source = ctx.source
+    id = "tx:unreadable"
+
+    assert :ok =
+             Impl.flow_create(source, id,
+               type: "tx.unreadable",
+               state: "queued",
+               partition_key: "tx:tenant-a",
+               payload: %{"order" => 42},
+               run_at_ms: ctx.now_ms,
+               now_ms: ctx.now_ms
+             )
+
+    assert {:ok, %{payload_ref: ref}} = Impl.flow_get(source, id, partition_key: "tx:tenant-a")
+    shard_index = Ferricstore.Store.Router.shard_for(source, ref)
+    shard_path = Ferricstore.DataDir.shard_data_path(source.data_dir, shard_index)
+    keydir = elem(source.keydir_refs, shard_index)
+
+    # The history projector moves the payload into its log; corrupt that copy.
+    Enum.find(1..500, fn _ ->
+      :ok = Ferricstore.Flow.HistoryProjector.flush(source, shard_index)
+      :ets.lookup(keydir, ref) == [] or (Process.sleep(10) && false)
+    end)
+
+    assert {:ok, blob} = Ferricstore.Flow.LMDB.get(Ferricstore.Flow.LMDB.path(shard_path), ref)
+
+    assert {:ok, {:flow_value_locator, 1, _expire, {:flow_history, file_id}, offset, _size}} =
+             Ferricstore.TermCodec.decode(blob)
+
+    log = Path.join([shard_path, "history", String.pad_leading("#{file_id}", 5, "0") <> ".log"])
+    {:ok, file} = :file.open(log, [:read, :write, :binary])
+    :ok = :file.pwrite(file, offset, :binary.copy(<<0xFF>>, 8))
+    :ok = :file.close(file)
+
+    assert {:error, {:run_export_failed, _state_key, {:storage_read_failed, _reason}}} =
+             Transfer.export(source, ctx.path)
+    refute File.exists?(ctx.path)
+  end
+
   test "restored runs keep working: FIFO order, leases, hibernated waits, signals", ctx do
     {:ok, _} = Transfer.export(ctx.source, ctx.path)
     {:ok, _} = Transfer.restore(ctx.target, ctx.path)

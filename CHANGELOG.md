@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A Flow export left out any value, signal row or owned row it could not
+  read, and still reported success, so the restored run came back without
+  it (a shared value or governance row that could not be read crashed the
+  export instead). The export now fails, naming the run and the read error.
 - A Flow rewind looked its target event up in the node's own history, which
   the history projector writes and trims outside Raft. A rewind to an event
   just written failed where the projector had not caught up yet, and a

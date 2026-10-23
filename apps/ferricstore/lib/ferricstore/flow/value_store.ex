@@ -263,12 +263,14 @@ defmodule Ferricstore.Flow.ValueStore do
 
   @doc false
   # Stored bytes of any Flow rows, not only value refs, falling back to the
-  # LMDB mirror for rows pruned from the keydir (Flow export).
+  # LMDB mirror for rows pruned from the keydir (Flow export). A row that
+  # cannot be read is a ReadResult failure, so an export never mistakes it for
+  # a row that is gone.
   def raw_mget_any(_ctx, []), do: []
 
   def raw_mget_any(ctx, keys) do
     Stats.with_cache_tracking_disabled(fn -> Router.batch_get(ctx, keys) end)
-    |> fill_lmdb_missing(ctx, keys, fn _key -> true end)
+    |> fill_lmdb_missing(ctx, keys, fn _key -> true end, :report)
   end
 
   def raw_mget_with_file_refs(_ctx, [], _min_file_ref_size), do: []
@@ -332,9 +334,9 @@ defmodule Ferricstore.Flow.ValueStore do
   defp restore_filtered_value_results(other, _mask), do: other
 
   defp flow_value_fill_lmdb_missing(values, ctx, refs),
-    do: fill_lmdb_missing(values, ctx, refs, &flow_generated_payload_value_ref?/1)
+    do: fill_lmdb_missing(values, ctx, refs, &flow_generated_payload_value_ref?/1, :absent)
 
-  defp fill_lmdb_missing(values, ctx, refs, lmdb_backed?)
+  defp fill_lmdb_missing(values, ctx, refs, lmdb_backed?, failures)
        when is_list(values) and is_list(refs) and length(values) == length(refs) do
     missing =
       refs
@@ -361,19 +363,22 @@ defmodule Ferricstore.Flow.ValueStore do
         |> Enum.with_index()
         |> Map.new(fn {{idx, _ref}, lmdb_idx} -> {idx, elem(lmdb_values, lmdb_idx)} end)
 
-      # Public reads keep reporting an unreadable mirrored value as absent.
+      # Value reads keep reporting an unreadable mirrored value as absent.
       values
       |> Enum.with_index()
       |> Enum.map(fn
-        {nil, idx} -> replacements |> Map.get(idx) |> unless_read_failure()
+        {nil, idx} -> replacements |> Map.get(idx) |> read_failure_as(failures)
         {value, _idx} -> value
       end)
     end
   end
 
-  defp fill_lmdb_missing(values, _ctx, _refs, _lmdb_backed?), do: values
+  defp fill_lmdb_missing(values, _ctx, _refs, _lmdb_backed?, _failures), do: values
 
-  defp unless_read_failure(value), do: if(ReadResult.failure?(value), do: nil, else: value)
+  defp read_failure_as(value, :report), do: value
+
+  defp read_failure_as(value, :absent),
+    do: if(ReadResult.failure?(value), do: nil, else: value)
 
   @doc false
   # Values of `refs` that the history projector moved out of the keydir, read
