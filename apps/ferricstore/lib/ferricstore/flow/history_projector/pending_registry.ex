@@ -167,10 +167,13 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
   # older ones still wait here; a projected index past the oldest waiting
   # entry would claim history that is not written. :infinity when none waits.
   def overflow_publish_limit(projector) when is_atom(projector) do
-    table = ensure_overflow_registry()
-    overflow_publish_limit(table, projector, {projector, 0})
+    case :ets.whereis(@overflow_registry) do
+      # Without the table nothing can wait in overflow.
+      :undefined -> :infinity
+      table -> overflow_publish_limit(table, projector, {projector, 0})
+    end
   rescue
-    _ -> 0
+    ArgumentError -> :infinity
   end
 
   defp overflow_publish_limit(table, projector, key) do
