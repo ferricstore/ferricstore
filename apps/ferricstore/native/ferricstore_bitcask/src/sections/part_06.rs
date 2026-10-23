@@ -525,7 +525,12 @@ mod io_backend_architecture_tests {
     #[test]
     fn active_uring_validates_kernel_lengths_offsets_and_completion_tags() {
         let source = include_str!("../io_backend/uring.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        // Test-only fields and hooks carry #[cfg(test)] too; the tests module
+        // is where production code ends.
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or(source);
 
         assert!(production.contains("fn uring_write_len("));
         assert!(production.contains("fn checked_write_end("));
@@ -533,7 +538,12 @@ mod io_backend_architecture_tests {
         assert!(!production.contains(".user_data(file_offset)"));
         assert!(production.contains(".user_data(index as u64)"));
         assert!(production.contains("validate_uring_single_completion("));
-        assert!(production.contains("fn submit_and_wait_retry("));
+        assert!(
+            production.contains("fn submit_and_wait_all(")
+                && production.contains("fn abandon_queued(")
+                && !production.contains("fn submit_and_wait_retry("),
+            "a failed submission must wait out taken SQEs and drop untaken ones"
+        );
         assert!(
             production.contains(".push_multiple(&sqes)"),
             "batch SQEs must be capacity-checked before any borrowed buffer pointer is queued"

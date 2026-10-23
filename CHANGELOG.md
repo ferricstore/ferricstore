@@ -4,6 +4,14 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- On Linux with the io_uring writer, a failed `io_uring_enter` (any error
+  but EINTR, including the transient EAGAIN and EBUSY) returned with the
+  write still queued in the ring, or still in flight when the call returned
+  early. The next write submitted the queued one after its buffer was freed,
+  and a rollback could truncate under a write still landing, so stale or
+  garbage bytes could reach the log. Transient errors are now retried, a
+  write is never left in flight, and writes the kernel never took are
+  dropped with the ring.
 - An apply that stopped (its process killed) after staging Flow history in
   the history projector's overflow queue, but before committing it, left a
   row that every later overflow entry waited behind until the node

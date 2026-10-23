@@ -8,10 +8,11 @@
 //! Every `unsafe` block in this file is for `io_uring`'s SQE submission.
 //! The invariant is: the buffer pointer passed to the kernel is valid for
 //! the entire duration of the I/O operation. We guarantee this because all
-//! methods call `ring.submit_and_wait(n)` immediately after pushing SQEs,
-//! which blocks the calling thread until the kernel signals completion.
-//! The buffers live on the Rust stack/heap and cannot be freed while the
-//! thread is blocked inside `submit_and_wait`.
+//! methods call `submit_and_wait_all(n)` immediately after pushing SQEs,
+//! which blocks the calling thread until the kernel has posted every CQE,
+//! however `io_uring_enter` returns, and which drops (never submits later)
+//! SQEs the kernel did not take when it gives up. The buffers live on the
+//! Rust stack/heap and cannot be freed while the thread is blocked there.
 //!
 //! This is *synchronous* use of an asynchronous kernel interface — there is
 //! no tokio, no `Future`, no `Poll`. The BEAM dirty-scheduler thread blocks
@@ -65,6 +66,20 @@ fn checked_write_end(offset: u64, len: usize) -> io::Result<u64> {
     })
 }
 
+/// How often an `io_uring_enter` that failed with EAGAIN or EBUSY (the
+/// kernel could not take the work yet) is retried, and how long to wait
+/// between tries, before the submission is given up.
+const TRANSIENT_ENTER_RETRIES: u32 = 1_000;
+const TRANSIENT_ENTER_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1);
+
+fn transient_enter_error(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::EBUSY))
+}
+
+fn broken_ring_error() -> io::Error {
+    io::Error::other("io_uring backend unusable: a failed submission could not be discarded")
+}
+
 /// `io_uring`-backed append-only log writer.
 ///
 /// Uses `io_uring` as a batched I/O submission interface. Despite operating
@@ -84,6 +99,13 @@ pub struct UringBackend {
     file: File,
     offset: u64,
     append_lock: Arc<Mutex<()>>,
+    /// Set when a failed submission left SQEs queued and no new ring could
+    /// replace this one: submitting anything would submit those too.
+    broken: bool,
+    /// Errors the next `io_uring_enter` calls return instead of entering
+    /// the kernel, as a failed submission would.
+    #[cfg(test)]
+    enter_faults: std::collections::VecDeque<io::Error>,
 }
 
 impl UringBackend {
@@ -112,16 +134,77 @@ impl UringBackend {
             file,
             offset,
             append_lock,
+            broken: false,
+            #[cfg(test)]
+            enter_faults: std::collections::VecDeque::new(),
         })
     }
 
-    fn submit_and_wait_retry(&mut self, completions: usize) -> io::Result<()> {
+    fn enter(&mut self, completions: usize) -> io::Result<usize> {
+        #[cfg(test)]
+        if let Some(fault) = self.enter_faults.pop_front() {
+            return Err(fault);
+        }
+
+        self.ring.submit_and_wait(completions)
+    }
+
+    /// Submits every queued SQE and waits until `expected` CQEs are posted.
+    ///
+    /// The kernel reads the caller's buffers until their CQEs are posted, so
+    /// this never returns while a submitted write is still in flight, even
+    /// when `io_uring_enter` comes back early. EINTR, EAGAIN and EBUSY are
+    /// retried. Any other failure leaves the SQEs the kernel did not take in
+    /// the ring; they are dropped with it (see `abandon_queued`), so no later
+    /// call submits them after their buffers are gone.
+    fn submit_and_wait_all(&mut self, expected: usize) -> io::Result<()> {
+        if self.broken {
+            return Err(broken_ring_error());
+        }
+
+        let mut transient_retries = 0u32;
+
         loop {
-            match self.ring.submit_and_wait(completions) {
-                Ok(_submitted) => return Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
+            let queued = self.ring.submission().len();
+            let ready = self.ring.completion().len();
+
+            if queued == 0 && ready >= expected {
+                return Ok(());
             }
+
+            match self.enter(expected.saturating_sub(ready)) {
+                Ok(_submitted) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if transient_enter_error(&error)
+                        && transient_retries < TRANSIENT_ENTER_RETRIES =>
+                {
+                    transient_retries += 1;
+                    std::thread::sleep(TRANSIENT_ENTER_BACKOFF);
+                }
+                Err(error) => {
+                    self.abandon_queued(expected);
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// After a failed submission: waits for the CQEs of the SQEs the kernel
+    /// did take (it may still be reading their buffers), then replaces the
+    /// ring, which drops the ones it did not take unseen.
+    fn abandon_queued(&mut self, expected: usize) {
+        let taken = expected.saturating_sub(self.ring.submission().len());
+
+        // Completions arrive as task work, which runs when this thread
+        // returns from a system call, such as the sleep.
+        while self.ring.completion().len() < taken {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        match IoUring::builder().build(RING_SIZE) {
+            Ok(ring) => self.ring = ring,
+            Err(_error) => self.broken = true,
         }
     }
 
@@ -134,6 +217,10 @@ impl UringBackend {
     /// the duration of the enclosing function, and `submit_and_wait` blocks
     /// the thread until the kernel completes the I/O.
     fn submit_write_at(&mut self, data: &[u8], file_offset: u64) -> io::Result<()> {
+        if self.broken {
+            return Err(broken_ring_error());
+        }
+
         let fd = types::Fd(self.file.as_raw_fd());
         let write_len = uring_write_len(data.len())?;
         let _end = checked_write_end(file_offset, data.len())?;
@@ -153,7 +240,7 @@ impl UringBackend {
                 .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring: SQ full"))?;
         }
 
-        self.submit_and_wait_retry(1)?;
+        self.submit_and_wait_all(1)?;
 
         let completions = self
             .ring
@@ -168,6 +255,10 @@ impl UringBackend {
     /// `Fsync` (fsync). fdatasync skips non-critical metadata (mtime/atime),
     /// which is 2-10x faster on ext4/xfs.
     fn submit_fsync(&mut self) -> io::Result<()> {
+        if self.broken {
+            return Err(broken_ring_error());
+        }
+
         let fd = types::Fd(self.file.as_raw_fd());
 
         let sqe = opcode::Fsync::new(fd)
@@ -183,7 +274,7 @@ impl UringBackend {
                 .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring: SQ full on fsync"))?;
         }
 
-        self.submit_and_wait_retry(1)?;
+        self.submit_and_wait_all(1)?;
 
         let completions = self
             .ring
@@ -264,6 +355,10 @@ impl IoBackend for UringBackend {
             return Ok(Vec::new());
         }
 
+        if self.broken {
+            return Err(broken_ring_error());
+        }
+
         let fd = types::Fd(self.file.as_raw_fd());
         let mut all_offsets = Vec::new();
         all_offsets.try_reserve_exact(buffers.len()).map_err(|_| {
@@ -333,7 +428,7 @@ impl IoBackend for UringBackend {
 
                 // Step 3: wait for all completions in this chunk.
                 let chunk_len = chunk.len();
-                self.submit_and_wait_retry(chunk_len)?;
+                self.submit_and_wait_all(chunk_len)?;
 
                 // Step 4: drain and validate every CQE.
                 // Check both error (res < 0) and short write (res != expected_len).
@@ -519,6 +614,72 @@ mod tests {
             b"world"
         );
         assert_eq!(&bytes[(offsets[2] as usize)..=(offsets[2] as usize)], b"!");
+    }
+
+    // A submission the kernel never took leaves its SQE queued. Returning
+    // with it queued let the next call submit it after the caller's buffer
+    // was gone, writing stale bytes into the log.
+    #[test]
+    fn a_failed_submission_never_writes_its_buffer_later() {
+        if !requires_io_uring() {
+            return;
+        }
+
+        let dir = tmp();
+        let path = dir.path().join("test.log");
+        let mut backend = UringBackend::open(&path).unwrap();
+
+        backend
+            .enter_faults
+            .push_back(io::Error::from_raw_os_error(libc::EINVAL));
+        assert!(backend.append(&[b'X'; 12]).is_err());
+
+        assert_eq!(backend.append(b"second").unwrap(), 0);
+        backend.sync().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+    }
+
+    #[test]
+    fn a_failed_batch_submission_never_writes_its_buffers_later() {
+        if !requires_io_uring() {
+            return;
+        }
+
+        let dir = tmp();
+        let path = dir.path().join("test.log");
+        let mut backend = UringBackend::open(&path).unwrap();
+
+        backend
+            .enter_faults
+            .push_back(io::Error::from_raw_os_error(libc::EINVAL));
+        let stale: &[&[u8]] = &[&[b'X'; 12], &[b'Y'; 12]];
+        assert!(backend.append_batch_and_sync(stale).is_err());
+
+        assert_eq!(backend.append_batch_and_sync(&[b"ok"]).unwrap(), vec![0]);
+        assert_eq!(std::fs::read(&path).unwrap(), b"ok");
+    }
+
+    // EAGAIN and EBUSY only say the kernel could not take the work yet.
+    #[test]
+    fn a_transient_submission_error_is_retried() {
+        if !requires_io_uring() {
+            return;
+        }
+
+        let dir = tmp();
+        let path = dir.path().join("test.log");
+        let mut backend = UringBackend::open(&path).unwrap();
+
+        backend
+            .enter_faults
+            .push_back(io::Error::from_raw_os_error(libc::EAGAIN));
+        backend
+            .enter_faults
+            .push_back(io::Error::from_raw_os_error(libc::EBUSY));
+
+        assert_eq!(backend.append(b"hello").unwrap(), 0);
+        backend.sync().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
     }
 
     #[test]
