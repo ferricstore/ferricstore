@@ -1147,8 +1147,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
 
           Process.sleep(300)
 
-          started = System.monotonic_time(:millisecond)
-
           result =
             WARaftBackend.adjust_membership_redirected(
               0,
@@ -1157,10 +1155,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
               10_000,
               0
             )
-
-          IO.puts(
-            "PROBE membership #{inspect(result)} after #{System.monotonic_time(:millisecond) - started} ms status=#{inspect(waraft_storage_status(0) |> Keyword.take([:applied_position, :durable_position]))}"
-          )
 
           :atomics.put(stop, 1, 1)
           assert Enum.sum(Task.await_many(writers, 30_000)) > 0
