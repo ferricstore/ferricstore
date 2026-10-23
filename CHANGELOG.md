@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A single command past the per-command apply bound (4,096 members by
+  default), such as RPUSH, HDEL, HEXPIRE, HPEXPIRE, HGETDEL, HGETEX or HSETEX
+  with more elements or fields than that, answered the internal reason
+  `:compound_member_apply_budget_exceeded`. It now answers
+  `ERR too many members in one command (the limit is 4096)`, over the native
+  protocol and HTTP alike.
 - On Linux with the io_uring writer, a failed `io_uring_enter` (any error
   but EINTR, including the transient EAGAIN and EBUSY) returned with the
   write still queued in the ring, or still in flight when the call returned

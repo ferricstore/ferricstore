@@ -2249,7 +2249,14 @@ defmodule FerricstoreServer.Native.Commands do
     {status, reason, state}
   end
 
-  defp result_to_reply({:error, reason}, state), do: {:error, inspect(reason), state}
+  defp result_to_reply({:error, reason}, state) do
+    message =
+      Ferricstore.ErrorReasons.client_message(reason, Map.get(state, :instance_ctx)) ||
+        inspect(reason)
+
+    {:error, message, state}
+  end
+
   defp result_to_reply(value, state), do: {:ok, value, state}
 
   defp collection_result_to_reply({:ok, value}, state) do
