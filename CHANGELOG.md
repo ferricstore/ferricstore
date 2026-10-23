@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A capped Flow value read (FLOW.GET with a payload cap, history listings)
+  loaded a large blob-backed payload in full once the history projector had
+  moved it, only to report its size; it now takes the size from the blob's
+  file ref, as it does for a payload still in the keydir.
 - A Flow value that the history projector had moved to its history log and
   that could not be read there was answered as missing: no payload on
   FLOW.GET, nil from FLOW.VALUE.MGET. It is now reported as a storage read
