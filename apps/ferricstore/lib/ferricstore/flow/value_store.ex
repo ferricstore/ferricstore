@@ -465,13 +465,21 @@ defmodule Ferricstore.Flow.ValueStore do
         waraft_segment_file_id?(file_id)
       end)
 
-    acc =
-      Enum.reduce(other_locators, acc, fn {idx, ref, locator}, inner_acc ->
-        case flow_value_read_lmdb_locator(ctx, ref, locator) do
-          nil -> inner_acc
-          value -> Map.put(inner_acc, idx, value)
-        end
+    {history_locators, file_locators} =
+      Enum.split_with(other_locators, fn {_idx, _ref, {file_id, _offset, _value_size}} ->
+        match?({:flow_history, _file_id}, file_id)
       end)
+
+    acc =
+      history_locators
+      |> Enum.group_by(fn {_idx, ref, {file_id, _offset, _value_size}} ->
+        {Router.shard_for(ctx, ref), file_id}
+      end)
+      |> Enum.reduce(acc, fn {{shard_index, file_id}, entries}, inner_acc ->
+        flow_value_read_history_locators(ctx, shard_index, file_id, entries, inner_acc)
+      end)
+
+    acc = flow_value_read_lmdb_locators_one_by_one(ctx, file_locators, acc)
 
     waraft_locators
     |> Enum.group_by(fn {_idx, ref, {file_id, _offset, _value_size}} ->
@@ -495,6 +503,47 @@ defmodule Ferricstore.Flow.ValueStore do
           end)
       end
     end)
+  end
+
+  # One read of each history log for all its values in the batch. The batch
+  # read fails as a whole on one bad record, so then each value is read alone
+  # to tell which.
+  defp flow_value_read_history_locators(ctx, shard_index, file_id, entries, acc) do
+    offsets = Enum.map(entries, fn {_idx, _ref, {_file_id, offset, _size}} -> offset end)
+
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, shard_index)
+
+    case Ferricstore.Flow.HistoryProjector.read_values(shard_path, file_id, offsets) do
+      {:ok, values} when length(values) == length(entries) ->
+        entries
+        |> Enum.zip(values)
+        |> Enum.reduce(acc, fn
+          {{idx, _ref, _locator}, value}, inner_acc when is_binary(value) ->
+            Map.put(inner_acc, idx, flow_value_materialize(ctx, shard_index, value))
+
+          {_entry, _absent}, inner_acc ->
+            inner_acc
+        end)
+
+      _failed ->
+        flow_value_read_lmdb_locators_one_by_one(ctx, entries, acc)
+    end
+  end
+
+  defp flow_value_read_lmdb_locators_one_by_one(ctx, locators, acc) do
+    Enum.reduce(locators, acc, fn {idx, ref, locator}, inner_acc ->
+      case flow_value_read_lmdb_locator(ctx, ref, locator) do
+        nil -> inner_acc
+        value -> Map.put(inner_acc, idx, value)
+      end
+    end)
+  end
+
+  defp flow_value_materialize(ctx, shard_index, value) do
+    case BlobValue.maybe_materialize(ctx.data_dir, shard_index, BlobValue.threshold(ctx), value) do
+      {:ok, materialized} -> materialized
+      {:error, reason} -> ReadResult.failure(reason)
+    end
   end
 
   defp flow_value_lmdb_put_waraft_locator_values(ctx, shard_index, entries, values, acc) do

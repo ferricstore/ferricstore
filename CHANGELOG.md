@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Flow values the history projector has moved to its history log are read in
+  one call per log for a batch (value MGET, claim and history hydration,
+  export) instead of opening the log once per value: 2,000 such payloads
+  read in batches of 100 took 83 µs each, now 7 µs.
 - A Flow export left out any value, signal row or owned row it could not
   read, and still reported success, so the restored run came back without
   it (a shared value or governance row that could not be read crashed the

@@ -939,6 +939,9 @@ defmodule Ferricstore.Flow.HistoryProjector do
   defdelegate read_value(shard_data_path, file_id, offset),
     to: Ferricstore.Flow.HistoryProjector.Log
 
+  defdelegate read_values(shard_data_path, file_id, offsets),
+    to: Ferricstore.Flow.HistoryProjector.Log
+
   defdelegate scan_event_value(shard_data_path, target_key),
     to: Ferricstore.Flow.HistoryProjector.Log
 
