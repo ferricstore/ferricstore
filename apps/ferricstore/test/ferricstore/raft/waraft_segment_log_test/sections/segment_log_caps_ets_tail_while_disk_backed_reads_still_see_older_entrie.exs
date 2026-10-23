@@ -1035,7 +1035,9 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest.Sections.SegmentLogCapsEtsTailWh
                      [{"a", "1", 0}]
                    )
 
-          refute_receive {:waraft_segment_log_file_sync, _path}, 100
+          # The sync hook is global: the test instance's own WARaft storage may
+          # sync its logs meanwhile, so only this root's files count.
+          assert Enum.filter(synced_paths(), &String.starts_with?(&1, root)) == []
 
           assert {:ok, {_ordinal, offset, encoded_size}} =
                    :ferricstore_waraft_spike_segment_log.location_for_index(to_charlist(root), 42)
@@ -1050,6 +1052,14 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest.Sections.SegmentLogCapsEtsTailWh
         after
           restore_env(:ferricstore, :waraft_segment_log_file_sync_hook, previous_hook)
           File.rm_rf!(root)
+        end
+      end
+
+      defp synced_paths do
+        receive do
+          {:waraft_segment_log_file_sync, path} -> [to_string(path) | synced_paths()]
+        after
+          100 -> []
         end
       end
     end
