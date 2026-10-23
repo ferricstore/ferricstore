@@ -4,6 +4,9 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A WARaft shard whose storage blocked itself after a failed apply (it then
+  refuses every apply until restarted) only emitted telemetry; it now also
+  logs an error naming the shard, the position, the operation and the cause.
 - A capped Flow value read (FLOW.GET with a payload cap, history listings)
   loaded a large blob-backed payload in full once the history projector had
   moved it, only to report its size; it now takes the size from the blob's

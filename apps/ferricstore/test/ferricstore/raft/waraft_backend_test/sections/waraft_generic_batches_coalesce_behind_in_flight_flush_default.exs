@@ -904,6 +904,39 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftGenericBatchesCoales
         end
       end
 
+      # A blocked shard applies nothing until restarted, so the block is logged
+      # with its cause, once rather than for every refused apply.
+      test "a storage block logs the shard, operation and reason once", %{ctx: ctx} do
+        previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
+
+        try do
+          Application.put_env(:ferricstore, :waraft_storage_apply_mode, :bitcask_keydir)
+          assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          {encoded_ref, _ref} = missing_blob_ref("missing")
+
+          first =
+            capture_log(fn ->
+              assert Ferricstore.ErrorReasons.write_timeout_unknown() ==
+                       WARaftBackend.write(0, {:put_blob_ref, "log-block:k", encoded_ref, 0})
+            end)
+
+          assert first =~ "WARaft storage for shard 0 is blocked"
+          assert first =~ "apply_failure"
+          assert first =~ "blob_ref_unavailable"
+
+          later =
+            capture_log(fn ->
+              assert Ferricstore.ErrorReasons.write_timeout_unknown() ==
+                       WARaftBackend.write(0, {:put, "log-block:after", "v2", 0})
+            end)
+
+          refute later =~ "is blocked"
+        after
+          restore_env(:waraft_storage_apply_mode, previous_mode)
+        end
+      end
+
       test "blocked storage refuses snapshot creation instead of exporting a newer volatile position",
            %{
              ctx: ctx
