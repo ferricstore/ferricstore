@@ -44,9 +44,12 @@ defmodule Ferricstore.CanonicalTermTest do
              :crypto.hash(:sha256, IO.iodata_to_binary(CanonicalTerm.encode(term)))
   end
 
-  test "pids, references and functions are refused" do
-    for term <- [self(), make_ref(), fn -> :ok end] do
-      assert_raise ArgumentError, fn -> CanonicalTerm.encode(term) end
-    end
+  # Digests are computed in apply, where a raise would stop every replica.
+  test "pids, references and functions still encode, each distinctly" do
+    terms = [self(), spawn(fn -> :ok end), make_ref(), make_ref(), fn -> :ok end]
+    encodings = Enum.map(terms, &IO.iodata_to_binary(CanonicalTerm.encode(%{"v" => [&1]})))
+
+    assert length(Enum.uniq(encodings)) == length(terms)
+    assert CanonicalTerm.digest(self()) == CanonicalTerm.digest(self())
   end
 end

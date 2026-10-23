@@ -11,7 +11,9 @@ defmodule Ferricstore.CanonicalTerm do
 
   Every value is a one-byte tag, then a 32-bit count or length where one is
   needed, then its parts; map entries are ordered by their encoded keys.
-  The encoding is stored as digests, so it must never change.
+  The encoding is stored as digests, so it must never change. Terms with no
+  portable form (pids, ports, references, funs) are the exception: they are
+  tagged `term_to_binary` output, so that encoding never fails.
   """
 
   @spec encode(term()) :: iodata()
@@ -48,8 +50,12 @@ defmodule Ferricstore.CanonicalTerm do
     [?m, <<map_size(term)::32>> | entries]
   end
 
+  # Pids, ports, references and funs have no portable form. They are digested
+  # in apply, where a raise would stop every replica, so they are encoded by
+  # term_to_binary under their own tag.
   def encode(term) do
-    raise ArgumentError, "a canonical encoding has no form for #{inspect(term)}"
+    opaque = :erlang.term_to_binary(term)
+    [?x, <<byte_size(opaque)::32>>, opaque]
   end
 
   @spec digest(term()) :: binary()
