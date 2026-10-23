@@ -1099,6 +1099,78 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
         end
       end
 
+      # A membership change reports success once its entry is durable, and
+      # under a steady stream of Flow writes the durable position only moves
+      # in steps behind the newest one.
+      test "a membership change completes under a steady stream of Flow writes", %{ctx: ctx} do
+        previous_async_history = Application.get_env(:ferricstore, :flow_async_history)
+        previous_every = Application.get_env(:ferricstore, :waraft_storage_metadata_persist_every)
+        partition = "tenant-history-membership-#{System.unique_integer([:positive])}"
+
+        try do
+          Application.put_env(:ferricstore, :flow_async_history, true)
+          Application.put_env(:ferricstore, :waraft_storage_metadata_persist_every, 16)
+
+          assert :ok =
+                   WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          start_supervised!(
+            {Ferricstore.Flow.HistoryProjector,
+             [
+               shard_index: 0,
+               shard_data_path: Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0),
+               instance_ctx: ctx,
+               recover_on_init: false
+             ]}
+          )
+
+          stop = :atomics.new(1, [])
+
+          writers =
+            for writer <- 1..4 do
+              Task.async(fn ->
+                Enum.reduce_while(Stream.iterate(0, &(&1 + 1)), 0, fn i, count ->
+                  if :atomics.get(stop, 1) == 1 do
+                    {:halt, count}
+                  else
+                    case Ferricstore.Flow.create(ctx, "membership-#{writer}-#{i}",
+                           type: "router-flow-history-membership",
+                           partition_key: partition
+                         ) do
+                      :ok -> {:cont, count + 1}
+                      _error -> {:cont, count}
+                    end
+                  end
+                end)
+              end)
+            end
+
+          Process.sleep(300)
+
+          started = System.monotonic_time(:millisecond)
+
+          result =
+            WARaftBackend.adjust_membership_redirected(
+              0,
+              :add_participant,
+              :"ghost@127.0.0.1",
+              10_000,
+              0
+            )
+
+          IO.puts(
+            "PROBE membership #{inspect(result)} after #{System.monotonic_time(:millisecond) - started} ms status=#{inspect(waraft_storage_status(0) |> Keyword.take([:applied_position, :durable_position]))}"
+          )
+
+          :atomics.put(stop, 1, 1)
+          assert Enum.sum(Task.await_many(writers, 30_000)) > 0
+          assert {:ok, _config_position} = result
+        after
+          restore_env(:flow_async_history, previous_async_history)
+          restore_env(:waraft_storage_metadata_persist_every, previous_every)
+        end
+      end
+
       test "flow due indexes survive WARaft restart without shard process reads", %{
         root: root,
         ctx: ctx
