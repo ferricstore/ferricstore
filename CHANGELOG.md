@@ -4,6 +4,14 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A Flow signal's idempotency digest and a child group's request hash are
+  stored and compared on every replica, and were computed with
+  `term_to_binary`, whose output changes between OTP releases (OTP 26
+  changed how atoms encode; maps of more than 32 keys follow an internal
+  hash). During a rolling OTP upgrade, a retried signal or spawn could be
+  accepted on some replicas and refused as a conflict on others. From
+  feature level 5 they use FerricStore's own encoding, which no release
+  changes; digests stored before still match their retries.
 - A Flow schedule whose fire failed part-way, as when the shard's leader
   changed or a write timed out, stayed claimed for the whole 30 s lease, so
   it did not fire again until the lease expired. It is now handed back at

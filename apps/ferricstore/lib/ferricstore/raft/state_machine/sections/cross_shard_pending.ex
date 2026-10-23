@@ -982,12 +982,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
                 Map.get(record, :partition_key)
               )
 
-            digest = flow_signal_digest(attrs)
-
             case sm_store_batch_get(state, [idem_key], &sm_file_path/2) do
-              [^digest] -> :ok
-              [nil] -> :ok
-              [_other] -> {:error, "ERR flow signal idempotency conflict"}
+              [nil] ->
+                :ok
+
+              [stored] ->
+                if stored in flow_signal_stored_digests(attrs),
+                  do: :ok,
+                  else: {:error, "ERR flow signal idempotency conflict"}
             end
 
           _ ->
@@ -1008,7 +1010,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
             raw_put_cold(
               state,
               idem_key,
-              flow_signal_digest(attrs),
+              flow_signal_digest(state, attrs),
               flow_record_expire_at(record)
             )
 
@@ -1017,18 +1019,38 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
         end
       end
 
-      defp flow_signal_digest(attrs) do
+      @flow_signal_digest_fields [
+        :signal,
+        :if_state,
+        :transition_to,
+        :run_at_ms,
+        :values,
+        :value_refs,
+        :drop_values,
+        :override_values
+      ]
+
+      # The digest is stored and compared on every replica, so from level 5 it
+      # does not depend on the OTP release (Ferricstore.CanonicalTerm); "c1:"
+      # tells it from the term_to_binary digests stored before, which a retry
+      # still matches.
+      defp flow_signal_digest(state, attrs) do
+        if feature_level_5?(state),
+          do: flow_signal_canonical_digest(attrs),
+          else: flow_signal_legacy_digest(attrs)
+      end
+
+      defp flow_signal_stored_digests(attrs),
+        do: [flow_signal_canonical_digest(attrs), flow_signal_legacy_digest(attrs)]
+
+      defp flow_signal_canonical_digest(attrs) do
+        fields = Map.new(@flow_signal_digest_fields, &{&1, Map.get(attrs, &1)})
+        "c1:" <> Base.encode16(Ferricstore.CanonicalTerm.digest(fields), case: :lower)
+      end
+
+      defp flow_signal_legacy_digest(attrs) do
         attrs
-        |> Map.take([
-          :signal,
-          :if_state,
-          :transition_to,
-          :run_at_ms,
-          :values,
-          :value_refs,
-          :drop_values,
-          :override_values
-        ])
+        |> Map.take(@flow_signal_digest_fields)
         |> :erlang.term_to_binary()
         |> then(&:crypto.hash(:sha256, &1))
         |> Base.encode16(case: :lower)

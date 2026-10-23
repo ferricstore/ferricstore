@@ -57,7 +57,9 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    events by version ("1000-9" before "1000-10"), not by id bytes. WATCH
   #    records replicated write versions for the watched keys and a watched
   #    EXEC compares them (`Ferricstore.Transaction.WatchIndex`), instead of
-  #    node-local storage tokens.
+  #    node-local storage tokens. Flow signal idempotency digests and child
+  #    group request hashes are stored as `Ferricstore.CanonicalTerm` digests,
+  #    which no OTP release changes (older ones still match their retries).
   @supported 5
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

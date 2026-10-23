@@ -85,7 +85,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
                    {:ok, _child_records, child_plans} <-
                      flow_create_many_prepare(state, child_attrs),
                    {:ok, next_parent} <-
-                     flow_prepare_spawn_parent(parent, attrs, child_attrs, now_ms),
+                     flow_prepare_spawn_parent(
+                       parent,
+                       flow_put_child_group_request_hash(state, attrs, child_attrs),
+                       child_attrs,
+                       now_ms
+                     ),
                    :ok <- flow_validate_record_keys(next_parent),
                    :ok <-
                      flow_apply_parent_update(
@@ -132,7 +137,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
                    :ok <- flow_require_spawn_wait_state(parent, attrs),
                    {:ok, child_apply_groups} <- flow_cross_create_many_prepare(state, child_attrs),
                    {:ok, next_parent} <-
-                     flow_prepare_spawn_parent(parent, attrs, child_attrs, now_ms),
+                     flow_prepare_spawn_parent(
+                       parent,
+                       flow_put_child_group_request_hash(state, attrs, child_attrs),
+                       child_attrs,
+                       now_ms
+                     ),
                    :ok <- flow_validate_record_keys(next_parent),
                    :ok <-
                      flow_apply_parent_update(
@@ -409,14 +419,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
 
       defp flow_child_group_spawn_state(parent, attrs, child_attrs) do
         group_id = Map.fetch!(attrs, :group_id)
-        requested_hash = flow_child_group_request_hash(attrs, child_attrs)
 
         case Map.get(flow_child_groups(parent), group_id) do
           nil ->
             {:ok, :new}
 
-          %{"request_hash" => ^requested_hash} ->
-            {:ok, :idempotent}
+          %{"request_hash" => stored_hash} ->
+            if stored_hash in flow_child_group_request_hashes(attrs, child_attrs),
+              do: {:ok, :idempotent},
+              else: {:error, "ERR flow child group idempotency conflict"}
 
           _existing ->
             {:error, "ERR flow child group idempotency conflict"}
@@ -492,7 +503,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           "on_child_failed" => Atom.to_string(Map.fetch!(attrs, :on_child_failed)),
           "on_parent_closed" => Atom.to_string(Map.fetch!(attrs, :on_parent_closed)),
           "exhaust_to" => Map.fetch!(attrs, :exhaust_to),
-          "request_hash" => flow_child_group_request_hash(attrs, child_attrs),
+          "request_hash" => Map.fetch!(attrs, :child_group_request_hash),
           "children" => children,
           "child_partitions" => child_partitions,
           "summary" => %{
@@ -506,8 +517,70 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
         }
       end
 
-      defp flow_child_group_request_hash(attrs, child_attrs) do
-        request = %{
+      @flow_child_group_child_fields [
+        :id,
+        :type,
+        :state,
+        :partition_key,
+        :run_at_ms,
+        :priority,
+        :retention_ttl_ms,
+        :max_active_ms,
+        :history_hot_max_events,
+        :history_max_events,
+        :correlation_id,
+        :payload_ref
+      ]
+
+      # The request hash is stored in the parent and compared on every
+      # replica, so from level 5 it does not depend on the OTP release
+      # (Ferricstore.CanonicalTerm); "c1:" tells it from the term_to_binary
+      # hashes stored before, which a retry still matches.
+      defp flow_put_child_group_request_hash(state, attrs, child_attrs) do
+        hash =
+          if feature_level_5?(state),
+            do: flow_child_group_canonical_hash(attrs, child_attrs),
+            else: flow_child_group_legacy_hash(attrs, child_attrs)
+
+        Map.put(attrs, :child_group_request_hash, hash)
+      end
+
+      defp flow_child_group_request_hashes(attrs, child_attrs),
+        do: [
+          flow_child_group_canonical_hash(attrs, child_attrs),
+          flow_child_group_legacy_hash(attrs, child_attrs)
+        ]
+
+      defp flow_child_group_canonical_hash(attrs, child_attrs) do
+        request =
+          flow_child_group_request(attrs, child_attrs, &flow_child_group_canonical_child/1)
+
+        "c1:" <> Base.encode16(Ferricstore.CanonicalTerm.digest(request), case: :lower)
+      end
+
+      defp flow_child_group_legacy_hash(attrs, child_attrs) do
+        request = flow_child_group_request(attrs, child_attrs, &flow_child_group_request_child/1)
+
+        :crypto.hash(:sha256, :erlang.term_to_binary(request))
+        |> Base.encode16(case: :lower)
+      end
+
+      defp flow_child_group_canonical_child(attrs) do
+        @flow_child_group_child_fields
+        |> Map.new(&{&1, Map.get(attrs, &1)})
+        |> Map.put(
+          :payload_hash,
+          flow_child_group_canonical_payload_hash(Map.get(attrs, :payload))
+        )
+      end
+
+      defp flow_child_group_canonical_payload_hash(nil), do: nil
+
+      defp flow_child_group_canonical_payload_hash(payload),
+        do: Base.encode16(Ferricstore.CanonicalTerm.digest(payload), case: :lower)
+
+      defp flow_child_group_request(attrs, child_attrs, child_fun) do
+        %{
           wait: Map.fetch!(attrs, :wait),
           wait_state: Map.get(attrs, :wait_state),
           on_child_failed: Map.fetch!(attrs, :on_child_failed),
@@ -515,14 +588,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           exhaust_to: Map.fetch!(attrs, :exhaust_to),
           children:
             child_attrs
-            |> Enum.map(&flow_child_group_request_child/1)
+            |> Enum.map(child_fun)
             |> Enum.sort_by(fn child ->
               {Map.fetch!(child, :id), Map.fetch!(child, :partition_key)}
             end)
         }
-
-        :crypto.hash(:sha256, :erlang.term_to_binary(request))
-        |> Base.encode16(case: :lower)
       end
 
       defp flow_child_group_request_child(attrs) do

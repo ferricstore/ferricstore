@@ -589,6 +589,15 @@ shard_0: 2
     - HSETEX's Redis form and a conditional `ZADD ... INCR` run as one
       replicated entry, so concurrent clients see one outcome.
     - PFADD and PFMERGE keep the sketch's TTL.
+    - WATCH records a replicated write version for each watched key and EXEC
+      compares them, so every replica reaches the same decision. Below level
+      5 a watched EXEC on a promoted hash, set or sorted set, or on a key a
+      node had relocated, could apply on some replicas and not others.
+    - Apply's Flow history trim and duplicate-retry check order one
+      millisecond's events by version (`1000-9` before `1000-10`).
+    - Flow signal idempotency digests and child group request hashes no
+      longer depend on the OTP release, so a rolling OTP upgrade cannot make
+      replicas disagree on a retried signal or spawn.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.
