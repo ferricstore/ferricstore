@@ -11,6 +11,14 @@ defmodule FerricstoreServer.Test.DashboardCase do
       @moduletag timeout: 60_000
 
       import FerricstoreServer.Test.DashboardCase
+
+      # Dashboard pages read a bounded sample of the store's Flow records, so
+      # records other modules left behind can crowd a test's own out of it.
+      # This runs before the module's own setup_all.
+      setup_all do
+        Ferricstore.Test.ShardHelpers.flush_all_keys()
+        :ok
+      end
     end
   end
 
