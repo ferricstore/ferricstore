@@ -69,7 +69,9 @@ defmodule Ferricstore.Bench.OpenLoopTest do
       OpenLoop.start_link(
         target_qps: 100,
         concurrency: 4,
-        max_queue: 8,
+        # A stalled generator offers every missed slot at once; the queue
+        # must hold that burst so only failures, never drops, are counted.
+        max_queue: 1_000,
         job_fun: fn sequence ->
           %{
             sequence: sequence,
@@ -92,7 +94,11 @@ defmodule Ferricstore.Bench.OpenLoopTest do
         end
       )
 
-    Process.sleep(100)
+    Process.sleep(50)
+    :sys.suspend(generator)
+    Process.sleep(500)
+    :sys.resume(generator)
+    Process.sleep(50)
     stats = OpenLoop.stop(generator, 5_000)
 
     assert stats.offered >= 5
