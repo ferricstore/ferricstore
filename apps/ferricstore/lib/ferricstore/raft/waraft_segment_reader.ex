@@ -5,6 +5,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
 
   @table_prefix "raft_log_ferricstore_waraft_backend_"
   @storage_root "ferricstore_waraft_backend"
+  @storage_root_cache {__MODULE__, :storage_root}
   @projection_dir "segment_projection_log"
   @apply_projection_dir "apply_projection_log"
   @apply_projection_table :ferricstore_waraft_apply_projection_cache
@@ -2552,8 +2553,18 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     defp maybe_run_apply_projection_lock_backoff_hook(_wait_ms), do: :ok
   end
 
+  # A shard's storage process asks for its root on every apply, and readers
+  # ask for the same few roots on every read: each process keeps the last one.
   defp storage_root(%{data_dir: data_dir}, shard_index) do
-    Path.join([data_dir, "waraft", "#{@storage_root}.#{shard_index + 1}"])
+    case Process.get(@storage_root_cache) do
+      {^data_dir, ^shard_index, root} ->
+        root
+
+      _other ->
+        root = Path.join([data_dir, "waraft", "#{@storage_root}.#{shard_index + 1}"])
+        Process.put(@storage_root_cache, {data_dir, shard_index, root})
+        root
+    end
   end
 
   defp log_table(shard_index) do

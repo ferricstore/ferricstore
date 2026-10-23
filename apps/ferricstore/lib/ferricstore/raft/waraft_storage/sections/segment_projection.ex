@@ -503,9 +503,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
              {:raft_log_pos, index, _term}
            )
            when is_integer(index) and index > 0 do
-        root = Path.join([data_dir, "waraft", "#{@storage_root}.#{shard_index + 1}"])
+        root = segment_log_root(data_dir, shard_index)
 
-        case :ferricstore_waraft_spike_segment_log.location_for_index(to_charlist(root), index) do
+        case :ferricstore_waraft_spike_segment_log.location_for_index(root, index) do
           {:ok, {_ordinal, offset, _encoded_size}} when is_integer(offset) and offset >= 0 ->
             offset
 
@@ -515,6 +515,22 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
       end
 
       defp segment_record_offset(_sm_state, _position), do: 0
+
+      # Every projected apply looks its record up in the shard's log, whose
+      # root does not change while the storage process runs.
+      defp segment_log_root(data_dir, shard_index) do
+        case Process.get(@segment_log_root_cache) do
+          {^data_dir, ^shard_index, root} ->
+            root
+
+          _other ->
+            root =
+              to_charlist(Path.join([data_dir, "waraft", "#{@storage_root}.#{shard_index + 1}"]))
+
+            Process.put(@segment_log_root_cache, {data_dir, shard_index, root})
+            root
+        end
+      end
 
       defp apply_state_machine_command(command, position, sm_state, replayed?) do
         meta = meta_from_position(position)

@@ -59,6 +59,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
   @zero_pos {:raft_log_pos, 0, 0}
   @segment_projection_registry :ferricstore_waraft_segment_projection_registry
   @storage_root "ferricstore_waraft_backend"
+  @segment_log_root_cache {__MODULE__, :segment_log_root}
   @segment_value_pin_scan_limit 100_000
   @apply_projection_replay_dependencies_key :ferricstore_waraft_apply_projection_replay_dependencies
 

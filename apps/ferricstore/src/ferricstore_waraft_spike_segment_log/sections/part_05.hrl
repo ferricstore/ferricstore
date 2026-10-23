@@ -700,7 +700,14 @@ retire_abandoned_rewrite_writers(Dir) ->
     end.
 
 offset_dir_key(Dir) ->
-    unicode:characters_to_binary(cache_dir_key(Dir)).
+    case erlang:get(?OFFSET_DIR_KEY_CACHE) of
+        {Dir, DirKey} ->
+            DirKey;
+        _Other ->
+            DirKey = unicode:characters_to_binary(cache_dir_key(Dir)),
+            erlang:put(?OFFSET_DIR_KEY_CACHE, {Dir, DirKey}),
+            DirKey
+    end.
 
 read_log_disk_record(Log, Index) when is_integer(Index), Index >= 0 ->
     Dir = log_dir(Log),
