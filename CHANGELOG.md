@@ -11,7 +11,9 @@ All notable changes to FerricStore will be documented here.
   and every write asked the projector to catch up. The position now advances
   in steps to the last one whose history is written, asking the projector
   at most every 100 ms instead of on every write; in a single-node test,
-  Flow create throughput rose about 3.5 times.
+  Flow create throughput rose about 3.5 times. Between those steps, the
+  durable position a membership change waits for follows the projector
+  within about 100 ms instead of the persist cadence (1,024 entries).
 - In a cluster, a node restarted after a crash could permanently lose the
   history of the Flow writes it applied just before stopping, and keep those
   Flows only in its cold LMDB mirror. On restart a node re-applies the log

@@ -46,9 +46,10 @@ defmodule Ferricstore.Raft.WARaftStorage do
   # How long a checkpoint task waits for the Flow history of the entries its
   # cut covers before it gives up and retries with a later cut.
   @default_segment_projection_checkpoint_history_timeout_ms 5_000
-  # How often a replay position waiting for its history asks the projector
-  # again, in case a request was lost.
-  @durable_candidate_rerequest_ms 100
+  # How often storage takes a new durable candidate between metadata
+  # persists, and how often a waiting one asks the projector again (in case
+  # a request was lost).
+  @durable_candidate_interval_ms 100
   # A shard waiting for a checkpoint slot retries about once a second while it
   # still needs one; past this it no longer holds its place in line.
   @segment_projection_checkpoint_waiter_ttl_ms 5_000

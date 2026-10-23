@@ -1099,6 +1099,80 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
         end
       end
 
+      # A membership change waits for the durable position, which must follow
+      # the history the projector writes, not the metadata persist cadence.
+      test "the durable position follows trailing Flow history between persists", %{
+        ctx: ctx
+      } do
+        previous_async_history = Application.get_env(:ferricstore, :flow_async_history)
+        previous_every = Application.get_env(:ferricstore, :waraft_storage_metadata_persist_every)
+
+        previous_history_flush =
+          Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms)
+
+        partition = "tenant-history-durable-#{System.unique_integer([:positive])}"
+        shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+
+        try do
+          Application.put_env(:ferricstore, :flow_async_history, true)
+          Application.put_env(:ferricstore, :flow_history_projector_flush_interval_ms, 60_000)
+          Application.put_env(:ferricstore, :waraft_storage_metadata_persist_every, :never)
+
+          assert :ok =
+                   WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          projector =
+            start_supervised!(
+              {Ferricstore.Flow.HistoryProjector,
+               [
+                 shard_index: 0,
+                 shard_data_path: shard_data_path,
+                 instance_ctx: ctx,
+                 recover_on_init: false
+               ]}
+            )
+
+          create = fn id ->
+            assert :ok =
+                     Ferricstore.Flow.create(ctx, id,
+                       type: "router-flow-history-durable",
+                       partition_key: partition,
+                       run_at_ms: 1_000,
+                       now_ms: 900
+                     )
+
+            {:ok, {:raft_log_pos, index, _term}} = WARaftBackend.storage_position(0)
+            index
+          end
+
+          first_index = create.("durable-first-#{System.unique_integer([:positive])}")
+          Ferricstore.Flow.HistoryProjector.request(ctx, 0, shard_data_path, first_index)
+
+          assert eventually(fn ->
+                   Ferricstore.Flow.HistoryProjector.durable?(
+                     ctx,
+                     0,
+                     shard_data_path,
+                     first_index
+                   )
+                 end)
+
+          # The next write's history stays queued.
+          :ok = :sys.suspend(projector)
+          later_index = create.("durable-later-#{System.unique_integer([:positive])}")
+          assert later_index > first_index
+
+          assert position_index(Keyword.fetch!(waraft_storage_status(0), :durable_position)) >=
+                   first_index
+
+          :ok = :sys.resume(projector)
+        after
+          restore_env(:flow_async_history, previous_async_history)
+          restore_env(:waraft_storage_metadata_persist_every, previous_every)
+          restore_env(:flow_history_projector_flush_interval_ms, previous_history_flush)
+        end
+      end
+
       # A membership change reports success once its entry is durable, and
       # under a steady stream of Flow writes the durable position only moves
       # in steps behind the newest one.

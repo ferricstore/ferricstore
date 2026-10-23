@@ -445,10 +445,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
               position_index(Map.get(handle, :persisted_position, @zero_pos)) ->
             {:ok, take_durable_candidate(handle)}
 
-          replay_dependencies_ready?(%{
-            handle
-            | replay_dependencies: candidate.replay_dependencies
-          }) ->
+          durable_candidate_ready?(handle, candidate) ->
             with :ok <- PromotedFileSync.sync(Map.get(handle, :promoted_sync)),
                  :ok <- persist_storage_metadata(handle.root_dir, candidate.metadata, :normal) do
               {:ok,
@@ -470,25 +467,44 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       defp persist_durable_candidate(handle), do: {:ok, take_durable_candidate(handle)}
 
       defp take_durable_candidate(handle) do
+        now_ms = System.monotonic_time(:millisecond)
+
         candidate = %{
           position: handle.position,
           replay_dependencies:
             Map.get(handle, :replay_dependencies, replay_dependency_defaults()),
           metadata: storage_metadata(handle),
-          requested_at_ms: System.monotonic_time(:millisecond)
+          requested_at_ms: now_ms
         }
 
         handle
         |> Map.put(:durable_candidate, candidate)
+        |> Map.put(:durable_candidate_taken_at_ms, now_ms)
         |> request_candidate_dependencies(candidate)
       end
+
+      defp maybe_take_durable_candidate(handle) do
+        now_ms = System.monotonic_time(:millisecond)
+        taken_at_ms = Map.get(handle, :durable_candidate_taken_at_ms)
+
+        if is_nil(taken_at_ms) or now_ms - taken_at_ms >= @durable_candidate_interval_ms,
+          do: take_durable_candidate(handle),
+          else: handle
+      end
+
+      defp durable_candidate_ready?(handle, candidate),
+        do:
+          replay_dependencies_ready?(%{
+            handle
+            | replay_dependencies: candidate.replay_dependencies
+          })
 
       # A request can be lost (a projector restarting, say), so a waiting
       # candidate asks again, but not on every apply.
       defp maybe_rerequest_durable_candidate(handle, candidate) do
         now_ms = System.monotonic_time(:millisecond)
 
-        if now_ms - candidate.requested_at_ms >= @durable_candidate_rerequest_ms do
+        if now_ms - candidate.requested_at_ms >= @durable_candidate_interval_ms do
           candidate = %{candidate | requested_at_ms: now_ms}
 
           handle
@@ -529,17 +545,40 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       end
 
       defp maybe_mark_clean_position(%{bitcask_dirty?: false, position: position} = handle) do
-        if replay_dependencies_ready?(handle) and
-             PromotedFileSync.synced?(Map.get(handle, :promoted_sync)) do
+        synced? = PromotedFileSync.synced?(Map.get(handle, :promoted_sync))
+
+        if synced? and replay_dependencies_ready?(handle) do
           handle
           |> Map.put(:last_clean_position, position)
+          |> Map.delete(:durable_candidate)
           |> clear_replay_dependencies()
         else
-          handle
+          follow_durable_candidate(handle, synced?)
         end
       end
 
       defp maybe_mark_clean_position(handle), do: handle
+
+      # Between metadata persists the clean (durable) position follows a
+      # candidate as well, so what waits on it, a membership change for one,
+      # waits for the projector rather than for the persist cadence.
+      defp follow_durable_candidate(%{durable_candidate: candidate} = handle, synced?)
+           when is_map(candidate) do
+        if synced? and durable_candidate_ready?(handle, candidate) do
+          handle
+          |> Map.update(
+            :last_clean_position,
+            candidate.position,
+            &max_raft_position(&1, candidate.position)
+          )
+          |> Map.delete(:durable_candidate)
+          |> maybe_take_durable_candidate()
+        else
+          maybe_rerequest_durable_candidate(handle, candidate)
+        end
+      end
+
+      defp follow_durable_candidate(handle, _synced?), do: maybe_take_durable_candidate(handle)
 
       defp storage_metadata_persist_due?(new_handle) do
         position_gap_due?(
