@@ -512,10 +512,21 @@ defmodule Ferricstore.Flow.Schedule do
     case plan_schedule_fire(definition, target_id, due_at_ms, fire_count, now_ms) do
       {:ok, plan} ->
         with :ok <- create_target(ctx, definition, target_id, now_ms),
+             :ok <-
+               Ferricstore.FaultInjection.maybe_pause(:schedule_fire_after_target, %{
+                 schedule_id: Map.fetch!(definition, :id)
+               }),
              {:ok, coalesced_count} <-
                apply_schedule_fire_plan(ctx, record, plan, now_ms) do
           emit_schedule_event(ctx, record, definition, now_ms, @schedule_event_fired)
           {:ok, target_id, coalesced_count}
+        else
+          {:error, reason} = error when not is_binary(reason) ->
+            release_schedule_fire(ctx, record, definition, due_at_ms, now_ms)
+            error
+
+          error ->
+            error
         end
 
       {:error, reason} when is_binary(reason) ->
@@ -524,6 +535,28 @@ defmodule Ferricstore.Flow.Schedule do
       {:error, _reason} = error ->
         error
     end
+  end
+
+  # A fire that failed part-way (a leader change, a write that timed out)
+  # hands the schedule back at once instead of holding it for the whole
+  # lease; the next poll fires it again under the same target id, which
+  # creates nothing twice. A refusal (an error message) keeps the lease as
+  # its backoff. If the failed fire did commit, the stale lease refuses this.
+  defp release_schedule_fire(ctx, record, definition, due_at_ms, now_ms) do
+    Flow.reschedule(
+      ctx,
+      Map.fetch!(record, :id),
+      Map.fetch!(record, :lease_token),
+      Internal.put(
+        state: @active_state,
+        partition_key: Map.get(record, :partition_key),
+        fencing_token: Map.fetch!(record, :fencing_token),
+        payload: definition,
+        run_at_ms: due_at_ms,
+        history_max_events: history_max_events(),
+        now_ms: now_ms
+      )
+    )
   end
 
   defp execute_manual_schedule_fire(

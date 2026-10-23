@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A Flow schedule whose fire failed part-way, as when the shard's leader
+  changed or a write timed out, stayed claimed for the whole 30 s lease, so
+  it did not fire again until the lease expired. It is now handed back at
+  once and the next scheduler poll fires it (under the same target id, so
+  nothing is created twice). Refusals with an error message keep the lease
+  as their backoff. In a 3-node test with leadership moving every 300 ms, an
+  every-400 ms schedule fired 12 times in 14 s instead of 2.
 - A read of a hash field, set member or sorted-set member whose cold value
   could not be read where the keydir pointed retried the row, and when that
   retry met the clock-drift guard (the node's clock ahead of wall time and
