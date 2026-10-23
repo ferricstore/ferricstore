@@ -630,7 +630,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
             flow_history_event_fields(state, record, to_event, Map.get(attrs, :partition_key))
 
           is_binary(entry) and flow_history_event_retained?(record, to_event) ->
-            fields = entry |> flow_decode_history_fields(record) |> flow_history_fields_to_map()
+            fields = flow_rewind_entry_fields(entry, record)
 
             if to_string(Map.get(fields, "version")) ==
                  Integer.to_string(Ferricstore.Flow.HistoryEvent.version(to_event)),
@@ -640,6 +640,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
           true ->
             {:error, "ERR flow rewind target event not found"}
         end
+      end
+
+      # The entry came through Raft, so every replica decodes it: one that does not
+      # decode is refused everywhere rather than raising in every apply.
+      defp flow_rewind_entry_fields(entry, record) do
+        entry |> flow_decode_history_fields(record) |> flow_history_fields_to_map()
+      rescue
+        _invalid -> %{}
       end
 
       # A Flow's events carry consecutive versions, and the history projectors

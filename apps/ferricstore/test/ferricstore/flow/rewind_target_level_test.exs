@@ -72,6 +72,28 @@ defmodule Ferricstore.Flow.RewindTargetLevelTest do
     end
   end
 
+  test "apply refuses a target entry that does not decode" do
+    {id, _projector} = waiting_flow(10)
+    signal(id, 1)
+
+    attrs = %{
+      id: id,
+      to_event: "1001-2",
+      expected_version: nil,
+      expect_state: nil,
+      run_at_ms: nil,
+      reason_ref: nil,
+      partition_key: nil,
+      now_ms: 9_000,
+      target_entry: "not a history entry"
+    }
+
+    assert {:error, "ERR flow rewind target event not found"} =
+             Router.flow_rewind(FerricStore.Instance.get(:default), attrs)
+
+    assert {:ok, %{version: 2}} = FerricStore.flow_get(id)
+  end
+
   test "a rewind restores a cold event of a partitioned Flow" do
     ctx = FerricStore.Instance.get(:default)
     id = "rewind-cold-#{System.unique_integer([:positive])}"
