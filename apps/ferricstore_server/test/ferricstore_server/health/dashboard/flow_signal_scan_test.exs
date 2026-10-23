@@ -5,6 +5,9 @@ defmodule FerricstoreServer.Health.Dashboard.FlowSignalScanTest do
 
   setup do
     {:ok, _} = Application.ensure_all_started(:ferricstore_server)
+    # The page samples a bounded number of Flow records from the whole store, so
+    # Flows other tests left behind could crowd this test's out of the sample.
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
     previous_history = Application.get_env(:ferricstore, :flow_dashboard_flow_history_fun)
     previous_limit = Application.get_env(:ferricstore, :flow_dashboard_signal_scan_max_flows)
 
@@ -34,11 +37,6 @@ defmodule FerricstoreServer.Health.Dashboard.FlowSignalScanTest do
 
         id
       end)
-
-    # The dashboard samples Flows from the LMDB mirror, which projects them
-    # asynchronously.
-    ctx = FerricStore.Instance.get(:default)
-    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(:default, ctx.shard_count, 30_000)
 
     Application.put_env(:ferricstore, :flow_dashboard_signal_scan_max_flows, 4)
 
