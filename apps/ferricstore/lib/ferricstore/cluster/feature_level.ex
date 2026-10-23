@@ -62,7 +62,9 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    which no OTP release changes (older ones still match their retries).
   #    A rewind carries its target event's stored entry
   #    (`Ferricstore.Flow.RewindTarget`) instead of apply reading the
-  #    node-local history.
+  #    node-local history. A create batch holding an idempotent retry and a
+  #    rewind's value refresh read values the history projector moved to the
+  #    LMDB mirror.
   @supported 5
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

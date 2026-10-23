@@ -676,7 +676,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
             flow_create_apply_new_record(state, attrs, state_key)
 
           existing ->
-            case flow_create_duplicate_result(state, existing, attrs) do
+            value_reads = flow_create_value_reads(state, cross_shard_pending_active?())
+
+            case flow_create_duplicate_result(state, existing, attrs, value_reads) do
               {:ok, _existing} -> :ok
               {:error, _reason} = error -> error
             end

@@ -24,7 +24,9 @@ All notable changes to FerricStore will be documented here.
   applied on nodes whose projector lagged. A rewind that restarted a
   record's retention also skipped such values, so they could expire before
   their record. Apply now reads a record's values through the mirror too, as
-  Flow reads do.
+  Flow reads do: for a retry alone at any level, and from feature level 5
+  where the answer decides what else is written (a batch with new records, a
+  cross-shard transaction, a rewind's value refresh).
 - A Flow signal's idempotency digest and a child group's request hash are
   stored and compared on every replica, and were computed with
   `term_to_binary`, whose output changes between OTP releases (OTP 26

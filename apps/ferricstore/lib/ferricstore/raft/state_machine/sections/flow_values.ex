@@ -500,7 +500,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
           |> Enum.map(fn kind -> Map.get(record, flow_value_ref_field(kind)) end)
           |> Enum.filter(&flow_owned_value_ref?/1)
 
-        values = flow_record_value_batch_get(state, refs)
+        # Older releases refresh only values still in the keydir.
+        values =
+          if feature_level_5?(state),
+            do: flow_record_value_batch_get(state, refs),
+            else: sm_store_batch_get(state, refs, &sm_file_path/2)
+
         expire_at_ms = flow_record_expire_at(record)
 
         refs

@@ -601,6 +601,9 @@ shard_0: 2
     - A Flow rewind carries its target event, so every replica restores the
       same event or refuses it alike; only events within the Flow's history
       cap can be restored.
+    - A Flow create batch holding an idempotent retry, and a rewind's value
+      refresh, find values the history projector has moved to the LMDB
+      mirror, so replicas agree however far their projectors have got.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.
