@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A read of a hash field, set member or sorted-set member whose cold value
+  could not be read where the keydir pointed retried the row, and when that
+  retry met the clock-drift guard (the node's clock ahead of wall time and
+  the row now carrying a TTL) the read raised CaseClauseError instead of
+  answering the drift failure. It now answers it.
 - A single command past the per-command apply bound (4,096 members by
   default), such as RPUSH, HDEL, HEXPIRE, HPEXPIRE, HGETDEL, HGETEX or HSETEX
   with more elements or fields than that, answered the internal reason
