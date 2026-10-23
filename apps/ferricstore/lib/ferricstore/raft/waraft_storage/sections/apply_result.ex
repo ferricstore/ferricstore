@@ -429,8 +429,80 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
           true ->
             # Keep the release/persist boundary behind undurable projection data,
             # but do not spill that data synchronously from the WARaft apply path.
-            {:ok, request_replay_dependencies_async(new_handle)}
+            persist_durable_candidate(new_handle)
         end
+      end
+
+      # Under a steady stream of Flow writes the newest position always waits
+      # for history the projector writes a little later, so it is never ready.
+      # A candidate remembers one position with the metadata and dependencies
+      # it had then; once those are durable that position is persisted and a
+      # new candidate is taken, so the replay cursor advances in steps.
+      defp persist_durable_candidate(%{durable_candidate: candidate} = handle)
+           when is_map(candidate) do
+        cond do
+          position_index(candidate.position) <=
+              position_index(Map.get(handle, :persisted_position, @zero_pos)) ->
+            {:ok, take_durable_candidate(handle)}
+
+          replay_dependencies_ready?(%{
+            handle
+            | replay_dependencies: candidate.replay_dependencies
+          }) ->
+            with :ok <- PromotedFileSync.sync(Map.get(handle, :promoted_sync)),
+                 :ok <- persist_storage_metadata(handle.root_dir, candidate.metadata, :normal) do
+              {:ok,
+               handle
+               |> Map.put(:persisted_position, candidate.position)
+               |> Map.update(
+                 :last_clean_position,
+                 candidate.position,
+                 &max_raft_position(&1, candidate.position)
+               )
+               |> take_durable_candidate()}
+            end
+
+          true ->
+            {:ok, maybe_rerequest_durable_candidate(handle, candidate)}
+        end
+      end
+
+      defp persist_durable_candidate(handle), do: {:ok, take_durable_candidate(handle)}
+
+      defp take_durable_candidate(handle) do
+        candidate = %{
+          position: handle.position,
+          replay_dependencies:
+            Map.get(handle, :replay_dependencies, replay_dependency_defaults()),
+          metadata: storage_metadata(handle),
+          requested_at_ms: System.monotonic_time(:millisecond)
+        }
+
+        handle
+        |> Map.put(:durable_candidate, candidate)
+        |> request_candidate_dependencies(candidate)
+      end
+
+      # A request can be lost (a projector restarting, say), so a waiting
+      # candidate asks again, but not on every apply.
+      defp maybe_rerequest_durable_candidate(handle, candidate) do
+        now_ms = System.monotonic_time(:millisecond)
+
+        if now_ms - candidate.requested_at_ms >= @durable_candidate_rerequest_ms do
+          candidate = %{candidate | requested_at_ms: now_ms}
+
+          handle
+          |> Map.put(:durable_candidate, candidate)
+          |> request_candidate_dependencies(candidate)
+        else
+          handle
+        end
+      end
+
+      defp request_candidate_dependencies(handle, candidate) do
+        %{handle | replay_dependencies: candidate.replay_dependencies}
+        |> request_replay_dependencies_async()
+        |> Map.put(:replay_dependencies, handle.replay_dependencies)
       end
 
       defp persist_ready_hot_metadata(new_handle) do
@@ -446,6 +518,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
         handle
         |> Map.put(:persisted_position, position)
         |> Map.put(:last_clean_position, position)
+        |> Map.delete(:durable_candidate)
         |> clear_replay_dependencies()
       end
 

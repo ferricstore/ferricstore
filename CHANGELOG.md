@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Under a steady stream of Flow writes the shard's replay position never
+  advanced: it waited until the history of the newest write was projected,
+  and every write added newer history. A crash then replayed everything since
+  the stream began, a membership change waited for it until it timed out,
+  and every write asked the projector to catch up. The position now advances
+  in steps to the last one whose history is written, with one request per
+  step; in a single-node test, Flow create throughput rose about 3.5 times.
 - In a cluster, a node restarted after a crash could permanently lose the
   history of the Flow writes it applied just before stopping, and keep those
   Flows only in its cold LMDB mirror. On restart a node re-applies the log
