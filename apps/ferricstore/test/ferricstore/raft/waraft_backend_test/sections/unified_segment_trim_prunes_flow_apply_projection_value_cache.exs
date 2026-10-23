@@ -1885,6 +1885,51 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
         end
       end
 
+      # Pre-vote keeps a node that lost contact from disrupting a healthy leader
+      # when it returns; it is off unless configured.
+      test "WARaft pre-vote follows the election_pre_vote option", %{ctx: ctx} do
+        previous = Application.get_env(:ferricstore_waraft_backend, :raft_election_pre_vote)
+
+        try do
+          assert :ok =
+                   WARaftBackend.start(ctx,
+                     log_module: :ferricstore_waraft_spike_segment_log,
+                     election_pre_vote: true
+                   )
+
+          assert Application.get_env(:ferricstore_waraft_backend, :raft_election_pre_vote) ==
+                   true
+        after
+          if previous == nil,
+            do: Application.delete_env(:ferricstore_waraft_backend, :raft_election_pre_vote),
+            else:
+              Application.put_env(:ferricstore_waraft_backend, :raft_election_pre_vote, previous)
+        end
+      end
+
+      test "WARaft pre-vote is off by default", %{ctx: ctx} do
+        previous = Application.get_env(:ferricstore, :waraft_election_pre_vote)
+
+        try do
+          Application.delete_env(:ferricstore, :waraft_election_pre_vote)
+          assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          assert Application.get_env(:ferricstore_waraft_backend, :raft_election_pre_vote) ==
+                   false
+        after
+          restore_env(:waraft_election_pre_vote, previous)
+        end
+      end
+
+      test "an invalid WARaft pre-vote setting fails closed before partition start", %{ctx: ctx} do
+        assert_raise ArgumentError, ~r/election_pre_vote.*boolean/, fn ->
+          WARaftBackend.start(ctx,
+            log_module: :ferricstore_waraft_spike_segment_log,
+            election_pre_vote: "yes"
+          )
+        end
+      end
+
       test "invalid WARaft queue and commit knobs fail closed before partition start", %{ctx: ctx} do
         previous_pending = Application.get_env(:ferricstore, :waraft_max_pending_reads)
         existing_sup = Process.whereis(:raft_sup_ferricstore_waraft_backend_1)

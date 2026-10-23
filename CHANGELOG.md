@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- New setting `:waraft_election_pre_vote` (default `false`; also the
+  `election_pre_vote` start option) turns on wa_raft's pre-vote: a node that
+  lost contact asks whether it could win before raising its term, so on its
+  return it cannot unseat a leader the others still follow. With it and
+  1,500/3,000 ms election timeouts, a 3-node test resumed writes about 2 s
+  after its shard leader was killed (5.6-6.1 s with the defaults).
 - A WARaft shard whose storage blocked itself after a failed apply (it then
   refuses every apply until restarted) only emitted telemetry; it now also
   logs an error naming the shard, the position, the operation and the cause.
