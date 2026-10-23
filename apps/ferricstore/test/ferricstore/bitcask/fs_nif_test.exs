@@ -336,6 +336,53 @@ defmodule Ferricstore.Bitcask.FsNifTest do
     end
   end
 
+  describe "fs_lstat_many/1" do
+    # The segment log compares these identities with ones taken through
+    # prim_file, which keeps device and inode as 32-bit values.
+    test "reports each path as file:read_link_info/2 does, without following links", %{
+      tmp: tmp
+    } do
+      file = Path.join(tmp, "0.seg")
+      link = Path.join(tmp, "link")
+      File.write!(file, "twelve bytes")
+      :ok = File.ln_s(file, link)
+
+      assert [file_entry, link_entry, dir_entry] = NIF.fs_lstat_many([file, link, tmp])
+
+      for {path, {:ok, type, device, inode, size}} <- [
+            {file, file_entry},
+            {link, link_entry},
+            {tmp, dir_entry}
+          ] do
+        {:ok, info} = :file.read_link_info(String.to_charlist(path), [:raw, {:time, :posix}])
+
+        assert {type, device, inode, size} ==
+                 {elem(info, 2), elem(info, 9), elem(info, 11), elem(info, 1)}
+      end
+
+      assert {:ok, :regular, _, _, 12} = file_entry
+      assert {:ok, :symlink, _, _, _} = link_entry
+      assert {:ok, :directory, _, _, _} = dir_entry
+    end
+
+    test "reports the posix error file:read_link_info/2 reports", %{tmp: tmp} do
+      file = Path.join(tmp, "file")
+      File.write!(file, "x")
+
+      assert [{:error, :enoent}, {:error, :enotdir}] =
+               NIF.fs_lstat_many([Path.join(tmp, "missing"), Path.join(file, "child")])
+
+      assert {:error, :enoent} =
+               :file.read_link_info(String.to_charlist(Path.join(tmp, "missing")), [:raw])
+
+      assert {:error, :enotdir} =
+               :file.read_link_info(String.to_charlist(Path.join(file, "child")), [:raw])
+
+      assert [{:error, :einval}] = NIF.fs_lstat_many(["bad\0path"])
+      assert [] = NIF.fs_lstat_many([])
+    end
+  end
+
   describe "fs_ls/1" do
     test "lists entries (names only)", %{tmp: tmp} do
       File.write!(Path.join(tmp, "one"), "")

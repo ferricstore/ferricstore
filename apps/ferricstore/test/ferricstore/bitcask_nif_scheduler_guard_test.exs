@@ -83,6 +83,7 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
     fs_ls
     fs_read_nofollow
     fs_read_private_nofollow
+    fs_lstat_many
     fs_copy_sync_nofollow
     fs_copy_replace_sync_nofollow
     fs_hard_link_replace_sync_nofollow
