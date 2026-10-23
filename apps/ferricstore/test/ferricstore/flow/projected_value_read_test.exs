@@ -58,6 +58,45 @@ defmodule Ferricstore.Flow.ProjectedValueReadTest do
     assert Enum.count(calls, &(&1 == :read_values)) in 1..2
   end
 
+  # A value the mirror locates but cannot read is a storage failure, not a value
+  # that is gone.
+  test "an unreadable projected value is reported, not read as missing" do
+    ctx = Ferricstore.Test.IsolatedInstance.checkout()
+    on_exit(fn -> Ferricstore.Test.IsolatedInstance.checkin(ctx) end)
+    id = "projected-unreadable-read-#{System.unique_integer([:positive])}"
+
+    assert :ok =
+             FerricStore.Impl.flow_create(ctx, id,
+               type: "projected-unreadable-read",
+               state: "queued",
+               payload: "kept payload",
+               run_at_ms: 1_000,
+               now_ms: 10
+             )
+
+    assert {:ok, %{payload_ref: ref}} = FerricStore.Impl.flow_get(ctx, id, [])
+    shard_index = Router.shard_for(ctx, ref)
+    projected!(ctx, shard_index, [ref])
+
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, shard_index)
+    assert {:ok, blob} = Ferricstore.Flow.LMDB.get(Ferricstore.Flow.LMDB.path(shard_path), ref)
+
+    assert {:ok, {:flow_value_locator, 1, _expire, {:flow_history, file_id}, offset, _size}} =
+             Ferricstore.TermCodec.decode(blob)
+
+    log = Path.join([shard_path, "history", String.pad_leading("#{file_id}", 5, "0") <> ".log"])
+    {:ok, file} = :file.open(log, [:read, :write, :binary])
+    :ok = :file.pwrite(file, offset, :binary.copy(<<0xFF>>, 8))
+    :ok = :file.close(file)
+
+    assert {:error, "ERR storage read failed"} = ValueStore.value_mget(ctx, [ref])
+
+    assert {:ok, %{payload_error: "ERR storage read failed"} = record} =
+             FerricStore.Impl.flow_get(ctx, id, payload: true)
+
+    refute Map.has_key?(record, :payload)
+  end
+
   defp collect_calls(acc) do
     receive do
       {:trace, _pid, :call, {HistoryProjector, function, _args}} ->

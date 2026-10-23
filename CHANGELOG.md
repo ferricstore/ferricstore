@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A Flow value that the history projector had moved to its history log and
+  that could not be read there was answered as missing: no payload on
+  FLOW.GET, nil from FLOW.VALUE.MGET. It is now reported as a storage read
+  failure (`payload_error`, "ERR storage read failed"), as an unreadable
+  value still in the keydir is.
 - Flow values the history projector has moved to its history log are read in
   one call per log for a batch (value MGET, claim and history hydration,
   export) instead of opening the log once per value: 2,000 such payloads
