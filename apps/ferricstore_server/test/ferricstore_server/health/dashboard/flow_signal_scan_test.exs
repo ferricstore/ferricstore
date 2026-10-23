@@ -35,6 +35,11 @@ defmodule FerricstoreServer.Health.Dashboard.FlowSignalScanTest do
         id
       end)
 
+    # The dashboard samples Flows from the LMDB mirror, which projects them
+    # asynchronously.
+    ctx = FerricStore.Instance.get(:default)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(:default, ctx.shard_count, 30_000)
+
     Application.put_env(:ferricstore, :flow_dashboard_signal_scan_max_flows, 4)
 
     Application.put_env(:ferricstore, :flow_dashboard_flow_history_fun, fn id, _opts ->
