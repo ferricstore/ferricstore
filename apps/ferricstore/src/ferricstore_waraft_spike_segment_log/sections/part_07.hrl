@@ -93,7 +93,7 @@ reset_offset_indexes_for_dir(Dir) ->
                                 case parse_segment_ordinal(filename:basename(File, ".idx")) of
                                     {ok, _Ordinal} ->
                                         Path = filename:join(Dir, File),
-                                        case file:read_link_info(Path, [raw]) of
+                                        case file:read_link_info(Path, ?STAT_OPTS) of
                                             {ok, #file_info{type = regular}} -> file:delete(Path);
                                             {ok, #file_info{type = Type}} -> {error, {unsafe_offset_index_path, Type}};
                                             {error, _Reason} = Error -> Error
@@ -142,7 +142,7 @@ prune_offset_index_files(Dir, BeforeOrdinal) ->
                             case parse_segment_ordinal(filename:basename(File, ".idx")) of
                                 {ok, Ordinal} when Ordinal < BeforeOrdinal ->
                                     Path = filename:join(Dir, File),
-                                    case file:read_link_info(Path, [raw]) of
+                                    case file:read_link_info(Path, ?STAT_OPTS) of
                                         {ok, #file_info{type = regular}} -> file:delete(Path);
                                         _Unsafe -> {error, unsafe_offset_index_path}
                                     end;
@@ -267,7 +267,7 @@ flush_offset_index_rows(Fd, Start, Buffer) ->
     file:pwrite(Fd, Start, lists:reverse(Buffer)).
 
 open_offset_index_for_write(Path) ->
-    case file:read_link_info(Path, [raw]) of
+    case file:read_link_info(Path, ?STAT_OPTS) of
         {ok, #file_info{type = regular}} ->
             open_verified_segment_file(Path, [read, write, raw, binary]);
         {ok, #file_info{type = Type}} ->
@@ -548,7 +548,7 @@ await_segment_writer_idle(Dir) ->
 %% opens a replacement.
 track_segment_fd(Key, Fd) ->
     Identity =
-        case file:read_file_info(Fd, [raw]) of
+        case file:read_file_info(Fd, ?STAT_OPTS) of
             {ok, Info} -> file_identity(Info);
             {error, _Reason} -> unknown
         end,
@@ -573,7 +573,7 @@ close_tracked_segment_fd(Key) ->
 tracked_segment_fd_current(Key, Path, Fd) ->
     case get({?MODULE, segment_fd, Key}) of
         {Fd, Identity} when Identity =/= unknown ->
-            case file:read_link_info(Path, [raw]) of
+            case file:read_link_info(Path, ?STAT_OPTS) of
                 {ok, #file_info{type = regular} = Info} -> file_identity(Info) =:= Identity;
                 _Missing -> false
             end;
@@ -624,7 +624,7 @@ with_cached_offset_index_fd(Path, Fun) ->
 cached_offset_index_fd(Path) ->
     case get({?MODULE, offset_index_fd}) of
         {Path, Fd, Identity} ->
-            case file:read_link_info(Path, [raw]) of
+            case file:read_link_info(Path, ?STAT_OPTS) of
                 {ok, #file_info{type = regular} = Info} ->
                     case file_identity(Info) of
                         Identity -> {ok, Fd};
@@ -641,7 +641,7 @@ reopen_cached_offset_index_fd(Path) ->
     ok = drop_cached_offset_index_fd(),
     case open_offset_index_for_write(Path) of
         {ok, Fd} ->
-            case file:read_file_info(Fd, [raw]) of
+            case file:read_file_info(Fd, ?STAT_OPTS) of
                 {ok, Info} ->
                     _ = put({?MODULE, offset_index_fd}, {Path, Fd, file_identity(Info)}),
                     {ok, Fd};

@@ -117,8 +117,9 @@ defmodule Ferricstore.Raft.WARaftStorageHotPathGuardTest do
     assert String.split(open_source, "validate_open_segment_file(Path, Fd)", parts: 2)
            |> hd() =~ "file:open(Path"
 
-    assert source =~ "file:read_file_info(Fd, [raw])"
-    assert source =~ "file:read_link_info(Path, [raw])"
+    assert source =~ "-define(STAT_OPTS, [raw, {time, posix}])."
+    assert source =~ "file:read_file_info(Fd, ?STAT_OPTS)"
+    assert source =~ "file:read_link_info(Path, ?STAT_OPTS)"
   end
 
   test "segment recovery and truncation verify descriptor identity after open" do

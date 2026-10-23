@@ -398,25 +398,15 @@ clear_logical_trim_floor_cache(Dir) ->
 write_records(_Dir, []) ->
     ok;
 write_records(Dir, Records) ->
-    case validate_segment_log_dir(Dir) of
+    case ensure_segment_log_dir_for_append(Dir) of
         ok ->
             case check_append_failure_marker(Dir) of
                 ok ->
-                    case metadata_ensure_dir(filename:join(Dir, "dummy")) of
-                        ok ->
-                            case validate_segment_log_dir(Dir) of
-                                ok ->
-                                    case records_per_segment(Dir) of
-                                        {ok, RecordsPerSegment} ->
-                                            write_records_with_segment_size(Dir, Records, RecordsPerSegment);
-                                        {error, _Reason} = Error ->
-                                            Error
-                                    end;
-                                {error, _Reason} = Error ->
-                                    Error
-                            end;
-                        {error, Reason} ->
-                            {error, {ensure_dir, Reason}}
+                    case records_per_segment(Dir) of
+                        {ok, RecordsPerSegment} ->
+                            write_records_with_segment_size(Dir, Records, RecordsPerSegment);
+                        {error, _Reason} = Error ->
+                            Error
                     end;
                 {error, _Reason} = Error ->
                     Error
@@ -436,25 +426,15 @@ write_records_with_segment_size(Dir, Records, RecordsPerSegment) ->
 write_records_nosync(_Dir, []) ->
     ok;
 write_records_nosync(Dir, Records) ->
-    case validate_segment_log_dir(Dir) of
+    case ensure_segment_log_dir_for_append(Dir) of
         ok ->
             case check_append_failure_marker(Dir) of
                 ok ->
-                    case metadata_ensure_dir(filename:join(Dir, "dummy")) of
-                        ok ->
-                            case validate_segment_log_dir(Dir) of
-                                ok ->
-                                    case records_per_segment(Dir) of
-                                        {ok, RecordsPerSegment} ->
-                                            write_records_nosync_with_segment_size(Dir, Records, RecordsPerSegment);
-                                        {error, _Reason} = Error ->
-                                            Error
-                                    end;
-                                {error, _Reason} = Error ->
-                                    Error
-                            end;
-                        {error, Reason} ->
-                            {error, {ensure_dir, Reason}}
+                    case records_per_segment(Dir) of
+                        {ok, RecordsPerSegment} ->
+                            write_records_nosync_with_segment_size(Dir, Records, RecordsPerSegment);
+                        {error, _Reason} = Error ->
+                            Error
                     end;
                 {error, _Reason} = Error ->
                     Error
@@ -767,7 +747,7 @@ preallocate_keep_size_unavailable(_BinaryPath) ->
     end.
 
 validate_segment_file_for_append(Path) ->
-    case file:read_link_info(Path, [raw]) of
+    case file:read_link_info(Path, ?STAT_OPTS) of
         {ok, #file_info{type = regular}} ->
             ok;
         {ok, #file_info{type = Type}} ->
@@ -779,7 +759,7 @@ validate_segment_file_for_append(Path) ->
     end.
 
 validate_open_segment_file(Path, Fd) ->
-    case {file:read_file_info(Fd, [raw]), file:read_link_info(Path, [raw])} of
+    case {file:read_file_info(Fd, ?STAT_OPTS), file:read_link_info(Path, ?STAT_OPTS)} of
         {{ok, #file_info{
             type = regular,
             major_device = MajorDevice,
@@ -959,7 +939,7 @@ append_failure_marker_path(Dir) ->
 
 check_append_failure_marker(Dir) ->
     Path = append_failure_marker_path(Dir),
-    case file:read_link_info(Path, [raw]) of
+    case file:read_link_info(Path, ?STAT_OPTS) of
         {ok, #file_info{type = regular, size = Size}} when Size =< ?MAX_SEGMENT_METADATA_BYTES ->
             read_append_failure_marker(Path);
         {ok, #file_info{type = regular, size = Size}} ->

@@ -525,7 +525,7 @@ open_disk_reader_file(Dir, Index, ExpectedOrdinal, RecordsPerSegment) ->
             {error, {segment_ordinal_mismatch, Ordinal, ExpectedOrdinal}};
         true ->
             Path = filename:join(Dir, segment_file_from_ordinal(Ordinal)),
-            case file:read_link_info(Path, [raw]) of
+            case file:read_link_info(Path, ?STAT_OPTS) of
                 {ok, #file_info{type = regular, size = FileBytes}} ->
                     case open_verified_segment_file(Path, [read, raw, binary]) of
                         {ok, Fd} ->

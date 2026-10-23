@@ -68,7 +68,7 @@ rewrite_marker_path(Dir) ->
     filename:join(filename:dirname(Dir), filename:basename(Dir) ++ ?REWRITE_MARKER_EXT).
 
 path_exists(Path) ->
-    case file:read_link_info(Path, [raw]) of
+    case file:read_link_info(Path, ?STAT_OPTS) of
         {ok, #file_info{type = directory}} -> true;
         {ok, #file_info{type = Type}} -> {error, {unsafe_rewrite_path, Path, Type}};
         {error, enoent} -> false;
@@ -132,7 +132,7 @@ delete_file_if_exists(Path) ->
 %% Keep the same file_info/type checks; directory creation retains filelib's
 %% ordinary error handling when the parent is not already present.
 metadata_ensure_dir(Path) ->
-    case file:read_link_info(filename:dirname(Path), [raw]) of
+    case file:read_link_info(filename:dirname(Path), ?STAT_OPTS) of
         {ok, #file_info{type = directory}} -> ok;
         _Other -> filelib:ensure_dir(Path)
     end.

@@ -1134,6 +1134,75 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
     )
   end
 
+  # Every stat is a dirty-scheduler round trip on the durable write path, and
+  # a local-time file_info converts three timestamps the checks never read.
+  test "an append stats its segment log directory once and converts no times" do
+    with_segment_log_memory_env(
+      max_bytes: 1_000_000,
+      max_entries: 100_000,
+      min_entries: 1,
+      records_per_segment: 1_000_000,
+      fun: fn _root, log, _log_name ->
+        provider = :ferricstore_waraft_spike_segment_log
+        assert :ok = provider.init(log)
+        assert {:ok, _state} = provider.open(log)
+        dir = :wa_raft_part_sup.registered_partition_path(elem(log, 3), elem(log, 4))
+        log_dir = Path.join(to_string(dir), "segment_log")
+
+        append = fn index ->
+          Task.await(
+            Task.async(fn ->
+              provider.append(
+                {:log_view, log, max(index - 1, 0), index - 1, :undefined},
+                [{1, {:cmd, "entry-#{index}"}}],
+                :strict,
+                :low
+              )
+            end)
+          )
+        end
+
+        assert :ok = append.(1)
+
+        :erlang.trace_pattern({:file, :read_link_info, 2}, true, [:global])
+        :erlang.trace(:all, true, [:call])
+
+        on_exit(fn ->
+          :erlang.trace(:all, false, [:call])
+          :erlang.trace_pattern({:file, :read_link_info, 2}, false, [:global])
+        end)
+
+        for index <- 2..11 do
+          assert :ok = append.(index)
+        end
+
+        :erlang.trace(:all, false, [:call])
+
+        stats =
+          Stream.repeatedly(fn ->
+            receive do
+              {:trace, _pid, :call, {:file, :read_link_info, [path, opts]}} ->
+                {to_string(path), opts}
+            after
+              100 -> :done
+            end
+          end)
+          |> Enum.take_while(&(&1 != :done))
+          # The trace sees every process in the VM; keep only this log's paths.
+          |> Enum.filter(fn {path, _opts} -> String.starts_with?(path, log_dir) end)
+
+        dir_stats = Enum.count(stats, fn {path, _opts} -> path == log_dir end)
+        assert dir_stats == 10, "10 appends statted the log directory #{dir_stats} times"
+
+        assert stats != []
+
+        for {path, opts} <- stats do
+          assert {:time, :posix} in opts, "#{path} was statted with local times: #{inspect(opts)}"
+        end
+      end
+    )
+  end
+
   test "killing an append's caller stops its in-flight segment write" do
     previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_file_sync_hook)
     handler_id = {__MODULE__, :killed_append_caller, make_ref()}
