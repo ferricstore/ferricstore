@@ -1422,7 +1422,8 @@ defmodule Ferricstore.Flow do
 
     result =
       with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.rewind_attrs(id, opts),
-           {:ok, attrs} <- ScopeBinding.bind_mutation(ctx, :rewind, attrs) do
+           {:ok, attrs} <- ScopeBinding.bind_mutation(ctx, :rewind, attrs),
+           {:ok, attrs} <- Ferricstore.Flow.RewindTarget.attach(ctx, attrs) do
         ctx
         |> Router.flow_rewind(attrs)
         |> maybe_notify_claim_waiters(attrs, :any)

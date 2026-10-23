@@ -598,6 +598,9 @@ shard_0: 2
     - Flow signal idempotency digests and child group request hashes no
       longer depend on the OTP release, so a rolling OTP upgrade cannot make
       replicas disagree on a retried signal or spawn.
+    - A Flow rewind carries its target event, so every replica restores the
+      same event or refuses it alike; only events within the Flow's history
+      cap can be restored.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.

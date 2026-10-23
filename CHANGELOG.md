@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A Flow rewind looked its target event up in the node's own history, which
+  the history projector writes and trims outside Raft. A rewind to an event
+  just written failed where the projector had not caught up yet, and a
+  rewind to an event past the history cap still applied where the projector
+  had not trimmed it, so replicas could disagree. From feature level 5 the
+  rewind reads its target before it is proposed and carries it; apply
+  restores only events within the record's history cap.
 - An idempotent Flow create retried with a payload could be refused as an
   idempotency conflict. Once a node's history projector has projected a
   Flow value it removes the value's keydir row and the shard's LMDB mirror

@@ -60,6 +60,9 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    node-local storage tokens. Flow signal idempotency digests and child
   #    group request hashes are stored as `Ferricstore.CanonicalTerm` digests,
   #    which no OTP release changes (older ones still match their retries).
+  #    A rewind carries its target event's stored entry
+  #    (`Ferricstore.Flow.RewindTarget`) instead of apply reading the
+  #    node-local history.
   @supported 5
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"
