@@ -505,12 +505,16 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.LeaderWait do
         raise ArgumentError, "#{inspect(source)} must be a module atom, got: #{inspect(module)}"
       end
 
+      # A follower starts an election after 1.5-3 s without its leader: at the
+      # 120 ms heartbeat that is a dozen heartbeats missed in a row, and a
+      # killed leader's shard takes writes again about 2 s later. Clusters with
+      # slow shared disks or replicas across regions raise both bounds.
       defp election_options!(opts) do
         {timeout_source, timeout_value} =
-          config_option(opts, :election_timeout_ms, :waraft_election_timeout_ms, 5_000)
+          config_option(opts, :election_timeout_ms, :waraft_election_timeout_ms, 1_500)
 
         {timeout_max_source, timeout_max_value} =
-          config_option(opts, :election_timeout_ms_max, :waraft_election_timeout_ms_max, 7_500)
+          config_option(opts, :election_timeout_ms_max, :waraft_election_timeout_ms_max, 3_000)
 
         timeout_ms = positive_integer_option!(timeout_source, timeout_value)
         timeout_ms_max = positive_integer_option!(timeout_max_source, timeout_max_value)
@@ -521,9 +525,10 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.LeaderWait do
         end
 
         # Pre-vote (Raft thesis 9.6): a node that lost contact asks whether it
-        # could win before it raises its term, so on its return it cannot unseat
-        # a leader the others still follow.
-        pre_vote = boolean_option(opts, :election_pre_vote, :waraft_election_pre_vote, false)
+        # could win before it raises its term, and a follower grants that only
+        # once it has itself missed the leader for the minimum timeout. A node
+        # that stalled or was cut off cannot unseat a leader the others follow.
+        pre_vote = boolean_option(opts, :election_pre_vote, :waraft_election_pre_vote, true)
 
         %{timeout_ms: timeout_ms, timeout_ms_max: timeout_ms_max, pre_vote: pre_vote}
       end

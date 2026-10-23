@@ -83,6 +83,40 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.NumericAppendExpiringStrin
         end
       end
 
+      # Startup promotes a lone node straight to leader, but a Raft server that
+      # crashes comes back from its supervisor as a follower and must win an
+      # election. With pre-vote it first asks its peers whether it could win,
+      # and a shard's only member has none to ask.
+      test "a single-node shard elects itself after its Raft server restarts with pre-vote on",
+           %{root: root} do
+        ctx = build_ctx(Path.join(root, "pre-vote-restart"), shard_count: 1)
+        opts = [log_module: :ferricstore_waraft_spike_segment_log, election_pre_vote: true]
+
+        try do
+          assert :ok = WARaftBackend.start(ctx, opts)
+          assert :ok = Router.put(ctx, "pre-vote:before", "1", 0)
+
+          server =
+            Process.whereis(:wa_raft_server.registered_name(:ferricstore_waraft_backend, 1))
+
+          monitor = Process.monitor(server)
+          Process.exit(server, :kill)
+          assert_receive {:DOWN, ^monitor, :process, ^server, :killed}, 5_000
+
+          Ferricstore.Test.ShardHelpers.eventually(
+            fn -> assert :ok = Router.put(ctx, "pre-vote:after", "2", 0) end,
+            "the restarted single-node shard should elect itself and take writes",
+            150,
+            100
+          )
+
+          assert "2" == Router.get(ctx, "pre-vote:after")
+        after
+          WARaftBackend.stop()
+          FerricStore.Instance.cleanup(ctx.name)
+        end
+      end
+
       test "Router WARaft backend keeps shard partitions isolated", %{root: root} do
         ctx = build_ctx(Path.join(root, "multi"), shard_count: 4)
 
