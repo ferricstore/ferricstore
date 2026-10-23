@@ -64,6 +64,46 @@ defmodule Ferricstore.Flow.ProjectedValueApplyTest do
     assert {:ok, %{id: ^fresh}} = FerricStore.flow_get(fresh, partition_key: partition)
   end
 
+  # The mirror is derived and per node. One this node cannot read leaves the
+  # decision to the keydir, as before the mirror was read, rather than blocking
+  # the shard's apply.
+  test "an unreadable mirrored payload does not block the shard" do
+    ctx = Ferricstore.Test.IsolatedInstance.checkout()
+    on_exit(fn -> Ferricstore.Test.IsolatedInstance.checkin(ctx) end)
+    id = "projected-unreadable-#{System.unique_integer([:positive])}"
+
+    opts = [
+      type: "projected-unreadable",
+      state: "queued",
+      payload: "kept payload",
+      run_at_ms: 1_000,
+      now_ms: 10,
+      idempotent: true
+    ]
+
+    assert :ok = FerricStore.Impl.flow_create(ctx, id, opts)
+    assert {:ok, %{payload_ref: ref}} = FerricStore.Impl.flow_get(ctx, id, [])
+    projected!(ctx, ref)
+
+    shard_index = Router.shard_for(ctx, ref)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, shard_index)
+    assert {:ok, blob} = Ferricstore.Flow.LMDB.get(Ferricstore.Flow.LMDB.path(shard_path), ref)
+
+    assert {:ok, {:flow_value_locator, 1, _expire, {:flow_history, file_id}, offset, _size}} =
+             Ferricstore.TermCodec.decode(blob)
+
+    log = Path.join([shard_path, "history", String.pad_leading("#{file_id}", 5, "0") <> ".log"])
+    {:ok, file} = :file.open(log, [:read, :write, :binary])
+    :ok = :file.pwrite(file, offset, :binary.copy(<<0xFF>>, 8))
+    :ok = :file.close(file)
+
+    assert {:error, "ERR flow idempotency conflict"} =
+             FerricStore.Impl.flow_create(ctx, id, Keyword.put(opts, :now_ms, 20))
+
+    assert :ok =
+             FerricStore.Impl.flow_create(ctx, id <> "-after", Keyword.put(opts, :now_ms, 30))
+  end
+
   # Rewinding to a terminal event restarts the record's retention, and its values
   # must last as long as the record.
   test "a rewind extends a projected value's expiry with its record" do
@@ -126,18 +166,19 @@ defmodule Ferricstore.Flow.ProjectedValueApplyTest do
     end
   end
 
-  defp projected!(ref, attempts \\ 500)
+  defp projected!(ref), do: projected!(FerricStore.Instance.get(:default), ref)
 
-  defp projected!(ref, 0), do: flunk("the projector kept #{ref} in the keydir")
+  defp projected!(ctx, ref, attempts \\ 500)
 
-  defp projected!(ref, attempts) do
-    ctx = FerricStore.Instance.get(:default)
+  defp projected!(_ctx, ref, 0), do: flunk("the projector kept #{ref} in the keydir")
+
+  defp projected!(ctx, ref, attempts) do
     shard_index = Router.shard_for(ctx, ref)
     assert :ok = HistoryProjector.flush(ctx, shard_index)
 
     if :ets.lookup(elem(ctx.keydir_refs, shard_index), ref) != [] do
       Process.sleep(10)
-      projected!(ref, attempts - 1)
+      projected!(ctx, ref, attempts - 1)
     end
   end
 end

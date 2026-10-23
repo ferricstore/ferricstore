@@ -451,7 +451,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
               |> Map.new()
 
             Enum.zip_with(refs, values, fn
-              ref, nil -> flow_projected_value(Map.get(found, ref))
+              ref, nil -> flow_projected_value(state, ref, Map.get(found, ref))
               _ref, value -> value
             end)
 
@@ -479,12 +479,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
         ArgumentError -> true
       end
 
-      defp flow_projected_value({:error, {:storage_read_failed, reason}}) do
-        record_state_read_failure({:projected_flow_value_unavailable, reason})
+      # The mirror is this node's own, derived view of where a value went. A value
+      # it cannot read stays absent, as it was before apply read the mirror:
+      # failing the command would block the shard's apply until it restarts.
+      defp flow_projected_value(state, ref, {:error, {:storage_read_failed, reason}}) do
+        Logger.warning(
+          "Shard #{state.shard_index}: apply cannot read Flow value #{inspect(ref)} " <>
+            "from the LMDB mirror: #{inspect(reason)}"
+        )
+
         nil
       end
 
-      defp flow_projected_value(value), do: value
+      defp flow_projected_value(_state, _ref, value), do: value
 
       defp flow_refresh_record_value_expirations(state, record, attrs) do
         refs =
