@@ -83,7 +83,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
                    :ok <- flow_require_active_parent(parent),
                    :ok <- flow_require_spawn_wait_state(parent, attrs),
                    {:ok, _child_records, child_plans} <-
-                     flow_create_many_prepare(state, child_attrs),
+                     flow_create_many_prepare(state, child_attrs, :spawn),
                    {:ok, next_parent} <-
                      flow_prepare_spawn_parent(
                        parent,
@@ -170,7 +170,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
         end)
         |> Enum.reduce_while({:ok, []}, fn {child_state, shard_attrs}, {:ok, acc} ->
           with :ok <- flow_many_partitions_valid?(child_state, shard_attrs),
-               {:ok, _records, plans} <- flow_create_many_prepare(child_state, shard_attrs) do
+               {:ok, _records, plans} <-
+                 flow_create_many_prepare(child_state, shard_attrs, :spawn) do
             {:cont, {:ok, [{child_state, plans} | acc]}}
           else
             {:error, _reason} = error -> {:halt, error}
@@ -1830,10 +1831,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
 
       defp flow_non_empty_binary?(value), do: is_binary(value) and value != ""
 
-      defp flow_create_many_prepare(state, attrs_list) do
+      defp flow_create_many_prepare(state, attrs_list),
+        do: flow_create_many_prepare(state, attrs_list, :batch)
+
+      # `caller` is :spawn when a parent update follows, so the answer decides
+      # writes even when every child already exists.
+      defp flow_create_many_prepare(state, attrs_list, caller) do
         with :ok <- flow_validate_create_attrs_list(attrs_list) do
           existing_records = flow_create_many_existing_states(state, attrs_list)
-          value_reads = flow_create_value_reads(state, nil in existing_records)
+
+          value_reads =
+            flow_create_value_reads(state, caller == :spawn or nil in existing_records)
 
           attrs_list
           |> Enum.zip(existing_records)
