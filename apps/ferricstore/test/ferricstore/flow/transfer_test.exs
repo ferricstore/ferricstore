@@ -85,6 +85,7 @@ defmodule Ferricstore.Flow.TransferTest do
 
     assert {:error, {:run_export_failed, _state_key, {:storage_read_failed, _reason}}} =
              Transfer.export(source, ctx.path)
+
     refute File.exists?(ctx.path)
   end
 
