@@ -556,6 +556,11 @@ acquire_record_group_file_direct(Dir, Path) ->
         [{Key, WriterDir, file_fd, Fd, CachedPosition}]
           when is_integer(CachedPosition), CachedPosition >= 0 ->
             case tracked_segment_fd_current(Key, Path, Fd) of
+                {true, Size} ->
+                    %% The identity stat read the real end of file, which is
+                    %% what a seek would return; another owner's appends are
+                    %% already in it.
+                    {ok, Fd, Size, false};
                 true ->
                     case current_record_group_position(Dir, Fd, CachedPosition) of
                         {ok, Position} -> {ok, Fd, Position, false};

@@ -569,13 +569,20 @@ close_tracked_segment_fd(Key) ->
 
 %% A reused descriptor must still be the file its path names; a directory
 %% deleted and recreated outside this module would otherwise swallow
-%% acknowledged appends into an unlinked inode.
+%% acknowledged appends into an unlinked inode. When the stat confirms that,
+%% its size is the descriptor's end of file.
 tracked_segment_fd_current(Key, Path, Fd) ->
     case get({?MODULE, segment_fd, Key}) of
         {Fd, Identity} when Identity =/= unknown ->
             case lstat_path(Path) of
-                {ok, #file_info{type = regular} = Info} -> file_identity(Info) =:= Identity;
-                _Missing -> false
+                {ok, #file_info{type = regular, size = Size} = Info} ->
+                    case file_identity(Info) =:= Identity of
+                        true when is_integer(Size), Size >= 0 -> {true, Size};
+                        true -> true;
+                        false -> false
+                    end;
+                _Missing ->
+                    false
             end;
         {Fd, unknown} ->
             false;
