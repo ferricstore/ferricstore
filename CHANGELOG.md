@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- An apply that stopped (its process killed) after staging Flow history in
+  the history projector's overflow queue, but before committing it, left a
+  row that every later overflow entry waited behind until the node
+  restarted: that history was not written, and the shard's durable position
+  stopped at it. The apply runs again and stages the history anew, so a row
+  whose writer is gone is now dropped.
 - Under a steady stream of Flow writes the shard's replay position never
   advanced: it waited until the history of the newest write was projected,
   and every write added newer history. A crash then replayed everything since
