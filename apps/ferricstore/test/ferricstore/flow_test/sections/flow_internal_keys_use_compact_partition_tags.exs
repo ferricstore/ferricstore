@@ -419,7 +419,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowInternalKeysUseCompactPartitionTags 
                    run_at_ms: 2_000
                  )
 
-        assert {:ok, 1} = internal_del(missing_flow.payload_ref)
+        delete_flow_value(missing_flow.payload_ref)
 
         assert {:ok, [missing]} =
                  FerricStore.flow_claim_due(type,

@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- When one shard's Raft log process restarted, every shard lost its segment
+  log memory stats, and an append on another shard at that moment could fail
+  after it was synced and be rolled back, answering the write with an error.
+  The shared stats table was owned by whichever shard process created it
+  first; it now has its own owner in the application, with an heir, like
+  FerricStore's other shared tables.
 - Adding a node to a single-node cluster while a shard was taking writes could
   put the membership change and a batch of writes at the same Raft log index,
   and whichever finished last overwrote the other in the log. With
