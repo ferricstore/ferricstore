@@ -198,11 +198,27 @@ defmodule Ferricstore.Commands.Expiry do
   defp durable_raft_store?(_store), do: true
 
   defp rewrite_plain(key, value, expire_at_ms, store) do
-    with :ok <- refuse_probabilistic(key, store) do
-      case Ops.put(store, key, value, expire_at_ms) do
-        :ok -> 1
-        {:error, _} = error -> error
-      end
+    with :ok <- refuse_probabilistic(key, store),
+         do: write_plain_expiry(key, value, expire_at_ms, store)
+  end
+
+  # On the instance the expiry changes in one replicated entry, GETEX's, which
+  # keeps whatever value the key holds when it applies. Writing back the value
+  # read before undid any write in between: INCR racing EXPIRE lost most of
+  # its increments. Inside MULTI the handler runs in the state machine, where
+  # nothing comes in between, and keeps writing the value back.
+  defp write_plain_expiry(key, _value, expire_at_ms, %FerricStore.Instance{} = ctx) do
+    case Ops.getex(ctx, key, expire_at_ms) do
+      nil -> 0
+      {:error, _reason} = error -> error
+      _value -> 1
+    end
+  end
+
+  defp write_plain_expiry(key, value, expire_at_ms, store) do
+    case Ops.put(store, key, value, expire_at_ms) do
+      :ok -> 1
+      {:error, _} = error -> error
     end
   end
 

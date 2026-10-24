@@ -296,7 +296,7 @@ defmodule FerricStore.API.Generic do
   """
   @spec expire(key(), non_neg_integer()) :: {:ok, boolean()}
   def expire(key, ttl_ms) when is_integer(ttl_ms) and ttl_ms > 0 do
-    case Expiry.handle_ast({:pexpire, key, ttl_ms}, build_compound_store(key)) do
+    case Expiry.handle_ast({:pexpire, key, ttl_ms}, default_ctx()) do
       1 -> {:ok, true}
       0 -> {:ok, false}
       {:error, _} = err -> err
@@ -559,7 +559,7 @@ defmodule FerricStore.API.Generic do
   """
   @spec persist(key()) :: {:ok, boolean()}
   def persist(key) do
-    case Expiry.handle_ast({:persist, key}, build_compound_store(key)) do
+    case Expiry.handle_ast({:persist, key}, default_ctx()) do
       1 -> {:ok, true}
       0 -> {:ok, false}
       {:error, _} = err -> err
@@ -604,7 +604,7 @@ defmodule FerricStore.API.Generic do
   """
   @spec expireat(key(), non_neg_integer()) :: {:ok, boolean()}
   def expireat(key, unix_ts_seconds) do
-    case Expiry.handle_ast({:expireat, key, unix_ts_seconds}, build_compound_store(key)) do
+    case Expiry.handle_ast({:expireat, key, unix_ts_seconds}, default_ctx()) do
       1 -> {:ok, true}
       0 -> {:ok, false}
       {:error, _} = err -> err
@@ -630,7 +630,7 @@ defmodule FerricStore.API.Generic do
   """
   @spec pexpireat(key(), non_neg_integer()) :: {:ok, boolean()}
   def pexpireat(key, unix_ts_ms) do
-    case Expiry.handle_ast({:pexpireat, key, unix_ts_ms}, build_compound_store(key)) do
+    case Expiry.handle_ast({:pexpireat, key, unix_ts_ms}, default_ctx()) do
       1 -> {:ok, true}
       0 -> {:ok, false}
       {:error, _} = err -> err

@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT and PERSIST on a string read its value
+  and wrote it back with the new expiry, so a write in between was undone:
+  INCR racing EXPIRE on one key, the usual rate-limiter pattern, kept 5 of
+  400 increments. On the gateways and through `FerricStore.expire/2`,
+  `persist/1`, `expireat/2` and `pexpireat/2` the expiry now changes in one
+  replicated entry that keeps the current value.
 - Concurrent SETBIT on one key through the gateways lost bits: each command
   read the whole value, changed one bit and wrote the value back, so clients
   setting different bits overwrote each other's (16 clients setting 640

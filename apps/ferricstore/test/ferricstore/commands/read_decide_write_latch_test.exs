@@ -91,6 +91,57 @@ defmodule Ferricstore.Commands.ReadDecideWriteLatchTest do
     assert Dispatcher.dispatch("TTL", [key], ctx) in 95..100
   end
 
+  # EXPIRE and PERSIST of a string read the value and wrote it back with the
+  # new expiry, so a write in between (INCR here) was undone.
+  for {name, expiry} <- [
+        {"EXPIRE", ["EXPIRE", "100"]},
+        {"PEXPIRE", ["PEXPIRE", "100000"]},
+        {"PERSIST", ["PERSIST"]}
+      ] do
+    @expiry expiry
+    test "INCR racing #{name} loses no increment", %{ctx: ctx, key: key} do
+      [command | args] = @expiry
+      assert :ok = Dispatcher.dispatch("SET", [key, "0", "EX", "1000"], ctx)
+
+      expirer =
+        Task.async(fn ->
+          for _ <- 1..200, do: Dispatcher.dispatch(command, [key | args], ctx)
+        end)
+
+      1..8
+      |> Task.async_stream(
+        fn _ -> for _ <- 1..50, do: Dispatcher.dispatch("INCR", [key], ctx) end,
+        max_concurrency: 8,
+        timeout: 60_000
+      )
+      |> Stream.run()
+
+      Task.await(expirer, 60_000)
+      assert "400" == Dispatcher.dispatch("GET", [key], ctx)
+    end
+  end
+
+  test "embedded expire and persist racing incr lose no increment", %{key: key} do
+    assert :ok = FerricStore.set(key, "0")
+
+    expirer =
+      Task.async(fn ->
+        for i <- 1..200 do
+          if rem(i, 2) == 0, do: FerricStore.expire(key, 100_000), else: FerricStore.persist(key)
+        end
+      end)
+
+    1..8
+    |> Task.async_stream(fn _ -> for _ <- 1..50, do: FerricStore.incr(key) end,
+      max_concurrency: 8,
+      timeout: 60_000
+    )
+    |> Stream.run()
+
+    Task.await(expirer, 60_000)
+    assert {:ok, "400"} == FerricStore.get(key)
+  end
+
   test "concurrent EXPIRE NX has one winner", %{ctx: ctx, key: key} do
     assert :ok = Dispatcher.dispatch("SET", [key, "v"], ctx)
 
