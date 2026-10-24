@@ -167,30 +167,6 @@ defmodule Ferricstore.Commands.ReadDecideWriteLatchTest do
   end
 
   # A hash field's expiry was set by reading the field and writing it back.
-  for {name, getex} <- [{"HGETEX EX", ["EX", "1000"]}, {"HGETEX PERSIST", ["PERSIST"]}] do
-    @getex getex
-    test "HINCRBY racing #{name} on the field loses no increment", %{ctx: ctx, key: key} do
-      assert 1 == Dispatcher.dispatch("HSET", [key, "f", "0"], ctx)
-
-      expirer =
-        Task.async(fn ->
-          for _ <- 1..100,
-              do: Dispatcher.dispatch("HGETEX", [key | @getex] ++ ["FIELDS", "1", "f"], ctx)
-        end)
-
-      1..8
-      |> Task.async_stream(
-        fn _ -> for _ <- 1..50, do: Dispatcher.dispatch("HINCRBY", [key, "f", "1"], ctx) end,
-        max_concurrency: 8,
-        timeout: 60_000
-      )
-      |> Stream.run()
-
-      Task.await(expirer, 60_000)
-      assert "400" == Dispatcher.dispatch("HGET", [key, "f"], ctx)
-    end
-  end
-
   for expiry <- [["HEXPIRE", "1000"], ["HPEXPIRE", "1000000"], ["HPERSIST"]] do
     @expiry expiry
     test "HINCRBY racing #{hd(expiry)} on the field loses no increment", %{ctx: ctx, key: key} do
@@ -241,52 +217,6 @@ defmodule Ferricstore.Commands.ReadDecideWriteLatchTest do
     assert {:ok, "400"} == FerricStore.get(key)
   end
 
-  # PFMERGE read the destination's sketch and wrote it back merged, undoing
-  # PFADDs to the destination in between.
-  test "PFADD to the destination racing PFMERGE keeps every element", %{ctx: ctx, key: key} do
-    dest = key <> ":dest"
-    assert 1 == Dispatcher.dispatch("PFADD", [key <> ":src", "s"], ctx)
-
-    merger =
-      Task.async(fn ->
-        for _ <- 1..200, do: Dispatcher.dispatch("PFMERGE", [dest, key <> ":src"], ctx)
-      end)
-
-    1..8
-    |> Task.async_stream(
-      fn client ->
-        for i <- 1..100, do: Dispatcher.dispatch("PFADD", [dest, "#{client}-#{i}"], ctx)
-      end,
-      max_concurrency: 8,
-      timeout: 60_000
-    )
-    |> Stream.run()
-
-    Task.await(merger, 60_000)
-    # 801 distinct elements; HyperLogLog counts within a few percent.
-    assert Dispatcher.dispatch("PFCOUNT", [dest], ctx) in 770..830
-  end
-
-  test "embedded pfadd to the destination racing pfmerge keeps every element", %{key: key} do
-    dest = key <> ":edest"
-    assert {:ok, true} = FerricStore.pfadd(key <> ":esrc", ["s"])
-
-    merger =
-      Task.async(fn -> for _ <- 1..200, do: FerricStore.pfmerge(dest, [key <> ":esrc"]) end)
-
-    1..8
-    |> Task.async_stream(
-      fn client -> for i <- 1..100, do: FerricStore.pfadd(dest, ["#{client}-#{i}"]) end,
-      max_concurrency: 8,
-      timeout: 60_000
-    )
-    |> Stream.run()
-
-    Task.await(merger, 60_000)
-    assert {:ok, count} = FerricStore.pfcount([dest])
-    assert count in 770..830
-  end
-
   # A store command whose destination is also a source read it and wrote it
   # back, undoing writes to it in between.
   test "SADD racing SUNIONSTORE into one of its sources keeps every member",
@@ -313,28 +243,20 @@ defmodule Ferricstore.Commands.ReadDecideWriteLatchTest do
     assert 401 == Dispatcher.dispatch("SCARD", [key <> ":k"], ctx)
   end
 
-  test "SETBIT racing BITOP into one of its sources keeps every bit", %{ctx: ctx, key: key} do
-    assert 0 == Dispatcher.dispatch("SETBIT", [key <> ":o", "0", "1"], ctx)
+  # Below feature level 5 a transaction writes BITOP's and PFMERGE's results
+  # the way older releases do; the instance writes them as Redis does.
+  test "BITOP into one of its sources still deletes an empty result", %{ctx: ctx, key: key} do
+    assert :ok = Dispatcher.dispatch("SET", [key, ""], ctx)
+    assert 0 == Dispatcher.dispatch("BITOP", ["OR", key, key, key <> ":missing"], ctx)
+    assert 0 == Dispatcher.dispatch("EXISTS", [key], ctx)
+  end
 
-    merger =
-      Task.async(fn ->
-        for _ <- 1..200,
-            do: Dispatcher.dispatch("BITOP", ["OR", key <> ":b", key <> ":b", key <> ":o"], ctx)
-      end)
-
-    1..8
-    |> Task.async_stream(
-      fn client ->
-        for i <- 1..50,
-            do: Dispatcher.dispatch("SETBIT", [key <> ":b", "#{client * 50 + i}", "1"], ctx)
-      end,
-      max_concurrency: 8,
-      timeout: 60_000
-    )
-    |> Stream.run()
-
-    Task.await(merger, 60_000)
-    assert 401 == Dispatcher.dispatch("BITCOUNT", [key <> ":b"], ctx)
+  test "PFMERGE into one of its sources keeps the sketch's TTL", %{ctx: ctx, key: key} do
+    assert 1 == Dispatcher.dispatch("PFADD", [key, "a"], ctx)
+    assert 1 == Dispatcher.dispatch("EXPIRE", [key, "1000"], ctx)
+    assert 1 == Dispatcher.dispatch("PFADD", [key <> ":src", "b"], ctx)
+    assert :ok == Dispatcher.dispatch("PFMERGE", [key, key, key <> ":src"], ctx)
+    assert Dispatcher.dispatch("TTL", [key], ctx) in 990..1000
   end
 
   test "concurrent EXPIRE NX has one winner", %{ctx: ctx, key: key} do

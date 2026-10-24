@@ -575,7 +575,8 @@ defmodule Ferricstore.Commands.Hash do
   # Like HEXPIRE, HGETEX with an expiry or PERSIST writes each field back with
   # it; where it can, it runs as a one-command transaction.
   def handle_ast({:hgetex, key, mode, fields}, store) when is_list(fields) do
-    in_transaction(store, hgetex_args(key, mode, fields), fn ->
+    # Below level 5 a transaction keeps a field given a past time.
+    in_transaction(store, hgetex_args(key, mode, fields), [level: 5], fn ->
       getex_checked(key, mode, fields, store)
     end)
   end
@@ -1065,8 +1066,10 @@ defmodule Ferricstore.Commands.Hash do
   # Redis checks the key's type before the arguments: an argument error
   # becomes WRONGTYPE on a key of another type. (Parsed arguments go on to a
   # command that checks the type itself.)
-  defp in_transaction(store, [command | args], otherwise) do
-    case SingleCommand.run(store, command, args) do
+  defp in_transaction(store, command_args, opts \\ [], otherwise)
+
+  defp in_transaction(store, [command | args], opts, otherwise) do
+    case SingleCommand.run(store, command, args, opts) do
       :fallback -> otherwise.()
       result -> result
     end

@@ -483,7 +483,8 @@ defmodule Ferricstore.Commands.Bitmap do
   def handle_ast({:bitop, op, destkey, source_keys} = ast, store)
       when op in [:band, :bor, :bxor, :bnot] and is_list(source_keys) and source_keys != [] do
     if destkey in source_keys do
-      case Ferricstore.Transaction.SingleCommand.run(store, "BITOP", bitop_args(ast)) do
+      # Below level 5 a transaction keeps an empty result instead of deleting it.
+      case Ferricstore.Transaction.SingleCommand.run(store, "BITOP", bitop_args(ast), level: 5) do
         :fallback -> bitop_here(op, destkey, source_keys, store)
         result -> result
       end

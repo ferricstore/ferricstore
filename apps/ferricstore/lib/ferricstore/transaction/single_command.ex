@@ -11,16 +11,22 @@ defmodule Ferricstore.Transaction.SingleCommand do
   # default one (the transaction coordinator serves the default instance), keys
   # on more than one shard (one entry belongs to one shard), or a form that
   # releases before the current feature level would apply differently inside
-  # MULTI.
+  # MULTI. A command whose handler writes differently below a feature level
+  # inside MULTI (`Ops.level_5_writes?/1`) passes `level:`, and only runs this
+  # way once that level is active, where the transaction writes as the
+  # instance does.
 
   alias Ferricstore.Commands.PreparedCommand
   alias Ferricstore.Store.Router
   alias Ferricstore.Transaction.{Coordinator, ReplicaCompat}
 
-  @spec run(term(), binary(), [binary()]) :: term() | :fallback
-  def run(%FerricStore.Instance{name: :default} = ctx, command, args) do
+  @spec run(term(), binary(), [binary()], keyword()) :: term() | :fallback
+  def run(store, command, args, opts \\ [])
+
+  def run(%FerricStore.Instance{name: :default} = ctx, command, args, opts) do
     with {:ok, prepared} <- PreparedCommand.prepare(command, args),
          true <- one_shard?(ctx, prepared.command_keys),
+         true <- level_ready?(ctx, prepared.command_keys, Keyword.get(opts, :level)),
          nil <- ReplicaCompat.queue_error(command, prepared.ast, prepared.command_keys, ctx) do
       case Coordinator.execute([prepared], %{}, nil) do
         [result] -> result
@@ -32,7 +38,10 @@ defmodule Ferricstore.Transaction.SingleCommand do
     end
   end
 
-  def run(_store, _command, _args), do: :fallback
+  def run(_store, _command, _args, _opts), do: :fallback
+
+  defp level_ready?(_ctx, _keys, nil), do: true
+  defp level_ready?(ctx, keys, level), do: ReplicaCompat.level_active?(ctx, keys, level)
 
   defp one_shard?(ctx, [key | keys]),
     do: Enum.all?(keys, &(Router.shard_for(ctx, &1) == Router.shard_for(ctx, key)))

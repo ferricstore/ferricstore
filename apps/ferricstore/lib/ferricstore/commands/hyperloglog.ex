@@ -189,7 +189,8 @@ defmodule Ferricstore.Commands.HyperLogLog do
     # PFMERGE reads the destination and writes it back merged, which undid a
     # PFADD to it in between. Where it can, it runs as a one-command
     # transaction, applied by the shard with nothing in between.
-    case Ferricstore.Transaction.SingleCommand.run(store, "PFMERGE", args) do
+    # Below level 5 a transaction drops the sketch's TTL.
+    case Ferricstore.Transaction.SingleCommand.run(store, "PFMERGE", args, level: 5) do
       :fallback -> pfmerge_here(destkey, source_keys, store)
       result -> result
     end

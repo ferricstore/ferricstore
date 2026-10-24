@@ -8,18 +8,21 @@ All notable changes to FerricStore will be documented here.
   of their sources read it and wrote it back, undoing writes to it in between
   (SADD racing `SUNIONSTORE k k other` lost a third of its members, SETBIT
   racing `BITOP OR k k other` nearly all its bits). On one shard of the
-  default instance they now run as a one-command transaction.
+  default instance they now run as a one-command transaction (BITOP from
+  feature level 5, below which a transaction keeps an empty result).
 - PFMERGE read the destination's sketch and wrote it back merged, so a PFADD
   to the destination in between was undone (PFADDs racing repeated PFMERGEs
   into one key left a count of 2 for 801 elements); `FerricStore.pfmerge/2`
   did the same. With every key on one shard of the default instance it now
-  runs as a one-command transaction.
+  runs as a one-command transaction from feature level 5 (below it a
+  transaction drops the sketch's TTL, so PFMERGE keeps its old path).
 - HEXPIRE, HPEXPIRE, HPERSIST and HGETEX with an expiry or PERSIST read each
   field and wrote it back with its new expiry, so a write to the field in between was undone: HINCRBY racing
   HEXPIRE on one field kept 22 of 400 increments. On the default instance
   they now run as a one-command transaction the shard applies with nothing in
-  between (a conditional HEXPIRE or a TTL of 0 does so from feature level 5,
-  the level at which every replica applies those forms alike).
+  between (a conditional HEXPIRE, a TTL of 0 and HGETEX do so from feature
+  level 5, the level at which a transaction applies them as the gateways
+  do).
 - Changing the expiry of a list, hash, set or sorted set (EXPIRE, PEXPIRE,
   EXPIREAT, PEXPIREAT, PERSIST) read every member and wrote them all back
   with the new expiry, so members changed or added in between were undone:

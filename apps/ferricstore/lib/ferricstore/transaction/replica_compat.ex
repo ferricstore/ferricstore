@@ -87,12 +87,14 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
     end
   end
 
-  defp level_active?(ctx, [key | _rest], level) when is_binary(key) do
+  @doc false
+  @spec level_active?(FerricStore.Instance.t(), [binary()], pos_integer()) :: boolean()
+  def level_active?(ctx, [key | _rest], level) when is_binary(key) do
     Router.read_shard_value(ctx, Router.shard_for(ctx, key), FeatureLevel.key(level)) ==
       {:ok, FeatureLevel.marker()}
   rescue
     _error -> false
   end
 
-  defp level_active?(_ctx, _keys, _level), do: false
+  def level_active?(_ctx, _keys, _level), do: false
 end
