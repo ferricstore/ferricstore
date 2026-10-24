@@ -4,8 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
-- HEXPIRE, HPEXPIRE and HPERSIST read each field and wrote it back with its
-  new expiry, so a write to the field in between was undone: HINCRBY racing
+- HEXPIRE, HPEXPIRE, HPERSIST and HGETEX with an expiry or PERSIST read each
+  field and wrote it back with its new expiry, so a write to the field in between was undone: HINCRBY racing
   HEXPIRE on one field kept 22 of 400 increments. On the default instance
   they now run as a one-command transaction the shard applies with nothing in
   between (a conditional HEXPIRE or a TTL of 0 does so from feature level 5,

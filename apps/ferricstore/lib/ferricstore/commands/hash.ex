@@ -569,8 +569,16 @@ defmodule Ferricstore.Commands.Hash do
   def handle_ast({:hgetdel, key, fields}, store) when is_list(fields),
     do: getdel_fields(key, fields, store)
 
-  def handle_ast({:hgetex, key, mode, fields}, store) when is_list(fields),
-    do: getex_checked(key, mode, fields, store)
+  def handle_ast({:hgetex, key, :none, fields}, store) when is_list(fields),
+    do: getex_checked(key, :none, fields, store)
+
+  # Like HEXPIRE, HGETEX with an expiry or PERSIST writes each field back with
+  # it; where it can, it runs as a one-command transaction.
+  def handle_ast({:hgetex, key, mode, fields}, store) when is_list(fields) do
+    in_transaction(store, hgetex_args(key, mode, fields), fn ->
+      getex_checked(key, mode, fields, store)
+    end)
+  end
 
   def handle_ast({:hsetex, key, {condition, expiry}, pairs}, store)
       when condition in [nil, :fnx, :fxx] and is_list(pairs),
@@ -1062,6 +1070,16 @@ defmodule Ferricstore.Commands.Hash do
       :fallback -> otherwise.()
       result -> result
     end
+  end
+
+  defp hgetex_args(key, mode, fields) do
+    mode_args =
+      case mode do
+        :persist -> ["PERSIST"]
+        {unit, time} -> [unit |> Atom.to_string() |> String.upcase(), Integer.to_string(time)]
+      end
+
+    ["HGETEX", key | mode_args] ++ ["FIELDS", Integer.to_string(length(fields)) | fields]
   end
 
   defp field_ttl_args(tag, key, ttl, condition, fields) do
