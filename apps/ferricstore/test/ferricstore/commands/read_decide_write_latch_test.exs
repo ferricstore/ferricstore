@@ -267,6 +267,26 @@ defmodule Ferricstore.Commands.ReadDecideWriteLatchTest do
     assert Dispatcher.dispatch("PFCOUNT", [dest], ctx) in 770..830
   end
 
+  test "embedded pfadd to the destination racing pfmerge keeps every element", %{key: key} do
+    dest = key <> ":edest"
+    assert {:ok, true} = FerricStore.pfadd(key <> ":esrc", ["s"])
+
+    merger =
+      Task.async(fn -> for _ <- 1..200, do: FerricStore.pfmerge(dest, [key <> ":esrc"]) end)
+
+    1..8
+    |> Task.async_stream(
+      fn client -> for i <- 1..100, do: FerricStore.pfadd(dest, ["#{client}-#{i}"]) end,
+      max_concurrency: 8,
+      timeout: 60_000
+    )
+    |> Stream.run()
+
+    Task.await(merger, 60_000)
+    assert {:ok, count} = FerricStore.pfcount([dest])
+    assert count in 770..830
+  end
+
   test "concurrent EXPIRE NX has one winner", %{ctx: ctx, key: key} do
     assert :ok = Dispatcher.dispatch("SET", [key, "v"], ctx)
 

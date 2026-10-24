@@ -6,8 +6,9 @@ All notable changes to FerricStore will be documented here.
 
 - PFMERGE read the destination's sketch and wrote it back merged, so a PFADD
   to the destination in between was undone (PFADDs racing repeated PFMERGEs
-  into one key left a count of 2 for 801 elements). With every key on one
-  shard of the default instance it now runs as a one-command transaction.
+  into one key left a count of 2 for 801 elements); `FerricStore.pfmerge/2`
+  did the same. With every key on one shard of the default instance it now
+  runs as a one-command transaction.
 - HEXPIRE, HPEXPIRE, HPERSIST and HGETEX with an expiry or PERSIST read each
   field and wrote it back with its new expiry, so a write to the field in between was undone: HINCRBY racing
   HEXPIRE on one field kept 22 of 400 increments. On the default instance
