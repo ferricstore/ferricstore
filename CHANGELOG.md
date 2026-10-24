@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Changing the expiry of a list, hash, set or sorted set (EXPIRE, PEXPIRE,
+  EXPIREAT, PEXPIREAT, PERSIST) read every member and wrote them all back
+  with the new expiry, so members changed or added in between were undone:
+  HINCRBY racing EXPIRE kept 64 of 400 increments and RPUSH racing EXPIRE
+  left 9 of 401 elements. On the default instance the change now runs as a
+  one-command transaction that the shard applies with nothing in between.
 - EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT and PERSIST on a string read its value
   and wrote it back with the new expiry, so a write in between was undone:
   INCR racing EXPIRE on one key, the usual rate-limiter pattern, kept 5 of
