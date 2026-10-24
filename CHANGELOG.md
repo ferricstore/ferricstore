@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A TTL written inside a transaction (MULTI, `FerricStore.Tx`), or carried
+  by RENAME, COPY or a SET over a promoted collection, was never removed by
+  the active expiry sweep, only when the key was read: those writes reach the
+  keydir through a publication step that did not count them in the shard's
+  expiry tracker, and the sweep skips a shard whose tracker counts nothing.
+  They now count like any other write.
 - SUNIONSTORE, SINTERSTORE, SDIFFSTORE and BITOP into a key that is also one
   of their sources read it and wrote it back, undoing writes to it in between
   (SADD racing `SUNIONSTORE k k other` lost a third of its members, SETBIT

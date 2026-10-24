@@ -77,6 +77,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
           {{:put, idx, ^keydir, _file_path, ^file_id, key, ets_value, _disk_value, exp},
            {:put, offset, value_size}} ->
             track_cross_shard_keydir_binary_publish(ref, keydir, idx, key, ets_value)
+            track_cross_shard_expiry_publish(state, keydir, idx, key, exp)
             :ets.insert(keydir, {key, ets_value, exp, LFU.initial(), file_id, offset, value_size})
             {logical_keys, logical_slots} = logical_key_index_tables(state, idx)
             :ok = LogicalKeyIndex.put(logical_keys, logical_slots, key, ets_value, exp)
@@ -94,6 +95,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
 
           {{:delete, idx, ^keydir, _file_path, ^file_id, key}, {:delete, _offset, _record_size}} ->
             track_cross_shard_keydir_binary_publish(ref, keydir, idx, key, nil)
+            track_cross_shard_expiry_publish(state, keydir, idx, key, 0)
             :ets.delete(keydir, key)
             {logical_keys, logical_slots} = logical_key_index_tables(state, idx)
             :ok = LogicalKeyIndex.delete(logical_keys, logical_slots, key)
@@ -108,6 +110,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
 
       defp namespace_usage_tables(state, shard_index) do
         NamespaceUsageIndex.table_names(Map.get(state, :instance_name, :default), shard_index)
+      end
+
+      # The shard's expiry sweep only scans while its ExpiryTracker counts a key
+      # with a TTL, so an expiry a transaction writes, or a key with one it
+      # deletes, counts there as any other write does. Without it a TTL set
+      # inside MULTI was never swept, only removed when read.
+      defp track_cross_shard_expiry_publish(state, keydir, shard_index, key, new_expire_at_ms) do
+        ExpiryTracker.adjust(
+          expiry_instance_ctx(state),
+          shard_index,
+          ExpiryTracker.entry_expire_at(safe_ets_lookup(keydir, key)),
+          new_expire_at_ms
+        )
       end
 
       defp track_cross_shard_keydir_binary_publish(nil, _keydir, _shard_index, _key, _new_value),

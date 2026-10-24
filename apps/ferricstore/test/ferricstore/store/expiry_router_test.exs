@@ -68,6 +68,27 @@ defmodule Ferricstore.Store.ExpiryRouterTest do
     assert {"new", ^renewed_at_ms} = Router.compound_get_meta(ctx, redis_key, compound_key)
   end
 
+  # A transaction's writes reach the keydir through its own publication step;
+  # an expiry it writes must count in the shard's ExpiryTracker like any
+  # other, or the sweep, which skips a shard whose tracker counts nothing,
+  # never removes it.
+  test "an expiry set inside a transaction is swept" do
+    ctx = FerricStore.Instance.get(:default)
+    {redis_key, compound_key, shard_index} = compound_fixture(ctx, "transaction")
+
+    assert :ok = FerricStore.hset(redis_key, %{"field" => "value"})
+
+    assert [1] =
+             FerricStore.Tx.new()
+             |> FerricStore.Tx.expire(redis_key, 1)
+             |> FerricStore.Tx.execute()
+
+    Process.sleep(10)
+    assert :ok = GenServer.call(Router.shard_name(ctx, shard_index), :expiry_sweep)
+
+    assert :ets.lookup(elem(ctx.keydir_refs, shard_index), compound_key) == []
+  end
+
   test "the public compound expiry sweep removes keydir rows without warning" do
     ctx = FerricStore.Instance.get(:default)
     {redis_key, compound_key, shard_index} = compound_fixture(ctx, "sweep")
