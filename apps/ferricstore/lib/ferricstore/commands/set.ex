@@ -21,6 +21,7 @@ defmodule Ferricstore.Commands.Set do
   alias Ferricstore.Store.Ops
   alias Ferricstore.Store.ReadResult
   alias Ferricstore.Store.Router
+  alias Ferricstore.Transaction.SingleCommand
   alias Ferricstore.Store.TypeRegistry
   alias Ferricstore.CrossShardOp
 
@@ -666,7 +667,7 @@ defmodule Ferricstore.Commands.Set do
   end
 
   defp sdiffstore_args([destination | [_ | _] = keys], store) do
-    store_result_at(destination, keys, store, fn source_keys, unified_store ->
+    store_result_at("SDIFFSTORE", destination, keys, store, fn source_keys, unified_store ->
       with {:ok, [first_set | rest_sets]} <- get_member_sets(source_keys, unified_store) do
         {:ok, Enum.reduce(rest_sets, first_set, &MapSet.difference(&2, &1))}
       end
@@ -677,7 +678,7 @@ defmodule Ferricstore.Commands.Set do
     do: {:error, "ERR wrong number of arguments for 'sdiffstore' command"}
 
   defp sinterstore_args([destination | [_ | _] = keys], store) do
-    store_result_at(destination, keys, store, fn source_keys, unified_store ->
+    store_result_at("SINTERSTORE", destination, keys, store, fn source_keys, unified_store ->
       Intersection.sinter_set(source_keys, unified_store)
     end)
   end
@@ -686,7 +687,7 @@ defmodule Ferricstore.Commands.Set do
     do: {:error, "ERR wrong number of arguments for 'sinterstore' command"}
 
   defp sunionstore_args([destination | [_ | _] = keys], store) do
-    store_result_at(destination, keys, store, fn source_keys, unified_store ->
+    store_result_at("SUNIONSTORE", destination, keys, store, fn source_keys, unified_store ->
       with {:ok, sets} <- get_member_sets(source_keys, unified_store) do
         {:ok, Enum.reduce(sets, MapSet.new(), &MapSet.union(&2, &1))}
       end
@@ -696,7 +697,22 @@ defmodule Ferricstore.Commands.Set do
   defp sunionstore_args(_args, _store),
     do: {:error, "ERR wrong number of arguments for 'sunionstore' command"}
 
-  defp store_result_at(destination, keys, store, result_fun) do
+  # A destination that is also a source is read and then written back, which
+  # undid a write to it in between (SADD racing SUNIONSTORE k k other lost
+  # members). Then, where it can, the command runs as a one-command
+  # transaction, applied by the shard with nothing in between.
+  defp store_result_at(command, destination, keys, store, result_fun) do
+    if destination in keys do
+      case SingleCommand.run(store, command, [destination | keys]) do
+        :fallback -> store_result_here(destination, keys, store, result_fun)
+        result -> result
+      end
+    else
+      store_result_here(destination, keys, store, result_fun)
+    end
+  end
+
+  defp store_result_here(destination, keys, store, result_fun) do
     keys_with_roles =
       [{destination, :write}] ++ Enum.map(keys, fn key -> {key, :read} end)
 

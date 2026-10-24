@@ -287,6 +287,56 @@ defmodule Ferricstore.Commands.ReadDecideWriteLatchTest do
     assert count in 770..830
   end
 
+  # A store command whose destination is also a source read it and wrote it
+  # back, undoing writes to it in between.
+  test "SADD racing SUNIONSTORE into one of its sources keeps every member",
+       %{ctx: ctx, key: key} do
+    assert 1 == Dispatcher.dispatch("SADD", [key <> ":o", "o1"], ctx)
+
+    merger =
+      Task.async(fn ->
+        for _ <- 1..200,
+            do: Dispatcher.dispatch("SUNIONSTORE", [key <> ":k", key <> ":k", key <> ":o"], ctx)
+      end)
+
+    1..8
+    |> Task.async_stream(
+      fn client ->
+        for i <- 1..50, do: Dispatcher.dispatch("SADD", [key <> ":k", "#{client}-#{i}"], ctx)
+      end,
+      max_concurrency: 8,
+      timeout: 60_000
+    )
+    |> Stream.run()
+
+    Task.await(merger, 60_000)
+    assert 401 == Dispatcher.dispatch("SCARD", [key <> ":k"], ctx)
+  end
+
+  test "SETBIT racing BITOP into one of its sources keeps every bit", %{ctx: ctx, key: key} do
+    assert 0 == Dispatcher.dispatch("SETBIT", [key <> ":o", "0", "1"], ctx)
+
+    merger =
+      Task.async(fn ->
+        for _ <- 1..200,
+            do: Dispatcher.dispatch("BITOP", ["OR", key <> ":b", key <> ":b", key <> ":o"], ctx)
+      end)
+
+    1..8
+    |> Task.async_stream(
+      fn client ->
+        for i <- 1..50,
+            do: Dispatcher.dispatch("SETBIT", [key <> ":b", "#{client * 50 + i}", "1"], ctx)
+      end,
+      max_concurrency: 8,
+      timeout: 60_000
+    )
+    |> Stream.run()
+
+    Task.await(merger, 60_000)
+    assert 401 == Dispatcher.dispatch("BITCOUNT", [key <> ":b"], ctx)
+  end
+
   test "concurrent EXPIRE NX has one winner", %{ctx: ctx, key: key} do
     assert :ok = Dispatcher.dispatch("SET", [key, "v"], ctx)
 

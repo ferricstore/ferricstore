@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- SUNIONSTORE, SINTERSTORE, SDIFFSTORE and BITOP into a key that is also one
+  of their sources read it and wrote it back, undoing writes to it in between
+  (SADD racing `SUNIONSTORE k k other` lost a third of its members, SETBIT
+  racing `BITOP OR k k other` nearly all its bits). On one shard of the
+  default instance they now run as a one-command transaction.
 - PFMERGE read the destination's sketch and wrote it back merged, so a PFADD
   to the destination in between was undone (PFADDs racing repeated PFMERGEs
   into one key left a count of 2 for 801 elements); `FerricStore.pfmerge/2`

@@ -477,14 +477,33 @@ defmodule Ferricstore.Commands.Bitmap do
     end
   end
 
-  def handle_ast({:bitop, op, destkey, source_keys}, store)
+  # A destination that is also a source is read and then written back, which
+  # undid a SETBIT to it in between. Then, where it can, BITOP runs as a
+  # one-command transaction, applied by the shard with nothing in between.
+  def handle_ast({:bitop, op, destkey, source_keys} = ast, store)
       when op in [:band, :bor, :bxor, :bnot] and is_list(source_keys) and source_keys != [] do
+    if destkey in source_keys do
+      case Ferricstore.Transaction.SingleCommand.run(store, "BITOP", bitop_args(ast)) do
+        :fallback -> bitop_here(op, destkey, source_keys, store)
+        result -> result
+      end
+    else
+      bitop_here(op, destkey, source_keys, store)
+    end
+  end
+
+  def handle_ast(_ast, _store), do: {:error, "ERR unsupported bitmap command AST"}
+
+  defp bitop_here(op, destkey, source_keys, store) do
     with {:ok, result} <- execute_bitop_ast(op, source_keys, store) do
       write_bitop_result(store, destkey, result)
     end
   end
 
-  def handle_ast(_ast, _store), do: {:error, "ERR unsupported bitmap command AST"}
+  defp bitop_args({:bitop, op, destkey, source_keys}) do
+    name = %{band: "AND", bor: "OR", bxor: "XOR", bnot: "NOT"} |> Map.fetch!(op)
+    [name, destkey | source_keys]
+  end
 
   # ===========================================================================
   # Private helpers
