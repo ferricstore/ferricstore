@@ -562,6 +562,22 @@ defmodule Ferricstore.FlowTest do
   defp internal_del(key),
     do: FerricStore.Impl.del(FerricStore.Instance.get(:default), [key])
 
+  # Removes a generated Flow value for good. The history projector copies it
+  # into the shard's Flow LMDB mirror, which serves it once it is gone from
+  # the keydir, so it is removed from both once projection has finished.
+  defp delete_flow_value(ref) do
+    ctx = FerricStore.Instance.get(:default)
+    flush_history_projection(ctx)
+    assert {:ok, _deleted} = internal_del(ref)
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(Ferricstore.Store.Router.shard_for(ctx, ref))
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:delete, ref}])
+  end
+
   defp internal_zrange(key, start, stop),
     do: FerricStore.Impl.zrange(FerricStore.Instance.get(:default), key, start, stop, [])
 
