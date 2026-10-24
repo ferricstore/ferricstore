@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT with NX, XX, GT or LT decided from
+  the TTL they read, under a key latch that only holds against clients on
+  the same node: sent from every node of a cluster at once, EXPIRE NX had a
+  winner on each node, each replacing the TTL the last one set. On the
+  default instance from feature level 5 the decision now runs as a
+  one-command transaction where the write applies.
 - GEOSEARCHSTORE into its own source read the source and wrote the matches
   back over it, undoing a GEOADD in between (GEOADDs racing repeated
   `GEOSEARCHSTORE k k ...` kept 187 of 401 members). On one shard of the

@@ -277,8 +277,23 @@ defmodule Ferricstore.Commands.Expiry do
     end
   end
 
-  defp apply_expiry(key, expire_at_ms, flag, store),
-    do: apply_expiry_with_flag(key, expire_at_ms, flag, store)
+  # With a flag the expiry depends on the TTL read first. The key latch keeps
+  # that read and the write together only against clients on this node: from
+  # every node of a cluster, EXPIRE NX had a winner per node, each replacing
+  # the TTL the last one set. Where it can, the decision runs as a one-command
+  # transaction, made where the write applies (from feature level 5, below
+  # which a transaction rewrites a probabilistic key as a string).
+  defp apply_expiry(key, expire_at_ms, flag, store) do
+    args = [key, Integer.to_string(expire_at_ms) | flag_args(flag)]
+
+    case SingleCommand.run(store, "PEXPIREAT", args, level: 5) do
+      :fallback -> apply_expiry_with_flag(key, expire_at_ms, flag, store)
+      result -> result
+    end
+  end
+
+  defp flag_args(flags) when is_list(flags), do: Enum.flat_map(flags, &flag_args/1)
+  defp flag_args(flag) when is_atom(flag), do: [flag |> Atom.to_string() |> String.upcase()]
 
   defp apply_expiry_with_flag(key, expire_at_ms, flag, store) do
     case ttl_expire_at_ms(key, store) do
