@@ -31,7 +31,6 @@ defmodule Ferricstore.Commands.Hash do
   alias Ferricstore.Commands.Hash.Helpers
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.{Ops, ReadResult, TypeRegistry, ValueCodec}
-  alias Ferricstore.Transaction.SingleCommand
 
   @field_expire_commands ~w(HEXPIRE HPEXPIRE)
   @field_expire_tags [:hexpire, :hpexpire]
@@ -533,24 +532,14 @@ defmodule Ferricstore.Commands.Hash do
       when tag in [:httl, :hpersist, :hpttl, :hexpiretime, :hgetdel],
       do: type_checked_args(key, error, store)
 
-  # A field's expiry is set by reading the field and writing it back with it,
-  # which undid a write to the field in between (HINCRBY racing HEXPIRE kept a
-  # fraction of its increments). Where it can, the command runs as a
-  # one-command transaction, applied by the shard with nothing in between.
   def handle_ast({tag, key, ttl, fields}, store)
-      when tag in @field_expire_tags and is_integer(ttl) and ttl >= 0 and is_list(fields) do
-    in_transaction(store, field_ttl_args(tag, key, ttl, nil, fields), fn ->
-      expire_fields(key, Atom.to_string(tag), ttl, nil, fields, store)
-    end)
-  end
+      when tag in @field_expire_tags and is_integer(ttl) and ttl >= 0 and is_list(fields),
+      do: expire_fields(key, Atom.to_string(tag), ttl, nil, fields, store)
 
   def handle_ast({tag, key, ttl, condition, fields}, store)
       when tag in @field_expire_tags and is_integer(ttl) and ttl >= 0 and
-             condition in [:nx, :xx, :gt, :lt] and is_list(fields) do
-    in_transaction(store, field_ttl_args(tag, key, ttl, condition, fields), fn ->
-      expire_fields(key, Atom.to_string(tag), ttl, condition, fields, store)
-    end)
-  end
+             condition in [:nx, :xx, :gt, :lt] and is_list(fields),
+      do: expire_fields(key, Atom.to_string(tag), ttl, condition, fields, store)
 
   def handle_ast({:httl, key, fields}, store) when is_list(fields),
     do: FieldOps.ttl_fields(key, fields, :seconds, store)
@@ -558,10 +547,8 @@ defmodule Ferricstore.Commands.Hash do
   def handle_ast({:hpttl, key, fields}, store) when is_list(fields),
     do: FieldOps.ttl_fields(key, fields, :milliseconds, store)
 
-  def handle_ast({:hpersist, key, fields}, store) when is_list(fields) do
-    args = ["HPERSIST", key, "FIELDS", Integer.to_string(length(fields)) | fields]
-    in_transaction(store, args, fn -> FieldOps.persist_fields(key, fields, store) end)
-  end
+  def handle_ast({:hpersist, key, fields}, store) when is_list(fields),
+    do: FieldOps.persist_fields(key, fields, store)
 
   def handle_ast({:hexpiretime, key, fields}, store) when is_list(fields),
     do: FieldOps.expiretime_fields(key, fields, :seconds, store)
@@ -569,17 +556,8 @@ defmodule Ferricstore.Commands.Hash do
   def handle_ast({:hgetdel, key, fields}, store) when is_list(fields),
     do: getdel_fields(key, fields, store)
 
-  def handle_ast({:hgetex, key, :none, fields}, store) when is_list(fields),
-    do: getex_checked(key, :none, fields, store)
-
-  # Like HEXPIRE, HGETEX with an expiry or PERSIST writes each field back with
-  # it; where it can, it runs as a one-command transaction.
-  def handle_ast({:hgetex, key, mode, fields}, store) when is_list(fields) do
-    # Below level 5 a transaction keeps a field given a past time.
-    in_transaction(store, hgetex_args(key, mode, fields), [level: 5], fn ->
-      getex_checked(key, mode, fields, store)
-    end)
-  end
+  def handle_ast({:hgetex, key, mode, fields}, store) when is_list(fields),
+    do: getex_checked(key, mode, fields, store)
 
   def handle_ast({:hsetex, key, {condition, expiry}, pairs}, store)
       when condition in [nil, :fnx, :fxx] and is_list(pairs),
@@ -1066,33 +1044,6 @@ defmodule Ferricstore.Commands.Hash do
   # Redis checks the key's type before the arguments: an argument error
   # becomes WRONGTYPE on a key of another type. (Parsed arguments go on to a
   # command that checks the type itself.)
-  defp in_transaction(store, command_args, opts \\ [], otherwise)
-
-  defp in_transaction(store, [command | args], opts, otherwise) do
-    case SingleCommand.run(store, command, args, opts) do
-      :fallback -> otherwise.()
-      result -> result
-    end
-  end
-
-  defp hgetex_args(key, mode, fields) do
-    mode_args =
-      case mode do
-        :persist -> ["PERSIST"]
-        {unit, time} -> [unit |> Atom.to_string() |> String.upcase(), Integer.to_string(time)]
-      end
-
-    ["HGETEX", key | mode_args] ++ ["FIELDS", Integer.to_string(length(fields)) | fields]
-  end
-
-  defp field_ttl_args(tag, key, ttl, condition, fields) do
-    condition_args =
-      if condition, do: [condition |> Atom.to_string() |> String.upcase()], else: []
-
-    [String.upcase(Atom.to_string(tag)), key, Integer.to_string(ttl)] ++
-      condition_args ++ ["FIELDS", Integer.to_string(length(fields)) | fields]
-  end
-
   defp type_checked_args(key, {:error, _reason} = error, store),
     do: with(:ok <- TypeRegistry.command_check_type(key, :hash, store), do: error)
 

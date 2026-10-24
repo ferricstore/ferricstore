@@ -4,7 +4,6 @@ defmodule Ferricstore.Commands.Expiry do
   alias Ferricstore.Commands.ExpiryTime
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.{Ops, ReadResult, TypeRegistry}
-  alias Ferricstore.Transaction.SingleCommand
 
   @probabilistic_types ["bloom", "cms", "cuckoo", "topk"]
 
@@ -208,15 +207,29 @@ defmodule Ferricstore.Commands.Expiry do
   # read before undid any write in between: INCR racing EXPIRE lost most of
   # its increments. Inside MULTI the handler runs in the state machine, where
   # nothing comes in between, and keeps writing the value back.
-  defp write_plain_expiry(key, _value, expire_at_ms, %FerricStore.Instance{} = ctx) do
+  defp write_plain_expiry(key, value, expire_at_ms, %FerricStore.Instance{} = ctx) do
     case Ops.getex(ctx, key, expire_at_ms) do
-      nil -> 0
-      {:error, _reason} = error -> error
-      _value -> 1
+      nil ->
+        0
+
+      # A Bloom, Cuckoo, Count-Min or Top-K key holds its structure's metadata
+      # under a type GETEX refuses; where it takes an expiry at all (a
+      # standalone instance), the value is written back with it as before.
+      {:error, "WRONGTYPE" <> _rest} ->
+        write_plain_expiry(key, value, expire_at_ms, :rewrite, ctx)
+
+      {:error, _reason} = error ->
+        error
+
+      _value ->
+        1
     end
   end
 
-  defp write_plain_expiry(key, value, expire_at_ms, store) do
+  defp write_plain_expiry(key, value, expire_at_ms, store),
+    do: write_plain_expiry(key, value, expire_at_ms, :rewrite, store)
+
+  defp write_plain_expiry(key, value, expire_at_ms, :rewrite, store) do
     case Ops.put(store, key, value, expire_at_ms) do
       :ok -> 1
       {:error, _} = error -> error
@@ -489,27 +502,10 @@ defmodule Ferricstore.Commands.Expiry do
     end
   end
 
-  # A collection's expiry lives on every member, so changing it rewrites them
-  # all. Read here and written back, that undid any member changed or added in
-  # between: INCRBY racing EXPIRE kept a fraction of its increments and RPUSH
-  # lost elements. Where it can, it runs instead as a one-command transaction,
-  # which the shard's state machine applies with nothing in between (inside
-  # MULTI the handler already runs there).
   defp set_collection_expiry(key, type, expire_at_ms, store) do
-    {command, args} =
-      if expire_at_ms == 0,
-        do: {"PERSIST", [key]},
-        else: {"PEXPIREAT", [key, Integer.to_string(expire_at_ms)]}
-
-    case SingleCommand.run(store, command, args) do
-      :fallback ->
-        case expire_compound_key(key, type, expire_at_ms, store) do
-          :ok -> 1
-          {:error, _} = error -> ReadResult.command_result(error)
-        end
-
-      result ->
-        result
+    case expire_compound_key(key, type, expire_at_ms, store) do
+      :ok -> 1
+      {:error, _} = error -> ReadResult.command_result(error)
     end
   end
 
