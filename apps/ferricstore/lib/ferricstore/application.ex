@@ -273,6 +273,11 @@ defmodule Ferricstore.Application do
               id: Ferricstore.Raft.WARaftBackend.SyncGate.TableHeir
             ),
             Ferricstore.Raft.WARaftBackend.SyncGate.TableOwner,
+            Supervisor.child_spec(
+              {Ferricstore.Store.ETSTableHeir, name: Ferricstore.Raft.WARaftSegmentLog.TableHeir},
+              id: Ferricstore.Raft.WARaftSegmentLog.TableHeir
+            ),
+            Ferricstore.Raft.WARaftSegmentLog.TableOwner,
             Ferricstore.Raft.WARaftBackend.BatcherSupervisor,
             Supervisor.child_spec(
               {Ferricstore.Store.ETSTableHeir,

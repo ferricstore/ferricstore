@@ -1046,7 +1046,20 @@ memory_registry_lookup(Name) ->
             not_found
     end.
 
+%% The FerricStore runtime owns the table, so that it outlives the shard
+%% processes that use it; it is created here only without that runtime.
 ensure_memory_registry() ->
+    case ets:info(?MEMORY_REGISTRY) of
+        undefined ->
+            case 'Elixir.Ferricstore.Raft.WARaftSegmentLog.TableOwner':ensure_table() of
+                ok -> ok;
+                {error, table_owner_unavailable} -> create_memory_registry()
+            end;
+        _Info ->
+            ok
+    end.
+
+create_memory_registry() ->
     case ets:info(?MEMORY_REGISTRY) of
         undefined ->
             try
