@@ -1,8 +1,8 @@
 defmodule Ferricstore.Commands.ReadDecideWriteLevel5Test do
   @moduledoc """
   Commands whose handlers write differently below feature level 5 inside a
-  transaction (BITOP, PFMERGE) run as one transaction entry only from that
-  level, so their races are checked there.
+  transaction (BITOP, PFMERGE, HGETEX) run as one transaction entry only from
+  that level, so their races are checked there.
   """
   use ExUnit.Case, async: false
   @moduletag :global_state
@@ -21,6 +21,30 @@ defmodule Ferricstore.Commands.ReadDecideWriteLevel5Test do
   setup do
     tag = "{level5-rmw:#{System.unique_integer([:positive])}}"
     %{ctx: FerricStore.Instance.get(:default), key: tag}
+  end
+
+  for {name, getex} <- [{"HGETEX EX", ["EX", "1000"]}, {"HGETEX PERSIST", ["PERSIST"]}] do
+    @getex getex
+    test "HINCRBY racing #{name} on the field loses no increment", %{ctx: ctx, key: key} do
+      assert 1 == Dispatcher.dispatch("HSET", [key, "f", "0"], ctx)
+
+      expirer =
+        Task.async(fn ->
+          for _ <- 1..100,
+              do: Dispatcher.dispatch("HGETEX", [key | @getex] ++ ["FIELDS", "1", "f"], ctx)
+        end)
+
+      1..8
+      |> Task.async_stream(
+        fn _ -> for _ <- 1..50, do: Dispatcher.dispatch("HINCRBY", [key, "f", "1"], ctx) end,
+        max_concurrency: 8,
+        timeout: 60_000
+      )
+      |> Stream.run()
+
+      Task.await(expirer, 60_000)
+      assert "400" == Dispatcher.dispatch("HGET", [key, "f"], ctx)
+    end
   end
 
   # PFMERGE read the destination's sketch and wrote it back merged, undoing

@@ -4,6 +4,20 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Changing the expiry of a list, hash, set or sorted set (EXPIRE, PEXPIRE,
+  EXPIREAT, PEXPIREAT, PERSIST) read every member and wrote them all back
+  with the new expiry, so members changed or added in between were undone:
+  HINCRBY racing EXPIRE kept 64 of 400 increments and RPUSH racing EXPIRE
+  left 9 of 401 elements. On the default instance the change now runs as a
+  one-command transaction that the shard applies with nothing in between.
+- HEXPIRE, HPEXPIRE, HPERSIST and HGETEX with an expiry or PERSIST read each
+  field and wrote it back with its new expiry, so a write to the field in
+  between was undone: HINCRBY racing HEXPIRE on one field kept 22 of 400
+  increments. On the default instance
+  they now run as a one-command transaction the shard applies with nothing in
+  between (a conditional HEXPIRE, a TTL of 0 and HGETEX do so from feature
+  level 5, the level at which a transaction applies them as the gateways
+  do).
 - A TTL written inside a transaction (MULTI, `FerricStore.Tx`), or carried
   by RENAME, COPY or a SET over a promoted collection, was never removed by
   the active expiry sweep, only when the key was read: those writes reach the

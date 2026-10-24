@@ -4,6 +4,7 @@ defmodule Ferricstore.Commands.Expiry do
   alias Ferricstore.Commands.ExpiryTime
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.{Ops, ReadResult, TypeRegistry}
+  alias Ferricstore.Transaction.SingleCommand
 
   @probabilistic_types ["bloom", "cms", "cuckoo", "topk"]
 
@@ -502,10 +503,27 @@ defmodule Ferricstore.Commands.Expiry do
     end
   end
 
+  # A collection's expiry lives on every member, so changing it rewrites them
+  # all. Read here and written back, that undid any member changed or added in
+  # between: INCRBY racing EXPIRE kept a fraction of its increments and RPUSH
+  # lost elements. Where it can, it runs instead as a one-command transaction,
+  # which the shard's state machine applies with nothing in between (inside
+  # MULTI the handler already runs there).
   defp set_collection_expiry(key, type, expire_at_ms, store) do
-    case expire_compound_key(key, type, expire_at_ms, store) do
-      :ok -> 1
-      {:error, _} = error -> ReadResult.command_result(error)
+    {command, args} =
+      if expire_at_ms == 0,
+        do: {"PERSIST", [key]},
+        else: {"PEXPIREAT", [key, Integer.to_string(expire_at_ms)]}
+
+    case SingleCommand.run(store, command, args) do
+      :fallback ->
+        case expire_compound_key(key, type, expire_at_ms, store) do
+          :ok -> 1
+          {:error, _} = error -> ReadResult.command_result(error)
+        end
+
+      result ->
+        result
     end
   end
 

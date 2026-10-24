@@ -121,6 +121,81 @@ defmodule Ferricstore.Commands.ReadDecideWriteLatchTest do
     end
   end
 
+  # A collection's expiry was set by reading every member and writing them all
+  # back with it, so members changed or added in between were undone.
+  for {name, init, write, read} <- [
+        {"HINCRBY", ["HSET", "f", "0"], ["HINCRBY", "f", "1"], ["HGET", "f"]},
+        {"ZINCRBY", ["ZADD", "0", "m"], ["ZINCRBY", "1", "m"], ["ZSCORE", "m"]},
+        {"RPUSH", ["RPUSH", "seed"], ["RPUSH", "e"], ["LLEN"]}
+      ] do
+    @init init
+    @write write
+    @read read
+    @expected if name == "RPUSH", do: 401, else: "400"
+
+    for expiry <- [["EXPIRE", "1000"], ["PEXPIREAT", "99999999999999"], ["PERSIST"]] do
+      @expiry expiry
+      test "#{name} racing #{hd(expiry)} on a collection loses nothing", %{ctx: ctx, key: key} do
+        [init | init_args] = @init
+        [write | write_args] = @write
+        [read | read_args] = @read
+        [expiry | expiry_args] = @expiry
+        Dispatcher.dispatch(init, [key | init_args], ctx)
+
+        expirer =
+          Task.async(fn ->
+            for i <- 1..100 do
+              # PERSIST only changes a key with a TTL.
+              if expiry == "PERSIST" and rem(i, 2) == 0,
+                do: Dispatcher.dispatch("EXPIRE", [key, "1000"], ctx),
+                else: Dispatcher.dispatch(expiry, [key | expiry_args], ctx)
+            end
+          end)
+
+        1..8
+        |> Task.async_stream(
+          fn _ -> for _ <- 1..50, do: Dispatcher.dispatch(write, [key | write_args], ctx) end,
+          max_concurrency: 8,
+          timeout: 60_000
+        )
+        |> Stream.run()
+
+        Task.await(expirer, 60_000)
+        assert @expected == Dispatcher.dispatch(read, [key | read_args], ctx)
+      end
+    end
+  end
+
+  # A hash field's expiry was set by reading the field and writing it back.
+  for expiry <- [["HEXPIRE", "1000"], ["HPEXPIRE", "1000000"], ["HPERSIST"]] do
+    @expiry expiry
+    test "HINCRBY racing #{hd(expiry)} on the field loses no increment", %{ctx: ctx, key: key} do
+      [expiry | ttl] = @expiry
+      assert 1 == Dispatcher.dispatch("HSET", [key, "f", "0"], ctx)
+
+      expirer =
+        Task.async(fn ->
+          for i <- 1..100 do
+            # HPERSIST only changes a field with a TTL.
+            if expiry == "HPERSIST" and rem(i, 2) == 0,
+              do: Dispatcher.dispatch("HEXPIRE", [key, "1000", "FIELDS", "1", "f"], ctx),
+              else: Dispatcher.dispatch(expiry, [key | ttl] ++ ["FIELDS", "1", "f"], ctx)
+          end
+        end)
+
+      1..8
+      |> Task.async_stream(
+        fn _ -> for _ <- 1..50, do: Dispatcher.dispatch("HINCRBY", [key, "f", "1"], ctx) end,
+        max_concurrency: 8,
+        timeout: 60_000
+      )
+      |> Stream.run()
+
+      Task.await(expirer, 60_000)
+      assert "400" == Dispatcher.dispatch("HGET", [key, "f"], ctx)
+    end
+  end
+
   test "embedded expire and persist racing incr lose no increment", %{key: key} do
     assert :ok = FerricStore.set(key, "0")
 
