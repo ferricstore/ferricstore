@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- At feature level 4 the gateways run HDEL and HSETNX as one replicated
+  entry, but `FerricStore.hdel/2` and `FerricStore.hsetnx/3` kept reading
+  and then writing: concurrent `hdel` calls of one field each answered
+  `{:ok, 1}`, and `hsetnx` could answer `{:ok, true}` and overwrite a field
+  a concurrent HSET had just created. They now take the same single-entry
+  path.
 - SMOVE racing SPOP or SREM on the same member could hand that member out
   twice: SMOVE read the source, a concurrent SPOP took the member, and SMOVE
   still added it to the destination, where a later SPOP returned it again.

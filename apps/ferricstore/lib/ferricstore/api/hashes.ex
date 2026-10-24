@@ -132,10 +132,11 @@ defmodule FerricStore.API.Hashes do
   """
   @spec hdel(key(), [binary()]) :: {:ok, non_neg_integer()}
   def hdel(key, fields) when is_list(fields) do
-    store = build_compound_store(key)
     str_fields = Enum.map(fields, &to_string/1)
 
-    case Hash.handle_ast({:hdel, [key | str_fields]}, store) do
+    # Given the instance, HDEL runs as one replicated entry at feature level 4,
+    # as on the gateways, so concurrent callers each see one outcome.
+    case Hash.handle_ast({:hdel, [key | str_fields]}, default_ctx()) do
       {:error, _} = err -> err
       count -> {:ok, count}
     end
@@ -371,13 +372,14 @@ defmodule FerricStore.API.Hashes do
   """
   @spec hsetnx(key(), binary(), binary()) :: {:ok, boolean()}
   def hsetnx(key, field, value) do
-    store = build_compound_store(key)
+    ctx = default_ctx()
 
-    # HSETNX reads the field and then writes it; the key latch keeps two
-    # callers from both seeing it missing, as the command path does.
+    # Given the instance, HSETNX runs as one replicated entry at feature level
+    # 4, as on the gateways. Below it, it reads the field and then writes it;
+    # the key latch keeps two callers from both seeing it missing.
     result =
-      Ferricstore.Store.Router.with_key_latch(default_ctx(), key, fn ->
-        Hash.handle_ast({:hsetnx, key, to_string(field), to_string(value)}, store)
+      Ferricstore.Store.Router.with_key_latch(ctx, key, fn ->
+        Hash.handle_ast({:hsetnx, key, to_string(field), to_string(value)}, ctx)
       end)
 
     case result do
