@@ -33,6 +33,45 @@ defmodule Ferricstore.Commands.ReadDecideWriteLatchTest do
     assert 1 == Dispatcher.dispatch("SCARD", [key <> ":to"], ctx)
   end
 
+  # SMOVE latches its source, but SPOP and SREM do not take that latch: a
+  # member SPOP took between SMOVE's read and its write still reached the
+  # destination, and a later SPOP there handed it out a second time.
+  test "concurrent SMOVE and SPOP hand out each member once", %{ctx: ctx, key: key} do
+    for round <- 1..3 do
+      from = "#{key}:from#{round}"
+      to = "#{key}:to#{round}"
+      members = for i <- 1..100, do: "m#{i}"
+      assert 100 == Dispatcher.dispatch("SADD", [from | members], ctx)
+
+      popped =
+        1..32
+        |> Task.async_stream(
+          fn client ->
+            Enum.flat_map(1..10, fn i ->
+              if rem(client + i, 2) == 0 do
+                [Dispatcher.dispatch("SPOP", [from], ctx), Dispatcher.dispatch("SPOP", [to], ctx)]
+              else
+                _ = Dispatcher.dispatch("SMOVE", [from, to, Enum.random(members)], ctx)
+                []
+              end
+            end)
+          end,
+          max_concurrency: 32,
+          timeout: 60_000
+        )
+        |> Enum.flat_map(fn {:ok, result} -> result end)
+        |> Enum.reject(&is_nil/1)
+
+      left =
+        Dispatcher.dispatch("SMEMBERS", [from], ctx) ++ Dispatcher.dispatch("SMEMBERS", [to], ctx)
+
+      all = popped ++ left
+
+      assert [] == all -- Enum.uniq(all), "handed out twice in round #{round}"
+      assert Enum.sort(members) == Enum.sort(all)
+    end
+  end
+
   test "concurrent EXPIRE NX has one winner", %{ctx: ctx, key: key} do
     assert :ok = Dispatcher.dispatch("SET", [key, "v"], ctx)
 

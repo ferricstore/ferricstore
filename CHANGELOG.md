@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- SMOVE racing SPOP or SREM on the same member could hand that member out
+  twice: SMOVE read the source, a concurrent SPOP took the member, and SMOVE
+  still added it to the destination, where a later SPOP returned it again.
+  With both keys on one shard SMOVE now removes the member from the source
+  in one atomic step that reports whether it was still there, and adds it to
+  the destination only then.
 - `SET key value KEEPTTL` (and `FerricStore.set/3` with `keepttl: true`) over
   a list, hash, set or sorted set that had a TTL replaced it with a string
   without a TTL; the key now keeps its TTL, as in Redis. Inside MULTI the old

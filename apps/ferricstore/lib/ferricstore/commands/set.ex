@@ -20,6 +20,7 @@ defmodule Ferricstore.Commands.Set do
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
   alias Ferricstore.Store.ReadResult
+  alias Ferricstore.Store.Router
   alias Ferricstore.Store.TypeRegistry
   alias Ferricstore.CrossShardOp
 
@@ -275,15 +276,8 @@ defmodule Ferricstore.Commands.Set do
   # SMOVE source destination member
   # ---------------------------------------------------------------------------
 
-  def handle("SMOVE", [source, destination, member], store) do
-    CrossShardOp.execute(
-      [{source, :read_write}, {destination, :write}],
-      fn unified_store ->
-        do_smove(source, destination, member, unified_store)
-      end,
-      store: store
-    )
-  end
+  def handle("SMOVE", [source, destination, member], store),
+    do: smove_member(source, destination, member, store)
 
   def handle("SMOVE", _args, _store) do
     {:error, "ERR wrong number of arguments for 'smove' command"}
@@ -651,7 +645,17 @@ defmodule Ferricstore.Commands.Set do
   defp sdiff_keys(_args, _store),
     do: {:error, "ERR wrong number of arguments for 'sdiff' command"}
 
-  defp smove_member(source, destination, member, store) do
+  defp smove_member(source, destination, member, %FerricStore.Instance{} = ctx)
+       when source != destination do
+    if Router.shard_for(ctx, source) == Router.shard_for(ctx, destination),
+      do: smove_atomic(source, destination, member, ctx),
+      else: smove_routed(source, destination, member, ctx)
+  end
+
+  defp smove_member(source, destination, member, store),
+    do: smove_routed(source, destination, member, store)
+
+  defp smove_routed(source, destination, member, store) do
     CrossShardOp.execute(
       [{source, :read_write}, {destination, :write}],
       fn unified_store ->
@@ -787,6 +791,52 @@ defmodule Ferricstore.Commands.Set do
   end
 
   # Core SMOVE logic, extracted for use inside CrossShardOp.execute.
+  # On the instance the member leaves the source through one replicated entry
+  # that reports whether it was still there, so of this SMOVE and a concurrent
+  # SPOP, SREM or SMOVE of the member only one takes it; only then does it
+  # join the destination. Reading first and moving after let a member SPOP had
+  # just taken reach the destination too, where it was handed out again.
+  # Inside MULTI the handler runs in the state machine, in order on every
+  # replica, and keeps the steps of do_smove/4.
+  defp smove_atomic(source, destination, member, store) do
+    with :ok <- TypeRegistry.command_check_type(source, :set, store) do
+      case TypeRegistry.get_type(source, store) do
+        "none" ->
+          0
+
+        {:error, {:storage_read_failed, _reason}} = failure ->
+          ReadResult.command_error(failure)
+
+        _set ->
+          with :ok <- TypeRegistry.command_check_type(destination, :set, store) do
+            case Ops.srem_single(store, source, member) do
+              1 -> add_moved_member(source, destination, member, store)
+              0 -> 0
+              {:error, _reason} = error -> error
+            end
+          end
+      end
+    end
+  end
+
+  # The member already left the source; if the destination refuses it, it
+  # goes back.
+  defp add_moved_member(source, destination, member, store) do
+    case Ops.sadd_single(store, destination, member) do
+      added when added in [0, 1] ->
+        1
+
+      {:error, _reason} = error ->
+        case Ops.sadd_single(store, source, member) do
+          restored when restored in [0, 1] ->
+            error
+
+          {:error, _reason} = restore_error ->
+            {:error, {:smove_rollback_failed, error, restore_error}}
+        end
+    end
+  end
+
   defp do_smove(source, destination, member, store) do
     with :ok <- TypeRegistry.command_check_type(source, :set, store),
          {:ok, source_has_member?} <- member_present?(source, member, store) do
