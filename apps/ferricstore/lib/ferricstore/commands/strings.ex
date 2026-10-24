@@ -1,6 +1,6 @@
 # Suppress function clause grouping warnings (clauses added by different agents)
 defmodule Ferricstore.Commands.Strings do
-  alias Ferricstore.Commands.ExpiryTime
+  alias Ferricstore.Commands.{Expiry, ExpiryTime}
   alias Ferricstore.Commands.Strings.{Compound, Delete, GetEx, MSet, Range, SetOptions}
   alias Ferricstore.Store.Ops
   alias Ferricstore.Store.ReadResult
@@ -832,6 +832,19 @@ defmodule Ferricstore.Commands.Strings do
 
       :compound when parsed.nx ->
         nil
+
+      # The collection keeps its TTL on its own metadata; the string that
+      # replaces it takes that TTL over. Only the instance takes this path:
+      # inside MULTI the handler runs in the state machine, where every
+      # release must keep applying the same thing.
+      :compound when parsed.keepttl and is_struct(store, FerricStore.Instance) ->
+        case Expiry.collection_expire_at_ms(key, store) do
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
+
+          expire_at_ms ->
+            replace_string_key(key, value, expire_at_ms || 0, store)
+        end
 
       :compound ->
         replace_string_key(key, value, parsed.expire_at_ms, store)

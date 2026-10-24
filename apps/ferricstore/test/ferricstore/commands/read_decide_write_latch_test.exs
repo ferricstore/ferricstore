@@ -33,6 +33,170 @@ defmodule Ferricstore.Commands.ReadDecideWriteLatchTest do
     assert 1 == Dispatcher.dispatch("SCARD", [key <> ":to"], ctx)
   end
 
+  # SMOVE latches its source, but SPOP and SREM do not take that latch: a
+  # member SPOP took between SMOVE's read and its write still reached the
+  # destination, and a later SPOP there handed it out a second time.
+  test "concurrent SMOVE and SPOP hand out each member once", %{ctx: ctx, key: key} do
+    for round <- 1..3 do
+      from = "#{key}:from#{round}"
+      to = "#{key}:to#{round}"
+      members = for i <- 1..100, do: "m#{i}"
+      assert 100 == Dispatcher.dispatch("SADD", [from | members], ctx)
+
+      popped =
+        1..32
+        |> Task.async_stream(
+          fn client ->
+            Enum.flat_map(1..10, fn i ->
+              if rem(client + i, 2) == 0 do
+                [Dispatcher.dispatch("SPOP", [from], ctx), Dispatcher.dispatch("SPOP", [to], ctx)]
+              else
+                _ = Dispatcher.dispatch("SMOVE", [from, to, Enum.random(members)], ctx)
+                []
+              end
+            end)
+          end,
+          max_concurrency: 32,
+          timeout: 60_000
+        )
+        |> Enum.flat_map(fn {:ok, result} -> result end)
+        |> Enum.reject(&is_nil/1)
+
+      left =
+        Dispatcher.dispatch("SMEMBERS", [from], ctx) ++ Dispatcher.dispatch("SMEMBERS", [to], ctx)
+
+      all = popped ++ left
+
+      assert [] == all -- Enum.uniq(all), "handed out twice in round #{round}"
+      assert Enum.sort(members) == Enum.sort(all)
+    end
+  end
+
+  # SETBIT read the whole value, changed one bit and wrote the value back, so
+  # concurrent clients setting different bits overwrote each other's.
+  test "concurrent SETBIT of different bits keeps every bit", %{ctx: ctx, key: key} do
+    assert :ok = Dispatcher.dispatch("SET", [key, "", "EX", "100"], ctx)
+
+    1..16
+    |> Task.async_stream(
+      fn client ->
+        for i <- 1..40, do: Dispatcher.dispatch("SETBIT", [key, "#{client * 40 + i}", "1"], ctx)
+      end,
+      max_concurrency: 16,
+      timeout: 60_000
+    )
+    |> Stream.run()
+
+    assert 640 == Dispatcher.dispatch("BITCOUNT", [key], ctx)
+    assert Dispatcher.dispatch("TTL", [key], ctx) in 95..100
+  end
+
+  # EXPIRE and PERSIST of a string read the value and wrote it back with the
+  # new expiry, so a write in between (INCR here) was undone.
+  for {name, expiry} <- [
+        {"EXPIRE", ["EXPIRE", "100"]},
+        {"PEXPIRE", ["PEXPIRE", "100000"]},
+        {"PERSIST", ["PERSIST"]}
+      ] do
+    @expiry expiry
+    test "INCR racing #{name} loses no increment", %{ctx: ctx, key: key} do
+      [command | args] = @expiry
+      assert :ok = Dispatcher.dispatch("SET", [key, "0", "EX", "1000"], ctx)
+
+      expirer =
+        Task.async(fn ->
+          for _ <- 1..200, do: Dispatcher.dispatch(command, [key | args], ctx)
+        end)
+
+      1..8
+      |> Task.async_stream(
+        fn _ -> for _ <- 1..50, do: Dispatcher.dispatch("INCR", [key], ctx) end,
+        max_concurrency: 8,
+        timeout: 60_000
+      )
+      |> Stream.run()
+
+      Task.await(expirer, 60_000)
+      assert "400" == Dispatcher.dispatch("GET", [key], ctx)
+    end
+  end
+
+  test "embedded expire and persist racing incr lose no increment", %{key: key} do
+    assert :ok = FerricStore.set(key, "0")
+
+    expirer =
+      Task.async(fn ->
+        for i <- 1..200 do
+          if rem(i, 2) == 0, do: FerricStore.expire(key, 100_000), else: FerricStore.persist(key)
+        end
+      end)
+
+    1..8
+    |> Task.async_stream(fn _ -> for _ <- 1..50, do: FerricStore.incr(key) end,
+      max_concurrency: 8,
+      timeout: 60_000
+    )
+    |> Stream.run()
+
+    Task.await(expirer, 60_000)
+    assert {:ok, "400"} == FerricStore.get(key)
+  end
+
+  # A store command whose destination is also a source read it and wrote it
+  # back, undoing writes to it in between.
+  test "SADD racing SUNIONSTORE into one of its sources keeps every member",
+       %{ctx: ctx, key: key} do
+    assert 1 == Dispatcher.dispatch("SADD", [key <> ":o", "o1"], ctx)
+
+    merger =
+      Task.async(fn ->
+        for _ <- 1..200,
+            do: Dispatcher.dispatch("SUNIONSTORE", [key <> ":k", key <> ":k", key <> ":o"], ctx)
+      end)
+
+    1..8
+    |> Task.async_stream(
+      fn client ->
+        for i <- 1..50, do: Dispatcher.dispatch("SADD", [key <> ":k", "#{client}-#{i}"], ctx)
+      end,
+      max_concurrency: 8,
+      timeout: 60_000
+    )
+    |> Stream.run()
+
+    Task.await(merger, 60_000)
+    assert 401 == Dispatcher.dispatch("SCARD", [key <> ":k"], ctx)
+  end
+
+  # Below feature level 5 a transaction writes BITOP's and PFMERGE's results
+  # the way older releases do; the instance writes them as Redis does.
+  test "BITOP into one of its sources still deletes an empty result", %{ctx: ctx, key: key} do
+    assert :ok = Dispatcher.dispatch("SET", [key, ""], ctx)
+    assert 0 == Dispatcher.dispatch("BITOP", ["OR", key, key, key <> ":missing"], ctx)
+    assert 0 == Dispatcher.dispatch("EXISTS", [key], ctx)
+  end
+
+  test "PFMERGE into one of its sources keeps the sketch's TTL", %{ctx: ctx, key: key} do
+    assert 1 == Dispatcher.dispatch("PFADD", [key, "a"], ctx)
+    assert 1 == Dispatcher.dispatch("EXPIRE", [key, "1000"], ctx)
+    assert 1 == Dispatcher.dispatch("PFADD", [key <> ":src", "b"], ctx)
+    assert :ok == Dispatcher.dispatch("PFMERGE", [key, key, key <> ":src"], ctx)
+    assert Dispatcher.dispatch("TTL", [key], ctx) in 990..1000
+  end
+
+  # A collection too large for one transaction entry still takes an expiry
+  # through the command's own path.
+  test "EXPIRE and PERSIST on a hash of 4000 fields", %{ctx: ctx, key: key} do
+    for chunk <- Enum.chunk_every(1..4000, 1000) do
+      Dispatcher.dispatch("HSET", [key | Enum.flat_map(chunk, &["f#{&1}", "v"])], ctx)
+    end
+
+    assert 1 == Dispatcher.dispatch("EXPIRE", [key, "1000"], ctx)
+    assert Dispatcher.dispatch("TTL", [key], ctx) in 990..1000
+    assert 1 == Dispatcher.dispatch("PERSIST", [key], ctx)
+    assert -1 == Dispatcher.dispatch("TTL", [key], ctx)
+  end
+
   test "concurrent EXPIRE NX has one winner", %{ctx: ctx, key: key} do
     assert :ok = Dispatcher.dispatch("SET", [key, "v"], ctx)
 

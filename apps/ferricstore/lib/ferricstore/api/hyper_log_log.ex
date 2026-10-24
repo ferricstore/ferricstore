@@ -92,12 +92,11 @@ defmodule FerricStore.API.HyperLogLog do
   def pfmerge(dest_key, source_keys) when is_list(source_keys) do
     ctx = default_ctx()
 
+    # Given the instance, PFMERGE runs as one transaction entry where it can,
+    # as on the gateways, so a concurrent pfadd to dest_key is not undone.
     result =
       Router.with_key_latch(ctx, dest_key, fn ->
-        HyperLogLog.handle_ast(
-          {:pfmerge, [dest_key | source_keys]},
-          build_string_store(dest_key)
-        )
+        HyperLogLog.handle_ast({:pfmerge, [dest_key | source_keys]}, ctx)
       end)
 
     case result do

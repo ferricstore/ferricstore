@@ -477,14 +477,34 @@ defmodule Ferricstore.Commands.Bitmap do
     end
   end
 
-  def handle_ast({:bitop, op, destkey, source_keys}, store)
+  # A destination that is also a source is read and then written back, which
+  # undid a SETBIT to it in between. Then, where it can, BITOP runs as a
+  # one-command transaction, applied by the shard with nothing in between.
+  def handle_ast({:bitop, op, destkey, source_keys} = ast, store)
       when op in [:band, :bor, :bxor, :bnot] and is_list(source_keys) and source_keys != [] do
+    if destkey in source_keys do
+      # Below level 5 a transaction keeps an empty result instead of deleting it.
+      case Ferricstore.Transaction.SingleCommand.run(store, "BITOP", bitop_args(ast), level: 5) do
+        :fallback -> bitop_here(op, destkey, source_keys, store)
+        result -> result
+      end
+    else
+      bitop_here(op, destkey, source_keys, store)
+    end
+  end
+
+  def handle_ast(_ast, _store), do: {:error, "ERR unsupported bitmap command AST"}
+
+  defp bitop_here(op, destkey, source_keys, store) do
     with {:ok, result} <- execute_bitop_ast(op, source_keys, store) do
       write_bitop_result(store, destkey, result)
     end
   end
 
-  def handle_ast(_ast, _store), do: {:error, "ERR unsupported bitmap command AST"}
+  defp bitop_args({:bitop, op, destkey, source_keys}) do
+    name = %{band: "AND", bor: "OR", bxor: "XOR", bnot: "NOT"} |> Map.fetch!(op)
+    [name, destkey | source_keys]
+  end
 
   # ===========================================================================
   # Private helpers
@@ -573,6 +593,14 @@ defmodule Ferricstore.Commands.Bitmap do
     do: value_size.(key)
 
   defp setbit_noop_candidate_size(_store, _key), do: :unknown
+
+  # On the instance the bit changes in one replicated entry that reads the
+  # value, flips the bit and keeps the TTL, as FerricStore.setbit/3 does.
+  # Reading here and writing the whole value back let concurrent clients
+  # setting different bits overwrite each other's. Inside MULTI the handler
+  # runs in the state machine and keeps rewriting the value.
+  defp setbit_rewrite(key, offset, bit_val, %FerricStore.Instance{} = ctx),
+    do: Ferricstore.Store.Router.setbit(ctx, key, offset, bit_val)
 
   defp setbit_rewrite(key, offset, bit_val, store) do
     case Ops.get_meta(store, key) do

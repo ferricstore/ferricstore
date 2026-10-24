@@ -198,11 +198,41 @@ defmodule Ferricstore.Commands.Expiry do
   defp durable_raft_store?(_store), do: true
 
   defp rewrite_plain(key, value, expire_at_ms, store) do
-    with :ok <- refuse_probabilistic(key, store) do
-      case Ops.put(store, key, value, expire_at_ms) do
-        :ok -> 1
-        {:error, _} = error -> error
-      end
+    with :ok <- refuse_probabilistic(key, store),
+         do: write_plain_expiry(key, value, expire_at_ms, store)
+  end
+
+  # On the instance the expiry changes in one replicated entry, GETEX's, which
+  # keeps whatever value the key holds when it applies. Writing back the value
+  # read before undid any write in between: INCR racing EXPIRE lost most of
+  # its increments. Inside MULTI the handler runs in the state machine, where
+  # nothing comes in between, and keeps writing the value back.
+  defp write_plain_expiry(key, value, expire_at_ms, %FerricStore.Instance{} = ctx) do
+    case Ops.getex(ctx, key, expire_at_ms) do
+      nil ->
+        0
+
+      # A Bloom, Cuckoo, Count-Min or Top-K key holds its structure's metadata
+      # under a type GETEX refuses; where it takes an expiry at all (a
+      # standalone instance), the value is written back with it as before.
+      {:error, "WRONGTYPE" <> _rest} ->
+        write_plain_expiry(key, value, expire_at_ms, :rewrite, ctx)
+
+      {:error, _reason} = error ->
+        error
+
+      _value ->
+        1
+    end
+  end
+
+  defp write_plain_expiry(key, value, expire_at_ms, store),
+    do: write_plain_expiry(key, value, expire_at_ms, :rewrite, store)
+
+  defp write_plain_expiry(key, value, expire_at_ms, :rewrite, store) do
+    case Ops.put(store, key, value, expire_at_ms) do
+      :ok -> 1
+      {:error, _} = error -> error
     end
   end
 
@@ -282,10 +312,7 @@ defmodule Ferricstore.Commands.Expiry do
         rewrite_plain(key, value, expire_at_ms, store)
 
       {:compound, type, _old_exp} ->
-        case expire_compound_key(key, type, expire_at_ms, store) do
-          :ok -> 1
-          {:error, _} = error -> ReadResult.command_result(error)
-        end
+        set_collection_expiry(key, type, expire_at_ms, store)
     end
   end
 
@@ -411,10 +438,7 @@ defmodule Ferricstore.Commands.Expiry do
         rewrite_plain(key, value, 0, store)
 
       {:compound, type, _exp} ->
-        case expire_compound_key(key, type, 0, store) do
-          :ok -> 1
-          {:error, _} = error -> ReadResult.command_result(error)
-        end
+        set_collection_expiry(key, type, 0, store)
     end
   end
 
@@ -443,6 +467,18 @@ defmodule Ferricstore.Commands.Expiry do
     end
   end
 
+  @doc false
+  # The expiry a list, hash, set or sorted set keeps on its own metadata, or
+  # nil when `key` holds none of them.
+  @spec collection_expire_at_ms(binary(), map()) ::
+          non_neg_integer() | nil | ReadResult.failure()
+  def collection_expire_at_ms(key, store) do
+    case compound_meta(key, store) do
+      {:compound, _type, expire_at_ms} -> expire_at_ms
+      nil_or_failure -> nil_or_failure
+    end
+  end
+
   defp compound_meta(key, store) do
     if Ops.has_compound?(store) do
       type_key = CompoundKey.type_key(key)
@@ -463,6 +499,13 @@ defmodule Ferricstore.Commands.Expiry do
         {type, expire_at_ms} ->
           {:compound, type, expire_at_ms}
       end
+    end
+  end
+
+  defp set_collection_expiry(key, type, expire_at_ms, store) do
+    case expire_compound_key(key, type, expire_at_ms, store) do
+      :ok -> 1
+      {:error, _} = error -> ReadResult.command_result(error)
     end
   end
 

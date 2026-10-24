@@ -26,6 +26,13 @@ defmodule Ferricstore.WritePathSetOptionsTest do
   # Helper: unique key with a given prefix
   defp ukey(prefix), do: "#{prefix}:#{:rand.uniform(9_999_999)}"
 
+  defp dispatch(command, args, ctx) do
+    case Ferricstore.Commands.Dispatcher.dispatch(command, args, ctx) do
+      {:error, _reason} = error -> error
+      result -> {:ok, result}
+    end
+  end
+
   # Helper: builds a store map backed by the real Router
   defp real_store do
     %{
@@ -157,6 +164,44 @@ defmodule Ferricstore.WritePathSetOptionsTest do
       {_val2, new_exp} = store.get_meta.(key)
       # The TTL should be preserved (approximately the same)
       assert_in_delta new_exp, stored_exp, 1000
+    end
+
+    # SET replaces a list, hash, set or sorted set with a string, and with
+    # KEEPTTL the key keeps the TTL it had, as in Redis.
+    test "SET KEEPTTL over a collection keeps the collection's TTL" do
+      ctx = FerricStore.Instance.get(:default)
+
+      for {type, create} <- [
+            list: ["RPUSH", "a"],
+            hash: ["HSET", "f", "v"],
+            set: ["SADD", "a"],
+            zset: ["ZADD", "1", "a"]
+          ] do
+        key = ukey("keepttl_#{type}")
+        [command | args] = create
+        assert {:ok, _} = dispatch(command, [key | args], ctx)
+        assert {:ok, 1} = dispatch("EXPIRE", [key, "100"], ctx)
+
+        assert {:ok, :ok} = dispatch("SET", [key, "v", "KEEPTTL"], ctx)
+
+        assert {:ok, "v"} = dispatch("GET", [key], ctx)
+        assert {:ok, ttl} = dispatch("TTL", [key], ctx)
+        assert ttl in 99..100, "SET KEEPTTL over a #{type} left TTL #{ttl}"
+      end
+    end
+
+    test "embedded set with keepttl over a collection keeps the collection's TTL" do
+      key = ukey("embedded_keepttl_list")
+      assert {:ok, 1} = FerricStore.rpush(key, ["a"])
+      assert {:ok, true} = FerricStore.expire(key, 100_000)
+
+      assert :ok = FerricStore.set(key, "v", keepttl: true)
+
+      assert {:ok, "v"} = FerricStore.get(key)
+      assert {:ok, ttl_ms} = FerricStore.ttl(key)
+
+      assert ttl_ms in 98_000..100_000,
+             "embedded keepttl set over a list left TTL #{inspect(ttl_ms)}"
     end
 
     test "SET KEEPTTL on key without TTL keeps no-expiry" do

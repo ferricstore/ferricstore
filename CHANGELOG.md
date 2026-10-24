@@ -4,6 +4,45 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- SUNIONSTORE, SINTERSTORE, SDIFFSTORE and BITOP into a key that is also one
+  of their sources read it and wrote it back, undoing writes to it in between
+  (SADD racing `SUNIONSTORE k k other` lost a third of its members, SETBIT
+  racing `BITOP OR k k other` nearly all its bits). On one shard of the
+  default instance they now run as a one-command transaction (BITOP from
+  feature level 5, below which a transaction keeps an empty result).
+- PFMERGE read the destination's sketch and wrote it back merged, so a PFADD
+  to the destination in between was undone (PFADDs racing repeated PFMERGEs
+  into one key left a count of 2 for 801 elements); `FerricStore.pfmerge/2`
+  did the same. With every key on one shard of the default instance it now
+  runs as a one-command transaction from feature level 5 (below it a
+  transaction drops the sketch's TTL, so PFMERGE keeps its old path).
+- EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT and PERSIST on a string read its value
+  and wrote it back with the new expiry, so a write in between was undone:
+  INCR racing EXPIRE on one key, the usual rate-limiter pattern, kept 5 of
+  400 increments. On the gateways and through `FerricStore.expire/2`,
+  `persist/1`, `expireat/2` and `pexpireat/2` the expiry now changes in one
+  replicated entry that keeps the current value.
+- Concurrent SETBIT on one key through the gateways lost bits: each command
+  read the whole value, changed one bit and wrote the value back, so clients
+  setting different bits overwrote each other's (16 clients setting 640
+  distinct bits left 40). SETBIT now changes the bit in one replicated entry,
+  as `FerricStore.setbit/3` already did.
+- At feature level 4 the gateways run HDEL and HSETNX as one replicated
+  entry, but `FerricStore.hdel/2` and `FerricStore.hsetnx/3` kept reading
+  and then writing: concurrent `hdel` calls of one field each answered
+  `{:ok, 1}`, and `hsetnx` could answer `{:ok, true}` and overwrite a field
+  a concurrent HSET had just created. They now take the same single-entry
+  path.
+- SMOVE racing SPOP or SREM on the same member could hand that member out
+  twice: SMOVE read the source, a concurrent SPOP took the member, and SMOVE
+  still added it to the destination, where a later SPOP returned it again.
+  With both keys on one shard SMOVE now removes the member from the source
+  in one atomic step that reports whether it was still there, and adds it to
+  the destination only then.
+- `SET key value KEEPTTL` (and `FerricStore.set/3` with `keepttl: true`) over
+  a list, hash, set or sorted set that had a TTL replaced it with a string
+  without a TTL; the key now keeps its TTL, as in Redis. Inside MULTI the old
+  behavior stays, since the transaction is applied on every replica.
 - When one shard's Raft log process restarted, every shard lost its segment
   log memory stats, and an append on another shard at that moment could fail
   after it was synced and be rolled back, answering the write with an error.
