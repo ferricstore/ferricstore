@@ -29,9 +29,20 @@ defmodule Ferricstore.Transaction.SingleCommand do
          true <- level_ready?(ctx, prepared.command_keys, Keyword.get(opts, :level)),
          nil <- ReplicaCompat.queue_error(command, prepared.ast, prepared.command_keys, ctx) do
       case Coordinator.execute([prepared], %{}, nil) do
-        [result] -> result
-        {:error, _reason} = error -> error
-        other -> {:error, {:unexpected_transaction_result, other}}
+        [result] ->
+          result
+
+        # The entry was refused before it changed anything, as when the
+        # command's work is more than one transaction entry may do; the
+        # command's own path may still take it.
+        {:error, "ERR transaction raft unavailable: " <> _reason} ->
+          :fallback
+
+        {:error, _reason} = error ->
+          error
+
+        other ->
+          {:error, {:unexpected_transaction_result, other}}
       end
     else
       _not_here -> :fallback

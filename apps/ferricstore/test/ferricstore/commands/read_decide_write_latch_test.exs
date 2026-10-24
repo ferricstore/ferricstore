@@ -259,6 +259,19 @@ defmodule Ferricstore.Commands.ReadDecideWriteLatchTest do
     assert Dispatcher.dispatch("TTL", [key], ctx) in 990..1000
   end
 
+  # A collection too large for one transaction entry still takes an expiry
+  # through the command's own path.
+  test "EXPIRE and PERSIST on a hash of 4000 fields", %{ctx: ctx, key: key} do
+    for chunk <- Enum.chunk_every(1..4000, 1000) do
+      Dispatcher.dispatch("HSET", [key | Enum.flat_map(chunk, &["f#{&1}", "v"])], ctx)
+    end
+
+    assert 1 == Dispatcher.dispatch("EXPIRE", [key, "1000"], ctx)
+    assert Dispatcher.dispatch("TTL", [key], ctx) in 990..1000
+    assert 1 == Dispatcher.dispatch("PERSIST", [key], ctx)
+    assert -1 == Dispatcher.dispatch("TTL", [key], ctx)
+  end
+
   test "concurrent EXPIRE NX has one winner", %{ctx: ctx, key: key} do
     assert :ok = Dispatcher.dispatch("SET", [key, "v"], ctx)
 
