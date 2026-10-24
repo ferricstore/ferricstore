@@ -4,6 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A durable write spends less time around its fsync. Before each append the
+  WARaft segment log stats its directory, poison marker, segment and offset
+  index in one call (new NIF `fs_lstat_many/1`) instead of six separate
+  stats, takes the open segment's end from that stat instead of seeking, and
+  no longer converts file times nothing reads; the storage apply keeps its
+  shard paths instead of rebuilding them for every write. On Linux (Docker
+  VM, medians of interleaved runs) the work around each write's fsync fell
+  from about 200 to 143 µs, and throughput rose 22% with 64 concurrent writers
+  and 9% with 256. The live symlink, replaced-file and poison-marker checks
+  are unchanged.
 - A Flow signal retried with the same idempotency key and the same content
   was applied again: it added a version and a history event, and a retried
   signal that had already moved the Flow (`transition_to`) answered "ERR flow

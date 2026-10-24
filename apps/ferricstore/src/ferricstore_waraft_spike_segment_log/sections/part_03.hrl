@@ -582,7 +582,7 @@ stream_disk_segment_paths([{SourceOrdinal, Path} | Rest], DestDir, KeepFun, Reco
     end.
 
 stream_disk_segment_path(Path, DestDir, KeepFun, RecordsPerSegment, SourceOrdinal, Ordinal, RecordsRev, Rollbacks) ->
-    case file:read_link_info(Path, [raw]) of
+    case file:read_link_info(Path, ?STAT_OPTS) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
             case open_verified_segment_file(Path, [read, raw, binary]) of
                 {ok, Fd} ->
@@ -1215,7 +1215,7 @@ existing_records_per_segment(Dir) ->
 read_disk_record(Dir, Index, RecordsPerSegment) ->
     Ordinal = segment_ordinal(Index, RecordsPerSegment),
     Path = filename:join(Dir, segment_file_from_ordinal(Ordinal)),
-    case file:read_link_info(Path, [raw]) of
+    case file:read_link_info(Path, ?STAT_OPTS) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
             case open_verified_segment_file(Path, [read, raw, binary]) of
                 {ok, Fd} ->

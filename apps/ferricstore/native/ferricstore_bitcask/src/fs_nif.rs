@@ -114,6 +114,138 @@ fn remove_dir_all_idempotent(path: &Path) -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Batched lstat (dirty I/O scheduler)
+// ---------------------------------------------------------------------------
+
+mod lstat_atoms {
+    rustler::atoms! {
+        regular,
+        directory,
+        symlink,
+        device,
+        other,
+        eperm,
+        enoent,
+        eio,
+        enxio,
+        ebadf,
+        enomem,
+        eacces,
+        efault,
+        enotdir,
+        einval,
+        enametoolong,
+        eloop,
+        eoverflow,
+        estale,
+        unknown,
+    }
+}
+
+/// What `lstat` reports about one path, in the units `file:read_link_info/2`
+/// uses: OTP keeps the device and inode as 32-bit values, so identities taken
+/// here compare with identities taken through `prim_file`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LstatInfo {
+    pub kind: LstatKind,
+    pub device: u32,
+    pub inode: u32,
+    pub size: u64,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum LstatKind {
+    Regular,
+    Directory,
+    Symlink,
+    Device,
+    Other,
+}
+
+/// `lstat` one path. Errors carry the raw errno; an empty path or one with a
+/// NUL byte is `EINVAL`, which is what the kernel would not get a chance to say.
+#[cfg(unix)]
+pub(crate) fn lstat_info(path: &[u8]) -> Result<LstatInfo, i32> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    if path.is_empty() || path.contains(&0u8) {
+        return Err(libc::EINVAL);
+    }
+
+    let metadata = std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(path))
+        .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))?;
+    let file_type = metadata.file_type();
+    let kind = if file_type.is_file() {
+        LstatKind::Regular
+    } else if file_type.is_dir() {
+        LstatKind::Directory
+    } else if file_type.is_symlink() {
+        LstatKind::Symlink
+    } else if file_type.is_block_device() || file_type.is_char_device() {
+        LstatKind::Device
+    } else {
+        LstatKind::Other
+    };
+
+    Ok(LstatInfo {
+        kind,
+        device: metadata.dev() as u32,
+        inode: metadata.ino() as u32,
+        size: metadata.size(),
+    })
+}
+
+/// The posix atom `prim_file` reports for an errno (`unknown` for the rest).
+fn posix_atom(errno: i32) -> rustler::Atom {
+    match errno {
+        libc::EPERM => lstat_atoms::eperm(),
+        libc::ENOENT => lstat_atoms::enoent(),
+        libc::EIO => lstat_atoms::eio(),
+        libc::ENXIO => lstat_atoms::enxio(),
+        libc::EBADF => lstat_atoms::ebadf(),
+        libc::ENOMEM => lstat_atoms::enomem(),
+        libc::EACCES => lstat_atoms::eacces(),
+        libc::EFAULT => lstat_atoms::efault(),
+        libc::ENOTDIR => lstat_atoms::enotdir(),
+        libc::EINVAL => lstat_atoms::einval(),
+        libc::ENAMETOOLONG => lstat_atoms::enametoolong(),
+        libc::ELOOP => lstat_atoms::eloop(),
+        libc::EOVERFLOW => lstat_atoms::eoverflow(),
+        libc::ESTALE => lstat_atoms::estale(),
+        _ => lstat_atoms::unknown(),
+    }
+}
+
+/// `lstat` several paths in one call, so a caller that checks a handful of
+/// paths pays one dirty-scheduler round trip instead of one per path.
+///
+/// Returns one entry per path, in order: `{:ok, type, device, inode, size}`
+/// with `type` one of `:regular | :directory | :symlink | :device | :other`,
+/// or `{:error, posix}` with the atom `file:read_link_info/2` would return.
+#[cfg(unix)]
+#[rustler::nif(schedule = "DirtyIo")]
+fn fs_lstat_many<'a>(env: Env<'a>, paths: Vec<Binary<'a>>) -> NifResult<Term<'a>> {
+    let entries: Vec<Term<'a>> = paths
+        .iter()
+        .map(|path| match lstat_info(path.as_slice()) {
+            Ok(info) => {
+                let kind = match info.kind {
+                    LstatKind::Regular => lstat_atoms::regular(),
+                    LstatKind::Directory => lstat_atoms::directory(),
+                    LstatKind::Symlink => lstat_atoms::symlink(),
+                    LstatKind::Device => lstat_atoms::device(),
+                    LstatKind::Other => lstat_atoms::other(),
+                };
+                (atoms::ok(), kind, info.device, info.inode, info.size).encode(env)
+            }
+            Err(errno) => (atoms::error(), posix_atom(errno)).encode(env),
+        })
+        .collect();
+    let _ = consume_timeslice(env, 1);
+    Ok(entries.encode(env))
+}
+
+// ---------------------------------------------------------------------------
 // Synchronous metadata NIFs (dirty I/O scheduler)
 // ---------------------------------------------------------------------------
 
@@ -1115,6 +1247,52 @@ fn encode_error_owned<'a>(env: Env<'a>, err: &io::Error) -> Term<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn lstat_info_reports_type_identity_and_size_without_following_links() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("0.seg");
+        let link = dir.path().join("link");
+        fs::write(&file, b"twelve bytes").unwrap();
+        symlink(&file, &link).unwrap();
+        let metadata = fs::symlink_metadata(&file).unwrap();
+
+        let info = lstat_info(file.as_os_str().as_bytes()).unwrap();
+        assert_eq!(info.kind, LstatKind::Regular);
+        assert_eq!(info.size, 12);
+        assert_eq!(info.device, metadata.dev() as u32);
+        assert_eq!(info.inode, metadata.ino() as u32);
+
+        let link_info = lstat_info(link.as_os_str().as_bytes()).unwrap();
+        assert_eq!(link_info.kind, LstatKind::Symlink);
+        assert_ne!(link_info.inode, info.inode);
+
+        let dir_info = lstat_info(dir.path().as_os_str().as_bytes()).unwrap();
+        assert_eq!(dir_info.kind, LstatKind::Directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lstat_info_reports_errno_for_missing_and_malformed_paths() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("missing");
+        let under_file = dir.path().join("file");
+        fs::write(&under_file, b"x").unwrap();
+
+        assert_eq!(
+            lstat_info(missing.as_os_str().as_bytes()),
+            Err(libc::ENOENT)
+        );
+        assert_eq!(
+            lstat_info(under_file.join("child").as_os_str().as_bytes()),
+            Err(libc::ENOTDIR)
+        );
+        assert_eq!(lstat_info(b""), Err(libc::EINVAL));
+        assert_eq!(lstat_info(b"/tmp/a\0b"), Err(libc::EINVAL));
+    }
     use std::fs::{self, File};
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;

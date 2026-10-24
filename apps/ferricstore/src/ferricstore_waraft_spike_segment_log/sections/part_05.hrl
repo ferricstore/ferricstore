@@ -1,13 +1,33 @@
 %% Included by ferricstore_waraft_spike_segment_log.erl; generated split section 5.
 
 validate_segment_log_dir(Dir) ->
-    case file:read_link_info(Dir, [raw]) of
+    case segment_log_dir_state(Dir) of
+        missing -> ok;
+        Result -> Result
+    end.
+
+%% Every append runs this, and each stat is a dirty-scheduler round trip: one
+%% lstat tells an existing directory, which is all an append needs, from a
+%% missing one, which is created and then checked again.
+ensure_segment_log_dir_for_append(Dir) ->
+    case segment_log_dir_state(Dir) of
+        missing ->
+            case metadata_ensure_dir(filename:join(Dir, "dummy")) of
+                ok -> validate_segment_log_dir(Dir);
+                {error, Reason} -> {error, {ensure_dir, Reason}}
+            end;
+        Result ->
+            Result
+    end.
+
+segment_log_dir_state(Dir) ->
+    case lstat_path(Dir) of
         {ok, #file_info{type = directory}} ->
             ok;
         {ok, #file_info{type = Type}} ->
             {error, {unsafe_segment_log_dir, Dir, Type}};
         {error, enoent} ->
-            ok;
+            missing;
         {error, Reason} ->
             {error, {read_segment_log_dir, Dir, Reason}}
     end.
@@ -257,7 +277,7 @@ locate_offset_on_disk(_Dir, _Index) ->
 locate_disk_record_offset(Dir, Index, RecordsPerSegment) ->
     Ordinal = segment_ordinal(Index, RecordsPerSegment),
     Path = filename:join(Dir, segment_file_from_ordinal(Ordinal)),
-    case file:read_link_info(Path, [raw]) of
+    case file:read_link_info(Path, ?STAT_OPTS) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
             %% Sparse projection indexes legitimately have no derived slot.
             %% Buffer the verified fallback scan while retaining its full CRC
@@ -680,7 +700,14 @@ retire_abandoned_rewrite_writers(Dir) ->
     end.
 
 offset_dir_key(Dir) ->
-    unicode:characters_to_binary(cache_dir_key(Dir)).
+    case erlang:get(?OFFSET_DIR_KEY_CACHE) of
+        {Dir, DirKey} ->
+            DirKey;
+        _Other ->
+            DirKey = unicode:characters_to_binary(cache_dir_key(Dir)),
+            erlang:put(?OFFSET_DIR_KEY_CACHE, {Dir, DirKey}),
+            DirKey
+    end.
 
 read_log_disk_record(Log, Index) when is_integer(Index), Index >= 0 ->
     Dir = log_dir(Log),
@@ -1237,7 +1264,7 @@ preload_segment_config(Dir) ->
     end.
 
 read_segment_metadata_file(Path, TooLargeReason) ->
-    case file:read_link_info(Path, [raw]) of
+    case file:read_link_info(Path, ?STAT_OPTS) of
         {ok, #file_info{type = regular, size = Size}} when Size =< ?MAX_SEGMENT_METADATA_BYTES ->
             case read_segment_file_nofollow(Path, ?MAX_SEGMENT_METADATA_BYTES) of
                 {error, {too_large, Detail}} ->

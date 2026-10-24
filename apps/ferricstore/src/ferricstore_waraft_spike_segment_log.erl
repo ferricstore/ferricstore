@@ -78,6 +78,10 @@
 -define(REWRITE_GROUP_MAX_RECORDS, 128).
 -define(APPEND_FAILURE_MARKER, "segment_log.append_failed.term").
 -define(DEFAULT_PREALLOCATE_BYTES, 0).
+%% Options for every stat in this module. Nothing reads file times, and the
+%% default local times cost three time-zone conversions per stat.
+-define(STAT_OPTS, [raw, {time, posix}]).
+-define(STAT_PREFETCH, ferricstore_waraft_segment_stat_prefetch).
 -define(WRITER_REGISTRY, ferricstore_waraft_segment_writer_registry).
 -define(OFFSET_REGISTRY, ferricstore_waraft_segment_offset_registry).
 -define(OFFSET_INDEX_MAGIC, 16#F00D2026).
@@ -93,6 +97,8 @@
 %% filename:dirname/1 walk the whole charlist path on every call.
 -define(APPEND_KIND_CACHE, ferricstore_waraft_segment_append_kind_cache).
 -define(DIRNAME_CACHE, ferricstore_waraft_segment_dirname_cache).
+-define(SEGMENT_DIR_CACHE, ferricstore_waraft_segment_dir_cache).
+-define(OFFSET_DIR_KEY_CACHE, ferricstore_waraft_segment_offset_dir_key_cache).
 -define(FOLD_LOCATION, ferricstore_waraft_segment_log_fold_location).
 -define(DEFAULT_MAX_ETS_BYTES, 536870912).
 -define(DEFAULT_MAX_ETS_ENTRIES, 65536).

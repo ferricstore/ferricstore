@@ -1329,6 +1329,18 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec fs_read_nofollow(binary(), non_neg_integer()) :: {:ok, binary()} | fs_error()
   def fs_read_nofollow(_path, _max_bytes), do: :erlang.nif_error(:nif_not_loaded)
 
+  @doc """
+  `lstat` several paths in one dirty-scheduler call. Returns one entry per path,
+  in order: `{:ok, type, device, inode, size}` with the type, device and inode
+  as `file:read_link_info/2` reports them, or `{:error, posix}`.
+  """
+  @spec fs_lstat_many([binary()]) :: [
+          {:ok, :regular | :directory | :symlink | :device | :other, non_neg_integer(),
+           non_neg_integer(), non_neg_integer()}
+          | {:error, atom()}
+        ]
+  def fs_lstat_many(_paths), do: :erlang.nif_error(:nif_not_loaded)
+
   @doc "Read a private regular file without following a final symlink."
   @spec fs_read_private_nofollow(binary(), non_neg_integer()) :: {:ok, binary()} | fs_error()
   def fs_read_private_nofollow(_path, _max_bytes), do: :erlang.nif_error(:nif_not_loaded)

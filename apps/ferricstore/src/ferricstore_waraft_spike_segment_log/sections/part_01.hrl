@@ -525,7 +525,7 @@ open_disk_reader_file(Dir, Index, ExpectedOrdinal, RecordsPerSegment) ->
             {error, {segment_ordinal_mismatch, Ordinal, ExpectedOrdinal}};
         true ->
             Path = filename:join(Dir, segment_file_from_ordinal(Ordinal)),
-            case file:read_link_info(Path, [raw]) of
+            case file:read_link_info(Path, ?STAT_OPTS) of
                 {ok, #file_info{type = regular, size = FileBytes}} ->
                     case open_verified_segment_file(Path, [read, raw, binary]) of
                         {ok, Fd} ->
@@ -958,7 +958,18 @@ reset_disk_to_position(RootDir, {raft_log_pos, Index, Term})
 reset_disk_to_position(_RootDir, Position) ->
     {error, {bad_reset_position, Position}}.
 
+%% Storage applies and readers resolve the same root on every call.
 fold_disk_segment_dir(RootDir) ->
+    case erlang:get(?SEGMENT_DIR_CACHE) of
+        {RootDir, Dir} ->
+            Dir;
+        _Other ->
+            Dir = fold_disk_segment_dir_uncached(RootDir),
+            erlang:put(?SEGMENT_DIR_CACHE, {RootDir, Dir}),
+            Dir
+    end.
+
+fold_disk_segment_dir_uncached(RootDir) ->
     Path = unicode:characters_to_list(RootDir),
     case filename:basename(Path) of
         "segment_log" -> Path;

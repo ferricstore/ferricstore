@@ -1134,6 +1134,159 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
     )
   end
 
+  # Every stat is a dirty-scheduler round trip on the durable write path. An
+  # append checks its directory, poison marker, segment and offset index, so
+  # it asks for all four in one call.
+  test "an append checks its log paths with one stat call" do
+    with_segment_log_memory_env(
+      max_bytes: 1_000_000,
+      max_entries: 100_000,
+      min_entries: 1,
+      records_per_segment: 1_000_000,
+      fun: fn _root, log, _log_name ->
+        provider = :ferricstore_waraft_spike_segment_log
+        assert :ok = provider.init(log)
+        assert {:ok, _state} = provider.open(log)
+        dir = :wa_raft_part_sup.registered_partition_path(elem(log, 3), elem(log, 4))
+        log_dir = Path.join(to_string(dir), "segment_log")
+
+        append = fn index ->
+          Task.await(
+            Task.async(fn ->
+              provider.append(
+                {:log_view, log, max(index - 1, 0), index - 1, :undefined},
+                [{1, {:cmd, "entry-#{index}"}}],
+                :strict,
+                :low
+              )
+            end)
+          )
+        end
+
+        assert :ok = append.(1)
+        stat_many = {Ferricstore.Bitcask.NIF, :fs_lstat_many, 1}
+        :erlang.trace_pattern({:file, :read_link_info, 2}, true, [:global])
+        :erlang.trace_pattern(stat_many, true, [:global])
+        :erlang.trace(:all, true, [:call])
+
+        on_exit(fn ->
+          :erlang.trace(:all, false, [:call])
+          :erlang.trace_pattern({:file, :read_link_info, 2}, false, [:global])
+          :erlang.trace_pattern(stat_many, false, [:global])
+        end)
+
+        for index <- 2..11 do
+          assert :ok = append.(index)
+        end
+
+        :erlang.trace(:all, false, [:call])
+
+        calls =
+          Stream.repeatedly(fn ->
+            receive do
+              {:trace, _pid, :call, {:file, :read_link_info, [path, _opts]}} ->
+                {:single, to_string(path)}
+
+              {:trace, _pid, :call, {Ferricstore.Bitcask.NIF, :fs_lstat_many, [paths]}} ->
+                {:batch, Enum.map(paths, &to_string/1)}
+            after
+              100 -> :done
+            end
+          end)
+          |> Enum.take_while(&(&1 != :done))
+
+        # The trace sees every process in the VM; keep only this log's paths.
+        singles = for {:single, path} <- calls, String.starts_with?(path, log_dir), do: path
+
+        batches =
+          for {:batch, paths} <- calls,
+              Enum.any?(paths, &String.starts_with?(&1, log_dir)),
+              do: paths
+
+        assert singles == [], "10 appends made #{length(singles)} single stat calls"
+        assert length(batches) == 10, "10 appends made #{length(batches)} batched stat calls"
+
+        for paths <- batches do
+          assert Enum.sort(paths) ==
+                   Enum.sort([
+                     log_dir,
+                     Path.join(log_dir, "segment_log.append_failed.term"),
+                     Path.join(log_dir, "0.seg"),
+                     Path.join(log_dir, "0.idx")
+                   ])
+        end
+      end
+    )
+  end
+
+  # The stat that confirms the open segment is still the file at its path also
+  # gives its size, which is where the next record goes; a seek to the end
+  # would be one more dirty-scheduler round trip.
+  test "an append to an open segment takes its end from the identity stat" do
+    with_segment_log_memory_env(
+      max_bytes: 1_000_000,
+      max_entries: 100_000,
+      min_entries: 1,
+      records_per_segment: 1_000_000,
+      fun: fn _root, log, _log_name ->
+        provider = :ferricstore_waraft_spike_segment_log
+        assert :ok = provider.init(log)
+        assert {:ok, _state} = provider.open(log)
+
+        append = fn index ->
+          Task.await(
+            Task.async(fn ->
+              provider.append(
+                {:log_view, log, max(index - 1, 0), index - 1, :undefined},
+                [{1, {:cmd, "entry-#{index}"}}],
+                :strict,
+                :low
+              )
+            end)
+          )
+        end
+
+        assert :ok = append.(1)
+
+        writers =
+          :ets.match(
+            :ferricstore_waraft_segment_writer_registry,
+            {{:segment_writer_proc, :_}, :"$1"}
+          )
+          |> List.flatten()
+          |> Enum.filter(&is_pid/1)
+
+        :erlang.trace_pattern({:file, :position, 2}, true, [:global])
+        for writer <- writers, do: :erlang.trace(writer, true, [:call])
+
+        on_exit(fn -> :erlang.trace_pattern({:file, :position, 2}, false, [:global]) end)
+
+        for index <- 2..11 do
+          assert :ok = append.(index)
+        end
+
+        for writer <- writers, do: :erlang.trace(writer, false, [:call])
+
+        seeks =
+          Stream.repeatedly(fn ->
+            receive do
+              {:trace, _pid, :call, {:file, :position, [_fd, :eof]}} -> :seek
+            after
+              100 -> :done
+            end
+          end)
+          |> Enum.take_while(&(&1 != :done))
+
+        assert seeks == [], "10 appends sought the segment end #{length(seeks)} times"
+
+        for index <- 1..11 do
+          command = "entry-#{index}"
+          assert {:ok, {1, {:cmd, ^command}}} = provider.get(log, index)
+        end
+      end
+    )
+  end
+
   test "killing an append's caller stops its in-flight segment write" do
     previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_file_sync_hook)
     handler_id = {__MODULE__, :killed_append_caller, make_ref()}
