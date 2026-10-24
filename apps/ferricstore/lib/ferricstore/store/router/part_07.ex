@@ -1151,22 +1151,15 @@ defmodule Ferricstore.Store.Router.Part07 do
       defp flow_claim_due_start_shard(_ctx, _attrs), do: 0
 
       defp flow_claim_due_cursor_table do
-        case :ets.whereis(@flow_claim_cursor_table) do
-          :undefined ->
-            try do
-              :ets.new(@flow_claim_cursor_table, [
-                :named_table,
-                :public,
-                read_concurrency: true,
-                write_concurrency: true
-              ])
-            rescue
-              ArgumentError -> @flow_claim_cursor_table
-            end
+        :ok =
+          Ferricstore.SharedTables.ensure(@flow_claim_cursor_table, [
+            :named_table,
+            :public,
+            read_concurrency: true,
+            write_concurrency: true
+          ])
 
-          _tid ->
-            @flow_claim_cursor_table
-        end
+        @flow_claim_cursor_table
       end
 
       defp flow_claim_route_state(:any), do: "queued"

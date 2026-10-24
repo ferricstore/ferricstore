@@ -230,6 +230,7 @@ defmodule Ferricstore.Application do
         ] ++
           cluster_children ++
           [
+            Ferricstore.SharedTables,
             Ferricstore.Stats,
             Ferricstore.SlowLog,
             Ferricstore.Stream.ActivityLog,
