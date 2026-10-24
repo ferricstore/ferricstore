@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Adding a node to a single-node cluster while a shard was taking writes could
+  put the membership change and a batch of writes at the same Raft log index,
+  and whichever finished last overwrote the other in the log. With
+  `ferricstore_waraft` 0.1.3 the shard first finishes and commits the batch
+  being written, then appends the change; if that write is still running
+  after 5 seconds the change fails with `async_append_in_flight`, leaves the
+  membership as it was, and can be retried. Also from 0.1.3: a shard's Raft
+  server that crashed rolling back a failed write restarts at once instead of
+  5 seconds later.
 - A durable write spends less time around its fsync. Before each append the
   WARaft segment log stats its directory, poison marker, segment and offset
   index in one call (new NIF `fs_lstat_many/1`) instead of six separate
