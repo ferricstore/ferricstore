@@ -166,6 +166,36 @@ defmodule Ferricstore.Commands.ReadDecideWriteLatchTest do
     end
   end
 
+  # A hash field's expiry was set by reading the field and writing it back.
+  for expiry <- [["HEXPIRE", "1000"], ["HPEXPIRE", "1000000"], ["HPERSIST"]] do
+    @expiry expiry
+    test "HINCRBY racing #{hd(expiry)} on the field loses no increment", %{ctx: ctx, key: key} do
+      [expiry | ttl] = @expiry
+      assert 1 == Dispatcher.dispatch("HSET", [key, "f", "0"], ctx)
+
+      expirer =
+        Task.async(fn ->
+          for i <- 1..100 do
+            # HPERSIST only changes a field with a TTL.
+            if expiry == "HPERSIST" and rem(i, 2) == 0,
+              do: Dispatcher.dispatch("HEXPIRE", [key, "1000", "FIELDS", "1", "f"], ctx),
+              else: Dispatcher.dispatch(expiry, [key | ttl] ++ ["FIELDS", "1", "f"], ctx)
+          end
+        end)
+
+      1..8
+      |> Task.async_stream(
+        fn _ -> for _ <- 1..50, do: Dispatcher.dispatch("HINCRBY", [key, "f", "1"], ctx) end,
+        max_concurrency: 8,
+        timeout: 60_000
+      )
+      |> Stream.run()
+
+      Task.await(expirer, 60_000)
+      assert "400" == Dispatcher.dispatch("HGET", [key, "f"], ctx)
+    end
+  end
+
   test "embedded expire and persist racing incr lose no increment", %{key: key} do
     assert :ok = FerricStore.set(key, "0")
 

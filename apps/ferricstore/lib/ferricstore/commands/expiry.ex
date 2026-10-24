@@ -1,10 +1,10 @@
 defmodule Ferricstore.Commands.Expiry do
   alias Ferricstore.CommandTime
   alias Ferricstore.Commands.CompoundSnapshot
-  alias Ferricstore.Commands.{ExpiryTime, PreparedCommand}
+  alias Ferricstore.Commands.ExpiryTime
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.{Ops, ReadResult, TypeRegistry}
-  alias Ferricstore.Transaction.Coordinator
+  alias Ferricstore.Transaction.SingleCommand
 
   @probabilistic_types ["bloom", "cms", "cuckoo", "topk"]
 
@@ -492,29 +492,24 @@ defmodule Ferricstore.Commands.Expiry do
   # A collection's expiry lives on every member, so changing it rewrites them
   # all. Read here and written back, that undid any member changed or added in
   # between: INCRBY racing EXPIRE kept a fraction of its increments and RPUSH
-  # lost elements. On the default instance it runs instead as a one-command
-  # transaction, which the shard's state machine applies with nothing in
-  # between, as it applies MULTI. (The transaction coordinator serves the
-  # default instance; inside MULTI the handler already runs there.)
-  defp set_collection_expiry(key, _type, expire_at_ms, %FerricStore.Instance{name: :default}) do
+  # lost elements. Where it can, it runs instead as a one-command transaction,
+  # which the shard's state machine applies with nothing in between (inside
+  # MULTI the handler already runs there).
+  defp set_collection_expiry(key, type, expire_at_ms, store) do
     {command, args} =
       if expire_at_ms == 0,
         do: {"PERSIST", [key]},
         else: {"PEXPIREAT", [key, Integer.to_string(expire_at_ms)]}
 
-    with {:ok, prepared} <- PreparedCommand.prepare(command, args) do
-      case Coordinator.execute([prepared], %{}, nil) do
-        [result] -> result
-        {:error, _reason} = error -> error
-        other -> {:error, {:unexpected_collection_expiry_result, other}}
-      end
-    end
-  end
+    case SingleCommand.run(store, command, args) do
+      :fallback ->
+        case expire_compound_key(key, type, expire_at_ms, store) do
+          :ok -> 1
+          {:error, _} = error -> ReadResult.command_result(error)
+        end
 
-  defp set_collection_expiry(key, type, expire_at_ms, store) do
-    case expire_compound_key(key, type, expire_at_ms, store) do
-      :ok -> 1
-      {:error, _} = error -> ReadResult.command_result(error)
+      result ->
+        result
     end
   end
 
