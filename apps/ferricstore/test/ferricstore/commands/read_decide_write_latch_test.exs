@@ -241,6 +241,32 @@ defmodule Ferricstore.Commands.ReadDecideWriteLatchTest do
     assert {:ok, "400"} == FerricStore.get(key)
   end
 
+  # PFMERGE read the destination's sketch and wrote it back merged, undoing
+  # PFADDs to the destination in between.
+  test "PFADD to the destination racing PFMERGE keeps every element", %{ctx: ctx, key: key} do
+    dest = key <> ":dest"
+    assert 1 == Dispatcher.dispatch("PFADD", [key <> ":src", "s"], ctx)
+
+    merger =
+      Task.async(fn ->
+        for _ <- 1..200, do: Dispatcher.dispatch("PFMERGE", [dest, key <> ":src"], ctx)
+      end)
+
+    1..8
+    |> Task.async_stream(
+      fn client ->
+        for i <- 1..100, do: Dispatcher.dispatch("PFADD", [dest, "#{client}-#{i}"], ctx)
+      end,
+      max_concurrency: 8,
+      timeout: 60_000
+    )
+    |> Stream.run()
+
+    Task.await(merger, 60_000)
+    # 801 distinct elements; HyperLogLog counts within a few percent.
+    assert Dispatcher.dispatch("PFCOUNT", [dest], ctx) in 770..830
+  end
+
   test "concurrent EXPIRE NX has one winner", %{ctx: ctx, key: key} do
     assert :ok = Dispatcher.dispatch("SET", [key, "v"], ctx)
 

@@ -185,7 +185,21 @@ defmodule Ferricstore.Commands.HyperLogLog do
 
   # As in Redis, PFMERGE dest alone merges nothing into dest, creating an
   # empty sketch when it is missing.
-  defp pfmerge_args([destkey | source_keys], store) when is_binary(destkey) do
+  defp pfmerge_args([destkey | source_keys] = args, store) when is_binary(destkey) do
+    # PFMERGE reads the destination and writes it back merged, which undid a
+    # PFADD to it in between. Where it can, it runs as a one-command
+    # transaction, applied by the shard with nothing in between.
+    case Ferricstore.Transaction.SingleCommand.run(store, "PFMERGE", args) do
+      :fallback -> pfmerge_here(destkey, source_keys, store)
+      result -> result
+    end
+  end
+
+  defp pfmerge_args(_args, _store) do
+    {:error, "ERR wrong number of arguments for 'pfmerge' command"}
+  end
+
+  defp pfmerge_here(destkey, source_keys, store) do
     case read_sketches([destkey | source_keys], store) do
       {:ok, sketches} ->
         merged = Enum.reduce(sketches, &HLL.merge/2)
@@ -194,10 +208,6 @@ defmodule Ferricstore.Commands.HyperLogLog do
       {:error, _} = err ->
         err
     end
-  end
-
-  defp pfmerge_args(_args, _store) do
-    {:error, "ERR wrong number of arguments for 'pfmerge' command"}
   end
 
   defp write_sketch(store, key, sketch, success_result) do
