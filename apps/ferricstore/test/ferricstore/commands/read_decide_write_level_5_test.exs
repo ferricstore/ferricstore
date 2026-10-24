@@ -1,8 +1,8 @@
 defmodule Ferricstore.Commands.ReadDecideWriteLevel5Test do
   @moduledoc """
   Commands whose handlers write differently below feature level 5 inside a
-  transaction (BITOP, PFMERGE, HGETEX) run as one transaction entry only from
-  that level, so their races are checked there.
+  transaction (BITOP, PFMERGE, HGETEX, GEOSEARCHSTORE) run as one transaction
+  entry only from that level, so their races are checked there.
   """
   use ExUnit.Case, async: false
   @moduletag :global_state
@@ -45,6 +45,37 @@ defmodule Ferricstore.Commands.ReadDecideWriteLevel5Test do
       Task.await(expirer, 60_000)
       assert "400" == Dispatcher.dispatch("HGET", [key, "f"], ctx)
     end
+  end
+
+  # GEOSEARCHSTORE into its own source read the source and wrote the matches
+  # back over it, undoing a GEOADD in between.
+  test "GEOADD racing GEOSEARCHSTORE into its own source keeps every member",
+       %{ctx: ctx, key: key} do
+    assert 1 == Dispatcher.dispatch("GEOADD", [key, "0", "0", "origin"], ctx)
+
+    search = ["FROMLONLAT", "0", "0", "BYRADIUS", "500", "km"]
+
+    searcher =
+      Task.async(fn ->
+        for _ <- 1..200, do: Dispatcher.dispatch("GEOSEARCHSTORE", [key, key | search], ctx)
+      end)
+
+    1..8
+    |> Task.async_stream(
+      fn client ->
+        for i <- 1..50 do
+          lng = Float.to_string(client * 0.1)
+          lat = Float.to_string(i * 0.01)
+          Dispatcher.dispatch("GEOADD", [key, lng, lat, "#{client}-#{i}"], ctx)
+        end
+      end,
+      max_concurrency: 8,
+      timeout: 60_000
+    )
+    |> Stream.run()
+
+    Task.await(searcher, 60_000)
+    assert 401 == Dispatcher.dispatch("ZCARD", [key], ctx)
   end
 
   # PFMERGE read the destination's sketch and wrote it back merged, undoing

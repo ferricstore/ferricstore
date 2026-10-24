@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- GEOSEARCHSTORE into its own source read the source and wrote the matches
+  back over it, undoing a GEOADD in between (GEOADDs racing repeated
+  `GEOSEARCHSTORE k k ...` kept 187 of 401 members). On one shard of the
+  default instance it now runs there as a one-command transaction, from
+  feature level 5 (below it a transaction searches with the older Earth
+  radius).
 - Changing the expiry of a list, hash, set or sorted set (EXPIRE, PEXPIRE,
   EXPIREAT, PEXPIREAT, PERSIST) read every member and wrote them all back
   with the new expiry, so members changed or added in between were undone:

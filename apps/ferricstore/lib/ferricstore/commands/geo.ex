@@ -25,6 +25,7 @@ defmodule Ferricstore.Commands.Geo do
 
   alias Ferricstore.Commands.{CompoundSnapshot, Geo.Parsing, Strings.Delete}
   alias Ferricstore.Store.{CompoundKey, Ops, ReadResult, TypeRegistry, ValueCodec}
+  alias Ferricstore.Transaction.SingleCommand
 
   # Earth radius in meters (WGS-84 mean radius)
   # Redis's Earth radius. Releases before cluster feature level 5 used the
@@ -428,10 +429,69 @@ defmodule Ferricstore.Commands.Geo do
     end
   end
 
+  # Into its own source, the search was read and its matches written back over
+  # the source, undoing a GEOADD in between. There it runs as a one-command
+  # transaction, which the shard applies with nothing in between (from feature
+  # level 5, below which a transaction searches with the older radius).
+  defp geosearchstore(store, key, key, opts) do
+    with {:ok, search} <- geosearch_args(opts),
+         result when result != :fallback <-
+           SingleCommand.run(store, "GEOSEARCHSTORE", [key, key | search], level: 5) do
+      result
+    else
+      _here -> geosearchstore_here(store, key, key, opts)
+    end
+  end
+
+  defp geosearchstore(store, destination, source, opts),
+    do: geosearchstore_here(store, destination, source, opts)
+
+  # Sizes go in meters, which parse back to the same floats; the unit only
+  # changes how GEOSEARCH reports distances.
+  defp geosearch_args(%{center: center, shape: shape} = opts) do
+    center_args =
+      case center do
+        {:lonlat, lng, lat} -> ["FROMLONLAT", Float.to_string(lng), Float.to_string(lat)]
+        {:member, member} -> ["FROMMEMBER", member]
+      end
+
+    shape_args =
+      case shape do
+        {:radius, radius_m} ->
+          ["BYRADIUS", Float.to_string(radius_m), "M"]
+
+        {:box, width_m, height_m} ->
+          ["BYBOX", Float.to_string(width_m), Float.to_string(height_m), "M"]
+      end
+
+    sort_args =
+      case Map.get(opts, :sort) do
+        :asc -> ["ASC"]
+        :desc -> ["DESC"]
+        nil -> []
+      end
+
+    count_args =
+      case opts do
+        %{count: count, any: true} -> ["COUNT", Integer.to_string(count), "ANY"]
+        %{count: count} -> ["COUNT", Integer.to_string(count)]
+        _no_count -> []
+      end
+
+    flag_args =
+      for {flag, arg} <- [withcoord: "WITHCOORD", withdist: "WITHDIST", withhash: "WITHHASH"],
+          Map.get(opts, flag, false),
+          do: arg
+
+    {:ok, center_args ++ shape_args ++ sort_args ++ count_args ++ flag_args}
+  end
+
+  defp geosearch_args(_opts), do: :fallback
+
   # For a missing source Redis empties the destination and answers 0. Older
   # releases answer FROMMEMBER's error instead, so a MULTI transaction does so
   # only at feature level 5.
-  defp geosearchstore(store, destination, source, opts) do
+  defp geosearchstore_here(store, destination, source, opts) do
     case read_compound_zset(store, source) do
       :missing ->
         if Ops.level_5_writes?(store),
