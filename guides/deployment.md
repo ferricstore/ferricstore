@@ -518,6 +518,24 @@ bin/ferricstore rpc 'IO.inspect(FerricStore.flow_purge_orphans(dry_run: false), 
 # {:ok, %{dry_run?: false, orphans: [...], purged: 982, skipped: 0}}
 ```
 
+## Starting a New Cluster
+
+A new cluster starts at feature level 0, the behavior every release applies
+the same way, and stays there until you raise it, even when every node runs
+the same release. Several fixes only take effect from a level on: at level 4
+HDEL, HSETNX, HGETDEL and ZADD/GEOADD with NX, XX, GT or LT run as one
+replicated entry (below it, concurrent clients can each see the same field
+deleted or set), member writes check the key's type, and INCRBYFLOAT stores
+"3" rather than "3.0". After the first start of a new cluster, once every node
+is up, raise it to the level the release supports:
+
+```bash
+bin/ferricstore rpc 'IO.inspect(FerricStore.cluster_feature_level())'
+# {:ok, %{supported: 5, active: 0, shards: [0, 0, 0, 0]}}
+
+bin/ferricstore rpc 'IO.inspect(FerricStore.raise_cluster_feature_level(5))'
+```
+
 ## Upgrading a Cluster
 
 Upgrade nodes one at a time (rolling upgrade). New behavior that older releases
