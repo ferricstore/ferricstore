@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Concurrent SETBIT on one key through the gateways lost bits: each command
+  read the whole value, changed one bit and wrote the value back, so clients
+  setting different bits overwrote each other's (16 clients setting 640
+  distinct bits left 40). SETBIT now changes the bit in one replicated entry,
+  as `FerricStore.setbit/3` already did.
 - At feature level 4 the gateways run HDEL and HSETNX as one replicated
   entry, but `FerricStore.hdel/2` and `FerricStore.hsetnx/3` kept reading
   and then writing: concurrent `hdel` calls of one field each answered

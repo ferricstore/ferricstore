@@ -574,6 +574,14 @@ defmodule Ferricstore.Commands.Bitmap do
 
   defp setbit_noop_candidate_size(_store, _key), do: :unknown
 
+  # On the instance the bit changes in one replicated entry that reads the
+  # value, flips the bit and keeps the TTL, as FerricStore.setbit/3 does.
+  # Reading here and writing the whole value back let concurrent clients
+  # setting different bits overwrite each other's. Inside MULTI the handler
+  # runs in the state machine and keeps rewriting the value.
+  defp setbit_rewrite(key, offset, bit_val, %FerricStore.Instance{} = ctx),
+    do: Ferricstore.Store.Router.setbit(ctx, key, offset, bit_val)
+
   defp setbit_rewrite(key, offset, bit_val, store) do
     case Ops.get_meta(store, key) do
       {:error, {:storage_read_failed, _reason}} = failure ->

@@ -72,6 +72,25 @@ defmodule Ferricstore.Commands.ReadDecideWriteLatchTest do
     end
   end
 
+  # SETBIT read the whole value, changed one bit and wrote the value back, so
+  # concurrent clients setting different bits overwrote each other's.
+  test "concurrent SETBIT of different bits keeps every bit", %{ctx: ctx, key: key} do
+    assert :ok = Dispatcher.dispatch("SET", [key, "", "EX", "100"], ctx)
+
+    1..16
+    |> Task.async_stream(
+      fn client ->
+        for i <- 1..40, do: Dispatcher.dispatch("SETBIT", [key, "#{client * 40 + i}", "1"], ctx)
+      end,
+      max_concurrency: 16,
+      timeout: 60_000
+    )
+    |> Stream.run()
+
+    assert 640 == Dispatcher.dispatch("BITCOUNT", [key], ctx)
+    assert Dispatcher.dispatch("TTL", [key], ctx) in 95..100
+  end
+
   test "concurrent EXPIRE NX has one winner", %{ctx: ctx, key: key} do
     assert :ok = Dispatcher.dispatch("SET", [key, "v"], ctx)
 
