@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- `SET key value KEEPTTL` (and `FerricStore.set/3` with `keepttl: true`) over
+  a list, hash, set or sorted set that had a TTL replaced it with a string
+  without a TTL; the key now keeps its TTL, as in Redis. Inside MULTI the old
+  behavior stays, since the transaction is applied on every replica.
 - When one shard's Raft log process restarted, every shard lost its segment
   log memory stats, and an append on another shard at that moment could fail
   after it was synced and be rolled back, answering the write with an error.

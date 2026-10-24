@@ -443,6 +443,18 @@ defmodule Ferricstore.Commands.Expiry do
     end
   end
 
+  @doc false
+  # The expiry a list, hash, set or sorted set keeps on its own metadata, or
+  # nil when `key` holds none of them.
+  @spec collection_expire_at_ms(binary(), map()) ::
+          non_neg_integer() | nil | ReadResult.failure()
+  def collection_expire_at_ms(key, store) do
+    case compound_meta(key, store) do
+      {:compound, _type, expire_at_ms} -> expire_at_ms
+      nil_or_failure -> nil_or_failure
+    end
+  end
+
   defp compound_meta(key, store) do
     if Ops.has_compound?(store) do
       type_key = CompoundKey.type_key(key)

@@ -2,7 +2,7 @@ defmodule FerricStore.API.Strings do
   @moduledoc false
 
   import FerricStore.API.Store
-  alias Ferricstore.Commands.Strings
+  alias Ferricstore.Commands.{Expiry, Strings}
   alias Ferricstore.EmbeddedStringValidation
   alias Ferricstore.Store.{ReadResult, Router, ValueCodec}
 
@@ -77,23 +77,38 @@ defmodule FerricStore.API.Strings do
 
   defp set_inner(ctx, key, value, parsed) do
     if parsed.nx or parsed.xx or parsed.get or parsed.keepttl do
-      opts = %{
-        expire_at_ms: parsed.expire_at_ms,
-        nx: parsed.nx,
-        xx: parsed.xx,
-        get: parsed.get,
-        keepttl: parsed.keepttl
-      }
+      with {:ok, parsed} <- keep_collection_ttl(key, parsed) do
+        opts = %{
+          expire_at_ms: parsed.expire_at_ms,
+          nx: parsed.nx,
+          xx: parsed.xx,
+          get: parsed.get,
+          keepttl: parsed.keepttl
+        }
 
-      case Router.set(ctx, key, value, opts) do
-        {:error, _} = err -> err
-        result when parsed.get -> {:ok, result}
-        result -> result
+        case Router.set(ctx, key, value, opts) do
+          {:error, _} = err -> err
+          result when parsed.get -> {:ok, result}
+          result -> result
+        end
       end
     else
       Router.put(ctx, key, value, parsed.expire_at_ms)
     end
   end
+
+  # KEEPTTL keeps a string's TTL where the write finds it. A list, hash, set
+  # or sorted set keeps its TTL on its own metadata instead, so a string
+  # replacing one carries that TTL explicitly.
+  defp keep_collection_ttl(key, %{keepttl: true} = parsed) do
+    case Expiry.collection_expire_at_ms(key, build_compound_store(key)) do
+      {:error, _reason} = failure -> failure
+      nil -> {:ok, parsed}
+      expire_at_ms -> {:ok, %{parsed | keepttl: false, expire_at_ms: expire_at_ms}}
+    end
+  end
+
+  defp keep_collection_ttl(_key, parsed), do: {:ok, parsed}
 
   @doc """
   Gets the value stored at `key`.
