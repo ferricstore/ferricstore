@@ -3,7 +3,7 @@ defmodule Ferricstore.FlowSignalTest do
   @moduletag :flow
   @moduletag :global_state
 
-  alias Ferricstore.Store.Router
+  alias Ferricstore.Test.FlowValues
   alias Ferricstore.Test.ShardHelpers
 
   setup_all do
@@ -473,7 +473,9 @@ defmodule Ferricstore.FlowSignalTest do
     artifact_ref = get_in(signaled.value_refs, ["artifact", :ref])
     ctx = FerricStore.Instance.get(:default)
     assert is_binary(artifact_ref)
-    assert is_binary(Router.get(ctx, artifact_ref))
+    # Projected, so the cleanup below has to remove it from the mirror.
+    FlowValues.projected!(ctx, artifact_ref)
+    assert is_binary(FlowValues.stored_value(ctx, artifact_ref))
 
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due("signal-retention",
@@ -501,6 +503,6 @@ defmodule Ferricstore.FlowSignalTest do
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
 
     assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
-    assert is_nil(Router.get(ctx, artifact_ref))
+    assert is_nil(FlowValues.stored_value(ctx, artifact_ref))
   end
 end

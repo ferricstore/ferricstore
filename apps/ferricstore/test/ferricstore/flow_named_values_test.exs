@@ -3,8 +3,8 @@ defmodule Ferricstore.FlowNamedValuesTest do
   @moduletag :flow
   @moduletag :global_state
 
+  alias Ferricstore.Test.FlowValues
   alias Ferricstore.Test.ShardHelpers
-  alias Ferricstore.Store.Router
 
   setup_all do
     ShardHelpers.wait_shards_alive()
@@ -284,7 +284,7 @@ defmodule Ferricstore.FlowNamedValuesTest do
     assert {:ok, created} = FerricStore.flow_get(id, partition_key: "tenant-retention")
     order_ref = get_in(created.value_refs, ["order", :ref])
     assert is_binary(order_ref)
-    assert is_binary(Router.get(ctx, order_ref))
+    assert is_binary(FlowValues.stored_value(ctx, order_ref))
 
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due("named-retention",
@@ -317,8 +317,8 @@ defmodule Ferricstore.FlowNamedValuesTest do
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
 
     assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
-    assert is_nil(Router.get(ctx, order_ref))
-    assert is_nil(Router.get(ctx, receipt_ref))
+    assert is_nil(FlowValues.stored_value(ctx, order_ref))
+    assert is_nil(FlowValues.stored_value(ctx, receipt_ref))
   end
 
   test "retention cleanup removes overridden named value versions from history" do
@@ -348,8 +348,11 @@ defmodule Ferricstore.FlowNamedValuesTest do
              )
 
     assert override.ref != old_ref
-    assert is_binary(Router.get(ctx, old_ref))
-    assert is_binary(Router.get(ctx, override.ref))
+    # The projector moves a value out of the keydir when it gets to it;
+    # do it now so the cleanup below has to remove it from the mirror.
+    FlowValues.projected!(ctx, old_ref)
+    assert is_binary(FlowValues.stored_value(ctx, old_ref))
+    assert is_binary(FlowValues.stored_value(ctx, override.ref))
 
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due("named-retention-override",
@@ -374,9 +377,10 @@ defmodule Ferricstore.FlowNamedValuesTest do
              FerricStore.flow_retention_cleanup(limit: 10, now_ms: cleanup_now_ms)
 
     assert cleaned.values >= 2
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
 
-    assert is_nil(Router.get(ctx, old_ref))
-    assert is_nil(Router.get(ctx, override.ref))
+    assert is_nil(FlowValues.stored_value(ctx, old_ref))
+    assert is_nil(FlowValues.stored_value(ctx, override.ref))
   end
 
   test "transition_many stores named value blobs for every transitioned flow" do
