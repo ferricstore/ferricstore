@@ -4,6 +4,45 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A node that last stopped on a release before 0.12.7 could not start again
+  once a shard held a promoted collection (a hash, set or sorted set past the
+  promotion threshold): neither on its own release nor on 0.12.7 or 0.12.8.
+  It stopped at start with "failed to rebuild logical key index on shard N:
+  :invalid_type_metadata_values". Those releases wrote a shard's shutdown
+  hint from its keydir, so the hint for log file 0 also listed the promoted
+  collection's rows, whose dedicated file is numbered 0 too, and the next
+  start read them from the shared log. Hint metadata is now version 2, and a
+  start reads only version 2 hints: the first start after an upgrade reads
+  the log files once instead. See the deployment guide for starting a node
+  that is stuck on such a hint.
+- Below cluster feature level 4, HDEL and HGETDEL delete the fields and then,
+  when the hash is left empty, its type marker, as two replicated writes.
+  When the marker delete failed, they wrote the deleted fields back. After a
+  timeout, whose write may have committed, that left the fields under a
+  deleted marker (EXISTS 0 while HGET still answered), and a value another
+  client wrote in between was overwritten with the old one. When both writes
+  failed, the reply was an internal term
+  (`{:hash_delete_rollback_failed, ...}`). The fields now stay deleted and the
+  marker delete's error is the reply.
+- An HSET the instance cannot send as one replicated entry (a value past the
+  blob threshold, or HSETNX below cluster feature level 4) claims a new
+  hash's type marker and then writes the fields. When the field write failed
+  it deleted the marker, even after a timeout whose write may have committed,
+  or when another client had written fields under the marker in between:
+  those fields were left without one (EXISTS 0, TYPE none, while HGET
+  answered). The marker now goes only when the write failed outright and the
+  hash is still empty.
+- An idempotent Flow create retried after its reply was lost answered "ERR
+  flow idempotency conflict" once a worker had claimed or finished the Flow:
+  the retry was compared with the Flow's current state, not the one it was
+  created in. A job outbox that retries an enqueue until it succeeds kept
+  retrying a job that had already run. A retry of a Flow that has moved on is
+  now compared with what no later command changes (type, partition, lineage,
+  correlation ID, and the created payload while it is still in place), and
+  answers the Flow. A batch with new items, a spawn, or a cross-shard
+  transaction keeps the earlier comparison, since its answer decides what
+  else is written.
+
 ## 0.12.8 - 2026-10-25
 
 - A trim that rebuilt the segment projection itself (past the deferral

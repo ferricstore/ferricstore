@@ -1,7 +1,7 @@
 defmodule Ferricstore.Commands.Hash.FieldOps do
   @moduledoc false
 
-  alias Ferricstore.CommandTime
+  alias Ferricstore.{CommandTime, ErrorReasons}
   alias Ferricstore.Store.{CompoundKey, Ops, ReadResult, TypeRegistry}
 
   @spec set_pairs([binary()], binary(), map(), term()) :: non_neg_integer() | {:error, term()}
@@ -313,7 +313,7 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
         {added, entries} =
           put_entries(fields, compound_keys, existing_values, values_by_field, expire_at_ms)
 
-        case Ops.compound_batch_put(store, key, entries) do
+        case put_fields(store, key, entries) do
           :ok -> added
           {:error, _} = err -> rollback_new_hash_type_marker(key, store, type_status, err)
         end
@@ -398,7 +398,7 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
 
     case Ops.compound_count(store, key, prefix) do
       0 ->
-        TypeRegistry.delete_type(key, store)
+        delete_type_marker(key, store)
 
       count when is_integer(count) and count > 0 ->
         :ok
@@ -412,7 +412,37 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
     end
   end
 
+  if Mix.env() == :test do
+    defp delete_type_marker(key, store) do
+      case Process.get(:ferricstore_hash_type_delete_hook) do
+        hook when is_function(hook, 1) -> hook.(fn -> TypeRegistry.delete_type(key, store) end)
+        _missing -> TypeRegistry.delete_type(key, store)
+      end
+    end
+
+    defp put_fields(store, key, entries) do
+      case Process.get(:ferricstore_hash_field_put_hook) do
+        hook when is_function(hook, 1) ->
+          hook.(fn -> Ops.compound_batch_put(store, key, entries) end)
+
+        _missing ->
+          Ops.compound_batch_put(store, key, entries)
+      end
+    end
+  else
+    defp delete_type_marker(key, store), do: TypeRegistry.delete_type(key, store)
+    defp put_fields(store, key, entries), do: Ops.compound_batch_put(store, key, entries)
+  end
+
   defp rollback_deleted_fields(_key, [], _store, write_error), do: write_error
+
+  # On the instance the delete and the cleanup are separate replicated writes.
+  # The delete has committed, the failed cleanup may have committed too (a
+  # timeout's outcome is unknown), and other clients may have written the
+  # fields since, so writing the old values back could leave fields under a
+  # deleted type marker or overwrite a newer value. The error goes back as is.
+  defp rollback_deleted_fields(_key, _deleted_entries, %FerricStore.Instance{}, write_error),
+    do: write_error
 
   defp rollback_deleted_fields(key, deleted_entries, store, write_error) do
     case Ops.compound_batch_put(store, key, deleted_entries) do
@@ -422,6 +452,19 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
       {:error, _} = rollback_error ->
         {:error, {:hash_delete_rollback_failed, write_error, rollback_error}}
     end
+  end
+
+  # On the instance the marker claim and the field write are separate
+  # replicated writes. A timed-out write may have committed, and other clients
+  # may have written fields under the marker since, so the marker goes only
+  # when the write failed outright and the hash is still empty.
+  defp rollback_new_hash_type_marker(key, %FerricStore.Instance{} = ctx, {:ok, :created}, error) do
+    if error != ErrorReasons.write_timeout_unknown() and
+         Ops.compound_count(ctx, key, CompoundKey.hash_prefix(key)) == 0 do
+      _ = TypeRegistry.rollback_created_type(key, ctx)
+    end
+
+    error
   end
 
   defp rollback_new_hash_type_marker(key, store, {:ok, :created}, write_error) do
