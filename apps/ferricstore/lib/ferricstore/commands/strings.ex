@@ -552,7 +552,36 @@ defmodule Ferricstore.Commands.Strings do
     end
   end
 
-  defp del_keys(keys, store) do
+  defp del_keys(keys, %FerricStore.Instance{} = ctx), do: atomic_del(ctx, keys, ctx)
+  defp del_keys(keys, store), do: del_keys_here(keys, store)
+
+  @doc """
+  Deletes `keys` and counts those that existed. DEL read whether a key
+  existed and then deleted it, so clients on two nodes both counted it (a DEL
+  used as a claim had two winners). On the default instance, from cluster
+  feature level 6, each key is deleted by one replicated entry, which decides
+  whether it existed where it applies; otherwise it is deleted with `store`
+  here.
+  """
+  @spec atomic_del(FerricStore.Instance.t(), [binary()], term()) ::
+          non_neg_integer() | {:error, term()}
+  def atomic_del(%FerricStore.Instance{} = ctx, keys, store) do
+    Enum.reduce_while(keys, 0, fn key, count ->
+      case del_key(ctx, key, store) do
+        deleted when is_integer(deleted) -> {:cont, count + deleted}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp del_key(ctx, key, store) do
+    case Ops.compound_command(ctx, key, {:del, [key]}, 6) do
+      :unsupported -> del_keys_here([key], store)
+      result -> result
+    end
+  end
+
+  defp del_keys_here(keys, store) do
     keys
     |> Enum.reduce_while({:ok, 0}, fn key, {:ok, acc} ->
       case Delete.do_del_key(key, store) do

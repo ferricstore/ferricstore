@@ -86,8 +86,7 @@ defmodule FerricStore.Impl do
 
   def del(ctx, keys) when is_list(keys) do
     ctx
-    |> build_store()
-    |> then(&Strings.handle_ast({:del, keys}, &1))
+    |> Strings.atomic_del(keys, build_store(ctx))
     |> wrap_result()
   end
 

@@ -28,6 +28,10 @@ All notable changes to FerricStore will be documented here.
   ("123.45600000000000304"). They now give the shortest text that reads back
   as the value ("1.0e300", "1.0e-300", "123.456"); values such as "45.0" and
   "2.5" read as before.
+- DEL and UNLINK sent through different nodes could each count the same key
+  (a DEL used as a claim had more than one winner): DEL read whether the key
+  existed and then deleted it. From cluster feature level 6 each key is
+  deleted by one replicated entry that decides whether it existed.
 - A shard whose log held a Flow value pin with no locator left (the value
   deleted since, as by retention) could never trim its log again: each trim
   stopped with `{:segment_value_pin_missing_live_value, ...}` and the log kept

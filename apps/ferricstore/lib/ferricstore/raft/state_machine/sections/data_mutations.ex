@@ -1206,6 +1206,26 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         })
       end
 
+      # DEL of one key deletes whatever it holds: its value, or its
+      # collection's members, metadata and type key. The prob file of a
+      # bloom/cms/cuckoo/topk key goes with its value's delete, as for every
+      # replicated delete (`do_delete/2`).
+      defp compound_command_store(state, Ferricstore.Commands.Strings) do
+        value_store = build_string_value_store(state)
+
+        state
+        |> compound_command_store()
+        |> Map.merge(%{
+          get: materializing_read(state, value_store.get),
+          get_meta: materializing_read(state, value_store.get_meta),
+          delete: value_store.delete,
+          compound_delete_prefix: fn redis_key, prefix ->
+            do_compound_delete_prefix(state, redis_key, prefix)
+          end,
+          prob_file_lifecycle: :replicated
+        })
+      end
+
       defp compound_command_store(state, _handler), do: compound_command_store(state)
 
       defp compound_command_store(state) do
@@ -1312,6 +1332,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
                   pairs != [],
            do: binaries_handler(pairs, Ferricstore.Commands.Hash)
 
+      defp compound_command_handler(key, {:del, [key]}) when is_binary(key),
+        do: {:ok, Ferricstore.Commands.Strings}
+
       defp compound_command_handler(key, {:tdigest_create, key, compression})
            when is_binary(key) and (is_nil(compression) or is_integer(compression)),
            do: {:ok, Ferricstore.Commands.TDigest}
@@ -1350,9 +1373,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
           else: require_feature_level_4(state)
       end
 
-      # TDIGEST writes joined the entry at level 6.
+      # DEL and TDIGEST writes joined the entry at level 6.
       defp require_compound_command_level(state, ast)
-           when elem(ast, 0) in [:tdigest_create, :tdigest_add, :tdigest_reset, :tdigest_merge] do
+           when elem(ast, 0) in [
+                  :del,
+                  :tdigest_create,
+                  :tdigest_add,
+                  :tdigest_reset,
+                  :tdigest_merge
+                ] do
         if feature_level_6?(state),
           do: :ok,
           else: {:error, "ERR this command requires cluster feature level 6"}

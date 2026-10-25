@@ -76,7 +76,8 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    only an integer's canonical form as the stored operand, as Redis's
   #    string2ll does (`ValueCodec.parse_canonical_integer/1`). Transactions
   #    take TDIGEST commands, and `:compound_command` runs TDIGEST.CREATE, ADD,
-  #    RESET and MERGE in one entry (`TDigest.atomic_write/3`).
+  #    RESET and MERGE in one entry (`TDigest.atomic_write/3`), and DEL of one
+  #    key (`Strings.atomic_del/3`).
   @supported 6
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

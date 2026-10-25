@@ -52,6 +52,24 @@ defmodule Ferricstore.Cluster.CrossNodeDecideWriteTest do
     end
   end
 
+  # DEL checked that a key existed and then deleted it, so clients on two
+  # nodes both counted the key: a DEL used as a claim had two winners.
+  test "DEL and UNLINK from every node count a key once", %{nodes: [first | _] = nodes} do
+    for round <- 1..5, command <- ["DEL", "UNLINK"] do
+      string = "{decide}ds#{command}#{round}"
+      hash = "{decide}dh#{command}#{round}"
+      list = "{decide}dl#{command}#{round}"
+      assert :ok == dispatch(first, "SET", [string, "v"])
+      assert 2 == dispatch(first, "HSET", [hash, "f", "v", "g", "w"])
+      assert 2 == dispatch(first, "RPUSH", [list, "a", "b"])
+
+      for key <- [string, hash, list] do
+        replies = race(nodes, fn node, _client -> dispatch(node, command, [key]) end)
+        assert Enum.sort(replies) == [0, 0, 0, 0, 0, 1], "#{command} #{key}: #{inspect(replies)}"
+      end
+    end
+  end
+
   # TDIGEST writes read the digest, change it and write it back under the
   # node-local key latch, so clients on two nodes lost each other's values and
   # both created the digest. From feature level 6 each runs as one
