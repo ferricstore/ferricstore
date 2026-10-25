@@ -40,6 +40,9 @@ All notable changes to FerricStore will be documented here.
   that node: a claim waiting for a Flow written through another node slept
   until its block ended, and a native claim subscription could wait for good.
   The writing node now wakes blocked claims on every node.
+- A write that timed out reached native and HTTP clients as the text
+  `{:timeout, :unknown_outcome}`. It now reads "ERR write timed out and may or
+  may not have applied; read before retrying".
 - A shard whose log held a Flow value pin with no locator left (the value
   deleted since, as by retention) could never trim its log again: each trim
   stopped with `{:segment_value_pin_missing_live_value, ...}` and the log kept
