@@ -1065,6 +1065,7 @@ defmodule FerricStore.Impl do
       __instance_ctx__: ctx,
       # Its writes reach the cluster through the router.
       level_5_writes?: true,
+      level_6_writes?: true,
       get: fn key -> Router.get(ctx, key) end,
       get_meta: fn key -> Router.get_meta(ctx, key) end,
       batch_get: fn keys -> Router.batch_get(ctx, keys) end,

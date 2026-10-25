@@ -535,7 +535,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
             error
 
           existing ->
-            case do_compound_put(state, key, field_key, value, 0) do
+            expire_at_ms = new_member_expire_at(state, key)
+
+            case do_compound_put(state, key, field_key, value, expire_at_ms) do
               :ok -> if is_nil(existing), do: 1, else: 0
               {:error, _reason} = error -> error
             end
@@ -687,9 +689,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
            ) do
         element_key = CompoundKey.list_element(key, pos)
         meta_key = CompoundKey.list_meta_key(key)
+        expire_at_ms = if type_created?, do: 0, else: new_member_expire_at(state, key)
 
-        with :ok <- do_put(state, element_key, value, 0) do
-          case do_put(state, meta_key, ListOps.encode_meta(meta), 0) do
+        with :ok <- do_put(state, element_key, value, expire_at_ms) do
+          case do_put(state, meta_key, ListOps.encode_meta(meta), expire_at_ms) do
             :ok ->
               elem(meta, 0)
 
@@ -865,7 +868,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         if current_score == score_str do
           0
         else
-          case do_compound_put(state, key, member_key, score_str, 0) do
+          expire_at_ms = new_member_expire_at(state, key)
+
+          case do_compound_put(state, key, member_key, score_str, expire_at_ms) do
             :ok ->
               queue_zset_index_put_after_flush(state, key, member_key, score_str)
 

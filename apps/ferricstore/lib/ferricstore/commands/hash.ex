@@ -1026,7 +1026,9 @@ defmodule Ferricstore.Commands.Hash do
   defp plain_float_reply(other), do: other
 
   defp write_hash_field(store, key, compound_key, value, success, type_status) do
-    case Ops.compound_put(store, key, compound_key, value, 0) do
+    expire_at_ms = FieldOps.member_expire_at(key, store, type_status)
+
+    case Ops.compound_put(store, key, compound_key, value, expire_at_ms) do
       :ok ->
         success
 

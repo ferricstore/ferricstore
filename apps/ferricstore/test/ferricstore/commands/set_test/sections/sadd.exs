@@ -73,7 +73,7 @@ defmodule Ferricstore.Commands.SetTest.Sections.Sadd do
           [sadd_source] = Regex.run(~r/defp sadd_members_generic\(.*?^  end/ms, source)
 
           assert sadd_source =~
-                   "new_entries = set_member_entries_for_missing(compound_keys, values, [])"
+                   "new_entries = set_member_entries_for_missing(compound_keys, values, expire_at_ms, [])"
 
           refute sadd_source =~ "Enum.zip(compound_keys)"
           refute sadd_source =~ "Enum.flat_map"

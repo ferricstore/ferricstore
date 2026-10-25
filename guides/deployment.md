@@ -526,14 +526,15 @@ the same release. Several fixes only take effect from a level on: at level 4
 HDEL, HSETNX, HGETDEL and ZADD/GEOADD with NX, XX, GT or LT run as one
 replicated entry (below it, concurrent clients can each see the same field
 deleted or set), member writes check the key's type, and INCRBYFLOAT stores
-"3" rather than "3.0". After the first start of a new cluster, once every node
+"3" rather than "3.0"; at level 6 a member added to a collection that has a
+TTL takes it. After the first start of a new cluster, once every node
 is up, raise it to the level the release supports:
 
 ```bash
 bin/ferricstore rpc 'IO.inspect(FerricStore.cluster_feature_level())'
-# {:ok, %{supported: 5, active: 0, shards: [0, 0, 0, 0]}}
+# {:ok, %{supported: 6, active: 0, shards: [0, 0, 0, 0]}}
 
-bin/ferricstore rpc 'IO.inspect(FerricStore.raise_cluster_feature_level(5))'
+bin/ferricstore rpc 'IO.inspect(FerricStore.raise_cluster_feature_level(6))'
 ```
 
 ## Upgrading a Cluster

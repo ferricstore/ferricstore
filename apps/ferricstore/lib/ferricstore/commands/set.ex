@@ -479,7 +479,8 @@ defmodule Ferricstore.Commands.Set do
 
       case ReadResult.first_failure(values) do
         nil ->
-          new_entries = set_member_entries_for_missing(compound_keys, values, [])
+          expire_at_ms = new_member_expire_at(key, store, type_status)
+          new_entries = set_member_entries_for_missing(compound_keys, values, expire_at_ms, [])
           put_new_member_entries(store, key, new_entries, type_status)
 
         failure ->
@@ -554,17 +555,35 @@ defmodule Ferricstore.Commands.Set do
   defp srem_args_generic(_args, _store),
     do: {:error, "ERR wrong number of arguments for 'srem' command"}
 
-  defp set_member_entries_for_missing([compound_key | compound_keys], [nil | values], acc) do
-    set_member_entries_for_missing(compound_keys, values, [
-      {compound_key, @presence_marker, 0} | acc
+  defp set_member_entries_for_missing(
+         [compound_key | compound_keys],
+         [nil | values],
+         expire_at_ms,
+         acc
+       ) do
+    set_member_entries_for_missing(compound_keys, values, expire_at_ms, [
+      {compound_key, @presence_marker, expire_at_ms} | acc
     ])
   end
 
-  defp set_member_entries_for_missing([_compound_key | compound_keys], [_value | values], acc) do
-    set_member_entries_for_missing(compound_keys, values, acc)
+  defp set_member_entries_for_missing(
+         [_compound_key | compound_keys],
+         [_value | values],
+         expire_at_ms,
+         acc
+       ) do
+    set_member_entries_for_missing(compound_keys, values, expire_at_ms, acc)
   end
 
-  defp set_member_entries_for_missing(_compound_keys, _values, acc), do: Enum.reverse(acc)
+  defp set_member_entries_for_missing(_compound_keys, _values, _expire_at_ms, acc),
+    do: Enum.reverse(acc)
+
+  # A member added to an existing set takes the key's TTL (see
+  # TypeRegistry.member_expire_at/2); a set this command created has none.
+  defp new_member_expire_at(_key, _store, {:ok, :created}), do: 0
+
+  defp new_member_expire_at(key, store, _type_status),
+    do: TypeRegistry.member_expire_at(key, store)
 
   defp set_member_entries_for_present([_compound_key | compound_keys], [nil | values], acc) do
     set_member_entries_for_present(compound_keys, values, acc)

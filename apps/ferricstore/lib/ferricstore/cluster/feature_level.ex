@@ -66,7 +66,14 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    rewind's value refresh read values the history projector moved to the
   #    LMDB mirror. A signal retried with its idempotency key and the same
   #    content changes nothing.
-  @supported 5
+  # 6: a member written into a hash, set, sorted set, list or stream that has
+  #    a TTL takes the key's TTL (its type key's expiry), so members added
+  #    after EXPIRE expire with the rest; a ZADD, ZINCRBY or list operation on
+  #    an existing member or element keeps the TTL instead of dropping it.
+  #    Apply reads it in `TypeRegistry.member_expire_at/2` (stores built in
+  #    apply set `:level_6_writes?`) and in the state machine's
+  #    `new_member_expire_at/2`.
+  @supported 6
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"
   @probe_timeout_ms 5_000

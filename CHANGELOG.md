@@ -4,6 +4,17 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Members added to a hash, set, sorted set, list or stream after EXPIRE were
+  stored without the key's TTL (a key's TTL is stored on each member), so
+  when it passed the key was gone (EXISTS 0, TYPE none) while HGETALL,
+  SMEMBERS, ZRANGE, LRANGE and XLEN still returned the late members, the
+  sweep never removed them, and a later write to the key brought them back.
+  A ZADD or ZINCRBY of an existing member, and any list write (a push, pop,
+  LSET, LINSERT or LMOVE), also dropped the TTL from what it rewrote. From
+  cluster feature level 6 (new in this release) such writes take the key's
+  TTL. Raise the level once every node runs this release; members written
+  before it keep the rows they have.
+
 - ZINCRBY on a new key (at every cluster feature level) and ZADD with NX,
   XX, GT or LT on a new key (below level 4) claim the sorted set's type
   marker and then write the member as a separate replicated write. When that

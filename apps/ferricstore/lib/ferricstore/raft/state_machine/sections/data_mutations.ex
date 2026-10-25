@@ -201,7 +201,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             if delta > @int64_max or delta < @int64_min do
               {:error, "ERR increment or decrement would overflow"}
             else
-              case do_compound_put(state, redis_key, compound_key, Integer.to_string(delta), 0) do
+              expire_at_ms = new_member_expire_at(state, redis_key)
+
+              case do_compound_put(
+                     state,
+                     redis_key,
+                     compound_key,
+                     Integer.to_string(delta),
+                     expire_at_ms
+                   ) do
                 :ok -> delta
                 {:error, _reason} = error -> error
               end
@@ -251,7 +259,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             error
 
           nil ->
-            do_hincrbyfloat_put(state, redis_key, compound_key, 0.0, delta, 0)
+            expire_at_ms = new_member_expire_at(state, redis_key)
+            do_hincrbyfloat_put(state, redis_key, compound_key, 0.0, delta, expire_at_ms)
 
           {value, expire_at_ms} ->
             case coerce_float(value) do
@@ -322,8 +331,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
                   case ValueCodec.checked_float_add(current_score, increment) do
                     {:ok, new_score} ->
                       new_str = Float.to_string(new_score)
+                      expire_at_ms = zincrby_expire_at(state, redis_key, current)
 
-                      case do_compound_put(state, redis_key, compound_key, new_str, 0) do
+                      case do_compound_put(state, redis_key, compound_key, new_str, expire_at_ms) do
                         :ok -> new_str
                         {:error, _reason} = error -> error
                       end
@@ -340,6 +350,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
               end
           end
         end
+      end
+
+      # From feature level 6 an incremented member keeps its TTL (the key's) and a
+      # new one takes the key's; older releases write none.
+      defp zincrby_expire_at(state, redis_key, nil), do: new_member_expire_at(state, redis_key)
+
+      defp zincrby_expire_at(state, _redis_key, {_score, expire_at_ms}) do
+        if feature_level_6?(state), do: expire_at_ms, else: 0
       end
 
       defp current_zset_score(nil), do: {:ok, 0.0}
@@ -1319,6 +1337,31 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         do:
           do_get(state, Ferricstore.Cluster.FeatureLevel.key(5)) ==
             Ferricstore.Cluster.FeatureLevel.marker()
+
+      defp feature_level_6?(state),
+        do:
+          do_get(state, Ferricstore.Cluster.FeatureLevel.key(6)) ==
+            Ferricstore.Cluster.FeatureLevel.marker()
+
+      # A key's TTL is stored on each of its members. From feature level 6 a
+      # member written into a collection that has one takes it (its type key's
+      # expiry, while in the future), so members added after EXPIRE expire with
+      # the rest; older releases write none.
+      defp new_member_expire_at(state, redis_key) do
+        if feature_level_6?(state) do
+          type_key = Ferricstore.Store.CompoundKey.type_key(redis_key)
+
+          case sm_store_compound_get_meta(state, redis_key, type_key) do
+            {_type, expire_at_ms} when is_integer(expire_at_ms) and expire_at_ms > 0 ->
+              if expire_at_ms > CommandTime.now_ms(), do: expire_at_ms, else: 0
+
+            _none_or_failure ->
+              0
+          end
+        else
+          0
+        end
+      end
 
       # Feature level 4 also stores INCRBYFLOAT and HINCRBYFLOAT results as
       # Redis does ("3", "5200"); older releases store Float.to_string/1

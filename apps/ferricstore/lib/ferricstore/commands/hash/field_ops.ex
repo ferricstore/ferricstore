@@ -303,7 +303,18 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
     put_entries(fields, compound_keys, existing_values, values_by_field, expire_at_ms, 0, [])
   end
 
+  @doc """
+  The expiry a field written without one of its own takes: none in a hash this
+  command created, the key's TTL in an existing one (TypeRegistry.member_expire_at/2).
+  """
+  @spec member_expire_at(binary(), map(), term()) :: non_neg_integer()
+  def member_expire_at(_key, _store, {:ok, :created}), do: 0
+  def member_expire_at(key, store, _type_status), do: TypeRegistry.member_expire_at(key, store)
+
   defp set_pairs(field_value_pairs, key, store, expire_at_ms, type_status) do
+    expire_at_ms =
+      if expire_at_ms == 0, do: member_expire_at(key, store, type_status), else: expire_at_ms
+
     {fields, values_by_field} = collapse_field_values(field_value_pairs, [], %{})
     compound_keys = Enum.map(fields, &CompoundKey.hash_field(key, &1))
     existing_values = Ops.compound_batch_get(store, key, compound_keys)

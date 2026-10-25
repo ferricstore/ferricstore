@@ -175,6 +175,18 @@ defmodule Ferricstore.Store.Ops do
   def level_5_writes?(store) when is_map(store), do: Map.get(store, :level_5_writes?) == true
   def level_5_writes?(_store), do: false
 
+  @doc """
+  Whether a member written into a collection that has a TTL takes the key's
+  TTL, as feature level 6 does (older releases write it without one). As with
+  `level_5_writes?/1`, the instance and the embedded API write explicit expiries
+  every replica applies alike; a store running inside apply allows it only once
+  level 6 is active.
+  """
+  @spec level_6_writes?(term()) :: boolean()
+  def level_6_writes?(%FerricStore.Instance{}), do: true
+  def level_6_writes?(store) when is_map(store), do: Map.get(store, :level_6_writes?) == true
+  def level_6_writes?(_store), do: false
+
   def value_size(%FerricStore.Instance{} = ctx, key), do: Router.value_size(ctx, key)
 
   def value_size(%LocalTxStore{} = tx, key) do

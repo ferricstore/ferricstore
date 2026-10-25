@@ -305,7 +305,7 @@ defmodule Ferricstore.Commands.Stream.AtomicAppend do
 
         put_entries =
           if marker_present? do
-            data_entries
+            with_key_ttl(data_entries, key, store)
           else
             [{type_key, "stream", 0} | data_entries]
           end
@@ -514,6 +514,21 @@ defmodule Ferricstore.Commands.Stream.AtomicAppend do
   defp stream_type_status(key, type_key, store),
     do: TypeRegistry.check_type_status(key, :stream, type_key, store)
 
+  # A stream's TTL is stored on its entries and meta row: what an append writes
+  # to an existing stream takes the key's TTL (TypeRegistry.member_expire_at/2).
+  defp with_key_ttl(entries, key, store) do
+    case Ferricstore.Store.TypeRegistry.member_expire_at(key, store) do
+      0 ->
+        entries
+
+      expire_at_ms ->
+        Enum.map(entries, fn
+          {compound_key, value, 0} -> {compound_key, value, expire_at_ms}
+          entry -> entry
+        end)
+    end
+  end
+
   defp current_meta(_key, false, _store), do: {:ok, {0, "0-0", "0-0", 0, 0}}
 
   defp current_meta(key, true, %{stream_meta_cache_safe: true} = store) do
@@ -698,7 +713,7 @@ defmodule Ferricstore.Commands.Stream.AtomicAppend do
 
       put_entries =
         if marker_present? do
-          data_entries
+          with_key_ttl(data_entries, key, store)
         else
           [{Ferricstore.Store.CompoundKey.type_key(key), "stream", 0} | data_entries]
         end
