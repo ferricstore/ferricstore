@@ -338,7 +338,7 @@ defmodule Ferricstore.Commands.List do
   end
 
   defp rollback_new_list_type_marker(key, store, {:ok, :created}, write_error) do
-    case TypeRegistry.rollback_created_type(key, store) do
+    case TypeRegistry.release_created_type(key, :list, store, write_error) do
       :ok ->
         write_error
 
