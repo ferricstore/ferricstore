@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.8 - 2026-10-25
+
 - A trim that rebuilt the segment projection itself (past the deferral
   bound) repointed a key only if its cached value and expiry were unchanged
   since it was read, so a key MemoryGuard evicted, or that an EXPIRE reached,
