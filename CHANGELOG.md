@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A shard whose log held a Flow value pin with no locator left (the value
+  deleted since, as by retention) could never trim its log again: each trim
+  stopped with `{:segment_value_pin_missing_live_value, ...}` and the log kept
+  growing. Startup recovery re-pins every value an apply-projection batch
+  wrote, deleted values among them. Such a pin is now released when its source
+  does not hold the value either, so no read could reach it; a pin whose
+  source still holds the value, or whose locator points at a source without
+  it, still stops the trim.
+
 - ZINCRBY on a new key (at every cluster feature level) and ZADD with NX,
   XX, GT or LT on a new key (below level 4) claim the sorted set's type
   marker and then write the member as a separate replicated write. When that
