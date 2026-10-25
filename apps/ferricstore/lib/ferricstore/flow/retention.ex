@@ -16,9 +16,7 @@ defmodule Ferricstore.Flow.Retention do
            {:ok, limit} <- optional_pos_integer(opts, :limit, 100),
            {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
            {:ok, continuation} <- optional_continuation(opts),
-           :ok <- flush_lmdb_before_cleanup(ctx),
-           :ok <- flush_history_before_cleanup(ctx),
-           :ok <- flush_lmdb_before_cleanup(ctx) do
+           :ok <- flush_before_cleanup(ctx) do
         Router.flow_retention_cleanup(ctx, %{
           limit: limit,
           now_ms: now,
@@ -30,6 +28,26 @@ defmodule Ferricstore.Flow.Retention do
   end
 
   def cleanup(_ctx, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  # A writer or projector that fails or times out flushing used to surface
+  # its internal reason to clients.
+  defp flush_before_cleanup(ctx) do
+    with :ok <- flush_lmdb_before_cleanup(ctx),
+         :ok <- flush_history_before_cleanup(ctx),
+         :ok <- flush_lmdb_before_cleanup(ctx) do
+      :ok
+    else
+      {:error, reason} ->
+        {:error,
+         "ERR flow retention cleanup could not flush Flow storage (#{flush_failure(reason)}); " <>
+           "retry later"}
+    end
+  end
+
+  defp flush_failure({:timeout, _call}), do: "timeout"
+  defp flush_failure(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp flush_failure({reason, _detail}) when is_atom(reason), do: Atom.to_string(reason)
+  defp flush_failure(_reason), do: "unavailable"
 
   defp flush_lmdb_before_cleanup(%{name: name, shard_count: shard_count})
        when is_atom(name) and is_integer(shard_count) and shard_count >= 0 do
