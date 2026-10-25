@@ -4,6 +4,22 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- The Flow LMDB mirror fell further behind as the apply-projection cache grew:
+  each value it mirrored looked up its cache entries by scanning the whole
+  cache. After 10k Flow creates its writers took 11 s, then 21 s to catch up
+  (44 s on Linux), and FLOW.RETENTION_CLEANUP, which waits for them, timed
+  out. The cache is now ordered, so a lookup reads only its own entries
+  (1.3-2.9 s for the same creates).
+- FLOW.RETENTION_CLEANUP answered a failed flush of Flow storage with the raw
+  internal reason; it now answers "ERR flow retention cleanup could not flush
+  Flow storage (...); retry later".
+- A Flow removed by retention cleanup was still returned by FLOW.GET, listed
+  and counted as existing until the node's LMDB writer caught up, and a create
+  of the same id was refused ("ERR flow already exists"). In a cluster that
+  create applied on nodes whose writer had caught up and was refused on the
+  others, so the replicas disagreed for good. A deleted Flow's state now
+  leaves a tombstone that hides its LMDB copy until the writer has removed it.
+
 ## 0.12.10 - 2026-10-25
 
 - Upgrading: the entries below that say "from cluster feature level 6" take

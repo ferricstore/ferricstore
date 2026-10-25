@@ -158,6 +158,16 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
         end
       end
 
+      # A Flow delete tombstone: the key is deleted, and the row only hides the
+      # LMDB copy until the LMDB writer removes it.
+      defp segment_projection_entry_from_keydir_row(
+             {_key, nil, _expire_at_ms, :flow_state_deleted, :deleted, _offset, _value_size},
+             _ctx,
+             _shard_index,
+             _now
+           ),
+           do: :skip
+
       defp segment_projection_entry_from_keydir_row(
              {key, nil, expire_at_ms, _lfu, file_id, offset, _value_size},
              ctx,

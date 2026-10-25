@@ -147,7 +147,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     do: prepare_flow_projection_source(state, op)
 
   defp coalesce_flow_state_projections(ops) do
-    winners = projection_winners(ops, 0, %{})
+    winners = projection_winners(ops, 0, %{}, %{})
     retain_projection_winners(ops, winners, 0, [])
   end
 
@@ -396,24 +396,43 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   defp maybe_prefetch_composite_reverse_values(_state, _state_keys, _definitions),
     do: CompositeProjection.new_cache()
 
-  defp projection_winners([], _index, winners), do: winners
+  # One projection per state key: the highest expected version, which the
+  # source reaches once it has published. A versionless projection (a delete)
+  # starts a new run for its key, and a later run always wins: a Flow deleted
+  # and created again under the same id starts over at version 1, which an
+  # older run's higher version could never be read back at.
+  defp projection_winners([], _index, winners, _runs), do: winners
 
-  defp projection_winners([op | rest], index, winners) do
-    winners =
+  defp projection_winners([op | rest], index, winners, runs) do
+    {winners, runs} =
       case flow_state_projection_key(op) do
         {:ok, state_key} ->
-          candidate = {index, op, nil}
+          runs =
+            if versionless_projection?(op),
+              do: Map.update(runs, state_key, 1, &(&1 + 1)),
+              else: runs
 
-          Map.update(winners, state_key, candidate, fn winner ->
-            preferred_projection(winner, candidate)
-          end)
+          candidate = {index, op, {Map.get(runs, state_key, 0), projection_rank(op)}}
+
+          winners =
+            Map.update(winners, state_key, candidate, fn winner ->
+              preferred_projection(winner, candidate)
+            end)
+
+          {winners, runs}
 
         :error ->
-          winners
+          {winners, runs}
       end
 
-    projection_winners(rest, index + 1, winners)
+    projection_winners(rest, index + 1, winners, runs)
   end
+
+  defp versionless_projection?({kind, _state_key})
+       when kind in [:project_flow_state_from_source, :project_flow_query_state_from_source],
+       do: true
+
+  defp versionless_projection?(_op), do: false
 
   defp retain_projection_winners([], _winners, _index, acc), do: Enum.reverse(acc)
 
@@ -433,10 +452,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     retain_projection_winners(rest, winners, index + 1, acc)
   end
 
-  defp preferred_projection({old_index, old_op, old_rank}, {new_index, new_op, _new_rank}) do
-    old_rank = old_rank || projection_rank(old_op)
-    new_rank = projection_rank(new_op)
-
+  defp preferred_projection({old_index, old_op, old_rank}, {new_index, new_op, new_rank}) do
     if new_rank >= old_rank,
       do: {new_index, new_op, new_rank},
       else: {old_index, old_op, old_rank}

@@ -1079,9 +1079,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
 
       defp maybe_queue_lmdb_state_delete(_state, _key), do: :ok
 
+      # A WARaft apply publishes its deletes after the entry. The state key's
+      # LMDB copy outlives the keydir row until the LMDB writer deletes it, so
+      # the tombstone hides it, as the unstaged delete above does: without it a
+      # deleted Flow was read back from the mirror, and apply refused a create
+      # of its id on a node whose writer had not caught up while other nodes
+      # applied it.
       defp maybe_queue_lmdb_state_delete_after_publish(state, key) when is_binary(key) do
         cond do
           flow_state_key?(key) ->
+            :ets.insert(state.ets, {key, nil, 0, :flow_state_deleted, :deleted, 0, 0})
             queue_lmdb_state_delete_projection(state, key)
 
           keydir_spill_tracked?(state, key) ->

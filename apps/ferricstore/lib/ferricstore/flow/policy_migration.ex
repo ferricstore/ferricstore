@@ -845,8 +845,13 @@ defmodule Ferricstore.Flow.PolicyMigration do
     |> Enum.reverse()
   end
 
+  # Skips Flow delete tombstones: those keys are deleted, the row only hides
+  # their LMDB copy until the writer removes it.
   defp snapshot_match_spec,
-    do: [{{:"$1", :_, :_, :_, :_, :_, :_}, [{:is_binary, :"$1"}], [:"$1"]}]
+    do: [
+      {{:"$1", :_, :_, :"$2", :_, :_, :_},
+       [{:is_binary, :"$1"}, {:"=/=", :"$2", :flow_state_deleted}], [:"$1"]}
+    ]
 
   defp encode_snapshot_cursor(table_id, continuation) do
     @snapshot_progress_magic <> TermCodec.encode({table_id, continuation})
