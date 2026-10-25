@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.10 - 2026-10-25
+
+- Upgrading: the entries below that say "from cluster feature level 6" take
+  effect once you raise the cluster to level 6
+  (`FerricStore.raise_cluster_feature_level(6)` or `CLUSTER.FEATURES.RAISE 6`)
+  after every node runs 0.12.10; until then those commands behave as in
+  0.12.9, and a node can still roll back to 0.12.9.
 - Members added to a hash, set, sorted set, list or stream after EXPIRE were
   stored without the key's TTL (a key's TTL is stored on each member), so
   when it passed the key was gone (EXISTS 0, TYPE none) while HGETALL,
