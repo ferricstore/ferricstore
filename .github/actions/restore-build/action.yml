@@ -39,7 +39,8 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        mix compile 2>&1 | tee "$RUNNER_TEMP/restore-build-compile.log"
+        # --verbose names each file it compiles, should any still be stale.
+        mix compile --verbose 2>&1 | tee "$RUNNER_TEMP/restore-build-compile.log"
         if grep -qE '^Compiling|Compiling crate' "$RUNNER_TEMP/restore-build-compile.log"; then
           echo "::warning title=Compiled build not reused::mix compile rebuilt files after restoring the build job's output"
         fi
