@@ -527,8 +527,11 @@ HDEL, HSETNX, HGETDEL and ZADD/GEOADD with NX, XX, GT or LT run as one
 replicated entry (below it, concurrent clients can each see the same field
 deleted or set), member writes check the key's type, and INCRBYFLOAT stores
 "3" rather than "3.0"; at level 6 a member added to a collection that has a
-TTL takes it. After the first start of a new cluster, once every node
-is up, raise it to the level the release supports:
+TTL takes it, INCR and HINCRBY refuse stored integers Redis does not read
+("05", "+5"), and TDIGEST writes and DEL each run as one replicated entry
+(below it, clients on different nodes can lose each other's TDIGEST values
+or both count the same deleted key). After the first start of a new cluster,
+once every node is up, raise it to the level the release supports:
 
 ```bash
 bin/ferricstore rpc 'IO.inspect(FerricStore.cluster_feature_level())'
