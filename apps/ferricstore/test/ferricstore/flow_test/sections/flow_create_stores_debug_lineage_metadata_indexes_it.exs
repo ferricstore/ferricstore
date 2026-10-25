@@ -746,6 +746,12 @@ defmodule Ferricstore.FlowTest.Sections.FlowCreateStoresDebugLineageMetadataInde
                  )
       end
 
+      # The existing flow has no payload. Below feature level 5 (this instance)
+      # a batch that also creates new flows compares a retried payload with the
+      # keydir alone, so once the history projector moved it to the LMDB mirror
+      # the retry answered an idempotency conflict, as older releases do. When
+      # that happened depended on the projector. A projected payload retried in
+      # such a batch is covered at level 5 by Ferricstore.Flow.ProjectedValueLevelTest.
       test "flow_create_many idempotent retry returns existing records without duplicate writes" do
         partition = uid("tenant")
         type = uid("bulk-idempotent")
@@ -756,7 +762,6 @@ defmodule Ferricstore.FlowTest.Sections.FlowCreateStoresDebugLineageMetadataInde
                  flow_create_and_get(existing_id,
                    type: type,
                    partition_key: partition,
-                   payload: "payload:" <> existing_id,
                    run_at_ms: 1_000,
                    now_ms: 1_000
                  )
@@ -765,7 +770,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowCreateStoresDebugLineageMetadataInde
                  flow_create_many_and_get(
                    partition,
                    [
-                     %{id: existing_id, payload: "payload:" <> existing_id},
+                     %{id: existing_id},
                      %{id: new_id, payload: "payload:" <> new_id}
                    ],
                    type: type,
