@@ -1,5 +1,6 @@
 defmodule Ferricstore.Commands.Generic do
   alias Ferricstore.Commands.CompoundSnapshot
+  alias Ferricstore.Flow.InternalKey
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
   alias Ferricstore.Store.ReadResult
@@ -417,6 +418,11 @@ defmodule Ferricstore.Commands.Generic do
 
   defp random_key(store) do
     case Ops.random_key(store) do
+      # The key index holds internal collections for exports; drawing one,
+      # pick from the keys a client may see instead.
+      {:ok, key} when is_binary(key) ->
+        if InternalKey.internal?(key), do: random_key_from_full_key_list(store), else: key
+
       {:ok, key} ->
         key
 
@@ -987,8 +993,10 @@ defmodule Ferricstore.Commands.Generic do
 
   defp do_scan(cursor_str, match_pattern, count, type_filter, store) do
     case Ops.scan_keys_page(store, cursor_str, count, match_pattern, type_filter) do
+      # The key index holds internal collections for exports; SCAN shows only
+      # keys a client may access.
       {:ok, {next_cursor, keys}} when is_binary(next_cursor) and is_list(keys) ->
-        [next_cursor, keys]
+        [next_cursor, Enum.reject(keys, &InternalKey.internal?/1)]
 
       {:error, {:storage_read_failed, _reason}} = failure ->
         ReadResult.command_error(failure)

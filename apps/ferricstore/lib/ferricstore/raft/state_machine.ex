@@ -128,6 +128,7 @@ defmodule Ferricstore.Raft.StateMachine do
   @sm_waraft_projection_writer_key :sm_waraft_projection_writer
   @sm_waraft_recovery_before_index_key :waraft_recovery_before_index
   @sm_pending_write_keys [
+    :sm_pending_list_push_notifications,
     :sm_state_read_failure,
     :sm_state_write_failure,
     :sm_pending_writes,
@@ -168,6 +169,7 @@ defmodule Ferricstore.Raft.StateMachine do
     :sm_pending_fast_staged_put_batch
   ]
   @sm_pending_write_initial_values [
+    sm_pending_list_push_notifications: [],
     sm_state_read_failure: nil,
     sm_state_write_failure: nil,
     sm_pending_writes: [],

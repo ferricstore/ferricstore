@@ -1139,7 +1139,11 @@ defmodule Ferricstore.Store.Router.Part09 do
                    &delete_expired_logical_entry(ctx, i, keydir, &1)
                  ) do
               {:ok, count} ->
-                {:cont, acc + count}
+                # Internal collections are indexed for exports, not counted.
+                case LogicalKeyIndex.count_internal_live(ordered, now) do
+                  {:ok, internal} -> {:cont, acc + max(count - internal, 0)}
+                  :unavailable -> {:cont, acc + count}
+                end
 
               :unavailable ->
                 emit_shard_unavailable(ctx, i, :dbsize, :logical_key_index_unavailable)

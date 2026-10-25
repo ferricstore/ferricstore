@@ -147,4 +147,27 @@ defmodule Ferricstore.Commands.ReadDecideWriteLevel5Test do
     Task.await(merger, 60_000)
     assert 401 == Dispatcher.dispatch("BITCOUNT", [key <> ":b"], ctx)
   end
+
+  test "embedded bitop into one of its sources keeps every bit", %{ctx: ctx, key: key} do
+    assert 0 == Dispatcher.dispatch("SETBIT", [key <> ":eo", "0", "1"], ctx)
+
+    merger =
+      Task.async(fn ->
+        for _ <- 1..200, do: FerricStore.bitop(:or, key <> ":eb", [key <> ":eb", key <> ":eo"])
+      end)
+
+    1..8
+    |> Task.async_stream(
+      fn client ->
+        for i <- 1..50,
+            do: Dispatcher.dispatch("SETBIT", [key <> ":eb", "#{client * 50 + i}", "1"], ctx)
+      end,
+      max_concurrency: 8,
+      timeout: 60_000
+    )
+    |> Stream.run()
+
+    Task.await(merger, 60_000)
+    assert 401 == Dispatcher.dispatch("BITCOUNT", [key <> ":eb"], ctx)
+  end
 end

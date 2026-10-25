@@ -63,9 +63,29 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
   end
 
   describe "single-shard transactions" do
-    test "backend exits return a typed transaction error", %{same1: key} do
+    # A backend exit or a timed-out write may have committed the entry, so it
+    # is reported as an unknown outcome, not as raft being unavailable: a
+    # caller must not take it as "not applied" and run the queue again.
+    test "backend exits and timeouts report an unknown outcome", %{same1: key} do
+      on_exit(fn -> Process.delete(:ferricstore_tx_backend_write_hook) end)
+      assert {:ok, prepared} = PreparedCommand.prepare("SET", [key, "value"])
+
+      for failure <- [
+            fn -> exit({:timeout, :synthetic_backend_timeout}) end,
+            fn -> {:error, {:timeout, :unknown_outcome}} end
+          ] do
+        Process.put(:ferricstore_tx_backend_write_hook, fn _shard_idx, _command ->
+          failure.()
+        end)
+
+        assert {:error, "ERR transaction outcome unknown: " <> _reason} =
+                 Ferricstore.Transaction.Coordinator.execute([prepared], %{}, nil)
+      end
+    end
+
+    test "a refused entry still reports raft unavailable", %{same1: key} do
       Process.put(:ferricstore_tx_backend_write_hook, fn _shard_idx, _command ->
-        exit({:timeout, :synthetic_backend_timeout})
+        {:error, :compound_member_apply_budget_exceeded}
       end)
 
       on_exit(fn -> Process.delete(:ferricstore_tx_backend_write_hook) end)

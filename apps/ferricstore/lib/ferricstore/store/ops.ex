@@ -1034,8 +1034,12 @@ defmodule Ferricstore.Store.Ops do
   @spec on_push(store(), binary(), non_neg_integer()) :: [pid()] | pid() | nil
   def on_push(store, key, count \\ 1) do
     case store do
+      # Every node's state machine wakes its own waiters when it applies the
+      # push; waking here too would wake two waiters on this node and race
+      # them for one element.
       %FerricStore.Instance{} ->
-        Ferricstore.Waiters.notify_push(key, count)
+        _ = count
+        nil
 
       %LocalTxStore{} ->
         Ferricstore.Waiters.notify_push(key, count)

@@ -4,6 +4,34 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A blocking Flow claim (`block_ms`) is woken by the node that wrote the
+  flow, so in a cluster a flow created through another node left it asleep
+  for the whole block, after which it answered nothing although the flow had
+  been ready. It now claims once more when the block ends. (Waking it as
+  soon as the flow is written, from every node's apply as list waiters now
+  are, is still to do.)
+- A blocked BLPOP, BRPOP, BLMOVE or BLMPOP was woken only by a push made
+  through its own node, so in a cluster a push through another node left it
+  waiting until its timeout (for good, with timeout 0) while the list held
+  the element. LMOVE and RPOPLPUSH woke no waiter on their destination at
+  all. Each node's state machine now wakes its own waiters when it applies
+  a push or a move, once the entry is published.
+- A MULTI/EXEC whose Raft write timed out or whose call exited answered
+  "transaction raft unavailable", as if nothing had applied, though the
+  entry may have committed. It now answers "transaction outcome unknown".
+  Commands that run as a one-command transaction (since #92) no longer fall
+  back to their own path then, which could apply them twice (BITOP XOR into
+  one of its sources would undo itself); they answer as a timed-out write.
+- The embedded `sunionstore/2`, `sinterstore/2`, `sdiffstore/2` and `bitop/3`
+  still read a destination that is also a source and wrote it back, undoing
+  writes in between (SADD racing `sunionstore(k, [k, other])` kept 261 of
+  401 members, SETBIT racing `bitop(:or, k, [k, other])` 1 of 401 bits).
+  They now run as the gateways do, in one transaction entry.
+- SCAN and RANDOMKEY returned the invocation definition catalog
+  (`f:{f}:invocation:definitions:1`, an internal hash clients are refused
+  access to) and DBSIZE counted it, while KEYS left it out. Internal
+  collections stay in the key index, where exports find them, and SCAN,
+  RANDOMKEY and DBSIZE now leave them out.
 - EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT with NX, XX, GT or LT decided from
   the TTL they read, under a key latch that only holds against clients on
   the same node: sent from every node of a cluster at once, EXPIRE NX had a

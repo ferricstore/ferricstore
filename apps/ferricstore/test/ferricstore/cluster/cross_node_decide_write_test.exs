@@ -49,6 +49,74 @@ defmodule Ferricstore.Cluster.CrossNodeDecideWriteTest do
     end
   end
 
+  # A blocked list pop waits in its own node's waiter registry. A push made
+  # through another node only notified that node's registry, so the pop slept
+  # until its timeout (or for good, with timeout 0) while the list had data.
+  test "a list push wakes list waiters on every node", %{nodes: [first, second, third]} do
+    for {push, args} <- [
+          {"RPUSH", ["{decide}l", "a"]},
+          {"LPUSH", ["{decide}l2", "b"]},
+          {"LMOVE", ["{decide}src", "{decide}l3", "LEFT", "RIGHT"]}
+        ] do
+      key = Enum.at(args, if(push == "LMOVE", do: 1, else: 0))
+      if push == "LMOVE", do: assert(1 == dispatch(first, "RPUSH", ["{decide}src", "m"]))
+
+      waiters =
+        for node <- [second, third] do
+          Task.async(fn -> await_waiter_notify(node, key) end)
+        end
+
+      Process.sleep(300)
+      dispatch(first, push, args)
+
+      assert [:notified, :notified] == Task.await_many(waiters, 10_000), push
+    end
+  end
+
+  # Claim waiters are woken by the node that wrote the flow, so a claim
+  # blocked on another node slept through its block and then answered
+  # nothing although the flow had been ready for most of it. It now claims
+  # once more when the block ends.
+  test "a blocked claim takes a flow created through another node", %{
+    nodes: [first, second, _third] = nodes
+  } do
+    type = "cross-node-claim-#{System.unique_integer([:positive])}"
+
+    claim =
+      Task.async(fn ->
+        ClusterHelper.run(second.name, FerricStore, :flow_claim_due, [
+          type,
+          [worker: "w", block_ms: 1_500]
+        ])
+      end)
+
+    Process.sleep(300)
+    # A crowded local disk pauses new flows on the peers; the test is not about that.
+    for node <- nodes,
+        do: ClusterHelper.run(node.name, Ferricstore.Flow.Admission, :clear_create_pause, [])
+
+    assert :ok ==
+             ClusterHelper.run(first.name, FerricStore, :flow_create, ["#{type}-1", [type: type]])
+
+    assert {:ok, [_claimed]} = Task.await(claim, 10_000)
+  end
+
+  # Registers a waiter for `key` on `node` and reports whether it was notified.
+  defp await_waiter_notify(node, key) do
+    code = """
+    Ferricstore.Waiters.register(key, self(), System.monotonic_time(:millisecond) + 5_000)
+
+    receive do
+      {:waiter_notify, ^key} -> :notified
+    after
+      3_000 -> :not_notified
+    end
+    """
+
+    {result, _binding} = ClusterHelper.run(node.name, Code, :eval_string, [code, [key: key]])
+    result
+  end
+
   # Two clients on each node, all at once.
   defp race(nodes, fun) do
     for node <- nodes, client <- 1..2 do
