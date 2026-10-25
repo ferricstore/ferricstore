@@ -1357,9 +1357,10 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
 
   # A Flow deleted (retention cleanup) and created again under the same id
   # starts over at version 1. A writer behind both still holds the old
-  # incarnation's projection for a higher version; the delete's versionless
-  # projection starts a new run for the key, so the latest op wins instead of
-  # the old version, which the source can never reach again.
+  # incarnation's projection for a higher version, in either order (an outbox
+  # entry drains late); the delete's versionless projection wins, projecting
+  # what the source holds now instead of waiting for a version it never
+  # reaches again.
   test "a delete between projections lets a re-created Flow's lower version win" do
     root = tmp_lmdb_path("recreated_source_version")
     path = Path.join(root, "query")
@@ -1390,16 +1391,22 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
       terminal_count_inits: MapSet.new()
     }
 
-    assert {:ok, ops, _state} =
-             ProjectionOps.expand_ops(state, [
-               {:project_flow_state_from_source, state_key, 3},
-               {:project_flow_state_from_source, state_key},
-               {:project_flow_state_from_source, state_key, 1}
-             ])
-
-    assert :ok = LMDB.write_batch(path, ops)
-    assert {:ok, query_row} = LMDB.get(path, state_key)
-    assert {:ok, %{record: %{version: 1}}} = QueryRowCodec.decode(query_row, state_key)
+    for batch <- [
+          [
+            {:project_flow_state_from_source, state_key, 3},
+            {:project_flow_state_from_source, state_key},
+            {:project_flow_state_from_source, state_key, 1}
+          ],
+          [
+            {:project_flow_state_from_source, state_key},
+            {:project_flow_query_state_from_source, state_key, 3}
+          ]
+        ] do
+      assert {:ok, ops, _state} = ProjectionOps.expand_ops(state, batch)
+      assert :ok = LMDB.write_batch(path, ops)
+      assert {:ok, query_row} = LMDB.get(path, state_key)
+      assert {:ok, %{record: %{version: 1}}} = QueryRowCodec.decode(query_row, state_key)
+    end
   end
 
   test "versioned source projection cleans up a record deleted before outbox drain" do
