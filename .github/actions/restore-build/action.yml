@@ -37,10 +37,6 @@ runs:
         tar -xzf build-test.tgz
         rm build-test.tgz
 
-    - name: Ensure dependencies
-      shell: bash
-      run: mix deps.get
-
     - name: Check the compiled build is reused
       shell: bash
       run: |
