@@ -1046,9 +1046,10 @@ defmodule Ferricstore.Commands.TDigest do
   # Private: result formatting
   # ===========================================================================
 
-  defp format_number(val) when is_float(val) do
-    :erlang.float_to_binary(val, [:compact, decimals: 17])
-  end
+  # The shortest text that reads back as the same float ("45.0", "2.5",
+  # "1.0e300"). Seventeen fixed decimals raised from about 1e252, read "0.0"
+  # below 1e-17 and carried noise digits ("123.45600000000000304").
+  defp format_number(val) when is_float(val), do: :erlang.float_to_binary(val, [:short])
 
   defp format_number(val) when is_integer(val) do
     Integer.to_string(val)

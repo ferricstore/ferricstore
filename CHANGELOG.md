@@ -22,6 +22,12 @@ All notable changes to FerricStore will be documented here.
   other's values (and two CREATEs could both succeed): each read the digest
   and wrote it back under a node-local latch. From cluster feature level 6
   they run as one-command transactions, and MULTI accepts TDIGEST commands.
+- TDIGEST replies (MIN, MAX, QUANTILE, CDF, BYRANK, TRIMMED_MEAN, INFO) failed
+  with an internal error for values from about 1e252 up, answered "0.0" for
+  values below 1e-17, and gave others with noise digits
+  ("123.45600000000000304"). They now give the shortest text that reads back
+  as the value ("1.0e300", "1.0e-300", "123.456"); values such as "45.0" and
+  "2.5" read as before.
 - A shard whose log held a Flow value pin with no locator left (the value
   deleted since, as by retention) could never trim its log again: each trim
   stopped with `{:segment_value_pin_missing_live_value, ...}` and the log kept
