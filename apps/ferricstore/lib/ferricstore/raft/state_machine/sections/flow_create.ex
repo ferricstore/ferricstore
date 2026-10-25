@@ -713,18 +713,37 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       # also reads values this node's history projector has moved to the LMDB
       # mirror (see flow_record_value_batch_get); :keydir reads only the keydir,
       # as releases before feature level 5 do.
-      defp flow_create_duplicate_result(state, existing, attrs, value_reads)
+      #
+      # `match` is how a retry is compared with a Flow changed since it was
+      # created (see flow_create_progress_match/1).
+      defp flow_create_duplicate_result(state, existing, attrs, value_reads, match)
 
-      defp flow_create_duplicate_result(state, existing, %{idempotent: true} = attrs, value_reads) do
-        if flow_create_idempotent_match?(state, existing, attrs, value_reads) do
+      defp flow_create_duplicate_result(
+             state,
+             existing,
+             %{idempotent: true} = attrs,
+             value_reads,
+             match
+           ) do
+        if flow_create_idempotent_match?(state, existing, attrs, value_reads, match) do
           {:ok, existing}
         else
           {:error, "ERR flow idempotency conflict"}
         end
       end
 
-      defp flow_create_duplicate_result(_state, _existing, _attrs, _value_reads),
+      defp flow_create_duplicate_result(_state, _existing, _attrs, _value_reads, _match),
         do: {:error, "ERR flow already exists"}
+
+      # A Flow a worker has claimed or finished no longer has the state, and
+      # perhaps not the payload, its create asked for. Where the retry's answer
+      # changes nothing stored, :identity compares it only with what no later
+      # command changes, so a create retried after its reply was lost still
+      # answers the Flow it made. Where the answer decides what else is written
+      # (new records of a batch, a spawn, a cross-shard transaction), :strict
+      # keeps the comparison with the current record every release applies.
+      defp flow_create_progress_match(writes_depend_on_answer?),
+        do: if(writes_depend_on_answer?, do: :strict, else: :identity)
 
       # The answer to a retry alone changes nothing stored, so it may read the
       # mirror at any level. Where it decides what else is written (new records of
@@ -1616,6 +1635,51 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
         |> Base.encode16(case: :lower)
       end
 
+      defp flow_create_idempotent_match?(
+             state,
+             %{version: version} = existing,
+             attrs,
+             value_reads,
+             :identity
+           )
+           when is_integer(version) and version > 1 do
+        id = Map.fetch!(attrs, :id)
+
+        identity = %{
+          id: id,
+          type: Map.get(attrs, :type),
+          partition_key: Map.get(attrs, :partition_key),
+          parent_flow_id: Map.get(attrs, :parent_flow_id),
+          root_flow_id: Map.get(attrs, :root_flow_id) || id,
+          correlation_id: Map.get(attrs, :correlation_id)
+        }
+
+        Enum.all?(identity, fn {key, value} -> Map.get(existing, key) == value end) and
+          flow_create_created_payload_match?(state, existing, attrs, value_reads)
+      end
+
+      defp flow_create_idempotent_match?(state, existing, attrs, value_reads, _match),
+        do: flow_create_idempotent_match?(state, existing, attrs, value_reads)
+
+      # The payload the create stored, still in place, must match the retry's.
+      # One a later command replaced or dropped cannot be compared with it.
+      defp flow_create_created_payload_match?(state, existing, attrs, value_reads) do
+        id = Map.fetch!(attrs, :id)
+        partition_key = Map.get(attrs, :partition_key)
+        current_ref = Map.get(existing, :payload_ref)
+
+        cond do
+          current_ref == flow_value_ref(attrs, :payload, id, 1, partition_key) ->
+            flow_create_idempotent_payload_match?(state, existing, attrs, value_reads)
+
+          current_ref == FlowKeys.value_key(id, :payload, 1, partition_key) ->
+            false
+
+          true ->
+            true
+        end
+      end
+
       defp flow_create_idempotent_match?(state, existing, attrs, value_reads) do
         id = Map.fetch!(attrs, :id)
         partition_key = Map.get(attrs, :partition_key)
@@ -1840,8 +1904,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
         with :ok <- flow_validate_create_attrs_list(attrs_list) do
           existing_records = flow_create_many_existing_states(state, attrs_list)
 
-          value_reads =
-            flow_create_value_reads(state, caller == :spawn or nil in existing_records)
+          writes_depend_on_answer? = caller == :spawn or nil in existing_records
+          value_reads = flow_create_value_reads(state, writes_depend_on_answer?)
+          match = flow_create_progress_match(writes_depend_on_answer?)
 
           attrs_list
           |> Enum.zip(existing_records)
@@ -1864,7 +1929,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
                   {:halt, {:error, "ERR flow already exists"}}
 
                 existing ->
-                  case flow_create_duplicate_result(state, existing, attrs, value_reads) do
+                  case flow_create_duplicate_result(state, existing, attrs, value_reads, match) do
                     {:ok, existing} -> {:cont, {:ok, [existing | acc], new_acc, retention_cache}}
                     {:error, _reason} = error -> {:halt, error}
                   end

@@ -21,6 +21,16 @@ All notable changes to FerricStore will be documented here.
   those fields were left without one (EXISTS 0, TYPE none, while HGET
   answered). The marker now goes only when the write failed outright and the
   hash is still empty.
+- An idempotent Flow create retried after its reply was lost answered "ERR
+  flow idempotency conflict" once a worker had claimed or finished the Flow:
+  the retry was compared with the Flow's current state, not the one it was
+  created in. A job outbox that retries an enqueue until it succeeds kept
+  retrying a job that had already run. A retry of a Flow that has moved on is
+  now compared with what no later command changes (type, partition, lineage,
+  correlation ID, and the created payload while it is still in place), and
+  answers the Flow. A batch with new items, a spawn, or a cross-shard
+  transaction keeps the earlier comparison, since its answer decides what
+  else is written.
 
 ## 0.12.8 - 2026-10-25
 
