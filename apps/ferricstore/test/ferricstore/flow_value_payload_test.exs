@@ -3,8 +3,8 @@ defmodule Ferricstore.FlowValuePayloadTest do
   @moduletag :flow
   @moduletag :global_state
 
+  alias Ferricstore.Test.FlowValues
   alias Ferricstore.Test.ShardHelpers
-  alias Ferricstore.Store.Router
 
   setup_all do
     ShardHelpers.wait_shards_alive()
@@ -193,6 +193,8 @@ defmodule Ferricstore.FlowValuePayloadTest do
 
     assert {:ok, created} = FerricStore.flow_get(id, partition_key: "tenant-retention")
 
+    # Projected, so the cleanup below has to remove it from the mirror.
+    FlowValues.projected!(FerricStore.Instance.get(:default), created.payload_ref)
     assert {:ok, value_blob} = internal_get(created.payload_ref)
     assert is_binary(value_blob)
 
@@ -923,7 +925,10 @@ defmodule Ferricstore.FlowValuePayloadTest do
     end)
   end
 
-  defp internal_get(key), do: {:ok, Router.get(FerricStore.Instance.get(:default), key)}
+  # Where Flow reads look: the keydir, or the LMDB mirror once the history
+  # projector has moved the value there.
+  defp internal_get(key),
+    do: {:ok, FlowValues.stored_value(FerricStore.Instance.get(:default), key)}
 
   defp unique_id(prefix), do: "#{prefix}:#{System.unique_integer([:positive])}"
 end
