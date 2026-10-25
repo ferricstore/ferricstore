@@ -23,10 +23,15 @@ defmodule Ferricstore.Raft.WARaftSegmentLogMemoryRegistryTest do
     logs = @registry |> :ets.tab2list() |> Enum.map(&elem(&1, 0)) |> Enum.sort()
     assert length(logs) > 1
 
-    # The log whose process holds the table, if one does, else the first.
+    # The log whose process holds the table, if one does, else the first
+    # running one. A row can name a log with no process at the moment (one
+    # restarting, or another instance's), which cannot be killed (CI: a
+    # Process.exit(nil, :kill) ArgumentError).
     owner = :ets.info(@registry, :owner)
-    restarted = Enum.find(logs, hd(logs), &(Process.whereis(&1) == owner))
-    others = logs -- [restarted]
+    running = Enum.filter(logs, &is_pid(Process.whereis(&1)))
+    assert running != []
+    restarted = Enum.find(running, hd(running), &(Process.whereis(&1) == owner))
+    others = running -- [restarted]
 
     pid = Process.whereis(restarted)
     monitor = Process.monitor(pid)
