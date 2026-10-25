@@ -648,13 +648,65 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
                )}
 
             :missing ->
-              {:error, {:segment_value_pin_missing_live_value, key, file_id}}
+              case segment_value_pin_source_without_locator(ctx, shard_index, key, file_id) do
+                :stale ->
+                  {:ok,
+                   key
+                   |> segment_value_pin_stale_relocation(
+                     expire_at_ms,
+                     file_id,
+                     offset,
+                     value_size,
+                     pin_key,
+                     false
+                   )
+                   |> Map.put(:missing_locator?, true)}
+
+                {:error, _reason} = error ->
+                  error
+              end
 
             {:error, _reason} = error ->
               error
           end
         end
       end
+
+      # A pin whose value no locator names any more. If its source still holds
+      # the value, those bytes may be its only copy, so the trim stops (fail
+      # closed). If the source does not hold it either, no read can reach the
+      # value and the pin keeps nothing: it is stale. Startup recovery re-pins
+      # every value an apply-projection batch wrote, values deleted since among
+      # them, and such a pin would otherwise stop every later trim of the log.
+      defp segment_value_pin_source_without_locator(ctx, shard_index, key, file_id) do
+        case WARaftSegmentReader.read_value_from_location_including_expired(
+               ctx,
+               shard_index,
+               file_id,
+               key
+             ) do
+          :not_found -> :stale
+          {:ok, _value} -> {:error, {:segment_value_pin_missing_live_value, key, file_id}}
+          {:error, reason} -> {:error, {:segment_value_pin_read_failed, key, file_id, reason}}
+        end
+      end
+
+      # The locator is still missing, as when the pin was found stale; the
+      # compare keeps the pin should a locator have been published since.
+      defp segment_value_pin_missing_locator_action(%{missing_locator?: true} = relocation) do
+        {:ok,
+         %{
+           relocation: relocation,
+           remove_pin?: true,
+           locator_ops: [{:compare_missing, relocation.key}],
+           value_pin_ops: []
+         }}
+      end
+
+      defp segment_value_pin_missing_locator_action(relocation),
+        do:
+          {:error,
+           {:segment_value_pin_missing_live_value, relocation.key, relocation.source_file_id}}
 
       defp segment_value_pin_relocation_from_pin(_ctx, _shard_index, pin, _expiry_cutoff_ms),
         do: {:error, {:bad_segment_value_pin, pin}}
@@ -1126,7 +1178,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
                 {:cont, {:ok, entries}}
 
               :missing ->
-                {:halt, {:error, {:segment_value_pin_missing_live_value, key, file_id}}}
+                case segment_value_pin_source_without_locator(ctx, shard_index, key, file_id) do
+                  :stale -> {:cont, {:ok, entries}}
+                  {:error, reason} -> {:halt, {:error, reason}}
+                end
 
               {:error, reason} ->
                 {:halt, {:error, reason}}
@@ -1322,8 +1377,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
              }}
 
           :missing ->
-            {:error,
-             {:segment_value_pin_missing_live_value, relocation.key, relocation.source_file_id}}
+            segment_value_pin_missing_locator_action(relocation)
 
           {:error, _reason} = error ->
             error
@@ -1385,7 +1439,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
              }}
 
           :missing ->
-            {:error, {:segment_value_pin_missing_live_value, key, source_file_id}}
+            segment_value_pin_missing_locator_action(relocation)
 
           {:error, _reason} = error ->
             error

@@ -474,6 +474,124 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
                  )
       end
 
+      # A pin whose value no locator names and whose source does not hold it
+      # protects no bytes: no read can reach the value, so the pin is released
+      # rather than stopping every later trim of the shard's log. (Startup
+      # recovery re-pins every value an apply-projection batch wrote, values
+      # deleted since among them.)
+      @tag :apply_projection_pin_retention
+      test "unified segment trim releases a pin whose value is in neither the mirror nor its source",
+           %{root: root, ctx: ctx} do
+        clear_apply_projection_cache!()
+
+        assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+        payload_ref =
+          Ferricstore.Flow.Keys.value_key(
+            "missing-locator-missing-source",
+            :payload,
+            1,
+            "segment-keydir-flow-trim-current-pin"
+          )
+
+        {_log, value_index} = append_waraft_fence!("missing-locator-pin:source-index", "v")
+        value_size = 512
+
+        lmdb_path =
+          ctx.data_dir
+          |> Ferricstore.DataDir.shard_data_path(0)
+          |> Ferricstore.Flow.LMDB.path()
+
+        assert :ok =
+                 Ferricstore.Flow.LMDB.write_batch(
+                   lmdb_path,
+                   Ferricstore.Flow.LMDB.segment_value_pin_batch_put_ops([
+                     {payload_ref, 0, {:waraft_apply_projection, value_index}, 0, value_size}
+                   ])
+                 )
+
+        # The value was deleted since: no locator names it.
+        assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:delete, payload_ref}])
+
+        assert {:ok, 1} =
+                 WARaftStorage.__prepare_segment_value_pins_for_trim_for_test__(
+                   root,
+                   ctx,
+                   0,
+                   value_index + 1,
+                   100
+                 )
+
+        assert {:ok, []} =
+                 Ferricstore.Flow.LMDB.segment_value_pin_entries_before(
+                   lmdb_path,
+                   value_index + 1,
+                   100
+                 )
+
+        assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, payload_ref)
+      end
+
+      @tag :apply_projection_pin_retention
+      test "unified segment trim fails closed when a pinned value has no locator but its source holds it",
+           %{root: root, ctx: ctx} do
+        clear_apply_projection_cache!()
+
+        assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+        payload_ref =
+          Ferricstore.Flow.Keys.value_key(
+            "missing-locator-live-source",
+            :payload,
+            1,
+            "segment-keydir-flow-trim-current-pin"
+          )
+
+        encoded = Ferricstore.Flow.encode_value(:binary.copy("s", 512))
+        {_log, value_index} = append_waraft_fence!("live-source-pin:source-index", "v")
+
+        assert :ok =
+                 Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(root, 0, value_index, [
+                   {payload_ref, encoded, 0}
+                 ])
+
+        lmdb_path =
+          ctx.data_dir
+          |> Ferricstore.DataDir.shard_data_path(0)
+          |> Ferricstore.Flow.LMDB.path()
+
+        assert :ok =
+                 Ferricstore.Flow.LMDB.write_batch(
+                   lmdb_path,
+                   Ferricstore.Flow.LMDB.segment_value_pin_batch_put_ops([
+                     {payload_ref, 0, {:waraft_apply_projection, value_index}, 0,
+                      byte_size(encoded)}
+                   ])
+                 )
+
+        # No locator names the value, though its source still holds it.
+        assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:delete, payload_ref}])
+        assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, payload_ref)
+
+        assert {:error,
+                {:segment_value_pin_missing_live_value, ^payload_ref,
+                 {:waraft_apply_projection, ^value_index}}} =
+                 WARaftStorage.__prepare_segment_value_pins_for_trim_for_test__(
+                   root,
+                   ctx,
+                   0,
+                   value_index + 1,
+                   100
+                 )
+
+        assert {:ok, [%{key: ^payload_ref}]} =
+                 Ferricstore.Flow.LMDB.segment_value_pin_entries_before(
+                   lmdb_path,
+                   value_index + 1,
+                   100
+                 )
+      end
+
       @tag :apply_projection_pin_retention
       test "unified segment trim fails closed on a malformed current locator", %{
         root: root,
