@@ -462,6 +462,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
                       publish_pending_compound_revisions(state)
                       Ferricstore.Store.PromotedPublication.finish()
                       dispatch_pending_compound_promotions(state)
+                      notify_pending_list_waiters()
 
                       case publish_pending_flow_history_projections(state) do
                         :ok ->
@@ -538,6 +539,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
         end
 
         :ok
+      end
+
+      defp notify_pending_list_waiters do
+        case Process.put(:sm_pending_list_push_notifications, []) do
+          [_ | _] = pending ->
+            pending
+            |> Enum.reverse()
+            |> Enum.each(fn {key, count} -> Ferricstore.Waiters.notify_push(key, count) end)
+
+          _none ->
+            :ok
+        end
+      rescue
+        # The waiter registry is not up (startup replay); nobody is waiting.
+        ArgumentError -> :ok
       end
 
       defp init_pending_write_process_state(state) do

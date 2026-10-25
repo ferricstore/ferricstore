@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A blocked BLPOP, BRPOP, BLMOVE or BLMPOP was woken only by a push made
+  through its own node, so in a cluster a push through another node left it
+  waiting until its timeout (for good, with timeout 0) while the list held
+  the element. LMOVE and RPOPLPUSH woke no waiter on their destination at
+  all. Each node's state machine now wakes its own waiters when it applies
+  a push or a move, once the entry is published.
 - A MULTI/EXEC whose Raft write timed out or whose call exited answered
   "transaction raft unavailable", as if nothing had applied, though the
   entry may have committed. It now answers "transaction outcome unknown".

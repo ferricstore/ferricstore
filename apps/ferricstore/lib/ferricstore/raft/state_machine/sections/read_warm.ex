@@ -596,9 +596,31 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           end)
 
         case ensure_list_type_for_operation(key, operation, type_store) do
-          :ok -> ListOps.execute(key, store, operation)
-          {:error, _} = err -> err
+          :ok ->
+            key
+            |> ListOps.execute(store, operation)
+            |> queue_list_push_notification(key, operation)
+
+          {:error, _} = err ->
+            err
         end
+      end
+
+      # Blocked list pops wait in their own node's waiter registry, and every
+      # node applies the push: each wakes its oldest waiter once the entry is
+      # published (with_pending_writes/2), and a woken pop that leaves elements
+      # behind hands the wake-up on, keeping them FIFO.
+      defp queue_list_push_notification(length, key, {tag, _elements})
+           when tag in [:lpush, :rpush, :lpushx, :rpushx] and is_integer(length) and length > 0 do
+        queue_list_push_notification(key, 1)
+        length
+      end
+
+      defp queue_list_push_notification(result, _key, _operation), do: result
+
+      defp queue_list_push_notification(key, count) do
+        pending = Process.get(:sm_pending_list_push_notifications, [])
+        Process.put(:sm_pending_list_push_notifications, [{key, count} | pending])
       end
 
       defp do_checked_lmove(state, source, destination, from_dir, to_dir) do
@@ -617,7 +639,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
 
             _meta ->
               with :ok <- Ferricstore.Store.TypeRegistry.check_or_set(destination, :list, store) do
-                ListOps.execute_lmove(source, destination, store, from_dir, to_dir)
+                case ListOps.execute_lmove(source, destination, store, from_dir, to_dir) do
+                  element when is_binary(element) ->
+                    queue_list_push_notification(destination, 1)
+                    element
+
+                  other ->
+                    other
+                end
               end
           end
         end

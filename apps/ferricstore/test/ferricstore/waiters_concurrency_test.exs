@@ -142,6 +142,56 @@ defmodule Ferricstore.WaitersConcurrencyTest do
     assert Waiters.count(key) == 0
   end
 
+  # LMOVE and RPOPLPUSH push onto their destination, so a pop blocked there
+  # can run; only the push commands woke waiters.
+  for {name, command} <- [
+        {"LMOVE", &__MODULE__.lmove/3},
+        {"RPOPLPUSH", &__MODULE__.rpoplpush/3},
+        {"embedded lmove", &__MODULE__.embedded_lmove/3}
+      ] do
+    @command command
+    test "#{name} wakes a waiter on its destination" do
+      ctx = FerricStore.Instance.get(:default)
+      tag = System.unique_integer([:positive])
+      source = "{waiters-move-#{tag}}src"
+      destination = "{waiters-move-#{tag}}dst"
+      parent = self()
+      assert {:ok, 1} = FerricStore.rpush(source, ["moved"])
+
+      waiter =
+        spawn(fn ->
+          :ok = Waiters.register(destination, self(), 0)
+          send(parent, :move_waiter_ready)
+          forward_notifications(parent, destination)
+        end)
+
+      on_exit(fn ->
+        Process.exit(waiter, :kill)
+        Waiters.cleanup(waiter)
+      end)
+
+      assert_receive :move_waiter_ready, 1_000
+      assert "moved" == @command.(ctx, source, destination)
+      assert_receive {:waiter_notified, ^waiter, ^destination}, 1_000
+    end
+  end
+
+  def lmove(ctx, source, destination),
+    do:
+      Ferricstore.Commands.Dispatcher.dispatch(
+        "LMOVE",
+        [source, destination, "LEFT", "RIGHT"],
+        ctx
+      )
+
+  def rpoplpush(ctx, source, destination),
+    do: Ferricstore.Commands.Dispatcher.dispatch("RPOPLPUSH", [source, destination], ctx)
+
+  def embedded_lmove(_ctx, source, destination) do
+    {:ok, element} = FerricStore.lmove(source, destination, :left, :right)
+    element
+  end
+
   defp forward_notifications(parent, key) do
     receive do
       {:waiter_notify, ^key} ->

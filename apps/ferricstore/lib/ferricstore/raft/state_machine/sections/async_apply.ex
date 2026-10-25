@@ -573,6 +573,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       end
 
       defp apply_list_push_single(state, key, value, direction) do
+        case do_apply_list_push_single(state, key, value, direction) do
+          length when is_integer(length) and length > 0 ->
+            queue_list_push_notification(key, 1)
+            length
+
+          other ->
+            other
+        end
+      end
+
+      defp do_apply_list_push_single(state, key, value, direction) do
         type_key = CompoundKey.type_key(key)
 
         case do_get(state, type_key) do

@@ -49,6 +49,46 @@ defmodule Ferricstore.Cluster.CrossNodeDecideWriteTest do
     end
   end
 
+  # A blocked list pop waits in its own node's waiter registry. A push made
+  # through another node only notified that node's registry, so the pop slept
+  # until its timeout (or for good, with timeout 0) while the list had data.
+  test "a list push wakes list waiters on every node", %{nodes: [first, second, third]} do
+    for {push, args} <- [
+          {"RPUSH", ["{decide}l", "a"]},
+          {"LPUSH", ["{decide}l2", "b"]},
+          {"LMOVE", ["{decide}src", "{decide}l3", "LEFT", "RIGHT"]}
+        ] do
+      key = Enum.at(args, if(push == "LMOVE", do: 1, else: 0))
+      if push == "LMOVE", do: assert(1 == dispatch(first, "RPUSH", ["{decide}src", "m"]))
+
+      waiters =
+        for node <- [second, third] do
+          Task.async(fn -> await_waiter_notify(node, key) end)
+        end
+
+      Process.sleep(300)
+      dispatch(first, push, args)
+
+      assert [:notified, :notified] == Task.await_many(waiters, 10_000), push
+    end
+  end
+
+  # Registers a waiter for `key` on `node` and reports whether it was notified.
+  defp await_waiter_notify(node, key) do
+    code = """
+    Ferricstore.Waiters.register(key, self(), System.monotonic_time(:millisecond) + 5_000)
+
+    receive do
+      {:waiter_notify, ^key} -> :notified
+    after
+      3_000 -> :not_notified
+    end
+    """
+
+    {result, _binding} = ClusterHelper.run(node.name, Code, :eval_string, [code, [key: key]])
+    result
+  end
+
   # Two clients on each node, all at once.
   defp race(nodes, fun) do
     for node <- nodes, client <- 1..2 do
