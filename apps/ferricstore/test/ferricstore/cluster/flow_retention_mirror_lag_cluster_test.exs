@@ -31,12 +31,20 @@ defmodule Ferricstore.Cluster.FlowRetentionMirrorLagClusterTest do
     nodes: [first, second, third] = nodes
   } do
     run = fn node, m, f, a -> ClusterHelper.run(node.name, m, f, a) end
-    flush = fn node -> run.(node, Ferricstore.Flow.LMDBWriter, :flush_all, [:default, 1, 60_000]) end
-    clear_pause = fn -> for node <- nodes, do: run.(node, Ferricstore.Flow.Admission, :clear_create_pause, []) end
+
+    flush = fn node ->
+      run.(node, Ferricstore.Flow.LMDBWriter, :flush_all, [:default, 1, 60_000])
+    end
+
+    clear_pause = fn ->
+      for node <- nodes, do: run.(node, Ferricstore.Flow.Admission, :clear_create_pause, [])
+    end
 
     clear_pause.()
     assert :ok = run.(first, FerricStore, :flow_create, ["lag-1", [type: "lag", payload: "in"]])
-    assert {:ok, [c]} = run.(first, FerricStore, :flow_claim_due, ["lag", [worker: "w", limit: 1]])
+
+    assert {:ok, [c]} =
+             run.(first, FerricStore, :flow_claim_due, ["lag", [worker: "w", limit: 1]])
 
     assert :ok =
              run.(first, FerricStore, :flow_complete, [
@@ -61,7 +69,9 @@ defmodule Ferricstore.Cluster.FlowRetentionMirrorLagClusterTest do
       assert :ok = flush.(first)
       assert :ok = flush.(second)
       clear_pause.()
-      assert :ok = run.(first, FerricStore, :flow_create, ["lag-1", [type: "lag", payload: "again"]])
+
+      assert :ok =
+               run.(first, FerricStore, :flow_create, ["lag-1", [type: "lag", payload: "again"]])
     after
       run.(third, :sys, :resume, [writer])
     end
