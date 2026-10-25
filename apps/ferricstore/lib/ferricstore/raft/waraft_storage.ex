@@ -40,6 +40,10 @@ defmodule Ferricstore.Raft.WARaftStorage do
   # How far a trim may run ahead of the durable log floor while it waits for a
   # background checkpoint. Past this, it rebuilds the projection synchronously.
   @default_segment_projection_trim_max_deferred_entries 1_000_000
+  # After a synchronous rebuild fails, trims defer for a second, doubling while
+  # rebuilds keep failing, up to this maximum (0 retries at once).
+  @segment_projection_rebuild_first_backoff_ms 1_000
+  @default_segment_projection_trim_rebuild_backoff_max_ms 60_000
   # How long storage holds its applies for a checkpoint's keydir copy, and how
   # long the checkpoint task waits for storage.
   @segment_projection_cut_timeout_ms 30_000

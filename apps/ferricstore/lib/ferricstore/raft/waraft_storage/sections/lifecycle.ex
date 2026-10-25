@@ -374,22 +374,50 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
             defer_segment_projection_trim(root_dir, trim_index, :no_checkpoint)
 
           :not_available ->
-            # The rebuilt projection becomes the replay floor at the context's
-            # position, so the history up to there must be durable first.
-            if history_dependencies_durable?(context, context.history_dependencies) do
-              changing_segment_projection(root_dir, fn ->
-                rebuild_segment_projection_for_trim(
-                  root_dir,
-                  projection_root,
-                  context,
-                  trim_index
-                )
-              end)
-            else
-              request_history_dependencies(context, context.history_dependencies)
-              defer_segment_projection_trim(root_dir, trim_index, :history_not_durable)
+            cond do
+              # WARaft retries a failed trim with every batch it applies, in
+              # the Raft server, so a rebuild that failed waits before it runs
+              # again.
+              segment_projection_rebuild_backing_off?(root_dir) ->
+                defer_segment_projection_trim(root_dir, trim_index, :rebuild_backoff)
+
+              # The rebuilt projection becomes the replay floor at the context's
+              # position, so the history up to there must be durable first.
+              history_dependencies_durable?(context, context.history_dependencies) ->
+                root_dir
+                |> changing_segment_projection(fn ->
+                  rebuild_segment_projection_for_trim(
+                    root_dir,
+                    projection_root,
+                    context,
+                    trim_index
+                  )
+                end)
+                |> note_segment_projection_rebuild(root_dir)
+
+              true ->
+                request_history_dependencies(context, context.history_dependencies)
+                defer_segment_projection_trim(root_dir, trim_index, :history_not_durable)
             end
         end
+      end
+
+      defp segment_projection_trim_rebuild_backoff_max_ms do
+        case Application.get_env(
+               :ferricstore,
+               :waraft_segment_projection_trim_rebuild_backoff_max_ms,
+               @default_segment_projection_trim_rebuild_backoff_max_ms
+             ) do
+          value when is_integer(value) and value >= 0 -> value
+          _ -> @default_segment_projection_trim_rebuild_backoff_max_ms
+        end
+      end
+
+      defp segment_projection_rebuild_backoff_ms(failures) do
+        doubled =
+          @segment_projection_rebuild_first_backoff_ms * Integer.pow(2, min(failures, 16) - 1)
+
+        min(doubled, segment_projection_trim_rebuild_backoff_max_ms())
       end
 
       defp request_segment_projection_checkpoint(context, trim_index) do

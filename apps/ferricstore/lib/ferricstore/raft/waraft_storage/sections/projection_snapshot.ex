@@ -107,74 +107,24 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
              keydir,
              projection_index,
              projection_offset,
-             {{key, value, expire_at_ms}, original_row}
+             {{_key, value, _expire_at_ms}, original_row}
            ) do
-        compare_and_relocate_segment_projection_row(
-          keydir,
-          key,
-          value,
-          expire_at_ms,
-          original_row,
-          projection_index,
-          projection_offset
-        )
-      end
-
-      defp compare_and_relocate_segment_projection_row(
-             keydir,
-             key,
-             projected_value,
-             expire_at_ms,
-             {key, _original_value, expire_at_ms, _original_lfu, _original_file_id,
-              _original_offset, _original_value_size} = original_row,
-             projection_index,
-             projection_offset
-           ) do
-        compare_and_relocate_segment_projection_row_sized(
+        relocate_segment_projection_row_at_location(
           keydir,
           original_row,
           projection_index,
           projection_offset,
-          segment_projected_value_size(projected_value)
+          segment_projected_value_size(value)
         )
       end
 
-      # Points the row at its projection record only if nobody changed it since
-      # it was read, keeping a cached hot value. Storage applies writes to the
-      # keydir while trims and checkpoints relocate rows, so the compare and the
-      # replace are one select_replace.
-      defp compare_and_relocate_segment_projection_row_sized(
-             keydir,
-             {key, original_value, expire_at_ms, _original_lfu, original_file_id, original_offset,
-              original_value_size},
-             projection_index,
-             projection_offset,
-             projected_value_size
-           ) do
-        value_guards =
-          if original_value == nil,
-            do: [],
-            else: [{:"=:=", :"$1", {:const, original_value}}]
-
-        _relocated =
-          :ets.select_replace(keydir, [
-            {{key, :"$1", expire_at_ms, :"$2", original_file_id, original_offset,
-              original_value_size}, value_guards,
-             [
-               {{key, :"$1", expire_at_ms, :"$2",
-                 {:const, {:waraft_projection, projection_index}}, projection_offset,
-                 projected_value_size}}
-             ]}
-          ])
-
-        :ok
-      end
-
-      # Points the row at its checkpoint record if it is still at the location
-      # it had when the relocation was collected. Its cached value, expiry and
-      # LFU are kept: a cold read or eviction and an EXPIRE change those without
-      # moving the row, and the record holds the value at that location. A write
-      # or delete moves it, and then it is left alone.
+      # Points the row at its projection or checkpoint record if it is still at
+      # the location it had when the relocation was collected. Its cached value,
+      # expiry and LFU are kept: a cold read or eviction and an EXPIRE change
+      # those without moving the row, and the record holds the value at that
+      # location. A write or delete moves it, and then it is left alone.
+      # Storage applies writes to the keydir while trims and checkpoints
+      # relocate rows, so the compare and the replace are one select_replace.
       defp relocate_segment_projection_row_at_location(
              keydir,
              {key, _value, _expire_at_ms, _lfu, file_id, offset, value_size},
@@ -193,17 +143,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
 
         :ok
       end
-
-      defp compare_and_relocate_segment_projection_row(
-             _keydir,
-             key,
-             _projected_value,
-             _expire_at_ms,
-             original_row,
-             _projection_index,
-             _projection_offset
-           ),
-           do: {:error, {:bad_segment_projection_relocation_row, key, original_row}}
 
       defp segment_projection_entry_from_keydir_row(
              {key, value, expire_at_ms, _lfu, _file_id, _offset, _value_size},

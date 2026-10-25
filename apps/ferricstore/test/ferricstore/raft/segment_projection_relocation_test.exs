@@ -47,30 +47,33 @@ defmodule Ferricstore.Raft.SegmentProjectionRelocationTest do
              :ets.lookup(keydir, "cached")
   end
 
-  test "relocation leaves a row alone once its location or expiry changed" do
+  # A trim that left an evicted or re-expired row where it was pointed it at
+  # the log it dropped, or at a projection record that now holds another key.
+  test "relocation follows a row's location, not its cached value or expiry" do
     keydir = :ets.new(:relocation_changed_keydir, [:set, :public])
     moved = {"moved", nil, 0, 0, {:waraft_segment, 4}, 11, 8}
-    expired = {"expired", nil, 100, 0, {:waraft_segment, 4}, 12, 8}
-    hot = {"hot", "old", 0, 0, {:waraft_segment, 4}, 13, 8}
-    true = :ets.insert(keydir, [moved, expired, hot])
+    expire_changed = {"expire-changed", nil, 100, 0, {:waraft_segment, 4}, 12, 8}
+    evicted = {"evicted", "old", 0, 0, {:waraft_projection, 2}, 13, 8}
+    true = :ets.insert(keydir, [moved, expire_changed, evicted])
 
     true =
       :ets.insert(keydir, [
         {"moved", nil, 0, 0, {:waraft_segment, 6}, 0, 8},
-        {"expired", nil, 200, 0, {:waraft_segment, 4}, 12, 8},
-        {"hot", "newer", 0, 0, {:waraft_segment, 4}, 13, 8}
+        {"expire-changed", nil, 200, 0, {:waraft_segment, 4}, 12, 8},
+        {"evicted", nil, 0, 0, {:waraft_projection, 2}, 13, 8}
       ])
 
-    for row <- [moved, expired, hot] do
+    for row <- [moved, expire_changed, evicted] do
       WARaftStorage.__relocate_segment_projection_row_for_test__(keydir, row, 9, 120, 5)
     end
 
     assert [{"moved", nil, 0, 0, {:waraft_segment, 6}, 0, 8}] = :ets.lookup(keydir, "moved")
 
-    assert [{"expired", nil, 200, 0, {:waraft_segment, 4}, 12, 8}] =
-             :ets.lookup(keydir, "expired")
+    assert [{"expire-changed", nil, 200, 0, {:waraft_projection, 9}, 120, 5}] =
+             :ets.lookup(keydir, "expire-changed")
 
-    assert [{"hot", "newer", 0, 0, {:waraft_segment, 4}, 13, 8}] = :ets.lookup(keydir, "hot")
+    assert [{"evicted", nil, 0, 0, {:waraft_projection, 9}, 120, 5}] =
+             :ets.lookup(keydir, "evicted")
   end
 
   test "checkpoint adoption follows a row's location, not its cached value or expiry" do

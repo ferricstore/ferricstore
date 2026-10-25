@@ -17,6 +17,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
         :waraft_segment_projection_checkpoint_hook,
         :waraft_segment_projection_before_relocate_hook,
         :waraft_segment_projection_trim_max_deferred_entries,
+        :waraft_segment_projection_trim_rebuild_backoff_max_ms,
         :waraft_segment_projection_checkpoint_concurrency,
         :waraft_segment_projection_checkpoint_history_timeout_ms
       ]
@@ -539,6 +540,164 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
         end)
       end
 
+      # An eviction or an EXPIRE changes a row's cached value or expiry without
+      # moving it, and storage keeps doing both while a rebuild writes the new
+      # projection. A row the rebuild left where it was pointed at the log it
+      # trimmed, and every later rebuild failed reading it.
+      @tag :bounded_checkpoint
+      test "a synchronous rebuild repoints a row evicted or given an expiry while it ran", %{
+        ctx: ctx
+      } do
+        keydir = elem(ctx.keydir_refs, 0)
+        expire_at_ms = System.os_time(:millisecond) + 3_600_000
+
+        relocate_hook = fn 0, _projection_root, _relocations ->
+          true = :ets.update_element(keydir, "rebuild-race:evicted", {2, nil})
+          true = :ets.update_element(keydir, "rebuild-race:expiring", {3, expire_at_ms})
+          :ok
+        end
+
+        with_checkpoint_env(
+          [every: :never, min_interval_ms: 0, max_deferred: 1, relocate_hook: relocate_hook],
+          fn ->
+            assert :ok =
+                     WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-race:evicted", "v1", 0})
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-race:expiring", "v2", 0})
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-race:other", "v3", 0})
+            assert [{_, "v1", 0, _, _, _, _}] = :ets.lookup(keydir, "rebuild-race:evicted")
+
+            log = waraft_segment_log_record(0)
+            trim_index = :ferricstore_waraft_spike_segment_log.last_index(log)
+
+            assert {:ok, _state} =
+                     :ferricstore_waraft_spike_segment_log.trim(log, trim_index, %{})
+
+            refute segment_row?(ctx, "rebuild-race:evicted")
+            refute segment_row?(ctx, "rebuild-race:expiring")
+            assert "v1" == Router.get(ctx, "rebuild-race:evicted")
+            assert "v2" == Router.get(ctx, "rebuild-race:expiring")
+
+            assert [{_, _, ^expire_at_ms, _, _, _, _}] =
+                     :ets.lookup(keydir, "rebuild-race:expiring")
+
+            Application.delete_env(:ferricstore, :waraft_segment_projection_before_relocate_hook)
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-race:later", "v4", 0})
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-race:later", "v5", 0})
+            log = waraft_segment_log_record(0)
+            trim_index = :ferricstore_waraft_spike_segment_log.last_index(log)
+
+            assert {:ok, _state} =
+                     :ferricstore_waraft_spike_segment_log.trim(log, trim_index, %{})
+
+            assert "v1" == Router.get(ctx, "rebuild-race:evicted")
+            assert "v2" == Router.get(ctx, "rebuild-race:expiring")
+          end
+        )
+      end
+
+      # WARaft rotates the log from the Raft server's apply loop, so a rebuild
+      # that failed ran again, keydir scan and cold reads included, for every
+      # batch applied after it, stalling the server while nothing had changed
+      # its outcome. A failed rebuild now waits before it runs again.
+      @tag :bounded_checkpoint
+      test "a failed synchronous rebuild is not rerun for every applied batch", %{ctx: ctx} do
+        with_checkpoint_env(
+          [every: :never, min_interval_ms: 0, max_deferred: 1, rebuild_backoff_max_ms: 60_000],
+          fn ->
+            assert :ok =
+                     WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-backoff:stuck", "v1", 0})
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-backoff:other", "v2", 0})
+            assert {:ok, _state} = trim_to_last_index(0)
+            dangle_projection_row!(ctx, "rebuild-backoff:stuck", "rebuild-backoff:other")
+
+            # Past the deferral bound of one entry, so the trim rebuilds.
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-backoff:k1", "v3", 0})
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-backoff:k1", "v3", 0})
+            first_before = :ferricstore_waraft_spike_segment_log.first_index(segment_log(0))
+
+            assert {:error,
+                    {:segment_projection_missing_live_value, "rebuild-backoff:stuck",
+                     {:waraft_projection, _index}}} = trim_to_last_index(0)
+
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-backoff:k2", "v4", 0})
+            assert {:ok, _state} = trim_to_last_index(0)
+
+            assert_receive {:waraft_segment_projection_trim,
+                            [:ferricstore, :waraft, :segment_projection_trim, :deferred], _,
+                            %{reason: :rebuild_backoff}},
+                           1_000
+
+            assert first_before ==
+                     :ferricstore_waraft_spike_segment_log.first_index(segment_log(0))
+
+            # Once the wait is over the rebuild runs again, and succeeds now
+            # that a write moved the row.
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-backoff:stuck", "v5", 0})
+
+            Application.put_env(
+              :ferricstore,
+              :waraft_segment_projection_trim_rebuild_backoff_max_ms,
+              0
+            )
+
+            trim_index = :ferricstore_waraft_spike_segment_log.last_index(segment_log(0))
+            assert {:ok, _state} = trim_to_last_index(0)
+            assert trim_index == :ferricstore_waraft_spike_segment_log.first_index(segment_log(0))
+            assert "v5" == Router.get(ctx, "rebuild-backoff:stuck")
+          end
+        )
+      end
+
+      # A row an earlier rebuild missed still names its record in the
+      # projection that rebuild replaced. The new projection holds the row's
+      # value, and recovery rebuilds the keydir from it, so a restart repairs
+      # the row and trims succeed again.
+      @tag :bounded_checkpoint
+      test "a restart repairs a row left on a replaced projection's record", %{ctx: ctx} do
+        with_checkpoint_env(
+          [every: :never, min_interval_ms: 0, max_deferred: 1, rebuild_backoff_max_ms: 60_000],
+          fn ->
+            assert :ok =
+                     WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-repair:stuck", "v1", 0})
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-repair:other", "v2", 0})
+            assert {:ok, _state} = trim_to_last_index(0)
+            dangle_projection_row!(ctx, "rebuild-repair:stuck", "rebuild-repair:other")
+
+            # Past the deferral bound of one entry, so the trim rebuilds.
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-repair:k1", "v3", 0})
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-repair:k1", "v3", 0})
+
+            assert {:error,
+                    {:segment_projection_missing_live_value, "rebuild-repair:stuck",
+                     {:waraft_projection, _index}}} = trim_to_last_index(0)
+
+            assert {:error, {:storage_read_failed, _reason}} =
+                     Router.get(ctx, "rebuild-repair:stuck")
+
+            WARaftBackend.stop()
+
+            assert :ok =
+                     WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+            assert "v1" == Router.get(ctx, "rebuild-repair:stuck")
+            assert "v3" == Router.get(ctx, "rebuild-repair:k1")
+
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-repair:k2", "v4", 0})
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-repair:k2", "v4", 0})
+            trim_index = :ferricstore_waraft_spike_segment_log.last_index(segment_log(0))
+            assert {:ok, _state} = trim_to_last_index(0)
+            assert trim_index == :ferricstore_waraft_spike_segment_log.first_index(segment_log(0))
+            assert "v1" == Router.get(ctx, "rebuild-repair:stuck")
+          end
+        )
+      end
+
       # Flow history lives outside the keydir, so recovery, which replays only
       # the entries after the projection, could not rebuild history the
       # projector had not written yet.
@@ -673,6 +832,18 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
               :ferricstore,
               :waraft_segment_projection_checkpoint_history_timeout_ms,
               timeout_ms
+            )
+
+          :error ->
+            :ok
+        end
+
+        case Keyword.fetch(settings, :rebuild_backoff_max_ms) do
+          {:ok, backoff_ms} ->
+            Application.put_env(
+              :ferricstore,
+              :waraft_segment_projection_trim_rebuild_backoff_max_ms,
+              backoff_ms
             )
 
           :error ->
@@ -869,6 +1040,34 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
         |> Enum.map(&{&1, File.stat!(Path.join(dir, &1))})
         |> Enum.filter(fn {_name, stat} -> stat.type == :regular end)
         |> Map.new(fn {name, stat} -> {name, stat.inode} end)
+      end
+
+      defp segment_log(shard_index), do: waraft_segment_log_record(shard_index)
+
+      defp trim_to_last_index(shard_index) do
+        log = segment_log(shard_index)
+
+        :ferricstore_waraft_spike_segment_log.trim(
+          log,
+          :ferricstore_waraft_spike_segment_log.last_index(log),
+          %{}
+        )
+      end
+
+      # What a rebuild that missed a row left behind: a cold row naming the
+      # record it had in the projection that rebuild replaced, which now holds
+      # another key.
+      defp dangle_projection_row!(ctx, key, other_key) do
+        keydir = elem(ctx.keydir_refs, 0)
+
+        [{^other_key, _value, _expire, _lfu, {:waraft_projection, _} = file_id, offset, size}] =
+          :ets.lookup(keydir, other_key)
+
+        [{^key, _value, expire_at_ms, lfu, {:waraft_projection, _}, _offset, _size}] =
+          :ets.lookup(keydir, key)
+
+        true = :ets.insert(keydir, {key, nil, expire_at_ms, lfu, file_id, offset, size})
+        :ok
       end
 
       defp segment_row?(ctx, key) do

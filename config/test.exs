@@ -37,6 +37,10 @@ config :ferricstore,
 # that trim directly see the relocated keydir immediately.
 config :ferricstore, :waraft_segment_projection_trim_max_deferred_entries, 0
 
+# Tests that make a rebuild fail retry the trim at once unless they opt into
+# the backoff a failed rebuild otherwise waits out.
+config :ferricstore, :waraft_segment_projection_trim_rebuild_backoff_max_ms, 0
+
 # One background checkpoint at a time per node whatever the core count, so
 # tests that race checkpoints on several shards see the same slot contention.
 config :ferricstore, :waraft_segment_projection_checkpoint_concurrency, 1
