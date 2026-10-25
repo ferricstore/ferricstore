@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A MULTI/EXEC whose Raft write timed out or whose call exited answered
+  "transaction raft unavailable", as if nothing had applied, though the
+  entry may have committed. It now answers "transaction outcome unknown".
+  Commands that run as a one-command transaction (since #92) no longer fall
+  back to their own path then, which could apply them twice (BITOP XOR into
+  one of its sources would undo itself); they answer as a timed-out write.
 - The embedded `sunionstore/2`, `sinterstore/2`, `sdiffstore/2` and `bitop/3`
   still read a destination that is also a source and wrote it back, undoing
   writes in between (SADD racing `sunionstore(k, [k, other])` kept 261 of

@@ -17,6 +17,7 @@ defmodule Ferricstore.Transaction.SingleCommand do
   # instance does.
 
   alias Ferricstore.Commands.PreparedCommand
+  alias Ferricstore.ErrorReasons
   alias Ferricstore.Store.Router
   alias Ferricstore.Transaction.{Coordinator, ReplicaCompat}
 
@@ -39,6 +40,12 @@ defmodule Ferricstore.Transaction.SingleCommand do
         # command's own path may still take it.
         {:error, "ERR transaction raft unavailable: " <> _reason} ->
           :fallback
+
+        # The entry may have applied, and running the command again could
+        # apply it twice (BITOP XOR into one of its sources undoes itself):
+        # answer as a timed-out write does.
+        {:error, "ERR transaction outcome unknown: " <> _reason} ->
+          ErrorReasons.write_timeout_unknown()
 
         {:error, _reason} = error ->
           error

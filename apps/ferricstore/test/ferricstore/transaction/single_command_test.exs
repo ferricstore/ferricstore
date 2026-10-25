@@ -24,6 +24,28 @@ defmodule Ferricstore.Transaction.SingleCommandTest do
     assert :fallback == SingleCommand.run(ctx, "LOCK", [key, "owner", "1000"])
   end
 
+  # A refused entry never applied, so the command's own path may run it; an
+  # entry whose outcome is unknown may have applied, and running it again
+  # would apply BITOP XOR or NOT into a source twice, undoing it.
+  test "falls back only when the entry is known not to have applied", %{ctx: ctx, key: key} do
+    on_exit(fn -> Process.delete(:ferricstore_tx_backend_write_hook) end)
+    args = [key, "#{System.os_time(:millisecond) + 60_000}"]
+
+    Process.put(:ferricstore_tx_backend_write_hook, fn _shard, _command ->
+      {:error, :compound_member_apply_budget_exceeded}
+    end)
+
+    assert :fallback == SingleCommand.run(ctx, "PEXPIREAT", args)
+
+    for failure <- [
+          fn -> exit({:timeout, :synthetic}) end,
+          fn -> {:error, {:timeout, :unknown_outcome}} end
+        ] do
+      Process.put(:ferricstore_tx_backend_write_hook, fn _shard, _command -> failure.() end)
+      assert {:error, {:timeout, :unknown_outcome}} == SingleCommand.run(ctx, "PEXPIREAT", args)
+    end
+  end
+
   test "falls back off the default instance and for keys on two shards", %{key: key} do
     assert :fallback == SingleCommand.run(%{}, "PERSIST", [key])
 

@@ -68,6 +68,11 @@ defmodule Ferricstore.Transaction.Coordinator do
         {:error, :noproc} ->
           raft_unavailable(:noproc)
 
+        # A timed-out write may have committed: report it as unknown, so no
+        # caller takes it for "not applied" and runs the queue again.
+        {:error, {:timeout, :unknown_outcome}} ->
+          outcome_unknown(:timeout)
+
         {:error, _reason} ->
           raft_unavailable(:pipeline_rejected)
 
@@ -83,7 +88,7 @@ defmodule Ferricstore.Transaction.Coordinator do
         raft_unavailable(:noproc)
 
       :exit, _reason ->
-        raft_unavailable(:pipeline_rejected)
+        outcome_unknown(:exit)
     end
   end
 
@@ -175,6 +180,10 @@ defmodule Ferricstore.Transaction.Coordinator do
   end
 
   defp pipeline_group_error(entries, error), do: Enum.map(entries, &{&1.index, error})
+
+  defp outcome_unknown(reason) do
+    {:error, "ERR transaction outcome unknown: #{inspect(reason)}"}
+  end
 
   defp raft_unavailable(reason) do
     {:error, "ERR transaction raft unavailable: #{inspect(reason)}"}
