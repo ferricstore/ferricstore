@@ -343,6 +343,10 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     assert action =~ "git ls-files -z | xargs -0 touch -h -t 202001010000"
     assert action =~ ~s|find "$otp_lib" -name '*.hrl' -exec touch -h -t 202001010000 {} +|
     assert action =~ "tar -xzf build-test.tgz"
+
+    # The build carries the fetched dependencies; reaching Hex again only adds
+    # a way to fail (a test job died on an unreachable repo.hex.pm).
+    refute action =~ "mix deps.get"
     assert action =~ "Compiled build not reused"
   end
 
