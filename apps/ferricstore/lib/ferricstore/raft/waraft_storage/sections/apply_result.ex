@@ -1266,6 +1266,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
             :ets.delete(@segment_projection_registry, {key, :position})
             :ets.delete(@segment_projection_registry, {key, :adopted_checkpoint})
             :ets.delete(@segment_projection_registry, {key, :checkpoint_waiting})
+            :ets.delete(@segment_projection_registry, {key, :rebuild_failure})
         end
 
         :ok
@@ -1310,6 +1311,48 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
           [{^key, adopted}] -> {:ok, adopted}
           [] -> :none
         end
+      end
+
+      defp segment_projection_rebuild_backing_off?(root_dir) do
+        ensure_segment_projection_registry!()
+        key = {segment_projection_registry_key(root_dir), :rebuild_failure}
+
+        case :ets.lookup(@segment_projection_registry, key) do
+          [{^key, failures, failed_at_ms}] ->
+            System.monotonic_time(:millisecond) <
+              failed_at_ms + segment_projection_rebuild_backoff_ms(failures)
+
+          [] ->
+            false
+        end
+      end
+
+      # A rebuild that succeeded clears the wait; one that failed waits twice as
+      # long as the failure before it (see segment_projection_rebuild_backoff_ms/1).
+      defp note_segment_projection_rebuild(:ok, root_dir) do
+        ensure_segment_projection_registry!()
+        key = {segment_projection_registry_key(root_dir), :rebuild_failure}
+        true = :ets.delete(@segment_projection_registry, key)
+        :ok
+      end
+
+      defp note_segment_projection_rebuild(failure, root_dir) do
+        ensure_segment_projection_registry!()
+        key = {segment_projection_registry_key(root_dir), :rebuild_failure}
+
+        failures =
+          case :ets.lookup(@segment_projection_registry, key) do
+            [{^key, previous, _failed_at_ms}] -> previous + 1
+            [] -> 1
+          end
+
+        true =
+          :ets.insert(
+            @segment_projection_registry,
+            {key, failures, System.monotonic_time(:millisecond)}
+          )
+
+        failure
       end
 
       defp lookup_segment_projection_context(root_dir) do

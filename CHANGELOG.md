@@ -13,6 +13,15 @@ All notable changes to FerricStore will be documented here.
   `segment_projection_missing_live_value`, retried on each new entry while
   the log grew. The rebuild now follows a key's location, as checkpoint
   adoption already did.
+- WARaft retries a failed log trim with every batch it applies, from the
+  Raft server, so a synchronous projection rebuild that failed reran its
+  whole keydir scan, cold reads included, for each batch while nothing had
+  changed its outcome, stalling the shard's writes behind it. After a
+  failed rebuild, trims now defer for a second, doubling while rebuilds keep
+  failing, up to `waraft_segment_projection_trim_rebuild_backoff_max_ms`
+  (default 60000; 0 retries at once). A restart already repairs a key left
+  pointing at a replaced projection record, since recovery reloads the keydir
+  from the current projection.
 - A blocking Flow claim (`block_ms`) is woken by the node that wrote the
   flow, so in a cluster a flow created through another node left it asleep
   for the whole block, after which it answered nothing although the flow had
