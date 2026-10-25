@@ -25,6 +25,8 @@ defmodule Ferricstore.Transaction.SingleCommand do
 
   def run(%FerricStore.Instance{name: :default} = ctx, command, args, opts) do
     with {:ok, prepared} <- PreparedCommand.prepare(command, args),
+         # A command transactions refuse runs on its own path.
+         :local <- prepared.transaction_mode,
          true <- one_shard?(ctx, prepared.command_keys),
          true <- level_ready?(ctx, prepared.command_keys, Keyword.get(opts, :level)),
          nil <- ReplicaCompat.queue_error(command, prepared.ast, prepared.command_keys, ctx) do

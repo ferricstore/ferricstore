@@ -4,6 +4,7 @@ defmodule Ferricstore.Commands.Expiry do
   alias Ferricstore.Commands.ExpiryTime
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.{Ops, ReadResult, TypeRegistry}
+  alias Ferricstore.Transaction.SingleCommand
 
   @probabilistic_types ["bloom", "cms", "cuckoo", "topk"]
 
@@ -276,8 +277,23 @@ defmodule Ferricstore.Commands.Expiry do
     end
   end
 
-  defp apply_expiry(key, expire_at_ms, flag, store),
-    do: apply_expiry_with_flag(key, expire_at_ms, flag, store)
+  # With a flag the expiry depends on the TTL read first. The key latch keeps
+  # that read and the write together only against clients on this node: from
+  # every node of a cluster, EXPIRE NX had a winner per node, each replacing
+  # the TTL the last one set. Where it can, the decision runs as a one-command
+  # transaction, made where the write applies (from feature level 5, below
+  # which a transaction rewrites a probabilistic key as a string).
+  defp apply_expiry(key, expire_at_ms, flag, store) do
+    args = [key, Integer.to_string(expire_at_ms) | flag_args(flag)]
+
+    case SingleCommand.run(store, "PEXPIREAT", args, level: 5) do
+      :fallback -> apply_expiry_with_flag(key, expire_at_ms, flag, store)
+      result -> result
+    end
+  end
+
+  defp flag_args(flags) when is_list(flags), do: Enum.flat_map(flags, &flag_args/1)
+  defp flag_args(flag) when is_atom(flag), do: [flag |> Atom.to_string() |> String.upcase()]
 
   defp apply_expiry_with_flag(key, expire_at_ms, flag, store) do
     case ttl_expire_at_ms(key, store) do
@@ -502,10 +518,27 @@ defmodule Ferricstore.Commands.Expiry do
     end
   end
 
+  # A collection's expiry lives on every member, so changing it rewrites them
+  # all. Read here and written back, that undid any member changed or added in
+  # between: INCRBY racing EXPIRE kept a fraction of its increments and RPUSH
+  # lost elements. Where it can, it runs instead as a one-command transaction,
+  # which the shard's state machine applies with nothing in between (inside
+  # MULTI the handler already runs there).
   defp set_collection_expiry(key, type, expire_at_ms, store) do
-    case expire_compound_key(key, type, expire_at_ms, store) do
-      :ok -> 1
-      {:error, _} = error -> ReadResult.command_result(error)
+    {command, args} =
+      if expire_at_ms == 0,
+        do: {"PERSIST", [key]},
+        else: {"PEXPIREAT", [key, Integer.to_string(expire_at_ms)]}
+
+    case SingleCommand.run(store, command, args) do
+      :fallback ->
+        case expire_compound_key(key, type, expire_at_ms, store) do
+          :ok -> 1
+          {:error, _} = error -> ReadResult.command_result(error)
+        end
+
+      result ->
+        result
     end
   end
 
