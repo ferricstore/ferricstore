@@ -4,6 +4,17 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A node that last stopped on a release before 0.12.7 could not start again
+  once a shard held a promoted collection (a hash, set or sorted set past the
+  promotion threshold): neither on its own release nor on 0.12.7 or 0.12.8.
+  It stopped at start with "failed to rebuild logical key index on shard N:
+  :invalid_type_metadata_values". Those releases wrote a shard's shutdown
+  hint from its keydir, so the hint for log file 0 also listed the promoted
+  collection's rows, whose dedicated file is numbered 0 too, and the next
+  start read them from the shared log. Hint metadata is now version 2, and a
+  start reads only version 2 hints: the first start after an upgrade reads
+  the log files once instead. See the deployment guide for starting a node
+  that is stuck on such a hint.
 - Below cluster feature level 4, HDEL and HGETDEL delete the fields and then,
   when the hash is left empty, its type marker, as two replicated writes.
   When the marker delete failed, they wrote the deleted fields back. After a

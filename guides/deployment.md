@@ -543,6 +543,16 @@ would apply differently stays off until you raise the cluster's feature level,
 so a mixed-version cluster keeps applying every write the same way on every
 node.
 
+The first start on a release after 0.12.8 reads each shard's log files
+instead of the hint files an older release wrote, once, so it takes longer
+than later starts. Releases before 0.12.7 could write a hint that lists a
+promoted collection's rows as the shard's own; 0.12.7 and 0.12.8 trusted such
+a hint and stopped at start with "failed to rebuild logical key index on shard
+N: :invalid_type_metadata_values", as does a restart of the release that wrote
+it. A node stuck there starts once its hint files are gone: stop it, back up
+the data directory, delete `data/shard_*/*.hint` and `data/shard_*/*.hint.meta`
+under it, and start it again. The shard then reads its log files instead.
+
 After every node runs the new release, check and raise the level:
 
 ```bash

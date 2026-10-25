@@ -5,7 +5,12 @@ defmodule Ferricstore.Store.HintMetadata do
   alias Ferricstore.TermCodec
 
   @magic "FSHM"
-  @version 1
+  # Version 2 hints are built from the log they cover. Releases before 0.12.7
+  # wrote a shard's shutdown hint from the keydir, listing every row in that
+  # file id, a promoted collection's dedicated-file rows among them, and
+  # published it as version 1. A start reads only version 2 hints, so it scans
+  # the log once after an upgrade instead of loading another file's rows.
+  @version 2
   @max_metadata_bytes 4_096
 
   @type source_snapshot :: %{
