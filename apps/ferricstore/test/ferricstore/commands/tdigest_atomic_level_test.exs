@@ -2,16 +2,16 @@ defmodule Ferricstore.Commands.TDigestAtomicLevelTest do
   @moduledoc """
   TDIGEST writes read the digest, change it and write it back under a
   node-local key latch, so clients on two nodes lost each other's values.
-  From cluster feature level 6 they run as one-command transactions (and
-  MULTI takes them); below it they run on their own path, as older releases
-  refuse TDIGEST in a transaction.
+  From cluster feature level 6 each runs as one replicated entry (and MULTI
+  takes them); below it they run on their own path, as older releases neither
+  apply that entry nor take TDIGEST in a transaction.
   """
   use ExUnit.Case, async: false
   @moduletag :global_state
 
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.Test.ShardHelpers
-  alias Ferricstore.Transaction.{ReplicaCompat, SingleCommand}
+  alias Ferricstore.Transaction.ReplicaCompat
 
   defp cmd(ctx, name, args), do: Dispatcher.dispatch(name, args, ctx)
   defp ukey, do: "{tdigest-atomic:#{System.unique_integer([:positive])}}"
@@ -28,7 +28,9 @@ defmodule Ferricstore.Commands.TDigestAtomicLevelTest do
       assert active < 6
       key = ukey()
 
-      assert :fallback == SingleCommand.run(ctx, "TDIGEST.CREATE", [key], level: 6)
+      assert :unsupported ==
+               Ferricstore.Store.Ops.compound_command(ctx, key, {:tdigest_create, key, nil}, 6)
+
       assert :ok == cmd(ctx, "TDIGEST.CREATE", [key])
       assert :ok == cmd(ctx, "TDIGEST.ADD", [key, "1.5", "2"])
       assert :ok == FerricStore.tdigest_add(key, [3])
@@ -47,18 +49,41 @@ defmodule Ferricstore.Commands.TDigestAtomicLevelTest do
       %{ctx: FerricStore.Instance.get(:default)}
     end
 
-    test "TDIGEST writes run as one-command transactions", %{ctx: ctx} do
+    # One replicated entry, not a transaction: a transaction entry costs
+    # several more fsyncs.
+    test "TDIGEST writes run as one entry, not a transaction", %{ctx: ctx} do
+      parent = self()
+
+      Process.put(:ferricstore_tx_backend_write_hook, fn _shard, _command ->
+        send(parent, :transaction_used)
+        {:error, :noproc}
+      end)
+
+      on_exit(fn -> Process.delete(:ferricstore_tx_backend_write_hook) end)
       key = ukey()
       dest = key <> "dest"
 
-      assert :ok == SingleCommand.run(ctx, "TDIGEST.CREATE", [key], level: 6)
-      assert :ok == SingleCommand.run(ctx, "TDIGEST.ADD", [key, "1.5", "2"], level: 6)
-      assert :ok == SingleCommand.run(ctx, "TDIGEST.MERGE", [dest, "1", key], level: 6)
+      assert :ok == cmd(ctx, "TDIGEST.CREATE", [key])
+      assert :ok == cmd(ctx, "TDIGEST.ADD", [key, "1.5", "2"])
+      assert :ok == cmd(ctx, "TDIGEST.MERGE", [dest, "1", key])
       assert 2.0 == weight(ctx, dest)
-      assert :ok == SingleCommand.run(ctx, "TDIGEST.RESET", [key], level: 6)
+      assert :ok == cmd(ctx, "TDIGEST.RESET", [key])
       assert 0.0 == weight(ctx, key)
-
       assert {:error, "ERR TDIGEST: key already exists"} == cmd(ctx, "TDIGEST.CREATE", [key])
+      assert :ok == FerricStore.tdigest_add(key, [4])
+      assert 1.0 == weight(ctx, key)
+      refute_received :transaction_used
+
+      assert :ok ==
+               Ferricstore.Store.Ops.compound_command(ctx, key, {:tdigest_add, key, [5.0]}, 6)
+
+      assert 2.0 == weight(ctx, key)
+
+      hash = ukey()
+      assert 1 == cmd(ctx, "HSET", [hash, "f", "v"])
+      assert {:error, "WRONGTYPE" <> _} = cmd(ctx, "TDIGEST.ADD", [hash, "1"])
+
+      Process.delete(:ferricstore_tx_backend_write_hook)
 
       assert nil ==
                ReplicaCompat.queue_error("TDIGEST.ADD", {:tdigest_add, key, [1.0]}, [key], ctx)

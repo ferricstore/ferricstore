@@ -35,12 +35,13 @@ defmodule Ferricstore.Commands.TDigest do
     * `TDIGEST.MERGE destkey numkeys src [src ...] [COMPRESSION c] [OVERRIDE]`
   """
 
+  alias Ferricstore.Commands.PreparedCommand
   alias Ferricstore.Store.Ops
   alias Ferricstore.Store.ReadResult
+  alias Ferricstore.Store.Router
   alias Ferricstore.Store.TypeRegistry
   alias Ferricstore.TDigest.Core
   alias Ferricstore.TermCodec
-  alias Ferricstore.Transaction.SingleCommand
 
   @wrongtype_msg "WRONGTYPE Operation against a key holding the wrong kind of value"
   @max_compression 1_000
@@ -70,57 +71,39 @@ defmodule Ferricstore.Commands.TDigest do
   def handle_ast(ast, store), do: handle_ast(ast, :here, store)
 
   @doc """
-  Runs a TDIGEST write as a one-command transaction where `ctx` can (see
+  Runs a TDIGEST write as one replicated entry where `ctx` can (see
   `handle/3`), else with `store` here. Other commands run here.
   """
   @spec atomic_write(FerricStore.Instance.t(), term(), map()) :: term()
   def atomic_write(%FerricStore.Instance{} = ctx, ast, store) do
-    with {:ok, command, args} <- command_args(ast),
-         result when result != :fallback <- SingleCommand.run(ctx, command, args, level: 6) do
+    with {:ok, key} <- entry_key(ctx, ast),
+         result when result != :unsupported <- Ops.compound_command(ctx, key, ast, 6) do
       result
     else
       _here -> handle_ast(ast, :here, store)
     end
   end
 
-  defp command_args({:tdigest_create, key, nil}), do: {:ok, "TDIGEST.CREATE", [key]}
+  defp entry_key(_ctx, {:tdigest_create, key, compression})
+       when is_binary(key) and (is_nil(compression) or is_integer(compression)),
+       do: {:ok, key}
 
-  defp command_args({:tdigest_create, key, compression}) when is_integer(compression),
-    do: {:ok, "TDIGEST.CREATE", [key, "COMPRESSION", Integer.to_string(compression)]}
+  defp entry_key(_ctx, {:tdigest_add, key, values}) when is_binary(key) and is_list(values),
+    do: {:ok, key}
 
-  defp command_args({:tdigest_add, key, values}) when is_list(values) and values != [] do
-    if Enum.all?(values, &is_float/1),
-      do: {:ok, "TDIGEST.ADD", [key | Enum.map(values, &float_arg/1)]},
+  defp entry_key(_ctx, {:tdigest_reset, [key]}) when is_binary(key), do: {:ok, key}
+
+  # The entry applies on the destination's shard, which reads only its own keys.
+  defp entry_key(ctx, {:tdigest_merge, dest, src_keys, opts})
+       when is_binary(dest) and is_list(src_keys) and is_list(opts) do
+    shard = Router.shard_for(ctx, dest)
+
+    if Enum.all?(src_keys, &(is_binary(&1) and Router.shard_for(ctx, &1) == shard)),
+      do: {:ok, dest},
       else: :here
   end
 
-  defp command_args({:tdigest_reset, [key]}), do: {:ok, "TDIGEST.RESET", [key]}
-
-  defp command_args({:tdigest_merge, dest, src_keys, opts})
-       when is_list(src_keys) and is_list(opts) do
-    with {:ok, option_args} <- merge_option_args(opts) do
-      {:ok, "TDIGEST.MERGE",
-       [dest, Integer.to_string(length(src_keys)) | src_keys] ++ option_args}
-    end
-  end
-
-  defp command_args(_ast), do: :here
-
-  # The shortest text that parses back to the same float.
-  defp float_arg(value), do: :erlang.float_to_binary(value, [:short])
-
-  defp merge_option_args(opts) do
-    Enum.reduce_while(opts, {:ok, []}, fn
-      {:compression, c}, {:ok, acc} when is_integer(c) ->
-        {:cont, {:ok, acc ++ ["COMPRESSION", Integer.to_string(c)]}}
-
-      {:override, true}, {:ok, acc} ->
-        {:cont, {:ok, acc ++ ["OVERRIDE"]}}
-
-      _other, _acc ->
-        {:halt, :here}
-    end)
-  end
+  defp entry_key(_ctx, _ast), do: :here
 
   defp handle_ast({:tdigest_create, key, nil}, :here, store) do
     handle_ast({:tdigest_create, key, 100}, :here, store)
@@ -246,17 +229,16 @@ defmodule Ferricstore.Commands.TDigest do
   # TDIGEST writes read the digest, change it and write it back. The key latch
   # that serializes them is node-local, so clients on two nodes lost each
   # other's values and both created the digest. On the default instance, from
-  # cluster feature level 6, a write runs as a one-command transaction, which
-  # the shard applies with nothing in between (older releases refuse TDIGEST
-  # in a transaction); otherwise, and inside the transaction itself, it runs
-  # here.
+  # cluster feature level 6, a write runs as one replicated entry the shard
+  # applies with nothing in between (`atomic_write/3`); otherwise, and in the
+  # state machine itself, it runs here.
   @atomic_writes ~w(TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.MERGE)
 
   @spec handle(binary(), [binary()], map()) :: term()
-  def handle(command, args, %FerricStore.Instance{} = store) when command in @atomic_writes do
-    case SingleCommand.run(store, command, args, level: 6) do
-      :fallback -> handle_here(command, args, store)
-      result -> result
+  def handle(command, args, %FerricStore.Instance{} = ctx) when command in @atomic_writes do
+    case PreparedCommand.prepare(command, args) do
+      {:ok, %PreparedCommand{ast: ast}} -> atomic_write(ctx, ast, ctx)
+      _invalid -> handle_here(command, args, ctx)
     end
   end
 

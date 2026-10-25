@@ -21,7 +21,7 @@ All notable changes to FerricStore will be documented here.
 - TDIGEST.CREATE, ADD, RESET and MERGE sent through different nodes lost each
   other's values (and two CREATEs could both succeed): each read the digest
   and wrote it back under a node-local latch. From cluster feature level 6
-  they run as one-command transactions, and MULTI accepts TDIGEST commands.
+  each runs as one replicated entry, and MULTI accepts TDIGEST commands.
 - TDIGEST replies (MIN, MAX, QUANTILE, CDF, BYRANK, TRIMMED_MEAN, INFO) failed
   with an internal error for values from about 1e252 up, answered "0.0" for
   values below 1e-17, and gave others with noise digits

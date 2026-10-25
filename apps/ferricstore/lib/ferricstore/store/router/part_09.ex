@@ -901,16 +901,17 @@ defmodule Ferricstore.Store.Router.Part09 do
 
       @doc """
       Runs a command that reads one hash or sorted set, decides and writes it
-      (HDEL, HSETNX, HGETDEL, ZADD or GEOADD with options; HSETEX at level 5)
+      (HDEL, HSETNX, HGETDEL, ZADD or GEOADD with options; HSETEX at level 5;
+      TDIGEST.CREATE, ADD, RESET and MERGE at level 6)
       as one replicated entry, in which the state machine runs the command's
       handler on its own store, so concurrent clients each see one outcome.
       Needs cluster feature `level` (4 by default) on the key's shard, since
       older releases do not apply the entry; returns `:unsupported` below it
       and for custom instances.
       """
-      @spec compound_command(FerricStore.Instance.t(), binary(), tuple(), 4 | 5) :: term()
+      @spec compound_command(FerricStore.Instance.t(), binary(), tuple(), 4 | 5 | 6) :: term()
       def compound_command(ctx, key, ast, level \\ 4)
-          when is_binary(key) and is_tuple(ast) and level in [4, 5] do
+          when is_binary(key) and is_tuple(ast) and level in [4, 5, 6] do
         idx = shard_for(ctx, key)
 
         if durable_raft_ctx?(ctx) and

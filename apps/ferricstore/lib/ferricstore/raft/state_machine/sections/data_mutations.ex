@@ -1167,7 +1167,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         with {:ok, handler} <- compound_command_handler(redis_key, ast),
              :ok <- require_compound_command_level(state, ast),
              :ok <- check_fetch_or_compute_lock(state, redis_key, nil) do
-          run_compound_command(handler, ast, compound_command_store(state))
+          run_compound_command(handler, ast, compound_command_store(state, handler))
         end
       end
 
@@ -1189,6 +1189,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         :compound_scan_slice,
         :exists?
       ]
+
+      # A TDIGEST digest is a plain value: its handler reads and writes the key
+      # itself, as the HyperLogLog handlers do (`build_string_value_store/1`).
+      defp compound_command_store(state, Ferricstore.Commands.TDigest) do
+        value_store = build_string_value_store(state)
+
+        state
+        |> compound_command_store()
+        |> Map.merge(%{
+          get: materializing_read(state, value_store.get),
+          get_meta: materializing_read(state, value_store.get_meta),
+          put: value_store.put,
+          delete: value_store.delete,
+          level_5_writes?: feature_level_5?(state)
+        })
+      end
+
+      defp compound_command_store(state, _handler), do: compound_command_store(state)
 
       defp compound_command_store(state) do
         store = build_compound_store(state)
@@ -1294,6 +1312,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
                   pairs != [],
            do: binaries_handler(pairs, Ferricstore.Commands.Hash)
 
+      defp compound_command_handler(key, {:tdigest_create, key, compression})
+           when is_binary(key) and (is_nil(compression) or is_integer(compression)),
+           do: {:ok, Ferricstore.Commands.TDigest}
+
+      defp compound_command_handler(key, {:tdigest_add, key, values})
+           when is_binary(key) and is_list(values) and values != [] do
+        if Enum.all?(values, &is_float/1),
+          do: {:ok, Ferricstore.Commands.TDigest},
+          else: {:error, "ERR invalid compound command"}
+      end
+
+      defp compound_command_handler(key, {:tdigest_reset, [key]}) when is_binary(key),
+        do: {:ok, Ferricstore.Commands.TDigest}
+
+      defp compound_command_handler(key, {:tdigest_merge, key, src_keys, opts})
+           when is_binary(key) and is_list(src_keys) and src_keys != [] and is_list(opts),
+           do: binaries_handler(src_keys, Ferricstore.Commands.TDigest)
+
       defp compound_command_handler(_key, _ast), do: {:error, "ERR invalid compound command"}
 
       defp binaries_handler(values, handler) do
@@ -1312,6 +1348,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         if :incr in opts,
           do: require_feature_level_5(state),
           else: require_feature_level_4(state)
+      end
+
+      # TDIGEST writes joined the entry at level 6.
+      defp require_compound_command_level(state, ast)
+           when elem(ast, 0) in [:tdigest_create, :tdigest_add, :tdigest_reset, :tdigest_merge] do
+        if feature_level_6?(state),
+          do: :ok,
+          else: {:error, "ERR this command requires cluster feature level 6"}
       end
 
       defp require_compound_command_level(state, _ast), do: require_feature_level_4(state)
