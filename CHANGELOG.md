@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A blocking Flow claim (`block_ms`) is woken by the node that wrote the
+  flow, so in a cluster a flow created through another node left it asleep
+  for the whole block, after which it answered nothing although the flow had
+  been ready. It now claims once more when the block ends. (Waking it as
+  soon as the flow is written, from every node's apply as list waiters now
+  are, is still to do.)
 - A blocked BLPOP, BRPOP, BLMOVE or BLMPOP was woken only by a push made
   through its own node, so in a cluster a push through another node left it
   waiting until its timeout (for good, with timeout 0) while the list held

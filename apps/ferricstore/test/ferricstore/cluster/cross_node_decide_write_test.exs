@@ -73,6 +73,34 @@ defmodule Ferricstore.Cluster.CrossNodeDecideWriteTest do
     end
   end
 
+  # Claim waiters are woken by the node that wrote the flow, so a claim
+  # blocked on another node slept through its block and then answered
+  # nothing although the flow had been ready for most of it. It now claims
+  # once more when the block ends.
+  test "a blocked claim takes a flow created through another node", %{
+    nodes: [first, second, _third] = nodes
+  } do
+    type = "cross-node-claim-#{System.unique_integer([:positive])}"
+
+    claim =
+      Task.async(fn ->
+        ClusterHelper.run(second.name, FerricStore, :flow_claim_due, [
+          type,
+          [worker: "w", block_ms: 1_500]
+        ])
+      end)
+
+    Process.sleep(300)
+    # A crowded local disk pauses new flows on the peers; the test is not about that.
+    for node <- nodes,
+        do: ClusterHelper.run(node.name, Ferricstore.Flow.Admission, :clear_create_pause, [])
+
+    assert :ok ==
+             ClusterHelper.run(first.name, FerricStore, :flow_create, ["#{type}-1", [type: type]])
+
+    assert {:ok, [_claimed]} = Task.await(claim, 10_000)
+  end
+
   # Registers a waiter for `key` on `node` and reports whether it was notified.
   defp await_waiter_notify(node, key) do
     code = """
