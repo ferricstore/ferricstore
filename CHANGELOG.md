@@ -32,6 +32,14 @@ All notable changes to FerricStore will be documented here.
   (a DEL used as a claim had more than one winner): DEL read whether the key
   existed and then deleted it. From cluster feature level 6 each key is
   deleted by one replicated entry that decides whether it existed.
+- PUBLISH through one node reached only the subscribers connected to that
+  node. A publish now reaches subscribers on every node of the cluster, once
+  each; as in Redis Cluster, it answers the number of subscribers on the node
+  that ran it. Keyspace notifications reach every node the same way.
+- A Flow claim blocked on one node was woken only by Flows written through
+  that node: a claim waiting for a Flow written through another node slept
+  until its block ended, and a native claim subscription could wait for good.
+  The writing node now wakes blocked claims on every node.
 - A shard whose log held a Flow value pin with no locator left (the value
   deleted since, as by retention) could never trim its log again: each trim
   stopped with `{:segment_value_pin_missing_live_value, ...}` and the log kept

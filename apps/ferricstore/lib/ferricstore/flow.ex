@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow do
   @moduledoc false
 
   alias Ferricstore.CommandTime
+  alias Ferricstore.Cluster.Relay
   alias Ferricstore.Flow.ClaimWaiters
   alias Ferricstore.Flow.Codec
   alias Ferricstore.Flow.PayloadReturn
@@ -585,7 +586,7 @@ defmodule Ferricstore.Flow do
 
   defp maybe_notify_claim_waiters({:ok, results} = result, attrs_list, state_key)
        when is_list(results) and is_list(attrs_list) do
-    if ClaimWaiters.any_waiters?(),
+    if claim_waiters_anywhere?(),
       do: notify_successful_claim_waiter_hints(results, attrs_list, state_key)
 
     result
@@ -593,14 +594,14 @@ defmodule Ferricstore.Flow do
 
   defp maybe_notify_claim_waiters(results, attrs_list, state_key)
        when is_list(results) and is_list(attrs_list) do
-    if ClaimWaiters.any_waiters?(),
+    if claim_waiters_anywhere?(),
       do: notify_successful_claim_waiter_hints(results, attrs_list, state_key)
 
     results
   end
 
   defp maybe_notify_claim_waiters(result, attrs_list, state_key) when is_list(attrs_list) do
-    if flow_write_succeeded?(result) and ClaimWaiters.any_waiters?() do
+    if flow_write_succeeded?(result) and claim_waiters_anywhere?() do
       attrs_list
       |> Enum.reduce([], fn attrs, hints ->
         case claim_waiter_hint(attrs, state_key) do
@@ -643,7 +644,7 @@ defmodule Ferricstore.Flow do
   defp successful_claim_waiter_hints(_results, _attrs_list, _state_key, _hints), do: :mismatch
 
   defp maybe_notify_retry_claim_waiters(result, ctx, attrs) when is_map(attrs) do
-    if flow_write_succeeded?(result) and ClaimWaiters.any_waiters?() do
+    if flow_write_succeeded?(result) and claim_waiters_anywhere?() do
       notify_claim_waiters_from_current_record(ctx, attrs)
     end
 
@@ -651,7 +652,7 @@ defmodule Ferricstore.Flow do
   end
 
   defp maybe_notify_retry_claim_waiters(result, ctx, attrs_list) when is_list(attrs_list) do
-    if flow_write_succeeded?(result) and ClaimWaiters.any_waiters?() do
+    if flow_write_succeeded?(result) and claim_waiters_anywhere?() do
       Enum.each(attrs_list, &notify_claim_waiters_from_current_record(ctx, &1))
     end
 
@@ -680,6 +681,13 @@ defmodule Ferricstore.Flow do
     priority = Map.get(record, :priority, @default_priority)
     partition_key = Map.get(record, :partition_key)
     now = now_ms()
+
+    hint =
+      if next_run_at_ms <= now,
+        do: {:ready, {type, state, priority, partition_key, 1}},
+        else: {:scheduled, {type, state, priority, partition_key, next_run_at_ms, 1}}
+
+    Relay.forward_claim_hints([hint])
 
     cond do
       next_run_at_ms <= now ->
@@ -739,7 +747,34 @@ defmodule Ferricstore.Flow do
   defp claim_ready_state(attrs, state_key) when is_atom(state_key), do: Map.get(attrs, state_key)
   defp claim_ready_state(_attrs, state), do: state
 
+  # Blocked claims wait in each node's own registry, so the node that wrote a
+  # Flow wakes its own and sends the wake-up to the other members
+  # (`Ferricstore.Cluster.Relay`).
+  defp claim_waiters_anywhere?, do: ClaimWaiters.any_waiters?() or Relay.peers() != []
+
   defp notify_claim_waiter_hints(hints) do
+    Relay.forward_claim_hints(hints)
+    notify_claim_waiter_hints_here(hints)
+  end
+
+  @doc false
+  # Wakes this node's blocked claims for wake-ups another member relayed.
+  @spec wake_relayed_claim_waiters(list()) :: non_neg_integer()
+  def wake_relayed_claim_waiters(hints) when is_list(hints) do
+    if ClaimWaiters.any_waiters?(),
+      do: hints |> Enum.filter(&claim_waiter_hint?/1) |> notify_claim_waiter_hints_here(),
+      else: 0
+  end
+
+  defp claim_waiter_hint?({:ready, {type, state, _priority, _partition_key, limit}}),
+    do: is_binary(type) and is_binary(state) and is_integer(limit)
+
+  defp claim_waiter_hint?({:scheduled, {type, state, _priority, _partition_key, run_at, limit}}),
+    do: is_binary(type) and is_binary(state) and is_integer(run_at) and is_integer(limit)
+
+  defp claim_waiter_hint?(_hint), do: false
+
+  defp notify_claim_waiter_hints_here(hints) do
     {ready, scheduled} =
       Enum.reduce(hints, {[], %{}}, fn
         {:ready, hint}, {ready, scheduled} ->

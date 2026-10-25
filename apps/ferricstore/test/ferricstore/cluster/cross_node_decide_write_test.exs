@@ -134,28 +134,61 @@ defmodule Ferricstore.Cluster.CrossNodeDecideWriteTest do
   # blocked on another node slept through its block and then answered
   # nothing although the flow had been ready for most of it. It now claims
   # once more when the block ends.
+  # The node that writes a Flow wakes its blocked claims and sends the wake-up
+  # to the other members, so a claim blocked on another node takes the Flow
+  # at once rather than when its block ends.
   test "a blocked claim takes a flow created through another node", %{
-    nodes: [first, second, _third] = nodes
+    nodes: [_first, second, _third] = nodes
   } do
-    type = "cross-node-claim-#{System.unique_integer([:positive])}"
+    for node <- nodes, do: await_relay_peers(node, 2, 100)
 
-    claim =
-      Task.async(fn ->
-        ClusterHelper.run(second.name, FerricStore, :flow_claim_due, [
-          type,
-          [worker: "w", block_ms: 1_500]
-        ])
-      end)
+    # Whichever node the claim waits on, one of the creators is another node.
+    for creator <- nodes do
+      type = "cross-node-claim-#{System.unique_integer([:positive])}"
 
-    Process.sleep(300)
-    # A crowded local disk pauses new flows on the peers; the test is not about that.
-    for node <- nodes,
-        do: ClusterHelper.run(node.name, Ferricstore.Flow.Admission, :clear_create_pause, [])
+      claim =
+        Task.async(fn ->
+          result =
+            ClusterHelper.run(second.name, FerricStore, :flow_claim_due, [
+              type,
+              [worker: "w", block_ms: 10_000]
+            ])
 
-    assert :ok ==
-             ClusterHelper.run(first.name, FerricStore, :flow_create, ["#{type}-1", [type: type]])
+          {result, System.monotonic_time(:millisecond)}
+        end)
 
-    assert {:ok, [_claimed]} = Task.await(claim, 10_000)
+      Process.sleep(300)
+      # A crowded local disk pauses new flows on the peers; the test is not about that.
+      for node <- nodes,
+          do: ClusterHelper.run(node.name, Ferricstore.Flow.Admission, :clear_create_pause, [])
+
+      created_at = System.monotonic_time(:millisecond)
+
+      assert :ok ==
+               ClusterHelper.run(creator.name, FerricStore, :flow_create, [
+                 "#{type}-1",
+                 [type: type]
+               ])
+
+      assert {{:ok, [_claimed]}, claimed_at} = Task.await(claim, 20_000)
+      assert claimed_at - created_at < 3_000, "created through #{creator.name}"
+    end
+  end
+
+  defp await_relay_peers(node, count, attempts) do
+    peers = ClusterHelper.run(node.name, Ferricstore.Cluster.Relay, :peers, [])
+
+    cond do
+      length(peers) == count ->
+        :ok
+
+      attempts > 0 ->
+        Process.sleep(50)
+        await_relay_peers(node, count, attempts - 1)
+
+      true ->
+        flunk("#{node.name} relays to #{inspect(peers)}")
+    end
   end
 
   # Registers a waiter for `key` on `node` and reports whether it was notified.
