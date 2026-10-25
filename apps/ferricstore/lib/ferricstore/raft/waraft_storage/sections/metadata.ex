@@ -363,7 +363,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
               projection_offset,
               projected_value_size
             ) do
-          compare_and_relocate_segment_projection_row_sized(
+          relocate_segment_projection_row_at_location(
             keydir,
             original_row,
             projection_index,
@@ -1197,15 +1197,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
           |> Enum.reduce_while(:ok, fn
             {{{entry, _row} = relocation, entry, {_ordinal, offset, _size}}, projection_index},
             :ok ->
-              case relocate_segment_projection_row_at(
-                     keydir,
-                     projection_index,
-                     offset,
-                     relocation
-                   ) do
-                :ok -> {:cont, :ok}
-                {:error, reason} -> {:halt, {:error, reason}}
-              end
+              :ok =
+                relocate_segment_projection_row_at(keydir, projection_index, offset, relocation)
+
+              {:cont, :ok}
 
             {_mismatched_projection, _projection_index}, :ok ->
               {:halt, {:error, :segment_projection_relocation_mismatch}}

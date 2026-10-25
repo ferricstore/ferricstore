@@ -539,6 +539,63 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
         end)
       end
 
+      # An eviction or an EXPIRE changes a row's cached value or expiry without
+      # moving it, and storage keeps doing both while a rebuild writes the new
+      # projection. A row the rebuild left where it was pointed at the log it
+      # trimmed, and every later rebuild failed reading it.
+      @tag :bounded_checkpoint
+      test "a synchronous rebuild repoints a row evicted or given an expiry while it ran", %{
+        ctx: ctx
+      } do
+        keydir = elem(ctx.keydir_refs, 0)
+        expire_at_ms = System.os_time(:millisecond) + 3_600_000
+
+        relocate_hook = fn 0, _projection_root, _relocations ->
+          true = :ets.update_element(keydir, "rebuild-race:evicted", {2, nil})
+          true = :ets.update_element(keydir, "rebuild-race:expiring", {3, expire_at_ms})
+          :ok
+        end
+
+        with_checkpoint_env(
+          [every: :never, min_interval_ms: 0, max_deferred: 1, relocate_hook: relocate_hook],
+          fn ->
+            assert :ok =
+                     WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-race:evicted", "v1", 0})
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-race:expiring", "v2", 0})
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-race:other", "v3", 0})
+            assert [{_, "v1", 0, _, _, _, _}] = :ets.lookup(keydir, "rebuild-race:evicted")
+
+            log = waraft_segment_log_record(0)
+            trim_index = :ferricstore_waraft_spike_segment_log.last_index(log)
+
+            assert {:ok, _state} =
+                     :ferricstore_waraft_spike_segment_log.trim(log, trim_index, %{})
+
+            refute segment_row?(ctx, "rebuild-race:evicted")
+            refute segment_row?(ctx, "rebuild-race:expiring")
+            assert "v1" == Router.get(ctx, "rebuild-race:evicted")
+            assert "v2" == Router.get(ctx, "rebuild-race:expiring")
+
+            assert [{_, _, ^expire_at_ms, _, _, _, _}] =
+                     :ets.lookup(keydir, "rebuild-race:expiring")
+
+            Application.delete_env(:ferricstore, :waraft_segment_projection_before_relocate_hook)
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-race:later", "v4", 0})
+            assert :ok = WARaftBackend.write(0, {:put, "rebuild-race:later", "v5", 0})
+            log = waraft_segment_log_record(0)
+            trim_index = :ferricstore_waraft_spike_segment_log.last_index(log)
+
+            assert {:ok, _state} =
+                     :ferricstore_waraft_spike_segment_log.trim(log, trim_index, %{})
+
+            assert "v1" == Router.get(ctx, "rebuild-race:evicted")
+            assert "v2" == Router.get(ctx, "rebuild-race:expiring")
+          end
+        )
+      end
+
       # Flow history lives outside the keydir, so recovery, which replays only
       # the entries after the projection, could not rebuild history the
       # projector had not written yet.

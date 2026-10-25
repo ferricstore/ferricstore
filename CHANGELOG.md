@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A trim that rebuilt the segment projection itself (past the deferral
+  bound) repointed a key only if its cached value and expiry were unchanged
+  since it was read, so a key MemoryGuard evicted, or that an EXPIRE reached,
+  while the projection was written kept pointing at the log the trim dropped
+  or at a projection record that now held another key. Its value could no
+  longer be read, and every later trim failed with
+  `segment_projection_missing_live_value`, retried on each new entry while
+  the log grew. The rebuild now follows a key's location, as checkpoint
+  adoption already did.
 - A blocking Flow claim (`block_ms`) is woken by the node that wrote the
   flow, so in a cluster a flow created through another node left it asleep
   for the whole block, after which it answered nothing although the flow had
