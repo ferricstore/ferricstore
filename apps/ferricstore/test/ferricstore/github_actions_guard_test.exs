@@ -99,16 +99,18 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     assert durability =~ "test-results-durability-${{ matrix.suite }}"
   end
 
-  test "cluster tests run in two partitions" do
+  test "cluster tests run in three duration-aware partitions" do
     workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
     cluster = workflow_section(workflow, "  test-cluster:", "name: test-results-cluster")
 
-    assert cluster =~ ~s|name: "Cluster tests (${{ matrix.partition }}/2)"|
-    assert cluster =~ "partition: [1, 2]"
+    assert cluster =~ ~s|name: "Cluster tests (${{ matrix.partition }}/3)"|
+    assert cluster =~ "partition: [1, 2, 3]"
 
     core = workflow_step(cluster, "Run ferricstore cluster tests")
-    assert core =~ "MIX_TEST_PARTITION=${{ matrix.partition }}"
-    assert core =~ "--only cluster --partitions 2 --timeout 180000 --seed 0"
+    assert core =~ ".github/scripts/core_test_partition.exs"
+    assert core =~ ".github/test-timings/ferricstore-cluster.tsv"
+    assert core =~ ~s|mix test "${files[@]}" --only cluster --timeout 180000 --seed 0|
+    refute core =~ "--partitions"
 
     server = workflow_step(cluster, "Run ferricstore_server cluster tests")
     assert server =~ "matrix.partition == 1"
@@ -295,13 +297,52 @@ defmodule Ferricstore.GitHubActionsGuardTest do
   test "core suites use deterministic duration-aware file partitions" do
     workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
 
-    assert count_occurrences(workflow, ".github/scripts/core_test_partition.exs") == 2
+    # Two core shards per OS plus the cluster shards.
+    assert count_occurrences(workflow, ".github/scripts/core_test_partition.exs") == 3
     assert workflow =~ ".github/test-timings/ferricstore.tsv"
     refute workflow =~ "mix test apps/ferricstore/test --partitions 3"
 
     assert File.exists?(Path.join(@repo_root, ".github/scripts/core_test_partition.ex"))
     assert File.exists?(Path.join(@repo_root, ".github/scripts/core_test_partition.exs"))
     assert File.exists?(Path.join(@repo_root, ".github/test-timings/ferricstore.tsv"))
+    assert File.exists?(Path.join(@repo_root, ".github/test-timings/ferricstore-cluster.tsv"))
+  end
+
+  # Each test job compiled the umbrella and the Rust crates again before it ran
+  # a test: about 3.5 minutes per macOS job, where only five run at once.
+  test "test jobs run the build job's compiled build instead of compiling again" do
+    workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
+    action = File.read!(Path.join(@repo_root, ".github/actions/restore-build/action.yml"))
+
+    for {build, os} <- [{"build-ubuntu", "Linux"}, {"build-macos", "macOS"}] do
+      section = workflow_section(workflow, "  #{build}:", "\n  checks-")
+      assert section =~ "mix compile --warnings-as-errors"
+
+      assert workflow_step(section, "Pack the compiled build") =~
+               "tar -czf build-test.tgz _build/test deps"
+
+      upload = workflow_step(section, "Upload the compiled build")
+      assert upload =~ "name: build-#{os}"
+      assert upload =~ "path: build-test.tgz"
+    end
+
+    jobs = String.split(workflow, ~r/\n  (?=[a-z0-9-]+:\n)/)
+
+    test_jobs =
+      Enum.filter(jobs, &(&1 =~ ~r/\A[a-z0-9-]+:\n(.*\n)*?    needs: build-(ubuntu|macos)\n/))
+
+    assert length(test_jobs) >= 12
+
+    for job <- test_jobs do
+      [name | _] = String.split(job, ":", parts: 2)
+      assert job =~ "uses: ./.github/actions/restore-build", "#{name} does not restore the build"
+      refute job =~ "actions/download-artifact", "#{name} downloads the build itself"
+    end
+
+    assert action =~ "name: build-${{ runner.os }}"
+    assert action =~ "git ls-files -z | xargs -0 touch -h -t 202001010000"
+    assert action =~ "tar -xzf build-test.tgz"
+    assert action =~ "Compiled build not reused"
   end
 
   test "lint and dependency security checks are gating" do
@@ -310,15 +351,18 @@ defmodule Ferricstore.GitHubActionsGuardTest do
 
     refute workflow =~ "--mute-exit-status"
 
-    assert count_occurrences(
-             workflow,
-             "mix credo suggest --only warning --min-priority high --files-excluded 'apps/*/test/**/*'"
-           ) == 2
+    # Credo reads the source alone, so it runs once, in checks-ubuntu.
+    checks = workflow_section(workflow, "  checks-ubuntu:", "  build-macos:")
 
     assert count_occurrences(
-             workflow,
+             checks,
+             "mix credo suggest --only warning --min-priority high --files-excluded 'apps/*/test/**/*'"
+           ) == 1
+
+    assert count_occurrences(
+             checks,
              "mix credo suggest --only warning --min-priority high --ignore-checks UnusedListOperation,ExpensiveEmptyEnumCheck"
-           ) == 2
+           ) == 1
 
     assert workflow =~ "mix hex.audit"
     assert workflow =~ "mix deps.compile --include-children mix_audit"

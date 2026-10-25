@@ -49,8 +49,78 @@ jobs:
   # ===========================================================================
   # Build (Ubuntu)
   # ===========================================================================
+  # Compiles what the test jobs run. Checks that gate nothing else run beside
+  # it in checks-ubuntu, so the test jobs start as soon as the build is ready.
   build-ubuntu:
     name: "Build (ubuntu)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Mix deps
+        uses: actions/cache@v5
+        with:
+          path: deps
+          key: mix-deps-Linux-1.20.4-29.0.5-${{ hashFiles('mix.lock') }}
+          restore-keys: mix-deps-Linux-1.20.4-29.0.5-
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/ferricstore/native/ferricstore_bitcask/target
+            apps/ferricstore/native/ferricstore_wal_nif/target
+            apps/ferricstore_server/native/native_protocol_nif/target
+          key: cargo-Linux-${{ hashFiles('apps/ferricstore/native/ferricstore_bitcask/Cargo.lock', 'apps/ferricstore/native/ferricstore_wal_nif/Cargo.lock', 'apps/ferricstore_server/native/native_protocol_nif/Cargo.lock') }}
+          restore-keys: cargo-Linux-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Build NIF (release)
+        run: |
+          cargo build --release --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
+          cargo build --release --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml
+          cargo build --release --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml
+          mkdir -p apps/ferricstore/priv/native
+          mkdir -p apps/ferricstore_server/priv/native
+          cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so apps/ferricstore/priv/native/libferricstore_bitcask.so
+          cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so apps/ferricstore/priv/native/ferricstore_bitcask.so
+          cp apps/ferricstore/native/ferricstore_wal_nif/target/release/libferricstore_wal_nif.so apps/ferricstore/priv/native/libferricstore_wal_nif.so
+          cp apps/ferricstore/native/ferricstore_wal_nif/target/release/libferricstore_wal_nif.so apps/ferricstore/priv/native/ferricstore_wal_nif.so
+          cp apps/ferricstore_server/native/native_protocol_nif/target/release/libnative_protocol_nif.so apps/ferricstore_server/priv/native/libnative_protocol_nif.so
+          cp apps/ferricstore_server/native/native_protocol_nif/target/release/libnative_protocol_nif.so apps/ferricstore_server/priv/native/native_protocol_nif.so
+
+      - name: Compile (warnings as errors)
+        run: mix compile --warnings-as-errors
+
+      # Test jobs unpack this instead of compiling the umbrella and the Rust
+      # crates again (see .github/actions/restore-build).
+      - name: Pack the compiled build
+        run: >-
+          tar -czf build-test.tgz _build/test deps
+          apps/ferricstore/priv/native apps/ferricstore_server/priv/native
+
+      - name: Upload the compiled build
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-Linux
+          path: build-test.tgz
+          compression-level: 0
+          retention-days: 1
+
+  checks-ubuntu:
+    name: "Checks (ubuntu)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -81,8 +151,10 @@ jobs:
             apps/ferricstore/native/ferricstore_bitcask/target
             apps/ferricstore/native/ferricstore_wal_nif/target
             apps/ferricstore_server/native/native_protocol_nif/target
-          key: cargo-Linux-${{ hashFiles('apps/ferricstore/native/ferricstore_bitcask/Cargo.lock', 'apps/ferricstore/native/ferricstore_wal_nif/Cargo.lock', 'apps/ferricstore_server/native/native_protocol_nif/Cargo.lock') }}
-          restore-keys: cargo-Linux-
+          key: cargo-checks-Linux-${{ hashFiles('apps/ferricstore/native/ferricstore_bitcask/Cargo.lock', 'apps/ferricstore/native/ferricstore_wal_nif/Cargo.lock', 'apps/ferricstore_server/native/native_protocol_nif/Cargo.lock') }}
+          restore-keys: |
+            cargo-checks-Linux-
+            cargo-Linux-
 
       - name: Cache cargo-audit
         uses: actions/cache@v5
@@ -161,9 +233,6 @@ jobs:
           cp apps/ferricstore_server/native/native_protocol_nif/target/release/libnative_protocol_nif.so apps/ferricstore_server/priv/native/libnative_protocol_nif.so
           cp apps/ferricstore_server/native/native_protocol_nif/target/release/libnative_protocol_nif.so apps/ferricstore_server/priv/native/native_protocol_nif.so
 
-      - name: Compile (warnings as errors)
-        run: mix compile --warnings-as-errors
-
       - name: Build publishable Hex package
         run: |
           package_dir="$(mktemp -d)"
@@ -188,15 +257,6 @@ jobs:
           mix credo suggest --only warning --min-priority high --files-excluded 'apps/*/test/**/*'
           mix credo suggest --only warning --min-priority high --ignore-checks UnusedListOperation,ExpensiveEmptyEnumCheck
 
-      - name: Upload native artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: build-Linux
-          path: |
-            apps/ferricstore/priv/native
-            apps/ferricstore_server/priv/native
-          retention-days: 1
-
   # ===========================================================================
   # Build (macOS)
   # ===========================================================================
@@ -213,8 +273,6 @@ jobs:
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
 
       - name: Cache Mix deps
         uses: actions/cache@v5
@@ -238,27 +296,6 @@ jobs:
       - name: Install dependencies
         run: mix deps.get
 
-      - name: Check Rust formatting
-        run: |
-          cargo fmt --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml -- --check
-          cargo fmt --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml -- --check
-          cargo fmt --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml -- --check
-
-      - name: Run Clippy
-        run: |
-          cargo clippy --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml --all-targets -- -D warnings
-          cargo clippy --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml --all-targets -- -D warnings
-          cargo clippy --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml --all-targets -- -D warnings
-
-      - name: Run Rust tests (bitcask)
-        run: cargo test --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
-
-      - name: Run Rust tests (wal_nif)
-        run: cargo test --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml
-
-      - name: Run Rust tests (native_protocol_nif)
-        run: cargo test --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml
-
       - name: Build NIF (release)
         run: |
           cargo build --release --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
@@ -276,19 +313,60 @@ jobs:
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
 
-      - name: Credo
-        run: |
-          mix credo suggest --only warning --min-priority high --files-excluded 'apps/*/test/**/*'
-          mix credo suggest --only warning --min-priority high --ignore-checks UnusedListOperation,ExpensiveEmptyEnumCheck
+      # Test jobs unpack this instead of compiling the umbrella and the Rust
+      # crates again (see .github/actions/restore-build).
+      - name: Pack the compiled build
+        run: >-
+          tar -czf build-test.tgz _build/test deps
+          apps/ferricstore/priv/native apps/ferricstore_server/priv/native
 
-      - name: Upload native artifacts
+      - name: Upload the compiled build
         uses: actions/upload-artifact@v7
         with:
           name: build-macOS
-          path: |
-            apps/ferricstore/priv/native
-            apps/ferricstore_server/priv/native
+          path: build-test.tgz
+          compression-level: 0
           retention-days: 1
+
+  # Clippy and the Rust tests on macOS, beside the build. Formatting and Credo
+  # do not depend on the platform and run in checks-ubuntu.
+  checks-macos:
+    name: "Checks (macos)"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/ferricstore/native/ferricstore_bitcask/target
+            apps/ferricstore/native/ferricstore_wal_nif/target
+            apps/ferricstore_server/native/native_protocol_nif/target
+          key: cargo-checks-macOS-${{ hashFiles('apps/ferricstore/native/ferricstore_bitcask/Cargo.lock', 'apps/ferricstore/native/ferricstore_wal_nif/Cargo.lock', 'apps/ferricstore_server/native/native_protocol_nif/Cargo.lock') }}
+          restore-keys: |
+            cargo-checks-macOS-
+            cargo-macOS-
+
+      - name: Run Clippy
+        run: |
+          cargo clippy --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml --all-targets -- -D warnings
+
+      - name: Run Rust tests (bitcask)
+        run: cargo test --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
+
+      - name: Run Rust tests (wal_nif)
+        run: cargo test --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml
+
+      - name: Run Rust tests (native_protocol_nif)
+        run: cargo test --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml
 
   # ===========================================================================
   # Architecture tests (visible guardrail)
@@ -300,21 +378,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.20.4"
-          otp-version: "29.0.5"
-          hexpm-mirrors: |
-            https://builds.hex.pm
-            https://cdn.jsdelivr.net/hex
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v8
-        with:
-          name: build-Linux
-          path: .
-
-      - name: Ensure dependencies
-        run: mix deps.get
+      - uses: ./.github/actions/restore-build
 
       - name: Run architecture tests
         run: |
@@ -346,20 +410,7 @@ jobs:
         partition: [1, 2, 3]
     steps:
       - uses: actions/checkout@v6
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.20.4"
-          otp-version: "29.0.5"
-          hexpm-mirrors: |
-            https://builds.hex.pm
-            https://cdn.jsdelivr.net/hex
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v8
-        with:
-          name: build-Linux
-          path: .
-      - name: Ensure dependencies
-        run: mix deps.get
+      - uses: ./.github/actions/restore-build
       - name: Run ferricstore tests
         timeout-minutes: 45
         env:
@@ -425,20 +476,7 @@ jobs:
         partition: [1, 2, 3]
     steps:
       - uses: actions/checkout@v6
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.20.4"
-          otp-version: "29.0.5"
-          hexpm-mirrors: |
-            https://builds.hex.pm
-            https://cdn.jsdelivr.net/hex
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v8
-        with:
-          name: build-macOS
-          path: .
-      - name: Ensure dependencies
-        run: mix deps.get
+      - uses: ./.github/actions/restore-build
       - name: Run ferricstore tests
         timeout-minutes: 80
         env:
@@ -514,20 +552,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.20.4"
-          otp-version: "29.0.5"
-          hexpm-mirrors: |
-            https://builds.hex.pm
-            https://cdn.jsdelivr.net/hex
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v8
-        with:
-          name: build-Linux
-          path: .
-      - name: Ensure dependencies
-        run: mix deps.get
+      - uses: ./.github/actions/restore-build
       - name: Run WARaft backend tests
         timeout-minutes: 55
         run: mix test ${{ matrix.file }} --timeout 30000
@@ -554,20 +579,7 @@ jobs:
     timeout-minutes: 70
     steps:
       - uses: actions/checkout@v6
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.20.4"
-          otp-version: "29.0.5"
-          hexpm-mirrors: |
-            https://builds.hex.pm
-            https://cdn.jsdelivr.net/hex
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v8
-        with:
-          name: build-macOS
-          path: .
-      - name: Ensure dependencies
-        run: mix deps.get
+      - uses: ./.github/actions/restore-build
       - name: Run WARaft backend tests
         timeout-minutes: 65
         run: mix test ${{ matrix.file }} --timeout 30000
@@ -583,74 +595,40 @@ jobs:
   # Server tests (parallel per OS, independent)
   # ===========================================================================
   test-server-ubuntu:
-    name: "Server tests (ubuntu ${{ matrix.partition }}/3)"
+    name: "Server tests (ubuntu)"
     needs: build-ubuntu
     runs-on: ubuntu-latest
     timeout-minutes: 50
-    strategy:
-      fail-fast: false
-      matrix:
-        partition: [1, 2, 3]
     steps:
       - uses: actions/checkout@v6
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.20.4"
-          otp-version: "29.0.5"
-          hexpm-mirrors: |
-            https://builds.hex.pm
-            https://cdn.jsdelivr.net/hex
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v8
-        with:
-          name: build-Linux
-          path: .
-      - name: Ensure dependencies
-        run: mix deps.get
+      - uses: ./.github/actions/restore-build
       - name: Run ferricstore_server tests
         timeout-minutes: 45
-        run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore_server/test --partitions 3 --timeout 30000
+        run: mix test apps/ferricstore_server/test --timeout 30000
       - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
         with:
-          name: test-results-server-ubuntu-${{ matrix.partition }}
+          name: test-results-server-ubuntu
           path: test-results/
           retention-days: 14
 
   test-server-macos:
-    name: "Server tests (macos ${{ matrix.partition }}/3)"
+    name: "Server tests (macos)"
     needs: build-macos
     runs-on: macos-latest
     timeout-minutes: 50
-    strategy:
-      fail-fast: false
-      matrix:
-        partition: [1, 2, 3]
     steps:
       - uses: actions/checkout@v6
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.20.4"
-          otp-version: "29.0.5"
-          hexpm-mirrors: |
-            https://builds.hex.pm
-            https://cdn.jsdelivr.net/hex
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v8
-        with:
-          name: build-macOS
-          path: .
-      - name: Ensure dependencies
-        run: mix deps.get
+      - uses: ./.github/actions/restore-build
       - name: Run ferricstore_server tests
         timeout-minutes: 45
-        run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore_server/test --partitions 3 --timeout 30000
+        run: mix test apps/ferricstore_server/test --timeout 30000
       - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
         with:
-          name: test-results-server-macos-${{ matrix.partition }}
+          name: test-results-server-macos
           path: test-results/
           retention-days: 14
 
@@ -664,20 +642,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.20.4"
-          otp-version: "29.0.5"
-          hexpm-mirrors: |
-            https://builds.hex.pm
-            https://cdn.jsdelivr.net/hex
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v8
-        with:
-          name: build-Linux
-          path: .
-      - name: Ensure dependencies
-        run: mix deps.get
+      - uses: ./.github/actions/restore-build
       - name: Run HTTP quality, architecture, and protocol tests
         run: mix quality.http
       - uses: actions/upload-artifact@v7
@@ -700,26 +665,14 @@ jobs:
           repository: ferricstore/ferricstore-python
           ref: v0.11.8
           path: ferricstore-python
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.20.4"
-          otp-version: "29.0.5"
-          hexpm-mirrors: |
-            https://builds.hex.pm
-            https://cdn.jsdelivr.net/hex
+      - uses: ./.github/actions/restore-build
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           cache: pip
           cache-dependency-path: ferricstore-python/pyproject.toml
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v8
-        with:
-          name: build-Linux
-          path: .
       - name: Install dependencies
         run: |
-          mix deps.get
           python -m pip install --upgrade pip
           python -m pip install -e "./ferricstore-python[dev]"
       - name: Run Python SDK through the in-process TLS listener
@@ -758,13 +711,7 @@ jobs:
           repository: ferricstore/ferricstore-java
           ref: 75b20cdd3fb0dffdddf372bd659f71e40f8e2f3f
           path: ferricstore-java
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.20.4"
-          otp-version: "29.0.5"
-          hexpm-mirrors: |
-            https://builds.hex.pm
-            https://cdn.jsdelivr.net/hex
+      - uses: ./.github/actions/restore-build
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26.6"
@@ -780,13 +727,6 @@ jobs:
           java-version: "17"
           cache: maven
           cache-dependency-path: ferricstore-java/pom.xml
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v8
-        with:
-          name: build-Linux
-          path: .
-      - name: Install server dependencies
-        run: mix deps.get
       - name: Install TypeScript SDK dependencies
         working-directory: ferricstore-typescript
         run: npm ci
@@ -820,21 +760,7 @@ jobs:
         suite: [shard-kill, jepsen, server-and-large-alloc]
     steps:
       - uses: actions/checkout@v6
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.20.4"
-          otp-version: "29.0.5"
-          hexpm-mirrors: |
-            https://builds.hex.pm
-            https://cdn.jsdelivr.net/hex
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v8
-        with:
-          name: build-Linux
-          path: .
-
-      - name: Ensure dependencies
-        run: mix deps.get
+      - uses: ./.github/actions/restore-build
 
       - name: Run ferricstore shard-kill tests
         if: matrix.suite == 'shard-kill'
@@ -885,21 +811,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.20.4"
-          otp-version: "29.0.5"
-          hexpm-mirrors: |
-            https://builds.hex.pm
-            https://cdn.jsdelivr.net/hex
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v8
-        with:
-          name: build-Linux
-          path: .
-
-      - name: Ensure dependencies
-        run: mix deps.get
+      - uses: ./.github/actions/restore-build
 
       - name: Run bounded performance guards
         run: mix test apps/ferricstore/test --only perf_guard --timeout 120000
@@ -916,30 +828,16 @@ jobs:
   # Cluster tests (ubuntu only — multi-node via :peer)
   # ===========================================================================
   test-cluster:
-    name: "Cluster tests (${{ matrix.partition }}/2)"
+    name: "Cluster tests (${{ matrix.partition }}/3)"
     needs: build-ubuntu
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        partition: [1, 2]
+        partition: [1, 2, 3]
     steps:
       - uses: actions/checkout@v6
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.20.4"
-          otp-version: "29.0.5"
-          hexpm-mirrors: |
-            https://builds.hex.pm
-            https://cdn.jsdelivr.net/hex
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v8
-        with:
-          name: build-Linux
-          path: .
-
-      - name: Ensure dependencies
-        run: mix deps.get
+      - uses: ./.github/actions/restore-build
 
       - name: Run ferricstore cluster tests
         run: |
@@ -947,8 +845,18 @@ jobs:
           epmd -daemon
           data_dir=$(mktemp -d "/tmp/ferricstore-cluster-XXXXXX")
           echo "Running ferricstore cluster tests with data_dir=${data_dir}"
-          FERRICSTORE_DATA_DIR="$data_dir" MIX_TEST_PARTITION=${{ matrix.partition }} \
-            elixir --sname ci_cluster_ferricstore --cookie ferricstore_test -S mix test apps/ferricstore/test --only cluster --partitions 2 --timeout 180000 --seed 0 2>&1 | tee /tmp/cluster_ferricstore.log
+          # Files split by their cluster test time, as the core shards are.
+          mapfile -t files < <(elixir .github/scripts/core_test_partition.exs \
+            apps/ferricstore/test \
+            .github/test-timings/ferricstore-cluster.tsv \
+            3 \
+            ${{ matrix.partition }})
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No test files assigned to cluster partition ${{ matrix.partition }}"
+            exit 1
+          fi
+          FERRICSTORE_DATA_DIR="$data_dir" \
+            elixir --sname ci_cluster_ferricstore --cookie ferricstore_test -S mix test "${files[@]}" --only cluster --timeout 180000 --seed 0 2>&1 | tee /tmp/cluster_ferricstore.log
 
       - name: Run ferricstore_server cluster tests
         if: matrix.partition == 1 && (success() || failure())

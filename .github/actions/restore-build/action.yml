@@ -1,0 +1,45 @@
+name: Restore compiled build
+description: >-
+  Sets up Elixir and unpacks the build job's compiled test build (_build/test,
+  deps and the NIFs) for this OS, so test jobs run the code it compiled instead
+  of compiling the umbrella and the Rust crates again.
+
+runs:
+  using: composite
+  steps:
+    - uses: erlef/setup-beam@v1
+      with:
+        elixir-version: "1.20.4"
+        otp-version: "29.0.5"
+        hexpm-mirrors: |
+          https://builds.hex.pm
+          https://cdn.jsdelivr.net/hex
+
+    - uses: actions/download-artifact@v8
+      with:
+        name: build-${{ runner.os }}
+        path: .
+
+    - name: Unpack the compiled build
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Mix recompiles a source newer than its build manifest. The checkout
+        # is the commit the build job compiled, so date every tracked file
+        # before the build's manifests and Mix reuses what it compiled.
+        git ls-files -z | xargs -0 touch -h -t 202001010000
+        tar -xzf build-test.tgz
+        rm build-test.tgz
+
+    - name: Ensure dependencies
+      shell: bash
+      run: mix deps.get
+
+    - name: Check the compiled build is reused
+      shell: bash
+      run: |
+        set -euo pipefail
+        mix compile 2>&1 | tee "$RUNNER_TEMP/restore-build-compile.log"
+        if grep -qE '^Compiling|Compiling crate' "$RUNNER_TEMP/restore-build-compile.log"; then
+          echo "::warning title=Compiled build not reused::mix compile rebuilt files after restoring the build job's output"
+        fi
