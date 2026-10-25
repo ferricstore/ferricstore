@@ -4,6 +4,21 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- ZINCRBY on a new key (at every cluster feature level) and ZADD with NX,
+  XX, GT or LT on a new key (below level 4) claim the sorted set's type
+  marker and then write the member as a separate replicated write. When that
+  write timed out they deleted the marker even if the write had committed,
+  leaving the member without one (ZSCORE answered while EXISTS said 0), and
+  a ZADD XX that added nothing deleted a marker another client had just added
+  members under. On the instance the marker now goes only when the write did
+  not time out and the set is still empty.
+- LPUSH and RPUSH on a new key (at every cluster feature level) and GEOADD
+  with NX, XX or CH on a new key (below level 4) deleted the type marker they
+  had claimed when the element write timed out, even if it had committed: the
+  list's elements were left without a marker (LRANGE answered while EXISTS
+  said 0) and a GEOADD's member could not be read back. The marker now stays
+  unless the write failed outright and the key is still empty.
+
 ## 0.12.9 - 2026-10-25
 
 - A node that last stopped on a release before 0.12.7 could not start again

@@ -675,7 +675,7 @@ defmodule Ferricstore.Commands.Geo do
   end
 
   defp rollback_new_zset_type_marker(key, store, {:ok, :created}, write_error) do
-    case TypeRegistry.rollback_created_type(key, store) do
+    case TypeRegistry.release_created_type(key, :zset, store, write_error) do
       :ok ->
         write_error
 

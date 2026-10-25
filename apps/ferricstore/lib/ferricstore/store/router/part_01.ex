@@ -359,7 +359,23 @@ defmodule Ferricstore.Store.Router.Part01 do
       # ---------------------------------------------------------------------------
 
       @spec quorum_write(FerricStore.Instance.t(), non_neg_integer(), tuple()) :: term()
-      defp quorum_write(ctx, idx, command) do
+      if Mix.env() == :test do
+        # Lets a test fail one replicated write, or let it commit and report
+        # an unknown outcome, as a timeout does.
+        defp quorum_write(ctx, idx, command) do
+          case Process.get(:ferricstore_quorum_write_hook) do
+            hook when is_function(hook, 2) ->
+              hook.(command, fn -> quorum_write_unhooked(ctx, idx, command) end)
+
+            _missing ->
+              quorum_write_unhooked(ctx, idx, command)
+          end
+        end
+      else
+        defp quorum_write(ctx, idx, command), do: quorum_write_unhooked(ctx, idx, command)
+      end
+
+      defp quorum_write_unhooked(ctx, idx, command) do
         case standalone_recovery_write_error(ctx) do
           nil -> do_quorum_write(ctx, idx, command)
           error -> error
