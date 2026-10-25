@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- SCAN and RANDOMKEY returned the invocation definition catalog
+  (`f:{f}:invocation:definitions:1`, an internal hash clients are refused
+  access to) and DBSIZE counted it, while KEYS left it out. Internal
+  collections stay in the key index, where exports find them, and SCAN,
+  RANDOMKEY and DBSIZE now leave them out.
 - EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT with NX, XX, GT or LT decided from
   the TTL they read, under a key latch that only holds against clients on
   the same node: sent from every node of a cluster at once, EXPIRE NX had a

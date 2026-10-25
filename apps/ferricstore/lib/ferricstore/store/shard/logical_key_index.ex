@@ -411,6 +411,39 @@ defmodule Ferricstore.Store.Shard.LogicalKeyIndex do
   def count_live(_ordered, _slots, _keydir, _now_ms, _on_expired),
     do: {:error, :invalid_logical_key_count}
 
+  @doc """
+  Counts the live internal collections indexed on a shard (the invocation and
+  governance catalogs are hashes and sets). Exports find them in this index;
+  user-facing counts leave them out. Every internal key starts with `f:{`.
+  """
+  @spec count_internal_live(table_ref(), non_neg_integer()) ::
+          {:ok, non_neg_integer()} | :unavailable
+  def count_internal_live(ordered, now_ms) when is_integer(now_ms) and now_ms >= 0 do
+    case fetch_ready_table(ordered) do
+      {:ok, tid} -> {:ok, count_internal_from(tid, :ets.next(tid, "f:{"), now_ms, 0)}
+      _unavailable -> :unavailable
+    end
+  rescue
+    ArgumentError -> :unavailable
+  end
+
+  defp count_internal_from(tid, <<"f:{", _rest::binary>> = key, now_ms, count) do
+    count =
+      case :ets.lookup(tid, key) do
+        [{^key, _type, expire_at_ms, _storage_key, _slot}] ->
+          if InternalKey.internal?(key) and live_expiration?(expire_at_ms, now_ms),
+            do: count + 1,
+            else: count
+
+        _missing ->
+          count
+      end
+
+    count_internal_from(tid, :ets.next(tid, key), now_ms, count)
+  end
+
+  defp count_internal_from(_tid, _past_internal_range, _now_ms, count), do: count
+
   @spec slot_count(table_ref(), table_ref()) ::
           non_neg_integer() | :unavailable | {:error, term()}
   def slot_count(ordered, slots) do
