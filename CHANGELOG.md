@@ -13,6 +13,14 @@ All notable changes to FerricStore will be documented here.
   failed, the reply was an internal term
   (`{:hash_delete_rollback_failed, ...}`). The fields now stay deleted and the
   marker delete's error is the reply.
+- An HSET the instance cannot send as one replicated entry (a value past the
+  blob threshold, or HSETNX below cluster feature level 4) claims a new
+  hash's type marker and then writes the fields. When the field write failed
+  it deleted the marker, even after a timeout whose write may have committed,
+  or when another client had written fields under the marker in between:
+  those fields were left without one (EXISTS 0, TYPE none, while HGET
+  answered). The marker now goes only when the write failed outright and the
+  hash is still empty.
 
 ## 0.12.8 - 2026-10-25
 
