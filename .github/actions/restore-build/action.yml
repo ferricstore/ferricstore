@@ -28,6 +28,12 @@ runs:
         # is the commit the build job compiled, so date every tracked file
         # before the build's manifests and Mix reuses what it compiled.
         git ls-files -z | xargs -0 touch -h -t 202001010000
+        # The same goes for OTP's headers, which setup-beam installs fresh in
+        # every job: an Erlang source that includes one (kernel/include/file.hrl)
+        # would recompile, and with it every module compiled against code
+        # that reaches it.
+        otp_lib=$(erl -noshell -eval 'io:format("~s", [code:lib_dir()]), halt().')
+        find "$otp_lib" -name '*.hrl' -exec touch -h -t 202001010000 {} +
         tar -xzf build-test.tgz
         rm build-test.tgz
 

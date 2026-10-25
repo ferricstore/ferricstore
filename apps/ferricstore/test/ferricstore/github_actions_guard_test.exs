@@ -341,6 +341,7 @@ defmodule Ferricstore.GitHubActionsGuardTest do
 
     assert action =~ "name: build-${{ runner.os }}"
     assert action =~ "git ls-files -z | xargs -0 touch -h -t 202001010000"
+    assert action =~ ~s|find "$otp_lib" -name '*.hrl' -exec touch -h -t 202001010000 {} +|
     assert action =~ "tar -xzf build-test.tgz"
     assert action =~ "Compiled build not reused"
   end
