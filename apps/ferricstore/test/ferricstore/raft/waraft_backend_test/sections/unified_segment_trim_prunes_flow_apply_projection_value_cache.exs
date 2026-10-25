@@ -168,10 +168,13 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
                        relocated_key == payload_ref
                      end)
 
+              # The rebuild repoints only rows still where it read them, so
+              # this one, moved within the same apply-projection entry, keeps
+              # referencing it.
               :ets.insert(
                 elem(ctx.keydir_refs, 0),
                 {payload_ref, nil, 9_999_999_999_999, lfu,
-                 {:waraft_apply_projection, value_index}, value_offset, value_size}
+                 {:waraft_apply_projection, value_index}, value_offset + 1, value_size}
               )
 
               send(test_pid, :apply_projection_ref_kept_referenced)
@@ -191,9 +194,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
 
           assert_receive :apply_projection_ref_kept_referenced
 
+          moved_offset = value_offset + 1
+
           assert [
                    {^payload_ref, nil, 9_999_999_999_999, ^lfu,
-                    {:waraft_apply_projection, ^value_index}, ^value_offset, ^value_size}
+                    {:waraft_apply_projection, ^value_index}, ^moved_offset, ^value_size}
                  ] = :ets.lookup(elem(ctx.keydir_refs, 0), payload_ref)
 
           assert apply_projection_cache_contains?(root, 0, value_index, payload_ref)
@@ -740,10 +745,12 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
                        key == keydir_key
                      end)
 
+              # Moved within its apply-projection entry, so the rebuild leaves
+              # it there and the compaction must keep that entry.
               :ets.insert(
                 elem(ctx.keydir_refs, 0),
                 {keydir_key, nil, 9_999_999_999_999, keydir_lfu,
-                 {:waraft_apply_projection, keydir_index}, keydir_offset, keydir_size}
+                 {:waraft_apply_projection, keydir_index}, keydir_offset + 1, keydir_size}
               )
 
               :ok
