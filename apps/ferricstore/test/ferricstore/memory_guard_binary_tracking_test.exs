@@ -135,10 +135,12 @@ defmodule Ferricstore.MemoryGuardBinaryTrackingTest do
         Router.put(ctx, "mg_test_#{i}", large_value, 0)
       end
 
-      # Check that MemoryGuard reports more than just ETS :memory
+      # Check that MemoryGuard reports more than just ETS :memory. This
+      # instance's own keydirs: the default instance's `keydir_N` tables hold
+      # whatever the tests before this one wrote.
       ets_only =
         Enum.reduce(0..(ctx.shard_count - 1), 0, fn i, acc ->
-          case :ets.info(:"keydir_#{i}", :memory) do
+          case :ets.info(elem(ctx.keydir_refs, i), :memory) do
             :undefined -> acc
             mem -> acc + mem * :erlang.system_info(:wordsize)
           end
@@ -151,8 +153,6 @@ defmodule Ferricstore.MemoryGuardBinaryTrackingTest do
              "Expected ~1MB tracked binary bytes, got #{binary_tracked}"
 
       # Binary bytes should be significant relative to ETS memory overhead.
-      # Under full-suite load, ETS tables accumulate entries from other tests,
-      # so we only assert binary_tracked is substantial (>500KB verified above).
       assert binary_tracked > ets_only,
              "Binary bytes (#{binary_tracked}) should exceed " <>
                "ETS :memory (#{ets_only}) for large-value workloads"
