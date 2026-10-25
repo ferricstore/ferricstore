@@ -20,7 +20,7 @@ defmodule Ferricstore.Transaction.SingleCommandTest do
   # Callers fall back to the command's own path; a refusal must not become
   # the command's reply.
   test "falls back for a command transactions refuse", %{ctx: ctx, key: key} do
-    assert :fallback == SingleCommand.run(ctx, "TDIGEST.CREATE", [key])
+    assert :fallback == SingleCommand.run(ctx, "BF.ADD", [key, "item"])
     assert :fallback == SingleCommand.run(ctx, "LOCK", [key, "owner", "1000"])
   end
 

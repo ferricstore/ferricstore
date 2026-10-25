@@ -957,7 +957,7 @@ defmodule FerricStore.Impl do
     compression = Keyword.get(opts, :compression)
 
     Router.with_key_latch(ctx, key, fn ->
-      TDigest.handle_ast({:tdigest_create, key, compression}, store)
+      TDigest.atomic_write(ctx, {:tdigest_create, key, compression}, store)
     end)
   end
 
@@ -966,7 +966,7 @@ defmodule FerricStore.Impl do
     store = build_store(ctx)
 
     Router.with_key_latch(ctx, key, fn ->
-      TDigest.handle_ast({:tdigest_add, key, Enum.map(values, &(&1 * 1.0))}, store)
+      TDigest.atomic_write(ctx, {:tdigest_add, key, Enum.map(values, &(&1 * 1.0))}, store)
     end)
   end
 
@@ -1012,7 +1012,7 @@ defmodule FerricStore.Impl do
     store = build_store(ctx)
 
     Router.with_key_latch(ctx, key, fn ->
-      TDigest.handle_ast({:tdigest_reset, [key]}, store)
+      TDigest.atomic_write(ctx, {:tdigest_reset, [key]}, store)
     end)
   end
 

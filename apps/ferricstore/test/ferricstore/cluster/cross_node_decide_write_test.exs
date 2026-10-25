@@ -25,8 +25,11 @@ defmodule Ferricstore.Cluster.CrossNodeDecideWriteTest do
     on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
     [first | _rest] = nodes
 
-    assert {:ok, %{active: 5}} =
-             ClusterHelper.run(first.name, FerricStore, :raise_cluster_feature_level, [5])
+    assert {:ok, %{active: 6}} =
+             ClusterHelper.run(first.name, FerricStore, :raise_cluster_feature_level, [6])
+
+    # A follower that has not applied the marker yet runs the older path.
+    for node <- nodes, do: await_level(node, 6, 100)
 
     {:ok, nodes: nodes}
   end
@@ -46,6 +49,42 @@ defmodule Ferricstore.Cluster.CrossNodeDecideWriteTest do
 
         assert Enum.count(replies, &(&1 == 1)) == 1, "#{key}: #{inspect(replies)}"
       end
+    end
+  end
+
+  # TDIGEST writes read the digest, change it and write it back under the
+  # node-local key latch, so clients on two nodes lost each other's values and
+  # both created the digest. From feature level 6 each runs as one
+  # transaction entry.
+  test "TDIGEST.ADD from every node keeps every value", %{nodes: [first | _] = nodes} do
+    assert :ok == dispatch(first, "TDIGEST.CREATE", ["{decide}td"])
+
+    # One client per node sends commands, the other uses the embedded API.
+    replies =
+      race(nodes, fn node, client ->
+        for n <- 1..50 do
+          value = client * 1000 + n
+
+          if client == 1,
+            do: dispatch(node, "TDIGEST.ADD", ["{decide}td", Integer.to_string(value)]),
+            else: ClusterHelper.run(node.name, FerricStore, :tdigest_add, ["{decide}td", [value]])
+        end
+      end)
+
+    assert Enum.all?(List.flatten(replies), &(&1 == :ok)),
+           inspect(Enum.reject(List.flatten(replies), &(&1 == :ok)))
+
+    info = dispatch(first, "TDIGEST.INFO", ["{decide}td"])
+    fields = info |> Enum.chunk_every(2) |> Map.new(fn [k, v] -> {k, v} end)
+    weight = String.to_float(fields["Merged weight"]) + String.to_float(fields["Unmerged weight"])
+    assert weight == 300.0, inspect(info)
+  end
+
+  test "TDIGEST.CREATE from every node has one winner", %{nodes: nodes} do
+    for round <- 1..5 do
+      key = "{decide}tdc#{round}"
+      replies = race(nodes, fn node, _client -> dispatch(node, "TDIGEST.CREATE", [key]) end)
+      assert Enum.count(replies, &(&1 == :ok)) == 1, "#{key}: #{inspect(replies)}"
     end
   end
 
@@ -123,6 +162,22 @@ defmodule Ferricstore.Cluster.CrossNodeDecideWriteTest do
       Task.async(fn -> fun.(node, client) end)
     end
     |> Task.await_many(120_000)
+  end
+
+  defp await_level(node, level, attempts) do
+    args = [ctx(node), ["{decide}"], level]
+
+    cond do
+      ClusterHelper.run(node.name, Ferricstore.Transaction.ReplicaCompat, :level_active?, args) ->
+        :ok
+
+      attempts > 0 ->
+        Process.sleep(50)
+        await_level(node, level, attempts - 1)
+
+      true ->
+        flunk("#{node.name} never saw feature level #{level}")
+    end
   end
 
   defp dispatch(node, command, args),

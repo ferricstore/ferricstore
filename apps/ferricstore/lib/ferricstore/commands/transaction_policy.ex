@@ -51,7 +51,6 @@ defmodule Ferricstore.Commands.TransactionPolicy do
   defp request_command?("CF." <> _rest), do: true
   defp request_command?("CMS." <> _rest), do: true
   defp request_command?("TOPK." <> _rest), do: true
-  defp request_command?("TDIGEST." <> _rest), do: true
   defp request_command?("FLOW." <> _rest), do: true
   defp request_command?(command), do: MapSet.member?(@request_commands, command)
 

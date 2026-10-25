@@ -578,7 +578,7 @@ defmodule FerricStore.API.Probabilistic do
     ctx = default_ctx()
 
     Router.with_key_latch(ctx, key, fn ->
-      TDigest.handle_ast({:tdigest_create, key, nil}, build_tdigest_store(ctx))
+      TDigest.atomic_write(ctx, {:tdigest_create, key, nil}, build_tdigest_store(ctx))
     end)
   end
 
@@ -601,7 +601,8 @@ defmodule FerricStore.API.Probabilistic do
     ctx = default_ctx()
 
     Router.with_key_latch(ctx, key, fn ->
-      TDigest.handle_ast(
+      TDigest.atomic_write(
+        ctx,
         {:tdigest_add, key, Enum.map(values, &(&1 * 1.0))},
         build_tdigest_store(ctx)
       )
@@ -722,7 +723,7 @@ defmodule FerricStore.API.Probabilistic do
     ctx = default_ctx()
 
     Router.with_key_latch(ctx, key, fn ->
-      TDigest.handle_ast({:tdigest_reset, [key]}, build_tdigest_store(ctx))
+      TDigest.atomic_write(ctx, {:tdigest_reset, [key]}, build_tdigest_store(ctx))
     end)
   end
 

@@ -18,6 +18,10 @@ All notable changes to FerricStore will be documented here.
   not read as integers ("05", "+5", "-0", "00") and incremented them. From
   cluster feature level 6 they answer "ERR value is not an integer or out of
   range" (HINCRBY: "ERR hash value is not an integer"), as Redis does.
+- TDIGEST.CREATE, ADD, RESET and MERGE sent through different nodes lost each
+  other's values (and two CREATEs could both succeed): each read the digest
+  and wrote it back under a node-local latch. From cluster feature level 6
+  they run as one-command transactions, and MULTI accepts TDIGEST commands.
 - A shard whose log held a Flow value pin with no locator left (the value
   deleted since, as by retention) could never trim its log again: each trim
   stopped with `{:segment_value_pin_missing_live_value, ...}` and the log kept

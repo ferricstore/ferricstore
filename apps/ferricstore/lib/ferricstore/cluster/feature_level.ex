@@ -74,7 +74,9 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    apply set `:level_6_writes?`) and in the state machine's
   #    `new_member_expire_at/2`. INCR, INCRBY, DECR, DECRBY and HINCRBY take
   #    only an integer's canonical form as the stored operand, as Redis's
-  #    string2ll does (`ValueCodec.parse_canonical_integer/1`).
+  #    string2ll does (`ValueCodec.parse_canonical_integer/1`). Transactions
+  #    take TDIGEST commands, and TDIGEST writes run as one-command
+  #    transactions (`TDigest.atomic_write/3`).
   @supported 6
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"
