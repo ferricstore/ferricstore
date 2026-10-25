@@ -904,9 +904,28 @@ defmodule Ferricstore.Commands.SortedSet do
   defp persist_zadd_entries(_key, [], result, _store, :ok), do: result
 
   defp persist_zadd_entries(key, entries, result, store, type_status) do
-    case Ops.compound_batch_put(store, key, entries) do
+    case Ops.compound_batch_put(store, key, with_key_ttl(entries, key, store, type_status)) do
       :ok -> result
       {:error, _} = err -> rollback_new_zset_type_marker(key, store, type_status, err)
+    end
+  end
+
+  @doc false
+  # Members written without a TTL of their own take the key's
+  # (TypeRegistry.member_expire_at/2); a sorted set this command created has
+  # none.
+  def with_key_ttl(entries, _key, _store, {:ok, :created}), do: entries
+
+  def with_key_ttl(entries, key, store, _type_status) do
+    case TypeRegistry.member_expire_at(key, store) do
+      0 ->
+        entries
+
+      expire_at_ms ->
+        Enum.map(entries, fn
+          {compound_key, value, 0} -> {compound_key, value, expire_at_ms}
+          entry -> entry
+        end)
     end
   end
 
@@ -1006,7 +1025,10 @@ defmodule Ferricstore.Commands.SortedSet do
   end
 
   defp write_zscore(store, key, compound_key, new_score, type_status) do
-    case Ops.compound_put(store, key, compound_key, Float.to_string(new_score), 0) do
+    [{^compound_key, score_str, expire_at_ms}] =
+      with_key_ttl([{compound_key, Float.to_string(new_score), 0}], key, store, type_status)
+
+    case Ops.compound_put(store, key, compound_key, score_str, expire_at_ms) do
       :ok -> Helpers.format_score(new_score)
       true -> Helpers.format_score(new_score)
       {:error, _reason} = error -> rollback_new_zset_type_marker(key, store, type_status, error)

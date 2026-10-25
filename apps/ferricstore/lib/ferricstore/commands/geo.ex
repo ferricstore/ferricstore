@@ -809,6 +809,8 @@ defmodule Ferricstore.Commands.Geo do
   defp write_geoadd_entries(_store, _key, [], _type_status), do: :ok
 
   defp write_geoadd_entries(store, key, entries, :ok) do
+    entries = Ferricstore.Commands.SortedSet.with_key_ttl(entries, key, store, :ok)
+
     case Ops.compound_batch_put(store, key, entries) do
       :ok -> :ok
       {:error, _} = err -> rollback_new_zset_type_marker(key, store, :ok, err)

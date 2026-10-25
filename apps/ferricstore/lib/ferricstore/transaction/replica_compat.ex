@@ -30,7 +30,7 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
   The cluster feature level a parsed command needs inside MULTI, or nil for a
   form every release applies.
   """
-  @spec required_level(term()) :: 4 | 5 | nil
+  @spec required_level(term()) :: 4 | 5 | 6 | nil
   def required_level({tag, _key, _time, flags}) when tag in @expiry_tags and is_list(flags),
     do: 4
 
@@ -67,7 +67,15 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
   def required_level({:zadd, _key, opts, pairs}) when is_list(opts) and is_list(pairs),
     do: if(:incr in opts, do: 5)
 
+  # TDIGEST (in a transaction from level 6: older releases refuse it there; its
+  # digest is a plain value the transaction reads and writes like any other).
+  def required_level(ast) when is_tuple(ast) and tuple_size(ast) > 0 and is_atom(elem(ast, 0)) do
+    if tdigest_tag?(elem(ast, 0)), do: 6
+  end
+
   def required_level(_ast), do: nil
+
+  defp tdigest_tag?(tag), do: String.starts_with?(Atom.to_string(tag), "tdigest_")
 
   @doc """
   The error MULTI answers for `command` with `ast` on `key`, or nil when the

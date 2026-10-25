@@ -66,7 +66,19 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    rewind's value refresh read values the history projector moved to the
   #    LMDB mirror. A signal retried with its idempotency key and the same
   #    content changes nothing.
-  @supported 5
+  # 6: a member written into a hash, set, sorted set, list or stream that has
+  #    a TTL takes the key's TTL (its type key's expiry), so members added
+  #    after EXPIRE expire with the rest; a ZADD, ZINCRBY or list operation on
+  #    an existing member or element keeps the TTL instead of dropping it.
+  #    Apply reads it in `TypeRegistry.member_expire_at/2` (stores built in
+  #    apply set `:level_6_writes?`) and in the state machine's
+  #    `new_member_expire_at/2`. INCR, INCRBY, DECR, DECRBY and HINCRBY take
+  #    only an integer's canonical form as the stored operand, as Redis's
+  #    string2ll does (`ValueCodec.parse_canonical_integer/1`). Transactions
+  #    take TDIGEST commands, and `:compound_command` runs TDIGEST.CREATE, ADD,
+  #    RESET and MERGE in one entry (`TDigest.atomic_write/3`), and DEL of one
+  #    key (`Strings.atomic_del/3`).
+  @supported 6
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"
   @probe_timeout_ms 5_000

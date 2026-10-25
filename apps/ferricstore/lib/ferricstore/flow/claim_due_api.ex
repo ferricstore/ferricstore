@@ -403,9 +403,9 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
             other
         end
     after
-      # Waiters are woken by the node that wrote the flow, so one written
-      # through another node of a cluster never wakes this one: claim once
-      # more before answering empty.
+      # The node that wrote a flow wakes waiters on every member
+      # (`Ferricstore.Cluster.Relay`), but a wake-up to a member it was not
+      # connected to is lost: claim once more before answering empty.
       wait_ms ->
         result_resolved(ctx, type, opts, expected_metadata, :block)
     end

@@ -201,14 +201,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             if delta > @int64_max or delta < @int64_min do
               {:error, "ERR increment or decrement would overflow"}
             else
-              case do_compound_put(state, redis_key, compound_key, Integer.to_string(delta), 0) do
+              expire_at_ms = new_member_expire_at(state, redis_key)
+
+              case do_compound_put(
+                     state,
+                     redis_key,
+                     compound_key,
+                     Integer.to_string(delta),
+                     expire_at_ms
+                   ) do
                 :ok -> delta
                 {:error, _reason} = error -> error
               end
             end
 
           {value, expire_at_ms} ->
-            case coerce_integer(value) do
+            case coerce_incr_integer(state, value) do
               {:ok, cur} ->
                 new_val = cur + delta
 
@@ -251,7 +259,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             error
 
           nil ->
-            do_hincrbyfloat_put(state, redis_key, compound_key, 0.0, delta, 0)
+            expire_at_ms = new_member_expire_at(state, redis_key)
+            do_hincrbyfloat_put(state, redis_key, compound_key, 0.0, delta, expire_at_ms)
 
           {value, expire_at_ms} ->
             case coerce_float(value) do
@@ -322,8 +331,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
                   case ValueCodec.checked_float_add(current_score, increment) do
                     {:ok, new_score} ->
                       new_str = Float.to_string(new_score)
+                      expire_at_ms = zincrby_expire_at(state, redis_key, current)
 
-                      case do_compound_put(state, redis_key, compound_key, new_str, 0) do
+                      case do_compound_put(state, redis_key, compound_key, new_str, expire_at_ms) do
                         :ok -> new_str
                         {:error, _reason} = error -> error
                       end
@@ -340,6 +350,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
               end
           end
         end
+      end
+
+      # From feature level 6 an incremented member keeps its TTL (the key's) and a
+      # new one takes the key's; older releases write none.
+      defp zincrby_expire_at(state, redis_key, nil), do: new_member_expire_at(state, redis_key)
+
+      defp zincrby_expire_at(state, _redis_key, {_score, expire_at_ms}) do
+        if feature_level_6?(state), do: expire_at_ms, else: 0
       end
 
       defp current_zset_score(nil), do: {:ok, 0.0}
@@ -1149,7 +1167,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         with {:ok, handler} <- compound_command_handler(redis_key, ast),
              :ok <- require_compound_command_level(state, ast),
              :ok <- check_fetch_or_compute_lock(state, redis_key, nil) do
-          run_compound_command(handler, ast, compound_command_store(state))
+          run_compound_command(handler, ast, compound_command_store(state, handler))
         end
       end
 
@@ -1171,6 +1189,44 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         :compound_scan_slice,
         :exists?
       ]
+
+      # A TDIGEST digest is a plain value: its handler reads and writes the key
+      # itself, as the HyperLogLog handlers do (`build_string_value_store/1`).
+      defp compound_command_store(state, Ferricstore.Commands.TDigest) do
+        value_store = build_string_value_store(state)
+
+        state
+        |> compound_command_store()
+        |> Map.merge(%{
+          get: materializing_read(state, value_store.get),
+          get_meta: materializing_read(state, value_store.get_meta),
+          put: value_store.put,
+          delete: value_store.delete,
+          level_5_writes?: feature_level_5?(state)
+        })
+      end
+
+      # DEL of one key deletes whatever it holds: its value, or its
+      # collection's members, metadata and type key. The prob file of a
+      # bloom/cms/cuckoo/topk key goes with its value's delete, as for every
+      # replicated delete (`do_delete/2`).
+      defp compound_command_store(state, Ferricstore.Commands.Strings) do
+        value_store = build_string_value_store(state)
+
+        state
+        |> compound_command_store()
+        |> Map.merge(%{
+          get: materializing_read(state, value_store.get),
+          get_meta: materializing_read(state, value_store.get_meta),
+          delete: value_store.delete,
+          compound_delete_prefix: fn redis_key, prefix ->
+            do_compound_delete_prefix(state, redis_key, prefix)
+          end,
+          prob_file_lifecycle: :replicated
+        })
+      end
+
+      defp compound_command_store(state, _handler), do: compound_command_store(state)
 
       defp compound_command_store(state) do
         store = build_compound_store(state)
@@ -1276,6 +1332,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
                   pairs != [],
            do: binaries_handler(pairs, Ferricstore.Commands.Hash)
 
+      defp compound_command_handler(key, {:del, [key]}) when is_binary(key),
+        do: {:ok, Ferricstore.Commands.Strings}
+
+      defp compound_command_handler(key, {:tdigest_create, key, compression})
+           when is_binary(key) and (is_nil(compression) or is_integer(compression)),
+           do: {:ok, Ferricstore.Commands.TDigest}
+
+      defp compound_command_handler(key, {:tdigest_add, key, values})
+           when is_binary(key) and is_list(values) and values != [] do
+        if Enum.all?(values, &is_float/1),
+          do: {:ok, Ferricstore.Commands.TDigest},
+          else: {:error, "ERR invalid compound command"}
+      end
+
+      defp compound_command_handler(key, {:tdigest_reset, [key]}) when is_binary(key),
+        do: {:ok, Ferricstore.Commands.TDigest}
+
+      defp compound_command_handler(key, {:tdigest_merge, key, src_keys, opts})
+           when is_binary(key) and is_list(src_keys) and src_keys != [] and is_list(opts),
+           do: binaries_handler(src_keys, Ferricstore.Commands.TDigest)
+
       defp compound_command_handler(_key, _ast), do: {:error, "ERR invalid compound command"}
 
       defp binaries_handler(values, handler) do
@@ -1294,6 +1371,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         if :incr in opts,
           do: require_feature_level_5(state),
           else: require_feature_level_4(state)
+      end
+
+      # DEL and TDIGEST writes joined the entry at level 6.
+      defp require_compound_command_level(state, ast)
+           when elem(ast, 0) in [
+                  :del,
+                  :tdigest_create,
+                  :tdigest_add,
+                  :tdigest_reset,
+                  :tdigest_merge
+                ] do
+        if feature_level_6?(state),
+          do: :ok,
+          else: {:error, "ERR this command requires cluster feature level 6"}
       end
 
       defp require_compound_command_level(state, _ast), do: require_feature_level_4(state)
@@ -1319,6 +1410,31 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         do:
           do_get(state, Ferricstore.Cluster.FeatureLevel.key(5)) ==
             Ferricstore.Cluster.FeatureLevel.marker()
+
+      defp feature_level_6?(state),
+        do:
+          do_get(state, Ferricstore.Cluster.FeatureLevel.key(6)) ==
+            Ferricstore.Cluster.FeatureLevel.marker()
+
+      # A key's TTL is stored on each of its members. From feature level 6 a
+      # member written into a collection that has one takes it (its type key's
+      # expiry, while in the future), so members added after EXPIRE expire with
+      # the rest; older releases write none.
+      defp new_member_expire_at(state, redis_key) do
+        if feature_level_6?(state) do
+          type_key = Ferricstore.Store.CompoundKey.type_key(redis_key)
+
+          case sm_store_compound_get_meta(state, redis_key, type_key) do
+            {_type, expire_at_ms} when is_integer(expire_at_ms) and expire_at_ms > 0 ->
+              if expire_at_ms > CommandTime.now_ms(), do: expire_at_ms, else: 0
+
+            _none_or_failure ->
+              0
+          end
+        else
+          0
+        end
+      end
 
       # Feature level 4 also stores INCRBYFLOAT and HINCRBYFLOAT results as
       # Redis does ("3", "5200"); older releases store Float.to_string/1

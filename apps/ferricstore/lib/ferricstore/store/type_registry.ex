@@ -271,6 +271,34 @@ defmodule Ferricstore.Store.TypeRegistry do
     end
   end
 
+  @doc """
+  The expiry a member written into `redis_key`'s collection takes.
+
+  A key's TTL is stored on each of its members (and on its type key). Where
+  `Ops.level_6_writes?/1` allows it, a member written into a collection whose
+  type key has a TTL in the future takes that TTL, so members added after
+  EXPIRE expire with the rest; otherwise 0, as older releases write.
+  """
+  @spec member_expire_at(binary(), map()) :: non_neg_integer()
+  def member_expire_at(redis_key, store) do
+    if Ops.level_6_writes?(store) and member_meta_readable?(store) do
+      case Ops.compound_get_meta(store, redis_key, CompoundKey.type_key(redis_key)) do
+        {_type, expire_at_ms} when is_integer(expire_at_ms) and expire_at_ms > 0 ->
+          if expire_at_ms > Ferricstore.CommandTime.now_ms(), do: expire_at_ms, else: 0
+
+        _none_or_failure ->
+          0
+      end
+    else
+      0
+    end
+  end
+
+  defp member_meta_readable?(store) when is_map(store) and not is_struct(store),
+    do: is_map_key(store, :compound_get_meta)
+
+  defp member_meta_readable?(_store), do: true
+
   @doc false
   @spec rollback_created_type(binary(), map()) :: :ok | {:error, term()}
   def rollback_created_type(redis_key, store) do

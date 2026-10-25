@@ -35,8 +35,10 @@ defmodule Ferricstore.Commands.TDigest do
     * `TDIGEST.MERGE destkey numkeys src [src ...] [COMPRESSION c] [OVERRIDE]`
   """
 
+  alias Ferricstore.Commands.PreparedCommand
   alias Ferricstore.Store.Ops
   alias Ferricstore.Store.ReadResult
+  alias Ferricstore.Store.Router
   alias Ferricstore.Store.TypeRegistry
   alias Ferricstore.TDigest.Core
   alias Ferricstore.TermCodec
@@ -65,18 +67,56 @@ defmodule Ferricstore.Commands.TDigest do
   def handle_ast({tag, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
   def handle_ast({tag, _key, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
 
-  def handle_ast({:tdigest_create, key, nil}, store) do
-    handle_ast({:tdigest_create, key, 100}, store)
+  def handle_ast(ast, %FerricStore.Instance{} = store), do: atomic_write(store, ast, store)
+  def handle_ast(ast, store), do: handle_ast(ast, :here, store)
+
+  @doc """
+  Runs a TDIGEST write as one replicated entry where `ctx` can (see
+  `handle/3`), else with `store` here. Other commands run here.
+  """
+  @spec atomic_write(FerricStore.Instance.t(), term(), map()) :: term()
+  def atomic_write(%FerricStore.Instance{} = ctx, ast, store) do
+    with {:ok, key} <- entry_key(ctx, ast),
+         result when result != :unsupported <- Ops.compound_command(ctx, key, ast, 6) do
+      result
+    else
+      _here -> handle_ast(ast, :here, store)
+    end
   end
 
-  def handle_ast({:tdigest_create, key, compression}, store) do
+  defp entry_key(_ctx, {:tdigest_create, key, compression})
+       when is_binary(key) and (is_nil(compression) or is_integer(compression)),
+       do: {:ok, key}
+
+  defp entry_key(_ctx, {:tdigest_add, key, values}) when is_binary(key) and is_list(values),
+    do: {:ok, key}
+
+  defp entry_key(_ctx, {:tdigest_reset, [key]}) when is_binary(key), do: {:ok, key}
+
+  # The entry applies on the destination's shard, which reads only its own keys.
+  defp entry_key(ctx, {:tdigest_merge, dest, src_keys, opts})
+       when is_binary(dest) and is_list(src_keys) and is_list(opts) do
+    shard = Router.shard_for(ctx, dest)
+
+    if Enum.all?(src_keys, &(is_binary(&1) and Router.shard_for(ctx, &1) == shard)),
+      do: {:ok, dest},
+      else: :here
+  end
+
+  defp entry_key(_ctx, _ast), do: :here
+
+  defp handle_ast({:tdigest_create, key, nil}, :here, store) do
+    handle_ast({:tdigest_create, key, 100}, :here, store)
+  end
+
+  defp handle_ast({:tdigest_create, key, compression}, :here, store) do
     with :ok <- validate_compression(compression),
          :ok <- check_create_available(key, store) do
       create_digest(key, compression, store)
     end
   end
 
-  def handle_ast({:tdigest_add, key, floats}, store) do
+  defp handle_ast({:tdigest_add, key, floats}, :here, store) do
     with :ok <- validate_float_list(floats),
          {:ok, digest} <- get_digest(store, key),
          :ok <- validate_observation_capacity(digest, length(floats)) do
@@ -85,9 +125,9 @@ defmodule Ferricstore.Commands.TDigest do
     end
   end
 
-  def handle_ast({:tdigest_reset, [key]}, store), do: reset_digest(key, store)
+  defp handle_ast({:tdigest_reset, [key]}, :here, store), do: reset_digest(key, store)
 
-  def handle_ast({:tdigest_quantile, key, quantiles}, store) do
+  defp handle_ast({:tdigest_quantile, key, quantiles}, :here, store) do
     with :ok <- validate_quantile_list(quantiles),
          {:ok, digest} <- get_digest(store, key) do
       quantiles
@@ -96,7 +136,7 @@ defmodule Ferricstore.Commands.TDigest do
     end
   end
 
-  def handle_ast({:tdigest_cdf, key, floats}, store) do
+  defp handle_ast({:tdigest_cdf, key, floats}, :here, store) do
     with :ok <- validate_float_list(floats),
          {:ok, digest} <- get_digest(store, key) do
       floats
@@ -105,21 +145,21 @@ defmodule Ferricstore.Commands.TDigest do
     end
   end
 
-  def handle_ast({:tdigest_rank, key, floats}, store) do
+  defp handle_ast({:tdigest_rank, key, floats}, :here, store) do
     with :ok <- validate_float_list(floats),
          {:ok, digest} <- get_digest(store, key) do
       Enum.map(floats, fn v -> Core.rank(digest, v) end)
     end
   end
 
-  def handle_ast({:tdigest_revrank, key, floats}, store) do
+  defp handle_ast({:tdigest_revrank, key, floats}, :here, store) do
     with :ok <- validate_float_list(floats),
          {:ok, digest} <- get_digest(store, key) do
       Enum.map(floats, fn v -> Core.rev_rank(digest, v) end)
     end
   end
 
-  def handle_ast({:tdigest_byrank, key, ranks}, store) do
+  defp handle_ast({:tdigest_byrank, key, ranks}, :here, store) do
     with :ok <- validate_rank_list(ranks),
          {:ok, digest} <- get_digest(store, key) do
       ranks
@@ -128,7 +168,7 @@ defmodule Ferricstore.Commands.TDigest do
     end
   end
 
-  def handle_ast({:tdigest_byrevrank, key, ranks}, store) do
+  defp handle_ast({:tdigest_byrevrank, key, ranks}, :here, store) do
     with :ok <- validate_rank_list(ranks),
          {:ok, digest} <- get_digest(store, key) do
       ranks
@@ -137,7 +177,7 @@ defmodule Ferricstore.Commands.TDigest do
     end
   end
 
-  def handle_ast({:tdigest_trimmed_mean, key, lo, hi}, store) do
+  defp handle_ast({:tdigest_trimmed_mean, key, lo, hi}, :here, store) do
     with :ok <- validate_trimmed_quantiles(lo, hi),
          {:ok, digest} <- get_digest(store, key) do
       digest
@@ -146,11 +186,11 @@ defmodule Ferricstore.Commands.TDigest do
     end
   end
 
-  def handle_ast({:tdigest_min, [key]}, store), do: min_digest(key, store)
-  def handle_ast({:tdigest_max, [key]}, store), do: max_digest(key, store)
-  def handle_ast({:tdigest_info, [key]}, store), do: info_digest(key, store)
+  defp handle_ast({:tdigest_min, [key]}, :here, store), do: min_digest(key, store)
+  defp handle_ast({:tdigest_max, [key]}, :here, store), do: max_digest(key, store)
+  defp handle_ast({:tdigest_info, [key]}, :here, store), do: info_digest(key, store)
 
-  def handle_ast({:tdigest_merge, dest, src_keys, opts}, store) do
+  defp handle_ast({:tdigest_merge, dest, src_keys, opts}, :here, store) do
     with :ok <- validate_merge_args(dest, src_keys, opts),
          {:ok, dest_digest} <- load_destination_digest(store, dest, opts),
          {:ok, src_digests} <- load_source_digests(store, src_keys) do
@@ -186,20 +226,35 @@ defmodule Ferricstore.Commands.TDigest do
     end
   end
 
+  # TDIGEST writes read the digest, change it and write it back. The key latch
+  # that serializes them is node-local, so clients on two nodes lost each
+  # other's values and both created the digest. On the default instance, from
+  # cluster feature level 6, a write runs as one replicated entry the shard
+  # applies with nothing in between (`atomic_write/3`); otherwise, and in the
+  # state machine itself, it runs here.
+  @atomic_writes ~w(TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.MERGE)
+
   @spec handle(binary(), [binary()], map()) :: term()
-  def handle(cmd, args, store)
+  def handle(command, args, %FerricStore.Instance{} = ctx) when command in @atomic_writes do
+    case PreparedCommand.prepare(command, args) do
+      {:ok, %PreparedCommand{ast: ast}} -> atomic_write(ctx, ast, ctx)
+      _invalid -> handle_here(command, args, ctx)
+    end
+  end
+
+  def handle(command, args, store), do: handle_here(command, args, store)
 
   # ---------------------------------------------------------------------------
   # TDIGEST.CREATE key [COMPRESSION compression]
   # ---------------------------------------------------------------------------
 
-  def handle("TDIGEST.CREATE", [key], store) do
+  defp handle_here("TDIGEST.CREATE", [key], store) do
     with :ok <- check_create_available(key, store) do
       create_digest(key, 100, store)
     end
   end
 
-  def handle("TDIGEST.CREATE", [key, option, comp_str], store) do
+  defp handle_here("TDIGEST.CREATE", [key, option, comp_str], store) do
     case String.upcase(option) do
       "COMPRESSION" ->
         with {:ok, compression} <- parse_pos_integer(comp_str, "compression"),
@@ -213,11 +268,11 @@ defmodule Ferricstore.Commands.TDigest do
     end
   end
 
-  def handle("TDIGEST.CREATE", [], _store) do
+  defp handle_here("TDIGEST.CREATE", [], _store) do
     {:error, "ERR wrong number of arguments for 'tdigest.create' command"}
   end
 
-  def handle("TDIGEST.CREATE", _args, _store) do
+  defp handle_here("TDIGEST.CREATE", _args, _store) do
     {:error, "ERR wrong number of arguments for 'tdigest.create' command"}
   end
 
@@ -225,7 +280,7 @@ defmodule Ferricstore.Commands.TDigest do
   # TDIGEST.ADD key value [value ...]
   # ---------------------------------------------------------------------------
 
-  def handle("TDIGEST.ADD", [key | values], store) when values != [] do
+  defp handle_here("TDIGEST.ADD", [key | values], store) when values != [] do
     with {:ok, floats} <- parse_float_list(values),
          {:ok, digest} <- get_digest(store, key),
          :ok <- validate_observation_capacity(digest, length(floats)) do
@@ -234,7 +289,7 @@ defmodule Ferricstore.Commands.TDigest do
     end
   end
 
-  def handle("TDIGEST.ADD", _args, _store) do
+  defp handle_here("TDIGEST.ADD", _args, _store) do
     {:error, "ERR wrong number of arguments for 'tdigest.add' command"}
   end
 
@@ -242,9 +297,9 @@ defmodule Ferricstore.Commands.TDigest do
   # TDIGEST.RESET key
   # ---------------------------------------------------------------------------
 
-  def handle("TDIGEST.RESET", [key], store), do: reset_digest(key, store)
+  defp handle_here("TDIGEST.RESET", [key], store), do: reset_digest(key, store)
 
-  def handle("TDIGEST.RESET", _args, _store) do
+  defp handle_here("TDIGEST.RESET", _args, _store) do
     {:error, "ERR wrong number of arguments for 'tdigest.reset' command"}
   end
 
@@ -252,7 +307,7 @@ defmodule Ferricstore.Commands.TDigest do
   # TDIGEST.QUANTILE key quantile [quantile ...]
   # ---------------------------------------------------------------------------
 
-  def handle("TDIGEST.QUANTILE", [key | qs], store) when qs != [] do
+  defp handle_here("TDIGEST.QUANTILE", [key | qs], store) when qs != [] do
     with {:ok, quantiles} <- parse_quantile_list(qs),
          {:ok, digest} <- get_digest(store, key) do
       results = Enum.map(quantiles, fn q -> Core.quantile(digest, q) end)
@@ -260,7 +315,7 @@ defmodule Ferricstore.Commands.TDigest do
     end
   end
 
-  def handle("TDIGEST.QUANTILE", _args, _store) do
+  defp handle_here("TDIGEST.QUANTILE", _args, _store) do
     {:error, "ERR wrong number of arguments for 'tdigest.quantile' command"}
   end
 
@@ -268,7 +323,7 @@ defmodule Ferricstore.Commands.TDigest do
   # TDIGEST.CDF key value [value ...]
   # ---------------------------------------------------------------------------
 
-  def handle("TDIGEST.CDF", [key | values], store) when values != [] do
+  defp handle_here("TDIGEST.CDF", [key | values], store) when values != [] do
     with {:ok, floats} <- parse_float_list(values),
          {:ok, digest} <- get_digest(store, key) do
       results = Enum.map(floats, fn v -> Core.cdf(digest, v) end)
@@ -276,7 +331,7 @@ defmodule Ferricstore.Commands.TDigest do
     end
   end
 
-  def handle("TDIGEST.CDF", _args, _store) do
+  defp handle_here("TDIGEST.CDF", _args, _store) do
     {:error, "ERR wrong number of arguments for 'tdigest.cdf' command"}
   end
 
@@ -284,14 +339,14 @@ defmodule Ferricstore.Commands.TDigest do
   # TDIGEST.RANK key value [value ...]
   # ---------------------------------------------------------------------------
 
-  def handle("TDIGEST.RANK", [key | values], store) when values != [] do
+  defp handle_here("TDIGEST.RANK", [key | values], store) when values != [] do
     with {:ok, floats} <- parse_float_list(values),
          {:ok, digest} <- get_digest(store, key) do
       Enum.map(floats, fn v -> Core.rank(digest, v) end)
     end
   end
 
-  def handle("TDIGEST.RANK", _args, _store) do
+  defp handle_here("TDIGEST.RANK", _args, _store) do
     {:error, "ERR wrong number of arguments for 'tdigest.rank' command"}
   end
 
@@ -299,14 +354,14 @@ defmodule Ferricstore.Commands.TDigest do
   # TDIGEST.REVRANK key value [value ...]
   # ---------------------------------------------------------------------------
 
-  def handle("TDIGEST.REVRANK", [key | values], store) when values != [] do
+  defp handle_here("TDIGEST.REVRANK", [key | values], store) when values != [] do
     with {:ok, floats} <- parse_float_list(values),
          {:ok, digest} <- get_digest(store, key) do
       Enum.map(floats, fn v -> Core.rev_rank(digest, v) end)
     end
   end
 
-  def handle("TDIGEST.REVRANK", _args, _store) do
+  defp handle_here("TDIGEST.REVRANK", _args, _store) do
     {:error, "ERR wrong number of arguments for 'tdigest.revrank' command"}
   end
 
@@ -314,7 +369,7 @@ defmodule Ferricstore.Commands.TDigest do
   # TDIGEST.BYRANK key rank [rank ...]
   # ---------------------------------------------------------------------------
 
-  def handle("TDIGEST.BYRANK", [key | ranks], store) when ranks != [] do
+  defp handle_here("TDIGEST.BYRANK", [key | ranks], store) when ranks != [] do
     with {:ok, rank_ints} <- parse_integer_list(ranks),
          {:ok, digest} <- get_digest(store, key) do
       results = Enum.map(rank_ints, fn r -> Core.by_rank(digest, r) end)
@@ -322,7 +377,7 @@ defmodule Ferricstore.Commands.TDigest do
     end
   end
 
-  def handle("TDIGEST.BYRANK", _args, _store) do
+  defp handle_here("TDIGEST.BYRANK", _args, _store) do
     {:error, "ERR wrong number of arguments for 'tdigest.byrank' command"}
   end
 
@@ -330,7 +385,7 @@ defmodule Ferricstore.Commands.TDigest do
   # TDIGEST.BYREVRANK key rank [rank ...]
   # ---------------------------------------------------------------------------
 
-  def handle("TDIGEST.BYREVRANK", [key | ranks], store) when ranks != [] do
+  defp handle_here("TDIGEST.BYREVRANK", [key | ranks], store) when ranks != [] do
     with {:ok, rank_ints} <- parse_integer_list(ranks),
          {:ok, digest} <- get_digest(store, key) do
       results = Enum.map(rank_ints, fn r -> Core.by_rev_rank(digest, r) end)
@@ -338,7 +393,7 @@ defmodule Ferricstore.Commands.TDigest do
     end
   end
 
-  def handle("TDIGEST.BYREVRANK", _args, _store) do
+  defp handle_here("TDIGEST.BYREVRANK", _args, _store) do
     {:error, "ERR wrong number of arguments for 'tdigest.byrevrank' command"}
   end
 
@@ -346,7 +401,7 @@ defmodule Ferricstore.Commands.TDigest do
   # TDIGEST.TRIMMED_MEAN key low_quantile high_quantile
   # ---------------------------------------------------------------------------
 
-  def handle("TDIGEST.TRIMMED_MEAN", [key, lo_str, hi_str], store) do
+  defp handle_here("TDIGEST.TRIMMED_MEAN", [key, lo_str, hi_str], store) do
     with {:ok, lo} <- parse_quantile(lo_str),
          {:ok, hi} <- parse_quantile(hi_str),
          :ok <- validate_trimmed_quantiles(lo, hi),
@@ -356,7 +411,7 @@ defmodule Ferricstore.Commands.TDigest do
     end
   end
 
-  def handle("TDIGEST.TRIMMED_MEAN", _args, _store) do
+  defp handle_here("TDIGEST.TRIMMED_MEAN", _args, _store) do
     {:error, "ERR wrong number of arguments for 'tdigest.trimmed_mean' command"}
   end
 
@@ -364,9 +419,9 @@ defmodule Ferricstore.Commands.TDigest do
   # TDIGEST.MIN key
   # ---------------------------------------------------------------------------
 
-  def handle("TDIGEST.MIN", [key], store), do: min_digest(key, store)
+  defp handle_here("TDIGEST.MIN", [key], store), do: min_digest(key, store)
 
-  def handle("TDIGEST.MIN", _args, _store) do
+  defp handle_here("TDIGEST.MIN", _args, _store) do
     {:error, "ERR wrong number of arguments for 'tdigest.min' command"}
   end
 
@@ -374,9 +429,9 @@ defmodule Ferricstore.Commands.TDigest do
   # TDIGEST.MAX key
   # ---------------------------------------------------------------------------
 
-  def handle("TDIGEST.MAX", [key], store), do: max_digest(key, store)
+  defp handle_here("TDIGEST.MAX", [key], store), do: max_digest(key, store)
 
-  def handle("TDIGEST.MAX", _args, _store) do
+  defp handle_here("TDIGEST.MAX", _args, _store) do
     {:error, "ERR wrong number of arguments for 'tdigest.max' command"}
   end
 
@@ -384,9 +439,9 @@ defmodule Ferricstore.Commands.TDigest do
   # TDIGEST.INFO key
   # ---------------------------------------------------------------------------
 
-  def handle("TDIGEST.INFO", [key], store), do: info_digest(key, store)
+  defp handle_here("TDIGEST.INFO", [key], store), do: info_digest(key, store)
 
-  def handle("TDIGEST.INFO", _args, _store) do
+  defp handle_here("TDIGEST.INFO", _args, _store) do
     {:error, "ERR wrong number of arguments for 'tdigest.info' command"}
   end
 
@@ -394,7 +449,7 @@ defmodule Ferricstore.Commands.TDigest do
   # TDIGEST.MERGE destkey numkeys src [src ...] [COMPRESSION c] [OVERRIDE]
   # ---------------------------------------------------------------------------
 
-  def handle("TDIGEST.MERGE", [dest, numkeys_str | rest], store) do
+  defp handle_here("TDIGEST.MERGE", [dest, numkeys_str | rest], store) do
     with {:ok, numkeys} <- parse_pos_integer(numkeys_str, "numkeys"),
          :ok <- validate_merge_source_count(numkeys),
          {:ok, src_keys, opts} <- parse_merge_args(rest, numkeys),
@@ -404,7 +459,7 @@ defmodule Ferricstore.Commands.TDigest do
     end
   end
 
-  def handle("TDIGEST.MERGE", _args, _store) do
+  defp handle_here("TDIGEST.MERGE", _args, _store) do
     {:error, "ERR wrong number of arguments for 'tdigest.merge' command"}
   end
 
@@ -973,9 +1028,10 @@ defmodule Ferricstore.Commands.TDigest do
   # Private: result formatting
   # ===========================================================================
 
-  defp format_number(val) when is_float(val) do
-    :erlang.float_to_binary(val, [:compact, decimals: 17])
-  end
+  # The shortest text that reads back as the same float ("45.0", "2.5",
+  # "1.0e300"). Seventeen fixed decimals raised from about 1e252, read "0.0"
+  # below 1e-17 and carried noise digits ("123.45600000000000304").
+  defp format_number(val) when is_float(val), do: :erlang.float_to_binary(val, [:short])
 
   defp format_number(val) when is_integer(val) do
     Integer.to_string(val)

@@ -729,6 +729,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       defp build_compound_store(state) do
         %{
           cache_scope: state.instance_name,
+          level_6_writes?: feature_level_6?(state),
           compound_write_budget: state.apply_context.compound_member_apply_budget,
           max_value_size: state.apply_context.max_value_size,
           stream_range_pages: true,

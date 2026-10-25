@@ -225,7 +225,12 @@ PUBSUB NUMPAT
 Pub/Sub behavior:
 
 - Messages are delivered only to subscribers connected at publish time.
-- A publish returns the number of subscribers that received the message.
+- In a cluster a publish reaches subscribers on every node, once each. As in
+  Redis Cluster, it returns the number of subscribers on the node that ran it,
+  and PUBSUB CHANNELS/NUMSUB/NUMPAT count that node's subscriptions.
+- A subscriber gets the messages of one publishing connection in the order
+  they were published; publishes through different nodes have no common
+  order.
 - Pattern subscriptions can match multiple channels.
 - Pub/Sub state belongs to active native server sessions, not to Bitcask or
   Raft storage.

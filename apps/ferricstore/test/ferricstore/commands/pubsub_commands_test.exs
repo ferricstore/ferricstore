@@ -704,7 +704,7 @@ defmodule Ferricstore.Commands.PubSubTest do
 
     test "pattern publish hot path streams ETS instead of copying the pattern table" do
       source = File.read!(Path.expand("../../../lib/ferricstore/pubsub.ex", __DIR__))
-      [publish_source] = Regex.run(~r/def publish\(channel, message\).*?^  end/ms, source)
+      [publish_source] = Regex.run(~r/def publish_local\(channel, message\).*?^  end/ms, source)
 
       assert publish_source =~ "@pattern_cache_table"
       assert source =~ "defp publish_pattern_scan"
@@ -714,7 +714,7 @@ defmodule Ferricstore.Commands.PubSubTest do
 
     test "exact publish skips pattern scan when there are no pattern subscribers" do
       source = File.read!(Path.expand("../../../lib/ferricstore/pubsub.ex", __DIR__))
-      [publish_source] = Regex.run(~r/def publish\(channel, message\).*?^  end/ms, source)
+      [publish_source] = Regex.run(~r/def publish_local\(channel, message\).*?^  end/ms, source)
 
       assert publish_source =~ ":ets.info(@pattern_cache_table, :size)"
 
@@ -748,7 +748,7 @@ defmodule Ferricstore.Commands.PubSubTest do
 
     test "pattern publish uses preclassified simple pattern matchers" do
       source = File.read!(Path.expand("../../../lib/ferricstore/pubsub.ex", __DIR__))
-      [publish_source] = Regex.run(~r/def publish\(channel, message\).*?^  end/ms, source)
+      [publish_source] = Regex.run(~r/def publish_local\(channel, message\).*?^  end/ms, source)
 
       assert source =~ "pattern_matcher(pattern)"
       assert source =~ "pattern_matches?(channel, matcher)"
@@ -774,7 +774,7 @@ defmodule Ferricstore.Commands.PubSubTest do
 
     test "adaptive matcher indexes preserve high-cardinality pattern delivery" do
       source = File.read!(Path.expand("../../../lib/ferricstore/pubsub.ex", __DIR__))
-      [publish_source] = Regex.run(~r/def publish\(channel, message\).*?^  end/ms, source)
+      [publish_source] = Regex.run(~r/def publish_local\(channel, message\).*?^  end/ms, source)
 
       assert source =~ "@pattern_linear_scan_limit"
       assert publish_source =~ "publish_pattern_indexes"

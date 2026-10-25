@@ -4,6 +4,45 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Members added to a hash, set, sorted set, list or stream after EXPIRE were
+  stored without the key's TTL (a key's TTL is stored on each member), so
+  when it passed the key was gone (EXISTS 0, TYPE none) while HGETALL,
+  SMEMBERS, ZRANGE, LRANGE and XLEN still returned the late members, the
+  sweep never removed them, and a later write to the key brought them back.
+  A ZADD or ZINCRBY of an existing member, and any list write (a push, pop,
+  LSET, LINSERT or LMOVE), also dropped the TTL from what it rewrote. From
+  cluster feature level 6 (new in this release) such writes take the key's
+  TTL. Raise the level once every node runs this release; members written
+  before it keep the rows they have.
+- INCR, INCRBY, DECR, DECRBY and HINCRBY accepted stored values Redis does
+  not read as integers ("05", "+5", "-0", "00") and incremented them. From
+  cluster feature level 6 they answer "ERR value is not an integer or out of
+  range" (HINCRBY: "ERR hash value is not an integer"), as Redis does.
+- TDIGEST.CREATE, ADD, RESET and MERGE sent through different nodes lost each
+  other's values (and two CREATEs could both succeed): each read the digest
+  and wrote it back under a node-local latch. From cluster feature level 6
+  each runs as one replicated entry, and MULTI accepts TDIGEST commands.
+- TDIGEST replies (MIN, MAX, QUANTILE, CDF, BYRANK, TRIMMED_MEAN, INFO) failed
+  with an internal error for values from about 1e252 up, answered "0.0" for
+  values below 1e-17, and gave others with noise digits
+  ("123.45600000000000304"). They now give the shortest text that reads back
+  as the value ("1.0e300", "1.0e-300", "123.456"); values such as "45.0" and
+  "2.5" read as before.
+- DEL and UNLINK sent through different nodes could each count the same key
+  (a DEL used as a claim had more than one winner): DEL read whether the key
+  existed and then deleted it. From cluster feature level 6 each key is
+  deleted by one replicated entry that decides whether it existed.
+- PUBLISH through one node reached only the subscribers connected to that
+  node. A publish now reaches subscribers on every node of the cluster, once
+  each; as in Redis Cluster, it answers the number of subscribers on the node
+  that ran it. Keyspace notifications reach every node the same way.
+- A Flow claim blocked on one node was woken only by Flows written through
+  that node: a claim waiting for a Flow written through another node slept
+  until its block ended, and a native claim subscription could wait for good.
+  The writing node now wakes blocked claims on every node.
+- A write that timed out reached native and HTTP clients as the text
+  `{:timeout, :unknown_outcome}`. It now reads "ERR write timed out and may or
+  may not have applied; read before retrying".
 - A shard whose log held a Flow value pin with no locator left (the value
   deleted since, as by retention) could never trim its log again: each trim
   stopped with `{:segment_value_pin_missing_live_value, ...}` and the log kept

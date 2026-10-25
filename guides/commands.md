@@ -1459,7 +1459,7 @@ Transactions work at the connection level. WATCH implements optimistic locking -
 | `UNSUBSCRIBE` | `UNSUBSCRIBE [channel ...]` | Push messages: `[unsubscribe, channel, count]` |
 | `PSUBSCRIBE` | `PSUBSCRIBE pattern [pattern ...]` | Push messages: `[psubscribe, pattern, count]` |
 | `PUNSUBSCRIBE` | `PUNSUBSCRIBE [pattern ...]` | Push messages: `[punsubscribe, pattern, count]` |
-| `PUBLISH` | `PUBLISH channel message` | Integer (subscribers that received) |
+| `PUBLISH` | `PUBLISH channel message` | Integer (subscribers on this node that received; subscribers on other nodes receive it too) |
 | `PUBSUB CHANNELS` | `PUBSUB CHANNELS [pattern]` | Array of active channels |
 | `PUBSUB NUMSUB` | `PUBSUB NUMSUB [channel ...]` | Array of `[channel, count, ...]` |
 | `PUBSUB NUMPAT` | `PUBSUB NUMPAT` | Integer (pattern subscriptions) |

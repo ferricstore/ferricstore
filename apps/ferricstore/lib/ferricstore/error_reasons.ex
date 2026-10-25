@@ -18,6 +18,11 @@ defmodule Ferricstore.ErrorReasons do
   def client_message(:batch_command_apply_budget_exceeded, ctx),
     do: "ERR too many items in one command" <> limit_suffix(ctx, :batch_command_apply_budget)
 
+  # A write whose entry may or may not have committed: retrying it blindly
+  # could apply it twice.
+  def client_message({:timeout, :unknown_outcome}, _ctx),
+    do: "ERR write timed out and may or may not have applied; read before retrying"
+
   def client_message(_reason, _ctx), do: nil
 
   defp limit_suffix(%{apply_context: %{} = context}, field) do

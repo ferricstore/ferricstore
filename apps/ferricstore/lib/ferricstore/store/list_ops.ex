@@ -14,6 +14,7 @@ defmodule Ferricstore.Store.ListOps do
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
   alias Ferricstore.Store.ReadResult
+  alias Ferricstore.Store.TypeRegistry
   alias Ferricstore.TermCodec
 
   # Integer positions with large gaps. LPUSH/RPUSH decrement/increment by @position_step.
@@ -23,6 +24,7 @@ defmodule Ferricstore.Store.ListOps do
   @position_step 1_000_000_000
   @integer_error "ERR value is not an integer or out of range"
   @max_encoded_meta_bytes 128
+  @expire_at_key :ferricstore_list_ops_expire_at
 
   @doc false
   @spec max_encoded_meta_bytes() :: pos_integer()
@@ -80,16 +82,48 @@ defmodule Ferricstore.Store.ListOps do
   @spec execute(binary(), map(), term()) :: term()
   def execute(key, store, operation) do
     case read_meta(key, store) do
-      {:error, _} = error -> error
-      meta -> do_execute(key, store, meta, operation)
+      {:error, _} = error ->
+        error
+
+      meta ->
+        with_expire_at([{key, meta}], store, fn -> do_execute(key, store, meta, operation) end)
     end
   end
+
+  # A list's TTL is stored on its elements and its meta row. Every write an
+  # operation makes to a list takes the key's TTL (TypeRegistry.member_expire_at/2),
+  # so a push, pop, LSET or LINSERT keeps it; a list the operation creates has
+  # none.
+  defp with_expire_at(keys_and_meta, store, fun) do
+    expire_at =
+      Map.new(keys_and_meta, fn
+        {key, nil} -> {key, 0}
+        {key, _meta} -> {key, TypeRegistry.member_expire_at(key, store)}
+      end)
+
+    previous = Process.put(@expire_at_key, expire_at)
+
+    try do
+      fun.()
+    after
+      if previous, do: Process.put(@expire_at_key, previous), else: Process.delete(@expire_at_key)
+    end
+  end
+
+  defp expire_at(key), do: Map.get(Process.get(@expire_at_key) || %{}, key, 0)
 
   @spec execute_lmove(binary(), binary(), map(), :left | :right, :left | :right) ::
           binary() | nil | {:error, term()}
   def execute_lmove(src_key, dst_key, store, from_dir, to_dir) when is_map(store) do
     src_meta = read_meta(src_key, store)
+    dst_meta = if src_key == dst_key, do: src_meta, else: read_meta(dst_key, store)
 
+    with_expire_at([{src_key, src_meta}, {dst_key, dst_meta}], store, fn ->
+      do_execute_lmove(src_key, dst_key, store, from_dir, to_dir, src_meta)
+    end)
+  end
+
+  defp do_execute_lmove(src_key, dst_key, store, from_dir, to_dir, src_meta) do
     case src_meta do
       nil ->
         nil
@@ -236,8 +270,8 @@ defmodule Ferricstore.Store.ListOps do
 
   defp rollback_lmove_source(src_key, store, pos, element, src_meta) do
     entries = [
-      {CompoundKey.list_element(src_key, pos), element, 0},
-      {CompoundKey.list_meta_key(src_key), encode_meta(src_meta), 0}
+      {CompoundKey.list_element(src_key, pos), element, expire_at(src_key)},
+      {CompoundKey.list_meta_key(src_key), encode_meta(src_meta), expire_at(src_key)}
     ]
 
     store
@@ -286,8 +320,8 @@ defmodule Ferricstore.Store.ListOps do
 
   defp put_moved_element_and_meta(key, store, {pos, element}, meta) do
     entries = [
-      {CompoundKey.list_element(key, pos), element, 0},
-      {CompoundKey.list_meta_key(key), encode_meta(meta), 0}
+      {CompoundKey.list_element(key, pos), element, expire_at(key)},
+      {CompoundKey.list_meta_key(key), encode_meta(meta), expire_at(key)}
     ]
 
     store
@@ -335,7 +369,13 @@ defmodule Ferricstore.Store.ListOps do
   def decode_meta(_), do: nil
 
   defp write_meta(key, store, {_len, _left, _right} = meta) do
-    Ops.compound_put(store, key, CompoundKey.list_meta_key(key), encode_meta(meta), 0)
+    Ops.compound_put(
+      store,
+      key,
+      CompoundKey.list_meta_key(key),
+      encode_meta(meta),
+      expire_at(key)
+    )
     |> write_result()
   end
 
@@ -581,7 +621,7 @@ defmodule Ferricstore.Store.ListOps do
     if norm >= 0 and norm < len do
       with {:ok, [{old_pos, _old_value}]} <- sorted_slice(key, store, norm, 1, len) do
         store
-        |> Ops.compound_put(key, CompoundKey.list_element(key, old_pos), element, 0)
+        |> Ops.compound_put(key, CompoundKey.list_element(key, old_pos), element, expire_at(key))
         |> write_result()
       end
     else
@@ -864,15 +904,15 @@ defmodule Ferricstore.Store.ListOps do
 
     entries =
       Enum.map(rebalanced, fn {pos, value} ->
-        {CompoundKey.list_element(key, pos), value, 0}
+        {CompoundKey.list_element(key, pos), value, expire_at(key)}
       end) ++
         [
-          {CompoundKey.list_element(key, new_pos), element, 0},
+          {CompoundKey.list_element(key, new_pos), element, expire_at(key)},
           {CompoundKey.list_meta_key(key),
            encode_meta(
              {new_len, min(min_pos, new_pos) - @position_step,
               max(max_pos, new_pos) + @position_step}
-           ), 0}
+           ), expire_at(key)}
         ]
 
     compound_keys =
@@ -937,7 +977,7 @@ defmodule Ferricstore.Store.ListOps do
   defp put_one_element_and_write_meta(key, store, {pos, element}, meta, success) do
     with :ok <-
            store
-           |> Ops.compound_put(key, CompoundKey.list_element(key, pos), element, 0)
+           |> Ops.compound_put(key, CompoundKey.list_element(key, pos), element, expire_at(key))
            |> write_result() do
       case write_meta(key, store, meta) do
         :ok -> success
@@ -959,7 +999,7 @@ defmodule Ferricstore.Store.ListOps do
   defp put_elements(key, store, writes) do
     entries =
       Enum.map(writes, fn {pos, elem} ->
-        {CompoundKey.list_element(key, pos), elem, 0}
+        {CompoundKey.list_element(key, pos), elem, expire_at(key)}
       end)
 
     store

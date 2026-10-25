@@ -183,7 +183,7 @@ defmodule FerricStore.API.Strings do
   def del(keys) when is_list(keys) do
     store = build_compound_store(hd(keys))
 
-    case Strings.handle_ast({:del, keys}, store) do
+    case Strings.atomic_del(default_ctx(), keys, store) do
       {:error, _} = err -> err
       count -> {:ok, count}
     end

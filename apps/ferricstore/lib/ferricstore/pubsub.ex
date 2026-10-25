@@ -305,6 +305,15 @@ defmodule Ferricstore.PubSub do
   """
   @spec publish(channel(), binary()) :: non_neg_integer()
   def publish(channel, message) when is_binary(channel) and is_binary(message) do
+    count = publish_local(channel, message)
+    Ferricstore.Cluster.Relay.forward_publishes([{channel, message}])
+    count
+  end
+
+  @doc false
+  # Delivers to this node's subscribers only (`publish/2` also relays).
+  @spec publish_local(channel(), binary()) :: non_neg_integer()
+  def publish_local(channel, message) when is_binary(channel) and is_binary(message) do
     channel_count =
       case :ets.lookup(@channel_cache_table, channel) do
         [{^channel, deliveries, _subscriber_count}] ->
@@ -347,11 +356,23 @@ defmodule Ferricstore.PubSub do
           [{channel(), binary()}],
           nil | (channel(), [binary()] -> term())
         ) :: [non_neg_integer()]
-  def publish_many([], batch_preparer)
+  def publish_many(publishes, batch_preparer) do
+    counts = publish_many_local(publishes, batch_preparer)
+    Ferricstore.Cluster.Relay.forward_publishes(publishes)
+    counts
+  end
+
+  @doc false
+  # Delivers to this node's subscribers only (`publish_many/2` also relays).
+  @spec publish_many_local(
+          [{channel(), binary()}],
+          nil | (channel(), [binary()] -> term())
+        ) :: [non_neg_integer()]
+  def publish_many_local([], batch_preparer)
       when is_nil(batch_preparer) or is_function(batch_preparer, 2),
       do: []
 
-  def publish_many([{channel, message} | rest] = publishes, batch_preparer)
+  def publish_many_local([{channel, message} | rest] = publishes, batch_preparer)
       when is_binary(channel) and is_binary(message) and is_list(rest) and
              (is_nil(batch_preparer) or is_function(batch_preparer, 2)) do
     case same_channel_messages(rest, channel, [message]) do
@@ -360,7 +381,7 @@ defmodule Ferricstore.PubSub do
 
       :mixed ->
         Enum.map(publishes, fn {item_channel, item_message} ->
-          publish(item_channel, item_message)
+          publish_local(item_channel, item_message)
         end)
     end
   end

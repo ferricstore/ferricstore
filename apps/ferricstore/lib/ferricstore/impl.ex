@@ -86,8 +86,7 @@ defmodule FerricStore.Impl do
 
   def del(ctx, keys) when is_list(keys) do
     ctx
-    |> build_store()
-    |> then(&Strings.handle_ast({:del, keys}, &1))
+    |> Strings.atomic_del(keys, build_store(ctx))
     |> wrap_result()
   end
 
@@ -957,7 +956,7 @@ defmodule FerricStore.Impl do
     compression = Keyword.get(opts, :compression)
 
     Router.with_key_latch(ctx, key, fn ->
-      TDigest.handle_ast({:tdigest_create, key, compression}, store)
+      TDigest.atomic_write(ctx, {:tdigest_create, key, compression}, store)
     end)
   end
 
@@ -966,7 +965,7 @@ defmodule FerricStore.Impl do
     store = build_store(ctx)
 
     Router.with_key_latch(ctx, key, fn ->
-      TDigest.handle_ast({:tdigest_add, key, Enum.map(values, &(&1 * 1.0))}, store)
+      TDigest.atomic_write(ctx, {:tdigest_add, key, Enum.map(values, &(&1 * 1.0))}, store)
     end)
   end
 
@@ -1012,7 +1011,7 @@ defmodule FerricStore.Impl do
     store = build_store(ctx)
 
     Router.with_key_latch(ctx, key, fn ->
-      TDigest.handle_ast({:tdigest_reset, [key]}, store)
+      TDigest.atomic_write(ctx, {:tdigest_reset, [key]}, store)
     end)
   end
 
@@ -1065,6 +1064,7 @@ defmodule FerricStore.Impl do
       __instance_ctx__: ctx,
       # Its writes reach the cluster through the router.
       level_5_writes?: true,
+      level_6_writes?: true,
       get: fn key -> Router.get(ctx, key) end,
       get_meta: fn key -> Router.get_meta(ctx, key) end,
       batch_get: fn keys -> Router.batch_get(ctx, keys) end,
