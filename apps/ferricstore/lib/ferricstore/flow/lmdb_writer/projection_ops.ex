@@ -402,7 +402,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     winners =
       case flow_state_projection_key(op) do
         {:ok, state_key} ->
-          candidate = {index, op, nil}
+          candidate = {index, op, projection_rank(op)}
 
           Map.update(winners, state_key, candidate, fn winner ->
             preferred_projection(winner, candidate)
@@ -433,16 +433,19 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     retain_projection_winners(rest, winners, index + 1, acc)
   end
 
-  defp preferred_projection({old_index, old_op, old_rank}, {new_index, new_op, _new_rank}) do
-    old_rank = old_rank || projection_rank(old_op)
-    new_rank = projection_rank(new_op)
-
+  defp preferred_projection({old_index, old_op, old_rank}, {new_index, new_op, new_rank}) do
     if new_rank >= old_rank,
       do: {new_index, new_op, new_rank},
       else: {old_index, old_op, old_rank}
   end
 
-  defp projection_rank({:project_flow_state_from_source, _state_key}), do: {3, 0, 1}
+  # One projection per state key: the highest expected version, which the
+  # source reaches once it has published. A versionless full projection (what a
+  # delete queues) wins over all of them: it projects what the source holds now.
+  # A Flow deleted and created again under the same id starts over at version
+  # 1, and an earlier incarnation's projection (one drained late from the
+  # outbox, say) expects a version the source never reaches again.
+  defp projection_rank({:project_flow_state_from_source, _state_key}), do: {4, 0, 1}
 
   defp projection_rank({:project_flow_state_from_source, _state_key, expected_version}),
     do: {3, expected_version, 1}

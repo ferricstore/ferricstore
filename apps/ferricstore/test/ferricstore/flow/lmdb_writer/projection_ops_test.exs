@@ -1355,6 +1355,60 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
              ])
   end
 
+  # A Flow deleted (retention cleanup) and created again under the same id
+  # starts over at version 1. A writer behind both still holds the old
+  # incarnation's projection for a higher version, in either order (an outbox
+  # entry drains late); the delete's versionless projection wins, projecting
+  # what the source holds now instead of waiting for a version it never
+  # reaches again.
+  test "a delete between projections lets a re-created Flow's lower version win" do
+    root = tmp_lmdb_path("recreated_source_version")
+    path = Path.join(root, "query")
+    keydir = :ets.new(:recreated_projection_source, [:set, :public])
+    state_key = Ferricstore.Flow.Keys.state_key("recreated-flow", "tenant-a")
+
+    recreated =
+      active_flow_record("recreated-flow", "jobs", "tenant-a")
+      |> Map.merge(%{version: 1, state: "failed", updated_at_ms: 20, next_run_at_ms: nil})
+      |> Ferricstore.Flow.encode_record()
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(root, 0, 5, [
+               {state_key, recreated, 0}
+             ])
+
+    :ets.insert(
+      keydir,
+      {state_key, nil, 0, 0, {:waraft_apply_projection, 5}, 0, byte_size(recreated)}
+    )
+
+    on_exit(fn -> Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(root, 0) end)
+
+    state = %{
+      path: path,
+      shard_index: 0,
+      instance_ctx: %{data_dir: root, keydir_refs: {keydir}},
+      terminal_count_inits: MapSet.new()
+    }
+
+    for batch <- [
+          [
+            {:project_flow_state_from_source, state_key, 3},
+            {:project_flow_state_from_source, state_key},
+            {:project_flow_state_from_source, state_key, 1}
+          ],
+          [
+            {:project_flow_state_from_source, state_key},
+            {:project_flow_query_state_from_source, state_key, 3}
+          ]
+        ] do
+      assert {:ok, ops, _state} = ProjectionOps.expand_ops(state, batch)
+      assert :ok = LMDB.write_batch(path, ops)
+      assert {:ok, query_row} = LMDB.get(path, state_key)
+      assert {:ok, %{record: %{version: 1}}} = QueryRowCodec.decode(query_row, state_key)
+    end
+  end
+
   test "versioned source projection cleans up a record deleted before outbox drain" do
     path = tmp_lmdb_path("deleted_versioned_source")
     keydir = :ets.new(:deleted_versioned_projection_source, [:set, :public])

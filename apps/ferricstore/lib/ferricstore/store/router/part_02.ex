@@ -492,6 +492,10 @@ defmodule Ferricstore.Store.Router.Part02 do
             [{^key, nil, 0, _lfu, :pending, off, vsize}] ->
               {:cold, :pending, off, vsize}
 
+            # A Flow delete tombstone: deleted, LMDB copy not removed yet.
+            [{^key, nil, 0, :flow_state_deleted, :deleted, _off, _vsize}] ->
+              :miss
+
             [{^key, value, exp, lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
               {:hit, value, lfu}
 
@@ -558,6 +562,10 @@ defmodule Ferricstore.Store.Router.Part02 do
 
             [{^key, nil, exp, _lfu, :pending, off, vsize}] when exp == 0 or exp > now ->
               {:cold, :pending, off, vsize, exp}
+
+            # A Flow delete tombstone: deleted, LMDB copy not removed yet.
+            [{^key, nil, 0, :flow_state_deleted, :deleted, _off, _vsize}] ->
+              :miss
 
             [{^key, _value, exp, _lfu, _fid, _off, _vsize} = expired_entry]
             when is_integer(exp) and exp > 0 and exp <= now ->

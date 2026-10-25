@@ -78,8 +78,12 @@ defmodule Ferricstore.Raft.WARaftSegmentReader.TableOwner do
     case :ets.whereis(@table) do
       :undefined ->
         try do
+          # Readers select by root or by {root, index} (the Flow LMDB writer
+          # looks up an index's entries for each value it mirrors). An ordered
+          # set walks only the matching key range; a hash set scanned every
+          # shard's cached entries on each select.
           options = [
-            :set,
+            :ordered_set,
             :public,
             :named_table,
             {:read_concurrency, true},

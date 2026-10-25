@@ -744,6 +744,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
           :expired ->
             nil
 
+          :deleted ->
+            nil
+
           :miss ->
             case flow_read_lmdb_record(state, key) do
               {:ok, record} -> record
@@ -802,15 +805,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
           |> Enum.with_index()
           |> Enum.map(fn
             {true, _idx} -> true
+            {:deleted, _idx} -> false
             {false, idx} -> Map.get(lmdb_by_idx, idx, false)
           end)
         else
-          hot_results
+          Enum.map(hot_results, &(&1 == true))
         end
       end
 
       defp flow_state_keys_present_hot_only(state, keys) do
-        Enum.map(keys, &flow_state_key_present_hot?(state, &1))
+        Enum.map(keys, &(flow_state_key_present_hot?(state, &1) == true))
       end
 
       defp flow_registry_keys_present_hot_only(
@@ -827,10 +831,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
         present?
       end
 
+      # true, false (the LMDB copy decides) or :deleted (a delete tombstone:
+      # the LMDB copy is stale until the writer removes it).
       defp flow_state_key_present_hot?(state, key) do
         case flow_read_state_record_status(state, key) do
           {:record, _record} -> true
           :expired -> false
+          :deleted -> :deleted
           :miss -> false
         end
       end
@@ -884,6 +891,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
               acc
 
             {:expired, idx}, acc ->
+              Map.put(acc, idx, nil)
+
+            {:deleted, idx}, acc ->
               Map.put(acc, idx, nil)
 
             {{:record, record}, idx}, acc ->
@@ -1035,6 +1045,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
         case flow_read_state_record_status(state, key) do
           {:record, record} -> record
           :expired -> nil
+          :deleted -> nil
           :miss -> nil
         end
       end
@@ -1063,11 +1074,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
             :expired
 
           _ ->
-            case flow_read_cold_ets_record(state, key) do
-              nil -> :miss
-              record -> {:record, record}
+            if flow_state_tombstone?(state, key) do
+              :deleted
+            else
+              case flow_read_cold_ets_record(state, key) do
+                nil -> :miss
+                record -> {:record, record}
+              end
             end
         end
+      end
+
+      defp flow_state_tombstone?(state, key) do
+        match?(
+          [{^key, nil, 0, :flow_state_deleted, :deleted, _offset, _size}],
+          :ets.lookup(state.ets, key)
+        )
+      rescue
+        ArgumentError -> false
       end
 
       defp flow_keydir_key_present_before?(state, key, before_raft_index) do

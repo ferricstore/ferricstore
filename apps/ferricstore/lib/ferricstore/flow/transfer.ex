@@ -567,6 +567,10 @@ defmodule Ferricstore.Flow.Transfer do
     :ets.foldl(
       fn row, acc ->
         case {elem(row, 0), elem(row, 2)} do
+          # A delete tombstone: the Flow is gone, its LMDB copy not removed yet.
+          {"f:" <> _rest, _expire_at_ms} when elem(row, 3) == :flow_state_deleted ->
+            acc
+
           {"f:" <> _rest = key, expire_at_ms} ->
             if live?(expire_at_ms, now_ms), do: classify(acc, key, expire_at_ms), else: acc
 
