@@ -119,9 +119,9 @@ defmodule FerricStore.API.Bitmap do
         _ -> op
       end
 
-    wrap_result(
-      Bitmap.handle_ast({:bitop, ast_op, dest_key, source_keys}, build_string_store(dest_key))
-    )
+    # Given the instance, BITOP into one of its sources runs as one
+    # transaction entry from feature level 5, as on the gateways.
+    wrap_result(Bitmap.handle_ast({:bitop, ast_op, dest_key, source_keys}, default_ctx()))
   end
 
   @doc """

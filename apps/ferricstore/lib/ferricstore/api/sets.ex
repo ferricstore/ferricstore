@@ -316,7 +316,7 @@ defmodule FerricStore.API.Sets do
   """
   @spec sdiffstore(key(), [key()]) :: {:ok, non_neg_integer()}
   def sdiffstore(destination, keys) when is_list(keys) do
-    result = Set.handle_ast({:sdiffstore, [destination | keys]}, %{})
+    result = Set.handle_ast({:sdiffstore, [destination | keys]}, default_ctx())
 
     wrap_result(result)
   end
@@ -337,7 +337,7 @@ defmodule FerricStore.API.Sets do
   """
   @spec sinterstore(key(), [key()]) :: {:ok, non_neg_integer()}
   def sinterstore(destination, keys) when is_list(keys) do
-    result = Set.handle_ast({:sinterstore, [destination | keys]}, %{})
+    result = Set.handle_ast({:sinterstore, [destination | keys]}, default_ctx())
 
     wrap_result(result)
   end
@@ -358,7 +358,9 @@ defmodule FerricStore.API.Sets do
   """
   @spec sunionstore(key(), [key()]) :: {:ok, non_neg_integer()}
   def sunionstore(destination, keys) when is_list(keys) do
-    result = Set.handle_ast({:sunionstore, [destination | keys]}, %{})
+    # Given the instance, a store into one of its sources runs as one
+    # transaction entry, as on the gateways.
+    result = Set.handle_ast({:sunionstore, [destination | keys]}, default_ctx())
 
     wrap_result(result)
   end

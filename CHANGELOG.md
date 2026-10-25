@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- The embedded `sunionstore/2`, `sinterstore/2`, `sdiffstore/2` and `bitop/3`
+  still read a destination that is also a source and wrote it back, undoing
+  writes in between (SADD racing `sunionstore(k, [k, other])` kept 261 of
+  401 members, SETBIT racing `bitop(:or, k, [k, other])` 1 of 401 bits).
+  They now run as the gateways do, in one transaction entry.
 - SCAN and RANDOMKEY returned the invocation definition catalog
   (`f:{f}:invocation:definitions:1`, an internal hash clients are refused
   access to) and DBSIZE counted it, while KEYS left it out. Internal

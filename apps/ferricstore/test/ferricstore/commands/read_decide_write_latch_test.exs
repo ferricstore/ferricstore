@@ -243,6 +243,31 @@ defmodule Ferricstore.Commands.ReadDecideWriteLatchTest do
     assert 401 == Dispatcher.dispatch("SCARD", [key <> ":k"], ctx)
   end
 
+  test "embedded sunionstore into one of its sources keeps every member",
+       %{ctx: ctx, key: key} do
+    assert 1 == Dispatcher.dispatch("SADD", [key <> ":eo", "o1"], ctx)
+
+    merger =
+      Task.async(fn ->
+        for _ <- 1..200,
+            do:
+              {:ok, _count} = FerricStore.sunionstore(key <> ":ek", [key <> ":ek", key <> ":eo"])
+      end)
+
+    1..8
+    |> Task.async_stream(
+      fn client ->
+        for i <- 1..50, do: Dispatcher.dispatch("SADD", [key <> ":ek", "#{client}-#{i}"], ctx)
+      end,
+      max_concurrency: 8,
+      timeout: 60_000
+    )
+    |> Stream.run()
+
+    Task.await(merger, 60_000)
+    assert 401 == Dispatcher.dispatch("SCARD", [key <> ":ek"], ctx)
+  end
+
   # Below feature level 5 a transaction writes BITOP's and PFMERGE's results
   # the way older releases do; the instance writes them as Redis does.
   test "BITOP into one of its sources still deletes an empty result", %{ctx: ctx, key: key} do
