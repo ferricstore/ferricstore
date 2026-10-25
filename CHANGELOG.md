@@ -4,6 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Below cluster feature level 4, HDEL and HGETDEL delete the fields and then,
+  when the hash is left empty, its type marker, as two replicated writes.
+  When the marker delete failed, they wrote the deleted fields back. After a
+  timeout, whose write may have committed, that left the fields under a
+  deleted marker (EXISTS 0 while HGET still answered), and a value another
+  client wrote in between was overwritten with the old one. When both writes
+  failed, the reply was an internal term
+  (`{:hash_delete_rollback_failed, ...}`). The fields now stay deleted and the
+  marker delete's error is the reply.
+
 ## 0.12.8 - 2026-10-25
 
 - A trim that rebuilt the segment projection itself (past the deferral
