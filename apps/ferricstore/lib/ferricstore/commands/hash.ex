@@ -946,7 +946,7 @@ defmodule Ferricstore.Commands.Hash do
 
     case read_compound_value(key, compound_key, store) do
       {:ok, current} ->
-        case Helpers.parse_integer_value(current) do
+        case parse_increment_operand(current, store) do
           {:ok, current_int} ->
             case Helpers.checked_integer_add(current_int, increment) do
               {:ok, new_val} ->
@@ -971,6 +971,21 @@ defmodule Ferricstore.Commands.Hash do
         FieldOps.rollback_new_type_marker(key, store, type_status, error)
     end
   end
+
+  # Redis takes only an integer's canonical form ("05" is not one); a store
+  # running in apply refuses the others from feature level 6, as apply does.
+  defp parse_increment_operand(current, store) when is_binary(current) do
+    if Ops.level_6_writes?(store) do
+      case ValueCodec.parse_canonical_integer(current) do
+        {:ok, _int} -> Helpers.parse_integer_value(current)
+        :error -> :error
+      end
+    else
+      Helpers.parse_integer_value(current)
+    end
+  end
+
+  defp parse_increment_operand(current, _store), do: Helpers.parse_integer_value(current)
 
   defp hincrbyfloat_field(key, field, increment, %FerricStore.Instance{} = ctx, type_status) do
     result = Ops.hincrbyfloat(ctx, key, field, increment)

@@ -2040,7 +2040,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
               end
 
             {value, expire_at_ms} ->
-              case coerce_integer(value) do
+              case coerce_incr_integer(anchor_state, value) do
                 {:ok, int_val} ->
                   new_val = int_val + delta
 

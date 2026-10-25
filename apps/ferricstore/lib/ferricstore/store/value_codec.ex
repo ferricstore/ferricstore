@@ -25,6 +25,19 @@ defmodule Ferricstore.Store.ValueCodec do
     end
   end
 
+  @doc """
+  Parses an integer the way Redis's string2ll does: only its canonical form,
+  so no "+" sign, no leading zeros and no "-0" ("05", "+5", "-0" are not
+  integers). Returns `{:ok, integer}` or `:error`.
+  """
+  @spec parse_canonical_integer(binary()) :: {:ok, integer()} | :error
+  def parse_canonical_integer(str) when is_binary(str) do
+    case Integer.parse(str) do
+      {val, ""} -> if Integer.to_string(val) == str, do: {:ok, val}, else: :error
+      _ -> :error
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Float parsing and formatting
   # ---------------------------------------------------------------------------

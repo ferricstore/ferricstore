@@ -14,6 +14,10 @@ All notable changes to FerricStore will be documented here.
   cluster feature level 6 (new in this release) such writes take the key's
   TTL. Raise the level once every node runs this release; members written
   before it keep the rows they have.
+- INCR, INCRBY, DECR, DECRBY and HINCRBY accepted stored values Redis does
+  not read as integers ("05", "+5", "-0", "00") and incremented them. From
+  cluster feature level 6 they answer "ERR value is not an integer or out of
+  range" (HINCRBY: "ERR hash value is not an integer"), as Redis does.
 
 - ZINCRBY on a new key (at every cluster feature level) and ZADD with NX,
   XX, GT or LT on a new key (below level 4) claim the sorted set's type

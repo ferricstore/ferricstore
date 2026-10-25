@@ -72,7 +72,9 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    an existing member or element keeps the TTL instead of dropping it.
   #    Apply reads it in `TypeRegistry.member_expire_at/2` (stores built in
   #    apply set `:level_6_writes?`) and in the state machine's
-  #    `new_member_expire_at/2`.
+  #    `new_member_expire_at/2`. INCR, INCRBY, DECR, DECRBY and HINCRBY take
+  #    only an integer's canonical form as the stored operand, as Redis's
+  #    string2ll does (`ValueCodec.parse_canonical_integer/1`).
   @supported 6
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

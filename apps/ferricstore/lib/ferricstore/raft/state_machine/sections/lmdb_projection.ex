@@ -1305,7 +1305,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
               end
 
             {value, expire_at_ms} ->
-              case coerce_integer(value) do
+              case coerce_incr_integer(state, value) do
                 {:ok, int_val} ->
                   new_val = int_val + delta
 
@@ -1330,6 +1330,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
           _ -> :error
         end
       end
+
+      # An INCR/HINCRBY operand. Redis reads it with string2ll, which takes only
+      # an integer's canonical form ("05", "+5" and "-0" are not integers); from
+      # feature level 6 apply does too, while older releases accept what
+      # Integer.parse/1 does.
+      defp coerce_incr_integer(state, value) when is_binary(value) do
+        if feature_level_6?(state),
+          do: ValueCodec.parse_canonical_integer(value),
+          else: coerce_integer(value)
+      end
+
+      defp coerce_incr_integer(_state, value), do: coerce_integer(value)
 
       # Coerces a value (integer, float, or binary) to integer.
       defp coerce_integer(v) when is_integer(v), do: {:ok, v}

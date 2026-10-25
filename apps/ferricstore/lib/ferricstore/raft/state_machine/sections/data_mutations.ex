@@ -216,7 +216,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             end
 
           {value, expire_at_ms} ->
-            case coerce_integer(value) do
+            case coerce_incr_integer(state, value) do
               {:ok, cur} ->
                 new_val = cur + delta
 
