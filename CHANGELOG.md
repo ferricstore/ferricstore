@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.9 - 2026-10-25
+
 - A node that last stopped on a release before 0.12.7 could not start again
   once a shard held a promoted collection (a hash, set or sorted set past the
   promotion threshold): neither on its own release nor on 0.12.7 or 0.12.8.
