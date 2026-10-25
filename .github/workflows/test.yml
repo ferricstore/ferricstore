@@ -564,15 +564,19 @@ jobs:
           path: test-results/
           retention-days: 14
 
+  # GitHub runs five macOS jobs at a time for this repository, so the server
+  # suite runs in the shorter WARaft shard rather than waiting for a sixth.
   test-waraft-macos:
-    name: "WARaft backend tests (macos ${{ matrix.part }}/2)"
+    name: "${{ matrix.name }}"
     strategy:
       fail-fast: false
       matrix:
         include:
           - part: 1
+            name: "WARaft backend and server tests (macos 1/2)"
             file: apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs
           - part: 2
+            name: "WARaft backend tests (macos 2/2)"
             file: apps/ferricstore/test/ferricstore/raft/waraft_backend_part2_test.exs
     needs: build-macos
     runs-on: macos-latest
@@ -583,6 +587,10 @@ jobs:
       - name: Run WARaft backend tests
         timeout-minutes: 65
         run: mix test ${{ matrix.file }} --timeout 30000
+      - name: Run ferricstore_server tests
+        if: matrix.part == 1 && (success() || failure())
+        timeout-minutes: 45
+        run: mix test apps/ferricstore_server/test --timeout 30000
       - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
@@ -610,25 +618,6 @@ jobs:
         continue-on-error: true
         with:
           name: test-results-server-ubuntu
-          path: test-results/
-          retention-days: 14
-
-  test-server-macos:
-    name: "Server tests (macos)"
-    needs: build-macos
-    runs-on: macos-latest
-    timeout-minutes: 50
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/restore-build
-      - name: Run ferricstore_server tests
-        timeout-minutes: 45
-        run: mix test apps/ferricstore_server/test --timeout 30000
-      - uses: actions/upload-artifact@v7
-        if: always()
-        continue-on-error: true
-        with:
-          name: test-results-server-macos
           path: test-results/
           retention-days: 14
 
