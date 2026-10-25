@@ -277,6 +277,30 @@ defmodule Ferricstore.Store.TypeRegistry do
     Ops.compound_delete(store, redis_key, CompoundKey.type_key(redis_key))
   end
 
+  @doc """
+  Gives back a type marker this command claimed, after the write meant to
+  follow it failed (`reason`) or wrote nothing.
+
+  On the instance the claim and that write are separate replicated writes. A
+  timed-out write may have committed, and other clients may have written
+  members under the marker since, so the marker goes only when the write did
+  not time out and the collection is still empty; otherwise it stays, and a
+  marker left over an empty collection is removed by the next type lookup.
+  Elsewhere (in apply) the claim is simply rolled back.
+  """
+  @spec release_created_type(binary(), atom(), map(), term()) :: :ok | {:error, term()}
+  def release_created_type(redis_key, type, %FerricStore.Instance{} = ctx, reason) do
+    if reason != Ferricstore.ErrorReasons.write_timeout_unknown() and
+         live_compound_type?(redis_key, CompoundKey.encode_type(type), ctx) == false do
+      _ = rollback_created_type(redis_key, ctx)
+    end
+
+    :ok
+  end
+
+  def release_created_type(redis_key, _type, store, _reason),
+    do: rollback_created_type(redis_key, store)
+
   defp cleanup_promoted_collection(redis_key, store) do
     case Ops.compound_get(store, redis_key, Promotion.marker_key(redis_key)) do
       nil ->

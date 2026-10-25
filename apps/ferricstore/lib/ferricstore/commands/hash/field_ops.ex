@@ -1,7 +1,7 @@
 defmodule Ferricstore.Commands.Hash.FieldOps do
   @moduledoc false
 
-  alias Ferricstore.{CommandTime, ErrorReasons}
+  alias Ferricstore.CommandTime
   alias Ferricstore.Store.{CompoundKey, Ops, ReadResult, TypeRegistry}
 
   @spec set_pairs([binary()], binary(), map(), term()) :: non_neg_integer() | {:error, term()}
@@ -454,21 +454,8 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
     end
   end
 
-  # On the instance the marker claim and the field write are separate
-  # replicated writes. A timed-out write may have committed, and other clients
-  # may have written fields under the marker since, so the marker goes only
-  # when the write failed outright and the hash is still empty.
-  defp rollback_new_hash_type_marker(key, %FerricStore.Instance{} = ctx, {:ok, :created}, error) do
-    if error != ErrorReasons.write_timeout_unknown() and
-         Ops.compound_count(ctx, key, CompoundKey.hash_prefix(key)) == 0 do
-      _ = TypeRegistry.rollback_created_type(key, ctx)
-    end
-
-    error
-  end
-
   defp rollback_new_hash_type_marker(key, store, {:ok, :created}, write_error) do
-    case TypeRegistry.rollback_created_type(key, store) do
+    case TypeRegistry.release_created_type(key, :hash, store, write_error) do
       :ok ->
         write_error
 
