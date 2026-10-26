@@ -4,6 +4,14 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A start after a stop or crash that left a Flow's retention delete
+  unflushed to the LMDB mirror refused to open the shard
+  (`flow_lmdb_reconcile_unhealthy`, `cold_read_errors: 1`). Replaying the
+  delete recreates its tombstone keydir row, and the startup check of terminal
+  Flows read that row as a record, found no source and failed. It now reads a
+  tombstone as a deleted Flow. Seen on 0.12.12 after a stop whose shard close
+  ran into the 30 s shutdown limit.
+
 ## 0.12.13 - 2026-10-26
 
 - Upgrading: raise the cluster to feature level 8 once every node runs this

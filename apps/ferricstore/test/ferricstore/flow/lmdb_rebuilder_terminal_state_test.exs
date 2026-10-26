@@ -50,6 +50,33 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalStateTest do
     refute_receive {:durable_state_keys, _other}
   end
 
+  # Retention cleanup deletes a Flow by writing a tombstone row, which stays in
+  # the keydir until the LMDB writer has flushed the delete. A start that
+  # replays the delete rebuilds the tombstone before any writer runs, and it
+  # once read it as a cold record, found no source and refused to open.
+  test "terminal state resolution reads a delete tombstone as a deleted Flow" do
+    keydir = :ets.new(:terminal_state_tombstone_keydir, [:set])
+    flow = record("deleted-terminal", "partition-deleted", "completed")
+    state_key = Keys.state_key(flow.id, flow.partition_key)
+
+    true =
+      :ets.insert(keydir, [
+        {state_key, nil, 0, :flow_state_deleted, :deleted, 0, 0},
+        {Keys.registry_key(flow.id, flow.partition_key), "owner", 0, 0, :hot, 0, 5}
+      ])
+
+    assert {:ok, %{^state_key => :missing}} =
+             TerminalState.statuses_with_reader(
+               keydir,
+               [state_key],
+               fn entry -> flunk("a tombstone has no record to read: #{inspect(entry)}") end,
+               fn
+                 [] -> {:ok, []}
+                 keys -> flunk("the LMDB copy of a deleted Flow is stale: #{inspect(keys)}")
+               end
+             )
+  end
+
   test "terminal state resolution fails closed when the authoritative keydir disappears" do
     keydir = :ets.new(:terminal_state_missing_keydir, [:set])
     state_key = Keys.state_key("flow", "partition")
