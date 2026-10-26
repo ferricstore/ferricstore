@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Retention cleanup on a shard whose Flow LMDB mirror was missing reported
+  more work on every pass without removing anything, so a caller following
+  its continuation never finished and the shard's expired Flows waited
+  behind it. Retention removes a terminal Flow only after reading its whole
+  history from the mirror; a shard without one now defers its terminal
+  cleanup, as it already did while mirror writes were pending.
+
 - A stop no longer turns into a crash for a busy shard. WARaft kills a
   storage process whose close runs past 30 s, and close could wait longer
   than that for Flow history and cache compaction (10 s per history shard,
