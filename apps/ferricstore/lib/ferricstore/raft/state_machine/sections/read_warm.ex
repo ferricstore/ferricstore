@@ -733,59 +733,63 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         |> zset_tree_wrap_store_reads(state)
       end
 
-      # A tree-encoded sorted set's member reads go to its tree.
+      # A tree-encoded sorted set's member reads go to its tree. Only the read
+      # functions the store has are wrapped.
       defp zset_tree_wrap_store_reads(store, state) do
+        Map.merge(store, Map.take(zset_tree_store_reads(store, state), Map.keys(store)))
+      end
+
+      defp zset_tree_store_reads(store, state) do
         %{
-          store
-          | compound_scan: fn redis_key, prefix ->
-              zset_tree_prefix_read(
-                state,
-                redis_key,
-                prefix,
-                &Ferricstore.Store.ZSetTree.members/1,
-                fn ->
-                  store.compound_scan.(redis_key, prefix)
-                end
-              )
-            end,
-            compound_scan_slice: fn redis_key, prefix, start, count, total ->
-              zset_tree_prefix_read(
-                state,
-                redis_key,
-                prefix,
-                &Ferricstore.Store.ZSetTree.member_slice(&1, start, count),
-                fn -> store.compound_scan_slice.(redis_key, prefix, start, count, total) end
-              )
-            end,
-            compound_scan_page: fn redis_key, prefix, cursor, count, match_pattern, fields_only ->
-              zset_tree_prefix_read(
-                state,
-                redis_key,
-                prefix,
-                &zset_tree_scan_page(&1, cursor, count, match_pattern, fields_only),
-                fn ->
-                  store.compound_scan_page.(
-                    redis_key,
-                    prefix,
-                    cursor,
-                    count,
-                    match_pattern,
-                    fields_only
-                  )
-                end
-              )
-            end,
-            compound_count: fn redis_key, prefix ->
-              zset_tree_prefix_read(
-                state,
-                redis_key,
-                prefix,
-                &Ferricstore.Store.ZSetTree.card/1,
-                fn ->
-                  store.compound_count.(redis_key, prefix)
-                end
-              )
-            end
+          compound_scan: fn redis_key, prefix ->
+            zset_tree_prefix_read(
+              state,
+              redis_key,
+              prefix,
+              &Ferricstore.Store.ZSetTree.members/1,
+              fn ->
+                store.compound_scan.(redis_key, prefix)
+              end
+            )
+          end,
+          compound_scan_slice: fn redis_key, prefix, start, count, total ->
+            zset_tree_prefix_read(
+              state,
+              redis_key,
+              prefix,
+              &Ferricstore.Store.ZSetTree.member_slice(&1, start, count),
+              fn -> store.compound_scan_slice.(redis_key, prefix, start, count, total) end
+            )
+          end,
+          compound_scan_page: fn redis_key, prefix, cursor, count, match_pattern, fields_only ->
+            zset_tree_prefix_read(
+              state,
+              redis_key,
+              prefix,
+              &zset_tree_scan_page(&1, cursor, count, match_pattern, fields_only),
+              fn ->
+                store.compound_scan_page.(
+                  redis_key,
+                  prefix,
+                  cursor,
+                  count,
+                  match_pattern,
+                  fields_only
+                )
+              end
+            )
+          end,
+          compound_count: fn redis_key, prefix ->
+            zset_tree_prefix_read(
+              state,
+              redis_key,
+              prefix,
+              &Ferricstore.Store.ZSetTree.card/1,
+              fn ->
+                store.compound_count.(redis_key, prefix)
+              end
+            )
+          end
         }
       end
 

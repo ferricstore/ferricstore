@@ -1068,6 +1068,12 @@ defmodule Ferricstore.Bitcask.NIF do
           | {:error, binary()}
   def zset_tree_recover(_path), do: :erlang.nif_error(:nif_not_loaded)
 
+  # Cuts the file back to before a token (a failed transaction's first write).
+  @spec zset_tree_rewind(binary(), non_neg_integer(), non_neg_integer()) ::
+          :ok | {:error, binary()}
+  def zset_tree_rewind(_path, _token_index, _token_ordinal),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec zset_tree_sync(binary()) :: :ok | {:error, binary()}
   def zset_tree_sync(_path), do: :erlang.nif_error(:nif_not_loaded)
 

@@ -1834,9 +1834,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
       defp zset_tree_path(ctx, redis_key) when is_binary(redis_key) do
         marker_key = Promotion.marker_key(redis_key)
 
-        # A marker this entry wrote or deleted is staged, not yet in the keydir.
+        # A marker this entry (or its MULTI) wrote or deleted is staged, not yet
+        # in the keydir.
+        staged =
+          if MapSet.member?(Process.get(:tx_deleted_keys, MapSet.new()), marker_key),
+            do: :deleted,
+            else:
+              Map.get(Process.get(:tx_pending_values, %{}), marker_key) ||
+                Map.get(Process.get(:sm_pending_values, %{}), marker_key)
+
         marker =
-          case Map.get(Process.get(:sm_pending_values, %{}), marker_key) do
+          case staged do
             {value, _expire_at_ms} when is_binary(value) -> value
             :deleted -> nil
             _not_staged -> cross_shard_ets_read(promoted_marker_ctx(ctx), marker_key)

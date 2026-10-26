@@ -825,3 +825,20 @@ fn negative_zero_keeps_its_sign_and_sorts_as_zero() {
     .unwrap();
     assert_eq!(zeros, 2);
 }
+
+/// A transaction that fails after writing cuts the tree back to before its
+/// first write.
+#[test]
+fn rewind_to_cuts_back_to_before_a_token() {
+    let (_dir, path) = temp_tree();
+    apply(&path, Token::new(3, 1), &[add("a", 1.0)]).unwrap();
+    apply(&path, Token::new(4, 1), &[add("b", 2.0)]).unwrap();
+    apply(&path, Token::new(4, 2), &[add("c", 3.0)]).unwrap();
+    rewind_to(&path, Token::new(4, 1)).unwrap();
+    assert_eq!(all_members(&path), vec![(b"a".to_vec(), 1.0)]);
+    // Nothing at or past the token: no change.
+    rewind_to(&path, Token::new(9, 1)).unwrap();
+    assert_eq!(all_members(&path).len(), 1);
+    // A missing file is fine.
+    rewind_to(&path.with_extension("missing"), Token::new(1, 1)).unwrap();
+}

@@ -86,13 +86,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
       # Member writes of a tree-encoded set, after converting the set when these
       # writes take it past the threshold: {:tree, path, member_keys, other_keys},
       # :keydir, or an error.
-      defp zset_tree_write_split(state, redis_key, compound_keys) do
+      defp zset_tree_write_split(state, redis_key, compound_keys, staging \\ nil) do
         case zset_tree_route(state, redis_key, compound_keys) do
           {:tree, _path, _members, _others} = route ->
             route
 
           :keydir ->
-            case maybe_convert_zset_to_tree(state, redis_key, compound_keys) do
+            case maybe_convert_zset_to_tree(state, redis_key, compound_keys, staging) do
               {:tree, path} ->
                 {members, others} =
                   Enum.split_with(
@@ -110,6 +110,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
 
       defp zset_tree_write(_state, path, ops) do
         with {:ok, index, ordinal} <- next_zset_tree_token(),
+             :ok <- record_zset_tree_tx_write(path, {index, ordinal}),
              {:ok, outcomes} <-
                PromotedFileSync.track_write(path, fn ->
                  ZSetTree.apply_ops(path, {index, ordinal}, ops)
@@ -120,6 +121,37 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
             record_state_write_failure({:zset_tree_write_failed, reason})
             {:error, {:zset_tree_write_failed, reason}}
         end
+      end
+
+      # Inside MULTI a tree write is applied at once; a transaction that fails
+      # cuts each tree it wrote back to before its first write.
+      defp record_zset_tree_tx_write(path, token) do
+        case Process.get(:sm_zset_tree_tx_writes) do
+          writes when is_map(writes) ->
+            Process.put(:sm_zset_tree_tx_writes, Map.put_new(writes, path, token))
+            :ok
+
+          _not_in_transaction ->
+            :ok
+        end
+      end
+
+      defp begin_zset_tree_tx_writes, do: Process.put(:sm_zset_tree_tx_writes, %{})
+      defp end_zset_tree_tx_writes, do: Process.delete(:sm_zset_tree_tx_writes)
+
+      defp rollback_zset_tree_tx_writes do
+        writes = Process.get(:sm_zset_tree_tx_writes, %{})
+        Process.put(:sm_zset_tree_tx_writes, %{})
+
+        Enum.each(writes, fn {path, {index, ordinal}} ->
+          case Ferricstore.Bitcask.NIF.zset_tree_rewind(path, index, ordinal) do
+            :ok ->
+              :ok
+
+            {:error, reason} ->
+              raise "sorted set tree #{path} could not undo a failed transaction: #{inspect(reason)}"
+          end
+        end)
       end
 
       defp zset_tree_put_entries(state, redis_key, path, entries) do
@@ -177,7 +209,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
       # that would take the set past the promotion threshold first moves the set
       # into its tree, then goes to the tree. Returns {:tree, path} when the
       # writes now belong in the tree, :keydir otherwise.
-      defp maybe_convert_zset_to_tree(state, redis_key, compound_keys) do
+      defp maybe_convert_zset_to_tree(state, redis_key, compound_keys, staging) do
         threshold = Map.fetch!(state, :apply_context).promotion_threshold
         prefix = CompoundKey.zset_prefix(redis_key)
 
@@ -191,7 +223,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
              nil <- promoted_compound_path(state, redis_key, prefix),
              {:ok, members} <- zset_members_with_pending(state, prefix),
              true <- map_size(Map.merge(members, Map.new(new_members, &{&1, nil}))) > threshold do
-          convert_zset_to_tree(state, redis_key, prefix, members)
+          convert_zset_to_tree(
+            state,
+            redis_key,
+            prefix,
+            members,
+            staging || zset_tree_apply_staging(state, redis_key, prefix)
+          )
         else
           {:error, _reason} = error -> error
           _not_converting -> :keydir
@@ -211,6 +249,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
 
             members =
               Process.get(:sm_pending_values, %{})
+              |> Map.merge(Process.get(:tx_pending_values, %{}))
+              |> Map.merge(Map.new(Process.get(:tx_deleted_keys, MapSet.new()), &{&1, :deleted}))
               |> Enum.reduce(Map.new(entries), fn
                 {<<^prefix::binary-size(^prefix_size), member::binary>>, :deleted}, acc ->
                   Map.delete(acc, member)
@@ -231,7 +271,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
         end
       end
 
-      defp convert_zset_to_tree(state, redis_key, prefix, members) do
+      # How a conversion stages its keydir changes: through the apply primitives,
+      # or MULTI's own staging, so they publish after its earlier writes.
+      defp zset_tree_apply_staging(state, redis_key, prefix) do
+        %{
+          put_marker: fn key, value -> do_put_value_validated(state, key, value, 0) end,
+          drop_members: fn entries ->
+            zset_tree_drop_keydir_members(state, redis_key, prefix, entries)
+          end
+        }
+      end
+
+      defp convert_zset_to_tree(state, redis_key, prefix, members, staging) do
         entries = Enum.sort(members)
 
         with {:ok, index, ordinal} <- zset_tree_conversion_token(),
@@ -247,13 +298,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
                # Readers check the marker first: once it names the tree, the
                # members in the keydir are no longer read.
                :ok <-
-                 do_put_value_validated(
-                   state,
+                 staging.put_marker.(
                    Promotion.marker_key(redis_key),
-                   ZSetTree.marker_value(generation),
-                   0
+                   ZSetTree.marker_value(generation)
                  ),
-               :ok <- zset_tree_drop_keydir_members(state, redis_key, prefix, entries) do
+               :ok <- staging.drop_members.(entries) do
             zset_index_clear(state, redis_key)
             {:tree, path}
           else
@@ -304,6 +353,267 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
           {:ok, ops} -> {:ok, Enum.reverse(ops)}
           error -> error
         end
+      end
+
+      # --- MULTI's store ---
+
+      # The local transaction store with a tree-encoded set's members routed to
+      # its tree. A store routed across shards refuses them: its writes would
+      # carry another shard's Raft positions.
+      defp zset_tree_wrap_tx_store(
+             store,
+             anchor_state,
+             ctx_for_key,
+             put_in_ctx,
+             delete_in_ctx,
+             :local
+           ) do
+        staging = fn redis_key, prefix ->
+          ctx = ctx_for_key.(redis_key)
+
+          %{
+            put_marker: fn key, value -> put_in_ctx.(ctx, key, value, 0) end,
+            delete_marker: fn key -> delete_in_ctx.(ctx, key) end,
+            drop_members: fn entries ->
+              Enum.each(entries, fn {member, _score} ->
+                :ok = delete_in_ctx.(ctx, prefix <> member)
+              end)
+            end
+          }
+        end
+
+        tree_store = zset_tree_store_fields(anchor_state)
+
+        store
+        |> Map.merge(tree_store, fn _key, keydir_fun, tree_fun ->
+          zset_tree_or(anchor_state, keydir_fun, tree_fun)
+        end)
+        |> zset_tree_wrap_store_reads(anchor_state)
+        |> zset_tree_wrap_member_reads(anchor_state)
+        |> zset_tree_wrap_member_writes(anchor_state, staging)
+      end
+
+      defp zset_tree_wrap_tx_store(store, anchor_state, _ctx_for_key, _put, _delete, :routed) do
+        refuse = fn redis_key ->
+          if is_binary(redis_key) and zset_tree_path(anchor_state, redis_key) do
+            throw({:transaction_store_failure, :zset_tree_cross_shard_unsupported})
+          end
+        end
+
+        Map.new(store, fn
+          {name, fun} when is_function(fun) ->
+            if String.starts_with?(Atom.to_string(name), ["compound_", "zset_"]),
+              do: {name, zset_tree_refusing(fun, refuse)},
+              else: {name, fun}
+
+          other ->
+            other
+        end)
+      end
+
+      defp zset_tree_refusing(fun, refuse) do
+        case :erlang.fun_info(fun, :arity) do
+          {:arity, 1} ->
+            fn key ->
+              refuse.(key)
+              fun.(key)
+            end
+
+          {:arity, 2} ->
+            fn key, a ->
+              refuse.(key)
+              fun.(key, a)
+            end
+
+          {:arity, 3} ->
+            fn key, a, b ->
+              refuse.(key)
+              fun.(key, a, b)
+            end
+
+          {:arity, 4} ->
+            fn key, a, b, c ->
+              refuse.(key)
+              fun.(key, a, b, c)
+            end
+
+          {:arity, 5} ->
+            fn key, a, b, c, d ->
+              refuse.(key)
+              fun.(key, a, b, c, d)
+            end
+
+          {:arity, 6} ->
+            fn key, a, b, c, d, e ->
+              refuse.(key)
+              fun.(key, a, b, c, d, e)
+            end
+
+          _other ->
+            fun
+        end
+      end
+
+      # Keeps the store's own function for a key that is not tree-encoded.
+      defp zset_tree_or(_state, keydir_fun, tree_fun) do
+        case :erlang.fun_info(tree_fun, :arity) do
+          {:arity, 3} ->
+            fn redis_key, a, b ->
+              with :unavailable <- tree_fun.(redis_key, a, b), do: keydir_fun.(redis_key, a, b)
+            end
+
+          {:arity, 4} ->
+            fn redis_key, a, b, c ->
+              with :unavailable <- tree_fun.(redis_key, a, b, c),
+                   do: keydir_fun.(redis_key, a, b, c)
+            end
+
+          {:arity, 6} ->
+            fn redis_key, a, b, c, d, e ->
+              with :unavailable <- tree_fun.(redis_key, a, b, c, d, e),
+                   do: keydir_fun.(redis_key, a, b, c, d, e)
+            end
+        end
+      end
+
+      defp zset_tree_wrap_member_reads(store, state) do
+        member_score = fn path, redis_key, compound_key ->
+          {:ok, member} = ZSetTree.member(redis_key, compound_key)
+
+          case ZSetTree.score(path, member) do
+            {:ok, score} ->
+              score
+
+            {:error, reason} ->
+              throw({:transaction_store_failure, {:zset_tree_read_failed, reason}})
+          end
+        end
+
+        meta = fn
+          nil -> nil
+          score -> {score, 0}
+        end
+
+        %{
+          store
+          | compound_get: fn redis_key, compound_key ->
+              case zset_tree_route(state, redis_key, [compound_key]) do
+                {:tree, path, [_], []} -> member_score.(path, redis_key, compound_key)
+                :keydir -> store.compound_get.(redis_key, compound_key)
+              end
+            end,
+            compound_get_meta: fn redis_key, compound_key ->
+              case zset_tree_route(state, redis_key, [compound_key]) do
+                {:tree, path, [_], []} -> meta.(member_score.(path, redis_key, compound_key))
+                :keydir -> store.compound_get_meta.(redis_key, compound_key)
+              end
+            end,
+            compound_batch_get: fn redis_key, compound_keys ->
+              case zset_tree_route(state, redis_key, compound_keys) do
+                {:tree, path, _members, _others} ->
+                  Enum.map(compound_keys, fn key ->
+                    if match?({:ok, _}, ZSetTree.member(redis_key, key)),
+                      do: member_score.(path, redis_key, key),
+                      else: store.compound_get.(redis_key, key)
+                  end)
+
+                :keydir ->
+                  store.compound_batch_get.(redis_key, compound_keys)
+              end
+            end,
+            compound_batch_get_meta: fn redis_key, compound_keys ->
+              case zset_tree_route(state, redis_key, compound_keys) do
+                {:tree, path, _members, _others} ->
+                  Enum.map(compound_keys, fn key ->
+                    if match?({:ok, _}, ZSetTree.member(redis_key, key)),
+                      do: meta.(member_score.(path, redis_key, key)),
+                      else: store.compound_get_meta.(redis_key, key)
+                  end)
+
+                :keydir ->
+                  store.compound_batch_get_meta.(redis_key, compound_keys)
+              end
+            end
+        }
+      end
+
+      defp zset_tree_wrap_member_writes(store, state, staging) do
+        prefix_staging = fn redis_key ->
+          staging.(redis_key, CompoundKey.zset_prefix(redis_key))
+        end
+
+        unwrap = fn
+          :ok -> :ok
+          {:error, reason} -> throw({:transaction_store_failure, reason})
+        end
+
+        put_split = fn redis_key, entries, keydir_put ->
+          keys = Enum.map(entries, &elem(&1, 0))
+
+          case zset_tree_write_split(state, redis_key, keys, prefix_staging.(redis_key)) do
+            {:tree, path, members, _others} ->
+              member_keys = MapSet.new(members)
+
+              {tree_entries, rest} =
+                Enum.split_with(entries, &MapSet.member?(member_keys, elem(&1, 0)))
+
+              unwrap.(zset_tree_put_entries(state, redis_key, path, tree_entries))
+              if rest == [], do: :ok, else: keydir_put.(rest)
+
+            {:error, reason} ->
+              throw({:transaction_store_failure, reason})
+
+            :keydir ->
+              keydir_put.(entries)
+          end
+        end
+
+        delete_split = fn redis_key, compound_keys, keydir_delete ->
+          case zset_tree_route(state, redis_key, compound_keys) do
+            {:tree, path, members, others} ->
+              unwrap.(zset_tree_delete_keys(state, redis_key, path, members))
+              if others == [], do: :ok, else: keydir_delete.(others)
+
+            :keydir ->
+              keydir_delete.(compound_keys)
+          end
+        end
+
+        %{
+          store
+          | compound_put: fn redis_key, compound_key, value, expire_at_ms ->
+              put_split.(redis_key, [{compound_key, value, expire_at_ms}], fn [{key, v, exp}] ->
+                store.compound_put.(redis_key, key, v, exp)
+              end)
+            end,
+            compound_batch_put: fn redis_key, entries ->
+              put_split.(redis_key, entries, &store.compound_batch_put.(redis_key, &1))
+            end,
+            compound_delete: fn redis_key, compound_key ->
+              delete_split.(redis_key, [compound_key], fn [key] ->
+                store.compound_delete.(redis_key, key)
+              end)
+            end,
+            compound_batch_delete: fn redis_key, compound_keys ->
+              delete_split.(
+                redis_key,
+                compound_keys,
+                &store.compound_batch_delete.(redis_key, &1)
+              )
+            end,
+            compound_delete_prefix: fn redis_key, prefix ->
+              case ZSetTree.member_prefix?(redis_key, prefix) and zset_tree_path(state, redis_key) do
+                path when is_binary(path) ->
+                  ctx_staging = prefix_staging.(redis_key)
+                  :ok = ctx_staging.delete_marker.(Promotion.marker_key(redis_key))
+                  record_zset_tree_removal(path)
+                  :ok
+
+                _keydir ->
+                  store.compound_delete_prefix.(redis_key, prefix)
+              end
+            end
+        }
       end
 
       # --- Reads, for commands run inside apply ---

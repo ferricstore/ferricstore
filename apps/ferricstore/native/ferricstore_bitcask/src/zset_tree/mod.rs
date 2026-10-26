@@ -79,6 +79,20 @@ pub fn apply(path: &Path, token: Token, ops: &[Op]) -> Result<Applied> {
     Ok(Applied { outcomes, state })
 }
 
+/// Cuts the file back to the last frame before `token` (a failed transaction's
+/// first write). A file with nothing at or past the token, or no file, is left
+/// as it is.
+pub fn rewind_to(path: &Path, token: Token) -> Result<()> {
+    let Some(file) = TreeFile::open_existing(path)? else {
+        return Ok(());
+    };
+    let state = file.state()?;
+    if token <= state.token {
+        maintain::rewind(&file, state, token)?;
+    }
+    Ok(())
+}
+
 /// Runs `f` on the latest tree; `None` when the file does not exist.
 pub fn read<R>(path: &Path, f: impl FnOnce(&Tx<'_>) -> Result<R>) -> Result<Option<R>> {
     let Some(file) = TreeFile::open_read(path)? else {

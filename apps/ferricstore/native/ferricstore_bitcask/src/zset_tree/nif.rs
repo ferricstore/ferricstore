@@ -439,6 +439,20 @@ pub fn zset_tree_recover(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
 
 #[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
+pub fn zset_tree_rewind(
+    env: Env<'_>,
+    path: String,
+    token_index: u64,
+    token_ordinal: u64,
+) -> NifResult<Term<'_>> {
+    match super::rewind_to(Path::new(&path), Token::new(token_index, token_ordinal)) {
+        Ok(()) => Ok(atoms::ok().encode(env)),
+        Err(reason) => error(env, &reason),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
 pub fn zset_tree_sync(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
     match super::sync(Path::new(&path)) {
         Ok(_) => Ok(atoms::ok().encode(env)),

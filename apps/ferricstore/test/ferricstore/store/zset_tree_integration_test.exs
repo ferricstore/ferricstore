@@ -9,7 +9,7 @@ defmodule Ferricstore.Store.ZSetTreeIntegrationTest do
   @moduletag timeout: 900_000
 
   alias Ferricstore.Cluster.FeatureLevel
-  alias Ferricstore.Commands.Dispatcher
+  alias Ferricstore.Commands.{Dispatcher, PreparedCommand}
   alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.Store.{CompoundKey, Promotion, Router}
   alias Ferricstore.Test.ShardHelpers
@@ -87,6 +87,150 @@ defmodule Ferricstore.Store.ZSetTreeIntegrationTest do
     assert Enum.any?(seeds, &(tree_files(ctx, "tree:#{&1}") != []))
   end
 
+  test "MULTI replies match a set promoted before level 9", %{ctx: ctx} do
+    seeds = [5, 61]
+
+    seed_set = fn key ->
+      pairs =
+        Enum.flat_map(1..30, fn i -> ["#{i - 15}", "m#{String.pad_leading("#{i}", 2, "0")}"] end)
+
+      assert 30 = cmd(ctx, "ZADD", [key | pairs])
+    end
+
+    legacy =
+      for seed <- seeds do
+        seed_set.("{multi-legacy:#{seed}}")
+        run_random_multi("{multi-legacy:#{seed}}", seed)
+      end
+
+    raise_to_9!(ctx)
+
+    tree =
+      for seed <- seeds do
+        seed_set.("{multi-tree:#{seed}}")
+        assert [_file] = tree_files(ctx, "{multi-tree:#{seed}}")
+        run_random_multi("{multi-tree:#{seed}}", seed)
+      end
+
+    for seed <- seeds do
+      assert cmd(ctx, "ZRANGE", ["{multi-tree:#{seed}}", "0", "-1", "WITHSCORES"]) ==
+               cmd(ctx, "ZRANGE", ["{multi-legacy:#{seed}}", "0", "-1", "WITHSCORES"])
+
+      if tree_files(ctx, "{multi-tree:#{seed}}") != [],
+        do: assert([] = member_rows(ctx, "{multi-tree:#{seed}}"))
+    end
+
+    assert Enum.any?(seeds, &(tree_files(ctx, "{multi-tree:#{&1}}") != []))
+
+    for {{legacy_run, tree_run}, seed} <- Enum.zip(Enum.zip(legacy, tree), seeds) do
+      Enum.zip(legacy_run, tree_run)
+      |> Enum.with_index()
+      |> Enum.each(fn {{{commands, expected}, {_commands, got}}, step} ->
+        assert got == expected,
+               "seed #{seed} exec #{step}: #{inspect(commands)}\nlegacy: #{inspect(expected)}\ntree:   #{inspect(got)}"
+      end)
+    end
+  end
+
+  test "a set that grows past the threshold inside MULTI moves into its tree", %{ctx: ctx} do
+    raise_to_9!(ctx)
+    pairs = Enum.flat_map(1..40, fn i -> ["#{i}", "m#{String.pad_leading("#{i}", 3, "0")}"] end)
+
+    assert %{results: [40, 40, ["m040"]], prepare_errors: []} =
+             exec([["ZADD", "{mz}" | pairs], ["ZCARD", "{mz}"], ["ZRANGE", "{mz}", "-1", "-1"]])
+
+    assert [_file] = tree_files(ctx, "{mz}")
+    assert [] = member_rows(ctx, "{mz}")
+    assert 39 = cmd(ctx, "ZRANK", ["{mz}", "m040"])
+  end
+
+  # Key commands on a tree-encoded set answer as they do for a set promoted
+  # before level 9.
+  test "key commands match a set promoted before level 9", %{ctx: ctx} do
+    scenario = fn key ->
+      pairs = Enum.flat_map(1..30, fn i -> ["#{i}", "m#{String.pad_leading("#{i}", 2, "0")}"] end)
+      other = key <> ":copy"
+      renamed = key <> ":renamed"
+
+      [
+        cmd(ctx, "ZADD", [key | pairs]),
+        cmd(ctx, "TYPE", [key]),
+        cmd(ctx, "EXISTS", [key]),
+        cmd(ctx, "OBJECT", ["ENCODING", key]),
+        cmd(ctx, "COPY", [key, other]),
+        cmd(ctx, "ZRANGE", [other, "0", "4", "WITHSCORES"]),
+        cmd(ctx, "ZCARD", [other]),
+        cmd(ctx, "RENAME", [other, renamed]),
+        cmd(ctx, "ZCARD", [renamed]),
+        cmd(ctx, "ZCARD", [other]),
+        cmd(ctx, "ZRANK", [renamed, "m30"]),
+        cmd(ctx, "ZADD", [renamed, "100", "new"]),
+        cmd(ctx, "ZCARD", [key]),
+        cmd(ctx, "PEXPIRE", [key, "150"]),
+        Process.sleep(300),
+        cmd(ctx, "ZCARD", [key]),
+        cmd(ctx, "EXISTS", [key]),
+        cmd(ctx, "ZADD", [key, "1", "fresh"]),
+        cmd(ctx, "ZRANGE", [key, "0", "-1"]),
+        cmd(ctx, "ZRANDMEMBER", [renamed, "-3"]) |> length(),
+        cmd(ctx, "DEL", [renamed]),
+        cmd(ctx, "ZCARD", [renamed])
+      ]
+    end
+
+    legacy = scenario.("{keys-legacy}")
+    raise_to_9!(ctx)
+    tree = scenario.("{keys-tree}")
+
+    assert tree == legacy
+  end
+
+  test "GEO commands match a set promoted before level 9", %{ctx: ctx} do
+    scenario = fn key ->
+      places =
+        for i <- 1..25,
+            do: ["#{13 + i / 100}", "#{52 + i / 100}", "p#{String.pad_leading("#{i}", 2, "0")}"]
+
+      [
+        cmd(ctx, "GEOADD", [key | List.flatten(places)]),
+        cmd(ctx, "GEOPOS", [key, "p01", "p25", "missing"]),
+        cmd(ctx, "GEODIST", [key, "p01", "p25", "km"]),
+        cmd(ctx, "GEOHASH", [key, "p10"]),
+        cmd(ctx, "GEOSEARCH", [
+          key,
+          "FROMMEMBER",
+          "p05",
+          "BYRADIUS",
+          "20",
+          "km",
+          "ASC",
+          "COUNT",
+          "5"
+        ]),
+        cmd(ctx, "GEOSEARCH", [
+          key,
+          "FROMLONLAT",
+          "13.1",
+          "52.1",
+          "BYBOX",
+          "40",
+          "40",
+          "km",
+          "DESC",
+          "WITHDIST"
+        ]),
+        cmd(ctx, "ZCARD", [key])
+      ]
+    end
+
+    legacy = scenario.("{geo-legacy}")
+    raise_to_9!(ctx)
+    tree = scenario.("{geo-tree}")
+
+    assert tree == legacy
+    assert [_file] = tree_files(ctx, "{geo-tree}")
+  end
+
   test "a tree-encoded set survives a restart", %{ctx: ctx} do
     raise_to_9!(ctx)
     pairs = Enum.flat_map(1..200, fn i -> ["#{rem(i * 7, 50)}", "m#{i}"] end)
@@ -131,6 +275,43 @@ defmodule Ferricstore.Store.ZSetTreeIntegrationTest do
     :rand.seed(:exsss, {seed, seed, seed})
     commands = for _ <- 1..500, do: random_command(key)
     for command <- commands, do: {command, run(ctx, command)}
+  end
+
+  # Random commands in MULTI blocks of one to eight.
+  defp run_random_multi(key, seed) do
+    :rand.seed(:exsss, {seed, seed, seed})
+
+    commands =
+      for _ <- 1..400,
+          command = random_command(key),
+          hd(command) != "ZSCAN",
+          do: command
+
+    commands
+    |> chunk_randomly([])
+    |> Enum.map(fn block -> {block, exec(block)} end)
+  end
+
+  # One MULTI/EXEC: a command that does not prepare is reported in place and
+  # left out of the queue.
+  defp exec(block) do
+    prepared = Enum.map(block, fn [name | args] -> PreparedCommand.prepare(name, args) end)
+    queue = for {:ok, command} <- prepared, do: command
+
+    results =
+      case queue do
+        [] -> []
+        _commands -> Ferricstore.Transaction.Coordinator.execute(queue, %{}, nil)
+      end
+
+    %{results: results, prepare_errors: for({:error, reason} <- prepared, do: reason)}
+  end
+
+  defp chunk_randomly([], acc), do: Enum.reverse(acc)
+
+  defp chunk_randomly(commands, acc) do
+    {block, rest} = Enum.split(commands, :rand.uniform(8))
+    chunk_randomly(rest, [block | acc])
   end
 
   defp run(ctx, [name | args]) when name == "ZSCAN" do
