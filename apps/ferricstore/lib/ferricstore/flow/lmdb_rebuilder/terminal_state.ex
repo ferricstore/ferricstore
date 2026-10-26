@@ -49,6 +49,17 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalState do
        )
        when is_binary(state_key) do
     case :ets.lookup(keydir, state_key) do
+      # A delete the LMDB writer has not flushed yet: the Flow is gone, and its
+      # LMDB copy is stale.
+      [{^state_key, nil, 0, :flow_state_deleted, :deleted, _offset, _value_size}] ->
+        collect_hot_statuses(
+          state_keys,
+          keydir,
+          decode_entry_fun,
+          Map.put(statuses, state_key, :missing),
+          missing
+        )
+
       [entry] ->
         with [{_key, _value, _expire_at_ms, record, _locator}] <- decode_entry_fun.(entry),
              {:ok, status} <- authoritative_record_status(record, state_key) do
