@@ -130,6 +130,15 @@ docker run -p 6388:6388 \
   quay.io/ferricstore/ferricstore:0.12.11
 ```
 
+#### Give the Container Time to Stop
+
+A graceful stop closes and syncs every shard. On about 10 GB of data it takes
+15 to 20 seconds, longer than Docker's default 10-second grace period, after
+which Docker kills the process and the next start recovers as it would after a
+crash. Allow two minutes: `docker stop -t 120`, `stop_grace_period: 2m` in
+Compose, or `terminationGracePeriodSeconds: 120` in Kubernetes. The Fargate
+stack already sets `stopTimeout = 120`.
+
 #### Why io_uring Matters
 
 Docker's default seccomp profile blocks the `io_uring_setup`, `io_uring_enter`,
@@ -260,9 +269,10 @@ spec:
   replicas: 3
   template:
     spec:
+      terminationGracePeriodSeconds: 120
       containers:
         - name: ferricstore
-           image: quay.io/ferricstore/ferricstore:0.12.11
+          image: quay.io/ferricstore/ferricstore:0.12.11
           ports:
             - name: native
               containerPort: 6388
