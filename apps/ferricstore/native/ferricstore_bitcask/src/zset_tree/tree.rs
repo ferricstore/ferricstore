@@ -476,6 +476,7 @@ impl<'f> Tx<'f> {
             page_count: pages.len() as u32,
             ops_len: ops.len() as u32,
             token,
+            base: false,
         }
         .encode();
         let mut frame = Vec::with_capacity(

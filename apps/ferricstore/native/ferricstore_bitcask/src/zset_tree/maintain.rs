@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use super::format::{
-    decode_ops, FrameHeader, HeaderSlot, Trailer, FRAME_HEADER_SIZE, HEADER_REGION, INLINE_KEY_MAX,
-    PAGE_SIZE, TRAILER_SIZE,
+    decode_ops, FrameHeader, HeaderSlot, Token, Trailer, FRAME_HEADER_SIZE, HEADER_REGION,
+    INLINE_KEY_MAX, PAGE_SIZE, TRAILER_SIZE,
 };
 use super::node::{decode_node, encode_node, encode_overflow, Branch, Child, Key, Leaf, Node};
 use super::store::{TreeFile, TreeState};
@@ -21,6 +21,46 @@ pub struct Recovery {
 pub struct Compaction {
     pub bytes_before: u64,
     pub bytes_after: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Compacted {
+    Missing,
+    /// Raft could still replay an entry the file holds; the compacted frame
+    /// would leave nothing to rewind to.
+    Uncovered,
+    Done(Compaction),
+}
+
+/// Cuts the file back to the last frame before `token`, so a replayed entry
+/// applies again from the state it first saw. Fails when that would go below
+/// a compacted base.
+pub fn rewind(file: &TreeFile, state: TreeState, token: Token) -> Result<TreeState> {
+    let mut end = state.frame_end;
+    while end > HEADER_REGION {
+        let trailer = file
+            .trailer_ending_at(end)?
+            .ok_or_else(|| "zset tree: rewind met a damaged frame".to_string())?;
+        if trailer.token < token {
+            break;
+        }
+        let header = FrameHeader::decode(&file.read_exact(trailer.frame_start, FRAME_HEADER_SIZE)?)
+            .ok_or_else(|| "zset tree: rewind met a damaged frame".to_string())?;
+        if header.base {
+            return Err(format!(
+                "zset tree: entry {}.{} is older than the compacted file ({}.{})",
+                token.index, token.ordinal, header.token.index, header.token.ordinal
+            ));
+        }
+        end = trailer.frame_start;
+    }
+    file.set_len(end)?;
+    file.write_slot(&HeaderSlot {
+        generation: state.generation + 1,
+        latest_frame_end: end,
+        synced_frame_end: state.synced_frame_end.min(end),
+    })?;
+    file.state()
 }
 
 const READ_CHUNK: usize = 1 << 20;
@@ -141,12 +181,16 @@ fn compacting_path(path: &Path) -> PathBuf {
 
 /// Rewrites the latest tree into a fresh file, pages about 7/8 full, and puts
 /// it in place. Must run where writes to the file run, so none happen
-/// meanwhile. Returns `None` when the file does not exist.
-pub fn compact(path: &Path) -> Result<Option<Compaction>> {
+/// meanwhile, and only once Raft will replay nothing at or below
+/// `covered_index`: a replayed entry could not rewind past the compacted frame.
+pub fn compact(path: &Path, covered_index: u64) -> Result<Compacted> {
     let Some(source) = TreeFile::open_read(path)? else {
-        return Ok(None);
+        return Ok(Compacted::Missing);
     };
     let state = source.state()?;
+    if state.token.index > covered_index {
+        return Ok(Compacted::Uncovered);
+    }
     let target_path = compacting_path(path);
     match crate::path_open::remove_file_nofollow(&target_path) {
         Ok(()) => {}
@@ -166,6 +210,7 @@ pub fn compact(path: &Path) -> Result<Option<Compaction>> {
         page_count,
         ops_len: 0,
         token: state.token,
+        base: true,
     }
     .encode();
     target.write_at(frame_start, &header)?;
@@ -199,7 +244,7 @@ pub fn compact(path: &Path) -> Result<Option<Compaction>> {
             .and_then(|dir| dir.sync_all())
             .map_err(|error| format!("zset tree: sync directory: {error}"))?;
     }
-    Ok(Some(Compaction {
+    Ok(Compacted::Done(Compaction {
         bytes_before: source.len(),
         bytes_after: frame_end,
     }))

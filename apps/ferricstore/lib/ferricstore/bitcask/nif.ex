@@ -1003,8 +1003,10 @@ defmodule Ferricstore.Bitcask.NIF do
   # {:pop_max, n}; flags nx 1, xx 2, gt 4, lt 8. Score bounds :neg_inf | :inf |
   # {:incl, float} | {:excl, float}; lex bounds :min | :max | {:incl, binary} |
   # {:excl, binary}.
+  # A token at or below the file's latest is a replayed entry: the file is cut
+  # back to before it first, so it gets the outcome it had the first time.
   @spec zset_tree_apply(binary(), non_neg_integer(), non_neg_integer(), [tuple()]) ::
-          {:ok, [term()] | :stale} | {:error, binary()}
+          {:ok, [term()]} | {:error, binary()}
   def zset_tree_apply(_path, _token_index, _token_ordinal, _ops),
     do: :erlang.nif_error(:nif_not_loaded)
 
@@ -1069,9 +1071,11 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec zset_tree_sync(binary()) :: :ok | {:error, binary()}
   def zset_tree_sync(_path), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec zset_tree_compact(binary()) ::
-          {:ok, :missing | {non_neg_integer(), non_neg_integer()}} | {:error, binary()}
-  def zset_tree_compact(_path), do: :erlang.nif_error(:nif_not_loaded)
+  # Compacts only once no Raft entry at or below `covered_index` can replay.
+  @spec zset_tree_compact(binary(), non_neg_integer()) ::
+          {:ok, :missing | :uncovered | {non_neg_integer(), non_neg_integer()}}
+          | {:error, binary()}
+  def zset_tree_compact(_path, _covered_index), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec bloom_file_add(binary(), binary()) :: :ok | {:error, term()}
   def bloom_file_add(_path, _element), do: :erlang.nif_error(:nif_not_loaded)

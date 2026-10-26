@@ -196,6 +196,9 @@ pub struct FrameHeader {
     pub page_count: u32,
     pub ops_len: u32,
     pub token: Token,
+    /// A compacted file's frame: the whole tree, with no earlier frame to
+    /// rewind to.
+    pub base: bool,
 }
 
 impl FrameHeader {
@@ -205,7 +208,7 @@ impl FrameHeader {
         put_u32(&mut out, FRAME_MAGIC);
         put_u32(&mut out, self.page_count);
         put_u32(&mut out, self.ops_len);
-        put_u32(&mut out, 0);
+        put_u32(&mut out, u32::from(self.base));
         put_u64(&mut out, self.token.index);
         put_u64(&mut out, self.token.ordinal);
         let checksum = crc(&[&out]);
@@ -226,6 +229,7 @@ impl FrameHeader {
             page_count: get_u32(bytes, 4).ok()?,
             ops_len: get_u32(bytes, 8).ok()?,
             token: Token::new(get_u64(bytes, 16).ok()?, get_u64(bytes, 24).ok()?),
+            base: get_u32(bytes, 12).ok()? & 1 == 1,
         })
     }
 

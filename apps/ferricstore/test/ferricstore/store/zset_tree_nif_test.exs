@@ -23,7 +23,14 @@ defmodule Ferricstore.Store.ZSetTreeNifTest do
                {:add, "a", 9.0, @nx}
              ])
 
-    assert {:ok, :stale} = NIF.zset_tree_apply(path, 1, 1, [{:add, "z", 0.0, 0}])
+    # A replayed entry gives the outcome it had the first time.
+    assert {:ok, [{true, true}, {true, true}, {true, true}, {false, false}]} =
+             NIF.zset_tree_apply(path, 1, 1, [
+               {:add, "b", 2.0, 0},
+               {:add, "a", 1.0, 0},
+               {:add, "c", 3.0, 0},
+               {:add, "a", 9.0, @nx}
+             ])
 
     assert {:ok, [{false, false}, 5.5, nil, true, [{"c", 3.0}]]} =
              NIF.zset_tree_apply(path, 2, 1, [
@@ -59,7 +66,8 @@ defmodule Ferricstore.Store.ZSetTreeNifTest do
     assert {:ok, {[], nil}} = NIF.zset_tree_scan(path, "zzz", 2)
 
     assert :ok = NIF.zset_tree_sync(path)
-    assert {:ok, {before, after_bytes}} = NIF.zset_tree_compact(path)
+    assert {:ok, :uncovered} = NIF.zset_tree_compact(path, 2)
+    assert {:ok, {before, after_bytes}} = NIF.zset_tree_compact(path, 3)
     assert after_bytes < before
     assert {:ok, {_frames, 0, 501}} = NIF.zset_tree_recover(path)
     assert {:ok, 501} = NIF.zset_tree_card(path)

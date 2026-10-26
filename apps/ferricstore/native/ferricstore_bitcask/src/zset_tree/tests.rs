@@ -421,7 +421,7 @@ fn matches_the_model_through_writes_compactions_and_syncs() {
             let expected: Result<Vec<Outcome>> = ops.iter().map(|op| trial.apply(op)).collect();
             index += 1;
             match (apply(&path, Token::new(index, 1), &ops), expected) {
-                (Ok(Applied::Done { outcomes, state }), Ok(expected)) => {
+                (Ok(Applied { outcomes, state }), Ok(expected)) => {
                     assert_eq!(outcomes, expected, "seed {seed} round {round}");
                     assert_eq!(state.count, trial.scores.len() as u64);
                     model = trial;
@@ -436,7 +436,7 @@ fn matches_the_model_through_writes_compactions_and_syncs() {
                 sync(&path).unwrap();
             }
             if round % 211 == 210 {
-                compact(&path).unwrap();
+                compact(&path, u64::MAX).unwrap();
                 check_reads(&path, &model, &mut rng);
             }
         }
@@ -444,34 +444,70 @@ fn matches_the_model_through_writes_compactions_and_syncs() {
     }
 }
 
-#[test]
-fn a_replayed_token_changes_nothing() {
-    let (_dir, path) = temp_tree();
-    let add = |member: &str, score| Op::Add {
+fn add(member: &str, score: f64) -> Op {
+    Op::Add {
         member: member.as_bytes().to_vec(),
         score,
         conditions: Conditions::default(),
-    };
-    assert!(matches!(
-        apply(&path, Token::new(5, 1), &[add("a", 1.0)]).unwrap(),
-        Applied::Done { .. }
-    ));
-    assert_eq!(
-        apply(&path, Token::new(5, 1), &[add("b", 2.0)]).unwrap(),
-        Applied::Stale
-    );
-    assert_eq!(
-        apply(&path, Token::new(4, 9), &[add("c", 3.0)]).unwrap(),
-        Applied::Stale
-    );
-    assert!(matches!(
-        apply(&path, Token::new(5, 2), &[add("d", 4.0)]).unwrap(),
-        Applied::Done { .. }
-    ));
-    let members = read(&path, |tx| tx.range_by_index(0, -1, false))
+    }
+}
+
+fn outcomes(applied: Applied) -> Vec<Outcome> {
+    let Applied { outcomes, .. } = applied;
+    outcomes
+}
+
+fn all_members(path: &Path) -> Vec<Entry> {
+    read(path, |tx| tx.range_by_index(0, -1, false))
         .unwrap()
-        .unwrap();
-    assert_eq!(members, vec![(b"a".to_vec(), 1.0), (b"d".to_vec(), 4.0)]);
+        .unwrap_or_default()
+}
+
+/// A crash can leave the file ahead of where Raft replays from. Replaying an
+/// entry must give the outcome it had the first time, so the file is cut back
+/// to before it and the entry applies again.
+#[test]
+fn a_replayed_entry_rewinds_the_file_and_applies_again() {
+    let (_dir, path) = temp_tree();
+    apply(&path, Token::new(5, 1), &[add("a", 1.0)]).unwrap();
+    apply(&path, Token::new(6, 1), &[Op::PopMin { count: 1 }]).unwrap();
+    apply(&path, Token::new(7, 1), &[add("b", 2.0)]).unwrap();
+    assert_eq!(all_members(&path), vec![(b"b".to_vec(), 2.0)]);
+
+    // Replay from entry 5.
+    assert_eq!(
+        outcomes(apply(&path, Token::new(5, 1), &[add("a", 1.0)]).unwrap()),
+        vec![Outcome::Add {
+            added: true,
+            changed: true
+        }]
+    );
+    assert_eq!(all_members(&path), vec![(b"a".to_vec(), 1.0)]);
+    assert_eq!(
+        outcomes(apply(&path, Token::new(6, 1), &[Op::PopMin { count: 1 }]).unwrap()),
+        vec![Outcome::Popped(vec![(b"a".to_vec(), 1.0)])]
+    );
+    apply(&path, Token::new(7, 1), &[add("b", 2.0)]).unwrap();
+    assert_eq!(all_members(&path), vec![(b"b".to_vec(), 2.0)]);
+
+    // A later ordinal of the same entry applies on top.
+    apply(&path, Token::new(7, 2), &[add("c", 3.0)]).unwrap();
+    assert_eq!(all_members(&path).len(), 2);
+}
+
+#[test]
+fn a_rewind_never_goes_below_a_compacted_base() {
+    let (_dir, path) = temp_tree();
+    for i in 1..=3 {
+        apply(&path, Token::new(i, 1), &[add(&format!("m{i}"), i as f64)]).unwrap();
+    }
+    assert!(matches!(compact(&path, 2).unwrap(), Compacted::Uncovered));
+    assert!(matches!(compact(&path, 3).unwrap(), Compacted::Done(_)));
+    apply(&path, Token::new(4, 1), &[add("m4", 4.0)]).unwrap();
+    apply(&path, Token::new(4, 1), &[add("m4", 4.0)]).unwrap();
+    assert_eq!(all_members(&path).len(), 4);
+    assert!(apply(&path, Token::new(3, 1), &[add("m3", 3.0)]).is_err());
+    assert_eq!(all_members(&path).len(), 4);
 }
 
 #[test]
@@ -510,7 +546,7 @@ fn positions_cost_a_descent_not_a_walk() {
             .collect();
         apply(&path, Token::new(index, 1), &ops).unwrap();
     }
-    compact(&path).unwrap();
+    compact(&path, u64::MAX).unwrap();
     let file = TreeFile::open_read(&path).unwrap().unwrap();
     let tx = Tx::begin(&file, file.state().unwrap());
     // Height bounds the pages a position lookup reads.
@@ -555,7 +591,8 @@ fn build_history(path: &Path, rng: &mut Rng, rounds: u64) -> Vec<(u64, Model)> {
         {
             continue;
         }
-        if let Applied::Done { state, .. } = apply(path, Token::new(round + 1, 1), &ops).unwrap() {
+        let Applied { state, .. } = apply(path, Token::new(round + 1, 1), &ops).unwrap();
+        {
             model = trial;
             if history.last().unwrap().0 != state.frame_end {
                 history.push((state.frame_end, model.clone()));
@@ -635,8 +672,7 @@ fn build_history_continue(
         {
             continue;
         }
-        if let Applied::Done { state, .. } =
-            apply(path, Token::new(10_000 + round, 1), &ops).unwrap()
+        let Applied { state, .. } = apply(path, Token::new(10_000 + round, 1), &ops).unwrap();
         {
             model = trial;
             if state.frame_end != last_end {

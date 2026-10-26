@@ -13,13 +13,12 @@ use std::path::Path;
 use rustler::types::tuple::get_tuple;
 use rustler::{Binary, Encoder, Env, NifResult, OwnedBinary, Term};
 
-use super::{Applied, Conditions, Entry, LexBound, Op, Outcome, ScoreBound, Token};
+use super::{Applied, Compacted, Conditions, Entry, LexBound, Op, Outcome, ScoreBound, Token};
 
 mod atoms {
     rustler::atoms! {
         ok,
         error,
-        stale,
         nil,
         add,
         incr,
@@ -33,6 +32,7 @@ mod atoms {
         min,
         max,
         missing,
+        uncovered,
     }
 }
 
@@ -203,8 +203,7 @@ pub fn zset_tree_apply<'a>(
         Token::new(token_index, token_ordinal),
         &ops,
     ) {
-        Ok(Applied::Stale) => Ok((atoms::ok(), atoms::stale()).encode(env)),
-        Ok(Applied::Done { outcomes, .. }) => {
+        Ok(Applied { outcomes, .. }) => {
             let terms = outcomes
                 .iter()
                 .map(|outcome| outcome_term(env, outcome))
@@ -449,10 +448,11 @@ pub fn zset_tree_sync(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
 
 #[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
-pub fn zset_tree_compact(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
-    match super::compact(Path::new(&path)) {
-        Ok(None) => Ok((atoms::ok(), atoms::missing()).encode(env)),
-        Ok(Some(compaction)) => Ok((
+pub fn zset_tree_compact(env: Env<'_>, path: String, covered_index: u64) -> NifResult<Term<'_>> {
+    match super::compact(Path::new(&path), covered_index) {
+        Ok(Compacted::Missing) => Ok((atoms::ok(), atoms::missing()).encode(env)),
+        Ok(Compacted::Uncovered) => Ok((atoms::ok(), atoms::uncovered()).encode(env)),
+        Ok(Compacted::Done(compaction)) => Ok((
             atoms::ok(),
             (compaction.bytes_before, compaction.bytes_after),
         )

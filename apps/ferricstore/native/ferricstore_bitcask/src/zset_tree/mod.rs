@@ -26,7 +26,7 @@ mod tests;
 pub type Result<T> = std::result::Result<T, String>;
 
 pub use format::{LoggedOp, Token, MAX_MEMBER_LEN};
-pub use maintain::{compact, recover, sync, Compaction, Recovery};
+pub use maintain::{compact, recover, sync, Compacted, Compaction, Recovery};
 pub use ops::{Conditions, Entry, LexBound, Op, Outcome, ScoreBound};
 pub use store::TreeState;
 pub use tree::Tx;
@@ -34,14 +34,9 @@ pub use tree::Tx;
 use store::TreeFile;
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum Applied {
-    /// The token is at or below the file's latest: a replayed Raft entry
-    /// whose changes the file already holds.
-    Stale,
-    Done {
-        outcomes: Vec<Outcome>,
-        state: TreeState,
-    },
+pub struct Applied {
+    pub outcomes: Vec<Outcome>,
+    pub state: TreeState,
 }
 
 fn op_member(op: &Op) -> Option<&[u8]> {
@@ -51,8 +46,10 @@ fn op_member(op: &Op) -> Option<&[u8]> {
     }
 }
 
-/// Applies `ops` in order as one frame, all or nothing. A token of index 0
-/// (no Raft log) takes the next index after the file's.
+/// Applies `ops` in order as one frame, all or nothing. A token at or below
+/// the file's latest is a replayed Raft entry: the file is first cut back to
+/// before it, so it gets the outcomes it had the first time. A token of index
+/// 0 (no Raft log) takes the next index after the file's.
 pub fn apply(path: &Path, token: Token, ops: &[Op]) -> Result<Applied> {
     if ops
         .iter()
@@ -68,16 +65,18 @@ pub fn apply(path: &Path, token: Token, ops: &[Op]) -> Result<Applied> {
     } else {
         token
     };
-    if token <= state.token {
-        return Ok(Applied::Stale);
-    }
+    let state = if token <= state.token {
+        maintain::rewind(&file, state, token)?
+    } else {
+        state
+    };
     let mut tx = Tx::begin(&file, state);
     let outcomes = ops
         .iter()
         .map(|op| tx.apply(op))
         .collect::<Result<Vec<_>>>()?;
     let state = tx.commit(token)?;
-    Ok(Applied::Done { outcomes, state })
+    Ok(Applied { outcomes, state })
 }
 
 /// Runs `f` on the latest tree; `None` when the file does not exist.
