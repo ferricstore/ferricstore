@@ -74,17 +74,6 @@ pub fn next_score_prefix(prefix: [u8; 8]) -> Option<[u8; 8]> {
 }
 
 #[must_use]
-pub fn decode_score_prefix(prefix: [u8; 8]) -> f64 {
-    let sortable = u64::from_be_bytes(prefix);
-    let bits = if sortable >> 63 == 1 {
-        sortable & !(1 << 63)
-    } else {
-        !sortable
-    };
-    f64::from_bits(bits)
-}
-
-#[must_use]
 pub fn crc(parts: &[&[u8]]) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
     for part in parts {

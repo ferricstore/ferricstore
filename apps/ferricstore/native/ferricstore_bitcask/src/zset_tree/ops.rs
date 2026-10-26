@@ -4,9 +4,7 @@
 //! trees, then reads that range: O(log N) to find it plus one step per
 //! returned member.
 
-use super::format::{
-    decode_score_prefix, next_score_prefix, normalize_score, score_prefix, LoggedOp,
-};
+use super::format::{next_score_prefix, normalize_score, score_prefix, LoggedOp};
 use super::tree::{Tree, Tx};
 use super::Result;
 
@@ -86,12 +84,13 @@ fn decode_score_value(value: &[u8]) -> Result<f64> {
     Ok(f64::from_bits(u64::from_le_bytes(bits)))
 }
 
-fn score_entry((key, _value): (Vec<u8>, Vec<u8>)) -> Result<Entry> {
+/// Score-tree entries carry the score as stored: the key's prefix orders -0
+/// with 0, the value keeps its sign.
+fn score_entry((key, value): (Vec<u8>, Vec<u8>)) -> Result<Entry> {
     if key.len() < 8 {
         return Err("zset tree: short score key".into());
     }
-    let prefix: [u8; 8] = key[..8].try_into().unwrap();
-    Ok((key[8..].to_vec(), decode_score_prefix(prefix)))
+    Ok((key[8..].to_vec(), decode_score_value(&value)?))
 }
 
 fn member_entry((member, value): (Vec<u8>, Vec<u8>)) -> Result<Entry> {
@@ -110,9 +109,10 @@ impl Tx<'_> {
             .transpose()
     }
 
-    /// Sets `member`'s score; returns whether the member was added.
+    /// Sets `member`'s score; returns whether the member was added. The score
+    /// is stored as given; only its sort key folds -0 into 0.
     fn set(&mut self, member: &[u8], score: f64) -> Result<bool> {
-        let score = normalize_score(score)?;
+        normalize_score(score)?;
         let previous = self.score(member)?;
         if previous == Some(score) {
             return Ok(false);
@@ -120,7 +120,7 @@ impl Tx<'_> {
         if let Some(old) = previous {
             self.remove(Tree::Score, &score_key(old, member)?)?;
         }
-        self.insert(Tree::Score, score_key(score, member)?, Vec::new())?;
+        self.insert(Tree::Score, score_key(score, member)?, score_value(score))?;
         self.insert(Tree::Member, member.to_vec(), score_value(score))?;
         self.log(LoggedOp::Set(member.to_vec(), score));
         if previous.is_none() {
@@ -155,7 +155,8 @@ impl Tx<'_> {
                 score,
                 conditions,
             } => {
-                let score = normalize_score(*score)?;
+                let score = *score;
+                normalize_score(score)?;
                 let outcome = match self.score(member)? {
                     None if conditions.xx => Outcome::Add {
                         added: false,
@@ -212,7 +213,7 @@ impl Tx<'_> {
                     return Ok(Outcome::Incr(None));
                 }
                 self.set(member, new)?;
-                Ok(Outcome::Incr(Some(normalize_score(new)?)))
+                Ok(Outcome::Incr(Some(new)))
             }
             Op::Remove { member } => Ok(Outcome::Removed(self.delete(member)?.is_some())),
             Op::PopMin { count } => {

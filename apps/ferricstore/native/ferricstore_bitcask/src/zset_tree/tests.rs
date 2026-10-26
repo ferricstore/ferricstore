@@ -46,7 +46,7 @@ impl Model {
     }
 
     fn apply(&mut self, op: &Op) -> Result<Outcome> {
-        let norm = |s: f64| if s == 0.0 { 0.0 } else { s };
+        let norm = |s: f64| s;
         Ok(match op {
             Op::Add {
                 member,
@@ -791,4 +791,37 @@ fn an_increment_that_overflows_to_infinity_is_refused() {
         read(&path, |tx| tx.score(b"big")).unwrap(),
         Some(Some(f64::MAX))
     );
+}
+
+/// Redis keeps a score of -0 as -0 while ordering it equal to 0.
+#[test]
+fn negative_zero_keeps_its_sign_and_sorts_as_zero() {
+    let (_dir, path) = temp_tree();
+    apply(
+        &path,
+        Token::new(1, 1),
+        &[add("neg", -0.0), add("pos", 0.0), add("one", 1.0)],
+    )
+    .unwrap();
+    let entries = read(&path, |tx| tx.range_by_index(0, -1, false))
+        .unwrap()
+        .unwrap();
+    assert_eq!(entries.len(), 3);
+    assert!(
+        entries[0].1.is_sign_negative() && entries[0].1 == 0.0,
+        "{entries:?}"
+    );
+    assert_eq!(
+        read(&path, |tx| tx.score(b"neg"))
+            .unwrap()
+            .unwrap()
+            .map(f64::is_sign_negative),
+        Some(true)
+    );
+    let zeros = read(&path, |tx| {
+        tx.count_by_score(&ScoreBound::Incl(0.0), &ScoreBound::Incl(0.0))
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(zeros, 2);
 }
