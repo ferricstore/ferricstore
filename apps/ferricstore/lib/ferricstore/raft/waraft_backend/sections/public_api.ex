@@ -271,7 +271,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       defp remove_stale_snapshots(ctx) do
         for partition <- 1..ctx.shard_count,
             root = Path.join([ctx.data_dir, "waraft", "#{@table}.#{partition}"]),
-            {:ok, names} <- [File.ls(root)],
+            {:ok, names} <- [Ferricstore.FS.ls(root)],
             name <- names,
             Regex.match?(~r/\Asnapshot\.\d+\.\d+(\.|\z)/, name) do
           remove_stale_snapshot(Path.join(root, name))
@@ -282,14 +282,11 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
 
       defp remove_stale_snapshot(path) do
         with {:ok, %{type: :directory}} <- File.lstat(path),
-             {:ok, _removed} <- File.rm_rf(path) do
+             :ok <- Ferricstore.FS.rm_rf(path) do
           Logger.notice("Removed stale WARaft snapshot #{path}")
         else
           {:ok, %File.Stat{}} ->
             :ok
-
-          {:error, reason, _file} ->
-            Logger.warning("Could not remove stale WARaft snapshot #{path}: #{inspect(reason)}")
 
           {:error, reason} ->
             Logger.warning("Could not remove stale WARaft snapshot #{path}: #{inspect(reason)}")
