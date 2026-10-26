@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.14 - 2026-10-26
+
 - A start after a stop or crash that left a Flow's retention delete
   unflushed to the LMDB mirror refused to open the shard
   (`flow_lmdb_reconcile_unhealthy`, `cold_read_errors: 1`). Replaying the
