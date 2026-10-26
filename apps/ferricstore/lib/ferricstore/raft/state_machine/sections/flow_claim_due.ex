@@ -1061,6 +1061,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
             flow_stale_due_cleanup(due_key, park_key, park_blob)
 
           not flow_cold_due_record_matches_claim?(
+            state,
             record,
             type,
             state_filter,
@@ -1111,6 +1112,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
       end
 
       defp flow_cold_due_record_matches_claim?(
+             state,
              record,
              type,
              state_filter,
@@ -1121,10 +1123,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
         Map.get(record, :type) == type and
           flow_claim_state_match?(state_filter, Map.get(record, :state)) and
           not flow_claim_state_excluded?(state_filter, Map.get(record, :state)) and
-          flow_claim_partition_match?(partition_key, Map.get(record, :partition_key)) and
+          flow_cold_claim_partition_match?(state, partition_key, Map.get(record, :partition_key)) and
           flow_claim_priority_match?(priority, Map.get(record, :priority, 0)) and
           flow_claim_record_due_ready?(record, now_ms)
       end
+
+      # A claim without a partition key (:auto) takes the automatic partitions,
+      # as its hot scan does. Before feature level 7 promotion matched no
+      # partition for it, so such a claim never took a hibernated Flow; older
+      # replicas still apply it that way.
+      defp flow_cold_claim_partition_match?(state, :auto, record_partition) do
+        feature_level_7?(state) and FlowKeys.auto_partition_key?(record_partition)
+      end
+
+      defp flow_cold_claim_partition_match?(_state, partition_key, record_partition),
+        do: flow_claim_partition_match?(partition_key, record_partition)
 
       defp flow_claim_partition_match?(:any, _record_partition), do: true
 

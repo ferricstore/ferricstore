@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A Flow due more than the hot window away (five minutes by default) is
+  hibernated: once the LMDB mirror holds it, its record leaves memory. A
+  claim that finds too few hot Flows promotes the due hibernated ones, but a
+  claim without a partition key (the default) matched no partition there, so
+  a hibernated Flow created without a partition key was never claimed by one
+  and stayed queued past its run time. From feature level 7 such a claim
+  promotes and claims the automatic partitions' Flows, as its hot scan
+  already did; raise the level once every node runs this release.
+
 ## 0.12.12 - 2026-10-26
 
 - Upgrading: the first start deletes the WARaft snapshots earlier releases

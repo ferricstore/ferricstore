@@ -540,14 +540,17 @@ deleted or set), member writes check the key's type, and INCRBYFLOAT stores
 TTL takes it, INCR and HINCRBY refuse stored integers Redis does not read
 ("05", "+5"), and TDIGEST writes and DEL each run as one replicated entry
 (below it, clients on different nodes can lose each other's TDIGEST values
-or both count the same deleted key). After the first start of a new cluster,
-once every node is up, raise it to the level the release supports:
+or both count the same deleted key); at level 7 a claim without a partition
+key takes due Flows that were hibernated (below it, a Flow created without a
+partition key and due more than the hot window away, five minutes by default,
+is never claimed by one). After the first start of a new cluster, once every node is
+up, raise it to the level the release supports:
 
 ```bash
 bin/ferricstore rpc 'IO.inspect(FerricStore.cluster_feature_level())'
-# {:ok, %{supported: 6, active: 0, shards: [0, 0, 0, 0]}}
+# {:ok, %{supported: 7, active: 0, shards: [0, 0, 0, 0]}}
 
-bin/ferricstore rpc 'IO.inspect(FerricStore.raise_cluster_feature_level(6))'
+bin/ferricstore rpc 'IO.inspect(FerricStore.raise_cluster_feature_level(7))'
 ```
 
 ## Upgrading a Cluster

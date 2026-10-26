@@ -78,7 +78,10 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    take TDIGEST commands, and `:compound_command` runs TDIGEST.CREATE, ADD,
   #    RESET and MERGE in one entry (`TDigest.atomic_write/3`), and DEL of one
   #    key (`Strings.atomic_del/3`).
-  @supported 6
+  # 7: a claim without a partition key promotes and claims due hibernated
+  #    Flows of the automatic partitions; before, it matched none, so a Flow
+  #    created without a partition key and hibernated was never claimed.
+  @supported 7
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"
   @probe_timeout_ms 5_000
