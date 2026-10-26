@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.12 - 2026-10-26
+
+- Upgrading: the first start deletes the WARaft snapshots earlier releases
+  left in each shard's partition directory, which on a copy of Inspeactor's
+  data freed 11 GB of 20.6 GB. The stop before the upgrade still runs the
+  old release and snapshots every shard, so give it time (it took 126 s on
+  that copy) or it is killed and the first start recovers as after a crash.
+  Give containers about two minutes to stop from now on: see "Give the
+  Container Time to Stop" in the deployment guide.
 - A graceful stop snapshotted every WARaft shard before closing it. A
   snapshot copies the whole shard, so a stop took minutes on large data (126 s
   on a 20 GB copy of Inspeactor's data; Docker's default 10 s grace period
@@ -12,6 +21,8 @@ All notable changes to FerricStore will be documented here.
   retention applied (11 GB of that copy's 20.6 GB). Nothing reads those
   copies at startup. A stop no longer snapshots: each shard's storage already
   flushes and syncs itself as it closes, and that copy now stops in 17 s.
+  The stop snapshot also compacted the apply-projection log; log trims still
+  compact it, as they did between stops.
 - Snapshots left in the WARaft partition directories (`snapshot.<index>.<term>`)
   stayed on disk for good: WARaft prunes them only when it takes a new one,
   and keeps two. Startup now removes them before any shard starts, while no
