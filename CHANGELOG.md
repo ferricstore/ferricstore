@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A shard's Raft log could stop trimming for good and grow without bound:
+  once a Flow was deleted before the trim that passed its value, every trim
+  stopped with `{:segment_value_pin_missing_live_value, ...}` (Inspeactor's
+  shard 5 log reached 1.39 million entries). Deleting a value removes its
+  LMDB locator but leaves its pin, and the trim kept any such pin whose
+  source still held the value, which an untrimmed log always does. A trim
+  now releases the pin of a deleted value and drops its bytes; no read
+  reaches a value without a locator or a keydir row. 0.12.10's fix covered
+  only pins whose source no longer held the value.
 - A log trim deferred until a projection checkpoint was ready, or done only
   up to an older checkpoint, counted as a full trim, so the next trim came
   only a full rotation interval later (50,000 entries by default) or at a
