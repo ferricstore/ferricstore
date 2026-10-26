@@ -54,6 +54,7 @@ defmodule Ferricstore.Cluster.FlowRetentionMirrorLagClusterTest do
              ])
 
     assert {:ok, record} = run.(first, FerricStore, :flow_get, ["lag-1"])
+    await_applied!(nodes)
     for node <- nodes, do: assert(:ok = flush.(node))
 
     # The third node's writer is busy: its queued ops wait, none is lost.
@@ -72,6 +73,9 @@ defmodule Ferricstore.Cluster.FlowRetentionMirrorLagClusterTest do
 
       assert :ok =
                run.(first, FerricStore, :flow_create, ["lag-1", [type: "lag", payload: "again"]])
+
+      # Every node applies the create while the third node's writer is behind.
+      await_applied!(nodes)
     after
       run.(third, :sys, :resume, [writer])
     end
@@ -87,5 +91,36 @@ defmodule Ferricstore.Cluster.FlowRetentionMirrorLagClusterTest do
       end
 
     assert views == List.duplicate({"queued", 1}, 3), inspect(views)
+  end
+
+  # A follower applies an entry once the leader tells it the entry committed,
+  # which can be after the leader answered; until then reads on it show the
+  # state before.
+  defp await_applied!(nodes) do
+    target = nodes |> Enum.map(&last_applied/1) |> Enum.max()
+
+    for node <- nodes do
+      assert eventually(fn -> last_applied(node) >= target end),
+             "#{node.name} applied #{last_applied(node)} of #{target}"
+    end
+  end
+
+  defp last_applied(node) do
+    case ClusterHelper.run(node.name, Ferricstore.Raft.WARaftBackend, :storage_status, [0]) do
+      {:ok, status} -> Keyword.fetch!(status, :last_applied)
+      _unavailable -> 0
+    end
+  end
+
+  defp eventually(fun, attempts \\ 200)
+  defp eventually(_fun, 0), do: false
+
+  defp eventually(fun, attempts) do
+    if fun.() do
+      true
+    else
+      Process.sleep(50)
+      eventually(fun, attempts - 1)
+    end
   end
 end
