@@ -4,6 +4,17 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A Flow LMDB mirror could go on writing to files a WARaft snapshot install
+  had moved away. The install moves a shard's data directory into a backup
+  and puts the snapshot's in its place; a read that reopened the mirror
+  between the install's release and the move cached the environment of the
+  moved files, and every later mirror read and write for that shard used the
+  backup while the live directory stayed empty. Each new shard installs an
+  empty snapshot when it first starts, so this could happen on a fresh node
+  too. A cached environment is now reused only while its path still names the
+  directory it was opened in; otherwise the path opens the directory there
+  now, and fails while a call still holds the moved one instead of serving
+  it.
 - A stop no longer turns into a crash for a busy shard. WARaft kills a
   storage process whose close runs past 30 s, and close could wait longer
   than that for Flow history and cache compaction (10 s per history shard,

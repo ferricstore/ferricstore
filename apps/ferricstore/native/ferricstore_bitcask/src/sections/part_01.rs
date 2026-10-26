@@ -68,6 +68,8 @@ struct LmdbStore {
     env: heed::Env,
     db: heed::Database<heed::types::Bytes, heed::types::Bytes>,
     map_size: usize,
+    // Device and inode of the directory the environment was opened in.
+    dir_identity: (u64, u64),
 }
 
 type LmdbStoreCell = OnceLock<Result<Arc<LmdbStore>, String>>;
