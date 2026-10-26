@@ -1832,35 +1832,67 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
 
       # The tree file of a tree-encoded sorted set (feature level 9), or nil.
       defp zset_tree_path(ctx, redis_key) when is_binary(redis_key) do
-        marker_key = Promotion.marker_key(redis_key)
-
-        # A marker this entry (or its MULTI) wrote or deleted is staged, not yet
-        # in the keydir.
-        staged =
-          if MapSet.member?(Process.get(:tx_deleted_keys, MapSet.new()), marker_key),
-            do: :deleted,
-            else:
-              Map.get(Process.get(:tx_pending_values, %{}), marker_key) ||
-                Map.get(Process.get(:sm_pending_values, %{}), marker_key)
-
-        marker =
-          case staged do
-            {value, _expire_at_ms} when is_binary(value) -> value
-            :deleted -> nil
-            _not_staged -> cross_shard_ets_read(promoted_marker_ctx(ctx), marker_key)
-          end
+        marker = zset_tree_staged_read(ctx, Promotion.marker_key(redis_key))
 
         case Ferricstore.Store.ZSetTree.marker_generation(marker) do
           nil ->
             nil
 
           generation ->
-            Ferricstore.Store.ZSetTree.path(
-              promoted_data_dir(ctx),
-              ctx_index(ctx),
-              redis_key,
-              generation
-            )
+            # A tree set has no TTL of its own: it lives while its type key
+            # does. An expired one is gone, and a write starts a new set.
+            if zset_tree_type_live?(ctx, redis_key) do
+              Ferricstore.Store.ZSetTree.path(
+                promoted_data_dir(ctx),
+                ctx_index(ctx),
+                redis_key,
+                generation
+              )
+            end
+        end
+      end
+
+      defp zset_tree_type_live?(ctx, redis_key),
+        do: zset_tree_staged_read(ctx, CompoundKey.type_key(redis_key)) == "zset"
+
+      defp zset_tree_staged_read(ctx, key) do
+        case zset_tree_staged_meta(ctx, key) do
+          {value, _expire_at_ms} -> value
+          nil -> nil
+        end
+      end
+
+      # The TTL a tree set's marker takes: its type key's.
+      defp zset_tree_type_expire_at(ctx, redis_key) do
+        case zset_tree_staged_meta(ctx, CompoundKey.type_key(redis_key)) do
+          {_type, expire_at_ms} -> expire_at_ms
+          nil -> 0
+        end
+      end
+
+      # `key` and its expiry as this entry (or its MULTI) left it: its staged
+      # writes, which are not yet in the keydir, then the keydir.
+      defp zset_tree_staged_meta(ctx, key) do
+        staged =
+          if MapSet.member?(Process.get(:tx_deleted_keys, MapSet.new()), key),
+            do: :deleted,
+            else:
+              Map.get(Process.get(:tx_pending_values, %{}), key) ||
+                Map.get(Process.get(:sm_pending_values, %{}), key)
+
+        case staged do
+          {value, expire_at_ms} when is_binary(value) and is_integer(expire_at_ms) ->
+            if ExpiryContext.classify(ExpiryContext.capture(), expire_at_ms) == :live,
+              do: {value, expire_at_ms}
+
+          :deleted ->
+            nil
+
+          _not_staged ->
+            case cross_shard_ets_read_meta(promoted_marker_ctx(ctx), key) do
+              {value, expire_at_ms} when is_binary(value) -> {value, expire_at_ms}
+              _missing -> nil
+            end
         end
       end
 

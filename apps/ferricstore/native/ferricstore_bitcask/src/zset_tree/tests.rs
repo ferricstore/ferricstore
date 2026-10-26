@@ -842,3 +842,16 @@ fn rewind_to_cuts_back_to_before_a_token() {
     // A missing file is fine.
     rewind_to(&path.with_extension("missing"), Token::new(1, 1)).unwrap();
 }
+
+/// Ops that change nothing (EXPIRE rewriting a set with its scores as they
+/// are) write no frame.
+#[test]
+fn unchanged_scores_write_nothing() {
+    let (_dir, path) = temp_tree();
+    apply(&path, Token::new(3, 1), &[add("a", 1.0), add("b", 2.0)]).unwrap();
+    let len = std::fs::metadata(&path).unwrap().len();
+    apply(&path, Token::new(4, 1), &[add("a", 1.0), add("b", 2.0)]).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
+    apply(&path, Token::new(5, 1), &[add("b", 3.0)]).unwrap();
+    assert!(std::fs::metadata(&path).unwrap().len() > len);
+}

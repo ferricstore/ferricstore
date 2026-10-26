@@ -22,9 +22,17 @@ defmodule Ferricstore.Store.Router.ZSetTreeReads do
             [_entry] -> compound_get_keydir(ctx, redis_key, marker_key)
           end
 
-        case ZSetTree.marker_generation(marker) do
-          nil -> nil
-          generation -> ZSetTree.path(ctx.data_dir, idx, redis_key, generation)
+        # A tree set lives while its type key does; an expired one reads as gone.
+        with generation when is_integer(generation) <- ZSetTree.marker_generation(marker),
+             "zset" <-
+               compound_get_keydir(
+                 ctx,
+                 redis_key,
+                 Ferricstore.Store.CompoundKey.type_key(redis_key)
+               ) do
+          ZSetTree.path(ctx.data_dir, idx, redis_key, generation)
+        else
+          _gone -> nil
         end
       rescue
         ArgumentError -> nil

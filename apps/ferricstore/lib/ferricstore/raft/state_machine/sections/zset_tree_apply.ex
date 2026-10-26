@@ -154,10 +154,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
         end)
       end
 
+      # A member write that leaves its score as it is (EXPIRE rewriting the set,
+      # say: a tree member has no TTL of its own) changes nothing, and the tree
+      # writes no frame for it.
       defp zset_tree_put_entries(state, redis_key, path, entries) do
         with {:ok, ops} <- ZSetTree.put_ops(redis_key, entries),
              {:ok, _outcomes} <- zset_tree_write(state, path, ops) do
           :ok
+        end
+      end
+
+      # A tree set lives while its type key does, and its marker takes the type
+      # key's TTL: when the set expires, its marker goes with it, and a later
+      # write starts a new set.
+      defp zset_tree_follow_type_ttl(state, redis_key, entries, staging \\ nil) do
+        type_key = CompoundKey.type_key(redis_key)
+        marker_key = Promotion.marker_key(redis_key)
+
+        with {^type_key, _type, expire_at_ms} <- List.keyfind(entries, type_key, 0),
+             marker when is_binary(marker) <- zset_tree_staged_read(state, marker_key),
+             true <- ZSetTree.marker?(marker) do
+          staging =
+            staging ||
+              zset_tree_apply_staging(state, redis_key, CompoundKey.zset_prefix(redis_key))
+
+          staging.put_marker.(marker_key, marker, expire_at_ms)
+        else
+          _no_tree_type_write -> :ok
         end
       end
 
@@ -216,8 +239,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
         new_members =
           for key <- compound_keys, {:ok, member} <- [ZSetTree.member(redis_key, key)], do: member
 
+        # A tree write carries its Raft position; with none, the set stays put.
         with true <- is_integer(threshold) and threshold > 0,
              [_ | _] <- new_members,
+             true <- is_integer(Process.get(:sm_zset_tree_index)),
              true <- feature_level_9?(state),
              nil <- zset_tree_path(state, redis_key),
              nil <- promoted_compound_path(state, redis_key, prefix),
@@ -275,7 +300,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
       # or MULTI's own staging, so they publish after its earlier writes.
       defp zset_tree_apply_staging(state, redis_key, prefix) do
         %{
-          put_marker: fn key, value -> do_put_value_validated(state, key, value, 0) end,
+          put_marker: fn key, value, expire_at_ms ->
+            do_put_value_validated(state, key, value, expire_at_ms)
+          end,
           drop_members: fn entries ->
             zset_tree_drop_keydir_members(state, redis_key, prefix, entries)
           end
@@ -300,7 +327,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
                :ok <-
                  staging.put_marker.(
                    Promotion.marker_key(redis_key),
-                   ZSetTree.marker_value(generation)
+                   ZSetTree.marker_value(generation),
+                   zset_tree_type_expire_at(state, redis_key)
                  ),
                :ok <- staging.drop_members.(entries) do
             zset_index_clear(state, redis_key)
@@ -372,7 +400,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
           ctx = ctx_for_key.(redis_key)
 
           %{
-            put_marker: fn key, value -> put_in_ctx.(ctx, key, value, 0) end,
+            put_marker: fn key, value, expire_at_ms ->
+              put_in_ctx.(ctx, key, value, expire_at_ms)
+            end,
             delete_marker: fn key -> delete_in_ctx.(ctx, key) end,
             drop_members: fn entries ->
               Enum.each(entries, fn {member, _score} ->
@@ -558,13 +588,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
                 Enum.split_with(entries, &MapSet.member?(member_keys, elem(&1, 0)))
 
               unwrap.(zset_tree_put_entries(state, redis_key, path, tree_entries))
-              if rest == [], do: :ok, else: keydir_put.(rest)
+
+              with :ok <- if(rest == [], do: :ok, else: keydir_put.(rest)) do
+                zset_tree_follow_type_ttl(state, redis_key, rest, prefix_staging.(redis_key))
+              end
 
             {:error, reason} ->
               throw({:transaction_store_failure, reason})
 
             :keydir ->
-              keydir_put.(entries)
+              with :ok <- keydir_put.(entries) do
+                zset_tree_follow_type_ttl(state, redis_key, entries, prefix_staging.(redis_key))
+              end
           end
         end
 

@@ -1155,14 +1155,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           {:error, _reason} = error ->
             error
 
-          _keydir ->
-            do_compound_put_value_validated_keydir(
-              state,
-              redis_key,
-              compound_key,
-              value,
-              expire_at_ms
-            )
+          :keydir ->
+            with :ok <-
+                   do_compound_put_value_validated_keydir(
+                     state,
+                     redis_key,
+                     compound_key,
+                     value,
+                     expire_at_ms
+                   ) do
+              zset_tree_follow_type_ttl(state, redis_key, [{compound_key, value, expire_at_ms}])
+            end
         end
       end
 
@@ -1330,15 +1333,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
                 MapSet.member?(member_keys, compound_key)
               end)
 
-            with :ok <- zset_tree_put_entries(state, redis_key, path, tree_entries) do
-              do_compound_batch_put_value_validated_keydir(state, redis_key, other_entries)
+            with :ok <- zset_tree_put_entries(state, redis_key, path, tree_entries),
+                 :ok <-
+                   do_compound_batch_put_value_validated_keydir(state, redis_key, other_entries) do
+              zset_tree_follow_type_ttl(state, redis_key, other_entries)
             end
 
           {:error, _reason} = error ->
             error
 
           :keydir ->
-            do_compound_batch_put_value_validated_keydir(state, redis_key, entries)
+            with :ok <- do_compound_batch_put_value_validated_keydir(state, redis_key, entries) do
+              zset_tree_follow_type_ttl(state, redis_key, entries)
+            end
         end
       end
 

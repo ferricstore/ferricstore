@@ -185,6 +185,36 @@ defmodule Ferricstore.Store.ZSetTreeIntegrationTest do
     assert tree == legacy
   end
 
+  # A tree member has no TTL of its own: EXPIRE and PERSIST change the type key
+  # and the marker, and leave the tree file as it is. The set expires with its
+  # marker, and a later write starts a new set.
+  test "EXPIRE leaves the tree as it is and the set expires with its marker", %{ctx: ctx} do
+    key = "{ttl-tree}"
+    raise_to_9!(ctx)
+
+    pairs = Enum.flat_map(1..30, fn i -> ["#{i}", "m#{i}"] end)
+    assert 30 = cmd(ctx, "ZADD", [key | pairs])
+    assert [file] = tree_files(ctx, key)
+    size = File.stat!(file).size
+
+    assert 1 = cmd(ctx, "PEXPIRE", [key, "100000"])
+    assert cmd(ctx, "PTTL", [key]) > 0
+    assert 1 = cmd(ctx, "PERSIST", [key])
+    assert -1 = cmd(ctx, "TTL", [key])
+    assert File.stat!(file).size == size
+
+    assert %{results: [1], prepare_errors: []} = exec([["PEXPIRE", key, "150"]])
+    assert cmd(ctx, "PTTL", [key]) > 0
+    Process.sleep(300)
+
+    assert 0 = cmd(ctx, "ZCARD", [key])
+    assert 0 = cmd(ctx, "EXISTS", [key])
+    assert 1 = cmd(ctx, "ZADD", [key, "1", "a"])
+    assert ["a"] = cmd(ctx, "ZRANGE", [key, "0", "-1"])
+    assert 1 = cmd(ctx, "ZCARD", [key])
+    assert File.stat!(file).size == size
+  end
+
   test "GEO commands match a set promoted before level 9", %{ctx: ctx} do
     scenario = fn key ->
       places =
