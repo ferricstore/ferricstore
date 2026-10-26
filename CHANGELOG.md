@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.11 - 2026-10-26
+
+- Upgrading: needs wa_raft 0.1.4 (`ferricstore_waraft` on Hex). The first
+  start deletes the Raft log segments earlier releases left below each
+  shard's trim floor, and a shard whose log had stopped trimming trims it
+  with its first writes. On a copy of Inspeactor's data that freed 4.25 GB
+  and took startup from about 5 minutes to under 2.
 - A Raft log trim only raised the log's logical floor: the segment files
   below it stayed on disk for good, so a shard kept every entry it ever
   wrote (Inspeactor's shard 13 still had its segments from September, about
