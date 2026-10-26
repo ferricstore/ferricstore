@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A log trim deferred until a projection checkpoint was ready, or done only
+  up to an older checkpoint, counted as a full trim, so the next trim came
+  only a full rotation interval later (50,000 entries by default) or at a
+  restart. With wa_raft 0.1.4 the segment log reports how far it trimmed, and
+  the rest is tried again once `waraft_segment_projection_trim_retry_ms`
+  (default 1,000) has passed.
+
 - The Flow LMDB mirror fell further behind as the apply-projection cache grew:
   each value it mirrored looked up its cache entries by scanning the whole
   cache. After 10k Flow creates its writers took 11 s, then 21 s to catch up

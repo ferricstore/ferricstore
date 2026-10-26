@@ -95,7 +95,7 @@ defmodule Ferricstore.MixProject do
     [
       {:rustler_precompiled, "~> 0.9"},
       {:rustler, "~> 0.38", optional: true},
-      {:wa_raft, "~> 0.1.3", hex: :ferricstore_waraft},
+      {:wa_raft, "~> 0.1.4", hex: :ferricstore_waraft},
       {:libcluster, "3.5.0"},
       {:libcluster_etcd, "1.1.2", optional: true},
       {:telemetry, "~> 1.4"},
