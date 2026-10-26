@@ -78,6 +78,7 @@ mod system_capacity;
 pub mod tdigest;
 pub mod topk;
 pub mod tracking_alloc;
+pub mod zset_tree;
 
 const LMDB_MAX_KEY_BYTES: usize = 511;
 
