@@ -85,24 +85,7 @@ defmodule Ferricstore.Flow.HibernationDeterminismTest do
     assert_indexed!(id, index_keys)
 
     ctx = FerricStore.Instance.get(:default)
-    me = self()
-
-    :telemetry.attach(
-      "probe-restore",
-      [:ferricstore, :flow, :hibernation, :restore],
-      fn _e, m, md, _ -> send(me, {:restore, m, md}) end,
-      nil
-    )
-
     :ok = restart_as_new_process(isolated, ctx.shard_count)
-    :telemetry.detach("probe-restore")
-
-    receive do
-      msg -> IO.inspect(msg, label: "PROBE restore during restart")
-    after
-      0 -> IO.puts("PROBE no restore during restart")
-    end
-
     assert_keydir_row!(id)
     assert_indexed!(id, index_keys)
 
