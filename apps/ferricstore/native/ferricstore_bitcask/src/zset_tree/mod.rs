@@ -14,6 +14,7 @@ use std::path::Path;
 
 mod format;
 mod maintain;
+mod nif;
 mod node;
 mod ops;
 mod store;

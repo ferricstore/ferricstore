@@ -203,6 +203,9 @@ impl Tx<'_> {
                 if new.is_nan() {
                     return Err("resulting score is not a number (NaN)".into());
                 }
+                if new.is_infinite() && old.is_finite() && delta.is_finite() {
+                    return Err("increment would produce NaN or Infinity".into());
+                }
                 if current.is_some()
                     && ((conditions.gt && new <= old) || (conditions.lt && new >= old))
                 {

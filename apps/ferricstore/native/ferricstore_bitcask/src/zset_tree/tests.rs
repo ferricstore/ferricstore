@@ -94,7 +94,11 @@ impl Model {
                     return Ok(Outcome::Incr(None));
                 }
                 let new = current.unwrap_or(0.0) + delta;
-                if new.is_nan() {
+                if new.is_nan()
+                    || (new.is_infinite()
+                        && current.unwrap_or(0.0).is_finite()
+                        && delta.is_finite())
+                {
                     return Err("nan".into());
                 }
                 if let Some(old) = current {
@@ -730,4 +734,25 @@ fn large_trees_rebalance_through_mass_removal() {
         }
     }
     check_reads(&path, &model, &mut rng);
+}
+
+#[test]
+fn an_increment_that_overflows_to_infinity_is_refused() {
+    let (_dir, path) = temp_tree();
+    let add = Op::Add {
+        member: b"big".to_vec(),
+        score: f64::MAX,
+        conditions: Conditions::default(),
+    };
+    apply(&path, Token::new(1, 1), &[add]).unwrap();
+    let incr = Op::Incr {
+        member: b"big".to_vec(),
+        delta: f64::MAX,
+        conditions: Conditions::default(),
+    };
+    assert!(apply(&path, Token::new(2, 1), &[incr]).is_err());
+    assert_eq!(
+        read(&path, |tx| tx.score(b"big")).unwrap(),
+        Some(Some(f64::MAX))
+    );
 }
