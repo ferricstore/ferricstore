@@ -43,6 +43,23 @@ defmodule Ferricstore.Store.Router.Part10 do
       @spec compound_batch_get(FerricStore.Instance.t(), binary(), [binary()]) ::
               [binary() | nil | ReadResult.failure()]
       def compound_batch_get(ctx, redis_key, compound_keys) do
+        case zset_tree_members_path(ctx, redis_key, compound_keys) do
+          nil ->
+            compound_batch_get_keydir(ctx, redis_key, compound_keys)
+
+          path ->
+            ctx
+            |> zset_tree_batch_scores(
+              path,
+              redis_key,
+              compound_keys,
+              &compound_get_keydir(ctx, redis_key, &1)
+            )
+            |> Enum.map(fn {_source, value} -> value end)
+        end
+      end
+
+      defp compound_batch_get_keydir(ctx, redis_key, compound_keys) do
         idx = shard_for(ctx, redis_key)
         keydir = resolve_keydir(ctx, idx)
         expiry_context = Ferricstore.ExpiryContext.capture()
@@ -283,6 +300,22 @@ defmodule Ferricstore.Store.Router.Part10 do
       @spec compound_get_meta(FerricStore.Instance.t(), binary(), binary()) ::
               {binary(), non_neg_integer()} | nil | ReadResult.failure()
       def compound_get_meta(ctx, redis_key, compound_key) do
+        case zset_tree_members_path(ctx, redis_key, [compound_key]) do
+          nil ->
+            compound_get_meta_keydir(ctx, redis_key, compound_key)
+
+          path ->
+            {:ok, member} = Ferricstore.Store.ZSetTree.member(redis_key, compound_key)
+
+            case Ferricstore.Store.ZSetTree.score(path, member) do
+              {:ok, nil} -> nil
+              {:ok, score} -> {score, 0}
+              {:error, reason} -> zset_tree_failure(reason)
+            end
+        end
+      end
+
+      defp compound_get_meta_keydir(ctx, redis_key, compound_key) do
         idx = shard_for(ctx, redis_key)
         keydir = resolve_keydir(ctx, idx)
         expiry_context = Ferricstore.ExpiryContext.capture()
@@ -357,6 +390,27 @@ defmodule Ferricstore.Store.Router.Part10 do
       @spec compound_batch_get_meta(FerricStore.Instance.t(), binary(), [binary()]) ::
               [{binary(), non_neg_integer()} | nil | ReadResult.failure()]
       def compound_batch_get_meta(ctx, redis_key, compound_keys) do
+        case zset_tree_members_path(ctx, redis_key, compound_keys) do
+          nil ->
+            compound_batch_get_meta_keydir(ctx, redis_key, compound_keys)
+
+          path ->
+            ctx
+            |> zset_tree_batch_scores(
+              path,
+              redis_key,
+              compound_keys,
+              &compound_get_meta_keydir(ctx, redis_key, &1)
+            )
+            |> Enum.map(fn
+              {:tree, nil} -> nil
+              {:tree, score} -> {score, 0}
+              {_keydir_or_failure, value} -> value
+            end)
+        end
+      end
+
+      defp compound_batch_get_meta_keydir(ctx, redis_key, compound_keys) do
         idx = shard_for(ctx, redis_key)
         keydir = resolve_keydir(ctx, idx)
         expiry_context = Ferricstore.ExpiryContext.capture()
@@ -753,6 +807,13 @@ defmodule Ferricstore.Store.Router.Part10 do
       @spec compound_scan(FerricStore.Instance.t(), binary(), binary()) ::
               [{binary(), binary()}] | ReadResult.failure()
       def compound_scan(ctx, redis_key, prefix) do
+        case zset_tree_prefix_path(ctx, redis_key, prefix) do
+          nil -> compound_scan_keydir(ctx, redis_key, prefix)
+          path -> path |> Ferricstore.Store.ZSetTree.members() |> zset_tree_value()
+        end
+      end
+
+      defp compound_scan_keydir(ctx, redis_key, prefix) do
         idx = shard_for(ctx, redis_key)
 
         if selected_waraft_ctx?(ctx) do
@@ -777,6 +838,16 @@ defmodule Ferricstore.Store.Router.Part10 do
               non_neg_integer()
             ) :: [{binary(), binary()}] | ReadResult.failure()
       def compound_scan_slice(ctx, redis_key, prefix, start, count, total) do
+        case zset_tree_prefix_path(ctx, redis_key, prefix) do
+          nil ->
+            compound_scan_slice_keydir(ctx, redis_key, prefix, start, count, total)
+
+          path ->
+            path |> Ferricstore.Store.ZSetTree.member_slice(start, count) |> zset_tree_value()
+        end
+      end
+
+      defp compound_scan_slice_keydir(ctx, redis_key, prefix, start, count, total) do
         idx = shard_for(ctx, redis_key)
 
         case prefix do
@@ -911,6 +982,41 @@ defmodule Ferricstore.Store.Router.Part10 do
             match_pattern,
             fields_only
           ) do
+        case zset_tree_prefix_path(ctx, redis_key, prefix) do
+          nil ->
+            compound_scan_page_keydir(
+              ctx,
+              redis_key,
+              prefix,
+              cursor,
+              count,
+              match_pattern,
+              fields_only
+            )
+
+          path ->
+            case Ferricstore.Store.ZSetTree.scan_page(
+                   path,
+                   cursor,
+                   count,
+                   match_pattern,
+                   fields_only
+                 ) do
+              {:ok, page} -> {:ok, page}
+              {:error, reason} -> zset_tree_failure(reason)
+            end
+        end
+      end
+
+      defp compound_scan_page_keydir(
+             ctx,
+             redis_key,
+             prefix,
+             cursor,
+             count,
+             match_pattern,
+             fields_only
+           ) do
         idx = shard_for(ctx, redis_key)
 
         request =
@@ -1078,6 +1184,19 @@ defmodule Ferricstore.Store.Router.Part10 do
       @spec compound_fields(FerricStore.Instance.t(), binary(), binary()) ::
               [binary()] | ReadResult.failure()
       def compound_fields(ctx, redis_key, prefix) do
+        case zset_tree_prefix_path(ctx, redis_key, prefix) do
+          nil ->
+            compound_fields_keydir(ctx, redis_key, prefix)
+
+          path ->
+            case Ferricstore.Store.ZSetTree.members(path) do
+              {:ok, members} -> Enum.map(members, &elem(&1, 0))
+              {:error, reason} -> zset_tree_failure(reason)
+            end
+        end
+      end
+
+      defp compound_fields_keydir(ctx, redis_key, prefix) do
         idx = shard_for(ctx, redis_key)
 
         if selected_waraft_ctx?(ctx) do
@@ -1095,6 +1214,13 @@ defmodule Ferricstore.Store.Router.Part10 do
       @spec compound_count(FerricStore.Instance.t(), binary(), binary()) ::
               non_neg_integer() | ReadResult.failure()
       def compound_count(ctx, redis_key, prefix) do
+        case zset_tree_prefix_path(ctx, redis_key, prefix) do
+          nil -> compound_count_keydir(ctx, redis_key, prefix)
+          path -> path |> Ferricstore.Store.ZSetTree.card() |> zset_tree_value()
+        end
+      end
+
+      defp compound_count_keydir(ctx, redis_key, prefix) do
         idx = shard_for(ctx, redis_key)
 
         if selected_waraft_ctx?(ctx) do
@@ -1239,6 +1365,24 @@ defmodule Ferricstore.Store.Router.Part10 do
       @spec zset_score_range(FerricStore.Instance.t(), binary(), term(), term(), boolean()) ::
               {:ok, [{binary(), float()}]} | :unavailable
       def zset_score_range(ctx, redis_key, min_bound, max_bound, reverse?) do
+        case zset_tree_read_path(ctx, redis_key) do
+          nil ->
+            zset_score_range_keydir(ctx, redis_key, min_bound, max_bound, reverse?)
+
+          path ->
+            path
+            |> Ferricstore.Store.ZSetTree.score_range_slice(
+              min_bound,
+              max_bound,
+              reverse?,
+              0,
+              :all
+            )
+            |> zset_tree_index_reply()
+        end
+      end
+
+      defp zset_score_range_keydir(ctx, redis_key, min_bound, max_bound, reverse?) do
         idx = shard_for(ctx, redis_key)
 
         if selected_waraft_ctx?(ctx) do
@@ -1264,6 +1408,40 @@ defmodule Ferricstore.Store.Router.Part10 do
             ) ::
               {:ok, [{binary(), float()}]} | :unavailable
       def zset_score_range_slice(ctx, redis_key, min_bound, max_bound, reverse?, offset, count) do
+        case zset_tree_read_path(ctx, redis_key) do
+          nil ->
+            zset_score_range_slice_keydir(
+              ctx,
+              redis_key,
+              min_bound,
+              max_bound,
+              reverse?,
+              offset,
+              count
+            )
+
+          path ->
+            path
+            |> Ferricstore.Store.ZSetTree.score_range_slice(
+              min_bound,
+              max_bound,
+              reverse?,
+              offset,
+              count
+            )
+            |> zset_tree_index_reply()
+        end
+      end
+
+      defp zset_score_range_slice_keydir(
+             ctx,
+             redis_key,
+             min_bound,
+             max_bound,
+             reverse?,
+             offset,
+             count
+           ) do
         idx = shard_for(ctx, redis_key)
 
         if selected_waraft_ctx?(ctx) do
@@ -1287,6 +1465,18 @@ defmodule Ferricstore.Store.Router.Part10 do
       @spec zset_score_count(FerricStore.Instance.t(), binary(), term(), term()) ::
               {:ok, non_neg_integer()} | :unavailable
       def zset_score_count(ctx, redis_key, min_bound, max_bound) do
+        case zset_tree_read_path(ctx, redis_key) do
+          nil ->
+            zset_score_count_keydir(ctx, redis_key, min_bound, max_bound)
+
+          path ->
+            path
+            |> Ferricstore.Store.ZSetTree.score_count(min_bound, max_bound)
+            |> zset_tree_index_reply()
+        end
+      end
+
+      defp zset_score_count_keydir(ctx, redis_key, min_bound, max_bound) do
         idx = shard_for(ctx, redis_key)
 
         if selected_waraft_ctx?(ctx) do

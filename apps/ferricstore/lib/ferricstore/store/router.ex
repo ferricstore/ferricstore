@@ -55,6 +55,7 @@ defmodule Ferricstore.Store.Router do
   @flow_claim_due_precheck_slack_ms 5
   @flow_shard_marker :__flow_shard_index__
 
+  use Ferricstore.Store.Router.ZSetTreeReads
   use Ferricstore.Store.Router.Part01
   use Ferricstore.Store.Router.Part02
   use Ferricstore.Store.Router.Part03

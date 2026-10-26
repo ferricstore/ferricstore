@@ -1820,10 +1820,39 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         end
       end
 
+      # A tree-encoded sorted set has no dedicated log: its members are in its
+      # tree file and its metadata stays in the shared log.
       defp promoted_marker_type(value) when is_binary(value) do
         case Promotion.decode_marker(value) do
+          {:ok, :zset_tree, :promoted, _generation} -> nil
           {:ok, type, :promoted, _generation} -> type
           _missing_invalid_or_intent -> nil
+        end
+      end
+
+      # The tree file of a tree-encoded sorted set (feature level 9), or nil.
+      defp zset_tree_path(ctx, redis_key) when is_binary(redis_key) do
+        marker_key = Promotion.marker_key(redis_key)
+
+        # A marker this entry wrote or deleted is staged, not yet in the keydir.
+        marker =
+          case Map.get(Process.get(:sm_pending_values, %{}), marker_key) do
+            {value, _expire_at_ms} when is_binary(value) -> value
+            :deleted -> nil
+            _not_staged -> cross_shard_ets_read(promoted_marker_ctx(ctx), marker_key)
+          end
+
+        case Ferricstore.Store.ZSetTree.marker_generation(marker) do
+          nil ->
+            nil
+
+          generation ->
+            Ferricstore.Store.ZSetTree.path(
+              promoted_data_dir(ctx),
+              ctx_index(ctx),
+              redis_key,
+              generation
+            )
         end
       end
 
