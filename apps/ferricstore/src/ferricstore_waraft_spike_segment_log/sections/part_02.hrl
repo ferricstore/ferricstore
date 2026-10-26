@@ -182,6 +182,7 @@ trim_to(Log, Name, Dir, Index, LastBefore, State) ->
                 ok ->
                     delete_before(Name, Index),
                     clear_offset_registry_before(Dir, Index),
+                    delete_segments_below_floor(Dir),
                     set_memory_boundaries_and_refresh(Name, Dir, Index, LastBefore),
                     rebuild_latest_config_cache(Log, Name, Dir),
                     {ok, State};
@@ -327,6 +328,55 @@ clear_offset_registry_before(Dir, Index) ->
                 _NoLast -> ok
             end;
         {error, _Reason} ->
+            ok
+    end.
+
+%% A segment wholly below the durable trim floor holds nothing a reader may
+%% ask for: reads below the floor answer not_found and recovery starts at the
+%% floor. Deleting it (and its offset index) is cleanup, so a failure leaves
+%% the files for the next trim or open instead of failing this one. Only the
+%% Raft log has a floor; projection logs are compacted by rewrites.
+delete_segments_below_floor(Dir) ->
+    case {segment_append_kind(Dir), logical_trim_floor_result(Dir), existing_records_per_segment(Dir)} of
+        {raft_log, {ok, Floor}, {ok, RecordsPerSegment}} when Floor > 0 ->
+            delete_segment_files_before(Dir, Floor div RecordsPerSegment);
+        _NoFloor ->
+            ok
+    end.
+
+delete_segment_files_before(_Dir, 0) ->
+    ok;
+delete_segment_files_before(Dir, BeforeOrdinal) ->
+    case file:list_dir(Dir) of
+        {ok, Files} ->
+            lists:foreach(
+                fun(File) ->
+                    Extension = filename:extension(File),
+                    case lists:member(Extension, [?SEGMENT_EXT, ".idx"]) andalso
+                             parse_segment_ordinal(filename:basename(File, Extension)) of
+                        {ok, Ordinal} when Ordinal < BeforeOrdinal ->
+                            delete_segment_file_below_floor(filename:join(Dir, File), Extension);
+                        _Keep ->
+                            ok
+                    end
+                end,
+                Files
+            );
+        {error, _Reason} ->
+            ok
+    end.
+
+delete_segment_file_below_floor(Path, Extension) ->
+    case file:read_link_info(Path, ?STAT_OPTS) of
+        {ok, #file_info{type = regular}} ->
+            %% A cached writer's descriptor would keep the space allocated.
+            _ = case Extension of
+                ?SEGMENT_EXT -> close_writer_for_path(Path);
+                _Index -> ok
+            end,
+            _ = file:delete(Path),
+            ok;
+        _NotRegular ->
             ok
     end.
 

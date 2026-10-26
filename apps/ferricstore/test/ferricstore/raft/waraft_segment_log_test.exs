@@ -581,7 +581,13 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
     )
   end
 
-  test "logical trim prunes sidecars without recreating indexes for trimmed records" do
+  # A trim only raised the logical floor and left the segment files below it
+  # on disk for good: Inspeactor's shard logs kept every segment since
+  # September (shard 13: 0.seg to 16.seg, about 1 GB, all below its floor).
+  # A segment wholly below the floor holds nothing a reader may ask for, so
+  # the trim deletes it with its offset index, and opening the log deletes the
+  # ones an older release left.
+  test "logical trim deletes segments and indexes below the floor" do
     clear_segment_offset_registry()
 
     with_segment_log_memory_env(
@@ -604,13 +610,19 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
                  )
 
         %{dir: segment_dir} = provider.memory_status(log)
+        old_segment = Path.join(segment_dir, "0.seg")
         old_index = Path.join(segment_dir, "0.idx")
+        live_segment = Path.join(segment_dir, "1.seg")
         live_index = Path.join(segment_dir, "1.idx")
+        assert File.regular?(old_segment)
         assert File.regular?(old_index)
-        assert File.regular?(live_index)
+        old_bytes = File.read!(old_segment)
 
+        # Index 64 opens segment 1, so segment 0 is wholly below the floor.
         assert {:ok, _} = provider.trim(log, 64, state)
+        refute File.exists?(old_segment)
         refute File.exists?(old_index)
+        assert File.regular?(live_segment)
         assert File.regular?(live_index)
         assert :not_found = provider.get(log, 63)
         assert {:ok, {1, {:cmd, 64}}} = provider.get(log, 64)
@@ -619,16 +631,10 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
         :ets.delete_all_objects(log_name)
         clear_segment_offset_registry()
 
-        # The obsolete physical segment is storage debt, not replayable WAL.
-        # Its corruption must not block a checkpointed restart.
-        old_segment = Path.join(segment_dir, "0.seg")
-        assert File.regular?(old_segment)
-        assert {:ok, fd} = :file.open(to_charlist(old_segment), [:read, :write, :binary, :raw])
-        assert :ok = :file.pwrite(fd, 8, <<0>>)
-        assert :ok = :file.close(fd)
-
+        # A segment an older release left below the floor goes on open.
+        File.write!(old_segment, old_bytes)
         assert {:ok, _} = provider.open(log)
-        refute File.exists?(old_index)
+        refute File.exists?(old_segment)
         assert {:ok, {1, {:cmd, 64}}} = provider.get(log, 64)
 
         assert {:ok, folded} =

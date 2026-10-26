@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A Raft log trim only raised the log's logical floor: the segment files
+  below it stayed on disk for good, so a shard kept every entry it ever
+  wrote (Inspeactor's shard 13 still had its segments from September, about
+  1 GB below its floor, and 7.3 GB of segments across its shards). A trim now
+  deletes the segments wholly below the floor with their offset indexes, and
+  opening a log deletes the ones earlier releases left.
 - A shard's Raft log could stop trimming for good and grow without bound:
   once a Flow was deleted before the trim that passed its value, every trim
   stopped with `{:segment_value_pin_missing_live_value, ...}` (Inspeactor's
