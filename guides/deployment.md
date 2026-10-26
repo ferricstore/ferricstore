@@ -84,13 +84,13 @@ The TCP acceptor uses the following socket options (hardcoded in `ferricstore_se
 docker run -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
-  quay.io/ferricstore/ferricstore:0.12.11
+  quay.io/ferricstore/ferricstore:0.12.12
 ```
 
 The official image is published publicly to Quay.io:
 
 ```bash
-docker pull quay.io/ferricstore/ferricstore:0.12.11
+docker pull quay.io/ferricstore/ferricstore:0.12.12
 ```
 
 Current release images are published as multi-arch images for `linux/amd64`
@@ -110,7 +110,7 @@ docker run --rm -p 6388:6388 -p 8080:8080 \
   -e FERRICSTORE_HTTP_TLS_KEY_FILE=/run/secrets/ferricstore/http-key.pem \
   -v "$PWD/certs:/run/secrets/ferricstore:ro" \
   -v ferricstore_data:/data \
-  quay.io/ferricstore/ferricstore:0.12.11
+  quay.io/ferricstore/ferricstore:0.12.12
 ```
 
 Create a least-privilege ACL identity before sending requests. Certificate
@@ -127,8 +127,17 @@ docker run -p 6388:6388 \
   --security-opt seccomp=unconfined \
   -e FERRICSTORE_PROTECTED_MODE=true \
   -v /mnt/nvme/ferricstore:/data \
-  quay.io/ferricstore/ferricstore:0.12.11
+  quay.io/ferricstore/ferricstore:0.12.12
 ```
+
+#### Give the Container Time to Stop
+
+A graceful stop closes and syncs every shard. On about 10 GB of data it takes
+15 to 20 seconds, longer than Docker's default 10-second grace period, after
+which Docker kills the process and the next start recovers as it would after a
+crash. Allow two minutes: `docker stop -t 120`, `stop_grace_period: 2m` in
+Compose, or `terminationGracePeriodSeconds: 120` in Kubernetes. The Fargate
+stack already sets `stopTimeout = 120`.
 
 #### Why io_uring Matters
 
@@ -260,9 +269,10 @@ spec:
   replicas: 3
   template:
     spec:
+      terminationGracePeriodSeconds: 120
       containers:
         - name: ferricstore
-           image: quay.io/ferricstore/ferricstore:0.12.11
+          image: quay.io/ferricstore/ferricstore:0.12.12
           ports:
             - name: native
               containerPort: 6388

@@ -2,7 +2,7 @@ defmodule Ferricstore.ReleaseVersionTest do
   use ExUnit.Case, async: true
 
   @repo_root Path.expand("../../../..", __DIR__)
-  @release_version "0.12.11"
+  @release_version "0.12.12"
 
   @project_files [
     "mix.exs",
