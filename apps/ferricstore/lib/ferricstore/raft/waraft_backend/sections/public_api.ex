@@ -4,6 +4,8 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
   # Extracted from WARaftBackend: is_storage_unknown_outcome_reason .. do_peer_ready
   defmacro __using__(_opts) do
     quote do
+      require Logger
+
       alias Ferricstore.ErrorReasons
       alias Ferricstore.NamespaceConfig
       alias Ferricstore.Raft.BlobCommand
@@ -255,10 +257,43 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       defp ensure_backend_data_layout(ctx) do
         with :ok <- validate_waraft_segment_log_dirs(ctx) do
           Ferricstore.DataDir.ensure_layout!(ctx.data_dir, ctx.shard_count)
+          remove_stale_snapshots(ctx)
         end
       rescue
         error in File.Error ->
           {:error, {:data_layout_failed, error.reason}}
+      end
+
+      # A snapshot is a full copy of a shard, made only to send the shard to
+      # another node, and nothing reads one at startup. Stops before 0.12.12
+      # left one in every shard, and WARaft keeps up to two. No shard runs
+      # yet, so no transfer can be reading them: remove them all.
+      defp remove_stale_snapshots(ctx) do
+        for partition <- 1..ctx.shard_count,
+            root = Path.join([ctx.data_dir, "waraft", "#{@table}.#{partition}"]),
+            {:ok, names} <- [File.ls(root)],
+            name <- names,
+            Regex.match?(~r/\Asnapshot\.\d+\.\d+(\.|\z)/, name) do
+          remove_stale_snapshot(Path.join(root, name))
+        end
+
+        :ok
+      end
+
+      defp remove_stale_snapshot(path) do
+        with {:ok, %{type: :directory}} <- File.lstat(path),
+             {:ok, _removed} <- File.rm_rf(path) do
+          Logger.notice("Removed stale WARaft snapshot #{path}")
+        else
+          {:ok, %File.Stat{}} ->
+            :ok
+
+          {:error, reason, _file} ->
+            Logger.warning("Could not remove stale WARaft snapshot #{path}: #{inspect(reason)}")
+
+          {:error, reason} ->
+            Logger.warning("Could not remove stale WARaft snapshot #{path}: #{inspect(reason)}")
+        end
       end
 
       defp validate_waraft_segment_log_dirs(ctx) do
