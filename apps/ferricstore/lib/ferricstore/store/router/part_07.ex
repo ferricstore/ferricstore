@@ -483,7 +483,8 @@ defmodule Ferricstore.Store.Router.Part07 do
       end
 
       defp flow_claim_due_any_cold_empty?(ctx, idx, attrs) do
-        if Map.get(attrs, :cold_due_mode) == :skip or not Ferricstore.Flow.Hibernation.enabled?() do
+        if Map.get(attrs, :cold_due_mode) == :skip or not Ferricstore.Flow.Hibernation.enabled?() or
+             flow_claim_due_hibernated_indexed?(ctx, idx) do
           true
         else
           # Only an exact, bounded negative proof can bypass the replicated
@@ -614,6 +615,7 @@ defmodule Ferricstore.Store.Router.Part07 do
            ) do
         with true <- cold_due_mode in [:allow, :block],
              true <- Ferricstore.Flow.Hibernation.enabled?(),
+             false <- flow_claim_due_hibernated_indexed?(ctx, idx),
              {:ok, states} <- flow_claim_due_precheck_states(state),
              priorities <- flow_claim_any_priorities(priority),
              true <- Enum.all?(priorities, &is_integer/1),
@@ -695,6 +697,15 @@ defmodule Ferricstore.Store.Router.Part07 do
           end)
         end)
       end
+
+      # From feature level 8 hibernated Flows stay in the hot index, which the
+      # precheck has already read; their claim never reads cold rows.
+      defp flow_claim_due_hibernated_indexed?(%{keydir_refs: keydir_refs}, idx)
+           when is_tuple(keydir_refs) and is_integer(idx) and idx >= 0 and
+                  idx < tuple_size(keydir_refs),
+           do: Ferricstore.Flow.Hibernation.level_8_keydir?(elem(keydir_refs, idx))
+
+      defp flow_claim_due_hibernated_indexed?(_ctx, _idx), do: false
 
       defp flow_claim_due_cold_precheck_path(%{data_dir: data_dir}, idx)
            when is_binary(data_dir) and is_integer(idx) and idx >= 0 do

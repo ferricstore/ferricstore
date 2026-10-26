@@ -114,6 +114,13 @@ defmodule Ferricstore.Flow.LMDBWriter.Quarantine do
   def action_state_key({:hibernate_flow_evict_hot, %{state_key: key}}) when is_binary(key),
     do: {:ok, key}
 
+  def action_state_key({:hibernate_flow_drop_value, %{state_key: key}}) when is_binary(key),
+    do: {:ok, key}
+
+  def action_state_key({:cleanup_superseded_cold_rows, _path, key, _version})
+      when is_binary(key),
+      do: {:ok, key}
+
   def action_state_key({:delete_flow_tombstone, _ets, key}) when is_binary(key), do: {:ok, key}
   def action_state_key(_action), do: :error
 

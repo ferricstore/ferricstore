@@ -588,7 +588,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
            ) do
         mode = Map.get(attrs, :cold_due_mode, :skip)
 
-        flow_hibernation_enabled?(state) and remaining > 0 and mode in [:allow, :block]
+        # From feature level 8 hibernated Flows keep their index entries, so the
+        # scan above already saw them. Promotion read the node-local cold due
+        # rows, which each node writes and drops on its own schedule.
+        flow_hibernation_enabled?(state) and remaining > 0 and mode in [:allow, :block] and
+          not feature_level_8?(state)
       end
 
       @doc false
@@ -1151,6 +1155,146 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
       defp flow_claim_priority_match?(:any, _record_priority), do: true
       defp flow_claim_priority_match?(priority, priority), do: true
       defp flow_claim_priority_match?(_priority, _record_priority), do: false
+
+      @flow_hibernated_restore_page_size 512
+
+      # Raising feature level 8 brings back the Flows that hibernated before
+      # it: their keydir rows and index entries left memory, and only this
+      # node's LMDB mirror (their cold park rows) locates them. Each comes back
+      # as hibernation leaves a Flow from level 8, a keydir row without a
+      # cached value plus its index entries. Every replica ends with the same
+      # rows and entries: a node evicts a Flow only after its mirror holds the
+      # park, so each Flow is still in the keydir or has a park. Runs under the
+      # shard's publication latch, which an eviction queued before the level
+      # holds while it reads the level and deletes, so no Flow is missed.
+      defp flow_restore_hibernated_flows(state) do
+        path = flow_lmdb_record_path(state)
+
+        case instance_ctx_for_state(state) do
+          %FerricStore.Instance{} = ctx ->
+            Ferricstore.Store.PublicationEpoch.with_write(ctx, state.shard_index, fn ->
+              flow_restore_hibernated_page(state, path, <<>>, 0)
+            end)
+
+          nil ->
+            {:error, :instance_unavailable}
+        end
+      end
+
+      defp flow_restore_hibernated_page(state, path, after_key, restored) do
+        case Ferricstore.Flow.LMDB.prefix_entries_after(
+               path,
+               Ferricstore.Flow.LMDB.Cold.park_prefix(),
+               after_key,
+               @flow_hibernated_restore_page_size
+             ) do
+          {:ok, []} ->
+            :telemetry.execute(
+              [:ferricstore, :flow, :hibernation, :restore],
+              %{count: restored},
+              %{shard_index: state.shard_index}
+            )
+
+            :ok
+
+          {:ok, entries} ->
+            entries
+            |> Enum.reduce_while({:ok, restored}, fn {_park_key, park_blob}, {:ok, count} ->
+              case flow_restore_hibernated_park(state, path, park_blob) do
+                :restored -> {:cont, {:ok, count + 1}}
+                :skip -> {:cont, {:ok, count}}
+                {:error, _reason} = error -> {:halt, error}
+              end
+            end)
+            |> case do
+              {:ok, count} ->
+                {last_key, _blob} = List.last(entries)
+                flow_restore_hibernated_page(state, path, last_key, count)
+
+              {:error, _reason} = error ->
+                error
+            end
+
+          {:error, reason} ->
+            {:error, {:hibernated_park_scan_failed, reason}}
+        end
+      end
+
+      defp flow_restore_hibernated_park(state, path, park_blob) do
+        with {:ok, %{locator: %Locator{kind: :state} = locator, state_key: state_key} = park}
+             when is_binary(state_key) <- Ferricstore.Flow.LMDB.decode_cold_park(park_blob),
+             false <- flow_restore_keydir_present?(state, state_key),
+             true <- flow_keydir_file_visible_during_recovery?(state, locator.file_id),
+             true <- flow_hibernated_park_current?(state, path, state_key, locator) do
+          flow_restore_hibernated_record(state, state_key, locator, park)
+        else
+          {:error, _reason} = error -> error
+          _hot_stale_or_invalid -> :skip
+        end
+      end
+
+      # Replay after a restart may find rows written after the entry it applies;
+      # it reads past them, as other Flow reads in recovery do.
+      defp flow_restore_keydir_present?(state, state_key) do
+        case flow_recovery_before_raft_index(state) do
+          nil ->
+            :ets.member(state.ets, state_key)
+
+          before_raft_index ->
+            flow_keydir_key_present_before?(state, state_key, before_raft_index)
+        end
+      end
+
+      # A park names the version hibernation evicted. The Flow's query row names
+      # its latest version; a later version (a Flow that ran and was pruned once
+      # terminal, or a stale park) is not restored. A query row written after
+      # the entry being replayed says nothing about it.
+      defp flow_hibernated_park_current?(state, path, state_key, %Locator{} = locator) do
+        case Ferricstore.Flow.LMDB.get(path, state_key) do
+          {:ok, blob} when is_binary(blob) ->
+            case Ferricstore.Flow.Query.QueryRowCodec.decode(blob, state_key) do
+              {:ok, %{locator: %Locator{flow_id: flow_id, version: version}} = row} ->
+                if Ferricstore.Flow.Query.QueryRecordStore.visible_before_raft_index?(
+                     row,
+                     flow_recovery_before_raft_index(state)
+                   ),
+                   do: flow_id == locator.flow_id and version == locator.version,
+                   else: true
+
+              _other ->
+                false
+            end
+
+          :not_found ->
+            false
+
+          {:error, reason} ->
+            {:error, {:hibernated_query_row_read_failed, reason}}
+        end
+      end
+
+      defp flow_restore_hibernated_record(state, state_key, %Locator{} = locator, park) do
+        with {:ok, value} when is_binary(value) <-
+               flow_read_cold_park_state_value(state, state_key, locator, park),
+             record when is_map(record) <- flow_decode_hot_state_value(value),
+             true <- flow_locator_matches_record?(locator, record) do
+          # Never over a row: in replay one may already hold a later version.
+          if :ets.insert_new(
+               state.ets,
+               {state_key, nil, locator.expire_at_ms || 0, LFU.initial(), locator.file_id,
+                locator.offset, locator.value_size}
+             ) do
+            with :ok <- flow_install_hot_cold_indexes_now(state, record),
+                 :ok <- flow_lane_insert_record(state, record) do
+              :restored
+            end
+          else
+            :skip
+          end
+        else
+          _unreadable -> {:error, {:hibernated_flow_unreadable, state_key}}
+        end
+      end
 
       defp flow_install_hot_cold_record(state, state_key, value, %Locator{} = locator, record) do
         if flow_keydir_file_visible_during_recovery?(state, locator.file_id) do

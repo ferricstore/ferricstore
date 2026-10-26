@@ -1421,6 +1421,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
           do_get(state, Ferricstore.Cluster.FeatureLevel.key(7)) ==
             Ferricstore.Cluster.FeatureLevel.marker()
 
+      defp feature_level_8?(state),
+        do:
+          do_get(state, Ferricstore.Cluster.FeatureLevel.key(8)) ==
+            Ferricstore.Cluster.FeatureLevel.marker()
+
       # A key's TTL is stored on each of its members. From feature level 6 a
       # member written into a collection that has one takes it (its type key's
       # expiry, while in the future), so members added after EXPIRE expire with

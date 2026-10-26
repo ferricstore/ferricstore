@@ -67,6 +67,7 @@ defmodule Ferricstore.Test.ClusterHelper do
     - `opts` -- keyword options:
       - `:shards` -- number of shards per node (default: 4)
       - `:timeout` -- leader election timeout in ms (default: 15_000)
+      - `:app_env` -- `:ferricstore` settings to put before the app starts
 
   ## Returns
 
@@ -123,6 +124,10 @@ defmodule Ferricstore.Test.ClusterHelper do
     # then start the FerricStore application.
     Enum.each(nodes, fn node ->
       configure_remote_node(node.name, node.data_dir, shards)
+
+      for {key, value} <- Keyword.get(opts, :app_env, []) do
+        :ok = :rpc.call(node.name, Application, :put_env, [:ferricstore, key, value])
+      end
 
       # Set cluster_nodes so Raft.Cluster.start_shard_server uses all
       # nodes as initial_members for each shard's Raft group.
@@ -418,6 +423,7 @@ defmodule Ferricstore.Test.ClusterHelper do
       - `:timeout` -- leader election timeout in ms (default: 30_000)
       - `:fresh_data` -- replace the old data directory with a new empty one
         (default: false)
+      - `:app_env` -- `:ferricstore` settings to put before the app starts
 
   ## Returns
 
@@ -469,6 +475,10 @@ defmodule Ferricstore.Test.ClusterHelper do
     :ok = ensure_nodes_reachable(node_names, timeout: timeout)
 
     configure_remote_node(node_name, restarted.data_dir, shards)
+
+    for {key, value} <- Keyword.get(opts, :app_env, []) do
+      :ok = :rpc.call(node_name, Application, :put_env, [:ferricstore, key, value])
+    end
 
     :ok =
       :rpc.call(node_name, Application, :put_env, [

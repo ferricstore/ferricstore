@@ -12,6 +12,19 @@ All notable changes to FerricStore will be documented here.
   and stayed queued past its run time. From feature level 7 such a claim
   promotes and claims the automatic partitions' Flows, as its hot scan
   already did; raise the level once every node runs this release.
+- Replicas could claim different Flows. Each node hibernated a Flow on its
+  own schedule, once its own LMDB writer had flushed it, by removing the
+  Flow's keydir row and index entries, and a restart rebuilt them from that
+  node's mirror. A claim took the Flows still indexed first and promoted the
+  rest from the node-local mirror, so a node whose writer was behind, or that
+  had restarted, claimed a different Flow than the others: in a 3-node test
+  two nodes claimed one Flow and the third, the leader, claimed and returned
+  another. From feature level 8 hibernation drops only the record's cached
+  value; the keydir row and index entries stay, a claim reads a hibernated
+  record from disk, and apply no longer reads the mirror's cold rows (claims
+  also stop scanning them in the apply loop). Raising the level brings back
+  the Flows hibernated before it. A hibernated Flow now keeps about 1 KB of
+  memory for its keydir row and index entries.
 
 ## 0.12.12 - 2026-10-26
 

@@ -33,6 +33,38 @@ defmodule Ferricstore.Store.KeydirConcurrencyTest do
     end
   end
 
+  test "unchanged source value drop keeps the row and its counter, and skips a changed row" do
+    cases = [
+      {"numeric", LFU.initial(), LFU.initial() + 1},
+      {
+        "tagged",
+        {:flow_state_version, 7, LFU.initial()},
+        {:flow_state_version, 7, LFU.initial() + 1}
+      }
+    ]
+
+    Enum.each(cases, fn {label, observed_lfu, current_lfu} ->
+      table = new_keydir()
+      key = "keydir-source-drop-#{label}"
+      observed = {key, "old", 10, observed_lfu, 1, 20, 3}
+      current = put_elem(observed, 3, current_lfu)
+
+      try do
+        true = :ets.insert(table, current)
+
+        assert Keydir.drop_value_unchanged_source(table, observed)
+        assert [{^key, nil, 10, ^current_lfu, 1, 20, 3}] = :ets.lookup(table, key)
+
+        replacement = {key, "new", 10, current_lfu, 2, 40, 3}
+        true = :ets.insert(table, replacement)
+        refute Keydir.drop_value_unchanged_source(table, observed)
+        assert [^replacement] = :ets.lookup(table, key)
+      after
+        :ets.delete(table)
+      end
+    end)
+  end
+
   test "unchanged source delete ignores numeric and tagged LFU counter changes" do
     cases = [
       {"numeric", LFU.initial(), LFU.initial() + 1},

@@ -152,6 +152,87 @@ defmodule Ferricstore.Flow.Hibernation do
 
   def demotable?(_record, _now_ms, _opts), do: false
 
+  @doc """
+  Whether a shard's keydir holds feature level 8's marker. Only the marker is
+  ever written under a level key, so a row whose value memory pressure dropped
+  still means the level is active.
+  """
+  @spec level_8_keydir?(:ets.tid() | atom()) :: boolean()
+  def level_8_keydir?(keydir) do
+    key = Ferricstore.Cluster.FeatureLevel.key(8)
+    marker = Ferricstore.Cluster.FeatureLevel.marker()
+
+    case :ets.lookup(keydir, key) do
+      [{^key, value, _expire_at_ms, _lfu, _file_id, _offset, _value_size}] ->
+        value == marker or is_nil(value)
+
+      _other ->
+        false
+    end
+  rescue
+    ArgumentError -> false
+  end
+
+  @doc """
+  From feature level 8 hibernation drops only a waiting Flow's cached record,
+  which a restart loads again. Startup drops it again for the Flows that
+  hibernation would leave cold now. Whether a value is cached changes nothing
+  apply reads, so each node decides this on its own clock. Returns how many
+  values were dropped.
+  """
+  @spec drop_cached_values(
+          :ets.tid() | atom(),
+          [tuple()],
+          [{binary(), map()}],
+          non_neg_integer(),
+          ApplyContext.t()
+        ) :: non_neg_integer()
+  def drop_cached_values(keydir, rows, records, now_ms, %ApplyContext{} = context) do
+    if enabled?(context) and records != [] and level_8_keydir?(keydir) do
+      rows_by_key =
+        for {key, value, _expire_at_ms, _lfu, _file_id, _offset, _value_size} = row <- rows,
+            is_binary(value),
+            into: %{},
+            do: {key, row}
+
+      opts = [hot_window_ms: hot_window_ms(context), safety_margin_ms: safety_margin_ms(context)]
+
+      Enum.count(records, fn {key, record} ->
+        case Map.fetch(rows_by_key, key) do
+          {:ok, row} ->
+            demotable?(record, now_ms, opts) and
+              Ferricstore.Store.Keydir.drop_value_unchanged_source(keydir, row)
+
+          :error ->
+            false
+        end
+      end)
+    else
+      0
+    end
+  end
+
+  @doc """
+  Whether a record was due far enough past its last write for that write to
+  hibernate it.
+  """
+  @spec hibernated_when_written?(map(), ApplyContext.t()) :: boolean()
+  def hibernated_when_written?(record, %ApplyContext{} = context) when is_map(record) do
+    case Map.get(record, :updated_at_ms) do
+      written_at_ms when is_integer(written_at_ms) and written_at_ms >= 0 ->
+        enabled?(context) and
+          demotable?(record, written_at_ms,
+            hot_window_ms: hot_window_ms(context),
+            safety_margin_ms: safety_margin_ms(context)
+          )
+
+      _unknown ->
+        false
+    end
+  end
+
+  def hibernated_when_written?(_record, _context), do: false
+
   @spec demote_candidates([candidate()], keyword()) ::
           {:ok, demote_result()} | {:error, term(), demote_result()}
   def demote_candidates(candidates, opts)
@@ -777,6 +858,67 @@ defmodule Ferricstore.Flow.Hibernation do
 
   def stale_due_cleanup_batch(_due_key, _park_key, _park_snapshot),
     do: {:error, :invalid_stale_due_cleanup}
+
+  @doc """
+  Removes the cold rows (park, by-segment and due) that hibernation wrote for
+  `version` of a Flow before feature level 8, once a newer version replaced
+  it. The LMDB writer runs this after flushing that write, and only if the
+  park still names `version`.
+  """
+  @spec cleanup_superseded_cold_rows(binary(), binary(), non_neg_integer()) ::
+          :ok | {:error, term()}
+  def cleanup_superseded_cold_rows(path, state_key, version)
+      when is_binary(path) and is_binary(state_key) and state_key != "" and
+             is_integer(version) and version >= 0 do
+    park_key = LMDB.cold_park_key_for_state_key(state_key)
+
+    case LMDB.get(path, park_key) do
+      {:ok, park_blob} when is_binary(park_blob) ->
+        case LMDB.decode_cold_park(park_blob) do
+          {:ok, %{locator: %Locator{version: ^version} = locator, state_key: ^state_key} = park} ->
+            delete_superseded_cold_rows(path, park_key, park_blob, locator, park)
+
+          _other_version_or_invalid ->
+            :ok
+        end
+
+      :not_found ->
+        :ok
+
+      {:error, _reason} = error ->
+        error
+    end
+  rescue
+    error in [ArgumentError, KeyError] -> {:error, {:invalid_cold_park, Exception.message(error)}}
+  end
+
+  def cleanup_superseded_cold_rows(_path, _state_key, _version),
+    do: {:error, :invalid_superseded_cold_rows}
+
+  defp delete_superseded_cold_rows(path, park_key, park_blob, locator, park) do
+    due_key =
+      LMDB.cold_due_key(
+        type: Map.fetch!(park, :type),
+        state: Map.fetch!(park, :state),
+        partition_key: Map.get(park, :partition_key) || "",
+        priority: Map.get(park, :priority, 0),
+        due_at_ms: Map.fetch!(park, :due_at_ms),
+        flow_id: locator.flow_id,
+        version: locator.version
+      )
+
+    case LMDB.write_batch(path, [
+           {:compare, park_key, park_blob},
+           {:delete, park_key},
+           {:delete, LMDB.cold_by_segment_key(locator)},
+           {:delete, due_key}
+         ]) do
+      :ok -> :ok
+      {:error, {:compare_failed, ^park_key}} -> :ok
+      {:error, _reason} = error -> error
+      other -> {:error, {:invalid_superseded_cold_cleanup_result, other}}
+    end
+  end
 
   @spec cleanup_stale_due_batches(binary(), [stale_due_cleanup_batch()]) ::
           :ok | {:error, term()}

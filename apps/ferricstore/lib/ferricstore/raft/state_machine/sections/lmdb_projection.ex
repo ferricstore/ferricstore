@@ -259,7 +259,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
         end
       end
 
-      defp enqueue_pending_lmdb_mirror_work(_state, [], _after_flush), do: :ok
+      defp enqueue_pending_lmdb_mirror_work(_state, [], []), do: :ok
 
       defp enqueue_pending_lmdb_mirror_work(state, ops, after_flush),
         do: enqueue_lmdb_mirror_groups(state, ops, after_flush)
@@ -362,6 +362,56 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
       end
 
       defp flow_hibernation_candidate_items(
+             state,
+             key,
+             record,
+             state_value,
+             pending_projections
+           ) do
+        if feature_level_8?(state) do
+          flow_hibernation_drop_value_items(state, key, record, state_value)
+        else
+          flow_hibernation_evict_items(state, key, record, state_value, pending_projections)
+        end
+      end
+
+      # From feature level 8 hibernation drops only the record's cached value
+      # from its keydir row. The row, which locates the record on disk, and
+      # the Flow's index entries stay, so apply sees the same Flows on every
+      # replica whenever each node's LMDB writer gets to the eviction, and
+      # after a restart. Nothing is written to LMDB.
+      defp flow_hibernation_drop_value_items(state, key, record, state_value) do
+        case :ets.lookup(state.ets, key) do
+          [{^key, current_value, _expire_at_ms, _lfu, file_id, offset, value_size}]
+          when valid_cold_location(file_id, offset, value_size) or
+                 valid_waraft_segment_location(file_id, offset, value_size) ->
+            if flow_keydir_file_visible_during_recovery?(state, file_id) and
+                 flow_hibernation_candidate_current?(current_value, state_value, record) do
+              action =
+                {:hibernate_flow_drop_value,
+                 %{
+                   data_dir: Map.get(state, :data_dir),
+                   shard_index: state.shard_index,
+                   ets: state.ets,
+                   state_key: key,
+                   file_id: file_id,
+                   offset: offset,
+                   value_size: value_size
+                 }}
+
+              {:ok, {[], [{:lmdb_shard, state.shard_index, action}]}}
+            else
+              :skip
+            end
+
+          _missing_or_pending ->
+            :skip
+        end
+      rescue
+        ArgumentError -> :skip
+      end
+
+      defp flow_hibernation_evict_items(
              state,
              key,
              record,
