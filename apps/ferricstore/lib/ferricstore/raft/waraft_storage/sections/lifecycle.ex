@@ -115,16 +115,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
             Ferricstore.Raft.WARaftBackend.cache_config(shard_index, recovered_config)
 
             sm_state =
-              profile_startup_phase(
-                shard_index,
-                root_dir,
-                :recover_apply_projection_value_locators,
-                fn ->
-                  recover_apply_projection_value_locators!(sm_state, root_dir)
-                end
-              )
-
-            sm_state =
               profile_startup_phase(shard_index, root_dir, :rebuild_segment_indexes, fn ->
                 rebuild_indexes_from_segment_keydir(sm_state, ctx, shard_index)
               end)

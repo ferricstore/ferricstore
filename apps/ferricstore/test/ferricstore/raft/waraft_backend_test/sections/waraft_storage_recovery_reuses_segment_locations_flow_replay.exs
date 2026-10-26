@@ -97,112 +97,77 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageRecoveryReuse
         end
       end
 
-      @tag :recovery_pin_batch
-      test "startup locator replay batches validated Flow pin writes across WAL records", %{
-        root: root,
-        ctx: ctx
-      } do
-        parent = self()
-        handler_id = {:recovered_pin_batches, make_ref()}
+      # Startup wrote a locator and a pin for every Flow value in the
+      # apply-projection log. That log still holds values deleted since (until
+      # a trim compacts it) and values the history projector copied to a
+      # history file, so a restart brought deleted values back and pointed
+      # projected ones at the log again, and the pins kept both in the log for
+      # good (Inspeactor: about 1,300 pins a shard, 212 for deleted Flows). Once
+      # such a value's Flow was deleted, its pin stopped every trim. LMDB writes
+      # are durable and the keydir is rebuilt from the projection and the log,
+      # so a restart leaves Flow value locators as they are.
+      @tag :flow_replay_segment_locations
+      test "a crash restart neither brings back a deleted Flow value nor repoints a projected one",
+           %{
+             root: root,
+             ctx: ctx
+           } do
+        assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+        deleted = Ferricstore.Flow.Keys.value_key("restart-deleted", :payload, 1, "tenant")
+        projected = Ferricstore.Flow.Keys.value_key("restart-projected", :payload, 1, "tenant")
+        {_log, index} = append_waraft_fence!("restart-locators:fence", "v")
 
-        :telemetry.attach(
-          handler_id,
-          [:ferricstore, :waraft, :storage, :recovery_pin_batch],
-          fn _event, measurements, metadata, pid ->
-            send(pid, {:recovered_pin_batch, measurements, metadata})
+        assert :ok =
+                 Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(root, 0, index, [
+                   {deleted, "gone", 0},
+                   {projected, "kept", 0}
+                 ])
+
+        assert {:ok, 2} =
+                 Ferricstore.Raft.WARaftSegmentReader.spill_apply_projection_cache(root, 0)
+
+        lmdb_path =
+          ctx.data_dir
+          |> Ferricstore.DataDir.shard_data_path(0)
+          |> Ferricstore.Flow.LMDB.path()
+
+        history_locator =
+          Ferricstore.Flow.LMDB.encode_value_locator(0, {:flow_history, 0}, 128, 4)
+
+        assert :ok =
+                 Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:put, projected, history_locator}])
+
+        # A crash (an OOM kill, say) skips the shutdown compaction that would
+        # drop both values from the log.
+        storage = :wa_raft_storage.registered_name(:ferricstore_waraft_backend, 1)
+        storage_pid = Process.whereis(storage)
+        monitor = Process.monitor(storage_pid)
+        Process.exit(storage_pid, :kill)
+        assert_receive {:DOWN, ^monitor, :process, ^storage_pid, :killed}, 5_000
+
+        assert_eventually(
+          fn ->
+            case Process.whereis(storage) do
+              pid when is_pid(pid) and pid != storage_pid ->
+                match?({:ok, _position}, WARaftBackend.storage_position(0))
+
+              _ ->
+                false
+            end
           end,
-          parent
+          true,
+          200
         )
 
-        on_exit(fn -> :telemetry.detach(handler_id) end)
+        assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, deleted)
+        assert {:ok, ^history_locator} = Ferricstore.Flow.LMDB.get(lmdb_path, projected)
 
-        assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
-
-        refs =
-          for i <- 1..4 do
-            key = Ferricstore.Flow.Keys.value_key("recovered-pin-#{i}", :payload, 1, "tenant")
-
-            assert Ferricstore.Flow.HistoryProjector.ValueProjection.generated_flow_value_ref?(
-                     key
-                   )
-
-            assert :ok =
-                     Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
-                       root,
-                       0,
-                       1_000 + i,
-                       [{key, "value-#{i}", 0}]
-                     )
-
-            key
-          end
-
-        assert :ok =
-                 Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
-                   root,
-                   0,
-                   1_005,
-                   [{hd(refs), "latest", 0}]
+        assert {:ok, []} =
+                 Ferricstore.Flow.LMDB.segment_value_pin_entries_before(
+                   lmdb_path,
+                   index + 1,
+                   100
                  )
-
-        assert {:ok, 5} =
-                 Ferricstore.Raft.WARaftSegmentReader.spill_apply_projection_cache(root, 0)
-
-        shard_path = Ferricstore.DataDir.shard_data_path(root, 0)
-        state = %{shard_data_path: shard_path, shard_index: 0}
-
-        assert ^state =
-                 WARaftStorage.__recover_apply_projection_value_locators_for_test__(
-                   state,
-                   waraft_storage_root(root, 0)
-                 )
-
-        assert_receive {:recovered_pin_batch, %{ops: 10}, %{shard_index: 0, result: :ok}},
-                       1_000
-
-        lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
-
-        Enum.each(refs, fn key ->
-          assert {:ok, _encoded_locator} = Ferricstore.Flow.LMDB.get(lmdb_path, key)
-        end)
-
-        assert {:ok, encoded_latest} = Ferricstore.Flow.LMDB.get(lmdb_path, hd(refs))
-
-        assert {:ok, {:flow_value_locator, 1, 0, {:waraft_apply_projection, 1_005}, 0, 6}} =
-                 Ferricstore.TermCodec.decode(encoded_latest)
-      end
-
-      @tag :recovery_pin_batch
-      test "batched locator replay fails closed when LMDB cannot accept the pins", %{
-        root: root,
-        ctx: ctx
-      } do
-        assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
-        key = Ferricstore.Flow.Keys.value_key("pin-write-failure", :payload, 1, "tenant")
-
-        assert :ok =
-                 Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
-                   root,
-                   0,
-                   1_001,
-                   [{key, "value", 0}]
-                 )
-
-        assert {:ok, 1} =
-                 Ferricstore.Raft.WARaftSegmentReader.spill_apply_projection_cache(root, 0)
-
-        blocked_shard_path = Path.join(root, "blocked-pin-shard")
-        File.write!(blocked_shard_path, "not a directory")
-        state = %{shard_data_path: blocked_shard_path, shard_index: 0}
-
-        assert_raise RuntimeError,
-                     ~r/failed to recover WARaft apply projection value locators/,
-                     fn ->
-                       WARaftStorage.__recover_apply_projection_value_locators_for_test__(
-                         state,
-                         waraft_storage_root(root, 0)
-                       )
-                     end
       end
 
       @tag :flow_replay_segment_locations

@@ -13,6 +13,13 @@ All notable changes to FerricStore will be documented here.
   now releases the pin of a deleted value and drops its bytes; no read
   reaches a value without a locator or a keydir row. 0.12.10's fix covered
   only pins whose source no longer held the value.
+- After a crash (an OOM kill, say), startup wrote an LMDB locator and a pin
+  for every Flow value still in the apply-projection log. Values deleted
+  since came back as orphan locators, values already moved to a history file
+  were pointed at the log again, and the pins kept all of them on disk for
+  good; a deleted Flow's pin then stopped trims as above. Startup no longer
+  writes them. Orphans left by earlier restarts stay until their key is
+  written again.
 - A log trim deferred until a projection checkpoint was ready, or done only
   up to an older checkpoint, counted as a full trim, so the next trim came
   only a full rotation interval later (50,000 entries by default) or at a
