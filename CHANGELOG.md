@@ -4,6 +4,14 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A stop no longer turns into a crash for a busy shard. WARaft kills a
+  storage process whose close runs past 30 s, and close could wait longer
+  than that for Flow history and cache compaction (10 s per history shard,
+  10 s more for the replay cursor, up to 30 s for a compaction). Those waits
+  now share one budget, `:waraft_storage_close_budget_ms` (default 20 s). A
+  close that leaves replay to the next start logs the shard and the position
+  replay starts from.
+
 ## 0.12.14 - 2026-10-26
 
 - A start after a stop or crash that left a Flow's retention delete

@@ -569,9 +569,17 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
         end
       end
 
-      defp drain_apply_projection_cache_compaction_for_snapshot(%{
-             apply_projection_cache_compaction: %{pid: pid}
-           })
+      defp drain_apply_projection_cache_compaction_for_snapshot(handle),
+        do:
+          drain_apply_projection_cache_compaction_for_snapshot(
+            handle,
+            snapshot_compaction_drain_timeout_ms()
+          )
+
+      defp drain_apply_projection_cache_compaction_for_snapshot(
+             %{apply_projection_cache_compaction: %{pid: pid}},
+             timeout_ms
+           )
            when is_pid(pid) do
         if Process.alive?(pid) do
           ref = Process.monitor(pid)
@@ -583,7 +591,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
             {:DOWN, ^ref, :process, ^pid, reason} ->
               {:error, {:apply_projection_cache_compaction_snapshot_drain_failed, reason}}
           after
-            snapshot_compaction_drain_timeout_ms() ->
+            timeout_ms ->
               Process.demonitor(ref, [:flush])
               {:error, :apply_projection_cache_compaction_snapshot_drain_timeout}
           end
@@ -592,7 +600,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
         end
       end
 
-      defp drain_apply_projection_cache_compaction_for_snapshot(_handle), do: :ok
+      defp drain_apply_projection_cache_compaction_for_snapshot(_handle, _timeout_ms), do: :ok
 
       defp snapshot_compaction_drain_timeout_ms do
         Application.get_env(
