@@ -18,6 +18,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
         :waraft_segment_projection_before_relocate_hook,
         :waraft_segment_projection_trim_max_deferred_entries,
         :waraft_segment_projection_trim_rebuild_backoff_max_ms,
+        :waraft_segment_projection_trim_retry_ms,
         :waraft_segment_projection_checkpoint_concurrency,
         :waraft_segment_projection_checkpoint_history_timeout_ms
       ]
@@ -236,7 +237,9 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
               )
             end)
 
-            assert_receive {^trim_ref, {:ok, _state}}, 1_000
+            # Nothing trimmed: WARaft's log view keeps its first index.
+            assert_receive {^trim_ref, {:ok, untrimmed, _state}}, 1_000
+            assert untrimmed <= first_before
 
             assert_receive {:waraft_segment_projection_trim,
                             [:ferricstore, :waraft, :segment_projection_trim, :deferred], _,
@@ -279,7 +282,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
           first_before = :ferricstore_waraft_spike_segment_log.first_index(log)
           trim_index = :ferricstore_waraft_spike_segment_log.last_index(log)
 
-          assert {:ok, _state} = :ferricstore_waraft_spike_segment_log.trim(log, trim_index, %{})
+          assert {:ok, untrimmed, _state} =
+                   :ferricstore_waraft_spike_segment_log.trim(log, trim_index, %{})
+
+          assert untrimmed <= first_before
 
           assert_receive {:waraft_segment_projection_trim,
                           [:ferricstore, :waraft, :segment_projection_trim, :deferred], _,
@@ -309,6 +315,97 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
         end)
       end
 
+      # The trim reported a deferral as done, so WARaft's log view moved past
+      # the entries the log kept, and rotation only asked again a whole
+      # rotation interval later (50,000 entries by default), or at a restart.
+      @tag :bounded_checkpoint
+      test "a deferred trim runs with the next writes once its checkpoint is done", %{ctx: ctx} do
+        parent = self()
+
+        with_checkpoint_env(
+          [
+            every: :never,
+            min_interval_ms: 0,
+            max_deferred: 1_000_000,
+            trim_retry_ms: 0,
+            hook: hold_checkpoint_writes_hook(parent)
+          ],
+          fn ->
+            start_rotating!(ctx)
+            log = segment_log(0)
+            trim_index = write_until_trim_deferred!("deferred-retry")
+            assert_receive {:checkpoint_writing, 0, checkpoint_pid}, 2_000
+            assert :ferricstore_waraft_spike_segment_log.first_index(log) < trim_index
+
+            send(checkpoint_pid, :resume_checkpoint)
+
+            assert_receive {:waraft_segment_projection_checkpoint,
+                            [:ferricstore, :waraft, :segment_projection_checkpoint, :stop], _,
+                            %{result: :ok}},
+                           5_000
+
+            # Far fewer writes than a rotation interval. A batch applied while
+            # an append is in flight does not rotate.
+            for n <- 1..4 do
+              assert :ok = WARaftBackend.write(0, {:put, "deferred-retry:after:#{n}", "v", 0})
+            end
+
+            assert :ferricstore_waraft_spike_segment_log.first_index(log) >= trim_index
+            assert "v" == Router.get(ctx, "deferred-retry:1")
+          end
+        )
+      end
+
+      # WARaft asks again with every batch it applies while a trim is deferred;
+      # preparing the trim takes the projection locks and syncs dedicated files,
+      # so the log waits waraft_segment_projection_trim_retry_ms between tries.
+      @tag :bounded_checkpoint
+      test "a deferred trim is prepared again only after the retry interval", %{ctx: ctx} do
+        parent = self()
+
+        with_checkpoint_env(
+          [
+            every: :never,
+            min_interval_ms: 0,
+            max_deferred: 1_000_000,
+            trim_retry_ms: 60_000,
+            hook: hold_checkpoint_writes_hook(parent)
+          ],
+          fn ->
+            start_rotating!(ctx)
+            log = segment_log(0)
+            trim_index = write_until_trim_deferred!("deferred-wait")
+            assert_receive {:checkpoint_writing, 0, checkpoint_pid}, 2_000
+
+            for n <- 1..20 do
+              assert :ok = WARaftBackend.write(0, {:put, "deferred-wait:held:#{n}", "v", 0})
+            end
+
+            refute_received {:waraft_segment_projection_trim,
+                             [:ferricstore, :waraft, :segment_projection_trim, :deferred], _, _}
+
+            send(checkpoint_pid, :resume_checkpoint)
+
+            assert_receive {:waraft_segment_projection_checkpoint,
+                            [:ferricstore, :waraft, :segment_projection_checkpoint, :stop], _,
+                            %{result: :ok}},
+                           5_000
+
+            assert :ok = WARaftBackend.write(0, {:put, "deferred-wait:done:1", "v", 0})
+            assert :ferricstore_waraft_spike_segment_log.first_index(log) < trim_index
+
+            Application.put_env(:ferricstore, :waraft_segment_projection_trim_retry_ms, 0)
+
+            # A batch applied while an append is in flight does not rotate.
+            for n <- 2..5 do
+              assert :ok = WARaftBackend.write(0, {:put, "deferred-wait:done:#{n}", "v", 0})
+            end
+
+            assert :ferricstore_waraft_spike_segment_log.first_index(log) >= trim_index
+          end
+        )
+      end
+
       @tag :bounded_checkpoint
       test "trim adopts a checkpoint that covers only part of it", %{ctx: ctx, root: root} do
         with_checkpoint_env([every: :never, min_interval_ms: 0, max_deferred: 1_000_000], fn ->
@@ -323,7 +420,9 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
           trim_index = :ferricstore_waraft_spike_segment_log.last_index(log)
           assert trim_index > checkpoint_index
 
-          assert {:ok, _state} = :ferricstore_waraft_spike_segment_log.trim(log, trim_index, %{})
+          # WARaft's log view starts where this trim stopped.
+          assert {:ok, ^checkpoint_index, _state} =
+                   :ferricstore_waraft_spike_segment_log.trim(log, trim_index, %{})
 
           # Adopted up to the checkpoint; the newer entries stay in the log.
           assert_receive {:waraft_segment_projection_trim,
@@ -624,7 +723,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
                      {:waraft_projection, _index}}} = trim_to_last_index(0)
 
             assert :ok = WARaftBackend.write(0, {:put, "rebuild-backoff:k2", "v4", 0})
-            assert {:ok, _state} = trim_to_last_index(0)
+            assert {:ok, untrimmed, _state} = trim_to_last_index(0)
+            assert untrimmed <= first_before
 
             assert_receive {:waraft_segment_projection_trim,
                             [:ferricstore, :waraft, :segment_projection_trim, :deferred], _,
@@ -746,10 +846,13 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
             end
 
             log = waraft_segment_log_record(0)
+            first_before = :ferricstore_waraft_spike_segment_log.first_index(log)
             trim_index = :ferricstore_waraft_spike_segment_log.last_index(log)
 
-            assert {:ok, _state} =
+            assert {:ok, untrimmed, _state} =
                      :ferricstore_waraft_spike_segment_log.trim(log, trim_index, %{})
+
+            assert untrimmed <= first_before
 
             assert_receive {:waraft_segment_projection_trim,
                             [:ferricstore, :waraft, :segment_projection_trim, :deferred], _,
@@ -833,6 +936,14 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
               :waraft_segment_projection_checkpoint_history_timeout_ms,
               timeout_ms
             )
+
+          :error ->
+            :ok
+        end
+
+        case Keyword.fetch(settings, :trim_retry_ms) do
+          {:ok, retry_ms} ->
+            Application.put_env(:ferricstore, :waraft_segment_projection_trim_retry_ms, retry_ms)
 
           :error ->
             :ok
@@ -1043,6 +1154,34 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentProjectionTrimWitho
       end
 
       defp segment_log(shard_index), do: waraft_segment_log_record(shard_index)
+
+      # Rotation asks for a trim whenever 32 entries can go.
+      defp start_rotating!(ctx) do
+        assert :ok =
+                 WARaftBackend.start(ctx,
+                   log_module: :ferricstore_waraft_spike_segment_log,
+                   log_rotation_interval: 32,
+                   log_rotation_keep: 1,
+                   max_retained_entries: 1
+                 )
+      end
+
+      # Writes until rotation's trim defers, at most one write past it; returns
+      # the index the trim asked for.
+      defp write_until_trim_deferred!(prefix) do
+        Enum.reduce_while(1..200, nil, fn n, nil ->
+          assert :ok = WARaftBackend.write(0, {:put, "#{prefix}:#{n}", "v", 0})
+
+          receive do
+            {:waraft_segment_projection_trim,
+             [:ferricstore, :waraft, :segment_projection_trim, :deferred], _,
+             %{trim_index: trim_index}} ->
+              {:halt, trim_index}
+          after
+            0 -> {:cont, nil}
+          end
+        end) || flunk("no trim deferred in 200 writes")
+      end
 
       defp trim_to_last_index(shard_index) do
         log = segment_log(shard_index)

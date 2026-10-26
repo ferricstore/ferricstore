@@ -110,7 +110,7 @@ truncate_segment_path_to(Path, Size) ->
     end.
 
 trim(#raft_log{name = Name} = Log, Index, State) ->
-    %% WARaft advances the in-memory log view only when this returns ok. Keep
+    %% WARaft advances the in-memory log view only as far as this trims. Keep
     %% that correctness boundary cheap: persist a logical trim floor, drop the
     %% in-memory/offset view below it, and let physical segment cleanup happen
     %% out of the commit path. Recovery honors the floor, so old bytes left on
@@ -119,25 +119,60 @@ trim(#raft_log{name = Name} = Log, Index, State) ->
     %% records, the storage layer must persist a projection checkpoint so cold
     %% keydir rows can still be rebuilt/read.
     %% The storage layer may defer the trim while a background checkpoint is
-    %% prepared; WARaft allows trims to run behind, so keep the entries and
-    %% report success. The durable trim floor bounds how far a trim may run
-    %% behind (the in-memory view is a bounded cache, not the floor).
+    %% prepared, or trim only up to the checkpoint it has. Either way this
+    %% returns where the log now starts, so WARaft asks again with the next
+    %% batch it applies; until waraft_segment_projection_trim_retry_ms has
+    %% passed, those asks are answered without preparing the trim again. The
+    %% durable trim floor bounds how far a trim may run behind (the in-memory
+    %% view is a bounded cache, not the floor).
     Dir = log_dir(Log),
     {_FirstBefore, LastBefore} = memory_boundaries(Name, Dir),
     Floor = case logical_trim_floor_result(Dir) of
         {ok, TrimFloor} -> TrimFloor;
         {error, _FloorReason} -> none
     end,
-    case prepare_segment_projection_for_trim(Dir, Index, Floor) of
-        deferred ->
-            {ok, State};
-        ok ->
-            trim_to(Log, Name, Dir, Index, LastBefore, State);
-        {trimmed_to, Adopted} ->
-            %% A checkpoint covered only part of the request; keep [Adopted, Index).
-            trim_to(Log, Name, Dir, Adopted, LastBefore, State);
-        {error, _Reason} = Error ->
-            Error
+    case trim_retry_due(State) of
+        false ->
+            {ok, untrimmed_first(Floor), State};
+        true ->
+            case prepare_segment_projection_for_trim(Dir, Index, Floor) of
+                deferred ->
+                    {ok, untrimmed_first(Floor), trim_stopped_short(State)};
+                ok ->
+                    case trim_to(Log, Name, Dir, Index, LastBefore, State) of
+                        {ok, NewState} -> {ok, maps:remove(trim_stopped_short_at, NewState)};
+                        {error, _Reason} = Error -> Error
+                    end;
+                {trimmed_to, Adopted} ->
+                    %% A checkpoint covered only part of the request; keep [Adopted, Index).
+                    case trim_to(Log, Name, Dir, Adopted, LastBefore, State) of
+                        {ok, NewState} -> {ok, Adopted, trim_stopped_short(NewState)};
+                        {error, _Reason} = Error -> Error
+                    end;
+                {error, _Reason} = Error ->
+                    Error
+            end
+    end.
+
+%% Nothing was trimmed: the log still starts at its floor. WARaft keeps the
+%% larger of this and its view's first index.
+untrimmed_first(Floor) when is_integer(Floor) -> Floor;
+untrimmed_first(_Floor) -> 0.
+
+trim_stopped_short(State) when is_map(State) ->
+    State#{trim_stopped_short_at => erlang:monotonic_time(millisecond)};
+trim_stopped_short(State) ->
+    State.
+
+trim_retry_due(#{trim_stopped_short_at := StoppedAt}) ->
+    erlang:monotonic_time(millisecond) - StoppedAt >= trim_retry_ms();
+trim_retry_due(_State) ->
+    true.
+
+trim_retry_ms() ->
+    case application:get_env(ferricstore, waraft_segment_projection_trim_retry_ms, 1000) of
+        Ms when is_integer(Ms), Ms >= 0 -> Ms;
+        _Invalid -> 1000
     end.
 
 trim_to(Log, Name, Dir, Index, LastBefore, State) ->
@@ -147,6 +182,7 @@ trim_to(Log, Name, Dir, Index, LastBefore, State) ->
                 ok ->
                     delete_before(Name, Index),
                     clear_offset_registry_before(Dir, Index),
+                    delete_segments_below_floor(Dir),
                     set_memory_boundaries_and_refresh(Name, Dir, Index, LastBefore),
                     rebuild_latest_config_cache(Log, Name, Dir),
                     {ok, State};
@@ -292,6 +328,55 @@ clear_offset_registry_before(Dir, Index) ->
                 _NoLast -> ok
             end;
         {error, _Reason} ->
+            ok
+    end.
+
+%% A segment wholly below the durable trim floor holds nothing a reader may
+%% ask for: reads below the floor answer not_found and recovery starts at the
+%% floor. Deleting it (and its offset index) is cleanup, so a failure leaves
+%% the files for the next trim or open instead of failing this one. Only the
+%% Raft log has a floor; projection logs are compacted by rewrites.
+delete_segments_below_floor(Dir) ->
+    case {segment_append_kind(Dir), logical_trim_floor_result(Dir), existing_records_per_segment(Dir)} of
+        {raft_log, {ok, Floor}, {ok, RecordsPerSegment}} when Floor > 0 ->
+            delete_segment_files_before(Dir, Floor div RecordsPerSegment);
+        _NoFloor ->
+            ok
+    end.
+
+delete_segment_files_before(_Dir, 0) ->
+    ok;
+delete_segment_files_before(Dir, BeforeOrdinal) ->
+    case file:list_dir(Dir) of
+        {ok, Files} ->
+            lists:foreach(
+                fun(File) ->
+                    Extension = filename:extension(File),
+                    case lists:member(Extension, [?SEGMENT_EXT, ".idx"]) andalso
+                             parse_segment_ordinal(filename:basename(File, Extension)) of
+                        {ok, Ordinal} when Ordinal < BeforeOrdinal ->
+                            delete_segment_file_below_floor(filename:join(Dir, File), Extension);
+                        _Keep ->
+                            ok
+                    end
+                end,
+                Files
+            );
+        {error, _Reason} ->
+            ok
+    end.
+
+delete_segment_file_below_floor(Path, Extension) ->
+    case file:read_link_info(Path, ?STAT_OPTS) of
+        {ok, #file_info{type = regular}} ->
+            %% A cached writer's descriptor would keep the space allocated.
+            _ = case Extension of
+                ?SEGMENT_EXT -> close_writer_for_path(Path);
+                _Index -> ok
+            end,
+            _ = file:delete(Path),
+            ok;
+        _NotRegular ->
             ok
     end.
 

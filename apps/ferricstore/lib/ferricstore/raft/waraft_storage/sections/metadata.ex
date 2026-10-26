@@ -647,24 +647,19 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
                  false
                )}
 
+            # The value was deleted since it was pinned; see
+            # segment_value_pin_missing_locator_action/1.
             :missing ->
-              case segment_value_pin_source_without_locator(ctx, shard_index, key, file_id) do
-                :stale ->
-                  {:ok,
-                   key
-                   |> segment_value_pin_stale_relocation(
-                     expire_at_ms,
-                     file_id,
-                     offset,
-                     value_size,
-                     pin_key,
-                     false
-                   )
-                   |> Map.put(:missing_locator?, true)}
-
-                {:error, _reason} = error ->
-                  error
-              end
+              {:ok,
+               segment_value_pin_stale_relocation(
+                 key,
+                 expire_at_ms,
+                 file_id,
+                 offset,
+                 value_size,
+                 pin_key,
+                 false
+               )}
 
             {:error, _reason} = error ->
               error
@@ -672,28 +667,15 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
         end
       end
 
-      # A pin whose value no locator names any more. If its source still holds
-      # the value, those bytes may be its only copy, so the trim stops (fail
-      # closed). If the source does not hold it either, no read can reach the
-      # value and the pin keeps nothing: it is stale. Startup recovery re-pins
-      # every value an apply-projection batch wrote, values deleted since among
-      # them, and such a pin would otherwise stop every later trim of the log.
-      defp segment_value_pin_source_without_locator(ctx, shard_index, key, file_id) do
-        case WARaftSegmentReader.read_value_from_location_including_expired(
-               ctx,
-               shard_index,
-               file_id,
-               key
-             ) do
-          :not_found -> :stale
-          {:ok, _value} -> {:error, {:segment_value_pin_missing_live_value, key, file_id}}
-          {:error, reason} -> {:error, {:segment_value_pin_read_failed, key, file_id, reason}}
-        end
-      end
-
-      # The locator is still missing, as when the pin was found stale; the
-      # compare keeps the pin should a locator have been published since.
-      defp segment_value_pin_missing_locator_action(%{missing_locator?: true} = relocation) do
+      # A pin keeps the bytes an LMDB locator names; deleting a value removes its
+      # locator and leaves the pin for a trim to release. So a pin whose locator
+      # is gone keeps nothing a read can reach, whether or not its source still
+      # holds the bytes (an untrimmed log always does): reads find a Flow value
+      # through its keydir row or its LMDB locator, and a keydir row's value is
+      # kept by the segment projection and apply-projection retention, not by
+      # pins. The compare keeps the pin should a locator have been published
+      # since.
+      defp segment_value_pin_missing_locator_action(relocation) do
         {:ok,
          %{
            relocation: relocation,
@@ -702,11 +684,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
            value_pin_ops: []
          }}
       end
-
-      defp segment_value_pin_missing_locator_action(relocation),
-        do:
-          {:error,
-           {:segment_value_pin_missing_live_value, relocation.key, relocation.source_file_id}}
 
       defp segment_value_pin_relocation_from_pin(_ctx, _shard_index, pin, _expiry_cutoff_ms),
         do: {:error, {:bad_segment_value_pin, pin}}
@@ -1177,11 +1154,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
               {:changed, _locator_blob} ->
                 {:cont, {:ok, entries}}
 
+              # Deleted since: nothing to retain.
               :missing ->
-                case segment_value_pin_source_without_locator(ctx, shard_index, key, file_id) do
-                  :stale -> {:cont, {:ok, entries}}
-                  {:error, reason} -> {:halt, {:error, reason}}
-                end
+                {:cont, {:ok, entries}}
 
               {:error, reason} ->
                 {:halt, {:error, reason}}

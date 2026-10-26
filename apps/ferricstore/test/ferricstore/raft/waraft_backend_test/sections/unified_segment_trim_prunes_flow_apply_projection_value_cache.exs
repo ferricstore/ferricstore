@@ -532,8 +532,15 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
         assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, payload_ref)
       end
 
+      # Deleting a Flow value removes its locator and leaves its pin. The trim
+      # stopped on such a pin whenever the source still held the value, which
+      # an untrimmed log always does, so a Flow deleted before the trim that
+      # passed its value stopped every later trim of the shard's log (Inspeactor
+      # shard 5, after startup recovery had pinned its values). No read reaches
+      # a value without a locator or a keydir row, so the pin is released and
+      # the value's bytes go with the trim.
       @tag :apply_projection_pin_retention
-      test "unified segment trim fails closed when a pinned value has no locator but its source holds it",
+      test "unified segment trim releases a deleted value's pin though its source still holds it",
            %{root: root, ctx: ctx} do
         clear_apply_projection_cache!()
 
@@ -548,12 +555,15 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
           )
 
         encoded = Ferricstore.Flow.encode_value(:binary.copy("s", 512))
-        {_log, value_index} = append_waraft_fence!("live-source-pin:source-index", "v")
+        {log, value_index} = append_waraft_fence!("live-source-pin:source-index", "v")
 
         assert :ok =
                  Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(root, 0, value_index, [
                    {payload_ref, encoded, 0}
                  ])
+
+        assert {:ok, 1} =
+                 Ferricstore.Raft.WARaftSegmentReader.spill_apply_projection_cache(root, 0)
 
         lmdb_path =
           ctx.data_dir
@@ -569,26 +579,37 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
                    ])
                  )
 
-        # No locator names the value, though its source still holds it.
+        # Deleted: no locator names the value, though its source still holds it.
         assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:delete, payload_ref}])
-        assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, payload_ref)
 
-        assert {:error,
-                {:segment_value_pin_missing_live_value, ^payload_ref,
-                 {:waraft_apply_projection, ^value_index}}} =
-                 WARaftStorage.__prepare_segment_value_pins_for_trim_for_test__(
-                   root,
+        assert {:ok, ^encoded} =
+                 Ferricstore.Raft.WARaftSegmentReader.read_value_from_location_including_expired(
                    ctx,
                    0,
-                   value_index + 1,
-                   100
+                   {:waraft_apply_projection, value_index},
+                   payload_ref
                  )
 
-        assert {:ok, [%{key: ^payload_ref}]} =
+        assert :ok = WARaftBackend.write(0, {:put, "live-source-pin:fence", "v", 0})
+
+        assert {:ok, _state} =
+                 :ferricstore_waraft_spike_segment_log.trim(log, value_index + 1, %{})
+
+        assert {:ok, []} =
                  Ferricstore.Flow.LMDB.segment_value_pin_entries_before(
                    lmdb_path,
                    value_index + 1,
                    100
+                 )
+
+        assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, payload_ref)
+
+        assert :not_found =
+                 Ferricstore.Raft.WARaftSegmentReader.read_value_from_location_including_expired(
+                   ctx,
+                   0,
+                   {:waraft_apply_projection, value_index},
+                   payload_ref
                  )
       end
 

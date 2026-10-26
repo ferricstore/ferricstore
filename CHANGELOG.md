@@ -4,6 +4,35 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A Raft log trim only raised the log's logical floor: the segment files
+  below it stayed on disk for good, so a shard kept every entry it ever
+  wrote (Inspeactor's shard 13 still had its segments from September, about
+  1 GB below its floor, and 7.3 GB of segments across its shards). A trim now
+  deletes the segments wholly below the floor with their offset indexes, and
+  opening a log deletes the ones earlier releases left.
+- A shard's Raft log could stop trimming for good and grow without bound:
+  once a Flow was deleted before the trim that passed its value, every trim
+  stopped with `{:segment_value_pin_missing_live_value, ...}` (Inspeactor's
+  shard 5 log reached 1.39 million entries). Deleting a value removes its
+  LMDB locator but leaves its pin, and the trim kept any such pin whose
+  source still held the value, which an untrimmed log always does. A trim
+  now releases the pin of a deleted value and drops its bytes; no read
+  reaches a value without a locator or a keydir row. 0.12.10's fix covered
+  only pins whose source no longer held the value.
+- After a crash (an OOM kill, say), startup wrote an LMDB locator and a pin
+  for every Flow value still in the apply-projection log. Values deleted
+  since came back as orphan locators, values already moved to a history file
+  were pointed at the log again, and the pins kept all of them on disk for
+  good; a deleted Flow's pin then stopped trims as above. Startup no longer
+  writes them. Orphans left by earlier restarts stay until their key is
+  written again.
+- A log trim deferred until a projection checkpoint was ready, or done only
+  up to an older checkpoint, counted as a full trim, so the next trim came
+  only a full rotation interval later (50,000 entries by default) or at a
+  restart. With wa_raft 0.1.4 the segment log reports how far it trimmed, and
+  the rest is tried again once `waraft_segment_projection_trim_retry_ms`
+  (default 1,000) has passed.
+
 - The Flow LMDB mirror fell further behind as the apply-projection cache grew:
   each value it mirrored looked up its cache entries by scanning the whole
   cache. After 10k Flow creates its writers took 11 s, then 21 s to catch up

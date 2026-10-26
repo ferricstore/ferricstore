@@ -1456,6 +1456,7 @@ open(#raft_log{name = Name} = Log) ->
                                                                                      profile_startup_phase(Dir, refresh_memory_stats, fun() -> refresh_memory_stats(Name, Dir) end),
                                                                                      profile_startup_phase(Dir, enforce_ets_memory_limit, fun() -> enforce_ets_memory_limit(Name, Dir) end),
                                                                                      trust_offset_index_for_dir(Dir),
+                                                                                     delete_segments_below_floor(Dir),
                                                                                      {ok, #{dir => Dir}};
                                                                                  {error, _Reason} = Error ->
                                                                                      true = ets:delete_all_objects(Name),
