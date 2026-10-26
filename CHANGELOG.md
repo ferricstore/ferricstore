@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Retention cleanup on a shard whose Flow LMDB mirror was missing reported
+  more work on every pass without removing anything, so a caller following
+  its continuation never finished and the shard's expired Flows waited
+  behind it. Retention removes a terminal Flow only after reading its whole
+  history from the mirror; a shard without one now defers its terminal
+  cleanup, as it already did while mirror writes were pending.
 - A Flow LMDB mirror could go on writing to files a WARaft snapshot install
   had moved away. The install moves a shard's data directory into a backup
   and puts the snapshot's in its place; a read that reopened the mirror
