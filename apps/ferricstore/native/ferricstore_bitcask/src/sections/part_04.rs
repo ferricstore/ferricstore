@@ -143,12 +143,79 @@ fn v2_append_ops_batch<'a>(
     }
 }
 
+// A WARaft snapshot install moves a shard's data directory, its Flow LMDB
+// mirror included, and puts the snapshot's directory in its place. A rename
+// keeps device and inode, so an environment cached for the path would keep
+// serving the moved files. Both caches therefore reuse an environment only
+// while the path still names the directory it was opened in; otherwise the
+// entry is dropped and the call opens the directory now at the path. Callers
+// already holding the old environment finish on it.
+const LMDB_MOVED_ENV_ATTEMPTS: usize = 3;
+
+fn lmdb_dir_identity(path: &str) -> Result<(u64, u64), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+fn lmdb_store_names_path(store: &LmdbStore, path: &str) -> bool {
+    lmdb_dir_identity(path).is_ok_and(|identity| identity == store.dir_identity)
+}
+
+fn evict_moved_lmdb_store(cache_key: &str, stale: &Arc<LmdbStore>) -> Result<(), String> {
+    // Same lock order as release: validated paths, then canonical stores.
+    let paths = LMDB_VALIDATED_PATHS
+        .get_or_init(|| RwLock::new(std::collections::HashMap::new()));
+    let mut path_guard = paths
+        .write()
+        .map_err(|_| "lmdb validated path cache poisoned".to_string())?;
+    path_guard.retain(|_path, validated| {
+        validated
+            .store
+            .upgrade()
+            .is_some_and(|store| !Arc::ptr_eq(&store, stale))
+    });
+
+    if let Some(stores) = LMDB_STORES.get() {
+        let mut store_guard = stores
+            .lock()
+            .map_err(|_| "lmdb cache poisoned".to_string())?;
+        let cached_stale = store_guard.get(cache_key).is_some_and(|cell| {
+            cell.get()
+                .and_then(|result| result.as_ref().ok())
+                .is_some_and(|store| Arc::ptr_eq(store, stale))
+        });
+        if cached_stale {
+            store_guard.remove(cache_key);
+        }
+    }
+    Ok(())
+}
+
 fn lmdb_store(path: &str, map_size: u64) -> Result<Arc<LmdbStore>, String> {
     let map_size = usize::try_from(map_size).map_err(|_| "lmdb map_size too large".to_string())?;
     if let Some(store) = exact_lmdb_store(path, map_size)? {
         return Ok(store);
     }
 
+    for _attempt in 0..LMDB_MOVED_ENV_ATTEMPTS {
+        let store = open_lmdb_store(path, map_size)?;
+        if lmdb_store_names_path(&store, path) {
+            return Ok(store);
+        }
+        let cache_key = std::fs::canonicalize(path)
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .into_owned();
+        evict_moved_lmdb_store(&cache_key, &store)?;
+    }
+    Err(format!(
+        "lmdb environment at {path} kept moving while it was opened"
+    ))
+}
+
+fn open_lmdb_store(path: &str, map_size: usize) -> Result<Arc<LmdbStore>, String> {
     crate::fs_nif::create_dir_all_nofollow(std::path::Path::new(path))
         .map_err(|e| e.to_string())?;
     let cache_key = std::fs::canonicalize(path)
@@ -214,7 +281,12 @@ fn exact_lmdb_store(path: &str, map_size: usize) -> Result<Option<Arc<LmdbStore>
                 store.map_size
             ));
         }
-        return Ok(Some(store));
+        drop(guard);
+        if lmdb_store_names_path(&store, path) {
+            return Ok(Some(store));
+        }
+        evict_moved_lmdb_store(&cache_key, &store)?;
+        return Ok(None);
     }
     drop(guard);
 
@@ -267,8 +339,14 @@ fn initialize_lmdb_store(cache_key: &str, map_size: usize) -> Result<Arc<LmdbSto
         .create_database::<heed::types::Bytes, heed::types::Bytes>(&mut wtxn, Some("flow_state"))
         .map_err(|e| e.to_string())?;
     wtxn.commit().map_err(|e| e.to_string())?;
+    let dir_identity = lmdb_dir_identity(cache_key)?;
 
-    Ok(Arc::new(LmdbStore { env, db, map_size }))
+    Ok(Arc::new(LmdbStore {
+        env,
+        db,
+        map_size,
+        dir_identity,
+    }))
 }
 
 fn lmdb_store_cell_busy(cell: &Arc<LmdbStoreCell>) -> bool {

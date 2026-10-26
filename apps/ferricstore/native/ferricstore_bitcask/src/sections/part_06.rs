@@ -989,7 +989,20 @@ mod lmdb_cache_tests {
     }
 
     #[test]
-    fn lmdb_store_reuses_an_exact_validated_path_without_more_filesystem_resolution() {
+    fn lmdb_store_reuses_an_exact_validated_path_while_it_names_the_same_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path_string = path.to_str().unwrap().to_owned();
+
+        let first = lmdb_store(&path_string, 64 * 1024 * 1024).unwrap();
+        let second = lmdb_store(&path_string, 64 * 1024 * 1024).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    // A snapshot install moves the directory and puts another in its place.
+    #[test]
+    fn lmdb_store_reopens_a_path_whose_directory_moved() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("db");
         let moved = dir.path().join("db-moved");
@@ -997,10 +1010,18 @@ mod lmdb_cache_tests {
 
         let first = lmdb_store(&path_string, 64 * 1024 * 1024).unwrap();
         std::fs::rename(&path, &moved).unwrap();
-        let second = lmdb_store(&path_string, 64 * 1024 * 1024).unwrap();
 
-        assert!(Arc::ptr_eq(&first, &second));
-        assert!(!path.exists());
+        // LMDB allows one environment per path in a process: while a call
+        // still holds the moved one, the path fails instead of serving it.
+        assert!(lmdb_store(&path_string, 64 * 1024 * 1024).is_err());
+        drop(first);
+
+        let second = lmdb_store(&path_string, 64 * 1024 * 1024).unwrap();
+        assert!(path.join("data.mdb").exists());
+        assert!(moved.join("data.mdb").exists());
+
+        let third = lmdb_store(&path_string, 64 * 1024 * 1024).unwrap();
+        assert!(Arc::ptr_eq(&second, &third));
     }
 
     #[test]
