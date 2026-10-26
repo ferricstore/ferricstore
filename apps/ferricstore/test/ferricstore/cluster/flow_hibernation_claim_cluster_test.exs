@@ -48,13 +48,14 @@ defmodule Ferricstore.Cluster.FlowHibernationClaimClusterTest do
     :ok = run.(third, :sys, :suspend, [writer])
 
     try do
-      # x is due later than the hot window, so it hibernates on the nodes whose
-      # writer flushes; the third node keeps it in memory.
+      # x is due well past the hot window, however late it applies, so it
+      # hibernates on the nodes whose writer flushes; the third node keeps it in
+      # memory.
       t0 = System.system_time(:millisecond)
       clear_pause.()
 
       assert :ok =
-               run.(first, FerricStore, :flow_create, ["x", [type: "hc", run_at_ms: t0 + 3_000]])
+               run.(first, FerricStore, :flow_create, ["x", [type: "hc", run_at_ms: t0 + 8_000]])
 
       await_applied!(nodes)
 
@@ -66,19 +67,20 @@ defmodule Ferricstore.Cluster.FlowHibernationClaimClusterTest do
 
                Enum.map(nodes, &cached?(&1, state_key)) == [false, false, true]
              end),
-             "x should hibernate on the first two nodes only"
+             "x should hibernate on the first two nodes only: " <>
+               inspect(Enum.map(nodes, &cached?(&1, state_key)))
 
       # y is due after x but within the hot window, so it stays in memory.
-      Process.sleep(max(t0 + 2_500 - System.system_time(:millisecond), 0))
+      Process.sleep(max(t0 + 7_500 - System.system_time(:millisecond), 0))
       clear_pause.()
 
       assert :ok =
-               run.(first, FerricStore, :flow_create, ["y", [type: "hc", run_at_ms: t0 + 3_100]])
+               run.(first, FerricStore, :flow_create, ["y", [type: "hc", run_at_ms: t0 + 8_100]])
 
       assert {:ok, [%{id: "x"}]} =
                run.(first, FerricStore, :flow_claim_due, [
                  "hc",
-                 [worker: "w", limit: 1, lease_ms: 600_000, now_ms: t0 + 4_000]
+                 [worker: "w", limit: 1, lease_ms: 600_000, now_ms: t0 + 9_000]
                ])
 
       await_applied!(nodes)
