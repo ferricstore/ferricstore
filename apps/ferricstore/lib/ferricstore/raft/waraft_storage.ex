@@ -59,6 +59,11 @@ defmodule Ferricstore.Raft.WARaftStorage do
   @segment_projection_checkpoint_waiter_ttl_ms 5_000
   @default_metadata_compact_every 1024
   @default_snapshot_compaction_drain_timeout_ms 30_000
+  # WARaft kills a storage process whose close runs past 30 s, and the next
+  # start then replays as after a crash. Close waits for Flow history and cache
+  # compaction only this long, leaving the rest for the payload flush and the
+  # metadata write.
+  @default_storage_close_budget_ms 20_000
   @cold_read_timeout_ms 10_000
   @zero_pos {:raft_log_pos, 0, 0}
   @segment_projection_registry :ferricstore_waraft_segment_projection_registry
@@ -75,6 +80,8 @@ defmodule Ferricstore.Raft.WARaftStorage do
                    is_integer(elem(file_id, 1)) and elem(file_id, 1) > 0
 
   @type handle :: map()
+
+  require Logger
 
   defp storage_expiry_cutoff_ms do
     ExpiryContext.capture()

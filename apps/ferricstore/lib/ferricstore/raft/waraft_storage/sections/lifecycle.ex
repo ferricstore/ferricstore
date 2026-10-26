@@ -154,10 +154,16 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
 
       @spec close(handle()) :: :ok | {:error, term()}
       def close(handle) do
-        try do
-          handle = flush_replay_dependencies_before_close(handle)
+        close_deadline = System.monotonic_time(:millisecond) + storage_close_budget_ms()
 
-          with :ok <- drain_apply_projection_cache_compaction_for_snapshot(handle),
+        try do
+          handle = flush_replay_dependencies_before_close(handle, close_deadline)
+
+          with :ok <-
+                 drain_apply_projection_cache_compaction_for_snapshot(
+                   handle,
+                   min(snapshot_compaction_drain_timeout_ms(), close_remaining_ms(close_deadline))
+                 ),
                :ok <- flush_apply_projection_snapshot_payload(handle),
                :ok <- maybe_fsync_payload_before_metadata(handle) do
             clean_handle =
@@ -176,8 +182,16 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
 
               true ->
                 request_replay_dependencies(clean_handle)
+                log_close_left_replay(clean_handle, :flow_history_not_durable)
                 :ok
             end
+          else
+            {:error, reason} = error ->
+              log_close_left_replay(handle, reason)
+              error
+
+            other ->
+              other
           end
         after
           unregister_segment_projection_context(handle)

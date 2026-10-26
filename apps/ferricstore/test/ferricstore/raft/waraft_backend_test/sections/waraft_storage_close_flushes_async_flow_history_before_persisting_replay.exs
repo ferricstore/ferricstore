@@ -1019,6 +1019,87 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
         end
       end
 
+      # WARaft kills a storage process whose close runs past 30 s, which turns a
+      # stop into a crash. Close waits for Flow history only within its budget
+      # and leaves the rest to replay.
+      test "storage close stays within its budget while Flow history stalls", %{
+        root: root,
+        ctx: ctx
+      } do
+        previous_async_history = Application.get_env(:ferricstore, :flow_async_history)
+        previous_budget = Application.get_env(:ferricstore, :waraft_storage_close_budget_ms)
+        flow_id = "router-flow-close-budget-id-#{System.unique_integer([:positive])}"
+        partition = "tenant-close-budget-#{System.unique_integer([:positive])}"
+
+        try do
+          Application.put_env(:ferricstore, :flow_async_history, true)
+          Application.put_env(:ferricstore, :waraft_storage_close_budget_ms, 1_000)
+
+          assert :ok =
+                   WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          {:ok, projector} =
+            Ferricstore.Flow.HistoryProjector.start_link(
+              shard_index: 0,
+              shard_data_path: Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0),
+              instance_ctx: ctx,
+              recover_on_init: false
+            )
+
+          Process.unlink(projector)
+
+          start_supervised!(
+            {Ferricstore.Flow.LMDBWriter,
+             shard_index: 0, data_dir: ctx.data_dir, instance_ctx: ctx}
+          )
+
+          # The projector is stuck through the stop.
+          :ok = :sys.suspend(projector)
+
+          assert :ok =
+                   Ferricstore.Flow.create(ctx, flow_id,
+                     type: "router-flow-close-budget",
+                     partition_key: partition,
+                     run_at_ms: 1_000,
+                     now_ms: 900
+                   )
+
+          assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, 0)
+          assert {:ok, {:raft_log_pos, flow_index, _term}} = WARaftBackend.storage_position(0)
+          stop_supervised!(Ferricstore.Flow.LMDBWriter)
+
+          {stop_us, :ok} = :timer.tc(fn -> WARaftBackend.stop() end)
+          monitor = Process.monitor(projector)
+          Process.exit(projector, :kill)
+          assert_receive {:DOWN, ^monitor, :process, ^projector, :killed}
+
+          assert div(stop_us, 1_000) < 5_000
+
+          assert %{position: {:raft_log_pos, persisted_index, _persisted_term}} =
+                   waraft_latest_storage_metadata(root, 0)
+
+          assert persisted_index < flow_index
+          FerricStore.Instance.cleanup(ctx.name)
+
+          restarted_ctx = build_ctx(root)
+
+          try do
+            assert :ok =
+                     WARaftBackend.start(restarted_ctx,
+                       log_module: :ferricstore_waraft_spike_segment_log
+                     )
+
+            assert {:ok, %{state: "queued"}} =
+                     Ferricstore.Flow.get(restarted_ctx, flow_id, partition_key: partition)
+          after
+            FerricStore.Instance.cleanup(restarted_ctx.name)
+          end
+        after
+          restore_env(:flow_async_history, previous_async_history)
+          restore_env(:waraft_storage_close_budget_ms, previous_budget)
+        end
+      end
+
       # Every Flow write adds history the projector writes a little later, so
       # under a steady stream of them the newest position is never durable.
       # The replay cursor must still advance to the positions that are.

@@ -730,18 +730,19 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
         _, _ -> :ok
       end
 
-      defp flush_history_replay_dependencies(handle, timeout_ms) do
+      defp flush_history_replay_dependencies(handle, deadline) do
         handle
         |> Map.get(:replay_dependencies, replay_dependency_defaults())
         |> Map.get(:history, %{})
         |> normalize_replay_dependency_map()
         |> Enum.each(fn {shard_index, _index} ->
-          _ =
-            HistoryProjector.flush(
-              Map.get(handle, :ctx),
-              shard_index,
-              timeout_ms
-            )
+          case close_remaining_ms(deadline) do
+            0 ->
+              :ok
+
+            timeout_ms ->
+              _ = HistoryProjector.flush(Map.get(handle, :ctx), shard_index, timeout_ms)
+          end
         end)
 
         :ok
@@ -898,15 +899,24 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
 
       defp maybe_start_apply_projection_replay_spill(handle), do: handle
 
-      defp flush_replay_dependencies_before_close(handle) do
+      # Each wait keeps its own timeout, and none runs past the close deadline.
+      defp flush_replay_dependencies_before_close(handle, close_deadline) do
         if replay_dependencies_ready?(handle) do
           handle
         else
           timeout_ms = replay_dependency_close_flush_timeout_ms()
 
-          flush_history_replay_dependencies(handle, timeout_ms)
+          flush_history_replay_dependencies(
+            handle,
+            close_step_deadline(timeout_ms, close_deadline)
+          )
+
           request_replay_dependencies(handle)
-          wait_replay_dependencies_ready(handle, timeout_ms)
+
+          do_wait_replay_dependencies_ready(
+            handle,
+            close_step_deadline(timeout_ms, close_deadline)
+          )
         end
       rescue
         _ -> handle
@@ -914,9 +924,26 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
         _, _ -> handle
       end
 
-      defp wait_replay_dependencies_ready(handle, timeout_ms) do
-        deadline = System.monotonic_time(:millisecond) + max(timeout_ms, 0)
-        do_wait_replay_dependencies_ready(handle, deadline)
+      defp close_step_deadline(timeout_ms, close_deadline),
+        do: min(System.monotonic_time(:millisecond) + max(timeout_ms, 0), close_deadline)
+
+      defp close_remaining_ms(deadline),
+        do: max(deadline - System.monotonic_time(:millisecond), 0)
+
+      defp storage_close_budget_ms do
+        Application.get_env(
+          :ferricstore,
+          :waraft_storage_close_budget_ms,
+          @default_storage_close_budget_ms
+        )
+      end
+
+      defp log_close_left_replay(handle, reason) do
+        Logger.warning(
+          "WARaft storage close for shard #{inspect(Map.get(handle, :shard_index))} " <>
+            "left replay from #{inspect(last_clean_position(handle))} to the next start: " <>
+            inspect(reason)
+        )
       end
 
       defp do_wait_replay_dependencies_ready(handle, deadline) do
