@@ -1077,11 +1077,13 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec zset_tree_sync(binary()) :: :ok | {:error, binary()}
   def zset_tree_sync(_path), do: :erlang.nif_error(:nif_not_loaded)
 
-  # Compacts only once no Raft entry at or below `covered_index` can replay.
+  # Folds the frames at or below `floor_index` (Raft replays none of them) into
+  # one base frame and keeps the later ones. `:uncovered` when every frame is
+  # after the floor.
   @spec zset_tree_compact(binary(), non_neg_integer()) ::
           {:ok, :missing | :uncovered | {non_neg_integer(), non_neg_integer()}}
           | {:error, binary()}
-  def zset_tree_compact(_path, _covered_index), do: :erlang.nif_error(:nif_not_loaded)
+  def zset_tree_compact(_path, _floor_index), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec bloom_file_add(binary(), binary()) :: :ok | {:error, term()}
   def bloom_file_add(_path, _element), do: :erlang.nif_error(:nif_not_loaded)

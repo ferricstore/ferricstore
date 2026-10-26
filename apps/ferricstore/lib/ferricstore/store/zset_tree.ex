@@ -275,5 +275,5 @@ defmodule Ferricstore.Store.ZSetTree do
   def sync(path), do: NIF.zset_tree_sync(path)
 
   @spec compact(binary(), non_neg_integer()) :: {:ok, term()} | {:error, term()}
-  def compact(path, covered_index), do: NIF.zset_tree_compact(path, covered_index)
+  def compact(path, floor_index), do: NIF.zset_tree_compact(path, floor_index)
 end

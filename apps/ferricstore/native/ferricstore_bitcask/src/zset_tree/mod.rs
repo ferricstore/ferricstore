@@ -93,12 +93,43 @@ pub fn rewind_to(path: &Path, token: Token) -> Result<()> {
     Ok(())
 }
 
+/// A read that saw its frame cut away is run again, this many times at most.
+const READ_ATTEMPTS: usize = 16;
+
 /// Runs `f` on the latest tree; `None` when the file does not exist.
-pub fn read<R>(path: &Path, f: impl FnOnce(&Tx<'_>) -> Result<R>) -> Result<Option<R>> {
+///
+/// Readers take no lock. A failed transaction cuts its frames off while
+/// others read, and a later frame can reuse their bytes; so once `f` is done
+/// the frame it read must still end the same way, or `f` runs again on the
+/// file as it is now.
+pub fn read<R>(path: &Path, f: impl Fn(&Tx<'_>) -> Result<R>) -> Result<Option<R>> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match read_once(path, &f) {
+            Ok(Some(result)) => return Ok(result),
+            Ok(None) if attempt < READ_ATTEMPTS => {}
+            Err(_reason) if attempt < READ_ATTEMPTS => {}
+            Ok(None) => return Err("zset tree: the file kept changing under a read".into()),
+            Err(reason) => return Err(reason),
+        }
+    }
+}
+
+/// `Some(result)` when the frame read is still in place after `f`.
+fn read_once<R>(path: &Path, f: &impl Fn(&Tx<'_>) -> Result<R>) -> Result<Option<Option<R>>> {
     let Some(file) = TreeFile::open_read(path)? else {
-        return Ok(None);
+        return Ok(Some(None));
     };
     let state = file.state()?;
-    let tx = Tx::begin(&file, state);
-    f(&tx).map(Some)
+    let result = f(&Tx::begin(&file, state))?;
+    let unchanged = state.frame_end == format::HEADER_REGION
+        || file
+            .trailer_ending_at(state.frame_end)?
+            .is_some_and(|trailer| {
+                trailer.token == state.token
+                    && trailer.score_root == state.score_root
+                    && trailer.member_root == state.member_root
+            });
+    Ok(unchanged.then_some(Some(result)))
 }

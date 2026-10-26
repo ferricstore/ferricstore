@@ -174,7 +174,7 @@ fn decode_limit(term: Term<'_>) -> NifResult<Option<u64>> {
 fn read_term<'a, R>(
     env: Env<'a>,
     path: &str,
-    read: impl FnOnce(&super::Tx<'_>) -> super::Result<R>,
+    read: impl Fn(&super::Tx<'_>) -> super::Result<R>,
     empty: impl FnOnce() -> R,
     encode: impl FnOnce(Env<'a>, R) -> NifResult<Term<'a>>,
 ) -> NifResult<Term<'a>> {
@@ -462,8 +462,8 @@ pub fn zset_tree_sync(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
 
 #[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
-pub fn zset_tree_compact(env: Env<'_>, path: String, covered_index: u64) -> NifResult<Term<'_>> {
-    match super::compact(Path::new(&path), covered_index) {
+pub fn zset_tree_compact(env: Env<'_>, path: String, floor_index: u64) -> NifResult<Term<'_>> {
+    match super::compact(Path::new(&path), floor_index) {
         Ok(Compacted::Missing) => Ok((atoms::ok(), atoms::missing()).encode(env)),
         Ok(Compacted::Uncovered) => Ok((atoms::ok(), atoms::uncovered()).encode(env)),
         Ok(Compacted::Done(compaction)) => Ok((

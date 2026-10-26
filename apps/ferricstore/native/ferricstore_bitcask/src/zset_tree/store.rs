@@ -1,8 +1,16 @@
 //! The tree file: opens without following symlinks, header slots, page reads.
 //! Each call opens the file, uses it and drops it; nothing is cached.
+//!
+//! Writers hold the file's exclusive lock (`flock`) while they write. A
+//! compaction builds the new file beside the old one without it, then takes it
+//! to copy the frames written meanwhile and put the new file in place; a
+//! writer that waited finds the path names another file and opens that one.
+//! Readers take no lock: frames are only appended, and a reader of a file
+//! that was replaced keeps reading the old one.
 
 use std::fs::File;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 use super::format::{
@@ -46,6 +54,30 @@ fn io_error(context: &str, error: &std::io::Error) -> String {
     format!("zset tree: {context}: {error}")
 }
 
+/// Takes the exclusive lock of `file`, released when it is closed.
+fn lock(file: &File) -> Result<()> {
+    loop {
+        // SAFETY: flock on a descriptor this function borrows for the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(io_error("lock", &error));
+        }
+    }
+}
+
+/// Whether `path` names the open `file`.
+fn names(path: &Path, file: &File) -> Result<bool> {
+    let open = file.metadata().map_err(|error| io_error("stat", &error))?;
+    match std::fs::symlink_metadata(path) {
+        Ok(at_path) => Ok(at_path.dev() == open.dev() && at_path.ino() == open.ino()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error("stat", &error)),
+    }
+}
+
 impl TreeFile {
     /// Opens the file for reading; `None` when it does not exist.
     pub fn open_read(path: &Path) -> Result<Option<Self>> {
@@ -56,20 +88,44 @@ impl TreeFile {
         }
     }
 
-    /// Opens an existing file for writing; `None` when it does not exist.
+    /// Opens an existing file for writing, holding its lock; `None` when it
+    /// does not exist.
     pub fn open_existing(path: &Path) -> Result<Option<Self>> {
-        match crate::path_open::open_file_nofollow(path, libc::O_RDWR, 0) {
-            Ok(file) => Self::from_file(file).map(Some),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(io_error("open", &error)),
+        Self::open_locked(path, libc::O_RDWR)
+    }
+
+    /// Opens the file for reading, holding its lock, so no writer changes it
+    /// meanwhile; `None` when it does not exist.
+    pub fn open_read_locked(path: &Path) -> Result<Option<Self>> {
+        Self::open_locked(path, libc::O_RDONLY)
+    }
+
+    fn open_locked(path: &Path, flags: libc::c_int) -> Result<Option<Self>> {
+        loop {
+            let file = match crate::path_open::open_file_nofollow(path, flags, 0o644) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(io_error("open", &error)),
+            };
+            lock(&file)?;
+            if names(path, &file)? {
+                return Self::from_file(file).map(Some);
+            }
         }
     }
 
-    /// Opens the file for writing, creating it with an empty tree.
+    /// Opens the file for writing, holding its lock, and creates it with an
+    /// empty tree.
     pub fn open_write(path: &Path) -> Result<Self> {
-        let file = crate::path_open::open_file_nofollow(path, libc::O_RDWR | libc::O_CREAT, 0o644)
-            .map_err(|error| io_error("open", &error))?;
-        let tree = Self::from_file(file)?;
+        let tree = loop {
+            let file =
+                crate::path_open::open_file_nofollow(path, libc::O_RDWR | libc::O_CREAT, 0o644)
+                    .map_err(|error| io_error("open", &error))?;
+            lock(&file)?;
+            if names(path, &file)? {
+                break Self::from_file(file)?;
+            }
+        };
         if tree.len() == 0 {
             let mut header = vec![0_u8; HEADER_REGION as usize];
             header[..SLOT_SIZE].copy_from_slice(&HeaderSlot::empty().encode());
@@ -77,6 +133,11 @@ impl TreeFile {
             tree.note_appended(HEADER_REGION);
         }
         Ok(tree)
+    }
+
+    /// Whether `path` still names this file (a compaction may have replaced it).
+    pub fn is_at(&self, path: &Path) -> Result<bool> {
+        names(path, &self.file)
     }
 
     fn from_file(file: File) -> Result<Self> {

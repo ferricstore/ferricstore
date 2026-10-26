@@ -284,11 +284,21 @@ fn redis_index_range(n: i64, start: i64, stop: i64) -> Option<(usize, usize)> {
 }
 
 /// Compares every read path of the file with the model.
+/// One read of the latest tree, for a check that draws random numbers as it
+/// goes (nothing writes the file meanwhile).
+fn read_mut<R>(path: &Path, f: impl FnOnce(&Tx<'_>) -> Result<R>) -> Result<Option<R>> {
+    let Some(file) = TreeFile::open_read(path)? else {
+        return Ok(None);
+    };
+    let state = file.state()?;
+    f(&Tx::begin(&file, state)).map(Some)
+}
+
 fn check_reads(path: &Path, model: &Model, rng: &mut Rng) {
     let by_score = model.by_score();
     let by_member = model.by_member();
     let n = by_score.len() as i64;
-    read(path, |tx| {
+    read_mut(path, |tx| {
         assert_eq!(tx.count, n as u64, "count");
         assert_eq!(tx.check(Tree::Score)?, n as u64, "score tree");
         assert_eq!(tx.check(Tree::Member)?, n as u64, "member tree");
@@ -501,13 +511,102 @@ fn a_rewind_never_goes_below_a_compacted_base() {
     for i in 1..=3 {
         apply(&path, Token::new(i, 1), &[add(&format!("m{i}"), i as f64)]).unwrap();
     }
-    assert!(matches!(compact(&path, 2).unwrap(), Compacted::Uncovered));
+    // No frame at or below the floor: nothing to fold.
+    assert!(matches!(compact(&path, 0).unwrap(), Compacted::Uncovered));
     assert!(matches!(compact(&path, 3).unwrap(), Compacted::Done(_)));
     apply(&path, Token::new(4, 1), &[add("m4", 4.0)]).unwrap();
     apply(&path, Token::new(4, 1), &[add("m4", 4.0)]).unwrap();
     assert_eq!(all_members(&path).len(), 4);
     assert!(apply(&path, Token::new(3, 1), &[add("m3", 3.0)]).is_err());
     assert_eq!(all_members(&path).len(), 4);
+}
+
+/// Compaction folds the frames at or below its floor into one base frame and
+/// keeps every later frame, one for one: a replay of an entry after the floor
+/// still rewinds to the state it first saw.
+#[test]
+fn compaction_keeps_the_frames_after_its_floor() {
+    let (_dir, path) = temp_tree();
+    // after[i]: the set once entry i has applied.
+    let mut after = vec![BTreeMap::new()];
+    for i in 1..=40_u64 {
+        let member = format!("m{}", i % 7).into_bytes();
+        let mut next = after.last().unwrap().clone();
+        let op = if i % 5 == 0 {
+            next.remove(&member);
+            Op::Remove { member }
+        } else {
+            next.insert(member.clone(), i as f64);
+            add(std::str::from_utf8(&member).unwrap(), i as f64)
+        };
+        apply(&path, Token::new(i, 1), &[op]).unwrap();
+        after.push(next);
+    }
+    let entries = |scores: &BTreeMap<Vec<u8>, f64>| {
+        Model {
+            scores: scores.clone(),
+        }
+        .by_score()
+    };
+    let before = std::fs::metadata(&path).unwrap().len();
+
+    let Compacted::Done(done) = compact(&path, 20).unwrap() else {
+        panic!("expected a compaction");
+    };
+    assert_eq!(done.bytes_before, before);
+    assert_eq!(all_members(&path), entries(&after[40]));
+
+    // Replaying entry 30 cuts back to the set after 29 and applies again.
+    apply(&path, Token::new(30, 1), &[add("again", 30.0)]).unwrap();
+    let mut expected = after[29].clone();
+    expected.insert(b"again".to_vec(), 30.0);
+    assert_eq!(all_members(&path), entries(&expected));
+
+    // Entry 21 is after the floor too; entry 20 is not.
+    apply(&path, Token::new(21, 1), &[add("again", 21.0)]).unwrap();
+    let mut expected = after[20].clone();
+    expected.insert(b"again".to_vec(), 21.0);
+    assert_eq!(all_members(&path), entries(&expected));
+    assert!(apply(&path, Token::new(20, 1), &[add("again", 20.0)]).is_err());
+}
+
+/// Writes that land while a compaction runs are in the compacted file.
+#[test]
+fn writes_during_a_compaction_are_kept() {
+    let (_dir, path) = temp_tree();
+    let seed: Vec<Op> = (0..30_000)
+        .map(|i| add(&format!("seed-{i:06}"), f64::from(i)))
+        .collect();
+    apply(&path, Token::new(1, 1), &seed).unwrap();
+
+    for round in 0..3_u64 {
+        let compactor = {
+            let path = path.clone();
+            std::thread::spawn(move || compact(&path, u64::MAX).unwrap())
+        };
+        let base = 2 + round * 1_000;
+        for i in 0..400 {
+            let member = format!("live-{round}-{i:03}");
+            apply(&path, Token::new(base + i, 1), &[add(&member, -(i as f64))]).unwrap();
+        }
+        assert!(matches!(compactor.join().unwrap(), Compacted::Done(_)));
+    }
+
+    let members = all_members(&path);
+    assert_eq!(members.len(), 30_000 + 3 * 400);
+    for round in 0..3 {
+        for i in 0..400 {
+            let member = format!("live-{round}-{i:03}").into_bytes();
+            assert!(members
+                .iter()
+                .any(|(m, s)| *m == member && *s == -(i as f64)));
+        }
+    }
+    assert!(matches!(
+        compact(&path, u64::MAX).unwrap(),
+        Compacted::Done(_)
+    ));
+    assert_eq!(all_members(&path), members);
 }
 
 #[test]
@@ -854,4 +953,42 @@ fn unchanged_scores_write_nothing() {
     assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
     apply(&path, Token::new(5, 1), &[add("b", 3.0)]).unwrap();
     assert!(std::fs::metadata(&path).unwrap().len() > len);
+}
+
+/// A failed transaction cuts frames off while other processes read the file;
+/// a read never fails for it, and sees the set before or after the cut.
+#[test]
+fn reads_beside_rewinds_never_fail() {
+    let (_dir, path) = temp_tree();
+    let seed: Vec<Op> = (0..2_000)
+        .map(|i| add(&format!("seed-{i:05}"), f64::from(i)))
+        .collect();
+    apply(&path, Token::new(1, 1), &seed).unwrap();
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let (path, stop) = (path.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut reads = 0_u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let count = read(&path, |tx| tx.range_by_index(0, -1, false))
+                    .unwrap()
+                    .unwrap()
+                    .len();
+                assert!(count == 2_000 || count == 2_050, "read {count} members");
+                reads += 1;
+            }
+            reads
+        })
+    };
+    for round in 0..300_u64 {
+        let token = Token::new(2 + round, 1);
+        let ops: Vec<Op> = (0..50)
+            .map(|i| add(&format!("tx-{i:02}"), -f64::from(i)))
+            .collect();
+        apply(&path, token, &ops).unwrap();
+        rewind_to(&path, token).unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(reader.join().unwrap() > 0);
 }

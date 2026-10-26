@@ -8,6 +8,7 @@ use super::format::{
 };
 use super::node::{decode_node, encode_node, encode_overflow, Branch, Child, Key, Leaf, Node};
 use super::store::{TreeFile, TreeState};
+use super::tree::Tx;
 use super::Result;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,18 +180,82 @@ fn compacting_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Rewrites the latest tree into a fresh file, pages about 7/8 full, and puts
-/// it in place. Must run where writes to the file run, so none happen
-/// meanwhile, and only once Raft will replay nothing at or below
-/// `covered_index`: a replayed entry could not rewind past the compacted frame.
-pub fn compact(path: &Path, covered_index: u64) -> Result<Compacted> {
+/// One frame of a file: where it starts and ends, and its trailer.
+#[derive(Clone, Copy)]
+struct FrameAt {
+    start: u64,
+    end: u64,
+    trailer: Trailer,
+}
+
+/// The last frame at or below `floor_index`, and the frames after it, oldest
+/// first; `None` when every frame is after the floor.
+fn split_at_floor(
+    file: &TreeFile,
+    latest_end: u64,
+    floor_index: u64,
+) -> Result<Option<(FrameAt, Vec<FrameAt>)>> {
+    let mut tail = Vec::new();
+    let mut end = latest_end;
+    while end > HEADER_REGION {
+        let trailer = file
+            .trailer_ending_at(end)?
+            .ok_or_else(|| "zset tree: compaction met a damaged frame".to_string())?;
+        let frame = FrameAt {
+            start: trailer.frame_start,
+            end,
+            trailer,
+        };
+        if trailer.token.index <= floor_index {
+            tail.reverse();
+            return Ok(Some((frame, tail)));
+        }
+        tail.push(frame);
+        end = trailer.frame_start;
+    }
+    Ok(None)
+}
+
+/// The frames after `base`, oldest first; `None` when `base` is not one of
+/// the file's frames.
+fn frames_after(file: &TreeFile, latest_end: u64, base: &FrameAt) -> Result<Option<Vec<FrameAt>>> {
+    let mut tail = Vec::new();
+    let mut end = latest_end;
+    while end > base.end {
+        let Some(trailer) = file.trailer_ending_at(end)? else {
+            return Ok(None);
+        };
+        tail.push(FrameAt {
+            start: trailer.frame_start,
+            end,
+            trailer,
+        });
+        end = trailer.frame_start;
+    }
+    if end != base.end || file.trailer_ending_at(end)? != Some(base.trailer) {
+        return Ok(None);
+    }
+    tail.reverse();
+    Ok(Some(tail))
+}
+
+/// Rewrites the tree as of the last frame at or below `floor_index` into a
+/// fresh file, pages about 7/8 full, as one base frame. Then copies each later
+/// frame onto it by replaying its logged changes under the frame's own token,
+/// and puts the new file in place.
+///
+/// Raft replays nothing at or below `floor_index`, so no rewind needs a frame
+/// the base folded away, and every later frame is still there to rewind to.
+/// Runs beside writers: the base is built without the file's lock; the copy of
+/// the later frames, and the rename, hold it.
+pub fn compact(path: &Path, floor_index: u64) -> Result<Compacted> {
     let Some(source) = TreeFile::open_read(path)? else {
         return Ok(Compacted::Missing);
     };
-    let state = source.state()?;
-    if state.token.index > covered_index {
+    let latest = source.state()?;
+    let Some((base, _tail)) = split_at_floor(&source, latest.frame_end, floor_index)? else {
         return Ok(Compacted::Uncovered);
-    }
+    };
     let target_path = compacting_path(path);
     match crate::path_open::remove_file_nofollow(&target_path) {
         Ok(()) => {}
@@ -198,10 +263,58 @@ pub fn compact(path: &Path, covered_index: u64) -> Result<Compacted> {
         Err(error) => return Err(format!("zset tree: remove stale compaction: {error}")),
     }
     let target = TreeFile::open_write(&target_path)?;
+    let mut state = write_base(&source, &target, &base.trailer)?;
+
+    // Held until the new file is in place: no writer adds a frame meanwhile.
+    let Some(locked) = TreeFile::open_read_locked(path)? else {
+        let _ = crate::path_open::remove_file_nofollow(&target_path);
+        return Ok(Compacted::Missing);
+    };
+    let latest = locked.state()?;
+    let Some(tail) = frames_after(&locked, latest.frame_end, &base)? else {
+        // Not the file the base came from.
+        let _ = crate::path_open::remove_file_nofollow(&target_path);
+        return Ok(Compacted::Uncovered);
+    };
+    for frame in tail {
+        let header = FrameHeader::decode(&locked.read_exact(frame.start, FRAME_HEADER_SIZE)?)
+            .filter(|header| !header.base)
+            .ok_or_else(|| "zset tree: compaction met a damaged frame".to_string())?;
+        let ops_len = header.ops_len as usize;
+        let ops_at = frame.end - TRAILER_SIZE as u64 - ops_len as u64;
+        let ops = decode_ops(&locked.read_exact(ops_at, ops_len)?)?;
+        let mut tx = Tx::begin(&target, state);
+        for op in &ops {
+            tx.replay(op)?;
+        }
+        state = tx.commit(frame.trailer.token)?;
+    }
+    target.sync()?;
+    target.write_slot(&HeaderSlot {
+        generation: state.generation + 1,
+        latest_frame_end: state.frame_end,
+        synced_frame_end: state.frame_end,
+    })?;
+    target.sync()?;
+    crate::path_open::rename_nofollow(&target_path, path)
+        .map_err(|error| format!("zset tree: install compacted file: {error}"))?;
+    if let Some(parent) = path.parent() {
+        crate::path_open::open_directory_nofollow(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|error| format!("zset tree: sync directory: {error}"))?;
+    }
+    Ok(Compacted::Done(Compaction {
+        bytes_before: locked.len(),
+        bytes_after: state.frame_end,
+    }))
+}
+
+/// Writes the tree `base` names into the empty `target` as one base frame.
+fn write_base(source: &TreeFile, target: &TreeFile, base: &Trailer) -> Result<TreeState> {
     let frame_start = HEADER_REGION;
-    let mut bulk = Bulk::new(&target, frame_start + FRAME_HEADER_SIZE as u64);
-    for root in [state.score_root, state.member_root] {
-        visit(&source, root, &mut |key, value| bulk.push_entry(key, value))?;
+    let mut bulk = Bulk::new(target, frame_start + FRAME_HEADER_SIZE as u64);
+    for root in [base.score_root, base.member_root] {
+        visit(source, root, &mut |key, value| bulk.push_entry(key, value))?;
         bulk.finish_tree()?;
     }
     let (roots, page_count, pages_crc, pages_end) = bulk.into_parts();
@@ -209,7 +322,7 @@ pub fn compact(path: &Path, covered_index: u64) -> Result<Compacted> {
     let header = FrameHeader {
         page_count,
         ops_len: 0,
-        token: state.token,
+        token: base.token,
         base: true,
     }
     .encode();
@@ -221,33 +334,21 @@ pub fn compact(path: &Path, covered_index: u64) -> Result<Compacted> {
     let trailer = Trailer {
         score_root: roots[0],
         member_root: roots[1],
-        count: state.count,
+        count: base.count,
         frame_start,
         generation,
-        token: state.token,
+        token: base.token,
         body_crc: body.finalize(),
     };
     target.write_at(pages_end, &trailer.encode())?;
     let frame_end = pages_end + TRAILER_SIZE as u64;
     target.note_appended(frame_end);
-    target.sync()?;
     target.write_slot(&HeaderSlot {
         generation,
         latest_frame_end: frame_end,
-        synced_frame_end: frame_end,
+        synced_frame_end: HEADER_REGION,
     })?;
-    target.sync()?;
-    crate::path_open::rename_nofollow(&target_path, path)
-        .map_err(|error| format!("zset tree: install compacted file: {error}"))?;
-    if let Some(parent) = path.parent() {
-        crate::path_open::open_directory_nofollow(parent)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|error| format!("zset tree: sync directory: {error}"))?;
-    }
-    Ok(Compacted::Done(Compaction {
-        bytes_before: source.len(),
-        bytes_after: frame_end,
-    }))
+    target.state()
 }
 
 /// Calls `f` with every key and value of a tree, in order.
