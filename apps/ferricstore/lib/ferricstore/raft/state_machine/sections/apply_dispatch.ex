@@ -123,7 +123,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           result =
             case check_fetch_or_compute_lock(state, redis_key, nil) do
               :ok ->
-                apply_put_with_atomic_storage(state, key, value, expire_at_ms)
+                restore_hibernated? = flow_hibernation_level_8_activation?(state, key, value)
+
+                state
+                |> apply_put_with_atomic_storage(key, value, expire_at_ms)
+                |> maybe_restore_hibernated_flows(state, restore_hibernated?)
 
               {:error, _reason} = error ->
                 error
@@ -134,6 +138,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           maybe_release_cursor(meta, old_count, new_state, result)
         end)
       end
+
+      # The put of feature level 8's marker on a shard that does not have it yet
+      # (see Ferricstore.Cluster.FeatureLevel).
+      defp flow_hibernation_level_8_activation?(state, key, value) do
+        key == Ferricstore.Cluster.FeatureLevel.key(8) and
+          value == Ferricstore.Cluster.FeatureLevel.marker() and not feature_level_8?(state)
+      end
+
+      defp maybe_restore_hibernated_flows(:ok, state, true) do
+        case flow_restore_hibernated_flows(state) do
+          :ok -> :ok
+          {:error, reason} -> {:error, {:state_read_failed, {:hibernated_flow_restore, reason}}}
+        end
+      end
+
+      defp maybe_restore_hibernated_flows(result, _state, _restore?), do: result
 
       defp apply_put_with_atomic_storage(state, key, value, expire_at_ms) do
         if promoted_string_replacement?(state, key) do

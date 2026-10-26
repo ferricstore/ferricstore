@@ -32,6 +32,29 @@ defmodule Ferricstore.Store.Keydir do
     ArgumentError -> false
   end
 
+  @spec drop_value_unchanged_source(:ets.tid() | atom(), entry()) :: boolean()
+  # Drops the cached value of a row whose source is unchanged, as memory
+  # pressure does; the row keeps locating the value on disk. The LFU counter may
+  # move meanwhile, as for delete_unchanged_source/2.
+  def drop_value_unchanged_source(table, row) do
+    [{head, guards, [true]}] = unchanged_source_match_spec(row)
+    :ets.select_replace(table, [{head, guards, [{dropped_value_object(head)}]}]) == 1
+  rescue
+    ArgumentError -> false
+  end
+
+  # Match spec bodies build tuples from {{...}}.
+  defp dropped_value_object(
+         {key, _value, expire_at_ms, {:flow_state_version, version, packed}, file_id, offset,
+          value_size}
+       ),
+       do:
+         {key, nil, expire_at_ms, {{:flow_state_version, version, packed}}, file_id, offset,
+          value_size}
+
+  defp dropped_value_object({key, _value, expire_at_ms, lfu, file_id, offset, value_size}),
+    do: {key, nil, expire_at_ms, lfu, file_id, offset, value_size}
+
   @spec outlives_keydir?(entry()) :: boolean()
   # Whether the value a row points at stays at that address once the row leaves
   # the keydir and only LMDB points at it. A segment-projection frame number is a

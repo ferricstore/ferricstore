@@ -17,7 +17,9 @@ defmodule Ferricstore.Flow.LMDB.Cold do
   @value_ref_kinds [:payload, :result, :error, :shared]
   @park_version 2
 
-  def park_key(flow_id) when is_binary(flow_id), do: "flow:park:v1:" <> flow_id
+  def park_prefix, do: "flow:park:v1:"
+
+  def park_key(flow_id) when is_binary(flow_id), do: park_prefix() <> flow_id
 
   def park_key_for_state_key(state_key) when is_binary(state_key),
     do: "flow:park:v1:key:" <> escape_key_part(state_key)

@@ -529,7 +529,7 @@ defmodule Ferricstore.Flow.HibernationTest do
   end
 
   test "Raft claim fills remaining capacity from cold rows after partial hot claims" do
-    state = %{apply_context: ApplyContext.default()}
+    state = %{apply_context: ApplyContext.default(), ets: :ets.new(:keydir, [:set, :public])}
 
     assert StateMachine.__flow_should_promote_cold_due_for_claim_for_test__(
              state,
@@ -544,6 +544,19 @@ defmodule Ferricstore.Flow.HibernationTest do
              %{cold_due_mode: :skip},
              [],
              [],
+             1
+           )
+
+    # From feature level 8 hibernated Flows keep their index entries, so the
+    # hot scan already saw them.
+    level_8 = Ferricstore.Cluster.FeatureLevel.key(8)
+    :ets.insert(state.ets, {level_8, Ferricstore.Cluster.FeatureLevel.marker(), 0, 0, 1, 0, 1})
+
+    refute StateMachine.__flow_should_promote_cold_due_for_claim_for_test__(
+             state,
+             %{cold_due_mode: :allow},
+             [],
+             [%{id: "hot-flow"}],
              1
            )
   end

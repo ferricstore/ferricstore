@@ -543,14 +543,16 @@ TTL takes it, INCR and HINCRBY refuse stored integers Redis does not read
 or both count the same deleted key); at level 7 a claim without a partition
 key takes due Flows that were hibernated (below it, a Flow created without a
 partition key and due more than the hot window away, five minutes by default,
-is never claimed by one). After the first start of a new cluster, once every node is
-up, raise it to the level the release supports:
+is never claimed by one); at level 8 every replica claims the same Flows
+(below it, a node whose LMDB writer is behind, or that restarted, can claim a
+different hibernated Flow than the others). After the first start of a new
+cluster, once every node is up, raise it to the level the release supports:
 
 ```bash
 bin/ferricstore rpc 'IO.inspect(FerricStore.cluster_feature_level())'
-# {:ok, %{supported: 7, active: 0, shards: [0, 0, 0, 0]}}
+# {:ok, %{supported: 8, active: 0, shards: [0, 0, 0, 0]}}
 
-bin/ferricstore rpc 'IO.inspect(FerricStore.raise_cluster_feature_level(7))'
+bin/ferricstore rpc 'IO.inspect(FerricStore.raise_cluster_feature_level(8))'
 ```
 
 ## Upgrading a Cluster
@@ -651,6 +653,16 @@ shard_0: 2
       mirror, so replicas agree however far their projectors have got.
     - A Flow signal retried with its idempotency key and the same content is
       applied once.
+  - 8: Flow hibernation keeps a Flow's keydir row and index entries and drops
+    only its cached record, so every replica claims from the same Flows
+    whenever its own LMDB writer gets to the Flow, and after a restart. Below
+    level 8 each node removed them on its own schedule and a claim took the
+    Flows still indexed first, so replicas could claim different Flows and a
+    client could hold a lease the other replicas never granted. A hibernated
+    Flow now keeps about 1 KB of memory for those entries. Raising to 8
+    brings back, on each shard, the Flows hibernated before it: the shard
+    reads each one's record once and applies nothing else meanwhile, so the
+    raise takes longer on a shard with many of them.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.

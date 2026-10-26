@@ -832,6 +832,15 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
           ActiveIndexes.rebuild_flow_indexes(flow_index, flow_lookup, record)
         end)
 
+        _dropped =
+          Ferricstore.Flow.Hibernation.drop_cached_values(
+            keydir,
+            entries,
+            active_records,
+            System.system_time(:millisecond),
+            Ferricstore.Raft.ApplyContext.from_runtime()
+          )
+
         if prune_terminal_keydir? do
           Enum.each(Enum.reverse(terminal_prunes), fn {key, record} ->
             safe_prune_terminal_keydir_entry(

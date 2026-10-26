@@ -81,7 +81,15 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   # 7: a claim without a partition key promotes and claims due hibernated
   #    Flows of the automatic partitions; before, it matched none, so a Flow
   #    created without a partition key and hibernated was never claimed.
-  @supported 7
+  # 8: hibernation drops only the cached value of a Flow's keydir row; the row
+  #    and the Flow's index entries stay, and a claim reads a hibernated record
+  #    from disk. Before, each node removed them once its own LMDB writer had
+  #    flushed the Flow, and a claim took the Flows still indexed first and
+  #    promoted the rest from the node-local LMDB mirror, so replicas could
+  #    claim different Flows. The marker's put also brings back the Flows that
+  #    hibernated before it (the state machine's
+  #    `flow_restore_hibernated_flows/1`).
+  @supported 8
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"
   @probe_timeout_ms 5_000

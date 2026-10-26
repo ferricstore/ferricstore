@@ -107,6 +107,47 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
     end
   end
 
+  # From feature level 8 hibernation drops only the cached value of the
+  # Flow's keydir row; the row and the Flow's index entries stay (see
+  # Ferricstore.Cluster.FeatureLevel).
+  def apply_after_flush(
+        {:hibernate_flow_drop_value,
+         %{
+           shard_index: shard_index,
+           ets: ets,
+           state_key: state_key,
+           file_id: file_id,
+           offset: offset,
+           value_size: value_size
+         } = attrs},
+        publication_ctx
+      ) do
+    case :ets.lookup(ets, state_key) do
+      [{^state_key, value, _expire_at_ms, _lfu, ^file_id, ^offset, ^value_size} = row]
+      when is_binary(value) ->
+        with :ok <-
+               ensure_apply_projection_row_durable(Map.get(attrs, :data_dir), shard_index, row) do
+          result =
+            with_publication_write(publication_ctx, shard_index, fn ->
+              drop_unchanged_hot_value(ets, row, publication_ctx, shard_index)
+            end)
+
+          emit_hibernation_evict(if(result, do: :value_dropped, else: :stale), shard_index)
+          :ok
+        else
+          {:error, _reason} = error ->
+            emit_hibernation_evict(:error, shard_index)
+            error
+        end
+
+      _changed_or_cold ->
+        emit_hibernation_evict(:stale, shard_index)
+        :ok
+    end
+  rescue
+    ArgumentError -> {:error, :source_keydir_unavailable}
+  end
+
   def apply_after_flush(
         {:hibernate_flow_evict_hot,
          %{
@@ -137,6 +178,9 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
       )
     end
 
+    # Queued before feature level 8 was raised. From then on only the value
+    # leaves: the level is read under the publication latch its activation
+    # takes, so the activation sees either the row or the eviction's park.
     case hibernate_delete_hot_state_key(
            data_dir,
            shard_index,
@@ -144,11 +188,16 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
            state_key,
            locator,
            publication_ctx,
-           cleanup
+           cleanup,
+           &level_8_active?/1
          ) do
       {:ok, true} ->
         Hibernation.maybe_schedule_claim_waiter(record)
         emit_hibernation_evict(:evicted, shard_index)
+        :ok
+
+      {:ok, :value_dropped} ->
+        emit_hibernation_evict(:value_dropped, shard_index)
         :ok
 
       {:ok, false} ->
@@ -159,6 +208,10 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
         emit_hibernation_evict(:error, shard_index)
         error
     end
+  end
+
+  def apply_after_flush({:cleanup_superseded_cold_rows, path, state_key, version}, _ctx) do
+    Hibernation.cleanup_superseded_cold_rows(path, state_key, version)
   end
 
   def apply_after_flush({:cleanup_stale_cold_due, path, batches}, _publication_ctx) do
@@ -206,6 +259,26 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
 
   def apply_after_flush(_action, _publication_ctx), do: {:error, :invalid_after_flush_action}
 
+  defp level_8_active?(ets), do: Hibernation.level_8_keydir?(ets)
+
+  # Reads of the row then go to its location.
+  defp drop_unchanged_hot_value(ets, {_key, value, _, _, _, _, _} = row, publication_ctx, shard) do
+    if Keydir.drop_value_unchanged_source(ets, row) do
+      track_dropped_binary(publication_ctx, shard, offheap_size(value))
+      true
+    else
+      false
+    end
+  end
+
+  defp track_dropped_binary(%{keydir_binary_bytes: ref, shard_count: count}, shard_index, bytes)
+       when ref != nil and shard_index < count and bytes > 0 do
+    :atomics.sub(ref, shard_index + 1, bytes)
+    :ok
+  end
+
+  defp track_dropped_binary(_publication_ctx, _shard_index, _bytes), do: :ok
+
   def hot_flow_record_from_ets(ets, state_key) do
     case :ets.lookup(ets, state_key) do
       [{^state_key, value, _expire_at_ms, _lfu, _file_id, _offset, _value_size}]
@@ -236,7 +309,8 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
       state_key,
       locator,
       %{},
-      fn -> :ok end
+      fn -> :ok end,
+      fn _ets -> false end
     )
   end
 
@@ -247,24 +321,32 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
          state_key,
          %Locator{} = locator,
          publication_ctx,
-         cleanup
+         cleanup,
+         keep_row?
        )
-       when is_function(cleanup, 0) do
+       when is_function(cleanup, 0) and is_function(keep_row?, 1) do
     case :ets.lookup(ets, state_key) do
       [{^state_key, _value, _expire_at_ms, _lfu, file_id, offset, value_size} = row] ->
         if file_id == locator.file_id and offset == locator.offset and
              value_size == locator.value_size and Keydir.outlives_keydir?(row) do
           with :ok <- ensure_apply_projection_row_durable(data_dir, shard_index, row) do
             with_publication_write(publication_ctx, shard_index, fn ->
-              if Keydir.delete_unchanged_source(ets, row) do
-                after_hot_delete_hook(:hibernate, ets, row)
+              cond do
+                keep_row?.(ets) ->
+                  if drop_unchanged_hot_value(ets, row, publication_ctx, shard_index),
+                    do: {:ok, :value_dropped},
+                    else: {:ok, false}
 
-                case cleanup.() do
-                  :ok -> {:ok, true}
-                  {:error, _reason} = error -> error
-                end
-              else
-                {:ok, false}
+                Keydir.delete_unchanged_source(ets, row) ->
+                  after_hot_delete_hook(:hibernate, ets, row)
+
+                  case cleanup.() do
+                    :ok -> {:ok, true}
+                    {:error, _reason} = error -> error
+                  end
+
+                true ->
+                  {:ok, false}
               end
             end)
           end

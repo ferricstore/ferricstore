@@ -1027,8 +1027,11 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
 
       defp segment_projectable_batch_command?(_sm_state, _command), do: false
 
+      # Feature level 8's marker put also restores hibernated Flows, which only
+      # the state machine does.
       defp segment_projectable_put?(sm_state, key, value, expire_at_ms) do
-        is_binary(key) and is_binary(value) and non_neg_integer?(expire_at_ms) and
+        is_binary(key) and key != Ferricstore.Cluster.FeatureLevel.key(8) and is_binary(value) and
+          non_neg_integer?(expire_at_ms) and
           Ferricstore.Raft.ApplyLimits.validate_value(sm_state, value) == :ok and
           segment_projection_fast_key?(key) and
           not segment_blob_candidate?(sm_state, value) and

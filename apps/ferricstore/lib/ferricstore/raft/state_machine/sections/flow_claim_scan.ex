@@ -698,6 +698,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
                  now_ms
                ) do
             :ok ->
+              flow_queue_claimed_cold_row_cleanup(state, plans)
+
               next_claimed =
                 flow_claim_due_phase(:return_assemble, phase_meta, fn ->
                   Enum.reduce(plans, claimed, fn plan, acc ->
@@ -712,6 +714,29 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
               error
           end
         end
+      end
+
+      # A Flow that hibernated before feature level 8 keeps the cold rows that
+      # located it (see FeatureLevel 8). Once a claim replaces the version they
+      # name, the LMDB writer removes them after flushing the claim.
+      defp flow_queue_claimed_cold_row_cleanup(state, plans) do
+        if feature_level_8?(state) and flow_hibernation_enabled?(state) do
+          context = raft_apply_context(state)
+          path = flow_lmdb_record_path(state)
+
+          Enum.each(plans, fn plan ->
+            {record, _next} = flow_claim_plan_pair(plan)
+
+            if Hibernation.hibernated_when_written?(record, context) do
+              queue_pending_lmdb_mirror_after_flush(
+                {:cleanup_superseded_cold_rows, path,
+                 FlowKeys.state_key(record.id, Map.get(record, :partition_key)), record.version}
+              )
+            end
+          end)
+        end
+
+        :ok
       end
 
       defp flow_prepare_claim_candidates(
