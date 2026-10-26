@@ -294,7 +294,9 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       def stop do
         shard_count = registered_partition_count()
         stop_namespace_batchers(shard_count)
-        flush_storage_before_stop(shard_count)
+        # Each shard's storage flushes and syncs itself as it closes. Do not
+        # snapshot here: a snapshot copies the whole shard, and nothing reads
+        # it at startup.
         _ = Supervisor.terminate_child(:kernel_sup, @sup_id)
         _ = Supervisor.delete_child(:kernel_sup, @sup_id)
         _ = stop_orphaned_waraft_sup()
@@ -310,18 +312,6 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
         RuntimeSupervisor.stop()
         :ok
       end
-
-      defp flush_storage_before_stop(shard_count)
-           when is_integer(shard_count) and shard_count > 0 do
-        Enum.each(0..(shard_count - 1), fn shard_index ->
-          _ = create_snapshot(shard_index)
-          :ok
-        end)
-      catch
-        _kind, _reason -> :ok
-      end
-
-      defp flush_storage_before_stop(_shard_count), do: :ok
 
       @doc false
       @spec __registered_names_for_test__(pos_integer()) :: [atom()]

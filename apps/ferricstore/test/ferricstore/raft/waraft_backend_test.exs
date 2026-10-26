@@ -19,6 +19,7 @@ Code.require_file(
 )
 
 Code.require_file("waraft_backend_test/sections/snapshot_copy_durability.exs", __DIR__)
+Code.require_file("waraft_backend_test/sections/graceful_stop_keeps_no_snapshots.exs", __DIR__)
 
 Code.require_file(
   "waraft_backend_test/sections/startup_finalizes_interrupted_snapshot_swap_after_metadata_persisted.exs",
@@ -72,6 +73,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
   use Ferricstore.Raft.WARaftBackendTest.Sections.RestartRecoversMissingCurrentStorageMetadataUsingPreviousDurable
 
   use Ferricstore.Raft.WARaftBackendTest.Sections.SnapshotCopyDurability
+  use Ferricstore.Raft.WARaftBackendTest.Sections.GracefulStopKeepsNoSnapshots
 
   use Ferricstore.Raft.WARaftBackendTest.Sections.StartupFinalizesInterruptedSnapshotSwapAfterMetadataPersisted
 
