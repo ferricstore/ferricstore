@@ -4,6 +4,20 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A graceful stop snapshotted every WARaft shard before closing it. A
+  snapshot copies the whole shard, so a stop took minutes on large data (126 s
+  on a 20 GB copy of Inspeactor's data; Docker's default 10 s grace period
+  killed it partway, so every stop there was a crash restart), and each stop
+  left a full copy of every shard on disk, two per shard once WARaft's
+  retention applied (11 GB of that copy's 20.6 GB). Nothing reads those
+  copies at startup. A stop no longer snapshots: each shard's storage already
+  flushes and syncs itself as it closes, and that copy now stops in 17 s.
+- Snapshots left in the WARaft partition directories (`snapshot.<index>.<term>`)
+  stayed on disk for good: WARaft prunes them only when it takes a new one,
+  and keeps two. Startup now removes them before any shard starts, while no
+  transfer can be reading them. On the copy of Inspeactor's data that removed
+  32 snapshots and freed 11 GB of its 20.6 GB.
+
 ## 0.12.11 - 2026-10-26
 
 - Upgrading: needs wa_raft 0.1.4 (`ferricstore_waraft` on Hex). The first

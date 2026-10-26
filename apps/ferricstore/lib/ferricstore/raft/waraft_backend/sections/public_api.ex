@@ -4,6 +4,8 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
   # Extracted from WARaftBackend: is_storage_unknown_outcome_reason .. do_peer_ready
   defmacro __using__(_opts) do
     quote do
+      require Logger
+
       alias Ferricstore.ErrorReasons
       alias Ferricstore.NamespaceConfig
       alias Ferricstore.Raft.BlobCommand
@@ -255,10 +257,40 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       defp ensure_backend_data_layout(ctx) do
         with :ok <- validate_waraft_segment_log_dirs(ctx) do
           Ferricstore.DataDir.ensure_layout!(ctx.data_dir, ctx.shard_count)
+          remove_stale_snapshots(ctx)
         end
       rescue
         error in File.Error ->
           {:error, {:data_layout_failed, error.reason}}
+      end
+
+      # A snapshot is a full copy of a shard, made only to send the shard to
+      # another node, and nothing reads one at startup. Stops before 0.12.12
+      # left one in every shard, and WARaft keeps up to two. No shard runs
+      # yet, so no transfer can be reading them: remove them all.
+      defp remove_stale_snapshots(ctx) do
+        for partition <- 1..ctx.shard_count,
+            root = Path.join([ctx.data_dir, "waraft", "#{@table}.#{partition}"]),
+            {:ok, names} <- [Ferricstore.FS.ls(root)],
+            name <- names,
+            Regex.match?(~r/\Asnapshot\.\d+\.\d+(\.|\z)/, name) do
+          remove_stale_snapshot(Path.join(root, name))
+        end
+
+        :ok
+      end
+
+      defp remove_stale_snapshot(path) do
+        with {:ok, %{type: :directory}} <- File.lstat(path),
+             :ok <- Ferricstore.FS.rm_rf(path) do
+          Logger.notice("Removed stale WARaft snapshot #{path}")
+        else
+          {:ok, %File.Stat{}} ->
+            :ok
+
+          {:error, reason} ->
+            Logger.warning("Could not remove stale WARaft snapshot #{path}: #{inspect(reason)}")
+        end
       end
 
       defp validate_waraft_segment_log_dirs(ctx) do
@@ -294,7 +326,9 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       def stop do
         shard_count = registered_partition_count()
         stop_namespace_batchers(shard_count)
-        flush_storage_before_stop(shard_count)
+        # Each shard's storage flushes and syncs itself as it closes. Do not
+        # snapshot here: a snapshot copies the whole shard, and nothing reads
+        # it at startup.
         _ = Supervisor.terminate_child(:kernel_sup, @sup_id)
         _ = Supervisor.delete_child(:kernel_sup, @sup_id)
         _ = stop_orphaned_waraft_sup()
@@ -310,18 +344,6 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
         RuntimeSupervisor.stop()
         :ok
       end
-
-      defp flush_storage_before_stop(shard_count)
-           when is_integer(shard_count) and shard_count > 0 do
-        Enum.each(0..(shard_count - 1), fn shard_index ->
-          _ = create_snapshot(shard_index)
-          :ok
-        end)
-      catch
-        _kind, _reason -> :ok
-      end
-
-      defp flush_storage_before_stop(_shard_count), do: :ok
 
       @doc false
       @spec __registered_names_for_test__(pos_integer()) :: [atom()]

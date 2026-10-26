@@ -156,6 +156,10 @@ triples; `flow-shutdown-mixed-trace-batch-1.json` is diagnostic only.
 
 ### Application stop is not proof of successful snapshots
 
+Since 0.12.12 a stop takes no snapshots: each shard's storage flushes and syncs
+itself as it closes. The stop times and snapshot gates below describe the
+earlier releases.
+
 `WARaftBackend.stop/0` currently ignores snapshot results. Consequently, an
 application-stop return of `:ok` can coexist with failed snapshot preparation.
 The unprofiled timings above measure **operation replies and application-stop

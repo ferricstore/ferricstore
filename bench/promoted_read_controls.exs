@@ -252,8 +252,8 @@ defmodule FerricstoreBench.PromotedReadControls do
               row["mfa"] == "{Ferricstore.Raft.WARaftStorage, :create_snapshot, 2}"
             end)
 
-          snapshots_succeeded? =
-            length(storage_results) == 4 and Enum.all?(storage_results, &(&1["result"] == ":ok"))
+          # Since 0.12.12 a stop takes no snapshots, so there may be none to check.
+          snapshots_succeeded? = Enum.all?(storage_results, &(&1["result"] == ":ok"))
 
           probe =
             probe

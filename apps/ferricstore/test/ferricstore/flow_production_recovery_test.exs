@@ -275,7 +275,7 @@ defmodule Ferricstore.FlowProductionRecoveryTest do
              )
   end
 
-  test "retention deletes a cold expired QueryRow whose apply-projection source was compacted away by a process restart",
+  test "retention deletes a cold expired QueryRow whose apply-projection source was compacted away before a process restart",
        %{isolated: isolated} do
     id = unique("expired-cold-row")
     type = unique("expired-cold-row-type")
@@ -330,9 +330,11 @@ defmodule Ferricstore.FlowProductionRecoveryTest do
                "the cancelled Flow should expire before the restart"
              )
 
-    # The shutdown snapshot compacts the apply-projection log. Expired
-    # QueryRows are neither retained nor relocated by that rewrite, so the
-    # cold row keeps a physical locator into a log that now holds other frames.
+    # A snapshot (one taken to send the shard to another node, say) compacts
+    # the apply-projection log. Expired QueryRows are neither retained nor
+    # relocated by that rewrite, so the cold row keeps a physical locator into
+    # a log that now holds other frames.
+    assert {:ok, _position} = Ferricstore.Raft.WARaftBackend.create_snapshot(shard_index)
     :ok = restart_as_new_process(isolated, ctx.shard_count)
     restarted_ctx = FerricStore.Instance.get(:default)
     assert shard_index == Router.shard_for(restarted_ctx, state_key)
@@ -348,7 +350,7 @@ defmodule Ferricstore.FlowProductionRecoveryTest do
 
     refute WARaftSegmentReader.physical_location(restarted_ctx, shard_index, locator.file_id) ==
              {:ok, {locator.segment_generation, locator.offset, locator.frame_size}},
-           "restart compaction should have moved the apply-projection frame under the row"
+           "snapshot compaction should have moved the apply-projection frame under the row"
 
     cleanup_pages = drain_retention_pages(cancel_now_ms + 10_000, nil, 64, [])
 
