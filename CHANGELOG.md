@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.13 - 2026-10-26
+
+- Upgrading: raise the cluster to feature level 8 once every node runs this
+  release (see "Upgrading a Cluster" in the deployment guide). Until then
+  claims and hibernation work as in 0.12.12. Raising to 8 brings back, on
+  each shard, the Flows hibernated before it; a shard reads each one's record
+  once while it applies the raise.
 - A Flow due more than the hot window away (five minutes by default) is
   hibernated: once the LMDB mirror holds it, its record leaves memory. A
   claim that finds too few hot Flows promotes the due hibernated ones, but a
