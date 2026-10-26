@@ -4,6 +4,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Flow.HistoryProjectedIndex
   alias Ferricstore.Flow.HistoryProjector
+  alias Ferricstore.Flow.HistoryProjector.Files
   alias Ferricstore.Flow.HistoryProjector.KeyCodec
   alias Ferricstore.Flow.HistoryProjector.Keydir
   alias Ferricstore.Flow.HistoryProjector.Log
@@ -18,23 +19,21 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
   @max_exact_integer 9_007_199_254_740_991
   @tombstone_batch_size 4_096
 
+  # Replays the history files in id order from `start`: an offset in file 0,
+  # or {file_id, offset}. A later record of a key wins over an earlier one,
+  # across files as within one.
   def recover_history_log(
         instance_ctx,
         shard_index,
         shard_data_path,
         keydir_override,
-        start_offset \\ 0
+        start \\ 0
       ) do
-    file_path = HistoryProjector.history_file_path(shard_data_path, 0)
+    {start_file_id, start_offset} = recovery_start(start)
     keydir = keydir_override || HistoryProjector.keydir(instance_ctx, shard_index)
     recovery_ctx = {instance_ctx, shard_index, shard_data_path, keydir}
 
-    case Log.reduce_metadata_pages_buffered(
-           file_path,
-           start_offset,
-           {:ok, %{}, %{}},
-           fn record, acc -> recover_history_record(record, acc, recovery_ctx) end
-         ) do
+    case scan_history_files(shard_data_path, start_file_id, start_offset, recovery_ctx) do
       {:ok, {:ok, live_records, tombstones}}
       when map_size(live_records) == 0 and map_size(tombstones) == 0 ->
         :ok
@@ -44,18 +43,11 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
              {:ok, {entries, locations}} <-
                recovered_history_entries(live_records, keydir, shard_data_path),
              :ok <-
-               HistoryProjector.publish_lmdb_history_locations(
-                 shard_data_path,
-                 0,
-                 entries,
-                 locations
-               ),
-             :ok <-
-               HistoryProjector.publish_keydir_entries(
+               publish_recovered_locations(
                  instance_ctx,
                  shard_index,
+                 shard_data_path,
                  keydir,
-                 0,
                  entries,
                  locations
                ),
@@ -78,14 +70,90 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
     error -> {:error, {:history_recover_exception, error}}
   end
 
+  defp recovery_start({file_id, offset})
+       when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0,
+       do: {file_id, offset}
+
+  defp recovery_start(offset) when is_integer(offset) and offset >= 0, do: {0, offset}
+
+  defp scan_history_files(shard_data_path, start_file_id, start_offset, recovery_ctx) do
+    with {:ok, file_ids} <- Files.list(shard_data_path) do
+      file_ids
+      |> Enum.filter(&(&1 >= start_file_id))
+      |> Enum.reduce_while({:ok, {:ok, %{}, %{}}}, fn file_id, {:ok, acc} ->
+        offset = if file_id == start_file_id, do: start_offset, else: 0
+
+        case Log.reduce_metadata_pages_buffered(
+               HistoryProjector.history_file_path(shard_data_path, file_id),
+               offset,
+               acc,
+               fn record, acc -> recover_history_record(record, acc, recovery_ctx, file_id) end
+             ) do
+          {:ok, {:ok, _live, _tombstones} = next_acc} -> {:cont, {:ok, next_acc}}
+          {:ok, {:error, _reason}} = error -> {:halt, error}
+          other -> {:halt, other}
+        end
+      end)
+    end
+  end
+
+  # Locations published per file: each recovered record carries its file id.
+  defp publish_recovered_locations(
+         instance_ctx,
+         shard_index,
+         shard_data_path,
+         keydir,
+         entries,
+         locations
+       ) do
+    entries
+    |> Enum.zip(locations)
+    |> Enum.group_by(
+      fn
+        {_entry, {file_id, _offset, _value_size}} -> file_id
+        {_entry, {_offset, _value_size}} -> 0
+      end,
+      fn
+        {entry, {_file_id, offset, value_size}} -> {entry, {offset, value_size}}
+        {entry, location} -> {entry, location}
+      end
+    )
+    |> Enum.sort_by(fn {file_id, _items} -> file_id end)
+    |> Enum.reduce_while(:ok, fn {file_id, items}, :ok ->
+      {file_entries, file_locations} = Enum.unzip(items)
+
+      with :ok <-
+             HistoryProjector.publish_lmdb_history_locations(
+               shard_data_path,
+               file_id,
+               file_entries,
+               file_locations
+             ),
+           :ok <-
+             HistoryProjector.publish_keydir_entries(
+               instance_ctx,
+               shard_index,
+               keydir,
+               file_id,
+               file_entries,
+               file_locations
+             ) do
+        {:cont, :ok}
+      else
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
   def live_history_records(records) do
     Enum.reduce(records, {:ok, %{}}, &accumulate_live_history_record/2)
   end
 
-  defp recover_history_record(_record, {:error, _reason} = error, _ctx), do: error
+  defp recover_history_record(_record, {:error, _reason} = error, _ctx, _file_id), do: error
 
-  defp recover_history_record(record, {:ok, live_records, tombstones}, ctx) do
-    with {:ok, live_records} <- accumulate_live_history_record(record, {:ok, live_records}) do
+  defp recover_history_record(record, {:ok, live_records, tombstones}, ctx, file_id) do
+    with {:ok, live_records} <-
+           accumulate_live_history_record(record, {:ok, live_records}, file_id) do
       tombstones =
         case record do
           {key, _offset, _size, _expiry, true} ->
@@ -133,11 +201,15 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
     end
   end
 
-  defp accumulate_live_history_record(_record, {:error, _reason} = error), do: error
+  defp accumulate_live_history_record(record, acc),
+    do: accumulate_live_history_record(record, acc, nil)
+
+  defp accumulate_live_history_record(_record, {:error, _reason} = error, _file_id), do: error
 
   defp accumulate_live_history_record(
          {key, offset, value_size, expire_at_ms, deleted?} = record,
-         {:ok, acc}
+         {:ok, acc},
+         file_id
        ),
        do:
          accumulate_valid_history_record(
@@ -147,10 +219,11 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
            value_size,
            expire_at_ms,
            deleted?,
-           acc
+           acc,
+           file_id
          )
 
-  defp accumulate_live_history_record(record, {:ok, _acc}),
+  defp accumulate_live_history_record(record, {:ok, _acc}, _file_id),
     do: {:error, {:invalid_history_log_record, record}}
 
   defp accumulate_valid_history_record(
@@ -160,17 +233,18 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
          value_size,
          expire_at_ms,
          deleted?,
-         acc
+         acc,
+         file_id
        )
        when is_binary(key) and is_integer(offset) and offset >= 0 and is_integer(value_size) and
               value_size >= 0 and is_integer(expire_at_ms) and expire_at_ms >= 0 and
               expire_at_ms <= @max_exact_integer and is_boolean(deleted?) do
     case KeyCodec.parse_history_entry_key(key) do
       {:ok, _history_key, _event_id, _event_ms} ->
-        if deleted? do
-          {:ok, Map.delete(acc, key)}
-        else
-          {:ok, Map.put(acc, key, {offset, value_size, expire_at_ms})}
+        cond do
+          deleted? -> {:ok, Map.delete(acc, key)}
+          is_nil(file_id) -> {:ok, Map.put(acc, key, {offset, value_size, expire_at_ms})}
+          true -> {:ok, Map.put(acc, key, {file_id, offset, value_size, expire_at_ms})}
         end
 
       :error ->
@@ -182,36 +256,43 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
     end
   end
 
-  defp accumulate_valid_history_record(record, _key, _offset, _size, _expire, _deleted, _acc),
-    do: {:error, {:invalid_history_log_record, record}}
+  defp accumulate_valid_history_record(
+         record,
+         _key,
+         _offset,
+         _size,
+         _expire,
+         _deleted,
+         _acc,
+         _file_id
+       ),
+       do: {:error, {:invalid_history_log_record, record}}
 
+  # A live record is {offset, value_size, expire_at_ms} in file 0, or
+  # {file_id, offset, value_size, expire_at_ms}; its location keeps that shape
+  # without the expiry.
   def recovered_history_entries(live_records, keydir, shard_data_path) do
     live_records
     |> Enum.reduce_while({:ok, [], [], %{}}, fn
-      {key, {offset, value_size, expire_at_ms}}, {:ok, entries, locations, caps} ->
-        case KeyCodec.parse_history_entry_key(key) do
-          {:ok, history_key, event_id, event_ms} ->
-            case recovered_history_hot_cap(history_key, keydir, shard_data_path, caps) do
-              {:ok, history_hot_max_events, next_caps} ->
-                entry = %{
-                  key: key,
-                  expire_at_ms: expire_at_ms,
-                  history_key: history_key,
-                  event_id: event_id,
-                  event_ms: event_ms,
-                  version: recovered_history_event_version(event_id),
-                  history_hot_max_events: history_hot_max_events
-                }
+      {key, {file_id, offset, value_size, expire_at_ms}}, acc ->
+        recovered_history_entry(
+          key,
+          {file_id, offset, value_size},
+          expire_at_ms,
+          keydir,
+          shard_data_path,
+          acc
+        )
 
-                {:cont, {:ok, [entry | entries], [{offset, value_size} | locations], next_caps}}
-
-              {:error, _reason} = error ->
-                {:halt, error}
-            end
-
-          :error ->
-            {:halt, {:error, {:invalid_history_log_key, key}}}
-        end
+      {key, {offset, value_size, expire_at_ms}}, acc ->
+        recovered_history_entry(
+          key,
+          {offset, value_size},
+          expire_at_ms,
+          keydir,
+          shard_data_path,
+          acc
+        )
 
       _invalid, _acc ->
         {:halt, {:error, :invalid_history_recovery_entry}}
@@ -222,6 +303,39 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
 
       {:error, _reason} = error ->
         error
+    end
+  end
+
+  defp recovered_history_entry(
+         key,
+         location,
+         expire_at_ms,
+         keydir,
+         shard_data_path,
+         {:ok, entries, locations, caps}
+       ) do
+    case KeyCodec.parse_history_entry_key(key) do
+      {:ok, history_key, event_id, event_ms} ->
+        case recovered_history_hot_cap(history_key, keydir, shard_data_path, caps) do
+          {:ok, history_hot_max_events, next_caps} ->
+            entry = %{
+              key: key,
+              expire_at_ms: expire_at_ms,
+              history_key: history_key,
+              event_id: event_id,
+              event_ms: event_ms,
+              version: recovered_history_event_version(event_id),
+              history_hot_max_events: history_hot_max_events
+            }
+
+            {:cont, {:ok, [entry | entries], [location | locations], next_caps}}
+
+          {:error, _reason} = error ->
+            {:halt, error}
+        end
+
+      :error ->
+        {:halt, {:error, {:invalid_history_log_key, key}}}
     end
   end
 
@@ -502,11 +616,25 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
 
   def skip_history_log_recover?(_shard_data_path, _projected), do: false
 
+  # Every history file is empty, or none exists.
   def history_log_safe_to_skip?(shard_data_path) do
-    shard_data_path
-    |> HistoryProjector.history_file_path(0)
-    |> File.stat()
-    |> case do
+    case Files.list(shard_data_path) do
+      {:ok, []} ->
+        history_file_empty?(HistoryProjector.history_file_path(shard_data_path, 0))
+
+      {:ok, file_ids} ->
+        Enum.all?(
+          file_ids,
+          &history_file_empty?(HistoryProjector.history_file_path(shard_data_path, &1))
+        )
+
+      {:error, _reason} ->
+        false
+    end
+  end
+
+  defp history_file_empty?(path) do
+    case File.stat(path) do
       {:ok, %{type: :regular, size: 0}} -> true
       {:error, :enoent} -> true
       _ -> false

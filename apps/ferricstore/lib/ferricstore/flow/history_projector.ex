@@ -54,14 +54,14 @@ defmodule Ferricstore.Flow.HistoryProjector do
         keydir = keydir_override || keydir(instance_ctx, shard_index)
 
         case HistoryRecoveryCheckpoint.recovery_offset(shard_data_path, keydir, projected) do
-          {:ok, offset} ->
+          {:ok, {file_id, offset} = start} ->
             :telemetry.execute(
               [:ferricstore, :flow, :history_recovery_checkpoint],
               %{prefix_bytes: offset},
-              %{shard_index: shard_index, status: :reused}
+              %{shard_index: shard_index, status: :reused, file_id: file_id}
             )
 
-            recover_history_log(instance_ctx, shard_index, shard_data_path, keydir, offset)
+            recover_history_log(instance_ctx, shard_index, shard_data_path, keydir, start)
 
           :full_scan ->
             recover_full_history_log(
@@ -859,8 +859,9 @@ defmodule Ferricstore.Flow.HistoryProjector do
          requested_index,
          keydir_override
        ) do
-    with {:ok, file_id, file_path} <- Storage.history_active_file(shard_data_path),
-         keydir <- keydir_override || keydir(instance_ctx, shard_index),
+    keydir = keydir_override || keydir(instance_ctx, shard_index)
+
+    with {:ok, file_id, file_path} <- history_append_file(shard_data_path, keydir),
          expanded_entries <- Storage.expand_entries(entries),
          encoded_entries <- Enum.map(expanded_entries, &Storage.encode_entry/1),
          :ok <- Storage.validate_entries(encoded_entries),
@@ -931,6 +932,30 @@ defmodule Ferricstore.Flow.HistoryProjector do
     error ->
       set_disk_pressure(instance_ctx, shard_index)
       {:error, {:history_projection_exception, error}}
+  end
+
+  # The file a batch goes to. When the active file is full a new one starts,
+  # and the recovery checkpoint moves to its start: every record before it is
+  # already published, since batches are projected one at a time.
+  defp history_append_file(shard_data_path, keydir) do
+    case Storage.history_append_file(shard_data_path) do
+      {:ok, file_id, file_path} ->
+        {:ok, file_id, file_path}
+
+      {:rotated, file_id, file_path, _previous_file_id} ->
+        case HistoryRecoveryCheckpoint.publish(shard_data_path, keydir) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            Logger.warning("Flow history recovery checkpoint not moved: #{inspect(reason)}")
+        end
+
+        {:ok, file_id, file_path}
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   defdelegate history_dir(shard_data_path), to: Storage

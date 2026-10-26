@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- The Flow history log was one file per shard that only grew (2.3 GB on a
+  copy of Inspeactor's data), and every start digested all of it to check its
+  recovery checkpoint. The history projector now starts a new file once the
+  active one reaches 128 MB (`:flow_history_log_max_bytes`), recovery replays
+  the files in order, and the checkpoint moves to each new file, so a start
+  digests at most one file.
+
 - Retention cleanup on a shard whose Flow LMDB mirror was missing reported
   more work on every pass without removing anything, so a caller following
   its continuation never finished and the shard's expired Flows waited
