@@ -157,6 +157,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
         close_deadline = System.monotonic_time(:millisecond) + storage_close_budget_ms()
 
         try do
+          :ok = drain_zset_tree_maintenance(handle)
           handle = flush_replay_dependencies_before_close(handle, close_deadline)
 
           with :ok <-
@@ -216,6 +217,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
           apply_projection_cache_compaction_pending?:
             Map.has_key?(handle, :apply_projection_cache_compaction),
           payload_dirty?: Map.get(handle, :bitcask_dirty?, false),
+          zset_tree_maintenance_floor: Map.get(handle, :zset_tree_maintenance_floor, 0),
+          zset_tree_compaction_running?: Map.has_key?(handle, :zset_tree_maintenance),
           blocked?: Map.has_key?(handle, :blocked_error)
         ]
         |> maybe_put_status(:blocked_error, Map.get(handle, :blocked_error))
@@ -785,6 +788,17 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
         finish_apply_projection_cache_compaction(ref, result, handle)
       end
 
+      def info({:ferricstore_zset_tree_compaction_done, ref, results}, handle) do
+        finish_zset_tree_compaction(ref, results, handle)
+      end
+
+      def info(
+            {:DOWN, monitor, :process, _pid, reason},
+            %{zset_tree_maintenance: %{monitor: monitor}} = handle
+          ) do
+        finish_zset_tree_compaction_down(monitor, reason, handle)
+      end
+
       def info(
             {:DOWN, monitor, :process, pid, reason},
             %{apply_projection_cache_compaction: %{monitor: monitor, pid: pid}} = handle
@@ -835,7 +849,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
       end
 
       defp do_create_snapshot(snapshot_path, handle) do
-        with :ok <- reset_dir(snapshot_path),
+        with :ok <- drain_zset_tree_maintenance(handle),
+             :ok <- reset_dir(snapshot_path),
              :ok <- copy_shard_dirs_to_snapshot(snapshot_path, handle),
              :ok <- drain_apply_projection_cache_compaction_for_snapshot(handle),
              :ok <- copy_compacted_storage_dirs_to_snapshot(snapshot_path, handle),
@@ -874,6 +889,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
           %{instance_ctx: handle.ctx, shard_index: handle.shard_index},
           fn ->
             with_flow_lmdb_snapshot_install(handle, fn ->
+              :ok = drain_zset_tree_maintenance(handle)
               do_open_snapshot(snapshot_path, expected_position, handle)
             end)
           end

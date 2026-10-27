@@ -27,26 +27,56 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
       # The Raft position of the entry being applied, for tree writes: its index
       # and an ordinal counting the tree writes within the entry.
       defp with_zset_tree_position(%{index: index}, fun) when is_integer(index) and index > 0 do
-        previous = {Process.get(:sm_zset_tree_index), Process.get(:sm_zset_tree_ordinal)}
+        keys = [:sm_zset_tree_index, :sm_zset_tree_ordinal, :sm_zset_tree_prepared]
+        previous = Enum.map(keys, &{&1, Process.get(&1)})
         Process.put(:sm_zset_tree_index, index)
         Process.put(:sm_zset_tree_ordinal, 0)
+        Process.put(:sm_zset_tree_prepared, MapSet.new())
 
         try do
           fun.()
         after
-          case previous do
-            {nil, _ordinal} ->
-              Process.delete(:sm_zset_tree_index)
-              Process.delete(:sm_zset_tree_ordinal)
-
-            {previous_index, previous_ordinal} ->
-              Process.put(:sm_zset_tree_index, previous_index)
-              Process.put(:sm_zset_tree_ordinal, previous_ordinal)
-          end
+          Enum.each(previous, fn
+            {key, nil} -> Process.delete(key)
+            {key, value} -> Process.put(key, value)
+          end)
         end
       end
 
       defp with_zset_tree_position(_meta, fun), do: fun.()
+
+      # A replayed entry must read a set as it was when the entry first applied,
+      # but the file still holds the frames the run before a restart wrote for
+      # this entry and later ones. So the first time an entry touches a tree,
+      # those frames are cut off; in a run without a restart there are none.
+      defp prepare_zset_tree_for_entry(path) do
+        with index when is_integer(index) and index > 0 <- Process.get(:sm_zset_tree_index),
+             prepared = Process.get(:sm_zset_tree_prepared, MapSet.new()),
+             false <- MapSet.member?(prepared, path) do
+          Process.put(:sm_zset_tree_prepared, MapSet.put(prepared, path))
+
+          case Ferricstore.Bitcask.NIF.zset_tree_rewind(path, index, 1) do
+            :ok ->
+              :ok
+
+            {:error, reason} ->
+              # The entry cannot see the set as it first did: stop rather than
+              # apply it to a later state.
+              raise "sorted set tree #{path} could not be cut back for entry #{index}: " <>
+                      inspect(reason)
+          end
+        end
+
+        path
+      end
+
+      # A file this entry created is already as the entry left it.
+      defp mark_zset_tree_prepared(path) do
+        Process.put(
+          :sm_zset_tree_prepared,
+          MapSet.put(Process.get(:sm_zset_tree_prepared, MapSet.new()), path)
+        )
+      end
 
       # A tree write needs the entry's Raft position, so a replay can rewind to
       # it. Outside a WARaft apply there is none, and the write fails.
@@ -115,12 +145,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
                PromotedFileSync.track_write(path, fn ->
                  ZSetTree.apply_ops(path, {index, ordinal}, ops)
                end) do
+          note_zset_tree_written(path)
           {:ok, outcomes}
         else
           {:error, reason} ->
             record_state_write_failure({:zset_tree_write_failed, reason})
             {:error, {:zset_tree_write_failed, reason}}
         end
+      end
+
+      # The storage process applies every entry, and its maintenance pass looks
+      # at the trees written since the last pass for ones worth compacting.
+      defp note_zset_tree_written(path) do
+        Process.put(
+          :sm_zset_tree_written,
+          MapSet.put(Process.get(:sm_zset_tree_written, MapSet.new()), path)
+        )
       end
 
       # Inside MULTI a tree write is applied at once; a transaction that fails
@@ -317,8 +357,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
              {:ok, ops} <- zset_tree_conversion_ops(entries) do
           generation = index * @zset_tree_ordinal_limit + ordinal
           path = ZSetTree.path(promoted_data_dir(state), state.shard_index, redis_key, generation)
+          mark_zset_tree_prepared(path)
 
-          with {:ok, _outcomes} <-
+          with :ok <- ZSetTree.write_key(Path.dirname(path), redis_key),
+               {:ok, _outcomes} <-
                  PromotedFileSync.track_write(path, fn ->
                    ZSetTree.apply_ops(path, {index, ordinal}, ops)
                  end),

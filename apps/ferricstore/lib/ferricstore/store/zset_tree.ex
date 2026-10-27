@@ -274,6 +274,35 @@ defmodule Ferricstore.Store.ZSetTree do
   @spec sync(binary()) :: :ok | {:error, term()}
   def sync(path), do: NIF.zset_tree_sync(path)
 
+  @spec file_stats(binary()) ::
+          {:ok, :missing | {non_neg_integer(), non_neg_integer()}} | {:error, term()}
+  def file_stats(path), do: NIF.zset_tree_file_stats(path)
+
+  @key_file "key"
+  @max_key_bytes 65_536
+
+  @doc """
+  The file in a set's directory that names the set's key. The sweep that
+  removes files no set names any more reads it to find the set's marker.
+  """
+  @spec key_path(binary()) :: binary()
+  def key_path(dir), do: Path.join(dir, @key_file)
+
+  @doc "Writes the key file of `dir`, once."
+  @spec write_key(binary(), binary()) :: :ok | {:error, term()}
+  def write_key(dir, redis_key) do
+    path = key_path(dir)
+
+    with :ok <- Ferricstore.FS.mkdir_p(dir) do
+      if Ferricstore.FS.exists?(path),
+        do: :ok,
+        else: Ferricstore.FS.atomic_replace_nofollow(path, redis_key, @max_key_bytes)
+    end
+  end
+
+  @spec read_key(binary()) :: {:ok, binary()} | {:error, term()}
+  def read_key(dir), do: Ferricstore.FS.read_nofollow(key_path(dir), @max_key_bytes)
+
   @spec compact(binary(), non_neg_integer()) :: {:ok, term()} | {:error, term()}
   def compact(path, floor_index), do: NIF.zset_tree_compact(path, floor_index)
 end

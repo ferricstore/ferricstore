@@ -1842,12 +1842,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
             # A tree set has no TTL of its own: it lives while its type key
             # does. An expired one is gone, and a write starts a new set.
             if zset_tree_type_live?(ctx, redis_key) do
-              Ferricstore.Store.ZSetTree.path(
-                promoted_data_dir(ctx),
-                ctx_index(ctx),
-                redis_key,
-                generation
-              )
+              ctx
+              |> promoted_data_dir()
+              |> Ferricstore.Store.ZSetTree.path(ctx_index(ctx), redis_key, generation)
+              |> prepare_zset_tree_for_entry()
             end
         end
       end
