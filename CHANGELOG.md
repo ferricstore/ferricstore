@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- `volatile_lru` and `allkeys_lru` eviction kept recently used keys and
+  dropped stale ones for a while after the access clock wrapped. A key's last
+  access is stored as 16-bit minutes, which wrap every 65,536 minutes (about
+  45 days), and eviction ordered keys by that stamp, so just after a wrap a
+  key used before it looked newer than one used a moment ago. Eviction now
+  orders keys by how long each has been idle.
 - Retention cleanup on a shard whose Flow LMDB mirror was missing reported
   more work on every pass without removing anything, so a caller following
   its continuation never finished and the shard's expired Flows waited
