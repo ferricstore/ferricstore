@@ -431,14 +431,21 @@ defmodule Ferricstore.Application do
   end
 
   defp history_log_size(data_dir, shard_index) do
-    path =
-      data_dir
-      |> Ferricstore.DataDir.shard_data_path(shard_index)
-      |> Ferricstore.Flow.HistoryProjector.history_file_path(0)
+    shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
 
-    case File.stat(path) do
-      {:ok, %{size: size}} -> size
-      _unreadable -> 0
+    case Ferricstore.Flow.HistoryProjector.Files.list(shard_data_path) do
+      {:ok, file_ids} ->
+        Enum.reduce(file_ids, 0, fn file_id, total ->
+          case File.stat(
+                 Ferricstore.Flow.HistoryProjector.history_file_path(shard_data_path, file_id)
+               ) do
+            {:ok, %{size: size}} -> total + size
+            _unreadable -> total
+          end
+        end)
+
+      {:error, _reason} ->
+        0
     end
   end
 

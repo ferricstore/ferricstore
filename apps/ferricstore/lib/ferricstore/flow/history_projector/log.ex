@@ -3,6 +3,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Log do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.CommandTime
+  alias Ferricstore.Flow.HistoryProjector.Files
 
   @scan_page_records 4_096
 
@@ -29,20 +30,32 @@ defmodule Ferricstore.Flow.HistoryProjector.Log do
 
   def read_values(_shard_data_path, _file_id, _offsets), do: {:error, :not_flow_history}
 
+  # The latest record of `target_key` across the history files, read in replay
+  # order.
   @spec scan_event_value(binary(), binary()) :: {:ok, binary()} | :miss | {:error, term()}
   def scan_event_value(shard_data_path, target_key) do
-    file_path = history_file_path(shard_data_path, 0)
     now_ms = CommandTime.now_ms()
 
-    with {:ok, location} <-
-           reduce_metadata_pages(file_path, :miss, fn record, location ->
-             latest_scanned_event_location(record, target_key, location, now_ms)
-           end) do
+    with {:ok, file_ids} <- Files.list(shard_data_path),
+         {:ok, location} <- scan_event_location(shard_data_path, file_ids, target_key, now_ms) do
       case location do
-        {:live, offset} -> NIF.v2_pread_at(file_path, offset)
+        {:live, file_path, offset} -> NIF.v2_pread_at(file_path, offset)
         :miss -> :miss
       end
     end
+  end
+
+  defp scan_event_location(shard_data_path, file_ids, target_key, now_ms) do
+    Enum.reduce_while(file_ids, {:ok, :miss}, fn file_id, {:ok, location} ->
+      file_path = history_file_path(shard_data_path, file_id)
+
+      case reduce_metadata_pages(file_path, location, fn record, location ->
+             latest_scanned_event_location(record, target_key, file_path, location, now_ms)
+           end) do
+        {:ok, next_location} -> {:cont, {:ok, next_location}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
   end
 
   @doc false
@@ -94,6 +107,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Log do
   defp latest_scanned_event_location(
          {target_key, _offset, _value_size, _expire_at_ms, true},
          target_key,
+         _file_path,
          _location,
          _now_ms
        ),
@@ -102,6 +116,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Log do
   defp latest_scanned_event_location(
          {target_key, _offset, _value_size, expire_at_ms, false},
          target_key,
+         _file_path,
          _location,
          now_ms
        )
@@ -111,18 +126,15 @@ defmodule Ferricstore.Flow.HistoryProjector.Log do
   defp latest_scanned_event_location(
          {target_key, offset, _value_size, expire_at_ms, false},
          target_key,
+         file_path,
          _location,
          _now_ms
        )
        when is_integer(expire_at_ms),
-       do: {:live, offset}
+       do: {:live, file_path, offset}
 
-  defp latest_scanned_event_location(_record, _target_key, location, _now_ms), do: location
+  defp latest_scanned_event_location(_record, _target_key, _file_path, location, _now_ms),
+    do: location
 
-  defp history_file_path(shard_data_path, file_id) do
-    Path.join(
-      Path.join(shard_data_path, "history"),
-      "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log"
-    )
-  end
+  defp history_file_path(shard_data_path, file_id), do: Files.path(shard_data_path, file_id)
 end
