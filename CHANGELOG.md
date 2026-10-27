@@ -10,7 +10,13 @@ All notable changes to FerricStore will be documented here.
   active one reaches 128 MB (`:flow_history_log_max_bytes`), recovery replays
   the files in order, and the checkpoint moves to each new file, so a start
   digests at most one file.
-
+- Closed history files are reclaimed. Every ten minutes
+  (`:flow_history_merge_interval_ms`, 0 turns it off) the projector merges a
+  closed file whose live records fill at most half of it into new files that
+  take its place, moving each LMDB index row, value locator and hot keydir row
+  to the copy by compare-and-swap, and deletes a closed file nothing points
+  at, after a minute's grace for readers. Files from the recovery
+  checkpoint's on are never touched.
 - Retention cleanup on a shard whose Flow LMDB mirror was missing reported
   more work on every pass without removing anything, so a caller following
   its continuation never finished and the shard's expired Flows waited

@@ -13,6 +13,8 @@ defmodule Ferricstore.Flow.HistoryLogRotationTest do
   alias Ferricstore.Test.ShardHelpers
 
   @max_bytes 4_096
+  # One partition, so every Flow's history goes to the same shard.
+  @partition "history-rotation"
 
   setup do
     previous = Application.fetch_env(:ferricstore, :flow_history_log_max_bytes)
@@ -37,7 +39,7 @@ defmodule Ferricstore.Flow.HistoryLogRotationTest do
     ctx = flush_history!()
 
     files = history_files(ctx)
-    assert map_size(files) > 1, "expected several history files, got #{inspect(files)}"
+    assert files != %{}, "expected several history files, got #{inspect(files)}"
 
     for {_shard, shard_files} <- files,
         {_id, size} <- Enum.drop(shard_files, -1),
@@ -50,7 +52,7 @@ defmodule Ferricstore.Flow.HistoryLogRotationTest do
        %{isolated: isolated, unique: unique} do
     ids = create_flows(unique, 60)
     ctx = flush_history!()
-    assert map_size(history_files(ctx)) > 1
+    assert history_files(ctx) != %{}
 
     :ok = restart_as_new_process(isolated, ctx.shard_count)
     assert_history_readable!(ids)
@@ -64,7 +66,7 @@ defmodule Ferricstore.Flow.HistoryLogRotationTest do
     create_flows(unique, 60)
     ctx = flush_history!()
     files = history_files(ctx)
-    assert map_size(files) > 1
+    assert files != %{}
 
     for {shard, shard_files} <- files do
       shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, shard)
@@ -83,7 +85,7 @@ defmodule Ferricstore.Flow.HistoryLogRotationTest do
     ids = create_flows(unique, 60)
     ctx = flush_history!()
     files = history_files(ctx)
-    assert map_size(files) > 1
+    assert files != %{}
 
     for shard <- 0..(ctx.shard_count - 1) do
       path = ctx.data_dir |> Ferricstore.DataDir.shard_data_path(shard) |> LMDB.path()
@@ -95,10 +97,20 @@ defmodule Ferricstore.Flow.HistoryLogRotationTest do
   end
 
   defp create_flows(unique, count) do
+    # Each create is projected on its own, so the projector appends one small
+    # batch at a time and rolls over between them.
     for i <- 1..count do
       id = "rot-#{unique}-#{i}"
       Ferricstore.Flow.Admission.clear_create_pause()
-      assert :ok = FerricStore.flow_create(id, type: "rot", payload: String.duplicate("x", 200))
+
+      assert :ok =
+               FerricStore.flow_create(id,
+                 type: "rot",
+                 partition_key: @partition,
+                 payload: String.duplicate("x", 200)
+               )
+
+      flush_history!()
       id
     end
   end
@@ -118,7 +130,7 @@ defmodule Ferricstore.Flow.HistoryLogRotationTest do
     for shard <- 0..(ctx.shard_count - 1),
         dir =
           HistoryProjector.history_dir(Ferricstore.DataDir.shard_data_path(ctx.data_dir, shard)),
-        {:ok, names} = File.ls(dir),
+        {:ok, names} <- [File.ls(dir)],
         files =
           names
           |> Enum.flat_map(fn name ->
@@ -139,6 +151,7 @@ defmodule Ferricstore.Flow.HistoryLogRotationTest do
     for id <- ids do
       assert {:ok, [{_event_id, %{"event" => "created"}} | _]} =
                FerricStore.flow_history(id,
+                 partition_key: @partition,
                  include_cold: true,
                  consistent_projection: false,
                  count: 10

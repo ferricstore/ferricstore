@@ -6,6 +6,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Flow.HistoryProjector.Config
   alias Ferricstore.Flow.HistoryProjector.Keydir
+  alias Ferricstore.Flow.HistoryProjector.Merge
   alias Ferricstore.Flow.HistoryProjector.Pending
   alias Ferricstore.Flow.HistoryProjector.Recovery
   alias Ferricstore.Flow.HistoryProjector.Storage
@@ -421,7 +422,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
       )
 
     Process.send_after(self(), :drain_overflow, 0)
-    {:ok, state}
+    {:ok, schedule_merge(state)}
   end
 
   @impl true
@@ -570,7 +571,80 @@ defmodule Ferricstore.Flow.HistoryProjector do
     {:noreply, drain_overflow(state)}
   end
 
+  def handle_info(:history_merge_tick, %{merge_ref: nil} = state) do
+    {:noreply, start_merge(state)}
+  end
+
+  def handle_info(:history_merge_tick, state), do: {:noreply, state}
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{merge_ref: ref} = state) do
+    {:noreply, state |> finish_merge(reason) |> Map.put(:merge_ref, nil) |> schedule_merge()}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
+
+  # Closed history files are merged in a separate process, so projection never
+  # waits on it; see HistoryProjector.Merge.
+  defp schedule_merge(%{merge_interval_ms: interval_ms} = state) when interval_ms > 0 do
+    Process.send_after(self(), :history_merge_tick, interval_ms)
+    state
+  end
+
+  defp schedule_merge(state), do: state
+
+  defp start_merge(%{instance_ctx: %{keydir_refs: _refs, data_dir: _dir} = ctx} = state) do
+    shard_index = state.shard_index
+    dead_since = state.merge_dead_since
+
+    {_pid, ref} =
+      spawn_monitor(fn ->
+        result =
+          try do
+            Merge.run(ctx, shard_index, dead_since: dead_since)
+          rescue
+            error -> {:error, {:history_merge_exception, error}}
+          end
+
+        exit({:shutdown, {:history_merge_result, result}})
+      end)
+
+    %{state | merge_ref: ref}
+  end
+
+  defp start_merge(state), do: schedule_merge(state)
+
+  defp finish_merge(state, {:shutdown, {:history_merge_result, {:ok, result}}}) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    :telemetry.execute(
+      [:ferricstore, :flow, :history_merge],
+      %{
+        merged: length(result.merged),
+        deleted: length(result.deleted),
+        pending_delete: length(result.pending_delete)
+      },
+      %{shard_index: state.shard_index}
+    )
+
+    dead_since =
+      Map.new(result.pending_delete, fn file_id ->
+        {file_id, Map.get(state.merge_dead_since, file_id, now_ms)}
+      end)
+
+    %{state | merge_dead_since: dead_since}
+  end
+
+  defp finish_merge(state, {:shutdown, {:history_merge_result, {:error, reason}}}) do
+    Logger.warning("Flow history merge for shard #{state.shard_index} failed: #{inspect(reason)}")
+
+    state
+  end
+
+  defp finish_merge(state, reason) do
+    Logger.warning("Flow history merge for shard #{state.shard_index} exited: #{inspect(reason)}")
+
+    state
+  end
 
   defp flush_until_idle(state, attempts \\ @flush_drain_limit)
 

@@ -7,6 +7,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Config do
   @default_max_pending_entries 100_000
   @default_retry_interval_ms 50
   @max_retry_interval_ms 5_000
+  @default_merge_interval_ms 10 * 60 * 1_000
 
   def default_batch_size, do: @default_batch_size
   def default_flush_interval_ms, do: @default_flush_interval_ms
@@ -41,8 +42,20 @@ defmodule Ferricstore.Flow.HistoryProjector.Config do
       flush_interval_ms:
         app_env(:flow_history_projector_flush_interval_ms, @default_flush_interval_ms),
       chunk_interval_ms:
-        app_env(:flow_history_projector_chunk_interval_ms, @default_chunk_interval_ms)
+        app_env(:flow_history_projector_chunk_interval_ms, @default_chunk_interval_ms),
+      merge_interval_ms: merge_interval_ms(),
+      merge_ref: nil,
+      merge_dead_since: %{}
     }
+  end
+
+  # How often the projector looks for closed history files to merge; 0 turns
+  # merging off.
+  def merge_interval_ms do
+    case Application.get_env(:ferricstore, :flow_history_merge_interval_ms) do
+      ms when is_integer(ms) and ms >= 0 -> ms
+      _default -> @default_merge_interval_ms
+    end
   end
 
   defp app_env(key, default) do

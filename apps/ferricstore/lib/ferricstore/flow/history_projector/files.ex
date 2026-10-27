@@ -42,7 +42,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Files do
   def list(shard_data_path) do
     case Ferricstore.FS.ls(dir(shard_data_path)) do
       {:ok, names} -> {:ok, names |> Enum.flat_map(&file_id/1) |> Enum.sort()}
-      {:error, :enoent} -> {:ok, []}
+      {:error, {:not_found, _message}} -> {:ok, []}
       {:error, reason} -> {:error, {:history_dir_list_failed, reason}}
     end
   end
