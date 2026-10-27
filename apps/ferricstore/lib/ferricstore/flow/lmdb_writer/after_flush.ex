@@ -214,6 +214,10 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
     Hibernation.cleanup_superseded_cold_rows(path, state_key, version)
   end
 
+  def apply_after_flush({:relocate_flow_history_refs, path, moves}, _publication_ctx) do
+    Ferricstore.Flow.HistoryProjector.Merge.relocate(path, moves)
+  end
+
   def apply_after_flush({:cleanup_stale_cold_due, path, batches}, _publication_ctx) do
     Hibernation.cleanup_stale_due_batches(path, batches)
   end

@@ -3,6 +3,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Storage do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Flow.HistoryProjector
+  alias Ferricstore.Flow.HistoryProjector.Files
   alias Ferricstore.Flow.HistoryProjector.KeyCodec
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
@@ -11,15 +12,10 @@ defmodule Ferricstore.Flow.HistoryProjector.Storage do
   @max_exact_integer 9_007_199_254_740_991
 
   @spec history_dir(binary()) :: binary()
-  def history_dir(shard_data_path), do: Path.join(shard_data_path, "history")
+  def history_dir(shard_data_path), do: Files.dir(shard_data_path)
 
   @spec history_file_path(binary(), non_neg_integer()) :: binary()
-  def history_file_path(shard_data_path, file_id) do
-    Path.join(
-      history_dir(shard_data_path),
-      "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log"
-    )
-  end
+  def history_file_path(shard_data_path, file_id), do: Files.path(shard_data_path, file_id)
 
   @spec read_value(binary(), {:flow_history, non_neg_integer()}, non_neg_integer()) ::
           {:ok, binary()} | {:error, term()}
@@ -31,8 +27,18 @@ defmodule Ferricstore.Flow.HistoryProjector.Storage do
     to: Ferricstore.Flow.HistoryProjector.Log
 
   def history_active_file(shard_data_path) do
+    with :ok <- ensure_history_file(shard_data_path),
+         {:ok, file_id} <- Files.active(shard_data_path) do
+      {:ok, file_id, history_file_path(shard_data_path, file_id)}
+    end
+  rescue
+    error -> {:error, {:history_file_unavailable, error}}
+  end
+
+  # The file the next batch goes to; see Files.append_target/2.
+  def history_append_file(shard_data_path) do
     with :ok <- ensure_history_file(shard_data_path) do
-      {:ok, 0, history_file_path(shard_data_path, 0)}
+      Files.append_target(shard_data_path, Files.max_bytes())
     end
   rescue
     error -> {:error, {:history_file_unavailable, error}}
@@ -40,9 +46,10 @@ defmodule Ferricstore.Flow.HistoryProjector.Storage do
 
   def ensure_history_file(shard_data_path) do
     dir = history_dir(shard_data_path)
-    path = history_file_path(shard_data_path, 0)
 
     with :ok <- Ferricstore.FS.mkdir_p(dir),
+         {:ok, file_id} <- Files.active(shard_data_path),
+         path = history_file_path(shard_data_path, file_id),
          :ok <- touch_if_missing(path),
          :ok <- validate_history_file(path) do
       :ok

@@ -13,6 +13,19 @@ All notable changes to FerricStore will be documented here.
   in memory, and nothing is rebuilt after a restart. A set promoted before
   the raise moves on its first write after it. See
   `docs/sorted-set-tree-design.md`.
+- The Flow history log was one file per shard that only grew (2.3 GB on a
+  copy of Inspeactor's data), and every start digested all of it to check its
+  recovery checkpoint. The history projector now starts a new file once the
+  active one reaches 128 MB (`:flow_history_log_max_bytes`), recovery replays
+  the files in order, and the checkpoint moves to each new file, so a start
+  digests at most one file.
+- Closed history files are reclaimed. Every ten minutes
+  (`:flow_history_merge_interval_ms`, 0 turns it off) the projector merges a
+  closed file whose live records fill at most half of it into new files that
+  take its place, moving each LMDB index row, value locator and hot keydir row
+  to the copy by compare-and-swap, and deletes a closed file nothing points
+  at, after a minute's grace for readers. Files from the recovery
+  checkpoint's on are never touched.
 - `volatile_lru` and `allkeys_lru` eviction kept recently used keys and
   dropped stale ones for a while after the access clock wrapped. A key's last
   access is stored as 16-bit minutes, which wrap every 65,536 minutes (about
