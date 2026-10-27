@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Upgrading: raise the cluster to feature level 9 once every node runs this
+  release. ZRANK, ZREVRANK and ZRANGE by index walked a sorted set from its
+  start, about 0.6 µs per member (4 ms for the last of 7,200 members, and
+  O(N²) to page through a set by position). From level 9 a sorted set past
+  the promotion threshold lives in its own counted, copy-on-write B+tree
+  file: every sorted-set read and write is O(log N), the set keeps no member
+  in memory, and nothing is rebuilt after a restart. A set promoted before
+  the raise moves on its first write after it. See
+  `docs/sorted-set-tree-design.md`.
 - `volatile_lru` and `allkeys_lru` eviction kept recently used keys and
   dropped stale ones for a while after the access clock wrapped. A key's last
   access is stored as 16-bit minutes, which wrap every 65,536 minutes (about

@@ -1343,8 +1343,14 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
 
         case :ets.lookup(Map.fetch!(sm_state, :ets), marker_key) do
           [{^marker_key, value, expire_at_ms, _lfu, _fid, _offset, _value_size}]
-          when is_binary(value) and (expire_at_ms == 0 or expire_at_ms > now) ->
-            match?({:ok, _type, :promoted, _generation}, Promotion.decode_marker(value))
+          when is_binary(value) ->
+            case Promotion.decode_marker(value) do
+              # A tree-encoded sorted set's marker takes the set's TTL; apply
+              # decides by its own clock whether it has expired.
+              {:ok, :zset_tree, :promoted, _generation} -> true
+              {:ok, _type, :promoted, _generation} -> expire_at_ms == 0 or expire_at_ms > now
+              _other -> false
+            end
 
           # Memory pressure may have evicted the marker's value; the state
           # machine reads it back and routes the collection.

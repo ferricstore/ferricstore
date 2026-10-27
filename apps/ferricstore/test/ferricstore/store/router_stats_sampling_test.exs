@@ -111,10 +111,19 @@ defmodule Ferricstore.Store.RouterStatsSamplingTest do
       Ferricstore.Test.SourceFiles.router_source()
       |> Code.string_to_quoted!()
 
+    # compound_batch_get/3 sends a tree-encoded sorted set to its tree and
+    # every other collection to compound_batch_get_keydir/3.
+    assert contains_call?(
+             find_function_body!(ast, :compound_batch_get, 3),
+             :compound_batch_get_keydir,
+             3
+           ),
+           "compound_batch_get/3 must delegate keydir reads to compound_batch_get_keydir/3"
+
     for {name, arity} <- [
           {:do_batch_get, 5},
           {:do_batch_get_with_file_refs, 5},
-          {:compound_batch_get, 3}
+          {:compound_batch_get_keydir, 3}
         ] do
       body = find_function_body!(ast, name, arity)
 

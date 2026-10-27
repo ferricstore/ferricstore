@@ -110,13 +110,16 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
                      end) do
                   {:ok, persisted_handle} ->
                     {tag_applied_result(position, result),
-                     maybe_start_segment_projection_checkpoint(persisted_handle)}
+                     persisted_handle
+                     |> maybe_start_segment_projection_checkpoint()
+                     |> maybe_start_zset_tree_maintenance()}
 
                   :skipped ->
                     {tag_applied_result(position, result),
                      projected_handle
                      |> maybe_mark_clean_position()
-                     |> maybe_start_segment_projection_checkpoint()}
+                     |> maybe_start_segment_projection_checkpoint()
+                     |> maybe_start_zset_tree_maintenance()}
 
                   {:error, reason} ->
                     {{:error, reason},

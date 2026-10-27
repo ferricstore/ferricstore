@@ -230,9 +230,15 @@ defmodule Ferricstore.Store.RouterTest do
       source = Ferricstore.Test.SourceFiles.router_source()
       {:ok, ast} = Code.string_to_quoted(source)
 
+      # compound_count/3 counts a tree-encoded sorted set from its tree and
+      # sends every other collection to compound_count_keydir/3.
+      assert ast
+             |> function_body(:compound_count, 3)
+             |> Macro.to_string() =~ "compound_count_keydir(ctx, redis_key, prefix)"
+
       body =
         ast
-        |> function_body(:compound_count, 3)
+        |> function_body(:compound_count_keydir, 3)
         |> Macro.to_string()
 
       assert body =~ "direct_compound_read_state(idx)"
@@ -654,8 +660,8 @@ defmodule Ferricstore.Store.RouterTest do
   defp function_body(ast, function_name, arity) do
     {_ast, bodies} =
       Macro.prewalk(ast, [], fn
-        {:def, _meta, [{^function_name, _call_meta, args}, body]} = node, acc
-        when length(args) == arity ->
+        {kind, _meta, [{^function_name, _call_meta, args}, body]} = node, acc
+        when kind in [:def, :defp] and length(args) == arity ->
           {node, [body | acc]}
 
         node, acc ->

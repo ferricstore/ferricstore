@@ -89,7 +89,12 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    claim different Flows. The marker's put also brings back the Flows that
   #    hibernated before it (the state machine's
   #    `flow_restore_hibernated_flows/1`).
-  @supported 8
+  # 9: a sorted set that passes the promotion threshold moves into its own
+  #    counted tree file (`Ferricstore.Store.ZSetTree`): apply converts it in
+  #    the entry that crosses the threshold, writes its members to the tree
+  #    with the entry's Raft position, and drops them from the keydir. Older
+  #    releases keep members in the keydir and cannot read the tree.
+  @supported 9
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"
   @probe_timeout_ms 5_000

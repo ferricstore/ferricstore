@@ -363,6 +363,7 @@ defmodule Ferricstore.Store.TypeRegistry do
   defp promotable_prefix(:hash, redis_key), do: CompoundKey.hash_prefix(redis_key)
   defp promotable_prefix(:set, redis_key), do: CompoundKey.set_prefix(redis_key)
   defp promotable_prefix(:zset, redis_key), do: CompoundKey.zset_prefix(redis_key)
+  defp promotable_prefix(:zset_tree, redis_key), do: CompoundKey.zset_prefix(redis_key)
 
   @doc """
   Checks that a key either does not exist or has the expected type,
