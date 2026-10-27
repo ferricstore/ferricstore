@@ -280,34 +280,64 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
           for key <- compound_keys, {:ok, member} <- [ZSetTree.member(redis_key, key)], do: member
 
         # A tree write carries its Raft position; with none, the set stays put.
+        # A set promoted to a dedicated Bitcask before level 9 converts on its
+        # first write, whatever its size.
         with true <- is_integer(threshold) and threshold > 0,
              [_ | _] <- new_members,
              true <- is_integer(Process.get(:sm_zset_tree_index)),
              true <- feature_level_9?(state),
              nil <- zset_tree_path(state, redis_key),
-             nil <- promoted_compound_path(state, redis_key, prefix),
-             {:ok, members} <- zset_members_with_pending(state, prefix),
-             true <- map_size(Map.merge(members, Map.new(new_members, &{&1, nil}))) > threshold do
-          convert_zset_to_tree(
-            state,
-            redis_key,
-            prefix,
-            members,
-            staging || zset_tree_apply_staging(state, redis_key, prefix)
-          )
+             legacy = promoted_compound_path(state, redis_key, prefix),
+             {:ok, legacy_generation} <- legacy_zset_generation(state, redis_key, legacy),
+             {:ok, members} <- zset_members_with_pending(state, prefix, legacy),
+             true <-
+               legacy != nil or
+                 map_size(Map.merge(members, Map.new(new_members, &{&1, nil}))) > threshold,
+             {:tree, _path} = converted <-
+               convert_zset_to_tree(
+                 state,
+                 redis_key,
+                 prefix,
+                 members,
+                 staging || zset_tree_apply_staging(state, redis_key, prefix)
+               ) do
+          retire_legacy_zset(redis_key, legacy, legacy_generation)
+          converted
         else
           {:error, _reason} = error -> error
           _not_converting -> :keydir
         end
       end
 
-      # The set's members as this entry sees them: the keydir's, with the writes
-      # this entry has staged but not yet published laid over them.
-      defp zset_members_with_pending(state, prefix) do
+      defp legacy_zset_generation(_state, _redis_key, nil), do: {:ok, nil}
+
+      defp legacy_zset_generation(state, redis_key, _dedicated_path) do
+        case promotion_marker_generation_for_delete(state, Promotion.marker_key(redis_key)) do
+          generation when is_integer(generation) -> {:ok, generation}
+          other -> {:error, {:legacy_zset_marker_unavailable, other}}
+        end
+      end
+
+      # The dedicated Bitcask goes once the entry commits: the post-commit
+      # cleanup finds the set's marker names a tree and removes the directory.
+      defp retire_legacy_zset(_redis_key, nil, _generation), do: :ok
+
+      defp retire_legacy_zset(redis_key, dedicated_path, generation) do
+        :ok =
+          queue_promoted_storage_cleanup_after_flush(redis_key, :zset, dedicated_path, generation)
+
+        record_promoted_instance_removal(redis_key)
+        :ok
+      end
+
+      # The set's members as this entry sees them: the keydir's (values read
+      # from the dedicated Bitcask for a promoted set), with the writes this
+      # entry has staged but not yet published laid over them.
+      defp zset_members_with_pending(state, prefix, dedicated_path) do
         case Ferricstore.Store.Shard.ETS.prefix_scan_entries(
                shard_ets_state(state),
                prefix,
-               state.shard_data_path
+               dedicated_path || state.shard_data_path
              ) do
           entries when is_list(entries) ->
             prefix_size = byte_size(prefix)

@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Upgrading: raise the cluster to feature level 9 once every node runs this
+  release. ZRANK, ZREVRANK and ZRANGE by index walked a sorted set from its
+  start, about 0.6 µs per member (4 ms for the last of 7,200 members, and
+  O(N²) to page through a set by position). From level 9 a sorted set past
+  the promotion threshold lives in its own counted, copy-on-write B+tree
+  file: every sorted-set read and write is O(log N), the set keeps no member
+  in memory, and nothing is rebuilt after a restart. A set promoted before
+  the raise moves on its first write after it. See
+  `docs/sorted-set-tree-design.md`.
 - A stop no longer turns into a crash for a busy shard. WARaft kills a
   storage process whose close runs past 30 s, and close could wait longer
   than that for Flow history and cache compaction (10 s per history shard,

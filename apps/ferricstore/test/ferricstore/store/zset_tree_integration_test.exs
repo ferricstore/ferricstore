@@ -14,6 +14,8 @@ defmodule Ferricstore.Store.ZSetTreeIntegrationTest do
   alias Ferricstore.Store.{CompoundKey, Promotion, Router}
   alias Ferricstore.Test.ShardHelpers
 
+  import Ferricstore.Test.Eventually
+
   @threshold 16
 
   setup do
@@ -339,6 +341,48 @@ defmodule Ferricstore.Store.ZSetTreeIntegrationTest do
 
     assert 1 = cmd(ctx, "ZADD", [key, "1", "after"])
     assert 31 = cmd(ctx, "ZCARD", [key])
+  end
+
+  # Sets promoted to a dedicated Bitcask before level 9 rank by walking an
+  # in-memory index; the first write after the raise moves them into a tree.
+  test "a set promoted before level 9 moves into its tree on its next write", %{ctx: ctx} do
+    key = "{legacy-promoted}"
+    in_multi = "{legacy-promoted}:multi"
+    shard = Router.shard_for(ctx, key)
+    dedicated = Promotion.dedicated_path(ctx.data_dir, shard, :zset, key)
+    dedicated_multi = Promotion.dedicated_path(ctx.data_dir, shard, :zset, in_multi)
+    pairs = Enum.flat_map(1..40, fn i -> ["#{rem(i * 7, 23)}", "m#{i}"] end)
+    assert 40 = cmd(ctx, "ZADD", [key | pairs])
+    assert 40 = cmd(ctx, "ZADD", [in_multi | pairs])
+    assert_eventually(fn -> assert File.dir?(dedicated) and File.dir?(dedicated_multi) end)
+    multi_before = cmd(ctx, "ZRANGE", [in_multi, "0", "-1", "WITHSCORES"])
+    assert "11" = cmd(ctx, "ZINCRBY", [key, "4", "m1"])
+    before = cmd(ctx, "ZRANGE", [key, "0", "-1", "WITHSCORES"])
+
+    raise_to_9!(ctx)
+    assert ^before = cmd(ctx, "ZRANGE", [key, "0", "-1", "WITHSCORES"])
+    assert 1 = cmd(ctx, "ZADD", [key, "100", "after"])
+
+    assert [_file] = tree_files(ctx, key)
+    assert_eventually(fn -> refute File.exists?(dedicated) end)
+    assert before ++ ["after", "100"] == cmd(ctx, "ZRANGE", [key, "0", "-1", "WITHSCORES"])
+    assert 41 = cmd(ctx, "ZCARD", [key])
+    assert 40 = cmd(ctx, "ZRANK", [key, "after"])
+    assert [] = member_rows(ctx, key)
+
+    assert %{results: [1, 41], prepare_errors: []} =
+             exec([["ZADD", in_multi, "100", "after"], ["ZCARD", in_multi]])
+
+    assert [_file] = tree_files(ctx, in_multi)
+    assert_eventually(fn -> refute File.exists?(dedicated_multi) end)
+
+    assert multi_before ++ ["after", "100"] ==
+             cmd(ctx, "ZRANGE", [in_multi, "0", "-1", "WITHSCORES"])
+
+    assert :ok = WARaftBackend.stop()
+    assert :ok = WARaftBackend.start(ctx)
+    assert :ok = ShardHelpers.wait_default_pipeline_ready()
+    assert before ++ ["after", "100"] == cmd(ctx, "ZRANGE", [key, "0", "-1", "WITHSCORES"])
   end
 
   test "a tree-encoded set survives a restart", %{ctx: ctx} do

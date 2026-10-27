@@ -200,7 +200,9 @@ Settings: `:zset_tree_maintenance_interval_ms` (1000),
   routed across shards refuses tree sets.
 - The segment projector sends any key with a tree marker to full apply, whatever
   the marker's TTL, so apply decides expiry by its own clock.
-- Sets promoted to a dedicated Bitcask before level 9 stay as they are.
+- A set promoted to a dedicated Bitcask before level 9 converts on its first
+  write after the raise, whatever its size. The post-commit cleanup then finds a
+  tree marker and removes the dedicated directory.
 - Snapshots copy the dedicated directory, trees included.
 
 ## Testing
@@ -211,7 +213,8 @@ Settings: `:zset_tree_maintenance_interval_ms` (1000),
   during compaction (fails without the lock); reads beside rewinds; overflow
   keys; -0.
 - `zset_tree_integration_test.exs`: random command runs against sets promoted
-  before level 9, plain and in MULTI; conversion in MULTI; MULTI rollback; key
+  before level 9, plain and in MULTI; conversion in MULTI; conversion of sets
+  promoted before level 9, plain and in MULTI; MULTI rollback; key
   commands, GEO, expiry; WATCH, SCAN TYPE, FLUSHDB; restart; flat ZRANK as the
   set grows.
 - `zset_tree_maintenance_test.exs`: removal after DEL and after expiry; small
