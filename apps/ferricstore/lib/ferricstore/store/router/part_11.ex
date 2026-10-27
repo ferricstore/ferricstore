@@ -105,6 +105,18 @@ defmodule Ferricstore.Store.Router.Part11 do
             ) ::
               {:ok, [{binary(), float()}]} | :unavailable
       def zset_rank_range(ctx, redis_key, start_idx, stop_idx, reverse?) do
+        case zset_tree_read_path(ctx, redis_key) do
+          nil ->
+            zset_rank_range_keydir(ctx, redis_key, start_idx, stop_idx, reverse?)
+
+          path ->
+            path
+            |> Ferricstore.Store.ZSetTree.rank_range(start_idx, stop_idx, reverse?)
+            |> zset_tree_index_reply()
+        end
+      end
+
+      defp zset_rank_range_keydir(ctx, redis_key, start_idx, stop_idx, reverse?) do
         idx = shard_for(ctx, redis_key)
 
         if selected_waraft_ctx?(ctx) do
@@ -122,6 +134,18 @@ defmodule Ferricstore.Store.Router.Part11 do
       @spec zset_member_rank(FerricStore.Instance.t(), binary(), binary(), boolean()) ::
               {:ok, non_neg_integer() | nil} | :unavailable
       def zset_member_rank(ctx, redis_key, member, reverse?) do
+        case zset_tree_read_path(ctx, redis_key) do
+          nil ->
+            zset_member_rank_keydir(ctx, redis_key, member, reverse?)
+
+          path ->
+            path
+            |> Ferricstore.Store.ZSetTree.member_rank(member, reverse?)
+            |> zset_tree_index_reply()
+        end
+      end
+
+      defp zset_member_rank_keydir(ctx, redis_key, member, reverse?) do
         idx = shard_for(ctx, redis_key)
 
         if selected_waraft_ctx?(ctx) do

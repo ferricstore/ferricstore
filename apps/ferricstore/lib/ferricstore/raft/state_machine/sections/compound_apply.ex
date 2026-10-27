@@ -1074,6 +1074,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
         init_pending_write_process_state(state)
         Process.put(:sm_cross_shard_pending_writes, [])
         Process.put(:sm_cross_shard_pending_originals, %{})
+        begin_zset_tree_tx_writes()
 
         try do
           result =
@@ -1109,6 +1110,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
         after
           Process.delete(:sm_cross_shard_pending_writes)
           Process.delete(:sm_cross_shard_pending_originals)
+          end_zset_tree_tx_writes()
           clear_pending_write_process_state()
         end
       end

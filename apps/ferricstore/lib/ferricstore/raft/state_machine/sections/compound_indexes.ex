@@ -121,13 +121,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       defp zset_index_delete(_state, _redis_key, _key), do: :ok
 
       defp queue_zset_index_put_after_flush(
-             %{zset_score_index_name: index, zset_score_lookup_name: lookup},
+             %{zset_score_index_name: index, zset_score_lookup_name: lookup} = state,
              redis_key,
              <<"Z:", _rest::binary>> = key,
              value
            )
            when index != nil and lookup != nil do
-        queue_pending_zset_index_op({:put, index, lookup, redis_key, key, to_disk_binary(value)})
+        # A tree-encoded set has no in-memory score index.
+        if zset_tree_path(state, redis_key) == nil do
+          queue_pending_zset_index_op(
+            {:put, index, lookup, redis_key, key, to_disk_binary(value)}
+          )
+        end
+
+        :ok
       end
 
       defp queue_zset_index_put_after_flush(_state, _redis_key, _key, _value), do: :ok
@@ -237,13 +244,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       defp queue_zset_index_ready_empty_after_flush(_state, _redis_key), do: :ok
 
       defp queue_zset_index_new_put_after_flush(
-             %{zset_score_index_name: index, zset_score_lookup_name: lookup},
+             %{zset_score_index_name: index, zset_score_lookup_name: lookup} = state,
              redis_key,
              member,
              score
            )
            when index != nil and lookup != nil do
-        queue_pending_zset_index_op({:new_put, index, lookup, redis_key, member, score})
+        if zset_tree_path(state, redis_key) == nil do
+          queue_pending_zset_index_op({:new_put, index, lookup, redis_key, member, score})
+        end
+
         :ok
       end
 

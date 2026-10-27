@@ -91,6 +91,25 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
     fs_append_sync_nofollow_bounded
     fs_atomic_replace_nofollow
   )
+  # Sorted-set tree files: each call opens the file and preads pages.
+  @dirty_io_sorted_set_tree_nifs ~w(
+    zset_tree_apply
+    zset_tree_card
+    zset_tree_scores
+    zset_tree_rank
+    zset_tree_range_by_index
+    zset_tree_range_by_score
+    zset_tree_range_by_lex
+    zset_tree_count_by_score
+    zset_tree_count_by_lex
+    zset_tree_at_positions
+    zset_tree_scan
+    zset_tree_recover
+    zset_tree_rewind
+    zset_tree_file_stats
+    zset_tree_sync
+    zset_tree_compact
+  )
   @dirty_cpu_async_copy_nifs ~w(
     v2_append_batch_async
     v2_pread_batch_path_async
@@ -110,7 +129,8 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
   @dirty_io_nifs @dirty_io_maintenance_nifs ++
                    @dirty_io_blocking_nifs ++
                    @dirty_io_probabilistic_nifs ++
-                   @dirty_io_metadata_nifs
+                   @dirty_io_metadata_nifs ++
+                   @dirty_io_sorted_set_tree_nifs
 
   test "only explicitly classified blocking NIFs use dirty schedulers" do
     offenders =
@@ -136,7 +156,10 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
     source = native_source()
 
     for function <-
-          @dirty_io_blocking_nifs ++ @dirty_io_probabilistic_nifs ++ @dirty_io_metadata_nifs do
+          @dirty_io_blocking_nifs ++
+            @dirty_io_probabilistic_nifs ++
+            @dirty_io_metadata_nifs ++
+            @dirty_io_sorted_set_tree_nifs do
       assert_nif_schedule(source, function, "DirtyIo")
     end
   end

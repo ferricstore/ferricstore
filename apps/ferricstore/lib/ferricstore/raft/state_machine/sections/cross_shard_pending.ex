@@ -395,6 +395,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
       end
 
       defp rollback_cross_shard_pending_writes(state) do
+        rollback_zset_tree_tx_writes()
         ref = keydir_binary_ref(state)
 
         Process.get(:sm_cross_shard_pending_originals, %{})

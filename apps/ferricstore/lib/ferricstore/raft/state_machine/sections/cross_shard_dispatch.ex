@@ -2757,6 +2757,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           transaction_result_byte_budget:
             anchor_state.apply_context.transaction_result_byte_budget
         }
+        |> zset_tree_wrap_tx_store(
+          anchor_state,
+          ctx_for_key,
+          put_in_ctx,
+          delete_in_ctx,
+          routing_mode
+        )
       end
 
       if Mix.env() == :test do

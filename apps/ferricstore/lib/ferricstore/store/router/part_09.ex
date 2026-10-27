@@ -1630,6 +1630,17 @@ defmodule Ferricstore.Store.Router.Part09 do
       @spec compound_get(FerricStore.Instance.t(), binary(), binary()) ::
               binary() | nil | ReadResult.failure()
       def compound_get(ctx, redis_key, compound_key) do
+        case zset_tree_members_path(ctx, redis_key, [compound_key]) do
+          nil ->
+            compound_get_keydir(ctx, redis_key, compound_key)
+
+          path ->
+            {:ok, member} = Ferricstore.Store.ZSetTree.member(redis_key, compound_key)
+            path |> Ferricstore.Store.ZSetTree.score(member) |> zset_tree_value()
+        end
+      end
+
+      defp compound_get_keydir(ctx, redis_key, compound_key) do
         idx = shard_for(ctx, redis_key)
         keydir = resolve_keydir(ctx, idx)
         expiry_context = ExpiryContext.capture()

@@ -961,6 +961,47 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
              prefix,
              ignored_keys
            ) do
+        tree_path =
+          if prefix == CompoundKey.zset_prefix(redis_key), do: zset_tree_path(state, redis_key)
+
+        case tree_path do
+          nil ->
+            maybe_delete_empty_keydir_compound_type(
+              state,
+              redis_key,
+              type_key,
+              prefix,
+              ignored_keys
+            )
+
+          path ->
+            maybe_delete_empty_zset_tree(state, redis_key, type_key, path)
+        end
+      end
+
+      # An emptied tree-encoded set goes entirely, as Redis drops an empty set.
+      defp maybe_delete_empty_zset_tree(state, redis_key, type_key, path) do
+        case Ferricstore.Store.ZSetTree.card(path) do
+          {:ok, 0} ->
+            with :ok <- zset_tree_delete_set(state, redis_key, path) do
+              do_compound_delete(state, redis_key, type_key)
+            end
+
+          {:ok, _count} ->
+            :ok
+
+          {:error, reason} ->
+            {:error, {:zset_tree_read_failed, reason}}
+        end
+      end
+
+      defp maybe_delete_empty_keydir_compound_type(
+             state,
+             redis_key,
+             type_key,
+             prefix,
+             ignored_keys
+           ) do
         ignored_keys =
           Enum.reduce(ignored_keys, Process.get(:sm_pending_values, %{}), fn key, acc ->
             Map.put(acc, key, :deleted)

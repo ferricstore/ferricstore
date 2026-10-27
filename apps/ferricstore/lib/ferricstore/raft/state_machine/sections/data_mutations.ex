@@ -439,39 +439,56 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
           if count == 0 do
             []
           else
-            prefix = CompoundKey.zset_prefix(redis_key)
-
-            with :ok <- ensure_zpop_score_index(state, redis_key, prefix) do
-              selected =
-                ZSetIndex.rank_range(
-                  state.zset_score_index_name,
-                  redis_key,
-                  0,
-                  count - 1,
-                  direction == :max
-                )
-
-              selected_delete_keys =
-                Enum.map(selected, fn {member, _score} ->
-                  CompoundKey.zset_member(redis_key, member)
-                end)
-
-              type_key = CompoundKey.type_key(redis_key)
-
-              with :ok <- do_compound_batch_delete(state, redis_key, selected_delete_keys),
-                   :ok <-
-                     maybe_delete_empty_compound_type(
-                       state,
-                       redis_key,
-                       type_key,
-                       :zset,
-                       selected_delete_keys
-                     ) do
-                Enum.flat_map(selected, fn {member, score} ->
-                  [member, format_zset_score(score)]
-                end)
-              end
+            case zset_tree_path(state, redis_key) do
+              nil -> do_zpop_keydir(state, redis_key, count, direction)
+              path -> do_zpop_tree(state, redis_key, count, direction, path)
             end
+          end
+        end
+      end
+
+      defp do_zpop_tree(state, redis_key, count, direction, path) do
+        op = if direction == :max, do: {:pop_max, count}, else: {:pop_min, count}
+        type_key = CompoundKey.type_key(redis_key)
+
+        with {:ok, [popped]} <- zset_tree_write(state, path, [op]),
+             :ok <- maybe_delete_empty_compound_type(state, redis_key, type_key, :zset, []) do
+          Enum.flat_map(popped, fn {member, score} -> [member, format_zset_score(score)] end)
+        end
+      end
+
+      defp do_zpop_keydir(state, redis_key, count, direction) do
+        prefix = CompoundKey.zset_prefix(redis_key)
+
+        with :ok <- ensure_zpop_score_index(state, redis_key, prefix) do
+          selected =
+            ZSetIndex.rank_range(
+              state.zset_score_index_name,
+              redis_key,
+              0,
+              count - 1,
+              direction == :max
+            )
+
+          selected_delete_keys =
+            Enum.map(selected, fn {member, _score} ->
+              CompoundKey.zset_member(redis_key, member)
+            end)
+
+          type_key = CompoundKey.type_key(redis_key)
+
+          with :ok <- do_compound_batch_delete(state, redis_key, selected_delete_keys),
+               :ok <-
+                 maybe_delete_empty_compound_type(
+                   state,
+                   redis_key,
+                   type_key,
+                   :zset,
+                   selected_delete_keys
+                 ) do
+            Enum.flat_map(selected, fn {member, score} ->
+              [member, format_zset_score(score)]
+            end)
           end
         end
       end
@@ -524,6 +541,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         do: Ferricstore.Store.ValueCodec.format_double(score)
 
       defp sm_store_compound_get_meta(state, redis_key, compound_key) do
+        case zset_tree_route(state, redis_key, [compound_key]) do
+          {:tree, path, [_member], []} ->
+            {:ok, member} = Ferricstore.Store.ZSetTree.member(redis_key, compound_key)
+
+            case Ferricstore.Store.ZSetTree.score(path, member) do
+              {:ok, nil} -> nil
+              {:ok, score} -> {score, 0}
+              {:error, reason} -> {:error, {:zset_tree_read_failed, reason}}
+            end
+
+          :keydir ->
+            sm_store_compound_get_meta_keydir(state, redis_key, compound_key)
+        end
+      end
+
+      defp sm_store_compound_get_meta_keydir(state, redis_key, compound_key) do
         result =
           case sm_store_compound_path_fun(state, redis_key, compound_key) do
             nil ->
