@@ -563,9 +563,7 @@ defmodule Ferricstore.MemoryGuard do
               end)
 
             p when p in [:volatile_lru, :allkeys_lru] ->
-              Enum.sort_by(eligible, fn {_k, _exp, lfu, _vs} ->
-                Ferricstore.Store.LFU.unpack(lfu) |> elem(0)
-              end)
+              lru_order(eligible, Ferricstore.Store.LFU.now_minutes())
           end
 
         # Evict until we've freed enough bytes or run out of candidates.
@@ -742,6 +740,22 @@ defmodule Ferricstore.MemoryGuard do
 
   defp shard_indexes(count) when is_integer(count) and count > 0, do: 0..(count - 1)
   defp shard_indexes(_count), do: []
+
+  @doc false
+  # Least recently used first. The access stamp is 16-bit minutes and wraps
+  # every 65,536 minutes, so candidates sort by how long each has been idle,
+  # not by the stamp: one touched just before a wrap has the larger stamp.
+  @spec lru_order([tuple()], non_neg_integer()) :: [tuple()]
+  def lru_order(eligible, now_minutes) do
+    Enum.sort_by(
+      eligible,
+      fn {_key, _exp, lfu, _vsize} ->
+        {ldt, _counter} = Ferricstore.Store.LFU.unpack(lfu)
+        Ferricstore.Store.LFU.elapsed_minutes(now_minutes, ldt)
+      end,
+      :desc
+    )
+  end
 
   defp keydir_binary_bytes_ref do
     ctx = FerricStore.Instance.get(:default)

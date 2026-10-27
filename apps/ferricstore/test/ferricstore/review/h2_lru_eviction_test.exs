@@ -131,6 +131,21 @@ defmodule Ferricstore.Review.H2LruEvictionTest do
     end
   end
 
+  # The access clock is 16-bit minutes and wraps every 65,536 minutes (about
+  # 45 days): a key touched just before the wrap has the larger stamp, yet it
+  # has been idle longer than one touched just after.
+  test "LRU order counts idle time across the minute clock's wrap" do
+    now = 14
+    fresh = {"fresh", 0, LFU.pack(14, 5), 1}
+    stale = {"stale", 0, LFU.pack(65_450, 5), 1}
+    staler = {"staler", 0, LFU.pack(65_000, 5), 1}
+
+    assert ["staler", "stale", "fresh"] =
+             [fresh, stale, staler]
+             |> MemoryGuard.lru_order(now)
+             |> Enum.map(&elem(&1, 0))
+  end
+
   # -- helpers ---------------------------------------------------------------
 
   defp partition_keys do
