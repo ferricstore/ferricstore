@@ -215,6 +215,46 @@ defmodule Ferricstore.Store.ZSetTreeIntegrationTest do
     assert File.stat!(file).size == size
   end
 
+  test "WATCH, SCAN TYPE and FLUSHDB see a tree-encoded set", %{ctx: ctx} do
+    raise_to_9!(ctx)
+    key = "{server}"
+    pairs = Enum.flat_map(1..30, fn i -> ["#{i}", "m#{i}"] end)
+    assert 30 = cmd(ctx, "ZADD", [key | pairs])
+    assert [_file] = tree_files(ctx, key)
+
+    # SCAN TYPE zset names the set once, not its members.
+    scanned =
+      Stream.unfold("0", fn
+        nil ->
+          nil
+
+        cursor ->
+          [next, keys] = cmd(ctx, "SCAN", [cursor, "TYPE", "zset", "COUNT", "1000"])
+          {keys, if(next == "0", do: nil, else: next)}
+      end)
+      |> Enum.concat()
+
+    assert [^key] = Enum.filter(scanned, &String.starts_with?(&1, "{server}"))
+
+    # A write after WATCH aborts the transaction.
+    watched = %{key => Router.watch_token(ctx, key)}
+    assert 1 = cmd(ctx, "ZADD", [key, "99", "intruder"])
+
+    {:ok, command} = PreparedCommand.prepare("ZADD", [key, "1", "from-multi"])
+    assert nil == Ferricstore.Transaction.Coordinator.execute([command], watched, nil)
+    assert nil == cmd(ctx, "ZSCORE", [key, "from-multi"])
+
+    # Unchanged since WATCH: it runs.
+    watched = %{key => Router.watch_token(ctx, key)}
+    assert [1] = Ferricstore.Transaction.Coordinator.execute([command], watched, nil)
+
+    assert :ok = cmd(ctx, "FLUSHDB", [])
+    assert 0 = cmd(ctx, "EXISTS", [key])
+    assert 0 = cmd(ctx, "ZCARD", [key])
+    assert 2 = cmd(ctx, "ZADD", [key, "1", "a", "2", "b"])
+    assert ["a", "b"] = cmd(ctx, "ZRANGE", [key, "0", "-1"])
+  end
+
   test "GEO commands match a set promoted before level 9", %{ctx: ctx} do
     scenario = fn key ->
       places =
@@ -259,6 +299,46 @@ defmodule Ferricstore.Store.ZSetTreeIntegrationTest do
 
     assert tree == legacy
     assert [_file] = tree_files(ctx, "{geo-tree}")
+  end
+
+  # A tree write inside MULTI lands at once; when the transaction then fails,
+  # each tree it wrote is cut back to before its first write.
+  test "a transaction that fails after writing a tree leaves the tree as it was", %{ctx: ctx} do
+    raise_to_9!(ctx)
+    key = "{rollback}"
+    poison = key <> ":poison"
+    pairs = Enum.flat_map(1..30, fn i -> ["#{i}", "m#{i}"] end)
+    assert 30 = cmd(ctx, "ZADD", [key | pairs])
+    assert [file] = tree_files(ctx, key)
+    before = cmd(ctx, "ZRANGE", [key, "0", "-1", "WITHSCORES"])
+    size = File.stat!(file).size
+
+    Application.put_env(:ferricstore, :cross_shard_transaction_hook, fn
+      {:staged_put, _shard, ^poison} -> throw({:transaction_store_failure, :injected_failure})
+      _event -> :ok
+    end)
+
+    try do
+      result =
+        exec([
+          ["ZADD", key, "100", "new"],
+          ["ZINCRBY", key, "5", "m1"],
+          ["ZREM", key, "m2"],
+          ["SET", poison, "x"]
+        ])
+
+      refute match?(%{results: [1, "6", 1, :ok]}, result)
+    after
+      Application.delete_env(:ferricstore, :cross_shard_transaction_hook)
+    end
+
+    assert ^before = cmd(ctx, "ZRANGE", [key, "0", "-1", "WITHSCORES"])
+    assert nil == cmd(ctx, "ZSCORE", [key, "new"])
+    assert File.stat!(file).size == size
+    assert nil == cmd(ctx, "GET", [poison])
+
+    assert 1 = cmd(ctx, "ZADD", [key, "1", "after"])
+    assert 31 = cmd(ctx, "ZCARD", [key])
   end
 
   test "a tree-encoded set survives a restart", %{ctx: ctx} do
