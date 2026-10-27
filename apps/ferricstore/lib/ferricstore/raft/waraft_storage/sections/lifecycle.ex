@@ -157,7 +157,12 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
         close_deadline = System.monotonic_time(:millisecond) + storage_close_budget_ms()
 
         try do
-          :ok = drain_zset_tree_maintenance(handle)
+          :ok =
+            drain_zset_tree_maintenance(
+              handle,
+              min(snapshot_compaction_drain_timeout_ms(), close_remaining_ms(close_deadline))
+            )
+
           handle = flush_replay_dependencies_before_close(handle, close_deadline)
 
           with :ok <-
@@ -849,7 +854,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
       end
 
       defp do_create_snapshot(snapshot_path, handle) do
-        with :ok <- drain_zset_tree_maintenance(handle),
+        with :ok <-
+               drain_zset_tree_maintenance(handle, snapshot_compaction_drain_timeout_ms()),
              :ok <- reset_dir(snapshot_path),
              :ok <- copy_shard_dirs_to_snapshot(snapshot_path, handle),
              :ok <- drain_apply_projection_cache_compaction_for_snapshot(handle),
@@ -889,7 +895,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
           %{instance_ctx: handle.ctx, shard_index: handle.shard_index},
           fn ->
             with_flow_lmdb_snapshot_install(handle, fn ->
-              :ok = drain_zset_tree_maintenance(handle)
+              :ok =
+                drain_zset_tree_maintenance(handle, snapshot_compaction_drain_timeout_ms())
+
               do_open_snapshot(snapshot_path, expected_position, handle)
             end)
           end

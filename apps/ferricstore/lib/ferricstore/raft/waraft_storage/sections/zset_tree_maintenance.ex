@@ -243,6 +243,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ZSetTreeMaintenance do
 
         {:ok, pid} =
           Task.start(fn ->
+            :ok = zset_tree_compaction_hook()
             results = Enum.map(paths, &{&1, ZSetTree.compact(&1, floor)})
 
             send_storage_info(
@@ -296,20 +297,46 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ZSetTreeMaintenance do
         Map.delete(handle, :zset_tree_maintenance)
       end
 
-      # A snapshot copies or replaces the tree files, so a running compaction
-      # finishes first.
-      defp drain_zset_tree_maintenance(handle) do
+      # A snapshot copies or replaces the tree files, and close ends the
+      # storage, so a running compaction gets up to `timeout_ms` to finish. One
+      # left running is safe: it holds a file's lock only to copy the frames
+      # written meanwhile and rename, a writer re-checks the path after taking
+      # the lock, and once a snapshot install has moved the directory its
+      # rename finds no file and fails.
+      defp drain_zset_tree_maintenance(handle, timeout_ms) do
         case Map.get(handle, :zset_tree_maintenance) do
           %{pid: pid} when is_pid(pid) ->
             monitor = Process.monitor(pid)
 
             receive do
               {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
+            after
+              timeout_ms ->
+                Process.demonitor(monitor, [:flush])
+
+                Logger.warning(
+                  "Sorted set tree compaction still running after #{timeout_ms} ms; going on"
+                )
+
+                :ok
             end
 
           _none ->
             :ok
         end
+      end
+
+      if Mix.env() == :test do
+        defp zset_tree_compaction_hook do
+          case Application.get_env(:ferricstore, :zset_tree_compaction_hook) do
+            hook when is_function(hook, 0) -> hook.()
+            _missing -> :ok
+          end
+
+          :ok
+        end
+      else
+        defp zset_tree_compaction_hook, do: :ok
       end
 
       defp zset_tree_env(:zset_tree_maintenance_interval_ms),

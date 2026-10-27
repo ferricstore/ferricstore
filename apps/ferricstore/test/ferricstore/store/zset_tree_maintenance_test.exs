@@ -228,4 +228,40 @@ defmodule Ferricstore.Store.ZSetTreeMaintenanceTest do
              |> Enum.reject(&match?(["after-crash", _score], &1))
              |> List.flatten()
   end
+
+  test "a close does not wait past its budget for a running compaction", %{ctx: ctx} do
+    parent = self()
+
+    Application.put_env(:ferricstore, :zset_tree_compaction_hook, fn ->
+      send(parent, {:compacting, self()})
+
+      receive do
+        :release -> :ok
+      after
+        60_000 -> :ok
+      end
+    end)
+
+    Application.put_env(:ferricstore, :waraft_storage_close_budget_ms, 1_000)
+
+    on_exit(fn ->
+      Application.delete_env(:ferricstore, :zset_tree_compaction_hook)
+      Application.delete_env(:ferricstore, :waraft_storage_close_budget_ms)
+    end)
+
+    key = "{close}"
+    assert 30 = cmd(ctx, "ZADD", [key | pairs("m", 30)])
+    for _ <- 1..150, do: cmd(ctx, "ZINCRBY", [key, "1", "m1"])
+    assert_receive {:compacting, task}, 10_000
+
+    {micros, :ok} = :timer.tc(fn -> WARaftBackend.stop() end)
+    assert micros < 10_000_000
+    assert Process.alive?(task)
+
+    send(task, :release)
+    assert :ok = WARaftBackend.start(ctx)
+    assert :ok = ShardHelpers.wait_default_pipeline_ready()
+    assert "151" = cmd(ctx, "ZSCORE", [key, "m1"])
+    assert 30 = cmd(ctx, "ZCARD", [key])
+  end
 end
