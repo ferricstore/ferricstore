@@ -100,6 +100,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
         plan_kind = Map.get(attrs, :plan_kind, :all)
         projection_pending? = flow_retention_history_projection_pending?(state)
         lmdb_pending? = flow_retention_lmdb_projection_pending?(state)
+        # A terminal Flow is removed only after its whole history is read from
+        # the mirror; without one no Flow can be planned, so the shard has
+        # nothing to offer now rather than more.
+        lmdb_unavailable? = flow_retention_lmdb_projection_state(state) == :unavailable
         backfill_pending? = not flow_retention_backfill_complete?(state)
 
         {active_candidates, active_more?} =
@@ -116,7 +120,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
 
         {terminal_candidates, terminal_more?} =
           if plan_kind not in [:terminal, :all] or projection_pending? or lmdb_pending? or
-               backfill_pending? do
+               lmdb_unavailable? or backfill_pending? do
             {[], false}
           else
             flow_retention_plan_terminal_candidates(state, now_ms, limit, attrs)
@@ -131,6 +135,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
            terminal_more?: terminal_more?,
            projection_pending?: projection_pending?,
            lmdb_pending?: lmdb_pending?,
+           lmdb_unavailable?: lmdb_unavailable?,
            backfill_pending?: backfill_pending?
          }}
       end
