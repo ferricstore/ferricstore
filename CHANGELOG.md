@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.15 - 2026-10-27
+
 - Upgrading: raise the cluster to feature level 9 once every node runs this
   release. ZRANK, ZREVRANK and ZRANGE by index walked a sorted set from its
   start, about 0.6 µs per member (4 ms for the last of 7,200 members, and
