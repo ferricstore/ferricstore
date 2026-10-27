@@ -150,6 +150,25 @@ defmodule Ferricstore.Raft.PromotedFileSync do
   end
 
   @doc """
+  Runs `write`, which changes `path` outside the Bitcask append API (a sorted
+  set's tree file, `Ferricstore.Store.ZSetTree`), and tracks the file like an
+  append. A process without a tracker syncs the file right after.
+  """
+  @spec track_write(binary(), (-> result)) :: result | {:error, term()} when result: term()
+  def track_write(path, write) when is_binary(path) and is_function(write, 0) do
+    case current() do
+      nil ->
+        with {:ok, _value} = result <- write.(),
+             :ok <- sync_file(path) do
+          result
+        end
+
+      tracker ->
+        tracked_append(tracker, path, write)
+    end
+  end
+
+  @doc """
   Syncs every tracked file and, once none is left, removes the marker.
 
   Only the owner untracks files, so a write that lands while another process
@@ -251,7 +270,7 @@ defmodule Ferricstore.Raft.PromotedFileSync do
     table
     |> :ets.match_object({{:file, :_}, :_})
     |> Enum.reduce_while(:ok, fn {{:file, path}, _version} = row, :ok ->
-      case fsync_file(path) do
+      case sync_file(path) do
         :ok ->
           synced.(row)
           {:cont, :ok}
@@ -308,6 +327,19 @@ defmodule Ferricstore.Raft.PromotedFileSync do
 
   # A tracked file that is gone was merged by compaction, which syncs what it
   # keeps, or removed with its collection.
+  # A tree file's own sync also records how far it is on disk, so its recovery
+  # checks only the frames written after.
+  defp sync_file(path) do
+    if Path.extname(path) == ".tree" do
+      case Ferricstore.Store.ZSetTree.sync(path) do
+        :ok -> :ok
+        {:error, reason} -> if FS.exists?(path), do: {:error, reason}, else: :ok
+      end
+    else
+      fsync_file(path)
+    end
+  end
+
   defp fsync_file(path) do
     case call_fsync(:file, path) do
       :ok -> :ok

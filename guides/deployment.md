@@ -545,14 +545,16 @@ key takes due Flows that were hibernated (below it, a Flow created without a
 partition key and due more than the hot window away, five minutes by default,
 is never claimed by one); at level 8 every replica claims the same Flows
 (below it, a node whose LMDB writer is behind, or that restarted, can claim a
-different hibernated Flow than the others). After the first start of a new
+different hibernated Flow than the others); at level 9 a large sorted set lives
+in its own counted tree file, so ZRANK and ZRANGE by index stay O(log N) (below
+it they walk the set from its start). After the first start of a new
 cluster, once every node is up, raise it to the level the release supports:
 
 ```bash
 bin/ferricstore rpc 'IO.inspect(FerricStore.cluster_feature_level())'
-# {:ok, %{supported: 8, active: 0, shards: [0, 0, 0, 0]}}
+# {:ok, %{supported: 9, active: 0, shards: [0, 0, 0, 0]}}
 
-bin/ferricstore rpc 'IO.inspect(FerricStore.raise_cluster_feature_level(8))'
+bin/ferricstore rpc 'IO.inspect(FerricStore.raise_cluster_feature_level(9))'
 ```
 
 ## Upgrading a Cluster
@@ -663,6 +665,14 @@ shard_0: 2
     brings back, on each shard, the Flows hibernated before it: the shard
     reads each one's record once and applies nothing else meanwhile, so the
     raise takes longer on a shard with many of them.
+  - 9: a sorted set past the promotion threshold (100 members by default)
+    moves into its own file under `dedicated/shard_N/`: a counted B+tree read
+    and written by stateless NIF calls, with no member kept in memory and
+    nothing rebuilt after a restart. ZRANK, ZREVRANK and ZRANGE by index cost
+    O(log N) instead of a walk from the set's start. A set promoted to a
+    dedicated Bitcask before the raise moves on its first write after it. The
+    storage compacts these files and removes the ones no set names; see
+    `docs/sorted-set-tree-design.md`.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.

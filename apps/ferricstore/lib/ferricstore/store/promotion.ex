@@ -47,6 +47,7 @@ defmodule Ferricstore.Store.Promotion do
   """
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.ZSetTree
   alias Ferricstore.ExpiryContext
   alias Ferricstore.Raft.WARaftSegmentReader
 
@@ -107,7 +108,7 @@ defmodule Ferricstore.Store.Promotion do
 
   @doc false
   @spec encode_marker(
-          :hash | :set | :zset,
+          :hash | :set | :zset | :zset_tree,
           marker_lifecycle(),
           marker_generation()
         ) :: binary()
@@ -124,7 +125,7 @@ defmodule Ferricstore.Store.Promotion do
   end
 
   def encode_marker(type, lifecycle, generation)
-      when type in [:hash, :set, :zset] and
+      when type in [:hash, :set, :zset, :zset_tree] and
              lifecycle in [:promoted, :fallback, :cleanup] and
              is_integer(generation) and generation > 0 and generation <= 0xFFFFFFFFFFFFFFFF do
     <<@marker_format_prefix::binary, marker_lifecycle_tag(lifecycle), marker_type_tag(type),
@@ -133,7 +134,7 @@ defmodule Ferricstore.Store.Promotion do
 
   @doc false
   @spec decode_marker(binary()) ::
-          {:ok, :hash | :set | :zset, marker_lifecycle(), marker_generation()}
+          {:ok, :hash | :set | :zset | :zset_tree, marker_lifecycle(), marker_generation()}
           | {:error, :malformed_versioned_marker}
           | {:error, :unsupported_marker_version}
           | :error
@@ -176,6 +177,9 @@ defmodule Ferricstore.Store.Promotion do
   defp marker_type_tag(:hash), do: 0
   defp marker_type_tag(:set), do: 1
   defp marker_type_tag(:zset), do: 2
+  # A sorted set in its counted tree file (`Ferricstore.Store.ZSetTree`), from
+  # feature level 9. Only the versioned codec names it.
+  defp marker_type_tag(:zset_tree), do: 3
 
   defp decode_marker_lifecycle(0), do: {:ok, :promoted}
   defp decode_marker_lifecycle(1), do: {:ok, :fallback}
@@ -185,6 +189,7 @@ defmodule Ferricstore.Store.Promotion do
   defp decode_marker_type(0), do: {:ok, :hash}
   defp decode_marker_type(1), do: {:ok, :set}
   defp decode_marker_type(2), do: {:ok, :zset}
+  defp decode_marker_type(3), do: {:ok, :zset_tree}
   defp decode_marker_type(_tag), do: :error
 
   @doc false
@@ -994,6 +999,24 @@ defmodule Ferricstore.Store.Promotion do
     end
   end
 
+  defp recover_zset_trees!(tree_markers, data_dir, shard_index) do
+    Enum.each(tree_markers, fn
+      {redis_key, :zset_tree, _marker_key, {:promoted, generation}} ->
+        path = ZSetTree.path(data_dir, shard_index, redis_key, generation)
+
+        case ZSetTree.recover(path) do
+          {:ok, _recovery} ->
+            :ok
+
+          {:error, reason} ->
+            raise "sorted set tree recovery failed for #{path}: #{inspect(reason)}"
+        end
+
+      _intent ->
+        :ok
+    end)
+  end
+
   @spec recover_promoted(binary(), atom(), binary(), non_neg_integer(), term()) :: map()
   def recover_promoted(shard_data_path, keydir, data_dir, shard_index, instance_ctx \\ nil) do
     recovery_plan = :ets.new(:promotion_recovery_plan, [:private, :ordered_set])
@@ -1002,6 +1025,18 @@ defmodule Ferricstore.Store.Promotion do
     try do
       {all_markers, marker_actions} =
         plan_recovery_markers!(shard_data_path, keydir, shard_index, instance_ctx)
+
+      # A tree-encoded sorted set has no dedicated log to recover: its tree
+      # file checks the frames written since its last sync and cuts any torn
+      # tail, before the log replays into it.
+      {tree_markers, all_markers} =
+        Enum.split_with(all_markers, fn {_redis_key, type, _marker_key, _state} ->
+          type == :zset_tree
+        end)
+
+      recover_zset_trees!(tree_markers, data_dir, shard_index)
+      tree_keys = MapSet.new(tree_markers, &elem(&1, 0))
+      marker_actions = Enum.reject(marker_actions, &MapSet.member?(tree_keys, elem(&1, 1)))
 
       now =
         ExpiryContext.capture()

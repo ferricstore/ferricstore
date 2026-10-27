@@ -59,8 +59,10 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
     |> Ferricstore.Store.Shard.Reads.do_get(Promotion.marker_key(redis_key))
   end
 
+  # A tree-encoded sorted set has no dedicated log (`Ferricstore.Store.ZSetTree`).
   defp decode_promoted_marker_type(type_str) do
     case Promotion.decode_marker(type_str) do
+      {:ok, :zset_tree, :promoted, _generation} -> nil
       {:ok, type, :promoted, _generation} -> type
       _missing_invalid_or_intent -> nil
     end

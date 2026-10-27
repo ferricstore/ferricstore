@@ -727,6 +727,92 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       # Shared collections retain the pending-write fast path; promoted
       # collections are resolved to their dedicated log before any access.
       defp build_compound_store(state) do
+        state
+        |> build_compound_store_keydir()
+        |> Map.merge(zset_tree_store_fields(state))
+        |> zset_tree_wrap_store_reads(state)
+      end
+
+      # A tree-encoded sorted set's member reads go to its tree. Only the read
+      # functions the store has are wrapped.
+      defp zset_tree_wrap_store_reads(store, state) do
+        Map.merge(store, Map.take(zset_tree_store_reads(store, state), Map.keys(store)))
+      end
+
+      defp zset_tree_store_reads(store, state) do
+        %{
+          compound_scan: fn redis_key, prefix ->
+            zset_tree_prefix_read(
+              state,
+              redis_key,
+              prefix,
+              &Ferricstore.Store.ZSetTree.members/1,
+              fn ->
+                store.compound_scan.(redis_key, prefix)
+              end
+            )
+          end,
+          compound_scan_slice: fn redis_key, prefix, start, count, total ->
+            zset_tree_prefix_read(
+              state,
+              redis_key,
+              prefix,
+              &Ferricstore.Store.ZSetTree.member_slice(&1, start, count),
+              fn -> store.compound_scan_slice.(redis_key, prefix, start, count, total) end
+            )
+          end,
+          compound_scan_page: fn redis_key, prefix, cursor, count, match_pattern, fields_only ->
+            zset_tree_prefix_read(
+              state,
+              redis_key,
+              prefix,
+              &zset_tree_scan_page(&1, cursor, count, match_pattern, fields_only),
+              fn ->
+                store.compound_scan_page.(
+                  redis_key,
+                  prefix,
+                  cursor,
+                  count,
+                  match_pattern,
+                  fields_only
+                )
+              end
+            )
+          end,
+          compound_count: fn redis_key, prefix ->
+            zset_tree_prefix_read(
+              state,
+              redis_key,
+              prefix,
+              &Ferricstore.Store.ZSetTree.card/1,
+              fn ->
+                store.compound_count.(redis_key, prefix)
+              end
+            )
+          end
+        }
+      end
+
+      defp zset_tree_prefix_read(state, redis_key, prefix, tree_read, keydir_read) do
+        path =
+          if prefix == CompoundKey.zset_prefix(redis_key), do: zset_tree_path(state, redis_key)
+
+        case path do
+          nil ->
+            keydir_read.()
+
+          path ->
+            case tree_read.(path) do
+              {:ok, value} ->
+                value
+
+              {:error, reason} ->
+                Ferricstore.Store.ReadResult.failure({:zset_tree_read_failed, reason})
+            end
+        end
+      end
+
+      defp build_compound_store_keydir(state) do
         %{
           cache_scope: state.instance_name,
           level_6_writes?: feature_level_6?(state),
@@ -1062,6 +1148,34 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
              value,
              expire_at_ms
            ) do
+        case zset_tree_write_split(state, redis_key, [compound_key]) do
+          {:tree, path, [_member], []} ->
+            zset_tree_put_entries(state, redis_key, path, [{compound_key, value, expire_at_ms}])
+
+          {:error, _reason} = error ->
+            error
+
+          :keydir ->
+            with :ok <-
+                   do_compound_put_value_validated_keydir(
+                     state,
+                     redis_key,
+                     compound_key,
+                     value,
+                     expire_at_ms
+                   ) do
+              zset_tree_follow_type_ttl(state, redis_key, [{compound_key, value, expire_at_ms}])
+            end
+        end
+      end
+
+      defp do_compound_put_value_validated_keydir(
+             state,
+             redis_key,
+             compound_key,
+             value,
+             expire_at_ms
+           ) do
         dedicated_path = promoted_compound_path(state, redis_key, compound_key)
 
         result =
@@ -1210,6 +1324,34 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       defp do_compound_batch_put_value_validated(_state, _redis_key, []), do: :ok
 
       defp do_compound_batch_put_value_validated(state, redis_key, entries) do
+        case zset_tree_write_split(state, redis_key, Enum.map(entries, &elem(&1, 0))) do
+          {:tree, path, members, _others} ->
+            member_keys = MapSet.new(members)
+
+            {tree_entries, other_entries} =
+              Enum.split_with(entries, fn {compound_key, _value, _expire_at_ms} ->
+                MapSet.member?(member_keys, compound_key)
+              end)
+
+            with :ok <- zset_tree_put_entries(state, redis_key, path, tree_entries),
+                 :ok <-
+                   do_compound_batch_put_value_validated_keydir(state, redis_key, other_entries) do
+              zset_tree_follow_type_ttl(state, redis_key, other_entries)
+            end
+
+          {:error, _reason} = error ->
+            error
+
+          :keydir ->
+            with :ok <- do_compound_batch_put_value_validated_keydir(state, redis_key, entries) do
+              zset_tree_follow_type_ttl(state, redis_key, entries)
+            end
+        end
+      end
+
+      defp do_compound_batch_put_value_validated_keydir(_state, _redis_key, []), do: :ok
+
+      defp do_compound_batch_put_value_validated_keydir(state, redis_key, entries) do
         case compound_batch_put_target(state, redis_key, entries) do
           :shared ->
             do_shared_compound_batch_put_fast(state, redis_key, entries, :generic)
@@ -1426,7 +1568,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       # Keep only one lightweight hint per collection and dispatch it after the
       # durable write batch succeeds. Carry the exact replicated threshold that
       # admitted the write so the async worker cannot observe newer process state.
-      defp queue_compound_promotion_after_flush(state, redis_key, compound_key) do
+      # From level 9 a sorted set converts to its tree in apply instead
+      # (`maybe_convert_zset_to_tree/3`).
+      defp queue_compound_promotion_after_flush(
+             state,
+             redis_key,
+             <<"Z:", _::binary>> = compound_key
+           ) do
+        if feature_level_9?(state),
+          do: :ok,
+          else: queue_compound_promotion_after_flush_any(state, redis_key, compound_key)
+      end
+
+      defp queue_compound_promotion_after_flush(state, redis_key, compound_key),
+        do: queue_compound_promotion_after_flush_any(state, redis_key, compound_key)
+
+      defp queue_compound_promotion_after_flush_any(state, redis_key, compound_key) do
         threshold = Map.fetch!(state, :apply_context).promotion_threshold
 
         case Process.get(:sm_pending_compound_promotions) do
@@ -1666,6 +1823,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       end
 
       defp do_compound_delete(state, redis_key, compound_key) do
+        case zset_tree_route(state, redis_key, [compound_key]) do
+          {:tree, path, [_member], []} ->
+            zset_tree_delete_keys(state, redis_key, path, [compound_key])
+
+          _keydir ->
+            do_compound_delete_keydir(state, redis_key, compound_key)
+        end
+      end
+
+      defp do_compound_delete_keydir(state, redis_key, compound_key) do
         result =
           case promoted_compound_path(state, redis_key, compound_key) do
             nil ->
@@ -1693,6 +1860,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       defp do_compound_batch_delete_admitted(_state, _redis_key, []), do: :ok
 
       defp do_compound_batch_delete_admitted(state, redis_key, compound_keys) do
+        case zset_tree_route(state, redis_key, compound_keys) do
+          {:tree, path, members, others} ->
+            with :ok <- zset_tree_delete_keys(state, redis_key, path, members) do
+              do_compound_batch_delete_keydir(state, redis_key, others)
+            end
+
+          :keydir ->
+            do_compound_batch_delete_keydir(state, redis_key, compound_keys)
+        end
+      end
+
+      defp do_compound_batch_delete_keydir(_state, _redis_key, []), do: :ok
+
+      defp do_compound_batch_delete_keydir(state, redis_key, compound_keys) do
         first_path = promoted_compound_path(state, redis_key, hd(compound_keys))
 
         if Enum.all?(compound_keys, fn compound_key ->
@@ -1850,6 +2031,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       defp valid_promoted_tombstone_location?(_location), do: false
 
       defp do_compound_delete_prefix(state, redis_key, prefix) do
+        tree_path =
+          if prefix == CompoundKey.zset_prefix(redis_key), do: zset_tree_path(state, redis_key)
+
+        case tree_path do
+          nil -> do_compound_delete_prefix_keydir(state, redis_key, prefix)
+          path -> zset_tree_delete_set(state, redis_key, path)
+        end
+      end
+
+      defp do_compound_delete_prefix_keydir(state, redis_key, prefix) do
         cleanup_target = promoted_prefix_cleanup_target(state, redis_key, prefix)
 
         promotion_generation =

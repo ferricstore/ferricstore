@@ -97,4 +97,5 @@ defmodule Ferricstore.Raft.WARaftStorage do
   use Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot
   use Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata
   use Ferricstore.Raft.WARaftStorage.Sections.SnapshotInstall
+  use Ferricstore.Raft.WARaftStorage.Sections.ZSetTreeMaintenance
 end

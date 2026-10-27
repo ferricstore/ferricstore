@@ -997,6 +997,97 @@ defmodule Ferricstore.Bitcask.NIF do
           :ok | {:error, term()}
   def bloom_file_create(_path, _num_bits, _num_hashes), do: :erlang.nif_error(:nif_not_loaded)
 
+  # Disk-native sorted sets (native/ferricstore_bitcask/src/zset_tree). A
+  # missing file reads as an empty set. Ops: {:add, member, score, flags},
+  # {:incr, member, delta, flags}, {:remove, member}, {:pop_min, n},
+  # {:pop_max, n}; flags nx 1, xx 2, gt 4, lt 8. Score bounds :neg_inf | :inf |
+  # {:incl, float} | {:excl, float}; lex bounds :min | :max | {:incl, binary} |
+  # {:excl, binary}.
+  # A token at or below the file's latest is a replayed entry: the file is cut
+  # back to before it first, so it gets the outcome it had the first time.
+  @spec zset_tree_apply(binary(), non_neg_integer(), non_neg_integer(), [tuple()]) ::
+          {:ok, [term()]} | {:error, binary()}
+  def zset_tree_apply(_path, _token_index, _token_ordinal, _ops),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec zset_tree_card(binary()) :: {:ok, non_neg_integer()} | {:error, binary()}
+  def zset_tree_card(_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec zset_tree_scores(binary(), [binary()]) :: {:ok, [float() | nil]} | {:error, binary()}
+  def zset_tree_scores(_path, _members), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec zset_tree_rank(binary(), binary(), boolean()) ::
+          {:ok, non_neg_integer() | nil} | {:error, binary()}
+  def zset_tree_rank(_path, _member, _rev), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec zset_tree_range_by_index(binary(), integer(), integer(), boolean()) ::
+          {:ok, [{binary(), float()}]} | {:error, binary()}
+  def zset_tree_range_by_index(_path, _start, _stop, _rev),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec zset_tree_range_by_score(
+          binary(),
+          term(),
+          term(),
+          boolean(),
+          non_neg_integer(),
+          non_neg_integer() | nil
+        ) :: {:ok, [{binary(), float()}]} | {:error, binary()}
+  def zset_tree_range_by_score(_path, _min, _max, _rev, _offset, _limit),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec zset_tree_range_by_lex(
+          binary(),
+          term(),
+          term(),
+          boolean(),
+          non_neg_integer(),
+          non_neg_integer() | nil
+        ) :: {:ok, [{binary(), float()}]} | {:error, binary()}
+  def zset_tree_range_by_lex(_path, _min, _max, _rev, _offset, _limit),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec zset_tree_count_by_score(binary(), term(), term()) ::
+          {:ok, non_neg_integer()} | {:error, binary()}
+  def zset_tree_count_by_score(_path, _min, _max), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec zset_tree_count_by_lex(binary(), term(), term()) ::
+          {:ok, non_neg_integer()} | {:error, binary()}
+  def zset_tree_count_by_lex(_path, _min, _max), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec zset_tree_at_positions(binary(), [non_neg_integer()]) ::
+          {:ok, [{binary(), float()}]} | {:error, binary()}
+  def zset_tree_at_positions(_path, _positions), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec zset_tree_scan(binary(), binary() | nil, non_neg_integer()) ::
+          {:ok, {[{binary(), float()}], binary() | nil}} | {:error, binary()}
+  def zset_tree_scan(_path, _after, _count), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec zset_tree_recover(binary()) ::
+          {:ok, :missing | {non_neg_integer(), non_neg_integer(), non_neg_integer()}}
+          | {:error, binary()}
+  def zset_tree_recover(_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  # Cuts the file back to before a token (a failed transaction's first write).
+  @spec zset_tree_rewind(binary(), non_neg_integer(), non_neg_integer()) ::
+          :ok | {:error, binary()}
+  def zset_tree_rewind(_path, _token_index, _token_ordinal),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  # The file's length and its first frame's: how far writes have grown it.
+  @spec zset_tree_file_stats(binary()) ::
+          {:ok, :missing | {non_neg_integer(), non_neg_integer()}} | {:error, binary()}
+  def zset_tree_file_stats(_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec zset_tree_sync(binary()) :: :ok | {:error, binary()}
+  def zset_tree_sync(_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  # Folds every frame into one, keeping the changes after `floor_index` (Raft
+  # replays nothing at or below it) as an undo log for replayed entries.
+  @spec zset_tree_compact(binary(), non_neg_integer()) ::
+          {:ok, :missing | {non_neg_integer(), non_neg_integer()}} | {:error, binary()}
+  def zset_tree_compact(_path, _floor_index), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec bloom_file_add(binary(), binary()) :: :ok | {:error, term()}
   def bloom_file_add(_path, _element), do: :erlang.nif_error(:nif_not_loaded)
 
