@@ -1074,15 +1074,18 @@ defmodule Ferricstore.Bitcask.NIF do
   def zset_tree_rewind(_path, _token_index, _token_ordinal),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  # The file's length and its first frame's: how far writes have grown it.
+  @spec zset_tree_file_stats(binary()) ::
+          {:ok, :missing | {non_neg_integer(), non_neg_integer()}} | {:error, binary()}
+  def zset_tree_file_stats(_path), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec zset_tree_sync(binary()) :: :ok | {:error, binary()}
   def zset_tree_sync(_path), do: :erlang.nif_error(:nif_not_loaded)
 
-  # Folds the frames at or below `floor_index` (Raft replays none of them) into
-  # one base frame and keeps the later ones. `:uncovered` when every frame is
-  # after the floor.
+  # Folds every frame into one, keeping the changes after `floor_index` (Raft
+  # replays nothing at or below it) as an undo log for replayed entries.
   @spec zset_tree_compact(binary(), non_neg_integer()) ::
-          {:ok, :missing | :uncovered | {non_neg_integer(), non_neg_integer()}}
-          | {:error, binary()}
+          {:ok, :missing | {non_neg_integer(), non_neg_integer()}} | {:error, binary()}
   def zset_tree_compact(_path, _floor_index), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec bloom_file_add(binary(), binary()) :: :ok | {:error, term()}

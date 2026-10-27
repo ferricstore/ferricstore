@@ -506,13 +506,11 @@ fn a_replayed_entry_rewinds_the_file_and_applies_again() {
 }
 
 #[test]
-fn a_rewind_never_goes_below_a_compacted_base() {
+fn a_rewind_never_goes_below_the_compacted_floor() {
     let (_dir, path) = temp_tree();
     for i in 1..=3 {
         apply(&path, Token::new(i, 1), &[add(&format!("m{i}"), i as f64)]).unwrap();
     }
-    // No frame at or below the floor: nothing to fold.
-    assert!(matches!(compact(&path, 0).unwrap(), Compacted::Uncovered));
     assert!(matches!(compact(&path, 3).unwrap(), Compacted::Done(_)));
     apply(&path, Token::new(4, 1), &[add("m4", 4.0)]).unwrap();
     apply(&path, Token::new(4, 1), &[add("m4", 4.0)]).unwrap();
@@ -521,11 +519,11 @@ fn a_rewind_never_goes_below_a_compacted_base() {
     assert_eq!(all_members(&path).len(), 4);
 }
 
-/// Compaction folds the frames at or below its floor into one base frame and
-/// keeps every later frame, one for one: a replay of an entry after the floor
-/// still rewinds to the state it first saw.
+/// Compaction folds every frame into one, and keeps the changes after its
+/// floor to undo: a replay of an entry after the floor still starts from the
+/// state the entry first saw.
 #[test]
-fn compaction_keeps_the_frames_after_its_floor() {
+fn compaction_folds_every_frame_and_rewinds_through_its_undo_log() {
     let (_dir, path) = temp_tree();
     // after[i]: the set once entry i has applied.
     let mut after = vec![BTreeMap::new()];
@@ -554,9 +552,10 @@ fn compaction_keeps_the_frames_after_its_floor() {
         panic!("expected a compaction");
     };
     assert_eq!(done.bytes_before, before);
+    assert!(done.bytes_after < before / 4);
     assert_eq!(all_members(&path), entries(&after[40]));
 
-    // Replaying entry 30 cuts back to the set after 29 and applies again.
+    // Replaying entry 30 starts from the set after 29.
     apply(&path, Token::new(30, 1), &[add("again", 30.0)]).unwrap();
     let mut expected = after[29].clone();
     expected.insert(b"again".to_vec(), 30.0);
@@ -568,6 +567,68 @@ fn compaction_keeps_the_frames_after_its_floor() {
     expected.insert(b"again".to_vec(), 21.0);
     assert_eq!(all_members(&path), entries(&expected));
     assert!(apply(&path, Token::new(20, 1), &[add("again", 20.0)]).is_err());
+}
+
+/// Writes, compactions at floors behind the latest entry, and restarts that
+/// apply every entry again from a point after the floor: the set and every
+/// outcome match the history.
+#[test]
+fn replays_after_compactions_match_the_history() {
+    let (_dir, path) = temp_tree();
+    let mut rng = Rng(0x00c0_ffee_1234_5678);
+    // entries[i] and history[i]: entry i's ops, and the set once it applied.
+    let mut entries: Vec<Vec<Op>> = vec![Vec::new()];
+    let mut history = vec![Model::default()];
+    let mut results: Vec<Option<Vec<Outcome>>> = vec![None];
+    let mut floor = 0_u64;
+    let mut replays = 0;
+    for _ in 0..900 {
+        let latest = (entries.len() - 1) as u64;
+        match rng.below(14) {
+            0 | 1 if latest > 0 => {
+                floor = floor.max(latest.saturating_sub(rng.below(40)));
+                assert!(matches!(compact(&path, floor).unwrap(), Compacted::Done(_)));
+            }
+            2 if latest > floor + 1 => {
+                replays += 1;
+                let from = floor + 1 + rng.below(latest - floor);
+                for index in from..=latest {
+                    let applied = apply(&path, Token::new(index, 1), &entries[index as usize]);
+                    assert_eq!(
+                        applied.ok().map(outcomes),
+                        results[index as usize],
+                        "entry {index}"
+                    );
+                    assert_eq!(all_members(&path), history[index as usize].by_score());
+                }
+            }
+            _ => {
+                let ops: Vec<Op> = (0..=rng.below(5)).map(|_| random_op(&mut rng)).collect();
+                let mut model = history.last().unwrap().clone();
+                let expected = ops
+                    .iter()
+                    .map(|op| model.apply(op))
+                    .collect::<Result<Vec<_>>>();
+                let applied = apply(&path, Token::new(latest + 1, 1), &ops);
+                let result = match (expected, applied) {
+                    (Ok(expected), Ok(applied)) => {
+                        assert_eq!(outcomes(applied), expected);
+                        Some(expected)
+                    }
+                    (Err(_), Err(_)) => {
+                        model = history.last().unwrap().clone();
+                        None
+                    }
+                    (expected, applied) => panic!("model {expected:?}, tree {applied:?}"),
+                };
+                entries.push(ops);
+                history.push(model);
+                results.push(result);
+            }
+        }
+        assert_eq!(all_members(&path), history.last().unwrap().by_score());
+    }
+    assert!(replays > 20, "{replays} replays");
 }
 
 /// Writes that land while a compaction runs are in the compacted file.
@@ -991,4 +1052,26 @@ fn reads_beside_rewinds_never_fail() {
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     assert!(reader.join().unwrap() > 0);
+}
+
+#[test]
+fn file_stats_show_how_far_writes_grew_the_file() {
+    let (_dir, path) = temp_tree();
+    assert_eq!(file_stats(&path).unwrap(), None);
+    let seed: Vec<Op> = (0..500)
+        .map(|i| add(&format!("m{i:03}"), f64::from(i)))
+        .collect();
+    apply(&path, Token::new(1, 1), &seed).unwrap();
+    let (len, first) = file_stats(&path).unwrap().unwrap();
+    assert_eq!(len, first + super::format::HEADER_REGION);
+    for i in 0..50 {
+        apply(&path, Token::new(2 + i, 1), &[add("m001", -(i as f64))]).unwrap();
+    }
+    let (grown, first_again) = file_stats(&path).unwrap().unwrap();
+    assert_eq!(first_again, first);
+    assert!(grown > len);
+    compact(&path, u64::MAX).unwrap();
+    let (compacted, base) = file_stats(&path).unwrap().unwrap();
+    assert_eq!(compacted, base + super::format::HEADER_REGION);
+    assert!(compacted < grown);
 }

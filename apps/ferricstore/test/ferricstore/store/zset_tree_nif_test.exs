@@ -66,9 +66,13 @@ defmodule Ferricstore.Store.ZSetTreeNifTest do
     assert {:ok, {[], nil}} = NIF.zset_tree_scan(path, "zzz", 2)
 
     assert :ok = NIF.zset_tree_sync(path)
-    assert {:ok, :uncovered} = NIF.zset_tree_compact(path, 0)
-    assert {:ok, {before, after_bytes}} = NIF.zset_tree_compact(path, 3)
+    assert {:ok, {before, after_bytes}} = NIF.zset_tree_compact(path, 0)
     assert after_bytes < before
+    # Entry 3 is after floor 0: replayed, it starts again from the set before it.
+    assert {:ok, outcomes} = NIF.zset_tree_apply(path, 3, 1, members)
+    assert Enum.all?(outcomes, &(&1 == {true, true}))
+    assert {:ok, {_before, _after}} = NIF.zset_tree_compact(path, 3)
+    assert {:error, _at_floor} = NIF.zset_tree_apply(path, 3, 1, members)
     assert {:ok, {_frames, 0, 501}} = NIF.zset_tree_recover(path)
     assert {:ok, 501} = NIF.zset_tree_card(path)
   end

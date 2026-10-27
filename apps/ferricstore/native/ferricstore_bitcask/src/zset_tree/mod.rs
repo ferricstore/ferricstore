@@ -26,7 +26,9 @@ mod tests;
 pub type Result<T> = std::result::Result<T, String>;
 
 pub use format::{LoggedOp, Token, MAX_MEMBER_LEN};
-pub use maintain::{compact, recover, sync, Compacted, Compaction, Recovery};
+pub use maintain::{compact, recover, sync, Compacted, Compaction, Recovery, TEMP_SUFFIXES};
+
+use maintain::Rewound;
 pub use ops::{Conditions, Entry, LexBound, Op, Outcome, ScoreBound};
 pub use store::TreeState;
 pub use tree::Tx;
@@ -58,18 +60,23 @@ pub fn apply(path: &Path, token: Token, ops: &[Op]) -> Result<Applied> {
     {
         return Err("zset tree: member too long".into());
     }
-    let file = TreeFile::open_write(path)?;
-    let state = file.state()?;
+    let mut file = TreeFile::open_write(path)?;
+    let mut state = file.state()?;
     let token = if token.index == 0 {
         Token::new(state.token.index + 1, token.ordinal.max(1))
     } else {
         token
     };
-    let state = if token <= state.token {
-        maintain::rewind(&file, state, token)?
-    } else {
-        state
-    };
+    if token <= state.token {
+        match maintain::rewind(path, &file, state, token)? {
+            Rewound::InPlace(rewound) => state = rewound,
+            Rewound::Rewritten => {
+                drop(file);
+                file = TreeFile::open_write(path)?;
+                state = file.state()?;
+            }
+        }
+    }
     let mut tx = Tx::begin(&file, state);
     let outcomes = ops
         .iter()
@@ -88,9 +95,27 @@ pub fn rewind_to(path: &Path, token: Token) -> Result<()> {
     };
     let state = file.state()?;
     if token <= state.token {
-        maintain::rewind(&file, state, token)?;
+        maintain::rewind(path, &file, state, token)?;
     }
     Ok(())
+}
+
+/// The file's length and its first frame's (the tree as conversion or the
+/// last compaction built it): how far writes have grown the file. `None` when
+/// the file does not exist.
+pub fn file_stats(path: &Path) -> Result<Option<(u64, u64)>> {
+    let Some(file) = TreeFile::open_read(path)? else {
+        return Ok(None);
+    };
+    let first = if file.len() >= format::HEADER_REGION + format::FRAME_HEADER_SIZE as u64 {
+        format::FrameHeader::decode(
+            &file.read_exact(format::HEADER_REGION, format::FRAME_HEADER_SIZE)?,
+        )
+        .map_or(0, |header| header.frame_len())
+    } else {
+        0
+    };
+    Ok(Some((file.len(), first)))
 }
 
 /// A read that saw its frame cut away is run again, this many times at most.

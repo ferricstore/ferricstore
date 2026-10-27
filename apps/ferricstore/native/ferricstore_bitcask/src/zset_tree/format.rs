@@ -282,29 +282,47 @@ impl Trailer {
     }
 }
 
-/// What a frame changed, member by member. Compaction replays these onto a
-/// rewritten file to catch up with frames written while it copied.
+/// What a frame changed, member by member, with what each member had before.
+/// Compaction replays these onto a rewritten file to catch up with frames
+/// written while it copied, and keeps them, newest last, as the undo log a
+/// replayed entry rewinds through.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LoggedOp {
-    Set(Vec<u8>, f64),
-    Remove(Vec<u8>),
+    /// `member` now has `score`; it had `prev` (`None`: it was not in the set).
+    Set {
+        member: Vec<u8>,
+        score: f64,
+        prev: Option<f64>,
+    },
+    /// `member` left the set; it had `prev`.
+    Remove { member: Vec<u8>, prev: f64 },
 }
+
+const OP_SET_NEW: u8 = 1;
+const OP_REMOVE: u8 = 2;
+const OP_SET_CHANGED: u8 = 3;
 
 pub fn encode_ops(ops: &[LoggedOp]) -> Vec<u8> {
     let mut out = Vec::new();
     for op in ops {
+        let (kind, member) = match op {
+            LoggedOp::Set {
+                member, prev: None, ..
+            } => (OP_SET_NEW, member),
+            LoggedOp::Set { member, .. } => (OP_SET_CHANGED, member),
+            LoggedOp::Remove { member, .. } => (OP_REMOVE, member),
+        };
+        out.push(kind);
+        put_u32(&mut out, member.len() as u32);
+        out.extend_from_slice(member);
         match op {
-            LoggedOp::Set(member, score) => {
-                out.push(1);
-                put_u32(&mut out, member.len() as u32);
-                out.extend_from_slice(member);
+            LoggedOp::Set { score, prev, .. } => {
                 put_u64(&mut out, score.to_bits());
+                if let Some(prev) = prev {
+                    put_u64(&mut out, prev.to_bits());
+                }
             }
-            LoggedOp::Remove(member) => {
-                out.push(2);
-                put_u32(&mut out, member.len() as u32);
-                out.extend_from_slice(member);
-            }
+            LoggedOp::Remove { prev, .. } => put_u64(&mut out, prev.to_bits()),
         }
     }
     out
@@ -320,15 +338,76 @@ pub fn decode_ops(mut bytes: &[u8]) -> Result<Vec<LoggedOp>> {
             .ok_or_else(|| "zset tree: truncated logged op".to_string())?
             .to_vec();
         bytes = &bytes[5 + len..];
-        match kind {
-            1 => {
-                let score = f64::from_bits(get_u64(bytes, 0)?);
-                bytes = &bytes[8..];
-                ops.push(LoggedOp::Set(member, score));
+        let mut next = || -> Result<f64> {
+            let value = f64::from_bits(get_u64(bytes, 0)?);
+            bytes = &bytes[8..];
+            Ok(value)
+        };
+        ops.push(match kind {
+            OP_SET_NEW => LoggedOp::Set {
+                member,
+                score: next()?,
+                prev: None,
+            },
+            OP_SET_CHANGED => {
+                let score = next()?;
+                LoggedOp::Set {
+                    member,
+                    score,
+                    prev: Some(next()?),
+                }
             }
-            2 => ops.push(LoggedOp::Remove(member)),
+            OP_REMOVE => LoggedOp::Remove {
+                member,
+                prev: next()?,
+            },
             _ => return Err("zset tree: unknown logged op".into()),
-        }
+        });
     }
     Ok(ops)
+}
+
+/// A compacted file's record of the changes it folded in after `floor` (an
+/// index Raft never replays at or below), one group per frame, oldest first.
+/// A replayed entry after the floor rewinds the file by undoing the groups at
+/// and after it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UndoLog {
+    pub floor: u64,
+    pub groups: Vec<(Token, Vec<LoggedOp>)>,
+}
+
+impl UndoLog {
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_u64(&mut out, self.floor);
+        for (token, ops) in &self.groups {
+            let ops = encode_ops(ops);
+            put_u64(&mut out, token.index);
+            put_u64(&mut out, token.ordinal);
+            put_u32(&mut out, ops.len() as u32);
+            out.extend_from_slice(&ops);
+        }
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.is_empty() {
+            return Ok(Self::default());
+        }
+        let floor = get_u64(bytes, 0)?;
+        let mut rest = &bytes[8..];
+        let mut groups = Vec::new();
+        while !rest.is_empty() {
+            let token = Token::new(get_u64(rest, 0)?, get_u64(rest, 8)?);
+            let len = get_u32(rest, 16)? as usize;
+            let ops = rest
+                .get(20..20 + len)
+                .ok_or_else(|| "zset tree: truncated undo log".to_string())?;
+            groups.push((token, decode_ops(ops)?));
+            rest = &rest[20 + len..];
+        }
+        Ok(Self { floor, groups })
+    }
 }

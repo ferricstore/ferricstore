@@ -32,7 +32,6 @@ mod atoms {
         min,
         max,
         missing,
-        uncovered,
     }
 }
 
@@ -453,6 +452,16 @@ pub fn zset_tree_rewind(
 
 #[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
+pub fn zset_tree_file_stats(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
+    match super::file_stats(Path::new(&path)) {
+        Ok(Some(stats)) => Ok((atoms::ok(), stats).encode(env)),
+        Ok(None) => Ok((atoms::ok(), atoms::missing()).encode(env)),
+        Err(reason) => error(env, &reason),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
 pub fn zset_tree_sync(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
     match super::sync(Path::new(&path)) {
         Ok(_) => Ok(atoms::ok().encode(env)),
@@ -465,7 +474,6 @@ pub fn zset_tree_sync(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
 pub fn zset_tree_compact(env: Env<'_>, path: String, floor_index: u64) -> NifResult<Term<'_>> {
     match super::compact(Path::new(&path), floor_index) {
         Ok(Compacted::Missing) => Ok((atoms::ok(), atoms::missing()).encode(env)),
-        Ok(Compacted::Uncovered) => Ok((atoms::ok(), atoms::uncovered()).encode(env)),
         Ok(Compacted::Done(compaction)) => Ok((
             atoms::ok(),
             (compaction.bytes_before, compaction.bytes_after),

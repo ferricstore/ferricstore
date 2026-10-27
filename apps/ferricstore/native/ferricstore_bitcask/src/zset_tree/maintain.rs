@@ -1,9 +1,9 @@
-//! Recovery, sync and compaction of a tree file.
+//! Recovery, sync, rewinds and compaction of a tree file.
 
 use std::path::{Path, PathBuf};
 
 use super::format::{
-    decode_ops, FrameHeader, HeaderSlot, Token, Trailer, FRAME_HEADER_SIZE, HEADER_REGION,
+    decode_ops, FrameHeader, HeaderSlot, Token, Trailer, UndoLog, FRAME_HEADER_SIZE, HEADER_REGION,
     INLINE_KEY_MAX, PAGE_SIZE, TRAILER_SIZE,
 };
 use super::node::{decode_node, encode_node, encode_overflow, Branch, Child, Key, Leaf, Node};
@@ -27,16 +27,63 @@ pub struct Compaction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Compacted {
     Missing,
-    /// Raft could still replay an entry the file holds; the compacted frame
-    /// would leave nothing to rewind to.
-    Uncovered,
     Done(Compaction),
 }
 
-/// Cuts the file back to the last frame before `token`, so a replayed entry
-/// applies again from the state it first saw. Fails when that would go below
-/// a compacted base.
-pub fn rewind(file: &TreeFile, state: TreeState, token: Token) -> Result<TreeState> {
+/// How a rewind left the file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Rewound {
+    /// Frames were cut off the end; the open file is the tree.
+    InPlace(TreeState),
+    /// The rewind went below the compacted base: a new file is in place, and
+    /// the open one is stale.
+    Rewritten,
+}
+
+/// One frame of a file: where it starts and ends, and its trailer.
+#[derive(Clone, Copy)]
+struct FrameAt {
+    start: u64,
+    end: u64,
+    trailer: Trailer,
+}
+
+fn frame_header(file: &TreeFile, start: u64) -> Result<FrameHeader> {
+    FrameHeader::decode(&file.read_exact(start, FRAME_HEADER_SIZE)?)
+        .ok_or_else(|| "zset tree: damaged frame header".to_string())
+}
+
+/// The bytes a frame keeps between its pages and its trailer: logged changes,
+/// or a base frame's undo log.
+fn frame_ops(file: &TreeFile, frame: &FrameAt, header: &FrameHeader) -> Result<Vec<u8>> {
+    let len = header.ops_len as usize;
+    file.read_exact(frame.end - TRAILER_SIZE as u64 - len as u64, len)
+}
+
+/// The file's frames from the latest back to the first, newest first.
+fn frames_back(file: &TreeFile, latest_end: u64) -> Result<Vec<FrameAt>> {
+    let mut frames = Vec::new();
+    let mut end = latest_end;
+    while end > HEADER_REGION {
+        let trailer = file
+            .trailer_ending_at(end)?
+            .ok_or_else(|| "zset tree: met a damaged frame".to_string())?;
+        frames.push(FrameAt {
+            start: trailer.frame_start,
+            end,
+            trailer,
+        });
+        end = trailer.frame_start;
+    }
+    Ok(frames)
+}
+
+/// Cuts the file back to just before `token`, so a replayed entry applies
+/// again from the state it first saw. Frames after the compacted base are cut
+/// off the end. Below the base, its undo log is undone back to `token` and the
+/// result written to a new file put in place of `path`. Fails at or below the
+/// undo log's floor, which Raft never replays.
+pub fn rewind(path: &Path, file: &TreeFile, state: TreeState, token: Token) -> Result<Rewound> {
     let mut end = state.frame_end;
     while end > HEADER_REGION {
         let trailer = file
@@ -45,13 +92,16 @@ pub fn rewind(file: &TreeFile, state: TreeState, token: Token) -> Result<TreeSta
         if trailer.token < token {
             break;
         }
-        let header = FrameHeader::decode(&file.read_exact(trailer.frame_start, FRAME_HEADER_SIZE)?)
-            .ok_or_else(|| "zset tree: rewind met a damaged frame".to_string())?;
+        let frame = FrameAt {
+            start: trailer.frame_start,
+            end,
+            trailer,
+        };
+        let header = frame_header(file, frame.start)?;
         if header.base {
-            return Err(format!(
-                "zset tree: entry {}.{} is older than the compacted file ({}.{})",
-                token.index, token.ordinal, header.token.index, header.token.ordinal
-            ));
+            let undo = UndoLog::decode(&frame_ops(file, &frame, &header)?)?;
+            rewrite_below_base(path, file, &frame, undo, token)?;
+            return Ok(Rewound::Rewritten);
         }
         end = trailer.frame_start;
     }
@@ -61,7 +111,91 @@ pub fn rewind(file: &TreeFile, state: TreeState, token: Token) -> Result<TreeSta
         latest_frame_end: end,
         synced_frame_end: state.synced_frame_end.min(end),
     })?;
-    file.state()
+    Ok(Rewound::InPlace(file.state()?))
+}
+
+/// The base's tree with its undo log undone back to `token`, as a new file.
+/// The old file is left as it is until the new one replaces it whole.
+fn rewrite_below_base(
+    path: &Path,
+    file: &TreeFile,
+    base: &FrameAt,
+    undo: UndoLog,
+    token: Token,
+) -> Result<()> {
+    if token.index <= undo.floor {
+        return Err(format!(
+            "zset tree: entry {}.{} is at or below the compacted file's floor ({})",
+            token.index, token.ordinal, undo.floor
+        ));
+    }
+    let (kept, undone): (Vec<_>, Vec<_>) = undo
+        .groups
+        .into_iter()
+        .partition(|(group, _ops)| *group < token);
+    // The state after the last change kept; with none, the state at the floor,
+    // marked just before `token`.
+    let at = kept
+        .last()
+        .map_or(Token::new(token.index, 0), |(group, _ops)| *group);
+
+    // The base's tree with the undone changes reverted, in a scratch file.
+    let step_path = temp_path(path, ".rewinding");
+    remove_stale(&step_path)?;
+    let step = TreeFile::open_write(&step_path)?;
+    let copied = write_base(file, &step, &base.trailer, &UndoLog::default())?;
+    let mut tx = Tx::begin(&step, copied);
+    for (_group, ops) in undone.iter().rev() {
+        for op in ops.iter().rev() {
+            tx.revert(op)?;
+        }
+    }
+    let reverted = tx.commit(at)?;
+    let trailer = step
+        .trailer_ending_at(reverted.frame_end)?
+        .ok_or_else(|| "zset tree: rewind wrote a damaged frame".to_string())?;
+
+    // That tree as the new file's base, keeping the earlier changes to undo.
+    let target_path = temp_path(path, ".rewound");
+    remove_stale(&target_path)?;
+    let target = TreeFile::open_write(&target_path)?;
+    let undo = UndoLog {
+        floor: undo.floor,
+        groups: kept,
+    };
+    let state = write_base(
+        &step,
+        &target,
+        &Trailer {
+            token: at,
+            ..trailer
+        },
+        &undo,
+    )?;
+    finish_rebuilt(path, &target_path, &target, state)?;
+    drop(step);
+    remove_stale(&step_path)
+}
+
+/// Files a compaction or a rewind writes beside the tree before putting one
+/// in its place; one left behind was stopped part way.
+pub const TEMP_SUFFIXES: [&str; 3] = [".compacting", ".rewinding", ".rewound"];
+
+fn temp_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+fn remove_stale(path: &Path) -> Result<()> {
+    match crate::path_open::remove_file_nofollow(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("zset tree: remove {}: {error}", path.display())),
+    }
 }
 
 const READ_CHUNK: usize = 1 << 20;
@@ -96,7 +230,12 @@ fn frame_valid(file: &TreeFile, start: u64) -> Result<Option<u64>> {
     }
     let ops_len = header.ops_len as usize;
     let ops = file.read_exact(trailer_at - ops_len as u64, ops_len)?;
-    Ok(decode_ops(&ops).is_ok().then_some(end))
+    let decoded = if header.base {
+        UndoLog::decode(&ops).is_ok()
+    } else {
+        decode_ops(&ops).is_ok()
+    };
+    Ok(decoded.then_some(end))
 }
 
 /// Run once when a node starts, before the file is used. Frames written since
@@ -171,49 +310,90 @@ pub fn sync(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn compacting_path(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_default();
-    name.push(".compacting");
-    path.with_file_name(name)
-}
-
-/// One frame of a file: where it starts and ends, and its trailer.
-#[derive(Clone, Copy)]
-struct FrameAt {
-    start: u64,
-    end: u64,
-    trailer: Trailer,
-}
-
-/// The last frame at or below `floor_index`, and the frames after it, oldest
-/// first; `None` when every frame is after the floor.
-fn split_at_floor(
-    file: &TreeFile,
-    latest_end: u64,
-    floor_index: u64,
-) -> Result<Option<(FrameAt, Vec<FrameAt>)>> {
-    let mut tail = Vec::new();
-    let mut end = latest_end;
-    while end > HEADER_REGION {
-        let trailer = file
-            .trailer_ending_at(end)?
-            .ok_or_else(|| "zset tree: compaction met a damaged frame".to_string())?;
-        let frame = FrameAt {
-            start: trailer.frame_start,
-            end,
-            trailer,
-        };
-        if trailer.token.index <= floor_index {
-            tail.reverse();
-            return Ok(Some((frame, tail)));
+/// The undo log of every change after `floor_index` up to `latest_end`: the
+/// part of the base's log after the floor, then each later frame's changes.
+fn undo_log_after(file: &TreeFile, latest_end: u64, floor_index: u64) -> Result<UndoLog> {
+    let mut floor = floor_index;
+    let mut groups = Vec::new();
+    for frame in frames_back(file, latest_end)?.into_iter().rev() {
+        let header = frame_header(file, frame.start)?;
+        let ops = frame_ops(file, &frame, &header)?;
+        if header.base {
+            let undo = UndoLog::decode(&ops)?;
+            floor = floor.max(undo.floor);
+            groups.extend(undo.groups);
+        } else {
+            groups.push((frame.trailer.token, decode_ops(&ops)?));
         }
-        tail.push(frame);
-        end = trailer.frame_start;
     }
-    Ok(None)
+    groups.retain(|(token, _ops)| token.index > floor);
+    Ok(UndoLog { floor, groups })
+}
+
+/// Rewrites the latest tree into a fresh file, pages about 7/8 full, as one
+/// base frame that keeps the changes after `floor_index` (an index Raft never
+/// replays at or below) as its undo log. Then copies each frame written
+/// meanwhile onto it, by replaying its logged changes under the frame's own
+/// token, and puts the new file in place.
+///
+/// Runs beside writers: the base is built without the file's lock; copying
+/// the later frames, and the rename, hold it.
+pub fn compact(path: &Path, floor_index: u64) -> Result<Compacted> {
+    let Some(source) = TreeFile::open_read(path)? else {
+        return Ok(Compacted::Missing);
+    };
+    let latest = source.state()?;
+    if latest.frame_end == HEADER_REGION {
+        return Ok(Compacted::Done(Compaction {
+            bytes_before: source.len(),
+            bytes_after: source.len(),
+        }));
+    }
+    let trailer = source
+        .trailer_ending_at(latest.frame_end)?
+        .ok_or_else(|| "zset tree: compaction met a damaged frame".to_string())?;
+    let base = FrameAt {
+        start: trailer.frame_start,
+        end: latest.frame_end,
+        trailer,
+    };
+    let undo = undo_log_after(&source, latest.frame_end, floor_index)?;
+    let target_path = temp_path(path, ".compacting");
+    remove_stale(&target_path)?;
+    let target = TreeFile::open_write(&target_path)?;
+    let mut state = write_base(&source, &target, &base.trailer, &undo)?;
+
+    // Held until the new file is in place: no writer adds a frame meanwhile.
+    let Some(locked) = TreeFile::open_read_locked(path)? else {
+        let _ = crate::path_open::remove_file_nofollow(&target_path);
+        return Ok(Compacted::Missing);
+    };
+    let latest = locked.state()?;
+    let Some(tail) = frames_after(&locked, latest.frame_end, &base)? else {
+        // Rewound or replaced meanwhile: not the tree the base holds.
+        let _ = crate::path_open::remove_file_nofollow(&target_path);
+        return Ok(Compacted::Done(Compaction {
+            bytes_before: locked.len(),
+            bytes_after: locked.len(),
+        }));
+    };
+    for frame in tail {
+        let header = frame_header(&locked, frame.start)?;
+        if header.base {
+            return Err("zset tree: compaction met a base frame after its own".into());
+        }
+        let ops = decode_ops(&frame_ops(&locked, &frame, &header)?)?;
+        let mut tx = Tx::begin(&target, state);
+        for op in &ops {
+            tx.replay(op)?;
+        }
+        state = tx.commit(frame.trailer.token)?;
+    }
+    finish_rebuilt(path, &target_path, &target, state)?;
+    Ok(Compacted::Done(Compaction {
+        bytes_before: locked.len(),
+        bytes_after: state.frame_end,
+    }))
 }
 
 /// The frames after `base`, oldest first; `None` when `base` is not one of
@@ -239,56 +419,13 @@ fn frames_after(file: &TreeFile, latest_end: u64, base: &FrameAt) -> Result<Opti
     Ok(Some(tail))
 }
 
-/// Rewrites the tree as of the last frame at or below `floor_index` into a
-/// fresh file, pages about 7/8 full, as one base frame. Then copies each later
-/// frame onto it by replaying its logged changes under the frame's own token,
-/// and puts the new file in place.
-///
-/// Raft replays nothing at or below `floor_index`, so no rewind needs a frame
-/// the base folded away, and every later frame is still there to rewind to.
-/// Runs beside writers: the base is built without the file's lock; the copy of
-/// the later frames, and the rename, hold it.
-pub fn compact(path: &Path, floor_index: u64) -> Result<Compacted> {
-    let Some(source) = TreeFile::open_read(path)? else {
-        return Ok(Compacted::Missing);
-    };
-    let latest = source.state()?;
-    let Some((base, _tail)) = split_at_floor(&source, latest.frame_end, floor_index)? else {
-        return Ok(Compacted::Uncovered);
-    };
-    let target_path = compacting_path(path);
-    match crate::path_open::remove_file_nofollow(&target_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("zset tree: remove stale compaction: {error}")),
-    }
-    let target = TreeFile::open_write(&target_path)?;
-    let mut state = write_base(&source, &target, &base.trailer)?;
-
-    // Held until the new file is in place: no writer adds a frame meanwhile.
-    let Some(locked) = TreeFile::open_read_locked(path)? else {
-        let _ = crate::path_open::remove_file_nofollow(&target_path);
-        return Ok(Compacted::Missing);
-    };
-    let latest = locked.state()?;
-    let Some(tail) = frames_after(&locked, latest.frame_end, &base)? else {
-        // Not the file the base came from.
-        let _ = crate::path_open::remove_file_nofollow(&target_path);
-        return Ok(Compacted::Uncovered);
-    };
-    for frame in tail {
-        let header = FrameHeader::decode(&locked.read_exact(frame.start, FRAME_HEADER_SIZE)?)
-            .filter(|header| !header.base)
-            .ok_or_else(|| "zset tree: compaction met a damaged frame".to_string())?;
-        let ops_len = header.ops_len as usize;
-        let ops_at = frame.end - TRAILER_SIZE as u64 - ops_len as u64;
-        let ops = decode_ops(&locked.read_exact(ops_at, ops_len)?)?;
-        let mut tx = Tx::begin(&target, state);
-        for op in &ops {
-            tx.replay(op)?;
-        }
-        state = tx.commit(frame.trailer.token)?;
-    }
+/// Makes a rebuilt file durable and puts it in place of `path`.
+fn finish_rebuilt(
+    path: &Path,
+    target_path: &Path,
+    target: &TreeFile,
+    state: TreeState,
+) -> Result<()> {
     target.sync()?;
     target.write_slot(&HeaderSlot {
         generation: state.generation + 1,
@@ -296,21 +433,24 @@ pub fn compact(path: &Path, floor_index: u64) -> Result<Compacted> {
         synced_frame_end: state.frame_end,
     })?;
     target.sync()?;
-    crate::path_open::rename_nofollow(&target_path, path)
-        .map_err(|error| format!("zset tree: install compacted file: {error}"))?;
+    crate::path_open::rename_nofollow(target_path, path)
+        .map_err(|error| format!("zset tree: install rebuilt file: {error}"))?;
     if let Some(parent) = path.parent() {
         crate::path_open::open_directory_nofollow(parent)
             .and_then(|dir| dir.sync_all())
             .map_err(|error| format!("zset tree: sync directory: {error}"))?;
     }
-    Ok(Compacted::Done(Compaction {
-        bytes_before: locked.len(),
-        bytes_after: state.frame_end,
-    }))
+    Ok(())
 }
 
-/// Writes the tree `base` names into the empty `target` as one base frame.
-fn write_base(source: &TreeFile, target: &TreeFile, base: &Trailer) -> Result<TreeState> {
+/// Writes the tree `base` names into the empty `target` as one base frame,
+/// with `undo` as its undo log.
+fn write_base(
+    source: &TreeFile,
+    target: &TreeFile,
+    base: &Trailer,
+    undo: &UndoLog,
+) -> Result<TreeState> {
     let frame_start = HEADER_REGION;
     let mut bulk = Bulk::new(target, frame_start + FRAME_HEADER_SIZE as u64);
     for root in [base.score_root, base.member_root] {
@@ -318,18 +458,21 @@ fn write_base(source: &TreeFile, target: &TreeFile, base: &Trailer) -> Result<Tr
         bulk.finish_tree()?;
     }
     let (roots, page_count, pages_crc, pages_end) = bulk.into_parts();
+    let undo = undo.encode();
 
     let header = FrameHeader {
         page_count,
-        ops_len: 0,
+        ops_len: undo.len() as u32,
         token: base.token,
         base: true,
     }
     .encode();
     target.write_at(frame_start, &header)?;
+    target.write_at(pages_end, &undo)?;
     let mut body = crc32fast::Hasher::new();
     body.update(&header);
     body.combine(&pages_crc);
+    body.update(&undo);
     let generation = 2;
     let trailer = Trailer {
         score_root: roots[0],
@@ -340,8 +483,9 @@ fn write_base(source: &TreeFile, target: &TreeFile, base: &Trailer) -> Result<Tr
         token: base.token,
         body_crc: body.finalize(),
     };
-    target.write_at(pages_end, &trailer.encode())?;
-    let frame_end = pages_end + TRAILER_SIZE as u64;
+    let trailer_at = pages_end + undo.len() as u64;
+    target.write_at(trailer_at, &trailer.encode())?;
+    let frame_end = trailer_at + TRAILER_SIZE as u64;
     target.note_appended(frame_end);
     target.write_slot(&HeaderSlot {
         generation,

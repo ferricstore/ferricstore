@@ -122,7 +122,11 @@ impl Tx<'_> {
         }
         self.insert(Tree::Score, score_key(score, member)?, score_value(score))?;
         self.insert(Tree::Member, member.to_vec(), score_value(score))?;
-        self.log(LoggedOp::Set(member.to_vec(), score));
+        self.log(LoggedOp::Set {
+            member: member.to_vec(),
+            score,
+            prev: previous,
+        });
         if previous.is_none() {
             self.count += 1;
         }
@@ -135,7 +139,10 @@ impl Tx<'_> {
         };
         self.remove(Tree::Score, &score_key(score, member)?)?;
         self.remove(Tree::Member, member)?;
-        self.log(LoggedOp::Remove(member.to_vec()));
+        self.log(LoggedOp::Remove {
+            member: member.to_vec(),
+            prev: score,
+        });
         self.count -= 1;
         Ok(Some(score))
     }
@@ -143,8 +150,23 @@ impl Tx<'_> {
     /// Replays one logged change (compaction catch-up).
     pub fn replay(&mut self, op: &LoggedOp) -> Result<()> {
         match op {
-            LoggedOp::Set(member, score) => self.set(member, *score).map(|_| ()),
-            LoggedOp::Remove(member) => self.delete(member).map(|_| ()),
+            LoggedOp::Set { member, score, .. } => self.set(member, *score).map(|_| ()),
+            LoggedOp::Remove { member, .. } => self.delete(member).map(|_| ()),
+        }
+    }
+
+    /// Undoes `op`: the member gets back what it had before.
+    pub fn revert(&mut self, op: &LoggedOp) -> Result<()> {
+        match op {
+            LoggedOp::Set {
+                member,
+                prev: Some(prev),
+                ..
+            }
+            | LoggedOp::Remove { member, prev } => self.set(member, *prev).map(|_| ()),
+            LoggedOp::Set {
+                member, prev: None, ..
+            } => self.delete(member).map(|_| ()),
         }
     }
 
