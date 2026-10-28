@@ -115,6 +115,9 @@ frame = [ header 40 B | pages, 4 KiB each, CRC each | logged changes | trailer 7
   position costs one descent.
 - Members longer than 512 bytes keep a 64-byte prefix in the node and the rest
   in overflow pages.
+- Reads search a page where it lies and copy out only what they return; a long
+  member's overflow pages are read only when its prefix ties. Writes decode the
+  nodes they copy.
 - A frame's trailer names both roots, the member count and the Raft token
   (index, ordinal) the frame was written for. Any valid trailer describes a
   whole tree.
