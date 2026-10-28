@@ -422,6 +422,49 @@ defmodule Ferricstore.Store.ZSetTreeIntegrationTest do
     assert large < small * 3, "ZRANK median #{large} us at 60k vs #{small} us at 2k"
   end
 
+  defmodule LocalInstance do
+    use FerricStore, shard_count: 4
+  end
+
+  # The cross-shard store of an instance without Raft refuses tree-encoded
+  # sets, so such an instance must never make one.
+  test "an instance without Raft keeps large sets out of trees and copies them across shards" do
+    root =
+      Path.join(System.tmp_dir!(), "ferricstore_zset_local_#{System.unique_integer([:positive])}")
+
+    on_exit(fn ->
+      LocalInstance.stop()
+      File.rm_rf(root)
+    end)
+
+    assert {:ok, _pid} =
+             LocalInstance.start_link(
+               data_dir: root,
+               shard_count: 4,
+               promotion_threshold: @threshold
+             )
+
+    local = FerricStore.Instance.get(LocalInstance)
+    refute Router.durable_context?(local)
+    raise_to_9!(local)
+
+    pairs = Enum.flat_map(1..40, fn i -> ["#{i}", "m#{i}"] end)
+    assert 40 = cmd(local, "ZADD", ["src" | pairs])
+    assert [] = tree_files(local, "src")
+    members = cmd(local, "ZRANGE", ["src", "0", "-1", "WITHSCORES"])
+
+    [copy, renamed] =
+      Stream.map(1..1_000, &"dst#{&1}")
+      |> Stream.filter(&(Router.shard_for(local, &1) != Router.shard_for(local, "src")))
+      |> Enum.take(2)
+
+    assert 1 = cmd(local, "COPY", ["src", copy])
+    assert :ok = cmd(local, "RENAME", ["src", renamed])
+    assert ^members = cmd(local, "ZRANGE", [copy, "0", "-1", "WITHSCORES"])
+    assert ^members = cmd(local, "ZRANGE", [renamed, "0", "-1", "WITHSCORES"])
+    assert 0 = cmd(local, "EXISTS", ["src"])
+  end
+
   # Random commands over a small member space, so sets cross the threshold,
   # shrink and grow again.
   # The commands are drawn before any runs: the store may use :rand itself.
