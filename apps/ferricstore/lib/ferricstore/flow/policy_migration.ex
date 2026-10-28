@@ -600,8 +600,12 @@ defmodule Ferricstore.Flow.PolicyMigration do
   defp state_record_value(ctx, shard_index, state_key),
     do: state_record_value(ctx, shard_index, state_key, :first_read)
 
+  # The backfill reads every Flow of the shard, so a record left on disk stays
+  # there.
   defp state_record_value(ctx, shard_index, state_key, attempt) do
-    case Router.read_shard_value(ctx, shard_index, state_key) do
+    case Ferricstore.Store.ScanRead.run(fn ->
+           Router.read_shard_value(ctx, shard_index, state_key)
+         end) do
       {:ok, value} when is_binary(value) ->
         validate_state_record_value(value, state_key)
 

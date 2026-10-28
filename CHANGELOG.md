@@ -12,6 +12,11 @@ All notable changes to FerricStore will be documented here.
   directory at a time, about 50 µs for a data file. On macOS 11 and later it
   now takes two calls (`O_NOFOLLOW_ANY` below the first component), about
   14 µs. Linux already did it in one call.
+- The Flow query index backfills and the policy catalog backfill read every
+  Flow of a shard, and each Flow they read from disk was cached again in
+  memory. A backfill therefore undid hibernation and memory pressure for the
+  whole shard. They now leave the records they read on disk. This was also
+  why `FlowHibernationClaimClusterTest` failed now and then.
 - `MEMORY USAGE` returned nil for a hash, list, set, sorted set or stream.
   It now estimates one from its member count and its first members
   (`SAMPLES`, default 5, 0 for all), as Redis does.
