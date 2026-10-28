@@ -17,6 +17,9 @@ All notable changes to FerricStore will be documented here.
   memory. A backfill therefore undid hibernation and memory pressure for the
   whole shard. They now leave the records they read on disk. This was also
   why `FlowHibernationClaimClusterTest` failed now and then.
+- `MEMORY USAGE` returned nil for a hash, list, set, sorted set or stream.
+  It now estimates one from its member count and its first members
+  (`SAMPLES`, default 5, 0 for all), as Redis does.
 
 ## 0.12.15 - 2026-10-27
 
