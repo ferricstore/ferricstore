@@ -12,6 +12,9 @@ All notable changes to FerricStore will be documented here.
   directory at a time, about 50 µs for a data file. On macOS 11 and later it
   now takes two calls (`O_NOFOLLOW_ANY` below the first component), about
   14 µs. Linux already did it in one call.
+- `MEMORY USAGE` returned nil for a hash, list, set, sorted set or stream.
+  It now estimates one from its member count and its first members
+  (`SAMPLES`, default 5, 0 for all), as Redis does.
 
 ## 0.12.15 - 2026-10-27
 

@@ -1433,7 +1433,7 @@ Handled via `dispatch_client/3` with per-connection state:
 | `DEBUG SLEEP` | `DEBUG SLEEP seconds` | `+OK` | Testing only. Logged to audit log. |
 | `MODULE LIST` | `MODULE LIST` | Empty array | Modules not supported |
 | `WAITAOF` | `WAITAOF numlocal numreplicas timeout` | `[0, 0]` | Stub |
-| `MEMORY USAGE` | `MEMORY USAGE key` | Integer (estimated bytes) | |
+| `MEMORY USAGE` | `MEMORY USAGE key [SAMPLES count]` | Integer (estimated bytes) | A hash, list, set, sorted set or stream is estimated from its member count and its first `count` members (default 5, 0 for all), as in Redis |
 
 ---
 

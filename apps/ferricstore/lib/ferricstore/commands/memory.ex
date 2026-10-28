@@ -1,5 +1,6 @@
 defmodule Ferricstore.Commands.Memory do
-  alias Ferricstore.Store.{Ops, ReadResult}
+  alias Ferricstore.Commands.{Hash, List, Set, SortedSet, Stream}
+  alias Ferricstore.Store.{Ops, ReadResult, TypeRegistry}
 
   @moduledoc """
   Handles Redis MEMORY subcommands.
@@ -19,6 +20,10 @@ defmodule Ferricstore.Commands.Memory do
   # Overhead estimate per key: ~64 bytes for the ETS tuple metadata +
   # ~32 bytes for the Bitcask keydir entry.
   @key_overhead_bytes 96
+
+  # Members of a collection MEMORY USAGE measures when SAMPLES is not given,
+  # as in Redis.
+  @default_samples 5
 
   @doc """
   Handles a MEMORY subcommand.
@@ -40,12 +45,12 @@ defmodule Ferricstore.Commands.Memory do
   # MEMORY USAGE key [SAMPLES count]
   # ---------------------------------------------------------------------------
 
-  def handle("USAGE", [key], store), do: memory_usage(key, store)
+  def handle("USAGE", [key], store), do: memory_usage(key, @default_samples, store)
 
   def handle("USAGE", [key, option, count], store) do
     if String.upcase(option) == "SAMPLES" do
       case Integer.parse(count) do
-        {samples, ""} when samples >= 0 -> memory_usage(key, store)
+        {samples, ""} when samples >= 0 -> memory_usage(key, samples, store)
         _ -> {:error, "ERR value is not an integer or out of range"}
       end
     else
@@ -170,11 +175,89 @@ defmodule Ferricstore.Commands.Memory do
     {:error, "ERR unknown subcommand '#{String.downcase(subcmd)}'. Try MEMORY HELP."}
   end
 
-  defp memory_usage(key, store) do
+  defp memory_usage(key, samples, store) do
     case Ops.value_size(store, key) do
       {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
-      nil -> nil
+      nil -> collection_usage(key, samples, store)
       value_size -> @key_overhead_bytes + byte_size(key) + value_size
     end
   end
+
+  # A collection keeps one row per member, keyed by the collection's key and
+  # the member, beside its type row. Like Redis, measure the first `samples`
+  # members (all of them for 0) and scale by the member count.
+  defp collection_usage(key, samples, store) do
+    with type when is_binary(type) <- TypeRegistry.get_type(key, store),
+         {:ok, count, sample} <- collection_sample(type, key, samples, store) do
+      base = @key_overhead_bytes + byte_size(key)
+
+      case sample do
+        [] ->
+          base
+
+        _ ->
+          sampled = Enum.sum_by(sample, &(@key_overhead_bytes + byte_size(key) + term_bytes(&1)))
+          base + div(count * sampled, length(sample))
+      end
+    else
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      {:error, _message} = error -> error
+      :not_collection -> nil
+    end
+  end
+
+  defp collection_sample("hash", key, samples, store) do
+    sample =
+      if samples == 0,
+        do: Hash.handle("HGETALL", [key], store),
+        else: scan_sample(Hash.handle("HSCAN", [key, "0", "COUNT", "#{samples}"], store))
+
+    sample_reply(Hash.handle("HLEN", [key], store), pairs(sample), samples)
+  end
+
+  defp collection_sample("set", key, samples, store) do
+    sample =
+      if samples == 0,
+        do: Set.handle("SMEMBERS", [key], store),
+        else: scan_sample(Set.handle("SSCAN", [key, "0", "COUNT", "#{samples}"], store))
+
+    sample_reply(Set.handle("SCARD", [key], store), sample, samples)
+  end
+
+  defp collection_sample("zset", key, samples, store) do
+    sample = SortedSet.handle("ZRANGE", [key, "0", "#{samples - 1}", "WITHSCORES"], store)
+    sample_reply(SortedSet.handle("ZCARD", [key], store), pairs(sample), samples)
+  end
+
+  defp collection_sample("list", key, samples, store) do
+    sample = List.handle("LRANGE", [key, "0", "#{samples - 1}"], store)
+    sample_reply(List.handle("LLEN", [key], store), sample, samples)
+  end
+
+  defp collection_sample("stream", key, samples, store) do
+    count_args = if samples == 0, do: [], else: ["COUNT", "#{samples}"]
+    sample = Stream.handle("XRANGE", [key, "-", "+" | count_args], store)
+    sample_reply(Stream.handle("XLEN", [key], store), sample, samples)
+  end
+
+  defp collection_sample(_type, _key, _samples, _store), do: :not_collection
+
+  defp scan_sample([_cursor, elements]) when is_list(elements), do: elements
+  defp scan_sample(other), do: other
+
+  defp pairs(elements) when is_list(elements), do: Enum.chunk_every(elements, 2)
+  defp pairs(other), do: other
+
+  defp sample_reply(count, sample, samples) when is_integer(count) and is_list(sample) do
+    sample = if samples == 0, do: sample, else: Enum.take(sample, samples)
+    {:ok, count, sample}
+  end
+
+  defp sample_reply({:error, _reason} = error, _sample, _samples), do: error
+  defp sample_reply(_count, {:error, _reason} = error, _samples), do: error
+
+  defp term_bytes(value) when is_binary(value), do: byte_size(value)
+  defp term_bytes(values) when is_list(values), do: Enum.sum_by(values, &term_bytes/1)
+  defp term_bytes(value) when is_number(value), do: value |> to_string() |> byte_size()
+  defp term_bytes(_other), do: 0
 end
