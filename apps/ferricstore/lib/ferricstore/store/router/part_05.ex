@@ -174,7 +174,9 @@ defmodule Ferricstore.Store.Router.Part05 do
         # Skip promotion when under memory pressure — prevents evict/re-promote
         # thrashing where MemoryGuard evicts values and cold reads immediately
         # re-cache them. skip_promotion? is set at :pressure level (85%+).
-        skip_promotion = :atomics.get(ctx.pressure_flags, 3) == 1
+        # A scan read leaves the value cold as well.
+        skip_promotion =
+          :atomics.get(ctx.pressure_flags, 3) == 1 or Ferricstore.Store.ScanRead.active?()
 
         if byte_size(value) <= ctx.hot_cache_max_value_size and not skip_promotion do
           lfu = LFU.initial()

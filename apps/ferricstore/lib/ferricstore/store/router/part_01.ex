@@ -122,8 +122,19 @@ defmodule Ferricstore.Store.Router.Part01 do
                 value -> {:ok, value}
               end
             else
-              safe_read_call(ctx, idx, {:get, key})
+              if Ferricstore.Store.ScanRead.active?(),
+                do: read_shard_value_for_scan(ctx, idx, key),
+                else: safe_read_call(ctx, idx, {:get, key})
             end
+        end
+      end
+
+      # The shard's entry read leaves cold values on disk; a plain get caches them.
+      defp read_shard_value_for_scan(ctx, idx, key) do
+        case read_shard_entries(ctx, idx, [key]) do
+          {:ok, [{value, _expire_at_ms}]} -> {:ok, value}
+          {:ok, [nil]} -> {:ok, nil}
+          other -> other
         end
       end
 
@@ -261,9 +272,13 @@ defmodule Ferricstore.Store.Router.Part01 do
                @shard_batch_read_max_key_bytes do
           deadline_ms = System.monotonic_time(:millisecond) + @shard_batch_read_deadline_ms
 
+          # Only background scans read shard entries; the shard's own reader
+          # treats entry reads the same way.
           read_result =
             if selected_waraft_ctx?(ctx) do
-              do_batch_get_entries_from_shard(ctx, idx, keys, :unlimited)
+              Ferricstore.Store.ScanRead.run(fn ->
+                do_batch_get_entries_from_shard(ctx, idx, keys, :unlimited)
+              end)
             else
               safe_read_call(
                 ctx,

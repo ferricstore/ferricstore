@@ -230,9 +230,15 @@ defmodule Ferricstore.Store.Shard.Reads do
           |> get_many_read_state()
           |> Map.put(:expiry_context, ExpiryContext.capture())
 
+        # Entry reads come only from Router.read_shard_entries/3, which serves
+        # background scans.
+        read = fn -> safe_get_many_values(keys, read_state, deadline_ms, mode) end
+
         {pid, monitor_ref} =
           spawn_monitor(fn ->
-            result = safe_get_many_values(keys, read_state, deadline_ms, mode)
+            result =
+              if mode == :entries, do: Ferricstore.Store.ScanRead.run(read), else: read.()
+
             send(parent, {:shard_get_many_complete, job_ref, result})
           end)
 
