@@ -13,7 +13,7 @@ use super::format::{
     INLINE_KEY_MAX, PAGE_SIZE,
 };
 use super::node::{
-    decode_node, encode_node, encode_overflow, Branch, Child, Key, Leaf, Node, EMPTY,
+    decode_node, encode_node, encode_overflow, Branch, Child, Key, Leaf, Node, PageView, EMPTY,
 };
 use super::store::{TreeFile, TreeState};
 use super::Result;
@@ -105,18 +105,43 @@ impl<'f> Tx<'f> {
         Child::Dirty(self.nodes.len() - 1)
     }
 
+    /// The page at `offset`, read in place.
+    fn page(&self, offset: u64) -> Result<Vec<u8>> {
+        if offset == 0 {
+            return Err("zset tree: read of the empty tree's root".into());
+        }
+        self.file.read_page(offset)
+    }
+
+    fn read_overflow(&self) -> impl FnMut(u64, usize) -> Result<Vec<u8>> + '_ {
+        |head, len| self.file.read_overflow(head, len)
+    }
+
     pub fn get(&self, tree: Tree, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let mut child = self.roots[tree as usize];
         if child == EMPTY {
             return Ok(None);
         }
         loop {
-            let node = self.node(child)?;
-            match node.as_ref() {
-                Node::Leaf(leaf) => {
-                    return Ok(leaf_search(leaf, key).ok().map(|i| leaf.values[i].clone()))
+            match child {
+                Child::Dirty(index) => match &self.nodes[index] {
+                    Node::Leaf(leaf) => {
+                        return Ok(leaf_search(leaf, key).ok().map(|i| leaf.values[i].clone()))
+                    }
+                    Node::Branch(branch) => {
+                        child = branch.children[child_index(&branch.keys, key)];
+                    }
+                },
+                Child::Disk(offset) => {
+                    let page = self.page(offset)?;
+                    let view = PageView::read(&page)?;
+                    let read_overflow = &mut self.read_overflow();
+                    if view.is_leaf() {
+                        let found = view.search(key, read_overflow)?;
+                        return Ok(found.ok().map(|i| view.value(i).to_vec()));
+                    }
+                    child = Child::Disk(view.child(view.child_index(key, read_overflow)?)?.0);
                 }
-                Node::Branch(branch) => child = branch.children[child_index(&branch.keys, key)],
             }
         }
     }
@@ -129,18 +154,35 @@ impl<'f> Tx<'f> {
         }
         let mut below = 0;
         loop {
-            let node = self.node(child)?;
-            match node.as_ref() {
-                Node::Leaf(leaf) => {
-                    let position = match leaf_search(leaf, key) {
-                        Ok(i) | Err(i) => i,
-                    };
-                    return Ok(below + position as u64);
-                }
-                Node::Branch(branch) => {
-                    let i = child_index(&branch.keys, key);
-                    below += branch.counts[..i].iter().sum::<u64>();
-                    child = branch.children[i];
+            match child {
+                Child::Dirty(index) => match &self.nodes[index] {
+                    Node::Leaf(leaf) => {
+                        let position = match leaf_search(leaf, key) {
+                            Ok(i) | Err(i) => i,
+                        };
+                        return Ok(below + position as u64);
+                    }
+                    Node::Branch(branch) => {
+                        let i = child_index(&branch.keys, key);
+                        below += branch.counts[..i].iter().sum::<u64>();
+                        child = branch.children[i];
+                    }
+                },
+                Child::Disk(offset) => {
+                    let page = self.page(offset)?;
+                    let view = PageView::read(&page)?;
+                    let read_overflow = &mut self.read_overflow();
+                    if view.is_leaf() {
+                        let position = match view.search(key, read_overflow)? {
+                            Ok(i) | Err(i) => i,
+                        };
+                        return Ok(below + position as u64);
+                    }
+                    let i = view.child_index(key, read_overflow)?;
+                    for j in 0..i {
+                        below += view.child(j)?.1;
+                    }
+                    child = Child::Disk(view.child(i)?.0);
                 }
             }
         }
@@ -157,6 +199,45 @@ impl<'f> Tx<'f> {
     }
 
     fn range_rec(
+        &self,
+        child: Child,
+        start: u64,
+        end: u64,
+        out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<()> {
+        let Child::Disk(page_offset) = child else {
+            return self.range_dirty(child, start, end, out);
+        };
+        let page = self.page(page_offset)?;
+        let view = PageView::read(&page)?;
+        if view.is_leaf() {
+            let read_overflow = &mut self.read_overflow();
+            let stop = (end as usize).min(view.len());
+            for i in (start as usize)..stop {
+                out.push((view.key(i, read_overflow)?, view.value(i).to_vec()));
+            }
+            return Ok(());
+        }
+        let mut offset = 0;
+        for i in 0..view.children() {
+            if offset >= end {
+                break;
+            }
+            let (below, count) = view.child(i)?;
+            if offset + count > start {
+                self.range_rec(
+                    Child::Disk(below),
+                    start.saturating_sub(offset),
+                    (end - offset).min(count),
+                    out,
+                )?;
+            }
+            offset += count;
+        }
+        Ok(())
+    }
+
+    fn range_dirty(
         &self,
         child: Child,
         start: u64,

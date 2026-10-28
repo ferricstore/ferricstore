@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Reads of a sorted set stored as a tree (feature level 9) decoded every page
+  they touched into separate keys and values to look at one entry. They now
+  search each page in place. On Linux, ZSCORE fell from 23 to 15 µs and ZRANK
+  from 42 to 18 µs on a 5,000-member set.
+- On macOS, opening a file without following symlinks walked its path one
+  directory at a time, about 50 µs for a data file. On macOS 11 and later it
+  now takes two calls (`O_NOFOLLOW_ANY` below the first component), about
+  14 µs. Linux already did it in one call.
+
 ## 0.12.15 - 2026-10-27
 
 - Upgrading: raise the cluster to feature level 9 once every node runs this

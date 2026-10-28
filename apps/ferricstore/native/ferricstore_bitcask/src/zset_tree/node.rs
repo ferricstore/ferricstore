@@ -246,38 +246,227 @@ pub fn decode_overflow(page: &[u8]) -> Result<(u64, &[u8])> {
     Ok((get_u64(page, PAGE_HEADER)?, &page[PAGE_HEADER + 8..used]))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many keys this thread copied out of pages by decoding whole nodes.
+    pub static DECODED_KEYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn decode_key(
     page: &[u8],
     at: &mut usize,
     read_overflow: &mut dyn FnMut(u64, usize) -> Result<Vec<u8>>,
 ) -> Result<Key> {
+    #[cfg(test)]
+    DECODED_KEYS.with(|keys| keys.set(keys.get() + 1));
+    let stored = stored_key(page, at)?;
+    Ok(Key {
+        bytes: stored.bytes(read_overflow)?,
+        overflow: match stored {
+            StoredKey::Inline(_) => None,
+            StoredKey::Overflow { head, .. } => Some(head),
+        },
+    })
+}
+
+/// A key as its page stores it: the bytes of an inline key, or the length,
+/// first bytes and overflow chain of a long one.
+#[derive(Clone, Copy)]
+enum StoredKey<'p> {
+    Inline(&'p [u8]),
+    Overflow {
+        len: usize,
+        prefix: &'p [u8],
+        head: u64,
+    },
+}
+
+fn stored_key<'p>(page: &'p [u8], at: &mut usize) -> Result<StoredKey<'p>> {
+    let truncated = || "zset tree: truncated key".to_string();
     match page.get(*at) {
         Some(0) => {
             let len = get_u16(page, *at + 1)? as usize;
-            let bytes = page
-                .get(*at + 3..*at + 3 + len)
-                .ok_or_else(|| "zset tree: truncated key".to_string())?
-                .to_vec();
+            let bytes = page.get(*at + 3..*at + 3 + len).ok_or_else(truncated)?;
             *at += 3 + len;
-            Ok(Key::new(bytes))
+            Ok(StoredKey::Inline(bytes))
         }
         Some(1) => {
             let len = get_u32(page, *at + 1)? as usize;
             let prefix = page
                 .get(*at + 5..*at + 5 + OVERFLOW_PREFIX)
-                .ok_or_else(|| "zset tree: truncated key".to_string())?;
+                .ok_or_else(truncated)?;
             let head = get_u64(page, *at + 5 + OVERFLOW_PREFIX)?;
             *at += OVERFLOW_KEY_SIZE;
-            let bytes = read_overflow(head, len)?;
-            if bytes.len() != len || &bytes[..OVERFLOW_PREFIX] != prefix {
-                return Err("zset tree: overflow key does not match its prefix".into());
-            }
-            Ok(Key {
-                bytes,
-                overflow: Some(head),
-            })
+            Ok(StoredKey::Overflow { len, prefix, head })
         }
         _ => Err("zset tree: unknown key encoding".into()),
+    }
+}
+
+impl StoredKey<'_> {
+    fn bytes(
+        self,
+        read_overflow: &mut dyn FnMut(u64, usize) -> Result<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        match self {
+            Self::Inline(bytes) => Ok(bytes.to_vec()),
+            Self::Overflow { len, prefix, head } => {
+                let bytes = read_overflow(head, len)?;
+                if bytes.len() != len || &bytes[..OVERFLOW_PREFIX] != prefix {
+                    return Err("zset tree: overflow key does not match its prefix".into());
+                }
+                Ok(bytes)
+            }
+        }
+    }
+
+    /// Orders the stored key against `key`; a long key's overflow pages are
+    /// read only when its first bytes tie.
+    fn cmp(
+        self,
+        key: &[u8],
+        read_overflow: &mut dyn FnMut(u64, usize) -> Result<Vec<u8>>,
+    ) -> Result<std::cmp::Ordering> {
+        match self {
+            Self::Inline(bytes) => Ok(bytes.cmp(key)),
+            Self::Overflow { prefix, .. } => {
+                match prefix.cmp(&key[..key.len().min(OVERFLOW_PREFIX)]) {
+                    std::cmp::Ordering::Equal => Ok(self.bytes(read_overflow)?.as_slice().cmp(key)),
+                    order => Ok(order),
+                }
+            }
+        }
+    }
+}
+
+/// A leaf or branch read where it lies in its page: entries are compared in
+/// place and only what a read returns is copied out.
+pub struct PageView<'p> {
+    page: &'p [u8],
+    leaf: bool,
+    /// A leaf's keys, each with where its value starts; a branch's
+    /// separators, each with where the child after it starts.
+    entries: Vec<(StoredKey<'p>, usize)>,
+}
+
+impl<'p> PageView<'p> {
+    pub fn read(page: &'p [u8]) -> Result<Self> {
+        let (kind, n, used) = verify_page(page)?;
+        let page = &page[..used];
+        let truncated = || "zset tree: truncated entry".to_string();
+        let mut at = PAGE_HEADER;
+        let mut entries = Vec::with_capacity(n);
+        match kind {
+            KIND_LEAF => {
+                for _ in 0..n {
+                    let key = stored_key(page, &mut at)?;
+                    let len = get_u16(page, at)? as usize;
+                    page.get(at + 2..at + 2 + len).ok_or_else(truncated)?;
+                    entries.push((key, at));
+                    at += 2 + len;
+                }
+            }
+            KIND_BRANCH => {
+                if n < 2 {
+                    return Err("zset tree: branch with fewer than two children".into());
+                }
+                page.get(at..at + 16).ok_or_else(truncated)?;
+                at += 16;
+                for _ in 1..n {
+                    let key = stored_key(page, &mut at)?;
+                    page.get(at..at + 16).ok_or_else(truncated)?;
+                    entries.push((key, at));
+                    at += 16;
+                }
+            }
+            _ => return Err("zset tree: expected a leaf or branch page".into()),
+        }
+        Ok(Self {
+            page,
+            leaf: kind == KIND_LEAF,
+            entries,
+        })
+    }
+
+    #[must_use]
+    pub const fn is_leaf(&self) -> bool {
+        self.leaf
+    }
+
+    /// A leaf's number of keys.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// A leaf's key at `i`, whole.
+    pub fn key(
+        &self,
+        i: usize,
+        read_overflow: &mut dyn FnMut(u64, usize) -> Result<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        self.entries[i].0.bytes(read_overflow)
+    }
+
+    /// A leaf's value at `i`.
+    #[must_use]
+    pub fn value(&self, i: usize) -> &'p [u8] {
+        let at = self.entries[i].1;
+        let len = usize::from(u16::from_le_bytes([self.page[at], self.page[at + 1]]));
+        &self.page[at + 2..at + 2 + len]
+    }
+
+    /// Where `key` is in a leaf, or where it would go.
+    pub fn search(
+        &self,
+        key: &[u8],
+        read_overflow: &mut dyn FnMut(u64, usize) -> Result<Vec<u8>>,
+    ) -> Result<std::result::Result<usize, usize>> {
+        let (mut low, mut high) = (0, self.entries.len());
+        while low < high {
+            let mid = low + (high - low) / 2;
+            match self.entries[mid].0.cmp(key, read_overflow)? {
+                std::cmp::Ordering::Less => low = mid + 1,
+                std::cmp::Ordering::Greater => high = mid,
+                std::cmp::Ordering::Equal => return Ok(Ok(mid)),
+            }
+        }
+        Ok(Err(low))
+    }
+
+    /// A branch's number of children.
+    #[must_use]
+    pub fn children(&self) -> usize {
+        self.entries.len() + 1
+    }
+
+    /// The branch child that holds `key`: the number of separators at or
+    /// below it.
+    pub fn child_index(
+        &self,
+        key: &[u8],
+        read_overflow: &mut dyn FnMut(u64, usize) -> Result<Vec<u8>>,
+    ) -> Result<usize> {
+        let (mut low, mut high) = (0, self.entries.len());
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if self.entries[mid].0.cmp(key, read_overflow)? == std::cmp::Ordering::Greater {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        Ok(low)
+    }
+
+    /// A branch child's page offset and the number of keys under it.
+    pub fn child(&self, i: usize) -> Result<(u64, u64)> {
+        let at = if i == 0 {
+            PAGE_HEADER
+        } else {
+            self.entries[i - 1].1
+        };
+        Ok((get_u64(self.page, at)?, get_u64(self.page, at + 8)?))
     }
 }
 

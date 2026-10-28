@@ -1075,3 +1075,32 @@ fn file_stats_show_how_far_writes_grew_the_file() {
     assert_eq!(compacted, base + super::format::HEADER_REGION);
     assert!(compacted < grown);
 }
+
+fn decoded_keys() -> usize {
+    super::node::DECODED_KEYS.with(std::cell::Cell::get)
+}
+
+/// Reads find entries where they lie in a page and copy out only what they
+/// return: one member's score or rank copies no key, a range only its own.
+#[test]
+fn reads_copy_no_keys_out_of_pages() {
+    let (_dir, path) = temp_tree();
+    let seed: Vec<Op> = (0..5_000)
+        .map(|i| add(&format!("m{i:05}"), f64::from(i)))
+        .collect();
+    apply(&path, Token::new(1, 1), &seed).unwrap();
+    let before = decoded_keys();
+    assert_eq!(
+        read(&path, |tx| tx.score(b"m02500")).unwrap(),
+        Some(Some(2500.0))
+    );
+    assert_eq!(
+        read(&path, |tx| tx.member_rank(b"m04999", false)).unwrap(),
+        Some(Some(4999))
+    );
+    let range = read(&path, |tx| tx.range_by_index(10, 12, false))
+        .unwrap()
+        .unwrap();
+    assert_eq!(range.len(), 3);
+    assert_eq!(decoded_keys() - before, 0);
+}

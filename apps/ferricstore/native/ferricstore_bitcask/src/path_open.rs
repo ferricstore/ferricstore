@@ -13,11 +13,23 @@ fn component_name(name: &OsStr) -> io::Result<CString> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains null byte"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many open and openat calls this thread made here.
+    static OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn note_open() {
+    #[cfg(test)]
+    OPENS.with(|opens| opens.set(opens.get() + 1));
+}
+
 fn open_directory_at(
     parent_fd: libc::c_int,
     name: &OsStr,
     allow_symlink: bool,
 ) -> io::Result<OwnedFd> {
+    note_open();
     let name = component_name(name)?;
     let nofollow = if allow_symlink { 0 } else { libc::O_NOFOLLOW };
     let fd = unsafe {
@@ -37,6 +49,7 @@ fn open_directory_at(
 
 fn starting_directory(path: &Path) -> io::Result<OwnedFd> {
     let start = if path.is_absolute() { c"/" } else { c"." };
+    note_open();
     let fd = unsafe {
         libc::open(
             start.as_ptr(),
@@ -89,9 +102,101 @@ fn openat2_nofollow(
     }
 }
 
+/// Whether `open` takes `O_NOFOLLOW_ANY` (macOS 11, Darwin 20, and later); an
+/// earlier kernel may ignore the flag and follow symlinks.
+#[cfg(target_os = "macos")]
+fn nofollow_any_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let mut name = std::mem::MaybeUninit::<libc::utsname>::uninit();
+        if unsafe { libc::uname(name.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        let name = unsafe { name.assume_init() };
+        let release = unsafe { CStr::from_ptr(name.release.as_ptr()) };
+        release
+            .to_str()
+            .ok()
+            .and_then(|release| release.split('.').next())
+            .and_then(|major| major.parse::<u32>().ok())
+            .is_some_and(|major| major >= 20)
+    })
+}
+
+/// macOS: opens `path` in at most two calls rather than one per component.
+/// As in the walk, only an absolute path's first component may be a symlink
+/// (a root-owned alias such as `/tmp` or `/var`); the rest resolves in one
+/// open that fails on any symlink. `None` leaves the path to the walk: an old
+/// kernel, a `.` or `..` component, or nothing below the first component.
+#[cfg(target_os = "macos")]
+fn open_nofollow_any(
+    path: &Path,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> io::Result<Option<std::fs::File>> {
+    if !nofollow_any_supported() {
+        return Ok(None);
+    }
+    let mut components = path.components();
+    let start = if path.is_absolute() {
+        let (Some(Component::RootDir), Some(Component::Normal(first))) =
+            (components.next(), components.next())
+        else {
+            return Ok(None);
+        };
+        let first = component_name(Path::new("/").join(first).as_os_str())?;
+        note_open();
+        let fd = unsafe {
+            libc::open(
+                first.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Some(unsafe { OwnedFd::from_raw_fd(fd) })
+    } else {
+        None
+    };
+    let rest = components.as_path();
+    if rest.as_os_str().is_empty()
+        || !rest
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Ok(None);
+    }
+    let rest = component_name(rest.as_os_str())?;
+    note_open();
+    let fd = unsafe {
+        libc::openat(
+            start.as_ref().map_or(libc::AT_FDCWD, AsRawFd::as_raw_fd),
+            rest.as_ptr(),
+            // macOS refuses O_NOFOLLOW beside O_NOFOLLOW_ANY, which covers it.
+            (flags & !libc::O_NOFOLLOW) | libc::O_NOFOLLOW_ANY,
+            libc::c_uint::from(mode),
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(Some(unsafe { std::fs::File::from_raw_fd(fd) }))
+    }
+}
+
 pub(crate) fn open_directory_nofollow(path: &Path) -> io::Result<std::fs::File> {
     #[cfg(target_os = "linux")]
     if let Some(directory) = openat2_nofollow(
+        path,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0,
+    )? {
+        return Ok(directory);
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(directory) = open_nofollow_any(
         path,
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
         0,
@@ -150,8 +255,14 @@ pub(crate) fn open_file_nofollow(
         return Ok(file);
     }
 
+    #[cfg(target_os = "macos")]
+    if let Some(file) = open_nofollow_any(path, flags, mode)? {
+        return Ok(file);
+    }
+
     let (directory, file_name) = open_parent_and_name(path)?;
 
+    note_open();
     let fd = unsafe {
         libc::openat(
             directory.as_raw_fd(),
@@ -333,5 +444,65 @@ pub(crate) fn remove_dir_all_nofollow(path: &Path) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "macos")]
+    fn opens() -> usize {
+        OPENS.with(std::cell::Cell::get)
+    }
+
+    /// Walking a path one directory at a time cost a call per component,
+    /// most of what reading a small file cost on macOS.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_deep_open_takes_at_most_two_calls() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dir = (0..12).fold(root.path().to_path_buf(), |dir, i| {
+            dir.join(format!("d{i}"))
+        });
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f");
+        std::fs::write(&file, b"x").unwrap();
+
+        let before = opens();
+        open_file_nofollow(&file, libc::O_RDONLY, 0).unwrap();
+        assert!(opens() - before <= 2, "{} opens", opens() - before);
+        let before = opens();
+        open_directory_nofollow(&dir).unwrap();
+        assert!(opens() - before <= 2, "{} opens", opens() - before);
+    }
+
+    /// Below the first component no symlink is followed, whichever way the
+    /// path is opened.
+    #[test]
+    fn opens_refuse_symlinks_below_the_first_component() {
+        let root = tempfile::TempDir::new().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(real.join("inner")).unwrap();
+        std::fs::write(real.join("inner/f"), b"x").unwrap();
+        std::os::unix::fs::symlink(&real, root.path().join("link")).unwrap();
+        std::os::unix::fs::symlink(real.join("inner/f"), real.join("inner/f-link")).unwrap();
+
+        assert!(open_file_nofollow(&real.join("inner/f"), libc::O_RDONLY, 0).is_ok());
+        assert!(open_directory_nofollow(&real.join("inner")).is_ok());
+        for path in [root.path().join("link/inner/f"), real.join("inner/f-link")] {
+            assert!(
+                open_file_nofollow(&path, libc::O_RDONLY, 0).is_err(),
+                "{path:?}"
+            );
+        }
+        assert!(open_directory_nofollow(&root.path().join("link/inner")).is_err());
+        assert!(open_file_nofollow(
+            &root.path().join("link/inner/new"),
+            libc::O_RDWR | libc::O_CREAT,
+            0o644
+        )
+        .is_err());
+        assert!(!real.join("inner/new").exists());
     }
 }
