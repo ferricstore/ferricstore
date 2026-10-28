@@ -451,6 +451,7 @@ pub(crate) fn remove_dir_all_nofollow(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     fn opens() -> usize {
         OPENS.with(std::cell::Cell::get)
     }
