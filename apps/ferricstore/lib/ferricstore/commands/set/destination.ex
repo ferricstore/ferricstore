@@ -7,34 +7,56 @@ defmodule Ferricstore.Commands.Set.Destination do
   @presence_marker "1"
 
   def store_set_at(destination, members, store) do
+    entries =
+      Enum.map(members, fn member ->
+        {CompoundKey.set_member(destination, member), @presence_marker, 0}
+      end)
+
+    store_at(destination, :set, entries, store)
+  end
+
+  @doc """
+  Replaces `destination` with a sorted set of `{member, score}` pairs, as
+  ZADD stores them; an empty result leaves no key. Answers the member count.
+  """
+  def store_zset_at(destination, pairs, store) do
+    entries =
+      Enum.map(pairs, fn {member, score} ->
+        {CompoundKey.zset_member(destination, member), Float.to_string(score), 0}
+      end)
+
+    store_at(destination, :zset, entries, store)
+  end
+
+  defp store_at(destination, type, entries, store) do
     case destination_backup(destination, store) do
-      {:ok, backup} -> replace_destination(destination, members, backup, store)
+      {:ok, backup} -> replace_destination(destination, type, entries, backup, store)
       {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
     end
   end
 
-  defp replace_destination(destination, members, backup, store) do
+  defp replace_destination(destination, type, entries, backup, store) do
     case clear_set_store_destination(destination, store) do
       :ok ->
-        write_destination(destination, MapSet.to_list(members), backup, store)
+        write_destination(destination, type, entries, backup, store)
 
       {:error, _reason} = error ->
         restore_set_store_destination(error, destination, backup, store)
     end
   end
 
-  defp write_destination(_destination, [], _backup, _store), do: 0
+  defp write_destination(_destination, _type, [], _backup, _store), do: 0
 
-  defp write_destination(destination, members, backup, store) do
-    case TypeRegistry.command_check_or_set_status(destination, :set, store) do
+  defp write_destination(destination, type, entries, backup, store) do
+    case TypeRegistry.command_check_or_set_status(destination, type, store) do
       type_status when type_status in [:ok, {:ok, :created}] ->
-        case put_set_members(store, destination, members) do
+        case Ops.compound_batch_put(store, destination, entries) do
           :ok ->
-            length(members)
+            length(entries)
 
           {:error, _reason} = error ->
             destination
-            |> rollback_new_set_type_marker(store, type_status, error)
+            |> rollback_new_type_marker(type, store, type_status, error)
             |> restore_set_store_destination(destination, backup, store)
         end
 
@@ -127,26 +149,20 @@ defmodule Ferricstore.Commands.Set.Destination do
     end
   end
 
-  defp put_set_members(store, key, members) do
-    entries =
-      Enum.map(members, fn member ->
-        {CompoundKey.set_member(key, member), @presence_marker, 0}
-      end)
-
-    Ops.compound_batch_put(store, key, entries)
-  end
-
-  defp rollback_new_set_type_marker(key, store, {:ok, :created}, write_error) do
+  defp rollback_new_type_marker(key, type, store, {:ok, :created}, write_error) do
     case TypeRegistry.rollback_created_type(key, store) do
       :ok ->
         write_error
 
       {:error, _} = rollback_error ->
-        {:error, {:set_type_marker_rollback_failed, write_error, rollback_error}}
+        {:error, {rollback_failure(type), write_error, rollback_error}}
     end
   end
 
-  defp rollback_new_set_type_marker(_key, _store, :ok, write_error), do: write_error
+  defp rollback_new_type_marker(_key, _type, _store, :ok, write_error), do: write_error
+
+  defp rollback_failure(:set), do: :set_type_marker_rollback_failed
+  defp rollback_failure(:zset), do: :zset_type_marker_rollback_failed
 
   defp command_error({:error, {:storage_read_failed, _reason}} = failure),
     do: ReadResult.command_error(failure)

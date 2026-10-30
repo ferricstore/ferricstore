@@ -94,7 +94,13 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    the entry that crosses the threshold, writes its members to the tree
   #    with the entry's Raft position, and drops them from the keydir. Older
   #    releases keep members in the keydir and cannot read the tree.
-  @supported 9
+  # 10: MULTI queues ZUNION, ZINTER, ZDIFF, ZUNIONSTORE, ZINTERSTORE,
+  #     ZDIFFSTORE, ZINTERCARD and ZRANGESTORE
+  #     (`Ferricstore.Transaction.ReplicaCompat`), which older releases do not
+  #     have; and their STORE forms run as one-command transactions, so the
+  #     shard computes the result where it writes it
+  #     (`Ferricstore.Commands.SortedSet.Algebra`).
+  @supported 10
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"
   @probe_timeout_ms 5_000

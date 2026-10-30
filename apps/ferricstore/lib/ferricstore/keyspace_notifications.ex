@@ -88,6 +88,10 @@ defmodule Ferricstore.KeyspaceNotifications do
     "zpopmax" => "z",
     "geoadd" => "z",
     "geosearchstore" => "z",
+    "zunionstore" => "z",
+    "zinterstore" => "z",
+    "zdiffstore" => "z",
+    "zrangestore" => "z",
     "xadd" => "t",
     "xdel" => "t",
     "xtrim" => "t",
@@ -166,6 +170,10 @@ defmodule Ferricstore.KeyspaceNotifications do
     "PFMERGE" => "pfmerge",
     "GEOADD" => "geoadd",
     "GEOSEARCHSTORE" => "geosearchstore",
+    "ZUNIONSTORE" => "zunionstore",
+    "ZINTERSTORE" => "zinterstore",
+    "ZDIFFSTORE" => "zdiffstore",
+    "ZRANGESTORE" => "zrangestore",
     "XADD" => "xadd",
     "XDEL" => "xdel",
     "XTRIM" => "xtrim"
@@ -249,7 +257,8 @@ defmodule Ferricstore.KeyspaceNotifications do
   end
 
   defp notify_event(command, event, [destination | _rest], _result)
-       when command in ~w(SDIFFSTORE SINTERSTORE SUNIONSTORE GEOSEARCHSTORE PFMERGE),
+       when command in ~w(SDIFFSTORE SINTERSTORE SUNIONSTORE GEOSEARCHSTORE PFMERGE
+                           ZUNIONSTORE ZINTERSTORE ZDIFFSTORE ZRANGESTORE),
        do: notify_key(destination, event)
 
   defp notify_event("BITOP", event, [_operation, destination | _rest], _result),

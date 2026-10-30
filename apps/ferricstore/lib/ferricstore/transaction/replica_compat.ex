@@ -1,7 +1,7 @@
 defmodule Ferricstore.Transaction.ReplicaCompat do
   @moduledoc """
   Command forms MULTI queues only at the cluster feature level that introduced
-  them (4 or 5).
+  them (4, 5, 6 or 10).
 
   A MULTI transaction's commands run in the state machine on every replica.
   Releases before level 4 do not handle some forms this release accepts:
@@ -13,13 +13,24 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
   them (`Ferricstore.Cluster.FeatureLevel`, level 4). Level 5 adds forms that
   releases before it do not parse at all, such as ZRANK ... WITHSCORE and
   HEXPIRE ... NX, or refuse, such as PFMERGE with no source and HEXPIRE with
-  a TTL of 0.
+  a TTL of 0. Level 10 adds ZUNION, ZINTER, ZDIFF, their STORE forms,
+  ZINTERCARD and ZRANGESTORE, which releases before it do not have.
   """
 
   alias Ferricstore.Cluster.FeatureLevel
   alias Ferricstore.Store.Router
 
   @expiry_tags [:expire, :pexpire, :expireat, :pexpireat]
+  @zset_algebra_tags [
+    :zunion,
+    :zinter,
+    :zdiff,
+    :zunionstore,
+    :zinterstore,
+    :zdiffstore,
+    :zintercard,
+    :zrangestore
+  ]
   @field_expiry_tags [:hexpire, :hpexpire]
 
   @doc "Whether a parsed command needs cluster feature level 4 inside MULTI."
@@ -30,7 +41,7 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
   The cluster feature level a parsed command needs inside MULTI, or nil for a
   form every release applies.
   """
-  @spec required_level(term()) :: 4 | 5 | 6 | nil
+  @spec required_level(term()) :: 4 | 5 | 6 | 10 | nil
   def required_level({tag, _key, _time, flags}) when tag in @expiry_tags and is_list(flags),
     do: 4
 
@@ -66,6 +77,9 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
   # ZADD INCR (older releases refuse the option).
   def required_level({:zadd, _key, opts, pairs}) when is_list(opts) and is_list(pairs),
     do: if(:incr in opts, do: 5)
+
+  # Level 10: sorted-set commands older releases do not have.
+  def required_level({tag, args}) when tag in @zset_algebra_tags and is_list(args), do: 10
 
   # TDIGEST (in a transaction from level 6: older releases refuse it there; its
   # digest is a plain value the transaction reads and writes like any other).

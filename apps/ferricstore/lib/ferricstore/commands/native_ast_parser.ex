@@ -1332,7 +1332,10 @@ defmodule Ferricstore.Commands.NativeAstParser do
   end
 
   defp extra_command_keys("XREADGROUP", _args), do: []
-  defp extra_command_keys("GEOSEARCHSTORE", [destination, source | _]), do: [destination, source]
+
+  defp extra_command_keys(cmd, [destination, source | _])
+       when cmd in ~w(GEOSEARCHSTORE ZRANGESTORE),
+       do: [destination, source]
 
   defp extra_command_keys(cmd, [key | _args]) when cmd in @extra_first_key_commands, do: [key]
   defp extra_command_keys(_cmd, _args), do: []

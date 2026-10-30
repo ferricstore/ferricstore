@@ -4,6 +4,18 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- ZUNION, ZINTER, ZDIFF, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE, ZINTERCARD and
+  ZRANGESTORE, as Redis answers them (WEIGHTS, AGGREGATE, WITHSCORES, LIMIT;
+  sets count as sorted sets of score 1), with `FerricStore.zunion/2`,
+  `zinter/2`, `zdiff/2`, `zunionstore/3`, `zinterstore/3`, `zdiffstore/2`,
+  `zintercard/2` and `zrangestore/5`. They read and write sorted sets stored
+  as trees (level 9). A score past the largest double is refused, as ZINCRBY
+  refuses one.
+- Upgrading: feature level 10 lets MULTI queue these commands, which older
+  releases do not have, and runs their STORE forms as one-command
+  transactions, so the shard computes the result from what it has applied.
+  Below it a STORE reads on the node the client is connected to, which may
+  lag the latest write. Raise to 10 once every node runs this release.
 - Reads of a sorted set stored as a tree (feature level 9) decoded every page
   they touched into separate keys and values to look at one entry. They now
   search each page in place. On Linux, ZSCORE fell from 23 to 15 µs and ZRANK
