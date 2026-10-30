@@ -97,8 +97,9 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   # 10: MULTI queues ZUNION, ZINTER, ZDIFF, ZUNIONSTORE, ZINTERSTORE,
   #     ZDIFFSTORE, ZINTERCARD and ZRANGESTORE
   #     (`Ferricstore.Transaction.ReplicaCompat`), which older releases do not
-  #     have; and a STORE form whose destination is one of its sources runs as
-  #     a one-command transaction (`Ferricstore.Commands.SortedSet.Algebra`).
+  #     have; and their STORE forms run as one-command transactions, so the
+  #     shard computes the result where it writes it
+  #     (`Ferricstore.Commands.SortedSet.Algebra`).
   @supported 10
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

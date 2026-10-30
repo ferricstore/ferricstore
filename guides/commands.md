@@ -952,7 +952,7 @@ missing key is empty).
 | **Protocol command** | `ZUNION numkeys key [key ...] [WEIGHTS weight ...] [AGGREGATE SUM\|MIN\|MAX] [WITHSCORES]`, `ZINTER` (same), `ZDIFF numkeys key [key ...] [WITHSCORES]`; `ZUNIONSTORE dest numkeys key [key ...] [WEIGHTS ...] [AGGREGATE ...]`, `ZINTERSTORE` (same), `ZDIFFSTORE dest numkeys key [key ...]` |
 | **Embedded API** | `FerricStore.zunion(keys, opts)`, `zinter/2`, `zdiff/2`, `zunionstore(dest, keys, opts)`, `zinterstore/3`, `zdiffstore/2` (`weights:`, `aggregate:`, `withscores:`) |
 | **Return** | Read forms: members by score (with scores for WITHSCORES); STORE forms: integer, the stored member count |
-| **Status** | Supported. A STORE replaces its destination, whatever its type, and deletes it for an empty result. Keys must share a slot on a cluster. A score past the largest double is refused (`ERR resulting score is not a number (NaN)`). Inside MULTI from feature level 10. |
+| **Status** | Supported. A STORE replaces its destination, whatever its type, and deletes it for an empty result. Keys must share a slot on a cluster. A score past the largest double is refused (`ERR resulting score is not a number (NaN)`). From feature level 10 a STORE runs as a one-command transaction (computed where it is written), and MULTI takes these commands. |
 
 ### ZINTERCARD / ZRANGESTORE
 
@@ -961,7 +961,7 @@ missing key is empty).
 | **Protocol command** | `ZINTERCARD numkeys key [key ...] [LIMIT limit]`, `ZRANGESTORE dst src min max [BYSCORE\|BYLEX] [REV] [LIMIT offset count]` |
 | **Embedded API** | `FerricStore.zintercard(keys, limit: n)`, `FerricStore.zrangestore(dst, src, start, stop, by: :score \| :lex, rev: true, limit: {offset, count})` |
 | **Return** | Integer: the intersection's size (up to LIMIT), or the stored member count |
-| **Status** | Supported. ZRANGESTORE selects as ZRANGE does and refuses WITHSCORES. Inside MULTI from feature level 10. |
+| **Status** | Supported. ZRANGESTORE selects as ZRANGE does and refuses WITHSCORES. From feature level 10 ZRANGESTORE runs as a one-command transaction, and MULTI takes both. |
 
 ---
 

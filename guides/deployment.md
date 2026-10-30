@@ -677,10 +677,11 @@ shard_0: 2
   - 10: MULTI queues ZUNION, ZINTER, ZDIFF, ZUNIONSTORE, ZINTERSTORE,
     ZDIFFSTORE, ZINTERCARD and ZRANGESTORE; releases before it do not have
     these commands, so a transaction holding one would apply on them
-    differently. A STORE whose destination is also one of its sources runs
-    as a one-command transaction, applied with nothing in between; below
-    level 10 it reads the sources and writes the destination as separate
-    steps, so a write to the destination in between can be lost.
+    differently. Their STORE forms (and ZRANGESTORE) run as one-command
+    transactions: the shard computes the result from what it has applied and
+    writes it with nothing in between. Below level 10 a STORE reads its
+    sources on the node the client is connected to, which may not have
+    applied the latest write yet, and writes as separate steps.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.

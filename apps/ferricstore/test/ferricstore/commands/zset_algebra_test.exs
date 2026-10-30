@@ -265,7 +265,9 @@ defmodule Ferricstore.Commands.ZSetAlgebraTest do
       assert ["b", "5"] == range(d, k.("top"))
     end
 
-    test "storing into a source runs as one transaction", %{d: d, k: k} do
+    # The shard decides the result where the write applies, so a STORE sent
+    # to a node that has not applied a source write yet still sees it.
+    test "a STORE runs as one transaction", %{d: d, k: k} do
       parent = self()
 
       Process.put(:ferricstore_tx_backend_write_hook, fn shard, command ->
@@ -275,6 +277,10 @@ defmodule Ferricstore.Commands.ZSetAlgebraTest do
 
       on_exit(fn -> Process.delete(:ferricstore_tx_backend_write_hook) end)
 
+      assert 3 == d.("ZUNIONSTORE", [k.("out"), "2", k.("z1"), k.("z2")])
+      assert_received :transaction_used
+      assert 1 == d.("ZRANGESTORE", [k.("top"), k.("out"), "0", "0", "REV"])
+      assert_received :transaction_used
       assert 1 == d.("ZINTERSTORE", [k.("z1"), "2", k.("z1"), k.("z2")])
       assert_received :transaction_used
       assert ["b", "5"] == range(d, k.("z1"))

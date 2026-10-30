@@ -55,7 +55,7 @@ defmodule Ferricstore.Commands.SortedSet.Algebra do
       store_result(destination, [source], store, fn unified_store ->
         range_pairs(source, min, max, options, unified_store)
       end)
-      |> run_atomic_if_source("ZRANGESTORE", destination, [source], store, [
+      |> run_in_apply("ZRANGESTORE", store, [
         destination,
         source,
         min,
@@ -78,7 +78,7 @@ defmodule Ferricstore.Commands.SortedSet.Algebra do
           sources |> combine(op, weights, aggregate) |> checked_pairs()
         end
       end)
-      |> run_atomic_if_source(command, destination, keys, store, [destination | args])
+      |> run_in_apply(command, store, [destination | args])
     end
   end
 
@@ -90,18 +90,16 @@ defmodule Ferricstore.Commands.SortedSet.Algebra do
     end
   end
 
-  # A destination that is also a source is read and then written back, which
-  # would undo a write to it in between; from feature level 10 the command
-  # then runs as a one-command transaction, applied with nothing in between.
-  # `result` is a function of the store, so the fallback runs it only then.
-  defp run_atomic_if_source(result, command, destination, keys, store, args) do
-    if destination in keys do
-      case SingleCommand.run(store, command, args, level: @transaction_level) do
-        :fallback -> result.()
-        answer -> answer
-      end
-    else
-      result.()
+  # A STORE reads its sources and writes its destination. Run from a client
+  # it read them on its own node, which may not have applied the latest
+  # write yet, and a write in between was lost. From feature level 10 it runs
+  # as a one-command transaction: the shard computes the result from what it
+  # has applied and writes it with nothing in between. `result` is a function
+  # of the store, so the older path runs only when that one cannot.
+  defp run_in_apply(result, command, store, args) do
+    case SingleCommand.run(store, command, args, level: @transaction_level) do
+      :fallback -> result.()
+      answer -> answer
     end
   end
 
