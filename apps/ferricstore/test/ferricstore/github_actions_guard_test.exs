@@ -429,10 +429,10 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     assert workflow =~ "repository: ferricstore/ferricstore-go\n            ref: v0.11.10"
 
     assert workflow =~
-             "repository: ferricstore/ferricstore-python\n            ref: c3f278614b7d41782b44a2b68ede37f7c2c743c8"
+             "repository: ferricstore/ferricstore-python\n            ref: 863061d23028126f235f69a20b4fc2ec77a2584b"
 
     assert workflow =~
-             "repository: ferricstore/ferricstore-typescript\n            ref: 560b771fadf3d827fedc49a7a34f004557cb2a6a"
+             "repository: ferricstore/ferricstore-typescript\n            ref: 7a9c68874e78a840cfecc5918adedff684a89a96"
 
     assert workflow =~
              "repository: ferricstore/ferricstore-elixir\n            ref: 035604100a812ddb3f38526735ba3da9e81d3a80"

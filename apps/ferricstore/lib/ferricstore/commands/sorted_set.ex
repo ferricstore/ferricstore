@@ -3,7 +3,9 @@ defmodule Ferricstore.Commands.SortedSet do
   Handles Redis sorted set commands: ZADD, ZSCORE, ZRANK, ZRANGE, ZCARD,
   ZREM, ZINCRBY, ZCOUNT, ZPOPMIN, ZPOPMAX, ZRANGEBYSCORE, ZREVRANGE,
   ZSCAN, ZRANDMEMBER, ZMSCORE, and (`SortedSet.Algebra`) ZUNION, ZINTER,
-  ZDIFF, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE, ZINTERCARD and ZRANGESTORE.
+  ZDIFF, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE, ZINTERCARD and ZRANGESTORE, and
+  (`SortedSet.RangeCommands`) ZRANGEBYLEX, ZREVRANGEBYLEX, ZLEXCOUNT,
+  ZREMRANGEBYRANK, ZREMRANGEBYSCORE, ZREMRANGEBYLEX and ZMPOP.
 
   Each sorted set member is stored as a compound key:
 
@@ -22,6 +24,7 @@ defmodule Ferricstore.Commands.SortedSet do
   alias Ferricstore.Commands.CollectionScan
   alias Ferricstore.Commands.SortedSet.Algebra
   alias Ferricstore.Commands.SortedSet.Helpers
+  alias Ferricstore.Commands.SortedSet.RangeCommands
   alias Ferricstore.Commands.SortedSet.Reads
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
@@ -29,6 +32,8 @@ defmodule Ferricstore.Commands.SortedSet do
   alias Ferricstore.Store.TypeRegistry
 
   @algebra_commands ~w(ZUNION ZINTER ZDIFF ZUNIONSTORE ZINTERSTORE ZDIFFSTORE ZINTERCARD ZRANGESTORE)
+  @range_commands ~w(ZRANGEBYLEX ZREVRANGEBYLEX ZLEXCOUNT ZREMRANGEBYRANK ZREMRANGEBYSCORE
+    ZREMRANGEBYLEX ZMPOP)
 
   @doc """
   Handles a sorted set command.
@@ -49,6 +54,10 @@ defmodule Ferricstore.Commands.SortedSet do
   # ZUNION, ZINTER, ZDIFF, their STORE forms, ZINTERCARD and ZRANGESTORE.
   def handle(cmd, args, store) when cmd in @algebra_commands,
     do: Algebra.handle(cmd, args, store)
+
+  # ZRANGEBYLEX, ZREVRANGEBYLEX, ZLEXCOUNT, ZREMRANGEBY* and ZMPOP.
+  def handle(cmd, args, store) when cmd in @range_commands,
+    do: RangeCommands.handle(cmd, args, store)
 
   # ---------------------------------------------------------------------------
   # ZADD key [NX|XX] [GT|LT] [CH] score member [score member ...]

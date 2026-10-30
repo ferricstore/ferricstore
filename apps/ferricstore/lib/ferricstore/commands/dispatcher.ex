@@ -58,7 +58,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   @list_raw_commands ~w(LPUSH RPUSH LPOP RPOP LRANGE LLEN LINDEX LSET LREM LTRIM LPOS LINSERT LMOVE RPOPLPUSH LPUSHX RPUSHX)
   @hash_raw_commands ~w(HSET HDEL HMGET HGET HGETALL HEXISTS HKEYS HVALS HLEN HSETNX HSTRLEN HSCAN HINCRBY HINCRBYFLOAT HRANDFIELD HEXPIRE HPEXPIRE HGETEX HSETEX HTTL HPTTL HPERSIST HEXPIRETIME HGETDEL)
   @set_raw_commands ~w(SADD SREM SMISMEMBER SINTER SUNION SDIFF SDIFFSTORE SINTERSTORE SUNIONSTORE SMEMBERS SCARD SISMEMBER SRANDMEMBER SPOP SMOVE SSCAN SINTERCARD)
-  @zset_raw_commands ~w(ZADD ZREM ZSCORE ZRANK ZREVRANK ZCARD ZINCRBY ZCOUNT ZPOPMIN ZPOPMAX ZRANDMEMBER ZMSCORE ZRANGE ZREVRANGE ZSCAN ZRANGEBYSCORE ZREVRANGEBYSCORE ZUNION ZINTER ZDIFF ZUNIONSTORE ZINTERSTORE ZDIFFSTORE ZINTERCARD ZRANGESTORE)
+  @zset_raw_commands ~w(ZADD ZREM ZSCORE ZRANK ZREVRANK ZCARD ZINCRBY ZCOUNT ZPOPMIN ZPOPMAX ZRANDMEMBER ZMSCORE ZRANGE ZREVRANGE ZSCAN ZRANGEBYSCORE ZREVRANGEBYSCORE ZUNION ZINTER ZDIFF ZUNIONSTORE ZINTERSTORE ZDIFFSTORE ZINTERCARD ZRANGESTORE ZRANGEBYLEX ZREVRANGEBYLEX ZLEXCOUNT ZREMRANGEBYRANK ZREMRANGEBYSCORE ZREMRANGEBYLEX ZMPOP)
   @bitmap_raw_commands ~w(GETBIT SETBIT BITCOUNT BITPOS BITOP)
   @generic_raw_commands ~w(TYPE UNLINK RENAME RENAMENX COPY RANDOMKEY SCAN EXPIRETIME PEXPIRETIME OBJECT WAIT)
   @server_raw_commands ~w(PING ECHO DBSIZE KEYS FLUSHDB FLUSHALL SELECT INFO COMMAND LOLWUT DEBUG SLOWLOG SAVE BGSAVE LASTSAVE CONFIG MODULE WAITAOF FERRICSTORE.BLOBGC FERRICSTORE.DOCTOR)
@@ -189,6 +189,13 @@ defmodule Ferricstore.Commands.Dispatcher do
     "ZDIFFSTORE" => -4,
     "ZINTERCARD" => -3,
     "ZRANGESTORE" => -5,
+    "ZRANGEBYLEX" => -4,
+    "ZREVRANGEBYLEX" => -4,
+    "ZLEXCOUNT" => 4,
+    "ZREMRANGEBYRANK" => 4,
+    "ZREMRANGEBYSCORE" => 4,
+    "ZREMRANGEBYLEX" => 4,
+    "ZMPOP" => -4,
     "ZREVRANGEBYSCORE" => -4,
     "SETBIT" => 4,
     "GETBIT" => 3,
@@ -216,7 +223,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     INVOCATION.DEFINITION.PUT INVOCATION.DEFINITION.GET INVOCATION.DEFINITION.LIST
     INVOCATION.CREATE INVOCATION.GET INVOCATION.PARTITION.LIST
   )
-  @raw_fallback_ast_tags ~w(bitcount bitpos xadd xlen xrange xrevrange xread xtrim xdel xinfo xgroup xreadgroup xack geoadd geopos geodist geohash geosearch geosearchstore zunion zinter zdiff zunionstore zinterstore zdiffstore zintercard zrangestore cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error)a
+  @raw_fallback_ast_tags ~w(bitcount bitpos xadd xlen xrange xrevrange xread xtrim xdel xinfo xgroup xreadgroup xack geoadd geopos geodist geohash geosearch geosearchstore zunion zinter zdiff zunionstore zinterstore zdiffstore zintercard zrangestore zrangebylex zrevrangebylex zlexcount zremrangebyrank zremrangebyscore zremrangebylex zmpop cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error)a
   @wrong_arity_list_ast_tags ~w(get incr decr strlen getdel getex ttl pttl persist lpop rpop llen hgetall hkeys hvals hlen hrandfield smembers scard srandmember spop zcard zpopmin zpopmax zrandmember type expiretime pexpiretime)a
 
   @ast_command_names %{
@@ -330,6 +337,13 @@ defmodule Ferricstore.Commands.Dispatcher do
     zdiffstore: "zdiffstore",
     zintercard: "zintercard",
     zrangestore: "zrangestore",
+    zrangebylex: "zrangebylex",
+    zrevrangebylex: "zrevrangebylex",
+    zlexcount: "zlexcount",
+    zremrangebyrank: "zremrangebyrank",
+    zremrangebyscore: "zremrangebyscore",
+    zremrangebylex: "zremrangebylex",
+    zmpop: "zmpop",
     zrevrangebyscore: "zrevrangebyscore",
     setbit: "setbit",
     getbit: "getbit",

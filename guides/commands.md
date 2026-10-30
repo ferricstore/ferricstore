@@ -31,6 +31,7 @@ SDIFFSTORE, SINTERSTORE, SUNIONSTORE, SINTERCARD, SMOVE, SSCAN,
 ZADD (NX/XX/GT/LT/CH/INCR), ZSCORE, ZRANK, ZREVRANK, ZRANGE, ZREVRANGE, ZCARD, ZREM, ZINCRBY,
 ZCOUNT, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZMSCORE, ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZSCAN,
 ZUNION, ZINTER, ZDIFF, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE, ZINTERCARD, ZRANGESTORE,
+ZRANGEBYLEX, ZREVRANGEBYLEX, ZLEXCOUNT, ZREMRANGEBYRANK, ZREMRANGEBYSCORE, ZREMRANGEBYLEX, ZMPOP,
 XADD, XLEN, XRANGE, XREVRANGE, XREAD (including BLOCK), XTRIM, XDEL, XINFO STREAM,
 XGROUP CREATE, XREADGROUP, XACK,
 EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT, TTL, PTTL, PERSIST, EXPIRETIME, PEXPIRETIME,
@@ -264,8 +265,7 @@ These are FerricStore-native commands:
 ### Command Names Not Yet Supported
 
 `EVAL`, `EVALSHA`, `EVALSHA_RO`, `EVAL_RO` (Lua scripting),
-`LMPOP`, `ZMPOP`, `BZMPOP` (multi-key pop),
-`ZRANGEBYLEX`, `ZREVRANGEBYLEX`, `ZLEXCOUNT`,
+`LMPOP`, `BZMPOP` (multi-key pop), `BZPOPMIN`, `BZPOPMAX`,
 `SORT`, `SORT_RO`,
 `OBJECT` extended subcommands (`OBJECT PERSIST`, `OBJECT COPY`),
 `CLUSTER` (full cluster command family),
@@ -962,6 +962,24 @@ missing key is empty).
 | **Embedded API** | `FerricStore.zintercard(keys, limit: n)`, `FerricStore.zrangestore(dst, src, start, stop, by: :score \| :lex, rev: true, limit: {offset, count})` |
 | **Return** | Integer: the intersection's size (up to LIMIT), or the stored member count |
 | **Status** | Supported. ZRANGESTORE selects as ZRANGE does and refuses WITHSCORES. From feature level 10 ZRANGESTORE runs as a one-command transaction, and MULTI takes both. |
+
+### ZRANGEBYLEX / ZREVRANGEBYLEX / ZLEXCOUNT
+
+| | |
+|---|---|
+| **Protocol command** | `ZRANGEBYLEX key min max [LIMIT offset count]`, `ZREVRANGEBYLEX key max min [LIMIT offset count]`, `ZLEXCOUNT key min max` |
+| **Embedded API** | `FerricStore.zrangebylex(key, min, max, limit: {offset, count})`, `zrevrangebylex/4`, `zlexcount/3` |
+| **Return** | Members in member order; ZLEXCOUNT an integer |
+| **Status** | Supported, with Redis's bounds (`-`, `+`, `[a`, `(a`). Meant for members that share one score. Inside MULTI from feature level 10. |
+
+### ZREMRANGEBYRANK / ZREMRANGEBYSCORE / ZREMRANGEBYLEX / ZMPOP
+
+| | |
+|---|---|
+| **Protocol command** | `ZREMRANGEBYRANK key start stop`, `ZREMRANGEBYSCORE key min max`, `ZREMRANGEBYLEX key min max`, `ZMPOP numkeys key [key ...] MIN\|MAX [COUNT count]` |
+| **Embedded API** | `FerricStore.zremrangebyrank/3`, `zremrangebyscore/3`, `zremrangebylex/3`, `zmpop(keys, :min \| :max, count: n)` |
+| **Return** | Integer (members removed); ZMPOP `[key, [[member, score], ...]]` or nil |
+| **Status** | Supported. From feature level 10 each runs as a one-command transaction (decided where it is written), and MULTI takes them. |
 
 ---
 
