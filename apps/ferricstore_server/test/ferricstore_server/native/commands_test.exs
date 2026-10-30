@@ -5089,6 +5089,22 @@ defmodule FerricstoreServer.Native.CommandsTest do
       end
     end
 
+    test "ZMPOP notifies the key it popped with the side's event", %{key: key} do
+      zset = key <> ":max"
+      :ok = PubSub.subscribe("__keyspace@0__:" <> zset, self())
+
+      exec = fn command, args ->
+        Commands.execute(@op_command_exec, %{"command" => command, "args" => args}, state())
+      end
+
+      assert {:ok, 2, _state} = exec.("ZADD", [zset, "1", "a", "2", "b"])
+      assert_receive {:pubsub_message, _channel, "zadd"}, 500
+      assert {:ok, [^zset, _pairs], _state} = exec.("ZMPOP", ["1", zset, "MIN"])
+      assert_receive {:pubsub_message, _channel, "zpopmin"}, 500
+      assert {:ok, [^zset, _pairs], _state} = exec.("ZMPOP", ["1", zset, "MAX"])
+      assert_receive {:pubsub_message, _channel, "zpopmax"}, 500
+    end
+
     test "ZREMRANGEBY* commands notify the key they removed from", %{key: key} do
       zset = key <> ":zremrange"
       :ok = PubSub.subscribe("__keyspace@0__:" <> zset, self())

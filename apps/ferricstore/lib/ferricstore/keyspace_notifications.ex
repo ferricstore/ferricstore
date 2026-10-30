@@ -147,6 +147,10 @@ defmodule Ferricstore.KeyspaceNotifications do
     "BLPOP" => "lpop",
     "BRPOP" => "rpop",
     "BLMPOP" => "lpop",
+    "BZPOPMIN" => "zpopmin",
+    "BZPOPMAX" => "zpopmax",
+    "BZMPOP" => "zpopmin",
+    "ZMPOP" => "zpopmin",
     "SADD" => "sadd",
     "SREM" => "srem",
     "SPOP" => "spop",
@@ -191,7 +195,8 @@ defmodule Ferricstore.KeyspaceNotifications do
   @zero_result_noop ~w(SETNX MSETNX DEL UNLINK EXPIRE PEXPIRE EXPIREAT PEXPIREAT
     PERSIST RENAMENX COPY HSETNX HDEL LPUSHX RPUSHX SADD SREM SMOVE ZREM LREM PFADD
     XDEL XTRIM)
-  @nil_result_noop ~w(GETDEL LPOP RPOP SPOP SET LMOVE RPOPLPUSH BLMOVE BLPOP BRPOP BLMPOP)
+  @nil_result_noop ~w(GETDEL LPOP RPOP SPOP SET LMOVE RPOPLPUSH BLMOVE BLPOP BRPOP BLMPOP
+    BZPOPMIN BZPOPMAX BZMPOP ZMPOP)
   @empty_list_result_noop ~w(LPOP RPOP SPOP ZPOPMIN ZPOPMAX)
 
   @doc "Whether `notify-keyspace-events` turns any notifications on."
@@ -284,6 +289,22 @@ defmodule Ferricstore.KeyspaceNotifications do
 
   defp notify_event(command, _event, _args, _result) when command in ~w(BLPOP BRPOP BLMPOP),
     do: :ok
+
+  # The sorted-set pops name the key they served in their reply; ZMPOP and
+  # BZMPOP fire the event of the side they popped.
+  defp notify_event(command, event, _args, [key, _member, _score])
+       when command in ~w(BZPOPMIN BZPOPMAX),
+       do: notify_key(key, event)
+
+  defp notify_event("ZMPOP", _event, [numkeys | rest], [key, _popped]),
+    do: notify_key(key, zmpop_event(numkeys, rest))
+
+  defp notify_event("BZMPOP", _event, [_timeout, numkeys | rest], [key, _popped]),
+    do: notify_key(key, zmpop_event(numkeys, rest))
+
+  defp notify_event(command, _event, _args, _result)
+       when command in ~w(BZPOPMIN BZPOPMAX BZMPOP ZMPOP),
+       do: :ok
 
   # The field TTL commands answer one code per field: 1 when they changed
   # its expiry, and for HEXPIRE 2 when a TTL of 0 deleted it.
@@ -378,5 +399,15 @@ defmodule Ferricstore.KeyspaceNotifications do
            nil -> false
            flag -> String.contains?(flags, flag)
          end)
+  end
+
+  # MIN or MAX follows the counted keys.
+  defp zmpop_event(numkeys, rest) do
+    with {count, ""} <- Integer.parse(numkeys),
+         where when is_binary(where) <- Enum.at(rest, count) do
+      if String.upcase(where) == "MAX", do: "zpopmax", else: "zpopmin"
+    else
+      _invalid -> "zpopmin"
+    end
   end
 end

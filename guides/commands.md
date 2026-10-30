@@ -250,7 +250,7 @@ documented in `guides/flow-elixir-sdk.md`.
 | `SELECT` | Returns error -- FerricStore is single-database |
 | `INFO` | Returns FerricStore-specific sections (`raft`, `bitcask`, `ferricstore`, `keydir_analysis`, `namespace_config`) |
 | `WAIT` | Always returns `0` immediately (no replica acknowledgement) |
-| `BLPOP`/`BRPOP`/`BLMOVE`/`BLMPOP` | Supported by native TCP and as one isolated transport-gateway request; not available in embedded mode |
+| `BLPOP`/`BRPOP`/`BLMOVE`/`BLMPOP`/`BZPOPMIN`/`BZPOPMAX`/`BZMPOP` | Supported by native TCP and as one isolated transport-gateway request; not available in embedded mode |
 | `XREAD BLOCK`/`XREADGROUP BLOCK` | Supported by native TCP and as one isolated transport-gateway request via stream waiters; not available in embedded mode |
 
 ### FerricStore-Only Commands
@@ -265,7 +265,7 @@ These are FerricStore-native commands:
 ### Command Names Not Yet Supported
 
 `EVAL`, `EVALSHA`, `EVALSHA_RO`, `EVAL_RO` (Lua scripting),
-`LMPOP`, `BZMPOP` (multi-key pop), `BZPOPMIN`, `BZPOPMAX`,
+`LMPOP` (multi-key pop),
 `SORT`, `SORT_RO`,
 `OBJECT` extended subcommands (`OBJECT PERSIST`, `OBJECT COPY`),
 `CLUSTER` (full cluster command family),
@@ -981,6 +981,14 @@ missing key is empty).
 | **Return** | Integer (members removed); ZMPOP `[key, [[member, score], ...]]` or nil |
 | **Status** | Supported. From feature level 10 each runs as a one-command transaction (decided where it is written), and MULTI takes them. |
 
+### BZPOPMIN / BZPOPMAX / BZMPOP
+
+| | |
+|---|---|
+| **Protocol command** | `BZPOPMIN key [key ...] timeout`, `BZPOPMAX key [key ...] timeout`, `BZMPOP timeout numkeys key [key ...] MIN\|MAX [COUNT count]` |
+| **Return** | BZPOPMIN/BZPOPMAX `[key, member, score]`; BZMPOP `[key, [[member, score], ...]]`; nil on timeout |
+| **Status** | Supported by native TCP and as one isolated transport-gateway request; not in embedded mode or inside MULTI. They pop at once from the first key with members, or wait until a write gives one members (on every node, whichever writes it). Waiters are served in arrival order. |
+
 ---
 
 ## Stream Commands
@@ -1525,7 +1533,7 @@ Transactions work at the connection level. WATCH implements optimistic locking -
 1. **Single database** -- `SELECT` returns an error. FerricStore is single-database.
 2. **Native TCP mode** -- clients start with `HELLO`/`STARTUP` on the native control lane.
 3. **No Lua scripting** -- `EVAL`/`EVALSHA` are not implemented. Use CAS, LOCK, and FETCH_OR_COMPUTE for atomic operations.
-4. **No blocking commands in embedded mode** -- `BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`, `XREAD BLOCK`, and `XREADGROUP BLOCK` require native TCP or one isolated transport-gateway request. A gateway request owns its waiter until completion, caller cancellation, or its absolute deadline.
+4. **No blocking commands in embedded mode** -- `BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`, `XREAD BLOCK`, and `XREADGROUP BLOCK` require native TCP or one isolated transport-gateway request. A gateway request owns its waiter until completion, caller cancellation, or its absolute deadline.
 5. **Probabilistic structures are built-in** -- available without an external module. BF, CF, CMS, TopK, TDigest are all native.
 6. **CAS is a native command** -- available as a direct compare-and-swap command. WATCH/MULTI/EXEC is also supported.
 8. **FETCH_OR_COMPUTE** -- built-in cache stampede protection.

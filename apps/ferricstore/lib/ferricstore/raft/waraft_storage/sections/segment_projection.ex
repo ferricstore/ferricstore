@@ -353,8 +353,29 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
         end
       end
 
+      # The member's keydir row is already visible (`segment_project_put`), so
+      # a BZPOPMIN/BZPOPMAX/BZMPOP waiter woken here finds it, on every replica.
+      defp segment_project_zset_put(
+             sm_state,
+             redis_key,
+             <<"Z:", _::binary>> = compound_key,
+             value
+           ) do
+        sm_state = ZSetIndex.apply_put(sm_state, redis_key, compound_key, value)
+        segment_project_wake_sorted_set(redis_key)
+        sm_state
+      end
+
       defp segment_project_zset_put(sm_state, redis_key, compound_key, value),
         do: ZSetIndex.apply_put(sm_state, redis_key, compound_key, value)
+
+      defp segment_project_wake_sorted_set(redis_key) do
+        Ferricstore.Waiters.notify_push(redis_key)
+        :ok
+      rescue
+        # The waiter registry is not up (startup replay); nobody is waiting.
+        ArgumentError -> :ok
+      end
 
       defp segment_project_zset_delete(sm_state, redis_key, compound_key),
         do: ZSetIndex.apply_delete(sm_state, redis_key, compound_key)

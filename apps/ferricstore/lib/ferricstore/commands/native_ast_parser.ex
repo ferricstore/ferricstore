@@ -1322,8 +1322,13 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp extra_command_keys("WATCH", keys), do: keys
   defp extra_command_keys("BLPOP", args), do: drop_last(args)
   defp extra_command_keys("BRPOP", args), do: drop_last(args)
+  defp extra_command_keys("BZPOPMIN", args), do: drop_last(args)
+  defp extra_command_keys("BZPOPMAX", args), do: drop_last(args)
 
   defp extra_command_keys("BLMPOP", [_timeout, count | rest]),
+    do: take_count(rest, parse_int(count))
+
+  defp extra_command_keys("BZMPOP", [_timeout, count | rest]),
     do: take_count(rest, parse_int(count))
 
   defp extra_command_keys("XREAD", args), do: xread_keys(args)

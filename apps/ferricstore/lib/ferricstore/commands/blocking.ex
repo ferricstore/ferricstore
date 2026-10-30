@@ -128,6 +128,57 @@ defmodule Ferricstore.Commands.Blocking do
     {:error, "ERR wrong number of arguments for 'blmpop' command"}
   end
 
+  @doc """
+  Parses BZPOPMIN/BZPOPMAX arguments, `key [key ...] timeout`, into
+  `{:ok, keys, timeout_ms}`.
+  """
+  @spec parse_bzpop_args(binary(), [binary()]) ::
+          {:ok, [binary()], non_neg_integer()} | {:error, binary()}
+  def parse_bzpop_args(_command, args) when length(args) >= 2 do
+    {keys, [timeout_str]} = Enum.split(args, -1)
+
+    with {:ok, timeout_ms} <- parse_timeout(timeout_str) do
+      {:ok, keys, timeout_ms}
+    end
+  end
+
+  def parse_bzpop_args(command, _args),
+    do: {:error, "ERR wrong number of arguments for '#{String.downcase(command)}' command"}
+
+  @doc """
+  Parses BZMPOP arguments, `timeout numkeys key [key ...] MIN|MAX [COUNT count]`,
+  into `{:ok, keys, :min | :max, count, timeout_ms}`.
+  """
+  @spec parse_bzmpop_args([binary()]) ::
+          {:ok, [binary()], :min | :max, pos_integer(), non_neg_integer()}
+          | {:error, binary()}
+  def parse_bzmpop_args([timeout_str, numkeys_str | rest]) when rest != [] do
+    with {:ok, timeout_ms} <- parse_timeout(timeout_str),
+         {:ok, numkeys} <- positive_count(numkeys_str, "numkeys"),
+         true <- length(rest) >= numkeys + 1 do
+      {keys, [where | count_opts]} = Enum.split(rest, numkeys)
+
+      with {:ok, side} <- parse_zset_side(where),
+           {:ok, count} <- parse_blmpop_count(count_opts) do
+        {:ok, keys, side, count, timeout_ms}
+      end
+    else
+      false -> {:error, "ERR syntax error"}
+      {:error, _} = err -> err
+    end
+  end
+
+  def parse_bzmpop_args(_args),
+    do: {:error, "ERR wrong number of arguments for 'bzmpop' command"}
+
+  defp parse_zset_side(where) do
+    case String.upcase(where) do
+      "MIN" -> {:ok, :min}
+      "MAX" -> {:ok, :max}
+      _ -> {:error, "ERR syntax error"}
+    end
+  end
+
   # ===========================================================================
   # Private -- parsing helpers
   # ===========================================================================

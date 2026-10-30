@@ -200,6 +200,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ZSetTreeApply do
       defp zset_tree_put_entries(state, redis_key, path, entries) do
         with {:ok, ops} <- ZSetTree.put_ops(redis_key, entries),
              {:ok, _outcomes} <- zset_tree_write(state, path, ops) do
+          # As for a set in the keydir (`zset_index_put`).
+          queue_sorted_set_wake(redis_key)
           :ok
         end
       end

@@ -95,7 +95,7 @@ The embedded API (`FerricStore` module) and the native TCP mode execute the same
 | Aspect | Native TCP mode | Embedded mode |
 |--------|---------------|---------------|
 | **Return values** | Native typed values (`nil`, binary, integer, list, map) | Elixir-idiomatic types (`{:ok, value}`, `:ok`, etc.) |
-| **Blocking commands** | `BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`, `XREAD BLOCK` supported | Not available -- return immediately |
+| **Blocking commands** | `BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`, `XREAD BLOCK` supported | Not available -- return immediately |
 | **Set algebra** | `SINTER`/`SUNION`/`SDIFF` scan the single shard owning the key | Same behavior -- set members are co-located per key |
 | **Transactions** | `MULTI`/`EXEC`/`WATCH` at connection level | `FerricStore.multi/1` with function-based API |
 | **ACL** | Per-connection ACL enforcement | No ACL checks |

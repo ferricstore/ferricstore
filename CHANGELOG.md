@@ -16,6 +16,11 @@ All notable changes to FerricStore will be documented here.
   `FerricStore.zrangebylex/4`, `zrevrangebylex/4`, `zlexcount/3`,
   `zremrangebyrank/3`, `zremrangebyscore/3`, `zremrangebylex/3` and `zmpop/3`.
   They work on sorted sets stored as trees (level 9).
+- BZPOPMIN, BZPOPMAX and BZMPOP over native TCP and the transport gateway:
+  they pop at once from the first sorted set with members, or wait until a
+  write gives one members. Every node's state machine (and WARaft's
+  projection) wakes the waiters on its node when it applies a sorted-set
+  member write, as list pushes do, so a waiter on any node is served.
 - Upgrading: feature level 10 lets MULTI queue these commands, which older
   releases do not have, and runs the ones that write (the STORE forms,
   ZRANGESTORE, ZREMRANGEBY* and ZMPOP) as one-command transactions, so the
