@@ -305,6 +305,41 @@ defmodule Ferricstore.Store.ZSetTreeIntegrationTest do
 
   # A tree write inside MULTI lands at once; when the transaction then fails,
   # each tree it wrote is cut back to before its first write.
+  test "set algebra reads tree-encoded sets and stores large results as trees", %{ctx: ctx} do
+    raise_to_9!(ctx)
+    big = Enum.flat_map(1..40, fn i -> ["#{i}", "m#{String.pad_leading("#{i}", 3, "0")}"] end)
+    assert 40 = cmd(ctx, "ZADD", ["{t}a" | big])
+    assert 2 = cmd(ctx, "ZADD", ["{t}b", "100", "m001", "100", "x"])
+    assert [_file] = tree_files(ctx, "{t}a")
+
+    assert 41 = cmd(ctx, "ZUNIONSTORE", ["{t}u", "2", "{t}a", "{t}b"])
+    assert [_file] = tree_files(ctx, "{t}u")
+    assert [] = member_rows(ctx, "{t}u")
+    assert 41 = cmd(ctx, "ZCARD", ["{t}u"])
+    assert ["x", "100", "m001", "101"] = cmd(ctx, "ZRANGE", ["{t}u", "-2", "-1", "WITHSCORES"])
+
+    assert 1 = cmd(ctx, "ZINTERSTORE", ["{t}i", "2", "{t}a", "{t}b"])
+    assert ["m001", "101"] = cmd(ctx, "ZRANGE", ["{t}i", "0", "-1", "WITHSCORES"])
+    assert 39 = cmd(ctx, "ZDIFFSTORE", ["{t}d", "2", "{t}a", "{t}b"])
+    assert 0 = cmd(ctx, "ZRANK", ["{t}d", "m002"])
+    assert 2 = cmd(ctx, "ZINTERCARD", ["2", "{t}u", "{t}b"])
+
+    assert 20 = cmd(ctx, "ZRANGESTORE", ["{t}r", "{t}a", "10", "29"])
+    assert [_file] = tree_files(ctx, "{t}r")
+
+    assert ["m011", "m030"] =
+             [cmd(ctx, "ZRANGE", ["{t}r", "0", "0"]), cmd(ctx, "ZRANGE", ["{t}r", "-1", "-1"])]
+             |> List.flatten()
+
+    # A small result replaces a tree-encoded destination, and a source can be
+    # the destination.
+    assert 2 = cmd(ctx, "ZUNIONSTORE", ["{t}u", "1", "{t}b"])
+    assert ["m001", "100", "x", "100"] = cmd(ctx, "ZRANGE", ["{t}u", "0", "-1", "WITHSCORES"])
+    assert 41 = cmd(ctx, "ZUNIONSTORE", ["{t}a", "2", "{t}a", "{t}b"])
+    assert 41 = cmd(ctx, "ZCARD", ["{t}a"])
+    assert 40 = cmd(ctx, "ZRANK", ["{t}a", "m001"])
+  end
+
   test "a transaction that fails after writing a tree leaves the tree as it was", %{ctx: ctx} do
     raise_to_9!(ctx)
     key = "{rollback}"

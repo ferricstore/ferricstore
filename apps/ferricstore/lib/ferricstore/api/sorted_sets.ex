@@ -449,6 +449,158 @@ defmodule FerricStore.API.SortedSets do
     end
   end
 
+  @doc """
+  Stores in `destination` the union of the sorted sets (or sets, whose
+  members score 1) at `keys`, replacing whatever it held; an empty result
+  deletes it. Returns the number of members stored.
+
+  ## Options
+
+    * `:weights` - one multiplier per key for its scores.
+    * `:aggregate` - `:sum` (default), `:min` or `:max`: how a member's
+      scores from several keys combine.
+
+  ## Examples
+
+      iex> FerricStore.zadd("{lb}:a", [{1, "x"}, {2, "y"}])
+      iex> FerricStore.zadd("{lb}:b", [{3, "y"}])
+      iex> FerricStore.zunionstore("{lb}:all", ["{lb}:a", "{lb}:b"])
+      {:ok, 2}
+
+  """
+  @spec zunionstore(key(), [key()], keyword()) :: {:ok, non_neg_integer()} | {:error, binary()}
+  def zunionstore(destination, keys, opts \\ []) when is_list(keys),
+    do: store_command("ZUNIONSTORE", destination, keys, combine_args(opts))
+
+  @doc """
+  Stores in `destination` the members present in every key, with their
+  scores combined (`:weights`, `:aggregate`, as in `zunionstore/3`).
+  """
+  @spec zinterstore(key(), [key()], keyword()) :: {:ok, non_neg_integer()} | {:error, binary()}
+  def zinterstore(destination, keys, opts \\ []) when is_list(keys),
+    do: store_command("ZINTERSTORE", destination, keys, combine_args(opts))
+
+  @doc """
+  Stores in `destination` the members of the first key that no other key
+  holds, with their scores.
+  """
+  @spec zdiffstore(key(), [key()]) :: {:ok, non_neg_integer()} | {:error, binary()}
+  def zdiffstore(destination, keys) when is_list(keys),
+    do: store_command("ZDIFFSTORE", destination, keys, [])
+
+  @doc """
+  Returns the union of the sorted sets at `keys`, ordered by score.
+  Takes `zunionstore/3`'s options and `:withscores` (`{member, score}`
+  tuples).
+  """
+  @spec zunion([key()], keyword()) :: {:ok, [binary() | {binary(), float()}]} | {:error, binary()}
+  def zunion(keys, opts \\ []) when is_list(keys),
+    do: read_command("ZUNION", keys, combine_args(opts), opts)
+
+  @doc "Returns the members present in every key; options as `zunion/2`."
+  @spec zinter([key()], keyword()) :: {:ok, [binary() | {binary(), float()}]} | {:error, binary()}
+  def zinter(keys, opts \\ []) when is_list(keys),
+    do: read_command("ZINTER", keys, combine_args(opts), opts)
+
+  @doc "Returns the first key's members no other key holds; takes `:withscores`."
+  @spec zdiff([key()], keyword()) :: {:ok, [binary() | {binary(), float()}]} | {:error, binary()}
+  def zdiff(keys, opts \\ []) when is_list(keys), do: read_command("ZDIFF", keys, [], opts)
+
+  @doc """
+  Counts the members present in every key, stopping at `:limit` when given
+  (0, the default, counts them all).
+  """
+  @spec zintercard([key()], keyword()) :: {:ok, non_neg_integer()} | {:error, binary()}
+  def zintercard(keys, opts \\ []) when is_list(keys) do
+    limit = Keyword.get(opts, :limit, 0)
+    args = [Integer.to_string(length(keys)) | keys] ++ ["LIMIT", Integer.to_string(limit)]
+    wrap(SortedSet.handle("ZINTERCARD", args, default_ctx()))
+  end
+
+  @doc """
+  Stores in `destination` the members of `source` in a range, as `ZRANGE`
+  selects them: by rank (default), or with `by: :score` or `by: :lex` by
+  score or member bounds given as Redis writes them (`"(1"`, `"+inf"`,
+  `"[a"`). `rev: true` reverses the order and `limit: {offset, count}`
+  pages a score or member range. Returns the number of members stored.
+  """
+  @spec zrangestore(key(), key(), term(), term(), keyword()) ::
+          {:ok, non_neg_integer()} | {:error, binary()}
+  def zrangestore(destination, source, start, stop, opts \\ []) do
+    by =
+      case Keyword.get(opts, :by) do
+        :score -> ["BYSCORE"]
+        :lex -> ["BYLEX"]
+        _rank -> []
+      end
+
+    rev = if Keyword.get(opts, :rev, false), do: ["REV"], else: []
+
+    limit =
+      case Keyword.get(opts, :limit) do
+        {offset, count} -> ["LIMIT", to_string(offset), to_string(count)]
+        nil -> []
+      end
+
+    args = [destination, source, to_string(start), to_string(stop)] ++ by ++ rev ++ limit
+    wrap(SortedSet.handle("ZRANGESTORE", args, default_ctx()))
+  end
+
+  defp combine_args(opts) do
+    weights =
+      case Keyword.get(opts, :weights) do
+        nil -> []
+        weights -> ["WEIGHTS" | Enum.map(weights, &format_number/1)]
+      end
+
+    aggregate =
+      case Keyword.get(opts, :aggregate) do
+        nil ->
+          []
+
+        mode when mode in [:sum, :min, :max] ->
+          ["AGGREGATE", mode |> Atom.to_string() |> String.upcase()]
+      end
+
+    weights ++ aggregate
+  end
+
+  defp format_number(number) when is_integer(number), do: Integer.to_string(number)
+  defp format_number(number) when is_float(number), do: Float.to_string(number)
+
+  # The instance as the store: a destination that is also a source then runs
+  # as one transaction entry, as on the gateways.
+  defp store_command(command, destination, keys, options) do
+    args = [destination, Integer.to_string(length(keys)) | keys] ++ options
+    wrap(SortedSet.handle(command, args, default_ctx()))
+  end
+
+  defp read_command(command, keys, options, opts) do
+    with_scores = Keyword.get(opts, :withscores, false)
+    scores = if with_scores, do: ["WITHSCORES"], else: []
+    args = [Integer.to_string(length(keys)) | keys] ++ options ++ scores
+
+    case SortedSet.handle(command, args, default_ctx()) do
+      {:error, _reason} = error ->
+        error
+
+      flat when with_scores ->
+        {:ok,
+         flat
+         |> Enum.chunk_every(2)
+         |> Enum.map(fn [member, score] ->
+           {value, _rest} = Float.parse(score)
+           {member, value}
+         end)}
+
+      members ->
+        {:ok, members}
+    end
+  end
+
+  defp wrap({:error, _reason} = error), do: error
+  defp wrap(result), do: {:ok, result}
+
   # ---------------------------------------------------------------------------
   # Streams
   # ---------------------------------------------------------------------------

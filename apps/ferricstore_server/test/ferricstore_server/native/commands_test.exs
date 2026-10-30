@@ -5065,6 +5065,30 @@ defmodule FerricstoreServer.Native.CommandsTest do
       end
     end
 
+    test "sorted set STORE commands notify their destination", %{key: key} do
+      source = key <> ":zsource"
+      destination = key <> ":zdestination"
+      :ok = PubSub.subscribe("__keyspace@0__:" <> destination, self())
+
+      exec = fn command, args ->
+        Commands.execute(@op_command_exec, %{"command" => command, "args" => args}, state())
+      end
+
+      assert {:ok, 2, _state} = exec.("ZADD", [source, "1", "a", "2", "b"])
+
+      for {command, args} <- [
+            {"ZUNIONSTORE", [destination, "1", source]},
+            {"ZINTERSTORE", [destination, "1", source]},
+            {"ZDIFFSTORE", [destination, "1", source]},
+            {"ZRANGESTORE", [destination, source, "0", "0"]}
+          ] do
+        assert {:ok, count, _state} = exec.(command, args)
+        assert count > 0
+        event = String.downcase(command)
+        assert_receive {:pubsub_message, "__keyspace@0__:" <> _destination, ^event}, 500
+      end
+    end
+
     test "RPOPLPUSH notifies like LMOVE, and neither notifies an empty source", %{key: key} do
       source = key <> ":source"
       destination = key <> ":destination"

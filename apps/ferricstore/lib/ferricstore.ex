@@ -344,6 +344,31 @@ defmodule FerricStore do
   defguardeddelegate(zpopmax(key, count \\ 1), to: SortedSetsAPI, keys: [key])
   defguardeddelegate(zmscore(key, members), to: SortedSetsAPI, keys: [key])
 
+  defguardeddelegate(zunionstore(destination, keys, opts \\ []),
+    to: SortedSetsAPI,
+    keys: FerricStore.API.PublicAccess.destination_keys(destination, keys)
+  )
+
+  defguardeddelegate(zinterstore(destination, keys, opts \\ []),
+    to: SortedSetsAPI,
+    keys: FerricStore.API.PublicAccess.destination_keys(destination, keys)
+  )
+
+  defguardeddelegate(zdiffstore(destination, keys),
+    to: SortedSetsAPI,
+    keys: FerricStore.API.PublicAccess.destination_keys(destination, keys)
+  )
+
+  defguardeddelegate(zrangestore(destination, source, start, stop, opts \\ []),
+    to: SortedSetsAPI,
+    keys: [destination, source]
+  )
+
+  defguardeddelegate(zunion(keys, opts \\ []), to: SortedSetsAPI, keys: keys)
+  defguardeddelegate(zinter(keys, opts \\ []), to: SortedSetsAPI, keys: keys)
+  defguardeddelegate(zdiff(keys, opts \\ []), to: SortedSetsAPI, keys: keys)
+  defguardeddelegate(zintercard(keys, opts \\ []), to: SortedSetsAPI, keys: keys)
+
   defguardeddelegate(cas(key, expected, new_value, opts \\ []), to: GenericAPI, keys: [key])
   defguardeddelegate(fetch_or_compute(key, opts), to: GenericAPI, keys: [key])
 

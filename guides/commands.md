@@ -30,6 +30,7 @@ SADD, SREM, SMEMBERS, SISMEMBER, SMISMEMBER, SCARD, SRANDMEMBER, SPOP, SDIFF, SI
 SDIFFSTORE, SINTERSTORE, SUNIONSTORE, SINTERCARD, SMOVE, SSCAN,
 ZADD (NX/XX/GT/LT/CH/INCR), ZSCORE, ZRANK, ZREVRANK, ZRANGE, ZREVRANGE, ZCARD, ZREM, ZINCRBY,
 ZCOUNT, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZMSCORE, ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZSCAN,
+ZUNION, ZINTER, ZDIFF, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE, ZINTERCARD, ZRANGESTORE,
 XADD, XLEN, XRANGE, XREVRANGE, XREAD (including BLOCK), XTRIM, XDEL, XINFO STREAM,
 XGROUP CREATE, XREADGROUP, XACK,
 EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT, TTL, PTTL, PERSIST, EXPIRETIME, PEXPIRETIME,
@@ -264,8 +265,7 @@ These are FerricStore-native commands:
 
 `EVAL`, `EVALSHA`, `EVALSHA_RO`, `EVAL_RO` (Lua scripting),
 `LMPOP`, `ZMPOP`, `BZMPOP` (multi-key pop),
-`ZUNIONSTORE`, `ZINTERSTORE`, `ZDIFFSTORE` (sorted set store operations),
-`ZRANGESTORE`, `ZRANGEBYLEX`, `ZREVRANGEBYLEX`, `ZLEXCOUNT`,
+`ZRANGEBYLEX`, `ZREVRANGEBYLEX`, `ZLEXCOUNT`,
 `SORT`, `SORT_RO`,
 `OBJECT` extended subcommands (`OBJECT PERSIST`, `OBJECT COPY`),
 `CLUSTER` (full cluster command family),
@@ -941,6 +941,27 @@ Pop the lowest/highest scored members.
 | `ZSCAN key cursor [MATCH pattern] [COUNT count]` | Offset-based cursor |
 | `ZCARD key` | Supported |
 | `ZREM key member [member ...]` | Supported |
+
+### ZUNION / ZINTER / ZDIFF and their STORE forms
+
+Sorted-set algebra over sorted sets and sets (a set's members score 1; a
+missing key is empty).
+
+| | |
+|---|---|
+| **Protocol command** | `ZUNION numkeys key [key ...] [WEIGHTS weight ...] [AGGREGATE SUM\|MIN\|MAX] [WITHSCORES]`, `ZINTER` (same), `ZDIFF numkeys key [key ...] [WITHSCORES]`; `ZUNIONSTORE dest numkeys key [key ...] [WEIGHTS ...] [AGGREGATE ...]`, `ZINTERSTORE` (same), `ZDIFFSTORE dest numkeys key [key ...]` |
+| **Embedded API** | `FerricStore.zunion(keys, opts)`, `zinter/2`, `zdiff/2`, `zunionstore(dest, keys, opts)`, `zinterstore/3`, `zdiffstore/2` (`weights:`, `aggregate:`, `withscores:`) |
+| **Return** | Read forms: members by score (with scores for WITHSCORES); STORE forms: integer, the stored member count |
+| **Status** | Supported. A STORE replaces its destination, whatever its type, and deletes it for an empty result. Keys must share a slot on a cluster. A score past the largest double is refused (`ERR resulting score is not a number (NaN)`). Inside MULTI from feature level 10. |
+
+### ZINTERCARD / ZRANGESTORE
+
+| | |
+|---|---|
+| **Protocol command** | `ZINTERCARD numkeys key [key ...] [LIMIT limit]`, `ZRANGESTORE dst src min max [BYSCORE\|BYLEX] [REV] [LIMIT offset count]` |
+| **Embedded API** | `FerricStore.zintercard(keys, limit: n)`, `FerricStore.zrangestore(dst, src, start, stop, by: :score \| :lex, rev: true, limit: {offset, count})` |
+| **Return** | Integer: the intersection's size (up to LIMIT), or the stored member count |
+| **Status** | Supported. ZRANGESTORE selects as ZRANGE does and refuses WITHSCORES. Inside MULTI from feature level 10. |
 
 ---
 

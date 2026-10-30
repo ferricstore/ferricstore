@@ -39,7 +39,7 @@ defmodule Ferricstore.Commands.KeyDiscovery do
     LRANGE LLEN LINDEX LPOS
     SMEMBERS SISMEMBER SMISMEMBER SCARD SRANDMEMBER SSCAN SINTER SUNION SDIFF SINTERCARD
     ZSCORE ZRANK ZREVRANK ZRANGE ZREVRANGE ZCARD ZCOUNT ZRANDMEMBER ZMSCORE ZSCAN
-    ZRANGEBYSCORE ZREVRANGEBYSCORE
+    ZRANGEBYSCORE ZREVRANGEBYSCORE ZUNION ZINTER ZDIFF ZINTERCARD
     GETBIT BITCOUNT BITPOS PFCOUNT GEOHASH GEOPOS GEODIST GEOSEARCH
     XLEN XRANGE XREVRANGE XREAD XINFO
     BF.EXISTS BF.MEXISTS BF.CARD BF.INFO CF.EXISTS CF.MEXISTS CF.COUNT CF.INFO
@@ -66,6 +66,7 @@ defmodule Ferricstore.Commands.KeyDiscovery do
     BLPOP BRPOP BLMOVE BLMPOP
     SADD SREM SPOP SMOVE SDIFFSTORE SINTERSTORE SUNIONSTORE
     ZADD ZREM ZINCRBY ZPOPMIN ZPOPMAX SETBIT BITOP PFADD PFMERGE GEOADD GEOSEARCHSTORE
+    ZUNIONSTORE ZINTERSTORE ZDIFFSTORE ZRANGESTORE
     XADD XTRIM XDEL XGROUP XREADGROUP XACK
     BF.RESERVE BF.ADD BF.MADD CF.RESERVE CF.ADD CF.ADDNX CF.DEL
     CMS.INITBYDIM CMS.INITBYPROB CMS.INCRBY CMS.MERGE
@@ -100,7 +101,7 @@ defmodule Ferricstore.Commands.KeyDiscovery do
 
   @destination_source_commands ~w(
     BITOP PFMERGE SDIFFSTORE SINTERSTORE SUNIONSTORE GEOSEARCHSTORE CMS.MERGE TDIGEST.MERGE
-    ZINTERSTORE ZUNIONSTORE
+    ZINTERSTORE ZUNIONSTORE ZDIFFSTORE ZRANGESTORE
   )
 
   @source_destination_commands ~w(RENAME RENAMENX LMOVE BLMOVE RPOPLPUSH SMOVE)
@@ -249,18 +250,25 @@ defmodule Ferricstore.Commands.KeyDiscovery do
   def extract(command, args)
 
   def extract(command, [destination, count | rest])
-      when command in ["CMS.MERGE", "TDIGEST.MERGE"] do
+      when command in ~w(CMS.MERGE TDIGEST.MERGE ZUNIONSTORE ZINTERSTORE ZDIFFSTORE) do
     {:ok, [destination | counted_keys(count, rest)]}
   end
 
   def extract(command, [destination | _args])
-      when command in ["CMS.MERGE", "TDIGEST.MERGE"],
+      when command in ~w(CMS.MERGE TDIGEST.MERGE ZUNIONSTORE ZINTERSTORE ZDIFFSTORE),
       do: {:ok, [destination]}
 
-  def extract(command, []) when command in ["CMS.MERGE", "TDIGEST.MERGE"], do: {:ok, []}
+  def extract(command, [])
+      when command in ~w(CMS.MERGE TDIGEST.MERGE ZUNIONSTORE ZINTERSTORE ZDIFFSTORE),
+      do: {:ok, []}
 
-  def extract("SINTERCARD", [count | rest]), do: {:ok, counted_keys(count, rest)}
-  def extract("SINTERCARD", []), do: {:ok, []}
+  def extract(command, [count | rest])
+      when command in ~w(SINTERCARD ZUNION ZINTER ZDIFF ZINTERCARD),
+      do: {:ok, counted_keys(count, rest)}
+
+  def extract(command, []) when command in ~w(SINTERCARD ZUNION ZINTER ZDIFF ZINTERCARD),
+    do: {:ok, []}
+
   def extract("PFCOUNT", keys), do: {:ok, keys}
 
   def extract("OBJECT", [subcommand, key | _args]) do

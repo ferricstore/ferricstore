@@ -98,6 +98,17 @@ defmodule Ferricstore.Transaction.Ast do
       when is_list(stream_ids),
       do: {:xreadgroup, group, consumer, {count, block, namespace_stream_ids(stream_ids, ns)}}
 
+  def namespace_ast_keys({tag, [destination, numkeys | rest]}, ns)
+      when tag in [:zunionstore, :zinterstore, :zdiffstore] and is_binary(destination),
+      do: {tag, [namespace_key(destination, ns) | namespace_counted_keys(numkeys, rest, ns)]}
+
+  def namespace_ast_keys({tag, [numkeys | rest]}, ns)
+      when tag in [:zunion, :zinter, :zdiff, :zintercard],
+      do: {tag, namespace_counted_keys(numkeys, rest, ns)}
+
+  def namespace_ast_keys({:zrangestore, [destination, source | rest]}, ns),
+    do: {:zrangestore, [namespace_key(destination, ns), namespace_key(source, ns) | rest]}
+
   def namespace_ast_keys({:geosearchstore, [destination, source | rest]}, ns),
     do: {:geosearchstore, [namespace_key(destination, ns), namespace_key(source, ns) | rest]}
 
@@ -221,6 +232,18 @@ defmodule Ferricstore.Transaction.Ast do
   defp namespace_key(key, _ns), do: key
 
   defp namespace_keys(keys, ns), do: Enum.map(keys, &namespace_key(&1, ns))
+
+  # `numkeys key [key ...] [options]`: only the counted keys are keys.
+  defp namespace_counted_keys(numkeys, rest, ns) do
+    case Integer.parse(numkeys) do
+      {count, ""} when count > 0 ->
+        {keys, options} = Enum.split(rest, count)
+        [numkeys | namespace_keys(keys, ns) ++ options]
+
+      _invalid ->
+        [numkeys | rest]
+    end
+  end
 
   defp namespace_key_value_args(args, ns) do
     args
