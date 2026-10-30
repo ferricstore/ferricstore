@@ -38,7 +38,7 @@ defmodule FerricstoreServer.Acl.CommandCategories do
   )
   @sorted_set_write ~w(
     ZADD ZREM ZINCRBY ZPOPMIN ZPOPMAX ZUNIONSTORE ZINTERSTORE ZDIFFSTORE ZRANGESTORE
-    ZREMRANGEBYRANK ZREMRANGEBYSCORE ZREMRANGEBYLEX ZMPOP
+    ZREMRANGEBYRANK ZREMRANGEBYSCORE ZREMRANGEBYLEX ZMPOP BZPOPMIN BZPOPMAX BZMPOP
   )
 
   @bitmap_read ~w(GETBIT BITCOUNT BITPOS)
@@ -147,7 +147,7 @@ defmodule FerricstoreServer.Acl.CommandCategories do
                          @client_connection_commands ++ @native_connection_commands
   @transaction_commands ~w(MULTI EXEC DISCARD WATCH UNWATCH)
   @pubsub_commands ~w(PUBLISH PUBSUB SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE)
-  @blocking_commands ~w(BLPOP BRPOP BLMOVE BLMPOP)
+  @blocking_commands ~w(BLPOP BRPOP BLMOVE BLMPOP BZPOPMIN BZPOPMAX BZMPOP)
 
   @read_commands MapSet.new(
                    @string_read ++

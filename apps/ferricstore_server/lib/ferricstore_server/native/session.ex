@@ -27,7 +27,7 @@ defmodule FerricstoreServer.Native.Session do
 
   @transaction_passthrough MapSet.new(~w(MULTI EXEC DISCARD WATCH UNWATCH))
   @blocked_in_transaction MapSet.new(~w(
-    BLPOP BRPOP BLMOVE BLMPOP XREAD XREADGROUP
+    BLPOP BRPOP BLMOVE BLMPOP BZPOPMIN BZPOPMAX BZMPOP XREAD XREADGROUP
     SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE
   ))
 

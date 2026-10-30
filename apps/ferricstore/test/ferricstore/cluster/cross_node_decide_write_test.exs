@@ -137,6 +137,28 @@ defmodule Ferricstore.Cluster.CrossNodeDecideWriteTest do
   # The node that writes a Flow wakes its blocked claims and sends the wake-up
   # to the other members, so a claim blocked on another node takes the Flow
   # at once rather than when its block ends.
+  test "a sorted-set write wakes BZPOPMIN waiters on every node", %{
+    nodes: [first, second, third]
+  } do
+    for {write, args} <- [
+          {"ZADD", ["{decide}z", "1", "a"]},
+          {"ZINCRBY", ["{decide}z2", "2", "b"]},
+          {"ZUNIONSTORE", ["{decide}z3", "1", "{decide}z"]}
+        ] do
+      key = hd(args)
+
+      waiters =
+        for node <- [second, third] do
+          Task.async(fn -> await_waiter_notify(node, key) end)
+        end
+
+      Process.sleep(300)
+      dispatch(first, write, args)
+
+      assert [:notified, :notified] == Task.await_many(waiters, 10_000), write
+    end
+  end
+
   test "a blocked claim takes a flow created through another node", %{
     nodes: [_first, second, _third] = nodes
   } do

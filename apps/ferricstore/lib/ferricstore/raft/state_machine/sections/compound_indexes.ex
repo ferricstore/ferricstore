@@ -78,10 +78,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         end
       end
 
-      defp zset_index_put(
+      # A sorted-set member write wakes the key's BZPOPMIN/BZPOPMAX/BZMPOP
+      # waiters once the entry is published, as a list push does: one waiter
+      # per entry, which passes the wake-up on if members remain after its pop.
+      defp zset_index_put(state, redis_key, <<"Z:", _rest::binary>> = key, value) do
+        queue_sorted_set_wake(redis_key)
+        zset_score_index_put(state, redis_key, key, value)
+      end
+
+      defp zset_index_put(_state, _redis_key, _key, _value), do: :ok
+
+      defp zset_score_index_put(
              %{zset_score_index_name: index, zset_score_lookup_name: lookup},
              redis_key,
-             <<"Z:", _rest::binary>> = key,
+             key,
              value
            )
            when index != nil and lookup != nil do
@@ -96,7 +106,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         :ok
       end
 
-      defp zset_index_put(_state, _redis_key, _key, _value), do: :ok
+      defp zset_score_index_put(_state, _redis_key, _key, _value), do: :ok
 
       defp zset_index_delete(
              %{zset_score_index_name: index, zset_score_lookup_name: lookup},
@@ -121,9 +131,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       defp zset_index_delete(_state, _redis_key, _key), do: :ok
 
       defp queue_zset_index_put_after_flush(
-             %{zset_score_index_name: index, zset_score_lookup_name: lookup} = state,
+             state,
              redis_key,
              <<"Z:", _rest::binary>> = key,
+             value
+           ) do
+        queue_sorted_set_wake(redis_key)
+        queue_zset_score_index_put_after_flush(state, redis_key, key, value)
+      end
+
+      defp queue_zset_index_put_after_flush(_state, _redis_key, _key, _value), do: :ok
+
+      defp queue_zset_score_index_put_after_flush(
+             %{zset_score_index_name: index, zset_score_lookup_name: lookup} = state,
+             redis_key,
+             key,
              value
            )
            when index != nil and lookup != nil do
@@ -137,7 +159,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         :ok
       end
 
-      defp queue_zset_index_put_after_flush(_state, _redis_key, _key, _value), do: :ok
+      defp queue_zset_score_index_put_after_flush(_state, _redis_key, _key, _value), do: :ok
 
       defp queue_zset_index_delete_after_flush(
              %{zset_score_index_name: index, zset_score_lookup_name: lookup},
@@ -243,7 +265,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
 
       defp queue_zset_index_ready_empty_after_flush(_state, _redis_key), do: :ok
 
-      defp queue_zset_index_new_put_after_flush(
+      defp queue_zset_index_new_put_after_flush(state, redis_key, member, score) do
+        queue_sorted_set_wake(redis_key)
+        queue_zset_score_index_new_put_after_flush(state, redis_key, member, score)
+      end
+
+      defp queue_zset_score_index_new_put_after_flush(
              %{zset_score_index_name: index, zset_score_lookup_name: lookup} = state,
              redis_key,
              member,
@@ -257,7 +284,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         :ok
       end
 
-      defp queue_zset_index_new_put_after_flush(_state, _redis_key, _member, _score), do: :ok
+      defp queue_zset_score_index_new_put_after_flush(_state, _redis_key, _member, _score),
+        do: :ok
+
+      defp queue_sorted_set_wake(redis_key) do
+        pending = Process.get(:sm_pending_list_push_notifications, [])
+
+        unless List.keymember?(pending, redis_key, 0),
+          do: queue_list_push_notification(redis_key, 1)
+
+        :ok
+      end
 
       defp zset_index_clear(
              %{zset_score_index_name: index, zset_score_lookup_name: lookup},

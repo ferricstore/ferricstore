@@ -5,11 +5,14 @@ defmodule FerricstoreServer.Native.Blocking do
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.Commands.PreparedCommand
   alias Ferricstore.Commands.List, as: ListCmd
+  alias Ferricstore.Commands.SortedSet, as: SortedSetCmd
   alias Ferricstore.Commands.Stream, as: StreamCmd
   alias Ferricstore.Waiters
   alias FerricstoreServer.Native.{OutboundBudget, ResourceBudget, Session}
 
-  @blocking_commands MapSet.new(~w(BLPOP BRPOP BLMOVE BLMPOP XREAD XREADGROUP))
+  @blocking_commands MapSet.new(
+                       ~w(BLPOP BRPOP BLMOVE BLMPOP BZPOPMIN BZPOPMAX BZMPOP XREAD XREADGROUP)
+                     )
   @delivery_overhead_bytes 128
 
   @spec blocking_command?(binary()) :: boolean()
@@ -128,7 +131,7 @@ defmodule FerricstoreServer.Native.Blocking do
   # The list pops here bypass the dispatcher, which fires these for other
   # commands; stream reads already run through it.
   defp notify_keyspace(%PreparedCommand{command: command, args: args}, :ok, value)
-       when command in ~w(BLPOP BRPOP BLMPOP BLMOVE),
+       when command in ~w(BLPOP BRPOP BLMPOP BLMOVE BZPOPMIN BZPOPMAX BZMPOP),
        do: Ferricstore.KeyspaceNotifications.after_command(command, args, value)
 
   defp notify_keyspace(_prepared, _status, _value), do: :ok
@@ -160,6 +163,9 @@ defmodule FerricstoreServer.Native.Blocking do
   defp run_blocking("BRPOP", args, _ast, store), do: run_pop(args, store, :right)
   defp run_blocking("BLMOVE", args, _ast, store), do: run_blmove(args, store)
   defp run_blocking("BLMPOP", args, _ast, store), do: run_blmpop(args, store)
+  defp run_blocking("BZPOPMIN", args, _ast, store), do: run_bzpop("BZPOPMIN", args, store)
+  defp run_blocking("BZPOPMAX", args, _ast, store), do: run_bzpop("BZPOPMAX", args, store)
+  defp run_blocking("BZMPOP", args, _ast, store), do: run_bzmpop(args, store)
 
   defp run_blocking(cmd, _args, ast, store) when cmd in ["XREAD", "XREADGROUP"],
     do: run_stream_read(ast, store)
@@ -227,6 +233,82 @@ defmodule FerricstoreServer.Native.Blocking do
     else
       {:error, reason} -> {:bad_request, reason}
     end
+  end
+
+  # Sorted sets wait in the same registry as lists: a write that gives the
+  # set members wakes one waiter (the state machine's or the WARaft
+  # projection's wake), which passes the wake-up on if members remain.
+  defp run_bzpop(command, args, store) do
+    pop = if command == "BZPOPMIN", do: "ZPOPMIN", else: "ZPOPMAX"
+
+    with {:ok, keys, timeout_ms} <- BlockingCmd.parse_bzpop_args(command, args) do
+      try do
+        pop_fun = fn ->
+          first_zpop(keys, store, fn key ->
+            case SortedSetCmd.handle(pop, [key], store) do
+              [member, score] -> [key, member, score]
+              other -> other
+            end
+          end)
+        end
+
+        case pop_fun.() do
+          nil -> wait_for_list(keys, timeout_ms, pop_fun)
+          other -> native_result(other)
+        end
+      after
+        cleanup_list_waiters(keys)
+      end
+    else
+      {:error, reason} -> {:bad_request, reason}
+    end
+  end
+
+  defp run_bzmpop(args, store) do
+    with {:ok, keys, side, count, timeout_ms} <- BlockingCmd.parse_bzmpop_args(args) do
+      pop = if side == :min, do: "ZPOPMIN", else: "ZPOPMAX"
+
+      try do
+        pop_fun = fn ->
+          first_zpop(keys, store, fn key ->
+            case SortedSetCmd.handle(pop, [key, Integer.to_string(count)], store) do
+              [_ | _] = flat -> [key, Enum.chunk_every(flat, 2)]
+              other -> other
+            end
+          end)
+        end
+
+        case pop_fun.() do
+          nil -> wait_for_list(keys, timeout_ms, pop_fun)
+          other -> native_result(other)
+        end
+      after
+        cleanup_list_waiters(keys)
+      end
+    else
+      {:error, reason} -> {:bad_request, reason}
+    end
+  end
+
+  defp first_zpop(keys, store, pop_key) do
+    Enum.reduce_while(keys, nil, fn key, nil ->
+      case pop_key.(key) do
+        [] -> {:cont, nil}
+        {:error, _reason} = error -> {:halt, error}
+        result -> {:halt, finish_zset_pop(keys, key, store, result)}
+      end
+    end)
+  end
+
+  defp finish_zset_pop(keys, key, store, result) do
+    cleanup_list_waiters(keys)
+
+    case SortedSetCmd.handle("ZCARD", [key], store) do
+      remaining when is_integer(remaining) and remaining > 0 -> Waiters.notify_push(key)
+      _empty_or_error -> :ok
+    end
+
+    result
   end
 
   defp run_stream_read(ast, store) do
