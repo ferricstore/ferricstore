@@ -250,24 +250,25 @@ defmodule Ferricstore.Commands.KeyDiscovery do
   def extract(command, args)
 
   def extract(command, [destination, count | rest])
-      when command in ~w(CMS.MERGE TDIGEST.MERGE ZUNIONSTORE ZINTERSTORE ZDIFFSTORE) do
+      when command in ["CMS.MERGE", "TDIGEST.MERGE", "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE"] do
     {:ok, [destination | counted_keys(count, rest)]}
   end
 
   def extract(command, [destination | _args])
-      when command in ~w(CMS.MERGE TDIGEST.MERGE ZUNIONSTORE ZINTERSTORE ZDIFFSTORE),
+      when command in ["CMS.MERGE", "TDIGEST.MERGE", "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE"],
       do: {:ok, [destination]}
 
   def extract(command, [])
-      when command in ~w(CMS.MERGE TDIGEST.MERGE ZUNIONSTORE ZINTERSTORE ZDIFFSTORE),
+      when command in ["CMS.MERGE", "TDIGEST.MERGE", "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE"],
       do: {:ok, []}
 
   def extract(command, [count | rest])
-      when command in ~w(SINTERCARD ZUNION ZINTER ZDIFF ZINTERCARD),
+      when command in ["SINTERCARD", "ZUNION", "ZINTER", "ZDIFF", "ZINTERCARD"],
       do: {:ok, counted_keys(count, rest)}
 
-  def extract(command, []) when command in ~w(SINTERCARD ZUNION ZINTER ZDIFF ZINTERCARD),
-    do: {:ok, []}
+  def extract(command, [])
+      when command in ["SINTERCARD", "ZUNION", "ZINTER", "ZDIFF", "ZINTERCARD"],
+      do: {:ok, []}
 
   def extract("PFCOUNT", keys), do: {:ok, keys}
 
