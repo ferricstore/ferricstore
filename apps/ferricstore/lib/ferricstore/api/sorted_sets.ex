@@ -546,6 +546,92 @@ defmodule FerricStore.API.SortedSets do
     wrap(SortedSet.handle("ZRANGESTORE", args, default_ctx()))
   end
 
+  @doc """
+  Returns the members of `key` between `min` and `max` in member order, with
+  bounds written as Redis does (`"-"`, `"+"`, `"[a"`, `"(a"`). All members
+  should share one score. `limit: {offset, count}` pages the range.
+  """
+  @spec zrangebylex(key(), binary(), binary(), keyword()) ::
+          {:ok, [binary()]} | {:error, binary()}
+  def zrangebylex(key, min, max, opts \\ []),
+    do: wrap(SortedSet.handle("ZRANGEBYLEX", [key, min, max | limit_args(opts)], default_ctx()))
+
+  @doc "As `zrangebylex/4`, in reverse member order; `max` comes first."
+  @spec zrevrangebylex(key(), binary(), binary(), keyword()) ::
+          {:ok, [binary()]} | {:error, binary()}
+  def zrevrangebylex(key, max, min, opts \\ []),
+    do:
+      wrap(SortedSet.handle("ZREVRANGEBYLEX", [key, max, min | limit_args(opts)], default_ctx()))
+
+  @doc "Counts the members of `key` between `min` and `max` in member order."
+  @spec zlexcount(key(), binary(), binary()) :: {:ok, non_neg_integer()} | {:error, binary()}
+  def zlexcount(key, min, max),
+    do: wrap(SortedSet.handle("ZLEXCOUNT", [key, min, max], default_ctx()))
+
+  @doc "Removes the members of `key` ranked `start..stop` (negative counts from the end)."
+  @spec zremrangebyrank(key(), integer(), integer()) ::
+          {:ok, non_neg_integer()} | {:error, binary()}
+  def zremrangebyrank(key, start, stop) do
+    args = [key, Integer.to_string(start), Integer.to_string(stop)]
+    wrap(SortedSet.handle("ZREMRANGEBYRANK", args, default_ctx()))
+  end
+
+  @doc """
+  Removes the members of `key` scored between `min` and `max`, given as
+  numbers or as Redis writes them (`"(1"`, `"+inf"`).
+  """
+  @spec zremrangebyscore(key(), number() | binary(), number() | binary()) ::
+          {:ok, non_neg_integer()} | {:error, binary()}
+  def zremrangebyscore(key, min, max) do
+    args = [key, score_arg(min), score_arg(max)]
+    wrap(SortedSet.handle("ZREMRANGEBYSCORE", args, default_ctx()))
+  end
+
+  @doc "Removes the members of `key` between `min` and `max` in member order."
+  @spec zremrangebylex(key(), binary(), binary()) ::
+          {:ok, non_neg_integer()} | {:error, binary()}
+  def zremrangebylex(key, min, max),
+    do: wrap(SortedSet.handle("ZREMRANGEBYLEX", [key, min, max], default_ctx()))
+
+  @doc """
+  Pops the lowest (`:min`) or highest (`:max`) scored members of the first
+  key in `keys` that is not empty: `{:ok, {key, [{member, score}]}}`, or
+  `{:ok, nil}` when all are empty. `count:` pops up to that many (default 1).
+  """
+  @spec zmpop([key()], :min | :max, keyword()) ::
+          {:ok, {key(), [{binary(), float()}]} | nil} | {:error, binary()}
+  def zmpop(keys, where, opts \\ []) when is_list(keys) and where in [:min, :max] do
+    count = Keyword.get(opts, :count, 1)
+    side = if where == :min, do: "MIN", else: "MAX"
+    args = [Integer.to_string(length(keys)) | keys] ++ [side, "COUNT", Integer.to_string(count)]
+
+    case SortedSet.handle("ZMPOP", args, default_ctx()) do
+      {:error, _reason} = error ->
+        error
+
+      nil ->
+        {:ok, nil}
+
+      [key, pairs] ->
+        {:ok,
+         {key,
+          Enum.map(pairs, fn [member, score] ->
+            {value, _rest} = Float.parse(score)
+            {member, value}
+          end)}}
+    end
+  end
+
+  defp limit_args(opts) do
+    case Keyword.get(opts, :limit) do
+      {offset, count} -> ["LIMIT", Integer.to_string(offset), Integer.to_string(count)]
+      nil -> []
+    end
+  end
+
+  defp score_arg(score) when is_binary(score), do: score
+  defp score_arg(score) when is_number(score), do: format_number(score)
+
   defp combine_args(opts) do
     weights =
       case Keyword.get(opts, :weights) do

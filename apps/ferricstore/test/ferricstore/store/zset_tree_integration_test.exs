@@ -340,6 +340,25 @@ defmodule Ferricstore.Store.ZSetTreeIntegrationTest do
     assert 40 = cmd(ctx, "ZRANK", ["{t}a", "m001"])
   end
 
+  test "lex reads, range removals and ZMPOP work on a tree-encoded set", %{ctx: ctx} do
+    raise_to_9!(ctx)
+    pairs = Enum.flat_map(1..40, fn i -> ["0", "m#{String.pad_leading("#{i}", 3, "0")}"] end)
+    assert 40 = cmd(ctx, "ZADD", ["{r}z" | pairs])
+    assert [_file] = tree_files(ctx, "{r}z")
+
+    assert ["m010", "m011", "m012"] = cmd(ctx, "ZRANGEBYLEX", ["{r}z", "[m010", "[m012"])
+    assert ["m040", "m039"] = cmd(ctx, "ZREVRANGEBYLEX", ["{r}z", "+", "-", "LIMIT", "0", "2"])
+    assert 11 = cmd(ctx, "ZLEXCOUNT", ["{r}z", "[m030", "+"])
+
+    assert 10 = cmd(ctx, "ZREMRANGEBYLEX", ["{r}z", "[m031", "+"])
+    assert 5 = cmd(ctx, "ZREMRANGEBYRANK", ["{r}z", "0", "4"])
+    assert 25 = cmd(ctx, "ZCARD", ["{r}z"])
+    assert ["m006"] = cmd(ctx, "ZRANGE", ["{r}z", "0", "0"])
+    assert ["{r}z", [["m006", "0"]]] = cmd(ctx, "ZMPOP", ["1", "{r}z", "MIN"])
+    assert 24 = cmd(ctx, "ZREMRANGEBYSCORE", ["{r}z", "-inf", "+inf"])
+    assert 0 = cmd(ctx, "EXISTS", ["{r}z"])
+  end
+
   test "a transaction that fails after writing a tree leaves the tree as it was", %{ctx: ctx} do
     raise_to_9!(ctx)
     key = "{rollback}"

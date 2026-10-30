@@ -95,11 +95,12 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #    with the entry's Raft position, and drops them from the keydir. Older
   #    releases keep members in the keydir and cannot read the tree.
   # 10: MULTI queues ZUNION, ZINTER, ZDIFF, ZUNIONSTORE, ZINTERSTORE,
-  #     ZDIFFSTORE, ZINTERCARD and ZRANGESTORE
+  #     ZDIFFSTORE, ZINTERCARD, ZRANGESTORE, ZRANGEBYLEX, ZREVRANGEBYLEX,
+  #     ZLEXCOUNT, ZREMRANGEBYRANK, ZREMRANGEBYSCORE, ZREMRANGEBYLEX and ZMPOP
   #     (`Ferricstore.Transaction.ReplicaCompat`), which older releases do not
-  #     have; and their STORE forms run as one-command transactions, so the
-  #     shard computes the result where it writes it
-  #     (`Ferricstore.Commands.SortedSet.Algebra`).
+  #     have; and the ones that write run as one-command transactions, so the
+  #     shard decides what to write where it writes it
+  #     (`Ferricstore.Commands.SortedSet.Algebra`, `SortedSet.RangeCommands`).
   @supported 10
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

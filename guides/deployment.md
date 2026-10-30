@@ -548,7 +548,8 @@ is never claimed by one); at level 8 every replica claims the same Flows
 different hibernated Flow than the others); at level 9 a large sorted set lives
 in its own counted tree file, so ZRANK and ZRANGE by index stay O(log N) (below
 it they walk the set from its start); at level 10 MULTI takes ZUNION, ZINTER,
-ZDIFF, their STORE forms, ZINTERCARD and ZRANGESTORE. After the first start of a new
+ZDIFF, their STORE forms, ZINTERCARD, ZRANGESTORE, ZRANGEBYLEX, ZREVRANGEBYLEX,
+ZLEXCOUNT, the ZREMRANGEBY* commands and ZMPOP. After the first start of a new
 cluster, once every node is up, raise it to the level the release supports:
 
 ```bash
@@ -675,13 +676,15 @@ shard_0: 2
     storage compacts these files and removes the ones no set names; see
     `docs/sorted-set-tree-design.md`.
   - 10: MULTI queues ZUNION, ZINTER, ZDIFF, ZUNIONSTORE, ZINTERSTORE,
-    ZDIFFSTORE, ZINTERCARD and ZRANGESTORE; releases before it do not have
-    these commands, so a transaction holding one would apply on them
-    differently. Their STORE forms (and ZRANGESTORE) run as one-command
-    transactions: the shard computes the result from what it has applied and
-    writes it with nothing in between. Below level 10 a STORE reads its
-    sources on the node the client is connected to, which may not have
-    applied the latest write yet, and writes as separate steps.
+    ZDIFFSTORE, ZINTERCARD, ZRANGESTORE, ZRANGEBYLEX, ZREVRANGEBYLEX,
+    ZLEXCOUNT, ZREMRANGEBYRANK, ZREMRANGEBYSCORE, ZREMRANGEBYLEX and ZMPOP;
+    releases before it do not have these commands, so a transaction holding
+    one would apply on them differently. The ones that write (the STORE
+    forms, ZRANGESTORE, the ZREMRANGEBY* commands and ZMPOP) run as
+    one-command transactions: the shard decides from what it has applied and
+    writes with nothing in between. Below level 10 they read on the node the
+    client is connected to, which may not have applied the latest write yet,
+    and write as separate steps.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.

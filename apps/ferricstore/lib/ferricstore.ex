@@ -368,6 +368,13 @@ defmodule FerricStore do
   defguardeddelegate(zinter(keys, opts \\ []), to: SortedSetsAPI, keys: keys)
   defguardeddelegate(zdiff(keys, opts \\ []), to: SortedSetsAPI, keys: keys)
   defguardeddelegate(zintercard(keys, opts \\ []), to: SortedSetsAPI, keys: keys)
+  defguardeddelegate(zrangebylex(key, min, max, opts \\ []), to: SortedSetsAPI, keys: [key])
+  defguardeddelegate(zrevrangebylex(key, max, min, opts \\ []), to: SortedSetsAPI, keys: [key])
+  defguardeddelegate(zlexcount(key, min, max), to: SortedSetsAPI, keys: [key])
+  defguardeddelegate(zremrangebyrank(key, start, stop), to: SortedSetsAPI, keys: [key])
+  defguardeddelegate(zremrangebyscore(key, min, max), to: SortedSetsAPI, keys: [key])
+  defguardeddelegate(zremrangebylex(key, min, max), to: SortedSetsAPI, keys: [key])
+  defguardeddelegate(zmpop(keys, where, opts \\ []), to: SortedSetsAPI, keys: keys)
 
   defguardeddelegate(cas(key, expected, new_value, opts \\ []), to: GenericAPI, keys: [key])
   defguardeddelegate(fetch_or_compute(key, opts), to: GenericAPI, keys: [key])

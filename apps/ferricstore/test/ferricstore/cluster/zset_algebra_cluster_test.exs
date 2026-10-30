@@ -55,6 +55,18 @@ defmodule Ferricstore.Cluster.ZSetAlgebraClusterTest do
              end),
              "#{node.name}: #{inspect(Enum.map([@union, @z1, @diff], &members(node, &1)))}"
     end
+
+    # A removal and a pop sent to a follower decide on the shard's state, right
+    # after a write the follower may not have applied yet.
+    third = List.last(nodes)
+    assert 1 == dispatch(first, "ZADD", [@union, "9", "late"])
+    assert 2 == dispatch(third, "ZREMRANGEBYSCORE", [@union, "3", "+inf"])
+    assert [@union, [["c", "2"]]] == dispatch(second, "ZMPOP", ["1", @union, "MAX"])
+
+    for node <- nodes do
+      assert eventually(fn -> members(node, @union) == [{"a", "1.0"}] end),
+             "#{node.name}: #{inspect(members(node, @union))}"
+    end
   end
 
   defp members(node, key) do

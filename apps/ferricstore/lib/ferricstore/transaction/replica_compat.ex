@@ -14,7 +14,8 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
   releases before it do not parse at all, such as ZRANK ... WITHSCORE and
   HEXPIRE ... NX, or refuse, such as PFMERGE with no source and HEXPIRE with
   a TTL of 0. Level 10 adds ZUNION, ZINTER, ZDIFF, their STORE forms,
-  ZINTERCARD and ZRANGESTORE, which releases before it do not have.
+  ZINTERCARD, ZRANGESTORE, ZRANGEBYLEX, ZREVRANGEBYLEX, ZLEXCOUNT, the
+  ZREMRANGEBY* commands and ZMPOP, which releases before it do not have.
   """
 
   alias Ferricstore.Cluster.FeatureLevel
@@ -29,7 +30,14 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
     :zinterstore,
     :zdiffstore,
     :zintercard,
-    :zrangestore
+    :zrangestore,
+    :zrangebylex,
+    :zrevrangebylex,
+    :zlexcount,
+    :zremrangebyrank,
+    :zremrangebyscore,
+    :zremrangebylex,
+    :zmpop
   ]
   @field_expiry_tags [:hexpire, :hpexpire]
 

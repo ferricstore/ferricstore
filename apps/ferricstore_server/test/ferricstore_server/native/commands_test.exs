@@ -5089,6 +5089,28 @@ defmodule FerricstoreServer.Native.CommandsTest do
       end
     end
 
+    test "ZREMRANGEBY* commands notify the key they removed from", %{key: key} do
+      zset = key <> ":zremrange"
+      :ok = PubSub.subscribe("__keyspace@0__:" <> zset, self())
+
+      exec = fn command, args ->
+        Commands.execute(@op_command_exec, %{"command" => command, "args" => args}, state())
+      end
+
+      assert {:ok, 4, _state} = exec.("ZADD", [zset, "0", "a", "0", "b", "1", "c", "2", "d"])
+      assert_receive {:pubsub_message, _channel, "zadd"}, 500
+
+      for {command, args} <- [
+            {"ZREMRANGEBYRANK", [zset, "0", "0"]},
+            {"ZREMRANGEBYLEX", [zset, "[b", "[b"]},
+            {"ZREMRANGEBYSCORE", [zset, "1", "1"]}
+          ] do
+        assert {:ok, 1, _state} = exec.(command, args)
+        event = String.downcase(command)
+        assert_receive {:pubsub_message, _channel, ^event}, 500
+      end
+    end
+
     test "RPOPLPUSH notifies like LMOVE, and neither notifies an empty source", %{key: key} do
       source = key <> ":source"
       destination = key <> ":destination"
