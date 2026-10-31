@@ -22,7 +22,7 @@ FerricStore implements these command names and argument shapes across native TCP
 mode and the embedded API:
 
 GET, SET (EX/PX/EXAT/PXAT/NX/XX/GET/KEEPTTL), DEL, EXISTS, MGET, MSET, MSETNX, INCR, DECR, INCRBY, DECRBY, INCRBYFLOAT,
-APPEND, STRLEN, GETSET, GETDEL, GETEX, SETNX, SETEX, PSETEX, GETRANGE, SETRANGE,
+APPEND, STRLEN, GETSET, GETDEL, GETEX, SETNX, SETEX, PSETEX, GETRANGE, SETRANGE, LCS,
 HSET, HMSET, HGET, HDEL, HMGET, HGETALL, HEXISTS, HKEYS, HVALS, HLEN, HINCRBY, HINCRBYFLOAT,
 HSETNX, HSTRLEN, HRANDFIELD, HSCAN, HEXPIRE, HTTL, HPERSIST, HPEXPIRE, HPTTL, HEXPIRETIME, HEXPIREAT,
 HPEXPIREAT, HPEXPIRETIME, HGETDEL, HGETEX, HSETEX,
@@ -520,6 +520,22 @@ Overwrites part of a string starting at the given byte offset. If the key does n
 | **Embedded API** | `FerricStore.setrange(key, offset, value)` |
 | **Return** | Integer -- the new string length |
 | **Elixir return** | `{:ok, integer()}` |
+| **Status** | Supported |
+
+### LCS
+
+The longest common subsequence of two strings (a missing key is an empty
+string). LEN answers its length; IDX answers the matching ranges, from the
+end, as `{"matches" => [[[a_start, a_end], [b_start, b_end]] ...], "len" =>
+length}`, with MINMATCHLEN dropping shorter ranges and WITHMATCHLEN adding
+each range's length. It takes O(len(a) * len(b)); strings whose lengths
+multiply past 16,777,216 are refused. The keys must share a hash slot. Inside
+MULTI it needs cluster feature level 12.
+
+| | |
+|---|---|
+| **Protocol command** | `LCS key1 key2 [LEN] [IDX] [MINMATCHLEN len] [WITHMATCHLEN]` |
+| **Return** | Bulk string, integer (LEN) or map (IDX) |
 | **Status** | Supported |
 
 ---

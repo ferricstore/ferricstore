@@ -42,7 +42,7 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
   ]
   @field_expiry_tags [:hexpire, :hpexpire]
   # Level 12: commands older releases do not have.
-  @level_12_tags [:hmset, :touch, :hexpireat, :hpexpireat, :hpexpiretime, :lmpop]
+  @level_12_tags [:hmset, :touch, :hexpireat, :hpexpireat, :hpexpiretime, :lmpop, :lcs]
 
   @doc "Whether a parsed command needs cluster feature level 4 inside MULTI."
   @spec level_4_form?(term()) :: boolean()

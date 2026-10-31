@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- New command: LCS, the longest common subsequence of two strings, with LEN,
+  IDX, MINMATCHLEN and WITHMATCHLEN as Redis answers them. Strings whose
+  lengths multiply past 16,777,216 are refused. Inside MULTI it needs cluster
+  feature level 12.
+
 - New command: LMPOP, the non-blocking BLMPOP. Of several keys it picks the
   first with elements where the pops apply (one-command transaction, from
   cluster feature level 12); inside MULTI it needs level 12.

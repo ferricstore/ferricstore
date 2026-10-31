@@ -106,6 +106,9 @@ defmodule Ferricstore.Transaction.Ast do
       when tag in [:zunion, :zinter, :zdiff, :zintercard, :zmpop, :lmpop],
       do: {tag, namespace_counted_keys(numkeys, rest, ns)}
 
+  def namespace_ast_keys({:lcs, [key_a, key_b | options]}, ns),
+    do: {:lcs, [namespace_key(key_a, ns), namespace_key(key_b, ns) | options]}
+
   def namespace_ast_keys({:zrangestore, [destination, source | rest]}, ns),
     do: {:zrangestore, [namespace_key(destination, ns), namespace_key(source, ns) | rest]}
 

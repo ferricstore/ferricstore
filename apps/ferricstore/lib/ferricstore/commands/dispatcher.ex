@@ -97,6 +97,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     "PSETEX" => 4,
     "GETRANGE" => 4,
     "SETRANGE" => 4,
+    "LCS" => -3,
     "EXPIRE" => -3,
     "PEXPIRE" => -3,
     "EXPIREAT" => -3,
@@ -233,7 +234,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     INVOCATION.DEFINITION.PUT INVOCATION.DEFINITION.GET INVOCATION.DEFINITION.LIST
     INVOCATION.CREATE INVOCATION.GET INVOCATION.PARTITION.LIST
   )
-  @raw_fallback_ast_tags ~w(hmset touch time lmpop bitcount bitpos xadd xlen xrange xrevrange xread xtrim xdel xinfo xgroup xreadgroup xack xpending xclaim xautoclaim xsetid geoadd geopos geodist geohash geosearch geosearchstore zunion zinter zdiff zunionstore zinterstore zdiffstore zintercard zrangestore zrangebylex zrevrangebylex zlexcount zremrangebyrank zremrangebyscore zremrangebylex zmpop cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error)a
+  @raw_fallback_ast_tags ~w(hmset touch time lmpop lcs bitcount bitpos xadd xlen xrange xrevrange xread xtrim xdel xinfo xgroup xreadgroup xack xpending xclaim xautoclaim xsetid geoadd geopos geodist geohash geosearch geosearchstore zunion zinter zdiff zunionstore zinterstore zdiffstore zintercard zrangestore zrangebylex zrevrangebylex zlexcount zremrangebyrank zremrangebyscore zremrangebylex zmpop cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error)a
   @wrong_arity_list_ast_tags ~w(get incr decr strlen getdel getex ttl pttl persist lpop rpop llen hgetall hkeys hvals hlen hrandfield smembers scard srandmember spop zcard zpopmin zpopmax zrandmember type expiretime pexpiretime)a
 
   @ast_command_names %{
@@ -258,6 +259,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     psetex: "psetex",
     getrange: "getrange",
     setrange: "setrange",
+    lcs: "lcs",
     msetnx: "msetnx",
     expire: "expire",
     pexpire: "pexpire",
@@ -921,6 +923,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   defp dispatch_raw_handler(cmd, args, store) do
     cond do
       cmd in @string_raw_commands -> Strings.handle(cmd, args, store)
+      cmd == "LCS" -> Ferricstore.Commands.Lcs.handle(args, store)
       cmd in @expiry_raw_commands -> Expiry.handle(cmd, args, store)
       cmd in @list_raw_commands -> List.handle(cmd, args, store)
       cmd in @hash_raw_commands -> Hash.handle(cmd, args, store)

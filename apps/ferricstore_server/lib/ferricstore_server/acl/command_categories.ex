@@ -3,7 +3,7 @@ defmodule FerricstoreServer.Acl.CommandCategories do
 
   alias Ferricstore.Commands.{Extension, KeyDiscovery}
 
-  @string_read ~w(GET MGET GETRANGE STRLEN)
+  @string_read ~w(GET MGET GETRANGE STRLEN LCS)
   @string_write ~w(
     SET SETNX SETEX PSETEX MSET MSETNX PIPELINE APPEND SETRANGE
     INCR DECR INCRBY DECRBY INCRBYFLOAT

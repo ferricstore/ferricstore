@@ -33,6 +33,7 @@ defmodule Ferricstore.Commands.KeyDiscovery do
         }
 
   @read_key_commands MapSet.new(~w(
+    LCS
     GET MGET GETRANGE STRLEN
     HGET HMGET HGETALL HKEYS HVALS HLEN HEXISTS HRANDFIELD HSCAN HSTRLEN HTTL HPTTL
     HEXPIRETIME HPEXPIRETIME
@@ -279,6 +280,8 @@ defmodule Ferricstore.Commands.KeyDiscovery do
 
   def extract("PFCOUNT", keys), do: {:ok, keys}
   def extract("TOUCH", keys), do: {:ok, keys}
+  def extract("LCS", [key_a, key_b | _options]), do: {:ok, [key_a, key_b]}
+  def extract("LCS", keys), do: {:ok, keys}
 
   def extract("OBJECT", [subcommand, key | _args]) do
     if String.upcase(subcommand) in ["ENCODING", "FREQ", "IDLETIME", "REFCOUNT"] do
