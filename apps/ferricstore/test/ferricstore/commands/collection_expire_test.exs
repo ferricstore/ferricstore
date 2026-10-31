@@ -98,8 +98,10 @@ defmodule Ferricstore.Commands.CollectionExpireTest do
     assert 0 == d.("PERSIST", [k.("missing")])
   end
 
+  # Chunks of 250: a 500-member ZADD outran the write timeout on a loaded CI
+  # runner.
   defp fill(d, k, size) do
-    for chunk <- Enum.chunk_every(1..size, 500),
+    for chunk <- Enum.chunk_every(1..size, 250),
         {command, args} <- [
           {"HSET", [k.("h") | Enum.flat_map(chunk, &["f#{&1}", "v#{&1}"])]},
           {"RPUSH", [k.("l") | Enum.map(chunk, &"e#{&1}")]},
